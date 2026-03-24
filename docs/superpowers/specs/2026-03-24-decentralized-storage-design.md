@@ -10,7 +10,7 @@
 
 - DRM or content protection
 - Audio transcoding or adaptive bitrate
-- Search, discovery, or recommendation
+- Search, discovery, or recommendation (future work section below outlines the planned approach)
 - Mobile or web clients
 - Multi-chain support (single L2 only for PoC)
 - Erasure coding (full replication only)
@@ -413,3 +413,33 @@ min_stake_for_reports = 1000
 - Staking/unstaking, channel open/close/dispute, slashing via optimistic fraud proof
 
 No end-to-end multi-machine tests for PoC.
+
+## Future Work: Search & Discovery (Federated Indexers)
+
+Not in PoC scope, but the planned approach for the next phase.
+
+### Overview
+
+Dedicated **indexer nodes** crawl the network's content announcements (already broadcast on the `content-routing/v1` gossip topic), build a searchable index of track metadata, and expose a query API. Multiple independent indexers can coexist — clients pick one or query several for redundancy.
+
+This is analogous to how The Graph indexes blockchain data: indexers are semi-trusted infrastructure, but they cannot tamper with content (blobs are content-addressed), only withhold search results. Clients can cross-reference multiple indexers to detect omissions.
+
+### How It Works
+
+1. **Ingestion:** Indexer subscribes to `content-routing/v1` gossip topic. When a `ContentAnnounce` arrives, the indexer fetches the manifest and metadata blobs from a provider, extracts searchable fields (title, artist, genre, duration), and adds them to a local full-text search index (e.g., `tantivy`).
+2. **Query API:** Indexer exposes a query protocol on a custom ALPN (`storage-layer/search/v1`). Clients connect via iroh and send search queries. Results are manifest hashes + metadata summaries, ranked by relevance.
+3. **Incentive:** Indexers earn query fees via the same payment channel mechanism used for streaming. Clients pay per query (or per batch of queries). This makes indexing a self-sustaining role in the network.
+4. **Registration:** Indexers register in the `StakingRegistry` with an "indexer" role. Staking provides sybil resistance and a slashing mechanism if an indexer is proven to serve fabricated results (metadata doesn't match the actual blob).
+
+### Discovery & Recommendations
+
+Built on top of the indexer infrastructure:
+
+- **Trending:** Most-streamed tracks = most voucher settlements. Indexers can query on-chain settlement data or track gossip volume to rank by popularity.
+- **Genre browsing:** Structured metadata fields in the metadata blob enable category-based filtering.
+- **Playlists:** User-created hash sequences (same mechanism as track manifests) containing ordered lists of manifest hashes. Stored as blobs, shareable by hash.
+- **Algorithmic recommendations:** Application-layer concern. Could run on indexer nodes or as a separate service consuming indexer APIs.
+
+### PoC Bridge
+
+During PoC (before indexers exist), clients use the full-table gossip approach already in the design: every node holds the complete content routing table and metadata can be fetched directly. This works at tens of nodes. The migration path to indexers is additive — indexers subscribe to the same gossip topic, just with better query capabilities.
