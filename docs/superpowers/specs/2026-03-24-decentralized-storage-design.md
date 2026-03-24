@@ -128,14 +128,14 @@ A single ERC-20 token on Arbitrum Sepolia (testnet). Three payment flows:
 | Channel dispute window | 1 hour | Short for PoC; production should be longer |
 | Channel expiry timeout | 30 days | Funds reclaimable if provider vanishes |
 
-Token supply and distribution are out of scope for PoC — use a freely mintable testnet token.
+Token supply and distribution are out of scope for PoC — use a freely mintable testnet token. For comprehensive economics including supply model, slashing schedule, provider unit economics, reputation scoring math, governance, and attack analysis, see the [Tokenomics Spec](./2026-03-24-tokenomics.md).
 
 ### Provider Staking
 
 - Minimum stake deposit into a staking contract to join
 - Two purposes: sybil resistance and slashing collateral
 - Slashing conditions (PoC — narrow and provable):
-  - Serving wrong data: uses an **optimistic fraud proof** model. The client submits `{blob_hash, chunk_index, received_bytes, expected_blake3_root}` to a slashing contract. The contract does NOT verify BLAKE3 on-chain (too expensive). Instead, the provider has a challenge window (24 hours) to counter the claim by providing the correct chunk. If they fail to respond, slash is executed. This is optimistic — assumes the client is honest unless the provider disputes.
+  - Serving wrong data: uses an **optimistic fraud proof** model. The client submits `{blob_hash, chunk_index, received_bytes, expected_blake3_root}` to a slashing contract. The contract does NOT verify BLAKE3 on-chain (too expensive). Instead, the provider has a challenge window (24 hours) to counter the claim by providing the correct chunk. If they fail to respond, slash is executed. This is optimistic — assumes the client is honest unless the provider disputes. In production, challengers must post a **challenge bond** (50 tokens) that is forfeited if the provider successfully counters — see [Tokenomics Spec](./2026-03-24-tokenomics.md) Section 4 for details.
 - Stake withdrawable after unbonding period (7 days)
 
 ### Payment Channels
