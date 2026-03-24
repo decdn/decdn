@@ -3,12 +3,36 @@
 **Date:** 2026-03-24
 **Status:** Draft
 **Scope:** PoC — tens of nodes, proving the core protocol
+**Target L2:** Arbitrum Sepolia (testnet). Production L2 TBD.
+**iroh version:** Latest stable (0.35+). Key APIs: `iroh::Endpoint`, `iroh-blobs` (fs-store, verified streaming), `iroh-gossip` (topic-based epidemic broadcast).
+
+## Non-Goals (out of scope for PoC)
+
+- DRM or content protection
+- Audio transcoding or adaptive bitrate
+- Search, discovery, or recommendation
+- Mobile or web clients
+- Multi-chain support (single L2 only for PoC)
+- Erasure coding (full replication only)
 
 ## Overview
 
 A decentralized storage and delivery network optimized for audio streaming (decentralized Spotify use case). Built on iroh for p2p connectivity and content-addressed blob transfer, with cryptocurrency incentives on an EVM L2 for storage and delivery payments.
 
 The system is application-specific blob storage first (audio streaming), with the flexibility to serve as general-purpose storage. Providers choose what they store (hybrid permissioning). The network is permissionless to join but providers must stake tokens.
+
+## Glossary
+
+| Term | Definition |
+|------|-----------|
+| **Blob** | A content-addressed byte sequence in iroh, identified by its BLAKE3 hash |
+| **Chunk** | A 1024-byte segment of a blob used by iroh-blobs for verified streaming |
+| **Hash sequence** | An ordered collection of blob hashes (iroh's equivalent of a directory/manifest) |
+| **Voucher** | A signed off-chain payment message: `{channelId, cumulativeAmount, nonce, signature}` |
+| **Manifest** | A hash sequence linking a track's audio blob + metadata blob. Its hash is the track ID |
+| **ALPN** | Application-Layer Protocol Negotiation — identifies which protocol a QUIC connection uses |
+| **Provider** | A node that stores and serves blobs, earning tokens |
+| **Staking** | Locking tokens in a smart contract as collateral to join the network as a provider |
 
 ## Architecture
 
@@ -53,19 +77,27 @@ Audio files are stored as iroh blobs, content-addressed by BLAKE3 hash. A single
 
 The manifest hash is the canonical identifier. Clients request the manifest, get metadata to display, then stream the audio blob.
 
+**Why a manifest?** The indirection pays off in multiple ways: (1) the same audio blob can appear in multiple albums/playlists without duplication, (2) metadata can be updated without changing the audio hash, (3) the manifest naturally extends to albums (multiple audio blobs in one hash sequence), and (4) it separates the "what is this track" lookup from the "give me the bytes" transfer.
+
 ### Replication
 
 - Full replication with configurable factor (default 3)
 - Uploader specifies replication factor and pays for initial placement
 - Provider selection is reputation-weighted (prefer online, fast, geographically diverse nodes)
 - Providers can accept or reject storage requests (hybrid permissioning)
-- Lazy replication maintenance — if a provider goes offline for too long, the network re-replicates to maintain the target factor
+
+**Replication maintenance protocol:** The uploader is responsible for maintaining the replication factor. The uploader periodically polls providers (via a lightweight `Ping` on the `store/v1` ALPN) to confirm they still hold the blob. If a provider is unreachable for >30 minutes, the uploader selects a new provider (reputation-weighted) and re-uploads. For PoC, this polling interval is 5 minutes. Future: delegate monitoring to a "replication manager" role that other nodes can fill for a fee.
 
 ### Content Routing
 
-- Providers announce content via a lightweight gossip protocol
-- A distributed lookup table maps `blob_hash -> list of provider NodeIds`
-- Clients query routing to find providers, then connect directly via iroh
+For PoC (tens of nodes), content routing uses a **full-table gossip approach**:
+
+- A dedicated iroh-gossip topic (`content-routing/v1`) where providers announce what they store
+- Every node maintains a local routing table: `blob_hash -> Vec<(NodeId, last_seen)>`
+- Providers broadcast `ContentAnnounce {hash, available: bool}` messages when they store or drop a blob
+- At PoC scale, every node holds the full table (feasible with tens of nodes and thousands of blobs)
+- Clients query their local table to find providers, then connect directly via iroh
+- Future: replace with a DHT (Kademlia) for larger networks
 
 ### Local Store
 
@@ -76,7 +108,7 @@ The manifest hash is the canonical identifier. Clients request the manifest, get
 
 ### Token Model
 
-A single ERC-20 token on an EVM L2 (e.g., Arbitrum, Base). Three payment flows:
+A single ERC-20 token on Arbitrum Sepolia (testnet). Three payment flows:
 
 | Flow | Direction | Trigger |
 |------|-----------|---------|
@@ -84,24 +116,40 @@ A single ERC-20 token on an EVM L2 (e.g., Arbitrum, Base). Three payment flows:
 | Delivery payment | Listener -> Provider | Streaming audio chunks |
 | Staking | Provider -> Contract | Joining the network |
 
+### Placeholder Economics (PoC)
+
+| Parameter | Value | Rationale |
+|-----------|-------|-----------|
+| Minimum provider stake | 1000 tokens | High enough for sybil resistance, low enough for PoC participation |
+| Storage rate | 10 tokens / GB / month | Simple flat rate |
+| Delivery rate | 0.001 tokens / MB streamed | ~0.004 tokens per 4-min song at 128kbps |
+| Voucher interval | Every 256KB (1024 chunks) | Balance between payment granularity and signature overhead |
+| Unbonding period | 7 days | Prevents stake-and-run |
+| Channel dispute window | 1 hour | Short for PoC; production should be longer |
+| Channel expiry timeout | 30 days | Funds reclaimable if provider vanishes |
+
+Token supply and distribution are out of scope for PoC — use a freely mintable testnet token.
+
 ### Provider Staking
 
 - Minimum stake deposit into a staking contract to join
 - Two purposes: sybil resistance and slashing collateral
 - Slashing conditions (PoC — narrow and provable):
-  - Serving wrong data (BLAKE3 hash mismatch, client submits proof on-chain)
+  - Serving wrong data: uses an **optimistic fraud proof** model. The client submits `{blob_hash, chunk_index, received_bytes, expected_blake3_root}` to a slashing contract. The contract does NOT verify BLAKE3 on-chain (too expensive). Instead, the provider has a challenge window (24 hours) to counter the claim by providing the correct chunk. If they fail to respond, slash is executed. This is optimistic — assumes the client is honest unless the provider disputes.
 - Stake withdrawable after unbonding period (7 days)
 
 ### Payment Channels
 
-Off-chain bidirectional payment channels between clients/uploaders and providers:
+Off-chain **unidirectional** payment channels (client/uploader pays provider):
 
 - **Opening:** Client calls `openChannel(provider, deposit)` on L2. Funds locked.
 - **Payments:** Client signs incrementing vouchers off-chain: `{channelId, amount, nonce, signature}`. No on-chain tx per chunk.
 - **Closing:** Either party submits latest voucher to contract. After dispute window (1 hour for PoC), funds distributed.
 - **Disputes:** Stale voucher submitted? Other party submits newer one during dispute window. Highest nonce wins.
-- **Chunk-to-payment ratio:** One voucher per 1024 chunks (~256KB). Configurable.
+- **Client liveness requirement:** Clients must monitor for channel close attempts and submit a newer voucher within the dispute window if a stale one is submitted. A client offline for >1 hour during a dispute may lose funds. For PoC this is acceptable; production should use a watchtower pattern.
 - **Vouchers are cumulative** — each supersedes the previous (higher amount, higher nonce).
+
+**Failover and channel pre-warming:** Clients maintain a small pool of pre-opened channels with top-ranked providers (by reputation). When streaming a track, the client has channels ready with 2-3 providers so failover doesn't require an on-chain transaction. Channel deposits can be small (enough for a few tracks) and topped up as needed. For PoC, the client pre-opens channels with all known providers at startup (feasible at tens of nodes).
 
 ### Storage Payments
 
@@ -150,7 +198,8 @@ struct ReportMetrics {
 
 - Reports only accepted from staked nodes
 - Rate-limited: max 1 report per (reporter, provider) per hour
-- Each node aggregates locally, weighting by reporter stake and trust
+- Each node aggregates locally using **interaction-weighted scoring**: reports from nodes that have completed more verified transactions (voucher settlements visible on-chain) carry more weight. A node with 1 settled channel carries less influence than one with 100. This makes self-promotion expensive — you need real economic activity, not just stake.
+- A reporter's score for a provider is a weighted average: 70% local observations, 30% network gossip. Nodes always trust their own experience more than the crowd.
 
 ### Smart Contracts (PoC)
 
@@ -158,7 +207,7 @@ struct ReportMetrics {
 |----------|---------|
 | `StakingRegistry` | Provider registration, stake deposit/withdrawal, slashing |
 | `PaymentChannel` | Channel open/close/dispute, voucher verification |
-| `Token` | ERC-20 token (or use existing testnet token) |
+| `Token` | ERC-20 token (freely mintable on testnet) |
 
 ## Protocol & Wire Format
 
@@ -167,33 +216,37 @@ struct ReportMetrics {
 | ALPN | Purpose |
 |------|---------|
 | `storage-layer/stream/v1` | Audio streaming with payment vouchers |
-| `storage-layer/store/v1` | Storage deals (upload, replication, status) |
+| `storage-layer/store/v1` | Storage deals (upload, replication, status, ping) |
 | iroh-blobs built-in ALPN | Actual blob transfer |
-| iroh-gossip built-in ALPN | Reputation report propagation |
+| iroh-gossip built-in ALPN | Reputation + content routing propagation |
 
 ### Streaming Protocol (`stream/v1`)
 
 ```
 Client                          Provider
   |                                |
-  |--- StreamRequest {hash} ------>|
+  |--- StreamRequest {hash,       |
+  |     byte_offset} ------------>|
   |                                |
-  |<-- StreamResponse {ok, meta} --|
+  |<-- StreamResponse {ok, meta,  |
+  |     total_size} --------------|
   |                                |
-  |  +--- chunk loop ----------+   |
-  |  |<-- ChunkData {bytes} ---|   |
-  |  |                         |   |
-  |  |  (every N chunks:)      |   |
-  |  |-- Voucher {sig,amt} --->|   |
-  |  |<-- VoucherAck ----------|   |
-  |  +-------------------------+   |
+  |  +--- chunk loop ----------+  |
+  |  |<-- ChunkData {bytes} ---|  |
+  |  |                         |  |
+  |  |  (every N chunks:)      |  |
+  |  |-- Voucher {sig,amt} --->|  |
+  |  |<-- VoucherAck ----------|  |
+  |  +-------------------------+  |
   |                                |
   |--- StreamEnd ----------------->|
 ```
 
+- `StreamRequest` includes an optional `byte_offset` field for seek and resume. On failover, the client sends the byte offset of the last successfully verified chunk to the new provider.
 - Built on iroh-blobs verified streaming — chunks are BLAKE3-verified automatically
 - Payment wrapper intercepts every N chunks (default 1024 ~256KB) and expects a signed voucher
 - Self-enforcing: client stops paying, provider stops sending; provider stops sending, client stops paying
+- Voucher amount accounts for the offset — client only pays for bytes actually delivered from the offset onward
 
 ### Storage Protocol (`store/v1`)
 
@@ -219,6 +272,7 @@ Uploader                        Provider
 - Provider can reject based on content policy, capacity, or price
 - Blob transfer uses iroh-blobs natively after acceptance
 - Provider stores expiry metadata; garbage collects after expiry unless renewed
+- `Ping` message on this ALPN for uploader to check provider liveness and blob availability
 
 ### Serialization
 
@@ -252,36 +306,89 @@ protocol -> serde, postcard, iroh types (minimal)
 
 `protocol` is the leaf crate with minimal dependencies. Everything depends on it; it depends on almost nothing.
 
+### CLI & Configuration
+
+The `node` binary uses clap for CLI:
+
+```
+storage-layer-node [OPTIONS] <COMMAND>
+
+Commands:
+  provider    Run as a storage provider
+  upload      Upload a track to the network
+  stream      Stream a track by manifest hash
+  status      Show node status, channels, and stored blobs
+
+Options:
+  --config <PATH>     Path to config file (default: ~/.storage-layer/config.toml)
+  --data-dir <PATH>   Data directory for blob store (default: ~/.storage-layer/data)
+  --log-level <LEVEL> Log level: trace, debug, info, warn, error (default: info)
+```
+
+Config file (`config.toml`):
+
+```toml
+[node]
+mode = "provider"           # provider | client | uploader
+listen_port = 4433
+secret_key_path = "~/.storage-layer/secret.key"
+
+[storage]
+replication_factor = 3
+max_storage_gb = 100        # provider only
+
+[incentive]
+l2_rpc_url = "https://sepolia-rollup.arbitrum.io/rpc"
+staking_contract = "0x..."
+payment_contract = "0x..."
+token_contract = "0x..."
+wallet_key_path = "~/.storage-layer/wallet.key"
+
+[reputation]
+min_stake_for_reports = 1000
+```
+
 ## Error Handling & Edge Cases
 
 ### Network Failures
 
-- **Provider offline mid-stream:** Client picks next-best provider from routing table (reputation-ranked), resumes from last verified chunk. Partial voucher is still settleable.
-- **Provider offline while storing:** Replication monitor detects gap after threshold (30 min for PoC). Triggers re-replication to maintain factor.
+- **Provider offline mid-stream:** Client picks next-best provider from routing table (reputation-ranked), resumes from last verified byte offset using `StreamRequest.byte_offset`. Partial voucher with the failed provider is still settleable. Pre-warmed channel with fallback provider avoids on-chain latency.
+- **Provider offline while storing:** Uploader detects via periodic ping (5-min interval). After 30 minutes unreachable, uploader selects new provider and re-uploads to maintain replication factor.
 - **Client disappears mid-stream:** Provider stops sending. Last voucher is claimable. iroh cleans up QUIC connection.
 
 ### Payment Failures
 
 - **Channel runs dry:** Provider sends `PaymentRequired`. Client tops up or opens new channel.
-- **Stale voucher dispute:** Dispute window allows submitting newer voucher. Highest nonce wins.
+- **Stale voucher dispute:** Dispute window (1 hour) allows submitting newer voucher. Highest nonce wins. Clients must be online during dispute windows to protect themselves; production should use watchtowers.
 - **Provider never settles:** Channel timeout (30 days). Client reclaims unsettled funds.
 
 ### Data Integrity
 
-- **Corrupted data:** iroh-blobs BLAKE3 verified streaming rejects bad chunks at transport level. Provider marked faulty in reputation. Slashable if provable on-chain.
+- **Corrupted data:** iroh-blobs BLAKE3 verified streaming rejects bad chunks at transport level. Provider marked faulty in reputation. Slashable via optimistic fraud proof (client submits claim, provider has 24h to counter with correct data).
 - **Provider claims to store but doesn't:** Challenge-response spot checks. Failure harms reputation. On-chain slashing deferred past PoC.
 
 ### Reputation Gaming
 
-- **Sybil flood:** Reports only from staked nodes. Cost scales with stake.
-- **Self-promotion:** Weighted by reporter history and interaction diversity.
-- **Collusion:** Accepted risk for PoC at small network scale.
+- **Sybil flood:** Reports only from staked nodes. Cost scales with minimum stake.
+- **Self-promotion:** Interaction-weighted scoring means you need real settled payment channels (on-chain verifiable) to gain influence. Self-promotion requires actual economic activity.
+- **Collusion:** Mitigated by interaction weighting. Remaining risk accepted for PoC at small network scale.
 
 ### Graceful Degradation
 
 - L2 down: streaming continues, vouchers settle when chain returns
 - Gossip partitioned: fall back to local reputation
 - No provider has track: clear `ContentNotFound` error
+
+## Observability
+
+- **Structured logging** via `tracing` crate (standard in iroh ecosystem). JSON output for machine consumption.
+- **Metrics** via `prometheus` crate, exposed on a configurable HTTP port:
+  - `blobs_stored_total`, `blobs_stored_bytes` — provider storage usage
+  - `streams_active`, `streams_completed`, `streams_failed` — streaming activity
+  - `vouchers_signed`, `vouchers_received` — payment activity
+  - `reputation_reports_sent`, `reputation_reports_received` — gossip health
+  - `channels_open`, `channels_settled` — payment channel lifecycle
+- **Health endpoint** at `/health` on the metrics HTTP port — returns node status, peer count, and channel balances
 
 ## Testing Strategy
 
@@ -290,12 +397,12 @@ protocol -> serde, postcard, iroh types (minimal)
 - `protocol` — serialization round-trips, voucher signature verification, message validation
 - `storage` — blob store/retrieve, replication factor enforcement, routing lookups
 - `incentive` — payment channel state machine (open/pay/close), voucher nonce ordering, dispute logic
-- `reputation` — score aggregation, rate limiting, report deduplication
+- `reputation` — score aggregation, rate limiting, report deduplication, interaction weighting
 
 ### Integration Tests (multi-node, in-process)
 
 - Happy path: upload -> discover -> stream with payments
-- Provider failure + failover mid-stream
+- Provider failure + failover mid-stream (resume from byte offset)
 - Payment channel full lifecycle with dispute
 - Reputation propagation via gossip
 - Replication maintenance after provider loss
@@ -303,6 +410,6 @@ protocol -> serde, postcard, iroh types (minimal)
 ### Contract Tests
 
 - Foundry tests against local Anvil chain
-- Staking/unstaking, channel open/close/dispute, slashing
+- Staking/unstaking, channel open/close/dispute, slashing via optimistic fraud proof
 
 No end-to-end multi-machine tests for PoC.
