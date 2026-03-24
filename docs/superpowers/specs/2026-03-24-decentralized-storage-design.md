@@ -151,6 +151,8 @@ Off-chain **unidirectional** payment channels (client/uploader pays provider):
 
 **Failover and channel pre-warming:** Clients maintain a small pool of pre-opened channels with top-ranked providers (by reputation). When streaming a track, the client has channels ready with 2-3 providers so failover doesn't require an on-chain transaction. Channel deposits can be small (enough for a few tracks) and topped up as needed. For PoC, the client pre-opens channels with all known providers at startup (feasible at tens of nodes).
 
+**Production: stablecoin channels.** For production, payments transition from the native token to stablecoins (USDC) via a `StablePaymentChannel` contract. This eliminates provider revenue volatility while the native token retains utility for staking and governance. See the [Stablecoin Payments Spec](./2026-03-24-stablecoin-payments.md) for the dual-currency design, migration path, and token utility preservation mechanisms.
+
 ### Storage Payments
 
 - Uploader opens a channel per provider

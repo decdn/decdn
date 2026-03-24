@@ -115,7 +115,9 @@ Client deposits 100 tokens into channel
 | Ecosystem grants | 20% |
 | Burn (deflationary) | 20% |
 
-The 20% burn is automatic (sent to `address(0)`). The remaining 80% accumulates in the treasury for governance-directed spending. The burn percentage is governable.
+**PoC (native token fees):** The 20% burn is automatic (sent to `address(0)`). The remaining 80% accumulates in the treasury for governance-directed spending. The burn percentage is governable.
+
+**Production (stablecoin fees):** When payments move to stablecoin (see [Stablecoin Payments Spec](./2026-03-24-stablecoin-payments.md)), the 20% burn allocation becomes a **buyback & burn**: USDC fees are swapped for AUDIO on a DEX and the purchased AUDIO is burned. This creates market buy pressure proportional to network usage. See the stablecoin spec Section 5 for mechanism details.
 
 ---
 
@@ -652,11 +654,11 @@ All economic parameters in one reference table:
 4. **Inflationary provider rewards:** Should there be a capped inflation mechanism for bootstrapping, or is the provider bootstrap fund (20% of supply) sufficient?
 5. **Optimal slash percentages:** The 5/15/100% escalation is a design target. Should be validated through simulation before production.
 6. **Dynamic fee adjustment:** Should the protocol fee auto-adjust based on network utilization, or only via governance votes?
-7. **Token price oracle:** Unit economics depend on token price vs. fiat costs. Should the protocol use an oracle for rate bounds, or leave everything in token-denominated terms?
+7. **Token price oracle:** ~~Unit economics depend on token price vs. fiat costs. Should the protocol use an oracle for rate bounds, or leave everything in token-denominated terms?~~ **Resolved:** The [Stablecoin Payments Spec](./2026-03-24-stablecoin-payments.md) eliminates the need for an oracle by moving payments to stablecoins. Rates are denominated in USD-stable terms. No oracle needed.
 
 ### Risks
 
-1. **Token price volatility:** Provider profitability swings with token price. Mitigation: providers can adjust rates. Long-term: consider stablecoin-denominated channels as an alternative.
+1. **Token price volatility:** Provider profitability swings with token price. Mitigation: providers can adjust rates. **Long-term solution:** The [Stablecoin Payments Spec](./2026-03-24-stablecoin-payments.md) defines a dual-currency model where payments use stablecoins (USDC) while the native token is reserved for staking, governance, and fee discounts. This eliminates provider revenue volatility.
 2. **Low initial demand:** Without listeners, providers have no delivery revenue. The bootstrap fund must be large enough to sustain providers until organic demand kicks in.
 3. **Governance capture:** Large token holders can control parameter changes. Safety bounds limit damage but don't prevent rent-seeking (e.g., setting fees to 20%).
 4. **Regulatory risk:** Tokens with economic utility may be classified as securities in some jurisdictions. Legal review required before production distribution.
