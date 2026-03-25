@@ -16,7 +16,7 @@ This repository includes a devcontainer for running consistent, secure, long-run
 ### Platform notes
 
 - **Windows**: Docker Desktop must use the WSL2 backend. Enable it in Docker Desktop Settings > General > "Use the WSL 2 based engine".
-- **macOS (Apple Silicon)**: Enable Rosetta emulation in Docker Desktop Settings > General > "Use Rosetta for x86_64/amd64 emulation on Apple Silicon" for best compatibility.
+- **macOS (Apple Silicon)**: The container runs natively on arm64. Only enable Rosetta in Docker Desktop if you encounter compatibility issues with specific packages.
 - **Linux**: Your user must be in the `docker` group (`sudo usermod -aG docker $USER`) or use rootless Docker.
 
 ## Quick start
@@ -73,7 +73,7 @@ Inside the container terminal:
 claude --version       # Claude Code CLI
 rustc --version        # Rust compiler
 cargo --version        # Cargo package manager
-echo $ANTHROPIC_API_KEY  # Should show your key
+[ -n "$ANTHROPIC_API_KEY" ] && echo "Key is set" || echo "Key is missing"
 ```
 
 ## What's included
@@ -142,7 +142,7 @@ On container start, `init-firewall.sh` configures a default-deny iptables firewa
 
 | Rule | Scope | Purpose |
 |---|---|---|
-| DNS (UDP/TCP 53) | Docker resolver (`127.0.0.11`) only | Name resolution — restricted to prevent DNS tunneling |
+| DNS (UDP/TCP 53) | Docker resolver (`127.0.0.11`) only | Name resolution — restricted to prevent direct external DNS access |
 | SSH (TCP 22) | Whitelisted IPs only | Git over SSH to GitHub — not open to arbitrary hosts |
 | Localhost | `lo` interface | Inter-process communication |
 | Host gateway | Single gateway IP | Docker host ↔ container communication |
@@ -151,16 +151,21 @@ All other outbound traffic is rejected.
 
 ### Adding a new domain
 
-Edit `.devcontainer/init-firewall.sh` and add the domain to the `for domain in ...` loop:
+Edit `.devcontainer/init-firewall.sh` and add the domain to either the `CRITICAL_DOMAINS` array (must resolve or container fails to start) or the `OPTIONAL_DOMAINS` array (best-effort):
 
 ```bash
-for domain in \
-    "registry.npmjs.org" \
+CRITICAL_DOMAINS=(
     ...
-    "your-new-domain.example.com"; do
+    "your-critical-domain.example.com"
+)
+
+OPTIONAL_DOMAINS=(
+    ...
+    "your-optional-domain.example.com"
+)
 ```
 
-Rebuild the container for the change to take effect.
+Rebuild the container image for the change to take effect (the script is baked in at build time, then executed on every container start).
 
 ## Persistent volumes
 
@@ -236,11 +241,11 @@ Check which domain is blocked:
 curl -v https://the-domain.com 2>&1 | head -20
 ```
 
-Add it to `init-firewall.sh` and rebuild the container.
+Add it to `init-firewall.sh` and rebuild the container image (the script is copied during build).
 
 ### Slow first build on Apple Silicon
 
-The Rust toolchain compilation under Rosetta emulation is slower than native. The first build may take 5-10 minutes. Subsequent starts use cached layers.
+Compiling Rust dev tools (`cargo-watch`, `cargo-nextest`) from source takes longer on arm64. The first build may take 5-10 minutes. Subsequent starts reuse cached layers.
 
 ### Docker not running (Windows)
 

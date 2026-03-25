@@ -34,20 +34,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN mkdir -p /usr/local/share/npm-global && \
   chown -R node:node /usr/local/share
 
-ARG USERNAME=node
-
-# Persist shell history across container restarts.
+# Create directories and set permissions
 RUN mkdir /commandhistory \
   && touch /commandhistory/.bash_history \
   && touch /commandhistory/.zsh_history \
-  && chown -R $USERNAME /commandhistory
+  && chown -R node /commandhistory \
+  && mkdir -p /workspace /home/node/.claude \
+  && chown -R node:node /workspace /home/node/.claude
 
 # Set `DEVCONTAINER` environment variable to help with orientation
 ENV DEVCONTAINER=true
-
-# Create workspace and config directories and set permissions
-RUN mkdir -p /workspace /home/node/.claude && \
-  chown -R node:node /workspace /home/node/.claude
 
 WORKDIR /workspace
 
@@ -68,16 +64,14 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --de
 
 ENV PATH="/home/node/.cargo/bin:$PATH"
 
-# Install global packages
-ENV NPM_CONFIG_PREFIX=/usr/local/share/npm-global
-ENV PATH=$PATH:/usr/local/share/npm-global/bin
+# Global npm prefix
+ENV NPM_CONFIG_PREFIX=/usr/local/share/npm-global \
+    PATH=$PATH:/usr/local/share/npm-global/bin
 
-# Set the default shell to zsh rather than sh
-ENV SHELL=/bin/zsh
-
-# Set the default editor and visual
-ENV EDITOR=nano
-ENV VISUAL=nano
+# Shell and editor defaults
+ENV SHELL=/bin/zsh \
+    EDITOR=nano \
+    VISUAL=nano
 
 # Default powerline10k theme
 ARG ZSH_IN_DOCKER_VERSION=1.2.0
@@ -94,9 +88,9 @@ RUN sh -c "$(wget -O- https://github.com/deluan/zsh-in-docker/releases/download/
 # Install Claude
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 
-# Copy and set up firewall script
-COPY init-firewall.sh /usr/local/bin/
+# Copy and set up firewall script (as root to ensure correct ownership)
 USER root
+COPY init-firewall.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/init-firewall.sh && \
   echo "node ALL=(root) NOPASSWD: /usr/local/bin/init-firewall.sh" > /etc/sudoers.d/node-firewall && \
   chmod 0440 /etc/sudoers.d/node-firewall

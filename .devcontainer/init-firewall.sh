@@ -1,6 +1,74 @@
 #!/bin/bash
 set -euo pipefail  # Exit on error, undefined vars, and pipeline failures
-IFS=$'\n\t'       # Stricter word splitting
+IFS=$'\n\t'       # Word splitting on newlines and tabs only (spaces preserved)
+
+# If the script exits for any reason before completing successfully,
+# set default-deny policies so the container is locked down rather than
+# left wide open with ACCEPT policies from the setup phase.
+lockdown_on_failure() {
+    echo "FATAL: Firewall setup failed. Setting default-deny policies for safety."
+    iptables -P INPUT DROP 2>/dev/null || true
+    iptables -P OUTPUT DROP 2>/dev/null || true
+    iptables -P FORWARD DROP 2>/dev/null || true
+}
+trap lockdown_on_failure ERR EXIT
+
+# Critical domains must resolve or the script aborts (with retry).
+# Optional domains are best-effort — CDN/analytics that may use CNAME-only records.
+CRITICAL_DOMAINS=(
+    "api.anthropic.com"
+    "sentry.io"
+    "registry.npmjs.org"
+    "crates.io"
+    "static.crates.io"
+    "index.crates.io"
+)
+
+OPTIONAL_DOMAINS=(
+    "statsig.anthropic.com"
+    "statsig.com"
+    "marketplace.visualstudio.com"
+    "vscode.blob.core.windows.net"
+    "update.code.visualstudio.com"
+    "static.rust-lang.org"
+    "sepolia-rollup.arbitrum.io"
+    "arb-sepolia.g.alchemy.com"
+)
+
+# Resolve a domain to A record IPs with retries.
+# Returns IPs on stdout, exits 1 if all retries fail.
+resolve_domain() {
+    local domain="$1"
+    local retries=3
+    local ips=""
+    for ((i=1; i<=retries; i++)); do
+        ips=$(dig +noall +answer A "$domain" | awk '$4 == "A" {print $5}')
+        if [ -n "$ips" ]; then
+            echo "$ips"
+            return 0
+        fi
+        if [ "$i" -lt "$retries" ]; then
+            echo "  Retry $i/$retries for $domain..." >&2
+            sleep 2
+        fi
+    done
+    return 1
+}
+
+# Add an IP to the allowed-domains ipset, failing on real errors.
+add_to_ipset() {
+    local ip="$1"
+    local domain="$2"
+    local output
+    if output=$(ipset add allowed-domains "$ip" 2>&1); then
+        echo "Adding $ip for $domain"
+    elif [[ "$output" == *"already added"* ]]; then
+        echo "  $ip for $domain (already in set)"
+    else
+        echo "ERROR: Failed to add $ip for $domain to ipset: $output"
+        exit 1
+    fi
+}
 
 # 1. Extract Docker DNS info BEFORE any flushing
 DOCKER_DNS_RULES=$(iptables-save -t nat | grep "127\.0\.0\.11" || true)
@@ -12,7 +80,10 @@ iptables -t nat -F
 iptables -t nat -X
 iptables -t mangle -F
 iptables -t mangle -X
-ipset destroy allowed-domains 2>/dev/null || true
+
+if ipset list allowed-domains &>/dev/null; then
+    ipset destroy allowed-domains
+fi
 
 # Ensure policies are permissive during setup (needed if script re-runs
 # after a previous run already set DROP policies)
@@ -25,7 +96,10 @@ if [ -n "$DOCKER_DNS_RULES" ]; then
     echo "Restoring Docker DNS rules..."
     iptables -t nat -N DOCKER_OUTPUT 2>/dev/null || true
     iptables -t nat -N DOCKER_POSTROUTING 2>/dev/null || true
-    echo "$DOCKER_DNS_RULES" | xargs -L 1 iptables -t nat
+    while IFS= read -r rule; do
+        [[ "$rule" =~ ^-A ]] || continue
+        iptables -t nat $rule || echo "WARNING: Failed to restore NAT rule: $rule"
+    done <<< "$DOCKER_DNS_RULES"
 else
     echo "No Docker DNS rules to restore"
 fi
@@ -39,16 +113,15 @@ iptables -A INPUT -p tcp -s 127.0.0.11 --sport 53 -m state --state ESTABLISHED,R
 iptables -A INPUT -i lo -j ACCEPT
 iptables -A OUTPUT -o lo -j ACCEPT
 
-# Create ipset with CIDR support
+# Create ipset (supports both CIDR ranges and individual IPs)
 ipset create allowed-domains hash:net
 
-# Fetch GitHub meta information and aggregate + add their IP ranges
+# Fetch GitHub meta information and aggregate + add their IPv4 ranges
 echo "Fetching GitHub IP ranges..."
-gh_ranges=$(curl -s https://api.github.com/meta)
-if [ -z "$gh_ranges" ]; then
-    echo "ERROR: Failed to fetch GitHub IP ranges"
+gh_ranges=$(curl -sS --fail --connect-timeout 10 https://api.github.com/meta) || {
+    echo "ERROR: Failed to fetch GitHub IP ranges (curl exit code: $?)"
     exit 1
-fi
+}
 
 if ! echo "$gh_ranges" | jq -e '.web and .api and .git' >/dev/null; then
     echo "ERROR: GitHub API response missing required fields"
@@ -56,6 +129,13 @@ if ! echo "$gh_ranges" | jq -e '.web and .api and .git' >/dev/null; then
 fi
 
 echo "Processing GitHub IPs..."
+github_cidrs=$(echo "$gh_ranges" | jq -r '(.web + .api + .git)[]' | grep '\.' | aggregate -q)
+if [ -z "$github_cidrs" ]; then
+    echo "ERROR: No GitHub CIDR ranges produced after aggregation"
+    exit 1
+fi
+
+cidr_count=0
 while read -r cidr; do
     if [[ ! "$cidr" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
         echo "ERROR: Invalid CIDR range from GitHub meta: $cidr"
@@ -63,43 +143,32 @@ while read -r cidr; do
     fi
     echo "Adding GitHub range $cidr"
     ipset add allowed-domains "$cidr"
-done < <(echo "$gh_ranges" | jq -r '(.web + .api + .git)[]' | grep '\.' | aggregate -q)
+    cidr_count=$((cidr_count + 1))
+done <<< "$github_cidrs"
+echo "Added $cidr_count GitHub CIDR ranges"
 
-# Resolve and add other allowed domains
-for domain in \
-    "registry.npmjs.org" \
-    "api.anthropic.com" \
-    "sentry.io" \
-    "statsig.anthropic.com" \
-    "statsig.com" \
-    "marketplace.visualstudio.com" \
-    "vscode.blob.core.windows.net" \
-    "update.code.visualstudio.com" \
-    "crates.io" \
-    "static.crates.io" \
-    "index.crates.io" \
-    "static.rust-lang.org" \
-    "sepolia-rollup.arbitrum.io" \
-    "arb-sepolia.g.alchemy.com"; do
-    echo "Resolving $domain..."
-    ips=$(dig +noall +answer A "$domain" | awk '$4 == "A" {print $5}')
-    if [ -z "$ips" ]; then
-        echo "WARNING: Failed to resolve $domain, trying CNAME chain..."
-        ips=$(dig +noall +answer "$domain" | awk '$4 == "A" {print $5}')
+# Resolve and add critical domains (fail-hard with retry)
+for domain in "${CRITICAL_DOMAINS[@]}"; do
+    echo "Resolving $domain (critical)..."
+    if ! ips=$(resolve_domain "$domain"); then
+        echo "ERROR: Failed to resolve critical domain $domain after retries"
+        exit 1
     fi
-    if [ -z "$ips" ]; then
-        echo "WARNING: Could not resolve $domain — skipping (may use CDN/CNAME)"
+    while read -r ip; do
+        add_to_ipset "$ip" "$domain"
+    done <<< "$ips"
+done
+
+# Resolve and add optional domains (warn-and-skip)
+for domain in "${OPTIONAL_DOMAINS[@]}"; do
+    echo "Resolving $domain (optional)..."
+    if ! ips=$(resolve_domain "$domain"); then
+        echo "WARNING: Could not resolve optional domain $domain — skipping"
         continue
     fi
-
     while read -r ip; do
-        if [[ ! "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-            echo "WARNING: Invalid IP from DNS for $domain: $ip — skipping"
-            continue
-        fi
-        echo "Adding $ip for $domain"
-        ipset add allowed-domains "$ip" 2>/dev/null || true
-    done < <(echo "$ips")
+        add_to_ipset "$ip" "$domain"
+    done <<< "$ips"
 done
 
 # Get host gateway IP from default route
@@ -117,11 +186,6 @@ iptables -A OUTPUT -d "$HOST_IP" -j ACCEPT
 # Allow outbound SSH only to allowed domains (e.g., GitHub git IP ranges)
 iptables -A OUTPUT -p tcp --dport 22 -m set --match-set allowed-domains dst -j ACCEPT
 
-# Set default policies to DROP
-iptables -P INPUT DROP
-iptables -P FORWARD DROP
-iptables -P OUTPUT DROP
-
 # Allow established connections for already approved traffic
 iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
 iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
@@ -132,7 +196,23 @@ iptables -A OUTPUT -m set --match-set allowed-domains dst -j ACCEPT
 # Explicitly REJECT all other outbound traffic for immediate feedback
 iptables -A OUTPUT -j REJECT --reject-with icmp-admin-prohibited
 
+# Set default policies to DROP *last* — all ACCEPT rules are already in place,
+# so a failure here cannot brick networking
+iptables -P INPUT DROP
+iptables -P FORWARD DROP
+iptables -P OUTPUT DROP
+
 echo "Firewall configuration complete"
+
+# Verify ipset is populated
+IPSET_COUNT=$(ipset list allowed-domains | grep -c "^[0-9]" || echo "0")
+if [ "$IPSET_COUNT" -lt 5 ]; then
+    echo "ERROR: ipset contains only $IPSET_COUNT entries — expected many more"
+    exit 1
+fi
+echo "ipset contains $IPSET_COUNT entries"
+
+# Verify blocked traffic
 echo "Verifying firewall rules..."
 if curl --connect-timeout 5 https://example.com >/dev/null 2>&1; then
     echo "ERROR: Firewall verification failed - was able to reach https://example.com"
@@ -141,10 +221,16 @@ else
     echo "Firewall verification passed - unable to reach https://example.com as expected"
 fi
 
-# Verify GitHub API access
-if ! curl --connect-timeout 5 https://api.github.com/zen >/dev/null 2>&1; then
-    echo "ERROR: Firewall verification failed - unable to reach https://api.github.com"
-    exit 1
-else
-    echo "Firewall verification passed - able to reach https://api.github.com as expected"
-fi
+# Verify critical services are reachable
+for verify_url in \
+    "https://api.github.com/zen" \
+    "https://api.anthropic.com"; do
+    if ! curl --connect-timeout 5 -o /dev/null -sS "$verify_url" 2>/dev/null; then
+        echo "ERROR: Firewall verification failed - unable to reach $verify_url"
+        exit 1
+    fi
+    echo "Firewall verification passed - $verify_url reachable"
+done
+
+# Remove the failure trap — setup completed successfully
+trap - ERR EXIT
