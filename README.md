@@ -125,7 +125,9 @@ This bypasses all permission prompts, allowing Claude to read/write files, run c
 
 ## Firewall and security
 
-On container start, `init-firewall.sh` configures a default-deny iptables firewall. Only these destinations are reachable:
+On container start, `init-firewall.sh` configures a default-deny iptables firewall.
+
+**Whitelisted domains** (HTTPS/TCP):
 
 | Category | Domains |
 |---|---|
@@ -136,7 +138,16 @@ On container start, `init-firewall.sh` configures a default-deny iptables firewa
 | **Rust** | `crates.io`, `static.crates.io`, `index.crates.io`, `static.rust-lang.org` |
 | **Ethereum** | `sepolia-rollup.arbitrum.io`, `arb-sepolia.g.alchemy.com` |
 
-Additionally: DNS (port 53), SSH (port 22), localhost, and the host network are allowed.
+**Infrastructure rules** (always allowed):
+
+| Rule | Scope | Purpose |
+|---|---|---|
+| DNS (UDP/TCP 53) | Docker resolver (`127.0.0.11`) only | Name resolution — restricted to prevent DNS tunneling |
+| SSH (TCP 22) | Whitelisted IPs only | Git over SSH to GitHub — not open to arbitrary hosts |
+| Localhost | `lo` interface | Inter-process communication |
+| Host gateway | Single gateway IP | Docker host ↔ container communication |
+
+All other outbound traffic is rejected.
 
 ### Adding a new domain
 
