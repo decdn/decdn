@@ -16,6 +16,8 @@ trap lockdown_on_failure ERR EXIT
 # Critical domains must resolve or the script aborts (with retry).
 # Optional domains are best-effort — CDN/analytics that may use CNAME-only records.
 CRITICAL_DOMAINS=(
+    "github.com"
+    "api.github.com"
     "api.anthropic.com"
     "sentry.io"
     "registry.npmjs.org"
@@ -225,7 +227,7 @@ fi
 for verify_url in \
     "https://api.github.com/zen" \
     "https://api.anthropic.com"; do
-    if ! curl --connect-timeout 5 -o /dev/null -sS "$verify_url" 2>/dev/null; then
+    if ! curl --connect-timeout 5 -o /dev/null -sS "$verify_url"; then
         echo "ERROR: Firewall verification failed - unable to reach $verify_url"
         exit 1
     fi
