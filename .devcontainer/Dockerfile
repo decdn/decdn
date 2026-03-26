@@ -1,0 +1,97 @@
+FROM node:20
+
+ARG TZ
+ENV TZ="$TZ"
+
+ARG CLAUDE_CODE_VERSION=latest
+
+# Install basic development tools and iptables/ipset
+RUN apt-get update && apt-get install -y --no-install-recommends \
+  less \
+  git \
+  procps \
+  sudo \
+  fzf \
+  zsh \
+  man-db \
+  unzip \
+  gnupg2 \
+  gh \
+  iptables \
+  ipset \
+  iproute2 \
+  dnsutils \
+  aggregate \
+  jq \
+  nano \
+  vim \
+  pkg-config \
+  libssl-dev \
+  build-essential \
+  && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Ensure default node user has access to /usr/local/share
+RUN mkdir -p /usr/local/share/npm-global && \
+  chown -R node:node /usr/local/share
+
+# Create directories and set permissions
+RUN mkdir /commandhistory \
+  && touch /commandhistory/.bash_history \
+  && touch /commandhistory/.zsh_history \
+  && chown -R node /commandhistory \
+  && mkdir -p /workspace /home/node/.claude \
+  && chown -R node:node /workspace /home/node/.claude
+
+# Set `DEVCONTAINER` environment variable to help with orientation
+ENV DEVCONTAINER=true
+
+WORKDIR /workspace
+
+ARG GIT_DELTA_VERSION=0.18.2
+RUN ARCH=$(dpkg --print-architecture) && \
+  wget "https://github.com/dandavison/delta/releases/download/${GIT_DELTA_VERSION}/git-delta_${GIT_DELTA_VERSION}_${ARCH}.deb" && \
+  dpkg -i "git-delta_${GIT_DELTA_VERSION}_${ARCH}.deb" && \
+  rm "git-delta_${GIT_DELTA_VERSION}_${ARCH}.deb"
+
+# Set up non-root user
+USER node
+
+# Install Rust toolchain
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable \
+  && . "$HOME/.cargo/env" \
+  && rustup component add rust-analyzer \
+  && cargo install cargo-watch cargo-nextest
+
+ENV PATH="/home/node/.cargo/bin:$PATH"
+
+# Global npm prefix
+ENV NPM_CONFIG_PREFIX=/usr/local/share/npm-global \
+    PATH=$PATH:/usr/local/share/npm-global/bin
+
+# Shell and editor defaults
+ENV SHELL=/bin/zsh \
+    EDITOR=nano \
+    VISUAL=nano
+
+# Default powerline10k theme
+ARG ZSH_IN_DOCKER_VERSION=1.2.0
+RUN sh -c "$(wget -O- https://github.com/deluan/zsh-in-docker/releases/download/v${ZSH_IN_DOCKER_VERSION}/zsh-in-docker.sh)" -- \
+  -p git \
+  -p fzf \
+  -a "source /usr/share/doc/fzf/examples/key-bindings.zsh" \
+  -a "source /usr/share/doc/fzf/examples/completion.zsh" \
+  -a 'export HISTFILE=/commandhistory/.zsh_history' \
+  -a 'setopt APPEND_HISTORY SHARE_HISTORY' \
+  -a 'export PATH="/home/node/.cargo/bin:$PATH"' \
+  -x
+
+# Install Claude
+RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
+
+# Copy and set up firewall script (as root to ensure correct ownership)
+USER root
+COPY init-firewall.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/init-firewall.sh && \
+  echo "node ALL=(root) NOPASSWD: /usr/local/bin/init-firewall.sh" > /etc/sudoers.d/node-firewall && \
+  chmod 0440 /etc/sudoers.d/node-firewall
+USER node
