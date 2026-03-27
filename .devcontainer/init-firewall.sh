@@ -106,11 +106,22 @@ else
     echo "No Docker DNS rules to restore"
 fi
 
-# Allow DNS only to Docker's embedded resolver (UDP and TCP)
-iptables -A OUTPUT -p udp -d 127.0.0.11 --dport 53 -m state --state NEW,ESTABLISHED -j ACCEPT
-iptables -A OUTPUT -p tcp -d 127.0.0.11 --dport 53 -m state --state NEW,ESTABLISHED -j ACCEPT
-iptables -A INPUT -p udp -s 127.0.0.11 --sport 53 -m state --state ESTABLISHED,RELATED -j ACCEPT
-iptables -A INPUT -p tcp -s 127.0.0.11 --sport 53 -m state --state ESTABLISHED,RELATED -j ACCEPT
+# Detect host gateway early — needed for DNS rules below
+HOST_IP=$(ip route | grep default | cut -d" " -f3)
+if [ -z "$HOST_IP" ]; then
+    echo "ERROR: Failed to detect host IP"
+    exit 1
+fi
+echo "Host gateway detected as: $HOST_IP"
+
+# Allow DNS to any destination — the actual DNS server varies by Docker network
+# mode (127.0.0.11 on user-defined networks, host gateway or external DNS on
+# default bridge). HTTP/HTTPS is restricted via ipset; DNS itself is not a
+# meaningful exfiltration vector for this threat model.
+iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
+iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT
+iptables -A INPUT -p udp --sport 53 -m state --state ESTABLISHED,RELATED -j ACCEPT
+iptables -A INPUT -p tcp --sport 53 -m state --state ESTABLISHED,RELATED -j ACCEPT
 # Allow localhost
 iptables -A INPUT -i lo -j ACCEPT
 iptables -A OUTPUT -o lo -j ACCEPT
@@ -173,15 +184,7 @@ for domain in "${OPTIONAL_DOMAINS[@]}"; do
     done <<< "$ips"
 done
 
-# Get host gateway IP from default route
-HOST_IP=$(ip route | grep default | cut -d" " -f3)
-if [ -z "$HOST_IP" ]; then
-    echo "ERROR: Failed to detect host IP"
-    exit 1
-fi
-echo "Host gateway detected as: $HOST_IP"
-
-# Allow traffic to/from host gateway only (not the entire subnet)
+# Allow traffic to/from host gateway (non-DNS traffic, e.g. Docker API)
 iptables -A INPUT -s "$HOST_IP" -j ACCEPT
 iptables -A OUTPUT -d "$HOST_IP" -j ACCEPT
 
