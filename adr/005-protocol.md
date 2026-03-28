@@ -5,7 +5,7 @@
 
 ## Context
 
-Vault nodes, edge nodes, and clients communicate over QUIC connections established via iroh. We need to define what protocols run over those connections: how a client or edge node requests a blob and pays for it, how an edge node pulls a blob from a peer for free, and how content availability is broadcast across the network.
+Nodes and clients communicate over QUIC connections established via iroh. We need to define what protocols run over those connections: how a client or node requests a blob and pays for it, how a node pulls a blob from a peer for free, and how content availability is broadcast across the network.
 
 The protocol layer must be distinct from the transport layer (iroh/QUIC) and the payment layer (vouchers, channels) so each can evolve independently.
 
@@ -16,8 +16,8 @@ Four protocols, each identified by an ALPN string:
 | ALPN | Participants | Purpose |
 | --- | --- | --- |
 | `cdn/probe/v1` | any node ↔ any node | Latency and availability check before committing to a node |
-| `cdn/client/v1` | payer ↔ delivering node | Blob delivery with payment vouchers (client→edge, edge→vault, client→vault) |
-| `cdn/peer/v1` | edge node ↔ edge node | Unpaid peer blob pull between staked edge nodes |
+| `cdn/client/v1` | payer ↔ delivering node | Blob delivery with payment vouchers (client→node, node→node on cache miss) |
+| `cdn/peer/v1` | node ↔ node | Unpaid peer blob pull between staked nodes |
 | iroh-gossip built-in | all nodes | Content availability announcements, node discovery |
 
 ### `cdn/probe/v1` — latency probe
@@ -39,11 +39,11 @@ Requester                       Candidate node
 
 `signature` is the candidate node's iroh private key signature over `{hash, has_blob, rate_per_mb, timestamp_us}`. This makes the probe response cryptographically attributable and enables two slashing mechanisms: (1) **phantom announcement slashing** — if `has_blob: true` but the node subsequently fails to deliver, the signed probe response is evidence; (2) **rate manipulation slashing** — if the probe response rate differs from the subsequent `StreamResponse` rate within 30 seconds, both signed messages constitute evidence of bait-and-switch. See ADR 004 for slashing details.
 
-The requester probes candidates from the routing table in parallel, waits up to 200ms, then selects the winner using a composite score: `rate_per_mb × rtt_ms` (lower is better). This applies to clients picking edge nodes, clients picking vault nodes directly, and edge nodes picking vault nodes for a cache miss pull.
+The requester probes candidates from the routing table in parallel, waits up to 200ms, then selects the winner using a composite score: `rate_per_mb × rtt_ms` (lower is better). This applies to clients picking nodes and nodes picking peers for a cache miss pull.
 
 ### `cdn/client/v1` — paid delivery protocol
 
-Used for all paid delivery: client→edge, client→vault (direct), and edge→vault (initial content pull).
+Used for all paid delivery: client→node and node→node (cache miss pull from an origin-backed or cached node).
 
 ```text
 Payer                           Delivering node
@@ -66,22 +66,22 @@ Payer                           Delivering node
   |--- StreamEnd ----------------->|
 ```
 
-The delivering node advertises its `rate_per_mb` in `StreamResponse`. The payer accepts by sending the first voucher or disconnects and tries another node. No surprise pricing. `timestamp_us` and `signature` (node's iroh key signs `{hash, rate_per_mb, channel_id, timestamp_us}`) make the rate commitment cryptographically binding — a rate mismatch between a signed `ProbeResponse` and a signed `StreamResponse` within 30 seconds is slashable evidence of rate manipulation. The `redirect` field in `StreamResponse` is used when a node cannot serve — it contains the NodeId of another node that can (a vault node or a better-positioned edge node), never an external URL. The network is fully opaque.
+The delivering node advertises its `rate_per_mb` in `StreamResponse`. The payer accepts by sending the first voucher or disconnects and tries another node. No surprise pricing. `timestamp_us` and `signature` (node's iroh key signs `{hash, rate_per_mb, channel_id, timestamp_us}`) make the rate commitment cryptographically binding — a rate mismatch between a signed `ProbeResponse` and a signed `StreamResponse` within 30 seconds is slashable evidence of rate manipulation. The `redirect` field in `StreamResponse` is used when a node cannot serve — it contains the NodeId of another node that can, never an external URL. The network is fully opaque.
 
 `byte_offset` supports seek and resume: on failover, the requester reconnects to a different node and resumes from the last BLAKE3-verified byte.
 
 The protocol is self-enforcing: payer stops sending vouchers → delivering node stops sending chunks; delivering node stops sending chunks → payer stops sending vouchers.
 
-### `cdn/peer/v1` — unpaid edge-to-edge pull
+### `cdn/peer/v1` — unpaid node-to-node pull
 
-Only between staked edge nodes. Vault nodes do not participate in this protocol — pulls from vault nodes are paid via `cdn/client/v1`.
+Between any staked nodes that opt in to peer pulls (via `accepts_peer_pull` in their `CacheAnnounce`). Nodes configured with an origin backend may choose not to accept peer pulls to avoid absorbing backend egress costs for free — in that case, peers must use `cdn/client/v1` (paid) to pull from them.
 
 ```text
-Requesting edge                 Serving edge
+Requesting node                 Serving node
   |                                |
   |--- PeerPullRequest {hash,     |
   |     node_id, eth_addr, sig} -->|
-  |                                | verify node_id is staked edge
+  |                                | verify node_id is staked
   |<-- PeerPullResponse {ok |     |
   |     not_cached | reject} ------|
   |                                |
@@ -89,11 +89,11 @@ Requesting edge                 Serving edge
   |  (BLAKE3-verified, no voucher) |
 ```
 
-The requesting edge signs `{hash, timestamp}` with its iroh private key. The serving edge verifies the requester is a staked edge node (not vault) in the on-chain registry before serving. No payment channel.
+The requesting node signs `{hash, timestamp}` with its iroh private key. The serving node verifies the requester is staked in the on-chain registry before serving. No payment channel.
 
 ### Gossip — content availability
 
-Content availability is broadcast over iroh-gossip on region-scoped topics (`cdn/region/{cc}/v1`) and a global topic (`cdn/global/v1`). Both vault nodes and edge nodes publish `CacheAnnounce` messages listing hashes they hold (max 500 entries) or a Bloom filter for large sets. Clients and edge nodes maintain a local routing table (`hash → Vec<NodeId>`) from received announcements. The routing table does not distinguish vault from edge nodes — the probe step determines cost.
+Content availability is broadcast over iroh-gossip on region-scoped topics (`cdn/region/{cc}/v1`) and a global topic (`cdn/global/v1`). All staked nodes publish `CacheAnnounce` messages listing hashes they hold (max 500 entries) or a Bloom filter for large sets. Clients and nodes maintain a local routing table (`hash → Vec<NodeId>`) from received announcements. The probe step determines cost and latency for each candidate.
 
 ### Serialization
 
@@ -104,9 +104,9 @@ All protocol messages use [postcard](https://docs.rs/postcard) — compact, no-s
 **Positive:**
 
 - ALPN separation means a single iroh `Endpoint` dispatches all connection types without ambiguity
-- Probing in parallel before committing means no payment channel is opened with a slow or unresponsive node; applies equally to client→edge and edge→vault selection
-- `cdn/client/v1` is reused for all paid delivery tiers — no separate protocol needed for edge→vault pulls
-- `redirect` always points to a NodeId, never an external URL; the backend topology of vault nodes is fully hidden from the network
+- Probing in parallel before committing means no payment channel is opened with a slow or unresponsive node
+- `cdn/client/v1` is reused for all paid delivery — no separate protocol needed for node→node pulls
+- `redirect` always points to a NodeId, never an external URL; the backend topology of origin-backed nodes is fully hidden from the network
 - The delivery protocol is self-enforcing — payment and data flow are coupled by design
 - `byte_offset` in `StreamRequest` makes failover transparent; the requester resumes without restarting the stream
 

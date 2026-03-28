@@ -7,7 +7,7 @@
 
 ## Overview
 
-This document specifies the token economics for a decentralized content delivery network. The system uses a single ERC-20 token to incentivize three roles: providers (store and serve content), uploaders (push content into the network), and clients (consume content). Payments flow through off-chain unidirectional payment channels settled on an EVM L2. Providers stake tokens to join and face slashing for provable misbehavior. A gossip-based reputation system uses interaction-weighted scoring to rank providers.
+This document specifies the token economics for a decentralized content delivery network. The system uses a single ERC-20 token to incentivize three roles: nodes (store and serve content), uploaders (push content into the network), and clients (consume content). Payments flow through off-chain unidirectional payment channels settled on an EVM L2. Nodes stake tokens to join and face slashing for provable misbehavior. A gossip-based reputation system uses interaction-weighted scoring to rank nodes.
 
 For protocol mechanics (wire format, ALPN protocols, crate structure, content model), see the main design spec.
 
@@ -29,22 +29,22 @@ For protocol mechanics (wire format, ALPN protocols, crate structure, content mo
 | Minting after genesis | None. Fixed supply. |
 | Burn mechanism | 100% of slashed stake + 20% of protocol fees are burned (see Section 3 for fee allocation) |
 
-**Why fixed supply with burn:** Simplicity. No inflation schedule to manage, no emission curve debates. The burn creates deflationary pressure proportional to network activity — more usage means more fees burned. This is easier to reason about than inflationary models and avoids the "provider reward halving" cliffs that plague emission-based systems.
+**Why fixed supply with burn:** Simplicity. No inflation schedule to manage, no emission curve debates. The burn creates deflationary pressure proportional to network activity — more usage means more fees burned. This is easier to reason about than inflationary models and avoids the "node reward halving" cliffs that plague emission-based systems.
 
-**Tradeoff acknowledged:** Fixed supply means no protocol-level provider bootstrapping rewards. Early providers must be incentivized through the distribution (see bootstrap fund below) or through organic demand. If organic demand is insufficient at launch, a capped inflation mechanism (max 2% annual, governance-controlled) can be added via contract upgrade. This is documented as an open question.
+**Tradeoff acknowledged:** Fixed supply means no protocol-level node bootstrapping rewards. Early nodes must be incentivized through the distribution (see bootstrap fund below) or through organic demand. If organic demand is insufficient at launch, a capped inflation mechanism (max 2% annual, governance-controlled) can be added via contract upgrade. This is documented as an open question.
 
 ### Distribution (Production)
 
 | Allocation | Percentage | Tokens | Vesting |
 |------------|-----------|--------|---------|
 | Protocol treasury | 25% | 250M | 4-year linear, 6-month cliff |
-| Provider bootstrap fund | 20% | 200M | Released on-demand via governance for provider incentive programs |
+| Node bootstrap fund | 20% | 200M | Released on-demand via governance for node incentive programs |
 | Team & contributors | 15% | 150M | 4-year linear, 12-month cliff |
 | Community & ecosystem grants | 20% | 200M | 3-year linear, no cliff |
 | Liquidity (DEX + CEX) | 10% | 100M | Fully unlocked at genesis |
 | Early supporters / seed | 10% | 100M | 2-year linear, 6-month cliff |
 
-**Provider bootstrap fund:** Dedicated to attracting early providers before organic delivery revenue is sufficient. Distributed as bonus rewards on top of normal storage/delivery payments. Governed by token holders — proposals to release funds require a governance vote. Target: fund 2 years of above-market provider rewards.
+**Node bootstrap fund:** Dedicated to attracting early nodes before organic delivery revenue is sufficient. Distributed as bonus rewards on top of normal storage/delivery payments. Governed by token holders — proposals to release funds require a governance vote. Target: fund 2 years of above-market node rewards.
 
 ### PoC Simplification
 
@@ -62,16 +62,16 @@ For PoC, the token contract includes a public `mint(address to, uint256 amount)`
 | Delivery | 0.001 tokens / MB delivered | 1 blob (~3.75 MB) = 0.00375 tokens |
 | Indexer queries (future) | 0.0001 tokens / query | 100 searches = 0.01 tokens |
 
-### Production: Provider-Set Rates
+### Production: Node-Set Rates
 
-In production, providers set their own rates within protocol-defined bounds:
+In production, nodes set their own rates within protocol-defined bounds:
 
 | Parameter | Floor | Ceiling | Rationale |
 |-----------|-------|---------|-----------|
 | Storage rate | 1 token / GB / month | 100 tokens / GB / month | Floor prevents race-to-bottom; ceiling prevents gouging |
 | Delivery rate | 0.0001 tokens / MB | 0.01 tokens / MB | Same logic |
 
-**Rate advertisement:** Providers include their rates in gossip announcements. Extend the existing `ContentAnnounce` message on the `content-routing/v1` gossip topic with optional rate fields:
+**Rate advertisement:** Nodes include their rates in gossip announcements. Extend the existing `ContentAnnounce` message on the `content-routing/v1` gossip topic with optional rate fields:
 
 ```rust
 struct ContentAnnounce {
@@ -82,9 +82,9 @@ struct ContentAnnounce {
 }
 ```
 
-Clients see rates before connecting and choose providers by a combination of reputation, rate, and geography. No on-chain auction — the market discovers prices through competition.
+Clients see rates before connecting and choose nodes by a combination of reputation, rate, and geography. No on-chain auction — the market discovers prices through competition.
 
-**Rate confirmation:** The `StreamResponse` message includes the provider's current delivery rate. The client confirms (by sending the first voucher) or disconnects. No surprise pricing.
+**Rate confirmation:** The `StreamResponse` message includes the node's current delivery rate. The client confirms (by sending the first voucher) or disconnects. No surprise pricing.
 
 ---
 
@@ -102,7 +102,7 @@ Clients see rates before connecting and choose providers by a combination of rep
 Client deposits 100 tokens into channel
   → Delivers content, signs vouchers totaling 80 tokens
   → Channel closes with final voucher of 80 tokens
-  → Contract distributes: 77.6 tokens to provider, 2.4 tokens to treasury
+  → Contract distributes: 77.6 tokens to node, 2.4 tokens to treasury
   → Client reclaims remaining 20 tokens
 ```
 
@@ -130,11 +130,11 @@ Client deposits 100 tokens into channel
 | Minimum stake | 1,000 tokens | 1,000 tokens (governable) |
 | Unbonding period | 7 days | 7 days (governable, min 3 days) |
 | Slashable during unbonding | Yes | Yes |
-| Max providers per node | 1 | 1 |
+| Max stake registrations per node | 1 | 1 |
 
 **Staking flow:**
-1. Provider calls `StakingRegistry.stake(amount)` with `amount >= minStake`
-2. Provider is registered and can announce content
+1. Node calls `StakingRegistry.stake(amount)` with `amount >= minStake`
+2. Node is registered and can announce content
 3. To leave: calls `StakingRegistry.initiateUnbonding()`
 4. After unbonding period: calls `StakingRegistry.withdraw()`
 5. During unbonding, stake remains slashable — prevents slash-then-run
@@ -143,10 +143,10 @@ Client deposits 100 tokens into channel
 
 | Offense | Description | Proof Mechanism | Scope |
 |---------|-------------|----------------|-------|
-| **Wrong data** | Provider served bytes that don't match the expected BLAKE3 hash | Optimistic fraud proof: challenger submits `{blob_hash, chunk_index, received_bytes, expected_root}`. Provider has 24h to counter with correct chunk. | **PoC + Production** |
-| **Phantom announcement** | Edge node signed a `ProbeResponse` claiming `has_blob: true` but failed to deliver within 30 seconds | Challenger submits signed `ProbeResponse` (has_blob: true) + signed `StreamResponse` (NotCached) or delivery timeout proof. Provider has 24h to counter with proof of delivery. | **PoC + Production** |
-| **Rate manipulation** | Edge node signed a `ProbeResponse` with rate X then signed a `StreamResponse` with rate Y > X within 30 seconds | Challenger submits both signed messages from the same node showing rate discrepancy within the 30-second window. Provider has 24h to counter. | **Production only** |
-| **Double settlement** | Provider submits a voucher to two different close transactions for the same channel | On-chain provable: contract detects duplicate channelId settlements. Automatic slash, no challenge needed. | **Production only** |
+| **Wrong data** | Node served bytes that don't match the expected BLAKE3 hash | Optimistic fraud proof: challenger submits `{blob_hash, chunk_index, received_bytes, expected_root}`. Node has 24h to counter with correct chunk. | **PoC + Production** |
+| **Phantom announcement** | Node signed a `ProbeResponse` claiming `has_blob: true` but failed to deliver within 30 seconds | Challenger submits signed `ProbeResponse` (has_blob: true) + signed `StreamResponse` (NotCached) or delivery timeout proof. Node has 24h to counter with proof of delivery. | **PoC + Production** |
+| **Rate manipulation** | Node signed a `ProbeResponse` with rate X then signed a `StreamResponse` with rate Y > X within 30 seconds | Challenger submits both signed messages from the same node showing rate discrepancy within the 30-second window. Node has 24h to counter. | **Production only** |
+| **Double settlement** | Node submits a voucher to two different close transactions for the same channel | On-chain provable: contract detects duplicate channelId settlements. Automatic slash, no challenge needed. | **Production only** |
 
 For PoC, "wrong data" and "phantom announcement" offenses are implemented. Rate manipulation and double settlement are added in production.
 
@@ -175,32 +175,32 @@ To prevent frivolous or malicious fraud proof submissions:
 | Parameter | PoC | Production |
 |-----------|-----|-----------|
 | Challenge bond | N/A (not implemented) | 50 tokens |
-| Bond return | N/A | Returned if challenge succeeds (provider slashed) |
-| Bond forfeiture | N/A | Forfeited if provider successfully counters. 50% burned, 50% to provider. |
+| Bond return | N/A | Returned if challenge succeeds (node slashed) |
+| Bond forfeiture | N/A | Forfeited if node successfully counters. 50% burned, 50% to node. |
 
-**This is a new mechanism not in the main design spec** — it should be added as a cross-reference. Without the challenge bond, anyone can grief providers with false fraud proofs at zero cost (only gas).
+**This is a new mechanism not in the main design spec** — it should be added as a cross-reference. Without the challenge bond, anyone can grief nodes with false fraud proofs at zero cost (only gas).
 
 ### Auto-Ejection
 
-If a provider's stake drops below 50% of the minimum stake requirement due to accumulated slashing, they are automatically ejected:
+If a node's stake drops below 50% of the minimum stake requirement due to accumulated slashing, they are automatically ejected:
 - Removed from the staking registry
 - Content routing announces their content as unavailable
 - Remaining stake enters forced unbonding (standard unbonding period applies)
-- Provider must re-stake at full minimum to rejoin
+- Node must re-stake at full minimum to rejoin
 
 ---
 
-## 5. Provider Unit Economics
+## 5. Node Unit Economics
 
 ### Cost Model (Estimated)
 
-Based on typical infrastructure costs for a small provider node:
+Based on typical infrastructure costs for a small node:
 
 | Cost Category | Monthly Estimate | Notes |
 |---------------|-----------------|-------|
 | VPS (4 vCPU, 8GB RAM) | $20-40 | Hetzner, OVH tier |
 | Storage (1TB SSD) | $10-20 | Included in many VPS plans |
-| Bandwidth (5TB egress) | $0-25 | Many providers include 5-20TB |
+| Bandwidth (5TB egress) | $0-25 | Many VPS plans include 5-20TB |
 | L2 gas costs | $5-15 | ~10 channel settlements/month at ~$0.50-1.50 each |
 | **Total monthly cost** | **$35-100** | |
 
@@ -225,7 +225,7 @@ At PoC rates, the breakeven depends on the token's notional value. Since PoC use
 | $0.05 | $350 | $35-100 | Profitable |
 | $0.10 | $700 | $35-100 | Very profitable |
 
-**Key insight:** Provider profitability is highly sensitive to token price and utilization. At $0.01/token, a provider needs ~500GB stored and ~2TB/month served to break even on a budget VPS. This is achievable for a moderately popular content catalog.
+**Key insight:** Node profitability is highly sensitive to token price and utilization. At $0.01/token, a node needs ~500GB stored and ~2TB/month served to break even on a budget VPS. This is achievable for a moderately popular content catalog.
 
 ### Gas Cost Breakdown (Arbitrum)
 
@@ -285,23 +285,23 @@ Cost: 112.5 * 0.001 tokens/MB = 0.1125 tokens
 
 At PoC delivery rate of 0.001 tokens/MB:
 
-| Interval | Vouchers per Blob (3.75MB) | Max Loss on Provider Failure | Signature Overhead |
+| Interval | Vouchers per Blob (3.75MB) | Max Loss on Node Failure | Signature Overhead |
 |----------|-----------------------------|--------------------------|--------------------|
 | 64KB | ~59 | 0.0000625 tokens (64KB * 0.001/MB) | High |
 | 256KB (default) | ~15 | 0.000250 tokens (256KB * 0.001/MB) | Moderate |
 | 1MB | ~4 | 0.001 tokens (1MB * 0.001/MB) | Low |
 
-The default 256KB (1024 chunks) is a good balance. Maximum loss on provider failure is a fraction of a token. Finer granularity gives diminishing returns while increasing signature overhead.
+The default 256KB (1024 chunks) is a good balance. Maximum loss on node failure is a fraction of a token. Finer granularity gives diminishing returns while increasing signature overhead.
 
 ### Channel Pool Capital Lockup
 
-At PoC scale (pre-open channels with all ~10 providers):
+At PoC scale (pre-open channels with all ~10 nodes):
 
 ```
 10 channels * 1 token deposit = 10 tokens locked
 ```
 
-At production scale (pre-open with top 3 providers):
+At production scale (pre-open with top 3 nodes):
 
 ```
 3 channels * 1 token deposit = 3 tokens locked
@@ -311,9 +311,9 @@ This is minimal capital lockup. Not a concern for the economic model.
 
 ### Griefing Mitigation
 
-**Attack:** Malicious client opens many channels with minimum deposit, never streams, forcing provider to pay gas to close them.
+**Attack:** Malicious client opens many channels with minimum deposit, never streams, forcing node to pay gas to close them.
 
-**Mitigation:** The production minimum deposit (governable `minDeposit`) is set to exceed close-channel gas cost. Channels also auto-expire after 30 days — providers don't need to actively close stale channels, just wait for expiry. Additionally, providers can set their own minimum deposit threshold above the protocol minimum.
+**Mitigation:** The production minimum deposit (governable `minDeposit`) is set to exceed close-channel gas cost. Channels also auto-expire after 30 days — nodes don't need to actively close stale channels, just wait for expiry. Additionally, nodes can set their own minimum deposit threshold above the protocol minimum.
 
 ---
 
@@ -324,13 +324,13 @@ This is minimal capital lockup. Not a concern for the economic model.
 | Parameter | Value |
 |-----------|-------|
 | Score range | 0.0 to 1.0 (stored as u32, 0 to 1,000,000, for 6-decimal precision) |
-| Initial score (new provider) | 0.5 |
+| Initial score (new node) | 0.5 |
 | Weight: local observations | 70% |
 | Weight: network gossip | 30% |
 
 ### Local Score Calculation
 
-After each interaction with a provider, the client updates its local score:
+After each interaction with a node, the client updates its local score:
 
 ```
 local_score = ewma(local_score, interaction_score, alpha=0.1)
@@ -367,7 +367,7 @@ network_score = ewma(network_score, report.score, alpha=0.05 * reporter_weight)
 final_score = 0.7 * local_score + 0.3 * network_score
 ```
 
-If a node has no local observations for a provider (never interacted), it uses 100% network score.
+If a client has no local observations for a node (never interacted), it uses 100% network score.
 
 ### Decay
 
@@ -388,31 +388,31 @@ This is an exponential decay — scores converge to 0.5 asymptotically, reaching
 |-----------|-------|
 | Decay rate | 10% per week (applied iteratively) |
 | Decay starts after | 1 week with no new reports or interactions |
-| Minimum score (floor) | 0.0 (fully untrusted providers are still scoreable) |
+| Minimum score (floor) | 0.0 (fully untrusted nodes are still scoreable) |
 | Scope | **Production only** (PoC uses static scores, no decay) |
 
-Inactive providers converge to "unknown" (neutral), preventing stale high scores from persisting indefinitely.
+Inactive nodes converge to "unknown" (neutral), preventing stale high scores from persisting indefinitely.
 
 ### Score Clamping
 
-A single reputation report (local or network) can move a provider's score by at most **0.05** in either direction. This prevents:
-- One bad interaction from destroying a good provider's reputation
-- One fake report from inflating a sybil provider's score
+A single reputation report (local or network) can move a node's score by at most **0.05** in either direction. This prevents:
+- One bad interaction from destroying a good node's reputation
+- One fake report from inflating a sybil node's score
 
 ### Tie-Breaking
 
-When multiple providers have the same final score (within 0.01 tolerance), select by:
+When multiple nodes have the same final score (within 0.01 tolerance), select by:
 
-1. **Lower current load** — providers include approximate load in gossip announcements (number of active connections)
-2. **Geographic diversity** — prefer providers in regions not already selected (if requesting multiple providers for replication)
+1. **Lower current load** — nodes include approximate load in gossip announcements (number of active connections)
+2. **Geographic diversity** — prefer nodes in regions not already selected (if requesting multiple nodes for replication)
 3. **Higher stake** — more skin in the game, all else being equal
 4. **Random** — final tiebreaker to prevent deterministic routing patterns
 
 ### Cold-Start Bootstrap
 
-New providers face a chicken-and-egg problem: no reputation means no traffic, no traffic means no reputation.
+New nodes face a chicken-and-egg problem: no reputation means no traffic, no traffic means no reputation.
 
-**Mitigation:** During the first 7 days after staking (or first 50 completed interactions, whichever comes first), new providers receive a **10% selection bonus**. When a client ranks providers, new providers' scores are temporarily boosted by 0.05 (additive). This gives them enough traffic to build a real track record.
+**Mitigation:** During the first 7 days after staking (or first 50 completed interactions, whichever comes first), new nodes receive a **10% selection bonus**. When a client ranks nodes, new nodes' scores are temporarily boosted by 0.05 (additive). This gives them enough traffic to build a real track record.
 
 The bonus is local to each client (not on-chain) and decays linearly over the bootstrap period.
 
@@ -420,8 +420,8 @@ The bonus is local to each client (not on-chain) and decays linearly over the bo
 
 To prevent spam and gaming, reputation reports are rate-limited:
 
-- **Max 1 report per (reporter, provider) pair per hour** — prevents a single node from flooding the gossip topic with reports about one provider
-- **Max 10 reports per reporter per hour** — prevents a single node from mass-rating all providers in a burst
+- **Max 1 report per (reporter, node) pair per hour** — prevents a single node from flooding the gossip topic with reports about one node
+- **Max 10 reports per reporter per hour** — prevents a single node from mass-rating all nodes in a burst
 - Reports that exceed the rate limit are silently dropped by receiving nodes
 - Rate limiting is enforced locally by each node on received gossip messages (not by the gossip protocol itself)
 
@@ -447,8 +447,8 @@ Watchtowers monitor on-chain channel close attempts and submit counter-vouchers 
 ### Trust Model
 
 - Client shares latest voucher state with the watchtower (necessary for it to function)
-- Privacy impact is minimal: the provider already has all vouchers, and vouchers are not secret (they authorize payments to the provider)
-- Watchtower cannot steal funds: vouchers pay the provider, not the watchtower
+- Privacy impact is minimal: the node already has all vouchers, and vouchers are not secret (they authorize payments to the node)
+- Watchtower cannot steal funds: vouchers pay the node, not the watchtower
 - Watchtower cannot grief: submitting a counter-voucher only helps the client
 - Risk: watchtower goes offline during a dispute. Mitigated by allowing multiple watchtowers per channel (client sends voucher updates to 2-3 watchtowers)
 
@@ -508,10 +508,10 @@ Based on OpenZeppelin Governor with the following parameters:
 
 | Aspect | Details |
 |--------|---------|
-| **Attack** | Create N fake providers, stake each, have them rate each other positively |
+| **Attack** | Create N fake nodes, stake each, have them rate each other positively |
 | **Cost** | N * 1,000 tokens (stake) + gas for channels between sybils + actual delivery activity (interaction-weighted scoring requires settled channels) |
 | **Example** | 10 sybil nodes = 10,000 tokens stake + ~100 tokens in cross-channel settlements to build credibility |
-| **Damage** | Sybil providers ranked higher than honest ones, receive traffic, deliver poor service |
+| **Damage** | Sybil nodes ranked higher than honest ones, receive traffic, deliver poor service |
 | **Mitigation** | Interaction-weighted scoring: reports from nodes with few settled channels carry little weight. Score clamping limits impact of each report. Local observations (70%) dominate network gossip (30%). |
 | **Residual risk** | Attacker with sufficient capital can build real interaction history. Cost scales linearly with desired influence. At production scale, this becomes prohibitively expensive. |
 
@@ -519,19 +519,19 @@ Based on OpenZeppelin Governor with the following parameters:
 
 | Aspect | Details |
 |--------|---------|
-| **Attack** | Submit fake fraud proofs to slash honest providers |
-| **Cost** | Challenge bond (50 tokens) + gas. Bond forfeited if provider successfully counters. |
-| **Damage** | If uncountered: 5-10% of provider's stake slashed. Provider must be offline for 24h to miss counter window. |
-| **Mitigation** | Challenge bond makes spam expensive. 50% of forfeited bond goes to targeted provider as compensation. Provider only needs to respond once within 24h. |
-| **Residual risk** | Attacker willing to lose 50 tokens per attempt can annoy providers who happen to be offline. Mitigated by provider monitoring/alerting. |
+| **Attack** | Submit fake fraud proofs to slash honest nodes |
+| **Cost** | Challenge bond (50 tokens) + gas. Bond forfeited if node successfully counters. |
+| **Damage** | If uncountered: 5-10% of node's stake slashed. Node must be offline for 24h to miss counter window. |
+| **Mitigation** | Challenge bond makes spam expensive. 50% of forfeited bond goes to targeted node as compensation. Node only needs to respond once within 24h. |
+| **Residual risk** | Attacker willing to lose 50 tokens per attempt can annoy nodes who happen to be offline. Mitigated by node monitoring/alerting. |
 
 ### Attack 3: Stake Grinding
 
 | Aspect | Details |
 |--------|---------|
-| **Attack** | Provider stakes, builds reputation, unstakes, re-stakes on a new identity to shed bad reputation |
+| **Attack** | Node stakes, builds reputation, unstakes, re-stakes on a new identity to shed bad reputation |
 | **Cost** | 7-day unbonding period per cycle + reputation decay during unbonding + new stake deposit |
-| **Damage** | Provider escapes accumulated negative reputation |
+| **Damage** | Node escapes accumulated negative reputation |
 | **Mitigation** | Reputation decays toward neutral (0.5) during the unbonding period. Re-staking gives a neutral score, not a good one. The cold-start bootstrap bonus is small (0.05) and temporary. Net effect: attacker spends 7+ days with no revenue to reset to neutral — not advantageous. |
 | **Residual risk** | Low. The attack costs more (lost revenue during unbonding) than it gains (neutral score vs. bad score). |
 
@@ -539,10 +539,10 @@ Based on OpenZeppelin Governor with the following parameters:
 
 | Aspect | Details |
 |--------|---------|
-| **Attack** | Open many channels with minimum deposit, never stream, forcing provider to track them and eventually pay gas to close |
+| **Attack** | Open many channels with minimum deposit, never stream, forcing node to track them and eventually pay gas to close |
 | **Cost** | N * minDeposit + N * open gas |
-| **Damage** | Provider memory/tracking overhead + gas to close stale channels |
-| **Mitigation** | Minimum deposit must exceed close gas cost. Providers can set their own minimum deposit threshold (above protocol minimum). Channels auto-expire after 30 days — provider doesn't need to close them, just wait. |
+| **Damage** | Node memory/tracking overhead + gas to close stale channels |
+| **Mitigation** | Minimum deposit must exceed close gas cost. Nodes can set their own minimum deposit threshold (above protocol minimum). Channels auto-expire after 30 days — node doesn't need to close them, just wait. |
 | **Residual risk** | Low. Attack is expensive (capital locked) and self-limiting (channels expire). |
 
 ### Attack 5: Majority Stake Attack
@@ -560,11 +560,11 @@ Based on OpenZeppelin Governor with the following parameters:
 | Aspect | Details |
 |--------|---------|
 | **Attack** | Accept storage deal, take uploader's payment, delete the data |
-| **Cost** | No direct slash. Storage withholding is NOT a slashable offense — slashing is focused on edge node misbehavior (wrong data, phantom announcements, rate manipulation, double settlement), not storage guarantees. |
+| **Cost** | No direct slash. Storage withholding is NOT a slashable offense — slashing is focused on node misbehavior (wrong data, phantom announcements, rate manipulation, double settlement), not storage guarantees. |
 | **Revenue from attack** | Storage payment for the deleted data. E.g., 1GB for 1 month = 10 tokens. |
 | **Profitability** | Short-term profitable, but reputation damage makes it self-defeating over time. |
-| **Mitigation** | Handled by reputation only: uploaders detect missing data via periodic probes and trigger re-replication. Failed probes tank the provider's reputation score, reducing future traffic and revenue. Persistent withholding leads to near-zero reputation, effectively soft-ejecting the provider from the network. |
-| **Residual risk** | A provider willing to sacrifice reputation can profit short-term. Mitigated by replication factor (uploaders store with multiple providers) and the cold-start cost of rebuilding reputation on a new identity. |
+| **Mitigation** | Handled by reputation only: uploaders detect missing data via periodic probes and trigger re-replication. Failed probes tank the node's reputation score, reducing future traffic and revenue. Persistent withholding leads to near-zero reputation, effectively soft-ejecting the node from the network. |
+| **Residual risk** | A node willing to sacrifice reputation can profit short-term. Mitigated by replication factor (uploaders store with multiple nodes) and the cold-start cost of rebuilding reputation on a new identity. |
 
 ---
 
@@ -612,10 +612,10 @@ All economic parameters in one reference table:
 | Challenge bond | N/A | 50 tokens | StakingRegistry | Yes |
 | Challenge window | 24 hours | 24 hours | StakingRegistry | Yes |
 | **Pricing** | | | | |
-| Storage rate | 10 tokens/GB/mo | Provider-set | Off-chain | N/A |
+| Storage rate | 10 tokens/GB/mo | Node-set | Off-chain | N/A |
 | Storage rate floor | N/A | 1 token/GB/mo | StakingRegistry | Yes |
 | Storage rate ceiling | N/A | 100 tokens/GB/mo | StakingRegistry | Yes |
-| Delivery rate | 0.001 tokens/MB | Provider-set | Off-chain | N/A |
+| Delivery rate | 0.001 tokens/MB | Node-set | Off-chain | N/A |
 | Delivery rate floor | N/A | 0.0001 tokens/MB | StakingRegistry | Yes |
 | Delivery rate ceiling | N/A | 0.01 tokens/MB | StakingRegistry | Yes |
 | **Payment Channels** | | | | |
@@ -634,7 +634,7 @@ All economic parameters in one reference table:
 | Decay rate | N/A (static scores) | 10%/week (iterative) | Off-chain | N/A |
 | Max score change per report | N/A | 0.05 | Off-chain | N/A |
 | Cold-start bonus | N/A | 0.05 for 7 days | Off-chain | N/A |
-| Report rate limit | 1/reporter/provider/hr | 1/reporter/provider/hr | Off-chain | N/A |
+| Report rate limit | 1/reporter/node/hr | 1/reporter/node/hr | Off-chain | N/A |
 | **Watchtower** | | | | |
 | Monitoring fee | N/A | 0.1% of deposit/30d | Off-chain | N/A |
 | **Governance** | | | | |
@@ -652,15 +652,15 @@ All economic parameters in one reference table:
 1. **Exact token supply number:** 1B is a placeholder. Should be validated against expected network size, target token price, and comparable projects.
 2. **Distribution percentages:** The 25/20/15/20/10/10 split is a starting point. Needs input from legal (team vesting), market (liquidity needs), and community (grant expectations).
 3. **Production L2 choice:** Arbitrum One vs. Base vs. other. Affects gas costs, bridges, and ecosystem.
-4. **Inflationary provider rewards:** Should there be a capped inflation mechanism for bootstrapping, or is the provider bootstrap fund (20% of supply) sufficient?
+4. **Inflationary node rewards:** Should there be a capped inflation mechanism for bootstrapping, or is the node bootstrap fund (20% of supply) sufficient?
 5. **Optimal slash percentages:** The 5/15/100% escalation is a design target. Should be validated through simulation before production.
 6. **Dynamic fee adjustment:** Should the protocol fee auto-adjust based on network utilization, or only via governance votes?
 7. **Token price oracle:** ~~Unit economics depend on token price vs. fiat costs. Should the protocol use an oracle for rate bounds, or leave everything in token-denominated terms?~~ **Resolved:** The [Stablecoin Payments Spec](./2026-03-24-stablecoin-payments.md) eliminates the need for an oracle by moving payments to stablecoins. Rates are denominated in USD-stable terms. No oracle needed.
 
 ### Risks
 
-1. **Token price volatility:** Provider profitability swings with token price. Mitigation: providers can adjust rates. **Long-term solution:** The [Stablecoin Payments Spec](./2026-03-24-stablecoin-payments.md) defines a dual-currency model where payments use stablecoins (USDC) while the native token is reserved for staking, governance, and fee discounts. This eliminates provider revenue volatility.
-2. **Low initial demand:** Without clients, providers have no delivery revenue. The bootstrap fund must be large enough to sustain providers until organic demand kicks in.
+1. **Token price volatility:** Node profitability swings with token price. Mitigation: nodes can adjust rates. **Long-term solution:** The [Stablecoin Payments Spec](./2026-03-24-stablecoin-payments.md) defines a dual-currency model where payments use stablecoins (USDC) while the native token is reserved for staking, governance, and fee discounts. This eliminates node revenue volatility.
+2. **Low initial demand:** Without clients, nodes have no delivery revenue. The bootstrap fund must be large enough to sustain nodes until organic demand kicks in.
 3. **Governance capture:** Large token holders can control parameter changes. Safety bounds limit damage but don't prevent rent-seeking (e.g., setting fees to 20%).
 4. **Regulatory risk:** Tokens with economic utility may be classified as securities in some jurisdictions. Legal review required before production distribution.
 5. **Smart contract risk:** Bugs in staking/payment contracts could lead to fund loss. Multiple audits required before production mainnet deployment.

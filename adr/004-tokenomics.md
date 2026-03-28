@@ -7,7 +7,7 @@
 
 The network needs an economic mechanism that:
 
-1. Incentivizes vault nodes and edge nodes to join and behave honestly (staking with slashing)
+1. Incentivizes nodes to join and behave honestly (staking with slashing)
 2. Gives token holders a voice in protocol parameters (governance)
 3. Pays node operators reliably without exposing them to asset volatility (see ADR 003)
 4. Creates sustainable token demand as the network grows
@@ -21,20 +21,20 @@ Use a **dual-currency model**: USDC for operational payments, TOKEN (native ERC-
 | Function | Currency | Rationale |
 | --- | --- | --- |
 | Delivery payments | USDC | Predictable unit economics for operators |
-| Vault node staking | TOKEN | Stake to publish content; aligns vault operators with network health |
-| Edge node staking | TOKEN | Stake to serve content in the peer mesh |
+| Node staking | TOKEN | Stake to participate in the network; aligns operators with network health |
 | Governance voting | TOKEN | Power reflects network commitment, not purchasing power |
 | Fee discounts | TOKEN | Direct financial incentive to hold more TOKEN |
 | Slashing | TOKEN | Already denominated in stake |
 
 **Token supply:** 1B TOKEN, fixed at genesis, no post-genesis minting. Deflationary pressure comes from two sources: 100% of slashed stake is burned; 20% of protocol fees (collected in USDC) are used to buy TOKEN on the open market and burn it.
 
-**Staking — two roles:**
+**Staking — single role:**
 
-- **Vault nodes** stake to gain the right to publish content into the network. A vault node that has not staked cannot register blobs in the on-chain registry and will not appear in gossip routing tables. Stake is slashable for serving corrupted bytes. Withholding (announcing but not serving) is handled by reputation penalties, not slashing — vault operators may legitimately take content offline.
-- **Edge nodes** stake to participate in the peer mesh and receive unpaid peer pulls from other edge nodes. Stake is slashable for: (1) serving data that fails BLAKE3 hash verification, (2) phantom blob announcements — claiming to have content they cannot deliver, and (3) rate manipulation — advertising one rate in probe responses then charging a higher rate during delivery. Going offline or having a cache miss is not slashable.
+All nodes stake TOKEN to participate in the network. A node that has not staked cannot register in the on-chain registry and will not appear in gossip routing tables. Whether a node is configured with an origin backend (S3/R2) or operates as a pure cache is a deployment choice — the protocol treats all staked nodes identically.
 
-Both roles share the same minimum stake of 1,000 TOKEN and the same 7-day unbonding period. Stake remains slashable during unbonding to prevent slash-then-run.
+Stake is slashable for: (1) serving data that fails BLAKE3 hash verification, (2) phantom blob announcements — claiming to have content that cannot be delivered, (3) rate manipulation — advertising one rate in probe responses then charging a higher rate during delivery, and (4) double settlement (production only). Going offline, having a cache miss, or taking content offline is not slashable — these are handled by reputation.
+
+Minimum stake is 1,000 TOKEN with a 7-day unbonding period. Stake remains slashable during unbonding to prevent slash-then-run.
 
 **Fee discount:** Providers staking ≥10× the minimum (10,000 TOKEN) pay a 1.5% protocol fee instead of 3%. This creates a direct financial return on holding more TOKEN and rewards long-term network commitment.
 

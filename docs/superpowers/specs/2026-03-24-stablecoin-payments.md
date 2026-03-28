@@ -18,15 +18,15 @@ The tokenomics spec (Section 5) demonstrates the core problem:
 | $0.05 | $350 | $35-100 | Profitable |
 | $0.10 | $700 | $35-100 | Very profitable |
 
-Provider infrastructure costs are denominated in USD (VPS, bandwidth, storage hardware). Revenue is denominated in a volatile token. A 10x price drop turns a profitable provider into a losing one overnight, even with identical workload.
+Node infrastructure costs are denominated in USD (VPS, bandwidth, storage hardware). Revenue is denominated in a volatile token. A 10x price drop turns a profitable node into a losing one overnight, even with identical workload.
 
 **Why reactive rate adjustment is insufficient:**
 
-- Providers must continuously monitor token price and update gossip-advertised rates
+- Nodes must continuously monitor token price and update gossip-advertised rates
 - Rate changes propagate slowly via gossip — clients see stale rates
 - Mid-session rate changes are impossible (vouchers are pre-signed at the old rate)
 - Creates a poor UX: clients see different prices every time they open the app
-- Providers competing on rate become a proxy for providers competing on price predictions
+- Nodes competing on rate become a proxy for nodes competing on price predictions
 
 The inverse problem affects clients: a 10x token pump means their deposited channel funds become worth far more than intended, creating opportunity cost.
 
@@ -40,12 +40,12 @@ The inverse problem affects clients: a 10x token pump means their deposited chan
 
 | Function | Currency | Rationale |
 |----------|----------|-----------|
-| Provider staking | TOKEN | Stake must align provider incentives with network health. If the network thrives, stake appreciates. |
+| Node staking | TOKEN | Stake must align node incentives with network health. If the network thrives, stake appreciates. |
 | Governance voting | TOKEN | Governance power should reflect network commitment, not purchasing power. |
 | Challenge bonds | TOKEN | Security mechanism in the staking domain. |
 | Slashing penalties | TOKEN | Already denominated in stake. No change. |
-| Storage payments | Stablecoin (USDC) | Provider costs are in USD. Storage deals last days-to-months — too long to tolerate volatility. |
-| Delivery payments | Stablecoin (USDC) | Per-MB delivery payments. Providers need predictable unit economics. |
+| Storage payments | Stablecoin (USDC) | Node costs are in USD. Storage deals last days-to-months — too long to tolerate volatility. |
+| Delivery payments | Stablecoin (USDC) | Per-MB delivery payments. Nodes need predictable unit economics. |
 | Protocol fees | Stablecoin (collected), partially converted to TOKEN (buyback) | Fees match payment currency to avoid forced conversion at collection time. |
 
 ### Supported Stablecoins
@@ -66,7 +66,7 @@ An alternative keeps the native token for all payments but uses a Chainlink pric
 
 1. **Dependency:** Oracle downtime freezes rate bounds. The payment system becomes dependent on external infrastructure.
 2. **Manipulation:** Oracle price manipulation distorts the entire payment system. Flash loan attacks on the oracle's price feed could temporarily shift rates.
-3. **Root cause unaddressed:** Providers still receive a volatile token and must sell to cover costs. The conversion friction remains, just hidden behind an oracle.
+3. **Root cause unaddressed:** Nodes still receive a volatile token and must sell to cover costs. The conversion friction remains, just hidden behind an oracle.
 4. **Complexity:** Oracle integration adds gas costs to every rate check and introduces staleness windows.
 
 The dual-currency model is more invasive but eliminates the volatility problem at its root.
@@ -95,7 +95,7 @@ struct Channel {
 }
 ```
 
-**Channel ID derivation:** `channelId = keccak256(abi.encodePacked(client, provider, stablecoin, nonce))` where `nonce` is a per-client counter incremented on each `openChannel` call. This allows multiple channels between the same client-provider pair (e.g., one in USDC and one in USDT). The `openChannel` function returns the `channelId`.
+**Channel ID derivation:** `channelId = keccak256(abi.encodePacked(client, provider, stablecoin, nonce))` where `nonce` is a per-client counter incremented on each `openChannel` call. This allows multiple channels between the same client-node pair (e.g., one in USDC and one in USDT). The `openChannel` function returns the `channelId`.
 
 **Key difference:** USDC uses 6 decimals, not 18. All arithmetic must account for this. The contract stores the stablecoin address per channel, allowing different channels to use different stablecoins.
 
@@ -122,7 +122,7 @@ enum ChannelType {
 }
 ```
 
-Providers and clients negotiate the channel type during the `StreamRequest`/`StreamResponse` handshake. The `StreamRequest` includes the client's preferred `ChannelType`; the `StreamResponse` confirms or rejects it.
+Nodes and clients negotiate the channel type during the `StreamRequest`/`StreamResponse` handshake. The `StreamRequest` includes the client's preferred `ChannelType`; the `StreamResponse` confirms or rejects it.
 
 ### Channel Lifecycle
 
@@ -132,7 +132,7 @@ Identical flow to the native token channel, different currency:
 2. Client calls `openChannel(provider, stablecoin, deposit)`. Contract transfers stablecoin from client.
 3. Off-chain: client signs cumulative vouchers. Amounts are in stablecoin base units.
 4. Close: either party submits latest voucher. Dispute window applies (24 hours).
-5. Settlement: contract distributes stablecoin — provider gets `voucherAmount - protocolFee`, client reclaims `deposit - voucherAmount`, treasury gets `protocolFee`.
+5. Settlement: contract distributes stablecoin — node gets `voucherAmount - protocolFee`, client reclaims `deposit - voucherAmount`, treasury gets `protocolFee`.
 
 ### Decimal Handling (Rust Side)
 
@@ -165,7 +165,7 @@ Rates are quoted in USD-stable terms. This is the core benefit.
 | Delivery | 0.001 tokens/MB | $0.00001/MB (10 USDC base units) |
 | Indexer query (future) | 0.0001 tokens/query | $0.000001/query (1 USDC base unit) |
 
-**Why these numbers:** They roughly match current cloud storage/CDN economics with a markup for decentralization overhead. A provider storing 500GB and serving 2TB/month earns $50 + $20 = $70/month in stablecoin — enough to cover a budget VPS ($35-100) with a margin, regardless of TOKEN price.
+**Why these numbers:** They roughly match current cloud storage/CDN economics with a markup for decentralization overhead. A node storing 500GB and serving 2TB/month earns $50 + $20 = $70/month in stablecoin — enough to cover a budget VPS ($35-100) with a margin, regardless of TOKEN price.
 
 ### Rate Advertisement in Gossip
 
@@ -187,7 +187,7 @@ struct ContentAnnounce {
 
 Old fields remain for backward compatibility during migration. Nodes that don't understand the new fields ignore them (all fields are `Option`).
 
-**Bounds on `accepted_stablecoins`:** Maximum 5 entries. Receiving nodes silently drop messages with more than 5 entries to prevent gossip bloat from malicious providers. In practice, 2-3 stablecoins (USDC, USDT, DAI) is sufficient.
+**Bounds on `accepted_stablecoins`:** Maximum 5 entries. Receiving nodes silently drop messages with more than 5 entries to prevent gossip bloat from malicious nodes. In practice, 2-3 stablecoins (USDC, USDT, DAI) is sufficient.
 
 ### Rate Bounds (Governable)
 
@@ -200,7 +200,7 @@ Bounds are wide to accommodate market variation. Floor prevents race-to-bottom, 
 
 ### Rate Confirmation
 
-The `StreamResponse` message includes the provider's current stablecoin delivery rate. The client confirms by sending the first stablecoin-denominated voucher, or disconnects. No surprise pricing.
+The `StreamResponse` message includes the node's current stablecoin delivery rate. The client confirms by sending the first stablecoin-denominated voucher, or disconnects. No surprise pricing.
 
 ---
 
@@ -222,7 +222,7 @@ Client deposits 100 USDC into channel
   → Delivers content, signs vouchers totaling 80 USDC
   → Channel closes with final voucher of 80 USDC
   → Contract distributes:
-      77.60 USDC → provider
+      77.60 USDC → node
        2.40 USDC → treasury
       20.00 USDC → client (reclaimed)
 ```
@@ -270,16 +270,16 @@ If payments move to stablecoin, why hold TOKEN? The token must have clear, non-s
 
 | Utility | Mechanism | Why USDC Can't Substitute |
 |---------|-----------|--------------------------|
-| **1. Provider staking** | Min 1,000 TOKEN to operate as provider. No TOKEN = no network access. | Stake must correlate with network health. USDC-staked providers have no skin in the game. |
+| **1. Node staking** | Min 1,000 TOKEN to operate a node. No TOKEN = no network access. | Stake must correlate with network health. USDC-staked nodes have no skin in the game. |
 | **2. Governance** | Token-weighted voting on all protocol parameters. | Governance power must reflect network commitment, not just capital. |
-| **3. Fee discount** | Providers staking ≥10x minimum (10,000 TOKEN) get 50% protocol fee reduction: 1.5% instead of 3%. | Rewards long-term network commitment. Direct financial incentive to hold more TOKEN. |
-| **4. Client priority staking** | Clients optionally stake TOKEN (no minimum, no slashing). Providers prioritize high-stake clients during congestion. | Creates demand-side utility. Clients who hold TOKEN get better service. |
+| **3. Fee discount** | Nodes staking ≥10x minimum (10,000 TOKEN) get 50% protocol fee reduction: 1.5% instead of 3%. | Rewards long-term network commitment. Direct financial incentive to hold more TOKEN. |
+| **4. Client priority staking** | Clients optionally stake TOKEN (no minimum, no slashing). Nodes prioritize high-stake clients during congestion. | Creates demand-side utility. Clients who hold TOKEN get better service. |
 | **5. Buyback pressure** | 20% of all stablecoin fees used to buy and burn TOKEN on open market. | Direct link: more delivery = more USDC fees = more TOKEN bought and burned = supply reduction. |
-| **6. Bootstrap rewards** | Provider bootstrap fund (200M TOKEN from distribution) paid as bonuses on top of USDC payments. | Early providers earn USDC for costs + TOKEN for upside. |
+| **6. Bootstrap rewards** | Node bootstrap fund (200M TOKEN from distribution) paid as bonuses on top of USDC payments. | Early nodes earn USDC for costs + TOKEN for upside. |
 
 ### Fee Discount Details
 
-The `StablePaymentChannel` contract checks provider stake at channel close:
+The `StablePaymentChannel` contract checks node stake at channel close:
 
 ```solidity
 uint256 feePercent = baseFeePercent; // 300 = 3%
@@ -289,9 +289,9 @@ if (stakingRegistry.stakeOf(channel.provider) >= stakingRegistry.minStake() * 10
 uint256 fee = (amount * feePercent) / 10000;
 ```
 
-This is a simple threshold check, not a continuous function. A provider either qualifies (≥10x min stake) or doesn't. Keeps the contract logic straightforward and gas-efficient.
+This is a simple threshold check, not a continuous function. A node either qualifies (≥10x min stake) or doesn't. Keeps the contract logic straightforward and gas-efficient.
 
-**Economic impact:** At 3% fee, a provider earning $70/month pays $2.10 in fees. At 1.5%, they pay $1.05 — saving $1.05/month. To qualify, they must stake 10,000 TOKEN. If TOKEN is $0.01, that's $100 locked for a $12.60/year savings — a 12.6% yield on staked capital just from fee reduction. This creates real demand for TOKEN.
+**Economic impact:** At 3% fee, a node earning $70/month pays $2.10 in fees. At 1.5%, they pay $1.05 — saving $1.05/month. To qualify, they must stake 10,000 TOKEN. If TOKEN is $0.01, that's $100 locked for a $12.60/year savings — a 12.6% yield on staked capital just from fee reduction. This creates real demand for TOKEN.
 
 ### Client Priority Staking
 
@@ -299,10 +299,10 @@ A lightweight, optional mechanism:
 
 - Clients call `StakingRegistry.clientStake(amount)` to deposit TOKEN
 - No minimum, no slashing, no unbonding period — just a deposit
-- Providers check client stake via `StakingRegistry.clientStakeOf(address)`
-- **NodeId-to-address mapping:** During the iroh connection handshake, the client's `NodeId` (ed25519 public key) is known. The client signs a message binding their `NodeId` to their Ethereum address and includes it in the `StreamRequest`. The provider verifies this signature and uses the Ethereum address to look up `clientStakeOf`. This mapping is ephemeral (per-session, not stored on-chain) to minimize complexity.
-- During congestion, providers prioritize higher-staking clients in their connection queue
-- Enforcement is off-chain (provider-side logic), not on-chain — keeps it simple
+- Nodes check client stake via `StakingRegistry.clientStakeOf(address)`
+- **NodeId-to-address mapping:** During the iroh connection handshake, the client's `NodeId` (ed25519 public key) is known. The client signs a message binding their `NodeId` to their Ethereum address and includes it in the `StreamRequest`. The node verifies this signature and uses the Ethereum address to look up `clientStakeOf`. This mapping is ephemeral (per-session, not stored on-chain) to minimize complexity.
+- During congestion, nodes prioritize higher-staking clients in their connection queue
+- Enforcement is off-chain (node-side logic), not on-chain — keeps it simple
 - Clients withdraw anytime: `StakingRegistry.clientUnstake(amount)`
 
 This is a soft signal, not a hard gate. Non-staking clients still get served, just with lower priority during congestion.
@@ -313,7 +313,7 @@ The token transitions from "medium of exchange" (bad for volatile assets) to "pr
 
 | Role | Why they hold TOKEN |
 |------|-------------------|
-| Provider | Must stake to operate. More stake = fee discount. |
+| Node | Must stake to operate. More stake = fee discount. |
 | Client | Optional stake for priority access during congestion. |
 | Governance participant | Must hold to vote on protocol parameters. |
 | Market | Buyback creates continuous buy pressure proportional to usage. |
@@ -372,7 +372,7 @@ interface IStablePaymentChannel {
 
 These match the safety philosophy in the tokenomics spec. Even a compromised governance cannot set the fee to 100% or the dispute window to zero.
 
-**Rate bounds are per-stablecoin.** The contract stores `mapping(address => RateBounds)` where `RateBounds` contains floor/ceiling for storage and delivery rates in that stablecoin's base units. This solves the decimal mismatch: USDC bounds are in 6-decimal units, DAI bounds are in 18-decimal units, each set independently via `setRateBounds`. Rate bounds are enforced off-chain (providers check before advertising) and optionally on-chain (providers can register their rates for transparency).
+**Rate bounds are per-stablecoin.** The contract stores `mapping(address => RateBounds)` where `RateBounds` contains floor/ceiling for storage and delivery rates in that stablecoin's base units. This solves the decimal mismatch: USDC bounds are in 6-decimal units, DAI bounds are in 18-decimal units, each set independently via `setRateBounds`. Rate bounds are enforced off-chain (nodes check before advertising) and optionally on-chain (nodes can register their rates for transparency).
 
 ### `BuybackBurner` Interface
 
@@ -454,16 +454,16 @@ No breaking changes. Both channel types coexist.
 1. Deploy `StablePaymentChannel` and `BuybackBurner` on Arbitrum Sepolia
 2. Add `stable_*` rate fields to gossip `ContentAnnounce` messages. Old fields remain. Backward compatible — nodes that don't understand new fields ignore them.
 3. Update `incentive` crate to support both `PaymentChannel` (token) and `StablePaymentChannel` (stablecoin), selected by config
-4. Providers opt in by setting `accepted_stablecoins` in config and advertising stablecoin rates
+4. Nodes opt in by setting `accepted_stablecoins` in config and advertising stablecoin rates
 5. Clients detect stablecoin support and prefer stablecoin channels when available, fall back to token channels
 
 ### Phase 2: Stablecoin-Preferred (2-3 months)
 
 1. Deploy to production L2
-2. Default client behavior: open stablecoin channels if provider supports them, token channels otherwise
-3. Provider bootstrap fund begins distributing TOKEN bonuses on top of USDC payments
+2. Default client behavior: open stablecoin channels if node supports them, token channels otherwise
+3. Node bootstrap fund begins distributing TOKEN bonuses on top of USDC payments
 4. Governance sets stablecoin rate bounds
-5. Fee discount mechanism goes live (providers with ≥10x stake get 1.5% fee)
+5. Fee discount mechanism goes live (nodes with ≥10x stake get 1.5% fee)
 6. Monitor: track % of channels as stablecoin vs. token. **Target: >80% stablecoin within 3 months.**
 
 ### Phase 3: Token Channels Deprecated (1-2 months after Phase 2)
@@ -476,7 +476,7 @@ No breaking changes. Both channel types coexist.
 ### Rollback Plan
 
 If stablecoin channels cause unforeseen problems during Phase 1-2:
-- Providers remove stablecoin rates from gossip announcements
+- Nodes remove stablecoin rates from gossip announcements
 - Clients fall back to token channels automatically (already the fallback path)
 - `StablePaymentChannel` contract remains deployed but unused
 - No governance action needed — the migration is market-driven, not forced
@@ -487,10 +487,10 @@ If stablecoin channels cause unforeseen problems during Phase 1-2:
 
 ### What We Gain
 
-- **Provider revenue stability.** $70/month in USDC covers costs regardless of TOKEN price.
+- **Node revenue stability.** $70/month in USDC covers costs regardless of TOKEN price.
 - **Client cost predictability.** ~$0.0000375 per 3.75MB blob ($0.00001/MB), period.
 - **Simpler rate discovery.** Rates are directly comparable without mental token-price conversion.
-- **Reduced rate churn.** Providers don't adjust rates when token price moves.
+- **Reduced rate churn.** Nodes don't adjust rates when token price moves.
 - **Cleaner token model.** TOKEN becomes a capital asset (staking, governance) not a payment token.
 
 ### What We Lose or Risk
@@ -545,10 +545,10 @@ All new and modified parameters introduced by this spec:
 
 1. **TWAP oracle for buyback slippage protection?** Currently using a simple `minAudioOut` parameter set by the caller. A Uniswap V3 TWAP oracle would allow automated buybacks without human-set slippage bounds. Adds oracle dependency. **Recommendation:** Start with `minAudioOut`, add TWAP later if automated buybacks are needed.
 
-2. **Can providers refuse native token channels entirely?** Simplifies their accounting but fragments the network during migration. **Recommendation:** Yes — providers choose what they accept via `accepted_stablecoins` in their config. If `accepted_stablecoins` is non-empty, the provider supports stablecoin channels for those currencies. If empty, the provider only supports legacy token channels. A provider can support both by advertising stablecoin rates alongside legacy token rates. The protocol never forces a switch.
+2. **Can nodes refuse native token channels entirely?** Simplifies their accounting but fragments the network during migration. **Recommendation:** Yes — nodes choose what they accept via `accepted_stablecoins` in their config. If `accepted_stablecoins` is non-empty, the node supports stablecoin channels for those currencies. If empty, the node only supports legacy token channels. A node can support both by advertising stablecoin rates alongside legacy token rates. The protocol never forces a switch.
 
-3. **Client-side fee discounts?** Should clients who stake TOKEN also get reduced fees? Creates demand-side utility but complicates fee calculation (who gets the discount — client or provider?). **Recommendation:** Defer to v2. Provider-only fee discounts are simpler and create sufficient token demand.
+3. **Client-side fee discounts?** Should clients who stake TOKEN also get reduced fees? Creates demand-side utility but complicates fee calculation (who gets the discount — client or node?). **Recommendation:** Defer to v2. Node-only fee discounts are simpler and create sufficient token demand.
 
 4. **Watchtower fees in stablecoin?** Watchtowers monitor stablecoin channels, so their fees should logically be in stablecoin. **Recommendation:** Yes, but design when watchtowers are actually implemented (see Tokenomics Spec Section 8).
 
-5. **Should the bootstrap fund pay in USDC, TOKEN, or both?** The tokenomics spec allocates 200M TOKEN for provider bootstrapping. With stablecoin payments, early providers already earn USDC. The bootstrap fund could pay TOKEN bonuses (upside exposure) or USDC (guaranteed value). **Recommendation:** TOKEN bonuses. Providers get USDC for costs, TOKEN for network-aligned upside. This also creates token distribution among active participants.
+5. **Should the bootstrap fund pay in USDC, TOKEN, or both?** The tokenomics spec allocates 200M TOKEN for node bootstrapping. With stablecoin payments, early nodes already earn USDC. The bootstrap fund could pay TOKEN bonuses (upside exposure) or USDC (guaranteed value). **Recommendation:** TOKEN bonuses. Nodes get USDC for costs, TOKEN for network-aligned upside. This also creates token distribution among active participants.

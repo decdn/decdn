@@ -31,35 +31,33 @@ The system is general-purpose blob storage. Providers choose what they store (hy
 | **Voucher** | A signed off-chain payment message: `{channelId, cumulativeAmount, nonce, signature}` |
 | **Manifest** | An optional application-level hash sequence grouping related blobs |
 | **ALPN** | Application-Layer Protocol Negotiation — identifies which protocol a QUIC connection uses |
-| **Provider** | A node that stores and serves blobs, earning payment |
+| **Node** | A participant in the network; either a provider (staked, stores/serves blobs) or a client (lightweight, consumes content) |
+| **Provider** | A staked node that stores and serves blobs, earning payment |
 | **Staking** | Locking tokens in a smart contract as collateral to join the network as a provider |
 
 ## Architecture
 
-Three layers, cleanly separated:
+Two layers, cleanly separated:
 
 ```
 +---------------------------------------------+
 |  Application Layer (future)                 |
 |  Catalog, search, collections, client apps  |
 +---------------------------------------------+
-|  Incentive Layer                            |
-|  Payment channels, staking, reputation      |
-|  (EVM L2 smart contracts + off-chain sigs)  |
-+---------------------------------------------+
-|  Storage Layer                              |
+|  Storage + Incentive Layer                  |
 |  iroh endpoints, blob store, replication,   |
-|  content routing, delivery protocol         |
+|  content routing, delivery protocol,        |
+|  payment channels, staking, reputation      |
+|  (EVM L2 smart contracts + off-chain sigs)  |
 +---------------------------------------------+
 ```
 
 ### Node Types
 
-All three types are the same binary with different configurations:
+Both types are the same binary with different configurations:
 
-- **Provider node** — runs iroh endpoint + blob store, serves content, earns payment. Must stake to join.
-- **Client node** — lightweight iroh endpoint, fetches content, pays per chunk. No staking required.
-- **Uploader node** — pushes content to providers, sets replication factor, pays for initial storage.
+- **Provider node** — runs iroh endpoint + blob store, serves and stores content, earns payment. Can also upload content to other nodes. Must stake to join.
+- **Client node** — lightweight iroh endpoint, fetches content, pays per chunk. Can upload content to providers. No staking required.
 
 ### Key Design Decision
 
@@ -79,11 +77,11 @@ Applications may optionally create manifest blobs (hash sequences) to group rela
 ### Replication
 
 - Full replication with configurable factor (default 3)
-- Uploader specifies replication factor and pays for initial placement
+- The uploading node specifies replication factor and pays for initial placement
 - Provider selection is reputation-weighted (prefer online, fast, geographically diverse nodes)
 - Providers can accept or reject storage requests (hybrid permissioning)
 
-**Replication maintenance protocol:** The uploader is responsible for maintaining the replication factor. The uploader periodically polls providers (via a lightweight `Ping` on the `store/v1` ALPN) to confirm they still hold the blob. If a provider is unreachable for >30 minutes, the uploader selects a new provider (reputation-weighted) and re-uploads. For PoC, this polling interval is 5 minutes. Future: delegate monitoring to a "replication manager" role that other nodes can fill for a fee.
+**Replication maintenance protocol:** The uploading node is responsible for maintaining the replication factor. It periodically polls providers (via a lightweight `Ping` on the `store/v1` ALPN) to confirm they still hold the blob. If a provider is unreachable for >30 minutes, the uploading node selects a new provider (reputation-weighted) and re-uploads. For PoC, this polling interval is 5 minutes. Future: delegate monitoring to a "replication manager" role that other nodes can fill for a fee.
 
 ### Content Routing
 
@@ -98,8 +96,8 @@ For PoC (tens of nodes), content routing uses a **full-table gossip approach**:
 
 ### Local Store
 
-- Providers: iroh-blobs `fs-store` (persistent, backed by redb)
-- Clients: iroh-blobs `mem-store` (ephemeral, buffering only)
+- Provider nodes: iroh-blobs `fs-store` (persistent, backed by redb)
+- Client nodes: iroh-blobs `mem-store` (ephemeral, buffering only)
 
 ## Incentive Layer
 
@@ -109,7 +107,7 @@ A single ERC-20 token on Arbitrum Sepolia (testnet). Three payment flows:
 
 | Flow | Direction | Trigger |
 |------|-----------|---------|
-| Storage payment | Uploader -> Provider | Storing a blob for a duration |
+| Storage payment | Uploading node -> Provider | Storing a blob for a duration |
 | Delivery payment | Client -> Provider | Delivering content chunks |
 | Staking | Provider -> Contract | Joining the network |
 
@@ -137,7 +135,7 @@ Token supply and distribution are out of scope for PoC — use a freely mintable
 
 ### Payment Channels
 
-Off-chain **unidirectional** payment channels (client/uploader pays provider):
+Off-chain **unidirectional** payment channels (paying node pays provider):
 
 - **Opening:** Client calls `openChannel(provider, deposit)` on L2. Funds locked.
 - **Payments:** Client signs incrementing vouchers off-chain: `{channelId, amount, nonce, signature}`. No on-chain tx per chunk.
@@ -152,14 +150,14 @@ Off-chain **unidirectional** payment channels (client/uploader pays provider):
 
 ### Storage Payments
 
-- Uploader opens a channel per provider
+- Uploading node opens a channel per provider
 - Pays upfront for storage duration (e.g., 30 days)
 - Flat rate per GB per month for PoC (no auction)
 - Renewal is explicit — top up or provider garbage-collects after expiry
 
 ### Delivery Payments
 
-- Client opens channel to delivery provider
+- Client opens channel to provider
 - Pays per chunk via signed vouchers
 - Channel stays open across multiple blobs/sessions
 - Top up when low, or open a new channel
@@ -250,7 +248,7 @@ Client                          Provider
 ### Storage Protocol (`store/v1`)
 
 ```
-Uploader                        Provider
+Node (uploading)                Provider
   |                                |
   |--- StoreRequest {hash,        |
   |     duration, replication,     |
@@ -271,7 +269,7 @@ Uploader                        Provider
 - Provider can reject based on content policy, capacity, or price
 - Blob transfer uses iroh-blobs natively after acceptance
 - Provider stores expiry metadata; garbage collects after expiry unless renewed
-- `Ping` message on this ALPN for uploader to check provider liveness and blob availability
+- `Ping` message on this ALPN for the uploading node to check provider liveness and blob availability
 
 ### Serialization
 
@@ -313,7 +311,7 @@ The `node` binary uses clap for CLI:
 storage-layer-node [OPTIONS] <COMMAND>
 
 Commands:
-  provider    Run as a storage provider
+  run         Run the node (provider or client, per config)
   upload      Upload content to the network
   stream      Fetch a blob by hash
   status      Show node status, channels, and stored blobs
@@ -328,7 +326,7 @@ Config file (`config.toml`):
 
 ```toml
 [node]
-mode = "provider"           # provider | client | uploader
+mode = "provider"           # provider | client
 listen_port = 4433
 secret_key_path = "~/.storage-layer/secret.key"
 
@@ -352,7 +350,7 @@ min_stake_for_reports = 1000
 ### Network Failures
 
 - **Provider offline mid-delivery:** Client picks next-best provider from routing table (reputation-ranked), resumes from last verified byte offset using `StreamRequest.byte_offset`. Partial voucher with the failed provider is still settleable. Pre-warmed channel with fallback provider avoids on-chain latency.
-- **Provider offline while storing:** Uploader detects via periodic ping (5-min interval). After 30 minutes unreachable, uploader selects new provider and re-uploads to maintain replication factor.
+- **Provider offline while storing:** Uploading node detects via periodic ping (5-min interval). After 30 minutes unreachable, it selects a new provider and re-uploads to maintain replication factor.
 - **Client disappears mid-delivery:** Provider stops sending. Last voucher is claimable. iroh cleans up QUIC connection.
 
 ### Payment Failures
