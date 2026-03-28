@@ -104,6 +104,87 @@ Origin                    App Server              CDN Node              Client
   |                          |                       |         play       |
 ```
 
+### Offline Playback (lease-based access)
+
+The online scheme (epoch keys over a persistent connection) assumes connectivity. Offline playback requires a second access mode that trades revocation speed for availability.
+
+**Offline lease issuance:** When a client requests offline access for specific tracks, the app server issues a lease — a bundle of `K_blob` values sealed to a device-bound key:
+
+```
+Client requests offline access for tracks [hash_1, hash_2, ..., hash_n]
+
+App server:
+  1. Verify subscription is active
+  2. Verify device count is within limit (max 3-5 per account)
+  3. Verify track count is within limit (max 500 per device)
+  4. Build lease:
+
+     lease = {
+         k_blobs: {hash_1: K_1, hash_2: K_2, ...},
+         issued_at: 1743300000,
+         expires_at: 1745892000,       // 30 days
+         device_id: "device_xyz",
+         account_id: "alice"
+     }
+
+  5. Seal to device key:
+
+     sealed_lease = encrypt(device_key, lease)
+     // device_key lives in platform keystore:
+     //   iOS: Secure Enclave via Keychain
+     //   Android: Hardware-backed Keystore
+     //   Desktop: OS credential store (less secure)
+
+  6. Return sealed_lease to client
+```
+
+**Offline playback flow:**
+
+```
+Client (offline):
+  1. Unseal lease with device_key (from platform keystore)
+  2. Check: expires_at > now? If not, deny playback
+  3. Check: device_id matches this device? If not, deny playback
+  4. Look up K_blob for requested track hash
+  5. Read ciphertext from local cache (downloaded earlier via cdn/client/v1)
+  6. Decrypt XChaCha20-Poly1305(K_blob, ciphertext) -> plaintext
+  7. Play
+```
+
+**Content download:** Before going offline, the client downloads tracks through the normal CDN protocol (`cdn/client/v1`, paid per MB). The ciphertext is stored in local cache. This is identical to online streaming — the CDN protocol does not distinguish between streaming and download-for-offline.
+
+**Check-in and revocation:** When connectivity returns, the client contacts the app server to renew or revoke the lease:
+
+```
+Client reconnects:
+  App server checks subscription status:
+    Active    → renew lease (extend expires_at, update track list)
+    Canceled  → revoke lease → client deletes sealed_lease and cached ciphertext
+    Suspended → revoke lease, notify client
+```
+
+If the client never checks in, the lease expires at `expires_at` and offline playback stops. The client retains cached ciphertext but cannot decrypt it without a valid lease.
+
+**Relationship to the online scheme:** The two modes are complementary and coexist:
+
+| | Online (epoch keys) | Offline (lease) |
+| --- | --- | --- |
+| Key source | Epoch key via WebSocket + sealed envelope | Sealed lease from device keystore |
+| K_blob lifetime in client | Transient — in memory, discarded after play | Persistent — on disk, sealed to device key |
+| Revocation speed | ~5 minutes (epoch boundary) | Up to 30 days (lease TTL) |
+| Server dependency | Continuous | None until lease expires |
+| Content source | CDN nodes (streamed) | Local cache (pre-downloaded) |
+| Blast radius if compromised | K_blobs for tracks played in current epoch | K_blobs for all tracks in lease (up to 500) |
+
+The offline lease intentionally weakens two properties of the online scheme: K_blob values persist on disk rather than transiently in memory, and revocation is delayed from 5 minutes to the lease TTL. This is an accepted tradeoff — it is the same tradeoff every major streaming service makes, and there is no cryptographic solution that provides both offline playback and instant revocation.
+
+**Device key compromise (jailbroken devices):** If a device's keystore is compromised, the attacker can unseal the lease and extract all K_blob values in it. The blast radius is bounded by `max_tracks` (up to 500 tracks per device). Mitigations are operational, not cryptographic:
+
+- Device attestation (iOS App Attest, Android Play Integrity) — refuse to issue leases to compromised devices
+- Device limit per account (3-5) — bounds the total exposure per subscriber
+- Per-account audio watermarking — pirated tracks trace back to the source account
+- Behavioral detection — flag accounts that download max tracks, never stream online, and churn subscriptions
+
 ## Considered Alternatives
 
 ### Client-enforced expiry (timestamp in envelope, no epoch keys)
@@ -148,3 +229,5 @@ Rejected because it destroys global content-addressing. The same track would hav
 - A hacked client can still extract `K_blob` for tracks it plays in real-time. This is inherent to any scheme where the client produces plaintext output — equivalent to the "analog hole" in DRM systems.
 - Epoch key rotation creates a hard dependency on the persistent connection. If the WebSocket drops, the client cannot decrypt new tracks until it reconnects and receives the current epoch key. The client should cache the most recent epoch key in memory (not disk) to survive brief disconnects within the same epoch.
 - `server_secret` (the epoch key derivation root) is a critical secret. Rotation of `server_secret` invalidates all outstanding epoch keys and sealed envelopes, forcing all clients to re-request. Rotation should be infrequent and coordinated.
+- Offline leases trade revocation speed for availability: a canceled subscription may retain offline playback for up to the lease TTL (default 30 days). This is an accepted industry-standard tradeoff.
+- Offline leases persist K_blob values on disk (sealed to device key), increasing the blast radius of a device compromise from one epoch's tracks to the full lease (up to 500 tracks). Device attestation and watermarking are operational mitigations, not cryptographic guarantees.
