@@ -93,6 +93,14 @@ TOKEN is not used for payments. All nodes must stake TOKEN to participate. Staki
 
 ---
 
+### [ADR 006 — End-to-End Encryption and Key Distribution](006-e2e-encryption.md)
+
+**Envelope encryption with epoch-rotated key distribution.**
+
+Each blob is encrypted once at ingest with a random symmetric key (XChaCha20-Poly1305). The ciphertext is content-addressed and cached normally — one hash, one copy for all clients. An app server gates access: on each play request it wraps the blob key with a rotating epoch key and seals it to the client's public key. Epoch keys are pushed over an authenticated persistent connection; closing the connection revokes access within one epoch (5 minutes). CDN nodes only ever see ciphertext.
+
+---
+
 ## Key Invariants
 
 - No external origin URL exists — content enters the network through origin-backed nodes whose backends are hidden
