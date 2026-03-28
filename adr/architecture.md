@@ -7,37 +7,42 @@
 
 ## What This Is
 
-A decentralized CDN where **storage stays centralized** (S3/R2/object store) and **delivery is decentralized**. Edge nodes operated by third parties cache content close to end users, serve it over QUIC, and are paid per MB delivered. The operator of the origin pays edge nodes; edge nodes compete on latency and price.
+A decentralized CDN with three node roles:
 
-The PoC scope is tens of nodes on a testnet, proving the core delivery and payment protocol. Audio streaming is the motivating use case but the network is general-purpose blob delivery.
+- **Vault nodes** hold canonical content behind a hidden backend (S3, NFS, local disk — irrelevant to the network). They stake AUDIO to publish content and are the only entry point for content into the network. No external origin URL is ever exposed.
+- **Edge nodes** cache content and serve it close to clients. They stake AUDIO to participate in the peer mesh and compete on price and latency.
+- **Clients** consume content. They pay edge nodes (or vault nodes directly) per MB via off-chain USDC payment channels.
+
+The PoC scope is tens of nodes on a testnet, proving the core delivery and payment protocol.
 
 ---
 
 ## System Diagram
 
 ```
-                  ┌─────────────────────────┐
-                  │   Origin (S3/R2/etc.)   │
-                  │   Canonical blob store  │
-                  └────────────┬────────────┘
-                               │ pull (last resort)
-              ┌────────────────┼────────────────┐
-              ▼                ▼                ▼
-       ┌────────────┐  ┌────────────┐  ┌────────────┐
-       │  Edge Node │◄─┤  Edge Node │◄─┤  Edge Node │
-       │  (cached)  ├─►│  (cached)  ├─►│  (cached)  │
-       └──────┬─────┘  └──────┬─────┘  └──────┬─────┘
-              │  peer mesh (cdn/peer/v1, free)  │
-           pays             pays            pays
-        per-MB            per-MB          per-MB
-        (USDC)            (USDC)          (USDC)
-              │               │               │
-       ┌──────▼─────┐  ┌──────▼─────┐  ┌──────▼─────┐
-       │   Client   │  │   Client   │  │   Client   │
-       └────────────┘  └────────────┘  └────────────┘
+       ┌──────────────────────────────────────────┐
+       │  Vault Nodes  (hidden backend)           │
+       │  Staked content publishers               │
+       │  Sets price ceiling per blob             │
+       └───────────────┬──────────────────────────┘
+                       │ paid pull (cdn/client/v1)
+         ┌─────────────┼─────────────┐
+         ▼             ▼             ▼
+  ┌────────────┐ ┌────────────┐ ┌────────────┐
+  │ Edge Node  │◄┤ Edge Node  │◄┤ Edge Node  │
+  │ (cached)   ├►│ (cached)   ├►│ (cached)   │
+  └─────┬──────┘ └─────┬──────┘ └─────┬──────┘
+        │  peer mesh (cdn/peer/v1, free between edges)
+     pays           pays           pays
+   per-MB          per-MB         per-MB
+   (USDC)          (USDC)         (USDC)
+        │               │               │
+  ┌─────▼──────┐ ┌──────▼─────┐ ┌──────▼─────┐
+  │   Client   │ │   Client   │ │   Client   │
+  └────────────┘ └────────────┘ └────────────┘
 ```
 
-Clients probe candidates, pick the best node, stream over `cdn/client/v1`, and pay via off-chain USDC vouchers. Edge nodes form a peer mesh and pull from each other before touching origin. Origin is accessed as infrequently as possible.
+Clients probe candidates (edge nodes or vault nodes directly), pick the best by `rate_per_mb × rtt_ms`, stream over `cdn/client/v1`, and pay via off-chain USDC vouchers. Edge nodes pull from peers for free; on a cache miss they pay a vault node wholesale and serve subsequent clients at a markup.
 
 ---
 
@@ -47,31 +52,31 @@ Clients probe candidates, pick the best node, stream over `cdn/client/v1`, and p
 
 **Rust + iroh (0.35+).**
 
-The implementation language is Rust. The networking stack is iroh, which provides QUIC transport, NAT traversal, content-addressed blob transfer, and gossip as a cohesive unit. A single statically linked binary runs as edge node or client depending on configuration.
+The implementation language is Rust. The networking stack is iroh, which provides QUIC transport, NAT traversal, content-addressed blob transfer, and gossip as a cohesive unit. A single statically linked binary runs as vault node, edge node, or client depending on configuration.
 
 ---
 
 ### [ADR 001 — Network Topology and Peer Mesh](001-network.md)
 
-**Flat peer mesh. Gossip for cache announcements. DHT for content lookup.**
+**Flat peer mesh. Gossip for content availability. DHT for lookup. Vault nodes replace external origin.**
 
-Edge nodes form a flat mesh with no routing hierarchy. Cache state is broadcast over iroh-gossip on regional topics. DHT lookup serves as fallback when the local routing table has no match. On a cache miss, nodes resolve via peer pull before falling back to origin. Edge-to-edge transfers are unpaid — the incentive is lower origin egress cost for everyone.
+All staked nodes (vault and edge) form a flat mesh. Cache state is broadcast over iroh-gossip on regional topics. On a cache miss, edge nodes pull from peers for free, then from a vault node (paid). No external URL is ever accessed — the network is fully self-contained.
 
 ---
 
 ### [ADR 002 — Content Addressing](002-content-addressing.md)
 
-**BLAKE3 content-addressed blobs. Manifest as canonical track identifier.**
+**BLAKE3 content-addressed blobs. Vault node backends are opaque to the network.**
 
-Every blob is identified by its BLAKE3 hash. Clients verify received bytes against the known hash — an edge node cannot serve corrupted data without immediate detection. This makes the hash both the content identifier and the delivery proof, eliminating the need for a separate proof-of-delivery oracle.
+Every blob is identified by its BLAKE3 hash. Clients verify received bytes against the known hash. The hash→backend mapping is internal to each vault node and never shared — no node in the network can learn or bypass the vault's backing storage.
 
 ---
 
 ### [ADR 003 — Payment Model](003-payments.md)
 
-**Off-chain USDC payment channels. Voucher per MB delivered.**
+**Off-chain USDC payment channels at two tiers. Market-driven rates.**
 
-Clients open a USDC payment channel with an edge node via the `StablePaymentChannel` contract. As bytes are delivered, the client signs cumulative off-chain vouchers. The edge node submits the final voucher on-chain to close the channel. USDC denomination gives edge node operators predictable unit economics independent of native token price.
+Clients pay edge nodes per MB. Edge nodes pay vault nodes per MB for initial content pulls, then amortise that cost across many client deliveries. Vault nodes set the effective price ceiling. Rates are fully market-driven within governance-set bounds.
 
 ---
 
@@ -79,30 +84,31 @@ Clients open a USDC payment channel with an edge node via the `StablePaymentChan
 
 **USDC for payments. AUDIO for staking, governance, and fee discounts.**
 
-The native token (AUDIO) is not used for delivery payments. It is used for: staking (required to operate an edge node), governance (parameter votes), fee discounts (≥10× minimum stake → 1.5% fee instead of 3%), and a buyback-and-burn sink funded by 20% of protocol fees. Fixed supply of 1B AUDIO at genesis.
+AUDIO is not used for payments. Both vault nodes (to publish content) and edge nodes (to serve content) must stake AUDIO. Staking cost creates accountability and Sybil resistance. 20% of protocol fees buy back and burn AUDIO. Fixed supply of 1B at genesis.
 
 ---
 
 ### [ADR 005 — Wire Protocol](005-protocol.md)
 
-**Four ALPN-identified protocols over iroh QUIC connections.**
+**Four ALPN-identified protocols. `cdn/client/v1` covers all paid delivery tiers.**
 
 | ALPN | Purpose |
-|------|---------|
+| --- | --- |
 | `cdn/probe/v1` | Parallel latency + availability check before node selection |
-| `cdn/client/v1` | Blob delivery with USDC payment vouchers |
-| `cdn/peer/v1` | Unpaid peer blob pull between staked edge nodes |
-| iroh-gossip built-in | Cache announcements and node discovery |
+| `cdn/client/v1` | Paid delivery: client→edge, edge→vault, client→vault |
+| `cdn/peer/v1` | Unpaid pull between staked edge nodes only |
+| iroh-gossip built-in | Content availability and node discovery |
 
-Clients probe candidates in parallel (200ms window), score by `rate_per_mb × rtt_ms`, then stream from the winner. All messages serialized with postcard.
+`redirect` in `StreamResponse` always points to a NodeId, never an external URL. The vault's backend is never revealed.
 
 ---
 
 ## Key Invariants
 
+- No external origin URL exists — all content enters the network through staked vault nodes
+- A node cannot deliver paid content without being reachable via iroh NodeId; the backend is always hidden
 - An edge node cannot earn without delivering verifiable bytes — BLAKE3 hash mismatch voids payment
 - A node cannot join the peer mesh without staking — prevents free-riders and provides a slashable bond
-- Origin is the source of truth; edge caches are opportunistic and evictable
 - Payment channels amortize on-chain costs across an entire session; per-MB payments are off-chain
 - Safety bounds on all governable parameters are hardcoded — governance cannot set fees to 100% or stake to zero
 
@@ -111,6 +117,7 @@ Clients probe candidates in parallel (200ms window), score by `rate_per_mb × rt
 ## What Is Not Decided Yet
 
 - Production L2 choice (Arbitrum One, Base, or other) — gated on PoC validation
-- Content catalog decentralization — currently a centralized operator API; DHT is a future option
-- Watchtower design for offline client protection during channel disputes
-- Parallel streaming from multiple edge nodes for a single blob (protocol supports it, not prioritized)
+- Vault node minimum stake vs edge node minimum stake — same amount currently, may diverge
+- Watchtower design for offline node protection during channel disputes
+- Parallel streaming from multiple nodes for a single blob (protocol supports it, not prioritised)
+- Whether vault nodes can charge edge nodes differently from clients (wholesale vs retail rates)

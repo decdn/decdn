@@ -5,13 +5,13 @@
 
 ## Context
 
-We are building a decentralized CDN where storage remains centralized (S3/R2/object store) and delivery is handled by incentivized edge nodes that cache and serve content to clients and each other. The network requires:
+We are building a decentralized CDN with three node roles: **vault nodes** that hold canonical content behind a hidden backend and seed it into the network, **edge nodes** that cache and deliver content close to clients, and **clients** that consume content. The network requires:
 
-- High-throughput, low-latency blob transfer between edge nodes and to clients over peer-to-peer connections
-- Concurrent handling of many inbound connections per edge node
+- High-throughput, low-latency blob transfer between all node types over peer-to-peer connections
+- Concurrent handling of many inbound connections per node
 - Safe memory management without a garbage collector introducing latency spikes under load
 - A QUIC-based transport with content-addressed verified transfer
-- A single binary deployable as an edge node or client depending on configuration
+- A single binary deployable as a vault node, edge node, or client depending on configuration
 
 ## Decision
 
@@ -20,7 +20,7 @@ Use **Rust** as the implementation language and **iroh** (0.35+) as the core net
 Specifically:
 - `iroh::Endpoint` for QUIC-based peer-to-peer connectivity and ALPN protocol negotiation
 - `iroh-blobs` with `fs-store` backend for content-addressed blob storage and verified transfer
-- `iroh-gossip` for topic-based epidemic broadcast (edge node discovery, cache availability announcements)
+- `iroh-gossip` for topic-based epidemic broadcast (node discovery, cache and content availability announcements)
 
 ## Consequences
 
@@ -30,7 +30,7 @@ Specifically:
 - Rust's async runtime (tokio) handles thousands of concurrent connections per edge node efficiently
 - iroh bundles QUIC, NAT traversal, content-addressed transfer, and verified streaming — fewer moving parts than assembling these from separate libraries
 - BLAKE3 is native to iroh's content model; blob IDs and transport layer use the same hash with no translation layer
-- A single statically linked binary simplifies edge node deployment with no runtime dependency management
+- A single statically linked binary simplifies deployment of all node types with no runtime dependency management
 
 **Negative:**
 

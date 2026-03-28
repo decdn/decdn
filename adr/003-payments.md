@@ -5,37 +5,42 @@
 
 ## Context
 
-Edge nodes deliver bytes to clients and need to be paid for it. The payment mechanism must work at per-MB granularity without an on-chain transaction per delivery, and must give edge nodes immediate protection against non-payment.
+Vault nodes and edge nodes deliver bytes and need to be paid for it. The payment mechanism must work at per-MB granularity without an on-chain transaction per delivery, and must give delivering nodes immediate protection against non-payment.
 
 Three constraints shape the design:
 
 1. On-chain transactions on an L2 cost ~$0.05–0.10 each — acceptable per channel lifecycle, not per MB delivered.
 2. A typical delivery session transfers a few MB. The payment per MB at market rates is on the order of $0.00001 — far below any on-chain transaction cost.
-3. Edge nodes are operators with real infrastructure costs (VPS, bandwidth). Revenue denominated in a volatile native token creates unacceptable P&L risk: a 10× price drop turns a profitable node into a loss.
+3. Node operators have real infrastructure costs (VPS, bandwidth, backend storage). Revenue denominated in a volatile native token creates unacceptable P&L risk: a 10× price drop turns a profitable operator into a loss.
 
 ## Decision
 
 Payments use **unidirectional off-chain payment channels settled on an EVM L2, denominated in USDC**.
 
-A client opens a channel by depositing USDC into the `StablePaymentChannel` contract. As the edge node delivers content, the client signs cumulative vouchers off-chain — one voucher per MB received. The edge node holds the latest voucher and submits it on-chain to close the channel and claim the accumulated payment. A 24-hour dispute window allows either party to counter a stale or fraudulent close attempt.
+The same channel mechanism operates at two tiers:
+
+- **Client → edge node**: a client opens a USDC channel with an edge node, signs cumulative vouchers as MB are delivered, and the edge node closes the channel on-chain to claim payment.
+- **Edge node → vault node**: when an edge node pulls content from a vault node for the first time, it pays the vault node via the same channel mechanism. The vault node is paid wholesale; the edge node recoups this by serving multiple clients from its cache at a markup.
+
+A channel is opened by depositing USDC into the `StablePaymentChannel` contract. As content is delivered, the payer signs cumulative vouchers off-chain — one voucher per MB received. The delivering node holds the latest voucher and submits it on-chain to close the channel. A 24-hour dispute window allows either party to counter a stale or fraudulent close attempt.
 
 Key parameters:
 
 - Voucher cadence: 1 MB delivered per voucher
 - Minimum deposit: 1 USDC (covers ~100,000 MB at floor rate, far more than any practical session)
 - Protocol fee: 3% deducted at channel close, sent to treasury
-- Fee discount: providers staking ≥10× the minimum AUDIO stake pay 1.5% instead of 3%
+- Fee discount: nodes staking ≥10× the minimum AUDIO stake pay 1.5% instead of 3%
 
 The native token (AUDIO) is not used for delivery payments. It is reserved for staking, governance, and fee discount qualification (see ADR 004).
 
-**Rate setting is entirely up to each edge node.** Nodes advertise their `rate_per_mb` in probe responses and stream responses; clients see the rate before committing a voucher. There is no protocol-enforced rate beyond a governance-set floor and ceiling. This creates a market with natural arbitrage dynamics:
+**Rate setting is entirely up to each node.** Vault nodes and edge nodes advertise their `rate_per_mb` in probe responses and stream responses; the requester sees the rate before committing a voucher. There is no protocol-enforced rate beyond a governance-set floor and ceiling. This creates a two-tier market with natural arbitrage dynamics:
 
-- The origin gateway, as the node that always has the content and bears S3 egress cost, will set a higher rate — it is effectively the price ceiling for any given blob.
-- An edge node that pulls from origin and caches the blob can undercut the origin rate, since its marginal cost of serving subsequent requests is just bandwidth.
-- An edge node in a region where no peer has the content yet can charge a premium for that first delivery. Once it has cached the blob, other nearby nodes can pull from it (via `cdn/peer/v1`, free) and then compete for local clients at lower rates.
+- Vault nodes set a higher rate because they bear backend costs (storage + egress from their hidden backing store). They are the effective price ceiling for any blob they hold.
+- An edge node that pays a vault node to pull a blob can then serve that blob to many clients at a markup, recouping the vault cost across multiple deliveries.
+- An edge node in a region where no peer has the content yet can charge a premium for that first delivery. Once it has the blob, other nearby edges pull from it for free (via `cdn/peer/v1`) and compete for local clients at lower rates.
 - Nodes with cheaper bandwidth or better hardware can sustainably undercut others; nodes in high-demand regions can charge more and still win on latency.
 
-This means the network self-balances: popular content in a region gets replicated because serving it is profitable, and competition among edge nodes in that region drives prices down. Unpopular content stays at origin rates until demand justifies caching it. No central coordinator needs to decide where to replicate what.
+This means the network self-balances: popular content gets replicated because caching it is profitable, competition drives prices down in well-served regions, and unpopular content stays at vault node rates until demand justifies caching it. No central coordinator decides where to replicate what.
 
 ## Consequences
 
@@ -162,11 +167,11 @@ Not a real attack. The contract always settles the highest valid voucher, and on
 **Eclipse attack**
 Attacker surrounds a client with malicious nodes so all probe responses come from nodes under attacker control.
 
-BLAKE3 verification prevents corrupted data from being accepted regardless of who serves it. The remaining gap is a denial-of-service variant: an attacker who controls all of a client's known nodes can simply refuse to serve, forcing the client to discover honest nodes it cannot currently reach. Options:
+BLAKE3 verification catches data corruption regardless of which nodes are in the routing table. The remaining gap is a denial-of-service variant: an attacker controlling all of a client's known nodes can simply refuse to serve. Options:
 
-- **Option A — Origin gateway as unconditional fallback.** Clients always maintain a direct connection to the origin gateway, discovered independently of peer gossip. An eclipse cannot block origin access without also blocking internet access to the origin URL. This is already in the design but should be treated as a hard invariant, not a soft fallback.
+- **Option A — Vault nodes as typed fallback.** The staking registry exposes node roles. Clients can specifically query for vault nodes for a given blob, bypassing the general routing table. An eclipse must also control all vault nodes for the target content — which requires capital proportional to the number of vault nodes staked for that content.
 - **Option B — Multi-source bootstrap.** Clients discover initial peers from at least two independent sources (on-chain registry + a hardcoded DNS seed list). An attacker must compromise both to fully eclipse a client.
-- **Option C — Minimum honest-peer diversity.** Clients maintain connections to at least N nodes discovered via different paths (gossip, DHT, direct registry query). All N would need to be attacker-controlled for a full eclipse.
+- **Option C — Minimum honest-peer diversity.** Clients maintain connections to at least N nodes discovered via different paths. All N would need to be attacker-controlled for a full eclipse.
 
 ---
 
@@ -191,7 +196,18 @@ The core weakness is token-price dependency: at $0.001/AUDIO, a minimum stake of
 **Rate manipulation cartel**
 Colluding edge nodes in a region hold rates artificially high.
 
-Well-mitigated by the origin gateway ceiling and permissionless entry. The game theory strongly favours defection from a cartel. No meaningful alternative needed.
+Vault nodes set the effective price ceiling for any blob. Clients can always probe vault nodes directly and pay vault rates as a guaranteed fallback. Any edge node outside the cartel that undercuts wins all local traffic — the incentive to defect is strong. New entrants can join permissionlessly by staking.
+
+---
+
+**Vault node content withholding**
+A vault node stakes, announces content it holds, but refuses to serve it — collecting credibility in the routing tables without actually participating.
+
+This attack has no equivalent in a model with a public origin URL. Options:
+
+- **Option A — Slash for announced-but-unserved content.** If a vault node's `CacheAnnounce` claims a hash but consistently returns `NotCached` or times out on direct requests, clients can submit on-chain evidence. Requires a challenge mechanism similar to the corrupted delivery slash path.
+- **Option B — Multiple vault nodes per blob.** Content owners register more than one vault node for important content. A single withholding node becomes irrelevant if others serve the same blob. Staking cost is a natural limit on how many vault nodes an attacker can control across all content.
+- **Option C — Reputation fast-path for vault nodes.** Vault nodes that fail to serve announced content accumulate reputation penalties at a steeper rate than edge nodes, since their role is canonical availability, not best-effort caching.
 
 ---
 

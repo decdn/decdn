@@ -7,28 +7,34 @@
 
 The network needs an economic mechanism that:
 
-1. Incentivizes edge nodes to join and behave honestly (staking with slashing)
+1. Incentivizes vault nodes and edge nodes to join and behave honestly (staking with slashing)
 2. Gives token holders a voice in protocol parameters (governance)
-3. Pays edge nodes reliably without exposing them to asset volatility (see ADR 003)
+3. Pays node operators reliably without exposing them to asset volatility (see ADR 003)
 4. Creates sustainable token demand as the network grows
 
-A single-token model where edge nodes are paid in the native token fails constraint 3: a provider's infrastructure costs are USD-denominated, so a volatile payment token makes their P&L unpredictable. Reactive rate adjustment is insufficient — gossip propagates rate changes slowly, mid-session rate changes are impossible, and rate churn degrades user experience.
+A single-token model where nodes are paid in the native token fails constraint 3: operator infrastructure costs are USD-denominated, so a volatile payment token makes P&L unpredictable. Reactive rate adjustment is insufficient — gossip propagates rate changes slowly, mid-session rate changes are impossible, and rate churn degrades user experience.
 
 ## Decision
 
 Use a **dual-currency model**: USDC for operational payments, AUDIO (native ERC-20) for network-specific economic functions where aligned incentives matter.
 
 | Function | Currency | Rationale |
-|----------|----------|-----------|
+| --- | --- | --- |
 | Delivery payments | USDC | Predictable unit economics for operators |
-| Provider staking | AUDIO | Stake must appreciate with network health |
+| Vault node staking | AUDIO | Stake to publish content; aligns vault operators with network health |
+| Edge node staking | AUDIO | Stake to serve content in the peer mesh |
 | Governance voting | AUDIO | Power reflects network commitment, not purchasing power |
 | Fee discounts | AUDIO | Direct financial incentive to hold more AUDIO |
 | Slashing | AUDIO | Already denominated in stake |
 
 **Token supply:** 1B AUDIO, fixed at genesis, no post-genesis minting. Deflationary pressure comes from two sources: 100% of slashed stake is burned; 20% of protocol fees (collected in USDC) are used to buy AUDIO on the open market and burn it.
 
-**Staking:** Edge nodes must stake a minimum of 1,000 AUDIO to register on the network. Stake is slashable only for serving data that fails BLAKE3 hash verification (provable, objective offense). Going offline or having a cache miss is not slashable — these are handled by reputation and client fallback logic. Unbonding period is 7 days; stake remains slashable during unbonding to prevent slash-then-run.
+**Staking — two roles:**
+
+- **Vault nodes** stake to gain the right to publish content into the network. A vault node that has not staked cannot register blobs in the on-chain registry and will not appear in gossip routing tables. Stake is slashable for announcing content it cannot actually serve (withholding) and for serving corrupted bytes.
+- **Edge nodes** stake to participate in the peer mesh and receive unpaid peer pulls from other edge nodes. Stake is slashable only for serving data that fails BLAKE3 hash verification. Going offline or having a cache miss is not slashable.
+
+Both roles share the same minimum stake of 1,000 AUDIO and the same 7-day unbonding period. Stake remains slashable during unbonding to prevent slash-then-run.
 
 **Fee discount:** Providers staking ≥10× the minimum (10,000 AUDIO) pay a 1.5% protocol fee instead of 3%. This creates a direct financial return on holding more AUDIO and rewards long-term network commitment.
 
@@ -45,8 +51,8 @@ Use a **dual-currency model**: USDC for operational payments, AUDIO (native ERC-
 
 **Negative:**
 
-- Bootstrapping requires token demand before organic streaming revenue is sufficient; a 200M AUDIO provider bootstrap fund is allocated for this but its adequacy is unproven
-- Two-token UX: edge node operators need both USDC (to fund client payment channels) and AUDIO (to stake). Client software should abstract this with integrated DEX swaps but adds complexity
+- Bootstrapping requires token demand before organic revenue is sufficient; a 200M AUDIO bootstrap fund is allocated for this but its adequacy is unproven
+- Two-token UX: all node operators need both USDC (for payment channels) and AUDIO (to stake). Client software should abstract this with integrated DEX swaps but adds complexity
 - The AUDIO/USDC Uniswap pool may be thin at launch, making buyback execution sensitive to pool depth; `maxBuybackAmount` and `minAudioOut` parameters mitigate sandwich risk but require active governance attention
 - Token-weighted governance is vulnerable to large-holder capture; safety bounds limit damage but cannot prevent rent-seeking within allowed parameter ranges (e.g., setting protocol fee to the 20% maximum)
 - Regulatory risk: a token with staking, governance, and economic utility may be classified as a security in some jurisdictions. Legal review is required before production token distribution.
