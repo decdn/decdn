@@ -31,10 +31,13 @@ Requester                       Candidate node
   |     timestamp_us} ------------>|
   |                                |
   |<-- ProbeResponse {has_blob,   |
-  |     rate_per_mb, timestamp_us} |
+  |     rate_per_mb, timestamp_us, |
+  |     signature} ----------------|
 ```
 
 `timestamp_us` is a requester-generated microsecond timestamp echoed back. RTT is `receive_time - timestamp_us`. `has_blob` confirms the node has the content. `rate_per_mb` lets the requester score candidates on both latency and price in a single round-trip.
+
+`signature` is the candidate node's iroh private key signature over `{hash, has_blob, rate_per_mb, timestamp_us}`. This makes the probe response cryptographically attributable and enables two slashing mechanisms: (1) **phantom announcement slashing** — if `has_blob: true` but the node subsequently fails to deliver, the signed probe response is evidence; (2) **rate manipulation slashing** — if the probe response rate differs from the subsequent `StreamResponse` rate within 30 seconds, both signed messages constitute evidence of bait-and-switch. See ADR 004 for slashing details.
 
 The requester probes candidates from the routing table in parallel, waits up to 200ms, then selects the winner using a composite score: `rate_per_mb × rtt_ms` (lower is better). This applies to clients picking edge nodes, clients picking vault nodes directly, and edge nodes picking vault nodes for a cache miss pull.
 
@@ -50,6 +53,7 @@ Payer                           Delivering node
   |                                |
   |<-- StreamResponse {ok,        |
   |     rate_per_mb, total_bytes,  |
+  |     timestamp_us, signature,   |
   |     redirect?} ---------------|
   |                                |
   |  +--- chunk loop -----------+ |
@@ -62,7 +66,7 @@ Payer                           Delivering node
   |--- StreamEnd ----------------->|
 ```
 
-The delivering node advertises its `rate_per_mb` in `StreamResponse`. The payer accepts by sending the first voucher or disconnects and tries another node. No surprise pricing. The `redirect` field in `StreamResponse` is used when a node cannot serve — it contains the NodeId of another node that can (a vault node or a better-positioned edge node), never an external URL. The network is fully opaque.
+The delivering node advertises its `rate_per_mb` in `StreamResponse`. The payer accepts by sending the first voucher or disconnects and tries another node. No surprise pricing. `timestamp_us` and `signature` (node's iroh key signs `{hash, rate_per_mb, channel_id, timestamp_us}`) make the rate commitment cryptographically binding — a rate mismatch between a signed `ProbeResponse` and a signed `StreamResponse` within 30 seconds is slashable evidence of rate manipulation. The `redirect` field in `StreamResponse` is used when a node cannot serve — it contains the NodeId of another node that can (a vault node or a better-positioned edge node), never an external URL. The network is fully opaque.
 
 `byte_offset` supports seek and resume: on failover, the requester reconnects to a different node and resumes from the last BLAKE3-verified byte.
 

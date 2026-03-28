@@ -29,9 +29,9 @@ Key parameters:
 - Voucher cadence: 1 MB delivered per voucher
 - Minimum deposit: 1 USDC (covers ~100,000 MB at floor rate, far more than any practical session)
 - Protocol fee: 3% deducted at channel close, sent to treasury
-- Fee discount: nodes staking ≥10× the minimum AUDIO stake pay 1.5% instead of 3%
+- Fee discount: nodes staking ≥10× the minimum TOKEN stake pay 1.5% instead of 3%
 
-The native token (AUDIO) is not used for delivery payments. It is reserved for staking, governance, and fee discount qualification (see ADR 004).
+The native token (TOKEN) is not used for delivery payments. It is reserved for staking, governance, and fee discount qualification (see ADR 004).
 
 **Rate setting is entirely up to each node.** Vault nodes and edge nodes advertise their `rate_per_mb` in probe responses and stream responses; the requester sees the rate before committing a voucher. There is no protocol-enforced rate beyond a governance-set floor and ceiling. This creates a two-tier market with natural arbitrage dynamics:
 
@@ -47,7 +47,7 @@ This means the network self-balances: popular content gets replicated because ca
 **Positive:**
 
 - On-chain costs are amortized across an entire channel lifetime — open + close = two transactions regardless of how many MB are delivered
-- USDC denomination gives edge node operators predictable unit economics: delivery revenue covers infrastructure costs without exposure to AUDIO price movements
+- USDC denomination gives edge node operators predictable unit economics: delivery revenue covers infrastructure costs without exposure to TOKEN price movements
 - The voucher is the payment receipt; the BLAKE3 hash is the delivery receipt. Together they provide mutual protection: the client doesn't sign a voucher for bytes that fail hash verification; the edge node stops delivering if vouchers stop arriving
 - Maximum risk per voucher interval (1 MB) at $0.00001/MB is $0.00001 — negligible
 - Market-driven rate setting means replication happens organically: profitable content gets cached by more nodes, driving prices down without any coordination protocol
@@ -57,7 +57,7 @@ This means the network self-balances: popular content gets replicated because ca
 
 - Clients must hold USDC to use the network; this adds an onboarding step compared to a single-token model
 - Rate volatility: a node can change its advertised rate between a probe and a stream request; the `StreamResponse` rate is the binding one, but a client that probed at one rate and receives a higher rate in `StreamResponse` must disconnect and re-probe rather than having been deceived silently
-- Two payment contracts coexist during migration (legacy `PaymentChannel` for AUDIO, `StablePaymentChannel` for USDC), doubling audit surface temporarily
+- Two payment contracts coexist during migration (legacy `PaymentChannel` for TOKEN, `StablePaymentChannel` for USDC), doubling audit surface temporarily
 - USDC is issued by Circle, which can freeze specific addresses or blacklist the contract. This is mitigated by a governance-maintained allowlist that can add DAI or other stablecoins, but the risk is not eliminated
 - BLAKE3 verification on EVM requires an intermediate Merkle proof scheme for PoC-era slash evidence; a client submitting a slash claim cannot directly prove BLAKE3 mismatch on-chain
 
@@ -136,22 +136,14 @@ BLAKE3 verification catches this immediately at the client. The remaining gap is
 **Rate bait-and-switch**
 Edge node advertises a low rate in probe responses then returns a higher rate in `StreamResponse`.
 
-Disconnecting works per-incident. The gap is that reputation is local and slow — a new node can bait-and-switch many clients before its reputation degrades enough to matter, and there is no global signal. Options:
-
-- **Option A — Signed, timestamped rate advertisement.** Nodes sign their advertised rate with their iroh private key and a timestamp. If the `StreamResponse` rate differs from the last signed probe rate, the discrepancy is cryptographically provable and can be reported on gossip as evidence, degrading the node's network-wide reputation immediately rather than only locally.
-- **Option B — Short local blacklist.** On a bait-and-switch, the client blacklists the offending node for a cooldown period (e.g., 1 hour). Simple, no coordination required, limits repeated abuse from the same node against the same client.
-- **Option C — On-chain rate registration.** Nodes publish their rate on-chain. Changes require a transaction, introducing gas cost and finality delay as a natural brake on rapid rate manipulation. Heavy-weight but auditable.
+**Resolved: slashable offense.** Both `ProbeResponse` and `StreamResponse` now include cryptographic signatures over the advertised rate (see ADR 005). If a client receives a signed `ProbeResponse` with rate X and a signed `StreamResponse` with rate Y > X from the same node within 30 seconds, the two signed messages constitute on-chain-verifiable evidence of rate manipulation. The edge node is slashed per the escalating schedule in ADR 004. The 30-second window allows legitimate rate changes between sessions while catching same-session bait-and-switch.
 
 ---
 
 **Phantom blob announcement**
 Edge node announces a blob as cached then fails or redirects on actual request.
 
-Reputation is too slow here — a newly staked node can announce thousands of phantom blobs before penalties accumulate. The 200ms timeout bounds per-incident cost but the aggregate across many probe targets adds up. Options:
-
-- **Option A — Proof-of-possession challenge.** During the probe exchange, the client requests a hash of a small random byte range within the blob (e.g., bytes 4096–8192). The node must return the correct value or `has_blob` is treated as false. This proves the node actually has the blob with one extra hash computation, at negligible cost for honest nodes.
-- **Option B — Stake-weighted announcement trust.** Clients weight `has_blob` claims by the node's stake. A new node with minimum stake gets lower trust for its cache claims; clients probe but don't rely on it without a possession challenge. Higher-staked nodes get more trust implicitly.
-- **Option C — Reputation fast-path for phantom detection.** Track `has_blob: true` claims that result in a redirect or `NotCached` response separately from other reputation signals, with a steeper penalty weight. A node that lies about cache hits is penalised faster than one that is simply slow.
+**Resolved: slashable offense.** The `ProbeResponse` now includes a cryptographic signature over `{hash, has_blob, rate_per_mb, timestamp_us}` (see ADR 005). If an edge node signs `has_blob: true` but subsequently responds with `NotCached` or fails to deliver within 30 seconds, the signed probe response plus the delivery failure constitute on-chain-verifiable evidence. The edge node is slashed per the escalating schedule in ADR 004. The 30-second validity window accounts for the possibility that a blob is legitimately evicted between probe and request — 30 seconds is short enough to make eviction implausible but long enough for normal protocol flow. The challenged edge has a 24-hour window to counter by proving it delivered the blob (signed delivery receipt from the same requester within the relevant time window).
 
 ---
 
@@ -185,7 +177,7 @@ Registry check + per-sender rate limiting is solid. The minor gap is that the lo
 **Sybil edge nodes**
 Attacker stakes many cheap nodes to dominate probe responses for popular content, controlling pricing in a region.
 
-The core weakness is token-price dependency: at $0.001/AUDIO, a minimum stake of 1,000 AUDIO costs $1 per sybil node. The `rate_per_mb × rtt_ms` selection score helps — a sybil fleet must be real hardware in the right geography and competitively priced — but does not eliminate the risk when the token is cheap. Options:
+The core weakness is token-price dependency: at $0.001/TOKEN, a minimum stake of 1,000 TOKEN costs $1 per sybil node. The `rate_per_mb × rtt_ms` selection score helps — a sybil fleet must be real hardware in the right geography and competitively priced — but does not eliminate the risk when the token is cheap. Options:
 
 - **Option A — Governance raises minimum stake if token price falls.** The minimum stake is governable. Token holders are incentivised to raise it to protect the network, since a sybil-dominated network reduces usage and token value. Reactive but aligned.
 - **Option B — Minimum stake denominated in USD equivalent via oracle.** Requires a price oracle, which was rejected in ADR 004 for payment rate bounds. The same concerns (oracle downtime, manipulation) apply here, but the impact of oracle failure is lower (new stakers temporarily blocked, not payments broken).
@@ -203,11 +195,10 @@ Vault nodes set the effective price ceiling for any blob. Clients can always pro
 **Vault node content withholding**
 A vault node stakes, announces content it holds, but refuses to serve it — collecting credibility in the routing tables without actually participating.
 
-This attack has no equivalent in a model with a public origin URL. Options:
+This attack has no equivalent in a model with a public origin URL. **Withholding is not a slashable offense for vault nodes** — vault operators may legitimately take content offline for maintenance, migration, or business reasons, and slashing for availability creates perverse incentives (operators become afraid to perform necessary operations). Instead, withholding is handled through reputation and redundancy:
 
-- **Option A — Slash for announced-but-unserved content.** If a vault node's `CacheAnnounce` claims a hash but consistently returns `NotCached` or times out on direct requests, clients can submit on-chain evidence. Requires a challenge mechanism similar to the corrupted delivery slash path.
-- **Option B — Multiple vault nodes per blob.** Content owners register more than one vault node for important content. A single withholding node becomes irrelevant if others serve the same blob. Staking cost is a natural limit on how many vault nodes an attacker can control across all content.
-- **Option C — Reputation fast-path for vault nodes.** Vault nodes that fail to serve announced content accumulate reputation penalties at a steeper rate than edge nodes, since their role is canonical availability, not best-effort caching.
+- **Multiple vault nodes per blob.** Content owners register more than one vault node for important content. A single withholding node becomes irrelevant if others serve the same blob. Staking cost is a natural limit on how many vault nodes an attacker can control across all content.
+- **Reputation fast-path for vault nodes.** Vault nodes that fail to serve announced content accumulate reputation penalties at a steeper rate than edge nodes, since their role is canonical availability, not best-effort caching. A vault node with consistently poor availability is deprioritized in routing and loses delivery revenue.
 
 ---
 

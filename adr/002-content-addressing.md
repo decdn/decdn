@@ -9,7 +9,9 @@ Vault nodes hold canonical content and seed it into the network. Edge nodes cach
 
 ## Decision
 
-All blobs are content-addressed by their BLAKE3 hash. The hash is computed once when content is uploaded to a vault node and stored in a manifest. The manifest hash is the canonical identifier clients use to request content.
+All blobs are content-addressed by their BLAKE3 hash. The hash is computed once when content is uploaded to a vault node and serves as the canonical identifier clients use to request content.
+
+The protocol is content-agnostic. It stores and delivers arbitrary blobs with no assumptions about format, structure, or metadata. Applications may define their own metadata or manifest layers on top (e.g., linking multiple blobs, adding descriptive fields), but these are opaque to the delivery network — the protocol sees only hashes and bytes.
 
 Blob identity is intrinsic to the content: the same bytes always produce the same hash, regardless of which node holds them. Clients verify every received blob against its known hash — no node can serve corrupted data without immediate detection.
 
@@ -30,5 +32,5 @@ BLAKE3 is iroh's native hash function, so there is no translation layer between 
 **Negative:**
 
 - BLAKE3 is not a native EVM precompile, so on-chain verification requires an intermediate scheme (Merkle proof over chunks using keccak256) for the PoC. Full BLAKE3 verification on-chain is deferred to a later version.
-- Content is immutable: updating a blob produces a new hash and a new identity. Manifest indirection handles metadata updates, but clients must re-fetch the manifest to discover a new hash.
+- Content is immutable: updating a blob produces a new hash and a new identity. Applications that need mutable references (e.g., "latest version of X") must manage their own indirection layer above the protocol.
 - If a vault node loses its backing data (disk failure, misconfiguration), the content is gone from the network unless another vault node holds the same blob. Vault node operators are responsible for their own backend durability.

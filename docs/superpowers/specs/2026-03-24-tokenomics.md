@@ -1,4 +1,4 @@
-# Tokenomics: Decentralized Audio Storage & Delivery Network
+# Tokenomics: Decentralized Content Delivery Network
 
 **Date:** 2026-03-24
 **Status:** Draft
@@ -7,7 +7,7 @@
 
 ## Overview
 
-This document specifies the token economics for a decentralized audio storage and delivery network. The system uses a single ERC-20 token to incentivize three roles: providers (store and serve audio), uploaders (push content into the network), and listeners (stream audio). Payments flow through off-chain unidirectional payment channels settled on an EVM L2. Providers stake tokens to join and face slashing for provable misbehavior. A gossip-based reputation system uses interaction-weighted scoring to rank providers.
+This document specifies the token economics for a decentralized content delivery network. The system uses a single ERC-20 token to incentivize three roles: providers (store and serve content), uploaders (push content into the network), and clients (consume content). Payments flow through off-chain unidirectional payment channels settled on an EVM L2. Providers stake tokens to join and face slashing for provable misbehavior. A gossip-based reputation system uses interaction-weighted scoring to rank providers.
 
 For protocol mechanics (wire format, ALPN protocols, crate structure, content model), see the main design spec.
 
@@ -44,7 +44,7 @@ For protocol mechanics (wire format, ALPN protocols, crate structure, content mo
 | Liquidity (DEX + CEX) | 10% | 100M | Fully unlocked at genesis |
 | Early supporters / seed | 10% | 100M | 2-year linear, 6-month cliff |
 
-**Provider bootstrap fund:** Dedicated to attracting early providers before organic streaming revenue is sufficient. Distributed as bonus rewards on top of normal storage/delivery payments. Governed by token holders — proposals to release funds require a governance vote. Target: fund 2 years of above-market provider rewards.
+**Provider bootstrap fund:** Dedicated to attracting early providers before organic delivery revenue is sufficient. Distributed as bonus rewards on top of normal storage/delivery payments. Governed by token holders — proposals to release funds require a governance vote. Target: fund 2 years of above-market provider rewards.
 
 ### PoC Simplification
 
@@ -58,8 +58,8 @@ For PoC, the token contract includes a public `mint(address to, uint256 amount)`
 
 | Service | Rate | Example |
 |---------|------|---------|
-| Storage | 10 tokens / GB / month | 1 track (5MB FLAC) for 1 month = 0.05 tokens |
-| Delivery | 0.001 tokens / MB streamed | 1 track (4 min, 128kbps) ~3.75MB = 0.00375 tokens |
+| Storage | 10 tokens / GB / month | 1 blob (5MB) for 1 month = 0.05 tokens |
+| Delivery | 0.001 tokens / MB delivered | 1 blob (~3.75 MB) = 0.00375 tokens |
 | Indexer queries (future) | 0.0001 tokens / query | 100 searches = 0.01 tokens |
 
 ### Production: Provider-Set Rates
@@ -100,7 +100,7 @@ Clients see rates before connecting and choose providers by a combination of rep
 
 ```
 Client deposits 100 tokens into channel
-  → Streams audio, signs vouchers totaling 80 tokens
+  → Delivers content, signs vouchers totaling 80 tokens
   → Channel closes with final voucher of 80 tokens
   → Contract distributes: 77.6 tokens to provider, 2.4 tokens to treasury
   → Client reclaims remaining 20 tokens
@@ -117,7 +117,7 @@ Client deposits 100 tokens into channel
 
 **PoC (native token fees):** The 20% burn is automatic (sent to `address(0)`). The remaining 80% accumulates in the treasury for governance-directed spending. The burn percentage is governable.
 
-**Production (stablecoin fees):** When payments move to stablecoin (see [Stablecoin Payments Spec](./2026-03-24-stablecoin-payments.md)), the 20% burn allocation becomes a **buyback & burn**: USDC fees are swapped for AUDIO on a DEX and the purchased AUDIO is burned. This creates market buy pressure proportional to network usage. See the stablecoin spec Section 5 for mechanism details.
+**Production (stablecoin fees):** When payments move to stablecoin (see [Stablecoin Payments Spec](./2026-03-24-stablecoin-payments.md)), the 20% burn allocation becomes a **buyback & burn**: USDC fees are swapped for TOKEN on a DEX and the purchased TOKEN is burned. This creates market buy pressure proportional to network usage. See the stablecoin spec Section 5 for mechanism details.
 
 ---
 
@@ -144,10 +144,11 @@ Client deposits 100 tokens into channel
 | Offense | Description | Proof Mechanism | Scope |
 |---------|-------------|----------------|-------|
 | **Wrong data** | Provider served bytes that don't match the expected BLAKE3 hash | Optimistic fraud proof: challenger submits `{blob_hash, chunk_index, received_bytes, expected_root}`. Provider has 24h to counter with correct chunk. | **PoC + Production** |
-| **Prolonged downtime** | Provider unreachable for >24h while holding paid storage deals | Challenger submits signed ping failure logs + on-chain deal record. Provider has 24h to prove liveness (respond to a challenge ping). | **Production only** |
+| **Phantom announcement** | Edge node signed a `ProbeResponse` claiming `has_blob: true` but failed to deliver within 30 seconds | Challenger submits signed `ProbeResponse` (has_blob: true) + signed `StreamResponse` (NotCached) or delivery timeout proof. Provider has 24h to counter with proof of delivery. | **PoC + Production** |
+| **Rate manipulation** | Edge node signed a `ProbeResponse` with rate X then signed a `StreamResponse` with rate Y > X within 30 seconds | Challenger submits both signed messages from the same node showing rate discrepancy within the 30-second window. Provider has 24h to counter. | **Production only** |
 | **Double settlement** | Provider submits a voucher to two different close transactions for the same channel | On-chain provable: contract detects duplicate channelId settlements. Automatic slash, no challenge needed. | **Production only** |
 
-For PoC, only the "wrong data" offense is implemented. Prolonged downtime is handled via reputation (not slashing) and double settlement is unlikely at PoC scale.
+For PoC, "wrong data" and "phantom announcement" offenses are implemented. Rate manipulation and double settlement are added in production.
 
 ### Slash Amounts
 
@@ -224,7 +225,7 @@ At PoC rates, the breakeven depends on the token's notional value. Since PoC use
 | $0.05 | $350 | $35-100 | Profitable |
 | $0.10 | $700 | $35-100 | Very profitable |
 
-**Key insight:** Provider profitability is highly sensitive to token price and utilization. At $0.01/token, a provider needs ~500GB stored and ~2TB/month served to break even on a budget VPS. This is achievable for a moderately popular music catalog.
+**Key insight:** Provider profitability is highly sensitive to token price and utilization. At $0.01/token, a provider needs ~500GB stored and ~2TB/month served to break even on a budget VPS. This is achievable for a moderately popular content catalog.
 
 ### Gas Cost Breakdown (Arbitrum)
 
@@ -238,7 +239,7 @@ Estimated gas costs at typical Arbitrum L2 prices (~$0.01-0.10 per transaction):
 | `submitFraudProof()` | ~250k gas | ~$0.10 |
 | `withdraw()` | ~80k gas | ~$0.05 |
 
-**Payment channels amortize gas effectively.** A channel that stays open for 30 streaming sessions costs $0.15 total (open + close) = $0.005 per session. Without channels, 30 sessions would need 30 on-chain transactions = $1.50.
+**Payment channels amortize gas effectively.** A channel that stays open for 30 delivery sessions costs $0.15 total (open + close) = $0.005 per session. Without channels, 30 sessions would need 30 on-chain transactions = $1.50.
 
 ### Sensitivity Table
 
@@ -254,10 +255,10 @@ Estimated gas costs at typical Arbitrum L2 prices (~$0.01-0.10 per transaction):
 
 ### Minimum Viable Deposit
 
-A typical listening session: 30 tracks, 4 minutes each, 128kbps.
+A typical content delivery session: 30 blobs, ~3.75 MB each.
 
 ```
-Per track: 4 min * 60s * 128kbps / 8 = 3.75 MB
+Per blob: 3.75 MB
 Per session: 30 * 3.75 MB = 112.5 MB
 Cost: 112.5 * 0.001 tokens/MB = 0.1125 tokens
 ```
@@ -276,7 +277,7 @@ Cost: 112.5 * 0.001 tokens/MB = 0.1125 tokens
 | Close channel | ~$0.10 | ~10 tokens |
 | **Total lifecycle** | **~$0.15** | **~15 tokens** |
 
-**Per-session amortization:** If a channel stays open for 30 sessions, the on-chain overhead is 15 tokens / 30 = 0.5 tokens/session. The actual streaming cost for a session is ~0.1125 tokens, so the channel overhead dominates at low usage. This reinforces the design choice to keep channels open as long as possible. **Note:** The token-denominated gas cost (15 tokens) is highly sensitive to token price. At $0.10/token, the same gas costs only 1.5 tokens total — making the overhead negligible. The PoC uses free testnet tokens, so gas overhead is not a concern during testing.
+**Per-session amortization:** If a channel stays open for 30 sessions, the on-chain overhead is 15 tokens / 30 = 0.5 tokens/session. The actual delivery cost for a session is ~0.1125 tokens, so the channel overhead dominates at low usage. This reinforces the design choice to keep channels open as long as possible. **Note:** The token-denominated gas cost (15 tokens) is highly sensitive to token price. At $0.10/token, the same gas costs only 1.5 tokens total — making the overhead negligible. The PoC uses free testnet tokens, so gas overhead is not a concern during testing.
 
 **Implication:** Clients should keep channels open as long as possible. The protocol should not auto-close idle channels — only explicit close or expiry.
 
@@ -284,7 +285,7 @@ Cost: 112.5 * 0.001 tokens/MB = 0.1125 tokens
 
 At PoC delivery rate of 0.001 tokens/MB:
 
-| Interval | Vouchers per Track (3.75MB) | Max Loss on Provider Failure | Signature Overhead |
+| Interval | Vouchers per Blob (3.75MB) | Max Loss on Provider Failure | Signature Overhead |
 |----------|-----------------------------|--------------------------|--------------------|
 | 64KB | ~59 | 0.0000625 tokens (64KB * 0.001/MB) | High |
 | 256KB (default) | ~15 | 0.000250 tokens (256KB * 0.001/MB) | Moderate |
@@ -402,7 +403,7 @@ A single reputation report (local or network) can move a provider's score by at 
 
 When multiple providers have the same final score (within 0.01 tolerance), select by:
 
-1. **Lower current load** — providers include approximate load in gossip announcements (number of active streams)
+1. **Lower current load** — providers include approximate load in gossip announcements (number of active connections)
 2. **Geographic diversity** — prefer providers in regions not already selected (if requesting multiple providers for replication)
 3. **Higher stake** — more skin in the game, all else being equal
 4. **Random** — final tiebreaker to prevent deterministic routing patterns
@@ -508,7 +509,7 @@ Based on OpenZeppelin Governor with the following parameters:
 | Aspect | Details |
 |--------|---------|
 | **Attack** | Create N fake providers, stake each, have them rate each other positively |
-| **Cost** | N * 1,000 tokens (stake) + gas for channels between sybils + actual streaming activity (interaction-weighted scoring requires settled channels) |
+| **Cost** | N * 1,000 tokens (stake) + gas for channels between sybils + actual delivery activity (interaction-weighted scoring requires settled channels) |
 | **Example** | 10 sybil nodes = 10,000 tokens stake + ~100 tokens in cross-channel settlements to build credibility |
 | **Damage** | Sybil providers ranked higher than honest ones, receive traffic, deliver poor service |
 | **Mitigation** | Interaction-weighted scoring: reports from nodes with few settled channels carry little weight. Score clamping limits impact of each report. Local observations (70%) dominate network gossip (30%). |
@@ -559,11 +560,11 @@ Based on OpenZeppelin Governor with the following parameters:
 | Aspect | Details |
 |--------|---------|
 | **Attack** | Accept storage deal, take uploader's payment, delete the data |
-| **Cost** | Slash on detection (5-10% of stake on first offense) |
+| **Cost** | No direct slash. Storage withholding is NOT a slashable offense — slashing is focused on edge node misbehavior (wrong data, phantom announcements, rate manipulation, double settlement), not storage guarantees. |
 | **Revenue from attack** | Storage payment for the deleted data. E.g., 1GB for 1 month = 10 tokens. |
-| **Profitability** | Slash = 5% of 1,000 tokens = 50 tokens. Revenue = 10 tokens. **Net loss of 40 tokens.** Attack is unprofitable. |
-| **Mitigation** | Slash amount (50 tokens) exceeds maximum storage payment for any reasonable data size. Repeated offenses escalate to ejection. Uploaders detect via periodic ping and trigger re-replication. |
-| **Residual risk** | Negligible at PoC rates. For production, ensure slash amount always exceeds maximum deal value — this should be a protocol invariant. |
+| **Profitability** | Short-term profitable, but reputation damage makes it self-defeating over time. |
+| **Mitigation** | Handled by reputation only: uploaders detect missing data via periodic probes and trigger re-replication. Failed probes tank the provider's reputation score, reducing future traffic and revenue. Persistent withholding leads to near-zero reputation, effectively soft-ejecting the provider from the network. |
+| **Residual risk** | A provider willing to sacrifice reputation can profit short-term. Mitigated by replication factor (uploaders store with multiple providers) and the cold-start cost of rebuilding reputation on a new identity. |
 
 ---
 
@@ -659,7 +660,7 @@ All economic parameters in one reference table:
 ### Risks
 
 1. **Token price volatility:** Provider profitability swings with token price. Mitigation: providers can adjust rates. **Long-term solution:** The [Stablecoin Payments Spec](./2026-03-24-stablecoin-payments.md) defines a dual-currency model where payments use stablecoins (USDC) while the native token is reserved for staking, governance, and fee discounts. This eliminates provider revenue volatility.
-2. **Low initial demand:** Without listeners, providers have no delivery revenue. The bootstrap fund must be large enough to sustain providers until organic demand kicks in.
+2. **Low initial demand:** Without clients, providers have no delivery revenue. The bootstrap fund must be large enough to sustain providers until organic demand kicks in.
 3. **Governance capture:** Large token holders can control parameter changes. Safety bounds limit damage but don't prevent rent-seeking (e.g., setting fees to 20%).
 4. **Regulatory risk:** Tokens with economic utility may be classified as securities in some jurisdictions. Legal review required before production distribution.
 5. **Smart contract risk:** Bugs in staking/payment contracts could lead to fund loss. Multiple audits required before production mainnet deployment.

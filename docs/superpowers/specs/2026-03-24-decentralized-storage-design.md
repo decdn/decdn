@@ -1,4 +1,4 @@
-# Decentralized Audio Storage & Delivery Network
+# Decentralized Content Storage & Delivery Network
 
 **Date:** 2026-03-24
 **Status:** Draft
@@ -9,7 +9,7 @@
 ## Non-Goals (out of scope for PoC)
 
 - DRM or content protection
-- Audio transcoding or adaptive bitrate
+- Content transcoding or adaptive format conversion
 - Search, discovery, or recommendation (future work section below outlines the planned approach)
 - Mobile or web clients
 - Multi-chain support (single L2 only for PoC)
@@ -17,9 +17,9 @@
 
 ## Overview
 
-A decentralized storage and delivery network optimized for audio streaming (decentralized Spotify use case). Built on iroh for p2p connectivity and content-addressed blob transfer, with cryptocurrency incentives on an EVM L2 for storage and delivery payments.
+A decentralized storage and delivery network for content storage and delivery. Built on iroh for p2p connectivity and content-addressed blob transfer, with cryptocurrency incentives on an EVM L2 for storage and delivery payments.
 
-The system is application-specific blob storage first (audio streaming), with the flexibility to serve as general-purpose storage. Providers choose what they store (hybrid permissioning). The network is permissionless to join but providers must stake tokens.
+The system is general-purpose blob storage. Providers choose what they store (hybrid permissioning). The network is permissionless to join but providers must stake tokens.
 
 ## Glossary
 
@@ -29,9 +29,9 @@ The system is application-specific blob storage first (audio streaming), with th
 | **Chunk** | A 1024-byte segment of a blob used by iroh-blobs for verified streaming |
 | **Hash sequence** | An ordered collection of blob hashes (iroh's equivalent of a directory/manifest) |
 | **Voucher** | A signed off-chain payment message: `{channelId, cumulativeAmount, nonce, signature}` |
-| **Manifest** | A hash sequence linking a track's audio blob + metadata blob. Its hash is the track ID |
+| **Manifest** | An optional application-level hash sequence grouping related blobs |
 | **ALPN** | Application-Layer Protocol Negotiation — identifies which protocol a QUIC connection uses |
-| **Provider** | A node that stores and serves blobs, earning tokens |
+| **Provider** | A node that stores and serves blobs, earning payment |
 | **Staking** | Locking tokens in a smart contract as collateral to join the network as a provider |
 
 ## Architecture
@@ -41,7 +41,7 @@ Three layers, cleanly separated:
 ```
 +---------------------------------------------+
 |  Application Layer (future)                 |
-|  Catalog, search, playlists, client apps    |
+|  Catalog, search, collections, client apps  |
 +---------------------------------------------+
 |  Incentive Layer                            |
 |  Payment channels, staking, reputation      |
@@ -49,7 +49,7 @@ Three layers, cleanly separated:
 +---------------------------------------------+
 |  Storage Layer                              |
 |  iroh endpoints, blob store, replication,   |
-|  content routing, streaming protocol        |
+|  content routing, delivery protocol         |
 +---------------------------------------------+
 ```
 
@@ -57,8 +57,8 @@ Three layers, cleanly separated:
 
 All three types are the same binary with different configurations:
 
-- **Provider node** — runs iroh endpoint + blob store, serves content, earns tokens. Must stake to join.
-- **Client node** — lightweight iroh endpoint, streams content, pays per chunk. No staking required.
+- **Provider node** — runs iroh endpoint + blob store, serves content, earns payment. Must stake to join.
+- **Client node** — lightweight iroh endpoint, fetches content, pays per chunk. No staking required.
 - **Uploader node** — pushes content to providers, sets replication factor, pays for initial storage.
 
 ### Key Design Decision
@@ -69,15 +69,12 @@ The storage layer and incentive layer are separate crates. The storage layer wor
 
 ### Content Model
 
-Audio files are stored as iroh blobs, content-addressed by BLAKE3 hash. A single track consists of:
+Blobs are arbitrary byte sequences, content-addressed by BLAKE3 hash. The protocol imposes no mandatory structure — applications define their own organization on top of raw blobs.
 
-- **Audio blob** — raw audio file (FLAC/Opus/MP3), stored as a single iroh blob
-- **Metadata blob** — small JSON/CBOR blob with track info (title, artist, duration, format, bitrate)
-- **Manifest blob** — iroh hash sequence (collection) linking audio + metadata, serves as the canonical track ID
+- **Content blob** — raw file bytes, format-agnostic
+- **Metadata blob** — optional small JSON/CBOR blob with content metadata (application-defined fields)
 
-The manifest hash is the canonical identifier. Clients request the manifest, get metadata to display, then stream the audio blob.
-
-**Why a manifest?** The indirection pays off in multiple ways: (1) the same audio blob can appear in multiple albums/playlists without duplication, (2) metadata can be updated without changing the audio hash, (3) the manifest naturally extends to albums (multiple audio blobs in one hash sequence), and (4) it separates the "what is this track" lookup from the "give me the bytes" transfer.
+Applications may optionally create manifest blobs (hash sequences) to group related blobs and metadata. For example, an application could bundle a content blob and its metadata blob into a single hash sequence for convenient retrieval. Hash sequences can also represent collections (e.g., albums, datasets, archives). The protocol does not require manifests — individual blobs are independently addressable and retrievable by hash.
 
 ### Replication
 
@@ -102,7 +99,7 @@ For PoC (tens of nodes), content routing uses a **full-table gossip approach**:
 ### Local Store
 
 - Providers: iroh-blobs `fs-store` (persistent, backed by redb)
-- Clients: iroh-blobs `mem-store` (ephemeral, playback buffering only)
+- Clients: iroh-blobs `mem-store` (ephemeral, buffering only)
 
 ## Incentive Layer
 
@@ -112,8 +109,8 @@ A single ERC-20 token on Arbitrum Sepolia (testnet). Three payment flows:
 
 | Flow | Direction | Trigger |
 |------|-----------|---------|
-| Storage payment | Uploader -> Provider | Storing a track for a duration |
-| Delivery payment | Listener -> Provider | Streaming audio chunks |
+| Storage payment | Uploader -> Provider | Storing a blob for a duration |
+| Delivery payment | Client -> Provider | Delivering content chunks |
 | Staking | Provider -> Contract | Joining the network |
 
 ### Placeholder Economics (PoC)
@@ -122,7 +119,7 @@ A single ERC-20 token on Arbitrum Sepolia (testnet). Three payment flows:
 |-----------|-------|-----------|
 | Minimum provider stake | 1000 tokens | High enough for sybil resistance, low enough for PoC participation |
 | Storage rate | 10 tokens / GB / month | Simple flat rate |
-| Delivery rate | 0.001 tokens / MB streamed | ~0.004 tokens per 4-min song at 128kbps |
+| Delivery rate | 0.001 tokens / MB delivered | Simple per-MB rate |
 | Voucher interval | Every 256KB (1024 chunks) | Balance between payment granularity and signature overhead |
 | Unbonding period | 7 days | Prevents stake-and-run |
 | Channel dispute window | 1 hour | Short for PoC; production should be longer |
@@ -149,7 +146,7 @@ Off-chain **unidirectional** payment channels (client/uploader pays provider):
 - **Client liveness requirement:** Clients must monitor for channel close attempts and submit a newer voucher within the dispute window if a stale one is submitted. A client offline for >1 hour during a dispute may lose funds. For PoC this is acceptable; production should use a watchtower pattern.
 - **Vouchers are cumulative** — each supersedes the previous (higher amount, higher nonce).
 
-**Failover and channel pre-warming:** Clients maintain a small pool of pre-opened channels with top-ranked providers (by reputation). When streaming a track, the client has channels ready with 2-3 providers so failover doesn't require an on-chain transaction. Channel deposits can be small (enough for a few tracks) and topped up as needed. For PoC, the client pre-opens channels with all known providers at startup (feasible at tens of nodes).
+**Failover and channel pre-warming:** Clients maintain a small pool of pre-opened channels with top-ranked providers (by reputation). When fetching a blob, the client has channels ready with 2-3 providers so failover doesn't require an on-chain transaction. Channel deposits can be small (enough for a few blobs) and topped up as needed. For PoC, the client pre-opens channels with all known providers at startup (feasible at tens of nodes).
 
 **Production: stablecoin channels.** For production, payments transition from the native token to stablecoins (USDC) via a `StablePaymentChannel` contract. This eliminates provider revenue volatility while the native token retains utility for staking and governance. See the [Stablecoin Payments Spec](./2026-03-24-stablecoin-payments.md) for the dual-currency design, migration path, and token utility preservation mechanisms.
 
@@ -162,9 +159,9 @@ Off-chain **unidirectional** payment channels (client/uploader pays provider):
 
 ### Delivery Payments
 
-- Listener opens channel to streaming provider
+- Client opens channel to delivery provider
 - Pays per chunk via signed vouchers
-- Channel stays open across multiple tracks/sessions
+- Channel stays open across multiple blobs/sessions
 - Top up when low, or open a new channel
 
 ### Reputation System
@@ -217,12 +214,12 @@ struct ReportMetrics {
 
 | ALPN | Purpose |
 |------|---------|
-| `storage-layer/stream/v1` | Audio streaming with payment vouchers |
+| `storage-layer/stream/v1` | Content delivery with payment vouchers |
 | `storage-layer/store/v1` | Storage deals (upload, replication, status, ping) |
 | iroh-blobs built-in ALPN | Actual blob transfer |
 | iroh-gossip built-in ALPN | Reputation + content routing propagation |
 
-### Streaming Protocol (`stream/v1`)
+### Delivery Protocol (`stream/v1`)
 
 ```
 Client                          Provider
@@ -245,7 +242,7 @@ Client                          Provider
 ```
 
 - `StreamRequest` includes an optional `byte_offset` field for seek and resume. On failover, the client sends the byte offset of the last successfully verified chunk to the new provider.
-- Built on iroh-blobs verified streaming — chunks are BLAKE3-verified automatically
+- Built on iroh-blobs verified delivery — chunks are BLAKE3-verified automatically
 - Payment wrapper intercepts every N chunks (default 1024 ~256KB) and expects a signed voucher
 - Self-enforcing: client stops paying, provider stops sending; provider stops sending, client stops paying
 - Voucher amount accounts for the offset — client only pays for bytes actually delivered from the offset onward
@@ -317,8 +314,8 @@ storage-layer-node [OPTIONS] <COMMAND>
 
 Commands:
   provider    Run as a storage provider
-  upload      Upload a track to the network
-  stream      Stream a track by manifest hash
+  upload      Upload content to the network
+  stream      Fetch a blob by hash
   status      Show node status, channels, and stored blobs
 
 Options:
@@ -354,9 +351,9 @@ min_stake_for_reports = 1000
 
 ### Network Failures
 
-- **Provider offline mid-stream:** Client picks next-best provider from routing table (reputation-ranked), resumes from last verified byte offset using `StreamRequest.byte_offset`. Partial voucher with the failed provider is still settleable. Pre-warmed channel with fallback provider avoids on-chain latency.
+- **Provider offline mid-delivery:** Client picks next-best provider from routing table (reputation-ranked), resumes from last verified byte offset using `StreamRequest.byte_offset`. Partial voucher with the failed provider is still settleable. Pre-warmed channel with fallback provider avoids on-chain latency.
 - **Provider offline while storing:** Uploader detects via periodic ping (5-min interval). After 30 minutes unreachable, uploader selects new provider and re-uploads to maintain replication factor.
-- **Client disappears mid-stream:** Provider stops sending. Last voucher is claimable. iroh cleans up QUIC connection.
+- **Client disappears mid-delivery:** Provider stops sending. Last voucher is claimable. iroh cleans up QUIC connection.
 
 ### Payment Failures
 
@@ -366,7 +363,7 @@ min_stake_for_reports = 1000
 
 ### Data Integrity
 
-- **Corrupted data:** iroh-blobs BLAKE3 verified streaming rejects bad chunks at transport level. Provider marked faulty in reputation. Slashable via optimistic fraud proof (client submits claim, provider has 24h to counter with correct data).
+- **Corrupted data:** iroh-blobs BLAKE3 verified delivery rejects bad chunks at transport level. Provider marked faulty in reputation. Slashable via optimistic fraud proof (client submits claim, provider has 24h to counter with correct data).
 - **Provider claims to store but doesn't:** Challenge-response spot checks. Failure harms reputation. On-chain slashing deferred past PoC.
 
 ### Reputation Gaming
@@ -377,16 +374,16 @@ min_stake_for_reports = 1000
 
 ### Graceful Degradation
 
-- L2 down: streaming continues, vouchers settle when chain returns
+- L2 down: delivery continues, vouchers settle when chain returns
 - Gossip partitioned: fall back to local reputation
-- No provider has track: clear `ContentNotFound` error
+- No provider has blob: clear `ContentNotFound` error
 
 ## Observability
 
 - **Structured logging** via `tracing` crate (standard in iroh ecosystem). JSON output for machine consumption.
 - **Metrics** via `prometheus` crate, exposed on a configurable HTTP port:
   - `blobs_stored_total`, `blobs_stored_bytes` — provider storage usage
-  - `streams_active`, `streams_completed`, `streams_failed` — streaming activity
+  - `streams_active`, `streams_completed`, `streams_failed` — delivery activity
   - `vouchers_signed`, `vouchers_received` — payment activity
   - `reputation_reports_sent`, `reputation_reports_received` — gossip health
   - `channels_open`, `channels_settled` — payment channel lifecycle
@@ -403,8 +400,8 @@ min_stake_for_reports = 1000
 
 ### Integration Tests (multi-node, in-process)
 
-- Happy path: upload -> discover -> stream with payments
-- Provider failure + failover mid-stream (resume from byte offset)
+- Happy path: upload -> discover -> fetch with payments
+- Provider failure + failover mid-delivery (resume from byte offset)
 - Payment channel full lifecycle with dispute
 - Reputation propagation via gossip
 - Replication maintenance after provider loss
@@ -422,24 +419,24 @@ Not in PoC scope, but the planned approach for the next phase.
 
 ### Overview
 
-Dedicated **indexer nodes** crawl the network's content announcements (already broadcast on the `content-routing/v1` gossip topic), build a searchable index of track metadata, and expose a query API. Multiple independent indexers can coexist — clients pick one or query several for redundancy.
+Dedicated **indexer nodes** crawl the network's content announcements (already broadcast on the `content-routing/v1` gossip topic), build a searchable index of content metadata, and expose a query API. Multiple independent indexers can coexist — clients pick one or query several for redundancy.
 
 This is analogous to how The Graph indexes blockchain data: indexers are semi-trusted infrastructure, but they cannot tamper with content (blobs are content-addressed), only withhold search results. Clients can cross-reference multiple indexers to detect omissions.
 
 ### How It Works
 
-1. **Ingestion:** Indexer subscribes to `content-routing/v1` gossip topic. When a `ContentAnnounce` arrives, the indexer fetches the manifest and metadata blobs from a provider, extracts searchable fields (title, artist, genre, duration), and adds them to a local full-text search index (e.g., `tantivy`).
+1. **Ingestion:** Indexer subscribes to `content-routing/v1` gossip topic. When a `ContentAnnounce` arrives, the indexer fetches the manifest and metadata blobs from a provider, extracts searchable fields (application-defined metadata fields), and adds them to a local full-text search index (e.g., `tantivy`).
 2. **Query API:** Indexer exposes a query protocol on a custom ALPN (`storage-layer/search/v1`). Clients connect via iroh and send search queries. Results are manifest hashes + metadata summaries, ranked by relevance.
-3. **Incentive:** Indexers earn query fees via the same payment channel mechanism used for streaming. Clients pay per query (or per batch of queries). This makes indexing a self-sustaining role in the network.
+3. **Incentive:** Indexers earn query fees via the same payment channel mechanism used for delivery. Clients pay per query (or per batch of queries). This makes indexing a self-sustaining role in the network.
 4. **Registration:** Indexers register in the `StakingRegistry` with an "indexer" role. Staking provides sybil resistance and a slashing mechanism if an indexer is proven to serve fabricated results (metadata doesn't match the actual blob).
 
 ### Discovery & Recommendations
 
 Built on top of the indexer infrastructure:
 
-- **Trending:** Most-streamed tracks = most voucher settlements. Indexers can query on-chain settlement data or track gossip volume to rank by popularity.
-- **Genre browsing:** Structured metadata fields in the metadata blob enable category-based filtering.
-- **Playlists:** User-created hash sequences (same mechanism as track manifests) containing ordered lists of manifest hashes. Stored as blobs, shareable by hash.
+- **Trending:** Most-delivered blobs = most voucher settlements. Indexers can query on-chain settlement data or track gossip volume to rank by popularity.
+- **Category browsing:** Structured metadata fields in the metadata blob enable category-based filtering.
+- **Collections:** User-created hash sequences (same mechanism as manifests) containing ordered lists of blob hashes. Stored as blobs, shareable by hash.
 - **Algorithmic recommendations:** Application-layer concern. Could run on indexer nodes or as a separate service consuming indexer APIs.
 
 ### PoC Bridge

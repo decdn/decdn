@@ -9,7 +9,7 @@
 
 ## 1. The Shift
 
-The decentralized storage design solves a hard problem (durable, replicated, incentivized storage) at significant complexity cost. But the actual bottleneck for audio streaming isn't storage — it's delivery latency and bandwidth cost.
+The decentralized storage design solves a hard problem (durable, replicated, incentivized storage) at significant complexity cost. But the actual bottleneck for content delivery isn't storage — it's delivery latency and bandwidth cost.
 
 S3-class object storage is:
 - Cheap ($0.023/GB/month)
@@ -21,7 +21,7 @@ What S3 is not:
 - Free to egress (S3 egress costs $0.09/GB, CloudFront is $0.008/GB)
 - Decentralized
 
-A decentralized CDN inverts the model: **keep storage centralized and cheap; decentralize delivery**. Edge nodes cache and serve content close to listeners. They earn per MB delivered. Storage costs stay predictable. The network gains geographic distribution without requiring nodes to commit to durable storage.
+A decentralized CDN inverts the model: **keep storage centralized and cheap; decentralize delivery**. Edge nodes cache and serve content close to clients. They earn per MB delivered. Storage costs stay predictable. The network gains geographic distribution without requiring nodes to commit to durable storage.
 
 ---
 
@@ -71,9 +71,9 @@ An edge node is the core participant in the delivery network.
 **Economics:**
 - **Revenue:** per-MB delivery payments from clients
 - **Costs:** bandwidth (egress to clients and peers + ingress from origin or peers), storage hardware, staking opportunity cost
-- **Cache strategy:** purely operator's choice — the protocol doesn't dictate eviction policy. Nodes cache what they expect will be requested again. Popular tracks = more delivery earnings = caching them is profitable. Peer pulls are cheaper than origin pulls, so nodes benefit from a well-seeded peer mesh.
+- **Cache strategy:** purely operator's choice — the protocol doesn't dictate eviction policy. Nodes cache what they expect will be requested again. Popular content = more delivery earnings = caching them is profitable. Peer pulls are cheaper than origin pulls, so nodes benefit from a well-seeded peer mesh.
 
-**Staking requirement:** Edge nodes must stake a minimum amount of USDC (or AUDIO if the native token model is used) to be listed in the DHT-backed node registry. Stake is slashable for provably bad behavior (serving corrupted data — detected by content hash mismatch). Stake is **not** slashable for cache misses or going offline.
+**Staking requirement:** Edge nodes must stake a minimum amount of TOKEN (the native network token) to be listed in the DHT-backed node registry. Stake is slashable for provably bad behavior (serving corrupted data — detected by content hash mismatch, phantom blob announcements, or rate manipulation). Stake is **not** slashable for cache misses or going offline.
 
 ### 3.2 Origin Gateway
 
@@ -97,33 +97,15 @@ A lightweight QUIC endpoint that streams content. Clients:
 
 ---
 
-## 4. Content Addressing and Manifest
+## 4. Content Addressing
 
-Content addressing is identical to the storage design — this is the correct model regardless of where blobs live.
+All content is stored as BLAKE3-hashed blobs. The protocol is content-agnostic — it stores and delivers arbitrary bytes with no assumptions about format, structure, or metadata.
 
-**Blob ID:** BLAKE3 hash of the raw bytes. Computed once at upload time and stored in the manifest.
+**Blob ID:** BLAKE3 hash of the raw bytes. Computed once at upload time.
 
-**Manifest format:**
-```json
-{
-  "version": 1,
-  "track_id": "<manifest_hash>",
-  "audio": {
-    "hash": "<blake3_hex>",
-    "size_bytes": 12345678,
-    "format": "opus",
-    "bitrate_kbps": 320
-  },
-  "metadata": {
-    "hash": "<blake3_hex>",
-    "title": "...",
-    "artist": "...",
-    "duration_secs": 215
-  }
-}
-```
+**Size:** Discoverable at delivery time via the `total_bytes` field in `StreamResponse`.
 
-**The manifest hash is the track ID.** Clients request a track by manifest hash. The manifest is tiny (< 1KB) and can be served from a catalog service, embedded in app responses, or fetched from any edge node.
+**Application-level metadata:** The protocol does not define a manifest or metadata format. Applications may layer their own metadata, manifest, or catalog structures on top — for example, linking multiple blobs, adding descriptive fields, or organizing content into collections. These are opaque to the delivery network, which sees only hashes and bytes.
 
 **Integrity guarantee:** Because blobs are content-addressed, a client can verify every chunk it receives against the known hash. An edge node cannot serve corrupted data without being detected. This removes the need for complex proof-of-delivery schemes — the hash is the proof.
 
@@ -135,7 +117,7 @@ Clients need to find edge nodes that have the content they want. Two complementa
 
 ### 5.1 Gossip-Based Announcement
 
-Edge nodes broadcast cache state over a gossip topic per content category (e.g., by genre, label, or a flat global topic for small networks). A `CacheAnnounce` message:
+Edge nodes broadcast cache state over a gossip topic per region or category (e.g., by geography or a flat global topic for small networks). A `CacheAnnounce` message:
 
 ```rust
 struct CacheAnnounce {
@@ -184,13 +166,13 @@ Client opens channel with 10 USDC deposit
   → Client reclaims 9.995 USDC
 ```
 
-**Channel economics for a typical track (3.75 MB at 320kbps Opus):**
+**Channel economics for a typical small blob (3.75 MB):**
 
 | Item | Cost |
 |------|------|
-| Delivery payment per track | 0.0000375 USDC |
+| Delivery payment per blob | 0.0000375 USDC |
 | Protocol fee (3%) | ~0.000001 USDC |
-| Tracks per $1 channel deposit | ~26,000 |
+| Blobs of this size per $1 deposit | ~26,000 |
 
 Clients rarely need to top up. A $1 deposit funds thousands of streams.
 
@@ -208,7 +190,7 @@ The ceiling is intentionally high. The origin gateway sets the practical ceiling
 
 ### 6.3 Voucher Cadence
 
-Vouchers are sent every **1 MB delivered** (approximately every 3 seconds at 320kbps). This is coarser than the storage design's chunk-level vouchers because CDN delivery is sequential and the hash-based integrity check provides sufficient protection against non-delivery without per-chunk payments.
+Vouchers are sent every **1 MB delivered** (the cadence depends on transfer speed). This is coarser than the storage design's chunk-level vouchers because CDN delivery is sequential and the hash-based integrity check provides sufficient protection against non-delivery without per-chunk payments.
 
 **Rationale:** More frequent vouchers = more cryptographic overhead. 1 MB cadence means an edge node risks losing at most one voucher's worth of revenue if a client disconnects without signing. At $0.00001/MB, the maximum risk per disconnect is $0.00001 — negligible.
 
@@ -259,15 +241,14 @@ If the edge node chooses not to do a pull-through (config option `pull_through: 
 
 The `StreamResponse` message includes an optional `redirect` field for Step 3. Pull-through (Steps 1–2) is the default and preferred path — it earns the edge node delivery revenue and warms the cache for future requests.
 
-**Peer-first rationale:** Peer pulls are typically faster (nearby datacenter, no S3 round-trip overhead), free of egress charges, and keep origin load minimal. After the first listener in a region triggers an origin pull, all subsequent edge nodes in that region get the blob from peers.
+**Peer-first rationale:** Peer pulls are typically faster (nearby datacenter, no S3 round-trip overhead), free of egress charges, and keep origin load minimal. After the first client in a region triggers an origin pull, all subsequent edge nodes in that region get the blob from peers.
 
 ### 7.2 Prefetching and Warming
 
 Edge nodes can proactively cache popular content before it's requested:
 
 - **Popularity signals from gossip:** If multiple peers announce a blob, it's popular. Worth caching.
-- **Manifest prefetch:** When caching an audio blob, also cache its manifest. The manifest is tiny but required for every play.
-- **Album clustering:** If a listener requests track 1 of an album, tracks 2-5 are likely to follow. Prefetch them.
+- **Related content prefetch:** Applications can hint at related blobs (e.g., via a prefetch list in application-level metadata). Edge nodes can speculatively cache related blobs when one is requested.
 
 These are local heuristics. No coordination protocol is needed.
 
@@ -275,7 +256,7 @@ These are local heuristics. No coordination protocol is needed.
 
 LRU or frequency-weighted eviction (LFU) are both reasonable. Operators should tune cache size to maximize hit rate within their storage budget. A node with a 100% hit rate on a popular catalog earns maximum revenue per unit of bandwidth.
 
-**Minimum viable cache:** A single popular album (10 tracks × ~40 MB = 400 MB) cached by 10 nodes globally is a functional CDN for that album.
+**Minimum viable cache:** A set of popular blobs (e.g., 400 MB of frequently requested content) cached by 10 nodes globally is a functional CDN for that content.
 
 ### 7.4 Edge-to-Edge Transfer Protocol
 
@@ -359,7 +340,7 @@ trait OriginStore: Send + Sync {
 
 Origin objects can be public (presigned URL not needed) or private (presigned URLs with short TTLs). For private origins, the origin gateway holds credentials and generates presigned URLs for pull-through. Edge nodes that want to pull directly from origin can request a presigned URL from the origin gateway — the origin gateway validates the requesting node's stake before issuing the URL.
 
-**Simpler alternative:** Require origins to be public S3 buckets. Any edge node can pull directly without auth delegation. This is acceptable for audio content that isn't DRM-protected and is appropriate for the PoC.
+**Simpler alternative:** Require origins to be public S3 buckets. Any edge node can pull directly without auth delegation. This is acceptable for content that isn't access-controlled and is appropriate for the PoC.
 
 ### 8.3 Hash-to-Object-Key Mapping
 
@@ -373,8 +354,7 @@ The catalog is a small database (PostgreSQL or SQLite) maintained by the operato
 
 **Catalog API:**
 ```
-GET /catalog/{hash} → {origin_url, size_bytes, format}
-GET /catalog/manifest/{track_id} → ManifestObject
+GET /catalog/{hash} → {origin_url, size_bytes, content_type}
 ```
 
 ---
@@ -440,7 +420,7 @@ Revenue depends entirely on traffic to clients. A node serving no clients earns 
 | ------ | ------ | ---------------- |
 | Cache hit rate | Higher hit rate = lower origin pull costs | Cache popular content |
 | Peer mesh density | More peers with overlapping catalogs = fewer origin pulls | Operate in a well-seeded region |
-| Geographic placement | Closer to listeners = lower latency = preferred in selection | Choose datacenter region |
+| Geographic placement | Closer to clients = lower latency = preferred in selection | Choose datacenter region |
 | Delivery rate | Lower rate attracts more clients, lower margin | Set rate strategically |
 | Bandwidth cost | Lower cost provider has more margin headroom | Choose cheap bandwidth provider |
 | Cache size | Larger cache = higher hit rate and more shareable content | Provision more disk |
@@ -451,7 +431,7 @@ A new edge node has an empty cache. It earns nothing until it caches content. Tw
 
 **Passive warm-up:** Serve origin pull-through requests (at a slight loss or break-even) to populate the cache. Once cache is warm, flip to serving from cache and earning margin.
 
-**Active warm-up:** Prefetch the top N most popular tracks before accepting client connections. The node can pull these from peers (free) or from origin. A public popularity API (or on-chain analytics from delivery payment volume) provides the top-N list.
+**Active warm-up:** Prefetch the top N most popular blobs before accepting client connections. The node can pull these from peers (free) or from origin. A public popularity API (or on-chain analytics from delivery payment volume) provides the top-N list.
 
 **Peer-assisted warm-up:** A new node announces itself on gossip without any cached content. Existing nodes in the region detect the new peer and can proactively push their most popular blobs to it (unsolicited `PeerPush` — see Section 7.4). This is optional and altruistic, but established nodes benefit from having a local peer that reduces origin load for both.
 
@@ -471,10 +451,16 @@ Staking serves two purposes in the CDN context:
 | Parameter | Value | Notes |
 |-----------|-------|-------|
 | Minimum stake | 100 USDC equivalent | Low enough to be accessible; high enough to have skin in the game |
-| Slash amount | Full stake | Only for provably bad behavior (hash mismatch) |
+| Slash amount | Full stake | Only for provably bad behavior (hash mismatch, phantom blob announcements, rate manipulation) |
 | Unbonding period | 7 days | Standard delay after unstake request |
 
-**Why slash for hash mismatch only?** Going offline, having a cache miss, or being slow are not malicious acts — they're just poor service. Clients handle them by switching to another node. Slashing for reliability would punish operators for infrastructure failures and add governance complexity. The hash mismatch case is different: it's either malicious (sending garbage) or catastrophic failure. Either warrants slashing.
+**Slashable offenses:**
+
+- **Hash mismatch:** Edge node serves data that doesn't match the advertised BLAKE3 hash. Either malicious (sending garbage) or catastrophic failure. Either warrants slashing.
+- **Phantom blob announcements:** Edge node claims `has_blob: true` in gossip or DHT but cannot deliver the blob when requested. This pollutes the routing table and wastes client time.
+- **Rate manipulation:** Edge node advertises one delivery rate in its probe/announcement but charges a different (higher) rate in the actual `StreamResponse`. This is bait-and-switch behavior.
+
+**Not slashable:** Going offline, having a cache miss, or being slow are not malicious acts — they're just poor service. Clients handle them by switching to another node. Slashing for reliability would punish operators for infrastructure failures and add governance complexity.
 
 ### 11.2 Slash Evidence
 
@@ -499,10 +485,10 @@ The contract verifies: `keccak256(receivedData) != expectedHash` (using a bridge
 
 ### 12.1 Node Selection
 
-When a client wants to play a track, it follows this selection algorithm:
+When a client wants to fetch a blob, it follows this selection algorithm:
 
 ```
-1. Check local routing table for nodes advertising the track's audio hash
+1. Check local routing table for nodes advertising the blob's content hash
 2. Filter: only staked nodes (from registry), within acceptable latency
 3. Sort by: delivery_rate ASC (cheapest first), then latency ASC
 4. Try top candidate: open payment channel (or reuse existing), request stream
@@ -514,7 +500,7 @@ When a client wants to play a track, it follows this selection algorithm:
 
 ### 12.2 Parallel Streaming (Future)
 
-For a single track, a client could open channels with multiple edge nodes and request different byte ranges in parallel (like BitTorrent's rarest-first piece selection). This is out of scope for the initial version but the content-addressed blob model supports it natively — any node serving the correct BLAKE3-verified bytes is interchangeable.
+For a single blob, a client could open channels with multiple edge nodes and request different byte ranges in parallel (like BitTorrent's rarest-first piece selection). This is out of scope for the initial version but the content-addressed blob model supports it natively — any node serving the correct BLAKE3-verified bytes is interchangeable.
 
 ### 12.3 Fallback Chain
 

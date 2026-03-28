@@ -9,8 +9,8 @@
 
 A decentralized CDN with three node roles:
 
-- **Vault nodes** hold canonical content behind a hidden backend (S3, NFS, local disk — irrelevant to the network). They stake AUDIO to publish content and are the only entry point for content into the network. No external origin URL is ever exposed.
-- **Edge nodes** cache content and serve it close to clients. They stake AUDIO to participate in the peer mesh and compete on price and latency.
+- **Vault nodes** hold canonical content behind a hidden backend (S3, NFS, local disk — irrelevant to the network). They stake TOKEN to publish content and are the only entry point for content into the network. No external origin URL is ever exposed.
+- **Edge nodes** cache content and serve it close to clients. They stake TOKEN to participate in the peer mesh and compete on price and latency.
 - **Clients** consume content. They pay edge nodes (or vault nodes directly) per MB via off-chain USDC payment channels.
 
 The PoC scope is tens of nodes on a testnet, proving the core delivery and payment protocol.
@@ -82,9 +82,9 @@ Clients pay edge nodes per MB. Edge nodes pay vault nodes per MB for initial con
 
 ### [ADR 004 — Dual-Currency Token Model](004-tokenomics.md)
 
-**USDC for payments. AUDIO for staking, governance, and fee discounts.**
+**USDC for payments. TOKEN for staking, governance, and fee discounts.**
 
-AUDIO is not used for payments. Both vault nodes (to publish content) and edge nodes (to serve content) must stake AUDIO. Staking cost creates accountability and Sybil resistance. 20% of protocol fees buy back and burn AUDIO. Fixed supply of 1B at genesis.
+TOKEN is not used for payments. Both vault nodes (to publish content) and edge nodes (to serve content) must stake TOKEN. Staking cost creates accountability and Sybil resistance. 20% of protocol fees buy back and burn TOKEN. Fixed supply of 1B at genesis.
 
 ---
 
