@@ -10,7 +10,7 @@ The CDN has two participant roles. **Nodes** (providers) cache and serve content
 Two questions are in scope:
 
 1. How do nodes discover each other and learn what content each holds?
-2. How does a node resolve a cache miss — pull from a peer or pull from an origin-backed node?
+2. How does a node resolve a cache miss?
 
 ## Decision
 
@@ -20,12 +20,7 @@ All staked nodes form a flat peer mesh with no fixed routing hierarchy. Discover
 
 - **DHT-based lookup** as fallback when the local routing table has no match. Standard Kademlia approach — each node publishes `(hash → nodeIds)` records as content enters its store and removes them when it leaves. TTL is 1 hour.
 
-On a cache miss, a node resolves in priority order:
-
-1. **Peer pull** — free, from another staked node via `cdn/peer/v1` (if the peer has the blob cached and opts in to peer pulls)
-2. **Paid pull** — from an origin-backed node (or any node that has the blob) via `cdn/client/v1`
-
-Node-to-node transfers via `cdn/peer/v1` are unpaid. Paid pulls via `cdn/client/v1` are used when no peer offers the blob for free — typically this means pulling from an origin-backed node that bears real backend costs (storage, egress) and charges accordingly.
+On a cache miss, a node probes candidates from its routing table (or DHT), selects the best by `rate_per_mb × rtt_ms`, and pulls via `cdn/client/v1` (paid). This is the same protocol used for client→node delivery — every byte transferred in the network is paid. Origin-backed nodes typically charge more (reflecting their backend egress costs) and set the effective price ceiling. Cache-only nodes that have the blob compete at lower rates.
 
 Node identity is the iroh `NodeId` (ed25519 public key). All staked nodes register in an on-chain registry mapping `NodeId → QUIC multiaddrs + Ethereum address`. Clients query this registry on first startup to find initial peers.
 
@@ -36,13 +31,13 @@ Node identity is the iroh `NodeId` (ed25519 public key). All staked nodes regist
 - No external infrastructure is reachable from the network — origin-backed nodes completely hide their backends, so no client or node can bypass the payment layer by going directly to a storage URL
 - All nodes participate in the same discovery and transport protocols; the only difference between origin-backed and cache-only nodes is whether they have an origin store configured
 - Regional gossip topics bound message volume: nodes in one region don't receive announcements from irrelevant regions
-- Peer-first cache miss resolution means origin-backed nodes are hit only for the first request for content in a region; all subsequent nodes in that region pull from peers for free
+- Once a node in a region caches a blob, other nodes in that region can pull from it at competitive rates rather than paying origin-backed node prices — popular content gets cheaper as it spreads
 - The flat mesh is simple to reason about and easy to test at small scale (PoC is tens of nodes)
 
 **Negative:**
 
 - Gossip consistency is eventual — a node that evicts or loses content may still appear in routing tables for up to one DHT TTL (1 hour); clients and nodes must handle stale entries by falling back to the next candidate
 - Bloom filter announcements (for large caches) introduce false positives: a probe to a node that turns out not to have the blob wastes a round-trip
-- Node-to-node transfers being unpaid creates a free-rider edge case: a staked node can set `accepts_peer_pull: false` and benefit from the mesh without contributing; mitigated by staking requirements but not fully eliminated
+- Every transfer is paid, so nodes pulling content on cache miss incur a cost that must be recouped through subsequent client deliveries; this creates a natural economic barrier to speculative caching
 - Self-reported region hints (ISO 3166-1 alpha-2) are unverified; a node could misreport its region to appear in more gossip topics
 - Origin-backed nodes become the last line of defence for content availability — if all origin-backed nodes for a given blob go offline or are deregistered, the content becomes permanently unavailable (unless cached elsewhere). Content owners are responsible for origin node uptime.

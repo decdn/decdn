@@ -23,7 +23,7 @@ The PoC scope is tens of nodes on a testnet, proving the core delivery and payme
   │    Node    │◄┤    Node    │◄┤    Node    │
   │  (cached)  ├►│  (origin)  ├►│  (cached)  │
   └─────┬──────┘ └─────┬──────┘ └─────┬──────┘
-        │  peer mesh (cdn/peer/v1, free between staked nodes)
+        │  all transfers paid via cdn/client/v1 (USDC)
      pays           pays           pays
    per-MB          per-MB         per-MB
    (USDC)          (USDC)         (USDC)
@@ -33,7 +33,7 @@ The PoC scope is tens of nodes on a testnet, proving the core delivery and payme
   └────────────┘ └────────────┘ └────────────┘
 ```
 
-Clients probe candidate nodes, pick the best by `rate_per_mb × rtt_ms`, stream over `cdn/client/v1`, and pay via off-chain USDC vouchers. Nodes pull from peers for free via `cdn/peer/v1`; on a cache miss, if no peer has the content, the node pulls from an origin-backed node (paid via `cdn/client/v1`) and caches locally.
+Clients probe candidate nodes, pick the best by `rate_per_mb × rtt_ms`, stream over `cdn/client/v1`, and pay via off-chain USDC vouchers. On a cache miss, a node pulls from another node that has the blob (paid via `cdn/client/v1`) and caches locally. Every byte delivered — whether client→node or node→node — is paid.
 
 ---
 
@@ -51,7 +51,7 @@ The implementation language is Rust. The networking stack is iroh, which provide
 
 **Flat peer mesh. Gossip for content availability. DHT for lookup.**
 
-All staked nodes form a flat mesh. Cache state is broadcast over iroh-gossip on regional topics. On a cache miss, nodes pull from peers for free, then from an origin-backed node (paid). No external URL is ever accessed — the network is fully self-contained.
+All staked nodes form a flat mesh. Cache state is broadcast over iroh-gossip on regional topics. On a cache miss, nodes pull from another node that has the blob (paid via `cdn/client/v1`). No external URL is ever accessed — the network is fully self-contained.
 
 ---
 
@@ -81,13 +81,12 @@ TOKEN is not used for payments. All nodes must stake TOKEN to participate. Staki
 
 ### [ADR 005 — Wire Protocol](005-protocol.md)
 
-**Four ALPN-identified protocols. `cdn/client/v1` covers all paid delivery.**
+**Three ALPN-identified protocols. `cdn/client/v1` covers all paid delivery.**
 
 | ALPN | Purpose |
 | --- | --- |
 | `cdn/probe/v1` | Parallel latency + availability check before node selection |
-| `cdn/client/v1` | Paid delivery: client→node, node→node (cache miss from origin-backed node) |
-| `cdn/peer/v1` | Unpaid pull between staked nodes |
+| `cdn/client/v1` | Paid delivery: client→node, node→node (cache miss) |
 | iroh-gossip built-in | Content availability and node discovery |
 
 `redirect` in `StreamResponse` always points to a NodeId, never an external URL. The origin backend is never revealed.

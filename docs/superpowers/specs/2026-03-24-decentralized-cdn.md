@@ -32,7 +32,7 @@ A decentralized CDN inverts the model: **keep storage centralized and cheap; dec
        │    Node     │◄─┤    Node    │◄─┤  Node              │
        │  (cached)   ├─►│  (cached)  ├─►│  (origin-backed)   │
        └──────┬─────┘  └──────┬─────┘  │  S3/R2 configured  │
-              │   peer share  │         └──────┬─────────────┘
+              │    paid pull  │         └──────┬─────────────┘
            pays             pays            pays
         per-MB            per-MB          per-MB
               │               │               │
@@ -41,9 +41,9 @@ A decentralized CDN inverts the model: **keep storage centralized and cheap; dec
        └────────────┘  └────────────┘  └────────────┘
 ```
 
-**Nodes** form a peer mesh. Some are configured with an origin backend (S3/R2/B2) — they can serve any blob in their origin store and never experience a true cache miss. Others are pure caches that rely on peer pulls or redirects when they don't have the requested content. The protocol does not distinguish between them; staking, slashing, and peer pulls all work the same regardless of whether a node has an origin backend.
+**Nodes** form a peer mesh. Some are configured with an origin backend (S3/R2/B2) — they can serve any blob in their origin store and never experience a true cache miss. Others are pure caches that rely on paid pulls from other nodes or redirects when they don't have the requested content. The protocol does not distinguish between them; staking, slashing, and paid transfers all work the same regardless of whether a node has an origin backend.
 
-On a cache miss, a node first tries to pull from another node before touching any origin store. Nodes cache everything they pull — from origin or from peers — and serve it to clients. They are paid per MB delivered to clients via stablecoin payment channels. Node-to-node transfers carry no payment; the economic incentive is saving origin egress cost.
+On a cache miss, a node pulls from another node via `cdn/client/v1` (paid). Nodes cache everything they pull — from origin or from other nodes — and serve it to clients. All transfers are paid per MB via stablecoin payment channels.
 
 **Origin backends** are conventional object stores (S3, R2, Backblaze B2, or self-hosted MinIO). They are the source of truth for all blobs but are accessed as infrequently as possible — only when no peer node has the content. Clients can also fall back directly to an origin-backed node if no pure-cache node is available.
 
@@ -59,16 +59,16 @@ A node is the core participant in the delivery network. It caches and serves con
 - Maintain a local cache of blobs (size is operator-configured)
 - Announce cached content to all peers (clients and other nodes) via gossip
 - Serve cached blobs to clients over QUIC/iroh (paid per MB)
-- Share cached blobs with other nodes over QUIC/iroh (unpaid, see Section 7.4)
-- On cache miss: check peer nodes first, fall back to origin pull (if origin-backed) or redirect to an origin-backed node
-- Sign up with staking contract to be eligible for client payments and peer sharing
+- Serve cached blobs to other nodes over QUIC/iroh via `cdn/client/v1` (paid per MB)
+- On cache miss: find a node with the blob, pull via `cdn/client/v1` (paid), or redirect to an origin-backed node
+- Sign up with staking contract to be eligible for delivery payments
 
 **Origin backend configuration (optional):** A node configured with an origin backend holds credentials for an object store and can serve any blob, always (no cache miss possible). It typically charges a higher delivery rate to reflect origin egress cost. The network operator runs at least one origin-backed node as the fallback provider of last resort. Its delivery rate is publicly known and sets an effective price ceiling — no node can charge more than origin and expect traffic.
 
 **Economics:**
-- **Revenue:** per-MB delivery payments from clients
-- **Costs:** bandwidth (egress to clients and peers + ingress from origin or peers), storage hardware, staking opportunity cost
-- **Cache strategy:** purely operator's choice — the protocol doesn't dictate eviction policy. Nodes cache what they expect will be requested again. Popular content = more delivery earnings = caching them is profitable. Peer pulls are cheaper than origin pulls, so nodes benefit from a well-seeded peer mesh.
+- **Revenue:** per-MB delivery payments from clients and from other nodes pulling content
+- **Costs:** bandwidth (egress to clients and other nodes + ingress from origin or other nodes), storage hardware, staking opportunity cost
+- **Cache strategy:** purely operator's choice — the protocol doesn't dictate eviction policy. Nodes cache what they expect will be requested again. Popular content = more delivery earnings = caching them is profitable. Nodes that cache popular content earn from both client delivery and node-to-node pulls.
 
 **Staking requirement:** Nodes must stake a minimum amount of TOKEN (the native network token) to be listed in the DHT-backed node registry. Stake is slashable for provably bad behavior (serving corrupted data — detected by content hash mismatch, phantom blob announcements, or rate manipulation). Stake is **not** slashable for cache misses or going offline.
 
@@ -108,10 +108,9 @@ Nodes broadcast cache state over a gossip topic per region or category (e.g., by
 ```rust
 struct CacheAnnounce {
     node_id: NodeId,             // iroh NodeId (ed25519 public key)
-    eth_address: Address,        // for payment channel opening (client→node only)
+    eth_address: Address,        // for payment channel opening
     cached_hashes: Vec<Hash>,    // blobs currently in cache (max 500 per message)
-    delivery_rate_per_mb: u64,   // USDC base units per MB charged to clients
-    accepts_peer_pull: bool,     // whether this node serves other nodes
+    delivery_rate_per_mb: u64,   // USDC base units per MB
     has_origin_backend: bool,    // whether this node is origin-backed
     region_hint: Option<String>, // ISO 3166-1 alpha-2 country code, self-reported
     signed_at: u64,              // unix timestamp
@@ -119,9 +118,7 @@ struct CacheAnnounce {
 }
 ```
 
-`accepts_peer_pull: true` means this node will respond to blob requests from other staked nodes without requiring a payment channel. Nodes opt in; it defaults to true for any node that has accepted staking terms. Origin-backed nodes may set this to false to avoid absorbing egress costs for free.
-
-Both **clients** and **nodes** maintain a local routing table: `hash → Vec<NodeId>` built from received announcements. Clients use it to find a serving node; nodes use it to find a peer to pull from on a cache miss. The same gossip layer serves both use cases.
+Both **clients** and **nodes** maintain a local routing table: `hash → Vec<NodeId>` built from received announcements. Clients use it to find a serving node; nodes use it to find a node to pull from on a cache miss. All transfers use `cdn/client/v1` with payment. The same gossip layer serves both use cases.
 
 **Message size bound:** `cached_hashes` is capped at 500 entries per message. Nodes with large caches split announcements across multiple messages or use a bloom filter summary instead of an exact list.
 
@@ -205,101 +202,37 @@ The protocol does not dictate cache policy. Nodes are economically motivated to 
 
 When a client requests a blob the node doesn't have, the node resolves it in this priority order:
 
-**Step 1 — Peer pull (preferred):**
+**Step 1 — Paid pull from another node (preferred):**
 
-1. Node checks its gossip routing table for a peer node with `accepts_peer_pull: true` and the requested hash
-2. If found: pulls the blob from the peer over QUIC (no payment — see Section 7.4), caches it locally
-3. Streams to the client at the node's normal delivery rate while the peer pull is in progress
+1. Node checks its routing table for nodes that have the requested blob
+2. Probes candidates for latency and rate
+3. Selects the best candidate by `rate_per_mb x rtt_ms` (balancing cost and speed)
+4. Pulls the blob via `cdn/client/v1` (paid), caches it locally
+5. Streams to the client at the node's own delivery rate while the pull is in progress
 
-**Step 2 — Paid pull from an origin-backed node (fallback):**
-
-If no peer has the blob via free peer pull (or all peers time out):
-
-1. Node connects to an origin-backed node via `cdn/client/v1` (the same protocol clients use)
-2. Pays the origin-backed node's delivery rate, caches locally, streams to client
-3. The requesting node absorbs the origin-backed node's delivery cost from its margin
-
-**Step 3 — Redirect (last resort):**
+**Step 2 — Redirect (last resort):**
 
 If the node chooses not to do a pull-through (config option `pull_through: false`):
 
 1. Returns a redirect to an origin-backed node's address
 2. Client opens a channel with the origin-backed node directly
 
-The `StreamResponse` message includes an optional `redirect` field for Step 3. Pull-through (Steps 1-2) is the default and preferred path — it earns the node delivery revenue and warms the cache for future requests.
-
-**Peer-first rationale:** Peer pulls are typically faster (nearby datacenter, no S3 round-trip overhead), free of egress charges, and keep origin load minimal. After the first client in a region triggers an origin pull, all subsequent nodes in that region get the blob from peers.
+The `StreamResponse` message includes an optional `redirect` field for Step 2. Pull-through (Step 1) is the default and preferred path — it earns the node delivery revenue and warms the cache for future requests. The requesting node absorbs the source node's delivery cost from its margin.
 
 ### 7.2 Prefetching and Warming
 
-Nodes can proactively cache popular content before it's requested:
+Nodes can proactively cache popular content before it's requested by paying to pull it from other nodes:
 
-- **Popularity signals from gossip:** If multiple peers announce a blob, it's popular. Worth caching.
-- **Related content prefetch:** Applications can hint at related blobs (e.g., via a prefetch list in application-level metadata). Nodes can speculatively cache related blobs when one is requested.
+- **Popularity signals from gossip:** If multiple nodes announce a blob, it's popular. Worth paying to cache.
+- **Related content prefetch:** Applications can hint at related blobs (e.g., via a prefetch list in application-level metadata). Nodes can speculatively pull and cache related blobs when one is requested.
 
-These are local heuristics. No coordination protocol is needed.
+These are local heuristics. No coordination protocol is needed. All prefetch pulls are paid via `cdn/client/v1`.
 
 ### 7.3 Eviction
 
 LRU or frequency-weighted eviction (LFU) are both reasonable. Operators should tune cache size to maximize hit rate within their storage budget. A node with a 100% hit rate on a popular catalog earns maximum revenue per unit of bandwidth.
 
 **Minimum viable cache:** A set of popular blobs (e.g., 400 MB of frequently requested content) cached by 10 nodes globally is a functional CDN for that content.
-
-### 7.4 Node-to-Node Transfer Protocol
-
-Nodes pull blobs from peers using the same QUIC/iroh transport used for client delivery, with a different ALPN identifier to distinguish the connection type.
-
-**ALPN:** `cdn/peer/v1` (client delivery uses `cdn/client/v1`)
-
-**Authentication:** The requesting node identifies itself by its iroh `NodeId`. The serving node verifies the requester is a staked node by checking the on-chain registry (cached locally, refreshed every 10 minutes). Unstaked nodes are rejected — this prevents free-riders who never serve clients from draining peer bandwidth.
-
-**No payment channel:** Peer pulls carry no vouchers and no payment. The serving node donates bandwidth; the economic return is indirect — a better-seeded network means more clients find content locally, raising delivery volume for everyone.
-
-**Peer pull availability:** Peer pulls are available between any staked nodes that opt in (via `accepts_peer_pull` in their `CacheAnnounce` message). Origin-backed nodes may set this to false to avoid absorbing egress costs for free — in that case, other nodes can still fetch from them via the paid `cdn/client/v1` path.
-
-**Transfer flow:**
-
-```
-Requesting node                     Serving node
-      │                                   │
-      │── PeerPullRequest(hash, nodeId) ──►│
-      │                                   │ verify nodeId is staked
-      │◄── PeerPullResponse(ok | reject) ──│
-      │                                   │
-      │◄══════ blob chunks (BLAKE3) ══════│
-      │                                   │
-      │ verify hash, cache locally        │
-```
-
-**`PeerPullRequest` message:**
-
-```rust
-struct PeerPullRequest {
-    hash: Hash,
-    requester_node_id: NodeId,
-    requester_eth_address: Address,  // for registry lookup
-    timestamp: u64,
-    signature: Bytes,                // signs hash + timestamp, proves key ownership
-}
-```
-
-**`PeerPullResponse` variants:**
-
-```rust
-enum PeerPullResponse {
-    Ok { size_bytes: u64 },
-    NotCached,                    // don't have it; try someone else
-    Reject { reason: RejectReason }, // not staked, rate-limited, etc.
-}
-```
-
-**Rate limiting:** Serving nodes apply a per-peer bandwidth cap (default: 100 MB/hour per requesting node, operator-configurable). This prevents a single node from monopolizing a peer's outbound bandwidth. Requests exceeding the cap receive `Reject { reason: RateLimited }`.
-
-**Partial failure:** If a peer pull stalls mid-transfer (peer goes offline, connection drops), the requesting node falls back to the next candidate in its routing table or to an origin-backed node. Partial data received so far is discarded — BLAKE3 verification only passes on a complete blob.
-
-**Why free rather than a wholesale rate?**
-
-A wholesale micro-payment for peer pulls would require payment channels between every pair of nodes — O(n^2) channels. The economic benefit to individual nodes is small (peer pull costs are a fraction of total operating costs), while the protocol complexity is large. Free peer sharing keeps the design simple and creates a network externality: every node that shares freely benefits from others doing the same.
 
 ---
 
@@ -389,46 +322,45 @@ Clients query this registry on first startup to find their initial peers, then r
 
 ### 10.1 Revenue Model
 
-A node earns only when it delivers bytes. No delivery, no revenue.
+A node earns when it delivers bytes — to clients or to other nodes. No delivery, no revenue.
 
 **Unit economics example** (operator at $35/month VPS with 10 TB/month bandwidth):
 
-| Metric | Without peer sharing | With peer sharing |
-| ------ | ------------------- | ----------------- |
-| Bandwidth allowance | 10,000 GB/month | 10,000 GB/month |
-| Cache miss rate | 30% (3,000 GB miss) | 10% (1,000 GB miss) |
-| Origin pull cost (B2, $0.01/GB) | $30/month | $10/month |
-| Peer pull bandwidth cost | — | ~$2/month (inbound) |
-| Infrastructure cost | $65/month | $47/month |
-| Revenue at $0.00001/MB | $100/month | $100/month |
-| Gross profit | ~$35/month | ~$53/month |
+| Metric | Value |
+| ------ | ----- |
+| Bandwidth allowance | 10,000 GB/month |
+| Client delivery volume | 7,000 GB/month |
+| Node-to-node delivery volume | 3,000 GB/month |
+| Cache miss rate | 15% (1,500 GB miss) |
+| Paid pull cost for cache misses | ~$15/month |
+| Infrastructure cost | $50/month |
+| Revenue at $0.00001/MB (client + node-to-node) | $100/month |
+| Gross profit | ~$50/month |
 
-Peer sharing reduces origin pull costs significantly once the network reaches a critical mass of nodes. A new node in the same region as an established node can warm most of its cache from peers rather than origin.
+Nodes earn revenue from both client delivery and serving content to other nodes. A well-positioned node with popular content cached earns from both streams. A new node in the same region as an established node pays to warm its cache but recovers that cost through subsequent client delivery revenue.
 
-Revenue depends entirely on traffic to clients. A node serving no clients earns $0. This is the correct incentive: nodes compete on cache quality, latency, and price to attract clients.
+Revenue depends on traffic. A node serving no bytes earns $0. This is the correct incentive: nodes compete on cache quality, latency, and price to attract traffic.
 
 ### 10.2 Profitability Drivers
 
 | Factor | Effect | Provider control |
 | ------ | ------ | ---------------- |
-| Cache hit rate | Higher hit rate = lower origin pull costs | Cache popular content |
-| Peer mesh density | More peers with overlapping catalogs = fewer origin pulls | Operate in a well-seeded region |
+| Cache hit rate | Higher hit rate = lower pull costs, more direct revenue | Cache popular content |
+| Network density | More nodes in region = more pull revenue opportunities | Operate in a well-connected region |
 | Geographic placement | Closer to clients = lower latency = preferred in selection | Choose datacenter region |
-| Delivery rate | Lower rate attracts more clients, lower margin | Set rate strategically |
+| Delivery rate | Lower rate attracts more traffic, lower margin | Set rate strategically |
 | Bandwidth cost | Lower cost provider has more margin headroom | Choose cheap bandwidth provider |
-| Cache size | Larger cache = higher hit rate and more shareable content | Provision more disk |
+| Cache size | Larger cache = higher hit rate and more content to sell | Provision more disk |
 
 ### 10.3 Cold Start Problem
 
 A new node has an empty cache. It earns nothing until it caches content. Two strategies:
 
-**Passive warm-up:** Serve origin pull-through requests (at a slight loss or break-even) to populate the cache. Once cache is warm, flip to serving from cache and earning margin.
+**Passive warm-up:** Serve pull-through requests (at a slight loss or break-even) to populate the cache. Once cache is warm, flip to serving from cache and earning margin.
 
-**Active warm-up:** Prefetch the top N most popular blobs before accepting client connections. The node can pull these from peers (free) or from origin. A public popularity API (or on-chain analytics from delivery payment volume) provides the top-N list.
+**Active warm-up:** Prefetch the top N most popular blobs before accepting client connections. The node pays to pull these from other nodes or from origin via `cdn/client/v1`. A public popularity API (or on-chain analytics from delivery payment volume) provides the top-N list. This is an upfront investment that pays off once the cache is warm and the node begins earning delivery revenue.
 
-**Peer-assisted warm-up:** A new node announces itself on gossip without any cached content. Existing nodes in the region detect the new peer and can proactively push their most popular blobs to it (unsolicited `PeerPush` — see Section 7.4). This is optional and altruistic, but established nodes benefit from having a local peer that reduces origin load for both.
-
-The protocol supports all strategies; no special handling is required.
+The protocol supports both strategies; no special handling is required.
 
 ---
 
@@ -519,11 +451,11 @@ This CDN model deliberately simplifies the problem:
 | ------- | -------------- | ---------- |
 | Where data lives permanently | Decentralized providers (iroh-blobs) | Centralized origin (S3/R2) |
 | What providers are paid for | Storing + delivering | Delivering to clients only |
-| Inter-node data transfer | Not applicable (each node owns its data) | Free peer pulls between staked nodes |
+| Inter-node data transfer | Not applicable (each node owns its data) | Paid pulls via `cdn/client/v1` between nodes |
 | Storage durability guarantee | Replication factor N, pinning deals | S3's 11-nines (operator responsibility) |
 | Provider data commitment | Must store for agreed duration | Can evict anytime |
 | Staking slash conditions | Missing data, not replicating | Serving bad data (hash mismatch) |
-| Node operator burden | Must guarantee data persistence | Cache, share, and serve |
+| Node operator burden | Must guarantee data persistence | Cache and serve |
 | Content upload flow | Client→providers via iroh-blobs | Client→S3, node pulls on demand |
 | Economics complexity | Storage payments + delivery payments | Delivery payments only |
 | Node roles | Distinct provider types | Single node role (origin backend is config) |
@@ -544,4 +476,4 @@ This CDN model deliberately simplifies the problem:
 
 5. **Competing on latency vs. price.** The client selection algorithm currently prioritizes price then latency. In practice, a $0.000001/MB cheaper node that's 200ms farther away is probably worse for UX. Should selection weight latency more heavily? **Recommendation:** Make the selection function configurable with sensible defaults. Latency x price scoring (e.g., `score = rate * latency_ms`) is more realistic than lexicographic ordering.
 
-6. **PeerPush unsolicited transfers.** Section 7.4 mentions that established nodes can proactively push blobs to new peers. This is useful for warm-up but could be abused (flooding a new node with unwanted data). **Recommendation:** New nodes must opt in to unsolicited pushes via a flag in their `CacheAnnounce` message (`accepts_peer_push: bool`). Default false. Nodes enable it during their warm-up phase and disable it once the cache is populated.
+6. **Node-to-node payment channel management.** Since all node-to-node transfers are paid via `cdn/client/v1`, nodes need payment channels with each other. In a large network, this could mean many open channels. **Recommendation:** Nodes open channels lazily on first pull and keep a pool of channels with frequently used peers. Channel management follows the same pattern as client-to-node channels.

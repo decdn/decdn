@@ -37,7 +37,7 @@ The native token (TOKEN) is not used for delivery payments. It is reserved for s
 
 - Origin-backed nodes set a higher rate because they bear backend costs (storage + egress from their hidden backing store). They are the effective price ceiling for any blob they hold.
 - A cache-only node that pays an origin-backed node to pull a blob can then serve that blob to many clients at a markup, recouping the origin cost across multiple deliveries.
-- A node in a region where no peer has the content yet can charge a premium for that first delivery. Once it has the blob, other nearby nodes pull from it for free (via `cdn/peer/v1`) and compete for local clients at lower rates.
+- A node in a region where no peer has the content yet can charge a premium for that first delivery. Once it has the blob, other nearby nodes can pull from it at a competitive rate and compete for local clients.
 - Nodes with cheaper bandwidth or better hardware can sustainably undercut others; nodes in high-demand regions can charge more and still win on latency.
 
 This means the network self-balances: popular content gets replicated because caching it is profitable, competition drives prices down in well-served regions, and unpopular content stays at origin-backed node rates until demand justifies caching it. No central coordinator decides where to replicate what.

@@ -5,19 +5,18 @@
 
 ## Context
 
-Nodes and clients communicate over QUIC connections established via iroh. We need to define what protocols run over those connections: how a client or node requests a blob and pays for it, how a node pulls a blob from a peer for free, and how content availability is broadcast across the network.
+Nodes and clients communicate over QUIC connections established via iroh. We need to define what protocols run over those connections: how a client or node requests a blob and pays for it, and how content availability is broadcast across the network.
 
 The protocol layer must be distinct from the transport layer (iroh/QUIC) and the payment layer (vouchers, channels) so each can evolve independently.
 
 ## Decision
 
-Four protocols, each identified by an ALPN string:
+Three protocols, each identified by an ALPN string:
 
 | ALPN | Participants | Purpose |
 | --- | --- | --- |
 | `cdn/probe/v1` | any node ↔ any node | Latency and availability check before committing to a node |
-| `cdn/client/v1` | payer ↔ delivering node | Blob delivery with payment vouchers (client→node, node→node on cache miss) |
-| `cdn/peer/v1` | node ↔ node | Unpaid peer blob pull between staked nodes |
+| `cdn/client/v1` | payer ↔ delivering node | Paid blob delivery with payment vouchers (client→node, node→node on cache miss) |
 | iroh-gossip built-in | all nodes | Content availability announcements, node discovery |
 
 ### `cdn/probe/v1` — latency probe
@@ -72,25 +71,6 @@ The delivering node advertises its `rate_per_mb` in `StreamResponse`. The payer 
 
 The protocol is self-enforcing: payer stops sending vouchers → delivering node stops sending chunks; delivering node stops sending chunks → payer stops sending vouchers.
 
-### `cdn/peer/v1` — unpaid node-to-node pull
-
-Between any staked nodes that opt in to peer pulls (via `accepts_peer_pull` in their `CacheAnnounce`). Nodes configured with an origin backend may choose not to accept peer pulls to avoid absorbing backend egress costs for free — in that case, peers must use `cdn/client/v1` (paid) to pull from them.
-
-```text
-Requesting node                 Serving node
-  |                                |
-  |--- PeerPullRequest {hash,     |
-  |     node_id, eth_addr, sig} -->|
-  |                                | verify node_id is staked
-  |<-- PeerPullResponse {ok |     |
-  |     not_cached | reject} ------|
-  |                                |
-  |<====== blob chunks ============|
-  |  (BLAKE3-verified, no voucher) |
-```
-
-The requesting node signs `{hash, timestamp}` with its iroh private key. The serving node verifies the requester is staked in the on-chain registry before serving. No payment channel.
-
 ### Gossip — content availability
 
 Content availability is broadcast over iroh-gossip on region-scoped topics (`cdn/region/{cc}/v1`) and a global topic (`cdn/global/v1`). All staked nodes publish `CacheAnnounce` messages listing hashes they hold (max 500 entries) or a Bloom filter for large sets. Clients and nodes maintain a local routing table (`hash → Vec<NodeId>`) from received announcements. The probe step determines cost and latency for each candidate.
@@ -115,5 +95,4 @@ All protocol messages use [postcard](https://docs.rs/postcard) — compact, no-s
 - Probe RTT includes iroh's NAT traversal overhead on first connection, inflating the latency estimate. Reusing existing connections for probes gives a cleaner signal.
 - A node under load can respond to probes quickly but deliver slowly — probe RTT is necessary but not sufficient. Reputation (separate system) provides the longer-term signal.
 - The `cdn/client/v1` voucher cadence (1 MB) is coarser than iroh-blobs' internal chunk granularity (1024 bytes); the payment layer and transfer layer operate at different tick rates, requiring a buffering layer between them
-- `cdn/peer/v1` registry lookup introduces a network dependency per connection; a stale local registry cache could reject a legitimate peer for up to 10 minutes after they stake
 - Postcard has no schema evolution story — adding fields requires a new ALPN version (`cdn/client/v2`); version negotiation must be planned before the first breaking change
