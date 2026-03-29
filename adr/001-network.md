@@ -84,7 +84,7 @@ struct NodeInfo {
 }
 ```
 
-`multiaddrs` uses `bytes` rather than `string[]` for gas efficiency. The encoding is a packed array of `(uint16 length, bytes data)` entries. Clients parse this off-chain. Maximum size is 1024 bytes (hardcoded).
+`multiaddrs` uses `bytes` rather than `string[]` for gas efficiency. The encoding is a packed array of `(uint16 length, bytes data)` entries. Clients parse this off-chain. Maximum encoded size is bounded by the governable `maxMultiaddrSize` parameter (default 1024 bytes; see ADR 004 for safety bounds).
 
 ### Interface (additions to StakingRegistry)
 
@@ -114,7 +114,8 @@ function getActiveNodes(uint256 offset, uint256 limit)
 event NodeRegistered(
     bytes32 indexed nodeId,
     address indexed ethAddress,
-    bytes multiaddrs
+    bytes multiaddrs,
+    string regionHint
 );
 event NodeMultiaddrUpdated(bytes32 indexed nodeId, bytes newMultiaddrs);
 event NodeDeregistered(bytes32 indexed nodeId);
@@ -123,9 +124,9 @@ event NodeAutoEjected(bytes32 indexed nodeId, uint256 remainingStake);
 
 ### Constraints
 
-- **One-to-one mapping.** Each `nodeId` maps to exactly one `ethAddress` and vice versa. Enforced with `require(nodeByAddress[msg.sender].nodeId == bytes32(0))` and `require(nodes[nodeId].ethAddress == address(0))`. This aligns with ADR 004: "Max stake registrations per node: 1."
-- **`registerNode` binds `msg.sender` to `nodeId`.** The caller's Ethereum address becomes `ethAddress`. This binding is on-chain and permanent until deregistration — distinct from the ephemeral per-session `NodeId`-to-address binding described in ADR 003 for clients.
-- **`deregisterNode` triggers unbonding.** Sets `active = false` and starts the 7-day unbonding period (ADR 004). Stake remains slashable during unbonding to prevent slash-then-run.
+- **One-to-one mapping.** Each `nodeId` maps to exactly one `ethAddress` and vice versa. Enforced with `require(nodeByAddress[msg.sender].nodeId == bytes32(0))` and `require(nodes[nodeId].ethAddress == address(0))`, where `bytes32(0)` is the sentinel for "unregistered". This aligns with ADR 004: "Max stake registrations per node: 1."
+- **`registerNode` rejects `nodeId == bytes32(0)`**, since this value is reserved as the unregistered sentinel. It binds `msg.sender` to `nodeId` — the caller's Ethereum address becomes `ethAddress`. This binding is on-chain and permanent until deregistration, distinct from the ephemeral per-session `NodeId`-to-address binding described in ADR 003 for clients.
+- **`deregisterNode` triggers unbonding.** Sets `active = false` and starts the current unbonding period (default 7 days, minimum 3 days per ADR 004). Stake remains slashable during unbonding to prevent slash-then-run.
 - **Auto-ejection.** When slashing drops a node's stake below 50% of the minimum stake requirement (ADR 004), the contract sets `active = false` and emits `NodeAutoEjected`. The node must re-stake at full minimum to rejoin.
 
 ### Multiaddr Update Policy
@@ -156,6 +157,6 @@ Three tiers, from simplest to most scalable:
 
 ### NodeId Ownership Verification
 
-**PoC simplification:** On-chain ed25519 verification is skipped. A node registering someone else's `nodeId` gains nothing — it cannot complete iroh QUIC handshakes with that identity, so no client or peer will connect to it. The misregistration is detectable off-chain and wastes only the attacker's gas.
+**PoC simplification:** On-chain ed25519 verification is skipped. A node registering someone else's `nodeId` gains nothing in terms of traffic — it cannot complete iroh QUIC handshakes with that identity, so no client or peer will connect to it. However, under the one-to-one uniqueness constraint, a malicious first registration for a given `nodeId` blocks the legitimate owner from registering (a cheap griefing/DoS). In the PoC this risk is accepted: the deployment is small and permissioned, and misregistrations are detectable off-chain and resolvable via admin intervention.
 
-**Production hardening:** `registerNode` should require a signature proving the caller controls the ed25519 private key corresponding to `nodeId`: `ed25519_sign(private_key, keccak256(abi.encodePacked(nodeId, msg.sender, block.chainid)))`. Verification uses an ed25519 precompile or library (e.g., RIP-7212 on Arbitrum). This closes the gap for adversarial scenarios where registering a false `nodeId` could poison the registry or block the real owner from registering.
+**Production hardening:** `registerNode` should require a signature proving the caller controls the ed25519 private key corresponding to `nodeId`: `ed25519_sign(private_key, keccak256(abi.encodePacked(nodeId, msg.sender, block.chainid)))`. Verification uses an ed25519 precompile (where available) or a well-audited ed25519 verification library; the concrete mechanism is chain-specific and deferred to implementation. This proof also enables a reclaim flow — the legitimate `nodeId` owner can rebind to a new address, closing the griefing gap described above.
