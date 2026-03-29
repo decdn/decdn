@@ -64,7 +64,7 @@ The implementation language is Rust. The networking stack is iroh, which provide
 
 ### [ADR 001 — Network Topology and Peer Mesh](001-network.md)
 
-**Flat peer mesh. Gossip for content availability. DHT for lookup.**
+**Flat peer mesh. Gossip-only content discovery (DHT deferred to post-PoC).**
 
 All staked nodes form a flat mesh. Cache state is broadcast over iroh-gossip on regional topics. On a cache miss, nodes pull from another node that has the blob (paid via `cdn/client/v1`). No external URL is ever accessed — the network is fully self-contained. The on-chain node registry is part of the `StakingRegistry` contract; the `NodeInfo` struct maps `NodeId` (ed25519 public key) to QUIC multiaddrs and Ethereum address.
 
