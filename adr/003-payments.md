@@ -297,13 +297,17 @@ bytes32 constant DOMAIN_TYPEHASH = keccak256(
     "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
 );
 
-bytes32 DOMAIN_SEPARATOR = keccak256(abi.encode(
-    DOMAIN_TYPEHASH,
-    keccak256("StablePaymentChannel"),   // name
-    keccak256("1"),                      // version
-    block.chainid,                       // chainId (L2)
-    address(this)                        // verifyingContract
-));
+bytes32 public immutable DOMAIN_SEPARATOR;
+
+constructor() {
+    DOMAIN_SEPARATOR = keccak256(abi.encode(
+        DOMAIN_TYPEHASH,
+        keccak256(bytes("StablePaymentChannel")),   // name
+        keccak256(bytes("1")),                      // version
+        block.chainid,                              // chainId (L2)
+        address(this)                               // verifyingContract
+    ));
+}
 ```
 
 The domain separator binds every voucher to a specific contract deployment on a specific chain. A voucher signed for Arbitrum Sepolia cannot be replayed on mainnet, and a voucher signed for one `StablePaymentChannel` deployment cannot be replayed against an upgraded or redeployed contract at a different address.
@@ -326,9 +330,9 @@ bytes32 digest = keccak256(abi.encodePacked(
 ));
 ```
 
-**Verification:** `ecrecover(digest, v, r, s)` must equal `channel.client`. The signature is encoded as 65 bytes (`r || s || v`), matching the format used by `eth_sign` and standard Ethereum libraries.
+**Verification:** Implementations must use a hardened ECDSA helper (e.g., OpenZeppelin's `ECDSA.recover`) or equivalent logic that rejects non-canonical `s` values and restricts `v` to `27`/`28`. The recovered signer must equal `channel.client`. The signature is encoded as 65 bytes (`r || s || v`), matching the format used by `eth_sign` and standard Ethereum libraries.
 
-The `DOMAIN_SEPARATOR` should be computed once in the constructor and stored as an immutable. If the contract is deployed behind a proxy and may be migrated to a different chain, it should be recomputed per-call using `block.chainid` to remain correct after an L2 chain ID change.
+The `DOMAIN_SEPARATOR` is computed once in the constructor and stored as an immutable. If the contract is deployed behind a proxy and may be migrated to a different chain, it should be cached in a state variable and recomputed only when `block.chainid` changes (the pattern used by OpenZeppelin's `EIP712` base contract), rather than on every call.
 
 ### StakingRegistry Modifications
 
