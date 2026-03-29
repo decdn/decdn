@@ -14,7 +14,7 @@ Two questions are in scope:
 
 ## Decision
 
-All staked nodes form a flat peer mesh with no fixed routing hierarchy. Content discovery is gossip-based:
+All staked nodes form a flat peer mesh with no fixed routing hierarchy. Node discovery is gossip-based; content discovery is probe-based:
 
 ```mermaid
 graph TD
@@ -25,26 +25,75 @@ graph TD
         REG_ETC["cdn/region/.../v1"]
     end
 
-    CA["CacheAnnounce<br/>{hashes[] or bloom_filter}"]
+    NA["NodeAnnounce<br/>{region, load, popular_hashes}"]
 
-    CA -->|all staked nodes publish| GLOBAL
-    CA -->|regional nodes publish| REG_US
-    CA -->|regional nodes publish| REG_DE
-    CA -->|regional nodes publish| REG_ETC
+    NA -->|all staked nodes publish| GLOBAL
+    NA -->|regional nodes publish| REG_US
+    NA -->|regional nodes publish| REG_DE
+    NA -->|regional nodes publish| REG_ETC
 
-    GLOBAL --> RT["Local Routing Table<br/>hash -> Vec of NodeId"]
-    REG_US --> RT
-    REG_DE --> RT
-    REG_ETC --> RT
+    GLOBAL --> PT["Peer Table<br/>NodeId -> NodeAnnounce"]
+    REG_US --> PT
+    REG_DE --> PT
+    REG_ETC --> PT
 
-    RT -->|miss| MISS["No Known Provider<br/>(serve from local origin if configured,<br/>otherwise reject)"]
+    PT -->|cache miss| PROBE["Probe Fan-Out<br/>cdn/probe/v1 to all known peers"]
+    PROBE -->|has_blob: true| SELECT["Select best by rate_per_mb x rtt_ms"]
+    PROBE -->|no provider found| MISS["No Known Provider<br/>(serve from local origin if configured,<br/>otherwise reject)"]
 ```
 
-- **iroh-gossip** for ongoing content state broadcast. Nodes publish `CacheAnnounce` messages on regional topics (`cdn/region/{cc}/v1`) and a global topic (`cdn/global/v1`). Origin-backed nodes announce all content they hold; pure-cache nodes announce their current cache. Each announcement lists blob hashes (capped at 500 entries) or a Bloom filter for large sets. Both clients and nodes maintain a local routing table (`hash → Vec<NodeId>`) built from received announcements. The routing table does not distinguish between origin-backed and cache-only nodes — the probe step determines which is cheaper and faster.
+#### Node Discovery (Gossip)
 
-- **PoC scale: gossip-only discovery.** At tens of nodes, every node receives every `CacheAnnounce` on the global topic, so the local routing table has near-complete coverage of network-wide content. A routing table miss means no other node is known to hold the blob. If the requesting node is itself origin-backed for that content, it serves from its own origin store; otherwise it returns an error to the client. A content-addressed DHT is deferred to production scale (see [Future Work: Content-Addressed DHT](#future-work-content-addressed-dht) below).
+Nodes broadcast lightweight metadata over iroh-gossip on regional topics (`cdn/region/{cc}/v1`) and a global topic (`cdn/global/v1`). Each node publishes `NodeAnnounce` messages:
 
-On a cache miss, a node probes candidates from its routing table, selects the best by `rate_per_mb × rtt_ms`, and pulls via `cdn/client/v1` (paid). This is the same protocol used for client→node delivery — every byte transferred in the network is paid. Origin-backed nodes typically charge more (reflecting their backend egress costs) and set the effective price ceiling. Cache-only nodes that have the blob compete at lower rates.
+```rust
+struct NodeAnnounce {
+    node_id: NodeId,
+    region: String,              // ISO 3166-1 alpha-2 (self-reported)
+    load: LoadHint,              // approximate current utilization
+    popular_hashes: Vec<Hash>,   // top-N most-requested hashes (max 20)
+    timestamp: u64,              // microseconds since epoch
+    signature: Signature,        // node's iroh key signs the message
+}
+
+struct LoadHint {
+    active_streams: u32,         // current concurrent delivery streams
+    bandwidth_utilization: u8,   // 0-100 percentage of self-reported capacity
+}
+```
+
+- **`NodeAnnounce` carries node-level metadata only** — no content inventory. `popular_hashes` (capped at 20) is a popularity signal for prefetching, not a content catalog. Message size is ~700 bytes worst case.
+- **`LoadHint`** makes the "approximate load in gossip announcements" from [ADR 008](008-reputation.md) section 9 concrete, feeding tie-breaking logic.
+- **Announce interval** is a per-node configuration parameter (PoC default TBD during implementation).
+
+Both clients and nodes maintain a **peer table** (`NodeId → NodeAnnounce`) built from received gossip messages. This table tracks which nodes exist and their metadata — it does not track content.
+
+#### Content Discovery (Probe Fan-Out)
+
+Content discovery is on-demand via the existing `cdn/probe/v1` protocol. When a node or client needs a blob, it probes known peers in parallel:
+
+1. **Probe cache check.** Look up `hash` in a short-lived LRU cache (`hash → Vec<(NodeId, rate_per_mb, rtt)>`, TTL 30 seconds, max 1024 entries). If a valid entry exists, skip to step 4.
+2. **Fan-out.** Send `ProbeRequest {hash, timestamp_us}` in parallel to all known nodes (regional + global). The `cdn/probe/v1` protocol is unchanged — `ProbeResponse {has_blob, rate_per_mb, timestamp_us, signature}`.
+3. **Collect.** Wait up to 200ms. Store all `has_blob: true` responses in the probe cache.
+4. **Select.** Pick the best provider by `rate_per_mb × rtt_ms` (lowest wins). Open `cdn/client/v1` stream and pull.
+
+On probe cache hit, if the selected provider no longer has the blob (evicted since the cached probe), the node falls back to a fresh fan-out.
+
+**Note:** The 30s probe cache TTL overlaps with ADR 005's 30-second slashing evidence window for rate manipulation. Implementation should keep the probe cache TTL shorter than the evidence window, or require a confirmation probe before committing to a paid pull from a cached entry.
+
+#### Prefetching with Dual Signals
+
+Two complementary signals drive proactive caching:
+
+**Local demand signal:** Each node tracks cache miss timestamps per hash in a bounded map (`HashMap<Hash, VecDeque<u64>>`, max 10,000 entries, LRU eviction). Each miss appends a timestamp; entries older than 5 minutes are pruned on access. When a hash crosses a configurable threshold (default: 3 misses in 5 minutes), the node proactively pulls the blob via the same probe fan-out → `cdn/client/v1` path.
+
+**Network popularity signal:** Nodes observe which hashes appear in `popular_hashes` across multiple `NodeAnnounce` messages from different peers. A hash appearing in N peers' top-20 lists suggests cross-region demand. Tracked by storing the announcing peer's NodeId and announcement timestamp for each hash; entries older than the window are pruned on access. Threshold is configurable (default: seen in 3+ peers' popular lists within 10 minutes).
+
+Both signals feed the same action: probe fan-out → select provider → pull via `cdn/client/v1` (paid). PoC implements both signals with conservative (high) network popularity thresholds.
+
+- **PoC scale: probe fan-out discovery.** At tens of nodes, every probe fan-out reaches all peers, so content discovery has complete coverage. A probe fan-out miss (no `has_blob: true` responses) means no node in the network holds the blob. If the requesting node is itself origin-backed for that content, it serves from its own origin store; otherwise it returns an error to the client. At production scale, probe fan-out can be bounded via selective fan-out or a content-addressed DHT (see [Future Work: Scaling Content Discovery](#future-work-scaling-content-discovery) below).
+
+On a cache miss, a node checks its probe cache or performs a probe fan-out (see Content Discovery above), selects the best provider by `rate_per_mb × rtt_ms`, and pulls via `cdn/client/v1` (paid). This is the same protocol used for client→node delivery — every byte transferred in the network is paid. Origin-backed nodes typically charge more (reflecting their backend egress costs) and set the effective price ceiling. Cache-only nodes that have the blob compete at lower rates.
 
 Node identity is the iroh `NodeId` (ed25519 public key). All staked nodes register in an on-chain registry mapping `NodeId → QUIC multiaddrs + Ethereum address`. Clients query this registry on first startup to find initial peers.
 
@@ -54,28 +103,37 @@ Node identity is the iroh `NodeId` (ed25519 public key). All staked nodes regist
 
 - No external infrastructure is reachable from the network — origin-backed nodes completely hide their backends, so no client or node can bypass the payment layer by going directly to a storage URL
 - All nodes participate in the same discovery and transport protocols; the only difference between origin-backed and cache-only nodes is whether they have an origin store configured
-- Regional gossip topics bound message volume: nodes in one region don't receive announcements from irrelevant regions
+- Gossip messages are lightweight (~700 bytes) — no content inventories, Bloom filters, or hash lists. Regional gossip topics bound message volume: nodes in one region don't receive announcements from irrelevant regions
+- Content discovery via probe fan-out eliminates stale routing table entries — every probe response is fresh
+- Probe cache prevents redundant fan-outs for popular content within a 30-second window
 - Once a node in a region caches a blob, other nodes in that region can pull from it at competitive rates rather than paying origin-backed node prices — popular content gets cheaper as it spreads
 - The flat mesh is simple to reason about and easy to test at small scale (PoC is tens of nodes)
 
 **Negative:**
 
-- Gossip consistency is eventual — a node that evicts or loses content may still appear in routing tables until the next `CacheAnnounce` cycle (announce interval is a per-node configuration parameter; PoC default TBD during implementation); clients and nodes must handle stale entries by falling back to the next candidate
-- Bloom filter announcements (for large caches) introduce false positives: a probe to a node that turns out not to have the blob wastes a round-trip
-- Every transfer is paid, so nodes pulling content on cache miss incur a cost that must be recouped through subsequent client deliveries; this creates a natural economic barrier to speculative caching
+- Probe fan-out generates O(N) probe messages per cache miss. At PoC scale (tens of nodes) this is negligible; at production scale, fan-out must be bounded (DHT or selective fan-out)
+- Cold cache miss adds ~200ms latency (probe timeout) compared to an instant routing table lookup; mitigated by probe cache for repeated lookups within 30 seconds
+- Probe cache introduces a brief staleness window (up to 30s) where a node may attempt to pull from a provider that has evicted the blob; the fallback is a fresh fan-out
+- `popular_hashes` in `NodeAnnounce` explicitly gossips which blobs are in high demand — a new, compactly gossiped signal distinct from content availability (which is now only probe-discoverable)
 - Self-reported region hints (ISO 3166-1 alpha-2) are unverified; a node could misreport its region to appear in more gossip topics
+- Every transfer is paid, so nodes pulling content on cache miss incur a cost that must be recouped through subsequent client deliveries; this creates a natural economic barrier to speculative caching
 - Origin-backed nodes become the last line of defence for content availability — if all origin-backed nodes for a given blob go offline or are deregistered, the content becomes permanently unavailable (unless cached elsewhere). Content owners are responsible for origin node uptime.
 
-### Future Work: Content-Addressed DHT
+### Future Work: Scaling Content Discovery
 
-At production scale (hundreds or thousands of nodes), gossip alone may not guarantee complete routing table coverage — topic partitioning, message volume, and churn can cause gaps. A content-addressed DHT layer (Kademlia or similar) publishing `(hash → Vec<NodeId>)` records over iroh QUIC would introduce an additional lookup step between a routing-table miss and the terminal "No Known Provider" outcome.
+At production scale (hundreds or thousands of nodes), broadcast probe fan-out becomes expensive — O(N) probes per cache miss. Three scaling strategies, in order of complexity:
 
-Key considerations for a production DHT:
+1. **Selective fan-out:** Probe only regional peers + a random subset of global peers. Reduces probe count while maintaining discovery probability. No protocol changes.
 
-- **iroh's built-in mainline DHT** (pkarr/`DhtDiscovery`) resolves `NodeId → address` for node discovery only — it does not support arbitrary content-hash lookups. A separate content DHT overlay would be required.
-- **iroh's native discovery services** (DNS/pkarr) resolve `NodeId → address` without on-chain lookups and should be evaluated for production address resolution, complementing the on-chain registry which remains the authoritative source for enumerating active staked nodes.
-- **As of March 2026, no existing Rust Kademlia library** integrates directly with iroh's QUIC transport; `libp2p-kad` uses libp2p's transport layer and cannot be used without an adapter. Implementation options include a custom Kademlia layer over iroh QUIC streams or an ALPN-identified DHT protocol.
-- **State storage** (in-memory vs. on-disk) and **TTL policy** for DHT records are deferred to the production design phase.
+2. **Content-addressed DHT:** A Kademlia overlay publishing `(hash → Vec<NodeId>)` records over iroh QUIC. Targeted O(log N) lookups replace O(N) fan-out. The probe protocol remains unchanged — DHT narrows the candidate set, probes confirm and measure.
+   - iroh's built-in mainline DHT (pkarr/`DhtDiscovery`) resolves `NodeId → address` for node discovery only — it does not support arbitrary content-hash lookups. A separate content DHT overlay would be required.
+   - iroh's native discovery services (DNS/pkarr) resolve `NodeId → address` without on-chain lookups and should be evaluated for production address resolution, complementing the on-chain registry which remains the authoritative source for enumerating active staked nodes.
+   - As of March 2026, no existing Rust Kademlia library integrates directly with iroh's QUIC transport; implementation options include a custom Kademlia layer over iroh QUIC streams or an ALPN-identified DHT protocol.
+   - State storage (in-memory vs. on-disk) and TTL policy for DHT records are deferred to the production design phase.
+
+3. **Gossip-based content hints:** Nodes that frequently serve certain content can advertise content "categories" or prefix ranges in `NodeAnnounce`, enabling smarter probe targeting without a full DHT.
+
+These are additive — the probe-based content discovery mechanism doesn't change, only the strategy for selecting who to probe.
 
 ---
 
