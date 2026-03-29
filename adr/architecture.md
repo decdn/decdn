@@ -218,7 +218,7 @@ The protocol does not dictate cache policy. Nodes are economically motivated to 
 
 **Cache miss resolution** follows a priority order:
 
-1. **Paid pull-through (preferred):** Node checks its routing table for peers that have the blob, probes candidates, selects by `rate_per_mb × rtt_ms`, pulls via `cdn/client/v1` (paid), caches locally, and streams to the client while the pull is in progress.
+1. **Paid pull-through (preferred):** Node checks its probe cache or performs a probe fan-out (`cdn/probe/v1` to all known peers), selects the best provider by `rate_per_mb × rtt_ms`, pulls via `cdn/client/v1` (paid), caches locally, and streams to the client while the pull is in progress.
 2. **Redirect (last resort):** If pull-through is disabled (`pull_through: false` in config), the node returns a redirect to an origin-backed node's NodeId. The client opens a channel with that node directly.
 
 **Prefetching:** Nodes can proactively cache popular content using two signals: (1) local demand — tracking cache miss frequency per hash and prefetching when a threshold is crossed (default: 3 misses in 5 minutes); (2) network popularity — observing which hashes appear in multiple peers' `popular_hashes` fields in `NodeAnnounce` gossip messages (default threshold: 3+ peers within 10 minutes). All prefetch pulls use the same probe fan-out → `cdn/client/v1` path (paid).
@@ -232,8 +232,8 @@ flowchart TD
     C --> D[Client pays per MB via vouchers]
 
     B -->|Miss| E{pull_through enabled?}
-    E -->|Yes| F[Query routing table for peers with blob]
-    F --> G["Probe candidates (cdn/probe/v1)"]
+    E -->|Yes| F["Probe fan-out (cdn/probe/v1 to all known peers)"]
+    F --> G["Collect has_blob:true responses (200ms timeout)"]
     G --> H["Select best: rate_per_mb x rtt_ms"]
     H --> I["Pull via cdn/client/v1 (node pays peer)"]
     I --> J[Cache locally + stream to client simultaneously]
