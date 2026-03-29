@@ -104,16 +104,16 @@ sequenceDiagram
 
     C->>A: auth + play request
     A->>A: verify subscription
-    A->>A: wrapped = XChaCha20(epoch_key, K_blob)
+    A->>A: wrapped = XChaCha20-Poly1305(epoch_key, K_blob)
     A->>C: sealed envelope {wrapped, epoch_id, hash}
 
     C->>N: StreamRequest {hash}
     N->>C: ciphertext (paid per MB via cdn/client/v1)
 
     C->>C: unseal envelope with private key
-    C->>C: decrypt wrapped with epoch_key to get K_blob
+    C->>C: decrypt wrapped with epoch_key via XChaCha20-Poly1305 to get K_blob
     C->>C: verify BLAKE3(ciphertext) == hash
-    C->>C: decrypt XChaCha20(K_blob, ciphertext) and play
+    C->>C: decrypt XChaCha20-Poly1305(K_blob, ciphertext) and play
 ```
 
 ### Offline Playback (lease-based access)

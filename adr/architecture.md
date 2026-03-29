@@ -286,6 +286,7 @@ graph TD
 
     protocol --> serde
     protocol --> postcard
+    protocol --> iroh
 
     style node fill:#4a9eff,color:#fff
     style cache fill:#34d399,color:#fff
