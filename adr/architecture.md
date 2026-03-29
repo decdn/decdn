@@ -66,7 +66,7 @@ The implementation language is Rust. The networking stack is iroh, which provide
 
 **Flat peer mesh. Gossip for content availability. DHT for lookup.**
 
-All staked nodes form a flat mesh. Cache state is broadcast over iroh-gossip on regional topics. On a cache miss, nodes pull from another node that has the blob (paid via `cdn/client/v1`). No external URL is ever accessed — the network is fully self-contained.
+All staked nodes form a flat mesh. Cache state is broadcast over iroh-gossip on regional topics. On a cache miss, nodes pull from another node that has the blob (paid via `cdn/client/v1`). No external URL is ever accessed — the network is fully self-contained. The on-chain node registry is part of the `StakingRegistry` contract; the `NodeInfo` struct maps `NodeId` (ed25519 public key) to QUIC multiaddrs and Ethereum address.
 
 ---
 
@@ -138,6 +138,7 @@ Nodes are ranked by a reputation score (0.0–1.0) derived from local observatio
 - A node cannot deliver paid content without being reachable via iroh NodeId; the backend is always hidden
 - A node cannot earn without delivering verifiable bytes — BLAKE3 hash mismatch voids payment
 - A node cannot join the peer mesh without staking — prevents free-riders and provides a slashable bond
+- A node cannot register without staking — `StakingRegistry` enforces `stake >= minStake` before accepting a `registerNode` call
 - Payment channels amortize on-chain costs across an entire session; per-MB payments are off-chain
 - Safety bounds on all governable parameters are hardcoded — governance cannot set fees to 100% or stake to zero
 

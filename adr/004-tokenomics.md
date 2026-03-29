@@ -239,6 +239,8 @@ Based on OpenZeppelin Governor:
 | Minimum stake | StakingRegistry | 100 TOKEN | 100,000 TOKEN |
 | Slash percentages | StakingRegistry | 1% | 100% |
 | Unbonding period | StakingRegistry | 3 days | 30 days |
+| Multiaddr update cooldown | StakingRegistry | 0 (disabled) | 86400 seconds (1 day) |
+| Max multiaddr size | StakingRegistry | 64 bytes | 1024 bytes |
 | Dispute window | StablePaymentChannel | 30 minutes | 7 days |
 | Rate floor/ceiling | StablePaymentChannel | Floor > 0 | Ceiling > floor |
 | Challenge bond | StakingRegistry | 1 TOKEN | 1,000 TOKEN |
