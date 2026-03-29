@@ -125,7 +125,7 @@ To prevent frivolous fraud proof submissions:
 If a node's stake drops below 50% of the minimum stake requirement due to accumulated slashing:
 
 - Removed from the staking registry
-- Peers drop the node from their peer table (gossip messages from unregistered nodes are rejected)
+- Peers drop the node from their peer table (gossip messages from unregistered nodes are rejected via signature + registry validation; see [ADR 001](001-network.md))
 - Remaining stake enters forced unbonding (standard unbonding period applies)
 - Node must re-stake at full minimum to rejoin
 

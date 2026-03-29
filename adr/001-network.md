@@ -52,8 +52,8 @@ struct NodeAnnounce {
     region: String,              // ISO 3166-1 alpha-2 (self-reported)
     load: LoadHint,              // approximate current utilization
     popular_hashes: Vec<Hash>,   // top-N most-requested hashes (max 20)
-    timestamp: u64,              // microseconds since epoch
-    signature: Signature,        // node's iroh key signs the message
+    timestamp_us: u64,           // microseconds since epoch
+    signature: Signature,        // node's iroh key signs all fields above
 }
 
 struct LoadHint {
@@ -68,11 +68,13 @@ struct LoadHint {
 
 Both clients and nodes maintain a **peer table** (`NodeId → NodeAnnounce`) built from received gossip messages. This table tracks which nodes exist and their metadata — it does not track content.
 
+**Gossip validation:** Before accepting a `NodeAnnounce` and updating the peer table, a node verifies: (1) the `signature` is valid for the `node_id`'s public key over all other fields (serialized via postcard, consistent with [ADR 005](005-protocol.md)); (2) the `node_id` corresponds to an active staked node in the on-chain registry (checked against a local registry cache). Messages failing either check are silently dropped. This prevents unregistered or unstaked nodes from appearing in peer tables.
+
 #### Content Discovery (Probe Fan-Out)
 
 Content discovery is on-demand via the existing `cdn/probe/v1` protocol. When a node or client needs a blob, it probes known peers in parallel:
 
-1. **Probe cache check.** Look up `hash` in a short-lived LRU cache (`hash → Vec<(NodeId, rate_per_mb, rtt)>`, TTL 30 seconds, max 1024 entries). If a valid entry exists, skip to step 4.
+1. **Probe cache check.** Look up `hash` in a short-lived LRU cache (`hash → Vec<(NodeId, rate_per_mb, rtt, ProbeResponse)>`, TTL 30 seconds, max 1024 entries). Each entry retains the full signed `ProbeResponse` for slashing evidence. If a valid entry exists, skip to step 4.
 2. **Fan-out.** Send `ProbeRequest {hash, timestamp_us}` in parallel to all known nodes (regional + global). The `cdn/probe/v1` protocol is unchanged — `ProbeResponse {has_blob, rate_per_mb, timestamp_us, signature}`.
 3. **Collect.** Wait up to 200ms. Store all `has_blob: true` responses in the probe cache.
 4. **Select.** Pick the best provider by `rate_per_mb × rtt_ms` (lowest wins). Open `cdn/client/v1` stream and pull.
