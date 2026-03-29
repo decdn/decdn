@@ -25,7 +25,7 @@ Separate the two concerns completely:
 | Content discovery | `cdn/probe/v1` fan-out | "Do you have hash X?" — on-demand, per-blob |
 | Reputation | iroh-gossip on `reputation/v1` | Signed interaction reports (unchanged from ADR 008) |
 
-`CacheAnnounce` is removed entirely. No hash lists, no Bloom filters, no local routing tables mapping `hash → Vec<NodeId>`. Issue #25 goes away completely.
+`CacheAnnounce` is removed entirely. No hash lists, no Bloom filters, and no long-lived gossip-derived routing tables mapping `hash → Vec<NodeId>` — only a bounded, TTL-based probe-result cache for short-lived routing hints remains. Issue #25 goes away completely.
 
 ---
 
@@ -105,14 +105,14 @@ Select best provider ──► Pull via cdn/client/v1
 Two complementary signals drive proactive caching:
 
 **Local demand signal:**
-- Each node tracks cache miss frequency per hash in a bounded counter map (`HashMap<Hash, (count, last_seen)>`, max 10,000 entries, LRU eviction).
-- When a hash crosses a configurable threshold (default: 3 misses in 5 minutes), the node proactively pulls the blob via the same probe fan-out → `cdn/client/v1` path.
+- Each node tracks cache miss timestamps per hash in a bounded map (`HashMap<Hash, VecDeque<u64>>`, max 10,000 entries, LRU eviction). Each miss appends a timestamp; entries older than the window (5 minutes) are pruned on access.
+- When a hash accumulates enough recent misses to cross a configurable threshold (default: 3 misses in 5 minutes), the node proactively pulls the blob via the same probe fan-out → `cdn/client/v1` path.
 - Local decision — no coordination needed.
 
 **Network popularity signal:**
 - Nodes observe which hashes appear in `popular_hashes` across multiple `NodeAnnounce` messages from different peers.
 - A hash appearing in N peers' top-20 lists suggests cross-region demand. The node can prefetch before any local client requests it.
-- Threshold is configurable (default: seen in 3+ peers' popular lists within 10 minutes).
+- Threshold is configurable (default: seen in 3+ peers' popular lists within 10 minutes). Tracked by storing the announcing peer's NodeId and announcement timestamp for each hash; entries older than the window are pruned on access.
 
 Both signals feed the same action: probe fan-out → select provider → pull via `cdn/client/v1` (paid). No special prefetch protocol.
 
@@ -142,7 +142,7 @@ Both signals feed the same action: probe fan-out → select provider → pull vi
 - Unchanged. Reputation still uses its own gossip topic and the same scoring model.
 - `LoadHint` in `NodeAnnounce` makes "approximate load in gossip announcements" concrete (ADR 008 section 9 references this for tie-breaking).
 
-### Architecture overview (`architecture.md`)
+### Architecture overview (`adr/architecture.md`)
 
 - System diagram: gossip arrows labeled `NodeAnnounce` instead of `CacheAnnounce`.
 - Cache miss flowchart updated to show probe fan-out path.
@@ -165,8 +165,8 @@ Both signals feed the same action: probe fan-out → select provider → pull vi
 
 - More probe traffic per cache miss: O(N) probes instead of a routing table lookup. At PoC scale (tens of nodes) this is negligible; at production scale, probe fan-out must be bounded (DHT or selective fan-out).
 - Adds ~200ms latency on a cold cache miss (probe timeout) compared to an instant routing table lookup. Mitigated by probe cache for repeated lookups.
-- `popular_hashes` in `NodeAnnounce` reveals demand patterns. Same privacy profile as the current `CacheAnnounce` (content availability is already public), but more explicit about popularity.
-- Probe cache introduces a brief staleness window (up to 30s) where a node may attempt to pull from a provider that has evicted the blob.
+- `popular_hashes` in `NodeAnnounce` explicitly gossips which blobs are in high demand. Content availability is now only discoverable via active probing (not broadcast), but popularity becomes a new, compactly gossiped signal with a different visibility/effort trade-off than the removed `CacheAnnounce`.
+- Probe cache introduces a brief staleness window (up to 30s) where a node may attempt to pull from a provider that has evicted the blob. Note: the 30s TTL overlaps with ADR 005's 30-second slashing evidence window for rate manipulation. Implementation should ensure that a cached probe entry used to initiate a paid pull still constitutes a fresh enough signal — either by keeping the probe cache TTL shorter than the evidence window or by requiring a confirmation probe before committing to a paid pull from a cached entry.
 
 ---
 
