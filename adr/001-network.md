@@ -42,7 +42,7 @@ graph TD
 
 - **iroh-gossip** for ongoing content state broadcast. Nodes publish `CacheAnnounce` messages on regional topics (`cdn/region/{cc}/v1`) and a global topic (`cdn/global/v1`). Origin-backed nodes announce all content they hold; pure-cache nodes announce their current cache. Each announcement lists blob hashes (capped at 500 entries) or a Bloom filter for large sets. Both clients and nodes maintain a local routing table (`hash → Vec<NodeId>`) built from received announcements. The routing table does not distinguish between origin-backed and cache-only nodes — the probe step determines which is cheaper and faster.
 
-- **PoC scale: gossip-only discovery.** At tens of nodes, every node receives every `CacheAnnounce` on the global topic, so the local routing table has near-complete coverage of network-wide content. A routing table miss means the node has no known provider for the requested blob — the requesting node returns an error to the client (or, if it is itself origin-backed for that content, serves from its own origin store). A content-addressed DHT is deferred to production scale (see Future Work below).
+- **PoC scale: gossip-only discovery.** At tens of nodes, every node receives every `CacheAnnounce` on the global topic, so the local routing table has near-complete coverage of network-wide content. A routing table miss means no other node is known to hold the blob. If the requesting node is itself origin-backed for that content, it serves from its own origin store; otherwise it returns an error to the client. A content-addressed DHT is deferred to production scale (see [Future Work: Content-Addressed DHT](#future-work-content-addressed-dht) below).
 
 On a cache miss, a node probes candidates from its routing table, selects the best by `rate_per_mb × rtt_ms`, and pulls via `cdn/client/v1` (paid). This is the same protocol used for client→node delivery — every byte transferred in the network is paid. Origin-backed nodes typically charge more (reflecting their backend egress costs) and set the effective price ceiling. Cache-only nodes that have the blob compete at lower rates.
 
@@ -72,9 +72,9 @@ At production scale (hundreds or thousands of nodes), gossip alone may not guara
 
 Key considerations for a production DHT:
 
-- **iroh's built-in mainline DHT** (`discovery-pkarr-dht` feature) resolves `EndpointId → address` for node discovery only — it does not support arbitrary content-hash lookups. A separate content DHT overlay would be required.
-- **iroh's native discovery services** (DNS/pkarr for node resolution) should be evaluated for production bootstrap alongside the on-chain registry, potentially reducing reliance on the `StakingRegistry.getActiveNodes()` view function.
-- **No existing Rust Kademlia library** integrates directly with iroh's QUIC transport; `libp2p-kad` uses libp2p's transport layer and cannot be used without an adapter. Implementation options include a custom Kademlia layer over iroh QUIC streams or an ALPN-identified DHT protocol.
+- **iroh's built-in mainline DHT** (pkarr/`DhtDiscovery`) resolves `NodeId → address` for node discovery only — it does not support arbitrary content-hash lookups. A separate content DHT overlay would be required.
+- **iroh's native discovery services** (DNS/pkarr) resolve `NodeId → address` without on-chain lookups and should be evaluated for production address resolution, complementing the on-chain registry which remains the authoritative source for enumerating active staked nodes.
+- **As of March 2026, no existing Rust Kademlia library** integrates directly with iroh's QUIC transport; `libp2p-kad` uses libp2p's transport layer and cannot be used without an adapter. Implementation options include a custom Kademlia layer over iroh QUIC streams or an ALPN-identified DHT protocol.
 - **State storage** (in-memory vs. on-disk) and **TTL policy** for DHT records are deferred to the production design phase.
 
 ---
