@@ -42,6 +42,8 @@ sequenceDiagram
 
 The requester probes candidates from the routing table in parallel, waits up to 200ms, then selects the winner using a composite score: `rate_per_mb × rtt_ms` (lower is better). This applies to clients picking nodes and nodes picking peers for a cache miss pull.
 
+**Probe responses are public information.** `ProbeRequest` requires no authentication — any node can probe any other node. The information revealed (content availability, pricing, node identity) is not confidential: content availability is already broadcast via gossip announcements, and pricing is advertised publicly. Network topology can be inferred by probing many nodes, but this is an inherent property of any system where nodes must be discoverable to serve content. Rate limiting (see ADR 003, "Probe fishing") bounds the cost of bulk probing, but the design does not treat probe responses as secrets. The cryptographic signatures on probe responses exist for accountability (slashing evidence), not confidentiality.
+
 ### `cdn/client/v1` — paid delivery protocol
 
 Used for all paid delivery: client→node and node→node (cache miss pull from an origin-backed or cached node).
