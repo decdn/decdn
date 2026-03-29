@@ -37,12 +37,12 @@ graph TD
     REG_DE --> RT
     REG_ETC --> RT
 
-    RT -->|miss| MISS["No Known Provider<br/>(origin pull or reject)"]
+    RT -->|miss| MISS["No Known Provider<br/>(serve from local origin if configured,<br/>otherwise reject)"]
 ```
 
 - **iroh-gossip** for ongoing content state broadcast. Nodes publish `CacheAnnounce` messages on regional topics (`cdn/region/{cc}/v1`) and a global topic (`cdn/global/v1`). Origin-backed nodes announce all content they hold; pure-cache nodes announce their current cache. Each announcement lists blob hashes (capped at 500 entries) or a Bloom filter for large sets. Both clients and nodes maintain a local routing table (`hash → Vec<NodeId>`) built from received announcements. The routing table does not distinguish between origin-backed and cache-only nodes — the probe step determines which is cheaper and faster.
 
-- **PoC scale: gossip-only discovery.** At tens of nodes, every node receives every `CacheAnnounce` on the global topic, so the local routing table has near-complete coverage of network-wide content. A routing table miss means no node currently holds the requested blob — the requesting node returns an error to the client (or, if it is itself origin-backed for that content, serves from its own origin store). A content-addressed DHT is deferred to production scale (see Future Work below).
+- **PoC scale: gossip-only discovery.** At tens of nodes, every node receives every `CacheAnnounce` on the global topic, so the local routing table has near-complete coverage of network-wide content. A routing table miss means the node has no known provider for the requested blob — the requesting node returns an error to the client (or, if it is itself origin-backed for that content, serves from its own origin store). A content-addressed DHT is deferred to production scale (see Future Work below).
 
 On a cache miss, a node probes candidates from its routing table, selects the best by `rate_per_mb × rtt_ms`, and pulls via `cdn/client/v1` (paid). This is the same protocol used for client→node delivery — every byte transferred in the network is paid. Origin-backed nodes typically charge more (reflecting their backend egress costs) and set the effective price ceiling. Cache-only nodes that have the blob compete at lower rates.
 
@@ -60,7 +60,7 @@ Node identity is the iroh `NodeId` (ed25519 public key). All staked nodes regist
 
 **Negative:**
 
-- Gossip consistency is eventual — a node that evicts or loses content may still appear in routing tables until the next `CacheAnnounce` cycle; clients and nodes must handle stale entries by falling back to the next candidate
+- Gossip consistency is eventual — a node that evicts or loses content may still appear in routing tables until the next `CacheAnnounce` cycle (announce interval is a per-node configuration parameter; PoC default TBD during implementation); clients and nodes must handle stale entries by falling back to the next candidate
 - Bloom filter announcements (for large caches) introduce false positives: a probe to a node that turns out not to have the blob wastes a round-trip
 - Every transfer is paid, so nodes pulling content on cache miss incur a cost that must be recouped through subsequent client deliveries; this creates a natural economic barrier to speculative caching
 - Self-reported region hints (ISO 3166-1 alpha-2) are unverified; a node could misreport its region to appear in more gossip topics
@@ -68,7 +68,7 @@ Node identity is the iroh `NodeId` (ed25519 public key). All staked nodes regist
 
 ### Future Work: Content-Addressed DHT
 
-At production scale (hundreds or thousands of nodes), gossip alone may not guarantee complete routing table coverage — topic partitioning, message volume, and churn can cause gaps. A content-addressed DHT layer (Kademlia or similar) publishing `(hash → Vec<NodeId>)` records over iroh QUIC would restore the fallback lookup path shown in the PoC diagram as "No Known Provider."
+At production scale (hundreds or thousands of nodes), gossip alone may not guarantee complete routing table coverage — topic partitioning, message volume, and churn can cause gaps. A content-addressed DHT layer (Kademlia or similar) publishing `(hash → Vec<NodeId>)` records over iroh QUIC would introduce an additional lookup step between a routing-table miss and the terminal "No Known Provider" outcome.
 
 Key considerations for a production DHT:
 
