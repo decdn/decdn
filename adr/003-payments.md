@@ -229,6 +229,21 @@ struct Channel {
 }
 ```
 
+```mermaid
+stateDiagram-v2
+    [*] --> Open : openChannel(provider, stablecoin, deposit)
+    Open --> Open : topUp(additionalDeposit)
+    Open --> Closing : closeChannel(amount, nonce, sig)
+    Closing --> Closing : disputeChannel(higher nonce)
+    Closing --> Closed : dispute window expires
+    Open --> Closed : reclaimExpired (channel TTL exceeded)
+    Closed --> [*]
+
+    note right of Open : Client deposits USDC
+    note right of Closing : 24h dispute window
+    note right of Closed : Funds settled on-chain
+```
+
 **Channel ID:** `channelId = keccak256(abi.encodePacked(client, provider, stablecoin, nonce))` where `nonce` is a per-client counter. Allows multiple channels between the same client-node pair (e.g., one in USDC and one in DAI).
 
 ```solidity
@@ -357,6 +372,21 @@ enum ChannelType {
 ```
 
 Nodes and clients negotiate channel type during the `StreamRequest`/`StreamResponse` handshake.
+
+```mermaid
+classDiagram
+    class Currency {
+        <<enumeration>>
+        Native(decimals: u8)
+        Stable(address: Address, decimals: u8)
+    }
+
+    class ChannelType {
+        <<enumeration>>
+        NativeToken
+        Stablecoin(address: Address)
+    }
+```
 
 ## Stablecoin Migration Path
 

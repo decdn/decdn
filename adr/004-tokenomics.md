@@ -68,6 +68,16 @@ Minimum stake is 1,000 TOKEN with a 7-day unbonding period. Stake remains slasha
 | Liquidity (DEX + CEX) | 10% | 100M | Fully unlocked at genesis |
 | Early supporters / seed | 10% | 100M | 2-year linear, 6-month cliff |
 
+```mermaid
+pie title TOKEN Distribution (1B total, fixed supply)
+    "Protocol Treasury (25%)" : 25
+    "Node Bootstrap Fund (20%)" : 20
+    "Community & Ecosystem (20%)" : 20
+    "Team & Contributors (15%)" : 15
+    "Liquidity (10%)" : 10
+    "Early Supporters (10%)" : 10
+```
+
 **Node bootstrap fund:** Dedicated to attracting early nodes before organic delivery revenue is sufficient. Distributed as bonus rewards on top of normal USDC delivery payments. Governed by token holders — proposals to release funds require a governance vote. Target: fund 2 years of above-market node rewards.
 
 **PoC simplification:** The token contract includes a public `mint(address to, uint256 amount)` function callable by anyone. No supply cap, no distribution, no vesting.
@@ -101,6 +111,31 @@ Minimum stake is 1,000 TOKEN with a 7-day unbonding period. Stake remains slasha
 
 The challenger reward incentivizes watchtowers and honest nodes to monitor and report misbehavior.
 
+```mermaid
+stateDiagram-v2
+    [*] --> Unstaked
+
+    Unstaked --> Staked : stake(amount >= 1000 TOKEN)
+
+    Staked --> Staked : slashed (1st offense 5%)
+    Staked --> Staked : slashed (2nd offense 30d 15%)
+    Staked --> Ejected : slashed (3rd offense 30d 100%)
+    Staked --> Ejected : stake below 50% of minimum
+
+    Staked --> Unbonding : requestUnbond()
+
+    Unbonding --> Unstaked : 7 days elapsed
+    Unbonding --> Unbonding : slashed (still slashable)
+    Unbonding --> Ejected : stake below 50% of minimum
+
+    Ejected --> ForcedUnbonding : remaining stake enters unbonding
+    ForcedUnbonding --> Unstaked : 7 days elapsed
+    Unstaked --> Staked : re-stake at full minimum
+
+    note right of Unbonding : Stake remains slashable during unbonding
+    note right of Ejected : Removed from registry and content marked unavailable
+```
+
 ### Challenge Bond
 
 To prevent frivolous fraud proof submissions:
@@ -131,6 +166,14 @@ Protocol fees (3%, collected in USDC at channel close) are allocated:
 | Ecosystem grants | 20% | USDC | Held as stablecoin in treasury |
 | Token buyback & burn | 20% | USDC → TOKEN → burn | Via `BuybackBurner` contract |
 
+```mermaid
+pie title Protocol Fee Allocation (3% at channel close)
+    "Development Fund" : 40
+    "Bug Bounties & Audits" : 20
+    "Ecosystem Grants" : 20
+    "Token Buyback & Burn" : 20
+```
+
 The 80% non-buyback allocation stays as stablecoin in the treasury. Governance directs spending.
 
 ### BuybackBurner Contract
@@ -152,6 +195,45 @@ The `BuybackBurner` contract converts accumulated USDC fees into TOKEN and burns
 | Execution | Governance-triggered or automated keeper | — |
 
 The caller provides `minTokenOut` to prevent sandwich attacks. If the TOKEN/USDC pool has insufficient liquidity, the swap reverts due to the `minTokenOut` check and accumulated fees remain in the contract until liquidity improves. The `maxBuybackAmount` should be set conservatively relative to pool depth.
+
+```mermaid
+graph LR
+    subgraph Contracts
+        SPC["StablePaymentChannel"]
+        SR["StakingRegistry"]
+        BB["BuybackBurner"]
+        GOV["Governor + Timelock"]
+        EM["Emergency Multisig<br/>3-of-5"]
+    end
+
+    subgraph Tokens
+        USDC([USDC])
+        TOKEN([TOKEN])
+    end
+
+    UNI["Uniswap V3<br/>TOKEN/USDC pool"]
+    BURN["Burn Address"]
+
+    USDC -->|deposit| SPC
+    SPC -->|3% fee at close| BB
+    SPC -->|97% to provider| USDC
+
+    TOKEN -->|stake| SR
+    SR -->|50% slash burned| BURN
+    SR -->|50% slash to challenger| TOKEN
+
+    BB -->|swap USDC for TOKEN| UNI
+    BB -->|burn purchased TOKEN| BURN
+
+    SPC -->|getStakeMultiple| SR
+
+    GOV -->|set parameters| SPC
+    GOV -->|set parameters| SR
+    GOV -->|trigger buyback| BB
+
+    EM -->|pause only| SPC
+    EM -->|pause only| SR
+```
 
 ## Node Unit Economics
 

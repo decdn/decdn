@@ -57,16 +57,23 @@ The client receives the sealed envelope. To decrypt the blob, the client needs b
 
 **Epoch key delivery:** Epoch keys are pushed to clients over an authenticated persistent connection (WebSocket or SSE). The connection requires a valid session token. When the subscription expires or is canceled, the connection is closed and the client receives no further epoch keys.
 
-```
-App Server                              Client
-  |                                       |
-  |<-- connect (session token) -----------|
-  |                                       |
-  |-- epoch_key (epoch 42) ------------->|
-  |       ... 5 minutes ...              |
-  |-- epoch_key (epoch 43) ------------->|  (epoch 42 key discarded)
-  |       ... subscription canceled ...  |
-  |-- close connection ----------------->|  (no epoch 44 key)
+```mermaid
+sequenceDiagram
+    participant A as App Server
+    participant C as Client
+
+    C->>A: connect (session token)
+    A->>C: epoch_key (epoch 42)
+
+    Note over A,C: 5 minutes pass...
+
+    A->>C: epoch_key (epoch 43)
+    Note over C: epoch 42 key discarded
+
+    Note over A: subscription canceled
+
+    A->>C: close connection
+    Note over C: no epoch 44 key — cannot decrypt new content
 ```
 
 ### Client Decryption Flow
@@ -83,25 +90,30 @@ App Server                              Client
 
 ### Full System Flow
 
-```
-Origin                    App Server              CDN Node              Client
-  |                          |                       |                    |
-  | encrypt blob             |                       |                    |
-  | push ciphertext -------->|                       |                    |
-  | store K_blob ----------->|                       |                    |
-  |                          |                       |                    |
-  |                          |<---- auth + play req -+--------------------|
-  |                          | check subscription    |                    |
-  |                          | wrap K_blob in epoch  |                    |
-  |                          |-- sealed envelope ----|------------------>|
-  |                          |                       |                    |
-  |                          |                       |<-- StreamRequest --|
-  |                          |                       |-- ciphertext ----->|
-  |                          |                       |   (paid per MB)    |
-  |                          |                       |                    |
-  |                          |                       |         unseal key |
-  |                          |                       |         decrypt    |
-  |                          |                       |         play       |
+```mermaid
+sequenceDiagram
+    participant O as Origin
+    participant A as App Server
+    participant N as CDN Node
+    participant C as Client
+
+    O->>O: K_blob = random key, encrypt blob
+    O->>O: hash = BLAKE3(ciphertext)
+    O->>A: store K_blob
+    O->>N: push ciphertext (content-addressed blob)
+
+    C->>A: auth + play request
+    A->>A: verify subscription
+    A->>A: wrapped = XChaCha20(epoch_key, K_blob)
+    A->>C: sealed envelope {wrapped, epoch_id, hash}
+
+    C->>N: StreamRequest {hash}
+    N->>C: ciphertext (paid per MB via cdn/client/v1)
+
+    C->>C: unseal envelope with private key
+    C->>C: decrypt wrapped with epoch_key to get K_blob
+    C->>C: verify BLAKE3(ciphertext) == hash
+    C->>C: decrypt XChaCha20(K_blob, ciphertext) and play
 ```
 
 ### Offline Playback (lease-based access)
@@ -140,27 +152,29 @@ App server:
 
 **Offline playback flow:**
 
-```
-Client (offline):
-  1. Unseal lease with device_key (from platform keystore)
-  2. Check: expires_at > now? If not, deny playback
-  3. Check: device_id matches this device? If not, deny playback
-  4. Look up K_blob for requested track hash
-  5. Read ciphertext from local cache (downloaded earlier via cdn/client/v1)
-  6. Decrypt XChaCha20-Poly1305(K_blob, ciphertext) -> plaintext
-  7. Play
+```mermaid
+flowchart TD
+    A[Unseal lease with device_key] --> B{expires_at > now?}
+    B -->|No| DENY[Deny playback]
+    B -->|Yes| C{device_id matches?}
+    C -->|No| DENY
+    C -->|Yes| D[Look up K_blob for track hash]
+    D --> E[Read ciphertext from local cache]
+    E --> F["Decrypt XChaCha20-Poly1305(K_blob, ciphertext)"]
+    F --> G[Play plaintext]
 ```
 
 **Content download:** Before going offline, the client downloads tracks through the normal CDN protocol (`cdn/client/v1`, paid per MB). The ciphertext is stored in local cache. This is identical to online streaming — the CDN protocol does not distinguish between streaming and download-for-offline.
 
 **Check-in and revocation:** When connectivity returns, the client contacts the app server to renew or revoke the lease:
 
-```
-Client reconnects:
-  App server checks subscription status:
-    Active    → renew lease (extend expires_at, update track list)
-    Canceled  → revoke lease → client deletes sealed_lease and cached ciphertext
-    Suspended → revoke lease, notify client
+```mermaid
+flowchart TD
+    A[Client reconnects] --> B[App server checks subscription]
+    B --> C{Status?}
+    C -->|Active| D["Renew lease<br/>(extend expires_at, update track list)"]
+    C -->|Canceled| E["Revoke lease<br/>Client deletes sealed_lease + cached ciphertext"]
+    C -->|Suspended| F["Revoke lease<br/>Notify client"]
 ```
 
 If the client never checks in, the lease expires at `expires_at` and offline playback stops. The client retains cached ciphertext but cannot decrypt it without a valid lease.

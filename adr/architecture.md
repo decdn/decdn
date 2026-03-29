@@ -18,19 +18,34 @@ The PoC scope is tens of nodes on a testnet, proving the core delivery and payme
 
 ## System Diagram
 
-```
-  ┌────────────┐ ┌────────────┐ ┌────────────┐
-  │    Node    │◄┤    Node    │◄┤    Node    │
-  │  (cached)  ├►│  (origin)  ├►│  (cached)  │
-  └─────┬──────┘ └─────┬──────┘ └─────┬──────┘
-        │  all transfers paid via cdn/client/v1 (USDC)
-     pays           pays           pays
-   per-MB          per-MB         per-MB
-   (USDC)          (USDC)         (USDC)
-        │               │               │
-  ┌─────▼──────┐ ┌──────▼─────┐ ┌──────▼─────┐
-  │   Client   │ │   Client   │ │   Client   │
-  └────────────┘ └────────────┘ └────────────┘
+```mermaid
+graph TD
+    subgraph Nodes
+        N1["Node (cached)"]
+        N2["Node (origin-backed)"]
+        N3["Node (cached)"]
+    end
+
+    subgraph Clients
+        C1[Client]
+        C2[Client]
+        C3[Client]
+    end
+
+    S3[("Hidden Origin Backend<br/>S3 / R2 / B2")]
+
+    N1 <-->|"cdn/client/v1<br/>paid per-MB USDC"| N2
+    N2 <-->|"cdn/client/v1<br/>paid per-MB USDC"| N3
+    N1 <-->|"cdn/client/v1<br/>paid per-MB USDC"| N3
+
+    C1 -->|"cdn/client/v1<br/>paid per-MB USDC"| N1
+    C2 -->|"cdn/client/v1<br/>paid per-MB USDC"| N2
+    C3 -->|"cdn/client/v1<br/>paid per-MB USDC"| N3
+
+    N2 -.->|opaque fetch| S3
+
+    N1 <-.->|"iroh-gossip<br/>CacheAnnounce"| N2
+    N2 <-.->|"iroh-gossip<br/>CacheAnnounce"| N3
 ```
 
 Clients probe candidate nodes, pick the best by `rate_per_mb × rtt_ms`, stream over `cdn/client/v1`, and pay via off-chain USDC vouchers. On a cache miss, a node pulls from another node that has the blob (paid via `cdn/client/v1`) and caches locally. Every byte delivered — whether client→node or node→node — is paid.
@@ -201,6 +216,24 @@ The protocol does not dictate cache policy. Nodes are economically motivated to 
 
 **Eviction:** LRU or frequency-weighted eviction (LFU). Operators tune cache size to maximize hit rate within their storage budget.
 
+```mermaid
+flowchart TD
+    A[Client requests blob via StreamRequest] --> B{Node has blob in cache?}
+    B -->|Hit| C[Stream from local cache]
+    C --> D[Client pays per MB via vouchers]
+
+    B -->|Miss| E{pull_through enabled?}
+    E -->|Yes| F[Query routing table for peers with blob]
+    F --> G["Probe candidates (cdn/probe/v1)"]
+    G --> H["Select best: rate_per_mb x rtt_ms"]
+    H --> I["Pull via cdn/client/v1 (node pays peer)"]
+    I --> J[Cache locally + stream to client simultaneously]
+    J --> D
+
+    E -->|No| K[Return redirect with origin NodeId]
+    K --> L[Client connects to origin-backed node directly]
+```
+
 ---
 
 ## Crate Structure
@@ -221,12 +254,44 @@ decdn/
 
 ### Dependency Chain
 
-```
-node -> cache, incentive, reputation, protocol
-cache -> protocol, iroh, iroh-blobs
-incentive -> protocol, alloy
-reputation -> protocol, iroh-gossip
-protocol -> serde, postcard, iroh types (minimal)
+```mermaid
+graph TD
+    node[node]
+    cache[cache]
+    incentive[incentive]
+    reputation[reputation]
+    protocol[protocol]
+
+    iroh([iroh])
+    iroh_blobs([iroh-blobs])
+    iroh_gossip([iroh-gossip])
+    alloy([alloy])
+    serde([serde])
+    postcard([postcard])
+
+    node --> cache
+    node --> incentive
+    node --> reputation
+    node --> protocol
+
+    cache --> protocol
+    cache --> iroh
+    cache --> iroh_blobs
+
+    incentive --> protocol
+    incentive --> alloy
+
+    reputation --> protocol
+    reputation --> iroh_gossip
+
+    protocol --> serde
+    protocol --> postcard
+
+    style node fill:#4a9eff,color:#fff
+    style cache fill:#34d399,color:#fff
+    style incentive fill:#f59e0b,color:#fff
+    style reputation fill:#a78bfa,color:#fff
+    style protocol fill:#f87171,color:#fff
 ```
 
 `protocol` is the leaf crate with minimal dependencies. Everything depends on it; it depends on almost nothing. The cache and incentive layers are separate crates — the cache layer works without incentives (useful for testing, local dev, private deployments). The incentive layer wraps cache operations with payment logic. The `node` crate wires them together.

@@ -54,25 +54,20 @@ A new ALPN-scoped protocol: **`cdn/watchtower/v1`**, running over iroh QUIC alon
 
 The watched party (typically the node) establishes a persistent connection to the watchtower and streams voucher updates:
 
-```
-Watched Party                         Watchtower
-  │                                       │
-  │── WatchtowerRegister ────────────────►│
-  │   {channel_id, deposit, counterparty, │
-  │    latest_voucher, fee_offer}         │
-  │                                       │
-  │◄── WatchtowerAccept ─────────────────│
-  │    {accepted, fee_rate, terms}        │
-  │                                       │
-  │   ┌── voucher update loop ──┐        │
-  │   │── VoucherUpdate ────────────────►│
-  │   │   {channel_id, amount,           │
-  │   │    nonce, signature}             │
-  │   │◄── VoucherAck ─────────────────│
-  │   └────────────────────────┘        │
-  │                                       │
-  │── WatchtowerRevoke ──────────────────►│
-  │   {channel_id}                        │
+```mermaid
+sequenceDiagram
+    participant W as Watched Party (Node)
+    participant T as Watchtower
+
+    W->>T: WatchtowerRegister {channel_id, deposit, counterparty, latest_voucher, fee_offer}
+    T->>W: WatchtowerAccept {accepted, fee_rate, terms}
+
+    loop Every voucher (1 MB delivered)
+        W->>T: VoucherUpdate {channel_id, amount, nonce, signature}
+        T->>W: VoucherAck
+    end
+
+    W->>T: WatchtowerRevoke {channel_id}
 ```
 
 **Frequency:** Every voucher — one update per 1 MB delivered, matching the voucher cadence from ADR 003. The watchtower must hold the absolute latest voucher to be effective. Each update is ~150 bytes; at typical delivery rates this is negligible overhead.
@@ -131,6 +126,23 @@ The defense stack is:
 1. **Local dispute monitor** (in-process) — handles the node-is-online case
 2. **Watchtowers** (external, redundant) — handles the node-is-offline case
 3. **24-hour dispute window** — provides the time budget for both layers to respond
+
+```mermaid
+flowchart TD
+    E["ChannelCloseInitiated event (on-chain)"] --> CHECK{Stale voucher?}
+
+    CHECK -->|No| OK[Settlement correct — no action needed]
+
+    CHECK -->|Yes| LAYER1{Node online?}
+
+    LAYER1 -->|Yes| LOCAL["Local Dispute Monitor<br/>(in-process thread)"]
+    LOCAL --> DISPUTE["disputeChannel<br/>(submit latest voucher)"]
+
+    LAYER1 -->|No| WT["Watchtowers (1-3)<br/>(external, redundant)"]
+    WT --> DISPUTE
+
+    DISPUTE --> SETTLED[Settlement corrected to highest-nonce voucher]
+```
 
 ### 8. PoC Scope
 
