@@ -17,7 +17,7 @@ Four protocols, each identified by an ALPN string:
 | --- | --- | --- |
 | `cdn/probe/v1` | any node ↔ any node | Latency and availability check before committing to a node |
 | `cdn/client/v1` | payer ↔ delivering node | Paid blob delivery with payment vouchers (client→node, node→node on cache miss) |
-| `cdn/watchtower/v1` | watched node ↔ watchtower | Channel-dispute monitoring: voucher registration and updates (see ADR 007) |
+| `cdn/watchtower/v1` | watched party (typically node) ↔ watchtower | Channel-dispute monitoring: voucher registration and updates (see ADR 007) |
 | iroh-gossip built-in | all nodes | Content availability announcements, node discovery |
 
 ### `cdn/probe/v1` — latency probe
@@ -78,24 +78,25 @@ Content availability is broadcast over iroh-gossip on region-scoped topics (`cdn
 
 ### `cdn/watchtower/v1` — channel-dispute monitoring
 
-Used by nodes to register payment channels with a watchtower service that monitors for on-chain disputes. The full protocol design is specified in ADR 007.
+Used by either channel party (typically the node) to register payment channels with a watchtower service that monitors for on-chain disputes. The full protocol design is specified in ADR 007.
 
 ```mermaid
 sequenceDiagram
-    participant N as Watched Node
-    participant W as Watchtower
+    participant W as Watched Party (Node)
+    participant T as Watchtower
 
-    N->>W: WatchtowerRegister {channel_id, deposit, counterparty, latest_voucher, fee_offer}
-    W->>N: WatchtowerAccept {channel_id, fee_accepted}
+    W->>T: WatchtowerRegister {channel_id, deposit, counterparty, latest_voucher, fee_offer}
+    T->>W: WatchtowerAccept {accepted, fee_rate, terms}
 
-    loop Every 1 MB delivered
-        N->>W: VoucherUpdate {channel_id, voucher}
+    loop Every voucher (1 MB delivered)
+        W->>T: VoucherUpdate {channel_id, amount, nonce, signature}
+        T->>W: VoucherAck
     end
 
-    N->>W: WatchtowerRevoke {channel_id}
+    W->>T: WatchtowerRevoke {channel_id}
 ```
 
-The watched node sends its latest voucher on registration and streams updates as new vouchers arrive during delivery. If the counterparty initiates an on-chain close with a stale (lower-nonce) voucher, the watchtower submits a `disputeChannel` transaction with the latest voucher it holds. The watchtower is non-custodial — it cannot steal funds, worsen settlement, or grief; the voucher's EIP-712 signature is the only authorisation the contract checks.
+The watched party sends its latest voucher on registration and streams updates as new vouchers arrive during delivery. If the counterparty initiates an on-chain close with a stale (lower-nonce) voucher, the watchtower submits a `disputeChannel` transaction with the latest voucher it holds. The watchtower is non-custodial — it cannot steal funds, worsen settlement, or grief; the voucher's EIP-712 signature is the only authorisation the contract checks.
 
 ### Serialization
 
