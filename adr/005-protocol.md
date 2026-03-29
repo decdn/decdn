@@ -11,12 +11,13 @@ The protocol layer must be distinct from the transport layer (iroh/QUIC) and the
 
 ## Decision
 
-Three protocols, each identified by an ALPN string:
+Four protocols, each identified by an ALPN string:
 
 | ALPN | Participants | Purpose |
 | --- | --- | --- |
 | `cdn/probe/v1` | any node ↔ any node | Latency and availability check before committing to a node |
 | `cdn/client/v1` | payer ↔ delivering node | Paid blob delivery with payment vouchers (client→node, node→node on cache miss) |
+| `cdn/watchtower/v1` | watched node ↔ watchtower | Channel-dispute monitoring: voucher registration and updates (see ADR 007) |
 | iroh-gossip built-in | all nodes | Content availability announcements, node discovery |
 
 ### `cdn/probe/v1` — latency probe
@@ -75,6 +76,27 @@ The protocol is self-enforcing: payer stops sending vouchers → delivering node
 
 Content availability is broadcast over iroh-gossip on region-scoped topics (`cdn/region/{cc}/v1`) and a global topic (`cdn/global/v1`). All staked nodes publish `CacheAnnounce` messages listing hashes they hold (max 500 entries) or a Bloom filter for large sets. Clients and nodes maintain a local routing table (`hash → Vec<NodeId>`) from received announcements. The probe step determines cost and latency for each candidate.
 
+### `cdn/watchtower/v1` — channel-dispute monitoring
+
+Used by nodes to register payment channels with a watchtower service that monitors for on-chain disputes. The full protocol design is specified in ADR 007.
+
+```mermaid
+sequenceDiagram
+    participant N as Watched Node
+    participant W as Watchtower
+
+    N->>W: WatchtowerRegister {channel_id, deposit, counterparty, latest_voucher, fee_offer}
+    W->>N: WatchtowerAccept {channel_id, fee_accepted}
+
+    loop Every 1 MB delivered
+        N->>W: VoucherUpdate {channel_id, voucher}
+    end
+
+    N->>W: WatchtowerRevoke {channel_id}
+```
+
+The watched node sends its latest voucher on registration and streams updates as new vouchers arrive during delivery. If the counterparty initiates an on-chain close with a stale (lower-nonce) voucher, the watchtower submits a `disputeChannel` transaction with the latest voucher it holds. The watchtower is non-custodial — it cannot steal funds, worsen settlement, or grief; the voucher's EIP-712 signature is the only authorisation the contract checks.
+
 ### Serialization
 
 All protocol messages use [postcard](https://docs.rs/postcard) — compact, no-std friendly, serde-based. Standard in the iroh ecosystem; avoids introducing a second serialization dependency alongside what iroh already uses internally.
@@ -83,7 +105,7 @@ All protocol messages use [postcard](https://docs.rs/postcard) — compact, no-s
 
 **Positive:**
 
-- ALPN separation means a single iroh `Endpoint` dispatches all connection types without ambiguity
+- ALPN separation means a single iroh `Endpoint` dispatches all four connection types without ambiguity
 - Probing in parallel before committing means no payment channel is opened with a slow or unresponsive node
 - `cdn/client/v1` is reused for all paid delivery — no separate protocol needed for node→node pulls
 - `redirect` always points to a NodeId, never an external URL; the backend topology of origin-backed nodes is fully hidden from the network
