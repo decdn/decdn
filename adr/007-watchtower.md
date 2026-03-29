@@ -25,7 +25,7 @@ A watchtower **cannot steal funds** — vouchers authorise payment to the node, 
 
 ### 2. Contract Integration
 
-The `StablePaymentChannel.disputeChannel()` function must accept submissions from **any address**, not just the channel's client or provider. The voucher's EIP-712 signature (`ecrecover(signature) == channel.client`) is sufficient authorisation — no `msg.sender` access check is needed.
+The `StablePaymentChannel.disputeChannel()` function must accept submissions from **any address**, not just the channel's client or provider. The voucher's EIP-712 signature (`ecrecover(signature) == channel.client`) is sufficient authorisation — no `msg.sender` access check is needed. The signature is verified against the EIP-712 domain separator defined in [ADR 003 — EIP-712 Voucher Signature](003-payments.md#eip-712-voucher-signature), which binds each voucher to a specific chain and contract deployment. Watchtower implementations must use the same domain separator when validating vouchers off-chain.
 
 Required contract events for watchtower monitoring:
 
