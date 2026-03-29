@@ -109,6 +109,14 @@ A watchtower holds the latest voucher for a registered channel and submits a `di
 
 ---
 
+### [ADR 008 — Reputation System](008-reputation.md)
+
+**Interaction-weighted scoring with gossip propagation.**
+
+Nodes are ranked by a reputation score (0.0–1.0) derived from local observations (70%) and gossip-propagated reports (30%). Reports are weighted by the reporter's number of settled payment channels (on-chain verifiable), making reputation manipulation expensive. Scores decay toward neutral without fresh data, clamping limits per-report impact, and a cold-start bootstrap gives new nodes initial traffic.
+
+---
+
 ## Key Invariants
 
 - No external origin URL exists — content enters the network through origin-backed nodes whose backends are hidden
@@ -117,6 +125,145 @@ A watchtower holds the latest voucher for a registered channel and submits a `di
 - A node cannot join the peer mesh without staking — prevents free-riders and provides a slashable bond
 - Payment channels amortize on-chain costs across an entire session; per-MB payments are off-chain
 - Safety bounds on all governable parameters are hardcoded — governance cannot set fees to 100% or stake to zero
+
+---
+
+## Non-Goals (PoC)
+
+- DRM or content protection
+- Content transcoding or adaptive format conversion
+- Search, discovery, or recommendation (see Future Work below)
+- Mobile or web clients
+- Multi-chain support (single L2 only)
+- Erasure coding (full replication only)
+
+---
+
+## Glossary
+
+| Term | Definition |
+| --- | --- |
+| **Blob** | A content-addressed byte sequence identified by its BLAKE3 hash |
+| **Chunk** | A 1024-byte segment of a blob used by iroh-blobs for verified streaming |
+| **Hash sequence** | An ordered collection of blob hashes (iroh's equivalent of a directory/manifest) |
+| **Voucher** | A signed off-chain payment message: `{channelId, cumulativeAmount, nonce, signature}` |
+| **ALPN** | Application-Layer Protocol Negotiation — identifies which protocol a QUIC connection uses |
+| **Node** | A staked participant that caches and serves blobs. Some are configured with an origin backend; others are pure caches. |
+| **Client** | A lightweight QUIC endpoint that streams content and pays per MB |
+| **Origin-backed node** | A node configured with an object store (S3/R2/B2) — can serve any blob in that store, never experiences a true cache miss |
+
+---
+
+## Origin Integration
+
+Some nodes are configured with an origin backend (S3, R2, Backblaze B2, or self-hosted MinIO). They are the source of truth for all blobs but are accessed as infrequently as possible — only when no peer node has the content.
+
+### Supported Origins
+
+| Origin | Auth Method | Notes |
+| --- | --- | --- |
+| AWS S3 | IAM credentials or pre-signed URLs | Most common |
+| Cloudflare R2 | S3-compatible API | No egress fees between R2 and Workers |
+| Backblaze B2 | S3-compatible API | Cheapest egress ($0.01/GB) |
+| MinIO (self-hosted) | S3-compatible API | Full operator control |
+
+All origin access goes through a single trait:
+
+```rust
+trait OriginStore: Send + Sync {
+    async fn fetch(&self, hash: &Hash) -> Result<Bytes>;
+    async fn head(&self, hash: &Hash) -> Result<ObjectMeta>;
+}
+```
+
+### Hash-to-Object-Key Mapping
+
+S3 objects are addressed by key (a path string). Blobs are addressed by BLAKE3 hash. The mapping is stored in a content catalog — a small database (PostgreSQL or SQLite) maintained by the operator:
+
+```
+catalog: hash → {s3_bucket, s3_key, size_bytes, content_type}
+```
+
+Nodes query it on cache miss to find the origin pull URL. The catalog is not on-chain — it is an operational concern.
+
+---
+
+## Cache Behavior
+
+The protocol does not dictate cache policy. Nodes are economically motivated to make good caching decisions.
+
+**Cache miss resolution** follows a priority order:
+
+1. **Paid pull-through (preferred):** Node checks its routing table for peers that have the blob, probes candidates, selects by `rate_per_mb × rtt_ms`, pulls via `cdn/client/v1` (paid), caches locally, and streams to the client while the pull is in progress.
+2. **Redirect (last resort):** If pull-through is disabled (`pull_through: false` in config), the node returns a redirect to an origin-backed node's NodeId. The client opens a channel with that node directly.
+
+**Prefetching:** Nodes can proactively cache popular content by paying to pull it from other nodes. Popularity signals come from gossip (if multiple nodes announce a blob, it is popular). All prefetch pulls are paid via `cdn/client/v1`.
+
+**Eviction:** LRU or frequency-weighted eviction (LFU). Operators tune cache size to maximize hit rate within their storage budget.
+
+---
+
+## Crate Structure
+
+```
+storage-layer/
+├── Cargo.toml                    # workspace root
+├── crates/
+│   ├── node/                     # Binary — CLI entry, config, wiring
+│   ├── protocol/                 # Shared types, wire format, messages
+│   ├── cache/                    # Cache engine wrapping iroh-blobs + origin pull
+│   ├── incentive/                # Payment channels, staking, vouchers
+│   ├── reputation/               # Gossip-based reputation system
+│   └── contracts/                # Solidity contracts + Foundry
+├── tests/                        # Integration tests
+└── adr/                          # Architecture decision records
+```
+
+### Dependency Chain
+
+```
+node -> cache, incentive, reputation, protocol
+cache -> protocol, iroh, iroh-blobs
+incentive -> protocol, alloy
+reputation -> protocol, iroh-gossip
+protocol -> serde, postcard, iroh types (minimal)
+```
+
+`protocol` is the leaf crate with minimal dependencies. Everything depends on it; it depends on almost nothing. The cache and incentive layers are separate crates — the cache layer works without incentives (useful for testing, local dev, private deployments). The incentive layer wraps cache operations with payment logic. The `node` crate wires them together.
+
+---
+
+## Observability
+
+- **Structured logging** via `tracing` crate (standard in iroh ecosystem). JSON output for machine consumption.
+- **Metrics** via `prometheus` crate, exposed on a configurable HTTP port:
+  - `streams_active`, `streams_completed`, `streams_failed` — delivery activity
+  - `vouchers_signed`, `vouchers_received` — payment activity
+  - `reputation_reports_sent`, `reputation_reports_received` — gossip health
+  - `channels_open`, `channels_settled` — payment channel lifecycle
+  - `cache_hits`, `cache_misses`, `cache_bytes` — cache performance
+- **Health endpoint** at `/health` on the metrics HTTP port — returns node status, peer count, and channel balances
+
+---
+
+## Considered Alternatives
+
+A fully decentralized storage model was evaluated: nodes would commit to durable storage with replication factor N, pinning deals, and replication maintenance protocols. This was rejected in favor of centralized storage (S3/R2) + decentralized delivery because:
+
+- S3-class storage is cheap ($0.023/GB/month), reliable (11 nines), and already solved
+- The actual bottleneck is delivery latency and bandwidth cost, not storage
+- Decentralized storage requires complex pinning deals, replication verification, and challenge games
+- The CDN model is strictly simpler: trust S3 for durability, decentralize only delivery
+
+---
+
+## Future Work: Search & Discovery
+
+Not in PoC scope. The planned approach for the next phase:
+
+Dedicated **indexer nodes** subscribe to the gossip topic, build a searchable index of content metadata (via `tantivy` or equivalent), and expose a query API on a custom ALPN (`cdn/search/v1`). Multiple independent indexers can coexist. Clients pay per query via the same payment channel mechanism. Indexers register in the `StakingRegistry` and are slashable for fabricated results.
+
+During PoC (before indexers exist), clients use the full-table gossip approach: every node holds the complete content routing table. The migration to indexers is additive — they subscribe to the same gossip topic.
 
 ---
 

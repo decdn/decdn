@@ -206,3 +206,190 @@ A node stakes, announces content it holds, but refuses to serve it — collectin
 Attacker intercepts a signed voucher and attempts to replay it against a different channel or after close.
 
 Fully solved. EIP-712 typed data over `{channelId, amount, nonce, stablecoin}` binds the voucher to a specific channel. The monotonically increasing nonce prevents resubmission after settlement.
+
+## Contract Interfaces
+
+### StablePaymentChannel
+
+The `StablePaymentChannel` is a new contract separate from the existing `PaymentChannel`. It handles only stablecoin payment channels.
+
+**Channel state:**
+
+```solidity
+struct Channel {
+    address client;
+    address provider;
+    address stablecoin;       // ERC-20 address (e.g., USDC)
+    uint256 deposit;          // in stablecoin base units (USDC: 6 decimals)
+    uint256 claimedAmount;    // cumulative amount claimed via vouchers
+    uint256 openedAt;
+    uint256 expiresAt;
+    uint8   status;           // Open, Closing, Closed
+    uint256 disputeDeadline;  // set when close is initiated
+}
+```
+
+**Channel ID:** `channelId = keccak256(abi.encodePacked(client, provider, stablecoin, nonce))` where `nonce` is a per-client counter. Allows multiple channels between the same client-node pair (e.g., one in USDC and one in DAI).
+
+```solidity
+interface IStablePaymentChannel {
+    // Channel lifecycle
+    function openChannel(address provider, address stablecoin, uint256 deposit) external returns (bytes32 channelId);
+    function topUp(bytes32 channelId, uint256 additionalDeposit) external;
+    function closeChannel(bytes32 channelId, uint256 amount, uint256 nonce, bytes calldata signature) external;
+    function disputeChannel(bytes32 channelId, uint256 amount, uint256 nonce, bytes calldata signature) external;
+    function reclaimExpired(bytes32 channelId) external;
+
+    // Views
+    function getChannel(bytes32 channelId) external view returns (Channel memory);
+    function getEffectiveFee(address provider) external view returns (uint256 bps);
+    function isAllowedStablecoin(address token) external view returns (bool);
+
+    // Governance
+    function setFeePercentage(uint256 bps) external;
+    function setAllowedStablecoin(address token, bool allowed) external;
+    function setTreasuryAddress(address treasury) external;
+    function setMinDeposit(uint256 amount) external;
+    function setDisputeWindow(uint256 seconds_) external;
+    function setRateBounds(address stablecoin, uint256 deliveryFloor, uint256 deliveryCeiling) external;
+}
+```
+
+**Safety bounds (hardcoded):**
+
+| Parameter | Minimum | Maximum |
+| --- | --- | --- |
+| Fee percentage | 0 bps (0%) | 2000 bps (20%) |
+| Dispute window | 1800 seconds (30 min) | 604800 seconds (7 days) |
+| Min deposit | 1 base unit | No max |
+| Rate floor | 0 | Must be < ceiling |
+| Rate ceiling | Must be > floor | No max |
+
+**Rate bounds are per-stablecoin.** The contract stores `mapping(address => RateBounds)` where `RateBounds` contains floor/ceiling in that stablecoin's base units. USDC bounds are in 6-decimal units, DAI bounds are in 18-decimal units, each set independently.
+
+### BuybackBurner
+
+```solidity
+interface IBuybackBurner {
+    function executeBuyback(address stablecoin, uint256 amount, uint256 minTokenOut) external;
+    function setKeeper(address keeper) external;
+    function setSwapRouter(address router) external;
+    function setSlippageTolerance(uint256 bps) external;
+    function setMinBuybackAmount(uint256 amount) external;
+    function setMaxBuybackAmount(uint256 amount) external;
+    function keeper() external view returns (address);
+    function getAccumulatedFees(address stablecoin) external view returns (uint256);
+}
+```
+
+`executeBuyback` is callable by governance multisig or the authorized `keeper` address. All `set*` functions are governance-only behind a timelock.
+
+### StakingRegistry Modifications
+
+Two additions to the existing contract:
+
+```solidity
+// Fee discount check
+function getStakeMultiple(address provider) external view returns (uint256) {
+    return stakes[provider].amount / minStake;
+}
+
+// Client staking (optional, no slashing)
+mapping(address => uint256) public clientStakes;
+
+function clientStake(uint256 amount) external nonReentrant {
+    token.transferFrom(msg.sender, address(this), amount);
+    clientStakes[msg.sender] += amount;
+}
+
+function clientUnstake(uint256 amount) external nonReentrant {
+    require(clientStakes[msg.sender] >= amount);
+    clientStakes[msg.sender] -= amount;
+    token.transfer(msg.sender, amount);
+}
+
+function clientStakeOf(address client) external view returns (uint256) {
+    return clientStakes[client];
+}
+```
+
+## Client Priority Staking
+
+A lightweight, optional mechanism for clients to signal commitment:
+
+- Clients call `StakingRegistry.clientStake(amount)` to deposit TOKEN
+- No minimum, no slashing, no unbonding period — just a deposit
+- Nodes check client stake via `StakingRegistry.clientStakeOf(address)`
+- During congestion, nodes prioritize higher-staking clients in their connection queue
+- Enforcement is off-chain (node-side logic), not on-chain
+- Clients withdraw anytime: `StakingRegistry.clientUnstake(amount)`
+
+**NodeId-to-address mapping:** During the iroh connection handshake, the client's `NodeId` (ed25519 public key) is known. The client signs a message binding their `NodeId` to their Ethereum address and includes it in the `StreamRequest`. The node verifies this signature and uses the Ethereum address to look up `clientStakeOf`. This mapping is ephemeral (per-session, not stored on-chain).
+
+This is a soft signal, not a hard gate. Non-staking clients still get served, just with lower priority during congestion.
+
+## Decimal Handling
+
+USDC uses 6 decimals, TOKEN uses 18, DAI uses 18. The `incentive` crate handles this with a currency abstraction:
+
+```rust
+enum Currency {
+    Native { decimals: u8 },                       // TOKEN, 18 decimals
+    Stable { address: Address, decimals: u8 },     // USDC (6), DAI (18), etc.
+}
+```
+
+All amount formatting, parsing, and display go through this abstraction. The voucher signing code uses raw base units — no decimal conversion in the signature path to avoid precision bugs.
+
+**Voucher format change for stablecoin channels:**
+
+```
+{channelId, amount, nonce, stablecoin, signature}
+```
+
+The `stablecoin` field (ERC-20 address) is included in the signed EIP-712 typed data to prevent cross-token replay attacks. The streaming protocol includes a `ChannelType` discriminator:
+
+```rust
+enum ChannelType {
+    NativeToken,                           // legacy
+    Stablecoin { address: Address },       // new
+}
+```
+
+Nodes and clients negotiate channel type during the `StreamRequest`/`StreamResponse` handshake.
+
+## Stablecoin Migration Path
+
+### Phase 1: Deploy Alongside (4–6 weeks)
+
+No breaking changes. Both channel types coexist.
+
+1. Deploy `StablePaymentChannel` and `BuybackBurner` on Arbitrum Sepolia
+2. Add stablecoin rate fields to gossip messages (backward compatible — old fields remain, new fields are `Option`)
+3. Update `incentive` crate to support both `PaymentChannel` (token) and `StablePaymentChannel` (stablecoin), selected by config
+4. Nodes opt in by setting `accepted_stablecoins` in config
+5. Clients prefer stablecoin channels when available, fall back to token channels
+
+### Phase 2: Stablecoin-Preferred (2–3 months)
+
+1. Deploy to production L2
+2. Default client behavior: stablecoin channels if node supports them, token channels otherwise
+3. Node bootstrap fund begins distributing TOKEN bonuses on top of USDC payments
+4. Governance sets stablecoin rate bounds
+5. Fee discount mechanism goes live (nodes with ≥10× stake get 1.5% fee)
+6. Target: >80% stablecoin channels within 3 months
+
+### Phase 3: Token Channels Deprecated (1–2 months after Phase 2)
+
+1. Governance vote to disable new token channels (`PaymentChannel.openChannel()` reverts)
+2. Existing token channels settle normally — no funds trapped
+3. After 60 days with no open token channels, `PaymentChannel` is effectively retired
+
+### Rollback Plan
+
+If stablecoin channels cause unforeseen problems during Phase 1–2:
+
+- Nodes remove stablecoin rates from gossip announcements
+- Clients fall back to token channels automatically
+- `StablePaymentChannel` remains deployed but unused
+- No governance action needed — migration is market-driven, not forced
