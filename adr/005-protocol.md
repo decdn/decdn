@@ -23,15 +23,16 @@ Three protocols, each identified by an ALPN string:
 
 Before opening a payment channel or sending a `StreamRequest`, a node probes candidates to measure round-trip latency and confirm the node has the blob:
 
-```text
-Requester                       Candidate node
-  |                                |
-  |--- ProbeRequest {hash,        |
-  |     timestamp_us} ------------>|
-  |                                |
-  |<-- ProbeResponse {has_blob,   |
-  |     rate_per_mb, timestamp_us, |
-  |     signature} ----------------|
+```mermaid
+sequenceDiagram
+    participant R as Requester
+    participant C as Candidate Node
+
+    R->>C: ProbeRequest {hash, timestamp_us}
+    C->>R: ProbeResponse {has_blob, rate_per_mb, timestamp_us, signature}
+
+    Note over R: RTT = receive_time - timestamp_us
+    Note over R: Score = rate_per_mb x rtt_ms (lower is better)
 ```
 
 `timestamp_us` is a requester-generated microsecond timestamp echoed back. RTT is `receive_time - timestamp_us`. `has_blob` confirms the node has the content. `rate_per_mb` lets the requester score candidates on both latency and price in a single round-trip.
@@ -44,25 +45,24 @@ The requester probes candidates from the routing table in parallel, waits up to 
 
 Used for all paid delivery: client→node and node→node (cache miss pull from an origin-backed or cached node).
 
-```text
-Payer                           Delivering node
-  |                                |
-  |--- StreamRequest {hash,       |
-  |     channel_id, byte_offset} ->|
-  |                                |
-  |<-- StreamResponse {ok,        |
-  |     rate_per_mb, total_bytes,  |
-  |     timestamp_us, signature,   |
-  |     redirect?} ---------------|
-  |                                |
-  |  +--- chunk loop -----------+ |
-  |  |<-- ChunkData {bytes} ----| |
-  |  |   (every 1 MB:)          | |
-  |  |--- Voucher {sig, amt} -->| |
-  |  |<-- VoucherAck -----------| |
-  |  +--------------------------+ |
-  |                                |
-  |--- StreamEnd ----------------->|
+```mermaid
+sequenceDiagram
+    participant P as Payer
+    participant D as Delivering Node
+
+    P->>D: StreamRequest {hash, channel_id, byte_offset}
+    D->>P: StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, signature, redirect?}
+
+    alt ok = true
+        loop Every 1 MB
+            D->>P: ChunkData {bytes} (1024-byte chunks)
+            P->>D: Voucher {sig, amt} (cumulative USDC)
+            D->>P: VoucherAck
+        end
+        P->>D: StreamEnd
+    else redirect
+        Note over P: Connect to redirect NodeId and retry
+    end
 ```
 
 The delivering node advertises its `rate_per_mb` in `StreamResponse`. The payer accepts by sending the first voucher or disconnects and tries another node. No surprise pricing. `timestamp_us` and `signature` (node's iroh key signs all security-relevant fields: `{hash, ok, rate_per_mb, total_bytes, channel_id, timestamp_us, redirect}`) make the response cryptographically binding. Signing the full response prevents a malicious party from altering unsigned fields while reusing a valid signature — in particular, `ok` is needed for phantom announcement evidence (proving a node signed `ok: false` after claiming `has_blob: true` in a probe), and `redirect` ensures a node cannot silently alter routing without accountability. A rate mismatch between a signed `ProbeResponse` and a signed `StreamResponse` within 30 seconds is slashable evidence of rate manipulation. The `redirect` field in `StreamResponse` is used when a node cannot serve — it contains the NodeId of another node that can, never an external URL. The network is fully opaque.

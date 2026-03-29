@@ -16,6 +16,30 @@ Two questions are in scope:
 
 All staked nodes form a flat peer mesh with no fixed routing hierarchy. Discovery uses two complementary mechanisms:
 
+```mermaid
+graph TD
+    subgraph Topics["iroh-gossip Topics"]
+        GLOBAL["cdn/global/v1"]
+        REG_US["cdn/region/US/v1"]
+        REG_DE["cdn/region/DE/v1"]
+        REG_ETC["cdn/region/.../v1"]
+    end
+
+    CA["CacheAnnounce<br/>{hashes[] or bloom_filter}"]
+
+    CA -->|all staked nodes publish| GLOBAL
+    CA -->|regional nodes publish| REG_US
+    CA -->|regional nodes publish| REG_DE
+    CA -->|regional nodes publish| REG_ETC
+
+    GLOBAL --> RT["Local Routing Table<br/>hash -> Vec of NodeId"]
+    REG_US --> RT
+    REG_DE --> RT
+    REG_ETC --> RT
+
+    RT -->|miss| DHT["DHT Lookup (Kademlia)<br/>1-hour TTL"]
+```
+
 - **iroh-gossip** for ongoing content state broadcast. Nodes publish `CacheAnnounce` messages on regional topics (`cdn/region/{cc}/v1`) and a global topic (`cdn/global/v1`). Origin-backed nodes announce all content they hold; pure-cache nodes announce their current cache. Each announcement lists blob hashes (capped at 500 entries) or a Bloom filter for large sets. Both clients and nodes maintain a local routing table (`hash → Vec<NodeId>`) built from received announcements. The routing table does not distinguish between origin-backed and cache-only nodes — the probe step determines which is cheaper and faster.
 
 - **DHT-based lookup** as fallback when the local routing table has no match. Standard Kademlia approach — each node publishes `(hash → nodeIds)` records as content enters its store and removes them when it leaves. TTL is 1 hour.

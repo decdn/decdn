@@ -68,6 +68,16 @@ Minimum stake is 1,000 TOKEN with a 7-day unbonding period. Stake remains slasha
 | Liquidity (DEX + CEX) | 10% | 100M | Fully unlocked at genesis |
 | Early supporters / seed | 10% | 100M | 2-year linear, 6-month cliff |
 
+```mermaid
+pie title TOKEN Distribution (1B total, fixed supply)
+    "Protocol Treasury (25%)" : 25
+    "Node Bootstrap Fund (20%)" : 20
+    "Community & Ecosystem (20%)" : 20
+    "Team & Contributors (15%)" : 15
+    "Liquidity (10%)" : 10
+    "Early Supporters (10%)" : 10
+```
+
 **Node bootstrap fund:** Dedicated to attracting early nodes before organic delivery revenue is sufficient. Distributed as bonus rewards on top of normal USDC delivery payments. Governed by token holders — proposals to release funds require a governance vote. Target: fund 2 years of above-market node rewards.
 
 **PoC simplification:** The token contract includes a public `mint(address to, uint256 amount)` function callable by anyone. No supply cap, no distribution, no vesting.
@@ -130,6 +140,14 @@ Protocol fees (3%, collected in USDC at channel close) are allocated:
 | Bug bounties & audits | 20% | USDC | Held as stablecoin in treasury |
 | Ecosystem grants | 20% | USDC | Held as stablecoin in treasury |
 | Token buyback & burn | 20% | USDC → TOKEN → burn | Via `BuybackBurner` contract |
+
+```mermaid
+pie title Protocol Fee Allocation (3% at channel close)
+    "Development Fund" : 40
+    "Bug Bounties & Audits" : 20
+    "Ecosystem Grants" : 20
+    "Token Buyback & Burn" : 20
+```
 
 The 80% non-buyback allocation stays as stablecoin in the treasury. Governance directs spending.
 

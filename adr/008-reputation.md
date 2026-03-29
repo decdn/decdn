@@ -63,6 +63,30 @@ final_score = 0.7 * local_score + 0.3 * network_score
 
 If a client has no local observations for a node (never interacted), it uses 100% network score.
 
+```mermaid
+flowchart TD
+    subgraph Local["Local Score (70%)"]
+        I[Interaction with node] --> M1["delivery_speed (40%)"]
+        I --> M2["data_correct (40%)"]
+        I --> M3["connection_success (20%)"]
+        M1 --> IS["interaction_score =<br/>0.4*speed + 0.4*correct + 0.2*reachable"]
+        M2 --> IS
+        M3 --> IS
+        IS --> EWMA1["local_score = EWMA(local, interaction, a=0.1)"]
+    end
+
+    subgraph Network["Network Score (30%)"]
+        GR[Gossip ReputationReport] --> RW["reporter_weight =<br/>settled_channels / max_observed"]
+        RW --> EWMA2["network_score = EWMA(network, report,<br/>a=0.05 * reporter_weight)"]
+    end
+
+    EWMA1 --> FINAL["final_score =<br/>0.7 * local + 0.3 * network"]
+    EWMA2 --> FINAL
+
+    FINAL --> CLAMP["Clamped: max +/-0.05 per report"]
+    CLAMP --> DECAY["Decay toward 0.5<br/>10%/week without data"]
+```
+
 ### 6. Gossip Protocol
 
 Dedicated gossip topic (`reputation/v1`) — all nodes subscribe. After interacting with a node, a node broadcasts a signed reputation report:
@@ -84,6 +108,25 @@ struct ReportMetrics {
 ```
 
 Reports only accepted from staked nodes.
+
+```mermaid
+classDiagram
+    class ReputationReport {
+        +NodeId provider
+        +NodeId reporter
+        +ReportMetrics metrics
+        +u64 timestamp
+        +Signature signature
+    }
+
+    class ReportMetrics {
+        +Option~u32~ delivery_speed
+        +Option~bool~ uptime_observed
+        +Option~bool~ data_correct
+    }
+
+    ReputationReport *-- ReportMetrics
+```
 
 ### 7. Score Decay (Production Only)
 
