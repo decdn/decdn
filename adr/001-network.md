@@ -79,7 +79,7 @@ Content discovery is on-demand via the existing `cdn/probe/v1` protocol. When a 
 
 On probe cache hit, if the selected provider no longer has the blob (evicted since the cached probe), the node falls back to a fresh fan-out.
 
-**Note:** The 30s probe cache TTL overlaps with ADR 005's 30-second slashing evidence window for rate manipulation. Implementation should keep the probe cache TTL shorter than the evidence window, or require a confirmation probe before committing to a paid pull from a cached entry.
+**Note:** As currently specified, the probe cache TTL (30s) equals the slashing evidence window (30s) from ADR 005. Implementation must either reduce the probe cache TTL below the evidence window or require a confirmation probe before committing to a paid pull from a cached entry.
 
 #### Prefetching with Dual Signals
 
@@ -104,7 +104,7 @@ Node identity is the iroh `NodeId` (ed25519 public key). All staked nodes regist
 - No external infrastructure is reachable from the network — origin-backed nodes completely hide their backends, so no client or node can bypass the payment layer by going directly to a storage URL
 - All nodes participate in the same discovery and transport protocols; the only difference between origin-backed and cache-only nodes is whether they have an origin store configured
 - Gossip messages are lightweight (~700 bytes) — no content inventories, Bloom filters, or hash lists. Regional gossip topics bound message volume: nodes in one region don't receive announcements from irrelevant regions
-- Content discovery via probe fan-out eliminates stale routing table entries — every probe response is fresh
+- Content discovery via probe fan-out provides fresh availability data — no stale content inventory to maintain
 - Probe cache prevents redundant fan-outs for popular content within a 30-second window
 - Once a node in a region caches a blob, other nodes in that region can pull from it at competitive rates rather than paying origin-backed node prices — popular content gets cheaper as it spreads
 - The flat mesh is simple to reason about and easy to test at small scale (PoC is tens of nodes)
@@ -112,7 +112,7 @@ Node identity is the iroh `NodeId` (ed25519 public key). All staked nodes regist
 **Negative:**
 
 - Probe fan-out generates O(N) probe messages per cache miss. At PoC scale (tens of nodes) this is negligible; at production scale, fan-out must be bounded (DHT or selective fan-out)
-- Cold cache miss adds ~200ms latency (probe timeout) compared to an instant routing table lookup; mitigated by probe cache for repeated lookups within 30 seconds
+- Cold cache miss adds ~200ms latency (probe timeout) compared to a pre-built content index lookup; mitigated by probe cache for repeated lookups within 30 seconds
 - Probe cache introduces a brief staleness window (up to 30s) where a node may attempt to pull from a provider that has evicted the blob; the fallback is a fresh fan-out
 - `popular_hashes` in `NodeAnnounce` explicitly gossips which blobs are in high demand — a new, compactly gossiped signal distinct from content availability (which is now only probe-discoverable)
 - Self-reported region hints (ISO 3166-1 alpha-2) are unverified; a node could misreport its region to appear in more gossip topics
