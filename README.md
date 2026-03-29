@@ -29,6 +29,7 @@ Decentralized CDN where nodes cache and serve content-addressed blobs over [iroh
 |------|---------|
 | `cdn/probe/v1` | Latency + availability probing |
 | `cdn/client/v1` | All paid delivery (client→node and node→node) |
+| `cdn/watchtower/v1` | Channel-dispute monitoring (voucher registration) |
 | iroh-gossip | Content availability broadcast, node discovery |
 
 ### Planned Crate Structure
@@ -52,7 +53,9 @@ Architecture decision records live in [`adr/`](adr/), with [`adr/architecture.md
 - **No exposed origins:** Origin backends (S3/R2/B2) are opaque per-node config
 - **E2E encryption:** Envelope encryption with epoch-rotated keys; CDN nodes only see ciphertext
 - **Watchtowers:** Non-custodial dispute monitors for payment channel safety
+- **Discovery:** Gossip-only content routing for PoC; DHT/Kademlia deferred to post-PoC
 - **Reputation:** Interaction-weighted scoring propagated via gossip
+- **Governance:** Admin key for PoC; token-weighted governance with safety bounds for production
 
 ## Development
 
