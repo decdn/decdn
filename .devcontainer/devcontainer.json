@@ -1,5 +1,5 @@
 {
-  "name": "Storage Layer Dev",
+  "name": "DeCDN Dev",
   "build": {
     "dockerfile": "Dockerfile",
     "args": {
@@ -41,9 +41,9 @@
   },
   "remoteUser": "node",
   "mounts": [
-    "source=storage-layer-bashhistory-${devcontainerId},target=/commandhistory,type=volume",
-    "source=storage-layer-claude-config-${devcontainerId},target=/home/node/.claude,type=volume",
-    "source=storage-layer-cargo-registry-${devcontainerId},target=/home/node/.cargo/registry,type=volume"
+    "source=decdn-bashhistory-${devcontainerId},target=/commandhistory,type=volume",
+    "source=decdn-claude-config-${devcontainerId},target=/home/node/.claude,type=volume",
+    "source=decdn-cargo-registry-${devcontainerId},target=/home/node/.cargo/registry,type=volume"
   ],
   "containerEnv": {
     "NODE_OPTIONS": "--max-old-space-size=4096",

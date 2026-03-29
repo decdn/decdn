@@ -46,8 +46,8 @@ Restart your terminal after setting the variable.
 ### 2. Clone and open
 
 ```bash
-git clone git@github.com:thiras/storage-layer.git
-cd storage-layer
+git clone git@github.com:thiras/decdn.git
+cd decdn
 code .
 ```
 
@@ -173,9 +173,9 @@ These volumes survive container rebuilds:
 
 | Volume | Path in container | Contents |
 |---|---|---|
-| `storage-layer-bashhistory-*` | `/commandhistory` | Shell history |
-| `storage-layer-claude-config-*` | `/home/node/.claude` | Claude Code config and session data |
-| `storage-layer-cargo-registry-*` | `/home/node/.cargo/registry` | Downloaded crate sources and indices |
+| `decdn-bashhistory-*` | `/commandhistory` | Shell history |
+| `decdn-claude-config-*` | `/home/node/.claude` | Claude Code config and session data |
+| `decdn-cargo-registry-*` | `/home/node/.cargo/registry` | Downloaded crate sources and indices |
 
 Your workspace files are bind-mounted from the host, so they always persist.
 

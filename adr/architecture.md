@@ -206,7 +206,7 @@ The protocol does not dictate cache policy. Nodes are economically motivated to 
 ## Crate Structure
 
 ```
-storage-layer/
+decdn/
 ├── Cargo.toml                    # workspace root
 ├── crates/
 │   ├── node/                     # Binary — CLI entry, config, wiring
