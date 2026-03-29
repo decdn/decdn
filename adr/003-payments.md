@@ -286,7 +286,8 @@ interface IBuybackBurner {
 
 ### StakingRegistry Modifications
 
-Two additions to the existing contract:
+The full node registry interface (`NodeInfo`, `registerNode`, `getActiveNodes`, etc.) is defined in ADR 001. The additions below are payment-specific extensions:
+
 
 ```solidity
 // Fee discount check

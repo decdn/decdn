@@ -65,3 +65,97 @@ Node identity is the iroh `NodeId` (ed25519 public key). All staked nodes regist
 - Every transfer is paid, so nodes pulling content on cache miss incur a cost that must be recouped through subsequent client deliveries; this creates a natural economic barrier to speculative caching
 - Self-reported region hints (ISO 3166-1 alpha-2) are unverified; a node could misreport its region to appear in more gossip topics
 - Origin-backed nodes become the last line of defence for content availability — if all origin-backed nodes for a given blob go offline or are deregistered, the content becomes permanently unavailable (unless cached elsewhere). Content owners are responsible for origin node uptime.
+
+## Contract Interface: Node Registry
+
+The node registry is part of the `StakingRegistry` contract — not a separate contract. Staking is a prerequisite for registration (ADR 004), so co-locating them avoids cross-contract calls and simplifies the atomic stake-then-register flow.
+
+### Data Structure
+
+```solidity
+struct NodeInfo {
+    bytes32 nodeId;              // iroh NodeId (ed25519 public key, 32 bytes)
+    address ethAddress;          // Ethereum address for payment channels
+    bytes   multiaddrs;          // packed QUIC multiaddrs (length-prefixed entries)
+    string  regionHint;          // ISO 3166-1 alpha-2 code (self-reported, unverified)
+    uint256 registeredAt;        // block.timestamp of initial registration
+    uint256 lastMultiaddrUpdate; // block.timestamp of last multiaddr change
+    bool    active;              // false after deregistration or auto-ejection
+}
+```
+
+`multiaddrs` uses `bytes` rather than `string[]` for gas efficiency. The encoding is a packed array of `(uint16 length, bytes data)` entries. Clients parse this off-chain. Maximum size is 1024 bytes (hardcoded).
+
+### Interface (additions to StakingRegistry)
+
+```solidity
+// --- Node Registry ---
+
+// Registration (requires active stake >= minStake)
+function registerNode(
+    bytes32 nodeId,
+    bytes calldata multiaddrs,
+    string calldata regionHint
+) external;
+
+function updateMultiaddrs(bytes calldata multiaddrs) external;
+
+function deregisterNode() external;
+
+// Views
+function getNode(bytes32 nodeId) external view returns (NodeInfo memory);
+function getNodeByAddress(address ethAddress) external view returns (NodeInfo memory);
+function isActiveNode(bytes32 nodeId) external view returns (bool);
+function getActiveNodeCount() external view returns (uint256);
+function getActiveNodes(uint256 offset, uint256 limit)
+    external view returns (NodeInfo[] memory);
+
+// Events
+event NodeRegistered(
+    bytes32 indexed nodeId,
+    address indexed ethAddress,
+    bytes multiaddrs
+);
+event NodeMultiaddrUpdated(bytes32 indexed nodeId, bytes newMultiaddrs);
+event NodeDeregistered(bytes32 indexed nodeId);
+event NodeAutoEjected(bytes32 indexed nodeId, uint256 remainingStake);
+```
+
+### Constraints
+
+- **One-to-one mapping.** Each `nodeId` maps to exactly one `ethAddress` and vice versa. Enforced with `require(nodeByAddress[msg.sender].nodeId == bytes32(0))` and `require(nodes[nodeId].ethAddress == address(0))`. This aligns with ADR 004: "Max stake registrations per node: 1."
+- **`registerNode` binds `msg.sender` to `nodeId`.** The caller's Ethereum address becomes `ethAddress`. This binding is on-chain and permanent until deregistration — distinct from the ephemeral per-session `NodeId`-to-address binding described in ADR 003 for clients.
+- **`deregisterNode` triggers unbonding.** Sets `active = false` and starts the 7-day unbonding period (ADR 004). Stake remains slashable during unbonding to prevent slash-then-run.
+- **Auto-ejection.** When slashing drops a node's stake below 50% of the minimum stake requirement (ADR 004), the contract sets `active = false` and emits `NodeAutoEjected`. The node must re-stake at full minimum to rejoin.
+
+### Multiaddr Update Policy
+
+**PoC:** No cooldown. On Arbitrum Sepolia, `updateMultiaddrs` costs approximately $0.03 per call. For tens of nodes updating occasionally (IP change, port rotation), no rate limiting is needed.
+
+**Production:** A governable cooldown (0–86400 seconds) prevents a compromised node key from rapidly flipping multiaddrs to redirect traffic. The default is 0 (disabled) — governance can tighten this if abuse is observed.
+
+### Gas Costs
+
+| Operation | Estimated Gas | Cost (Arbitrum, ~$0.05/tx) |
+| --- | --- | --- |
+| `registerNode()` | ~120k gas | ~$0.05 |
+| `updateMultiaddrs()` | ~60k gas | ~$0.03 |
+| `deregisterNode()` | ~80k gas | ~$0.05 |
+
+These estimates assume typical multiaddr sizes (2–4 addresses, ~200 bytes total). Larger multiaddr payloads increase storage gas proportionally.
+
+### Client Query Patterns
+
+Three tiers, from simplest to most scalable:
+
+1. **View functions (PoC).** `getActiveNodes(offset, limit)` with pagination. For tens of nodes, a single call with `limit = 100` returns the full node set. Clients call this on first startup to bootstrap their peer list, then rely on gossip for ongoing discovery (see Decision section above).
+
+2. **Event logs (PoC + production).** Clients index `NodeRegistered`, `NodeMultiaddrUpdated`, `NodeDeregistered`, and `NodeAutoEjected` events to maintain a local cache. Events are indexed by `nodeId` for efficient filtering. More efficient than repeated view calls for larger node sets.
+
+3. **Subgraph (future production).** A Graph Protocol subgraph indexing registry events for complex queries (nodes by region, active node count over time, churn analysis). Not in PoC scope.
+
+### NodeId Ownership Verification
+
+**PoC simplification:** On-chain ed25519 verification is skipped. A node registering someone else's `nodeId` gains nothing — it cannot complete iroh QUIC handshakes with that identity, so no client or peer will connect to it. The misregistration is detectable off-chain and wastes only the attacker's gas.
+
+**Production hardening:** `registerNode` should require a signature proving the caller controls the ed25519 private key corresponding to `nodeId`: `ed25519_sign(private_key, keccak256(abi.encodePacked(nodeId, msg.sender, block.chainid)))`. Verification uses an ed25519 precompile or library (e.g., RIP-7212 on Arbitrum). This closes the gap for adversarial scenarios where registering a false `nodeId` could poison the registry or block the real owner from registering.
