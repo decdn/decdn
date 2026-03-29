@@ -349,6 +349,8 @@ All amount formatting, parsing, and display go through this abstraction. The vou
 {channelId, amount, nonce, stablecoin, signature}
 ```
 
+During delivery over `cdn/client/v1`, only `{signature, amount}` are transmitted on the wire; the remaining fields are derived from stream context. See [ADR 005](005-protocol.md) for wire protocol details.
+
 The `stablecoin` field (ERC-20 address) is included in the signed EIP-712 typed data to prevent cross-token replay attacks. The streaming protocol includes a `ChannelType` discriminator:
 
 ```rust
