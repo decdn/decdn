@@ -66,6 +66,8 @@ Node identity is the iroh `NodeId` (ed25519 public key). All staked nodes regist
 - Self-reported region hints (ISO 3166-1 alpha-2) are unverified; a node could misreport its region to appear in more gossip topics
 - Origin-backed nodes become the last line of defence for content availability — if all origin-backed nodes for a given blob go offline or are deregistered, the content becomes permanently unavailable (unless cached elsewhere). Content owners are responsible for origin node uptime.
 
+---
+
 ## Contract Interface: Node Registry
 
 The node registry is part of the `StakingRegistry` contract — not a separate contract. Staking is a prerequisite for registration (ADR 004), so co-locating them avoids cross-contract calls and simplifies the atomic stake-then-register flow.
@@ -84,7 +86,7 @@ struct NodeInfo {
 }
 ```
 
-`multiaddrs` uses `bytes` rather than `string[]` for gas efficiency. The encoding is a packed array of `(uint16 length, bytes data)` entries. Clients parse this off-chain. Maximum encoded size is bounded by the governable `maxMultiaddrSize` parameter (default 1024 bytes; see ADR 004 for safety bounds).
+`multiaddrs` uses `bytes` rather than `string[]` for gas efficiency. The encoding is a packed array of `(uint16 length, bytes data)` entries. Clients parse this off-chain. Maximum encoded size is bounded by the governable `maxMultiaddrSize` parameter (initial value 1024 bytes; safety bounds 64–1024 bytes per ADR 004).
 
 ### Interface (additions to StakingRegistry)
 
@@ -117,7 +119,7 @@ event NodeRegistered(
     bytes multiaddrs,
     string regionHint
 );
-event NodeMultiaddrUpdated(bytes32 indexed nodeId, bytes newMultiaddrs);
+event NodeMultiaddrUpdated(bytes32 indexed nodeId, bytes multiaddrs);
 event NodeDeregistered(bytes32 indexed nodeId);
 event NodeAutoEjected(bytes32 indexed nodeId, uint256 remainingStake);
 ```
@@ -137,7 +139,7 @@ event NodeAutoEjected(bytes32 indexed nodeId, uint256 remainingStake);
 
 ### Gas Costs
 
-| Operation | Estimated Gas | Cost (Arbitrum, ~$0.05/tx) |
+| Operation | Estimated Gas | Cost at ~$0.05/tx |
 | --- | --- | --- |
 | `registerNode()` | ~120k gas | ~$0.05 |
 | `updateMultiaddrs()` | ~60k gas | ~$0.03 |
@@ -159,4 +161,4 @@ Three tiers, from simplest to most scalable:
 
 **PoC simplification:** On-chain ed25519 verification is skipped. A node registering someone else's `nodeId` gains nothing in terms of traffic — it cannot complete iroh QUIC handshakes with that identity, so no client or peer will connect to it. However, under the one-to-one uniqueness constraint, a malicious first registration for a given `nodeId` blocks the legitimate owner from registering (a cheap griefing/DoS). In the PoC this risk is accepted: the deployment is small and permissioned, and misregistrations are detectable off-chain and resolvable via admin intervention.
 
-**Production hardening:** `registerNode` should require a signature proving the caller controls the ed25519 private key corresponding to `nodeId`: `ed25519_sign(private_key, keccak256(abi.encodePacked(nodeId, msg.sender, block.chainid)))`. Verification uses an ed25519 precompile (where available) or a well-audited ed25519 verification library; the concrete mechanism is chain-specific and deferred to implementation. This proof also enables a reclaim flow — the legitimate `nodeId` owner can rebind to a new address, closing the griefing gap described above.
+**Production hardening:** `registerNode` should require a signature proving the caller controls the ed25519 private key corresponding to `nodeId`: `ed25519_sign(private_key, keccak256(abi.encodePacked(nodeId, msg.sender, block.chainid, registrationNonce)))`, where `registrationNonce` is a per-`nodeId` counter incremented on each deregistration. The nonce prevents replay of old signatures after a node deregisters and a different address attempts to re-register the same `nodeId`. Verification uses an ed25519 precompile (where available) or a well-audited ed25519 verification library; the concrete mechanism is chain-specific and deferred to implementation. This proof also enables a reclaim flow — the legitimate `nodeId` owner can rebind to a new address, closing the griefing gap described above.
