@@ -5,7 +5,7 @@
 
 ## Context
 
-Vault nodes and edge nodes deliver bytes and need to be paid for it. The payment mechanism must work at per-MB granularity without an on-chain transaction per delivery, and must give delivering nodes immediate protection against non-payment.
+Nodes deliver bytes and need to be paid for it. The payment mechanism must work at per-MB granularity without an on-chain transaction per delivery, and must give delivering nodes immediate protection against non-payment.
 
 Three constraints shape the design:
 
@@ -19,8 +19,8 @@ Payments use **unidirectional off-chain payment channels settled on an EVM L2, d
 
 The same channel mechanism operates at two tiers:
 
-- **Client → edge node**: a client opens a USDC channel with an edge node, signs cumulative vouchers as MB are delivered, and the edge node closes the channel on-chain to claim payment.
-- **Edge node → vault node**: when an edge node pulls content from a vault node for the first time, it pays the vault node via the same channel mechanism. The vault node is paid wholesale; the edge node recoups this by serving multiple clients from its cache at a markup.
+- **Client → node**: a client opens a USDC channel with a node, signs cumulative vouchers as MB are delivered, and the node closes the channel on-chain to claim payment.
+- **Node → node**: when a node pulls content from another node (typically an origin-backed node) for the first time, it pays via the same channel mechanism. The origin-backed node is paid wholesale; the pulling node recoups this by serving multiple clients from its cache at a markup.
 
 A channel is opened by depositing USDC into the `StablePaymentChannel` contract. As content is delivered, the payer signs cumulative vouchers off-chain — one voucher per MB received. The delivering node holds the latest voucher and submits it on-chain to close the channel. A 24-hour dispute window allows either party to counter a stale or fraudulent close attempt.
 
@@ -29,26 +29,26 @@ Key parameters:
 - Voucher cadence: 1 MB delivered per voucher
 - Minimum deposit: 1 USDC (covers ~100,000 MB at floor rate, far more than any practical session)
 - Protocol fee: 3% deducted at channel close, sent to treasury
-- Fee discount: nodes staking ≥10× the minimum AUDIO stake pay 1.5% instead of 3%
+- Fee discount: nodes staking ≥10× the minimum TOKEN stake pay 1.5% instead of 3%
 
-The native token (AUDIO) is not used for delivery payments. It is reserved for staking, governance, and fee discount qualification (see ADR 004).
+The native token (TOKEN) is not used for delivery payments. It is reserved for staking, governance, and fee discount qualification (see ADR 004).
 
-**Rate setting is entirely up to each node.** Vault nodes and edge nodes advertise their `rate_per_mb` in probe responses and stream responses; the requester sees the rate before committing a voucher. There is no protocol-enforced rate beyond a governance-set floor and ceiling. This creates a two-tier market with natural arbitrage dynamics:
+**Rate setting is entirely up to each node.** Nodes advertise their `rate_per_mb` in probe responses and stream responses; the requester sees the rate before committing a voucher. There is no protocol-enforced rate beyond a governance-set floor and ceiling. This creates a market with natural arbitrage dynamics:
 
-- Vault nodes set a higher rate because they bear backend costs (storage + egress from their hidden backing store). They are the effective price ceiling for any blob they hold.
-- An edge node that pays a vault node to pull a blob can then serve that blob to many clients at a markup, recouping the vault cost across multiple deliveries.
-- An edge node in a region where no peer has the content yet can charge a premium for that first delivery. Once it has the blob, other nearby edges pull from it for free (via `cdn/peer/v1`) and compete for local clients at lower rates.
+- Origin-backed nodes set a higher rate because they bear backend costs (storage + egress from their hidden backing store). They are the effective price ceiling for any blob they hold.
+- A cache-only node that pays an origin-backed node to pull a blob can then serve that blob to many clients at a markup, recouping the origin cost across multiple deliveries.
+- A node in a region where no peer has the content yet can charge a premium for that first delivery. Once it has the blob, other nearby nodes can pull from it at a competitive rate and compete for local clients.
 - Nodes with cheaper bandwidth or better hardware can sustainably undercut others; nodes in high-demand regions can charge more and still win on latency.
 
-This means the network self-balances: popular content gets replicated because caching it is profitable, competition drives prices down in well-served regions, and unpopular content stays at vault node rates until demand justifies caching it. No central coordinator decides where to replicate what.
+This means the network self-balances: popular content gets replicated because caching it is profitable, competition drives prices down in well-served regions, and unpopular content stays at origin-backed node rates until demand justifies caching it. No central coordinator decides where to replicate what.
 
 ## Consequences
 
 **Positive:**
 
 - On-chain costs are amortized across an entire channel lifetime — open + close = two transactions regardless of how many MB are delivered
-- USDC denomination gives edge node operators predictable unit economics: delivery revenue covers infrastructure costs without exposure to AUDIO price movements
-- The voucher is the payment receipt; the BLAKE3 hash is the delivery receipt. Together they provide mutual protection: the client doesn't sign a voucher for bytes that fail hash verification; the edge node stops delivering if vouchers stop arriving
+- USDC denomination gives node operators predictable unit economics: delivery revenue covers infrastructure costs without exposure to TOKEN price movements
+- The voucher is the payment receipt; the BLAKE3 hash is the delivery receipt. Together they provide mutual protection: the client doesn't sign a voucher for bytes that fail hash verification; the node stops delivering if vouchers stop arriving
 - Maximum risk per voucher interval (1 MB) at $0.00001/MB is $0.00001 — negligible
 - Market-driven rate setting means replication happens organically: profitable content gets cached by more nodes, driving prices down without any coordination protocol
 - The `StablePaymentChannel` contract is isolated from the staking/slashing contract (`PaymentChannel`), keeping the audit surface for each contract bounded
@@ -57,7 +57,7 @@ This means the network self-balances: popular content gets replicated because ca
 
 - Clients must hold USDC to use the network; this adds an onboarding step compared to a single-token model
 - Rate volatility: a node can change its advertised rate between a probe and a stream request; the `StreamResponse` rate is the binding one, but a client that probed at one rate and receives a higher rate in `StreamResponse` must disconnect and re-probe rather than having been deceived silently
-- Two payment contracts coexist during migration (legacy `PaymentChannel` for AUDIO, `StablePaymentChannel` for USDC), doubling audit surface temporarily
+- Two payment contracts coexist during migration (legacy `PaymentChannel` for TOKEN, `StablePaymentChannel` for USDC), doubling audit surface temporarily
 - USDC is issued by Circle, which can freeze specific addresses or blacklist the contract. This is mitigated by a governance-maintained allowlist that can add DAI or other stablecoins, but the risk is not eliminated
 - BLAKE3 verification on EVM requires an intermediate Merkle proof scheme for PoC-era slash evidence; a client submitting a slash claim cannot directly prove BLAKE3 mismatch on-chain
 
@@ -73,24 +73,24 @@ The self-enforcing stop is sufficient. Maximum loss is one interval (1 MB × rat
 ---
 
 **Channel griefing**
-Client opens many channels with minimum deposit and never streams, forcing edge nodes to track and eventually close stale channels.
+Client opens many channels with minimum deposit and never streams, forcing nodes to track and eventually close stale channels.
 
-The current mitigation (auto-expire + deposit > gas cost) limits financial loss to the attacker but does not bound the memory overhead on the edge node. An attacker with modest capital can hold thousands of open-but-idle channels in the node's tracking state for up to 30 days. Options:
+The current mitigation (auto-expire + deposit > gas cost) limits financial loss to the attacker but does not bound the memory overhead on the node. An attacker with modest capital can hold thousands of open-but-idle channels in the node's tracking state for up to 30 days. Options:
 
 - **Option A — Inactivity expiry.** Channels with no voucher submitted within the first 7 days auto-expire, rather than the full 30-day channel lifetime. Reduces the attack window significantly at no cost to normal users.
 - **Option B — On-chain channel cap per address.** The `StablePaymentChannel` contract enforces a maximum number of open channels per client Ethereum address (e.g., 10). Hard to circumvent without new wallet addresses, each requiring on-chain funding.
-- **Option C — Edge node-side filtering.** Edge nodes refuse `StreamRequest` from channels that have been open longer than N days with zero vouchers. Off-chain, no contract change needed, but relies on node operator implementation.
+- **Option C — Node-side filtering.** Nodes refuse `StreamRequest` from channels that have been open longer than N days with zero vouchers. Off-chain, no contract change needed, but relies on node operator implementation.
 
 ---
 
 **Stale close**
-Client submits an old voucher (lower amount) to close the channel, underpaying the edge node.
+Client submits an old voucher (lower amount) to close the channel, underpaying the node.
 
-The 24-hour dispute window works if the edge node is online. The gap is liveness: if the node goes offline after a stale close is submitted and misses the dispute window, it loses the difference. Options:
+The 24-hour dispute window works if the node is online. The gap is liveness: if the node goes offline after a stale close is submitted and misses the dispute window, it loses the difference. Options:
 
 - **Option A — Watchtowers.** A separate monitoring service holds the latest voucher and submits it on the node's behalf if a dispute is detected. Adds operational complexity but fully closes the gap.
 - **Option B — Longer dispute window.** Increase from 24 hours to 7 days, giving operators more time to respond. Delays legitimate channel closes for everyone.
-- **Option C — Persistent monitoring process.** The edge node binary runs a lightweight dispute monitor as a separate thread that only watches the chain for close events, independent of the serving process. Simpler than a watchtower but still single-node.
+- **Option C — Persistent monitoring process.** The node binary runs a lightweight dispute monitor as a separate thread that only watches the chain for close events, independent of the serving process. Simpler than a watchtower but still single-node.
 
 ---
 
@@ -113,17 +113,17 @@ Fully solved. Each `openChannel` call transfers USDC into the contract immediate
 
 ---
 
-### Edge node-side
+### Node-side
 
 **Data withholding**
-Edge node accepts a stream request, receives a voucher, then stops delivering bytes.
+Node accepts a stream request, receives a voucher, then stops delivering bytes.
 
-Fully solved by the self-enforcing protocol. The edge node cannot extract more payment than the last acknowledged voucher. The client resumes from `byte_offset` on a different node.
+Fully solved by the self-enforcing protocol. The node cannot extract more payment than the last acknowledged voucher. The client resumes from `byte_offset` on a different node.
 
 ---
 
 **Corrupted delivery**
-Edge node serves bytes that don't match the advertised BLAKE3 hash.
+Node serves bytes that don't match the advertised BLAKE3 hash.
 
 BLAKE3 verification catches this immediately at the client. The remaining gap is the slash evidence path: submitting the full bad bytes on-chain to prove a BLAKE3 mismatch is gas-expensive for large blobs, and the PoC Merkle proof scheme adds complexity. Options:
 
@@ -134,31 +134,23 @@ BLAKE3 verification catches this immediately at the client. The remaining gap is
 ---
 
 **Rate bait-and-switch**
-Edge node advertises a low rate in probe responses then returns a higher rate in `StreamResponse`.
+Node advertises a low rate in probe responses then returns a higher rate in `StreamResponse`.
 
-Disconnecting works per-incident. The gap is that reputation is local and slow — a new node can bait-and-switch many clients before its reputation degrades enough to matter, and there is no global signal. Options:
-
-- **Option A — Signed, timestamped rate advertisement.** Nodes sign their advertised rate with their iroh private key and a timestamp. If the `StreamResponse` rate differs from the last signed probe rate, the discrepancy is cryptographically provable and can be reported on gossip as evidence, degrading the node's network-wide reputation immediately rather than only locally.
-- **Option B — Short local blacklist.** On a bait-and-switch, the client blacklists the offending node for a cooldown period (e.g., 1 hour). Simple, no coordination required, limits repeated abuse from the same node against the same client.
-- **Option C — On-chain rate registration.** Nodes publish their rate on-chain. Changes require a transaction, introducing gas cost and finality delay as a natural brake on rapid rate manipulation. Heavy-weight but auditable.
+**Resolved: slashable offense.** Both `ProbeResponse` and `StreamResponse` now include cryptographic signatures over the advertised rate (see ADR 005). If a client receives a signed `ProbeResponse` with rate X and a signed `StreamResponse` with rate Y > X from the same node within 30 seconds, the two signed messages constitute on-chain-verifiable evidence of rate manipulation. The node is slashed per the escalating schedule in ADR 004. The 30-second window allows legitimate rate changes between sessions while catching same-session bait-and-switch.
 
 ---
 
 **Phantom blob announcement**
-Edge node announces a blob as cached then fails or redirects on actual request.
+Node announces a blob as cached then fails or redirects on actual request.
 
-Reputation is too slow here — a newly staked node can announce thousands of phantom blobs before penalties accumulate. The 200ms timeout bounds per-incident cost but the aggregate across many probe targets adds up. Options:
-
-- **Option A — Proof-of-possession challenge.** During the probe exchange, the client requests a hash of a small random byte range within the blob (e.g., bytes 4096–8192). The node must return the correct value or `has_blob` is treated as false. This proves the node actually has the blob with one extra hash computation, at negligible cost for honest nodes.
-- **Option B — Stake-weighted announcement trust.** Clients weight `has_blob` claims by the node's stake. A new node with minimum stake gets lower trust for its cache claims; clients probe but don't rely on it without a possession challenge. Higher-staked nodes get more trust implicitly.
-- **Option C — Reputation fast-path for phantom detection.** Track `has_blob: true` claims that result in a redirect or `NotCached` response separately from other reputation signals, with a steeper penalty weight. A node that lies about cache hits is penalised faster than one that is simply slow.
+**Resolved: slashable offense.** The `ProbeResponse` now includes a cryptographic signature over `{hash, has_blob, rate_per_mb, timestamp_us}` (see ADR 005). If a node signs `has_blob: true` but subsequently responds with `NotCached` or fails to deliver within 30 seconds, the signed probe response plus the delivery failure constitute on-chain-verifiable evidence. The node is slashed per the escalating schedule in ADR 004. The 30-second validity window accounts for the possibility that a blob is legitimately evicted between probe and request — 30 seconds is short enough to make eviction implausible but long enough for normal protocol flow. The challenged node has a 24-hour window to counter by proving it delivered the blob (signed delivery receipt from the same requester within the relevant time window).
 
 ---
 
 **Channel close front-running**
-Edge node monitors the mempool and front-runs a client's channel close with a higher voucher submission.
+Node monitors the mempool and front-runs a client's channel close with a higher voucher submission.
 
-Not a real attack. The contract always settles the highest valid voucher, and only the client can sign a valid voucher. An edge node submitting the latest voucher before the client is the intended happy path. Fabricating a higher voucher requires forging the client's ECDSA signature, which is cryptographically infeasible.
+Not a real attack. The contract always settles the highest valid voucher, and only the client can sign a valid voucher. A node submitting the latest voucher before the client is the intended happy path. Fabricating a higher voucher requires forging the client's ECDSA signature, which is cryptographically infeasible.
 
 ---
 
@@ -169,7 +161,7 @@ Attacker surrounds a client with malicious nodes so all probe responses come fro
 
 BLAKE3 verification catches data corruption regardless of which nodes are in the routing table. The remaining gap is a denial-of-service variant: an attacker controlling all of a client's known nodes can simply refuse to serve. Options:
 
-- **Option A — Vault nodes as typed fallback.** The staking registry exposes node roles. Clients can specifically query for vault nodes for a given blob, bypassing the general routing table. An eclipse must also control all vault nodes for the target content — which requires capital proportional to the number of vault nodes staked for that content.
+- **Option A — Origin-backed nodes as fallback.** Clients can specifically query the registry for well-known origin-backed nodes for a given blob, bypassing the general routing table. An eclipse must also control all origin-backed nodes for the target content — which requires capital proportional to the number of origin-backed nodes for that content.
 - **Option B — Multi-source bootstrap.** Clients discover initial peers from at least two independent sources (on-chain registry + a hardcoded DNS seed list). An attacker must compromise both to fully eclipse a client.
 - **Option C — Minimum honest-peer diversity.** Clients maintain connections to at least N nodes discovered via different paths. All N would need to be attacker-controlled for a full eclipse.
 
@@ -182,10 +174,10 @@ Registry check + per-sender rate limiting is solid. The minor gap is that the lo
 
 ---
 
-**Sybil edge nodes**
+**Sybil nodes**
 Attacker stakes many cheap nodes to dominate probe responses for popular content, controlling pricing in a region.
 
-The core weakness is token-price dependency: at $0.001/AUDIO, a minimum stake of 1,000 AUDIO costs $1 per sybil node. The `rate_per_mb × rtt_ms` selection score helps — a sybil fleet must be real hardware in the right geography and competitively priced — but does not eliminate the risk when the token is cheap. Options:
+The core weakness is token-price dependency: at $0.001/TOKEN, a minimum stake of 1,000 TOKEN costs $1 per sybil node. The `rate_per_mb × rtt_ms` selection score helps — a sybil fleet must be real hardware in the right geography and competitively priced — but does not eliminate the risk when the token is cheap. Options:
 
 - **Option A — Governance raises minimum stake if token price falls.** The minimum stake is governable. Token holders are incentivised to raise it to protect the network, since a sybil-dominated network reduces usage and token value. Reactive but aligned.
 - **Option B — Minimum stake denominated in USD equivalent via oracle.** Requires a price oracle, which was rejected in ADR 004 for payment rate bounds. The same concerns (oracle downtime, manipulation) apply here, but the impact of oracle failure is lower (new stakers temporarily blocked, not payments broken).
@@ -194,20 +186,19 @@ The core weakness is token-price dependency: at $0.001/AUDIO, a minimum stake of
 ---
 
 **Rate manipulation cartel**
-Colluding edge nodes in a region hold rates artificially high.
+Colluding nodes in a region hold rates artificially high.
 
-Vault nodes set the effective price ceiling for any blob. Clients can always probe vault nodes directly and pay vault rates as a guaranteed fallback. Any edge node outside the cartel that undercuts wins all local traffic — the incentive to defect is strong. New entrants can join permissionlessly by staking.
+Origin-backed nodes set the effective price ceiling for any blob. Clients can always probe origin-backed nodes directly and pay their rates as a guaranteed fallback. Any node outside the cartel that undercuts wins all local traffic — the incentive to defect is strong. New entrants can join permissionlessly by staking.
 
 ---
 
-**Vault node content withholding**
-A vault node stakes, announces content it holds, but refuses to serve it — collecting credibility in the routing tables without actually participating.
+**Content withholding**
+A node stakes, announces content it holds, but refuses to serve it — collecting credibility in the routing tables without actually participating.
 
-This attack has no equivalent in a model with a public origin URL. Options:
+**Withholding is not a slashable offense** — operators may legitimately take content offline for maintenance, migration, or business reasons, and slashing for availability creates perverse incentives. Instead, withholding is handled through reputation and redundancy:
 
-- **Option A — Slash for announced-but-unserved content.** If a vault node's `CacheAnnounce` claims a hash but consistently returns `NotCached` or times out on direct requests, clients can submit on-chain evidence. Requires a challenge mechanism similar to the corrupted delivery slash path.
-- **Option B — Multiple vault nodes per blob.** Content owners register more than one vault node for important content. A single withholding node becomes irrelevant if others serve the same blob. Staking cost is a natural limit on how many vault nodes an attacker can control across all content.
-- **Option C — Reputation fast-path for vault nodes.** Vault nodes that fail to serve announced content accumulate reputation penalties at a steeper rate than edge nodes, since their role is canonical availability, not best-effort caching.
+- **Multiple origin-backed nodes per blob.** Content owners configure multiple origin-backed nodes for important content. A single withholding node becomes irrelevant if others serve the same blob.
+- **Reputation fast-path.** Nodes that fail to serve announced content accumulate reputation penalties at a steeper rate. A node with consistently poor availability is deprioritized in routing and loses delivery revenue.
 
 ---
 
@@ -215,3 +206,190 @@ This attack has no equivalent in a model with a public origin URL. Options:
 Attacker intercepts a signed voucher and attempts to replay it against a different channel or after close.
 
 Fully solved. EIP-712 typed data over `{channelId, amount, nonce, stablecoin}` binds the voucher to a specific channel. The monotonically increasing nonce prevents resubmission after settlement.
+
+## Contract Interfaces
+
+### StablePaymentChannel
+
+The `StablePaymentChannel` is a new contract separate from the existing `PaymentChannel`. It handles only stablecoin payment channels.
+
+**Channel state:**
+
+```solidity
+struct Channel {
+    address client;
+    address provider;
+    address stablecoin;       // ERC-20 address (e.g., USDC)
+    uint256 deposit;          // in stablecoin base units (USDC: 6 decimals)
+    uint256 claimedAmount;    // cumulative amount claimed via vouchers
+    uint256 openedAt;
+    uint256 expiresAt;
+    uint8   status;           // Open, Closing, Closed
+    uint256 disputeDeadline;  // set when close is initiated
+}
+```
+
+**Channel ID:** `channelId = keccak256(abi.encodePacked(client, provider, stablecoin, nonce))` where `nonce` is a per-client counter. Allows multiple channels between the same client-node pair (e.g., one in USDC and one in DAI).
+
+```solidity
+interface IStablePaymentChannel {
+    // Channel lifecycle
+    function openChannel(address provider, address stablecoin, uint256 deposit) external returns (bytes32 channelId);
+    function topUp(bytes32 channelId, uint256 additionalDeposit) external;
+    function closeChannel(bytes32 channelId, uint256 amount, uint256 nonce, bytes calldata signature) external;
+    function disputeChannel(bytes32 channelId, uint256 amount, uint256 nonce, bytes calldata signature) external;
+    function reclaimExpired(bytes32 channelId) external;
+
+    // Views
+    function getChannel(bytes32 channelId) external view returns (Channel memory);
+    function getEffectiveFee(address provider) external view returns (uint256 bps);
+    function isAllowedStablecoin(address token) external view returns (bool);
+
+    // Governance
+    function setFeePercentage(uint256 bps) external;
+    function setAllowedStablecoin(address token, bool allowed) external;
+    function setTreasuryAddress(address treasury) external;
+    function setMinDeposit(uint256 amount) external;
+    function setDisputeWindow(uint256 seconds_) external;
+    function setRateBounds(address stablecoin, uint256 deliveryFloor, uint256 deliveryCeiling) external;
+}
+```
+
+**Safety bounds (hardcoded):**
+
+| Parameter | Minimum | Maximum |
+| --- | --- | --- |
+| Fee percentage | 0 bps (0%) | 2000 bps (20%) |
+| Dispute window | 1800 seconds (30 min) | 604800 seconds (7 days) |
+| Min deposit | 1 base unit | No max |
+| Rate floor | 0 | Must be < ceiling |
+| Rate ceiling | Must be > floor | No max |
+
+**Rate bounds are per-stablecoin.** The contract stores `mapping(address => RateBounds)` where `RateBounds` contains floor/ceiling in that stablecoin's base units. USDC bounds are in 6-decimal units, DAI bounds are in 18-decimal units, each set independently.
+
+### BuybackBurner
+
+```solidity
+interface IBuybackBurner {
+    function executeBuyback(address stablecoin, uint256 amount, uint256 minTokenOut) external;
+    function setKeeper(address keeper) external;
+    function setSwapRouter(address router) external;
+    function setSlippageTolerance(uint256 bps) external;
+    function setMinBuybackAmount(uint256 amount) external;
+    function setMaxBuybackAmount(uint256 amount) external;
+    function keeper() external view returns (address);
+    function getAccumulatedFees(address stablecoin) external view returns (uint256);
+}
+```
+
+`executeBuyback` is callable by governance multisig or the authorized `keeper` address. All `set*` functions are governance-only behind a timelock.
+
+### StakingRegistry Modifications
+
+Two additions to the existing contract:
+
+```solidity
+// Fee discount check
+function getStakeMultiple(address provider) external view returns (uint256) {
+    return stakes[provider].amount / minStake;
+}
+
+// Client staking (optional, no slashing)
+mapping(address => uint256) public clientStakes;
+
+function clientStake(uint256 amount) external nonReentrant {
+    token.transferFrom(msg.sender, address(this), amount);
+    clientStakes[msg.sender] += amount;
+}
+
+function clientUnstake(uint256 amount) external nonReentrant {
+    require(clientStakes[msg.sender] >= amount);
+    clientStakes[msg.sender] -= amount;
+    token.transfer(msg.sender, amount);
+}
+
+function clientStakeOf(address client) external view returns (uint256) {
+    return clientStakes[client];
+}
+```
+
+## Client Priority Staking
+
+A lightweight, optional mechanism for clients to signal commitment:
+
+- Clients call `StakingRegistry.clientStake(amount)` to deposit TOKEN
+- No minimum, no slashing, no unbonding period — just a deposit
+- Nodes check client stake via `StakingRegistry.clientStakeOf(address)`
+- During congestion, nodes prioritize higher-staking clients in their connection queue
+- Enforcement is off-chain (node-side logic), not on-chain
+- Clients withdraw anytime: `StakingRegistry.clientUnstake(amount)`
+
+**NodeId-to-address mapping:** During the iroh connection handshake, the client's `NodeId` (ed25519 public key) is known. The client signs a message binding their `NodeId` to their Ethereum address and includes it in the `StreamRequest`. The node verifies this signature and uses the Ethereum address to look up `clientStakeOf`. This mapping is ephemeral (per-session, not stored on-chain).
+
+This is a soft signal, not a hard gate. Non-staking clients still get served, just with lower priority during congestion.
+
+## Decimal Handling
+
+USDC uses 6 decimals, TOKEN uses 18, DAI uses 18. The `incentive` crate handles this with a currency abstraction:
+
+```rust
+enum Currency {
+    Native { decimals: u8 },                       // TOKEN, 18 decimals
+    Stable { address: Address, decimals: u8 },     // USDC (6), DAI (18), etc.
+}
+```
+
+All amount formatting, parsing, and display go through this abstraction. The voucher signing code uses raw base units — no decimal conversion in the signature path to avoid precision bugs.
+
+**Voucher format change for stablecoin channels:**
+
+```
+{channelId, amount, nonce, stablecoin, signature}
+```
+
+The `stablecoin` field (ERC-20 address) is included in the signed EIP-712 typed data to prevent cross-token replay attacks. The streaming protocol includes a `ChannelType` discriminator:
+
+```rust
+enum ChannelType {
+    NativeToken,                           // legacy
+    Stablecoin { address: Address },       // new
+}
+```
+
+Nodes and clients negotiate channel type during the `StreamRequest`/`StreamResponse` handshake.
+
+## Stablecoin Migration Path
+
+### Phase 1: Deploy Alongside (4–6 weeks)
+
+No breaking changes. Both channel types coexist.
+
+1. Deploy `StablePaymentChannel` and `BuybackBurner` on Arbitrum Sepolia
+2. Add stablecoin rate fields to gossip messages (backward compatible — old fields remain, new fields are `Option`)
+3. Update `incentive` crate to support both `PaymentChannel` (token) and `StablePaymentChannel` (stablecoin), selected by config
+4. Nodes opt in by setting `accepted_stablecoins` in config
+5. Clients prefer stablecoin channels when available, fall back to token channels
+
+### Phase 2: Stablecoin-Preferred (2–3 months)
+
+1. Deploy to production L2
+2. Default client behavior: stablecoin channels if node supports them, token channels otherwise
+3. Node bootstrap fund begins distributing TOKEN bonuses on top of USDC payments
+4. Governance sets stablecoin rate bounds
+5. Fee discount mechanism goes live (nodes with ≥10× stake get 1.5% fee)
+6. Target: >80% stablecoin channels within 3 months
+
+### Phase 3: Token Channels Deprecated (1–2 months after Phase 2)
+
+1. Governance vote to disable new token channels (`PaymentChannel.openChannel()` reverts)
+2. Existing token channels settle normally — no funds trapped
+3. After 60 days with no open token channels, `PaymentChannel` is effectively retired
+
+### Rollback Plan
+
+If stablecoin channels cause unforeseen problems during Phase 1–2:
+
+- Nodes remove stablecoin rates from gossip announcements
+- Clients fall back to token channels automatically
+- `StablePaymentChannel` remains deployed but unused
+- No governance action needed — migration is market-driven, not forced
