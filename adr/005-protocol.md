@@ -112,9 +112,9 @@ Maximum concurrent bidirectional streams per connection, set via QUIC transport 
 | --- | --- | --- |
 | `cdn/client/v1` | 100 | Enough parallelism for bulk fetching (e.g., video manifest + segments) without exhausting server resources |
 | `cdn/probe/v1` | 1 | Single request-response; the connection is reused for sequential probes to the same node |
-| `cdn/watchtower/v1` | 10 | One stream per registered channel; a node with many channels to the same watchtower multiplexes updates |
+| `cdn/watchtower/v1` | 10 | Allows concurrent updates for up to 10 registered channels; a node with more channels multiplexes updates over the available streams |
 
-A node that receives a stream beyond the limit does not need to reject it explicitly — QUIC flow control will block the peer until an existing stream closes.
+Stream concurrency is enforced via QUIC's `MAX_STREAMS` transport parameter: a peer MUST NOT open a new bidirectional stream beyond the advertised limit (doing so is a protocol violation resulting in `STREAM_LIMIT_ERROR` and connection close). The receiver grants additional credit by sending `MAX_STREAMS` updates as existing streams close.
 
 #### Payment channels and concurrent streams
 
@@ -128,15 +128,15 @@ sequenceDiagram
     Note over C,N: Single QUIC connection (cdn/client/v1)
 
     par Stream 1 (blob A)
-        C->>N: StreamRequest {hash_a, channel_id, offset: 0}
+        C->>N: StreamRequest {hash_a, channel_id, byte_offset: 0}
         N->>C: StreamResponse + ChunkData…
     and Stream 2 (blob B)
-        C->>N: StreamRequest {hash_b, channel_id, offset: 0}
+        C->>N: StreamRequest {hash_b, channel_id, byte_offset: 0}
         N->>C: StreamResponse + ChunkData…
     end
 
     Note over C: Aggregate byte counter crosses 1 MB
-    C->>N: Voucher {sig, cumulative_amt} (sent on any active stream)
+    C->>N: Voucher {sig, amt} (sent on any active stream)
     N->>C: VoucherAck
 ```
 
@@ -146,8 +146,8 @@ Implementation constraint: the payer must have a single voucher-signing task per
 
 #### Connection lifetime
 
-- Connections remain open while any stream is active or vouchers are pending settlement.
-- **Idle timeout:** 30 seconds after the last stream closes and no vouchers are pending. QUIC keep-alive interval is set to 10 seconds (below the idle timeout) to prevent NAT middleboxes from dropping the mapping.
+- Connections remain open while any stream is active or any sent voucher is awaiting `VoucherAck` (on-chain channel closure does not affect connection lifetime).
+- **Idle timeout:** 30 seconds after the last stream closes and no unacknowledged vouchers remain in flight. Endpoints SHOULD send periodic QUIC PING frames when otherwise idle, with a default interval of 10 seconds (below the idle timeout) to prevent NAT middleboxes from dropping the mapping.
 - **`cdn/watchtower/v1` exception:** watchtower connections are long-lived by design (ADR 007). No idle timeout while any channel is registered.
 
 ### Serialization
