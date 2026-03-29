@@ -1,10 +1,64 @@
-# Storage Layer
+# deCDN
 
-Decentralized audio storage and delivery network built on [iroh](https://iroh.computer/).
+Decentralized CDN where nodes cache and serve content-addressed blobs over [iroh](https://iroh.computer/) QUIC, and clients pay per-MB via off-chain USDC payment channels. Rust implementation targeting a PoC of tens of nodes on Arbitrum Sepolia testnet.
 
-This repository includes a devcontainer for running consistent, secure, long-running [Claude Code](https://claude.ai/claude-code) instances across the team.
+## How It Works
 
-## Prerequisites
+- **Nodes** stake TOKEN, cache content, and serve BLAKE3-addressed blobs over QUIC
+- **Clients** probe candidate nodes, pick the best by `rate_per_mb × rtt_ms`, stream content, and pay via off-chain USDC vouchers
+- On a **cache miss**, nodes pull from peers (paid), cache locally, and stream to the client simultaneously
+- All byte transfers are paid — client-to-node and node-to-node
+
+```
+  ┌────────────┐ ┌────────────┐ ┌────────────┐
+  │    Node    │◄┤    Node    │◄┤    Node    │
+  │  (cached)  ├►│  (origin)  ├►│  (cached)  │
+  └─────┬──────┘ └─────┬──────┘ └─────┬──────┘
+        │              │              │
+     pays per-MB    pays per-MB    pays per-MB
+       (USDC)         (USDC)         (USDC)
+        │              │              │
+  ┌─────▼──────┐ ┌─────▼──────┐ ┌─────▼──────┐
+  │   Client   │ │   Client   │ │   Client   │
+  └────────────┘ └────────────┘ └────────────┘
+```
+
+### Wire Protocols
+
+| ALPN | Purpose |
+|------|---------|
+| `cdn/probe/v1` | Latency + availability probing |
+| `cdn/client/v1` | All paid delivery (client→node and node→node) |
+| iroh-gossip | Content availability broadcast, node discovery |
+
+### Planned Crate Structure
+
+```
+crates/
+  node/         — binary entry point, CLI, config, wiring
+  protocol/     — shared types, wire format, ALPN message definitions
+  cache/        — cache engine wrapping iroh-blobs + origin pull-through
+  incentive/    — payment channels, staking, vouchers (alloy for Ethereum)
+  reputation/   — gossip-based reputation scoring
+  contracts/    — Solidity contracts + Foundry
+```
+
+### Key Design Decisions
+
+Architecture decision records live in [`adr/`](adr/), with [`adr/architecture.md`](adr/architecture.md) as the living overview. Highlights:
+
+- **Content addressing:** BLAKE3 hashes; clients verify on receipt
+- **Dual currency:** USDC for payments, TOKEN for staking/governance
+- **No exposed origins:** Origin backends (S3/R2/B2) are opaque per-node config
+- **E2E encryption:** Envelope encryption with epoch-rotated keys; CDN nodes only see ciphertext
+- **Watchtowers:** Non-custodial dispute monitors for payment channel safety
+- **Reputation:** Interaction-weighted scoring propagated via gossip
+
+## Development
+
+This repository includes a devcontainer for a consistent, firewall-isolated development environment.
+
+### Prerequisites
 
 | Requirement | Windows | macOS | Linux |
 |---|---|---|---|
@@ -13,15 +67,15 @@ This repository includes a devcontainer for running consistent, secure, long-run
 | Extension | [Dev Containers](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers) | Dev Containers | Dev Containers |
 | API Key | `ANTHROPIC_API_KEY` set on host | `ANTHROPIC_API_KEY` set on host | `ANTHROPIC_API_KEY` set on host |
 
-### Platform notes
+#### Platform Notes
 
 - **Windows**: Docker Desktop must use the WSL2 backend. Enable it in Docker Desktop Settings > General > "Use the WSL 2 based engine".
 - **macOS (Apple Silicon)**: The container runs natively on arm64. Only enable Rosetta in Docker Desktop if you encounter compatibility issues with specific packages.
 - **Linux**: Your user must be in the `docker` group (`sudo usermod -aG docker $USER`) or use rootless Docker.
 
-## Quick start
+### Quick Start
 
-### 1. Set your API key
+#### 1. Set Your API Key
 
 **Linux / macOS** (add to `~/.bashrc`, `~/.zshrc`, or `~/.profile`):
 
@@ -43,7 +97,7 @@ setx ANTHROPIC_API_KEY "sk-ant-..."
 
 Restart your terminal after setting the variable.
 
-### 2. Clone and open
+#### 2. Clone and Open
 
 ```bash
 git clone git@github.com:thiras/decdn.git
@@ -51,7 +105,7 @@ cd decdn
 code .
 ```
 
-### 3. Reopen in container
+#### 3. Reopen in Container
 
 When VS Code detects the `.devcontainer/` folder, it will prompt:
 
@@ -65,7 +119,7 @@ Dev Containers: Reopen in Container
 
 The first build takes a few minutes (Rust toolchain + dependencies). Subsequent starts reuse the cached image.
 
-### 4. Verify
+#### 4. Verify
 
 Inside the container terminal:
 
@@ -76,7 +130,7 @@ cargo --version        # Cargo package manager
 [ -n "$ANTHROPIC_API_KEY" ] && echo "Key is set" || echo "Key is missing"
 ```
 
-## What's included
+### What's Included
 
 | Tool | Purpose |
 |---|---|
@@ -88,13 +142,13 @@ cargo --version        # Cargo package manager
 | iptables + ipset | Container firewall (auto-configured on start) |
 | Node.js 20 | Runtime for Claude Code |
 
-### VS Code extensions (auto-installed)
+#### VS Code Extensions (Auto-Installed)
 
 - `anthropic.claude-code` — Claude Code
 - `rust-lang.rust-analyzer` — Rust language server (clippy on save)
 - `eamodio.gitlens` — Git history and blame
 
-## Authentication
+### Authentication
 
 The `ANTHROPIC_API_KEY` environment variable is forwarded from your host machine into the container via `devcontainer.json`:
 
@@ -106,7 +160,7 @@ The `ANTHROPIC_API_KEY` environment variable is forwarded from your host machine
 
 The key is never baked into the image or committed to the repo. Each team member sets their own key on their host.
 
-## Running Claude Code unattended
+### Running Claude Code Unattended
 
 The container's firewall isolation enables safe use of `--dangerously-skip-permissions` for long-running, unattended sessions:
 
@@ -123,7 +177,7 @@ This bypasses all permission prompts, allowing Claude to read/write files, run c
 - Only use this with trusted repositories — a malicious project could exfiltrate data accessible within the container
 - Monitor Claude's activities, especially during initial use
 
-## Firewall and security
+### Firewall and Security
 
 On container start, `init-firewall.sh` configures a default-deny iptables firewall.
 
@@ -149,7 +203,7 @@ On container start, `init-firewall.sh` configures a default-deny iptables firewa
 
 All other outbound traffic is rejected.
 
-### Adding a new domain
+#### Adding a New Domain
 
 Edit `.devcontainer/init-firewall.sh` and add the domain to either the `CRITICAL_DOMAINS` array (must resolve or container fails to start) or the `OPTIONAL_DOMAINS` array (best-effort):
 
@@ -167,7 +221,7 @@ OPTIONAL_DOMAINS=(
 
 Rebuild the container image for the change to take effect (the script is baked in at build time, then executed on every container start).
 
-## Persistent volumes
+### Persistent Volumes
 
 These volumes survive container rebuilds:
 
@@ -179,9 +233,9 @@ These volumes survive container rebuilds:
 
 Your workspace files are bind-mounted from the host, so they always persist.
 
-## Customization
+### Customization
 
-### Add a VS Code extension
+#### Add a VS Code Extension
 
 Edit `.devcontainer/devcontainer.json`:
 
@@ -194,7 +248,7 @@ Edit `.devcontainer/devcontainer.json`:
 ]
 ```
 
-### Change the timezone
+#### Change the Timezone
 
 The container inherits your host's `TZ` environment variable. To override, set it before opening:
 
@@ -204,24 +258,24 @@ export TZ="Europe/Istanbul"
 
 Or change the default in `devcontainer.json` build args.
 
-### Add system packages
+#### Add System Packages
 
 Edit the `apt-get install` block in `.devcontainer/Dockerfile` and rebuild.
 
-## Troubleshooting
+### Troubleshooting
 
-### "Reopen in Container" doesn't appear
+#### "Reopen in Container" Doesn't Appear
 
 Ensure the Dev Containers extension is installed. Open Command Palette and search for "Dev Containers: Reopen in Container".
 
-### Container build fails
+#### Container Build Fails
 
 ```bash
 # Build manually to see full output
 docker build -f .devcontainer/Dockerfile .devcontainer/
 ```
 
-### `ANTHROPIC_API_KEY` is empty inside the container
+#### `ANTHROPIC_API_KEY` is Empty Inside the Container
 
 The key must be set in your host shell **before** opening VS Code. Verify on your host:
 
@@ -233,7 +287,7 @@ echo %ANTHROPIC_API_KEY%  # cmd
 
 If set but not visible, restart VS Code — it reads environment variables at launch.
 
-### Firewall blocks a domain you need
+#### Firewall Blocks a Domain You Need
 
 Check which domain is blocked:
 
@@ -243,10 +297,10 @@ curl -v https://the-domain.com 2>&1 | head -20
 
 Add it to `init-firewall.sh` and rebuild the container image (the script is copied during build).
 
-### Slow first build on Apple Silicon
+#### Slow First Build on Apple Silicon
 
 Compiling Rust dev tools (`cargo-watch`, `cargo-nextest`) from source takes longer on arm64. The first build may take 5-10 minutes. Subsequent starts reuse cached layers.
 
-### Docker not running (Windows)
+#### Docker Not Running (Windows)
 
 Ensure Docker Desktop is running and the WSL2 backend is active. If using WSL2, run `wsl --update` to ensure it's current.
