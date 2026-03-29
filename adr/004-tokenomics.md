@@ -51,7 +51,7 @@ Minimum stake is 1,000 TOKEN with a 7-day unbonding period. Stake remains slasha
 
 **Negative:**
 
-- Bootstrapping requires token demand before organic revenue is sufficient; a 200M TOKEN bootstrap fund is allocated for this but its adequacy is unproven
+- Bootstrapping requires token demand before organic revenue is sufficient; a 200M TOKEN bootstrap fund is allocated for this — adequate for PoC scale (see Node Unit Economics), but adequacy for the production bootstrap period (hundreds of nodes before organic traffic) is unproven
 - Two-token UX: all node operators need both USDC (for payment channels) and TOKEN (to stake). Client software should abstract this with integrated DEX swaps but adds complexity
 - The TOKEN/USDC Uniswap pool may be thin at launch, making buyback execution sensitive to pool depth; `maxBuybackAmount` and `minTokenOut` parameters mitigate sandwich risk but require active governance attention
 - Regulatory risk: a token with staking, governance, and economic utility may be classified as a security in some jurisdictions. Legal review is required before production token distribution. See [ADR 009](009-governance.md) for governance-specific risks.
@@ -182,9 +182,9 @@ The caller provides `minTokenOut` to prevent sandwich attacks. If the TOKEN/USDC
 | L2 gas costs | $5–15 | ~10 channel settlements/month at ~$0.50–1.50 each |
 | **Total monthly cost** | **$35–100** | |
 
-### Revenue Model
+### Revenue Model (Production Target)
 
-A node earning at PoC delivery rates with a USDC-denominated delivery rate of $0.00001/MB:
+A node earning at a USDC-denominated delivery rate of $0.00001/MB with production-level traffic:
 
 | Metric | Value |
 | --- | --- |
@@ -198,6 +198,33 @@ A node earning at PoC delivery rates with a USDC-denominated delivery rate of $0
 | Gross profit | ~$50/month |
 
 Revenue depends entirely on traffic. A node serving no bytes earns $0.
+
+### Revenue Model (PoC Reality)
+
+The production target above assumes 10,000 GB/month (233 GB/day) — a meaningful production CDN node. A PoC with tens of nodes and limited test traffic will see far less:
+
+| Metric | PoC | Production |
+| --- | --- | --- |
+| Client delivery volume | 100 GB/month | 7,000 GB/month |
+| Node-to-node delivery volume | 50 GB/month | 3,000 GB/month |
+| Cache miss rate | 30% | 15% |
+| Revenue at $0.00001/MB | ~$1.50/month | $100/month |
+| Infrastructure cost | $35/month | $50/month |
+| Gross profit (without subsidy) | **−$33.50/month** | ~$50/month |
+| Profitable without subsidy? | No | Yes |
+
+PoC nodes will operate at a loss without bootstrap subsidies. This is expected — the bootstrap fund exists precisely for this phase.
+
+### Bootstrap Fund Gap (PoC)
+
+The per-node monthly shortfall at PoC scale is ~$34. Subsidy requirements at different network sizes:
+
+| Scenario | Nodes | Duration | Total subsidy (USDC equivalent) |
+| --- | --- | --- | --- |
+| Minimal PoC | 20 | 6 months | ~$4,080 |
+| Extended PoC | 50 | 12 months | ~$20,400 |
+
+At any reasonable TOKEN price, these amounts are a tiny fraction of the 200M TOKEN bootstrap fund. The bootstrap fund is more than adequate for PoC scale. The open question is whether it suffices for the production bootstrap period — hundreds or thousands of nodes operating before organic traffic catches up to infrastructure costs.
 
 ### Gas Cost Breakdown (Arbitrum)
 
