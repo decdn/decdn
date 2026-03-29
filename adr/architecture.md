@@ -101,6 +101,14 @@ Each blob is encrypted once at ingest with a random symmetric key (XChaCha20-Pol
 
 ---
 
+### [ADR 007 — Watchtower Design for Channel Disputes](007-watchtower.md)
+
+**Non-custodial watchtowers for dispute-window liveness.**
+
+A watchtower holds the latest voucher for a registered channel and submits a `disputeChannel` transaction if a stale close is detected on-chain. Watchtowers cannot steal funds or worsen settlement — the voucher's EIP-712 signature is the only authorisation the contract checks. Nodes register with 2–3 independent watchtowers via `cdn/watchtower/v1` over iroh QUIC. A local in-process dispute monitor provides defense-in-depth for the node-is-online case.
+
+---
+
 ## Key Invariants
 
 - No external origin URL exists — content enters the network through origin-backed nodes whose backends are hidden
@@ -115,5 +123,4 @@ Each blob is encrypted once at ingest with a random symmetric key (XChaCha20-Pol
 ## What Is Not Decided Yet
 
 - Production L2 choice (Arbitrum One, Base, or other) — gated on PoC validation
-- Watchtower design for offline node protection during channel disputes
 - Parallel streaming from multiple nodes for a single blob (protocol supports it, not prioritised)
