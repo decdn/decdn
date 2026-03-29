@@ -195,7 +195,7 @@ A node earning at a USDC-denominated delivery rate of $0.00001/MB with productio
 | Paid pull cost for cache misses | ~$15/month |
 | Infrastructure cost | $50/month |
 | Revenue at $0.00001/MB | $100/month |
-| Gross profit | ~$50/month |
+| Gross profit | ~$35/month |
 
 Revenue depends entirely on traffic. A node serving no bytes earns $0.
 
