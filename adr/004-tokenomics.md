@@ -51,7 +51,7 @@ Minimum stake is 1,000 TOKEN with a 7-day unbonding period. Stake remains slasha
 
 **Negative:**
 
-- Bootstrapping requires token demand before organic revenue is sufficient; a 200M TOKEN bootstrap fund is allocated for this — adequate for PoC scale (see Node Unit Economics), but adequacy for the production bootstrap period (hundreds of nodes before organic traffic) is unproven
+- Bootstrapping requires token demand before organic revenue is sufficient; a 200M TOKEN bootstrap fund is allocated for this — adequate for PoC scale (see [Node Unit Economics](#node-unit-economics)), but adequacy for the production bootstrap period (hundreds of nodes before organic traffic) is unproven
 - Two-token UX: all node operators need both USDC (for payment channels) and TOKEN (to stake). Client software should abstract this with integrated DEX swaps but adds complexity
 - The TOKEN/USDC Uniswap pool may be thin at launch, making buyback execution sensitive to pool depth; `maxBuybackAmount` and `minTokenOut` parameters mitigate sandwich risk but require active governance attention
 - Regulatory risk: a token with staking, governance, and economic utility may be classified as a security in some jurisdictions. Legal review is required before production token distribution. See [ADR 009](009-governance.md) for governance-specific risks.
@@ -201,7 +201,7 @@ Revenue depends entirely on traffic. A node serving no bytes earns $0.
 
 ### Revenue Model (PoC Reality)
 
-The production target above assumes 10,000 GB/month (233 GB/day) — a meaningful production CDN node. A PoC with tens of nodes and limited test traffic will see far less:
+The production target above assumes 10,000 GB/month (~333 GB/day) — a meaningful production CDN node. A PoC with tens of nodes and limited test traffic will see far less:
 
 | Metric | PoC | Production |
 | --- | --- | --- |
@@ -209,8 +209,9 @@ The production target above assumes 10,000 GB/month (233 GB/day) — a meaningfu
 | Node-to-node delivery volume | 50 GB/month | 3,000 GB/month |
 | Cache miss rate | 30% | 15% |
 | Revenue at $0.00001/MB | ~$1.50/month | $100/month |
+| Paid pull cost for cache misses | ~$0.50/month | ~$15/month |
 | Infrastructure cost | $35/month | $50/month |
-| Gross profit (without subsidy) | **−$33.50/month** | ~$50/month |
+| Gross profit (without subsidy) | **−$34/month** | ~$35/month |
 | Profitable without subsidy? | No | Yes |
 
 PoC nodes will operate at a loss without bootstrap subsidies. This is expected — the bootstrap fund exists precisely for this phase.
