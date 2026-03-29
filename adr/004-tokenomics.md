@@ -38,7 +38,7 @@ Minimum stake is 1,000 TOKEN with a 7-day unbonding period. Stake remains slasha
 
 **Fee discount:** Providers staking ≥10× the minimum (10,000 TOKEN) pay a 1.5% protocol fee instead of 3%. This creates a direct financial return on holding more TOKEN and rewards long-term network commitment.
 
-**Governance:** Token-weighted voting using OpenZeppelin Governor. All economic parameters (fee %, rate bounds, slash percentages, dispute window) are governable within hardcoded safety bounds. Safety bounds are immutable — even a governance attack cannot set fees to 100% or stake to 0.
+**Governance:** See [ADR 009](009-governance.md). All economic parameters (fee %, rate bounds, slash percentages, dispute window) are governable within hardcoded safety bounds. During the PoC, a single admin key controls all parameters.
 
 ## Consequences
 
@@ -46,7 +46,7 @@ Minimum stake is 1,000 TOKEN with a 7-day unbonding period. Stake remains slasha
 
 - TOKEN transitions from a medium of exchange (bad for volatile assets) to a productive capital asset: stake it to operate, hold more for fee discounts, vote with it
 - Buyback creates continuous buy-side demand proportional to network usage — more delivery volume → more USDC fees → more TOKEN purchased and burned
-- Hardcoded safety bounds on all governable parameters limit the damage a governance attack can cause
+- Hardcoded safety bounds on all governable parameters limit the damage a governance attack can cause (see [ADR 009](009-governance.md))
 - PoC can use a freely mintable testnet token with the same contracts; no supply constraints or distribution mechanics required during development
 
 **Negative:**
@@ -54,8 +54,7 @@ Minimum stake is 1,000 TOKEN with a 7-day unbonding period. Stake remains slasha
 - Bootstrapping requires token demand before organic revenue is sufficient; a 200M TOKEN bootstrap fund is allocated for this but its adequacy is unproven
 - Two-token UX: all node operators need both USDC (for payment channels) and TOKEN (to stake). Client software should abstract this with integrated DEX swaps but adds complexity
 - The TOKEN/USDC Uniswap pool may be thin at launch, making buyback execution sensitive to pool depth; `maxBuybackAmount` and `minTokenOut` parameters mitigate sandwich risk but require active governance attention
-- Token-weighted governance is vulnerable to large-holder capture; safety bounds limit damage but cannot prevent rent-seeking within allowed parameter ranges (e.g., setting protocol fee to the 20% maximum)
-- Regulatory risk: a token with staking, governance, and economic utility may be classified as a security in some jurisdictions. Legal review is required before production token distribution.
+- Regulatory risk: a token with staking, governance, and economic utility may be classified as a security in some jurisdictions. Legal review is required before production token distribution. See [ADR 009](009-governance.md) for governance-specific risks.
 
 ## Token Distribution (Production)
 
@@ -212,56 +211,8 @@ Revenue depends entirely on traffic. A node serving no bytes earns $0.
 
 Payment channels amortize gas effectively. A channel open for 30 sessions costs $0.15 total (open + close) = $0.005 per session.
 
-## Governance Model
+## Governance
 
-### PoC: Admin Key
+See [ADR 009 — Governance Model](009-governance.md) for the full governance specification, including the production voting model (OpenZeppelin Governor), governable parameters with safety bounds, and emergency multisig design.
 
-A single deployer address (EOA or multisig) has admin rights on all contracts. Can update any parameter. No voting, no timelock.
-
-### Production: Token-Weighted Governance
-
-Based on OpenZeppelin Governor:
-
-| Parameter | Value |
-| --- | --- |
-| Voting token | TOKEN (staked or unstaked) |
-| Proposal threshold | 100,000 TOKEN (0.01% of supply) |
-| Voting period | 3 days |
-| Quorum | 4% of total supply |
-| Timelock | 2 days between vote passing and execution |
-| Vote delegation | Supported |
-
-### Governable Parameters with Safety Bounds
-
-| Parameter | Contract | Min | Max |
-| --- | --- | --- | --- |
-| Protocol fee % | StablePaymentChannel | 0% (0 bps) | 20% (2000 bps) |
-| Minimum stake | StakingRegistry | 100 TOKEN | 100,000 TOKEN |
-| Slash percentages | StakingRegistry | 1% | 100% |
-| Unbonding period | StakingRegistry | 3 days | 30 days |
-| Multiaddr update cooldown | StakingRegistry | 0 (disabled) | 86400 seconds (1 day) |
-| Max multiaddr size | StakingRegistry | 64 bytes | 1024 bytes |
-| Dispute window | StablePaymentChannel | 30 minutes | 7 days |
-| Rate floor/ceiling | StablePaymentChannel | Floor > 0 | Ceiling > floor |
-| Challenge bond | StakingRegistry | 1 TOKEN | 1,000 TOKEN |
-| Burn percentage of fees | StablePaymentChannel | 0% | 100% |
-
-Safety bounds are hardcoded — even governance cannot set parameters outside these ranges.
-
-### Emergency Multisig
-
-- 3-of-5 multisig with known, trusted signers
-- Can ONLY pause contracts (not change parameters or withdraw funds)
-- Used for exploit response and critical bug mitigation
-- Sunset: after 12 months, the pause function is permanently disabled (or requires governance vote to extend)
-- Signers should be geographically and organizationally diverse
-
-## Multi-Chain Bridging
-
-Not in PoC scope. High-level production approach:
-
-- TOKEN is **canonical on one L2** (the production chain). All staking, channel settlements, and governance happen on this chain.
-- Users on other chains use standard ERC-20 bridges (Arbitrum native bridge, or cross-chain protocols like LayerZero/Wormhole) to move tokens to the canonical chain.
-- **No cross-chain payment channels in v1.** Channels exist on one chain only. Cross-chain would require atomic swaps or a bridge-aware channel design — too complex for initial production.
-
-The production L2 choice determines available bridges, gas costs, finality time, and tooling. This decision is deferred until after PoC validation.
+**PoC:** A single deployer address (EOA or multisig) has admin rights on all contracts. No voting, no timelock.

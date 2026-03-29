@@ -88,9 +88,9 @@ Clients pay nodes per MB. On a cache miss, nodes pay origin-backed nodes per MB 
 
 ### [ADR 004 — Dual-Currency Token Model](004-tokenomics.md)
 
-**USDC for payments. TOKEN for staking, governance, and fee discounts.**
+**USDC for payments. TOKEN for staking and fee discounts.**
 
-TOKEN is not used for payments. All nodes must stake TOKEN to participate. Staking cost creates accountability and Sybil resistance. 20% of protocol fees buy back and burn TOKEN. Fixed supply of 1B at genesis.
+TOKEN is not used for payments. All nodes must stake TOKEN to participate. Staking cost creates accountability and Sybil resistance. 20% of protocol fees buy back and burn TOKEN. Fixed supply of 1B at genesis. Governance is covered separately in ADR 009.
 
 ---
 
@@ -132,6 +132,14 @@ Nodes are ranked by a reputation score (0.0–1.0) derived from local observatio
 
 ---
 
+### [ADR 009 — Governance Model](009-governance.md)
+
+**Admin key for PoC. Token-weighted governance with safety bounds for production.**
+
+During the PoC, a single deployer address controls all contract parameters. Production governance uses OpenZeppelin Governor with TOKEN voting, 4% quorum, and a 2-day timelock. All governable parameters have hardcoded safety bounds that even governance cannot override. A 3-of-5 emergency multisig can only pause contracts, with a 12-month sunset.
+
+---
+
 ## Key Invariants
 
 - No external origin URL exists — content enters the network through origin-backed nodes whose backends are hidden
@@ -140,7 +148,7 @@ Nodes are ranked by a reputation score (0.0–1.0) derived from local observatio
 - A node cannot join the peer mesh without staking — prevents free-riders and provides a slashable bond
 - A node cannot register without staking — `StakingRegistry` enforces `stake >= minStake` before accepting a `registerNode` call
 - Payment channels amortize on-chain costs across an entire session; per-MB payments are off-chain
-- Safety bounds on all governable parameters are hardcoded — governance cannot set fees to 100% or stake to zero
+- Safety bounds on all governable parameters are hardcoded — governance cannot set fees to 100% or stake to zero (see [ADR 009](009-governance.md))
 
 ---
 

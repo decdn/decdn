@@ -31,7 +31,7 @@ Key parameters:
 - Protocol fee: 3% deducted at channel close, sent to treasury
 - Fee discount: nodes staking ≥10× the minimum TOKEN stake pay 1.5% instead of 3%
 
-The native token (TOKEN) is not used for delivery payments. It is reserved for staking, governance, and fee discount qualification (see ADR 004).
+The native token (TOKEN) is not used for delivery payments. It is reserved for staking and fee discount qualification (see ADR 004) and governance (see [ADR 009](009-governance.md)).
 
 **Rate setting is entirely up to each node.** Nodes advertise their `rate_per_mb` in probe responses and stream responses; the requester sees the rate before committing a voucher. There is no protocol-enforced rate beyond a governance-set floor and ceiling. This creates a market with natural arbitrage dynamics:
 
