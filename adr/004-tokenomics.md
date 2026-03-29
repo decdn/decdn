@@ -111,31 +111,6 @@ pie title TOKEN Distribution (1B total, fixed supply)
 
 The challenger reward incentivizes watchtowers and honest nodes to monitor and report misbehavior.
 
-```mermaid
-stateDiagram-v2
-    [*] --> Unstaked
-
-    Unstaked --> Staked : stake(amount >= 1000 TOKEN)
-
-    Staked --> Staked : slashed (1st offense 5%)
-    Staked --> Staked : slashed (2nd offense 30d 15%)
-    Staked --> Ejected : slashed (3rd offense 30d 100%)
-    Staked --> Ejected : stake below 50% of minimum
-
-    Staked --> Unbonding : requestUnbond()
-
-    Unbonding --> Unstaked : 7 days elapsed
-    Unbonding --> Unbonding : slashed (still slashable)
-    Unbonding --> Ejected : stake below 50% of minimum
-
-    Ejected --> ForcedUnbonding : remaining stake enters unbonding
-    ForcedUnbonding --> Unstaked : 7 days elapsed
-    Unstaked --> Staked : re-stake at full minimum
-
-    note right of Unbonding : Stake remains slashable during unbonding
-    note right of Ejected : Removed from registry and content marked unavailable
-```
-
 ### Challenge Bond
 
 To prevent frivolous fraud proof submissions:
@@ -195,45 +170,6 @@ The `BuybackBurner` contract converts accumulated USDC fees into TOKEN and burns
 | Execution | Governance-triggered or automated keeper | — |
 
 The caller provides `minTokenOut` to prevent sandwich attacks. If the TOKEN/USDC pool has insufficient liquidity, the swap reverts due to the `minTokenOut` check and accumulated fees remain in the contract until liquidity improves. The `maxBuybackAmount` should be set conservatively relative to pool depth.
-
-```mermaid
-graph LR
-    subgraph Contracts
-        SPC["StablePaymentChannel"]
-        SR["StakingRegistry"]
-        BB["BuybackBurner"]
-        GOV["Governor + Timelock"]
-        EM["Emergency Multisig<br/>3-of-5"]
-    end
-
-    subgraph Tokens
-        USDC([USDC])
-        TOKEN([TOKEN])
-    end
-
-    UNI["Uniswap V3<br/>TOKEN/USDC pool"]
-    BURN["Burn Address"]
-
-    USDC -->|deposit| SPC
-    SPC -->|3% fee at close| BB
-    SPC -->|97% to provider| USDC
-
-    TOKEN -->|stake| SR
-    SR -->|50% slash burned| BURN
-    SR -->|50% slash to challenger| TOKEN
-
-    BB -->|swap USDC for TOKEN| UNI
-    BB -->|burn purchased TOKEN| BURN
-
-    SPC -->|getStakeMultiple| SR
-
-    GOV -->|set parameters| SPC
-    GOV -->|set parameters| SR
-    GOV -->|trigger buyback| BB
-
-    EM -->|pause only| SPC
-    EM -->|pause only| SR
-```
 
 ## Node Unit Economics
 
