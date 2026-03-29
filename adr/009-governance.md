@@ -53,7 +53,7 @@ All economic parameters across the protocol are governable within hardcoded safe
 | Challenge bond | StakingRegistry | 1 TOKEN | 1,000 TOKEN |
 | Burn percentage of fees | StablePaymentChannel | 0% | 100% |
 
-Staking, slashing, and fee parameters are defined in ADR 004. Payment channel parameters are defined in ADR 003. This ADR defines the governance mechanism that controls them.
+Staking, slashing, and fee parameters are defined in [ADR 004](004-tokenomics.md). Payment channel parameters are defined in [ADR 003](003-payments.md). This ADR defines the governance mechanism that controls them.
 
 ### Emergency Multisig
 
