@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Decentralized CDN (deCDN) — nodes cache and serve content-addressed blobs over iroh QUIC, clients pay per-MB via off-chain USDC payment channels. Rust implementation targeting a PoC of tens of nodes on an Arbitrum Sepolia testnet.
 
+**Status: Pre-implementation (design/ADR phase).** No Rust source code or `Cargo.toml` exists yet. The repo currently contains architecture decision records (`adr/`), a devcontainer setup, and this documentation.
+
 ## Development Environment
 
 This repo uses a VS Code devcontainer with a firewall-isolated environment. The container runs as the `node` user.
@@ -15,7 +17,11 @@ This repo uses a VS Code devcontainer with a firewall-isolated environment. The 
 # Or: Ctrl+Shift+P → "Dev Containers: Reopen in Container"
 ```
 
-### Build and Test
+### Working with ADRs
+
+ADRs in `adr/` are the primary deliverables right now. `adr/architecture.md` is the living overview; numbered files (`000-language.md`, `001-network.md`, etc.) cover individual decisions.
+
+### Build and Test (once implementation begins)
 
 ```bash
 cargo build                          # build all crates
@@ -38,7 +44,7 @@ cargo fmt -- --check                 # check formatting without modifying
 
 **Language:** Rust. **Networking:** iroh (QUIC transport, NAT traversal, content-addressed blobs, gossip).
 
-### Crate Structure
+### Crate Structure (planned)
 
 ```
 crates/
