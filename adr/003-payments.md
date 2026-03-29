@@ -207,7 +207,7 @@ A node stakes, announces content it holds, but refuses to serve it — collectin
 **Replay attack on vouchers**
 Attacker intercepts a signed voucher and attempts to replay it against a different channel or after close.
 
-Fully solved. EIP-712 typed data over `{channelId, amount, nonce, stablecoin}` binds the voucher to a specific channel. The monotonically increasing nonce prevents resubmission after settlement.
+Fully solved. EIP-712 typed data over `{channelId, amount, nonce, stablecoin}` binds the voucher to a specific channel. The EIP-712 domain separator (see [EIP-712 Voucher Signature](#eip-712-voucher-signature)) further binds each voucher to a specific chain and contract deployment, preventing replay across different L2s, contract upgrades, or test vs production environments. The monotonically increasing nonce prevents resubmission after settlement.
 
 ## Contract Interfaces
 
@@ -286,6 +286,50 @@ interface IBuybackBurner {
 
 `executeBuyback` is callable by governance multisig or the authorized `keeper` address. All `set*` functions are governance-only behind a timelock.
 
+### EIP-712 Voucher Signature
+
+All voucher signatures use [EIP-712](https://eips.ethereum.org/EIPS/eip-712) typed structured data to prevent cross-chain, cross-contract, and cross-environment replay.
+
+**Domain separator:**
+
+```solidity
+bytes32 constant DOMAIN_TYPEHASH = keccak256(
+    "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
+);
+
+bytes32 DOMAIN_SEPARATOR = keccak256(abi.encode(
+    DOMAIN_TYPEHASH,
+    keccak256("StablePaymentChannel"),   // name
+    keccak256("1"),                      // version
+    block.chainid,                       // chainId (L2)
+    address(this)                        // verifyingContract
+));
+```
+
+The domain separator binds every voucher to a specific contract deployment on a specific chain. A voucher signed for Arbitrum Sepolia cannot be replayed on mainnet, and a voucher signed for one `StablePaymentChannel` deployment cannot be replayed against an upgraded or redeployed contract at a different address.
+
+**Voucher type:**
+
+```solidity
+bytes32 constant VOUCHER_TYPEHASH = keccak256(
+    "Voucher(bytes32 channelId,uint256 amount,uint256 nonce,address stablecoin)"
+);
+```
+
+**Signature digest:**
+
+```solidity
+bytes32 digest = keccak256(abi.encodePacked(
+    "\x19\x01",
+    DOMAIN_SEPARATOR,
+    keccak256(abi.encode(VOUCHER_TYPEHASH, channelId, amount, nonce, stablecoin))
+));
+```
+
+**Verification:** `ecrecover(digest, v, r, s)` must equal `channel.client`. The signature is encoded as 65 bytes (`r || s || v`), matching the format used by `eth_sign` and standard Ethereum libraries.
+
+The `DOMAIN_SEPARATOR` should be computed once in the constructor and stored as an immutable. If the contract is deployed behind a proxy and may be migrated to a different chain, it should be recomputed per-call using `block.chainid` to remain correct after an L2 chain ID change.
+
 ### StakingRegistry Modifications
 
 The full node registry interface (`NodeInfo`, `registerNode`, `getActiveNodes`, etc.) is defined in ADR 001. The additions below are payment-specific extensions:
@@ -351,7 +395,7 @@ All amount formatting, parsing, and display go through this abstraction. The vou
 
 During delivery over `cdn/client/v1`, only `{signature, amount}` are transmitted on the wire; the remaining fields are derived from stream context. See [ADR 005](005-protocol.md) for wire protocol details.
 
-The `stablecoin` field (ERC-20 address) is included in the signed EIP-712 typed data to prevent cross-token replay attacks. The streaming protocol includes a `ChannelType` discriminator:
+The `stablecoin` field (ERC-20 address) is included in the signed EIP-712 typed data to prevent cross-token replay attacks. The full EIP-712 type definition and domain separator are specified in [EIP-712 Voucher Signature](#eip-712-voucher-signature). The streaming protocol includes a `ChannelType` discriminator:
 
 ```rust
 enum ChannelType {
