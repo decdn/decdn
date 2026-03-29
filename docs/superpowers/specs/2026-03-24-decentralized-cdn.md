@@ -377,7 +377,7 @@ All staked nodes share a single staking role. Whether a node has an origin backe
 
 | Parameter | Value | Notes |
 |-----------|-------|-------|
-| Minimum stake | 100 USDC equivalent | Low enough to be accessible; high enough to have skin in the game |
+| Minimum stake | 1,000 TOKEN | Matches ADR 004; low enough to be accessible, high enough to have skin in the game |
 | Slash amount | Full stake | Only for provably bad behavior (hash mismatch, phantom blob announcements, rate manipulation) |
 | Unbonding period | 7 days | Standard delay after unstake request |
 

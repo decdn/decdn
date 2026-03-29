@@ -144,11 +144,11 @@ Client deposits 100 tokens into channel
 | Offense | Description | Proof Mechanism | Scope |
 |---------|-------------|----------------|-------|
 | **Wrong data** | Node served bytes that don't match the expected BLAKE3 hash | Optimistic fraud proof: challenger submits `{blob_hash, chunk_index, received_bytes, expected_root}`. Node has 24h to counter with correct chunk. | **PoC + Production** |
-| **Phantom announcement** | Node signed a `ProbeResponse` claiming `has_blob: true` but failed to deliver within 30 seconds | Challenger submits signed `ProbeResponse` (has_blob: true) + signed `StreamResponse` (NotCached) or delivery timeout proof. Node has 24h to counter with proof of delivery. | **PoC + Production** |
-| **Rate manipulation** | Node signed a `ProbeResponse` with rate X then signed a `StreamResponse` with rate Y > X within 30 seconds | Challenger submits both signed messages from the same node showing rate discrepancy within the 30-second window. Node has 24h to counter. | **Production only** |
+| **Phantom announcement** | Node signed a `ProbeResponse` claiming `has_blob: true` but failed to deliver within 30 seconds | Challenger submits signed `ProbeResponse` (`has_blob: true`) + signed `StreamResponse` (`ok: false`) or delivery timeout proof. Both signatures bind all security-relevant fields (see ADR 005). Node has 24h to counter with proof of delivery. | **PoC + Production** |
+| **Rate manipulation** | Node signed a `ProbeResponse` with rate X then signed a `StreamResponse` with rate Y > X within 30 seconds | Challenger submits both signed messages from the same node showing rate discrepancy within the 30-second window. Node has 24h to counter. | **PoC + Production** |
 | **Double settlement** | Node submits a voucher to two different close transactions for the same channel | On-chain provable: contract detects duplicate channelId settlements. Automatic slash, no challenge needed. | **Production only** |
 
-For PoC, "wrong data" and "phantom announcement" offenses are implemented. Rate manipulation and double settlement are added in production.
+For PoC, "wrong data", "phantom announcement", and "rate manipulation" offenses are implemented. The signature mechanism in ADR 005 already supports rate manipulation evidence. Double settlement is added in production.
 
 ### Slash Amounts
 
@@ -555,16 +555,16 @@ Based on OpenZeppelin Governor with the following parameters:
 | **Mitigation** | Safety bounds prevent governance from setting destructive parameters. Local observations (70% weight) limit reputation manipulation. Emergency multisig can pause contracts. |
 | **Residual risk** | Real but standard for any token-weighted governance system. Mitigation: distribute tokens widely, vest team/investor tokens. |
 
-### Attack 6: Storage Withholding
+### Attack 6: Content Withholding
 
 | Aspect | Details |
 |--------|---------|
-| **Attack** | Accept storage deal, take uploader's payment, delete the data |
-| **Cost** | No direct slash. Storage withholding is NOT a slashable offense — slashing is focused on node misbehavior (wrong data, phantom announcements, rate manipulation, double settlement), not storage guarantees. |
-| **Revenue from attack** | Storage payment for the deleted data. E.g., 1GB for 1 month = 10 tokens. |
-| **Profitability** | Short-term profitable, but reputation damage makes it self-defeating over time. |
-| **Mitigation** | Handled by reputation only: uploaders detect missing data via periodic probes and trigger re-replication. Failed probes tank the node's reputation score, reducing future traffic and revenue. Persistent withholding leads to near-zero reputation, effectively soft-ejecting the node from the network. |
-| **Residual risk** | A node willing to sacrifice reputation can profit short-term. Mitigated by replication factor (uploaders store with multiple nodes) and the cold-start cost of rebuilding reputation on a new identity. |
+| **Attack** | Node announces content via gossip or probe responses but refuses to serve it — collecting routing table presence without delivering |
+| **Cost** | No direct slash. Content withholding is NOT a slashable offense — operators may legitimately take content offline for maintenance, migration, or business reasons. Slashing for availability creates perverse incentives (see ADR 003). |
+| **Revenue from attack** | None directly — the node earns nothing without delivering bytes. The benefit is fraudulent routing table presence at zero delivery cost. |
+| **Profitability** | Not profitable. The node pays staking costs but earns no delivery revenue. Only useful as a griefing vector (wasting client probe time). |
+| **Mitigation** | Handled by reputation only: clients that probe a node and get no delivery penalise it in their local reputation score. Persistent withholding leads to near-zero reputation, effectively soft-ejecting the node from client routing tables. Origin-backed nodes provide guaranteed fallback for any blob. |
+| **Residual risk** | A node willing to sacrifice reputation can grief clients short-term. Mitigated by redundant routing (clients probe multiple nodes in parallel) and the staking cost of maintaining a node identity. |
 
 ---
 

@@ -256,7 +256,7 @@ The `BuybackBurner` contract replaces the direct token burn from the tokenomics 
 | DEX | Uniswap V3 TOKEN/USDC pool | Yes (pool address) |
 | Execution | Governance-triggered or automated keeper | — |
 
-**Slippage protection:** The caller provides `minAudioOut` to the `executeBuyback` function. This prevents sandwich attacks. A TWAP oracle could be added later for automated buybacks, but for initial deployment, governance/keeper sets `minAudioOut` based on current market price.
+**Slippage protection:** The caller provides `minTokenOut` to the `executeBuyback` function. This prevents sandwich attacks. A TWAP oracle could be added later for automated buybacks, but for initial deployment, governance/keeper sets `minTokenOut` based on current market price.
 
 **Why buyback is better than direct burn:** The tokenomics spec burned 20% of fees collected in native token — those tokens were already held. The buyback mechanism creates *new buy pressure* from the open market, directly linking network usage to token demand. More delivery → more USDC fees → more TOKEN purchased and burned.
 
@@ -382,7 +382,7 @@ interface IBuybackBurner {
     function executeBuyback(
         address stablecoin,
         uint256 amount,
-        uint256 minAudioOut
+        uint256 minTokenOut
     ) external;
 
     // Governance only
@@ -408,11 +408,11 @@ interface IBuybackBurner {
 The `executeBuyback` function:
 1. Validates `amount >= minBuybackAmount && amount <= maxBuybackAmount`
 2. Approves Uniswap V3 router to spend `amount` of `stablecoin`
-3. Swaps via `ISwapRouter.exactInputSingle()` with `amountOutMinimum = minAudioOut`
+3. Swaps via `ISwapRouter.exactInputSingle()` with `amountOutMinimum = minTokenOut`
 4. Sends received TOKEN to burn address (`0x000...dEaD`)
-5. Reverts if `minAudioOut` is not met (prevents sandwich attacks)
+5. Reverts if `minTokenOut` is not met (prevents sandwich attacks)
 
-**Thin liquidity handling:** If the TOKEN/USDC pool does not exist or has insufficient liquidity, the swap reverts due to `minAudioOut` check. Accumulated fees remain in the contract until liquidity improves. The keeper should monitor pool depth before triggering buybacks. The `maxBuybackAmount` (default 10,000 USDC) should be set conservatively relative to pool depth — governance should lower it if the pool is thin.
+**Thin liquidity handling:** If the TOKEN/USDC pool does not exist or has insufficient liquidity, the swap reverts due to `minTokenOut` check. Accumulated fees remain in the contract until liquidity improves. The keeper should monitor pool depth before triggering buybacks. The `maxBuybackAmount` (default 10,000 USDC) should be set conservatively relative to pool depth — governance should lower it if the pool is thin.
 
 ### `StakingRegistry` Modifications
 
@@ -499,7 +499,7 @@ If stablecoin channels cause unforeseen problems during Phase 1-2:
 |------|----------|------------|
 | **Token demand reduction** | High | All 6 utility mechanisms (Section 6) must be live before or during migration. If payments move to stablecoin before fee discounts and buyback are active, the token loses its primary demand driver with nothing to replace it. **This is the critical sequencing constraint.** |
 | **USDC regulatory/censorship risk** | Medium | Circle can freeze USDC at specific addresses or blacklist the contract itself. Mitigation: support multiple stablecoins including decentralized options (DAI, LUSD). If USDC is compromised, governance adds DAI as the primary stablecoin. |
-| **Contract surface area increase** | Medium | Two new contracts (`StablePaymentChannel`, `BuybackBurner`) double the audit surface. `BuybackBurner` interacts with Uniswap, adding composability risk. Mitigation: `minAudioOut` parameter prevents sandwich attacks; timelock on buyback parameters; full audit before production. |
+| **Contract surface area increase** | Medium | Two new contracts (`StablePaymentChannel`, `BuybackBurner`) double the audit surface. `BuybackBurner` interacts with Uniswap, adding composability risk. Mitigation: `minTokenOut` parameter prevents sandwich attacks; timelock on buyback parameters; full audit before production. |
 | **Decimal mismatch bugs** | Low-Medium | USDC (6 decimals) vs TOKEN (18 decimals). Off-by-12-orders-of-magnitude bugs possible. Mitigation: `Currency` enum in the `incentive` crate with explicit decimal handling. Extensive unit tests with both 6 and 18 decimal tokens. |
 | **Liquidity fragmentation** | Low | Payment volume moves from TOKEN to USDC markets. The TOKEN/USDC pool may thin. Mitigation: buyback mechanism provides continuous buy-side demand. Protocol treasury can seed the TOKEN/USDC pool. |
 | **User complexity** | Low | Users need USDC + TOKEN (for staking). Two tokens instead of one. Mitigation: client software can integrate a DEX swap (swap TOKEN↔USDC in one click). Clients who only consume content need only USDC — simpler than understanding a volatile token. |
@@ -543,7 +543,7 @@ All new and modified parameters introduced by this spec:
 
 ## 11. Open Questions
 
-1. **TWAP oracle for buyback slippage protection?** Currently using a simple `minAudioOut` parameter set by the caller. A Uniswap V3 TWAP oracle would allow automated buybacks without human-set slippage bounds. Adds oracle dependency. **Recommendation:** Start with `minAudioOut`, add TWAP later if automated buybacks are needed.
+1. **TWAP oracle for buyback slippage protection?** Currently using a simple `minTokenOut` parameter set by the caller. A Uniswap V3 TWAP oracle would allow automated buybacks without human-set slippage bounds. Adds oracle dependency. **Recommendation:** Start with `minTokenOut`, add TWAP later if automated buybacks are needed.
 
 2. **Can nodes refuse native token channels entirely?** Simplifies their accounting but fragments the network during migration. **Recommendation:** Yes — nodes choose what they accept via `accepted_stablecoins` in their config. If `accepted_stablecoins` is non-empty, the node supports stablecoin channels for those currencies. If empty, the node only supports legacy token channels. A node can support both by advertising stablecoin rates alongside legacy token rates. The protocol never forces a switch.
 

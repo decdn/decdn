@@ -240,7 +240,7 @@ Client                          Provider
 ```
 
 - `StreamRequest` includes an optional `byte_offset` field for seek and resume. On failover, the client sends the byte offset of the last successfully verified chunk to the new provider.
-- Built on iroh-blobs verified delivery — chunks are BLAKE3-verified automatically
+- Built on iroh-blobs verified streaming — chunks are BLAKE3-verified automatically
 - Payment wrapper intercepts every N chunks (default 1024 ~256KB) and expects a signed voucher
 - Self-enforcing: client stops paying, provider stops sending; provider stops sending, client stops paying
 - Voucher amount accounts for the offset — client only pays for bytes actually delivered from the offset onward
@@ -361,7 +361,7 @@ min_stake_for_reports = 1000
 
 ### Data Integrity
 
-- **Corrupted data:** iroh-blobs BLAKE3 verified delivery rejects bad chunks at transport level. Provider marked faulty in reputation. Slashable via optimistic fraud proof (client submits claim, provider has 24h to counter with correct data).
+- **Corrupted data:** iroh-blobs BLAKE3 verified streaming rejects bad chunks at transport level. Provider marked faulty in reputation. Slashable via optimistic fraud proof (client submits claim, provider has 24h to counter with correct data).
 - **Provider claims to store but doesn't:** Challenge-response spot checks. Failure harms reputation. On-chain slashing deferred past PoC.
 
 ### Reputation Gaming
