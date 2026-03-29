@@ -18,7 +18,7 @@ Four protocols, each identified by an ALPN string:
 | `cdn/probe/v1` | any node ↔ any node | Latency and availability check before committing to a node |
 | `cdn/client/v1` | payer ↔ delivering node | Paid blob delivery with payment vouchers (client→node, node→node on cache miss) |
 | `cdn/watchtower/v1` | watched party (typically node) ↔ watchtower | Channel-dispute monitoring: voucher registration and updates (see ADR 007) |
-| iroh-gossip built-in | all nodes | Content availability announcements, node discovery |
+| iroh-gossip built-in | all nodes | Node metadata announcements (`NodeAnnounce`), node discovery |
 
 ### `cdn/probe/v1` — latency probe
 
@@ -76,9 +76,11 @@ The delivering node advertises its `rate_per_mb` in `StreamResponse`. The payer 
 
 The protocol is self-enforcing: payer stops sending vouchers → delivering node stops sending chunks; delivering node stops sending chunks → payer stops sending vouchers.
 
-### Gossip — content availability
+### Gossip — node metadata
 
-Content availability is broadcast over iroh-gossip on region-scoped topics (`cdn/region/{cc}/v1`) and a global topic (`cdn/global/v1`). All staked nodes publish `CacheAnnounce` messages listing hashes they hold (max 500 entries) or a Bloom filter for large sets. Clients and nodes maintain a local routing table (`hash → Vec<NodeId>`) from received announcements. The probe step determines cost and latency for each candidate.
+Node metadata is broadcast over iroh-gossip on region-scoped topics (`cdn/region/{cc}/v1`) and a global topic (`cdn/global/v1`). All staked nodes publish `NodeAnnounce` messages containing node-level metadata: region, load hint, and a list of popular hashes (max 20). `NodeAnnounce` does not carry content inventories — content discovery is handled on-demand via `cdn/probe/v1` fan-out (see [ADR 001](001-network.md)).
+
+Gossip messages are lightweight (~700 bytes worst case), well within iroh-gossip message limits. Clients and nodes maintain a peer table (`NodeId → NodeAnnounce`) from received messages. The probe step determines which peers hold specific content, along with their cost and latency.
 
 ### `cdn/watchtower/v1` — channel-dispute monitoring
 
