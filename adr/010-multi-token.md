@@ -5,7 +5,7 @@
 
 ## Context
 
-ADR 003 hardcodes USDC as the payment token for the PoC. This was a deliberate scope reduction. For production, the payment protocol should be token-agnostic: the only requirement is that the token is an ERC-20 contract. What constitutes a "good" payment token — a widely-trusted stablecoin, a network-specific governance token, an operator-issued community coin — is a decision for nodes and their clients, not for the protocol.
+ADR 003 hardcodes USDC as the payment token for the PoC. This was a deliberate scope reduction. For production, the payment protocol should support multiple tokens — but which tokens are acceptable is a governance decision, not an unconstrained per-node choice. The contract must gate token acceptance to protect against adversarial ERC-20 contracts and garbage tokens.
 
 Two motivating cases:
 
@@ -35,8 +35,12 @@ The PoC contract (`StablePaymentChannel`) is renamed `PaymentChannel` in product
 mapping(address => bool) public allowedTokens;
 uint256 public allowedTokenCount;
 
+event TokenAdded(address indexed token);
+event TokenRemoved(address indexed token);
+
 // Governance-only
 function addToken(address token) external onlyGovernance {
+    require(token != address(0), "Zero address");
     require(!allowedTokens[token], "Already allowed");
     allowedTokens[token] = true;
     allowedTokenCount++;
@@ -65,10 +69,12 @@ The contract validates the token against the allowlist, then calls `transferFrom
 
 ```solidity
 require(allowedTokens[token], "Token not allowed");
-IERC20(token).transferFrom(msg.sender, address(this), deposit);
+SafeERC20.safeTransferFrom(IERC20(token), msg.sender, address(this), deposit);
 ```
 
-Tokens with fee-on-transfer or rebase mechanics are unsupported — the contract assumes `deposit` equals the amount actually received. The allowlist gives governance a gatekeeping mechanism to reject tokens with known adversarial behaviour (reentrancy, fee-on-transfer, pausable transfers) before they can interact with contract funds.
+Tokens with fee-on-transfer or rebase mechanics are unsupported — the contract assumes `deposit` equals the amount actually received. `SafeERC20` is used for all token interactions to handle ERC-20s that return `false` on failure instead of reverting.
+
+The allowlist reduces exposure by letting governance reject tokens with known problematic behaviour (e.g., fee-on-transfer, pausable transfers, obvious reentrancy patterns) before they are used, but it does not by itself prevent reentrancy or other ERC-20-level attacks. The implementation must still use standard on-chain mitigations (`nonReentrant` guards, checks-effects-interactions pattern, `SafeERC20`), and governance should account for proxy/upgradability and admin controls when vetting tokens.
 
 **Channel ID** incorporates the token address to allow the same client-provider pair to hold concurrent channels in different tokens:
 
@@ -119,7 +125,7 @@ bytes32 constant VOUCHER_TYPEHASH = keccak256(
 
 ### Wire Protocol: cdn/client/v1
 
-A `payment_token` field is added to `StreamRequest`. This tells the serving node which token the client intends to use for this channel:
+A `payment_token` field is added to `StreamRequest` (extending the `{hash, channel_id, byte_offset}` definition in ADR 005). This tells the serving node which token the client intends to use for this channel:
 
 ```rust
 struct StreamRequest {
@@ -211,7 +217,7 @@ struct SignedRate {
 - No issuer dependency. Governance can approve tokens with different trust profiles: Circle (USDC), MakerDAO (DAI), or operator-issued tokens on a private chain.
 - The EIP-712 voucher format already carries the token address — no signature scheme migration needed.
 - Operators advertising multiple tokens give clients the best chance of finding a compatible channel without pre-coordination.
-- **Malicious token protection.** The allowlist prevents adversarial ERC-20 contracts (reentrant, fee-on-transfer, pausable) from interacting with `PaymentChannel` funds. Governance can vet tokens before approval.
+- **Malicious token exposure reduction.** The allowlist lets governance reject known-problematic ERC-20 contracts before they interact with `PaymentChannel` funds. This is a first line of defence; on-chain mitigations (`nonReentrant`, `SafeERC20`, checks-effects-interactions) remain required.
 - **Garbage token prevention.** Only governance-approved tokens can be used in channels, eliminating the attack surface of worthless self-issued tokens polluting the network.
 
 **Negative:**
@@ -228,7 +234,7 @@ struct SignedRate {
 1. Deploy `PaymentChannel` (the production contract) alongside the PoC `StablePaymentChannel`; both coexist. Governance immediately calls `addToken(USDC_ADDRESS)` so USDC is available from deployment
 2. Governance calls `addToken` for any additional tokens the network wants to support (e.g., DAI)
 3. Nodes add `accepted_tokens` to config; default is USDC (backward-compatible)
-4. Clients begin negotiating token in `StreamRequest`; nodes on old software respond with `UnsupportedToken` and the client falls back to USDC
+4. Clients begin negotiating token in `StreamRequest`; nodes on new software respond with `UnsupportedToken` if the requested token is not accepted, while nodes on old software ignore the `payment_token` field and therefore only operate USDC channels
 5. Gossip messages include `token_rates`; old nodes advertise only legacy `rate_per_mb`; new nodes advertise both
 6. When the network has migrated sufficiently, the legacy `StablePaymentChannel` is retired by governance
 
