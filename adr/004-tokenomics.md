@@ -199,7 +199,7 @@ A node earning at a USDC-denominated delivery rate of $0.00001/MB with productio
 
 Revenue depends entirely on traffic. A node serving no bytes earns $0.
 
-**Competitive context:** The $0.00001/MB ($0.01/GB) market rate is 4–8× cheaper than major traditional CDNs (CloudFront $0.085/GB, Akamai $0.12–0.20/GB, KeyCDN $0.04/GB) and at parity with budget CDNs (Bunny.net $0.01/GB). Governance-set rate bounds (floor: 1 USDC base unit/$0.000001/MB, ceiling: 1,000 USDC base units/$0.001/MB — see [ADR 003](003-payments.md)) provide a 10×–100× band around this expected market rate. The ceiling accommodates origin-backed nodes using high-egress backends while remaining well above any traditional CDN rate.
+**Competitive context:** The $0.00001/MB ($0.01/GB) market rate is 4–20× cheaper than major traditional CDNs (CloudFront $0.085/GB, Akamai $0.12–0.20/GB, KeyCDN $0.04/GB) and at parity with budget CDNs (Bunny.net $0.01/GB). Governance-set rate bounds (floor: 1 USDC base unit/$0.000001/MB, ceiling: 1,000 USDC base units/$0.001/MB — see [ADR 003](003-payments.md)) provide a 10×–100× band around this expected market rate. The ceiling accommodates origin-backed nodes using high-egress backends while remaining well above any traditional CDN rate.
 
 ### Revenue Model (PoC Reality)
 
