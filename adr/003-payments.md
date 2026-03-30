@@ -60,7 +60,7 @@ Both are deferred to post-PoC. For the PoC, clients must hold both USDC and a sm
 
 At the default 1 MB cadence, a 10 GB blob requires 10,000 vouchers — each involving a sign, transmit, verify, and ack cycle. This overhead is unnecessary when the unacknowledged exposure per interval is negligible at typical rates.
 
-**Parameter:** `maxVoucherIntervalMb` is a governable parameter on `StablePaymentChannel` defining the maximum allowed voucher interval in MB. Default: 1 MB. Hardcoded safety bounds: minimum 1 MB, maximum 1024 MB (1 GB).
+**Parameter:** `maxVoucherIntervalMb` is a governable parameter on `StablePaymentChannel` defining the maximum allowed voucher interval in MB. Default: 1 MB. Hardcoded safety bounds: minimum 1 MB, maximum 1024 MB (~1 GB).
 
 **Negotiation semantics:**
 
@@ -84,7 +84,7 @@ At the default 1 MB cadence, a 10 GB blob requires 10,000 vouchers — each invo
 
 Even the worst case (1024 MB at ceiling rate) exposes $1.024 — well below the recommended 10 USDC minimum deposit.
 
-**Concurrent streams interaction:** When multiple streams share a channel with different negotiated intervals, the effective interval for the channel is the **minimum** across all active streams. This preserves the existing invariant that the aggregate voucher deficit never exceeds the effective interval. A consequence is that the overhead reduction from larger intervals is only realized when **all** streams on a channel negotiate larger intervals — a single 1 MB stream added to a channel with a 1024 MB stream forces the entire channel back to 1 MB cadence. Clients fetching a mix of small and large blobs from the same node may benefit from opening separate channels to isolate large-interval streams. See [ADR 005 — Payment channels and concurrent streams](005-protocol.md#payment-channels-and-concurrent-streams) for wire-level details.
+**Concurrent streams interaction:** When multiple streams share a channel with different negotiated intervals, the effective interval for the channel is the **minimum** across all active streams. This preserves the existing invariant that the aggregate voucher deficit never exceeds the effective interval. A consequence is that the overhead reduction from larger intervals is only realized when **all** streams on a channel negotiate larger intervals — a single 1 MB stream added to a channel with a 1024 MB stream forces the entire channel back to 1 MB cadence. When the effective interval shrinks (e.g., a new stream joins with a smaller interval), the client MUST immediately issue a cumulative voucher if the current unvouchered byte count exceeds the new effective interval, to prevent all streams from stalling. Clients fetching a mix of small and large blobs from the same node may benefit from opening separate channels to isolate large-interval streams. See [ADR 005 — Payment channels and concurrent streams](005-protocol.md#payment-channels-and-concurrent-streams) for wire-level details.
 
 ### Fee Calculation on Disputed Closes
 
@@ -372,7 +372,7 @@ event ChannelSettled(
 | Min deposit | 1 base unit | No max |
 | Rate floor | 0 | Must be < ceiling |
 | Rate ceiling | Must be > floor | No max |
-| Max voucher interval | 1 MB | 1024 MB (1 GB) |
+| Max voucher interval | 1 MB | 1024 MB (~1 GB) |
 
 **Rate bounds are in USDC base units (6 decimals) for the PoC.** The contract stores a single `RateBounds` struct with `deliveryFloor` and `deliveryCeiling`. Per-token rate bounds are deferred to [ADR 010](010-multi-token.md).
 

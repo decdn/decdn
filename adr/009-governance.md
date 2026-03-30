@@ -48,7 +48,7 @@ All economic parameters across the protocol are governable within hardcoded safe
 | Max multiaddr size | StakingRegistry | 64 bytes | 1024 bytes |
 | Dispute window | StablePaymentChannel | 30 minutes | 7 days |
 | Rate floor/ceiling | StablePaymentChannel | Floor > 0 | Ceiling > floor |
-| Max voucher interval | StablePaymentChannel | 1 MB | 1024 MB (1 GB) |
+| Max voucher interval | StablePaymentChannel | 1 MB | 1024 MB (~1 GB) |
 | Challenge bond | StakingRegistry | 1 TOKEN | 1,000 TOKEN |
 | Burn percentage of fees | StablePaymentChannel | 0% | 100% |
 
