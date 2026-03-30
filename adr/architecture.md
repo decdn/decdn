@@ -96,12 +96,14 @@ TOKEN is not used for payments. All nodes must stake TOKEN to participate. Staki
 
 ### [ADR 005 — Wire Protocol](005-protocol.md)
 
-**Three ALPN-identified protocols. `cdn/client/v1` covers all paid delivery.**
+**Five ALPN-identified protocols. `cdn/client/v1` covers all paid delivery.**
 
 | ALPN | Purpose |
 | --- | --- |
 | `cdn/probe/v1` | Parallel latency + availability check before node selection |
 | `cdn/client/v1` | Paid delivery: client→node, node→node (cache miss) |
+| `cdn/keys/v1` | Epoch key delivery and sealed envelope requests (app server ↔ client) |
+| `cdn/watchtower/v1` | Channel-dispute monitoring: voucher registration and updates |
 | iroh-gossip built-in | Content availability and node discovery |
 
 `redirect` in `StreamResponse` always points to a NodeId, never an external URL. The origin backend is never revealed.
@@ -112,7 +114,7 @@ TOKEN is not used for payments. All nodes must stake TOKEN to participate. Staki
 
 **Envelope encryption with epoch-rotated key distribution.**
 
-Each blob is encrypted once at ingest with a random symmetric key (XChaCha20-Poly1305). The ciphertext is content-addressed and cached normally — one hash, one copy for all clients. An app server gates access: on each play request it wraps the blob key with a rotating epoch key and seals it to the client's public key. Epoch keys are pushed over an authenticated persistent connection; closing the connection revokes access within one epoch (5 minutes). CDN nodes only ever see ciphertext.
+Each blob is encrypted once at ingest with a random symmetric key (XChaCha20-Poly1305). The ciphertext is content-addressed and cached normally — one hash, one copy for all clients. An app server (running its own iroh `Endpoint`) gates access: on each play request it wraps the blob key with a rotating epoch key and seals it to the client's public key. Epoch keys are pushed over `cdn/keys/v1` (iroh QUIC); closing the connection revokes access within one epoch (5 minutes). CDN nodes only ever see ciphertext.
 
 ---
 
