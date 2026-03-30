@@ -125,7 +125,7 @@ bytes32 constant VOUCHER_TYPEHASH = keccak256(
 
 ### Wire Protocol: cdn/client/v1
 
-A `payment_token` field is added to `StreamRequest` (extending the `{hash, channel_id, byte_offset}` definition in ADR 005). This tells the serving node which token the client intends to use for this channel:
+A `payment_token` field is added to `StreamRequest` (extending the `{hash, channel_id, byte_offset, timestamp_us}` definition in ADR 005). This tells the serving node which token the client intends to use for this channel:
 
 ```rust
 struct StreamRequest {
