@@ -5,7 +5,7 @@
 
 ## Context
 
-ADR 003 hardcodes USDC as the payment token for the PoC. This was a deliberate scope reduction. For production, the payment protocol should be token-agnostic: the only requirement is that the token is an ERC-20 contract. What constitutes a "good" payment token — a widely-trusted stablecoin, a network-specific governance token, an operator-issued community coin — is a decision for nodes and their clients, not for the protocol.
+ADR 003 hardcodes USDC as the payment token for the PoC. This was a deliberate scope reduction. For production, the payment protocol should support multiple tokens — but which tokens are acceptable is a governance decision, not an unconstrained per-node choice. The contract must gate token acceptance to protect against adversarial ERC-20 contracts and garbage tokens.
 
 Two motivating cases:
 
@@ -17,7 +17,9 @@ The EIP-712 `token` field was retained in ADR 003 specifically for this extensio
 
 ## Decision
 
-The payment protocol is token-agnostic. Any ERC-20 address is valid as a payment token. There is no protocol-level allowlist. Each node independently configures which token addresses it accepts; each client selects from the intersection of what it holds and what the target node advertises.
+The payment protocol is token-agnostic but governed. The `PaymentChannel` contract maintains a governance-managed allowlist of approved ERC-20 token addresses. `openChannel` reverts if the token is not on the allowlist. This is consistent with how governance already controls rate bounds, fees, and staking parameters (ADR 004).
+
+Within the set of allowed tokens, each node independently configures which it accepts; each client selects from the intersection of what it holds and what the target node advertises.
 
 Rate bounds, decimal handling, and gossip advertisements are all keyed by token address.
 
@@ -27,7 +29,35 @@ Rate bounds, decimal handling, and gossip advertisements are all keyed by token 
 
 The PoC contract (`StablePaymentChannel`) is renamed `PaymentChannel` in production to reflect that it handles any ERC-20, not only stablecoins. The interface is otherwise structurally the same, with the following changes:
 
-**`openChannel` accepts any ERC-20:**
+**Token allowlist (governance-managed):**
+
+```solidity
+mapping(address => bool) public allowedTokens;
+uint256 public allowedTokenCount;
+
+event TokenAdded(address indexed token);
+event TokenRemoved(address indexed token);
+
+// Governance-only
+function addToken(address token) external onlyGovernance {
+    require(token != address(0), "Zero address");
+    require(!allowedTokens[token], "Already allowed");
+    allowedTokens[token] = true;
+    allowedTokenCount++;
+    emit TokenAdded(token);
+}
+
+function removeToken(address token) external onlyGovernance {
+    require(allowedTokens[token], "Not allowed");
+    allowedTokens[token] = false;
+    allowedTokenCount--;
+    emit TokenRemoved(token);
+}
+```
+
+Governance (admin key for PoC, OpenZeppelin Governor for production) must call `addToken` before any channel can be opened in that token. `removeToken` prevents new channels from being opened in that token; existing open channels remain valid and can still be closed/disputed normally.
+
+**`openChannel` accepts governance-approved ERC-20s:**
 
 ```solidity
 function openChannel(address provider, address token, uint256 deposit)
@@ -35,7 +65,16 @@ function openChannel(address provider, address token, uint256 deposit)
     returns (bytes32 channelId);
 ```
 
-The contract calls `IERC20(token).transferFrom(msg.sender, address(this), deposit)`. No allowlist check. Any token that implements `IERC20` is accepted. Tokens with fee-on-transfer or rebase mechanics are unsupported — the contract assumes `deposit` equals the amount actually received.
+The contract validates the token against the allowlist, then calls `transferFrom`:
+
+```solidity
+require(allowedTokens[token], "Token not allowed");
+SafeERC20.safeTransferFrom(IERC20(token), msg.sender, address(this), deposit);
+```
+
+Tokens with fee-on-transfer or rebase mechanics are unsupported — the contract assumes `deposit` equals the amount actually received. `SafeERC20` is used for all token interactions to handle ERC-20s that return `false` on failure instead of reverting.
+
+The allowlist reduces exposure by letting governance reject tokens with known problematic behaviour (e.g., fee-on-transfer, pausable transfers, obvious reentrancy patterns) before they are used, but it does not by itself prevent reentrancy or other ERC-20-level attacks. The implementation must still use standard on-chain mitigations (`nonReentrant` guards, checks-effects-interactions pattern, `SafeERC20`), and governance should account for proxy/upgradability and admin controls when vetting tokens.
 
 **Channel ID** incorporates the token address to allow the same client-provider pair to hold concurrent channels in different tokens:
 
@@ -69,8 +108,9 @@ struct RateBounds {
 
 mapping(address => RateBounds) public rateBounds;
 
-// governance-only
+// governance-only; token must be on the allowlist
 function setRateBounds(address token, uint256 deliveryFloor, uint256 deliveryCeiling) external;
+// requires: allowedTokens[token]
 ```
 
 A zero `RateBounds` entry (the default) means no bounds are enforced for that token — the node's advertised rate is unconstrained. Governance sets bounds only for tokens where protocol-level enforcement is wanted.
@@ -85,7 +125,7 @@ bytes32 constant VOUCHER_TYPEHASH = keccak256(
 
 ### Wire Protocol: cdn/client/v1
 
-A `payment_token` field is added to `StreamRequest`. This tells the serving node which token the client intends to use for this channel:
+A `payment_token` field is added to `StreamRequest` (extending the `{hash, channel_id, byte_offset}` definition in ADR 005). This tells the serving node which token the client intends to use for this channel:
 
 ```rust
 struct StreamRequest {
@@ -162,7 +202,7 @@ struct SignedRate {
 
 | Layer | Change | Breaking? |
 |-------|--------|-----------|
-| `PaymentChannel` contract | Accept any ERC-20 in `openChannel`, per-token `rateBounds`, token in channel ID | New deployment (not an upgrade of PoC contract) |
+| `PaymentChannel` contract | Governance-managed token allowlist, accept approved ERC-20s in `openChannel`, per-token `rateBounds`, token in channel ID | New deployment (not an upgrade of PoC contract) |
 | EIP-712 voucher typehash | Already uses `address token` from ADR 003 | No |
 | `cdn/client/v1` | Add `payment_token` to `StreamRequest` | No (unknown field ignored by old nodes; `UnsupportedToken` response is new but additive) |
 | `incentive` crate | `TokenInfo` struct, `accepted_tokens` config, per-token rate map | No (defaults to USDC if unconfigured) |
@@ -173,29 +213,35 @@ struct SignedRate {
 
 **Positive:**
 
-- The protocol works identically on any EVM chain with any token. A private operator can run the entire CDN stack with their own token and zero changes to the core codebase.
-- No issuer dependency. Nodes choose their own risk profile: trust Circle (USDC), trust MakerDAO (DAI), or trust no one (self-issued token on a private chain).
+- The protocol works identically on any EVM chain with any governance-approved token. A private operator can run the entire CDN stack with their own token by adding it to the allowlist — zero changes to the core codebase.
+- No issuer dependency. Governance can approve tokens with different trust profiles: Circle (USDC), MakerDAO (DAI), or operator-issued tokens on a private chain.
 - The EIP-712 voucher format already carries the token address — no signature scheme migration needed.
 - Operators advertising multiple tokens give clients the best chance of finding a compatible channel without pre-coordination.
+- **Malicious token exposure reduction.** The allowlist lets governance reject known-problematic ERC-20 contracts before they interact with `PaymentChannel` funds. This is a first line of defence; on-chain mitigations (`nonReentrant`, `SafeERC20`, checks-effects-interactions) remain required.
+- **Garbage token prevention.** Only governance-approved tokens can be used in channels, eliminating the attack surface of worthless self-issued tokens polluting the network.
 
 **Negative:**
 
 - **Decimal heterogeneity.** Tokens use 0–18 decimals. A node misconfiguring decimals silently misprices deliveries. The `TokenInfo.decimals` field must be validated against the on-chain `IERC20Metadata.decimals()` return value at startup.
-- **No protocol-level price normalization.** A node advertising 1 base-unit/MB in USDC (= $0.000001/MB) and 1 base-unit/MB in a worthless token are indistinguishable at the wire level. Clients bear responsibility for evaluating whether a node's accepted token has value.
-- **Garbage token griefing.** A node could accept a zero-value self-issued token, collect "payment" in it, and provide no real revenue. This only harms the node itself — it starves itself of real revenue. Not a protocol-level attack.
+- **No protocol-level price normalization.** A node advertising 1 base-unit/MB in USDC (= $0.000001/MB) and 1 base-unit/MB in a low-value token are indistinguishable at the wire level. Clients bear responsibility for evaluating whether a node's accepted token has value.
+- **Governance bottleneck.** Adding a new payment token requires a governance action (admin call for PoC, Governor proposal for production). This adds latency for operators who want to use a token not yet approved. Mitigated by the fact that token additions are infrequent and low-risk governance actions.
+- **Token removal complexity.** `removeToken` blocks new channels but existing open channels in that token remain valid. The network may carry "sunset" tokens for up to 30 days (channel auto-expiry) after removal.
 - **Per-token rate bounds governance burden.** Governance must set meaningful bounds for each token it wants to constrain. An unbounded token (zero `RateBounds` entry) has no floor or ceiling enforced.
 - **Slashing cross-token complexity.** ADR 004's slashing schedule is denominated in TOKEN. Converting a slash penalty from the payment token to TOKEN requires a price reference. For PoC, slash penalties remain in TOKEN regardless of payment token; a production implementation may need an oracle or a fixed TOKEN-denominated slash amount.
 
 ## Migration from ADR 003
 
-1. Deploy `PaymentChannel` (the production contract) alongside the PoC `StablePaymentChannel`; both coexist
-2. Nodes add `accepted_tokens` to config; default is USDC (backward-compatible)
-3. Clients begin negotiating token in `StreamRequest`; nodes on old software respond with `UnsupportedToken` and the client falls back to USDC
-4. Gossip messages include `token_rates`; old nodes advertise only legacy `rate_per_mb`; new nodes advertise both
-5. When the network has migrated sufficiently, the legacy `StablePaymentChannel` is retired by governance
+1. Deploy `PaymentChannel` (the production contract) alongside the PoC `StablePaymentChannel`; both coexist. Governance immediately calls `addToken(USDC_ADDRESS)` so USDC is available from deployment
+2. Governance calls `addToken` for any additional tokens the network wants to support (e.g., DAI)
+3. Nodes add `accepted_tokens` to config; default is USDC (backward-compatible)
+4. Clients begin negotiating token in `StreamRequest`; nodes on new software respond with `UnsupportedToken` if the requested token is not accepted, while nodes on old software ignore the `payment_token` field and therefore only operate USDC channels
+5. Gossip messages include `token_rates`; old nodes advertise only legacy `rate_per_mb`; new nodes advertise both
+6. When the network has migrated sufficiently, the legacy `StablePaymentChannel` is retired by governance
 
 ## Open Questions
 
 - **Decimal validation at runtime.** Should the node fail to start if a configured token's on-chain `decimals()` does not match the configured value, or warn and continue? Failing to start is safer but may cause operational disruption if a proxy token contract is upgraded (rare but possible).
 - **Slash denomination.** When a node is slashed for misbehaviour (ADR 004), the penalty is in TOKEN. If the node earned payment in DAI or a custom token, there is no automatic conversion. Either the slash is always in TOKEN (simple, but the node must hold TOKEN to be slashable), or slashing needs a price reference for the payment token. This is an open design question for the staking/slashing contract.
 - **Token metadata trust.** `IERC20Metadata` is not mandatory for ERC-20 tokens. Tokens without `decimals()` will cause a revert at startup. Should the contract use a try/catch and default to 18 decimals, or require the operator to always specify decimals explicitly in config?
+- **Token removal semantics.** `removeToken` blocks new channel opens but existing channels remain valid until expiry (up to 30 days). Should governance also have the ability to force-close all channels in a removed token (e.g., if the token is discovered to be malicious), or is blocking new channels sufficient?
+- **Token vetting criteria.** What due diligence should governance perform before calling `addToken`? At minimum: verify no fee-on-transfer, no rebase mechanics, no pausable transfers that could lock contract funds, and standard `IERC20` compliance. Should this be codified in a checklist or left to governance discretion?
