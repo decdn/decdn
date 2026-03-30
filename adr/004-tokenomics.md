@@ -26,7 +26,7 @@ Use a **dual-currency model**: USDC for operational payments, TOKEN (native ERC-
 | Fee discounts | TOKEN | Direct financial incentive to hold more TOKEN |
 | Slashing | TOKEN | Already denominated in stake |
 
-**Token supply:** 1B TOKEN, fixed at genesis, no post-genesis minting. Deflationary pressure comes from two sources: 100% of slashed stake is burned; 20% of protocol fees (collected in USDC) are used to buy TOKEN on the open market and burn it.
+**Token supply:** 1B TOKEN, fixed at genesis, no post-genesis minting. Deflationary pressure comes from two sources: 100% of slashed stake is burned; 20% of protocol fees (collected in USDC) are allocated for TOKEN buyback and burn. During the PoC, this allocation accumulates in the `BuybackBurner` contract without execution; buyback execution is a production-only feature (see [BuybackBurner Contract](#buybackburner-contract)).
 
 **Staking — single role:**
 
@@ -53,7 +53,7 @@ Minimum stake is 1,000 TOKEN with a 7-day unbonding period. Stake remains slasha
 
 - Bootstrapping requires token demand before organic revenue is sufficient; a 200M TOKEN bootstrap fund is allocated for this — adequate for PoC scale (see [Node Unit Economics](#node-unit-economics)), but adequacy for the production bootstrap period (hundreds of nodes before organic traffic) is unproven
 - Two-token UX: all node operators need both USDC (for payment channels) and TOKEN (to stake). Client software should abstract this with integrated DEX swaps but adds complexity
-- The TOKEN/USDC Uniswap pool may be thin at launch, making buyback execution sensitive to pool depth; `maxBuybackAmount` and `minTokenOut` parameters mitigate sandwich risk but require active governance attention
+- The TOKEN/USDC Uniswap pool will be thin at PoC scale and early production, making buyback execution impractical until sufficient pool depth exists. Buyback execution is deferred to production and requires a governance vote to enable (see [BuybackBurner Contract](#buybackburner-contract)). In production, `maxBuybackAmount` and `minTokenOut` parameters mitigate sandwich risk but require active governance attention
 - Regulatory risk: a token with staking, governance, and economic utility may be classified as a security in some jurisdictions. Legal review is required before production token distribution. See [ADR 009](009-governance.md) for governance-specific risks.
 
 ## Token Distribution (Production)
@@ -140,7 +140,7 @@ Protocol fees (3%, collected in USDC at channel settlement — see [ADR 003](003
 | Development fund | 40% | USDC | Held as stablecoin in treasury |
 | Bug bounties & audits | 20% | USDC | Held as stablecoin in treasury |
 | Ecosystem grants | 20% | USDC | Held as stablecoin in treasury |
-| Token buyback & burn | 20% | USDC → TOKEN → burn | Via `BuybackBurner` contract |
+| Token buyback & burn | 20% | USDC → TOKEN → burn | Via `BuybackBurner` contract (accumulate-only in PoC; execution production-only) |
 
 ```mermaid
 pie title Protocol Fee Allocation (3% at channel settlement)
@@ -160,17 +160,22 @@ The `BuybackBurner` contract converts accumulated USDC fees into TOKEN and burns
 2. `executeBuyback()` swaps USDC for TOKEN via Uniswap V3 on L2
 3. Purchased TOKEN is sent to burn address (`0x000...dEaD`)
 
+**PoC behavior:** The `BuybackBurner` contract is deployed and receives the 20% fee allocation, but `executeBuyback()` is not called. Fees accumulate in the contract as a treasury reserve. At PoC scale, per-node revenue is ~$1.50/month (see [PoC Reality](#revenue-model-poc-reality)), so even a 20-node network generates only ~$30/month in delivery payments, ~$0.90/month in protocol fees, and ~$0.18/month in buyback allocation — insufficient to justify gas costs, let alone execute a meaningful market buy on a thin TOKEN/USDC pool. Buyback execution is enabled in production via governance vote once pool liquidity and fee volume justify it.
+
 **Parameters:**
 
-| Parameter | Value | Governable |
-| --- | --- | --- |
-| Minimum accumulation before buyback | 1,000 USDC | Yes |
-| Maximum single buyback | 10,000 USDC | Yes |
-| Slippage tolerance | 2% (200 bps) | Yes |
-| DEX | Uniswap V3 TOKEN/USDC pool | Yes (pool address) |
-| Execution | Governance-triggered or automated keeper | — |
+| Parameter | PoC | Production | Governable |
+| --- | --- | --- | --- |
+| Minimum accumulation before buyback | N/A (execution disabled) | 100 USDC (reduced from 1,000 — at early production fee volumes, 1,000 USDC takes years to accumulate) | Yes |
+| Maximum single buyback | N/A (execution disabled) | 10,000 USDC | Yes |
+| Slippage tolerance | N/A (execution disabled) | 2% (200 bps) | Yes |
+| DEX | N/A (execution disabled) | Uniswap V3 TOKEN/USDC pool | Yes (pool address) |
+| Execution | Disabled — fees accumulate only | Governance-triggered or automated keeper | — |
+| Execution activation | N/A | Requires governance vote to enable | — |
 
 The caller provides `minTokenOut` to prevent sandwich attacks. If the TOKEN/USDC pool has insufficient liquidity, the swap reverts due to the `minTokenOut` check and accumulated fees remain in the contract until liquidity improves. The `maxBuybackAmount` should be set conservatively relative to pool depth.
+
+**Activation criteria (production):** Buyback execution should be enabled via governance vote only when: (1) the TOKEN/USDC pool has sufficient depth that a maximum single buyback causes less than the configured slippage tolerance in price impact, and (2) accumulated fees in the contract exceed the minimum accumulation threshold. These criteria are guidelines for governance voters, not on-chain enforcement.
 
 ## Node Unit Economics
 
@@ -219,6 +224,8 @@ The production target above assumes 10,000 GB/month (~333 GB/day) — a meaningf
 | Profitable without subsidy? | No | Yes |
 
 PoC nodes will operate at a loss without bootstrap subsidies. This is expected — the bootstrap fund exists precisely for this phase.
+
+**Buyback at PoC scale:** Buyback execution is disabled during the PoC — see [BuybackBurner Contract](#buybackburner-contract) for the detailed calculation showing that buyback allocations at PoC-scale revenue are far too small to justify gas costs or meaningful market buys.
 
 ### Bootstrap Fund Gap (PoC)
 

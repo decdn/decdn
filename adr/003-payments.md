@@ -402,6 +402,8 @@ interface IBuybackBurner {
 
 `executeBuyback` is callable by governance multisig or the authorized `keeper` address. All `set*` functions are governance-only behind a timelock.
 
+**PoC note:** The `BuybackBurner` contract is deployed with the same interface, but `executeBuyback` is not called during the PoC. Fees accumulate in the contract. See [ADR 004](004-tokenomics.md#buybackburner-contract) for activation criteria.
+
 ### EIP-712 Voucher Signature
 
 All voucher signatures use [EIP-712](https://eips.ethereum.org/EIPS/eip-712) typed structured data to prevent cross-chain, cross-contract, and cross-environment replay.
