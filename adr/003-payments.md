@@ -22,11 +22,11 @@ The same channel mechanism operates at two tiers:
 - **Client → node**: a client opens a USDC channel with a node, signs cumulative vouchers as MB are delivered, and the node initiates channel close on-chain and settles to claim payment after the dispute window.
 - **Node → node**: when a node pulls content from another node (typically an origin-backed node) for the first time, it pays via the same channel mechanism. The origin-backed node is paid wholesale; the pulling node recoups this by serving multiple clients from its cache at a markup.
 
-A channel is opened by depositing USDC into the `StablePaymentChannel` contract. As content is delivered, the payer signs cumulative vouchers off-chain — one voucher per MB received. The delivering node holds the latest voucher and submits it on-chain to initiate channel close. A 24-hour dispute window allows either party to counter a stale or fraudulent close attempt. After the dispute window expires, the channel is settled and funds are distributed.
+A channel is opened by depositing USDC into the `StablePaymentChannel` contract. As content is delivered, the payer signs cumulative vouchers off-chain — one voucher per MB received (default cadence; negotiable for large transfers). The delivering node holds the latest voucher and submits it on-chain to initiate channel close. A 24-hour dispute window allows either party to counter a stale or fraudulent close attempt. After the dispute window expires, the channel is settled and funds are distributed.
 
 Key parameters:
 
-- Voucher cadence: 1 MB delivered per voucher
+- Voucher cadence: 1 MB delivered per voucher (default; negotiable up to `maxVoucherIntervalMb` for large transfers — see [Voucher Interval Negotiation](#voucher-interval-negotiation))
 - Minimum deposit: 1 USDC (contract floor, governable); recommended practical minimum: 10 USDC (see [Deposit Economics](#deposit-economics))
 - Protocol fee: 3% deducted at channel settlement, sent to treasury
 - Fee discount: nodes staking ≥10× the minimum TOKEN stake pay 1.5% instead of 3%
@@ -55,6 +55,36 @@ Two standards can eliminate the requirement for clients to hold native L2 tokens
 - **ERC-4337 account abstraction.** Smart contract wallets batch USDC approval + channel open into a single user operation. A paymaster can sponsor gas in USDC rather than ETH. Works with unmodified contracts — no changes to `StablePaymentChannel` needed.
 
 Both are deferred to post-PoC. For the PoC, clients must hold both USDC and a small amount of ETH for gas.
+
+### Voucher Interval Negotiation
+
+At the default 1 MB cadence, a 10 GB blob requires 10,000 vouchers — each involving a sign, transmit, verify, and ack cycle. This overhead is unnecessary when the unacknowledged exposure per interval is negligible at typical rates.
+
+**Parameter:** `maxVoucherIntervalMb` is a governable parameter on `StablePaymentChannel` defining the maximum allowed voucher interval in MB. Default: 1 MB. Hardcoded safety bounds: minimum 1 MB, maximum 1024 MB (1 GB).
+
+**Negotiation semantics:**
+
+1. The client proposes a `voucher_interval_mb` in `StreamRequest` (see [ADR 005](005-protocol.md)).
+2. The node responds with its accepted `voucher_interval_mb` in `StreamResponse`. The node may accept the client's proposal, reduce it, or omit the field to fall back to 1 MB.
+3. The effective interval for the stream is `min(client_proposed, node_accepted, on-chain maxVoucherIntervalMb)`.
+
+**Backward compatibility:** If `voucher_interval_mb` is absent from `StreamRequest` (older client), the default is 1 MB. If absent from `StreamResponse` (older node), the client assumes 1 MB. The field is optional in both messages.
+
+**Node sovereignty:** A node can always enforce a smaller interval than the negotiated value by stopping delivery after that many MB without receiving a voucher. This uses the existing self-enforcing mechanism — no protocol change needed beyond the negotiation field.
+
+**Enforcement model:** The on-chain `maxVoucherIntervalMb` parameter is advisory — vouchers contain no interval field, so the contract cannot verify what interval was used during off-chain delivery. Enforcement depends on honest client and node software querying the on-chain parameter and capping their negotiation accordingly. This is consistent with other off-chain protocol parameters (e.g., `rate_per_mb` is advertised off-chain and only becomes enforceable when both signed messages are submitted as slash evidence). The governance parameter serves as a coordination point and a signal to implementations, not a contract-level invariant.
+
+**Risk analysis at negotiated intervals:**
+
+| Interval | Floor rate ($0.000001/MB) | Market rate ($0.00001/MB) | Ceiling rate ($0.001/MB) |
+| --- | --- | --- | --- |
+| 1 MB (default) | $0.000001 | $0.00001 | $0.001 |
+| 100 MB | $0.0001 | $0.001 | $0.10 |
+| 1024 MB (max) | $0.001024 | $0.01024 | $1.024 |
+
+Even the worst case (1024 MB at ceiling rate) exposes $1.024 — well below the recommended 10 USDC minimum deposit.
+
+**Concurrent streams interaction:** When multiple streams share a channel with different negotiated intervals, the effective interval for the channel is the **minimum** across all active streams. This preserves the existing invariant that the aggregate voucher deficit never exceeds the effective interval. A consequence is that the overhead reduction from larger intervals is only realized when **all** streams on a channel negotiate larger intervals — a single 1 MB stream added to a channel with a 1024 MB stream forces the entire channel back to 1 MB cadence. Clients fetching a mix of small and large blobs from the same node may benefit from opening separate channels to isolate large-interval streams. See [ADR 005 — Payment channels and concurrent streams](005-protocol.md#payment-channels-and-concurrent-streams) for wire-level details.
 
 ### Fee Calculation on Disputed Closes
 
@@ -89,7 +119,7 @@ This means the network self-balances: popular content gets replicated because ca
 - On-chain costs are amortized across an entire channel lifetime — open + close + settle = three transactions regardless of how many MB are delivered (settle can be called by any address, allowing third-party settlement bots)
 - USDC denomination gives node operators predictable unit economics: delivery revenue covers infrastructure costs without exposure to TOKEN price movements
 - The voucher is the payment receipt; the BLAKE3 hash is the delivery receipt. Together they provide mutual protection: the client doesn't sign a voucher for bytes that fail hash verification; the node stops delivering if vouchers stop arriving
-- Maximum risk per voucher interval (1 MB) at $0.00001/MB is $0.00001 — negligible
+- Maximum risk per voucher interval at default cadence (1 MB) is $0.00001 at market rate — negligible. At the governance maximum interval (1024 MB) and ceiling rate ($0.001/MB), worst-case risk is $1.024 per interval — still small relative to the recommended 10 USDC minimum deposit (see [Voucher Interval Negotiation](#voucher-interval-negotiation))
 - Market-driven rate setting means replication happens organically: profitable content gets cached by more nodes, driving prices down without any coordination protocol
 - The `StablePaymentChannel` contract is functionally separated from the `StakingRegistry`, keeping the audit surface for each contract's core logic bounded
 
@@ -107,7 +137,7 @@ This means the network self-balances: popular content gets replicated because ca
 **Voucher withholding**
 Client receives bytes but stops signing vouchers, getting content for free up to the last signed interval.
 
-The self-enforcing stop is sufficient. Maximum loss is one interval (1 MB × rate ≈ $0.00001). No additional mechanism needed — this is fully addressed by the protocol design.
+The self-enforcing stop is sufficient. Maximum loss is one voucher interval at the negotiated cadence. At the default cadence (1 MB × market rate ≈ $0.00001), risk is negligible. At a negotiated interval of 100 MB at market rate, loss is ~$0.001. At the governance maximum (1024 MB) at ceiling rate, loss is ~$1.024 — still economically negligible relative to channel deposits. Nodes serving high-value content can unilaterally enforce smaller intervals regardless of what was negotiated. No additional mechanism needed — this is fully addressed by the protocol design.
 
 ---
 
@@ -298,6 +328,7 @@ interface IStablePaymentChannel {
     function setMinDeposit(uint256 amount) external;
     function setDisputeWindow(uint256 seconds_) external;
     function setRateBounds(uint256 deliveryFloor, uint256 deliveryCeiling) external;
+    function setMaxVoucherIntervalMb(uint256 mb) external;
 }
 ```
 
@@ -341,6 +372,7 @@ event ChannelSettled(
 | Min deposit | 1 base unit | No max |
 | Rate floor | 0 | Must be < ceiling |
 | Rate ceiling | Must be > floor | No max |
+| Max voucher interval | 1 MB | 1024 MB (1 GB) |
 
 **Rate bounds are in USDC base units (6 decimals) for the PoC.** The contract stores a single `RateBounds` struct with `deliveryFloor` and `deliveryCeiling`. Per-token rate bounds are deferred to [ADR 010](010-multi-token.md).
 

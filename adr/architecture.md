@@ -82,7 +82,7 @@ Every blob is identified by its BLAKE3 hash. Clients verify received bytes again
 
 **Off-chain USDC payment channels. Market-driven rates.**
 
-Clients pay nodes per MB. On a cache miss, nodes pay origin-backed nodes per MB for initial content pulls, then amortise that cost across many client deliveries. Origin-backed nodes set the effective price ceiling (reflecting their backend egress costs). Rates are fully market-driven within governance-set bounds.
+Clients pay nodes per MB. On a cache miss, nodes pay origin-backed nodes per MB for initial content pulls, then amortise that cost across many client deliveries. Origin-backed nodes set the effective price ceiling (reflecting their backend egress costs). Rates are fully market-driven within governance-set bounds. Voucher cadence (default 1 MB) is negotiable per-stream for large blob transfers, reducing overhead without materially increasing risk.
 
 ---
 
@@ -346,3 +346,4 @@ During PoC (before indexers exist), clients use the full-table gossip approach: 
 
 - Production L2 choice (Arbitrum One, Base, or other) — gated on PoC validation
 - Parallel streaming from multiple nodes for a single blob (protocol supports it, not prioritised)
+- Whether a maximum blob size should be imposed for operational reasons — the protocol currently imposes no limit, and streaming delivery with negotiable voucher intervals ([ADR 003](003-payments.md#voucher-interval-negotiation)) handles arbitrarily large blobs without full materialization, but practical considerations (cache eviction impact, origin pull duration, channel lifetime) may warrant an explicit ceiling

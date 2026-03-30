@@ -73,7 +73,7 @@ sequenceDiagram
     W->>T: WatchtowerRegister {channel_id, deposit, counterparty, latest_voucher, fee_offer}
     T->>W: WatchtowerAccept {accepted, fee_rate, terms}
 
-    loop Every voucher (1 MB delivered)
+    loop Every voucher (at negotiated interval; default 1 MB)
         W->>T: VoucherUpdate {channel_id, amount, nonce, signature}
         T->>W: VoucherAck
     end
@@ -81,7 +81,7 @@ sequenceDiagram
     W->>T: WatchtowerRevoke {channel_id}
 ```
 
-**Frequency:** Every voucher — one update per 1 MB delivered, matching the voucher cadence from ADR 003. The watchtower must hold the absolute latest voucher to be effective. Each update is ~150 bytes; at typical delivery rates this is negligible overhead.
+**Frequency:** Every voucher — one update per voucher interval delivered, matching the negotiated voucher cadence from [ADR 003](003-payments.md#voucher-interval-negotiation). The default interval is 1 MB; for large blob transfers the interval may be negotiated up to 1024 MB. With larger intervals, the watchtower receives fewer updates. The watchtower must hold the absolute latest voucher to be effective. Each update is ~150 bytes; even at the default 1 MB cadence this is negligible overhead. See [Voucher state desynchronisation](#voucher-state-desynchronisation) for the security implications of larger intervals.
 
 **Connection management:** If the QUIC connection drops, the watchtower retains the last received voucher and continues monitoring. The watched party should reconnect and resume updates. The watchtower's obligation persists as long as the channel is open and the monitoring period is paid for.
 
@@ -242,3 +242,5 @@ Mitigated by periodic liveness testing: the watched party can open a test channe
 The QUIC connection between the watched party and watchtower drops. The watchtower holds an outdated voucher. A stale close occurs. The watchtower submits a counter-voucher that is newer than the stale close but not the absolute latest — settlement is better than the stale close but not optimal.
 
 This is a partial-protection scenario, not a total failure. Mitigation: the watched party's software treats watchtower connection health as critical and alerts on disconnection. Automatic reconnection with full voucher resync on reconnect. The local dispute monitor covers the gap if the node is online. For the node-offline case, the most recent voucher the watchtower holds is still better than the stale voucher — the node recovers most of its earnings even if the absolute latest voucher is lost.
+
+With negotiable voucher intervals ([ADR 003](003-payments.md#voucher-interval-negotiation)), larger gaps between voucher updates increase the potential value lost during a desynchronisation event. At a 100 MB interval and market rate, the worst case is the watchtower is one interval behind — a $0.001 discrepancy. At the governance maximum (1024 MB) and ceiling rate ($0.001/MB), the worst-case discrepancy is $1.024. Operators delivering high-value large blobs should weigh the tradeoff between fewer voucher round-trips and larger desynchronisation exposure when choosing an interval.

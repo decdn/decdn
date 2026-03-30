@@ -53,11 +53,11 @@ sequenceDiagram
     participant P as Payer
     participant D as Delivering Node
 
-    P->>D: StreamRequest {hash, channel_id, byte_offset, timestamp_us}
-    D->>P: StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, signature, redirect?}
+    P->>D: StreamRequest {hash, channel_id, byte_offset, timestamp_us, voucher_interval_mb?}
+    D->>P: StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, signature, redirect?, voucher_interval_mb?}
 
     alt ok = true
-        loop Every 1 MB
+        loop Every voucher_interval_mb (default 1 MB)
             D->>P: ChunkData {bytes} (1024-byte chunks)
             P->>D: Voucher {sig, amt} (cumulative USDC)
             D->>P: VoucherAck
@@ -68,11 +68,13 @@ sequenceDiagram
     end
 ```
 
-**Voucher wire format:** `Voucher {sig, amt}` above is shorthand. The EIP-712 signed data covers the full structure from [ADR 003](003-payments.md): `{channelId, amount, nonce, stablecoin}`. Only `signature` and `amount` are transmitted on the wire because the remaining fields are derivable from stream context — `channel_id` is in `StreamRequest`, `nonce` increments monotonically (one per MB boundary), and `stablecoin` is fixed at channel open. The receiver reconstructs the full typed data to verify the signature. Contrast with the watchtower `VoucherUpdate` below, which must include `channel_id` and `nonce` explicitly because the watchtower lacks stream context.
+**Voucher wire format:** `Voucher {sig, amt}` above is shorthand. The EIP-712 signed data covers the full structure from [ADR 003](003-payments.md): `{channelId, amount, nonce, stablecoin}`. Only `signature` and `amount` are transmitted on the wire because the remaining fields are derivable from stream context — `channel_id` is in `StreamRequest`, `nonce` increments monotonically (one per voucher interval boundary — default 1 MB, or the negotiated interval), and `stablecoin` is fixed at channel open. The receiver reconstructs the full typed data to verify the signature. Contrast with the watchtower `VoucherUpdate` below, which must include `channel_id` and `nonce` explicitly because the watchtower lacks stream context.
 
 The delivering node advertises its `rate_per_mb` in `StreamResponse`. The payer accepts by sending the first voucher or disconnects and tries another node. No surprise pricing. `timestamp_us` in `StreamResponse` is the requester-generated microsecond timestamp from `StreamRequest`, echoed back unchanged — the same pattern as `ProbeResponse`. The node's iroh key signs all security-relevant fields: `{hash, ok, rate_per_mb, total_bytes, channel_id, timestamp_us, redirect}`, making the response cryptographically binding. Signing the full response prevents a malicious party from altering unsigned fields while reusing a valid signature — in particular, `ok` is needed for phantom announcement evidence (proving a node signed `ok: false` after claiming `has_blob: true` in a probe), and `redirect` ensures a node cannot silently alter routing without accountability. A rate mismatch where `stream_response.rate_per_mb > probe_response.rate_per_mb` is slashable if `stream_response.timestamp_us >= probe_response.timestamp_us` and `stream_response.timestamp_us - probe_response.timestamp_us < 30_000_000` (30 seconds). The ordering check prevents unsigned integer underflow in the on-chain verifier. Because both `timestamp_us` values are requester-generated, the on-chain verifier computes this delta from the signed messages alone — no wall-clock reference or external time oracle is needed, and clock skew between the requester and the node does not affect the check. The `redirect` field in `StreamResponse` is used when a node cannot serve — it contains the NodeId of another node that can, never an external URL. The network is fully opaque.
 
 `byte_offset` supports seek and resume: on failover, the requester reconnects to a different node and resumes from the last BLAKE3-verified byte.
+
+**Voucher interval negotiation.** The optional `voucher_interval_mb` field in `StreamRequest` proposes a larger-than-default voucher cadence for this stream (see [ADR 003 — Voucher Interval Negotiation](003-payments.md#voucher-interval-negotiation)). If present, the node responds with its accepted interval in `StreamResponse.voucher_interval_mb` — which may be equal to or smaller than the proposed value. If absent from either message, both sides default to 1 MB. The `voucher_interval_mb` field is **not** included in the `StreamResponse` signature because it is a delivery-layer optimization, not a security-relevant field — the node can always enforce a smaller interval unilaterally by pausing delivery.
 
 The protocol is self-enforcing: payer stops sending vouchers → delivering node stops sending chunks; delivering node stops sending chunks → payer stops sending vouchers.
 
@@ -92,7 +94,7 @@ sequenceDiagram
     W->>T: WatchtowerRegister {channel_id, deposit, counterparty, latest_voucher, fee_offer}
     T->>W: WatchtowerAccept {accepted, fee_rate, terms}
 
-    loop Every voucher (1 MB delivered)
+    loop Every voucher (at negotiated interval, default 1 MB)
         W->>T: VoucherUpdate {channel_id, amount, nonce, signature}
         T->>W: VoucherAck
     end
@@ -139,12 +141,12 @@ sequenceDiagram
         N->>C: StreamResponse + ChunkData…
     end
 
-    Note over C: Aggregate byte counter crosses 1 MB
+    Note over C: Aggregate byte counter crosses voucher interval boundary
     C->>N: Voucher {sig, amt} (sent on any active stream)
     N->>C: VoucherAck
 ```
 
-The payer maintains **one aggregate byte counter per channel**. When the counter crosses the next 1 MB boundary, it issues the next cumulative voucher on any active stream sharing that channel. The delivering node tracks total bytes sent across all streams on the channel and **pauses all streams** if the voucher deficit exceeds 1 MB — the self-enforcing threshold is applied collectively, not per-stream.
+The payer maintains **one aggregate byte counter per channel**. When the counter crosses the next voucher interval boundary (default 1 MB; negotiable per-stream — see [ADR 003 — Voucher Interval Negotiation](003-payments.md#voucher-interval-negotiation)), it issues the next cumulative voucher on any active stream sharing that channel. When multiple streams on the same channel have different negotiated intervals, the effective interval for the channel is the **minimum** across all active streams. The delivering node tracks total bytes sent across all streams on the channel and **pauses all streams** if the voucher deficit exceeds the effective interval — the self-enforcing threshold is applied collectively, not per-stream.
 
 Implementation constraint: the payer must have a single voucher-signing task per channel that aggregates byte counts from all streams, rather than independent per-stream voucher logic.
 
@@ -175,9 +177,10 @@ All protocol messages use [postcard](https://docs.rs/postcard) — compact, no-s
 
 - Probe RTT includes iroh's NAT traversal overhead on first connection, inflating the latency estimate. Reusing existing connections for probes gives a cleaner signal.
 - A node under load can respond to probes quickly but deliver slowly — probe RTT is necessary but not sufficient. Reputation (separate system) provides the longer-term signal.
-- The `cdn/client/v1` voucher cadence (1 MB) is coarser than iroh-blobs' internal chunk granularity (1024 bytes); the payment layer and transfer layer operate at different tick rates, requiring a buffering layer between them
+- The `cdn/client/v1` voucher cadence (default 1 MB, negotiable up to 1024 MB) is coarser than iroh-blobs' internal chunk granularity (1024 bytes); the payment layer and transfer layer operate at different tick rates, requiring a buffering layer between them
 - Concurrent streams sharing a `channel_id` require the payer to maintain a single aggregate byte counter and voucher-signing task per channel; per-stream independence is lost for payment tracking
 - The delivering node enforces the voucher deficit threshold across all streams collectively — a slow voucher on one stream pauses all streams on that channel
 - Different ALPNs require separate QUIC connections; probing a node via `cdn/probe/v1` and then fetching via `cdn/client/v1` incurs two handshake costs to the same peer
 - Postcard has no schema evolution story — adding fields requires a new ALPN version (`cdn/client/v2`); version negotiation must be planned before the first breaking change
+- The `voucher_interval_mb` field in `StreamRequest`/`StreamResponse` is optional and defaults to 1 MB if absent — this allows backward compatibility with older peers without requiring a new ALPN version. However, this is a one-time workaround; any future mandatory field addition still requires `cdn/client/v2`
 - `StreamRequest` includes a requester-generated `timestamp_us` that the node echoes in `StreamResponse`. A malicious requester could craft timestamps to make a legitimate rate change (probe 60 seconds ago, rate changed since) appear within the 30-second slashing window. In production, the challenge bond (ADR 004) deters this: the bond is forfeited if the node successfully counters within the 24-hour counter-window, e.g. by showing a rate change published via gossip between the two timestamps. In the PoC, where the challenge bond is not implemented (ADR 004), the node's 24-hour counter-window still provides a defense, but frivolous challenges are not economically penalized
