@@ -15,7 +15,9 @@ We are building a decentralized CDN with two participant roles: **nodes** (provi
 
 ## Decision
 
-Use **Rust** as the implementation language and **iroh** (0.35+) as the core networking library.
+Use **Rust** as the implementation language and **iroh** as the core networking library.
+
+iroh versioning policy: pin to a specific version in `Cargo.toml` (e.g. `iroh = "0.35"`) rather than an open range. The current evaluated baseline is **0.35**. Upgrades are deliberate — evaluate API compatibility, update `Cargo.toml`, and record the new baseline here before merging. `Cargo.lock` is committed and acts as the true pin within a given version constraint.
 
 Specifically:
 - `iroh::Endpoint` for QUIC-based peer-to-peer connectivity and ALPN protocol negotiation
@@ -36,5 +38,5 @@ Specifically:
 
 - Rust's compile times slow the development feedback loop compared to interpreted or JVM languages
 - The team needs Rust proficiency; onboarding contributors takes longer
-- iroh is a relatively young library; its APIs have changed across versions and may continue to do so
+- iroh is a relatively young library; its APIs have changed across versions and may continue to do so — mitigated by pinning policy above
 - Fewer off-the-shelf libraries for EVM interaction compared to TypeScript or Python — `alloy-rs` covers the gap but with less community documentation
