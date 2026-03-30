@@ -11,15 +11,15 @@ The protocol layer must be distinct from the transport layer (iroh/QUIC) and the
 
 ## Decision
 
-Five protocols, each identified by an ALPN string:
+Five protocols: four negotiated via ALPN, plus the built-in iroh-gossip protocol:
 
-| ALPN | Participants | Purpose |
+| Protocol | Participants | Purpose |
 | --- | --- | --- |
 | `cdn/probe/v1` | any node ↔ any node | Latency and availability check before committing to a node |
 | `cdn/client/v1` | payer ↔ delivering node | Paid blob delivery with payment vouchers (client→node, node→node on cache miss) |
 | `cdn/keys/v1` | app server ↔ client | Epoch key delivery and sealed envelope requests (see ADR 006) |
 | `cdn/watchtower/v1` | watched party (typically node) ↔ watchtower | Channel-dispute monitoring: voucher registration and updates (see ADR 007) |
-| iroh-gossip built-in | all nodes | Content availability announcements, node discovery |
+| iroh-gossip (built-in) | all nodes | Content availability announcements, node discovery |
 
 ### `cdn/probe/v1` — latency probe
 

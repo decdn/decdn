@@ -35,7 +35,7 @@ hash     = BLAKE3(ciphertext)
 
 XChaCha20-Poly1305 is chosen over AES-256-GCM because its 24-byte nonce eliminates nonce-reuse risk with random generation, and it requires no hardware AES support.
 
-### Key Delivery Layer (per play request)
+### Key Delivery Layer (session + per play request)
 
 An app server (outside the CDN protocol) gates access and delivers `K_blob` to authorized clients. The app server runs an iroh `Endpoint` with its own `NodeId` and accepts connections on ALPN `cdn/keys/v1`. It is **not** a CDN node — it does not stake, serve blobs, or register in the `StakingRegistry`. Clients discover the app server's `NodeId` out-of-band (hardcoded in client config for PoC, similar to watchtower peer discovery in ADR 007).
 
@@ -65,7 +65,7 @@ sequenceDiagram
     participant C as Client
 
     C->>A: connect via cdn/keys/v1
-    C->>A: KeySessionOpen {session_token, client_pubkey}
+    C->>A: KeySessionOpen {session_token}
     A->>C: KeySessionAccepted {epoch_id: 42, epoch_key}
 
     Note over A,C: 5 minutes pass...
@@ -88,7 +88,7 @@ The protocol uses two QUIC stream patterns on a single connection, serialized wi
 
 | Message | Direction | Fields | Purpose |
 | --- | --- | --- | --- |
-| `KeySessionOpen` | client → server | `session_token`, `client_pubkey` | Authenticate and start key session |
+| `KeySessionOpen` | client → server | `session_token` | Authenticate and start key session |
 | `KeySessionAccepted` | server → client | `epoch_id`, `epoch_key` | Confirm session, deliver current epoch key |
 | `EpochKeyUpdate` | server → client | `epoch_id`, `epoch_key` | Push rotated epoch key (every 5 minutes) |
 | `EpochKeyAck` | client → server | `epoch_id` | Acknowledge receipt of epoch key |
@@ -102,7 +102,7 @@ The protocol uses two QUIC stream patterns on a single connection, serialized wi
 
 The server rejects `EnvelopeRequest` streams if no active `KeySession` stream exists for the client — this enforces that only clients with an active subscription receive envelopes.
 
-**Authentication:** `KeySessionOpen` carries a `session_token` (opaque to the CDN protocol — issued by the application's auth system, e.g., JWT). The client's iroh `NodeId` provides transport-layer identity (the QUIC handshake proves the client holds the ed25519 private key). Both are needed: `NodeId` alone does not prove subscription status; `session_token` alone does not prove transport-layer identity.
+**Authentication:** `KeySessionOpen` carries a `session_token` (opaque to the CDN protocol — issued by the application's auth system, e.g., JWT). The client's iroh `NodeId` provides transport-layer identity (the QUIC handshake proves the client holds the ed25519 private key). The server derives the client's public key for `crypto_box_seal` from the NodeId (ed25519 → X25519 conversion) — no separate `client_pubkey` field is needed. Both authentication layers are required: `NodeId` alone does not prove subscription status; `session_token` alone does not prove transport-layer identity.
 
 **Concurrent stream limiting:** The long-lived epoch key stream doubles as a presence signal. The app server tracks open `KeySession` streams per account. If `active_sessions >= max_concurrent`, the server rejects new `KeySessionOpen` requests with an error code.
 

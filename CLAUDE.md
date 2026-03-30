@@ -58,7 +58,7 @@ crates/
 
 **Dependency flow:** `node → cache, incentive, reputation, protocol`. Cache and incentive are independent — cache works without payment logic (useful for testing/local dev).
 
-### Wire Protocols (ALPN-identified)
+### Wire Protocols
 
 | ALPN | Purpose |
 |------|---------|
