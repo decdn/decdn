@@ -91,7 +91,7 @@ This means the network self-balances: popular content gets replicated because ca
 - The voucher is the payment receipt; the BLAKE3 hash is the delivery receipt. Together they provide mutual protection: the client doesn't sign a voucher for bytes that fail hash verification; the node stops delivering if vouchers stop arriving
 - Maximum risk per voucher interval (1 MB) at $0.00001/MB is $0.00001 — negligible
 - Market-driven rate setting means replication happens organically: profitable content gets cached by more nodes, driving prices down without any coordination protocol
-- The `StablePaymentChannel` contract is isolated from the `StakingRegistry`, keeping the audit surface for each contract bounded
+- The `StablePaymentChannel` contract is functionally separated from the `StakingRegistry`, keeping the audit surface for each contract's core logic bounded
 
 **Negative:**
 
@@ -500,14 +500,14 @@ The `token` field (ERC-20 address) is included in the signed EIP-712 typed data 
 
 Slashing and payment channels are independent by design. The following interactions apply regardless of which governance-approved tokens are in use (see [ADR 010](010-multi-token.md)).
 
-**Slashing does not affect channel funds.** Slashing operates exclusively on TOKEN stake in the `StakingRegistry` (see [ADR 004](004-tokenomics.md#slash-amounts-escalating)). Funds deposited into payment channels are client deposits held in escrow — they are not stake and are never touched by slashing. This follows directly from the contract isolation described in [Consequences](#consequences): the payment channel contract has no reference to `StakingRegistry`.
+**Slashing does not affect channel funds.** Slashing operates exclusively on TOKEN stake in the `StakingRegistry` (see [ADR 004](004-tokenomics.md#slash-amounts-escalating)). Funds deposited into payment channels are client deposits held in escrow — they are not stake and are never touched by slashing. This follows directly from the functional separation described in [Consequences](#consequences): payment channel contracts never hold or move TOKEN stake, cannot be called by `StakingRegistry` to slash or reassign stake, and any `StakingRegistry` interaction is read-only (e.g., computing fee discounts based on stake multiples).
 
 **Slashing can drop a node below minimum stake while channels are open.** Because channel deposits are independent of stake, a node can be slashed below the minimum stake requirement (or even to zero) while it has open channels. The channels continue their normal lifecycle — close, dispute window, settle — regardless of the node's staking status. Channel settlement is purely a function of the voucher state, not the node's registry status.
 
 **Auto-ejection does not interrupt open channels.** When a node's stake drops below 50% of the minimum and auto-ejection triggers (see [ADR 004](004-tokenomics.md#auto-ejection)):
 
 - Open channels settle normally. Client funds are never trapped.
-- The ejected node cannot open new channels (nodes verify counterparty registration before accepting `openChannel`).
+- The ejected node cannot participate in new channels (clients verify node registration before opening channels, and nodes verify counterparty status before accepting a `StreamRequest`).
 - The ejected node is removed from gossip routing, so it receives no new client connections.
 - `closeChannel`, `disputeChannel`, and `settleChannel` remain callable on existing channels — these functions check channel state, not registry status.
 - The node must re-stake at the full minimum and re-register to resume operations.
