@@ -33,17 +33,17 @@ Key parameters:
 
 ### Deposit Economics
 
-Opening, closing, and settling a channel requires three on-chain transactions totalling ~$0.23 on Arbitrum L2 (see [ADR 004](004-tokenomics.md) gas breakdown: `openChannel` ~$0.05, `closeChannel` ~$0.10, `settleChannel` ~$0.08). The table below shows this lifecycle gas cost as a percentage of various deposit sizes, with the optional watchtower minimum fee from [ADR 007](007-watchtower.md):
+Opening, closing, and settling a channel requires three on-chain transactions totalling ~$0.23 on Arbitrum L2 (see [ADR 004](004-tokenomics.md) gas breakdown: `openChannel` ~$0.05, `closeChannel` ~$0.10, `settleChannel` ~$0.08). This estimate assumes an existing ERC-20 approval; first-time users incur an additional one-time `approve` transaction (~$0.03), bringing the true first-channel cost to ~$0.26. The table below uses the $0.23 lifecycle cost (excluding the one-time approval) as a percentage of various deposit sizes, with the optional watchtower minimum fee from [ADR 007](007-watchtower.md) modeled as a single 30-day monitoring period:
 
-| Deposit | Lifecycle gas ($0.23) | Gas % of deposit | + Watchtower ($0.50, optional) | Total overhead % |
-|---------|----------------------|------------------|-------------------------------|-----------------|
-| 1 USDC  | $0.23                | 23%              | $0.50                         | 73%             |
-| 5 USDC  | $0.23                | 4.6%             | $0.50                         | 14.6%           |
-| 10 USDC | $0.23                | 2.3%             | $0.50                         | 7.3%            |
-| 25 USDC | $0.23                | 0.92%            | $0.50                         | 2.9%            |
-| 100 USDC| $0.23                | 0.23%            | $0.50                         | 0.73%           |
+| Deposit | Lifecycle gas ($0.23) | Gas % of deposit | + Watchtower ($0.50 / 30 days, optional) | Total overhead % (1 monitoring period) |
+|---------|----------------------|------------------|------------------------------------------|----------------------------------------|
+| 1 USDC  | $0.23                | 23%              | $0.50                                    | 73%                                    |
+| 5 USDC  | $0.23                | 4.6%             | $0.50                                    | 14.6%                                  |
+| 10 USDC | $0.23                | 2.3%             | $0.50                                    | 7.3%                                   |
+| 25 USDC | $0.23                | 0.92%            | $0.50                                    | 2.9%                                   |
+| 100 USDC| $0.23                | 0.23%            | $0.50                                    | 0.73%                                  |
 
-**Recommended practical minimum: 10 USDC.** Client software should default to a 10 USDC minimum deposit (user-overridable). At 10 USDC, gas overhead is 2.3% — acceptable for a payment channel that covers ~1,000,000 MB at floor rate or ~100 GB at the expected market rate ($0.01/GB), sufficient for weeks to months of casual use without top-up. The contract minimum (1 USDC, governable via `setMinDeposit`) remains a safety floor — it prevents dust channels that cost more to settle than they contain and preserves flexibility for testing and governance adjustment. Raising the contract minimum is not recommended because it would reduce governance flexibility and create a hard barrier for development/testing scenarios where small deposits are useful.
+**Recommended practical minimum: 10 USDC.** Client software should default to a 10 USDC minimum deposit (user-overridable). At 10 USDC, gas overhead is 2.3% — acceptable for a payment channel that covers ~10,000,000 MB at the floor rate or ~1,000,000 MB (~1,000 GB) at the expected market rate ($0.01/GB), sufficient for weeks to months of casual use without top-up. The contract minimum (1 USDC, governable via `setMinDeposit`) remains a safety floor — it prevents dust channels that cost more to settle than they contain and preserves flexibility for testing and governance adjustment. Raising the contract minimum is not recommended because it would reduce governance flexibility and create a hard barrier for development/testing scenarios where small deposits are useful.
 
 **Amortization.** The overhead percentages above represent worst-case single-session economics. Long-lived channels amortize open/settle costs across many sessions: a channel used for 30 sessions costs ~$0.008/session in gas ([ADR 004](004-tokenomics.md)). Channels extended via `topUp` amortize further since only the initial open and final settle incur gas.
 
