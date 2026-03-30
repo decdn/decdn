@@ -58,7 +58,7 @@ This means the network self-balances: popular content gets replicated because ca
 - Clients must hold USDC to use the network; this adds an onboarding step compared to a single-token model
 - Rate volatility: a node can change its advertised rate between a probe and a stream request; the `StreamResponse` rate is the binding one, but a client that probed at one rate and receives a higher rate in `StreamResponse` must disconnect and re-probe rather than having been deceived silently
 - Two payment contracts coexist during migration (legacy `PaymentChannel` for TOKEN, `StablePaymentChannel` for USDC), doubling audit surface temporarily
-- USDC is issued by Circle, which can freeze specific addresses or blacklist the contract. This is mitigated by a governance-maintained allowlist that can add DAI or other stablecoins, but the risk is not eliminated
+- USDC is issued by Circle, which can freeze specific addresses or blacklist the contract. For the PoC this risk is accepted; multi-token payment support to mitigate it is deferred to [ADR 010](010-multi-token.md)
 - BLAKE3 verification on EVM requires an intermediate Merkle proof scheme for PoC-era slash evidence; a client submitting a slash claim cannot directly prove BLAKE3 mismatch on-chain
 
 ## Attack Vectors
@@ -207,7 +207,7 @@ A node stakes, announces content it holds, but refuses to serve it — collectin
 **Replay attack on vouchers**
 Attacker intercepts a signed voucher and attempts to replay it against a different channel or after close.
 
-Fully solved. EIP-712 typed data over `{channelId, amount, nonce, stablecoin}` binds the voucher to a specific channel. The EIP-712 domain separator (see [EIP-712 Voucher Signature](#eip-712-voucher-signature)) further binds each voucher to a specific chain and contract deployment, preventing replay across different L2s, contract upgrades, or test vs production environments. The monotonically increasing nonce prevents resubmission after settlement.
+Fully solved. EIP-712 typed data over `{channelId, amount, nonce, token}` binds the voucher to a specific channel. The EIP-712 domain separator (see [EIP-712 Voucher Signature](#eip-712-voucher-signature)) further binds each voucher to a specific chain and contract deployment, preventing replay across different L2s, contract upgrades, or test vs production environments. The monotonically increasing nonce prevents resubmission after settlement.
 
 ## Contract Interfaces
 
@@ -221,8 +221,8 @@ The `StablePaymentChannel` is a new contract separate from the existing `Payment
 struct Channel {
     address client;
     address provider;
-    address stablecoin;       // ERC-20 address (e.g., USDC)
-    uint256 deposit;          // in stablecoin base units (USDC: 6 decimals)
+    address token;            // hardcoded to USDC for PoC; any ERC-20 in production (see ADR 010)
+    uint256 deposit;          // in token base units (USDC: 6 decimals for PoC)
     uint256 claimedAmount;    // cumulative amount claimed via vouchers
     uint256 openedAt;
     uint256 expiresAt;
@@ -231,12 +231,12 @@ struct Channel {
 }
 ```
 
-**Channel ID:** `channelId = keccak256(abi.encodePacked(client, provider, stablecoin, nonce))` where `nonce` is a per-client counter. Allows multiple channels between the same client-node pair (e.g., one in USDC and one in DAI).
+**Channel ID:** `channelId = keccak256(abi.encodePacked(client, provider, nonce))` where `nonce` is a per-client counter. Allows multiple channels between the same client-node pair.
 
 ```solidity
 interface IStablePaymentChannel {
     // Channel lifecycle
-    function openChannel(address provider, address stablecoin, uint256 deposit) external returns (bytes32 channelId);
+    function openChannel(address provider, uint256 deposit) external returns (bytes32 channelId);
     function topUp(bytes32 channelId, uint256 additionalDeposit) external;
     function closeChannel(bytes32 channelId, uint256 amount, uint256 nonce, bytes calldata signature) external;
     function disputeChannel(bytes32 channelId, uint256 amount, uint256 nonce, bytes calldata signature) external;
@@ -245,15 +245,13 @@ interface IStablePaymentChannel {
     // Views
     function getChannel(bytes32 channelId) external view returns (Channel memory);
     function getEffectiveFee(address provider) external view returns (uint256 bps);
-    function isAllowedStablecoin(address token) external view returns (bool);
 
     // Governance
     function setFeePercentage(uint256 bps) external;
-    function setAllowedStablecoin(address token, bool allowed) external;
     function setTreasuryAddress(address treasury) external;
     function setMinDeposit(uint256 amount) external;
     function setDisputeWindow(uint256 seconds_) external;
-    function setRateBounds(address stablecoin, uint256 deliveryFloor, uint256 deliveryCeiling) external;
+    function setRateBounds(uint256 deliveryFloor, uint256 deliveryCeiling) external;
 }
 ```
 
@@ -267,20 +265,20 @@ interface IStablePaymentChannel {
 | Rate floor | 0 | Must be < ceiling |
 | Rate ceiling | Must be > floor | No max |
 
-**Rate bounds are per-stablecoin.** The contract stores `mapping(address => RateBounds)` where `RateBounds` contains floor/ceiling in that stablecoin's base units. USDC bounds are in 6-decimal units, DAI bounds are in 18-decimal units, each set independently.
+**Rate bounds are in USDC base units (6 decimals) for the PoC.** The contract stores a single `RateBounds` struct with `deliveryFloor` and `deliveryCeiling`. Per-token rate bounds are deferred to [ADR 010](010-multi-token.md).
 
 ### BuybackBurner
 
 ```solidity
 interface IBuybackBurner {
-    function executeBuyback(address stablecoin, uint256 amount, uint256 minTokenOut) external;
+    function executeBuyback(address token, uint256 amount, uint256 minTokenOut) external;
     function setKeeper(address keeper) external;
     function setSwapRouter(address router) external;
     function setSlippageTolerance(uint256 bps) external;
     function setMinBuybackAmount(uint256 amount) external;
     function setMaxBuybackAmount(uint256 amount) external;
     function keeper() external view returns (address);
-    function getAccumulatedFees(address stablecoin) external view returns (uint256);
+    function getAccumulatedFees(address token) external view returns (uint256);
 }
 ```
 
@@ -316,7 +314,7 @@ The domain separator binds every voucher to a specific contract deployment on a 
 
 ```solidity
 bytes32 constant VOUCHER_TYPEHASH = keccak256(
-    "Voucher(bytes32 channelId,uint256 amount,uint256 nonce,address stablecoin)"
+    "Voucher(bytes32 channelId,uint256 amount,uint256 nonce,address token)"
 );
 ```
 
@@ -326,7 +324,7 @@ bytes32 constant VOUCHER_TYPEHASH = keccak256(
 bytes32 digest = keccak256(abi.encodePacked(
     "\x19\x01",
     DOMAIN_SEPARATOR,
-    keccak256(abi.encode(VOUCHER_TYPEHASH, channelId, amount, nonce, stablecoin))
+    keccak256(abi.encode(VOUCHER_TYPEHASH, channelId, amount, nonce, token))
 ));
 ```
 
@@ -380,35 +378,19 @@ This is a soft signal, not a hard gate. Non-staking clients still get served, ju
 
 ## Decimal Handling
 
-USDC uses 6 decimals, TOKEN uses 18, DAI uses 18. The `incentive` crate handles this with a currency abstraction:
+USDC uses 6 decimals; TOKEN uses 18 decimals. All payment amounts in the `incentive` crate use USDC base units (µUSDC). The voucher signing code uses raw base units — no decimal conversion in the signature path to avoid precision bugs.
 
-```rust
-enum Currency {
-    Native { decimals: u8 },                       // TOKEN, 18 decimals
-    Stable { address: Address, decimals: u8 },     // USDC (6), DAI (18), etc.
-}
-```
+Multi-token decimal abstraction (a `Currency` enum covering arbitrary ERC-20 decimals) is deferred to [ADR 010](010-multi-token.md).
 
-All amount formatting, parsing, and display go through this abstraction. The voucher signing code uses raw base units — no decimal conversion in the signature path to avoid precision bugs.
-
-**Voucher format change for stablecoin channels:**
+**Voucher format:**
 
 ```
-{channelId, amount, nonce, stablecoin, signature}
+{channelId, amount, nonce, token, signature}
 ```
 
 During delivery over `cdn/client/v1`, only `{signature, amount}` are transmitted on the wire; the remaining fields are derived from stream context. See [ADR 005](005-protocol.md) for wire protocol details.
 
-The `stablecoin` field (ERC-20 address) is included in the signed EIP-712 typed data to prevent cross-token replay attacks. The full EIP-712 type definition and domain separator are specified in [EIP-712 Voucher Signature](#eip-712-voucher-signature). The streaming protocol includes a `ChannelType` discriminator:
-
-```rust
-enum ChannelType {
-    NativeToken,                           // legacy
-    Stablecoin { address: Address },       // new
-}
-```
-
-Nodes and clients negotiate channel type during the `StreamRequest`/`StreamResponse` handshake.
+The `token` field (ERC-20 address) is included in the signed EIP-712 typed data to prevent cross-token replay attacks. For the PoC, this field is hardcoded to the USDC contract address. The full EIP-712 type definition and domain separator are specified in [EIP-712 Voucher Signature](#eip-712-voucher-signature).
 
 ## Stablecoin Migration Path
 
@@ -419,8 +401,8 @@ No breaking changes. Both channel types coexist.
 1. Deploy `StablePaymentChannel` and `BuybackBurner` on Arbitrum Sepolia
 2. Add stablecoin rate fields to gossip messages (backward compatible — old fields remain, new fields are `Option`)
 3. Update `incentive` crate to support both `PaymentChannel` (token) and `StablePaymentChannel` (stablecoin), selected by config
-4. Nodes opt in by setting `accepted_stablecoins` in config
-5. Clients prefer stablecoin channels when available, fall back to token channels
+4. Nodes opt in by setting `accepted_tokens` in config
+5. Clients prefer USDC channels when available, fall back to TOKEN channels
 
 ### Phase 2: Stablecoin-Preferred (2–3 months)
 
