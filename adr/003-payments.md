@@ -337,10 +337,28 @@ The `DOMAIN_SEPARATOR` is computed once in the constructor and stored as an immu
 The full node registry interface (`NodeInfo`, `registerNode`, `getActiveNodes`, etc.) is defined in ADR 001. The additions below are payment-specific extensions:
 
 ```solidity
-// Fee discount check
+// Fee discount check — divides by minStake so the result scales with governance changes
 function getStakeMultiple(address provider) external view returns (uint256) {
     return stakes[provider].amount / minStake;
 }
+```
+
+`StablePaymentChannel.getEffectiveFee` calls this function and compares against the multiplier threshold (not a hardcoded absolute amount):
+
+```solidity
+uint256 constant DISCOUNT_MULTIPLE = 10;
+
+function getEffectiveFee(address provider) external view returns (uint256 bps) {
+    if (stakingRegistry.getStakeMultiple(provider) >= DISCOUNT_MULTIPLE) {
+        return feePercentage / 2; // 1.5% when base fee is 3%
+    }
+    return feePercentage;
+}
+```
+
+This ensures the discount threshold (currently 10 × 1,000 = 10,000 TOKEN) stays correct if governance changes `minStake`.
+
+```solidity
 
 // Client staking (optional, no slashing)
 mapping(address => uint256) public clientStakes;

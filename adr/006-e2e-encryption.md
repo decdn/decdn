@@ -225,6 +225,21 @@ Each blob is re-encrypted per client, producing different ciphertexts and differ
 
 Rejected because it destroys global content-addressing. The same track would have a different hash per client, breaking CDN caching, deduplication, and gossip announcements.
 
+## PoC Scope
+
+| Aspect | PoC | Production |
+| --- | --- | --- |
+| E2E encryption | Not implemented. Content is delivered as plaintext blobs. | Full implementation as described |
+| Epoch key rotation | N/A | 5-minute rotation via BLAKE3_KDF |
+| Key delivery infrastructure | N/A | WebSocket/SSE persistent connection |
+| Sealed envelopes | N/A | XChaCha20-Poly1305 + crypto_box_seal |
+| Offline leases | N/A | 30-day TTL, device-bound keys |
+| Device attestation | N/A | iOS Secure Enclave, Android Keystore |
+| Audio watermarking | N/A | Per-account |
+| App server key store | N/A | KMS/HSM-protected |
+
+For PoC, no action items from this ADR are required. Content-addressed blobs are stored and served as plaintext. The CDN protocol, payment channels, and caching are unchanged regardless of whether encryption is applied at the application layer. This ADR documents the post-PoC design so that the protocol and contract interfaces remain forward-compatible.
+
 ## Consequences
 
 **Positive:**

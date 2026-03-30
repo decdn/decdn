@@ -36,7 +36,7 @@ Stake is slashable for: (1) serving data that fails BLAKE3 hash verification, (2
 
 Minimum stake is 1,000 TOKEN with a 7-day unbonding period. Stake remains slashable during unbonding to prevent slash-then-run.
 
-**Fee discount:** Providers staking ≥10× the minimum (10,000 TOKEN) pay a 1.5% protocol fee instead of 3%. This creates a direct financial return on holding more TOKEN and rewards long-term network commitment.
+**Fee discount:** Providers staking ≥10× the minimum stake pay a 1.5% protocol fee instead of 3%. The contract checks `StakingRegistry.getStakeMultiple(provider) >= 10` rather than a hardcoded absolute amount, so the discount threshold scales automatically if governance changes the minimum stake (see [ADR 003](003-payments.md#stakingregistry-modifications)). This creates a direct financial return on holding more TOKEN and rewards long-term network commitment.
 
 **Governance:** See [ADR 009](009-governance.md). All economic parameters (fee %, rate bounds, slash percentages, dispute window) are governable within hardcoded safety bounds. During the PoC, a single admin key controls all parameters.
 
