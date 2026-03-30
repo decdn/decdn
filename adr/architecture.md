@@ -32,7 +32,10 @@ graph TD
         C3[Client]
     end
 
-    S3[("Hidden Origin Backend<br/>S3 / R2 / B2")]
+    subgraph "Provider Infrastructure (external)"
+        S3[("Hidden Origin Backend<br/>S3 / R2 / B2")]
+        A["App Server<br/>(ADR 006)"]
+    end
 
     N1 <-->|"cdn/client/v1<br/>paid per-MB USDC"| N2
     N2 <-->|"cdn/client/v1<br/>paid per-MB USDC"| N3
@@ -46,6 +49,11 @@ graph TD
 
     N1 <-.->|"iroh-gossip<br/>NodeAnnounce"| N2
     N2 <-.->|"iroh-gossip<br/>NodeAnnounce"| N3
+
+    S3 -.->|"K_blob at ingest"| A
+    A -.->|"WebSocket/SSE<br/>epoch keys + sealed envelopes"| C1
+    A -.->|"WebSocket/SSE<br/>epoch keys + sealed envelopes"| C2
+    A -.->|"WebSocket/SSE<br/>epoch keys + sealed envelopes"| C3
 ```
 
 Clients probe candidate nodes, pick the best by `rate_per_mb × rtt_ms`, stream over `cdn/client/v1`, and pay via off-chain USDC vouchers. On a cache miss, a node discovers providers via probe fan-out (`cdn/probe/v1` to all known peers), selects the best, and pulls via `cdn/client/v1` (paid). Every byte delivered — whether client→node or node→node — is paid.
@@ -106,13 +114,15 @@ TOKEN is not used for payments. All nodes must stake TOKEN to participate. Staki
 
 `redirect` in `StreamResponse` always points to a NodeId, never an external URL. The origin backend is never revealed.
 
+**Note:** Epoch key delivery (ADR 006) uses WebSocket/SSE over standard HTTPS, not an iroh QUIC ALPN. The app server is an external component operated by the content provider; see [External Components](#external-components).
+
 ---
 
 ### [ADR 006 — End-to-End Encryption and Key Distribution](006-e2e-encryption.md)
 
 **Envelope encryption with epoch-rotated key distribution.**
 
-Each blob is encrypted once at ingest with a random symmetric key (XChaCha20-Poly1305). The ciphertext is content-addressed and cached normally — one hash, one copy for all clients. An app server gates access: on each play request it wraps the blob key with a rotating epoch key and seals it to the client's public key. Epoch keys are pushed over an authenticated persistent connection; closing the connection revokes access within one epoch (5 minutes). CDN nodes only ever see ciphertext.
+Each blob is encrypted once at ingest with a random symmetric key (XChaCha20-Poly1305). The ciphertext is content-addressed and cached normally — one hash, one copy for all clients. An **app server** — an external component operated by the content provider, outside the CDN protocol and crate structure — gates access: on each play request it wraps the blob key with a rotating epoch key and seals it to the client's public key. Epoch keys are pushed over an authenticated persistent connection (WebSocket/SSE over HTTPS); closing the connection revokes access within one epoch (5 minutes). CDN nodes only ever see ciphertext. See [External Components](#external-components) for the app server's role and deployment model.
 
 ---
 
@@ -259,6 +269,9 @@ decdn/
 │   └── contracts/                # Solidity contracts + Foundry
 ├── tests/                        # Integration tests
 └── adr/                          # Architecture decision records
+# The app server (ADR 006) is an external component, not part of this workspace.
+# Content providers build it using their own stack. A reference implementation
+# may be provided as a separate repository.
 ```
 
 ### Dependency Chain
@@ -305,6 +318,30 @@ graph TD
 ```
 
 `protocol` is the leaf crate with minimal dependencies. Everything depends on it; it depends on almost nothing. The cache and incentive layers are separate crates — the cache layer works without incentives (useful for testing, local dev, private deployments). The incentive layer wraps cache operations with payment logic. The `node` crate wires them together.
+
+---
+
+## External Components
+
+Components referenced by ADRs that are operated by content providers, not part of the CDN protocol or workspace.
+
+### App Server ([ADR 006](006-e2e-encryption.md))
+
+The app server is a traditional web service operated by the content provider (e.g., a streaming platform's backend). It is **not** part of the decentralized CDN — it does not participate in gossip, probing, or paid delivery.
+
+**Responsibilities:**
+
+- Stores blob encryption keys (`K_blob`) received from the origin at ingest time
+- Authenticates client sessions and validates subscription status
+- Delivers epoch keys over an authenticated persistent connection (WebSocket or SSE)
+- Issues sealed envelopes (`crypto_box_seal`) containing wrapped `K_blob` on play requests
+- Issues offline playback leases (sealed to device keys)
+
+**Why WebSocket/SSE, not iroh QUIC:** The app server intentionally sits outside the iroh ecosystem. It handles subscription billing, OAuth/session auth, and key management — traditional web service concerns. Content providers integrate it with their existing infrastructure (load balancers, API gateways, auth systems). Requiring iroh QUIC would couple the provider's application backend to the CDN networking stack without protocol benefit. The watchtower ([ADR 007](007-watchtower.md)) uses iroh QUIC because it is a CDN protocol participant; the app server is not.
+
+**Scaling model:** One persistent connection per active subscriber. Standard WebSocket scaling applies (sticky sessions or pub/sub fanout). The app server scales with subscriber count, not CDN node count.
+
+**PoC scope:** A minimal reference implementation may be provided in a separate repository. The CDN crates do not depend on it.
 
 ---
 
