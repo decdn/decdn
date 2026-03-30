@@ -27,9 +27,34 @@ A channel is opened by depositing USDC into the `StablePaymentChannel` contract.
 Key parameters:
 
 - Voucher cadence: 1 MB delivered per voucher
-- Minimum deposit: 1 USDC (covers ~100,000 MB at floor rate, far more than any practical session)
+- Minimum deposit: 1 USDC (contract floor, governable); recommended practical minimum: 10 USDC (see [Deposit Economics](#deposit-economics))
 - Protocol fee: 3% deducted at channel settlement, sent to treasury
 - Fee discount: nodes staking ≥10× the minimum TOKEN stake pay 1.5% instead of 3%
+
+### Deposit Economics
+
+Opening, closing, and settling a channel requires three on-chain transactions totalling ~$0.23 on Arbitrum L2 (see [ADR 004](004-tokenomics.md) gas breakdown: `openChannel` ~$0.05, `closeChannel` ~$0.10, `settleChannel` ~$0.08). This estimate assumes an existing ERC-20 approval; first-time users incur an additional one-time `approve` transaction (~$0.03), bringing the true first-channel cost to ~$0.26. The table below uses the $0.23 lifecycle cost (excluding the one-time approval) as a percentage of various deposit sizes, with the optional watchtower minimum fee from [ADR 007](007-watchtower.md) modeled as a single 30-day monitoring period:
+
+| Deposit | Lifecycle gas ($0.23) | Gas % of deposit | + Watchtower ($0.50 / 30 days, optional) | Total overhead % (1 monitoring period) |
+|---------|----------------------|------------------|------------------------------------------|----------------------------------------|
+| 1 USDC  | $0.23                | 23%              | $0.50                                    | 73%                                    |
+| 5 USDC  | $0.23                | 4.6%             | $0.50                                    | 14.6%                                  |
+| 10 USDC | $0.23                | 2.3%             | $0.50                                    | 7.3%                                   |
+| 25 USDC | $0.23                | 0.92%            | $0.50                                    | 2.9%                                   |
+| 100 USDC| $0.23                | 0.23%            | $0.50                                    | 0.73%                                  |
+
+**Recommended practical minimum: 10 USDC.** Client software should default to a 10 USDC minimum deposit (user-overridable). At 10 USDC, gas overhead is 2.3% — acceptable for a payment channel that covers ~10,000,000 MB at the floor rate or ~1,000,000 MB (~1,000 GB) at the expected market rate ($0.01/GB), sufficient for weeks to months of casual use without top-up. The contract minimum (1 USDC, governable via `setMinDeposit`) remains a safety floor — it prevents dust channels that cost more to settle than they contain and preserves flexibility for testing and governance adjustment. Raising the contract minimum is not recommended because it would reduce governance flexibility and create a hard barrier for development/testing scenarios where small deposits are useful.
+
+**Amortization.** The overhead percentages above represent worst-case single-session economics. Long-lived channels amortize open/settle costs across many sessions: a channel used for 30 sessions costs ~$0.008/session in gas ([ADR 004](004-tokenomics.md)). Channels extended via `topUp` amortize further since only the initial open and final settle incur gas.
+
+#### Future: Gasless Channel Opens
+
+Two standards can eliminate the requirement for clients to hold native L2 tokens (ETH on Arbitrum) for gas, improving onboarding:
+
+- **ERC-2771 meta-transactions.** A relayer submits the `openChannel` transaction on behalf of the client, paying gas. The client signs an ERC-2771 forwarding request; the relayer recoups gas from the deposit or a separate sponsorship fund. Requires adding a trusted-forwarder check to the contract.
+- **ERC-4337 account abstraction.** Smart contract wallets batch USDC approval + channel open into a single user operation. A paymaster can sponsor gas in USDC rather than ETH. Works with unmodified contracts — no changes to `StablePaymentChannel` needed.
+
+Both are deferred to post-PoC. For the PoC, clients must hold both USDC and a small amount of ETH for gas.
 
 ### Fee Calculation on Disputed Closes
 
@@ -70,7 +95,7 @@ This means the network self-balances: popular content gets replicated because ca
 
 **Negative:**
 
-- Clients must hold USDC to use the network; this adds an onboarding step compared to a single-token model
+- Clients must hold USDC and native L2 tokens for gas to use the network; this adds an onboarding step compared to a single-token model. At the recommended 10 USDC practical minimum, channel lifecycle gas ($0.23) is 2.3% overhead — acceptable but non-negligible for first-time users. Gasless channel opens via meta-transactions or account abstraction can eliminate the native token requirement post-PoC (see [Deposit Economics](#deposit-economics))
 - Rate volatility: a node can change its advertised rate between a probe and a stream request; the `StreamResponse` rate is the binding one, but a client that probed at one rate and receives a higher rate in `StreamResponse` must disconnect and re-probe rather than having been deceived silently. Rate changes more than 30 seconds after the probe are not slashable; the 30-second window is precisely defined as `stream_response.timestamp_us >= probe_response.timestamp_us && stream_response.timestamp_us - probe_response.timestamp_us < 30_000_000` using requester-anchored timestamps in both signed messages (see ADR 005)
 - Two payment contracts coexist during migration (legacy `PaymentChannel` for TOKEN, `StablePaymentChannel` for USDC), doubling audit surface temporarily
 - USDC is issued by Circle, which can freeze specific addresses or blacklist the contract. For the PoC this risk is accepted; multi-token payment support to mitigate it is deferred to [ADR 010](010-multi-token.md)
@@ -90,7 +115,7 @@ The self-enforcing stop is sufficient. Maximum loss is one interval (1 MB × rat
 **Channel griefing**
 Client opens many channels with minimum deposit and never streams, forcing nodes to track and eventually close stale channels.
 
-The current mitigation (auto-expire + deposit > gas cost) limits financial loss to the attacker but does not bound the memory overhead on the node. An attacker with modest capital can hold thousands of open-but-idle channels in the node's tracking state for up to 30 days. Options:
+The current mitigation (auto-expire + deposit > gas cost) limits financial loss to the attacker but does not bound the memory overhead on the node. At the recommended 10 USDC practical minimum, an attacker spending $1,000 can open only 100 griefing channels (each auto-expiring); at the 1 USDC contract minimum, the same capital opens 1,000 channels but each channel's deposit still exceeds its settlement gas cost. Options:
 
 - **Option A — Inactivity expiry.** Channels with no voucher submitted within the first 7 days auto-expire, rather than the full 30-day channel lifetime. Reduces the attack window significantly at no cost to normal users.
 - **Option B — On-chain channel cap per address.** The `StablePaymentChannel` contract enforces a maximum number of open channels per client Ethereum address (e.g., 10). Hard to circumvent without new wallet addresses, each requiring on-chain funding.
