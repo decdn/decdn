@@ -44,7 +44,18 @@ event ChannelDisputed(
     uint256 newAmount,
     uint256 newNonce
 );
+
+event ChannelSettled(
+    bytes32 indexed channelId,
+    uint256 providerPayout,
+    uint256 clientRefund,
+    uint256 protocolFee
+);
 ```
+
+Watchtowers use `ChannelCloseInitiated` and `ChannelDisputed` for active dispute intervention. `ChannelSettled` signals that the dispute window has closed and the channel is finalised — watchtowers use this to stop monitoring the channel and clean up stored voucher state.
+
+A successful `disputeChannel` call updates the on-chain `claimedAmount`, which changes the protocol fee computed at final settlement. See [ADR 003 — Fee Calculation on Disputed Closes](003-payments.md#fee-calculation-on-disputed-closes) for the full lifecycle.
 
 No separate watchtower registry contract is needed. The watchtower relationship is purely off-chain — the watched party shares voucher state with the watchtower, and the watchtower submits disputes using its own EOA and gas.
 
@@ -150,7 +161,7 @@ flowchart TD
 | --- | --- | --- |
 | Watchtower service | Not implemented | Required |
 | `disputeChannel` access | No sender restriction (future-proof) | Same |
-| Contract events | `ChannelCloseInitiated`, `ChannelDisputed` emitted | Same |
+| Contract events | `ChannelCloseInitiated`, `ChannelDisputed`, `ChannelSettled` emitted | Same |
 | Local dispute monitor | Recommended | Required |
 | Discovery | N/A | Config-based → gossip → on-chain registry |
 | Redundancy | N/A | 2–3 per channel |
@@ -160,7 +171,7 @@ flowchart TD
 For PoC, the only action items are:
 
 1. Ensure `disputeChannel` has no `msg.sender` restriction — voucher signature is the only authorisation
-2. Emit `ChannelCloseInitiated` and `ChannelDisputed` events
+2. Emit `ChannelCloseInitiated`, `ChannelDisputed`, and `ChannelSettled` events
 3. Optionally implement the local dispute monitor thread (Option C from ADR 003)
 
 These three items future-proof the contract and node software for watchtower integration without implementing the watchtower service itself.

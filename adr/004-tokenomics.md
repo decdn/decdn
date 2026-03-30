@@ -131,7 +131,7 @@ If a node's stake drops below 50% of the minimum stake requirement due to accumu
 
 ## Fee Allocation
 
-Protocol fees (3%, collected in USDC at channel close) are allocated:
+Protocol fees (3%, collected in USDC at channel settlement — see [ADR 003](003-payments.md#fee-calculation-on-disputed-closes)) are allocated:
 
 | Use | % of Fees | Currency | Mechanism |
 | --- | --- | --- | --- |
@@ -141,7 +141,7 @@ Protocol fees (3%, collected in USDC at channel close) are allocated:
 | Token buyback & burn | 20% | USDC → TOKEN → burn | Via `BuybackBurner` contract |
 
 ```mermaid
-pie title Protocol Fee Allocation (3% at channel close)
+pie title Protocol Fee Allocation (3% at channel settlement)
     "Development Fund" : 40
     "Bug Bounties & Audits" : 20
     "Ecosystem Grants" : 20
@@ -236,10 +236,11 @@ At any reasonable TOKEN price, these amounts are a tiny fraction of the 200M TOK
 | `stake()` | ~100k gas | ~$0.05 |
 | `openChannel()` | ~150k gas | ~$0.05 |
 | `closeChannel()` | ~200k gas | ~$0.10 |
+| `settleChannel()` | ~150k gas | ~$0.08 |
 | `submitFraudProof()` | ~250k gas | ~$0.10 |
 | `withdraw()` | ~80k gas | ~$0.05 |
 
-Payment channels amortize gas effectively. A channel open for 30 sessions costs $0.15 total (open + close) = $0.005 per session.
+Payment channels amortize gas effectively. A channel open for 30 sessions costs $0.23 total (open + close + settle) = ~$0.008 per session. `settleChannel` is callable by any address, so settlement bots or the counterparty can trigger it.
 
 ## Governance
 

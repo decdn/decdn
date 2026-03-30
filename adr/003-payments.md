@@ -19,17 +19,30 @@ Payments use **unidirectional off-chain payment channels settled on an EVM L2, d
 
 The same channel mechanism operates at two tiers:
 
-- **Client → node**: a client opens a USDC channel with a node, signs cumulative vouchers as MB are delivered, and the node closes the channel on-chain to claim payment.
+- **Client → node**: a client opens a USDC channel with a node, signs cumulative vouchers as MB are delivered, and the node initiates channel close on-chain and settles to claim payment after the dispute window.
 - **Node → node**: when a node pulls content from another node (typically an origin-backed node) for the first time, it pays via the same channel mechanism. The origin-backed node is paid wholesale; the pulling node recoups this by serving multiple clients from its cache at a markup.
 
-A channel is opened by depositing USDC into the `StablePaymentChannel` contract. As content is delivered, the payer signs cumulative vouchers off-chain — one voucher per MB received. The delivering node holds the latest voucher and submits it on-chain to close the channel. A 24-hour dispute window allows either party to counter a stale or fraudulent close attempt.
+A channel is opened by depositing USDC into the `StablePaymentChannel` contract. As content is delivered, the payer signs cumulative vouchers off-chain — one voucher per MB received. The delivering node holds the latest voucher and submits it on-chain to initiate channel close. A 24-hour dispute window allows either party to counter a stale or fraudulent close attempt. After the dispute window expires, the channel is settled and funds are distributed.
 
 Key parameters:
 
 - Voucher cadence: 1 MB delivered per voucher
 - Minimum deposit: 1 USDC (covers ~100,000 MB at floor rate, far more than any practical session)
-- Protocol fee: 3% deducted at channel close, sent to treasury
+- Protocol fee: 3% deducted at channel settlement, sent to treasury
 - Fee discount: nodes staking ≥10× the minimum TOKEN stake pay 1.5% instead of 3%
+
+### Fee Calculation on Disputed Closes
+
+The protocol fee is calculated **at final settlement**, after the dispute window expires, based on the highest valid voucher amount on-chain at that point. The three-step channel close lifecycle is:
+
+1. **`closeChannel`** — records the submitted voucher's `amount` in `claimedAmount` and `nonce` in `claimedNonce`, sets status to `Closing`, starts the dispute window. **No fee is deducted.**
+2. **`disputeChannel`** (during dispute window) — if the submitted voucher has a strictly higher nonce, updates both `claimedAmount` and `claimedNonce` to the new values. Still **no fee deduction**. Submissions with an equal or lower nonce revert with no state change and no fee implications.
+3. **`settleChannel`** (after dispute window expires) — callable by anyone. Computes the fee on the final `claimedAmount`, distributes funds, and sets status to `Closed`:
+   - Provider receives: `claimedAmount - fee`
+   - Treasury receives: `fee = claimedAmount × feePercentage / 10000`
+   - Client receives refund: `deposit - claimedAmount`
+
+This means a dispute that increases the settlement amount (e.g., from 50 USDC to 80 USDC) automatically increases the protocol fee (from 1.50 USDC to 2.40 USDC at 3%). The fee is always computed once, on the final settled amount — never on intermediate values and never more than once per channel.
 
 The native token (TOKEN) is not used for delivery payments. It is reserved for staking and fee discount qualification (see ADR 004) and governance (see [ADR 009](009-governance.md)).
 
@@ -48,7 +61,7 @@ This means the network self-balances: popular content gets replicated because ca
 
 **Positive:**
 
-- On-chain costs are amortized across an entire channel lifetime — open + close = two transactions regardless of how many MB are delivered
+- On-chain costs are amortized across an entire channel lifetime — open + close + settle = three transactions regardless of how many MB are delivered (settle can be called by any address, allowing third-party settlement bots)
 - USDC denomination gives node operators predictable unit economics: delivery revenue covers infrastructure costs without exposure to TOKEN price movements
 - The voucher is the payment receipt; the BLAKE3 hash is the delivery receipt. Together they provide mutual protection: the client doesn't sign a voucher for bytes that fail hash verification; the node stops delivering if vouchers stop arriving
 - Maximum risk per voucher interval (1 MB) at $0.00001/MB is $0.00001 — negligible
@@ -226,9 +239,10 @@ struct Channel {
     address token;            // hardcoded to USDC for PoC; any ERC-20 in production (see ADR 010)
     uint256 deposit;          // in token base units (USDC: 6 decimals for PoC)
     uint256 claimedAmount;    // cumulative amount claimed via vouchers
+    uint256 claimedNonce;     // nonce of the current best voucher, for dispute comparison
     uint256 openedAt;
     uint256 expiresAt;
-    uint8   status;           // Open, Closing, Closed
+    uint8   status;           // 0 = Open, 1 = Closing (dispute window active), 2 = Closed (settled)
     uint256 disputeDeadline;  // set when close is initiated
 }
 ```
@@ -242,6 +256,7 @@ interface IStablePaymentChannel {
     function topUp(bytes32 channelId, uint256 additionalDeposit) external;
     function closeChannel(bytes32 channelId, uint256 amount, uint256 nonce, bytes calldata signature) external;
     function disputeChannel(bytes32 channelId, uint256 amount, uint256 nonce, bytes calldata signature) external;
+    function settleChannel(bytes32 channelId) external;
     function reclaimExpired(bytes32 channelId) external;
 
     // Views
@@ -256,6 +271,37 @@ interface IStablePaymentChannel {
     function setRateBounds(uint256 deliveryFloor, uint256 deliveryCeiling) external;
 }
 ```
+
+**Channel close events:**
+
+```solidity
+event ChannelCloseInitiated(
+    bytes32 indexed channelId,
+    address indexed initiator,
+    uint256 amount,
+    uint256 nonce,
+    uint256 disputeDeadline
+);
+
+event ChannelDisputed(
+    bytes32 indexed channelId,
+    address indexed disputor,
+    uint256 newAmount,
+    uint256 newNonce
+);
+
+event ChannelSettled(
+    bytes32 indexed channelId,
+    uint256 providerPayout,
+    uint256 clientRefund,
+    uint256 protocolFee
+);
+```
+
+**Channel close lifecycle:**
+- `closeChannel` → requires status `Open`. Sets status to `Closing`, records voucher, emits `ChannelCloseInitiated`. No fund transfers.
+- `disputeChannel` → requires status `Closing` and `block.timestamp < disputeDeadline`. Accepts only vouchers with strictly higher nonce. Updates `claimedAmount`, emits `ChannelDisputed`. No fund transfers.
+- `settleChannel` → requires status `Closing` and `block.timestamp >= disputeDeadline`. Computes fee on final `claimedAmount`, transfers funds to provider/treasury/client, sets status to `Closed`, emits `ChannelSettled`.
 
 **Safety bounds (hardcoded):**
 
