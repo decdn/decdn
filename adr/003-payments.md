@@ -19,7 +19,7 @@ Payments use **unidirectional off-chain payment channels settled on an EVM L2, d
 
 The same channel mechanism operates at two tiers:
 
-- **Client → node**: a client opens a USDC channel with a node, signs cumulative vouchers as MB are delivered, and the node closes the channel on-chain to claim payment.
+- **Client → node**: a client opens a USDC channel with a node, signs cumulative vouchers as MB are delivered, and the node initiates channel close on-chain and settles to claim payment after the dispute window.
 - **Node → node**: when a node pulls content from another node (typically an origin-backed node) for the first time, it pays via the same channel mechanism. The origin-backed node is paid wholesale; the pulling node recoups this by serving multiple clients from its cache at a markup.
 
 A channel is opened by depositing USDC into the `StablePaymentChannel` contract. As content is delivered, the payer signs cumulative vouchers off-chain — one voucher per MB received. The delivering node holds the latest voucher and submits it on-chain to initiate channel close. A 24-hour dispute window allows either party to counter a stale or fraudulent close attempt. After the dispute window expires, the channel is settled and funds are distributed.
@@ -36,7 +36,7 @@ Key parameters:
 The protocol fee is calculated **at final settlement**, after the dispute window expires, based on the highest valid voucher amount on-chain at that point. The three-step channel close lifecycle is:
 
 1. **`closeChannel`** — records the submitted voucher's `amount` in `claimedAmount` and `nonce` in `claimedNonce`, sets status to `Closing`, starts the dispute window. **No fee is deducted.**
-2. **`disputeChannel`** (during dispute window) — if the submitted voucher has a strictly higher nonce, updates `claimedAmount` to the new `amount`. Still **no fee deduction**. Submissions with an equal or lower nonce revert with no state change and no fee implications.
+2. **`disputeChannel`** (during dispute window) — if the submitted voucher has a strictly higher nonce, updates both `claimedAmount` and `claimedNonce` to the new values. Still **no fee deduction**. Submissions with an equal or lower nonce revert with no state change and no fee implications.
 3. **`settleChannel`** (after dispute window expires) — callable by anyone. Computes the fee on the final `claimedAmount`, distributes funds, and sets status to `Closed`:
    - Provider receives: `claimedAmount - fee`
    - Treasury receives: `fee = claimedAmount × feePercentage / 10000`

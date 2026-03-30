@@ -53,7 +53,7 @@ event ChannelSettled(
 );
 ```
 
-Watchtowers use `ChannelCloseInitiated` and `ChannelDisputed` for active dispute intervention. `ChannelSettled` signals that the dispute window has closed and the channel is finalized — watchtowers use this to stop monitoring the channel and clean up stored voucher state.
+Watchtowers use `ChannelCloseInitiated` and `ChannelDisputed` for active dispute intervention. `ChannelSettled` signals that the dispute window has closed and the channel is finalised — watchtowers use this to stop monitoring the channel and clean up stored voucher state.
 
 A successful `disputeChannel` call updates the on-chain `claimedAmount`, which changes the protocol fee computed at final settlement. See [ADR 003 — Fee Calculation on Disputed Closes](003-payments.md#fee-calculation-on-disputed-closes) for the full lifecycle.
 
@@ -171,7 +171,7 @@ flowchart TD
 For PoC, the only action items are:
 
 1. Ensure `disputeChannel` has no `msg.sender` restriction — voucher signature is the only authorisation
-2. Emit `ChannelCloseInitiated` and `ChannelDisputed` events
+2. Emit `ChannelCloseInitiated`, `ChannelDisputed`, and `ChannelSettled` events
 3. Optionally implement the local dispute monitor thread (Option C from ADR 003)
 
 These three items future-proof the contract and node software for watchtower integration without implementing the watchtower service itself.
