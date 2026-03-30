@@ -42,6 +42,8 @@ The native token (TOKEN) is not used for delivery payments. It is reserved for s
 
 This means the network self-balances: popular content gets replicated because caching it is profitable, competition drives prices down in well-served regions, and unpopular content stays at origin-backed node rates until demand justifies caching it. No central coordinator decides where to replicate what.
 
+**Origin backend economics:** The choice of backing store directly affects an origin-backed node's viable rate. At the expected market rate of $0.01/GB, an S3-backed node paying $0.09/GB egress loses money on every cache miss and must amortize origin pulls across a high cache-hit ratio (or price above market rate). Zero-egress backends — Cloudflare R2 ($0.00/GB), Backblaze B2 ($0.01/GB via CDN partners), and Wasabi ($0.00/GB) — allow origin-backed nodes to remain profitable at or near market rates. Operators choosing high-egress backends should expect to set higher `rate_per_mb` values to cover their costs, which the market tolerates for content that is not yet cached elsewhere.
+
 ## Consequences
 
 **Positive:**
@@ -266,6 +268,15 @@ interface IStablePaymentChannel {
 | Rate ceiling | Must be > floor | No max |
 
 **Rate bounds are in USDC base units (6 decimals) for the PoC.** The contract stores a single `RateBounds` struct with `deliveryFloor` and `deliveryCeiling`. Per-token rate bounds are deferred to [ADR 010](010-multi-token.md).
+
+**Initial rate bounds (PoC):**
+
+| Parameter | Value (USD/MB) | USDC base units | Rationale |
+| --- | --- | --- | --- |
+| `deliveryFloor` | $0.000001/MB | 1 | Anti-abuse minimum; 10× below expected market rate. Prevents zero-rate free-riding while imposing no practical constraint on legitimate pricing. |
+| `deliveryCeiling` | $0.001/MB | 1,000 | 100× expected market rate. Accommodates origin-backed nodes with high-egress backends (e.g., S3 at $0.09/GB) while remaining well above any legitimate pricing scenario ($1.00/GB vs Akamai's ~$0.12–0.20/GB). |
+
+The expected market rate is $0.00001/MB (10 USDC base units per MB, or $0.01/GB). This positions deCDN 4–8× cheaper than major traditional CDNs (CloudFront at $0.085/GB, KeyCDN at $0.04/GB) and at parity with budget providers (Bunny.net at $0.01/GB). Both bounds are governable post-PoC within the hardcoded safety constraints above.
 
 ### BuybackBurner
 
