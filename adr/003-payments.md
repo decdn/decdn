@@ -91,13 +91,12 @@ This means the network self-balances: popular content gets replicated because ca
 - The voucher is the payment receipt; the BLAKE3 hash is the delivery receipt. Together they provide mutual protection: the client doesn't sign a voucher for bytes that fail hash verification; the node stops delivering if vouchers stop arriving
 - Maximum risk per voucher interval (1 MB) at $0.00001/MB is $0.00001 — negligible
 - Market-driven rate setting means replication happens organically: profitable content gets cached by more nodes, driving prices down without any coordination protocol
-- The `StablePaymentChannel` contract is isolated from the staking/slashing contract (`PaymentChannel`), keeping the audit surface for each contract bounded
+- The `StablePaymentChannel` contract is isolated from the `StakingRegistry`, keeping the audit surface for each contract bounded
 
 **Negative:**
 
 - Clients must hold USDC and native L2 tokens for gas to use the network; this adds an onboarding step compared to a single-token model. At the recommended 10 USDC practical minimum, channel lifecycle gas ($0.23) is 2.3% overhead — acceptable but non-negligible for first-time users. Gasless channel opens via meta-transactions or account abstraction can eliminate the native token requirement post-PoC (see [Deposit Economics](#deposit-economics))
 - Rate volatility: a node can change its advertised rate between a probe and a stream request; the `StreamResponse` rate is the binding one, but a client that probed at one rate and receives a higher rate in `StreamResponse` must disconnect and re-probe rather than having been deceived silently. Rate changes more than 30 seconds after the probe are not slashable; the 30-second window is precisely defined as `stream_response.timestamp_us >= probe_response.timestamp_us && stream_response.timestamp_us - probe_response.timestamp_us < 30_000_000` using requester-anchored timestamps in both signed messages (see ADR 005)
-- Two payment contracts coexist during migration (legacy `PaymentChannel` for TOKEN, `StablePaymentChannel` for USDC), doubling audit surface temporarily
 - USDC is issued by Circle, which can freeze specific addresses or blacklist the contract. For the PoC this risk is accepted; multi-token payment support to mitigate it is deferred to [ADR 010](010-multi-token.md)
 - BLAKE3 verification on EVM requires an intermediate Merkle proof scheme for PoC-era slash evidence; a client submitting a slash claim cannot directly prove BLAKE3 mismatch on-chain
 
@@ -497,38 +496,18 @@ During delivery over `cdn/client/v1`, only `{signature, amount}` are transmitted
 
 The `token` field (ERC-20 address) is included in the signed EIP-712 typed data to prevent cross-token replay attacks. For the PoC, this field is hardcoded to the USDC contract address. The full EIP-712 type definition and domain separator are specified in [EIP-712 Voucher Signature](#eip-712-voucher-signature).
 
-## Stablecoin Migration Path
+## Slashing and Channel Interactions
 
-### Phase 1: Deploy Alongside (4–6 weeks)
+Slashing and payment channels are independent by design. The following interactions apply regardless of which governance-approved tokens are in use (see [ADR 010](010-multi-token.md)).
 
-No breaking changes. Both channel types coexist.
+**Slashing does not affect channel funds.** Slashing operates exclusively on TOKEN stake in the `StakingRegistry` (see [ADR 004](004-tokenomics.md#slash-amounts-escalating)). Funds deposited into payment channels are client deposits held in escrow — they are not stake and are never touched by slashing. This follows directly from the contract isolation described in [Consequences](#consequences): the payment channel contract has no reference to `StakingRegistry`.
 
-1. Deploy `StablePaymentChannel` and `BuybackBurner` on Arbitrum Sepolia
-2. Add stablecoin rate fields to gossip messages (backward compatible — old fields remain, new fields are `Option`)
-3. Update `incentive` crate to support both `PaymentChannel` (token) and `StablePaymentChannel` (stablecoin), selected by config
-4. Nodes opt in by setting `accepted_tokens` in config
-5. Clients prefer USDC channels when available, fall back to TOKEN channels
+**Slashing can drop a node below minimum stake while channels are open.** Because channel deposits are independent of stake, a node can be slashed below the minimum stake requirement (or even to zero) while it has open channels. The channels continue their normal lifecycle — close, dispute window, settle — regardless of the node's staking status. Channel settlement is purely a function of the voucher state, not the node's registry status.
 
-### Phase 2: Stablecoin-Preferred (2–3 months)
+**Auto-ejection does not interrupt open channels.** When a node's stake drops below 50% of the minimum and auto-ejection triggers (see [ADR 004](004-tokenomics.md#auto-ejection)):
 
-1. Deploy to production L2
-2. Default client behavior: stablecoin channels if node supports them, token channels otherwise
-3. Node bootstrap fund begins distributing TOKEN bonuses on top of USDC payments
-4. Governance sets stablecoin rate bounds
-5. Fee discount mechanism goes live (nodes with ≥10× stake get 1.5% fee)
-6. Target: >80% stablecoin channels within 3 months
-
-### Phase 3: Token Channels Deprecated (1–2 months after Phase 2)
-
-1. Governance vote to disable new token channels (`PaymentChannel.openChannel()` reverts)
-2. Existing token channels settle normally — no funds trapped
-3. After 60 days with no open token channels, `PaymentChannel` is effectively retired
-
-### Rollback Plan
-
-If stablecoin channels cause unforeseen problems during Phase 1–2:
-
-- Nodes remove stablecoin rates from gossip announcements
-- Clients fall back to token channels automatically
-- `StablePaymentChannel` remains deployed but unused
-- No governance action needed — migration is market-driven, not forced
+- Open channels settle normally. Client funds are never trapped.
+- The ejected node cannot open new channels (nodes verify counterparty registration before accepting `openChannel`).
+- The ejected node is removed from gossip routing, so it receives no new client connections.
+- `closeChannel`, `disputeChannel`, and `settleChannel` remain callable on existing channels — these functions check channel state, not registry status.
+- The node must re-stake at the full minimum and re-register to resume operations.

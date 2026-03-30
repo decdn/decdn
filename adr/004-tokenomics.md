@@ -129,6 +129,8 @@ If a node's stake drops below 50% of the minimum stake requirement due to accumu
 - Remaining stake enters forced unbonding (standard unbonding period applies)
 - Node must re-stake at full minimum to rejoin
 
+Open payment channels are unaffected by ejection — see [ADR 003](003-payments.md#slashing-and-channel-interactions). Channel close, dispute, and settlement proceed normally; client funds are never trapped by ejection.
+
 ## Fee Allocation
 
 Protocol fees (3%, collected in USDC at channel settlement — see [ADR 003](003-payments.md#fee-calculation-on-disputed-closes)) are allocated:
