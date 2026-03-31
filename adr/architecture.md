@@ -37,13 +37,13 @@ graph TD
         A["App Server<br/>(ADR 006)"]
     end
 
-    N1 <-->|"cdn/client/v1<br/>paid per-MB USDC"| N2
-    N2 <-->|"cdn/client/v1<br/>paid per-MB USDC"| N3
-    N1 <-->|"cdn/client/v1<br/>paid per-MB USDC"| N3
+    N1 <-->|"cdn/client/v1<br/>paid per-MB"| N2
+    N2 <-->|"cdn/client/v1<br/>paid per-MB"| N3
+    N1 <-->|"cdn/client/v1<br/>paid per-MB"| N3
 
-    C1 -->|"cdn/client/v1<br/>paid per-MB USDC"| N1
-    C2 -->|"cdn/client/v1<br/>paid per-MB USDC"| N2
-    C3 -->|"cdn/client/v1<br/>paid per-MB USDC"| N3
+    C1 -->|"cdn/client/v1<br/>paid per-MB"| N1
+    C2 -->|"cdn/client/v1<br/>paid per-MB"| N2
+    C3 -->|"cdn/client/v1<br/>paid per-MB"| N3
 
     N2 -.->|opaque fetch| S3
 
@@ -98,7 +98,7 @@ Clients pay nodes per MB. On a cache miss, nodes pay origin-backed nodes per MB 
 
 **USDC for payments. TOKEN for staking and fee discounts.**
 
-TOKEN is not used for payments. All nodes must stake TOKEN to participate. Staking cost creates accountability and Sybil resistance. 20% of protocol fees buy back and burn TOKEN. Fixed supply of 1B at genesis. Challenge bonds (100 TOKEN in PoC, 50 TOKEN in production) are required for slash claims, preventing zero-cost griefing. Governance is covered separately in [ADR 009](009-governance.md).
+TOKEN is not used for payments. All nodes must stake TOKEN to participate. Staking cost creates accountability and Sybil resistance. 20% of protocol fees buy back and burn TOKEN (accumulate-only in PoC; buyback execution deferred to production). Fixed supply of 1B at genesis. Challenge bonds (100 TOKEN in PoC, 50 TOKEN in production) are required for slash claims, preventing zero-cost griefing. Governance is covered separately in [ADR 009](009-governance.md).
 
 ---
 
@@ -151,6 +151,22 @@ During the PoC, a single deployer address controls all contract parameters. Prod
 
 ---
 
+### [ADR 010 — Multi-Token Payment Support](010-multi-token.md)
+
+**Token-agnostic payments with governance-managed ERC-20 allowlist. USDC-only for PoC.**
+
+Extends ADR 003 to support multiple ERC-20 tokens. The production `PaymentChannel` contract maintains a governance-managed allowlist of approved tokens; `openChannel` reverts if the token is not on the allowlist. Per-token rate bounds are set by governance. A `payment_token` field is added to `StreamRequest` and `token_rates` replaces the single `rate_per_mb` in gossip advertisements. The EIP-712 voucher already carries a `token` field from ADR 003 — no signature scheme migration is needed. Production deploys a new `PaymentChannel` contract (not an upgrade of the PoC `StablePaymentChannel`).
+
+---
+
+### [ADR 011 — Content Takedown and Hash Blacklisting](011-content-takedown.md)
+
+**Governance-controlled on-chain hash blacklist with regional bodies and emergency fast-path.**
+
+A `ContentBlacklist` contract supports global (network-wide) and regional (jurisdiction-scoped) takedown via designated regional governance bodies. Standard governance entries have a 24-hour compliance window; the emergency multisig path takes effect immediately with a 2-hour slash window. Origin blacklisting by operator address counters hash evasion via trivial re-encoding — each re-upload requires fresh stake and a new identity. Each node also maintains a local denylist for direct legal notices. Serving a blacklisted hash after the compliance window is a slashable offense, subject to the escalating schedule in [ADR 004](004-tokenomics.md).
+
+---
+
 ## Key Invariants
 
 - No external origin URL exists — content enters the network through origin-backed nodes whose backends are hidden
@@ -160,6 +176,7 @@ During the PoC, a single deployer address controls all contract parameters. Prod
 - A node cannot register without staking — `StakingRegistry` enforces `stake >= minStake` before accepting a `registerNode` call
 - Payment channels amortize on-chain costs across an entire session; per-MB payments are off-chain
 - Safety bounds on all governable parameters are hardcoded — governance cannot set fees to 100% or stake to zero (see [ADR 009](009-governance.md))
+- A node cannot serve a blacklisted hash after the compliance window — doing so is a slashable offense (see [ADR 011](011-content-takedown.md))
 
 ---
 
@@ -170,6 +187,7 @@ During the PoC, a single deployer address controls all contract parameters. Prod
 - Search, discovery, or recommendation (see Future Work below)
 - Mobile or web clients
 - Multi-chain support (single L2 only)
+- Multi-token payment support (USDC only for PoC; see [ADR 010](010-multi-token.md))
 - Erasure coding (full replication only)
 
 ---
@@ -181,7 +199,7 @@ During the PoC, a single deployer address controls all contract parameters. Prod
 | **Blob** | A content-addressed byte sequence identified by its BLAKE3 hash |
 | **Chunk** | A 1024-byte segment of a blob used by iroh-blobs for verified streaming |
 | **Hash sequence** | An ordered collection of blob hashes (iroh's equivalent of a directory/manifest) |
-| **Voucher** | A signed off-chain payment message: `{channelId, cumulativeAmount, nonce, signature}` |
+| **Voucher** | A signed off-chain payment message: `{channelId, amount, nonce, token, signature}` |
 | **ALPN** | Application-Layer Protocol Negotiation — identifies which protocol a QUIC connection uses |
 | **Node** | A staked participant that caches and serves blobs. Some are configured with an origin backend; others are pure caches. |
 | **Client** | A lightweight QUIC endpoint that streams content and pays per MB |
