@@ -12,7 +12,7 @@ A decentralized CDN with two participant roles:
 - **Nodes** (providers) cache and serve content. They stake TOKEN to participate in the peer mesh and compete on price and latency. Some nodes are configured with an origin backend (S3, NFS, local disk) making them the canonical source for specific content — this is a deployment choice, not a protocol distinction. No external origin URL is ever exposed.
 - **Clients** consume content. They pay nodes per MB via off-chain USDC payment channels.
 
-The PoC scope is tens of nodes on a testnet, proving the core delivery and payment protocol.
+The PoC scope is tens of nodes on a testnet, proving the delivery pipeline (content discovery, probing, paid streaming) and payment channel lifecycle (open, voucher, close, dispute). Reputation, encryption, watchtowers, and governance use simplified stand-ins.
 
 ---
 

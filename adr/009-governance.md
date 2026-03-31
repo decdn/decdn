@@ -57,9 +57,12 @@ Staking, slashing, and fee parameters are defined in [ADR 004](004-tokenomics.md
 ### Emergency Multisig
 
 - 3-of-5 multisig with known, trusted signers
-- Can ONLY pause contracts (not change parameters or withdraw funds)
-- Used for exploit response and critical bug mitigation
-- Sunset: after 12 months, the pause function is permanently disabled (or requires governance vote to extend)
+- Capabilities (exhaustive list):
+  1. **Pause contracts** — halt all contract execution for exploit response and critical bug mitigation
+  2. **Emergency content blacklisting** — add hashes and origin operators to the `ContentBlacklist` contract via `emergencyAdd` and `emergencyAddOrigin` (see [ADR 011](011-content-takedown.md))
+- Cannot change parameters, withdraw funds, or bypass governance for non-emergency actions
+- Used for exploit response, critical bug mitigation, and time-critical content removal (e.g., CSAM, actively-exploited material)
+- Sunset: after 12 months, the pause function is permanently disabled (or requires governance vote to extend). Emergency blacklisting capability follows the same sunset schedule.
 - Signers should be geographically and organizationally diverse
 
 ## Consequences

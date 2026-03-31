@@ -228,4 +228,4 @@ The minimum viable process for PoC:
 - **ADR 001** (Network Topology) — `CacheAnnounce` must suppress blacklisted hashes and exclude blacklisted origin NodeIds; `StreamError::HashBlacklisted` and `StreamError::OriginBlacklisted` are new error variants
 - **ADR 002** (Content Addressing) — content-addressed blobs can be removed from the network layer even though the hash remains valid; this is explicitly accepted
 - **ADR 004** (Tokenomics) — serving blacklisted content added to the slashable offense list; origin blacklisting triggers same stake ejection path as repeated slashing
-- **ADR 009** (Governance) — `ContentBlacklist` contract added to governance-controlled contracts; emergency multisig scope extended to content and origin blacklisting; regional body registry introduced as a new governance primitive
+- **ADR 009** (Governance) — `ContentBlacklist` contract added to governance-controlled contracts; emergency multisig scope documented in ADR 009 as the single source of truth, covering both contract pausing and content/origin blacklisting; regional body registry introduced as a new governance primitive
