@@ -112,13 +112,15 @@ The challenger reward incentivizes watchtowers and honest nodes to monitor and r
 
 ### Challenge Bond
 
-To prevent frivolous fraud proof submissions:
+To prevent frivolous fraud proof submissions, challengers must post a TOKEN bond. Without a bond, the PoC is vulnerable to zero-cost rate manipulation slash claims — any address can submit slash evidence (two signed messages) with no penalty for frivolous or fabricated claims, enabling griefing of honest nodes.
 
 | Parameter | PoC | Production |
 | --- | --- | --- |
-| Challenge bond | N/A (not implemented) | 50 TOKEN |
-| Bond return | N/A | Returned if challenge succeeds (node slashed) |
-| Bond forfeiture | N/A | Forfeited if node successfully counters. 50% burned, 50% to node. |
+| Challenge bond | 100 TOKEN | 50 TOKEN |
+| Bond return | Returned if challenge succeeds (node slashed) | Returned if challenge succeeds (node slashed) |
+| Bond forfeiture | Forfeited if node successfully counters. 50% burned, 50% to node. | Forfeited if node successfully counters. 50% burned, 50% to node. |
+
+The PoC bond is set higher than production (100 vs 50 TOKEN) because the freely mintable testnet token has no intrinsic cost — a higher nominal amount creates at least a transactional friction barrier. In production, where TOKEN has real value, 50 TOKEN provides sufficient economic deterrence.
 
 ### Auto-Ejection
 

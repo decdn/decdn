@@ -510,9 +510,82 @@ A lightweight, optional mechanism for clients to signal commitment:
 - Enforcement is off-chain (node-side logic), not on-chain
 - Clients withdraw anytime: `StakingRegistry.clientUnstake(amount)`
 
-**NodeId-to-address mapping:** During the iroh connection handshake, the client's `NodeId` (ed25519 public key) is known. The client signs a message binding their `NodeId` to their Ethereum address and includes it in the `StreamRequest`. The node verifies this signature and uses the Ethereum address to look up `clientStakeOf`. This mapping is ephemeral (per-session, not stored on-chain).
+**NodeId-to-address mapping:** See [NodeId-to-Ethereum Binding](#nodeid-to-ethereum-binding) for the full specification of how iroh NodeIds are bound to Ethereum addresses.
 
 This is a soft signal, not a hard gate. Non-staking clients still get served, just with lower priority during congestion.
+
+## NodeId-to-Ethereum Binding
+
+The protocol requires a verifiable mapping between iroh NodeIds (ed25519 public keys) and Ethereum addresses (secp256k1-derived). This binding is used for client priority staking lookups, payment channel association, and slash evidence attribution.
+
+### Binding Message Format
+
+The binding uses EIP-712 typed structured data, signed by the Ethereum private key:
+
+```solidity
+bytes32 constant BIND_NODE_TYPEHASH = keccak256(
+    "BindNodeId(bytes32 nodeId,uint64 nonce)"
+);
+```
+
+Where:
+- `nodeId`: the 32-byte ed25519 public key (iroh `NodeId`)
+- `nonce`: a monotonic counter per Ethereum address, preventing replay of revoked bindings
+
+The EIP-712 domain separator is the same as the `StakingRegistry` contract deployment (chain ID + contract address), preventing cross-chain and cross-contract replay.
+
+### On-Chain Registration
+
+Nodes register their binding on-chain via `StakingRegistry.bindNodeId()`. This creates an authoritative, publicly queryable mapping:
+
+```solidity
+// StakingRegistry additions
+mapping(bytes32 => address) public nodeIdToAddress;
+mapping(address => bytes32) public addressToNodeId;
+mapping(address => uint64) public bindingNonce;
+
+function bindNodeId(bytes32 nodeId, bytes calldata signature) external {
+    uint64 nonce = bindingNonce[msg.sender];
+    bytes32 digest = keccak256(abi.encodePacked(
+        "\x19\x01",
+        DOMAIN_SEPARATOR,
+        keccak256(abi.encode(BIND_NODE_TYPEHASH, nodeId, nonce))
+    ));
+    require(ECDSA.recover(digest, signature) == msg.sender, "invalid signature");
+
+    // Clear previous binding if exists
+    bytes32 oldNodeId = addressToNodeId[msg.sender];
+    if (oldNodeId != bytes32(0)) {
+        delete nodeIdToAddress[oldNodeId];
+    }
+
+    nodeIdToAddress[nodeId] = msg.sender;
+    addressToNodeId[msg.sender] = nodeId;
+    bindingNonce[msg.sender] = nonce + 1;
+
+    emit NodeIdBound(msg.sender, nodeId, nonce);
+}
+
+function resolveNodeId(bytes32 nodeId) external view returns (address) {
+    return nodeIdToAddress[nodeId];
+}
+```
+
+### Off-Chain (Ephemeral) Binding for Clients
+
+Clients who do not wish to register on-chain (e.g., for priority staking lookups only) include a signed binding in their `StreamRequest`. The node verifies the EIP-712 signature over `BindNodeId(nodeId, nonce=0)` using `ecrecover`, confirms the recovered address matches the claimed Ethereum address, and uses that address for `clientStakeOf` lookups. This ephemeral binding is not stored on-chain and is valid only for the session.
+
+### Binding Requirements by Role
+
+| Role | On-chain binding required? | Rationale |
+| --- | --- | --- |
+| Node (staked) | **Yes** — must call `bindNodeId` at registration | Slash evidence references on-chain NodeId→address mapping |
+| Client (priority staking) | No — ephemeral binding in `StreamRequest` is sufficient | Priority staking is a soft signal; no on-chain enforcement needed |
+| Client (opening channels) | No — channel `client` field is the Ethereum address directly | Channel operations use Ethereum addresses, not NodeIds |
+
+### Rebinding
+
+A node or client can rebind their Ethereum address to a new NodeId by calling `bindNodeId` again (the nonce increments, invalidating the old binding). The old NodeId→address mapping is deleted. This supports key rotation scenarios (e.g., compromised iroh key).
 
 ## Decimal Handling
 
