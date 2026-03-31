@@ -300,7 +300,7 @@ Fully solved. EIP-712 typed data over `{channelId, amount, nonce, token}` binds 
 
 ### StablePaymentChannel
 
-The `StablePaymentChannel` is a new contract separate from the existing `PaymentChannel`. It handles only stablecoin payment channels.
+The `StablePaymentChannel` is the PoC payment channel contract, handling USDC-only payment channels. In production, this contract is superseded by the multi-token `PaymentChannel` contract defined in [ADR 010](010-multi-token.md).
 
 **Channel state:**
 

@@ -27,7 +27,7 @@ Rate bounds, decimal handling, and gossip advertisements are all keyed by token 
 
 ### Contract: PaymentChannel
 
-The PoC contract (`StablePaymentChannel`) is renamed `PaymentChannel` in production to reflect that it handles any ERC-20, not only stablecoins. The interface is otherwise structurally the same, with the following changes:
+The production contract is named `PaymentChannel` (replacing the PoC's `StablePaymentChannel` from [ADR 003](003-payments.md)) to reflect that it handles any governance-approved ERC-20, not only stablecoins. This is a new deployment, not a rename — the PoC `StablePaymentChannel` is decommissioned (see [Migration from ADR 003](#migration-from-adr-003)). The interface is otherwise structurally the same, with the following changes:
 
 **Token allowlist (governance-managed):**
 

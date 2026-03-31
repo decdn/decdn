@@ -168,10 +168,10 @@ The `BuybackBurner` contract converts accumulated USDC fees into TOKEN and burns
 
 | Parameter | PoC | Production | Governable |
 | --- | --- | --- | --- |
-| Minimum accumulation before buyback | N/A (execution disabled) | 100 USDC | Yes |
-| Maximum single buyback | N/A (execution disabled) | 10,000 USDC | Yes |
-| Slippage tolerance | N/A (execution disabled) | 2% (200 bps) | Yes |
-| DEX | N/A (execution disabled) | Uniswap V3 TOKEN/USDC pool | Yes (pool address) |
+| Minimum accumulation before buyback (`minBuybackAmount`) | N/A (execution disabled) | 100 USDC | Yes |
+| Maximum single buyback (`maxBuybackAmount`) | N/A (execution disabled) | 10,000 USDC | Yes |
+| Slippage tolerance (`slippageBps`) | N/A (execution disabled) | 2% (200 bps) | Yes |
+| DEX (`dexPool`) | N/A (execution disabled) | Uniswap V3 TOKEN/USDC pool | Yes (pool address) |
 | Execution | Disabled — fees accumulate only | Governance-triggered or automated keeper | — |
 | Execution activation | N/A | Requires governance vote to enable | — |
 
