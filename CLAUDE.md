@@ -1,7 +1,5 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
 ## Project Overview
 
 Decentralized CDN (deCDN) — nodes cache and serve content-addressed blobs over iroh QUIC, clients pay per-MB via off-chain USDC payment channels. Rust implementation targeting a PoC of tens of nodes on an Arbitrum Sepolia testnet.
@@ -20,6 +18,11 @@ This repo uses a VS Code devcontainer with a firewall-isolated environment. The 
 ### Working with ADRs
 
 ADRs in `adr/` are the primary deliverables right now. `adr/architecture.md` is the living overview; numbered files (`000-language.md`, `001-network.md`, etc.) cover individual decisions.
+
+**Conventions:**
+- File naming: `NNN-topic.md` (zero-padded 3-digit prefix, next number is 012)
+- When changing any ADR, check for cross-ADR consistency — terms, parameters, and protocol names must match across all ADRs and `architecture.md`. This is the most common source of bugs in this repo.
+- `architecture.md` must be updated whenever an ADR changes a user-visible summary point
 
 ### Build and Test (once implementation begins)
 
