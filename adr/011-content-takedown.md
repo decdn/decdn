@@ -41,6 +41,8 @@ interface IContentBlacklist {
     function removeOrigin(address operatorAddress) external;
 
     // Emergency multisig path (3-of-5, no timelock) — hash and origin
+    // Subject to 12-month sunset: blacklistDeadline = deployTimestamp + 365 days
+    // (see ADR 009, Emergency Multisig)
     function emergencyAdd(bytes32 blake3Hash, string calldata reason) external;
     function emergencyAddOrigin(address operatorAddress, string calldata reason) external;
 
@@ -96,7 +98,7 @@ Regional bodies operate independently within their scope. A hash blacklisted by 
 | Regional governance body | 24 hours after `effectiveAt` |
 | Emergency multisig add | `effectiveAt = addedAt` — slash applies after 2 hours |
 
-The 24-hour window accounts for nodes that are offline or have a long poll interval. The 2-hour emergency window is tight enough to matter for active illegal content while giving online nodes time to act.
+The 24-hour window accounts for nodes that are offline or have a long poll interval. The 2-hour emergency window is tight enough to matter for active illegal content while giving online nodes time to act. The emergency multisig path is subject to a 12-month sunset (`blacklistDeadline = deployTimestamp + 365 days`) — see [ADR 009](009-governance.md#emergency-multisig).
 
 The compliance window is a governable parameter (hardcoded bounds: minimum 1 hour, maximum 7 days).
 

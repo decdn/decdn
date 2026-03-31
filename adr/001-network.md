@@ -38,7 +38,7 @@ graph TD
     REG_ETC --> PT
 
     PT -->|cache miss| PROBE["Probe Fan-Out<br/>cdn/probe/v1 to all known peers"]
-    PROBE -->|has_blob: true| SELECT["Select best by rate_per_mb x rtt_ms"]
+    PROBE -->|has_blob: true| SELECT["Select best by unified selection score"]
     PROBE -->|no provider found| MISS["No Known Provider<br/>(serve from local origin if configured,<br/>otherwise reject)"]
 ```
 
@@ -63,7 +63,7 @@ struct LoadHint {
 ```
 
 - **`NodeAnnounce` carries node-level metadata only** — no content inventory. `popular_hashes` (capped at 20) is a popularity signal for prefetching, not a content catalog. Message size is ~700 bytes worst case.
-- **`LoadHint`** makes the "approximate load in gossip announcements" from [ADR 008](008-reputation.md) section 9 concrete, feeding tie-breaking logic.
+- **`LoadHint`** makes the "approximate load in gossip announcements" from [ADR 008, Tie-Breaking](008-reputation.md#9-tie-breaking) concrete, feeding tie-breaking logic.
 - **Announce interval** is a per-node configuration parameter (PoC default TBD during implementation).
 
 Both clients and nodes maintain a **peer table** (`NodeId → NodeAnnounce`) built from received gossip messages. This table tracks which nodes exist and their metadata — it does not track content.
@@ -113,9 +113,9 @@ For new nodes with the initial reputation of 0.5 ([ADR 008](008-reputation.md)),
 
 **Inputs:** `rate_per_mb` and `rtt_ms` come from `ProbeResponse` (see [ADR 005](005-protocol.md)). `reputation` is the node's `final_score` from [ADR 008](008-reputation.md) — local observations (70%) + network gossip (30%).
 
-**Tie-breaking** (scores within 1% of each other): see [ADR 008, Section 9](008-reputation.md#9-tie-breaking).
+**Tie-breaking** (scores within 1% of each other): see [ADR 008, Tie-Breaking](008-reputation.md#9-tie-breaking).
 
-This score is used in Content Discovery step 4 above and in all other node selection contexts. The simpler `rate_per_mb × rtt_ms` formula referenced in ADR 005 describes the price×latency component; the full selection algorithm adds reputation weighting.
+This score is used in Content Discovery step 4 above and in all other node selection contexts. The simpler `rate_per_mb × rtt_ms` product is the price×latency component; the full selection algorithm adds reputation weighting as shown above.
 
 #### Prefetching with Dual Signals
 
