@@ -20,6 +20,16 @@ Four protocols: three negotiated via ALPN, plus the built-in iroh-gossip protoco
 | `cdn/watchtower/v1` | watched party (typically node) ↔ watchtower | Channel-dispute monitoring: voucher registration and updates (see ADR 007) |
 | iroh-gossip (built-in) | all nodes | Node metadata announcements (`NodeAnnounce`), node discovery |
 
+**Gossip topics.** The iroh-gossip protocol carries multiple message types on distinct topics:
+
+| Topic | Message Type | Source ADR |
+| --- | --- | --- |
+| `cdn/global/v1`, `cdn/region/{cc}/v1` | `NodeAnnounce` | [ADR 001](001-network.md) |
+| `cdn/reputation/v1` | `ReputationReport` | [ADR 008](008-reputation.md) |
+| `cdn/global/v1` (production) | `WatchtowerAnnounce` | [ADR 007](007-watchtower.md) |
+
+All gossip topics use the `cdn/` namespace prefix. `NodeAnnounce` and `ReputationReport` are active in production; `WatchtowerAnnounce` is a planned production extension for watchtower discovery at scale (PoC uses static watchtower lists — see [ADR 007](007-watchtower.md)).
+
 **Note:** Key delivery (epoch keys, sealed envelopes) is handled by the app server — an external component communicating over WebSocket/SSE, not an iroh QUIC ALPN. See [ADR 006](006-e2e-encryption.md) for details.
 
 ### `cdn/probe/v1` — latency probe
@@ -69,6 +79,23 @@ sequenceDiagram
         Note over P: Connect to redirect NodeId and retry<br/>(max 3 hops, cycle detection)
     end
 ```
+
+**Client identity binding.** For clients using ephemeral (off-chain) NodeId-to-Ethereum-address bindings (see [ADR 003 — Off-Chain Ephemeral Binding](003-payments.md#off-chain-ephemeral-binding-for-clients)), the binding is conveyed via optional fields in `StreamRequest`:
+
+```rust
+struct StreamRequest {
+    hash: Hash,
+    channel_id: ChannelId,
+    byte_offset: u64,
+    timestamp_us: u64,
+    voucher_interval_mb: Option<u64>,
+    // Ephemeral client binding (optional; required on first request per connection)
+    ethereum_address: Option<Address>,
+    binding_signature: Option<Bytes>,  // EIP-712 BindNodeId signature
+}
+```
+
+The client includes `ethereum_address` and `binding_signature` in the first `StreamRequest` on a connection. The node verifies the EIP-712 signature via `ecrecover`, caches the verified binding for the connection's lifetime, and uses the recovered address for `clientStakeOf` lookups and voucher attribution. Subsequent requests on the same connection may omit these fields. These are `Option` fields with `#[serde(default)]`, so peers that do not send them (e.g., nodes in node-to-node pulls where both sides have on-chain bindings) decode them as `None` — no ALPN version bump is needed since this is defined before the first implementation.
 
 **Voucher wire format:** `Voucher {sig, amt}` above is shorthand. The EIP-712 signed data covers the full structure from [ADR 003](003-payments.md): `{channelId, amount, nonce, stablecoin}`. Only `signature` and `amount` are transmitted on the wire because the remaining fields are derivable from stream context — `channel_id` is in `StreamRequest`, `nonce` increments monotonically (one per voucher interval boundary — default 1 MB, or the negotiated interval), and `stablecoin` is fixed at channel open. The receiver reconstructs the full typed data to verify the signature. Contrast with the watchtower `VoucherUpdate` below, which must include `channel_id` and `nonce` explicitly because the watchtower lacks stream context.
 

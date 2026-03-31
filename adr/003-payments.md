@@ -319,14 +319,16 @@ struct Channel {
 }
 ```
 
-**Channel ID:** `channelId = keccak256(abi.encodePacked(client, provider, nonce))` where `nonce` is a monotonic per-client counter stored on-chain as `clientNonce[msg.sender]`. **Ordering:** `openChannel` reads the current nonce, uses it to compute `channelId`, then increments: `nonce = clientNonce[msg.sender]; channelId = keccak256(..., nonce); clientNonce[msg.sender] = nonce + 1`. The client pre-computes the next channelId off-chain by reading `clientNonce[client]` and using that value directly — no off-by-one because the contract uses the same value before incrementing. The nonce is global per-client (not per-provider), ensuring uniqueness across all of a client's channels.
+**Channel ID:** `channelId = keccak256(abi.encodePacked(client, provider, channelNonce))` where `channelNonce` is a monotonic per-client counter stored on-chain as `clientChannelNonce[msg.sender]`. **Ordering:** `openChannel` reads the current nonce, uses it to compute `channelId`, then increments: `n = clientChannelNonce[msg.sender]; channelId = keccak256(..., n); clientChannelNonce[msg.sender] = n + 1`. The client pre-computes the next channelId off-chain by reading `clientChannelNonce[client]` and using that value directly — no off-by-one because the contract uses the same value before incrementing. The `channelNonce` is global per-client (not per-provider), ensuring uniqueness across all of a client's channels.
+
+> **Terminology:** `channelNonce` (the channel creation counter) is distinct from the voucher `nonce` (the monotonic sequence number within a channel used in EIP-712 voucher signatures). The former uniquely identifies channels; the latter orders vouchers within a channel. [ADR 010](010-multi-token.md) extends this formula to `keccak256(client, provider, token, channelNonce)` for multi-token support.
 
 ```solidity
 interface IStablePaymentChannel {
-    // Nonce tracking
-    function clientNonce(address client) external view returns (uint256);
+    // Channel nonce tracking (see "Channel ID" above for terminology)
+    function clientChannelNonce(address client) external view returns (uint256);
 
-    // Channel lifecycle (openChannel increments clientNonce[msg.sender] and uses it in channelId)
+    // Channel lifecycle (openChannel increments clientChannelNonce[msg.sender] and uses it in channelId)
     function openChannel(address provider, uint256 deposit) external returns (bytes32 channelId);
     function topUp(bytes32 channelId, uint256 additionalDeposit) external;
     function closeChannel(bytes32 channelId, uint256 amount, uint256 nonce, bytes calldata signature) external;
@@ -347,6 +349,22 @@ interface IStablePaymentChannel {
     function setMaxVoucherIntervalMb(uint256 mb) external;
 }
 ```
+
+**Initial deployment values.** The constructor (or initializer for proxy deployments) sets governable parameters to their PoC defaults. All values are within the hardcoded safety bounds table further below (see also [ADR 009](009-governance.md) for governance ranges):
+
+```solidity
+constructor(address usdc_, address treasury_, uint256 disputeWindow_) {
+    require(disputeWindow_ >= 43200 && disputeWindow_ <= 259200, "out of bounds");
+    usdc = usdc_;
+    treasury = treasury_;
+    disputeWindow = disputeWindow_;   // PoC default: 86400 (24 hours)
+    feePercentage = 300;              // 3% (300 bps)
+    maxVoucherIntervalMb = 1;         // 1 MB
+    maxChannelDuration = 7776000;     // 90 days
+}
+```
+
+Default PoC deployment value for `disputeWindow`: **86400 seconds (24 hours)**. Safety bounds per [ADR 009](009-governance.md): 43200–259200 seconds (12h–72h).
 
 **Channel close events:**
 
@@ -562,7 +580,11 @@ The EIP-712 domain separator is the same as the `StakingRegistry` contract deplo
 
 ### On-Chain Registration
 
-Nodes register their binding on-chain via `StakingRegistry.bindNodeId()`. This creates an authoritative, publicly queryable mapping:
+Nodes register their binding on-chain via `StakingRegistry.bindNodeId()`. This is distinct from `StakingRegistry.registerNode()` ([ADR 001](001-network.md)), which handles mesh membership (NodeId, multiaddrs, region, stake validation). `bindNodeId()` establishes the cryptographic NodeId-to-Ethereum-address binding used for slash evidence and payment channel attribution. Nodes call both at registration time: `registerNode` to join the peer mesh, then `bindNodeId` to create the signed binding.
+
+**Canonical source of truth:** The `nodeIdToAddress` / `addressToNodeId` mappings maintained by `bindNodeId` are the authoritative source for payment attribution and slashing. `NodeInfo.ethAddress` in ADR 001 is always `msg.sender` (the same address that calls `bindNodeId`), so the two are consistent by construction under the one-to-one constraint. If the implementation stores both, `NodeInfo.ethAddress` MUST equal `nodeIdToAddress[nodeId]` at all times.
+
+This creates an authoritative, publicly queryable mapping:
 
 ```solidity
 // StakingRegistry additions

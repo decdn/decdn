@@ -90,7 +90,7 @@ Every blob is identified by its BLAKE3 hash. Clients verify received bytes again
 
 **Off-chain USDC payment channels. Market-driven rates.**
 
-Clients pay nodes per MB. On a cache miss, nodes pay origin-backed nodes per MB for initial content pulls, then amortise that cost across many client deliveries. Origin-backed nodes set the effective price ceiling (reflecting their backend egress costs). Rates are fully market-driven within governance-set bounds. Voucher cadence (default 1 MB) is negotiable per-stream for large blob transfers, reducing overhead without materially increasing risk. NodeId-to-Ethereum address binding is registered on-chain via `StakingRegistry.bindNodeId()` for nodes and ephemeral (per-session) for clients.
+Clients pay nodes per MB. On a cache miss, nodes pay origin-backed nodes per MB for initial content pulls, then amortise that cost across many client deliveries. Origin-backed nodes set the effective price ceiling (reflecting their backend egress costs). Rates are fully market-driven within governance-set bounds. Voucher cadence (default 1 MB) is negotiable per-stream for large blob transfers, reducing overhead without materially increasing risk. Nodes join the mesh via `StakingRegistry.registerNode()` ([ADR 001](001-network.md)) and establish a cryptographic NodeId-to-Ethereum address binding via `StakingRegistry.bindNodeId()` ([ADR 003](003-payments.md)) for slash evidence and payment attribution. Client bindings are ephemeral (per-session).
 
 ---
 
