@@ -22,7 +22,7 @@ The same channel mechanism operates at two tiers:
 - **Client → node**: a client opens a USDC channel with a node, signs cumulative vouchers as MB are delivered, and the node initiates channel close on-chain and settles to claim payment after the dispute window.
 - **Node → node**: when a node pulls content from another node (typically an origin-backed node) for the first time, it pays via the same channel mechanism. The origin-backed node is paid wholesale; the pulling node recoups this by serving multiple clients from its cache at a markup.
 
-A channel is opened by depositing USDC into the `StablePaymentChannel` contract. As content is delivered, the payer signs cumulative vouchers off-chain — one voucher per MB received (default cadence; negotiable for large transfers). The delivering node holds the latest voucher and submits it on-chain to initiate channel close. A 24-hour dispute window allows either party to counter a stale or fraudulent close attempt. After the dispute window expires, the channel is settled and funds are distributed.
+A channel is opened by depositing USDC into the `StablePaymentChannel` contract. As content is delivered, the payer signs cumulative vouchers off-chain — one voucher per MB received (default cadence; negotiable for large transfers). The delivering node holds the latest voucher and submits it on-chain to initiate channel close. A dispute window (default 24 hours, governable within 12h–72h — see [ADR 009](009-governance.md)) allows either party to counter a stale or fraudulent close attempt. After the dispute window expires, the channel is settled and funds are distributed.
 
 Key parameters:
 
@@ -84,7 +84,20 @@ At the default 1 MB cadence, a 10 GB blob requires 10,000 vouchers — each invo
 
 Even the worst case (1024 MB at ceiling rate) exposes $1.024 — well below the recommended 10 USDC minimum deposit.
 
-**Concurrent streams interaction:** When multiple streams share a channel with different negotiated intervals, the effective interval for the channel is the **minimum** across all active streams. This preserves the existing invariant that the aggregate voucher deficit never exceeds the effective interval. A consequence is that the overhead reduction from larger intervals is only realized when **all** streams on a channel negotiate larger intervals — a single 1 MB stream added to a channel with a 1024 MB stream forces the entire channel back to 1 MB cadence. When the effective interval shrinks (e.g., a new stream joins with a smaller interval), the client MUST immediately issue a cumulative voucher if the current unvouchered byte count exceeds the new effective interval, to prevent all streams from stalling. Clients fetching a mix of small and large blobs from the same node may benefit from opening separate channels to isolate large-interval streams. See [ADR 005 — Payment channels and concurrent streams](005-protocol.md#payment-channels-and-concurrent-streams) for wire-level details.
+### Concurrent Streams
+
+When multiple streams share a single payment channel, they share a **single cumulative voucher counter**. The rules:
+
+1. **Effective interval = minimum across all active streams.** If stream A negotiated 100 MB and stream B negotiated 1 MB, the channel operates at 1 MB cadence.
+2. **Aggregate byte counter.** The client tracks total bytes received across all streams on the channel. A voucher is due whenever the aggregate crosses the next interval boundary.
+3. **Interval shrink.** When a new stream joins with a smaller interval than the current effective interval, the client MUST immediately issue a cumulative voucher if the current unvouchered byte count exceeds the new effective interval. Failure to do so causes the node to pause **all** streams on the channel (the self-enforcing threshold is applied collectively, not per-stream).
+4. **Voucher routing.** Vouchers are sent on any active stream sharing the channel — the node credits them against the channel-wide counter regardless of which stream carries the message.
+
+**Example:** Client has stream A (blob X, 100 MB interval) and stream B (blob Y, 1 MB interval) on the same channel. Effective interval is 1 MB. After receiving 1 MB total (e.g., 0.7 MB from A + 0.3 MB from B), the client sends a cumulative voucher. If stream B ends, the effective interval rises to 100 MB for the remainder of stream A.
+
+**Isolation recommendation:** Clients fetching a mix of small and large blobs from the same node may benefit from opening separate channels to isolate large-interval streams from small-interval ones.
+
+See [ADR 005 — Payment channels and concurrent streams](005-protocol.md#payment-channels-and-concurrent-streams) for wire-level details.
 
 ### Fee Calculation on Disputed Closes
 
@@ -155,7 +168,7 @@ The current mitigation (auto-expire + deposit > gas cost) limits financial loss 
 **Stale close**
 Client submits an old voucher (lower amount) to close the channel, underpaying the node.
 
-The 24-hour dispute window works if the node is online. The gap is liveness: if the node goes offline after a stale close is submitted and misses the dispute window, it loses the difference. Options:
+The dispute window (default 24 hours) works if the node is online. The gap is liveness: if the node goes offline after a stale close is submitted and misses the dispute window, it loses the difference. Options:
 
 - **Option A — Watchtowers.** A separate monitoring service holds the latest voucher and submits it on the node's behalf if a dispute is detected. Adds operational complexity but fully closes the gap.
 - **Option B — Longer dispute window.** Increase from 24 hours to 7 days, giving operators more time to respond. Delays legitimate channel closes for everyone.
@@ -169,11 +182,11 @@ Client sends probe requests to many nodes at high frequency to map the network o
 The current mitigation is weak. Clients are not staked — their NodeIds are free to rotate — so per-NodeId rate limiting is bypassable. The iroh connection setup cost is also low. Options:
 
 - **Option A — IP-based rate limiting.** Rate limit probe requests by source IP rather than NodeId. Harder to rotate at scale, though not impossible with proxies or cloud infrastructure.
-- **Option B — Require an open channel to probe.** Only clients with an existing open payment channel (any amount) can probe. Strong protection but adds friction for new users who haven't yet deposited.
+- ~~**Option B — Require an open channel to probe.**~~ **Rejected.** This creates a bootstrap catch-22: clients need probe results (rate, latency) to choose a node before opening a channel, but Option B requires a channel before probing. Since probes happen before channel opens (see [ADR 005](005-protocol.md) probe flow), requiring a channel is architecturally incompatible with the protocol sequence. Probes are unauthenticated and free — see ADR 005's statement that "`ProbeRequest` requires no authentication."
 - **Option C — Proof-of-work on probe requests.** Include a small PoW challenge in the probe request (e.g., find a nonce such that `hash(NodeId || nonce) < difficulty`). Adds CPU cost to bulk probing without affecting honest single-request clients noticeably.
-- **Option D — Accept the risk.** A probe is a single message exchange. The cost to serve one is negligible; the attack only matters at extreme scale. Rate limit at the connection level (iroh handles this) and monitor for abuse rather than trying to prevent it at the protocol level.
+- **Option D — Accept the risk (PoC default).** A probe is a single message exchange. The cost to serve one is negligible; the attack only matters at extreme scale. Rate limit at the connection level (iroh handles this) and monitor for abuse rather than trying to prevent it at the protocol level.
 
-**Note:** Probe responses are considered public information (see ADR 005). The concern here is resource exhaustion from bulk probing, not information leakage — content availability is already broadcast via gossip, and pricing is revealed in probe/stream responses by design.
+**Note:** Probe responses are considered public information (see ADR 005). The concern here is resource exhaustion from bulk probing, not information leakage — content availability is discoverable via probing (see ADR 005), and pricing is revealed in probe/stream responses by design.
 
 ---
 
@@ -207,7 +220,7 @@ BLAKE3 verification catches this immediately at the client. The remaining gap is
 **Rate bait-and-switch**
 Node advertises a low rate in probe responses then returns a higher rate in `StreamResponse`.
 
-**Resolved: slashable offense.** Both `ProbeResponse` and `StreamResponse` include cryptographic signatures over the advertised rate (see ADR 005). The on-chain verifier checks: (1) both signatures are valid and from the same NodeId, (2) `StreamResponse.rate_per_mb > ProbeResponse.rate_per_mb`, (3) `stream_response.timestamp_us >= probe_response.timestamp_us` (prevents unsigned underflow), and (4) `stream_response.timestamp_us - probe_response.timestamp_us < 30_000_000` (30 seconds in microseconds). Both `timestamp_us` values are requester-generated — the probe timestamp is echoed in `ProbeResponse`, and a separate requester timestamp from `StreamRequest` is echoed in `StreamResponse` — so the delta is computed from a single clock with no wall-clock reference or time oracle needed. Clock skew between the requester and the node does not affect the check. The node is slashed per the escalating schedule in ADR 004. The 30-second window allows legitimate rate changes between sessions while catching same-session bait-and-switch.
+**Resolved: slashable offense.** Both `ProbeResponse` and `StreamResponse` include cryptographic signatures over the advertised rate (see ADR 005). The on-chain verifier checks: (1) both signatures are valid and from the same NodeId, (2) `StreamResponse.rate_per_mb > ProbeResponse.rate_per_mb`, (3) `stream_response.timestamp_us >= probe_response.timestamp_us` (prevents unsigned underflow), and (4) `stream_response.timestamp_us - probe_response.timestamp_us < 30_000_000` (30 seconds in microseconds). Both `timestamp_us` values are requester-generated — the probe timestamp is echoed in `ProbeResponse`, and a separate requester timestamp from `StreamRequest` is echoed in `StreamResponse` — so the delta is computed from a single clock with no wall-clock reference or time oracle needed. **Clock skew immunity:** because both timestamps originate from the requester's clock (the node merely echoes them back in its signed response), clock skew between the requester and the node is irrelevant. The on-chain verifier never compares timestamps from different clocks — it only computes the delta between two requester-generated values extracted from signed messages. A node with a clock 5 minutes ahead or behind has zero effect on the 30-second window check. The node is slashed per the escalating schedule in ADR 004. The 30-second window allows legitimate rate changes between sessions while catching same-session bait-and-switch.
 
 ---
 
@@ -235,16 +248,16 @@ Not a real attack. The contract always settles the highest valid voucher, and on
 **Eclipse attack**
 Attacker surrounds a client with malicious nodes so all probe responses come from nodes under attacker control.
 
-BLAKE3 verification catches data corruption regardless of which nodes are in the routing table. The remaining gap is a denial-of-service variant: an attacker controlling all of a client's known nodes can simply refuse to serve. Options:
+BLAKE3 verification catches data corruption regardless of which nodes are in the peer table. The remaining gap is a denial-of-service variant: an attacker controlling all of a client's known nodes can simply refuse to serve. Options:
 
-- **Option A — Origin-backed nodes as fallback.** Clients can specifically query the registry for well-known origin-backed nodes for a given blob, bypassing the general routing table. An eclipse must also control all origin-backed nodes for the target content — which requires capital proportional to the number of origin-backed nodes for that content.
+- **Option A — Origin-backed nodes as fallback.** Clients can specifically query the registry for well-known origin-backed nodes for a given blob, bypassing the general peer table. An eclipse must also control all origin-backed nodes for the target content — which requires capital proportional to the number of origin-backed nodes for that content.
 - **Option B — Multi-source bootstrap.** Clients discover initial peers from at least two independent sources (on-chain registry + a hardcoded DNS seed list). An attacker must compromise both to fully eclipse a client.
 - **Option C — Minimum honest-peer diversity.** Clients maintain connections to at least N nodes discovered via different paths. All N would need to be attacker-controlled for a full eclipse.
 
 ---
 
 **Gossip flooding**
-Node sends high-volume `CacheAnnounce` messages to exhaust peer routing table memory or crowd out legitimate announcements.
+Node sends high-volume `NodeAnnounce` messages to exhaust peer table memory or crowd out legitimate announcements.
 
 Registry check + per-sender rate limiting is solid. The minor gap is that the local registry cache may be up to 10 minutes stale, briefly allowing recently-unstaked nodes to flood. Mostly solved; no strong alternative needed beyond tightening the registry cache refresh on high flood detection.
 
@@ -269,12 +282,12 @@ Origin-backed nodes set the effective price ceiling for any blob. Clients can al
 ---
 
 **Content withholding**
-A node stakes, announces content it holds, but refuses to serve it — collecting credibility in the routing tables without actually participating.
+A node stakes, responds to probes with `has_blob: true`, but refuses to serve — collecting credibility in the peer table without actually participating.
 
 **Withholding is not a slashable offense** — operators may legitimately take content offline for maintenance, migration, or business reasons, and slashing for availability creates perverse incentives. Instead, withholding is handled through reputation and redundancy:
 
 - **Multiple origin-backed nodes per blob.** Content owners configure multiple origin-backed nodes for important content. A single withholding node becomes irrelevant if others serve the same blob.
-- **Reputation fast-path.** Nodes that fail to serve announced content accumulate reputation penalties at a steeper rate. A node with consistently poor availability is deprioritized in routing and loses delivery revenue.
+- **Reputation fast-path.** Nodes that respond `has_blob: true` to probes but fail to deliver accumulate reputation penalties at a steeper rate. A node with consistently poor availability is deprioritized in provider selection and loses delivery revenue.
 
 ---
 
@@ -306,11 +319,14 @@ struct Channel {
 }
 ```
 
-**Channel ID:** `channelId = keccak256(abi.encodePacked(client, provider, nonce))` where `nonce` is a per-client counter. Allows multiple channels between the same client-node pair.
+**Channel ID:** `channelId = keccak256(abi.encodePacked(client, provider, nonce))` where `nonce` is a monotonic per-client counter stored on-chain as `clientNonce[msg.sender]`. **Ordering:** `openChannel` reads the current nonce, uses it to compute `channelId`, then increments: `nonce = clientNonce[msg.sender]; channelId = keccak256(..., nonce); clientNonce[msg.sender] = nonce + 1`. The client pre-computes the next channelId off-chain by reading `clientNonce[client]` and using that value directly — no off-by-one because the contract uses the same value before incrementing. The nonce is global per-client (not per-provider), ensuring uniqueness across all of a client's channels.
 
 ```solidity
 interface IStablePaymentChannel {
-    // Channel lifecycle
+    // Nonce tracking
+    function clientNonce(address client) external view returns (uint256);
+
+    // Channel lifecycle (openChannel increments clientNonce[msg.sender] and uses it in channelId)
     function openChannel(address provider, uint256 deposit) external returns (bytes32 channelId);
     function topUp(bytes32 channelId, uint256 additionalDeposit) external;
     function closeChannel(bytes32 channelId, uint256 amount, uint256 nonce, bytes calldata signature) external;
@@ -356,23 +372,33 @@ event ChannelSettled(
     uint256 clientRefund,
     uint256 protocolFee
 );
+
+event ChannelExpiredReclaimed(
+    bytes32 indexed channelId,
+    address indexed client,
+    uint256 deposit
+);
 ```
+
+**Channel expiry:** `expiresAt` is set at channel open: `expiresAt = block.timestamp + maxChannelDuration`. The `maxChannelDuration` parameter defaults to 90 days and is governable within hardcoded bounds (minimum 7 days, maximum 365 days). Channel expiry protects clients from indefinitely locked funds when a node disappears without closing the channel.
 
 **Channel close lifecycle:**
 - `closeChannel` → requires status `Open`. Sets status to `Closing`, records voucher, emits `ChannelCloseInitiated`. No fund transfers.
 - `disputeChannel` → requires status `Closing` and `block.timestamp < disputeDeadline`. Accepts only vouchers with strictly higher nonce. Updates `claimedAmount`, emits `ChannelDisputed`. No fund transfers.
 - `settleChannel` → requires status `Closing` and `block.timestamp >= disputeDeadline`. Computes fee on final `claimedAmount`, transfers funds to provider/treasury/client, sets status to `Closed`, emits `ChannelSettled`.
+- `reclaimExpired` → requires status `Open` and `block.timestamp >= expiresAt`. Returns the full deposit to the client (no fee deducted — no voucher was submitted). Sets status to `Closed`, emits `ChannelExpiredReclaimed`. Callable by the client only. This is the escape hatch for channels where the node never initiated a close.
 
 **Safety bounds (hardcoded):**
 
 | Parameter | Minimum | Maximum |
 | --- | --- | --- |
 | Fee percentage | 0 bps (0%) | 2000 bps (20%) |
-| Dispute window | 1800 seconds (30 min) | 604800 seconds (7 days) |
+| Dispute window | 43200 seconds (12 hours) | 259200 seconds (3 days) |
 | Min deposit | 1 base unit | No max |
-| Rate floor | 0 | Must be < ceiling |
+| Rate floor | 1 base unit | Must be < ceiling |
 | Rate ceiling | Must be > floor | No max |
 | Max voucher interval | 1 MB | 1024 MB (~1 GB) |
+| Max channel duration | 604800 seconds (7 days) | 31536000 seconds (365 days) |
 
 **Rate bounds are in USDC base units (6 decimals) for the PoC.** The contract stores a single `RateBounds` struct with `deliveryFloor` and `deliveryCeiling`. Per-token rate bounds are deferred to [ADR 010](010-multi-token.md).
 
@@ -510,9 +536,86 @@ A lightweight, optional mechanism for clients to signal commitment:
 - Enforcement is off-chain (node-side logic), not on-chain
 - Clients withdraw anytime: `StakingRegistry.clientUnstake(amount)`
 
-**NodeId-to-address mapping:** During the iroh connection handshake, the client's `NodeId` (ed25519 public key) is known. The client signs a message binding their `NodeId` to their Ethereum address and includes it in the `StreamRequest`. The node verifies this signature and uses the Ethereum address to look up `clientStakeOf`. This mapping is ephemeral (per-session, not stored on-chain).
+**NodeId-to-address mapping:** See [NodeId-to-Ethereum Binding](#nodeid-to-ethereum-binding) for the full specification of how iroh NodeIds are bound to Ethereum addresses.
 
 This is a soft signal, not a hard gate. Non-staking clients still get served, just with lower priority during congestion.
+
+## NodeId-to-Ethereum Binding
+
+The protocol requires a verifiable mapping between iroh NodeIds (ed25519 public keys) and Ethereum addresses (secp256k1-derived). This binding is used for client priority staking lookups, payment channel association, and slash evidence attribution.
+
+### Binding Message Format
+
+The binding uses EIP-712 typed structured data, signed by the Ethereum private key:
+
+```solidity
+bytes32 constant BIND_NODE_TYPEHASH = keccak256(
+    "BindNodeId(bytes32 nodeId,uint64 nonce)"
+);
+```
+
+Where:
+- `nodeId`: the 32-byte ed25519 public key (iroh `NodeId`)
+- `nonce`: a monotonic counter per Ethereum address, preventing replay of revoked bindings
+
+The EIP-712 domain separator is the same as the `StakingRegistry` contract deployment (chain ID + contract address), preventing cross-chain and cross-contract replay.
+
+### On-Chain Registration
+
+Nodes register their binding on-chain via `StakingRegistry.bindNodeId()`. This creates an authoritative, publicly queryable mapping:
+
+```solidity
+// StakingRegistry additions
+mapping(bytes32 => address) public nodeIdToAddress;
+mapping(address => bytes32) public addressToNodeId;
+mapping(address => uint64) public bindingNonce;
+
+function bindNodeId(bytes32 nodeId, bytes calldata signature) external {
+    uint64 nonce = bindingNonce[msg.sender];
+    bytes32 digest = keccak256(abi.encodePacked(
+        "\x19\x01",
+        DOMAIN_SEPARATOR,
+        keccak256(abi.encode(BIND_NODE_TYPEHASH, nodeId, nonce))
+    ));
+    require(ECDSA.recover(digest, signature) == msg.sender, "invalid signature");
+
+    // Reject if nodeId is already bound to a different address
+    address existingOwner = nodeIdToAddress[nodeId];
+    require(existingOwner == address(0) || existingOwner == msg.sender, "NodeId bound to another address");
+
+    // Clear caller's previous binding if exists
+    bytes32 oldNodeId = addressToNodeId[msg.sender];
+    if (oldNodeId != bytes32(0)) {
+        delete nodeIdToAddress[oldNodeId];
+    }
+
+    nodeIdToAddress[nodeId] = msg.sender;
+    addressToNodeId[msg.sender] = nodeId;
+    bindingNonce[msg.sender] = nonce + 1;
+
+    emit NodeIdBound(msg.sender, nodeId, nonce);
+}
+
+function resolveNodeId(bytes32 nodeId) external view returns (address) {
+    return nodeIdToAddress[nodeId];
+}
+```
+
+### Off-Chain (Ephemeral) Binding for Clients
+
+Clients who do not wish to register on-chain (e.g., for priority staking lookups only) include a signed binding in their `StreamRequest`. The node verifies the EIP-712 signature over `BindNodeId(nodeId, nonce=0)` using `ecrecover`, confirms the recovered address matches the claimed Ethereum address, and uses that address for `clientStakeOf` lookups. This ephemeral binding is not stored on-chain and is valid only for the session.
+
+### Binding Requirements by Role
+
+| Role | On-chain binding required? | Rationale |
+| --- | --- | --- |
+| Node (staked) | **Yes** — must call `bindNodeId` at registration | Slash evidence references on-chain NodeId→address mapping |
+| Client (priority staking) | No — ephemeral binding in `StreamRequest` is sufficient | Priority staking is a soft signal; no on-chain enforcement needed |
+| Client (opening channels) | No — channel `client` field is the Ethereum address directly | Channel operations use Ethereum addresses, not NodeIds |
+
+### Rebinding
+
+A node or client can rebind their Ethereum address to a new NodeId by calling `bindNodeId` again (the nonce increments, invalidating the old binding). The old NodeId→address mapping is deleted. This supports key rotation scenarios (e.g., compromised iroh key).
 
 ## Decimal Handling
 

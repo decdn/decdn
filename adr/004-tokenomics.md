@@ -30,7 +30,7 @@ Use a **dual-currency model**: USDC for operational payments, TOKEN (native ERC-
 
 **Staking — single role:**
 
-All nodes stake TOKEN to participate in the network. A node that has not staked cannot register in the on-chain registry and will not appear in gossip routing tables. Whether a node is configured with an origin backend (S3/R2) or operates as a pure cache is a deployment choice — the protocol treats all staked nodes identically.
+All nodes stake TOKEN to participate in the network. A node that has not staked cannot register in the on-chain registry and will not appear in gossip peer tables. Whether a node is configured with an origin backend (S3/R2) or operates as a pure cache is a deployment choice — the protocol treats all staked nodes identically.
 
 Stake is slashable for: (1) serving data that fails BLAKE3 hash verification, (2) phantom blob announcements — claiming to have content that cannot be delivered, (3) rate manipulation — advertising one rate in probe responses then charging a higher rate during delivery, and (4) double settlement (production only). Going offline, having a cache miss, or taking content offline is not slashable — these are handled by reputation.
 
@@ -79,7 +79,7 @@ pie title TOKEN Distribution (1B total, fixed supply)
 
 **Node bootstrap fund:** Dedicated to attracting early nodes before organic delivery revenue is sufficient. Distributed as bonus rewards on top of normal USDC delivery payments. Governed by token holders — proposals to release funds require a governance vote. Target: fund 2 years of above-market node rewards.
 
-**PoC simplification:** The token contract includes a public `mint(address to, uint256 amount)` function callable by anyone. No supply cap, no distribution, no vesting.
+**PoC simplification:** The token contract includes a `mint(address to, uint256 amount)` function restricted to `onlyOwner` (the deployer address). No supply cap, no distribution, no vesting. The `onlyOwner` guard prevents arbitrary minting by non-deployers on the testnet, avoiding confusion with an unrestricted public mint. **Production:** the mint function is removed entirely from the production token contract. The fixed 1B supply is minted once in the constructor and distributed per the allocation table above. There is no `mint` function in the production contract — supply is immutably fixed at genesis.
 
 ## Staking and Slashing Schedule
 
@@ -98,8 +98,8 @@ pie title TOKEN Distribution (1B total, fixed supply)
 | --- | --- | --- |
 | First offense | 10% of stake | 5% of stake |
 | Second offense within 30 days | 10% of stake | 15% of stake |
-| Third offense within 30 days | 10% of stake | 100% of stake (full ejection) |
-| Offense counter reset | N/A | After 90 days without incidents |
+| Third offense within 30 days | 10% of stake | 50% of stake (triggers auto-ejection via cumulative loss) |
+| Offense counter reset | After 30 days without incidents | After 90 days without incidents |
 
 ### Slash Distribution
 
@@ -112,20 +112,22 @@ The challenger reward incentivizes watchtowers and honest nodes to monitor and r
 
 ### Challenge Bond
 
-To prevent frivolous fraud proof submissions:
+To prevent frivolous fraud proof submissions, challengers must post a TOKEN bond. Without a bond, the PoC is vulnerable to zero-cost rate manipulation slash claims — any address can submit slash evidence (two signed messages) with no penalty for frivolous or fabricated claims, enabling griefing of honest nodes.
 
 | Parameter | PoC | Production |
 | --- | --- | --- |
-| Challenge bond | N/A (not implemented) | 50 TOKEN |
-| Bond return | N/A | Returned if challenge succeeds (node slashed) |
-| Bond forfeiture | N/A | Forfeited if node successfully counters. 50% burned, 50% to node. |
+| Challenge bond | 100 TOKEN | 50 TOKEN |
+| Bond return | Returned if challenge succeeds (node slashed) | Returned if challenge succeeds (node slashed) |
+| Bond forfeiture | Forfeited if node successfully counters. 50% burned, 50% to node. | Forfeited if node successfully counters. 50% burned, 50% to node. |
+
+The PoC bond is set higher than production (100 vs 50 TOKEN) because testnet TOKEN has no real economic cost and can be provisioned cheaply by the team — a higher nominal amount creates at least a transactional friction barrier. In production, where TOKEN has real value, 50 TOKEN provides sufficient economic deterrence.
 
 ### Auto-Ejection
 
 If a node's stake drops below 50% of the minimum stake requirement due to accumulated slashing:
 
 - Removed from the staking registry
-- Content routing announces their content as unavailable
+- Peers drop the node from their peer table (gossip messages from unregistered nodes are rejected via signature + registry validation; see [ADR 001](001-network.md)). Paid pulls also verify registry status before opening a stream (ADR 001, Content Discovery step 5), bounding the risk of paying an ejected node to at most 1 MB × rate_per_mb
 - Remaining stake enters forced unbonding (standard unbonding period applies)
 - Node must re-stake at full minimum to rejoin
 
@@ -238,7 +240,17 @@ The per-node monthly shortfall at PoC scale is ~$34. Subsidy requirements at dif
 | Minimal PoC | 20 | 6 months | ~$4,080 |
 | Extended PoC | 50 | 12 months | ~$20,400 |
 
-At any reasonable TOKEN price, these amounts are a tiny fraction of the 200M TOKEN bootstrap fund. The bootstrap fund is more than adequate for PoC scale. The open question is whether it suffices for the production bootstrap period — hundreds or thousands of nodes operating before organic traffic catches up to infrastructure costs.
+At any reasonable TOKEN price, these amounts are a tiny fraction of the 200M TOKEN bootstrap fund. The bootstrap fund is more than adequate for PoC scale.
+
+**Production bootstrap modeling.** The table below estimates bootstrap fund requirements at various production scales, assuming the per-node shortfall decreases as organic traffic grows:
+
+| Phase | Nodes | Organic revenue/node | Shortfall/node | Duration | Total subsidy |
+| --- | --- | --- | --- | --- | --- |
+| Early production | 100 | $15/month | $35/month | 12 months | $420,000 |
+| Growth | 500 | $50/month | $0/month (breakeven) | — | $0 |
+| Mature | 1,000+ | $100+/month | — (profitable) | — | $0 |
+
+At a TOKEN price of $0.01 (conservative early production), the 200M TOKEN bootstrap fund is worth $2M — sufficient to cover the early production phase (~$420K) with margin. At $0.001/TOKEN, the fund is worth $200K — marginal. **The bootstrap fund's adequacy is directly tied to TOKEN price**, which creates a reflexive dependency: if the network fails to attract traffic, TOKEN price drops, the fund buys less subsidy, and nodes leave. This chicken-and-egg dynamic is the primary economic risk and should be monitored as the network scales.
 
 ### Gas Cost Breakdown (Arbitrum)
 

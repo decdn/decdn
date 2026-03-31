@@ -108,7 +108,7 @@ Hash-based blacklisting covers only exact copies of a blob. A one-byte change pr
 
 - Is removed from the `StakingRegistry` (same effect as stake ejection)
 - Cannot register new nodes under the same address
-- Has all its NodeIds excluded from `CacheAnnounce` routing tables
+- Has all its NodeIds excluded from peer tables (gossip validation rejects messages from blacklisted nodes)
 
 This raises the cost of re-upload evasion from trivial (change a byte) to significant: the operator must fund and register a new identity with fresh stake. Repeat evasion becomes progressively more expensive.
 
@@ -122,19 +122,27 @@ This raises the cost of re-upload evasion from trivial (change a byte) to signif
 
 Nodes poll `getBlacklistVersion()` on a configurable interval (`blacklist_poll_interval`, default 10 minutes). When the version has advanced, the node fetches new entries since its last-seen version, filtered to its declared region plus global entries.
 
+**Version sync recovery.** If a node has been offline or missed multiple version bumps, delta fetching may be insufficient (events may have been pruned from the RPC provider's log retention window). The recovery strategy is:
+
+1. If the gap between `last_seen_version` and `current_version` is ≤ 100 versions: fetch deltas normally via contract events.
+2. If the gap exceeds 100 versions (or the delta fetch fails): perform a full re-sync by calling `getBlacklistVersion()` and iterating all events from the contract's deployment block. This is expensive but correct.
+3. As a fallback, if the full event log is unavailable (RPC provider pruned old events): the node fetches the current blacklist state by calling `isBlacklisted` for all hashes in its local cache. This is O(cache_size) RPC calls but ensures no stale content is served.
+
+The node MUST NOT accept connections until its blacklist is synced to the current version.
+
 On startup, nodes always fetch the full current blacklist (global + their region) before accepting connections.
 
 ### On Blacklist Event
 
 When a node receives a new blacklisted hash, it must, **in order**:
 
-1. **Stop announcing** — omit the hash from all future `CacheAnnounce` gossip messages immediately
+1. **Stop announcing** — omit the hash from `popular_hashes` in all future `NodeAnnounce` gossip messages immediately
 2. **Stop serving** — reject any new `StreamRequest` for the hash immediately, returning `HashBlacklisted`
 3. **Evict from cache** — delete the blob from local storage within the compliance window
 
 The announce-first ordering is critical: announcing content that is then not delivered triggers the phantom-blob detection path (ADR 003). Eviction from disk can be async; announcement suppression must be synchronous.
 
-When a node receives a blacklisted origin address, it additionally stops accepting any `StreamRequest` that presents a channel funded by that operator address, and removes all of that origin's NodeIds from its local routing table.
+When a node receives a blacklisted origin address, it additionally stops accepting any `StreamRequest` that presents a channel funded by that operator address, and removes all of that origin's NodeIds from its local peer table.
 
 In-flight streams for a blacklisted hash are terminated at the next MB boundary. The client receives a `HashBlacklisted` error and can request a refund of the unused channel balance.
 
@@ -142,7 +150,7 @@ In-flight streams for a blacklisted hash are terminated at the next MB boundary.
 
 A node applies only blacklist entries that are global or match its declared region (`node.region` in config). Entries for other regions are ignored. Nodes are not required to enforce takedowns outside their declared jurisdiction — regional compliance is the operator's legal obligation for their own node.
 
-Node region is self-reported and unverified at the protocol level. An operator who misreports their region to evade a regional takedown bears the legal risk of that choice — the protocol provides the mechanism; legal compliance is the operator's responsibility.
+Node region is self-reported and unverified at the protocol level. **PoC acceptance:** the PoC accepts self-reported regions as sufficient. An operator who misreports their region to evade a regional takedown bears the legal risk of that choice — the protocol provides the mechanism; legal compliance is the operator's responsibility. **Production mitigation:** IP-geolocation cross-checking via a decentralized oracle or third-party attestation service (consistent with the approach in [ADR 001](001-network.md)). Regional takedowns would then be enforced against both declared region and verified geolocation, with a mismatch triggering a compliance review. This is deferred to production because IP-geolocation infrastructure adds complexity and a new external dependency.
 
 ### Local Denylist
 
@@ -225,7 +233,7 @@ The minimum viable process for PoC:
 
 ## ADRs Affected
 
-- **ADR 001** (Network Topology) — `CacheAnnounce` must suppress blacklisted hashes and exclude blacklisted origin NodeIds; `StreamError::HashBlacklisted` and `StreamError::OriginBlacklisted` are new error variants
+- **ADR 001** (Network Topology) — `NodeAnnounce` must suppress blacklisted hashes from `popular_hashes`; blacklisted origin NodeIds are excluded from peer tables; `StreamError::HashBlacklisted` and `StreamError::OriginBlacklisted` are new error variants
 - **ADR 002** (Content Addressing) — content-addressed blobs can be removed from the network layer even though the hash remains valid; this is explicitly accepted
 - **ADR 004** (Tokenomics) — serving blacklisted content added to the slashable offense list; origin blacklisting triggers same stake ejection path as repeated slashing
 - **ADR 009** (Governance) — `ContentBlacklist` contract added to governance-controlled contracts; emergency multisig scope documented in ADR 009 as the single source of truth, covering both contract pausing and content/origin blacklisting; regional body registry introduced as a new governance primitive

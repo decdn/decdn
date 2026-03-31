@@ -48,12 +48,13 @@ EWMA with alpha=0.1 means recent interactions matter more but old interactions s
 Reports received via iroh-gossip are aggregated using EWMA weighted by reporter credibility:
 
 ```
-reporter_weight = settled_channels(reporter) / max_settled_channels_observed
+reporter_weight = total_settled_usdc(reporter) / max(1, max_settled_usdc_observed)
 network_score = ewma(network_score, report.score, alpha=0.05 * reporter_weight)
 ```
 
-- `settled_channels(reporter)`: number of payment channels the reporter has settled on-chain (verifiable)
-- Alpha is scaled by reporter weight: high-credibility reporters move the score faster
+- `total_settled_usdc(reporter)`: cumulative USDC value across all payment channels the reporter has settled on-chain (verifiable). **Value-weighted, not count-weighted** — this prevents Sybil manipulation via many cheap channels (opening 100 channels with 1 USDC each gives the same weight as one channel with 100 USDC, making the attack cost proportional to desired influence rather than proportional to channel count).
+- `max(1, max_settled_usdc_observed)`: the `max(1, ...)` guard prevents division by zero at network bootstrap when no channels have been settled yet. At bootstrap, all reporters have weight 0 (no settled value), so network scores remain at their initial value (0.5) until the first channels settle.
+- Alpha is scaled by reporter weight: high-credibility reporters (more settled value) move the score faster
 
 ### 5. Combined Score
 
@@ -76,7 +77,7 @@ flowchart TD
     end
 
     subgraph Network["Network Score (30%)"]
-        GR[Gossip ReputationReport] --> RW["reporter_weight =<br/>settled_channels / max_observed"]
+        GR[Gossip ReputationReport] --> RW["reporter_weight =<br/>total_settled_usdc / max(1, max_observed)"]
         RW --> EWMA2["network_score = EWMA(network, report,<br/>a=0.05 * reporter_weight)"]
     end
 
@@ -107,7 +108,7 @@ struct ReportMetrics {
 }
 ```
 
-Reports only accepted from staked nodes.
+Reports only accepted from staked nodes. **Recency validation:** receivers MUST reject reports where either (a) `current_time - report.timestamp > max_report_age_secs` (too old) or (b) `report.timestamp > current_time + allowed_clock_skew_secs` (too far in the future). Defaults: `max_report_age_secs = 3600` (1 hour), `allowed_clock_skew_secs = 300` (5 minutes). This prevents replay of old reports and prevents reporters from using far-future timestamps to extend the replay window. The effective replay window is bounded to `max_report_age_secs + allowed_clock_skew_secs` (~65 minutes). **Clock sync dependency:** unlike the probe/stream timestamps (which are requester-generated and avoid clock sync — see ADR 005), reputation recency depends on loose clock agreement between reporter and receiver. The 1-hour + 5-minute window is tolerant of typical NTP drift but not of nodes with completely unsynchronized clocks.
 
 ```mermaid
 classDiagram
@@ -156,9 +157,9 @@ A single reputation report (local or network) can move a node's score by at most
 
 ### 9. Tie-Breaking
 
-When multiple nodes have the same final score (within 0.01 tolerance), select by:
+When multiple nodes have the same unified selection score (within 1% — see [ADR 001, Node Selection Algorithm](001-network.md#node-selection-algorithm)), select by:
 
-1. Lower current load (nodes include approximate load in gossip announcements)
+1. Lower current load (from `LoadHint` in `NodeAnnounce` gossip messages — see [ADR 001](001-network.md))
 2. Geographic diversity (prefer nodes in regions not already selected)
 3. Higher stake (more skin in the game)
 4. Random (final tiebreaker)

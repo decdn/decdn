@@ -32,7 +32,10 @@ graph TD
         C3[Client]
     end
 
-    S3[("Hidden Origin Backend<br/>S3 / R2 / B2")]
+    subgraph "Provider Infrastructure (external)"
+        S3[("Hidden Origin Backend<br/>S3 / R2 / B2")]
+        A["App Server<br/>(ADR 006)"]
+    end
 
     N1 <-->|"cdn/client/v1<br/>paid per-MB USDC"| N2
     N2 <-->|"cdn/client/v1<br/>paid per-MB USDC"| N3
@@ -44,11 +47,16 @@ graph TD
 
     N2 -.->|opaque fetch| S3
 
-    N1 <-.->|"iroh-gossip<br/>CacheAnnounce"| N2
-    N2 <-.->|"iroh-gossip<br/>CacheAnnounce"| N3
+    N1 <-.->|"iroh-gossip<br/>NodeAnnounce"| N2
+    N2 <-.->|"iroh-gossip<br/>NodeAnnounce"| N3
+
+    S3 -.->|"K_blob at ingest"| A
+    A -.->|"WebSocket/SSE<br/>epoch keys + sealed envelopes"| C1
+    A -.->|"WebSocket/SSE<br/>epoch keys + sealed envelopes"| C2
+    A -.->|"WebSocket/SSE<br/>epoch keys + sealed envelopes"| C3
 ```
 
-Clients probe candidate nodes, pick the best by `rate_per_mb × rtt_ms`, stream over `cdn/client/v1`, and pay via off-chain USDC vouchers. On a cache miss, a node pulls from another node that has the blob (paid via `cdn/client/v1`) and caches locally. Every byte delivered — whether client→node or node→node — is paid.
+Clients probe candidate nodes, pick the best by the unified selection score (see [ADR 001](001-network.md#node-selection-algorithm) for the full formula), stream over `cdn/client/v1`, and pay via off-chain USDC vouchers. On a cache miss, a node discovers providers via probe fan-out (`cdn/probe/v1` to all known peers), selects the best, and pulls via `cdn/client/v1` (paid). Every byte delivered — whether client→node or node→node — is paid.
 
 ---
 
@@ -64,9 +72,9 @@ The implementation language is Rust. The networking stack is iroh, which provide
 
 ### [ADR 001 — Network Topology and Peer Mesh](001-network.md)
 
-**Flat peer mesh. Gossip-only content discovery (DHT deferred to post-PoC).**
+**Flat peer mesh. Gossip for node discovery, probe fan-out for content discovery (DHT deferred to post-PoC).**
 
-All staked nodes form a flat mesh. Cache state is broadcast over iroh-gossip on regional topics. On a cache miss, nodes pull from another node that has the blob (paid via `cdn/client/v1`). No external URL is ever accessed — the network is fully self-contained. The on-chain node registry is part of the `StakingRegistry` contract; the `NodeInfo` struct maps `NodeId` (ed25519 public key) to QUIC multiaddrs and Ethereum address.
+All staked nodes form a flat mesh. Node metadata is broadcast over iroh-gossip on regional topics (`cdn/region/{cc}/v1`) and a global topic (`cdn/global/v1`) via lightweight `NodeAnnounce` messages (~700 bytes). Content discovery is on-demand: on a cache miss, nodes probe all known peers via `cdn/probe/v1` in parallel and select the best provider by `rate_per_mb × rtt_ms`. No content inventories are broadcast — no Bloom filters, no hash lists. The on-chain node registry is part of the `StakingRegistry` contract; the `NodeInfo` struct maps `NodeId` (ed25519 public key) to QUIC multiaddrs and Ethereum address.
 
 ---
 
@@ -82,7 +90,7 @@ Every blob is identified by its BLAKE3 hash. Clients verify received bytes again
 
 **Off-chain USDC payment channels. Market-driven rates.**
 
-Clients pay nodes per MB. On a cache miss, nodes pay origin-backed nodes per MB for initial content pulls, then amortise that cost across many client deliveries. Origin-backed nodes set the effective price ceiling (reflecting their backend egress costs). Rates are fully market-driven within governance-set bounds. Voucher cadence (default 1 MB) is negotiable per-stream for large blob transfers, reducing overhead without materially increasing risk.
+Clients pay nodes per MB. On a cache miss, nodes pay origin-backed nodes per MB for initial content pulls, then amortise that cost across many client deliveries. Origin-backed nodes set the effective price ceiling (reflecting their backend egress costs). Rates are fully market-driven within governance-set bounds. Voucher cadence (default 1 MB) is negotiable per-stream for large blob transfers, reducing overhead without materially increasing risk. NodeId-to-Ethereum address binding is registered on-chain via `StakingRegistry.bindNodeId()` for nodes and ephemeral (per-session) for clients.
 
 ---
 
@@ -90,21 +98,24 @@ Clients pay nodes per MB. On a cache miss, nodes pay origin-backed nodes per MB 
 
 **USDC for payments. TOKEN for staking and fee discounts.**
 
-TOKEN is not used for payments. All nodes must stake TOKEN to participate. Staking cost creates accountability and Sybil resistance. 20% of protocol fees buy back and burn TOKEN. Fixed supply of 1B at genesis. Governance is covered separately in [ADR 009](009-governance.md).
+TOKEN is not used for payments. All nodes must stake TOKEN to participate. Staking cost creates accountability and Sybil resistance. 20% of protocol fees buy back and burn TOKEN. Fixed supply of 1B at genesis. Challenge bonds (100 TOKEN in PoC, 50 TOKEN in production) are required for slash claims, preventing zero-cost griefing. Governance is covered separately in [ADR 009](009-governance.md).
 
 ---
 
 ### [ADR 005 — Wire Protocol](005-protocol.md)
 
-**Three ALPN-identified protocols. `cdn/client/v1` covers all paid delivery.**
+**Four ALPN protocols + iroh-gossip. `cdn/client/v1` covers all paid delivery.**
 
-| ALPN | Purpose |
+| Protocol | Purpose |
 | --- | --- |
 | `cdn/probe/v1` | Parallel latency + availability check before node selection |
 | `cdn/client/v1` | Paid delivery: client→node, node→node (cache miss) |
-| iroh-gossip built-in | Content availability and node discovery |
+| `cdn/watchtower/v1` | Channel-dispute monitoring ([ADR 007](007-watchtower.md)) |
+| iroh-gossip (built-in) | Node metadata broadcast (`NodeAnnounce`), node discovery |
 
 `redirect` in `StreamResponse` always points to a NodeId, never an external URL. The origin backend is never revealed.
+
+**Note:** Epoch key delivery (ADR 006) uses WebSocket/SSE over standard HTTPS, not an iroh QUIC ALPN. The app server is an external component operated by the content provider; see [External Components](#external-components).
 
 ---
 
@@ -112,7 +123,7 @@ TOKEN is not used for payments. All nodes must stake TOKEN to participate. Staki
 
 **Envelope encryption with epoch-rotated key distribution.**
 
-Each blob is encrypted once at ingest with a random symmetric key (XChaCha20-Poly1305). The ciphertext is content-addressed and cached normally — one hash, one copy for all clients. An app server gates access: on each play request it wraps the blob key with a rotating epoch key and seals it to the client's public key. Epoch keys are pushed over an authenticated persistent connection; closing the connection revokes access within one epoch (5 minutes). CDN nodes only ever see ciphertext.
+Each blob is encrypted once at ingest with a random symmetric key (XChaCha20-Poly1305). The ciphertext is content-addressed and cached normally — one hash, one copy for all clients. An **app server** — an external component operated by the content provider, outside the CDN protocol and crate structure — gates access: on each play request it wraps the blob key with a rotating epoch key and seals it to the client's public key. Epoch keys are pushed over an authenticated persistent connection (WebSocket/SSE over HTTPS); closing the connection revokes access within one epoch (5 minutes). CDN nodes only ever see ciphertext. See [External Components](#external-components) for the app server's role and deployment model.
 
 ---
 
@@ -128,7 +139,7 @@ A watchtower holds the latest voucher for a registered channel and submits a `di
 
 **Interaction-weighted scoring with gossip propagation.**
 
-Nodes are ranked by a reputation score (0.0–1.0) derived from local observations (70%) and gossip-propagated reports (30%). Reports are weighted by the reporter's number of settled payment channels (on-chain verifiable), making reputation manipulation expensive. Scores decay toward neutral without fresh data, clamping limits per-report impact, and a cold-start bootstrap gives new nodes initial traffic.
+Nodes are ranked by a reputation score (0.0–1.0) derived from local observations (70%) and gossip-propagated reports (30%). Reports are weighted by the reporter's total settled USDC value (on-chain verifiable), making reputation manipulation expensive (proportional to capital deployed, not channel count). Scores decay toward neutral without fresh data, clamping limits per-report impact, and a cold-start bootstrap gives new nodes initial traffic.
 
 ---
 
@@ -136,7 +147,7 @@ Nodes are ranked by a reputation score (0.0–1.0) derived from local observatio
 
 **Admin key for PoC. Token-weighted governance with safety bounds for production.**
 
-During the PoC, a single deployer address controls all contract parameters. Production governance uses OpenZeppelin Governor with TOKEN voting, 4% quorum, and a 2-day timelock. All governable parameters have hardcoded safety bounds that even governance cannot override. A 3-of-5 emergency multisig can only pause contracts, with a 12-month sunset.
+During the PoC, a single deployer address controls all contract parameters. Production governance uses OpenZeppelin Governor with TOKEN voting, 4% quorum, and a 2-day timelock. All governable parameters have hardcoded safety bounds that even governance cannot override (e.g., slash 5%–50%, dispute window 12h–72h). A 3-of-5 emergency multisig can only pause contracts and add emergency blacklist entries, with a 12-month sunset enforced via an immutable constructor deadline.
 
 ---
 
@@ -218,10 +229,10 @@ The protocol does not dictate cache policy. Nodes are economically motivated to 
 
 **Cache miss resolution** follows a priority order:
 
-1. **Paid pull-through (preferred):** Node checks its routing table for peers that have the blob, probes candidates, selects by `rate_per_mb × rtt_ms`, pulls via `cdn/client/v1` (paid), caches locally, and streams to the client while the pull is in progress.
+1. **Paid pull-through (preferred):** Node checks its probe cache or performs a probe fan-out (`cdn/probe/v1` to all known peers), selects the best provider by the unified selection score ([ADR 001](001-network.md#node-selection-algorithm)), pulls via `cdn/client/v1` (paid), caches locally, and streams to the client while the pull is in progress.
 2. **Redirect (last resort):** If pull-through is disabled (`pull_through: false` in config), the node returns a redirect to an origin-backed node's NodeId. The client opens a channel with that node directly.
 
-**Prefetching:** Nodes can proactively cache popular content by paying to pull it from other nodes. Popularity signals come from gossip (if multiple nodes announce a blob, it is popular). All prefetch pulls are paid via `cdn/client/v1`.
+**Prefetching:** Nodes can proactively cache popular content using two signals: (1) local demand — tracking cache miss frequency per hash and prefetching when a threshold is crossed (default: 3 misses in 5 minutes); (2) network popularity — observing which hashes appear in multiple peers' `popular_hashes` fields in `NodeAnnounce` gossip messages (default threshold: 3+ peers within 10 minutes). All prefetch pulls use the same probe fan-out → `cdn/client/v1` path (paid).
 
 **Eviction:** LRU or frequency-weighted eviction (LFU). Operators tune cache size to maximize hit rate within their storage budget.
 
@@ -232,9 +243,9 @@ flowchart TD
     C --> D[Client pays per MB via vouchers]
 
     B -->|Miss| E{pull_through enabled?}
-    E -->|Yes| F[Query routing table for peers with blob]
-    F --> G["Probe candidates (cdn/probe/v1)"]
-    G --> H["Select best: rate_per_mb x rtt_ms"]
+    E -->|Yes| F["Probe fan-out (cdn/probe/v1 to all known peers)"]
+    F --> G["Collect has_blob:true responses (500ms timeout)"]
+    G --> H["Select best: unified selection score"]
     H --> I["Pull via cdn/client/v1 (node pays peer)"]
     I --> J[Cache locally + stream to client simultaneously]
     J --> D
@@ -259,6 +270,9 @@ decdn/
 │   └── contracts/                # Solidity contracts + Foundry
 ├── tests/                        # Integration tests
 └── adr/                          # Architecture decision records
+# The app server (ADR 006) is an external component, not part of this workspace.
+# Content providers build it using their own stack. A reference implementation
+# may be provided as a separate repository.
 ```
 
 ### Dependency Chain
@@ -308,6 +322,30 @@ graph TD
 
 ---
 
+## External Components
+
+Components referenced by ADRs that are operated by content providers, not part of the CDN protocol or workspace.
+
+### App Server ([ADR 006](006-e2e-encryption.md))
+
+The app server is a traditional web service operated by the content provider (e.g., a streaming platform's backend). It is **not** part of the decentralized CDN — it does not participate in gossip, probing, or paid delivery.
+
+**Responsibilities:**
+
+- Stores blob encryption keys (`K_blob`) received from the origin at ingest time
+- Authenticates client sessions and validates subscription status
+- Delivers epoch keys over an authenticated persistent connection (WebSocket or SSE)
+- Issues sealed envelopes (`crypto_box_seal`) containing wrapped `K_blob` on play requests
+- Issues offline playback leases (sealed to device keys)
+
+**Why WebSocket/SSE, not iroh QUIC:** The app server intentionally sits outside the iroh ecosystem. It handles subscription billing, OAuth/session auth, and key management — traditional web service concerns. Content providers integrate it with their existing infrastructure (load balancers, API gateways, auth systems). Requiring iroh QUIC would couple the provider's application backend to the CDN networking stack without protocol benefit. The watchtower ([ADR 007](007-watchtower.md)) uses iroh QUIC because it is a CDN protocol participant; the app server is not.
+
+**Scaling model:** One persistent connection per active subscriber. Standard WebSocket scaling applies (sticky sessions or pub/sub fanout). The app server scales with subscriber count, not CDN node count.
+
+**PoC scope:** A minimal reference implementation may be provided in a separate repository. The CDN crates do not depend on it.
+
+---
+
 ## Observability
 
 - **Structured logging** via `tracing` crate (standard in iroh ecosystem). JSON output for machine consumption.
@@ -336,9 +374,9 @@ A fully decentralized storage model was evaluated: nodes would commit to durable
 
 Not in PoC scope. The planned approach for the next phase:
 
-Dedicated **indexer nodes** subscribe to the gossip topic, build a searchable index of content metadata (via `tantivy` or equivalent), and expose a query API on a custom ALPN (`cdn/search/v1`). Multiple independent indexers can coexist. Clients pay per query via the same payment channel mechanism. Indexers register in the `StakingRegistry` and are slashable for fabricated results.
+Dedicated **indexer nodes** subscribe to gossip topics and participate in probe fan-out (responding to `cdn/probe/v1` queries) to build a searchable index of content metadata (via `tantivy` or equivalent), exposing a query API on a custom ALPN (`cdn/search/v1`). Multiple independent indexers can coexist. Clients pay per query via the same payment channel mechanism. Indexers register in the `StakingRegistry` and are slashable for fabricated results.
 
-During PoC (before indexers exist), clients use the full-table gossip approach: every node holds the complete content routing table. The migration to indexers is additive — they subscribe to the same gossip topic.
+During PoC (before indexers exist), content discovery uses probe fan-out — every cache miss probes all known peers via `cdn/probe/v1`. At PoC scale (tens of nodes), this provides complete coverage. The migration to indexers or DHT-based discovery is additive — probe fan-out remains the fallback.
 
 ---
 

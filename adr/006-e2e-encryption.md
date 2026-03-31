@@ -37,7 +37,21 @@ XChaCha20-Poly1305 is chosen over AES-256-GCM because its 24-byte nonce eliminat
 
 ### Key Delivery Layer (per play request)
 
-An app server (outside the CDN protocol) gates access and delivers `K_blob` to authorized clients using two mechanisms combined:
+#### App Server (External Component)
+
+An app server gates access and delivers `K_blob` to authorized clients. The app server is a traditional web service operated by the content provider, **not** part of the CDN protocol or crate structure. It communicates with clients over WebSocket or SSE (provider's choice), not over iroh QUIC. This is a deliberate boundary: the app server handles subscription auth, billing integration, and key management — concerns that belong to the content provider's existing infrastructure, not the decentralized CDN.
+
+The app server's minimum API surface:
+
+- `POST /play` — accepts session token + blob hash, returns sealed envelope
+- `GET /keys/stream` (WebSocket) or `GET /keys/events` (SSE) — authenticated persistent connection for epoch key delivery
+- `POST /offline/lease` — issues offline playback lease for a set of tracks
+
+The technology stack, deployment model, and auth mechanism are provider choices. The CDN protocol is agnostic to these — it only requires that the client possesses the correct epoch key and sealed envelope before issuing a `StreamRequest` to a CDN node.
+
+#### Key Wrapping Protocol
+
+The app server gates access and delivers `K_blob` to authorized clients using two mechanisms combined:
 
 **Epoch keys** rotate on a fixed interval (default: 5 minutes). The app server derives each epoch key deterministically:
 
@@ -253,7 +267,7 @@ For PoC, no action items from this ADR are required. Content-addressed blobs are
 
 **Negative:**
 
-- Adds an app server component outside the CDN protocol. This is a new service to build, deploy, and operate.
+- Adds an app server component outside the CDN protocol (documented in [architecture.md](architecture.md#external-components) under External Components). This is a new service that content providers must build, deploy, and operate using their own stack. The client requires two transport stacks: iroh QUIC for CDN delivery and WebSocket/SSE for key delivery. A minimal reference implementation may be provided in a separate repository.
 - The app server's key store (holding all `K_blob` values) is a high-value target. It must be protected with a KMS or HSM in production. Compromise of the key store exposes all content.
 - A hacked client can still extract `K_blob` for tracks it plays in real-time. This is inherent to any scheme where the client produces plaintext output — equivalent to the "analog hole" in DRM systems.
 - Epoch key rotation creates a hard dependency on the persistent connection. If the WebSocket drops, the client cannot decrypt new tracks until it reconnects and receives the current epoch key. The client should cache the most recent epoch key in memory (not disk) to survive brief disconnects within the same epoch.
