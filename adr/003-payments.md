@@ -103,8 +103,8 @@ See [ADR 005 — Payment channels and concurrent streams](005-protocol.md#paymen
 
 The protocol fee is calculated **at final settlement**, after the dispute window expires, based on the highest valid voucher amount on-chain at that point. The three-step channel close lifecycle is:
 
-1. **`closeChannel`** — records the submitted voucher's `amount` in `claimedAmount` and `nonce` in `claimedNonce`, sets status to `Closing`, starts the dispute window. **No fee is deducted.**
-2. **`disputeChannel`** (during dispute window) — if the submitted voucher has a strictly higher nonce, updates both `claimedAmount` and `claimedNonce` to the new values. Still **no fee deduction**. Submissions with an equal or lower nonce revert with no state change and no fee implications.
+1. **`closeChannel`** — callable by client or provider only. Records the submitted voucher's `amount` in `claimedAmount` and `nonce` in `claimedNonce`, sets status to `Closing`, starts the dispute window. **No fee is deducted.**
+2. **`disputeChannel`** (during dispute window) — callable by any address. If the submitted voucher has a strictly higher nonce, updates both `claimedAmount` and `claimedNonce` to the new values. Still **no fee deduction**. Submissions with an equal or lower nonce revert with no state change and no fee implications.
 3. **`settleChannel`** (after dispute window expires) — callable by anyone. Computes the fee on the final `claimedAmount`, distributes funds, and sets status to `Closed`:
    - Provider receives: `claimedAmount - fee`
    - Treasury receives: `fee = claimedAmount × feePercentage / 10000`
@@ -240,6 +240,13 @@ The 30-second validity window accounts for the possibility that a blob is legiti
 Node monitors the mempool and front-runs a client's channel close with a higher voucher submission.
 
 Not a real attack. The contract always settles the highest valid voucher, and only the client can sign a valid voucher. A node submitting the latest voucher before the client is the intended happy path. Fabricating a higher voucher requires forging the client's ECDSA signature, which is cryptographically infeasible.
+
+---
+
+**Third-party forced channel close (DoS)**
+A third party holding a valid voucher calls `closeChannel` to force the channel from `Open` to `Closing`, halting delivery.
+
+**Resolved: access control restriction.** `closeChannel` requires `msg.sender == channel.client || msg.sender == channel.provider`. Third parties cannot initiate a close regardless of whether they hold a valid voucher. Watchtower functionality is unaffected — watchtowers operate via `disputeChannel` during the dispute window. The residual risk is a `disputeChannel` call with an intercepted voucher, which can only *improve* the settlement (higher nonce required). QUIC transport (TLS 1.3) makes voucher interception unlikely.
 
 ---
 
@@ -401,9 +408,9 @@ event ChannelExpiredReclaimed(
 **Channel expiry:** `expiresAt` is set at channel open: `expiresAt = block.timestamp + maxChannelDuration`. The `maxChannelDuration` parameter defaults to 90 days and is governable within hardcoded bounds (minimum 7 days, maximum 365 days). Channel expiry protects clients from indefinitely locked funds when a node disappears without closing the channel.
 
 **Channel close lifecycle:**
-- `closeChannel` → requires status `Open`. Sets status to `Closing`, records voucher, emits `ChannelCloseInitiated`. No fund transfers.
-- `disputeChannel` → requires status `Closing` and `block.timestamp < disputeDeadline`. Accepts only vouchers with strictly higher nonce. Updates `claimedAmount`, emits `ChannelDisputed`. No fund transfers.
-- `settleChannel` → requires status `Closing` and `block.timestamp >= disputeDeadline`. Computes fee on final `claimedAmount`, transfers funds to provider/treasury/client, sets status to `Closed`, emits `ChannelSettled`.
+- `closeChannel` → requires status `Open`. **Callable by `channel.client` or `channel.provider` only** (`require(msg.sender == channel.client || msg.sender == channel.provider)`). Sets status to `Closing`, records voucher, emits `ChannelCloseInitiated`. No fund transfers. Third parties (including watchtowers) cannot initiate a close — they act only during the dispute window via `disputeChannel`.
+- `disputeChannel` → requires status `Closing` and `block.timestamp < disputeDeadline`. Callable by any address holding a valid voucher with a strictly higher nonce. Updates `claimedAmount`, emits `ChannelDisputed`. No fund transfers. Unrestricted caller access is intentional: watchtowers and other third parties must be able to submit higher-nonce vouchers on behalf of an offline party during the dispute window.
+- `settleChannel` → requires status `Closing` and `block.timestamp >= disputeDeadline`. Callable by any address. Computes fee on final `claimedAmount`, transfers funds to provider/treasury/client, sets status to `Closed`, emits `ChannelSettled`.
 - `reclaimExpired` → requires status `Open` and `block.timestamp >= expiresAt`. Returns the full deposit to the client (no fee deducted — no voucher was submitted). Sets status to `Closed`, emits `ChannelExpiredReclaimed`. Callable by the client only. This is the escape hatch for channels where the node never initiated a close.
 
 **Safety bounds (hardcoded):**
@@ -668,5 +675,5 @@ Slashing and payment channels are independent by design. The following interacti
 - Open channels settle normally. Client funds are never trapped.
 - The ejected node cannot participate in new channels (clients verify node registration before opening channels, and nodes verify counterparty status before accepting a `StreamRequest`).
 - The ejected node is removed from gossip routing, so it receives no new client connections.
-- `closeChannel`, `disputeChannel`, and `settleChannel` remain callable on existing channels — these functions check channel state, not registry status.
+- `closeChannel` (client/provider only), `disputeChannel` (any address), and `settleChannel` (any address) remain callable on existing channels — these functions check channel state, not registry status.
 - The node must re-stake at the full minimum and re-register to resume operations.
