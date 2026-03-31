@@ -42,7 +42,7 @@ All economic parameters across the protocol are governable within hardcoded safe
 | --- | --- | --- | --- |
 | Protocol fee % | StablePaymentChannel | 0% (0 bps) | 20% (2000 bps) |
 | Minimum stake | StakingRegistry | 100 TOKEN | 100,000 TOKEN |
-| Slash percentages | StakingRegistry | 5% | 50% |
+| Slash percentage (per offense) | StakingRegistry | 5% | 50% |
 | Unbonding period | StakingRegistry | 3 days | 30 days |
 | Multiaddr update cooldown | StakingRegistry | 0 (disabled) | 86400 seconds (1 day) |
 | Max multiaddr size | StakingRegistry | 64 bytes | 1024 bytes |
@@ -55,7 +55,7 @@ All economic parameters across the protocol are governable within hardcoded safe
 Staking, slashing, and fee parameters are defined in [ADR 004](004-tokenomics.md). Payment channel parameters are defined in [ADR 003](003-payments.md). This ADR defines the governance mechanism that controls them.
 
 **Safety bound rationale:**
-- **Slash 5%–50%:** A 1% slash is economically negligible (10 TOKEN at minimum stake) and provides no deterrence. A 100% slash enables governance to fully confiscate stake, which is disproportionate for minor offenses and discourages staking. The 5%–50% range ensures slashing is meaningful but not existential for a single offense.
+- **Slash 5%–50% per offense:** A 1% slash is economically negligible (10 TOKEN at minimum stake) and provides no deterrence. A 100% single-offense slash enables governance to fully confiscate stake, which is disproportionate and discourages staking. The 5%–50% range ensures each individual slash is meaningful but not existential. Full ejection (effectively 100% loss) is still possible through **cumulative** slashing: three offenses at the production schedule (5% + 15% + 50% = 70% cumulative) triggers auto-ejection when stake drops below the 50% threshold ([ADR 004](004-tokenomics.md#auto-ejection)).
 - **Rate floor ≥ 1 base unit:** A zero floor allows free-riding nodes that advertise zero rates to attract traffic without generating protocol fees. The minimum of 1 USDC base unit ($0.000001/MB) is negligibly small but prevents true zero-rate abuse.
 - **Dispute window 12h–72h:** A 30-minute window is too short for watchtowers or human operators to respond to a stale close. A 7-day window locks client funds for an unacceptably long period. The 12h–72h range balances responsiveness with fund liquidity.
 - **Min deposit floor ≥ 1 base unit:** prevents dust channels that cost more in gas to settle than they contain.

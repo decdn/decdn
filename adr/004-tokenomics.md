@@ -98,7 +98,7 @@ pie title TOKEN Distribution (1B total, fixed supply)
 | --- | --- | --- |
 | First offense | 10% of stake | 5% of stake |
 | Second offense within 30 days | 10% of stake | 15% of stake |
-| Third offense within 30 days | 10% of stake | 100% of stake (full ejection) |
+| Third offense within 30 days | 10% of stake | 50% of stake (triggers auto-ejection via cumulative loss) |
 | Offense counter reset | After 30 days without incidents | After 90 days without incidents |
 
 ### Slash Distribution

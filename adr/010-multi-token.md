@@ -225,7 +225,7 @@ struct SignedRate {
 - **Decimal heterogeneity.** Tokens use 0–18 decimals. A node misconfiguring decimals silently misprices deliveries. The `TokenInfo.decimals` field must be validated against the on-chain `IERC20Metadata.decimals()` return value at startup.
 - **No protocol-level price normalization.** A node advertising 1 base-unit/MB in USDC (= $0.000001/MB) and 1 base-unit/MB in a low-value token are indistinguishable at the wire level. Clients bear responsibility for evaluating whether a node's accepted token has value.
 - **Governance bottleneck.** Adding a new payment token requires a governance action (admin call for PoC, Governor proposal for production). This adds latency for operators who want to use a token not yet approved. Mitigated by the fact that token additions are infrequent and low-risk governance actions.
-- **Token removal complexity.** `removeToken` blocks new channels but existing open channels in that token remain valid. The network may carry "sunset" tokens for up to 30 days (channel auto-expiry) after removal.
+- **Token removal complexity.** `removeToken` blocks new channels but existing open channels in that token remain valid. The network may carry "sunset" tokens for up to 90 days (channel auto-expiry per `maxChannelDuration` — see [ADR 003](003-payments.md)) after removal.
 - **Per-token rate bounds governance burden.** Governance must set meaningful bounds for each token it wants to constrain. An unbounded token (zero `RateBounds` entry) has no floor or ceiling enforced.
 - **Slashing is always in TOKEN (resolved).** ADR 004's slashing schedule is denominated in TOKEN stake, and this remains unchanged with multi-token payments. Slashing operates on the `StakingRegistry` (TOKEN stake), not on payment channel deposits (which may be in any approved token). A node paid exclusively in DAI is still slashed in TOKEN — the node must hold TOKEN stake to participate in the network regardless of which payment tokens it accepts. No price oracle or cross-token conversion is needed. The slash amount is a percentage of TOKEN stake, not a percentage of delivery revenue.
 
@@ -248,7 +248,7 @@ Migration proceeds in three phases. Phase 3 is a **breaking change** for nodes t
 
 ### Phase 3: Retirement (breaking)
 
-8. Governance retires the legacy `StablePaymentChannel` — no new channels can be opened on it. Existing open channels settle normally until expiry (up to 30 days)
+8. Governance retires the legacy `StablePaymentChannel` — no new channels can be opened on it. Existing open channels settle normally until expiry (up to 90 days per `maxChannelDuration`)
 9. Nodes that have not upgraded to `PaymentChannel` can no longer participate in new payment channels — they cannot open channels on the new contract, and clients using the new contract cannot open channels with them. **This is a breaking change** — operators must upgrade before Phase 3 takes effect
 
 ## Open Questions
@@ -256,5 +256,5 @@ Migration proceeds in three phases. Phase 3 is a **breaking change** for nodes t
 - **Decimal validation at runtime.** Should the node fail to start if a configured token's on-chain `decimals()` does not match the configured value, or warn and continue? Failing to start is safer but may cause operational disruption if a proxy token contract is upgraded (rare but possible).
 - ~~**Slash denomination.**~~ **Resolved:** slashing is always in TOKEN stake (see Consequences above). No cross-token conversion needed — nodes must hold TOKEN stake regardless of payment token.
 - **Token metadata trust.** `IERC20Metadata` is not mandatory for ERC-20 tokens. Tokens without `decimals()` will cause a revert at startup. Should the contract use a try/catch and default to 18 decimals, or require the operator to always specify decimals explicitly in config?
-- **Token removal semantics.** `removeToken` blocks new channel opens but existing channels remain valid until expiry (up to 30 days). Should governance also have the ability to force-close all channels in a removed token (e.g., if the token is discovered to be malicious), or is blocking new channels sufficient?
+- **Token removal semantics.** `removeToken` blocks new channel opens but existing channels remain valid until expiry (up to 90 days per `maxChannelDuration`). Should governance also have the ability to force-close all channels in a removed token (e.g., if the token is discovered to be malicious), or is blocking new channels sufficient?
 - **Token vetting criteria.** What due diligence should governance perform before calling `addToken`? At minimum: verify no fee-on-transfer, no rebase mechanics, no pausable transfers that could lock contract funds, and standard `IERC20` compliance. Should this be codified in a checklist or left to governance discretion?

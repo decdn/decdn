@@ -96,7 +96,7 @@ TOKEN is not used for payments. All nodes must stake TOKEN to participate. Staki
 
 ### [ADR 005 — Wire Protocol](005-protocol.md)
 
-**Three ALPN-identified protocols. `cdn/client/v1` covers all paid delivery.**
+**Four ALPN-identified protocols. `cdn/client/v1` covers all paid delivery.**
 
 | ALPN | Purpose |
 | --- | --- |
@@ -219,7 +219,7 @@ The protocol does not dictate cache policy. Nodes are economically motivated to 
 
 **Cache miss resolution** follows a priority order:
 
-1. **Paid pull-through (preferred):** Node checks its routing table for peers that have the blob, probes candidates, selects by `rate_per_mb × rtt_ms`, pulls via `cdn/client/v1` (paid), caches locally, and streams to the client while the pull is in progress.
+1. **Paid pull-through (preferred):** Node checks its routing table for peers that have the blob, probes candidates, selects by the unified selection score ([ADR 001](001-network.md#node-selection-algorithm)), pulls via `cdn/client/v1` (paid), caches locally, and streams to the client while the pull is in progress.
 2. **Redirect (last resort):** If pull-through is disabled (`pull_through: false` in config), the node returns a redirect to an origin-backed node's NodeId. The client opens a channel with that node directly.
 
 **Prefetching:** Nodes can proactively cache popular content by paying to pull it from other nodes. Popularity signals come from gossip (if multiple nodes announce a blob, it is popular). All prefetch pulls are paid via `cdn/client/v1`.

@@ -5,7 +5,7 @@
 
 ## Context
 
-ADR 003 defines a 24-hour dispute window for payment channel settlement. Either party can counter a stale or fraudulent close by submitting a higher-nonce voucher during the window. This works if the counterparty is online — but if a node goes offline after a client submits a stale (low-amount) voucher, the node misses the dispute window and loses the difference between what it earned and what the stale voucher claims.
+ADR 003 defines a dispute window (default 24 hours, governable within 12h–72h) for payment channel settlement. Either party can counter a stale or fraudulent close by submitting a higher-nonce voucher during the window. This works if the counterparty is online — but if a node goes offline after a client submits a stale (low-amount) voucher, the node misses the dispute window and loses the difference between what it earned and what the stale voucher claims.
 
 ADR 003 identifies this liveness gap explicitly (stale close, Option A) and proposes a watchtower as the solution. The tokenomics spec (Section 8) sketches economic parameters — 0.1% of channel deposit per 30-day monitoring period — but defers the protocol design. This ADR resolves both.
 
@@ -124,7 +124,7 @@ Each channel should be registered with **2–3 independent watchtowers**. The wa
 Redundancy properties:
 - **No coordination between watchtowers.** Each operates independently with its own copy of the latest voucher.
 - **Multiple dispute submissions are harmless.** The contract accepts the highest-nonce voucher regardless of how many `disputeChannel` calls are made. Duplicate submissions waste gas but do not affect settlement.
-- **Failure tolerance.** All watchtowers must fail simultaneously during the 24-hour dispute window for the attack to succeed. With 3 independent operators, this requires correlated failure (shared infrastructure, coordinated attack, or bribery of all 3).
+- **Failure tolerance.** All watchtowers must fail simultaneously during the dispute window (default 24 hours) for the attack to succeed. With 3 independent operators, this requires correlated failure (shared infrastructure, coordinated attack, or bribery of all 3).
 
 The watched party's software should monitor watchtower connection health and alert the operator if fewer than 2 watchtowers are connected for more than 1 hour.
 
@@ -136,7 +136,7 @@ The defense stack is:
 
 1. **Local dispute monitor** (in-process) — handles the node-is-online case
 2. **Watchtowers** (external, redundant) — handles the node-is-offline case
-3. **24-hour dispute window** — provides the time budget for both layers to respond
+3. **Dispute window (default 24h, governable 12h–72h)** — provides the time budget for both layers to respond
 
 ```mermaid
 flowchart TD
