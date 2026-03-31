@@ -26,7 +26,7 @@ Use a **dual-currency model**: USDC for operational payments, TOKEN (native ERC-
 | Fee discounts | TOKEN | Direct financial incentive to hold more TOKEN |
 | Slashing | TOKEN | Already denominated in stake |
 
-**Token supply:** 1B TOKEN, fixed at genesis, no post-genesis minting. Deflationary pressure comes from two sources: 100% of slashed stake is burned; 20% of protocol fees (collected in USDC) are allocated for TOKEN buyback and burn. During the PoC, this allocation accumulates in the `BuybackBurner` contract without execution; buyback execution is a production-only feature (see [BuybackBurner Contract](#buybackburner-contract)).
+**Token supply:** 1B TOKEN, fixed at genesis, no post-genesis minting. Deflationary pressure comes from two sources: 50% of slashed stake is burned (the other 50% goes to the challenger who submitted the fraud proof — see [Slash Distribution](#slash-distribution)); 20% of protocol fees (collected in USDC) are allocated for TOKEN buyback and burn. During the PoC, this allocation accumulates in the `BuybackBurner` contract without execution; buyback execution is a production-only feature (see [BuybackBurner Contract](#buybackburner-contract)).
 
 **Staking — single role:**
 

@@ -168,7 +168,7 @@ decimals = 18
 # decimals = 18
 ```
 
-Nodes with no `accepted_tokens` entry default to USDC on their configured chain (backward-compatible with ADR 003 deployments).
+Nodes with no `accepted_tokens` entry default to USDC on their configured chain (backward-compatible with ADR 003 deployments during the coexistence phase — see [Migration from ADR 003](#migration-from-adr-003) for the full migration timeline including legacy contract retirement).
 
 **Amount handling:** All internal arithmetic uses raw base units. Display formatting divides by `10^decimals`. No conversion happens in the voucher signing path.
 
@@ -231,12 +231,25 @@ struct SignedRate {
 
 ## Migration from ADR 003
 
+Migration proceeds in three phases. Phase 3 is a **breaking change** for nodes that have not upgraded.
+
+### Phase 1: Coexistence (backward-compatible)
+
 1. Deploy `PaymentChannel` (the production contract) alongside the PoC `StablePaymentChannel`; both coexist. Governance immediately calls `addToken(USDC_ADDRESS)` so USDC is available from deployment
 2. Governance calls `addToken` for any additional tokens the network wants to support (e.g., DAI)
 3. Nodes add `accepted_tokens` to config; default is USDC (backward-compatible)
 4. Clients begin negotiating token in `StreamRequest`; nodes on new software respond with `UnsupportedToken` if the requested token is not accepted, while nodes on old software ignore the `payment_token` field and therefore only operate USDC channels
 5. Gossip messages include `token_rates`; old nodes advertise only legacy `rate_per_mb`; new nodes advertise both
-6. When the network has migrated sufficiently, the legacy `StablePaymentChannel` is retired by governance
+
+### Phase 2: Deprecation
+
+6. Governance announces deprecation of `StablePaymentChannel` — new channels should use `PaymentChannel`
+7. Node software emits deprecation warnings when opening channels on the legacy contract
+
+### Phase 3: Retirement (breaking)
+
+8. Governance retires the legacy `StablePaymentChannel` — no new channels can be opened on it. Existing open channels settle normally until expiry (up to 30 days)
+9. Nodes that have not upgraded to `PaymentChannel` can no longer open new payment channels. **This is a breaking change** — operators must upgrade before Phase 3 takes effect
 
 ## Open Questions
 
