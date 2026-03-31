@@ -243,7 +243,7 @@ flowchart TD
 
     B -->|Miss| E{pull_through enabled?}
     E -->|Yes| F["Probe fan-out (cdn/probe/v1 to all known peers)"]
-    F --> G["Collect has_blob:true responses (200ms timeout)"]
+    F --> G["Collect has_blob:true responses (500ms timeout)"]
     G --> H["Select best: rate_per_mb x rtt_ms"]
     H --> I["Pull via cdn/client/v1 (node pays peer)"]
     I --> J[Cache locally + stream to client simultaneously]

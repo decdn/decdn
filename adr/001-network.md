@@ -68,20 +68,28 @@ struct LoadHint {
 
 Both clients and nodes maintain a **peer table** (`NodeId → NodeAnnounce`) built from received gossip messages. This table tracks which nodes exist and their metadata — it does not track content.
 
-**Gossip validation:** Before accepting a `NodeAnnounce` and updating the peer table, a node verifies: (1) the `signature` is valid for the `node_id`'s public key over all other fields (serialized via postcard, consistent with [ADR 005](005-protocol.md)); (2) the `node_id` corresponds to an active staked node in the on-chain registry (checked against a local registry cache). Messages failing either check are silently dropped. This prevents unregistered or unstaked nodes from appearing in peer tables.
+**Registry cache:** Nodes maintain a local cache of the on-chain registry, kept fresh by subscribing to `NodeRegistered`, `NodeDeregistered`, and `NodeAutoEjected` events. On Arbitrum Sepolia (PoC), block times are ~250ms, so the staleness window is small. The registry cache is checked during gossip validation (below) and before initiating paid pulls (see Content Discovery step 5).
+
+**Gossip validation:** Before accepting a `NodeAnnounce` and updating the peer table, a node verifies: (1) the `signature` is valid for the `node_id`'s public key over all other fields (serialized via postcard, consistent with [ADR 005](005-protocol.md)); (2) the `node_id` corresponds to an active staked node in the on-chain registry (checked against a local registry cache); (3) `timestamp_us` is within ±60 seconds of the receiver's local clock (prevents replay of old messages; the 60-second window accommodates clock skew between nodes); (4) `timestamp_us` is strictly greater than the `timestamp_us` of the existing peer table entry for the same `node_id` (monotonic — prevents replay of older messages within the freshness window). Messages failing any check are silently dropped. This prevents unregistered, unstaked, or replayed nodes from appearing in or corrupting peer tables.
 
 #### Content Discovery (Probe Fan-Out)
 
 Content discovery is on-demand via the existing `cdn/probe/v1` protocol. When a node or client needs a blob, it probes known peers in parallel:
 
-1. **Probe cache check.** Look up `hash` in a short-lived LRU cache (`hash → Vec<(NodeId, rate_per_mb, rtt, ProbeResponse)>`, TTL 30 seconds, max 1024 entries). Each entry retains the full signed `ProbeResponse` for slashing evidence. If a valid entry exists, skip to step 4.
+1. **Probe cache check.** Look up `hash` in a short-lived LRU cache (`hash → Vec<(NodeId, rate_per_mb, rtt, ProbeResponse)>`, TTL 15 seconds, max 1024 entries). Each entry retains the full signed `ProbeResponse` for slashing evidence. If a valid entry exists, skip to step 4.
 2. **Fan-out.** Send `ProbeRequest {hash, timestamp_us}` in parallel to all known nodes (regional + global). The `cdn/probe/v1` protocol is unchanged — `ProbeResponse {has_blob, rate_per_mb, timestamp_us, signature}`.
-3. **Collect.** Wait up to 200ms. Store all `has_blob: true` responses in the probe cache.
-4. **Select.** Pick the best provider by `rate_per_mb × rtt_ms` (lowest wins). Open `cdn/client/v1` stream and pull.
+3. **Collect.** Wait up to 500ms. Store all `has_blob: true` responses in the probe cache. The 500ms window accommodates inter-continental RTTs (e.g., London↔Sydney ~250-300ms) to avoid creating geographical bottlenecks where only nearby nodes are ever selected.
+4. **Select.** Pick the best provider by `rate_per_mb × rtt_ms` (lowest wins).
+5. **Registry check.** Before opening a `cdn/client/v1` stream, verify the selected node's `node_id` is still active in the local registry cache. If not (ejected or deregistered since the probe), skip to the next-best provider. This bounds the risk of paying a node whose stake has been depleted — the maximum exposure without this check is 1 MB × `rate_per_mb` (one voucher granularity) before BLAKE3 verification detects bad data.
+6. **Pull.** Open `cdn/client/v1` stream and pull.
 
-On probe cache hit, if the selected provider no longer has the blob (evicted since the cached probe), the node falls back to a fresh fan-out.
+On probe cache hit, if the selected provider no longer has the blob (evicted since the cached probe), the node tries the next-best cached provider. If all cached providers fail or no cache entries remain, the node falls back to a fresh fan-out.
 
-**Note:** As currently specified, the probe cache TTL (30s) equals the slashing evidence window (30s) from ADR 005. Implementation must either reduce the probe cache TTL below the evidence window or require a confirmation probe before committing to a paid pull from a cached entry.
+**Probe cache TTL is 15 seconds** — half the 30-second slashing evidence window from ADR 005. This guarantees any cached probe response used for a paid pull is still within the slashable window with margin to spare, without requiring a confirmation probe.
+
+**Probe rate limits** prevent bursty cache misses from flooding the network:
+- **Outbound:** Each node limits itself to 10 probe fan-outs per second. Excess cache misses queue. At PoC scale (30 peers), this means a maximum of 300 outbound probes/s — well within capacity.
+- **Inbound:** Each node accepts at most 20 probe requests per peer per second (token bucket). Excess probes are silently dropped. This protects individual nodes from being overwhelmed by a single aggressive prober.
 
 #### Prefetching with Dual Signals
 
@@ -107,15 +115,15 @@ Node identity is the iroh `NodeId` (ed25519 public key). All staked nodes regist
 - All nodes participate in the same discovery and transport protocols; the only difference between origin-backed and cache-only nodes is whether they have an origin store configured
 - Gossip messages are lightweight (~700 bytes) — no content inventories, Bloom filters, or hash lists. Regional gossip topics bound message volume: nodes in one region don't receive announcements from irrelevant regions
 - Content discovery via probe fan-out provides fresh availability data — no stale content inventory to maintain
-- Probe cache prevents redundant fan-outs for popular content within a 30-second window
+- Probe cache prevents redundant fan-outs for popular content within a 15-second window
 - Once a node in a region caches a blob, other nodes in that region can pull from it at competitive rates rather than paying origin-backed node prices — popular content gets cheaper as it spreads
 - The flat mesh is simple to reason about and easy to test at small scale (PoC is tens of nodes)
 
 **Negative:**
 
-- Probe fan-out generates O(N) probe messages per cache miss. At PoC scale (tens of nodes) this is negligible; at production scale, fan-out must be bounded (DHT or selective fan-out)
-- Cold cache miss adds ~200ms latency (probe timeout) compared to a pre-built content index lookup; mitigated by probe cache for repeated lookups within 30 seconds
-- Probe cache introduces a brief staleness window (up to 30s) where a node may attempt to pull from a provider that has evicted the blob; the fallback is a fresh fan-out
+- Probe fan-out generates O(N) probe messages per cache miss. Rate limits (see below) prevent bursty cache misses from becoming a self-DoS; at production scale, fan-out must be bounded (DHT or selective fan-out)
+- Cold cache miss adds up to 500ms latency (probe timeout) compared to a pre-built content index lookup; mitigated by probe cache for repeated lookups within 15 seconds
+- Probe cache introduces a brief staleness window (up to 15s) where a node may attempt to pull from a provider that has evicted the blob; the fallback is trying the next cached provider, then a fresh fan-out
 - `popular_hashes` in `NodeAnnounce` explicitly gossips which blobs are in high demand — a new, compactly gossiped signal distinct from content availability (which is now only probe-discoverable)
 - Self-reported region hints (ISO 3166-1 alpha-2) are unverified; a node could misreport its region to appear in more gossip topics
 - Every transfer is paid, so nodes pulling content on cache miss incur a cost that must be recouped through subsequent client deliveries; this creates a natural economic barrier to speculative caching
