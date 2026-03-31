@@ -402,7 +402,7 @@ interface IBuybackBurner {
 
 `executeBuyback` is callable by governance multisig or the authorized `keeper` address. All `set*` functions are governance-only behind a timelock.
 
-**PoC note:** The `BuybackBurner` contract is deployed with the same interface, but `executeBuyback` is not called during the PoC. Fees accumulate in the contract. See [ADR 004](004-tokenomics.md#buybackburner-contract) for activation criteria.
+**PoC note:** The `BuybackBurner` contract is deployed with the same interface, but `executeBuyback` is not called during the PoC. The treasury transfers the 20% buyback allocation to the contract as usual, but fees accumulate there without being swapped. See [ADR 004](004-tokenomics.md#buybackburner-contract) for activation criteria.
 
 ### EIP-712 Voucher Signature
 

@@ -160,18 +160,20 @@ The `BuybackBurner` contract converts accumulated USDC fees into TOKEN and burns
 2. `executeBuyback()` swaps USDC for TOKEN via Uniswap V3 on L2
 3. Purchased TOKEN is sent to burn address (`0x000...dEaD`)
 
-**PoC behavior:** The `BuybackBurner` contract is deployed and receives the 20% fee allocation, but `executeBuyback()` is not called. Fees accumulate in the contract as a treasury reserve. At PoC scale, per-node revenue is ~$1.50/month (see [PoC Reality](#revenue-model-poc-reality)), so even a 20-node network generates only ~$30/month in delivery payments, ~$0.90/month in protocol fees, and ~$0.18/month in buyback allocation — insufficient to justify gas costs, let alone execute a meaningful market buy on a thin TOKEN/USDC pool. Buyback execution is enabled in production via governance vote once pool liquidity and fee volume justify it.
+**PoC behavior:** The `BuybackBurner` contract is deployed and receives the 20% fee allocation from the treasury, but `executeBuyback()` is not called. Fees accumulate in the contract as a treasury reserve. At PoC scale, per-node revenue is ~$1.50/month (see [PoC Reality](#revenue-model-poc-reality)), so even a 20-node network generates only ~$30/month in delivery payments, ~$0.90/month in protocol fees, and ~$0.18/month in buyback allocation — insufficient to justify gas costs, let alone execute a meaningful market buy on a thin TOKEN/USDC pool. Buyback execution is enabled in production via governance vote once pool liquidity and fee volume justify it.
 
 **Parameters:**
 
 | Parameter | PoC | Production | Governable |
 | --- | --- | --- | --- |
-| Minimum accumulation before buyback | N/A (execution disabled) | 100 USDC (reduced from 1,000 — at early production fee volumes, 1,000 USDC takes years to accumulate) | Yes |
+| Minimum accumulation before buyback | N/A (execution disabled) | 100 USDC | Yes |
 | Maximum single buyback | N/A (execution disabled) | 10,000 USDC | Yes |
 | Slippage tolerance | N/A (execution disabled) | 2% (200 bps) | Yes |
 | DEX | N/A (execution disabled) | Uniswap V3 TOKEN/USDC pool | Yes (pool address) |
 | Execution | Disabled — fees accumulate only | Governance-triggered or automated keeper | — |
 | Execution activation | N/A | Requires governance vote to enable | — |
+
+The minimum accumulation threshold is reduced from 1,000 to 100 USDC because at early production fee volumes, accumulating 1,000 USDC in the buyback allocation takes years even with dozens of active nodes.
 
 The caller provides `minTokenOut` to prevent sandwich attacks. If the TOKEN/USDC pool has insufficient liquidity, the swap reverts due to the `minTokenOut` check and accumulated fees remain in the contract until liquidity improves. The `maxBuybackAmount` should be set conservatively relative to pool depth.
 
