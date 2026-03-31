@@ -46,7 +46,7 @@ epoch_id  = floor(now_unix / 300)
 epoch_key = BLAKE3_KDF(server_secret, epoch_id)
 ```
 
-**Key hierarchy.** To limit the blast radius of `server_secret` compromise, per-content keys are derived using both `server_secret` and the content hash:
+**Key hierarchy.** To limit the blast radius of individual key compromise (e.g., a client leaking a content key), per-content keys are derived using both `server_secret` and the content hash:
 
 ```
 content_epoch_key = BLAKE3_KDF(epoch_key, blob_hash)

@@ -54,7 +54,7 @@ sequenceDiagram
     participant D as Delivering Node
 
     P->>D: StreamRequest {hash, channel_id, byte_offset, timestamp_us, voucher_interval_mb?}
-    D->>P: StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, signature, redirect?, voucher_interval_mb?}
+    D->>P: StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, signature, redirect?, error?, voucher_interval_mb?}
 
     alt ok = true
         loop Every voucher_interval_mb (default 1 MB)

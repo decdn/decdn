@@ -48,7 +48,7 @@ graph TD
     N2 <-.->|"iroh-gossip<br/>CacheAnnounce"| N3
 ```
 
-Clients probe candidate nodes, pick the best by the unified selection score (`rate_per_mb × rtt_ms × 1/reputation²` — see [ADR 001](001-network.md#node-selection-algorithm)), stream over `cdn/client/v1`, and pay via off-chain USDC vouchers. On a cache miss, a node pulls from another node that has the blob (paid via `cdn/client/v1`) and caches locally. Every byte delivered — whether client→node or node→node — is paid.
+Clients probe candidate nodes, pick the best by the unified selection score (see [ADR 001](001-network.md#node-selection-algorithm) for the full formula), stream over `cdn/client/v1`, and pay via off-chain USDC vouchers. On a cache miss, a node pulls from another node that has the blob (paid via `cdn/client/v1`) and caches locally. Every byte delivered — whether client→node or node→node — is paid.
 
 ---
 
