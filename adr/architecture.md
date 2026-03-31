@@ -153,44 +153,6 @@ During the PoC, a single deployer address controls all contract parameters. Prod
 
 ---
 
-## Gossip Bandwidth Budget
-
-Multiple ADRs introduce independent gossip topics. The aggregate bandwidth per node at PoC scale (20 nodes):
-
-| Topic | Source ADR | Message type | Est. size | Frequency per node | Bandwidth per node (recv) |
-| --- | --- | --- | --- | --- | --- |
-| `cdn/global/v1` | ADR 001/005 | `CacheAnnounce` (hash list) | ~16 KB | 1/min per node × 19 peers | ~5 KB/s |
-| `cdn/region/{cc}/v1` | ADR 001/005 | `CacheAnnounce` (regional) | ~8 KB | 1/min per node × ~5 regional peers | ~0.7 KB/s |
-| `reputation/v1` | ADR 008 | `ReputationReport` | ~150 B | Max 10/hr per reporter × 19 peers | ~8 B/s |
-| `cdn/keys/v1` (production) | ADR 006 | `EpochRotated` | ~100 B | 1/5 min | ~0.3 B/s |
-
-**Total estimated gossip bandwidth at PoC scale: ~6 KB/s inbound per node.** This is well under the 100 KB/s target budget. At production scale (500 nodes), CacheAnnounce traffic dominates — Bloom filter announcements (~18 KB per node × 499 peers ÷ 60s) could reach ~150 KB/s per node, justifying the transition to a DHT-based discovery layer (see [ADR 001, Future Work](001-network.md#future-work-content-addressed-dht)).
-
-**Rate limiting budget:** The per-topic rate limits specified in ADR 008 (max 10 reports/hr per reporter) and the CacheAnnounce interval (configurable, PoC default TBD) are the primary controls. If gossip bandwidth exceeds the budget, the first lever is increasing the CacheAnnounce interval or switching to Bloom filters earlier.
-
----
-
-## Privacy Surface
-
-The protocol makes several deliberate privacy tradeoffs favoring decentralization and accountability over privacy. Consolidated from all ADRs:
-
-| Data | Visibility | Source ADR | Classification |
-| --- | --- | --- | --- |
-| Node identities (NodeId, Ethereum address) | Public on-chain registry | ADR 001 | **Intentional** — nodes are public service providers |
-| Content availability (which nodes have which blobs) | Public via gossip + probes | ADR 001, 005 | **Intentional** — discovery requires availability data |
-| Node pricing (`rate_per_mb`) | Public via probe/stream responses | ADR 005 | **Intentional** — market pricing requires transparency |
-| Payment channel activity (open, close, amounts) | Public on-chain | ADR 003 | **Accepted** — L2 transactions are public; channel amounts reveal payment volumes |
-| Client Ethereum addresses | Public on-chain (channel opens) | ADR 003 | **Accepted** — clients are pseudonymous but linkable via address reuse |
-| Reputation scores (gossip reports) | Semi-public (gossip subscribers) | ADR 008 | **Intentional** — reputation is a public signal |
-| Node region (ISO 3166-1) | Public on-chain registry | ADR 001 | **Intentional** — but self-reported and unverified |
-| Content access patterns (who fetches what) | Visible to serving node only | ADR 005 | **Mitigatable** — multi-node fetching distributes access patterns; no single node sees all of a client's requests |
-| Watchtower channel registration | Visible to watchtower | ADR 007 | **Accepted** — watchtower sees channel amounts and voucher frequency; privacy impact is low (counterparty already has this data) |
-| Epoch key delivery (subscription status) | Visible to app server | ADR 006 | **Accepted** — app server is a trusted party for subscription management |
-
-**Not addressed:** IP-level metadata (which IPs connect to which nodes) is visible to network observers. This is inherent to any QUIC-based system and not mitigated by the protocol. Tor/VPN integration is out of scope.
-
----
-
 ## Non-Goals (PoC)
 
 - DRM or content protection

@@ -204,7 +204,7 @@ struct SignedRate {
 |-------|--------|-----------|
 | `PaymentChannel` contract | Governance-managed token allowlist, accept approved ERC-20s in `openChannel`, per-token `rateBounds`, token in channel ID | New deployment (not an upgrade of PoC contract) |
 | EIP-712 voucher typehash | Already uses `address token` from ADR 003 | No |
-| `cdn/client/v1` → `cdn/client/v2` | Add `payment_token` to `StreamRequest` | **Yes — requires new ALPN version.** Per [ADR 005 schema evolution strategy](005-protocol.md#schema-evolution-strategy), adding `payment_token` is a breaking change because old nodes cannot safely ignore it (they would process payments incorrectly). Nodes must support both `v1` (USDC-only) and `v2` (multi-token) during the transition period. |
+| `cdn/client/v1` → `cdn/client/v2` | Add `payment_token` to `StreamRequest` | **Yes — requires new ALPN version.** Per [ADR 005](005-protocol.md) ("Postcard has no schema evolution story — adding fields requires a new ALPN version"), adding `payment_token` is a breaking change because old nodes cannot safely ignore it (they would process payments incorrectly). Nodes must support both `v1` (USDC-only) and `v2` (multi-token) during the transition period. |
 | `incentive` crate | `TokenInfo` struct, `accepted_tokens` config, per-token rate map | No (defaults to USDC if unconfigured) |
 | Gossip messages | Add `token_rates` alongside legacy `rate_per_mb` | No (additive field) |
 | Probe / stream responses | Add `token` field to signed rate | New signature scope; old signed-rate slashing requires both sides on same version |

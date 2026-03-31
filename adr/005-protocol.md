@@ -187,24 +187,6 @@ The error code is **not** included in the `StreamResponse` signature — it is i
 
 All protocol messages use [postcard](https://docs.rs/postcard) — compact, no-std friendly, serde-based. Standard in the iroh ecosystem; avoids introducing a second serialization dependency alongside what iroh already uses internally.
 
-### Schema Evolution Strategy
-
-Postcard has no built-in schema evolution support — it serializes structs as ordered fields with no field tags or version markers. The following strategy governs message format changes:
-
-**Within a version (non-breaking):**
-- New fields MAY be appended to the end of a message struct as `Option<T>` with a default of `None`.
-- Older deserializers that encounter trailing bytes (the new field) will ignore them if using `postcard`'s `take_from_bytes` (which returns remaining bytes) rather than `from_bytes` (which rejects trailing data). Implementations MUST use `take_from_bytes` for forward compatibility.
-- Removing or reordering fields within a version is **never** permitted.
-
-**Breaking changes (new ALPN version):**
-- Any change that is not a trailing `Option<T>` append requires a new ALPN version (e.g., `cdn/client/v1` → `cdn/client/v2`).
-- During a transition period, nodes SHOULD accept connections on both old and new ALPNs. The transition period is governable (default 30 days for production; immediate for PoC).
-- The old ALPN is deregistered after the transition period — nodes MAY stop accepting it.
-
-**Example:** adding `payment_token: Option<Address>` to `StreamRequest` for multi-token support ([ADR 010](010-multi-token.md)) is a breaking change because `payment_token` affects contract interaction semantics — old nodes that ignore it would process payments incorrectly. This requires `cdn/client/v2`.
-
-**PoC simplification:** during the PoC, all nodes are expected to run the same software version. Schema evolution is primarily relevant for production deployments with heterogeneous node versions.
-
 ## Consequences
 
 **Positive:**
