@@ -72,7 +72,7 @@ require(allowedTokens[token], "Token not allowed");
 SafeERC20.safeTransferFrom(IERC20(token), msg.sender, address(this), deposit);
 ```
 
-Tokens with fee-on-transfer or rebase mechanics are unsupported — the contract assumes `deposit` equals the amount actually received. `SafeERC20` is used for all token interactions to handle ERC-20s that return `false` on failure instead of reverting.
+Tokens with fee-on-transfer or rebase mechanics are unsupported — the contract assumes `deposit` equals the amount actually received. `SafeERC20` is used for all token interactions because some widely-deployed ERC-20s (notably USDT) do not return a `bool` on `transfer`/`approve`, causing a raw `IERC20.transfer()` call to revert on the missing return data. `SafeERC20` wraps these calls to handle both returning and non-returning tokens uniformly. This is a separate concern from fee-on-transfer rejection, which is enforced by the governance allowlist vetting process.
 
 The allowlist reduces exposure by letting governance reject tokens with known problematic behaviour (e.g., fee-on-transfer, pausable transfers, obvious reentrancy patterns) before they are used, but it does not by itself prevent reentrancy or other ERC-20-level attacks. The implementation must still use standard on-chain mitigations (`nonReentrant` guards, checks-effects-interactions pattern, `SafeERC20`), and governance should account for proxy/upgradability and admin controls when vetting tokens.
 
@@ -204,7 +204,7 @@ struct SignedRate {
 |-------|--------|-----------|
 | `PaymentChannel` contract | Governance-managed token allowlist, accept approved ERC-20s in `openChannel`, per-token `rateBounds`, token in channel ID | New deployment (not an upgrade of PoC contract) |
 | EIP-712 voucher typehash | Already uses `address token` from ADR 003 | No |
-| `cdn/client/v1` | Add `payment_token` to `StreamRequest` | No (unknown field ignored by old nodes; `UnsupportedToken` response is new but additive) |
+| `cdn/client/v1` → `cdn/client/v2` | Add `payment_token` to `StreamRequest` | **Yes — requires new ALPN version.** Per [ADR 005 schema evolution strategy](005-protocol.md#schema-evolution-strategy), adding `payment_token` is a breaking change because old nodes cannot safely ignore it (they would process payments incorrectly). Nodes must support both `v1` (USDC-only) and `v2` (multi-token) during the transition period. |
 | `incentive` crate | `TokenInfo` struct, `accepted_tokens` config, per-token rate map | No (defaults to USDC if unconfigured) |
 | Gossip messages | Add `token_rates` alongside legacy `rate_per_mb` | No (additive field) |
 | Probe / stream responses | Add `token` field to signed rate | New signature scope; old signed-rate slashing requires both sides on same version |
@@ -227,7 +227,7 @@ struct SignedRate {
 - **Governance bottleneck.** Adding a new payment token requires a governance action (admin call for PoC, Governor proposal for production). This adds latency for operators who want to use a token not yet approved. Mitigated by the fact that token additions are infrequent and low-risk governance actions.
 - **Token removal complexity.** `removeToken` blocks new channels but existing open channels in that token remain valid. The network may carry "sunset" tokens for up to 30 days (channel auto-expiry) after removal.
 - **Per-token rate bounds governance burden.** Governance must set meaningful bounds for each token it wants to constrain. An unbounded token (zero `RateBounds` entry) has no floor or ceiling enforced.
-- **Slashing cross-token complexity.** ADR 004's slashing schedule is denominated in TOKEN. Converting a slash penalty from the payment token to TOKEN requires a price reference. For PoC, slash penalties remain in TOKEN regardless of payment token; a production implementation may need an oracle or a fixed TOKEN-denominated slash amount.
+- **Slashing is always in TOKEN (resolved).** ADR 004's slashing schedule is denominated in TOKEN stake, and this remains unchanged with multi-token payments. Slashing operates on the `StakingRegistry` (TOKEN stake), not on payment channel deposits (which may be in any approved token). A node paid exclusively in DAI is still slashed in TOKEN — the node must hold TOKEN stake to participate in the network regardless of which payment tokens it accepts. No price oracle or cross-token conversion is needed. The slash amount is a percentage of TOKEN stake, not a percentage of delivery revenue.
 
 ## Migration from ADR 003
 
@@ -238,7 +238,7 @@ Migration proceeds in three phases. Phase 3 is a **breaking change** for nodes t
 1. Deploy `PaymentChannel` (the production contract) alongside the PoC `StablePaymentChannel`; both coexist. Governance immediately calls `addToken(USDC_ADDRESS)` so USDC is available from deployment
 2. Governance calls `addToken` for any additional tokens the network wants to support (e.g., DAI)
 3. Nodes add `accepted_tokens` to config; default is USDC (backward-compatible)
-4. Clients begin negotiating token in `StreamRequest`; nodes on new software respond with `UnsupportedToken` if the requested token is not accepted, while nodes on old software ignore the `payment_token` field and therefore only operate USDC channels
+4. Clients use `cdn/client/v2` for multi-token streams (including `payment_token` in `StreamRequest`). Nodes on new software accept both `v1` and `v2` connections; nodes on old software only accept `v1` (USDC-only). Nodes on new software respond with `UnsupportedToken` on `v2` if the requested token is not accepted
 5. Gossip messages include `token_rates`; old nodes advertise only legacy `rate_per_mb`; new nodes advertise both
 
 ### Phase 2: Deprecation
@@ -254,7 +254,7 @@ Migration proceeds in three phases. Phase 3 is a **breaking change** for nodes t
 ## Open Questions
 
 - **Decimal validation at runtime.** Should the node fail to start if a configured token's on-chain `decimals()` does not match the configured value, or warn and continue? Failing to start is safer but may cause operational disruption if a proxy token contract is upgraded (rare but possible).
-- **Slash denomination.** When a node is slashed for misbehaviour (ADR 004), the penalty is in TOKEN. If the node earned payment in DAI or a custom token, there is no automatic conversion. Either the slash is always in TOKEN (simple, but the node must hold TOKEN to be slashable), or slashing needs a price reference for the payment token. This is an open design question for the staking/slashing contract.
+- ~~**Slash denomination.**~~ **Resolved:** slashing is always in TOKEN stake (see Consequences above). No cross-token conversion needed — nodes must hold TOKEN stake regardless of payment token.
 - **Token metadata trust.** `IERC20Metadata` is not mandatory for ERC-20 tokens. Tokens without `decimals()` will cause a revert at startup. Should the contract use a try/catch and default to 18 decimals, or require the operator to always specify decimals explicitly in config?
 - **Token removal semantics.** `removeToken` blocks new channel opens but existing channels remain valid until expiry (up to 30 days). Should governance also have the ability to force-close all channels in a removed token (e.g., if the token is discovered to be malicious), or is blocking new channels sufficient?
 - **Token vetting criteria.** What due diligence should governance perform before calling `addToken`? At minimum: verify no fee-on-transfer, no rebase mechanics, no pausable transfers that could lock contract funds, and standard `IERC20` compliance. Should this be codified in a checklist or left to governance discretion?

@@ -122,6 +122,14 @@ This raises the cost of re-upload evasion from trivial (change a byte) to signif
 
 Nodes poll `getBlacklistVersion()` on a configurable interval (`blacklist_poll_interval`, default 10 minutes). When the version has advanced, the node fetches new entries since its last-seen version, filtered to its declared region plus global entries.
 
+**Version sync recovery.** If a node has been offline or missed multiple version bumps, delta fetching may be insufficient (events may have been pruned from the RPC provider's log retention window). The recovery strategy is:
+
+1. If the gap between `last_seen_version` and `current_version` is ≤ 100 versions: fetch deltas normally via contract events.
+2. If the gap exceeds 100 versions (or the delta fetch fails): perform a full re-sync by calling `getBlacklistVersion()` and iterating all events from the contract's deployment block. This is expensive but correct.
+3. As a fallback, if the full event log is unavailable (RPC provider pruned old events): the node fetches the current blacklist state by calling `isBlacklisted` for all hashes in its local cache. This is O(cache_size) RPC calls but ensures no stale content is served.
+
+The node MUST NOT accept connections until its blacklist is synced to the current version.
+
 On startup, nodes always fetch the full current blacklist (global + their region) before accepting connections.
 
 ### On Blacklist Event
@@ -142,7 +150,7 @@ In-flight streams for a blacklisted hash are terminated at the next MB boundary.
 
 A node applies only blacklist entries that are global or match its declared region (`node.region` in config). Entries for other regions are ignored. Nodes are not required to enforce takedowns outside their declared jurisdiction — regional compliance is the operator's legal obligation for their own node.
 
-Node region is self-reported and unverified at the protocol level. An operator who misreports their region to evade a regional takedown bears the legal risk of that choice — the protocol provides the mechanism; legal compliance is the operator's responsibility.
+Node region is self-reported and unverified at the protocol level. **PoC acceptance:** the PoC accepts self-reported regions as sufficient. An operator who misreports their region to evade a regional takedown bears the legal risk of that choice — the protocol provides the mechanism; legal compliance is the operator's responsibility. **Production mitigation:** IP-geolocation cross-checking via a decentralized oracle or third-party attestation service (consistent with the approach in [ADR 001](001-network.md)). Regional takedowns would then be enforced against both declared region and verified geolocation, with a mismatch triggering a compliance review. This is deferred to production because IP-geolocation infrastructure adds complexity and a new external dependency.
 
 ### Local Denylist
 

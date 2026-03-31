@@ -79,7 +79,7 @@ pie title TOKEN Distribution (1B total, fixed supply)
 
 **Node bootstrap fund:** Dedicated to attracting early nodes before organic delivery revenue is sufficient. Distributed as bonus rewards on top of normal USDC delivery payments. Governed by token holders — proposals to release funds require a governance vote. Target: fund 2 years of above-market node rewards.
 
-**PoC simplification:** The token contract includes a public `mint(address to, uint256 amount)` function callable by anyone. No supply cap, no distribution, no vesting.
+**PoC simplification:** The token contract includes a `mint(address to, uint256 amount)` function restricted to `onlyOwner` (the deployer address). No supply cap, no distribution, no vesting. The `onlyOwner` guard prevents arbitrary minting by non-deployers on the testnet, avoiding confusion with an unrestricted public mint. **Production:** the mint function is removed entirely from the production token contract. The fixed 1B supply is minted once in the constructor and distributed per the allocation table above. There is no `mint` function in the production contract — supply is immutably fixed at genesis.
 
 ## Staking and Slashing Schedule
 
@@ -99,7 +99,7 @@ pie title TOKEN Distribution (1B total, fixed supply)
 | First offense | 10% of stake | 5% of stake |
 | Second offense within 30 days | 10% of stake | 15% of stake |
 | Third offense within 30 days | 10% of stake | 100% of stake (full ejection) |
-| Offense counter reset | N/A | After 90 days without incidents |
+| Offense counter reset | After 30 days without incidents | After 90 days without incidents |
 
 ### Slash Distribution
 
