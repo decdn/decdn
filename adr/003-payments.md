@@ -350,7 +350,7 @@ interface IStablePaymentChannel {
 }
 ```
 
-**Initial deployment values.** The constructor (or initializer for proxy deployments) sets governable parameters to their PoC defaults. All values are within the hardcoded safety bounds below:
+**Initial deployment values.** The constructor (or initializer for proxy deployments) sets governable parameters to their PoC defaults. All values are within the hardcoded safety bounds table further below (see also [ADR 009](009-governance.md) for governance ranges):
 
 ```solidity
 constructor(address usdc_, address treasury_, uint256 disputeWindow_) {
@@ -358,7 +358,7 @@ constructor(address usdc_, address treasury_, uint256 disputeWindow_) {
     usdc = usdc_;
     treasury = treasury_;
     disputeWindow = disputeWindow_;   // PoC default: 86400 (24 hours)
-    feePercentage = 100;              // 1% (100 bps)
+    feePercentage = 300;              // 3% (300 bps)
     maxVoucherIntervalMb = 1;         // 1 MB
     maxChannelDuration = 7776000;     // 90 days
 }
@@ -581,6 +581,8 @@ The EIP-712 domain separator is the same as the `StakingRegistry` contract deplo
 ### On-Chain Registration
 
 Nodes register their binding on-chain via `StakingRegistry.bindNodeId()`. This is distinct from `StakingRegistry.registerNode()` ([ADR 001](001-network.md)), which handles mesh membership (NodeId, multiaddrs, region, stake validation). `bindNodeId()` establishes the cryptographic NodeId-to-Ethereum-address binding used for slash evidence and payment channel attribution. Nodes call both at registration time: `registerNode` to join the peer mesh, then `bindNodeId` to create the signed binding.
+
+**Canonical source of truth:** The `nodeIdToAddress` / `addressToNodeId` mappings maintained by `bindNodeId` are the authoritative source for payment attribution and slashing. `NodeInfo.ethAddress` in ADR 001 is always `msg.sender` (the same address that calls `bindNodeId`), so the two are consistent by construction under the one-to-one constraint. If the implementation stores both, `NodeInfo.ethAddress` MUST equal `nodeIdToAddress[nodeId]` at all times.
 
 This creates an authoritative, publicly queryable mapping:
 

@@ -80,7 +80,22 @@ sequenceDiagram
     end
 ```
 
-**Client identity binding.** For clients using ephemeral (off-chain) NodeId-to-Ethereum-address bindings (see [ADR 003 — Off-Chain Ephemeral Binding](003-payments.md#off-chain-ephemeral-binding-for-clients)), the binding is established at the QUIC connection level, not per-request. The client presents its `BindNodeId` EIP-712 signature during the first `StreamRequest` on a connection; the node verifies the signature via `ecrecover`, caches the verified binding for the connection's lifetime, and uses the recovered Ethereum address for `clientStakeOf` lookups and voucher attribution. Subsequent `StreamRequest` messages on the same connection do not repeat the binding fields. For stateless node implementations that do not cache connection-level state, the optional fields `ethereum_address: Option<Address>` and `binding_signature: Option<Bytes>` may be included in `StreamRequest`.
+**Client identity binding.** For clients using ephemeral (off-chain) NodeId-to-Ethereum-address bindings (see [ADR 003 — Off-Chain Ephemeral Binding](003-payments.md#off-chain-ephemeral-binding-for-clients)), the binding is conveyed via optional fields in `StreamRequest`:
+
+```rust
+struct StreamRequest {
+    hash: Hash,
+    channel_id: ChannelId,
+    byte_offset: u64,
+    timestamp_us: u64,
+    voucher_interval_mb: Option<u64>,
+    // Ephemeral client binding (optional; required on first request per connection)
+    ethereum_address: Option<Address>,
+    binding_signature: Option<Bytes>,  // EIP-712 BindNodeId signature
+}
+```
+
+The client includes `ethereum_address` and `binding_signature` in the first `StreamRequest` on a connection. The node verifies the EIP-712 signature via `ecrecover`, caches the verified binding for the connection's lifetime, and uses the recovered address for `clientStakeOf` lookups and voucher attribution. Subsequent requests on the same connection may omit these fields. These are `Option` fields with `#[serde(default)]`, so peers that do not send them (e.g., nodes in node-to-node pulls where both sides have on-chain bindings) decode them as `None` — no ALPN version bump is needed since this is defined before the first implementation.
 
 **Voucher wire format:** `Voucher {sig, amt}` above is shorthand. The EIP-712 signed data covers the full structure from [ADR 003](003-payments.md): `{channelId, amount, nonce, stablecoin}`. Only `signature` and `amount` are transmitted on the wire because the remaining fields are derivable from stream context — `channel_id` is in `StreamRequest`, `nonce` increments monotonically (one per voucher interval boundary — default 1 MB, or the negotiated interval), and `stablecoin` is fixed at channel open. The receiver reconstructs the full typed data to verify the signature. Contrast with the watchtower `VoucherUpdate` below, which must include `channel_id` and `nonce` explicitly because the watchtower lacks stream context.
 
