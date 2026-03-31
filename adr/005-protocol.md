@@ -64,13 +64,18 @@ sequenceDiagram
         end
         P->>D: StreamEnd
     else redirect
-        Note over P: Connect to redirect NodeId and retry
+        Note over P: Connect to redirect NodeId and retry<br/>(max 3 hops, cycle detection)
     end
 ```
 
 **Voucher wire format:** `Voucher {sig, amt}` above is shorthand. The EIP-712 signed data covers the full structure from [ADR 003](003-payments.md): `{channelId, amount, nonce, stablecoin}`. Only `signature` and `amount` are transmitted on the wire because the remaining fields are derivable from stream context — `channel_id` is in `StreamRequest`, `nonce` increments monotonically (one per voucher interval boundary — default 1 MB, or the negotiated interval), and `stablecoin` is fixed at channel open. The receiver reconstructs the full typed data to verify the signature. Contrast with the watchtower `VoucherUpdate` below, which must include `channel_id` and `nonce` explicitly because the watchtower lacks stream context.
 
 The delivering node advertises its `rate_per_mb` in `StreamResponse`. The payer accepts by sending the first voucher or disconnects and tries another node. No surprise pricing. `timestamp_us` in `StreamResponse` is the requester-generated microsecond timestamp from `StreamRequest`, echoed back unchanged — the same pattern as `ProbeResponse`. The node's iroh key signs all security-relevant fields: `{hash, ok, rate_per_mb, total_bytes, channel_id, timestamp_us, redirect}`, making the response cryptographically binding. Signing the full response prevents a malicious party from altering unsigned fields while reusing a valid signature — in particular, `ok` is needed for phantom announcement evidence (proving a node signed `ok: false` after claiming `has_blob: true` in a probe), and `redirect` ensures a node cannot silently alter routing without accountability. A rate mismatch where `stream_response.rate_per_mb > probe_response.rate_per_mb` is slashable if `stream_response.timestamp_us >= probe_response.timestamp_us` and `stream_response.timestamp_us - probe_response.timestamp_us < 30_000_000` (30 seconds). The ordering check prevents unsigned integer underflow in the on-chain verifier. Because both `timestamp_us` values are requester-generated, the on-chain verifier computes this delta from the signed messages alone — no wall-clock reference or external time oracle is needed, and clock skew between the requester and the node does not affect the check. The `redirect` field in `StreamResponse` is used when a node cannot serve — it contains the NodeId of another node that can, never an external URL. The network is fully opaque.
+
+**Redirect loop prevention.** The requester MUST enforce:
+1. **Hop limit:** maximum 3 redirects per original request. After 3 redirects, the requester treats the request as failed (no more redirects followed).
+2. **Cycle detection:** the requester tracks the set of NodeIds visited for each request. A redirect to an already-visited NodeId is rejected immediately.
+3. **Failure handling:** when the redirect limit is reached or a cycle is detected, the requester falls back to the next-best node from the original probe results (same as a `ok: false` response).
 
 `byte_offset` supports seek and resume: on failover, the requester reconnects to a different node and resumes from the last BLAKE3-verified byte.
 
@@ -156,9 +161,49 @@ Implementation constraint: the payer must have a single voucher-signing task per
 - **Idle timeout:** 30 seconds after the last stream closes and no unacknowledged vouchers remain in flight. Endpoints SHOULD send periodic QUIC PING frames when otherwise idle, with a default interval of 10 seconds (below the idle timeout) to prevent NAT middleboxes from dropping the mapping.
 - **`cdn/watchtower/v1` exception:** watchtower connections are long-lived by design (ADR 007). No idle timeout while any channel is registered.
 
+### Error Handling and Retry Semantics
+
+When a `StreamResponse` returns `ok: false`, the response includes an error code indicating the reason:
+
+```rust
+enum StreamError {
+    NotFound,       // Node does not have the blob (cache miss, no origin)
+    Overloaded,     // Node is at capacity; try another node
+    InternalError,  // Unexpected failure; do not retry this node
+}
+```
+
+**Retry behavior:**
+
+1. On `ok: false` or connection failure, the requester does **not** retry the same node for the same blob hash.
+2. The requester falls back to the next-best candidate from the original probe results (sorted by unified selection score — see [ADR 001](001-network.md#node-selection-algorithm)).
+3. Maximum 3 total attempts (including the first) per blob request. After 3 failures, the request is surfaced as an error to the caller.
+4. **Per-attempt timeout:** 10 seconds from `StreamRequest` to first `ChunkData`. If no data arrives within 10 seconds, the requester treats it as a connection failure and moves to the next candidate.
+5. **Mid-stream failure:** if chunks stop arriving mid-delivery, the requester waits 10 seconds, then reconnects to the next candidate with `byte_offset` set to the last BLAKE3-verified byte.
+
+The error code is **not** included in the `StreamResponse` signature — it is informational only and not used for slashing evidence.
+
 ### Serialization
 
 All protocol messages use [postcard](https://docs.rs/postcard) — compact, no-std friendly, serde-based. Standard in the iroh ecosystem; avoids introducing a second serialization dependency alongside what iroh already uses internally.
+
+### Schema Evolution Strategy
+
+Postcard has no built-in schema evolution support — it serializes structs as ordered fields with no field tags or version markers. The following strategy governs message format changes:
+
+**Within a version (non-breaking):**
+- New fields MAY be appended to the end of a message struct as `Option<T>` with a default of `None`.
+- Older deserializers that encounter trailing bytes (the new field) will ignore them if using `postcard`'s `take_from_bytes` (which returns remaining bytes) rather than `from_bytes` (which rejects trailing data). Implementations MUST use `take_from_bytes` for forward compatibility.
+- Removing or reordering fields within a version is **never** permitted.
+
+**Breaking changes (new ALPN version):**
+- Any change that is not a trailing `Option<T>` append requires a new ALPN version (e.g., `cdn/client/v1` → `cdn/client/v2`).
+- During a transition period, nodes SHOULD accept connections on both old and new ALPNs. The transition period is governable (default 30 days for production; immediate for PoC).
+- The old ALPN is deregistered after the transition period — nodes MAY stop accepting it.
+
+**Example:** adding `payment_token: Option<Address>` to `StreamRequest` for multi-token support ([ADR 010](010-multi-token.md)) is a breaking change because `payment_token` affects contract interaction semantics — old nodes that ignore it would process payments incorrectly. This requires `cdn/client/v2`.
+
+**PoC simplification:** during the PoC, all nodes are expected to run the same software version. Schema evolution is primarily relevant for production deployments with heterogeneous node versions.
 
 ## Consequences
 
@@ -180,7 +225,7 @@ All protocol messages use [postcard](https://docs.rs/postcard) — compact, no-s
 - The `cdn/client/v1` voucher cadence (default 1 MB, negotiable up to ~1 GB) is coarser than iroh-blobs' internal chunk granularity (1024 bytes); the payment layer and transfer layer operate at different tick rates, requiring a buffering layer between them
 - Concurrent streams sharing a `channel_id` require the payer to maintain a single aggregate byte counter and voucher-signing task per channel; per-stream independence is lost for payment tracking
 - The delivering node enforces the voucher deficit threshold across all streams collectively — a slow voucher on one stream pauses all streams on that channel
-- Different ALPNs require separate QUIC connections; probing a node via `cdn/probe/v1` and then fetching via `cdn/client/v1` incurs two handshake costs to the same peer
+- Different ALPNs require separate QUIC connections; probing a node via `cdn/probe/v1` and then fetching via `cdn/client/v1` incurs two handshake costs to the same peer. **PoC acceptance:** two connections per node interaction is acceptable at PoC scale (tens of nodes, moderate traffic). **Production optimization:** investigate iroh ALPN multiplexing (negotiating multiple ALPNs on a single connection) or a unified `cdn/v2` ALPN that combines probe and delivery as sub-protocols within one connection. The two-connection overhead is ~1 additional RTT per node interaction — significant for latency-sensitive clients but not a correctness issue
 - Postcard has no schema evolution story — adding fields requires a new ALPN version (`cdn/client/v2`); version negotiation must be planned before the first breaking change
 - The `voucher_interval_mb` field in `StreamRequest`/`StreamResponse` is optional and defaults to 1 MB if absent — this allows backward compatibility with older peers without requiring a new ALPN version. However, this is a one-time workaround; any future mandatory field addition still requires `cdn/client/v2`
-- `StreamRequest` includes a requester-generated `timestamp_us` that the node echoes in `StreamResponse`. A malicious requester could craft timestamps to make a legitimate rate change (probe 60 seconds ago, rate changed since) appear within the 30-second slashing window. In production, the challenge bond (ADR 004) deters this: the bond is forfeited if the node successfully counters within the 24-hour counter-window, e.g. by showing a rate change published via gossip between the two timestamps. In the PoC, where the challenge bond is not implemented (ADR 004), the node's 24-hour counter-window still provides a defense, but frivolous challenges are not economically penalized
+- `StreamRequest` includes a requester-generated `timestamp_us` that the node echoes in `StreamResponse`. A malicious requester could craft timestamps to make a legitimate rate change (probe 60 seconds ago, rate changed since) appear within the 30-second slashing window. The challenge bond ([ADR 004](004-tokenomics.md#challenge-bond)) deters this in both PoC and production: the bond (100 TOKEN in PoC, 50 TOKEN in production) is forfeited if the node successfully counters within the 24-hour counter-window, e.g. by showing a rate change published via gossip between the two timestamps
