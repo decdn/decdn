@@ -387,7 +387,7 @@ event ChannelSettled(
 | Parameter | Minimum | Maximum |
 | --- | --- | --- |
 | Fee percentage | 0 bps (0%) | 2000 bps (20%) |
-| Dispute window | 1800 seconds (30 min) | 604800 seconds (7 days) |
+| Dispute window | 43200 seconds (12 hours) | 259200 seconds (3 days) |
 | Min deposit | 1 base unit | No max |
 | Rate floor | 0 | Must be < ceiling |
 | Rate ceiling | Must be > floor | No max |

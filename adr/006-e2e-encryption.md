@@ -46,6 +46,17 @@ epoch_id  = floor(now_unix / 300)
 epoch_key = BLAKE3_KDF(server_secret, epoch_id)
 ```
 
+**Key hierarchy.** To limit the blast radius of `server_secret` compromise, per-content keys are derived using both `server_secret` and the content hash:
+
+```
+content_epoch_key = BLAKE3_KDF(epoch_key, blob_hash)
+wrapped = XChaCha20-Poly1305(content_epoch_key, K_blob)
+```
+
+This means an attacker who obtains a single `content_epoch_key` (e.g., by compromising one client's decryption) cannot derive `epoch_key` or `server_secret` — and therefore cannot decrypt other content in the same epoch. Compromise of `server_secret` remains catastrophic (all past and future keys derivable), but the key hierarchy ensures that client-side compromise is bounded to the specific content the client accessed.
+
+**`server_secret` rotation procedure:** When rotation is required (suspected compromise, periodic rotation policy), the app server: (1) generates a new `server_secret`, (2) broadcasts an `EpochRotated` message via gossip, (3) re-wraps active content's `K_blob` values with the new key hierarchy over the next N epochs (where N is configurable, default 1). During the transition, the app server accepts envelopes sealed with both old and new epoch keys. Old `server_secret` is securely deleted after the transition completes.
+
 **Per-request sealed envelope:** On each play request, the app server verifies the client's subscription is active, then wraps `K_blob` with the current epoch key and seals the result to the client's public key:
 
 ```
@@ -55,7 +66,9 @@ envelope  = crypto_box_seal(client_pubkey, {wrapped, epoch_id, blob_hash})
 
 The client receives the sealed envelope. To decrypt the blob, the client needs both the envelope and the current epoch key.
 
-**Epoch key delivery:** Epoch keys are pushed to clients over an authenticated persistent connection (WebSocket or SSE). The connection requires a valid session token. When the subscription expires or is canceled, the connection is closed and the client receives no further epoch keys.
+**Epoch key delivery:** Epoch keys are pushed to clients over an authenticated persistent connection. **PoC:** uses an iroh QUIC stream (ALPN `cdn/keys/v1`) to avoid introducing a separate WebSocket/SSE transport stack. The client opens a bidirectional QUIC stream to the app server's iroh endpoint, authenticates with a session token, and receives epoch keys as they rotate. This keeps the PoC on a single transport (iroh QUIC) for all communication. **Production:** may migrate to WebSocket/SSE if the app server needs to serve web clients that cannot use QUIC directly, or if the app server is deployed separately from the iroh network. The protocol is transport-agnostic — the message format (epoch key + epoch ID) is the same regardless of delivery mechanism.
+
+The connection requires a valid session token. When the subscription expires or is canceled, the connection is closed and the client receives no further epoch keys.
 
 ```mermaid
 sequenceDiagram
@@ -134,7 +147,7 @@ App server:
      lease = {
          k_blobs: {hash_1: K_1, hash_2: K_2, ...},
          issued_at: 1743300000,
-         expires_at: 1745892000,       // 30 days
+         expires_at: 1743904800,       // 7 days
          device_id: "device_xyz",
          account_id: "alice"
      }
@@ -179,18 +192,20 @@ flowchart TD
 
 If the client never checks in, the lease expires at `expires_at` and offline playback stops. The client retains cached ciphertext but cannot decrypt it without a valid lease.
 
+**Mandatory daily check-in.** Offline leases require a daily check-in with the app server when connectivity is available. On check-in, the server either renews the lease (extending `expires_at` by 24 hours) or revokes it. If the client has connectivity but fails to check in within 24 hours, the client software MUST treat the lease as revoked and delete the sealed lease and cached keys. This reduces the worst-case revocation window from the full lease TTL to ~24 hours for devices that have intermittent connectivity. Devices that are truly offline (airplane mode, no network) retain the full TTL as an unavoidable upper bound.
+
 **Relationship to the online scheme:** The two modes are complementary and coexist:
 
 | | Online (epoch keys) | Offline (lease) |
 | --- | --- | --- |
-| Key source | Epoch key via WebSocket + sealed envelope | Sealed lease from device keystore |
+| Key source | Epoch key via persistent connection + sealed envelope | Sealed lease from device keystore |
 | K_blob lifetime in client | Transient — in memory, discarded after play | Persistent — on disk, sealed to device key |
-| Revocation speed | ~5 minutes (epoch boundary) | Up to 30 days (lease TTL) |
-| Server dependency | Continuous | None until lease expires |
+| Revocation speed | ~5 minutes (epoch boundary) | ~24 hours (daily check-in) to 7 days (full TTL) |
+| Server dependency | Continuous | Daily check-in when connected; none when offline |
 | Content source | CDN nodes (streamed) | Local cache (pre-downloaded) |
 | Blast radius if compromised | K_blobs for tracks played in current epoch | K_blobs for all tracks in lease (up to 500) |
 
-The offline lease intentionally weakens two properties of the online scheme: K_blob values persist on disk rather than transiently in memory, and revocation is delayed from 5 minutes to the lease TTL. This is an accepted tradeoff — it is the same tradeoff every major streaming service makes, and there is no cryptographic solution that provides both offline playback and instant revocation.
+The offline lease intentionally weakens two properties of the online scheme: K_blob values persist on disk rather than transiently in memory, and revocation is delayed from 5 minutes to 24 hours (with daily check-in) or up to 7 days (without connectivity). This is an accepted tradeoff — it is the same tradeoff every major streaming service makes, and there is no cryptographic solution that provides both offline playback and instant revocation.
 
 **Device key compromise (jailbroken devices):** If a device's keystore is compromised, the attacker can unseal the lease and extract all K_blob values in it. The blast radius is bounded by `max_tracks` (up to 500 tracks per device). Mitigations are operational, not cryptographic:
 
@@ -231,9 +246,9 @@ Rejected because it destroys global content-addressing. The same track would hav
 | --- | --- | --- |
 | E2E encryption | Not implemented. Content is delivered as plaintext blobs. | Full implementation as described |
 | Epoch key rotation | N/A | 5-minute rotation via BLAKE3_KDF |
-| Key delivery infrastructure | N/A | WebSocket/SSE persistent connection |
+| Key delivery infrastructure | N/A | iroh QUIC stream (PoC) → WebSocket/SSE (production) |
 | Sealed envelopes | N/A | XChaCha20-Poly1305 + crypto_box_seal |
-| Offline leases | N/A | 30-day TTL, device-bound keys |
+| Offline leases | N/A | 7-day TTL with daily check-in, device-bound keys |
 | Device attestation | N/A | iOS Secure Enclave, Android Keystore |
 | Audio watermarking | N/A | Per-account |
 | App server key store | N/A | KMS/HSM-protected |
@@ -257,6 +272,6 @@ For PoC, no action items from this ADR are required. Content-addressed blobs are
 - The app server's key store (holding all `K_blob` values) is a high-value target. It must be protected with a KMS or HSM in production. Compromise of the key store exposes all content.
 - A hacked client can still extract `K_blob` for tracks it plays in real-time. This is inherent to any scheme where the client produces plaintext output — equivalent to the "analog hole" in DRM systems.
 - Epoch key rotation creates a hard dependency on the persistent connection. If the WebSocket drops, the client cannot decrypt new tracks until it reconnects and receives the current epoch key. The client should cache the most recent epoch key in memory (not disk) to survive brief disconnects within the same epoch.
-- `server_secret` (the epoch key derivation root) is a critical secret. Rotation of `server_secret` invalidates all outstanding epoch keys and sealed envelopes, forcing all clients to re-request. Rotation should be infrequent and coordinated.
-- Offline leases trade revocation speed for availability: a canceled subscription may retain offline playback for up to the lease TTL (default 30 days). This is an accepted industry-standard tradeoff.
-- Offline leases persist K_blob values on disk (sealed to device key), increasing the blast radius of a device compromise from one epoch's tracks to the full lease (up to 500 tracks). Device attestation and watermarking are operational mitigations, not cryptographic guarantees.
+- `server_secret` (the epoch key derivation root) is a critical secret. Rotation of `server_secret` invalidates all outstanding epoch keys and sealed envelopes, forcing all clients to re-request. Rotation should be infrequent and coordinated. **Key rotation notification:** when `server_secret` rotates, the app server broadcasts an `EpochRotated { new_epoch_id, rotated_at }` message via iroh-gossip on a dedicated `cdn/keys/v1` topic. Clients subscribed to this topic receive the rotation event and re-request epoch keys from the app server. This avoids requiring a separate WebSocket solely for rotation events. For PoC, epoch key delivery itself uses an iroh QUIC stream (ALPN `cdn/keys/v1`) rather than WebSocket/SSE — see below.
+- Offline leases trade revocation speed for availability: a canceled subscription may retain offline playback for up to the lease TTL (default 7 days). Mandatory daily check-in reduces this to ~24 hours for devices with intermittent connectivity. This is an accepted industry-standard tradeoff.
+- Offline leases persist K_blob values on disk (sealed to device key), increasing the blast radius of a device compromise from one epoch's tracks to the full lease (up to 500 tracks). The 7-day TTL (reduced from 30 days) limits the window. Device attestation and watermarking are operational mitigations, not cryptographic guarantees.

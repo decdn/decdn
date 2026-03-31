@@ -42,17 +42,23 @@ All economic parameters across the protocol are governable within hardcoded safe
 | --- | --- | --- | --- |
 | Protocol fee % | StablePaymentChannel | 0% (0 bps) | 20% (2000 bps) |
 | Minimum stake | StakingRegistry | 100 TOKEN | 100,000 TOKEN |
-| Slash percentages | StakingRegistry | 1% | 100% |
+| Slash percentages | StakingRegistry | 5% | 50% |
 | Unbonding period | StakingRegistry | 3 days | 30 days |
 | Multiaddr update cooldown | StakingRegistry | 0 (disabled) | 86400 seconds (1 day) |
 | Max multiaddr size | StakingRegistry | 64 bytes | 1024 bytes |
-| Dispute window | StablePaymentChannel | 30 minutes | 7 days |
-| Rate floor/ceiling | StablePaymentChannel | Floor > 0 | Ceiling > floor |
+| Dispute window | StablePaymentChannel | 12 hours | 72 hours (3 days) |
+| Rate floor/ceiling | StablePaymentChannel | Floor ≥ 1 base unit | Ceiling > floor |
 | Max voucher interval | StablePaymentChannel | 1 MB | 1024 MB (~1 GB) |
 | Challenge bond | StakingRegistry | 1 TOKEN | 1,000 TOKEN |
 | Burn percentage of fees | StablePaymentChannel | 0% | 100% |
 
 Staking, slashing, and fee parameters are defined in [ADR 004](004-tokenomics.md). Payment channel parameters are defined in [ADR 003](003-payments.md). This ADR defines the governance mechanism that controls them.
+
+**Safety bound rationale:**
+- **Slash 5%–50%:** A 1% slash is economically negligible (10 TOKEN at minimum stake) and provides no deterrence. A 100% slash enables governance to fully confiscate stake, which is disproportionate for minor offenses and discourages staking. The 5%–50% range ensures slashing is meaningful but not existential for a single offense.
+- **Rate floor ≥ 1 base unit:** A zero floor allows free-riding nodes that advertise zero rates to attract traffic without generating protocol fees. The minimum of 1 USDC base unit ($0.000001/MB) is negligibly small but prevents true zero-rate abuse.
+- **Dispute window 12h–72h:** A 30-minute window is too short for watchtowers or human operators to respond to a stale close. A 7-day window locks client funds for an unacceptably long period. The 12h–72h range balances responsiveness with fund liquidity.
+- **Min deposit floor ≥ 1 base unit:** prevents dust channels that cost more in gas to settle than they contain.
 
 ### Emergency Multisig
 
@@ -62,7 +68,7 @@ Staking, slashing, and fee parameters are defined in [ADR 004](004-tokenomics.md
   2. **Emergency content blacklisting** — add hashes and origin operators to the `ContentBlacklist` contract via `emergencyAdd` and `emergencyAddOrigin` (see [ADR 011](011-content-takedown.md))
 - Cannot change parameters, withdraw funds, or bypass governance for non-emergency actions
 - Used for exploit response, critical bug mitigation, and time-critical content removal (e.g., CSAM, actively-exploited material)
-- Sunset: after 12 months, the pause function is permanently disabled (or requires governance vote to extend). Emergency blacklisting capability follows the same sunset schedule.
+- Sunset: `pauseDeadline = deployTimestamp + 365 days` is hardcoded in the constructor as an immutable value. After the deadline, `pause()` reverts with `"PauseExpired"`. Emergency blacklisting capability follows the same sunset schedule (`blacklistDeadline = deployTimestamp + 365 days`). **Extension mechanism:** governance cannot modify the immutable deadline. To extend pause/blacklist capability, governance must deploy a new contract version with a new deadline and migrate via the standard contract upgrade path (timelock + governance vote). This ensures the sunset cannot be silently extended — a new deployment is a visible, auditable event.
 - Signers should be geographically and organizationally diverse
 
 ## Consequences
