@@ -11,15 +11,16 @@ The protocol layer must be distinct from the transport layer (iroh/QUIC) and the
 
 ## Decision
 
-Five protocols: four negotiated via ALPN, plus the built-in iroh-gossip protocol:
+Four protocols: three negotiated via ALPN, plus the built-in iroh-gossip protocol:
 
 | Protocol | Participants | Purpose |
 | --- | --- | --- |
 | `cdn/probe/v1` | any node ↔ any node | Latency and availability check before committing to a node |
 | `cdn/client/v1` | payer ↔ delivering node | Paid blob delivery with payment vouchers (client→node, node→node on cache miss) |
-| `cdn/keys/v1` | app server ↔ client | Epoch key delivery and sealed envelope requests (see [ADR 006](006-e2e-encryption.md)) |
 | `cdn/watchtower/v1` | watched party (typically node) ↔ watchtower | Channel-dispute monitoring: voucher registration and updates (see ADR 007) |
-| iroh-gossip (built-in) | all nodes | Content availability announcements, node discovery |
+| iroh-gossip (built-in) | all nodes | Node metadata announcements (`NodeAnnounce`), node discovery |
+
+**Note:** Key delivery (epoch keys, sealed envelopes) is handled by the app server — an external component communicating over WebSocket/SSE, not an iroh QUIC ALPN. See [ADR 006](006-e2e-encryption.md) for details.
 
 ### `cdn/probe/v1` — latency probe
 
@@ -41,9 +42,9 @@ sequenceDiagram
 
 `signature` is the candidate node's iroh private key signature over `{hash, has_blob, rate_per_mb, timestamp_us}`. This makes the probe response cryptographically attributable and enables two slashing mechanisms: (1) **phantom announcement slashing** — if `has_blob: true` in `ProbeResponse` but the node returns a signed `StreamResponse` with `ok: false` or a redirect for the same hash, the two signed messages are on-chain-verifiable evidence of a phantom announcement (the timeout/non-response case is handled separately — see ADR 003); (2) **rate manipulation slashing** — if `stream_response.timestamp_us >= probe_response.timestamp_us` and `stream_response.timestamp_us - probe_response.timestamp_us < 30_000_000` (30 seconds) and `stream_response.rate_per_mb > probe_response.rate_per_mb`, both signed messages constitute on-chain-verifiable evidence of bait-and-switch. Both `timestamp_us` values are requester-generated (the probe timestamp is echoed in `ProbeResponse`; `StreamResponse` echoes a separate requester timestamp from `StreamRequest`), so the on-chain verifier computes the delta from a single clock with no wall-clock reference needed. **Submitting slash evidence requires a challenge bond** (100 TOKEN in PoC, 50 TOKEN in production) — see [ADR 004](004-tokenomics.md#challenge-bond). The bond is returned if the challenge succeeds and forfeited if the node successfully counters, preventing zero-cost griefing via fabricated slash claims.
 
-The requester probes candidates from the routing table in parallel, waits up to 200ms, then selects the winner using the unified selection score (see [ADR 001, Node Selection Algorithm](001-network.md#node-selection-algorithm)). This applies to clients picking nodes and nodes picking peers for a cache miss pull.
+The requester probes all known peers in parallel (or checks the probe cache for recent results), waits up to 500ms, then selects the winner using the unified selection score (see [ADR 001, Node Selection Algorithm](001-network.md#node-selection-algorithm)). The 500ms window accommodates inter-continental RTTs. This applies to clients picking nodes and nodes picking peers for a cache miss pull.
 
-**Probe responses are public information.** `ProbeRequest` requires no authentication — any node can probe any other node. The information revealed (content availability, pricing, node identity) is not confidential: node identities are listed in a public on-chain registry, content availability is broadcast via gossip announcements, and pricing is discoverable through probe and stream responses by design. Network topology can be inferred by probing many nodes, but this is an inherent property of any system where nodes must be discoverable to serve content. Operational mitigations such as rate limiting (see ADR 003, "Probe fishing") aim to bound the cost of bulk probing, but the specific mechanism is not yet decided; the design does not treat probe responses as secrets. The cryptographic signatures on probe responses exist for accountability (slashing evidence), not confidentiality.
+**Probe responses are public information.** `ProbeRequest` requires no authentication — any node can probe any other node. The information revealed (content availability, pricing, node identity) is not confidential: node identities are listed in a public on-chain registry, content availability is discoverable via probing, and pricing is discoverable through probe and stream responses by design. Network topology can be inferred by probing many nodes, but this is an inherent property of any system where nodes must be discoverable to serve content. Operational mitigations such as rate limiting (see ADR 003, "Probe fishing") aim to bound the cost of bulk probing, but the specific mechanism is not yet decided; the design does not treat probe responses as secrets. The cryptographic signatures on probe responses exist for accountability (slashing evidence), not confidentiality.
 
 ### `cdn/client/v1` — paid delivery protocol
 
@@ -84,9 +85,11 @@ The delivering node advertises its `rate_per_mb` in `StreamResponse`. The payer 
 
 The protocol is self-enforcing: payer stops sending vouchers → delivering node stops sending chunks; delivering node stops sending chunks → payer stops sending vouchers.
 
-### Gossip — content availability
+### Gossip — node metadata
 
-Content availability is broadcast over iroh-gossip on region-scoped topics (`cdn/region/{cc}/v1`) and a global topic (`cdn/global/v1`). All staked nodes publish `CacheAnnounce` messages listing hashes they hold (max 500 entries) or a Bloom filter for large sets. Clients and nodes maintain a local routing table (`hash → Vec<NodeId>`) from received announcements. The probe step determines cost and latency for each candidate.
+Node metadata is broadcast over iroh-gossip on region-scoped topics (`cdn/region/{cc}/v1`) and a global topic (`cdn/global/v1`). All staked nodes publish `NodeAnnounce` messages containing node-level metadata: region, load hint, and a list of popular hashes (max 20). `NodeAnnounce` does not carry content inventories — content discovery is handled on-demand via `cdn/probe/v1` fan-out. See [ADR 001](001-network.md) for the full `NodeAnnounce` struct definition including `LoadHint`.
+
+Gossip messages are lightweight (~700 bytes worst case), well within iroh-gossip message limits. Clients and nodes maintain a peer table (`NodeId → NodeAnnounce`) from received messages. The probe step determines which peers hold specific content, along with their cost and latency.
 
 ### `cdn/watchtower/v1` — channel-dispute monitoring
 
@@ -124,7 +127,6 @@ Maximum concurrent bidirectional streams per connection, set via QUIC transport 
 | --- | --- | --- |
 | `cdn/client/v1` | 100 | Enough parallelism for bulk fetching (e.g., video manifest + segments) without exhausting server resources |
 | `cdn/probe/v1` | 1 | Single request-response; the connection is reused for sequential probes to the same node |
-| `cdn/keys/v1` | 10 | 1 long-lived epoch key stream + up to 9 concurrent envelope requests |
 | `cdn/watchtower/v1` | 10 | Allows concurrent updates for up to 10 registered channels; a node with more channels multiplexes updates over the available streams |
 
 Stream concurrency is enforced via QUIC's `MAX_STREAMS` transport parameter: a peer MUST NOT open a new bidirectional stream beyond the advertised limit (doing so is a protocol violation resulting in `STREAM_LIMIT_ERROR` and connection close). The receiver grants additional credit by sending `MAX_STREAMS` updates as existing streams close.
@@ -161,7 +163,6 @@ Implementation constraint: the payer must have a single voucher-signing task per
 
 - Connections remain open while any stream is active or any sent voucher is awaiting `VoucherAck` (on-chain channel closure does not affect connection lifetime).
 - **Idle timeout:** 30 seconds after the last stream closes and no unacknowledged vouchers remain in flight. Endpoints SHOULD send periodic QUIC PING frames when otherwise idle, with a default interval of 10 seconds (below the idle timeout) to prevent NAT middleboxes from dropping the mapping.
-- **`cdn/keys/v1` exception:** key delivery connections are long-lived by design (ADR 006). No idle timeout while a `KeySession` stream is active.
 - **`cdn/watchtower/v1` exception:** watchtower connections are long-lived by design (ADR 007). No idle timeout while any channel is registered.
 
 ### Error Handling and Retry Semantics
@@ -194,7 +195,7 @@ All protocol messages use [postcard](https://docs.rs/postcard) — compact, no-s
 
 **Positive:**
 
-- ALPN separation means a single iroh `Endpoint` dispatches all five connection types without ambiguity
+- ALPN separation means a single iroh `Endpoint` dispatches all connection types without ambiguity
 - Probing in parallel before committing means no payment channel is opened with a slow or unresponsive node
 - `cdn/client/v1` is reused for all paid delivery — no separate protocol needed for node→node pulls
 - `redirect` always points to a NodeId, never an external URL; the backend topology of origin-backed nodes is fully hidden from the network

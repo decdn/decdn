@@ -22,7 +22,7 @@ iroh versioning policy: pin to a specific version in `Cargo.toml` (e.g. `iroh = 
 Specifically:
 - `iroh::Endpoint` for QUIC-based peer-to-peer connectivity and ALPN protocol negotiation
 - `iroh-blobs` with `fs-store` backend for content-addressed blob storage and verified transfer
-- `iroh-gossip` for topic-based epidemic broadcast (node discovery, cache and content availability announcements)
+- `iroh-gossip` for topic-based epidemic broadcast (node discovery and metadata announcements via `NodeAnnounce`)
 
 ## Consequences
 

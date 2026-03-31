@@ -174,7 +174,7 @@ Nodes with no `accepted_tokens` entry default to USDC on their configured chain.
 
 ### Gossip: Rate Advertisement
 
-Gossip `CacheAnnounce` messages advertise rates as a list of `(token_address, rate_per_mb)` pairs:
+`ProbeResponse` messages advertise rates as a list of `(token_address, rate_per_mb)` pairs:
 
 ```rust
 // Before (ADR 003)

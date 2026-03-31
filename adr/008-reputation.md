@@ -159,7 +159,7 @@ A single reputation report (local or network) can move a node's score by at most
 
 When multiple nodes have the same unified selection score (within 1% — see [ADR 001, Node Selection Algorithm](001-network.md#node-selection-algorithm)), select by:
 
-1. Lower current load (nodes include approximate load in gossip announcements)
+1. Lower current load (from `LoadHint` in `NodeAnnounce` gossip messages — see [ADR 001](001-network.md))
 2. Geographic diversity (prefer nodes in regions not already selected)
 3. Higher stake (more skin in the game)
 4. Random (final tiebreaker)

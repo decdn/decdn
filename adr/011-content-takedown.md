@@ -108,7 +108,7 @@ Hash-based blacklisting covers only exact copies of a blob. A one-byte change pr
 
 - Is removed from the `StakingRegistry` (same effect as stake ejection)
 - Cannot register new nodes under the same address
-- Has all its NodeIds excluded from `CacheAnnounce` routing tables
+- Has all its NodeIds excluded from peer tables (gossip validation rejects messages from blacklisted nodes)
 
 This raises the cost of re-upload evasion from trivial (change a byte) to significant: the operator must fund and register a new identity with fresh stake. Repeat evasion becomes progressively more expensive.
 
@@ -136,13 +136,13 @@ On startup, nodes always fetch the full current blacklist (global + their region
 
 When a node receives a new blacklisted hash, it must, **in order**:
 
-1. **Stop announcing** — omit the hash from all future `CacheAnnounce` gossip messages immediately
+1. **Stop announcing** — omit the hash from `popular_hashes` in all future `NodeAnnounce` gossip messages immediately
 2. **Stop serving** — reject any new `StreamRequest` for the hash immediately, returning `HashBlacklisted`
 3. **Evict from cache** — delete the blob from local storage within the compliance window
 
 The announce-first ordering is critical: announcing content that is then not delivered triggers the phantom-blob detection path (ADR 003). Eviction from disk can be async; announcement suppression must be synchronous.
 
-When a node receives a blacklisted origin address, it additionally stops accepting any `StreamRequest` that presents a channel funded by that operator address, and removes all of that origin's NodeIds from its local routing table.
+When a node receives a blacklisted origin address, it additionally stops accepting any `StreamRequest` that presents a channel funded by that operator address, and removes all of that origin's NodeIds from its local peer table.
 
 In-flight streams for a blacklisted hash are terminated at the next MB boundary. The client receives a `HashBlacklisted` error and can request a refund of the unused channel balance.
 
@@ -233,7 +233,7 @@ The minimum viable process for PoC:
 
 ## ADRs Affected
 
-- **ADR 001** (Network Topology) — `CacheAnnounce` must suppress blacklisted hashes and exclude blacklisted origin NodeIds; `StreamError::HashBlacklisted` and `StreamError::OriginBlacklisted` are new error variants
+- **ADR 001** (Network Topology) — `NodeAnnounce` must suppress blacklisted hashes from `popular_hashes`; blacklisted origin NodeIds are excluded from peer tables; `StreamError::HashBlacklisted` and `StreamError::OriginBlacklisted` are new error variants
 - **ADR 002** (Content Addressing) — content-addressed blobs can be removed from the network layer even though the hash remains valid; this is explicitly accepted
 - **ADR 004** (Tokenomics) — serving blacklisted content added to the slashable offense list; origin blacklisting triggers same stake ejection path as repeated slashing
 - **ADR 009** (Governance) — `ContentBlacklist` contract added to governance-controlled contracts; emergency multisig scope documented in ADR 009 as the single source of truth, covering both contract pausing and content/origin blacklisting; regional body registry introduced as a new governance primitive
