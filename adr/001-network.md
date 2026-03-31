@@ -44,9 +44,44 @@ graph TD
 
 - **PoC scale: gossip-only discovery.** At tens of nodes, every node receives every `CacheAnnounce` on the global topic, so the local routing table has near-complete coverage of network-wide content. A routing table miss means no other node is known to hold the blob. If the requesting node is itself origin-backed for that content, it serves from its own origin store; otherwise it returns an error to the client. A content-addressed DHT is deferred to production scale (see [Future Work: Content-Addressed DHT](#future-work-content-addressed-dht) below).
 
-On a cache miss, a node probes candidates from its routing table, selects the best by `rate_per_mb × rtt_ms`, and pulls via `cdn/client/v1` (paid). This is the same protocol used for client→node delivery — every byte transferred in the network is paid. Origin-backed nodes typically charge more (reflecting their backend egress costs) and set the effective price ceiling. Cache-only nodes that have the blob compete at lower rates.
+On a cache miss, a node probes candidates from its routing table, selects the best by the **unified node selection score**, and pulls via `cdn/client/v1` (paid). This is the same protocol used for client→node delivery — every byte transferred in the network is paid. Origin-backed nodes typically charge more (reflecting their backend egress costs) and set the effective price ceiling. Cache-only nodes that have the blob compete at lower rates.
+
+### Node Selection Algorithm
+
+The unified selection score combines price, latency, and reputation into a single comparable value:
+
+```
+selection_score = rate_per_mb × rtt_ms × (1 / reputation²)
+```
+
+Lower is better. The `reputation²` term amplifies the effect of reputation: a node with reputation 0.5 (neutral) is 4× more expensive in score terms than a node with reputation 1.0 (perfect). This means:
+
+| Reputation | Score multiplier (vs. rep=1.0) |
+| --- | --- |
+| 1.0 | 1.0× |
+| 0.8 | 1.56× |
+| 0.5 | 4.0× |
+| 0.3 | 11.1× |
+| 0.1 | 100× |
+
+For new nodes with the initial reputation of 0.5 ([ADR 008](008-reputation.md)), the 4× multiplier means they must be ~4× cheaper or faster to compete with established nodes — a reasonable bootstrap barrier softened by the cold-start bonus in ADR 008.
+
+**Inputs:** `rate_per_mb` and `rtt_ms` come from `ProbeResponse` (see [ADR 005](005-protocol.md)). `reputation` is the node's `final_score` from [ADR 008](008-reputation.md) — local observations (70%) + network gossip (30%).
+
+**Tie-breaking** (scores within 1% of each other): see [ADR 008, Section 9](008-reputation.md#9-tie-breaking).
+
+This replaces the simpler `rate_per_mb × rtt_ms` formula referenced elsewhere in this ADR and in ADR 005. The simpler formula remains valid as a description of the price×latency component; the full selection algorithm adds reputation weighting.
 
 Node identity is the iroh `NodeId` (ed25519 public key). All staked nodes register in an on-chain registry mapping `NodeId → QUIC multiaddrs + Ethereum address`. Clients query this registry on first startup to find initial peers.
+
+### Registry Unavailability
+
+If the on-chain registry (or RPC endpoint) is unavailable at startup, the client retries with exponential backoff: 3 attempts at 1s, 5s, and 30s intervals. If all retries fail:
+
+- **Returning client (has cached peer list):** Falls back to the peer list from the last successful registry query, stored in a local file (`~/.decdn/peers.json`). Stale entries are tolerable — probes will fail for deregistered nodes, and gossip will update the routing table once connected.
+- **First-ever startup (no cache):** Fails with an actionable error: `"Cannot reach registry at {rpc_url}. Check network connectivity and RPC endpoint configuration."` No hardcoded peer list is shipped — the on-chain registry is the single source of truth for PoC.
+
+The client refreshes its cached peer list on every successful registry query (on startup and periodically every 10 minutes while running).
 
 ## Consequences
 
@@ -61,9 +96,9 @@ Node identity is the iroh `NodeId` (ed25519 public key). All staked nodes regist
 **Negative:**
 
 - Gossip consistency is eventual — a node that evicts or loses content may still appear in routing tables until the next `CacheAnnounce` cycle (announce interval is a per-node configuration parameter; PoC default TBD during implementation); clients and nodes must handle stale entries by falling back to the next candidate
-- Bloom filter announcements (for large caches) introduce false positives: a probe to a node that turns out not to have the blob wastes a round-trip
+- Bloom filter announcements (for large caches) introduce false positives: a probe to a node that turns out not to have the blob wastes a round-trip. **Bloom filter parameters:** target false positive rate (FPR) of 1%, using `k = 10` hash functions and `m = 14.4` bits per item. At 10,000 cached blobs, the filter is ~18 KB; at 100,000 blobs, ~180 KB. The threshold for switching from explicit hash list to Bloom filter is 500 items (the `CacheAnnounce` hash list cap). Nodes MUST include the number of items (`n`) and the target FPR in the Bloom filter metadata so receivers can validate filter size and estimate actual FPR
 - Every transfer is paid, so nodes pulling content on cache miss incur a cost that must be recouped through subsequent client deliveries; this creates a natural economic barrier to speculative caching
-- Self-reported region hints (ISO 3166-1 alpha-2) are unverified; a node could misreport its region to appear in more gossip topics
+- Self-reported region hints (ISO 3166-1 alpha-2) are unverified; a node could misreport its region to appear in more gossip topics. **PoC mitigation:** region misreporting is detectable via latency — a node claiming "US" but responding with 200ms RTT from a US client is suspicious. Clients apply a reputation penalty when observed latency contradicts the claimed region (e.g., RTT > 150ms to a node in the same claimed region). **Production:** IP-geolocation verification via a decentralized oracle or third-party attestation service is deferred to production. The PoC accepts the residual risk that a small number of nodes may misreport regions
 - Origin-backed nodes become the last line of defence for content availability — if all origin-backed nodes for a given blob go offline or are deregistered, the content becomes permanently unavailable (unless cached elsewhere). Content owners are responsible for origin node uptime.
 
 ### Future Work: Content-Addressed DHT
