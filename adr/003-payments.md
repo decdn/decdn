@@ -84,7 +84,20 @@ At the default 1 MB cadence, a 10 GB blob requires 10,000 vouchers — each invo
 
 Even the worst case (1024 MB at ceiling rate) exposes $1.024 — well below the recommended 10 USDC minimum deposit.
 
-**Concurrent streams interaction:** When multiple streams share a channel with different negotiated intervals, the effective interval for the channel is the **minimum** across all active streams. This preserves the existing invariant that the aggregate voucher deficit never exceeds the effective interval. A consequence is that the overhead reduction from larger intervals is only realized when **all** streams on a channel negotiate larger intervals — a single 1 MB stream added to a channel with a 1024 MB stream forces the entire channel back to 1 MB cadence. When the effective interval shrinks (e.g., a new stream joins with a smaller interval), the client MUST immediately issue a cumulative voucher if the current unvouchered byte count exceeds the new effective interval, to prevent all streams from stalling. Clients fetching a mix of small and large blobs from the same node may benefit from opening separate channels to isolate large-interval streams. See [ADR 005 — Payment channels and concurrent streams](005-protocol.md#payment-channels-and-concurrent-streams) for wire-level details.
+### Concurrent Streams
+
+When multiple streams share a single payment channel, they share a **single cumulative voucher counter**. The rules:
+
+1. **Effective interval = minimum across all active streams.** If stream A negotiated 100 MB and stream B negotiated 1 MB, the channel operates at 1 MB cadence.
+2. **Aggregate byte counter.** The client tracks total bytes received across all streams on the channel. A voucher is due whenever the aggregate crosses the next interval boundary.
+3. **Interval shrink.** When a new stream joins with a smaller interval than the current effective interval, the client MUST immediately issue a cumulative voucher if the current unvouchered byte count exceeds the new effective interval. Failure to do so causes the node to pause **all** streams on the channel (the self-enforcing threshold is applied collectively, not per-stream).
+4. **Voucher routing.** Vouchers are sent on any active stream sharing the channel — the node credits them against the channel-wide counter regardless of which stream carries the message.
+
+**Example:** Client has stream A (blob X, 100 MB interval) and stream B (blob Y, 1 MB interval) on the same channel. Effective interval is 1 MB. After receiving 1 MB total (e.g., 0.7 MB from A + 0.3 MB from B), the client sends a cumulative voucher. If stream B ends, the effective interval rises to 100 MB for the remainder of stream A.
+
+**Isolation recommendation:** Clients fetching a mix of small and large blobs from the same node may benefit from opening separate channels to isolate large-interval streams from small-interval ones.
+
+See [ADR 005 — Payment channels and concurrent streams](005-protocol.md#payment-channels-and-concurrent-streams) for wire-level details.
 
 ### Fee Calculation on Disputed Closes
 
@@ -169,9 +182,9 @@ Client sends probe requests to many nodes at high frequency to map the network o
 The current mitigation is weak. Clients are not staked — their NodeIds are free to rotate — so per-NodeId rate limiting is bypassable. The iroh connection setup cost is also low. Options:
 
 - **Option A — IP-based rate limiting.** Rate limit probe requests by source IP rather than NodeId. Harder to rotate at scale, though not impossible with proxies or cloud infrastructure.
-- **Option B — Require an open channel to probe.** Only clients with an existing open payment channel (any amount) can probe. Strong protection but adds friction for new users who haven't yet deposited.
+- ~~**Option B — Require an open channel to probe.**~~ **Rejected.** This creates a bootstrap catch-22: clients need probe results (rate, latency) to choose a node before opening a channel, but Option B requires a channel before probing. Since probes happen before channel opens (see [ADR 005](005-protocol.md) probe flow), requiring a channel is architecturally incompatible with the protocol sequence. Probes are unauthenticated and free — see ADR 005's statement that "`ProbeRequest` requires no authentication."
 - **Option C — Proof-of-work on probe requests.** Include a small PoW challenge in the probe request (e.g., find a nonce such that `hash(NodeId || nonce) < difficulty`). Adds CPU cost to bulk probing without affecting honest single-request clients noticeably.
-- **Option D — Accept the risk.** A probe is a single message exchange. The cost to serve one is negligible; the attack only matters at extreme scale. Rate limit at the connection level (iroh handles this) and monitor for abuse rather than trying to prevent it at the protocol level.
+- **Option D — Accept the risk (PoC default).** A probe is a single message exchange. The cost to serve one is negligible; the attack only matters at extreme scale. Rate limit at the connection level (iroh handles this) and monitor for abuse rather than trying to prevent it at the protocol level.
 
 **Note:** Probe responses are considered public information (see ADR 005). The concern here is resource exhaustion from bulk probing, not information leakage — content availability is already broadcast via gossip, and pricing is revealed in probe/stream responses by design.
 
@@ -207,7 +220,7 @@ BLAKE3 verification catches this immediately at the client. The remaining gap is
 **Rate bait-and-switch**
 Node advertises a low rate in probe responses then returns a higher rate in `StreamResponse`.
 
-**Resolved: slashable offense.** Both `ProbeResponse` and `StreamResponse` include cryptographic signatures over the advertised rate (see ADR 005). The on-chain verifier checks: (1) both signatures are valid and from the same NodeId, (2) `StreamResponse.rate_per_mb > ProbeResponse.rate_per_mb`, (3) `stream_response.timestamp_us >= probe_response.timestamp_us` (prevents unsigned underflow), and (4) `stream_response.timestamp_us - probe_response.timestamp_us < 30_000_000` (30 seconds in microseconds). Both `timestamp_us` values are requester-generated — the probe timestamp is echoed in `ProbeResponse`, and a separate requester timestamp from `StreamRequest` is echoed in `StreamResponse` — so the delta is computed from a single clock with no wall-clock reference or time oracle needed. Clock skew between the requester and the node does not affect the check. The node is slashed per the escalating schedule in ADR 004. The 30-second window allows legitimate rate changes between sessions while catching same-session bait-and-switch.
+**Resolved: slashable offense.** Both `ProbeResponse` and `StreamResponse` include cryptographic signatures over the advertised rate (see ADR 005). The on-chain verifier checks: (1) both signatures are valid and from the same NodeId, (2) `StreamResponse.rate_per_mb > ProbeResponse.rate_per_mb`, (3) `stream_response.timestamp_us >= probe_response.timestamp_us` (prevents unsigned underflow), and (4) `stream_response.timestamp_us - probe_response.timestamp_us < 30_000_000` (30 seconds in microseconds). Both `timestamp_us` values are requester-generated — the probe timestamp is echoed in `ProbeResponse`, and a separate requester timestamp from `StreamRequest` is echoed in `StreamResponse` — so the delta is computed from a single clock with no wall-clock reference or time oracle needed. **Clock skew immunity:** because both timestamps originate from the requester's clock (the node merely echoes them back in its signed response), clock skew between the requester and the node is irrelevant. The on-chain verifier never compares timestamps from different clocks — it only computes the delta between two requester-generated values extracted from signed messages. A node with a clock 5 minutes ahead or behind has zero effect on the 30-second window check. The node is slashed per the escalating schedule in ADR 004. The 30-second window allows legitimate rate changes between sessions while catching same-session bait-and-switch.
 
 ---
 
@@ -306,11 +319,14 @@ struct Channel {
 }
 ```
 
-**Channel ID:** `channelId = keccak256(abi.encodePacked(client, provider, nonce))` where `nonce` is a per-client counter. Allows multiple channels between the same client-node pair.
+**Channel ID:** `channelId = keccak256(abi.encodePacked(client, provider, nonce))` where `nonce` is a monotonic per-client counter stored on-chain as `clientNonce[msg.sender]` and auto-incremented by `openChannel`. The client can pre-compute the next channelId off-chain via `keccak256(client, provider, clientNonce[client])` before submitting the transaction. This allows multiple sequential channels between the same client-node pair, each with a unique ID. The nonce is global per-client (not per-provider), ensuring uniqueness across all of a client's channels.
 
 ```solidity
 interface IStablePaymentChannel {
-    // Channel lifecycle
+    // Nonce tracking
+    function clientNonce(address client) external view returns (uint256);
+
+    // Channel lifecycle (openChannel increments clientNonce[msg.sender] and uses it in channelId)
     function openChannel(address provider, uint256 deposit) external returns (bytes32 channelId);
     function topUp(bytes32 channelId, uint256 additionalDeposit) external;
     function closeChannel(bytes32 channelId, uint256 amount, uint256 nonce, bytes calldata signature) external;
@@ -358,10 +374,13 @@ event ChannelSettled(
 );
 ```
 
+**Channel expiry:** `expiresAt` is set at channel open: `expiresAt = block.timestamp + maxChannelDuration`. The `maxChannelDuration` parameter defaults to 90 days and is governable within hardcoded bounds (minimum 7 days, maximum 365 days). Channel expiry protects clients from indefinitely locked funds when a node disappears without closing the channel.
+
 **Channel close lifecycle:**
 - `closeChannel` → requires status `Open`. Sets status to `Closing`, records voucher, emits `ChannelCloseInitiated`. No fund transfers.
 - `disputeChannel` → requires status `Closing` and `block.timestamp < disputeDeadline`. Accepts only vouchers with strictly higher nonce. Updates `claimedAmount`, emits `ChannelDisputed`. No fund transfers.
 - `settleChannel` → requires status `Closing` and `block.timestamp >= disputeDeadline`. Computes fee on final `claimedAmount`, transfers funds to provider/treasury/client, sets status to `Closed`, emits `ChannelSettled`.
+- `reclaimExpired` → requires status `Open` and `block.timestamp >= expiresAt`. Returns the full deposit to the client (no fee deducted — no voucher was submitted). Sets status to `Closed`. Callable by the client only. This is the escape hatch for channels where the node never initiated a close.
 
 **Safety bounds (hardcoded):**
 
@@ -373,6 +392,7 @@ event ChannelSettled(
 | Rate floor | 0 | Must be < ceiling |
 | Rate ceiling | Must be > floor | No max |
 | Max voucher interval | 1 MB | 1024 MB (~1 GB) |
+| Max channel duration | 604800 seconds (7 days) | 31536000 seconds (365 days) |
 
 **Rate bounds are in USDC base units (6 decimals) for the PoC.** The contract stores a single `RateBounds` struct with `deliveryFloor` and `deliveryCeiling`. Per-token rate bounds are deferred to [ADR 010](010-multi-token.md).
 
