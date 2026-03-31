@@ -148,12 +148,14 @@ Scores converge to 0.5 asymptotically, reaching within 0.05 of neutral after ~30
 |-----------|-------|
 | Decay rate | 10% per week (applied iteratively) |
 | Decay starts after | 1 week with no new reports or interactions |
-| Minimum score (floor) | 0.0 |
+| Minimum score (floor) | 0.0 (selection algorithm clamps at 0.1 — see [ADR 001](001-network.md#node-selection-algorithm)) |
 | Scope | Production only (PoC uses static scores, no decay) |
 
 ### 8. Score Clamping
 
 A single reputation report (local or network) can move a node's score by at most 0.05 in either direction. Prevents one bad interaction from destroying a good node or one fake report from inflating a sybil.
+
+**Selection clamp:** Independently of per-report clamping, the node selection formula in [ADR 001](001-network.md#node-selection-algorithm) clamps reputation to `max(reputation, 0.1)` to avoid division by zero. Nodes with reputation below 0.1 are scored identically (100× penalty vs. a perfect node) — effectively unselectable but not blacklisted.
 
 ### 9. Tie-Breaking
 
