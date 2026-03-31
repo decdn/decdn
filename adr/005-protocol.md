@@ -11,14 +11,15 @@ The protocol layer must be distinct from the transport layer (iroh/QUIC) and the
 
 ## Decision
 
-Four protocols, each identified by an ALPN string:
+Five protocols: four negotiated via ALPN, plus the built-in iroh-gossip protocol:
 
-| ALPN | Participants | Purpose |
+| Protocol | Participants | Purpose |
 | --- | --- | --- |
 | `cdn/probe/v1` | any node ↔ any node | Latency and availability check before committing to a node |
 | `cdn/client/v1` | payer ↔ delivering node | Paid blob delivery with payment vouchers (client→node, node→node on cache miss) |
+| `cdn/keys/v1` | app server ↔ client | Epoch key delivery and sealed envelope requests (see [ADR 006](006-e2e-encryption.md)) |
 | `cdn/watchtower/v1` | watched party (typically node) ↔ watchtower | Channel-dispute monitoring: voucher registration and updates (see ADR 007) |
-| iroh-gossip built-in | all nodes | Content availability announcements, node discovery |
+| iroh-gossip (built-in) | all nodes | Content availability announcements, node discovery |
 
 ### `cdn/probe/v1` — latency probe
 
@@ -123,6 +124,7 @@ Maximum concurrent bidirectional streams per connection, set via QUIC transport 
 | --- | --- | --- |
 | `cdn/client/v1` | 100 | Enough parallelism for bulk fetching (e.g., video manifest + segments) without exhausting server resources |
 | `cdn/probe/v1` | 1 | Single request-response; the connection is reused for sequential probes to the same node |
+| `cdn/keys/v1` | 10 | 1 long-lived epoch key stream + up to 9 concurrent envelope requests |
 | `cdn/watchtower/v1` | 10 | Allows concurrent updates for up to 10 registered channels; a node with more channels multiplexes updates over the available streams |
 
 Stream concurrency is enforced via QUIC's `MAX_STREAMS` transport parameter: a peer MUST NOT open a new bidirectional stream beyond the advertised limit (doing so is a protocol violation resulting in `STREAM_LIMIT_ERROR` and connection close). The receiver grants additional credit by sending `MAX_STREAMS` updates as existing streams close.
@@ -159,6 +161,7 @@ Implementation constraint: the payer must have a single voucher-signing task per
 
 - Connections remain open while any stream is active or any sent voucher is awaiting `VoucherAck` (on-chain channel closure does not affect connection lifetime).
 - **Idle timeout:** 30 seconds after the last stream closes and no unacknowledged vouchers remain in flight. Endpoints SHOULD send periodic QUIC PING frames when otherwise idle, with a default interval of 10 seconds (below the idle timeout) to prevent NAT middleboxes from dropping the mapping.
+- **`cdn/keys/v1` exception:** key delivery connections are long-lived by design (ADR 006). No idle timeout while a `KeySession` stream is active.
 - **`cdn/watchtower/v1` exception:** watchtower connections are long-lived by design (ADR 007). No idle timeout while any channel is registered.
 
 ### Error Handling and Retry Semantics
@@ -191,7 +194,7 @@ All protocol messages use [postcard](https://docs.rs/postcard) — compact, no-s
 
 **Positive:**
 
-- ALPN separation means a single iroh `Endpoint` dispatches all four connection types without ambiguity
+- ALPN separation means a single iroh `Endpoint` dispatches all five connection types without ambiguity
 - Probing in parallel before committing means no payment channel is opened with a slow or unresponsive node
 - `cdn/client/v1` is reused for all paid delivery — no separate protocol needed for node→node pulls
 - `redirect` always points to a NodeId, never an external URL; the backend topology of origin-backed nodes is fully hidden from the network

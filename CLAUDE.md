@@ -58,12 +58,14 @@ crates/
 
 **Dependency flow:** `node → cache, incentive, reputation, protocol`. Cache and incentive are independent — cache works without payment logic (useful for testing/local dev).
 
-### Wire Protocols (ALPN-identified)
+### Wire Protocols
 
 | ALPN | Purpose |
 |------|---------|
 | `cdn/probe/v1` | Latency + availability probing |
 | `cdn/client/v1` | All paid delivery (client→node and node→node) |
+| `cdn/keys/v1` | Epoch key delivery, sealed envelope requests (app server ↔ client) |
+| `cdn/watchtower/v1` | Channel-dispute monitoring, voucher registration |
 | iroh-gossip | Content availability broadcast, node discovery |
 
 ### Key Design Decisions
