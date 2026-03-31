@@ -58,7 +58,7 @@ graph TD
 
 **Note:** PoC payments use USDC only; production supports multiple governance-approved ERC-20 tokens (see [ADR 010](010-multi-token.md)).
 
-Clients probe candidate nodes, pick the best by the unified selection score (see [ADR 001](001-network.md#node-selection-algorithm) for the full formula), stream over `cdn/client/v1`, and pay via off-chain USDC vouchers. On a cache miss, a node discovers providers via probe fan-out (`cdn/probe/v1` to all known peers), selects the best, and pulls via `cdn/client/v1` (paid). Every byte delivered — whether client→node or node→node — is paid.
+Clients probe candidate nodes, pick the best by the unified selection score (see [ADR 001](001-network.md#node-selection-algorithm) for the full formula), stream over `cdn/client/v1`, and pay via off-chain payment vouchers (USDC in PoC). On a cache miss, a node discovers providers via probe fan-out (`cdn/probe/v1` to all known peers), selects the best, and pulls via `cdn/client/v1` (paid). Every byte delivered — whether client→node or node→node — is paid.
 
 ---
 
@@ -205,13 +205,13 @@ A `ContentBlacklist` contract supports global (network-wide) and regional (juris
 | **ALPN** | Application-Layer Protocol Negotiation — identifies which protocol a QUIC connection uses |
 | **Node** | A staked participant that caches and serves blobs. Some are configured with an origin backend; others are pure caches. |
 | **Client** | A lightweight QUIC endpoint that streams content and pays per MB |
-| **Origin-backed node** | A node configured with an object store (S3/R2/B2), NFS mount, or local disk — can serve any blob in that store, never experiences a true cache miss |
+| **Origin-backed node** | A node configured with an S3-compatible object store (e.g., S3/R2/B2/MinIO), NFS mount, or local disk — can serve any blob in that store, never experiences a true cache miss |
 
 ---
 
 ## Origin Integration
 
-Some nodes are configured with an origin backend (S3, R2, Backblaze B2, or self-hosted MinIO). They are the source of truth for all blobs but are accessed as infrequently as possible — only when no peer node has the content.
+Some nodes are configured with an origin backend (S3, R2, Backblaze B2, self-hosted MinIO, NFS, or local disk). They are the source of truth for all blobs but are accessed as infrequently as possible — only when no peer node has the content.
 
 ### Supported Origins
 
