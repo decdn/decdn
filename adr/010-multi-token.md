@@ -249,7 +249,7 @@ Migration proceeds in three phases. Phase 3 is a **breaking change** for nodes t
 ### Phase 3: Retirement (breaking)
 
 8. Governance retires the legacy `StablePaymentChannel` — no new channels can be opened on it. Existing open channels settle normally until expiry (up to 30 days)
-9. Nodes that have not upgraded to `PaymentChannel` can no longer open new payment channels. **This is a breaking change** — operators must upgrade before Phase 3 takes effect
+9. Nodes that have not upgraded to `PaymentChannel` can no longer participate in new payment channels — they cannot open channels on the new contract, and clients using the new contract cannot open channels with them. **This is a breaking change** — operators must upgrade before Phase 3 takes effect
 
 ## Open Questions
 
