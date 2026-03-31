@@ -48,7 +48,7 @@ graph TD
     N2 <-.->|"iroh-gossip<br/>CacheAnnounce"| N3
 ```
 
-Clients probe candidate nodes, pick the best by `rate_per_mb × rtt_ms`, stream over `cdn/client/v1`, and pay via off-chain USDC vouchers. On a cache miss, a node pulls from another node that has the blob (paid via `cdn/client/v1`) and caches locally. Every byte delivered — whether client→node or node→node — is paid.
+Clients probe candidate nodes, pick the best by the unified selection score (`rate_per_mb × rtt_ms × 1/reputation²` — see [ADR 001](001-network.md#node-selection-algorithm)), stream over `cdn/client/v1`, and pay via off-chain USDC vouchers. On a cache miss, a node pulls from another node that has the blob (paid via `cdn/client/v1`) and caches locally. Every byte delivered — whether client→node or node→node — is paid.
 
 ---
 
@@ -82,7 +82,7 @@ Every blob is identified by its BLAKE3 hash. Clients verify received bytes again
 
 **Off-chain USDC payment channels. Market-driven rates.**
 
-Clients pay nodes per MB. On a cache miss, nodes pay origin-backed nodes per MB for initial content pulls, then amortise that cost across many client deliveries. Origin-backed nodes set the effective price ceiling (reflecting their backend egress costs). Rates are fully market-driven within governance-set bounds. Voucher cadence (default 1 MB) is negotiable per-stream for large blob transfers, reducing overhead without materially increasing risk.
+Clients pay nodes per MB. On a cache miss, nodes pay origin-backed nodes per MB for initial content pulls, then amortise that cost across many client deliveries. Origin-backed nodes set the effective price ceiling (reflecting their backend egress costs). Rates are fully market-driven within governance-set bounds. Voucher cadence (default 1 MB) is negotiable per-stream for large blob transfers, reducing overhead without materially increasing risk. NodeId-to-Ethereum address binding is registered on-chain via `StakingRegistry.bindNodeId()` for nodes and ephemeral (per-session) for clients.
 
 ---
 
@@ -90,7 +90,7 @@ Clients pay nodes per MB. On a cache miss, nodes pay origin-backed nodes per MB 
 
 **USDC for payments. TOKEN for staking and fee discounts.**
 
-TOKEN is not used for payments. All nodes must stake TOKEN to participate. Staking cost creates accountability and Sybil resistance. 20% of protocol fees buy back and burn TOKEN. Fixed supply of 1B at genesis. Governance is covered separately in [ADR 009](009-governance.md).
+TOKEN is not used for payments. All nodes must stake TOKEN to participate. Staking cost creates accountability and Sybil resistance. 20% of protocol fees buy back and burn TOKEN. Fixed supply of 1B at genesis. Challenge bonds (100 TOKEN in PoC, 50 TOKEN in production) are required for slash claims, preventing zero-cost griefing. Governance is covered separately in [ADR 009](009-governance.md).
 
 ---
 
@@ -102,6 +102,7 @@ TOKEN is not used for payments. All nodes must stake TOKEN to participate. Staki
 | --- | --- |
 | `cdn/probe/v1` | Parallel latency + availability check before node selection |
 | `cdn/client/v1` | Paid delivery: client→node, node→node (cache miss) |
+| `cdn/watchtower/v1` | Channel-dispute monitoring ([ADR 007](007-watchtower.md)) |
 | iroh-gossip built-in | Content availability and node discovery |
 
 `redirect` in `StreamResponse` always points to a NodeId, never an external URL. The origin backend is never revealed.
@@ -128,7 +129,7 @@ A watchtower holds the latest voucher for a registered channel and submits a `di
 
 **Interaction-weighted scoring with gossip propagation.**
 
-Nodes are ranked by a reputation score (0.0–1.0) derived from local observations (70%) and gossip-propagated reports (30%). Reports are weighted by the reporter's number of settled payment channels (on-chain verifiable), making reputation manipulation expensive. Scores decay toward neutral without fresh data, clamping limits per-report impact, and a cold-start bootstrap gives new nodes initial traffic.
+Nodes are ranked by a reputation score (0.0–1.0) derived from local observations (70%) and gossip-propagated reports (30%). Reports are weighted by the reporter's total settled USDC value (on-chain verifiable), making reputation manipulation expensive (proportional to capital deployed, not channel count). Scores decay toward neutral without fresh data, clamping limits per-report impact, and a cold-start bootstrap gives new nodes initial traffic.
 
 ---
 
@@ -136,7 +137,7 @@ Nodes are ranked by a reputation score (0.0–1.0) derived from local observatio
 
 **Admin key for PoC. Token-weighted governance with safety bounds for production.**
 
-During the PoC, a single deployer address controls all contract parameters. Production governance uses OpenZeppelin Governor with TOKEN voting, 4% quorum, and a 2-day timelock. All governable parameters have hardcoded safety bounds that even governance cannot override. A 3-of-5 emergency multisig can only pause contracts, with a 12-month sunset.
+During the PoC, a single deployer address controls all contract parameters. Production governance uses OpenZeppelin Governor with TOKEN voting, 4% quorum, and a 2-day timelock. All governable parameters have hardcoded safety bounds that even governance cannot override (e.g., slash 5%–50%, dispute window 12h–72h). A 3-of-5 emergency multisig can only pause contracts and add emergency blacklist entries, with a 12-month sunset enforced via an immutable constructor deadline.
 
 ---
 
@@ -149,6 +150,44 @@ During the PoC, a single deployer address controls all contract parameters. Prod
 - A node cannot register without staking — `StakingRegistry` enforces `stake >= minStake` before accepting a `registerNode` call
 - Payment channels amortize on-chain costs across an entire session; per-MB payments are off-chain
 - Safety bounds on all governable parameters are hardcoded — governance cannot set fees to 100% or stake to zero (see [ADR 009](009-governance.md))
+
+---
+
+## Gossip Bandwidth Budget
+
+Multiple ADRs introduce independent gossip topics. The aggregate bandwidth per node at PoC scale (20 nodes):
+
+| Topic | Source ADR | Message type | Est. size | Frequency per node | Bandwidth per node (recv) |
+| --- | --- | --- | --- | --- | --- |
+| `cdn/global/v1` | ADR 001/005 | `CacheAnnounce` (hash list) | ~16 KB | 1/min per node × 19 peers | ~5 KB/s |
+| `cdn/region/{cc}/v1` | ADR 001/005 | `CacheAnnounce` (regional) | ~8 KB | 1/min per node × ~5 regional peers | ~0.7 KB/s |
+| `reputation/v1` | ADR 008 | `ReputationReport` | ~150 B | Max 10/hr per reporter × 19 peers | ~8 B/s |
+| `cdn/keys/v1` (production) | ADR 006 | `EpochRotated` | ~100 B | 1/5 min | ~0.3 B/s |
+
+**Total estimated gossip bandwidth at PoC scale: ~6 KB/s inbound per node.** This is well under the 100 KB/s target budget. At production scale (500 nodes), CacheAnnounce traffic dominates — Bloom filter announcements (~18 KB per node × 499 peers ÷ 60s) could reach ~150 KB/s per node, justifying the transition to a DHT-based discovery layer (see [ADR 001, Future Work](001-network.md#future-work-content-addressed-dht)).
+
+**Rate limiting budget:** The per-topic rate limits specified in ADR 008 (max 10 reports/hr per reporter) and the CacheAnnounce interval (configurable, PoC default TBD) are the primary controls. If gossip bandwidth exceeds the budget, the first lever is increasing the CacheAnnounce interval or switching to Bloom filters earlier.
+
+---
+
+## Privacy Surface
+
+The protocol makes several deliberate privacy tradeoffs favoring decentralization and accountability over privacy. Consolidated from all ADRs:
+
+| Data | Visibility | Source ADR | Classification |
+| --- | --- | --- | --- |
+| Node identities (NodeId, Ethereum address) | Public on-chain registry | ADR 001 | **Intentional** — nodes are public service providers |
+| Content availability (which nodes have which blobs) | Public via gossip + probes | ADR 001, 005 | **Intentional** — discovery requires availability data |
+| Node pricing (`rate_per_mb`) | Public via probe/stream responses | ADR 005 | **Intentional** — market pricing requires transparency |
+| Payment channel activity (open, close, amounts) | Public on-chain | ADR 003 | **Accepted** — L2 transactions are public; channel amounts reveal payment volumes |
+| Client Ethereum addresses | Public on-chain (channel opens) | ADR 003 | **Accepted** — clients are pseudonymous but linkable via address reuse |
+| Reputation scores (gossip reports) | Semi-public (gossip subscribers) | ADR 008 | **Intentional** — reputation is a public signal |
+| Node region (ISO 3166-1) | Public on-chain registry | ADR 001 | **Intentional** — but self-reported and unverified |
+| Content access patterns (who fetches what) | Visible to serving node only | ADR 005 | **Mitigatable** — multi-node fetching distributes access patterns; no single node sees all of a client's requests |
+| Watchtower channel registration | Visible to watchtower | ADR 007 | **Accepted** — watchtower sees channel amounts and voucher frequency; privacy impact is low (counterparty already has this data) |
+| Epoch key delivery (subscription status) | Visible to app server | ADR 006 | **Accepted** — app server is a trusted party for subscription management |
+
+**Not addressed:** IP-level metadata (which IPs connect to which nodes) is visible to network observers. This is inherent to any QUIC-based system and not mitigated by the protocol. Tor/VPN integration is out of scope.
 
 ---
 
@@ -234,7 +273,7 @@ flowchart TD
     B -->|Miss| E{pull_through enabled?}
     E -->|Yes| F[Query routing table for peers with blob]
     F --> G["Probe candidates (cdn/probe/v1)"]
-    G --> H["Select best: rate_per_mb x rtt_ms"]
+    G --> H["Select best: unified score"]
     H --> I["Pull via cdn/client/v1 (node pays peer)"]
     I --> J[Cache locally + stream to client simultaneously]
     J --> D

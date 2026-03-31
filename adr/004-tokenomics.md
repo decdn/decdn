@@ -240,7 +240,17 @@ The per-node monthly shortfall at PoC scale is ~$34. Subsidy requirements at dif
 | Minimal PoC | 20 | 6 months | ~$4,080 |
 | Extended PoC | 50 | 12 months | ~$20,400 |
 
-At any reasonable TOKEN price, these amounts are a tiny fraction of the 200M TOKEN bootstrap fund. The bootstrap fund is more than adequate for PoC scale. The open question is whether it suffices for the production bootstrap period — hundreds or thousands of nodes operating before organic traffic catches up to infrastructure costs.
+At any reasonable TOKEN price, these amounts are a tiny fraction of the 200M TOKEN bootstrap fund. The bootstrap fund is more than adequate for PoC scale.
+
+**Production bootstrap modeling.** The table below estimates bootstrap fund requirements at various production scales, assuming the per-node shortfall decreases as organic traffic grows:
+
+| Phase | Nodes | Organic revenue/node | Shortfall/node | Duration | Total subsidy |
+| --- | --- | --- | --- | --- | --- |
+| Early production | 100 | $15/month | $35/month | 12 months | $420,000 |
+| Growth | 500 | $50/month | $0/month (breakeven) | — | $0 |
+| Mature | 1,000+ | $100+/month | — (profitable) | — | $0 |
+
+At a TOKEN price of $0.01 (conservative early production), the 200M TOKEN bootstrap fund is worth $2M — sufficient to cover the early production phase (~$420K) with margin. At $0.001/TOKEN, the fund is worth $200K — marginal. **The bootstrap fund's adequacy is directly tied to TOKEN price**, which creates a reflexive dependency: if the network fails to attract traffic, TOKEN price drops, the fund buys less subsidy, and nodes leave. This chicken-and-egg dynamic is the primary economic risk and should be monitored as the network scales.
 
 ### Gas Cost Breakdown (Arbitrum)
 
