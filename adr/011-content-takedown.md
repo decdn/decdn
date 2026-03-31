@@ -182,13 +182,7 @@ The response does not distinguish between governance and local denylist sources.
 
 ## Slashing
 
-Serving a blacklisted hash after the compliance window is a slashable offense. It uses the existing escalating schedule from [ADR 004](004-tokenomics.md):
-
-| Offense | Slash |
-|---------|-------|
-| First | 10% of stake |
-| Second within 30 days | 15% of stake |
-| Third within 30 days | 100% of stake (full ejection) |
+Serving a blacklisted hash after the compliance window is a slashable offense, subject to the escalating schedule in [ADR 004](004-tokenomics.md#slash-amounts-escalating). Repeated offenses trigger cumulative stake loss; nodes whose stake drops below 50% of the minimum are auto-ejected ([ADR 004 § Auto-ejection](004-tokenomics.md#auto-ejection)). Individual slash percentages are capped at 50% per offense ([ADR 009 § Safety bounds](009-governance.md#governable-parameters-with-safety-bounds)).
 
 **Slash evidence.** The challenger submits:
 - The `blake3Hash`
