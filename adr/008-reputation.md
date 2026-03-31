@@ -108,7 +108,7 @@ struct ReportMetrics {
 }
 ```
 
-Reports only accepted from staked nodes. **Recency validation:** receivers MUST reject reports where `current_time - report.timestamp > max_report_age_secs` (default: 3600 seconds / 1 hour). This prevents replay of old reports — a report from weeks ago cannot be resubmitted to re-damage a recovered node's reputation. The `timestamp` is reporter-generated and cannot be verified for accuracy, but the recency check bounds the replay window: an attacker can replay a report for at most 1 hour after it was originally broadcast.
+Reports only accepted from staked nodes. **Recency validation:** receivers MUST reject reports where either (a) `current_time - report.timestamp > max_report_age_secs` (too old) or (b) `report.timestamp > current_time + allowed_clock_skew_secs` (too far in the future). Defaults: `max_report_age_secs = 3600` (1 hour), `allowed_clock_skew_secs = 300` (5 minutes). This prevents replay of old reports and prevents reporters from using far-future timestamps to extend the replay window. The effective replay window is bounded to `max_report_age_secs + allowed_clock_skew_secs` (~65 minutes). **Clock sync dependency:** unlike the probe/stream timestamps (which are requester-generated and avoid clock sync — see ADR 005), reputation recency depends on loose clock agreement between reporter and receiver. The 1-hour + 5-minute window is tolerant of typical NTP drift but not of nodes with completely unsynchronized clocks.
 
 ```mermaid
 classDiagram

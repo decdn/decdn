@@ -319,7 +319,7 @@ struct Channel {
 }
 ```
 
-**Channel ID:** `channelId = keccak256(abi.encodePacked(client, provider, nonce))` where `nonce` is a monotonic per-client counter stored on-chain as `clientNonce[msg.sender]` and auto-incremented by `openChannel`. The client can pre-compute the next channelId off-chain via `keccak256(client, provider, clientNonce[client])` before submitting the transaction. This allows multiple sequential channels between the same client-node pair, each with a unique ID. The nonce is global per-client (not per-provider), ensuring uniqueness across all of a client's channels.
+**Channel ID:** `channelId = keccak256(abi.encodePacked(client, provider, nonce))` where `nonce` is a monotonic per-client counter stored on-chain as `clientNonce[msg.sender]`. **Ordering:** `openChannel` reads the current nonce, uses it to compute `channelId`, then increments: `nonce = clientNonce[msg.sender]; channelId = keccak256(..., nonce); clientNonce[msg.sender] = nonce + 1`. The client pre-computes the next channelId off-chain by reading `clientNonce[client]` and using that value directly — no off-by-one because the contract uses the same value before incrementing. The nonce is global per-client (not per-provider), ensuring uniqueness across all of a client's channels.
 
 ```solidity
 interface IStablePaymentChannel {
@@ -580,7 +580,11 @@ function bindNodeId(bytes32 nodeId, bytes calldata signature) external {
     ));
     require(ECDSA.recover(digest, signature) == msg.sender, "invalid signature");
 
-    // Clear previous binding if exists
+    // Reject if nodeId is already bound to a different address
+    address existingOwner = nodeIdToAddress[nodeId];
+    require(existingOwner == address(0) || existingOwner == msg.sender, "NodeId bound to another address");
+
+    // Clear caller's previous binding if exists
     bytes32 oldNodeId = addressToNodeId[msg.sender];
     if (oldNodeId != bytes32(0)) {
         delete nodeIdToAddress[oldNodeId];

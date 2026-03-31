@@ -120,7 +120,7 @@ To prevent frivolous fraud proof submissions, challengers must post a TOKEN bond
 | Bond return | Returned if challenge succeeds (node slashed) | Returned if challenge succeeds (node slashed) |
 | Bond forfeiture | Forfeited if node successfully counters. 50% burned, 50% to node. | Forfeited if node successfully counters. 50% burned, 50% to node. |
 
-The PoC bond is set higher than production (100 vs 50 TOKEN) because the freely mintable testnet token has no intrinsic cost — a higher nominal amount creates at least a transactional friction barrier. In production, where TOKEN has real value, 50 TOKEN provides sufficient economic deterrence.
+The PoC bond is set higher than production (100 vs 50 TOKEN) because testnet TOKEN has no real economic cost and can be provisioned cheaply by the team — a higher nominal amount creates at least a transactional friction barrier. In production, where TOKEN has real value, 50 TOKEN provides sufficient economic deterrence.
 
 ### Auto-Ejection
 
