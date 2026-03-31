@@ -33,7 +33,7 @@ sequenceDiagram
     C->>R: ProbeResponse {has_blob, rate_per_mb, timestamp_us, signature}
 
     Note over R: RTT = receive_time - timestamp_us
-    Note over R: Score = rate_per_mb x rtt_ms (lower is better)
+    Note over R: Score = unified selection score (see ADR 001)
 ```
 
 `timestamp_us` is a requester-generated microsecond timestamp echoed back. RTT is `receive_time - timestamp_us`. `has_blob` confirms the node has the content. `rate_per_mb` lets the requester score candidates on both latency and price in a single round-trip.

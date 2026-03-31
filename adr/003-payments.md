@@ -372,6 +372,12 @@ event ChannelSettled(
     uint256 clientRefund,
     uint256 protocolFee
 );
+
+event ChannelExpiredReclaimed(
+    bytes32 indexed channelId,
+    address indexed client,
+    uint256 deposit
+);
 ```
 
 **Channel expiry:** `expiresAt` is set at channel open: `expiresAt = block.timestamp + maxChannelDuration`. The `maxChannelDuration` parameter defaults to 90 days and is governable within hardcoded bounds (minimum 7 days, maximum 365 days). Channel expiry protects clients from indefinitely locked funds when a node disappears without closing the channel.
@@ -380,6 +386,7 @@ event ChannelSettled(
 - `closeChannel` → requires status `Open`. Sets status to `Closing`, records voucher, emits `ChannelCloseInitiated`. No fund transfers.
 - `disputeChannel` → requires status `Closing` and `block.timestamp < disputeDeadline`. Accepts only vouchers with strictly higher nonce. Updates `claimedAmount`, emits `ChannelDisputed`. No fund transfers.
 - `settleChannel` → requires status `Closing` and `block.timestamp >= disputeDeadline`. Computes fee on final `claimedAmount`, transfers funds to provider/treasury/client, sets status to `Closed`, emits `ChannelSettled`.
+- `reclaimExpired` → requires status `Open` and `block.timestamp >= expiresAt`. Returns the full deposit to the client (no fee deducted — no voucher was submitted). Sets status to `Closed`, emits `ChannelExpiredReclaimed`. Callable by the client only. This is the escape hatch for channels where the node never initiated a close.
 - `reclaimExpired` → requires status `Open` and `block.timestamp >= expiresAt`. Returns the full deposit to the client (no fee deducted — no voucher was submitted). Sets status to `Closed`. Callable by the client only. This is the escape hatch for channels where the node never initiated a close.
 
 **Safety bounds (hardcoded):**
