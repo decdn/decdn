@@ -79,8 +79,10 @@ The allowlist reduces exposure by letting governance reject tokens with known pr
 **Channel ID** incorporates the token address to allow the same client-provider pair to hold concurrent channels in different tokens:
 
 ```solidity
-channelId = keccak256(abi.encodePacked(client, provider, token, nonce));
+channelId = keccak256(abi.encodePacked(client, provider, token, channelNonce));
 ```
+
+**Breaking change from ADR 003:** The PoC channel ID formula is `keccak256(client, provider, channelNonce)` (see [ADR 003](003-payments.md)). This production formula adds `token` to support concurrent channels in different tokens between the same client-provider pair. This is a new contract deployment, not an upgrade of the PoC contract — see [Migration from ADR 003](#migration-from-adr-003) below.
 
 **Channel struct:**
 

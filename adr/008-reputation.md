@@ -90,7 +90,7 @@ flowchart TD
 
 ### 6. Gossip Protocol
 
-Dedicated gossip topic (`reputation/v1`) — all nodes subscribe. After interacting with a node, a node broadcasts a signed reputation report:
+Dedicated gossip topic (`cdn/reputation/v1`) — all nodes subscribe. After interacting with a node, a node broadcasts a signed reputation report:
 
 ```rust
 struct ReputationReport {
