@@ -66,7 +66,7 @@ Clients probe candidate nodes, pick the best by the unified selection score (see
 
 ### [ADR 000 — Language and Core Networking Stack](000-language.md)
 
-**Rust + iroh (0.35+).**
+**Rust + iroh (0.97+).**
 
 The implementation language is Rust. The networking stack is iroh, which provides QUIC transport, NAT traversal, content-addressed blob transfer, and gossip as a cohesive unit. A single statically linked binary runs as a node or client depending on configuration.
 

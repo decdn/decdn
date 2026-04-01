@@ -17,7 +17,7 @@ We are building a decentralized CDN with two participant roles: **nodes** (provi
 
 Use **Rust** as the implementation language and **iroh** as the core networking library.
 
-iroh versioning policy: pin to a specific version in `Cargo.toml` (e.g. `iroh = "0.35"`) rather than an open range. The current evaluated baseline is **0.35**. Upgrades are deliberate — evaluate API compatibility, update `Cargo.toml`, and record the new baseline here before merging. `Cargo.lock` is committed and acts as the true pin within a given version constraint.
+iroh versioning policy: pin to a specific version in `Cargo.toml` (e.g. `iroh = "0.97"`) rather than an open range. The current evaluated baseline is **0.97**. Upgrades are deliberate — evaluate API compatibility, update `Cargo.toml`, and record the new baseline here before merging. `Cargo.lock` is committed and acts as the true pin within a given version constraint.
 
 Specifically:
 - `iroh::Endpoint` for QUIC-based peer-to-peer connectivity and ALPN protocol negotiation
