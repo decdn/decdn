@@ -172,7 +172,7 @@ When multiple nodes have the same unified selection score (within 1% — see [AD
 
 ### 10. Cold-Start Bootstrap
 
-During the first 7 days after staking (or first 50 completed interactions, whichever comes first), new nodes receive a 10% selection bonus — scores temporarily boosted by 0.05 (additive). Local to each client, decays linearly over the bootstrap period.
+During the first 7 days after staking (or first 50 completed interactions, whichever comes first), new nodes receive a 10% selection bonus — scores temporarily boosted by 0.05 (additive), clamped to 1.0: `boosted_score = min(final_score + 0.05, 1.0)`. Local to each client, decays linearly over the bootstrap period.
 
 ### 11. Rate Limiting
 
