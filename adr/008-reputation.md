@@ -48,6 +48,7 @@ EWMA with alpha=0.1 means recent interactions matter more but old interactions s
 Reports received via iroh-gossip are aggregated using EWMA weighted by reporter credibility:
 
 ```
+weight_cap = 5.0
 raw_weight = total_settled_usdc(reporter) / max(1, max_settled_usdc_observed)
 reporter_weight = min(raw_weight, weight_cap)
 network_score = ewma(network_score, report.score, alpha=0.05 * reporter_weight)
@@ -79,7 +80,7 @@ flowchart TD
     end
 
     subgraph Network["Network Score (30%)"]
-        GR[Gossip ReputationReport] --> RW["reporter_weight =<br/>min(total_settled_usdc / max(1, max_observed), 5.0)"]
+        GR[Gossip ReputationReport] --> RW["reporter_weight =<br/>min(total_settled_usdc / max(1, max_settled_usdc_observed), 5.0)"]
         RW --> EWMA2["network_score = EWMA(network, report,<br/>a=0.05 * reporter_weight)"]
     end
 
@@ -151,7 +152,7 @@ Scores converge to 0.5 asymptotically, reaching within 0.05 of neutral after ~30
 | Decay rate | 10% per week (applied iteratively) |
 | Decay starts after | 1 week with no new reports or interactions |
 | Minimum score (floor) | 0.0 (selection algorithm clamps at 0.1 — see [ADR 001](001-network.md#node-selection-algorithm)) |
-| Reporter weight cap | 5.0 (max influence = 5× a median reporter) |
+| Reporter weight cap | 5.0 (max `reporter_weight` value; bounds the EWMA alpha multiplier) |
 | Scope | Production only (PoC uses static scores, no decay) |
 
 ### 8. Score Clamping
