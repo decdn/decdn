@@ -168,7 +168,7 @@ The current mitigation (auto-expire + deposit > gas cost) limits financial loss 
 **Stale close**
 Client submits an old voucher (lower amount) to close the channel, underpaying the node.
 
-The dispute window (default 48 hours for PoC — raised from 24 hours to account for L2 forced inclusion delay; see [ADR 007](007-watchtower.md#l2-sequencer-censorship)) works if the node is online. The gap is liveness: if the node goes offline after a stale close is submitted and misses the dispute window, it loses the difference. Production deployments add a forced-inclusion deadline extension mechanism ([ADR 007](007-watchtower.md#l2-sequencer-censorship)) that allows shorter windows without re-opening the censorship vulnerability. Options:
+The dispute window (default 48 hours for PoC — raised from 24 hours to account for L2 forced inclusion delay; see [ADR 007](007-watchtower.md#l2-sequencer-censorship)) works if the node is online. The gap is liveness: if the node goes offline after a stale close is submitted and misses the dispute window, it loses the difference. Production deployments add a forced-inclusion deadline extension mechanism ([ADR 007](007-watchtower.md#l2-sequencer-censorship)) that provides additional safety margin, though the dispute window must still exceed the L2's maximum forced-inclusion delay for the extension to be effective. Options:
 
 - **Option A — Watchtowers.** A separate monitoring service holds the latest voucher and submits it on the node's behalf if a dispute is detected. Adds operational complexity but fully closes the gap.
 - **Option B — Longer dispute window.** Increase beyond 48 hours (up to the 72h governance max), giving operators more time to respond. Delays legitimate channel closes for everyone.

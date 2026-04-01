@@ -223,7 +223,7 @@ Mitigated by diverse selection: the watched party should choose watchtowers oper
 
 All watchtowers go offline simultaneously during a dispute window due to infrastructure failure, DDoS, or correlated outage.
 
-The dispute window (48h PoC default, governable 12h–72h) is the primary buffer. For all 3 independent watchtowers to be offline for 24 consecutive hours requires a severe correlated event. The local dispute monitor (defense-in-depth) provides an additional layer — even if all watchtowers fail, the node itself can respond if it comes back online within the dispute window. Additionally, the watched party's software alerts the operator when watchtower connections drop, giving them time to manually submit the latest voucher.
+The dispute window (48h PoC default, governable 12h–72h) is the primary buffer. For all 3 independent watchtowers to be offline for the full dispute window (48 consecutive hours by default) requires a severe correlated event. The local dispute monitor (defense-in-depth) provides an additional layer — even if all watchtowers fail, the node itself can respond if it comes back online within the dispute window. Additionally, the watched party's software alerts the operator when watchtower connections drop, giving them time to manually submit the latest voucher.
 
 ---
 
@@ -235,7 +235,9 @@ The L2 sequencer censors the watchtower's `disputeChannel` transaction during th
 
 **PoC mitigation.** The PoC default dispute window is raised to **48 hours** (172800 seconds). This guarantees at least 24 hours of effective dispute response time even under worst-case sequencer censorship on any L2 with a forced inclusion delay ≤ 24 hours. This is simple, L2-agnostic, and stays within the governance bounds (12h–72h, [ADR 009](009-governance.md)).
 
-**Production mitigation — forced-inclusion deadline extension.** For production, the `StablePaymentChannel` contract implements a deadline extension mechanism: if a `disputeChannel` transaction arrives via L1 forced inclusion and the remaining dispute time is less than 24 hours, the `disputeDeadline` is automatically extended to `block.timestamp + 24 hours`. This allows production governance to set dispute windows shorter than 48 hours (down to the 12h minimum) without re-opening the censorship vulnerability.
+**Production mitigation — forced-inclusion deadline extension.** For production, the payment channel contract implements a deadline extension mechanism: if a `disputeChannel` transaction arrives via L1 forced inclusion and the remaining dispute time is less than 24 hours, the `disputeDeadline` is set to `block.timestamp + 24 hours` (i.e., guaranteeing at least 24 hours of dispute time from the moment the forced-inclusion transaction is processed). This provides an additional safety margin for dispute windows that are above but close to the L2's forced-inclusion delay.
+
+**Important constraint:** the extension mechanism only helps if the forced-inclusion transaction is processed *before* the original `disputeDeadline` expires. If the dispute window is shorter than the L2's maximum forced-inclusion delay, `settleChannel` becomes callable before the forced-inclusion `disputeChannel` arrives — the extension logic never executes. Therefore, **governance must not set the dispute window below the L2's maximum forced-inclusion delay** (e.g., ≥ 25h for an L2 with ~24h forced inclusion). The 12h governance floor remains as a hardcoded safety bound for L2s with shorter forced-inclusion paths, but is not safe on L2s with ~24h forced inclusion without additional mitigation.
 
 Constraints on the extension mechanism:
 - **One extension per close.** A second forced-inclusion dispute on the same channel does not trigger a further extension. This bounds the worst-case settlement delay to `disputeWindow + 24h`.
