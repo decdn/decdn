@@ -530,19 +530,20 @@ function getEffectiveFee(address provider) external view returns (uint256 bps) {
 This ensures the discount threshold (currently 10 × 1,000 = 10,000 TOKEN) stays correct if governance changes `minStake`.
 
 ```solidity
+using SafeERC20 for IERC20;
 
 // Client staking (optional, no slashing)
 mapping(address => uint256) public clientStakes;
 
 function clientStake(uint256 amount) external nonReentrant {
-    token.transferFrom(msg.sender, address(this), amount);
+    token.safeTransferFrom(msg.sender, address(this), amount);
     clientStakes[msg.sender] += amount;
 }
 
 function clientUnstake(uint256 amount) external nonReentrant {
     require(clientStakes[msg.sender] >= amount);
     clientStakes[msg.sender] -= amount;
-    token.transfer(msg.sender, amount);
+    token.safeTransfer(msg.sender, amount);
 }
 
 function clientStakeOf(address client) external view returns (uint256) {
