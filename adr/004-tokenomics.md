@@ -97,9 +97,28 @@ pie title TOKEN Distribution (1B total, fixed supply)
 | Scenario | PoC | Production |
 | --- | --- | --- |
 | First offense | 10% of stake | 5% of stake |
-| Second offense within 30 days | 10% of stake | 15% of stake |
-| Third offense within 30 days | 10% of stake | 50% of stake (triggers auto-ejection via cumulative loss) |
-| Offense counter reset | After 30 days without incidents | After 90 days without incidents |
+| Second offense before tier reset | 10% of stake | 15% of stake |
+| Third offense before tier reset | 10% of stake | 50% of stake (triggers auto-ejection via cumulative loss) |
+
+**PoC:** Flat 10% slash for all offenses. Escalation tier resets after 30 days without incidents. No lifetime counter.
+
+**Production — increasing reset periods.** Lifetime offenses increase the clean period required to drop one escalation tier, up to a 4× cap. The lifetime offense counter is a monotonically increasing `uint32` per node in `StakingRegistry` — it never resets.
+
+| Lifetime offense count | Reset period per tier drop |
+| --- | --- |
+| 1 | 90 days |
+| 2 | 180 days |
+| 3+ | 360 days |
+
+Formula: `resetPeriod = baseResetPeriod × min(2^(max(lifetimeOffenses, 1) - 1), 4)`, where `lifetimeOffenses` is a `uint32` starting at 0 and `baseResetPeriod` is 90 days (governable — see [ADR 009](009-governance.md#governable-parameters-with-safety-bounds)). For `lifetimeOffenses = 0` (no prior offenses), the multiplier is 1× — i.e., `resetPeriod = baseResetPeriod`.
+
+When the reset period elapses without a new offense, the node's escalation tier drops by one (e.g., tier 2 → tier 1). Multiple elapsed periods drop multiple tiers: `effectiveTier = max(0, storedTier - floor(elapsed / resetPeriod))`.
+
+**Example:** A node commits its first offense (5% slash, tier 1, lifetime count = 1). After 90 clean days, its tier resets to 0. The node commits a second offense (5% slash — tier was 0 — but lifetime count = 2). Now the node needs 180 clean days per tier drop. A third offense at any tier sets lifetime count = 3, requiring 360 clean days per tier drop.
+
+**Anti-gaming rationale:** Without increasing reset periods, a node can misbehave once every 91 days, always receiving the minimum 5% slash, never facing escalation or ejection (~20% annual stake loss). The increasing reset period makes this strategy progressively worse: after 3 lifetime offenses, the node must remain incident-free for 360 days to drop even one tier, during which its stake is locked and earning nothing if the node is inactive.
+
+**On-chain storage:** `StakingRegistry` stores two additional fields per node: `lifetimeOffenseCount` (`uint32`) and `lastOffenseTimestamp` (`uint256`). The `slash()` function first computes the effective tier via `currentTier()` (applying any decay from elapsed clean time), then sets `storedTier = currentTier() + 1`, increments `lifetimeOffenseCount`, and updates `lastOffenseTimestamp`. This ensures decay is applied before escalation — without this, a stale stored tier would be incremented past the correct level. The `currentTier()` view function computes the effective tier dynamically: `max(0, storedTier - floor(elapsed / resetPeriod))` — no keeper or decay transaction required.
 
 ### Slash Distribution
 
