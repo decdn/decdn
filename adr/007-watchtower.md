@@ -5,7 +5,7 @@
 
 ## Context
 
-ADR 003 defines a dispute window (default 24 hours, governable within 12h–72h) for payment channel settlement. Either party can counter a stale or fraudulent close by submitting a higher-nonce voucher during the window. This works if the counterparty is online — but if a node goes offline after a client submits a stale (low-amount) voucher, the node misses the dispute window and loses the difference between what it earned and what the stale voucher claims.
+ADR 003 defines a dispute window (default 48 hours for PoC, governable within 12h–72h) for payment channel settlement. Either party can counter a stale or fraudulent close by submitting a higher-nonce voucher during the window. This works if the counterparty is online — but if a node goes offline after a client submits a stale (low-amount) voucher, the node misses the dispute window and loses the difference between what it earned and what the stale voucher claims.
 
 ADR 003 identifies this liveness gap explicitly (stale close, Option A) and proposes a watchtower as the solution. The tokenomics spec (Section 8) sketches economic parameters — 0.1% of channel deposit per 30-day monitoring period — but defers the protocol design. This ADR resolves both.
 
@@ -124,7 +124,7 @@ Each channel should be registered with **2–3 independent watchtowers**. The wa
 Redundancy properties:
 - **No coordination between watchtowers.** Each operates independently with its own copy of the latest voucher.
 - **Multiple dispute submissions are harmless.** The contract accepts the highest-nonce voucher regardless of how many `disputeChannel` calls are made. Duplicate submissions waste gas but do not affect settlement.
-- **Failure tolerance.** All watchtowers must fail simultaneously during the dispute window (default 24 hours) for the attack to succeed. With 3 independent operators, this requires correlated failure (shared infrastructure, coordinated attack, or bribery of all 3).
+- **Failure tolerance.** All watchtowers must fail simultaneously during the dispute window (default 48 hours) for the attack to succeed. With 3 independent operators, this requires correlated failure (shared infrastructure, coordinated attack, or bribery of all 3).
 
 The watched party's software should monitor watchtower connection health and alert the operator if fewer than 2 watchtowers are connected for more than 1 hour.
 
@@ -136,7 +136,7 @@ The defense stack is:
 
 1. **Local dispute monitor** (in-process) — handles the node-is-online case
 2. **Watchtowers** (external, redundant) — handles the node-is-offline case
-3. **Dispute window (default 24h, governable 12h–72h)** — provides the time budget for both layers to respond
+3. **Dispute window (default 48h for PoC, governable 12h–72h)** — provides the time budget for both layers to respond
 
 ```mermaid
 flowchart TD
@@ -223,7 +223,7 @@ Mitigated by diverse selection: the watched party should choose watchtowers oper
 
 All watchtowers go offline simultaneously during a dispute window due to infrastructure failure, DDoS, or correlated outage.
 
-The 24-hour production dispute window is the primary buffer. For all 3 independent watchtowers to be offline for 24 consecutive hours requires a severe correlated event. The local dispute monitor (defense-in-depth) provides an additional layer — even if all watchtowers fail, the node itself can respond if it comes back online within the dispute window. Additionally, the watched party's software alerts the operator when watchtower connections drop, giving them time to manually submit the latest voucher.
+The dispute window (48h PoC default, governable 12h–72h) is the primary buffer. For all 3 independent watchtowers to be offline for the full dispute window (48 consecutive hours by default) requires a severe correlated event. The local dispute monitor (defense-in-depth) provides an additional layer — even if all watchtowers fail, the node itself can respond if it comes back online within the dispute window. Additionally, the watched party's software alerts the operator when watchtower connections drop, giving them time to manually submit the latest voucher.
 
 ---
 
@@ -231,7 +231,18 @@ The 24-hour production dispute window is the primary buffer. For all 3 independe
 
 The L2 sequencer censors the watchtower's `disputeChannel` transaction during the dispute window.
 
-This is a general L2 risk, not watchtower-specific. Mitigation depends on the L2's forced inclusion mechanism: Arbitrum's delayed inbox allows direct L1 submission that the sequencer cannot censor (with ~24h delay); Base (OP Stack) has a similar L1 force-inclusion path. The 24-hour dispute window should account for forced inclusion delay — if forced inclusion takes up to 24h, the effective dispute response time may require a longer window or a contract parameter that extends the deadline when a forced-inclusion transaction is detected. This interacts with the L2 chain selection decision (architecture.md, not yet decided) and should be revisited when the L2 is chosen.
+**Attack scenario.** A malicious closer (or a colluding sequencer) submits `closeChannel` with a stale voucher, then ensures all `disputeChannel` transactions are censored for the full dispute window. The watchtower falls back to L1 forced inclusion, but this takes up to ~24 hours (Arbitrum delayed inbox; OP Stack has a similar path). If the dispute window is also 24 hours, the effective dispute response time is **zero** — by the time the forced-inclusion transaction is processed, the window has expired.
+
+**PoC mitigation.** The PoC default dispute window is raised to **48 hours** (172800 seconds). This guarantees at least 24 hours of effective dispute response time even under worst-case sequencer censorship on any L2 with a forced inclusion delay ≤ 24 hours. This is simple, L2-agnostic, and stays within the governance bounds (12h–72h, [ADR 009](009-governance.md)).
+
+**Production mitigation — forced-inclusion deadline extension.** For production, the payment channel contract implements a deadline extension mechanism: if a `disputeChannel` transaction arrives via L1 forced inclusion and the remaining dispute time is less than 24 hours, the `disputeDeadline` is set to `block.timestamp + 24 hours` (i.e., guaranteeing at least 24 hours of dispute time from the moment the forced-inclusion transaction is processed). This provides an additional safety margin for dispute windows that are above but close to the L2's forced-inclusion delay.
+
+**Important constraint:** the extension mechanism only helps if the forced-inclusion transaction is processed *before* the original `disputeDeadline` expires. If the dispute window is shorter than the L2's maximum forced-inclusion delay, `settleChannel` becomes callable before the forced-inclusion `disputeChannel` arrives — the extension logic never executes. Therefore, **governance must not set the dispute window below the L2's maximum forced-inclusion delay** (e.g., ≥ 25h for an L2 with ~24h forced inclusion). The 12h governance floor remains as a hardcoded safety bound for L2s with shorter forced-inclusion paths, but is not safe on L2s with ~24h forced inclusion without additional mitigation.
+
+Constraints on the extension mechanism:
+- **One extension per close.** A second forced-inclusion dispute on the same channel does not trigger a further extension. This bounds the worst-case settlement delay to `disputeWindow + 24h`.
+- **Only forced-inclusion transactions.** Normal sequencer-included `disputeChannel` calls do not trigger the extension, preventing abuse.
+- **L2-specific detection.** Identifying a forced-inclusion transaction is inherently L2-specific. On Arbitrum, this can be detected via the `ArbSys` precompile or delayed inbox origin; on OP Stack, via L1 message origin. The exact detection logic is a parameter of the L2 chain selection decision (architecture.md, not yet decided) and will be finalized when the L2 is chosen.
 
 ---
 

@@ -22,7 +22,7 @@ The same channel mechanism operates at two tiers:
 - **Client → node**: a client opens a USDC channel with a node, signs cumulative vouchers as MB are delivered, and the node initiates channel close on-chain and settles to claim payment after the dispute window.
 - **Node → node**: when a node pulls content from another node (typically an origin-backed node) for the first time, it pays via the same channel mechanism. The origin-backed node is paid wholesale; the pulling node recoups this by serving multiple clients from its cache at a markup.
 
-A channel is opened by depositing USDC into the `StablePaymentChannel` contract. As content is delivered, the payer signs cumulative vouchers off-chain — one voucher per MB received (default cadence; negotiable for large transfers). The delivering node holds the latest voucher and submits it on-chain to initiate channel close. A dispute window (default 24 hours, governable within 12h–72h — see [ADR 009](009-governance.md)) allows either party to counter a stale or fraudulent close attempt. After the dispute window expires, the channel is settled and funds are distributed.
+A channel is opened by depositing USDC into the `StablePaymentChannel` contract. As content is delivered, the payer signs cumulative vouchers off-chain — one voucher per MB received (default cadence; negotiable for large transfers). The delivering node holds the latest voucher and submits it on-chain to initiate channel close. A dispute window (default 48 hours for PoC, governable within 12h–72h — see [ADR 009](009-governance.md)) allows either party to counter a stale or fraudulent close attempt. After the dispute window expires, the channel is settled and funds are distributed.
 
 Key parameters:
 
@@ -168,10 +168,10 @@ The current mitigation (auto-expire + deposit > gas cost) limits financial loss 
 **Stale close**
 Client submits an old voucher (lower amount) to close the channel, underpaying the node.
 
-The dispute window (default 24 hours) works if the node is online. The gap is liveness: if the node goes offline after a stale close is submitted and misses the dispute window, it loses the difference. Options:
+The dispute window (default 48 hours for PoC — raised from 24 hours to account for L2 forced inclusion delay; see [ADR 007](007-watchtower.md#l2-sequencer-censorship)) works if the node is online. The gap is liveness: if the node goes offline after a stale close is submitted and misses the dispute window, it loses the difference. Production deployments add a forced-inclusion deadline extension mechanism ([ADR 007](007-watchtower.md#l2-sequencer-censorship)) that provides additional safety margin, though the dispute window must still exceed the L2's maximum forced-inclusion delay for the extension to be effective. Options:
 
 - **Option A — Watchtowers.** A separate monitoring service holds the latest voucher and submits it on the node's behalf if a dispute is detected. Adds operational complexity but fully closes the gap.
-- **Option B — Longer dispute window.** Increase from 24 hours to 7 days, giving operators more time to respond. Delays legitimate channel closes for everyone.
+- **Option B — Longer dispute window.** Increase beyond 48 hours (up to the 72h governance max), giving operators more time to respond. Delays legitimate channel closes for everyone.
 - **Option C — Persistent monitoring process.** The node binary runs a lightweight dispute monitor as a separate thread that only watches the chain for close events, independent of the serving process. Simpler than a watchtower but still single-node.
 
 ---
@@ -364,14 +364,14 @@ constructor(address usdc_, address treasury_, uint256 disputeWindow_) {
     require(disputeWindow_ >= 43200 && disputeWindow_ <= 259200, "out of bounds");
     usdc = usdc_;
     treasury = treasury_;
-    disputeWindow = disputeWindow_;   // PoC default: 86400 (24 hours)
+    disputeWindow = disputeWindow_;   // PoC default: 172800 (48 hours)
     feePercentage = 300;              // 3% (300 bps)
     maxVoucherIntervalMb = 1;         // 1 MB
     maxChannelDuration = 7776000;     // 90 days
 }
 ```
 
-Default PoC deployment value for `disputeWindow`: **86400 seconds (24 hours)**. Safety bounds per [ADR 009](009-governance.md): 43200–259200 seconds (12h–72h).
+Default PoC deployment value for `disputeWindow`: **172800 seconds (48 hours)** — raised from 24 hours to guarantee effective dispute response time under L2 sequencer censorship (see [ADR 007](007-watchtower.md#l2-sequencer-censorship)). Safety bounds per [ADR 009](009-governance.md): 43200–259200 seconds (12h–72h).
 
 **Channel close events:**
 

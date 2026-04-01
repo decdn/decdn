@@ -46,7 +46,7 @@ All economic parameters across the protocol are governable within hardcoded safe
 | Unbonding period | StakingRegistry | 3 days | 30 days |
 | Multiaddr update cooldown | StakingRegistry | 0 (disabled) | 86400 seconds (1 day) |
 | Max multiaddr size | StakingRegistry | 64 bytes | 1024 bytes |
-| Dispute window | StablePaymentChannel | 12 hours | 72 hours (3 days) |
+| Dispute window (PoC default: 48h) | StablePaymentChannel | 12 hours | 72 hours (3 days) |
 | Rate floor/ceiling | StablePaymentChannel | Floor ≥ 1 base unit | Ceiling > floor |
 | Max voucher interval | StablePaymentChannel | 1 MB | 1024 MB (~1 GB) |
 | Min deposit | StablePaymentChannel | 1 base unit | No max |
@@ -58,7 +58,7 @@ Staking, slashing, and fee parameters are defined in [ADR 004](004-tokenomics.md
 **Safety bound rationale:**
 - **Slash 5%–50% per offense:** A 1% slash is economically negligible (10 TOKEN at minimum stake) and provides no deterrence. A 100% single-offense slash enables governance to fully confiscate stake, which is disproportionate and discourages staking. The 5%–50% range ensures each individual slash is meaningful but not existential. Full ejection (effectively 100% loss) is still possible through **cumulative** slashing: three offenses at the production schedule (5% + 15% + 50% = 70% cumulative) triggers auto-ejection when stake drops below the 50% threshold ([ADR 004](004-tokenomics.md#auto-ejection)).
 - **Rate floor ≥ 1 base unit:** A zero floor allows free-riding nodes that advertise zero rates to attract traffic without generating protocol fees. The minimum of 1 USDC base unit ($0.000001/MB) is negligibly small but prevents true zero-rate abuse.
-- **Dispute window 12h–72h:** A 30-minute window is too short for watchtowers or human operators to respond to a stale close. A 7-day window locks client funds for an unacceptably long period. The 12h–72h range balances responsiveness with fund liquidity.
+- **Dispute window 12h–72h:** A 30-minute window is too short for watchtowers or human operators to respond to a stale close. A 7-day window locks client funds for an unacceptably long period. The 12h–72h range balances responsiveness with fund liquidity. The PoC deploys at 48 hours to guarantee 24 hours of effective dispute response time under worst-case L2 sequencer censorship (forced inclusion delay ≤ 24h). Governance must not set the dispute window below the chosen L2's maximum forced-inclusion delay — on an L2 with ~24h forced inclusion, the 12h floor is not safe (see [ADR 007](007-watchtower.md#l2-sequencer-censorship)). The 12h floor remains for L2s with shorter forced-inclusion paths.
 - **Min deposit floor ≥ 1 base unit:** prevents dust channels that cost more in gas to settle than they contain.
 
 ### Emergency Multisig
