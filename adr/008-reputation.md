@@ -48,12 +48,14 @@ EWMA with alpha=0.1 means recent interactions matter more but old interactions s
 Reports received via iroh-gossip are aggregated using EWMA weighted by reporter credibility:
 
 ```
-reporter_weight = total_settled_usdc(reporter) / max(1, max_settled_usdc_observed)
+raw_weight = total_settled_usdc(reporter) / max(1, max_settled_usdc_observed)
+reporter_weight = min(raw_weight, weight_cap)
 network_score = ewma(network_score, report.score, alpha=0.05 * reporter_weight)
 ```
 
-- `total_settled_usdc(reporter)`: cumulative USDC value across all payment channels the reporter has settled on-chain (verifiable). **Value-weighted, not count-weighted** — this prevents Sybil manipulation via many cheap channels (opening 100 channels with 1 USDC each gives the same weight as one channel with 100 USDC, making the attack cost proportional to desired influence rather than proportional to channel count).
-- `max(1, max_settled_usdc_observed)`: the `max(1, ...)` guard prevents division by zero at network bootstrap when no channels have been settled yet. At bootstrap, all reporters have weight 0 (no settled value), so network scores remain at their initial value (0.5) until the first channels settle.
+- `total_settled_usdc(reporter)`: cumulative USDC value across all payment channels the reporter has settled on-chain (verifiable), counting channels where the reporter was **either the client or the provider**. Including both sides gives credit to nodes that pay for cache-miss pulls, not only nodes that receive payment for delivery. **Value-weighted, not count-weighted** — this prevents Sybil manipulation via many cheap channels (opening 100 channels with 1 USDC each gives the same weight as one channel with 100 USDC, making the attack cost proportional to desired influence rather than proportional to channel count).
+- `max(1, max_settled_usdc_observed)`: the `max(1, ...)` guard prevents division by zero at network bootstrap when no channels have been settled yet. At bootstrap, all reporters have weight 0 (no settled value), so network scores remain at their initial value (0.5) until the first channels settle. **Note:** `max_settled_usdc_observed` is local to each node, so two nodes may compute different weights for the same reporter. This means network scores are inherently subjective and will not converge to a single global value — an accepted property of the design (see Consequences).
+- `weight_cap`: caps reporter influence at 5× to prevent established high-earning nodes from having disproportionate control over network reputation. The cap preserves the anti-Sybil property (influence still scales with capital) while bounding the maximum incumbency advantage.
 - Alpha is scaled by reporter weight: high-credibility reporters (more settled value) move the score faster
 
 ### 5. Combined Score
@@ -77,7 +79,7 @@ flowchart TD
     end
 
     subgraph Network["Network Score (30%)"]
-        GR[Gossip ReputationReport] --> RW["reporter_weight =<br/>total_settled_usdc / max(1, max_observed)"]
+        GR[Gossip ReputationReport] --> RW["reporter_weight =<br/>min(total_settled_usdc / max(1, max_observed), 5.0)"]
         RW --> EWMA2["network_score = EWMA(network, report,<br/>a=0.05 * reporter_weight)"]
     end
 
@@ -108,7 +110,7 @@ struct ReportMetrics {
 }
 ```
 
-Reports only accepted from staked nodes. **Recency validation:** receivers MUST reject reports where either (a) `current_time - report.timestamp > max_report_age_secs` (too old) or (b) `report.timestamp > current_time + allowed_clock_skew_secs` (too far in the future). Defaults: `max_report_age_secs = 3600` (1 hour), `allowed_clock_skew_secs = 300` (5 minutes). This prevents replay of old reports and prevents reporters from using far-future timestamps to extend the replay window. The effective replay window is bounded to `max_report_age_secs + allowed_clock_skew_secs` (~65 minutes). **Clock sync dependency:** unlike the probe/stream timestamps (which are requester-generated and avoid clock sync — see ADR 005), reputation recency depends on loose clock agreement between reporter and receiver. The 1-hour + 5-minute window is tolerant of typical NTP drift but not of nodes with completely unsynchronized clocks.
+Reports only accepted from staked nodes. **Client exclusion:** Only staked nodes may submit gossip reputation reports; clients (unstaked requesters) contribute to reputation only via their own local scores (Section 3). This is intentional — without a staking requirement, an attacker could spin up disposable clients to flood the gossip topic with cheap reputation reports, bypassing the economic cost that makes manipulation expensive. **Recency validation:** receivers MUST reject reports where either (a) `current_time - report.timestamp > max_report_age_secs` (too old) or (b) `report.timestamp > current_time + allowed_clock_skew_secs` (too far in the future). Defaults: `max_report_age_secs = 3600` (1 hour), `allowed_clock_skew_secs = 300` (5 minutes). This prevents replay of old reports and prevents reporters from using far-future timestamps to extend the replay window. The effective replay window is bounded to `max_report_age_secs + allowed_clock_skew_secs` (~65 minutes). **Clock sync dependency:** unlike the probe/stream timestamps (which are requester-generated and avoid clock sync — see ADR 005), reputation recency depends on loose clock agreement between reporter and receiver. The 1-hour + 5-minute window is tolerant of typical NTP drift but not of nodes with completely unsynchronized clocks.
 
 ```mermaid
 classDiagram
@@ -149,6 +151,7 @@ Scores converge to 0.5 asymptotically, reaching within 0.05 of neutral after ~30
 | Decay rate | 10% per week (applied iteratively) |
 | Decay starts after | 1 week with no new reports or interactions |
 | Minimum score (floor) | 0.0 (selection algorithm clamps at 0.1 — see [ADR 001](001-network.md#node-selection-algorithm)) |
+| Reporter weight cap | 5.0 (max influence = 5× a median reporter) |
 | Scope | Production only (PoC uses static scores, no decay) |
 
 ### 8. Score Clamping
@@ -191,6 +194,7 @@ During the first 7 days after staking (or first 50 completed interactions, which
 
 - Off-chain reputation is inherently subjective — no single ground truth
 - A well-funded attacker can build real interaction history to manipulate scores; cost scales linearly with desired influence
+- Reporter weight creates a residual incumbency advantage — established nodes with more settled USDC have more influence over network scores. The weight cap (5×) bounds this advantage but does not eliminate it
 - Gossip-based propagation adds bandwidth overhead, though rate limiting bounds this
 - The 70/30 local/network split means a client's view of the network is biased toward its own usage patterns
 - PoC uses static scores (no decay, no clamping) — production behavior is untested until migration
