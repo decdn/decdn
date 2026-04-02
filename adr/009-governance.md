@@ -40,19 +40,23 @@ All economic parameters across the protocol are governable within hardcoded safe
 
 | Parameter | Contract | Min | Max |
 | --- | --- | --- | --- |
-| Protocol fee % | StablePaymentChannel | 0% (0 bps) | 20% (2000 bps) |
+| Protocol fee % | StablePaymentChannel (PoC) / PaymentChannel (production) | 0% (0 bps) | 20% (2000 bps) |
+| Discounted fee % | StablePaymentChannel (PoC) / PaymentChannel (production) | 0% (0 bps) | ≤ Protocol fee % |
 | Minimum stake | StakingRegistry | 100 TOKEN | 100,000 TOKEN |
 | Slash percentage (per offense) | StakingRegistry | 5% | 50% |
 | Unbonding period | StakingRegistry | 3 days | 30 days |
 | Multiaddr update cooldown | StakingRegistry | 0 (disabled) | 86400 seconds (1 day) |
 | Max multiaddr size | StakingRegistry | 64 bytes | 1024 bytes |
-| Dispute window (PoC default: 48h) | StablePaymentChannel | 12 hours | 72 hours (3 days) |
+| Dispute window (PoC default: 48h) | StablePaymentChannel (PoC) / PaymentChannel (production) | 12 hours | 72 hours (3 days) |
 | Rate floor/ceiling | StablePaymentChannel (PoC) / PaymentChannel per-token (production, [ADR 010](010-multi-token.md)) | Floor ≥ 1 base unit | Ceiling > floor |
-| Max voucher interval | StablePaymentChannel | 1 MB | 1024 MB (~1 GB) |
-| Min deposit | StablePaymentChannel | 1 base unit | No max |
+| Max voucher interval | StablePaymentChannel (PoC) / PaymentChannel (production) | 1 MB | 1024 MB (~1 GB) |
+| Min deposit | StablePaymentChannel (PoC) / PaymentChannel (production) | 1 base unit | No max |
 | Challenge bond | StakingRegistry | 1 TOKEN | 1,000 TOKEN |
 | Base slash reset period | StakingRegistry | 30 days | 365 days |
-| Burn percentage of fees | StablePaymentChannel | 0% | 100% |
+| Burn percentage of fees | StablePaymentChannel (PoC) / PaymentChannel (production) | 0% | 100% |
+| Compliance window | ContentBlacklist | 1 hour | 7 days |
+
+The 3-day voting period balances responsiveness with participation. Combined with the 2-day timelock, the total governance delay is 5 days minimum — comparable to standard OpenZeppelin Governor deployments.
 
 Staking, slashing, and fee parameters are defined in [ADR 004](004-tokenomics.md). Payment channel parameters are defined in [ADR 003](003-payments.md). This ADR defines the governance mechanism that controls them.
 

@@ -5,7 +5,7 @@
 
 ## Context
 
-We are building a decentralized CDN with two participant roles: **nodes** (providers) that cache and deliver content to clients — some configured with an origin backend (S3/R2) as the canonical source for specific content — and **clients** that consume content. The network requires:
+We are building a decentralized CDN with two participant roles: **nodes** (providers) that cache and deliver content to clients — some configured with an origin backend (e.g., S3/R2/NFS/local disk) as the canonical source for specific content — and **clients** that consume content. The network requires:
 
 - High-throughput, low-latency blob transfer between all node types over peer-to-peer connections
 - Concurrent handling of many inbound connections per node

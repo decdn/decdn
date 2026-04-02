@@ -100,6 +100,8 @@ pie title TOKEN Distribution (1B total, fixed supply)
 | Second offense before tier reset | 10% of stake | 15% of stake |
 | Third offense before tier reset | 10% of stake | 50% of stake (triggers auto-ejection via cumulative loss) |
 
+Production starts at 5% (vs. 10% in PoC) because the escalating tier system provides increasing deterrence for repeat offenders, making a lower first-offense penalty proportionate.
+
 **PoC:** Flat 10% slash for all offenses. Escalation tier resets after 30 days without incidents. No lifetime counter.
 
 **Production — increasing reset periods.** Lifetime offenses increase the clean period required to drop one escalation tier, up to a 4× cap. The lifetime offense counter is a monotonically increasing `uint32` per node in `StakingRegistry` — it never resets.
@@ -113,6 +115,8 @@ pie title TOKEN Distribution (1B total, fixed supply)
 Formula: `resetPeriod = baseResetPeriod × min(2^(max(lifetimeOffenses, 1) - 1), 4)`, where `lifetimeOffenses` is a `uint32` starting at 0 and `baseResetPeriod` is 90 days (governable — see [ADR 009](009-governance.md#governable-parameters-with-safety-bounds)). For `lifetimeOffenses = 0` (no prior offenses), the multiplier is 1× — i.e., `resetPeriod = baseResetPeriod`.
 
 When the reset period elapses without a new offense, the node's escalation tier drops by one (e.g., tier 2 → tier 1). Multiple elapsed periods drop multiple tiers: `effectiveTier = max(0, storedTier - floor(elapsed / resetPeriod))`.
+
+**Note:** The reset period formula is only meaningful when `storedTier > 0` (at least one prior offense). For `lifetimeOffenses = 0`, the result is vacuously correct — there is no tier to decay.
 
 **Example:** A node commits its first offense (5% slash, tier 1, lifetime count = 1). After 90 clean days, its tier resets to 0. The node commits a second offense (5% slash — tier was 0 — but lifetime count = 2). Now the node needs 180 clean days per tier drop. A third offense at any tier sets lifetime count = 3, requiring 360 clean days per tier drop.
 
@@ -195,6 +199,8 @@ The `BuybackBurner` contract converts accumulated USDC fees into TOKEN and burns
 | Minimum accumulation before buyback (`minBuybackAmount`) | N/A (execution disabled) | 100 USDC | Yes |
 | Maximum single buyback (`maxBuybackAmount`) | N/A (execution disabled) | 10,000 USDC | Yes |
 | Slippage tolerance (`slippageBps`) | N/A (execution disabled) | 2% (200 bps) | Yes |
+
+Parameter name `slippageBps` corresponds to `setSlippageTolerance(uint256 bps)` in the [IBuybackBurner interface](003-payments.md).
 | DEX (`dexPool`) | N/A (execution disabled) | Uniswap V3 TOKEN/USDC pool | Yes (pool address) |
 | Execution | Disabled — fees accumulate only | Governance-triggered or automated keeper | — |
 | Execution activation | N/A | Requires governance vote to enable | — |
@@ -288,6 +294,8 @@ At a TOKEN price of $0.01 (conservative early production), the 200M TOKEN bootst
 | `withdraw()` | ~80k gas | ~$0.05 |
 
 Payment channels amortize gas effectively. A channel open for 30 sessions costs $0.23 total (open + close + settle) = ~$0.008 per session. `settleChannel` is callable by any address, so settlement bots or the counterparty can trigger it.
+
+Estimates assume Arbitrum average gas price as of early 2026. Actual costs vary with L2 congestion and L1 data availability pricing (post-EIP-4844). Costs may swing 10× in either direction.
 
 ## Governance
 

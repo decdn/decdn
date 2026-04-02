@@ -51,7 +51,7 @@ struct NodeAnnounce {
     node_id: NodeId,
     region: String,              // ISO 3166-1 alpha-2 (self-reported)
     load: LoadHint,              // approximate current utilization
-    popular_hashes: Vec<Hash>,   // top-N most-requested hashes (max 20)
+    popular_hashes: Vec<Hash>,   // top-N most-requested hashes (max 20, unique)
     timestamp_us: u64,           // microseconds since epoch
     signature: Signature,        // node's iroh key signs all fields above
 }
@@ -62,7 +62,9 @@ struct LoadHint {
 }
 ```
 
-- **`NodeAnnounce` carries node-level metadata only** — no content inventory. `popular_hashes` (capped at 20) is a popularity signal for prefetching, not a content catalog. Message size is ~700 bytes worst case.
+`LoadHint` is advisory and untrusted. The reputation system ([ADR 008](008-reputation.md)) penalizes nodes whose observed delivery performance contradicts their advertised load.
+
+- **`NodeAnnounce` carries node-level metadata only** — no content inventory. `popular_hashes` (capped at 20) is a popularity signal for prefetching, not a content catalog. Message size is ~800 bytes worst case.
 - **`LoadHint`** makes the "approximate load in gossip announcements" from [ADR 008, Tie-Breaking](008-reputation.md#9-tie-breaking) concrete, feeding tie-breaking logic.
 - **Announce interval** is a per-node configuration parameter (PoC default TBD during implementation).
 
@@ -70,17 +72,19 @@ Both clients and nodes maintain a **peer table** (`NodeId → NodeAnnounce`) bui
 
 **Registry cache:** Nodes maintain a local cache of the on-chain registry, kept fresh by subscribing to `NodeRegistered`, `NodeDeregistered`, and `NodeAutoEjected` events. On Arbitrum Sepolia (PoC), block times are ~250ms, so the staleness window is small. The registry cache is checked during gossip validation (below) and before initiating paid pulls (see Content Discovery step 5).
 
-**Gossip validation:** Before accepting a `NodeAnnounce` and updating the peer table, a node verifies: (1) the `signature` is valid for the `node_id`'s public key over all other fields (serialized via postcard, consistent with [ADR 005](005-protocol.md)); (2) the `node_id` corresponds to an active staked node in the on-chain registry (checked against a local registry cache); (3) `timestamp_us` is within ±60 seconds of the receiver's local clock (prevents replay of old messages; the 60-second window accommodates clock skew between nodes — see Clock synchronization below); (4) `timestamp_us` is strictly greater than the `timestamp_us` of the existing peer table entry for the same `node_id` (monotonic — prevents replay of older messages within the freshness window). Messages failing any check are silently dropped. This prevents unregistered, unstaked, or replayed nodes from appearing in or corrupting peer tables.
+**Gossip validation:** Before accepting a `NodeAnnounce` and updating the peer table, a node verifies: (1) the `signature` is valid for the `node_id`'s public key over all other fields (serialized via postcard, consistent with [ADR 005](005-protocol.md)); (2) the `node_id` corresponds to an active staked node in the on-chain registry (checked against a local registry cache); (3) `timestamp_us` is within ±60 seconds of the receiver's local clock (prevents replay of old messages; the 60-second window accommodates clock skew between nodes — see Clock synchronization below); (4) `timestamp_us` is strictly greater than the `timestamp_us` of the existing peer table entry for the same `node_id` (monotonic — prevents replay of older messages within the freshness window). Messages failing any check are silently dropped. Additionally: (5) `region` is exactly 2 ASCII uppercase letters matching a known ISO 3166-1 alpha-2 code set. Messages with invalid region values are dropped. (6) `popular_hashes` contains no duplicate entries. This prevents unregistered, unstaked, or replayed nodes from appearing in or corrupting peer tables.
 
 **Gossip deduplication:** iroh-gossip uses PlumTree (epidemic broadcast trees) for message dissemination, which performs message-level deduplication internally — each gossip message is assigned a unique identifier and nodes track a bounded in-memory set of seen message IDs, so the same message arriving via multiple epidemic broadcast paths is delivered to the application at most once while its ID remains in that seen-set. This is not a global or persistent exactly-once guarantee: duplicates may be re-delivered after seen-set eviction or process restart. This transport-layer dedup is the primary mechanism that prevents redundant processing of `NodeAnnounce` messages in a multi-path gossip topology. As defense-in-depth, gossip validation rule (4) above (monotonic `timestamp_us` per `node_id`) independently rejects any duplicate or older `NodeAnnounce` — even if transport-level dedup were bypassed (e.g., after a restart), a replayed message would fail the strictly-greater timestamp check against the peer table. The peer table itself (`NodeId → NodeAnnounce`) acts as a natural dedup structure: keyed by `node_id` with only the latest timestamp retained, it is inherently convergent regardless of message delivery order or multiplicity. No application-level seen-message set or content-hash table is required at the gossip layer. See also [ADR 008, Section 6](008-reputation.md#6-gossip-protocol) for deduplication of `ReputationReport` messages on the `cdn/reputation/v1` topic.
 
 **Clock synchronization:** The ±60-second freshness check in gossip validation (3) is evaluated against the receiver's local clock. A process whose wall-clock offset exceeds 60 seconds relative to well-synchronized peers will both (a) have its own `NodeAnnounce` messages silently rejected by those peers and (b) silently reject otherwise-valid `NodeAnnounce` messages from correctly synchronized peers — in either case making peers invisible in the local mesh view, with no error feedback. All processes that perform gossip validation and maintain a peer table (staked nodes and any validating clients) MUST run NTP (or an equivalent time-synchronization service) to maintain wall-clock accuracy well within this 60-second window. At startup, such a process SHOULD query an NTP server and log a warning if the measured offset exceeds 10 seconds, giving operators an early signal before silent gossip rejection occurs.
 
+**Observability:** Nodes SHOULD expose a `gossip_messages_rejected_clock_skew` counter (Prometheus metric). Additionally, a node SHOULD periodically compare its own `NodeAnnounce` timestamp against timestamps in received `NodeAnnounce` messages from peers to detect relative drift. If median peer timestamps diverge from the local clock by more than 30 seconds, the node logs a warning.
+
 #### Content Discovery (Probe Fan-Out)
 
 Content discovery is on-demand via the existing `cdn/probe/v1` protocol. When a node or client needs a blob, it probes known peers in parallel:
 
-1. **Probe cache check.** Look up `hash` in a short-lived LRU cache (`hash → Vec<(NodeId, rate_per_mb, rtt, ProbeResponse)>`, TTL 15 seconds, max 1024 entries). Each entry retains the full signed `ProbeResponse` for slashing evidence. If a valid entry exists, skip to step 4.
+1. **Probe cache check.** Look up `hash` in a short-lived LRU cache (`hash → Vec<(NodeId, rate_per_mb, rtt, ProbeResponse)>`, TTL 15 seconds, max 1024 entries). Each hash entry retains at most 10 responses (the top 10 by selection score), bounding memory at production scale. Each entry retains the full signed `ProbeResponse` for slashing evidence. If a valid entry exists, skip to step 4.
 2. **Fan-out.** Send `ProbeRequest {hash, timestamp_us}` in parallel to all known nodes (regional + global). The `cdn/probe/v1` protocol is unchanged — `ProbeResponse {has_blob, rate_per_mb, timestamp_us, signature}`.
 3. **Collect.** Wait for probe responses in two phases:
    - **Phase 1 — Minimum wait** (`probe_min_wait`, default 50ms): Always wait at least this long to collect responses from nearby nodes, ensuring multiple candidates compete rather than always selecting the single fastest responder.
@@ -135,7 +139,7 @@ This score is used in Content Discovery step 4 above and in all other node selec
 
 Two complementary signals drive proactive caching:
 
-**Local demand signal:** Each node tracks cache miss timestamps per hash in a bounded map (`HashMap<Hash, VecDeque<u64>>`, max 10,000 entries, LRU eviction). Each miss appends a timestamp; entries older than 5 minutes are pruned on access. When a hash crosses a configurable threshold (default: 3 misses in 5 minutes), the node proactively pulls the blob via the same probe fan-out → `cdn/client/v1` path.
+**Local demand signal:** Each node tracks cache miss timestamps per hash in a bounded map (`HashMap<Hash, VecDeque<u64>>`, max 10,000 entries, LRU eviction). Each miss appends a timestamp; entries older than 5 minutes are pruned on access. Appending a miss timestamp refreshes the entry's LRU position. When a hash crosses a configurable threshold (default: 3 misses in 5 minutes), the node proactively pulls the blob via the same probe fan-out → `cdn/client/v1` path.
 
 **Network popularity signal:** Nodes observe which hashes appear in `popular_hashes` across multiple `NodeAnnounce` messages from different peers. A hash appearing in N peers' top-20 lists suggests cross-region demand. Tracked by storing the announcing peer's NodeId and announcement timestamp for each hash; entries older than the window are pruned on access. Threshold is configurable (default: seen in 3+ peers' popular lists within 10 minutes).
 
@@ -156,13 +160,15 @@ If the on-chain registry (or RPC endpoint) is unavailable at startup, the client
 
 The client refreshes its cached peer list on every successful registry query (on startup and periodically every 10 minutes while running).
 
+This schedule is tuned for PoC with a single RPC endpoint. Production deployments SHOULD configure a reliable RPC endpoint; the retry schedule is a last resort, not a primary reliability mechanism.
+
 ## Consequences
 
 **Positive:**
 
 - No external infrastructure is reachable from the network — origin-backed nodes completely hide their backends, so no client or node can bypass the payment layer by going directly to a storage URL
 - All nodes participate in the same discovery and transport protocols; the only difference between origin-backed and cache-only nodes is whether they have an origin store configured
-- Gossip messages are lightweight (~700 bytes) — no content inventories, Bloom filters, or hash lists. Regional gossip topics bound message volume: nodes in one region don't receive announcements from irrelevant regions
+- Gossip messages are lightweight (~800 bytes) — no content inventories, Bloom filters, or hash lists. Regional gossip topics bound message volume: nodes in one region don't receive announcements from irrelevant regions
 - Content discovery via probe fan-out provides fresh availability data — no stale content inventory to maintain
 - Probe cache prevents redundant fan-outs for popular content within a 15-second window
 - Once a node in a region caches a blob, other nodes in that region can pull from it at competitive rates rather than paying origin-backed node prices — popular content gets cheaper as it spreads

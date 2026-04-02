@@ -70,16 +70,21 @@ sequenceDiagram
     participant W as Watched Party (Node)
     participant T as Watchtower
 
-    W->>T: WatchtowerRegister {channel_id, deposit, counterparty, latest_voucher}
+    W->>T: WatchtowerRegister {channel_id, deposit, client, token, latest_voucher}
     T->>W: WatchtowerAccept {accepted, fee}
 
     loop Every voucher (at voucher interval from ADR 003, default 1 MB)
-        W->>T: VoucherUpdate {channel_id, amount, nonce, signature}
+        W->>T: VoucherUpdate {channel_id, amount, nonce, token, signature}
         T->>W: VoucherAck
     end
 
     W->>T: WatchtowerRevoke {channel_id}
+    T->>W: WatchtowerRevokeAck {channel_id}
 ```
+
+**Registration authentication.** The `WatchtowerRegister` message must include a proof of channel membership. The registrant signs the `channel_id` with their Ethereum key; the watchtower verifies via `ecrecover` that the recovered address matches either the `client` or `provider` of the channel (verifiable on-chain). This prevents state exhaustion attacks from parties not involved in the channel.
+
+`latest_voucher` has the same shape as `VoucherUpdate`: `{channel_id, amount, nonce, token, signature}`. If no vouchers have been exchanged yet, `latest_voucher` is omitted (the watchtower registers the channel with `amount=0, nonce=0`).
 
 **Frequency:** Every voucher — one update per voucher interval delivered, matching the negotiated voucher cadence from [ADR 003](003-payments.md#voucher-interval-negotiation). The default interval is 1 MB; for large blob transfers the interval may be negotiated up to 1024 MB. With larger intervals, the watchtower receives fewer updates. The watchtower must hold the absolute latest voucher to be effective. Each update is ~150 bytes; even at the default 1 MB cadence this is negligible overhead. See [Voucher state desynchronisation](#voucher-state-desynchronisation) for the security implications of larger intervals.
 
@@ -117,7 +122,7 @@ The fee is deterministic and non-negotiable (per 30-day monitoring period): both
 
 **Payment method:** The watched party pays via a direct USDC transfer (signed ERC-20 `transfer` or `permit` + `transferFrom`) to the watchtower's Ethereum address at registration time. No contract modification needed. The watchtower verifies payment on-chain before accepting the registration.
 
-**Gas economics:** A `disputeChannel` call on an L2 costs approximately $0.05–0.10. The dispute gas bonus (2× gas cost) ensures watchtowers are not penalised for actually performing their function. The bonus is paid off-chain by the watched party after the dispute settles — the watchtower provides the transaction hash as proof.
+**Gas economics:** A `disputeChannel` call on an L2 costs approximately $0.05–0.10. The dispute gas bonus (2× gas cost) ensures watchtowers are not penalised for actually performing their function. The bonus is paid off-chain by the watched party after the dispute settles — the watchtower provides the transaction hash as proof. The off-chain bonus is unenforceable — the watched party can refuse to pay after the dispute is submitted. This is an accepted PoC limitation. Production mitigates this via the prepaid escrow described below, which includes the dispute gas bonus in the escrowed amount.
 
 ### 6. Redundancy
 
@@ -202,6 +207,8 @@ These three items future-proof the contract and node software for watchtower int
 **PoC:** Fee payment is trust-based — the watched party sends USDC directly to the watchtower's address at registration. No escrow, no refund mechanism, no on-chain proof of service. A watchtower that accepts payment and disappears has no penalty. This is an accepted PoC limitation — the PoC does not implement watchtowers at all (see PoC Scope above), so the fee model is theoretical.
 
 **Production:** Prepaid escrow with proof-of-monitoring. The watched party deposits the monitoring fee into a `WatchtowerEscrow` contract. The watchtower must submit periodic signed heartbeats (e.g., every 6 hours) proving it is monitoring the chain — each heartbeat includes the latest `ChannelCloseInitiated` event block number the watchtower has processed. If the watchtower misses N consecutive heartbeats (default: 3, i.e., 18 hours), the watched party can reclaim the escrowed fee. On successful completion of the monitoring period (no missed heartbeats, or a dispute was correctly submitted), the watchtower claims the escrowed fee. This provides on-chain accountability without requiring watchtower staking — the escrowed fee itself is the watchtower's bond.
+
+**Voucher state attestation (production enhancement):** Heartbeats SHOULD include a BLAKE3 hash commitment over the set of `(channel_id, latest_nonce)` pairs the watchtower holds. The watched party can verify this commitment matches its own state. A mismatch signals stale voucher data, triggering a resync or watchtower switch.
 
 **Limitation:** heartbeats prove chain-monitoring liveness only — they do not attest to voucher state. A watchtower that lost its voucher database would continue submitting valid heartbeats but would be unable to dispute a stale close. This gap is addressed by off-chain liveness testing (see [Fee extraction without service](#fee-extraction-without-service)) and by the voucher resync protocol on reconnection (see [Voucher state desynchronisation](#voucher-state-desynchronisation)), not by the heartbeat mechanism itself.
 

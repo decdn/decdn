@@ -60,8 +60,10 @@ The app server gates access and delivers `K_blob` to authorized clients using tw
 
 ```
 epoch_id  = floor(now_unix / 300)
-epoch_key = BLAKE3_KDF(server_secret, epoch_id)
+epoch_key = BLAKE3_derive_key("decdn-epoch-key-v1 | <provider_node_id>", server_secret || epoch_id.to_le_bytes())
 ```
+
+Uses BLAKE3's `derive_key` mode (not keyed hash). The context string includes the provider's NodeId to prevent cross-provider key collisions if two providers share the same `server_secret`. `epoch_id` is serialized as 8-byte little-endian.
 
 **Per-request sealed envelope:** On each play request, the app server verifies the client's subscription is active, then wraps `K_blob` with the current epoch key and seals the result to the client's public key:
 
@@ -70,6 +72,8 @@ nonce_wrap = random 24-byte nonce
 wrapped    = nonce_wrap || XChaCha20-Poly1305(epoch_key, nonce_wrap, K_blob)
 envelope   = crypto_box_seal(client_pubkey, {wrapped, epoch_id, blob_hash})
 ```
+
+`client_pubkey` is the X25519 public key derived from the client's iroh Ed25519 key via the standard birational map (`ge25519_to_x25519`). This is a well-known, widely-implemented conversion (e.g., `ed25519_to_curve25519` in libsodium).
 
 The client receives the sealed envelope. To decrypt the blob, the client needs both the envelope and the current epoch key.
 
@@ -192,6 +196,7 @@ App server:
   4. Build lease:
 
      lease = {
+         version: 1,
          k_blobs: {hash_1: K_1, hash_2: K_2, ...},
          issued_at: 1743300000,
          expires_at: 1745892000,       // 30 days
@@ -235,6 +240,8 @@ flowchart TD
     E --> F["Parse nonce_blob, decrypt with K_blob"]
     F --> G[Play plaintext]
 ```
+
+> **Note:** The `expires_at` check is client-enforced only. A tampered client can bypass it. Actual revocation relies on the lease TTL combined with the check-in protocol — without a renewed lease, the client cannot obtain `K_blob` values for new epochs.
 
 **Content download:** Before going offline, the client downloads tracks through the normal CDN protocol (`cdn/client/v1`, paid per MB). The ciphertext is stored in local cache. This is identical to online streaming — the CDN protocol does not distinguish between streaming and download-for-offline.
 
@@ -331,7 +338,7 @@ For PoC, no action items from this ADR are required. Content-addressed blobs are
 - A hacked client can still extract `K_blob` for tracks it plays in real-time. This is inherent to any scheme where the client produces plaintext output — equivalent to the "analog hole" in DRM systems.
 - Epoch key rotation creates a hard dependency on the persistent connection. If the WebSocket drops, the client cannot decrypt new tracks until it reconnects and receives the current epoch key. The client should cache the most recent epoch key in memory (not disk) to survive brief disconnects within the same epoch.
 - `server_secret` (the epoch key derivation root) is a critical secret. Rotation of `server_secret` invalidates all outstanding epoch keys and sealed envelopes, forcing all clients to re-request. Rotation is signaled via the `epoch_key_revoked` event on the persistent connection (see [Rotation signaling](#rotation-signaling)); disconnected clients fall back to AEAD-failure-triggered reconnection. Rotation should be infrequent and coordinated.
-- **No forward secrecy for epoch keys.** Because `epoch_key = BLAKE3_KDF(server_secret, epoch_id)` is purely deterministic, compromising `server_secret` retroactively exposes every past epoch key and every future epoch key until rotation. An attacker who obtains `server_secret` can derive any epoch key. Note that sealed envelopes are additionally protected by `crypto_box_seal` to the client's public key, so recovering `K_blob` from a recorded envelope requires both `server_secret` (to derive the epoch key) and the client's private key (to unseal the envelope). However, an attacker who compromises the app server — the most likely scenario for `server_secret` exposure — may also have access to the `K_blob` key store directly, bypassing the envelope path entirely. This is the most significant cryptographic limitation of the current design. Production deployments MUST mitigate this with the following complementary measures:
+- **No forward secrecy for epoch keys.** Because `epoch_key = BLAKE3_derive_key("decdn-epoch-key-v1 | <provider_node_id>", server_secret || epoch_id.to_le_bytes())` is purely deterministic, compromising `server_secret` retroactively exposes every past epoch key and every future epoch key until rotation. An attacker who obtains `server_secret` can derive any epoch key. Note that sealed envelopes are additionally protected by `crypto_box_seal` to the client's public key, so recovering `K_blob` from a recorded envelope requires both `server_secret` (to derive the epoch key) and the client's private key (to unseal the envelope). However, an attacker who compromises the app server — the most likely scenario for `server_secret` exposure — may also have access to the `K_blob` key store directly, bypassing the envelope path entirely. This is the most significant cryptographic limitation of the current design. Production deployments MUST mitigate this with the following complementary measures:
 
   1. **HSM-backed derivation.** Store `server_secret` in a hardware security module (AWS CloudHSM, Azure Managed HSM, GCP Cloud HSM) or cloud KMS as a non-exportable key, and derive `epoch_key` values inside that service using a supported PRF/KDF. Most cloud KMS products do not natively support BLAKE3; if BLAKE3 is required, use an HSM that can run the BLAKE3-based KDF internally. Otherwise, substitute a KMS-supported primitive (e.g., HMAC-SHA256 or HKDF-SHA256 over `epoch_id`) for the production derivation path. This reduces the attack surface to HSM/KMS API access control rather than secret exfiltration.
   2. **Periodic `server_secret` rotation on epoch boundaries.** Rotate `server_secret` on a fixed schedule (e.g., every 24–72 hours), aligning each rotation to an epoch boundary so that each `epoch_id` maps to exactly one `server_secret`. The new secret is used to derive `epoch_key` values only for future `epoch_id`s; the outgoing secret handles the current epoch and is destroyed once that epoch expires. This keeps `epoch_key = KDF(server_secret, epoch_id)` and the envelope `{wrapped, epoch_id, blob_hash}` unambiguous — no version identifier is needed because each epoch_id is associated with exactly one secret. The blast radius of a compromise is bounded to the rotation interval rather than the full lifetime of the service. The rotation cadence is a tradeoff: shorter intervals reduce exposure but increase coordination cost (all app server instances must converge on the new secret before the first epoch that uses it).

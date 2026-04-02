@@ -112,6 +112,8 @@ The protocol fee is calculated **at final settlement**, after the dispute window
    - Treasury receives: `fee = claimedAmount × feePercentage / 10000`
    - Client receives refund: `deposit - claimedAmount`
 
+   > **Invariant:** `closeChannel` and `disputeChannel` MUST revert if the submitted voucher's `amount > channel.deposit`. This prevents client bugs or malicious over-deposit vouchers from causing an underflow revert in `settleChannel` that would lock the channel.
+
    The treasury address receives the full protocol fee as a single transfer. The internal allocation across the four buckets (development fund, bug bounties & audits, ecosystem grants, token buyback & burn — see [ADR 004, Fee Allocation](004-tokenomics.md#fee-allocation)) is handled outside the payment channel contract: manually by the admin key holder in the PoC, and via governance-directed disbursement in production.
 
 This means a dispute that increases the settlement amount (e.g., from 50 USDC to 80 USDC) automatically increases the protocol fee (from 1.50 USDC to 2.40 USDC at 3%). The fee is always computed once, on the final settled amount — never on intermediate values and never more than once per channel.
@@ -280,11 +282,11 @@ Registry check + per-sender rate limiting is solid. The minor gap is that the lo
 **Sybil nodes**
 Attacker stakes many cheap nodes to dominate probe responses for popular content, controlling pricing in a region.
 
-The core weakness is token-price dependency: at $0.001/TOKEN, a minimum stake of 1,000 TOKEN costs $1 per sybil node. The `rate_per_mb × rtt_ms` selection score helps — a sybil fleet must be real hardware in the right geography and competitively priced — but does not eliminate the risk when the token is cheap. Options:
+The core weakness is token-price dependency: at $0.001/TOKEN, a minimum stake of 1,000 TOKEN costs $1 per sybil node. The unified selection score `rate_per_mb × rtt_ms × (1 / max(reputation, 0.1)²)` (see [ADR 001](001-network.md#node-selection-algorithm)) helps — a sybil fleet must be real hardware in the right geography, competitively priced, and build reputation over time — but does not eliminate the risk when the token is cheap. Options:
 
 - **Option A — Governance raises minimum stake if token price falls.** The minimum stake is governable. Token holders are incentivised to raise it to protect the network, since a sybil-dominated network reduces usage and token value. Reactive but aligned.
-- **Option B — Minimum stake denominated in USD equivalent via oracle.** Requires a price oracle, which was rejected in ADR 004 for payment rate bounds. The same concerns (oracle downtime, manipulation) apply here, but the impact of oracle failure is lower (new stakers temporarily blocked, not payments broken).
-- **Option C — Reputation as a second filter.** New nodes (low reputation, few settled channels) are deprioritised in client selection even if their `rate_per_mb × rtt_ms` score is competitive. A sybil fleet takes time to build reputation, limiting its effectiveness during that window.
+- **Option B — Minimum stake denominated in USD equivalent via oracle.** Requires a price oracle, which introduces oracle dependency, manipulation, and downtime risks (see rate bounds discussion above). The same concerns apply here, but the impact of oracle failure is lower (new stakers temporarily blocked, not payments broken).
+- **Option C — Reputation as a second filter.** New nodes (low reputation, few settled channels) are deprioritised in client selection even if their `rate_per_mb × rtt_ms × (1 / max(reputation, 0.1)²)` score is competitive. A sybil fleet takes time to build reputation, limiting its effectiveness during that window.
 
 ---
 
@@ -337,7 +339,7 @@ struct Channel {
 
 **Channel ID:** `channelId = keccak256(abi.encodePacked(client, provider, channelNonce))` where `channelNonce` is a monotonic per-client counter stored on-chain as `clientChannelNonce[msg.sender]`. **Ordering:** `openChannel` reads the current nonce, uses it to compute `channelId`, then increments: `n = clientChannelNonce[msg.sender]; channelId = keccak256(..., n); clientChannelNonce[msg.sender] = n + 1`. The client pre-computes the next channelId off-chain by reading `clientChannelNonce[client]` and using that value directly — no off-by-one because the contract uses the same value before incrementing. The `channelNonce` is global per-client (not per-provider), ensuring uniqueness across all of a client's channels.
 
-> **Terminology:** `channelNonce` (the channel creation counter) is distinct from the voucher `nonce` (the monotonic sequence number within a channel used in EIP-712 voucher signatures). The former uniquely identifies channels; the latter orders vouchers within a channel. [ADR 010](010-multi-token.md) extends this formula to `keccak256(client, provider, token, channelNonce)` for multi-token support.
+> **Terminology:** `channelNonce` (the channel creation counter) is distinct from the voucher `nonce` (the monotonic sequence number within a channel used in EIP-712 voucher signatures). The former uniquely identifies channels; the latter orders vouchers within a channel. [ADR 010](010-multi-token.md) extends this formula to `keccak256(client, provider, token, channelNonce)` for multi-token support. In implementation, consider naming the on-chain mapping `clientChannelCounter` to avoid confusion with voucher nonces.
 
 ```solidity
 interface IStablePaymentChannel {
@@ -359,6 +361,7 @@ interface IStablePaymentChannel {
 
     // Governance
     function setFeePercentage(uint256 bps) external;
+    function setDiscountedFeePercentage(uint256 bps) external;
     function setTreasuryAddress(address treasury) external;
     function setMinDeposit(uint256 amount) external;
     function setDisputeWindow(uint256 seconds_) external;
@@ -366,6 +369,15 @@ interface IStablePaymentChannel {
     function setMaxVoucherIntervalMb(uint256 mb) external;
 }
 ```
+
+> **Reentrancy protection:** All state-mutating functions that perform external calls (ERC-20 transfers) — `openChannel`, `topUp`, `settleChannel`, `reclaimExpired` — MUST use `nonReentrant` guards and follow checks-effects-interactions. This is especially critical for the production multi-token contract ([ADR 010](010-multi-token.md)) which accepts arbitrary governance-approved tokens.
+
+**`topUp` behavior:** `topUp(channelId, additionalDeposit)` adds funds to an open channel:
+- **Status precondition:** MUST require status `Open` (reverts on `Closing` or `Closed`).
+- **Caller:** client only (`require(msg.sender == channel.client)`).
+- **Effects:** `channel.deposit += additionalDeposit`. Does NOT extend `expiresAt` (to prevent indefinite lock-in).
+- **Modifiers:** `nonReentrant`.
+- **Emits:** `ChannelToppedUp(channelId, additionalDeposit, newDeposit)`.
 
 **Initial deployment values.** The constructor (or initializer for proxy deployments) sets governable parameters to their PoC defaults. All values are within the hardcoded safety bounds table further below (see also [ADR 009](009-governance.md) for governance ranges):
 
@@ -427,7 +439,7 @@ event RateBoundsUpdated(
 - `closeChannel` → requires status `Open`. **Callable by `channel.client` or `channel.provider` only** (`require(msg.sender == channel.client || msg.sender == channel.provider)`). Sets status to `Closing`, records voucher, emits `ChannelCloseInitiated`. No fund transfers. Third parties (including watchtowers) cannot initiate a close — they act only via `disputeChannel` (during the dispute window) or `settleChannel` (after expiration). **Zero-voucher close:** when the provider calls with `amount == 0`, `nonce == 0`, an empty signature (`signature.length == 0`), and `channel.claimedNonce == 0`, the voucher signature is not verified — this is the provider's mechanism for releasing channels where no vouchers were ever signed. Since voucher nonces start at 1, any real voucher has a strictly higher nonce than the recorded `claimedNonce=0`, so `disputeChannel` works normally. The dispute window applies; a client or watchtower holding a real voucher can dispute.
 - `disputeChannel` → requires status `Closing` and `block.timestamp < disputeDeadline`. Callable by any address holding a valid voucher with a strictly higher nonce. Updates `claimedAmount`, emits `ChannelDisputed`. No fund transfers. Unrestricted caller access is intentional: watchtowers and other third parties must be able to submit higher-nonce vouchers on behalf of an offline party during the dispute window.
 - `settleChannel` → requires status `Closing` and `block.timestamp >= disputeDeadline`. Callable by any address. Computes fee on final `claimedAmount`, transfers funds to provider/treasury/client, sets status to `Closed`, emits `ChannelSettled`.
-- `reclaimExpired` → requires status `Open` and `block.timestamp >= expiresAt`. Returns the full deposit to the client (no fee deducted — no voucher was submitted). Sets status to `Closed`, emits `ChannelExpiredReclaimed`. Callable by the client only. This is the escape hatch for channels where the node never initiated a close.
+- `reclaimExpired` → requires status `Open` and `block.timestamp >= expiresAt`. Returns the full deposit to the client (no fee deducted — no voucher was submitted). Sets status to `Closed`, emits `ChannelExpiredReclaimed`. Callable by the client or the provider. Regardless of caller, the full deposit is returned to `channel.client` — the provider cannot claim funds via this path. This ensures abandoned channels where both parties are absent can be cleaned up by the provider to free on-chain state.
 
 **Safety bounds (hardcoded):**
 
@@ -447,7 +459,7 @@ event RateBoundsUpdated(
 
 | Parameter | Value (USD/MB) | USDC base units | Rationale |
 | --- | --- | --- | --- |
-| `deliveryFloor` | $0.000001/MB | 1 | Anti-abuse minimum; 10× below expected market rate. Prevents zero-rate free-riding while imposing no practical constraint on legitimate pricing. |
+| `deliveryFloor` | $0.000001/MB | 1 | Anti-abuse minimum; 10× below expected market rate. Prevents zero-rate free-riding while imposing no practical constraint on legitimate pricing. Nodes are expected to set rates well above this floor; the floor is purely an anti-zero safeguard, not a recommended price. |
 | `deliveryCeiling` | $0.001/MB | 1,000 | 100× expected market rate. Accommodates origin-backed nodes with high-egress backends (e.g., S3 at $0.09/GB) while remaining well above any legitimate pricing scenario ($1.00/GB vs Akamai's ~$0.12–0.20/GB). |
 
 The expected market rate is $0.00001/MB (10 USDC base units per MB, or $0.01/GB). This positions deCDN ~4–9× cheaper than major traditional CDNs (CloudFront at $0.085/GB, KeyCDN at $0.04/GB) and at parity with budget providers (Bunny.net at $0.01/GB). Both bounds are governable post-PoC within the hardcoded safety constraints above.
@@ -484,6 +496,8 @@ interface IBuybackBurner {
     function getAccumulatedFees(address token) external view returns (uint256);
 }
 ```
+
+This interface is the canonical specification for `BuybackBurner`. [ADR 004](004-tokenomics.md) defines the economic parameters; parameter names in ADR 004 reference this interface (e.g., `slippageBps` corresponds to `setSlippageTolerance(uint256 bps)` above).
 
 `executeBuyback` is callable by governance multisig or the authorized `keeper` address. All `set*` functions are governance-only behind a timelock.
 
@@ -562,11 +576,13 @@ uint256 constant DISCOUNT_MULTIPLE = 10;
 
 function getEffectiveFee(address provider) external view returns (uint256 bps) {
     if (stakingRegistry.getStakeMultiple(provider) >= DISCOUNT_MULTIPLE) {
-        return feePercentage / 2; // 1.5% when base fee is 3%
+        return discountedFeePercentage; // e.g. 150 bps (1.5%) when base is 300 bps (3%)
     }
     return feePercentage;
 }
 ```
+
+`discountedFeePercentage` is a separate governable parameter (set via `setDiscountedFeePercentage(uint256 bps)`) with safety bounds: must be ≤ `feePercentage`, minimum 0 bps. This avoids integer truncation from dividing odd fee values and allows the discount to be tuned independently of the base fee. PoC default: 150 bps (half of the 300 bps base fee).
 
 This ensures the discount threshold (currently 10 × 1,000 = 10,000 TOKEN) stays correct if governance changes `minStake`.
 
@@ -576,15 +592,20 @@ using SafeERC20 for IERC20;
 // Client staking (optional, no slashing)
 mapping(address => uint256) public clientStakes;
 
+event ClientStaked(address indexed client, uint256 amount, uint256 newTotal);
+event ClientUnstaked(address indexed client, uint256 amount, uint256 newTotal);
+
 function clientStake(uint256 amount) external nonReentrant {
     token.safeTransferFrom(msg.sender, address(this), amount);
     clientStakes[msg.sender] += amount;
+    emit ClientStaked(msg.sender, amount, clientStakes[msg.sender]);
 }
 
 function clientUnstake(uint256 amount) external nonReentrant {
     require(clientStakes[msg.sender] >= amount);
     clientStakes[msg.sender] -= amount;
     token.safeTransfer(msg.sender, amount);
+    emit ClientUnstaked(msg.sender, amount, clientStakes[msg.sender]);
 }
 
 function clientStakeOf(address client) external view returns (uint256) {
@@ -672,6 +693,8 @@ function resolveNodeId(bytes32 nodeId) external view returns (address) {
 }
 ```
 
+> **Note on EIP-712 signature in `bindNodeId`:** The signature is technically redundant for direct on-chain calls (where `msg.sender` already authenticates the caller) but is retained to support future meta-transaction/relayer patterns where a third party submits the binding on behalf of the node operator.
+
 ### Off-Chain (Ephemeral) Binding for Clients
 
 Clients who do not wish to register on-chain (e.g., for priority staking lookups only) include a signed binding in their `StreamRequest`. The node verifies the EIP-712 signature over `BindNodeId(nodeId, nonce=0)` using `ecrecover`, confirms the recovered address matches the claimed Ethereum address, and uses that address for `clientStakeOf` lookups. This ephemeral binding is not stored on-chain and is valid only for the session.
@@ -700,7 +723,7 @@ Multi-token decimal abstraction (a `Currency` enum covering arbitrary ERC-20 dec
 {channelId, amount, nonce, token, signature}
 ```
 
-During delivery over `cdn/client/v1`, only `{signature, amount}` are transmitted on the wire; the remaining fields are derived from stream context. See [ADR 005](005-protocol.md) for wire protocol details.
+During delivery over `cdn/client/v1`, only `{signature, amount}` are transmitted on the wire; the remaining fields are derived from stream context. The `nonce` is implicit: it equals `previous_nonce + 1` (starting at 1 for the first voucher in a channel). Both parties maintain an in-sync counter. See [ADR 005](005-protocol.md) for wire protocol details.
 
 The `token` field (ERC-20 address) is included in the signed EIP-712 typed data to prevent cross-token replay attacks. For the PoC, this field is hardcoded to the USDC contract address. The full EIP-712 type definition and domain separator are specified in [EIP-712 Voucher Signature](#eip-712-voucher-signature).
 
