@@ -153,7 +153,7 @@ Scores converge to 0.5 asymptotically, reaching within 0.05 of neutral after ~30
 | Decay starts after | 1 week with no new reports or interactions |
 | Minimum score (floor) | 0.0 (selection algorithm clamps at 0.1 — see [ADR 001](001-network.md#node-selection-algorithm)) |
 | Reporter weight cap | 5.0 (max `reporter_weight` value; bounds the EWMA alpha multiplier) |
-| Scope | Production only (PoC uses static scores, no decay) |
+| Scope | Production only — see [Section 12](#12-poc-scope) for PoC scope |
 
 ### 8. Score Clamping
 
@@ -181,6 +181,29 @@ During the first 7 days after staking (or first 50 completed interactions, which
 - Reports exceeding limits are silently dropped by receiving nodes
 - Enforced locally by each node on received gossip messages
 
+### 12. PoC Scope
+
+| Aspect | PoC | Production |
+| --- | --- | --- |
+| Local score calculation | Implemented (EWMA from delivery interactions) | Same |
+| Network gossip scores | Not implemented (no gossip aggregation) | Full implementation as described |
+| Combined score | Local-only (`final_score = local_score`; no network component) | 70/30 local/network blend |
+| Score decay | Not implemented (scores persist indefinitely) | 10%/week toward 0.5 |
+| Score clamping | Not implemented (no per-report ±0.05 cap) | Per-report ±0.05 cap |
+| Cold-start bootstrap bonus | Not implemented | +0.05 additive, linear decay over 7 days / 50 interactions |
+| Rate limiting | Not implemented (no gossip to rate-limit) | Per Section 11 |
+| ReputationReport gossip | Not implemented | Signed reports on `cdn/reputation/v1` topic |
+| Tie-breaking | Simplified: lower load → random | Full 4-tier (load → geo → stake → random) |
+| Initial score | 0.5 (same) | 0.5 |
+
+For PoC, reputation is local-only — each client tracks its own observations of node performance (delivery speed, correctness, reachability) via EWMA. There is no gossip propagation, no decay, and no clamping. The node selection algorithm in [ADR 001](001-network.md#node-selection-algorithm) uses `final_score = local_score` directly. This exercises the core scoring path (interaction → EWMA → selection weight) without the complexity of cross-node reputation aggregation.
+
+PoC action items:
+
+1. Implement `local_score` EWMA calculation (Section 3)
+2. Wire `local_score` into the node selection formula as `reputation` ([ADR 001](001-network.md#node-selection-algorithm))
+3. Store per-node local scores in memory (no persistence required for PoC)
+
 ## Consequences
 
 ### Positive
@@ -198,4 +221,4 @@ During the first 7 days after staking (or first 50 completed interactions, which
 - Reporter weight creates a residual incumbency advantage — established nodes with more settled USDC have more influence over network scores. The weight cap (5×) bounds this advantage but does not eliminate it
 - Gossip-based propagation adds bandwidth overhead, though rate limiting bounds this
 - The 70/30 local/network split means a client's view of the network is biased toward its own usage patterns
-- PoC uses static scores (no decay, no clamping) — production behavior is untested until migration
+- PoC uses local-only scores (no gossip, no decay, no clamping) — see [Section 12](#12-poc-scope) for full PoC scope
