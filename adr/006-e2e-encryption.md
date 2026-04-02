@@ -32,11 +32,11 @@ ciphertext  = nonce_blob || XChaCha20-Poly1305(K_blob, nonce_blob, plaintext)
 hash        = BLAKE3(ciphertext)
 ```
 
-The stored blob is `nonce (24 bytes) || AEAD ciphertext + tag`. The BLAKE3 hash covers the nonce, so content-addressing is unaffected. The client reads the first 24 bytes as the nonce before decrypting. Since each blob is encrypted exactly once with a random nonce, nonce reuse is impossible.
+The stored blob is `nonce (24 bytes) || AEAD output (encrypted data + 16-byte tag)`. The BLAKE3 hash covers the nonce, so content-addressing is unaffected. The client reads the first 24 bytes as the nonce before decrypting. Since each blob is encrypted exactly once with a CSPRNG-generated nonce, nonce collision is cryptographically negligible.
 
 `K_blob` is stored in the app server's key store (never on CDN nodes). The ciphertext (including its prepended nonce) is pushed to the CDN network as an ordinary content-addressed blob. CDN nodes only ever see ciphertext.
 
-XChaCha20-Poly1305 is chosen over AES-256-GCM because its 24-byte nonce eliminates nonce-reuse risk with random generation, and it requires no hardware AES support. All XChaCha20-Poly1305 outputs in this scheme use the `nonce || ciphertext || tag` wire format: the first 24 bytes are the nonce, the remainder is the AEAD output.
+XChaCha20-Poly1305 is chosen over AES-256-GCM because its 24-byte nonce eliminates nonce-reuse risk with random generation, and it requires no hardware AES support. All nonces MUST be generated from a CSPRNG. All XChaCha20-Poly1305 outputs in this scheme use the `nonce (24 bytes) || AEAD output` wire format: the first 24 bytes are the nonce, the remainder is the AEAD encrypted data and authentication tag.
 
 ### Key Delivery Layer (per play request)
 
