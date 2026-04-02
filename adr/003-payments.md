@@ -353,6 +353,7 @@ interface IStablePaymentChannel {
     // Views
     function getChannel(bytes32 channelId) external view returns (Channel memory);
     function getEffectiveFee(address provider) external view returns (uint256 bps);
+    function getRateBounds() external view returns (uint256 deliveryFloor, uint256 deliveryCeiling);
 
     // Governance
     function setFeePercentage(uint256 bps) external;
@@ -410,6 +411,12 @@ event ChannelExpiredReclaimed(
     address indexed client,
     uint256 deposit
 );
+
+// Governance events (emitted by setRateBounds)
+event RateBoundsUpdated(
+    uint256 newDeliveryFloor,
+    uint256 newDeliveryCeiling
+);
 ```
 
 **Channel expiry:** `expiresAt` is set at channel open: `expiresAt = block.timestamp + maxChannelDuration`. The `maxChannelDuration` parameter defaults to 90 days and is governable within hardcoded bounds (minimum 7 days, maximum 365 days). Channel expiry protects clients from indefinitely locked funds when a node disappears without closing the channel.
@@ -442,6 +449,24 @@ event ChannelExpiredReclaimed(
 | `deliveryCeiling` | $0.001/MB | 1,000 | 100× expected market rate. Accommodates origin-backed nodes with high-egress backends (e.g., S3 at $0.09/GB) while remaining well above any legitimate pricing scenario ($1.00/GB vs Akamai's ~$0.12–0.20/GB). |
 
 The expected market rate is $0.00001/MB (10 USDC base units per MB, or $0.01/GB). This positions deCDN ~4–9× cheaper than major traditional CDNs (CloudFront at $0.085/GB, KeyCDN at $0.04/GB) and at parity with budget providers (Bunny.net at $0.01/GB). Both bounds are governable post-PoC within the hardcoded safety constraints above.
+
+### Rate Bounds Refresh
+
+Nodes must keep their local copy of `RateBounds` current so that advertised `rate_per_mb` values stay within governance-set bounds. Because rate bounds are advisory coordination parameters — the contract does not verify rate compliance during settlement or slashing — the refresh strategy is lighter-touch than the content blacklist ([ADR 011](011-content-takedown.md)), where serving blacklisted content is a slashable offense.
+
+**Primary mechanism: event listening.** Nodes SHOULD subscribe to `RateBoundsUpdated` events on the `StablePaymentChannel` contract. On receiving the event, the node updates its local rate bounds cache immediately. Event listening is the recommended approach because governance actions are infrequent (days to weeks between changes), making high-frequency polling wasteful.
+
+**Fallback mechanism: periodic polling.** Nodes MUST poll `getRateBounds()` at a configurable interval (`rate_bounds_poll_interval`, default **1 hour**). This guards against missed events due to RPC provider issues, WebSocket disconnections, or chain reorganizations. The 1-hour default is deliberately longer than the 10-minute intervals used for the on-chain registry ([ADR 001](001-network.md)) and content blacklist ([ADR 011](011-content-takedown.md)): registry freshness is connectivity-critical, blacklist freshness is slashing-critical, but rate bounds staleness only risks counterparties rejecting the node's advertised rate.
+
+**Startup.** Nodes MUST call `getRateBounds()` before accepting connections, ensuring the node never operates without rate bounds. This follows the same pattern as the content blacklist initial sync ([ADR 011](011-content-takedown.md)).
+
+**Stale bounds.** If the event subscription is lost and RPC polling fails, the node SHOULD continue operating with its last-known bounds and log a warning. No service interruption is required. The worst-case consequence of stale bounds is that counterparties running compliant software reject the node's `rate_per_mb` as out-of-bounds — a revenue impact, not a safety violation.
+
+**No version-based delta pattern.** Unlike the content blacklist (which uses `getBlacklistVersion()` for cheap change detection and incremental delta fetching), rate bounds are a single struct containing two `uint256` values. A version counter adds no value — the full state is readable in a single `eth_call` with negligible overhead. This is an intentional divergence from the ADR 011 pattern.
+
+**Multi-token extension.** The PoC uses a single `RateBounds` struct. When per-token rate bounds are introduced ([ADR 010](010-multi-token.md)), the `RateBoundsUpdated` event will need a token parameter: `RateBoundsUpdated(address indexed token, uint256 newDeliveryFloor, uint256 newDeliveryCeiling)`. Nodes will subscribe with a token filter or listen for all tokens and update their local cache accordingly.
+
+For how nodes validate `rate_per_mb` against cached bounds before signing protocol messages, see [ADR 005 — Rate Bounds Validation](005-protocol.md#rate-bounds-validation).
 
 ### BuybackBurner
 
