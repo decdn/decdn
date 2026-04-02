@@ -38,12 +38,15 @@ uint256 public allowedTokenCount;
 event TokenAdded(address indexed token);
 event TokenRemoved(address indexed token);
 
-// Governance-only
-function addToken(address token) external onlyGovernance {
+// Governance-only; rate bounds are mandatory to prevent zero-rate free-riding (ADR 009)
+function addToken(address token, uint256 deliveryFloor, uint256 deliveryCeiling) external onlyGovernance {
     require(token != address(0), "Zero address");
     require(!allowedTokens[token], "Already allowed");
+    require(deliveryFloor >= 1, "Floor must be >= 1 base unit");
+    require(deliveryCeiling > deliveryFloor, "Ceiling must exceed floor");
     allowedTokens[token] = true;
     allowedTokenCount++;
+    rateBounds[token] = RateBounds(deliveryFloor, deliveryCeiling);
     emit TokenAdded(token);
 }
 
@@ -112,10 +115,10 @@ mapping(address => RateBounds) public rateBounds;
 
 // governance-only; token must be on the allowlist
 function setRateBounds(address token, uint256 deliveryFloor, uint256 deliveryCeiling) external;
-// requires: allowedTokens[token]
+// requires: allowedTokens[token], deliveryFloor >= 1, deliveryCeiling > deliveryFloor
 ```
 
-A zero `RateBounds` entry (the default) means no bounds are enforced for that token — the node's advertised rate is unconstrained. Governance sets bounds only for tokens where protocol-level enforcement is wanted.
+`addToken` requires `deliveryFloor` and `deliveryCeiling` parameters, so every allowed token has rate bounds from the moment it is added — there is no window where a token is allowed but unconstrained. `setRateBounds` can adjust bounds afterward, but the floor can never be set below 1 base unit, consistent with ADR 009's safety bound (`Floor ≥ 1 base unit`) that prevents zero-rate free-riding.
 
 **EIP-712 voucher type** is unchanged from ADR 003 — the `token` field already carries the token address:
 
@@ -228,15 +231,15 @@ struct SignedRate {
 - **No protocol-level price normalization.** A node advertising 1 base-unit/MB in USDC (= $0.000001/MB) and 1 base-unit/MB in a low-value token are indistinguishable at the wire level. Clients bear responsibility for evaluating whether a node's accepted token has value.
 - **Governance bottleneck.** Adding a new payment token requires a governance action (admin call for PoC, Governor proposal for production). This adds latency for operators who want to use a token not yet approved. Mitigated by the fact that token additions are infrequent and low-risk governance actions.
 - **Token removal complexity.** `removeToken` blocks new channels but existing open channels in that token remain valid. The network may carry "sunset" tokens for up to 90 days (channel auto-expiry per `maxChannelDuration` — see [ADR 003](003-payments.md)) after removal.
-- **Per-token rate bounds governance burden.** Governance must set meaningful bounds for each token it wants to constrain. An unbounded token (zero `RateBounds` entry) has no floor or ceiling enforced.
+- **Per-token rate bounds governance burden.** Governance must set meaningful bounds for each token at `addToken` time. Bounds can be adjusted later via `setRateBounds`, but the floor can never drop below 1 base unit.
 - **Slashing is always in TOKEN (resolved).** ADR 004's slashing schedule is denominated in TOKEN stake, and this remains unchanged with multi-token payments. Slashing operates on the `StakingRegistry` (TOKEN stake), not on payment channel deposits (which may be in any approved token). A node paid exclusively in DAI is still slashed in TOKEN — the node must hold TOKEN stake to participate in the network regardless of which payment tokens it accepts. No price oracle or cross-token conversion is needed. The slash amount is a percentage of TOKEN stake, not a percentage of delivery revenue.
 
 ## Migration from ADR 003
 
 The PoC uses `StablePaymentChannel` (USDC-only, defined in ADR 003). Production deploys `PaymentChannel` (multi-token, defined above) as a direct replacement — not a parallel deployment. Since no real users or funds exist on the PoC contract, no phased migration is needed:
 
-1. Deploy `PaymentChannel` with `addToken(USDC_ADDRESS)` called at deployment
-2. Governance calls `addToken` for any additional tokens (e.g., DAI)
+1. Deploy `PaymentChannel` with `addToken(USDC_ADDRESS, 1, 1000)` called at deployment (floor = 1 USDC base unit, ceiling = 1000 USDC base units = $0.001/MB, matching [ADR 003](003-payments.md) defaults)
+2. Governance calls `addToken` with appropriate rate bounds in the token's own base units for any additional tokens (e.g., DAI)
 3. All nodes update config to point to the new contract
 4. The PoC `StablePaymentChannel` is decommissioned
 
