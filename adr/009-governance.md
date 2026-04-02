@@ -47,7 +47,7 @@ All economic parameters across the protocol are governable within hardcoded safe
 | Multiaddr update cooldown | StakingRegistry | 0 (disabled) | 86400 seconds (1 day) |
 | Max multiaddr size | StakingRegistry | 64 bytes | 1024 bytes |
 | Dispute window (PoC default: 48h) | StablePaymentChannel | 12 hours | 72 hours (3 days) |
-| Rate floor/ceiling | StablePaymentChannel | Floor ≥ 1 base unit | Ceiling > floor |
+| Rate floor/ceiling | StablePaymentChannel (PoC) / PaymentChannel per-token (production, [ADR 010](010-multi-token.md)) | Floor ≥ 1 base unit | Ceiling > floor |
 | Max voucher interval | StablePaymentChannel | 1 MB | 1024 MB (~1 GB) |
 | Min deposit | StablePaymentChannel | 1 base unit | No max |
 | Challenge bond | StakingRegistry | 1 TOKEN | 1,000 TOKEN |
