@@ -46,9 +46,16 @@ interface IContentBlacklist {
     function emergencyAdd(bytes32 blake3Hash, string calldata reason) external;
     function emergencyAddOrigin(address operatorAddress, string calldata reason) external;
 
+    // Emergency entries expire after 14 days unless ratified by governance.
+    // Expiry is derived from the entry's addedAt timestamp: addedAt + 14 days.
+    // isBlacklisted returns false after this deadline unless a governance addHash
+    // has been called for the same hash.
+
     // Regional body registry — global governance only
     function registerRegionalBody(string calldata region, address body) external;
     function deregisterRegionalBody(string calldata region) external;
+    function suspendRegionalBody(string calldata region) external;
+    function unsuspendRegionalBody(string calldata region) external;
 
     // Views
     function isBlacklisted(bytes32 blake3Hash) external view returns (bool);
@@ -58,10 +65,10 @@ interface IContentBlacklist {
     function getBlacklistVersion() external view returns (uint256);
 
     // Events
-    event HashBlacklisted(bytes32 indexed blake3Hash, uint256 effectiveAt, string region, string reason, bool emergency);
-    event HashRemoved(bytes32 indexed blake3Hash, string region);
-    event OriginBlacklisted(address indexed operatorAddress, string reason);
-    event OriginRemoved(address indexed operatorAddress);
+    event HashBlacklisted(bytes32 indexed blake3Hash, uint256 indexed version, uint256 effectiveAt, string region, string reason, bool emergency);
+    event HashRemoved(bytes32 indexed blake3Hash, uint256 indexed version, string region);
+    event OriginBlacklisted(address indexed operatorAddress, uint256 indexed version, string reason);
+    event OriginRemoved(address indexed operatorAddress, uint256 indexed version);
 }
 
 struct BlacklistEntry {
@@ -73,6 +80,8 @@ struct BlacklistEntry {
     bool    emergency;        // true if added via emergency multisig path
 }
 ```
+
+> **Gas optimization (production):** The `region` field uses `string` for PoC readability. Production implementations SHOULD use `bytes2` for ISO 3166-1 alpha-2 codes (always exactly 2 ASCII characters), with `bytes2(0)` as the global sentinel. This reduces storage costs.
 
 **Blacklist version.** `getBlacklistVersion()` returns a monotonically increasing counter incremented on every add/remove operation across all paths. Nodes cache the last-seen version and only re-fetch deltas when the version advances, minimising RPC load.
 
@@ -87,6 +96,8 @@ A regional body is an address (multisig or governance contract) registered by gl
 **PoC:** No regional bodies are registered. The admin key acts as sole governance. The contract is designed to support regional bodies from day one so they can be added by governance vote without a contract redeploy.
 
 **Production:** Regional bodies are expected for at minimum EU (DSA compliance) and US (DMCA). Each body is a 3-of-5 multisig constituted with signers who have legal presence in the relevant jurisdiction.
+
+**Suspension:** The emergency multisig can suspend a regional body immediately via `suspendRegionalBody(region)`. Suspended bodies cannot issue new entries but existing entries remain active. Suspension must be ratified or reversed by a governance vote within 14 days (same ratification window as emergency blacklist entries).
 
 Regional bodies operate independently within their scope. A hash blacklisted by the EU body is a compliance obligation only for nodes that declare an EU region. A hash blacklisted globally is a compliance obligation for all nodes regardless of region.
 
@@ -109,6 +120,9 @@ Hash-based blacklisting covers only exact copies of a blob. A one-byte change pr
 **The protocol's primary response is origin blacklisting.** If an origin-backed node repeatedly sources blacklisted content — whether the same blob or trivially re-encoded variants — governance can blacklist the operator's Ethereum address. A blacklisted origin:
 
 - Is removed from the `StakingRegistry` (same effect as stake ejection)
+
+The `ContentBlacklist.addOrigin()` function calls `StakingRegistry.ejectNode(operatorAddress)` via a cross-contract call. The `StakingRegistry` grants the `ContentBlacklist` contract address the `BLACKLIST_ROLE`, permitting this call. The ejection follows the same path as stake-based auto-ejection (emits `NodeAutoEjected`, sets `active = false`).
+
 - Cannot register new nodes under the same address
 - Has all its NodeIds excluded from peer tables (gossip validation rejects messages from blacklisted nodes)
 
@@ -122,7 +136,7 @@ This raises the cost of re-upload evasion from trivial (change a byte) to signif
 
 ### Polling
 
-Nodes poll `getBlacklistVersion()` on a configurable interval (`blacklist_poll_interval`, default 10 minutes). When the version has advanced, the node fetches new entries since its last-seen version, filtered to its declared region plus global entries.
+Nodes poll `getBlacklistVersion()` on a configurable interval (`blacklist_poll_interval`, default 10 minutes). When the version has advanced, the node fetches new entries since its last-seen version, filtered to its declared region plus global entries. Delta fetching relies on contract event logs: `HashBlacklisted` and `OriginBlacklisted` events include an indexed `version` field, enabling efficient `eth_getLogs` queries filtered by version range.
 
 **Version sync recovery.** If a node has been offline or missed multiple version bumps, delta fetching may be insufficient (events may have been pruned from the RPC provider's log retention window). The recovery strategy is:
 
@@ -131,6 +145,8 @@ Nodes poll `getBlacklistVersion()` on a configurable interval (`blacklist_poll_i
 3. As a fallback, if the full event log is unavailable (RPC provider pruned old events): the node fetches the current blacklist state by calling `isBlacklisted` for all hashes in its local cache. This is O(cache_size) RPC calls but ensures no stale content is served.
 
 The node MUST NOT accept connections until its blacklist is synced to the current version.
+
+**Pre-cache check:** Before caching any newly-fetched blob (whether from origin pull-through or peer pull), the node MUST check `isBlacklisted(hash)` and reject the blob if blacklisted. This enables proactive blacklisting of known-bad hashes before any node caches them.
 
 On startup, nodes always fetch the full current blacklist (global + their region) before accepting connections.
 
@@ -142,7 +158,7 @@ When a node receives a new blacklisted hash, it must, **in order**:
 2. **Stop serving** — reject any new `StreamRequest` for the hash immediately, returning `HashBlacklisted`
 3. **Evict from cache** — delete the blob from local storage within the compliance window
 
-The announce-first ordering is critical: announcing content that is then not delivered triggers the phantom-blob detection path (ADR 003). Eviction from disk can be async; announcement suppression must be synchronous.
+The announce-first ordering is critical: announcing content that is then not delivered triggers the phantom-blob detection path ([ADR 005](005-protocol.md#phantom-announcement-slashing)). Eviction from disk can be async; announcement suppression must be synchronous.
 
 When a node receives a blacklisted origin address, it additionally stops accepting any `StreamRequest` that presents a channel funded by that operator address, and removes all of that origin's NodeIds from its local peer table.
 
@@ -184,11 +200,11 @@ The response does not distinguish between governance and local denylist sources.
 
 ## Slashing
 
-Serving a blacklisted hash after the compliance window is a slashable offense, subject to the escalating schedule in [ADR 004](004-tokenomics.md#slash-amounts-escalating). Repeated offenses trigger cumulative stake loss; nodes whose stake drops below 50% of the minimum are auto-ejected ([ADR 004 § Auto-ejection](004-tokenomics.md#auto-ejection)). Individual slash percentages are capped at 50% per offense ([ADR 009 § Safety bounds](009-governance.md#governable-parameters-with-safety-bounds)).
+Serving a blacklisted hash after the compliance window is a slashable offense, subject to the escalating schedule in [ADR 004](004-tokenomics.md#slash-amounts-escalating). Repeated offenses trigger cumulative stake loss; nodes whose stake drops below 50% of the minimum are auto-ejected ([ADR 004 § Auto-ejection](004-tokenomics.md#auto-ejection)). Individual slash percentages are capped at 50% per offense ([ADR 009 § Safety bounds](009-governance.md#governable-parameters-with-safety-bounds)). The standard challenge bond from [ADR 004](004-tokenomics.md#challenge-bond) applies (100 TOKEN PoC / 50 TOKEN production).
 
 **Slash evidence.** The challenger submits:
 - The `blake3Hash`
-- A signed `StreamResponse` (or delivery receipt) from the offending node, timestamped after the compliance window
+- A node-signed `ProbeResponse` with `has_blob: true` for the blacklisted hash, timestamped after the compliance window. The probe signature (defined in [ADR 005](005-protocol.md)) cryptographically binds the node's identity to the hash claim. On-chain verification uses the same intermediate scheme as other slash evidence: the Ed25519 signature is verified via an on-chain Ed25519 verification library (not `ecrecover`, which is secp256k1 only) — see [ADR 002](002-content-addressing.md) for the open question on the exact on-chain verification path. This is the primary evidence path. Alternatively, a node-signed `StreamResponse` with `ok: true` for the blacklisted hash (binding `hash` and `channel_id` in the signed data) is also sufficient. Client-signed vouchers alone are NOT sufficient evidence — vouchers do not contain the hash and the `channel_id → hash` binding is not on-chain verifiable.
 - The `BlacklistEntry.effectiveAt` timestamp showing the compliance window had passed
 
 The `ContentBlacklist` contract verifies that `effectiveAt` is in the past relative to the delivery timestamp and that the hash is still on the blacklist. If the hash was subsequently removed, the slash is invalid.

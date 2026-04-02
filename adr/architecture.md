@@ -10,7 +10,7 @@
 A decentralized CDN with two participant roles:
 
 - **Nodes** (providers) cache and serve content. They stake TOKEN to participate in the peer mesh and compete on price and latency. Some nodes are configured with an origin backend (S3, NFS, local disk) making them the canonical source for specific content — this is a deployment choice, not a protocol distinction. No external origin URL is ever exposed.
-- **Clients** consume content. They pay nodes per MB via off-chain USDC payment channels.
+- **Clients** consume content. They pay nodes per MB via off-chain payment channels (USDC in PoC; multiple governance-approved ERC-20 tokens in production — see [ADR 010](010-multi-token.md)).
 
 The PoC scope is tens of nodes on a testnet, proving the delivery pipeline (content discovery, probing, paid streaming) and payment channel lifecycle (open, voucher, close, dispute). Reputation, encryption, watchtowers, and governance use simplified stand-ins.
 
@@ -66,7 +66,7 @@ Clients probe candidate nodes, pick the best by the unified selection score (see
 
 ### [ADR 000 — Language and Core Networking Stack](000-language.md)
 
-**Rust + iroh (0.97+).**
+**Rust + iroh (0.97).**
 
 The implementation language is Rust. The networking stack is iroh, which provides QUIC transport, NAT traversal, content-addressed blob transfer, and gossip as a cohesive unit. A single statically linked binary runs as a node or client depending on configuration.
 
@@ -76,7 +76,7 @@ The implementation language is Rust. The networking stack is iroh, which provide
 
 **Flat peer mesh. Gossip for node discovery, probe fan-out for content discovery (DHT deferred to post-PoC).**
 
-All staked nodes form a flat mesh. Node metadata is broadcast over iroh-gossip on regional topics (`cdn/region/{cc}/v1`) and a global topic (`cdn/global/v1`) via lightweight `NodeAnnounce` messages (~700 bytes). Content discovery is on-demand: on a cache miss, nodes probe all known peers via `cdn/probe/v1` in parallel and select the best provider by the unified selection score (`rate_per_mb × rtt_ms × (1 / max(reputation, 0.1)²)` — lower is better). No content inventories are broadcast — no Bloom filters, no hash lists. The on-chain node registry is part of the `StakingRegistry` contract; the `NodeInfo` struct maps `NodeId` (ed25519 public key) to QUIC multiaddrs and Ethereum address.
+All staked nodes form a flat mesh. Node metadata is broadcast over iroh-gossip on regional topics (`cdn/region/{cc}/v1`) and a global topic (`cdn/global/v1`) via lightweight `NodeAnnounce` messages (~800 bytes). Content discovery is on-demand: on a cache miss, nodes probe all known peers via `cdn/probe/v1` in parallel and select the best provider by the unified selection score (`rate_per_mb × rtt_ms × (1 / max(reputation, 0.1)²)` — lower is better). No content inventories are broadcast — no Bloom filters, no hash lists. The on-chain node registry is part of the `StakingRegistry` contract; the `NodeInfo` struct maps `NodeId` (ed25519 public key) to QUIC multiaddrs and Ethereum address.
 
 ---
 
@@ -98,7 +98,7 @@ Clients pay nodes per MB. On a cache miss, nodes pay origin-backed nodes per MB 
 
 ### [ADR 004 — Dual-Currency Token Model](004-tokenomics.md)
 
-**USDC for payments. TOKEN for staking and fee discounts.**
+**USDC for payments. TOKEN for staking, governance, and fee discounts.**
 
 TOKEN is not used for payments. All nodes must stake TOKEN to participate. Staking cost creates accountability and Sybil resistance. 20% of protocol fees buy back and burn TOKEN (accumulate-only in PoC; buyback execution deferred to production). Fixed supply of 1B at genesis. Challenge bonds (100 TOKEN in PoC, 50 TOKEN in production) are required for slash claims, preventing zero-cost griefing. Governance is covered separately in [ADR 009](009-governance.md).
 
@@ -114,6 +114,8 @@ TOKEN is not used for payments. All nodes must stake TOKEN to participate. Staki
 | `cdn/client/v1` | Paid delivery: client→node, node→node (cache miss) |
 | `cdn/watchtower/v1` | Channel-dispute monitoring ([ADR 007](007-watchtower.md)) |
 | iroh-gossip (built-in) | Node metadata broadcast (`NodeAnnounce`), node discovery |
+
+Gossip topics: `cdn/global/v1` (all nodes), `cdn/region/{cc}/v1` (regional), `cdn/reputation/v1` (reputation reports — [ADR 008](008-reputation.md)).
 
 `redirect` in `StreamResponse` always points to a NodeId, never an external URL. The origin backend is never revealed.
 
@@ -141,7 +143,7 @@ A watchtower holds the latest voucher for a registered channel and submits a `di
 
 **Interaction-weighted scoring with gossip propagation.**
 
-Nodes are ranked by a reputation score (0.0–1.0) derived from local observations (70%) and gossip-propagated reports (30%). Reports are weighted by the reporter's total settled USDC value (on-chain verifiable, counting both client and provider sides), capped at 5× to limit incumbency advantage while keeping manipulation expensive. Only staked nodes may submit gossip reports; clients contribute via local scores only. Scores decay toward neutral without fresh data, clamping limits per-report impact, and a cold-start bootstrap gives new nodes initial traffic.
+Nodes are ranked by a reputation score (0.0–1.0) derived from local observations (70%) and gossip-propagated reports (30%). Reports are weighted by the reporter's total settled value (on-chain verifiable, counting both client and provider sides; USDC-only in PoC, multi-token normalized in production — see [ADR 010](010-multi-token.md)), capped at 5× to limit incumbency advantage while keeping manipulation expensive. Only staked nodes may submit gossip reports; clients contribute via local scores only. Scores decay toward neutral without fresh data, clamping limits per-report impact, and a cold-start bootstrap gives new nodes initial traffic.
 
 ---
 
@@ -199,7 +201,7 @@ A `ContentBlacklist` contract supports global (network-wide) and regional (juris
 | Term | Definition |
 | --- | --- |
 | **Blob** | A content-addressed byte sequence identified by its BLAKE3 hash |
-| **Chunk** | A 1024-byte segment of a blob used by iroh-blobs for verified streaming |
+| **Chunk** | The BLAKE3 hash tree leaf size (1024 bytes). iroh-blobs uses this for verified streaming. On-chain Merkle proofs for slash evidence reference this leaf size — see [ADR 002](002-content-addressing.md) |
 | **Hash sequence** | An ordered collection of blob hashes (iroh's equivalent of a directory/manifest) |
 | **Voucher** | A signed off-chain payment message: `{channelId, amount, nonce, token, signature}` |
 | **ALPN** | Application-Layer Protocol Negotiation — identifies which protocol a QUIC connection uses |

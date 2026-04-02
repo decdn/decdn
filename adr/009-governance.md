@@ -40,19 +40,23 @@ All economic parameters across the protocol are governable within hardcoded safe
 
 | Parameter | Contract | Min | Max |
 | --- | --- | --- | --- |
-| Protocol fee % | StablePaymentChannel | 0% (0 bps) | 20% (2000 bps) |
+| Protocol fee % | StablePaymentChannel (PoC) / PaymentChannel (production) | 0% (0 bps) | 20% (2000 bps) |
+| Discounted fee % | StablePaymentChannel (PoC) / PaymentChannel (production) | 0% (0 bps) | ≤ Protocol fee % |
 | Minimum stake | StakingRegistry | 100 TOKEN | 100,000 TOKEN |
 | Slash percentage (per offense) | StakingRegistry | 5% | 50% |
 | Unbonding period | StakingRegistry | 3 days | 30 days |
 | Multiaddr update cooldown | StakingRegistry | 0 (disabled) | 86400 seconds (1 day) |
 | Max multiaddr size | StakingRegistry | 64 bytes | 1024 bytes |
-| Dispute window (PoC default: 48h) | StablePaymentChannel | 12 hours | 72 hours (3 days) |
+| Dispute window (PoC default: 48h) | StablePaymentChannel (PoC) / PaymentChannel (production) | 12 hours | 72 hours (3 days) |
 | Rate floor/ceiling | StablePaymentChannel (PoC) / PaymentChannel per-token (production, [ADR 010](010-multi-token.md)) | Floor ≥ 1 base unit | Ceiling > floor |
-| Max voucher interval | StablePaymentChannel | 1 MB | 1024 MB (~1 GB) |
-| Min deposit | StablePaymentChannel | 1 base unit | No max |
+| Max voucher interval | StablePaymentChannel (PoC) / PaymentChannel (production) | 1 MB | 1024 MB (~1 GB) |
+| Min deposit | StablePaymentChannel (PoC) / PaymentChannel (production) | 1 base unit | No max |
 | Challenge bond | StakingRegistry | 1 TOKEN | 1,000 TOKEN |
 | Base slash reset period | StakingRegistry | 30 days | 365 days |
-| Burn percentage of fees | StablePaymentChannel | 0% | 100% |
+| Burn percentage of fees | StablePaymentChannel (PoC) / PaymentChannel (production) | 0% | 100% |
+| Compliance window | ContentBlacklist | 1 hour | 7 days |
+
+The 3-day voting period balances responsiveness with participation. Combined with the 2-day timelock, the total governance delay is 5 days minimum — comparable to standard OpenZeppelin Governor deployments.
 
 Staking, slashing, and fee parameters are defined in [ADR 004](004-tokenomics.md). Payment channel parameters are defined in [ADR 003](003-payments.md). This ADR defines the governance mechanism that controls them.
 
@@ -71,6 +75,7 @@ Staking, slashing, and fee parameters are defined in [ADR 004](004-tokenomics.md
 - Capabilities (exhaustive list):
   1. **Pause contracts** — halt all contract execution for exploit response and critical bug mitigation
   2. **Emergency content blacklisting** — add hashes and origin operators to the `ContentBlacklist` contract via `emergencyAdd` and `emergencyAddOrigin` (see [ADR 011](011-content-takedown.md))
+  3. **Regional body suspension** — suspend a compromised regional governance body via `suspendRegionalBody` (see [ADR 011](011-content-takedown.md)); must be ratified or reversed by governance within 14 days
 - Cannot change parameters, withdraw funds, or bypass governance for non-emergency actions
 - Used for exploit response, critical bug mitigation, and time-critical content removal (e.g., CSAM, actively-exploited material)
 - Sunset: `pauseDeadline = deployTimestamp + 365 days` is hardcoded in the constructor as an immutable value. After the deadline, `pause()` reverts with `"PauseExpired"`. Emergency blacklisting capability follows the same sunset schedule (`blacklistDeadline = deployTimestamp + 365 days`). **Extension mechanism:** governance cannot modify the immutable deadline. To extend pause/blacklist capability, governance must deploy a new contract version with a new deadline and migrate via the standard contract upgrade path (timelock + governance vote). This ensures the sunset cannot be silently extended — a new deployment is a visible, auditable event.

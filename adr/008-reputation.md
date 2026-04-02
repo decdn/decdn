@@ -41,6 +41,8 @@ Where interaction_score is:
 
 Formula: `interaction_score = 0.4 * speed_score + 0.4 * correctness + 0.2 * reachability`
 
+Normalization: `speed_score = min(1.0, actual_bps / expected_bps)` where `expected_bps` is a node-local configurable baseline (default: 10 MiB/s = 10,485,760 bytes/sec).
+
 EWMA with alpha=0.1 means recent interactions matter more but old interactions still contribute.
 
 ### 4. Network Score Aggregation
@@ -49,13 +51,15 @@ Reports received via iroh-gossip are aggregated using EWMA weighted by reporter 
 
 ```
 weight_cap = 5.0
-raw_weight = total_settled_usdc(reporter) / max(1, max_settled_usdc_observed)
+raw_weight = total_settled_value(reporter) / max(1, max_settled_value_observed)
 reporter_weight = min(raw_weight, weight_cap)
 network_score = ewma(network_score, report.score, alpha=0.05 * reporter_weight)
 ```
 
-- `total_settled_usdc(reporter)`: cumulative USDC value across all payment channels the reporter has settled on-chain (verifiable), counting channels where the reporter was **either the client or the provider**. Including both sides gives credit to nodes that pay for cache-miss pulls, not only nodes that receive payment for delivery. **Value-weighted, not count-weighted** — this prevents Sybil manipulation via many cheap channels (opening 100 channels with 1 USDC each gives the same weight as one channel with 100 USDC, making the attack cost proportional to desired influence rather than proportional to channel count).
-- `max(1, max_settled_usdc_observed)`: the `max(1, ...)` guard prevents division by zero at network bootstrap when no channels have been settled yet. At bootstrap, all reporters have weight 0 (no settled value), so network scores remain at their initial value (0.5) until the first channels settle. **Note:** `max_settled_usdc_observed` is local to each node, so two nodes may compute different weights for the same reporter. This means network scores are inherently subjective and will not converge to a single global value — an accepted property of the design (see Consequences).
+> **EWMA/clamp interaction:** For large score divergences (gap > 0.5), when `reporter_weight` exceeds ~2.0, the EWMA delta is almost always overridden by the ±0.05 per-report clamp. In this regime the effective influence range is 0–2× rather than 0–5×. For smaller score gaps, weights above 2× still produce proportionally larger EWMA deltas. This is an accepted property: the clamp prevents large single-report swings regardless of reporter credibility.
+
+- `total_settled_value(reporter)`: cumulative settlement value across all payment channels the reporter has settled on-chain, normalized to a common unit. **PoC:** only USDC channels exist, so this equals `total_settled_usdc`. **Production:** governance tags each approved token as stablecoin-equivalent at `addToken` time ([ADR 010](010-multi-token.md)); settled amounts for stablecoin-class tokens are summed directly (1 USDC base unit = 1 DAI base unit). Non-stablecoin tokens use a governance-set weight factor. Including both sides gives credit to nodes that pay for cache-miss pulls, not only nodes that receive payment for delivery. **Value-weighted, not count-weighted** — this prevents Sybil manipulation via many cheap channels (opening 100 channels with 1 USDC each gives the same weight as one channel with 100 USDC, making the attack cost proportional to desired influence rather than proportional to channel count).
+- `max(1, max_settled_value_observed)`: the `max(1, ...)` guard prevents division by zero at network bootstrap when no channels have been settled yet. At bootstrap, all reporters have weight 0 (no settled value), so network scores remain at their initial value (0.5) until the first channels settle. **Note:** `max_settled_value_observed` is local to each node, so two nodes may compute different weights for the same reporter. This means network scores are inherently subjective and will not converge to a single global value — an accepted property of the design (see Consequences).
 - `weight_cap`: caps reporter influence at 5× to prevent established high-earning nodes from having disproportionate control over network reputation. The cap preserves the anti-Sybil property (influence still scales with capital) while bounding the maximum incumbency advantage.
 - Alpha is scaled by reporter weight: high-credibility reporters (more settled value) move the score faster
 
@@ -81,7 +85,7 @@ flowchart TD
     end
 
     subgraph Network["Network Score (30%)"]
-        GR[Gossip ReputationReport] --> RW["reporter_weight =<br/>min(total_settled_usdc / max(1, max_settled_usdc_observed), 5.0)"]
+        GR[Gossip ReputationReport] --> RW["reporter_weight =<br/>min(total_settled_value / max(1, max_settled_value_observed), 5.0)"]
         RW --> EWMA2["network_score = EWMA(network, report,<br/>a=0.05 * reporter_weight)"]
         EWMA2 --> CLAMP2["Per-report clamp: max ±0.05"]
     end
