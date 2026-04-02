@@ -196,7 +196,7 @@ During the first 7 days after staking (or first 50 completed interactions, which
 | Tie-breaking | Simplified: lower load → random | Full 4-tier (load → geo → stake → random) |
 | Initial score | 0.5 (same) | 0.5 |
 
-For PoC, reputation is local-only — each client tracks its own observations of node performance (delivery speed, correctness, reachability) via EWMA. There is no gossip propagation, no decay, and no clamping. The node selection algorithm in [ADR 001](001-network.md#node-selection-algorithm) uses `final_score = local_score` directly. This exercises the core scoring path (interaction → EWMA → selection weight) without the complexity of cross-node reputation aggregation.
+For PoC, reputation is local-only — each client tracks its own observations of node performance (delivery speed, correctness, reachability) via EWMA. There is no gossip propagation, no decay, and no per-report clamping (the selection floor `max(reputation, 0.1)` from [ADR 001](001-network.md#node-selection-algorithm) still applies). The node selection algorithm in [ADR 001](001-network.md#node-selection-algorithm) uses `final_score = local_score` directly. This exercises the core scoring path (interaction → EWMA → selection weight) without the complexity of cross-node reputation aggregation.
 
 PoC action items:
 
@@ -221,4 +221,4 @@ PoC action items:
 - Reporter weight creates a residual incumbency advantage — established nodes with more settled USDC have more influence over network scores. The weight cap (5×) bounds this advantage but does not eliminate it
 - Gossip-based propagation adds bandwidth overhead, though rate limiting bounds this
 - The 70/30 local/network split means a client's view of the network is biased toward its own usage patterns
-- PoC uses local-only scores (no gossip, no decay, no clamping) — see [Section 12](#12-poc-scope) for full PoC scope
+- PoC uses local-only scores (no gossip, no decay, no per-report clamping) — see [Section 12](#12-poc-scope) for full PoC scope
