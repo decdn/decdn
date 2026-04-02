@@ -112,7 +112,7 @@ The protocol fee is calculated **at final settlement**, after the dispute window
    - Treasury receives: `fee = claimedAmount × feePercentage / 10000`
    - Client receives refund: `deposit - claimedAmount`
 
-   > **Invariant:** `closeChannel` and `disputeChannel` MUST revert if the submitted voucher's `amount > channel.deposit`. This prevents client bugs or malicious over-deposit vouchers from causing an underflow revert in `settleChannel` that would lock the channel.
+   > **Invariants:** (1) `closeChannel` and `disputeChannel` MUST revert if the submitted voucher's `amount > channel.deposit`. This prevents client bugs or malicious over-deposit vouchers from causing an underflow revert in `settleChannel` that would lock the channel. (2) `disputeChannel` MUST revert if `newAmount < claimedAmount`. Since vouchers are cumulative, a higher nonce must correspond to a non-decreasing amount; this prevents a malicious client from reducing the provider's payout via a higher-nonce dispute with a lower amount.
 
    The treasury address receives the full protocol fee as a single transfer. The internal allocation across the four buckets (development fund, bug bounties & audits, ecosystem grants, token buyback & burn — see [ADR 004, Fee Allocation](004-tokenomics.md#fee-allocation)) is handled outside the payment channel contract: manually by the admin key holder in the PoC, and via governance-directed disbursement in production.
 
@@ -373,9 +373,9 @@ interface IStablePaymentChannel {
 > **Reentrancy protection:** All state-mutating functions that perform external calls (ERC-20 transfers) — `openChannel`, `topUp`, `settleChannel`, `reclaimExpired` — MUST use `nonReentrant` guards and follow checks-effects-interactions. This is especially critical for the production multi-token contract ([ADR 010](010-multi-token.md)) which accepts arbitrary governance-approved tokens.
 
 **`topUp` behavior:** `topUp(channelId, additionalDeposit)` adds funds to an open channel:
-- **Status precondition:** MUST require status `Open` (reverts on `Closing` or `Closed`).
+- **Status precondition:** MUST require status `Open` and `block.timestamp < expiresAt` (reverts on `Closing`, `Closed`, or expired).
 - **Caller:** client only (`require(msg.sender == channel.client)`).
-- **Effects:** `channel.deposit += additionalDeposit`. Does NOT extend `expiresAt` (to prevent indefinite lock-in).
+- **Effects:** Transfers `additionalDeposit` from `msg.sender` to the contract via `safeTransferFrom`. Updates `channel.deposit += additionalDeposit`. Does NOT extend `expiresAt` (to prevent indefinite lock-in — the channel's utility is bounded by the initial `maxChannelDuration`).
 - **Modifiers:** `nonReentrant`.
 - **Emits:** `ChannelToppedUp(channelId, additionalDeposit, newDeposit)`.
 

@@ -143,7 +143,7 @@ A watchtower holds the latest voucher for a registered channel and submits a `di
 
 **Interaction-weighted scoring with gossip propagation.**
 
-Nodes are ranked by a reputation score (0.0–1.0) derived from local observations (70%) and gossip-propagated reports (30%). Reports are weighted by the reporter's total settled USDC value (on-chain verifiable, counting both client and provider sides), capped at 5× to limit incumbency advantage while keeping manipulation expensive. Only staked nodes may submit gossip reports; clients contribute via local scores only. Scores decay toward neutral without fresh data, clamping limits per-report impact, and a cold-start bootstrap gives new nodes initial traffic.
+Nodes are ranked by a reputation score (0.0–1.0) derived from local observations (70%) and gossip-propagated reports (30%). Reports are weighted by the reporter's total settled value (on-chain verifiable, counting both client and provider sides; USDC-only in PoC, multi-token normalized in production — see [ADR 010](010-multi-token.md)), capped at 5× to limit incumbency advantage while keeping manipulation expensive. Only staked nodes may submit gossip reports; clients contribute via local scores only. Scores decay toward neutral without fresh data, clamping limits per-report impact, and a cold-start bootstrap gives new nodes initial traffic.
 
 ---
 

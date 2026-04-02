@@ -63,7 +63,7 @@ epoch_id  = floor(now_unix / 300)
 epoch_key = BLAKE3_derive_key("decdn-epoch-key-v1", provider_node_id || server_secret || epoch_id.to_le_bytes())
 ```
 
-Uses BLAKE3's `derive_key` mode (not keyed hash). The context string is hardcoded and application-specific per BLAKE3's API contract. The provider's NodeId is included in the key material (not the context string) to prevent cross-provider key collisions if two providers share the same `server_secret`. `epoch_id` is serialized as 8-byte little-endian.
+Uses BLAKE3's `derive_key` mode (not keyed hash). The context string is hardcoded and application-specific per BLAKE3's API contract. The key material is concatenated as: `provider_node_id` (raw 32-byte Ed25519 public key) || `server_secret` (32 bytes, generated via `CSPRNG`) || `epoch_id` (8-byte little-endian `u64`). The provider's NodeId is included in the key material (not the context string) to prevent cross-provider key collisions if two providers share the same `server_secret`.
 
 **Per-request sealed envelope:** On each play request, the app server verifies the client's subscription is active, then wraps `K_blob` with the current epoch key and seals the result to the client's public key:
 
