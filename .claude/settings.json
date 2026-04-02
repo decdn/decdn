@@ -3,6 +3,7 @@
     "superpowers@claude-plugins-official": true,
     "commit-commands@claude-plugins-official": true,
     "blockchain-web3@claude-code-workflows": true,
-    "github@claude-plugins-official": true
+    "github@claude-plugins-official": true,
+    "documentation-generation@claude-code-workflows": true
   }
 }
