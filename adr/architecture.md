@@ -258,6 +258,8 @@ The protocol does not dictate cache policy. Nodes are economically motivated to 
 
 **Eviction:** LRU or frequency-weighted eviction (LFU). Operators tune cache size to maximize hit rate within their storage budget.
 
+**Maximum blob size:** Nodes may configure a `max_blob_size` (PoC recommended default: 10 GB). Requests for blobs exceeding this limit are rejected with `StreamError::BlobTooLarge` ([ADR 005](005-protocol.md#error-handling-and-retry-semantics)). This prevents a single large blob from exhausting cache capacity or tying up connections for extended periods. The limit is per-node — nodes with larger storage budgets can raise it; cache-only nodes on constrained hardware can lower it.
+
 ```mermaid
 flowchart TD
     A[Client requests blob via StreamRequest] --> B{Node has blob in cache?}
@@ -406,4 +408,4 @@ During PoC (before indexers exist), content discovery uses probe fan-out — eve
 
 - Production L2 choice (Arbitrum One, Base, or other) — gated on PoC validation. Sequencer censorship mitigation for the dispute window is addressed in [ADR 007](007-watchtower.md#l2-sequencer-censorship) (PoC: 48h default; production: forced-inclusion deadline extension); the extension's detection logic depends on the L2 chosen
 - Parallel streaming from multiple nodes for a single blob (protocol supports it, not prioritised)
-- Whether a maximum blob size should be imposed for operational reasons — the protocol currently imposes no limit, and streaming delivery with negotiable voucher intervals ([ADR 003](003-payments.md#voucher-interval-negotiation)) handles arbitrarily large blobs without full materialization, but practical considerations (cache eviction impact, origin pull duration, channel lifetime) may warrant an explicit ceiling
+- ~~Maximum blob size~~: decided — nodes may configure a `max_blob_size` limit (PoC recommended default: 10 GB). Requests exceeding a node's limit are rejected with `StreamError::BlobTooLarge` ([ADR 005](005-protocol.md#error-handling-and-retry-semantics)). This is a per-node operational policy, not an on-chain governance parameter, because different nodes have different storage and bandwidth budgets

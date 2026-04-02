@@ -200,13 +200,16 @@ When a `StreamResponse` returns `ok: false`, the response includes an error code
 enum StreamError {
     NotFound,       // Node does not have the blob (cache miss, no origin)
     Overloaded,     // Node is at capacity; try another node
+    BlobTooLarge,   // Blob exceeds this node's configured max_blob_size
     InternalError,  // Unexpected failure; do not retry this node
 }
 ```
 
+**`BlobTooLarge` enforcement:** Nodes may configure a `max_blob_size` limit (PoC recommended default: 10 GB). When a node receives a `StreamRequest` for a blob whose `total_bytes` exceeds its configured `max_blob_size`, it returns `StreamResponse {ok: false, error: BlobTooLarge}`. On a cache miss pull, if the upstream node's `StreamResponse.total_bytes` exceeds the pulling node's `max_blob_size`, the pulling node aborts the upstream stream and returns `BlobTooLarge` to the original requester. The limit applies to individual blobs, not to the aggregate of a hash sequence.
+
 **Retry behavior:**
 
-1. On `ok: false` or connection failure, the requester does **not** retry the same node for the same blob hash.
+1. On `ok: false` or connection failure, the requester does **not** retry the same node for the same blob hash. For `BlobTooLarge`, the requester SHOULD NOT retry the same node — the limit is a stable node policy, not a transient condition like `Overloaded`. Since `max_blob_size` is per-node, a different node may accept the blob.
 2. The requester falls back to the next-best candidate from the original probe results (sorted by unified selection score — see [ADR 001](001-network.md#node-selection-algorithm)).
 3. Maximum 3 total attempts (including the first) per blob request. After 3 failures, the request is surfaced as an error to the caller.
 4. **Per-attempt timeout:** 10 seconds from `StreamRequest` to first `ChunkData`. If no data arrives within 10 seconds, the requester treats it as a connection failure and moves to the next candidate.
