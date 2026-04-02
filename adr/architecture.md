@@ -358,7 +358,7 @@ The app server is a traditional web service operated by the content provider (e.
 - Authenticates client sessions and validates subscription status
 - Delivers epoch keys over an authenticated persistent connection (WebSocket or SSE)
 - Issues sealed envelopes (`crypto_box_seal`) containing wrapped `K_blob` on play requests
-- Issues offline playback leases (sealed to device keys)
+- Builds and returns offline playback leases (client seals locally to device keystore)
 
 **Why WebSocket/SSE, not iroh QUIC:** The app server intentionally sits outside the iroh ecosystem. It handles subscription billing, OAuth/session auth, and key management — traditional web service concerns. Content providers integrate it with their existing infrastructure (load balancers, API gateways, auth systems). Requiring iroh QUIC would couple the provider's application backend to the CDN networking stack without protocol benefit. The watchtower ([ADR 007](007-watchtower.md)) uses iroh QUIC because it is a CDN protocol participant; the app server is not.
 

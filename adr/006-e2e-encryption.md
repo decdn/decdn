@@ -134,7 +134,7 @@ sequenceDiagram
 
 The online scheme (epoch keys over a persistent connection) assumes connectivity. Offline playback requires a second access mode that trades revocation speed for availability.
 
-**Offline lease issuance:** When a client requests offline access for specific tracks, the app server issues a lease — a bundle of `K_blob` values sealed to a device-bound key:
+**Offline lease issuance:** When a client requests offline access for specific tracks, the app server builds a lease and the client seals it locally with a device-bound key:
 
 ```
 Client requests offline access for tracks [hash_1, hash_2, ..., hash_n]
@@ -153,20 +153,27 @@ App server:
          account_id: "alice"
      }
 
-  5. Seal to device key:
+  5. Return lease to client over authenticated channel
+     // The lease endpoint (POST /offline/lease) MUST be served
+     // over HTTPS, as the response contains plaintext K_blob values.
+     // The client is authenticated via session token.
 
-     sealed_lease = XChaCha20-Poly1305(device_key, lease)
-     // device_key is a 256-bit symmetric key held in the platform keystore:
-     //   iOS: Secure Enclave via Keychain
-     //   Android: Hardware-backed Keystore
-     //   Desktop: OS credential store (less secure)
-     // The keystore performs the AEAD operation internally where
-     // hardware support exists; the primitive may be AES-256-GCM
-     // on platforms whose secure element does not support XChaCha20.
-     // Either AEAD is acceptable — the security requirement is that
-     // device_key never leaves the keystore in plaintext.
+Client (on device):
+  6. Seal lease to device keystore for at-rest protection:
 
-  6. Return sealed_lease to client
+     sealed_lease = AEAD_Seal(device_key, lease)
+     // device_key is a 256-bit symmetric key managed by the
+     // platform keystore:
+     //   iOS: Keychain (hardware-backed where available; non-exportable)
+     //   Android: Hardware-backed Keystore (AES-256-GCM; non-exportable)
+     //   Desktop: OS credential store (key may be returned to user-space; less secure)
+     // On mobile, the keystore performs the AEAD operation internally
+     // and the client holds only an opaque key handle. On desktop,
+     // the app may retrieve device_key for the operation and MUST
+     // zeroize it from process memory immediately after use.
+     // The primitive depends on the platform (typically AES-256-GCM).
+
+  7. Store sealed_lease on disk
 ```
 
 **Offline playback flow:**
