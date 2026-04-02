@@ -270,7 +270,7 @@ Rejected because it destroys global content-addressing. The same track would hav
 | Offline leases | N/A | 30-day TTL, device-bound keys |
 | Device attestation | N/A | iOS Secure Enclave, Android Keystore |
 | Audio watermarking | N/A | Per-account |
-| App server key store | N/A | KMS/HSM-protected |
+| App server key store | N/A | KMS/HSM-protected; `server_secret` in HSM with periodic rotation |
 
 For PoC, no action items from this ADR are required. Content-addressed blobs are stored and served as plaintext. The CDN protocol, payment channels, and caching are unchanged regardless of whether encryption is applied at the application layer. This ADR documents the post-PoC design so that the protocol and contract interfaces remain forward-compatible.
 
@@ -292,5 +292,12 @@ For PoC, no action items from this ADR are required. Content-addressed blobs are
 - A hacked client can still extract `K_blob` for tracks it plays in real-time. This is inherent to any scheme where the client produces plaintext output — equivalent to the "analog hole" in DRM systems.
 - Epoch key rotation creates a hard dependency on the persistent connection. If the WebSocket drops, the client cannot decrypt new tracks until it reconnects and receives the current epoch key. The client should cache the most recent epoch key in memory (not disk) to survive brief disconnects within the same epoch.
 - `server_secret` (the epoch key derivation root) is a critical secret. Rotation of `server_secret` invalidates all outstanding epoch keys and sealed envelopes, forcing all clients to re-request. Rotation should be infrequent and coordinated.
+- **No forward secrecy for epoch keys.** Because `epoch_key = BLAKE3_KDF(server_secret, epoch_id)` is purely deterministic, compromising `server_secret` retroactively exposes every past epoch key and every future epoch key until rotation. An attacker who obtains `server_secret` and has recorded sealed envelopes can unwrap every `K_blob` ever delivered via the epoch key mechanism. This is the most significant cryptographic limitation of the current design. Production deployments MUST mitigate this with the following complementary measures:
+
+  1. **HSM-backed derivation.** Store `server_secret` in a hardware security module (AWS CloudHSM, Azure Managed HSM, GCP Cloud HSM) or KMS with a policy that permits BLAKE3_KDF derivation but never exports the raw secret. This reduces the attack surface to HSM API access control rather than secret exfiltration.
+  2. **Periodic `server_secret` rotation with epoch overlap.** Rotate `server_secret` on a fixed schedule (e.g., every 24–72 hours). During rotation, the app server derives epoch keys from both the outgoing and incoming secrets for one epoch period, allowing clients with in-flight envelopes to still decrypt. After the overlap window, the old secret is destroyed. This bounds the blast radius of a compromise to the rotation interval rather than the full lifetime of the service. The rotation cadence is a tradeoff: shorter intervals reduce exposure but increase coordination cost (all app server instances must converge on the new secret within one epoch).
+  3. **Append-only key rotation log.** The app server maintains a signed, append-only log of `server_secret` rotation events (secret hash, rotation timestamp, operator identity). This does not prevent compromise but provides auditability — after an incident, the log establishes which secrets were active during which periods, bounding the forensic scope.
+
+  For the PoC, none of these mitigations apply (E2E encryption is not implemented). The deterministic derivation is acceptable for the design document because it is simple, stateless, and sufficient for the threat model where the app server is trusted infrastructure. Forward secrecy becomes critical when the production deployment handles real subscriber content.
 - Offline leases trade revocation speed for availability: a canceled subscription may retain offline playback for up to the lease TTL (default 30 days). This is an accepted industry-standard tradeoff.
 - Offline leases persist K_blob values on disk (sealed to device key), increasing the blast radius of a device compromise from one epoch's tracks to the full lease (up to 500 tracks). Device attestation and watermarking are operational mitigations, not cryptographic guarantees.
