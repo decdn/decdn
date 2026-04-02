@@ -137,10 +137,10 @@ sequenceDiagram
     participant W as Watched Party (Node)
     participant T as Watchtower
 
-    W->>T: WatchtowerRegister {channel_id, deposit, counterparty, latest_voucher, fee_offer}
-    T->>W: WatchtowerAccept {accepted, fee_rate, terms}
+    W->>T: WatchtowerRegister {channel_id, deposit, counterparty, latest_voucher}
+    T->>W: WatchtowerAccept {accepted, fee}
 
-    loop Every voucher (at negotiated interval, default 1 MB)
+    loop Every voucher (at voucher interval from ADR 003, default 1 MB)
         W->>T: VoucherUpdate {channel_id, amount, nonce, signature}
         T->>W: VoucherAck
     end
