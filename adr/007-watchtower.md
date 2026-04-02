@@ -73,7 +73,7 @@ sequenceDiagram
     W->>T: WatchtowerRegister {channel_id, deposit, counterparty, latest_voucher}
     T->>W: WatchtowerAccept {accepted, fee}
 
-    loop Every voucher (at voucher interval from ADR 003; default 1 MB)
+    loop Every voucher (at voucher interval from ADR 003, default 1 MB)
         W->>T: VoucherUpdate {channel_id, amount, nonce, signature}
         T->>W: VoucherAck
     end
@@ -113,7 +113,7 @@ The node software connects to configured watchtowers at startup and registers ch
 
 The fee is `max(0.1% × deposit, 0.50 USDC)`. At the minimum deposit of 1 USDC, the 0.1% rate yields $0.001 — far below gas costs — so the floor applies. For a 100 USDC deposit, the 0.1% rate yields $0.10, still below the floor. The floor becomes non-binding at deposits above 500 USDC.
 
-The fee is deterministic and non-negotiable: both parties compute it from the `deposit` field in `WatchtowerRegister`. The `WatchtowerAccept` response includes the computed `fee` so the watched party can verify the watchtower applied the formula correctly. If the values disagree, the watched party should reject the watchtower and select an alternative.
+The fee is deterministic and non-negotiable (per 30-day monitoring period): both parties compute it from the `deposit` field in `WatchtowerRegister`. The `WatchtowerAccept` response includes the computed `fee` so the watched party can verify the watchtower applied the formula correctly. If the values disagree, the watched party should reject the watchtower and select an alternative.
 
 **Payment method:** The watched party pays via a direct USDC transfer (signed ERC-20 `transfer` or `permit` + `transferFrom`) to the watchtower's Ethereum address at registration time. No contract modification needed. The watchtower verifies payment on-chain before accepting the registration.
 
