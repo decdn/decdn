@@ -199,11 +199,11 @@ The `BuybackBurner` contract converts accumulated USDC fees into TOKEN and burns
 | Minimum accumulation before buyback (`minBuybackAmount`) | N/A (execution disabled) | 100 USDC | Yes |
 | Maximum single buyback (`maxBuybackAmount`) | N/A (execution disabled) | 10,000 USDC | Yes |
 | Slippage tolerance (`slippageBps`) | N/A (execution disabled) | 2% (200 bps) | Yes |
-
-Parameter name `slippageBps` corresponds to `setSlippageTolerance(uint256 bps)` in the [IBuybackBurner interface](003-payments.md).
 | DEX (`dexPool`) | N/A (execution disabled) | Uniswap V3 TOKEN/USDC pool | Yes (pool address) |
 | Execution | Disabled — fees accumulate only | Governance-triggered or automated keeper | — |
 | Execution activation | N/A | Requires governance vote to enable | — |
+
+> Parameter name `slippageBps` corresponds to `setSlippageTolerance(uint256 bps)` in the [IBuybackBurner interface](003-payments.md).
 
 The minimum accumulation threshold is reduced from 1,000 to 100 USDC because at early production fee volumes, accumulating 1,000 USDC in the buyback allocation takes years even with dozens of active nodes.
 

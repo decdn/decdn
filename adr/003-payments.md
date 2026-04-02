@@ -388,6 +388,7 @@ constructor(address usdc_, address treasury_, uint256 disputeWindow_) {
     treasury = treasury_;
     disputeWindow = disputeWindow_;   // PoC default: 172800 (48 hours)
     feePercentage = 300;              // 3% (300 bps)
+    discountedFeePercentage = 150;    // 1.5% (150 bps)
     maxVoucherIntervalMb = 1;         // 1 MB
     maxChannelDuration = 7776000;     // 90 days
 }
@@ -426,6 +427,12 @@ event ChannelExpiredReclaimed(
     uint256 deposit
 );
 
+event ChannelToppedUp(
+    bytes32 indexed channelId,
+    uint256 additionalDeposit,
+    uint256 newDeposit
+);
+
 // Governance events (emitted by setRateBounds)
 event RateBoundsUpdated(
     uint256 newDeliveryFloor,
@@ -439,7 +446,7 @@ event RateBoundsUpdated(
 - `closeChannel` → requires status `Open`. **Callable by `channel.client` or `channel.provider` only** (`require(msg.sender == channel.client || msg.sender == channel.provider)`). Sets status to `Closing`, records voucher, emits `ChannelCloseInitiated`. No fund transfers. Third parties (including watchtowers) cannot initiate a close — they act only via `disputeChannel` (during the dispute window) or `settleChannel` (after expiration). **Zero-voucher close:** when the provider calls with `amount == 0`, `nonce == 0`, an empty signature (`signature.length == 0`), and `channel.claimedNonce == 0`, the voucher signature is not verified — this is the provider's mechanism for releasing channels where no vouchers were ever signed. Since voucher nonces start at 1, any real voucher has a strictly higher nonce than the recorded `claimedNonce=0`, so `disputeChannel` works normally. The dispute window applies; a client or watchtower holding a real voucher can dispute.
 - `disputeChannel` → requires status `Closing` and `block.timestamp < disputeDeadline`. Callable by any address holding a valid voucher with a strictly higher nonce. Updates `claimedAmount`, emits `ChannelDisputed`. No fund transfers. Unrestricted caller access is intentional: watchtowers and other third parties must be able to submit higher-nonce vouchers on behalf of an offline party during the dispute window.
 - `settleChannel` → requires status `Closing` and `block.timestamp >= disputeDeadline`. Callable by any address. Computes fee on final `claimedAmount`, transfers funds to provider/treasury/client, sets status to `Closed`, emits `ChannelSettled`.
-- `reclaimExpired` → requires status `Open` and `block.timestamp >= expiresAt`. Returns the full deposit to the client (no fee deducted — no voucher was submitted). Sets status to `Closed`, emits `ChannelExpiredReclaimed`. Callable by the client or the provider. Regardless of caller, the full deposit is returned to `channel.client` — the provider cannot claim funds via this path. This ensures abandoned channels where both parties are absent can be cleaned up by the provider to free on-chain state.
+- `reclaimExpired` → requires status `Open` and `block.timestamp >= expiresAt`. Returns the full deposit to the client (no fee deducted — no voucher was submitted). Sets status to `Closed`, emits `ChannelExpiredReclaimed`. Callable by the client or the provider. Regardless of caller, the full deposit is returned to `channel.client` — the provider cannot claim funds via this path. This ensures abandoned channels where the client is absent can be cleaned up by the provider to free on-chain state.
 
 **Safety bounds (hardcoded):**
 
