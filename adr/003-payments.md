@@ -112,7 +112,7 @@ The protocol fee is calculated **at final settlement**, after the dispute window
    - Treasury receives: `fee = claimedAmount × feePercentage / 10000`
    - Client receives refund: `deposit - claimedAmount`
 
-   The treasury address receives the full protocol fee as a single transfer. The internal allocation across the four buckets (development fund, bounties, ecosystem grants, buyback — see [ADR 004, Fee Allocation](004-tokenomics.md#fee-allocation)) is handled outside the payment channel contract: manually by the admin key holder in the PoC, and via governance-directed disbursement in production.
+   The treasury address receives the full protocol fee as a single transfer. The internal allocation across the four buckets (development fund, bug bounties & audits, ecosystem grants, token buyback & burn — see [ADR 004, Fee Allocation](004-tokenomics.md#fee-allocation)) is handled outside the payment channel contract: manually by the admin key holder in the PoC, and via governance-directed disbursement in production.
 
 This means a dispute that increases the settlement amount (e.g., from 50 USDC to 80 USDC) automatically increases the protocol fee (from 1.50 USDC to 2.40 USDC at 3%). The fee is always computed once, on the final settled amount — never on intermediate values and never more than once per channel.
 
