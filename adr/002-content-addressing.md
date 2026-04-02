@@ -15,6 +15,8 @@ The protocol is content-agnostic. It stores and delivers arbitrary blobs with no
 
 Blob identity is intrinsic to the content: the same bytes always produce the same hash, regardless of which node holds them. Clients verify every received blob against its known hash — no node can serve corrupted data without immediate detection.
 
+When end-to-end encryption is active ([ADR 006](006-e2e-encryption.md)), the BLAKE3 hash covers the ciphertext — not the plaintext. The origin encrypts content once at ingest, producing `nonce || AEAD output`, and the hash is computed over that entire byte sequence. This preserves global content-addressing: one ciphertext, one hash, one cached copy for all clients. CDN nodes never see or hash plaintext. When encryption is not active, the hash covers the raw blob bytes directly.
+
 The mapping from hash to the actual backing storage location (e.g., which S3 key, which local file path) is internal to each origin-backed node and never exposed to the network. Other nodes and clients have no knowledge of a node's backend — they only know hashes and NodeIds.
 
 BLAKE3 is iroh's native hash function, so there is no translation layer between blob IDs and the transport layer.
@@ -26,6 +28,7 @@ BLAKE3 is iroh's native hash function, so there is no translation layer between 
 - Delivery verification is inherent: hash mismatch on receipt is both detection and proof. No separate proof-of-delivery oracle is needed.
 - Content is location-independent: a blob from any node is interchangeable as long as the hash matches. This makes the entire delivery layer transparent to clients.
 - Deduplication is automatic: two nodes holding identical bytes share one logical blob identity.
+- Content-addressing composes cleanly with encryption: hashing ciphertext means the CDN layer is encryption-agnostic — nodes cache, deliver, and verify blobs identically regardless of whether the content is encrypted. See [ADR 006](006-e2e-encryption.md) for the encryption scheme.
 - The hash serves as the slash evidence primitive: a client submitting a slash claim provides the expected hash and the received bytes; the mismatch is verifiable on-chain (via a chunk Merkle proof for the PoC, since BLAKE3 is not an EVM precompile). See [ADR 004](004-tokenomics.md#challenge-bond) for challenge bond requirements and [ADR 005](005-protocol.md#cdnprobev1--latency-probe) for slashing evidence mechanisms.
 - The origin-backed node's backing storage is completely opaque to the network — nobody can discover the origin URL or bypass the payment layer.
 
