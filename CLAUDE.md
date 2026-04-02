@@ -17,30 +17,26 @@ This repo uses a VS Code devcontainer with a firewall-isolated environment. The 
 
 ### Working with ADRs
 
-ADRs in `adr/` are the primary deliverables right now. `adr/architecture.md` is the living overview; numbered files (`000-language.md`, `001-network.md`, etc.) cover individual decisions.
+ADRs in `adr/` are the primary deliverables right now. `adr/architecture.md` is the living overview and index of all decisions; numbered files (`000-language.md` through `011-content-takedown.md`) cover individual decisions.
 
 **Conventions:**
 - File naming: `NNN-topic.md` (zero-padded 3-digit prefix, next number is 012)
 - When changing any ADR, check for cross-ADR consistency — terms, parameters, and protocol names must match across all ADRs and `architecture.md`. This is the most common source of bugs in this repo.
 - `architecture.md` must be updated whenever an ADR changes a user-visible summary point
 
+**Consistency checks when editing ADRs:**
+- Grep for renamed terms/parameters across all `adr/*.md` files
+- Verify ALPN strings, message type names, and protocol version identifiers match `005-protocol.md`
+- Verify token names (TOKEN/USDC), contract references, and fee parameters match `003-payments.md` and `004-tokenomics.md`
+- Confirm `architecture.md` summary still reflects any changed ADR
+
 ### Build and Test (once implementation begins)
 
 ```bash
-cargo build                          # build all crates
-cargo clippy                         # lint (rust-analyzer runs this on save)
-cargo test                           # run all tests
-cargo nextest run                    # run tests with cargo-nextest (preferred)
-cargo nextest run -p protocol        # run tests for a single crate
-cargo nextest run test_name          # run a single test by name
-cargo watch -x test                  # re-run tests on file change
-```
-
-### Formatting
-
-```bash
-cargo fmt                            # format all code
-cargo fmt -- --check                 # check formatting without modifying
+cargo build && cargo clippy          # build + lint
+cargo nextest run                    # test (preferred over cargo test)
+cargo nextest run -p protocol        # single crate
+cargo fmt -- --check                 # check formatting
 ```
 
 ## Architecture
