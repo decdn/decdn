@@ -155,11 +155,16 @@ App server:
 
   5. Seal to device key:
 
-     sealed_lease = encrypt(device_key, lease)
-     // device_key lives in platform keystore:
+     sealed_lease = XChaCha20-Poly1305(device_key, lease)
+     // device_key is a 256-bit symmetric key held in the platform keystore:
      //   iOS: Secure Enclave via Keychain
      //   Android: Hardware-backed Keystore
      //   Desktop: OS credential store (less secure)
+     // The keystore performs the AEAD operation internally where
+     // hardware support exists; the primitive may be AES-256-GCM
+     // on platforms whose secure element does not support XChaCha20.
+     // Either AEAD is acceptable — the security requirement is that
+     // device_key never leaves the keystore in plaintext.
 
   6. Return sealed_lease to client
 ```
