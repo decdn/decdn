@@ -87,7 +87,7 @@ flowchart TD
     EWMA1 --> FINAL["final_score =<br/>0.7 * local + 0.3 * network"]
     EWMA2 --> FINAL
 
-    FINAL --> CLAMP["Clamped: max +/-0.05 per report"]
+    FINAL --> CLAMP["Clamp EWMA delta: max ±0.05 per report"]
     CLAMP --> DECAY["Decay toward 0.5<br/>10%/week without data"]
 ```
 
@@ -158,6 +158,8 @@ Scores converge to 0.5 asymptotically, reaching within 0.05 of neutral after ~30
 ### 8. Score Clamping
 
 A single reputation report (local or network) can move a node's score by at most 0.05 in either direction. Prevents one bad interaction from destroying a good node or one fake report from inflating a sybil.
+
+**Interaction with EWMA:** The clamp applies to the delta produced by the EWMA update — compute the EWMA result, then cap the change at ±0.05. For local scores (alpha=0.1), the EWMA itself limits deltas to `0.1 × |interaction_score − local_score|`, so the clamp only binds when the score gap exceeds 0.5 (e.g., a node at 0.9 receiving a 0.0 interaction). For network scores, high-weight reporters (alpha up to 0.25) can produce EWMA deltas up to 0.25, making the clamp the primary rate limiter — this is intentional, ensuring no single report, however credible, moves a score by more than 0.05.
 
 **Selection clamp:** Independently of per-report clamping, the node selection formula in [ADR 001](001-network.md#node-selection-algorithm) clamps reputation to `max(reputation, 0.1)` to avoid division by zero. Nodes with reputation below 0.1 are scored identically (100× penalty vs. a perfect node) — effectively unselectable but not blacklisted.
 
