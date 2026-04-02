@@ -358,7 +358,7 @@ The app server is a traditional web service operated by the content provider (e.
 
 - Stores blob encryption keys (`K_blob`) received from the origin at ingest time
 - Authenticates client sessions and validates subscription status
-- Delivers epoch keys over an authenticated persistent connection (WebSocket or SSE)
+- Delivers epoch keys over an authenticated persistent connection (WebSocket or SSE); signals `server_secret` rotation via `epoch_key_revoked` events on the same connection
 - Issues sealed envelopes (`crypto_box_seal`) containing wrapped `K_blob` on play requests
 - Builds and returns offline playback leases (client seals locally to device keystore)
 
