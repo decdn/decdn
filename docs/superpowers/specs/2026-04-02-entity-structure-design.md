@@ -83,8 +83,19 @@ This avoids the Swiss Verein member-register problem: Swiss law expects Vereins 
 ### Board Composition (Pre-Token)
 
 - 2-3 founders as board members
-- 1 Swiss-resident director (service provider, ~$5-8K/yr) — required for Zug registration
 - Optional: 1 independent advisor for credibility
+
+**Swiss residency requirement:** Swiss Civil Code Art. 60-79 imposes no residency requirement on Vorstand members. Whether one is needed depends on registration status:
+
+| Registration Status | Residency Requirement | Cost |
+|---|---|---|
+| Unregistered Verein | None — entire board can be non-resident | $0 |
+| Registered + domicile service | Swiss-domiciled representative via law firm or trust company (post-2023 corporate reform) | ~CHF 1-3K/yr |
+| Registered + resident director | Swiss-resident board member or service provider | ~CHF 5-8K/yr |
+
+Registration is required only if the Verein operates a commercial enterprise (Art. 61 para. 2 ZGB). A Verein that holds treasury and issues grants is likely not commercial, but many crypto Vereins in Zug voluntarily register for credibility and banking access.
+
+**Recommendation:** Voluntarily register and use a domicile service (~CHF 1-3K/yr) rather than a resident director (~CHF 5-8K/yr). Swiss counsel should confirm whether banking (Sygnum, SEBA) and SRO membership require a resident board member in practice, even if not legally mandated.
 
 ### Treasury Management
 
@@ -113,14 +124,14 @@ The Verein holds the TOKEN treasury post-TGE after the GmbH transfers sale proce
 |---|---|---|
 | Board president | Founder 1 | Verein governance, signing authority |
 | Board member | Founder 2 | Technical oversight, treasury co-signer |
-| Swiss director | Service provider | Local compliance, registered address |
+| Domicile representative | Law firm or trust company | Registered address, Swiss-domiciled signatory (if registered) |
 | AML officer | Outsourced or board member | KYC process, suspicious activity reporting |
 | Legal counsel | Swiss crypto law firm (MME, Lenz & Staehelin, Wenger Vieli) | Formation, FINMA inquiry, ongoing |
 
 ### Costs
 
 - **Setup:** ~CHF 15-25K (legal + formation)
-- **Annual:** ~CHF 15-25K (director, SRO fees, registered office, accounting)
+- **Annual:** ~CHF 10-20K (domicile service, SRO fees, registered office, accounting)
 
 ---
 
@@ -223,7 +234,7 @@ Purpose-built as a single-purpose vehicle for token issuance. Isolates token sal
 ### Directors
 
 - 1-2 directors, overlapping with Verein board members
-- At least one Swiss-resident director (can share the service provider with Verein)
+- Swiss-domiciled representative required for registration (can share the Verein's domicile service)
 
 ### Compliance
 
@@ -431,12 +442,12 @@ Token                                                    xxx> launch
 |---|---|
 | Labs formation + legal | $3-5K |
 | Verein formation + legal | CHF 20-30K |
-| Swiss director (annual) | CHF 5-8K |
+| Verein domicile service (annual) | CHF 1-3K |
 | Verein SRO membership (annual) | CHF 2-5K |
 | Verein registered office | CHF 3-5K |
 | Labs registered agent + franchise tax | $1-2K |
 | Inter-entity agreements (legal) | $5-10K |
-| **Total Year 1 (pre-TGE)** | **~$40-65K** |
+| **Total Year 1 (pre-TGE)** | **~$36-60K** |
 
 **TGE year (when GmbH is formed):**
 
@@ -453,11 +464,11 @@ Token                                                    xxx> launch
 
 | Item | Cost |
 |---|---|
-| Verein (director + SRO + office + accounting) | CHF 15-25K |
+| Verein (domicile + SRO + office + accounting) | CHF 10-20K |
 | GmbH (dormant: registered office + minimal accounting) | CHF 1-2K |
 | Labs (agent + tax + bookkeeping) | $5-10K |
 | Legal retainer (all entities) | $10-20K |
-| **Total annual** | **~$31-57K** |
+| **Total annual** | **~$26-52K** |
 
 Note: GmbH share capital (CHF 20K) is recoverable if the GmbH is dissolved after TGE. Dissolution costs ~CHF 2-5K.
 
