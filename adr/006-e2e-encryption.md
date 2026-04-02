@@ -94,7 +94,9 @@ sequenceDiagram
     Note over C: no epoch 44 key — cannot decrypt new content
 ```
 
-**Rotation signaling:** When the app server rotates `server_secret` (see periodic rotation mitigation under [Consequences](#consequences)), it sends an `epoch_key_revoked` event on the persistent connection to notify clients that outstanding epoch keys are being invalidated:
+##### Rotation signaling
+
+When the app server rotates `server_secret` (see periodic rotation mitigation under [Consequences](#consequences)), it sends an `epoch_key_revoked` event on the persistent connection to notify clients that outstanding epoch keys are being invalidated:
 
 ```
 epoch_key_revoked = {
@@ -128,7 +130,7 @@ sequenceDiagram
 2. Any sealed envelopes referencing `epoch_id <= last_epoch_id` are stale — the client must re-request them via `POST /play` to obtain envelopes wrapped with the new epoch key
 3. Wait for the immediately following `epoch_key` push before attempting to decrypt new content
 
-**Disconnected clients:** A client whose persistent connection dropped before receiving the `epoch_key_revoked` event will discover the rotation when it attempts to unwrap a sealed envelope using a stale epoch key: the XChaCha20-Poly1305 AEAD decryption will fail (authentication tag mismatch). On AEAD failure during epoch key unwrapping, the client SHOULD reconnect to the epoch key stream and re-request the affected envelope via `POST /play`. This is not a new failure mode — a dropped WebSocket already prevents the client from receiving new epoch keys (see above), so the client must reconnect regardless.
+**Disconnected clients:** A client whose persistent connection dropped before receiving the `epoch_key_revoked` event will discover the rotation when it attempts to unwrap a sealed envelope using a stale epoch key: the XChaCha20-Poly1305 AEAD decryption will fail (authentication tag mismatch). On AEAD failure during blob key unwrapping, the client SHOULD reconnect to the epoch key stream and re-request the affected envelope via `POST /play`. This is not a new failure mode — a dropped WebSocket already prevents the client from receiving new epoch keys (see above), so the client must reconnect regardless.
 
 ### Client Decryption Flow
 
@@ -328,7 +330,7 @@ For PoC, no action items from this ADR are required. Content-addressed blobs are
 - The app server's key store (holding all `K_blob` values) is a high-value target. It must be protected with a KMS or HSM in production. Compromise of the key store exposes all content.
 - A hacked client can still extract `K_blob` for tracks it plays in real-time. This is inherent to any scheme where the client produces plaintext output — equivalent to the "analog hole" in DRM systems.
 - Epoch key rotation creates a hard dependency on the persistent connection. If the WebSocket drops, the client cannot decrypt new tracks until it reconnects and receives the current epoch key. The client should cache the most recent epoch key in memory (not disk) to survive brief disconnects within the same epoch.
-- `server_secret` (the epoch key derivation root) is a critical secret. Rotation of `server_secret` invalidates all outstanding epoch keys and sealed envelopes, forcing all clients to re-request. Rotation is signaled via the `epoch_key_revoked` event on the persistent connection (see [Rotation signaling](#key-wrapping-protocol)); disconnected clients fall back to AEAD-failure-triggered reconnection. Rotation should be infrequent and coordinated.
+- `server_secret` (the epoch key derivation root) is a critical secret. Rotation of `server_secret` invalidates all outstanding epoch keys and sealed envelopes, forcing all clients to re-request. Rotation is signaled via the `epoch_key_revoked` event on the persistent connection (see [Rotation signaling](#rotation-signaling)); disconnected clients fall back to AEAD-failure-triggered reconnection. Rotation should be infrequent and coordinated.
 - **No forward secrecy for epoch keys.** Because `epoch_key = BLAKE3_KDF(server_secret, epoch_id)` is purely deterministic, compromising `server_secret` retroactively exposes every past epoch key and every future epoch key until rotation. An attacker who obtains `server_secret` can derive any epoch key. Note that sealed envelopes are additionally protected by `crypto_box_seal` to the client's public key, so recovering `K_blob` from a recorded envelope requires both `server_secret` (to derive the epoch key) and the client's private key (to unseal the envelope). However, an attacker who compromises the app server — the most likely scenario for `server_secret` exposure — may also have access to the `K_blob` key store directly, bypassing the envelope path entirely. This is the most significant cryptographic limitation of the current design. Production deployments MUST mitigate this with the following complementary measures:
 
   1. **HSM-backed derivation.** Store `server_secret` in a hardware security module (AWS CloudHSM, Azure Managed HSM, GCP Cloud HSM) or cloud KMS as a non-exportable key, and derive `epoch_key` values inside that service using a supported PRF/KDF. Most cloud KMS products do not natively support BLAKE3; if BLAKE3 is required, use an HSM that can run the BLAKE3-based KDF internally. Otherwise, substitute a KMS-supported primitive (e.g., HMAC-SHA256 or HKDF-SHA256 over `epoch_id`) for the production derivation path. This reduces the attack surface to HSM/KMS API access control rather than secret exfiltration.
