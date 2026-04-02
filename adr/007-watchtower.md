@@ -201,6 +201,8 @@ These three items future-proof the contract and node software for watchtower int
 
 **Production:** Prepaid escrow with proof-of-monitoring. The watched party deposits the monitoring fee into a `WatchtowerEscrow` contract. The watchtower must submit periodic signed heartbeats (e.g., every 6 hours) proving it is monitoring the chain — each heartbeat includes the latest `ChannelCloseInitiated` event block number the watchtower has processed. If the watchtower misses N consecutive heartbeats (default: 3, i.e., 18 hours), the watched party can reclaim the escrowed fee. On successful completion of the monitoring period (no missed heartbeats, or a dispute was correctly submitted), the watchtower claims the escrowed fee. This provides on-chain accountability without requiring watchtower staking — the escrowed fee itself is the watchtower's bond.
 
+**Limitation:** heartbeats prove chain-monitoring liveness only — they do not attest to voucher state. A watchtower that lost its voucher database would continue submitting valid heartbeats but would be unable to dispute a stale close. This gap is addressed by off-chain liveness testing (see [Fee extraction without service](#fee-extraction-without-service)) and by the voucher resync protocol on reconnection (see [Voucher state desynchronisation](#voucher-state-desynchronisation)), not by the heartbeat mechanism itself.
+
 ## Attack Vectors
 
 ### Watchtower bribery
