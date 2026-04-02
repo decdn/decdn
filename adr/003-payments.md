@@ -84,6 +84,8 @@ At the default 1 MB cadence, a 10 GB blob requires 10,000 vouchers — each invo
 
 Even the worst case (1024 MB at ceiling rate) exposes $1.024 — well below the recommended 10 USDC minimum deposit.
 
+Voucher interval negotiation is complemented by per-node `max_blob_size` limits ([ADR 005](005-protocol.md#error-handling-and-retry-semantics)): while interval negotiation reduces per-voucher overhead for large blobs, `max_blob_size` allows nodes to refuse blobs that would create unacceptable resource pressure (cache exhaustion, extended origin pulls) regardless of voucher cadence.
+
 ### Concurrent Streams
 
 When multiple streams share a single payment channel, they share a **single cumulative voucher counter**. The rules:
