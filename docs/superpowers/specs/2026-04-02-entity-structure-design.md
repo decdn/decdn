@@ -2,23 +2,39 @@
 
 ## Overview
 
-Two legally independent entities, economically linked through service agreements and token grants:
+Three entities: two Swiss (Verein + GmbH subsidiary) and one US (Delaware C-Corp), economically linked through service agreements, token grants, and a parent-subsidiary relationship:
 
-1. **deCDN Verein** (Swiss Association, Zug) — protocol stewardship, TOKEN issuance, treasury, governance transition
-2. **deCDN Labs Inc.** (Delaware C-Corp) — product development, equity fundraising, commercial operations
+1. **deCDN Verein** (Swiss Association, Zug) — protocol stewardship, treasury, governance transition
+2. **deCDN Token GmbH** (Swiss LLC, Zug) — token issuance SPV, wholly owned by Verein
+3. **deCDN Labs Inc.** (Delaware C-Corp) — product development, equity fundraising, commercial operations
 
-No ownership link between entities. Founding team sits on both sides in different legal capacities. All inter-entity transactions at arm's length.
+The Verein owns the GmbH. The Verein and Labs have no ownership link — they are legally separate, economically linked through service agreements. Founding team sits on both sides in different legal capacities. All inter-entity transactions at arm's length.
+
+DAO governance follows **Pattern A (Legal Fiction Separation)**: Verein's legal members remain a small identified group, while TOKEN holders govern permissionlessly via on-chain Governor. The board is contractually obligated to execute DAO decisions.
 
 ```
-+-----------------------------+       +-----------------------------+
-|  deCDN Verein (Swiss Assn)  |       |  deCDN Labs Inc. (DE C-Corp)|
-|                             |       |                             |
-|  - Protocol stewardship     |       |  - Product development      |
-|  - TOKEN issuance & treasury|<----->|  - SDKs, tooling, apps      |
-|  - Governance transition    |service |  - Equity fundraising       |
-|  - Grants program           |  agmt |  - Commercial partnerships  |
-|  - Ecosystem fund           |       |  - Team employment          |
-+-----------------------------+       +-----------------------------+
++-----------------------------+
+|  deCDN Verein (Swiss Assn)  |
+|                             |
+|  - Protocol stewardship     |
+|  - Treasury (post-TGE)      |
+|  - Governance transition    |
+|  - Grants program           |
+|  - Ecosystem fund           |
++-----------------------------+
+       |              |
+       | owns         | service agmt
+       v              v
++-----------------+   +-----------------------------+
+| deCDN Token     |   |  deCDN Labs Inc. (DE C-Corp)|
+| GmbH (SPV)     |   |                             |
+|                 |   |  - Product development      |
+| - Token sale    |   |  - SDKs, tooling, apps      |
+| - KYC for sale  |   |  - Equity fundraising       |
+| - Sale proceeds |   |  - Commercial partnerships  |
+| - Dormant after |   |  - Team employment          |
+|   TGE           |   |                             |
++-----------------+   +-----------------------------+
 ```
 
 ---
@@ -42,13 +58,27 @@ Verein chosen over Stiftung (Foundation) because:
 - Registration in Zug Commercial Register
 - No minimum capital requirement
 
-### Governance (Phased)
+### Governance (Phased) — Pattern A: Legal Fiction Separation
+
+The Verein's legal members remain a small, identified group (founders + Swiss director + key contributors). TOKEN holders are NOT formal Verein members under Swiss law. Instead, they govern via on-chain Governor, and the Verein board is contractually obligated to execute DAO decisions.
+
+This avoids the Swiss Verein member-register problem: Swiss law expects Vereins to know their members, but TOKEN holders are pseudonymous on-chain addresses. Pattern A resolves this by keeping legal membership small and identified, while binding the board to follow on-chain governance.
+
+**Verein articles must include:** "The board shall implement any governance proposal that passes the on-chain quorum threshold, unless doing so would violate Swiss law or the Verein's articles."
 
 | Phase | Who Governs | How |
 |---|---|---|
 | Pre-token (now to launch) | Founding board (Vorstand), 3 members | Majority vote, monthly meetings |
 | Token launch to 12 months | Board + TOKEN advisory vote | Board retains veto, token holders vote on grants/parameters |
-| Mature (12+ months) | TOKEN holders via on-chain Governor | Board becomes executor of DAO decisions, no veto |
+| Mature (12+ months) | TOKEN holders via on-chain Governor | Board executes DAO decisions as legal obligation, no veto |
+
+**Legal members (identified, KYC'd):** Founders, Swiss director, key contributors — small group with Swiss legal standing.
+
+**TOKEN holders (pseudonymous):** Vote on-chain, no KYC required, no Swiss legal standing as Verein members — governance power is economic and contractual, not statutory.
+
+**Risks and mitigations:**
+- Board ignores a DAO vote → economic pressure (reputation damage, token price impact), legal members can replace board at general assembly
+- Regulator challenges Pattern A → upgrade to Pattern B (tiered membership with formal "associate member" class for TOKEN holders) without restructuring. Articles should be drafted to support this upgrade path from day one.
 
 ### Board Composition (Pre-Token)
 
@@ -73,12 +103,9 @@ Verein chosen over Stiftung (Foundation) because:
 
 ### Token Issuance Path
 
-1. FINMA no-action letter confirming utility token classification
-2. KYC/AML via SRO-compliant process (identity verification for buyers)
-3. Public sale via launchpad or directly, with US persons excluded or Reg D only
-4. Listing: DEX immediately, CEX after sufficient liquidity
+Token issuance is handled by the **deCDN Token GmbH** (SPV), not the Verein directly. This isolates token sale risk — if a regulator reclassifies the token, liability sits in the GmbH, not the Verein. See Entity 3 section for details.
 
-TOKEN classifies as utility under FINMA guidelines because it has functional utility at launch: staking, governance voting, and fee discounts.
+The Verein holds the TOKEN treasury post-TGE after the GmbH transfers sale proceeds.
 
 ### Operational Roles
 
@@ -92,7 +119,7 @@ TOKEN classifies as utility under FINMA guidelines because it has functional uti
 
 ### Costs
 
-- **Setup:** ~CHF 20-30K (legal + formation + FINMA inquiry)
+- **Setup:** ~CHF 15-25K (legal + formation)
 - **Annual:** ~CHF 15-25K (director, SRO fees, registered office, accounting)
 
 ---
@@ -178,7 +205,74 @@ Labs also receives ~15% TOKEN allocation from the Verein (per ADR 004 team alloc
 
 ---
 
+## Entity 3: deCDN Token GmbH (Token Issuance SPV)
+
+### Legal Basis
+
+Swiss GmbH (Gesellschaft mit beschränkter Haftung), registered in Zug. Wholly owned subsidiary of the deCDN Verein.
+
+Purpose-built as a single-purpose vehicle for token issuance. Isolates token sale risk from the Verein — if a regulator reclassifies TOKEN as a security, liability sits in the GmbH, not the Verein. The Verein's treasury, grants program, and governance role are shielded.
+
+### Formation Requirements
+
+- CHF 20,000 minimum share capital (paid in at formation)
+- Verein is sole shareholder (Gesellschafter)
+- Registration in Zug Commercial Register
+- Articles of association defining single purpose: token issuance and distribution
+
+### Directors
+
+- 1-2 directors, overlapping with Verein board members
+- At least one Swiss-resident director (can share the service provider with Verein)
+
+### Compliance
+
+- **SRO membership:** Joins VQF or PolyReg (can potentially share membership with Verein, or separate — consult SRO)
+- **FINMA no-action inquiry:** Filed by the GmbH specifically, confirming TOKEN utility classification
+- **KYC/AML:** All token sale KYC handled by the GmbH, buyer data stored with SRO-compliant provider
+- **MiCA:** If selling to EU residents, crypto-asset whitepaper filed by GmbH
+
+### Token Issuance Path
+
+1. GmbH formed 4-6 weeks before planned TGE (not at project start — avoids paying for a dormant entity during development)
+2. SRO membership application
+3. FINMA no-action inquiry filed by GmbH
+4. KYC infrastructure set up (identity verification for buyers)
+5. Public sale via launchpad or directly, US persons excluded or Reg D only
+6. Listing: DEX immediately, CEX after sufficient liquidity
+7. Sale proceeds transferred to Verein treasury
+8. GmbH goes dormant or is dissolved
+
+TOKEN classifies as utility under FINMA guidelines because it has functional utility at launch: staking, governance voting, and fee discounts.
+
+### Lifecycle
+
+| Phase | Status |
+|---|---|
+| Pre-TGE development | GmbH does not exist yet |
+| 4-6 weeks before TGE | GmbH formed, SRO joined, FINMA inquiry filed |
+| TGE | GmbH conducts token sale, handles KYC |
+| Post-TGE (distribution complete) | Sale proceeds transferred to Verein |
+| Post-distribution | GmbH goes dormant (~CHF 1-2K/yr) or dissolved (zero ongoing cost) |
+
+### Costs
+
+- **Formation:** ~CHF 5-10K (legal + filing) + CHF 20,000 (share capital)
+- **Annual (active):** ~CHF 3-5K (SRO fees, registered office, accounting)
+- **Annual (dormant):** ~CHF 1-2K (registered office, minimal accounting)
+- **Dissolution:** ~CHF 2-5K (one-time)
+
+---
+
 ## Inter-Entity Relationships & Agreements
+
+### 0. Verein ↔ GmbH (Parent-Subsidiary)
+
+- Verein is sole shareholder of GmbH
+- GmbH purpose is limited to token issuance and distribution
+- GmbH directors appointed by Verein board
+- Sale proceeds flow from GmbH to Verein after TGE (via capital contribution, dividend, or intercompany loan — structure per Swiss tax counsel)
+- GmbH goes dormant or is dissolved after distribution is complete
 
 ### 1. Protocol Development Services Agreement
 
@@ -205,29 +299,42 @@ Labs also receives ~15% TOKEN allocation from the Verein (per ADR 004 team alloc
 
 ### 4. Data & Privacy Boundaries
 
-- Verein handles KYC data for token sale — stored with SRO-compliant provider, not shared with Labs
+- GmbH SPV handles KYC data for token sale — stored with SRO-compliant provider, not shared with Verein or Labs
 - Labs handles user data for its products — standard privacy policy, GDPR if serving EU users
 - No user data flows between entities
 
 ### Financial Flows
 
 ```
-                    TOKEN grant (15%, vesting)
-            +--------------------------------------+
-            |                                      v
-   +----------------+                +--------------------+
-   |  deCDN Verein  |                |  deCDN Labs Inc.   |
-   |                |----------------|                    |
-   |  TOKEN treasury|  USDC grants   |  Equity + TOKEN    |
-   |  Protocol fees |  (quarterly)   |  Product revenue   |
-   |  Token sale    |                |  VC investment     |
-   +----------------+                +--------------------+
-            |                                  |
-            v                                  v
-   Ecosystem grants                   Employee salaries
-   Bug bounties                       Infrastructure costs
-   Audits                             Product development
-   Community programs                 Business development
+                       TOKEN grant (15%, vesting)
+               +--------------------------------------+
+               |                                      v
+   +----------------+                    +--------------------+
+   |  deCDN Verein  |--------------------|  deCDN Labs Inc.   |
+   |                |   USDC grants      |                    |
+   |  TOKEN treasury|   (quarterly)      |  Equity + TOKEN    |
+   |  Protocol fees |                    |  Product revenue   |
+   +----------------+                    |  VC investment     |
+         |    ^                          +--------------------+
+         |    | sale proceeds                      |
+   owns  |    | (post-TGE)                         v
+         v    |                          Employee salaries
+   +-----------------+                   Infrastructure costs
+   | deCDN Token     |                   Product development
+   | GmbH (SPV)     |                   Business development
+   |                 |
+   | Token sale      |
+   | KYC for buyers  |
+   +-----------------+
+               |
+               v
+   +----------------+                    +--------------------+
+   | Verein spends: |                    | Labs spends:       |
+   | Ecosystem grants|                   | Employee salaries  |
+   | Bug bounties   |                    | Infrastructure     |
+   | Audits         |                    | Product dev        |
+   | Community      |                    | Business dev       |
+   +----------------+                    +--------------------+
 ```
 
 ### Conflict of Interest Management
@@ -249,13 +356,18 @@ Labs also receives ~15% TOKEN allocation from the Verein (per ADR 004 team alloc
 
 | Activity | KYC Required? | Who Handles It? |
 |----------|--------------|-----------------|
-| Public token sale | Yes | Verein via SRO membership or licensed launchpad |
-| Private/seed round (TOKEN) | Yes (accredited investor checks) | Verein + legal counsel |
+| Public token sale | Yes | GmbH SPV via SRO membership or licensed launchpad |
+| Private/seed round (TOKEN) | Yes (accredited investor checks) | GmbH SPV + legal counsel |
 | Equity round (C-Corp) | Standard investor verification | Labs + VC's own compliance |
+| Verein legal membership | Yes (small group, trivial) | Verein board |
+| DAO governance voting | No | N/A — permissionless, Pattern A |
 | Using the deCDN protocol | No | N/A — permissionless |
 | Running a node | No (just stake TOKEN) | N/A — permissionless |
+| Secondary market trading | No | Exchange handles (CEX) or nobody (DEX) |
 
-KYC is a token-sale problem, not a protocol problem. The protocol architecture is permissionless by design. The Verein handles KYC for sale events via SRO-compliant processes.
+KYC is a token-sale problem, not a protocol or governance problem. The GmbH SPV handles KYC for the primary sale event. The Verein never touches buyer personal data. On-chain governance participation (voting, proposing) requires no KYC under Pattern A — TOKEN holders are not formal Verein members.
+
+Secondary market trading is not the Verein's or GmbH's responsibility. CEXes handle their own KYC; DEX trading is permissionless.
 
 ---
 
@@ -270,7 +382,7 @@ KYC is a token-sale problem, not a protocol problem. The protocol architecture i
 
 ### Phase 2: Swiss Verein Formation (Weeks 1-8, parallel with Phase 1)
 - Engage Swiss crypto law firm
-- Draft Articles of Association
+- Draft Articles of Association (include Pattern A governance clauses + Pattern B upgrade path)
 - Engage Swiss-resident director service
 - Hold founding assembly
 - Register in Zug Commercial Register
@@ -278,56 +390,76 @@ KYC is a token-sale problem, not a protocol problem. The protocol architecture i
 
 ### Phase 3: Inter-Entity Agreements (Weeks 6-10)
 - Draft and sign service agreement, TOKEN grant agreement, trademark license
-- Both entities' counsel review
+- Both entities' counsel review (Swiss counsel for Verein, US counsel for Labs)
 - Set up multisig wallets for both entities
 
-### Phase 4: Compliance Setup (Weeks 8-14)
+### Phase 4: Verein Compliance (Weeks 8-14)
 - Verein joins SRO (VQF application takes 4-8 weeks)
-- FINMA no-action inquiry submitted (response in 4-12 weeks)
 - Labs 409A valuation if issuing options
-- Do not issue TOKEN before SRO membership and FINMA confirmation
 
-### Phase 5: Token Launch (Months 4-6+)
-- KYC infrastructure ready
+### Phase 5: GmbH Formation (4-6 weeks before TGE)
+- Form deCDN Token GmbH as Verein subsidiary
+- GmbH joins SRO (or shares Verein's membership)
+- FINMA no-action inquiry submitted by GmbH (response in 4-12 weeks)
+- KYC infrastructure set up
+- **GmbH is deferred until needed** — avoids paying for a dormant entity during development
+
+### Phase 6: Token Launch (Months 4-6+)
 - Token smart contracts audited
-- Public sale or initial distribution
+- GmbH conducts public sale with KYC
 - DEX liquidity provision
+- Sale proceeds transferred to Verein treasury
 - Governance contracts deployed (OpenZeppelin Governor per ADR 009)
+- GmbH goes dormant or begins dissolution
 
 ```
-Week:  1    2    4    6    8    10   12   14   16+
-       |----|----|----|----|----|----|----|----|---->
+Week:  1    2    4    6    8    10   12   14     TGE-6w  TGE
+       |----|----|----|----|----|----|----|----|---...----|---->
 Labs   xxxxxx done: incorporated, banking, fundraising ready
 Verein xxxxxxxxxxxxxxxxxx done: formed, registered
 Agreements        xxxxxxxxxxxx done: signed
-Compliance              xxxxxxxxxxxxxxxx done: SRO + FINMA
-Token                                    xxxxxxxx> launch
+Verein SRO              xxxxxxxxxxxxxxxx done
+GmbH                                          xxxxxxxxxx done
+Token                                                    xxx> launch
 ```
 
 ### Cost Summary
 
-**Year 1:**
+**Year 1 (pre-TGE, GmbH not yet formed):**
 
 | Item | Cost |
 |---|---|
 | Labs formation + legal | $3-5K |
 | Verein formation + legal | CHF 20-30K |
-| FINMA no-action inquiry | CHF 5-10K |
 | Swiss director (annual) | CHF 5-8K |
-| SRO membership (annual) | CHF 2-5K |
+| Verein SRO membership (annual) | CHF 2-5K |
 | Verein registered office | CHF 3-5K |
 | Labs registered agent + franchise tax | $1-2K |
 | Inter-entity agreements (legal) | $5-10K |
-| **Total Year 1** | **~$45-70K** |
+| **Total Year 1 (pre-TGE)** | **~$40-65K** |
 
-**Annual (Year 2+):**
+**TGE year (when GmbH is formed):**
+
+| Item | Cost |
+|---|---|
+| GmbH formation + legal | CHF 5-10K |
+| GmbH share capital | CHF 20,000 (recoverable on dissolution) |
+| GmbH SRO membership | CHF 2-5K |
+| FINMA no-action inquiry (filed by GmbH) | CHF 5-10K |
+| GmbH KYC infrastructure | CHF 3-5K |
+| **Additional TGE-year cost** | **~CHF 35-50K** |
+
+**Annual (Year 2+, post-TGE):**
 
 | Item | Cost |
 |---|---|
 | Verein (director + SRO + office + accounting) | CHF 15-25K |
+| GmbH (dormant: registered office + minimal accounting) | CHF 1-2K |
 | Labs (agent + tax + bookkeeping) | $5-10K |
-| Legal retainer (both entities) | $10-20K |
-| **Total annual** | **~$30-55K** |
+| Legal retainer (all entities) | $10-20K |
+| **Total annual** | **~$31-57K** |
+
+Note: GmbH share capital (CHF 20K) is recoverable if the GmbH is dissolved after TGE. Dissolution costs ~CHF 2-5K.
 
 ---
 
@@ -342,3 +474,23 @@ Token                                    xxxxxxxx> launch
 - Cheapest total cost, excellent banking in Singapore
 - Zero regulatory clarity in Panama, less institutional credibility for Western VCs
 - Rejected due to regulatory risk and VC perception concerns
+
+### BVI SPV for Token Issuance (instead of Swiss GmbH)
+- Cheaper (~$1-2K vs CHF 25-30K), no corporate tax, fast formation
+- No regulatory clarity on tokens (gray zone, legal opinion only), no MiCA passporting for EU
+- Undermines the Swiss credibility story — routing token sale through BVI looks like regulatory arbitrage
+- FINMA may view the Verein as economic issuer anyway, thinning the SPV shield
+- Rejected: cost savings (~CHF 20K) not worth losing regulatory clarity and institutional credibility
+
+### Marshall Islands / UAE ADGM DAO LLC for Governance (instead of Swiss Verein)
+- Both jurisdictions legally recognize TOKEN holders as governing members — no legal fiction needed
+- Marshall Islands: untested in courts, no banking, low institutional credibility
+- UAE/ADGM: newer framework (2023), growing credibility, good banking, purpose-built for DAOs
+- Would require three jurisdictions (DAO LLC + Swiss GmbH for token + Delaware C-Corp) — more complexity
+- Rejected in favor of Pattern A legal fiction with Swiss Verein: simpler two-jurisdiction structure (Switzerland + Delaware), industry-standard approach, upgrade path to Pattern B if needed
+
+### Pattern C: Full KYC on Governance Participants
+- Every voting address linked to verified identity, governance is permissioned
+- Fully compliant, zero legal risk
+- Kills permissionless governance — most TOKEN holders won't KYC just to vote, participation drops to near zero
+- Rejected: defeats the purpose of decentralization
