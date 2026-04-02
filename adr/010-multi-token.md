@@ -238,8 +238,8 @@ struct SignedRate {
 
 The PoC uses `StablePaymentChannel` (USDC-only, defined in ADR 003). Production deploys `PaymentChannel` (multi-token, defined above) as a direct replacement — not a parallel deployment. Since no real users or funds exist on the PoC contract, no phased migration is needed:
 
-1. Deploy `PaymentChannel` with `addToken(USDC_ADDRESS, 1, 1000000)` called at deployment (floor = 1 base unit, ceiling = $1/MB)
-2. Governance calls `addToken` with appropriate rate bounds for any additional tokens (e.g., DAI)
+1. Deploy `PaymentChannel` with `addToken(USDC_ADDRESS, 1, 1000)` called at deployment (floor = 1 USDC base unit, ceiling = 1000 USDC base units = $0.001/MB, matching [ADR 003](003-payments.md) defaults)
+2. Governance calls `addToken` with appropriate rate bounds in the token's own base units for any additional tokens (e.g., DAI)
 3. All nodes update config to point to the new contract
 4. The PoC `StablePaymentChannel` is decommissioned
 
