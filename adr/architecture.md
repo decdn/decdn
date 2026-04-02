@@ -268,7 +268,7 @@ flowchart TD
 
     B -->|Miss| E{pull_through enabled?}
     E -->|Yes| F["Probe fan-out (cdn/probe/v1 to all known peers)"]
-    F --> G["Collect has_blob:true responses (500ms timeout)"]
+    F --> G["Collect has_blob:true responses (50ms min, 500ms max; early exit on good score)"]
     G --> H["Select best: unified selection score"]
     H --> I["Pull via cdn/client/v1 (node pays peer)"]
     I --> J[Cache locally + stream to client simultaneously]
