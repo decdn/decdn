@@ -52,7 +52,11 @@ sequenceDiagram
 
 `signature` is the candidate node's iroh private key signature over `{hash, has_blob, rate_per_mb, timestamp_us}`. This makes the probe response cryptographically attributable and enables two slashing mechanisms: (1) **phantom announcement slashing** — if `has_blob: true` in `ProbeResponse` but the node returns a signed `StreamResponse` with `ok: false` or a redirect for the same hash, the two signed messages are on-chain-verifiable evidence of a phantom announcement (the timeout/non-response case is handled separately — see ADR 003); (2) **rate manipulation slashing** — if `stream_response.timestamp_us >= probe_response.timestamp_us` and `stream_response.timestamp_us - probe_response.timestamp_us < 30_000_000` (30 seconds) and `stream_response.rate_per_mb > probe_response.rate_per_mb`, both signed messages constitute on-chain-verifiable evidence of bait-and-switch. Both `timestamp_us` values are requester-generated (the probe timestamp is echoed in `ProbeResponse`; `StreamResponse` echoes a separate requester timestamp from `StreamRequest`), so the on-chain verifier computes the delta from a single clock with no wall-clock reference needed. **Submitting slash evidence requires a challenge bond** (100 TOKEN in PoC, 50 TOKEN in production) — see [ADR 004](004-tokenomics.md#challenge-bond). The bond is returned if the challenge succeeds and forfeited if the node successfully counters, preventing zero-cost griefing via fabricated slash claims.
 
-**Dependent parameters:** The probe cache TTL in [ADR 001](001-network.md) is derived as half this 30-second window (15 seconds). Changing the slashing window requires updating the probe cache TTL to maintain the invariant that cached probe responses remain within the slashable window.
+**Dependent parameters:** The probe cache TTL in [ADR 001](001-network.md) is derived as half this 30-second window (15 seconds). Changing the slashing window requires updating the probe cache TTL to maintain the invariant that cached probe responses remain within the slashable window. The `probe_hold_duration` (see below) is derived as this window plus 5-second margin; changing the slashing window requires updating both.
+
+**Probe-triggered eviction hold.** When a node responds `has_blob: true` to a `ProbeRequest`, the node MUST ensure the blob is not evicted by LRU/LFU cache pressure for at least `probe_hold_duration` (35 seconds — the 30-second slashing window plus 5 seconds of margin for network latency). This is a local implementation requirement, not a wire protocol change — the `ProbeResponse` format is unchanged. The hold is implemented by marking the blob as eviction-exempt in the cache engine for `probe_hold_duration` after signing the response. If the cache engine cannot guarantee the hold (e.g., the blob is already being evicted, or the hold budget is exhausted), the node MUST respond `has_blob: false` rather than risk a phantom-announcement slash. This is consistent with the `BlobTooLarge` principle: a node MUST NOT sign `has_blob: true` unless it can deliver (see [Error Handling](#error-handling-and-retry-semantics)).
+
+**Hold budget.** The total number of concurrently held blobs is bounded by `max_probe_holds` (default: 256, operator-configurable). When all hold slots are occupied, additional probe requests for unheld blobs receive `has_blob: false` even if the blob is currently in cache. This bounds the effective cache size reduction from holds to at most `max_probe_holds` entries. Operators running small caches should set `max_probe_holds` proportional to their cache size (recommended: no more than 25% of cache capacity). The existing inbound probe rate limit (20 probes/peer/second — see [ADR 001](001-network.md)) bounds the rate at which hold slots are consumed, preventing a probe flood from exhausting the budget.
 
 The requester probes all known peers in parallel (or checks the probe cache for recent results), waits up to 500ms, then selects the winner using the unified selection score (see [ADR 001, Node Selection Algorithm](001-network.md#node-selection-algorithm)). The 500ms window accommodates inter-continental RTTs. This applies to clients picking nodes and nodes picking peers for a cache miss pull.
 
@@ -200,12 +204,15 @@ When a `StreamResponse` returns `ok: false`, the response includes an error code
 
 ```rust
 enum StreamError {
-    NotFound,       // Node does not have the blob (cache miss, no origin)
-    Overloaded,     // Node is at capacity; try another node
-    BlobTooLarge,   // Blob exceeds this node's configured max_blob_size; do not retry this node
-    InternalError,  // Unexpected failure; do not retry this node
+    NotFound,          // Node does not have the blob (cache miss, no origin)
+    Overloaded,        // Node is at capacity; try another node
+    BlobTooLarge,      // Blob exceeds this node's configured max_blob_size; do not retry this node
+    InternalError,     // Unexpected failure; do not retry this node
+    EvictedSinceProbe, // Blob was evicted between probe and stream request
 }
 ```
+
+**`EvictedSinceProbe` semantics.** This error code is informational only (unsigned, like all error codes — see below). It signals to the requester that the node had the blob at probe time but lost it due to cache pressure. The requester SHOULD treat this identically to `NotFound` for retry purposes (fall back to next-best provider). The error code exists to improve observability and debugging — it does not affect slashing logic. A well-implemented node using probe-triggered eviction holds (see [Probe-Triggered Eviction Hold](#cdnprobev1--latency-probe)) should rarely return this error under normal operation; its presence at significant rates indicates the node's `max_probe_holds` budget is too small relative to its probe traffic.
 
 **`BlobTooLarge` enforcement:** Nodes may configure a `max_blob_size` limit (PoC recommended default: 10 GB). When deciding whether to serve a blob, a node enforces `max_blob_size` against locally known blob metadata (its cache index or origin catalog). If the locally known size exceeds `max_blob_size`, the node returns `StreamResponse {ok: false, error: BlobTooLarge}`. On a cache-miss pull from an upstream node, the pulling node additionally enforces `max_blob_size` against `StreamResponse.total_bytes`: if the upstream `total_bytes` exceeds the pulling node's `max_blob_size`, the pulling node aborts the upstream stream and returns `BlobTooLarge` to the original requester. The limit applies to individual blobs.
 
