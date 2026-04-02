@@ -171,13 +171,18 @@ pie title Protocol Fee Allocation (3% at channel settlement)
     "Token Buyback & Burn" : 20
 ```
 
-The 80% non-buyback allocation stays as stablecoin in the treasury. Governance directs spending.
+### Treasury Splitting Mechanism
+
+`settleChannel` transfers the full protocol fee to a single treasury address (see [ADR 003](003-payments.md#fee-calculation-on-disputed-closes)). The 40/20/20/20 allocation above is a **spending policy** — no on-chain splitting occurs at settlement time. Fee distribution from the treasury to the four buckets is a separate, off-contract process:
+
+- **PoC:** The admin key holder manually transfers from the treasury address. The 20% buyback allocation is sent to `BuybackBurner` (see below); the 80% non-buyback allocation is held as stablecoin for development, bounties, and grants. No on-chain sub-split is enforced — at ~$0.90/month in total protocol fees ([PoC Reality](#revenue-model-poc-reality)), automation adds gas cost and contract surface area without benefit.
+- **Production:** Governance proposals direct treasury disbursements per the allocation policy. The allocation percentages are themselves governable via standard governance vote ([ADR 009](009-governance.md)). A dedicated `TreasurySplitter` contract that automatically routes incoming fees to per-bucket addresses may be introduced in a future ADR once fee volumes justify the gas and complexity overhead.
 
 ### BuybackBurner Contract
 
 The `BuybackBurner` contract converts accumulated USDC fees into TOKEN and burns them:
 
-1. Treasury transfers accumulated USDC fees (20% allocation) to `BuybackBurner`
+1. The admin key holder (PoC) or an authorized governance action (production) transfers accumulated USDC fees (20% allocation) to `BuybackBurner`
 2. `executeBuyback()` swaps USDC for TOKEN via Uniswap V3 on L2
 3. Purchased TOKEN is sent to burn address (`0x000...dEaD`)
 

@@ -112,6 +112,8 @@ The protocol fee is calculated **at final settlement**, after the dispute window
    - Treasury receives: `fee = claimedAmount × feePercentage / 10000`
    - Client receives refund: `deposit - claimedAmount`
 
+   The treasury address receives the full protocol fee as a single transfer. The internal allocation across the four buckets (development fund, bounties, ecosystem grants, buyback — see [ADR 004, Fee Allocation](004-tokenomics.md#fee-allocation)) is handled outside the payment channel contract: manually by the admin key holder in the PoC, and via governance-directed disbursement in production.
+
 This means a dispute that increases the settlement amount (e.g., from 50 USDC to 80 USDC) automatically increases the protocol fee (from 1.50 USDC to 2.40 USDC at 3%). The fee is always computed once, on the final settled amount — never on intermediate values and never more than once per channel.
 
 The native token (TOKEN) is not used for delivery payments. It is reserved for staking and fee discount qualification (see ADR 004) and governance (see [ADR 009](009-governance.md)).
@@ -485,7 +487,7 @@ interface IBuybackBurner {
 
 `executeBuyback` is callable by governance multisig or the authorized `keeper` address. All `set*` functions are governance-only behind a timelock.
 
-**PoC note:** The `BuybackBurner` contract is deployed with the same interface, but `executeBuyback` is not called during the PoC. The treasury transfers the 20% buyback allocation to the contract as usual, but fees accumulate there without being swapped. See [ADR 004](004-tokenomics.md#buybackburner-contract) for activation criteria.
+**PoC note:** The `BuybackBurner` contract is deployed with the same interface, but `executeBuyback` is not called during the PoC. The admin key holder (PoC) or an authorized governance action (production) transfers the 20% buyback allocation to the contract periodically, but fees accumulate there without being swapped. See [ADR 004](004-tokenomics.md#buybackburner-contract) for activation criteria.
 
 ### EIP-712 Voucher Signature
 
