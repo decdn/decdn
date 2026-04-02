@@ -100,7 +100,7 @@ Registration is required only if the Verein operates a commercial enterprise (Ar
 ### Treasury Management
 
 - **Bank account:** Sygnum or SEBA Bank (Swiss crypto-native), or Hypothekarbank Zug (traditional, crypto-friendly)
-- **On-chain:** Gnosis Safe multisig (3-of-5), aligned with ADR 009 emergency multisig design
+- **On-chain treasury:** Gnosis Safe multisig (3-of-5) for holding funds and executing treasury operations. This is a separate treasury multisig, not the ADR 009 emergency multisig; the ADR 009 emergency multisig is scope-limited (pause + content blacklist only) and may reuse the same signer set but with restricted powers
 - **Fiat runway:** 12-18 months operating costs in CHF/USD in bank account
 - **TOKEN treasury:** Held in multisig, governed by vesting schedules from ADR 004
 
@@ -109,8 +109,8 @@ Registration is required only if the Verein operates a commercial enterprise (Ar
 - **SRO membership:** VQF or PolyReg for AML/KYC compliance (required for token issuance)
 - **SRO annual fees:** ~CHF 2,000-5,000 depending on volume
 - **AML officer:** Board member or outsourced compliance service
-- **FINMA:** No license needed for utility token — file a "no-action" inquiry to confirm classification (~CHF 5-10K legal cost)
-- **MiCA:** If selling to EU residents, file a crypto-asset whitepaper. Swiss entities can passport via bilateral agreements or register with an EU member state.
+- **FINMA:** No license needed for utility token — file a "no-action" inquiry to confirm classification (~CHF 5-10K legal + CHF 2-5K FINMA admin fees)
+- **MiCA:** If selling to EU residents, file a crypto-asset whitepaper. Swiss entities must register with an EU member state authority as there is no direct passporting from Switzerland.
 
 ### Token Issuance Path
 
@@ -162,7 +162,7 @@ C-Corp chosen over LLC because:
 | Common stock (employee pool) | ~15-20% | ESOP for future hires |
 | Preferred stock | Reserved for investors | Issued at priced rounds |
 
-Labs also receives ~15% TOKEN allocation from the Verein (per ADR 004 team allocation), separate from equity. Investors get equity upside in the company AND indirect TOKEN exposure through Labs' token treasury.
+Under this design, Labs is allocated up to ~15% TOKEN from the Verein out of the ADR 004 "Team & contributors" bucket (this is a design choice of this spec, not specified in ADR 004 itself), separate from equity. Investors get equity upside in the company AND indirect TOKEN exposure through Labs' token treasury.
 
 ### Fundraising Path
 
@@ -245,7 +245,7 @@ Purpose-built as a single-purpose vehicle for token issuance. Isolates token sal
 
 ### Token Issuance Path
 
-1. GmbH formed 4-6 weeks before planned TGE (not at project start — avoids paying for a dormant entity during development)
+1. GmbH formed 5-6 months before planned TGE (allows time for FINMA response; avoids paying for a dormant entity during early development)
 2. SRO membership application
 3. FINMA no-action inquiry filed by GmbH
 4. KYC infrastructure set up (identity verification for buyers)
@@ -261,7 +261,7 @@ TOKEN classifies as utility under FINMA guidelines because it has functional uti
 | Phase | Status |
 |---|---|
 | Pre-TGE development | GmbH does not exist yet |
-| 4-6 weeks before TGE | GmbH formed, SRO joined, FINMA inquiry filed |
+| 5-6 months before TGE | GmbH formed, SRO joined, FINMA inquiry filed (allow 8-16 weeks for response) |
 | TGE | GmbH conducts token sale, handles KYC |
 | Post-TGE (distribution complete) | Sale proceeds transferred to Verein |
 | Post-distribution | GmbH goes dormant (~CHF 1-2K/yr) or dissolved (zero ongoing cost) |
@@ -291,11 +291,11 @@ TOKEN classifies as utility under FINMA guidelines because it has functional uti
 - Verein compensates Labs via quarterly grants in USDC + TOKEN
 - Deliverables defined per quarter — milestone-based funding, not open-ended
 - Either party can terminate with 90-day notice
-- Establishes arm's length relationship, protects Verein's non-profit status, gives Labs predictable revenue
+- Establishes arm's length relationship via documented transfer pricing (e.g., Cost Plus model) to satisfy both IRS and Swiss cantonal tax requirements, protects Verein's non-profit status, gives Labs predictable revenue
 
 ### 2. TOKEN Grant Agreement
 
-- Verein grants Labs 15% of TOKEN supply (150M tokens per ADR 004)
+- Per ADR 004, 15% of TOKEN supply (150M tokens) is allocated to "Team & contributors"; this spec proposes granting that allocation to Labs (to be formalized in a companion ADR)
 - 4-year vesting, 1-year cliff, monthly thereafter
 - Lockup: 6-12 months post-TGE before any sales
 - Labs can distribute to employees via sub-grants (subject to Labs board approval)
@@ -351,7 +351,7 @@ TOKEN classifies as utility under FINMA guidelines because it has functional uti
 ### Conflict of Interest Management
 
 - Founders sit on Verein board AND lead Labs — normal but must be managed
-- Verein board votes on Labs grants: founders recuse themselves, Swiss director + independent advisor vote
+- Verein board votes on Labs grants: founders recuse themselves. Board must have enough independent members to form quorum during recusals — either expand to 4-5 members (adding 2-3 independent advisors) or define a reduced quorum for conflict-of-interest votes in the articles
 - All inter-entity transactions documented and at market rates
 - Annual disclosure of cross-entity relationships in Verein's financial statements
 
@@ -408,12 +408,12 @@ Secondary market trading is not the Verein's or GmbH's responsibility. CEXes han
 - Verein joins SRO (VQF application takes 4-8 weeks)
 - Labs 409A valuation if issuing options
 
-### Phase 5: GmbH Formation (4-6 weeks before TGE)
+### Phase 5: GmbH Formation (5-6 months before TGE)
 - Form deCDN Token GmbH as Verein subsidiary
 - GmbH joins SRO (or shares Verein's membership)
-- FINMA no-action inquiry submitted by GmbH (response in 4-12 weeks)
+- FINMA no-action inquiry submitted by GmbH (response in 8-16 weeks; utility/governance hybrids may take longer)
 - KYC infrastructure set up
-- **GmbH is deferred until needed** — avoids paying for a dormant entity during development
+- **GmbH is deferred until needed** — avoids paying for a dormant entity during early development
 
 ### Phase 6: Token Launch (Months 4-6+)
 - Token smart contracts audited
@@ -424,14 +424,15 @@ Secondary market trading is not the Verein's or GmbH's responsibility. CEXes han
 - GmbH goes dormant or begins dissolution
 
 ```
-Week:  1    2    4    6    8    10   12   14     TGE-6w  TGE
-       |----|----|----|----|----|----|----|----|---...----|---->
+Week:  1    2    4    6    8    10   12   14     TGE-6mo  TGE-3mo  TGE
+       |----|----|----|----|----|----|----|----|---...---|--------|---->
 Labs   xxxxxx done: incorporated, banking, fundraising ready
 Verein xxxxxxxxxxxxxxxxxx done: formed, registered
 Agreements        xxxxxxxxxxxx done: signed
 Verein SRO              xxxxxxxxxxxxxxxx done
-GmbH                                          xxxxxxxxxx done
-Token                                                    xxx> launch
+GmbH                                          xxxxxxxxxxxxxxxxxx done
+FINMA                                              xxxxxxxxxxxxxxxxxx response
+Token                                                                 xxx> launch
 ```
 
 ### Cost Summary
@@ -446,8 +447,8 @@ Token                                                    xxx> launch
 | Verein SRO membership (annual) | CHF 2-5K |
 | Verein registered office | CHF 3-5K |
 | Labs registered agent + franchise tax | $1-2K |
-| Inter-entity agreements (legal) | $5-10K |
-| **Total Year 1 (pre-TGE)** | **~$36-60K** |
+| Inter-entity agreements (legal, cross-border Swiss + US counsel) | $10-20K |
+| **Total Year 1 (pre-TGE)** | **~$41-70K** |
 
 **TGE year (when GmbH is formed):**
 
@@ -456,9 +457,9 @@ Token                                                    xxx> launch
 | GmbH formation + legal | CHF 5-10K |
 | GmbH share capital | CHF 20,000 (recoverable on dissolution) |
 | GmbH SRO membership | CHF 2-5K |
-| FINMA no-action inquiry (filed by GmbH) | CHF 5-10K |
+| FINMA no-action inquiry (legal + FINMA admin fees) | CHF 7-15K |
 | GmbH KYC infrastructure | CHF 3-5K |
-| **Additional TGE-year cost** | **~CHF 35-50K** |
+| **Additional TGE-year cost** | **~CHF 37-55K** |
 
 **Annual (Year 2+, post-TGE):**
 
