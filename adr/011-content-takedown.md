@@ -47,7 +47,7 @@ interface IContentBlacklist {
     function emergencyAddOrigin(address operatorAddress, string calldata reason) external;
 
     // Emergency entries expire after 14 days unless ratified by governance.
-    // emergencyAdd entries carry emergencyExpiresAt = block.timestamp + 14 days;
+    // Expiry is derived from the entry's addedAt timestamp: addedAt + 14 days.
     // isBlacklisted returns false after this deadline unless a governance addHash
     // has been called for the same hash.
 
@@ -65,10 +65,10 @@ interface IContentBlacklist {
     function getBlacklistVersion() external view returns (uint256);
 
     // Events
-    event HashBlacklisted(bytes32 indexed blake3Hash, uint256 effectiveAt, string region, string reason, bool emergency);
-    event HashRemoved(bytes32 indexed blake3Hash, string region);
-    event OriginBlacklisted(address indexed operatorAddress, string reason);
-    event OriginRemoved(address indexed operatorAddress);
+    event HashBlacklisted(bytes32 indexed blake3Hash, uint256 indexed version, uint256 effectiveAt, string region, string reason, bool emergency);
+    event HashRemoved(bytes32 indexed blake3Hash, uint256 indexed version, string region);
+    event OriginBlacklisted(address indexed operatorAddress, uint256 indexed version, string reason);
+    event OriginRemoved(address indexed operatorAddress, uint256 indexed version);
 }
 
 struct BlacklistEntry {
@@ -204,7 +204,7 @@ Serving a blacklisted hash after the compliance window is a slashable offense, s
 
 **Slash evidence.** The challenger submits:
 - The `blake3Hash`
-- A client-signed voucher proving payment for delivery of the blacklisted hash after the compliance window. The voucher's `channelId` identifies the provider; the `channel_id → hash` binding is established by the `StreamRequest` logged in the client's local evidence store. Alternatively, a `ProbeResponse` with `has_blob: true` for the blacklisted hash, timestamped after the compliance window, is sufficient evidence (the probe signature is already defined in [ADR 005](005-protocol.md)).
+- A node-signed `ProbeResponse` with `has_blob: true` for the blacklisted hash, timestamped after the compliance window. The probe signature (defined in [ADR 005](005-protocol.md)) cryptographically binds the node's identity to the hash claim, making it on-chain verifiable via `ecrecover`. This is the primary evidence path. Alternatively, a node-signed `StreamResponse` with `ok: true` for the blacklisted hash (binding `hash` and `channel_id` in the signed data) is also sufficient. Client-signed vouchers alone are NOT sufficient evidence — vouchers do not contain the hash and the `channel_id → hash` binding is not on-chain verifiable.
 - The `BlacklistEntry.effectiveAt` timestamp showing the compliance window had passed
 
 The `ContentBlacklist` contract verifies that `effectiveAt` is in the past relative to the delivery timestamp and that the hash is still on the blacklist. If the hash was subsequently removed, the slash is invalid.

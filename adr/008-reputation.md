@@ -41,7 +41,7 @@ Where interaction_score is:
 
 Formula: `interaction_score = 0.4 * speed_score + 0.4 * correctness + 0.2 * reachability`
 
-Normalization: `speed_score = min(1.0, actual_bps / expected_bps)` where `expected_bps` is a node-local configurable baseline (default: 10 MB/s = 10,485,760 bytes/sec).
+Normalization: `speed_score = min(1.0, actual_bps / expected_bps)` where `expected_bps` is a node-local configurable baseline (default: 10 MiB/s = 10,485,760 bytes/sec).
 
 EWMA with alpha=0.1 means recent interactions matter more but old interactions still contribute.
 

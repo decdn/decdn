@@ -70,7 +70,7 @@ sequenceDiagram
     participant W as Watched Party (Node)
     participant T as Watchtower
 
-    W->>T: WatchtowerRegister {channel_id, deposit, client, token, latest_voucher}
+    W->>T: WatchtowerRegister {channel_id, deposit, client, token, latest_voucher, membership_sig}
     T->>W: WatchtowerAccept {accepted, fee}
 
     loop Every voucher (at voucher interval from ADR 003, default 1 MB)
@@ -82,7 +82,7 @@ sequenceDiagram
     T->>W: WatchtowerRevokeAck {channel_id}
 ```
 
-**Registration authentication.** The `WatchtowerRegister` message must include a proof of channel membership. The registrant signs the `channel_id` with their Ethereum key; the watchtower verifies via `ecrecover` that the recovered address matches either the `client` or `provider` of the channel (verifiable on-chain). This prevents state exhaustion attacks from parties not involved in the channel.
+**Registration authentication.** The `WatchtowerRegister` message includes `membership_sig` — a proof of channel membership. The registrant signs `keccak256(abi.encodePacked("WatchtowerRegister", channel_id))` with their Ethereum key. The watchtower verifies via `ecrecover` that the recovered address matches either the `client` or `provider` of the channel (verifiable on-chain via the payment channel contract's `getChannel` view). This prevents state exhaustion attacks from parties not involved in the channel.
 
 `latest_voucher` has the same shape as `VoucherUpdate`: `{channel_id, amount, nonce, token, signature}`. If no vouchers have been exchanged yet, `latest_voucher` is omitted (the watchtower registers the channel with `amount=0, nonce=0`).
 
