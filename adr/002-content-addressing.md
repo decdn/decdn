@@ -28,7 +28,7 @@ BLAKE3 is iroh's native hash function, so there is no translation layer between 
 - Delivery verification is inherent: hash mismatch on receipt is both detection and proof. No separate proof-of-delivery oracle is needed.
 - Content is location-independent: a blob from any node is interchangeable as long as the hash matches. This makes the entire delivery layer transparent to clients.
 - Deduplication is automatic: two nodes holding identical bytes share one logical blob identity.
-- Content-addressing composes cleanly with encryption: hashing ciphertext means the CDN layer is encryption-agnostic — nodes cache, deliver, and verify blobs identically regardless of whether the content is encrypted. See [ADR 006](006-e2e-encryption.md) for the encryption scheme.
+- Content-addressing composes cleanly with encryption: hashing ciphertext means the CDN layer is encryption-agnostic — nodes cache and deliver blobs identically regardless of whether the content is encrypted, while clients always verify the received ciphertext against its expected hash. See [ADR 006](006-e2e-encryption.md) for the encryption scheme.
 - The hash serves as the slash evidence primitive: a client submitting a slash claim provides the expected hash and the received bytes; the mismatch is verifiable on-chain (via a chunk Merkle proof for the PoC, since BLAKE3 is not an EVM precompile). See [ADR 004](004-tokenomics.md#challenge-bond) for challenge bond requirements and [ADR 005](005-protocol.md#cdnprobev1--latency-probe) for slashing evidence mechanisms.
 - The origin-backed node's backing storage is completely opaque to the network — nobody can discover the origin URL or bypass the payment layer.
 
