@@ -26,14 +26,17 @@ The scheme has two independent layers: a permanent content layer and an ephemera
 The origin generates a random symmetric key per blob, encrypts the content, and stores both the ciphertext and the key:
 
 ```
-K_blob   = random 256-bit key
-ciphertext = XChaCha20-Poly1305(K_blob, plaintext)
-hash     = BLAKE3(ciphertext)
+K_blob      = random 256-bit key
+nonce_blob  = random 24-byte nonce
+ciphertext  = nonce_blob || XChaCha20-Poly1305(K_blob, nonce_blob, plaintext)
+hash        = BLAKE3(ciphertext)
 ```
 
-`K_blob` is stored in the app server's key store (never on CDN nodes). The ciphertext is pushed to the CDN network as an ordinary content-addressed blob. CDN nodes only ever see ciphertext.
+The stored blob is `nonce (24 bytes) || AEAD ciphertext + tag`. The BLAKE3 hash covers the nonce, so content-addressing is unaffected. The client reads the first 24 bytes as the nonce before decrypting. Since each blob is encrypted exactly once with a random nonce, nonce reuse is impossible.
 
-XChaCha20-Poly1305 is chosen over AES-256-GCM because its 24-byte nonce eliminates nonce-reuse risk with random generation, and it requires no hardware AES support.
+`K_blob` is stored in the app server's key store (never on CDN nodes). The ciphertext (including its prepended nonce) is pushed to the CDN network as an ordinary content-addressed blob. CDN nodes only ever see ciphertext.
+
+XChaCha20-Poly1305 is chosen over AES-256-GCM because its 24-byte nonce eliminates nonce-reuse risk with random generation, and it requires no hardware AES support. All XChaCha20-Poly1305 outputs in this scheme use the `nonce || ciphertext || tag` wire format: the first 24 bytes are the nonce, the remainder is the AEAD output.
 
 ### Key Delivery Layer (per play request)
 
@@ -63,8 +66,9 @@ epoch_key = BLAKE3_KDF(server_secret, epoch_id)
 **Per-request sealed envelope:** On each play request, the app server verifies the client's subscription is active, then wraps `K_blob` with the current epoch key and seals the result to the client's public key:
 
 ```
-wrapped   = XChaCha20-Poly1305(epoch_key, K_blob)
-envelope  = crypto_box_seal(client_pubkey, {wrapped, epoch_id, blob_hash})
+nonce_wrap = random 24-byte nonce
+wrapped    = nonce_wrap || XChaCha20-Poly1305(epoch_key, nonce_wrap, K_blob)
+envelope   = crypto_box_seal(client_pubkey, {wrapped, epoch_id, blob_hash})
 ```
 
 The client receives the sealed envelope. To decrypt the blob, the client needs both the envelope and the current epoch key.
@@ -95,11 +99,13 @@ sequenceDiagram
 ```
 1. Receive sealed envelope from app server
 2. Unseal with client private key -> {wrapped, epoch_id, blob_hash}
-3. Decrypt wrapped with current epoch_key -> K_blob
-4. Fetch ciphertext from CDN via existing protocol (StreamRequest{blob_hash})
-5. Verify BLAKE3(ciphertext) == blob_hash
-6. Decrypt XChaCha20-Poly1305(K_blob, ciphertext) -> plaintext
-7. Discard K_blob from memory after use
+3. Parse nonce_wrap (first 24 bytes) from wrapped
+4. Decrypt remainder with epoch_key and nonce_wrap -> K_blob
+5. Fetch ciphertext from CDN via existing protocol (StreamRequest{blob_hash})
+6. Verify BLAKE3(ciphertext) == blob_hash
+7. Parse nonce_blob (first 24 bytes) from ciphertext
+8. Decrypt remainder with K_blob and nonce_blob -> plaintext
+9. Discard K_blob from memory after use
 ```
 
 ### Full System Flow
@@ -111,23 +117,25 @@ sequenceDiagram
     participant N as CDN Node
     participant C as Client
 
-    O->>O: K_blob = random key, encrypt blob
+    O->>O: K_blob = random key, nonce_blob = random 24 bytes
+    O->>O: ciphertext = nonce_blob || encrypt(K_blob, nonce_blob, plaintext)
     O->>O: hash = BLAKE3(ciphertext)
     O->>A: store K_blob
     O->>N: push ciphertext (content-addressed blob)
 
     C->>A: auth + play request
     A->>A: verify subscription
-    A->>A: wrapped = XChaCha20-Poly1305(epoch_key, K_blob)
+    A->>A: nonce_wrap = random 24 bytes
+    A->>A: wrapped = nonce_wrap || encrypt(epoch_key, nonce_wrap, K_blob)
     A->>C: sealed envelope {wrapped, epoch_id, hash}
 
     C->>N: StreamRequest {hash}
     N->>C: ciphertext (paid per MB via cdn/client/v1)
 
     C->>C: unseal envelope with private key
-    C->>C: decrypt wrapped with epoch_key via XChaCha20-Poly1305 to get K_blob
+    C->>C: parse nonce_wrap from wrapped, decrypt with epoch_key -> K_blob
     C->>C: verify BLAKE3(ciphertext) == hash
-    C->>C: decrypt XChaCha20-Poly1305(K_blob, ciphertext) and play
+    C->>C: parse nonce_blob from ciphertext, decrypt with K_blob -> plaintext
 ```
 
 ### Offline Playback (lease-based access)
@@ -186,7 +194,7 @@ flowchart TD
     C -->|No| DENY
     C -->|Yes| D[Look up K_blob for track hash]
     D --> E[Read ciphertext from local cache]
-    E --> F["Decrypt XChaCha20-Poly1305(K_blob, ciphertext)"]
+    E --> F["Parse nonce_blob, decrypt with K_blob"]
     F --> G[Play plaintext]
 ```
 
