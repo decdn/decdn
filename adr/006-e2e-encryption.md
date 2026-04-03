@@ -206,10 +206,10 @@ App server:
          account_id: "alice"
      }
 
-  5. Return lease to client over authenticated channel
-     // The lease endpoint (POST /offline/lease) MUST be served
-     // over HTTPS, as the response contains plaintext K_blob values.
-     // The client is authenticated via session token.
+  5. Return lease to client over cdn/keys/v1 offline lease request stream (type 0x03)
+     // Delivered over the authenticated QUIC connection. TLS 1.3 provides
+     // confidentiality for the plaintext K_blob values in the response.
+     // The client is already authenticated via the epoch key stream.
 
 Client (on device):
   6. Seal lease to device keystore for at-rest protection:

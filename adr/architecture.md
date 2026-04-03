@@ -106,7 +106,7 @@ TOKEN is not used for payments. All nodes must stake TOKEN to participate. Staki
 
 ### [ADR 005 — Wire Protocol](005-protocol.md)
 
-**Four ALPN protocols + iroh-gossip. `cdn/client/v1` covers all paid delivery.**
+**Five protocols (four ALPN + iroh-gossip). `cdn/client/v1` covers all paid delivery.**
 
 | Protocol | Purpose |
 | --- | --- |
