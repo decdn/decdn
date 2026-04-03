@@ -569,7 +569,7 @@ Voucher nonces within a channel start at **1**. Nonce 0 is reserved as the senti
 
 ### StakingRegistry Modifications
 
-The full node registry interface (`NodeInfo`, `registerNode`, `getActiveNodes`, etc.) is defined in ADR 001. The additions below are payment-specific extensions:
+The full node registry interface (`NodeInfo`, `registerNode` with atomic binding, `getActiveNodes`, etc.) is defined in ADR 001. The additions below are payment-specific extensions:
 
 ```solidity
 // Fee discount check — divides by minStake so the result scales with governance changes
@@ -659,9 +659,11 @@ The EIP-712 domain separator is the same as the `StakingRegistry` contract deplo
 
 ### On-Chain Registration
 
-Nodes register their binding on-chain via `StakingRegistry.bindNodeId()`. This is distinct from `StakingRegistry.registerNode()` ([ADR 001](001-network.md)), which handles mesh membership (NodeId, multiaddrs, region, stake validation). `bindNodeId()` establishes the cryptographic NodeId-to-Ethereum-address binding used for slash evidence and payment channel attribution. Nodes call both at registration time: `registerNode` to join the peer mesh, then `bindNodeId` to create the signed binding.
+Node registration and NodeId binding are atomic. `StakingRegistry.registerNode()` ([ADR 001](001-network.md)) accepts a `bindingSignature` parameter — an EIP-712 signature over `BindNodeId(nodeId, bindingNonce[msg.sender])` — and verifies the signature, writes the `nodeIdToAddress`/`addressToNodeId` mappings, and increments `bindingNonce[msg.sender]` in the same transaction that adds the node to the mesh. The per-address nonce counter is shared with `bindNodeId`, ensuring replay protection across both paths. This eliminates the window in which a node could be active but not slashable.
 
-**Canonical source of truth:** The `nodeIdToAddress` / `addressToNodeId` mappings maintained by `bindNodeId` are the authoritative source for payment attribution and slashing. `NodeInfo.ethAddress` in ADR 001 is always `msg.sender` (the same address that calls `bindNodeId`), so the two are consistent by construction under the one-to-one constraint. If the implementation stores both, `NodeInfo.ethAddress` MUST equal `nodeIdToAddress[nodeId]` at all times.
+The standalone `StakingRegistry.bindNodeId()` function below remains available for **rebinding only** (key rotation after initial registration). It is no longer needed at initial registration time.
+
+**Canonical source of truth:** The `nodeIdToAddress` / `addressToNodeId` mappings — written atomically by `registerNode` at initial registration and by `bindNodeId` on rebinding — are the authoritative source for payment attribution and slashing. `NodeInfo.ethAddress` in ADR 001 is always `msg.sender`, so the two are consistent by construction under the one-to-one constraint. If the implementation stores both, `NodeInfo.ethAddress` MUST equal `nodeIdToAddress[nodeId]` at all times.
 
 This creates an authoritative, publicly queryable mapping:
 
@@ -671,6 +673,10 @@ mapping(bytes32 => address) public nodeIdToAddress;
 mapping(address => bytes32) public addressToNodeId;
 mapping(address => uint64) public bindingNonce;
 
+// Intended for rebinding (key rotation) only — initial binding is performed
+// atomically inside registerNode(). No on-chain guard prevents calling this
+// before registerNode, but doing so creates a binding without mesh membership
+// or stake (harmless but useless). See ADR 001.
 function bindNodeId(bytes32 nodeId, bytes calldata signature) external {
     uint64 nonce = bindingNonce[msg.sender];
     bytes32 digest = keccak256(abi.encodePacked(
@@ -702,7 +708,7 @@ function resolveNodeId(bytes32 nodeId) external view returns (address) {
 }
 ```
 
-> **Note on EIP-712 signature in `bindNodeId`:** The signature is technically redundant for direct on-chain calls (where `msg.sender` already authenticates the caller) but is retained to support future meta-transaction/relayer patterns where a third party submits the binding on behalf of the node operator.
+> **Note on EIP-712 signature:** The signature is technically redundant for direct on-chain calls (where `msg.sender` already authenticates the caller) but is retained for two reasons: (1) future meta-transaction/relayer patterns where a third party submits the binding on behalf of the node operator, and (2) atomic binding inside `registerNode`, where the signature is required because `registerNode` writes the binding mapping on behalf of `msg.sender` — without it, the binding would lack explicit cryptographic consent to associate a specific NodeId with the calling address.
 
 ### Off-Chain (Ephemeral) Binding for Clients
 
@@ -712,13 +718,13 @@ Clients who do not wish to register on-chain (e.g., for priority staking lookups
 
 | Role | On-chain binding required? | Rationale |
 | --- | --- | --- |
-| Node (staked) | **Yes** — must call `bindNodeId` at registration | Slash evidence references on-chain NodeId→address mapping |
+| Node (staked) | **Yes** — `registerNode` performs binding atomically via `bindingSignature` parameter | Slash evidence references on-chain NodeId→address mapping; atomic binding eliminates gap |
 | Client (priority staking) | No — ephemeral binding in `StreamRequest` is sufficient | Priority staking is a soft signal; no on-chain enforcement needed |
 | Client (opening channels) | No — channel `client` field is the Ethereum address directly | Channel operations use Ethereum addresses, not NodeIds |
 
 ### Rebinding
 
-A node or client can rebind their Ethereum address to a new NodeId by calling `bindNodeId` again (the nonce increments, invalidating the old binding). The old NodeId→address mapping is deleted. This supports key rotation scenarios (e.g., compromised iroh key).
+A node or client can rebind their Ethereum address to a new NodeId by calling `bindNodeId` (the nonce increments, invalidating the old binding). The old NodeId→address mapping is deleted. This supports key rotation scenarios (e.g., compromised iroh key). Initial binding is handled atomically by `registerNode` and does not require a separate `bindNodeId` call.
 
 ## Decimal Handling
 
