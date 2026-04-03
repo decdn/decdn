@@ -12,12 +12,12 @@ Four slashable offenses require on-chain evidence verification ([ADR 004](004-to
 3. **Rate manipulation** — node advertises one rate in probe, charges higher in stream
 4. **Blacklist violation** — node serves a blacklisted hash after the compliance window ([ADR 011](011-content-takedown.md))
 
-Three of these (phantom, rate, blacklist) require verifying cryptographic signatures from protocol messages. One (corruption) requires proving a BLAKE3 hash mismatch. Neither verification is natively supported on EVM:
+Three of these (phantom, rate, blacklist) require verifying cryptographic signatures from protocol messages. The fourth (corruption) requires adjudicating whether delivered bytes match the claimed BLAKE3 hash. Neither Ed25519 signature verification nor BLAKE3 mismatch adjudication is natively supported on EVM:
 
 - **Ed25519 signatures** (iroh NodeId keys, used for `ProbeResponse` and `StreamResponse` per [ADR 005](005-protocol.md)) have no EVM precompile. Solidity-based verification costs ~500k–1M gas per signature — economically unviable for routine slashing on Arbitrum.
-- **BLAKE3 hashes** have no EVM opcode. Submitting full blob data on-chain to prove a mismatch is gas-prohibitive for any non-trivial blob size.
+- **BLAKE3 hashes** have no EVM opcode. Submitting full blob data on-chain to prove a mismatch is gas-prohibitive for any non-trivial blob size. The PoC therefore uses an optimistic bond + counter-evidence scheme rather than cryptographic mismatch proof; a production Merkle proof design is specified but deferred.
 
-This ADR specifies concrete verification mechanisms for both, enabling all four slash evidence paths for the PoC.
+This ADR specifies concrete on-chain mechanisms for both: `ecrecover`-based signature verification for the three signature-dependent offenses, and an optimistic challenge-response for corruption — enabling all four slash evidence paths for the PoC.
 
 ## Decision
 
@@ -43,7 +43,7 @@ StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, signature, redirect?
 - **ProbeResponse slash_sig covers:** `{hash, has_blob, rate_per_mb, timestamp_us}`
 - **StreamResponse slash_sig covers:** `{hash, ok, rate_per_mb, total_bytes, channel_id, timestamp_us, redirect}`
 
-These match the Ed25519-signed field sets defined in [ADR 005](005-protocol.md). The `slash_sig` field follows the Tier 1 minor evolution pattern from [ADR 013](013-schema-evolution.md#tier-1--minor-no-coordination) — nodes that have not upgraded omit it. Requesters cannot submit on-chain slash evidence for messages without `slash_sig`; those cases fall back to reputation penalties, consistent with the existing timeout/non-response handling in [ADR 003](003-payments.md).
+These match the Ed25519-signed field sets defined in [ADR 005](005-protocol.md). Note that `hash` and `channel_id` are request-context fields (from `ProbeRequest` and `StreamRequest` respectively), not transmitted in the response body — implementers must include them when building and verifying the EIP-712 typed data. When `redirect` is absent (the common case), it is encoded as `bytes32(0)`. The `slash_sig` field follows the Tier 1 minor evolution pattern from [ADR 013](013-schema-evolution.md#tier-1--minor-no-coordination) — nodes that have not upgraded omit it. Requesters cannot submit on-chain slash evidence for messages without `slash_sig`; those cases fall back to reputation penalties, consistent with the existing timeout/non-response handling in [ADR 003](003-payments.md).
 
 #### EIP-712 Type Definitions
 
@@ -120,7 +120,25 @@ The contract verifies:
 
 **Counter-evidence window: 24 hours.**
 
-The challenged node may call `SlashJudge.counterChallenge(challengeId, evidence)` within 24 hours. Valid counter-evidence is a signed delivery receipt from the same requester within the relevant time window, proving the node delivered correct bytes for the same blob. The exact counter-evidence format is: the requester's Ethereum address, a `StreamEnd` acknowledgement signed by the requester (binding `blobHash` and `channel_id`), and the delivery timestamp — demonstrating the requester accepted the full delivery without BLAKE3 mismatch.
+The challenged node may call `SlashJudge.counterChallenge(challengeId, evidence)` within 24 hours. Valid counter-evidence is a requester-signed `DeliveryReceipt` from the same requester, proving the node delivered correct bytes for the same blob. `StreamEnd` itself is an unsigned wire message and cannot serve as on-chain evidence.
+
+**DeliveryReceipt.** After a stream completes and the requester's local BLAKE3 verification passes, the requester produces an EIP-712 signed receipt over:
+
+```solidity
+bytes32 constant DELIVERY_RECEIPT_TYPEHASH = keccak256(
+    "DeliveryReceipt(address requester,bytes32 nodeId,bytes32 channelId,bytes32 blobHash,uint64 deliveredAtUs)"
+);
+```
+
+- `requester` — the requester's Ethereum address
+- `nodeId` — the delivering node's registered identity
+- `channelId` — the payment channel used for this stream
+- `blobHash` — the BLAKE3 hash of the blob that was delivered and verified
+- `deliveredAtUs` — requester-generated microsecond timestamp of delivery completion
+
+The receipt uses the `SlashJudge` EIP-712 domain (same domain separator as slash signatures). The requester signs this only after successful BLAKE3 verification of the full blob. On counter-challenge, the contract verifies the requester's signature and checks that `nodeId`, `channelId`, and `blobHash` match the challenged delivery.
+
+**Incentive to sign:** Nodes SHOULD request a `DeliveryReceipt` after successful delivery. A requester that refuses to sign after accepting delivery cannot later submit a corruption challenge for the same blob and channel (the contract checks for contradictory receipts). Nodes MAY deprioritize or refuse future streams to requesters that consistently refuse receipts.
 
 **Resolution:**
 
@@ -150,6 +168,8 @@ For production, the corruption slash path should upgrade to a two-round interact
 A unified contract that adjudicates all four slashable offense types. The contract holds challenge bonds, verifies evidence, manages counter-evidence windows, and calls `StakingRegistry.slash()` on resolution.
 
 #### Interface
+
+**Encoding convention.** The `bytes calldata` arguments named `*ResponseData` in the interface below are **ABI-encoded structs** matching the EIP-712 typed data fields (not postcard wire bytes). The contract ABI-decodes these fields, reconstructs the EIP-712 struct hash, and calls `ecrecover`. This ensures a single canonical encoding for both the contract and off-chain signature construction.
 
 ```solidity
 interface ISlashJudge {
@@ -220,7 +240,7 @@ interface ISlashJudge {
 3. Decode `hash` from the response; verify it matches `blobHash`
 4. If `ProbeResponse`: verify `has_blob == true`. If `StreamResponse`: verify `ok == true`
 5. Query `ContentBlacklist.getEntry(blobHash)` — must exist and `effectiveAt` must be before the response's `timestamp_us`
-6. Verify the node's declared region is in-scope for the blacklist entry ([ADR 011 § Regional slash eligibility](011-content-takedown.md#slashing))
+6. **Regional scope limitation (PoC):** [ADR 011](011-content-takedown.md#slashing) specifies that a node is only slashable for hashes blacklisted in its declared region. However, the node's region is self-reported and not stored on-chain in `StakingRegistry` for the PoC. The `SlashJudge` contract therefore cannot enforce regional scope in the PoC — all blacklist violations are treated as globally scoped. Production should add a `region` field to `NodeInfo` to enable on-chain regional filtering
 
 **Corrupted delivery (PoC):**
 1. `ecrecover(streamResponseData, streamSlashSig)` → address
@@ -286,5 +306,5 @@ These estimates replace the `submitFraudProof()` placeholder (~250k gas) in [ADR
 - **[ADR 002](002-content-addressing.md):** Open question on on-chain verification mechanism → resolved (this ADR).
 - **[ADR 003](003-payments.md):** Options A/B/C for corruption evidence → resolved as Option A (optimistic challenge-response).
 - **[ADR 005](005-protocol.md):** Signer binding section updated to reference dual signatures; `slash_sig` field added to `ProbeResponse` and `StreamResponse`.
-- **[ADR 011](011-content-takedown.md):** "Ed25519 verification library" reference → updated to dual-key `ecrecover` scheme (this ADR).
+- **[ADR 011](011-content-takedown.md):** Ed25519-library assumption for slash evidence → updated to dual-key `ecrecover` scheme (this ADR).
 - **[ADR 004](004-tokenomics.md):** `submitFraudProof()` gas estimate → replaced by per-offense `SlashJudge` estimates.
