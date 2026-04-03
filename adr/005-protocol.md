@@ -43,13 +43,13 @@ sequenceDiagram
     participant C as Candidate Node
 
     R->>C: ProbeRequest {hash, timestamp_us}
-    C->>R: ProbeResponse {has_blob, rate_per_mb, timestamp_us, signature}
+    C->>R: ProbeResponse {has_blob, rate_per_mb, timestamp_us, signature, total_bytes?}
 
     Note over R: RTT = receive_time - timestamp_us
     Note over R: Score = unified selection score (see ADR 001)
 ```
 
-`timestamp_us` is a requester-generated microsecond timestamp echoed back. RTT is `receive_time - timestamp_us`. `has_blob` confirms the node has the content. `rate_per_mb` lets the requester score candidates on both latency and price in a single round-trip.
+`timestamp_us` is a requester-generated microsecond timestamp echoed back. RTT is `receive_time - timestamp_us`. `has_blob` confirms the node has the content. `rate_per_mb` lets the requester score candidates on both latency and price in a single round-trip. `total_bytes` is an optional unsigned field indicating the blob's total size in bytes. When present, it lets the requester estimate total cost (`rate_per_mb × total_bytes`) before committing to a node or opening a payment channel. Nodes SHOULD include it when the blob size is known. The field is not covered by the signature — it is not needed for any slashing mechanism and follows the Tier 1 minor evolution pattern from [ADR 013](013-schema-evolution.md#tier-1--minor-no-coordination).
 
 `signature` is the candidate node's iroh private key signature over `{hash, has_blob, rate_per_mb, timestamp_us}`. This makes the probe response cryptographically attributable and enables two slashing mechanisms: (1) **phantom announcement slashing** — if `has_blob: true` in `ProbeResponse` but the node returns a signed `StreamResponse` with `ok: false` or a redirect for the same hash, the two signed messages are on-chain-verifiable evidence of a phantom announcement (the timeout/non-response case is handled separately — see ADR 003); (2) **rate manipulation slashing** — if `stream_response.timestamp_us >= probe_response.timestamp_us` and `stream_response.timestamp_us - probe_response.timestamp_us < 30_000_000` (30 seconds) and `stream_response.rate_per_mb > probe_response.rate_per_mb`, both signed messages constitute on-chain-verifiable evidence of bait-and-switch. Both `timestamp_us` values are requester-generated (the probe timestamp is echoed in `ProbeResponse`; `StreamResponse` echoes a separate requester timestamp from `StreamRequest`), so the on-chain verifier computes the delta from a single clock with no wall-clock reference needed. **Submitting slash evidence requires a challenge bond** (100 TOKEN in PoC, 50 TOKEN in production) — see [ADR 004](004-tokenomics.md#challenge-bond). The bond is returned if the challenge succeeds and forfeited if the node successfully counters, preventing zero-cost griefing via fabricated slash claims.
 

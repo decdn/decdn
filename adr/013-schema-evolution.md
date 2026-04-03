@@ -336,7 +336,7 @@ Fields covered by a cryptographic signature are frozen at the protocol version t
 
 | Message | Signed fields | Unsigned fields (evolvable via Tier 1) |
 | --- | --- | --- |
-| `ProbeResponse` | `hash`, `has_blob`, `rate_per_mb`, `timestamp_us` | *(none currently)* |
+| `ProbeResponse` | `hash`, `has_blob`, `rate_per_mb`, `timestamp_us` | `total_bytes` |
 | `StreamResponse` | `hash`, `ok`, `rate_per_mb`, `total_bytes`, `channel_id`, `timestamp_us`, `redirect` | `error`, `voucher_interval_mb` |
 | `NodeAnnounce` | `node_id`, `region`, `load`, `popular_hashes`, `timestamp_us` | *(none currently — see implementation note)* |
 | `ReputationReport` | `provider`, `reporter`, `metrics`, `timestamp` | *(none currently)* |
