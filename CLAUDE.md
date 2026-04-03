@@ -70,7 +70,7 @@ crates/
 | `cdn/probe/v1` | Latency + availability probing |
 | `cdn/client/v1` | All paid delivery (client→node and node→node) |
 | `cdn/watchtower/v1` | Channel-dispute monitoring, voucher registration |
-| iroh-gossip | Node metadata broadcast (`NodeAnnounce`), node discovery |
+| iroh-gossip (built-in) | Node metadata broadcast (`NodeAnnounce`), node discovery |
 
 ### Companion Protocol (App Server)
 
