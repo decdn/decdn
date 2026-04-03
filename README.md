@@ -30,6 +30,7 @@ Decentralized CDN where nodes cache and serve content-addressed blobs over [iroh
 | `cdn/probe/v1` | Latency + availability probing |
 | `cdn/client/v1` | All paid delivery (client→node and node→node) |
 | `cdn/watchtower/v1` | Channel-dispute monitoring (voucher registration) |
+| `cdn/keys/v1` | Epoch key delivery, play requests, offline leases (app server) |
 | iroh-gossip | Node metadata broadcast (`NodeAnnounce`), node discovery |
 
 ### Planned Crate Structure
@@ -58,6 +59,8 @@ Architecture decision records live in [`adr/`](adr/), with [`adr/architecture.md
 - **Governance:** Admin key for PoC; token-weighted governance with safety bounds for production
 - **Multi-token payments (post-PoC):** PoC uses USDC only; production supports governance-approved ERC-20 allowlist
 - **Content takedown:** Governance-controlled hash blacklisting with regional compliance bodies
+- **Client architecture:** Lightweight QUIC endpoints; gossip subscribe (no publish); registry bootstrap with fallback; per-connection ephemeral identity binding
+- **Schema evolution:** Varint-length framing, protocol enums, three-tier evolution model (minor/medium/major)
 
 ## Development
 
