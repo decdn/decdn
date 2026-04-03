@@ -68,7 +68,7 @@ At the default 1 MB cadence, a 10 GB blob requires 10,000 vouchers — each invo
 2. The node responds with its accepted `voucher_interval_mb` in `StreamResponse`. The node may accept the client's proposal, reduce it, or omit the field to fall back to 1 MB.
 3. The effective interval for the stream is `min(client_proposed, node_accepted, on-chain maxVoucherIntervalMb)`.
 
-**Backward compatibility:** If `voucher_interval_mb` is absent from `StreamRequest` (older client), the default is 1 MB. If absent from `StreamResponse` (older node), the client assumes 1 MB. The field is optional in both messages.
+**Default:** `voucher_interval_mb` is optional in both `StreamRequest` and `StreamResponse`; if absent, the default is 1 MB.
 
 **Node sovereignty:** A node can always enforce a smaller interval than the negotiated value by stopping delivery after that many MB without receiving a voucher. This uses the existing self-enforcing mechanism — no protocol change needed beyond the negotiation field.
 
