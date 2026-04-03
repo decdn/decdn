@@ -10,7 +10,7 @@ All wire messages in the deCDN protocol are serialized with [postcard](https://d
 The codebase already contains two ad-hoc evolution patterns:
 
 1. **Optional trailing fields.** `StreamRequest` appends `ethereum_address: Option<Address>` and `binding_signature: Option<Bytes>` with `#[serde(default)]` ([ADR 005](005-protocol.md)). ADR 005 called this a "one-time workaround" and stated that "any future mandatory field addition still requires `cdn/client/v2`."
-2. **1-byte message type prefix.** `cdn/keys/v1` differentiates three stream types with a raw byte prefix (`0x01`, `0x02`, `0x03`) ([ADR 006](006-e2e-encryption.md)). This is an ad-hoc discrimination scheme specific to one ALPN.
+2. **1-byte message type prefix.** `cdn/keys/v1` (the companion app-server protocol) differentiates three stream types with a raw byte prefix (`0x01`, `0x02`, `0x03`) ([ADR 006](006-e2e-encryption.md)). This is an ad-hoc discrimination scheme specific to one ALPN.
 
 These patterns address real needs but are inconsistent with each other and unscalable. Meanwhile, gossip messages (`NodeAnnounce`, `ReputationReport`) have no ALPN negotiation at all — they are published to iroh-gossip topics whose names embed a version (`cdn/global/v1`), but changing a topic name partitions the gossip network.
 
@@ -100,7 +100,7 @@ enum WatchtowerMessage {
     RevokeAck(WatchtowerRevokeAck),   // 5
 }
 
-/// cdn/keys/v1 — replaces the 1-byte type prefix from ADR 006
+/// cdn/keys/v1 — companion protocol (app server). Replaces the 1-byte type prefix from ADR 006
 #[derive(Serialize, Deserialize)]
 enum KeysMessage {
     EpochKeyAuth(EpochKeyAuth),               // 0
@@ -115,7 +115,7 @@ enum KeysMessage {
 
 **Variant ordering rule.** Discriminants are assigned in declaration order (postcard default). New variants MUST be appended at the end. Reordering or removing variants is a major (breaking) change requiring an ALPN version bump.
 
-**`KeysMessage` supersedes ADR 006's 1-byte prefix.** Since the project is pre-implementation, the `0x01`/`0x02`/`0x03` prefix scheme from [ADR 006](006-e2e-encryption.md) has never been deployed. `cdn/keys/v1` uses the same protocol-enum framing as all other ALPNs. The functional mapping is: `0x01` (epoch key stream) → `EpochKeyAuth`/`EpochKey`/`EpochKeyRevoked`; `0x02` (play request) → `PlayRequest`/`PlayResponse`; `0x03` (offline lease) → `OfflineLeaseRequest`/`OfflineLeaseResponse`. The finer-grained enum variants allow request and response messages to be distinguished by type rather than by stream direction.
+**`KeysMessage` supersedes ADR 006's 1-byte prefix.** (This enum is part of the companion app-server protocol, not the core CDN protocol suite — see [ADR 006](006-e2e-encryption.md).) Since the project is pre-implementation, the `0x01`/`0x02`/`0x03` prefix scheme from [ADR 006](006-e2e-encryption.md) has never been deployed. `cdn/keys/v1` uses the same protocol-enum framing as all other ALPNs. The functional mapping is: `0x01` (epoch key stream) → `EpochKeyAuth`/`EpochKey`/`EpochKeyRevoked`; `0x02` (play request) → `PlayRequest`/`PlayResponse`; `0x03` (offline lease) → `OfflineLeaseRequest`/`OfflineLeaseResponse`. The finer-grained enum variants allow request and response messages to be distinguished by type rather than by stream direction.
 
 **Unknown variant handling.** When a peer receives a message with an unknown enum discriminant:
 
@@ -437,7 +437,7 @@ These codes are scoped to individual QUIC streams (sent via `RESET_STREAM` or `S
 ## ADRs Affected
 
 - **[ADR 005](005-protocol.md):** Serialization section updated to reference this ADR. Schema evolution negative consequence resolved. The `voucher_interval_mb` "one-time workaround" language replaced with reference to the standard minor evolution mechanism.
-- **[ADR 006](006-e2e-encryption.md):** The 1-byte message type prefix for `cdn/keys/v1` is superseded by the `KeysMessage` protocol enum defined here.
+- **[ADR 006](006-e2e-encryption.md):** The 1-byte message type prefix for `cdn/keys/v1` is superseded by the `KeysMessage` protocol enum defined here. `cdn/keys/v1` is a companion protocol operated by the app server, not a core CDN protocol — this ADR standardizes its framing for consistency but does not change its architectural role.
 - **[ADR 001](001-network.md):** Gossip validation now operates on payloads unwrapped from `GossipEnvelope`.
 - **[architecture.md](architecture.md):** New ADR 013 entry added to the Architectural Decisions section.
 
