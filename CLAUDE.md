@@ -17,7 +17,7 @@ This repo uses a VS Code devcontainer with a firewall-isolated environment. The 
 
 ### Working with ADRs
 
-ADRs in `adr/` are the primary deliverables right now. `adr/architecture.md` is the living overview and index of all decisions; numbered files (`000-language.md` through `013-schema-evolution.md`) cover individual decisions.
+ADRs in `adr/` are the primary deliverables right now. `adr/architecture.md` is the living overview and index of all decisions; numbered files cover individual decisions.
 
 **Conventions:**
 - File naming: `NNN-topic.md` (zero-padded 3-digit prefix, next number is 014)
@@ -29,6 +29,12 @@ ADRs in `adr/` are the primary deliverables right now. `adr/architecture.md` is 
 - Verify ALPN strings, message type names, and protocol version identifiers match `005-protocol.md`
 - Verify token names (TOKEN/USDC), contract references, and fee parameters match `003-payments.md` and `004-tokenomics.md`
 - Confirm `architecture.md` summary still reflects any changed ADR
+
+```bash
+# Quick consistency checks
+grep -rn 'cdn/[a-z]*/v[0-9]' adr/      # find all ALPN references
+grep -rn 'TOKEN\|USDC' adr/             # find all token references
+```
 
 ### Build and Test (once implementation begins)
 
