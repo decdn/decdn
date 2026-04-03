@@ -55,7 +55,7 @@ event ChannelSettled(
 
 Watchtowers use `ChannelCloseInitiated` and `ChannelDisputed` for active dispute intervention. `ChannelSettled` signals that the dispute window has closed and the channel is finalised — watchtowers use this to stop monitoring the channel and clean up stored voucher state.
 
-A successful `disputeChannel` call updates the on-chain `claimedAmount`, which changes the protocol fee computed at final settlement. See [ADR 003 — Fee Calculation on Disputed Closes](003-payments.md#fee-calculation-on-disputed-closes) for the full lifecycle.
+A successful `disputeChannel` call updates the on-chain `claimedAmount`, which changes the protocol fee computed at final settlement. See [ADR 003 — Fee Calculation on Disputed Closes](003-payments.md#fee-calculation-on-disputed-closes) for the full lifecycle. The `disputeChannel` function must also store `msg.sender` as `lastDisputor` in the `Channel` struct (or a dedicated mapping), so that the production `WatchtowerEscrow` contract can verify dispute authorship via a cross-contract static call (see [Contract: WatchtowerEscrow](#contract-watchtowerescrow)).
 
 No separate watchtower registry contract is needed. The watchtower relationship is purely off-chain — the watched party shares voucher state with the watchtower, and the watchtower submits disputes using its own EOA and gas.
 
@@ -124,6 +124,28 @@ The fee is deterministic and non-negotiable (per 30-day monitoring period): both
 
 **Gas economics:** A `disputeChannel` call on an L2 costs approximately $0.05–0.10. The dispute gas bonus (2× gas cost) ensures watchtowers are not penalised for actually performing their function. The bonus is paid off-chain by the watched party after the dispute settles — the watchtower provides the transaction hash as proof. The off-chain bonus is unenforceable — the watched party can refuse to pay after the dispute is submitted. This is an accepted PoC limitation. Production mitigates this via the prepaid escrow described below, which includes the dispute gas bonus in the escrowed amount.
 
+### Break-Even Economics
+
+Heartbeats are batched — one on-chain transaction per 6-hour window covers all active escrows for a given watchtower (see [Contract: WatchtowerEscrow](#contract-watchtowerescrow)). This makes the heartbeat gas cost fixed rather than per-channel.
+
+**Monthly cost model (per watchtower):**
+
+| Cost component | Monthly estimate | Notes |
+| --- | --- | --- |
+| Heartbeat gas (120 batched tx) | $1.20–$2.40 | Fixed cost, amortised across all channels |
+| Infrastructure (VPS + monitoring) | $20–$50 | Shared with node operation if co-located |
+| Dispute gas (rare) | $0.05–$0.10 per event | Covered by 2× gas bonus from escrow |
+
+**Break-even at various fee levels:**
+
+| Average fee/channel/month | Fixed cost assumption | Channels to break even |
+| --- | --- | --- |
+| $0.50 (minimum, deposits ≤ 500 USDC) | $25 | ~50 |
+| $1.00 (deposits ~1,000 USDC) | $25 | ~25 |
+| $5.00 (deposits ~5,000 USDC) | $25 | ~5 |
+
+**Implication:** Watchtower operation is viable as a side activity for existing node operators — who already run infrastructure and monitor the chain — but unlikely to sustain a standalone business at PoC scale. This is acceptable: the PoC does not implement watchtowers (see [PoC Scope](#8-poc-scope)), and production economics improve with channel volume and deposit sizes.
+
 ### 6. Redundancy
 
 Each channel should be registered with **2–3 independent watchtowers**. The watched party establishes independent `cdn/watchtower/v1` connections to each and streams identical voucher updates.
@@ -173,6 +195,7 @@ flowchart TD
 | Discovery | N/A | Config-based → gossip → on-chain registry |
 | Redundancy | N/A | 2–3 per channel |
 | Fee model | N/A | 0.1% with 0.50 USDC floor |
+| `WatchtowerEscrow` contract | N/A | Required (prepaid escrow with heartbeat accountability) |
 | Watchtower staking | N/A | Deferred |
 
 For PoC, the only action items are:
@@ -208,9 +231,181 @@ These three items future-proof the contract and node software for watchtower int
 
 **Production:** Prepaid escrow with proof-of-monitoring. The watched party deposits the monitoring fee into a `WatchtowerEscrow` contract. The watchtower must submit periodic signed heartbeats (e.g., every 6 hours) proving it is monitoring the chain — each heartbeat includes the latest `ChannelCloseInitiated` event block number the watchtower has processed. If the watchtower misses N consecutive heartbeats (default: 3, i.e., 18 hours), the watched party can reclaim the escrowed fee. On successful completion of the monitoring period (no missed heartbeats, or a dispute was correctly submitted), the watchtower claims the escrowed fee. This provides on-chain accountability without requiring watchtower staking — the escrowed fee itself is the watchtower's bond.
 
-**Voucher state attestation (production enhancement):** Heartbeats SHOULD include a BLAKE3 hash commitment over the set of `(channel_id, latest_nonce)` pairs the watchtower holds. The watched party can verify this commitment matches its own state. A mismatch signals stale voucher data, triggering a resync or watchtower switch.
+**Voucher state attestation:** Heartbeats MUST include a BLAKE3 hash commitment (`voucherStateHash`) over the sorted set of `(channel_id, latest_nonce)` pairs the watchtower holds. The `submitHeartbeat` function reverts if `voucherStateHash == bytes32(0)`. The watched party verifies this commitment off-chain against its own state after each `HeartbeatSubmitted` event. A mismatch signals stale voucher data, triggering a resync via the voucher sharing protocol or watchtower replacement.
 
-**Limitation:** heartbeats prove chain-monitoring liveness only — they do not attest to voucher state. A watchtower that lost its voucher database would continue submitting valid heartbeats but would be unable to dispute a stale close. This gap is addressed by off-chain liveness testing (see [Fee extraction without service](#fee-extraction-without-service)) and by the voucher resync protocol on reconnection (see [Voucher state desynchronisation](#voucher-state-desynchronisation)), not by the heartbeat mechanism itself.
+**Hash specification:** Sort all monitored `(channel_id, latest_nonce)` pairs lexicographically by `channel_id`. Concatenate and hash: `BLAKE3(channel_id_1 || nonce_1 || channel_id_2 || nonce_2 || ...)` where each `channel_id` is 32 bytes and each `nonce` is `uint256` ABI-encoded (32 bytes). If the watchtower monitors zero channels (edge case during wind-down), `voucherStateHash` is `BLAKE3("")` (the BLAKE3 hash of the empty input), not `bytes32(0)`.
+
+**Limitation:** The `voucherStateHash` is a BLAKE3 hash, which the contract cannot verify on-chain (same constraint as content hashes elsewhere in the protocol). The contract enforces only that the commitment is non-zero. Off-chain verification by the watched party is the enforcement mechanism — a mismatch triggers watchtower replacement. A watchtower that lost its voucher database but continues submitting arbitrary non-zero hashes would be detected by the watched party's off-chain check. This is complemented by off-chain liveness testing (see [Fee extraction without service](#fee-extraction-without-service)) and the voucher resync protocol on reconnection (see [Voucher state desynchronisation](#voucher-state-desynchronisation)).
+
+### Contract: WatchtowerEscrow
+
+The `WatchtowerEscrow` contract manages prepaid monitoring fees and enforces heartbeat-based liveness accountability. It is a standalone contract that reads channel state from `StablePaymentChannel` (PoC) / `PaymentChannel` (production) via `getChannel()` but does not modify the payment channel contract. This follows the same pattern as `SlashJudge` ([ADR 014](014-on-chain-verification.md)) — a separate accountability contract that references but does not alter the core payment infrastructure.
+
+**Associated structs:**
+
+```solidity
+struct EscrowDeposit {
+    bytes32 channelId;         // channel being monitored
+    address watchedParty;      // depositor (typically the node/provider)
+    address watchtower;        // monitoring service
+    uint256 feeAmount;         // escrowed monitoring fee (USDC)
+    uint256 gasBonus;          // escrowed dispute gas bonus (2× estimated gas cost)
+    uint256 periodStart;       // block.timestamp when monitoring began
+    uint256 periodEnd;         // periodStart + monitoring period (default 30 days)
+    uint8   status;            // 0 = Active, 1 = Completed, 2 = Reclaimed, 3 = Disputed
+}
+
+// Per-watchtower global state (not per-escrow — enables O(1) heartbeats)
+mapping(address => uint256) public lastHeartbeat;  // watchtower → block.timestamp of last heartbeat
+```
+
+**Interface:**
+
+```solidity
+interface IWatchtowerEscrow {
+    // ── Lifecycle ──────────────────────────────────────────────
+
+    /// Deposit monitoring fee + gas bonus for a channel.
+    /// Caller is the watched party. Transfers feeAmount + gasBonus in USDC from msg.sender.
+    /// Reverts if the channel does not exist or is not Open in the payment channel contract.
+    /// feeAmount must equal getComputedFee(channel.deposit); the contract enforces the formula.
+    function depositEscrow(
+        bytes32 channelId,
+        address watchtower,
+        uint256 feeAmount,
+        uint256 gasBonus
+    ) external returns (uint256 escrowId);
+
+    /// Watchtower submits a batched heartbeat covering all active escrows.
+    /// One call per heartbeat window (default 6 hours) regardless of how many escrows exist.
+    /// voucherStateHash MUST be the BLAKE3 commitment over all monitored channel state;
+    /// reverts if voucherStateHash == bytes32(0).
+    /// The contract stores a single global lastHeartbeat timestamp per watchtower address;
+    /// reclaimEscrow and claimFee check liveness lazily against this timestamp.
+    /// Any address may call this if the EIP-712 signature recovers to an active watchtower
+    /// (enables gas relaying).
+    function submitHeartbeat(
+        uint256 latestCloseBlock,
+        bytes32 voucherStateHash,
+        uint256 timestamp,
+        bytes calldata signature
+    ) external;
+
+    /// Watchtower claims the escrowed monitoring fee after the monitoring period ends.
+    /// Requires block.timestamp >= periodEnd and status == Active.
+    /// Reverts if the watchtower's global lastHeartbeat shows missThreshold or more
+    /// consecutive missed windows at claim time (same liveness check as reclaimEscrow).
+    /// Sets status = Completed. Transfers feeAmount to the watchtower. gasBonus is
+    /// returned to the watched party unless a dispute was submitted (see claimGasBonus).
+    function claimFee(uint256 escrowId) external;
+
+    /// Watchtower claims the gas bonus after submitting a successful disputeChannel.
+    /// The contract reads Channel.lastDisputor from the payment channel contract via
+    /// a cross-contract static call to verify that the watchtower submitted the dispute.
+    /// Sets status = Disputed. Transfers gasBonus to the watchtower.
+    function claimGasBonus(uint256 escrowId) external;
+
+    /// Watched party reclaims escrowed funds if the watchtower's global lastHeartbeat shows
+    /// N or more missed heartbeat windows (default 3 = 18 hours). Computed lazily from
+    /// (block.timestamp - lastHeartbeat) / heartbeatInterval.
+    /// Sets status = Reclaimed. Transfers feeAmount + gasBonus back to the watched party.
+    function reclaimEscrow(uint256 escrowId) external;
+
+    // ── Views ──────────────────────────────────────────────────
+
+    function getEscrow(uint256 escrowId) external view returns (EscrowDeposit memory);
+    function getEscrowsByChannel(bytes32 channelId) external view returns (uint256[] memory escrowIds);
+    function getEscrowsByWatchtower(address watchtower) external view returns (uint256[] memory escrowIds);
+
+    /// Computes the deterministic monitoring fee: max(feeRateBps × deposit / 10000, minFee).
+    function getComputedFee(uint256 channelDeposit) external view returns (uint256 fee);
+
+    // ── Governance ─────────────────────────────────────────────
+
+    function setHeartbeatInterval(uint256 seconds_) external;
+    function setMissThreshold(uint8 consecutiveMisses) external;
+    function setFeeRateBps(uint256 bps) external;
+    function setMinFee(uint256 amount) external;
+    function setMonitoringPeriod(uint256 seconds_) external;
+}
+```
+
+**Events:**
+
+```solidity
+event EscrowDeposited(
+    uint256 indexed escrowId,
+    bytes32 indexed channelId,
+    address indexed watchtower,
+    uint256 feeAmount,
+    uint256 gasBonus,
+    uint256 periodEnd
+);
+
+event HeartbeatSubmitted(
+    address indexed watchtower,
+    uint256 latestCloseBlock,
+    bytes32 voucherStateHash
+);
+
+event FeeClaimed(
+    uint256 indexed escrowId,
+    address indexed watchtower,
+    uint256 amount
+);
+
+event GasBonusClaimed(
+    uint256 indexed escrowId,
+    address indexed watchtower,
+    uint256 amount
+);
+
+event EscrowReclaimed(
+    uint256 indexed escrowId,
+    address indexed watchedParty,
+    uint256 totalReturned
+);
+```
+
+**EIP-712 heartbeat signature.** The contract uses its own EIP-712 domain separator (same pattern as `SlashJudge` in [ADR 014](014-on-chain-verification.md) — per-contract domain prevents cross-contract replay):
+
+```solidity
+EIP712Domain({
+    name: "deCDN WatchtowerEscrow",
+    version: "1",
+    chainId: <deployment chain>,
+    verifyingContract: <WatchtowerEscrow address>
+})
+
+bytes32 constant HEARTBEAT_TYPEHASH = keccak256(
+    "Heartbeat(uint256 latestCloseBlock,bytes32 voucherStateHash,uint256 timestamp)"
+);
+```
+
+**Access control:**
+
+- `depositEscrow`: callable by any address (the caller becomes `watchedParty`).
+- `submitHeartbeat`: callable by any address. The contract recovers the signer from the EIP-712 signature and verifies it matches an active watchtower. This enables gas relaying — a third party can submit heartbeats on behalf of a watchtower. The contract stores a single global `lastHeartbeat` timestamp per recovered watchtower address.
+- `claimFee`: callable only by the `watchtower` address recorded in the escrow, only after `block.timestamp >= periodEnd` and `status == Active`. The contract checks liveness by comparing the watchtower's global `lastHeartbeat` against the escrow's timing requirements.
+- `claimGasBonus`: callable only by the `watchtower` address. The contract reads `Channel.lastDisputor` from the payment channel contract via `getChannel()` and verifies `lastDisputor == msg.sender` for the escrowed channel. This requires the payment channel contract to store the `disputor` address in the `Channel` struct on each successful `disputeChannel` call (see [Contract Integration](#2-contract-integration) and [ADR 003](003-payments.md)).
+- `reclaimEscrow`: callable only by the `watchedParty`. The contract computes missed heartbeats lazily: `missedWindows = (block.timestamp - lastHeartbeat[watchtower]) / heartbeatInterval`. Reverts if `missedWindows < missThreshold`.
+- All `set*` functions: admin key (PoC), timelock governance (production).
+
+**Governable parameters with safety bounds:**
+
+| Parameter | Min | Max | PoC Default |
+| --- | --- | --- | --- |
+| Heartbeat interval | 1 hour (3600s) | 24 hours (86400s) | 6 hours (21600s) |
+| Miss threshold | 1 | 10 | 3 |
+| Fee rate | 1 bps (0.01%) | 100 bps (1%) | 10 bps (0.1%) |
+| Min fee | 0.01 USDC | 10 USDC | 0.50 USDC |
+| Monitoring period | 7 days | 90 days | 30 days |
+
+**Batched heartbeats.** `submitHeartbeat` is a single O(1) call per heartbeat window, regardless of how many channels the watchtower monitors. The contract stores a single global `lastHeartbeat` timestamp per watchtower address rather than iterating over individual escrows — `reclaimEscrow` and `claimFee` check liveness lazily by comparing the watchtower's global timestamp against each escrow's timing requirements. Per-escrow heartbeats would cost ~$1.20–$2.40/month in gas (120 tx × $0.01–$0.02 at L2 pricing) and would hit the block gas limit as the watchtower's portfolio grows. The `voucherStateHash` already commits to the full set of monitored `(channel_id, latest_nonce)` pairs, so a single heartbeat per 6-hour window suffices.
+
+**Monitoring period renewal.** A monitoring period (default 30 days) may be shorter than the channel's lifetime. The watched party must call `depositEscrow` again before the current period ends to maintain continuous coverage. A gap between periods is not penalised — it simply means no heartbeat accountability during that window.
+
+**On-chain escrow at channel open time.** An alternative design embeds the watchtower fee in `openChannel`, atomically reserving a portion of the channel deposit for watchtower payment. This is rejected for the PoC because: (1) it couples the payment channel contract to watchtower economics, (2) the watchtower identity is typically not known at channel open time — selection happens after streaming begins, and (3) it changes the `IStablePaymentChannel` interface, which is otherwise frozen for watchtower integration. A hybrid approach — an optional `watchtowerEscrowData` parameter in the production `PaymentChannel` contract that atomically opens the channel and deposits escrow — is viable as a future gas optimisation if watchtower adoption is high.
 
 ## Attack Vectors
 

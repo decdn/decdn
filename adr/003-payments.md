@@ -332,6 +332,7 @@ struct Channel {
     uint256 expiresAt;
     uint8   status;           // 0 = Open, 1 = Closing (dispute window active), 2 = Closed (settled)
     uint256 disputeDeadline;  // set when close is initiated
+    address lastDisputor;     // msg.sender of the most recent disputeChannel call (used by WatchtowerEscrow for gas bonus verification — see ADR 007)
 }
 ```
 

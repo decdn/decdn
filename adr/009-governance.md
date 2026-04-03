@@ -55,6 +55,11 @@ All economic parameters across the protocol are governable within hardcoded safe
 | Base slash reset period | StakingRegistry | 30 days | 365 days |
 | Burn percentage of fees | StablePaymentChannel (PoC) / PaymentChannel (production) | 0% | 100% |
 | Compliance window | ContentBlacklist | 1 hour | 7 days |
+| Heartbeat interval | WatchtowerEscrow | 1 hour (3600s) | 24 hours (86400s) |
+| Miss threshold | WatchtowerEscrow | 1 | 10 |
+| Fee rate | WatchtowerEscrow | 1 bps (0.01%) | 100 bps (1%) |
+| Min fee | WatchtowerEscrow | 0.01 USDC | 10 USDC |
+| Monitoring period | WatchtowerEscrow | 7 days | 90 days |
 
 The 3-day voting period balances responsiveness with participation. Combined with the 2-day timelock, the total governance delay is 5 days minimum — comparable to standard OpenZeppelin Governor deployments.
 

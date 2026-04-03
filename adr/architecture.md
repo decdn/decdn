@@ -141,7 +141,7 @@ Each blob is encrypted once at ingest with a random symmetric key (XChaCha20-Pol
 
 **Non-custodial watchtowers for dispute-window liveness.**
 
-A watchtower holds the latest voucher for a registered channel and submits a `disputeChannel` transaction if a stale close is detected on-chain. Watchtowers cannot steal funds or worsen settlement — the voucher's EIP-712 signature is the only authorisation the contract checks. Nodes register with 2–3 independent watchtowers via `cdn/watchtower/v1` over iroh QUIC. A local in-process dispute monitor provides defense-in-depth for the node-is-online case.
+A watchtower holds the latest voucher for a registered channel and submits a `disputeChannel` transaction if a stale close is detected on-chain. Watchtowers cannot steal funds or worsen settlement — the voucher's EIP-712 signature is the only authorisation the contract checks. Nodes register with 2–3 independent watchtowers via `cdn/watchtower/v1` over iroh QUIC. A local in-process dispute monitor provides defense-in-depth for the node-is-online case. Production deployments use an on-chain `WatchtowerEscrow` contract for fee accountability: watchtowers submit periodic heartbeats with mandatory voucher state attestation (BLAKE3 commitment), and watched parties can reclaim escrowed fees on heartbeat failure.
 
 ---
 
@@ -257,6 +257,7 @@ The system relies on several infrastructure-level assumptions beyond the cryptog
 | **Origin-backed node** | A node configured with an S3-compatible object store (e.g., S3/R2/B2/MinIO), NFS mount, or local disk — can serve any blob in that store, never experiences a true cache miss |
 | **Slash signature** | An EIP-712 secp256k1 signature (`slash_sig`) on protocol messages, used for on-chain slash evidence via `ecrecover`. Distinct from the Ed25519 wire signature — see [ADR 014](014-on-chain-verification.md) |
 | **SlashJudge** | The on-chain contract that adjudicates all slashable offenses, verifies slash signatures, manages challenge bonds, and calls `StakingRegistry.slash()` — see [ADR 014](014-on-chain-verification.md) |
+| **WatchtowerEscrow** | The on-chain contract that manages prepaid watchtower monitoring fees and enforces heartbeat-based liveness accountability. Standalone contract that reads channel state but does not modify the payment channel contract — see [ADR 007](007-watchtower.md) |
 
 ---
 
