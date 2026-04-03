@@ -186,6 +186,14 @@ All QUIC stream messages use varint-length-prefixed frames containing a top-leve
 
 ---
 
+### [ADR 014 — On-Chain Verification for Slashing Evidence](014-on-chain-verification.md)
+
+**Dual-key slash signatures, optimistic challenge-response, unified SlashJudge contract.**
+
+All four slashable offenses (corrupted delivery, phantom announcements, rate manipulation, blacklist violations) now have concrete on-chain evidence paths. Ed25519 signatures from iroh NodeIds are not EVM-verifiable, so protocol messages (`ProbeResponse`, `StreamResponse`) carry an optional secp256k1 `slash_sig` — an EIP-712 signature over the same security-relevant fields — enabling `ecrecover`-based verification at 3,000 gas (vs ~500k–1M for a Solidity Ed25519 library). For BLAKE3 content corruption, the PoC uses a single-round optimistic challenge-response with a 100 TOKEN bond and 24-hour counter-evidence window; the production path upgrades to an interactive keccak256 Merkle proof over 1024-byte chunks. A unified `SlashJudge` contract adjudicates all offense types and calls `StakingRegistry.slash()` on resolution.
+
+---
+
 ## Key Invariants
 
 - No external origin URL exists — content enters the network through origin-backed nodes whose backends are hidden
@@ -242,6 +250,8 @@ The system relies on several infrastructure-level assumptions beyond the cryptog
 | **Node** | A staked participant that caches and serves blobs. Some are configured with an origin backend; others are pure caches. |
 | **Client** | A lightweight QUIC endpoint that streams content and pays per MB |
 | **Origin-backed node** | A node configured with an S3-compatible object store (e.g., S3/R2/B2/MinIO), NFS mount, or local disk — can serve any blob in that store, never experiences a true cache miss |
+| **Slash signature** | An EIP-712 secp256k1 signature (`slash_sig`) on protocol messages, used for on-chain slash evidence via `ecrecover`. Distinct from the Ed25519 wire signature — see [ADR 014](014-on-chain-verification.md) |
+| **SlashJudge** | The on-chain contract that adjudicates all slashable offenses, verifies slash signatures, manages challenge bonds, and calls `StakingRegistry.slash()` — see [ADR 014](014-on-chain-verification.md) |
 
 ---
 
@@ -446,3 +456,4 @@ During PoC (before indexers exist), content discovery uses probe fan-out — eve
 - Parallel streaming from multiple nodes for a single blob (protocol supports it, not prioritised)
 - ~~Maximum blob size~~: decided — nodes may configure a `max_blob_size` limit (PoC recommended default: 10 GB). Requests exceeding a node's limit are rejected with `StreamError::BlobTooLarge` ([ADR 005](005-protocol.md#error-handling-and-retry-semantics)). This is a per-node operational policy, not an on-chain governance parameter, because different nodes have different storage and bandwidth budgets
 - ~~Schema evolution strategy for postcard wire messages~~: decided — [ADR 013](013-schema-evolution.md) defines varint-length framing, protocol enums, a three-tier evolution model, and a gossip envelope
+- ~~On-chain verification for slash evidence (Ed25519 signatures, BLAKE3 mismatch)~~: decided — [ADR 014](014-on-chain-verification.md) specifies dual-key slash signatures (`ecrecover` at 3,000 gas), optimistic challenge-response for corruption, and a unified `SlashJudge` contract
