@@ -95,7 +95,7 @@ sequenceDiagram
     alt ok = true
         loop Every voucher_interval_mb (default 1 MB)
             D->>P: ChunkData {bytes} (1024-byte chunks)
-            P->>D: Voucher {sig, amt} (cumulative USDC)
+            P->>D: Voucher {sig, amt, nonce} (cumulative USDC)
             D->>P: VoucherAck
         end
         P->>D: StreamEnd
@@ -121,7 +121,7 @@ struct StreamRequest {
 
 The client includes `ethereum_address` and `binding_signature` in the first `StreamRequest` on a connection. The node verifies the EIP-712 signature via `ecrecover`, caches the verified binding for the connection's lifetime, and uses the recovered address for `clientStakeOf` lookups and voucher attribution. Subsequent requests on the same connection may omit these fields. These are `Option` fields with `#[serde(default)]`, so peers that do not send them (e.g., nodes in node-to-node pulls where both sides have on-chain bindings) decode them as `None` — no ALPN version bump is needed since this is defined before the first implementation.
 
-**Voucher wire format:** `Voucher {sig, amt}` above is shorthand. The EIP-712 signed data covers the full structure from [ADR 003](003-payments.md): `{channelId, amount, nonce, token}`. Only `signature` and `amount` are transmitted on the wire because the remaining fields are derivable from stream context — `channel_id` is in `StreamRequest`, `nonce` increments monotonically (one per voucher interval boundary — default 1 MB, or the negotiated interval), and `token` is fixed at channel open. The receiver reconstructs the full typed data to verify the signature. Contrast with the watchtower `VoucherUpdate` below, which must include `channel_id` and `nonce` explicitly because the watchtower lacks stream context.
+**Voucher wire format:** `Voucher {sig, amt, nonce}` above is shorthand. The EIP-712 signed data covers the full structure from [ADR 003](003-payments.md): `{channelId, amount, nonce, token}`. The fields `signature`, `amount`, and `nonce` are transmitted on the wire; the remaining fields are derived from stream context — `channel_id` is in `StreamRequest` and `token` is fixed at channel open. Including `nonce` explicitly (rather than relying on a monotonically incrementing implicit counter) prevents desynchronization if a `VoucherAck` is dropped. The receiver reconstructs the full typed data to verify the signature. This aligns with the watchtower `VoucherUpdate` below, which also includes `nonce` explicitly — though the watchtower version still requires `channel_id` and `token` because it lacks stream context.
 
 The delivering node advertises its `rate_per_mb` in `StreamResponse`. The payer accepts by sending the first voucher or disconnects and tries another node. No surprise pricing. `timestamp_us` in `StreamResponse` is the requester-generated microsecond timestamp from `StreamRequest`, echoed back unchanged — the same pattern as `ProbeResponse`. The node's iroh key signs all security-relevant fields: `{hash, ok, rate_per_mb, total_bytes, channel_id, timestamp_us, redirect}`, making the response cryptographically binding. Signing the full response prevents a malicious party from altering unsigned fields while reusing a valid signature — in particular, `ok` is needed for phantom announcement evidence (proving a node signed `ok: false` after claiming `has_blob: true` in a probe), and `redirect` ensures a node cannot silently alter routing without accountability. A rate mismatch where `stream_response.rate_per_mb > probe_response.rate_per_mb` is slashable if `stream_response.timestamp_us >= probe_response.timestamp_us` and `stream_response.timestamp_us - probe_response.timestamp_us < 30_000_000` (30 seconds). The ordering check prevents unsigned integer underflow in the on-chain verifier. Because both `timestamp_us` values are requester-generated, the on-chain verifier computes this delta from the signed messages alone — no wall-clock reference or external time oracle is needed, and clock skew between the requester and the node does not affect the check. The `redirect` field in `StreamResponse` is used when a node cannot serve — it contains the NodeId of another node that can, never an external URL. The network is fully opaque.
 
@@ -205,7 +205,7 @@ sequenceDiagram
     end
 
     Note over C: Aggregate byte counter crosses voucher interval boundary
-    C->>N: Voucher {sig, amt} (sent on any active stream)
+    C->>N: Voucher {sig, amt, nonce} (sent on any active stream)
     N->>C: VoucherAck
 ```
 
