@@ -92,7 +92,7 @@ Every blob is identified by its BLAKE3 hash. Clients verify received bytes again
 
 **Off-chain USDC payment channels. Market-driven rates.**
 
-Clients pay nodes per MB. On a cache miss, nodes pay origin-backed nodes per MB for initial content pulls, then amortise that cost across many client deliveries. Origin-backed nodes set the effective price ceiling (reflecting their backend egress costs). Rates are fully market-driven within governance-set bounds. Voucher cadence (default 1 MB) is negotiable per-stream for large blob transfers, reducing overhead without materially increasing risk. Nodes join the mesh via `StakingRegistry.registerNode()` ([ADR 001](001-network.md)) and establish a cryptographic NodeId-to-Ethereum address binding via `StakingRegistry.bindNodeId()` ([ADR 003](003-payments.md)) for slash evidence and payment attribution. Client bindings are ephemeral (per-session).
+Clients pay nodes per MB. On a cache miss, nodes pay origin-backed nodes per MB for initial content pulls, then amortise that cost across many client deliveries. Origin-backed nodes set the effective price ceiling (reflecting their backend egress costs). Rates are fully market-driven within governance-set bounds. Voucher cadence (default 1 MB) is negotiable per-stream for large blob transfers, reducing overhead without materially increasing risk. Nodes join the mesh via `StakingRegistry.registerNode()` ([ADR 001](001-network.md)), which atomically establishes the cryptographic NodeId-to-Ethereum address binding (EIP-712 signature, see [ADR 003](003-payments.md)) for slash evidence and payment attribution. `bindNodeId()` remains available for post-registration key rotation. Client bindings are ephemeral (per-session).
 
 ---
 
@@ -193,6 +193,7 @@ All QUIC stream messages use varint-length-prefixed frames containing a top-leve
 - A node cannot earn without delivering verifiable bytes — BLAKE3 hash mismatch voids payment
 - A node cannot join the peer mesh without staking — prevents free-riders and provides a slashable bond
 - A node cannot register without staking — `StakingRegistry` enforces `stake >= minStake` before accepting a `registerNode` call
+- A node cannot register without binding — `registerNode` atomically writes the NodeId-to-address mapping via EIP-712 signature, ensuring every active node is immediately slashable
 - Payment channels amortize on-chain costs across an entire session; per-MB payments are off-chain
 - Safety bounds on all governable parameters are hardcoded — governance cannot set fees to 100% or stake to zero (see [ADR 009](009-governance.md))
 - A node cannot serve a blacklisted hash after the compliance window — doing so is a slashable offense (see [ADR 011](011-content-takedown.md))
