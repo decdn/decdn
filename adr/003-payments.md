@@ -636,7 +636,7 @@ This is a soft signal, not a hard gate. Non-staking clients still get served, ju
 
 ## NodeId-to-Ethereum Binding
 
-The protocol requires a verifiable mapping between iroh NodeIds (ed25519 public keys) and Ethereum addresses (secp256k1-derived). This binding is used for client priority staking lookups, payment channel association, and slash evidence attribution.
+The protocol requires a verifiable mapping between iroh NodeIds (ed25519 public keys) and Ethereum addresses (secp256k1-derived). This binding is used for client priority staking lookups, payment channel association, and slash evidence attribution. Two orthogonal signature mechanisms protect this mapping: the EIP-712 `bindingSignature` (secp256k1) proves the Ethereum key holder consents to the association — preventing un-slashable registration; the `ed25519Signature` ([ADR 001, NodeId Ownership Verification](001-network.md#nodeid-ownership-verification)) proves the NodeId's private key holder authorized the registration — preventing NodeId squatting.
 
 ### Binding Message Format
 
@@ -656,7 +656,7 @@ The EIP-712 domain separator is the same as the `StakingRegistry` contract deplo
 
 ### On-Chain Registration
 
-Node registration and NodeId binding are atomic. `StakingRegistry.registerNode()` ([ADR 001](001-network.md)) accepts a `bindingSignature` parameter — an EIP-712 signature over `BindNodeId(nodeId, bindingNonce[msg.sender])` — and verifies the signature, writes the `nodeIdToAddress`/`addressToNodeId` mappings, and increments `bindingNonce[msg.sender]` in the same transaction that adds the node to the mesh. The per-address nonce counter is shared with `bindNodeId`, ensuring replay protection across both paths. This eliminates the window in which a node could be active but not slashable.
+Node registration and NodeId binding are atomic. `StakingRegistry.registerNode()` ([ADR 001](001-network.md)) accepts a `bindingSignature` parameter — an EIP-712 signature over `BindNodeId(nodeId, bindingNonce[msg.sender])` — and an `ed25519Signature` parameter proving ownership of the NodeId's ed25519 private key (see [ADR 001, NodeId Ownership Verification](001-network.md#nodeid-ownership-verification)). The function verifies both signatures, writes the `nodeIdToAddress`/`addressToNodeId` mappings, and increments `bindingNonce[msg.sender]` in the same transaction that adds the node to the mesh. The per-address nonce counter is shared with `bindNodeId`, ensuring replay protection across both paths. This eliminates the window in which a node could be active but not slashable.
 
 The standalone `StakingRegistry.bindNodeId()` function below remains available for **rebinding only** (key rotation after initial registration). It is no longer needed at initial registration time.
 
@@ -715,7 +715,7 @@ Clients who do not wish to register on-chain (e.g., for priority staking lookups
 
 | Role | On-chain binding required? | Rationale |
 | --- | --- | --- |
-| Node (staked) | **Yes** — `registerNode` performs binding atomically via `bindingSignature` parameter | Slash evidence references on-chain NodeId→address mapping; atomic binding eliminates gap |
+| Node (staked) | **Yes** — `registerNode` performs binding atomically via `bindingSignature` (EIP-712, proves Ethereum key consent) and `ed25519Signature` (proves NodeId ownership) | Slash evidence references on-chain NodeId→address mapping; atomic binding eliminates gap; ed25519 proof prevents NodeId squatting |
 | Client (priority staking) | No — ephemeral binding in `StreamRequest` is sufficient | Priority staking is a soft signal; no on-chain enforcement needed |
 | Client (opening channels) | No — channel `client` field is the Ethereum address directly | Channel operations use Ethereum addresses, not NodeIds |
 
