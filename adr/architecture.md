@@ -200,6 +200,24 @@ All QUIC stream messages use varint-length-prefixed frames containing a top-leve
 
 ---
 
+## Trust Assumptions
+
+The system relies on several infrastructure-level assumptions beyond the cryptographic guarantees verified on-chain or in-protocol. [ADR 012](012-client.md) documents the client-specific trust boundary (verified / trusted / not trusted); this section covers system-wide assumptions that span multiple components.
+
+- **NTP availability and correctness.** Gossip validation depends on loose clock agreement: ±60 s for `NodeAnnounce` freshness ([ADR 001](001-network.md)), ±5 min for `ReputationReport` recency ([ADR 008](008-reputation.md)). A compromised or unavailable NTP source could cause mesh partitions or cause nodes to reject valid gossip. Mitigation: nodes detect relative drift via peer timestamp comparison; the tolerance windows are generous enough to absorb typical NTP jitter.
+
+- **L2 RPC provider honesty.** Nodes and clients trust their RPC provider to return correct event logs for registry queries, blacklist polling, and rate-bounds lookups. A malicious RPC provider could hide `ChannelCloseInitiated` events from watchtowers, defeating dispute protection, or return a fabricated node list to eclipse a client. Mitigation: PoC accepts single-RPC trust; production plans multi-source bootstrap ([ADR 012](012-client.md) Option B) and multiple independent RPC providers.
+
+- **App server as trusted infrastructure.** The app server holds all blob encryption keys (`K_blob`) for encrypted content ([ADR 006](006-e2e-encryption.md)). Compromise grants access to all content for the affected epochs. Mitigation: epoch key rotation limits blast radius; per-epoch keys provide forward secrecy for past epochs.
+
+- **QUIC/TLS transport integrity for voucher confidentiality.** Vouchers are bearer instruments — a leaked voucher is valid regardless of how it was obtained. The system assumes vouchers never leave the encrypted QUIC channel between client and node. Mitigation: QUIC provides in-transit encryption; vouchers are never logged or persisted in plaintext. Endpoint compromise or debug output leaking vouchers remains an operational risk.
+
+- **Arbitrum sequencer liveness.** The dispute mechanism assumes forced-inclusion transactions complete within ~24 h ([ADR 007](007-watchtower.md)). If the sequencer censors dispute transactions beyond this window, a fraudulent close could settle before the honest party responds. Mitigation: PoC dispute window is 48 h (governable 12h–72h), providing at least 24 h of effective response time after worst-case sequencer censorship.
+
+- **ERC-20 token behavior stability.** Governance-approved tokens are assumed not to change behavior post-approval (e.g., a proxy-upgradeable token adding fee-on-transfer). Changed token semantics could break settlement arithmetic or trap funds. Mitigation: PoC is USDC-only (non-upgradeable, well-audited); production token vetting criteria are an open question in [ADR 010](010-multi-token.md).
+
+---
+
 ## Non-Goals (PoC)
 
 - DRM or content protection
