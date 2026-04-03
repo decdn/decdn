@@ -730,7 +730,7 @@ Multi-token decimal abstraction (a `Currency` enum covering arbitrary ERC-20 dec
 {channelId, amount, nonce, token, signature}
 ```
 
-During delivery over `cdn/client/v1`, only `{signature, amount}` are transmitted on the wire; the remaining fields are derived from stream context. The `nonce` is implicit: it equals `previous_nonce + 1` (starting at 1 for the first voucher in a channel). Both parties maintain an in-sync counter. See [ADR 005](005-protocol.md) for wire protocol details.
+During delivery over `cdn/client/v1`, `{signature, amount, nonce}` are transmitted on the wire; the remaining fields (`channelId`, `token`) are derived from stream context. The `nonce` is explicit to prevent desynchronization if a `VoucherAck` is dropped (it starts at 1 for the first voucher in a channel; 0 is reserved as a sentinel). See [ADR 005](005-protocol.md) for wire protocol details.
 
 The `token` field (ERC-20 address) is included in the signed EIP-712 typed data to prevent cross-token replay attacks. For the PoC, this field is hardcoded to the USDC contract address. The full EIP-712 type definition and domain separator are specified in [EIP-712 Voucher Signature](#eip-712-voucher-signature).
 
