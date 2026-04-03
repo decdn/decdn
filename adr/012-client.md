@@ -36,23 +36,31 @@ Capabilities:
 Complete startup sequence from first launch to ready state:
 
 ```
-1. Load or generate iroh identity key (see Key Management below)
-2. Load Ethereum key from encrypted keystore
-3. Query on-chain registry: paginated getActiveNodes(offset, 100) calls,
-     starting at offset 0, incrementing until a page returns fewer than 100
-     On failure: retry 3× exponential backoff (1 s, 5 s, 30 s)
-     On continued failure + cached peers: fall back to ~/.decdn/peers.json
-     On continued failure + no cache: exit with error —
-       "Cannot reach registry at {rpc_url}. Check network connectivity
-        and RPC endpoint configuration."
-4. Connect to iroh relay (for NAT traversal)
-5. Subscribe to gossip topics:
-     - cdn/global/v1  (mandatory)
-     - cdn/region/{region}/v1  (if region configured)
-6. Build peer table from registry results + incoming NodeAnnounce messages
-7. Persist peer list to ~/.decdn/peers.json
-8. Begin periodic registry refresh (every 10 minutes)
+ 1. Load or generate iroh identity key (see Key Management below)
+ 2. Load Ethereum key from encrypted keystore
+ 3. Query on-chain registry: paginated getActiveNodes(offset, 100) calls,
+      starting at offset 0, incrementing until a page returns fewer than 100
+      On failure: retry 3× exponential backoff (1 s, 5 s, 30 s)
+ 4. (Production only) Resolve DNS bootstrap seeds from configured seed domains
+      On failure: retry 3× exponential backoff (1 s, 5 s, 30 s)
+ 5. Merge peers: registry results ∪ DNS seed results (registry metadata
+      takes precedence when the same NodeId appears in both — see
+      DNS Seed Specification below)
+ 6. If no usable peers from live sources:
+      On cached peers present: fall back to ~/.decdn/peers.json
+      On no cache: exit with error —
+        "Cannot reach bootstrap sources. Check network connectivity
+         and RPC endpoint configuration."
+ 7. Connect to iroh relay (for NAT traversal)
+ 8. Subscribe to gossip topics:
+      - cdn/global/v1  (mandatory)
+      - cdn/region/{region}/v1  (if region configured)
+ 9. Build peer table from merged bootstrap peers + incoming NodeAnnounce messages
+10. Persist peer list to ~/.decdn/peers.json
+11. Begin periodic registry refresh (every 10 minutes)
 ```
+
+For PoC, steps 4–5 are skipped (no DNS seeds configured). The registry is the sole bootstrap source.
 
 **Gossip participation policy:**
 
@@ -197,7 +205,7 @@ Default configuration:
 
 ```toml
 [network]
-rpc_url = "https://arb-sepolia.g.alchemy.com/v2/{key}"
+rpc_url = "https://<arb-sepolia-rpc-endpoint>"
 region = ""                                  # optional ISO 3166-1 alpha-2
 
 [bootstrap]
@@ -205,6 +213,11 @@ registry_refresh_secs = 600                  # 10 minutes
 # Production only — empty in PoC
 dns_seeds = []
 min_peer_diversity = 3                       # Option C threshold (production)
+
+[app_server]
+# Required for encrypted content (ADR 006). Omit for plaintext PoC.
+node_id = ""                                 # app server's iroh NodeId (hex)
+addrs = []                                   # app server multiaddrs
 
 [keys]
 # Paths use ~ as shorthand; the client MUST perform home-directory expansion.
