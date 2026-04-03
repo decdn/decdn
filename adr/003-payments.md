@@ -659,7 +659,7 @@ The EIP-712 domain separator is the same as the `StakingRegistry` contract deplo
 
 ### On-Chain Registration
 
-Node registration and NodeId binding are atomic. `StakingRegistry.registerNode()` ([ADR 001](001-network.md)) accepts a `bindingSignature` parameter — an EIP-712 signature over `BindNodeId(nodeId, nonce)` — and writes the `nodeIdToAddress`/`addressToNodeId` mappings in the same transaction that adds the node to the mesh. This eliminates the window in which a node could be active but not slashable.
+Node registration and NodeId binding are atomic. `StakingRegistry.registerNode()` ([ADR 001](001-network.md)) accepts a `bindingSignature` parameter — an EIP-712 signature over `BindNodeId(nodeId, bindingNonce[msg.sender])` — and verifies the signature, writes the `nodeIdToAddress`/`addressToNodeId` mappings, and increments `bindingNonce[msg.sender]` in the same transaction that adds the node to the mesh. The per-address nonce counter is shared with `bindNodeId`, ensuring replay protection across both paths. This eliminates the window in which a node could be active but not slashable.
 
 The standalone `StakingRegistry.bindNodeId()` function below remains available for **rebinding only** (key rotation after initial registration). It is no longer needed at initial registration time.
 
