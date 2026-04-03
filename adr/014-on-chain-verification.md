@@ -94,6 +94,8 @@ The Ed25519 signature remains the primary authentication mechanism for the QUIC 
 | Optimistic (no signature verification) | ~50k | Insufficient security | A node could deny authorship of any message; counter-evidence alone is not enough |
 | **Dual-key slash signatures (chosen)** | **~3,000** | **Recommended** | Uses proven `ecrecover`; adds one `Option` field per message; no new infrastructure |
 
+> **Note:** [ADR 001](001-network.md#nodeid-ownership-verification) uses direct ed25519 verification (Solidity library, ~500k–1M gas) for node registration ownership proof. This is acceptable because registration is a one-time cost per node lifetime, unlike slash evidence which may be submitted frequently.
+
 ### 2. BLAKE3 Content Corruption — Optimistic Challenge-Response
 
 #### Problem
