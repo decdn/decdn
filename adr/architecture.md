@@ -426,6 +426,13 @@ The app server is operated by the content provider (e.g., a streaming platform's
   - `channels_open`, `channels_settled` — payment channel lifecycle
   - `cache_hits`, `cache_misses`, `cache_bytes` — cache performance
 - **Health endpoint** at `/health` on the metrics HTTP port — returns node status, peer count, and channel balances
+- **Slash-risk metrics** — early warning for conditions that can lead to slashing (see [ADR 004](004-tokenomics.md)):
+  - `probe_hold_violations` — times a blob was evicted within `probe_hold_duration` after signing `has_blob: true` (phantom announcement risk — [ADR 005](005-protocol.md))
+  - `probe_hold_slots_used` — current occupied hold slots out of `max_probe_holds` (saturation signal — [ADR 005](005-protocol.md))
+  - `rate_bounds_clamp_events` — times `rate_per_mb` was clamped to governance bounds before signing ([ADR 005](005-protocol.md))
+  - `blacklist_sync_lag_seconds` — seconds since last successful `getBlacklistVersion()` poll ([ADR 011](011-content-takedown.md))
+  - `blacklist_version_behind` — gap between local and on-chain blacklist version ([ADR 011](011-content-takedown.md))
+  - `slash_evidence_exposure` — times the node detected it produced a signed probe + stream pair meeting slashing contradiction conditions within the 30-second window ([ADR 005](005-protocol.md))
 
 ---
 
