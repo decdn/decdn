@@ -36,10 +36,12 @@ Where interaction_score is:
 | Metric | Score Contribution | Weight |
 |--------|-------------------|--------|
 | Delivery speed (bytes/sec vs. expected) | 0.0-1.0 (linear scale) | 40% |
-| Data correctness (BLAKE3 verified) | 0.0 or 1.0 (binary) | 40% |
+| Data correctness (BLAKE3 verified) | 0.0 or 1.0 (binary) | 40% ¹ |
 | Connection success (reachable?) | 0.0 or 1.0 (binary) | 20% |
 
 Formula: `interaction_score = 0.4 * speed_score + 0.4 * correctness + 0.2 * reachability`
+
+> **¹ Why 40% for data correctness — same as delivery speed?** The reputation system measures *service quality*, not *honesty*. Data correctness is one quality signal among several, and the primary deterrent for corruption is economic, not reputational. A BLAKE3 mismatch triggers on-chain slashing via the challenge-response mechanism in [ADR 014](014-on-chain-verification.md): 10% stake slash per offense (PoC), escalating 5%/15%/50% (production), with auto-ejection when remaining stake falls below 50% of the minimum ([ADR 004](004-tokenomics.md)). The reputation impact compounds on top of this: a single corruption event (a) zeros the correctness component (−0.4 on `interaction_score`), (b) drops `local_score` via EWMA, and (c) degrades node selection via the quadratic reputation penalty (`1/max(reputation, 0.1)²` — [ADR 001](001-network.md#node-selection-algorithm)). Together, economic slashing and traffic loss make corruption irrational for any staked node. A higher reputation weight or immediate local blacklist would duplicate the slashing mechanism without improving security.
 
 Normalization: `speed_score = min(1.0, actual_bps / expected_bps)` where `expected_bps` is a node-local configurable baseline (default: 10 MiB/s = 10,485,760 bytes/sec).
 
