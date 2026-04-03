@@ -216,7 +216,8 @@ struct NodeInfo {
     address ethAddress;          // Ethereum address for payment channels
     bytes   multiaddrs;          // packed QUIC multiaddrs (length-prefixed entries)
     string  regionHint;          // ISO 3166-1 alpha-2 code (self-reported, unverified)
-    uint256 registeredAt;        // block.timestamp of initial registration
+    uint256 registeredAt;        // block.timestamp of current registration
+    uint256 firstRegisteredAt;   // block.timestamp of first-ever registration (immutable once set)
     uint256 lastMultiaddrUpdate; // block.timestamp of last multiaddr change
     bool    active;              // false after deregistration or auto-ejection
 }
@@ -248,6 +249,7 @@ function isActiveNode(bytes32 nodeId) external view returns (bool);
 function getActiveNodeCount() external view returns (uint256);
 function getActiveNodes(uint256 offset, uint256 limit)
     external view returns (NodeInfo[] memory);
+function getFirstRegisteredAt(address ethAddress) external view returns (uint256);
 
 // Events
 event NodeRegistered(
@@ -270,6 +272,7 @@ event NodeAutoEjected(bytes32 indexed nodeId, uint256 remainingStake);
 - **`registerNode` rejects `nodeId == bytes32(0)`**, since this value is reserved as the unregistered sentinel. It binds `msg.sender` to `nodeId` — the caller's Ethereum address becomes `ethAddress`. This binding is on-chain and permanent until deregistration, distinct from the ephemeral per-session `NodeId`-to-address binding described in ADR 003 for clients. The `bindingSignature` parameter is an EIP-712 signature over `BindNodeId(nodeId, bindingNonce[msg.sender])` (see [ADR 003](003-payments.md)); `registerNode` verifies this signature against the caller's current `bindingNonce`, then atomically writes the `nodeIdToAddress`/`addressToNodeId` mappings and increments `bindingNonce[msg.sender]` within the same transaction. This shares the per-address nonce counter with `bindNodeId`, ensuring replay protection across both registration and rebinding. Every registered node is immediately slashable — there is no window in which a node can be active in the mesh without a verifiable binding. The separate `StakingRegistry.bindNodeId()` function in [ADR 003](003-payments.md) remains available for rebinding (key rotation) after initial registration.
 - **`deregisterNode` triggers unbonding.** Sets `active = false` and starts the current unbonding period (default 7 days, minimum 3 days per [ADR 009](009-governance.md)). Stake remains slashable during unbonding to prevent slash-then-run.
 - **Auto-ejection.** When slashing drops a node's stake below 50% of the minimum stake requirement ([ADR 004](004-tokenomics.md)), the contract sets `active = false` and emits `NodeAutoEjected`. The node must re-stake at full minimum to rejoin.
+- **`firstRegisteredAt` is write-once.** `registerNode` sets `firstRegisteredAt = block.timestamp` only if the stored value is 0 (first-ever registration for this address). On re-registration after deregistration or auto-ejection, `firstRegisteredAt` retains its original value. This field is never cleared by `deregisterNode` or auto-ejection. Used by clients to determine cold-start bootstrap eligibility ([ADR 008](008-reputation.md#10-cold-start-bootstrap)).
 
 ### Multiaddr Update Policy
 

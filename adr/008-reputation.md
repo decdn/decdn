@@ -183,6 +183,8 @@ When multiple nodes have the same unified selection score (within 1% — see [AD
 
 During the first 7 days after staking (or first 50 completed interactions, whichever comes first), new nodes receive a 10% selection bonus — scores temporarily boosted by 0.05 (additive), clamped to 1.0: `boosted_score = min(final_score + 0.05, 1.0)`. Local to each client, decays linearly over the bootstrap period.
 
+**Anti-gaming: one-time bonus per operator.** The bootstrap bonus is granted only once per operator Ethereum address. Clients check `StakingRegistry.getFirstRegisteredAt(operator)` and compare it against the chain's latest block timestamp. If `firstRegisteredAt > 0` and the operator's first registration is older than 7 days, no bonus is applied, regardless of the current `registeredAt`. The 7-day bootstrap timer is derived from `firstRegisteredAt`, not `registeredAt`. This prevents the unstake → re-stake cycle described in the threat model. The `firstRegisteredAt` field is immutable once set and survives deregistration, auto-ejection, and re-registration (see [ADR 001](001-network.md#data-structure)).
+
 ### 11. Rate Limiting
 
 - Max 1 report per (reporter, node) pair per hour
@@ -199,7 +201,7 @@ During the first 7 days after staking (or first 50 completed interactions, which
 | Combined score | Local-only (`final_score = local_score`; no network component) | 70/30 local/network blend |
 | Score decay | Not implemented (scores persist indefinitely) | 10%/week toward 0.5 |
 | Score clamping | Not implemented (no per-report ±0.05 cap) | Per-report ±0.05 cap |
-| Cold-start bootstrap bonus | Not implemented | +0.05 additive, linear decay over 7 days / 50 interactions |
+| Cold-start bootstrap bonus | Not implemented | +0.05 additive, linear decay over 7 days / 50 interactions; one-time per operator via `firstRegisteredAt` |
 | Rate limiting | Not implemented (no gossip to rate-limit) | Per Section 11 |
 | ReputationReport gossip | Not implemented | Signed reports on `cdn/reputation/v1` topic |
 | Tie-breaking | Simplified: lower load → random | Full 4-tier (load → geo → stake → random) |
