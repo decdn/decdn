@@ -169,6 +169,12 @@ Extends ADR 003 to support multiple ERC-20 tokens. The production `PaymentChanne
 
 A `ContentBlacklist` contract supports global (network-wide) and regional (jurisdiction-scoped) takedown via designated regional governance bodies. Standard governance entries have a 24-hour compliance window; the emergency multisig path takes effect immediately with a 2-hour slash window. Origin blacklisting by operator address counters hash evasion via trivial re-encoding — each re-upload requires fresh stake and a new identity. Each node also maintains a local denylist for direct legal notices. Serving a blacklisted hash after the compliance window is a slashable offense, subject to the escalating schedule in [ADR 004](004-tokenomics.md).
 
+### [ADR 012 — Client Architecture, Bootstrap, and Trust Model](012-client.md)
+
+**Canonical specification for client bootstrap, key management, identity lifecycle, and trust boundary.**
+
+Clients are lightweight QUIC endpoints that subscribe to gossip (but do not publish), maintain local peer tables and reputation scores, and pay for content via off-chain vouchers. The bootstrap procedure covers iroh key generation, Ethereum key import, registry query with exponential-backoff retry and `peers.json` fallback, gossip subscription, and periodic registry refresh. Key management distinguishes PoC (file-based) from production (platform keychain, hardware wallet with derived hot key for voucher signing). Ephemeral NodeId-to-Ethereum bindings are per-connection with `nonce=0` sentinel. Eclipse attack mitigation is resolved: registry-only for PoC; multi-source bootstrap (Option B — on-chain registry + DNS seed list) for production, with minimum peer diversity (Option C) as supplementary client-side policy. An explicit three-tier trust boundary classifies what the client verifies, trusts, and does not trust.
+
 ---
 
 ## Key Invariants
