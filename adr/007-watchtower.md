@@ -293,20 +293,22 @@ interface IWatchtowerEscrow {
 
     /// Watchtower claims the escrowed monitoring fee after the monitoring period ends.
     /// Requires block.timestamp >= periodEnd and status == Active.
-    /// Transfers feeAmount to the watchtower. gasBonus is returned to the watched party
-    /// unless a dispute was submitted (see claimGasBonus).
+    /// Reverts if the watchtower's global lastHeartbeat shows missThreshold or more
+    /// consecutive missed windows at claim time (same liveness check as reclaimEscrow).
+    /// Sets status = Completed. Transfers feeAmount to the watchtower. gasBonus is
+    /// returned to the watched party unless a dispute was submitted (see claimGasBonus).
     function claimFee(uint256 escrowId) external;
 
     /// Watchtower claims the gas bonus after submitting a successful disputeChannel.
-    /// The contract reads the disputor address from StablePaymentChannel contract state
-    /// (Channel.lastDisputor) via a cross-contract static call to verify that the
-    /// watchtower submitted the dispute. Transfers gasBonus to the watchtower.
+    /// The contract reads Channel.lastDisputor from the payment channel contract via
+    /// a cross-contract static call to verify that the watchtower submitted the dispute.
+    /// Sets status = Disputed. Transfers gasBonus to the watchtower.
     function claimGasBonus(uint256 escrowId) external;
 
     /// Watched party reclaims escrowed funds if the watchtower's global lastHeartbeat shows
     /// N or more missed heartbeat windows (default 3 = 18 hours). Computed lazily from
-    /// (block.timestamp - lastHeartbeat) / heartbeatInterval. Transfers feeAmount + gasBonus
-    /// back to the watched party.
+    /// (block.timestamp - lastHeartbeat) / heartbeatInterval.
+    /// Sets status = Reclaimed. Transfers feeAmount + gasBonus back to the watched party.
     function reclaimEscrow(uint256 escrowId) external;
 
     // ── Views ──────────────────────────────────────────────────
@@ -385,7 +387,7 @@ bytes32 constant HEARTBEAT_TYPEHASH = keccak256(
 - `depositEscrow`: callable by any address (the caller becomes `watchedParty`).
 - `submitHeartbeat`: callable by any address. The contract recovers the signer from the EIP-712 signature and verifies it matches an active watchtower. This enables gas relaying — a third party can submit heartbeats on behalf of a watchtower. The contract stores a single global `lastHeartbeat` timestamp per recovered watchtower address.
 - `claimFee`: callable only by the `watchtower` address recorded in the escrow, only after `block.timestamp >= periodEnd` and `status == Active`. The contract checks liveness by comparing the watchtower's global `lastHeartbeat` against the escrow's timing requirements.
-- `claimGasBonus`: callable only by the `watchtower` address. The contract reads `Channel.lastDisputor` from the `StablePaymentChannel` contract via `getChannel()` and verifies `lastDisputor == msg.sender` for the escrowed channel. This requires `StablePaymentChannel` to store the `disputor` address in the `Channel` struct on each successful `disputeChannel` call (a minor addition — see [Contract Integration](#2-contract-integration)).
+- `claimGasBonus`: callable only by the `watchtower` address. The contract reads `Channel.lastDisputor` from the payment channel contract via `getChannel()` and verifies `lastDisputor == msg.sender` for the escrowed channel. This requires the payment channel contract to store the `disputor` address in the `Channel` struct on each successful `disputeChannel` call (see [Contract Integration](#2-contract-integration) and [ADR 003](003-payments.md)).
 - `reclaimEscrow`: callable only by the `watchedParty`. The contract computes missed heartbeats lazily: `missedWindows = (block.timestamp - lastHeartbeat[watchtower]) / heartbeatInterval`. Reverts if `missedWindows < missThreshold`.
 - All `set*` functions: admin key (PoC), timelock governance (production).
 

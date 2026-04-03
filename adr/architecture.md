@@ -257,6 +257,7 @@ The system relies on several infrastructure-level assumptions beyond the cryptog
 | **Origin-backed node** | A node configured with an S3-compatible object store (e.g., S3/R2/B2/MinIO), NFS mount, or local disk — can serve any blob in that store, never experiences a true cache miss |
 | **Slash signature** | An EIP-712 secp256k1 signature (`slash_sig`) on protocol messages, used for on-chain slash evidence via `ecrecover`. Distinct from the Ed25519 wire signature — see [ADR 014](014-on-chain-verification.md) |
 | **SlashJudge** | The on-chain contract that adjudicates all slashable offenses, verifies slash signatures, manages challenge bonds, and calls `StakingRegistry.slash()` — see [ADR 014](014-on-chain-verification.md) |
+| **WatchtowerEscrow** | The on-chain contract that manages prepaid watchtower monitoring fees and enforces heartbeat-based liveness accountability. Standalone contract that reads channel state but does not modify the payment channel contract — see [ADR 007](007-watchtower.md) |
 
 ---
 
