@@ -117,14 +117,14 @@ The compliance window is a governable parameter (hardcoded bounds: minimum 1 hou
 
 Hash-based blacklisting covers only exact copies of a blob. A one-byte change produces a completely different BLAKE3 hash and evades the blacklist. This is a known limitation shared by every hash-based content moderation system.
 
-**The protocol's primary response is origin blacklisting.** If an origin-backed node repeatedly sources blacklisted content — whether the same blob or trivially re-encoded variants — governance can blacklist the operator's Ethereum address. A blacklisted origin:
+**The protocol's primary response is origin blacklisting.** If an origin-backed node repeatedly sources blacklisted content — whether the same blob or trivially re-encoded variants — governance can blacklist the operator's Ethereum address. `ContentBlacklist.addOrigin()` calls `StakingRegistry.ejectNode(operatorAddress)` via a cross-contract call; the `StakingRegistry` grants the `ContentBlacklist` contract address the `BLACKLIST_ROLE`, permitting this call. A blacklisted origin:
 
-- Is removed from the `StakingRegistry` (same effect as stake ejection)
+- **Ejected from `StakingRegistry`** — sets `active = false`, emits `NodeAutoEjected`. This follows the same code path as stake-based auto-ejection ([ADR 004 § Auto-ejection](004-tokenomics.md#auto-ejection))
+- **Remaining stake enters forced unbonding** — the standard unbonding period applies (7 days PoC / governable in production, minimum 3 days). Stake remains slashable during unbonding ([ADR 004](004-tokenomics.md))
+- **Address permanently banned** — cannot register new nodes under the same Ethereum address. Re-entry requires a new identity funded with fresh stake (minimum 1,000 TOKEN — [ADR 004](004-tokenomics.md))
+- **All NodeIds excluded from peer tables** — gossip validation rejects messages from blacklisted nodes
 
-The `ContentBlacklist.addOrigin()` function calls `StakingRegistry.ejectNode(operatorAddress)` via a cross-contract call. The `StakingRegistry` grants the `ContentBlacklist` contract address the `BLACKLIST_ROLE`, permitting this call. The ejection follows the same path as stake-based auto-ejection (emits `NodeAutoEjected`, sets `active = false`).
-
-- Cannot register new nodes under the same address
-- Has all its NodeIds excluded from peer tables (gossip validation rejects messages from blacklisted nodes)
+> **Ejection vs. slashing.** Origin blacklisting triggers ejection (forced unbonding of remaining stake), *not* the escalating slash schedule. The operator's stake is not burned — it is returned after the unbonding period, assuming no separate slashable offense occurs during unbonding. By contrast, *serving* a blacklisted hash after the compliance window is a slashable offense under the escalating schedule in [ADR 004](004-tokenomics.md#slash-amounts-escalating), where stake is partially burned and the challenger is rewarded. A node operator can face both: slashing for serving blacklisted content, followed by origin blacklisting and ejection if the behaviour persists.
 
 This raises the cost of re-upload evasion from trivial (change a byte) to significant: the operator must fund and register a new identity with fresh stake. Repeat evasion becomes progressively more expensive.
 
