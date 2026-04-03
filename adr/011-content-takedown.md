@@ -119,10 +119,10 @@ Hash-based blacklisting covers only exact copies of a blob. A one-byte change pr
 
 **The protocol's primary response is origin blacklisting.** If an origin-backed node repeatedly sources blacklisted content — whether the same blob or trivially re-encoded variants — governance can blacklist the operator's Ethereum address. `ContentBlacklist.addOrigin()` calls `StakingRegistry.ejectNode(operatorAddress)` via a cross-contract call; the `StakingRegistry` grants the `ContentBlacklist` contract address the `BLACKLIST_ROLE`, permitting this call. A blacklisted origin:
 
-- **Ejected from `StakingRegistry`** — sets `active = false`, emits `NodeAutoEjected`. This follows the same code path as stake-based auto-ejection ([ADR 004 § Auto-ejection](004-tokenomics.md#auto-ejection))
-- **Remaining stake enters forced unbonding** — the standard unbonding period applies (7 days PoC / governable in production, minimum 3 days). Stake remains slashable during unbonding ([ADR 004](004-tokenomics.md))
-- **Address permanently banned** — cannot register new nodes under the same Ethereum address. Re-entry requires a new identity funded with fresh stake (minimum 1,000 TOKEN — [ADR 004](004-tokenomics.md))
-- **All NodeIds excluded from peer tables** — gossip validation rejects messages from blacklisted nodes
+- **Ejected from `StakingRegistry`** — sets `active = false`, emits `NodeAutoEjected` ([ADR 001](001-network.md)). This follows the same code path as stake-based auto-ejection ([ADR 004 § Auto-ejection](004-tokenomics.md#auto-ejection))
+- **Remaining stake enters forced unbonding** — the standard unbonding period applies (7 days PoC / governable in production, minimum 3 days). Stake remains slashable during unbonding ([ADR 004 § Staking Parameters](004-tokenomics.md#staking-parameters))
+- **Address banned while blacklisted** — cannot register new nodes under the same Ethereum address unless governance removes the blacklist entry via `removeOrigin(operatorAddress)`. Re-entry otherwise requires a new identity funded with fresh stake (minimum 1,000 TOKEN — [ADR 004 § Staking Parameters](004-tokenomics.md#staking-parameters))
+- **The operator's registered NodeId is excluded from peer tables** — gossip validation rejects messages from that blacklisted node
 
 > **Ejection vs. slashing.** Origin blacklisting triggers ejection (forced unbonding of remaining stake), *not* the escalating slash schedule. The operator's stake is not burned — it is returned after the unbonding period, assuming no separate slashable offense occurs during unbonding. By contrast, *serving* a blacklisted hash after the compliance window is a slashable offense under the escalating schedule in [ADR 004](004-tokenomics.md#slash-amounts-escalating), where stake is partially burned and the challenger is rewarded. A node operator can face both: slashing for serving blacklisted content, followed by origin blacklisting and ejection if the behaviour persists.
 
