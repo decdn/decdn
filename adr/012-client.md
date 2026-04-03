@@ -5,10 +5,10 @@
 
 ## Context
 
-Clients are referenced throughout ADRs 001–011 — they pay for content, hold Ethereum keys that authorize fund movement, maintain peer tables, validate gossip, and decrypt sealed envelopes — but no ADR defines the client as a coherent entity. Five gaps block PoC functionality:
+Clients are referenced throughout ADRs 001–011 — they pay for content, hold Ethereum keys that authorize fund movement, maintain peer tables, validate gossip, and decrypt content envelopes — but no ADR defines the client as a coherent entity. Five gaps block PoC functionality:
 
 1. **Bootstrap** — how does a client discover initial peers? [ADR 001](001-network.md) specifies registry query and retry but the procedure is interleaved with node-specific concerns and is incomplete for clients (no gossip subscription policy, no identity loading).
-2. **Key management** — clients hold an iroh Ed25519 key (NodeId), an Ethereum secp256k1 key (voucher signing, channel operations), and an implicit X25519 key (sealed envelope decryption). Generation, storage, and rotation are unspecified.
+2. **Key management** — clients hold an iroh Ed25519 key (NodeId) and an Ethereum secp256k1 key (voucher signing, channel operations). Generation, storage, and rotation are unspecified.
 3. **Identity lifecycle** — [ADR 005](005-protocol.md) defines ephemeral NodeId-to-Ethereum bindings in `StreamRequest` but does not specify creation, rotation, or expiry.
 4. **Eclipse attack resolution** — [ADR 003](003-payments.md) lists Options A/B/C with no decision.
 5. **Trust boundary** — what does the client verify vs. trust? This is implied across multiple ADRs but never stated explicitly.
@@ -70,11 +70,11 @@ The registry query, retry schedule, and `peers.json` fallback behaviour defined 
 
 ### Key Management
 
-Clients manage two independent cryptographic keys. A third (X25519) is derived deterministically and requires no separate storage.
+Clients manage two independent cryptographic keys.
 
 #### iroh Identity Key (Ed25519)
 
-- **Purpose:** Defines the client's `NodeId` in the peer mesh. Used for QUIC connection authentication and as the basis for X25519 derivation ([ADR 006](006-e2e-encryption.md)).
+- **Purpose:** Defines the client's `NodeId` in the peer mesh. Used for QUIC connection authentication — both for CDN delivery (`cdn/client/v1`, `cdn/probe/v1`) and for key delivery from the app server (`cdn/keys/v1`, [ADR 006](006-e2e-encryption.md)).
 - **Generation:** Created at first startup via `iroh::SecretKey::generate()`.
 - **Storage (PoC):** File at `~/.decdn/iroh_key`, permissions `0600`. No encryption — the file contains the raw 32-byte secret key.
 - **Storage (production):** Platform keychain (macOS Keychain, Windows Credential Manager, Linux Secret Service API).
@@ -102,17 +102,12 @@ voucher_key = HKDF-SHA256(
 
 The resulting secp256k1 key is used exclusively for EIP-712 voucher signatures. It is held in memory only — never written to disk. The corresponding Ethereum address must be pre-authorized in the payment channel contract as a delegated signer (contract support for delegated signers is deferred to a future ADR).
 
-#### X25519 Key (Sealed Envelope Decryption)
-
-Derived deterministically from the iroh Ed25519 key via birational map to Curve25519 ([ADR 006](006-e2e-encryption.md)). No separate generation or storage. Available whenever the iroh key is loaded.
-
 #### Key Summary
 
 | Key | Algorithm | PoC Storage | Production Storage | Rotation |
 | --- | --- | --- | --- | --- |
 | iroh identity | Ed25519 | `~/.decdn/iroh_key` (0600) | Platform keychain | New key + reconnect |
 | Ethereum | secp256k1 | `~/.decdn/eth_keystore` (encrypted) | Hardware wallet + derived hot key | Wallet-level |
-| X25519 | X25519 | Derived from iroh key | Derived from iroh key | Follows iroh key |
 
 ### Identity Lifecycle
 
@@ -134,7 +129,7 @@ Client identity bindings are **ephemeral and per-connection**, as specified in [
 
 | Compromised key | Impact | Response |
 | --- | --- | --- |
-| iroh Ed25519 | Attacker can impersonate client NodeId (connect to nodes, receive gossip) but cannot sign vouchers or move funds | Generate new iroh key, reconnect |
+| iroh Ed25519 | Attacker can impersonate client NodeId (connect to nodes, receive gossip) but cannot sign vouchers or move funds. Attacker can connect to the app server as this NodeId via `cdn/keys/v1`, but cannot authenticate without the session token — no content access. | Generate new iroh key, reconnect |
 | Ethereum secp256k1 | Attacker can sign vouchers draining the payment channel balance | Race to close channels: call `closeChannel` with the latest voucher nonce. If attacker has already submitted a close with a higher-nonce voucher, dispute within the challenge window ([ADR 003](003-payments.md)). No revocation mechanism exists beyond racing to close. |
 | Both | Full impersonation | Close all channels immediately. Generate new iroh key. Use a new Ethereum address for future sessions. |
 
@@ -172,7 +167,7 @@ The DNS seed domains are maintained by governance ([ADR 009](009-governance.md))
 - **RPC endpoint:** Returns correct registry data. A compromised RPC can return a fabricated node list (eclipse). Mitigated in production by multi-source bootstrap (Option B above).
 - **Registry correctness:** The `StakingRegistry` contract accurately reflects staked nodes. Enforced by EVM execution — trust in the chain, not any specific party.
 - **Gossip integrity:** `NodeAnnounce` messages are signed by the announcing node's registered key and validated against the registry. A node cannot forge another's announcement. However, `LoadHint` and `popular_hashes` are advisory — a node can lie, affecting selection quality but not safety.
-- **App server:** For encrypted content ([ADR 006](006-e2e-encryption.md)), the client trusts the app server to deliver correct epoch keys and sealed envelopes. This is outside the CDN trust boundary.
+- **App server:** For encrypted content ([ADR 006](006-e2e-encryption.md)), the client trusts the app server to deliver correct epoch keys and envelopes over `cdn/keys/v1`. The QUIC handshake authenticates the app server's NodeId; the session token binds the client to its subscriber account. The app server is outside the CDN protocol boundary but shares the iroh transport layer.
 - **Clock:** NTP-synchronized local clock, used for gossip validation (±60 s freshness). Drift beyond this window causes the client to reject valid gossip.
 
 **Not trusted — the client does not rely on these:**
