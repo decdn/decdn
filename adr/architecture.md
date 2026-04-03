@@ -51,9 +51,9 @@ graph TD
     N2 <-.->|"iroh-gossip<br/>NodeAnnounce"| N3
 
     S3 -.->|"K_blob at ingest"| A
-    A -.->|"WebSocket/SSE<br/>epoch keys + sealed envelopes"| C1
-    A -.->|"WebSocket/SSE<br/>epoch keys + sealed envelopes"| C2
-    A -.->|"WebSocket/SSE<br/>epoch keys + sealed envelopes"| C3
+    A -.->|"cdn/keys/v1<br/>epoch keys + envelopes"| C1
+    A -.->|"cdn/keys/v1<br/>epoch keys + envelopes"| C2
+    A -.->|"cdn/keys/v1<br/>epoch keys + envelopes"| C3
 ```
 
 **Note:** PoC payments use USDC only; production supports multiple governance-approved ERC-20 tokens (see [ADR 010](010-multi-token.md)).
@@ -106,20 +106,21 @@ TOKEN is not used for payments. All nodes must stake TOKEN to participate. Staki
 
 ### [ADR 005 — Wire Protocol](005-protocol.md)
 
-**Three ALPN protocols + iroh-gossip. `cdn/client/v1` covers all paid delivery.**
+**Five protocols (four ALPN + iroh-gossip). `cdn/client/v1` covers all paid delivery.**
 
 | Protocol | Purpose |
 | --- | --- |
 | `cdn/probe/v1` | Parallel latency + availability check before node selection |
 | `cdn/client/v1` | Paid delivery: client→node, node→node (cache miss) |
 | `cdn/watchtower/v1` | Channel-dispute monitoring ([ADR 007](007-watchtower.md)) |
+| `cdn/keys/v1` | Epoch key delivery, play requests, offline leases ([ADR 006](006-e2e-encryption.md)) |
 | iroh-gossip (built-in) | Node metadata broadcast (`NodeAnnounce`), node discovery |
 
 Gossip topics: `cdn/global/v1` (all nodes), `cdn/region/{cc}/v1` (regional), `cdn/reputation/v1` (reputation reports — [ADR 008](008-reputation.md)).
 
 `redirect` in `StreamResponse` always points to a NodeId, never an external URL. The origin backend is never revealed.
 
-**Note:** Epoch key delivery (ADR 006) uses WebSocket/SSE over standard HTTPS, not an iroh QUIC ALPN. The app server is an external component operated by the content provider; see [External Components](#external-components).
+**Note:** `cdn/keys/v1` is handled by the app server — an external component that shares the iroh QUIC transport but is not a CDN protocol participant (no gossip, probing, or staking). See [External Components](#external-components).
 
 ---
 
@@ -127,7 +128,7 @@ Gossip topics: `cdn/global/v1` (all nodes), `cdn/region/{cc}/v1` (regional), `cd
 
 **Envelope encryption with epoch-rotated key distribution.**
 
-Each blob is encrypted once at ingest with a random symmetric key (XChaCha20-Poly1305). The ciphertext is content-addressed and cached normally — one hash, one copy for all clients. An **app server** — an external component operated by the content provider, outside the CDN protocol and crate structure — gates access: on each play request it wraps the blob key with a rotating epoch key and seals it to the client's public key. Epoch keys are pushed over an authenticated persistent connection (WebSocket/SSE over HTTPS); closing the connection revokes access within one epoch (5 minutes). CDN nodes only ever see ciphertext. See [External Components](#external-components) for the app server's role and deployment model.
+Each blob is encrypted once at ingest with a random symmetric key (XChaCha20-Poly1305). The ciphertext is content-addressed and cached normally — one hash, one copy for all clients. An **app server** — an external component operated by the content provider — gates access: on each play request it wraps the blob key with a rotating epoch key and sends it over an authenticated `cdn/keys/v1` QUIC stream. Closing the epoch key stream revokes access within one epoch (5 minutes). CDN nodes only ever see ciphertext. See [External Components](#external-components) for the app server's role and deployment model.
 
 ---
 
@@ -168,6 +169,12 @@ Extends ADR 003 to support multiple ERC-20 tokens. The production `PaymentChanne
 **Governance-controlled on-chain hash blacklist with regional bodies and emergency fast-path.**
 
 A `ContentBlacklist` contract supports global (network-wide) and regional (jurisdiction-scoped) takedown via designated regional governance bodies. Standard governance entries have a 24-hour compliance window; the emergency multisig path takes effect immediately with a 2-hour slash window. Origin blacklisting by operator address counters hash evasion via trivial re-encoding — each re-upload requires fresh stake and a new identity. Each node also maintains a local denylist for direct legal notices. Serving a blacklisted hash after the compliance window is a slashable offense, subject to the escalating schedule in [ADR 004](004-tokenomics.md).
+
+### [ADR 012 — Client Architecture, Bootstrap, and Trust Model](012-client.md)
+
+**Client bootstrap, key management, identity lifecycle, and trust boundary.**
+
+Clients are lightweight QUIC endpoints that subscribe to gossip (but do not publish), maintain local peer tables and reputation scores, and pay for content via off-chain vouchers. The bootstrap procedure covers iroh key generation, Ethereum key import, registry query with exponential-backoff retry and `peers.json` fallback, gossip subscription, and periodic registry refresh. Key management distinguishes PoC (file-based) from production (platform keychain, hardware wallet with derived hot key for voucher signing). Ephemeral NodeId-to-Ethereum bindings are per-connection with `nonce=0` sentinel. Eclipse attack mitigation is resolved: registry-only for PoC; multi-source bootstrap (Option B — on-chain registry + DNS seed list) for production, with minimum peer diversity (Option C) as supplementary client-side policy. An explicit three-tier trust boundary classifies what the client verifies, trusts, and does not trust.
 
 ---
 
@@ -354,19 +361,19 @@ Components referenced by ADRs that are operated by content providers, not part o
 
 ### App Server ([ADR 006](006-e2e-encryption.md))
 
-The app server is a traditional web service operated by the content provider (e.g., a streaming platform's backend). It is **not** part of the decentralized CDN — it does not participate in gossip, probing, or paid delivery.
+The app server is operated by the content provider (e.g., a streaming platform's backend). It shares the iroh QUIC transport layer with the CDN but is **not** a CDN protocol participant — it does not participate in gossip, probing, or paid delivery.
 
 **Responsibilities:**
 
 - Stores blob encryption keys (`K_blob`) received from the origin at ingest time
 - Authenticates client sessions and validates subscription status
-- Delivers epoch keys over an authenticated persistent connection (WebSocket or SSE); signals `server_secret` rotation via `epoch_key_revoked` events on the same connection
-- Issues sealed envelopes (`crypto_box_seal`) containing wrapped `K_blob` on play requests
+- Delivers epoch keys over an authenticated `cdn/keys/v1` QUIC stream; signals `server_secret` rotation via `epoch_key_revoked` events on the same stream
+- Issues envelopes containing epoch-key-wrapped `K_blob` on play requests
 - Builds and returns offline playback leases (client seals locally to device keystore)
 
-**Why WebSocket/SSE, not iroh QUIC:** The app server intentionally sits outside the iroh ecosystem. It handles subscription billing, OAuth/session auth, and key management — traditional web service concerns. Content providers integrate it with their existing infrastructure (load balancers, API gateways, auth systems). Requiring iroh QUIC would couple the provider's application backend to the CDN networking stack without protocol benefit. The watchtower ([ADR 007](007-watchtower.md)) uses iroh QUIC because it is a CDN protocol participant; the app server is not.
+**Why iroh QUIC:** Key delivery is tightly coupled to the client's iroh identity — the QUIC handshake provides mutual authentication (client NodeId ↔ app server NodeId) and TLS 1.3 confidentiality in a single step, eliminating the need for `crypto_box_seal` and X25519 key management. This gives clients a single transport stack for both CDN delivery and key delivery, and makes iroh key rotation seamless (reconnect with new NodeId, re-authenticate with session token). The app server still handles subscription billing, OAuth/session auth, and key management — content providers integrate an `iroh::Endpoint` accepting `cdn/keys/v1` connections alongside their existing auth/billing infrastructure.
 
-**Scaling model:** One persistent connection per active subscriber. Standard WebSocket scaling applies (sticky sessions or pub/sub fanout). The app server scales with subscriber count, not CDN node count.
+**Scaling model:** One iroh QUIC connection per active subscriber. Standard QUIC server scaling applies (connection migration, load balancer affinity). The app server scales with subscriber count, not CDN node count.
 
 **PoC scope:** A minimal reference implementation may be provided in a separate repository. The CDN crates do not depend on it.
 

@@ -17,10 +17,10 @@ This repo uses a VS Code devcontainer with a firewall-isolated environment. The 
 
 ### Working with ADRs
 
-ADRs in `adr/` are the primary deliverables right now. `adr/architecture.md` is the living overview and index of all decisions; numbered files (`000-language.md` through `011-content-takedown.md`) cover individual decisions.
+ADRs in `adr/` are the primary deliverables right now. `adr/architecture.md` is the living overview and index of all decisions; numbered files (`000-language.md` through `012-client.md`) cover individual decisions.
 
 **Conventions:**
-- File naming: `NNN-topic.md` (zero-padded 3-digit prefix, next number is 012)
+- File naming: `NNN-topic.md` (zero-padded 3-digit prefix, next number is 013)
 - When changing any ADR, check for cross-ADR consistency — terms, parameters, and protocol names must match across all ADRs and `architecture.md`. This is the most common source of bugs in this repo.
 - `architecture.md` must be updated whenever an ADR changes a user-visible summary point
 
@@ -64,6 +64,7 @@ crates/
 | `cdn/probe/v1` | Latency + availability probing |
 | `cdn/client/v1` | All paid delivery (client→node and node→node) |
 | `cdn/watchtower/v1` | Channel-dispute monitoring, voucher registration |
+| `cdn/keys/v1` | Epoch key delivery, play requests, offline leases (app server) |
 | iroh-gossip | Node metadata broadcast (`NodeAnnounce`), node discovery |
 
 ### Key Design Decisions

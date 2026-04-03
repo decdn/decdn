@@ -270,6 +270,8 @@ BLAKE3 verification catches data corruption regardless of which nodes are in the
 - **Option B — Multi-source bootstrap.** Clients discover initial peers from at least two independent sources (on-chain registry + a hardcoded DNS seed list). An attacker must compromise both to fully eclipse a client.
 - **Option C — Minimum honest-peer diversity.** Clients maintain connections to at least N nodes discovered via different paths. All N would need to be attacker-controlled for a full eclipse.
 
+> **Resolved in [ADR 012](012-client.md):** Option B (multi-source bootstrap) for production; registry-only for PoC. Option C adopted as supplementary client-side policy.
+
 ---
 
 **Gossip flooding**

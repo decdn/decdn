@@ -42,15 +42,19 @@ XChaCha20-Poly1305 is chosen over AES-256-GCM because its 24-byte nonce eliminat
 
 #### App Server (External Component)
 
-An app server gates access and delivers `K_blob` to authorized clients. The app server is a traditional web service operated by the content provider, **not** part of the CDN protocol or crate structure. It communicates with clients over WebSocket or SSE (provider's choice), not over iroh QUIC. This is a deliberate boundary: the app server handles subscription auth, billing integration, and key management — concerns that belong to the content provider's existing infrastructure, not the decentralized CDN.
+An app server gates access and delivers `K_blob` to authorized clients. The app server is operated by the content provider and is **not** a CDN protocol participant (no gossip, probing, or staking), but it shares the iroh QUIC transport layer with the rest of the network. It communicates with clients over iroh QUIC on the `cdn/keys/v1` ALPN ([ADR 005](005-protocol.md)). The app server handles subscription auth, billing integration, and key management — concerns that belong to the content provider — while reusing the same transport stack the client already has for CDN delivery.
 
-The app server's minimum API surface:
+The app server accepts `cdn/keys/v1` connections from clients. A single connection carries three stream types, differentiated by a 1-byte message type prefix:
 
-- `POST /play` — accepts session token + blob hash, returns sealed envelope
-- `GET /keys/stream` (WebSocket) or `GET /keys/events` (SSE) — authenticated persistent connection for epoch key delivery
-- `POST /offline/lease` — issues offline playback lease for a set of tracks
+- **Epoch key stream** (type `0x01`, long-lived, bidirectional) — client sends `{session_token}`, server pushes `epoch_key` and `epoch_key_revoked` events. Server closes the stream on subscription expiry. Doubles as a presence signal for concurrent stream limiting.
+- **Play request** (type `0x02`, short-lived, request-response) — client sends `{blob_hash}`, server responds with `{wrapped, epoch_id, blob_hash}`. The client's subscription is already authenticated on the epoch key stream.
+- **Offline lease request** (type `0x03`, short-lived, request-response) — client sends `{track_hashes[], device_id}`, server responds with the lease structure (see [Offline Playback](#offline-playback-lease-based-access)).
 
-The technology stack, deployment model, and auth mechanism are provider choices. The CDN protocol is agnostic to these — it only requires that the client possesses the correct epoch key and sealed envelope before issuing a `StreamRequest` to a CDN node.
+The QUIC handshake mutually authenticates the client's iroh NodeId and encrypts the channel (TLS 1.3). The session token on the epoch key stream binds the iroh identity to the provider's subscriber account.
+
+**Authentication sequencing:** The client MUST establish an authenticated epoch key stream (type `0x01`) before opening play request or offline lease streams. The app server MUST reject play/lease streams (types `0x02`, `0x03`) on connections that do not have an active, authenticated epoch key stream — responding with an error and closing the stream. This ensures that every play/lease request is implicitly bound to a verified subscriber session.
+
+The technology stack, deployment model, and auth mechanism are provider choices — the CDN protocol only requires that the app server accepts `cdn/keys/v1` connections and that the client possesses the correct epoch key and envelope before issuing a `StreamRequest` to a CDN node.
 
 #### Key Wrapping Protocol
 
@@ -65,26 +69,27 @@ epoch_key = BLAKE3_derive_key("decdn-epoch-key-v1", provider_node_id || server_s
 
 Uses BLAKE3's `derive_key` mode (not keyed hash). The context string is hardcoded and application-specific per BLAKE3's API contract. The key material is concatenated as: `provider_node_id` (raw 32-byte Ed25519 public key) || `server_secret` (32 bytes, generated via `CSPRNG`) || `epoch_id` (8-byte little-endian `u64`). The provider's NodeId is included in the key material (not the context string) to prevent cross-provider key collisions if two providers share the same `server_secret`.
 
-**Per-request sealed envelope:** On each play request, the app server verifies the client's subscription is active, then wraps `K_blob` with the current epoch key and seals the result to the client's public key:
+**Per-request envelope:** On each play request, the app server verifies the client's subscription is active, then wraps `K_blob` with the current epoch key:
 
 ```
 nonce_wrap = random 24-byte nonce
 wrapped    = nonce_wrap || XChaCha20-Poly1305(epoch_key, nonce_wrap, K_blob)
-envelope   = crypto_box_seal(client_pubkey, {wrapped, epoch_id, blob_hash})
+envelope   = {wrapped, epoch_id, blob_hash}
 ```
 
-`client_pubkey` is the X25519 public key derived from the client's iroh Ed25519 key via the standard birational map (`ge25519_to_x25519`). This is a well-known, widely-implemented conversion (e.g., `ed25519_to_curve25519` in libsodium).
+The envelope is sent directly over the authenticated `cdn/keys/v1` QUIC stream. QUIC TLS 1.3 provides confidentiality and mutual authentication — no additional asymmetric encryption layer (such as `crypto_box_seal`) is needed. This eliminates the X25519 key from the client's key set: the client needs only its iroh Ed25519 key (for QUIC authentication) and its Ethereum secp256k1 key (for payments). See [ADR 012](012-client.md) for the full client key management specification.
 
-The client receives the sealed envelope. To decrypt the blob, the client needs both the envelope and the current epoch key.
+The client receives the envelope. To decrypt the blob, the client needs both the envelope and the current epoch key.
 
-**Epoch key delivery:** Epoch keys are pushed to clients over an authenticated persistent connection (WebSocket or SSE). The connection requires a valid session token. When the subscription expires or is canceled, the connection is closed and the client receives no further epoch keys.
+**Epoch key delivery:** Epoch keys are pushed to clients over the epoch key stream on the `cdn/keys/v1` connection. The client opens a long-lived bidirectional QUIC stream (type `0x01`) and sends its session token. The app server validates the token, then pushes epoch keys as they rotate. When the subscription expires or is canceled, the server closes the stream and the client receives no further epoch keys.
 
 ```mermaid
 sequenceDiagram
     participant A as App Server
     participant C as Client
 
-    C->>A: connect (session token)
+    C->>A: cdn/keys/v1 QUIC connect
+    C->>A: epoch key stream (session token)
     A->>C: epoch_key (epoch 42)
 
     Note over A,C: 5 minutes pass...
@@ -94,13 +99,13 @@ sequenceDiagram
 
     Note over A: subscription canceled
 
-    A->>C: close connection
+    A->>C: close stream
     Note over C: no epoch 44 key — cannot decrypt new content
 ```
 
 ##### Rotation signaling
 
-When the app server rotates `server_secret` (see periodic rotation mitigation under [Consequences](#consequences)), it sends an `epoch_key_revoked` event on the persistent connection to notify clients that outstanding epoch keys are being invalidated:
+When the app server rotates `server_secret` (see periodic rotation mitigation under [Consequences](#consequences)), it sends an `epoch_key_revoked` event on the epoch key stream to notify clients that outstanding epoch keys are being invalidated:
 
 ```
 epoch_key_revoked = {
@@ -124,30 +129,29 @@ sequenceDiagram
     A->>C: epoch_key (epoch 501, secret_v2)
     Note over C: discard epoch 500 key,<br/>re-request any envelopes with epoch_id ≤ 500
 
-    C->>A: POST /play (re-request for stale envelope)
-    A->>C: new sealed envelope {wrapped, epoch_id: 501, hash}
+    C->>A: play request stream {blob_hash}
+    A->>C: new envelope {wrapped, epoch_id: 501, hash}
 ```
 
 **Client behavior on `epoch_key_revoked`:**
 
 1. Discard the cached epoch key for `last_epoch_id` (and any earlier epoch keys, if retained)
-2. Any sealed envelopes referencing `epoch_id <= last_epoch_id` are stale — the client must re-request them via `POST /play` to obtain envelopes wrapped with the new epoch key
+2. Any envelopes referencing `epoch_id <= last_epoch_id` are stale — the client must re-request them via a play request stream to obtain envelopes wrapped with the new epoch key
 3. Wait for the immediately following `epoch_key` push before attempting to decrypt new content
 
-**Disconnected clients:** A client whose persistent connection dropped before receiving the `epoch_key_revoked` event will discover the rotation when it attempts to unwrap a sealed envelope using a stale epoch key: the XChaCha20-Poly1305 AEAD decryption will fail (authentication tag mismatch). On AEAD failure during blob key unwrapping, the client SHOULD reconnect to the epoch key stream and re-request the affected envelope via `POST /play`. This is not a new failure mode — a dropped WebSocket already prevents the client from receiving new epoch keys (see above), so the client must reconnect regardless.
+**Disconnected clients:** A client whose `cdn/keys/v1` connection dropped before receiving the `epoch_key_revoked` event will discover the rotation when it attempts to unwrap an envelope using a stale epoch key: the XChaCha20-Poly1305 AEAD decryption will fail (authentication tag mismatch). On AEAD failure during blob key unwrapping, the client SHOULD reconnect to the app server and re-request the affected envelope via a play request stream. This is not a new failure mode — a dropped connection already prevents the client from receiving new epoch keys (see above), so the client must reconnect regardless.
 
 ### Client Decryption Flow
 
 ```
-1. Receive sealed envelope from app server
-2. Unseal with client private key -> {wrapped, epoch_id, blob_hash}
-3. Parse nonce_wrap (first 24 bytes) from wrapped
-4. Decrypt remainder with epoch_key and nonce_wrap -> K_blob
-5. Fetch ciphertext from CDN via existing protocol (StreamRequest{blob_hash})
-6. Verify BLAKE3(ciphertext) == blob_hash
-7. Parse nonce_blob (first 24 bytes) from ciphertext
-8. Decrypt remainder with K_blob and nonce_blob -> plaintext
-9. Discard K_blob from memory after use
+1. Receive envelope {wrapped, epoch_id, blob_hash} from app server (cdn/keys/v1 play request stream)
+2. Parse nonce_wrap (first 24 bytes) from wrapped
+3. Decrypt remainder with epoch_key and nonce_wrap -> K_blob
+4. Fetch ciphertext from CDN via existing protocol (StreamRequest{blob_hash})
+5. Verify BLAKE3(ciphertext) == blob_hash
+6. Parse nonce_blob (first 24 bytes) from ciphertext
+7. Decrypt remainder with K_blob and nonce_blob -> plaintext
+8. Discard K_blob from memory after use
 ```
 
 ### Full System Flow
@@ -165,16 +169,18 @@ sequenceDiagram
     O->>A: store K_blob
     O->>N: push ciphertext (content-addressed blob)
 
-    C->>A: auth + play request
+    C->>A: cdn/keys/v1 connect + epoch key stream (session token)
+    A->>C: epoch_key (current epoch)
+
+    C->>A: play request stream {hash}
     A->>A: verify subscription
     A->>A: nonce_wrap = random 24 bytes
     A->>A: wrapped = nonce_wrap || encrypt(epoch_key, nonce_wrap, K_blob)
-    A->>C: sealed envelope {wrapped, epoch_id, hash}
+    A->>C: envelope {wrapped, epoch_id, hash}
 
-    C->>N: StreamRequest {hash}
-    N->>C: ciphertext (paid per MB via cdn/client/v1)
+    C->>N: StreamRequest {hash} (cdn/client/v1)
+    N->>C: ciphertext (paid per MB)
 
-    C->>C: unseal envelope with private key
     C->>C: parse nonce_wrap from wrapped, decrypt with epoch_key -> K_blob
     C->>C: verify BLAKE3(ciphertext) == hash
     C->>C: parse nonce_blob from ciphertext, decrypt with K_blob -> plaintext
@@ -204,10 +210,10 @@ App server:
          account_id: "alice"
      }
 
-  5. Return lease to client over authenticated channel
-     // The lease endpoint (POST /offline/lease) MUST be served
-     // over HTTPS, as the response contains plaintext K_blob values.
-     // The client is authenticated via session token.
+  5. Return lease to client over cdn/keys/v1 offline lease request stream (type 0x03)
+     // Delivered over the authenticated QUIC connection. TLS 1.3 provides
+     // confidentiality for the plaintext K_blob values in the response.
+     // The client is already authenticated via the epoch key stream.
 
 Client (on device):
   6. Seal lease to device keystore for at-rest protection:
@@ -262,7 +268,7 @@ If the client never checks in, the lease expires at `expires_at` and offline pla
 
 | | Online (epoch keys) | Offline (lease) |
 | --- | --- | --- |
-| Key source | Epoch key via WebSocket + sealed envelope | Sealed lease from device keystore |
+| Key source | Epoch key via `cdn/keys/v1` + envelope | Sealed lease from device keystore |
 | K_blob lifetime in client | Transient — in memory, discarded after play | Persistent — on disk, sealed to device key |
 | Revocation speed | ~5 minutes (epoch boundary) | Up to 30 days (lease TTL) |
 | Server dependency | Continuous | None until lease expires |
@@ -282,7 +288,7 @@ The offline lease intentionally weakens two properties of the online scheme: K_b
 
 ### Client-enforced expiry (timestamp in envelope, no epoch keys)
 
-The app server seals `{K_blob, expires_at}` directly to the client's public key. The client checks the timestamp before decrypting.
+The app server wraps `{K_blob, expires_at}` and sends it to the client. The client checks the timestamp before decrypting.
 
 Rejected because a hacked client can ignore the timestamp. Expiry becomes advisory, not enforced. Acceptable for a PoC but not for production subscription gating.
 
@@ -310,8 +316,8 @@ Rejected because it destroys global content-addressing. The same track would hav
 | --- | --- | --- |
 | E2E encryption | Not implemented. Content is delivered as plaintext blobs. | Full implementation as described |
 | Epoch key rotation | N/A | 5-minute rotation via BLAKE3_KDF |
-| Key delivery infrastructure | N/A | WebSocket/SSE persistent connection |
-| Sealed envelopes | N/A | XChaCha20-Poly1305 + crypto_box_seal |
+| Key delivery infrastructure | N/A | `cdn/keys/v1` iroh QUIC (epoch key stream + play request streams) |
+| Envelopes | N/A | XChaCha20-Poly1305 wrapped `K_blob` over authenticated QUIC |
 | Offline leases | N/A | 30-day TTL, device-bound keys |
 | Device attestation | N/A | iOS Secure Enclave, Android Keystore |
 | Audio watermarking | N/A | Per-account |
@@ -327,18 +333,19 @@ For PoC, no action items from this ADR are required. Content-addressed blobs are
 - Global content-addressing is preserved: one ciphertext, one hash, one cached copy for all clients. CDN nodes, protocol, payments, and gossip are completely unchanged.
 - CDN nodes never see plaintext or any key material. Compromising a node yields only ciphertext.
 - Compromising a client yields only `K_blob` values for tracks that client has already played — not the catalog. Each blob has an independent random key; there is no master key.
-- Subscription revocation takes effect within one epoch (5 minutes): the client's epoch key stream is closed and previously sealed envelopes cannot be unwrapped without the next epoch key.
-- The epoch key WebSocket doubles as a presence signal for concurrent stream limiting.
-- The key delivery layer uses only primitives already in the stack: BLAKE3 for KDF, XChaCha20-Poly1305 for symmetric encryption, X25519 (convertible from iroh Ed25519 keys) for `crypto_box_seal`.
+- Subscription revocation takes effect within one epoch (5 minutes): the client's epoch key stream is closed and previously received envelopes cannot be unwrapped without the next epoch key.
+- The epoch key stream on `cdn/keys/v1` doubles as a presence signal for concurrent stream limiting.
+- Single transport stack: both CDN delivery and key delivery use iroh QUIC, eliminating the need for a separate WebSocket/SSE stack on the client.
+- The key delivery layer uses only primitives already in the stack: BLAKE3 for KDF and XChaCha20-Poly1305 for symmetric encryption. No asymmetric encryption (X25519/`crypto_box_seal`) is needed — QUIC TLS 1.3 handles confidentiality and authentication.
 
 **Negative:**
 
-- Adds an app server component outside the CDN protocol (documented in [architecture.md](architecture.md#external-components) under External Components). This is a new service that content providers must build, deploy, and operate using their own stack. The client requires two transport stacks: iroh QUIC for CDN delivery and WebSocket/SSE for key delivery. A minimal reference implementation may be provided in a separate repository.
+- Adds an app server component that shares the iroh QUIC transport layer but is not a CDN protocol participant (documented in [architecture.md](architecture.md#external-components) under External Components). Content providers must run an `iroh::Endpoint` accepting `cdn/keys/v1` connections alongside their auth/billing infrastructure. A minimal reference implementation may be provided in a separate repository.
 - The app server's key store (holding all `K_blob` values) is a high-value target. It must be protected with a KMS or HSM in production. Compromise of the key store exposes all content.
 - A hacked client can still extract `K_blob` for tracks it plays in real-time. This is inherent to any scheme where the client produces plaintext output — equivalent to the "analog hole" in DRM systems.
-- Epoch key rotation creates a hard dependency on the persistent connection. If the WebSocket drops, the client cannot decrypt new tracks until it reconnects and receives the current epoch key. The client should cache the most recent epoch key in memory (not disk) to survive brief disconnects within the same epoch.
-- `server_secret` (the epoch key derivation root) is a critical secret. Rotation of `server_secret` invalidates all outstanding epoch keys and sealed envelopes, forcing all clients to re-request. Rotation is signaled via the `epoch_key_revoked` event on the persistent connection (see [Rotation signaling](#rotation-signaling)); disconnected clients fall back to AEAD-failure-triggered reconnection. Rotation should be infrequent and coordinated.
-- **No forward secrecy for epoch keys.** Because `epoch_key = BLAKE3_derive_key("decdn-epoch-key-v1", provider_node_id || server_secret || epoch_id.to_le_bytes())` is purely deterministic, compromising `server_secret` retroactively exposes every past epoch key and every future epoch key until rotation. An attacker who obtains `server_secret` can derive any epoch key. Note that sealed envelopes are additionally protected by `crypto_box_seal` to the client's public key, so recovering `K_blob` from a recorded envelope requires both `server_secret` (to derive the epoch key) and the client's private key (to unseal the envelope). However, an attacker who compromises the app server — the most likely scenario for `server_secret` exposure — may also have access to the `K_blob` key store directly, bypassing the envelope path entirely. This is the most significant cryptographic limitation of the current design. Production deployments MUST mitigate this with the following complementary measures:
+- Epoch key rotation creates a hard dependency on the `cdn/keys/v1` connection. If the QUIC connection drops, the client cannot decrypt new tracks until it reconnects and receives the current epoch key. The client should cache the current and previous epoch keys in memory (not disk) to survive brief disconnects and to unwrap envelopes for content buffered just before an epoch boundary.
+- `server_secret` (the epoch key derivation root) is a critical secret. Rotation of `server_secret` invalidates all outstanding epoch keys and envelopes, forcing all clients to re-request. Rotation is signaled via the `epoch_key_revoked` event on the epoch key stream (see [Rotation signaling](#rotation-signaling)); disconnected clients fall back to AEAD-failure-triggered reconnection. Rotation should be infrequent and coordinated.
+- **No forward secrecy for epoch keys.** Because `epoch_key = BLAKE3_derive_key("decdn-epoch-key-v1", provider_node_id || server_secret || epoch_id.to_le_bytes())` is purely deterministic, compromising `server_secret` retroactively exposes every past epoch key and every future epoch key until rotation. An attacker who obtains `server_secret` can derive any epoch key. Envelopes are protected only by the QUIC TLS session (no additional asymmetric layer), so a recorded envelope captured during transit is protected by TLS forward secrecy — but an attacker with `server_secret` who also compromises the app server (the most likely scenario for `server_secret` exposure) has direct access to the `K_blob` key store, bypassing the envelope path entirely. This is the most significant cryptographic limitation of the current design. Production deployments MUST mitigate this with the following complementary measures:
 
   1. **HSM-backed derivation.** Store `server_secret` in a hardware security module (AWS CloudHSM, Azure Managed HSM, GCP Cloud HSM) or cloud KMS as a non-exportable key, and derive `epoch_key` values inside that service using a supported PRF/KDF. Most cloud KMS products do not natively support BLAKE3; if BLAKE3 is required, use an HSM that can run the BLAKE3-based KDF internally. Otherwise, substitute a KMS-supported primitive (e.g., HMAC-SHA256 or HKDF-SHA256 over `epoch_id`) for the production derivation path. This reduces the attack surface to HSM/KMS API access control rather than secret exfiltration.
   2. **Periodic `server_secret` rotation on epoch boundaries.** Rotate `server_secret` on a fixed schedule (e.g., every 24–72 hours), aligning each rotation to an epoch boundary so that each `epoch_id` maps to exactly one `server_secret`. The new secret is used to derive `epoch_key` values only for future `epoch_id`s; the outgoing secret handles the current epoch and is destroyed once that epoch expires. This keeps `epoch_key = KDF(server_secret, epoch_id)` and the envelope `{wrapped, epoch_id, blob_hash}` unambiguous — no version identifier is needed because each epoch_id is associated with exactly one secret. The blast radius of a compromise is bounded to the rotation interval rather than the full lifetime of the service. The rotation cadence is a tradeoff: shorter intervals reduce exposure but increase coordination cost (all app server instances must converge on the new secret before the first epoch that uses it).
