@@ -31,9 +31,9 @@ Every message on every QUIC stream (all ALPNs) is length-prefixed:
 └─────────────────────┴──────────────────────────────┘
 ```
 
-The varint uses postcard's native varint encoding (a continuation-bit scheme similar to LEB128). Maximum message size: `MAX_MESSAGE_SIZE = 16 MiB` (16,777,216 bytes). Messages exceeding this limit are rejected before allocation. This limit applies uniformly across all ALPNs for PoC simplicity; production deployments MAY tighten this per-ALPN (see [Open Questions](#open-questions)). **DoS note:** Since `read_msg` allocates a buffer of `len` bytes, a malicious peer could send a large length prefix to force allocation. The 16 MiB cap bounds per-stream allocation, and QUIC's `MAX_STREAMS` transport parameter ([ADR 005](005-protocol.md)) bounds concurrent streams per connection — together limiting total memory exposure per peer. Operators running memory-constrained nodes SHOULD set a lower `MAX_MESSAGE_SIZE` as a local policy; `cdn/probe/v1` messages never exceed ~200 bytes, and `cdn/client/v1` messages (excluding `ChunkData`) never exceed ~1 KiB.
+The varint uses postcard's native varint encoding (a continuation-bit scheme similar to LEB128). Maximum message size: `MAX_MESSAGE_SIZE = 16 MiB` (16,777,216 bytes). Messages exceeding this limit are rejected before allocation. This limit applies uniformly across all ALPNs for PoC simplicity; production deployments MAY tighten this per-ALPN (see [Open Questions](#open-questions)). **DoS note:** Since `read_frame` allocates a buffer of `len` bytes, a malicious peer could send a large length prefix to force allocation. The 16 MiB cap bounds per-stream allocation, and QUIC's `MAX_STREAMS` transport parameter ([ADR 005](005-protocol.md)) bounds concurrent streams per connection — together limiting total memory exposure per peer. Operators running memory-constrained nodes SHOULD set a lower `MAX_MESSAGE_SIZE` as a local policy; `cdn/probe/v1` messages never exceed ~200 bytes, and `cdn/client/v1` messages (excluding `ChunkData`) never exceed ~1 KiB.
 
-The receiver reads the varint length, allocates and reads exactly that many bytes, then deserializes with `postcard::take_from_bytes` on the bounded slice. `take_from_bytes` succeeds even if the sender's struct has more fields than the receiver's definition — the unconsumed trailing bytes are silently discarded. This is the key mechanism for forward-compatible minor evolution.
+The receiver reads the varint length, allocates and reads exactly that many bytes, then deserializes with `postcard::take_from_bytes` on the bounded slice. `take_from_bytes` succeeds even if the sender's struct has more fields than the receiver's definition — the unconsumed trailing bytes are returned as a remainder. This is the key mechanism for forward-compatible minor evolution.
 
 ```rust
 use postcard::take_from_bytes;
@@ -41,26 +41,28 @@ use serde::de::DeserializeOwned;
 
 const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024; // 16 MiB
 
-/// Read one length-prefixed message from a QUIC RecvStream.
-async fn read_msg<T: DeserializeOwned>(stream: &mut RecvStream) -> Result<T> {
+/// Read one length-prefixed frame from a QUIC RecvStream.
+/// Returns the raw frame bytes for application-layer deserialization.
+async fn read_frame(stream: &mut RecvStream) -> Result<Vec<u8>> {
     let len = read_varint_u32(stream).await?;
     if len > MAX_MESSAGE_SIZE {
         return Err(Error::MessageTooLarge(len));
     }
     let mut buf = vec![0u8; len as usize];
     stream.read_exact(&mut buf).await?;
-    let (msg, _remainder) = take_from_bytes::<T>(&buf)?;
-    Ok(msg)
+    Ok(buf)
 }
 
-/// Write one length-prefixed message to a QUIC SendStream.
-async fn write_msg<T: Serialize>(stream: &mut SendStream, msg: &T) -> Result<()> {
-    let payload = postcard::to_allocvec(msg)?;
+/// Write one length-prefixed frame to a QUIC SendStream.
+/// `payload` is pre-serialized bytes (protocol enum + optional extensions).
+async fn write_frame(stream: &mut SendStream, payload: &[u8]) -> Result<()> {
     write_varint_u32(stream, payload.len() as u32).await?;
-    stream.write_all(&payload).await?;
+    stream.write_all(payload).await?;
     Ok(())
 }
 ```
+
+These are low-level framing helpers. Application-layer deserialization is handled separately — the caller deserializes the protocol enum from the frame bytes using `take_from_bytes`, then optionally deserializes extensions from the remainder (see [Tier 1 — Minor](#tier-1--minor-no-coordination) and [Wire Layout](#wire-layout) for the full deserialization flow).
 
 **`ChunkData` exemption.** `ChunkData` payloads (1024-byte blob chunks in the delivery protocol) are already implicitly length-delimited by the QUIC stream's byte count and the voucher interval. However, they MUST still use varint-length framing for consistency — the receiver must be able to distinguish `ChunkData` from `Voucher` or `VoucherAck` messages on the same stream via the protocol enum discriminant. The 1–2 byte framing overhead on 1024-byte chunks is ~0.1%.
 
@@ -118,7 +120,7 @@ enum KeysMessage {
 **Unknown variant handling.** When a peer receives a message with an unknown enum discriminant:
 
 - **QUIC stream protocols:** The receiver MUST close the individual stream with application error code `0x01` (`UNSUPPORTED_MESSAGE`). The QUIC connection and other streams are unaffected. The receiver SHOULD log the unknown discriminant at `WARN` level for operational visibility.
-- **Gossip:** Unknown variants are silently dropped (consistent with existing gossip validation rules — unknown messages are ignored).
+- **Gossip:** Unknown variants are silently dropped at the application layer (consistent with existing gossip validation rules — unknown messages are ignored). This does not create a propagation barrier: iroh-gossip's PlumTree relay operates at the transport layer and forwards raw message bytes to tree neighbors before the application deserializes the `GossipEnvelope`. Unknown variants reach all nodes in the mesh; only application-layer processing ignores them on nodes that do not understand them.
 
 ### Gossip Envelope
 
@@ -143,7 +145,7 @@ enum GossipPayload {
 }
 ```
 
-**Deserialization rule.** On receiving a gossip message, peers deserialize `GossipEnvelope` using `take_from_bytes`. If `version > 1` (unknown envelope version), the message is silently dropped — the envelope format itself may have changed in incompatible ways. If the `GossipPayload` variant is unknown (new enum discriminant), the message is also silently dropped. This ensures old peers safely ignore messages from newer peers without crashing or corrupting state.
+**Deserialization rule.** On receiving a gossip message, peers deserialize `GossipEnvelope` using `take_from_bytes`. If `version != 1` (unknown envelope version, including version 0 which is reserved/invalid), the message is silently dropped — the envelope format itself may have changed in incompatible ways. If the `GossipPayload` variant is unknown (new enum discriminant), the message is also silently dropped. This ensures old peers safely ignore messages from newer peers without crashing or corrupting state.
 
 **Topic names vs. envelope version.** Topic names (`cdn/global/v1`, `cdn/reputation/v1`) embed a version that refers to the topic's semantic contract — its purpose, membership rules, and validation semantics. The `GossipEnvelope.version` handles wire format evolution independently. A topic name version bump (e.g., `cdn/global/v2`) is the gossip equivalent of a major ALPN bump and requires dual-subscription during transition.
 
@@ -211,15 +213,45 @@ This provides bidirectional compatibility:
 - **Old sender → new receiver:** `take_from_bytes` on the base struct succeeds with no remainder; the receiver fills `StreamRequestExt::default()`.
 - **Newer sender → new receiver:** `take_from_bytes` on the extensions struct succeeds; any further trailing bytes (from fields the receiver doesn't know about) are discarded.
 
-**Wire format.** The base and extensions are serialized contiguously within a single length-prefixed frame — they are not separately length-delimited. The sender serializes both structs back-to-back:
+#### Wire Layout
+
+The two-phase pattern interacts with the protocol enum as follows. Within a single length-prefixed frame, the wire layout is:
+
+```
+┌────────────────┬─────────────────────────┬───────────────────────┐
+│ varint(len)    │ postcard(enum_variant +  │ postcard(ext_fields)  │
+│ (frame prefix) │   base_fields)          │ (optional, may be     │
+│                │                         │  absent from old      │
+│                │                         │  senders)             │
+└────────────────┴─────────────────────────┴───────────────────────┘
+```
+
+The protocol enum variant wraps the **base** struct only. Extension fields trail after the enum value within the same frame. The receiver deserializes the enum with `take_from_bytes`, which returns the base message and a byte remainder. If the remainder is non-empty, it contains extension fields for that message type.
 
 ```rust
+/// Application-layer deserialization for messages with extensions.
+fn deserialize_client_msg(frame: &[u8]) -> Result<(ClientMessage, Option<StreamRequestExt>)> {
+    let (msg, remainder) = take_from_bytes::<ClientMessage>(frame)?;
+    let ext = match &msg {
+        ClientMessage::StreamRequest(_) if !remainder.is_empty() => {
+            Some(take_from_bytes::<StreamRequestExt>(remainder)?.0)
+        }
+        _ => None, // No extensions for this message type, or old sender
+    };
+    Ok((msg, ext))
+}
+
+/// Application-layer serialization for messages with extensions.
 fn serialize_stream_request(base: &StreamRequestBase, ext: &StreamRequestExt) -> Result<Vec<u8>> {
-    let mut buf = postcard::to_allocvec(base)?;
+    let msg = ClientMessage::StreamRequest(StreamRequest::from(base));
+    let mut buf = postcard::to_allocvec(&msg)?;
     buf.extend_from_slice(&postcard::to_allocvec(ext)?);
     Ok(buf)
+    // Caller passes `buf` to `write_frame(stream, &buf)`
 }
 ```
+
+Messages without extensions (e.g., `VoucherAck`, `StreamEnd`, `ChunkData`) have no trailing bytes — the remainder from `take_from_bytes` is empty. The framing helpers (`read_frame`/`write_frame`) are agnostic to extensions; the two-phase logic lives in per-message-type application code.
 
 **Rules:**
 - New extension fields MUST be `Option<T>` or types with a meaningful `Default` impl. Non-optional fields cannot be added via minor evolution.
