@@ -432,7 +432,7 @@ The app server is operated by the content provider (e.g., a streaming platform's
   - `rate_bounds_clamp_events` — times `rate_per_mb` was clamped to governance bounds before signing ([ADR 005](005-protocol.md))
   - `blacklist_sync_lag_seconds` — seconds since last successful `getBlacklistVersion()` poll ([ADR 011](011-content-takedown.md))
   - `blacklist_version_behind` — gap between local and on-chain blacklist version ([ADR 011](011-content-takedown.md))
-  - `slash_evidence_exposure` — times the node produced signed message pairs (probe + stream) that could constitute valid slash evidence
+  - `slash_evidence_exposure` — times the node detected it produced a signed probe + stream pair meeting slashing contradiction conditions within the 30-second window ([ADR 005](005-protocol.md))
 
 ---
 
