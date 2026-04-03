@@ -44,15 +44,15 @@ XChaCha20-Poly1305 is chosen over AES-256-GCM because its 24-byte nonce eliminat
 
 An app server gates access and delivers `K_blob` to authorized clients. The app server is operated by the content provider and is **not** a CDN protocol participant (no gossip, probing, or staking), but it shares the iroh QUIC transport layer with the rest of the network. It communicates with clients over iroh QUIC on the `cdn/keys/v1` ALPN ([ADR 005](005-protocol.md)). The app server handles subscription auth, billing integration, and key management — concerns that belong to the content provider — while reusing the same transport stack the client already has for CDN delivery.
 
-The app server accepts `cdn/keys/v1` connections from clients. A single connection carries three stream types, differentiated by a 1-byte message type prefix:
+The app server accepts `cdn/keys/v1` connections from clients. A single connection carries three stream types, discriminated by the `KeysMessage` protocol enum ([ADR 013](013-schema-evolution.md)) — each message is varint-length-prefixed and the enum discriminant identifies the message type, consistent with all other ALPNs:
 
-- **Epoch key stream** (type `0x01`, long-lived, bidirectional) — client sends `{session_token}`, server pushes `epoch_key` and `epoch_key_revoked` events. Server closes the stream on subscription expiry. Doubles as a presence signal for concurrent stream limiting.
-- **Play request** (type `0x02`, short-lived, request-response) — client sends `{blob_hash}`, server responds with `{wrapped, epoch_id, blob_hash}`. The client's subscription is already authenticated on the epoch key stream.
-- **Offline lease request** (type `0x03`, short-lived, request-response) — client sends `{track_hashes[], device_id}`, server responds with the lease structure (see [Offline Playback](#offline-playback-lease-based-access)).
+- **Epoch key stream** (`EpochKeyAuth`/`EpochKey`/`EpochKeyRevoked` variants, long-lived, bidirectional) — client sends `{session_token}`, server pushes `epoch_key` and `epoch_key_revoked` events. Server closes the stream on subscription expiry. Doubles as a presence signal for concurrent stream limiting.
+- **Play request** (`PlayRequest`/`PlayResponse` variants, short-lived, request-response) — client sends `{blob_hash}`, server responds with `{wrapped, epoch_id, blob_hash}`. The client's subscription is already authenticated on the epoch key stream.
+- **Offline lease request** (`OfflineLeaseRequest`/`OfflineLeaseResponse` variants, short-lived, request-response) — client sends `{track_hashes[], device_id}`, server responds with the lease structure (see [Offline Playback](#offline-playback-lease-based-access)).
 
 The QUIC handshake mutually authenticates the client's iroh NodeId and encrypts the channel (TLS 1.3). The session token on the epoch key stream binds the iroh identity to the provider's subscriber account.
 
-**Authentication sequencing:** The client MUST establish an authenticated epoch key stream (type `0x01`) before opening play request or offline lease streams. The app server MUST reject play/lease streams (types `0x02`, `0x03`) on connections that do not have an active, authenticated epoch key stream — responding with an error and closing the stream. This ensures that every play/lease request is implicitly bound to a verified subscriber session.
+**Authentication sequencing:** The client MUST establish an authenticated epoch key stream (`EpochKeyAuth`) before opening play request or offline lease streams. The app server MUST reject play/lease streams (`PlayRequest`, `OfflineLeaseRequest`) on connections that do not have an active, authenticated epoch key stream — responding with an error and closing the stream. This ensures that every play/lease request is implicitly bound to a verified subscriber session.
 
 The technology stack, deployment model, and auth mechanism are provider choices — the CDN protocol only requires that the app server accepts `cdn/keys/v1` connections and that the client possesses the correct epoch key and envelope before issuing a `StreamRequest` to a CDN node.
 
@@ -81,7 +81,7 @@ The envelope is sent directly over the authenticated `cdn/keys/v1` QUIC stream. 
 
 The client receives the envelope. To decrypt the blob, the client needs both the envelope and the current epoch key.
 
-**Epoch key delivery:** Epoch keys are pushed to clients over the epoch key stream on the `cdn/keys/v1` connection. The client opens a long-lived bidirectional QUIC stream (type `0x01`) and sends its session token. The app server validates the token, then pushes epoch keys as they rotate. When the subscription expires or is canceled, the server closes the stream and the client receives no further epoch keys.
+**Epoch key delivery:** Epoch keys are pushed to clients over the epoch key stream on the `cdn/keys/v1` connection. The client opens a long-lived bidirectional QUIC stream (`EpochKeyAuth` — see [ADR 013](013-schema-evolution.md)) and sends its session token. The app server validates the token, then pushes epoch keys as they rotate. When the subscription expires or is canceled, the server closes the stream and the client receives no further epoch keys.
 
 ```mermaid
 sequenceDiagram
@@ -210,7 +210,7 @@ App server:
          account_id: "alice"
      }
 
-  5. Return lease to client over cdn/keys/v1 offline lease request stream (type 0x03)
+  5. Return lease to client over cdn/keys/v1 offline lease request stream (OfflineLeaseResponse)
      // Delivered over the authenticated QUIC connection. TLS 1.3 provides
      // confidentiality for the plaintext K_blob values in the response.
      // The client is already authenticated via the epoch key stream.

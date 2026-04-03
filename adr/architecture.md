@@ -178,6 +178,14 @@ Clients are lightweight QUIC endpoints that subscribe to gossip (but do not publ
 
 ---
 
+### [ADR 013 — Schema Evolution](013-schema-evolution.md)
+
+**Varint-length framing, protocol enums, three-tier evolution model.**
+
+All QUIC stream messages use varint-length-prefixed frames containing a top-level protocol enum (one enum per ALPN). Gossip messages are wrapped in a versioned `GossipEnvelope`. Schema evolution follows three tiers: minor (append optional trailing fields), medium (add enum variants), major (ALPN version bump with QUIC TLS negotiation). Fields covered by cryptographic signatures are frozen per protocol version — unsigned fields can still be appended via minor evolution using a signed-body / unsigned-outer-fields pattern. Resolves the schema evolution limitation identified in [ADR 005](005-protocol.md).
+
+---
+
 ## Key Invariants
 
 - No external origin URL exists — content enters the network through origin-backed nodes whose backends are hidden
@@ -418,3 +426,4 @@ During PoC (before indexers exist), content discovery uses probe fan-out — eve
 - Production L2 choice (Arbitrum One, Base, or other) — gated on PoC validation. Sequencer censorship mitigation for the dispute window is addressed in [ADR 007](007-watchtower.md#l2-sequencer-censorship) (PoC: 48h default; production: forced-inclusion deadline extension); the extension's detection logic depends on the L2 chosen
 - Parallel streaming from multiple nodes for a single blob (protocol supports it, not prioritised)
 - ~~Maximum blob size~~: decided — nodes may configure a `max_blob_size` limit (PoC recommended default: 10 GB). Requests exceeding a node's limit are rejected with `StreamError::BlobTooLarge` ([ADR 005](005-protocol.md#error-handling-and-retry-semantics)). This is a per-node operational policy, not an on-chain governance parameter, because different nodes have different storage and bandwidth budgets
+- ~~Schema evolution strategy for postcard wire messages~~: decided — [ADR 013](013-schema-evolution.md) defines varint-length framing, protocol enums, a three-tier evolution model, and a gossip envelope
