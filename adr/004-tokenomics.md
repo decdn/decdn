@@ -290,7 +290,7 @@ At a TOKEN price of $0.01 (conservative early production), the 200M TOKEN bootst
 | `openChannel()` | ~150k gas | ~$0.05 |
 | `closeChannel()` | ~200k gas | ~$0.10 |
 | `settleChannel()` | ~150k gas | ~$0.08 |
-| `submitFraudProof()` | ~250k gas | ~$0.10 |
+| `SlashJudge.submit*Challenge()` | ~50–60k gas | ~$0.03 |
 | `withdraw()` | ~80k gas | ~$0.05 |
 
 Payment channels amortize gas effectively. A channel open for 30 sessions costs $0.23 total (open + close + settle) = ~$0.008 per session. `settleChannel` is callable by any address, so settlement bots or the counterparty can trigger it.

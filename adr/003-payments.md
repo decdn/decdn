@@ -147,7 +147,7 @@ This means the network self-balances: popular content gets replicated because ca
 - Clients must hold USDC and native L2 tokens for gas to use the network; this adds an onboarding step compared to a single-token model. At the recommended 10 USDC practical minimum, channel lifecycle gas ($0.23) is 2.3% overhead — acceptable but non-negligible for first-time users. Gasless channel opens via meta-transactions or account abstraction can eliminate the native token requirement post-PoC (see [Deposit Economics](#deposit-economics))
 - Rate volatility: a node can change its advertised rate between a probe and a stream request; the `StreamResponse` rate is the binding one, but a client that probed at one rate and receives a higher rate in `StreamResponse` must disconnect and re-probe rather than having been deceived silently. Rate changes more than 30 seconds after the probe are not slashable; the 30-second window is precisely defined as `stream_response.timestamp_us >= probe_response.timestamp_us && stream_response.timestamp_us - probe_response.timestamp_us < 30_000_000` using requester-anchored timestamps in both signed messages (see ADR 005)
 - USDC is issued by Circle, which can freeze specific addresses or blacklist the contract. For the PoC this risk is accepted; multi-token payment support to mitigate it is deferred to [ADR 010](010-multi-token.md)
-- BLAKE3 verification on EVM requires an intermediate Merkle proof scheme for PoC-era slash evidence; a client submitting a slash claim cannot directly prove BLAKE3 mismatch on-chain
+- BLAKE3 verification on EVM requires an intermediate scheme for slash evidence — [ADR 014](014-on-chain-verification.md) specifies the optimistic challenge-response for PoC and keccak256 Merkle proof for production
 
 ## Attack Vectors
 
@@ -216,11 +216,7 @@ Fully solved by the self-enforcing protocol. The node cannot extract more paymen
 **Corrupted delivery**
 Node serves bytes that don't match the advertised BLAKE3 hash.
 
-BLAKE3 verification catches this immediately at the client. The remaining gap is the slash evidence path: submitting the full bad bytes on-chain to prove a BLAKE3 mismatch is gas-expensive for large blobs, and the PoC Merkle proof scheme adds complexity. Options:
-
-- **Option A — Optimistic challenge-response.** Client submits only a commitment (hash of received data) and the chunk index on-chain. The contract gives the node 24 hours to respond with the correct chunk and a Merkle proof. If it cannot, it is slashed. This avoids submitting full blob data on-chain.
-- **Option B — Rely on reputation, not slash, for the common case.** Slash is a last resort for severe or repeated corruption. For a single incident, immediate session termination + reputation penalty is sufficient. Reserve the on-chain slash path for nodes with a history of corruption.
-- **Option C — Off-chain fraud proof with a verifier role.** A designated verifier node (staked, incentivised by a cut of the slash) receives the disputed bytes off-chain, verifies the BLAKE3 mismatch, and submits a compact on-chain attestation. Adds a trusted verifier dependency.
+BLAKE3 verification catches this immediately at the client. The remaining gap is the slash evidence path: submitting the full bad bytes on-chain to prove a BLAKE3 mismatch is gas-expensive for large blobs. **Resolved:** [ADR 014](014-on-chain-verification.md) specifies a single-round optimistic challenge-response for the PoC — the challenger submits the node's signed `StreamResponse` (proving commitment to serve the blob) plus a 100 TOKEN bond. The node has 24 hours to counter with delivery proof. If it cannot, it is slashed. The production path upgrades to an interactive keccak256 Merkle proof over 1024-byte chunks.
 
 ---
 
