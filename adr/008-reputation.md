@@ -50,17 +50,17 @@ EWMA with alpha=0.1 means recent interactions matter more but old interactions s
 Reports received via iroh-gossip are aggregated using EWMA weighted by reporter credibility:
 
 ```
-weight_cap = 5.0
+weight_cap = 3.0
 raw_weight = total_settled_value(reporter) / max(1, max_settled_value_observed)
 reporter_weight = min(raw_weight, weight_cap)
 network_score = ewma(network_score, report.score, alpha=0.05 * reporter_weight)
 ```
 
-> **EWMA/clamp interaction:** For large score divergences (gap > 0.5), when `reporter_weight` exceeds ~2.0, the EWMA delta is almost always overridden by the ±0.05 per-report clamp. In this regime the effective influence range is 0–2× rather than 0–5×. For smaller score gaps, weights above 2× still produce proportionally larger EWMA deltas. This is an accepted property: the clamp prevents large single-report swings regardless of reporter credibility.
+> **EWMA/clamp interaction:** For large score divergences (gap > 0.5), when `reporter_weight` exceeds ~2.0, the EWMA delta is almost always overridden by the ±0.05 per-report clamp. For smaller score gaps (gap ≤ 0.5), the full 0–3× weight range produces proportionally larger EWMA deltas without hitting the clamp. The 3× cap was chosen to sit just above the clamp-saturation threshold (~2×), preserving meaningful differentiation for typical score gaps while accepting that extreme divergences are clamp-limited regardless of reporter credibility.
 
 - `total_settled_value(reporter)`: cumulative settlement value across all payment channels the reporter has settled on-chain, normalized to a common unit. **PoC:** only USDC channels exist, so this equals `total_settled_usdc`. **Production:** governance tags each approved token as stablecoin-equivalent at `addToken` time ([ADR 010](010-multi-token.md)); settled amounts for stablecoin-class tokens are summed directly (1 USDC base unit = 1 DAI base unit). Non-stablecoin tokens use a governance-set weight factor. Including both sides gives credit to nodes that pay for cache-miss pulls, not only nodes that receive payment for delivery. **Value-weighted, not count-weighted** — this prevents Sybil manipulation via many cheap channels (opening 100 channels with 1 USDC each gives the same weight as one channel with 100 USDC, making the attack cost proportional to desired influence rather than proportional to channel count).
 - `max(1, max_settled_value_observed)`: the `max(1, ...)` guard prevents division by zero at network bootstrap when no channels have been settled yet. At bootstrap, all reporters have weight 0 (no settled value), so network scores remain at their initial value (0.5) until the first channels settle. **Note:** `max_settled_value_observed` is local to each node, so two nodes may compute different weights for the same reporter. This means network scores are inherently subjective and will not converge to a single global value — an accepted property of the design (see Consequences).
-- `weight_cap`: caps reporter influence at 5× to prevent established high-earning nodes from having disproportionate control over network reputation. The cap preserves the anti-Sybil property (influence still scales with capital) while bounding the maximum incumbency advantage.
+- `weight_cap`: caps reporter influence at 3× to prevent established high-earning nodes from having disproportionate control over network reputation. The 3× value sits just above the ~2× clamp-saturation threshold, so the full weight range is effective for typical score gaps while the per-report clamp still governs extreme divergences. The cap preserves the anti-Sybil property (influence still scales with capital) while tightening the maximum incumbency advantage.
 - Alpha is scaled by reporter weight: high-credibility reporters (more settled value) move the score faster
 
 ### 5. Combined Score
@@ -85,7 +85,7 @@ flowchart TD
     end
 
     subgraph Network["Network Score (30%)"]
-        GR[Gossip ReputationReport] --> RW["reporter_weight =<br/>min(total_settled_value / max(1, max_settled_value_observed), 5.0)"]
+        GR[Gossip ReputationReport] --> RW["reporter_weight =<br/>min(total_settled_value / max(1, max_settled_value_observed), 3.0)"]
         RW --> EWMA2["network_score = EWMA(network, report,<br/>a=0.05 * reporter_weight)"]
         EWMA2 --> CLAMP2["Per-report clamp: max ±0.05"]
     end
@@ -157,14 +157,14 @@ Scores converge to 0.5 asymptotically, reaching within 0.05 of neutral after ~30
 | Decay rate | 10% per week (applied iteratively) |
 | Decay starts after | 1 week with no new reports or interactions |
 | Minimum score (floor) | 0.0 (selection algorithm clamps at 0.1 — see [ADR 001](001-network.md#node-selection-algorithm)) |
-| Reporter weight cap | 5.0 (max `reporter_weight` value; bounds the EWMA alpha multiplier) |
+| Reporter weight cap | 3.0 (max `reporter_weight` value; bounds the EWMA alpha multiplier) |
 | Scope | Production only — see [Section 12](#12-poc-scope) for PoC scope |
 
 ### 8. Score Clamping
 
 A single reputation report (local or network) can move a node's `local_score` or `network_score` by at most 0.05 in either direction. The derived weighted `final_score` (70% local, 30% network) is not separately clamped. This per-report cap prevents one bad interaction from destroying a good node or one fake report from inflating a sybil.
 
-**Interaction with EWMA:** Per-report clamping applies to the delta produced by the EWMA update for `local_score` and `network_score` — compute the EWMA result for the relevant component, then cap the change at ±0.05. For local scores (alpha=0.1), the EWMA itself limits deltas to `0.1 × |interaction_score − local_score|`, so per-report clamping only binds when the score gap exceeds 0.5 (e.g., a node at 0.9 receiving a 0.0 interaction). For network scores, high-weight reporters (alpha up to 0.25) can produce EWMA deltas up to 0.25, making per-report clamping the primary rate limiter — this is intentional, ensuring no single report, however credible, moves a component score by more than 0.05.
+**Interaction with EWMA:** Per-report clamping applies to the delta produced by the EWMA update for `local_score` and `network_score` — compute the EWMA result for the relevant component, then cap the change at ±0.05. For local scores (alpha=0.1), the EWMA itself limits deltas to `0.1 × |interaction_score − local_score|`, so per-report clamping only binds when the score gap exceeds 0.5 (e.g., a node at 0.9 receiving a 0.0 interaction). For network scores, high-weight reporters (alpha up to 0.15) can produce EWMA deltas up to 0.15, making per-report clamping the primary rate limiter — this is intentional, ensuring no single report, however credible, moves a component score by more than 0.05.
 
 **Selection clamp:** Independently of per-report clamping, the node selection formula in [ADR 001](001-network.md#node-selection-algorithm) clamps reputation to `max(reputation, 0.1)` to avoid division by zero. Nodes with reputation below 0.1 are scored identically (100× penalty vs. a perfect node) — effectively unselectable but not blacklisted.
 
@@ -225,7 +225,7 @@ PoC action items:
 
 - Off-chain reputation is inherently subjective — no single ground truth
 - A well-funded attacker can build real interaction history to manipulate scores; cost scales linearly with desired influence
-- Reporter weight creates a residual incumbency advantage — established nodes with more settled USDC have more influence over network scores. The weight cap (5×) bounds this advantage but does not eliminate it
+- Reporter weight creates a residual incumbency advantage — established nodes with more settled USDC have more influence over network scores. The weight cap (3×) bounds this advantage tightly — set just above the ~2× clamp-saturation point so the full range is effective for typical score gaps while limiting maximum influence
 - Gossip-based propagation adds bandwidth overhead, though rate limiting bounds this
 - The 70/30 local/network split means a client's view of the network is biased toward its own usage patterns
 - PoC uses local-only scores (no gossip, no decay, no per-report clamping) — see [Section 12](#12-poc-scope) for full PoC scope
