@@ -55,7 +55,7 @@ event ChannelSettled(
 
 Watchtowers use `ChannelCloseInitiated` and `ChannelDisputed` for active dispute intervention. `ChannelSettled` signals that the dispute window has closed and the channel is finalised — watchtowers use this to stop monitoring the channel and clean up stored voucher state.
 
-A successful `disputeChannel` call updates the on-chain `claimedAmount`, which changes the protocol fee computed at final settlement. See [ADR 003 — Fee Calculation on Disputed Closes](003-payments.md#fee-calculation-on-disputed-closes) for the full lifecycle.
+A successful `disputeChannel` call updates the on-chain `claimedAmount`, which changes the protocol fee computed at final settlement. See [ADR 003 — Fee Calculation on Disputed Closes](003-payments.md#fee-calculation-on-disputed-closes) for the full lifecycle. The `disputeChannel` function must also store `msg.sender` as `lastDisputor` in the `Channel` struct (or a dedicated mapping), so that the production `WatchtowerEscrow` contract can verify dispute authorship via a cross-contract static call (see [Contract: WatchtowerEscrow](#contract-watchtowerescrow)).
 
 No separate watchtower registry contract is needed. The watchtower relationship is purely off-chain — the watched party shares voucher state with the watchtower, and the watchtower submits disputes using its own EOA and gas.
 
@@ -252,10 +252,11 @@ struct EscrowDeposit {
     uint256 gasBonus;          // escrowed dispute gas bonus (2× estimated gas cost)
     uint256 periodStart;       // block.timestamp when monitoring began
     uint256 periodEnd;         // periodStart + monitoring period (default 30 days)
-    uint256 lastHeartbeat;     // block.timestamp of last accepted heartbeat
-    uint8   consecutiveMisses; // consecutive missed heartbeat windows
     uint8   status;            // 0 = Active, 1 = Completed, 2 = Reclaimed, 3 = Disputed
 }
+
+// Per-watchtower global state (not per-escrow — enables O(1) heartbeats)
+mapping(address => uint256) public lastHeartbeat;  // watchtower → block.timestamp of last heartbeat
 ```
 
 **Interface:**
@@ -279,11 +280,14 @@ interface IWatchtowerEscrow {
     /// One call per heartbeat window (default 6 hours) regardless of how many escrows exist.
     /// voucherStateHash MUST be the BLAKE3 commitment over all monitored channel state;
     /// reverts if voucherStateHash == bytes32(0).
-    /// The contract updates lastHeartbeat and resets consecutiveMisses for all active escrows
-    /// belonging to the calling watchtower.
+    /// The contract stores a single global lastHeartbeat timestamp per watchtower address;
+    /// reclaimEscrow and claimFee check liveness lazily against this timestamp.
+    /// Any address may call this if the EIP-712 signature recovers to an active watchtower
+    /// (enables gas relaying).
     function submitHeartbeat(
         uint256 latestCloseBlock,
         bytes32 voucherStateHash,
+        uint256 timestamp,
         bytes calldata signature
     ) external;
 
@@ -294,12 +298,15 @@ interface IWatchtowerEscrow {
     function claimFee(uint256 escrowId) external;
 
     /// Watchtower claims the gas bonus after submitting a successful disputeChannel.
-    /// The contract verifies that a ChannelDisputed event was emitted with disputor == msg.sender
-    /// for the escrowed channel. Transfers gasBonus to the watchtower.
+    /// The contract reads the disputor address from StablePaymentChannel contract state
+    /// (Channel.lastDisputor) via a cross-contract static call to verify that the
+    /// watchtower submitted the dispute. Transfers gasBonus to the watchtower.
     function claimGasBonus(uint256 escrowId) external;
 
-    /// Watched party reclaims escrowed funds if the watchtower missed N consecutive heartbeats
-    /// (default 3 = 18 hours). Transfers feeAmount + gasBonus back to the watched party.
+    /// Watched party reclaims escrowed funds if the watchtower's global lastHeartbeat shows
+    /// N or more missed heartbeat windows (default 3 = 18 hours). Computed lazily from
+    /// (block.timestamp - lastHeartbeat) / heartbeatInterval. Transfers feeAmount + gasBonus
+    /// back to the watched party.
     function reclaimEscrow(uint256 escrowId) external;
 
     // ── Views ──────────────────────────────────────────────────
@@ -376,10 +383,10 @@ bytes32 constant HEARTBEAT_TYPEHASH = keccak256(
 **Access control:**
 
 - `depositEscrow`: callable by any address (the caller becomes `watchedParty`).
-- `submitHeartbeat`: callable only by addresses that are the `watchtower` in at least one active escrow. The contract updates all active escrows for `msg.sender`.
-- `claimFee`: callable only by the `watchtower` address recorded in the escrow, only after `block.timestamp >= periodEnd` and `status == Active`.
-- `claimGasBonus`: callable only by the `watchtower` address. Requires on-chain verification that a `ChannelDisputed` event was emitted with `disputor == msg.sender` for the escrowed channel.
-- `reclaimEscrow`: callable only by the `watchedParty`, requires `consecutiveMisses >= missThreshold`.
+- `submitHeartbeat`: callable by any address. The contract recovers the signer from the EIP-712 signature and verifies it matches an active watchtower. This enables gas relaying — a third party can submit heartbeats on behalf of a watchtower. The contract stores a single global `lastHeartbeat` timestamp per recovered watchtower address.
+- `claimFee`: callable only by the `watchtower` address recorded in the escrow, only after `block.timestamp >= periodEnd` and `status == Active`. The contract checks liveness by comparing the watchtower's global `lastHeartbeat` against the escrow's timing requirements.
+- `claimGasBonus`: callable only by the `watchtower` address. The contract reads `Channel.lastDisputor` from the `StablePaymentChannel` contract via `getChannel()` and verifies `lastDisputor == msg.sender` for the escrowed channel. This requires `StablePaymentChannel` to store the `disputor` address in the `Channel` struct on each successful `disputeChannel` call (a minor addition — see [Contract Integration](#2-contract-integration)).
+- `reclaimEscrow`: callable only by the `watchedParty`. The contract computes missed heartbeats lazily: `missedWindows = (block.timestamp - lastHeartbeat[watchtower]) / heartbeatInterval`. Reverts if `missedWindows < missThreshold`.
 - All `set*` functions: admin key (PoC), timelock governance (production).
 
 **Governable parameters with safety bounds:**
@@ -392,7 +399,7 @@ bytes32 constant HEARTBEAT_TYPEHASH = keccak256(
 | Min fee | 0.01 USDC | 10 USDC | 0.50 USDC |
 | Monitoring period | 7 days | 90 days | 30 days |
 
-**Batched heartbeats.** `submitHeartbeat` is a single call per heartbeat window, regardless of how many channels the watchtower monitors. Per-escrow heartbeats would cost ~$1.20–$2.40/month in gas (120 tx × $0.01–$0.02 at L2 pricing), exceeding the $0.50 minimum fee for small channels. The `voucherStateHash` already commits to the full set of monitored `(channel_id, latest_nonce)` pairs, so a single heartbeat per 6-hour window suffices. The contract iterates over the watchtower's active escrows and updates `lastHeartbeat` for each.
+**Batched heartbeats.** `submitHeartbeat` is a single O(1) call per heartbeat window, regardless of how many channels the watchtower monitors. The contract stores a single global `lastHeartbeat` timestamp per watchtower address rather than iterating over individual escrows — `reclaimEscrow` and `claimFee` check liveness lazily by comparing the watchtower's global timestamp against each escrow's timing requirements. Per-escrow heartbeats would cost ~$1.20–$2.40/month in gas (120 tx × $0.01–$0.02 at L2 pricing) and would hit the block gas limit as the watchtower's portfolio grows. The `voucherStateHash` already commits to the full set of monitored `(channel_id, latest_nonce)` pairs, so a single heartbeat per 6-hour window suffices.
 
 **Monitoring period renewal.** A monitoring period (default 30 days) may be shorter than the channel's lifetime. The watched party must call `depositEscrow` again before the current period ends to maintain continuous coverage. A gap between periods is not penalised — it simply means no heartbeat accountability during that window.
 
