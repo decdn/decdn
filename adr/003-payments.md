@@ -673,8 +673,10 @@ mapping(bytes32 => address) public nodeIdToAddress;
 mapping(address => bytes32) public addressToNodeId;
 mapping(address => uint64) public bindingNonce;
 
-// Used for rebinding (key rotation) only. Initial binding is performed
-// atomically inside registerNode(). See ADR 001.
+// Intended for rebinding (key rotation) only — initial binding is performed
+// atomically inside registerNode(). No on-chain guard prevents calling this
+// before registerNode, but doing so creates a binding without mesh membership
+// or stake (harmless but useless). See ADR 001.
 function bindNodeId(bytes32 nodeId, bytes calldata signature) external {
     uint64 nonce = bindingNonce[msg.sender];
     bytes32 digest = keccak256(abi.encodePacked(
@@ -706,7 +708,7 @@ function resolveNodeId(bytes32 nodeId) external view returns (address) {
 }
 ```
 
-> **Note on EIP-712 signature:** The signature is technically redundant for direct on-chain calls (where `msg.sender` already authenticates the caller) but is retained for two reasons: (1) future meta-transaction/relayer patterns where a third party submits the binding on behalf of the node operator, and (2) atomic binding inside `registerNode`, where the signature proves intent to bind a specific NodeId to the calling address within the registration transaction.
+> **Note on EIP-712 signature:** The signature is technically redundant for direct on-chain calls (where `msg.sender` already authenticates the caller) but is retained for two reasons: (1) future meta-transaction/relayer patterns where a third party submits the binding on behalf of the node operator, and (2) atomic binding inside `registerNode`, where the signature is required because `registerNode` writes the binding mapping on behalf of `msg.sender` — without it, the binding would lack explicit cryptographic consent to associate a specific NodeId with the calling address.
 
 ### Off-Chain (Ephemeral) Binding for Clients
 
