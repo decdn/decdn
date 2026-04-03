@@ -106,21 +106,26 @@ TOKEN is not used for payments. All nodes must stake TOKEN to participate. Staki
 
 ### [ADR 005 — Wire Protocol](005-protocol.md)
 
-**Five protocols (four ALPN + iroh-gossip). `cdn/client/v1` covers all paid delivery.**
+**Three core protocols (ALPN-negotiated) plus iroh-gossip. `cdn/client/v1` covers all paid delivery.**
 
 | Protocol | Purpose |
 | --- | --- |
 | `cdn/probe/v1` | Parallel latency + availability check before node selection |
 | `cdn/client/v1` | Paid delivery: client→node, node→node (cache miss) |
 | `cdn/watchtower/v1` | Channel-dispute monitoring ([ADR 007](007-watchtower.md)) |
-| `cdn/keys/v1` | Epoch key delivery, play requests, offline leases ([ADR 006](006-e2e-encryption.md)) |
 | iroh-gossip (built-in) | Node metadata broadcast (`NodeAnnounce`), node discovery |
+
+**Companion protocol (app server — not a CDN protocol participant):**
+
+| Protocol | Purpose |
+| --- | --- |
+| `cdn/keys/v1` | Epoch key delivery, play requests, offline leases ([ADR 006](006-e2e-encryption.md)) |
+
+The app server shares the iroh QUIC transport but does not participate in gossip, probing, or staking. See [External Components](#external-components).
 
 Gossip topics: `cdn/global/v1` (all nodes), `cdn/region/{cc}/v1` (regional), `cdn/reputation/v1` (reputation reports — [ADR 008](008-reputation.md)).
 
 `redirect` in `StreamResponse` always points to a NodeId, never an external URL. The origin backend is never revealed.
-
-**Note:** `cdn/keys/v1` is handled by the app server — an external component that shares the iroh QUIC transport but is not a CDN protocol participant (no gossip, probing, or staking). See [External Components](#external-components).
 
 ---
 

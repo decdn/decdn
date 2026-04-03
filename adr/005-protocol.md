@@ -11,15 +11,20 @@ The protocol layer must be distinct from the transport layer (iroh/QUIC) and the
 
 ## Decision
 
-Five protocols: four negotiated via ALPN, plus the built-in iroh-gossip protocol:
+Three core protocols negotiated via ALPN, plus the built-in iroh-gossip protocol:
 
 | Protocol | Participants | Purpose |
 | --- | --- | --- |
 | `cdn/probe/v1` | any node ↔ any node | Latency and availability check before committing to a node |
 | `cdn/client/v1` | payer ↔ delivering node | Paid blob delivery with payment vouchers (client→node, node→node on cache miss) |
 | `cdn/watchtower/v1` | watched party (typically node) ↔ watchtower | Channel-dispute monitoring: voucher registration and updates (see ADR 007) |
-| `cdn/keys/v1` | client ↔ app server | Epoch key delivery, play requests, offline leases (see [ADR 006](006-e2e-encryption.md)) |
 | iroh-gossip (built-in) | all nodes | Node metadata announcements (`NodeAnnounce`), node discovery |
+
+Companion protocol (app server — external to the CDN protocol):
+
+| Protocol | Participants | Purpose |
+| --- | --- | --- |
+| `cdn/keys/v1` | client ↔ app server | Epoch key delivery, play requests, offline leases (see [ADR 006](006-e2e-encryption.md)) |
 
 **Gossip topics.** The iroh-gossip protocol carries multiple message types on distinct topics:
 
@@ -31,7 +36,7 @@ Five protocols: four negotiated via ALPN, plus the built-in iroh-gossip protocol
 
 All gossip topics use the `cdn/` namespace prefix. `NodeAnnounce` and `ReputationReport` are active in production; `WatchtowerAnnounce` is a planned production extension for watchtower discovery at scale (PoC uses static watchtower lists — see [ADR 007](007-watchtower.md)).
 
-**Note:** Key delivery (`cdn/keys/v1`) is handled by the app server — an external component that shares the iroh QUIC transport layer but is not a CDN protocol participant (no gossip, probing, or staking). See [ADR 006](006-e2e-encryption.md) for stream types and the full key delivery protocol.
+**Note:** See [ADR 006](006-e2e-encryption.md) for `cdn/keys/v1` stream types and the full key delivery protocol.
 
 ### `cdn/probe/v1` — latency probe
 
@@ -183,6 +188,11 @@ Maximum concurrent bidirectional streams per connection, set via QUIC transport 
 | `cdn/client/v1` | 100 | Enough parallelism for bulk fetching (e.g., video manifest + segments) without exhausting server resources |
 | `cdn/probe/v1` | 1 | Single request-response; the connection is reused for sequential probes to the same node |
 | `cdn/watchtower/v1` | 10 | Allows concurrent updates for up to 10 registered channels; a node with more channels multiplexes updates over the available streams (sufficient for PoC; production nodes with many concurrent channels should open multiple connections or increase this limit via transport parameter negotiation) |
+
+For the companion protocol on the app server:
+
+| ALPN | Max streams | Rationale |
+| --- | --- | --- |
 | `cdn/keys/v1` | 10 | 1 long-lived epoch key stream + up to 9 concurrent play/lease request streams; sufficient for streaming playback with look-ahead prefetch |
 
 Stream concurrency is enforced via QUIC's `MAX_STREAMS` transport parameter: a peer MUST NOT open a new bidirectional stream beyond the advertised limit (doing so is a protocol violation resulting in `STREAM_LIMIT_ERROR` and connection close). The receiver grants additional credit by sending `MAX_STREAMS` updates as existing streams close.
