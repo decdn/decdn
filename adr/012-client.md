@@ -38,7 +38,8 @@ Complete startup sequence from first launch to ready state:
 ```
 1. Load or generate iroh identity key (see Key Management below)
 2. Load Ethereum key from encrypted keystore
-3. Query on-chain registry: getActiveNodes(0, 100)
+3. Query on-chain registry: paginated getActiveNodes(offset, 100) calls,
+     starting at offset 0, incrementing until a page returns fewer than 100
      On failure: retry 3× exponential backoff (1 s, 5 s, 30 s)
      On continued failure + cached peers: fall back to ~/.decdn/peers.json
      On continued failure + no cache: exit with error —
@@ -94,10 +95,14 @@ Clients manage two independent cryptographic keys.
 
 ```
 voucher_key = HKDF-SHA256(
-    ikm    = hardware_wallet_sign("decdn-voucher-signer-v1"),
+    ikm    = hardware_wallet_sign("decdn-voucher-signer-v1:" || ethereum_address),
     salt   = session_id,   // random 32 bytes, generated at startup
     info   = "decdn-voucher-signer-v1"
 )
+// The signed message includes the Ethereum address for domain separation,
+// preventing cross-account replay. The 32-byte HKDF output is interpreted
+// as a secp256k1 scalar via rejection sampling: if the value is ≥ n
+// (the curve order) or 0, re-derive with an incremented salt.
 ```
 
 The resulting secp256k1 key is used exclusively for EIP-712 voucher signatures. It is held in memory only — never written to disk. The corresponding Ethereum address must be pre-authorized in the payment channel contract as a delegated signer (contract support for delegated signers is deferred to a future ADR).
@@ -121,7 +126,7 @@ Client identity bindings are **ephemeral and per-connection**, as specified in [
 4. **Session:** The node verifies the signature via `ecrecover`, caches the binding for the connection's lifetime, and uses the recovered address for `clientStakeOf` lookups and voucher attribution. Subsequent requests on the same connection omit these fields.
 5. **Disconnect:** The node discards the cached binding. No on-chain state to clean up.
 
-**Security properties of `nonce=0`:** The ephemeral binding is not a replay vulnerability because the node only uses it for the authenticated QUIC connection on which it was received. A binding from connection A is never applied to connection B. The binding cannot be used to impersonate the client on-chain because on-chain `bindNodeId` requires `nonce > 0` (monotonic counter per address).
+**Security properties of `nonce=0`:** The ephemeral binding is not a replay vulnerability because the node only uses it for the authenticated QUIC connection on which it was received. A binding from connection A is never applied to connection B. On-chain `bindNodeId` ([ADR 003](003-payments.md)) also starts at nonce 0 (`bindingNonce[msg.sender]` is initially 0), so the nonce value alone does not distinguish off-chain from on-chain bindings. The protection against on-chain replay is the EIP-712 domain separator: the off-chain binding is verified by the node via `ecrecover` only, while on-chain `bindNodeId` verifies against `DOMAIN_SEPARATOR` (which includes the `StakingRegistry` contract address and chain ID). A signature produced for off-chain use cannot pass the on-chain domain check unless the client uses the exact same domain parameters — and if it does, the on-chain binding consumes the nonce, preventing reuse.
 
 **Key rotation:** Generating a new iroh key and reconnecting produces a new NodeId. The client signs a fresh `BindNodeId` with the same Ethereum key and the new NodeId. Open payment channels remain valid — channels are keyed by `(client_ethereum_address, provider_ethereum_address, nonce)`, not by NodeId.
 
@@ -146,7 +151,7 @@ Clients discover initial peers from at least two independent sources:
 1. **On-chain registry** — `StakingRegistry.getActiveNodes()` via the configured RPC endpoint.
 2. **DNS seed list** — TXT records at `_decdn-seeds.{domain}` for each domain in a governance-maintained seed list. Record format: `nodeId=<hex>; addrs=<multiaddr>,<multiaddr>`.
 
-The DNS seed domains are maintained by governance ([ADR 009](009-governance.md)) and hardcoded in the client binary for each release. An attacker must compromise both the RPC endpoint and all DNS seed domains to fully eclipse a client.
+Each client release ships with a built-in default seed list compiled into the binary; the `dns_seeds` configuration key (see [Client Configuration](#client-configuration)) provides a runtime override. Seed domains are maintained by governance ([ADR 009](009-governance.md)) and updated via new client releases or local config. An attacker must compromise both the RPC endpoint and all effective DNS seed domains to fully eclipse a client.
 
 **Supplementary: Option C — Minimum honest-peer diversity** is adopted as a client-side policy (not protocol-enforced). The client maintains connections to at least `min_peer_diversity` nodes (default: 3) discovered via different sources (registry vs. DNS vs. gossip). If all connected nodes were discovered via the same source, the client logs a warning. This is advisory — not blocking.
 
@@ -202,6 +207,7 @@ dns_seeds = []
 min_peer_diversity = 3                       # Option C threshold (production)
 
 [keys]
+# Paths use ~ as shorthand; the client MUST perform home-directory expansion.
 iroh_key_path = "~/.decdn/iroh_key"
 eth_keystore_path = "~/.decdn/eth_keystore"
 
@@ -223,7 +229,7 @@ Each governance-managed domain publishes TXT records at `_decdn-seeds.{domain}`:
 _decdn-seeds.seeds.decdn.network. 300 IN TXT "nodeId=a1b2...;addrs=/ip4/1.2.3.4/udp/4433/quic-v1"
 ```
 
-The client queries all configured seed domains, cross-checks returned NodeIds against the on-chain registry (seeds must be staked nodes), and merges valid entries into the peer table. Seeds not found in the registry are discarded with a warning.
+The client queries all configured seed domains, cross-checks returned NodeIds against the on-chain registry (seeds must be staked nodes), and merges valid entries into the peer table. For matching NodeIds, the multiaddrs from the on-chain registry are used as the canonical source of truth — addresses from DNS are discarded in favour of registry data, preventing a compromised seed domain from redirecting traffic for a valid NodeId. Seeds whose NodeId is not found in the registry are discarded entirely with a warning.
 
 ## Consequences
 

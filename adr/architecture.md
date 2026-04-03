@@ -172,7 +172,7 @@ A `ContentBlacklist` contract supports global (network-wide) and regional (juris
 
 ### [ADR 012 — Client Architecture, Bootstrap, and Trust Model](012-client.md)
 
-**Canonical specification for client bootstrap, key management, identity lifecycle, and trust boundary.**
+**Client bootstrap, key management, identity lifecycle, and trust boundary.**
 
 Clients are lightweight QUIC endpoints that subscribe to gossip (but do not publish), maintain local peer tables and reputation scores, and pay for content via off-chain vouchers. The bootstrap procedure covers iroh key generation, Ethereum key import, registry query with exponential-backoff retry and `peers.json` fallback, gossip subscription, and periodic registry refresh. Key management distinguishes PoC (file-based) from production (platform keychain, hardware wallet with derived hot key for voucher signing). Ephemeral NodeId-to-Ethereum bindings are per-connection with `nonce=0` sentinel. Eclipse attack mitigation is resolved: registry-only for PoC; multi-source bootstrap (Option B — on-chain registry + DNS seed list) for production, with minimum peer diversity (Option C) as supplementary client-side policy. An explicit three-tier trust boundary classifies what the client verifies, trusts, and does not trust.
 
