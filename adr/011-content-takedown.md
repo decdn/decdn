@@ -136,7 +136,7 @@ This raises the cost of re-upload evasion from trivial (change a byte) to signif
 
 ### Polling
 
-Nodes poll `getBlacklistVersion()` on a configurable interval (`blacklist_poll_interval`, default 10 minutes). When the version has advanced, the node fetches new entries since its last-seen version, filtered to its declared region plus global entries. Delta fetching relies on contract event logs: `HashBlacklisted` and `OriginBlacklisted` events include an indexed `version` field, enabling efficient `eth_getLogs` queries filtered by version range.
+Nodes poll `getBlacklistVersion()` on a configurable interval (`blacklist_poll_interval`, default 10 minutes). When the version has advanced, the node fetches new entries since its last-seen version, filtered to its declared region plus global entries. Delta fetching relies on contract event logs: `HashBlacklisted` and `OriginBlacklisted` events include an indexed `version` field, enabling efficient `eth_getLogs` queries filtered by version range. Nodes SHOULD expose `blacklist_sync_lag_seconds` and `blacklist_version_behind` metrics for operational monitoring — see [architecture.md § Observability](architecture.md#observability).
 
 **Version sync recovery.** If a node has been offline or missed multiple version bumps, delta fetching may be insufficient (events may have been pruned from the RPC provider's log retention window). The recovery strategy is:
 
