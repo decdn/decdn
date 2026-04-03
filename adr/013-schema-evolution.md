@@ -31,7 +31,7 @@ Every message on every QUIC stream (all ALPNs) is length-prefixed:
 └─────────────────────┴──────────────────────────────┘
 ```
 
-The varint uses LEB128 encoding (the same encoding postcard uses internally). Maximum message size: `MAX_MESSAGE_SIZE = 16 MiB` (16,777,216 bytes). Messages exceeding this limit are rejected before allocation.
+The varint uses LEB128 encoding (the same encoding postcard uses internally). Maximum message size: `MAX_MESSAGE_SIZE = 16 MiB` (16,777,216 bytes). Messages exceeding this limit are rejected before allocation. This limit applies uniformly across all ALPNs for PoC simplicity; production deployments MAY tighten this per-ALPN (see [Open Questions](#open-questions)). **DoS note:** Since `read_msg` allocates a buffer of `len` bytes, a malicious peer could send a large length prefix to force allocation. The 16 MiB cap bounds per-stream allocation, and QUIC's `MAX_STREAMS` transport parameter ([ADR 005](005-protocol.md)) bounds concurrent streams per connection — together limiting total memory exposure per peer. Operators running memory-constrained nodes SHOULD set a lower `MAX_MESSAGE_SIZE` as a local policy; `cdn/probe/v1` messages never exceed ~200 bytes, and `cdn/client/v1` messages (excluding `ChunkData`) never exceed ~1 KiB.
 
 The receiver reads the varint length, allocates and reads exactly that many bytes, then deserializes with `postcard::take_from_bytes` on the bounded slice. `take_from_bytes` succeeds even if the sender's struct has more fields than the receiver's definition — the unconsumed trailing bytes are silently discarded. This is the key mechanism for forward-compatible minor evolution.
 
@@ -158,38 +158,104 @@ flowchart TD
     B -->|"Add new message type"| D["Tier 2 — Medium"]
     B -->|"Change field type, remove field,\nreorder variants, change signed fields"| E["Tier 3 — Major"]
 
-    C --> F["Append Option&lt;T&gt; with #[serde(default)].\nNo coordination needed.\nOld peers ignore trailing bytes via take_from_bytes."]
+    C --> F["Append to extensions struct.\nTwo-phase deserialization.\nOld peers ignore trailing bytes via take_from_bytes."]
     D --> G["Append enum variant.\nOld peers see unknown discriminant →\nclose stream or drop gossip message."]
     E --> H["Bump ALPN: cdn/client/v2.\nQUIC TLS negotiation picks highest shared version."]
 ```
 
 #### Tier 1 — Minor (no coordination)
 
-Append optional fields to an existing struct. The receiver's `take_from_bytes` on the length-delimited frame silently discards unknown trailing bytes. Old senders produce shorter payloads; new receivers see `None` or the `Default` value for missing trailing fields.
+Append optional fields to an existing struct using two-phase deserialization. This requires the length-prefixed framing defined above — the receiver knows exactly how many bytes belong to the message and can detect whether extension bytes are present.
+
+**Postcard limitation.** Postcard is positional: `Option<T>` is serialized as `0x00` (None) or `0x01 ++ T_bytes` (Some). If an old sender serializes a struct without a new trailing `Option<T>` field, the buffer ends before the Option discriminant byte. Both `from_bytes` and `take_from_bytes` fail with `DeserializeUnexpectedEnd` — postcard has no mechanism to fill defaults for missing trailing fields. A simple `#[serde(default)]` annotation does not help because serde's `default` only applies when the *key* is absent (relevant for self-describing formats like JSON), not when the *bytes* are absent.
+
+**Two-phase deserialization.** The solution is to split the struct into a frozen base and an extensions struct, then deserialize in two phases using the length-prefixed frame boundary:
+
+```rust
+use postcard::take_from_bytes;
+
+/// Frozen base fields — never changes within a protocol version.
+#[derive(Serialize, Deserialize)]
+struct StreamRequestBase {
+    hash: Hash,
+    channel_id: ChannelId,
+    byte_offset: u64,
+    timestamp_us: u64,
+}
+
+/// Extension fields — new optional fields are appended here via Tier 1.
+#[derive(Serialize, Deserialize, Default)]
+struct StreamRequestExt {
+    voucher_interval_mb: Option<u64>,
+    ethereum_address: Option<Address>,
+    binding_signature: Option<Bytes>,
+}
+
+fn deserialize_stream_request(buf: &[u8]) -> Result<(StreamRequestBase, StreamRequestExt)> {
+    let (base, remainder) = take_from_bytes::<StreamRequestBase>(buf)?;
+    let ext = if remainder.is_empty() {
+        // Old sender — no extension bytes present. Fill defaults.
+        StreamRequestExt::default()
+    } else {
+        // New sender — extension bytes present. Deserialize them.
+        // Use take_from_bytes to tolerate further trailing bytes
+        // from even-newer senders.
+        take_from_bytes::<StreamRequestExt>(remainder)?.0
+    };
+    Ok((base, ext))
+}
+```
+
+This provides bidirectional compatibility:
+- **New sender → old receiver:** `take_from_bytes` on the base struct succeeds; trailing extension bytes are discarded.
+- **Old sender → new receiver:** `take_from_bytes` on the base struct succeeds with no remainder; the receiver fills `StreamRequestExt::default()`.
+- **Newer sender → new receiver:** `take_from_bytes` on the extensions struct succeeds; any further trailing bytes (from fields the receiver doesn't know about) are discarded.
+
+**Wire format.** The base and extensions are serialized contiguously within a single length-prefixed frame — they are not separately length-delimited. The sender serializes both structs back-to-back:
+
+```rust
+fn serialize_stream_request(base: &StreamRequestBase, ext: &StreamRequestExt) -> Result<Vec<u8>> {
+    let mut buf = postcard::to_allocvec(base)?;
+    buf.extend_from_slice(&postcard::to_allocvec(ext)?);
+    Ok(buf)
+}
+```
 
 **Rules:**
-- New fields MUST be `Option<T>` or types with a meaningful `Default` impl. Non-optional fields cannot be added via minor evolution.
-- New fields MUST be appended to the end of the struct. Field order is frozen once a struct is released — insertions and reordering are major changes.
+- New extension fields MUST be `Option<T>` or types with a meaningful `Default` impl. Non-optional fields cannot be added via minor evolution.
+- New extension fields MUST be appended to the end of the extensions struct. Field order within `*Ext` is frozen once released — insertions and reordering are major changes.
 - New fields MUST NOT be included in any existing signature computation (see [Signed Field Freezing](#signed-field-freezing)).
+- The base struct is frozen at the protocol version that introduced it. Moving fields between base and extensions is a major change.
 
-This formalizes the pattern already used for `ethereum_address`, `binding_signature`, and `voucher_interval_mb` in `StreamRequest` ([ADR 005](005-protocol.md)). It is no longer a one-time workaround — it is the standard minor evolution mechanism.
+This formalizes the pattern already used for `ethereum_address`, `binding_signature`, and `voucher_interval_mb` in `StreamRequest` ([ADR 005](005-protocol.md)). It is no longer a one-time workaround — it is the standard minor evolution mechanism. The existing fields that were defined with `#[serde(default)]` before first implementation will be placed in the extensions struct from the start.
 
 **Example — adding `supported_versions` to `NodeAnnounce`:**
 
 ```rust
-struct NodeAnnounce {
+#[derive(Serialize, Deserialize)]
+struct NodeAnnounceBody {
     node_id: NodeId,
-    region: [u8; 2],
+    region: String,  // ISO 3166-1 alpha-2
     load: LoadHint,
     popular_hashes: Vec<Hash>,
     timestamp_us: u64,
-    signature: Bytes,
-    // Added via minor evolution — not included in signature
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct NodeAnnounceExt {
+    // Added via minor evolution
     supported_versions: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct NodeAnnounce {
+    body: NodeAnnounceBody,
+    signature: Bytes,
+    // Extensions follow — deserialized via two-phase pattern
 }
 ```
 
-Old peers deserialize `NodeAnnounce` without `supported_versions` — `take_from_bytes` succeeds, trailing bytes are discarded. New peers that receive old `NodeAnnounce` messages see `supported_versions: None`. **Caveat:** Since `NodeAnnounce` is signed over all fields except `signature`, adding `supported_versions` as an unsigned field requires that the signature computation explicitly excludes it. The signed field set must be defined as a named sub-struct or serialized separately (see [Signed Field Freezing](#signed-field-freezing)).
+Old peers deserialize `NodeAnnounce` without extensions — `take_from_bytes` on the body + signature succeeds with no remainder, and the receiver fills `NodeAnnounceExt::default()`. New peers that receive old `NodeAnnounce` messages see `supported_versions: None`. The signature covers only `NodeAnnounceBody`, so extensions are freely evolvable (see [Signed Field Freezing](#signed-field-freezing)).
 
 #### Tier 2 — Medium (new message types, no ALPN bump)
 
@@ -250,23 +316,29 @@ Fields covered by a cryptographic signature are frozen at the protocol version t
 #[derive(Serialize, Deserialize)]
 struct NodeAnnounceBody {
     node_id: NodeId,
-    region: [u8; 2],
+    region: String,  // ISO 3166-1 alpha-2, e.g. "US"
     load: LoadHint,
     popular_hashes: Vec<Hash>,
     timestamp_us: u64,
 }
 
-/// Full wire message — unsigned fields can be appended via Tier 1.
+/// Full wire message — extensions follow body + signature via two-phase deserialization.
 #[derive(Serialize, Deserialize)]
 struct NodeAnnounce {
     body: NodeAnnounceBody,
     signature: Bytes,
-    // Unsigned, evolvable:
+}
+
+/// Extension fields — appended via Tier 1 minor evolution.
+#[derive(Serialize, Deserialize, Default)]
+struct NodeAnnounceExt {
     supported_versions: Option<Vec<String>>,
 }
 ```
 
-This pattern cleanly separates the frozen signed region from the evolvable unsigned region. The same pattern applies to `ProbeResponse`, `StreamResponse`, and `ReputationReport`.
+This pattern cleanly separates the frozen signed region from the evolvable unsigned region via two-phase deserialization (see [Tier 1](#tier-1--minor-no-coordination)). The same pattern applies to `ProbeResponse`, `StreamResponse`, and `ReputationReport`.
+
+**Cross-ADR struct alignment.** The `Body` + extensions pattern and type definitions here are the canonical reference for implementation. Struct definitions in [ADR 001](001-network.md), [ADR 005](005-protocol.md), and [ADR 008](008-reputation.md) retain their existing flat-struct representations for readability; implementations MUST follow the body/extensions split defined here. The flat-struct definitions in those ADRs will be updated when implementation begins.
 
 ### ALPN Version Negotiation
 
