@@ -311,6 +311,11 @@ interface IWatchtowerEscrow {
     /// Sets status = Reclaimed. Transfers feeAmount + gasBonus back to the watched party.
     function reclaimEscrow(uint256 escrowId) external;
 
+    /// Watched party confirms off-chain heartbeat verification for a specific escrow.
+    /// Updates lastVerified[escrowId] to block.timestamp.
+    /// Caller must be the watchedParty for this escrow.
+    function confirmMonitoring(uint256 escrowId) external;
+
     // ── Views ──────────────────────────────────────────────────
 
     function getEscrow(uint256 escrowId) external view returns (EscrowDeposit memory);
@@ -329,6 +334,8 @@ interface IWatchtowerEscrow {
     function setMonitoringPeriod(uint256 seconds_) external;
 }
 ```
+
+**Heartbeat validation.** `submitHeartbeat` MUST enforce strict timestamp monotonicity: `timestamp > lastHeartbeat[recoveredSigner]` (where `recoveredSigner` is the address recovered from the EIP-712 signature, not `msg.sender`, since gas relayers may submit on behalf of watchtowers). Additionally, the timestamp MUST be within a bounded window of the current block: `block.timestamp - heartbeatInterval <= timestamp <= block.timestamp + 60`. These checks prevent heartbeat replay attacks where a third-party relayer submits old signatures to artificially maintain liveness. Note: all values in this on-chain check are in seconds (`block.timestamp` is the L2 sequencer timestamp in seconds on Arbitrum); the protocol wire format's `timestamp_us` (microseconds) is a separate domain not used in the heartbeat contract.
 
 **Events:**
 
@@ -400,6 +407,15 @@ bytes32 constant HEARTBEAT_TYPEHASH = keccak256(
 | Fee rate | 1 bps (0.01%) | 100 bps (1%) | 10 bps (0.1%) |
 | Min fee | 0.01 USDC | 10 USDC | 0.50 USDC |
 | Monitoring period | 7 days | 90 days | 30 days |
+| Verification miss threshold | 1 | 10 | 3 |
+
+**Per-escrow monitoring verification.** The global `lastHeartbeat` per watchtower creates a cross-escrow dependency: a watchtower that stops monitoring one channel but continues heartbeating for others appears live for all escrows. To give watched parties on-chain recourse:
+
+- `WatchtowerEscrow` maintains a `lastVerified` mapping per escrow ID alongside the existing global `lastHeartbeat` mapping.
+- `depositEscrow` initializes `lastVerified[escrowId] = block.timestamp` when the escrow is created, so the verification-miss timer starts from the beginning of the monitoring period rather than from Solidity's default zero value.
+- The watched party calls `confirmMonitoring(escrowId)` after off-chain heartbeat verification (confirming the `voucherStateHash` includes their channel state), updating `lastVerified[escrowId] = block.timestamp`.
+- `reclaimEscrow` is also allowed when `block.timestamp - lastVerified[escrowId] > verificationMissThreshold * heartbeatInterval` (where `verificationMissThreshold` is a governance parameter, PoC default: 3). Because `lastVerified` is initialized in `depositEscrow`, this path only opens after at least one full verification window has elapsed without confirmation.
+- This mechanism is additive — the existing global heartbeat check remains as a first-pass liveness filter.
 
 **Batched heartbeats.** `submitHeartbeat` is a single O(1) call per heartbeat window, regardless of how many channels the watchtower monitors. The contract stores a single global `lastHeartbeat` timestamp per watchtower address rather than iterating over individual escrows — `reclaimEscrow` and `claimFee` check liveness lazily by comparing the watchtower's global timestamp against each escrow's timing requirements. Per-escrow heartbeats would cost ~$1.20–$2.40/month in gas (120 tx × $0.01–$0.02 at L2 pricing) and would hit the block gas limit as the watchtower's portfolio grows. The `voucherStateHash` already commits to the full set of monitored `(channel_id, latest_nonce)` pairs, so a single heartbeat per 6-hour window suffices.
 

@@ -12,6 +12,8 @@ Four slashable offenses require on-chain evidence verification ([ADR 004](004-to
 3. **Rate manipulation** — node advertises one rate in probe, charges higher in stream
 4. **Blacklist violation** — node serves a blacklisted hash after the compliance window ([ADR 011](011-content-takedown.md))
 
+A fifth offense, **double settlement** (submitting the same voucher to multiple channels), is defined in [ADR 004](004-tokenomics.md) as production-only and is not covered by on-chain verification in the PoC.
+
 Three of these (phantom, rate, blacklist) require verifying cryptographic signatures from protocol messages. The fourth (corruption) requires adjudicating whether delivered bytes match the claimed BLAKE3 hash. Neither Ed25519 signature verification nor BLAKE3 mismatch adjudication is natively supported on EVM:
 
 - **Ed25519 signatures** (iroh NodeId keys, used for `ProbeResponse` and `StreamResponse` per [ADR 005](005-protocol.md)) have no EVM precompile. Solidity-based verification costs ~500k–1M gas per signature — economically unviable for routine slashing on Arbitrum.
@@ -29,13 +31,13 @@ This ADR specifies concrete on-chain mechanisms for both: `ecrecover`-based sign
 
 #### Approach: secp256k1 slash signatures alongside Ed25519 wire signatures
 
-Nodes already register an Ethereum address (secp256k1-derived) alongside their Ed25519 NodeId in `StakingRegistry` ([ADR 003](003-payments.md)). This ADR leverages that existing binding: protocol messages carry an **optional second signature** using the node's Ethereum key, specifically for on-chain evidence.
+Nodes already register an Ethereum address (secp256k1-derived) alongside their Ed25519 NodeId in `StakingRegistry` ([ADR 003](003-payments.md)). This ADR leverages that existing binding: protocol messages carry a **second signature** using the node's Ethereum key, specifically for on-chain evidence.
 
-**Wire protocol additions.** `ProbeResponse` and `StreamResponse` each gain an optional `slash_sig` field:
+**Wire protocol additions.** `ProbeResponse` and `StreamResponse` each carry a `slash_sig` field, mandatory in this protocol version. Any future relaxation allowing `slash_sig` to be omitted from the wire would change field requiredness and therefore requires a Tier 3 / major-version ALPN bump per [ADR 013](013-schema-evolution.md), not a Tier 1 change. Production may instead relax *validation semantics* (e.g., accept zero-length `slash_sig`) while keeping the field always present on the wire:
 
 ```
-ProbeResponse {has_blob, rate_per_mb, timestamp_us, signature, total_bytes?, slash_sig?}
-StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, signature, redirect?, error?, voucher_interval_mb?, slash_sig?}
+ProbeResponse {has_blob, rate_per_mb, timestamp_us, signature, total_bytes?, slash_sig}
+StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, signature, redirect?, error?, voucher_interval_mb?, slash_sig}
 ```
 
 `slash_sig` is an EIP-712 secp256k1 signature over the same security-relevant fields already covered by the Ed25519 `signature`:
@@ -43,7 +45,7 @@ StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, signature, redirect?
 - **ProbeResponse slash_sig covers:** `{hash, has_blob, rate_per_mb, timestamp_us}`
 - **StreamResponse slash_sig covers:** `{hash, ok, rate_per_mb, total_bytes, channel_id, timestamp_us, redirect}`
 
-These match the Ed25519-signed field sets defined in [ADR 005](005-protocol.md). Note that `hash` and `channel_id` are request-context fields (from `ProbeRequest` and `StreamRequest` respectively), not transmitted in the response body — implementers must include them when building and verifying the EIP-712 typed data. When `redirect` is absent (the common case), it is encoded as `bytes32(0)`. The `slash_sig` field follows the Tier 1 minor evolution pattern from [ADR 013](013-schema-evolution.md#tier-1--minor-no-coordination) — nodes that have not upgraded omit it. Requesters cannot submit on-chain slash evidence for messages without `slash_sig`; those cases fall back to reputation penalties, consistent with the existing timeout/non-response handling in [ADR 003](003-payments.md).
+These match the Ed25519-signed field sets defined in [ADR 005](005-protocol.md). Note that `hash` and `channel_id` are request-context fields (from `ProbeRequest` and `StreamRequest` respectively), not transmitted in the response body — implementers must include them when building and verifying the EIP-712 typed data. When `redirect` is absent (the common case), it is encoded as `bytes32(0)`. In the PoC, `slash_sig` is mandatory — all nodes must include it, and requesters MUST reject responses that omit it. Production may relax validation semantics (e.g., accepting zero-length `slash_sig` to indicate opt-out) while keeping the field present on the wire for postcard compatibility. Requesters cannot submit on-chain slash evidence for messages with empty `slash_sig`; those cases fall back to reputation penalties, consistent with the existing timeout/non-response handling in [ADR 003](003-payments.md). Fully removing `slash_sig` from the wire format would require a Tier 3 / ALPN bump per [ADR 013](013-schema-evolution.md).
 
 #### EIP-712 Type Definitions
 
@@ -101,6 +103,8 @@ The Ed25519 signature remains the primary authentication mechanism for the QUIC 
 | **Dual-key slash signatures (chosen)** | **~3,000** | **Recommended** | Uses proven `ecrecover`; adds one `Option` field per message; no new infrastructure |
 
 > **Note:** [ADR 001](001-network.md#nodeid-ownership-verification) uses direct ed25519 verification (Solidity library, ~500k–1M gas) for node registration ownership proof. This is acceptable because registration is a one-time cost per node lifetime, unlike slash evidence which may be submitted frequently.
+
+> **PoC vs production:** The PoC makes `slash_sig` mandatory on all `ProbeResponse` and `StreamResponse` messages ([ADR 005](005-protocol.md)), ensuring universal on-chain accountability. Production may relax validation semantics (accepting zero-length `slash_sig` as an opt-out) while keeping the field on the wire for postcard compatibility — fully removing the field would require a Tier 3 / ALPN bump per [ADR 013](013-schema-evolution.md). Requesters SHOULD be able to require a non-empty `slash_sig` as a precondition for proceeding with a stream — nodes that refuse receive a reputation penalty ([ADR 008](008-reputation.md)), creating economic pressure toward inclusion without a hard protocol requirement.
 
 ### 2. BLAKE3 Content Corruption — Optimistic Challenge-Response
 
@@ -224,6 +228,8 @@ interface ISlashJudge {
 }
 ```
 
+**Challenge rate limit.** `SlashJudge` enforces a maximum number of concurrent active (unresolved) challenges per target node address: `maxActiveChallengesPerNode` (PoC: 10, production safety bound: [1, 50]). New `submitPhantomChallenge`, `submitRateChallenge`, `submitBlacklistChallenge`, and `submitCorruptionChallenge` calls targeting a node at the limit MUST revert. This bounds the defender's concurrent counter-evidence response burden and prevents griefing attacks where a well-funded attacker submits many simultaneous spurious challenges to force operational disruption. The parameter is governable per [ADR 009](009-governance.md).
+
 #### Evidence Verification Per Offense Type
 
 **Phantom announcement:**
@@ -235,6 +241,8 @@ interface ISlashJudge {
 6. Verify `streamResponse.timestamp_us >= probeResponse.timestamp_us`
 7. Verify `streamResponse.timestamp_us - probeResponse.timestamp_us < 30_000_000` (30-second window)
 8. Look up address A in `StakingRegistry` — must be a registered node
+
+**Evidence staleness.** All challenge types MUST validate evidence age using a skew-safe comparison. Let `nowUs = block.timestamp * 1_000_000` and `evidence.timestamp_us` be the earliest `timestamp_us` from the submitted evidence messages (e.g., `probeResponse.timestamp_us` for phantom/rate challenges, `streamResponse.timestamp_us` for corruption/blacklist challenges that lack a probe). The contract MUST first require `evidence.timestamp_us <= nowUs + MAX_FUTURE_SKEW_US` (rejects far-future timestamps), then compute age without underflow: `ageUs = evidence.timestamp_us >= nowUs ? 0 : nowUs - evidence.timestamp_us`, and finally require `ageUs < MAX_EVIDENCE_AGE_US`. `MAX_EVIDENCE_AGE_US` is a governable parameter on `SlashJudge` (PoC: 7 days = 604,800,000,000 μs; safety bounds: [1 day, 30 days]). `MAX_FUTURE_SKEW_US` is fixed at 60,000,000 μs (60 seconds).
 
 **Rate manipulation:**
 1–3. Same address recovery and identity check as phantom
@@ -314,7 +322,7 @@ These estimates replace the `submitFraudProof()` placeholder (~250k gas) in [ADR
 - All four slashable offenses now have a concrete, gas-efficient on-chain evidence path. Slashing is no longer aspirational.
 - `ecrecover` at 3,000 gas per signature is 100–300× cheaper than a Solidity Ed25519 library, making routine slashing economically viable even for small offenses.
 - The dual-key approach reuses the existing NodeId-to-Ethereum-address binding in `StakingRegistry` — no new on-chain registration step.
-- The `slash_sig` field is optional (Tier 1 evolution per [ADR 013](013-schema-evolution.md)), so nodes can upgrade incrementally. The network degrades gracefully: unsigned messages fall back to reputation penalties.
+- In the PoC, `slash_sig` is mandatory, ensuring all delivery interactions are on-chain slashable. Production may relax validation semantics (accepting zero-length `slash_sig` as opt-out) while keeping the field on the wire; messages with empty `slash_sig` fall back to reputation penalties. Fully removing the field requires a Tier 3 / ALPN bump.
 - The unified `SlashJudge` contract provides a single audit surface for all slashing logic.
 - The PoC corruption path (single-round optimistic) is simple to implement and audit. The production upgrade path (interactive Merkle proof) is designed but deferred.
 

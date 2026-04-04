@@ -51,7 +51,7 @@ All economic parameters across the protocol are governable within hardcoded safe
 | Rate floor/ceiling | StablePaymentChannel (PoC) / PaymentChannel per-token (production, [ADR 010](010-multi-token.md)) | Floor ≥ 1 base unit | Ceiling > floor |
 | Max voucher interval | StablePaymentChannel (PoC) / PaymentChannel (production) | 1 MB | 1024 MB (~1 GB) |
 | Min deposit | StablePaymentChannel (PoC) / PaymentChannel (production) | 1 base unit | No max |
-| Challenge bond | StakingRegistry | 1 TOKEN | 1,000 TOKEN |
+| Challenge bond | SlashJudge | 1 TOKEN | 1,000 TOKEN |
 | Base slash reset period | StakingRegistry | 30 days | 365 days |
 | Burn percentage of fees | StablePaymentChannel (PoC) / PaymentChannel (production) | 0% | 100% |
 | Compliance window | ContentBlacklist | 1 hour | 7 days |
@@ -60,6 +60,9 @@ All economic parameters across the protocol are governable within hardcoded safe
 | Fee rate | WatchtowerEscrow | 1 bps (0.01%) | 100 bps (1%) |
 | Min fee | WatchtowerEscrow | 0.01 USDC | 10 USDC |
 | Monitoring period | WatchtowerEscrow | 7 days | 90 days |
+| Verification miss threshold | WatchtowerEscrow | 1 | 10 |
+| Max active challenges per node | SlashJudge | 1 | 50 |
+| Max evidence age | SlashJudge | 1 day | 30 days |
 
 The 3-day voting period balances responsiveness with participation. Combined with the 2-day timelock, the total governance delay is 5 days minimum — comparable to standard OpenZeppelin Governor deployments.
 

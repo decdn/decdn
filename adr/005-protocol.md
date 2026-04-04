@@ -18,7 +18,7 @@ Three core protocols negotiated via ALPN, plus the built-in iroh-gossip protocol
 | `cdn/probe/v1` | any node ↔ any node | Latency and availability check before committing to a node |
 | `cdn/client/v1` | payer ↔ delivering node | Paid blob delivery with payment vouchers (client→node, node→node on cache miss) |
 | `cdn/watchtower/v1` | watched party (typically node) ↔ watchtower | Channel-dispute monitoring: voucher registration and updates (see ADR 007) |
-| iroh-gossip (built-in) | all nodes | Node metadata announcements (`NodeAnnounce`), node discovery |
+| iroh-gossip (built-in) | all nodes | Node metadata announcements (`NodeAnnounce`), rate announcements (`RateChange`), node discovery |
 
 Companion protocol (app server — external to the CDN protocol):
 
@@ -72,7 +72,7 @@ sequenceDiagram
     participant C as Candidate Node
 
     R->>C: ProbeRequest {hash, timestamp_us}
-    C->>R: ProbeResponse {has_blob, rate_per_mb, timestamp_us, signature, total_bytes?, slash_sig?}
+    C->>R: ProbeResponse {has_blob, rate_per_mb, timestamp_us, signature, total_bytes?, slash_sig}
 
     Note over R: RTT = receive_time - timestamp_us
     Note over R: Score = unified selection score (see ADR 001)
@@ -82,7 +82,9 @@ sequenceDiagram
 
 `signature` is the candidate node's iroh private key signature over `{hash, has_blob, rate_per_mb, timestamp_us}`. This makes the probe response cryptographically attributable and enables two slashing mechanisms: (1) **phantom announcement slashing** — if `has_blob: true` in `ProbeResponse` but the node returns a signed `StreamResponse` with `ok: false` or a redirect for the same hash, the two signed messages are on-chain-verifiable evidence of a phantom announcement (the timeout/non-response case is handled separately — see ADR 003); (2) **rate manipulation slashing** — if `stream_response.timestamp_us >= probe_response.timestamp_us` and `stream_response.timestamp_us - probe_response.timestamp_us < 30_000_000` (30 seconds) and `stream_response.rate_per_mb > probe_response.rate_per_mb`, both signed messages constitute on-chain-verifiable evidence of bait-and-switch. Both `timestamp_us` values are requester-generated (the probe timestamp is echoed in `ProbeResponse`; `StreamResponse` echoes a separate requester timestamp from `StreamRequest`), so the on-chain verifier computes the delta from a single clock with no wall-clock reference needed. **Submitting slash evidence requires a challenge bond** (100 TOKEN in PoC, 50 TOKEN in production) — see [ADR 004](004-tokenomics.md#challenge-bond). The bond is returned if the challenge succeeds and forfeited if the node successfully counters, preventing zero-cost griefing via fabricated slash claims.
 
-**Signer binding:** Both `ProbeResponse` and `StreamResponse` Ed25519 signatures bind to the signer's identity through the iroh connection's authenticated NodeId. For on-chain slash evidence, each message also carries an optional `slash_sig` — an EIP-712 secp256k1 signature over the same security-relevant fields, verifiable via `ecrecover` at 3,000 gas. The `slash_sig` field follows the Tier 1 minor evolution pattern from [ADR 013](013-schema-evolution.md#tier-1--minor-no-coordination); nodes that have not upgraded omit it, and those messages fall back to reputation penalties rather than on-chain slashing. On-chain slash evidence submissions include the NodeId so the `SlashJudge` contract can confirm the recovered Ethereum address maps to a registered node via `StakingRegistry`. See [ADR 014](014-on-chain-verification.md) for the full dual-key scheme, EIP-712 type definitions, and `SlashJudge` contract interface.
+**Signer binding:** Both `ProbeResponse` and `StreamResponse` Ed25519 signatures bind to the signer's identity through the iroh connection's authenticated NodeId. For on-chain slash evidence, each message carries a `slash_sig` — an EIP-712 secp256k1 signature over the same security-relevant fields, verifiable via `ecrecover` at 3,000 gas. In the PoC, `slash_sig` is mandatory on every `ProbeResponse` and `StreamResponse`, ensuring all delivery interactions are on-chain slashable. On-chain slash evidence submissions include the NodeId so the `SlashJudge` contract can confirm the recovered Ethereum address maps to a registered node via `StakingRegistry`. See [ADR 014](014-on-chain-verification.md) for the full dual-key scheme, EIP-712 type definitions, and `SlashJudge` contract interface.
+
+> **PoC constraint:** `slash_sig` is mandatory. PoC nodes MUST reject any `ProbeResponse` or `StreamResponse` that omits `slash_sig`. A future production version may relax validation semantics (accepting zero-length `slash_sig` as opt-out) while keeping the field on the wire for postcard compatibility — fully removing the field would require a Tier 3 / ALPN bump per [ADR 013](013-schema-evolution.md). Requesters may require a non-empty `slash_sig` as a stream precondition; nodes that refuse receive a reputation penalty ([ADR 008](008-reputation.md)).
 
 **Dependent parameters:** The probe cache TTL in [ADR 001](001-network.md) is derived as half this 30-second window (15 seconds). Changing the slashing window requires updating the probe cache TTL to maintain the invariant that cached probe responses remain within the slashable window. The `probe_hold_duration` (see below) is derived as this window plus 5-second margin; changing the slashing window requires updating both.
 
@@ -120,7 +122,7 @@ sequenceDiagram
     participant D as Delivering Node
 
     P->>D: StreamRequest {hash, channel_id, byte_offset, timestamp_us, voucher_interval_mb?}
-    D->>P: StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, signature, redirect?, error?, voucher_interval_mb?, slash_sig?}
+    D->>P: StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, signature, redirect?, error?, voucher_interval_mb?, slash_sig}
 
     alt ok = true
         loop Every voucher_interval_mb (default 1 MB)
@@ -153,7 +155,7 @@ The client includes `ethereum_address` and `binding_signature` in the first `Str
 
 **Voucher wire format:** `Voucher {sig, amt, nonce}` above is shorthand. The EIP-712 signed data covers the full structure from [ADR 003](003-payments.md): `{channelId, amount, nonce, token}`. The fields `signature`, `amount`, and `nonce` are transmitted on the wire; the remaining fields are derived from stream context — `channel_id` is in `StreamRequest` and `token` is fixed at channel open. Including `nonce` explicitly (rather than relying on a monotonically incrementing implicit counter) prevents desynchronization if a `VoucherAck` is dropped. The receiver reconstructs the full typed data to verify the signature. This aligns with the watchtower `VoucherUpdate` below, which also includes `nonce` explicitly — though the watchtower version still requires `channel_id` and `token` because it lacks stream context.
 
-The delivering node advertises its `rate_per_mb` in `StreamResponse`. The payer accepts by sending the first voucher or disconnects and tries another node. No surprise pricing. `timestamp_us` in `StreamResponse` is the requester-generated microsecond timestamp from `StreamRequest`, echoed back unchanged — the same pattern as `ProbeResponse`. The node's iroh key signs all security-relevant fields: `{hash, ok, rate_per_mb, total_bytes, channel_id, timestamp_us, redirect}`, making the response cryptographically binding. An optional `slash_sig` (EIP-712 secp256k1 signature over the same fields) enables on-chain verification via `ecrecover` — see [ADR 014](014-on-chain-verification.md). Signing the full response prevents a malicious party from altering unsigned fields while reusing a valid signature — in particular, `ok` is needed for phantom announcement evidence (proving a node signed `ok: false` after claiming `has_blob: true` in a probe), and `redirect` ensures a node cannot silently alter routing without accountability. A rate mismatch where `stream_response.rate_per_mb > probe_response.rate_per_mb` is slashable if `stream_response.timestamp_us >= probe_response.timestamp_us` and `stream_response.timestamp_us - probe_response.timestamp_us < 30_000_000` (30 seconds). The ordering check prevents unsigned integer underflow in the on-chain verifier. Because both `timestamp_us` values are requester-generated, the on-chain verifier computes this delta from the signed messages alone — no wall-clock reference or external time oracle is needed, and clock skew between the requester and the node does not affect the check. The `redirect` field in `StreamResponse` is used when a node cannot serve — it contains the NodeId of another node that can, never an external URL. The network is fully opaque.
+The delivering node advertises its `rate_per_mb` in `StreamResponse`. The payer accepts by sending the first voucher or disconnects and tries another node. No surprise pricing. `timestamp_us` in `StreamResponse` is the requester-generated microsecond timestamp from `StreamRequest`, echoed back unchanged — the same pattern as `ProbeResponse`. The node's iroh key signs all security-relevant fields: `{hash, ok, rate_per_mb, total_bytes, channel_id, timestamp_us, redirect}`, making the response cryptographically binding. A `slash_sig` (EIP-712 secp256k1 signature over the same fields, mandatory in PoC) enables on-chain verification via `ecrecover` — see [ADR 014](014-on-chain-verification.md). Signing the full response prevents a malicious party from altering unsigned fields while reusing a valid signature — in particular, `ok` is needed for phantom announcement evidence (proving a node signed `ok: false` after claiming `has_blob: true` in a probe), and `redirect` ensures a node cannot silently alter routing without accountability. A rate mismatch where `stream_response.rate_per_mb > probe_response.rate_per_mb` is slashable if `stream_response.timestamp_us >= probe_response.timestamp_us` and `stream_response.timestamp_us - probe_response.timestamp_us < 30_000_000` (30 seconds). The ordering check prevents unsigned integer underflow in the on-chain verifier. Because both `timestamp_us` values are requester-generated, the on-chain verifier computes this delta from the signed messages alone — no wall-clock reference or external time oracle is needed, and clock skew between the requester and the node does not affect the check. The `redirect` field in `StreamResponse` is used when a node cannot serve — it contains the NodeId of another node that can, never an external URL. The network is fully opaque.
 
 **Redirect loop prevention.** The requester MUST enforce:
 1. **Hop limit:** maximum 3 redirects per original request. After 3 redirects, the requester treats the request as failed (no more redirects followed).
@@ -165,6 +167,8 @@ The delivering node advertises its `rate_per_mb` in `StreamResponse`. The payer 
 **Voucher interval negotiation.** The optional `voucher_interval_mb` field in `StreamRequest` proposes a larger-than-default voucher cadence for this stream (see [ADR 003 — Voucher Interval Negotiation](003-payments.md#voucher-interval-negotiation)). If present, the node responds with its accepted interval in `StreamResponse.voucher_interval_mb` — which may be equal to or smaller than the proposed value. If absent from either message, both sides default to 1 MB. The `voucher_interval_mb` field is **not** included in the `StreamResponse` signature because it is a delivery-layer optimization, not a security-relevant field — the node can always enforce a smaller interval unilaterally by pausing delivery.
 
 The protocol is self-enforcing: payer stops sending vouchers → delivering node stops sending chunks; delivering node stops sending chunks → payer stops sending vouchers.
+
+> **Relationship to iroh-blobs:** The `cdn/client/v1` protocol wraps iroh-blobs' verified streaming within its own message framing. iroh-blobs provides BLAKE3 tree-hash verification at the chunk level; `ChunkData` messages carry these verified chunks alongside the payment and delivery control messages (`Voucher`, `StreamEnd`, `StreamError`) that iroh-blobs' native transfer protocol does not support. The BLAKE3 content hash in `StreamRequest` is the iroh-blobs hash, and verification uses iroh-blobs' incremental tree-hash mechanism — receivers do not need to buffer the full blob before confirming integrity.
 
 ### Gossip — node metadata
 
@@ -286,6 +290,38 @@ enum StreamError {
 5. **Mid-stream failure:** if chunks stop arriving mid-delivery, the requester waits 10 seconds, then reconnects to the next candidate with `byte_offset` set to the last BLAKE3-verified byte.
 
 The error code is **not** included in the `StreamResponse` signature — it is informational only and not used for slashing evidence.
+
+### Stream Lifecycle State Machine
+
+**Per-stream states** (one instance per `StreamRequest`):
+
+```
+AwaitingResponse ──StreamResponse{ok: true}──► Streaming
+       │                    │                          │
+       │ StreamResponse     │ StreamResponse           ├── ChunkData ──► Streaming (loop)
+       │ {error}            │ {redirect}               ├── StreamEnd ──► Completed
+       │ or timeout         ▼                          └── StreamError ──► Failed
+       ▼              Redirecting
+    Failed                  │
+                            ▼
+                  (new StreamRequest
+                   to redirect target)
+```
+
+**Transition rules:**
+- **Voucher-before-response:** Receiving a `Voucher` on a stream that has not yet received its own `StreamResponse` is a protocol error; that stream MUST be closed. Vouchers on other streams sharing the same `channel_id` are unaffected — the rule is per-stream, not per-channel.
+- **Partial final chunk:** The last `ChunkData` before `StreamEnd` MAY be smaller than 1,024 bytes. Receivers MUST accept partial chunks at stream end.
+- **Voucher pacing:** The node pauses delivery when outstanding (unvouchered) bytes exceed `voucher_interval_mb × 1,048,576` bytes (i.e., the MB value converted to bytes). Delivery resumes when the client sends a `Voucher` covering the outstanding balance.
+
+**Per-channel voucher coordinator** (one instance per `channel_id`, shared across streams):
+
+```
+Active ──voucher deficit──► VoucherPending ──Voucher received──► Active
+   │                                               │
+   └──── all streams done ────► Closed             └── timeout ──► Closed
+```
+
+The byte counter is cumulative across all streams sharing a `channel_id`. Each stream's delivered bytes contribute to the aggregate counter that triggers voucher requests.
 
 ### Serialization
 

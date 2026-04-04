@@ -142,6 +142,7 @@ enum GossipPayload {
     NodeAnnounce(NodeAnnounce),             // 0
     ReputationReport(ReputationReport),     // 1
     WatchtowerAnnounce(WatchtowerAnnounce), // 2 (planned — ADR 007)
+    RateChange(RateChange),                 // 3 (ADR 005)
 }
 ```
 
@@ -260,6 +261,8 @@ Messages without extensions (e.g., `VoucherAck`, `StreamEnd`, `ChunkData`) have 
 - The base struct is frozen at the protocol version that introduced it. Moving fields between base and extensions is a major change.
 
 This formalizes the pattern already used for `ethereum_address`, `binding_signature`, and `voucher_interval_mb` in `StreamRequest` ([ADR 005](005-protocol.md)). It is no longer a one-time workaround — it is the standard minor evolution mechanism. The existing `Option<T>` fields with default semantics (`ethereum_address` and `binding_signature` with `#[serde(default)]`, and `voucher_interval_mb` which defaults to 1 MB when absent) will be placed in the extensions struct from the start, since the project is pre-implementation.
+
+> ADR 010 (multi-token, post-PoC) specifies `payment_token: Address` as a required field. Because postcard encodes structs positionally, appending a new field to an already-in-use `StreamRequestExt` would break compatibility for senders that already include extension bytes. Multi-token support therefore requires either a Tier 3 / major `cdn/client` version bump or a new trailing extension container (e.g., `StreamRequestExt2`) rather than extending `StreamRequestExt` in place.
 
 **Example — adding `supported_versions` to `NodeAnnounce`:**
 
@@ -425,6 +428,7 @@ QUIC application error codes used by this ADR:
 | --- | --- | --- |
 | `0x01` | `UNSUPPORTED_MESSAGE` | Received an unknown protocol enum variant. Stream closed; connection unaffected |
 | `0x02` | `MESSAGE_TOO_LARGE` | Received a length prefix exceeding `MAX_MESSAGE_SIZE`. Stream closed |
+| `0x03` | `MALFORMED_MESSAGE` | Frame passed length validation but payload failed deserialization. Stream closed |
 
 These codes are scoped to individual QUIC streams (sent via `RESET_STREAM` or `STOP_SENDING`), not connections. Additional application error codes defined by other ADRs are unaffected.
 
