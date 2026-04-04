@@ -179,6 +179,8 @@ One QUIC connection per `(local_node, remote_node, ALPN)` tuple. Multiple reques
 
 Different ALPNs require separate connections (TLS ALPN is negotiated at connection establishment). A `cdn/probe/v1` connection and a `cdn/client/v1` connection to the same node are always distinct.
 
+**0-RTT early data** is permitted on `cdn/probe/v1` (idempotent, read-only probes) and conditionally on `cdn/keys/v1` (idempotent `PlayRequest` only). Payment-bearing (`cdn/client/v1`) and state-changing (`cdn/watchtower/v1`) protocols reject 0-RTT to prevent replay-based accounting or registration confusion. See [ADR 015](015-zero-rtt.md) for the full replay safety analysis and session ticket management.
+
 #### Concurrent stream limits
 
 Maximum concurrent bidirectional streams per connection, set via QUIC transport parameter `initial_max_streams_bidi`:

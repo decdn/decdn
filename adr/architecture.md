@@ -197,6 +197,12 @@ All QUIC stream messages use varint-length-prefixed frames containing a top-leve
 
 All four slashable offenses (corrupted delivery, phantom announcements, rate manipulation, blacklist violations) now have concrete on-chain evidence paths. Ed25519 signatures from iroh NodeIds are not EVM-verifiable, so protocol messages (`ProbeResponse`, `StreamResponse`) carry an optional secp256k1 `slash_sig` — an EIP-712 signature over the same security-relevant fields — enabling `ecrecover`-based verification at 3,000 gas (vs ~500k–1M for a Solidity Ed25519 library). For BLAKE3 content corruption, the PoC uses a single-round optimistic challenge-response with a 100 TOKEN bond and 24-hour counter-evidence window; the production path upgrades to an interactive keccak256 Merkle proof over 1024-byte chunks. A unified `SlashJudge` contract adjudicates all offense types and calls `StakingRegistry.slash()` on resolution.
 
+### [ADR 015 — QUIC 0-RTT Connection Establishment](015-zero-rtt.md)
+
+**0-RTT early data for latency-sensitive protocols.**
+
+QUIC 0-RTT eliminates the TLS handshake round trip on repeat connections. `cdn/probe/v1` is the primary beneficiary — after the first probe cycle, subsequent cache-miss fan-outs send `ProbeRequest` alongside the ClientHello with zero handshake delay. `cdn/keys/v1` permits 0-RTT for idempotent `PlayRequest` envelope lookups. Payment-bearing (`cdn/client/v1`) and state-changing (`cdn/watchtower/v1`) protocols reject 0-RTT to prevent replay-based accounting confusion. Session tickets are cached per `(remote_node_id, ALPN)` in an in-memory LRU (max 1,000 entries).
+
 ---
 
 ## Key Invariants
