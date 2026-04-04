@@ -123,7 +123,7 @@ TOKEN is not used for payments. All nodes must stake TOKEN to participate. Staki
 
 The app server shares the iroh QUIC transport but does not participate in gossip, probing, or staking. See [External Components](#external-components).
 
-Gossip topics: `cdn/global/v1` (all nodes), `cdn/region/{cc}/v1` (regional), `cdn/reputation/v1` (reputation reports — [ADR 008](008-reputation.md)).
+Gossip topics: `cdn/global/v1` (all nodes — `NodeAnnounce`, `RateChange`), `cdn/region/{cc}/v1` (regional — `NodeAnnounce`), `cdn/reputation/v1` (reputation reports — [ADR 008](008-reputation.md)).
 
 `redirect` in `StreamResponse` always points to a NodeId, never an external URL. The origin backend is never revealed.
 

@@ -190,7 +190,7 @@ interface ISlashJudge {
         bytes calldata streamSlashSig        // EIP-712 secp256k1 signature
     ) external;
 
-    /// Rate manipulation: stream rate > probe rate within 30s
+    /// Rate manipulation: stream rate > probe rate within 30s window (deferred — 24h counter-evidence)
     function submitRateChallenge(
         bytes32 nodeId,
         bytes calldata probeResponseData,
@@ -286,7 +286,7 @@ See [ADR 005, Gossip — rate change announcements](005-protocol.md#gossip--rate
 | Operation | Estimated Gas | Notes |
 | --- | --- | --- |
 | `submitPhantomChallenge` | ~60k | 2× `ecrecover` (6k) + calldata + storage + bond transfer |
-| `submitRateChallenge` | ~60k | Same as phantom; creates pending challenge with 24-hour counter window |
+| `submitRateChallenge` | ~60k | 2× `ecrecover` (6k) + calldata + storage for pending challenge + bond transfer |
 | `submitBlacklistChallenge` | ~50k | 1× `ecrecover` (3k) + `ContentBlacklist` lookup + bond transfer |
 | `submitCorruptionChallenge` | ~50k | 1× `ecrecover` (3k) + storage for challenge state + bond transfer |
 | `counterChallenge` (rate) | ~40k | 1× `ecrecover` (3k) + timestamp range check + rate match + storage update |
