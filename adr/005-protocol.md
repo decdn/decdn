@@ -82,9 +82,9 @@ sequenceDiagram
 
 `signature` is the candidate node's iroh private key signature over `{hash, has_blob, rate_per_mb, timestamp_us}`. This makes the probe response cryptographically attributable and enables two slashing mechanisms: (1) **phantom announcement slashing** — if `has_blob: true` in `ProbeResponse` but the node returns a signed `StreamResponse` with `ok: false` or a redirect for the same hash, the two signed messages are on-chain-verifiable evidence of a phantom announcement (the timeout/non-response case is handled separately — see ADR 003); (2) **rate manipulation slashing** — if `stream_response.timestamp_us >= probe_response.timestamp_us` and `stream_response.timestamp_us - probe_response.timestamp_us < 30_000_000` (30 seconds) and `stream_response.rate_per_mb > probe_response.rate_per_mb`, both signed messages constitute on-chain-verifiable evidence of bait-and-switch. Both `timestamp_us` values are requester-generated (the probe timestamp is echoed in `ProbeResponse`; `StreamResponse` echoes a separate requester timestamp from `StreamRequest`), so the on-chain verifier computes the delta from a single clock with no wall-clock reference needed. **Submitting slash evidence requires a challenge bond** (100 TOKEN in PoC, 50 TOKEN in production) — see [ADR 004](004-tokenomics.md#challenge-bond). The bond is returned if the challenge succeeds and forfeited if the node successfully counters, preventing zero-cost griefing via fabricated slash claims.
 
-**Signer binding:** Both `ProbeResponse` and `StreamResponse` Ed25519 signatures bind to the signer's identity through the iroh connection's authenticated NodeId. For on-chain slash evidence, each message also carries an optional `slash_sig` — an EIP-712 secp256k1 signature over the same security-relevant fields, verifiable via `ecrecover` at 3,000 gas. The `slash_sig` field follows the Tier 1 minor evolution pattern from [ADR 013](013-schema-evolution.md#tier-1--minor-no-coordination); nodes that have not upgraded omit it, and those messages fall back to reputation penalties rather than on-chain slashing. On-chain slash evidence submissions include the NodeId so the `SlashJudge` contract can confirm the recovered Ethereum address maps to a registered node via `StakingRegistry`. See [ADR 014](014-on-chain-verification.md) for the full dual-key scheme, EIP-712 type definitions, and `SlashJudge` contract interface.
+**Signer binding:** Both `ProbeResponse` and `StreamResponse` Ed25519 signatures bind to the signer's identity through the iroh connection's authenticated NodeId. For on-chain slash evidence, each message carries a `slash_sig` — an EIP-712 secp256k1 signature over the same security-relevant fields, verifiable via `ecrecover` at 3,000 gas. In the PoC, `slash_sig` is mandatory on every `ProbeResponse` and `StreamResponse`, ensuring all delivery interactions are on-chain slashable. On-chain slash evidence submissions include the NodeId so the `SlashJudge` contract can confirm the recovered Ethereum address maps to a registered node via `StakingRegistry`. See [ADR 014](014-on-chain-verification.md) for the full dual-key scheme, EIP-712 type definitions, and `SlashJudge` contract interface.
 
-> **PoC constraint:** `slash_sig` is mandatory on all `ProbeResponse` and `StreamResponse` messages, ensuring all delivery interactions are on-chain slashable. Production may relax this to optional via Tier 1 evolution (ADR 013), with requesters able to require it as a stream precondition; nodes that refuse receive a reputation penalty.
+> **PoC constraint:** `slash_sig` is mandatory. PoC nodes MUST reject any `ProbeResponse` or `StreamResponse` that omits `slash_sig`. A future production version may relax this to optional via Tier 1 evolution ([ADR 013](013-schema-evolution.md#tier-1--minor-no-coordination)), with requesters able to require it as a stream precondition; nodes that refuse receive a reputation penalty ([ADR 008](008-reputation.md)).
 
 **Dependent parameters:** The probe cache TTL in [ADR 001](001-network.md) is derived as half this 30-second window (15 seconds). Changing the slashing window requires updating the probe cache TTL to maintain the invariant that cached probe responses remain within the slashable window. The `probe_hold_duration` (see below) is derived as this window plus 5-second margin; changing the slashing window requires updating both.
 
@@ -297,19 +297,19 @@ The error code is **not** included in the `StreamResponse` signature — it is i
 
 ```
 AwaitingResponse ──StreamResponse{ok: true}──► Streaming
-       │                                           │
-       │ StreamResponse{error}                     ├── ChunkData ──► Streaming (loop)
-       │ or timeout                                ├── StreamEnd ──► Completed
-       ▼                                           ├── StreamError ──► Failed
-    Failed                                         └── Redirect ──► Redirecting
-                                                                        │
-                                                                        ▼
-                                                              (new StreamRequest
-                                                               to redirect target)
+       │                    │                          │
+       │ StreamResponse     │ StreamResponse           ├── ChunkData ──► Streaming (loop)
+       │ {error}            │ {redirect}               ├── StreamEnd ──► Completed
+       │ or timeout         ▼                          └── StreamError ──► Failed
+       ▼              Redirecting
+    Failed                  │
+                            ▼
+                  (new StreamRequest
+                   to redirect target)
 ```
 
 **Transition rules:**
-- **Voucher-before-response:** Receiving a `Voucher` message before `StreamResponse` is a protocol error; the stream MUST be closed.
+- **Voucher-before-response:** Receiving a `Voucher` on a stream that has not yet received its own `StreamResponse` is a protocol error; that stream MUST be closed. Vouchers on other streams sharing the same `channel_id` are unaffected — the rule is per-stream, not per-channel.
 - **Partial final chunk:** The last `ChunkData` before `StreamEnd` MAY be smaller than 1,024 bytes. Receivers MUST accept partial chunks at stream end.
 - **Voucher pacing:** The node pauses delivery when outstanding (unvouchered) bytes exceed `voucher_interval_mb`. Delivery resumes when the client sends a `Voucher` covering the outstanding balance.
 
