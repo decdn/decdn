@@ -5,7 +5,7 @@
 
 ## Context
 
-The protocol makes several deliberate privacy tradeoffs favoring decentralization and accountability over confidentiality. These decisions are scattered across [ADR 001](001-network.md), [ADR 003](003-payments.md), [ADR 005](005-protocol.md), [ADR 006](006-e2e-encryption.md), [ADR 007](007-watchtower.md), [ADR 008](008-reputation.md), [ADR 012](012-client.md), and [architecture.md](architecture.md). No single document maps the full privacy surface, making it difficult to reason about the cumulative exposure or prioritize mitigations.
+The protocol makes several deliberate privacy tradeoffs favoring decentralization and accountability over confidentiality. These decisions are scattered across [ADR 001](001-network.md), [ADR 002](002-content-addressing.md), [ADR 003](003-payments.md), [ADR 005](005-protocol.md), [ADR 006](006-e2e-encryption.md), [ADR 007](007-watchtower.md), [ADR 008](008-reputation.md), [ADR 012](012-client.md), and [architecture.md](architecture.md). No single document maps the full privacy surface, making it difficult to reason about the cumulative exposure or prioritize mitigations.
 
 This ADR consolidates that analysis into a single reference. It does not introduce new functionality — it systematizes privacy properties that other ADRs already specify, assigns an explicit disposition to each, and prioritizes mitigations for PoC versus production.
 
@@ -128,7 +128,7 @@ Endpoint compromise yields secrets specific to that endpoint.
 
 **Current state:** [ADR 012](012-client.md) says rotation is "not supported" for PoC; generating a new key requires deleting the key file and restarting. Production rotation is described but not prioritized.
 
-**Proposal:** Periodic rotation (configurable interval, e.g., every N connections or every T minutes). The client generates a new Ed25519 key via `iroh::SecretKey::generate()`, reconnects, and discards the old key. Payment channels are keyed by Ethereum address ([ADR 012](012-client.md)), so rotation does not affect open channels. The Ethereum key (and associated on-chain identity) remains stable — NodeId rotation breaks correlation at the transport layer only.
+**Proposal:** Periodic rotation (configurable interval, e.g., every N connections or every T minutes). The client generates a new Ed25519 key, reconnects, and discards the old key. Payment channels are keyed by Ethereum address ([ADR 012](012-client.md)), so rotation does not affect open channels. The Ethereum key (and associated on-chain identity) remains stable — NodeId rotation breaks correlation at the transport layer only.
 
 **Limitation:** A T1 adversary correlating the Ethereum address across channels can still link sessions. NodeId rotation mitigates T2 adversaries (node operators) who see the NodeId in QUIC connections but may not know the client's Ethereum address.
 
@@ -159,7 +159,7 @@ Endpoint compromise yields secrets specific to that endpoint.
 
 #### 5.5 Epoch Key Forward Secrecy (P-20)
 
-**Current state:** [ADR 006](006-e2e-encryption.md) already specifies three production mitigations: HSM-backed derivation, periodic `server_secret` rotation, and an append-only key rotation log. No additional design needed — these mitigations are already specified and deferred to production.
+**Current state:** [ADR 006](006-e2e-encryption.md) already specifies three mitigations: HSM-backed derivation, periodic `server_secret` rotation, and an append-only key rotation log. No additional design needed — these mitigations are already specified and should be completed pre-mainnet as part of mainnet readiness.
 
 #### 5.6 Dummy Probes (Not Recommended)
 
