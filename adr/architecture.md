@@ -199,6 +199,14 @@ All four slashable offenses (corrupted delivery, phantom announcements, rate man
 
 ---
 
+### [ADR 015 — QUIC 0-RTT Connection Establishment](015-zero-rtt.md)
+
+**0-RTT early data for latency-sensitive protocols.**
+
+QUIC 0-RTT eliminates the TLS handshake round trip on repeat connections. `cdn/probe/v1` is the sole beneficiary — after the first probe cycle, subsequent cache-miss fan-outs send `ProbeRequest` alongside the ClientHello with zero handshake delay. All other protocols reject 0-RTT: payment-bearing (`cdn/client/v1`) and state-changing (`cdn/watchtower/v1`) to prevent replay-based accounting confusion, and `cdn/keys/v1` because authentication sequencing ([ADR 006](006-e2e-encryption.md)) requires `EpochKeyAuth` before any request stream. Session tickets are cached per `(remote_node_id, ALPN)` in an in-memory LRU (max 1,000 entries).
+
+---
+
 ## Key Invariants
 
 - No external origin URL exists — content enters the network through origin-backed nodes whose backends are hidden
