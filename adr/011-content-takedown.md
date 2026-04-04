@@ -51,9 +51,12 @@ interface IContentBlacklist {
     // isBlacklisted returns false after this deadline unless a governance addHash
     // has been called for the same hash.
 
-    // Category-based expiry: entries with reason containing "CSAM" or "TERRORIST"
+    // Category-based expiry: entries tagged with Category.CSAM or Category.TERRORIST
     // use a 90-day expiry instead of 14 days, ensuring the most severe content
     // categories are not re-exposed due to governance latency.
+    // The Category enum (GENERAL, CSAM, TERRORIST) is set at emergency-add time
+    // via an explicit parameter, not derived from the free-form reason string.
+    // enum Category { GENERAL, CSAM, TERRORIST }
 
     // Regional body registry — global governance only
     function registerRegionalBody(string calldata region, address body) external;

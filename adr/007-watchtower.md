@@ -17,7 +17,7 @@ The threat is asymmetric in unidirectional channels. Vouchers are client-signed 
 
 A watchtower is a non-custodial monitoring service that:
 
-1. Watches for `ChannelCloseInitiated` events on the `StablePaymentChannel` (PoC) / `PaymentChannel` (production) contract
+1. Watches for `ChannelCloseInitiated` events on the `StablePaymentChannel` (PoC) / `PaymentChannel` (production) contract, and in production also monitors `ChannelForceClosedByTokenRemoval` events from token-removal force-closes ([ADR 010](010-multi-token.md))
 2. Holds the latest voucher for each registered channel
 3. Submits a `disputeChannel` transaction if the on-chain close uses a lower-nonce voucher than what the watchtower holds
 

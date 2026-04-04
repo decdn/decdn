@@ -132,7 +132,7 @@ sequenceDiagram
             P->>D: Voucher {sig, amt, nonce} (cumulative USDC)
             D->>P: VoucherAck
         end
-        P->>D: StreamEnd
+        D->>P: StreamEnd
     else redirect
         Note over P: Connect to redirect NodeId and retry<br/>(max 3 hops, cycle detection)
     end
