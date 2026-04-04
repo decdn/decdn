@@ -47,8 +47,8 @@ graph TD
 
     N2 -.->|opaque fetch| S3
 
-    N1 <-.->|"iroh-gossip<br/>NodeAnnounce"| N2
-    N2 <-.->|"iroh-gossip<br/>NodeAnnounce"| N3
+    N1 <-.->|"iroh-gossip<br/>NodeAnnounce, RateChange"| N2
+    N2 <-.->|"iroh-gossip<br/>NodeAnnounce, RateChange"| N3
 
     S3 -.->|"K_blob at ingest"| A
     A -.->|"cdn/keys/v1<br/>epoch keys + envelopes"| C1
@@ -113,7 +113,7 @@ TOKEN is not used for payments. All nodes must stake TOKEN to participate. Staki
 | `cdn/probe/v1` | Parallel latency + availability check before node selection |
 | `cdn/client/v1` | Paid delivery: client→node, node→node (cache miss) |
 | `cdn/watchtower/v1` | Channel-dispute monitoring ([ADR 007](007-watchtower.md)) |
-| iroh-gossip (built-in) | Node metadata broadcast (`NodeAnnounce`), node discovery |
+| iroh-gossip (built-in) | Node metadata broadcast (`NodeAnnounce`), rate change announcements (`RateChange`), node discovery |
 
 **Companion protocol (app server — not a CDN protocol participant):**
 
@@ -123,7 +123,7 @@ TOKEN is not used for payments. All nodes must stake TOKEN to participate. Staki
 
 The app server shares the iroh QUIC transport but does not participate in gossip, probing, or staking. See [External Components](#external-components).
 
-Gossip topics: `cdn/global/v1` (all nodes), `cdn/region/{cc}/v1` (regional), `cdn/reputation/v1` (reputation reports — [ADR 008](008-reputation.md)).
+Gossip topics: `cdn/global/v1` (all nodes — `NodeAnnounce`, `RateChange`), `cdn/region/{cc}/v1` (regional — `NodeAnnounce`), `cdn/reputation/v1` (reputation reports — [ADR 008](008-reputation.md)).
 
 `redirect` in `StreamResponse` always points to a NodeId, never an external URL. The origin backend is never revealed.
 
@@ -195,7 +195,7 @@ All QUIC stream messages use varint-length-prefixed frames containing a top-leve
 
 **Dual-key slash signatures, optimistic challenge-response, unified SlashJudge contract.**
 
-All four slashable offenses (corrupted delivery, phantom announcements, rate manipulation, blacklist violations) now have concrete on-chain evidence paths. Ed25519 signatures from iroh NodeIds are not EVM-verifiable, so protocol messages (`ProbeResponse`, `StreamResponse`) carry an optional secp256k1 `slash_sig` — an EIP-712 signature over the same security-relevant fields — enabling `ecrecover`-based verification at 3,000 gas (vs ~500k–1M for a Solidity Ed25519 library). For BLAKE3 content corruption, the PoC uses a single-round optimistic challenge-response with a 100 TOKEN bond and 24-hour counter-evidence window; the production path upgrades to an interactive keccak256 Merkle proof over 1024-byte chunks. A unified `SlashJudge` contract adjudicates all offense types and calls `StakingRegistry.slash()` on resolution.
+All four slashable offenses (corrupted delivery, phantom announcements, rate manipulation, blacklist violations) now have concrete on-chain evidence paths. Ed25519 signatures from iroh NodeIds are not EVM-verifiable, so protocol messages (`ProbeResponse`, `StreamResponse`, `RateChange`) carry a secp256k1 `slash_sig` — an EIP-712 signature over the same security-relevant fields — enabling `ecrecover`-based verification at 3,000 gas. The `slash_sig` is optional at the wire/gossip level (`Option<Bytes>`), but for `RateChange` a valid `slash_sig` is required to serve as on-chain counter-evidence in rate manipulation challenges (vs ~500k–1M for a Solidity Ed25519 library). Phantom and blacklist offenses are immediate (no counter window). Corruption and rate manipulation are deferred with a 24-hour counter-evidence window: corruption counters use a signed `DeliveryReceipt`; rate manipulation counters use a signed `RateChange` gossip message proving a legitimate rate change between the disputed timestamps. The production path upgrades corruption to an interactive keccak256 Merkle proof over 1024-byte chunks. A unified `SlashJudge` contract adjudicates all offense types and calls `StakingRegistry.slash()` on resolution.
 
 ---
 
