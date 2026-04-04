@@ -60,16 +60,18 @@ function removeToken(address token) external onlyGovernance {
 
 Governance (admin key for PoC, OpenZeppelin Governor for production) must call `addToken` before any channel can be opened in that token. `removeToken` prevents new channels from being opened in that token; existing open channels remain valid and can still be closed/disputed normally.
 
-**Force-close channels in removed tokens.** Once a token is removed, any address can force-close open channels in that token via `forceCloseChannel`. This avoids the need for on-chain enumeration of channels per token — callers (watchtowers, governance bots, channel parties) provide the channel ID, and the contract checks `!allowedTokens[channel.token]`:
+**Force-close channels in removed tokens.** Once a token is removed, any address can force-close open channels in that token via `forceCloseChannel`. This avoids the need for on-chain enumeration of channels per token — callers (watchtowers, governance bots, channel parties) provide the channel ID, and the contract first verifies that the channel exists, then checks `!allowedTokens[channel.token]`:
 
 ```solidity
 function forceCloseChannel(bytes32 channelId) external {
     Channel storage ch = channels[channelId];
+    require(ch.openedAt != 0, "Channel does not exist");
     require(ch.status == Status.Open, "Not open");
     require(!allowedTokens[ch.token], "Token still allowed");
 
     ch.status = Status.Closing;
     ch.claimedAmount = 0;
+    ch.claimedNonce = 0;
     ch.disputeDeadline = block.timestamp + disputeWindow;
 
     emit ChannelForceClosedByTokenRemoval(channelId, ch.token, msg.sender, ch.disputeDeadline);
@@ -83,7 +85,7 @@ event ChannelForceClosedByTokenRemoval(
 );
 ```
 
-The force-close sets `claimedAmount = 0` (no voucher submitted) and enters the standard Closing→dispute→settle flow (see [ADR 003](003-payments.md)). If the provider holds a valid voucher, they can call `disputeChannel` during the dispute window to claim earned fees. If nobody disputes, `settleChannel` returns the full deposit to the client. This preserves fairness: providers get the same dispute opportunity as a normal close.
+The force-close sets `claimedAmount = 0` and `claimedNonce = 0` (no voucher submitted, matching the zero-voucher close semantics in [ADR 003](003-payments.md)) and enters the standard Closing→dispute→settle flow. If the provider holds a valid voucher, they can call `disputeChannel` during the dispute window to claim earned fees — any real voucher (nonce >= 1) satisfies the strictly-higher-nonce requirement against `claimedNonce = 0`. If nobody disputes, `settleChannel` returns the full deposit to the client. This preserves fairness: providers get the same dispute opportunity as a normal close.
 
 **`openChannel` accepts governance-approved ERC-20s:**
 
@@ -255,7 +257,7 @@ struct SignedRate {
 - **Decimal heterogeneity.** Tokens use 0–18 decimals. A node misconfiguring decimals silently misprices deliveries. The `TokenInfo.decimals` field must be validated against the on-chain `IERC20Metadata.decimals()` return value at startup.
 - **No protocol-level price normalization.** A node advertising 1 base-unit/MB in USDC (= $0.000001/MB) and 1 base-unit/MB in a low-value token are indistinguishable at the wire level. Clients bear responsibility for evaluating whether a node's accepted token has value.
 - **Governance bottleneck.** Adding a new payment token requires a governance action (admin call for PoC, Governor proposal for production). This adds latency for operators who want to use a token not yet approved. Mitigated by the fact that token additions are infrequent and low-risk governance actions.
-- **Token removal complexity.** `removeToken` blocks new channels but existing open channels in that token remain valid until force-closed or expired. `forceCloseChannel` (see contract interface above) allows any address to close these channels immediately, bounding the effective sunset to the dispute window duration (48h PoC) rather than `maxChannelDuration` (90 days). Off-chain enumeration via `ChannelOpened` event logs is required to identify channels to force-close.
+- **Token removal complexity.** `removeToken` blocks new channels but existing open channels in that token remain valid until force-closed or expired. `forceCloseChannel` (see contract interface above) allows any address to close these channels immediately, bounding the effective sunset to the dispute window duration (48h PoC) rather than `maxChannelDuration` (90 days). Because the contract provides no on-chain enumeration of channels, callers must maintain an off-chain inventory of channel IDs (persisted from channel creation) to identify channels to force-close after a token is removed.
 - **Per-token rate bounds governance burden.** Governance must set meaningful bounds for each token at `addToken` time. Bounds can be adjusted later via `setRateBounds`, but the floor can never drop below 1 base unit.
 - **Slashing is always in TOKEN (resolved).** ADR 004's slashing schedule is denominated in TOKEN stake, and this remains unchanged with multi-token payments. Slashing operates on the `StakingRegistry` (TOKEN stake), not on payment channel deposits (which may be in any approved token). A node paid exclusively in DAI is still slashed in TOKEN — the node must hold TOKEN stake to participate in the network regardless of which payment tokens it accepts. No price oracle or cross-token conversion is needed. The slash amount is a percentage of TOKEN stake, not a percentage of delivery revenue.
 
