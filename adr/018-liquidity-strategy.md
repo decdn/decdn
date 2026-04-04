@@ -62,7 +62,7 @@ The canonical `IBuybackBurner` interface is defined in [ADR 003 — BuybackBurne
 
 The core `executeBuyback(address token, uint256 amount, uint256 minTokenOut)` call pattern is **unchanged** for the Balancer V3 venue. What this ADR adds is one additional configuration setter, `setPool(address pool)`, so the same interface can select a venue-specific pool identifier symmetrically across Balancer V3 and any future Uniswap V3 deployment (both identify pools by contract address). Deployment configuration for the Balancer V3 venue:
 
-- `setSwapRouter(address)` is set to the **Balancer V3 Router address** on the production L2. On Arbitrum mainnet this is `0xEAedc32a51c510d35ebC11088fD5fF2b47aACF2E` (Router v2); Sepolia and other testnet addresses MUST be pulled from [`balancer-deployments/addresses/arbitrum-sepolia.json`](https://github.com/balancer/balancer-deployments) at deployment time and not hardcoded in this ADR.
+- `setSwapRouter(address)` is set to the router contract used for the **Balancer V3 Vault** on the production L2. On Arbitrum mainnet this is `0xEAedc32a51c510d35ebC11088fD5fF2b47aACF2E`. Balancer's deployment registry labels this contract **`Router v2`** — that label is the second iteration of the Balancer V3 Router artifact (a contract versioning within Balancer V3), **not** a reference to Balancer V2 protocol routing. This is the correct router address to use for the Balancer V3 venue on Arbitrum. Sepolia and other testnet addresses MUST be pulled from [`balancer-deployments/addresses/arbitrum-sepolia.json`](https://github.com/balancer/balancer-deployments) at deployment time and not hardcoded in this ADR.
 - `setPool(address)` is set to the contract address of the deployed 80/20 TOKEN/USDC Weighted Pool. V3 identifies pools by their contract address directly; the V2 `bytes32 poolId` abstraction is gone. The setter is venue-symmetric — a Uniswap V3 deployment would hold the V3 pool contract address here, with no bytes-cast gymnastics.
 - **Approvals footgun.** USDC approval is made to the **Balancer V3 Vault** address (`0xbA1333333333a1BA1108E8412f11850A5C319bA9` on Arbitrum mainnet), *not* to the Router — even though `executeBuyback()` *calls* the Router. This split (call the Router, but approve the Vault) is the single most common V2→V3 integration mistake and MUST be explicitly documented in deployment runbooks. The Router forwards into the Vault, which pulls input tokens via its own allowance.
 
@@ -93,9 +93,9 @@ The core `executeBuyback(address token, uint256 amount, uint256 minTokenOut)` ca
 | `slippageBps` | N/A (execution disabled) | 200 bps (2%) | Yes |
 | TWAP `subSwapCount` | 1 (no splitting) | 4 (default, governable) [^subswap-rationale] | Yes |
 | TWAP `subSwapMinBlockGap` | N/A | 10 blocks (~2 minutes on Arbitrum) | Yes |
+| Execution activation | Disabled — fees accumulate only | Governance vote required to enable | — |
 
 [^subswap-rationale]: A default of 4 balances MEV mitigation against gas overhead and keeper complexity. 2 sub-swaps provides marginal splitting benefit; ≥8 multiplies keeper gas and `ceilDiv` rounding artifacts without proportionate MEV improvement on a weighted pool (where curvature is already smoother than V3 concentrated bands). Governance may tune this once production buyback volumes are observed.
-| Execution activation | Disabled — fees accumulate only | Governance vote required to enable | — |
 
 ### Activation Criteria (Production)
 
