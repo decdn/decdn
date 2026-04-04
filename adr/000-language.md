@@ -19,8 +19,6 @@ Use **Rust** as the implementation language and **iroh** as the core networking 
 
 iroh versioning policy: pin to a specific version in `Cargo.toml` (e.g. `iroh = "0.97"`) rather than an open range. The current evaluated baseline is **0.97**. Upgrades are deliberate — evaluate API compatibility, update `Cargo.toml`, and record the new baseline here before merging. `Cargo.lock` is committed and acts as the true pin within a given version constraint.
 
-> **`protocol` crate re-exports.** The `protocol` crate (see [architecture.md § Crate Structure](architecture.md#crate-structure)) SHOULD re-export shared iroh types (`NodeId`, `Hash`, `Signature`, `PublicKey`, etc.) so that downstream crates (`cache`, `incentive`, `reputation`) depend on `protocol` for these types rather than importing `iroh` directly. This confines an iroh version bump to `protocol` + the wiring in `node`, rather than requiring all crates to update simultaneously.
-
 Specifically:
 - `iroh::Endpoint` for QUIC-based peer-to-peer connectivity and ALPN protocol negotiation
 - `iroh-blobs` with `fs-store` backend for content-addressed blob storage and verified transfer

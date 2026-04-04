@@ -17,7 +17,7 @@ The threat is asymmetric in unidirectional channels. Vouchers are client-signed 
 
 A watchtower is a non-custodial monitoring service that:
 
-1. Watches for `ChannelCloseInitiated` events on the `StablePaymentChannel` (PoC) / `PaymentChannel` (production) contract, and in production also monitors `ChannelForceClosedByTokenRemoval` events from token-removal force-closes ([ADR 010](010-multi-token.md))
+1. Watches for `ChannelCloseInitiated` events on the `StablePaymentChannel` contract
 2. Holds the latest voucher for each registered channel
 3. Submits a `disputeChannel` transaction if the on-chain close uses a lower-nonce voucher than what the watchtower holds
 
@@ -240,8 +240,6 @@ These three items future-proof the contract and node software for watchtower int
 ### Contract: WatchtowerEscrow
 
 The `WatchtowerEscrow` contract manages prepaid monitoring fees and enforces heartbeat-based liveness accountability. It is a standalone contract that reads channel state from `StablePaymentChannel` (PoC) / `PaymentChannel` (production) via `getChannel()` but does not modify the payment channel contract. This follows the same pattern as `SlashJudge` ([ADR 014](014-on-chain-verification.md)) — a separate accountability contract that references but does not alter the core payment infrastructure.
-
-> **Fee denomination.** `WatchtowerEscrow` fees are denominated in USDC regardless of the payment channel's token. In production, where `PaymentChannel` supports multiple governance-approved ERC-20 tokens ([ADR 010](010-multi-token.md)), the watchtower fee remains USDC-only to avoid requiring watchtowers to manage multiple token inventories or exchange rate risk. Watched parties using non-USDC payment channels must hold sufficient USDC separately for watchtower fee deposits.
 
 **Associated structs:**
 

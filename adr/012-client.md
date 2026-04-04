@@ -115,8 +115,6 @@ voucher_key = HKDF-SHA256(
 
 The resulting secp256k1 key is used exclusively for EIP-712 voucher signatures. It is held in memory only — never written to disk. The corresponding Ethereum address must be pre-authorized in the payment channel contract as a delegated signer (contract support for delegated signers is deferred to a future ADR).
 
-> **Implementation status.** The derived hot key scheme is a production design sketch. It requires a delegated signer contract extension that authorizes the derived key to sign vouchers on behalf of the hardware wallet's Ethereum address. This contract extension is not yet specified and is deferred to a future ADR. The PoC uses direct Ethereum key signing from the encrypted keystore file ([Section 3.1](#31-poc-key-storage)).
-
 #### Key Summary
 
 | Key | Algorithm | PoC Storage | Production Storage | Rotation |
@@ -145,7 +143,7 @@ Client identity bindings are **ephemeral and per-connection**, as specified in [
 | Compromised key | Impact | Response |
 | --- | --- | --- |
 | iroh Ed25519 | Attacker can impersonate client NodeId (connect to nodes, receive gossip) but cannot sign vouchers or move funds. Attacker can connect to the app server as this NodeId via `cdn/keys/v1`, but cannot authenticate without the session token — no content access. | Generate new iroh key, reconnect |
-| Ethereum secp256k1 | Attacker can sign vouchers draining the payment channel balance | Race to close channels: call `closeChannel` with the latest voucher nonce. If attacker has already submitted a close with a higher-nonce voucher, dispute within the challenge window ([ADR 003](003-payments.md)). No revocation mechanism exists beyond racing to close. **Race condition detail:** if the attacker calls `closeChannel` with a fabricated high-nonce voucher before the legitimate client, the client must dispute within the dispute window using their own highest-nonce voucher. Additionally, the attacker can sign *new* vouchers draining the remaining channel balance to a colluding node before the client can close — the only defense is speed. See [ADR 016](016-contract-interactions.md) for the full channel close lifecycle. |
+| Ethereum secp256k1 | Attacker can sign vouchers draining the payment channel balance | Race to close channels: call `closeChannel` with the latest voucher nonce. If attacker has already submitted a close with a higher-nonce voucher, dispute within the challenge window ([ADR 003](003-payments.md)). No revocation mechanism exists beyond racing to close. |
 | Both | Full impersonation | Close all channels immediately. Generate new iroh key. Use a new Ethereum address for future sessions. |
 
 ### Eclipse Attack Mitigation

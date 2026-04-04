@@ -87,9 +87,6 @@ Staking, slashing, and fee parameters are defined in [ADR 004](004-tokenomics.md
 - Cannot change parameters, withdraw funds, or bypass governance for non-emergency actions
 - Used for exploit response, critical bug mitigation, and time-critical content removal (e.g., CSAM, actively-exploited material)
 - Sunset: `pauseDeadline = deployTimestamp + 365 days` is hardcoded in the constructor as an immutable value. After the deadline, `pause()` reverts with `"PauseExpired"`. Emergency blacklisting capability follows the same sunset schedule (`blacklistDeadline = deployTimestamp + 365 days`). **Extension mechanism:** governance cannot modify the immutable deadline. To extend pause/blacklist capability, governance must deploy a new contract version with a new deadline and migrate via the standard contract upgrade path (timelock + governance vote). This ensures the sunset cannot be silently extended — a new deployment is a visible, auditable event.
-
-> **Response latency gap post-sunset.** After the 12-month sunset, emergency capabilities (pause, emergency blacklist) are unavailable until governance deploys a replacement. The minimum governance response time is 5 days (3-day voting + 2-day timelock), creating a gap where time-critical responses (e.g., active exploit, CSAM distribution) cannot be addressed quickly. **Recommendation: renewable sunset.** Instead of a single immutable deadline, consider a renewable mechanism: governance can vote to extend the deadline by capped increments (e.g., maximum 6-month extensions). The sunset still happens by default if governance does nothing (preserving the anti-centralization guarantee), but continued emergency capability is available if the community actively renews it. This is a production design consideration — the PoC uses an admin key with no sunset.
-
 - Signers should be geographically and organizationally diverse
 
 ## Consequences

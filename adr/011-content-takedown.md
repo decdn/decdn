@@ -43,20 +43,17 @@ interface IContentBlacklist {
     // Emergency multisig path (3-of-5, no timelock) — hash and origin
     // Subject to 12-month sunset: blacklistDeadline = deployTimestamp + 365 days
     // (see ADR 009, Emergency Multisig)
-    function emergencyAdd(bytes32 blake3Hash, string calldata reason) external;
-    function emergencyAddOrigin(address operatorAddress, string calldata reason) external;
+    // Category determines emergency entry expiry:
+    //   GENERAL — 14-day auto-expiry (default)
+    //   CSAM, TERRORIST — 90-day auto-expiry (severe content must not be re-exposed due to governance latency)
+    // enum Category { GENERAL, CSAM, TERRORIST }
+    function emergencyAdd(bytes32 blake3Hash, uint8 category, string calldata reason) external;
+    function emergencyAddOrigin(address operatorAddress, uint8 category, string calldata reason) external;
 
-    // Emergency entries expire after 14 days unless ratified by governance.
-    // Expiry is derived from the entry's addedAt timestamp: addedAt + 14 days.
+    // Emergency entries expire after their category-specific deadline unless ratified by governance.
+    // Expiry is derived from the entry's addedAt timestamp: addedAt + expiryForCategory(category).
     // isBlacklisted returns false after this deadline unless a governance addHash
     // has been called for the same hash.
-
-    // Category-based expiry: entries tagged with Category.CSAM or Category.TERRORIST
-    // use a 90-day expiry instead of 14 days, ensuring the most severe content
-    // categories are not re-exposed due to governance latency.
-    // The Category enum (GENERAL, CSAM, TERRORIST) is set at emergency-add time
-    // via an explicit parameter, not derived from the free-form reason string.
-    // enum Category { GENERAL, CSAM, TERRORIST }
 
     // Regional body registry — global governance only
     function registerRegionalBody(string calldata region, address body) external;
