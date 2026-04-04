@@ -65,7 +65,7 @@ graph TD
 | 3 | StakingRegistry | TOKEN address, `minStake` (1,000 TOKEN), `unbondingPeriod` (7 days PoC) |
 | 4a | StablePaymentChannel (PoC) | Constructor args: USDC address, `treasuryAddress`, `disputeWindow` (48h). Initialized in constructor body: StakingRegistry address, `feePercentage` (300 bps), `discountedFeePercentage` (150 bps), `maxChannelDuration` (90 days), rate bounds ([ADR 003](003-payments.md)) |
 | 4b | PaymentChannel (production) | StakingRegistry address, Governor address |
-| 5 | BuybackBurner | TOKEN address, USDC address, Balancer V2 Vault address, `bytes32 poolId` (see [ADR 018](018-liquidity-strategy.md)) |
+| 5 | BuybackBurner | TOKEN address, USDC address, Balancer V3 Router address, pool contract `address` (see [ADR 018](018-liquidity-strategy.md)). **Note:** ERC-20 approvals must target the Balancer V3 **Vault** address, not the Router — see the V3 footgun in [ADR 018](018-liquidity-strategy.md#buyback-execution-via-balancer-v3). |
 | 6 | ContentBlacklist | `ContentBlacklist(address stakingRegistry)`. StakingRegistry address is required for `ejectNode()` cross-contract call. [ADR 011](011-content-takedown.md) describes the call but not the constructor interface; this ADR formalizes it. |
 | 7 | SlashJudge | StakingRegistry address, TOKEN address, `challengeBond` (100 TOKEN PoC / 50 TOKEN production), `counterEvidenceWindow` (24h) |
 | 8 | WatchtowerEscrow | StablePaymentChannel/PaymentChannel address, `heartbeatInterval`, `missThreshold`, `feeRateBps`, `minFee`, `monitoringPeriod` |
@@ -116,7 +116,7 @@ graph LR
     BB["BuybackBurner"]
     WE["WatchtowerEscrow"]
     ERC["ERC-20 Tokens<br/>(USDC, TOKEN)"]
-    BAL["Balancer V2 Vault"]
+    BAL["Balancer V3 Router"]
 
     SPC -->|"getStakeMultiple(provider)"| SR
     SPC -->|"safeTransferFrom / safeTransfer"| ERC
@@ -124,7 +124,7 @@ graph LR
     SJ -->|"slash(node, offenseType)"| SR
     SJ -->|"safeTransferFrom / safeTransfer"| ERC
     SR -->|"safeTransferFrom / safeTransfer"| ERC
-    BB -->|"Vault.swap()"| BAL
+    BB -->|"Router.swapSingleTokenExactIn()"| BAL
     BB -->|"safeTransferFrom / safeTransfer"| ERC
     WE -->|"read channel state"| SPC
 ```
@@ -142,7 +142,7 @@ graph LR
 | SlashJudge | StakingRegistry | `slash(node, offenseType)` | `SLASH_ROLE` | Yes |
 | SlashJudge | IERC20 (TOKEN) | `safeTransferFrom()` / `safeTransfer()` | Caller must have allowance/balance | Yes |
 | StakingRegistry | IERC20 (TOKEN) | `safeTransferFrom()` / `safeTransfer()` | Caller must have allowance/balance | Yes |
-| BuybackBurner | Balancer V2 Vault | `swap(SingleSwap, FundManagement, limit, deadline)` | USDC must be approved to the Vault (not to the pool) | Yes |
+| BuybackBurner | Balancer V3 Router | `swapSingleTokenExactIn(pool, tokenIn, tokenOut, exactAmountIn, minAmountOut, deadline, wethIsEth, userData)` | USDC must be approved to the **Balancer V3 Vault** address (NOT the Router) — the V3 footgun; see [ADR 018](018-liquidity-strategy.md#buyback-execution-via-balancer-v3) | Yes |
 | BuybackBurner | IERC20 (USDC, TOKEN) | `safeTransferFrom()` / `safeTransfer()` | Caller must have allowance/balance | Yes |
 | WatchtowerEscrow | StablePaymentChannel / PaymentChannel | Channel state reads | Public (read-only) | No |
 
@@ -159,7 +159,7 @@ flowchart TD
     Provider["Provider (node operator)"]
     Treasury["Treasury (EOA)"]
     BB["BuybackBurner"]
-    BAL["Balancer V2 Vault<br/>(80/20 TOKEN/USDC pool)"]
+    BAL["Balancer V3 Router<br/>(→ 80/20 TOKEN/USDC Weighted Pool)"]
     BURN["Burn Address<br/>(0x...dEaD)"]
 
     Client -->|"openChannel() / topUp()<br/>deposit USDC"| SPC
@@ -167,7 +167,7 @@ flowchart TD
     SPC -->|"settleChannel()<br/>protocol fee (default 3% / 1.5% discounted)"| Treasury
     SPC -->|"settleChannel()<br/>unused balance"| Client
     Treasury -->|"20% of fees (manual PoC)"| BB
-    BB -->|"Vault.swap() (see ADR 018)"| BAL
+    BB -->|"Router.swapSingleTokenExactIn() (see ADR 018)"| BAL
     BAL -->|"TOKEN"| BB
     BB -->|"burn()"| BURN
 ```
@@ -298,7 +298,7 @@ Every state-mutating function that makes an external call is listed below with i
 
 | Function | External Calls | Guards |
 | --- | --- | --- |
-| `executeBuyback()` | `BalancerV2Vault.swap()` (swaps contract-held USDC), `IERC20.safeTransfer()` (TOKEN to burn) | `nonReentrant`, checks-effects-interactions, `KEEPER_ROLE` |
+| `executeBuyback()` | `BalancerV3Router.swapSingleTokenExactIn()` (swaps contract-held USDC; Router forwards to Vault which pulls input tokens via Vault-scoped allowance), `IERC20.safeTransfer()` (TOKEN to burn) | `nonReentrant`, checks-effects-interactions, `KEEPER_ROLE` |
 
 > **MEV protection (production).** See [ADR 018 — Buyback execution via Balancer](018-liquidity-strategy.md#buyback-execution-via-balancer) for the authoritative policy. In summary: Balancer's weighted-pool curve reduces (but does not eliminate) price-impact concerns compared to concentrated liquidity, and `executeBuyback` MAY split large buybacks into `subSwapCount` sub-swaps spaced by `subSwapMinBlockGap` blocks. The recommended production path is to route buybacks through CoW Swap, which provides native batch-auction MEV protection and routes through the Balancer pool when it is best-execution. The `maxBuybackAmount` parameter MUST be enforced to limit per-transaction MEV exposure regardless of venue.
 
