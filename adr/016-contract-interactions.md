@@ -65,7 +65,7 @@ graph TD
 | 3 | StakingRegistry | TOKEN address, `minStake` (1,000 TOKEN), `unbondingPeriod` (7 days PoC) |
 | 4a | StablePaymentChannel (PoC) | Constructor args: USDC address, `treasuryAddress`, `disputeWindow` (48h). Initialized in constructor body: StakingRegistry address, `feePercentage` (300 bps), `discountedFeePercentage` (150 bps), `maxChannelDuration` (90 days), rate bounds ([ADR 003](003-payments.md)) |
 | 4b | PaymentChannel (production) | StakingRegistry address, Governor address |
-| 5 | BuybackBurner | TOKEN address, USDC address, Balancer V2 Vault address, `bytes32` pool id (see [ADR 018](018-liquidity-strategy.md)) |
+| 5 | BuybackBurner | TOKEN address, USDC address, Balancer V2 Vault address, `bytes32 poolId` (see [ADR 018](018-liquidity-strategy.md)) |
 | 6 | ContentBlacklist | `ContentBlacklist(address stakingRegistry)`. StakingRegistry address is required for `ejectNode()` cross-contract call. [ADR 011](011-content-takedown.md) describes the call but not the constructor interface; this ADR formalizes it. |
 | 7 | SlashJudge | StakingRegistry address, TOKEN address, `challengeBond` (100 TOKEN PoC / 50 TOKEN production), `counterEvidenceWindow` (24h) |
 | 8 | WatchtowerEscrow | StablePaymentChannel/PaymentChannel address, `heartbeatInterval`, `missThreshold`, `feeRateBps`, `minFee`, `monitoringPeriod` |

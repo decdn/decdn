@@ -31,7 +31,7 @@ This reverses the implicit Uniswap V3 choice in prior ADRs.
 | USDC required to pair 100M TOKEN at $0.01 anchor | ~$250K | ~$1M (50/50 range) |
 | Operational burden | None — set weights once | Active range management, keeper infra, rebalance transactions |
 | Behavior when price exits anticipated range | Pool continues trading across full curve | Position becomes 100% one asset, earns zero fees |
-| IL for a 2× price move | ~1.3% (80/20) | ~5.7% (50/50); position may be fully converted if out of range |
+| IL for a 2× price move | ~3.3% (80/20) | ~5.7% (50/50); position may be fully converted if out of range |
 | MEV protection for buybacks | Native via CoW Swap batch-auction routing (Balancer is a primary CoW venue) | Requires custom TWAP + private mempool (Flashbots Protect) |
 | Fee capture per TVL (active conditions) | Lower | Higher (if well-managed and in-range) |
 | Aggregator routing density on Arbitrum | Lower | Higher |
@@ -39,7 +39,7 @@ This reverses the implicit Uniswap V3 choice in prior ADRs.
 
 The first three rows dominate the decision for a TOKEN-rich, USDC-poor treasury with a small team. Uniswap V3's wins (fee capture, routing density) presuppose active range management the protocol team cannot provide during the PoC and early production.
 
-**Weights rationale.** 80/20 TOKEN-heavy lets the treasury seed the pool with ~1/4 the USDC of a 50/50 position while retaining comparable near-spot depth for small trades. It also reduces IL for a given TOKEN price move by roughly 4× compared to 50/50, which aligns the DAO's LP position with the protocol's own upside thesis — if TOKEN appreciates with network usage, the DAO keeps more of the upside.
+**Weights rationale.** 80/20 TOKEN-heavy lets the treasury seed the pool with ~1/4 the USDC of a 50/50 position while retaining comparable near-spot depth for small trades. It also reduces IL for a given TOKEN price move by roughly 1.75× compared to 50/50 (at a 2× price move: ~3.3% vs ~5.7%), which aligns the DAO's LP position with the protocol's own upside thesis — if TOKEN appreciates with network usage, the DAO keeps more of the upside. Derivation: `IL = r^w_TOKEN / (w_TOKEN·r + w_USDC) − 1`; at `r=2`, `w_TOKEN=0.8` gives `2^0.8 / 1.8 − 1 ≈ −3.27%` and `w_TOKEN=0.5` gives `√2 / 1.5 − 1 ≈ −5.72%`.
 
 **Fee tier rationale.** 1% is appropriate for a long-tail asset with limited trading activity. Lower tiers (0.3%, 0.05%) assume volume sufficient to compensate LPs, which TOKEN will not have at PoC scale.
 
@@ -54,31 +54,24 @@ The first three rows dominate the decision for a TOKEN-rich, USDC-poor treasury 
 
 ### Buyback execution via Balancer
 
-[ADR 003](003-payments.md) specifies the `IBuybackBurner` interface:
+The canonical `IBuybackBurner` interface is defined in [ADR 003 — BuybackBurner](003-payments.md#buybackburner); that block is the single source of truth and is not duplicated here to avoid cross-ADR drift.
 
-```solidity
-interface IBuybackBurner {
-    function executeBuyback(address token, uint256 amount, uint256 minTokenOut) external;
-    function setSwapRouter(address router) external;
-    function setSlippageTolerance(uint256 bps) external;
-    function setMinBuybackAmount(uint256 amount) external;
-    function setMaxBuybackAmount(uint256 amount) external;
-    // ...
-}
-```
-
-This interface is venue-agnostic and **requires no changes for the Balancer venue**. Only the deployment configuration changes:
+The core `executeBuyback(address token, uint256 amount, uint256 minTokenOut)` call pattern is **unchanged** for the Balancer venue. What this ADR adds is one additional configuration setter, `setPoolId(bytes32 poolId)`, so the same interface can select a venue-specific pool identifier symmetrically across Balancer and any future Uniswap V3 deployment. Deployment configuration for the Balancer venue:
 
 - `setSwapRouter(address)` is set to the **Balancer V2 Vault address** on the production L2 (Arbitrum).
-- The target pool is identified by `bytes32 poolId`, stored in a new venue-specific config slot. This ADR adds one setter to the interface: `setPoolId(bytes32 poolId)`. The setter is symmetric across venues — for a Uniswap V3 deployment it would hold the pool address cast to `bytes32`.
-- Inside `executeBuyback()`, the contract calls `Vault.swap(SingleSwap, FundManagement, limit, deadline)` with `poolId` from storage, `assetIn = USDC`, `assetOut = TOKEN`, `kind = GIVEN_IN`, `amount` from the input, and `limit = minTokenOut` (the caller-supplied sandwich guard). The existing `maxBuybackAmount` and `slippageBps` guards apply unchanged.
-- USDC must be approved to the Vault address before the call (standard Balancer pattern — approvals are to the Vault, not to the pool).
+- `setPoolId(bytes32)` is set to the `poolId` of the deployed 80/20 TOKEN/USDC weighted pool. The setter is venue-symmetric — for a Uniswap V3 deployment it would hold the pool address cast to `bytes32`.
+- USDC must be approved to the Vault address before the first `executeBuyback()` call (standard Balancer pattern — approvals are to the Vault, not to the pool).
 
-**TWAP policy.** Balancer's smoother curve (compared to V3's concentrated bands) reduces the need for TWAP, but does not eliminate it for large buybacks. The policy:
+**Single-swap (non-TWAP) execution.** When `subSwapCount = 1`, `executeBuyback()` calls `Vault.swap(SingleSwap, FundManagement, limit, deadline)` once with `poolId` from storage, `assetIn = USDC`, `assetOut = TOKEN`, `kind = GIVEN_IN`, `amount` from the caller, and `limit = minTokenOut` (the caller-supplied sandwich guard applied directly). The existing `maxBuybackAmount` and `slippageBps` guards apply unchanged — `amount` MUST be ≤ `maxBuybackAmount`.
 
-- `executeBuyback()` MAY split the input into up to `subSwapCount` sub-swaps with at least `subSwapMinBlockGap` blocks between them. Each sub-swap is capped at `maxBuybackAmount / subSwapCount` and applies `minTokenOut / subSwapCount` as its per-sub-swap guard.
-- Alternatively, the keeper MAY route the buyback through CoW Swap, which provides batch-auction MEV protection natively and will route through the Balancer pool when it is the best-execution venue. CoW routing is the recommended path for production.
-- Partial execution is acceptable: if a later sub-swap reverts due to `minTokenOut`, earlier sub-swaps stand and residual USDC remains in the contract until the next execution.
+**TWAP policy (`subSwapCount > 1`).** Balancer's smoother curve reduces the need for TWAP compared to V3's concentrated bands but does not eliminate it for large buybacks. When splitting:
+
+- **`minTokenOut` is the aggregate minimum** TOKEN output required across the full buyback request, not a per-sub-swap minimum. The contract MUST track cumulative TOKEN received and MUST ensure the final cumulative output is ≥ `minTokenOut` for the split request to be considered satisfied. A naive per-sub-swap guard of `minTokenOut / subSwapCount` is rejected because integer truncation allows the aggregate to fall below the caller's requested minimum.
+- **Per-sub-swap guard** is derived from the remaining required output and remaining sub-swaps: `remainingMinOut = minTokenOut − cumulativeReceived`; `perSubSwapLimit = ceilDiv(remainingMinOut, remainingSubSwaps)`. This keeps the aggregate bound tight even under uneven per-sub-swap fills.
+- **`maxBuybackAmount` is a per-transaction cap**, consistent with its definition at [ADR 016 — BuybackBurner reentrancy row](016-contract-interactions.md#buybackburner). Each sub-swap (being its own transaction) MAY be as large as `maxBuybackAmount`; the *total* buyback is bounded by the caller-supplied `amount`, not by `maxBuybackAmount × subSwapCount`. Dividing the per-transaction cap by the split count would unnecessarily restrict the protocol's ability to process accumulated fees.
+- **Spacing.** Sub-swaps are separated by at least `subSwapMinBlockGap` blocks.
+- **Alternative: CoW Swap routing.** The keeper MAY route the buyback through CoW Swap instead of calling the Vault directly. CoW provides batch-auction MEV protection natively and routes through the Balancer pool when it is best-execution. CoW routing is the recommended production path.
+- **Partial execution.** If a later sub-swap reverts (e.g., its derived `remainingMinOut` cannot be satisfied), earlier sub-swaps stand and their output is retained; residual USDC remains in the contract until the next execution. The original split request MUST NOT be treated as having satisfied `minTokenOut` unless cumulative output across its sub-swaps meets the aggregate minimum.
 
 ### Parameter Table
 
