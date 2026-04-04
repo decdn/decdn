@@ -69,8 +69,8 @@ network_score = ewma(network_score, report.score, alpha=0.05 * reporter_weight)
 
 The `effective_settled_value` computation applies a distinct-counterparty discount to prevent wash trading via self-dealing channels. For each reporter, the indexer tracks two quantities from `ChannelSettled` events:
 
-- `gross_settled_value`: sum of all settlement amounts across channels where the reporter was either client or provider (the pre-adjustment `total_settled_value`)
-- `distinct_counterparties`: count of unique counterparty addresses across all settled channels within the settlement time window (Section 4.2)
+- `gross_settled_value`: sum of all settlement amounts across channels where the reporter was either client or provider (i.e., the sum before applying diversity discount and time decay)
+- `distinct_counterparties`: count of unique counterparty addresses across all settled channels within the last 52 weeks (`settlement_max_age` — see Section 4.2)
 
 The diversity factor scales the time-decayed settlement sum (see Section 4.2 for the full formula):
 
@@ -134,7 +134,8 @@ flowchart TD
     end
 
     subgraph Network["Network Score (30%)"]
-        GR[Gossip ReputationReport] --> DC["diversity_factor =<br/>min(distinct_counterparties / 5, 1.0)"]
+        GR[Gossip ReputationReport] --> FILT["Filter: exclude settlements<br/>> 52 weeks old"]
+        FILT --> DC["diversity_factor =<br/>min(distinct_counterparties / 5, 1.0)"]
         DC --> TD["effective_settled_value =<br/>Σ(amount_i × e^(−0.1 × age_weeks_i)) × diversity_factor"]
         TD --> RW["reporter_weight =<br/>min(effective / max(1, max_observed), 3.0)"]
         RW --> EWMA2["network_score = EWMA(network, report,<br/>a=0.05 * reporter_weight)"]
@@ -270,7 +271,7 @@ PoC action items:
 ### Positive
 
 - Interaction-weighted scoring makes reputation manipulation expensive — you need real economic activity (settled payment channels), not just stake
-- Distinct-counterparty discount and settlement time decay raise the cost of wash trading from ~$37.50 (cycling $1,000 through one self-dealing pair) to requiring 5+ staking deposits (minimum 1,000 TOKEN each) plus continuous per-cycle fees (1.5–3% depending on stake level per [ADR 003](003-payments.md)) across 5+ counterparties — an order-of-magnitude increase in capital requirements
+- Distinct-counterparty discount and settlement time decay raise the cost of wash trading from ~$30 in protocol fees (cycling $1,000 through one self-dealing pair at 3%) to requiring 5+ staking deposits (minimum 1,000 TOKEN each) plus continuous per-cycle fees (1.5–3% depending on stake level per [ADR 003](003-payments.md)) across 5+ counterparties — an order-of-magnitude increase in capital requirements
 - Local observations dominate (70%), so a node's own experience always outweighs the crowd
 - Score clamping limits the damage from individual malicious reports
 - Cold-start bootstrap gives new nodes enough traffic to build a real track record
