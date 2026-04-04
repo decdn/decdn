@@ -53,17 +53,64 @@ Reports received via iroh-gossip are aggregated using EWMA weighted by reporter 
 
 ```
 weight_cap = 3.0
-raw_weight = total_settled_value(reporter) / max(1, max_settled_value_observed)
+raw_weight = effective_settled_value(reporter) / max(1, max_effective_settled_value_observed)
 reporter_weight = min(raw_weight, weight_cap)
 network_score = ewma(network_score, report.score, alpha=0.05 * reporter_weight)
 ```
 
 > **EWMA/clamp interaction:** The per-report clamp (±0.05) binds when `reporter_weight × gap > 1`. At the 3× cap, this means the clamp activates for gaps above ~0.33; at weight 2×, for gaps above 0.5. For small score gaps (gap ≤ 0.33), the full 0–3× weight range produces proportionally larger EWMA deltas without hitting the clamp. For moderate gaps (0.33–0.5), weights above `1/gap` are clamp-limited but lower weights still differentiate. For large gaps (> 0.5), all weights above 2× produce identical clamped deltas. The 3× cap was chosen so the full weight range remains effective for the most common score adjustments (small gaps), while accepting that large corrections are clamp-governed regardless of reporter credibility.
 
-- `total_settled_value(reporter)`: cumulative settlement value across all payment channels the reporter has settled on-chain, normalized to a common unit. **PoC:** only USDC channels exist, so this equals `total_settled_usdc`. **Production:** governance tags each approved token as stablecoin-equivalent at `addToken` time ([ADR 010](010-multi-token.md)); settled amounts for stablecoin-class tokens are summed directly (1 USDC base unit = 1 DAI base unit). Non-stablecoin tokens use a governance-set weight factor. Including both sides gives credit to nodes that pay for cache-miss pulls, not only nodes that receive payment for delivery. **Value-weighted, not count-weighted** — this prevents Sybil manipulation via many cheap channels (opening 100 channels with 1 USDC each gives the same weight as one channel with 100 USDC, making the attack cost proportional to desired influence rather than proportional to channel count).
-- `max(1, max_settled_value_observed)`: the `max(1, ...)` guard prevents division by zero at network bootstrap when no channels have been settled yet. At bootstrap, all reporters have weight 0 (no settled value), so network scores remain at their initial value (0.5) until the first channels settle. **Note:** `max_settled_value_observed` is local to each node, so two nodes may compute different weights for the same reporter. This means network scores are inherently subjective and will not converge to a single global value — an accepted property of the design (see Consequences).
+- `effective_settled_value(reporter)`: the reporter's cumulative settlement value after applying distinct-counterparty discount and time decay (see Sections 4.1–4.2). The gross settlement value is computed from all payment channels the reporter has settled on-chain, normalized to a common unit. **PoC:** only USDC channels exist, so the gross value equals `total_settled_usdc`. **Production:** governance tags each approved token as stablecoin-equivalent at `addToken` time ([ADR 010](010-multi-token.md)); settled amounts for stablecoin-class tokens are summed directly (1 USDC base unit = 1 DAI base unit). Non-stablecoin tokens use a governance-set weight factor. Including both sides gives credit to nodes that pay for cache-miss pulls, not only nodes that receive payment for delivery. **Value-weighted, not count-weighted** — this prevents Sybil manipulation via many cheap channels (opening 100 channels with 1 USDC each gives the same weight as one channel with 100 USDC, making the attack cost proportional to desired influence rather than proportional to channel count).
+- `max(1, max_effective_settled_value_observed)`: the `max(1, ...)` guard prevents division by zero at network bootstrap when no channels have been settled yet. At bootstrap, all reporters have weight 0 (no settled value), so network scores remain at their initial value (0.5) until the first channels settle. **Note:** `max_effective_settled_value_observed` is local to each node, so two nodes may compute different weights for the same reporter. This means network scores are inherently subjective and will not converge to a single global value — an accepted property of the design (see Consequences). Because effective values decay over time (Section 4.2), the max observed value will also drift downward — each node should recompute this periodically (e.g., hourly or on each new `ChannelSettled` event) rather than caching it indefinitely.
 - `weight_cap`: caps reporter influence at 3× to prevent established high-earning nodes from having disproportionate control over network reputation. The 3× value sits just above the ~2× clamp-saturation threshold, so the full weight range is effective for typical score gaps while the per-report clamp still governs extreme divergences. The cap preserves the anti-Sybil property (influence still scales with capital) while tightening the maximum incumbency advantage.
 - Alpha is scaled by reporter weight: high-credibility reporters (more settled value) move the score faster
+
+#### 4.1 Distinct-Counterparty Discount
+
+The `effective_settled_value` computation applies a distinct-counterparty discount to prevent wash trading via self-dealing channels. For each reporter, the indexer tracks two quantities from `ChannelSettled` events:
+
+- `gross_settled_value`: sum of all settlement amounts across channels where the reporter was either client or provider (i.e., the sum before applying diversity discount and time decay)
+- `distinct_counterparties`: count of unique counterparty addresses across all settled channels within the last 52 weeks (`settlement_max_age` — see Section 4.2)
+
+The diversity factor scales the time-decayed settlement sum (see Section 4.2 for the full formula):
+
+```
+diversity_factor = min(distinct_counterparties / min_counterparties, 1.0)
+```
+
+Where `min_counterparties = 5` (governance-tunable; hardcoded floor: 2).
+
+**Effect on wash trading:** An attacker cycling funds between two self-owned addresses has `distinct_counterparties = 1`, yielding `diversity_factor = 0.2` — an 80% reduction in effective weight. To reach full credit, the attacker needs settlements with 5+ distinct counterparties, each requiring a separate staking deposit (minimum 1,000 TOKEN per [ADR 004](004-tokenomics.md)) and its own capital cycling fees.
+
+**Counterparty validation:** Only counterparty addresses that had a `StakingRegistry` NodeId binding at the time of channel settlement count toward `distinct_counterparties`. Unregistered addresses (pure clients without stake) do not count, because only staked nodes submit gossip reports (Section 6) and counterparty diversity is only relevant for reporter weight in the network score.
+
+#### 4.2 Settled-Value Time Decay
+
+Individual settlement contributions decay exponentially with age, forcing an attacker to continuously cycle capital (incurring the protocol fee — 3% standard or 1.5% for providers staking ≥10× minimum per [ADR 003](003-payments.md)) to maintain reporter weight:
+
+```
+settlement_weight_i = exp(-lambda * age_weeks_i)
+effective_settled_value = sum(settled_amount_i * settlement_weight_i) * diversity_factor
+```
+
+Where `lambda = 0.1` per week (half-life ≈ 6.9 weeks) and `age_weeks_i` is the time since the `ChannelSettled` event was emitted for channel _i_. Settlements older than `settlement_max_age` (52 weeks) are excluded entirely.
+
+**Decay examples:**
+
+| Settlement age | Weight retained |
+|----------------|-----------------|
+| 1 week | ~90% |
+| 7 weeks | ~50% |
+| 20 weeks | ~13.5% |
+| 52 weeks | ~0.5% (then excluded) |
+
+**Implementation note:** The computation can be cached per-reporter and updated incrementally on each new `ChannelSettled` event. The 52-week maximum age bounds the iteration window.
+
+| Parameter | Value |
+|-----------|-------|
+| `min_counterparties` | 5 (governance-tunable; hardcoded floor: 2) |
+| `settlement_decay_lambda` | 0.1 per week (half-life ≈ 6.9 weeks) |
+| `settlement_max_age` | 52 weeks (older settlements contribute 0) |
 
 ### 5. Combined Score
 
@@ -87,7 +134,10 @@ flowchart TD
     end
 
     subgraph Network["Network Score (30%)"]
-        GR[Gossip ReputationReport] --> RW["reporter_weight =<br/>min(total_settled_value / max(1, max_settled_value_observed), 3.0)"]
+        GR[Gossip ReputationReport] --> FILT["Filter: exclude settlements<br/>> 52 weeks old"]
+        FILT --> DC["diversity_factor =<br/>min(distinct_counterparties / 5, 1.0)"]
+        DC --> TD["effective_settled_value =<br/>Σ(amount_i × e^(−0.1 × age_weeks_i)) × diversity_factor"]
+        TD --> RW["reporter_weight =<br/>min(effective / max(1, max_observed), 3.0)"]
         RW --> EWMA2["network_score = EWMA(network, report,<br/>a=0.05 * reporter_weight)"]
         EWMA2 --> CLAMP2["Per-report clamp: max ±0.05"]
     end
@@ -204,6 +254,7 @@ During the first 7 days after staking (or first 50 completed interactions, which
 | Cold-start bootstrap bonus | Not implemented | +0.05 additive, linear decay over 7 days / 50 interactions; one-time per operator via `firstRegisteredAt` |
 | Rate limiting | Not implemented (no gossip to rate-limit) | Per Section 11 |
 | ReputationReport gossip | Not implemented | Signed reports on `cdn/reputation/v1` topic |
+| Anti-wash-trading (Sections 4.1–4.2) | Not implemented (no gossip, no reporter weight) | Distinct-counterparty discount + settlement time decay |
 | Tie-breaking | Simplified: lower load → random | Full 4-tier (load → geo → stake → random) |
 | Initial score | 0.5 (same) | 0.5 |
 
@@ -220,6 +271,7 @@ PoC action items:
 ### Positive
 
 - Interaction-weighted scoring makes reputation manipulation expensive — you need real economic activity (settled payment channels), not just stake
+- Distinct-counterparty discount and settlement time decay raise the cost of wash trading from ~$30 in protocol fees (cycling $1,000 through one self-dealing pair at 3%) to requiring 5+ staking deposits (minimum 1,000 TOKEN each) plus continuous per-cycle fees (1.5–3% depending on stake level per [ADR 003](003-payments.md)) across 5+ counterparties — an order-of-magnitude increase in capital requirements
 - Local observations dominate (70%), so a node's own experience always outweighs the crowd
 - Score clamping limits the damage from individual malicious reports
 - Cold-start bootstrap gives new nodes enough traffic to build a real track record
@@ -228,7 +280,8 @@ PoC action items:
 ### Negative
 
 - Off-chain reputation is inherently subjective — no single ground truth
-- A well-funded attacker can build real interaction history to manipulate scores; cost scales linearly with desired influence
+- A well-funded attacker can still build real interaction history to manipulate scores, but must maintain settlements with at least 5 distinct counterparties and continuously cycle capital to counteract settlement decay. The cost scales linearly with desired influence and multiplicatively with the counterparty diversity requirement (the attacker needs capital in N distinct channels, each requiring a separate staking deposit, not just one recycled pair). Coordinated multi-party wash trading (where the attacker controls 5+ colluding nodes) remains possible but requires N staking deposits plus cycling fees
+- Circular settlement detection (graph-based analysis of settlement flow patterns) is not included in this version. A coordinated attacker operating 5+ staked nodes can still build wash-traded reputation, though the capital cost is substantially higher. Future iterations may add graph-based detection as an additional layer
 - Reporter weight creates a residual incumbency advantage — established nodes with more settled USDC have more influence over network scores. The weight cap (3×) bounds this advantage tightly — set just above the ~2× clamp-saturation point so the full range is effective for typical score gaps while limiting maximum influence
 - Gossip-based propagation adds bandwidth overhead: at 1,000 nodes with all reporters at max rate (10 reports/hr), each node receives ~10,000 reports/hr (~2 MB/hr ingress), which is modest relative to `NodeAnnounce` traffic (~48 MB/hr at 60-second intervals). The strict rate limits (Section 11) keep reputation gossip well-bounded. See [ADR 001, Gossip Bandwidth Analysis](001-network.md#gossip-bandwidth-analysis) for the combined budget
 - The 70/30 local/network split means a client's view of the network is biased toward its own usage patterns
