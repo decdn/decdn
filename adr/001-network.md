@@ -123,10 +123,10 @@ Per-node ingress: `(N−1) × 800 bytes × (3600 / interval_s)` per hour.
 
 | Nodes | Messages/node/hr | Ingress/node/hr | Sustained rate |
 | --- | --- | --- | --- |
-| 30 (PoC) | 1,740 | ~1.3 MB | ~3 Kbps |
-| 100 | 5,940 | ~4.5 MB | ~10 Kbps |
-| 500 | 29,940 | ~22.8 MB | ~51 Kbps |
-| 1,000 | 59,940 | ~45.7 MB | ~102 Kbps |
+| 30 (PoC) | 1,740 | ~1.4 MB | ~3 Kbps |
+| 100 | 5,940 | ~4.8 MB | ~11 Kbps |
+| 500 | 29,940 | ~24.0 MB | ~53 Kbps |
+| 1,000 | 59,940 | ~48.0 MB | ~107 Kbps |
 
 Regional topics (`cdn/region/{cc}/v1`) add per-region bandwidth but do not reduce global topic traffic — all staked nodes publish to and subscribe to `cdn/global/v1`.
 
@@ -146,10 +146,10 @@ The strict rate limits (Section 11 of [ADR 008](008-reputation.md)) keep reputat
 
 | Nodes | NodeAnnounce | ReputationReport | Combined/node/hr | Sustained rate | ed25519 verify/s |
 | --- | --- | --- | --- | --- | --- |
-| 30 (PoC) | ~1.3 MB | ~0.0 MB | ~1.3 MB | ~3 Kbps | <1 |
-| 100 | ~4.5 MB | ~0.2 MB | ~4.7 MB | ~10 Kbps | ~2 |
-| 500 | ~22.8 MB | ~1.0 MB | ~23.8 MB | ~53 Kbps | ~10 |
-| 1,000 | ~45.7 MB | ~2.0 MB | ~47.7 MB | ~106 Kbps | ~19 |
+| 30 (PoC) | ~1.4 MB | ~0.0 MB | ~1.4 MB | ~3 Kbps | <1 |
+| 100 | ~4.8 MB | ~0.2 MB | ~5.0 MB | ~11 Kbps | ~2 |
+| 500 | ~24.0 MB | ~1.0 MB | ~25.0 MB | ~56 Kbps | ~10 |
+| 1,000 | ~48.0 MB | ~2.0 MB | ~50.0 MB | ~111 Kbps | ~19 |
 
 **CPU cost:** Modern hardware handles ~50,000–100,000 ed25519 verifications/sec/core. At 1,000 nodes, ~19 verify/sec is negligible. CPU is not the gossip bottleneck.
 
@@ -158,9 +158,9 @@ The strict rate limits (Section 11 of [ADR 008](008-reputation.md)) keep reputat
 | Scale | Gossip overhead | Recommended action |
 | --- | --- | --- |
 | ≤200 nodes | <10 MB/node/hr (~22 Kbps) | No action needed |
-| 200–500 nodes | ~24 MB/node/hr (~53 Kbps) | Monitor bandwidth metrics; consider increasing interval to 120s if constrained |
-| 500–1,000 nodes | ~48 MB/node/hr (~106 Kbps) | Evaluate selective gossip (regional-only subscription for non-global nodes) |
-| >1,000 nodes | >90 MB/node/hr (>200 Kbps) | Structured overlay (DHT) or gossip partitioning required — see [Future Work](#future-work-scaling-content-discovery) |
+| 200–500 nodes | ~25 MB/node/hr (~56 Kbps) | Monitor bandwidth metrics; consider increasing interval to 120s if constrained |
+| 500–1,000 nodes | ~50 MB/node/hr (~111 Kbps) | Evaluate selective gossip (regional-only subscription for non-global nodes) |
+| >1,000 nodes | Scales linearly (~50 KB/node/hr per additional node) | Structured overlay (DHT) or gossip partitioning required — see [Future Work](#future-work-scaling-content-discovery) |
 
 **PoC (tens of nodes) is well within safe bounds.** At 30 nodes with a 60-second interval, gossip consumes ~3 Kbps per node — negligible on any connection. This analysis is a production planning exercise; the PoC will validate the bandwidth model empirically.
 
@@ -223,7 +223,7 @@ This schedule is tuned for PoC with a single RPC endpoint. Production deployment
 
 - No external infrastructure is reachable from the network — origin-backed nodes completely hide their backends, so no client or node can bypass the payment layer by going directly to a storage URL
 - All nodes participate in the same discovery and transport protocols; the only difference between origin-backed and cache-only nodes is whether they have an origin store configured
-- Gossip messages are lightweight (~800 bytes) — no content inventories, Bloom filters, or hash lists. At the PoC default of 60-second announce intervals, per-node gossip bandwidth is ~3 Kbps at 30 nodes and scales linearly to ~106 Kbps at 1,000 nodes (see [Gossip Bandwidth Analysis](#gossip-bandwidth-analysis)). Regional gossip topics provide faster regional delivery but do not reduce global topic bandwidth
+- Gossip messages are lightweight (~800 bytes) — no content inventories, Bloom filters, or hash lists. At the PoC default of 60-second announce intervals, per-node gossip bandwidth is ~3 Kbps at 30 nodes and scales linearly to ~111 Kbps at 1,000 nodes (see [Gossip Bandwidth Analysis](#gossip-bandwidth-analysis)). Regional gossip topics provide faster regional delivery but do not reduce global topic bandwidth
 - Content discovery via probe fan-out provides fresh availability data — no stale content inventory to maintain
 - Probe cache prevents redundant fan-outs for popular content within a 15-second window
 - Once a node in a region caches a blob, other nodes in that region can pull from it at competitive rates rather than paying origin-backed node prices — popular content gets cheaper as it spreads
@@ -243,7 +243,7 @@ This schedule is tuned for PoC with a single RPC endpoint. Production deployment
 
 ### Future Work: Scaling Content Discovery
 
-At production scale (hundreds or thousands of nodes), broadcast probe fan-out becomes expensive — O(N) probes per cache miss. Additionally, gossip bandwidth grows linearly per node (see [Gossip Bandwidth Analysis](#gossip-bandwidth-analysis)) — at >1,000 nodes with a 60-second announce interval, per-node gossip exceeds 200 Kbps sustained, making structured overlay or gossip partitioning necessary. Three scaling strategies, in order of complexity:
+At production scale (hundreds or thousands of nodes), broadcast probe fan-out becomes expensive — O(N) probes per cache miss. Additionally, gossip bandwidth grows linearly per node (see [Gossip Bandwidth Analysis](#gossip-bandwidth-analysis)) — at >1,000 nodes with a 60-second announce interval, per-node gossip exceeds 111 Kbps and continues to scale linearly, making structured overlay or gossip partitioning necessary. Three scaling strategies, in order of complexity:
 
 1. **Selective fan-out:** Probe only regional peers + a random subset of global peers. Reduces probe count while maintaining discovery probability. No protocol changes.
 
