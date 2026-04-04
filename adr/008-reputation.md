@@ -72,7 +72,7 @@ The `effective_settled_value` computation applies a distinct-counterparty discou
 - `gross_settled_value`: sum of all settlement amounts across channels where the reporter was either client or provider (the pre-adjustment `total_settled_value`)
 - `distinct_counterparties`: count of unique counterparty addresses across all settled channels within the settlement time window (Section 4.2)
 
-The diversity factor scales the gross value:
+The diversity factor scales the time-decayed settlement sum (see Section 4.2 for the full formula):
 
 ```
 diversity_factor = min(distinct_counterparties / min_counterparties, 1.0)
@@ -86,7 +86,7 @@ Where `min_counterparties = 5` (governance-tunable; hardcoded floor: 2).
 
 #### 4.2 Settled-Value Time Decay
 
-Individual settlement contributions decay exponentially with age, forcing an attacker to continuously cycle capital (incurring the 3% protocol fee each round) to maintain reporter weight:
+Individual settlement contributions decay exponentially with age, forcing an attacker to continuously cycle capital (incurring the protocol fee — 3% standard or 1.5% for providers staking ≥10× minimum per [ADR 003](003-payments.md)) to maintain reporter weight:
 
 ```
 settlement_weight_i = exp(-lambda * age_weeks_i)
@@ -135,7 +135,7 @@ flowchart TD
 
     subgraph Network["Network Score (30%)"]
         GR[Gossip ReputationReport] --> DC["diversity_factor =<br/>min(distinct_counterparties / 5, 1.0)"]
-        DC --> TD["effective_settled_value =<br/>Σ(amount_i × e^(−0.1 × age_i)) × diversity_factor"]
+        DC --> TD["effective_settled_value =<br/>Σ(amount_i × e^(−0.1 × age_weeks_i)) × diversity_factor"]
         TD --> RW["reporter_weight =<br/>min(effective / max(1, max_observed), 3.0)"]
         RW --> EWMA2["network_score = EWMA(network, report,<br/>a=0.05 * reporter_weight)"]
         EWMA2 --> CLAMP2["Per-report clamp: max ±0.05"]
@@ -270,7 +270,7 @@ PoC action items:
 ### Positive
 
 - Interaction-weighted scoring makes reputation manipulation expensive — you need real economic activity (settled payment channels), not just stake
-- Distinct-counterparty discount and settlement time decay raise the cost of wash trading from ~$37.50 (cycling $1,000 through one self-dealing pair) to requiring 5+ staking deposits (minimum 1,000 TOKEN each) plus continuous 3%-per-cycle fees across 5+ counterparties — an order-of-magnitude increase in capital requirements
+- Distinct-counterparty discount and settlement time decay raise the cost of wash trading from ~$37.50 (cycling $1,000 through one self-dealing pair) to requiring 5+ staking deposits (minimum 1,000 TOKEN each) plus continuous per-cycle fees (1.5–3% depending on stake level per [ADR 003](003-payments.md)) across 5+ counterparties — an order-of-magnitude increase in capital requirements
 - Local observations dominate (70%), so a node's own experience always outweighs the crowd
 - Score clamping limits the damage from individual malicious reports
 - Cold-start bootstrap gives new nodes enough traffic to build a real track record
