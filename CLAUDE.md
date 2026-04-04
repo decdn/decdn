@@ -28,12 +28,15 @@ ADRs in `adr/` are the primary deliverables right now. `adr/architecture.md` is 
 - Grep for renamed terms/parameters across all `adr/*.md` files
 - Verify ALPN strings, message type names, and protocol version identifiers match `005-protocol.md`
 - Verify token names (TOKEN/USDC), contract references, and fee parameters match `003-payments.md` and `004-tokenomics.md`
+- Verify contract interaction flows and function signatures match `016-contract-interactions.md`
+- Verify privacy claims and data-flow assertions match `017-privacy.md`
 - Confirm `architecture.md` summary still reflects any changed ADR
 
 ```bash
 # Quick consistency checks
 grep -rn 'cdn/[a-z]*/v[0-9]' adr/      # find all ALPN references
 grep -rn 'TOKEN\|USDC' adr/             # find all token references
+grep -rn 'function\|contract\|modifier' adr/  # find Solidity interface references
 ```
 
 ### Build and Test (once implementation begins)
