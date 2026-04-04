@@ -60,6 +60,31 @@ function removeToken(address token) external onlyGovernance {
 
 Governance (admin key for PoC, OpenZeppelin Governor for production) must call `addToken` before any channel can be opened in that token. `removeToken` prevents new channels from being opened in that token; existing open channels remain valid and can still be closed/disputed normally.
 
+**Force-close channels in removed tokens.** Once a token is removed, any address can force-close open channels in that token via `forceCloseChannel`. This avoids the need for on-chain enumeration of channels per token — callers (watchtowers, governance bots, channel parties) provide the channel ID, and the contract checks `!allowedTokens[channel.token]`:
+
+```solidity
+function forceCloseChannel(bytes32 channelId) external {
+    Channel storage ch = channels[channelId];
+    require(ch.status == Status.Open, "Not open");
+    require(!allowedTokens[ch.token], "Token still allowed");
+
+    ch.status = Status.Closing;
+    ch.claimedAmount = 0;
+    ch.disputeDeadline = block.timestamp + disputeWindow;
+
+    emit ChannelForceClosedByTokenRemoval(channelId, ch.token, msg.sender, ch.disputeDeadline);
+}
+
+event ChannelForceClosedByTokenRemoval(
+    bytes32 indexed channelId,
+    address indexed token,
+    address indexed caller,
+    uint256 disputeDeadline
+);
+```
+
+The force-close sets `claimedAmount = 0` (no voucher submitted) and enters the standard Closing→dispute→settle flow (see [ADR 003](003-payments.md)). If the provider holds a valid voucher, they can call `disputeChannel` during the dispute window to claim earned fees. If nobody disputes, `settleChannel` returns the full deposit to the client. This preserves fairness: providers get the same dispute opportunity as a normal close.
+
 **`openChannel` accepts governance-approved ERC-20s:**
 
 ```solidity
@@ -230,7 +255,7 @@ struct SignedRate {
 - **Decimal heterogeneity.** Tokens use 0–18 decimals. A node misconfiguring decimals silently misprices deliveries. The `TokenInfo.decimals` field must be validated against the on-chain `IERC20Metadata.decimals()` return value at startup.
 - **No protocol-level price normalization.** A node advertising 1 base-unit/MB in USDC (= $0.000001/MB) and 1 base-unit/MB in a low-value token are indistinguishable at the wire level. Clients bear responsibility for evaluating whether a node's accepted token has value.
 - **Governance bottleneck.** Adding a new payment token requires a governance action (admin call for PoC, Governor proposal for production). This adds latency for operators who want to use a token not yet approved. Mitigated by the fact that token additions are infrequent and low-risk governance actions.
-- **Token removal complexity.** `removeToken` blocks new channels but existing open channels in that token remain valid. The network may carry "sunset" tokens for up to 90 days (channel auto-expiry per `maxChannelDuration` — see [ADR 003](003-payments.md)) after removal.
+- **Token removal complexity.** `removeToken` blocks new channels but existing open channels in that token remain valid until force-closed or expired. `forceCloseChannel` (see contract interface above) allows any address to close these channels immediately, bounding the effective sunset to the dispute window duration (48h PoC) rather than `maxChannelDuration` (90 days). Off-chain enumeration via `ChannelOpened` event logs is required to identify channels to force-close.
 - **Per-token rate bounds governance burden.** Governance must set meaningful bounds for each token at `addToken` time. Bounds can be adjusted later via `setRateBounds`, but the floor can never drop below 1 base unit.
 - **Slashing is always in TOKEN (resolved).** ADR 004's slashing schedule is denominated in TOKEN stake, and this remains unchanged with multi-token payments. Slashing operates on the `StakingRegistry` (TOKEN stake), not on payment channel deposits (which may be in any approved token). A node paid exclusively in DAI is still slashed in TOKEN — the node must hold TOKEN stake to participate in the network regardless of which payment tokens it accepts. No price oracle or cross-token conversion is needed. The slash amount is a percentage of TOKEN stake, not a percentage of delivery revenue.
 
@@ -248,5 +273,5 @@ The PoC uses `StablePaymentChannel` (USDC-only, defined in ADR 003). Production 
 - **Decimal validation at runtime.** Should the node fail to start if a configured token's on-chain `decimals()` does not match the configured value, or warn and continue? Failing to start is safer but may cause operational disruption if a proxy token contract is upgraded (rare but possible).
 - ~~**Slash denomination.**~~ **Resolved:** slashing is always in TOKEN stake (see Consequences above). No cross-token conversion needed — nodes must hold TOKEN stake regardless of payment token.
 - **Token metadata trust.** `IERC20Metadata` is not mandatory for ERC-20 tokens. Tokens without `decimals()` will cause a revert at startup. Should the contract use a try/catch and default to 18 decimals, or require the operator to always specify decimals explicitly in config?
-- **Token removal semantics.** `removeToken` blocks new channel opens but existing channels remain valid until expiry (up to 90 days per `maxChannelDuration`). Should governance also have the ability to force-close all channels in a removed token (e.g., if the token is discovered to be malicious), or is blocking new channels sufficient?
+- ~~**Token removal semantics.**~~ **Resolved:** `forceCloseChannel(channelId)` — permissionless, succeeds only when `!allowedTokens[channel.token]`. Enters the standard Closing→dispute→settle flow. No on-chain enumeration; callers (watchtowers, governance bots, channel parties) provide the channel ID. See contract interface above.
 - **Token vetting criteria.** What due diligence should governance perform before calling `addToken`? At minimum: verify no fee-on-transfer, no rebase mechanics, no pausable transfers that could lock contract funds, and standard `IERC20` compliance. Should this be codified in a checklist or left to governance discretion?
