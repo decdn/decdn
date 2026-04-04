@@ -23,8 +23,8 @@ All on-chain contracts inherit from [OpenZeppelin Contracts](https://docs.openze
 | PaymentChannel | [010](010-multi-token.md) | Yes | Governance-approved ERC-20s | `AccessControl`, `ReentrancyGuard`, `Pausable`, `EIP712` | Production only |
 | BuybackBurner | [004](004-tokenomics.md) | Yes | USDC, TOKEN (transient) | `AccessControl`, `ReentrancyGuard`, `Pausable` | PoC (accumulate-only) + Production |
 | ContentBlacklist | [011](011-content-takedown.md) | No | — | `AccessControl` | PoC + Production |
-| SlashJudge | [014](014-on-chain-verification.md) | Yes | TOKEN (challenge bonds) | `AccessControl`, `ReentrancyGuard`, `Pausable` | PoC + Production |
-| WatchtowerEscrow | [007](007-watchtower.md) | Yes | USDC | `ReentrancyGuard`, `Pausable` | Production only |
+| SlashJudge | [014](014-on-chain-verification.md) | Yes | TOKEN (challenge bonds) | `AccessControl`, `ReentrancyGuard`, `Pausable`, `EIP712` | PoC + Production |
+| WatchtowerEscrow | [007](007-watchtower.md) | Yes | USDC | `ReentrancyGuard`, `Pausable`, `EIP712` | Production only |
 
 **Build toolchain:** [Foundry](https://book.getfoundry.sh/) (forge, cast, anvil) for compilation, testing, and deployment.
 
@@ -57,7 +57,7 @@ graph TD
 
 | Step | Contract | Constructor Requires |
 | --- | --- | --- |
-| 1 | TOKEN | None (fixed 1B supply minted to deployer) |
+| 1 | TOKEN | None. **PoC:** freely mintable testnet token with `onlyOwner` mint ([ADR 004](004-tokenomics.md)). **Production:** fixed 1B supply, no mint function. |
 | 2 | USDC | External (testnet faucet or mainnet address) |
 | 3 | StakingRegistry | TOKEN address, `minStake` (1,000 TOKEN), `unbondingPeriod` (7 days PoC) |
 | 4a | StablePaymentChannel (PoC) | USDC address, StakingRegistry address, `treasuryAddress`, `feePercentage` (300 bps), `discountedFeePercentage` (150 bps), `disputeWindow` (48h), `maxChannelDuration` (90 days), rate bounds |
@@ -65,7 +65,7 @@ graph TD
 | 5 | BuybackBurner | TOKEN address, USDC address, Uniswap V3 Router address |
 | 6 | ContentBlacklist | StakingRegistry address |
 | 7 | SlashJudge | StakingRegistry address, TOKEN address, `challengeBond` (100 TOKEN PoC / 50 TOKEN production), `counterEvidenceWindow` (24h) |
-| 8 | WatchtowerEscrow | StablePaymentChannel/PaymentChannel address, `heartbeatInterval`, `heartbeatReward` |
+| 8 | WatchtowerEscrow | StablePaymentChannel/PaymentChannel address, `heartbeatInterval`, `missThreshold`, `feeRateBps`, `minFee`, `monitoringPeriod` |
 
 #### Post-Deployment Initialization
 
@@ -114,7 +114,7 @@ graph LR
     SPC -->|"getStakeMultiple(provider)"| SR
     SPC -->|"safeTransferFrom / safeTransfer"| ERC
     CB -->|"ejectNode(operatorAddress)"| SR
-    SJ -->|"slash(nodeAddress, amount)"| SR
+    SJ -->|"slash(node, offenseType)"| SR
     SJ -->|"safeTransferFrom / safeTransfer"| ERC
     SR -->|"safeTransferFrom / safeTransfer"| ERC
     BB -->|"exactInputSingle()"| UNI
@@ -132,7 +132,7 @@ graph LR
 | PaymentChannel | StakingRegistry | `getStakeMultiple(provider)` | Public (read-only) | No |
 | PaymentChannel | IERC20 (per-token) | `safeTransferFrom()` / `safeTransfer()` | Caller must have allowance/balance | Yes |
 | ContentBlacklist | StakingRegistry | `ejectNode(operatorAddress)` | `BLACKLIST_ROLE` | Yes |
-| SlashJudge | StakingRegistry | `slash(nodeAddress, amount)` | `SLASH_ROLE` | Yes |
+| SlashJudge | StakingRegistry | `slash(node, offenseType)` | `SLASH_ROLE` | Yes |
 | SlashJudge | IERC20 (TOKEN) | `safeTransferFrom()` / `safeTransfer()` | Caller must have allowance/balance | Yes |
 | StakingRegistry | IERC20 (TOKEN) | `safeTransferFrom()` / `safeTransfer()` | Caller must have allowance/balance | Yes |
 | BuybackBurner | Uniswap V3 Router | `exactInputSingle()` | Caller must have approved router | Yes |
@@ -192,7 +192,7 @@ flowchart TD
     ClientStaker -->|"clientStake(amount)"| SR
     SR -->|"clientUnstake() (no unbonding)"| ClientStaker
     Challenger -->|"submitChallenge()<br/>bond deposit"| SJ
-    SJ -->|"executeSlash()<br/>→ slash(node, amount)"| SR
+    SJ -->|"executeSlash()<br/>→ slash(node, offenseType)<br/>(amount computed internally)"| SR
     SR -->|"50% of slash"| Challenger
     SR -->|"50% of slash"| BURN
     SJ -->|"bond return (successful slash)"| Challenger
@@ -287,7 +287,7 @@ Every state-mutating function that makes an external call is listed below with i
 
 | Function | External Calls | Guards |
 | --- | --- | --- |
-| `executeBuyback()` | `IERC20.safeTransferFrom()` (USDC in), `UniswapV3Router.exactInputSingle()`, `IERC20.safeTransfer()` (TOKEN to burn) | `nonReentrant`, checks-effects-interactions, `KEEPER_ROLE` |
+| `executeBuyback()` | `UniswapV3Router.exactInputSingle()` (swaps contract-held USDC), `IERC20.safeTransfer()` (TOKEN to burn) | `nonReentrant`, checks-effects-interactions, `KEEPER_ROLE` |
 
 #### Multi-Token Reentrancy Considerations
 
@@ -309,7 +309,7 @@ Every deCDN contract should inherit from audited OpenZeppelin base contracts rat
 | `ReentrancyGuard` | All fund-holding contracts | `nonReentrant` modifier on state-mutating functions with external calls |
 | `Pausable` | All fund-holding contracts | Emergency pause capability |
 | `SafeERC20` | All contracts interacting with ERC-20 tokens | Safe wrappers for `transfer`, `transferFrom`, `approve` |
-| `EIP712` | StablePaymentChannel, PaymentChannel | Domain separator for voucher signature verification |
+| `EIP712` | StablePaymentChannel, PaymentChannel, SlashJudge, WatchtowerEscrow | Domain separator for voucher/slash/heartbeat signature verification |
 | `ERC20` + `ERC20Permit` | TOKEN | Standard fungible token with gasless approvals |
 | `Governor` | Production governance | Token-weighted voting |
 | `GovernorVotes` | Production governance | TOKEN as voting token |
@@ -329,9 +329,9 @@ Every deCDN contract should inherit from audited OpenZeppelin base contracts rat
 | WatchtowerEscrow | Not deployed | Deployed |
 | TOKEN minting | `onlyOwner` mint for testnet flexibility | No mint function; fixed 1B supply |
 | Regional bodies | Not used | Jurisdiction-scoped multisigs |
-| Staking migration | N/A | New `PaymentChannel` deployed; `StablePaymentChannel` enters close-only mode |
+| Contract migration | N/A | New `PaymentChannel` deployed; PoC `StablePaymentChannel` decommissioned |
 
-**Migration path:** Production deploys a new `PaymentChannel` contract (not an upgrade of `StablePaymentChannel`). Existing PoC channels settle normally. The `StablePaymentChannel` stops accepting new `openChannel()` calls but continues to process `settleChannel()`, `disputeChannel()`, and `reclaimExpired()` for existing channels.
+**Migration path:** Production deploys a new `PaymentChannel` contract (not an upgrade of `StablePaymentChannel`). Per [ADR 010](010-multi-token.md), no phased migration is required because the PoC `StablePaymentChannel` has no real users or funds in production; the PoC contract is decommissioned rather than operated in a close-only mode alongside `PaymentChannel`.
 
 ## Consequences
 
