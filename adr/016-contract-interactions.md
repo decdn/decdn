@@ -65,7 +65,7 @@ graph TD
 | 3 | StakingRegistry | TOKEN address, `minStake` (1,000 TOKEN), `unbondingPeriod` (7 days PoC) |
 | 4a | StablePaymentChannel (PoC) | Constructor args: USDC address, `treasuryAddress`, `disputeWindow` (48h). Initialized in constructor body: StakingRegistry address, `feePercentage` (300 bps), `discountedFeePercentage` (150 bps), `maxChannelDuration` (90 days), rate bounds ([ADR 003](003-payments.md)) |
 | 4b | PaymentChannel (production) | StakingRegistry address, Governor address |
-| 5 | BuybackBurner | TOKEN address, USDC address, Uniswap V3 Router address |
+| 5 | BuybackBurner | TOKEN address, USDC address, Balancer V3 Router address, initial pool contract `address` (may be zero-address at deploy and set later via `setPool(address)` — see [ADR 003](003-payments.md#buybackburner) for the interface and [ADR 018](018-liquidity-strategy.md) for the venue rationale). The pool address remains governance-mutable post-deploy via `setPool(address)`; the constructor value is an initial convenience, not a hard requirement. **Router naming note:** the Arbitrum mainnet Router `0xEAedc32a51c510d35ebC11088fD5fF2b47aACF2E` is labelled `v3-router-v2` in the Balancer deployments registry — "v2" is the second iteration of the Balancer V3 Router artifact, NOT Balancer V2 protocol routing (see [ADR 018](018-liquidity-strategy.md#buyback-execution-via-balancer-v3)). **Approvals note:** `BuybackBurner` MUST self-approve the Balancer V3 **Vault** address (distinct from the Router) during its initialization — the Vault pulls input tokens from the `msg.sender` of the Router call, which is `BuybackBurner` itself. This is the V3 footgun; see [ADR 018](018-liquidity-strategy.md#buyback-execution-via-balancer-v3). |
 | 6 | ContentBlacklist | `ContentBlacklist(address stakingRegistry)`. StakingRegistry address is required for `ejectNode()` cross-contract call. [ADR 011](011-content-takedown.md) describes the call but not the constructor interface; this ADR formalizes it. |
 | 7 | SlashJudge | StakingRegistry address, TOKEN address, `challengeBond` (100 TOKEN PoC / 50 TOKEN production), `counterEvidenceWindow` (24h) |
 | 8 | WatchtowerEscrow | StablePaymentChannel/PaymentChannel address, `heartbeatInterval`, `missThreshold`, `feeRateBps`, `minFee`, `monitoringPeriod` |
@@ -116,7 +116,7 @@ graph LR
     BB["BuybackBurner"]
     WE["WatchtowerEscrow"]
     ERC["ERC-20 Tokens<br/>(USDC, TOKEN)"]
-    UNI["Uniswap V3 Router"]
+    BAL["Balancer V3 Router"]
 
     SPC -->|"getStakeMultiple(provider)"| SR
     SPC -->|"safeTransferFrom / safeTransfer"| ERC
@@ -124,7 +124,7 @@ graph LR
     SJ -->|"slash(node, offenseType)"| SR
     SJ -->|"safeTransferFrom / safeTransfer"| ERC
     SR -->|"safeTransferFrom / safeTransfer"| ERC
-    BB -->|"exactInputSingle()"| UNI
+    BB -->|"Router.swapSingleTokenExactIn()"| BAL
     BB -->|"safeTransferFrom / safeTransfer"| ERC
     WE -->|"read channel state"| SPC
 ```
@@ -142,7 +142,7 @@ graph LR
 | SlashJudge | StakingRegistry | `slash(node, offenseType)` | `SLASH_ROLE` | Yes |
 | SlashJudge | IERC20 (TOKEN) | `safeTransferFrom()` / `safeTransfer()` | Caller must have allowance/balance | Yes |
 | StakingRegistry | IERC20 (TOKEN) | `safeTransferFrom()` / `safeTransfer()` | Caller must have allowance/balance | Yes |
-| BuybackBurner | Uniswap V3 Router | `exactInputSingle()` | Caller must have approved router | Yes |
+| BuybackBurner | Balancer V3 Router | `swapSingleTokenExactIn(pool, tokenIn, tokenOut, exactAmountIn, minAmountOut, deadline, wethIsEth, userData)` | `BuybackBurner` self-approves the **Balancer V3 Vault** address (NOT the Router) during its initialization — the Vault pulls input tokens from the `msg.sender` of the Router call. This is the V3 footgun; see [ADR 018](018-liquidity-strategy.md#buyback-execution-via-balancer-v3) | Yes |
 | BuybackBurner | IERC20 (USDC, TOKEN) | `safeTransferFrom()` / `safeTransfer()` | Caller must have allowance/balance | Yes |
 | WatchtowerEscrow | StablePaymentChannel / PaymentChannel | Channel state reads | Public (read-only) | No |
 
@@ -159,7 +159,7 @@ flowchart TD
     Provider["Provider (node operator)"]
     Treasury["Treasury (EOA)"]
     BB["BuybackBurner"]
-    UNI["Uniswap V3"]
+    BAL["Balancer V3 Router<br/>(→ 80/20 TOKEN/USDC Weighted Pool)"]
     BURN["Burn Address<br/>(0x...dEaD)"]
 
     Client -->|"openChannel() / topUp()<br/>deposit USDC"| SPC
@@ -167,8 +167,8 @@ flowchart TD
     SPC -->|"settleChannel()<br/>protocol fee (default 3% / 1.5% discounted)"| Treasury
     SPC -->|"settleChannel()<br/>unused balance"| Client
     Treasury -->|"20% of fees (manual PoC)"| BB
-    BB -->|"executeBuyback()"| UNI
-    UNI -->|"TOKEN"| BB
+    BB -->|"Router.swapSingleTokenExactIn() (see ADR 018)"| BAL
+    BAL -->|"TOKEN"| BB
     BB -->|"burn()"| BURN
 ```
 
@@ -298,9 +298,9 @@ Every state-mutating function that makes an external call is listed below with i
 
 | Function | External Calls | Guards |
 | --- | --- | --- |
-| `executeBuyback()` | `UniswapV3Router.exactInputSingle()` (swaps contract-held USDC), `IERC20.safeTransfer()` (TOKEN to burn) | `nonReentrant`, checks-effects-interactions, `KEEPER_ROLE` |
+| `executeBuyback()` | `BalancerV3Router.swapSingleTokenExactIn()` (swaps contract-held USDC; Router forwards to Vault which pulls input tokens via Vault-scoped allowance), `IERC20.safeTransfer()` (TOKEN to burn) | `nonReentrant`, checks-effects-interactions, `KEEPER_ROLE` |
 
-> **MEV protection (production).** Production `executeBuyback` SHOULD use a private mempool (e.g., Flashbots Protect on Arbitrum) or implement TWAP (time-weighted average price) execution that splits large buybacks across multiple blocks to mitigate sandwich attacks. The `maxBuybackAmount` parameter MUST be enforced to limit per-transaction MEV exposure.
+> **MEV protection (production).** See [ADR 018 — Buyback execution via Balancer V3](018-liquidity-strategy.md#buyback-execution-via-balancer-v3) for the authoritative policy. In summary: Balancer's weighted-pool curve reduces (but does not eliminate) price-impact concerns compared to concentrated liquidity, and `executeBuyback` MAY split large buybacks into `subSwapCount` sub-swaps spaced by `subSwapMinBlockGap` blocks. **Direct Router execution with TWAP + `minTokenOut` guards is the primary production path and the required fallback.** Routing through CoW Swap is a conditional add-on that requires operator verification of CoW solver routing against the deployed Balancer V3 pool (per ADR 018's activation criteria); if CoW routing is unavailable or regresses, direct Router + TWAP remains correct. The `maxBuybackAmount` parameter MUST be enforced to limit per-transaction MEV exposure regardless of venue.
 
 #### WatchtowerEscrow
 

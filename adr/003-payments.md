@@ -504,6 +504,7 @@ interface IBuybackBurner {
     function executeBuyback(address token, uint256 amount, uint256 minTokenOut) external;
     function setKeeper(address keeper) external;
     function setSwapRouter(address router) external;
+    function setPool(address pool) external;
     function setSlippageTolerance(uint256 bps) external;
     function setMinBuybackAmount(uint256 amount) external;
     function setMaxBuybackAmount(uint256 amount) external;
@@ -512,7 +513,7 @@ interface IBuybackBurner {
 }
 ```
 
-This interface is the canonical specification for `BuybackBurner`. [ADR 004](004-tokenomics.md) defines the economic parameters; parameter names in ADR 004 reference this interface (e.g., `slippageBps` corresponds to `setSlippageTolerance(uint256 bps)` above).
+This interface is the canonical specification for `BuybackBurner`. [ADR 004](004-tokenomics.md) defines the economic parameters; parameter names in ADR 004 reference this interface (e.g., `slippageBps` corresponds to `setSlippageTolerance(uint256 bps)` above). [ADR 018](018-liquidity-strategy.md) specifies the venue (Balancer V3 Router + 80/20 weighted pool) and how `setSwapRouter` and `setPool` are configured at deployment. **V3 integration note:** `setSwapRouter` holds the Balancer V3 **Router** address, but the `BuybackBurner` contract itself MUST self-approve the Balancer V3 **Vault** address (a separate contract) during initialization — the Vault pulls input tokens from the `msg.sender` of the Router call. See [ADR 018 — Buyback execution via Balancer V3](018-liquidity-strategy.md#buyback-execution-via-balancer-v3).
 
 `executeBuyback` is callable by governance multisig or the authorized `keeper` address. All `set*` functions are governance-only behind a timelock.
 
