@@ -113,7 +113,7 @@ TOKEN is not used for payments. All nodes must stake TOKEN to participate. Staki
 | `cdn/probe/v1` | Parallel latency + availability check before node selection |
 | `cdn/client/v1` | Paid delivery: client→node, node→node (cache miss) |
 | `cdn/watchtower/v1` | Channel-dispute monitoring ([ADR 007](007-watchtower.md)) |
-| iroh-gossip (built-in) | Node metadata broadcast (`NodeAnnounce`), rate change announcements (`RateChange`), node discovery |
+| iroh-gossip (built-in) | Node metadata broadcast (`NodeAnnounce`), rate change announcements (`RateChange`), watchtower discovery (`WatchtowerAnnounce`, production), node discovery |
 
 **Companion protocol (app server — not a CDN protocol participant):**
 

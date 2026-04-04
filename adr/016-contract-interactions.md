@@ -101,7 +101,7 @@ After all contracts are deployed, the deployer must execute these transactions b
    contract.revokeRole(DEFAULT_ADMIN_ROLE, deployer);
    ```
 
-> **Production hardening:** Production deployments SHOULD execute `grantRole(DEFAULT_ADMIN_ROLE, timelockController)` and `renounceRole(DEFAULT_ADMIN_ROLE, deployer)` in a single multicall transaction to minimize the dual-admin window between the two operations.
+> **Production hardening:** Production deployments SHOULD execute `grantRole(DEFAULT_ADMIN_ROLE, timelockController)` and `revokeRole(DEFAULT_ADMIN_ROLE, deployer)` in a single multicall transaction to minimize the dual-admin window between the two operations.
 
 ### 3. Cross-Contract Call Graph
 

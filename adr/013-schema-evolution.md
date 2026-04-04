@@ -262,7 +262,7 @@ Messages without extensions (e.g., `VoucherAck`, `StreamEnd`, `ChunkData`) have 
 
 This formalizes the pattern already used for `ethereum_address`, `binding_signature`, and `voucher_interval_mb` in `StreamRequest` ([ADR 005](005-protocol.md)). It is no longer a one-time workaround — it is the standard minor evolution mechanism. The existing `Option<T>` fields with default semantics (`ethereum_address` and `binding_signature` with `#[serde(default)]`, and `voucher_interval_mb` which defaults to 1 MB when absent) will be placed in the extensions struct from the start, since the project is pre-implementation.
 
-> ADR 010 (multi-token, post-PoC) adds `payment_token: Option<Address>` to `StreamRequestExt`. Per the extension field rules above, it is `Option<T>` with `#[serde(default)]`. This field is omitted from the PoC wire format and will be appended as a Tier 1 minor extension when multi-token support is implemented.
+> ADR 010 (multi-token, post-PoC) specifies `payment_token: Address` as a required field. Because postcard encodes structs positionally, appending a new field to an already-in-use `StreamRequestExt` would break compatibility for senders that already include extension bytes. Multi-token support therefore requires either a Tier 3 / major `cdn/client` version bump or a new trailing extension container (e.g., `StreamRequestExt2`) rather than extending `StreamRequestExt` in place.
 
 **Example — adding `supported_versions` to `NodeAnnounce`:**
 
