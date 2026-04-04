@@ -17,9 +17,9 @@ All on-chain contracts inherit from [OpenZeppelin Contracts](https://docs.openze
 
 | Contract | ADR | Holds Funds | Token Types | OZ Base Contracts | Phase |
 | --- | --- | --- | --- | --- | --- |
-| TOKEN (ERC-20) | [004](004-tokenomics.md) | No (fungible token) | — | `ERC20`, `ERC20Permit` | PoC + Production |
+| TOKEN (ERC-20) | [004](004-tokenomics.md) | No (fungible token) | — | `ERC20`, `ERC20Permit` (recommended; enables gasless approvals) | PoC + Production |
 | StakingRegistry | [003](003-payments.md), [004](004-tokenomics.md) | Yes | TOKEN | `AccessControl`, `ReentrancyGuard`, `Pausable` | PoC + Production |
-| StablePaymentChannel | [003](003-payments.md) | Yes | USDC | `ReentrancyGuard`, `Pausable`, `EIP712` | PoC only |
+| StablePaymentChannel | [003](003-payments.md) | Yes | USDC | `Ownable`, `ReentrancyGuard`, `Pausable`, `EIP712` | PoC only |
 | PaymentChannel | [010](010-multi-token.md) | Yes | Governance-approved ERC-20s | `AccessControl`, `ReentrancyGuard`, `Pausable`, `EIP712` | Production only |
 | BuybackBurner | [004](004-tokenomics.md) | Yes | USDC, TOKEN (transient) | `AccessControl`, `ReentrancyGuard`, `Pausable` | PoC (accumulate-only) + Production |
 | ContentBlacklist | [011](011-content-takedown.md) | No | — | `AccessControl` | PoC + Production |
@@ -46,7 +46,8 @@ graph TD
     SR --> TOKEN
     SPC --> USDC
     SPC --> SR
-    BB --> SR
+    BB --> TOKEN
+    BB --> USDC
     CB --> SR
     SJ --> SR
     SJ --> TOKEN
@@ -60,10 +61,10 @@ graph TD
 | 1 | TOKEN | None. **PoC:** freely mintable testnet token with `onlyOwner` mint ([ADR 004](004-tokenomics.md)). **Production:** fixed 1B supply, no mint function. |
 | 2 | USDC | External (testnet faucet or mainnet address) |
 | 3 | StakingRegistry | TOKEN address, `minStake` (1,000 TOKEN), `unbondingPeriod` (7 days PoC) |
-| 4a | StablePaymentChannel (PoC) | USDC address, StakingRegistry address, `treasuryAddress`, `feePercentage` (300 bps), `discountedFeePercentage` (150 bps), `disputeWindow` (48h), `maxChannelDuration` (90 days), rate bounds |
+| 4a | StablePaymentChannel (PoC) | Constructor args: USDC address, `treasuryAddress`, `disputeWindow` (48h). Initialized in constructor body: StakingRegistry address, `feePercentage` (300 bps), `discountedFeePercentage` (150 bps), `maxChannelDuration` (90 days), rate bounds ([ADR 003](003-payments.md)) |
 | 4b | PaymentChannel (production) | StakingRegistry address, Governor address |
 | 5 | BuybackBurner | TOKEN address, USDC address, Uniswap V3 Router address |
-| 6 | ContentBlacklist | StakingRegistry address |
+| 6 | ContentBlacklist | StakingRegistry address (required for `ejectNode()` cross-contract call; address storage is a consolidation recommendation — [ADR 011](011-content-takedown.md) describes the call but not the constructor interface) |
 | 7 | SlashJudge | StakingRegistry address, TOKEN address, `challengeBond` (100 TOKEN PoC / 50 TOKEN production), `counterEvidenceWindow` (24h) |
 | 8 | WatchtowerEscrow | StablePaymentChannel/PaymentChannel address, `heartbeatInterval`, `missThreshold`, `feeRateBps`, `minFee`, `monitoringPeriod` |
 
@@ -157,7 +158,7 @@ flowchart TD
 
     Client -->|"openChannel() / topUp()<br/>deposit USDC"| SPC
     SPC -->|"settleChannel()<br/>earned fees"| Provider
-    SPC -->|"settleChannel()<br/>protocol fee (3% base / 1.5% discounted)"| Treasury
+    SPC -->|"settleChannel()<br/>protocol fee (default 3% / 1.5% discounted)"| Treasury
     SPC -->|"settleChannel()<br/>unused balance"| Client
     Treasury -->|"20% of fees (manual PoC)"| BB
     BB -->|"executeBuyback()"| UNI
@@ -211,7 +212,7 @@ flowchart TD
 
 ### 5. Access Control Matrix
 
-All role-based access uses OpenZeppelin `AccessControl`. The `DEFAULT_ADMIN_ROLE` holder can grant and revoke all other roles.
+All role-based access uses OpenZeppelin `AccessControl`. The `DEFAULT_ADMIN_ROLE` holder can grant and revoke all other roles. Named roles below (`KEEPER_ROLE`, `GOVERNANCE_ROLE`, `EMERGENCY_ROLE`) formalize the implicit access patterns described across source ADRs into concrete `AccessControl` role identifiers for implementation.
 
 #### Role Assignments
 
@@ -222,7 +223,7 @@ All role-based access uses OpenZeppelin `AccessControl`. The `DEFAULT_ADMIN_ROLE
 | `SLASH_ROLE` | StakingRegistry | `slash()` | SlashJudge contract | SlashJudge contract |
 | `KEEPER_ROLE` | BuybackBurner | `executeBuyback()` | Admin / disabled | Keeper bot or governance |
 | `GOVERNANCE_ROLE` | ContentBlacklist | `addHash()`, `removeHash()`, `addOrigin()`, `removeOrigin()`, `registerRegionalBody()` | Admin | Governor via timelock |
-| `EMERGENCY_ROLE` | ContentBlacklist + Pausable contracts | `emergencyAdd()`, `emergencyAddOrigin()`, `suspendRegionalBody()`, `pause()` | Admin | 3-of-5 multisig (12-month sunset) |
+| `EMERGENCY_ROLE` | ContentBlacklist (emergency functions), fund-holding contracts (`pause()`) | `emergencyAdd()`, `emergencyAddOrigin()`, `suspendRegionalBody()` (ContentBlacklist); `pause()` (Pausable contracts only) | Admin | 3-of-5 multisig (12-month sunset) |
 | Regional body | ContentBlacklist | `addHashRegional(region)` | Not used in PoC | Per-jurisdiction multisig |
 
 #### Governance-Controlled Parameters
@@ -235,7 +236,7 @@ Full parameter table with safety bounds is in [ADR 009](009-governance.md#govern
 | Slash % per offense | 5% | 50% | StakingRegistry |
 | Dispute window | 12h | 72h | StablePaymentChannel / PaymentChannel |
 | Minimum stake | 100 TOKEN | 100,000 TOKEN | StakingRegistry |
-| Challenge bond | 1 TOKEN | 1,000 TOKEN | SlashJudge |
+| Challenge bond | 1 TOKEN | 1,000 TOKEN | SlashJudge (note: [ADR 009](009-governance.md) lists this under StakingRegistry; SlashJudge is correct per [ADR 014](014-on-chain-verification.md)) |
 | Unbonding period | 3 days | 30 days | StakingRegistry |
 
 Safety bounds are `immutable` — hardcoded in constructors, not overridable by governance or admin.
@@ -305,6 +306,7 @@ Every deCDN contract should inherit from audited OpenZeppelin base contracts rat
 
 | OZ Contract | Used By | Purpose |
 | --- | --- | --- |
+| `Ownable` | StablePaymentChannel (PoC) | Admin-key governance for PoC-only contract |
 | `AccessControl` | StakingRegistry, PaymentChannel, ContentBlacklist, SlashJudge, BuybackBurner | Role-based function authorization |
 | `ReentrancyGuard` | All fund-holding contracts | `nonReentrant` modifier on state-mutating functions with external calls |
 | `Pausable` | All fund-holding contracts | Emergency pause capability |
