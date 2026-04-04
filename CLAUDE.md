@@ -20,7 +20,7 @@ This repo uses a VS Code devcontainer with a firewall-isolated environment. The 
 ADRs in `adr/` are the primary deliverables right now. `adr/architecture.md` is the living overview and index of all decisions; numbered files cover individual decisions.
 
 **Conventions:**
-- File naming: `NNN-topic.md` (zero-padded 3-digit prefix, next number is 018)
+- File naming: `NNN-topic.md` (zero-padded 3-digit prefix, next number is 019)
 - When changing any ADR, check for cross-ADR consistency — terms, parameters, and protocol names must match across all ADRs and `architecture.md`. This is the most common source of bugs in this repo.
 - `architecture.md` must be updated whenever an ADR changes a user-visible summary point
 

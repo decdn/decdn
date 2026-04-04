@@ -53,7 +53,7 @@ Minimum stake is 1,000 TOKEN with a 7-day unbonding period. Stake remains slasha
 
 - Bootstrapping requires token demand before organic revenue is sufficient; a 200M TOKEN bootstrap fund is allocated for this — adequate for PoC scale (see [Node Unit Economics](#node-unit-economics)), but adequacy for the production bootstrap period (hundreds of nodes before organic traffic) is unproven
 - Two-token UX: all node operators need both USDC (for payment channels) and TOKEN (to stake). Client software should abstract this with integrated DEX swaps but adds complexity
-- The TOKEN/USDC Uniswap pool will be thin at PoC scale and early production, making buyback execution impractical until sufficient pool depth exists. Buyback execution is deferred to production and requires a governance vote to enable (see [BuybackBurner Contract](#buybackburner-contract)). In production, `maxBuybackAmount` and `minTokenOut` parameters mitigate sandwich risk but require active governance attention
+- The TOKEN/USDC pool will be thin at PoC scale and early production, making buyback execution impractical until sufficient pool depth exists. Buyback execution is deferred to production and requires a governance vote to enable (see [BuybackBurner Contract](#buybackburner-contract)). The venue, pool type, and liquidity-seeding strategy are specified in [ADR 018](018-liquidity-strategy.md) — a Balancer V2 80/20 TOKEN/USDC weighted pool seeded as Protocol-Owned Liquidity. In production, `maxBuybackAmount` and `minTokenOut` parameters mitigate sandwich risk but require active governance attention
 - Regulatory risk: a token with staking, governance, and economic utility may be classified as a security in some jurisdictions. Legal review is required before production token distribution. See [ADR 009](009-governance.md) for governance-specific risks.
 
 ## Token Distribution (Production)
@@ -187,7 +187,7 @@ pie title Protocol Fee Allocation (3% at channel settlement)
 The `BuybackBurner` contract converts accumulated USDC fees into TOKEN and burns them:
 
 1. The admin key holder (PoC) or an authorized governance action (production) transfers accumulated USDC fees (20% allocation) to `BuybackBurner`
-2. `executeBuyback()` swaps USDC for TOKEN via Uniswap V3 on L2
+2. `executeBuyback()` swaps USDC for TOKEN via the Balancer V2 Vault on L2 (see [ADR 018](018-liquidity-strategy.md) for venue rationale and the alternative-venue comparison)
 3. Purchased TOKEN is sent to burn address (`0x000...dEaD`)
 
 **PoC behavior:** The `BuybackBurner` contract is deployed and receives the 20% fee allocation from the treasury, but `executeBuyback()` is not called. Fees accumulate in the contract as a treasury reserve. At PoC scale, per-node revenue is ~$1.50/month (see [PoC Reality](#revenue-model-poc-reality)), so even a 20-node network generates only ~$30/month in delivery payments, ~$0.90/month in protocol fees, and ~$0.18/month in buyback allocation — insufficient to justify gas costs, let alone execute a meaningful market buy on a thin TOKEN/USDC pool. Buyback execution is enabled in production via governance vote once pool liquidity and fee volume justify it.
@@ -199,7 +199,7 @@ The `BuybackBurner` contract converts accumulated USDC fees into TOKEN and burns
 | Minimum accumulation before buyback (`minBuybackAmount`) | N/A (execution disabled) | 100 USDC | Yes |
 | Maximum single buyback (`maxBuybackAmount`) | N/A (execution disabled) | 10,000 USDC | Yes |
 | Slippage tolerance (`slippageBps`) | N/A (execution disabled) | 2% (200 bps) | Yes |
-| DEX (`dexPool`) | N/A (execution disabled) | Uniswap V3 TOKEN/USDC pool | Yes (pool address) |
+| DEX (`dexPool`) | N/A (execution disabled) | Balancer V2 80/20 TOKEN/USDC weighted pool (identified by `bytes32 poolId`) | Yes (`setSwapRouter` + `setPoolId`) |
 | Execution | Disabled — fees accumulate only | Governance-triggered or automated keeper | — |
 | Execution activation | N/A | Requires governance vote to enable | — |
 
@@ -209,7 +209,7 @@ The minimum accumulation threshold is reduced from 1,000 to 100 USDC because at 
 
 The caller provides `minTokenOut` to prevent sandwich attacks. If the TOKEN/USDC pool has insufficient liquidity, the swap reverts due to the `minTokenOut` check and accumulated fees remain in the contract until liquidity improves. The `maxBuybackAmount` should be set conservatively relative to pool depth.
 
-**Activation criteria (production):** Buyback execution should be enabled via governance vote only when: (1) the TOKEN/USDC pool has sufficient depth that a maximum single buyback causes less than the configured slippage tolerance in price impact, and (2) accumulated fees in the contract exceed the minimum accumulation threshold. These criteria are guidelines for governance voters, not on-chain enforcement.
+**Activation criteria (production):** See [ADR 018 — Activation Criteria](018-liquidity-strategy.md#activation-criteria-production) for the authoritative list, which covers pool seeding, price-impact conditions, accumulated-fee thresholds, and keeper readiness. These criteria are guidelines for governance voters, not on-chain enforcement.
 
 ## Node Unit Economics
 

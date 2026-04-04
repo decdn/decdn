@@ -504,6 +504,7 @@ interface IBuybackBurner {
     function executeBuyback(address token, uint256 amount, uint256 minTokenOut) external;
     function setKeeper(address keeper) external;
     function setSwapRouter(address router) external;
+    function setPoolId(bytes32 poolId) external;
     function setSlippageTolerance(uint256 bps) external;
     function setMinBuybackAmount(uint256 amount) external;
     function setMaxBuybackAmount(uint256 amount) external;
@@ -512,7 +513,7 @@ interface IBuybackBurner {
 }
 ```
 
-This interface is the canonical specification for `BuybackBurner`. [ADR 004](004-tokenomics.md) defines the economic parameters; parameter names in ADR 004 reference this interface (e.g., `slippageBps` corresponds to `setSlippageTolerance(uint256 bps)` above).
+This interface is the canonical specification for `BuybackBurner`. [ADR 004](004-tokenomics.md) defines the economic parameters; parameter names in ADR 004 reference this interface (e.g., `slippageBps` corresponds to `setSlippageTolerance(uint256 bps)` above). [ADR 018](018-liquidity-strategy.md) specifies the venue (Balancer V2 Vault + 80/20 weighted pool) and how `setSwapRouter` and `setPoolId` are configured at deployment.
 
 `executeBuyback` is callable by governance multisig or the authorized `keeper` address. All `set*` functions are governance-only behind a timelock.
 
