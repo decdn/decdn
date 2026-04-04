@@ -111,6 +111,7 @@ Where `lambda = 0.1` per week (half-life ≈ 6.9 weeks) and `age_weeks_i` is the
 | `min_counterparties` | 5 (governance-tunable; hardcoded floor: 2) |
 | `settlement_decay_lambda` | 0.1 per week (half-life ≈ 6.9 weeks) |
 | `settlement_max_age` | 52 weeks (older settlements contribute 0) |
+| `weight_cap` | 3.0 (max `reporter_weight` value; bounds the EWMA alpha multiplier) |
 
 ### 5. Combined Score
 
@@ -209,7 +210,6 @@ Scores converge to 0.5 asymptotically, reaching within 0.05 of neutral after ~30
 | Decay rate | 10% per week (applied iteratively) |
 | Decay starts after | 1 week with no new reports or interactions |
 | Minimum score (floor) | 0.0 (selection algorithm clamps at 0.1 — see [ADR 001](001-network.md#node-selection-algorithm)) |
-| Reporter weight cap | 3.0 (max `reporter_weight` value; bounds the EWMA alpha multiplier) |
 | Scope | Production only — see [Section 12](#12-poc-scope) for PoC scope |
 
 ### 8. Score Clamping
