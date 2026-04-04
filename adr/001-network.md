@@ -86,7 +86,7 @@ Both clients and nodes maintain a **peer table** (`NodeId → NodeAnnounce`) bui
 
 Content discovery is on-demand via the existing `cdn/probe/v1` protocol. When a node or client needs a blob, it probes known peers in parallel:
 
-1. **Probe cache check.** Look up `hash` in a short-lived LRU cache (`hash → Vec<(NodeId, rate_per_mb, rtt, ProbeResponse)>`, TTL 15 seconds, max 1024 entries). Each hash entry retains at most 10 responses (the top 10 by selection score), bounding memory at production scale. Each entry retains the full signed `ProbeResponse` for slashing evidence. If a valid entry exists, skip to step 4.
+1. **Probe cache check.** Look up `hash` in a short-lived LRU cache (`hash → Vec<(NodeId, rate_per_mb, rtt, ProbeResponse)>`, TTL 15 seconds, max 1024 entries). Each hash entry retains at most 10 responses (the top 10 by selection score), bounding memory at production scale. Each entry retains the full signed `ProbeResponse` for slashing evidence. Approximate memory bound: 1,024 entries × 10 responses × ~200 bytes ≈ 2 MB. If a valid entry exists, skip to step 4.
 2. **Fan-out.** Send `ProbeRequest {hash, timestamp_us}` in parallel to all known nodes (regional + global). The ALPN remains `cdn/probe/v1` — `ProbeResponse {has_blob, rate_per_mb, timestamp_us, signature, total_bytes?}`.
 3. **Collect.** Wait for probe responses in two phases:
    - **Phase 1 — Minimum wait** (`probe_min_wait`, default 50ms): Always wait at least this long to collect responses from nearby nodes, ensuring multiple candidates compete rather than always selecting the single fastest responder.
