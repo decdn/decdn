@@ -472,6 +472,24 @@ During PoC (before indexers exist), content discovery uses probe fan-out — eve
 
 ---
 
+## Future Work: KV-CRDT Content Catalogs
+
+Not in PoC scope. iroh's KV-CRDT protocol (`iroh-docs`) provides a replicated key-value store with eventual consistency via range-based set reconciliation. Entries are `(namespace, author, key) → (BLAKE3 hash, size, timestamp)` — metadata only; actual content travels via iroh-blobs separately. This maps naturally to deCDN's content-addressing model.
+
+**Primary use case — content catalog replication.** A KV-CRDT namespace per content provider could replicate a catalog of `hash → content metadata` entries across nodes. Nodes would learn what content exists before needing it, enabling smarter prefetching and reducing probe fan-out pressure as the network scales beyond PoC. This is the most natural replacement for brute-force probe fan-out at scale.
+
+**Secondary use cases to evaluate:**
+
+- **Node metadata.** A shared document keyed by `NodeId` could provide persistent, eventually-consistent node state (rates, capacity, regions) that survives reconnections — supplementing or replacing ephemeral gossip `NodeAnnounce` messages.
+- **Watchtower voucher state.** A KV-CRDT keyed by `(channel_id, nonce)` between a watchtower and its client could keep voucher state consistent, simplifying the bespoke sync and heartbeat commitment described in [ADR 007](007-watchtower.md).
+- **Indexer replication layer.** Indexer nodes (see [Search & Discovery](#future-work-search--discovery) above) could subscribe to content catalog namespaces and build their search index from replicated entries, rather than relying solely on gossip and probe participation.
+
+**Why not in PoC:** At tens of nodes, probe fan-out provides complete coverage and is simpler. Adding a CRDT replication layer is worthwhile only when the network grows large enough that probing all peers becomes expensive. The migration is additive — probe fan-out remains the fallback.
+
+**Reference:** [iroh-docs protocol](https://docs.iroh.computer/protocols/kv-crdts)
+
+---
+
 ## What Is Not Decided Yet
 
 - Production L2 choice (Arbitrum One, Base, or other) — gated on PoC validation. Sequencer censorship mitigation for the dispute window is addressed in [ADR 007](007-watchtower.md#l2-sequencer-censorship) (PoC: 48h default; production: forced-inclusion deadline extension); the extension's detection logic depends on the L2 chosen
