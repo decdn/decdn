@@ -54,11 +54,13 @@ struct RateChange {
 }
 ```
 
-Peers store the latest `RateChange` per `node_id` in their peer table alongside `NodeAnnounce` state. Peers SHOULD reject `RateChange` messages whose `effective_at_us` is more than 60 seconds in the past relative to the peer's local clock, preventing post-hoc fabrication from propagating through the gossip network.
+Peers store the latest `RateChange` per `node_id` in their peer table alongside `NodeAnnounce` state. Peers SHOULD reject `RateChange` messages whose `effective_at_us` is more than 60 seconds in the past relative to the peer's local clock. This limits how far back a node can backdate a fabricated `RateChange` and reduces propagation of stale messages through the gossip network, but does not eliminate the timeliness limitation described below.
 
 `RateChange` messages are event-driven (not periodic like `NodeAnnounce`). Operators change rates infrequently — typically daily or weekly. Bandwidth impact is negligible; see [ADR 001, Gossip Bandwidth Analysis](001-network.md#gossip-bandwidth-analysis).
 
-**Inherent limitation:** The `slash_sig` proves the node *signed* a `RateChange` but cannot prove *when* it was signed. A malicious node could fabricate a `RateChange` after being challenged during the 24-hour counter-evidence window. Mitigations: (1) gossip peers that received the `RateChange` before the challenge provide a witness layer — for PoC, this social attestation is sufficient; (2) the challenge bond ([ADR 004](004-tokenomics.md#challenge-bond)) deters frivolous challenges; (3) production could require `RateChange` hashes to be anchored in a Merkle tree with periodic on-chain roots, providing cryptographic timeliness proof.
+**Clock-skew note:** The `effective_at_us` timestamp is node-generated, while the `timestamp_us` values in `ProbeResponse`/`StreamResponse` are requester-generated. On-chain counter-evidence verification ([ADR 014](014-on-chain-verification.md#rate-manipulation-counter-evidence)) compares these across clock domains. This is acceptable because: (1) the 30-second slashing window provides margin for reasonable clock skew (seconds); (2) the comparison establishes ordering, not precise timing — the node's rate change must fall roughly between the two requester timestamps; (3) a node whose clock is severely skewed will fail to produce valid counter-evidence, incentivizing clock synchronization.
+
+**Inherent limitation:** The `slash_sig` proves the node *signed* a `RateChange` but cannot prove *when* it was signed. A malicious node could fabricate a `RateChange` after being challenged during the 24-hour counter-evidence window, provided the fabricated `effective_at_us` falls within the gossip acceptance window. Mitigations: (1) gossip peers that received the `RateChange` before the challenge provide a witness layer — for PoC, this social attestation is sufficient; (2) the challenge bond ([ADR 004](004-tokenomics.md#challenge-bond)) deters frivolous challenges; (3) production could require `RateChange` hashes to be anchored in a Merkle tree with periodic on-chain roots, providing cryptographic timeliness proof.
 
 ### `cdn/probe/v1` — latency probe
 

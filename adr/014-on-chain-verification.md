@@ -248,11 +248,13 @@ interface ISlashJudge {
 The challenged node may call `counterChallenge(challengeId, evidence)` within 24 hours, where `evidence` is the ABI-encoded `RateChange` fields plus `slash_sig`. The contract verifies:
 
 1. `ecrecover(rateChangeData, rateChangeSlashSig)` recovers the same address as the challenged node
-2. `rateChange.effective_at_us >= probeResponse.timestamp_us` — the rate change happened after the probe
-3. `rateChange.effective_at_us <= streamResponse.timestamp_us` — the rate change was effective before or at the stream response
-4. `rateChange.new_rate_per_mb == streamResponse.rate_per_mb` — the new rate matches what the node charged
+2. `rateChange.nodeId` matches the challenged node's registered `NodeId` in `StakingRegistry` — defense-in-depth alongside `ecrecover`, since `nodeId` (iroh Ed25519) and Ethereum address are different identity layers
+3. `rateChange.old_rate_per_mb == probeResponse.rate_per_mb` — the prior rate matches what the node advertised in the probe, proving this specific rate transition is legitimate
+4. `rateChange.effective_at_us >= probeResponse.timestamp_us` — the rate change happened after the probe
+5. `rateChange.effective_at_us <= streamResponse.timestamp_us` — the rate change was effective before or at the stream response
+6. `rateChange.new_rate_per_mb == streamResponse.rate_per_mb` — the new rate matches what the node charged
 
-If all four conditions pass, the challenge is dismissed and the challenger's bond is forfeited (50% burned, 50% to node). If the 24-hour window expires without valid counter-evidence, the slash executes via `StakingRegistry.slash()`.
+If all six conditions pass, the challenge is dismissed and the challenger's bond is forfeited (50% burned, 50% to node). If the 24-hour window expires without valid counter-evidence, the slash executes via `StakingRegistry.slash()`.
 
 See [ADR 005, Gossip — rate change announcements](005-protocol.md#gossip--rate-change-announcements) for the `RateChange` gossip message that produces this counter-evidence.
 
