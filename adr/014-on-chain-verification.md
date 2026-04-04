@@ -31,13 +31,13 @@ This ADR specifies concrete on-chain mechanisms for both: `ecrecover`-based sign
 
 #### Approach: secp256k1 slash signatures alongside Ed25519 wire signatures
 
-Nodes already register an Ethereum address (secp256k1-derived) alongside their Ed25519 NodeId in `StakingRegistry` ([ADR 003](003-payments.md)). This ADR leverages that existing binding: protocol messages carry an **optional second signature** using the node's Ethereum key, specifically for on-chain evidence.
+Nodes already register an Ethereum address (secp256k1-derived) alongside their Ed25519 NodeId in `StakingRegistry` ([ADR 003](003-payments.md)). This ADR leverages that existing binding: protocol messages carry a **second signature** using the node's Ethereum key, specifically for on-chain evidence.
 
-**Wire protocol additions.** `ProbeResponse` and `StreamResponse` each gain an optional `slash_sig` field:
+**Wire protocol additions.** `ProbeResponse` and `StreamResponse` each carry a `slash_sig` field (mandatory in PoC; production may relax to optional via Tier 1 evolution per [ADR 013](013-schema-evolution.md)):
 
 ```
-ProbeResponse {has_blob, rate_per_mb, timestamp_us, signature, total_bytes?, slash_sig?}
-StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, signature, redirect?, error?, voucher_interval_mb?, slash_sig?}
+ProbeResponse {has_blob, rate_per_mb, timestamp_us, signature, total_bytes?, slash_sig}
+StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, signature, redirect?, error?, voucher_interval_mb?, slash_sig}
 ```
 
 `slash_sig` is an EIP-712 secp256k1 signature over the same security-relevant fields already covered by the Ed25519 `signature`:
@@ -45,7 +45,7 @@ StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, signature, redirect?
 - **ProbeResponse slash_sig covers:** `{hash, has_blob, rate_per_mb, timestamp_us}`
 - **StreamResponse slash_sig covers:** `{hash, ok, rate_per_mb, total_bytes, channel_id, timestamp_us, redirect}`
 
-These match the Ed25519-signed field sets defined in [ADR 005](005-protocol.md). Note that `hash` and `channel_id` are request-context fields (from `ProbeRequest` and `StreamRequest` respectively), not transmitted in the response body — implementers must include them when building and verifying the EIP-712 typed data. When `redirect` is absent (the common case), it is encoded as `bytes32(0)`. The `slash_sig` field follows the Tier 1 minor evolution pattern from [ADR 013](013-schema-evolution.md#tier-1--minor-no-coordination) — nodes that have not upgraded omit it. Requesters cannot submit on-chain slash evidence for messages without `slash_sig`; those cases fall back to reputation penalties, consistent with the existing timeout/non-response handling in [ADR 003](003-payments.md).
+These match the Ed25519-signed field sets defined in [ADR 005](005-protocol.md). Note that `hash` and `channel_id` are request-context fields (from `ProbeRequest` and `StreamRequest` respectively), not transmitted in the response body — implementers must include them when building and verifying the EIP-712 typed data. When `redirect` is absent (the common case), it is encoded as `bytes32(0)`. In the PoC, `slash_sig` is mandatory — all nodes must include it, and requesters MUST reject responses that omit it. Production may relax this to optional via Tier 1 evolution ([ADR 013](013-schema-evolution.md#tier-1--minor-no-coordination)), in which case requesters cannot submit on-chain slash evidence for messages without `slash_sig`; those cases fall back to reputation penalties, consistent with the existing timeout/non-response handling in [ADR 003](003-payments.md).
 
 #### EIP-712 Type Definitions
 
@@ -242,7 +242,7 @@ interface ISlashJudge {
 7. Verify `streamResponse.timestamp_us - probeResponse.timestamp_us < 30_000_000` (30-second window)
 8. Look up address A in `StakingRegistry` — must be a registered node
 
-**Evidence staleness.** All challenge types MUST validate: `block.timestamp * 1_000_000 - probeResponse.timestamp_us < MAX_EVIDENCE_AGE_US` (PoC: 7 days = 604,800,000,000 us). This prevents hoarding of legitimately signed protocol messages for later use as slash evidence after the context has changed (e.g., a node legitimately updated its rate after the captured probe).
+**Evidence staleness.** All challenge types MUST validate: `block.timestamp * 1_000_000 - evidence.timestamp_us < MAX_EVIDENCE_AGE_US` (PoC: 7 days = 604,800,000,000 μs), where `evidence.timestamp_us` is the earliest `timestamp_us` from the submitted evidence messages (e.g., `probeResponse.timestamp_us` for phantom/rate challenges, `streamResponse.timestamp_us` for corruption/blacklist challenges that lack a probe). This prevents hoarding of legitimately signed protocol messages for later use as slash evidence after the context has changed (e.g., a node legitimately updated its rate after the captured probe). `MAX_EVIDENCE_AGE_US` is a governable parameter on `SlashJudge` (safety bounds: [1 day, 30 days]).
 
 **Rate manipulation:**
 1–3. Same address recovery and identity check as phantom
@@ -322,7 +322,7 @@ These estimates replace the `submitFraudProof()` placeholder (~250k gas) in [ADR
 - All four slashable offenses now have a concrete, gas-efficient on-chain evidence path. Slashing is no longer aspirational.
 - `ecrecover` at 3,000 gas per signature is 100–300× cheaper than a Solidity Ed25519 library, making routine slashing economically viable even for small offenses.
 - The dual-key approach reuses the existing NodeId-to-Ethereum-address binding in `StakingRegistry` — no new on-chain registration step.
-- The `slash_sig` field is optional (Tier 1 evolution per [ADR 013](013-schema-evolution.md)), so nodes can upgrade incrementally. The network degrades gracefully: unsigned messages fall back to reputation penalties.
+- In the PoC, `slash_sig` is mandatory, ensuring all delivery interactions are on-chain slashable. Production may relax this to optional (Tier 1 evolution per [ADR 013](013-schema-evolution.md)), allowing incremental upgrades where unsigned messages fall back to reputation penalties.
 - The unified `SlashJudge` contract provides a single audit surface for all slashing logic.
 - The PoC corruption path (single-round optimistic) is simple to implement and audit. The production upgrade path (interactive Merkle proof) is designed but deferred.
 
