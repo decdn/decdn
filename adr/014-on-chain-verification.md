@@ -12,6 +12,8 @@ Four slashable offenses require on-chain evidence verification ([ADR 004](004-to
 3. **Rate manipulation** — node advertises one rate in probe, charges higher in stream
 4. **Blacklist violation** — node serves a blacklisted hash after the compliance window ([ADR 011](011-content-takedown.md))
 
+A fifth offense, **double settlement** (submitting the same voucher to multiple channels), is defined in [ADR 004](004-tokenomics.md) as production-only and is not covered by on-chain verification in the PoC.
+
 Three of these (phantom, rate, blacklist) require verifying cryptographic signatures from protocol messages. The fourth (corruption) requires adjudicating whether delivered bytes match the claimed BLAKE3 hash. Neither Ed25519 signature verification nor BLAKE3 mismatch adjudication is natively supported on EVM:
 
 - **Ed25519 signatures** (iroh NodeId keys, used for `ProbeResponse` and `StreamResponse` per [ADR 005](005-protocol.md)) have no EVM precompile. Solidity-based verification costs ~500k–1M gas per signature — economically unviable for routine slashing on Arbitrum.
@@ -101,6 +103,8 @@ The Ed25519 signature remains the primary authentication mechanism for the QUIC 
 | **Dual-key slash signatures (chosen)** | **~3,000** | **Recommended** | Uses proven `ecrecover`; adds one `Option` field per message; no new infrastructure |
 
 > **Note:** [ADR 001](001-network.md#nodeid-ownership-verification) uses direct ed25519 verification (Solidity library, ~500k–1M gas) for node registration ownership proof. This is acceptable because registration is a one-time cost per node lifetime, unlike slash evidence which may be submitted frequently.
+
+> **PoC vs production:** The PoC makes `slash_sig` mandatory on all `ProbeResponse` and `StreamResponse` messages ([ADR 005](005-protocol.md)), ensuring universal on-chain accountability. Production may relax this to optional via Tier 1 evolution ([ADR 013](013-schema-evolution.md)). In that case, requesters SHOULD be able to require `slash_sig` as a precondition for proceeding with a stream — nodes that refuse receive a reputation penalty ([ADR 008](008-reputation.md)), creating economic pressure toward inclusion without a hard protocol requirement.
 
 ### 2. BLAKE3 Content Corruption — Optimistic Challenge-Response
 
@@ -224,6 +228,8 @@ interface ISlashJudge {
 }
 ```
 
+**Challenge rate limit.** `SlashJudge` enforces a maximum number of concurrent active (unresolved) challenges per target node address: `maxActiveChallengesPerNode` (PoC: 10, production safety bound: [1, 50]). New `submitChallenge` calls targeting a node at the limit MUST revert. This bounds the defender's concurrent counter-evidence response burden and prevents griefing attacks where a well-funded attacker submits many simultaneous spurious challenges to force operational disruption. The parameter is governable per [ADR 009](009-governance.md).
+
 #### Evidence Verification Per Offense Type
 
 **Phantom announcement:**
@@ -235,6 +241,8 @@ interface ISlashJudge {
 6. Verify `streamResponse.timestamp_us >= probeResponse.timestamp_us`
 7. Verify `streamResponse.timestamp_us - probeResponse.timestamp_us < 30_000_000` (30-second window)
 8. Look up address A in `StakingRegistry` — must be a registered node
+
+**Evidence staleness.** All challenge types MUST validate: `block.timestamp * 1_000_000 - probeResponse.timestamp_us < MAX_EVIDENCE_AGE_US` (PoC: 7 days = 604,800,000,000 us). This prevents hoarding of legitimately signed protocol messages for later use as slash evidence after the context has changed (e.g., a node legitimately updated its rate after the captured probe).
 
 **Rate manipulation:**
 1–3. Same address recovery and identity check as phantom

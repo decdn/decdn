@@ -22,9 +22,11 @@ All on-chain contracts inherit from [OpenZeppelin Contracts](https://docs.openze
 | StablePaymentChannel | [003](003-payments.md) | Yes | USDC | `Ownable`, `ReentrancyGuard`, `Pausable`, `EIP712` | PoC only |
 | PaymentChannel | [010](010-multi-token.md) | Yes | Governance-approved ERC-20s | `AccessControl`, `ReentrancyGuard`, `Pausable`, `EIP712` | Production only |
 | BuybackBurner | [004](004-tokenomics.md) | Yes | USDC, TOKEN (transient) | `AccessControl`, `ReentrancyGuard`, `Pausable` | PoC (accumulate-only) + Production |
-| ContentBlacklist | [011](011-content-takedown.md) | No | — | `AccessControl` | PoC + Production |
+| ContentBlacklist | [011](011-content-takedown.md) | No | — | `AccessControl`, `ReentrancyGuard` | PoC + Production |
 | SlashJudge | [014](014-on-chain-verification.md) | Yes | TOKEN (challenge bonds) | `AccessControl`, `ReentrancyGuard`, `Pausable`, `EIP712` | PoC + Production |
 | WatchtowerEscrow | [007](007-watchtower.md) | Yes | USDC | `ReentrancyGuard`, `Pausable`, `EIP712` | Production only |
+
+**No proxy deployment patterns.** No deCDN contract uses proxy (upgradeable) deployment patterns. Production contract upgrades deploy new contracts at new addresses with state migration as described in Section 6. This constraint ensures that EIP-712 domain separators computed in constructors (as `immutable`) remain valid for the contract's lifetime — a proxy migration to a different address or chain would invalidate all existing voucher signatures.
 
 **Build toolchain:** [Foundry](https://book.getfoundry.sh/) (forge, cast, anvil) for compilation, testing, and deployment.
 
@@ -98,6 +100,8 @@ After all contracts are deployed, the deployer must execute these transactions b
    contract.grantRole(DEFAULT_ADMIN_ROLE, address(timelockController));
    contract.revokeRole(DEFAULT_ADMIN_ROLE, deployer);
    ```
+
+> **Production hardening:** Production deployments SHOULD execute `grantRole(DEFAULT_ADMIN_ROLE, timelockController)` and `renounceRole(DEFAULT_ADMIN_ROLE, deployer)` in a single multicall transaction to minimize the dual-admin window between the two operations.
 
 ### 3. Cross-Contract Call Graph
 
@@ -289,6 +293,8 @@ Every state-mutating function that makes an external call is listed below with i
 | Function | External Calls | Guards |
 | --- | --- | --- |
 | `executeBuyback()` | `UniswapV3Router.exactInputSingle()` (swaps contract-held USDC), `IERC20.safeTransfer()` (TOKEN to burn) | `nonReentrant`, checks-effects-interactions, `KEEPER_ROLE` |
+
+> **MEV protection (production).** Production `executeBuyback` SHOULD use a private mempool (e.g., Flashbots Protect on Arbitrum) or implement TWAP (time-weighted average price) execution that splits large buybacks across multiple blocks to mitigate sandwich attacks. The `maxBuybackAmount` parameter MUST be enforced to limit per-transaction MEV exposure.
 
 #### Multi-Token Reentrancy Considerations
 

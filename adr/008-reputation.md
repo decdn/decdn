@@ -121,6 +121,8 @@ final_score = 0.7 * local_score + 0.3 * network_score
 
 If a client has no local observations for a node (never interacted), it uses 100% network score.
 
+**Minimum reporter threshold.** A node's network reputation score requires reports from at least 3 distinct staked reporters before departing from the default 0.5 neutral score. This defends against gossip-layer eclipse attacks where an attacker controls all of a victim's gossip peers on `cdn/reputation/v1` and injects fabricated reports. Until the threshold is met, the node is treated as unscored rather than positively or negatively rated.
+
 ```mermaid
 flowchart TD
     subgraph Local["Local Score (70%)"]

@@ -30,6 +30,8 @@ This ADR defines which protocols are eligible for 0-RTT, the replay safety ratio
 
 Responders MUST NOT use `ProbeRequest` receipt to trigger any state change (e.g., cache priority boosting, demand-signal updates). If future protocol versions add such behavior, probe processing must be made replay-aware or 0-RTT eligibility must be revoked.
 
+> **Implementation note:** Probe-receipt handling functions MUST be annotated as 0-RTT-safe (no side effects). If future implementations add demand-signal tracking or cache-priority boosting to probe handling, they MUST check the QUIC transport layer's early-data/replayed indicator before applying side effects.
+
 **`KeysMessage::PlayRequest` (side-effect-free but blocked by auth sequencing):** Contains `{blob_hash}`. The app server wraps the blob key with the current epoch key and a fresh random nonce per response — the operation is side-effect-free and read-only, but response bytes are not deterministic across calls (due to `nonce_wrap`). Despite being replay-safe in isolation, `PlayRequest` cannot be sent as 0-RTT early data because ADR 006 requires an authenticated `EpochKeyAuth` stream on the connection before the server will accept it. On a new 0-RTT connection, no auth stream exists yet, so the server would reject the request.
 
 **`StreamRequest` (unsafe):** Initiates paid byte delivery. Replay could cause a node to begin streaming bytes and expect voucher payment for a transfer the client did not request. Even if the node detects the duplicate `channel_id` + `byte_offset` combination, the window between replay receipt and detection creates accounting ambiguity.

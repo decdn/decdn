@@ -84,6 +84,8 @@ Infrastructure operators have a privileged view of specific interaction channels
 
 **Watchtower (P-16).** Voucher updates expose channel activity patterns (amounts, frequency, session duration). [ADR 007](007-watchtower.md) acknowledges this: "the privacy impact is low — vouchers are not secret (the counterparty already has them) — but it is a new data surface." The watchtower sees no more than the channel counterparty already knows.
 
+> **Aggregation risk:** Watchtower operators aggregate voucher update patterns across all monitored channels, providing a qualitatively broader payment activity view than any single bilateral counterparty. Production watchtower selection guidance SHOULD recommend using watchtowers operated by different entities than the node's primary business partners to limit cross-channel correlation.
+
 **Relay (P-17).** iroh relays see source/destination IP pairs and connection timing for relayed connections (~10% of conditions). Relays cannot inspect content (all traffic is end-to-end encrypted). This is standard for any relay-based NAT traversal system.
 
 #### T4: Compromised Endpoint
