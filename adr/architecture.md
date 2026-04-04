@@ -201,7 +201,7 @@ All four slashable offenses (corrupted delivery, phantom announcements, rate man
 
 **0-RTT early data for latency-sensitive protocols.**
 
-QUIC 0-RTT eliminates the TLS handshake round trip on repeat connections. `cdn/probe/v1` is the primary beneficiary — after the first probe cycle, subsequent cache-miss fan-outs send `ProbeRequest` alongside the ClientHello with zero handshake delay. `cdn/keys/v1` permits 0-RTT for idempotent `PlayRequest` envelope lookups. Payment-bearing (`cdn/client/v1`) and state-changing (`cdn/watchtower/v1`) protocols reject 0-RTT to prevent replay-based accounting confusion. Session tickets are cached per `(remote_node_id, ALPN)` in an in-memory LRU (max 1,000 entries).
+QUIC 0-RTT eliminates the TLS handshake round trip on repeat connections. `cdn/probe/v1` is the sole beneficiary — after the first probe cycle, subsequent cache-miss fan-outs send `ProbeRequest` alongside the ClientHello with zero handshake delay. All other protocols reject 0-RTT: payment-bearing (`cdn/client/v1`) and state-changing (`cdn/watchtower/v1`) to prevent replay-based accounting confusion, and `cdn/keys/v1` because authentication sequencing ([ADR 006](006-e2e-encryption.md)) requires `EpochKeyAuth` before any request stream. Session tickets are cached per `(remote_node_id, ALPN)` in an in-memory LRU (max 1,000 entries).
 
 ---
 

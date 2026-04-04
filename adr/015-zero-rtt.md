@@ -22,7 +22,7 @@ This ADR defines which protocols are eligible for 0-RTT, the replay safety ratio
 | `cdn/probe/v1` | **Yes** | `ProbeRequest` is read-only and idempotent. A replayed probe produces a duplicate `ProbeResponse` that the requester deduplicates by `NodeId` in the probe cache. No state change on the responder. |
 | `cdn/client/v1` | **No** | `StreamRequest` initiates a payment relationship. Replay could cause duplicate byte delivery or voucher accounting confusion. Subsequent streams on an established connection already benefit from QUIC stream multiplexing (zero additional handshake cost). |
 | `cdn/watchtower/v1` | **No** | `WatchtowerRegister` has side effects (begins channel monitoring, allocates state). Connections are long-lived — handshake cost is amortized over hours or days. |
-| `cdn/keys/v1` | **Conditional** | `PlayRequest` (stream type `0x02`) is an idempotent envelope lookup — same hash always returns the same envelope. Eligible for 0-RTT on reconnection. `EpochKeyAuth` (stream type `0x01`) performs authentication with side effects — **not** eligible. Implementations MUST distinguish stream types before sending early data. |
+| `cdn/keys/v1` | **No** | ADR 006 requires an authenticated `EpochKeyAuth` stream before `PlayRequest` or `OfflineLeaseRequest` streams are accepted. Since `EpochKeyAuth` has authentication side effects (not 0-RTT safe), and all other stream types depend on it, 0-RTT is not viable for any `KeysMessage` variant on a new connection. On an existing connection the handshake is already complete. |
 
 ### Replay Safety Analysis
 
@@ -30,7 +30,7 @@ This ADR defines which protocols are eligible for 0-RTT, the replay safety ratio
 
 Responders MUST NOT use `ProbeRequest` receipt to trigger any state change (e.g., cache priority boosting, demand-signal updates). If future protocol versions add such behavior, probe processing must be made replay-aware or 0-RTT eligibility must be revoked.
 
-**`PlayRequest` (safe):** Contains `{hash}`. The app server looks up the blob's envelope (epoch-key-wrapped symmetric key) and returns it. The same input always produces the same output within an epoch. Replay delivers the same envelope twice — the client ignores the duplicate. The app server SHOULD rate-limit `PlayRequest` per client identity to prevent replay-based amplification.
+**`KeysMessage::PlayRequest` (side-effect-free but blocked by auth sequencing):** Contains `{blob_hash}`. The app server wraps the blob key with the current epoch key and a fresh random nonce per response — the operation is side-effect-free and read-only, but response bytes are not deterministic across calls (due to `nonce_wrap`). Despite being replay-safe in isolation, `PlayRequest` cannot be sent as 0-RTT early data because ADR 006 requires an authenticated `EpochKeyAuth` stream on the connection before the server will accept it. On a new 0-RTT connection, no auth stream exists yet, so the server would reject the request.
 
 **`StreamRequest` (unsafe):** Initiates paid byte delivery. Replay could cause a node to begin streaming bytes and expect voucher payment for a transfer the client did not request. Even if the node detects the duplicate `channel_id` + `byte_offset` combination, the window between replay receipt and detection creates accounting ambiguity.
 
@@ -42,8 +42,8 @@ After a successful 1-RTT handshake on a 0-RTT-eligible ALPN, the implementation 
 
 1. **Cache the session ticket** keyed by `(remote_node_id, ALPN)` in an in-memory LRU cache.
 2. **Wait for the ticket before closing.** After the application exchange completes, spawn a background task that waits up to 2x the measured RTT (minimum 100ms, maximum 2 seconds) for the server's NewSessionTicket message before closing the connection. This matches the pattern used by iroh-experiments/content-discovery.
-3. **Honor server-advertised expiry.** Discard tickets whose `ticket_lifetime` has elapsed. If the server does not advertise a lifetime, discard after 24 hours.
-4. **LRU eviction.** Maximum 1,000 cached tickets. At PoC scale (30 nodes x 2 eligible ALPNs = 60 active entries), this provides ample headroom.
+3. **Honor server-advertised expiry.** Discard tickets whose `ticket_lifetime` has elapsed. Additionally, implementations SHOULD discard tickets after 24 hours regardless of the advertised lifetime (which RFC 8446 caps at 7 days) to limit the window of ticket theft impact.
+4. **LRU eviction.** Maximum 1,000 cached tickets. At PoC scale (30 nodes x 1 eligible ALPN = 30 active entries), this provides ample headroom.
 
 ### 0-RTT Rejection Handling
 
@@ -62,7 +62,7 @@ Nodes MUST configure 0-RTT acceptance per ALPN:
 - **`cdn/probe/v1`:** Accept 0-RTT. Process early-data `ProbeRequest` immediately.
 - **`cdn/client/v1`:** Reject 0-RTT (do not configure `max_early_data_size`). This is the default — QUIC servers that do not explicitly enable 0-RTT will reject it.
 - **`cdn/watchtower/v1`:** Reject 0-RTT.
-- **`cdn/keys/v1`:** Accept 0-RTT. The app server MUST buffer early-data frames and inspect the stream type byte before processing. If the stream type is `0x01` (`EpochKeyAuth`), the server MUST defer processing until the handshake completes.
+- **`cdn/keys/v1`:** Reject 0-RTT. Authentication sequencing ([ADR 006](006-e2e-encryption.md)) requires `EpochKeyAuth` before any other stream type, which is incompatible with 0-RTT early data.
 
 ### Impact on Probe Fan-Out Latency
 
@@ -96,7 +96,7 @@ The `probe_fanout_latency_seconds` histogram with the `0rtt` label enables opera
 - **No change to payment security.** `cdn/client/v1` and `cdn/watchtower/v1` remain 1-RTT-only. Payment channel setup, voucher exchange, and watchtower registration are never sent as early data.
 - **Session ticket storage** adds a small memory footprint (~200 bytes per ticket x 1,000 max = ~200 KB).
 - **Complexity cost** is modest: iroh's `connect_with_0rtt()` handles the transport-level details. The implementation burden is the ticket cache, the per-ALPN accept/reject configuration, and the fallback path.
-- **Future protocol versions** that add state-changing behavior to `ProbeRequest` or `PlayRequest` must re-evaluate 0-RTT eligibility. The replay safety analysis in this ADR is tied to the current message semantics.
+- **Future protocol versions** that add state-changing behavior to `ProbeRequest` must re-evaluate 0-RTT eligibility. The replay safety analysis in this ADR is tied to the current message semantics. If ADR 006's authentication sequencing for `cdn/keys/v1` is relaxed in the future, `PlayRequest` could become 0-RTT eligible (it is side-effect-free), but that would require a separate decision.
 
 ## References
 
@@ -104,4 +104,5 @@ The `probe_fanout_latency_seconds` histogram with the `0rtt` label enables opera
 - [RFC 8446 Section 8](https://www.rfc-editor.org/rfc/rfc8446#section-8) — TLS 1.3 0-RTT and anti-replay
 - [ADR 001 — Probe Fan-Out](001-network.md#content-discovery-probe-fan-out)
 - [ADR 005 — Connection Management](005-protocol.md#connection-management)
-- [ADR 006 — cdn/keys/v1 Stream Types](006-e2e-encryption.md)
+- [ADR 006 — E2E Encryption and Key Distribution](006-e2e-encryption.md) — authentication sequencing that precludes `cdn/keys/v1` 0-RTT
+- [ADR 013 — Schema Evolution](013-schema-evolution.md) — `KeysMessage` enum framing
