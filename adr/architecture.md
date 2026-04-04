@@ -207,6 +207,14 @@ QUIC 0-RTT eliminates the TLS handshake round trip on repeat connections. `cdn/p
 
 ---
 
+### [ADR 016 — Smart Contract Interaction Model](016-contract-interactions.md)
+
+**Cross-contract call graph, fund custody, access control matrix, and reentrancy analysis.**
+
+Consolidates the interaction model across all on-chain contracts (StakingRegistry, StablePaymentChannel/PaymentChannel, BuybackBurner, ContentBlacklist, SlashJudge, WatchtowerEscrow). Documents the deployment order and initialization dependencies, every cross-contract call path with required authorization, which contracts hold which token types, the full role-based access control matrix (PoC admin key vs production Governor + timelock), and a per-function reentrancy analysis. All contracts inherit from [OpenZeppelin Contracts](https://docs.openzeppelin.com/contracts/) — `AccessControl`, `ReentrancyGuard`, `Pausable`, `SafeERC20`, `EIP712`, and `Governor` — to minimize custom security-critical code. Cross-contract state mutations are limited to two paths: `ContentBlacklist → StakingRegistry.ejectNode()` (via `BLACKLIST_ROLE`) and `SlashJudge → StakingRegistry.slash()` (via `SLASH_ROLE`).
+
+---
+
 ## Key Invariants
 
 - No external origin URL exists — content enters the network through origin-backed nodes whose backends are hidden
