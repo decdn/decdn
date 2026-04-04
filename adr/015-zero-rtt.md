@@ -5,7 +5,7 @@
 
 ## Context
 
-Every QUIC connection begins with a TLS 1.3 handshake that costs one round trip (1-RTT) before application data can flow. In a CDN where probe fan-out is the critical latency path — a cache miss at PoC scale triggers 30 parallel `cdn/probe/v1` connections — this overhead is significant. At inter-continental RTTs (250-300ms), the handshake alone can consume half the probe collection window (`probe_max_wait` = 500ms, [ADR 001](001-network.md#content-discovery-probe-fan-out)).
+Every QUIC connection begins with a TLS 1.3 handshake that costs one round trip (1-RTT) before application data can flow. In a CDN where probe fan-out is the critical latency path — a cache miss at PoC scale sends `ProbeRequest` to 30 peers, each requiring a separate QUIC connection when no connection to that peer already exists — this overhead is significant. At inter-continental RTTs (250-300ms), the handshake alone can consume half the probe collection window (`probe_max_wait` = 500ms, [ADR 001](001-network.md#content-discovery-probe-fan-out)).
 
 TLS 1.3 defines a **0-RTT** mode: after a successful 1-RTT handshake, the server issues a session ticket. On the next connection to that server, the client sends early data (application bytes) alongside the TLS ClientHello, eliminating the round-trip wait. The trade-off is that 0-RTT data is **replayable** — a network adversary can capture and resend the early-data packet, causing the server to process the same request twice. This is acceptable for idempotent, read-only operations but dangerous for state-changing ones.
 
@@ -66,7 +66,7 @@ Nodes MUST configure 0-RTT acceptance per ALPN:
 
 ### Impact on Probe Fan-Out Latency
 
-At PoC scale with 30 peers, a cache miss triggers 30 parallel `ProbeRequest` connections. Without 0-RTT, each cold connection costs 1 RTT before the probe is sent:
+At PoC scale with 30 peers, a cache miss sends `ProbeRequest` to all known nodes. When connections must be (re-)established — after the first probe cycle or after idle timeout closes them — each new connection costs 1 RTT before the probe is sent:
 
 | Scenario | Probe send delay | Notes |
 | --- | --- | --- |
@@ -74,7 +74,7 @@ At PoC scale with 30 peers, a cache miss triggers 30 parallel `ProbeRequest` con
 | Warm (cached ticket, 0-RTT accepted) | 0 RTT | Probe sent with ClientHello |
 | Warm (cached ticket, 0-RTT rejected) | 1 RTT | Fallback to 1-RTT, re-send |
 
-After the first probe cycle, all 30 peer connections have cached tickets. Subsequent cache misses send probes with zero handshake delay. Combined with the adaptive early-exit mechanism ([ADR 001](001-network.md#content-discovery-probe-fan-out)), this reduces P50 cache-miss latency for warm connections from ~50-100ms (dominated by `probe_min_wait`) to the `probe_min_wait` floor itself — network RTT is no longer the bottleneck for probe delivery.
+After the first probe cycle, all 30 peer connections have cached tickets. Subsequent cache misses send probes with zero handshake delay. Combined with the adaptive early-exit mechanism ([ADR 001](001-network.md#content-discovery-probe-fan-out)), this reduces P50 cache-miss latency for reconnections by eliminating the handshake round trip — probes complete in one RTT (probe send + response) rather than two (handshake + probe), making `probe_min_wait` the dominant factor for nearby peers.
 
 ### Observability
 
