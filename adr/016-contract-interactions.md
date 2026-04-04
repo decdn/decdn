@@ -66,7 +66,7 @@ graph TD
 | 4a | StablePaymentChannel (PoC) | Constructor args: USDC address, `treasuryAddress`, `disputeWindow` (48h). Initialized in constructor body: StakingRegistry address, `feePercentage` (300 bps), `discountedFeePercentage` (150 bps), `maxChannelDuration` (90 days), rate bounds ([ADR 003](003-payments.md)) |
 | 4b | PaymentChannel (production) | StakingRegistry address, Governor address |
 | 5 | BuybackBurner | TOKEN address, USDC address, Uniswap V3 Router address |
-| 6 | ContentBlacklist | StakingRegistry address (required for `ejectNode()` cross-contract call; address storage is a consolidation recommendation — [ADR 011](011-content-takedown.md) describes the call but not the constructor interface) |
+| 6 | ContentBlacklist | `ContentBlacklist(address stakingRegistry)`. StakingRegistry address is required for `ejectNode()` cross-contract call. [ADR 011](011-content-takedown.md) describes the call but not the constructor interface; this ADR formalizes it. |
 | 7 | SlashJudge | StakingRegistry address, TOKEN address, `challengeBond` (100 TOKEN PoC / 50 TOKEN production), `counterEvidenceWindow` (24h) |
 | 8 | WatchtowerEscrow | StablePaymentChannel/PaymentChannel address, `heartbeatInterval`, `missThreshold`, `feeRateBps`, `minFee`, `monitoringPeriod` |
 
@@ -102,6 +102,8 @@ After all contracts are deployed, the deployer must execute these transactions b
    ```
 
 > **Production hardening:** Production deployments SHOULD execute `grantRole(DEFAULT_ADMIN_ROLE, timelockController)` and `revokeRole(DEFAULT_ADMIN_ROLE, deployer)` in a single multicall transaction to minimize the dual-admin window between the two operations.
+
+> **Deployment atomicity.** The post-deployment initialization steps (1–5) SHOULD be executed atomically via a multicall contract or a deployment script that reverts on any failure. A partially initialized system (e.g., `SLASH_ROLE` granted but `BLACKLIST_ROLE` not yet) could create a window where some security mechanisms work but others do not. Between deployment and initialization completion, `StakingRegistry` SHOULD reject `registerNode` calls (e.g., via a `paused` initial state or a deployment flag) to prevent nodes from registering before the security infrastructure is fully wired. For the PoC, a Foundry deployment script with sequential `vm.broadcast()` calls provides sufficient atomicity.
 
 ### 3. Cross-Contract Call Graph
 
@@ -196,11 +198,11 @@ flowchart TD
     SR -->|"unstake() after unbonding"| Operator
     ClientStaker -->|"clientStake(amount)"| SR
     SR -->|"clientUnstake() (no unbonding)"| ClientStaker
-    Challenger -->|"submitChallenge()<br/>bond deposit"| SJ
-    SJ -->|"executeSlash()<br/>→ slash(node, offenseType)<br/>(amount computed internally)"| SR
-    SR -->|"50% of slash"| Challenger
+    Challenger -->|"submitPhantomChallenge() /<br/>submitRateChallenge() /<br/>submitBlacklistChallenge() /<br/>submitCorruptionChallenge()<br/>bond deposit"| SJ
+    SJ -->|"resolveChallenge()<br/>→ slash(node, offenseType)<br/>(amount computed internally)"| SR
+    SR -->|"50% of slash to msg.sender"| SJ
     SR -->|"50% of slash"| BURN
-    SJ -->|"bond return (successful slash)"| Challenger
+    SJ -->|"slash reward + bond return"| Challenger
     SJ -->|"bond forfeit: 50% burn, 50% to node"| BURN
 ```
 
@@ -210,7 +212,7 @@ flowchart TD
 | --- | --- | --- | --- |
 | StablePaymentChannel / PaymentChannel | USDC (PoC) / approved ERC-20s (production) | Client deposits | `settleChannel()`, `reclaimExpired()`, `forceCloseChannel()` |
 | StakingRegistry | TOKEN | Node operator stakes, client priority stakes | `unstake()` after unbonding (operators), `clientUnstake()` anytime (clients) |
-| SlashJudge | TOKEN | Challenger bond deposits | `executeSlash()` (return to challenger) or bond forfeiture |
+| SlashJudge | TOKEN | Challenger bond deposits | `resolveChallenge()` (slash reward + bond return to challenger) or bond forfeiture |
 | BuybackBurner | USDC (accumulated), TOKEN (transient) | Treasury transfers | `executeBuyback()` (production; accumulate-only in PoC) |
 | WatchtowerEscrow | USDC | Prepaid watchtower fees | Heartbeat-based payouts, reclaim on liveness failure |
 
@@ -277,7 +279,7 @@ Every state-mutating function that makes an external call is listed below with i
 | `unstake()` | `IERC20.safeTransfer()` (TOKEN) | `nonReentrant`, checks-effects-interactions |
 | `clientStake()` | `IERC20.safeTransferFrom()` (TOKEN) | `nonReentrant`, checks-effects-interactions |
 | `clientUnstake()` | `IERC20.safeTransfer()` (TOKEN) | `nonReentrant`, checks-effects-interactions |
-| `slash()` | `IERC20.safeTransfer()` (TOKEN, 50% to challenger), burn (50%) | `nonReentrant`, checks-effects-interactions, `SLASH_ROLE` |
+| `slash()` | `IERC20.safeTransfer()` (TOKEN, 50% to `msg.sender` i.e. SlashJudge), burn (50%) | `nonReentrant`, checks-effects-interactions, `SLASH_ROLE` |
 | `ejectNode()` | None (state change only) | `BLACKLIST_ROLE` |
 | `getStakeMultiple()` | None (read-only) | N/A |
 
@@ -285,8 +287,12 @@ Every state-mutating function that makes an external call is listed below with i
 
 | Function | External Calls | Guards |
 | --- | --- | --- |
-| `submitChallenge()` | `IERC20.safeTransferFrom()` (TOKEN bond deposit) | `nonReentrant`, checks-effects-interactions |
-| `executeSlash()` | `StakingRegistry.slash()`, `IERC20.safeTransfer()` (bond return) | `nonReentrant`, checks-effects-interactions |
+| `submitPhantomChallenge()` | `IERC20.safeTransferFrom()` (TOKEN bond deposit) | `nonReentrant`, checks-effects-interactions |
+| `submitRateChallenge()` | `IERC20.safeTransferFrom()` (TOKEN bond deposit) | `nonReentrant`, checks-effects-interactions |
+| `submitBlacklistChallenge()` | `IERC20.safeTransferFrom()` (TOKEN bond deposit), `ContentBlacklist.isBlacklisted()` (read) | `nonReentrant`, checks-effects-interactions |
+| `submitCorruptionChallenge()` | `IERC20.safeTransferFrom()` (TOKEN bond deposit) | `nonReentrant`, checks-effects-interactions |
+| `counterChallenge()` | `IERC20.safeTransfer()` (bond forfeit: 50% burn, 50% to node) | `nonReentrant`, checks-effects-interactions |
+| `resolveChallenge()` | `StakingRegistry.slash()`, `IERC20.safeTransfer()` (slash reward + bond return to challenger) | `nonReentrant`, checks-effects-interactions |
 
 #### BuybackBurner
 
@@ -295,6 +301,16 @@ Every state-mutating function that makes an external call is listed below with i
 | `executeBuyback()` | `UniswapV3Router.exactInputSingle()` (swaps contract-held USDC), `IERC20.safeTransfer()` (TOKEN to burn) | `nonReentrant`, checks-effects-interactions, `KEEPER_ROLE` |
 
 > **MEV protection (production).** Production `executeBuyback` SHOULD use a private mempool (e.g., Flashbots Protect on Arbitrum) or implement TWAP (time-weighted average price) execution that splits large buybacks across multiple blocks to mitigate sandwich attacks. The `maxBuybackAmount` parameter MUST be enforced to limit per-transaction MEV exposure.
+
+#### WatchtowerEscrow
+
+| Function | External Calls | Guards |
+| --- | --- | --- |
+| `depositFee()` | `IERC20.safeTransferFrom()` (USDC fee deposit) | `nonReentrant`, checks-effects-interactions |
+| `submitHeartbeat()` | None (state change only) | N/A |
+| `claimFees()` | `IERC20.safeTransfer()` (USDC to watchtower) | `nonReentrant`, checks-effects-interactions |
+| `reclaimOnLivenessFailure()` | `IERC20.safeTransfer()` (USDC to watched party) | `nonReentrant`, checks-effects-interactions |
+| Channel state reads | `StablePaymentChannel`/`PaymentChannel.getChannel()` (read-only) | N/A |
 
 #### Multi-Token Reentrancy Considerations
 

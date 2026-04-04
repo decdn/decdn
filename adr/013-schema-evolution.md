@@ -254,6 +254,8 @@ fn serialize_stream_request(base: &StreamRequestBase, ext: &StreamRequestExt) ->
 
 Messages without extensions (e.g., `VoucherAck`, `StreamEnd`, `ChunkData`) have no trailing bytes — the remainder from `take_from_bytes` is empty. The framing helpers (`read_frame`/`write_frame`) are agnostic to extensions; the two-phase logic lives in per-message-type application code.
 
+> **Variant-gated extension deserialization.** Extension deserialization MUST be gated by an exact variant match (as shown above: `ClientMessage::StreamRequest(_)`). Attempting to deserialize extension bytes for the wrong variant produces garbage or deserialization errors. Implementations MUST NOT attempt extension deserialization on a catch-all `_ =>` branch. A `HasExtensions` trait associating each variant with its extension type can enforce this at compile time.
+
 **Rules:**
 - New extension fields MUST be `Option<T>` or types with a meaningful `Default` impl. Non-optional fields cannot be added via minor evolution.
 - New extension fields MUST be appended to the end of the extensions struct. Field order within `*Ext` is frozen once released — insertions and reordering are major changes.
@@ -339,10 +341,14 @@ Fields covered by a cryptographic signature are frozen at the protocol version t
 
 | Message | Signed fields | Unsigned fields (evolvable via Tier 1) |
 | --- | --- | --- |
-| `ProbeResponse` | `hash`, `has_blob`, `rate_per_mb`, `timestamp_us` | `total_bytes` |
-| `StreamResponse` | `hash`, `ok`, `rate_per_mb`, `total_bytes`, `channel_id`, `timestamp_us`, `redirect` | `error`, `voucher_interval_mb` |
+| `ProbeResponse` | `hash`, `has_blob`, `rate_per_mb`, `timestamp_us` | `total_bytes`, `slash_sig` |
+| `StreamResponse` | `hash`, `ok`, `rate_per_mb`, `total_bytes`, `channel_id`, `timestamp_us`, `redirect` | `error`, `voucher_interval_mb`, `slash_sig` |
 | `NodeAnnounce` | `node_id`, `region`, `load`, `popular_hashes`, `timestamp_us` | *(none currently — see implementation note)* |
 | `ReputationReport` | `provider`, `reporter`, `metrics`, `timestamp` | *(none currently)* |
+
+> **Note on `slash_sig` placement.** `slash_sig` is listed as an unsigned field because it is itself a signature over the signed fields — it does not need to be covered by the Ed25519 `signature`. It is a base field (not an extension) because it is mandatory in the PoC ([ADR 014](014-on-chain-verification.md)); relaxing it to optional would be a Tier 1 change.
+>
+> **`DeliveryReceipt` (Tier 2 addition).** The `DeliveryReceipt` type ([ADR 014](014-on-chain-verification.md)) is a new EIP-712 signed message type exchanged post-stream. It is not a modification to existing `cdn/client/v1` wire messages — it is a new request/response pair (`DeliveryReceiptRequest` / `DeliveryReceipt`) that would be added as new enum variants in the `ClientMessage` enum (Tier 2 medium evolution). This can be added without an ALPN bump.
 
 **Implementation note — separating signed and unsigned fields.** For messages that are currently signed over all non-signature fields (e.g., `NodeAnnounce`), implementations SHOULD serialize signed fields into a dedicated inner struct (e.g., `NodeAnnounceBody`) and compute the signature over that struct's postcard bytes. Unsigned fields (added via minor evolution) live in the outer struct, outside the signed region:
 

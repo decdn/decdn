@@ -50,6 +50,10 @@ The app server accepts `cdn/keys/v1` connections from clients. A single connecti
 - **Play request** (`PlayRequest`/`PlayResponse` variants, short-lived, request-response) — client sends `{blob_hash}`, server responds with `{wrapped, epoch_id, blob_hash}`. The client's subscription is already authenticated on the epoch key stream.
 - **Offline lease request** (`OfflineLeaseRequest`/`OfflineLeaseResponse` variants, short-lived, request-response) — client sends `{track_hashes[], device_id}`, server responds with the lease structure (see [Offline Playback](#offline-playback-lease-based-access)).
 
+> **Epoch key caching scope.** Clients SHOULD cache the current epoch key only for the duration of in-flight content requests. Once all active streams for a given epoch complete, the client SHOULD discard the epoch key from memory to limit the exposure window if the client process is memory-dumped. Clients MUST NOT persist epoch keys to disk.
+>
+> **Play request rate limiting.** The app server SHOULD enforce a per-session rate limit on `PlayRequest` messages (recommended: 10 requests per second per authenticated session). Without rate limiting, a compromised or malicious client could enumerate the content catalog by rapidly issuing play requests for sequential blob hashes, undermining the per-blob access control design. The rate limit is enforced at the app server, not in the CDN protocol.
+
 The QUIC handshake mutually authenticates the client's iroh NodeId and encrypts the channel (TLS 1.3). The session token on the epoch key stream binds the iroh identity to the provider's subscriber account.
 
 **Authentication sequencing:** The client MUST establish an authenticated epoch key stream (`EpochKeyAuth`) before opening play request or offline lease streams. The app server MUST reject play/lease streams (`PlayRequest`, `OfflineLeaseRequest`) on connections that do not have an active, authenticated epoch key stream — responding with an error and closing the stream. This ensures that every play/lease request is implicitly bound to a verified subscriber session.

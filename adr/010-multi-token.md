@@ -87,6 +87,8 @@ event ChannelForceClosedByTokenRemoval(
 
 The force-close sets `claimedAmount = 0` and `claimedNonce = 0` (no voucher submitted, matching the zero-voucher close semantics in [ADR 003](003-payments.md)) and enters the standard Closing→dispute→settle flow. If the provider holds a valid voucher, they can call `disputeChannel` during the dispute window to claim earned fees — any real voucher (nonce >= 1) satisfies the strictly-higher-nonce requirement against `claimedNonce = 0`. If nobody disputes, `settleChannel` returns the full deposit to the client. This preserves fairness: providers get the same dispute opportunity as a normal close.
 
+> **Watchtower event compatibility.** `forceCloseChannel` emits `ChannelForceClosedByTokenRemoval` but does NOT emit `ChannelCloseInitiated`. Watchtower implementations ([ADR 007](007-watchtower.md)) that monitor only `ChannelCloseInitiated` will miss force-closes. Watchtowers MUST monitor both `ChannelCloseInitiated` and `ChannelForceClosedByTokenRemoval` event types to ensure complete coverage. The dual-event monitoring approach preserves event semantics (the close reason is unambiguous) while ensuring no channel closure is missed.
+
 **`openChannel` accepts governance-approved ERC-20s:**
 
 ```solidity
@@ -219,6 +221,8 @@ token_rates: Vec<(Address, u64)>,   // rate in that token's base units per MB
 ```
 
 Nodes that accept only USDC may also include the `rate_per_mb: Option<u64>` field for simplicity; nodes accepting multiple tokens use `token_rates` exclusively.
+
+> **Schema evolution tier.** The `rate_per_mb` → `token_rates` field change is a **Tier 2 (medium)** evolution per [ADR 013](013-schema-evolution.md): it adds `token_rates` as a new field alongside the existing `rate_per_mb`, which is retained for backward compatibility. Nodes accepting only USDC may continue using the single `rate_per_mb` field. This is NOT a Tier 1 (minor) change because `token_rates` introduces a structurally different type (`Vec<(Address, u64)>`) rather than appending an `Option<T>` field.
 
 ### Probe and Stream Responses
 

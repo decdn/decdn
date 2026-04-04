@@ -51,7 +51,7 @@ struct NodeAnnounce {
     node_id: NodeId,
     region: String,              // ISO 3166-1 alpha-2 (self-reported)
     load: LoadHint,              // approximate current utilization
-    popular_hashes: Vec<Hash>,   // top-N most-requested hashes (max 20, unique)
+    popular_hashes: Vec<Hash>,   // top-N most-requested hashes (max 20, unique); see ADR 017 P-01 for privacy analysis and recommended cardinality reduction to 5
     timestamp_us: u64,           // microseconds since epoch
     signature: Signature,        // node's iroh key signs all fields above
 }
@@ -88,6 +88,9 @@ Content discovery is on-demand via the existing `cdn/probe/v1` protocol. When a 
 
 1. **Probe cache check.** Look up `hash` in a short-lived LRU cache (`hash → Vec<(NodeId, rate_per_mb, rtt, ProbeResponse)>`, TTL 15 seconds, max 1024 entries). Each hash entry retains at most 10 responses (the top 10 by selection score), bounding memory at production scale. Each entry retains the full signed `ProbeResponse` for slashing evidence. Approximate memory bound: 1,024 entries × 10 responses × ~200 bytes ≈ 2 MB. If a valid entry exists, skip to step 4.
 2. **Fan-out.** Send `ProbeRequest {hash, timestamp_us}` in parallel to all known nodes (regional + global). The ALPN remains `cdn/probe/v1` — `ProbeResponse {has_blob, rate_per_mb, timestamp_us, signature, total_bytes?, slash_sig}`.
+
+   > **Selective fan-out (future).** At >100 known peers, full fan-out becomes bandwidth-intensive (~100+ concurrent QUIC streams per cache miss). Implementations SHOULD adopt a selective strategy: probe regional peers first, then a random sample of K global peers (e.g., K=50) if no regional `has_blob: true` responses arrive within `probe_min_wait`. This is not required for the PoC (tens of nodes) but bridges the gap between PoC and the DHT-based discovery planned for 1,000+ nodes.
+
 3. **Collect.** Wait for probe responses in two phases:
    - **Phase 1 — Minimum wait** (`probe_min_wait`, default 50ms): Always wait at least this long to collect responses from nearby nodes, ensuring multiple candidates compete rather than always selecting the single fastest responder.
    - **Phase 2 — Extended wait with optional early exit** (`probe_max_wait`, default 500ms): After `probe_min_wait`, continue waiting for additional responses, but exit early when **both** conditions are met: (a) at least `min_probe_responses` (default: 3) `has_blob: true` responses have been received, and (b) the best selection score among collected responses is below `early_exit_score_threshold` (default: `1.5 × rolling_median_score`). The rolling median is computed from the node's last 100 successful pull scores (bounded circular buffer, seeded with `0` so early exit is disabled until the node has enough history — since all real scores are positive, no score can be below `1.5 × 0 = 0`). If the early-exit condition is not met, wait up to `probe_max_wait` (500ms). The 500ms ceiling accommodates inter-continental RTTs (e.g., London↔Sydney ~250-300ms) to avoid creating geographical bottlenecks where only nearby nodes are ever selected.

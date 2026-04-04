@@ -54,6 +54,8 @@ struct RateChange {
 }
 ```
 
+**`slash_sig` importance.** Nodes SHOULD always include a valid `slash_sig` in `RateChange` messages. A `RateChange` without `slash_sig` cannot serve as counter-evidence in a rate manipulation challenge ([ADR 014](014-on-chain-verification.md#rate-manipulation-counter-evidence)) — the node would have no on-chain defense against a legitimate rate-change being mischaracterized as rate manipulation. Omitting `slash_sig` from `RateChange` is not a protocol violation, but it is a self-harming omission.
+
 Peers store the latest `RateChange` per `node_id` in their peer table alongside `NodeAnnounce` state. Peers SHOULD reject `RateChange` messages whose `effective_at_us` is more than 60 seconds in the past relative to the peer's local clock. This limits how far back a node can backdate a fabricated `RateChange` and reduces propagation of stale messages through the gossip network, but does not eliminate the timeliness limitation described below.
 
 `RateChange` messages are event-driven (not periodic like `NodeAnnounce`). Operators change rates infrequently — typically daily or weekly. Bandwidth impact is negligible; see [ADR 001, Gossip Bandwidth Analysis](001-network.md#gossip-bandwidth-analysis).
@@ -135,6 +137,14 @@ sequenceDiagram
         Note over P: Connect to redirect NodeId and retry<br/>(max 3 hops, cycle detection)
     end
 ```
+
+**Message semantics:**
+
+- **`ChunkData`**: Contains a contiguous slice of blob bytes starting from the current stream position. Chunks are 1024 bytes (matching the iroh-blobs BLAKE3 hash tree leaf size), except for the final chunk which may be shorter. Chunks are delivered in order; QUIC guarantees in-order delivery per stream. The delivering node MUST NOT reorder or skip chunks within a stream. BLAKE3 incremental verification is performed at 1024-byte chunk boundaries using iroh-blobs' tree-hash mechanism.
+
+- **`VoucherAck`**: Sent by the delivering node after validating a received `Voucher` signature and updating its local voucher state. Contains no payload — it is a simple confirmation. If `VoucherAck` is not received within a reasonable timeout (implementation-defined, recommended 5 seconds), the payer MAY resend the same voucher (idempotent — same nonce). A node that rejects a voucher (invalid signature, unexpected nonce) does not send `VoucherAck` — instead, the self-enforcing protocol handles this implicitly by pausing delivery until a valid voucher is received.
+
+- **`StreamEnd`**: Sent by the **delivering node** after transmitting the final `ChunkData` for the blob. Indicates the stream is complete. The payer confirms by sending a final cumulative voucher covering all delivered bytes. Early termination by the payer is expressed by closing the QUIC stream (FIN), not by sending `StreamEnd`. `StreamEnd` is an unsigned, informational wire message — it cannot serve as on-chain evidence (see [ADR 014](014-on-chain-verification.md) for the signed `DeliveryReceipt` used instead). The requester's local BLAKE3 verification of the complete blob is the authoritative completion signal.
 
 **Client identity binding.** For clients using ephemeral (off-chain) NodeId-to-Ethereum-address bindings (see [ADR 003 — Off-Chain Ephemeral Binding](003-payments.md#off-chain-ephemeral-binding-for-clients)), the binding is conveyed via optional fields in `StreamRequest`:
 
