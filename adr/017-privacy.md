@@ -51,6 +51,8 @@ Each row identifies a discrete data exposure. The **ID** column is used for back
 | P-19 | Offline lease blast radius | Up to 500 `K_blob` values extractable from a compromised device's sealed lease | T4 | [006](006-e2e-encryption.md) §Offline Leases |
 | P-20 | No forward secrecy for epoch keys | Compromising `server_secret` retroactively exposes all past and future epoch keys until rotation | T4 | [006](006-e2e-encryption.md) §Consequences |
 | P-21 | Permanent client NodeId | Ed25519 identity is persistent across sessions; all content requests are correlatable under one identity | T2 | [012](012-client.md) §iroh Identity Key |
+| P-22 | On-chain settlement volume leakage | Voucher nonce and cumulative amount at `settleChannel` reveal per-channel delivery volume; nonce spacing reveals session granularity | T1 | [003](003-payments.md) §settleChannel |
+| P-23 | `slash_sig` as content inventory proof | A node's `slash_sig` on `ProbeResponse` with `has_blob: true` constitutes non-repudiable cryptographic proof that the node held specific content at a specific time; accumulated signatures build a verifiable content inventory | T2 | [014](014-on-chain-verification.md) §slash_sig |
 
 ### 3. Analysis by Adversary Tier
 
@@ -61,6 +63,8 @@ A passive observer sees gossip messages, on-chain state, and QUIC connection met
 **Content demand patterns (P-01, P-06, P-08).** `popular_hashes` in `NodeAnnounce` is the most explicit content-interest signal: it broadcasts the top-20 most-requested hashes per node at the default interval of 60 seconds to all peers. Combined with `RateChange` events (which signal pricing adjustments that may correlate with demand shifts) and the deterministic nature of BLAKE3 hashes, a passive observer can build a per-node demand profile over time. This is a deliberate design choice — `popular_hashes` feeds the prefetching system ([ADR 001](001-network.md) §Prefetch Triggers) and cannot be removed without losing that capability.
 
 **Payment and identity linkability (P-02, P-03, P-07, P-14).** On-chain data permanently links client Ethereum addresses to provider Ethereum addresses via payment channels. Settlement amounts make node revenue computable. The `StakingRegistry` publishes node identity and network location. Reporter credibility in the reputation system leaks a node's settlement history. These are inherent to the accountability model: staking, slashing, and dispute resolution require on-chain identities and state. For the PoC (testnet with no real economic value), this is acceptable.
+
+**Settlement volume leakage (P-22).** When a channel is settled on-chain, the final voucher nonce and cumulative amount are publicly visible. Since vouchers are issued per MB (default cadence), the nonce directly reveals the number of MB-sized increments transferred on that channel. Combined with P-02 (client/provider address linkage) and publicly known rate information, an observer can compute the exact volume of data transferred between a specific client-provider pair. This is inherent to the on-chain dispute model — the settlement amount must be public for dispute resolution to work.
 
 **Protocol fingerprinting (P-04).** ALPN negotiation in the QUIC TLS ClientHello reveals whether a connection is a probe, a paid stream, a watchtower interaction, or a key delivery session. A network-level observer can classify connections by type. This is standard for any QUIC-based multi-protocol system and is not considered a significant privacy concern — the protocols are not secret.
 
@@ -73,6 +77,8 @@ An active participant can probe nodes, join gossip topics, and observe responses
 **Probe content leakage (P-09, P-10, P-11).** When a client probes peers for a content hash, all probed nodes learn what is being requested. Probes triggered by cache misses are visible to the entire fan-out set, revealing regionally uncommon or newly requested content. The 15-second probe cache creates a tight timing correlation between probe and subsequent `StreamRequest`. However, probes are explicitly public information ([ADR 005](005-protocol.md)): node identities are in a public registry, content availability is discoverable via probing, and pricing is revealed by design. The protocol fundamentally requires the delivering node to know the requested hash. Mitigating leakage to non-delivering nodes (e.g., via dummy probes) adds bandwidth cost without changing the fundamental property.
 
 **Network enumeration (P-12, P-13).** Regional gossip topics are enumerable, and joining them reveals all participating nodes' identities and self-reported regions. Combined with `multiaddrs` from the on-chain registry, this enables geolocation. This is inherent to any system where nodes must be discoverable to serve content.
+
+**`slash_sig` as content inventory proof (P-23).** Every `ProbeResponse` carries a `slash_sig` — an EIP-712 secp256k1 signature binding the node's Ethereum address to specific content hashes and timestamps ([ADR 014](014-on-chain-verification.md)). Any T2 participant that probes a node collects a non-repudiable, cryptographically verifiable proof that the node committed to having (or not having) specific content at a specific time. This is stronger than the unsigned `popular_hashes` signal (P-01) — it is individually attributable and EVM-verifiable. A party systematically probing nodes could build a cryptographic content inventory per node, keyed by Ethereum address. This is an inherent consequence of the on-chain slashing design: the `slash_sig` exists precisely to make node commitments provable. Removing it would eliminate on-chain slashability.
 
 **Cross-session client tracking (P-21).** A persistent client NodeId allows any node that has served the client to correlate all past and future requests. Payment channels are keyed by Ethereum address ([ADR 012](012-client.md)), not NodeId, so NodeId rotation would not break the payment model. This is the most actionable privacy improvement with the lowest implementation cost.
 
@@ -123,6 +129,8 @@ Endpoint compromise yields secrets specific to that endpoint.
 | P-19 | Offline lease blast radius | Accept | Industry-standard tradeoff; operational mitigations in [ADR 006](006-e2e-encryption.md) | — |
 | P-20 | No epoch key forward secrecy | Mitigate | HSM-backed derivation and rotation already specified in [ADR 006](006-e2e-encryption.md) | Pre-mainnet |
 | P-21 | Permanent client NodeId | Mitigate | Breaks cross-session linkability at low cost | Pre-mainnet |
+| P-22 | Settlement volume leakage | Accept | Inherent to on-chain settlement; settlement amount must be public for dispute resolution | — |
+| P-23 | `slash_sig` content inventory | Accept | Required for on-chain accountability; removing `slash_sig` eliminates slashability | — |
 
 ### 5. Candidate Mitigations
 
@@ -132,7 +140,7 @@ Endpoint compromise yields secrets specific to that endpoint.
 
 **Proposal:** Periodic rotation (configurable interval, e.g., every N connections or every T minutes). The client generates a new Ed25519 key, reconnects, and discards the old key. Payment channels are keyed by Ethereum address ([ADR 012](012-client.md)), so rotation does not affect open channels. The Ethereum key (and associated on-chain identity) remains stable — NodeId rotation breaks correlation at the transport layer only.
 
-**Limitation:** A T1 adversary correlating the Ethereum address across channels can still link sessions. NodeId rotation mitigates T2 adversaries (node operators) who see the NodeId in QUIC connections but may not know the client's Ethereum address.
+**Limitation:** A T1 adversary correlating the Ethereum address across channels can still link sessions. A T2 adversary (node operator) that serves the client learns the Ethereum address via the `ethereum_address` field in `StreamRequest` ([ADR 005](005-protocol.md)), so NodeId rotation does NOT prevent a serving node from linking sessions. NodeId rotation primarily mitigates correlation by non-serving T2 participants (nodes that receive probes but are not selected for delivery) and T1 passive observers who see QUIC connection metadata but not `StreamRequest` contents (which are encrypted by TLS).
 
 **Effort:** Low. Key generation is cheap, no protocol message changes needed, no on-chain interaction.
 

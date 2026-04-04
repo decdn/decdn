@@ -43,11 +43,15 @@ interface IContentBlacklist {
     // Emergency multisig path (3-of-5, no timelock) — hash and origin
     // Subject to 12-month sunset: blacklistDeadline = deployTimestamp + 365 days
     // (see ADR 009, Emergency Multisig)
-    function emergencyAdd(bytes32 blake3Hash, string calldata reason) external;
-    function emergencyAddOrigin(address operatorAddress, string calldata reason) external;
+    // Category determines emergency entry expiry:
+    //   GENERAL — 14-day auto-expiry (default)
+    //   CSAM, TERRORIST — 90-day auto-expiry (severe content must not be re-exposed due to governance latency)
+    // enum Category { GENERAL, CSAM, TERRORIST }
+    function emergencyAdd(bytes32 blake3Hash, uint8 category, string calldata reason) external;
+    function emergencyAddOrigin(address operatorAddress, uint8 category, string calldata reason) external;
 
-    // Emergency entries expire after 14 days unless ratified by governance.
-    // Expiry is derived from the entry's addedAt timestamp: addedAt + 14 days.
+    // Emergency entries expire after their category-specific deadline unless ratified by governance.
+    // Expiry is derived from the entry's addedAt timestamp: addedAt + expiryForCategory(category).
     // isBlacklisted returns false after this deadline unless a governance addHash
     // has been called for the same hash.
 

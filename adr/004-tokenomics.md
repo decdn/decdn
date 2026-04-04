@@ -282,6 +282,8 @@ At any reasonable TOKEN price, these amounts are a tiny fraction of the 200M TOK
 
 At a TOKEN price of $0.01 (conservative early production), the 200M TOKEN bootstrap fund is worth $2M — sufficient to cover the early production phase (~$420K) with margin. At $0.001/TOKEN, the fund is worth $200K — marginal. **The bootstrap fund's adequacy is directly tied to TOKEN price**, which creates a reflexive dependency: if the network fails to attract traffic, TOKEN price drops, the fund buys less subsidy, and nodes leave. This chicken-and-egg dynamic is the primary economic risk and should be monitored as the network scales.
 
+**Circuit-breaker trigger.** If the bootstrap fund's USD-equivalent value drops below 2× the projected 12-month subsidy requirement (computed as `active_nodes × monthly_shortfall × 12`), governance SHOULD trigger a subsidy reduction playbook: (1) reduce per-node subsidies to extend the fund's runway, (2) prioritize subsidies for nodes with the highest delivery volume (reward productive nodes, not idle stake), (3) publish a transparent fund status report to the community. The 2× threshold provides a 12-month buffer before the fund is exhausted. This trigger is a governance policy recommendation, not an on-chain mechanism — monitoring is off-chain via treasury balance tracking.
+
 ### Gas Cost Breakdown (Arbitrum)
 
 | Operation | Estimated Gas | Cost at $0.05/tx |
