@@ -58,7 +58,7 @@ Each row identifies a discrete data exposure. The **ID** column is used for back
 
 A passive observer sees gossip messages, on-chain state, and QUIC connection metadata. The key concern is whether aggregating these signals reveals more than any single signal.
 
-**Content demand patterns (P-01, P-06, P-08).** `popular_hashes` in `NodeAnnounce` is the most explicit content-interest signal: it broadcasts the top-20 most-requested hashes per node every 60 seconds to all peers. Combined with `RateChange` events (which signal pricing adjustments that may correlate with demand shifts) and the deterministic nature of BLAKE3 hashes, a passive observer can build a per-node demand profile over time. This is a deliberate design choice — `popular_hashes` feeds the prefetching system ([ADR 001](001-network.md) §Prefetch Triggers) and cannot be removed without losing that capability.
+**Content demand patterns (P-01, P-06, P-08).** `popular_hashes` in `NodeAnnounce` is the most explicit content-interest signal: it broadcasts the top-20 most-requested hashes per node at the default interval of 60 seconds to all peers. Combined with `RateChange` events (which signal pricing adjustments that may correlate with demand shifts) and the deterministic nature of BLAKE3 hashes, a passive observer can build a per-node demand profile over time. This is a deliberate design choice — `popular_hashes` feeds the prefetching system ([ADR 001](001-network.md) §Prefetch Triggers) and cannot be removed without losing that capability.
 
 **Payment and identity linkability (P-02, P-03, P-07, P-14).** On-chain data permanently links client Ethereum addresses to provider Ethereum addresses via payment channels. Settlement amounts make node revenue computable. The `StakingRegistry` publishes node identity and network location. Reporter credibility in the reputation system leaks a node's settlement history. These are inherent to the accountability model: staking, slashing, and dispute resolution require on-chain identities and state. For the PoC (testnet with no real economic value), this is acceptable.
 
@@ -143,7 +143,7 @@ Endpoint compromise yields secrets specific to that endpoint.
 - **(b) Add Laplacian noise** (differential privacy). Insert random hashes alongside real ones. Preserves cardinality but degrades prefetch accuracy.
 - **(c) Remove entirely.** Not viable — breaks the network popularity signal for prefetching.
 
-**Recommendation:** Option (a) — reduce to 5. The prefetch threshold of 3+ peers is still achievable with top-5 lists across a network of tens or hundreds of nodes, and the demand signal is 75% smaller.
+**Recommendation:** Option (a) — reduce to 5. The default prefetch threshold of 3+ peers is still achievable with top-5 lists across a network of tens or hundreds of nodes, and the demand signal is 75% smaller.
 
 **Effort:** Low. Change the cap constant and update gossip validation.
 
