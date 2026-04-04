@@ -55,7 +55,13 @@ bytes32 constant PROBE_RESPONSE_TYPEHASH = keccak256(
 bytes32 constant STREAM_RESPONSE_TYPEHASH = keccak256(
     "StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 totalBytes,bytes32 channelId,uint64 timestampUs,bytes32 redirect)"
 );
+
+bytes32 constant RATE_CHANGE_TYPEHASH = keccak256(
+    "RateChange(bytes32 nodeId,uint64 oldRatePerMb,uint64 newRatePerMb,uint64 effectiveAtUs)"
+);
 ```
+
+The `RATE_CHANGE_TYPEHASH` is used for counter-evidence in rate manipulation challenges — see [Rate manipulation counter-evidence](#rate-manipulation-counter-evidence) below.
 
 The `SlashJudge` contract uses its own EIP-712 domain separator, not shared with `StakingRegistry` or `StablePaymentChannel`. This prevents cross-contract signature replay.
 
@@ -235,6 +241,20 @@ interface ISlashJudge {
 4. Verify `streamResponse.rate_per_mb > probeResponse.rate_per_mb`
 5. Verify `probeResponse.hash == streamResponse.hash` (same blob)
 6–8. Same timestamp and registration checks as phantom
+9. Store challenge; start 24-hour counter-evidence window
+
+##### Rate manipulation counter-evidence
+
+The challenged node may call `counterChallenge(challengeId, evidence)` within 24 hours, where `evidence` is the ABI-encoded `RateChange` fields plus `slash_sig`. The contract verifies:
+
+1. `ecrecover(rateChangeData, rateChangeSlashSig)` recovers the same address as the challenged node
+2. `rateChange.effective_at_us >= probeResponse.timestamp_us` — the rate change happened after the probe
+3. `rateChange.effective_at_us <= streamResponse.timestamp_us` — the rate change was effective before or at the stream response
+4. `rateChange.new_rate_per_mb == streamResponse.rate_per_mb` — the new rate matches what the node charged
+
+If all four conditions pass, the challenge is dismissed and the challenger's bond is forfeited (50% burned, 50% to node). If the 24-hour window expires without valid counter-evidence, the slash executes via `StakingRegistry.slash()`.
+
+See [ADR 005, Gossip — rate change announcements](005-protocol.md#gossip--rate-change-announcements) for the `RateChange` gossip message that produces this counter-evidence.
 
 **Blacklist violation:**
 1. `ecrecover(responseData, slashSig)` → address
@@ -256,18 +276,19 @@ interface ISlashJudge {
 - Challengers must `TOKEN.approve(slashJudge, bondAmount)` before calling any `submit*Challenge()` function. The contract transfers the bond on submission.
 - **Successful challenge:** bond returned to challenger; node slashed via `StakingRegistry.slash()`.
 - **Successful counter:** bond forfeited — 50% burned, 50% transferred to the challenged node ([ADR 004](004-tokenomics.md#challenge-bond)).
-- **Immediate offenses** (phantom, rate, blacklist): if on-chain verification passes, the slash executes immediately (no counter-evidence window). The node's recourse is to not commit the offense.
-- **Deferred offenses** (corruption): 24-hour counter-evidence window before resolution.
+- **Immediate offenses** (phantom, blacklist): if on-chain verification passes, the slash executes immediately (no counter-evidence window). The node's recourse is to not commit the offense.
+- **Deferred offenses** (corruption, rate manipulation): 24-hour counter-evidence window before resolution. For rate manipulation, the node may submit a signed `RateChange` message proving a legitimate rate change between the two timestamps (see [Rate manipulation counter-evidence](#rate-manipulation-counter-evidence)). For corruption, the node may submit a valid delivery receipt.
 
 #### Gas Estimates
 
 | Operation | Estimated Gas | Notes |
 | --- | --- | --- |
 | `submitPhantomChallenge` | ~60k | 2× `ecrecover` (6k) + calldata + storage + bond transfer |
-| `submitRateChallenge` | ~60k | Same as phantom |
+| `submitRateChallenge` | ~60k | Same as phantom; creates pending challenge with 24-hour counter window |
 | `submitBlacklistChallenge` | ~50k | 1× `ecrecover` (3k) + `ContentBlacklist` lookup + bond transfer |
 | `submitCorruptionChallenge` | ~50k | 1× `ecrecover` (3k) + storage for challenge state + bond transfer |
-| `counterChallenge` | ~40k | Evidence verification + storage update |
+| `counterChallenge` (rate) | ~40k | 1× `ecrecover` (3k) + timestamp range check + rate match + storage update |
+| `counterChallenge` (corruption) | ~40k | Evidence verification + storage update |
 | `resolveChallenge` | ~80k | `StakingRegistry.slash()` + bond transfer + state cleanup |
 
 These estimates replace the `submitFraudProof()` placeholder (~250k gas) in [ADR 004](004-tokenomics.md#gas-cost-breakdown-arbitrum). The dual-key approach reduces per-signature verification from ~500k (Ed25519 library) to ~3k (`ecrecover`), making routine slashing economically viable.
