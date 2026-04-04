@@ -126,7 +126,8 @@ The Verein holds the TOKEN treasury post-TGE after the GmbH transfers sale proce
 | Board member | Founder 2 | Technical oversight, treasury co-signer |
 | Domicile representative | Law firm or trust company | Registered address, Swiss-domiciled signatory (if registered) |
 | AML officer | Outsourced or board member | KYC process, suspicious activity reporting |
-| Legal counsel | Swiss crypto law firm (MME, Lenz & Staehelin, Wenger Vieli) | Formation, FINMA inquiry, ongoing |
+| Legal counsel (Swiss) | Swiss crypto law firm (MME, Lenz & Staehelin, Wenger Vieli) | Formation, FINMA inquiry, ongoing |
+| Legal counsel (US securities) | US token securities specialist (Cooley/Fenwick/Latham token teams, Anderson Kill, DLx Law, Lewis Rice) | SAFT drafting, Form D + blue-sky filings, Reg S/Reg D compliance, transfer-restriction review. Engaged by GmbH at formation, not by Labs. |
 
 ### Costs
 
@@ -249,12 +250,41 @@ Purpose-built as a single-purpose vehicle for token issuance. Isolates token sal
 2. SRO membership application
 3. FINMA no-action inquiry filed by GmbH
 4. KYC infrastructure set up (identity verification for buyers)
-5. Public sale via launchpad or directly, US persons excluded or Reg D only
-6. Listing: DEX immediately, CEX after sufficient liquidity
+5. Public sale via launchpad or directly, under a **Reg S + Reg D 506(c) dual-track structure** (see "US Market Access" below)
+6. Listing: DEX immediately, non-US CEX after sufficient liquidity (US CEX listings deferred — see "US Market Access")
 7. Sale proceeds transferred to Verein treasury
 8. GmbH goes dormant or is dissolved
 
-TOKEN classifies as utility under FINMA guidelines because it has functional utility at launch: staking, governance voting, and fee discounts.
+TOKEN classifies as utility under FINMA guidelines because it has functional utility at launch: staking, governance voting, and fee discounts. **Note:** FINMA utility classification has no bearing on US securities law analysis, which applies the *Howey* test independently. The GmbH must plan for US securities compliance as a separate workstream — see next section.
+
+### US Market Access (Reg S + Reg D 506(c))
+
+Since *SEC v. Telegram* (2020) and *SEC v. Kik* (2020), the SEC has consistently treated primary token sales to US persons as securities offerings under *Howey*, regardless of utility framing. A public ICO to US retail is not viable without S-1 registration (prohibitive) or Reg A+ Tier 2 qualification (6-12 month SEC process, audited financials, ongoing reporting — deferred unless retail access becomes strategic).
+
+The GmbH runs a **dual-track primary sale** to reach US capital legally while preserving a permissionless global offering:
+
+| Track | Buyers | Instrument | Cap | Resale restriction |
+|---|---|---|---|---|
+| **Reg S** | Non-US persons only | TOKEN (direct sale at TGE) | Unlimited | Distribution compliance period (typically 40 days – 1 year depending on category) |
+| **Reg D 506(c)** | US accredited investors, verified | SAFT pre-TGE → TOKEN at TGE | Unlimited | 1-year Rule 144 lockup from delivery |
+
+**Why SAFTs for the US tranche:** The Simple Agreement for Future Tokens is the standard instrument for pre-TGE US accredited sales. It is a security at signing (purchase contract), delivers TOKEN at TGE, and keeps the securities analysis confined to the pre-TGE investor group. Post-lockup secondary trading of TOKEN itself is a separate analysis — by then the project argues TOKEN has matured into a functional utility network (the *Hinman* "sufficient decentralization" argument, weakened but not dead).
+
+**Requirements for the GmbH:**
+
+1. **Accreditation verification** — third-party vendor (VerifyInvestor, Parallel Markets, or CPA/attorney letter). Self-certification is not sufficient under 506(c).
+2. **Form D filing** — filed with the SEC within 15 days of first US sale. State blue-sky notice filings in each state where a US purchaser resides (typically $100-500 per state).
+3. **Geoblocking for the Reg S tranche** — IP-based blocking of US visitors, KYC rejection of US documents, purchase-page attestation. Sham geoblocks have been pierced by courts (*SEC v. LBRY*) — the block must be genuine.
+4. **Transfer restrictions during lockup** — token contract or distribution wrapper must enforce the 1-year US lockup. Options: (a) legended SAFTs that deliver to a KYC'd allowlist contract for the lockup period, (b) vesting contract with US-address flags, (c) off-chain contractual covenant with economic penalties. Option (a) is cleanest.
+5. **No general solicitation into the Reg S tranche from the US** — marketing channels must be segregated or carry clear geographic disclaimers.
+
+**What Labs must NOT do:** Labs (Delaware C-Corp) must not conduct, market, or take payment for any token sale. Labs may receive its ADR 004 TOKEN allocation as compensation for services under the existing grant agreement, but any involvement in the primary sale flow collapses the GmbH SPV shield, destroys the Reg S position (the offering becomes US-originated), and gives the SEC maximum jurisdiction. All sale marketing, KYC, payment processing, and token distribution must flow through the GmbH.
+
+**Airdrops:** Airdrops to US wallets are not a loophole. The SEC's 2024 enforcement posture (Wells notices to multiple projects) treats marketing-driven airdrops as unregistered offerings when recipients take actions of value (signup, staking, referral). Any retroactive or promotional airdrop program must exclude US addresses by the same mechanisms as the Reg S tranche, or be analyzed separately by US counsel.
+
+**Secondary market:** Post-lockup, the GmbH's responsibility ends. US CEX listings (Coinbase, Kraken) require those venues' own securities review and are unlikely pre-maturity — plan for non-US CEXes (KuCoin, OKX, Bybit, Gate) and DEX-only US access for the first 12-24 months post-TGE. The GmbH should not list on or actively facilitate US CEX access during the lockup.
+
+**US securities counsel:** A US token securities specialist must be engaged alongside Swiss counsel. Swiss counsel cannot opine on US securities law, and US startup counsel (Labs' firm) is generally not the right fit — token-specific securities work lives with specialists. Candidates: Cooley / Fenwick / Latham token teams, Anderson Kill, DLx Law, Lewis Rice, Morrison Cohen. Budget **$40-80K** for SAFT templates, Form D + blue-sky filings, transfer-restriction review, and issuance opinion.
 
 ### Lifecycle
 
@@ -367,8 +397,8 @@ TOKEN classifies as utility under FINMA guidelines because it has functional uti
 
 | Activity | KYC Required? | Who Handles It? |
 |----------|--------------|-----------------|
-| Public token sale | Yes | GmbH SPV via SRO membership or licensed launchpad |
-| Private/seed round (TOKEN) | Yes (accredited investor checks) | GmbH SPV + legal counsel |
+| Public token sale (Reg S, non-US) | Yes | GmbH SPV via SRO membership or licensed launchpad; US persons blocked at IP, KYC, and attestation |
+| Private/seed round (SAFT, US accredited) | Yes (Rule 506(c) third-party accreditation verification) | GmbH SPV + US securities counsel; Form D filed within 15 days of first sale |
 | Equity round (C-Corp) | Standard investor verification | Labs + VC's own compliance |
 | Verein legal membership | Yes (small group, trivial) | Verein board |
 | DAO governance voting | No | N/A — permissionless, Pattern A |
@@ -459,7 +489,9 @@ Token                                                                 xxx> launc
 | GmbH SRO membership | CHF 2-5K |
 | FINMA no-action inquiry (legal + FINMA admin fees) | CHF 7-15K |
 | GmbH KYC infrastructure | CHF 3-5K |
-| **Additional TGE-year cost** | **~CHF 37-55K** |
+| US securities counsel (SAFT, Form D, blue-sky, opinion) | $40-80K |
+| Accreditation verification vendor (per-investor fees) | $2-10K (volume-dependent) |
+| **Additional TGE-year cost** | **~CHF 37-55K + ~$42-90K** |
 
 **Annual (Year 2+, post-TGE):**
 
@@ -500,6 +532,24 @@ Note: GmbH share capital (CHF 20K) is recoverable if the GmbH is dissolved after
 - UAE/ADGM: newer framework (2023), growing credibility, good banking, purpose-built for DAOs
 - Would require three jurisdictions (DAO LLC + Swiss GmbH for token + Delaware C-Corp) — more complexity
 - Rejected in favor of Pattern A legal fiction with Swiss Verein: simpler two-jurisdiction structure (Switzerland + Delaware), industry-standard approach, upgrade path to Pattern B if needed
+
+### Reg A+ Tier 2 for US Retail Token Sale
+- Only exemption that reaches US non-accredited retail (up to $75M/yr)
+- Precedents: INX (2020), Exodus (2021) — both took 12+ months for SEC qualification
+- Requires audited financials, ongoing reporting (semi-annual + material event), SEC qualification process
+- Cost: $500K-1M+ in legal, audit, and filing fees before first dollar raised
+- Rejected for initial TGE: disproportionate cost and timeline for a protocol launch. Revisit if US retail access becomes strategic post-maturity.
+
+### Full S-1 Registration of TOKEN
+- Only path to unrestricted US public offering
+- No crypto project has completed this; treated as prohibitive by every practitioner
+- Rejected: not a realistic option in 2026.
+
+### Skip US Entirely (Reg S Only)
+- Simplest compliance posture — geoblock US, no Reg D, no Form D, no US counsel
+- Forgoes US accredited capital (a meaningful fraction of crypto-native LPs and funds are US-domiciled)
+- US funds can still participate via non-US feeder vehicles, but this pushes compliance burden onto investors and shrinks the addressable pool
+- Considered but rejected: the marginal cost of adding a Reg D 506(c) SAFT tranche (~$40-80K) is small relative to the US accredited capital it unlocks.
 
 ### Pattern C: Full KYC on Governance Participants
 - Every voting address linked to verified identity, governance is permissioned
