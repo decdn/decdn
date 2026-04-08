@@ -11,8 +11,10 @@ use cli::{Cli, Command};
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    let config_path = cli.config.map(|p| cli::common::expand_tilde(&p));
+
     match cli.command {
-        Command::Run(run_args) => cmd_run(cli.config.as_deref(), &run_args),
+        Command::Run(run_args) => cmd_run(config_path.as_deref(), &run_args),
         Command::KeyGen(args) => cmd_key_gen(&args),
         Command::Config(args) => cmd_config_init(&args),
     }
@@ -123,7 +125,8 @@ fn init_otlp_tracer(endpoint: &str) -> anyhow::Result<opentelemetry_sdk::trace::
 fn cmd_key_gen(args: &cli::KeyGenArgs) -> anyhow::Result<()> {
     let output_dir = args
         .output_dir
-        .clone()
+        .as_deref()
+        .map(cli::common::expand_tilde)
         .or_else(cli::default_data_dir)
         .ok_or_else(|| anyhow::anyhow!("cannot determine output directory: home dir not found"))?;
 
@@ -139,7 +142,8 @@ fn cmd_key_gen(args: &cli::KeyGenArgs) -> anyhow::Result<()> {
 fn cmd_config_init(args: &cli::ConfigInitArgs) -> anyhow::Result<()> {
     let output = args
         .output
-        .clone()
+        .as_deref()
+        .map(cli::common::expand_tilde)
         .or_else(cli::default_config_path)
         .ok_or_else(|| anyhow::anyhow!("cannot determine config path: home dir not found"))?;
 

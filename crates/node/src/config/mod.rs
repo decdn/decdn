@@ -73,6 +73,7 @@ fn resolve_identity(
     let data_dir = cli
         .data_dir
         .clone()
+        .map(|p| expand_tilde(&p))
         .or_else(|| {
             file.and_then(|i| i.data_dir.clone())
                 .map(|p| expand_tilde(&p))
@@ -116,6 +117,7 @@ fn resolve_blockchain(
         .rpc_url
         .clone()
         .or_else(|| file.and_then(|b| b.rpc_url.clone()))
+        .filter(|s| !s.is_empty())
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "missing required option: --rpc-url (or blockchain.rpc_url in config file)"
@@ -125,6 +127,7 @@ fn resolve_blockchain(
     let eth_keystore = cli
         .eth_keystore
         .clone()
+        .map(|p| expand_tilde(&p))
         .or_else(|| {
             file.and_then(|b| b.eth_keystore.clone())
                 .map(|p| expand_tilde(&p))
@@ -135,6 +138,7 @@ fn resolve_blockchain(
         .payment_channel_address
         .clone()
         .or_else(|| file.and_then(|b| b.payment_channel_address.clone()))
+        .filter(|s| !s.is_empty())
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "missing required option: --payment-channel-address \
@@ -146,6 +150,7 @@ fn resolve_blockchain(
         .staking_registry_address
         .clone()
         .or_else(|| file.and_then(|b| b.staking_registry_address.clone()))
+        .filter(|s| !s.is_empty())
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "missing required option: --staking-registry-address \
@@ -170,6 +175,7 @@ fn resolve_cache(
     let cache_dir = cli
         .cache_dir
         .clone()
+        .map(|p| expand_tilde(&p))
         .or_else(|| {
             file.and_then(|c| c.cache_dir.clone())
                 .map(|p| expand_tilde(&p))
