@@ -30,6 +30,7 @@ Decentralized CDN where nodes cache and serve content-addressed blobs over [iroh
 | `cdn/probe/v1` | Latency + availability probing |
 | `cdn/client/v1` | All paid delivery (client→node and node→node) |
 | `cdn/watchtower/v1` | Channel-dispute monitoring (voucher registration) |
+| `cdn/dht/v1` | Content discovery via Kademlia DHT (see [ADR 022](adr/022-content-discovery.md)) |
 | iroh-gossip (built-in) | Node metadata broadcast (`NodeAnnounce`), node discovery |
 
 ### Companion Protocol (App Server)
@@ -40,7 +41,7 @@ Decentralized CDN where nodes cache and serve content-addressed blobs over [iroh
 
 > The app server is not a CDN protocol participant — see [ADR 006](adr/006-e2e-encryption.md).
 
-### Planned Crate Structure
+### Crate Structure
 
 ```
 crates/
@@ -61,13 +62,17 @@ Architecture decision records live in [`adr/`](adr/), with [`adr/architecture.md
 - **No exposed origins:** Origin backends (S3/R2/B2) are opaque per-node config
 - **E2E encryption:** Envelope encryption with epoch-rotated keys; CDN nodes only see ciphertext
 - **Watchtowers:** Non-custodial dispute monitors for payment channel safety
-- **Discovery:** Gossip-only content routing for PoC; DHT/Kademlia deferred to post-PoC
+- **Discovery:** `cdn/dht/v1` Kademlia DHT for content discovery from PoC onward; broadcast probe fan-out as bootstrap fallback
 - **Reputation:** Interaction-weighted scoring propagated via gossip
 - **Governance:** Admin key for PoC; token-weighted governance with safety bounds for production
 - **Multi-token payments (post-PoC):** PoC uses USDC only; production supports governance-approved ERC-20 allowlist
 - **Content takedown:** Governance-controlled hash blacklisting with regional compliance bodies
 - **Client architecture:** Lightweight QUIC endpoints; gossip subscribe (no publish); registry bootstrap with fallback; per-connection ephemeral identity binding
 - **Schema evolution:** Varint-length framing, protocol enums, three-tier evolution model (minor/medium/major)
+- **On-chain verification:** Dual-key slash signatures (ed25519 wire + secp256k1 on-chain) with optimistic challenge-response
+- **0-RTT probing:** QUIC 0-RTT for `cdn/probe/v1` repeat connections, eliminating TLS handshake round trip
+- **Liquidity:** Protocol-owned liquidity via Balancer V3 80/20 TOKEN/USDC weighted pool
+- **Production L2:** Arbitrum One for all on-chain contracts (PoC on Arbitrum Sepolia)
 
 ## Development
 
