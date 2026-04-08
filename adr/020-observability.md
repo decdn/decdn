@@ -165,6 +165,14 @@ canonical naming regime.
 
 ---
 
+#### 2.9 Node / Process Metrics
+
+| Metric | Type | Tier | Description |
+|--------|------|------|-------------|
+| `decdn_node_uptime_seconds` | Gauge | R | Seconds since the node process started (Unix epoch of start subtracted from current time). Used by the `/health` endpoint and operator dashboards to correlate events with restarts. |
+
+---
+
 ### 3. Health Endpoint
 
 `GET /health` (same HTTP port as `/metrics`) returns a JSON object:
@@ -177,12 +185,22 @@ canonical naming regime.
   "blacklist_version": 42,
   "blacklist_synced": true,
   "rate_bounds_loaded": true,
-  "peer_count": 12,
+  "peer_table_size": 12,
   "channels_open": 3,
   "channel_deposit_usdc": "15.23",
-  "uptime_seconds": 3601
+  "node_uptime_seconds": 3601
 }
 ```
+
+**JSON key → Prometheus metric mapping:**
+
+| JSON key | Prometheus metric | Notes |
+|----------|------------------|-------|
+| `peer_table_size` | `decdn_peer_table_size` | Direct gauge value |
+| `channels_open` | `decdn_channels_open` | Direct gauge value |
+| `channel_deposit_usdc` | `decdn_channel_deposit_usdc` | Formatted as decimal string for readability; metric stores raw value |
+| `node_uptime_seconds` | `decdn_node_uptime_seconds` | Direct gauge value |
+| `blacklist_version` | `decdn_blacklist_version_behind` (derived) | Absolute version number from RPC, not the lag gauge |
 
 **Status semantics:**
 
