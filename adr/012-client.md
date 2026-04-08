@@ -23,7 +23,7 @@ A client is a lightweight QUIC endpoint that streams content and pays per MB. It
 
 Capabilities:
 - Opens `cdn/client/v1` connections to nodes for paid content delivery
-- Opens `cdn/probe/v1` connections for content discovery
+- Uses `cdn/dht/v1` FIND_VALUE for content discovery; falls back to `cdn/probe/v1` broadcast during bootstrap (see [ADR 022](022-content-discovery.md))
 - **Subscribes** to gossip topics to receive `NodeAnnounce` messages
 - Does **not** publish `NodeAnnounce` (not a staked node)
 - Does **not** publish `ReputationReport` via gossip ([ADR 008](008-reputation.md) — clients contribute local observations only)

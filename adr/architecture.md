@@ -58,7 +58,7 @@ graph TD
 
 **Note:** PoC payments use USDC only; production supports multiple governance-approved ERC-20 tokens (see [ADR 010](010-multi-token.md)).
 
-Clients probe candidate nodes, pick the best by the unified selection score (see [ADR 001](001-network.md#node-selection-algorithm) for the full formula), stream over `cdn/client/v1`, and pay via off-chain payment vouchers (USDC in PoC). On a cache miss, a node discovers providers via probe fan-out (`cdn/probe/v1` to all known peers), selects the best, and pulls via `cdn/client/v1` (paid). Every byte delivered — whether client→node or node→node — is paid.
+Clients probe candidate nodes, pick the best by the unified selection score (see [ADR 001](001-network.md#node-selection-algorithm) for the full formula), stream over `cdn/client/v1`, and pay via off-chain payment vouchers (USDC in PoC). On a cache miss, a node performs a DHT FIND_VALUE lookup (`cdn/dht/v1`), probes the returned candidates via `cdn/probe/v1`, selects the best, and pulls via `cdn/client/v1` (paid). During bootstrap, broadcast probe fan-out is used as a fallback. Every byte delivered — whether client→node or node→node — is paid.
 
 ---
 
@@ -74,7 +74,7 @@ The implementation language is Rust. The networking stack is iroh, which provide
 
 ### [ADR 001 — Network Topology and Peer Mesh](001-network.md)
 
-**Flat peer mesh. Gossip for node discovery, probe fan-out for content discovery (DHT deferred to post-PoC).**
+**Flat peer mesh. Gossip for node discovery; `cdn/dht/v1` (Kademlia subset) for content discovery from PoC onward, with broadcast probe fan-out as a bootstrap fallback (see [ADR 022](022-content-discovery.md)).**
 
 All staked nodes form a flat mesh. Node metadata is broadcast over iroh-gossip on regional topics (`cdn/region/{cc}/v1`) and a global topic (`cdn/global/v1`) via lightweight `NodeAnnounce` messages (~800 bytes, 60-second PoC default interval). Per-node gossip bandwidth scales linearly: ~3 Kbps at 30 nodes (PoC), ~111 Kbps at 1,000 nodes; structured overlay or gossip partitioning is needed beyond ~1,000 nodes. Content discovery is on-demand: on a cache miss, nodes probe all known peers via `cdn/probe/v1` in parallel and select the best provider by the unified selection score (`rate_per_mb × rtt_ms × (1 / max(reputation, 0.1)²)` — lower is better). No content inventories are broadcast — no Bloom filters, no hash lists. The on-chain node registry is part of the `StakingRegistry` contract; the `NodeInfo` struct maps `NodeId` (ed25519 public key) to QUIC multiaddrs and Ethereum address. Registration requires both an EIP-712 binding signature (for slashability) and an ed25519 ownership proof (preventing NodeId squatting).
 
@@ -229,9 +229,19 @@ Consolidates privacy properties scattered across ADRs 001, 003, 005, 006, 007, 0
 
 Reverses the implicit Uniswap V3 venue choice in prior ADRs. Balancer 80/20 weighted pools let the treasury seed the pool with roughly 1/4 the USDC of a 50/50 position for comparable near-spot depth *for small trades* (critical for a TOKEN-rich, USDC-poor treasury), eliminate concentrated-liquidity range-management overhead (no `LiquidityManager`, no keeper for rebalancing), and reduce impermanent loss by ~1.75× for a 2× TOKEN price move (~3.3% vs ~5.7%), aligning the DAO's IL profile with the TOKEN-upside thesis. The DAO treasury holds BPT directly; no LP rewards or liquidity mining. `BuybackBurner.executeBuyback()` swaps USDC → TOKEN via `BalancerV3Router.swapSingleTokenExactIn()`, with TWAP + `minTokenOut` as the primary MEV defense and CoW Swap batch-auction routing as a conditional add-on pending verification of V3-pool solver coverage. Balancer V3 is chosen over V2 in response to the 2025-11-03 V2 Composable Stable Pool exploit (~$125M); V3's new Vault architecture mitigates the bug class per Certora/Trail of Bits post-mortems. The `IBuybackBurner` interface adds one setter (`setPool(address)`) to stay venue-symmetric, preserving the option to supplement with a Uniswap V3 position in a future ADR once treasury USDC reserves and keeper infrastructure justify it.
 
----
+### [ADR 021 — Production L2 Chain Selection](021-l2-chain-selection.md)
 
-## Key Invariants
+**Arbitrum One (chain ID 42161) is the canonical production chain for all deCDN contracts.**
+
+Resolves the explicit deferral in ADR 004 and formalises the Arbitrum assumptions already embedded in ADRs 004, 007, and 018. Arbitrum One is selected over Base and OP Mainnet on the basis of: PoC continuity (Arbitrum Sepolia → Arbitrum One is a same-family migration), highest DeFi TVL and aggregator routing density for Balancer V3 buybacks, prior ADR consistency (gas estimates, forced-inclusion delay, Balancer V3 Router address all calibrated for Arbitrum One), and battle-tested OpenZeppelin Governor + TimelockController deployments. Native USDC (Circle CCTP, `0xaf88d065e77c8cC2239327C5EDb3A432268e5831`) is used — not bridged USDC.e. Cross-chain payment channels are excluded from v1. Re-evaluation triggers are defined for gas cost spikes, fraud-proof vulnerabilities, and sequencer censorship events.
+
+### [ADR 022 — Content Discovery at Scale](022-content-discovery.md)
+
+**`cdn/dht/v1` Kademlia subset for content discovery — primary mechanism from PoC onward. `cdn/probe/v1` broadcast fan-out retained as bootstrap/emergency fallback. Two popularity signals: `popular_hashes` gossip (advisory) and DHT FIND_VALUE query frequency (non-suppressible oracle). No discovery fees.**
+
+Probe fan-out is O(N) per cache miss and does not scale beyond ~100 nodes. Gossip content announcements were rejected (unbounded traffic proportional to cache churn). Hash-prefix range hints were rejected (economically irrational — nodes cache popular content regardless of hash prefix). The production path is a lightweight Kademlia subset (`cdn/dht/v1` ALPN): nodes self-publish `(hash → NodeId)` STORE records when caching a blob, attracting paying clients; FIND_VALUE lookups are O(log N). No discovery fees — all revenue stays on delivery. Popularity is surfaced by two complementary signals: `popular_hashes` gossip (advisory, self-reported; suppression is self-limiting via `LoadHint`/selection score) and DHT FIND_VALUE query frequency (non-suppressible — routing traffic reaches nearby-keyspace nodes regardless of gossip). The probe step (`cdn/probe/v1`) is preserved as the final availability confirmation before any delivery commitment.
+
+
 
 - No external origin URL exists — content enters the network through origin-backed nodes whose backends are hidden
 - A node cannot deliver paid content without being reachable via iroh NodeId; the backend is always hidden
@@ -338,10 +348,10 @@ The protocol does not dictate cache policy. Nodes are economically motivated to 
 
 **Cache miss resolution** follows a priority order:
 
-1. **Paid pull-through (preferred):** Node checks its probe cache or performs a probe fan-out (`cdn/probe/v1` to all known peers), selects the best provider by the unified selection score ([ADR 001](001-network.md#node-selection-algorithm)), pulls via `cdn/client/v1` (paid), caches locally, and streams to the client while the pull is in progress.
+1. **Paid pull-through (preferred):** Node checks its probe cache or performs a DHT FIND_VALUE lookup + probe (`cdn/dht/v1` → `cdn/probe/v1`), selects the best provider by the unified selection score ([ADR 001](001-network.md#node-selection-algorithm)), pulls via `cdn/client/v1` (paid), caches locally, and streams to the client while the pull is in progress.
 2. **Redirect (last resort):** If pull-through is disabled (`pull_through: false` in config), the node returns a redirect to an origin-backed node's NodeId. The client opens a channel with that node directly.
 
-**Prefetching:** Nodes can proactively cache popular content using two signals: (1) local demand — tracking cache miss frequency per hash and prefetching when a threshold is crossed (default: 3 misses in 5 minutes); (2) network popularity — observing which hashes appear in multiple peers' `popular_hashes` fields in `NodeAnnounce` gossip messages (default threshold: 3+ peers within 10 minutes). All prefetch pulls use the same probe fan-out → `cdn/client/v1` path (paid).
+**Prefetching:** Nodes can proactively cache popular content using two signals: (1) local demand — tracking cache miss frequency per hash and prefetching when a threshold is crossed (default: 3 misses in 5 minutes); (2) network popularity — observing which hashes appear in multiple peers' `popular_hashes` fields in `NodeAnnounce` gossip messages (default threshold: 3+ peers within 10 minutes). All prefetch pulls use the same DHT FIND_VALUE → probe → `cdn/client/v1` path (paid).
 
 **Eviction:** LRU or frequency-weighted eviction (LFU). Operators tune cache size to maximize hit rate within their storage budget. Blobs for which the node has signed `has_blob: true` in a `cdn/probe/v1` response are temporarily exempt from eviction via the **probe-triggered eviction hold** (`probe_hold_duration`, see [ADR 005](005-protocol.md#probe-triggered-eviction-hold)), which prevents false phantom-announcement slashing when cache pressure would otherwise evict a blob between probe and subsequent stream request.
 
@@ -492,9 +502,9 @@ A fully decentralized storage model was evaluated: nodes would commit to durable
 
 Not in PoC scope. The planned approach for the next phase:
 
-Dedicated **indexer nodes** subscribe to gossip topics and participate in probe fan-out (responding to `cdn/probe/v1` queries) to build a searchable index of content metadata (via `tantivy` or equivalent), exposing a query API on a custom ALPN (`cdn/search/v1`). Multiple independent indexers can coexist. Clients pay per query via the same payment channel mechanism. Indexers register in the `StakingRegistry` and are slashable for fabricated results.
+Dedicated **indexer nodes** subscribe to gossip topics and respond to `cdn/probe/v1` queries to build a searchable index of content metadata (via `tantivy` or equivalent), exposing a query API on a custom ALPN (`cdn/search/v1`). Multiple independent indexers can coexist. Clients pay per query via the same payment channel mechanism. Indexers register in the `StakingRegistry` and are slashable for fabricated results.
 
-During PoC (before indexers exist), content discovery uses probe fan-out — every cache miss probes all known peers via `cdn/probe/v1`. At PoC scale (tens of nodes), this provides complete coverage. The migration to indexers or DHT-based discovery is additive — probe fan-out remains the fallback.
+Content discovery uses `cdn/dht/v1` from PoC onward — at 30 nodes, FIND_VALUE resolves in 1–2 hops and is negligible overhead. Indexers complement DHT by providing metadata search. Broadcast probe fan-out remains the bootstrap/emergency fallback.
 
 ---
 
@@ -502,7 +512,7 @@ During PoC (before indexers exist), content discovery uses probe fan-out — eve
 
 Not in PoC scope. iroh's KV-CRDT protocol (`iroh-docs`) provides a replicated key-value store with eventual consistency via range-based set reconciliation. Entries are `(namespace, author, key) → (BLAKE3 hash, size, timestamp)` — metadata only; actual content travels via iroh-blobs separately. This maps naturally to deCDN's content-addressing model.
 
-**Primary use case — content catalog replication.** A KV-CRDT namespace per content provider could replicate a catalog of `hash → content metadata` entries across nodes. Nodes would learn what content exists before needing it, enabling smarter prefetching and reducing probe fan-out pressure as the network scales beyond PoC. This is the most natural replacement for brute-force probe fan-out at scale.
+**Primary use case — content catalog replication.** A KV-CRDT namespace per content provider could replicate a catalog of `hash → content metadata` entries across nodes. Nodes would learn what content exists before needing it, enabling smarter prefetching. This complements (not replaces) `cdn/dht/v1` — CRDT replication propagates metadata; DHT locates holders.
 
 **Secondary use cases to evaluate:**
 
@@ -510,7 +520,7 @@ Not in PoC scope. iroh's KV-CRDT protocol (`iroh-docs`) provides a replicated ke
 - **Watchtower voucher state.** A KV-CRDT keyed by `(channel_id, nonce)` between a watchtower and its client could keep voucher state consistent, simplifying the bespoke sync and heartbeat commitment described in [ADR 007](007-watchtower.md).
 - **Indexer replication layer.** Indexer nodes (see [Search & Discovery](#future-work-search--discovery) above) could subscribe to content catalog namespaces and build their search index from replicated entries, rather than relying solely on gossip and probe participation.
 
-**Why not in PoC:** At tens of nodes, probe fan-out provides complete coverage and is simpler. Adding a CRDT replication layer is worthwhile only when the network grows large enough that probing all peers becomes expensive. The migration is additive — probe fan-out remains the fallback.
+**Why not in PoC:** DHT already handles content discovery at PoC scale. CRDT replication adds value at larger scale for smarter prefetching; deferred until the network grows beyond where DHT alone suffices.
 
 **Reference:** [iroh-docs protocol](https://docs.iroh.computer/protocols/kv-crdts)
 
@@ -518,7 +528,8 @@ Not in PoC scope. iroh's KV-CRDT protocol (`iroh-docs`) provides a replicated ke
 
 ## What Is Not Decided Yet
 
-- Production L2 choice (Arbitrum One, Base, or other) — gated on PoC validation. Sequencer censorship mitigation for the dispute window is addressed in [ADR 007](007-watchtower.md#l2-sequencer-censorship) (PoC: 48h default; production: forced-inclusion deadline extension); the extension's detection logic depends on the L2 chosen
+- ~~Production L2 choice~~: decided — [ADR 021](021-l2-chain-selection.md) selects Arbitrum One (chain ID 42161). Sequencer censorship mitigation uses Arbitrum's 24h forced-inclusion path; see [ADR 007](007-watchtower.md#l2-sequencer-censorship)
+- ~~Content discovery scaling strategy (DHT vs gossip hints)~~: decided — [ADR 022](022-content-discovery.md) specifies a phased approach: selective fan-out (>100 nodes) then `cdn/dht/v1` Kademlia subset (>500 nodes); gossip content hints rejected
 - Parallel streaming from multiple nodes for a single blob (protocol supports it, not prioritised)
 - ~~Maximum blob size~~: decided — nodes may configure a `max_blob_size` limit (PoC recommended default: 10 GB). Requests exceeding a node's limit are rejected with `StreamError::BlobTooLarge` ([ADR 005](005-protocol.md#error-handling-and-retry-semantics)). This is a per-node operational policy, not an on-chain governance parameter, because different nodes have different storage and bandwidth budgets
 - ~~Schema evolution strategy for postcard wire messages~~: decided — [ADR 013](013-schema-evolution.md) defines varint-length framing, protocol enums, a three-tier evolution model, and a gossip envelope
