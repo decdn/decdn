@@ -12,6 +12,9 @@ pub const ALPN_CLIENT: &[u8] = b"cdn/client/v1";
 /// ALPN protocol identifier for watchtower channel-dispute monitoring.
 pub const ALPN_WATCHTOWER: &[u8] = b"cdn/watchtower/v1";
 
+/// ALPN protocol identifier for Kademlia-based content discovery (ADR 022).
+pub const ALPN_DHT: &[u8] = b"cdn/dht/v1";
+
 /// Gossip topic for global node announcements and rate changes.
 pub const TOPIC_GLOBAL: &str = "cdn/global/v1";
 
