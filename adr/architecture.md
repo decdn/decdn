@@ -229,6 +229,13 @@ Consolidates privacy properties scattered across ADRs 001, 003, 005, 006, 007, 0
 
 Reverses the implicit Uniswap V3 venue choice in prior ADRs. Balancer 80/20 weighted pools let the treasury seed the pool with roughly 1/4 the USDC of a 50/50 position for comparable near-spot depth *for small trades* (critical for a TOKEN-rich, USDC-poor treasury), eliminate concentrated-liquidity range-management overhead (no `LiquidityManager`, no keeper for rebalancing), and reduce impermanent loss by ~1.75× for a 2× TOKEN price move (~3.3% vs ~5.7%), aligning the DAO's IL profile with the TOKEN-upside thesis. The DAO treasury holds BPT directly; no LP rewards or liquidity mining. `BuybackBurner.executeBuyback()` swaps USDC → TOKEN via `BalancerV3Router.swapSingleTokenExactIn()`, with TWAP + `minTokenOut` as the primary MEV defense and CoW Swap batch-auction routing as a conditional add-on pending verification of V3-pool solver coverage. Balancer V3 is chosen over V2 in response to the 2025-11-03 V2 Composable Stable Pool exploit (~$125M); V3's new Vault architecture mitigates the bug class per Certora/Trail of Bits post-mortems. The `IBuybackBurner` interface adds one setter (`setPool(address)`) to stay venue-symmetric, preserving the option to supplement with a Uniswap V3 position in a future ADR once treasury USDC reserves and keeper infrastructure justify it.
 
+### [ADR 020 — Observability and Metrics Standard](020-observability.md)
+
+**Canonical Prometheus metric registry, naming convention, alert thresholds, and `/health` endpoint contract.**
+
+Consolidates metrics scattered across ADRs 001, 005, 011, 015 and `architecture.md § Observability` into a single reference. Defines a `decdn_` prefix + `_total`/unit-suffix naming convention; splits 35 metrics across eight subsystems into **mandatory** (M) and **recommended** (R) tiers; provides recommended alert thresholds for the seven slash-safety metrics; specifies the `/health` JSON endpoint with `ready`/`degraded`/`not_ready` semantics; and supplies a cross-reference table mapping all informal prior-ADR metric names to their canonical replacements. Resolves the observability gap identified in Issue #190.
+
+
 ---
 
 ## Key Invariants
@@ -459,21 +466,24 @@ The app server is operated by the content provider (e.g., a streaming platform's
 
 ## Observability
 
-- **Structured logging** via `tracing` crate (standard in iroh ecosystem). JSON output for machine consumption.
-- **Metrics** via `prometheus` crate, exposed on a configurable HTTP port:
-  - `streams_active`, `streams_completed`, `streams_failed` — delivery activity
-  - `vouchers_signed`, `vouchers_received` — payment activity
-  - `reputation_reports_sent`, `reputation_reports_received` — gossip health
-  - `channels_open`, `channels_settled` — payment channel lifecycle
-  - `cache_hits`, `cache_misses`, `cache_bytes` — cache performance
-- **Health endpoint** at `/health` on the metrics HTTP port — returns node status, peer count, and channel balances
-- **Slash-risk metrics** — early warning for conditions that can lead to slashing (see [ADR 004](004-tokenomics.md)):
-  - `probe_hold_violations` — times a blob was evicted within `probe_hold_duration` after signing `has_blob: true` (phantom announcement risk — [ADR 005](005-protocol.md))
-  - `probe_hold_slots_used` — current occupied hold slots out of `max_probe_holds` (saturation signal — [ADR 005](005-protocol.md))
-  - `rate_bounds_clamp_events` — times `rate_per_mb` was clamped to governance bounds before signing ([ADR 005](005-protocol.md))
-  - `blacklist_sync_lag_seconds` — seconds since last successful `getBlacklistVersion()` poll ([ADR 011](011-content-takedown.md))
-  - `blacklist_version_behind` — gap between local and on-chain blacklist version ([ADR 011](011-content-takedown.md))
-  - `slash_evidence_exposure` — times the node detected it produced a signed probe + stream pair meeting slashing contradiction conditions within the 30-second window ([ADR 005](005-protocol.md))
+The canonical metric registry, naming convention (`decdn_` prefix, `_total` suffix for
+counters), mandatory vs. recommended tiers, alert thresholds, and `/health` endpoint
+contract are defined in [ADR 020](020-observability.md). The summary below is for
+orientation only — ADR 020 is authoritative.
+
+- **Structured logging** via `tracing` crate (JSON in production).
+- **Metrics** via `prometheus` crate, exposed at `:{port}/metrics` (default port 9090).
+  Key metric groups: delivery (`decdn_streams_*`, `decdn_bytes_*`), cache
+  (`decdn_cache_*`), payment channels (`decdn_channels_*`, `decdn_vouchers_*`), gossip
+  (`decdn_gossip_*`, `decdn_peer_table_size`), and slash-safety (see below).
+- **Health endpoint** at `:{port}/health` — JSON with `ready`/`degraded`/`not_ready`
+  status, peer count, channel balances, and blacklist sync state.
+- **Slash-risk metrics** (all mandatory — nodes must expose these at startup):
+  - `decdn_probe_hold_violations_total` — phantom announcement risk ([ADR 005](005-protocol.md))
+  - `decdn_probe_hold_slots_used` / `decdn_probe_hold_slots_max` — eviction-hold saturation
+  - `decdn_rate_bounds_clamp_events_total` — rate outside governance bounds ([ADR 003](003-payments.md))
+  - `decdn_blacklist_sync_lag_seconds` / `decdn_blacklist_version_behind` — compliance lag ([ADR 011](011-content-takedown.md))
+  - `decdn_slash_evidence_exposure_total` — self-detected slashing contradiction ([ADR 005](005-protocol.md))
 
 ---
 
