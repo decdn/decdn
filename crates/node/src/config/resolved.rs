@@ -1,4 +1,7 @@
-//! Fully resolved configuration with concrete types (no `Option` fields).
+//! Fully resolved configuration with concrete types.
+//!
+//! Most fields are non-optional. `region` and `relay_url` remain
+//! `Option` because they have no universal default.
 
 use std::path::PathBuf;
 

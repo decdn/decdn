@@ -69,19 +69,23 @@ pub fn default_config_path() -> Option<PathBuf> {
     default_data_dir().map(|d| d.join("node.toml"))
 }
 
-/// Expands a leading `~` in a path to the user's home directory.
+/// Expands a leading `~/` or bare `~` in a path to the user's home directory.
 ///
-/// Returns the path unchanged if it does not start with `~` or if the
-/// home directory cannot be determined.
+/// Logs a warning and returns the path unchanged if `~` is present but
+/// the home directory cannot be determined (e.g. in minimal containers).
+/// Does not handle `~username` syntax.
 pub fn expand_tilde(path: &std::path::Path) -> PathBuf {
     let s = path.to_string_lossy();
-    if s.starts_with('~') {
+    if let Some(rest) = s.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
-            return home.join(
-                s.strip_prefix("~/")
-                    .unwrap_or(s.strip_prefix('~').unwrap_or(&s)),
-            );
+            return home.join(rest);
         }
+        tracing::warn!(path = %s, "cannot expand '~': home directory not available");
+    } else if s == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+        tracing::warn!("cannot expand '~': home directory not available");
     }
     path.to_path_buf()
 }

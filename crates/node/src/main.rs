@@ -21,9 +21,17 @@ fn main() -> anyhow::Result<()> {
 fn cmd_run(config_path: Option<&std::path::Path>, run_args: &cli::RunArgs) -> anyhow::Result<()> {
     let resolved = config::resolve_config(config_path, run_args)?;
 
-    // Initialize tracing — RUST_LOG takes precedence over resolved log level.
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(resolved.log_level.to_string()));
+    // Initialize tracing — RUST_LOG env var takes precedence over resolved log level.
+    let filter = match tracing_subscriber::EnvFilter::try_from_default_env() {
+        Ok(f) => f,
+        Err(e) => {
+            // Only warn if RUST_LOG was actually set (not just absent).
+            if std::env::var_os("RUST_LOG").is_some() {
+                eprintln!("warning: ignoring malformed RUST_LOG: {e}");
+            }
+            tracing_subscriber::EnvFilter::new(resolved.log_level.to_string())
+        }
+    };
 
     match resolved.log_format {
         LogFormat::Json => {
@@ -41,7 +49,7 @@ fn cmd_run(config_path: Option<&std::path::Path>, run_args: &cli::RunArgs) -> an
     tracing::debug!(
         data_dir = %resolved.data_dir.display(),
         bind_port = resolved.bind_port,
-        rpc_url = %resolved.rpc_url,
+        rpc_url = "<redacted>",
         cache_dir = %resolved.cache_dir.display(),
         cache_size_mb = resolved.cache_size_mb,
         rate_per_mb = resolved.rate_per_mb,
