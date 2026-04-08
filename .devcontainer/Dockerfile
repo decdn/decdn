@@ -62,7 +62,7 @@ USER node
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable \
   && . "$HOME/.cargo/env" \
   && rustup component add rust-analyzer \
-  && cargo install cargo-watch && cargo install --locked cargo-nextest \
+  && cargo install --locked cargo-watch && cargo install --locked cargo-nextest \
   && cargo install --locked cargo-deny
 
 ENV PATH="/home/node/.cargo/bin:$PATH"
