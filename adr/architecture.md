@@ -229,7 +229,13 @@ Consolidates privacy properties scattered across ADRs 001, 003, 005, 006, 007, 0
 
 Reverses the implicit Uniswap V3 venue choice in prior ADRs. Balancer 80/20 weighted pools let the treasury seed the pool with roughly 1/4 the USDC of a 50/50 position for comparable near-spot depth *for small trades* (critical for a TOKEN-rich, USDC-poor treasury), eliminate concentrated-liquidity range-management overhead (no `LiquidityManager`, no keeper for rebalancing), and reduce impermanent loss by ~1.75× for a 2× TOKEN price move (~3.3% vs ~5.7%), aligning the DAO's IL profile with the TOKEN-upside thesis. The DAO treasury holds BPT directly; no LP rewards or liquidity mining. `BuybackBurner.executeBuyback()` swaps USDC → TOKEN via `BalancerV3Router.swapSingleTokenExactIn()`, with TWAP + `minTokenOut` as the primary MEV defense and CoW Swap batch-auction routing as a conditional add-on pending verification of V3-pool solver coverage. Balancer V3 is chosen over V2 in response to the 2025-11-03 V2 Composable Stable Pool exploit (~$125M); V3's new Vault architecture mitigates the bug class per Certora/Trail of Bits post-mortems. The `IBuybackBurner` interface adds one setter (`setPool(address)`) to stay venue-symmetric, preserving the option to supplement with a Uniswap V3 position in a future ADR once treasury USDC reserves and keeper infrastructure justify it.
 
----
+### [ADR 021 — Production L2 Chain Selection](021-l2-chain-selection.md)
+
+**Arbitrum One (chain ID 42161) is the canonical production chain for all deCDN contracts.**
+
+Resolves the explicit deferral in ADR 004 and formalises the Arbitrum assumptions already embedded in ADRs 004, 007, and 018. Arbitrum One is selected over Base and OP Mainnet on the basis of: PoC continuity (Arbitrum Sepolia → Arbitrum One is a same-family migration), highest DeFi TVL and aggregator routing density for Balancer V3 buybacks, prior ADR consistency (gas estimates, forced-inclusion delay, Balancer V3 Router address all calibrated for Arbitrum One), and battle-tested OpenZeppelin Governor + TimelockController deployments. Native USDC (Circle CCTP, `0xaf88d065e77c8cC2239327C5EDb3A432268e5831`) is used — not bridged USDC.e. Cross-chain payment channels are excluded from v1. Re-evaluation triggers are defined for gas cost spikes, fraud-proof vulnerabilities, and sequencer censorship events.
+
+
 
 ## Key Invariants
 
@@ -518,7 +524,7 @@ Not in PoC scope. iroh's KV-CRDT protocol (`iroh-docs`) provides a replicated ke
 
 ## What Is Not Decided Yet
 
-- Production L2 choice (Arbitrum One, Base, or other) — gated on PoC validation. Sequencer censorship mitigation for the dispute window is addressed in [ADR 007](007-watchtower.md#l2-sequencer-censorship) (PoC: 48h default; production: forced-inclusion deadline extension); the extension's detection logic depends on the L2 chosen
+- ~~Production L2 choice~~: decided — [ADR 021](021-l2-chain-selection.md) selects Arbitrum One (chain ID 42161). Sequencer censorship mitigation uses Arbitrum's 24h forced-inclusion path; see [ADR 007](007-watchtower.md#l2-sequencer-censorship)
 - Parallel streaming from multiple nodes for a single blob (protocol supports it, not prioritised)
 - ~~Maximum blob size~~: decided — nodes may configure a `max_blob_size` limit (PoC recommended default: 10 GB). Requests exceeding a node's limit are rejected with `StreamError::BlobTooLarge` ([ADR 005](005-protocol.md#error-handling-and-retry-semantics)). This is a per-node operational policy, not an on-chain governance parameter, because different nodes have different storage and bandwidth budgets
 - ~~Schema evolution strategy for postcard wire messages~~: decided — [ADR 013](013-schema-evolution.md) defines varint-length framing, protocol enums, a three-tier evolution model, and a gossip envelope
