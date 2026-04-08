@@ -4,7 +4,7 @@
 
 Decentralized CDN (deCDN) — nodes cache and serve content-addressed blobs over iroh QUIC, clients pay per-MB via off-chain USDC payment channels. Rust implementation targeting a PoC of tens of nodes on an Arbitrum Sepolia testnet.
 
-**Status: Pre-implementation (design/ADR phase).** No Rust source code or `Cargo.toml` exists yet. The repo currently contains architecture decision records (`adr/`), a devcontainer setup, and this documentation.
+**Status: Early implementation.** Cargo workspace with 5 crates is scaffolded (stub `lib.rs` files, `node` has initial CLI/config). ADRs in `adr/` remain the primary design artifacts.
 
 ## Development Environment
 
@@ -20,7 +20,7 @@ This repo uses a VS Code devcontainer with a firewall-isolated environment. The 
 ADRs in `adr/` are the primary deliverables right now. `adr/architecture.md` is the living overview and index of all decisions; numbered files cover individual decisions.
 
 **Conventions:**
-- File naming: `NNN-topic.md` (zero-padded 3-digit prefix, next number is 019)
+- File naming: `NNN-topic.md` (zero-padded 3-digit prefix, next number is 023)
 - When changing any ADR, check for cross-ADR consistency — terms, parameters, and protocol names must match across all ADRs and `architecture.md`. This is the most common source of bugs in this repo.
 - `architecture.md` must be updated whenever an ADR changes a user-visible summary point
 
@@ -46,11 +46,16 @@ cargo build && cargo clippy          # build + lint
 cargo nextest run                    # test (preferred over cargo test)
 cargo nextest run -p protocol        # single crate
 cargo fmt -- --check                 # check formatting
+cargo deny check                     # license + advisory audit (deny.toml)
 ```
 
 ## Architecture
 
-**Language:** Rust. **Networking:** iroh (QUIC transport, NAT traversal, content-addressed blobs, gossip).
+**Language:** Rust (edition 2024, MSRV 1.85). **Networking:** iroh (QUIC transport, NAT traversal, content-addressed blobs, gossip).
+
+**Code style:** `rustfmt.toml` sets `max_width = 100`.
+
+**Anti-panic policy:** Clippy denies `unwrap_used`, `expect_used`, `panic`, and `indexing_slicing` workspace-wide. Use `Result`/`Option` combinators or `.get()` for indexing. This is the most common CI failure for new code.
 
 ### Crate Structure (planned)
 
@@ -61,7 +66,7 @@ crates/
   cache/        — cache engine wrapping iroh-blobs + origin pull-through
   incentive/    — payment channels, staking, vouchers (alloy for Ethereum)
   reputation/   — gossip-based reputation scoring
-  contracts/    — Solidity contracts + Foundry
+  contracts/    — Solidity contracts + Foundry (excluded from workspace, not yet populated)
 ```
 
 **Dependency flow:** `node → cache, incentive, reputation, protocol`. Cache and incentive are independent — cache works without payment logic (useful for testing/local dev).
@@ -73,6 +78,7 @@ crates/
 | `cdn/probe/v1` | Latency + availability probing |
 | `cdn/client/v1` | All paid delivery (client→node and node→node) |
 | `cdn/watchtower/v1` | Channel-dispute monitoring, voucher registration |
+| `cdn/dht/v1` | Content discovery via Kademlia DHT (see ADR 022) |
 | iroh-gossip (built-in) | Node metadata broadcast (`NodeAnnounce`), node discovery |
 
 ### Companion Protocol (App Server)
