@@ -235,6 +235,12 @@ Reverses the implicit Uniswap V3 venue choice in prior ADRs. Balancer 80/20 weig
 
 Formalizes the complete ordered flow that existing ADRs left implicit: Phase 1 (pre-flight: clock sync, iroh key generation, Ethereum key funding, region selection); Phase 2 (on-chain setup: TOKEN approval, staking, atomic `registerNode` with ed25519 + EIP-712 signatures); Phase 3 (node startup: rate bounds fetch, blacklist sync, peer table bootstrap from registry); Phase 4 (gossip subscription: join `cdn/global/v1` and regional topic, publish first `NodeAnnounce`); Phase 5 (accepting paid delivery: seven acceptance criteria for operational readiness). Also covers NAT/multiaddr handling (iroh hole-punching, when to call `updateMultiaddrs`), re-onboarding after deregistration or auto-ejection (nonce increment, preserved `firstRegisteredAt`), and PoC vs. production differences. Resolves the bootstrapping gap identified in Issue #190.
 
+### [ADR 020 — Observability and Metrics Standard](020-observability.md)
+
+**Canonical Prometheus metric registry, naming convention, alert thresholds, and `/health` endpoint contract.**
+
+Consolidates metrics scattered across ADRs 001, 005, 011, 015 and `architecture.md § Observability` into a single reference. Defines a `decdn_` prefix + `_total`/unit-suffix naming convention; splits 35 metrics across eight subsystems into **mandatory** (M) and **recommended** (R) tiers; provides recommended alert thresholds for the seven slash-safety metrics; specifies the `/health` JSON endpoint with `ready`/`degraded`/`not_ready` semantics; and supplies a cross-reference table mapping all informal prior-ADR metric names to their canonical replacements. Resolves the observability gap identified in Issue #190.
+
 ### [ADR 021 — Production L2 Chain Selection](021-l2-chain-selection.md)
 
 **Arbitrum One (chain ID 42161) is the canonical production chain for all deCDN contracts.**
@@ -476,21 +482,24 @@ The app server is operated by the content provider (e.g., a streaming platform's
 
 ## Observability
 
-- **Structured logging** via `tracing` crate (standard in iroh ecosystem). JSON output for machine consumption.
-- **Metrics** via `prometheus` crate, exposed on a configurable HTTP port:
-  - `streams_active`, `streams_completed`, `streams_failed` — delivery activity
-  - `vouchers_signed`, `vouchers_received` — payment activity
-  - `reputation_reports_sent`, `reputation_reports_received` — gossip health
-  - `channels_open`, `channels_settled` — payment channel lifecycle
-  - `cache_hits`, `cache_misses`, `cache_bytes` — cache performance
-- **Health endpoint** at `/health` on the metrics HTTP port — returns node status, peer count, and channel balances
-- **Slash-risk metrics** — early warning for conditions that can lead to slashing (see [ADR 004](004-tokenomics.md)):
-  - `probe_hold_violations` — times a blob was evicted within `probe_hold_duration` after signing `has_blob: true` (phantom announcement risk — [ADR 005](005-protocol.md))
-  - `probe_hold_slots_used` — current occupied hold slots out of `max_probe_holds` (saturation signal — [ADR 005](005-protocol.md))
-  - `rate_bounds_clamp_events` — times `rate_per_mb` was clamped to governance bounds before signing ([ADR 005](005-protocol.md))
-  - `blacklist_sync_lag_seconds` — seconds since last successful `getBlacklistVersion()` poll ([ADR 011](011-content-takedown.md))
-  - `blacklist_version_behind` — gap between local and on-chain blacklist version ([ADR 011](011-content-takedown.md))
-  - `slash_evidence_exposure` — times the node detected it produced a signed probe + stream pair meeting slashing contradiction conditions within the 30-second window ([ADR 005](005-protocol.md))
+The canonical metric registry, naming convention (`decdn_` prefix, `_total` suffix for
+counters), mandatory vs. recommended tiers, alert thresholds, and `/health` endpoint
+contract are defined in [ADR 020](020-observability.md). The summary below is for
+orientation only — ADR 020 is authoritative.
+
+- **Structured logging** via `tracing` crate (JSON in production).
+- **Metrics** via `prometheus` crate, exposed at `:{port}/metrics` (default port 9090).
+  Key metric groups: delivery (`decdn_streams_*`, `decdn_bytes_*`), cache
+  (`decdn_cache_*`), payment channels (`decdn_channels_*`, `decdn_vouchers_*`), gossip
+  (`decdn_gossip_*`, `decdn_peer_table_size`), and slash-safety (see below).
+- **Health endpoint** at `:{port}/health` — JSON with `ready`/`degraded`/`not_ready`
+  status, peer count, channel balances, and blacklist sync state.
+- **Slash-risk metrics** (all mandatory — nodes must expose these at startup):
+  - `decdn_probe_hold_violations_total` — phantom announcement risk ([ADR 005](005-protocol.md))
+  - `decdn_probe_hold_slots_used` / `decdn_probe_hold_slots_max` — eviction-hold saturation
+  - `decdn_rate_bounds_clamp_events_total` — rate outside governance bounds ([ADR 003](003-payments.md))
+  - `decdn_blacklist_sync_lag_seconds` / `decdn_blacklist_version_behind` — compliance lag ([ADR 011](011-content-takedown.md))
+  - `decdn_slash_evidence_exposure_total` — self-detected slashing contradiction ([ADR 005](005-protocol.md))
 
 ---
 
