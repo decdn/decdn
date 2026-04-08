@@ -41,7 +41,7 @@ chacha20poly1305 = "0.10"
 alloy = { version = "1", features = ["providers", "signers", "contract"] }
 
 # CLI
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 
 # Observability
 tracing = "0.1"
