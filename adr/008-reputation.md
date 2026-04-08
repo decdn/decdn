@@ -93,7 +93,7 @@ settlement_weight_i = exp(-lambda * age_weeks_i)
 effective_settled_value = sum(settled_amount_i * settlement_weight_i) * diversity_factor
 ```
 
-Where `lambda = 0.1` per week (half-life ≈ 6.9 weeks) and `age_weeks_i` is the time since the `ChannelSettled` event was emitted for channel _i_. Settlements older than `settlement_max_age` (52 weeks) are excluded entirely.
+Where `lambda = 0.1` per week (half-life ≈ 6.9 weeks) and `age_weeks_i` is the time since the `ChannelSettled` event was emitted for channel *i*. Settlements older than `settlement_max_age` (52 weeks) are excluded entirely.
 
 **Decay examples:**
 

@@ -109,6 +109,7 @@ governable per [ADR 004](004-tokenomics.md#staking-parameters)).
 Call `StakingRegistry.registerNode(nodeId, multiaddrs, regionHint, bindingSignature, ed25519Signature)`.
 
 This single transaction atomically:
+
 - Verifies the EIP-712 `bindingSignature` over `BindNodeId(nodeId, bindingNonce[ethAddress])`,
   establishing the `nodeId → ethAddress` mapping for slash evidence and payment attribution.
 - Verifies the `ed25519Signature` over
@@ -209,6 +210,7 @@ Once startup state is synchronized, the node joins the iroh-gossip mesh.
 #### Step 4.1 — Subscribe to gossip topics
 
 Subscribe to the following topics:
+
 - `cdn/global/v1` — all staked nodes publish and subscribe.
 - `cdn/region/{cc}/v1` — subscribe to the node's own declared region topic.
 - `cdn/reputation/v1` — reputation reports (production only; see [ADR 008](008-reputation.md)).
@@ -266,6 +268,7 @@ After Phases 1–4, the node is fully operational and should be accepting traffi
 | 7 | Multiaddrs synchronized | On-chain multiaddrs match `iroh::Endpoint::direct_addresses()` (or relay placeholder if direct addresses are not yet resolved) |
 
 A node that satisfies all seven criteria is ready to:
+
 - Respond to `ProbeRequest` messages on `cdn/probe/v1`
 - Accept `StreamRequest` messages on `cdn/client/v1`
 - Earn USDC via voucher-based payment channels opened by clients and other nodes

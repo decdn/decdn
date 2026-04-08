@@ -149,6 +149,7 @@ Endpoint compromise yields secrets specific to that endpoint.
 **Current state:** `NodeAnnounce` broadcasts the top-20 most-requested hashes every 60 seconds ([ADR 001](001-network.md)). This field is actively consumed by the prefetching system: nodes observe which hashes appear in multiple peers' `popular_hashes` to detect cross-region demand ([ADR 001](001-network.md) §Prefetch Triggers).
 
 **Options:**
+
 - **(a) Reduce cardinality** from 20 to 5. Reduces the signal while preserving the prefetch mechanism. The network popularity threshold (default: 3+ peers within 10 minutes) still works with smaller lists.
 - **(b) Add Laplacian noise** (differential privacy). Insert random hashes alongside real ones. Preserves cardinality but degrades prefetch accuracy.
 - **(c) Remove entirely.** Not viable — breaks the network popularity signal for prefetching.

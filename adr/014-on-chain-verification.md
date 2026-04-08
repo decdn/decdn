@@ -86,6 +86,7 @@ EIP712Domain({
 #### Node Implementation
 
 When constructing a `ProbeResponse` or `StreamResponse`, the node:
+
 1. Signs the security-relevant fields with its Ed25519 iroh key (existing behavior, used for wire authentication).
 2. Signs the same fields with its Ethereum private key using EIP-712 typed data (new behavior, used for on-chain evidence).
 3. Includes both signatures in the response.
@@ -119,6 +120,7 @@ For the PoC, the corruption slash path uses a single-round optimistic model. The
 **Challenge submission:**
 
 The challenger calls `SlashJudge.submitCorruptionChallenge()` with:
+
 - `nodeId` — the node's Ed25519 public key (for identification)
 - `blobHash` — the BLAKE3 hash of the content that was requested
 - `streamResponse` — the serialized `StreamResponse` fields (with `ok: true` for the challenged blob)
@@ -126,6 +128,7 @@ The challenger calls `SlashJudge.submitCorruptionChallenge()` with:
 - Challenge bond: 100 TOKEN ([ADR 004](004-tokenomics.md#challenge-bond))
 
 The contract verifies:
+
 1. `ecrecover(streamResponse, slashSig)` recovers a registered node address
 2. The `StreamResponse` has `ok: true` and its `hash` field matches `blobHash`
 3. The challenge bond is transferred and held
@@ -168,6 +171,7 @@ For production, the corruption slash path should upgrade to a two-round interact
 3. **Node responds** (24 hours) with the correct chunk at the same index and a Merkle proof against the correct keccak256 Merkle root for the BLAKE3-addressed blob.
 
 **Merkle tree construction:**
+
 - A blob of `N` bytes is divided into `ceil(N / 1024)` chunks of 1024 bytes (last chunk may be shorter). The 1024-byte leaf size matches the iroh-blobs BLAKE3 hash tree leaf size ([architecture.md glossary](architecture.md#glossary)).
 - Each leaf is `keccak256(chunk_index || chunk_bytes)` — including the index prevents second-preimage attacks.
 - Internal nodes are `keccak256(left || right)`. Standard binary Merkle tree, left-padded with zero-hashes for non-power-of-2 leaf counts.
@@ -233,6 +237,7 @@ interface ISlashJudge {
 #### Evidence Verification Per Offense Type
 
 **Phantom announcement:**
+
 1. `ecrecover(probeResponseData, probeSlashSig)` → address A
 2. `ecrecover(streamResponseData, streamSlashSig)` → address B
 3. Verify A == B (same node)
@@ -269,6 +274,7 @@ If all six conditions pass, the challenge is dismissed and the challenger's bond
 See [ADR 005, Gossip — rate change announcements](005-protocol.md#gossip--rate-change-announcements) for the `RateChange` gossip message that produces this counter-evidence.
 
 **Blacklist violation:**
+
 1. `ecrecover(responseData, slashSig)` → address
 2. Look up address in `StakingRegistry` — must be a registered node
 3. Decode `hash` from the response; verify it matches `blobHash`
@@ -277,6 +283,7 @@ See [ADR 005, Gossip — rate change announcements](005-protocol.md#gossip--rate
 6. **Regional scope limitation (PoC):** [ADR 011](011-content-takedown.md#slashing) specifies that a node is only slashable for hashes blacklisted in its declared region. However, the node's region is self-reported and not stored on-chain in `StakingRegistry` for the PoC. The `SlashJudge` contract therefore cannot enforce regional scope in the PoC — all blacklist violations are treated as globally scoped. Production should add a `region` field to `NodeInfo` to enable on-chain regional filtering
 
 **Corrupted delivery (PoC):**
+
 1. `ecrecover(streamResponseData, streamSlashSig)` → address
 2. Look up address in `StakingRegistry` — must be a registered node
 3. Verify `streamResponse.ok == true` and `streamResponse.hash == blobHash`
@@ -308,13 +315,16 @@ These estimates replace the `submitFraudProof()` placeholder (~250k gas) in [ADR
 ### 4. Integration with Existing Contracts
 
 **StakingRegistry ([ADR 001](001-network.md), [ADR 003](003-payments.md), [ADR 004](004-tokenomics.md)):**
+
 - Adds `slash(address node, uint8 offenseType) external` callable only by the `SlashJudge` contract address. Implements the escalating schedule from [ADR 004](004-tokenomics.md#slash-amounts-escalating) (10% flat for PoC; 5/15/50% with lifetime counter for production). Checks auto-ejection threshold (50% of `minStake`).
 - No new fields in `NodeInfo` for PoC — the existing `msg.sender` Ethereum address serves as the slash key.
 
 **StablePaymentChannel ([ADR 003](003-payments.md)):**
+
 - No changes. Slashing and payment channels are independent by design.
 
 **ContentBlacklist ([ADR 011](011-content-takedown.md)):**
+
 - `SlashJudge` calls `ContentBlacklist.isBlacklisted(hash)` and `ContentBlacklist.getEntry(hash)` to verify blacklist status and compliance window timing. No changes to the `ContentBlacklist` interface.
 
 ## Consequences

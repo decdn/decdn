@@ -210,6 +210,7 @@ fn deserialize_stream_request(buf: &[u8]) -> Result<(StreamRequestBase, StreamRe
 ```
 
 This provides bidirectional compatibility:
+
 - **New sender → old receiver:** `take_from_bytes` on the base struct succeeds; trailing extension bytes are discarded.
 - **Old sender → new receiver:** `take_from_bytes` on the base struct succeeds with no remainder; the receiver fills `StreamRequestExt::default()`.
 - **Newer sender → new receiver:** `take_from_bytes` on the extensions struct succeeds; any further trailing bytes (from fields the receiver doesn't know about) are discarded.
@@ -255,6 +256,7 @@ fn serialize_stream_request(base: &StreamRequestBase, ext: &StreamRequestExt) ->
 Messages without extensions (e.g., `VoucherAck`, `StreamEnd`, `ChunkData`) have no trailing bytes — the remainder from `take_from_bytes` is empty. The framing helpers (`read_frame`/`write_frame`) are agnostic to extensions; the two-phase logic lives in per-message-type application code.
 
 **Rules:**
+
 - New extension fields MUST be `Option<T>` or types with a meaningful `Default` impl. Non-optional fields cannot be added via minor evolution.
 - New extension fields MUST be appended to the end of the extensions struct. Field order within `*Ext` is frozen once released — insertions and reordering are major changes.
 - New fields MUST NOT be included in any existing signature computation (see [Signed Field Freezing](#signed-field-freezing)).
@@ -297,6 +299,7 @@ Old peers deserialize `NodeAnnounce` without extensions — `take_from_bytes` on
 Append a new variant to the protocol enum. Old peers that encounter an unknown varint discriminant handle it gracefully (stream close or gossip drop — see [Unknown variant handling](#protocol-enums)).
 
 **Rules:**
+
 - New variants MUST be appended at the end of the enum. Reordering or removal is a major change.
 - The new message type MUST be non-critical for peers that do not understand it. If the message is required for protocol correctness, it is a major change.
 - For QUIC protocols, the sender SHOULD be prepared for the receiver to close the stream with `UNSUPPORTED_MESSAGE` and fall back to behavior that does not require the new message type.
@@ -322,6 +325,7 @@ Old peers receiving `Ping` (discriminant 6) close the stream with `UNSUPPORTED_M
 #### Tier 3 — Major (ALPN version bump)
 
 Required for changes that cannot be handled by minor or medium evolution:
+
 - Removing a field from a struct
 - Changing a field's type (e.g., `u64` → `u128`)
 - Reordering or removing enum variants

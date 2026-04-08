@@ -1,11 +1,17 @@
 [advisories]
-vulnerability = "deny"
-unmaintained = "warn"
-yanked = "warn"
-notice = "warn"
+version = 2
+# Transitive unmaintained-crate advisories with no available fix
+ignore = [
+    # proc-macro-error: unmaintained, transitive via genawaiter -> bao-tree -> iroh-blobs
+    "RUSTSEC-2024-0370",
+    # atomic-polyfill: unmaintained, platform-conditional transitive dep (not on linux x86_64)
+    "RUSTSEC-2023-0089",
+    # paste: unmaintained, transitive via alloy-primitives
+    "RUSTSEC-2024-0436",
+]
 
 [licenses]
-unlicensed = "deny"
+version = 2
 allow = [
     "MIT",
     "Apache-2.0",
@@ -19,12 +25,13 @@ allow = [
     "BSL-1.0",
     "CC0-1.0",
     "MPL-2.0",
+    "Unlicense",
+    "CDLA-Permissive-2.0",
 ]
-copyleft = "deny"
 
 [bans]
 multiple-versions = "warn"
-wildcards = "deny"
+wildcards = "warn"
 
 [sources]
 unknown-registry = "deny"

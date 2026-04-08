@@ -151,6 +151,7 @@ Heartbeats are batched — one on-chain transaction per 6-hour window covers all
 Each channel should be registered with **2–3 independent watchtowers**. The watched party establishes independent `cdn/watchtower/v1` connections to each and streams identical voucher updates.
 
 Redundancy properties:
+
 - **No coordination between watchtowers.** Each operates independently with its own copy of the latest voucher.
 - **Multiple dispute submissions are harmless.** The contract accepts the highest-nonce voucher regardless of how many `disputeChannel` calls are made. Duplicate submissions waste gas but do not affect settlement.
 - **Failure tolerance.** All watchtowers must fail simultaneously during the dispute window (default 48 hours) for the attack to succeed. With 3 independent operators, this requires correlated failure (shared infrastructure, coordinated attack, or bribery of all 3).
@@ -462,6 +463,7 @@ The L2 sequencer censors the watchtower's `disputeChannel` transaction during th
 **Important constraint:** the extension mechanism only helps if the forced-inclusion transaction is processed *before* the original `disputeDeadline` expires. If the dispute window is shorter than the L2's maximum forced-inclusion delay, `settleChannel` becomes callable before the forced-inclusion `disputeChannel` arrives — the extension logic never executes. Therefore, **governance must not set the dispute window below the L2's maximum forced-inclusion delay** (e.g., ≥ 25h for an L2 with ~24h forced inclusion). The 12h governance floor remains as a hardcoded safety bound for L2s with shorter forced-inclusion paths, but is not safe on L2s with ~24h forced inclusion without additional mitigation.
 
 Constraints on the extension mechanism:
+
 - **One extension per close.** A second forced-inclusion dispute on the same channel does not trigger a further extension. This bounds the worst-case settlement delay to `disputeWindow + 24h`.
 - **Only forced-inclusion transactions.** Normal sequencer-included `disputeChannel` calls do not trigger the extension, preventing abuse.
 - **L2-specific detection.** Identifying a forced-inclusion transaction is inherently L2-specific. On Arbitrum, this can be detected via the `ArbSys` precompile or delayed inbox origin; on OP Stack, via L1 message origin. The exact detection logic is a parameter of the L2 chain selection decision (architecture.md, not yet decided) and will be finalized when the L2 is chosen.

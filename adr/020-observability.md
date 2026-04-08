@@ -235,6 +235,7 @@ complementary — logs are not a substitute for metrics.
     volumes.
 
 **Mandatory log fields** on every event:
+
 - `node_id` — iroh NodeId (hex)
 - `ts` — RFC 3339 timestamp
 - `level` — log level

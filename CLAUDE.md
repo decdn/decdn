@@ -15,16 +15,29 @@ This repo uses a VS Code devcontainer with a firewall-isolated environment. The 
 # Or: Ctrl+Shift+P → "Dev Containers: Reopen in Container"
 ```
 
+### Pre-commit Hooks
+
+The repo uses [pre-commit](https://pre-commit.com/) to enforce formatting, linting, and supply chain checks before each commit. The devcontainer runs `pre-commit install` automatically on creation.
+
+```bash
+pre-commit install                # one-time setup (done automatically in devcontainer)
+pre-commit run --all-files        # run all hooks manually
+```
+
+Hooks: trailing-whitespace, end-of-file-fixer, check-yaml, check-merge-conflict, check-added-large-files, markdownlint, `cargo fmt`, `cargo clippy`, `cargo deny`.
+
 ### Working with ADRs
 
 ADRs in `adr/` are the primary deliverables right now. `adr/architecture.md` is the living overview and index of all decisions; numbered files cover individual decisions.
 
 **Conventions:**
+
 - File naming: `NNN-topic.md` (zero-padded 3-digit prefix, next number is 023)
 - When changing any ADR, check for cross-ADR consistency — terms, parameters, and protocol names must match across all ADRs and `architecture.md`. This is the most common source of bugs in this repo.
 - `architecture.md` must be updated whenever an ADR changes a user-visible summary point
 
 **Consistency checks when editing ADRs:**
+
 - Grep for renamed terms/parameters across all `adr/*.md` files
 - Verify ALPN strings, message type names, and protocol version identifiers match `005-protocol.md`
 - Verify token names (TOKEN/USDC), contract references, and fee parameters match `003-payments.md` and `004-tokenomics.md`
