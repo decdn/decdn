@@ -173,7 +173,7 @@ This ADR resolves the deferral in ADR 004 and formalises implicit assumptions in
 |----------|-------|--------|
 | Chain ID | **42161** | Arbitrum One |
 | Native token (gas) | ETH | — |
-| Native USDC address | `0xaf88d065e77c8cC2239327C5EDb3A432268e5831` | Circle CCTP on Arbitrum One |
+| Native USDC (CCTP) address | `0xaf88d065e77c8cC2239327C5EDb3A432268e5831` | Circle CCTP on Arbitrum One |
 | Balancer V3 Vault | `0xbA1333333333a1BA1108E8412f11850A5C319bA9` | Balancer deployments registry |
 | Balancer V3 Router | `0xEAedc32a51c510d35ebC11088fD5fF2b47aACF2E` | Balancer deployments registry (`Router v2`) |
 | Sequencer forced-inclusion delay | ~24 h | Arbitrum delayed inbox |
