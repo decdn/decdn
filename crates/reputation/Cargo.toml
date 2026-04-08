@@ -1,0 +1,20 @@
+[package]
+name = "decdn-reputation"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Gossip-based reputation scoring for deCDN nodes"
+
+[dependencies]
+decdn-protocol = { workspace = true }
+iroh = { workspace = true }
+iroh-gossip = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+
+[lints]
+workspace = true
