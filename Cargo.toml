@@ -61,6 +61,28 @@ missing_debug_implementations = "warn"
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
+
+# Anti-panic: no panicking in a CDN node
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+
+# Numeric safety (payment amounts, byte offsets)
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+cast_precision_loss = "warn"
+
+# Code quality
+cognitive_complexity = "warn"
+needless_pass_by_value = "warn"
+missing_const_for_fn = "warn"
+semicolon_if_nothing_returned = "warn"
+uninlined_format_args = "warn"
+trivially_copy_pass_by_ref = "warn"
+unused_self = "warn"
+
+# Pedantic relaxations
 module_name_repetitions = "allow"
 must_use_candidate = "allow"
 missing_errors_doc = "allow"
