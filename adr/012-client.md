@@ -114,7 +114,7 @@ voucher_key = HKDF-SHA256(
 // (the curve order) or 0, re-derive with an incremented salt.
 ```
 
-The resulting secp256k1 key is used exclusively for EIP-712 voucher signatures. It is held in memory only — never written to disk. The corresponding Ethereum address must be pre-authorized in the payment channel contract as a delegated signer (contract support for delegated signers is deferred to a future ADR).
+The resulting secp256k1 key is used exclusively for EIP-712 voucher signatures. It is held in memory only — never written to disk. The corresponding Ethereum address is pre-authorized in the payment channel contract as a delegated signer via `StablePaymentChannel.setDelegate(hotKeyAddress)` — see [ADR 003 Amendment: Delegated Voucher Signer](003-payments.md#amendment-delegated-voucher-signer).
 
 #### Key Summary
 
@@ -261,12 +261,12 @@ The client queries all configured seed domains, cross-checks returned NodeIds ag
 - File-based key storage in PoC is not suitable for production (acceptable for testnet with test funds)
 - Ephemeral bindings mean a disconnected client loses priority staking benefits until reconnection
 - NTP synchronization is a hard requirement for gossip validation — clients without NTP will reject valid gossip and build stale peer tables
-- Hardware wallet voucher signing is confirmed infeasible — the derived hot key requires delegated signer support in the payment channel contract (deferred)
+- Hardware wallet voucher signing is confirmed infeasible with direct signing — the derived hot key approach (session key registered via `setDelegate`) resolves this; see [ADR 003 Amendment](003-payments.md#amendment-delegated-voucher-signer)
 
 ## Open Questions
 
 1. **Gossip relay:** Should clients forward received gossip messages to other peers, or only consume? Recommendation: consume-only for PoC to minimize client complexity. Evaluate relay participation for production to improve message propagation.
-2. **Delegated voucher signer:** The derived hot key for production hardware wallet users requires contract-level support for delegated signers. This should be addressed in a future ADR or an amendment to [ADR 003](003-payments.md).
+2. ~~**Delegated voucher signer:**~~ Resolved — [ADR 003 Amendment](003-payments.md#amendment-delegated-voucher-signer) adds `setDelegate` / `clearDelegate` to `StablePaymentChannel`.
 3. **Mobile/web clients:** This ADR assumes a desktop/server client with filesystem access. Mobile and web clients are listed as non-goals in the architecture overview but may need adapted key storage and bootstrap mechanisms.
 
 ## ADRs Affected

@@ -767,3 +767,100 @@ Slashing and payment channels are independent by design. The following interacti
 - The ejected node is removed from gossip routing, so it receives no new client connections.
 - `closeChannel` (client/provider only), `disputeChannel` (any address), and `settleChannel` (any address) remain callable on existing channels — these functions check channel state, not registry status.
 - The node must re-stake at the full minimum and re-register to resume operations.
+
+---
+
+## Amendment: Delegated Voucher Signer
+
+**Date:** 2026-04-08
+**Amends:** ADR 003 (Payment Model)
+**Resolves:** ADR 012 deferral — *"contract support for delegated signers is deferred to a future ADR"*
+
+### Context
+
+At the default 1 MB voucher cadence, a 100 MB download requires 100 EIP-712 voucher signatures. Hardware wallets (Ledger, Trezor) require physical confirmation per signature (2–5 seconds each), making streaming delivery with hardware wallets infeasible in practice. [ADR 012](012-client.md) proposes a **derived hot key** — a short-lived session key that holds voucher-signing authority in memory, derived from the hardware wallet with a single confirmation at session start. This amendment specifies the on-chain mechanism that makes a hot key's signatures contractually valid.
+
+### Decision
+
+`StablePaymentChannel` gains a **global delegate mapping**: a client address may register exactly one delegate address that is authorized to sign vouchers on its behalf across all of that client's channels. Voucher verification in `closeChannel` and `disputeChannel` accepts a signature from either `channel.client` or the registered delegate.
+
+**One active delegate at a time, global scope.** A client maps to at most one delegate address. The delegate applies to all current and future channels opened by that client address. This is simpler than per-channel delegation and sufficient for the hardware wallet use case, where a single hot key covers all in-flight channels for a session.
+
+**No change to `closeChannel` access control.** The delegate is authorized only to produce valid voucher _signatures_. The `msg.sender` check for who may _call_ `closeChannel` and `topUp` remains `channel.client` or `channel.provider` — the delegate address is not a channel participant and cannot initiate lifecycle transitions.
+
+**EIP-712 type hash unchanged.** The `Voucher` type continues to encode `{channelId, amount, nonce, token}`. The `channelId` already binds the voucher to a specific client-provider pair; the delegate mapping on-chain provides the authorization link. Adding a `delegator` field would break deployed PoC contracts and is unnecessary given the on-chain mapping.
+
+**Included in the PoC contract from day one.** The PoC uses file-based keys (`FileKeyStore` per [ADR 023](023-poc-production-seams.md)), so PoC clients sign vouchers directly with their Ethereum key and do not use delegation. However, the mapping and functions are present in the deployed contract so that the production client can exercise them without a contract upgrade.
+
+### Contract Changes
+
+```solidity
+interface IStablePaymentChannel {
+    // ... existing functions unchanged ...
+
+    // Delegate management
+    function setDelegate(address delegate) external;
+    function clearDelegate() external;
+    function delegateOf(address client) external view returns (address);
+}
+```
+
+**`setDelegate(address delegate)`**
+- `delegate` MUST NOT be `address(0)` (use `clearDelegate` to remove).
+- `delegate` MUST NOT equal `msg.sender` (self-delegation provides no benefit and indicates a caller bug).
+- Overwrites any previously registered delegate for `msg.sender`.
+- Emits `DelegateSet(address indexed client, address indexed delegate)`.
+
+**`clearDelegate()`**
+- Sets `clientDelegate[msg.sender] = address(0)`.
+- Emits `DelegateCleared(address indexed client)`.
+
+**Events:**
+
+```solidity
+event DelegateSet(address indexed client, address indexed delegate);
+event DelegateCleared(address indexed client);
+```
+
+**Modified voucher verification** (applies to both `closeChannel` and `disputeChannel`):
+
+```solidity
+address recovered = ECDSA.recover(digest, signature);
+address delegate  = clientDelegate[channel.client];
+require(
+    recovered == channel.client ||
+    (delegate != address(0) && delegate == recovered),
+    "invalid signer"
+);
+```
+
+The zero-voucher close path (`amount=0, nonce=0, signature.length==0`) is unchanged — it is a provider-only path with no signature verification.
+
+### Hot Key Lifecycle (Off-Chain, Production)
+
+The hardware wallet flow per session:
+
+1. **Key derivation.** Client software derives a session hot key from the hardware wallet using the BIP-32/BIP-44 path defined in [ADR 012](012-client.md) (one hardware wallet confirmation).
+2. **On-chain registration.** Client calls `setDelegate(hotKeyAddress)` from the hardware wallet (one transaction, ~$0.05 gas on Arbitrum).
+3. **Channel open.** Client calls `openChannel(provider, deposit)` from the hardware wallet (one transaction).
+4. **Streaming.** The hot key signs all vouchers in memory. Zero hardware wallet interactions during delivery.
+5. **Channel close.** The node calls `closeChannel` with the latest voucher (signed by the hot key, valid because of the delegate mapping). The hardware wallet is not needed.
+6. **Session end.** Client calls `clearDelegate()` from the hardware wallet, or relies on the next session's `setDelegate` to overwrite. The hot key is wiped from memory.
+
+**PoC client flow.** The PoC `FileKeyStore` loads an Ethereum key from disk and signs vouchers directly. `setDelegate` / `clearDelegate` are not called. No code path in PoC exercises delegation.
+
+### Revocation Semantics and Residual Risk
+
+`clearDelegate()` is effective immediately on-chain — after the transaction is confirmed, the contract will reject new vouchers signed by the former delegate. However:
+
+- **Vouchers already held by a node** (signed before revocation) remain valid — they were produced while the delegation was active and the signature is verifiable against the historical on-chain state at the time the voucher was signed. This is safe: the node cannot produce new vouchers post-revocation, only redeem ones it already holds.
+- **Maximum exposure** is one voucher interval at the negotiated cadence (see [Voucher Interval Negotiation](#voucher-interval-negotiation)). A compromised hot key cannot extract more than the latest acknowledged voucher amount minus the previously settled amount.
+- **Worst-case revocation scenario.** If a hot key is compromised and the attacker signs a voucher for `channel.deposit`, the node can submit it during the dispute window. The client's recourse is to call `disputeChannel` with a legitimate lower-nonce voucher *before* the attacker does — but since the attacker's forged voucher has a higher nonce it would win the dispute. This is the same trust model as a compromised `channel.client` key. Mitigation: keep the hot key memory-only, scoped to the session, and `clearDelegate` at session end.
+
+### Alternatives Considered
+
+**Per-channel delegation.** A `setChannelDelegate(bytes32 channelId, address delegate)` variant would limit exposure to a single channel if the hot key is compromised. Rejected: this requires one additional transaction per channel opened during the session, most clients open exactly one channel per session anyway, and the hardware wallet must sign each `openChannel` — the per-channel cost is equivalent to per-address cost in the common case.
+
+**Off-chain delegation certificate.** Include a signed authorization from `channel.client` in the wire protocol; nodes verify it before accepting vouchers. Rejected: shifts trust to the node to correctly verify authorizations rather than the contract, adds a new wire message type, and is harder to audit.
+
+**Session key in EIP-712 domain.** Add a `sessionKey` field to the domain separator or voucher type, allowing time-bounded or nonce-bounded delegation without a contract call. Rejected: changes the voucher type hash (breaking PoC deployments) and requires more complex contract-side validation for the time-bound or scope checks.
