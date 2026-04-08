@@ -255,7 +255,6 @@ Probe fan-out is O(N) per cache miss and does not scale beyond ~100 nodes. Gossi
 
 ## Key Invariants
 
-
 - No external origin URL exists — content enters the network through origin-backed nodes whose backends are hidden
 - A node cannot deliver paid content without being reachable via iroh NodeId; the backend is always hidden
 - A node cannot earn without delivering verifiable bytes — BLAKE3 hash mismatch voids payment

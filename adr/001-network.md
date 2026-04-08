@@ -108,9 +108,9 @@ On probe cache hit, if the selected provider no longer has the blob (evicted —
 **Eviction hold interaction.** Probe cache TTL (15s) < `probe_hold_duration` (35s), so any cached probe response used for a stream is within both the slashing window and the eviction hold period.
 
 **Probe rate limits:**
+
 - **Outbound:** 10 probe fan-outs per second per node. Excess cache misses queue.
 - **Inbound:** 20 probe requests per peer per second (token bucket). Excess probes silently dropped.
-
 
 ### Gossip Bandwidth Analysis
 
@@ -266,8 +266,6 @@ The three strategies considered here are resolved in [ADR 022](022-content-disco
 1. **Selective fan-out** — subsumed by DHT; retained only as bootstrap fallback.
 2. **Content-addressed DHT** — adopted as the primary mechanism from PoC onward via `cdn/dht/v1`. iroh's native discovery services (DNS/pkarr) resolve `NodeId → address` and should be evaluated for production address resolution, complementing the on-chain registry which remains authoritative for enumerating active staked nodes.
 3. **Gossip-based content hints** — rejected (hash-prefix ranges are economically irrational in an incentive-driven network; see [ADR 022 §Context](022-content-discovery.md)).
-
-
 
 ---
 

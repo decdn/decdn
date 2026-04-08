@@ -28,6 +28,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   pkg-config \
   libssl-dev \
   build-essential \
+  python3-pip \
+  pipx \
   && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Ensure default node user has access to /usr/local/share
@@ -60,9 +62,14 @@ USER node
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable \
   && . "$HOME/.cargo/env" \
   && rustup component add rust-analyzer \
-  && cargo install cargo-watch && cargo install --locked cargo-nextest
+  && cargo install cargo-watch && cargo install --locked cargo-nextest \
+  && cargo install --locked cargo-deny
 
 ENV PATH="/home/node/.cargo/bin:$PATH"
+
+# Install pre-commit
+RUN pipx install pre-commit
+ENV PATH="/home/node/.local/bin:$PATH"
 
 # Global npm prefix
 ENV NPM_CONFIG_PREFIX=/usr/local/share/npm-global \

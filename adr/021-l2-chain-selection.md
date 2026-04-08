@@ -118,6 +118,7 @@ deployment pipeline against a different architecture.
 **Deploy deCDN production contracts on Arbitrum One (chain ID 42161).**
 
 Rationale:
+
 1. **ADR 018 alignment** — the Balancer V3 Router address, CoW Swap routing assumptions,
    and aggregator density arguments in ADR 018 are calibrated for Arbitrum One. Changing
    chains would require re-validating all three.
@@ -136,6 +137,7 @@ Rationale:
 
 **Base** is the strongest alternative. Its DeFi TVL is growing rapidly and Coinbase's
 involvement gives it strong retail onboarding. It should be re-evaluated if:
+
 - Arbitrum One gas costs increase significantly relative to Base.
 - Base's Balancer V3 CoW routing coverage reaches parity with Arbitrum.
 - Regulatory pressure shifts the token's liquidity centre to Base.

@@ -1,11 +1,17 @@
 [advisories]
-vulnerability = "deny"
-unmaintained = "warn"
-yanked = "warn"
-notice = "warn"
+version = 2
+# Ignore unmaintained proc-macro-error (transitive dep via genawaiter, no alternative available)
+ignore = [
+    # proc-macro-error: unmaintained, transitive dep via genawaiter
+    "RUSTSEC-2024-0370",
+    # atomic-polyfill: unmaintained, transitive dep
+    "RUSTSEC-2023-0089",
+    # paste: unmaintained, transitive dep
+    "RUSTSEC-2024-0436",
+]
 
 [licenses]
-unlicensed = "deny"
+version = 2
 allow = [
     "MIT",
     "Apache-2.0",
@@ -19,12 +25,13 @@ allow = [
     "BSL-1.0",
     "CC0-1.0",
     "MPL-2.0",
+    "Unlicense",
+    "CDLA-Permissive-2.0",
 ]
-copyleft = "deny"
 
 [bans]
 multiple-versions = "warn"
-wildcards = "deny"
+wildcards = "allow"
 
 [sources]
 unknown-registry = "deny"

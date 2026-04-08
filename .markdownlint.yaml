@@ -1,0 +1,27 @@
+# markdownlint configuration for deCDN
+# See https://github.com/DavidAnson/markdownlint/blob/main/doc/Rules.md
+
+# Disable line length — ADRs use prose paragraphs, not hard-wrapped lines
+MD013: false
+
+# Disable table pipe style — existing ADRs use varied table formatting
+MD060: false
+
+# Allow multiple top-level headings — ADR files use # for title and ## for sections
+MD025: false
+
+# Allow heading increment jumps — some ADRs skip from ## to ####
+MD001: false
+
+# Allow duplicate headings in different sections
+MD024:
+  siblings_only: true
+
+# Disable code fence language requirement — many existing blocks are pseudocode/diagrams
+MD040: false
+
+# Allow blank lines inside blockquotes — used for spacing in ADR callouts
+MD028: false
+
+# Disable link fragment validation — some ADR cross-references use generated anchors
+MD051: false

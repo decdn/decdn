@@ -15,6 +15,7 @@ This ADR covers:
 2. The production governance model (OpenZeppelin Governor)
 3. Governable parameters and their hardcoded safety bounds
 4. Emergency multisig design
+
 ## Decision
 
 ### PoC: Admin Key
@@ -71,6 +72,7 @@ Staking, slashing, and fee parameters are defined in [ADR 004](004-tokenomics.md
 **Treasury disbursement:** Spending from the protocol treasury — including transfers to the four fee allocation buckets (development fund, bug bounties & audits, ecosystem grants, token buyback & burn; see [ADR 004, Fee Allocation](004-tokenomics.md#fee-allocation)) — requires a standard governance proposal in production. During the PoC, the admin key holder directs treasury spending. The emergency multisig cannot withdraw treasury funds (see [Emergency Multisig](#emergency-multisig)).
 
 **Safety bound rationale:**
+
 - **Slash 5%–50% per offense:** A 1% slash is economically negligible (10 TOKEN at minimum stake) and provides no deterrence. A 100% single-offense slash enables governance to fully confiscate stake, which is disproportionate and discourages staking. The 5%–50% range ensures each individual slash is meaningful but not existential. Full ejection (effectively 100% loss) is still possible through **cumulative** slashing: three offenses at the production schedule (5% + 15% + 50% = 70% cumulative) triggers auto-ejection when stake drops below the 50% threshold ([ADR 004](004-tokenomics.md#auto-ejection)). To prevent gaming the escalation reset (misbehaving once per reset period to always receive the minimum penalty), each lifetime offense increases the clean period required to drop one escalation tier (90 → 180 → 360 days) — see [ADR 004](004-tokenomics.md#slash-amounts-escalating). The reset period multiplier schedule (1×/2×/4×) is hardcoded, not governable, to prevent governance from flattening the anti-gaming curve; only the base reset period is governable.
 - **Base slash reset period 30–365 days:** These bounds apply to the **base** reset period only. The base period (default 90 days) is multiplied by a hardcoded factor derived from lifetime offense count (1×/2×/4×). A 30-day minimum prevents governance from making the base reset trivially short (re-enabling gaming). A 365-day maximum on the base period prevents effectively permanent escalation while keeping the system governable; under the fixed multiplier schedule this implies a maximum **effective** reset period of up to 1,460 days (4 × 365) when lifetime offenses ≥ 3.
 - **Rate floor ≥ 1 base unit:** A zero floor allows free-riding nodes that advertise zero rates to attract traffic without generating protocol fees. The minimum of 1 base unit of the payment token (e.g., $0.000001/MB for 6-decimal USDC) is negligibly small but prevents true zero-rate abuse. For the PoC this is 1 USDC base unit; in production, `addToken` enforces a per-token floor ≥ 1 base unit at token registration time ([ADR 010](010-multi-token.md)).

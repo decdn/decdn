@@ -75,26 +75,31 @@ graph TD
 After all contracts are deployed, the deployer must execute these transactions before the system accepts user traffic:
 
 1. **Grant `BLACKLIST_ROLE`** on StakingRegistry to ContentBlacklist:
+
    ```solidity
    stakingRegistry.grantRole(BLACKLIST_ROLE, address(contentBlacklist));
    ```
 
 2. **Grant `SLASH_ROLE`** on StakingRegistry to SlashJudge:
+
    ```solidity
    stakingRegistry.grantRole(SLASH_ROLE, address(slashJudge));
    ```
 
 3. **Add initial token to PaymentChannel** (production only):
+
    ```solidity
    paymentChannel.addToken(USDC_ADDRESS, rateFloor, rateCeiling);
    ```
 
 4. **Register regional governance bodies** (production, if applicable):
+
    ```solidity
    contentBlacklist.registerRegionalBody(regionCode, bodyAddress);
    ```
 
 5. **Transfer admin roles** to Governor + timelock (production):
+
    ```solidity
    // For each contract with AccessControl:
    contract.grantRole(DEFAULT_ADMIN_ROLE, address(timelockController));
@@ -360,12 +365,14 @@ Every deCDN contract should inherit from audited OpenZeppelin base contracts rat
 ## Consequences
 
 **Positive:**
+
 - Single reference document for all contract interactions, reducing audit scope ambiguity
 - Explicit deployment order prevents initialization-order bugs
 - Access control matrix makes privilege escalation paths visible and auditable
 - OZ base contract prescriptions eliminate classes of implementation bugs before code is written
 
 **Negative:**
+
 - Must be kept in sync as other ADRs evolve — any change to contract interfaces in ADRs 003, 004, 007, 009, 010, 011, or 014 requires updating this document
 - Does not cover off-chain interaction patterns (voucher exchange, gossip, probing) — those remain in their respective ADRs
 
