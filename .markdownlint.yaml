@@ -4,7 +4,7 @@
 # Disable line length — ADRs use prose paragraphs, not hard-wrapped lines
 MD013: false
 
-# Disable table pipe style — existing ADRs use varied table formatting
+# Disable table column count rule — some ADR tables have intentional column variations
 MD060: false
 
 # Allow multiple top-level headings — ADR files use # for title and ## for sections

@@ -1,12 +1,12 @@
 [advisories]
 version = 2
-# Ignore unmaintained proc-macro-error (transitive dep via genawaiter, no alternative available)
+# Transitive unmaintained-crate advisories with no available fix
 ignore = [
-    # proc-macro-error: unmaintained, transitive dep via genawaiter
+    # proc-macro-error: unmaintained, transitive via genawaiter -> bao-tree -> iroh-blobs
     "RUSTSEC-2024-0370",
-    # atomic-polyfill: unmaintained, transitive dep
+    # atomic-polyfill: unmaintained, platform-conditional transitive dep (not on linux x86_64)
     "RUSTSEC-2023-0089",
-    # paste: unmaintained, transitive dep
+    # paste: unmaintained, transitive via alloy-primitives
     "RUSTSEC-2024-0436",
 ]
 
