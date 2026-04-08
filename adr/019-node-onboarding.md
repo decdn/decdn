@@ -48,7 +48,8 @@ Before any on-chain or protocol activity:
 2. **Synchronize clock.** The node MUST run NTP (or equivalent) and MUST verify the local
    clock offset is within 10 seconds of UTC before proceeding. Clock skew ≥ 60 s causes
    gossip messages to be silently rejected by all peers ([ADR 001](001-network.md#clock-synchronization)).
-   Nodes SHOULD expose a `gossip_messages_rejected_clock_skew` Prometheus counter.
+   Nodes SHOULD expose a `decdn_gossip_messages_rejected_total` Prometheus counter with the
+   `reason="clock_skew"` label ([ADR 020](020-observability.md#26-gossip-metrics)).
 
 3. **Generate iroh identity.** Run the node binary with a `keys generate` (or equivalent)
    subcommand. This produces an **ed25519 key pair** whose public key is the iroh `NodeId`.
@@ -119,12 +120,18 @@ This single transaction atomically:
   registration — used for cold-start bootstrap eligibility in [ADR 008](008-reputation.md#10-cold-start-bootstrap)).
 - Sets `active = true` in the registry.
 
-**Constructing `multiaddrs`:** Use the iroh binary or library to obtain the node's QUIC
-addresses after startup. If the node is behind NAT, iroh performs hole-punching and
-provides direct addresses after the relay connection is established (see
-[NAT and Multiaddr Handling](#nat-and-multiaddr-handling) below). For the initial
-registration, the operator may register with known direct addresses; update via
-`updateMultiaddrs` after Phase 3 if hole-punched addresses are not yet known.
+**Constructing `multiaddrs`:** The iroh `Endpoint` is not yet bound in Phase 2, so
+hole-punched addresses are not available at registration time. Use the following approach:
+
+- **Direct-address nodes (known public IP/port):** provide the stable QUIC address.
+- **NAT'd nodes:** register with the iroh relay address as a placeholder
+  (`quic-v1/relay/<relay-url>`). After Phase 3 binds the endpoint and iroh establishes
+  relay connectivity, call `updateMultiaddrs` with the actual
+  `Endpoint::direct_addresses()` values. The relay address ensures peers can still
+  reach the node in the interim.
+
+See [NAT and Multiaddr Handling](#nat-and-multiaddr-handling) below for the full relay →
+direct address promotion flow.
 
 **Constructing signatures:**
 
