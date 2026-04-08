@@ -9,9 +9,6 @@ description = "Wire protocol types and ALPN definitions for deCDN"
 [dependencies]
 serde = { workspace = true }
 postcard = { workspace = true }
-bytes = { workspace = true }
-ed25519-dalek = { workspace = true }
-iroh = { workspace = true }
 thiserror = { workspace = true }
 
 [lints]
