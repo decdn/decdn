@@ -10,6 +10,15 @@ description = "CLI entry point and runtime wiring for a deCDN node"
 name = "decdn"
 path = "src/main.rs"
 
+[features]
+default = []
+otlp = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+]
+
 [dependencies]
 decdn-protocol = { workspace = true }
 decdn-cache = { workspace = true }
@@ -26,6 +35,10 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
 dirs = { workspace = true }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
 
 [lints]
 workspace = true

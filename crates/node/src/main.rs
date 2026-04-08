@@ -5,9 +5,10 @@ mod config;
 
 use clap::Parser;
 
-use cli::{Cli, Command, LogFormat};
+use cli::{Cli, Command};
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -33,17 +34,7 @@ fn cmd_run(config_path: Option<&std::path::Path>, run_args: &cli::RunArgs) -> an
         }
     };
 
-    match resolved.log_format {
-        LogFormat::Json => {
-            tracing_subscriber::fmt()
-                .json()
-                .with_env_filter(filter)
-                .init();
-        }
-        LogFormat::Pretty => {
-            tracing_subscriber::fmt().with_env_filter(filter).init();
-        }
-    }
+    init_tracing(filter, &resolved)?;
 
     tracing::info!("deCDN node starting");
     tracing::debug!(
@@ -57,7 +48,75 @@ fn cmd_run(config_path: Option<&std::path::Path>, run_args: &cli::RunArgs) -> an
         "resolved configuration"
     );
 
+    // TODO: block on node runtime here; for now just exit cleanly.
+
     Ok(())
+}
+
+/// Initialize the tracing subscriber with fmt layer and optional OTLP layer.
+#[allow(clippy::unnecessary_wraps)] // Returns Result only when otlp feature is enabled.
+fn init_tracing(
+    filter: tracing_subscriber::EnvFilter,
+    resolved: &config::ResolvedConfig,
+) -> anyhow::Result<()> {
+    use tracing_subscriber::prelude::*;
+
+    let fmt_layer = match resolved.log_format {
+        cli::LogFormat::Json => tracing_subscriber::fmt::layer().json().boxed(),
+        cli::LogFormat::Pretty => tracing_subscriber::fmt::layer().boxed(),
+    };
+
+    let registry = tracing_subscriber::registry().with(filter).with(fmt_layer);
+
+    #[cfg(feature = "otlp")]
+    {
+        if let Some(ref endpoint) = resolved.otlp_endpoint {
+            let tracer = init_otlp_tracer(endpoint)?;
+            let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+            registry.with(otel_layer).init();
+        } else {
+            registry.init();
+        }
+    }
+
+    #[cfg(not(feature = "otlp"))]
+    {
+        if resolved.otlp_endpoint.is_some() {
+            eprintln!("warning: --otlp-endpoint ignored (binary not built with 'otlp' feature)");
+        }
+        registry.init();
+    }
+
+    Ok(())
+}
+
+/// Build an OTLP span exporter and tracer provider.
+#[cfg(feature = "otlp")]
+fn init_otlp_tracer(endpoint: &str) -> anyhow::Result<opentelemetry_sdk::trace::SdkTracer> {
+    use opentelemetry::KeyValue;
+    use opentelemetry_otlp::{SpanExporter, WithExportConfig};
+    use opentelemetry_sdk::Resource;
+    use opentelemetry_sdk::trace::SdkTracerProvider;
+
+    let exporter = SpanExporter::builder()
+        .with_tonic()
+        .with_endpoint(endpoint)
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build OTLP exporter: {e}"))?;
+
+    let provider = SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
+        .with_resource(
+            Resource::builder()
+                .with_attributes([KeyValue::new("service.name", "decdn")])
+                .build(),
+        )
+        .build();
+
+    let tracer = opentelemetry::trace::TracerProvider::tracer(&provider, "decdn");
+    opentelemetry::global::set_tracer_provider(provider);
+
+    Ok(tracer)
 }
 
 /// Generate Ed25519 node key and Ethereum keystore.
@@ -133,4 +192,5 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # log_level = "info"
 # log_format = "pretty"
 # metrics_port = 9090
+# otlp_endpoint = "http://localhost:4317"  # requires --features otlp
 "#;

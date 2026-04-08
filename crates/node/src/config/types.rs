@@ -84,4 +84,6 @@ pub struct ObservabilityConfig {
     pub log_format: Option<LogFormat>,
     /// Prometheus metrics HTTP port.
     pub metrics_port: Option<u16>,
+    /// OTLP collector endpoint URL.
+    pub otlp_endpoint: Option<String>,
 }

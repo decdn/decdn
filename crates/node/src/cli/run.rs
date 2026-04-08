@@ -122,4 +122,8 @@ pub struct ObservabilityArgs {
     /// HTTP port for Prometheus metrics and /health endpoint [default: 9090].
     #[arg(long, value_name = "PORT", env = "DECDN_METRICS_PORT")]
     pub metrics_port: Option<u16>,
+
+    /// OTLP collector endpoint URL (enables span export; requires `--features otlp`).
+    #[arg(long, value_name = "URL", env = "DECDN_OTLP_ENDPOINT")]
+    pub otlp_endpoint: Option<String>,
 }

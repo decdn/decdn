@@ -59,4 +59,6 @@ pub struct ResolvedConfig {
     pub log_format: LogFormat,
     /// Prometheus metrics HTTP port.
     pub metrics_port: u16,
+    /// OTLP collector endpoint URL (if set, span export is enabled).
+    pub otlp_endpoint: Option<String>,
 }

@@ -61,6 +61,7 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
         log_level: obs.0,
         log_format: obs.1,
         metrics_port: obs.2,
+        otlp_endpoint: obs.3,
     })
 }
 
@@ -195,7 +196,7 @@ fn resolve_payment(cli: &crate::cli::run::PaymentArgs, file: Option<&types::Paym
         .unwrap_or(DEFAULT_RATE_PER_MB)
 }
 
-/// Resolve observability fields: `(log_level, log_format, metrics_port)`.
+/// Resolve observability fields: `(log_level, log_format, metrics_port, otlp_endpoint)`.
 fn resolve_observability(
     cli: &crate::cli::run::ObservabilityArgs,
     file: Option<&types::ObservabilityConfig>,
@@ -203,6 +204,7 @@ fn resolve_observability(
     crate::cli::common::LogLevel,
     crate::cli::common::LogFormat,
     u16,
+    Option<String>,
 ) {
     let log_level = cli
         .log_level
@@ -219,7 +221,12 @@ fn resolve_observability(
         .or_else(|| file.and_then(|o| o.metrics_port))
         .unwrap_or(DEFAULT_METRICS_PORT);
 
-    (log_level, log_format, metrics_port)
+    let otlp_endpoint = cli
+        .otlp_endpoint
+        .clone()
+        .or_else(|| file.and_then(|o| o.otlp_endpoint.clone()));
+
+    (log_level, log_format, metrics_port, otlp_endpoint)
 }
 
 /// Load a [`FileConfig`] from disk.
