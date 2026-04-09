@@ -786,7 +786,7 @@ At the default 1 MB voucher cadence, a 100 MB download requires 100 EIP-712 vouc
 
 **One active delegate at a time, global scope.** A client maps to at most one delegate address. The delegate applies to all current and future channels opened by that client address. This is simpler than per-channel delegation and sufficient for the hardware wallet use case, where a single hot key covers all in-flight channels for a session.
 
-**No change to `closeChannel` access control.** The delegate is authorized only to produce valid voucher _signatures_. The `msg.sender` check for who may _call_ `closeChannel` and `topUp` remains `channel.client` or `channel.provider` — the delegate address is not a channel participant and cannot initiate lifecycle transitions.
+**No change to `closeChannel` access control.** The delegate is authorized only to produce valid voucher *signatures*. The `msg.sender` check for who may *call* `closeChannel` and `topUp` remains `channel.client` or `channel.provider` — the delegate address is not a channel participant and cannot initiate lifecycle transitions.
 
 **EIP-712 type hash unchanged.** The `Voucher` type continues to encode `{channelId, amount, nonce, token}`. The `channelId` already binds the voucher to a specific client-provider pair; the delegate mapping on-chain provides the authorization link. Adding a `delegator` field would break deployed PoC contracts and is unnecessary given the on-chain mapping.
 
@@ -806,12 +806,14 @@ interface IStablePaymentChannel {
 ```
 
 **`setDelegate(address delegate)`**
+
 - `delegate` MUST NOT be `address(0)` (use `clearDelegate` to remove).
 - `delegate` MUST NOT equal `msg.sender` (self-delegation provides no benefit and indicates a caller bug).
 - Overwrites any previously registered delegate for `msg.sender`.
 - Emits `DelegateSet(address indexed client, address indexed delegate)`.
 
 **`clearDelegate()`**
+
 - Sets `clientDelegate[msg.sender] = address(0)`.
 - Emits `DelegateCleared(address indexed client)`.
 
@@ -857,6 +859,7 @@ The hardware wallet flow per session:
 - **Sequencing is the safety mechanism.** The client-side lifecycle (step 6 above) enforces correct ordering: wait for all channels to reach `Closing` before revoking. Client software MUST enforce this — it should block `clearDelegate()` if any channel opened during the session is still `Open`.
 
 **Residual risk from a compromised hot key.** If the hot key is extracted from memory while channels are open, an attacker can sign vouchers up to `channel.deposit`. Because `disputeChannel` also validates against the current delegate mapping, an attacker race is only possible while the delegation is still active. The client's response to a detected key compromise is:
+
 1. Immediately submit `disputeChannel` with the highest legitimate voucher (signed by the hardware wallet — `channel.client` signatures are always accepted regardless of delegate state).
 2. Do **not** call `clearDelegate()` until the dispute is won and the channel is at `Closing`.
 
