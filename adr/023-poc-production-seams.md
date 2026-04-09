@@ -8,7 +8,7 @@
 
 ## Context
 
-Every ADR from 001–022 contains a PoC vs production split: different contracts, different constants, simplified stand-in components, admin-key shortcuts, and deferred features. Without a canonical architectural pattern for managing these differences, implementation will produce scattered `if mode == Poc` checks throughout every crate, making both the PoC and the production path harder to reason about, test, and eventually remove.
+Every ADR from 001–022 contains a PoC vs production split: different contracts, different constants, simplified stand-in components, admin-key shortcuts, and deferred features. Without a canonical architectural pattern for managing these differences, implementation will produce scattered `if mode == PoC` checks throughout every crate, making both the PoC and the production path harder to reason about, test, and eventually remove.
 
 The goal is a clean mechanical answer to: **how does the codebase express the difference between PoC and production?**
 
@@ -303,7 +303,7 @@ crates/
 ## Alternatives Considered
 
 ### Runtime `NetworkMode` enum throughout
-Rejected. Leads to `if mode == Poc` branches scattered across all crates. Makes it impossible to statically verify that no PoC code runs in a production binary.
+Rejected. Leads to `if mode == PoC` branches scattered across all crates. Makes it impossible to statically verify that no PoC code runs in a production binary.
 
 ### Single implementation with `Option`-typed production fields
 Rejected. `Option<WatchtowerClient>` forces every call site to unwrap and handle the None case, which is just a verbose runtime mode-check with worse ergonomics.
