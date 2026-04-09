@@ -85,7 +85,7 @@ pub struct BlockchainArgs {
 #[derive(Args, Debug)]
 #[command(next_help_heading = "Cache")]
 pub struct CacheArgs {
-    /// Directory for cached blobs [default: <data-dir>/cache].
+    /// Directory for cached blobs \[default: \<data-dir\>/cache\].
     #[arg(long, value_name = "DIR", env = "DECDN_CACHE_DIR")]
     pub cache_dir: Option<PathBuf>,
 

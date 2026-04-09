@@ -1,0 +1,10 @@
+[workspace]
+shared-version = true
+tag-name = "v{{version}}"
+pre-release-hook = ["git-cliff", "--output", "CHANGELOG.md", "--tag", "v{{version}}"]
+pre-release-commit-message = "chore(release): v{{version}}"
+push = true
+push-remote = "origin"
+publish = false
+sign-tag = false
+dependent-version = "upgrade"
