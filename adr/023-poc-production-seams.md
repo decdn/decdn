@@ -211,17 +211,19 @@ pub fn build_components(config: &Config) -> Components {
 }
 
 fn network_constants() -> NetworkConstants {
-    #[cfg(feature = "poc")]
-    return NetworkConstants::poc();
-    #[cfg(not(feature = "poc"))]
-    return NetworkConstants::production();
+    if cfg!(feature = "poc") {
+        NetworkConstants::poc()
+    } else {
+        NetworkConstants::production()
+    }
 }
 
 fn key_store(config: &Config) -> Arc<dyn KeyStore> {
-    #[cfg(feature = "poc")]
-    return Arc::new(FileKeyStore::new(&config.key_dir));
-    #[cfg(not(feature = "poc"))]
-    return Arc::new(KeychainKeyStore::new(&config.keychain));
+    if cfg!(feature = "poc") {
+        Arc::new(FileKeyStore::new(&config.key_dir))
+    } else {
+        Arc::new(KeychainKeyStore::new(&config.keychain))
+    }
 }
 
 // ... same pattern for remaining seams
