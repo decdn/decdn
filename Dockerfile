@@ -44,6 +44,6 @@ WORKDIR /home/decdn
 
 VOLUME ["/home/decdn/.decdn"]
 
-EXPOSE 4433 9090
+EXPOSE 4433 9090  # QUIC transport, Prometheus metrics
 
 ENTRYPOINT ["decdn"]
