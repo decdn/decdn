@@ -19,3 +19,6 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    ignore:
+      # MSRV pin — dtolnay/rust-toolchain@1.85.0 is intentional; see ci.yml msrv job
+      - dependency-name: "dtolnay/rust-toolchain"
