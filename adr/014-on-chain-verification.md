@@ -80,8 +80,8 @@ EIP712Domain({
 
 1. Challenger submits the serialized message fields and `slash_sig` to `SlashJudge`.
 2. The contract reconstructs the EIP-712 typed data hash and calls `SignatureChecker.isValidSignatureNow(challengedNode, hash, slash_sig)` — **~3,000 gas** for EOA nodes, **~15,000 gas** for Safe-based nodes ([ADR 023](023-account-abstraction.md)).
-3. The recovered address is looked up in `StakingRegistry` to confirm it maps to a registered node.
-4. For offenses requiring two messages (phantom, rate manipulation), both must recover to the **same** address.
+3. The challenger-provided address is looked up in `StakingRegistry` to confirm it maps to a registered node.
+4. For offenses requiring two messages (phantom, rate manipulation), the signatures must both validate against the **same** node address.
 
 #### Node Implementation
 
@@ -191,15 +191,17 @@ A unified contract that adjudicates all four slashable offense types. The contra
 interface ISlashJudge {
     /// Phantom announcement: node signed has_blob=true then ok=false within 30s
     function submitPhantomChallenge(
+        address challengedNode,              // Ethereum address or Safe address of the challenged node
         bytes32 nodeId,
         bytes calldata probeResponseData,   // serialized {hash, has_blob, rate_per_mb, timestamp_us}
-        bytes calldata probeSlashSig,        // EIP-712 secp256k1 signature
+        bytes calldata probeSlashSig,        // EIP-712 signature (EOA or ERC-1271)
         bytes calldata streamResponseData,  // serialized {hash, ok, rate_per_mb, total_bytes, channel_id, timestamp_us, redirect}
-        bytes calldata streamSlashSig        // EIP-712 secp256k1 signature
+        bytes calldata streamSlashSig        // EIP-712 signature (EOA or ERC-1271)
     ) external;
 
     /// Rate manipulation: stream rate > probe rate within 30s window (deferred — 24h counter-evidence)
     function submitRateChallenge(
+        address challengedNode,
         bytes32 nodeId,
         bytes calldata probeResponseData,
         bytes calldata probeSlashSig,
@@ -209,6 +211,7 @@ interface ISlashJudge {
 
     /// Blacklist violation: serving a blacklisted hash after compliance window
     function submitBlacklistChallenge(
+        address challengedNode,
         bytes32 nodeId,
         bytes32 blobHash,
         bytes calldata responseData,   // ProbeResponse (has_blob=true) or StreamResponse (ok=true)
@@ -218,6 +221,7 @@ interface ISlashJudge {
 
     /// Corrupted delivery: node served bytes failing BLAKE3 verification
     function submitCorruptionChallenge(
+        address challengedNode,
         bytes32 nodeId,
         bytes32 blobHash,
         bytes calldata streamResponseData,
@@ -263,7 +267,7 @@ interface ISlashJudge {
 The challenged node may call `counterChallenge(challengeId, evidence)` within 24 hours, where `evidence` is the ABI-encoded `RateChange` fields plus `slash_sig`. The contract verifies:
 
 1. `SignatureChecker.isValidSignatureNow(challengedNode, rateChangeDigest, rateChangeSlashSig)` — must pass
-2. `rateChange.nodeId` matches the challenged node's registered `NodeId` in `StakingRegistry` — defense-in-depth alongside `ecrecover`, since `nodeId` (iroh Ed25519) and Ethereum address are different identity layers
+2. `rateChange.nodeId` matches the challenged node's registered `NodeId` in `StakingRegistry` — defense-in-depth alongside signature verification, since `nodeId` (iroh Ed25519) and Ethereum address are different identity layers
 3. `rateChange.old_rate_per_mb == probeResponse.rate_per_mb` — the prior rate matches what the node advertised in the probe, proving this specific rate transition is legitimate
 4. `rateChange.effective_at_us >= probeResponse.timestamp_us` — the rate change happened after the probe
 5. `rateChange.effective_at_us <= streamResponse.timestamp_us` — the rate change was effective before or at the stream response
