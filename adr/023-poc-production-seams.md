@@ -1,7 +1,7 @@
 # ADR 023 — PoC/Production Seam Architecture
 
-**Status:** Accepted  
-**Date:** 2026-04-08  
+**Status:** Accepted
+**Date:** 2026-04-08
 **Deciders:** Core team
 
 ---
@@ -38,9 +38,9 @@ The goal is a clean mechanical answer to: **how does the codebase express the di
 
 ## Decision
 
-**Use trait-based seams, with the single Cargo feature `poc` applied only to the `node` crate (the wiring point).** Leaf crates (`protocol`, `cache`) contain no mode-conditional code. Mode-specific implementations live in sibling modules within each crate; the `node` crate selects which concrete types to wire based on the `poc` feature.
+**Use trait-based seams, with two explicit Cargo features `poc` and `prod` applied only to the `node` crate (the wiring point).** Leaf crates (`protocol`, `cache`) contain no mode-conditional code. Mode-specific implementations live in sibling modules within each crate; the `node` crate selects which concrete types to wire via `#[cfg(feature = "poc")]` / `#[cfg(feature = "prod")]` attributes on separate function definitions.
 
-No `if mode == PoC` checks appear in internal crate logic. All branching is resolved at compile time at the top level.
+No `if mode == PoC` checks appear in internal crate logic. All branching is resolved at compile time at the top level. PoC code is physically absent from a production binary — it is excluded from compilation, not merely optimized away.
 
 ---
 
@@ -183,16 +183,17 @@ Concrete values:
 
 ---
 
-## Cargo Feature: `poc`
+## Cargo Features: `poc` and `prod`
 
-The `poc` Cargo feature is declared **only on the `node` crate**. Leaf crates (`protocol`, `cache`, `reputation`, `incentive`) do not declare or use it.
+Both features are declared **only on the `node` crate**. Leaf crates (`protocol`, `cache`, `reputation`, `incentive`) do not declare or use them. Exactly one must be set at build time; CI enforces this.
 
 ```toml
 # crates/node/Cargo.toml (additions to existing [features])
 [features]
 default = []
 otlp = [...]          # existing — OpenTelemetry export
-poc = []              # opt-in; enables PoC concrete implementations at wiring point
+poc  = []             # opt-in; PoC concrete implementations at wiring point
+prod = []             # opt-in; production concrete implementations at wiring point
 ```
 
 Usage in `crates/node/src/wiring.rs`:
@@ -210,26 +211,32 @@ pub fn build_components(config: &Config) -> Components {
     }
 }
 
+#[cfg(feature = "poc")]
 fn network_constants() -> NetworkConstants {
-    if cfg!(feature = "poc") {
-        NetworkConstants::poc()
-    } else {
-        NetworkConstants::production()
-    }
+    NetworkConstants::poc()
 }
 
+#[cfg(feature = "prod")]
+fn network_constants() -> NetworkConstants {
+    NetworkConstants::production()
+}
+
+#[cfg(feature = "poc")]
 fn key_store(config: &Config) -> Arc<dyn KeyStore> {
-    if cfg!(feature = "poc") {
-        Arc::new(FileKeyStore::new(&config.key_dir))
-    } else {
-        Arc::new(KeychainKeyStore::new(&config.keychain))
-    }
+    Arc::new(FileKeyStore::new(&config.key_dir))
+}
+
+#[cfg(feature = "prod")]
+fn key_store(config: &Config) -> Arc<dyn KeyStore> {
+    Arc::new(KeychainKeyStore::new(&config.keychain))
 }
 
 // ... same pattern for remaining seams
 ```
 
-`#[cfg(feature = "poc")]` appears **only** in `crates/node/src/wiring.rs` and `crates/node/src/main.rs`. It is **banned** in all other crates via a `rustflags` lint (see Enforcement below).
+This is a stronger guarantee than `if cfg!(feature = "poc")`: with the attribute form, the PoC branch is **excluded from compilation entirely** in a `prod` build. `FileKeyStore`, `NoopWatchtowerClient`, and other PoC types are not present in the production binary at all — not merely optimized away.
+
+`#[cfg(feature = "poc")]` and `#[cfg(feature = "prod")]` appear **only** in `crates/node/src/wiring.rs` and `crates/node/src/main.rs`. They are **banned** in all other crates via a `rustflags` lint (see Enforcement below).
 
 ### Contracts: `unsafe-admin` feature
 
@@ -277,11 +284,11 @@ crates/
 
 ### Rules
 
-1. **No `#[cfg(feature = "poc")]` outside `crates/node/src/wiring.rs` and `crates/node/src/main.rs`.** Enforced via `rustflags = ["-D", "unexpected_cfgs"]` with an explicit `check-cfg` list in `.cargo/config.toml`, or a `#[forbid(unexpected_cfgs)]` crate-level attribute on leaf crates.
+1. **No `#[cfg(feature = "poc")]` or `#[cfg(feature = "prod")]` outside `crates/node/src/wiring.rs` and `crates/node/src/main.rs`.** Enforced via `rustflags = ["-D", "unexpected_cfgs"]` with an explicit `check-cfg` list in `.cargo/config.toml`, or a `#[forbid(unexpected_cfgs)]` crate-level attribute on leaf crates.
 2. **No runtime `NetworkMode` enum.** All mode selection is compile-time. A PoC binary cannot accidentally run in production mode.
 3. **`NetworkConstants` is the single source of truth for all numeric differences.** No magic numbers elsewhere — always reference `constants.popular_hashes_max`, never literal `20`.
-4. **Both implementations must compile in CI.** The CI matrix builds with and without `--features poc`. This prevents PoC-only code rot and production-only breaks.
-5. **PoC implementations may panic on unimplemented production paths** (e.g., `KeychainKeyStore` is not compiled into a PoC binary), but must not `todo!()` on PoC paths that could be triggered at runtime.
+4. **Both implementations must compile in CI.** The CI matrix builds with `--features poc` and with `--features prod`. This prevents either path from rotting and catches type errors in both concrete implementations.
+5. **Exactly one of `poc` or `prod` must be set.** A build with neither (or both) is a compile error — `wiring.rs` will emit duplicate or missing function definitions. CI enforces this; the `node` binary's `main.rs` should `compile_error!` if neither feature is active.
 
 ---
 
@@ -291,13 +298,15 @@ crates/
 
 - Zero mode-conditional branches in internal crate logic
 - Both modes are tested in CI continuously — no surprise at production migration time
-- Production is the default compile target — no flag needed, no accidental PoC deployment
-- Removing PoC support later is a mechanical delete: remove `poc` feature, delete `file.rs`/`simple.rs`/`noop.rs`, remove `wiring.rs` `cfg` blocks
+- PoC code is **physically absent** from a production binary (excluded at compile time, not just optimized away) — provides a hard security boundary
+- Production is explicit (`--features prod`) — no accidental PoC deployment
+- Removing PoC support later is a mechanical delete: remove `poc` feature, delete `file.rs`/`simple.rs`/`noop.rs`, remove `wiring.rs` `#[cfg(feature = "poc")]` functions
 - `NetworkConstants` gives operators a single reference for all tunable differences
 
 ### Negative
 
 - Two concrete implementations must be maintained for each seam until production migration
+- Requires exactly one feature to be set — a neutral build (no feature) is a compile error, which may surprise contributors unfamiliar with the pattern
 - Adding a new seam requires registering it in `wiring.rs`; easy to forget
 
 ### Neutral
@@ -307,6 +316,22 @@ crates/
 ---
 
 ## Alternatives Considered
+
+### `cfg!()` macro with `if`/`else` in a single function
+
+Considered (and initially implemented) as:
+
+```rust
+fn network_constants() -> NetworkConstants {
+    if cfg!(feature = "poc") {
+        NetworkConstants::poc()
+    } else {
+        NetworkConstants::production()
+    }
+}
+```
+
+Rejected. `cfg!()` is a macro that evaluates to `true`/`false` at compile time, but **both branches are still compiled**. The compiler may optimize away the dead branch, but this is not guaranteed — PoC types (`FileKeyStore`, `NoopWatchtowerClient`) may be present in the production binary. The `#[cfg()]` attribute form on separate function definitions provides a hard guarantee: excluded code is never compiled, never linked, and never present in the binary.
 
 ### Runtime `NetworkMode` enum throughout
 
