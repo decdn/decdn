@@ -1,0 +1,244 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      level:
+        description: "Release level"
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+      dry_run:
+        description: "Dry run (no publish, no push)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-release,git-cliff
+
+      # inputs.level is a constrained choice enum (patch/minor/major), not free-text
+      - name: Validate release (dry run)
+        if: inputs.dry_run
+        run: cargo release "$LEVEL" --workspace --no-confirm --no-publish --no-push --no-tag --execute
+        env:
+          LEVEL: ${{ inputs.level }}
+
+      - name: Execute release
+        if: ${{ !inputs.dry_run }}
+        run: cargo release "$LEVEL" --workspace --no-confirm --no-publish --execute
+        env:
+          LEVEL: ${{ inputs.level }}
+
+      - name: Get new version
+        if: ${{ !inputs.dry_run }}
+        id: version
+        run: |
+          VERSION=$(cargo metadata --no-deps --format-version 1 | \
+            jq -r '.packages[] | select(.name == "decdn-node") | .version')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        if: ${{ !inputs.dry_run }}
+        run: |
+          git cliff --latest --strip header > /tmp/release-notes.md
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes-file /tmp/release-notes.md
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+
+  build-binaries:
+    name: Build ${{ matrix.target }}
+    needs: release
+    if: ${{ !inputs.dry_run }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            binary: decdn
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            binary: decdn
+            archive: tar.gz
+            cross: true
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            binary: decdn
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            binary: decdn
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            binary: decdn.exe
+            archive: zip
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Install cross
+        if: matrix.cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --release --package decdn-node --target "$TARGET"
+        env:
+          RUSTC_WRAPPER: sccache
+          SCCACHE_GHA_ENABLED: "true"
+          TARGET: ${{ matrix.target }}
+
+      - name: Build (native)
+        if: ${{ !matrix.cross }}
+        run: cargo build --release --package decdn-node --target "$TARGET"
+        env:
+          RUSTC_WRAPPER: sccache
+          SCCACHE_GHA_ENABLED: "true"
+          TARGET: ${{ matrix.target }}
+
+      - name: Archive (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        run: |
+          cd "target/$TARGET/release"
+          tar czf "../../../decdn-${VERSION}-${TARGET}.tar.gz" "$BINARY"
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.release.outputs.version }}
+          BINARY: ${{ matrix.binary }}
+
+      - name: Archive (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "target/$env:TARGET/release/$env:BINARY" `
+            -DestinationPath "decdn-$env:VERSION-$env:TARGET.zip"
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.release.outputs.version }}
+          BINARY: ${{ matrix.binary }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: decdn-${{ matrix.target }}
+          path: decdn-${{ needs.release.outputs.version }}-${{ matrix.target }}.*
+
+  upload-assets:
+    name: Upload release assets
+    needs: [release, build-binaries]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Upload to GitHub Release
+        run: gh release upload "$TAG" artifacts/*
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.release.outputs.tag }}
+
+  docker:
+    name: Docker image
+    needs: release
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}},value=v${{ needs.release.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=v${{ needs.release.outputs.version }}
+            type=raw,value=latest
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
