@@ -20,7 +20,7 @@ RUN mkdir -p crates/node/src crates/protocol/src crates/cache/src \
           crates/incentive/src/lib.rs crates/reputation/src/lib.rs
 
 # Build dependencies only (cached until Cargo.toml/Cargo.lock change)
-RUN cargo build --release --package decdn-node 2>/dev/null || true
+RUN cargo build --release --package decdn-node || true
 
 # Copy actual source and rebuild
 COPY crates crates
@@ -44,6 +44,6 @@ WORKDIR /home/decdn
 
 VOLUME ["/home/decdn/.decdn"]
 
-EXPOSE 4919
+EXPOSE 4433 9090
 
 ENTRYPOINT ["decdn"]

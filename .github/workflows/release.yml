@@ -54,7 +54,7 @@ jobs:
       # inputs.level is a constrained choice enum (patch/minor/major), not free-text
       - name: Validate release (dry run)
         if: inputs.dry_run
-        run: cargo release "$LEVEL" --workspace --no-confirm --no-publish --no-push --no-tag --execute
+        run: cargo release "$LEVEL" --workspace --no-confirm --no-publish --no-push --no-tag
         env:
           LEVEL: ${{ inputs.level }}
 
@@ -117,7 +117,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: main
+          ref: ${{ needs.release.outputs.tag }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -206,7 +206,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: main
+          ref: ${{ needs.release.outputs.tag }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
