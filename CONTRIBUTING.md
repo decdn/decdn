@@ -139,7 +139,7 @@ Hooks: trailing-whitespace, end-of-file-fixer, check-yaml, check-merge-conflict,
 ```bash
 cargo build && cargo clippy          # build + lint
 cargo nextest run                    # test (preferred over cargo test)
-cargo nextest run -p protocol        # single crate
+cargo nextest run -p decdn-protocol   # single crate
 cargo fmt -- --check                 # check formatting
 cargo deny check                     # license + advisory audit (deny.toml)
 ```
@@ -158,7 +158,7 @@ ADRs in `adr/` are the primary deliverables right now. `adr/architecture.md` is 
 
 **Conventions:**
 
-- File naming: `NNN-topic.md` (zero-padded 3-digit prefix, next number is 023)
+- File naming: `NNN-topic.md` (zero-padded 3-digit prefix). Check `adr/` for the current highest number to determine the next sequence.
 - When changing any ADR, check for cross-ADR consistency — terms, parameters, and protocol names must match across all ADRs and `architecture.md`. This is the most common source of bugs in this repo.
 - `architecture.md` must be updated whenever an ADR changes a user-visible summary point
 
