@@ -188,9 +188,10 @@ Concrete values:
 The `poc` Cargo feature is declared **only on the `node` crate**. Leaf crates (`protocol`, `cache`, `reputation`, `incentive`) do not declare or use it.
 
 ```toml
-# crates/node/Cargo.toml
+# crates/node/Cargo.toml (additions to existing [features])
 [features]
-default = []          # production is the default — no flag required
+default = []
+otlp = [...]          # existing — OpenTelemetry export
 poc = []              # opt-in; enables PoC concrete implementations at wiring point
 ```
 
