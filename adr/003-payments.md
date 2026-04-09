@@ -844,18 +844,23 @@ The hardware wallet flow per session:
 2. **On-chain registration.** Client calls `setDelegate(hotKeyAddress)` from the hardware wallet (one transaction, ~$0.05 gas on Arbitrum).
 3. **Channel open.** Client calls `openChannel(provider, deposit)` from the hardware wallet (one transaction).
 4. **Streaming.** The hot key signs all vouchers in memory. Zero hardware wallet interactions during delivery.
-5. **Channel close.** The node calls `closeChannel` with the latest voucher (signed by the hot key, valid because of the delegate mapping). The hardware wallet is not needed.
-6. **Session end.** Client calls `clearDelegate()` from the hardware wallet, or relies on the next session's `setDelegate` to overwrite. The hot key is wiped from memory.
+5. **Channel close.** The node calls `closeChannel` with the latest voucher (signed by the hot key, valid because of the delegate mapping). The client waits for `closeChannel` to be confirmed on-chain (status → `Closing`). The hardware wallet is not needed for close.
+6. **Session end — sequencing requirement.** Client MUST NOT call `clearDelegate()` until all channels opened during the session have reached `Closing` or `Closed` status. Once all channels are at least `Closing`, `clearDelegate()` is safe — the node already has its voucher on-chain and `disputeChannel` (which does require a valid signature) cannot be called with a higher nonce than what was submitted at close. After `clearDelegate()` is confirmed, the hot key is wiped from memory.
 
 **PoC client flow.** The PoC `FileKeyStore` loads an Ethereum key from disk and signs vouchers directly. `setDelegate` / `clearDelegate` are not called. No code path in PoC exercises delegation.
 
 ### Revocation Semantics and Residual Risk
 
-`clearDelegate()` is effective immediately on-chain — after the transaction is confirmed, the contract will reject new vouchers signed by the former delegate. However:
+`clearDelegate()` is effective immediately on-chain — after the transaction is confirmed, the contract reads `address(0)` for that client and will **reject all voucher signatures from the former delegate**. EVM contracts operate on current state only; there is no mechanism to verify that a signature was produced while a mapping held a different value. This has two implications:
 
-- **Vouchers already held by a node** (signed before revocation) remain valid — they were produced while the delegation was active and the signature is verifiable against the historical on-chain state at the time the voucher was signed. This is safe: the node cannot produce new vouchers post-revocation, only redeem ones it already holds.
-- **Maximum exposure** is one voucher interval at the negotiated cadence (see [Voucher Interval Negotiation](#voucher-interval-negotiation)). A compromised hot key cannot extract more than the latest acknowledged voucher amount minus the previously settled amount.
-- **Worst-case revocation scenario.** If a hot key is compromised and the attacker signs a voucher for `channel.deposit`, the node can submit it during the dispute window. The client's recourse is to call `disputeChannel` with a legitimate lower-nonce voucher *before* the attacker does — but since the attacker's forged voucher has a higher nonce it would win the dispute. This is the same trust model as a compromised `channel.client` key. Mitigation: keep the hot key memory-only, scoped to the session, and `clearDelegate` at session end.
+- **Vouchers held by a node become unclaimable after revocation.** If a node holds a delegate-signed voucher and the client calls `clearDelegate()` before that voucher is submitted on-chain (via `closeChannel` or `disputeChannel`), the contract will reject the voucher and the node cannot claim payment for those bytes. Nodes SHOULD initiate `closeChannel` before the client revokes.
+- **Sequencing is the safety mechanism.** The client-side lifecycle (step 6 above) enforces correct ordering: wait for all channels to reach `Closing` before revoking. Client software MUST enforce this — it should block `clearDelegate()` if any channel opened during the session is still `Open`.
+
+**Residual risk from a compromised hot key.** If the hot key is extracted from memory while channels are open, an attacker can sign vouchers up to `channel.deposit`. Because `disputeChannel` also validates against the current delegate mapping, an attacker race is only possible while the delegation is still active. The client's response to a detected key compromise is:
+1. Immediately submit `disputeChannel` with the highest legitimate voucher (signed by the hardware wallet — `channel.client` signatures are always accepted regardless of delegate state).
+2. Do **not** call `clearDelegate()` until the dispute is won and the channel is at `Closing`.
+
+Mitigation: keep the hot key memory-only, scoped to the session, and enforce the sequencing requirement (step 6) in all client implementations.
 
 ### Alternatives Considered
 
