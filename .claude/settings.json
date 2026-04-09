@@ -5,6 +5,7 @@
     "blockchain-web3@claude-code-workflows": true,
     "github@claude-plugins-official": true,
     "documentation-generation@claude-code-workflows": true,
-    "cicd-automation@claude-code-workflows": true
+    "cicd-automation@claude-code-workflows": true,
+    "systems-programming@claude-code-workflows": true
   }
 }
