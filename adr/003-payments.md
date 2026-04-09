@@ -47,14 +47,16 @@ Opening, closing, and settling a channel requires three on-chain transactions to
 
 **Amortization.** The overhead percentages above represent worst-case single-session economics. Long-lived channels amortize open/settle costs across many sessions: a channel used for 30 sessions costs ~$0.008/session in gas ([ADR 004](004-tokenomics.md)). Channels extended via `topUp` amortize further since only the initial open and final settle incur gas.
 
-#### Future: Gasless Channel Opens
+#### Smart Account Support and Gasless Channel Opens
 
-Two standards can eliminate the requirement for clients to hold native L2 tokens (ETH on Arbitrum) for gas, improving onboarding:
+All deCDN contracts use OpenZeppelin `SignatureChecker` for signature verification, supporting both EOA (via `ecrecover`) and smart account wallets (via ERC-1271 `isValidSignature`) from the PoC. Safe smart wallets are the recommended wallet type for both node operators and clients — see [ADR 023](023-account-abstraction.md).
+
+Two standards can further eliminate the requirement for clients to hold native L2 tokens (ETH on Arbitrum) for gas:
 
 - **ERC-2771 meta-transactions.** A relayer submits the `openChannel` transaction on behalf of the client, paying gas. The client signs an ERC-2771 forwarding request; the relayer recoups gas from the deposit or a separate sponsorship fund. Requires adding a trusted-forwarder check to the contract.
 - **ERC-4337 account abstraction.** Smart contract wallets batch USDC approval + channel open into a single user operation. A paymaster can sponsor gas in USDC rather than ETH. Works with unmodified contracts — no changes to `StablePaymentChannel` needed.
 
-Both are deferred to post-PoC. For the PoC, clients must hold both USDC and a small amount of ETH for gas.
+Gas abstraction via ERC-2771 or ERC-4337 paymasters is deferred to production. For the PoC, clients must hold both USDC and a small amount of ETH for gas.
 
 ### Voucher Interval Negotiation
 
@@ -565,7 +567,7 @@ bytes32 digest = keccak256(abi.encodePacked(
 ));
 ```
 
-**Verification:** Implementations must use a hardened ECDSA helper (e.g., OpenZeppelin's `ECDSA.recover`) or equivalent logic that rejects non-canonical `s` values and restricts `v` to `27`/`28`. The recovered signer must equal `channel.client`. The signature is encoded as 65 bytes (`r || s || v`), matching the format used by `eth_sign` and standard Ethereum libraries.
+**Verification:** Implementations must use OpenZeppelin's `SignatureChecker.isValidSignatureNow(channel.client, digest, signature)`, which transparently supports both EOA signers (via hardened `ECDSA.recover` that rejects non-canonical `s` values and restricts `v` to `27`/`28`) and smart account signers (via ERC-1271 `isValidSignature`). The signature is encoded as 65 bytes (`r || s || v`) for EOA signers; smart account signers may use longer signatures per their wallet implementation. See [ADR 023](023-account-abstraction.md) for the full account abstraction design.
 
 The `DOMAIN_SEPARATOR` is computed once in the constructor and stored as an immutable. If the contract is deployed behind a proxy and may be migrated to a different chain, it should be cached in a state variable and recomputed only when `block.chainid` changes (the pattern used by OpenZeppelin's `EIP712` base contract), rather than on every call.
 
@@ -694,7 +696,7 @@ function bindNodeId(bytes32 nodeId, bytes calldata signature) external {
         DOMAIN_SEPARATOR,
         keccak256(abi.encode(BIND_NODE_TYPEHASH, nodeId, nonce))
     ));
-    require(ECDSA.recover(digest, signature) == msg.sender, "invalid signature");
+    require(SignatureChecker.isValidSignatureNow(msg.sender, digest, signature), "invalid signature");
 
     // Reject if nodeId is already bound to a different address
     address existingOwner = nodeIdToAddress[nodeId];
@@ -722,7 +724,7 @@ function resolveNodeId(bytes32 nodeId) external view returns (address) {
 
 ### Off-Chain (Ephemeral) Binding for Clients
 
-Clients who do not wish to register on-chain (e.g., for priority staking lookups only) include a signed binding in their `StreamRequest`. The node verifies the EIP-712 signature over `BindNodeId(nodeId, nonce=0)` using `ecrecover`, confirms the recovered address matches the claimed Ethereum address, and uses that address for `clientStakeOf` lookups. This ephemeral binding is not stored on-chain and is valid only for the session.
+Clients who do not wish to register on-chain (e.g., for priority staking lookups only) include a signed binding in their `StreamRequest`. The node verifies the EIP-712 signature over `BindNodeId(nodeId, nonce=0)` using `SignatureChecker` semantics: `ecrecover` for EOA clients, or an RPC call to `isValidSignature` for smart account clients ([ADR 023](023-account-abstraction.md#4-off-chain-erc-1271-verification)). The verified address is used for `clientStakeOf` lookups. This ephemeral binding is not stored on-chain and is valid only for the session.
 
 ### Binding Requirements by Role
 
