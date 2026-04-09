@@ -285,6 +285,7 @@ crates/
 ## Consequences
 
 ### Positive
+
 - Zero mode-conditional branches in internal crate logic
 - Both modes are tested in CI continuously — no surprise at production migration time
 - Production is the default compile target — no flag needed, no accidental PoC deployment
@@ -292,10 +293,12 @@ crates/
 - `NetworkConstants` gives operators a single reference for all tunable differences
 
 ### Negative
+
 - Two concrete implementations must be maintained for each seam until production migration
 - Adding a new seam requires registering it in `wiring.rs`; easy to forget
 
 ### Neutral
+
 - Solidity contract selection is outside Rust's feature system — managed via separate Foundry deploy scripts, which is already the standard Foundry pattern
 
 ---
@@ -303,15 +306,19 @@ crates/
 ## Alternatives Considered
 
 ### Runtime `NetworkMode` enum throughout
+
 Rejected. Leads to `if mode == PoC` branches scattered across all crates. Makes it impossible to statically verify that no PoC code runs in a production binary.
 
 ### Single implementation with `Option`-typed production fields
+
 Rejected. `Option<WatchtowerClient>` forces every call site to unwrap and handle the None case, which is just a verbose runtime mode-check with worse ergonomics.
 
 ### Two separate repositories
+
 Rejected. Shared protocol types, cache logic, and contract interaction code is large enough that duplication would create divergence. The trait abstraction achieves the same clean separation within a monorepo.
 
 ### Compile-time `#[cfg(feature = "poc")]` throughout all crates
+
 Rejected. Scatters the PoC/production boundary into every crate, making it hard to track all the differences and audit the production surface. Centralizing in `wiring.rs` gives a single readable inventory.
 
 ---
