@@ -259,6 +259,12 @@ Probe fan-out is O(N) per cache miss and does not scale beyond ~100 nodes. Gossi
 
 Opens N connections to N different nodes simultaneously, each serving a non-overlapping byte range. Range assignment probes N candidates, assigns fastest to first range. Minimum range: 256 MiB. Channel overhead (~$0.23 × N) dominates for small blobs; the economic breakeven is ~9 GiB for N=4 at $0.01/GB. Sequential streaming (`--streaming` flag or piped output) overrides and forces single-channel delivery. Node failure mid-range triggers re-probe and channel reopen from last BLAKE3-verified byte. Part files written to `~/.decdn/downloads/<hash>/range-N.part`; full-blob BLAKE3 verified after reassembly.
 
+### [ADR 025 — Client Download Resume: Crash Recovery and State Persistence](025-download-resume.md)
+
+**Atomic `state.json` (write-to-temp + rename) under `~/.decdn/downloads/<hash>/`; resume from last BLAKE3-verified byte via `byte_offset`. Voucher nonce flushed on every send. Reuses open payment channels on reconnect; deposits only remaining bytes on new channel. 64 MiB flush cadence; worst-case re-download per crash: 64 MiB.**
+
+On-disk layout: `state.json` (authoritative, atomically replaced), `blob.partial` (single-channel) or `range-N.part` (multi-channel, ADR 024). `state.json` records per-range `verified_offset`, `channel_id`, `voucher_nonce`, and `node_id`. Resume reconnects to the same node or re-probes a replacement; sends `StreamRequest{byte_offset: verified_offset}`. Channel reuse avoids the $0.23 lifecycle overhead if the channel is still open. Stale state cleanup via `decdn downloads` subcommands; 30-day abandonment threshold.
+
 ## Key Invariants
 
 - No external origin URL exists — content enters the network through origin-backed nodes whose backends are hidden
