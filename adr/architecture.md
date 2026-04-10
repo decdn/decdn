@@ -253,17 +253,17 @@ Resolves the explicit deferral in ADR 004 and formalises the Arbitrum assumption
 
 Probe fan-out is O(N) per cache miss and does not scale beyond ~100 nodes. Gossip content announcements were rejected (unbounded traffic proportional to cache churn). Hash-prefix range hints were rejected (economically irrational — nodes cache popular content regardless of hash prefix). The production path is a lightweight Kademlia subset (`cdn/dht/v1` ALPN): nodes self-publish `(hash → NodeId)` STORE records when caching a blob, attracting paying clients; FIND_VALUE lookups are O(log N). No discovery fees — all revenue stays on delivery. Popularity is surfaced by two complementary signals: `popular_hashes` gossip (advisory, self-reported; suppression is self-limiting via `LoadHint`/selection score) and DHT FIND_VALUE query frequency (non-suppressible — routing traffic reaches nearby-keyspace nodes regardless of gossip). The probe step (`cdn/probe/v1`) is preserved as the final availability confirmation before any delivery commitment.
 
-### [ADR 024 — Client Parallelism: Multi-Node Parallel Blob Download](024-client-parallelism.md)
-
-**Multi-node parallel download (BitTorrent-style) via `--max-channels N` CLI flag. One payment channel per node; N equal byte ranges assigned by latency rank. Economically viable only above ~10 GiB; default is single-channel (N=1). Incompatible with sequential streaming output. PoC caps `--max-channels` at 1.**
-
-Opens N connections to N different nodes simultaneously, each serving a non-overlapping byte range. Range assignment probes N candidates, assigns fastest to first range. Minimum range: 256 MiB. Channel overhead (~$0.23 × N) dominates for small blobs; the economic breakeven is ~9 GiB for N=4 at $0.01/GB. Sequential streaming (`--streaming` flag or piped output) overrides and forces single-channel delivery. Node failure mid-range triggers re-probe and channel reopen from last BLAKE3-verified byte. Part files written to `~/.decdn/downloads/<hash>/range-N.part`; full-blob BLAKE3 verified after reassembly.
-
 ### [ADR 025 — Client Download Resume: Crash Recovery and State Persistence](025-download-resume.md)
 
 **Atomic `state.json` (write-to-temp + rename) under `~/.decdn/downloads/<hash>/`; resume from last BLAKE3-verified byte via `byte_offset`. Voucher nonce flushed on every send. Reuses open payment channels on reconnect; deposits only remaining bytes on new channel. 64 MiB flush cadence; worst-case re-download per crash: 64 MiB.**
 
 On-disk layout: `state.json` (authoritative, atomically replaced), `blob.partial` (single-channel) or `range-N.part` (multi-channel, ADR 024). `state.json` records per-range `verified_offset`, `channel_id`, `voucher_nonce`, and `node_id`. Resume reconnects to the same node or re-probes a replacement; sends `StreamRequest{byte_offset: verified_offset}`. Channel reuse avoids the $0.23 lifecycle overhead if the channel is still open. Stale state cleanup via `decdn downloads` subcommands; 30-day abandonment threshold.
+
+### [ADR 026 — File-to-Blob Mapping, Manifests, and Reconstruction](026-file-reconstruction.md)
+
+**Files split into 256 MiB chunks at ingest; a manifest blob (postcard-encoded) lists ordered chunk hashes and is the canonical file identifier. Client fetches manifest first, then chunks; full-file BLAKE3 verified after reassembly. Blobs retained by default for re-serving. Encrypted files use per-chunk K\_blob via ADR 006 epoch key scheme.**
+
+The manifest is a content-addressed blob: its BLAKE3 hash is the shareable file ID distributed out-of-band by the content provider. Chunk-level verification catches corruption early without re-downloading the full file. Chunk boundaries align with ADR 024 range assignment for parallel download. Per-chunk encryption (ADR 006) keeps K\_blob out of the manifest (served by app server only). Single-blob raw downloads remain unchanged — manifest parsing is attempted first; failure falls back to raw blob. PoC supports single-chunk manifests only.
 
 ## Key Invariants
 
