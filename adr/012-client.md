@@ -285,14 +285,14 @@ decdn pull <hash> --max-channels <N> -o <output>
 
 ### Economic threshold
 
-Opening, closing, and settling a payment channel costs ~$0.23 on Arbitrum L2 ([ADR 003](003-payments.md)). For N nodes that is N × $0.23 in fixed overhead before a byte is delivered. At $0.01/GB, parallelism is only economical above ~10 GiB for N = 4. The `--min-blob-size` flag (default: 10 GiB) disables parallelism for smaller blobs.
+Opening, closing, and settling a payment channel costs ~$0.23 on Arbitrum L2 ([ADR 003](003-payments.md)). For N nodes that is N × $0.23 in fixed overhead before a byte is delivered. At $0.01/GB, the fixed overhead of parallelism is significant; it is recommended only for large blobs (e.g., > 10 GiB) to amortize the per-channel cost. The `--min-blob-size` flag (default: 10 GiB) disables parallelism for smaller blobs.
 
 ### Range assignment
 
 1. Probe N candidates; confirm `has_blob: true` and collect latency.
 2. Learn `total_bytes` from the first `StreamResponse` (or from the manifest — see below).
-3. Divide `[0, total_bytes)` into N equal ranges; last range absorbs the remainder.
-   Minimum range: 256 MiB — reduce N if necessary.
+3. Divide `total_bytes` into N ranges aligned to the 256 MiB chunk boundary; last range absorbs
+   the remainder. Minimum range: 256 MiB — reduce N if necessary.
 4. Assign lowest-latency node to first range (minimises time-to-first-byte).
 
 One payment channel per node; channel deposit sized for its assigned range plus a 5% buffer.
@@ -342,7 +342,7 @@ Location overridden by `DECDN_DOWNLOADS_DIR` env var or `--downloads-dir` flag.
     {
       "start_byte": 0,
       "end_byte": 17476266666,
-      "verified_offset": 8738133333,  // last BLAKE3-verified byte; -1 = none
+      "verified_offset": 8738133333,  // next byte to fetch; 0 = start of range
       "channel_id": "0xabc...def",    // null if not yet opened
       "voucher_nonce": 42,            // -1 = no vouchers sent yet
       "node_id": "..."
@@ -366,7 +366,7 @@ Worst-case re-download after a crash: 64 MiB per range.
 On startup, `decdn pull <hash>` checks for an existing download directory:
 
 - **Not found:** start fresh.
-- **Found:** load `state.json`; for each range with `verified_offset >= 0`, reconnect to the
+- **Found:** load `state.json`; for each range with `verified_offset > 0`, reconnect to the
   same node (or re-probe a replacement), open or reuse the channel, send
   `StreamRequest{byte_offset: verified_offset}`, and continue writing from that offset.
 
@@ -404,6 +404,7 @@ for origin-produced content — CDN nodes serve any BLAKE3-addressed blob regard
 
 ```rust
 struct Manifest {
+    magic: [u8; 8],       // b"DECDNMAN" — checked before deserialization
     version: u8,          // currently 1
     total_bytes: u64,
     mime_type: String,    // empty if unknown
@@ -444,8 +445,8 @@ them via iroh-blobs. Pass `--no-keep-blobs` to delete immediately after reconstr
 
 ### Backward compatibility
 
-Raw single-blob downloads are unchanged. The client attempts to deserialise a fetched blob as
-a `Manifest`; on failure it treats the bytes as a raw blob. Content providers signal
+Raw single-blob downloads are unchanged. The client checks the `DECDNMAN` magic header; on
+failure (wrong or missing magic) it treats the bytes as a raw blob. Content providers signal
 manifest vs. raw out-of-band.
 
 **PoC simplification:** single-chunk manifests only (validates the format end-to-end);
