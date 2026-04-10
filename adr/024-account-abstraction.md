@@ -1,4 +1,4 @@
-# ADR 023: Account Abstraction and Safe Smart Wallet Support
+# ADR 024: Account Abstraction and Safe Smart Wallet Support
 
 **Date:** 2026-04-09
 **Status:** Draft

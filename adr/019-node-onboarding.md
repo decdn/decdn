@@ -344,8 +344,8 @@ after re-registration to associate the new `nodeId` with the same `ethAddress` �
 | Area | PoC | Production |
 |------|-----|------------|
 | NODE key storage | Encrypted file | Platform keychain / HSM |
-| ETH gas sponsor | Operator provides ETH directly | ERC-4337 paymaster (gas-in-USDC) — see [ADR 023](023-account-abstraction.md) |
-| Operator wallet | EOA or Safe ([ADR 023](023-account-abstraction.md)) | Safe multisig recommended (2-of-3) with session keys |
+| ETH gas sponsor | Operator provides ETH directly | ERC-4337 paymaster (gas-in-USDC) — see [ADR 024](024-account-abstraction.md) |
+| Operator wallet | EOA or Safe ([ADR 024](024-account-abstraction.md)) | Safe multisig recommended (2-of-3) with session keys |
 | Multiaddr cooldown | None | Governable (default 0, can be tightened) |
 | Origin assignment | Operator self-configures | Evaluated in [Issue #189](https://github.com/thiras/decdn/issues/189) |
 | Geolocation verification | Self-reported `regionHint` | Deferred — see Issue #190 gap 7 |
@@ -385,4 +385,4 @@ after re-registration to associate the new `nodeId` with the same `ethAddress` �
 - **Geolocation verification.** Self-reported `regionHint` is an accepted PoC risk.
   Production should use a decentralized oracle or attestation service — see Issue #190,
   gap 7.
-- ~~**Delegated voucher signer.**~~ Resolved — [ADR 023](023-account-abstraction.md) specifies Safe session keys for high-frequency signing (vouchers and slash_sig), replacing the delegated signer approach.
+- ~~**Delegated voucher signer.**~~ Resolved — [ADR 024](024-account-abstraction.md) specifies Safe session keys for high-frequency signing (vouchers and slash_sig), replacing the delegated signer approach.

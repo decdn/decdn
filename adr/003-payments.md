@@ -49,7 +49,7 @@ Opening, closing, and settling a channel requires three on-chain transactions to
 
 #### Smart Account Support and Gasless Channel Opens
 
-All deCDN contracts use OpenZeppelin `SignatureChecker` for signature verification, supporting both EOA (via `ecrecover`) and smart account wallets (via ERC-1271 `isValidSignature`) from the PoC. Safe smart wallets are the recommended wallet type for both node operators and clients — see [ADR 023](023-account-abstraction.md).
+All deCDN contracts use OpenZeppelin `SignatureChecker` for signature verification, supporting both EOA (via `ecrecover`) and smart account wallets (via ERC-1271 `isValidSignature`) from the PoC. Safe smart wallets are the recommended wallet type for both node operators and clients — see [ADR 024](024-account-abstraction.md).
 
 Two standards can further eliminate the requirement for clients to hold native L2 tokens (ETH on Arbitrum) for gas:
 
@@ -567,7 +567,7 @@ bytes32 digest = keccak256(abi.encodePacked(
 ));
 ```
 
-**Verification:** Implementations must use OpenZeppelin's `SignatureChecker.isValidSignatureNow(channel.client, digest, signature)`, which transparently supports both EOA signers (via hardened `ECDSA.recover` that rejects non-canonical `s` values and restricts `v` to `27`/`28`) and smart account signers (via ERC-1271 `isValidSignature`). The signature is encoded as 65 bytes (`r || s || v`) for EOA signers; smart account signers may use longer signatures per their wallet implementation. See [ADR 023](023-account-abstraction.md) for the full account abstraction design.
+**Verification:** Implementations must use OpenZeppelin's `SignatureChecker.isValidSignatureNow(channel.client, digest, signature)`, which transparently supports both EOA signers (via hardened `ECDSA.recover` that rejects non-canonical `s` values and restricts `v` to `27`/`28`) and smart account signers (via ERC-1271 `isValidSignature`). The signature is encoded as 65 bytes (`r || s || v`) for EOA signers; smart account signers may use longer signatures per their wallet implementation. See [ADR 024](024-account-abstraction.md) for the full account abstraction design.
 
 The `DOMAIN_SEPARATOR` is computed once in the constructor and stored as an immutable. If the contract is deployed behind a proxy and may be migrated to a different chain, it should be cached in a state variable and recomputed only when `block.chainid` changes (the pattern used by OpenZeppelin's `EIP712` base contract), rather than on every call.
 
@@ -724,7 +724,7 @@ function resolveNodeId(bytes32 nodeId) external view returns (address) {
 
 ### Off-Chain (Ephemeral) Binding for Clients
 
-Clients who do not wish to register on-chain (e.g., for priority staking lookups only) include a signed binding in their `StreamRequest`. The node verifies the EIP-712 signature over `BindNodeId(nodeId, nonce=0)` using `SignatureChecker` semantics: `ecrecover` for EOA clients, or an RPC call to `isValidSignature` for smart account clients ([ADR 023](023-account-abstraction.md#4-off-chain-erc-1271-verification)). The verified address is used for `clientStakeOf` lookups. This ephemeral binding is not stored on-chain and is valid only for the session.
+Clients who do not wish to register on-chain (e.g., for priority staking lookups only) include a signed binding in their `StreamRequest`. The node verifies the EIP-712 signature over `BindNodeId(nodeId, nonce=0)` using `SignatureChecker` semantics: `ecrecover` for EOA clients, or an RPC call to `isValidSignature` for smart account clients ([ADR 024](024-account-abstraction.md#4-off-chain-erc-1271-verification)). The verified address is used for `clientStakeOf` lookups. This ephemeral binding is not stored on-chain and is valid only for the session.
 
 ### Binding Requirements by Role
 

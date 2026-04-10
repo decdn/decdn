@@ -79,7 +79,7 @@ EIP712Domain({
 #### On-Chain Verification Flow
 
 1. Challenger submits the serialized message fields and `slash_sig` to `SlashJudge`.
-2. The contract reconstructs the EIP-712 typed data hash and calls `SignatureChecker.isValidSignatureNow(challengedNode, hash, slash_sig)` — **~3,000 gas** for EOA nodes, **~15,000 gas** for Safe-based nodes ([ADR 023](023-account-abstraction.md)).
+2. The contract reconstructs the EIP-712 typed data hash and calls `SignatureChecker.isValidSignatureNow(challengedNode, hash, slash_sig)` — **~3,000 gas** for EOA nodes, **~15,000 gas** for Safe-based nodes ([ADR 024](024-account-abstraction.md)).
 3. The challenger-provided address is looked up in `StakingRegistry` to confirm it maps to a registered node.
 4. For offenses requiring two messages (phantom, rate manipulation), the signatures must both validate against the **same** node address.
 
@@ -185,7 +185,7 @@ A unified contract that adjudicates all four slashable offense types. The contra
 
 #### Interface
 
-**Encoding convention.** The `bytes calldata` arguments named `*ResponseData` in the interface below are **ABI-encoded structs** matching the EIP-712 typed data fields (not postcard wire bytes). The contract ABI-decodes these fields, reconstructs the EIP-712 struct hash, and verifies using `SignatureChecker.isValidSignatureNow` ([ADR 023](023-account-abstraction.md)). This ensures a single canonical encoding for both the contract and off-chain signature construction.
+**Encoding convention.** The `bytes calldata` arguments named `*ResponseData` in the interface below are **ABI-encoded structs** matching the EIP-712 typed data fields (not postcard wire bytes). The contract ABI-decodes these fields, reconstructs the EIP-712 struct hash, and verifies using `SignatureChecker.isValidSignatureNow` ([ADR 024](024-account-abstraction.md)). This ensures a single canonical encoding for both the contract and off-chain signature construction.
 
 ```solidity
 interface ISlashJudge {
