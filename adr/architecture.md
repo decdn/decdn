@@ -253,6 +253,12 @@ Resolves the explicit deferral in ADR 004 and formalises the Arbitrum assumption
 
 Probe fan-out is O(N) per cache miss and does not scale beyond ~100 nodes. Gossip content announcements were rejected (unbounded traffic proportional to cache churn). Hash-prefix range hints were rejected (economically irrational — nodes cache popular content regardless of hash prefix). The production path is a lightweight Kademlia subset (`cdn/dht/v1` ALPN): nodes self-publish `(hash → NodeId)` STORE records when caching a blob, attracting paying clients; FIND_VALUE lookups are O(log N). No discovery fees — all revenue stays on delivery. Popularity is surfaced by two complementary signals: `popular_hashes` gossip (advisory, self-reported; suppression is self-limiting via `LoadHint`/selection score) and DHT FIND_VALUE query frequency (non-suppressible — routing traffic reaches nearby-keyspace nodes regardless of gossip). The probe step (`cdn/probe/v1`) is preserved as the final availability confirmation before any delivery commitment.
 
+### [ADR 024 — Client Parallelism: Multi-Node Parallel Blob Download](024-client-parallelism.md)
+
+**Multi-node parallel download (BitTorrent-style) via `--max-channels N` CLI flag. One payment channel per node; N equal byte ranges assigned by latency rank. Economically viable only above ~10 GiB; default is single-channel (N=1). Incompatible with sequential streaming output. PoC caps `--max-channels` at 1.**
+
+Opens N connections to N different nodes simultaneously, each serving a non-overlapping byte range. Range assignment probes N candidates, assigns fastest to first range. Minimum range: 256 MiB. Channel overhead (~$0.23 × N) dominates for small blobs; the economic breakeven is ~9 GiB for N=4 at $0.01/GB. Sequential streaming (`--streaming` flag or piped output) overrides and forces single-channel delivery. Node failure mid-range triggers re-probe and channel reopen from last BLAKE3-verified byte. Part files written to `~/.decdn/downloads/<hash>/range-N.part`; full-blob BLAKE3 verified after reassembly.
+
 ## Key Invariants
 
 - No external origin URL exists — content enters the network through origin-backed nodes whose backends are hidden
