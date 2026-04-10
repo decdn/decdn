@@ -1,16 +1,16 @@
-# ADR 023 — Seam Architecture for Incremental Production Readiness
+# ADR 023 — PoC/Production Seam Architecture
 
 **Status:** Accepted
-**Date:** 2026-04-10
+**Date:** 2026-04-08
 **Deciders:** Core team
 
 ---
 
 ## Context
 
-Every ADR from 001–022 contains a PoC vs production split: different contracts, different constants, simplified stand-in components, admin-key shortcuts, and deferred features. Without clear architectural boundaries between these concerns, upgrading any single area risks shotgun surgery across multiple crates.
+Every ADR from 001–022 contains a PoC vs production split: different contracts, different constants, simplified stand-in components, admin-key shortcuts, and deferred features. Without a canonical architectural pattern for managing these differences, implementation will produce scattered `if mode == PoC` checks throughout every crate, making both the PoC and the production path harder to reason about, test, and eventually remove.
 
-The goal is a clean answer to: **where are the boundaries between PoC and production behavior, so each concern can be upgraded independently?**
+The goal is a clean mechanical answer to: **how does the codebase express the difference between PoC and production?**
 
 ### Inventory of PoC/Production differences (from prior ADRs)
 
@@ -38,11 +38,11 @@ The goal is a clean answer to: **where are the boundaries between PoC and produc
 
 ## Decision
 
-**Use trait-based seams to define clean architectural boundaries between the seven areas where PoC and production behavior differ.** Leaf crates (`protocol`, `cache`, `reputation`, `incentive`) contain no mode-conditional code. Each seam is a Rust trait with PoC and production implementations as sibling modules; the `node` crate's `wiring.rs` selects which concrete type to instantiate.
+**Use trait-based seams, with the single Cargo feature `poc` applied only to the `node` crate (the wiring point).** Leaf crates (`protocol`, `cache`) contain no mode-conditional code. Mode-specific implementations live in sibling modules within each crate; the `node` crate selects which concrete types to wire via `#[cfg(feature = "poc")]` and `#[cfg(not(feature = "poc"))]` attributes on separate function definitions.
 
-The codebase starts with PoC implementations wired in. There is no compile-time switching mechanism — no `poc` Cargo feature flag, no `#[cfg]` gating, no dual compilation. Only one implementation is active for each seam at any given time. When an area is ready for production, the wiring function is updated to instantiate the production type instead. This is a localized change at the wiring point, not a codebase-wide refactor.
+No `if mode == PoC` checks appear in internal crate logic. All branching is resolved at compile time at the top level. PoC code is physically absent from a production binary — it is excluded from compilation, not merely optimized away.
 
-The PoC/Production comparison tables below serve as a **production-readiness roadmap**: each row documents what "done" looks like for that seam. Seams can be upgraded independently and in any order.
+The single-feature design makes PoC removal straightforward: delete all `#[cfg(feature = "poc")]` functions and the `poc` feature declaration. The `#[cfg(not(feature = "poc"))]` production functions become unconditional with no further edits needed.
 
 ---
 
@@ -185,21 +185,65 @@ Concrete values:
 
 ---
 
-## Cargo Features
+## Cargo Feature: `poc`
 
-No mode-switching feature flag exists. The only custom feature is `otlp` for OpenTelemetry export:
+The `poc` Cargo feature is declared **only on the `node` crate**. Leaf crates (`protocol`, `cache`, `reputation`, `incentive`) do not declare or use it. Production is the default — no flag is needed for a production build.
 
 ```toml
-# crates/node/Cargo.toml
+# crates/node/Cargo.toml (additions to existing [features])
 [features]
 default = []
-otlp = [
-    "dep:opentelemetry",
-    "dep:opentelemetry_sdk",
-    "dep:opentelemetry-otlp",
-    "dep:tracing-opentelemetry",
-]
+otlp = [...]          # existing — OpenTelemetry export
+poc  = []             # opt-in; PoC concrete implementations at wiring point
 ```
+
+Usage in `crates/node/src/wiring.rs`:
+
+```rust
+pub fn build_components(config: &Config) -> Components {
+    Components {
+        key_store:     key_store(config),
+        reputation:    reputation_engine(config),
+        payment:       payment_client(config),
+        governance:    governance_client(config),
+        watchtower:    watchtower_client(config),
+        challenger:    corruption_challenger(config),
+        constants:     network_constants(),
+    }
+}
+
+#[cfg(feature = "poc")]
+fn network_constants() -> NetworkConstants {
+    NetworkConstants::poc()
+}
+
+#[cfg(not(feature = "poc"))]
+fn network_constants() -> NetworkConstants {
+    NetworkConstants::production()
+}
+
+#[cfg(feature = "poc")]
+fn key_store(config: &Config) -> Arc<dyn KeyStore> {
+    Arc::new(FileKeyStore::new(&config.key_dir))
+}
+
+#[cfg(not(feature = "poc"))]
+fn key_store(config: &Config) -> Arc<dyn KeyStore> {
+    Arc::new(KeychainKeyStore::new(&config.keychain))
+}
+
+// ... same pattern for remaining seams
+```
+
+This is a stronger guarantee than `if cfg!(feature = "poc")`: with the attribute form, the PoC branch is **excluded from compilation entirely** in a production build. `FileKeyStore`, `NoopWatchtowerClient`, and other PoC types are not present in the production binary at all — not merely optimized away.
+
+`#[cfg(feature = "poc")]` and `#[cfg(not(feature = "poc"))]` appear **only** in `crates/node/src/wiring.rs` and `crates/node/src/main.rs`. They are **banned** in all other crates via a `rustflags` lint (see Enforcement below).
+
+### Contracts: `unsafe-admin` feature
+
+The Solidity `adminReclaimNodeId` function (ADR 001) is removed in production contracts. Foundry controls this via a separate deploy script — not a Rust feature flag. The PoC deploy script (`script/DeployPoc.s.sol`) deploys `PocStakingRegistry`, which extends `StakingRegistry` with `adminReclaimNodeId`. The production deploy script (`script/DeployProduction.s.sol`) deploys `StakingRegistry` directly.
+
+No Rust `unsafe-admin` compile flag is needed — the function simply does not exist on the production contract ABI.
 
 ---
 
@@ -232,33 +276,20 @@ crates/
         weighted.rs    — Production: WeightedReputationEngine
   protocol/
     src/
-      constants.rs     — NetworkConstants (poc() and production() constructors)
+      constants.rs     — NetworkConstants (both modes, no cfg)
   node/
     src/
-      wiring.rs        — sole wiring point: plain functions, no #[cfg]
+      wiring.rs        — ONLY place #[cfg(feature = "poc")] appears
       main.rs          — reads config, calls wiring::build_components()
-```
-
-`wiring.rs` contains plain functions that currently instantiate PoC types. When a seam is upgraded, the function body is changed to instantiate the production type instead — a one-line change at the wiring point.
-
-```rust
-// Current — PoC implementation wired
-fn key_store(config: &Config) -> Arc<dyn KeyStore> {
-    Arc::new(FileKeyStore::new(&config.key_dir))
-}
-
-// After upgrade — production implementation wired
-fn key_store(config: &Config) -> Arc<dyn KeyStore> {
-    Arc::new(KeychainKeyStore::new(&config.keychain))
-}
 ```
 
 ### Rules
 
-1. **No runtime `NetworkMode` enum.** There is no mode toggle. The wired implementation is the only implementation.
-2. **`NetworkConstants` is the single source of truth for all numeric differences.** No magic numbers elsewhere — always reference `constants.popular_hashes_max`, never literal `20`. Currently calls `NetworkConstants::poc()`; updated to `::production()` when constants are finalized.
-3. **Single build configuration.** One `cargo build`, one CI pipeline. No feature-flag matrix.
-4. **Upgrading a seam is a localized change.** Update the wiring function; remove the old PoC implementation when no longer needed.
+1. **No `#[cfg(feature = "poc")]` or `#[cfg(not(feature = "poc"))]` outside `crates/node/src/wiring.rs` and `crates/node/src/main.rs`.** Enforced via `rustflags = ["-D", "unexpected_cfgs"]` with an explicit `check-cfg` list in `.cargo/config.toml`, or a `#[forbid(unexpected_cfgs)]` crate-level attribute on leaf crates.
+2. **No runtime `NetworkMode` enum.** All mode selection is compile-time. A PoC binary cannot accidentally run in production mode.
+3. **`NetworkConstants` is the single source of truth for all numeric differences.** No magic numbers elsewhere — always reference `constants.popular_hashes_max`, never literal `20`.
+4. **Both implementations must compile in CI.** The CI matrix builds with `--features poc` and without (production). This prevents either path from rotting and catches type errors in both concrete implementations.
+5. **PoC removal is mechanical.** To graduate to production-only: delete all `#[cfg(feature = "poc")]` functions, remove the `poc` feature from `Cargo.toml`, and strip the `#[cfg(not(feature = "poc"))]` attributes from the remaining functions. No logic changes required.
 
 ---
 
@@ -266,16 +297,16 @@ fn key_store(config: &Config) -> Arc<dyn KeyStore> {
 
 ### Positive
 
-- Zero mode-conditional branches in internal crate logic — no `if mode == PoC` anywhere
-- Trait-based seams ensure each production upgrade is a localized change at the wiring point
-- Single build configuration — no feature-flag matrix, no risk of configuration mismatch
-- PoC/Production tables serve as a checklist for production readiness
+- Zero mode-conditional branches in internal crate logic
+- Both modes are tested in CI continuously — no surprise at production migration time
+- PoC code is **physically absent** from a production binary (excluded at compile time, not just optimized away) — provides a hard security boundary
+- Production is the default compile target — no flag needed, no accidental PoC deployment
+- Removing PoC support later is mechanical: delete `#[cfg(feature = "poc")]` functions, drop the feature, strip `#[cfg(not(feature = "poc"))]` attributes — no logic changes
 - `NetworkConstants` gives operators a single reference for all tunable differences
-- Seams can be upgraded independently and in any order
 
 ### Negative
 
-- Production implementations may not exist yet — the tables document intent, not current capability
+- Two concrete implementations must be maintained for each seam until production migration
 - Adding a new seam requires registering it in `wiring.rs`; easy to forget
 
 ### Neutral
@@ -286,11 +317,25 @@ fn key_store(config: &Config) -> Arc<dyn KeyStore> {
 
 ## Alternatives Considered
 
-### Compile-time `#[cfg(feature = "poc")]` switching
+### `cfg!()` macro with `if`/`else` in a single function
 
-An earlier revision of this ADR used a `poc` Cargo feature on the `node` crate with `#[cfg(feature = "poc")]` / `#[cfg(not(feature = "poc"))]` paired function definitions in `wiring.rs`. Both PoC and production paths compiled in CI via a feature-flag matrix.
+Considered (and initially implemented) as:
 
-Rejected. Maintaining two compilable implementations in parallel has cost but no benefit until the production implementation actually exists. Dual CI builds add matrix overhead. The feature flag also introduces removal ceremony (strip `#[cfg]` attributes) that is unnecessary when the codebase simply evolves in place. The trait boundary alone provides the localized-change guarantee.
+```rust
+fn network_constants() -> NetworkConstants {
+    if cfg!(feature = "poc") {
+        NetworkConstants::poc()
+    } else {
+        NetworkConstants::production()
+    }
+}
+```
+
+Rejected. `cfg!()` is a macro that evaluates to `true`/`false` at compile time, but **both branches are still compiled**. The compiler may optimize away the dead branch, but this is not guaranteed — PoC types (`FileKeyStore`, `NoopWatchtowerClient`) may be present in the production binary. The `#[cfg()]` attribute form on separate function definitions provides a hard guarantee: excluded code is never compiled, never linked, and never present in the binary.
+
+### Two explicit features: `poc` and `prod`
+
+Considered as an alternative to single `poc` with `not(poc)`. Rejected because it introduces a third invalid state (neither feature set, or both set simultaneously) that requires a `compile_error!` guard to catch. It also makes PoC removal harder: after migration, every `#[cfg(feature = "prod")]` attribute must be stripped from what are now the only implementations. With single `poc` + `not(poc)`, production functions need no attribute changes at all — the `not(poc)` attribute simply disappears with the feature declaration.
 
 ### Runtime `NetworkMode` enum throughout
 
@@ -303,6 +348,10 @@ Rejected. `Option<WatchtowerClient>` forces every call site to unwrap and handle
 ### Two separate repositories
 
 Rejected. Shared protocol types, cache logic, and contract interaction code is large enough that duplication would create divergence. The trait abstraction achieves the same clean separation within a monorepo.
+
+### Compile-time `#[cfg(feature = "poc")]` throughout all crates
+
+Rejected. Scatters the PoC/production boundary into every crate, making it hard to track all the differences and audit the production surface. Centralizing in `wiring.rs` gives a single readable inventory.
 
 ---
 
