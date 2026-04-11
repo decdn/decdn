@@ -177,9 +177,11 @@ A `ContentBlacklist` contract supports global (network-wide) and regional (juris
 
 ### [ADR 012 — Client Architecture, Bootstrap, and Trust Model](012-client.md)
 
-**Client bootstrap, key management, identity lifecycle, and trust boundary.**
+**Client bootstrap, key management, identity lifecycle, trust boundary, multi-node parallel download, crash recovery, and file manifests.**
 
 Clients are lightweight QUIC endpoints that subscribe to gossip (but do not publish), maintain local peer tables and reputation scores, and pay for content via off-chain vouchers. The bootstrap procedure covers iroh key generation, Ethereum key import, registry query with exponential-backoff retry and `peers.json` fallback, gossip subscription, and periodic registry refresh. Key management distinguishes PoC (file-based) from production (platform keychain, hardware wallet with derived hot key for voucher signing). Ephemeral NodeId-to-Ethereum bindings are per-connection with `nonce=0` sentinel. Eclipse attack mitigation is resolved: registry-only for PoC; multi-source bootstrap (Option B — on-chain registry + DNS seed list) for production, with minimum peer diversity (Option C) as supplementary client-side policy. An explicit three-tier trust boundary classifies what the client verifies, trusts, and does not trust.
+
+Also specifies three client-side features: **multi-node parallel download** (`--max-channels N`; one channel per node; economical above ~10 GiB at N=4; incompatible with streaming output; PoC capped at 1); **crash recovery and resume** (atomic `state.json` under `~/.decdn/downloads/<hash>/`; resume from last BLAKE3-verified byte; voucher nonce persisted on every send; 64 MiB flush cadence); and **file manifests** (256 MiB chunks; postcard-encoded manifest blob whose BLAKE3 hash is the canonical file ID; client fetches manifest first then chunks; per-chunk BLAKE3 verification; blob retention for re-serving; per-chunk encryption via ADR 006 epoch keys).
 
 ---
 
