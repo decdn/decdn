@@ -113,7 +113,7 @@ Client identity bindings are **ephemeral and per-connection**, as specified in [
 
 **Lifecycle:**
 
-1. **Startup:** Load iroh key (→ `NodeId`). Load Ethereum key from keystore.
+1. **Startup:** Load iroh key (→ `NodeId`). Load Ethereum key from keystore (EOA) or configure Safe address and establish/refresh a session key for signing ([ADR 024](024-account-abstraction.md)).
 2. **Connect:** Establish QUIC connection to a node via `cdn/client/v1`.
 3. **Bind:** First `StreamRequest` on the connection includes `ethereum_address` and `binding_signature` — an EIP-712 `BindNodeId(nodeId, nonce=0)` signature. The `nonce=0` sentinel indicates an ephemeral (off-chain) binding.
 4. **Session:** The node verifies the signature using `SignatureChecker` semantics (`ecrecover` for EOA clients, ERC-1271 `isValidSignature` RPC call for smart account clients — see [ADR 024](024-account-abstraction.md#4-off-chain-erc-1271-verification)), caches the binding for the connection's lifetime, and uses the verified address for `clientStakeOf` lookups and voucher attribution. Subsequent requests on the same connection omit these fields.

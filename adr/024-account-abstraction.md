@@ -101,7 +101,7 @@ Session keys replace both the derived hot key scheme ([ADR 012](012-client.md), 
 
 A **session key** is a lightweight secp256k1 key pair generated at process startup and held in memory only (never written to disk). The Safe owners authorize this key via a Safe module, granting it permission to produce EIP-712 signatures on behalf of the Safe within defined constraints.
 
-When a contract calls `SignatureChecker.isValidSignatureNow(safeAddress, digest, sessionKeySig)`, the Safe's `isValidSignature` implementation routes through its enabled modules. The Session Key Module validates that:
+When a contract calls `SignatureChecker.isValidSignatureNow(safeAddress, digest, sessionKeySig)`, the call reaches the Safe's `isValidSignature`, which the fallback handler dispatches to the Session Key Module (enabled via `enableModule`). The module validates that:
 
 1. The session key is authorized
 2. The current time is within the key's validity window
@@ -159,6 +159,7 @@ The session key signs vouchers at delivery speed. It cannot execute channel oper
 pragma solidity ^0.8.20;
 
 import {ISafe} from "@safe-global/safe-contracts/contracts/interfaces/ISafe.sol";
+import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
 /// @title Minimal Session Key Module for deCDN
 /// @notice Authorizes time-bounded session keys to produce EIP-712 signatures
@@ -168,6 +169,7 @@ contract SessionKeyModule {
     struct SessionKey {
         uint48 validAfter;
         uint48 validUntil;
+        bytes32 scope;       // allowed EIP-712 domain separator (0 = any)
     }
 
     // safe => session key address => session key config
@@ -177,10 +179,10 @@ contract SessionKeyModule {
     event SessionKeyRemoved(address indexed safe, address indexed key);
 
     /// @notice Authorize a session key. Must be called via Safe's execTransactionFromModule.
-    function addSessionKey(address key, uint48 validAfter, uint48 validUntil) external {
+    function addSessionKey(address key, uint48 validAfter, uint48 validUntil, bytes32 scope) external {
         // msg.sender is the Safe (called via delegatecall or module exec)
         require(validUntil > validAfter, "invalid validity window");
-        sessionKeys[msg.sender][key] = SessionKey(validAfter, validUntil);
+        sessionKeys[msg.sender][key] = SessionKey(validAfter, validUntil, scope);
         emit SessionKeyAdded(msg.sender, key, validAfter, validUntil);
     }
 
@@ -197,10 +199,30 @@ contract SessionKeyModule {
             && block.timestamp >= sk.validAfter
             && block.timestamp <= sk.validUntil;
     }
+
+    /// @notice ERC-1271 signature validation — called by the Safe's fallback handler.
+    /// @dev Signature format: abi.encode(sessionKeyAddress, ecdsaSignature).
+    ///      The Safe's SignMessageLib fallback handler routes `isValidSignature` calls
+    ///      to enabled modules. This function recovers the signer from the ECDSA
+    ///      signature, checks it matches an authorized session key, and returns the
+    ///      ERC-1271 magic value on success.
+    function isValidSignature(bytes32 digest, bytes calldata signature) external view returns (bytes4) {
+        require(signature.length == 85, "invalid sig length"); // 20 + 65
+        address sessionKey = address(bytes20(signature[:20]));
+        bytes memory ecdsaSig = signature[20:];
+        // Verify the ECDSA signature was produced by the claimed session key
+        (address recovered, ECDSA.RecoverError err,) = ECDSA.tryRecover(digest, ecdsaSig);
+        require(err == ECDSA.RecoverError.NoError && recovered == sessionKey, "invalid session sig");
+        // Verify session key is authorized for this Safe (msg.sender is the Safe)
+        SessionKey memory sk = sessionKeys[msg.sender][sessionKey];
+        require(sk.validUntil > 0 && block.timestamp >= sk.validAfter && block.timestamp <= sk.validUntil, "expired/unknown key");
+        require(sk.scope == bytes32(0) || sk.scope == digest, "out of scope");
+        return 0x1626ba7e; // ERC-1271 magic value
+    }
 }
 ```
 
-This module is ~50 lines and covers the PoC requirements. The Safe's `isValidSignature` implementation must be configured to check this module when validating signatures from authorized session keys. In practice, the Safe's fallback handler routes `isValidSignature` calls through enabled modules.
+This module covers the PoC requirements. The Safe's fallback handler (set via `setFallbackHandler`) routes incoming `isValidSignature(bytes32, bytes)` calls to enabled modules. When a contract calls `SignatureChecker.isValidSignatureNow(safeAddress, digest, sig)`, the Safe receives the `isValidSignature` call, the fallback handler dispatches it to this module, and the module validates the session key signature, returning the ERC-1271 magic value (`0x1626ba7e`) on success.
 
 **Deployment:** The module is deployed once per network (singleton pattern). Each Safe enables it via `enableModule()`.
 
