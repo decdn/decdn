@@ -169,7 +169,6 @@ contract SessionKeyModule {
     struct SessionKey {
         uint48 validAfter;
         uint48 validUntil;
-        bytes32 scope;       // allowed EIP-712 domain separator (0 = any)
     }
 
     // safe => session key address => session key config
@@ -179,10 +178,10 @@ contract SessionKeyModule {
     event SessionKeyRemoved(address indexed safe, address indexed key);
 
     /// @notice Authorize a session key. Must be called via Safe's execTransactionFromModule.
-    function addSessionKey(address key, uint48 validAfter, uint48 validUntil, bytes32 scope) external {
+    function addSessionKey(address key, uint48 validAfter, uint48 validUntil) external {
         // msg.sender is the Safe (called via delegatecall or module exec)
         require(validUntil > validAfter, "invalid validity window");
-        sessionKeys[msg.sender][key] = SessionKey(validAfter, validUntil, scope);
+        sessionKeys[msg.sender][key] = SessionKey(validAfter, validUntil);
         emit SessionKeyAdded(msg.sender, key, validAfter, validUntil);
     }
 
@@ -216,7 +215,6 @@ contract SessionKeyModule {
         // Verify session key is authorized for this Safe (msg.sender is the Safe)
         SessionKey memory sk = sessionKeys[msg.sender][sessionKey];
         require(sk.validUntil > 0 && block.timestamp >= sk.validAfter && block.timestamp <= sk.validUntil, "expired/unknown key");
-        require(sk.scope == bytes32(0) || sk.scope == digest, "out of scope");
         return 0x1626ba7e; // ERC-1271 magic value
     }
 }
