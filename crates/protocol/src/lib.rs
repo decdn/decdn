@@ -3,6 +3,8 @@
 //! This is the leaf crate in the dependency graph — it has minimal dependencies
 //! and defines the shared vocabulary used by all other deCDN crates.
 
+pub mod message;
+
 /// ALPN protocol identifier for latency and availability probing.
 pub const ALPN_PROBE: &[u8] = b"cdn/probe/v1";
 

@@ -2,6 +2,10 @@
 
 mod cli;
 mod config;
+mod handlers;
+mod identity;
+mod metrics;
+mod runtime;
 
 use clap::Parser;
 
@@ -14,14 +18,17 @@ async fn main() -> anyhow::Result<()> {
     let config_path = cli.config.map(|p| cli::common::expand_tilde(&p));
 
     match cli.command {
-        Command::Run(run_args) => cmd_run(config_path.as_deref(), &run_args),
+        Command::Run(run_args) => cmd_run(config_path.as_deref(), &run_args).await,
         Command::KeyGen(args) => cmd_key_gen(&args),
         Command::Config(args) => cmd_config_init(&args),
     }
 }
 
 /// Run the deCDN node with resolved configuration.
-fn cmd_run(config_path: Option<&std::path::Path>, run_args: &cli::RunArgs) -> anyhow::Result<()> {
+async fn cmd_run(
+    config_path: Option<&std::path::Path>,
+    run_args: &cli::RunArgs,
+) -> anyhow::Result<()> {
     let resolved = config::resolve_config(config_path, run_args)?;
 
     // Initialize tracing — RUST_LOG env var takes precedence over resolved log level.
@@ -50,9 +57,7 @@ fn cmd_run(config_path: Option<&std::path::Path>, run_args: &cli::RunArgs) -> an
         "resolved configuration"
     );
 
-    // TODO: block on node runtime here; for now just exit cleanly.
-
-    Ok(())
+    runtime::run(resolved).await
 }
 
 /// Initialize the tracing subscriber with fmt layer and optional OTLP layer.
@@ -121,7 +126,7 @@ fn init_otlp_tracer(endpoint: &str) -> anyhow::Result<opentelemetry_sdk::trace::
     Ok(tracer)
 }
 
-/// Generate Ed25519 node key and Ethereum keystore.
+/// Generate (or reuse) the persistent Ed25519 node key.
 fn cmd_key_gen(args: &cli::KeyGenArgs) -> anyhow::Result<()> {
     let output_dir = args
         .output_dir
@@ -130,11 +135,21 @@ fn cmd_key_gen(args: &cli::KeyGenArgs) -> anyhow::Result<()> {
         .or_else(cli::default_data_dir)
         .ok_or_else(|| anyhow::anyhow!("cannot determine output directory: home dir not found"))?;
 
-    // TODO: implement key generation
-    println!("would generate keys in {}", output_dir.display());
-    if args.force {
-        println!("(overwrite mode enabled)");
+    let key_path = identity::key_path(&output_dir);
+    if key_path.exists() {
+        if !args.force {
+            anyhow::bail!(
+                "node key already exists at {}; pass --force to overwrite",
+                key_path.display()
+            );
+        }
+        std::fs::remove_file(&key_path)
+            .map_err(|e| anyhow::anyhow!("failed to remove {}: {e}", key_path.display()))?;
     }
+
+    let key = identity::load_or_generate(&output_dir)?;
+    println!("node id: {}", key.public());
+    println!("wrote secret key to {}", key_path.display());
     Ok(())
 }
 
