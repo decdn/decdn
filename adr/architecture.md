@@ -261,6 +261,12 @@ Probe fan-out is O(N) per cache miss and does not scale beyond ~100 nodes. Gossi
 
 All PoC/production behavioral differences are expressed as Rust traits with separate concrete implementations (`file.rs` / `keychain.rs`, `simple.rs` / `weighted.rs`, etc.). The `node` crate wires the correct implementations at compile time via a single `poc` Cargo feature declared only on that crate. No `#[cfg(feature = "poc")]` appears in leaf crates. Seven seams are defined: `KeyStore`, `ReputationEngine`, `PaymentChannelClient`, `GovernanceClient`, `WatchtowerClient`, `CorruptionChallenger`, and `NetworkConstants`. Production is the default compile target — the `poc` feature must be explicitly opted in. Solidity contract differences (admin key vs Governor, `adminReclaimNodeId` presence) are managed via separate Foundry deploy scripts rather than Rust feature flags.
 
+### [ADR 027 — Content Discovery: Namespace Registry and Origin Search Indexes](027-content-discovery-namespace-registry.md)
+
+**On-chain namespace registry + origin-run HTTP search indexes; `decdn search` CLI for hash discovery; `cdn/search/v1` ALPN deferred as production evolution.**
+
+Closes the hash-discovery CUJ gap: clients need a manifest hash before they can pull. Origins register a short namespace (e.g. `decdn-ml`, `crates-rs`) and an HTTPS search endpoint URL as part of their staking transaction (ADR 019); the smart contract is the authoritative namespace-to-endpoint mapping. Each origin runs its own search index (SQLite FTS, Elasticsearch, static JSON — operator's choice); deCDN defines only the JSON response schema (`hash`, `name`, `namespace`, `size_bytes`, optional metadata). `decdn search --origin decdn-ml google/gemma-4-3B-it` queries a specific origin; omitting `--origin` fans out to all registered origins from the contract. The client caches the registry locally (1-hour TTL, refreshable via `decdn registry refresh`). Trust is unchanged — BLAKE3 verification on receipt is independent of search results; a malicious search endpoint can only cause discoverability denial, not content substitution. Staking creates economic friction for namespace squatting. `cdn/search/v1` over iroh QUIC is the natural production path (protocol consistency, no HTTP dependency) but is deferred; the `searchEndpoint` field is transport-agnostic and can hold either an HTTPS URL or an iroh NodeId+ALPN string.
+
 ---
 
 ## Key Invariants
