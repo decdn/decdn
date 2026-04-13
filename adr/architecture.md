@@ -261,7 +261,7 @@ Probe fan-out is O(N) per cache miss and does not scale beyond ~100 nodes. Gossi
 
 All PoC/production behavioral differences are expressed as Rust traits with separate concrete implementations (`file.rs` / `keychain.rs`, `simple.rs` / `weighted.rs`, etc.). The `node` crate wires the correct implementations at compile time via a single `poc` Cargo feature declared only on that crate. No `#[cfg(feature = "poc")]` appears in leaf crates. Seven seams are defined: `KeyStore`, `ReputationEngine`, `PaymentChannelClient`, `GovernanceClient`, `WatchtowerClient`, `CorruptionChallenger`, and `NetworkConstants`. Production is the default compile target — the `poc` feature must be explicitly opted in. Solidity contract differences (admin key vs Governor, `adminReclaimNodeId` presence) are managed via separate Foundry deploy scripts rather than Rust feature flags.
 
-### [ADR 027 — Content Discovery: Namespace Registry and Origin Search Indexes](027-content-discovery-namespace-registry.md)
+### [ADR 025 — Content Discovery: Namespace Registry and Origin Search Indexes](025-content-discovery-namespace-registry.md)
 
 **On-chain namespace registry + origin-run HTTP search indexes; `decdn search` CLI for hash discovery; `cdn/search/v1` ALPN deferred as production evolution.**
 

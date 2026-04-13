@@ -1,4 +1,4 @@
-# ADR 027 — Content Discovery: Namespace Registry and Origin Search Indexes
+# ADR 025 — Content Discovery: Namespace Registry and Origin Search Indexes
 
 **Status:** Accepted
 **Date:** 2026-04-13
@@ -22,7 +22,7 @@ complete.
 
 For **public/unencrypted content** — the `decdn pull <hash>` CLI use case — there
 is no mechanism. Content providers publish BLAKE3 hashes on their own websites or
-APIs, but deCDN provides no standard way to discover them. This is the gap ADR 027
+APIs, but deCDN provides no standard way to discover them. This is the gap ADR 025
 addresses.
 
 ---
@@ -280,4 +280,4 @@ path without mandating how origins implement their search indexes.
 | [ADR 012](012-client.md) | `decdn search` and `decdn registry` added to client CLI section |
 | [ADR 016](016-contract-interactions.md) | `OriginSearchInfo` fields added to origin registration; `updateOriginSearch` function |
 | [ADR 019](019-node-onboarding.md) | Namespace + endpoint included in optional origin registration fields |
-| [ADR 022](022-content-discovery.md) | Clarify scope: DHT resolves hash → nodes; ADR 027 resolves name → hash |
+| [ADR 022](022-content-discovery.md) | Clarify scope: DHT resolves hash → nodes; ADR 025 resolves name → hash |
