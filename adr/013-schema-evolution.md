@@ -430,11 +430,14 @@ QUIC application error codes used by this ADR:
 
 | Code | Name | Meaning |
 | --- | --- | --- |
-| `0x01` | `UNSUPPORTED_MESSAGE` | Received an unknown protocol enum variant. Stream closed; connection unaffected |
-| `0x02` | `MESSAGE_TOO_LARGE` | Received a length prefix exceeding `MAX_MESSAGE_SIZE`. Stream closed |
-| `0x03` | `MALFORMED_MESSAGE` | Frame passed length validation but payload failed deserialization. Stream closed |
+| `0x00` | `NO_ERROR` | Normal stream/connection close. Also used when a failure does not map to any code below (e.g. read timeout) |
+| `0x01` | `UNSUPPORTED_MESSAGE` | Received an unknown protocol enum variant |
+| `0x02` | `MESSAGE_TOO_LARGE` | Received a length prefix exceeding `MAX_MESSAGE_SIZE` |
+| `0x03` | `MALFORMED_MESSAGE` | Frame failed decoding. Covers postcard deserialization failure, varint parse errors, and transport I/O errors during frame read (since the receiver cannot distinguish a truncated frame from a malformed one at the application layer) |
 
-These codes are scoped to individual QUIC streams (sent via `RESET_STREAM` or `STOP_SENDING`), not connections. Additional application error codes defined by other ADRs are unaffected.
+**Scope.** These codes SHOULD be delivered via `RESET_STREAM` / `STOP_SENDING` so that other streams multiplexed on the same QUIC connection are unaffected. An ALPN that guarantees a 1:1 connection:stream topology (e.g. `cdn/probe/v1`) MAY additionally mirror the same code in the application-level `CONNECTION_CLOSE` frame so the peer observes a deterministic error code even when a stream reset races connection teardown. ALPNs that multiplex multiple streams per connection MUST NOT surface these codes at the connection level, as doing so would tear down unrelated streams.
+
+Additional application error codes defined by other ADRs are unaffected. The codes above occupy the low range `0x00`–`0x0F`; ADRs allocating new codes SHOULD use `0x10` and above to avoid collisions.
 
 ## Open Questions
 
