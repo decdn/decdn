@@ -27,16 +27,16 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
     let metrics = Arc::new(metrics::Metrics::new());
     metrics.started();
 
-    let secret_key = identity::load_or_generate(&cfg.data_dir)?;
+    let secret_key = identity::load_or_generate(&cfg.identity.data_dir)?;
     tracing::info!(node_id = %secret_key.public(), "loaded node identity");
 
     let handlers: Vec<Arc<dyn Handler>> = vec![Arc::new(ProbeHandler::new(
         secret_key.public(),
-        cfg.rate_per_mb,
+        cfg.payment.rate_per_mb,
         Arc::clone(&metrics),
     ))];
 
-    let ep = endpoint::build(&secret_key, cfg.bind_port, &handlers)
+    let ep = endpoint::build(&secret_key, cfg.network.bind_port, &handlers)
         .await
         .context("failed to build iroh endpoint")?;
 
@@ -52,7 +52,7 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
     //
     // Bind *synchronously* so a port-in-use or permissions failure aborts
     // startup via `?` rather than silently leaving the node without /metrics.
-    let metrics_addr = std::net::SocketAddr::from(([127, 0, 0, 1], cfg.metrics_port));
+    let metrics_addr = std::net::SocketAddr::from(([127, 0, 0, 1], cfg.observability.metrics_port));
     let metrics_listener = metrics::bind(metrics_addr)
         .await
         .context("failed to bind metrics listener")?;
@@ -74,8 +74,8 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
     });
 
     tracing::info!(
-        bind_port = cfg.bind_port,
-        metrics_port = cfg.metrics_port,
+        bind_port = cfg.network.bind_port,
+        metrics_port = cfg.observability.metrics_port,
         "node runtime ready"
     );
 
