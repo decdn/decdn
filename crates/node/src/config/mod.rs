@@ -269,10 +269,10 @@ fn load_file_config(explicit_path: Option<&Path>) -> anyhow::Result<FileConfig> 
     Ok(config)
 }
 
-/// Expand `${VAR}` and a leading `~` in every string and path field on
-/// [`FileConfig`]. Missing env vars produce a contextual error naming the
-/// offending field. Enables a single TOML template to be reused across
-/// container/Kubernetes deployments (see GitHub issue #223).
+/// Expand `${VAR}` and a leading `~` in the TOML config fields listed
+/// below. Missing env vars produce a contextual error naming the offending
+/// field. Enables a single TOML template to be reused across container and
+/// Kubernetes deployments without file mutation.
 ///
 /// Bare `$VAR` (without braces) is intentionally **not** expanded: many
 /// legitimate config values contain a literal `$` (URLs with basic-auth
@@ -334,7 +334,7 @@ fn expand_value(raw: &str, ctx: &'static str) -> anyhow::Result<String> {
     if !needs_expansion(raw) {
         return Ok(raw.to_string());
     }
-    let tilde_expanded = expand_tilde_prefix(raw);
+    let tilde_expanded = expand_tilde_prefix(raw, ctx)?;
     expand_braces(&tilde_expanded, ctx)
 }
 
@@ -345,25 +345,32 @@ fn needs_expansion(raw: &str) -> bool {
     raw.contains("${") || raw.starts_with('~')
 }
 
-/// Replace a leading `~` or `~/` with the user's home directory. Other
-/// occurrences of `~` (e.g. in the middle of a string) are left alone. Bare
-/// `~` with no home dir available passes through unchanged.
-fn expand_tilde_prefix(raw: &str) -> String {
+/// Replace a leading `~`, `~/`, or (on Windows) `~\` with the user's home
+/// directory. Other occurrences of `~` (e.g. in the middle of a string) are
+/// left alone. Errors contextually if the home directory is not resolvable,
+/// rather than silently returning a literal `~` that downstream file I/O
+/// would later fail on with an unrelated error.
+fn expand_tilde_prefix(raw: &str, ctx: &'static str) -> anyhow::Result<String> {
     if raw == "~" {
-        return match dirs::home_dir() {
-            Some(h) => h.to_string_lossy().into_owned(),
-            None => raw.to_string(),
-        };
+        let home = dirs::home_dir().ok_or_else(|| missing_home_err(ctx))?;
+        return Ok(home.to_string_lossy().into_owned());
     }
-    if let Some(rest) = raw.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            let mut out = home.to_string_lossy().into_owned();
-            out.push('/');
-            out.push_str(rest);
-            return out;
+    let rest = raw.strip_prefix("~/").or_else(|| {
+        if cfg!(windows) {
+            raw.strip_prefix(r"~\")
+        } else {
+            None
         }
+    });
+    if let Some(rest) = rest {
+        let home = dirs::home_dir().ok_or_else(|| missing_home_err(ctx))?;
+        return Ok(home.join(rest).to_string_lossy().into_owned());
     }
-    raw.to_string()
+    Ok(raw.to_string())
+}
+
+fn missing_home_err(ctx: &'static str) -> anyhow::Error {
+    anyhow::anyhow!("config field `{ctx}` uses `~` but home directory is not available")
 }
 
 /// Substitute `${VAR}` sequences with the corresponding env var value. No
@@ -379,9 +386,15 @@ fn expand_braces(raw: &str, ctx: &'static str) -> anyhow::Result<String> {
         let (name, tail) = after.split_once('}').ok_or_else(|| {
             anyhow::anyhow!("config field `{ctx}` has unterminated `${{` sequence")
         })?;
-        let value = std::env::var(name).map_err(|_| {
-            anyhow::anyhow!("config field `{ctx}` references undefined env var `{name}`")
-        })?;
+        let value = match std::env::var(name) {
+            Ok(v) => v,
+            Err(std::env::VarError::NotPresent) => {
+                anyhow::bail!("config field `{ctx}` references undefined env var `{name}`")
+            }
+            Err(std::env::VarError::NotUnicode(_)) => anyhow::bail!(
+                "config field `{ctx}` references env var `{name}` whose value is not valid UTF-8"
+            ),
+        };
         out.push_str(&value);
         rest = tail;
     }
@@ -484,9 +497,9 @@ mod tests {
         Ok(())
     }
 
-    // Regression for PR #226: a literal `$` (e.g. in basic-auth passwords or
-    // query strings) must not trigger env expansion, which would otherwise
-    // surface as a spurious "undefined env var" error.
+    // A literal `$` (e.g. in basic-auth passwords or query strings) must
+    // pass through untouched; only the explicit `${VAR}` form triggers
+    // expansion. Otherwise operators lose access to values containing `$`.
     #[test]
     fn expand_env_preserves_literal_dollar_without_braces() -> anyhow::Result<()> {
         let raw = "https://user:p$w0rd@host/path?token=abc$def";
@@ -501,9 +514,9 @@ mod tests {
         Ok(())
     }
 
-    // Regression for PR #226: Windows-style paths with backslashes must keep
-    // their backslashes and still expand `${VAR}` — shell-style escape
-    // interpreters would swallow `\` before `$` and disable expansion.
+    // Windows-style paths with backslashes must keep their backslashes and
+    // still expand `${VAR}` — shell-style escape interpreters would swallow
+    // `\` before `$` and disable the expansion on real Windows paths.
     #[test]
     fn expand_env_handles_backslash_before_brace() -> anyhow::Result<()> {
         let home = home_str()?;
@@ -562,6 +575,131 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("cache_dir missing"))?
             .to_path_buf();
         anyhow::ensure!(dir == home.join("decdn-cache"), "got: {}", dir.display());
+        Ok(())
+    }
+
+    #[test]
+    fn expand_env_substitutes_multiple_vars_in_one_value() -> anyhow::Result<()> {
+        let home = home_str()?;
+        let mut cfg = cfg_with_rpc("${HOME}/a/${HOME}/b");
+        expand_env(&mut cfg)?;
+        let url = cfg
+            .blockchain
+            .as_ref()
+            .and_then(|b| b.rpc_url.as_deref())
+            .ok_or_else(|| anyhow::anyhow!("rpc_url missing"))?;
+        anyhow::ensure!(url == format!("{home}/a/{home}/b"), "got: {url}");
+        Ok(())
+    }
+
+    #[test]
+    fn expand_env_expands_bare_tilde_path() -> anyhow::Result<()> {
+        let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("test requires home dir"))?;
+        let mut cfg = FileConfig {
+            cache: Some(types::CacheConfig {
+                cache_dir: Some(PathBuf::from("~")),
+                cache_size_mb: None,
+                max_blob_size_mb: None,
+            }),
+            ..Default::default()
+        };
+        expand_env(&mut cfg)?;
+        let dir = cfg
+            .cache
+            .as_ref()
+            .and_then(|c| c.cache_dir.as_deref())
+            .ok_or_else(|| anyhow::anyhow!("cache_dir missing"))?
+            .to_path_buf();
+        anyhow::ensure!(dir == home, "got: {}", dir.display());
+        Ok(())
+    }
+
+    type FieldSetter = fn(&mut FileConfig, &str);
+
+    // Guards against copy-paste mislabeling in the 8-arm wiring of
+    // `expand_env` — every expandable field must surface its own dotted
+    // path in the error message.
+    #[test]
+    fn expand_env_per_field_error_context() -> anyhow::Result<()> {
+        let missing = "DECDN_UNSET_PER_FIELD_VAR_ZZZ";
+        anyhow::ensure!(
+            std::env::var_os(missing).is_none(),
+            "test precondition violated: {missing} is set in the environment"
+        );
+        let placeholder = format!("${{{missing}}}");
+
+        let cases: &[(&str, FieldSetter)] = &[
+            ("identity.data_dir", |c, v| {
+                c.identity = Some(types::IdentityConfig {
+                    data_dir: Some(PathBuf::from(v)),
+                    region: None,
+                });
+            }),
+            ("identity.region", |c, v| {
+                c.identity = Some(types::IdentityConfig {
+                    data_dir: None,
+                    region: Some(v.to_string()),
+                });
+            }),
+            ("network.relay_url", |c, v| {
+                c.network = Some(types::NetworkConfig {
+                    bind_port: None,
+                    relay_url: Some(v.to_string()),
+                });
+            }),
+            ("blockchain.rpc_url", |c, v| {
+                c.blockchain = Some(types::BlockchainConfig {
+                    rpc_url: Some(v.to_string()),
+                    ..Default::default()
+                });
+            }),
+            ("blockchain.eth_keystore", |c, v| {
+                c.blockchain = Some(types::BlockchainConfig {
+                    eth_keystore: Some(PathBuf::from(v)),
+                    ..Default::default()
+                });
+            }),
+            ("blockchain.payment_channel_address", |c, v| {
+                c.blockchain = Some(types::BlockchainConfig {
+                    payment_channel_address: Some(v.to_string()),
+                    ..Default::default()
+                });
+            }),
+            ("blockchain.staking_registry_address", |c, v| {
+                c.blockchain = Some(types::BlockchainConfig {
+                    staking_registry_address: Some(v.to_string()),
+                    ..Default::default()
+                });
+            }),
+            ("cache.cache_dir", |c, v| {
+                c.cache = Some(types::CacheConfig {
+                    cache_dir: Some(PathBuf::from(v)),
+                    cache_size_mb: None,
+                    max_blob_size_mb: None,
+                });
+            }),
+            ("observability.otlp_endpoint", |c, v| {
+                c.observability = Some(types::ObservabilityConfig {
+                    log_level: None,
+                    log_format: None,
+                    metrics_port: None,
+                    otlp_endpoint: Some(v.to_string()),
+                });
+            }),
+        ];
+
+        for (expected_ctx, setter) in cases {
+            let mut cfg = FileConfig::default();
+            setter(&mut cfg, &placeholder);
+            let err = expand_env(&mut cfg)
+                .err()
+                .ok_or_else(|| anyhow::anyhow!("expected error for {expected_ctx}"))?
+                .to_string();
+            anyhow::ensure!(
+                err.contains(expected_ctx),
+                "field `{expected_ctx}` missing from error: {err}"
+            );
+        }
         Ok(())
     }
 }
