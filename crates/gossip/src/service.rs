@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -10,6 +11,7 @@ use decdn_protocol::{
     TOPIC_GLOBAL, TOPIC_REGION_PREFIX,
 };
 use iroh::{Endpoint, SecretKey};
+use iroh_gossip::api::{GossipReceiver, GossipSender};
 use iroh_gossip::net::Gossip;
 use iroh_gossip::proto::TopicId;
 use tokio::sync::RwLock;
@@ -17,6 +19,11 @@ use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 
 use crate::{AnnounceReject, GossipMetrics, InsertOutcome, PeerTable, validate_envelope};
+
+/// Label used for both subscribe failures and, transitively, any per-topic
+/// rejection tied to the subscription itself. Kept here so the string is
+/// defined in one place for the `label()` stability contract.
+const SUBSCRIBE_FAILED_LABEL: &str = "subscribe_failed";
 
 /// Configuration handed to [`GossipService::spawn`] by the consumer. The
 /// peer-table TTL is configured on the `PeerTable` itself at construction
@@ -26,8 +33,11 @@ pub struct GossipRuntimeConfig {
     pub announce_interval_sec: u64,
     pub subscribe_global: bool,
     /// Optional region code (ISO 3166-1 alpha-2). If `Some`, the service
-    /// publishes and subscribes on `cdn/region/{code}/v1` in addition to
-    /// the global topic.
+    /// publishes and subscribes on `cdn/region/{code}/v1` in addition to the
+    /// global topic. Callers that want to publish MUST set this — the
+    /// publisher is disabled (with a WARN) otherwise, since peers would
+    /// reject a region-less announce at validation time. `decdn-node`
+    /// enforces this at config resolution.
     pub region: Option<String>,
     /// Hex-validated set of permitted announcer node IDs. Empty = accept any.
     pub allowlist: HashSet<[u8; 32]>,
@@ -39,9 +49,21 @@ pub struct GossipService;
 
 impl GossipService {
     /// Spawn publisher + subscriber tasks for the configured topics and
-    /// return their `JoinHandle`s for the caller's `JoinSet`.
-    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
-    pub fn spawn(
+    /// return their `JoinHandle`s for the caller's shutdown path.
+    ///
+    /// Each topic is subscribed to exactly once; the returned
+    /// [`iroh_gossip::api::GossipTopic`] is split into sender + receiver, so
+    /// the publisher and subscriber loops share a single gossip state
+    /// machine per topic. Subscribe failures are surfaced via
+    /// [`GossipMetrics::inc_rejected`] with the `subscribe_failed` label and
+    /// an error-level log line; the old code merely `warn!`'d and left the
+    /// subscriber task silently dead.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::needless_pass_by_value,
+        clippy::cognitive_complexity
+    )]
+    pub async fn spawn(
         _endpoint: Endpoint,
         secret_key: SecretKey,
         gossip: Gossip,
@@ -59,28 +81,62 @@ impl GossipService {
         let announce_interval = Duration::from_secs(cfg.announce_interval_sec);
         let region = cfg.region.clone();
 
-        let mut handles = Vec::new();
+        // Open one subscription per topic up front. Failures bump a metric
+        // and emit an error log; the topic is then skipped so the caller
+        // isn't left with half-wired state.
+        let mut senders: Vec<(String, GossipSender)> = Vec::new();
+        let mut receivers: Vec<(String, GossipReceiver)> = Vec::new();
+        for (topic_name, topic_id) in topics {
+            match gossip.subscribe(topic_id, Vec::new()).await {
+                Ok(topic) => {
+                    let (sender, receiver) = topic.split();
+                    senders.push((topic_name.clone(), sender));
+                    receivers.push((topic_name, receiver));
+                }
+                Err(err) => {
+                    metrics.inc_rejected(SUBSCRIBE_FAILED_LABEL);
+                    tracing::error!(
+                        %err,
+                        topic = %topic_name,
+                        "gossip subscribe failed; topic skipped"
+                    );
+                }
+            }
+        }
 
-        for (topic_name, topic_id) in &topics {
-            let sub = subscriber_task(
-                gossip.clone(),
-                *topic_id,
-                topic_name.clone(),
+        if receivers.is_empty() {
+            tracing::error!("gossip: every topic subscribe failed; service exiting");
+            return Vec::new();
+        }
+
+        let mut handles: Vec<JoinHandle<()>> = Vec::new();
+
+        for (topic_name, receiver) in receivers {
+            handles.push(subscriber_task(
+                topic_name,
+                receiver,
                 Arc::clone(&allowlist),
                 Arc::clone(&peer_table),
                 Arc::clone(&metrics),
-            );
-            handles.push(sub);
+            ));
         }
 
-        handles.push(publisher_task(
-            gossip,
-            secret_key,
-            topics,
-            region,
-            announce_interval,
-            Arc::clone(&metrics),
-        ));
+        // Skip publishing entirely when no region is configured: an announce
+        // without a region fails peer-side validation, so emitting silence
+        // beats emitting announces everyone drops.
+        if let Some(region_code) = region {
+            handles.push(publisher_task(
+                secret_key,
+                region_code,
+                announce_interval,
+                senders,
+                Arc::clone(&metrics),
+            ));
+        } else {
+            tracing::warn!(
+                "gossip: identity.region not set; publisher disabled (subscribe-only mode)"
+            );
+        }
 
         handles.push(ttl_sweeper_task(
             Arc::clone(&peer_table),
@@ -92,8 +148,8 @@ impl GossipService {
 }
 
 /// Build `(topic_name, TopicId)` pairs to subscribe to. `TopicId` is the
-/// blake3 hash of the topic name — the convention iroh-gossip uses in its
-/// own examples.
+/// blake3 hash of the topic name, matching iroh-gossip's own convention for
+/// deriving topic IDs from a string namespace.
 fn build_topic_list(cfg: &GossipRuntimeConfig) -> Vec<(String, TopicId)> {
     let mut out = Vec::new();
     if cfg.subscribe_global {
@@ -112,36 +168,65 @@ fn topic_id(name: &str) -> TopicId {
     TopicId::from_bytes(*hash.as_bytes())
 }
 
-fn publisher_task(
-    gossip: Gossip,
-    secret_key: SecretKey,
-    topics: Vec<(String, TopicId)>,
-    region: Option<String>,
-    interval: Duration,
+fn subscriber_task(
+    topic_name: String,
+    mut receiver: GossipReceiver,
+    allowlist: Arc<HashSet<[u8; 32]>>,
+    peer_table: Arc<RwLock<PeerTable>>,
     metrics: Arc<dyn GossipMetrics>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        // Subscribe once per topic (with no bootstrap for PoC) so we have a
-        // sender. The GossipTopic's receiver half is dropped; the subscriber
-        // tasks hold their own.
-        let mut senders = Vec::new();
-        for (name, id) in &topics {
-            match gossip.subscribe(*id, Vec::new()).await {
-                Ok(topic) => {
-                    let (sender, _recv) = topic.split();
-                    senders.push((name.clone(), sender));
-                }
+        while let Some(event) = receiver.next().await {
+            let msg = match event {
+                Ok(iroh_gossip::api::Event::Received(m)) => m,
+                Ok(
+                    iroh_gossip::api::Event::NeighborUp(_)
+                    | iroh_gossip::api::Event::NeighborDown(_)
+                    | iroh_gossip::api::Event::Lagged,
+                ) => continue,
                 Err(err) => {
-                    tracing::warn!(%err, topic = %name, "gossip publisher subscribe failed");
+                    tracing::debug!(%err, topic = %topic_name, "gossip receive error");
+                    continue;
                 }
+            };
+            metrics.inc_received(&topic_name);
+            // Snapshot the clock once so validation and peer-table insert
+            // share the same timestamp (avoids a race if the system clock
+            // moves between the two reads) and halves the syscall cost.
+            let now = now_us();
+            match validate_envelope(&msg.content, now, allowlist.as_ref()) {
+                Ok(announce) => {
+                    let mut table = peer_table.write().await;
+                    match table.insert_or_refresh(announce, now) {
+                        Ok(InsertOutcome::Inserted | InsertOutcome::Refreshed) => {
+                            metrics.set_peer_table_size(
+                                i64::try_from(table.len()).unwrap_or(i64::MAX),
+                            );
+                        }
+                        // Exhaustive match on the typed error: adding a new
+                        // `PeerTable` failure mode is a compile error here,
+                        // so a future variant can't be silently mislabeled as
+                        // `stale_timestamp`.
+                        Err(crate::StaleTimestamp { .. }) => {
+                            metrics.inc_rejected(AnnounceReject::StaleTimestamp.label());
+                        }
+                    }
+                }
+                Err(reject) => metrics.inc_rejected(reject.label()),
             }
         }
+    })
+}
 
+fn publisher_task(
+    secret_key: SecretKey,
+    region_code: String,
+    interval: Duration,
+    senders: Vec<(String, GossipSender)>,
+    metrics: Arc<dyn GossipMetrics>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
         let node_id = *secret_key.public().as_bytes();
-        // Default to "ZZ" when unset so operators see a clearly fake code
-        // in announces rather than panicking at signing time. Real operators
-        // should set identity.region.
-        let region_code = region.as_deref().unwrap_or("ZZ").to_string();
 
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -188,60 +273,6 @@ fn publisher_task(
     })
 }
 
-fn subscriber_task(
-    gossip: Gossip,
-    topic_id: TopicId,
-    topic_name: String,
-    allowlist: Arc<HashSet<[u8; 32]>>,
-    peer_table: Arc<RwLock<PeerTable>>,
-    metrics: Arc<dyn GossipMetrics>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let topic = match gossip.subscribe(topic_id, Vec::new()).await {
-            Ok(t) => t,
-            Err(err) => {
-                tracing::warn!(%err, topic = %topic_name, "gossip subscriber subscribe failed");
-                return;
-            }
-        };
-        let (_sender, mut receiver) = topic.split();
-
-        while let Some(event) = receiver.next().await {
-            let msg = match event {
-                Ok(iroh_gossip::api::Event::Received(m)) => m,
-                Ok(
-                    iroh_gossip::api::Event::NeighborUp(_)
-                    | iroh_gossip::api::Event::NeighborDown(_)
-                    | iroh_gossip::api::Event::Lagged,
-                ) => continue,
-                Err(err) => {
-                    tracing::debug!(%err, topic = %topic_name, "gossip receive error");
-                    continue;
-                }
-            };
-            metrics.inc_received(&topic_name);
-            // Snapshot the clock once so validation and peer-table insert
-            // share the same timestamp (avoids a race if the system clock
-            // moves between the two reads) and halves the syscall cost.
-            let now = now_us();
-            match validate_envelope(&msg.content, now, allowlist.as_ref()) {
-                Ok(announce) => {
-                    let mut table = peer_table.write().await;
-                    match table.insert_or_refresh(announce, now) {
-                        Ok(InsertOutcome::Inserted | InsertOutcome::Refreshed) => {
-                            metrics.set_peer_table_size(
-                                i64::try_from(table.len()).unwrap_or(i64::MAX),
-                            );
-                        }
-                        Err(_) => metrics.inc_rejected(AnnounceReject::StaleTimestamp.label()),
-                    }
-                }
-                Err(reject) => metrics.inc_rejected(reject.label()),
-            }
-        }
-    })
-}
-
 fn ttl_sweeper_task(
     peer_table: Arc<RwLock<PeerTable>>,
     metrics: Arc<dyn GossipMetrics>,
@@ -260,12 +291,21 @@ fn ttl_sweeper_task(
     })
 }
 
+/// Set on the first observed `SystemTime::duration_since(UNIX_EPOCH)` failure
+/// so a broken clock only logs once rather than at every publish/receive.
+static CLOCK_ERROR_LOGGED: AtomicBool = AtomicBool::new(false);
+
 fn now_us() -> u64 {
-    u64::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_micros())
-            .unwrap_or(0),
-    )
-    .unwrap_or(u64::MAX)
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => u64::try_from(d.as_micros()).unwrap_or(u64::MAX),
+        Err(err) => {
+            if !CLOCK_ERROR_LOGGED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    %err,
+                    "gossip: system clock is before UNIX epoch; announces will be rejected as ClockSkew by peers"
+                );
+            }
+            0
+        }
+    }
 }

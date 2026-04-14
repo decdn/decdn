@@ -20,6 +20,12 @@ pub enum AnnounceReject {
     DecodeFailed,
     #[error("unknown envelope version")]
     UnknownVersion,
+    /// Reserved for the day [`GossipPayload`] grows a second variant. With
+    /// only `NodeAnnounce` defined, postcard decode of an unknown
+    /// discriminant surfaces as [`Self::DecodeFailed`] (no reachable path
+    /// emits this variant today). Kept in the enum + `label()` so adding a
+    /// manual discriminant peek later is a pure code change that doesn't
+    /// rename any Prometheus label.
     #[error("unknown gossip payload variant")]
     UnknownVariant,
     #[error("signature length != {SIGNATURE_LEN}")]
@@ -75,7 +81,9 @@ pub const CLOCK_SKEW_TOLERANCE_US: u64 = 60 * 1_000_000;
 /// (rule 4) is enforced against the latest stored entry.
 ///
 /// `allowlist` is checked only if non-empty: empty allowlist means accept
-/// any signature-valid announce (`PoC` default per ADR 001 rule 2).
+/// any signature-valid announce. This is the `PoC` stand-in for ADR 001
+/// rule 2 (on-chain staking registry check) until the registry contract
+/// lands; it is not an implementation of the rule itself.
 pub fn validate_envelope<S: std::hash::BuildHasher>(
     bytes: &[u8],
     now_us: u64,
@@ -159,6 +167,30 @@ mod tests {
         GOSSIP_VERSION, GossipEnvelope, GossipPayload, LoadHint, NodeAnnounce, NodeAnnounceBody,
     };
     use iroh::SecretKey;
+
+    /// Freeze the Prometheus label strings: a rename without updating this
+    /// test would break operator dashboards silently. Every variant must be
+    /// listed here; a new variant that forgets its label will fail to
+    /// compile thanks to the exhaustive match.
+    #[test]
+    fn reject_labels_are_stable() {
+        fn assert_label(r: &AnnounceReject, expected: &'static str) {
+            assert_eq!(r.label(), expected, "label changed for {r:?}");
+        }
+        assert_label(&AnnounceReject::DecodeFailed, "decode_failed");
+        assert_label(&AnnounceReject::UnknownVersion, "unknown_version");
+        assert_label(&AnnounceReject::UnknownVariant, "unknown_variant");
+        assert_label(&AnnounceReject::BadSignatureLen, "bad_signature_len");
+        assert_label(&AnnounceReject::InvalidPublicKey, "invalid_public_key");
+        assert_label(&AnnounceReject::BodyEncodeFailed, "body_encode_failed");
+        assert_label(&AnnounceReject::InvalidSignature, "invalid_signature");
+        assert_label(&AnnounceReject::ClockSkew, "clock_skew");
+        assert_label(&AnnounceReject::StaleTimestamp, "stale_timestamp");
+        assert_label(&AnnounceReject::BadRegion, "bad_region");
+        assert_label(&AnnounceReject::DuplicateHashes, "duplicate_hashes");
+        assert_label(&AnnounceReject::TooManyHashes, "too_many_hashes");
+        assert_label(&AnnounceReject::NotAllowlisted, "not_allowlisted");
+    }
 
     fn sample_body(sk: &SecretKey, ts_us: u64) -> NodeAnnounceBody {
         NodeAnnounceBody {

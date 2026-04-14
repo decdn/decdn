@@ -60,6 +60,17 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
     let observability = resolve_observability(&cli.observability, file.observability.as_ref());
     let gossip = resolve_gossip(file.gossip.as_ref())?;
 
+    // NodeAnnounce carries a signed region; a node that subscribes but lacks
+    // a region would be subscribe-only (receivers drop region-less announces
+    // as `BadRegion`). Publishing without a configured region is almost
+    // certainly a misconfiguration, so fail startup loudly instead.
+    anyhow::ensure!(
+        identity.region.is_some() || !gossip_will_publish(&gossip),
+        "identity.region must be set when gossip is enabled (it signs every NodeAnnounce); \
+         set identity.region or disable gossip by setting gossip.subscribe_global = false \
+         and omitting the region"
+    );
+
     Ok(ResolvedConfig {
         identity,
         network,
@@ -69,6 +80,13 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
         observability,
         gossip,
     })
+}
+
+/// Will the gossip service actually publish anything? True if at least one
+/// topic will be subscribed. The publisher task is skipped if no topic is
+/// reachable, so a "no-op gossip" configuration doesn't need a region.
+const fn gossip_will_publish(g: &ResolvedGossip) -> bool {
+    g.subscribe_global
 }
 
 /// Resolve identity fields.
@@ -287,9 +305,9 @@ fn resolve_observability(
     }
 }
 
-/// Resolve gossip fields. Allowlist entries are parsed as 64-char lowercase
-/// hex node IDs; bad entries fail loudly at startup rather than silently
-/// degrading to accept-all mode later.
+/// Resolve gossip fields. Allowlist entries are parsed as 64-character hex
+/// node IDs (either case accepted); bad entries fail loudly at startup
+/// rather than silently degrading to accept-all mode later.
 fn resolve_gossip(file: Option<&types::GossipConfig>) -> anyhow::Result<ResolvedGossip> {
     let announce_interval_sec = file
         .and_then(|g| g.announce_interval_sec)
@@ -510,8 +528,112 @@ fn expand_braces(raw: &str, ctx: &'static str) -> anyhow::Result<String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_region_accepts_and_uppercases() -> anyhow::Result<()> {
+        assert_eq!(normalize_region("US")?, "US");
+        assert_eq!(normalize_region("us")?, "US");
+        assert_eq!(normalize_region("Us")?, "US");
+        Ok(())
+    }
+
+    #[test]
+    fn normalize_region_rejects_wrong_length_or_charset() {
+        for bad in ["usa", "u1", "", "U", "U S", "Ü1", "12", "U-"] {
+            assert!(
+                normalize_region(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_node_id_hex_accepts_either_case() -> anyhow::Result<()> {
+        let lower = "0".repeat(64);
+        let upper = "A".repeat(64);
+        let mixed: String = "Aa".repeat(32);
+        assert_eq!(parse_node_id_hex(&lower)?, [0u8; 32]);
+        assert_eq!(parse_node_id_hex(&upper)?, [0xAA; 32]);
+        assert_eq!(parse_node_id_hex(&mixed)?, [0xAA; 32]);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_node_id_hex_round_trips_nibble_order() -> anyhow::Result<()> {
+        let hex = "0123456789abcdef".repeat(4);
+        let bytes = parse_node_id_hex(&hex)?;
+        // First byte should be 0x01 — high nibble from '0', low from '1'.
+        assert_eq!(bytes[0], 0x01);
+        assert_eq!(bytes[1], 0x23);
+        assert_eq!(bytes[31], 0xef);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_node_id_hex_rejects_bad_input() {
+        assert!(parse_node_id_hex(&"0".repeat(63)).is_err());
+        assert!(parse_node_id_hex(&"0".repeat(65)).is_err());
+        assert!(parse_node_id_hex(&"g".repeat(64)).is_err());
+        assert!(parse_node_id_hex("").is_err());
+    }
+
+    #[test]
+    fn resolve_gossip_applies_defaults_when_absent() -> anyhow::Result<()> {
+        let g = resolve_gossip(None)?;
+        assert_eq!(g.announce_interval_sec, DEFAULT_ANNOUNCE_INTERVAL_SEC);
+        assert_eq!(g.peer_ttl_sec, DEFAULT_PEER_TTL_SEC);
+        assert!(g.subscribe_global);
+        assert!(g.allowlist.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_gossip_rejects_zero_announce_interval() {
+        let cfg = types::GossipConfig {
+            announce_interval_sec: Some(0),
+            ..Default::default()
+        };
+        let err = resolve_gossip(Some(&cfg))
+            .expect_err("expected error")
+            .to_string();
+        assert!(
+            err.contains("announce_interval_sec"),
+            "error missing field context: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_gossip_rejects_zero_peer_ttl() {
+        let cfg = types::GossipConfig {
+            peer_ttl_sec: Some(0),
+            ..Default::default()
+        };
+        let err = resolve_gossip(Some(&cfg))
+            .expect_err("expected error")
+            .to_string();
+        assert!(
+            err.contains("peer_ttl_sec"),
+            "error missing field context: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_gossip_rejects_bad_allowlist_entry() {
+        let cfg = types::GossipConfig {
+            allowlist: Some(vec!["0".repeat(63)]),
+            ..Default::default()
+        };
+        let err = resolve_gossip(Some(&cfg))
+            .expect_err("expected error")
+            .to_string();
+        assert!(
+            err.contains("64 hex chars"),
+            "error missing field context: {err}"
+        );
+    }
 
     // HOME is guaranteed set in Rust test harness on Linux/macOS and used here
     // to exercise ${VAR} expansion without mutating the process environment

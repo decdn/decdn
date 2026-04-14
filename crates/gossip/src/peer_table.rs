@@ -28,6 +28,17 @@ pub enum InsertOutcome {
     Refreshed,
 }
 
+/// Error returned by [`PeerTable::insert_or_refresh`] when the incoming
+/// announce's timestamp is not strictly greater than the stored entry's.
+///
+/// A named struct (rather than a bare `u64`) so a future second failure mode
+/// can be added without silently mislabeling metrics that match this variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaleTimestamp {
+    /// Microseconds-since-epoch timestamp of the entry already stored.
+    pub existing_us: u64,
+}
+
 /// In-memory, TTL-bounded peer table.
 #[derive(Debug)]
 pub struct PeerTable {
@@ -64,20 +75,22 @@ impl PeerTable {
     /// monotonicity against the existing entry.
     ///
     /// # Errors
-    /// Returns `Err(existing_timestamp_us)` if `announce.body.timestamp_us`
-    /// is not strictly greater than the stored entry's timestamp. The caller
-    /// maps this into [`crate::AnnounceReject::StaleTimestamp`] so metrics and
+    /// Returns [`StaleTimestamp`] if `announce.body.timestamp_us` is not
+    /// strictly greater than the stored entry's timestamp. The caller maps
+    /// this into [`crate::AnnounceReject::StaleTimestamp`] so metrics and
     /// logging stay uniform with other rejection reasons.
     pub fn insert_or_refresh(
         &mut self,
         announce: NodeAnnounce,
         now_us: u64,
-    ) -> Result<InsertOutcome, u64> {
+    ) -> Result<InsertOutcome, StaleTimestamp> {
         let node_id = announce.body.node_id;
         let ts = announce.body.timestamp_us;
         if let Some(existing) = self.entries.get_mut(&node_id) {
             if ts <= existing.announce.body.timestamp_us {
-                return Err(existing.announce.body.timestamp_us);
+                return Err(StaleTimestamp {
+                    existing_us: existing.announce.body.timestamp_us,
+                });
             }
             existing.announce = announce;
             existing.last_seen_us = now_us;
@@ -136,7 +149,7 @@ mod tests {
     }
 
     #[test]
-    fn insert_then_refresh() -> Result<(), u64> {
+    fn insert_then_refresh() -> Result<(), StaleTimestamp> {
         let mut t = PeerTable::new(0);
         let id = [1u8; 32];
         assert_eq!(
@@ -147,7 +160,7 @@ mod tests {
             t.insert_or_refresh(mk_announce(id, 11), 200)?,
             InsertOutcome::Refreshed
         );
-        let entry = t.get(&id).ok_or(0u64)?;
+        let entry = t.get(&id).ok_or(StaleTimestamp { existing_us: 0 })?;
         assert_eq!(entry.announce.body.timestamp_us, 11);
         assert_eq!(entry.first_seen_us, 100);
         assert_eq!(entry.last_seen_us, 200);
@@ -160,9 +173,9 @@ mod tests {
         let id = [2u8; 32];
         t.insert_or_refresh(mk_announce(id, 10), 100).ok();
         let err = t.insert_or_refresh(mk_announce(id, 9), 200);
-        assert_eq!(err, Err(10));
+        assert_eq!(err, Err(StaleTimestamp { existing_us: 10 }));
         let err_eq = t.insert_or_refresh(mk_announce(id, 10), 200);
-        assert_eq!(err_eq, Err(10));
+        assert_eq!(err_eq, Err(StaleTimestamp { existing_us: 10 }));
     }
 
     #[test]

@@ -21,7 +21,9 @@ use crate::handlers::probe::ProbeHandler;
 use crate::{identity, metrics};
 
 /// Ceiling on how long we wait for spawned tasks to drain after the endpoint
-/// and metrics server have been signalled to stop.
+/// and metrics server have been signalled to stop. Sized comfortably larger
+/// than the probe handler's accept + close timeouts (5s + 3s) so handlers
+/// finish naturally; `abort_all` only fires as a safety net.
 const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(15);
 
 /// Build the endpoint, register handlers on a `Router`, spawn the metrics
@@ -96,7 +98,8 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
         gossip_runtime_cfg,
         Arc::clone(&peer_table),
         gossip_metrics,
-    );
+    )
+    .await;
 
     tracing::info!(
         bind_port = cfg.network.bind_port,
@@ -115,7 +118,12 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
     if let Err(err) = router.shutdown().await {
         tracing::warn!(%err, "router shutdown reported an error");
     }
-    let _ = metrics_stop_tx.send(());
+    if metrics_stop_tx.send(()).is_err() {
+        // Receiver already dropped → metrics server exited on its own
+        // (port died, bind listener errored, etc). Not fatal, but worth a
+        // breadcrumb for shutdown-order debugging.
+        tracing::debug!("metrics stop channel closed before shutdown signal");
+    }
     for handle in &gossip_handles {
         handle.abort();
     }
@@ -125,10 +133,15 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
             log_join_result(result, "shutdown");
         }
         // Await aborted gossip tasks so the runtime doesn't return while
-        // they're still unwinding. `abort()` followed by `await` resolves
-        // with `JoinError::is_cancelled()`, which we don't log.
+        // they're still unwinding. `abort()` then `await` resolves with
+        // `JoinError::is_cancelled()`, which is the expected path and not
+        // logged; panics in the gossip loops still surface as warnings.
         for handle in gossip_handles {
-            let _ = handle.await;
+            if let Err(err) = handle.await
+                && !err.is_cancelled()
+            {
+                tracing::warn!(%err, "gossip task panicked during shutdown");
+            }
         }
     };
     if tokio::time::timeout(SHUTDOWN_DEADLINE, drain).await.is_ok() {
