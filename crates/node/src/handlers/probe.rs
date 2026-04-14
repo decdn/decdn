@@ -58,7 +58,9 @@ impl ProbeHandler {
         let frame_result = tokio::time::timeout(PROBE_READ_TIMEOUT, read_frame(&mut recv)).await;
         let req = match frame_result {
             Err(_) => {
-                let code = VarInt::from_u32(APP_ERR_MALFORMED_MESSAGE);
+                // ADR 013 defines no timeout-specific code; use 0 (no app error)
+                // and let the connection teardown signal the peer.
+                let code = VarInt::from_u32(0);
                 let _ = send.reset(code);
                 let _ = recv.stop(code);
                 return Err(anyhow::anyhow!(

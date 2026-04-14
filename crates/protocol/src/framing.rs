@@ -118,16 +118,17 @@ async fn write_varint_u32<W: AsyncWrite + Unpin>(w: &mut W, mut value: u32) -> s
 mod tests {
     use super::*;
 
-    async fn roundtrip_varint(v: u32) {
+    async fn roundtrip_varint(v: u32) -> Result<(), FrameError> {
         let mut buf = Vec::new();
-        write_varint_u32(&mut buf, v).await.unwrap_or_default();
+        write_varint_u32(&mut buf, v).await?;
         let mut cursor = std::io::Cursor::new(buf);
-        let decoded = read_varint_u32(&mut cursor).await.ok();
-        assert_eq!(decoded, Some(v), "varint roundtrip {v}");
+        let decoded = read_varint_u32(&mut cursor).await?;
+        assert_eq!(decoded, v, "varint roundtrip {v}");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn varint_edges() {
+    async fn varint_edges() -> Result<(), FrameError> {
         for v in [
             0u32,
             1,
@@ -139,8 +140,9 @@ mod tests {
             2_097_152,
             u32::MAX,
         ] {
-            roundtrip_varint(v).await;
+            roundtrip_varint(v).await?;
         }
+        Ok(())
     }
 
     #[tokio::test]
@@ -162,39 +164,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn frame_roundtrip() {
+    async fn frame_roundtrip() -> Result<(), FrameError> {
         let payload = b"hello deCDN".to_vec();
         let mut buf = Vec::new();
-        write_frame(&mut buf, &payload).await.ok();
+        write_frame(&mut buf, &payload).await?;
         let mut cursor = std::io::Cursor::new(buf);
-        let got = read_frame(&mut cursor).await.ok();
-        assert_eq!(got.as_deref(), Some(payload.as_slice()));
+        let got = read_frame(&mut cursor).await?;
+        assert_eq!(got, payload);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn frame_rejects_too_large_without_reading_payload() {
+    async fn frame_rejects_too_large_without_reading_payload() -> Result<(), FrameError> {
         // Encode a varint for MAX+1 and follow with NO payload bytes.
         let mut header = Vec::new();
-        write_varint_u32(&mut header, MAX_MESSAGE_SIZE + 1)
-            .await
-            .ok();
+        write_varint_u32(&mut header, MAX_MESSAGE_SIZE + 1).await?;
         let header_len = header.len();
         let mut cursor = std::io::Cursor::new(header);
         let r = read_frame(&mut cursor).await;
         assert!(matches!(r, Err(FrameError::TooLarge(n)) if n == MAX_MESSAGE_SIZE + 1));
         // No payload bytes were read.
         assert_eq!(usize::try_from(cursor.position()).ok(), Some(header_len));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn frame_short_read_errors() {
+    async fn frame_short_read_errors() -> Result<(), FrameError> {
         // Varint says 10 bytes, but stream only has 3.
         let mut buf = Vec::new();
-        write_varint_u32(&mut buf, 10).await.ok();
+        write_varint_u32(&mut buf, 10).await?;
         buf.extend_from_slice(b"abc");
         let mut cursor = std::io::Cursor::new(buf);
         let r = read_frame(&mut cursor).await;
         assert!(matches!(r, Err(FrameError::Io(_))));
+        Ok(())
     }
 
     #[tokio::test]
@@ -216,19 +219,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn frame_matches_postcard_length() {
+    async fn frame_matches_postcard_length() -> Result<(), FrameError> {
         // Compatibility sanity: postcard serializing a u32 as a standalone value
         // uses the same varint encoding we emit for the length prefix.
         let mut ours = Vec::new();
-        write_varint_u32(&mut ours, 300).await.ok();
-        let theirs = postcard::to_allocvec(&300u32).unwrap_or_default();
+        write_varint_u32(&mut ours, 300).await?;
+        let theirs = postcard::to_allocvec(&300u32)?;
         assert_eq!(ours, theirs);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn empty_payload_encodes_single_zero_byte() {
+    async fn empty_payload_encodes_single_zero_byte() -> Result<(), FrameError> {
         let mut buf: Vec<u8> = Vec::new();
-        write_frame(&mut buf, &[]).await.ok();
+        write_frame(&mut buf, &[]).await?;
         assert_eq!(buf, vec![0u8]);
+        Ok(())
     }
 }
