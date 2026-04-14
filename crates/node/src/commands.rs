@@ -288,23 +288,40 @@ pub fn config_validate(
 ) -> anyhow::Result<()> {
     let resolved = config::resolve_config(config_path, &args.run)?;
 
+    // Mirror the fallback logic in `config::load_file_config`: when no
+    // `--config` is supplied, the default path is loaded if it exists.
+    // Reporting the actual file consulted (not just the explicit flag) keeps
+    // the summary honest for operators diagnosing "why did it resolve X?".
+    let effective_source = config_path
+        .map(std::path::Path::to_path_buf)
+        .or_else(|| cli::common::default_config_path().filter(|p| p.exists()));
+
     println!("config valid");
-    if let Some(path) = config_path {
-        println!("  source:                  {}", path.display());
-    } else {
-        println!("  source:                  (defaults + env only, no config file)");
+    match effective_source {
+        Some(path) => println!("  source:                   {}", path.display()),
+        None => println!("  source:                   (defaults + env only, no config file)"),
     }
     println!(
-        "  data_dir:                {}",
+        "  data_dir:                 {}",
         resolved.identity.data_dir.display()
     );
-    println!("  bind_port:               {}", resolved.network.bind_port);
+    if let Some(region) = &resolved.identity.region {
+        println!("  region:                   {region}");
+    }
+    println!("  bind_port:                {}", resolved.network.bind_port);
+    if let Some(relay) = &resolved.network.relay_url {
+        println!("  relay_url:                {relay}");
+    }
     println!(
-        "  rpc_url:                 <redacted> ({} chars)",
+        "  rpc_url:                  <redacted> ({} chars)",
         resolved.blockchain.rpc_url.len()
     );
     println!(
-        "  payment_channel_address: {}",
+        "  eth_keystore:             {}",
+        resolved.blockchain.eth_keystore.display()
+    );
+    println!(
+        "  payment_channel_address:  {}",
         resolved.blockchain.payment_channel_address
     );
     println!(
@@ -312,21 +329,37 @@ pub fn config_validate(
         resolved.blockchain.staking_registry_address
     );
     println!(
-        "  cache_dir:               {}",
+        "  cache_dir:                {}",
         resolved.cache.cache_dir.display()
     );
     println!(
-        "  cache_size_mb:           {}",
+        "  cache_size_mb:            {}",
         resolved.cache.cache_size_mb
     );
     println!(
-        "  rate_per_mb:             {}",
+        "  max_blob_size_mb:         {}",
+        resolved.cache.max_blob_size_mb
+    );
+    println!(
+        "  rate_per_mb:              {}",
         resolved.payment.rate_per_mb
     );
     println!(
-        "  metrics_port:            {}",
+        "  log_level:                {}",
+        resolved.observability.log_level
+    );
+    println!(
+        "  metrics_port:             {}",
         resolved.observability.metrics_port
     );
+    // otlp_endpoint URLs commonly carry bearer tokens or API keys in the
+    // path or headers, so redact like rpc_url.
+    if let Some(otlp) = &resolved.observability.otlp_endpoint {
+        println!(
+            "  otlp_endpoint:            <redacted> ({} chars)",
+            otlp.len()
+        );
+    }
 
     Ok(())
 }

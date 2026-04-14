@@ -36,12 +36,21 @@ payment_channel_address = "0x0000000000000000000000000000000000000001"
 staking_registry_address = "0x0000000000000000000000000000000000000002"
 "#;
 
-const UNKNOWN_VAR: &str = r#"
+/// Build a TOML fixture that references `${var_name}` in `rpc_url`. We
+/// accept the name as a parameter (rather than hard-coding it) so each test
+/// can pick a unique-per-process name and guarantee the variable is unset —
+/// a fixed name could, in principle, be set in the ambient test environment
+/// and make the assertion below pass when it should fail.
+fn unknown_var_config(var_name: &str) -> String {
+    format!(
+        r#"
 [blockchain]
-rpc_url = "${DECDN_TEST_CONFIG_VALIDATE_UNSET_XYZ}"
+rpc_url = "${{{var_name}}}"
 payment_channel_address = "0x0000000000000000000000000000000000000001"
 staking_registry_address = "0x0000000000000000000000000000000000000002"
-"#;
+"#
+    )
+}
 
 /// Build a `ConfigValidateArgs` with no CLI overrides, pointing the data
 /// directory at `data_dir` so the test does not depend on `$HOME`.
@@ -83,14 +92,23 @@ fn validate_fails_when_required_field_missing() -> anyhow::Result<()> {
 
 #[test]
 fn validate_fails_when_env_var_unset() -> anyhow::Result<()> {
+    // Embed the PID so concurrent test runners and any ambient environment
+    // in CI cannot have this variable set. Assert it is unset before we
+    // rely on the failure — if it is, fail loudly rather than silently pass.
+    let var_name = format!("DECDN_TEST_UNSET_{}", std::process::id());
+    anyhow::ensure!(
+        std::env::var_os(&var_name).is_none(),
+        "test precondition: {var_name} must not be set"
+    );
+
     let dir = TempDir::new()?;
-    let path = write_config(&dir, UNKNOWN_VAR)?;
+    let path = write_config(&dir, &unknown_var_config(&var_name))?;
     let err = commands::config_validate(Some(&path), &args(dir.path())?)
         .err()
         .ok_or_else(|| anyhow::anyhow!("expected validation to fail"))?;
     let msg = format!("{err:#}");
     anyhow::ensure!(
-        msg.contains("DECDN_TEST_CONFIG_VALIDATE_UNSET_XYZ"),
+        msg.contains(&var_name),
         "error should name the missing env var: {msg}"
     );
     Ok(())
