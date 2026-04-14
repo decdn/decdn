@@ -40,7 +40,6 @@ chacha20poly1305 = "0.10"
 
 # Blockchain / EVM
 alloy = { version = "2", features = ["providers", "signers", "contract"] }
-alloy-primitives = "1.5.7"
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }

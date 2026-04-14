@@ -7,7 +7,7 @@ pub mod types;
 
 use std::path::{Path, PathBuf};
 
-use alloy_primitives::Address;
+use alloy::primitives::Address;
 use anyhow::Context;
 
 use crate::cli::common::{self, expand_tilde};
