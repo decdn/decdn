@@ -7,7 +7,29 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use decdn_cache::{CacheEngine, HttpOrigin, Origin};
 use tokio::sync::oneshot;
+
+#[allow(dead_code)] // Consumed by the next PR's `cdn/client/v1` handler.
+async fn build_cache(cfg: &ResolvedConfig) -> anyhow::Result<CacheEngine> {
+    let origin: Option<std::sync::Arc<dyn Origin>> = cfg
+        .cache
+        .origin_url
+        .as_deref()
+        .map(|url| -> anyhow::Result<std::sync::Arc<dyn Origin>> {
+            Ok(std::sync::Arc::new(
+                HttpOrigin::new(url).context("invalid cache.origin_url")?,
+            ))
+        })
+        .transpose()?;
+    CacheEngine::open(&cfg.cache.cache_dir, origin, cfg.cache.max_blob_size_mb)
+        .await
+        .context("failed to open cache engine")
+}
+
+const fn cache_has_origin(cfg: &ResolvedConfig) -> bool {
+    cfg.cache.origin_url.is_some()
+}
 use tokio::task::JoinSet;
 
 use crate::config::ResolvedConfig;
@@ -29,6 +51,17 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
 
     let secret_key = identity::load_or_generate(&cfg.identity.data_dir)?;
     tracing::info!(node_id = %secret_key.public(), "loaded node identity");
+
+    let cache = build_cache(&cfg).await?;
+    tracing::info!(
+        cache_dir = %cfg.cache.cache_dir.display(),
+        has_origin = cache_has_origin(&cfg),
+        "cache engine ready",
+    );
+    // `cache` is not yet consumed by any handler; the binding keeps the
+    // engine alive alongside the runtime so `cdn/client/v1` (next PR) can
+    // pick it up without changing this wiring.
+    let _cache = cache;
 
     let handlers: Vec<Arc<dyn Handler>> = vec![Arc::new(ProbeHandler::new(
         secret_key.public(),

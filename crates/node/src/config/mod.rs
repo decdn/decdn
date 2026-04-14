@@ -214,10 +214,17 @@ fn resolve_cache(
         .or_else(|| file.and_then(|c| c.max_blob_size_mb))
         .unwrap_or(DEFAULT_MAX_BLOB_SIZE_MB);
 
+    let origin_url = cli
+        .origin_url
+        .clone()
+        .or_else(|| file.and_then(|c| c.origin_url.clone()))
+        .filter(|s| !s.is_empty());
+
     ResolvedCache {
         cache_dir,
         cache_size_mb,
         max_blob_size_mb,
+        origin_url,
     }
 }
 
@@ -547,6 +554,7 @@ mod tests {
                 cache_dir: Some(PathBuf::from(r"C:\data\${HOME}\cache")),
                 cache_size_mb: None,
                 max_blob_size_mb: None,
+                origin_url: None,
             }),
             ..Default::default()
         };
@@ -586,6 +594,7 @@ mod tests {
                 cache_dir: Some(PathBuf::from("~/decdn-cache")),
                 cache_size_mb: None,
                 max_blob_size_mb: None,
+                origin_url: None,
             }),
             ..Default::default()
         };
@@ -622,6 +631,7 @@ mod tests {
                 cache_dir: Some(PathBuf::from("~")),
                 cache_size_mb: None,
                 max_blob_size_mb: None,
+                origin_url: None,
             }),
             ..Default::default()
         };
@@ -698,6 +708,7 @@ mod tests {
                     cache_dir: Some(PathBuf::from(v)),
                     cache_size_mb: None,
                     max_blob_size_mb: None,
+                    origin_url: None,
                 });
             }),
             ("observability.otlp_endpoint", |c, v| {

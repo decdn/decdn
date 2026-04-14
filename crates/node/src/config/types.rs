@@ -66,6 +66,10 @@ pub struct CacheConfig {
     pub cache_size_mb: Option<u64>,
     /// Maximum single blob size in megabytes.
     pub max_blob_size_mb: Option<u64>,
+    /// Origin base URL (HTTP/HTTPS) served at `{url}/{blake3_hex}`. When
+    /// absent, cache misses fail with `NoOrigin` — useful for nodes that
+    /// only serve already-pinned content.
+    pub origin_url: Option<String>,
 }
 
 /// Payment section of the config file.

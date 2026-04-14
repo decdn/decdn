@@ -193,6 +193,7 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             cache_dir: PathBuf::from("/var/lib/decdn/cache"),
             cache_size_mb: 10_240,
             max_blob_size_mb: 10_240,
+            origin_url: None,
         },
         payment: ResolvedPayment { rate_per_mb: 10 },
         observability: ResolvedObservability {

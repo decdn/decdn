@@ -49,6 +49,8 @@ pub struct ResolvedCache {
     pub cache_size_mb: u64,
     /// Maximum single blob size in megabytes.
     pub max_blob_size_mb: u64,
+    /// Optional HTTP origin base URL for pull-through on cache misses.
+    pub origin_url: Option<String>,
 }
 
 /// Resolved payment fields.
