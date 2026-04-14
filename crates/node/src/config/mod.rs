@@ -8,6 +8,7 @@ pub mod types;
 use std::path::{Path, PathBuf};
 
 use alloy::primitives::Address;
+use anyhow::Context;
 
 use crate::cli::common::{self, expand_tilde};
 use crate::cli::run::RunArgs;
@@ -115,9 +116,9 @@ fn resolve_network(
 /// Returns the canonical checksummed form.
 pub fn parse_contract_address(flag_name: &str, raw: &str) -> anyhow::Result<String> {
     let trimmed = raw.trim();
-    let addr = Address::parse_checksummed(trimmed, None).map_err(|e| {
-        anyhow::anyhow!(
-            "invalid {flag_name}: {e} (value: {trimmed:?}); expected an EIP-55 \
+    let addr = Address::parse_checksummed(trimmed, None).with_context(|| {
+        format!(
+            "invalid {flag_name}: value {trimmed:?}; expected an EIP-55 \
              checksummed 0x-prefixed 40-hex-character address"
         )
     })?;
