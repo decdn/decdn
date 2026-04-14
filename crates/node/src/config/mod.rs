@@ -7,6 +7,8 @@ pub mod types;
 
 use std::path::{Path, PathBuf};
 
+use alloy::primitives::Address;
+
 use crate::cli::common::{self, expand_tilde};
 use crate::cli::run::RunArgs;
 
@@ -107,6 +109,21 @@ fn resolve_network(
     }
 }
 
+/// Validate a user-supplied EVM contract address string.
+///
+/// Requires `0x` prefix, 40 hex characters, and a correct EIP-55 checksum.
+/// Returns the canonical checksummed form.
+pub(crate) fn parse_contract_address(flag_name: &str, raw: &str) -> anyhow::Result<String> {
+    let trimmed = raw.trim();
+    let addr = Address::parse_checksummed(trimmed, None).map_err(|e| {
+        anyhow::anyhow!(
+            "invalid {flag_name}: {e} (value: {trimmed:?}); expected an EIP-55 \
+             checksummed 0x-prefixed 40-hex-character address"
+        )
+    })?;
+    Ok(addr.to_checksum(None))
+}
+
 /// Resolve blockchain fields.
 fn resolve_blockchain(
     cli: &crate::cli::run::BlockchainArgs,
@@ -145,6 +162,8 @@ fn resolve_blockchain(
                  (or blockchain.payment_channel_address in config file)"
             )
         })?;
+    let payment_channel_address =
+        parse_contract_address("payment_channel_address", &payment_channel_address)?;
 
     let staking_registry_address = cli
         .staking_registry_address
@@ -157,6 +176,8 @@ fn resolve_blockchain(
                  (or blockchain.staking_registry_address in config file)"
             )
         })?;
+    let staking_registry_address =
+        parse_contract_address("staking_registry_address", &staking_registry_address)?;
 
     Ok(ResolvedBlockchain {
         rpc_url,
