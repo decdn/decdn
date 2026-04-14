@@ -21,10 +21,6 @@ jobs:
   trivy-fs:
     name: Trivy filesystem scan
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      security-events: write
-      actions: read
     steps:
       - uses: actions/checkout@v6
 
@@ -33,29 +29,17 @@ jobs:
         with:
           scan-type: fs
           scan-ref: .
-          format: sarif
-          output: trivy-fs.sarif
+          format: table
           severity: CRITICAL,HIGH
           ignore-unfixed: true
-
-      # Fork PRs don't receive `security-events: write` on GITHUB_TOKEN,
-      # so the upload would fail for external contributors.
-      - name: Upload SARIF to GitHub Security
-        if: github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: trivy-fs.sarif
-          category: trivy-fs
+          exit-code: "1"
 
   trivy-image:
     name: Trivy image scan
-    # Image scan only runs on schedule / manual dispatch (PRs don't have a published image).
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      security-events: write
-      actions: read
       packages: read
     steps:
       - uses: actions/checkout@v6
@@ -86,14 +70,7 @@ jobs:
         uses: aquasecurity/trivy-action@v0.35.0
         with:
           image-ref: ghcr.io/${{ github.repository }}:latest
-          format: sarif
-          output: trivy-image.sarif
+          format: table
           severity: CRITICAL,HIGH
           ignore-unfixed: true
-
-      - name: Upload SARIF to GitHub Security
-        if: steps.image.outputs.exists == 'true'
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: trivy-image.sarif
-          category: trivy-image
+          exit-code: "1"
