@@ -18,11 +18,12 @@ use tokio_stream::StreamExt;
 
 use crate::{AnnounceReject, GossipMetrics, InsertOutcome, PeerTable, validate_envelope};
 
-/// Configuration handed to [`GossipService::spawn`] by the consumer.
+/// Configuration handed to [`GossipService::spawn`] by the consumer. The
+/// peer-table TTL is configured on the `PeerTable` itself at construction
+/// time, so it doesn't appear here.
 #[derive(Debug, Clone)]
 pub struct GossipRuntimeConfig {
     pub announce_interval_sec: u64,
-    pub peer_ttl_sec: u64,
     pub subscribe_global: bool,
     /// Optional region code (ISO 3166-1 alpha-2). If `Some`, the service
     /// publishes and subscribes on `cdn/region/{code}/v1` in addition to
@@ -219,10 +220,14 @@ fn subscriber_task(
                 }
             };
             metrics.inc_received(&topic_name);
-            match validate_envelope(&msg.content, now_us(), allowlist.as_ref()) {
+            // Snapshot the clock once so validation and peer-table insert
+            // share the same timestamp (avoids a race if the system clock
+            // moves between the two reads) and halves the syscall cost.
+            let now = now_us();
+            match validate_envelope(&msg.content, now, allowlist.as_ref()) {
                 Ok(announce) => {
                     let mut table = peer_table.write().await;
-                    match table.insert_or_refresh(announce, now_us()) {
+                    match table.insert_or_refresh(announce, now) {
                         Ok(InsertOutcome::Inserted | InsertOutcome::Refreshed) => {
                             metrics.set_peer_table_size(
                                 i64::try_from(table.len()).unwrap_or(i64::MAX),

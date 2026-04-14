@@ -89,7 +89,7 @@ pub struct GossipConfig {
     /// (`cdn/global/v1`). Default true.
     pub subscribe_global: Option<bool>,
     /// Optional allowlist of accepted announcer node IDs, hex-encoded
-    /// (64 lowercase hex chars). Absent/empty = accept any signature-valid
+    /// (64 hex chars, either case). Absent/empty = accept any signature-valid
     /// announce. `PoC` replacement for ADR 001 rule 2 (staked-node check).
     pub allowlist: Option<Vec<String>>,
 }

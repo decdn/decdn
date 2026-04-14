@@ -90,9 +90,24 @@ fn resolve_identity(
     let region = cli
         .region
         .clone()
-        .or_else(|| file.and_then(|i| i.region.clone()));
+        .or_else(|| file.and_then(|i| i.region.clone()))
+        .map(|r| normalize_region(&r))
+        .transpose()?;
 
     Ok(ResolvedIdentity { data_dir, region })
+}
+
+/// Normalize an operator-supplied region code: uppercase it and require
+/// exactly two ASCII letters (ISO 3166-1 alpha-2 per ADR 001). A bad value
+/// here would otherwise cause the node to publish announces that it and
+/// its peers all reject at validation time — fail loudly at startup.
+fn normalize_region(raw: &str) -> anyhow::Result<String> {
+    let upper = raw.to_ascii_uppercase();
+    anyhow::ensure!(
+        upper.len() == 2 && upper.bytes().all(|b| b.is_ascii_uppercase()),
+        "identity.region must be 2 ASCII letters (ISO 3166-1 alpha-2), got {raw:?}"
+    );
+    Ok(upper)
 }
 
 /// Resolve network fields.

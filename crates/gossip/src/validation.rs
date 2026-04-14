@@ -81,8 +81,11 @@ pub fn validate_envelope<S: std::hash::BuildHasher>(
     now_us: u64,
     allowlist: &HashSet<[u8; 32], S>,
 ) -> Result<NodeAnnounce, AnnounceReject> {
-    let env: GossipEnvelope =
-        postcard::from_bytes(bytes).map_err(|_| AnnounceReject::DecodeFailed)?;
+    // ADR 013: trailing bytes are tolerated so future unsigned extensions on
+    // the envelope don't break old decoders. Use `take_from_bytes` and drop
+    // the remainder rather than `from_bytes`, which errors on trailing input.
+    let (env, _rest): (GossipEnvelope, &[u8]) =
+        postcard::take_from_bytes(bytes).map_err(|_| AnnounceReject::DecodeFailed)?;
 
     if env.version != GOSSIP_VERSION {
         return Err(AnnounceReject::UnknownVersion);
@@ -132,20 +135,18 @@ fn validate_announce_fields(a: &NodeAnnounce, now_us: u64) -> Result<(), Announc
 }
 
 fn verify_signature(a: &NodeAnnounce) -> Result<(), AnnounceReject> {
-    if a.signature.len() != SIGNATURE_LEN {
-        return Err(AnnounceReject::BadSignatureLen);
-    }
+    let sig_bytes: &[u8; SIGNATURE_LEN] = a
+        .signature
+        .as_slice()
+        .try_into()
+        .map_err(|_| AnnounceReject::BadSignatureLen)?;
     let pk = iroh::PublicKey::from_bytes(&a.body.node_id)
         .map_err(|_| AnnounceReject::InvalidPublicKey)?;
     let signing_bytes = a
         .body
         .signing_bytes()
         .map_err(|_| AnnounceReject::BodyEncodeFailed)?;
-    let mut sig_bytes = [0u8; SIGNATURE_LEN];
-    for (dst, src) in sig_bytes.iter_mut().zip(a.signature.iter()) {
-        *dst = *src;
-    }
-    let sig = iroh::Signature::from_bytes(&sig_bytes);
+    let sig = iroh::Signature::from_bytes(sig_bytes);
     pk.verify(&signing_bytes, &sig)
         .map_err(|_| AnnounceReject::InvalidSignature)
 }

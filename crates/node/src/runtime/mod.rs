@@ -78,13 +78,17 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
     )));
     let gossip_runtime_cfg = GossipRuntimeConfig {
         announce_interval_sec: cfg.gossip.announce_interval_sec,
-        peer_ttl_sec: cfg.gossip.peer_ttl_sec,
         subscribe_global: cfg.gossip.subscribe_global,
         region: cfg.identity.region.clone(),
         allowlist: cfg.gossip.allowlist.iter().copied().collect::<HashSet<_>>(),
     };
     let gossip_metrics: Arc<dyn GossipMetrics> =
         Arc::new(NodeGossipMetrics::new(Arc::clone(&node_metrics)));
+    // Keep the gossip JoinHandles outside the JoinSet: dropping a
+    // JoinHandle *detaches* the task in tokio (it keeps running), so if we
+    // only held wrappers inside `tasks` an `abort_all()` would cancel the
+    // wrapper but leak the inner gossip loop. Storing the handles lets us
+    // call `.abort()` on each explicitly during shutdown.
     let gossip_handles = GossipService::spawn(
         ep.clone(),
         secret_key.clone(),
@@ -93,13 +97,6 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
         Arc::clone(&peer_table),
         gossip_metrics,
     );
-    for handle in gossip_handles {
-        tasks.spawn(async move {
-            if let Err(err) = handle.await {
-                tracing::warn!(%err, "gossip task exited");
-            }
-        });
-    }
 
     tracing::info!(
         bind_port = cfg.network.bind_port,
@@ -111,15 +108,27 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
     tracing::info!("shutdown signal received; closing router");
 
     // Router::shutdown waits for ProtocolHandler::shutdown on each handler,
-    // then closes the endpoint. Unblock the metrics accept loop too.
+    // then closes the endpoint. Unblock the metrics accept loop too, and
+    // abort gossip's infinite loops (publisher / subscriber / TTL sweeper)
+    // so the drain phase actually finishes rather than hitting the 15s
+    // timeout every time.
     if let Err(err) = router.shutdown().await {
         tracing::warn!(%err, "router shutdown reported an error");
     }
     let _ = metrics_stop_tx.send(());
+    for handle in &gossip_handles {
+        handle.abort();
+    }
 
     let drain = async {
         while let Some(result) = tasks.join_next().await {
             log_join_result(result, "shutdown");
+        }
+        // Await aborted gossip tasks so the runtime doesn't return while
+        // they're still unwinding. `abort()` followed by `await` resolves
+        // with `JoinError::is_cancelled()`, which we don't log.
+        for handle in gossip_handles {
+            let _ = handle.await;
         }
     };
     if tokio::time::timeout(SHUTDOWN_DEADLINE, drain).await.is_ok() {
