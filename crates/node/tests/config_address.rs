@@ -48,3 +48,18 @@ fn rejects_non_hex() {
     let bad = "0xZZZZ6BF26964aF9D7eEd9e03E53415D37aA96045";
     assert!(parse_contract_address("x", bad).is_err());
 }
+
+#[test]
+fn error_message_names_field_and_format() -> anyhow::Result<()> {
+    let lower = GOOD.to_lowercase();
+    let Err(err) = parse_contract_address("payment_channel_address", &lower) else {
+        anyhow::bail!("expected parse_contract_address to fail on lowercase input");
+    };
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("invalid payment_channel_address"),
+        "missing flag name: {msg}"
+    );
+    assert!(msg.contains("EIP-55"), "missing format hint: {msg}");
+    Ok(())
+}
