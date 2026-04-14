@@ -59,6 +59,7 @@ thiserror = "2"
 # Config
 toml = "1"
 dirs = "6"
+shellexpand = "3"
 
 # Misc
 bytes = "1"

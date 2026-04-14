@@ -5,7 +5,7 @@
 pub mod resolved;
 pub mod types;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::cli::common::{self, expand_tilde};
 use crate::cli::run::RunArgs;
@@ -261,8 +261,188 @@ fn load_file_config(explicit_path: Option<&Path>) -> anyhow::Result<FileConfig> 
     let contents = std::fs::read_to_string(&path)
         .map_err(|e| anyhow::anyhow!("failed to read config file {}: {e}", path.display()))?;
 
-    let config: FileConfig = toml::from_str(&contents)
+    let mut config: FileConfig = toml::from_str(&contents)
         .map_err(|e| anyhow::anyhow!("failed to parse config file {}: {e}", path.display()))?;
 
+    expand_env(&mut config)?;
+
     Ok(config)
+}
+
+/// Expand `$VAR`, `${VAR}`, and `~` in every string and path field on
+/// [`FileConfig`]. Missing env vars produce a contextual error naming the
+/// offending field. Enables a single TOML template to be reused across
+/// container/Kubernetes deployments (see GitHub issue #223).
+fn expand_env(cfg: &mut FileConfig) -> anyhow::Result<()> {
+    if let Some(i) = cfg.identity.as_mut() {
+        expand_path(&mut i.data_dir, "identity.data_dir")?;
+        expand_str(&mut i.region, "identity.region")?;
+    }
+    if let Some(n) = cfg.network.as_mut() {
+        expand_str(&mut n.relay_url, "network.relay_url")?;
+    }
+    if let Some(b) = cfg.blockchain.as_mut() {
+        expand_str(&mut b.rpc_url, "blockchain.rpc_url")?;
+        expand_path(&mut b.eth_keystore, "blockchain.eth_keystore")?;
+        expand_str(
+            &mut b.payment_channel_address,
+            "blockchain.payment_channel_address",
+        )?;
+        expand_str(
+            &mut b.staking_registry_address,
+            "blockchain.staking_registry_address",
+        )?;
+    }
+    if let Some(c) = cfg.cache.as_mut() {
+        expand_path(&mut c.cache_dir, "cache.cache_dir")?;
+    }
+    if let Some(o) = cfg.observability.as_mut() {
+        expand_str(&mut o.otlp_endpoint, "observability.otlp_endpoint")?;
+    }
+    Ok(())
+}
+
+fn expand_str(field: &mut Option<String>, ctx: &'static str) -> anyhow::Result<()> {
+    if let Some(s) = field.as_mut() {
+        *s = expand_value(s, ctx)?;
+    }
+    Ok(())
+}
+
+fn expand_path(field: &mut Option<PathBuf>, ctx: &'static str) -> anyhow::Result<()> {
+    if let Some(p) = field.as_mut() {
+        let as_str = p.to_string_lossy();
+        let expanded = expand_value(&as_str, ctx)?;
+        *p = PathBuf::from(expanded);
+    }
+    Ok(())
+}
+
+fn expand_value(raw: &str, ctx: &'static str) -> anyhow::Result<String> {
+    shellexpand::full(raw)
+        .map(std::borrow::Cow::into_owned)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "config field `{ctx}` references undefined env var `{}`",
+                e.var_name
+            )
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // HOME is guaranteed set in Rust test harness on Linux/macOS and used here
+    // to exercise ${VAR} expansion without mutating the process environment
+    // (std::env::set_var is `unsafe` in edition 2024, and workspace lints
+    // forbid `unsafe_code`).
+    fn home_str() -> anyhow::Result<String> {
+        Ok(dirs::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("test requires home dir"))?
+            .to_string_lossy()
+            .into_owned())
+    }
+
+    fn cfg_with_rpc(raw: &str) -> FileConfig {
+        FileConfig {
+            blockchain: Some(types::BlockchainConfig {
+                rpc_url: Some(raw.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn expand_env_substitutes_string_field() -> anyhow::Result<()> {
+        let home = home_str()?;
+        let mut cfg = cfg_with_rpc("${HOME}/rpc");
+        expand_env(&mut cfg)?;
+        let url = cfg
+            .blockchain
+            .as_ref()
+            .and_then(|b| b.rpc_url.as_deref())
+            .ok_or_else(|| anyhow::anyhow!("rpc_url missing"))?;
+        anyhow::ensure!(url == format!("{home}/rpc"), "got: {url}");
+        Ok(())
+    }
+
+    #[test]
+    fn expand_env_substitutes_path_field() -> anyhow::Result<()> {
+        let home = home_str()?;
+        let mut cfg = FileConfig {
+            identity: Some(types::IdentityConfig {
+                data_dir: Some(PathBuf::from("${HOME}/node")),
+                region: None,
+            }),
+            ..Default::default()
+        };
+        expand_env(&mut cfg)?;
+        let dd = cfg
+            .identity
+            .as_ref()
+            .and_then(|i| i.data_dir.as_deref())
+            .ok_or_else(|| anyhow::anyhow!("data_dir missing"))?
+            .to_path_buf();
+        let expected = format!("{home}/node");
+        anyhow::ensure!(dd == Path::new(&expected), "got: {}", dd.display());
+        Ok(())
+    }
+
+    #[test]
+    fn expand_env_errors_on_missing_var_naming_field() -> anyhow::Result<()> {
+        // Var name unlikely to exist; if it does, the test is meaningless —
+        // skip loudly rather than producing a false pass.
+        let missing = "DECDN_DEFINITELY_UNSET_VAR_QZX_223";
+        anyhow::ensure!(
+            std::env::var_os(missing).is_none(),
+            "test precondition violated: {missing} is set in the environment"
+        );
+        let mut cfg = cfg_with_rpc(&format!("${{{missing}}}"));
+        let err = expand_env(&mut cfg)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected expansion error"))?
+            .to_string();
+        anyhow::ensure!(
+            err.contains("blockchain.rpc_url") && err.contains(missing),
+            "error missing context, got: {err}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn expand_env_leaves_plain_values_untouched() -> anyhow::Result<()> {
+        let mut cfg = cfg_with_rpc("https://plain.example");
+        expand_env(&mut cfg)?;
+        let url = cfg
+            .blockchain
+            .as_ref()
+            .and_then(|b| b.rpc_url.as_deref())
+            .ok_or_else(|| anyhow::anyhow!("rpc_url missing"))?;
+        anyhow::ensure!(url == "https://plain.example", "got: {url}");
+        Ok(())
+    }
+
+    #[test]
+    fn expand_env_expands_tilde_in_path_field() -> anyhow::Result<()> {
+        let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("test requires home dir"))?;
+        let mut cfg = FileConfig {
+            cache: Some(types::CacheConfig {
+                cache_dir: Some(PathBuf::from("~/decdn-cache")),
+                cache_size_mb: None,
+                max_blob_size_mb: None,
+            }),
+            ..Default::default()
+        };
+        expand_env(&mut cfg)?;
+        let dir = cfg
+            .cache
+            .as_ref()
+            .and_then(|c| c.cache_dir.as_deref())
+            .ok_or_else(|| anyhow::anyhow!("cache_dir missing"))?
+            .to_path_buf();
+        anyhow::ensure!(dir == home.join("decdn-cache"), "got: {}", dir.display());
+        Ok(())
+    }
 }
