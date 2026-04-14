@@ -32,7 +32,7 @@ fn cmd_run(config_path: Option<&std::path::Path>, run_args: &cli::RunArgs) -> an
             if std::env::var_os("RUST_LOG").is_some() {
                 eprintln!("warning: ignoring malformed RUST_LOG: {e}");
             }
-            tracing_subscriber::EnvFilter::new(resolved.log_level.to_string())
+            tracing_subscriber::EnvFilter::new(resolved.observability.log_level.to_string())
         }
     };
 
@@ -40,13 +40,13 @@ fn cmd_run(config_path: Option<&std::path::Path>, run_args: &cli::RunArgs) -> an
 
     tracing::info!("deCDN node starting");
     tracing::debug!(
-        data_dir = %resolved.data_dir.display(),
-        bind_port = resolved.bind_port,
+        data_dir = %resolved.identity.data_dir.display(),
+        bind_port = resolved.network.bind_port,
         rpc_url = "<redacted>",
-        cache_dir = %resolved.cache_dir.display(),
-        cache_size_mb = resolved.cache_size_mb,
+        cache_dir = %resolved.cache.cache_dir.display(),
+        cache_size_mb = resolved.cache.cache_size_mb,
         rate_per_mb = resolved.rate_per_mb,
-        metrics_port = resolved.metrics_port,
+        metrics_port = resolved.observability.metrics_port,
         "resolved configuration"
     );
 
@@ -63,7 +63,7 @@ fn init_tracing(
 ) -> anyhow::Result<()> {
     use tracing_subscriber::prelude::*;
 
-    let fmt_layer = match resolved.log_format {
+    let fmt_layer = match resolved.observability.log_format {
         cli::LogFormat::Json => tracing_subscriber::fmt::layer().json().boxed(),
         cli::LogFormat::Pretty => tracing_subscriber::fmt::layer().boxed(),
     };
@@ -72,7 +72,7 @@ fn init_tracing(
 
     #[cfg(feature = "otlp")]
     {
-        if let Some(ref endpoint) = resolved.otlp_endpoint {
+        if let Some(ref endpoint) = resolved.observability.otlp_endpoint {
             let tracer = init_otlp_tracer(endpoint)?;
             let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
             registry.with(otel_layer).init();
@@ -83,7 +83,7 @@ fn init_tracing(
 
     #[cfg(not(feature = "otlp"))]
     {
-        if resolved.otlp_endpoint.is_some() {
+        if resolved.observability.otlp_endpoint.is_some() {
             eprintln!("warning: --otlp-endpoint ignored (binary not built with 'otlp' feature)");
         }
         registry.init();
