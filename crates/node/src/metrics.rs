@@ -40,10 +40,17 @@ pub struct DecdnMetrics {
 }
 
 /// Aggregated deCDN node metrics.
+#[derive(Debug)]
 pub struct Metrics {
     registry: Arc<RwLock<Registry>>,
     decdn: Arc<DecdnMetrics>,
     started_at: Instant,
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Metrics {

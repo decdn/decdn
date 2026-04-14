@@ -28,6 +28,7 @@ const PROBE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Serves `cdn/probe/v1`: reads a [`ProbeRequest`], writes a [`ProbeResponse`].
+#[derive(Debug)]
 pub struct ProbeHandler {
     node_id: PublicKey,
     rate_per_mb: u64,
