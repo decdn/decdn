@@ -21,6 +21,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Run(run_args) => cmd_run(config_path.as_deref(), &run_args).await,
         Command::KeyGen(args) => cmd_key_gen(&args),
         Command::Config(args) => cmd_config_init(&args),
+        Command::Probe(args) => cmd_probe(&args).await,
     }
 }
 
@@ -151,6 +152,149 @@ fn cmd_key_gen(args: &cli::KeyGenArgs) -> anyhow::Result<()> {
     println!("node id: {}", key.public());
     println!("wrote secret key to {}", key_path.display());
     Ok(())
+}
+
+/// Send a `cdn/probe/v1` request to a running node and print the response.
+async fn cmd_probe(args: &cli::ProbeArgs) -> anyhow::Result<()> {
+    use std::str::FromStr;
+    use std::time::{Duration, Instant};
+
+    use decdn_protocol::{
+        ALPN_PROBE,
+        message::{ProbeRequest, ProbeResponse},
+    };
+    use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl, SecretKey};
+    use rand::RngCore;
+
+    let node_id = PublicKey::from_str(&args.node_id)
+        .map_err(|e| anyhow::anyhow!("invalid --node-id {:?}: {e}", args.node_id))?;
+
+    let relay_url = match args.relay_url.as_deref() {
+        Some(s) => Some(
+            RelayUrl::from_str(s).map_err(|e| anyhow::anyhow!("invalid --relay-url {s:?}: {e}"))?,
+        ),
+        None => None,
+    };
+
+    let (relay_mode, bind_addr) = match relay_url.clone() {
+        Some(url) => (
+            RelayMode::Custom(RelayMap::from_iter([url])),
+            std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0),
+        ),
+        None => (
+            RelayMode::Disabled,
+            std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0),
+        ),
+    };
+
+    let client_sk = SecretKey::generate(&mut rand::rng());
+    let endpoint = Endpoint::empty_builder()
+        .secret_key(client_sk)
+        .relay_mode(relay_mode)
+        .bind_addr(bind_addr)
+        .map_err(|e| anyhow::anyhow!("invalid bind addr {bind_addr}: {e}"))?
+        .bind()
+        .await
+        .map_err(|e| anyhow::anyhow!("endpoint bind failed: {e}"))?;
+
+    let mut target = EndpointAddr::new(node_id);
+    if let Some(addr) = args.addr {
+        target = target.with_ip_addr(addr);
+    }
+    if let Some(url) = relay_url {
+        target = target.with_relay_url(url);
+    }
+
+    let timeout = Duration::from_millis(args.timeout_ms);
+    let nonce: u64 = rand::rng().next_u64();
+
+    let started = Instant::now();
+    let result = tokio::time::timeout(timeout, async {
+        let conn = endpoint
+            .connect(target, ALPN_PROBE)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect failed: {e}"))?;
+
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| anyhow::anyhow!("open_bi failed: {e}"))?;
+
+        let bytes = postcard::to_allocvec(&ProbeRequest { nonce })
+            .map_err(|e| anyhow::anyhow!("encode request: {e}"))?;
+        send.write_all(&bytes)
+            .await
+            .map_err(|e| anyhow::anyhow!("write request: {e}"))?;
+        send.finish()
+            .map_err(|e| anyhow::anyhow!("finish stream: {e}"))?;
+
+        let resp_bytes = recv
+            .read_to_end(4096)
+            .await
+            .map_err(|e| anyhow::anyhow!("read response: {e}"))?;
+        let resp: ProbeResponse = postcard::from_bytes(&resp_bytes)
+            .map_err(|e| anyhow::anyhow!("decode response: {e}"))?;
+
+        conn.close(0u32.into(), b"probe-done");
+        Ok::<_, anyhow::Error>(resp)
+    })
+    .await;
+
+    let rtt_ms = started.elapsed().as_secs_f64() * 1000.0;
+    endpoint.close().await;
+
+    let resp = match result {
+        Ok(inner) => inner?,
+        Err(_) => anyhow::bail!("probe timed out after {} ms", args.timeout_ms),
+    };
+
+    if resp.nonce != nonce {
+        anyhow::bail!(
+            "nonce mismatch: sent 0x{nonce:016x}, received 0x{:016x}",
+            resp.nonce
+        );
+    }
+
+    print_probe_response(&resp, rtt_ms, nonce, args.json);
+    Ok(())
+}
+
+/// Render a successful probe response to stdout in pretty or JSON form.
+fn print_probe_response(
+    resp: &decdn_protocol::message::ProbeResponse,
+    rtt_ms: f64,
+    nonce: u64,
+    json: bool,
+) {
+    let node_id_hex = hex_lower(&resp.node_id);
+    if json {
+        println!(
+            "{{\"node_id\":\"{node_id_hex}\",\"rate_per_mb\":{},\"measured_at_unix_ms\":{},\"rtt_ms\":{:.3},\"nonce\":\"0x{nonce:016x}\"}}",
+            resp.rate_per_mb, resp.measured_at_unix_ms, rtt_ms,
+        );
+    } else {
+        println!("node_id:       {node_id_hex}");
+        println!("rate_per_mb:   {} (base units)", resp.rate_per_mb);
+        println!("measured_at:   {} (unix ms)", resp.measured_at_unix_ms);
+        println!("rtt:           {rtt_ms:.3} ms");
+        println!("nonce:         0x{nonce:016x} (echoed ok)");
+    }
+}
+
+/// Lowercase hex encoding of a 32-byte array.
+fn hex_lower(bytes: &[u8; 32]) -> String {
+    const fn nibble(n: u8) -> char {
+        match n {
+            0..=9 => (b'0' + n) as char,
+            _ => (b'a' + n - 10) as char,
+        }
+    }
+    let mut out = String::with_capacity(64);
+    for b in bytes {
+        out.push(nibble(b >> 4));
+        out.push(nibble(b & 0x0f));
+    }
+    out
 }
 
 /// Write a default TOML configuration file.
