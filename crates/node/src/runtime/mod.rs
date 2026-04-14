@@ -131,7 +131,7 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
     tracing::info!("node stopped");
     match cache_shutdown_err {
         None => Ok(()),
-        Some(err) => Err(anyhow::Error::from(err).context("cache shutdown failed during drain")),
+        Some(err) => Err(anyhow::Error::from(err).context("cache shutdown failed")),
     }
 }
 

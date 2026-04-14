@@ -18,17 +18,51 @@ use super::{Origin, OriginFetch};
 
 /// How long to wait for the TCP/TLS handshake to complete. Per-request total
 /// duration is intentionally *not* bounded because `max_blob_size_mb` can be
-/// as large as 10 GB and no single timeout fits both small and large blobs.
-///
-/// Known MVP limitation: a stalled mid-stream origin is **not** time-bounded;
-/// only total bytes are capped via [`Origin::fetch`]'s `max_bytes` argument.
-/// A per-chunk idle timeout is a follow-up.
+/// as large as 10 GB and no single total-request timeout fits both small and
+/// large blobs. Instead, we pair this with phase-level timeouts below.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Ceiling on how long the origin may take to respond with headers after
+/// the connection is established. Without this, a compromised or misbehaving
+/// origin could accept the connection and then stall indefinitely, tying up
+/// a fetch task with no bytes in flight to catch it any other way.
+const RESPONSE_HEADERS_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Ceiling on the idle gap between body chunks. Bounds the time a
+/// slow-trickle origin can tie up a task — total bytes are capped by
+/// `max_bytes`, but without this check a pathological origin could send
+/// a single byte per second within the total cap and keep the task alive
+/// for days.
+const CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Ceiling on the `BytesMut::with_capacity` hint derived from an
 /// origin-advertised `Content-Length`. A legitimate 10 GB blob should grow
 /// incrementally rather than pre-allocating 10 GB up front for one request.
 const INITIAL_CAPACITY_HINT_CAP: usize = 1 << 20; // 1 MiB
+
+/// Return a loggable form of an origin URL with userinfo (`user:pass@`)
+/// stripped. Operators may legitimately use basic-auth-in-URL for
+/// internal origins, but those credentials must not reach logs or
+/// error messages.
+fn redact_for_log(url: &reqwest::Url) -> String {
+    let mut u = url.clone();
+    // Both setters return Err only for cannot-be-a-base URLs (data:, etc),
+    // which can't reach here because parse_origin_url rejects them.
+    let _ = u.set_username("");
+    let _ = u.set_password(None);
+    u.to_string()
+}
+
+/// Loggable form of a raw (not yet parsed) origin URL string. Used by
+/// `parse_origin_url` when the input might contain credentials. For
+/// unparseable input we don't echo it at all — no way to safely split
+/// userinfo from the rest.
+fn redact_raw_for_log(raw: &str) -> String {
+    match reqwest::Url::parse(raw) {
+        Ok(url) => redact_for_log(&url),
+        Err(_) => "<unparseable URL>".to_string(),
+    }
+}
 
 /// Parsed, scheme-validated, and path-normalized origin base URL. The only
 /// way to construct one is [`parse_origin_url`] — once you have an
@@ -67,22 +101,31 @@ impl std::fmt::Display for OriginUrl {
 /// both go through it, and the returned [`OriginUrl`] carries the
 /// scheme/path/query invariants in the type.
 pub fn parse_origin_url(raw: &str) -> anyhow::Result<OriginUrl> {
-    let mut url =
-        reqwest::Url::parse(raw).with_context(|| format!("invalid origin base URL: {raw:?}"))?;
+    // Error messages use `redact_raw_for_log` / `redact_for_log` so
+    // userinfo (user:pass@) never reaches error strings or logs.
+    let mut url = reqwest::Url::parse(raw)
+        .with_context(|| format!("invalid origin base URL: {}", redact_raw_for_log(raw)))?;
     match url.scheme() {
         "http" | "https" => {}
         other => anyhow::bail!(
-            "unsupported origin URL scheme {other:?} (expected http or https): {raw:?}"
+            "unsupported origin URL scheme {other:?} (expected http or https): {}",
+            redact_for_log(&url)
         ),
     }
     // A query or fragment on the base would be silently dropped by
     // `Url::join` when we append the blake3 hex, so reject up front rather
     // than accept a URL that can't possibly do what the operator expects.
     if url.query().is_some() {
-        anyhow::bail!("origin URL must not contain a query string: {raw:?}");
+        anyhow::bail!(
+            "origin URL must not contain a query string: {}",
+            redact_for_log(&url)
+        );
     }
     if url.fragment().is_some() {
-        anyhow::bail!("origin URL must not contain a fragment: {raw:?}");
+        anyhow::bail!(
+            "origin URL must not contain a fragment: {}",
+            redact_for_log(&url)
+        );
     }
     // Normalize the path (not the raw string) so `http://host/v1` becomes
     // `http://host/v1/` without corrupting any other URL component.
@@ -133,20 +176,29 @@ impl Origin for HttpOrigin {
                 .as_url()
                 .join(&hash.to_hex())
                 .with_context(|| format!("failed to build URL for {hash}"))?;
+            // Always log the redacted form — `url` may inherit userinfo
+            // from `base_url`, and errors go to logs.
+            let url_log = redact_for_log(&url);
 
-            let mut resp = self
-                .client
-                .get(url.clone())
-                .send()
+            // connect_timeout on the client covers the TCP/TLS handshake;
+            // the header-phase timeout covers everything after the
+            // connection is established until response headers arrive.
+            let send_fut = self.client.get(url.clone()).send();
+            let mut resp = tokio::time::timeout(RESPONSE_HEADERS_TIMEOUT, send_fut)
                 .await
-                .with_context(|| format!("origin GET {url} failed"))?;
+                .with_context(|| {
+                    format!(
+                        "origin GET {url_log} headers timed out after {RESPONSE_HEADERS_TIMEOUT:?}"
+                    )
+                })?
+                .with_context(|| format!("origin GET {url_log} failed"))?;
 
             let status = resp.status();
             if status == StatusCode::NOT_FOUND {
                 return Ok(OriginFetch::NotFound);
             }
             if !status.is_success() {
-                anyhow::bail!("origin GET {url} returned {status}");
+                anyhow::bail!("origin GET {url_log} returned {status}");
             }
 
             // Fast-path rejection using the advertised length before we
@@ -155,26 +207,34 @@ impl Origin for HttpOrigin {
             if let Some(len) = resp.content_length()
                 && len > max_bytes
             {
-                anyhow::bail!("origin GET {url} advertises {len} bytes, exceeds max {max_bytes}");
+                anyhow::bail!(
+                    "origin GET {url_log} advertises {len} bytes, exceeds max {max_bytes}"
+                );
             }
 
-            // Stream the body chunk-by-chunk, rejecting as soon as the
-            // running total would exceed `max_bytes`. This bounds the
-            // memory an untrusted origin can force us to allocate even
-            // when it omits or misreports `Content-Length`.
+            // Stream the body chunk-by-chunk. Three guards run per chunk:
+            //   1. per-chunk idle timeout (bounds slow-trickle origins)
+            //   2. running total cap (bounds memory; the only defense when
+            //      Content-Length is absent or misreported)
+            //   3. propagate reqwest transport errors
             let hint = resp
                 .content_length()
                 .and_then(|l| usize::try_from(l).ok())
                 .map_or(0, |l| min(l, INITIAL_CAPACITY_HINT_CAP));
             let mut buf = BytesMut::with_capacity(hint);
-            while let Some(chunk) = resp
-                .chunk()
-                .await
-                .with_context(|| format!("origin GET {url} body read failed"))?
-            {
+            loop {
+                let chunk_result = tokio::time::timeout(CHUNK_IDLE_TIMEOUT, resp.chunk())
+                    .await
+                    .with_context(|| {
+                        format!("origin GET {url_log} body read stalled for {CHUNK_IDLE_TIMEOUT:?}")
+                    })?
+                    .with_context(|| format!("origin GET {url_log} body read failed"))?;
+                let Some(chunk) = chunk_result else { break };
                 let next_total = (buf.len() as u64).saturating_add(chunk.len() as u64);
                 if next_total > max_bytes {
-                    anyhow::bail!("origin GET {url} body exceeds max_bytes={max_bytes} mid-stream");
+                    anyhow::bail!(
+                        "origin GET {url_log} body exceeds max_bytes={max_bytes} mid-stream"
+                    );
                 }
                 buf.extend_from_slice(&chunk);
             }

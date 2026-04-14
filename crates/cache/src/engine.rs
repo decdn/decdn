@@ -140,6 +140,13 @@ impl CacheEngine {
             .map_err(|e| CacheError::Store(anyhow::Error::from(e)))
     }
 
+    /// BLAKE3 of a 10 GB blob takes seconds of 100% CPU; running it on the
+    /// async executor would block one worker and starve other tasks. Small
+    /// blobs don't need the `spawn_blocking` round-trip (≤ 1 MiB hashes in
+    /// sub-millisecond on a modern core), so `pull_through` uses the inline
+    /// path when cheap and `spawn_blocking` above this threshold.
+    const BLOCKING_HASH_THRESHOLD: usize = 1 << 20;
+
     async fn pull_through(&self, hash: Hash) -> CacheResult<Bytes> {
         let origin = self
             .inner
@@ -170,7 +177,16 @@ impl CacheEngine {
             });
         }
 
-        let actual = Hash::new(&bytes);
+        let actual = if bytes.len() <= Self::BLOCKING_HASH_THRESHOLD {
+            Hash::new(&bytes)
+        } else {
+            let bytes_for_hash = bytes.clone();
+            tokio::task::spawn_blocking(move || Hash::new(&bytes_for_hash))
+                .await
+                .map_err(|e| {
+                    CacheError::Store(anyhow::Error::from(e).context("hash task panicked"))
+                })?
+        };
         if actual != hash {
             return Err(CacheError::HashMismatch {
                 expected: hash,
