@@ -10,7 +10,10 @@ use std::path::Path;
 use crate::cli::common::{self, expand_tilde};
 use crate::cli::run::RunArgs;
 
-pub use resolved::ResolvedConfig;
+pub use resolved::{
+    ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedIdentity, ResolvedNetwork,
+    ResolvedObservability,
+};
 pub use types::FileConfig;
 
 /// Default QUIC bind port.
@@ -40,36 +43,30 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
 
     let identity = resolve_identity(&cli.identity, file.identity.as_ref())?;
     let network = resolve_network(&cli.network, file.network.as_ref());
-    let blockchain = resolve_blockchain(&cli.blockchain, file.blockchain.as_ref(), &identity.0)?;
-    let cache = resolve_cache(&cli.cache, file.cache.as_ref(), &identity.0);
-    let payment = resolve_payment(&cli.payment, file.payment.as_ref());
-    let obs = resolve_observability(&cli.observability, file.observability.as_ref());
+    let blockchain = resolve_blockchain(
+        &cli.blockchain,
+        file.blockchain.as_ref(),
+        &identity.data_dir,
+    )?;
+    let cache = resolve_cache(&cli.cache, file.cache.as_ref(), &identity.data_dir);
+    let rate_per_mb = resolve_payment(&cli.payment, file.payment.as_ref());
+    let observability = resolve_observability(&cli.observability, file.observability.as_ref());
 
     Ok(ResolvedConfig {
-        data_dir: identity.0,
-        region: identity.1,
-        bind_port: network.0,
-        relay_url: network.1,
-        rpc_url: blockchain.0,
-        eth_keystore: blockchain.1,
-        payment_channel_address: blockchain.2,
-        staking_registry_address: blockchain.3,
-        cache_dir: cache.0,
-        cache_size_mb: cache.1,
-        max_blob_size_mb: cache.2,
-        rate_per_mb: payment,
-        log_level: obs.0,
-        log_format: obs.1,
-        metrics_port: obs.2,
-        otlp_endpoint: obs.3,
+        identity,
+        network,
+        blockchain,
+        cache,
+        rate_per_mb,
+        observability,
     })
 }
 
-/// Resolve identity fields: `(data_dir, region)`.
+/// Resolve identity fields.
 fn resolve_identity(
     cli: &crate::cli::run::IdentityArgs,
     file: Option<&types::IdentityConfig>,
-) -> anyhow::Result<(std::path::PathBuf, Option<String>)> {
+) -> anyhow::Result<ResolvedIdentity> {
     let data_dir = cli
         .data_dir
         .clone()
@@ -86,14 +83,14 @@ fn resolve_identity(
         .clone()
         .or_else(|| file.and_then(|i| i.region.clone()));
 
-    Ok((data_dir, region))
+    Ok(ResolvedIdentity { data_dir, region })
 }
 
-/// Resolve network fields: `(bind_port, relay_url)`.
+/// Resolve network fields.
 fn resolve_network(
     cli: &crate::cli::run::NetworkArgs,
     file: Option<&types::NetworkConfig>,
-) -> (u16, Option<String>) {
+) -> ResolvedNetwork {
     let bind_port = cli
         .bind_port
         .or_else(|| file.and_then(|n| n.bind_port))
@@ -104,15 +101,18 @@ fn resolve_network(
         .clone()
         .or_else(|| file.and_then(|n| n.relay_url.clone()));
 
-    (bind_port, relay_url)
+    ResolvedNetwork {
+        bind_port,
+        relay_url,
+    }
 }
 
-/// Resolve blockchain fields: `(rpc_url, eth_keystore, payment_channel_address, staking_registry_address)`.
+/// Resolve blockchain fields.
 fn resolve_blockchain(
     cli: &crate::cli::run::BlockchainArgs,
     file: Option<&types::BlockchainConfig>,
     data_dir: &std::path::Path,
-) -> anyhow::Result<(String, std::path::PathBuf, String, String)> {
+) -> anyhow::Result<ResolvedBlockchain> {
     let rpc_url = cli
         .rpc_url
         .clone()
@@ -158,20 +158,20 @@ fn resolve_blockchain(
             )
         })?;
 
-    Ok((
+    Ok(ResolvedBlockchain {
         rpc_url,
         eth_keystore,
         payment_channel_address,
         staking_registry_address,
-    ))
+    })
 }
 
-/// Resolve cache fields: `(cache_dir, cache_size_mb, max_blob_size_mb)`.
+/// Resolve cache fields.
 fn resolve_cache(
     cli: &crate::cli::run::CacheArgs,
     file: Option<&types::CacheConfig>,
     data_dir: &std::path::Path,
-) -> (std::path::PathBuf, u64, u64) {
+) -> ResolvedCache {
     let cache_dir = cli
         .cache_dir
         .clone()
@@ -192,7 +192,11 @@ fn resolve_cache(
         .or_else(|| file.and_then(|c| c.max_blob_size_mb))
         .unwrap_or(DEFAULT_MAX_BLOB_SIZE_MB);
 
-    (cache_dir, cache_size_mb, max_blob_size_mb)
+    ResolvedCache {
+        cache_dir,
+        cache_size_mb,
+        max_blob_size_mb,
+    }
 }
 
 /// Resolve payment fields: `rate_per_mb`.
@@ -202,16 +206,11 @@ fn resolve_payment(cli: &crate::cli::run::PaymentArgs, file: Option<&types::Paym
         .unwrap_or(DEFAULT_RATE_PER_MB)
 }
 
-/// Resolve observability fields: `(log_level, log_format, metrics_port, otlp_endpoint)`.
+/// Resolve observability fields.
 fn resolve_observability(
     cli: &crate::cli::run::ObservabilityArgs,
     file: Option<&types::ObservabilityConfig>,
-) -> (
-    crate::cli::common::LogLevel,
-    crate::cli::common::LogFormat,
-    u16,
-    Option<String>,
-) {
+) -> ResolvedObservability {
     let log_level = cli
         .log_level
         .or_else(|| file.and_then(|o| o.log_level))
@@ -232,7 +231,12 @@ fn resolve_observability(
         .clone()
         .or_else(|| file.and_then(|o| o.otlp_endpoint.clone()));
 
-    (log_level, log_format, metrics_port, otlp_endpoint)
+    ResolvedObservability {
+        log_level,
+        log_format,
+        metrics_port,
+        otlp_endpoint,
+    }
 }
 
 /// Load a [`FileConfig`] from disk.
