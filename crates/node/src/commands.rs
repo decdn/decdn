@@ -282,6 +282,140 @@ fn print_probe_response(
     }
 }
 
+/// Validate a configuration and print a resolved summary. Performs no I/O
+/// beyond reading the config file — does not open sockets or touch the RPC.
+pub fn config_validate(
+    config_path: Option<&std::path::Path>,
+    args: &cli::ConfigValidateArgs,
+) -> anyhow::Result<()> {
+    let resolved = config::resolve_config(config_path, &args.run)?;
+    let source = effective_source(config_path, cli::common::default_config_path)?;
+    let mut stdout = std::io::stdout().lock();
+    write_validate_summary(&mut stdout, source.as_deref(), &resolved)
+        .map_err(|e| anyhow::anyhow!("failed to write summary: {e}"))
+}
+
+/// Resolve the config source actually consulted. When `--config` is omitted,
+/// the default path is auto-loaded only if present, so report the file that
+/// `resolve_config` will actually read — not just the explicit flag.
+///
+/// Uses `try_exists` rather than `exists`: a permission error on the default
+/// path must be surfaced, not silently reported as "no config file" — the
+/// whole point of `validate` is telling the operator what the node sees.
+pub fn effective_source(
+    config_path: Option<&std::path::Path>,
+    default: impl FnOnce() -> Option<std::path::PathBuf>,
+) -> anyhow::Result<Option<std::path::PathBuf>> {
+    if let Some(p) = config_path {
+        return Ok(Some(p.to_path_buf()));
+    }
+    let Some(default) = default() else {
+        return Ok(None);
+    };
+    match default.try_exists() {
+        Ok(true) => Ok(Some(default)),
+        Ok(false) => Ok(None),
+        Err(e) => Err(anyhow::anyhow!(
+            "cannot determine whether default config {} exists: {e}",
+            default.display()
+        )),
+    }
+}
+
+/// Render the validation summary. Separated from [`config_validate`] so tests
+/// can capture the output into a buffer and assert on the printed contract —
+/// in particular that `rpc_url` and `otlp_endpoint` values never appear.
+pub fn write_validate_summary<W: std::io::Write>(
+    w: &mut W,
+    source: Option<&std::path::Path>,
+    resolved: &config::ResolvedConfig,
+) -> std::io::Result<()> {
+    writeln!(w, "config valid")?;
+    match source {
+        Some(path) => writeln!(w, "  source:                   {}", path.display())?,
+        None => writeln!(
+            w,
+            "  source:                   (defaults + env only, no config file)"
+        )?,
+    }
+    writeln!(
+        w,
+        "  data_dir:                 {}",
+        resolved.identity.data_dir.display()
+    )?;
+    if let Some(region) = &resolved.identity.region {
+        writeln!(w, "  region:                   {region}")?;
+    }
+    writeln!(
+        w,
+        "  bind_port:                {}",
+        resolved.network.bind_port
+    )?;
+    if let Some(relay) = &resolved.network.relay_url {
+        writeln!(w, "  relay_url:                {relay}")?;
+    }
+    writeln!(
+        w,
+        "  rpc_url:                  <redacted> ({} chars)",
+        resolved.blockchain.rpc_url.len()
+    )?;
+    writeln!(
+        w,
+        "  eth_keystore:             {}",
+        resolved.blockchain.eth_keystore.display()
+    )?;
+    writeln!(
+        w,
+        "  payment_channel_address:  {}",
+        resolved.blockchain.payment_channel_address
+    )?;
+    writeln!(
+        w,
+        "  staking_registry_address: {}",
+        resolved.blockchain.staking_registry_address
+    )?;
+    writeln!(
+        w,
+        "  cache_dir:                {}",
+        resolved.cache.cache_dir.display()
+    )?;
+    writeln!(
+        w,
+        "  cache_size_mb:            {}",
+        resolved.cache.cache_size_mb
+    )?;
+    writeln!(
+        w,
+        "  max_blob_size_mb:         {}",
+        resolved.cache.max_blob_size_mb
+    )?;
+    writeln!(
+        w,
+        "  rate_per_mb:              {}",
+        resolved.payment.rate_per_mb
+    )?;
+    writeln!(
+        w,
+        "  log_level:                {}",
+        resolved.observability.log_level
+    )?;
+    writeln!(
+        w,
+        "  metrics_port:             {}",
+        resolved.observability.metrics_port
+    )?;
+    // otlp_endpoint URLs commonly carry bearer tokens or API keys in the
+    // path or query, so redact like rpc_url.
+    if let Some(otlp) = &resolved.observability.otlp_endpoint {
+        writeln!(
+            w,
+            "  otlp_endpoint:            <redacted> ({} chars)",
+            otlp.len()
+        )?;
+    }
+    Ok(())
+}
+
 /// Write a default TOML configuration file.
 pub fn config_init(args: &cli::ConfigInitArgs) -> anyhow::Result<()> {
     let output = args
