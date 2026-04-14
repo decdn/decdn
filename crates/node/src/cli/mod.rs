@@ -7,7 +7,7 @@ pub mod probe;
 pub mod run;
 
 pub use common::{LogFormat, default_config_path, default_data_dir};
-pub use config_cmd::ConfigInitArgs;
+pub use config_cmd::{ConfigArgs, ConfigCommand, ConfigInitArgs, ConfigValidateArgs};
 pub use key_gen::KeyGenArgs;
 pub use probe::ProbeArgs;
 pub use run::RunArgs;
@@ -36,9 +36,8 @@ pub enum Command {
     Run(Box<RunArgs>),
     /// Generate a new Ed25519 node key and Ethereum keystore.
     KeyGen(KeyGenArgs),
-    /// Initialize a default configuration file.
-    #[command(name = "config")]
-    Config(ConfigInitArgs),
+    /// Manage configuration files (`init`, `validate`).
+    Config(ConfigArgs),
     /// Probe a running node over the `cdn/probe/v1` ALPN.
     Probe(ProbeArgs),
 }

@@ -1,8 +1,27 @@
-//! Arguments for the `decdn config init` subcommand.
+//! Arguments for the `decdn config` command group (`init`, `validate`).
 
 use std::path::PathBuf;
 
-use clap::Args;
+use clap::{Args, Subcommand};
+
+use super::run::RunArgs;
+
+/// Manage `decdn` configuration files.
+#[derive(Args, Debug)]
+pub struct ConfigArgs {
+    /// Subcommand to execute.
+    #[command(subcommand)]
+    pub command: ConfigCommand,
+}
+
+/// Subcommands of `decdn config`.
+#[derive(Subcommand, Debug)]
+pub enum ConfigCommand {
+    /// Write a default configuration file.
+    Init(ConfigInitArgs),
+    /// Validate a configuration file without starting the node.
+    Validate(Box<ConfigValidateArgs>),
+}
 
 /// Write a default TOML configuration file.
 #[derive(Args, Debug)]
@@ -14,4 +33,16 @@ pub struct ConfigInitArgs {
     /// Overwrite existing config file if present.
     #[arg(long)]
     pub force: bool,
+}
+
+/// Validate the resolved configuration without binding ports or connecting to
+/// the RPC endpoint.
+///
+/// Flattens the same argument groups as `run` so that `DECDN_*` environment
+/// variables and optional CLI overrides are honored exactly as they would be
+/// during `decdn run`.
+#[derive(Args, Debug)]
+pub struct ConfigValidateArgs {
+    #[command(flatten)]
+    pub run: RunArgs,
 }

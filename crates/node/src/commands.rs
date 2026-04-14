@@ -276,6 +276,61 @@ fn print_probe_response(
     }
 }
 
+/// Validate a configuration without binding ports or connecting to the RPC.
+///
+/// Runs the same [`config::resolve_config`] pipeline as `run` — TOML load,
+/// `${VAR}` + `~` expansion, CLI/env merge, and required-field checks — but
+/// stops before the runtime is constructed. Exits `Ok` on success; the error
+/// returned by `resolve_config` is surfaced verbatim on failure.
+pub fn config_validate(
+    config_path: Option<&std::path::Path>,
+    args: &cli::ConfigValidateArgs,
+) -> anyhow::Result<()> {
+    let resolved = config::resolve_config(config_path, &args.run)?;
+
+    println!("config valid");
+    if let Some(path) = config_path {
+        println!("  source:                  {}", path.display());
+    } else {
+        println!("  source:                  (defaults + env only, no config file)");
+    }
+    println!(
+        "  data_dir:                {}",
+        resolved.identity.data_dir.display()
+    );
+    println!("  bind_port:               {}", resolved.network.bind_port);
+    println!(
+        "  rpc_url:                 <redacted> ({} chars)",
+        resolved.blockchain.rpc_url.len()
+    );
+    println!(
+        "  payment_channel_address: {}",
+        resolved.blockchain.payment_channel_address
+    );
+    println!(
+        "  staking_registry_address: {}",
+        resolved.blockchain.staking_registry_address
+    );
+    println!(
+        "  cache_dir:               {}",
+        resolved.cache.cache_dir.display()
+    );
+    println!(
+        "  cache_size_mb:           {}",
+        resolved.cache.cache_size_mb
+    );
+    println!(
+        "  rate_per_mb:             {}",
+        resolved.payment.rate_per_mb
+    );
+    println!(
+        "  metrics_port:            {}",
+        resolved.observability.metrics_port
+    );
+
+    Ok(())
+}
+
 /// Write a default TOML configuration file.
 pub fn config_init(args: &cli::ConfigInitArgs) -> anyhow::Result<()> {
     let output = args
