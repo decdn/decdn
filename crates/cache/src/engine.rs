@@ -41,8 +41,11 @@ pub struct CacheStats {
 
 impl CacheEngine {
     /// Open or create the store at `cache_dir`. `max_blob_mb` caps the size
-    /// of any single blob pulled from the origin; larger payloads are rejected
-    /// with [`CacheError::BlobTooLarge`].
+    /// of any single blob pulled from the origin. Oversize payloads typically
+    /// surface as [`CacheError::OriginError`] (the HTTP origin trips the cap
+    /// mid-stream before the engine sees the bytes), or as
+    /// [`CacheError::BlobTooLarge`] when a custom `Origin` impl returns bytes
+    /// that exceed the cap without self-enforcement.
     pub async fn open(
         cache_dir: &Path,
         origin: Option<Arc<dyn Origin>>,
@@ -82,8 +85,17 @@ impl CacheEngine {
 
     /// Fetch the blob by hash. Hits the local store on a cache hit; on a miss
     /// pulls from the configured origin, BLAKE3-verifies, and inserts before
-    /// returning. Returns [`CacheError::NoOrigin`] if there is no origin and
-    /// the blob is not cached.
+    /// returning.
+    ///
+    /// Error variants callers commonly handle:
+    /// - [`CacheError::NoOrigin`] — miss with no origin configured.
+    /// - [`CacheError::NotFound`] — origin returned a definitive not-found
+    ///   (e.g. HTTP 404).
+    /// - [`CacheError::HashMismatch`] — origin returned bytes whose BLAKE3
+    ///   hash didn't match the request; bytes are dropped, not cached.
+    /// - [`CacheError::BlobTooLarge`] / [`CacheError::OriginError`] — size
+    ///   cap tripped in the engine or in the origin, respectively.
+    /// - [`CacheError::Store`] — local iroh-blobs store I/O failure.
     pub async fn get(&self, hash: Hash) -> CacheResult<Bytes> {
         if self.has(hash).await? {
             return self.read_local(hash).await;
@@ -105,11 +117,11 @@ impl CacheEngine {
             .map_err(|e| CacheError::Store(anyhow::Error::from(e)))
     }
 
-    /// Coarse stats for gossip / observability. MVP returns zeros — the
-    /// hook exists so call sites don't have to change once real accounting
-    /// lands.
-    #[allow(clippy::unused_self)] // Signature is part of the public seam.
+    /// Coarse stats for gossip / observability. MVP returns zeros; the
+    /// method exists so callers don't have to change once real accounting
+    /// lands (it'll read `self.inner` at that point).
     pub const fn stats(&self) -> CacheStats {
+        let _ = self;
         CacheStats {
             bytes_stored: 0,
             blob_count: 0,
@@ -166,12 +178,23 @@ impl CacheEngine {
         // Hash is verified — now insert. `add_bytes(..).await` runs to
         // completion and yields the tagged info; we discard the tag because
         // a lifecycle policy isn't in scope for the MVP.
-        self.inner
-            .store
-            .blobs()
-            .add_bytes(bytes.clone())
-            .await
-            .map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
+        //
+        // TODO: once iroh-blobs exposes a verified-insert API that accepts
+        // an expected hash, we can drop the explicit `Hash::new(&bytes)`
+        // above and pay BLAKE3 only once instead of twice on the happy path.
+        if let Err(err) = self.inner.store.blobs().add_bytes(bytes.clone()).await {
+            // Verified bytes failed to land in the store: distinct from a
+            // generic store error because the caller just spent origin
+            // egress and a retry will re-pay it. Surface as an error log so
+            // operators can spot this failure mode separately.
+            tracing::error!(
+                %hash,
+                bytes = bytes.len(),
+                %err,
+                "verified blob failed to insert into cache store",
+            );
+            return Err(CacheError::Store(anyhow::Error::from(err)));
+        }
 
         Ok(bytes)
     }

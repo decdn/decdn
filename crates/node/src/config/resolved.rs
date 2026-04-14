@@ -50,7 +50,9 @@ pub struct ResolvedCache {
     /// Maximum single blob size in megabytes.
     pub max_blob_size_mb: u64,
     /// Optional HTTP origin base URL for pull-through on cache misses.
-    pub origin_url: Option<String>,
+    /// Parsed and scheme-validated at resolution time so invalid URLs fail
+    /// config loading rather than engine construction.
+    pub origin_url: Option<decdn_cache::OriginUrl>,
 }
 
 /// Resolved payment fields.

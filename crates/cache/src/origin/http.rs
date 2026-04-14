@@ -4,6 +4,7 @@
 //! per-node config; it is never put on the wire (see ADR 012 — "no external
 //! origin URLs are ever exposed").
 
+use std::cmp::min;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -15,11 +16,40 @@ use reqwest::StatusCode;
 
 use super::{Origin, OriginFetch};
 
-/// How long to wait for the TCP/TLS handshake to complete. Per-chunk read
-/// progress is bounded by the `max_bytes` cap in [`Origin::fetch`]; a total
-/// request timeout is deliberately **not** set because it cannot be sized
-/// correctly for both small blobs and `max_blob_size_mb = 10_240` (10 GB).
+/// How long to wait for the TCP/TLS handshake to complete. Per-request total
+/// duration is intentionally *not* bounded because `max_blob_size_mb` can be
+/// as large as 10 GB and no single timeout fits both small and large blobs.
+///
+/// Known MVP limitation: a stalled mid-stream origin is **not** time-bounded;
+/// only total bytes are capped via [`Origin::fetch`]'s `max_bytes` argument.
+/// A per-chunk idle timeout is a follow-up.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Ceiling on the `BytesMut::with_capacity` hint derived from an
+/// origin-advertised `Content-Length`. A legitimate 10 GB blob should grow
+/// incrementally rather than pre-allocating 10 GB up front for one request.
+const INITIAL_CAPACITY_HINT_CAP: usize = 1 << 20; // 1 MiB
+
+/// Parse and normalize an origin base URL. Scheme must be `http` or `https`;
+/// a trailing slash is appended so `{base}.join(&hex)` produces
+/// `{base}/{hex}` rather than overwriting the final path component. This is
+/// the single source of truth for origin-URL validation — config resolution
+/// and [`HttpOrigin::new`] both route through it.
+pub fn parse_origin_url(raw: &str) -> anyhow::Result<reqwest::Url> {
+    let normalized = if raw.ends_with('/') {
+        raw.to_string()
+    } else {
+        format!("{raw}/")
+    };
+    let url = reqwest::Url::parse(&normalized)
+        .with_context(|| format!("invalid origin base URL: {raw:?}"))?;
+    match url.scheme() {
+        "http" | "https" => Ok(url),
+        other => anyhow::bail!(
+            "unsupported origin URL scheme {other:?} (expected http or https): {raw:?}"
+        ),
+    }
+}
 
 /// Origin backed by a plain HTTP(S) endpoint serving content-addressed blobs
 /// at `{base_url}/{blake3_hex}`.
@@ -30,33 +60,22 @@ pub struct HttpOrigin {
 }
 
 impl HttpOrigin {
-    /// Build an [`HttpOrigin`] pointing at `base_url`. A trailing slash is
-    /// appended if absent so that URL joining produces `{base}/{hex}` rather
-    /// than overwriting the final path component. Only `http` and `https`
-    /// schemes are accepted — `Url::parse` alone would silently accept
-    /// `file://`, `ftp://`, etc.
-    pub fn new(base_url: &str) -> anyhow::Result<Self> {
-        let normalized = if base_url.ends_with('/') {
-            base_url.to_string()
-        } else {
-            format!("{base_url}/")
-        };
-        let url = reqwest::Url::parse(&normalized)
-            .with_context(|| format!("invalid origin base URL: {base_url:?}"))?;
-        match url.scheme() {
-            "http" | "https" => {}
-            other => anyhow::bail!(
-                "unsupported origin URL scheme {other:?} (expected http or https): {base_url:?}"
-            ),
-        }
+    /// Build an [`HttpOrigin`] around an already-parsed URL. Callers coming
+    /// from config should use [`parse_origin_url`] once at resolution time and
+    /// pass the result here; see [`Self::parse`] for the convenience form.
+    pub fn new(base_url: reqwest::Url) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .context("failed to build reqwest client")?;
-        Ok(Self {
-            client,
-            base_url: url,
-        })
+        Ok(Self { client, base_url })
+    }
+
+    /// Convenience constructor that parses `raw` via [`parse_origin_url`]
+    /// before delegating to [`Self::new`]. Prefer [`Self::new`] in
+    /// production paths so URL validation happens at config-load time.
+    pub fn parse(raw: &str) -> anyhow::Result<Self> {
+        Self::new(parse_origin_url(raw)?)
     }
 }
 
@@ -100,9 +119,11 @@ impl Origin for HttpOrigin {
             // running total would exceed `max_bytes`. This bounds the
             // memory an untrusted origin can force us to allocate even
             // when it omits or misreports `Content-Length`.
-            let mut buf = BytesMut::with_capacity(
-                usize::try_from(resp.content_length().unwrap_or(0)).unwrap_or(0),
-            );
+            let hint = resp
+                .content_length()
+                .and_then(|l| usize::try_from(l).ok())
+                .map_or(0, |l| min(l, INITIAL_CAPACITY_HINT_CAP));
+            let mut buf = BytesMut::with_capacity(hint);
             while let Some(chunk) = resp
                 .chunk()
                 .await
@@ -116,5 +137,69 @@ impl Origin for HttpOrigin {
             }
             Ok(OriginFetch::Found(buf.freeze()))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_origin_url_appends_trailing_slash() -> anyhow::Result<()> {
+        let url = parse_origin_url("https://origin.example/v1")?;
+        anyhow::ensure!(url.as_str() == "https://origin.example/v1/", "got: {url}");
+        // The full path segment must survive `join`.
+        let joined = url.join("abcdef")?;
+        anyhow::ensure!(
+            joined.as_str() == "https://origin.example/v1/abcdef",
+            "join produced: {joined}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_origin_url_preserves_existing_trailing_slash() -> anyhow::Result<()> {
+        let url = parse_origin_url("https://origin.example/")?;
+        anyhow::ensure!(url.as_str() == "https://origin.example/", "got: {url}");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_origin_url_accepts_http_and_https() -> anyhow::Result<()> {
+        parse_origin_url("http://origin.example")?;
+        parse_origin_url("https://origin.example")?;
+        Ok(())
+    }
+
+    #[test]
+    fn parse_origin_url_rejects_non_http_schemes() -> anyhow::Result<()> {
+        for raw in [
+            "file:///etc/passwd",
+            "ftp://origin.example",
+            "ws://origin.example",
+        ] {
+            let err = parse_origin_url(raw)
+                .err()
+                .ok_or_else(|| anyhow::anyhow!("{raw} should have been rejected"))?
+                .to_string();
+            anyhow::ensure!(
+                err.contains("unsupported origin URL scheme"),
+                "error for {raw} lacked scheme context: {err}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn parse_origin_url_rejects_unparseable_input() -> anyhow::Result<()> {
+        let err = parse_origin_url("not a url")
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("bare text should have been rejected"))?
+            .to_string();
+        anyhow::ensure!(
+            err.contains("invalid origin base URL"),
+            "error lacked context: {err}"
+        );
+        Ok(())
     }
 }

@@ -1,9 +1,11 @@
 //! Integration tests for [`decdn_cache::CacheEngine`] end-to-end with a
 //! mocked HTTP origin.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
-use decdn_cache::{CacheEngine, CacheError, Hash, HttpOrigin};
+use decdn_cache::{CacheEngine, CacheError, Hash, HttpOrigin, Origin, OriginFetch};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -22,7 +24,7 @@ async fn serve_blob(payload: &'static [u8]) -> (MockServer, Hash) {
 
 async fn build_engine(origin_url: &str) -> anyhow::Result<(CacheEngine, tempfile::TempDir)> {
     let tmp = tempfile::tempdir()?;
-    let origin = Arc::new(HttpOrigin::new(origin_url)?);
+    let origin = Arc::new(HttpOrigin::parse(origin_url)?);
     let engine = CacheEngine::open(tmp.path(), Some(origin), 16).await?;
     Ok((engine, tmp))
 }
@@ -93,8 +95,10 @@ async fn origin_not_found_surfaces_not_found() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn blob_too_large_is_rejected() -> anyhow::Result<()> {
-    // Payload of 2 MB, cap at 1 MB.
+async fn blob_too_large_is_rejected_via_http_origin() -> anyhow::Result<()> {
+    // Payload of 2 MB, cap at 1 MB. Wiremock sets an honest `Content-Length`,
+    // so this trips the HTTP origin's fast-path rejection before any bytes
+    // are buffered — which surfaces as `OriginError`.
     let payload = vec![0xABu8; 2 * 1024 * 1024];
     let hash = Hash::new(&payload);
 
@@ -106,19 +110,86 @@ async fn blob_too_large_is_rejected() -> anyhow::Result<()> {
         .await;
 
     let tmp = tempfile::tempdir()?;
-    let origin = Arc::new(HttpOrigin::new(&server.uri())?);
+    let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
     let engine = CacheEngine::open(tmp.path(), Some(origin), 1).await?;
 
     let err = err_of(engine.get(hash).await)?;
-    // The HTTP origin trips the content-length check before bytes are read,
-    // which surfaces as OriginError. Either OriginError or BlobTooLarge is
-    // acceptable — both represent "refused to cache".
     anyhow::ensure!(
-        matches!(
-            err,
-            CacheError::OriginError { .. } | CacheError::BlobTooLarge { .. }
-        ),
-        "expected size rejection, got: {err:?}"
+        matches!(err, CacheError::OriginError { .. }),
+        "expected OriginError (fast-path content-length rejection), got: {err:?}"
+    );
+    Ok(())
+}
+
+/// Origin that returns bytes exceeding `max_bytes` regardless of its
+/// argument — a stand-in for a misbehaving backend that bypasses the HTTP
+/// origin's streaming cap (e.g. a future S3 / filesystem impl that forgets
+/// to honor the size argument).
+#[derive(Debug)]
+struct OversizedOrigin {
+    payload: bytes::Bytes,
+}
+
+impl Origin for OversizedOrigin {
+    fn fetch(
+        &self,
+        _hash: Hash,
+        _max_bytes: u64,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<OriginFetch>> + Send + '_>> {
+        let payload = self.payload.clone();
+        Box::pin(async move { Ok(OriginFetch::Found(payload)) })
+    }
+}
+
+#[tokio::test]
+async fn engine_rejects_oversize_bytes_from_misbehaving_origin() -> anyhow::Result<()> {
+    // Origin ignores the max_bytes advisory and returns 2 MiB. Cap at 1 MiB.
+    // This proves the engine's post-receive size check is load-bearing
+    // defense in depth — a regression dropping that check would caught by
+    // this test even if the HTTP origin's streaming cap is fine.
+    let payload = bytes::Bytes::from(vec![0xCDu8; 2 * 1024 * 1024]);
+    let hash = Hash::new(&payload);
+    let origin = Arc::new(OversizedOrigin { payload });
+
+    let tmp = tempfile::tempdir()?;
+    let engine = CacheEngine::open(tmp.path(), Some(origin), 1).await?;
+
+    let err = err_of(engine.get(hash).await)?;
+    anyhow::ensure!(
+        matches!(err, CacheError::BlobTooLarge { .. }),
+        "expected BlobTooLarge from engine-level check, got: {err:?}"
+    );
+    anyhow::ensure!(
+        !engine.has(hash).await?,
+        "oversize bytes must not be cached"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn shutdown_and_reopen_preserves_cached_blob() -> anyhow::Result<()> {
+    let payload: &[u8] = b"persisted across shutdown";
+    let (server, hash) = serve_blob(payload).await;
+
+    let tmp = tempfile::tempdir()?;
+    {
+        let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
+        let engine = CacheEngine::open(tmp.path(), Some(origin), 16).await?;
+        let _ = engine.get(hash).await?;
+        engine.shutdown().await?;
+    }
+    // Kill the origin so the reopened engine *must* serve from local state.
+    drop(server);
+
+    let engine = CacheEngine::open(tmp.path(), None, 16).await?;
+    anyhow::ensure!(
+        engine.has(hash).await?,
+        "reopened engine should see the blob flushed by shutdown()"
+    );
+    let got = engine.get(hash).await?;
+    anyhow::ensure!(
+        &got[..] == payload,
+        "reopened engine should serve the cached payload without an origin"
     );
     Ok(())
 }

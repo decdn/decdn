@@ -101,9 +101,13 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
     // Flush the cache store before the drain deadline so in-flight writes
     // hit disk. Intentionally *not* gated by `SHUTDOWN_DEADLINE`: a slow
     // flush is preferable to a lost write, and the watchdog at the outer
-    // process level catches a truly stuck shutdown.
-    if let Err(err) = cache.shutdown().await {
-        tracing::warn!(%err, "cache shutdown failed");
+    // process level catches a truly stuck shutdown. On failure we still
+    // finish the task drain cleanly (so metrics/dispatch don't leak) and
+    // then bubble the error out of `run()` — supervisors need a non-zero
+    // exit to know the store may be inconsistent.
+    let cache_shutdown_err = cache.shutdown().await.err();
+    if let Some(err) = cache_shutdown_err.as_ref() {
+        tracing::error!(%err, "cache shutdown failed; store state may be inconsistent");
     }
 
     let drain = async {
@@ -125,7 +129,10 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
     }
 
     tracing::info!("node stopped");
-    Ok(())
+    match cache_shutdown_err {
+        None => Ok(()),
+        Some(err) => Err(anyhow::Error::from(err).context("cache shutdown failed during drain")),
+    }
 }
 
 /// Log a `JoinError` from a shutdown-drained task with a phase label so a
@@ -148,10 +155,10 @@ async fn build_cache(cfg: &ResolvedConfig) -> anyhow::Result<CacheEngine> {
     let origin: Option<Arc<dyn Origin>> = cfg
         .cache
         .origin_url
-        .as_deref()
+        .clone()
         .map(|url| -> anyhow::Result<Arc<dyn Origin>> {
             Ok(Arc::new(
-                HttpOrigin::new(url).context("invalid cache.origin_url")?,
+                HttpOrigin::new(url).context("failed to build HTTP origin client")?,
             ))
         })
         .transpose()?;
