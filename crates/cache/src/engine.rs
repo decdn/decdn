@@ -92,9 +92,10 @@ impl CacheEngine {
     }
 
     /// Flush ephemeral state to disk. The iroh-blobs store does its own
-    /// cleanup on drop, but only [`FsStore::shutdown`] guarantees that
-    /// in-flight writes survive a crash of the surrounding process, so the
-    /// runtime calls this explicitly during graceful shutdown.
+    /// cleanup on drop, but only an explicit
+    /// [`iroh_blobs::store::fs::FsStore`] shutdown guarantees that in-flight
+    /// writes survive a crash of the surrounding process, so the runtime
+    /// calls this during graceful shutdown.
     pub async fn shutdown(&self) -> CacheResult<()> {
         tracing::debug!("flushing cache engine store");
         self.inner
