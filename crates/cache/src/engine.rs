@@ -91,11 +91,12 @@ impl CacheEngine {
         self.pull_through(hash).await
     }
 
-    /// Drop all ephemeral state and flush the store.
-    ///
-    /// Safe to call on shutdown; the store's `FsStore::Drop` runs its own
-    /// cleanup but a log line here makes delayed writes visible.
+    /// Flush ephemeral state to disk. The iroh-blobs store does its own
+    /// cleanup on drop, but only [`FsStore::shutdown`] guarantees that
+    /// in-flight writes survive a crash of the surrounding process, so the
+    /// runtime calls this explicitly during graceful shutdown.
     pub async fn shutdown(&self) -> CacheResult<()> {
+        tracing::debug!("flushing cache engine store");
         self.inner
             .store
             .shutdown()

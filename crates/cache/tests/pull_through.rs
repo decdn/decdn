@@ -96,13 +96,12 @@ async fn origin_not_found_surfaces_not_found() -> anyhow::Result<()> {
 async fn blob_too_large_is_rejected() -> anyhow::Result<()> {
     // Payload of 2 MB, cap at 1 MB.
     let payload = vec![0xABu8; 2 * 1024 * 1024];
-    let payload_static: &'static [u8] = Box::leak(payload.into_boxed_slice());
-    let hash = Hash::new(payload_static);
+    let hash = Hash::new(&payload);
 
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload_static))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload))
         .mount(&server)
         .await;
 

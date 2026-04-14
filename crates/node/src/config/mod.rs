@@ -336,6 +336,7 @@ fn expand_env(cfg: &mut FileConfig) -> anyhow::Result<()> {
     }
     if let Some(c) = cfg.cache.as_mut() {
         expand_path(&mut c.cache_dir, "cache.cache_dir")?;
+        expand_str(&mut c.origin_url, "cache.origin_url")?;
     }
     if let Some(o) = cfg.observability.as_mut() {
         expand_str(&mut o.otlp_endpoint, "observability.otlp_endpoint")?;

@@ -9,27 +9,6 @@ use std::time::Duration;
 use anyhow::Context;
 use decdn_cache::{CacheEngine, HttpOrigin, Origin};
 use tokio::sync::oneshot;
-
-#[allow(dead_code)] // Consumed by the next PR's `cdn/client/v1` handler.
-async fn build_cache(cfg: &ResolvedConfig) -> anyhow::Result<CacheEngine> {
-    let origin: Option<std::sync::Arc<dyn Origin>> = cfg
-        .cache
-        .origin_url
-        .as_deref()
-        .map(|url| -> anyhow::Result<std::sync::Arc<dyn Origin>> {
-            Ok(std::sync::Arc::new(
-                HttpOrigin::new(url).context("invalid cache.origin_url")?,
-            ))
-        })
-        .transpose()?;
-    CacheEngine::open(&cfg.cache.cache_dir, origin, cfg.cache.max_blob_size_mb)
-        .await
-        .context("failed to open cache engine")
-}
-
-const fn cache_has_origin(cfg: &ResolvedConfig) -> bool {
-    cfg.cache.origin_url.is_some()
-}
 use tokio::task::JoinSet;
 
 use crate::config::ResolvedConfig;
@@ -55,13 +34,9 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
     let cache = build_cache(&cfg).await?;
     tracing::info!(
         cache_dir = %cfg.cache.cache_dir.display(),
-        has_origin = cache_has_origin(&cfg),
+        has_origin = cfg.cache.origin_url.is_some(),
         "cache engine ready",
     );
-    // `cache` is not yet consumed by any handler; the binding keeps the
-    // engine alive alongside the runtime so `cdn/client/v1` (next PR) can
-    // pick it up without changing this wiring.
-    let _cache = cache;
 
     let handlers: Vec<Arc<dyn Handler>> = vec![Arc::new(ProbeHandler::new(
         secret_key.public(),
@@ -123,6 +98,14 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
     ep.close().await;
     let _ = metrics_stop_tx.send(());
 
+    // Flush the cache store before the drain deadline so in-flight writes
+    // hit disk. Intentionally *not* gated by `SHUTDOWN_DEADLINE`: a slow
+    // flush is preferable to a lost write, and the watchdog at the outer
+    // process level catches a truly stuck shutdown.
+    if let Err(err) = cache.shutdown().await {
+        tracing::warn!(%err, "cache shutdown failed");
+    }
+
     let drain = async {
         while let Some(result) = tasks.join_next().await {
             log_join_result(result, "shutdown");
@@ -156,6 +139,25 @@ fn log_join_result(result: Result<(), tokio::task::JoinError>, phase: &'static s
             tracing::warn!(phase, %err, "task failed during shutdown");
         }
     }
+}
+
+/// Construct the cache engine from resolved config. The `HttpOrigin` is
+/// only built when `origin_url` is set; otherwise the engine serves only
+/// already-cached content and cache misses surface as `CacheError::NoOrigin`.
+async fn build_cache(cfg: &ResolvedConfig) -> anyhow::Result<CacheEngine> {
+    let origin: Option<Arc<dyn Origin>> = cfg
+        .cache
+        .origin_url
+        .as_deref()
+        .map(|url| -> anyhow::Result<Arc<dyn Origin>> {
+            Ok(Arc::new(
+                HttpOrigin::new(url).context("invalid cache.origin_url")?,
+            ))
+        })
+        .transpose()?;
+    CacheEngine::open(&cfg.cache.cache_dir, origin, cfg.cache.max_blob_size_mb)
+        .await
+        .context("failed to open cache engine")
 }
 
 /// Wait for either SIGINT or (on Unix) SIGTERM.
