@@ -339,6 +339,7 @@ Every deCDN contract should inherit from audited OpenZeppelin base contracts rat
 | `Pausable` | All fund-holding contracts | Emergency pause capability |
 | `SafeERC20` | All contracts interacting with ERC-20 tokens | Safe wrappers for `transfer`, `transferFrom`, `approve` |
 | `EIP712` | StablePaymentChannel, PaymentChannel, SlashJudge, WatchtowerEscrow | Domain separator for voucher/slash/heartbeat signature verification |
+| `SignatureChecker` | StablePaymentChannel, PaymentChannel, StakingRegistry, SlashJudge | Unified EOA + ERC-1271 smart account signature verification ([ADR 024](024-account-abstraction.md)) |
 | `ERC20` + `ERC20Permit` | TOKEN | Standard fungible token with gasless approvals |
 | `Governor` | Production governance | Token-weighted voting |
 | `GovernorVotes` | Production governance | TOKEN as voting token |

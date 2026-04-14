@@ -79,9 +79,9 @@ EIP712Domain({
 #### On-Chain Verification Flow
 
 1. Challenger submits the serialized message fields and `slash_sig` to `SlashJudge`.
-2. The contract reconstructs the EIP-712 typed data hash and calls `ecrecover(hash, slash_sig)` — **3,000 gas**.
-3. The recovered address is looked up in `StakingRegistry` to confirm it maps to a registered node.
-4. For offenses requiring two messages (phantom, rate manipulation), both must recover to the **same** address.
+2. The contract reconstructs the EIP-712 typed data hash and calls `SignatureChecker.isValidSignatureNow(challengedNode, hash, slash_sig)` — **~3,000 gas** for EOA nodes, **~15,000 gas** for Safe-based nodes ([ADR 024](024-account-abstraction.md)).
+3. The challenger-provided address is looked up in `StakingRegistry` to confirm it maps to a registered node.
+4. For offenses requiring two messages (phantom, rate manipulation), the signatures must both validate against the **same** node address.
 
 #### Node Implementation
 
@@ -129,7 +129,7 @@ The challenger calls `SlashJudge.submitCorruptionChallenge()` with:
 
 The contract verifies:
 
-1. `ecrecover(streamResponse, slashSig)` recovers a registered node address
+1. `SignatureChecker.isValidSignatureNow(challengedNode, streamDigest, slashSig)` verifies the signature against the provided node address, which must be registered
 2. The `StreamResponse` has `ok: true` and its `hash` field matches `blobHash`
 3. The challenge bond is transferred and held
 
@@ -185,21 +185,23 @@ A unified contract that adjudicates all four slashable offense types. The contra
 
 #### Interface
 
-**Encoding convention.** The `bytes calldata` arguments named `*ResponseData` in the interface below are **ABI-encoded structs** matching the EIP-712 typed data fields (not postcard wire bytes). The contract ABI-decodes these fields, reconstructs the EIP-712 struct hash, and calls `ecrecover`. This ensures a single canonical encoding for both the contract and off-chain signature construction.
+**Encoding convention.** The `bytes calldata` arguments named `*ResponseData` in the interface below are **ABI-encoded structs** matching the EIP-712 typed data fields (not postcard wire bytes). The contract ABI-decodes these fields, reconstructs the EIP-712 struct hash, and verifies using `SignatureChecker.isValidSignatureNow` ([ADR 024](024-account-abstraction.md)). This ensures a single canonical encoding for both the contract and off-chain signature construction.
 
 ```solidity
 interface ISlashJudge {
     /// Phantom announcement: node signed has_blob=true then ok=false within 30s
     function submitPhantomChallenge(
+        address challengedNode,              // Ethereum address or Safe address of the challenged node
         bytes32 nodeId,
         bytes calldata probeResponseData,   // serialized {hash, has_blob, rate_per_mb, timestamp_us}
-        bytes calldata probeSlashSig,        // EIP-712 secp256k1 signature
+        bytes calldata probeSlashSig,        // EIP-712 signature (EOA or ERC-1271)
         bytes calldata streamResponseData,  // serialized {hash, ok, rate_per_mb, total_bytes, channel_id, timestamp_us, redirect}
-        bytes calldata streamSlashSig        // EIP-712 secp256k1 signature
+        bytes calldata streamSlashSig        // EIP-712 signature (EOA or ERC-1271)
     ) external;
 
     /// Rate manipulation: stream rate > probe rate within 30s window (deferred — 24h counter-evidence)
     function submitRateChallenge(
+        address challengedNode,
         bytes32 nodeId,
         bytes calldata probeResponseData,
         bytes calldata probeSlashSig,
@@ -209,6 +211,7 @@ interface ISlashJudge {
 
     /// Blacklist violation: serving a blacklisted hash after compliance window
     function submitBlacklistChallenge(
+        address challengedNode,
         bytes32 nodeId,
         bytes32 blobHash,
         bytes calldata responseData,   // ProbeResponse (has_blob=true) or StreamResponse (ok=true)
@@ -218,6 +221,7 @@ interface ISlashJudge {
 
     /// Corrupted delivery: node served bytes failing BLAKE3 verification
     function submitCorruptionChallenge(
+        address challengedNode,
         bytes32 nodeId,
         bytes32 blobHash,
         bytes calldata streamResponseData,
@@ -238,21 +242,21 @@ interface ISlashJudge {
 
 **Phantom announcement:**
 
-1. `ecrecover(probeResponseData, probeSlashSig)` → address A
-2. `ecrecover(streamResponseData, streamSlashSig)` → address B
-3. Verify A == B (same node)
+1. Challenger provides `challengedNode` address (the node's Ethereum address or Safe address)
+2. `SignatureChecker.isValidSignatureNow(challengedNode, probeDigest, probeSlashSig)` — must pass
+3. `SignatureChecker.isValidSignatureNow(challengedNode, streamDigest, streamSlashSig)` — must pass
 4. Verify `probeResponse.has_blob == true` and `streamResponse.ok == false`
 5. Verify `probeResponse.hash == streamResponse.hash` (same blob)
 6. Verify `streamResponse.timestamp_us >= probeResponse.timestamp_us`
 7. Verify `streamResponse.timestamp_us - probeResponse.timestamp_us < 30_000_000` (30-second window)
-8. Look up address A in `StakingRegistry` — must be a registered node
+8. Look up `challengedNode` in `StakingRegistry` — must be a registered node
 
 **Evidence staleness.** All challenge types MUST validate evidence age using a skew-safe comparison. Let `nowUs = block.timestamp * 1_000_000` and `evidence.timestamp_us` be the earliest `timestamp_us` from the submitted evidence messages (e.g., `probeResponse.timestamp_us` for phantom/rate challenges, `streamResponse.timestamp_us` for corruption/blacklist challenges that lack a probe). The contract MUST first require `evidence.timestamp_us <= nowUs + MAX_FUTURE_SKEW_US` (rejects far-future timestamps), then compute age without underflow: `ageUs = evidence.timestamp_us >= nowUs ? 0 : nowUs - evidence.timestamp_us`, and finally require `ageUs < MAX_EVIDENCE_AGE_US`. `MAX_EVIDENCE_AGE_US` is a governable parameter on `SlashJudge` (PoC: 5 days = 432,000,000,000 μs; safety bounds: [1 day, 30 days]). `MAX_FUTURE_SKEW_US` is fixed at 60,000,000 μs (60 seconds).
 
 **Interaction with unbonding period.** `MAX_EVIDENCE_AGE_US` MUST be strictly less than the `StakingRegistry.unbondingPeriod` (converted to microseconds). If evidence can be older than the unbonding period, a node could commit an offense, immediately initiate unstaking, and complete withdrawal before the evidence is submitted — avoiding the slash entirely. With PoC defaults (evidence age: 5 days, unbonding: 7 days), this invariant is satisfied with a 2-day margin. The safety bounds ([1 day, 30 days] for evidence age vs [3 days, 30 days] for unbonding per [ADR 009](009-governance.md)) permit governance to violate this invariant — implementations SHOULD enforce `MAX_EVIDENCE_AGE_US < unbondingPeriod` whenever `MAX_EVIDENCE_AGE_US` is configured or updated, including at initialization and in any governance-controlled reconfiguration path.
 
 **Rate manipulation:**
-1–3. Same address recovery and identity check as phantom
+1–3. Same `SignatureChecker` verification and identity check as phantom
 4. Verify `streamResponse.rate_per_mb > probeResponse.rate_per_mb`
 5. Verify `probeResponse.hash == streamResponse.hash` (same blob)
 6–8. Same timestamp and registration checks as phantom
@@ -262,8 +266,8 @@ interface ISlashJudge {
 
 The challenged node may call `counterChallenge(challengeId, evidence)` within 24 hours, where `evidence` is the ABI-encoded `RateChange` fields plus `slash_sig`. The contract verifies:
 
-1. `ecrecover(rateChangeData, rateChangeSlashSig)` recovers the same address as the challenged node
-2. `rateChange.nodeId` matches the challenged node's registered `NodeId` in `StakingRegistry` — defense-in-depth alongside `ecrecover`, since `nodeId` (iroh Ed25519) and Ethereum address are different identity layers
+1. `SignatureChecker.isValidSignatureNow(challengedNode, rateChangeDigest, rateChangeSlashSig)` — must pass
+2. `rateChange.nodeId` matches the challenged node's registered `NodeId` in `StakingRegistry` — defense-in-depth alongside signature verification, since `nodeId` (iroh Ed25519) and Ethereum address are different identity layers
 3. `rateChange.old_rate_per_mb == probeResponse.rate_per_mb` — the prior rate matches what the node advertised in the probe, proving this specific rate transition is legitimate
 4. `rateChange.effective_at_us >= probeResponse.timestamp_us` — the rate change happened after the probe
 5. `rateChange.effective_at_us <= streamResponse.timestamp_us` — the rate change was effective before or at the stream response
@@ -275,20 +279,22 @@ See [ADR 005, Gossip — rate change announcements](005-protocol.md#gossip--rate
 
 **Blacklist violation:**
 
-1. `ecrecover(responseData, slashSig)` → address
-2. Look up address in `StakingRegistry` — must be a registered node
-3. Decode `hash` from the response; verify it matches `blobHash`
-4. If `ProbeResponse`: verify `has_blob == true`. If `StreamResponse`: verify `ok == true`
-5. Query `ContentBlacklist.getEntry(blobHash)` — must exist and `effectiveAt` must be before the response's `timestamp_us`
-6. **Regional scope limitation (PoC):** [ADR 011](011-content-takedown.md#slashing) specifies that a node is only slashable for hashes blacklisted in its declared region. However, the node's region is self-reported and not stored on-chain in `StakingRegistry` for the PoC. The `SlashJudge` contract therefore cannot enforce regional scope in the PoC — all blacklist violations are treated as globally scoped. Production should add a `region` field to `NodeInfo` to enable on-chain regional filtering
+1. Challenger provides `challengedNode` address
+2. `SignatureChecker.isValidSignatureNow(challengedNode, responseDigest, slashSig)` — must pass
+3. Look up `challengedNode` in `StakingRegistry` — must be a registered node
+4. Decode `hash` from the response; verify it matches `blobHash`
+5. If `ProbeResponse`: verify `has_blob == true`. If `StreamResponse`: verify `ok == true`
+6. Query `ContentBlacklist.getEntry(blobHash)` — must exist and `effectiveAt` must be before the response's `timestamp_us`
+7. **Regional scope limitation (PoC):** [ADR 011](011-content-takedown.md#slashing) specifies that a node is only slashable for hashes blacklisted in its declared region. However, the node's region is self-reported and not stored on-chain in `StakingRegistry` for the PoC. The `SlashJudge` contract therefore cannot enforce regional scope in the PoC — all blacklist violations are treated as globally scoped. Production should add a `region` field to `NodeInfo` to enable on-chain regional filtering
 
 **Corrupted delivery (PoC):**
 
-1. `ecrecover(streamResponseData, streamSlashSig)` → address
-2. Look up address in `StakingRegistry` — must be a registered node
-3. Verify `streamResponse.ok == true` and `streamResponse.hash == blobHash`
-4. Store challenge; start 24-hour counter-evidence window
-5. Resolution after window: slash if no valid counter-evidence; dismiss if countered
+1. Challenger provides `challengedNode` address
+2. `SignatureChecker.isValidSignatureNow(challengedNode, streamDigest, streamSlashSig)` — must pass
+3. Look up `challengedNode` in `StakingRegistry` — must be a registered node
+4. Verify `streamResponse.ok == true` and `streamResponse.hash == blobHash`
+5. Store challenge; start 24-hour counter-evidence window
+6. Resolution after window: slash if no valid counter-evidence; dismiss if countered
 
 #### Bond Handling
 
@@ -302,11 +308,11 @@ See [ADR 005, Gossip — rate change announcements](005-protocol.md#gossip--rate
 
 | Operation | Estimated Gas | Notes |
 | --- | --- | --- |
-| `submitPhantomChallenge` | ~60k | 2× `ecrecover` (6k) + calldata + storage + bond transfer |
-| `submitRateChallenge` | ~60k | 2× `ecrecover` (6k) + calldata + storage for pending challenge + bond transfer |
-| `submitBlacklistChallenge` | ~50k | 1× `ecrecover` (3k) + `ContentBlacklist` lookup + bond transfer |
-| `submitCorruptionChallenge` | ~50k | 1× `ecrecover` (3k) + storage for challenge state + bond transfer |
-| `counterChallenge` (rate) | ~40k | 1× `ecrecover` (3k) + timestamp range check + rate match + storage update |
+| `submitPhantomChallenge` | ~60k–85k | 2× `SignatureChecker` (6k EOA / ~30k Safe) + calldata + storage + bond transfer |
+| `submitRateChallenge` | ~60k–85k | 2× `SignatureChecker` (6k EOA / ~30k Safe) + calldata + storage for pending challenge + bond transfer |
+| `submitBlacklistChallenge` | ~50k–65k | 1× `SignatureChecker` (3k EOA / ~15k Safe) + `ContentBlacklist` lookup + bond transfer |
+| `submitCorruptionChallenge` | ~50k–65k | 1× `SignatureChecker` (3k EOA / ~15k Safe) + storage for challenge state + bond transfer |
+| `counterChallenge` (rate) | ~40k–55k | 1× `SignatureChecker` (3k EOA / ~15k Safe) + timestamp range check + rate match + storage update |
 | `counterChallenge` (corruption) | ~40k | Evidence verification + storage update |
 | `resolveChallenge` | ~80k | `StakingRegistry.slash()` + bond transfer + state cleanup |
 
