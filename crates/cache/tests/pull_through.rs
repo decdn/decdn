@@ -4,6 +4,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use decdn_cache::{
     CacheEngine, CacheError, FilesystemOrigin, Hash, HttpOrigin, Origin, OriginFetch,
@@ -256,6 +257,126 @@ async fn spawn_chunked_oversize_server(
         let _ = sock.write_all(b"0\r\n\r\n").await;
     });
     Ok(addr)
+}
+
+/// Bind an ephemeral TCP port, accept one connection, then hold the socket
+/// open without ever writing response bytes. Exercises the response-headers
+/// timeout: the TCP handshake completes (so `connect_timeout` doesn't fire)
+/// but the server never writes a status line.
+async fn spawn_silent_server() -> anyhow::Result<std::net::SocketAddr> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        if let Ok((sock, _)) = listener.accept().await {
+            let _sock = sock;
+            std::future::pending::<()>().await;
+        }
+    });
+    Ok(addr)
+}
+
+/// Bind an ephemeral TCP port, serve headers + a single short chunk, then
+/// hang. Exercises the per-chunk idle timeout: the first chunk arrives
+/// quickly, subsequent `.chunk()` calls block forever.
+async fn spawn_stall_after_partial_body_server() -> anyhow::Result<std::net::SocketAddr> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        let Ok((mut sock, _)) = listener.accept().await else {
+            return;
+        };
+        let mut buf = [0u8; 4096];
+        loop {
+            match sock.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    let seen = buf.get(..n).unwrap_or(&[]);
+                    if seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+            }
+        }
+        let resp = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nABCD\r\n";
+        let _ = sock.write_all(resp).await;
+        // Hang — subsequent chunk reads must hit the idle timeout.
+        let _sock = sock;
+        std::future::pending::<()>().await;
+    });
+    Ok(addr)
+}
+
+#[tokio::test]
+async fn response_headers_timeout_fires_on_silent_server() -> anyhow::Result<()> {
+    let addr = spawn_silent_server().await?;
+    let origin = HttpOrigin::parse(&format!("http://{addr}/"))?
+        .with_timeouts(Duration::from_millis(200), Duration::from_secs(30));
+
+    let tmp = tempfile::tempdir()?;
+    let engine = CacheEngine::open(tmp.path(), Some(Arc::new(origin)), 16).await?;
+
+    let err = err_of(engine.get(Hash::new(b"anything")).await)?;
+    let msg = format!("{err:#}");
+    anyhow::ensure!(
+        matches!(err, CacheError::OriginError { .. }),
+        "expected OriginError from headers timeout, got: {err:?}"
+    );
+    anyhow::ensure!(
+        msg.contains("headers timed out"),
+        "error message missing headers-timeout marker: {msg}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn chunk_idle_timeout_fires_when_origin_stalls_mid_body() -> anyhow::Result<()> {
+    let addr = spawn_stall_after_partial_body_server().await?;
+    let origin = HttpOrigin::parse(&format!("http://{addr}/"))?
+        .with_timeouts(Duration::from_secs(30), Duration::from_millis(200));
+
+    let tmp = tempfile::tempdir()?;
+    let engine = CacheEngine::open(tmp.path(), Some(Arc::new(origin)), 16).await?;
+
+    let err = err_of(engine.get(Hash::new(b"anything")).await)?;
+    let msg = format!("{err:#}");
+    anyhow::ensure!(
+        matches!(err, CacheError::OriginError { .. }),
+        "expected OriginError from idle timeout, got: {err:?}"
+    );
+    anyhow::ensure!(
+        msg.contains("body read stalled"),
+        "error message missing stalled marker: {msg}"
+    );
+    // Sanity: 4 bytes of "ABCD" should be reported as buffered.
+    anyhow::ensure!(
+        msg.contains("4 bytes buffered"),
+        "error message missing progress info: {msg}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn pull_through_succeeds_above_blocking_hash_threshold() -> anyhow::Result<()> {
+    // 2 MiB payload crosses the 1 MiB `BLOCKING_HASH_THRESHOLD`, exercising
+    // the `spawn_blocking` branch of hash verification. A regression
+    // (missing `.await`, wrong comparator, panic in the blocking task) is
+    // caught here — prior tests above the threshold all abort earlier on
+    // size / hash mismatch.
+    let payload = vec![0x7Fu8; 2 * 1024 * 1024];
+    let hash = Hash::new(&payload);
+
+    let origin_dir = tempfile::tempdir()?;
+    seed_fs_blob(origin_dir.path(), hash, &payload)?;
+
+    let cache_dir = tempfile::tempdir()?;
+    let origin = Arc::new(FilesystemOrigin::new(origin_dir.path())?);
+    let engine = CacheEngine::open(cache_dir.path(), Some(origin), 16).await?;
+
+    let got = engine.get(hash).await?;
+    anyhow::ensure!(got.len() == payload.len(), "size mismatch: {}", got.len());
+    anyhow::ensure!(got[..] == payload[..], "content mismatch");
+    anyhow::ensure!(engine.has(hash).await?, "blob should be cached");
+    Ok(())
 }
 
 #[tokio::test]

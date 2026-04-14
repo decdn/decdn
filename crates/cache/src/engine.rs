@@ -145,7 +145,7 @@ impl CacheEngine {
     /// blobs don't need the `spawn_blocking` round-trip (≤ 1 MiB hashes in
     /// sub-millisecond on a modern core), so `pull_through` uses the inline
     /// path when cheap and `spawn_blocking` above this threshold.
-    const BLOCKING_HASH_THRESHOLD: usize = 1 << 20;
+    const BLOCKING_HASH_THRESHOLD: usize = 1 << 20; // 1 MiB
 
     async fn pull_through(&self, hash: Hash) -> CacheResult<Bytes> {
         let origin = self
@@ -184,7 +184,16 @@ impl CacheEngine {
             tokio::task::spawn_blocking(move || Hash::new(&bytes_for_hash))
                 .await
                 .map_err(|e| {
-                    CacheError::Store(anyhow::Error::from(e).context("hash task panicked"))
+                    // JoinError fires on panic or cancellation — don't
+                    // lie about which one happened.
+                    let note = if e.is_panic() {
+                        "blake3 hash task panicked"
+                    } else if e.is_cancelled() {
+                        "blake3 hash task cancelled"
+                    } else {
+                        "blake3 hash task failed to join"
+                    };
+                    CacheError::Store(anyhow::Error::from(e).context(note))
                 })?
         };
         if actual != hash {

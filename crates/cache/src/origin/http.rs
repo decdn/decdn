@@ -44,12 +44,21 @@ const INITIAL_CAPACITY_HINT_CAP: usize = 1 << 20; // 1 MiB
 /// stripped. Operators may legitimately use basic-auth-in-URL for
 /// internal origins, but those credentials must not reach logs or
 /// error messages.
+///
+/// Fails closed: if the setters can't strip userinfo (cannot-be-a-base
+/// URLs, or URL-parsing ambiguity that misattributes credentials into
+/// host/path), we emit a fixed placeholder rather than echoing anything
+/// that might contain secrets. Callers from `parse_origin_url` and
+/// `HttpOrigin::fetch` always pass http/https URLs (parse-and-scheme
+/// validated, with `.join()` preserving scheme), so the happy path is
+/// expected here.
 fn redact_for_log(url: &reqwest::Url) -> String {
     let mut u = url.clone();
-    // Both setters return Err only for cannot-be-a-base URLs (data:, etc),
-    // which can't reach here because parse_origin_url rejects them.
     let _ = u.set_username("");
     let _ = u.set_password(None);
+    if !u.username().is_empty() || u.password().is_some() {
+        return "<redacted URL>".to_string();
+    }
     u.to_string()
 }
 
@@ -142,18 +151,28 @@ pub fn parse_origin_url(raw: &str) -> anyhow::Result<OriginUrl> {
 pub struct HttpOrigin {
     client: reqwest::Client,
     base_url: OriginUrl,
+    response_headers_timeout: Duration,
+    chunk_idle_timeout: Duration,
 }
 
 impl HttpOrigin {
     /// Build an [`HttpOrigin`] around a validated [`OriginUrl`]. The only way
     /// to obtain one is [`parse_origin_url`], so invariants are enforced at
-    /// the type boundary rather than documented in prose.
+    /// the type boundary rather than documented in prose. Timeouts default
+    /// to the `RESPONSE_HEADERS_TIMEOUT` and `CHUNK_IDLE_TIMEOUT` constants; override
+    /// with [`Self::with_timeouts`] if operator policy or tests require
+    /// different values.
     pub fn new(base_url: OriginUrl) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .context("failed to build reqwest client")?;
-        Ok(Self { client, base_url })
+        Ok(Self {
+            client,
+            base_url,
+            response_headers_timeout: RESPONSE_HEADERS_TIMEOUT,
+            chunk_idle_timeout: CHUNK_IDLE_TIMEOUT,
+        })
     }
 
     /// Convenience constructor that parses `raw` via [`parse_origin_url`]
@@ -161,6 +180,20 @@ impl HttpOrigin {
     /// production paths so URL validation happens at config-load time.
     pub fn parse(raw: &str) -> anyhow::Result<Self> {
         Self::new(parse_origin_url(raw)?)
+    }
+
+    /// Override the phase timeouts. Primarily exists for tests — prod
+    /// paths should use the defaults unless operator policy dictates
+    /// otherwise.
+    #[must_use]
+    pub const fn with_timeouts(
+        mut self,
+        response_headers_timeout: Duration,
+        chunk_idle_timeout: Duration,
+    ) -> Self {
+        self.response_headers_timeout = response_headers_timeout;
+        self.chunk_idle_timeout = chunk_idle_timeout;
+        self
     }
 }
 
@@ -180,16 +213,17 @@ impl Origin for HttpOrigin {
             // from `base_url`, and errors go to logs.
             let url_log = redact_for_log(&url);
 
-            // connect_timeout on the client covers the TCP/TLS handshake;
-            // the header-phase timeout covers everything after the
-            // connection is established until response headers arrive.
+            // `connect_timeout` on the client covers the TCP/TLS handshake.
+            // This wrapper covers `.send()` — which is request write through
+            // response-header receipt (and a pool-miss connect if no idle
+            // connection is available), bounding a server that accepts the
+            // TCP/TLS but never writes back.
+            let headers_timeout = self.response_headers_timeout;
             let send_fut = self.client.get(url.clone()).send();
-            let mut resp = tokio::time::timeout(RESPONSE_HEADERS_TIMEOUT, send_fut)
+            let mut resp = tokio::time::timeout(headers_timeout, send_fut)
                 .await
                 .with_context(|| {
-                    format!(
-                        "origin GET {url_log} headers timed out after {RESPONSE_HEADERS_TIMEOUT:?}"
-                    )
+                    format!("origin GET {url_log} headers timed out after {headers_timeout:?}")
                 })?
                 .with_context(|| format!("origin GET {url_log} failed"))?;
 
@@ -221,12 +255,16 @@ impl Origin for HttpOrigin {
                 .content_length()
                 .and_then(|l| usize::try_from(l).ok())
                 .map_or(0, |l| min(l, INITIAL_CAPACITY_HINT_CAP));
+            let idle_timeout = self.chunk_idle_timeout;
             let mut buf = BytesMut::with_capacity(hint);
             loop {
-                let chunk_result = tokio::time::timeout(CHUNK_IDLE_TIMEOUT, resp.chunk())
+                let chunk_result = tokio::time::timeout(idle_timeout, resp.chunk())
                     .await
                     .with_context(|| {
-                        format!("origin GET {url_log} body read stalled for {CHUNK_IDLE_TIMEOUT:?}")
+                        format!(
+                            "origin GET {url_log} body read stalled for {idle_timeout:?} after {} bytes buffered",
+                            buf.len()
+                        )
                     })?
                     .with_context(|| format!("origin GET {url_log} body read failed"))?;
                 let Some(chunk) = chunk_result else { break };
@@ -324,6 +362,53 @@ mod tests {
                 "error for {raw} lacked scheme context: {err}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn redact_for_log_strips_user_and_password() -> anyhow::Result<()> {
+        let url = reqwest::Url::parse("https://user:secret@host.example/path")?;
+        let redacted = redact_for_log(&url);
+        anyhow::ensure!(
+            !redacted.contains("secret") && !redacted.contains("user"),
+            "redaction leaked credentials: {redacted}"
+        );
+        anyhow::ensure!(
+            redacted.contains("host.example"),
+            "redaction dropped host: {redacted}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn redact_for_log_strips_username_only() -> anyhow::Result<()> {
+        let url = reqwest::Url::parse("https://someuser@host.example/")?;
+        let redacted = redact_for_log(&url);
+        anyhow::ensure!(
+            !redacted.contains("someuser"),
+            "redaction kept username: {redacted}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn redact_raw_for_log_emits_placeholder_for_unparseable() -> anyhow::Result<()> {
+        anyhow::ensure!(redact_raw_for_log("not a url") == "<unparseable URL>");
+        anyhow::ensure!(redact_raw_for_log("   ") == "<unparseable URL>");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_origin_url_errors_do_not_leak_credentials() -> anyhow::Result<()> {
+        // URL parses cleanly but has a rejected query string. Credentials
+        // must not appear in the rejection message — operators routinely
+        // share config errors from logs.
+        let err = parse_origin_url("https://user:secret@host.example/path?token=abc")
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected rejection"))?
+            .to_string();
+        anyhow::ensure!(!err.contains("secret"), "error leaked password: {err}");
+        anyhow::ensure!(!err.contains("user"), "error leaked username: {err}");
         Ok(())
     }
 
