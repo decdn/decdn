@@ -12,7 +12,7 @@ use crate::cli::run::RunArgs;
 
 pub use resolved::{
     ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedIdentity, ResolvedNetwork,
-    ResolvedObservability,
+    ResolvedObservability, ResolvedPayment,
 };
 pub use types::FileConfig;
 
@@ -49,7 +49,7 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
         &identity.data_dir,
     )?;
     let cache = resolve_cache(&cli.cache, file.cache.as_ref(), &identity.data_dir);
-    let rate_per_mb = resolve_payment(&cli.payment, file.payment.as_ref());
+    let payment = resolve_payment(&cli.payment, file.payment.as_ref());
     let observability = resolve_observability(&cli.observability, file.observability.as_ref());
 
     Ok(ResolvedConfig {
@@ -57,7 +57,7 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
         network,
         blockchain,
         cache,
-        rate_per_mb,
+        payment,
         observability,
     })
 }
@@ -199,11 +199,16 @@ fn resolve_cache(
     }
 }
 
-/// Resolve payment fields: `rate_per_mb`.
-fn resolve_payment(cli: &crate::cli::run::PaymentArgs, file: Option<&types::PaymentConfig>) -> u64 {
-    cli.rate_per_mb
+/// Resolve payment fields.
+fn resolve_payment(
+    cli: &crate::cli::run::PaymentArgs,
+    file: Option<&types::PaymentConfig>,
+) -> ResolvedPayment {
+    let rate_per_mb = cli
+        .rate_per_mb
         .or_else(|| file.and_then(|p| p.rate_per_mb))
-        .unwrap_or(DEFAULT_RATE_PER_MB)
+        .unwrap_or(DEFAULT_RATE_PER_MB);
+    ResolvedPayment { rate_per_mb }
 }
 
 /// Resolve observability fields.

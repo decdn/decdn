@@ -45,7 +45,7 @@ fn cmd_run(config_path: Option<&std::path::Path>, run_args: &cli::RunArgs) -> an
         rpc_url = "<redacted>",
         cache_dir = %resolved.cache.cache_dir.display(),
         cache_size_mb = resolved.cache.cache_size_mb,
-        rate_per_mb = resolved.rate_per_mb,
+        rate_per_mb = resolved.payment.rate_per_mb,
         metrics_port = resolved.observability.metrics_port,
         "resolved configuration"
     );

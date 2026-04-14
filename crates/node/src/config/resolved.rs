@@ -51,6 +51,13 @@ pub struct ResolvedCache {
     pub max_blob_size_mb: u64,
 }
 
+/// Resolved payment fields.
+#[derive(Debug)]
+pub struct ResolvedPayment {
+    /// Rate per MB in USDC base units (6 decimals).
+    pub rate_per_mb: u64,
+}
+
 /// Resolved observability fields.
 #[derive(Debug)]
 pub struct ResolvedObservability {
@@ -78,7 +85,6 @@ pub struct ResolvedConfig {
     pub network: ResolvedNetwork,
     pub blockchain: ResolvedBlockchain,
     pub cache: ResolvedCache,
-    /// Rate per MB in USDC base units (6 decimals).
-    pub rate_per_mb: u64,
+    pub payment: ResolvedPayment,
     pub observability: ResolvedObservability,
 }
