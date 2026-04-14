@@ -2,7 +2,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use decdn_protocol::{
     ALPN_PROBE,
@@ -14,6 +14,14 @@ use super::Handler;
 use crate::metrics::Metrics;
 
 const MAX_REQUEST_BYTES: usize = 64;
+/// Ceiling on how long we wait for the client to send the `ProbeRequest` and
+/// FIN the stream. Without it a peer can pin a server task indefinitely by
+/// opening a stream and never closing it.
+const PROBE_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// Ceiling on how long we wait for the client to close the connection after
+/// receiving the response. Bounds the `active_connections` gauge against idle
+/// clients that hold the connection open.
+const PROBE_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Serves `cdn/probe/v1`: reads a [`ProbeRequest`], writes a [`ProbeResponse`].
 pub struct ProbeHandler {
@@ -38,9 +46,9 @@ impl ProbeHandler {
             .await
             .map_err(|e| anyhow::anyhow!("accept_bi failed: {e}"))?;
 
-        let buf = recv
-            .read_to_end(MAX_REQUEST_BYTES)
+        let buf = tokio::time::timeout(PROBE_READ_TIMEOUT, recv.read_to_end(MAX_REQUEST_BYTES))
             .await
+            .map_err(|_| anyhow::anyhow!("probe request timed out after {PROBE_READ_TIMEOUT:?}"))?
             .map_err(|e| anyhow::anyhow!("probe request read failed: {e}"))?;
 
         let req: ProbeRequest =
@@ -71,7 +79,11 @@ impl ProbeHandler {
             .map_err(|e| anyhow::anyhow!("probe stream finish failed: {e}"))?;
 
         self.metrics.probe_request();
-        conn.closed().await;
+        // Wait for the client's close so the response bytes are flushed to the
+        // peer, but cap the wait so an idle/malicious client can't hold the
+        // connection (and inflate active_connections) forever.
+        let _ = tokio::time::timeout(PROBE_CLOSE_TIMEOUT, conn.closed()).await;
+        conn.close(0u32.into(), b"probe-done");
         Ok(())
     }
 }

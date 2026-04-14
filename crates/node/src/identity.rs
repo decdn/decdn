@@ -1,8 +1,13 @@
 //! Node identity: load or generate a persistent ed25519 `SecretKey`.
 //!
-//! The key is stored as 32 raw bytes at `<data_dir>/node.secret` with file
-//! mode 0600 on Unix. If the file does not exist, a new key is generated using
-//! `OsRng` and written atomically.
+//! The key is stored as 32 raw bytes at `<data_dir>/node.secret`. On Unix the
+//! temp file is opened with mode `0600` from creation (no umask-window where
+//! the key material is world-readable) and atomically renamed into place.
+//!
+//! New keys are generated with `rand::rng()` — rand 0.9's `ThreadRng`, which is
+//! auto-seeded from the OS entropy source (`getrandom`). `rand::rngs::OsRng`
+//! itself only implements `TryCryptoRng` in rand 0.9 and is not directly
+//! accepted by `SecretKey::generate`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -54,7 +59,9 @@ pub fn load_from(path: &Path) -> anyhow::Result<SecretKey> {
     Ok(SecretKey::from_bytes(&arr))
 }
 
-/// Write `bytes` to `path` atomically with mode 0600 on Unix.
+/// Write `bytes` to `path` atomically. On Unix the temp file is created with
+/// mode 0600 from the start (via `OpenOptionsExt::mode`) so the key material is
+/// never briefly exposed under a permissive umask.
 fn write_atomic(path: &Path, bytes: &[u8; KEY_LEN]) -> anyhow::Result<()> {
     let parent = path
         .parent()
@@ -66,14 +73,28 @@ fn write_atomic(path: &Path, bytes: &[u8; KEY_LEN]) -> anyhow::Result<()> {
             .unwrap_or(KEY_FILE_NAME)
     ));
 
-    fs::write(&tmp, bytes).with_context(|| format!("failed to write {}", tmp.display()))?;
+    // Best-effort cleanup of a leftover temp from a prior crashed run. Absent is fine.
+    let _ = fs::remove_file(&tmp);
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = fs::Permissions::from_mode(0o600);
-        fs::set_permissions(&tmp, perms)
-            .with_context(|| format!("failed to chmod {}", tmp.display()))?;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .with_context(|| format!("failed to create {}", tmp.display()))?;
+        file.write_all(bytes)
+            .with_context(|| format!("failed to write {}", tmp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync {}", tmp.display()))?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        fs::write(&tmp, bytes).with_context(|| format!("failed to write {}", tmp.display()))?;
     }
 
     fs::rename(&tmp, path)

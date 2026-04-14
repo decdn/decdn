@@ -1,7 +1,12 @@
-//! Wire message types for deCDN ALPN protocols.
+//! Wire message payload types for deCDN ALPN protocols.
 //!
-//! All messages are postcard-serialized length-prefixed payloads exchanged over
-//! iroh QUIC bi-directional streams.
+//! This module defines the postcard-serializable request/response payloads used
+//! by deCDN protocols. It does not itself define or implement stream framing.
+//!
+//! ADR 013 specifies varint-length-prefixed framing plus top-level protocol
+//! enums for all ALPNs; that framing is not yet implemented. Current handlers
+//! read a single message per stream delimited by QUIC FIN. Implementing the
+//! ADR 013 framing + enum wrappers is tracked as a follow-up.
 
 use serde::{Deserialize, Serialize};
 

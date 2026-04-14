@@ -34,7 +34,12 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
 
     let mut tasks = JoinSet::new();
 
-    let metrics_addr = std::net::SocketAddr::from(([0, 0, 0, 0], cfg.metrics_port));
+    // Bind metrics to loopback by default: /metrics is an unauthenticated HTTP
+    // endpoint that leaks operational data. Operators who want to scrape from
+    // another host should front it with a reverse proxy or run node_exporter
+    // alongside. ADR 020 leaves the bind address operator-configurable; exposing
+    // that as a CLI flag is tracked as a follow-up.
+    let metrics_addr = std::net::SocketAddr::from(([127, 0, 0, 1], cfg.metrics_port));
     let metrics_handle = Arc::clone(&metrics);
     tasks.spawn(async move {
         if let Err(err) = metrics::serve(metrics_addr, metrics_handle).await {
