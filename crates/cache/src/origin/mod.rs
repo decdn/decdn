@@ -3,6 +3,7 @@
 //! [`Origin`] is the seam. One concrete implementation (`HttpOrigin`) lives
 //! alongside it; S3/R2/B2 backends are follow-up work.
 
+pub mod fs;
 pub mod http;
 
 use std::future::Future;
@@ -11,6 +12,7 @@ use std::pin::Pin;
 use bytes::Bytes;
 use iroh_blobs::Hash;
 
+pub use fs::FilesystemOrigin;
 pub use http::{HttpOrigin, OriginUrl, parse_origin_url};
 
 /// Result of an [`Origin::fetch`] call.

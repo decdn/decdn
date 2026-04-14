@@ -225,11 +225,31 @@ fn resolve_cache(
         .transpose()
         .context("invalid cache.origin_url")?;
 
+    let origin_path = cli
+        .origin_path
+        .clone()
+        .map(|p| expand_tilde(&p))
+        .or_else(|| {
+            file.and_then(|c| c.origin_path.clone())
+                .map(|p| expand_tilde(&p))
+        })
+        .filter(|p| !p.as_os_str().is_empty());
+
+    // origin_url and origin_path are different backends for the same slot
+    // (pull-through on miss). Accepting both would require choosing one
+    // silently; operators almost never want that, so fail loudly.
+    if origin_url.is_some() && origin_path.is_some() {
+        anyhow::bail!(
+            "cache.origin_url and cache.origin_path are mutually exclusive; set only one"
+        );
+    }
+
     Ok(ResolvedCache {
         cache_dir,
         cache_size_mb,
         max_blob_size_mb,
         origin_url,
+        origin_path,
     })
 }
 
@@ -342,6 +362,7 @@ fn expand_env(cfg: &mut FileConfig) -> anyhow::Result<()> {
     if let Some(c) = cfg.cache.as_mut() {
         expand_path(&mut c.cache_dir, "cache.cache_dir")?;
         expand_str(&mut c.origin_url, "cache.origin_url")?;
+        expand_path(&mut c.origin_path, "cache.origin_path")?;
     }
     if let Some(o) = cfg.observability.as_mut() {
         expand_str(&mut o.otlp_endpoint, "observability.otlp_endpoint")?;
@@ -561,6 +582,7 @@ mod tests {
                 cache_size_mb: None,
                 max_blob_size_mb: None,
                 origin_url: None,
+                origin_path: None,
             }),
             ..Default::default()
         };
@@ -601,6 +623,7 @@ mod tests {
                 cache_size_mb: None,
                 max_blob_size_mb: None,
                 origin_url: None,
+                origin_path: None,
             }),
             ..Default::default()
         };
@@ -638,6 +661,7 @@ mod tests {
                 cache_size_mb: None,
                 max_blob_size_mb: None,
                 origin_url: None,
+                origin_path: None,
             }),
             ..Default::default()
         };
@@ -715,6 +739,7 @@ mod tests {
                     cache_size_mb: None,
                     max_blob_size_mb: None,
                     origin_url: None,
+                    origin_path: None,
                 });
             }),
             ("cache.origin_url", |c, v| {
@@ -723,6 +748,16 @@ mod tests {
                     cache_size_mb: None,
                     max_blob_size_mb: None,
                     origin_url: Some(v.to_string()),
+                    origin_path: None,
+                });
+            }),
+            ("cache.origin_path", |c, v| {
+                c.cache = Some(types::CacheConfig {
+                    cache_dir: None,
+                    cache_size_mb: None,
+                    max_blob_size_mb: None,
+                    origin_url: None,
+                    origin_path: Some(PathBuf::from(v)),
                 });
             }),
             ("observability.otlp_endpoint", |c, v| {
@@ -762,6 +797,7 @@ mod tests {
                 cache_size_mb: None,
                 max_blob_size_mb: None,
                 origin_url: Some("https://origin.example/${HOME}/bucket".to_string()),
+                origin_path: None,
             }),
             ..Default::default()
         };
@@ -786,6 +822,7 @@ mod tests {
             cache_size_mb: None,
             max_blob_size_mb: None,
             origin_url: Some("file:///etc/passwd".to_string()),
+            origin_path: None,
         };
         let err = resolve_cache(&cli, None, std::path::Path::new("/tmp"))
             .err()
@@ -808,12 +845,14 @@ mod tests {
             cache_size_mb: None,
             max_blob_size_mb: None,
             origin_url: Some("https://cli-wins.example/".to_string()),
+            origin_path: None,
         };
         let toml = types::CacheConfig {
             cache_dir: None,
             cache_size_mb: None,
             max_blob_size_mb: None,
             origin_url: Some("https://toml-loses.example/".to_string()),
+            origin_path: None,
         };
         let resolved = resolve_cache(&cli, Some(&toml), std::path::Path::new("/tmp"))?;
         let url = resolved
@@ -822,6 +861,49 @@ mod tests {
         anyhow::ensure!(
             url.as_url().as_str() == "https://cli-wins.example/",
             "got: {url}"
+        );
+        Ok(())
+    }
+
+    // Both backends for the same miss-pull slot cannot be set at once —
+    // picking one silently would almost certainly violate operator intent.
+    #[test]
+    fn resolve_cache_rejects_both_origin_url_and_path() -> anyhow::Result<()> {
+        let cli = crate::cli::run::CacheArgs {
+            cache_dir: None,
+            cache_size_mb: None,
+            max_blob_size_mb: None,
+            origin_url: Some("https://origin.example/".to_string()),
+            origin_path: Some(PathBuf::from("/var/cache/decdn/origin")),
+        };
+        let err = resolve_cache(&cli, None, std::path::Path::new("/tmp"))
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected mutual-exclusion error"))?
+            .to_string();
+        anyhow::ensure!(
+            err.contains("mutually exclusive"),
+            "error lacked mutual-exclusion context: {err}"
+        );
+        Ok(())
+    }
+
+    // origin_path alone resolves cleanly and leaves origin_url absent —
+    // pairs with the runtime's (Some, None) / (None, Some) dispatch match.
+    #[test]
+    fn resolve_cache_origin_path_only() -> anyhow::Result<()> {
+        let cli = crate::cli::run::CacheArgs {
+            cache_dir: None,
+            cache_size_mb: None,
+            max_blob_size_mb: None,
+            origin_url: None,
+            origin_path: Some(PathBuf::from("/tmp/origin")),
+        };
+        let resolved = resolve_cache(&cli, None, std::path::Path::new("/tmp"))?;
+        anyhow::ensure!(resolved.origin_url.is_none(), "origin_url should be None");
+        anyhow::ensure!(
+            resolved.origin_path == Some(PathBuf::from("/tmp/origin")),
+            "origin_path: {:?}",
+            resolved.origin_path,
         );
         Ok(())
     }

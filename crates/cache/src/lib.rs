@@ -16,4 +16,4 @@ pub mod origin;
 pub use engine::{CacheEngine, CacheStats};
 pub use error::{CacheError, CacheResult};
 pub use iroh_blobs::Hash;
-pub use origin::{HttpOrigin, Origin, OriginFetch, OriginUrl, parse_origin_url};
+pub use origin::{FilesystemOrigin, HttpOrigin, Origin, OriginFetch, OriginUrl, parse_origin_url};

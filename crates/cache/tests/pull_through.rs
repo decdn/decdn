@@ -5,7 +5,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use decdn_cache::{CacheEngine, CacheError, Hash, HttpOrigin, Origin, OriginFetch};
+use decdn_cache::{
+    CacheEngine, CacheError, FilesystemOrigin, Hash, HttpOrigin, Origin, OriginFetch,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -295,6 +297,79 @@ async fn open_on_file_path_yields_store_error() -> anyhow::Result<()> {
     anyhow::ensure!(
         matches!(err, CacheError::Store(_)),
         "expected Store variant, got: {err:?}"
+    );
+    Ok(())
+}
+
+/// Write `payload` into the sharded filesystem layout rooted at `base`
+/// so `FilesystemOrigin` can serve it.
+fn seed_fs_blob(base: &std::path::Path, hash: Hash, payload: &[u8]) -> anyhow::Result<()> {
+    let hex = hash.to_hex();
+    let shard = hex
+        .get(..2)
+        .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
+    let dir = base.join(shard);
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join(hex.as_str()), payload)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn fs_origin_pulls_and_caches() -> anyhow::Result<()> {
+    let payload: &[u8] = b"content-addressed from local disk";
+    let hash = Hash::new(payload);
+
+    let origin_dir = tempfile::tempdir()?;
+    seed_fs_blob(origin_dir.path(), hash, payload)?;
+
+    let cache_dir = tempfile::tempdir()?;
+    let origin = Arc::new(FilesystemOrigin::new(origin_dir.path())?);
+    let engine = CacheEngine::open(cache_dir.path(), Some(origin), 16).await?;
+
+    anyhow::ensure!(!engine.has(hash).await?, "blob should be absent initially");
+    let got = engine.get(hash).await?;
+    anyhow::ensure!(&got[..] == payload, "first get should return fs bytes");
+    anyhow::ensure!(engine.has(hash).await?, "blob should be cached after miss");
+
+    // Wipe the origin dir to prove the second read is purely local.
+    drop(origin_dir);
+    let got2 = engine.get(hash).await?;
+    anyhow::ensure!(&got2[..] == payload, "second get should be served locally");
+    Ok(())
+}
+
+#[tokio::test]
+async fn fs_origin_reports_not_found() -> anyhow::Result<()> {
+    let origin_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let origin = Arc::new(FilesystemOrigin::new(origin_dir.path())?);
+    let engine = CacheEngine::open(cache_dir.path(), Some(origin), 16).await?;
+
+    let err = err_of(engine.get(Hash::new(b"absent")).await)?;
+    anyhow::ensure!(
+        matches!(err, CacheError::NotFound { .. }),
+        "expected NotFound, got: {err:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn fs_origin_rejects_oversize() -> anyhow::Result<()> {
+    // 2 MiB payload seeded on disk; 1 MiB cap.
+    let payload = vec![0x42u8; 2 * 1024 * 1024];
+    let hash = Hash::new(&payload);
+
+    let origin_dir = tempfile::tempdir()?;
+    seed_fs_blob(origin_dir.path(), hash, &payload)?;
+
+    let cache_dir = tempfile::tempdir()?;
+    let origin = Arc::new(FilesystemOrigin::new(origin_dir.path())?);
+    let engine = CacheEngine::open(cache_dir.path(), Some(origin), 1).await?;
+
+    let err = err_of(engine.get(hash).await)?;
+    anyhow::ensure!(
+        matches!(err, CacheError::OriginError { .. }),
+        "expected OriginError from fs metadata-length fast-path, got: {err:?}"
     );
     Ok(())
 }

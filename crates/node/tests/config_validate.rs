@@ -194,6 +194,7 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             cache_size_mb: 10_240,
             max_blob_size_mb: 10_240,
             origin_url: None::<decdn_cache::OriginUrl>,
+            origin_path: None,
         },
         payment: ResolvedPayment { rate_per_mb: 10 },
         observability: ResolvedObservability {

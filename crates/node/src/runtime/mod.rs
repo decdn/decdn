@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use decdn_cache::{CacheEngine, HttpOrigin, Origin};
+use decdn_cache::{CacheEngine, FilesystemOrigin, HttpOrigin, Origin};
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 
@@ -34,7 +34,7 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
     let cache = build_cache(&cfg).await?;
     tracing::info!(
         cache_dir = %cfg.cache.cache_dir.display(),
-        has_origin = cfg.cache.origin_url.is_some(),
+        has_origin = cfg.cache.origin_url.is_some() || cfg.cache.origin_path.is_some(),
         "cache engine ready",
     );
 
@@ -148,20 +148,27 @@ fn log_join_result(result: Result<(), tokio::task::JoinError>, phase: &'static s
     }
 }
 
-/// Construct the cache engine from resolved config. The `HttpOrigin` is
-/// only built when `origin_url` is set; otherwise the engine serves only
-/// already-cached content and cache misses surface as `CacheError::NoOrigin`.
+/// Construct the cache engine from resolved config. At most one of
+/// `origin_url` and `origin_path` is set (guaranteed by
+/// `config::resolve_cache`); neither-set means the engine serves only
+/// already-cached content and cache misses surface as
+/// `CacheError::NoOrigin`.
 async fn build_cache(cfg: &ResolvedConfig) -> anyhow::Result<CacheEngine> {
-    let origin: Option<Arc<dyn Origin>> = cfg
-        .cache
-        .origin_url
-        .clone()
-        .map(|url| -> anyhow::Result<Arc<dyn Origin>> {
-            Ok(Arc::new(
+    let origin: Option<Arc<dyn Origin>> =
+        match (cfg.cache.origin_url.clone(), cfg.cache.origin_path.clone()) {
+            (Some(url), None) => Some(Arc::new(
                 HttpOrigin::new(url).context("failed to build HTTP origin client")?,
-            ))
-        })
-        .transpose()?;
+            )),
+            (None, Some(path)) => Some(Arc::new(
+                FilesystemOrigin::new(path).context("failed to open filesystem origin")?,
+            )),
+            (None, None) => None,
+            // resolve_cache enforces this mutex; this arm is unreachable in
+            // practice but a typed fallback is safer than unwrap() or unreachable!().
+            (Some(_), Some(_)) => {
+                anyhow::bail!("cache.origin_url and cache.origin_path are mutually exclusive")
+            }
+        };
     CacheEngine::open(&cfg.cache.cache_dir, origin, cfg.cache.max_blob_size_mb)
         .await
         .context("failed to open cache engine")

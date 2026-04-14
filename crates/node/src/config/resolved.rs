@@ -56,6 +56,12 @@ pub struct ResolvedCache {
     /// parser is impossible — the invariants (http/https scheme,
     /// trailing-slash path, no query/fragment) are type-enforced.
     pub origin_url: Option<decdn_cache::OriginUrl>,
+    /// Optional filesystem origin root. Blobs live at
+    /// `{path}/{hex[0..2]}/{hex}`. Directory-existence is validated when
+    /// the runtime constructs the [`decdn_cache::FilesystemOrigin`] —
+    /// config resolution carries the raw path so resolution stays
+    /// filesystem-free and testable without real I/O.
+    pub origin_path: Option<PathBuf>,
 }
 
 /// Resolved payment fields.
