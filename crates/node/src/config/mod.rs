@@ -118,7 +118,7 @@ pub fn parse_contract_address(flag_name: &str, raw: &str) -> anyhow::Result<Stri
     let trimmed = raw.trim();
     let addr = Address::parse_checksummed(trimmed, None).with_context(|| {
         format!(
-            "invalid {flag_name}: value {trimmed:?}; expected an EIP-55 \
+            "invalid {flag_name}: value {raw:?} (trimmed: {trimmed:?}); expected an EIP-55 \
              checksummed 0x-prefixed 40-hex-character address"
         )
     })?;
@@ -126,7 +126,7 @@ pub fn parse_contract_address(flag_name: &str, raw: &str) -> anyhow::Result<Stri
 }
 
 /// Resolve blockchain fields.
-fn resolve_blockchain(
+pub fn resolve_blockchain(
     cli: &crate::cli::run::BlockchainArgs,
     file: Option<&types::BlockchainConfig>,
     data_dir: &std::path::Path,
