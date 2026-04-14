@@ -24,6 +24,7 @@ jobs:
     permissions:
       contents: read
       security-events: write
+      actions: read
     steps:
       - uses: actions/checkout@v6
 
@@ -38,7 +39,7 @@ jobs:
           ignore-unfixed: true
 
       - name: Upload SARIF to GitHub Security
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: trivy-fs.sarif
           category: trivy-fs
@@ -51,6 +52,7 @@ jobs:
     permissions:
       contents: read
       security-events: write
+      actions: read
       packages: read
     steps:
       - uses: actions/checkout@v6
@@ -72,7 +74,7 @@ jobs:
           ignore-unfixed: true
 
       - name: Upload SARIF to GitHub Security
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: trivy-image.sarif
           category: trivy-image
