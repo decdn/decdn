@@ -84,6 +84,30 @@ fn resolve_blockchain_names_correct_field_for_bad_address() -> anyhow::Result<()
 }
 
 #[test]
+fn resolve_blockchain_names_correct_field_for_bad_payment_address() -> anyhow::Result<()> {
+    let cli = BlockchainArgs {
+        rpc_url: Some("https://example/rpc".to_string()),
+        eth_keystore: None,
+        payment_channel_address: Some("0xNOTHEX".to_string()),
+        staking_registry_address: Some(GOOD.to_string()),
+    };
+    let data_dir = std::env::temp_dir();
+    let Err(err) = resolve_blockchain(&cli, None, &data_dir) else {
+        anyhow::bail!("expected resolve_blockchain to fail on bad payment address");
+    };
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("payment_channel_address"),
+        "error should name payment_channel_address: {msg}"
+    );
+    assert!(
+        !msg.contains("staking_registry_address"),
+        "error must not name the valid field: {msg}"
+    );
+    Ok(())
+}
+
+#[test]
 fn error_message_names_field_and_format() -> anyhow::Result<()> {
     let lower = GOOD.to_lowercase();
     let Err(err) = parse_contract_address("payment_channel_address", &lower) else {
