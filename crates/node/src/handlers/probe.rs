@@ -55,7 +55,17 @@ impl ProbeHandler {
             .map_err(|_| anyhow::anyhow!("accept_bi timed out after {ACCEPT_BI_TIMEOUT:?}"))?
             .map_err(|e| anyhow::anyhow!("accept_bi failed: {e}"))?;
 
-        let req = read_probe_request(&mut send, &mut recv).await?;
+        let req = match read_probe_request(&mut send, &mut recv).await {
+            Ok(req) => req,
+            Err(ProbeReadError { err, app_code }) => {
+                // ADR 013 scopes app error codes to streams, but probe is 1:1
+                // connection:stream — also close the connection with the same
+                // code so the peer observes it deterministically even if the
+                // stream RESET racing with connection teardown gets clobbered.
+                conn.close(VarInt::from_u32(app_code), b"probe-error");
+                return Err(err);
+            }
+        };
 
         let measured_at_unix_ms = u64::try_from(
             SystemTime::now()
@@ -97,8 +107,17 @@ const fn frame_err_code(e: &FrameError) -> u32 {
     }
 }
 
-/// Reads one framed `ProbeMessage::Request` from `recv`, resetting both streams
-/// with the appropriate ADR 013 app error code on every failure path.
+/// Error from the probe-request read path carrying the ADR 013 app error
+/// code the handler should propagate to the peer.
+struct ProbeReadError {
+    err: anyhow::Error,
+    app_code: u32,
+}
+
+/// Reads one framed `ProbeMessage::Request` from `recv`. On failure, also
+/// resets/stops the streams with the appropriate ADR 013 app error code so
+/// long-lived (future) multi-stream connections can keep running; the caller
+/// additionally closes the whole connection for probe's 1:1 topology.
 ///
 /// The cognitive-complexity allowance reflects that splitting this further
 /// would spread the ADR 013 error-code mapping across multiple helpers,
@@ -107,7 +126,7 @@ const fn frame_err_code(e: &FrameError) -> u32 {
 async fn read_probe_request(
     send: &mut SendStream,
     recv: &mut RecvStream,
-) -> anyhow::Result<decdn_protocol::message::ProbeRequest> {
+) -> Result<decdn_protocol::message::ProbeRequest, ProbeReadError> {
     let reset = |send: &mut SendStream, recv: &mut RecvStream, code: u32| {
         let v = VarInt::from_u32(code);
         // reset/stop may fail if stream already closed by peer; ignore.
@@ -123,13 +142,19 @@ async fn read_probe_request(
                 timeout_ms = u64::try_from(PROBE_READ_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
                 "probe request read timed out"
             );
-            anyhow::bail!("probe request timed out after {PROBE_READ_TIMEOUT:?}");
+            return Err(ProbeReadError {
+                err: anyhow::anyhow!("probe request timed out after {PROBE_READ_TIMEOUT:?}"),
+                app_code: 0,
+            });
         }
         Ok(Err(e)) => {
             let app_code = frame_err_code(&e);
             reset(send, recv, app_code);
             tracing::warn!(app_code, error = %e, "probe frame read failed");
-            anyhow::bail!("probe frame read failed: {e}");
+            return Err(ProbeReadError {
+                err: anyhow::anyhow!("probe frame read failed: {e}"),
+                app_code,
+            });
         }
         Ok(Ok(frame)) => frame,
     };
@@ -142,7 +167,10 @@ async fn read_probe_request(
                 error = %e,
                 "probe message decode failed"
             );
-            Err(anyhow::anyhow!("probe decode failed: {e}"))
+            Err(ProbeReadError {
+                err: anyhow::anyhow!("probe decode failed: {e}"),
+                app_code: APP_ERR_MALFORMED_MESSAGE,
+            })
         }
         Ok((ProbeMessage::Request(req), _rest)) => Ok(req),
         Ok((ProbeMessage::Response(_), _)) => {
@@ -151,9 +179,10 @@ async fn read_probe_request(
                 app_code = APP_ERR_UNSUPPORTED_MESSAGE,
                 "peer sent ProbeMessage::Response on server stream"
             );
-            Err(anyhow::anyhow!(
-                "unexpected ProbeMessage::Response on server stream"
-            ))
+            Err(ProbeReadError {
+                err: anyhow::anyhow!("unexpected ProbeMessage::Response on server stream"),
+                app_code: APP_ERR_UNSUPPORTED_MESSAGE,
+            })
         }
     }
 }

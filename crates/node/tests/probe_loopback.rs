@@ -14,7 +14,9 @@ use decdn_protocol::{
     message::{ProbeRequest, ProbeResponse},
     read_frame, write_frame,
 };
-use iroh::endpoint::{Connection, ReadError, ReadToEndError, VarInt};
+use iroh::endpoint::{
+    ApplicationClose, Connection, ConnectionError, ReadError, ReadToEndError, VarInt,
+};
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
 use tokio::task::JoinHandle;
 
@@ -171,17 +173,25 @@ async fn spin_up_probe_harness() -> anyhow::Result<Harness> {
     })
 }
 
-/// Expect `recv.read_to_end` to fail with a stream reset carrying `expected_code`.
-async fn assert_stream_reset_with_code(
+/// Expect `recv.read_to_end` to fail with `expected_code` delivered either as a
+/// stream `RESET_STREAM` or as a connection-level `CONNECTION_CLOSE` carrying
+/// an application error code. The probe handler closes the connection with
+/// the same app code it resets the stream with (probe is 1:1
+/// connection:stream), so either form is a correct observation of the ADR 013
+/// mapping.
+async fn assert_reset_with_code(
     recv: &mut iroh::endpoint::RecvStream,
     expected_code: u32,
 ) -> anyhow::Result<()> {
+    let expected = VarInt::from_u32(expected_code);
     match recv.read_to_end(4096).await {
-        Err(ReadToEndError::Read(ReadError::Reset(code))) => {
-            assert_eq!(code, VarInt::from_u32(expected_code));
-            Ok(())
+        Err(ReadToEndError::Read(ReadError::Reset(code))) if code == expected => Ok(()),
+        Err(ReadToEndError::Read(ReadError::ConnectionLost(
+            ConnectionError::ApplicationClosed(ApplicationClose { error_code, .. }),
+        ))) if error_code == expected => Ok(()),
+        other => {
+            anyhow::bail!("expected error carrying app code {expected_code:#x}, got {other:?}")
         }
-        other => anyhow::bail!("expected stream Reset({expected_code:#x}), got {other:?}"),
     }
 }
 
@@ -221,7 +231,7 @@ async fn probe_oversized_frame_returns_too_large_code() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("write: {e}"))?;
     send.finish().map_err(|e| anyhow::anyhow!("finish: {e}"))?;
 
-    assert_stream_reset_with_code(&mut recv, 0x02).await?;
+    assert_reset_with_code(&mut recv, 0x02).await?;
     tear_down(h).await
 }
 
@@ -240,7 +250,7 @@ async fn probe_garbage_postcard_returns_malformed_code() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("write: {e}"))?;
     send.finish().map_err(|e| anyhow::anyhow!("finish: {e}"))?;
 
-    assert_stream_reset_with_code(&mut recv, 0x03).await?;
+    assert_reset_with_code(&mut recv, 0x03).await?;
     tear_down(h).await
 }
 
@@ -265,6 +275,6 @@ async fn probe_response_on_server_stream_returns_unsupported_code() -> anyhow::R
         .map_err(|e| anyhow::anyhow!("write: {e}"))?;
     send.finish().map_err(|e| anyhow::anyhow!("finish: {e}"))?;
 
-    assert_stream_reset_with_code(&mut recv, 0x01).await?;
+    assert_reset_with_code(&mut recv, 0x01).await?;
     tear_down(h).await
 }
