@@ -30,25 +30,67 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// incrementally rather than pre-allocating 10 GB up front for one request.
 const INITIAL_CAPACITY_HINT_CAP: usize = 1 << 20; // 1 MiB
 
-/// Parse and normalize an origin base URL. Scheme must be `http` or `https`;
-/// a trailing slash is appended so `{base}.join(&hex)` produces
-/// `{base}/{hex}` rather than overwriting the final path component. This is
-/// the single source of truth for origin-URL validation — config resolution
-/// and [`HttpOrigin::new`] both route through it.
-pub fn parse_origin_url(raw: &str) -> anyhow::Result<reqwest::Url> {
-    let normalized = if raw.ends_with('/') {
-        raw.to_string()
-    } else {
-        format!("{raw}/")
-    };
-    let url = reqwest::Url::parse(&normalized)
-        .with_context(|| format!("invalid origin base URL: {raw:?}"))?;
+/// Parsed, scheme-validated, and path-normalized origin base URL. The only
+/// way to construct one is [`parse_origin_url`] — once you have an
+/// [`OriginUrl`], the following invariants are guaranteed by the type:
+///
+/// 1. Scheme is `http` or `https`.
+/// 2. Path ends with a trailing `/`, so `{base}.join(&hex)` produces
+///    `{base}/{hex}` rather than overwriting the final path component.
+/// 3. No query string or fragment — both silently get dropped by
+///    [`reqwest::Url::join`] and would turn into invisible footguns.
+#[derive(Debug, Clone)]
+pub struct OriginUrl(reqwest::Url);
+
+impl OriginUrl {
+    /// Borrow the underlying [`reqwest::Url`]. Needed when calling
+    /// `.join(hash_hex)` or handing the URL to `reqwest::Client::get`.
+    pub const fn as_url(&self) -> &reqwest::Url {
+        &self.0
+    }
+
+    /// Consume into the underlying [`reqwest::Url`].
+    #[allow(clippy::missing_const_for_fn)] // Destructuring a non-Copy newtype is not const.
+    pub fn into_url(self) -> reqwest::Url {
+        self.0
+    }
+}
+
+impl std::fmt::Display for OriginUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// Parse and normalize an origin base URL. This is the single source of
+/// truth for origin-URL validation — config resolution and test helpers
+/// both go through it, and the returned [`OriginUrl`] carries the
+/// scheme/path/query invariants in the type.
+pub fn parse_origin_url(raw: &str) -> anyhow::Result<OriginUrl> {
+    let mut url =
+        reqwest::Url::parse(raw).with_context(|| format!("invalid origin base URL: {raw:?}"))?;
     match url.scheme() {
-        "http" | "https" => Ok(url),
+        "http" | "https" => {}
         other => anyhow::bail!(
             "unsupported origin URL scheme {other:?} (expected http or https): {raw:?}"
         ),
     }
+    // A query or fragment on the base would be silently dropped by
+    // `Url::join` when we append the blake3 hex, so reject up front rather
+    // than accept a URL that can't possibly do what the operator expects.
+    if url.query().is_some() {
+        anyhow::bail!("origin URL must not contain a query string: {raw:?}");
+    }
+    if url.fragment().is_some() {
+        anyhow::bail!("origin URL must not contain a fragment: {raw:?}");
+    }
+    // Normalize the path (not the raw string) so `http://host/v1` becomes
+    // `http://host/v1/` without corrupting any other URL component.
+    if !url.path().ends_with('/') {
+        let normalized = format!("{}/", url.path());
+        url.set_path(&normalized);
+    }
+    Ok(OriginUrl(url))
 }
 
 /// Origin backed by a plain HTTP(S) endpoint serving content-addressed blobs
@@ -56,14 +98,14 @@ pub fn parse_origin_url(raw: &str) -> anyhow::Result<reqwest::Url> {
 #[derive(Debug, Clone)]
 pub struct HttpOrigin {
     client: reqwest::Client,
-    base_url: reqwest::Url,
+    base_url: OriginUrl,
 }
 
 impl HttpOrigin {
-    /// Build an [`HttpOrigin`] around an already-parsed URL. Callers coming
-    /// from config should use [`parse_origin_url`] once at resolution time and
-    /// pass the result here; see [`Self::parse`] for the convenience form.
-    pub fn new(base_url: reqwest::Url) -> anyhow::Result<Self> {
+    /// Build an [`HttpOrigin`] around a validated [`OriginUrl`]. The only way
+    /// to obtain one is [`parse_origin_url`], so invariants are enforced at
+    /// the type boundary rather than documented in prose.
+    pub fn new(base_url: OriginUrl) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .build()
@@ -88,6 +130,7 @@ impl Origin for HttpOrigin {
         Box::pin(async move {
             let url = self
                 .base_url
+                .as_url()
                 .join(&hash.to_hex())
                 .with_context(|| format!("failed to build URL for {hash}"))?;
 
@@ -147,9 +190,12 @@ mod tests {
     #[test]
     fn parse_origin_url_appends_trailing_slash() -> anyhow::Result<()> {
         let url = parse_origin_url("https://origin.example/v1")?;
-        anyhow::ensure!(url.as_str() == "https://origin.example/v1/", "got: {url}");
-        // The full path segment must survive `join`.
-        let joined = url.join("abcdef")?;
+        anyhow::ensure!(
+            url.as_url().as_str() == "https://origin.example/v1/",
+            "got: {url}"
+        );
+        // The full path segment must survive `join` — not collapse to `/`.
+        let joined = url.as_url().join("abcdef")?;
         anyhow::ensure!(
             joined.as_str() == "https://origin.example/v1/abcdef",
             "join produced: {joined}"
@@ -160,7 +206,38 @@ mod tests {
     #[test]
     fn parse_origin_url_preserves_existing_trailing_slash() -> anyhow::Result<()> {
         let url = parse_origin_url("https://origin.example/")?;
-        anyhow::ensure!(url.as_str() == "https://origin.example/", "got: {url}");
+        anyhow::ensure!(
+            url.as_url().as_str() == "https://origin.example/",
+            "got: {url}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_origin_url_rejects_query_string() -> anyhow::Result<()> {
+        // `.join(hex)` on a query-bearing base drops the query silently —
+        // operators would never notice. Reject at parse time instead.
+        let err = parse_origin_url("https://origin.example/v1?token=abc")
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("query-bearing URL should have been rejected"))?
+            .to_string();
+        anyhow::ensure!(
+            err.contains("must not contain a query string"),
+            "error lacked context: {err}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_origin_url_rejects_fragment() -> anyhow::Result<()> {
+        let err = parse_origin_url("https://origin.example/v1#frag")
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("fragment URL should have been rejected"))?
+            .to_string();
+        anyhow::ensure!(
+            err.contains("must not contain a fragment"),
+            "error lacked context: {err}"
+        );
         Ok(())
     }
 

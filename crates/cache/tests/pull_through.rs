@@ -6,6 +6,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use decdn_cache::{CacheEngine, CacheError, Hash, HttpOrigin, Origin, OriginFetch};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -145,8 +146,8 @@ impl Origin for OversizedOrigin {
 async fn engine_rejects_oversize_bytes_from_misbehaving_origin() -> anyhow::Result<()> {
     // Origin ignores the max_bytes advisory and returns 2 MiB. Cap at 1 MiB.
     // This proves the engine's post-receive size check is load-bearing
-    // defense in depth — a regression dropping that check would caught by
-    // this test even if the HTTP origin's streaming cap is fine.
+    // defense in depth — a regression dropping that check would be caught
+    // by this test even if the HTTP origin's streaming cap is fine.
     let payload = bytes::Bytes::from(vec![0xCDu8; 2 * 1024 * 1024]);
     let hash = Hash::new(&payload);
     let origin = Arc::new(OversizedOrigin { payload });
@@ -167,8 +168,13 @@ async fn engine_rejects_oversize_bytes_from_misbehaving_origin() -> anyhow::Resu
 }
 
 #[tokio::test]
-async fn shutdown_and_reopen_preserves_cached_blob() -> anyhow::Result<()> {
-    let payload: &[u8] = b"persisted across shutdown";
+async fn shutdown_flushes_without_drop() -> anyhow::Result<()> {
+    // Prove that `shutdown()` — not `Drop` — is what flushes pending state
+    // to disk. `FsStore::Drop` also flushes, so a naive "shutdown, drop,
+    // reopen" test passes even if `shutdown()` is a no-op. Using
+    // `std::mem::forget` to skip `Drop` isolates the flush-on-shutdown
+    // contract.
+    let payload: &[u8] = b"persisted via shutdown, not drop";
     let (server, hash) = serve_blob(payload).await;
 
     let tmp = tempfile::tempdir()?;
@@ -177,8 +183,9 @@ async fn shutdown_and_reopen_preserves_cached_blob() -> anyhow::Result<()> {
         let engine = CacheEngine::open(tmp.path(), Some(origin), 16).await?;
         let _ = engine.get(hash).await?;
         engine.shutdown().await?;
+        // Skip Drop so this test fails if shutdown() stopped flushing.
+        std::mem::forget(engine);
     }
-    // Kill the origin so the reopened engine *must* serve from local state.
     drop(server);
 
     let engine = CacheEngine::open(tmp.path(), None, 16).await?;
@@ -190,6 +197,104 @@ async fn shutdown_and_reopen_preserves_cached_blob() -> anyhow::Result<()> {
     anyhow::ensure!(
         &got[..] == payload,
         "reopened engine should serve the cached payload without an origin"
+    );
+    Ok(())
+}
+
+/// Bind an ephemeral TCP port and serve exactly one request with a
+/// chunked-encoded body whose total size is `payload_bytes`. No
+/// `Content-Length` is sent, so reqwest can't trip the HTTP origin's
+/// fast-path rejection — the mid-stream running-total check is the only
+/// line of defense.
+async fn spawn_chunked_oversize_server(
+    payload_bytes: usize,
+) -> anyhow::Result<std::net::SocketAddr> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        let Ok((mut sock, _)) = listener.accept().await else {
+            return;
+        };
+        // Drain request headers — we only need to know when the client is
+        // done speaking before we start responding.
+        let mut buf = [0u8; 4096];
+        loop {
+            match sock.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    let seen = buf.get(..n).unwrap_or(&[]);
+                    if seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+            }
+        }
+        let header = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\n\r\n";
+        if sock.write_all(header).await.is_err() {
+            return;
+        }
+        let chunk_size = 64 * 1024;
+        let pad = vec![0xEEu8; chunk_size];
+        let mut remaining = payload_bytes;
+        while remaining > 0 {
+            let send = remaining.min(chunk_size);
+            let hdr = format!("{send:x}\r\n");
+            if sock.write_all(hdr.as_bytes()).await.is_err() {
+                return;
+            }
+            let chunk = pad.get(..send).unwrap_or(&[]);
+            if sock.write_all(chunk).await.is_err() {
+                return;
+            }
+            if sock.write_all(b"\r\n").await.is_err() {
+                return;
+            }
+            remaining -= send;
+        }
+        let _ = sock.write_all(b"0\r\n\r\n").await;
+    });
+    Ok(addr)
+}
+
+#[tokio::test]
+async fn mid_stream_overrun_is_rejected_by_http_origin() -> anyhow::Result<()> {
+    // 2 MiB chunked body, 1 MiB cap, no Content-Length → only the
+    // streaming running-total check can catch this.
+    let payload_bytes = 2 * 1024 * 1024;
+    let addr = spawn_chunked_oversize_server(payload_bytes).await?;
+    let origin_url = format!("http://{addr}/");
+
+    let tmp = tempfile::tempdir()?;
+    let origin = Arc::new(HttpOrigin::parse(&origin_url)?);
+    let engine = CacheEngine::open(tmp.path(), Some(origin), 1).await?;
+
+    // Any hash works — the raw TCP server doesn't match paths.
+    let err = err_of(engine.get(Hash::new(b"doesn't matter")).await)?;
+    let msg = format!("{err:#}");
+    anyhow::ensure!(
+        matches!(err, CacheError::OriginError { .. }),
+        "expected OriginError from mid-stream cap, got: {err:?}"
+    );
+    anyhow::ensure!(
+        msg.contains("mid-stream"),
+        "error message missing mid-stream marker: {msg}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn open_on_file_path_yields_store_error() -> anyhow::Result<()> {
+    // `CacheEngine::open` calls `create_dir_all`; pointing at an existing
+    // regular file means that fails, which must surface as
+    // `CacheError::Store` (the only variant reserved for store I/O issues).
+    let tmp = tempfile::NamedTempFile::new()?;
+    let err = CacheEngine::open(tmp.path(), None, 16)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("expected open to fail on a file path"))?;
+    anyhow::ensure!(
+        matches!(err, CacheError::Store(_)),
+        "expected Store variant, got: {err:?}"
     );
     Ok(())
 }

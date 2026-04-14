@@ -120,8 +120,11 @@ impl CacheEngine {
     /// Coarse stats for gossip / observability. MVP returns zeros; the
     /// method exists so callers don't have to change once real accounting
     /// lands (it'll read `self.inner` at that point).
+    // `&self` is intentional — the signature is load-bearing across the
+    // eventual accounting implementation, and keeping it spares callers a
+    // churn commit. The `allow` is narrowly scoped to this method.
+    #[allow(clippy::unused_self)]
     pub const fn stats(&self) -> CacheStats {
-        let _ = self;
         CacheStats {
             bytes_stored: 0,
             blob_count: 0,

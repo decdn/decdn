@@ -16,9 +16,4 @@ pub mod origin;
 pub use engine::{CacheEngine, CacheStats};
 pub use error::{CacheError, CacheResult};
 pub use iroh_blobs::Hash;
-pub use origin::{HttpOrigin, Origin, OriginFetch, parse_origin_url};
-
-/// Parsed and validated origin base URL. Re-exported so callers don't need a
-/// direct dependency on `reqwest` (or its underlying `url` crate) for a type
-/// that only travels through config resolution and engine wiring.
-pub type OriginUrl = reqwest::Url;
+pub use origin::{HttpOrigin, Origin, OriginFetch, OriginUrl, parse_origin_url};

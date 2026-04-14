@@ -11,7 +11,7 @@ use std::pin::Pin;
 use bytes::Bytes;
 use iroh_blobs::Hash;
 
-pub use http::{HttpOrigin, parse_origin_url};
+pub use http::{HttpOrigin, OriginUrl, parse_origin_url};
 
 /// Result of an [`Origin::fetch`] call.
 #[derive(Debug)]

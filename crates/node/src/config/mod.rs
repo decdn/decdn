@@ -819,7 +819,10 @@ mod tests {
         let url = resolved
             .origin_url
             .ok_or_else(|| anyhow::anyhow!("origin_url missing"))?;
-        anyhow::ensure!(url.as_str() == "https://cli-wins.example/", "got: {url}");
+        anyhow::ensure!(
+            url.as_url().as_str() == "https://cli-wins.example/",
+            "got: {url}"
+        );
         Ok(())
     }
 }

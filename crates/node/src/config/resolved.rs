@@ -50,8 +50,11 @@ pub struct ResolvedCache {
     /// Maximum single blob size in megabytes.
     pub max_blob_size_mb: u64,
     /// Optional HTTP origin base URL for pull-through on cache misses.
-    /// Parsed and scheme-validated at resolution time so invalid URLs fail
-    /// config loading rather than engine construction.
+    /// Parsed, scheme-validated, and path-normalized at resolution time via
+    /// [`decdn_cache::parse_origin_url`] so invalid URLs fail config
+    /// loading. Constructing an [`decdn_cache::OriginUrl`] outside the
+    /// parser is impossible — the invariants (http/https scheme,
+    /// trailing-slash path, no query/fragment) are type-enforced.
     pub origin_url: Option<decdn_cache::OriginUrl>,
 }
 
