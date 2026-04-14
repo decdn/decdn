@@ -2,7 +2,8 @@
 //!
 //! Separating validation from the subscriber loop keeps the rules unit-testable
 //! and makes the rejection-reason taxonomy explicit. Each `AnnounceReject`
-//! variant maps one-to-one to a stable metric label via [`Self::label`].
+//! variant maps one-to-one to a stable metric label via
+//! [`AnnounceReject::label`].
 
 use std::collections::HashSet;
 
