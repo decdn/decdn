@@ -269,7 +269,7 @@ fn load_file_config(explicit_path: Option<&Path>) -> anyhow::Result<FileConfig> 
     Ok(config)
 }
 
-/// Expand `${VAR}` and leading `~` in every string and path field on
+/// Expand `${VAR}` and a leading `~` in every string and path field on
 /// [`FileConfig`]. Missing env vars produce a contextual error naming the
 /// offending field. Enables a single TOML template to be reused across
 /// container/Kubernetes deployments (see GitHub issue #223).
@@ -279,6 +279,12 @@ fn load_file_config(explicit_path: Option<&Path>) -> anyhow::Result<FileConfig> 
 /// passwords, query parameters, contract addresses), and eager expansion
 /// would turn those into spurious "undefined env var" errors. Operators
 /// wanting substitution must use the explicit `${VAR}` form.
+///
+/// The substitution has **no escape semantics** — backslashes pass through
+/// verbatim. This matters on Windows, where values like
+/// `C:\Users\${USER}\data` must still have `${USER}` expanded; a shell-style
+/// escape interpreter would treat `\$` as a literal `$` and skip the
+/// expansion.
 fn expand_env(cfg: &mut FileConfig) -> anyhow::Result<()> {
     if let Some(i) = cfg.identity.as_mut() {
         expand_path(&mut i.data_dir, "identity.data_dir")?;
@@ -328,14 +334,8 @@ fn expand_value(raw: &str, ctx: &'static str) -> anyhow::Result<String> {
     if !needs_expansion(raw) {
         return Ok(raw.to_string());
     }
-    shellexpand::full(raw)
-        .map(std::borrow::Cow::into_owned)
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "config field `{ctx}` references undefined env var `{}`",
-                e.var_name
-            )
-        })
+    let tilde_expanded = expand_tilde_prefix(raw);
+    expand_braces(&tilde_expanded, ctx)
 }
 
 /// Returns true if `raw` contains an expansion marker (`${` or leading `~`).
@@ -343,6 +343,50 @@ fn expand_value(raw: &str, ctx: &'static str) -> anyhow::Result<String> {
 /// literal (see [`expand_env`] for rationale).
 fn needs_expansion(raw: &str) -> bool {
     raw.contains("${") || raw.starts_with('~')
+}
+
+/// Replace a leading `~` or `~/` with the user's home directory. Other
+/// occurrences of `~` (e.g. in the middle of a string) are left alone. Bare
+/// `~` with no home dir available passes through unchanged.
+fn expand_tilde_prefix(raw: &str) -> String {
+    if raw == "~" {
+        return match dirs::home_dir() {
+            Some(h) => h.to_string_lossy().into_owned(),
+            None => raw.to_string(),
+        };
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            let mut out = home.to_string_lossy().into_owned();
+            out.push('/');
+            out.push_str(rest);
+            return out;
+        }
+    }
+    raw.to_string()
+}
+
+/// Substitute `${VAR}` sequences with the corresponding env var value. No
+/// escape semantics — backslashes, single `$`, and any other character pass
+/// through verbatim. This is important for Windows paths like
+/// `C:\Users\${USER}\data`, where a shell-style escape interpreter would
+/// swallow the `\` before `$` and disable the substitution.
+fn expand_braces(raw: &str, ctx: &'static str) -> anyhow::Result<String> {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some((before, after)) = rest.split_once("${") {
+        out.push_str(before);
+        let (name, tail) = after.split_once('}').ok_or_else(|| {
+            anyhow::anyhow!("config field `{ctx}` has unterminated `${{` sequence")
+        })?;
+        let value = std::env::var(name).map_err(|_| {
+            anyhow::anyhow!("config field `{ctx}` references undefined env var `{name}`")
+        })?;
+        out.push_str(&value);
+        rest = tail;
+    }
+    out.push_str(rest);
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -454,6 +498,48 @@ mod tests {
             .and_then(|b| b.rpc_url.as_deref())
             .ok_or_else(|| anyhow::anyhow!("rpc_url missing"))?;
         anyhow::ensure!(url == raw, "got: {url}");
+        Ok(())
+    }
+
+    // Regression for PR #226: Windows-style paths with backslashes must keep
+    // their backslashes and still expand `${VAR}` — shell-style escape
+    // interpreters would swallow `\` before `$` and disable expansion.
+    #[test]
+    fn expand_env_handles_backslash_before_brace() -> anyhow::Result<()> {
+        let home = home_str()?;
+        let mut cfg = FileConfig {
+            cache: Some(types::CacheConfig {
+                cache_dir: Some(PathBuf::from(r"C:\data\${HOME}\cache")),
+                cache_size_mb: None,
+                max_blob_size_mb: None,
+            }),
+            ..Default::default()
+        };
+        expand_env(&mut cfg)?;
+        let dir = cfg
+            .cache
+            .as_ref()
+            .and_then(|c| c.cache_dir.as_deref())
+            .ok_or_else(|| anyhow::anyhow!("cache_dir missing"))?
+            .to_path_buf();
+        let expected = PathBuf::from(format!(r"C:\data\{home}\cache"));
+        anyhow::ensure!(dir == expected, "got: {}", dir.display());
+        Ok(())
+    }
+
+    // Unterminated `${` should surface a clear error rather than silently
+    // consume the rest of the string.
+    #[test]
+    fn expand_env_errors_on_unterminated_brace() -> anyhow::Result<()> {
+        let mut cfg = cfg_with_rpc("https://${HOST/api");
+        let err = expand_env(&mut cfg)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected error"))?
+            .to_string();
+        anyhow::ensure!(
+            err.contains("blockchain.rpc_url") && err.contains("unterminated"),
+            "got: {err}"
+        );
         Ok(())
     }
 
