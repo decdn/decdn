@@ -12,11 +12,19 @@ use serde::{Deserialize, Serialize};
 
 /// Top-level protocol enum for `cdn/probe/v1`. Variant order is frozen per
 /// ADR 013 — new variants MUST be appended at the end.
+///
+/// ⚠️ **VARIANT ORDER FROZEN — ADR 013 §Protocol Enums**
+/// Postcard encodes each variant as its declaration-order index. Reordering,
+/// inserting, or removing a variant is a wire-breaking change requiring an
+/// ALPN version bump (`cdn/probe/v2`). The discriminant assignments are
+/// locked in by the tests `probe_message_request_discriminant_is_zero` and
+/// `probe_message_response_discriminant_is_one` — if you change this enum,
+/// those tests will fail and tell you why.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProbeMessage {
-    /// discriminant 0
+    /// discriminant 0 — asserted by `probe_message_request_discriminant_is_zero`
     Request(ProbeRequest),
-    /// discriminant 1
+    /// discriminant 1 — asserted by `probe_message_response_discriminant_is_one`
     Response(ProbeResponse),
 }
 

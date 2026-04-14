@@ -10,11 +10,13 @@ use std::sync::Arc;
 use decdn_node::handlers::{Handler, probe::ProbeHandler};
 use decdn_node::metrics::Metrics;
 use decdn_protocol::{
-    ALPN_PROBE, ProbeMessage, decode_message, encode_message,
+    ALPN_PROBE, MAX_MESSAGE_SIZE, ProbeMessage, decode_message, encode_message,
     message::{ProbeRequest, ProbeResponse},
     read_frame, write_frame,
 };
+use iroh::endpoint::{Connection, ReadError, ReadToEndError, VarInt};
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
+use tokio::task::JoinHandle;
 
 /// Build an endpoint bound to 127.0.0.1 with relays disabled and no discovery.
 /// Returns the endpoint plus its local socket address.
@@ -119,4 +121,150 @@ async fn probe_roundtrip() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("accept task join: {e}"))??;
     server_ep.close().await;
     Ok(())
+}
+
+/// Spin up a probe server and return the client's connected [`Connection`]
+/// plus the background accept task and endpoints. The accept task is expected
+/// to return `Err` once the server handler rejects the client's input — that
+/// is the signal the correct app error code was emitted.
+struct Harness {
+    client_conn: Connection,
+    accept_task: JoinHandle<anyhow::Result<()>>,
+    client_ep: Endpoint,
+    server_ep: Endpoint,
+}
+
+async fn spin_up_probe_harness() -> anyhow::Result<Harness> {
+    let server_sk = SecretKey::generate(&mut rand::rng());
+    let server_id = server_sk.public();
+    let metrics = Arc::new(Metrics::new());
+    let handler: Arc<dyn Handler> = Arc::new(ProbeHandler::new(server_id, 1, metrics));
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_PROBE.to_vec()]).await?;
+
+    let server_ep_bg = server_ep.clone();
+    let accept_task = tokio::spawn(async move {
+        let incoming = server_ep_bg
+            .accept()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("no incoming connection"))?;
+        let connecting = incoming
+            .accept()
+            .map_err(|e| anyhow::anyhow!("accept: {e}"))?;
+        let conn = connecting
+            .await
+            .map_err(|e| anyhow::anyhow!("handshake: {e}"))?;
+        handler.handle(conn).await
+    });
+
+    let (client_ep, _) = local_endpoint(SecretKey::generate(&mut rand::rng()), vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    let client_conn = client_ep
+        .connect(target, ALPN_PROBE)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+
+    Ok(Harness {
+        client_conn,
+        accept_task,
+        client_ep,
+        server_ep,
+    })
+}
+
+/// Expect `recv.read_to_end` to fail with a stream reset carrying `expected_code`.
+async fn assert_stream_reset_with_code(
+    recv: &mut iroh::endpoint::RecvStream,
+    expected_code: u32,
+) -> anyhow::Result<()> {
+    match recv.read_to_end(4096).await {
+        Err(ReadToEndError::Read(ReadError::Reset(code))) => {
+            assert_eq!(code, VarInt::from_u32(expected_code));
+            Ok(())
+        }
+        other => anyhow::bail!("expected stream Reset({expected_code:#x}), got {other:?}"),
+    }
+}
+
+async fn tear_down(h: Harness) -> anyhow::Result<()> {
+    h.client_conn.close(0u32.into(), b"bye");
+    h.client_ep.close().await;
+    // Handler is expected to return Err on these error-path tests; we only
+    // need to confirm the task joined, not that it succeeded.
+    let _ = h.accept_task.await;
+    h.server_ep.close().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_oversized_frame_returns_too_large_code() -> anyhow::Result<()> {
+    let h = spin_up_probe_harness().await?;
+    let (mut send, mut recv) = h
+        .client_conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+
+    // Write a varint length-prefix that exceeds MAX_MESSAGE_SIZE with no payload.
+    let mut bogus = Vec::new();
+    let mut v = MAX_MESSAGE_SIZE + 1;
+    loop {
+        let byte = (v & 0x7F) as u8;
+        v >>= 7;
+        if v == 0 {
+            bogus.push(byte);
+            break;
+        }
+        bogus.push(byte | 0x80);
+    }
+    send.write_all(&bogus)
+        .await
+        .map_err(|e| anyhow::anyhow!("write: {e}"))?;
+    send.finish().map_err(|e| anyhow::anyhow!("finish: {e}"))?;
+
+    assert_stream_reset_with_code(&mut recv, 0x02).await?;
+    tear_down(h).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_garbage_postcard_returns_malformed_code() -> anyhow::Result<()> {
+    let h = spin_up_probe_harness().await?;
+    let (mut send, mut recv) = h
+        .client_conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+
+    // Valid length-prefixed frame, but payload has unknown ProbeMessage discriminant.
+    write_frame(&mut send, &[99u8, 0])
+        .await
+        .map_err(|e| anyhow::anyhow!("write: {e}"))?;
+    send.finish().map_err(|e| anyhow::anyhow!("finish: {e}"))?;
+
+    assert_stream_reset_with_code(&mut recv, 0x03).await?;
+    tear_down(h).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_response_on_server_stream_returns_unsupported_code() -> anyhow::Result<()> {
+    let h = spin_up_probe_harness().await?;
+    let (mut send, mut recv) = h
+        .client_conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+
+    // Well-formed frame, but the wrong variant (server expects Request).
+    let payload = encode_message(&ProbeMessage::Response(ProbeResponse {
+        nonce: 0,
+        measured_at_unix_ms: 0,
+        node_id: [0u8; 32],
+        rate_per_mb: 0,
+    }))?;
+    write_frame(&mut send, &payload)
+        .await
+        .map_err(|e| anyhow::anyhow!("write: {e}"))?;
+    send.finish().map_err(|e| anyhow::anyhow!("finish: {e}"))?;
+
+    assert_stream_reset_with_code(&mut recv, 0x01).await?;
+    tear_down(h).await
 }

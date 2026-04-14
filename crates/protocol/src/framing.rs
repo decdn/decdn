@@ -94,6 +94,9 @@ async fn read_varint_u32<R: AsyncRead + Unpin>(r: &mut R) -> Result<u32, FrameEr
 }
 
 async fn write_varint_u32<W: AsyncWrite + Unpin>(w: &mut W, mut value: u32) -> std::io::Result<()> {
+    // u32 encodes to at most 5 varint bytes (ceil(32/7) = 5). The `buf.get_mut`
+    // + `buf.get(..idx)` guards exist only to satisfy the `indexing_slicing`
+    // clippy lint — they are unreachable given this bound, so assert it.
     let mut buf = [0u8; 5];
     let mut idx = 0usize;
     loop {
@@ -111,6 +114,7 @@ async fn write_varint_u32<W: AsyncWrite + Unpin>(w: &mut W, mut value: u32) -> s
         }
         idx += 1;
     }
+    debug_assert!(idx <= 5, "u32 varint must fit in 5 bytes, idx={idx}");
     w.write_all(buf.get(..idx).unwrap_or(&[])).await
 }
 
@@ -234,6 +238,58 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         write_frame(&mut buf, &[]).await?;
         assert_eq!(buf, vec![0u8]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn decode_message_rejects_garbage() {
+        use crate::ProbeMessage;
+        // Discriminant 99 has no matching `ProbeMessage` variant → Decode error.
+        let garbage = [99u8, 0, 0, 0];
+        let r = decode_message::<ProbeMessage>(&garbage);
+        assert!(
+            matches!(r, Err(FrameError::Decode(_))),
+            "expected FrameError::Decode"
+        );
+    }
+
+    #[tokio::test]
+    async fn varint_eof_mid_stream() {
+        // Continuation bit set, no further bytes. `read_exact` surfaces this as
+        // `UnexpectedEof` → `FrameError::Io`, not `FrameError::Varint` — pinning
+        // the classification so a future refactor can't silently change it.
+        let bytes = [0x80u8];
+        let mut cursor = std::io::Cursor::new(bytes);
+        let r = read_varint_u32(&mut cursor).await;
+        assert!(
+            matches!(&r, Err(FrameError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof),
+            "expected Io(UnexpectedEof), got {r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_message_full_stack_roundtrip() -> Result<(), FrameError> {
+        use crate::ProbeMessage;
+        use crate::message::{ProbeRequest, ProbeResponse};
+
+        let req = ProbeMessage::Request(ProbeRequest { nonce: 0xfeed_face });
+        let resp = ProbeMessage::Response(ProbeResponse {
+            nonce: 0xfeed_face,
+            measured_at_unix_ms: 1_700_000_000_000,
+            node_id: [3u8; 32],
+            rate_per_mb: 7,
+        });
+
+        for msg in [req, resp] {
+            let payload = encode_message(&msg)?;
+            let mut buf = Vec::new();
+            write_frame(&mut buf, &payload).await?;
+            let mut cursor = std::io::Cursor::new(buf);
+            let frame = read_frame(&mut cursor).await?;
+            let (decoded, tail) = decode_message::<ProbeMessage>(&frame)?;
+            assert_eq!(decoded, msg);
+            assert!(tail.is_empty(), "no extension bytes expected");
+        }
         Ok(())
     }
 }
