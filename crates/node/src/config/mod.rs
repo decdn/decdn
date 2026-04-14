@@ -113,7 +113,7 @@ fn resolve_network(
 ///
 /// Requires `0x` prefix, 40 hex characters, and a correct EIP-55 checksum.
 /// Returns the canonical checksummed form.
-pub(crate) fn parse_contract_address(flag_name: &str, raw: &str) -> anyhow::Result<String> {
+pub fn parse_contract_address(flag_name: &str, raw: &str) -> anyhow::Result<String> {
     let trimmed = raw.trim();
     let addr = Address::parse_checksummed(trimmed, None).map_err(|e| {
         anyhow::anyhow!(
