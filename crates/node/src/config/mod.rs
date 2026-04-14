@@ -14,8 +14,8 @@ use crate::cli::common::{self, expand_tilde};
 use crate::cli::run::RunArgs;
 
 pub use resolved::{
-    ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedIdentity, ResolvedNetwork,
-    ResolvedObservability, ResolvedPayment,
+    ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedGossip, ResolvedIdentity,
+    ResolvedNetwork, ResolvedObservability, ResolvedPayment,
 };
 pub use types::FileConfig;
 
@@ -29,6 +29,10 @@ const DEFAULT_MAX_BLOB_SIZE_MB: u64 = 10_240;
 const DEFAULT_RATE_PER_MB: u64 = 10;
 /// Default Prometheus metrics port.
 const DEFAULT_METRICS_PORT: u16 = 9090;
+/// Default interval between outgoing `NodeAnnounce` messages (ADR 001).
+const DEFAULT_ANNOUNCE_INTERVAL_SEC: u64 = 60;
+/// Default peer-table entry TTL after which a stale entry is evicted.
+const DEFAULT_PEER_TTL_SEC: u64 = 600;
 
 /// Load config from file (if present) and merge with CLI args.
 ///
@@ -54,6 +58,7 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
     let cache = resolve_cache(&cli.cache, file.cache.as_ref(), &identity.data_dir);
     let payment = resolve_payment(&cli.payment, file.payment.as_ref());
     let observability = resolve_observability(&cli.observability, file.observability.as_ref());
+    let gossip = resolve_gossip(file.gossip.as_ref())?;
 
     Ok(ResolvedConfig {
         identity,
@@ -62,6 +67,7 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
         cache,
         payment,
         observability,
+        gossip,
     })
 }
 
@@ -263,6 +269,70 @@ fn resolve_observability(
         log_format,
         metrics_port,
         otlp_endpoint,
+    }
+}
+
+/// Resolve gossip fields. Allowlist entries are parsed as 64-char lowercase
+/// hex node IDs; bad entries fail loudly at startup rather than silently
+/// degrading to accept-all mode later.
+fn resolve_gossip(file: Option<&types::GossipConfig>) -> anyhow::Result<ResolvedGossip> {
+    let announce_interval_sec = file
+        .and_then(|g| g.announce_interval_sec)
+        .unwrap_or(DEFAULT_ANNOUNCE_INTERVAL_SEC);
+    anyhow::ensure!(
+        announce_interval_sec > 0,
+        "gossip.announce_interval_sec must be > 0"
+    );
+
+    let peer_ttl_sec = file
+        .and_then(|g| g.peer_ttl_sec)
+        .unwrap_or(DEFAULT_PEER_TTL_SEC);
+    anyhow::ensure!(peer_ttl_sec > 0, "gossip.peer_ttl_sec must be > 0");
+
+    let subscribe_global = file.and_then(|g| g.subscribe_global).unwrap_or(true);
+
+    let allowlist = file
+        .and_then(|g| g.allowlist.as_ref())
+        .map(|v| v.iter().map(|s| parse_node_id_hex(s)).collect())
+        .transpose()?
+        .unwrap_or_default();
+
+    Ok(ResolvedGossip {
+        announce_interval_sec,
+        peer_ttl_sec,
+        subscribe_global,
+        allowlist,
+    })
+}
+
+/// Parse a 64-character lowercase-hex node ID into 32 raw bytes.
+fn parse_node_id_hex(s: &str) -> anyhow::Result<[u8; 32]> {
+    anyhow::ensure!(
+        s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()),
+        "gossip.allowlist entry must be 64 hex chars, got {s:?}"
+    );
+    let mut out = [0u8; 32];
+    let bytes = s.as_bytes();
+    for (i, slot) in out.iter_mut().enumerate() {
+        let hi = bytes
+            .get(i * 2)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
+        let lo = bytes
+            .get(i * 2 + 1)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
+        *slot = (hex_val(hi)? << 4) | hex_val(lo)?;
+    }
+    Ok(out)
+}
+
+fn hex_val(b: u8) -> anyhow::Result<u8> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => anyhow::bail!("invalid hex digit: {}", b as char),
     }
 }
 

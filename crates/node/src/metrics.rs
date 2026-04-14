@@ -37,6 +37,14 @@ pub struct DecdnMetrics {
     pub active_connections: Gauge,
     /// Seconds since node start.
     pub uptime_seconds: Gauge,
+    /// `NodeAnnounce` messages published to any gossip topic.
+    pub gossip_announces_published_total: Counter,
+    /// `NodeAnnounce`-bearing gossip envelopes received on any topic.
+    pub gossip_announces_received_total: Counter,
+    /// Incoming gossip envelopes rejected by validation (any reason).
+    pub gossip_announces_rejected_total: Counter,
+    /// Current peer-table size.
+    pub gossip_peer_table_size: Gauge,
 }
 
 /// Aggregated deCDN node metrics.
@@ -97,6 +105,22 @@ impl Metrics {
 
     pub fn connection_closed(&self) {
         self.decdn.active_connections.dec();
+    }
+
+    pub fn gossip_published(&self, _topic: &str) {
+        self.decdn.gossip_announces_published_total.inc();
+    }
+
+    pub fn gossip_received(&self, _topic: &str) {
+        self.decdn.gossip_announces_received_total.inc();
+    }
+
+    pub fn gossip_rejected(&self, _reason: &'static str) {
+        self.decdn.gossip_announces_rejected_total.inc();
+    }
+
+    pub fn gossip_peer_table_size(&self, n: i64) {
+        self.decdn.gossip_peer_table_size.set(n);
     }
 
     /// RAII guard that increments `active_connections` on construction and

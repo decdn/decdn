@@ -7,7 +7,7 @@
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 
-use decdn_node::handlers::{Handler, probe::ProbeHandler};
+use decdn_node::handlers::probe::ProbeHandler;
 use decdn_node::metrics::Metrics;
 use decdn_protocol::{
     ALPN_PROBE, MAX_MESSAGE_SIZE, ProbeMessage, decode_message, encode_message,
@@ -17,6 +17,7 @@ use decdn_protocol::{
 use iroh::endpoint::{
     ApplicationClose, Connection, ConnectionError, ReadError, ReadToEndError, VarInt,
 };
+use iroh::protocol::ProtocolHandler;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
 use tokio::task::JoinHandle;
 
@@ -57,7 +58,7 @@ async fn probe_roundtrip() -> anyhow::Result<()> {
     let server_sk = SecretKey::generate(&mut rand::rng());
     let server_id = server_sk.public();
     let metrics = Arc::new(Metrics::new());
-    let handler: Arc<dyn Handler> = Arc::new(ProbeHandler::new(
+    let handler = Arc::new(ProbeHandler::new(
         server_id,
         rate_per_mb,
         Arc::clone(&metrics),
@@ -74,7 +75,10 @@ async fn probe_roundtrip() -> anyhow::Result<()> {
             let conn = connecting
                 .await
                 .map_err(|e| anyhow::anyhow!("handshake: {e}"))?;
-            handler.handle(conn).await?;
+            handler
+                .accept(conn)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
         }
         Ok::<_, anyhow::Error>(())
     });
@@ -140,7 +144,7 @@ async fn spin_up_probe_harness() -> anyhow::Result<Harness> {
     let server_sk = SecretKey::generate(&mut rand::rng());
     let server_id = server_sk.public();
     let metrics = Arc::new(Metrics::new());
-    let handler: Arc<dyn Handler> = Arc::new(ProbeHandler::new(server_id, 1, metrics));
+    let handler = Arc::new(ProbeHandler::new(server_id, 1, metrics));
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_PROBE.to_vec()]).await?;
 
     let server_ep_bg = server_ep.clone();
@@ -155,7 +159,10 @@ async fn spin_up_probe_harness() -> anyhow::Result<Harness> {
         let conn = connecting
             .await
             .map_err(|e| anyhow::anyhow!("handshake: {e}"))?;
-        handler.handle(conn).await
+        handler
+            .accept(conn)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
     });
 
     let (client_ep, _) = local_endpoint(SecretKey::generate(&mut rand::rng()), vec![]).await?;

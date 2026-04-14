@@ -4,10 +4,15 @@
 //! and defines the shared vocabulary used by all other deCDN crates.
 
 pub mod framing;
+pub mod gossip;
 pub mod message;
 
 pub use framing::{
     FrameError, MAX_MESSAGE_SIZE, decode_message, encode_message, read_frame, write_frame,
+};
+pub use gossip::{
+    GOSSIP_VERSION, GossipEnvelope, GossipPayload, LoadHint, NodeAnnounce, NodeAnnounceBody,
+    POPULAR_HASHES_MAX, SIGNATURE_LEN,
 };
 pub use message::ProbeMessage;
 

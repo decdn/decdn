@@ -1,6 +1,5 @@
 //! `cdn/probe/v1` handler — unauthenticated latency + rate probe.
 
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -10,8 +9,8 @@ use decdn_protocol::{
 };
 use iroh::PublicKey;
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
+use iroh::protocol::{AcceptError, ProtocolHandler};
 
-use super::Handler;
 use crate::metrics::Metrics;
 
 /// Ceiling on how long we wait for the client to open the bi-directional
@@ -40,6 +39,8 @@ pub struct ProbeHandler {
 }
 
 impl ProbeHandler {
+    pub const ALPN: &'static [u8] = ALPN_PROBE;
+
     #[allow(clippy::missing_const_for_fn)] // Arc::new isn't const.
     pub fn new(node_id: PublicKey, rate_per_mb: u64, metrics: Arc<Metrics>) -> Self {
         Self {
@@ -49,7 +50,9 @@ impl ProbeHandler {
         }
     }
 
-    async fn serve(self: Arc<Self>, conn: Connection) -> anyhow::Result<()> {
+    async fn serve(&self, conn: Connection) -> anyhow::Result<()> {
+        let _guard = self.metrics.connection_guard();
+
         let (mut send, mut recv) = tokio::time::timeout(ACCEPT_BI_TIMEOUT, conn.accept_bi())
             .await
             .map_err(|_| anyhow::anyhow!("accept_bi timed out after {ACCEPT_BI_TIMEOUT:?}"))?
@@ -97,6 +100,14 @@ impl ProbeHandler {
         let _ = tokio::time::timeout(PROBE_CLOSE_TIMEOUT, conn.closed()).await;
         conn.close(0u32.into(), b"probe-done");
         Ok(())
+    }
+}
+
+impl ProtocolHandler for ProbeHandler {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        self.serve(connection)
+            .await
+            .map_err(|e| AcceptError::from_err(std::io::Error::other(e.to_string())))
     }
 }
 
@@ -184,18 +195,5 @@ async fn read_probe_request(
                 app_code: APP_ERR_UNSUPPORTED_MESSAGE,
             })
         }
-    }
-}
-
-impl Handler for ProbeHandler {
-    fn alpn(&self) -> &'static [u8] {
-        ALPN_PROBE
-    }
-
-    fn handle(
-        self: Arc<Self>,
-        conn: Connection,
-    ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>> {
-        Box::pin(self.serve(conn))
     }
 }
