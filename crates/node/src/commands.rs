@@ -141,8 +141,9 @@ pub async fn probe(args: &cli::ProbeArgs) -> anyhow::Result<()> {
     use std::time::{Duration, Instant};
 
     use decdn_protocol::{
-        ALPN_PROBE,
+        ALPN_PROBE, ProbeMessage, decode_message, encode_message,
         message::{ProbeRequest, ProbeResponse},
+        read_frame, write_frame,
     };
     use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl, SecretKey};
     use rand::RngCore;
@@ -200,20 +201,25 @@ pub async fn probe(args: &cli::ProbeArgs) -> anyhow::Result<()> {
             .await
             .map_err(|e| anyhow::anyhow!("open_bi failed: {e}"))?;
 
-        let bytes = postcard::to_allocvec(&ProbeRequest { nonce })
+        let payload = encode_message(&ProbeMessage::Request(ProbeRequest { nonce }))
             .map_err(|e| anyhow::anyhow!("encode request: {e}"))?;
-        send.write_all(&bytes)
+        write_frame(&mut send, &payload)
             .await
             .map_err(|e| anyhow::anyhow!("write request: {e}"))?;
         send.finish()
             .map_err(|e| anyhow::anyhow!("finish stream: {e}"))?;
 
-        let resp_bytes = recv
-            .read_to_end(4096)
+        let frame = read_frame(&mut recv)
             .await
             .map_err(|e| anyhow::anyhow!("read response: {e}"))?;
-        let resp: ProbeResponse = postcard::from_bytes(&resp_bytes)
+        let (msg, _rest) = decode_message::<ProbeMessage>(&frame)
             .map_err(|e| anyhow::anyhow!("decode response: {e}"))?;
+        let resp: ProbeResponse = match msg {
+            ProbeMessage::Response(r) => r,
+            ProbeMessage::Request(_) => {
+                anyhow::bail!("unexpected ProbeMessage::Request from server");
+            }
+        };
 
         conn.close(0u32.into(), b"probe-done");
         Ok::<_, anyhow::Error>(resp)

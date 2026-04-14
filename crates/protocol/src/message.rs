@@ -1,14 +1,24 @@
 //! Wire message payload types for deCDN ALPN protocols.
 //!
-//! This module defines the postcard-serializable request/response payloads used
-//! by deCDN protocols. It does not itself define or implement stream framing.
+//! Every ALPN defines a top-level enum (e.g. [`ProbeMessage`]) whose variants
+//! wrap the per-message structs. The enum is serialized as the outermost
+//! postcard value inside a length-prefixed frame (see [`crate::framing`]).
 //!
-//! ADR 013 specifies varint-length-prefixed framing plus top-level protocol
-//! enums for all ALPNs; that framing is not yet implemented. Current handlers
-//! read a single message per stream delimited by QUIC FIN. Implementing the
-//! ADR 013 framing + enum wrappers is tracked as a follow-up.
+//! Signed-field freezing (ADR 013 §Signed Field Freezing): `ProbeResponse` is
+//! currently unsigned; when it gains a signature, its signed fields will be
+//! split into a frozen `ProbeResponseBody` per ADR 013.
 
 use serde::{Deserialize, Serialize};
+
+/// Top-level protocol enum for `cdn/probe/v1`. Variant order is frozen per
+/// ADR 013 — new variants MUST be appended at the end.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProbeMessage {
+    /// discriminant 0
+    Request(ProbeRequest),
+    /// discriminant 1
+    Response(ProbeResponse),
+}
 
 /// Client → node request on `cdn/probe/v1`.
 ///
@@ -61,5 +71,38 @@ mod tests {
         let decoded: ProbeResponse = postcard::from_bytes(&bytes)?;
         assert_eq!(resp, decoded);
         Ok(())
+    }
+
+    #[test]
+    fn probe_message_request_discriminant_is_zero() -> Result<(), postcard::Error> {
+        let msg = ProbeMessage::Request(ProbeRequest { nonce: 1 });
+        let bytes = postcard::to_allocvec(&msg)?;
+        assert_eq!(bytes.first().copied(), Some(0u8));
+        let decoded: ProbeMessage = postcard::from_bytes(&bytes)?;
+        assert_eq!(decoded, msg);
+        Ok(())
+    }
+
+    #[test]
+    fn probe_message_response_discriminant_is_one() -> Result<(), postcard::Error> {
+        let resp = ProbeResponse {
+            nonce: 9,
+            measured_at_unix_ms: 1,
+            node_id: [0u8; 32],
+            rate_per_mb: 2,
+        };
+        let msg = ProbeMessage::Response(resp);
+        let bytes = postcard::to_allocvec(&msg)?;
+        assert_eq!(bytes.first().copied(), Some(1u8));
+        let decoded: ProbeMessage = postcard::from_bytes(&bytes)?;
+        assert_eq!(decoded, msg);
+        Ok(())
+    }
+
+    #[test]
+    fn probe_message_rejects_unknown_discriminant() {
+        let bytes = [99u8, 0, 0, 0, 0];
+        let r: Result<ProbeMessage, _> = postcard::from_bytes(&bytes);
+        assert!(r.is_err());
     }
 }

@@ -10,8 +10,9 @@ use std::sync::Arc;
 use decdn_node::handlers::{Handler, probe::ProbeHandler};
 use decdn_node::metrics::Metrics;
 use decdn_protocol::{
-    ALPN_PROBE,
+    ALPN_PROBE, ProbeMessage, decode_message, encode_message,
     message::{ProbeRequest, ProbeResponse},
+    read_frame, write_frame,
 };
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
 
@@ -89,17 +90,20 @@ async fn probe_roundtrip() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
 
     let req = ProbeRequest { nonce: 0x00c0_ffee };
-    let bytes = postcard::to_allocvec(&req)?;
-    send.write_all(&bytes)
+    let payload = encode_message(&ProbeMessage::Request(req))?;
+    write_frame(&mut send, &payload)
         .await
         .map_err(|e| anyhow::anyhow!("write: {e}"))?;
     send.finish().map_err(|e| anyhow::anyhow!("finish: {e}"))?;
 
-    let resp_bytes = recv
-        .read_to_end(4096)
+    let frame = read_frame(&mut recv)
         .await
         .map_err(|e| anyhow::anyhow!("read: {e}"))?;
-    let resp: ProbeResponse = postcard::from_bytes(&resp_bytes)?;
+    let (msg, _rest) = decode_message::<ProbeMessage>(&frame)?;
+    let resp: ProbeResponse = match msg {
+        ProbeMessage::Response(r) => r,
+        ProbeMessage::Request(_) => anyhow::bail!("unexpected request variant on client"),
+    };
 
     assert_eq!(resp.nonce, req.nonce);
     assert_eq!(resp.rate_per_mb, rate_per_mb);

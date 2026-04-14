@@ -5,30 +5,33 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use decdn_protocol::{
-    ALPN_PROBE,
-    message::{ProbeRequest, ProbeResponse},
+    ALPN_PROBE, FrameError, ProbeMessage, decode_message, encode_message, message::ProbeResponse,
+    read_frame, write_frame,
 };
-use iroh::{PublicKey, endpoint::Connection};
+use iroh::PublicKey;
+use iroh::endpoint::{Connection, VarInt};
 
 use super::Handler;
 use crate::metrics::Metrics;
 
-const MAX_REQUEST_BYTES: usize = 64;
 /// Ceiling on how long we wait for the client to open the bi-directional
 /// stream. Without it a peer can sit on an accepted connection without ever
 /// opening a stream.
 const ACCEPT_BI_TIMEOUT: Duration = Duration::from_secs(5);
-/// Ceiling on how long we wait for the client to send the `ProbeRequest` and
-/// FIN the stream. Without it a peer can pin a server task indefinitely by
-/// opening a stream and never closing it.
+/// Ceiling on how long we wait for the client to send the framed request.
+/// Without it a peer can pin a server task indefinitely.
 const PROBE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// Ceiling on how long we wait for the client to close the connection after
-/// receiving the response. Bounds the `active_connections` gauge against idle
-/// clients that hold the connection open. A well-behaved client closes in
-/// well under a round trip; 3s is plenty and keeps the `DoS` ceiling tight.
+/// receiving the response.
 const PROBE_CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Serves `cdn/probe/v1`: reads a [`ProbeRequest`], writes a [`ProbeResponse`].
+// QUIC application error codes defined by ADR 013 §Application Error Codes.
+const APP_ERR_UNSUPPORTED_MESSAGE: u32 = 0x01;
+const APP_ERR_MESSAGE_TOO_LARGE: u32 = 0x02;
+const APP_ERR_MALFORMED_MESSAGE: u32 = 0x03;
+
+/// Serves `cdn/probe/v1`: reads a framed [`ProbeMessage::Request`], writes a
+/// framed [`ProbeMessage::Response`].
 #[derive(Debug)]
 pub struct ProbeHandler {
     node_id: PublicKey,
@@ -52,13 +55,40 @@ impl ProbeHandler {
             .map_err(|_| anyhow::anyhow!("accept_bi timed out after {ACCEPT_BI_TIMEOUT:?}"))?
             .map_err(|e| anyhow::anyhow!("accept_bi failed: {e}"))?;
 
-        let buf = tokio::time::timeout(PROBE_READ_TIMEOUT, recv.read_to_end(MAX_REQUEST_BYTES))
-            .await
-            .map_err(|_| anyhow::anyhow!("probe request timed out after {PROBE_READ_TIMEOUT:?}"))?
-            .map_err(|e| anyhow::anyhow!("probe request read failed: {e}"))?;
-
-        let req: ProbeRequest =
-            postcard::from_bytes(&buf).map_err(|e| anyhow::anyhow!("probe decode failed: {e}"))?;
+        let frame_result = tokio::time::timeout(PROBE_READ_TIMEOUT, read_frame(&mut recv)).await;
+        let req = match frame_result {
+            Err(_) => {
+                let code = VarInt::from_u32(APP_ERR_MALFORMED_MESSAGE);
+                let _ = send.reset(code);
+                let _ = recv.stop(code);
+                return Err(anyhow::anyhow!(
+                    "probe request timed out after {PROBE_READ_TIMEOUT:?}"
+                ));
+            }
+            Ok(Err(e)) => {
+                let code = VarInt::from_u32(frame_err_code(&e));
+                let _ = send.reset(code);
+                let _ = recv.stop(code);
+                return Err(anyhow::anyhow!("probe frame read failed: {e}"));
+            }
+            Ok(Ok(frame)) => match decode_message::<ProbeMessage>(&frame) {
+                Err(e) => {
+                    let code = VarInt::from_u32(APP_ERR_MALFORMED_MESSAGE);
+                    let _ = send.reset(code);
+                    let _ = recv.stop(code);
+                    return Err(anyhow::anyhow!("probe decode failed: {e}"));
+                }
+                Ok((ProbeMessage::Request(req), _rest)) => req,
+                Ok((ProbeMessage::Response(_), _)) => {
+                    let code = VarInt::from_u32(APP_ERR_UNSUPPORTED_MESSAGE);
+                    let _ = send.reset(code);
+                    let _ = recv.stop(code);
+                    return Err(anyhow::anyhow!(
+                        "unexpected ProbeMessage::Response on server stream"
+                    ));
+                }
+            },
+        };
 
         let measured_at_unix_ms = u64::try_from(
             SystemTime::now()
@@ -75,10 +105,9 @@ impl ProbeHandler {
             rate_per_mb: self.rate_per_mb,
         };
 
-        let bytes = postcard::to_allocvec(&resp)
+        let payload = encode_message(&ProbeMessage::Response(resp))
             .map_err(|e| anyhow::anyhow!("probe encode failed: {e}"))?;
-
-        send.write_all(&bytes)
+        write_frame(&mut send, &payload)
             .await
             .map_err(|e| anyhow::anyhow!("probe response write failed: {e}"))?;
         send.finish()
@@ -91,6 +120,13 @@ impl ProbeHandler {
         let _ = tokio::time::timeout(PROBE_CLOSE_TIMEOUT, conn.closed()).await;
         conn.close(0u32.into(), b"probe-done");
         Ok(())
+    }
+}
+
+const fn frame_err_code(e: &FrameError) -> u32 {
+    match e {
+        FrameError::TooLarge(_) => APP_ERR_MESSAGE_TOO_LARGE,
+        _ => APP_ERR_MALFORMED_MESSAGE,
     }
 }
 
