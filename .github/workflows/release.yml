@@ -23,6 +23,8 @@ permissions:
 
 concurrency:
   group: release
+  # cancel-in-progress: false — tag push / docker push / release-asset upload
+  # are not idempotent; cancelling mid-flight can leave the release half-published.
   cancel-in-progress: false
 
 env:

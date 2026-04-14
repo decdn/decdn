@@ -1,8 +1,11 @@
 name: PR title
 
 on:
+  # pull_request_target is safe here: this action only reads PR title/metadata
+  # (no PR code checkout) and runs with `pull-requests: read`. `synchronize`
+  # is omitted — the title doesn't change on push.
   pull_request_target:
-    types: [opened, edited, synchronize, reopened]
+    types: [opened, edited, reopened]
 
 permissions:
   pull-requests: read
