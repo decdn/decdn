@@ -17,7 +17,7 @@ use iroh::Endpoint;
 use iroh_metrics::{Counter, Gauge, MetricsGroup, MetricsSource, Registry};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, oneshot};
 
 /// Cap concurrent `/metrics` connections. Prevents a trivial `DoS` where a
 /// peer opens many sockets to the operational-data endpoint and exhausts
@@ -99,6 +99,13 @@ impl Metrics {
         self.decdn.active_connections.dec();
     }
 
+    /// RAII guard that increments `active_connections` on construction and
+    /// decrements it on drop, so the gauge stays correct even if the handler
+    /// future is cancelled between open and close.
+    pub fn connection_guard(&self) -> ConnectionGuard<'_> {
+        ConnectionGuard::new(self)
+    }
+
     fn encode(&self) -> anyhow::Result<String> {
         let uptime = i64::try_from(self.started_at.elapsed().as_secs()).unwrap_or(i64::MAX);
         self.decdn.uptime_seconds.set(uptime);
@@ -112,23 +119,46 @@ impl Metrics {
     }
 }
 
-/// Serve `/metrics` over HTTP on `addr` until the listener errors.
-#[allow(clippy::cognitive_complexity)] // Accept+permit+spawn reads linearly.
-pub async fn serve(addr: SocketAddr, metrics: Arc<Metrics>) -> anyhow::Result<()> {
+/// Bind the `/metrics` HTTP listener synchronously so startup can fail fast
+/// if the port is unavailable. The returned listener is consumed by [`serve`].
+///
+/// # Errors
+///
+/// Returns an error if the `TcpListener::bind` call fails (port in use,
+/// permissions, etc.).
+pub async fn bind(addr: SocketAddr) -> anyhow::Result<TcpListener> {
     let listener = TcpListener::bind(addr)
         .await
         .map_err(|e| anyhow::anyhow!("metrics bind {addr} failed: {e}"))?;
     tracing::info!(%addr, "metrics server listening");
+    Ok(listener)
+}
 
+/// Serve `/metrics` over HTTP on the pre-bound `listener` until `shutdown`
+/// fires. The shutdown receiver is consumed; send `()` to stop the accept
+/// loop (in-flight connection tasks finish on their own).
+#[allow(clippy::cognitive_complexity)] // Accept+permit+spawn reads linearly.
+pub async fn serve(
+    listener: TcpListener,
+    metrics: Arc<Metrics>,
+    mut shutdown: oneshot::Receiver<()>,
+) -> anyhow::Result<()> {
     let limiter = Arc::new(Semaphore::new(MAX_METRICS_CONNECTIONS));
 
     loop {
-        let (stream, peer) = match listener.accept().await {
-            Ok(pair) => pair,
-            Err(err) => {
-                tracing::warn!(%err, "metrics accept failed");
-                continue;
+        let (stream, peer) = tokio::select! {
+            biased;
+            _ = &mut shutdown => {
+                tracing::debug!("metrics server shutdown signal received");
+                return Ok(());
             }
+            res = listener.accept() => match res {
+                Ok(pair) => pair,
+                Err(err) => {
+                    tracing::warn!(%err, "metrics accept failed");
+                    continue;
+                }
+            },
         };
 
         let Ok(permit) = Arc::clone(&limiter).try_acquire_owned() else {
@@ -187,5 +217,28 @@ fn handle(
                 .body(Full::new(Bytes::from_static(b"encode error\n")))
                 .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()))))
         }
+    }
+}
+
+/// RAII guard for the `active_connections` gauge.
+///
+/// Increments the gauge on construction, decrements on drop — so the count
+/// stays correct even if the handler future is cancelled (e.g. during
+/// shutdown) between open and close.
+#[derive(Debug)]
+pub struct ConnectionGuard<'a> {
+    metrics: &'a Metrics,
+}
+
+impl<'a> ConnectionGuard<'a> {
+    fn new(metrics: &'a Metrics) -> Self {
+        metrics.connection_opened();
+        Self { metrics }
+    }
+}
+
+impl Drop for ConnectionGuard<'_> {
+    fn drop(&mut self) {
+        self.metrics.connection_closed();
     }
 }

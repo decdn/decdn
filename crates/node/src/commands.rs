@@ -247,9 +247,21 @@ fn print_probe_response(
     json: bool,
 ) {
     // Format as the canonical iroh node-id string (z-base-32 via PublicKey's
-    // Display impl) — matches what the server logs on startup.
-    let node_id = iroh::PublicKey::from_bytes(&resp.node_id)
-        .map_or_else(|_| "<invalid node id>".to_string(), |pk| pk.to_string());
+    // Display impl) — matches what the server logs on startup. Fall back to
+    // raw hex if the key fails to parse; the fallback stays alphanumeric so
+    // downstream `--json` consumers never see non-conforming output.
+    let node_id = iroh::PublicKey::from_bytes(&resp.node_id).map_or_else(
+        |_| {
+            use std::fmt::Write as _;
+            let mut s = String::with_capacity(2 + 64);
+            s.push_str("0x");
+            for b in resp.node_id {
+                let _ = write!(s, "{b:02x}");
+            }
+            s
+        },
+        |pk| pk.to_string(),
+    );
     if json {
         println!(
             "{{\"node_id\":\"{node_id}\",\"rate_per_mb\":{},\"measured_at_unix_ms\":{},\"rtt_ms\":{:.3},\"nonce\":\"0x{nonce:016x}\"}}",

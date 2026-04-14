@@ -4,13 +4,21 @@ pub mod dispatch;
 pub mod endpoint;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
+use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 
 use crate::config::ResolvedConfig;
 use crate::handlers::{Handler, probe::ProbeHandler};
 use crate::{identity, metrics};
+
+/// Ceiling on how long we wait for spawned tasks to drain after the endpoint
+/// and metrics server have been signalled to stop. Sized comfortably larger
+/// than `HANDSHAKE_TIMEOUT` (5s) + `PROBE_CLOSE_TIMEOUT` (3s) so handlers
+/// finish naturally; `abort_all` only fires as a safety net.
+const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(15);
 
 /// Build the endpoint, register handlers, spawn the metrics server, and run
 /// until a shutdown signal (SIGINT / SIGTERM) is received.
@@ -36,17 +44,25 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
         .register_iroh_endpoint(&ep)
         .context("failed to register iroh metrics")?;
 
-    let mut tasks = JoinSet::new();
-
     // Bind metrics to loopback by default: /metrics is an unauthenticated HTTP
     // endpoint that leaks operational data. Operators who want to scrape from
     // another host should front it with a reverse proxy or run node_exporter
     // alongside. ADR 020 leaves the bind address operator-configurable; exposing
     // that as a CLI flag is tracked as a follow-up.
+    //
+    // Bind *synchronously* so a port-in-use or permissions failure aborts
+    // startup via `?` rather than silently leaving the node without /metrics.
     let metrics_addr = std::net::SocketAddr::from(([127, 0, 0, 1], cfg.metrics_port));
+    let metrics_listener = metrics::bind(metrics_addr)
+        .await
+        .context("failed to bind metrics listener")?;
+
+    let mut tasks = JoinSet::new();
+    let (metrics_stop_tx, metrics_stop_rx) = oneshot::channel::<()>();
+
     let metrics_handle = Arc::clone(&metrics);
     tasks.spawn(async move {
-        if let Err(err) = metrics::serve(metrics_addr, metrics_handle).await {
+        if let Err(err) = metrics::serve(metrics_listener, metrics_handle, metrics_stop_rx).await {
             tracing::error!(%err, "metrics server exited with error");
         }
     });
@@ -66,9 +82,25 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
     shutdown_signal().await;
     tracing::info!("shutdown signal received; closing endpoint");
 
+    // Stop accepting new work. `ep.close()` delivers CONNECTION_CLOSE to each
+    // active peer; the dispatch task's accept loop then falls through and its
+    // internal JoinSet drain waits on per-connection handlers to finish
+    // (bounded by their own timeouts). The oneshot unblocks the metrics
+    // accept loop.
     ep.close().await;
-    tasks.abort_all();
-    while tasks.join_next().await.is_some() {}
+    let _ = metrics_stop_tx.send(());
+
+    let drain = async { while tasks.join_next().await.is_some() {} };
+    if tokio::time::timeout(SHUTDOWN_DEADLINE, drain).await.is_ok() {
+        tracing::info!("graceful shutdown complete");
+    } else {
+        tracing::warn!(
+            deadline = ?SHUTDOWN_DEADLINE,
+            "graceful shutdown timed out; aborting remaining tasks",
+        );
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+    }
 
     tracing::info!("node stopped");
     Ok(())
