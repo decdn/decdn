@@ -90,7 +90,11 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
     ep.close().await;
     let _ = metrics_stop_tx.send(());
 
-    let drain = async { while tasks.join_next().await.is_some() {} };
+    let drain = async {
+        while let Some(result) = tasks.join_next().await {
+            log_join_result(result, "shutdown");
+        }
+    };
     if tokio::time::timeout(SHUTDOWN_DEADLINE, drain).await.is_ok() {
         tracing::info!("graceful shutdown complete");
     } else {
@@ -99,11 +103,26 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
             "graceful shutdown timed out; aborting remaining tasks",
         );
         tasks.abort_all();
-        while tasks.join_next().await.is_some() {}
+        while let Some(result) = tasks.join_next().await {
+            log_join_result(result, "abort");
+        }
     }
 
     tracing::info!("node stopped");
     Ok(())
+}
+
+/// Log a `JoinError` from a shutdown-drained task with a phase label so a
+/// panicked or cancelled spawned task (dispatch, metrics) is visible rather
+/// than silently swallowed.
+fn log_join_result(result: Result<(), tokio::task::JoinError>, phase: &'static str) {
+    if let Err(err) = result {
+        if err.is_cancelled() {
+            tracing::debug!(phase, "task cancelled during shutdown");
+        } else {
+            tracing::warn!(phase, %err, "task failed during shutdown");
+        }
+    }
 }
 
 /// Wait for either SIGINT or (on Unix) SIGTERM.

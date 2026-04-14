@@ -136,7 +136,15 @@ pub async fn bind(addr: SocketAddr) -> anyhow::Result<TcpListener> {
 
 /// Serve `/metrics` over HTTP on the pre-bound `listener` until `shutdown`
 /// fires. The shutdown receiver is consumed; send `()` to stop the accept
-/// loop (in-flight connection tasks finish on their own).
+/// loop.
+///
+/// Per-connection tasks are spawned with `tokio::spawn` and **detached** —
+/// they are not tracked or awaited during shutdown. In practice scrapes
+/// complete in milliseconds, and dropping an in-flight `/metrics` response
+/// is harmless (the scraper will retry on its next interval). This is a
+/// deliberate choice: tracking an unbounded `JoinSet` alongside the accept
+/// loop would add complexity without a consumer that cares about the
+/// guarantee.
 #[allow(clippy::cognitive_complexity)] // Accept+permit+spawn reads linearly.
 pub async fn serve(
     listener: TcpListener,
