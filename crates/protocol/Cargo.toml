@@ -10,6 +10,7 @@ description = "Wire protocol types and ALPN definitions for deCDN"
 serde = { workspace = true }
 postcard = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 
 [lints]
 workspace = true
