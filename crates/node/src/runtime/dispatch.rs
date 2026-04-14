@@ -81,8 +81,6 @@ async fn handle_one(
         .map_err(|_| anyhow::anyhow!("handshake timed out after {HANDSHAKE_TIMEOUT:?}"))?
         .map_err(|e| anyhow::anyhow!("connection handshake failed: {e}"))?;
 
-    metrics.connection_opened();
-    let result = handler.handle(conn).await;
-    metrics.connection_closed();
-    result
+    let _guard = metrics.connection_guard();
+    handler.handle(conn).await
 }

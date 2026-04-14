@@ -7,22 +7,13 @@
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 
+use decdn_node::handlers::{Handler, probe::ProbeHandler};
+use decdn_node::metrics::Metrics;
 use decdn_protocol::{
     ALPN_PROBE,
     message::{ProbeRequest, ProbeResponse},
 };
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
-
-#[allow(dead_code)] // Test only exercises a subset; full trait/metrics surface is used by the binary.
-#[path = "../src/handlers/mod.rs"]
-mod handlers;
-
-#[allow(dead_code)]
-#[path = "../src/metrics.rs"]
-mod metrics;
-
-use handlers::{Handler, probe::ProbeHandler};
-use metrics::Metrics;
 
 /// Build an endpoint bound to 127.0.0.1 with relays disabled and no discovery.
 /// Returns the endpoint plus its local socket address.

@@ -24,10 +24,12 @@ const ACCEPT_BI_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// Ceiling on how long we wait for the client to close the connection after
 /// receiving the response. Bounds the `active_connections` gauge against idle
-/// clients that hold the connection open.
-const PROBE_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
+/// clients that hold the connection open. A well-behaved client closes in
+/// well under a round trip; 3s is plenty and keeps the `DoS` ceiling tight.
+const PROBE_CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Serves `cdn/probe/v1`: reads a [`ProbeRequest`], writes a [`ProbeResponse`].
+#[derive(Debug)]
 pub struct ProbeHandler {
     node_id: PublicKey,
     rate_per_mb: u64,
