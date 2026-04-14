@@ -14,6 +14,10 @@ use super::Handler;
 use crate::metrics::Metrics;
 
 const MAX_REQUEST_BYTES: usize = 64;
+/// Ceiling on how long we wait for the client to open the bi-directional
+/// stream. Without it a peer can sit on an accepted connection without ever
+/// opening a stream.
+const ACCEPT_BI_TIMEOUT: Duration = Duration::from_secs(5);
 /// Ceiling on how long we wait for the client to send the `ProbeRequest` and
 /// FIN the stream. Without it a peer can pin a server task indefinitely by
 /// opening a stream and never closing it.
@@ -41,9 +45,9 @@ impl ProbeHandler {
     }
 
     async fn serve(self: Arc<Self>, conn: Connection) -> anyhow::Result<()> {
-        let (mut send, mut recv) = conn
-            .accept_bi()
+        let (mut send, mut recv) = tokio::time::timeout(ACCEPT_BI_TIMEOUT, conn.accept_bi())
             .await
+            .map_err(|_| anyhow::anyhow!("accept_bi timed out after {ACCEPT_BI_TIMEOUT:?}"))?
             .map_err(|e| anyhow::anyhow!("accept_bi failed: {e}"))?;
 
         let buf = tokio::time::timeout(PROBE_READ_TIMEOUT, recv.read_to_end(MAX_REQUEST_BYTES))

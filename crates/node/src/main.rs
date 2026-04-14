@@ -176,15 +176,14 @@ async fn cmd_probe(args: &cli::ProbeArgs) -> anyhow::Result<()> {
         None => None,
     };
 
-    let (relay_mode, bind_addr) = match relay_url.clone() {
-        Some(url) => (
-            RelayMode::Custom(RelayMap::from_iter([url])),
-            std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0),
-        ),
-        None => (
-            RelayMode::Disabled,
-            std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0),
-        ),
+    // Bind to an unspecified IPv4 address in both cases. Loopback-only binding
+    // prevents the probe client from reaching a non-loopback `--addr`, which
+    // is the whole point of the subcommand. `0.0.0.0:0` lets the OS pick an
+    // ephemeral port on any interface; we're a client, nothing listens here.
+    let bind_addr = std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0);
+    let relay_mode = match relay_url.clone() {
+        Some(url) => RelayMode::Custom(RelayMap::from_iter([url])),
+        None => RelayMode::Disabled,
     };
 
     let client_sk = SecretKey::generate(&mut rand::rng());
@@ -266,35 +265,22 @@ fn print_probe_response(
     nonce: u64,
     json: bool,
 ) {
-    let node_id_hex = hex_lower(&resp.node_id);
+    // Format as the canonical iroh node-id string (z-base-32 via PublicKey's
+    // Display impl) — matches what the server logs on startup.
+    let node_id = iroh::PublicKey::from_bytes(&resp.node_id)
+        .map_or_else(|_| "<invalid node id>".to_string(), |pk| pk.to_string());
     if json {
         println!(
-            "{{\"node_id\":\"{node_id_hex}\",\"rate_per_mb\":{},\"measured_at_unix_ms\":{},\"rtt_ms\":{:.3},\"nonce\":\"0x{nonce:016x}\"}}",
+            "{{\"node_id\":\"{node_id}\",\"rate_per_mb\":{},\"measured_at_unix_ms\":{},\"rtt_ms\":{:.3},\"nonce\":\"0x{nonce:016x}\"}}",
             resp.rate_per_mb, resp.measured_at_unix_ms, rtt_ms,
         );
     } else {
-        println!("node_id:       {node_id_hex}");
+        println!("node_id:       {node_id}");
         println!("rate_per_mb:   {} (base units)", resp.rate_per_mb);
         println!("measured_at:   {} (unix ms)", resp.measured_at_unix_ms);
         println!("rtt:           {rtt_ms:.3} ms");
         println!("nonce:         0x{nonce:016x} (echoed ok)");
     }
-}
-
-/// Lowercase hex encoding of a 32-byte array.
-fn hex_lower(bytes: &[u8; 32]) -> String {
-    const fn nibble(n: u8) -> char {
-        match n {
-            0..=9 => (b'0' + n) as char,
-            _ => (b'a' + n - 10) as char,
-        }
-    }
-    let mut out = String::with_capacity(64);
-    for b in bytes {
-        out.push(nibble(b >> 4));
-        out.push(nibble(b & 0x0f));
-    }
-    out
 }
 
 /// Write a default TOML configuration file.

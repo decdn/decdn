@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProbeRequest {
     /// Client-chosen nonce echoed back in the response. Lets clients correlate
-    /// concurrent probes and measure one-way latency against their own clock.
+    /// concurrent probes and match responses to the originating request.
     pub nonce: u64,
 }
 
@@ -30,7 +30,9 @@ pub struct ProbeResponse {
     pub measured_at_unix_ms: u64,
     /// The responding node's ed25519 public key (iroh `NodeId`), 32 bytes.
     pub node_id: [u8; 32],
-    /// The node's current quoted rate in the smallest USDC unit per MB.
+    /// The node's current quoted rate in token base units per MB. The specific
+    /// token is a deployment concern (see ADR 010) — the protocol itself does
+    /// not normalize units across tokens.
     pub rate_per_mb: u64,
 }
 

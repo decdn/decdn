@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow};
 use iroh::SecretKey;
+use rand::RngCore;
 
 const KEY_FILE_NAME: &str = "node.secret";
 const KEY_LEN: usize = 32;
@@ -66,15 +67,27 @@ fn write_atomic(path: &Path, bytes: &[u8; KEY_LEN]) -> anyhow::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("key path {} has no parent directory", path.display()))?;
+    // Unique temp name per writer: pid + 8 random hex chars. Avoids the race
+    // where two concurrent writers clobber each other's temp file. The rename
+    // step is still atomic on Unix, so only one final `path` will exist.
+    let suffix = {
+        let mut s = [0u8; 4];
+        rand::rng().fill_bytes(&mut s);
+        format!(
+            "{:08x}{:02x}{:02x}{:02x}{:02x}",
+            std::process::id(),
+            s[0],
+            s[1],
+            s[2],
+            s[3],
+        )
+    };
     let tmp = parent.join(format!(
-        "{}.tmp",
+        "{}.tmp.{suffix}",
         path.file_name()
             .and_then(|s| s.to_str())
-            .unwrap_or(KEY_FILE_NAME)
+            .unwrap_or(KEY_FILE_NAME),
     ));
-
-    // Best-effort cleanup of a leftover temp from a prior crashed run. Absent is fine.
-    let _ = fs::remove_file(&tmp);
 
     #[cfg(unix)]
     {

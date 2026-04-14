@@ -11,6 +11,12 @@ use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use prometheus::{Encoder, IntCounter, IntGauge, Registry, TextEncoder};
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
+
+/// Cap concurrent `/metrics` connections. Prevents a trivial `DoS` where a
+/// peer opens many sockets to the operational-data endpoint and exhausts
+/// tasks.
+const MAX_METRICS_CONNECTIONS: usize = 32;
 
 /// Aggregated deCDN node metrics.
 pub struct Metrics {
@@ -92,22 +98,37 @@ impl Metrics {
 }
 
 /// Serve `/metrics` over HTTP on `addr` until the listener errors.
+#[allow(clippy::cognitive_complexity)] // Accept+permit+spawn reads linearly.
 pub async fn serve(addr: SocketAddr, metrics: Arc<Metrics>) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr)
         .await
         .map_err(|e| anyhow::anyhow!("metrics bind {addr} failed: {e}"))?;
     tracing::info!(%addr, "metrics server listening");
 
+    let limiter = Arc::new(Semaphore::new(MAX_METRICS_CONNECTIONS));
+
     loop {
-        let (stream, _) = match listener.accept().await {
+        let (stream, peer) = match listener.accept().await {
             Ok(pair) => pair,
             Err(err) => {
                 tracing::warn!(%err, "metrics accept failed");
                 continue;
             }
         };
+
+        let Ok(permit) = Arc::clone(&limiter).try_acquire_owned() else {
+            tracing::warn!(
+                %peer,
+                limit = MAX_METRICS_CONNECTIONS,
+                "metrics connection rejected: at capacity",
+            );
+            drop(stream);
+            continue;
+        };
+
         let metrics = Arc::clone(&metrics);
         tokio::spawn(async move {
+            let _permit = permit; // released when task finishes
             let io = TokioIo::new(stream);
             let svc = service_fn(move |req| {
                 let metrics = Arc::clone(&metrics);
