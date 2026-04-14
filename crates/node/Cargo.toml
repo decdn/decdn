@@ -24,7 +24,7 @@ decdn-protocol = { workspace = true }
 decdn-cache = { workspace = true }
 decdn-incentive = { workspace = true }
 decdn-reputation = { workspace = true }
-alloy = { workspace = true }
+alloy-primitives = { workspace = true }
 iroh = { workspace = true }
 iroh-blobs = { workspace = true }
 iroh-gossip = { workspace = true }

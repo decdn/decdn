@@ -67,8 +67,8 @@ fn resolve_blockchain_names_correct_field_for_bad_address() -> anyhow::Result<()
         payment_channel_address: Some(GOOD.to_string()),
         staking_registry_address: Some("0xNOTHEX".to_string()),
     };
-    let data_dir = std::path::Path::new("/tmp");
-    let Err(err) = resolve_blockchain(&cli, None, data_dir) else {
+    let data_dir = std::env::temp_dir();
+    let Err(err) = resolve_blockchain(&cli, None, &data_dir) else {
         anyhow::bail!("expected resolve_blockchain to fail on bad staking address");
     };
     let msg = format!("{err:#}");
