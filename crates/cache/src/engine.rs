@@ -182,8 +182,8 @@ impl CacheEngine {
         // completion and yields the tagged info; we discard the tag because
         // a lifecycle policy isn't in scope for the MVP.
         //
-        // TODO: once iroh-blobs exposes a verified-insert API that accepts
-        // an expected hash, we can drop the explicit `Hash::new(&bytes)`
+        // TODO(#233): once iroh-blobs exposes a verified-insert API that
+        // accepts an expected hash, drop the explicit `Hash::new(&bytes)`
         // above and pay BLAKE3 only once instead of twice on the happy path.
         if let Err(err) = self.inner.store.blobs().add_bytes(bytes.clone()).await {
             // Verified bytes failed to land in the store: distinct from a
