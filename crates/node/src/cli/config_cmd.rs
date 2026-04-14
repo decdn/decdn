@@ -9,7 +9,6 @@ use super::run::RunArgs;
 /// Manage `decdn` configuration files.
 #[derive(Args, Debug)]
 pub struct ConfigArgs {
-    /// Subcommand to execute.
     #[command(subcommand)]
     pub command: ConfigCommand,
 }
@@ -20,6 +19,9 @@ pub enum ConfigCommand {
     /// Write a default configuration file.
     Init(ConfigInitArgs),
     /// Validate a configuration file without starting the node.
+    //
+    // Boxed to keep the enum variant size close to `Init`'s — `ConfigValidateArgs`
+    // flattens the large `RunArgs` struct. Mirrors `Command::Run(Box<RunArgs>)`.
     Validate(Box<ConfigValidateArgs>),
 }
 
