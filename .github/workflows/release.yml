@@ -49,6 +49,8 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
         with:

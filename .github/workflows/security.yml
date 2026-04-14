@@ -38,7 +38,10 @@ jobs:
           severity: CRITICAL,HIGH
           ignore-unfixed: true
 
+      # Fork PRs don't receive `security-events: write` on GITHUB_TOKEN,
+      # so the upload would fail for external contributors.
       - name: Upload SARIF to GitHub Security
+        if: github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: trivy-fs.sarif
@@ -64,7 +67,22 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Skip gracefully if no :latest image has been published yet
+      # (pre-first-release, or tags cleaned up).
+      - name: Check image exists
+        id: image
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}:latest
+        run: |
+          if docker manifest inspect "$IMAGE" > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Image $IMAGE not found; skipping scan."
+          fi
+
       - name: Run Trivy image scan
+        if: steps.image.outputs.exists == 'true'
         uses: aquasecurity/trivy-action@v0.35.0
         with:
           image-ref: ghcr.io/${{ github.repository }}:latest
@@ -74,6 +92,7 @@ jobs:
           ignore-unfixed: true
 
       - name: Upload SARIF to GitHub Security
+        if: steps.image.outputs.exists == 'true'
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: trivy-image.sarif
