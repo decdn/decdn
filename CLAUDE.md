@@ -4,11 +4,22 @@
 
 Decentralized CDN (deCDN) — nodes cache and serve content-addressed blobs over iroh QUIC, clients pay per-MB via off-chain USDC payment channels. Rust implementation targeting a PoC of tens of nodes on an Arbitrum Sepolia testnet.
 
-**Status: Early implementation.** Cargo workspace with 5 crates is scaffolded (stub `lib.rs` files, `node` has initial CLI/config). ADRs in `adr/` remain the primary design artifacts.
+**Status: Early implementation.** Cargo workspace with 5 crates. `node` has CLI, config, runtime bring-up, and a probe handler; `protocol` has varint framing and the `ProbeMessage` enum (ADR 013). `cache`, `incentive`, `reputation` are still stubs. ADRs in `adr/` remain the primary design artifacts.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for build commands, ADR conventions, pre-commit hooks, and development environment setup.
 
-**ADR note:** Next ADR number is 025. File naming: `NNN-topic.md` (zero-padded 3-digit prefix).
+**ADR note:** Next ADR number is 025. File naming: `NNN-topic.md` (zero-padded 3-digit prefix). Always verify by checking `adr/` for the highest number before creating a new ADR.
+
+## Common Commands
+
+```bash
+cargo build && cargo clippy          # build + lint (clippy is the usual CI failure)
+cargo nextest run                    # test (preferred over cargo test)
+cargo nextest run -p decdn-protocol  # single crate
+cargo fmt -- --check                 # check formatting
+cargo deny check                     # license + advisory audit
+pre-commit run --all-files           # run all hooks
+```
 
 ## Architecture
 
@@ -18,7 +29,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for build commands, ADR conventions, pre-
 
 **Anti-panic policy:** Clippy denies `unwrap_used`, `expect_used`, `panic`, and `indexing_slicing` workspace-wide. Use `Result`/`Option` combinators or `.get()` for indexing. This is the most common CI failure for new code.
 
-### Crate Structure (planned)
+### Crate Structure
 
 ```
 crates/

@@ -3,6 +3,14 @@
 //! This is the leaf crate in the dependency graph — it has minimal dependencies
 //! and defines the shared vocabulary used by all other deCDN crates.
 
+pub mod framing;
+pub mod message;
+
+pub use framing::{
+    FrameError, MAX_MESSAGE_SIZE, decode_message, encode_message, read_frame, write_frame,
+};
+pub use message::ProbeMessage;
+
 /// ALPN protocol identifier for latency and availability probing.
 pub const ALPN_PROBE: &[u8] = b"cdn/probe/v1";
 

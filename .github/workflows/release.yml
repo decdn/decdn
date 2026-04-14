@@ -21,6 +21,12 @@ permissions:
   contents: write
   packages: write
 
+concurrency:
+  group: release
+  # cancel-in-progress: false — tag push / docker push / release-asset upload
+  # are not idempotent; cancelling mid-flight can leave the release half-published.
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
   REGISTRY: ghcr.io
@@ -45,11 +51,30 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release
 
       - name: Install tools
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-release,git-cliff
+          tool: cargo-release,git-cliff,cargo-nextest
+
+      - name: Pre-release verification
+        run: |
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo nextest run --workspace --no-tests=pass
+
+      # Semver-checks on patch/minor. Skipped for major since breaking changes are expected.
+      - name: cargo semver-checks
+        if: inputs.level != 'major'
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          feature-group: default-features
 
       # inputs.level is a constrained choice enum (patch/minor/major), not free-text
       - name: Validate release (dry run)
@@ -230,6 +255,7 @@ jobs:
             type=raw,value=latest
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -240,3 +266,19 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: decdn-${{ needs.release.outputs.version }}-sbom.spdx.json
+          upload-release-assets: false
+          upload-artifact: false
+
+      - name: Upload SBOM to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.release.outputs.tag }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: gh release upload "$TAG" "decdn-${VERSION}-sbom.spdx.json"

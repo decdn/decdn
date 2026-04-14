@@ -3,11 +3,13 @@
 pub mod common;
 pub mod config_cmd;
 pub mod key_gen;
+pub mod probe;
 pub mod run;
 
 pub use common::{LogFormat, default_config_path, default_data_dir};
 pub use config_cmd::ConfigInitArgs;
 pub use key_gen::KeyGenArgs;
+pub use probe::ProbeArgs;
 pub use run::RunArgs;
 
 use std::path::PathBuf;
@@ -37,4 +39,6 @@ pub enum Command {
     /// Initialize a default configuration file.
     #[command(name = "config")]
     Config(ConfigInitArgs),
+    /// Probe a running node over the `cdn/probe/v1` ALPN.
+    Probe(ProbeArgs),
 }
