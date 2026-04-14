@@ -16,7 +16,7 @@ use crate::{identity, metrics};
 /// until a shutdown signal (SIGINT / SIGTERM) is received.
 #[allow(clippy::cognitive_complexity)] // Startup wiring reads top-to-bottom; splitting hurts clarity.
 pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
-    let metrics = Arc::new(metrics::Metrics::new()?);
+    let metrics = Arc::new(metrics::Metrics::new());
     metrics.started();
 
     let secret_key = identity::load_or_generate(&cfg.data_dir)?;
@@ -31,6 +31,10 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
     let ep = endpoint::build(&secret_key, cfg.bind_port, &handlers)
         .await
         .context("failed to build iroh endpoint")?;
+
+    metrics
+        .register_iroh_endpoint(&ep)
+        .context("failed to register iroh metrics")?;
 
     let mut tasks = JoinSet::new();
 

@@ -1,7 +1,11 @@
-//! Prometheus metrics and a minimal `/metrics` HTTP server.
+//! OpenMetrics/Prometheus metrics and a minimal `/metrics` HTTP server.
+//!
+//! Metrics live in an [`iroh_metrics::Registry`] so we can surface both our
+//! `decdn_*` counters and iroh's own transport metrics through a single
+//! endpoint. Output is `OpenMetrics` text, which Prometheus scrapers accept.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -9,7 +13,9 @@ use http_body_util::Full;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use prometheus::{Encoder, IntCounter, IntGauge, Registry, TextEncoder};
+use iroh::Endpoint;
+use iroh_metrics::{Counter, Gauge, MetricsGroup, MetricsSource, Registry};
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 
@@ -18,82 +24,84 @@ use tokio::sync::Semaphore;
 /// tasks.
 const MAX_METRICS_CONNECTIONS: usize = 32;
 
+/// deCDN-specific counters and gauges surfaced at `/metrics`.
+///
+/// The group name becomes the metric-name prefix, so fields appear as
+/// e.g. `decdn_probe_requests_total`.
+#[derive(Debug, Default, Serialize, Deserialize, MetricsGroup)]
+#[metrics(name = "decdn")]
+pub struct DecdnMetrics {
+    /// Total probe requests served.
+    pub probe_requests: Counter,
+    /// Currently open QUIC connections.
+    pub active_connections: Gauge,
+    /// Seconds since node start.
+    pub uptime_seconds: Gauge,
+}
+
 /// Aggregated deCDN node metrics.
 pub struct Metrics {
-    registry: Registry,
-    probe_requests_total: IntCounter,
-    active_connections: IntGauge,
+    registry: Arc<RwLock<Registry>>,
+    decdn: Arc<DecdnMetrics>,
     started_at: Instant,
-    uptime_seconds: IntGauge,
 }
 
 impl Metrics {
-    /// Create and register all metrics.
+    /// Create the registry and register deCDN's metric group.
+    pub fn new() -> Self {
+        let decdn = Arc::new(DecdnMetrics::default());
+        let mut registry = Registry::default();
+        registry.register(decdn.clone() as Arc<dyn MetricsGroup>);
+        Self {
+            registry: Arc::new(RwLock::new(registry)),
+            decdn,
+            started_at: Instant::now(),
+        }
+    }
+
+    /// Register iroh's transport metrics under the `decdn_iroh_` prefix so
+    /// `magicsock_*`, `net_report_*`, etc. come out as
+    /// `decdn_iroh_magicsock_*`, matching ADR 020's naming convention.
     ///
     /// # Errors
     ///
-    /// Returns an error if the Prometheus registry rejects a metric registration.
-    pub fn new() -> anyhow::Result<Self> {
-        let registry = Registry::new();
-
-        let probe_requests_total =
-            IntCounter::new("decdn_probe_requests_total", "Total probe requests served")
-                .map_err(|e| anyhow::anyhow!("counter construction failed: {e}"))?;
-        registry
-            .register(Box::new(probe_requests_total.clone()))
-            .map_err(|e| anyhow::anyhow!("register probe counter: {e}"))?;
-
-        let active_connections = IntGauge::new(
-            "decdn_active_connections",
-            "Currently open QUIC connections",
-        )
-        .map_err(|e| anyhow::anyhow!("gauge construction failed: {e}"))?;
-        registry
-            .register(Box::new(active_connections.clone()))
-            .map_err(|e| anyhow::anyhow!("register active_connections: {e}"))?;
-
-        let uptime_seconds = IntGauge::new("decdn_uptime_seconds", "Seconds since node start")
-            .map_err(|e| anyhow::anyhow!("gauge construction failed: {e}"))?;
-        registry
-            .register(Box::new(uptime_seconds.clone()))
-            .map_err(|e| anyhow::anyhow!("register uptime: {e}"))?;
-
-        Ok(Self {
-            registry,
-            probe_requests_total,
-            active_connections,
-            started_at: Instant::now(),
-            uptime_seconds,
-        })
+    /// Returns an error if the registry lock is poisoned.
+    pub fn register_iroh_endpoint(&self, ep: &Endpoint) -> anyhow::Result<()> {
+        let mut reg = self
+            .registry
+            .write()
+            .map_err(|_| anyhow::anyhow!("metrics registry lock poisoned"))?;
+        reg.sub_registry_with_prefix("decdn_iroh")
+            .register_all(ep.metrics());
+        Ok(())
     }
 
     pub fn started(&self) {
-        self.uptime_seconds.set(0);
+        self.decdn.uptime_seconds.set(0);
     }
 
     pub fn probe_request(&self) {
-        self.probe_requests_total.inc();
+        self.decdn.probe_requests.inc();
     }
 
     pub fn connection_opened(&self) {
-        self.active_connections.inc();
+        self.decdn.active_connections.inc();
     }
 
     pub fn connection_closed(&self) {
-        self.active_connections.dec();
+        self.decdn.active_connections.dec();
     }
 
-    fn encode(&self) -> anyhow::Result<Vec<u8>> {
+    fn encode(&self) -> anyhow::Result<String> {
         let uptime = i64::try_from(self.started_at.elapsed().as_secs()).unwrap_or(i64::MAX);
-        self.uptime_seconds.set(uptime);
+        self.decdn.uptime_seconds.set(uptime);
 
-        let encoder = TextEncoder::new();
-        let metric_families = self.registry.gather();
-        let mut buf = Vec::new();
-        encoder
-            .encode(&metric_families, &mut buf)
-            .map_err(|e| anyhow::anyhow!("prometheus encode failed: {e}"))?;
-        Ok(buf)
+        let reg = self
+            .registry
+            .read()
+            .map_err(|_| anyhow::anyhow!("metrics registry lock poisoned"))?;
+        reg.encode_openmetrics_to_string()
+            .map_err(|e| anyhow::anyhow!("openmetrics encode failed: {e}"))
     }
 }
 
@@ -159,7 +167,10 @@ fn handle(
     match metrics.encode() {
         Ok(body) => Ok(Response::builder()
             .status(StatusCode::OK)
-            .header("content-type", "text/plain; version=0.0.4")
+            .header(
+                "content-type",
+                "application/openmetrics-text; version=1.0.0; charset=utf-8",
+            )
             .body(Full::new(Bytes::from(body)))
             .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))),
         Err(err) => {

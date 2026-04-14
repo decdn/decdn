@@ -60,7 +60,7 @@ async fn probe_roundtrip() -> anyhow::Result<()> {
 
     let server_sk = SecretKey::generate(&mut rand::rng());
     let server_id = server_sk.public();
-    let metrics = Arc::new(Metrics::new()?);
+    let metrics = Arc::new(Metrics::new());
     let handler: Arc<dyn Handler> = Arc::new(ProbeHandler::new(
         server_id,
         rate_per_mb,

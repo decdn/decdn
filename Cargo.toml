@@ -25,6 +25,7 @@ decdn-reputation = { path = "crates/reputation" }
 iroh = "0.97"
 iroh-blobs = { version = "0.99", features = ["fs-store"] }
 iroh-gossip = { version = "0.97", features = ["net"] }
+iroh-metrics = "0.38"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -64,7 +65,6 @@ bytes = "1"
 rand = "0.9"
 
 # Metrics server
-prometheus = "0.14"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
