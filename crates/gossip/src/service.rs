@@ -20,10 +20,10 @@ use tokio_stream::StreamExt;
 
 use crate::{AnnounceReject, GossipMetrics, InsertOutcome, PeerTable, validate_envelope};
 
-/// Label used for both subscribe failures and, transitively, any per-topic
-/// rejection tied to the subscription itself. Kept here so the string is
-/// defined in one place for the `label()` stability contract.
-const SUBSCRIBE_FAILED_LABEL: &str = "subscribe_failed";
+/// Label passed to [`GossipMetrics::inc_rejected`] when a topic subscribe
+/// call fails at startup. Pinned by the label-stability test in
+/// `validation::tests` so a rename fails CI.
+pub(crate) const SUBSCRIBE_FAILED_LABEL: &str = "subscribe_failed";
 
 /// Configuration handed to [`GossipService::spawn`] by the consumer. The
 /// peer-table TTL is configured on the `PeerTable` itself at construction
@@ -307,5 +307,55 @@ fn now_us() -> u64 {
             }
             0
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+mod tests {
+    use super::*;
+
+    fn cfg(subscribe_global: bool, region: Option<&str>) -> GossipRuntimeConfig {
+        GossipRuntimeConfig {
+            announce_interval_sec: 60,
+            subscribe_global,
+            region: region.map(String::from),
+            allowlist: HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn build_topic_list_empty_when_neither_global_nor_region() {
+        // `GossipService::spawn` short-circuits to an empty handle vec when
+        // `build_topic_list` returns empty. This test locks that input
+        // behavior without needing a live `Gossip` instance.
+        assert!(build_topic_list(&cfg(false, None)).is_empty());
+    }
+
+    #[test]
+    fn build_topic_list_global_only() {
+        let topics = build_topic_list(&cfg(true, None));
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics[0].0, "cdn/global/v1");
+    }
+
+    #[test]
+    fn build_topic_list_region_only() {
+        let topics = build_topic_list(&cfg(false, Some("US")));
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics[0].0, "cdn/region/US/v1");
+    }
+
+    #[test]
+    fn build_topic_list_both() {
+        let topics = build_topic_list(&cfg(true, Some("US")));
+        assert_eq!(topics.len(), 2);
+        assert_eq!(topics[0].0, "cdn/global/v1");
+        assert_eq!(topics[1].0, "cdn/region/US/v1");
     }
 }

@@ -22,8 +22,10 @@ use crate::{identity, metrics};
 
 /// Ceiling on how long we wait for spawned tasks to drain after the endpoint
 /// and metrics server have been signalled to stop. Sized comfortably larger
-/// than the probe handler's accept + close timeouts (5s + 3s) so handlers
-/// finish naturally; `abort_all` only fires as a safety net.
+/// than the sum of the probe handler's accept + close timeouts (see
+/// `handlers::probe::ACCEPT_BI_TIMEOUT` + `PROBE_READ_TIMEOUT` +
+/// `PROBE_CLOSE_TIMEOUT`) so in-flight handlers finish naturally; the
+/// `abort_all` branch only fires as a safety net.
 const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(15);
 
 /// Build the endpoint, register handlers on a `Router`, spawn the metrics

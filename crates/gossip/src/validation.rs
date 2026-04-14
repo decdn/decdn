@@ -169,27 +169,52 @@ mod tests {
     use iroh::SecretKey;
 
     /// Freeze the Prometheus label strings: a rename without updating this
-    /// test would break operator dashboards silently. Every variant must be
-    /// listed here; a new variant that forgets its label will fail to
-    /// compile thanks to the exhaustive match.
+    /// test would break operator dashboards silently. The exhaustive `match`
+    /// inside `expected_label` is the compile-time guard — adding a new
+    /// `AnnounceReject` variant without a label mapping here fails to
+    /// compile, so the contract cannot silently drift.
     #[test]
     fn reject_labels_are_stable() {
-        fn assert_label(r: &AnnounceReject, expected: &'static str) {
-            assert_eq!(r.label(), expected, "label changed for {r:?}");
+        const fn expected_label(r: &AnnounceReject) -> &'static str {
+            match r {
+                AnnounceReject::DecodeFailed => "decode_failed",
+                AnnounceReject::UnknownVersion => "unknown_version",
+                AnnounceReject::UnknownVariant => "unknown_variant",
+                AnnounceReject::BadSignatureLen => "bad_signature_len",
+                AnnounceReject::InvalidPublicKey => "invalid_public_key",
+                AnnounceReject::BodyEncodeFailed => "body_encode_failed",
+                AnnounceReject::InvalidSignature => "invalid_signature",
+                AnnounceReject::ClockSkew => "clock_skew",
+                AnnounceReject::StaleTimestamp => "stale_timestamp",
+                AnnounceReject::BadRegion => "bad_region",
+                AnnounceReject::DuplicateHashes => "duplicate_hashes",
+                AnnounceReject::TooManyHashes => "too_many_hashes",
+                AnnounceReject::NotAllowlisted => "not_allowlisted",
+            }
         }
-        assert_label(&AnnounceReject::DecodeFailed, "decode_failed");
-        assert_label(&AnnounceReject::UnknownVersion, "unknown_version");
-        assert_label(&AnnounceReject::UnknownVariant, "unknown_variant");
-        assert_label(&AnnounceReject::BadSignatureLen, "bad_signature_len");
-        assert_label(&AnnounceReject::InvalidPublicKey, "invalid_public_key");
-        assert_label(&AnnounceReject::BodyEncodeFailed, "body_encode_failed");
-        assert_label(&AnnounceReject::InvalidSignature, "invalid_signature");
-        assert_label(&AnnounceReject::ClockSkew, "clock_skew");
-        assert_label(&AnnounceReject::StaleTimestamp, "stale_timestamp");
-        assert_label(&AnnounceReject::BadRegion, "bad_region");
-        assert_label(&AnnounceReject::DuplicateHashes, "duplicate_hashes");
-        assert_label(&AnnounceReject::TooManyHashes, "too_many_hashes");
-        assert_label(&AnnounceReject::NotAllowlisted, "not_allowlisted");
+        // One representative value per variant; the match above is the real
+        // contract, this just forces it to be exercised.
+        for r in [
+            AnnounceReject::DecodeFailed,
+            AnnounceReject::UnknownVersion,
+            AnnounceReject::UnknownVariant,
+            AnnounceReject::BadSignatureLen,
+            AnnounceReject::InvalidPublicKey,
+            AnnounceReject::BodyEncodeFailed,
+            AnnounceReject::InvalidSignature,
+            AnnounceReject::ClockSkew,
+            AnnounceReject::StaleTimestamp,
+            AnnounceReject::BadRegion,
+            AnnounceReject::DuplicateHashes,
+            AnnounceReject::TooManyHashes,
+            AnnounceReject::NotAllowlisted,
+        ] {
+            assert_eq!(r.label(), expected_label(&r), "label drift for {r:?}");
+        }
+
+        // Free-form labels passed directly to `inc_rejected` aren't covered
+        // by `AnnounceReject::label`; keep them pinned here too.
+        assert_eq!(crate::service::SUBSCRIBE_FAILED_LABEL, "subscribe_failed");
     }
 
     fn sample_body(sk: &SecretKey, ts_us: u64) -> NodeAnnounceBody {

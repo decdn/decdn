@@ -60,16 +60,7 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
     let observability = resolve_observability(&cli.observability, file.observability.as_ref());
     let gossip = resolve_gossip(file.gossip.as_ref())?;
 
-    // NodeAnnounce carries a signed region; a node that subscribes but lacks
-    // a region would be subscribe-only (receivers drop region-less announces
-    // as `BadRegion`). Publishing without a configured region is almost
-    // certainly a misconfiguration, so fail startup loudly instead.
-    anyhow::ensure!(
-        identity.region.is_some() || !gossip_will_publish(&gossip),
-        "identity.region must be set when gossip is enabled (it signs every NodeAnnounce); \
-         set identity.region or disable gossip by setting gossip.subscribe_global = false \
-         and omitting the region"
-    );
+    ensure_region_when_publishing_global(&identity, &gossip)?;
 
     Ok(ResolvedConfig {
         identity,
@@ -82,11 +73,23 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
     })
 }
 
-/// Will the gossip service actually publish anything? True if at least one
-/// topic will be subscribed. The publisher task is skipped if no topic is
-/// reachable, so a "no-op gossip" configuration doesn't need a region.
-const fn gossip_will_publish(g: &ResolvedGossip) -> bool {
-    g.subscribe_global
+/// Reject configurations that would publish a region-less `NodeAnnounce` on
+/// the global gossip topic — every peer drops those as `BadRegion`.
+///
+/// Region subscription is separately gated on `identity.region.is_some()` in
+/// `GossipService::spawn`, so only the global-topic case needs an interlock:
+/// if global is off and no region is set, the service runs as a no-op.
+fn ensure_region_when_publishing_global(
+    identity: &ResolvedIdentity,
+    gossip: &ResolvedGossip,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        identity.region.is_some() || !gossip.subscribe_global,
+        "identity.region must be set when gossip.subscribe_global is true \
+         (it signs every NodeAnnounce); set identity.region or disable the \
+         global topic by setting gossip.subscribe_global = false"
+    );
+    Ok(())
 }
 
 /// Resolve identity fields.
@@ -528,7 +531,12 @@ fn expand_braces(raw: &str, ctx: &'static str) -> anyhow::Result<String> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 
@@ -578,6 +586,78 @@ mod tests {
         assert!(parse_node_id_hex(&"0".repeat(65)).is_err());
         assert!(parse_node_id_hex(&"g".repeat(64)).is_err());
         assert!(parse_node_id_hex("").is_err());
+    }
+
+    #[test]
+    fn resolve_gossip_allowlist_happy_path() -> anyhow::Result<()> {
+        // "0123456789abcdef" repeated 4× = 64 hex chars.
+        // Decodes pairwise to 8 bytes (01 23 45 67 89 ab cd ef), repeated 4×.
+        let cfg = types::GossipConfig {
+            allowlist: Some(vec!["0123456789abcdef".repeat(4)]),
+            ..Default::default()
+        };
+        let g = resolve_gossip(Some(&cfg))?;
+        let pattern = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
+        let expected: [u8; 32] = std::array::from_fn(|i| pattern[i % 8]);
+        assert!(g.allowlist.contains(&expected));
+        assert_eq!(g.allowlist.len(), 1);
+        Ok(())
+    }
+
+    fn ident(region: Option<&str>) -> ResolvedIdentity {
+        ResolvedIdentity {
+            data_dir: PathBuf::from("/tmp/unused"),
+            region: region.map(String::from),
+        }
+    }
+
+    fn gossip_cfg(subscribe_global: bool) -> ResolvedGossip {
+        ResolvedGossip {
+            announce_interval_sec: 60,
+            peer_ttl_sec: 600,
+            subscribe_global,
+            allowlist: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn ensure_region_when_publishing_global_rejects_missing_region() {
+        let err = ensure_region_when_publishing_global(&ident(None), &gossip_cfg(true))
+            .expect_err("expected error when global is on but region is absent")
+            .to_string();
+        assert!(
+            err.contains("identity.region"),
+            "error missing field context: {err}"
+        );
+    }
+
+    #[test]
+    fn ensure_region_when_publishing_global_accepts_region_set() -> anyhow::Result<()> {
+        ensure_region_when_publishing_global(&ident(Some("US")), &gossip_cfg(true))?;
+        Ok(())
+    }
+
+    #[test]
+    fn ensure_region_when_publishing_global_accepts_subscribe_only() -> anyhow::Result<()> {
+        // `subscribe_global = false` + no region = subscribe-only noop; fine.
+        ensure_region_when_publishing_global(&ident(None), &gossip_cfg(false))?;
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_gossip_applies_positive_values() -> anyhow::Result<()> {
+        let cfg = types::GossipConfig {
+            announce_interval_sec: Some(42),
+            peer_ttl_sec: Some(123),
+            subscribe_global: Some(false),
+            allowlist: None,
+        };
+        let g = resolve_gossip(Some(&cfg))?;
+        assert_eq!(g.announce_interval_sec, 42);
+        assert_eq!(g.peer_ttl_sec, 123);
+        assert!(!g.subscribe_global);
+        assert!(g.allowlist.is_empty());
+        Ok(())
     }
 
     #[test]
