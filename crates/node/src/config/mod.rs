@@ -269,10 +269,16 @@ fn load_file_config(explicit_path: Option<&Path>) -> anyhow::Result<FileConfig> 
     Ok(config)
 }
 
-/// Expand `$VAR`, `${VAR}`, and `~` in every string and path field on
+/// Expand `${VAR}` and leading `~` in every string and path field on
 /// [`FileConfig`]. Missing env vars produce a contextual error naming the
 /// offending field. Enables a single TOML template to be reused across
 /// container/Kubernetes deployments (see GitHub issue #223).
+///
+/// Bare `$VAR` (without braces) is intentionally **not** expanded: many
+/// legitimate config values contain a literal `$` (URLs with basic-auth
+/// passwords, query parameters, contract addresses), and eager expansion
+/// would turn those into spurious "undefined env var" errors. Operators
+/// wanting substitution must use the explicit `${VAR}` form.
 fn expand_env(cfg: &mut FileConfig) -> anyhow::Result<()> {
     if let Some(i) = cfg.identity.as_mut() {
         expand_path(&mut i.data_dir, "identity.data_dir")?;
@@ -319,6 +325,9 @@ fn expand_path(field: &mut Option<PathBuf>, ctx: &'static str) -> anyhow::Result
 }
 
 fn expand_value(raw: &str, ctx: &'static str) -> anyhow::Result<String> {
+    if !needs_expansion(raw) {
+        return Ok(raw.to_string());
+    }
     shellexpand::full(raw)
         .map(std::borrow::Cow::into_owned)
         .map_err(|e| {
@@ -327,6 +336,13 @@ fn expand_value(raw: &str, ctx: &'static str) -> anyhow::Result<String> {
                 e.var_name
             )
         })
+}
+
+/// Returns true if `raw` contains an expansion marker (`${` or leading `~`).
+/// Values without a marker are passed through verbatim so literal `$` stays
+/// literal (see [`expand_env`] for rationale).
+fn needs_expansion(raw: &str) -> bool {
+    raw.contains("${") || raw.starts_with('~')
 }
 
 #[cfg(test)]
@@ -421,6 +437,23 @@ mod tests {
             .and_then(|b| b.rpc_url.as_deref())
             .ok_or_else(|| anyhow::anyhow!("rpc_url missing"))?;
         anyhow::ensure!(url == "https://plain.example", "got: {url}");
+        Ok(())
+    }
+
+    // Regression for PR #226: a literal `$` (e.g. in basic-auth passwords or
+    // query strings) must not trigger env expansion, which would otherwise
+    // surface as a spurious "undefined env var" error.
+    #[test]
+    fn expand_env_preserves_literal_dollar_without_braces() -> anyhow::Result<()> {
+        let raw = "https://user:p$w0rd@host/path?token=abc$def";
+        let mut cfg = cfg_with_rpc(raw);
+        expand_env(&mut cfg)?;
+        let url = cfg
+            .blockchain
+            .as_ref()
+            .and_then(|b| b.rpc_url.as_deref())
+            .ok_or_else(|| anyhow::anyhow!("rpc_url missing"))?;
+        anyhow::ensure!(url == raw, "got: {url}");
         Ok(())
     }
 
