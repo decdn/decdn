@@ -52,7 +52,7 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
         &identity.data_dir,
     )?;
     let cache = resolve_cache(&cli.cache, file.cache.as_ref(), &identity.data_dir);
-    let payment = resolve_payment(&cli.payment, file.payment.as_ref());
+    let payment = resolve_payment(&cli.payment, file.payment.as_ref())?;
     let observability = resolve_observability(&cli.observability, file.observability.as_ref());
 
     Ok(ResolvedConfig {
@@ -222,15 +222,27 @@ fn resolve_cache(
 }
 
 /// Resolve payment fields.
+///
+/// Rejects `rate_per_mb == 0`: the value participates in the node selection
+/// score (`rate_per_mb × rtt_ms × …`, ADR 001 § Node Selection Algorithm) and
+/// feeds the on-chain rate-mismatch evidence path (ADR 014). A zero rate would
+/// make this node trivially win every client selection while earning no
+/// payable revenue — an obvious misconfiguration that should fail startup, not
+/// silently degrade the network.
 fn resolve_payment(
     cli: &crate::cli::run::PaymentArgs,
     file: Option<&types::PaymentConfig>,
-) -> ResolvedPayment {
+) -> anyhow::Result<ResolvedPayment> {
     let rate_per_mb = cli
         .rate_per_mb
         .or_else(|| file.and_then(|p| p.rate_per_mb))
         .unwrap_or(DEFAULT_RATE_PER_MB);
-    ResolvedPayment { rate_per_mb }
+    anyhow::ensure!(
+        rate_per_mb > 0,
+        "payment.rate_per_mb must be > 0 (used in the node selection score, \
+         ADR 001); got 0"
+    );
+    Ok(ResolvedPayment { rate_per_mb })
 }
 
 /// Resolve observability fields.
@@ -722,6 +734,66 @@ mod tests {
                 "field `{expected_ctx}` missing from error: {err}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_payment_rejects_zero_from_cli() -> anyhow::Result<()> {
+        let cli = crate::cli::run::PaymentArgs {
+            rate_per_mb: Some(0),
+        };
+        let err = resolve_payment(&cli, None)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected rejection for rate_per_mb=0"))?
+            .to_string();
+        anyhow::ensure!(
+            err.contains("rate_per_mb") && err.contains("> 0"),
+            "error lacked context: {err}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_payment_rejects_zero_from_file() -> anyhow::Result<()> {
+        let cli = crate::cli::run::PaymentArgs { rate_per_mb: None };
+        let file = types::PaymentConfig {
+            rate_per_mb: Some(0),
+        };
+        let err = resolve_payment(&cli, Some(&file))
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected rejection for rate_per_mb=0"))?
+            .to_string();
+        anyhow::ensure!(
+            err.contains("rate_per_mb") && err.contains("> 0"),
+            "error lacked context: {err}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_payment_cli_overrides_file_and_passes_nonzero() -> anyhow::Result<()> {
+        // Regression guard for the merge order: a zero file value must not
+        // short-circuit the CLI override that would otherwise be valid.
+        let cli = crate::cli::run::PaymentArgs {
+            rate_per_mb: Some(42),
+        };
+        let file = types::PaymentConfig {
+            rate_per_mb: Some(0),
+        };
+        let resolved = resolve_payment(&cli, Some(&file))?;
+        anyhow::ensure!(resolved.rate_per_mb == 42, "got: {}", resolved.rate_per_mb);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_payment_defaults_when_unset() -> anyhow::Result<()> {
+        let cli = crate::cli::run::PaymentArgs { rate_per_mb: None };
+        let resolved = resolve_payment(&cli, None)?;
+        anyhow::ensure!(
+            resolved.rate_per_mb == DEFAULT_RATE_PER_MB,
+            "got: {}",
+            resolved.rate_per_mb
+        );
         Ok(())
     }
 }
