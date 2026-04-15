@@ -24,6 +24,12 @@ CRITICAL_DOMAINS=(
     "crates.io"
     "static.crates.io"
     "index.crates.io"
+    # pre-commit bootstraps Python hook envs via `pip install .`, which
+    # fetches the PEP 517 build toolchain (setuptools) and declared runtime
+    # deps from these two hosts. Without them, the `pre-commit-hooks`
+    # environment fails to install and every commit hits the same error.
+    "pypi.org"
+    "files.pythonhosted.org"
 )
 
 OPTIONAL_DOMAINS=(
