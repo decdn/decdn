@@ -341,7 +341,7 @@ fn resolve_gossip(file: Option<&types::GossipConfig>) -> anyhow::Result<Resolved
     })
 }
 
-/// Parse a 64-character lowercase-hex node ID into 32 raw bytes.
+/// Parse a 64-character hex (case-insensitive) node ID into 32 raw bytes.
 fn parse_node_id_hex(s: &str) -> anyhow::Result<[u8; 32]> {
     anyhow::ensure!(
         s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()),

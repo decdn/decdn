@@ -93,6 +93,11 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
     // only held wrappers inside `tasks` an `abort_all()` would cancel the
     // wrapper but leak the inner gossip loop. Storing the handles lets us
     // call `.abort()` on each explicitly during shutdown.
+    //
+    // TODO: GossipService should own its own shutdown (e.g. accept a
+    // CancellationToken or expose `shutdown().await`) so the runtime
+    // doesn't have to reach in with `.abort()`. Tracked for follow-up;
+    // PoC keeps the parent-driven abort to stay minimal.
     let gossip_handles = GossipService::spawn(
         ep.clone(),
         secret_key.clone(),
