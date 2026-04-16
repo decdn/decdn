@@ -42,8 +42,14 @@ flowchart TD
 
 Before any on-chain or protocol activity:
 
-1. **Provision server.** Minimum recommended spec: 4 vCPU, 8 GB RAM, 1 TB SSD, 5 TB/month
-   egress. See [ADR 004 § Node Unit Economics](004-tokenomics.md#node-unit-economics).
+1. **Provision server.** Reference deployment is an **unmetered dedicated server** on a
+   1 Gbps, 10 Gbps, or 100 Gbps flat-rate port. Minimum recommended spec (1 Gbps tier,
+   also the PoC reference): 4–8 vCPU, 32 GB RAM, 1 TB NVMe. Metered VPS plans with
+   bundled egress are supported but not the reference cost point — operators on metered
+   plans must model egress overage explicitly. See
+   [ADR 004 § Node Unit Economics](004-tokenomics.md#node-unit-economics) for per-tier
+   cost/revenue breakdowns and why the 10/100 Gbps tiers should wait for Growth-phase
+   demand before deployment.
 
 2. **Synchronize clock.** The node MUST run NTP (or equivalent) and MUST verify the local
    clock offset is within 10 seconds of UTC before proceeding. Clock skew ≥ 60 s causes
@@ -369,7 +375,8 @@ after re-registration to associate the new `nodeId` with the same `ethAddress` �
   Sepolia, confirmation is fast (~250 ms/block), but the operator tooling must handle
   nonce management across these transactions.
 - Multiaddr registration before iroh is started requires either a static IP/port
-  (suitable for most VPS deployments) or a two-step workflow (start node, observe
+  (typical for dedicated-server deployments, where a routable public IP is standard,
+  and also available on most VPS plans) or a two-step workflow (start node, observe
   addresses, then register or update).
 - Cold-start reputation (0.5, a 4× score penalty vs. a reputable node) means new nodes
   must price aggressively or wait out the 7-day bootstrap period to compete for traffic.

@@ -11,7 +11,7 @@ Three constraints shape the design:
 
 1. On-chain transactions on an L2 cost ~$0.05–0.10 each — acceptable per channel lifecycle, not per MB delivered.
 2. A typical delivery session transfers a few MB. The payment per MB at market rates is on the order of $0.00001 — far below any on-chain transaction cost.
-3. Node operators have real infrastructure costs (VPS, bandwidth, backend storage). Revenue denominated in a volatile native token creates unacceptable P&L risk: a 10× price drop turns a profitable operator into a loss.
+3. Node operators have real infrastructure costs (unmetered dedicated servers, port fees, backend storage — see [ADR 004 § Node Unit Economics](004-tokenomics.md#node-unit-economics)). Revenue denominated in a volatile native token creates unacceptable P&L risk: a 10× price drop turns a profitable operator into a loss.
 
 ## Decision
 

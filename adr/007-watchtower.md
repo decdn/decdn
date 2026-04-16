@@ -133,7 +133,7 @@ Heartbeats are batched — one on-chain transaction per 6-hour window covers all
 | Cost component | Monthly estimate | Notes |
 | --- | --- | --- |
 | Heartbeat gas (120 batched tx) | $1.20–$2.40 | Fixed cost, amortised across all channels |
-| Infrastructure (VPS + monitoring) | $20–$50 | Shared with node operation if co-located |
+| Infrastructure (small VPS or co-located on a node's dedicated box + monitoring) | $20–$50 | Watchtowers are latency-insensitive and monitoring-bound, so a small metered VPS is fine; operators already running a 1/10/100 Gbps unmetered deCDN node (see [ADR 004](004-tokenomics.md#node-unit-economics)) can co-locate for near-zero marginal cost |
 | Dispute gas (rare) | $0.05–$0.10 per event | Covered by 2× gas bonus from escrow |
 
 **Break-even at various fee levels:**

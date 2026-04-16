@@ -213,74 +213,104 @@ The caller provides `minTokenOut` to prevent sandwich attacks. If the TOKEN/USDC
 
 ## Node Unit Economics
 
-### Cost Model
+### Infrastructure Model: Unmetered Dedicated Servers
 
-| Cost Category | Monthly Estimate | Notes |
-| --- | --- | --- |
-| VPS (4 vCPU, 8GB RAM) | $20–40 | Hetzner, OVH tier |
-| Storage (1TB SSD) | $10–20 | Included in many VPS plans |
-| Bandwidth (5TB egress) | $0–25 | Many VPS plans include 5–20TB |
-| L2 gas costs | $5–15 | ~10 channel settlements/month at ~$0.50–1.50 each |
-| **Total monthly cost** | **$35–100** | |
+Earlier drafts of this ADR modeled node infrastructure on shared VPS plans with bundled egress allowances (5–20 TB/month). This model breaks down at any meaningful CDN load: metered VPS providers charge $0.01–$0.09/GB for overage, which swamps the $0.01/GB expected market delivery rate and makes origin-backed nodes unprofitable on any cache miss. Shared-tenancy also caps sustained throughput well below gigabit on most plans.
+
+Target deployment is instead an **unmetered dedicated server** with a flat-rate port at 1, 10, or 100 Gbps. Bandwidth becomes a fixed monthly cost, not a per-GB variable, which aligns operator P&L with the pay-per-MB protocol economics and lets nodes saturate their port without surprise overage bills. Reference providers at the time of writing include Hetzner (1 Gbps dedicated tiers), OVH / So you Start / Kimsufi (1–10 Gbps unmetered dedicated), FDCServers and Leaseweb (10–100 Gbps unmetered), and Latitude.sh / phoenixNAP for 100 Gbps. VPS and cloud deployments remain possible but are not the reference cost point — operators using them should model egress overage explicitly.
+
+### Cost Model (per tier)
+
+All three tiers assume a 4–16 vCPU dedicated server with 1–2 TB NVMe, L2 gas costs of $5–15/month (~10 channel settlements/month at ~$0.50–1.50 each), and Arbitrum Sepolia / Arbitrum One gas prices in early 2026. Prices are typical 2026 rack pricing and vary by region and provider; treat the ranges as order-of-magnitude rather than quotes.
+
+| Tier | Port | Typical server spec | Infra $/month | + gas | **Total $/month** |
+| --- | --- | --- | --- | --- | --- |
+| **1 Gbps unmetered** | 1 Gbps flat | 4–8 vCPU, 32 GB RAM, 1 TB NVMe | $50–120 | $5–15 | **$55–135** |
+| **10 Gbps unmetered** | 10 Gbps flat | 8–16 vCPU, 64 GB RAM, 2 TB NVMe | $250–500 | $5–15 | **$255–515** |
+| **100 Gbps unmetered** | 100 Gbps flat | 16–32 vCPU, 128 GB RAM, 4 TB NVMe | $1,500–3,500 | $10–20 | **$1,510–3,520** |
+
+The 1 Gbps tier is the recommended **minimum** spec for PoC and early production — it replaces the prior "VPS minimum" and is what Phase 1 of [ADR 019](019-node-onboarding.md) provisions. The 10 Gbps and 100 Gbps tiers are for operators targeting high-traffic hot regions or acting as origin-backed seed nodes.
+
+**Sustained throughput headroom.** A line-rate port rarely runs at 100%. Using a 30% average utilisation factor (typical for CDN edge nodes, accounting for diurnal traffic patterns and per-request idle), the served-bytes ceiling per tier is:
+
+| Tier | Peak port | 30% avg utilisation | **Sustained GB/month** |
+| --- | --- | --- | --- |
+| 1 Gbps | 125 MB/s | 37.5 MB/s | ~97,000 GB |
+| 10 Gbps | 1.25 GB/s | 375 MB/s | ~970,000 GB |
+| 100 Gbps | 12.5 GB/s | 3.75 GB/s | ~9,700,000 GB |
+
+Even the 1 Gbps tier comfortably exceeds the prior 10,000 GB/month production target. This means the bottleneck shifts from bandwidth allowance to **demand** — a node earns only for the bytes clients and peers actually pull.
 
 ### Revenue Model (Production Target)
 
-A node earning at a USDC-denominated delivery rate of $0.00001/MB with production-level traffic:
+A production-scale node earning at a USDC-denominated delivery rate of $0.00001/MB ($0.01/GB). Node-to-node and client delivery are priced identically; cache-miss pulls are a cost because the pulling node pays an upstream peer or origin-backed node. The "Paid pull cost" column below conservatively assumes misses are filled from other deCDN peers at the same $0.01/GB rate; origin-backed nodes pulling from high-egress backing stores see higher miss costs and should price accordingly.
 
-| Metric | Value |
-| --- | --- |
-| Bandwidth allowance | 10,000 GB/month |
-| Client delivery volume | 7,000 GB/month |
-| Node-to-node delivery volume | 3,000 GB/month |
-| Cache miss rate | 15% (1,500 GB miss) |
-| Paid pull cost for cache misses | ~$15/month |
-| Infrastructure cost | $50/month |
-| Revenue at $0.00001/MB | $100/month |
-| Gross profit | ~$35/month |
+| Metric | 1 Gbps node | 10 Gbps node | 100 Gbps node |
+| --- | --- | --- | --- |
+| Client delivery volume | 7,000 GB/month | 70,000 GB/month | 700,000 GB/month |
+| Node-to-node delivery volume | 3,000 GB/month | 30,000 GB/month | 300,000 GB/month |
+| Total served | 10,000 GB/month | 100,000 GB/month | 1,000,000 GB/month |
+| Port utilisation at this load | ~3% | ~3% | ~3% |
+| Cache miss rate | 15% | 15% | 15% |
+| Paid pull cost for cache misses | ~$15/month | ~$150/month | ~$1,500/month |
+| Infrastructure cost (mid-range) | ~$90/month | ~$380/month | ~$2,500/month |
+| Revenue at $0.00001/MB | $100/month | $1,000/month | $10,000/month |
+| **Gross profit (production target)** | **−$5/month** | **~$470/month** | **~$6,000/month** |
 
-Revenue depends entirely on traffic. A node serving no bytes earns $0.
+At the prior 10,000 GB/month production target, a 1 Gbps unmetered box is **marginal to slightly loss-making** — the fixed-bandwidth model costs more per month than a bundled-egress VPS, and only pays off at sustained demand well above the legacy target. Operators running the 1 Gbps tier should budget for 20,000+ GB/month to be comfortably profitable:
+
+| Served GB/month | 1 Gbps revenue | 1 Gbps gross profit (at ~$90 infra + 15% miss cost) |
+| --- | --- | --- |
+| 10,000 | $100 | ~−$5 |
+| 20,000 | $200 | ~$80 |
+| 50,000 | $500 | ~$335 |
+| 90,000 (near sustained ceiling) | $900 | ~$675 |
+
+The 10 Gbps and 100 Gbps tiers scale roughly linearly in both revenue and fixed cost, so their profitability thresholds scale proportionally.
+
+Revenue depends entirely on traffic. A node serving no bytes earns $0 at any tier and loses the full fixed infrastructure cost.
 
 **Competitive context:** The $0.00001/MB ($0.01/GB) market rate is 4–20× cheaper than major traditional CDNs (CloudFront $0.085/GB, Akamai $0.12–0.20/GB, KeyCDN $0.04/GB) and at parity with budget CDNs (Bunny.net $0.01/GB). Governance-set rate bounds (floor: 1 USDC base unit/$0.000001/MB, ceiling: 1,000 USDC base units/$0.001/MB — see [ADR 003](003-payments.md)) provide a 10×–100× band around this expected market rate. The ceiling accommodates origin-backed nodes using high-egress backends while remaining well above any traditional CDN rate.
 
 ### Revenue Model (PoC Reality)
 
-The production target above assumes 10,000 GB/month (~333 GB/day) — a meaningful production CDN node. A PoC with tens of nodes and limited test traffic will see far less:
+The production target above assumes sustained traffic measured in tens to hundreds of TB/month. A PoC with tens of nodes and limited test traffic will see far less. Only the 1 Gbps tier is modeled — running 10/100 Gbps nodes at PoC scale is actively wasteful (100% fixed cost, ~0% utilisation) and is discouraged until organic demand justifies it.
 
-| Metric | PoC | Production |
+| Metric | PoC (1 Gbps) | Production (1 Gbps) |
 | --- | --- | --- |
 | Client delivery volume | 100 GB/month | 7,000 GB/month |
 | Node-to-node delivery volume | 50 GB/month | 3,000 GB/month |
 | Cache miss rate | 30% | 15% |
 | Revenue at $0.00001/MB | ~$1.50/month | $100/month |
 | Paid pull cost for cache misses | ~$0.50/month | ~$15/month |
-| Infrastructure cost | $35/month | $50/month |
-| Gross profit (without subsidy) | **−$34/month** | ~$35/month |
-| Profitable without subsidy? | No | Yes |
+| Infrastructure cost | $75/month | $90/month |
+| Gross profit (without subsidy) | **−$74/month** | ~−$5/month |
+| Profitable without subsidy? | No | Marginal — requires traffic ≥ ~20,000 GB/month |
 
-PoC nodes will operate at a loss without bootstrap subsidies. This is expected — the bootstrap fund exists precisely for this phase.
+PoC nodes will operate at a loss without bootstrap subsidies. This is expected — the bootstrap fund exists precisely for this phase. The loss per PoC node is ~2× the prior VPS-based estimate because the fixed bandwidth cost no longer scales down with low traffic. Operators who cannot commit to a dedicated box may run on a VPS for PoC participation, but should expect metered-egress overage if their traffic grows.
 
 **Buyback at PoC scale:** Buyback execution is disabled during the PoC — see [BuybackBurner Contract](#buybackburner-contract) for the detailed calculation showing that buyback allocations at PoC-scale revenue are far too small to justify gas costs or meaningful market buys.
 
 ### Bootstrap Fund Gap (PoC)
 
-The per-node monthly shortfall at PoC scale is ~$34. Subsidy requirements at different network sizes:
+The per-node monthly shortfall at PoC scale is ~$74 on a 1 Gbps unmetered box (roughly 2× the prior VPS estimate, because fixed bandwidth cost does not scale down with low traffic). Subsidy requirements at different network sizes:
 
 | Scenario | Nodes | Duration | Total subsidy (USDC equivalent) |
 | --- | --- | --- | --- |
-| Minimal PoC | 20 | 6 months | ~$4,080 |
-| Extended PoC | 50 | 12 months | ~$20,400 |
+| Minimal PoC | 20 | 6 months | ~$8,880 |
+| Extended PoC | 50 | 12 months | ~$44,400 |
 
-At any reasonable TOKEN price, these amounts are a tiny fraction of the 200M TOKEN bootstrap fund. The bootstrap fund is more than adequate for PoC scale.
+At any reasonable TOKEN price, these amounts are still a tiny fraction of the 200M TOKEN bootstrap fund. The bootstrap fund is more than adequate for PoC scale, even under the higher fixed infrastructure cost.
 
-**Production bootstrap modeling.** The table below estimates bootstrap fund requirements at various production scales, assuming the per-node shortfall decreases as organic traffic grows:
+**Production bootstrap modeling.** All production-phase figures below assume 1 Gbps unmetered nodes (the reference tier). Higher-tier nodes (10/100 Gbps) are not expected to participate until the Growth phase at earliest — their fixed costs are uneconomic at Early-production traffic levels.
 
 | Phase | Nodes | Organic revenue/node | Shortfall/node | Duration | Total subsidy |
 | --- | --- | --- | --- | --- | --- |
-| Early production | 100 | $15/month | $35/month | 12 months | $420,000 |
-| Growth | 500 | $50/month | $0/month (breakeven) | — | $0 |
-| Mature | 1,000+ | $100+/month | — (profitable) | — | $0 |
+| Early production | 100 | $15/month | $75/month | 12 months | $900,000 |
+| Growth | 500 | $80/month | $10/month (near breakeven) | 6 months | $30,000 |
+| Mature | 1,000+ | $150+/month | — (profitable) | — | $0 |
 
-At a TOKEN price of $0.01 (conservative early production), the 200M TOKEN bootstrap fund is worth $2M — sufficient to cover the early production phase (~$420K) with margin. At $0.001/TOKEN, the fund is worth $200K — marginal. **The bootstrap fund's adequacy is directly tied to TOKEN price**, which creates a reflexive dependency: if the network fails to attract traffic, TOKEN price drops, the fund buys less subsidy, and nodes leave. This chicken-and-egg dynamic is the primary economic risk and should be monitored as the network scales.
+At a TOKEN price of $0.01 (conservative early production), the 200M TOKEN bootstrap fund is worth $2M — sufficient to cover the early production phase (~$900K) with ~2× margin. At $0.001/TOKEN, the fund is worth $200K — **insufficient** to cover the early production phase at the new shortfall, and governance SHOULD throttle new-node onboarding or apply the circuit-breaker playbook below until either traffic or token price recovers. **The bootstrap fund's adequacy is directly tied to TOKEN price**, which creates a reflexive dependency: if the network fails to attract traffic, TOKEN price drops, the fund buys less subsidy, and nodes leave. This chicken-and-egg dynamic is the primary economic risk and should be monitored as the network scales.
 
 **Circuit-breaker trigger.** If the bootstrap fund's USD-equivalent value drops below 2× the projected 12-month subsidy requirement (computed as `active_nodes × monthly_shortfall × 12`), governance SHOULD trigger a subsidy reduction playbook: (1) reduce per-node subsidies to extend the fund's runway, (2) prioritize subsidies for nodes with the highest delivery volume (reward productive nodes, not idle stake), (3) publish a transparent fund status report to the community. The 2× threshold provides a 12-month buffer before the fund is exhausted. This trigger is a governance policy recommendation, not an on-chain mechanism — monitoring is off-chain via treasury balance tracking.
 
