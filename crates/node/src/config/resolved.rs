@@ -49,6 +49,19 @@ pub struct ResolvedCache {
     pub cache_size_mb: u64,
     /// Maximum single blob size in megabytes.
     pub max_blob_size_mb: u64,
+    /// Optional HTTP origin base URL for pull-through on cache misses.
+    /// Parsed, scheme-validated, and path-normalized at resolution time via
+    /// [`decdn_cache::parse_origin_url`] so invalid URLs fail config
+    /// loading. Constructing an [`decdn_cache::OriginUrl`] outside the
+    /// parser is impossible — the invariants (http/https scheme,
+    /// trailing-slash path, no query/fragment) are type-enforced.
+    pub origin_url: Option<decdn_cache::OriginUrl>,
+    /// Optional filesystem origin root. Blobs live at
+    /// `{path}/{hex[0..2]}/{hex}`. Directory-existence is validated when
+    /// the runtime constructs the [`decdn_cache::FilesystemOrigin`] —
+    /// config resolution carries the raw path so resolution stays
+    /// filesystem-free and testable without real I/O.
+    pub origin_path: Option<PathBuf>,
 }
 
 /// Resolved payment fields.

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use decdn_cache::{CacheEngine, FilesystemOrigin, HttpOrigin, Origin};
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
 use iroh::{Endpoint, SecretKey};
@@ -30,13 +31,20 @@ const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(15);
 
 /// Build the endpoint, register handlers on a `Router`, spawn the metrics
 /// server and gossip tasks, and run until a shutdown signal is received.
-#[allow(clippy::cognitive_complexity)]
+#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
     let node_metrics = Arc::new(metrics::Metrics::new());
     node_metrics.started();
 
     let secret_key = identity::load_or_generate(&cfg.identity.data_dir)?;
     tracing::info!(node_id = %secret_key.public(), "loaded node identity");
+
+    let cache = build_cache(&cfg).await?;
+    tracing::info!(
+        cache_dir = %cfg.cache.cache_dir.display(),
+        has_origin = cfg.cache.origin_url.is_some() || cfg.cache.origin_path.is_some(),
+        "cache engine ready",
+    );
 
     let ep = build_endpoint(&secret_key, cfg.network.bind_port)
         .await
@@ -135,6 +143,18 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
         handle.abort();
     }
 
+    // Flush the cache store before the drain deadline so in-flight writes
+    // hit disk. Intentionally *not* gated by `SHUTDOWN_DEADLINE`: a slow
+    // flush is preferable to a lost write, and the watchdog at the outer
+    // process level catches a truly stuck shutdown. On failure we still
+    // finish the task drain cleanly (so metrics/dispatch don't leak) and
+    // then bubble the error out of `run()` — supervisors need a non-zero
+    // exit to know the store may be inconsistent.
+    let cache_shutdown_err = cache.shutdown().await.err();
+    if let Some(err) = cache_shutdown_err.as_ref() {
+        tracing::error!(%err, "cache shutdown failed; store state may be inconsistent");
+    }
+
     let drain = async {
         while let Some(result) = tasks.join_next().await {
             log_join_result(result, "shutdown");
@@ -165,7 +185,10 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
     }
 
     tracing::info!("node stopped");
-    Ok(())
+    match cache_shutdown_err {
+        None => Ok(()),
+        Some(err) => Err(anyhow::Error::from(err).context("cache shutdown failed")),
+    }
 }
 
 /// Build an iroh `Endpoint` bound to `bind_port`. ALPNs are set by the
@@ -218,6 +241,34 @@ fn log_join_result(result: Result<(), tokio::task::JoinError>, phase: &'static s
             tracing::warn!(phase, %err, "task failed during shutdown");
         }
     }
+}
+
+/// Construct the cache engine from resolved config. At most one of
+/// `origin_url` and `origin_path` is set (guaranteed by
+/// `config::resolve_cache`); neither-set means the engine serves only
+/// already-cached content and cache misses surface as
+/// `CacheError::NoOrigin`.
+async fn build_cache(cfg: &ResolvedConfig) -> anyhow::Result<CacheEngine> {
+    let origin: Option<Arc<dyn Origin>> =
+        match (cfg.cache.origin_url.clone(), cfg.cache.origin_path.clone()) {
+            (Some(url), None) => Some(Arc::new(
+                HttpOrigin::new(url).context("failed to build HTTP origin client")?,
+            )),
+            (None, Some(path)) => Some(Arc::new(
+                FilesystemOrigin::new(path)
+                    .await
+                    .context("failed to open filesystem origin")?,
+            )),
+            (None, None) => None,
+            // resolve_cache enforces this mutex; this arm is unreachable in
+            // practice but a typed fallback is safer than unwrap() or unreachable!().
+            (Some(_), Some(_)) => {
+                anyhow::bail!("cache.origin_url and cache.origin_path are mutually exclusive")
+            }
+        };
+    CacheEngine::open(&cfg.cache.cache_dir, origin, cfg.cache.max_blob_size_mb)
+        .await
+        .context("failed to open cache engine")
 }
 
 /// Wait for either SIGINT or (on Unix) SIGTERM.

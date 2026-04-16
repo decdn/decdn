@@ -96,6 +96,15 @@ pub struct CacheArgs {
     /// Maximum single blob size in megabytes [default: 10240].
     #[arg(long, value_name = "MB", env = "DECDN_MAX_BLOB_SIZE_MB")]
     pub max_blob_size_mb: Option<u64>,
+
+    /// Origin base URL served at `{url}/{blake3_hex}`. Absent = no pull-through.
+    #[arg(long, value_name = "URL", env = "DECDN_ORIGIN_URL")]
+    pub origin_url: Option<String>,
+
+    /// Filesystem origin root. Blobs live at `{path}/{hex[0..2]}/{hex}`.
+    /// Mutually exclusive with `--origin-url`.
+    #[arg(long, value_name = "DIR", env = "DECDN_ORIGIN_PATH")]
+    pub origin_path: Option<PathBuf>,
 }
 
 /// Payment rate configuration.
