@@ -73,6 +73,7 @@ fn write_config(dir: &TempDir, body: &str) -> anyhow::Result<PathBuf> {
 fn validate_passes_for_complete_config() -> anyhow::Result<()> {
     let dir = TempDir::new()?;
     let path = write_config(&dir, VALID_CONFIG)?;
+    fs::write(dir.path().join("keystore.json"), "")?;
     commands::config_validate(Some(&path), &args(dir.path())?)
 }
 
