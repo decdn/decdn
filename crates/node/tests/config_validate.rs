@@ -195,7 +195,7 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
         cache: ResolvedCache {
             cache_dir: PathBuf::from("/var/lib/decdn/cache"),
             cache_size_mb: 10_240,
-            max_blob_size_mb: 10_240,
+            max_blob_size_mb: 1_024,
             origin_url: None::<decdn_cache::OriginUrl>,
             origin_path: None,
         },

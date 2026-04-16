@@ -465,7 +465,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 [cache]
 # cache_dir = "~/.decdn/cache"
 # cache_size_mb = 10240
-# max_blob_size_mb = 10240
+# max_blob_size_mb = 1024
 
 [payment]
 # rate_per_mb = 10

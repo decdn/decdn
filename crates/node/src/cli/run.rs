@@ -93,7 +93,8 @@ pub struct CacheArgs {
     #[arg(long, value_name = "MB", env = "DECDN_CACHE_SIZE_MB")]
     pub cache_size_mb: Option<u64>,
 
-    /// Maximum single blob size in megabytes [default: 10240].
+    /// Maximum single blob size in megabytes [default: 1024]. Must be
+    /// strictly less than `cache_size_mb`.
     #[arg(long, value_name = "MB", env = "DECDN_MAX_BLOB_SIZE_MB")]
     pub max_blob_size_mb: Option<u64>,
 
