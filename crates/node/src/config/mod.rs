@@ -23,8 +23,12 @@ pub use types::FileConfig;
 const DEFAULT_BIND_PORT: u16 = 4433;
 /// Default maximum cache size in megabytes (10 GB).
 const DEFAULT_CACHE_SIZE_MB: u64 = 10_240;
-/// Default maximum single blob size in megabytes (10 GB).
-const DEFAULT_MAX_BLOB_SIZE_MB: u64 = 10_240;
+/// Default maximum single blob size in megabytes (1 GB).
+///
+/// Deliberately well below `DEFAULT_CACHE_SIZE_MB` so a single oversized
+/// blob can't saturate the entire cache and evict all other content in
+/// one fetch. See [`resolve_cache`] for the accompanying invariant.
+const DEFAULT_MAX_BLOB_SIZE_MB: u64 = 1_024;
 /// Default rate per MB in USDC base units ($0.00001/MB).
 const DEFAULT_RATE_PER_MB: u64 = 10;
 /// Default Prometheus metrics port.
@@ -51,7 +55,7 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
         file.blockchain.as_ref(),
         &identity.data_dir,
     )?;
-    let cache = resolve_cache(&cli.cache, file.cache.as_ref(), &identity.data_dir);
+    let cache = resolve_cache(&cli.cache, file.cache.as_ref(), &identity.data_dir)?;
     let payment = resolve_payment(&cli.payment, file.payment.as_ref())?;
     let observability = resolve_observability(&cli.observability, file.observability.as_ref());
 
@@ -189,11 +193,18 @@ pub fn resolve_blockchain(
 }
 
 /// Resolve cache fields.
+///
+/// Enforces `max_blob_size_mb < cache_size_mb`: a single blob equal to or
+/// larger than the cache would saturate the store on one fetch and evict
+/// every other entry, making the node a one-shot download target rather
+/// than a useful cache. Equality is rejected along with the greater-than
+/// case because a cache that can hold exactly one blob has the same
+/// failure mode as one that overflows.
 fn resolve_cache(
     cli: &crate::cli::run::CacheArgs,
     file: Option<&types::CacheConfig>,
     data_dir: &std::path::Path,
-) -> ResolvedCache {
+) -> anyhow::Result<ResolvedCache> {
     let cache_dir = cli
         .cache_dir
         .clone()
@@ -214,11 +225,18 @@ fn resolve_cache(
         .or_else(|| file.and_then(|c| c.max_blob_size_mb))
         .unwrap_or(DEFAULT_MAX_BLOB_SIZE_MB);
 
-    ResolvedCache {
+    anyhow::ensure!(
+        max_blob_size_mb < cache_size_mb,
+        "cache.max_blob_size_mb ({max_blob_size_mb}) must be strictly less than \
+         cache.cache_size_mb ({cache_size_mb}); otherwise a single oversized blob \
+         can saturate the cache on one fetch"
+    );
+
+    Ok(ResolvedCache {
         cache_dir,
         cache_size_mb,
         max_blob_size_mb,
-    }
+    })
 }
 
 /// Resolve payment fields.
@@ -793,6 +811,78 @@ mod tests {
             resolved.rate_per_mb == DEFAULT_RATE_PER_MB,
             "got: {}",
             resolved.rate_per_mb
+        );
+        Ok(())
+    }
+
+    fn cache_cli(
+        cache_size_mb: Option<u64>,
+        max_blob_size_mb: Option<u64>,
+    ) -> crate::cli::run::CacheArgs {
+        crate::cli::run::CacheArgs {
+            cache_dir: None,
+            cache_size_mb,
+            max_blob_size_mb,
+        }
+    }
+
+    #[test]
+    fn resolve_cache_rejects_max_blob_equal_to_cache_size() -> anyhow::Result<()> {
+        let cli = cache_cli(Some(100), Some(100));
+        let err = resolve_cache(&cli, None, Path::new("/tmp"))
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected rejection for max == cache"))?
+            .to_string();
+        anyhow::ensure!(
+            err.contains("max_blob_size_mb") && err.contains("cache_size_mb"),
+            "error lacked context: {err}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_rejects_max_blob_greater_than_cache_size() -> anyhow::Result<()> {
+        let cli = cache_cli(Some(100), Some(200));
+        let err = resolve_cache(&cli, None, Path::new("/tmp"))
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected rejection for max > cache"))?
+            .to_string();
+        anyhow::ensure!(
+            err.contains("strictly less than"),
+            "error lacked context: {err}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_accepts_max_blob_below_cache_size() -> anyhow::Result<()> {
+        let cli = cache_cli(Some(1024), Some(512));
+        let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
+        anyhow::ensure!(
+            resolved.cache_size_mb == 1024,
+            "cache_size: {}",
+            resolved.cache_size_mb
+        );
+        anyhow::ensure!(
+            resolved.max_blob_size_mb == 512,
+            "max_blob: {}",
+            resolved.max_blob_size_mb
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_defaults_satisfy_invariant() -> anyhow::Result<()> {
+        // Regression guard: if either default changes, the pair must still
+        // satisfy `max_blob < cache_size`. Lives here so a future edit to
+        // the DEFAULT_* constants can't silently reintroduce the #221 bug.
+        let cli = cache_cli(None, None);
+        let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
+        anyhow::ensure!(
+            resolved.max_blob_size_mb < resolved.cache_size_mb,
+            "defaults violate invariant: max_blob={} cache_size={}",
+            resolved.max_blob_size_mb,
+            resolved.cache_size_mb
         );
         Ok(())
     }
