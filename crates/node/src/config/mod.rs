@@ -198,6 +198,28 @@ pub fn resolve_blockchain(
         })
         .unwrap_or_else(|| data_dir.join("keystore.json"));
 
+    // Fail fast: otherwise a bad keystore path only surfaces at first sign.
+    // `metadata`/`is_file` catches missing paths, broken symlinks, and
+    // directories (which `File::open` silently accepts on Linux); `File::open`
+    // then proves read permission.
+    let meta = std::fs::metadata(&eth_keystore).with_context(|| {
+        format!(
+            "invalid eth_keystore: cannot access {}",
+            eth_keystore.display()
+        )
+    })?;
+    anyhow::ensure!(
+        meta.is_file(),
+        "invalid eth_keystore: {} is not a regular file",
+        eth_keystore.display()
+    );
+    std::fs::File::open(&eth_keystore).with_context(|| {
+        format!(
+            "invalid eth_keystore: cannot open {} for reading",
+            eth_keystore.display()
+        )
+    })?;
+
     let payment_channel_address = cli
         .payment_channel_address
         .clone()
