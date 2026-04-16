@@ -1,32 +1,40 @@
-//! Node runtime: owns the iroh endpoint, metrics server, and handler dispatch.
+//! Node runtime: owns the iroh endpoint, metrics server, and protocol router.
 
-pub mod dispatch;
-pub mod endpoint;
-
+use std::collections::HashSet;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
 use decdn_cache::{CacheEngine, FilesystemOrigin, HttpOrigin, Origin};
-use tokio::sync::oneshot;
+use iroh::endpoint::presets;
+use iroh::protocol::Router;
+use iroh::{Endpoint, SecretKey};
+use iroh_gossip::ALPN as GOSSIP_ALPN;
+use iroh_gossip::net::Gossip;
+use tokio::sync::{RwLock, oneshot};
 use tokio::task::JoinSet;
 
+use decdn_gossip::{GossipMetrics, GossipRuntimeConfig, GossipService, PeerTable};
+
 use crate::config::ResolvedConfig;
-use crate::handlers::{Handler, probe::ProbeHandler};
+use crate::handlers::probe::ProbeHandler;
 use crate::{identity, metrics};
 
 /// Ceiling on how long we wait for spawned tasks to drain after the endpoint
 /// and metrics server have been signalled to stop. Sized comfortably larger
-/// than `HANDSHAKE_TIMEOUT` (5s) + `PROBE_CLOSE_TIMEOUT` (3s) so handlers
-/// finish naturally; `abort_all` only fires as a safety net.
+/// than the sum of the probe handler's accept + close timeouts (see
+/// `handlers::probe::ACCEPT_BI_TIMEOUT` + `PROBE_READ_TIMEOUT` +
+/// `PROBE_CLOSE_TIMEOUT`) so in-flight handlers finish naturally; the
+/// `abort_all` branch only fires as a safety net.
 const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(15);
 
-/// Build the endpoint, register handlers, spawn the metrics server, and run
-/// until a shutdown signal (SIGINT / SIGTERM) is received.
-#[allow(clippy::cognitive_complexity)] // Startup wiring reads top-to-bottom; splitting hurts clarity.
+/// Build the endpoint, register handlers on a `Router`, spawn the metrics
+/// server and gossip tasks, and run until a shutdown signal is received.
+#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
-    let metrics = Arc::new(metrics::Metrics::new());
-    metrics.started();
+    let node_metrics = Arc::new(metrics::Metrics::new());
+    node_metrics.started();
 
     let secret_key = identity::load_or_generate(&cfg.identity.data_dir)?;
     tracing::info!(node_id = %secret_key.public(), "loaded node identity");
@@ -38,28 +46,30 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
         "cache engine ready",
     );
 
-    let handlers: Vec<Arc<dyn Handler>> = vec![Arc::new(ProbeHandler::new(
-        secret_key.public(),
-        cfg.payment.rate_per_mb,
-        Arc::clone(&metrics),
-    ))];
-
-    let ep = endpoint::build(&secret_key, cfg.network.bind_port, &handlers)
+    let ep = build_endpoint(&secret_key, cfg.network.bind_port)
         .await
         .context("failed to build iroh endpoint")?;
 
-    metrics
+    node_metrics
         .register_iroh_endpoint(&ep)
         .context("failed to register iroh metrics")?;
 
-    // Bind metrics to loopback by default: /metrics is an unauthenticated HTTP
-    // endpoint that leaks operational data. Operators who want to scrape from
-    // another host should front it with a reverse proxy or run node_exporter
-    // alongside. ADR 020 leaves the bind address operator-configurable; exposing
-    // that as a CLI flag is tracked as a follow-up.
-    //
-    // Bind *synchronously* so a port-in-use or permissions failure aborts
-    // startup via `?` rather than silently leaving the node without /metrics.
+    let gossip = Gossip::builder().spawn(ep.clone());
+
+    let probe_handler = Arc::new(ProbeHandler::new(
+        secret_key.public(),
+        cfg.payment.rate_per_mb,
+        Arc::clone(&node_metrics),
+    ));
+
+    let router = Router::builder(ep.clone())
+        .accept(ProbeHandler::ALPN, probe_handler)
+        .accept(GOSSIP_ALPN, gossip.clone())
+        .spawn();
+
+    // Bind metrics to loopback: /metrics is unauthenticated HTTP and leaks
+    // operational data. Operators who want to scrape from another host should
+    // front it with a reverse proxy.
     let metrics_addr = std::net::SocketAddr::from(([127, 0, 0, 1], cfg.observability.metrics_port));
     let metrics_listener = metrics::bind(metrics_addr)
         .await
@@ -68,18 +78,43 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
     let mut tasks = JoinSet::new();
     let (metrics_stop_tx, metrics_stop_rx) = oneshot::channel::<()>();
 
-    let metrics_handle = Arc::clone(&metrics);
+    let metrics_handle = Arc::clone(&node_metrics);
     tasks.spawn(async move {
         if let Err(err) = metrics::serve(metrics_listener, metrics_handle, metrics_stop_rx).await {
             tracing::error!(%err, "metrics server exited with error");
         }
     });
 
-    let dispatch_ep = ep.clone();
-    let dispatch_metrics = Arc::clone(&metrics);
-    tasks.spawn(async move {
-        dispatch::run(dispatch_ep, handlers, dispatch_metrics).await;
-    });
+    let peer_table = Arc::new(RwLock::new(PeerTable::new(
+        cfg.gossip.peer_ttl_sec.saturating_mul(1_000_000),
+    )));
+    let gossip_runtime_cfg = GossipRuntimeConfig {
+        announce_interval_sec: cfg.gossip.announce_interval_sec,
+        subscribe_global: cfg.gossip.subscribe_global,
+        region: cfg.identity.region.clone(),
+        allowlist: cfg.gossip.allowlist.iter().copied().collect::<HashSet<_>>(),
+    };
+    let gossip_metrics: Arc<dyn GossipMetrics> =
+        Arc::new(NodeGossipMetrics::new(Arc::clone(&node_metrics)));
+    // Keep the gossip JoinHandles outside the JoinSet: dropping a
+    // JoinHandle *detaches* the task in tokio (it keeps running), so if we
+    // only held wrappers inside `tasks` an `abort_all()` would cancel the
+    // wrapper but leak the inner gossip loop. Storing the handles lets us
+    // call `.abort()` on each explicitly during shutdown.
+    //
+    // TODO: GossipService should own its own shutdown (e.g. accept a
+    // CancellationToken or expose `shutdown().await`) so the runtime
+    // doesn't have to reach in with `.abort()`. Tracked for follow-up;
+    // PoC keeps the parent-driven abort to stay minimal.
+    let gossip_handles = GossipService::spawn(
+        ep.clone(),
+        secret_key.clone(),
+        gossip.clone(),
+        gossip_runtime_cfg,
+        Arc::clone(&peer_table),
+        gossip_metrics,
+    )
+    .await;
 
     tracing::info!(
         bind_port = cfg.network.bind_port,
@@ -88,15 +123,25 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
     );
 
     shutdown_signal().await;
-    tracing::info!("shutdown signal received; closing endpoint");
+    tracing::info!("shutdown signal received; closing router");
 
-    // Stop accepting new work. `ep.close()` delivers CONNECTION_CLOSE to each
-    // active peer; the dispatch task's accept loop then falls through and its
-    // internal JoinSet drain waits on per-connection handlers to finish
-    // (bounded by their own timeouts). The oneshot unblocks the metrics
-    // accept loop.
-    ep.close().await;
-    let _ = metrics_stop_tx.send(());
+    // Router::shutdown waits for ProtocolHandler::shutdown on each handler,
+    // then closes the endpoint. Unblock the metrics accept loop too, and
+    // abort gossip's infinite loops (publisher / subscriber / TTL sweeper)
+    // so the drain phase actually finishes rather than hitting the 15s
+    // timeout every time.
+    if let Err(err) = router.shutdown().await {
+        tracing::warn!(%err, "router shutdown reported an error");
+    }
+    if metrics_stop_tx.send(()).is_err() {
+        // Receiver already dropped → metrics server exited on its own
+        // (port died, bind listener errored, etc). Not fatal, but worth a
+        // breadcrumb for shutdown-order debugging.
+        tracing::debug!("metrics stop channel closed before shutdown signal");
+    }
+    for handle in &gossip_handles {
+        handle.abort();
+    }
 
     // Flush the cache store before the drain deadline so in-flight writes
     // hit disk. Intentionally *not* gated by `SHUTDOWN_DEADLINE`: a slow
@@ -113,6 +158,17 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
     let drain = async {
         while let Some(result) = tasks.join_next().await {
             log_join_result(result, "shutdown");
+        }
+        // Await aborted gossip tasks so the runtime doesn't return while
+        // they're still unwinding. `abort()` then `await` resolves with
+        // `JoinError::is_cancelled()`, which is the expected path and not
+        // logged; panics in the gossip loops still surface as warnings.
+        for handle in gossip_handles {
+            if let Err(err) = handle.await
+                && !err.is_cancelled()
+            {
+                tracing::warn!(%err, "gossip task panicked during shutdown");
+            }
         }
     };
     if tokio::time::timeout(SHUTDOWN_DEADLINE, drain).await.is_ok() {
@@ -135,9 +191,48 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
     }
 }
 
-/// Log a `JoinError` from a shutdown-drained task with a phase label so a
-/// panicked or cancelled spawned task (dispatch, metrics) is visible rather
-/// than silently swallowed.
+/// Build an iroh `Endpoint` bound to `bind_port`. ALPNs are set by the
+/// `Router` when it spawns.
+async fn build_endpoint(secret_key: &SecretKey, bind_port: u16) -> anyhow::Result<Endpoint> {
+    let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, bind_port);
+    Endpoint::builder(presets::N0)
+        .secret_key(secret_key.clone())
+        .bind_addr(bind_addr)
+        .map_err(|e| anyhow::anyhow!("invalid bind addr {bind_addr}: {e}"))?
+        .bind()
+        .await
+        .map_err(|e| anyhow::anyhow!("endpoint bind failed: {e}"))
+}
+
+/// Adapter: implements `decdn_gossip::GossipMetrics` against the node's
+/// Prometheus registry.
+#[derive(Debug)]
+struct NodeGossipMetrics {
+    metrics: Arc<metrics::Metrics>,
+}
+
+impl NodeGossipMetrics {
+    const fn new(metrics: Arc<metrics::Metrics>) -> Self {
+        Self { metrics }
+    }
+}
+
+impl GossipMetrics for NodeGossipMetrics {
+    fn inc_published(&self, topic: &str) {
+        self.metrics.gossip_published(topic);
+    }
+    fn inc_received(&self, topic: &str) {
+        self.metrics.gossip_received(topic);
+    }
+    fn inc_rejected(&self, reason: &'static str) {
+        self.metrics.gossip_rejected(reason);
+    }
+    fn set_peer_table_size(&self, n: i64) {
+        self.metrics.gossip_peer_table_size(n);
+    }
+}
+
+/// Log a `JoinError` from a shutdown-drained task with a phase label.
 fn log_join_result(result: Result<(), tokio::task::JoinError>, phase: &'static str) {
     if let Err(err) = result {
         if err.is_cancelled() {

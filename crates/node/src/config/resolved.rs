@@ -71,6 +71,20 @@ pub struct ResolvedPayment {
     pub rate_per_mb: u64,
 }
 
+/// Resolved gossip fields (ADR 001).
+#[derive(Debug)]
+pub struct ResolvedGossip {
+    /// Seconds between outgoing `NodeAnnounce` messages.
+    pub announce_interval_sec: u64,
+    /// Seconds after which a peer-table entry is evicted if unrefreshed.
+    pub peer_ttl_sec: u64,
+    /// Whether to subscribe to and publish on `cdn/global/v1`.
+    pub subscribe_global: bool,
+    /// Validated allowlist of accepted announcer node IDs. Empty = accept any
+    /// signature-valid announce (`PoC` substitute for ADR 001 rule 2).
+    pub allowlist: Vec<[u8; 32]>,
+}
+
 /// Resolved observability fields.
 #[derive(Debug)]
 pub struct ResolvedObservability {
@@ -100,4 +114,5 @@ pub struct ResolvedConfig {
     pub cache: ResolvedCache,
     pub payment: ResolvedPayment,
     pub observability: ResolvedObservability,
+    pub gossip: ResolvedGossip,
 }

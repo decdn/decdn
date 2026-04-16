@@ -24,6 +24,8 @@ pub struct FileConfig {
     pub payment: Option<PaymentConfig>,
     /// Observability settings.
     pub observability: Option<ObservabilityConfig>,
+    /// Gossip settings.
+    pub gossip: Option<GossipConfig>,
 }
 
 /// Identity section of the config file.
@@ -80,6 +82,23 @@ pub struct CacheConfig {
 pub struct PaymentConfig {
     /// Rate per MB in USDC base units.
     pub rate_per_mb: Option<u64>,
+}
+
+/// Gossip section of the config file (ADR 001).
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct GossipConfig {
+    /// Seconds between outgoing `NodeAnnounce` messages. Default 60.
+    pub announce_interval_sec: Option<u64>,
+    /// Seconds after which a peer-table entry is evicted if unrefreshed.
+    /// Default 600.
+    pub peer_ttl_sec: Option<u64>,
+    /// Whether to subscribe to and publish on the global topic
+    /// (`cdn/global/v1`). Default true.
+    pub subscribe_global: Option<bool>,
+    /// Optional allowlist of accepted announcer node IDs, hex-encoded
+    /// (64 hex chars, either case). Absent/empty = accept any signature-valid
+    /// announce. `PoC` replacement for ADR 001 rule 2 (staked-node check).
+    pub allowlist: Option<Vec<String>>,
 }
 
 /// Observability section of the config file.

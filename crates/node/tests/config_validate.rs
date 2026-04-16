@@ -12,8 +12,8 @@ use clap::Parser;
 use decdn_node::cli::{ConfigValidateArgs, RunArgs};
 use decdn_node::commands;
 use decdn_node::config::{
-    ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedIdentity, ResolvedNetwork,
-    ResolvedObservability, ResolvedPayment,
+    ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedGossip, ResolvedIdentity,
+    ResolvedNetwork, ResolvedObservability, ResolvedPayment,
 };
 use tempfile::TempDir;
 
@@ -26,6 +26,9 @@ struct RunArgsWrap {
 }
 
 const VALID_CONFIG: &str = r#"
+[identity]
+region = "us"
+
 [blockchain]
 rpc_url = "https://sepolia-rollup.arbitrum.io/rpc"
 payment_channel_address = "0x0000000000000000000000000000000000000001"
@@ -202,6 +205,12 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             log_format: decdn_node::cli::LogFormat::Pretty,
             metrics_port: 9090,
             otlp_endpoint: None,
+        },
+        gossip: ResolvedGossip {
+            announce_interval_sec: 60,
+            peer_ttl_sec: 600,
+            subscribe_global: true,
+            allowlist: Vec::new(),
         },
     };
     overrides(&mut cfg);
