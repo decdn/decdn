@@ -261,6 +261,12 @@ Probe fan-out is O(N) per cache miss and does not scale beyond ~100 nodes. Gossi
 
 All PoC/production behavioral differences are expressed as Rust traits with separate concrete implementations (`file.rs` / `keychain.rs`, `simple.rs` / `weighted.rs`, etc.). The `node` crate wires the correct implementations at compile time via a single `poc` Cargo feature declared only on that crate. No `#[cfg(feature = "poc")]` appears in leaf crates. Seven seams are defined: `KeyStore`, `ReputationEngine`, `PaymentChannelClient`, `GovernanceClient`, `WatchtowerClient`, `CorruptionChallenger`, and `NetworkConstants`. Production is the default compile target — the `poc` feature must be explicitly opted in. Solidity contract differences (admin key vs Governor, `adminReclaimNodeId` presence) are managed via separate Foundry deploy scripts rather than Rust feature flags.
 
+### [ADR 024 — Account Abstraction and Safe Smart Wallet Support](024-account-abstraction.md)
+
+**Universal `SignatureChecker` across all contracts; Safe as the recommended wallet for nodes and clients; session keys via ERC-7579 `smartsessions` deferred to production.**
+
+Every signature verification site (voucher close/dispute, node registration, slash challenges) uses OpenZeppelin's `SignatureChecker.isValidSignatureNow` rather than `ECDSA.recover` — transparently supporting both EOAs (`ecrecover`, ~5.6K gas) and smart accounts (ERC-1271 `isValidSignature`, ~12–15K gas for Safe). EIP-712 domains, typed data hashes, and voucher formats are unchanged. PoC configuration: node operators and high-value clients run a 1-of-1 Safe with a software-held owner key on the signing host — same trust posture as today's `eth_keystore`, but routed through Safe for ERC-1271 compatibility on day one. `SlashJudge`'s verification pattern shifts from "recover-then-lookup" to "verify-against-provided-address" because ERC-1271 has no recovery. Production migrates the hot signing path (per-MB vouchers, per-probe/stream `slash_sig`) to Safe-7579 + [`erc7579/smartsessions`](https://github.com/erc7579/smartsessions) — a standardized session-key module with ERC-1271 validation, time windows, selector/domain-scoped action policies, per-session spending caps, and first-class revocation. EOAs remain fully functional for clients who prefer them; `SignatureChecker` makes wallet type transparent at the protocol level.
+
 ---
 
 ## Key Invariants
