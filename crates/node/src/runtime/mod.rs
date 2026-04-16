@@ -160,7 +160,9 @@ async fn build_cache(cfg: &ResolvedConfig) -> anyhow::Result<CacheEngine> {
                 HttpOrigin::new(url).context("failed to build HTTP origin client")?,
             )),
             (None, Some(path)) => Some(Arc::new(
-                FilesystemOrigin::new(path).context("failed to open filesystem origin")?,
+                FilesystemOrigin::new(path)
+                    .await
+                    .context("failed to open filesystem origin")?,
             )),
             (None, None) => None,
             // resolve_cache enforces this mutex; this arm is unreachable in

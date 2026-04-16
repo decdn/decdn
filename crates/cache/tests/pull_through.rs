@@ -369,7 +369,7 @@ async fn pull_through_succeeds_above_blocking_hash_threshold() -> anyhow::Result
     seed_fs_blob(origin_dir.path(), hash, &payload)?;
 
     let cache_dir = tempfile::tempdir()?;
-    let origin = Arc::new(FilesystemOrigin::new(origin_dir.path())?);
+    let origin = Arc::new(FilesystemOrigin::new(origin_dir.path()).await?);
     let engine = CacheEngine::open(cache_dir.path(), Some(origin), 16).await?;
 
     let got = engine.get(hash).await?;
@@ -444,7 +444,7 @@ async fn fs_origin_pulls_and_caches() -> anyhow::Result<()> {
     seed_fs_blob(origin_dir.path(), hash, payload)?;
 
     let cache_dir = tempfile::tempdir()?;
-    let origin = Arc::new(FilesystemOrigin::new(origin_dir.path())?);
+    let origin = Arc::new(FilesystemOrigin::new(origin_dir.path()).await?);
     let engine = CacheEngine::open(cache_dir.path(), Some(origin), 16).await?;
 
     anyhow::ensure!(!engine.has(hash).await?, "blob should be absent initially");
@@ -463,7 +463,7 @@ async fn fs_origin_pulls_and_caches() -> anyhow::Result<()> {
 async fn fs_origin_reports_not_found() -> anyhow::Result<()> {
     let origin_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
-    let origin = Arc::new(FilesystemOrigin::new(origin_dir.path())?);
+    let origin = Arc::new(FilesystemOrigin::new(origin_dir.path()).await?);
     let engine = CacheEngine::open(cache_dir.path(), Some(origin), 16).await?;
 
     let err = err_of(engine.get(Hash::new(b"absent")).await)?;
@@ -484,7 +484,7 @@ async fn fs_origin_rejects_oversize() -> anyhow::Result<()> {
     seed_fs_blob(origin_dir.path(), hash, &payload)?;
 
     let cache_dir = tempfile::tempdir()?;
-    let origin = Arc::new(FilesystemOrigin::new(origin_dir.path())?);
+    let origin = Arc::new(FilesystemOrigin::new(origin_dir.path()).await?);
     let engine = CacheEngine::open(cache_dir.path(), Some(origin), 1).await?;
 
     let err = err_of(engine.get(hash).await)?;

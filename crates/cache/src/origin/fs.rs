@@ -32,9 +32,10 @@ impl FilesystemOrigin {
     /// Construct an origin rooted at `base`. Fails fast if `base` doesn't
     /// exist or isn't a directory — a typo in the config shouldn't surface
     /// as a per-request miss.
-    pub fn new(base: impl Into<PathBuf>) -> anyhow::Result<Self> {
+    pub async fn new(base: impl Into<PathBuf>) -> anyhow::Result<Self> {
         let base = base.into();
-        let meta = std::fs::metadata(&base)
+        let meta = tokio::fs::metadata(&base)
+            .await
             .with_context(|| format!("cache.origin_path {} is not accessible", base.display()))?;
         if !meta.is_dir() {
             anyhow::bail!("cache.origin_path {} is not a directory", base.display());
@@ -112,11 +113,12 @@ impl Origin for FilesystemOrigin {
 mod tests {
     use super::*;
 
-    #[test]
-    fn new_rejects_missing_path() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn new_rejects_missing_path() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let missing = tmp.path().join("does-not-exist");
         let err = FilesystemOrigin::new(&missing)
+            .await
             .err()
             .ok_or_else(|| anyhow::anyhow!("missing path should have been rejected"))?
             .to_string();
@@ -127,10 +129,11 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn new_rejects_non_directory() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn new_rejects_non_directory() -> anyhow::Result<()> {
         let tmp = tempfile::NamedTempFile::new()?;
         let err = FilesystemOrigin::new(tmp.path())
+            .await
             .err()
             .ok_or_else(|| anyhow::anyhow!("file path should have been rejected"))?
             .to_string();
@@ -141,10 +144,10 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn path_for_uses_two_char_shard() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn path_for_uses_two_char_shard() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
-        let origin = FilesystemOrigin::new(tmp.path())?;
+        let origin = FilesystemOrigin::new(tmp.path()).await?;
         let hash = Hash::new(b"marker");
         let hex = hash.to_hex();
         let path = origin.path_for(hash);
