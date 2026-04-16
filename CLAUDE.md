@@ -4,7 +4,7 @@
 
 Decentralized CDN (deCDN) — nodes cache and serve content-addressed blobs over iroh QUIC, clients pay per-MB via off-chain USDC payment channels. Rust implementation targeting a PoC of tens of nodes on an Arbitrum Sepolia testnet.
 
-**Status: Early implementation.** Cargo workspace with 5 crates. `node` has CLI, config, runtime bring-up, and a probe handler; `protocol` has varint framing and the `ProbeMessage` enum (ADR 013). `cache`, `incentive`, `reputation` are still stubs. ADRs in `adr/` remain the primary design artifacts.
+**Status: Early implementation.** Cargo workspace with 6 crates. `node` has CLI, config, runtime bring-up, and a probe handler; `protocol` has varint framing, `ProbeMessage` (ADR 013), and `NodeAnnounce` gossip types; `cache` has the pull-through engine + HTTP/filesystem origin adapters; `gossip` has the `NodeAnnounce` pub/sub service with peer table. `incentive` and `reputation` are still stubs. ADRs in `adr/` remain the primary design artifacts.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for build commands, ADR conventions, pre-commit hooks, and development environment setup.
 
@@ -36,12 +36,13 @@ crates/
   node/         — binary entry point, CLI, config, wiring
   protocol/     — shared types, wire format, ALPN message definitions (leaf crate, minimal deps)
   cache/        — cache engine wrapping iroh-blobs + origin pull-through
+  gossip/       — NodeAnnounce pub/sub over iroh-gossip, peer table, envelope validation
   incentive/    — payment channels, staking, vouchers (alloy for Ethereum)
   reputation/   — gossip-based reputation scoring
   contracts/    — Solidity contracts + Foundry (excluded from workspace, not yet populated)
 ```
 
-**Dependency flow:** `node → cache, incentive, reputation, protocol`. Cache and incentive are independent — cache works without payment logic (useful for testing/local dev).
+**Dependency flow:** `node → cache, gossip, incentive, reputation, protocol`. Cache and incentive are independent — cache works without payment logic (useful for testing/local dev).
 
 ### Wire Protocols (Core CDN)
 
@@ -52,6 +53,7 @@ crates/
 | `cdn/watchtower/v1` | Channel-dispute monitoring, voucher registration |
 | `cdn/dht/v1` | Content discovery via Kademlia DHT (see ADR 022) |
 | iroh-gossip (built-in) | Node metadata broadcast (`NodeAnnounce`), node discovery |
+| `cdn/reputation/v1` (gossip topic) | Reputation reports over iroh-gossip |
 
 ### Companion Protocol (App Server)
 
@@ -67,4 +69,5 @@ crates/
 - No external origin URLs are ever exposed — origin backends (S3/R2/B2) are opaque per-node config
 - All byte transfers are paid, including node-to-node cache-miss pulls
 - TOKEN for staking/governance, USDC for payments (dual-currency model)
+- Per ADR 023: domain crates (`cache`, `gossip`, etc.) are "leaf" — no mode branching or `#[cfg(feature = "poc")]`. The `node` crate's wiring layer selects backends/implementations.
 - ADRs in `adr/` document all major decisions; `adr/architecture.md` is the living overview
