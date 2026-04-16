@@ -24,6 +24,7 @@ decdn-protocol = { workspace = true }
 decdn-cache = { workspace = true }
 decdn-incentive = { workspace = true }
 decdn-reputation = { workspace = true }
+decdn-gossip = { workspace = true }
 alloy = { workspace = true }
 iroh = { workspace = true }
 iroh-blobs = { workspace = true }
@@ -49,7 +50,7 @@ opentelemetry-otlp = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

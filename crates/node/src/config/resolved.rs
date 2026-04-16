@@ -49,6 +49,19 @@ pub struct ResolvedCache {
     pub cache_size_mb: u64,
     /// Maximum single blob size in megabytes.
     pub max_blob_size_mb: u64,
+    /// Optional HTTP origin base URL for pull-through on cache misses.
+    /// Parsed, scheme-validated, and path-normalized at resolution time via
+    /// [`decdn_cache::parse_origin_url`] so invalid URLs fail config
+    /// loading. Constructing an [`decdn_cache::OriginUrl`] outside the
+    /// parser is impossible — the invariants (http/https scheme,
+    /// trailing-slash path, no query/fragment) are type-enforced.
+    pub origin_url: Option<decdn_cache::OriginUrl>,
+    /// Optional filesystem origin root. Blobs live at
+    /// `{path}/{hex[0..2]}/{hex}`. Directory-existence is validated when
+    /// the runtime constructs the [`decdn_cache::FilesystemOrigin`] —
+    /// config resolution carries the raw path so resolution stays
+    /// filesystem-free and testable without real I/O.
+    pub origin_path: Option<PathBuf>,
 }
 
 /// Resolved payment fields.
@@ -56,6 +69,20 @@ pub struct ResolvedCache {
 pub struct ResolvedPayment {
     /// Rate per MB in USDC base units (6 decimals).
     pub rate_per_mb: u64,
+}
+
+/// Resolved gossip fields (ADR 001).
+#[derive(Debug)]
+pub struct ResolvedGossip {
+    /// Seconds between outgoing `NodeAnnounce` messages.
+    pub announce_interval_sec: u64,
+    /// Seconds after which a peer-table entry is evicted if unrefreshed.
+    pub peer_ttl_sec: u64,
+    /// Whether to subscribe to and publish on `cdn/global/v1`.
+    pub subscribe_global: bool,
+    /// Validated allowlist of accepted announcer node IDs. Empty = accept any
+    /// signature-valid announce (`PoC` substitute for ADR 001 rule 2).
+    pub allowlist: Vec<[u8; 32]>,
 }
 
 /// Resolved observability fields.
@@ -87,4 +114,5 @@ pub struct ResolvedConfig {
     pub cache: ResolvedCache,
     pub payment: ResolvedPayment,
     pub observability: ResolvedObservability,
+    pub gossip: ResolvedGossip,
 }
