@@ -73,8 +73,7 @@ impl ProbeHandler {
         let measured_at_unix_ms = u64::try_from(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0),
+                .map_or(0, |d| d.as_millis()),
         )
         .unwrap_or(u64::MAX);
 
