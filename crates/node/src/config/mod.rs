@@ -14,8 +14,8 @@ use crate::cli::common::{self, expand_tilde};
 use crate::cli::run::RunArgs;
 
 pub use resolved::{
-    ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedIdentity, ResolvedNetwork,
-    ResolvedObservability, ResolvedPayment,
+    ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedGossip, ResolvedIdentity,
+    ResolvedNetwork, ResolvedObservability, ResolvedPayment,
 };
 pub use types::FileConfig;
 
@@ -29,6 +29,10 @@ const DEFAULT_MAX_BLOB_SIZE_MB: u64 = 10_240;
 const DEFAULT_RATE_PER_MB: u64 = 10;
 /// Default Prometheus metrics port.
 const DEFAULT_METRICS_PORT: u16 = 9090;
+/// Default interval between outgoing `NodeAnnounce` messages (ADR 001).
+const DEFAULT_ANNOUNCE_INTERVAL_SEC: u64 = 60;
+/// Default peer-table entry TTL after which a stale entry is evicted.
+const DEFAULT_PEER_TTL_SEC: u64 = 600;
 
 /// Load config from file (if present) and merge with CLI args.
 ///
@@ -54,6 +58,9 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
     let cache = resolve_cache(&cli.cache, file.cache.as_ref(), &identity.data_dir);
     let payment = resolve_payment(&cli.payment, file.payment.as_ref())?;
     let observability = resolve_observability(&cli.observability, file.observability.as_ref());
+    let gossip = resolve_gossip(file.gossip.as_ref())?;
+
+    ensure_region_when_publishing_global(&identity, &gossip)?;
 
     Ok(ResolvedConfig {
         identity,
@@ -62,7 +69,27 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
         cache,
         payment,
         observability,
+        gossip,
     })
+}
+
+/// Reject configurations that would publish a region-less `NodeAnnounce` on
+/// the global gossip topic — every peer drops those as `BadRegion`.
+///
+/// Region subscription is separately gated on `identity.region.is_some()` in
+/// `GossipService::spawn`, so only the global-topic case needs an interlock:
+/// if global is off and no region is set, the service runs as a no-op.
+fn ensure_region_when_publishing_global(
+    identity: &ResolvedIdentity,
+    gossip: &ResolvedGossip,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        identity.region.is_some() || !gossip.subscribe_global,
+        "identity.region must be set when gossip.subscribe_global is true \
+         (it signs every NodeAnnounce); set identity.region or disable the \
+         global topic by setting gossip.subscribe_global = false"
+    );
+    Ok(())
 }
 
 /// Resolve identity fields.
@@ -84,9 +111,24 @@ fn resolve_identity(
     let region = cli
         .region
         .clone()
-        .or_else(|| file.and_then(|i| i.region.clone()));
+        .or_else(|| file.and_then(|i| i.region.clone()))
+        .map(|r| normalize_region(&r))
+        .transpose()?;
 
     Ok(ResolvedIdentity { data_dir, region })
+}
+
+/// Normalize an operator-supplied region code: uppercase it and require
+/// exactly two ASCII letters (ISO 3166-1 alpha-2 per ADR 001). A bad value
+/// here would otherwise cause the node to publish announces that it and
+/// its peers all reject at validation time — fail loudly at startup.
+fn normalize_region(raw: &str) -> anyhow::Result<String> {
+    let upper = raw.to_ascii_uppercase();
+    anyhow::ensure!(
+        upper.len() == 2 && upper.bytes().all(|b| b.is_ascii_uppercase()),
+        "identity.region must be 2 ASCII letters (ISO 3166-1 alpha-2), got {raw:?}"
+    );
+    Ok(upper)
 }
 
 /// Resolve network fields.
@@ -278,6 +320,70 @@ fn resolve_observability(
     }
 }
 
+/// Resolve gossip fields. Allowlist entries are parsed as 64-character hex
+/// node IDs (either case accepted); bad entries fail loudly at startup
+/// rather than silently degrading to accept-all mode later.
+fn resolve_gossip(file: Option<&types::GossipConfig>) -> anyhow::Result<ResolvedGossip> {
+    let announce_interval_sec = file
+        .and_then(|g| g.announce_interval_sec)
+        .unwrap_or(DEFAULT_ANNOUNCE_INTERVAL_SEC);
+    anyhow::ensure!(
+        announce_interval_sec > 0,
+        "gossip.announce_interval_sec must be > 0"
+    );
+
+    let peer_ttl_sec = file
+        .and_then(|g| g.peer_ttl_sec)
+        .unwrap_or(DEFAULT_PEER_TTL_SEC);
+    anyhow::ensure!(peer_ttl_sec > 0, "gossip.peer_ttl_sec must be > 0");
+
+    let subscribe_global = file.and_then(|g| g.subscribe_global).unwrap_or(true);
+
+    let allowlist = file
+        .and_then(|g| g.allowlist.as_ref())
+        .map(|v| v.iter().map(|s| parse_node_id_hex(s)).collect())
+        .transpose()?
+        .unwrap_or_default();
+
+    Ok(ResolvedGossip {
+        announce_interval_sec,
+        peer_ttl_sec,
+        subscribe_global,
+        allowlist,
+    })
+}
+
+/// Parse a 64-character hex (case-insensitive) node ID into 32 raw bytes.
+fn parse_node_id_hex(s: &str) -> anyhow::Result<[u8; 32]> {
+    anyhow::ensure!(
+        s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()),
+        "gossip.allowlist entry must be 64 hex chars, got {s:?}"
+    );
+    let mut out = [0u8; 32];
+    let bytes = s.as_bytes();
+    for (i, slot) in out.iter_mut().enumerate() {
+        let hi = bytes
+            .get(i * 2)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
+        let lo = bytes
+            .get(i * 2 + 1)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
+        *slot = (hex_val(hi)? << 4) | hex_val(lo)?;
+    }
+    Ok(out)
+}
+
+fn hex_val(b: u8) -> anyhow::Result<u8> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => anyhow::bail!("invalid hex digit: {}", b as char),
+    }
+}
+
 /// Load a [`FileConfig`] from disk.
 ///
 /// - If `explicit_path` is `Some`, reads that file (errors if missing).
@@ -437,8 +543,189 @@ fn expand_braces(raw: &str, ctx: &'static str) -> anyhow::Result<String> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_region_accepts_and_uppercases() -> anyhow::Result<()> {
+        assert_eq!(normalize_region("US")?, "US");
+        assert_eq!(normalize_region("us")?, "US");
+        assert_eq!(normalize_region("Us")?, "US");
+        Ok(())
+    }
+
+    #[test]
+    fn normalize_region_rejects_wrong_length_or_charset() {
+        for bad in ["usa", "u1", "", "U", "U S", "Ü1", "12", "U-"] {
+            assert!(
+                normalize_region(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_node_id_hex_accepts_either_case() -> anyhow::Result<()> {
+        let lower = "0".repeat(64);
+        let upper = "A".repeat(64);
+        let mixed: String = "Aa".repeat(32);
+        assert_eq!(parse_node_id_hex(&lower)?, [0u8; 32]);
+        assert_eq!(parse_node_id_hex(&upper)?, [0xAA; 32]);
+        assert_eq!(parse_node_id_hex(&mixed)?, [0xAA; 32]);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_node_id_hex_round_trips_nibble_order() -> anyhow::Result<()> {
+        let hex = "0123456789abcdef".repeat(4);
+        let bytes = parse_node_id_hex(&hex)?;
+        // First byte should be 0x01 — high nibble from '0', low from '1'.
+        assert_eq!(bytes[0], 0x01);
+        assert_eq!(bytes[1], 0x23);
+        assert_eq!(bytes[31], 0xef);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_node_id_hex_rejects_bad_input() {
+        assert!(parse_node_id_hex(&"0".repeat(63)).is_err());
+        assert!(parse_node_id_hex(&"0".repeat(65)).is_err());
+        assert!(parse_node_id_hex(&"g".repeat(64)).is_err());
+        assert!(parse_node_id_hex("").is_err());
+    }
+
+    #[test]
+    fn resolve_gossip_allowlist_happy_path() -> anyhow::Result<()> {
+        // "0123456789abcdef" repeated 4× = 64 hex chars.
+        // Decodes pairwise to 8 bytes (01 23 45 67 89 ab cd ef), repeated 4×.
+        let cfg = types::GossipConfig {
+            allowlist: Some(vec!["0123456789abcdef".repeat(4)]),
+            ..Default::default()
+        };
+        let g = resolve_gossip(Some(&cfg))?;
+        let pattern = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
+        let expected: [u8; 32] = std::array::from_fn(|i| pattern[i % 8]);
+        assert!(g.allowlist.contains(&expected));
+        assert_eq!(g.allowlist.len(), 1);
+        Ok(())
+    }
+
+    fn ident(region: Option<&str>) -> ResolvedIdentity {
+        ResolvedIdentity {
+            data_dir: PathBuf::from("/tmp/unused"),
+            region: region.map(String::from),
+        }
+    }
+
+    fn gossip_cfg(subscribe_global: bool) -> ResolvedGossip {
+        ResolvedGossip {
+            announce_interval_sec: 60,
+            peer_ttl_sec: 600,
+            subscribe_global,
+            allowlist: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn ensure_region_when_publishing_global_rejects_missing_region() {
+        let err = ensure_region_when_publishing_global(&ident(None), &gossip_cfg(true))
+            .expect_err("expected error when global is on but region is absent")
+            .to_string();
+        assert!(
+            err.contains("identity.region"),
+            "error missing field context: {err}"
+        );
+    }
+
+    #[test]
+    fn ensure_region_when_publishing_global_accepts_region_set() -> anyhow::Result<()> {
+        ensure_region_when_publishing_global(&ident(Some("US")), &gossip_cfg(true))?;
+        Ok(())
+    }
+
+    #[test]
+    fn ensure_region_when_publishing_global_accepts_subscribe_only() -> anyhow::Result<()> {
+        // `subscribe_global = false` + no region = subscribe-only noop; fine.
+        ensure_region_when_publishing_global(&ident(None), &gossip_cfg(false))?;
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_gossip_applies_positive_values() -> anyhow::Result<()> {
+        let cfg = types::GossipConfig {
+            announce_interval_sec: Some(42),
+            peer_ttl_sec: Some(123),
+            subscribe_global: Some(false),
+            allowlist: None,
+        };
+        let g = resolve_gossip(Some(&cfg))?;
+        assert_eq!(g.announce_interval_sec, 42);
+        assert_eq!(g.peer_ttl_sec, 123);
+        assert!(!g.subscribe_global);
+        assert!(g.allowlist.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_gossip_applies_defaults_when_absent() -> anyhow::Result<()> {
+        let g = resolve_gossip(None)?;
+        assert_eq!(g.announce_interval_sec, DEFAULT_ANNOUNCE_INTERVAL_SEC);
+        assert_eq!(g.peer_ttl_sec, DEFAULT_PEER_TTL_SEC);
+        assert!(g.subscribe_global);
+        assert!(g.allowlist.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_gossip_rejects_zero_announce_interval() {
+        let cfg = types::GossipConfig {
+            announce_interval_sec: Some(0),
+            ..Default::default()
+        };
+        let err = resolve_gossip(Some(&cfg))
+            .expect_err("expected error")
+            .to_string();
+        assert!(
+            err.contains("announce_interval_sec"),
+            "error missing field context: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_gossip_rejects_zero_peer_ttl() {
+        let cfg = types::GossipConfig {
+            peer_ttl_sec: Some(0),
+            ..Default::default()
+        };
+        let err = resolve_gossip(Some(&cfg))
+            .expect_err("expected error")
+            .to_string();
+        assert!(
+            err.contains("peer_ttl_sec"),
+            "error missing field context: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_gossip_rejects_bad_allowlist_entry() {
+        let cfg = types::GossipConfig {
+            allowlist: Some(vec!["0".repeat(63)]),
+            ..Default::default()
+        };
+        let err = resolve_gossip(Some(&cfg))
+            .expect_err("expected error")
+            .to_string();
+        assert!(
+            err.contains("64 hex chars"),
+            "error missing field context: {err}"
+        );
+    }
 
     // HOME is guaranteed set in Rust test harness on Linux/macOS and used here
     // to exercise ${VAR} expansion without mutating the process environment
