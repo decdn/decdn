@@ -2,7 +2,7 @@
 
 use clap::Parser;
 
-use decdn_node::cli::{self, Cli, Command};
+use decdn_node::cli::{self, Cli, Command, ConfigCommand};
 use decdn_node::commands;
 
 #[tokio::main]
@@ -14,7 +14,12 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Run(run_args) => commands::run(config_path.as_deref(), &run_args).await,
         Command::KeyGen(args) => commands::key_gen(&args),
-        Command::Config(args) => commands::config_init(&args),
+        Command::Config(args) => match args.command {
+            ConfigCommand::Init(init) => commands::config_init(&init),
+            ConfigCommand::Validate(validate) => {
+                commands::config_validate(config_path.as_deref(), &validate)
+            }
+        },
         Command::Probe(args) => commands::probe(&args).await,
     }
 }
