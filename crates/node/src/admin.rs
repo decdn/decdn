@@ -174,7 +174,7 @@ async fn peers_response(state: &AdminState) -> Response<Full<Bytes>> {
             .map(|(id, entry)| PeerView::from_entry(id, entry))
             .collect();
         // Most recently seen first — on-call use case is "is gossip alive?".
-        views.sort_by(|a, b| b.last_seen_us.cmp(&a.last_seen_us));
+        views.sort_by_key(|v| std::cmp::Reverse(v.last_seen_us));
         views
     };
 
