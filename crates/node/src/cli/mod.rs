@@ -3,12 +3,14 @@
 pub mod common;
 pub mod config_cmd;
 pub mod key_gen;
+pub mod node;
 pub mod probe;
 pub mod run;
 
 pub use common::{LogFormat, default_config_path, default_data_dir};
 pub use config_cmd::{ConfigArgs, ConfigCommand, ConfigInitArgs, ConfigValidateArgs};
 pub use key_gen::KeyGenArgs;
+pub use node::{NodeArgs, NodeCommand, PeersArgs};
 pub use probe::ProbeArgs;
 pub use run::RunArgs;
 
@@ -40,4 +42,7 @@ pub enum Command {
     Config(ConfigArgs),
     /// Probe a running node over the `cdn/probe/v1` ALPN.
     Probe(ProbeArgs),
+    /// Operator-local admin commands that query a running node
+    /// over its loopback HTTP surface (ADR 025).
+    Node(NodeArgs),
 }

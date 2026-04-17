@@ -4,6 +4,7 @@
 //! and dispatches into [`commands`]. Integration tests and downstream tools
 //! should depend on this library rather than reaching into `src/` via `#[path]`.
 
+pub mod admin;
 pub mod cli;
 pub mod commands;
 pub mod config;

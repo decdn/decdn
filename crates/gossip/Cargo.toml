@@ -13,6 +13,7 @@ iroh-gossip = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = "0.1"
 postcard = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }

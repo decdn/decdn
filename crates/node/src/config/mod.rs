@@ -33,6 +33,8 @@ const DEFAULT_MAX_BLOB_SIZE_MB: u64 = 1_024;
 const DEFAULT_RATE_PER_MB: u64 = 10;
 /// Default Prometheus metrics port.
 const DEFAULT_METRICS_PORT: u16 = 9090;
+/// Default loopback admin HTTP port (ADR 025).
+const DEFAULT_ADMIN_PORT: u16 = 9191;
 /// Default interval between outgoing `NodeAnnounce` messages (ADR 001).
 const DEFAULT_ANNOUNCE_INTERVAL_SEC: u64 = 60;
 /// Default peer-table entry TTL after which a stale entry is evicted.
@@ -61,7 +63,7 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
     )?;
     let cache = resolve_cache(&cli.cache, file.cache.as_ref(), &identity.data_dir)?;
     let payment = resolve_payment(&cli.payment, file.payment.as_ref())?;
-    let observability = resolve_observability(&cli.observability, file.observability.as_ref());
+    let observability = resolve_observability(&cli.observability, file.observability.as_ref())?;
     let gossip = resolve_gossip(file.gossip.as_ref())?;
 
     ensure_region_when_publishing_global(&identity, &gossip)?;
@@ -360,10 +362,16 @@ fn resolve_payment(
 }
 
 /// Resolve observability fields.
+///
+/// The admin port is merged with `0` as a first-class "disable" value so
+/// operators can turn the surface off without removing the line from their
+/// config. `admin_port == metrics_port` is rejected because sharing one
+/// TCP socket across two servers would silently make the second bind fail
+/// at startup.
 fn resolve_observability(
     cli: &crate::cli::run::ObservabilityArgs,
     file: Option<&types::ObservabilityConfig>,
-) -> ResolvedObservability {
+) -> anyhow::Result<ResolvedObservability> {
     let log_level = cli
         .log_level
         .or_else(|| file.and_then(|o| o.log_level))
@@ -379,17 +387,37 @@ fn resolve_observability(
         .or_else(|| file.and_then(|o| o.metrics_port))
         .unwrap_or(DEFAULT_METRICS_PORT);
 
+    let admin_port_raw = cli
+        .admin_port
+        .or_else(|| file.and_then(|o| o.admin_port))
+        .unwrap_or(DEFAULT_ADMIN_PORT);
+    let admin_port = if admin_port_raw == 0 {
+        None
+    } else {
+        Some(admin_port_raw)
+    };
+    if let Some(p) = admin_port
+        && p == metrics_port
+    {
+        anyhow::bail!(
+            "observability.admin_port ({p}) must differ from \
+             observability.metrics_port ({metrics_port}); the two servers \
+             cannot share a TCP port"
+        );
+    }
+
     let otlp_endpoint = cli
         .otlp_endpoint
         .clone()
         .or_else(|| file.and_then(|o| o.otlp_endpoint.clone()));
 
-    ResolvedObservability {
+    Ok(ResolvedObservability {
         log_level,
         log_format,
         metrics_port,
+        admin_port,
         otlp_endpoint,
-    }
+    })
 }
 
 /// Resolve gossip fields. Allowlist entries are parsed as 64-character hex
@@ -1104,6 +1132,7 @@ mod tests {
                     log_level: None,
                     log_format: None,
                     metrics_port: None,
+                    admin_port: None,
                     otlp_endpoint: Some(v.to_string()),
                 });
             }),
@@ -1378,6 +1407,62 @@ mod tests {
             resolved.max_blob_size_mb,
             resolved.cache_size_mb
         );
+        Ok(())
+    }
+
+    fn obs_cli(
+        metrics_port: Option<u16>,
+        admin_port: Option<u16>,
+    ) -> crate::cli::run::ObservabilityArgs {
+        crate::cli::run::ObservabilityArgs {
+            log_level: None,
+            log_format: None,
+            metrics_port,
+            admin_port,
+            otlp_endpoint: None,
+        }
+    }
+
+    #[test]
+    fn resolve_observability_defaults_admin_port_to_9191() -> anyhow::Result<()> {
+        let obs = resolve_observability(&obs_cli(None, None), None)?;
+        anyhow::ensure!(
+            obs.admin_port == Some(DEFAULT_ADMIN_PORT),
+            "got: {:?}",
+            obs.admin_port
+        );
+        anyhow::ensure!(obs.metrics_port == DEFAULT_METRICS_PORT);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_observability_admin_port_zero_disables() -> anyhow::Result<()> {
+        let obs = resolve_observability(&obs_cli(None, Some(0)), None)?;
+        anyhow::ensure!(obs.admin_port.is_none(), "got: {:?}", obs.admin_port);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_observability_rejects_admin_eq_metrics() -> anyhow::Result<()> {
+        let err = resolve_observability(&obs_cli(Some(9090), Some(9090)), None)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected collision rejection"))?
+            .to_string();
+        anyhow::ensure!(
+            err.contains("admin_port") && err.contains("metrics_port"),
+            "error lacked context: {err}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_observability_cli_admin_port_overrides_file() -> anyhow::Result<()> {
+        let file = types::ObservabilityConfig {
+            admin_port: Some(1111),
+            ..Default::default()
+        };
+        let obs = resolve_observability(&obs_cli(None, Some(2222)), Some(&file))?;
+        anyhow::ensure!(obs.admin_port == Some(2222), "got: {:?}", obs.admin_port);
         Ok(())
     }
 }

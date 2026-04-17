@@ -7,9 +7,10 @@
 use std::collections::HashMap;
 
 use decdn_protocol::NodeAnnounce;
+use serde::{Deserialize, Serialize};
 
 /// One entry in the peer table.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerEntry {
     /// Most recent signature-valid announce for this peer.
     pub announce: NodeAnnounce,

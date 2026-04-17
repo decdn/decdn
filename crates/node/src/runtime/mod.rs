@@ -17,6 +17,7 @@ use tokio::task::JoinSet;
 
 use decdn_gossip::{GossipMetrics, GossipRuntimeConfig, GossipService, PeerTable};
 
+use crate::admin;
 use crate::config::ResolvedConfig;
 use crate::handlers::probe::ProbeHandler;
 use crate::{identity, metrics};
@@ -88,6 +89,28 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
     let peer_table = Arc::new(RwLock::new(PeerTable::new(
         cfg.gossip.peer_ttl_sec.saturating_mul(1_000_000),
     )));
+
+    // Admin HTTP surface (ADR 025). Bound before the gossip service spawns so
+    // startup fails fast on a port collision rather than after side-effectful
+    // subscriptions have registered.
+    let admin_stop_tx = if let Some(admin_port) = cfg.observability.admin_port {
+        let admin_addr = std::net::SocketAddr::from(([127, 0, 0, 1], admin_port));
+        let admin_listener = admin::bind(admin_addr)
+            .await
+            .context("failed to bind admin listener")?;
+        let (tx, rx) = oneshot::channel::<()>();
+        let state = admin::AdminState::new(Arc::clone(&peer_table));
+        tasks.spawn(async move {
+            if let Err(err) = admin::serve(admin_listener, state, rx).await {
+                tracing::error!(%err, "admin server exited with error");
+            }
+        });
+        Some(tx)
+    } else {
+        tracing::info!("admin server disabled (observability.admin_port unset)");
+        None
+    };
+
     let gossip_runtime_cfg = GossipRuntimeConfig {
         announce_interval_sec: cfg.gossip.announce_interval_sec,
         subscribe_global: cfg.gossip.subscribe_global,
@@ -119,6 +142,7 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
     tracing::info!(
         bind_port = cfg.network.bind_port,
         metrics_port = cfg.observability.metrics_port,
+        admin_port = ?cfg.observability.admin_port,
         "node runtime ready"
     );
 
@@ -138,6 +162,11 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
         // (port died, bind listener errored, etc). Not fatal, but worth a
         // breadcrumb for shutdown-order debugging.
         tracing::debug!("metrics stop channel closed before shutdown signal");
+    }
+    if let Some(tx) = admin_stop_tx
+        && tx.send(()).is_err()
+    {
+        tracing::debug!("admin stop channel closed before shutdown signal");
     }
     for handle in &gossip_handles {
         handle.abort();

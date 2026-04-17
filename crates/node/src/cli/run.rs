@@ -133,6 +133,10 @@ pub struct ObservabilityArgs {
     #[arg(long, value_name = "PORT", env = "DECDN_METRICS_PORT")]
     pub metrics_port: Option<u16>,
 
+    /// Loopback admin HTTP port (ADR 025); `0` disables [default: 9191].
+    #[arg(long, value_name = "PORT", env = "DECDN_ADMIN_PORT")]
+    pub admin_port: Option<u16>,
+
     /// OTLP collector endpoint URL (enables span export; requires `--features otlp`).
     #[arg(long, value_name = "URL", env = "DECDN_OTLP_ENDPOINT")]
     pub otlp_endpoint: Option<String>,

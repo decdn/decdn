@@ -21,5 +21,6 @@ async fn main() -> anyhow::Result<()> {
             }
         },
         Command::Probe(args) => commands::probe(&args).await,
+        Command::Node(args) => commands::node_dispatch(&args).await,
     }
 }
