@@ -76,8 +76,16 @@ CLI shape:
 - New subcommand group `decdn node`, whose children talk to the admin
   server: initially `decdn node peers`, with `decdn node drain` to follow
   under #244.
-- Admin URL resolution (`decdn node ...`): `--admin-url` flag, then
-  `DECDN_ADMIN_URL` env var, then default `http://127.0.0.1:9191`.
+- Admin URL resolution (`decdn node ...`) precedence:
+  1. `--admin-url` flag, or `DECDN_ADMIN_URL` env (folded into the flag
+     by clap's `env =`).
+  2. `observability.admin_port` from the TOML config file — the
+     subcommand-level `--config`, then the top-level `decdn --config`,
+     then the default `~/.decdn/node.toml`. An explicit path that
+     doesn't exist is an error; the default path missing is fine (just
+     falls through). `admin_port = 0` in the file errors rather than
+     silently probing the default port.
+  3. Built-in default `http://127.0.0.1:9191`.
 
 ---
 

@@ -107,7 +107,7 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
         });
         Some(tx)
     } else {
-        tracing::info!("admin server disabled (observability.admin_port resolved to 0)");
+        tracing::info!("admin server disabled (observability.admin_port = 0)");
         None
     };
 
@@ -157,15 +157,17 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
     // "still serving" signals. The accept loops are cheap to unwind, so
     // stopping them first is strictly cleaner.
     if metrics_stop_tx.send(()).is_err() {
-        // Receiver already dropped → metrics server exited on its own
-        // (port died, bind listener errored, etc). Not fatal, but worth a
-        // breadcrumb for shutdown-order debugging.
-        tracing::debug!("metrics stop channel closed before shutdown signal");
+        // Receiver dropped → the metrics server task already exited on
+        // its own. The spawn closure logs its own error on abnormal exit
+        // (see `metrics server exited with error` above), so this branch
+        // is purely informational: under a healthy shutdown we'd have
+        // been the ones signaling it.
+        tracing::warn!("metrics server exited before shutdown signal was sent");
     }
     if let Some(tx) = admin_stop_tx
         && tx.send(()).is_err()
     {
-        tracing::debug!("admin stop channel closed before shutdown signal");
+        tracing::warn!("admin server exited before shutdown signal was sent");
     }
 
     // Router::shutdown waits for ProtocolHandler::shutdown on each handler,

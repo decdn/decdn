@@ -81,9 +81,9 @@ impl PeerView {
     }
 }
 
-/// Owned variant used by both the server (borrow-free because `serde_json`
-/// serializes equally from `&[PeerView]` or `Vec<PeerView>`) and by the
-/// CLI when re-serializing a filtered subset.
+/// Response body for `GET /v1/peers`. Shared between the server
+/// (serializes) and `decdn node peers` (deserializes) so the two sides
+/// can't drift field-for-field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PeersResponse {
     pub(crate) peers: Vec<PeerView>,

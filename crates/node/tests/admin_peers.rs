@@ -190,7 +190,7 @@ async fn cli_peers_surfaces_non_2xx_http_status() -> anyhow::Result<()> {
         json: false,
         timeout_ms: 2_000,
     };
-    let err = commands::peers(&args)
+    let err = commands::peers(&args, None)
         .await
         .err()
         .ok_or_else(|| anyhow::anyhow!("expected non-2xx to surface as an error"))?
