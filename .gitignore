@@ -2,6 +2,9 @@
 .env.*
 .claude.local.md
 
+# Git worktrees
+/.worktrees/
+
 # Rust / Cargo
 /target/
 
