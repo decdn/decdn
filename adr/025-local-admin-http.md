@@ -63,7 +63,10 @@ Transport shape:
 Config shape:
 
 - New field `observability.admin_port: Option<u16>`.
-- `0` or missing means "admin server disabled".
+- Missing resolves to the default admin port `9191` (enabled);
+  explicit `0` means "admin server disabled". The "default-on"
+  choice keeps the operator tooling working out of the box — an
+  operator who wants the surface off has to opt out deliberately.
 - Resolution rejects `admin_port == metrics_port` up front to avoid a
   silent bind failure.
 - Clap flag `--admin-port`, env `DECDN_ADMIN_PORT`.

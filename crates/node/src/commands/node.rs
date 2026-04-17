@@ -1,14 +1,20 @@
 //! `decdn node ...` — operator-local admin commands that talk to a running
 //! node over its loopback HTTP admin surface (ADR 025).
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context;
 use serde::Deserialize;
 
 use crate::cli;
+use crate::cli::common::expand_tilde;
 
-const DEFAULT_ADMIN_URL: &str = "http://127.0.0.1:9191";
+/// Default loopback admin port, kept in sync with
+/// `crate::config::DEFAULT_ADMIN_PORT`. Duplicated here rather than
+/// re-exported so `decdn node ...` keeps working when the operator passes
+/// neither a flag, env var, nor config file.
+const DEFAULT_ADMIN_PORT: u16 = 9191;
 
 /// Dispatch a `decdn node <sub>` invocation.
 pub async fn node_dispatch(args: &cli::NodeArgs) -> anyhow::Result<()> {
@@ -19,7 +25,7 @@ pub async fn node_dispatch(args: &cli::NodeArgs) -> anyhow::Result<()> {
 
 /// `decdn node peers`: fetch `/v1/peers` from the running node and print it.
 pub async fn peers(args: &cli::PeersArgs) -> anyhow::Result<()> {
-    let base = resolve_admin_url(args.admin_url.as_deref());
+    let base = resolve_admin_url(args.admin_url.as_deref(), args.config.as_deref())?;
     let url = format!("{}/v1/peers", base.trim_end_matches('/'));
 
     let client = reqwest::Client::builder()
@@ -65,10 +71,64 @@ pub async fn peers(args: &cli::PeersArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn resolve_admin_url(flag: Option<&str>) -> String {
-    flag.map(str::to_string)
-        .or_else(|| std::env::var("DECDN_ADMIN_URL").ok())
-        .unwrap_or_else(|| DEFAULT_ADMIN_URL.to_string())
+/// Resolve the admin URL in this precedence order:
+///
+/// 1. `--admin-url` flag (takes whole URLs, preserves path/query).
+/// 2. `DECDN_ADMIN_URL` env var.
+/// 3. `observability.admin_port` from the TOML config file, either
+///    `--config <path>` or the default `~/.decdn/node.toml`. Missing file
+///    or unset field both fall through to the built-in default; explicit
+///    `admin_port = 0` is an operator-opt-out and returns an error so the
+///    caller doesn't silently probe the default port instead.
+/// 4. Default `http://127.0.0.1:9191`.
+fn resolve_admin_url(flag: Option<&str>, config_path: Option<&Path>) -> anyhow::Result<String> {
+    if let Some(url) = flag {
+        return Ok(url.to_string());
+    }
+    if let Ok(url) = std::env::var("DECDN_ADMIN_URL") {
+        return Ok(url);
+    }
+    let resolved_path = config_path
+        .map(expand_tilde)
+        .or_else(cli::common::default_config_path);
+    let port = port_from_config_file(resolved_path.as_deref())?.unwrap_or(DEFAULT_ADMIN_PORT);
+    Ok(format!("http://127.0.0.1:{port}"))
+}
+
+/// Read `observability.admin_port` from a TOML config file. Returns:
+/// - `Ok(None)` when the file is absent, the section/key is missing, or
+///   the path resolver decided there's no default to consult.
+/// - `Ok(Some(port))` for a positive port value.
+/// - `Err` if the file exists but can't be parsed, or if the operator
+///   explicitly set `admin_port = 0` (which disables the server — a
+///   local CLI call can't succeed against that).
+fn port_from_config_file(path: Option<&Path>) -> anyhow::Result<Option<u16>> {
+    let Some(path) = path else { return Ok(None) };
+    let expanded = if path.is_absolute() {
+        PathBuf::from(path)
+    } else {
+        expand_tilde(path)
+    };
+    match std::fs::read_to_string(&expanded) {
+        Ok(contents) => {
+            let file: crate::config::FileConfig = toml::from_str(&contents)
+                .with_context(|| format!("failed to parse config file {}", expanded.display()))?;
+            match file.observability.and_then(|o| o.admin_port) {
+                Some(0) => anyhow::bail!(
+                    "config {} disables the admin server (observability.admin_port = 0); \
+                     pass --admin-url or enable the admin port",
+                    expanded.display()
+                ),
+                other => Ok(other),
+            }
+        }
+        // Missing file is fine — fall through to the default port.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(anyhow::anyhow!(
+            "failed to read config file {}: {err}",
+            expanded.display()
+        )),
+    }
 }
 
 fn filter_peers(peers: Vec<PeerView>, region: Option<&str>) -> Vec<PeerView> {
@@ -221,20 +281,54 @@ mod tests {
 
     #[test]
     fn resolve_admin_url_prefers_flag() {
-        let got = resolve_admin_url(Some("http://custom:1234"));
+        let got = resolve_admin_url(Some("http://custom:1234"), None).expect("flag path ok");
         assert_eq!(got, "http://custom:1234");
     }
 
     #[test]
-    fn resolve_admin_url_default_when_flag_missing() {
-        // Guard: DECDN_ADMIN_URL must not be set in the test env, otherwise
-        // the precedence is different from what we're asserting. Skip-if
-        // rather than mutate the environment (edition 2024 env::set_var is
-        // unsafe and workspace forbids unsafe_code).
-        if std::env::var_os("DECDN_ADMIN_URL").is_some() {
-            return;
-        }
-        assert_eq!(resolve_admin_url(None), DEFAULT_ADMIN_URL);
+    fn port_from_config_file_missing_returns_none() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("absent.toml");
+        assert_eq!(port_from_config_file(Some(&path))?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn port_from_config_file_reads_admin_port() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("node.toml");
+        std::fs::write(&path, b"[observability]\nadmin_port = 12345\n")?;
+        assert_eq!(port_from_config_file(Some(&path))?, Some(12345));
+        Ok(())
+    }
+
+    #[test]
+    fn port_from_config_file_errors_on_explicit_zero() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("node.toml");
+        std::fs::write(&path, b"[observability]\nadmin_port = 0\n")?;
+        let err = port_from_config_file(Some(&path))
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected error for explicit 0"))?
+            .to_string();
+        assert!(
+            err.contains("disables the admin server"),
+            "missing context: {err}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn port_from_config_file_errors_on_invalid_toml() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("broken.toml");
+        std::fs::write(&path, b"not = valid = toml")?;
+        let err = port_from_config_file(Some(&path))
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected parse error"))?
+            .to_string();
+        assert!(err.contains("parse"), "missing context: {err}");
+        Ok(())
     }
 
     #[test]

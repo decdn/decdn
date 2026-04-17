@@ -110,8 +110,9 @@ pub struct ObservabilityConfig {
     pub log_format: Option<LogFormat>,
     /// Prometheus metrics HTTP port.
     pub metrics_port: Option<u16>,
-    /// Loopback admin HTTP port (ADR 025). `0` or missing disables the
-    /// admin server; any positive value binds on `127.0.0.1:<port>`.
+    /// Loopback admin HTTP port (ADR 025). Explicit `0` disables the
+    /// admin server; if the key is absent, resolution defaults to
+    /// `9191`. Any positive value binds on `127.0.0.1:<port>`.
     pub admin_port: Option<u16>,
     /// OTLP collector endpoint URL.
     pub otlp_endpoint: Option<String>,

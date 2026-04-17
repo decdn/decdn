@@ -167,16 +167,17 @@ async fn peers_response(state: &AdminState) -> Response<Full<Bytes>> {
     // Snapshot the table under a read lock: copying the entries keeps the
     // lock hold time proportional to peer count, not to the JSON encode
     // time (which grows with `popular_hashes` lengths etc.).
-    let snapshot: Vec<PeerView> = {
+    let mut snapshot: Vec<PeerView> = {
         let guard = state.peer_table.read().await;
-        let mut views: Vec<PeerView> = guard
+        guard
             .iter()
             .map(|(id, entry)| PeerView::from_entry(id, entry))
-            .collect();
-        // Most recently seen first — on-call use case is "is gossip alive?".
-        views.sort_by_key(|v| std::cmp::Reverse(v.last_seen_us));
-        views
+            .collect()
     };
+    // Most recently seen first — on-call use case is "is gossip alive?".
+    // Sorting happens after the read lock is released so concurrent
+    // announce-writers aren't blocked on the sort's CPU time.
+    snapshot.sort_by_key(|v| std::cmp::Reverse(v.last_seen_us));
 
     let body = PeersResponse {
         peers: snapshot.as_slice(),

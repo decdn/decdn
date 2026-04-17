@@ -107,7 +107,7 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
         });
         Some(tx)
     } else {
-        tracing::info!("admin server disabled (observability.admin_port unset)");
+        tracing::info!("admin server disabled (observability.admin_port = 0)");
         None
     };
 
