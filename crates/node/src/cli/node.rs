@@ -26,15 +26,17 @@ pub enum NodeCommand {
 pub struct PeersArgs {
     /// Base URL of the node's admin HTTP surface.
     ///
-    /// Takes precedence over `DECDN_ADMIN_URL` and over the admin port
-    /// derived from the config file. Example: `http://127.0.0.1:9191`.
+    /// Also read from `DECDN_ADMIN_URL` when unset; clap folds the env
+    /// var into this field. If still unset, the admin port is derived
+    /// from `observability.admin_port` in the config file (see
+    /// `--config`). Example: `http://127.0.0.1:9191`.
     #[arg(long, value_name = "URL", env = "DECDN_ADMIN_URL")]
     pub admin_url: Option<String>,
 
     /// Path to the TOML config file used to derive the admin URL when
-    /// `--admin-url` / `DECDN_ADMIN_URL` are unset. Mirrors the root
-    /// `--config` flag but is accepted here so the subcommand is usable
-    /// without the global `-c` being passed.
+    /// `--admin-url` / `DECDN_ADMIN_URL` are unset. The global
+    /// `decdn --config` flag is not plumbed into `node` subcommands —
+    /// pass `--config` here if you need a non-default config path.
     #[arg(long, value_name = "PATH")]
     pub config: Option<PathBuf>,
 

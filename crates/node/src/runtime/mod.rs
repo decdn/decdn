@@ -107,7 +107,7 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
         });
         Some(tx)
     } else {
-        tracing::info!("admin server disabled (observability.admin_port = 0)");
+        tracing::info!("admin server disabled (observability.admin_port resolved to 0)");
         None
     };
 
@@ -149,14 +149,13 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
     shutdown_signal().await;
     tracing::info!("shutdown signal received; closing router");
 
-    // Router::shutdown waits for ProtocolHandler::shutdown on each handler,
-    // then closes the endpoint. Unblock the metrics accept loop too, and
-    // abort gossip's infinite loops (publisher / subscriber / TTL sweeper)
-    // so the drain phase actually finishes rather than hitting the 15s
-    // timeout every time.
-    if let Err(err) = router.shutdown().await {
-        tracing::warn!(%err, "router shutdown reported an error");
-    }
+    // Signal the HTTP accept loops to stop *before* awaiting
+    // `router.shutdown()`. Router shutdown can block indefinitely if a
+    // protocol handler is slow, and while it's blocked the metrics/admin
+    // servers would otherwise keep accepting fresh loopback connections —
+    // wasting the outer `SHUTDOWN_DEADLINE` budget and emitting misleading
+    // "still serving" signals. The accept loops are cheap to unwind, so
+    // stopping them first is strictly cleaner.
     if metrics_stop_tx.send(()).is_err() {
         // Receiver already dropped → metrics server exited on its own
         // (port died, bind listener errored, etc). Not fatal, but worth a
@@ -167,6 +166,15 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
         && tx.send(()).is_err()
     {
         tracing::debug!("admin stop channel closed before shutdown signal");
+    }
+
+    // Router::shutdown waits for ProtocolHandler::shutdown on each handler,
+    // then closes the endpoint. After this returns we can safely abort
+    // gossip's infinite loops (publisher / subscriber / TTL sweeper) so
+    // the drain phase actually finishes rather than hitting the 15s
+    // timeout every time.
+    if let Err(err) = router.shutdown().await {
+        tracing::warn!(%err, "router shutdown reported an error");
     }
     for handle in &gossip_handles {
         handle.abort();

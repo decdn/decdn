@@ -19,7 +19,7 @@ use http_body_util::Full;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::{RwLock, Semaphore, oneshot};
 
@@ -42,23 +42,30 @@ impl AdminState {
 
 /// JSON view of a [`PeerEntry`] emitted by `GET /v1/peers`.
 ///
-/// Defined separately from `PeerEntry` so the wire format stays stable if
-/// the internal struct later grows fields that shouldn't leak to operators
-/// (e.g. per-peer counters, debug state).
-#[derive(Debug, Serialize)]
-struct PeerView {
+/// Defined separately from `PeerEntry` so that table-internal fields
+/// (per-peer counters, debug flags, etc.) that may accrete in the future
+/// can't silently leak into the wire format. Transitively-included
+/// protocol types (e.g. [`decdn_protocol::LoadHint`]) do remain on the
+/// wire, so changes to those still need to be treated as wire-format
+/// changes.
+///
+/// Also used by `decdn node peers` to deserialize the server response —
+/// sharing the type here prevents the two sides from drifting field-for-
+/// field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PeerView {
     /// Lowercase hex of the peer's Ed25519 public key (ADR 001).
-    node_id: String,
+    pub(crate) node_id: String,
     /// ISO 3166-1 alpha-2 region code from the announce.
-    region: String,
+    pub(crate) region: String,
     /// Microseconds-since-epoch the peer was first inserted into the table.
-    first_seen_us: u64,
+    pub(crate) first_seen_us: u64,
     /// Microseconds-since-epoch the peer's most recent announce was accepted.
-    last_seen_us: u64,
+    pub(crate) last_seen_us: u64,
     /// `LoadHint` from the most recent announce.
-    load: decdn_protocol::LoadHint,
+    pub(crate) load: decdn_protocol::LoadHint,
     /// `timestamp_us` carried inside the signed announce body.
-    announced_at_us: u64,
+    pub(crate) announced_at_us: u64,
 }
 
 impl PeerView {
@@ -74,9 +81,12 @@ impl PeerView {
     }
 }
 
-#[derive(Debug, Serialize)]
-struct PeersResponse<'a> {
-    peers: &'a [PeerView],
+/// Owned variant used by both the server (borrow-free because `serde_json`
+/// serializes equally from `&[PeerView]` or `Vec<PeerView>`) and by the
+/// CLI when re-serializing a filtered subset.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PeersResponse {
+    pub(crate) peers: Vec<PeerView>,
 }
 
 /// Bind the admin HTTP listener. Kept synchronous-at-startup so port
@@ -179,9 +189,7 @@ async fn peers_response(state: &AdminState) -> Response<Full<Bytes>> {
     // announce-writers aren't blocked on the sort's CPU time.
     snapshot.sort_by_key(|v| std::cmp::Reverse(v.last_seen_us));
 
-    let body = PeersResponse {
-        peers: snapshot.as_slice(),
-    };
+    let body = PeersResponse { peers: snapshot };
     match serde_json::to_vec(&body) {
         Ok(bytes) => json_ok(bytes),
         Err(err) => {
@@ -301,7 +309,19 @@ mod tests {
     #[tokio::test]
     async fn single_peer_serializes_with_hex_node_id() {
         let id = [0xABu8; 32];
-        let state = state_with(vec![(id, "US", 10, 100)]);
+        // Seed the entry once at now_us=100, then refresh with a later
+        // announce at now_us=300 so first_seen_us and last_seen_us differ.
+        // Distinct values catch a field-swap regression (first↔last) that
+        // identical seeds would not.
+        let mut table = PeerTable::new(0);
+        table
+            .insert_or_refresh(mk_announce(id, "US", 10), 100)
+            .expect("seed insert");
+        table
+            .insert_or_refresh(mk_announce(id, "US", 20), 300)
+            .expect("refresh insert");
+        let state = AdminState::new(Arc::new(RwLock::new(table)));
+
         let resp = peers_response(&state).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_to_string(resp).await;
@@ -311,8 +331,8 @@ mod tests {
         assert_eq!(peers[0]["node_id"], "ab".repeat(32));
         assert_eq!(peers[0]["region"], "US");
         assert_eq!(peers[0]["first_seen_us"], 100);
-        assert_eq!(peers[0]["last_seen_us"], 100);
-        assert_eq!(peers[0]["announced_at_us"], 10);
+        assert_eq!(peers[0]["last_seen_us"], 300);
+        assert_eq!(peers[0]["announced_at_us"], 20);
     }
 
     #[tokio::test]

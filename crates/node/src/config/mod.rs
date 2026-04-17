@@ -33,8 +33,10 @@ const DEFAULT_MAX_BLOB_SIZE_MB: u64 = 1_024;
 const DEFAULT_RATE_PER_MB: u64 = 10;
 /// Default Prometheus metrics port.
 const DEFAULT_METRICS_PORT: u16 = 9090;
-/// Default loopback admin HTTP port (ADR 025).
-const DEFAULT_ADMIN_PORT: u16 = 9191;
+/// Default loopback admin HTTP port (ADR 025). Exposed to the rest of
+/// the `node` crate so `decdn node <sub>` clients can fall back to the
+/// same default the server binds on, without duplicating the number.
+pub(crate) const DEFAULT_ADMIN_PORT: u16 = 9191;
 /// Default interval between outgoing `NodeAnnounce` messages (ADR 001).
 const DEFAULT_ANNOUNCE_INTERVAL_SEC: u64 = 60;
 /// Default peer-table entry TTL after which a stale entry is evicted.

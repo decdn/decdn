@@ -5,16 +5,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context;
-use serde::Deserialize;
 
+use crate::admin::{PeerView, PeersResponse};
 use crate::cli;
 use crate::cli::common::expand_tilde;
-
-/// Default loopback admin port, kept in sync with
-/// `crate::config::DEFAULT_ADMIN_PORT`. Duplicated here rather than
-/// re-exported so `decdn node ...` keeps working when the operator passes
-/// neither a flag, env var, nor config file.
-const DEFAULT_ADMIN_PORT: u16 = 9191;
+use crate::config::DEFAULT_ADMIN_PORT;
 
 /// Dispatch a `decdn node <sub>` invocation.
 pub async fn node_dispatch(args: &cli::NodeArgs) -> anyhow::Result<()> {
@@ -33,11 +28,28 @@ pub async fn peers(args: &cli::PeersArgs) -> anyhow::Result<()> {
         .build()
         .context("failed to build HTTP client")?;
 
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| format!("admin request to {url} failed"))?;
+    let resp = client.get(&url).send().await.map_err(|err| {
+        // Split connect vs. timeout vs. everything-else so the operator
+        // message points at the right fix. An ECONNREFUSED almost always
+        // means "admin isn't running / wrong port"; a timeout means the
+        // node is up but slow (often a lock-contention issue); other
+        // reqwest errors cover DNS/TLS/protocol — rarer in loopback but
+        // not free.
+        if err.is_connect() {
+            anyhow::anyhow!(
+                "admin at {url} refused the connection ({err}); is the node running, \
+                 and is admin_port configured correctly?",
+            )
+        } else if err.is_timeout() {
+            anyhow::anyhow!(
+                "admin at {url} did not respond within {}ms ({err}); the node may be \
+                 overloaded or blocked on a long lock hold",
+                args.timeout_ms,
+            )
+        } else {
+            anyhow::Error::new(err).context(format!("admin request to {url} failed"))
+        }
+    })?;
 
     let status = resp.status();
     let body = resp
@@ -46,7 +58,7 @@ pub async fn peers(args: &cli::PeersArgs) -> anyhow::Result<()> {
         .with_context(|| format!("failed to read response body from {url}"))?;
 
     if !status.is_success() {
-        anyhow::bail!("admin returned HTTP {status}: {body}");
+        anyhow::bail!("admin returned HTTP {status} from {url}: {body}");
     }
 
     let parsed: PeersResponse =
@@ -55,14 +67,7 @@ pub async fn peers(args: &cli::PeersArgs) -> anyhow::Result<()> {
     let filtered = filter_peers(parsed.peers, args.region.as_deref());
 
     if args.json {
-        // Re-serialize so the filter (if any) is reflected in the output and
-        // the JSON is pretty-printed consistently regardless of the server's
-        // whitespace.
-        let out = PeersResponse {
-            peers: filtered.clone(),
-        };
-        let pretty = serde_json::to_string_pretty(&out)
-            .context("failed to encode filtered peers as JSON")?;
+        let pretty = render_json(&filtered).context("failed to encode filtered peers as JSON")?;
         println!("{pretty}");
     } else {
         print_peers_table(&filtered);
@@ -73,36 +78,40 @@ pub async fn peers(args: &cli::PeersArgs) -> anyhow::Result<()> {
 
 /// Resolve the admin URL in this precedence order:
 ///
-/// 1. `--admin-url` flag (takes whole URLs, preserves path/query).
-/// 2. `DECDN_ADMIN_URL` env var.
-/// 3. `observability.admin_port` from the TOML config file, either
-///    `--config <path>` or the default `~/.decdn/node.toml`. Missing file
-///    or unset field both fall through to the built-in default; explicit
-///    `admin_port = 0` is an operator-opt-out and returns an error so the
-///    caller doesn't silently probe the default port instead.
-/// 4. Default `http://127.0.0.1:9191`.
+/// 1. `--admin-url` flag (`args.admin_url`). Clap's `env = "DECDN_ADMIN_URL"`
+///    attribute already folds the env var into this field, so a single
+///    check here covers both sources.
+/// 2. `observability.admin_port` from the TOML config file — either the
+///    explicit `--config <path>` or the default `~/.decdn/node.toml`. An
+///    explicit `--config` path that doesn't exist is an error (mirrors
+///    `decdn run`'s handling); a missing *default* path falls through to
+///    the built-in default. Explicit `admin_port = 0` in the file is an
+///    operator opt-out and errors here rather than silently probing the
+///    default.
+/// 3. Default `http://127.0.0.1:9191`.
 fn resolve_admin_url(flag: Option<&str>, config_path: Option<&Path>) -> anyhow::Result<String> {
     if let Some(url) = flag {
         return Ok(url.to_string());
     }
-    if let Ok(url) = std::env::var("DECDN_ADMIN_URL") {
-        return Ok(url);
-    }
-    let resolved_path = config_path
-        .map(expand_tilde)
-        .or_else(cli::common::default_config_path);
-    let port = port_from_config_file(resolved_path.as_deref())?.unwrap_or(DEFAULT_ADMIN_PORT);
+    let (resolved_path, explicit) = match config_path {
+        Some(p) => (Some(expand_tilde(p)), true),
+        None => (cli::common::default_config_path(), false),
+    };
+    let port =
+        port_from_config_file(resolved_path.as_deref(), explicit)?.unwrap_or(DEFAULT_ADMIN_PORT);
     Ok(format!("http://127.0.0.1:{port}"))
 }
 
 /// Read `observability.admin_port` from a TOML config file. Returns:
-/// - `Ok(None)` when the file is absent, the section/key is missing, or
-///   the path resolver decided there's no default to consult.
+/// - `Ok(None)` when `path` is `None`, or when `path` is the *default*
+///   path and the file doesn't exist (operator hasn't set up a config
+///   file yet — fall through to the built-in default).
 /// - `Ok(Some(port))` for a positive port value.
-/// - `Err` if the file exists but can't be parsed, or if the operator
-///   explicitly set `admin_port = 0` (which disables the server — a
-///   local CLI call can't succeed against that).
-fn port_from_config_file(path: Option<&Path>) -> anyhow::Result<Option<u16>> {
+/// - `Err` if the file exists but can't be parsed, if the operator
+///   explicitly set `admin_port = 0` (which disables the server), or if
+///   `explicit` is true and the file is missing/unreadable (operator
+///   passed `--config` pointing at the wrong place).
+fn port_from_config_file(path: Option<&Path>, explicit: bool) -> anyhow::Result<Option<u16>> {
     let Some(path) = path else { return Ok(None) };
     let expanded = if path.is_absolute() {
         PathBuf::from(path)
@@ -122,8 +131,9 @@ fn port_from_config_file(path: Option<&Path>) -> anyhow::Result<Option<u16>> {
                 other => Ok(other),
             }
         }
-        // Missing file is fine — fall through to the default port.
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        // Missing file: fine only if we fell back to the default path. An
+        // explicit --config that's missing is almost always an operator typo.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound && !explicit => Ok(None),
         Err(err) => Err(anyhow::anyhow!(
             "failed to read config file {}: {err}",
             expanded.display()
@@ -139,6 +149,16 @@ fn filter_peers(peers: Vec<PeerView>, region: Option<&str>) -> Vec<PeerView> {
             .filter(|p| p.region.eq_ignore_ascii_case(want))
             .collect(),
     }
+}
+
+/// Re-serialize the (possibly filtered) peer list so the output reflects
+/// `--region` instead of the raw server body. Kept as a pure function so
+/// tests can round-trip filter-then-render without an HTTP hop.
+fn render_json(peers: &[PeerView]) -> Result<String, serde_json::Error> {
+    let out = PeersResponse {
+        peers: peers.to_vec(),
+    };
+    serde_json::to_string_pretty(&out)
 }
 
 fn print_peers_table(peers: &[PeerView]) {
@@ -163,9 +183,8 @@ fn print_peers_table(peers: &[PeerView]) {
 }
 
 fn short_node_id(hex: &str) -> String {
-    // 12 leading hex chars + ellipsis so a full terminal column stays under
-    // 14 glyphs. Unicode '…' (U+2026) instead of "..." keeps the preview
-    // unambiguous when copy-pasted.
+    // Unicode '…' (U+2026) rather than "..." so a pasted preview is
+    // unambiguously a preview and never parses as hex.
     let prefix: String = hex.chars().take(12).collect();
     if hex.chars().count() > 12 {
         format!("{prefix}…")
@@ -188,6 +207,9 @@ fn wall_clock_us() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
 }
 
+/// Coarse operator-facing age bucket. On-call use case is "is this peer
+/// fresh in the last N {s,m,h,d}?"; sub-second precision would only add
+/// noise to the table.
 fn relative_age(now_us: u64, last_seen_us: u64) -> String {
     if last_seen_us == 0 {
         return "unknown".to_string();
@@ -219,21 +241,6 @@ fn format_age(delta_us: u64) -> String {
         return format!("{}h ago", delta_us / US_PER_HOUR);
     }
     format!("{}d ago", delta_us / US_PER_DAY)
-}
-
-#[derive(Debug, Clone, serde::Serialize, Deserialize)]
-struct PeersResponse {
-    peers: Vec<PeerView>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, Deserialize)]
-struct PeerView {
-    node_id: String,
-    region: String,
-    first_seen_us: u64,
-    last_seen_us: u64,
-    load: decdn_protocol::LoadHint,
-    announced_at_us: u64,
 }
 
 #[cfg(test)]
@@ -269,8 +276,11 @@ mod tests {
             mk_peer("cc", "EU", 30),
         ];
         let filtered = filter_peers(peers, Some("US"));
-        assert_eq!(filtered.len(), 2);
-        assert!(filtered.iter().all(|p| p.region.eq_ignore_ascii_case("US")));
+        // Both the length and the exact surviving node_ids are asserted
+        // so a regression that filtered on the wrong field (e.g. node_id
+        // vs region) can't accidentally produce a matching count.
+        let ids: Vec<&str> = filtered.iter().map(|p| p.node_id.as_str()).collect();
+        assert_eq!(ids, vec!["aa", "bb"]);
     }
 
     #[test]
@@ -280,16 +290,51 @@ mod tests {
     }
 
     #[test]
+    fn render_json_roundtrips_through_filter() -> anyhow::Result<()> {
+        let peers = vec![
+            mk_peer("aa", "US", 10),
+            mk_peer("bb", "EU", 20),
+            mk_peer("cc", "US", 30),
+        ];
+        let filtered = filter_peers(peers, Some("US"));
+        let pretty = render_json(&filtered)?;
+        let value: serde_json::Value = serde_json::from_str(&pretty)?;
+        let out_peers = value["peers"].as_array().expect("peers array");
+        assert_eq!(out_peers.len(), 2);
+        let out_ids: Vec<&str> = out_peers
+            .iter()
+            .map(|p| p["node_id"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(out_ids, vec!["aa", "cc"]);
+        Ok(())
+    }
+
+    #[test]
     fn resolve_admin_url_prefers_flag() {
         let got = resolve_admin_url(Some("http://custom:1234"), None).expect("flag path ok");
         assert_eq!(got, "http://custom:1234");
     }
 
     #[test]
-    fn port_from_config_file_missing_returns_none() -> anyhow::Result<()> {
+    fn port_from_config_file_missing_default_returns_none() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("absent.toml");
-        assert_eq!(port_from_config_file(Some(&path))?, None);
+        assert_eq!(port_from_config_file(Some(&path), false)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn port_from_config_file_missing_explicit_errors() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("absent.toml");
+        let err = port_from_config_file(Some(&path), true)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected explicit-missing error"))?
+            .to_string();
+        assert!(
+            err.contains("failed to read config file"),
+            "missing context: {err}"
+        );
         Ok(())
     }
 
@@ -298,7 +343,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("node.toml");
         std::fs::write(&path, b"[observability]\nadmin_port = 12345\n")?;
-        assert_eq!(port_from_config_file(Some(&path))?, Some(12345));
+        assert_eq!(port_from_config_file(Some(&path), false)?, Some(12345));
         Ok(())
     }
 
@@ -307,7 +352,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("node.toml");
         std::fs::write(&path, b"[observability]\nadmin_port = 0\n")?;
-        let err = port_from_config_file(Some(&path))
+        let err = port_from_config_file(Some(&path), false)
             .err()
             .ok_or_else(|| anyhow::anyhow!("expected error for explicit 0"))?
             .to_string();
@@ -323,7 +368,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("broken.toml");
         std::fs::write(&path, b"not = valid = toml")?;
-        let err = port_from_config_file(Some(&path))
+        let err = port_from_config_file(Some(&path), false)
             .err()
             .ok_or_else(|| anyhow::anyhow!("expected parse error"))?
             .to_string();

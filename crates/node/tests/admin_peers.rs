@@ -15,6 +15,8 @@ use std::sync::Arc;
 
 use decdn_gossip::PeerTable;
 use decdn_node::admin::{self, AdminState};
+use decdn_node::cli::PeersArgs;
+use decdn_node::commands;
 use decdn_protocol::{LoadHint, NodeAnnounce, NodeAnnounceBody};
 use tokio::net::TcpListener;
 use tokio::sync::{RwLock, oneshot};
@@ -161,6 +163,41 @@ async fn admin_rejects_post_to_peers_with_405() -> anyhow::Result<()> {
     assert_eq!(
         resp.headers().get("allow").and_then(|v| v.to_str().ok()),
         Some("GET")
+    );
+
+    let _ = stop_tx.send(());
+    server.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cli_peers_surfaces_non_2xx_http_status() -> anyhow::Result<()> {
+    let peer_table = Arc::new(RwLock::new(PeerTable::new(0)));
+    let state = AdminState::new(peer_table);
+
+    let (listener, addr) = bind_loopback().await?;
+    let (stop_tx, stop_rx) = oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        admin::serve(listener, state, stop_rx).await.ok();
+    });
+
+    // Point the CLI at a path the server 404s on so we exercise the
+    // non-2xx branch in `commands::peers` rather than the happy path.
+    let args = PeersArgs {
+        admin_url: Some(format!("http://{addr}/nope")),
+        config: None,
+        region: None,
+        json: false,
+        timeout_ms: 2_000,
+    };
+    let err = commands::peers(&args)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("expected non-2xx to surface as an error"))?
+        .to_string();
+    assert!(
+        err.contains("HTTP 404"),
+        "error should name the status code, got: {err}"
     );
 
     let _ = stop_tx.send(());
