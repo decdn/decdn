@@ -47,27 +47,29 @@ The rewrite is structural, not cosmetic. Burn becomes secondary. Real yield to v
 
 New contract `FeeRouter` replaces the ADR 003 settlement-fee-skim pattern entirely. Channel settlements route **100% of operator payment** through the router; the router performs the economic split atomically.
 
-**Split (T2):**
+**Split (T2b — peer-median operator share):**
 
 | Destination | % | Payment flow |
 |---|---|---|
-| Operator | 75% | Transferred USDC to operator's address in the same `settleChannel` transaction |
-| ve-locker pool | 12% | Accumulates in router per epoch; distributed pro-rata by ve-balance snapshot at epoch boundary |
-| BuybackBurner | 8% | Transferred USDC to `BuybackBurner` (ADR 018 mechanics unchanged) |
-| Treasury | 5% | Transferred USDC to Timelock-custodied treasury wallet |
+| Operator | 80% | Transferred USDC to operator's address in the same `settleChannel` transaction |
+| ve-locker pool | 10% | Accumulates in router per epoch; distributed pro-rata by ve-balance snapshot at epoch boundary |
+| BuybackBurner | 6% | Transferred USDC to `BuybackBurner` (ADR 018 mechanics unchanged) |
+| Treasury | 4% | Transferred USDC to Timelock-custodied treasury wallet |
+
+**Operator share of 80% is deliberately at peer-median** for two-sided marketplaces and decentralized infrastructure networks: Storj ~75%, Akash ~80%, Uber ~75%, Fiverr 80%, eBay 87%, Etsy 93.5%, Filecoin ~100% (offset by inflation). An aggressive 75% share (Uber/Storj tier) was considered and rejected — operator recruitment is the reflexive bootstrap bottleneck (ADR 004, production-bootstrap modeling section), and losing operators on margins is an unrecoverable failure mode. The 4pt ve-locker / 2pt burn / 1pt treasury reduction from the 75% alternative is small in absolute terms vs. the risk of under-supplying operators.
 
 **Applies only to client→node channel settlements.** Node-to-node cache-miss paid pulls bypass the router — direct peer USDC payment, no skim. Rationale: internal cost recovery, not net revenue.
 
-**Rate mechanics.** Per-MB rates are operator-set via probe responses (ADR 003 unchanged). Operators pricing to preserve $0.01/GB **net** revenue quote ~$0.0133/GB gross; clients pay the quoted rate; router's 25% skim is structural.
+**Rate mechanics.** Per-MB rates are operator-set via probe responses (ADR 003 unchanged). Operators pricing to preserve $0.01/GB **net** revenue quote ~$0.0125/GB gross; clients pay the quoted rate; router's 20% skim is structural.
 
 **Governable split parameters (within hard-coded safety bounds):**
 
 | Parameter | Default | Min | Max |
 |---|---|---|---|
-| Operator share | 75% | 50% | 95% |
-| ve-locker share | 12% | 0% | 30% |
-| Burn share | 8% | 0% | 25% |
-| Treasury share | 5% | 0% | 20% |
+| Operator share | 80% | 50% | 95% |
+| ve-locker share | 10% | 0% | 30% |
+| Burn share | 6% | 0% | 25% |
+| Treasury share | 4% | 0% | 20% |
 
 Shares must sum to 100% on any update. Governance changes gated by 48h timelock (ADR 009).
 
@@ -99,7 +101,7 @@ Vote-escrow TOKEN (veTOKEN). Modeled on veCRV with deliberate deviations noted.
 
 **Historical checkpointing.** `VotingEscrow` implements `balanceOfAt(user, ts)` via per-lock checkpoints. Reads are O(log n) on checkpoint array; writes are O(1) amortized. This is a load-bearing requirement for the epoch-snapshot pattern in 2.2.
 
-**Operator ve-positions.** Operators holding ve-locks appear in the same contract as passive holders; their ve-balance earns from the 12% pool identically. There is no separate "operator lock-boost" mechanic — operators earn the 75% router share on their delivery revenue (work), and may optionally earn from the 12% pool on their locked TOKEN (capital). The two are orthogonal.
+**Operator ve-positions.** Operators holding ve-locks appear in the same contract as passive holders; their ve-balance earns from the 10% pool identically. There is no separate "operator lock-boost" mechanic — operators earn the 80% router share on their delivery revenue (work), and may optionally earn from the 10% pool on their locked TOKEN (capital). The two are orthogonal.
 
 **ve-positions and operator stake are separate.** A node's operator stake is held in `StakingRegistry` (ADR 003) and is slashable; a ve-position is held in `VotingEscrow` and is not. An operator may hold both; they are not interchangeable and neither satisfies the other's requirements.
 
@@ -109,30 +111,30 @@ Vote-escrow TOKEN (veTOKEN). Modeled on veCRV with deliberate deviations noted.
 
 **Revenue streams:**
 
-1. **75% of every channel settlement.** Per-byte proportional via router; no pool accounting required on the operator side.
+1. **80% of every channel settlement.** Per-byte proportional via router; no pool accounting required on the operator side.
 2. **Optional ve-locker pool yield** on any TOKEN the operator ve-locks. Same terms as passive holders.
 
 **Fee discount mechanic — removed.** ADR 004's "stake 100K for 1% fee" is dropped. Replaced conceptually by the ve-locker pool: operators wanting return on non-stake capital ve-lock it and earn from the 12% pool instead of receiving a discount. Simpler, non-regressive, aligns operators with the supply sink rather than against it.
 
-**Sample P&L — 1 Gbps node at 30K GB/mo, gross rate $0.0133/GB:**
+**Sample P&L — 1 Gbps node at 30K GB/mo, gross rate $0.0125/GB:**
 
 ```
-Gross revenue:                 $400/mo  (30,000 GB × $0.0133/GB)
-Router → operator (75%):       $300/mo
+Gross revenue:                 $375/mo  (30,000 GB × $0.0125/GB)
+Router → operator (80%):       $300/mo
 Cache-miss paid pulls (15%):   −$45/mo
 Infrastructure (mid):          −$90/mo
 ─────────────────────────────────────
 Operator gross profit:         $165/mo
 
 Optional ve-lock of 50K TOKEN for 4y:
-  ve-balance:                  50K × 1.0 = 50K veTOKEN
-  At mature-scale pool yield (~5.8% USDC APR on locked TOKEN at $0.05):
+  ve-balance (time-averaged):  25K veTOKEN
+  At mature-scale pool yield (~6% USDC APR on locked TOKEN at $0.05):
   Ve-yield:                    ~$12/mo
 ─────────────────────────────────────
 Operator w/ ve-lock:           ~$177/mo
 ```
 
-Matches the branch's 1 Gbps 30K GB/mo line at unchanged **net** economics. The router's skim is entirely absorbed by the rate increase from $0.01/GB → $0.0133/GB — still 3× cheaper than Bunny.net, 6–15× cheaper than CloudFront/Akamai.
+Matches the branch's 1 Gbps 30K GB/mo line at unchanged **net** economics. The router's 20% skim is entirely absorbed by the rate increase from $0.01/GB → $0.0125/GB — a 25% premium over Bunny.net's $0.01/GB budget tier, and still 7× cheaper than CloudFront, 10–16× cheaper than Akamai.
 
 ### 2.5 Governance
 
@@ -158,11 +160,11 @@ Rest of ADR 009 (safety bounds on governable parameters, emergency multisig with
 
 **Mature-scale burn flow estimate.**
 
-- Baseline: 1,000 nodes × 30K GB/mo × $0.0133/GB = $400K/mo gross revenue
-- Burn inflow: 8% × $400K = **$32K/mo USDC = $384K/yr**
-- At $0.05 TOKEN: 7.68M TOKEN burned/yr = **1.54%/yr of 500M supply**
+- Baseline: 1,000 nodes × 30K GB/mo × $0.0125/GB = $375K/mo gross revenue
+- Burn inflow: 6% × $375K = **$22.5K/mo USDC = $270K/yr**
+- At $0.05 TOKEN: 5.4M TOKEN burned/yr = **1.08%/yr of 500M supply**
 
-**Scaling behavior.** Burn USDC flow scales linearly with network revenue (nodes × GB/node × $/GB). TOKEN-denominated burn scales with revenue and inversely with TOKEN price. If network grows 10× while TOKEN price is flat, per-year supply burn reaches ~15%/yr — genuinely deflationary. If network grows 10× and TOKEN price grows 10× proportionally, burn stays around 1.5%/yr of supply but TOKEN market-cap-destroyed grows 10×. Either trajectory is a working flywheel; which one dominates depends on the ratio of price growth to network growth.
+**Scaling behavior.** Burn USDC flow scales linearly with network revenue (nodes × GB/node × $/GB). TOKEN-denominated burn scales with revenue and inversely with TOKEN price. If network grows 10× while TOKEN price is flat, per-year supply burn reaches ~10.8%/yr — genuinely deflationary. If network grows 10× and TOKEN price grows 10× proportionally, burn stays around 1.1%/yr of supply but TOKEN market-cap-destroyed grows 10×. Either trajectory is a working flywheel; which one dominates depends on the ratio of price growth to network growth.
 
 The burn is meaningful at mature scale but still secondary to the supply sink from ve-locks and auto-lock vesting. That's intentional — burn narratives without real yield capture are thin.
 
@@ -176,7 +178,7 @@ The burn is meaningful at mature scale but still secondary to the supply sink fr
 4. **Auto-ve-lock is atomic with vesting.** Vested tokens never exist in recipient wallets in unlocked form.
 5. **Fixed supply, no minting.** Total supply is 500M at genesis; no function exists on the production token contract to create more.
 6. **Node-to-node cache-miss pulls bypass the router.** No skim on internal cost-recovery flow.
-7. **Operator's 75% share is paid in the same transaction as settlement.** No claim step, no latency, no separate withdrawal flow for the operator share.
+7. **Operator's 80% share is paid in the same transaction as settlement.** No claim step, no latency, no separate withdrawal flow for the operator share.
 
 ---
 
@@ -189,7 +191,7 @@ ADRs affected on acceptance:
 | Artifact | Impact |
 |---|---|
 | ADR 004 — Tokenomics | **Superseded** for: token distribution (§Token Distribution), fee allocation (§Fee Allocation + §BuybackBurner), fee discount mechanic (§Fee Discount), node unit-economics fee-discount row. Retained: staking/slashing schedule, staking-role equivalence, dual-currency rationale. |
-| ADR 003 — Payments | Updated: `settleChannel` routes full operator balance to `FeeRouter`, not split at settlement contract. Interface section for `FeeRouter` added. Operator receives their 75% via router transfer, same tx. |
+| ADR 003 — Payments | Updated: `settleChannel` routes full operator balance to `FeeRouter`, not split at settlement contract. Interface section for `FeeRouter` added. Operator receives their 80% via router transfer, same tx. |
 | ADR 009 — Governance | Updated: voting power = ve-balance; quorum/threshold recalibrated against ve-supply rather than total supply. Governor Bravo delegation pattern documented. Safety bounds updated to include fee-router share bounds (Section 2.2). |
 | ADR 018 — Liquidity | **Unchanged** for POL mechanics, pool choice, MEV protection. Buyback inflow-rate note added referencing ADR 025's 8% share. |
 | ADR 019 — Node onboarding | Updated: bootstrap-fund subsidies auto-ve-lock for 1y on delivery. |
@@ -204,14 +206,14 @@ ADRs affected on acceptance:
 
 Listed for planning context; detailed interfaces and invariants belong to the implementation plan, not this spec.
 
-- **`FeeRouter`** — receives full channel-settlement USDC; splits 75/12/8/5 atomically; holds ve-locker epoch buckets; exposes `claim(epochs[])` for ve-lockers. Governable share parameters with bounds per Section 2.2.
+- **`FeeRouter`** — receives full channel-settlement USDC; splits 80/10/6/4 atomically; holds ve-locker epoch buckets; exposes `claim(epochs[])` for ve-lockers. Governable share parameters with bounds per Section 2.2.
 - **`VotingEscrow`** — ERC-20-lockable ve-position contract with `balanceOfAt(user, ts)`, `create_lock`, `extend_lock`, `withdraw` (only after expiry), and a privileged `create_lock_for(recipient, amount, duration, creator)` callable by authorized vesting and bootstrap-subsidy contracts.
 - **`VestingWithAutoLock`** — replaces the current vesting contract family. On vest, calls `VotingEscrow.create_lock_for(recipient, vestedAmount, bucketLockPeriod)` atomically.
 - **`BuybackBurner`** — **unchanged from ADR 018** except for inflow source (now `FeeRouter`, not treasury manual transfer).
 
 Modified contracts:
 
-- **`PaymentChannel`** (ADR 003) — `settleChannel` transfers the full operator balance to `FeeRouter.routeSettlement(operator, amount)` instead of splitting at settlement time. `FeeRouter` then transfers operator's 75% and retains the rest.
+- **`PaymentChannel`** (ADR 003) — `settleChannel` transfers the full operator balance to `FeeRouter.routeSettlement(operator, amount)` instead of splitting at settlement time. `FeeRouter` then transfers operator's 80% and retains the rest.
 - **`StakingRegistry`** — `getStakeMultiple` discount-threshold logic is removed from the production contract (not queried by any fee path under this spec). PoC artifacts carrying the method can be left alone since they aren't on the production deployment path.
 - **`Governor`** — voting weight source changes from `TOKEN.getPastVotes()` to `VotingEscrow.balanceOfAt()`. Proposal and quorum thresholds recalibrated against `VotingEscrow.totalSupplyAt()`.
 
@@ -221,7 +223,7 @@ Modified contracts:
 
 ### Positive
 
-- **Burn flow 13× stronger per unit network revenue** (8% of 100% vs. 20% of 3%); material burn rate at mature scale.
+- **Burn flow 10× stronger per unit network revenue** (6% of 100% vs. 20% of 3%); material burn rate at mature scale.
 - **Three independent demand sources for TOKEN:** operators (stake-to-operate), yield-seekers (ve-lock for USDC fee share), governance participants (ve-lock for voting). Each source is independent of TOKEN price — they scale with network usage.
 - **Auto-ve-lock eliminates vesting-cliff dumps.** Team, seed, treasury, ecosystem all locked into multi-year timelines after vest; no "cliff + dump" opportunity.
 - **Operator P&L unchanged at same served volume.** The 25% router skim passes through to client rates via operator pricing; net $/GB to operators is identical to the branch baseline.
@@ -236,7 +238,7 @@ Modified contracts:
 - **Seed-investor negotiations may contest auto-ve-lock.** Traditional term sheets assume liquid positions post-cliff; a 2y auto-ve-lock is non-standard. Should be a negotiated parameter per seed round, not a hard rule. Spec fixes the default; term sheets may deviate.
 - **ve-position illiquidity creates Convex-capture risk.** If third-party protocols launch liquid-ve wrappers (Convex/Votium model), they can concentrate governance power. Mitigation: governance should monitor and consider direct treasury incentive programs to keep ve-lockers in the native contract. Out of scope for this spec.
 - **ve-locker pool epoch claims add UX overhead.** Lockers must claim each epoch (or batch up to 26 weeks). Non-claim → sweep to treasury. Acceptable UX; could be improved with a claim-aggregator in a later ADR.
-- **Effective supply growth still +10.5–11.5%/yr during vesting window** even after S4 + T2 burn. This design compresses the inflation story but does not eliminate it. Long-term deflation requires mature network scale ($1M+/mo fee flow) or further supply-side changes.
+- **Effective supply growth still +11.4%/yr during vesting window** even after S4 + T2b burn (12.5% unlock rate minus ~1.1% burn at mature scale at $0.05). This design compresses the inflation story but does not eliminate it. Long-term deflation requires mature network scale ($1M+/mo fee flow) or further supply-side changes.
 
 ### Risks
 
@@ -251,9 +253,9 @@ Modified contracts:
 1. **Treasury-bucket auto-ve-lock duration.** Current default: 2y, matching team/seed. Alternative: shorter (0–1y) because treasury is protocol-owned and long locks hurt responsiveness. Recommend resolving at implementation-plan time.
 2. **ve-locker claim aggregator.** A helper contract that batches claims across multiple epochs for a user with a single transaction. Not required for v1; usability optimization.
 3. **Liquid-ve wrapper strategy.** Convex-style wrappers are a known pattern; protocol should decide whether to pre-empt with its own (like Frax's vlCVX) or accept third-party capture. Defer to a governance ADR once the protocol ships.
-4. **Rate-advertising UX.** How do probe responses expose the pre-router-skim rate to clients? Should clients see "rate $0.0133/GB" or "rate $0.01/GB + 25% protocol cut"? Client-UX question for the decdn-website or client ADRs, not tokenomics.
+4. **Rate-advertising UX.** How do probe responses expose the pre-router-skim rate to clients? Should clients see "rate $0.0125/GB" or "rate $0.01/GB + 20% protocol cut"? Client-UX question for the decdn-website or client ADRs, not tokenomics.
 5. **Bootstrap-subsidy auto-ve-lock duration.** Current default: 1y. Operators may prefer shorter to maintain cashflow. Could be made per-tranche governable.
-6. **Effect on existing ADR 003 `settleChannel` semantics.** The channel close/dispute flow currently assumes operator receives payout in the settlement transaction. Routing via `FeeRouter` keeps this property (the router forwards 75% in the same tx) but the ADR 003 text needs rework to reflect the new call graph.
+6. **Effect on existing ADR 003 `settleChannel` semantics.** The channel close/dispute flow currently assumes operator receives payout in the settlement transaction. Routing via `FeeRouter` keeps this property (the router forwards 80% in the same tx) but the ADR 003 text needs rework to reflect the new call graph.
 
 ---
 
@@ -262,7 +264,7 @@ Modified contracts:
 Work is done when:
 
 1. `FeeRouter`, `VotingEscrow`, `VestingWithAutoLock` are deployed, unit-tested, and integration-tested against a local Arbitrum fork with representative channel-settlement load.
-2. `PaymentChannel.settleChannel` routes to `FeeRouter.routeSettlement` in a single transaction; operator receives 75% in the same tx; remaining splits land in the correct contracts.
+2. `PaymentChannel.settleChannel` routes to `FeeRouter.routeSettlement` in a single transaction; operator receives 80% in the same tx; remaining splits land in the correct contracts.
 3. Governance change to router splits requires 48h timelock and enforces the min/max bounds in Section 2.2.
 4. ve-locker `claim(epochs[])` correctly computes pro-rata share from historical ve-balance snapshots; unclaimed epochs past 26-week window sweep to treasury.
 5. Vesting contracts call `VotingEscrow.create_lock_for` atomically; no code path releases vested TOKEN unlocked.
