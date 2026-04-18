@@ -49,7 +49,7 @@ New contract: `FeeRouter`. Replaces ADR 003's settlement-fee-skim pattern.
 
 **Total operator compensation in aggregate = 80%.** The split is purely a *redistribution* of the operator bucket based on ve-commitment — operators-collective-earnings equal T2b; individual earnings depend on lock posture.
 
-**Rate mechanics.** Per-MB rates are operator-set via probe responses (ADR 003 unchanged). Operators pricing to preserve $0.01/GB **liquid net** revenue (from the 40% base only) quote ~$0.025/GB gross. Operators who treat the boost-pool yield as margin contribution may quote lower. Operators who expect no ve-commitment (pure commodity operators) will quote at the upper end. Market-discovery across operator types establishes an effective rate; typical early-production rate is expected in the $0.0125–$0.025/GB range. This is the only parameter materially different from T2b at the client-facing layer.
+**Rate mechanics.** Per-MB rates are operator-set via probe responses (ADR 003 unchanged). Gross client rate is expected to stay at **$0.01/GB — parity with Bunny.net's budget tier** and 7–20× cheaper than major CDNs. The router's 20% aggregate skim (40% base excluded from the 40% boost + 10% passive + 6% burn + 4% treasury) is absorbed by operator net revenue, not passed to clients. This keeps deCDN at the budget-CDN price point, preserving the "drop-in replacement" positioning in ADR 004. Operators compensate for the USDC margin compression through the boost-pool yield (Case B/C below), bootstrap subsidies, and TOKEN-economy exposure — the design explicitly shifts a portion of operator compensation from USDC to TOKEN-economy value.
 
 #### 2.2.2 Gauge boost formula
 
@@ -126,7 +126,7 @@ Shares must sum to 100% on any update. The minimum on operator-base (20%) guaran
 2. **Share of the 40% operator boost pool** — USDC, weekly epoch distribution, weighted by `working_bytes` (bytes × ve-boost). Non-ve-lockers receive ~40% of the "fair" share of this pool; max-ve-lockers receive 100% of their fair share (2.5× more per byte than non-lockers).
 3. **Optional passive ve-locker pool yield** — USDC on any TOKEN they ve-lock, distributed pro-rata by ve-balance. Same mechanic for operators and passive holders; disjoint from the boost pool.
 
-**Sample P&L — 1 Gbps node at 30K GB/mo, gross rate $0.0125/GB.**
+**Sample P&L — 1 Gbps node at 30K GB/mo, gross rate $0.01/GB (parity with Bunny.net).**
 
 Three operator profiles shown. Network assumption: 1,000 operators × 30K GB/mo average (total 30M GB/mo). 500 operators at "fair-share ve" (their ve-share equals their byte-share), 500 with zero ve-lock. Passive ve-lockers collectively hold as much veTOKEN as the operator pool, so total_ve ≈ 2 × operator_ve.
 
@@ -135,52 +135,53 @@ Under these assumptions:
 - Per-operator byte-share: 0.1%
 - "Fair-share ve" for an operator: ve-balance = 0.1% of total_ve
 - Total working-bytes (Curve formula): 500 × 12K + 500 × 30K = 21M
-- Boost pool (40% × $375K) = $150K/mo
-- Passive pool (10% × $375K) = $37.5K/mo
+- Boost pool (40% × $300K) = $120K/mo
+- Passive pool (10% × $300K) = $30K/mo
 
 ```
 Case A — No ve-lock (commodity operator):
   working = 0.4 × 30K = 12K; share = 12K/21M = 0.057%
-  Gross revenue per month:                $375
-  Router → operator base (40%):           $150
-  Router → boost-pool share:              $86    (0.057% of $150K)
+  Gross revenue per month:                $300
+  Router → operator base (40%):           $120
+  Router → boost-pool share:              $68    (0.057% of $120K)
   Router → passive-pool share:            $0     (no ve-lock)
   Cache-miss paid pulls (15%):           −$45
   Infrastructure (mid):                  −$90
   ─────────────────────────────────────
-  Net P&L:                                $101   ← 39% below T2b baseline ($165)
+  Net P&L:                                $53    ← 50% below T2b baseline ($105)
 
 Case B — Fair-share ve-lock (~100K TOKEN @ 4y lock, ~$5K capital @ $0.05):
   working = 30K (ve-share ≥ byte-share → boost cap reached); share = 30K/21M = 0.143%
-  Gross revenue per month:                $375
-  Router → operator base (40%):           $150
-  Router → boost-pool share:              $214   (0.143% of $150K)
-  Router → passive-pool share:            $38    (0.1% of $37.5K)
+  Gross revenue per month:                $300
+  Router → operator base (40%):           $120
+  Router → boost-pool share:              $171   (0.143% of $120K)
+  Router → passive-pool share:            $30    (0.1% of $30K)
   Cache-miss paid pulls (15%):           −$45
   Infrastructure (mid):                  −$90
   ─────────────────────────────────────
-  Net P&L:                                $267   ← 62% above T2b baseline
+  Net P&L:                                $186   ← 77% above T2b baseline
 
 Case C — Over-ve (~400K TOKEN @ 4y lock, ~$20K capital @ $0.05):
   working = 30K (capped at bytes — no over-boost for the boost-pool)
-  Gross revenue per month:                $375
-  Router → operator base (40%):           $150
-  Router → boost-pool share:              $214   (same as Case B; cap binds)
-  Router → passive-pool share:            $150   (0.4% of $37.5K; overflow ve earns here)
+  Gross revenue per month:                $300
+  Router → operator base (40%):           $120
+  Router → boost-pool share:              $171   (same as Case B; cap binds)
+  Router → passive-pool share:            $120   (0.4% of $30K; overflow ve earns here)
   Cache-miss paid pulls (15%):           −$45
   Infrastructure (mid):                  −$90
   ─────────────────────────────────────
-  Net P&L:                                $379   ← 130% above T2b baseline
+  Net P&L:                                $276   ← 163% above T2b baseline
 ```
 
 **Observations:**
 
-- **Case A runs thinner margins than T2b ($101 vs $165/mo).** They still earn above cost, but the margin is meaningfully lower. This is the designed incentive pressure — commodity operators feel a pull toward ve-locking.
-- **Case B captures strong value from a modest ve-lock.** Going from Case A to Case B costs ~$5K capital (~100K TOKEN at $0.05) and gains +$166/mo (+$1,992/yr in USDC terms). That's **~40% APR on the ve-locked capital** before counting TOKEN appreciation. Payback on the lock capital from boost-delta alone: ~2.5 years — meaningful for a 4y lock.
+- **Case A runs thin margins — ~$53/mo at 30K GB/mo.** Commodity operators below 40K GB/mo will struggle without ve-committing. This is the designed incentive pressure; the floor is that it's still positive (not loss-making).
+- **Case B captures strong value from a modest ve-lock.** Going from Case A to Case B costs ~$5K capital (~100K TOKEN at $0.05) and gains +$133/mo (+$1,596/yr USDC). That's **~32% APR on the ve-locked capital** in USDC terms before counting TOKEN appreciation. Payback on the lock capital from boost-delta alone: ~3.1 years — meaningful and practical for a 4y lock (especially if TOKEN appreciates over the lock period).
 - **Case C shows where the cap binds.** Beyond fair-share ve, boost-pool earnings are flat (boost caps at `bytes`), but passive-pool earnings continue to grow linearly with ve-balance. Over-locking is rational for long-term holders but offers diminishing marginal returns from the boost mechanism.
-- **Aggregate operator revenue = 80% of network revenue**, identical to T2b. The total amount paid to operators is unchanged; this spec is pure redistribution plus an additional passive-pool share that exists because operators are now also ve-lockers.
+- **Aggregate operator revenue = 80% of network revenue**, identical to T2b. The total amount paid to operators is unchanged; this spec is pure redistribution plus an additional passive-pool share for operators who ve-lock.
+- **Gross client rate $0.01/GB — at parity with Bunny.net.** No deCDN-specific premium; preserves budget-CDN positioning. Operators absorb the router skim via thinner USDC margins, compensated through boost-pool and TOKEN-economy value accrual.
 
-**Market dynamics.** Case A operators underperform Case B by ~$166/mo at baseline. Rational operators with capital available will ve-lock to reach Case B; capital-constrained operators accept Case A or exit. The network likely converges to a steady state where most committed operators hold at least fair-share ve — matching the Curve gauge model's intended equilibrium. The ~40% APR on locked capital is the mechanism that drives that convergence; it is strong enough to sustain adoption but not so extreme that it creates runaway whale dynamics (the boost cap enforces that).
+**Market dynamics.** Case A operators underperform Case B by ~$133/mo at baseline — strong incentive to ve-lock for capital-available operators. Capital-constrained operators accept Case A or exit (designed filter). The network likely converges to a steady state where most committed operators hold at least fair-share ve — matching the Curve gauge model's intended equilibrium. The ~32% USDC APR on locked capital (before TOKEN appreciation) is strong enough to sustain adoption without creating runaway whale dynamics; the boost cap enforces that.
 
 **Fee discount mechanic — removed.** Replaced structurally by the gauge boost: operators who want more return from their capital ve-lock and earn a larger boost-pool share, rather than paying lower fees. Simpler, non-regressive, and the core incentive loop that this spec is designed around.
 
@@ -196,9 +197,9 @@ Case C — Over-ve (~400K TOKEN @ 4y lock, ~$20K capital @ $0.05):
 
 **Mature-scale burn estimate:**
 
-- 1,000 nodes × 30K GB/mo × $0.0125/GB = $375K/mo gross revenue
-- Burn inflow: 6% × $375K = **$22.5K/mo USDC = $270K/yr**
-- At $0.05 TOKEN: 5.4M TOKEN burned/yr = **1.08%/yr of 500M supply**
+- 1,000 nodes × 30K GB/mo × $0.01/GB = $300K/mo gross revenue
+- Burn inflow: 6% × $300K = **$18K/mo USDC = $216K/yr**
+- At $0.05 TOKEN: 4.32M TOKEN burned/yr = **0.86%/yr of 500M supply**
 
 **Scaling behavior.** Identical to T2b — burn USDC flow scales linearly with revenue; TOKEN-denominated burn scales with revenue and inversely with TOKEN price. The gauge-boost split does not affect the 6% burn share.
 
@@ -261,7 +262,7 @@ Modified contracts:
 - **Self-selecting operator tiers.** Commodity operators (Case A) stay viable but earn less; committed operators (Case B/C) earn significantly more. The market sorts operators into tiers without protocol-enforced segmentation.
 - **No cashflow crisis.** Unlike the "mandatory 40% vesting" variant (V1 in the brainstorm), operators still receive 40% liquid USDC per settlement — sufficient to pay infrastructure costs on a 1 Gbps node at 30K GB/mo (Case A P&L is positive).
 - **Aggregate distribution identical to T2b.** Total burn, ve-pool, and treasury flows unchanged per unit revenue. All T2b burn-flow and yield estimates carry over.
-- **No gross-rate blowup.** Gross rate stays at $0.0125/GB for balanced operators (Case B sets this rate and earns their T2b-baseline equivalent). Client pricing unchanged from T2b.
+- **No gross-rate blowup.** Gross rate stays at $0.01/GB — identical to T2b, at parity with Bunny.net. No deCDN-specific premium at the client-facing layer.
 
 ### Negative
 
@@ -277,7 +278,7 @@ Modified contracts:
 
 - **Equilibrium fragility.** The Curve-style model converges to a stable equilibrium *if* the boost is valuable enough to lock for but not so valuable that a winner-take-all dynamic emerges. If the boost-pool is too small relative to operating revenue, operators won't bother ve-locking (falls back to T2b-like behavior). If it's too large, only whale operators can afford the "fair-share" threshold, squeezing out small operators. The 40% boost pool default is sized intentionally in the middle; production tuning may be needed.
 - **Reflexive bootstrap intensified (same as T2b).** TOKEN price drop → ve-lock value drops → Case B margins decrease → operators may unwind commitment → further price pressure. Same reflexivity as T2b, but with stronger ve-adoption, potentially more acute since more operator compensation is tied to TOKEN price.
-- **ve-locker pool fragmentation.** The 10% passive pool serves non-operator holders but may be thin relative to the 40% boost pool. This is still stronger than T2b's ve-pool in absolute size (10% of $375K = $37.5K/mo — same as T2b). Keeping the passive pool at 10% preserves passive-holder incentive to ve-lock without being their primary motivation.
+- **ve-locker pool fragmentation.** The 10% passive pool serves non-operator holders but may be thin relative to the 40% boost pool. Same absolute size as T2b's ve-pool (10% of $300K = $30K/mo). Keeping the passive pool at 10% preserves passive-holder incentive to ve-lock without being their primary motivation.
 
 ---
 

@@ -60,7 +60,7 @@ New contract `FeeRouter` replaces the ADR 003 settlement-fee-skim pattern entire
 
 **Applies only to client→node channel settlements.** Node-to-node cache-miss paid pulls bypass the router — direct peer USDC payment, no skim. Rationale: internal cost recovery, not net revenue.
 
-**Rate mechanics.** Per-MB rates are operator-set via probe responses (ADR 003 unchanged). Operators pricing to preserve $0.01/GB **net** revenue quote ~$0.0125/GB gross; clients pay the quoted rate; router's 20% skim is structural.
+**Rate mechanics.** Per-MB rates are operator-set via probe responses (ADR 003 unchanged). Gross client rate is expected to stay at **$0.01/GB — parity with Bunny.net's budget tier** and 7–20× cheaper than CloudFront / Akamai / KeyCDN. The router's 20% skim is absorbed into operator net revenue (operator net = $0.008/GB), **not** passed to clients. This keeps deCDN at the budget-CDN price point, preserving the "drop-in replacement" positioning in ADR 004. It tightens operator margins — 1 Gbps operators now require ~40K GB/mo to sustain comparable margins to the pre-router model's 20K GB/mo threshold. See §2.4 sample P&L.
 
 **Governable split parameters (within hard-coded safety bounds):**
 
@@ -116,25 +116,25 @@ Vote-escrow TOKEN (veTOKEN). Modeled on veCRV with deliberate deviations noted.
 
 **Fee discount mechanic — removed.** ADR 004's "stake 100K for 1% fee" is dropped. Replaced conceptually by the ve-locker pool: operators wanting return on non-stake capital ve-lock it and earn from the 12% pool instead of receiving a discount. Simpler, non-regressive, aligns operators with the supply sink rather than against it.
 
-**Sample P&L — 1 Gbps node at 30K GB/mo, gross rate $0.0125/GB:**
+**Sample P&L — 1 Gbps node at 30K GB/mo, gross rate $0.01/GB (parity with Bunny.net):**
 
 ```
-Gross revenue:                 $375/mo  (30,000 GB × $0.0125/GB)
-Router → operator (80%):       $300/mo
+Gross revenue:                 $300/mo  (30,000 GB × $0.01/GB)
+Router → operator (80%):       $240/mo
 Cache-miss paid pulls (15%):   −$45/mo
 Infrastructure (mid):          −$90/mo
 ─────────────────────────────────────
-Operator gross profit:         $165/mo
+Operator gross profit:         $105/mo
 
 Optional ve-lock of 50K TOKEN for 4y:
   ve-balance (time-averaged):  25K veTOKEN
-  At mature-scale pool yield (~6% USDC APR on locked TOKEN at $0.05):
-  Ve-yield:                    ~$12/mo
+  At mature-scale pool yield (~5% USDC APR on locked TOKEN at $0.05):
+  Ve-yield:                    ~$10/mo
 ─────────────────────────────────────
-Operator w/ ve-lock:           ~$177/mo
+Operator w/ ve-lock:           ~$115/mo
 ```
 
-Matches the branch's 1 Gbps 30K GB/mo line at unchanged **net** economics. The router's 20% skim is entirely absorbed by the rate increase from $0.01/GB → $0.0125/GB — a 25% premium over Bunny.net's $0.01/GB budget tier, and still 7× cheaper than CloudFront, 10–16× cheaper than Akamai.
+Gross client rate at **parity with Bunny.net** ($0.01/GB) — no premium on the deCDN network; operator absorbs the 20% router skim in their net rate. Compared to the branch's pre-router 30K GB/mo line ($165/mo), margins drop by ~$60/mo. The new 1 Gbps threshold for comfortable profitability (~$165/mo net equivalent to the pre-router target) shifts from 30K → 40K GB/mo; operators below that threshold should either increase delivery volume or consider higher-tier hardware. Operators compensate for the margin compression through TOKEN-denominated bootstrap subsidies, ve-locker yield, and TOKEN appreciation — the design deliberately shifts a portion of operator compensation from USDC to TOKEN-economy exposure.
 
 ### 2.5 Governance
 
@@ -160,11 +160,11 @@ Rest of ADR 009 (safety bounds on governable parameters, emergency multisig with
 
 **Mature-scale burn flow estimate.**
 
-- Baseline: 1,000 nodes × 30K GB/mo × $0.0125/GB = $375K/mo gross revenue
-- Burn inflow: 6% × $375K = **$22.5K/mo USDC = $270K/yr**
-- At $0.05 TOKEN: 5.4M TOKEN burned/yr = **1.08%/yr of 500M supply**
+- Baseline: 1,000 nodes × 30K GB/mo × $0.01/GB = $300K/mo gross revenue
+- Burn inflow: 6% × $300K = **$18K/mo USDC = $216K/yr**
+- At $0.05 TOKEN: 4.32M TOKEN burned/yr = **0.86%/yr of 500M supply**
 
-**Scaling behavior.** Burn USDC flow scales linearly with network revenue (nodes × GB/node × $/GB). TOKEN-denominated burn scales with revenue and inversely with TOKEN price. If network grows 10× while TOKEN price is flat, per-year supply burn reaches ~10.8%/yr — genuinely deflationary. If network grows 10× and TOKEN price grows 10× proportionally, burn stays around 1.1%/yr of supply but TOKEN market-cap-destroyed grows 10×. Either trajectory is a working flywheel; which one dominates depends on the ratio of price growth to network growth.
+**Scaling behavior.** Burn USDC flow scales linearly with network revenue (nodes × GB/node × $/GB). TOKEN-denominated burn scales with revenue and inversely with TOKEN price. If network grows 10× while TOKEN price is flat, per-year supply burn reaches ~8.6%/yr — genuinely deflationary. If network grows 10× and TOKEN price grows 10× proportionally, burn stays around 0.9%/yr of supply but TOKEN market-cap-destroyed grows 10×. Either trajectory is a working flywheel; which one dominates depends on the ratio of price growth to network growth.
 
 The burn is meaningful at mature scale but still secondary to the supply sink from ve-locks and auto-lock vesting. That's intentional — burn narratives without real yield capture are thin.
 
@@ -226,19 +226,18 @@ Modified contracts:
 - **Burn flow 10× stronger per unit network revenue** (6% of 100% vs. 20% of 3%); material burn rate at mature scale.
 - **Three independent demand sources for TOKEN:** operators (stake-to-operate), yield-seekers (ve-lock for USDC fee share), governance participants (ve-lock for voting). Each source is independent of TOKEN price — they scale with network usage.
 - **Auto-ve-lock eliminates vesting-cliff dumps.** Team, seed, treasury, ecosystem all locked into multi-year timelines after vest; no "cliff + dump" opportunity.
-- **Operator P&L unchanged at same served volume.** The 25% router skim passes through to client rates via operator pricing; net $/GB to operators is identical to the branch baseline.
+- **Gross client rate at parity with Bunny.net.** No deCDN-specific premium; preserves the budget-CDN positioning. (Trade-off noted in Negatives.)
 - **Single contract owns the economic split.** `FeeRouter` is the governance lever; operator contracts, payment channels, and settlement logic stay stable.
 - **ve-governance aligns voting with commitment.** Short-term holders can't govern; long-term holders have proportionally amplified voice.
 
 ### Negative
 
 - **Significant new contract surface.** `FeeRouter`, `VotingEscrow`, `VestingWithAutoLock` are all new and non-trivial. Audit burden is substantial.
-- **Client-rate perception.** Marketing the network as "3% protocol fee" vs. "25% protocol cut" is optically harder even though the operator keeps the same net $. Requires careful messaging about net operator economics.
-- **1 Gbps operators remain margin-thin.** At 20K GB/mo (the branch's "comfortably profitable" threshold), operator gross profit is ~$30/mo under the new model (vs. ~$80/mo pre-rate-adjustment); scale-up to 30K+ GB/mo is now essential for healthy operation. Rate-adjustment is the primary mitigation.
+- **Operator margin compression at unchanged gross rate.** Keeping $0.01/GB at parity with Bunny.net means the 20% router skim is absorbed by operators, not clients. At 30K GB/mo the operator nets ~$105/mo before ve-yield (vs. $165/mo under the branch's pre-router baseline); the 1 Gbps "comfortably profitable" threshold rises from ~20K to ~40K GB/mo. Commodity-minded operators may exit unless traffic matures; crypto-aligned operators accept the USDC compression in exchange for TOKEN-side exposure (subsidies, ve-yield, appreciation). Worth monitoring during early production; rate increases are always an option in governance.
 - **Seed-investor negotiations may contest auto-ve-lock.** Traditional term sheets assume liquid positions post-cliff; a 2y auto-ve-lock is non-standard. Should be a negotiated parameter per seed round, not a hard rule. Spec fixes the default; term sheets may deviate.
 - **ve-position illiquidity creates Convex-capture risk.** If third-party protocols launch liquid-ve wrappers (Convex/Votium model), they can concentrate governance power. Mitigation: governance should monitor and consider direct treasury incentive programs to keep ve-lockers in the native contract. Out of scope for this spec.
 - **ve-locker pool epoch claims add UX overhead.** Lockers must claim each epoch (or batch up to 26 weeks). Non-claim → sweep to treasury. Acceptable UX; could be improved with a claim-aggregator in a later ADR.
-- **Effective supply growth still +11.4%/yr during vesting window** even after S4 + T2b burn (12.5% unlock rate minus ~1.1% burn at mature scale at $0.05). This design compresses the inflation story but does not eliminate it. Long-term deflation requires mature network scale ($1M+/mo fee flow) or further supply-side changes.
+- **Effective supply growth still +11.6%/yr during vesting window** even after S4 + T2b burn (12.5% unlock rate minus ~0.9% burn at mature scale at $0.05). This design compresses the inflation story but does not eliminate it. Long-term deflation requires mature network scale ($1M+/mo fee flow) or further supply-side changes.
 
 ### Risks
 
@@ -253,7 +252,7 @@ Modified contracts:
 1. **Treasury-bucket auto-ve-lock duration.** Current default: 2y, matching team/seed. Alternative: shorter (0–1y) because treasury is protocol-owned and long locks hurt responsiveness. Recommend resolving at implementation-plan time.
 2. **ve-locker claim aggregator.** A helper contract that batches claims across multiple epochs for a user with a single transaction. Not required for v1; usability optimization.
 3. **Liquid-ve wrapper strategy.** Convex-style wrappers are a known pattern; protocol should decide whether to pre-empt with its own (like Frax's vlCVX) or accept third-party capture. Defer to a governance ADR once the protocol ships.
-4. **Rate-advertising UX.** How do probe responses expose the pre-router-skim rate to clients? Should clients see "rate $0.0125/GB" or "rate $0.01/GB + 20% protocol cut"? Client-UX question for the decdn-website or client ADRs, not tokenomics.
+4. **Rate-advertising UX.** Clients see a unified $0.01/GB gross rate; the router's 20% skim is transparent to them. How much operator-side detail (net-per-GB, router breakdown) should be exposed via client APIs? Client-UX question for the decdn-website or client ADRs, not tokenomics.
 5. **Bootstrap-subsidy auto-ve-lock duration.** Current default: 1y. Operators may prefer shorter to maintain cashflow. Could be made per-tranche governable.
 6. **Effect on existing ADR 003 `settleChannel` semantics.** The channel close/dispute flow currently assumes operator receives payout in the settlement transaction. Routing via `FeeRouter` keeps this property (the router forwards 80% in the same tx) but the ADR 003 text needs rework to reflect the new call graph.
 
