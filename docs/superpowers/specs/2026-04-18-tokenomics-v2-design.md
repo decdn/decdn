@@ -32,7 +32,7 @@ The rewrite is structural, not cosmetic. Burn becomes secondary. Real yield to v
 | Node bootstrap fund | 20% | 100M | On-demand via governance | 1y |
 | Community & ecosystem | 20% | 100M | 6y linear, no cliff | 1y |
 | Team & contributors | 15% | 75M | 6y linear, 12mo cliff | 2y |
-| Liquidity (POL) | 5% | 25M | Unlocked at genesis, Timelock-custodied (ADR 018) | None |
+| Liquidity (POL) | 10% | 50M | Unlocked at genesis, Timelock-custodied (ADR 018) | None |
 | Seed / early supporters | 10% | 50M | 6y linear, 12mo cliff | 2y |
 
 **Auto-ve-lock semantics.** When a vested tranche is released from the vesting contract into a recipient's wallet, it is atomically deposited into `VotingEscrow` with the bucket's stated lock period. The recipient owns the ve-position (accrues voting weight and ve-locker yield immediately) but the underlying TOKEN is non-transferable until the lock decays to zero. Recipients cannot bypass the auto-lock — the vesting contract calls `VotingEscrow.create_lock_for(recipient, amount, duration)` directly; no path routes TOKEN to the recipient unlocked.
@@ -41,7 +41,7 @@ The rewrite is structural, not cosmetic. Burn becomes secondary. Real yield to v
 
 **Effective circulating-supply growth.** 500M ÷ (6y vest + 2y mean lock) ≈ **~62.5M/yr ≈ 12.5%/yr** during the active vesting window. Halves ADR 004's effective unlock rate (~25%/yr).
 
-**Liquidity allocation halved (10% → 5%).** POL pool depth in absolute TOKEN terms is unchanged (25M TOKEN on a 500M supply represents the same pool-depth fraction as 50M on 1B); ADR 018's Balancer V3 80/20 weighted-pool mechanics continue unchanged.
+**Liquidity allocation.** 10% of supply (50M TOKEN) preserved from ADR 004's ratio; because total supply halves, absolute token count for POL seeding also halves (100M → 50M TOKEN). ADR 018's Balancer V3 80/20 weighted-pool mechanics continue unchanged — the pool depth in supply-fraction terms is identical to the original ADR 004 plan.
 
 ### 2.2 Fee router
 

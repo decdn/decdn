@@ -314,4 +314,169 @@ Modified contracts:
 
 ---
 
+## 9. Visual reference
+
+### 9.1 Token distribution (500M total)
+
+```mermaid
+pie title Token distribution (500M total supply)
+    "Protocol Treasury (25%)" : 125
+    "Node Bootstrap (20%)" : 100
+    "Community & Ecosystem (20%)" : 100
+    "Team & Contributors (15%)" : 75
+    "Seed / Early Supporters (10%)" : 50
+    "Liquidity POL (10%)" : 50
+```
+
+### 9.2 FeeRouter split per settlement
+
+```mermaid
+pie title FeeRouter split per settlement (% of gross revenue)
+    "Operator base (40%)" : 40
+    "Operator boost pool (40%)" : 40
+    "Passive ve-locker pool (10%)" : 10
+    "Burn (6%)" : 6
+    "Treasury (4%)" : 4
+```
+
+### 9.3 FeeRouter flow
+
+```mermaid
+flowchart TB
+    Client[Client] -->|"USDC at $0.01/GB gross"| Channel[PaymentChannel]
+    Channel -->|"full settlement"| Router{{FeeRouter}}
+
+    Router -->|"40% base<br/>same-tx, per-byte"| OpDirect[Operator<br/>base share]
+    Router -->|"40% boost<br/>epoch-accumulate"| BoostPool[(Operator<br/>boost pool)]
+    Router -->|"10% passive<br/>epoch-accumulate"| PassivePool[(Passive<br/>ve-pool)]
+    Router -->|"6% same-tx"| Burner[BuybackBurner]
+    Router -->|"4% same-tx"| Treasury[Treasury<br/>USDC reserve]
+
+    OpDirect --> Operator((Operator))
+    BoostPool -.->|"claimBoost<br/>ve-weighted"| Operator
+    PassivePool -.->|"claimPassive<br/>pro-rata by ve"| Operator
+    PassivePool -.->|"claimPassive<br/>pro-rata by ve"| Passive((Passive<br/>ve-locker))
+    Burner -->|"swap USDC→TOKEN"| BurnAddr[0x...dEaD]
+```
+
+### 9.4 Gauge boost formula (per operator, per epoch)
+
+```mermaid
+flowchart TD
+    B["bytes_i<br/>delivered in epoch"] --> FL["floor = 0.4 × bytes_i"]
+    V["ve_i<br/>ve-balance at epoch boundary"] --> VC["ve_contrib = 0.6 × (ve_i / total_ve) × total_bytes"]
+    FL --> CAND["candidate = floor + ve_contrib"]
+    VC --> CAND
+    CAND --> MIN{"working_bytes_i = min(candidate, bytes_i)"}
+    B --> MIN
+    MIN --> PAY["payout_i = working_i / Σworking × boost_pool"]
+```
+
+Properties illustrated by the formula:
+
+- **No ve-lock** → `candidate = 0.4 × bytes_i` → working = 0.4 × bytes (worst case, 40% of fair share).
+- **Fair-share ve** (ve_i / total_ve = bytes_i / total_bytes) → `candidate = bytes_i` → working = bytes (cap binds exactly).
+- **Over-ve** (ve_share > bytes_share) → `candidate > bytes_i` → working = bytes (cap binds; over-ve earns no extra boost but does earn from passive pool).
+- Max boost ratio between max-ve-locker and zero-ve-locker: **1 / 0.4 = 2.5×**.
+
+### 9.5 Contract architecture
+
+```mermaid
+classDiagram
+    class PaymentChannel {
+        +settleChannel(op, bytes, amount)
+    }
+    class FeeRouter {
+        +routeSettlement(op, bytes, amount)
+        +claimBoost(epochs)
+        +claimPassive(epochs)
+        +workingBytes(op, epoch)
+    }
+    class VotingEscrow {
+        +createLock(amount, duration)
+        +createLockFor(recipient, amount, duration)
+        +extendLock(duration)
+        +withdraw()
+        +balanceOfAt(user, ts)
+    }
+    class VestingWithAutoLock {
+        +vest()
+    }
+    class BuybackBurner {
+        +executeBuyback(amount, minOut)
+    }
+    class StakingRegistry {
+        +stake()
+        +unstake()
+        +slash()
+    }
+    class Governor {
+        +propose()
+        +vote()
+        +execute()
+    }
+    class Treasury
+    class BalancerV3Pool
+
+    PaymentChannel ..> FeeRouter : routeSettlement
+    FeeRouter ..> VotingEscrow : balanceOfAt
+    FeeRouter ..> BuybackBurner : 6% USDC
+    FeeRouter ..> Treasury : 4% USDC
+    VestingWithAutoLock ..> VotingEscrow : createLockFor
+    BuybackBurner ..> BalancerV3Pool : swap USDC→TOKEN
+    Governor ..> VotingEscrow : voting weight
+```
+
+StakingRegistry is drawn unconnected because it is independent of the fee-router path — it governs slashable stake and is read by gossip/peer-validation logic (ADR 001, ADR 003) rather than by FeeRouter.
+
+### 9.6 Epoch lifecycle
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant PC as PaymentChannel
+    participant FR as FeeRouter
+    participant VE as VotingEscrow
+    participant Op as Operator
+    participant BB as BuybackBurner
+    participant T as Treasury
+
+    Note over Client,T: During epoch e (1 week)
+    Client->>PC: close channel with vouchers
+    PC->>FR: routeSettlement(op, bytes, usdc)
+    FR-->>Op: 40% × usdc (base, same tx)
+    FR-->>BB: 6% × usdc
+    FR-->>T: 4% × usdc
+    Note over FR: bytesPerEpoch[op][e] += bytes<br/>boostPool[e] += 40% × usdc<br/>passivePool[e] += 10% × usdc
+
+    Note over FR,VE: Epoch rollover (week boundary)
+    FR->>VE: snapshot total ve at t_e
+    Note over FR: freeze epoch e buckets<br/>open epoch e+1
+
+    Note over Op,FR: Claim phase (any time within 26 epochs)
+    Op->>FR: claimBoost([e])
+    FR->>VE: balanceOfAt(op, t_e)
+    VE-->>FR: ve_op
+    Note over FR: working = min(bytes, 0.4×bytes + 0.6×ve_share × Σbytes)
+    FR-->>Op: working / Σworking × boostPool[e]
+    Op->>FR: claimPassive([e])
+    FR-->>Op: ve_op / total_ve × passivePool[e]
+```
+
+### 9.7 Operator P&L across ve-lock profiles
+
+```mermaid
+flowchart LR
+    A[No ve-lock<br/>Case A<br/>$53/mo] -->|"Lock ~$5K capital<br/>~100K TOKEN @ 4y<br/>+$133/mo → ~32% APR"| B[Fair-share ve<br/>Case B<br/>$186/mo]
+    B -->|"Lock ~$15K more<br/>~300K additional TOKEN<br/>+$90/mo from passive pool"| C[Over-ve<br/>Case C<br/>$276/mo]
+
+    style A fill:#fff1f1
+    style B fill:#f0f9ff
+    style C fill:#f0fdf4
+```
+
+Arrows indicate incremental decisions. Case B's payback period on incremental capital: ~3.1 years. Case C provides diminishing marginal returns from the boost pool (capped) but continued linear yield from the passive pool.
+
+---
+
 **End of spec.**
