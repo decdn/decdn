@@ -4,17 +4,21 @@
 //! temp file is opened with mode `0600` from creation (no umask-window where
 //! the key material is world-readable) and atomically renamed into place.
 //!
-//! New keys are generated with `rand::rng()` — rand 0.9's `ThreadRng`, which is
-//! auto-seeded from the OS entropy source (`getrandom`). `rand::rngs::OsRng`
-//! itself only implements `TryCryptoRng` in rand 0.9 and is not directly
-//! accepted by `SecretKey::generate`.
+//! New keys are built by drawing 32 random bytes from `rand::rng()`
+//! (rand 0.10's auto-seeded `ThreadRng`, backed by OS entropy via
+//! `getrandom`) and feeding them to [`SecretKey::from_bytes`]. We go
+//! through raw bytes rather than `SecretKey::generate(&mut rand::rng())`
+//! because iroh 0.97 still pins `rand_core 0.9`, so rand 0.10's
+//! `ThreadRng` does not satisfy iroh's `CryptoRng` bound — the
+//! `rand_core` trait lives in two incompatible versions in the dep
+//! graph.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow};
 use iroh::SecretKey;
-use rand::RngCore;
+use rand::Rng;
 
 const KEY_FILE_NAME: &str = "node.secret";
 const KEY_LEN: usize = 32;
@@ -39,7 +43,7 @@ pub fn load_or_generate(data_dir: &Path) -> anyhow::Result<SecretKey> {
     fs::create_dir_all(data_dir)
         .with_context(|| format!("failed to create data dir {}", data_dir.display()))?;
 
-    let key = SecretKey::generate(&mut rand::rng());
+    let key = fresh_secret_key();
     write_atomic(&path, &key.to_bytes())?;
     tracing::info!(path = %path.display(), "generated new node secret key");
     Ok(key)
@@ -58,6 +62,15 @@ pub fn load_from(path: &Path) -> anyhow::Result<SecretKey> {
         .try_into()
         .map_err(|_| anyhow!("secret key file {} must be {KEY_LEN} bytes", path.display()))?;
     Ok(SecretKey::from_bytes(&arr))
+}
+
+/// Build a fresh `SecretKey` from 32 random bytes drawn from
+/// [`rand::rng()`]. See module-level docs for why we don't use
+/// `SecretKey::generate` directly.
+pub(crate) fn fresh_secret_key() -> SecretKey {
+    let mut bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    SecretKey::from_bytes(&bytes)
 }
 
 /// Write `bytes` to `path` atomically. On Unix the temp file is created with
