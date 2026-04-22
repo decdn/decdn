@@ -14,9 +14,29 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// Per-ALPN maximum framed message size (ADR 013). The 16 MiB ceiling bounds
-/// per-stream allocation from a malicious peer.
+/// Maximum framed message size. Pinned at exactly 16 MiB by ADR 013 §Wire
+/// Framing, uniformly across all ALPNs in v1.
+///
+/// The ceiling is a pre-allocation denial-of-service bound: [`read_frame`]
+/// allocates exactly `len` bytes after decoding the length prefix, so an
+/// unbounded length would let a peer force arbitrary-sized allocations. 16 MiB
+/// sits well above every documented ALPN message (`cdn/probe/v1` ≤ ~200 B,
+/// `cdn/client/v1` non-`ChunkData` ≤ ~1 KiB) and pairs with QUIC's
+/// `MAX_STREAMS` (ADR 005) for the total per-peer memory bound.
+///
+/// Changing this constant is a protocol-wide wire-compatibility decision —
+/// any edit, whether bump or shrink, requires an ADR 013 amendment first.
+/// The compile-time guard below catches accidental edits. Per-deployment
+/// tightening for memory-constrained nodes is a runtime-config concern
+/// (ADR 013 §Wire Framing), not a change to the constant itself.
 pub const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
+
+// Compile-time guardrail tying MAX_MESSAGE_SIZE to ADR 013. Any change to
+// the constant without an ADR 013 amendment fails the build.
+const _: () = assert!(
+    MAX_MESSAGE_SIZE == 16 * 1024 * 1024,
+    "MAX_MESSAGE_SIZE must be exactly 16 MiB per ADR 013 §Wire Framing; any change (bump or shrink) requires an ADR amendment",
+);
 
 /// Errors produced by the framing helpers. The handler-layer mapping to QUIC
 /// application error codes lives in the node crate.

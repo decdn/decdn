@@ -167,6 +167,19 @@ mod tests {
         GOSSIP_VERSION, GossipEnvelope, GossipPayload, LoadHint, NodeAnnounce, NodeAnnounceBody,
     };
     use iroh::SecretKey;
+    use rand::Rng;
+
+    /// Build a fresh `SecretKey` by drawing 32 random bytes and feeding
+    /// them to `SecretKey::from_bytes`. We can't call
+    /// `SecretKey::generate(&mut rand::rng())` because iroh 0.97 pins
+    /// `rand_core 0.9` while this crate uses rand 0.10, so the two
+    /// `CryptoRng` traits don't match. Going through raw bytes
+    /// sidesteps the trait-version mismatch entirely.
+    fn fresh_key() -> SecretKey {
+        let mut bytes = [0u8; 32];
+        rand::rng().fill_bytes(&mut bytes);
+        SecretKey::from_bytes(&bytes)
+    }
 
     /// Freeze the Prometheus label strings: a rename without updating this
     /// test would break operator dashboards silently. The exhaustive `match`
@@ -255,7 +268,7 @@ mod tests {
 
     #[test]
     fn happy_path() {
-        let sk = SecretKey::generate(&mut rand::rng());
+        let sk = fresh_key();
         let bytes = mk_envelope(&sk, |_| {});
         let a = validate_envelope(&bytes, 1_700_000_000_000_000, &no_list()).expect("valid");
         assert_eq!(a.body.node_id, *sk.public().as_bytes());
@@ -263,7 +276,7 @@ mod tests {
 
     #[test]
     fn unknown_version_rejected() {
-        let sk = SecretKey::generate(&mut rand::rng());
+        let sk = fresh_key();
         let body = sample_body(&sk, 1_700_000_000_000_000);
         let signature = sign(&sk, &body);
         let bytes = encode(&GossipEnvelope {
@@ -278,7 +291,7 @@ mod tests {
 
     #[test]
     fn bad_signature_rejected() {
-        let sk = SecretKey::generate(&mut rand::rng());
+        let sk = fresh_key();
         let body = sample_body(&sk, 1_700_000_000_000_000);
         let bytes = encode(&GossipEnvelope {
             version: GOSSIP_VERSION,
@@ -295,7 +308,7 @@ mod tests {
 
     #[test]
     fn bad_signature_length_rejected() {
-        let sk = SecretKey::generate(&mut rand::rng());
+        let sk = fresh_key();
         let body = sample_body(&sk, 1_700_000_000_000_000);
         let bytes = encode(&GossipEnvelope {
             version: GOSSIP_VERSION,
@@ -312,7 +325,7 @@ mod tests {
 
     #[test]
     fn clock_skew_future_rejected() {
-        let sk = SecretKey::generate(&mut rand::rng());
+        let sk = fresh_key();
         let bytes = mk_envelope(&sk, |b| {
             b.timestamp_us = 2_000_000_000_000_000;
         });
@@ -326,7 +339,7 @@ mod tests {
 
     #[test]
     fn clock_skew_past_rejected() {
-        let sk = SecretKey::generate(&mut rand::rng());
+        let sk = fresh_key();
         let bytes = mk_envelope(&sk, |b| {
             b.timestamp_us = 2_000_000_000_000_000;
         });
@@ -339,7 +352,7 @@ mod tests {
 
     #[test]
     fn bad_region_rejected() {
-        let sk = SecretKey::generate(&mut rand::rng());
+        let sk = fresh_key();
         for bad in ["us", "USA", "", "U1", "U"] {
             let bytes = mk_envelope(&sk, |b| b.region = bad.to_string());
             assert_eq!(
@@ -352,7 +365,7 @@ mod tests {
 
     #[test]
     fn duplicate_hashes_rejected() {
-        let sk = SecretKey::generate(&mut rand::rng());
+        let sk = fresh_key();
         let bytes = mk_envelope(&sk, |b| b.popular_hashes = vec![[1u8; 32], [1u8; 32]]);
         assert_eq!(
             validate_envelope(&bytes, 1_700_000_000_000_000, &no_list()),
@@ -362,7 +375,7 @@ mod tests {
 
     #[test]
     fn too_many_hashes_rejected() {
-        let sk = SecretKey::generate(&mut rand::rng());
+        let sk = fresh_key();
         let bytes = mk_envelope(&sk, |b| {
             b.popular_hashes = (0..=POPULAR_HASHES_MAX)
                 .map(|i| {
@@ -380,7 +393,7 @@ mod tests {
 
     #[test]
     fn allowlist_enforced_when_non_empty() {
-        let sk = SecretKey::generate(&mut rand::rng());
+        let sk = fresh_key();
         let bytes = mk_envelope(&sk, |_| {});
         let mut allow = HashSet::new();
         allow.insert([42u8; 32]);

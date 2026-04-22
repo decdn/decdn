@@ -149,8 +149,10 @@ pub async fn probe(args: &cli::ProbeArgs) -> anyhow::Result<()> {
         message::{ProbeRequest, ProbeResponse},
         read_frame, write_frame,
     };
-    use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl, SecretKey};
-    use rand::RngCore;
+    use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl};
+    use rand::Rng;
+
+    use crate::identity::fresh_secret_key;
 
     let node_id = PublicKey::from_str(&args.node_id)
         .map_err(|e| anyhow::anyhow!("invalid --node-id {:?}: {e}", args.node_id))?;
@@ -172,7 +174,7 @@ pub async fn probe(args: &cli::ProbeArgs) -> anyhow::Result<()> {
         None => RelayMode::Disabled,
     };
 
-    let client_sk = SecretKey::generate(&mut rand::rng());
+    let client_sk = fresh_secret_key();
     let endpoint = Endpoint::empty_builder()
         .secret_key(client_sk)
         .relay_mode(relay_mode)

@@ -19,7 +19,19 @@ use iroh::endpoint::{
 };
 use iroh::protocol::ProtocolHandler;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
+use rand::Rng;
 use tokio::task::JoinHandle;
+
+/// Build a fresh `SecretKey` by drawing 32 random bytes and feeding them
+/// to `SecretKey::from_bytes`. We don't use
+/// `fresh_key()` because iroh 0.97 pins
+/// `rand_core 0.9` while this crate uses rand 0.10, so the two
+/// `CryptoRng` traits don't match.
+fn fresh_key() -> SecretKey {
+    let mut bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    SecretKey::from_bytes(&bytes)
+}
 
 /// Build an endpoint bound to 127.0.0.1 with relays disabled and no discovery.
 /// Returns the endpoint plus its local socket address.
@@ -55,7 +67,7 @@ async fn local_endpoint(
 async fn probe_roundtrip() -> anyhow::Result<()> {
     let rate_per_mb: u64 = 42;
 
-    let server_sk = SecretKey::generate(&mut rand::rng());
+    let server_sk = fresh_key();
     let server_id = server_sk.public();
     let metrics = Arc::new(Metrics::new());
     let handler = Arc::new(ProbeHandler::new(
@@ -83,7 +95,7 @@ async fn probe_roundtrip() -> anyhow::Result<()> {
         Ok::<_, anyhow::Error>(())
     });
 
-    let (client_ep, _) = local_endpoint(SecretKey::generate(&mut rand::rng()), vec![]).await?;
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
 
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
 
@@ -141,7 +153,7 @@ struct Harness {
 }
 
 async fn spin_up_probe_harness() -> anyhow::Result<Harness> {
-    let server_sk = SecretKey::generate(&mut rand::rng());
+    let server_sk = fresh_key();
     let server_id = server_sk.public();
     let metrics = Arc::new(Metrics::new());
     let handler = Arc::new(ProbeHandler::new(server_id, 1, metrics));
@@ -165,7 +177,7 @@ async fn spin_up_probe_harness() -> anyhow::Result<Harness> {
             .map_err(|e| anyhow::anyhow!("{e}"))
     });
 
-    let (client_ep, _) = local_endpoint(SecretKey::generate(&mut rand::rng()), vec![]).await?;
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
     let client_conn = client_ep
         .connect(target, ALPN_PROBE)
