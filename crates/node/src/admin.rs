@@ -1,34 +1,34 @@
-//! Loopback-only admin HTTP surface (ADR 025).
+//! Loopback-only admin JSON-RPC surface (ADR 025).
 //!
-//! Mirrors the structure of [`crate::metrics`]: hyper `service_fn` over a
-//! pre-bound `TcpListener`, shutdown via a `oneshot`, per-connection
-//! concurrency capped by a semaphore. The admin server is a local-operator
-//! control plane — it is expected to bind on `127.0.0.1` only.
+//! The admin surface is a local-operator control plane — it is expected
+//! to bind on `127.0.0.1` only. Methods are dispatched via JSON-RPC 2.0
+//! over HTTP `POST /`; the [`AdminRpc`] trait is the single source of
+//! truth for both the server impl and the generated client bindings in
+//! [`crate::commands`] and integration tests.
 //!
-//! Today it exposes a single route, `GET /v1/peers`, which returns the
-//! current gossip peer table as JSON. Future operational endpoints (drain,
-//! health, etc.) will land here as additional `/v1/...` routes without
-//! requiring a new transport.
+//! Today the trait exposes a single method, `admin_v1_peersList`, which
+//! returns the current gossip peer table as JSON. Future operational
+//! methods (drain, health, etc.) will land here as additional entries
+//! on the same trait without requiring a new transport.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use bytes::Bytes;
 use decdn_gossip::{PeerEntry, PeerTable};
-use http_body_util::Full;
-use hyper::service::service_fn;
-use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
+use jsonrpsee::core::{RpcResult, async_trait};
+use jsonrpsee::proc_macros::rpc;
+use jsonrpsee::server::{Server, ServerConfig};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
-use tokio::sync::{RwLock, Semaphore, oneshot};
+use tokio::sync::{RwLock, oneshot};
 
 /// Cap concurrent admin connections. The surface is local-operator-only,
-/// but an errant operator script looping curl must not be able to exhaust
-/// the runtime's task budget.
-const MAX_ADMIN_CONNECTIONS: usize = 16;
+/// but an errant operator script looping requests must not be able to
+/// exhaust the runtime's task budget. `u32` rather than `usize` because
+/// `ServerConfig::max_connections` is typed that way.
+const MAX_ADMIN_CONNECTIONS: u32 = 16;
 
-/// Shared state for admin HTTP handlers.
+/// Shared state for admin RPC handlers.
 #[derive(Debug, Clone)]
 pub struct AdminState {
     peer_table: Arc<RwLock<PeerTable>>,
@@ -40,7 +40,7 @@ impl AdminState {
     }
 }
 
-/// JSON view of a [`PeerEntry`] emitted by `GET /v1/peers`.
+/// JSON view of a [`PeerEntry`] emitted by `admin_v1_peersList`.
 ///
 /// Defined separately from `PeerEntry` so that table-internal fields
 /// (per-peer counters, debug flags, etc.) that may accrete in the future
@@ -49,23 +49,23 @@ impl AdminState {
 /// wire, so changes to those still need to be treated as wire-format
 /// changes.
 ///
-/// Also used by `decdn node peers` to deserialize the server response —
-/// sharing the type here prevents the two sides from drifting field-for-
-/// field.
+/// Also used by `decdn node peers` and the integration tests to
+/// deserialize the server response — sharing the type here prevents the
+/// two sides from drifting field-for-field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct PeerView {
+pub struct PeerView {
     /// Lowercase hex of the peer's Ed25519 public key (ADR 001).
-    pub(crate) node_id: String,
+    pub node_id: String,
     /// ISO 3166-1 alpha-2 region code from the announce.
-    pub(crate) region: String,
+    pub region: String,
     /// Microseconds-since-epoch the peer was first inserted into the table.
-    pub(crate) first_seen_us: u64,
+    pub first_seen_us: u64,
     /// Microseconds-since-epoch the peer's most recent announce was accepted.
-    pub(crate) last_seen_us: u64,
+    pub last_seen_us: u64,
     /// `LoadHint` from the most recent announce.
-    pub(crate) load: decdn_protocol::LoadHint,
+    pub load: decdn_protocol::LoadHint,
     /// `timestamp_us` carried inside the signed announce body.
-    pub(crate) announced_at_us: u64,
+    pub announced_at_us: u64,
 }
 
 impl PeerView {
@@ -81,15 +81,61 @@ impl PeerView {
     }
 }
 
-/// Response body for `GET /v1/peers`. Shared between the server
-/// (serializes) and `decdn node peers` (deserializes) so the two sides
-/// can't drift field-for-field.
+/// Response body for `admin_v1_peersList`. Shared between the server
+/// (serializes), `decdn node peers` (deserializes via the generated
+/// client), and the integration tests.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct PeersResponse {
-    pub(crate) peers: Vec<PeerView>,
+pub struct PeersResponse {
+    pub peers: Vec<PeerView>,
 }
 
-/// Bind the admin HTTP listener. Kept synchronous-at-startup so port
+/// Admin RPC surface. Versioned via the namespace prefix
+/// (`admin_v1_...`): new methods may be added backwards-compatibly
+/// within `v1`, a breaking change cuts over to `admin_v2_...`.
+#[rpc(server, client, namespace = "admin_v1")]
+pub trait AdminRpc {
+    /// Return the current gossip peer table. Ordering is most-recently-
+    /// seen first.
+    #[method(name = "peersList")]
+    async fn peers_list(&self) -> RpcResult<PeersResponse>;
+}
+
+/// Concrete server implementation backed by the live gossip peer table.
+#[derive(Debug, Clone)]
+pub struct AdminRpcImpl {
+    state: AdminState,
+}
+
+impl AdminRpcImpl {
+    pub const fn new(state: AdminState) -> Self {
+        Self { state }
+    }
+}
+
+#[async_trait]
+impl AdminRpcServer for AdminRpcImpl {
+    async fn peers_list(&self) -> RpcResult<PeersResponse> {
+        // Snapshot the table under a read lock: copying the entries
+        // keeps the lock hold time proportional to peer count, not to
+        // the JSON encode time (which grows with `popular_hashes`
+        // lengths etc.).
+        let mut snapshot: Vec<PeerView> = {
+            let guard = self.state.peer_table.read().await;
+            guard
+                .iter()
+                .map(|(id, entry)| PeerView::from_entry(id, entry))
+                .collect()
+        };
+        // Most recently seen first — on-call use case is "is gossip
+        // alive?". Sorting happens after the read lock is released so
+        // concurrent announce-writers aren't blocked on the sort's CPU
+        // time.
+        snapshot.sort_by_key(|v| std::cmp::Reverse(v.last_seen_us));
+        Ok(PeersResponse { peers: snapshot })
+    }
+}
+
+/// Bind the admin listener. Kept synchronous-at-startup so port
 /// conflicts fail fast rather than deep inside the runtime task graph.
 ///
 /// # Errors
@@ -102,137 +148,61 @@ pub async fn bind(addr: SocketAddr) -> anyhow::Result<TcpListener> {
     Ok(listener)
 }
 
-/// Serve admin routes on `listener` until `shutdown` fires.
+/// Serve admin RPC methods on `listener` until `shutdown` fires.
 ///
-/// Per-connection tasks are detached, same rationale as
-/// [`crate::metrics::serve`]: admin responses are short and dropping an
-/// in-flight one on shutdown is harmless to the operator CLI, which will
-/// surface the broken connection as an error return.
-#[allow(clippy::cognitive_complexity)] // Accept+permit+spawn is the same linear pattern as metrics::serve.
+/// Concurrency is capped via `ServerConfig::max_connections`; shutdown
+/// is signalled by calling `ServerHandle::stop()`, then we await
+/// `stopped()` so a caller that drops the future cannot leave the
+/// background accept loop running.
+#[allow(clippy::cognitive_complexity)] // Config build + select on two shutdown paths reads linearly.
 pub async fn serve(
     listener: TcpListener,
     state: AdminState,
     mut shutdown: oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
-    let limiter = Arc::new(Semaphore::new(MAX_ADMIN_CONNECTIONS));
+    // jsonrpsee's `build_from_tcp` expects a `std::net::TcpListener` in
+    // blocking mode. `into_std` is the official handoff; it must be
+    // called before any incoming connections have been accepted on the
+    // tokio side, which is the case here (we've only just bound).
+    let std_listener = listener
+        .into_std()
+        .map_err(|e| anyhow::anyhow!("convert admin listener to std: {e}"))?;
 
-    loop {
-        let (stream, peer) = tokio::select! {
-            biased;
-            _ = &mut shutdown => {
-                tracing::debug!("admin server shutdown signal received");
-                return Ok(());
+    let config = ServerConfig::builder()
+        .max_connections(MAX_ADMIN_CONNECTIONS)
+        .http_only()
+        .build();
+
+    let server = Server::builder()
+        .set_config(config)
+        .build_from_tcp(std_listener)
+        .map_err(|e| anyhow::anyhow!("build admin RPC server: {e}"))?;
+
+    let rpc = AdminRpcImpl::new(state);
+    let handle = server.start(rpc.into_rpc());
+
+    // Two shutdown paths:
+    //   1. Runtime fires the oneshot -> we call `handle.stop()` and
+    //      wait for the accept loop to drain.
+    //   2. Server exits on its own (shouldn't happen for HTTP-only but
+    //      guard against it) -> return Ok so the runtime can notice
+    //      via the `admin_stop_tx` / `warn!` path.
+    let stopped = handle.clone().stopped();
+    tokio::pin!(stopped);
+    tokio::select! {
+        biased;
+        _ = &mut shutdown => {
+            tracing::debug!("admin server shutdown signal received");
+            if handle.stop().is_err() {
+                tracing::debug!("admin server already stopped before shutdown signal");
             }
-            res = listener.accept() => match res {
-                Ok(pair) => pair,
-                Err(err) => {
-                    tracing::warn!(%err, "admin accept failed");
-                    continue;
-                }
-            },
-        };
-
-        let Ok(permit) = Arc::clone(&limiter).try_acquire_owned() else {
-            tracing::warn!(
-                %peer,
-                limit = MAX_ADMIN_CONNECTIONS,
-                "admin connection rejected: at capacity",
-            );
-            drop(stream);
-            continue;
-        };
-
-        let state = state.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            let io = TokioIo::new(stream);
-            let svc = service_fn(move |req| {
-                let state = state.clone();
-                async move { handle(req, state).await }
-            });
-            if let Err(err) = hyper::server::conn::http1::Builder::new()
-                .serve_connection(io, svc)
-                .await
-            {
-                tracing::debug!(%err, "admin connection ended");
-            }
-        });
-    }
-}
-
-async fn handle(
-    req: Request<hyper::body::Incoming>,
-    state: AdminState,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let method = req.method();
-    let path = req.uri().path();
-    match (method, path) {
-        (&Method::GET, "/v1/peers") => Ok(peers_response(&state).await),
-        (_, "/v1/peers") => Ok(method_not_allowed("GET")),
-        _ => Ok(not_found()),
-    }
-}
-
-async fn peers_response(state: &AdminState) -> Response<Full<Bytes>> {
-    // Snapshot the table under a read lock: copying the entries keeps the
-    // lock hold time proportional to peer count, not to the JSON encode
-    // time (which grows with `popular_hashes` lengths etc.).
-    let mut snapshot: Vec<PeerView> = {
-        let guard = state.peer_table.read().await;
-        guard
-            .iter()
-            .map(|(id, entry)| PeerView::from_entry(id, entry))
-            .collect()
-    };
-    // Most recently seen first — on-call use case is "is gossip alive?".
-    // Sorting happens after the read lock is released so concurrent
-    // announce-writers aren't blocked on the sort's CPU time.
-    snapshot.sort_by_key(|v| std::cmp::Reverse(v.last_seen_us));
-
-    let body = PeersResponse { peers: snapshot };
-    match serde_json::to_vec(&body) {
-        Ok(bytes) => json_ok(bytes),
-        Err(err) => {
-            tracing::warn!(%err, "peers response encode failed");
-            internal_error()
+            handle.stopped().await;
+        }
+        () = &mut stopped => {
+            tracing::warn!("admin server self-stopped before shutdown signal");
         }
     }
-}
-
-fn json_ok(body: Vec<u8>) -> Response<Full<Bytes>> {
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "application/json")
-        .body(Full::new(Bytes::from(body)))
-        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
-}
-
-fn not_found() -> Response<Full<Bytes>> {
-    static BODY: &[u8] = br#"{"error":"not_found"}"#;
-    Response::builder()
-        .status(StatusCode::NOT_FOUND)
-        .header("content-type", "application/json")
-        .body(Full::new(Bytes::from_static(BODY)))
-        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
-}
-
-fn method_not_allowed(allow: &'static str) -> Response<Full<Bytes>> {
-    static BODY: &[u8] = br#"{"error":"method_not_allowed"}"#;
-    Response::builder()
-        .status(StatusCode::METHOD_NOT_ALLOWED)
-        .header("content-type", "application/json")
-        .header("allow", allow)
-        .body(Full::new(Bytes::from_static(BODY)))
-        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
-}
-
-fn internal_error() -> Response<Full<Bytes>> {
-    static BODY: &[u8] = br#"{"error":"internal"}"#;
-    Response::builder()
-        .status(StatusCode::INTERNAL_SERVER_ERROR)
-        .header("content-type", "application/json")
-        .body(Full::new(Bytes::from_static(BODY)))
-        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
+    Ok(())
 }
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -258,7 +228,6 @@ fn hex_encode(bytes: &[u8; 32]) -> String {
 mod tests {
     use super::*;
     use decdn_protocol::{LoadHint, NodeAnnounce, NodeAnnounceBody};
-    use http_body_util::BodyExt;
 
     fn mk_announce(node_id: [u8; 32], region: &str, ts_us: u64) -> NodeAnnounce {
         NodeAnnounce {
@@ -286,33 +255,20 @@ mod tests {
         AdminState::new(Arc::new(RwLock::new(table)))
     }
 
-    async fn body_to_string(resp: Response<Full<Bytes>>) -> String {
-        let collected = resp.into_body().collect().await.expect("body collect");
-        String::from_utf8(collected.to_bytes().to_vec()).expect("utf-8 body")
-    }
-
     #[tokio::test]
-    async fn empty_peer_table_returns_empty_array() {
-        let state = state_with(vec![]);
-        let resp = peers_response(&state).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(
-            resp.headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok()),
-            Some("application/json")
-        );
-        let body = body_to_string(resp).await;
-        assert_eq!(body, r#"{"peers":[]}"#);
+    async fn empty_peer_table_returns_empty_vec() {
+        let rpc = AdminRpcImpl::new(state_with(vec![]));
+        let resp = rpc.peers_list().await.expect("peers_list ok");
+        assert!(resp.peers.is_empty());
     }
 
     #[tokio::test]
     async fn single_peer_serializes_with_hex_node_id() {
         let id = [0xABu8; 32];
-        // Seed the entry once at now_us=100, then refresh with a later
-        // announce at now_us=300 so first_seen_us and last_seen_us differ.
-        // Distinct values catch a field-swap regression (first↔last) that
-        // identical seeds would not.
+        // Seed once at now_us=100, then refresh at now_us=300 so
+        // first_seen_us and last_seen_us differ. Distinct values catch a
+        // field-swap regression (first↔last) that identical seeds would
+        // not.
         let mut table = PeerTable::new(0);
         table
             .insert_or_refresh(mk_announce(id, "US", 10), 100)
@@ -321,18 +277,16 @@ mod tests {
             .insert_or_refresh(mk_announce(id, "US", 20), 300)
             .expect("refresh insert");
         let state = AdminState::new(Arc::new(RwLock::new(table)));
+        let rpc = AdminRpcImpl::new(state);
 
-        let resp = peers_response(&state).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = body_to_string(resp).await;
-        let value: serde_json::Value = serde_json::from_str(&body).expect("valid json");
-        let peers = value["peers"].as_array().expect("peers array");
-        assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0]["node_id"], "ab".repeat(32));
-        assert_eq!(peers[0]["region"], "US");
-        assert_eq!(peers[0]["first_seen_us"], 100);
-        assert_eq!(peers[0]["last_seen_us"], 300);
-        assert_eq!(peers[0]["announced_at_us"], 20);
+        let resp = rpc.peers_list().await.expect("peers_list ok");
+        assert_eq!(resp.peers.len(), 1);
+        let p = &resp.peers[0];
+        assert_eq!(p.node_id, "ab".repeat(32));
+        assert_eq!(p.region, "US");
+        assert_eq!(p.first_seen_us, 100);
+        assert_eq!(p.last_seen_us, 300);
+        assert_eq!(p.announced_at_us, 20);
     }
 
     #[tokio::test]
@@ -341,19 +295,13 @@ mod tests {
         let b = [2u8; 32];
         let c = [3u8; 32];
         // (id, region, announce ts, now_us) — `now_us` becomes last_seen_us.
-        let state = state_with(vec![
+        let rpc = AdminRpcImpl::new(state_with(vec![
             (a, "US", 1, 500),
             (b, "EU", 1, 700),
             (c, "AP", 1, 600),
-        ]);
-        let resp = peers_response(&state).await;
-        let body = body_to_string(resp).await;
-        let value: serde_json::Value = serde_json::from_str(&body).expect("valid json");
-        let peers = value["peers"].as_array().expect("peers array");
-        let order: Vec<u64> = peers
-            .iter()
-            .map(|p| p["last_seen_us"].as_u64().unwrap_or_default())
-            .collect();
+        ]));
+        let resp = rpc.peers_list().await.expect("peers_list ok");
+        let order: Vec<u64> = resp.peers.iter().map(|p| p.last_seen_us).collect();
         assert_eq!(order, vec![700, 600, 500]);
     }
 
@@ -367,27 +315,5 @@ mod tests {
         assert!(out.starts_with("0123"));
         assert!(out.ends_with("ef"));
         assert_eq!(out.len(), 64);
-    }
-
-    #[test]
-    fn method_not_allowed_sets_allow_header() {
-        let resp = method_not_allowed("GET");
-        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
-        assert_eq!(
-            resp.headers().get("allow").and_then(|v| v.to_str().ok()),
-            Some("GET")
-        );
-    }
-
-    #[test]
-    fn not_found_is_json() {
-        let resp = not_found();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        assert_eq!(
-            resp.headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok()),
-            Some("application/json")
-        );
     }
 }

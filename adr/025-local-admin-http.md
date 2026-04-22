@@ -21,43 +21,57 @@ text-only, aggregate, and read-only by design; `cdn/probe/v1` is not intended
 as a local control channel and carries no auth beyond "anyone with an iroh
 connection".
 
-A control-plane surface is therefore needed. This ADR pins down the shape
-of that surface so the first route (`GET /v1/peers`, added for #247) and
-future ones (drain, health, config reload, …) share a common transport.
+A control-plane surface is therefore needed. This ADR pins down the
+shape of that surface so the first method (`admin_v1_peersList`, added
+for #247) and future ones (drain, health, config reload, …) share a
+common transport.
 
 ---
 
 ## Decision
 
-A running deCDN node exposes a **loopback-only HTTP admin server** on a
-configurable port (`observability.admin_port`, default `9191`). It speaks
-JSON on versioned `/v1/...` routes.
+A running deCDN node exposes a **loopback-only JSON-RPC 2.0 server** on a
+configurable port (`observability.admin_port`, default `9191`). Methods
+are dispatched over HTTP `POST /`, framed by JSON-RPC 2.0 per the spec at
+<https://www.jsonrpc.org/specification>.
 
-Initial route set:
+Method names carry the surface version in the namespace prefix
+(`admin_v1_...`) rather than in a URL path segment, because JSON-RPC
+dispatches on the envelope's `method` field — there is no URL path to
+version. `v1` means the same thing it did under the old `/v1/...`
+scheme: routes may accrete fields backwards-compatibly within `v1`,
+and a breaking change cuts over to `admin_v2_...`.
 
-| Method | Path         | Purpose                                   |
-| ------ | ------------ | ----------------------------------------- |
-| `GET`  | `/v1/peers`  | Dump the current gossip peer table.       |
+Initial method set:
 
-Future routes that are **expected** to use this surface (not designed here):
+| Method                 | Params | Result                         |
+| ---------------------- | ------ | ------------------------------ |
+| `admin_v1_peersList`   | none   | `{ peers: PeerView[] }`        |
 
-- `POST /v1/drain` — graceful drain (#244).
-- `GET  /v1/health` — readiness/liveness probe.
-- `POST /v1/config/reload` — reload mutable config sections.
+Future methods that are **expected** to use this surface (not designed here):
+
+- `admin_v1_drain` — graceful drain (#244).
+- `admin_v1_health` — readiness/liveness probe.
+- `admin_v1_configReload` — reload mutable config sections.
 
 Response format:
 
-- `200` responses are `application/json`.
-- Errors are JSON too: `{"error":"<slug>"}` with semantic HTTP status
-  codes (`404 not_found`, `405 method_not_allowed`, `500 internal`).
+- Per JSON-RPC 2.0: successful results live under `"result"`, errors
+  under `"error"` with a numeric `code`, a `message`, and optional
+  structured `data`. HTTP status is `200` for valid JSON-RPC envelopes
+  regardless of success/failure at the method level. Parse failures and
+  malformed envelopes use the standard JSON-RPC error codes
+  (`-32700 Parse error`, `-32600 Invalid Request`, `-32601 Method not
+  found`, `-32602 Invalid params`, `-32603 Internal error`).
 
 Transport shape:
 
 - Binds on `127.0.0.1:<port>` only. Never on a public interface.
-- Hyper `service_fn` over a pre-bound `TcpListener`, identical pattern to
-  the metrics server in `crates/node/src/metrics.rs`.
-- Per-connection concurrency capped by a semaphore.
-- Shutdown via a `oneshot::Receiver<()>` fired from the runtime's existing
+- Uses [`jsonrpsee`](https://github.com/paritytech/jsonrpsee) (server +
+  http-client + macros) so the trait is the single source of truth for
+  both sides of the wire — no hand-rolled routing or JSON parsing.
+- Per-connection concurrency capped via `ServerBuilder::max_connections`.
+- Shutdown via `ServerHandle::stop()` fired from the runtime's existing
   shutdown sequence.
 
 Config shape:
@@ -96,8 +110,8 @@ CLI shape:
 - The node already runs a loopback HTTP server for metrics; keeping one
   transport shape reduces operator surface area (one kind of port to
   document, one kind of client to script).
-- `curl` + `jq` is the universal admin-debug toolchain; no extra client
-  glue needed.
+- `curl` + `jq` still works for ad-hoc debugging — a JSON-RPC envelope
+  is a single `POST` with a short JSON body.
 - Portability: the current deployment target is Linux/macOS, but a UDS
   would make any future Windows support awkward. Localhost TCP is
   portable.
@@ -106,6 +120,31 @@ CLI shape:
   untrusted. For a PoC single-operator deployment, that gap is small
   and can be closed in a later ADR by adding a shared-secret header
   without changing the transport.
+
+### Why JSON-RPC, not REST-style routes?
+
+- The surface exists to dispatch named operations, not to manipulate
+  resource state. REST's verb/URI model is a bad fit — operator
+  actions like `drain` or `configReload` are neither `GET` nor `PUT` on
+  a resource, and forcing them into that shape adds friction without
+  benefit.
+- jsonrpsee's `#[rpc(server, client)]` macro makes the Rust trait the
+  single source of truth: server impl and client bindings are generated
+  together, so the two sides cannot drift on method name, params, or
+  return shape. The old hyper route table required paired hand-written
+  `handle(&req)` branches and reqwest JSON parsing, both maintained
+  separately.
+- Error modeling is cleaner. JSON-RPC carries errors inside a structured
+  `{ code, message, data }` object on a `200` response; route-based
+  HTTP conflates transport failures (`404` because the route is
+  missing) with application failures (`404` because a peer wasn't
+  found) unless the server is careful. We don't have to be careful
+  about that distinction.
+- Cost is modest: jsonrpsee is a larger dependency than a hand-rolled
+  hyper service, but the admin surface is expected to accrete methods
+  over time (drain, health, config reload, and more), and the per-
+  method cost with jsonrpsee is one trait method vs. one handler plus
+  a routing entry.
 
 ### Why not a new iroh ALPN (e.g. `cdn/admin/v1`)?
 
@@ -117,12 +156,15 @@ CLI shape:
 - Separating admin from node-to-node protocol boundaries means a buggy
   admin route cannot affect the CDN wire protocol ALPNs.
 
-### Why versioned routes (`/v1/...`)?
+### Why versioned method names (`admin_v1_...`)?
 
-- Admin surfaces accrete routes over time. A version prefix lets us
-  evolve the shape of existing routes (add fields, rename) within `v1`,
-  and cut over to `v2` without breaking operator scripts when a breaking
-  change is necessary.
+- Admin surfaces accrete methods over time. A version prefix lets us
+  evolve the shape of existing methods (add fields, rename) within
+  `v1`, and cut over to `admin_v2_...` without breaking operator
+  scripts when a breaking change is necessary.
+- The version lives in the method name, not the URL, because JSON-RPC
+  routes by the envelope's `method` string — there is no URL path
+  segment to place a version in.
 
 ### Why no authentication (for now)?
 
@@ -156,20 +198,35 @@ CLI shape:
 
 ## Implementation Notes
 
-- `crates/node/src/admin.rs` implements the hyper server and mirrors
-  `crates/node/src/metrics.rs` module-for-module.
+- `crates/node/src/admin.rs` defines the `AdminRpc` trait with
+  `#[rpc(server, client, namespace = "admin_v1")]` and the concrete
+  server impl backed by the gossip `PeerTable`.
 - `AdminState` carries `Arc<RwLock<PeerTable>>` (and will grow more
-  handles as new routes land).
-- JSON DTOs (`PeerView`) are defined in `admin.rs` rather than derived
-  from internal types so the wire format can stay stable even when
-  internal structs change.
+  handles as new methods land).
+- JSON DTOs (`PeerView`, `PeersResponse`) are defined in `admin.rs`
+  rather than derived from internal types so the wire format can stay
+  stable even when internal structs change.
 - `decdn node peers` lives in `crates/node/src/commands/node.rs` and
-  uses `reqwest` for the HTTP call.
+  uses `jsonrpsee::http_client::HttpClient` with the generated
+  `AdminRpcClient` trait — no hand-rolled JSON or HTTP logic on the
+  client side.
 
 ---
 
 ## Alternatives considered
 
+- **Hand-rolled hyper with REST-style routes.** The original draft of
+  this ADR (and the initial #247 implementation) went this way. It
+  works, but the ergonomic cost grows per-method: paired server handler
+  and client parser, no shared schema between them, verb/URI choices
+  argued case by case. Migrated to jsonrpsee before the first follow-up
+  method (`drain`, #244) would have doubled that maintenance surface.
+- **jsonrpsee + OpenRPC spec generation (`typed-openrpc`, `yerpc`).**
+  OpenRPC is the JSON-RPC analog of OpenAPI; both ecosystem crates that
+  generate it from Rust are thin/early (handful of stars, one-person
+  maintenance). For a loopback surface with a small method count,
+  hand-maintained docs in this ADR are cheaper than a generator
+  dependency. Revisit if the surface outgrows ~10 methods.
 - **Unix domain socket.** Better multi-user isolation; worse portability
   and higher client-side friction. Revisit if multi-tenant hosts enter
   scope.

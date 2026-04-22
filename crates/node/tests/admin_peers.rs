@@ -1,7 +1,11 @@
-//! Integration tests for the loopback admin HTTP surface (ADR 025).
+//! Integration tests for the loopback admin JSON-RPC surface (ADR 025).
 //!
 //! Spawns the admin server directly against a seeded `PeerTable` and
-//! verifies the `GET /v1/peers` route round-trips through real HTTP.
+//! verifies `admin_v1_peersList` round-trips through real HTTP via
+//! jsonrpsee's generated client bindings. Unit tests for the
+//! peers-list shape itself (sort, hex encoding, field mapping) live
+//! next to the server impl in `admin.rs`; this file owns the wire-
+//! level checks only.
 
 #![allow(
     clippy::unwrap_used,
@@ -14,10 +18,14 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 
 use decdn_gossip::PeerTable;
-use decdn_node::admin::{self, AdminState};
+use decdn_node::admin::{self, AdminRpcClient, AdminState};
 use decdn_node::cli::PeersArgs;
 use decdn_node::commands;
 use decdn_protocol::{LoadHint, NodeAnnounce, NodeAnnounceBody};
+use jsonrpsee::core::ClientError;
+use jsonrpsee::core::client::ClientT;
+use jsonrpsee::http_client::HttpClientBuilder;
+use jsonrpsee::rpc_params;
 use tokio::net::TcpListener;
 use tokio::sync::{RwLock, oneshot};
 
@@ -43,30 +51,37 @@ async fn bind_loopback() -> anyhow::Result<(TcpListener, SocketAddr)> {
     Ok((listener, addr))
 }
 
-#[tokio::test]
-async fn admin_peers_returns_empty_before_any_announce() -> anyhow::Result<()> {
-    let peer_table = Arc::new(RwLock::new(PeerTable::new(0)));
-    let state = AdminState::new(peer_table);
-
+/// Spawn an admin server with the given state, returning its URL and a
+/// `(stop_tx, join)` pair. The join handle must be awaited after
+/// sending on `stop_tx` so the test doesn't leak a background task.
+async fn spawn_admin(
+    state: AdminState,
+) -> anyhow::Result<(String, oneshot::Sender<()>, tokio::task::JoinHandle<()>)> {
     let (listener, addr) = bind_loopback().await?;
     let (stop_tx, stop_rx) = oneshot::channel::<()>();
-    let server = tokio::spawn(async move {
+    let join = tokio::spawn(async move {
         admin::serve(listener, state, stop_rx).await.ok();
     });
+    Ok((format!("http://{addr}"), stop_tx, join))
+}
 
-    let client = reqwest::Client::new();
-    let resp = client.get(format!("http://{addr}/v1/peers")).send().await?;
-    assert!(resp.status().is_success(), "status: {}", resp.status());
-    let body = resp.text().await?;
-    assert_eq!(body, r#"{"peers":[]}"#);
+#[tokio::test]
+async fn peers_list_empty_peer_table() -> anyhow::Result<()> {
+    let peer_table = Arc::new(RwLock::new(PeerTable::new(0)));
+    let state = AdminState::new(peer_table);
+    let (url, stop_tx, join) = spawn_admin(state).await?;
+
+    let client = HttpClientBuilder::default().build(&url)?;
+    let resp = client.peers_list().await?;
+    assert!(resp.peers.is_empty());
 
     let _ = stop_tx.send(());
-    server.await?;
+    join.await?;
     Ok(())
 }
 
 #[tokio::test]
-async fn admin_peers_lists_seeded_entries_sorted_desc() -> anyhow::Result<()> {
+async fn peers_list_seeded_entries_sorted_desc() -> anyhow::Result<()> {
     let peer_table = Arc::new(RwLock::new(PeerTable::new(0)));
     {
         let mut guard = peer_table.write().await;
@@ -82,109 +97,72 @@ async fn admin_peers_lists_seeded_entries_sorted_desc() -> anyhow::Result<()> {
             .ok();
     }
     let state = AdminState::new(Arc::clone(&peer_table));
+    let (url, stop_tx, join) = spawn_admin(state).await?;
 
-    let (listener, addr) = bind_loopback().await?;
-    let (stop_tx, stop_rx) = oneshot::channel::<()>();
-    let server = tokio::spawn(async move {
-        admin::serve(listener, state, stop_rx).await.ok();
-    });
-
-    let resp = reqwest::get(format!("http://{addr}/v1/peers")).await?;
-    assert!(resp.status().is_success());
-    let json: serde_json::Value = resp.json().await?;
-    let peers = json["peers"].as_array().expect("peers array");
-    assert_eq!(peers.len(), 3);
+    let client = HttpClientBuilder::default().build(&url)?;
+    let resp = client.peers_list().await?;
+    assert_eq!(resp.peers.len(), 3);
 
     // Sorted by last_seen_us descending (700, 600, 500).
-    let last_seens: Vec<u64> = peers
-        .iter()
-        .map(|p| p["last_seen_us"].as_u64().unwrap_or_default())
-        .collect();
+    let last_seens: Vec<u64> = resp.peers.iter().map(|p| p.last_seen_us).collect();
     assert_eq!(last_seens, vec![700, 600, 500]);
 
     // Regions follow the same order.
-    let regions: Vec<&str> = peers
-        .iter()
-        .map(|p| p["region"].as_str().unwrap_or_default())
-        .collect();
+    let regions: Vec<&str> = resp.peers.iter().map(|p| p.region.as_str()).collect();
     assert_eq!(regions, vec!["EU", "AP", "US"]);
 
     // Node IDs are lowercase hex, 64 chars each.
-    for p in peers {
-        let id = p["node_id"].as_str().expect("node_id string");
-        assert_eq!(id.len(), 64);
+    for p in &resp.peers {
+        assert_eq!(p.node_id.len(), 64);
         assert!(
-            id.chars()
+            p.node_id
+                .chars()
                 .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
         );
     }
 
     let _ = stop_tx.send(());
-    server.await?;
+    join.await?;
     Ok(())
 }
 
+/// JSON-RPC `-32601 Method not found` is the equivalent of the old
+/// HTTP `404` for an unknown route. Confirm the server returns it for
+/// a method name outside the `admin_v1_` namespace.
 #[tokio::test]
-async fn admin_rejects_unknown_route_with_404() -> anyhow::Result<()> {
+async fn unknown_method_returns_method_not_found() -> anyhow::Result<()> {
     let peer_table = Arc::new(RwLock::new(PeerTable::new(0)));
     let state = AdminState::new(peer_table);
+    let (url, stop_tx, join) = spawn_admin(state).await?;
 
-    let (listener, addr) = bind_loopback().await?;
-    let (stop_tx, stop_rx) = oneshot::channel::<()>();
-    let server = tokio::spawn(async move {
-        admin::serve(listener, state, stop_rx).await.ok();
-    });
-
-    let resp = reqwest::get(format!("http://{addr}/v1/nonexistent")).await?;
-    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    let client = HttpClientBuilder::default().build(&url)?;
+    let result: Result<serde_json::Value, ClientError> =
+        client.request("admin_v1_nonexistent", rpc_params![]).await;
+    match result {
+        Err(ClientError::Call(obj)) => {
+            // JSON-RPC 2.0 method-not-found code.
+            assert_eq!(obj.code(), -32601, "code was {}: {:?}", obj.code(), obj);
+        }
+        other => panic!("expected Call(-32601), got: {other:?}"),
+    }
 
     let _ = stop_tx.send(());
-    server.await?;
+    join.await?;
     Ok(())
 }
 
+/// The CLI's connection-refused branch is the single most operator-
+/// visible error path (mistyped `--admin-url`, node not running). Bind
+/// a loopback socket, drop it, and call `commands::peers` against its
+/// address: the kernel will return `ECONNREFUSED` and the CLI should
+/// surface that with the "is the node running?" hint.
 #[tokio::test]
-async fn admin_rejects_post_to_peers_with_405() -> anyhow::Result<()> {
-    let peer_table = Arc::new(RwLock::new(PeerTable::new(0)));
-    let state = AdminState::new(peer_table);
-
+async fn cli_peers_surfaces_connection_refused() -> anyhow::Result<()> {
     let (listener, addr) = bind_loopback().await?;
-    let (stop_tx, stop_rx) = oneshot::channel::<()>();
-    let server = tokio::spawn(async move {
-        admin::serve(listener, state, stop_rx).await.ok();
-    });
+    drop(listener);
 
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("http://{addr}/v1/peers"))
-        .send()
-        .await?;
-    assert_eq!(resp.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
-    assert_eq!(
-        resp.headers().get("allow").and_then(|v| v.to_str().ok()),
-        Some("GET")
-    );
-
-    let _ = stop_tx.send(());
-    server.await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn cli_peers_surfaces_non_2xx_http_status() -> anyhow::Result<()> {
-    let peer_table = Arc::new(RwLock::new(PeerTable::new(0)));
-    let state = AdminState::new(peer_table);
-
-    let (listener, addr) = bind_loopback().await?;
-    let (stop_tx, stop_rx) = oneshot::channel::<()>();
-    let server = tokio::spawn(async move {
-        admin::serve(listener, state, stop_rx).await.ok();
-    });
-
-    // Point the CLI at a path the server 404s on so we exercise the
-    // non-2xx branch in `commands::peers` rather than the happy path.
     let args = PeersArgs {
-        admin_url: Some(format!("http://{addr}/nope")),
+        admin_url: Some(format!("http://{addr}")),
         config: None,
         region: None,
         json: false,
@@ -193,15 +171,12 @@ async fn cli_peers_surfaces_non_2xx_http_status() -> anyhow::Result<()> {
     let err = commands::peers(&args, None)
         .await
         .err()
-        .ok_or_else(|| anyhow::anyhow!("expected non-2xx to surface as an error"))?
+        .ok_or_else(|| anyhow::anyhow!("expected connection-refused error"))?
         .to_string();
     assert!(
-        err.contains("HTTP 404"),
-        "error should name the status code, got: {err}"
+        err.contains("refused"),
+        "error should mention 'refused', got: {err}"
     );
-
-    let _ = stop_tx.send(());
-    server.await?;
     Ok(())
 }
 
@@ -209,30 +184,25 @@ async fn cli_peers_surfaces_non_2xx_http_status() -> anyhow::Result<()> {
 async fn admin_shutdown_closes_listener() -> anyhow::Result<()> {
     let peer_table = Arc::new(RwLock::new(PeerTable::new(0)));
     let state = AdminState::new(peer_table);
-
-    let (listener, addr) = bind_loopback().await?;
-    let (stop_tx, stop_rx) = oneshot::channel::<()>();
-    let server = tokio::spawn(async move {
-        admin::serve(listener, state, stop_rx).await.ok();
-    });
+    let (url, stop_tx, join) = spawn_admin(state).await?;
 
     // Baseline: server is up.
-    reqwest::get(format!("http://{addr}/v1/peers")).await?;
+    let client = HttpClientBuilder::default().build(&url)?;
+    client.peers_list().await?;
 
     let _ = stop_tx.send(());
-    server.await?;
+    join.await?;
 
-    // After shutdown the port should refuse new connections fairly quickly.
+    // After shutdown the port should refuse new connections fairly
+    // quickly. A fresh client is needed because jsonrpsee's HttpClient
+    // uses a connection pool that might otherwise retry silently.
     // Bound the wait so a stuck test fails instead of hanging.
-    let err = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        reqwest::get(format!("http://{addr}/v1/peers")),
-    )
-    .await;
-    match err {
+    let client2 = HttpClientBuilder::default().build(&url)?;
+    let res = tokio::time::timeout(std::time::Duration::from_secs(2), client2.peers_list()).await;
+    match res {
         Ok(Ok(_)) => panic!("admin server still responding after shutdown"),
-        // Either a reqwest error or the outer timeout are acceptable — both
-        // mean "no longer serving".
+        // Either a jsonrpsee error or the outer timeout are acceptable
+        // — both mean "no longer serving".
         Ok(Err(_)) | Err(_) => Ok(()),
     }
 }

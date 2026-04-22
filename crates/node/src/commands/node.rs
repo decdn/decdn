@@ -1,13 +1,15 @@
 //! `decdn node ...` — operator-local admin commands that talk to a running
-//! node over its loopback HTTP admin surface (ADR 025).
+//! node over its loopback JSON-RPC admin surface (ADR 025).
 
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context;
+use jsonrpsee::core::client::Error as JsonRpcClientError;
+use jsonrpsee::http_client::HttpClientBuilder;
 
-use crate::admin::{PeerView, PeersResponse};
+use crate::admin::{AdminRpcClient, PeerView, PeersResponse};
 use crate::cli;
 use crate::cli::common::expand_tilde;
 use crate::config::DEFAULT_ADMIN_PORT;
@@ -41,55 +43,27 @@ pub async fn node_dispatch(
     }
 }
 
-/// `decdn node peers`: fetch `/v1/peers` from the running node and print it.
+/// `decdn node peers`: call `admin_v1_peersList` on the running node and
+/// print the result.
 pub async fn peers(args: &cli::PeersArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
     anyhow::ensure!(
         args.timeout_ms > 0,
-        "--timeout-ms must be > 0 (reqwest treats Duration::ZERO as an \
-         implementation-defined sentinel, not a sub-millisecond deadline)"
+        "--timeout-ms must be > 0 (jsonrpsee treats Duration::ZERO as \
+         'never' rather than 'sub-millisecond deadline')"
     );
 
     let config_path = args.config.as_deref().or(global_config);
-    let base = resolve_admin_url(args.admin_url.as_deref(), config_path)?;
-    let url = format!("{}/v1/peers", base.trim_end_matches('/'));
+    let url = resolve_admin_url(args.admin_url.as_deref(), config_path)?;
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(args.timeout_ms))
-        .build()
-        .context("failed to build HTTP client")?;
+    let client = HttpClientBuilder::default()
+        .request_timeout(Duration::from_millis(args.timeout_ms))
+        .build(&url)
+        .with_context(|| format!("failed to build admin JSON-RPC client for {url}"))?;
 
-    let resp = client.get(&url).send().await.map_err(|err| {
-        // Three operator-actionable classes: "admin isn't there"
-        // (ECONNREFUSED → check it's running / port), "admin is slow"
-        // (timeout → check for stuck locks), and everything else.
-        if err.is_connect() {
-            anyhow::anyhow!(
-                "admin at {url} refused the connection ({err}); is the node running, \
-                 and is admin_port configured correctly?",
-            )
-        } else if err.is_timeout() {
-            anyhow::anyhow!(
-                "admin at {url} did not respond within {}ms ({err}); the node may be \
-                 overloaded or blocked on a long lock hold",
-                args.timeout_ms,
-            )
-        } else {
-            anyhow::Error::new(err).context(format!("admin request to {url} failed"))
-        }
-    })?;
-
-    let status = resp.status();
-    let body = resp
-        .text()
+    let parsed: PeersResponse = client
+        .peers_list()
         .await
-        .with_context(|| format!("failed to read response body from {url}"))?;
-
-    if !status.is_success() {
-        anyhow::bail!("admin returned HTTP {status} from {url}: {body}");
-    }
-
-    let parsed: PeersResponse =
-        serde_json::from_str(&body).with_context(|| format!("failed to parse JSON from {url}"))?;
+        .map_err(|err| classify_client_error(&url, args.timeout_ms, err))?;
 
     let filtered = filter_peers(parsed.peers, args.region.as_deref());
 
@@ -103,6 +77,59 @@ pub async fn peers(args: &cli::PeersArgs, global_config: Option<&Path>) -> anyho
     }
 
     Ok(())
+}
+
+/// Map a `jsonrpsee` client error into the three operator-actionable
+/// classes the previous reqwest path exposed:
+///
+/// - `Transport` with an `ECONNREFUSED` in the source chain → "admin
+///   isn't there" (check it's running / port).
+/// - `RequestTimeout` → "admin is slow" (stuck lock, overloaded).
+/// - `Call` → the server returned a JSON-RPC application error; surface
+///   the code and message so the operator can tell a misconfigured
+///   method name from a real server failure.
+/// - Anything else → passed through with the URL as context.
+fn classify_client_error(url: &str, timeout_ms: u64, err: JsonRpcClientError) -> anyhow::Error {
+    match err {
+        JsonRpcClientError::RequestTimeout => anyhow::anyhow!(
+            "admin at {url} did not respond within {timeout_ms}ms; \
+             the node may be overloaded or blocked on a long lock hold",
+        ),
+        JsonRpcClientError::Transport(inner) => {
+            if is_connection_refused(inner.as_ref()) {
+                anyhow::anyhow!(
+                    "admin at {url} refused the connection ({inner}); is the node \
+                     running, and is admin_port configured correctly?",
+                )
+            } else {
+                anyhow::anyhow!("admin request to {url} failed: {inner}")
+            }
+        }
+        JsonRpcClientError::Call(obj) => anyhow::anyhow!(
+            "admin at {url} returned JSON-RPC error {code}: {msg}",
+            code = obj.code(),
+            msg = obj.message(),
+        ),
+        other => anyhow::Error::new(other).context(format!("admin request to {url} failed")),
+    }
+}
+
+/// Walk the `source()` chain looking for an `std::io::Error` of kind
+/// `ConnectionRefused`. The hyper/jsonrpsee error hierarchy is several
+/// layers deep and the exact intermediate types are implementation
+/// details, so match on the innermost `io::Error` kind instead of any
+/// particular transport type.
+fn is_connection_refused(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = current {
+        if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+            if io_err.kind() == std::io::ErrorKind::ConnectionRefused {
+                return true;
+            }
+        }
+        current = e.source();
+    }
+    false
 }
 
 /// Resolve the admin URL in this precedence order:
