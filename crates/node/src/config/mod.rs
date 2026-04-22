@@ -102,27 +102,33 @@ fn ensure_region_when_publishing_global(
 /// different sections — a collision rule is inherently cross-section, and
 /// operators who set the two equal almost certainly made a typo. Also emits
 /// a stderr warning for well-known ports (<1024), which bind on Unix only
-/// with elevated privilege and may collide with standardized services. Uses
-/// `eprintln!` rather than `tracing::warn!` because `tracing` is not yet
-/// initialized at `resolve_config` time (see `commands::run`).
+/// with elevated privilege and may collide with standardized services.
+///
+/// Port `0` is the sentinel for OS-assigned ephemeral ports: it collides
+/// with nothing (the OS picks distinct values) and needs no elevated
+/// privilege, so both checks skip it. Uses `eprintln!` rather than
+/// `tracing::warn!` because `tracing` is not yet initialized at
+/// `resolve_config` time (see `commands::run`).
 fn validate_port_layout(
     network: &ResolvedNetwork,
     observability: &ResolvedObservability,
 ) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        network.bind_port != observability.metrics_port,
-        "network.bind_port ({}) must differ from observability.metrics_port ({}); \
-         QUIC (UDP) and metrics (TCP) would not collide at bind time, but sharing \
-         the same port number is almost certainly an operator typo",
-        network.bind_port,
-        observability.metrics_port,
-    );
+    if network.bind_port != 0 && observability.metrics_port != 0 {
+        anyhow::ensure!(
+            network.bind_port != observability.metrics_port,
+            "network.bind_port ({}) must differ from observability.metrics_port ({}); \
+             QUIC (UDP) and metrics (TCP) would not collide at bind time, but sharing \
+             the same port number is almost certainly an operator typo",
+            network.bind_port,
+            observability.metrics_port,
+        );
+    }
 
     for (name, port) in [
         ("network.bind_port", network.bind_port),
         ("observability.metrics_port", observability.metrics_port),
     ] {
-        if port < 1024 {
+        if (1..1024).contains(&port) {
             eprintln!(
                 "warning: {name} = {port} is in the well-known range (<1024); \
                  requires elevated privilege to bind on Unix and may collide with \
@@ -1458,6 +1464,23 @@ mod tests {
         // operators have legitimate reasons to bind there (QUIC on 443,
         // privileged setup scripts, CAP_NET_BIND_SERVICE).
         validate_port_layout(&net(443), &obs(9090))?;
+        Ok(())
+    }
+
+    #[test]
+    fn validate_port_layout_allows_both_zero() -> anyhow::Result<()> {
+        // Port 0 requests an OS-assigned ephemeral port, so two zeros
+        // resolve to two distinct ports at bind time and cannot collide.
+        // The equality check must not fire here.
+        validate_port_layout(&net(0), &obs(0))?;
+        Ok(())
+    }
+
+    #[test]
+    fn validate_port_layout_allows_zero_with_nonzero() -> anyhow::Result<()> {
+        // One ephemeral + one fixed is unambiguously collision-free.
+        validate_port_layout(&net(0), &obs(9090))?;
+        validate_port_layout(&net(4433), &obs(0))?;
         Ok(())
     }
 }
