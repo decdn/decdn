@@ -6,6 +6,7 @@
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
+use std::time::Duration;
 
 use decdn_node::handlers::probe::ProbeHandler;
 use decdn_node::metrics::Metrics;
@@ -296,4 +297,70 @@ async fn probe_response_on_server_stream_returns_unsupported_code() -> anyhow::R
 
     assert_reset_with_code(&mut recv, 0x01).await?;
     tear_down(h).await
+}
+
+// Closes #241. ProbeHandler has two phase-level timeouts that had no test
+// coverage: ACCEPT_BI_TIMEOUT (client connected but never opened a
+// bi-stream) and PROBE_READ_TIMEOUT (client opened a stream but never
+// wrote a frame). Both are 5s in production; gating tests on the real
+// deadline would slow every CI run, so instead each test uses
+// `tokio::time::pause()` + `advance()` to fast-forward the handler's
+// inner `tokio::time::timeout` future by 6s of virtual time. iroh's
+// network I/O sits on tokio-mio (not tokio::time), so only the timeout
+// futures we care about are affected.
+
+#[tokio::test(start_paused = true)]
+async fn probe_read_timeout_resets_stream_with_zero_code() -> anyhow::Result<()> {
+    let h = spin_up_probe_harness().await?;
+    let (mut send, mut recv) = h
+        .client_conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+
+    // Deliberately don't write a frame. Virtual-advance past the handler's
+    // PROBE_READ_TIMEOUT so the timeout fires without the test blocking
+    // on the real 5-second deadline. `start_paused = true` requires the
+    // current_thread runtime; iroh doesn't insist on multi-thread.
+    tokio::time::advance(Duration::from_secs(6)).await;
+
+    // Handler resets the stream AND closes the connection with app code 0
+    // (ADR 013 defines no timeout-specific code; the handler uses 0 for
+    // "no app error"). `assert_reset_with_code` tolerates either
+    // observation form.
+    assert_reset_with_code(&mut recv, 0x00).await?;
+    let _ = send.finish();
+    tear_down(h).await
+}
+
+#[tokio::test(start_paused = true)]
+async fn probe_accept_bi_timeout_errors_handler() -> anyhow::Result<()> {
+    let h = spin_up_probe_harness().await?;
+    // Deliberately do NOT call open_bi. The handler's first await is
+    // `tokio::time::timeout(ACCEPT_BI_TIMEOUT, conn.accept_bi())`, which
+    // must time out and return Err.
+    tokio::time::advance(Duration::from_secs(6)).await;
+
+    // Confirm the server task returned Err with the expected message.
+    // Wrap in a real-time timeout as a safety net: if virtual-advance
+    // didn't do its job, we don't want the test hanging forever.
+    let joined = tokio::time::timeout(Duration::from_secs(2), h.accept_task)
+        .await
+        .map_err(|_| anyhow::anyhow!("server task did not complete after virtual-advance"))?
+        .map_err(|e| anyhow::anyhow!("join: {e}"))?;
+    let Err(err) = joined else {
+        anyhow::bail!("handler should have returned Err on ACCEPT_BI_TIMEOUT, got Ok");
+    };
+    let msg = err.to_string();
+    anyhow::ensure!(
+        msg.contains("accept_bi timed out"),
+        "expected accept_bi timeout error, got: {msg}"
+    );
+
+    // Manual teardown — `h.accept_task` was consumed above, so the shared
+    // `tear_down` helper can't run as-is.
+    h.client_conn.close(0u32.into(), b"bye");
+    h.client_ep.close().await;
+    h.server_ep.close().await;
+    Ok(())
 }
