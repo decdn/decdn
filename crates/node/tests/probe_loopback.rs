@@ -342,11 +342,13 @@ async fn probe_accept_bi_timeout_errors_handler() -> anyhow::Result<()> {
     tokio::time::advance(Duration::from_secs(6)).await;
 
     // Confirm the server task returned Err with the expected message.
-    // Wrap in a real-time timeout as a safety net: if virtual-advance
-    // didn't do its job, we don't want the test hanging forever.
-    let joined = tokio::time::timeout(Duration::from_secs(2), h.accept_task)
+    // Just `.await` — no wrapper timeout, because under `start_paused`
+    // `tokio::time::timeout` itself runs on the virtual clock and would
+    // not trip on a non-timer deadlock. Cargo's test-harness global
+    // timeout covers that pathological case.
+    let joined = h
+        .accept_task
         .await
-        .map_err(|_| anyhow::anyhow!("server task did not complete after virtual-advance"))?
         .map_err(|e| anyhow::anyhow!("join: {e}"))?;
     let Err(err) = joined else {
         anyhow::bail!("handler should have returned Err on ACCEPT_BI_TIMEOUT, got Ok");
