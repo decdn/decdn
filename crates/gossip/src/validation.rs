@@ -413,4 +413,72 @@ mod tests {
             Err(AnnounceReject::DecodeFailed)
         );
     }
+
+    // Closes #281. Existing tests cover the "random signature bytes" path
+    // (`bad_signature_rejected`) and the length check
+    // (`bad_signature_length_rejected`). The remaining security-critical
+    // paths — "wrong key signed this" (impersonation) and "body mutated
+    // after signing" (wire tampering) — go here.
+    #[test]
+    fn signature_from_different_key_rejected() {
+        // Impersonation attempt: announce claims to be key A, signature
+        // was actually produced by key B. Ed25519 verification keys off
+        // the `body.node_id` bytes as the public key, so B's signature
+        // cannot verify against A's public key. `bad_signature_rejected`
+        // covers junk-bytes-as-signature; this one is the adversarial
+        // case where the attacker has a valid keypair but announces
+        // under someone else's identity.
+        let sk_a = fresh_key();
+        let sk_b = fresh_key();
+
+        let body = NodeAnnounceBody {
+            node_id: *sk_a.public().as_bytes(), // claims A
+            region: "US".to_string(),
+            load: LoadHint {
+                active_streams: 0,
+                bandwidth_utilization: 0,
+            },
+            popular_hashes: vec![],
+            timestamp_us: 1_700_000_000_000_000,
+        };
+        let signature = sign(&sk_b, &body); // signed by B
+        let bytes = encode(&GossipEnvelope {
+            version: GOSSIP_VERSION,
+            payload: GossipPayload::NodeAnnounce(NodeAnnounce { body, signature }),
+        });
+
+        assert_eq!(
+            validate_envelope(&bytes, 1_700_000_000_000_000, &no_list()),
+            Err(AnnounceReject::InvalidSignature)
+        );
+    }
+
+    #[test]
+    fn signature_does_not_verify_after_body_mutation() {
+        // A relay / on-path attacker alters a field after a legitimate
+        // signature was produced. ADR 001 requires per-field signing: any
+        // edit to `region`, `load`, `popular_hashes`, `timestamp_us`, or
+        // `node_id` must invalidate the signature. Mutating `region`
+        // stands in for the whole class — postcard's canonical encoding
+        // means any body-byte difference changes the signed bytes.
+        let sk = fresh_key();
+        let original = sample_body(&sk, 1_700_000_000_000_000);
+        let signature = sign(&sk, &original); // sign the pre-mutation bytes
+
+        let mut mutated = original.clone();
+        mutated.region = "DE".to_string(); // was "US"
+
+        let bytes = encode(&GossipEnvelope {
+            version: GOSSIP_VERSION,
+            payload: GossipPayload::NodeAnnounce(NodeAnnounce {
+                body: mutated,
+                signature, // stale — matches the pre-mutation body
+            }),
+        });
+
+        assert_eq!(
+            validate_envelope(&bytes, 1_700_000_000_000_000, &no_list()),
+            Err(AnnounceReject::InvalidSignature)
+        );
+    }
 }
