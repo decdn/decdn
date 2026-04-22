@@ -69,6 +69,7 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
     let gossip = resolve_gossip(file.gossip.as_ref())?;
 
     ensure_region_when_publishing_global(&identity, &gossip)?;
+    validate_port_layout(&network, &observability)?;
 
     Ok(ResolvedConfig {
         identity,
@@ -97,6 +98,49 @@ fn ensure_region_when_publishing_global(
          (it signs every NodeAnnounce); set identity.region or disable the \
          global topic by setting gossip.subscribe_global = false"
     );
+    Ok(())
+}
+
+/// Cross-section check on the running node's port assignments. Lives at the
+/// resolver boundary because `bind_port` and `metrics_port` come from
+/// different sections — a collision rule is inherently cross-section, and
+/// operators who set the two equal almost certainly made a typo. Also emits
+/// a stderr warning for well-known ports (<1024), which bind on Unix only
+/// with elevated privilege and may collide with standardized services.
+///
+/// Port `0` is the sentinel for OS-assigned ephemeral ports: it collides
+/// with nothing (the OS picks distinct values) and needs no elevated
+/// privilege, so both checks skip it. Uses `eprintln!` rather than
+/// `tracing::warn!` because `tracing` is not yet initialized at
+/// `resolve_config` time (see `commands::run`).
+fn validate_port_layout(
+    network: &ResolvedNetwork,
+    observability: &ResolvedObservability,
+) -> anyhow::Result<()> {
+    if network.bind_port != 0 && observability.metrics_port != 0 {
+        anyhow::ensure!(
+            network.bind_port != observability.metrics_port,
+            "network.bind_port ({}) must differ from observability.metrics_port ({}); \
+             QUIC (UDP) and metrics (TCP) would not collide at bind time, but sharing \
+             the same port number is almost certainly an operator typo",
+            network.bind_port,
+            observability.metrics_port,
+        );
+    }
+
+    for (name, port) in [
+        ("network.bind_port", network.bind_port),
+        ("observability.metrics_port", observability.metrics_port),
+    ] {
+        if (1..1024).contains(&port) {
+            eprintln!(
+                "warning: {name} = {port} is in the well-known range (<1024); \
+                 requires elevated privilege to bind on Unix and may collide with \
+                 a standardized service"
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -1425,6 +1469,23 @@ mod tests {
         }
     }
 
+    fn net(port: u16) -> ResolvedNetwork {
+        ResolvedNetwork {
+            bind_port: port,
+            relay_url: None,
+        }
+    }
+
+    fn obs(port: u16) -> ResolvedObservability {
+        ResolvedObservability {
+            log_level: crate::cli::common::LogLevel::default(),
+            log_format: crate::cli::common::LogFormat::default(),
+            metrics_port: port,
+            admin_port: None,
+            otlp_endpoint: None,
+        }
+    }
+
     #[test]
     fn resolve_observability_defaults_admin_port_to_9191() -> anyhow::Result<()> {
         let obs = resolve_observability(&obs_cli(None, None), None)?;
@@ -1438,9 +1499,35 @@ mod tests {
     }
 
     #[test]
+    fn validate_port_layout_rejects_bind_equal_metrics() {
+        let err = validate_port_layout(&net(9090), &obs(9090))
+            .expect_err("equal bind and metrics ports should be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("network.bind_port") && msg.contains("metrics_port"),
+            "error should name both fields: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_port_layout_accepts_distinct_ports() -> anyhow::Result<()> {
+        validate_port_layout(&net(4433), &obs(9090))?;
+        Ok(())
+    }
+
+    #[test]
     fn resolve_observability_admin_port_zero_disables() -> anyhow::Result<()> {
         let obs = resolve_observability(&obs_cli(None, Some(0)), None)?;
         anyhow::ensure!(obs.admin_port.is_none(), "got: {:?}", obs.admin_port);
+        Ok(())
+    }
+
+    #[test]
+    fn validate_port_layout_allows_well_known_port() -> anyhow::Result<()> {
+        // Well-known range only warns (via eprintln), never hard-fails —
+        // operators have legitimate reasons to bind there (QUIC on 443,
+        // privileged setup scripts, CAP_NET_BIND_SERVICE).
+        validate_port_layout(&net(443), &obs(9090))?;
         Ok(())
     }
 
@@ -1466,5 +1553,102 @@ mod tests {
         let obs = resolve_observability(&obs_cli(None, Some(2222)), Some(&file))?;
         anyhow::ensure!(obs.admin_port == Some(2222), "got: {:?}", obs.admin_port);
         Ok(())
+    }
+
+    #[test]
+    fn validate_port_layout_allows_both_zero() -> anyhow::Result<()> {
+        // Port 0 requests an OS-assigned ephemeral port, so two zeros
+        // resolve to two distinct ports at bind time and cannot collide.
+        // The equality check must not fire here.
+        validate_port_layout(&net(0), &obs(0))?;
+        Ok(())
+    }
+
+    #[test]
+    fn validate_port_layout_allows_zero_with_nonzero() -> anyhow::Result<()> {
+        // One ephemeral + one fixed is unambiguously collision-free.
+        validate_port_layout(&net(0), &obs(9090))?;
+        validate_port_layout(&net(4433), &obs(0))?;
+        Ok(())
+    }
+
+    // Closes #268. The three-layer merge is CLI/env > TOML file > default;
+    // `resolve_*_cli_overrides_file*` tests cover the "Option::Some on
+    // RunArgs beats file" leg. The remaining leg — that clap populates
+    // RunArgs from `DECDN_*` env vars so those Option::Some values are
+    // there to win — lives in this test.
+    //
+    // Done declaratively (via clap's `Command` introspection) rather than
+    // by setting process env vars: `std::env::set_var` is `unsafe` under
+    // edition 2024 and the workspace lints forbid `unsafe_code`. A dev-
+    // dependency like `temp-env` would work but costs more than the
+    // regression risk we're pinning here — a dropped `env = "DECDN_*"`
+    // attribute or a field rename fails this test immediately.
+    #[test]
+    fn run_subcommand_args_are_wired_to_decdn_env_vars() {
+        use clap::CommandFactory;
+
+        let cmd = crate::cli::Cli::command();
+        let run = cmd
+            .find_subcommand("run")
+            .expect("Cli has a `run` subcommand");
+
+        // One line per DECDN_* env var operators may set. Adding a new
+        // `#[arg(env = "DECDN_*")]` field without adding it here is a test
+        // failure — which is the point. Arg IDs are the Rust field name
+        // (underscored), not the `--long` form, because that's what clap
+        // stores on the `Arg` struct.
+        let expected: &[(&str, &str)] = &[
+            ("data_dir", "DECDN_DATA_DIR"),
+            ("region", "DECDN_REGION"),
+            ("bind_port", "DECDN_BIND_PORT"),
+            ("relay_url", "DECDN_RELAY_URL"),
+            ("rpc_url", "DECDN_RPC_URL"),
+            ("eth_keystore", "DECDN_ETH_KEYSTORE"),
+            ("payment_channel_address", "DECDN_PAYMENT_CHANNEL_ADDRESS"),
+            ("staking_registry_address", "DECDN_STAKING_REGISTRY_ADDRESS"),
+            ("cache_dir", "DECDN_CACHE_DIR"),
+            ("cache_size_mb", "DECDN_CACHE_SIZE_MB"),
+            ("max_blob_size_mb", "DECDN_MAX_BLOB_SIZE_MB"),
+            ("origin_url", "DECDN_ORIGIN_URL"),
+            ("origin_path", "DECDN_ORIGIN_PATH"),
+            ("rate_per_mb", "DECDN_RATE_PER_MB"),
+            ("log_level", "DECDN_LOG_LEVEL"),
+            ("log_format", "DECDN_LOG_FORMAT"),
+            ("metrics_port", "DECDN_METRICS_PORT"),
+            ("admin_port", "DECDN_ADMIN_PORT"),
+            ("otlp_endpoint", "DECDN_OTLP_ENDPOINT"),
+        ];
+
+        for (arg_id, env_name) in expected {
+            let arg = run
+                .get_arguments()
+                .find(|a| a.get_id() == arg_id)
+                .unwrap_or_else(|| panic!("run subcommand missing arg {arg_id:?}"));
+            let env = arg.get_env().unwrap_or_else(|| {
+                panic!("arg {arg_id:?} has no env mapping (expected {env_name:?})")
+            });
+            assert_eq!(
+                env.to_str(),
+                Some(*env_name),
+                "arg {arg_id:?} env mapping drifted"
+            );
+        }
+
+        // Reverse direction: catch a newly-added `#[arg(env = "DECDN_*")]`
+        // that wasn't added to `expected`. Otherwise this test only
+        // enforces "don't remove env mappings", not "don't silently add
+        // undocumented ones".
+        let all_env_args: Vec<String> = run
+            .get_arguments()
+            .filter(|a| a.get_env().is_some())
+            .map(|a| a.get_id().to_string())
+            .collect();
+        assert_eq!(
+            all_env_args.len(),
+            expected.len(),
+            "env-bearing args drifted; declared: {all_env_args:?}, expected {}",
+            expected.len()
+        );
     }
 }

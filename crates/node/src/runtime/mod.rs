@@ -139,15 +139,27 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
     )
     .await;
 
+    // Startup banner (#274). One structured INFO event per restart lets
+    // operators correlate log streams across a fleet and across restarts
+    // without stitching multiple lines together. Field names are stable —
+    // log aggregators key on them.
     tracing::info!(
+        event = "startup_banner",
+        node_id = %secret_key.public(),
+        version = env!("CARGO_PKG_VERSION"),
+        region = cfg.identity.region.as_deref().unwrap_or(""),
         bind_port = cfg.network.bind_port,
         metrics_port = cfg.observability.metrics_port,
         admin_port = ?cfg.observability.admin_port,
+        rate_per_mb = cfg.payment.rate_per_mb,
+        cache_dir = %cfg.cache.cache_dir.display(),
+        has_origin = cfg.cache.origin_url.is_some() || cfg.cache.origin_path.is_some(),
+        subscribe_global = cfg.gossip.subscribe_global,
         "node runtime ready"
     );
 
-    shutdown_signal().await;
-    tracing::info!("shutdown signal received; closing router");
+    let signal = shutdown_signal().await;
+    tracing::info!(signal = %signal, "shutdown signal received; closing router");
 
     // Signal the HTTP accept loops to stop *before* awaiting
     // `router.shutdown()`. Router shutdown can block indefinitely if a
@@ -310,8 +322,30 @@ async fn build_cache(cfg: &ResolvedConfig) -> anyhow::Result<CacheEngine> {
         .context("failed to open cache engine")
 }
 
-/// Wait for either SIGINT or (on Unix) SIGTERM.
-async fn shutdown_signal() {
+/// Which OS signal triggered shutdown. Returned by [`shutdown_signal`] so
+/// the "shutdown signal received" log line records the cause (SIGINT vs.
+/// SIGTERM) — operators need that distinction for post-incident analysis,
+/// and a future drain path can branch on it (immediate on SIGINT, graceful
+/// on SIGTERM). `Sigterm` is unreachable on non-unix targets.
+#[derive(Debug, Clone, Copy)]
+enum ShutdownSignal {
+    Sigint,
+    #[cfg(unix)]
+    Sigterm,
+}
+
+impl std::fmt::Display for ShutdownSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sigint => f.write_str("SIGINT"),
+            #[cfg(unix)]
+            Self::Sigterm => f.write_str("SIGTERM"),
+        }
+    }
+}
+
+/// Wait for either SIGINT or (on Unix) SIGTERM; return which one fired.
+async fn shutdown_signal() -> ShutdownSignal {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -320,16 +354,32 @@ async fn shutdown_signal() {
             Err(err) => {
                 tracing::warn!(%err, "failed to install SIGTERM handler; falling back to SIGINT only");
                 let _ = tokio::signal::ctrl_c().await;
-                return;
+                return ShutdownSignal::Sigint;
             }
         };
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {},
-            _ = term.recv() => {},
+            _ = tokio::signal::ctrl_c() => ShutdownSignal::Sigint,
+            _ = term.recv() => ShutdownSignal::Sigterm,
         }
     }
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+        ShutdownSignal::Sigint
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Operators grep `signal=SIGINT` / `signal=SIGTERM` in the structured
+    // "shutdown signal received" log line; a rename here would silently
+    // break dashboards and runbooks.
+    #[test]
+    fn shutdown_signal_display_is_stable() {
+        assert_eq!(ShutdownSignal::Sigint.to_string(), "SIGINT");
+        #[cfg(unix)]
+        assert_eq!(ShutdownSignal::Sigterm.to_string(), "SIGTERM");
     }
 }
