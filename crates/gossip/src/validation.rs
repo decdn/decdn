@@ -431,16 +431,7 @@ mod tests {
         let sk_a = fresh_key();
         let sk_b = fresh_key();
 
-        let body = NodeAnnounceBody {
-            node_id: *sk_a.public().as_bytes(), // claims A
-            region: "US".to_string(),
-            load: LoadHint {
-                active_streams: 0,
-                bandwidth_utilization: 0,
-            },
-            popular_hashes: vec![],
-            timestamp_us: 1_700_000_000_000_000,
-        };
+        let body = sample_body(&sk_a, 1_700_000_000_000_000); // claims A
         let signature = sign(&sk_b, &body); // signed by B
         let bytes = encode(&GossipEnvelope {
             version: GOSSIP_VERSION,
