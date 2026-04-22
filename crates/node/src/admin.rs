@@ -2,9 +2,13 @@
 //!
 //! The admin surface is a local-operator control plane — it is expected
 //! to bind on `127.0.0.1` only. Methods are dispatched via JSON-RPC 2.0
-//! over HTTP `POST /`; the [`AdminRpc`] trait is the single source of
+//! over HTTP `POST /`; the `AdminRpc` trait is the single source of
 //! truth for both the server impl and the generated client bindings in
-//! [`crate::commands`] and integration tests.
+//! [`crate::commands`] and integration tests. jsonrpsee's
+//! `#[rpc(server, client)]` macro consumes `AdminRpc` and emits
+//! separate `AdminRpcServer` / `AdminRpcClient` traits; the original
+//! `AdminRpc` name is not a linkable rustdoc item, hence the bare
+//! backticks rather than an intra-doc link.
 //!
 //! Today the trait exposes a single method, `admin_v1_peersList`, which
 //! returns the current gossip peer table as JSON. Future operational
