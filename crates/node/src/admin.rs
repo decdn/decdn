@@ -69,9 +69,37 @@ pub struct PeerView {
 }
 
 impl PeerView {
+    fn from_raw(raw: RawPeer) -> Self {
+        Self {
+            node_id: hex_encode(&raw.node_id),
+            region: raw.region,
+            first_seen_us: raw.first_seen_us,
+            last_seen_us: raw.last_seen_us,
+            load: raw.load,
+            announced_at_us: raw.announced_at_us,
+        }
+    }
+}
+
+/// Owned snapshot of one [`PeerEntry`]'s fields-of-interest, captured
+/// under the read lock so the lock can be dropped before [`hex_encode`]
+/// and final DTO assembly run. Hex-encoding the node id and allocating
+/// the wire-format `node_id` string don't need to see live state, so
+/// keeping them inside the locked region would block concurrent
+/// announce-writers for no benefit.
+struct RawPeer {
+    node_id: [u8; 32],
+    region: String,
+    first_seen_us: u64,
+    last_seen_us: u64,
+    load: decdn_protocol::LoadHint,
+    announced_at_us: u64,
+}
+
+impl RawPeer {
     fn from_entry(node_id: &[u8; 32], entry: &PeerEntry) -> Self {
         Self {
-            node_id: hex_encode(node_id),
+            node_id: *node_id,
             region: entry.announce.body.region.clone(),
             first_seen_us: entry.first_seen_us,
             last_seen_us: entry.last_seen_us,
@@ -115,21 +143,22 @@ impl AdminRpcImpl {
 #[async_trait]
 impl AdminRpcServer for AdminRpcImpl {
     async fn peers_list(&self) -> RpcResult<PeersResponse> {
-        // Snapshot the table under a read lock: copying the entries
-        // keeps the lock hold time proportional to peer count, not to
-        // the JSON encode time (which grows with `popular_hashes`
-        // lengths etc.).
-        let mut snapshot: Vec<PeerView> = {
+        // Two-pass snapshot: under the read lock we copy only the
+        // owned data needed to build a PeerView (raw node_id bytes,
+        // region clone, scalar fields). Hex encoding of node_id and
+        // final DTO assembly run *after* the lock is released, along
+        // with sorting and (later, in the framework) JSON encoding of
+        // `popular_hashes`. Lock hold time stays proportional to peer
+        // count and to the per-entry data extraction, no further.
+        let raw: Vec<RawPeer> = {
             let guard = self.state.peer_table.read().await;
             guard
                 .iter()
-                .map(|(id, entry)| PeerView::from_entry(id, entry))
+                .map(|(id, entry)| RawPeer::from_entry(id, entry))
                 .collect()
         };
-        // Most recently seen first — on-call use case is "is gossip
-        // alive?". Sorting happens after the read lock is released so
-        // concurrent announce-writers aren't blocked on the sort's CPU
-        // time.
+        let mut snapshot: Vec<PeerView> = raw.into_iter().map(PeerView::from_raw).collect();
+        // Most recently seen first — on-call use case is "is gossip alive?".
         snapshot.sort_by_key(|v| std::cmp::Reverse(v.last_seen_us));
         Ok(PeersResponse { peers: snapshot })
     }

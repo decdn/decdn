@@ -8,6 +8,7 @@ use std::time::Duration;
 use anyhow::Context;
 use jsonrpsee::core::client::Error as JsonRpcClientError;
 use jsonrpsee::http_client::HttpClientBuilder;
+use serde::Deserialize;
 
 use crate::admin::{AdminRpcClient, PeerView, PeersResponse};
 use crate::cli;
@@ -26,6 +27,24 @@ enum ConfigPathSource {
     Explicit,
     /// Path came from the built-in default (`~/.decdn/node.toml`).
     Default,
+}
+
+/// Partial deserializer for the TOML config — only the path
+/// `observability.admin_port` is interesting to `decdn node peers`.
+/// Kept private here (rather than reusing `crate::config::FileConfig`)
+/// so an operator's typo in an unrelated section can't make peer
+/// listing unusable. `serde(default)` and serde-toml's default
+/// "ignore unknown fields" together guarantee that any other valid
+/// TOML — including missing tables — round-trips through with no
+/// effect.
+#[derive(Debug, Default, Deserialize)]
+struct AdminPortConfig {
+    observability: Option<AdminPortObservability>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AdminPortObservability {
+    admin_port: Option<u16>,
 }
 
 /// Dispatch a `decdn node <sub>` invocation.
@@ -178,9 +197,17 @@ fn port_from_config_file(
     let path: PathBuf = path.to_path_buf();
     match std::fs::read_to_string(&path) {
         Ok(contents) => {
-            let file: crate::config::FileConfig = toml::from_str(&contents)
+            // Deliberately a partial deserializer: parsing the full
+            // `FileConfig` would couple `decdn node peers` to every
+            // unrelated field's well-formedness. An operator with a
+            // typo'd `[payments]` table shouldn't lose the ability to
+            // list peers. Serde's TOML mode ignores unknown fields by
+            // default, so this only fails on (a) genuinely malformed
+            // TOML or (b) a wrong type for `observability.admin_port`
+            // itself — both of which we genuinely want to surface.
+            let parsed: AdminPortConfig = toml::from_str(&contents)
                 .with_context(|| format!("failed to parse config file {}", path.display()))?;
-            match file.observability.and_then(|o| o.admin_port) {
+            match parsed.observability.and_then(|o| o.admin_port) {
                 Some(0) => anyhow::bail!(
                     "config {} disables the admin server (observability.admin_port = 0); \
                      pass --admin-url or enable the admin port",
@@ -492,6 +519,30 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("expected parse error"))?
             .to_string();
         assert!(err.contains("parse"), "missing context: {err}");
+        Ok(())
+    }
+
+    // Locks in the partial-deserializer choice: a wrong type in some
+    // unrelated section (here, a malformed `[network]` field that the
+    // full FileConfig would reject) must not stop `decdn node peers`
+    // from resolving the admin port. If a future refactor reverts to
+    // parsing FileConfig, this test fails.
+    #[test]
+    fn port_from_config_file_ignores_unrelated_field_errors() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("node.toml");
+        // `network.bind_addr` would be a string in the real schema;
+        // making it an integer is a guaranteed type-mismatch for the
+        // full FileConfig, but the narrow AdminPortConfig deserializer
+        // never sees `network` so it must round-trip fine.
+        std::fs::write(
+            &path,
+            b"[observability]\nadmin_port = 4242\n[network]\nbind_addr = 7\n",
+        )?;
+        assert_eq!(
+            port_from_config_file(Some(&path), ConfigPathSource::Default)?,
+            Some(4242)
+        );
         Ok(())
     }
 
