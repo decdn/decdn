@@ -116,9 +116,21 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
     )
     .await;
 
+    // Startup banner (#274). One structured INFO event per restart lets
+    // operators correlate log streams across a fleet and across restarts
+    // without stitching multiple lines together. Field names are stable —
+    // log aggregators key on them.
     tracing::info!(
+        event = "startup_banner",
+        node_id = %secret_key.public(),
+        version = env!("CARGO_PKG_VERSION"),
+        region = cfg.identity.region.as_deref().unwrap_or(""),
         bind_port = cfg.network.bind_port,
         metrics_port = cfg.observability.metrics_port,
+        rate_per_mb = cfg.payment.rate_per_mb,
+        cache_dir = %cfg.cache.cache_dir.display(),
+        has_origin = cfg.cache.origin_url.is_some() || cfg.cache.origin_path.is_some(),
+        subscribe_global = cfg.gossip.subscribe_global,
         "node runtime ready"
     );
 
