@@ -14,31 +14,28 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// Maximum framed message size. Pinned at 16 MiB by ADR 013 §Wire Framing,
-/// uniformly across all ALPNs in v1.
+/// Maximum framed message size. Pinned at exactly 16 MiB by ADR 013 §Wire
+/// Framing, uniformly across all ALPNs in v1.
 ///
-/// The ceiling exists as a pre-allocation denial-of-service bound: [`read_frame`]
+/// The ceiling is a pre-allocation denial-of-service bound: [`read_frame`]
 /// allocates exactly `len` bytes after decoding the length prefix, so an
 /// unbounded length would let a peer force arbitrary-sized allocations. 16 MiB
 /// sits well above every documented ALPN message (`cdn/probe/v1` ≤ ~200 B,
 /// `cdn/client/v1` non-`ChunkData` ≤ ~1 KiB) and pairs with QUIC's
 /// `MAX_STREAMS` (ADR 005) for the total per-peer memory bound.
 ///
-/// Changing this constant is a wire-compatibility decision, not a refactor —
-/// the compile-time guards below catch accidental edits. A legitimate change
-/// needs an ADR 013 amendment first.
+/// Changing this constant is a protocol-wide wire-compatibility decision —
+/// any edit, whether bump or shrink, requires an ADR 013 amendment first.
+/// The compile-time guard below catches accidental edits. Per-deployment
+/// tightening for memory-constrained nodes is a runtime-config concern
+/// (ADR 013 §Wire Framing), not a change to the constant itself.
 pub const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
 
-// Compile-time guardrails tying MAX_MESSAGE_SIZE to ADR 013. Changing the
-// constant without updating the ADR fails the build with a message that
-// points the changer at the right place.
+// Compile-time guardrail tying MAX_MESSAGE_SIZE to ADR 013. Any change to
+// the constant without an ADR 013 amendment fails the build.
 const _: () = assert!(
-    MAX_MESSAGE_SIZE >= 64 * 1024,
-    "MAX_MESSAGE_SIZE shrunk below the headroom floor above documented ALPN message maxima (ADR 013)",
-);
-const _: () = assert!(
-    MAX_MESSAGE_SIZE <= 16 * 1024 * 1024,
-    "MAX_MESSAGE_SIZE exceeds the ADR 013 ceiling; an ADR 013 amendment must land before the code change",
+    MAX_MESSAGE_SIZE == 16 * 1024 * 1024,
+    "MAX_MESSAGE_SIZE must be exactly 16 MiB per ADR 013 §Wire Framing; any change (bump or shrink) requires an ADR amendment",
 );
 
 /// Errors produced by the framing helpers. The handler-layer mapping to QUIC
