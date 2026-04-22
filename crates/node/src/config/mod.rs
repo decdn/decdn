@@ -1483,4 +1483,83 @@ mod tests {
         validate_port_layout(&net(4433), &obs(0))?;
         Ok(())
     }
+
+    // Closes #268. The three-layer merge is CLI/env > TOML file > default;
+    // `resolve_*_cli_overrides_file*` tests cover the "Option::Some on
+    // RunArgs beats file" leg. The remaining leg — that clap populates
+    // RunArgs from `DECDN_*` env vars so those Option::Some values are
+    // there to win — lives in this test.
+    //
+    // Done declaratively (via clap's `Command` introspection) rather than
+    // by setting process env vars: `std::env::set_var` is `unsafe` under
+    // edition 2024 and the workspace lints forbid `unsafe_code`. A dev-
+    // dependency like `temp-env` would work but costs more than the
+    // regression risk we're pinning here — a dropped `env = "DECDN_*"`
+    // attribute or a field rename fails this test immediately.
+    #[test]
+    fn run_subcommand_args_are_wired_to_decdn_env_vars() {
+        use clap::CommandFactory;
+
+        let cmd = crate::cli::Cli::command();
+        let run = cmd
+            .find_subcommand("run")
+            .expect("Cli has a `run` subcommand");
+
+        // One line per DECDN_* env var operators may set. Adding a new
+        // `#[arg(env = "DECDN_*")]` field without adding it here is a test
+        // failure — which is the point. Arg IDs are the Rust field name
+        // (underscored), not the `--long` form, because that's what clap
+        // stores on the `Arg` struct.
+        let expected: &[(&str, &str)] = &[
+            ("data_dir", "DECDN_DATA_DIR"),
+            ("region", "DECDN_REGION"),
+            ("bind_port", "DECDN_BIND_PORT"),
+            ("relay_url", "DECDN_RELAY_URL"),
+            ("rpc_url", "DECDN_RPC_URL"),
+            ("eth_keystore", "DECDN_ETH_KEYSTORE"),
+            ("payment_channel_address", "DECDN_PAYMENT_CHANNEL_ADDRESS"),
+            ("staking_registry_address", "DECDN_STAKING_REGISTRY_ADDRESS"),
+            ("cache_dir", "DECDN_CACHE_DIR"),
+            ("cache_size_mb", "DECDN_CACHE_SIZE_MB"),
+            ("max_blob_size_mb", "DECDN_MAX_BLOB_SIZE_MB"),
+            ("origin_url", "DECDN_ORIGIN_URL"),
+            ("origin_path", "DECDN_ORIGIN_PATH"),
+            ("rate_per_mb", "DECDN_RATE_PER_MB"),
+            ("log_level", "DECDN_LOG_LEVEL"),
+            ("log_format", "DECDN_LOG_FORMAT"),
+            ("metrics_port", "DECDN_METRICS_PORT"),
+            ("otlp_endpoint", "DECDN_OTLP_ENDPOINT"),
+        ];
+
+        for (arg_id, env_name) in expected {
+            let arg = run
+                .get_arguments()
+                .find(|a| a.get_id() == arg_id)
+                .unwrap_or_else(|| panic!("run subcommand missing arg {arg_id:?}"));
+            let env = arg.get_env().unwrap_or_else(|| {
+                panic!("arg {arg_id:?} has no env mapping (expected {env_name:?})")
+            });
+            assert_eq!(
+                env.to_str(),
+                Some(*env_name),
+                "arg {arg_id:?} env mapping drifted"
+            );
+        }
+
+        // Reverse direction: catch a newly-added `#[arg(env = "DECDN_*")]`
+        // that wasn't added to `expected`. Otherwise this test only
+        // enforces "don't remove env mappings", not "don't silently add
+        // undocumented ones".
+        let all_env_args: Vec<String> = run
+            .get_arguments()
+            .filter(|a| a.get_env().is_some())
+            .map(|a| a.get_id().to_string())
+            .collect();
+        assert_eq!(
+            all_env_args.len(),
+            expected.len(),
+            "env-bearing args drifted; declared: {all_env_args:?}, expected {}",
+            expected.len()
+        );
+    }
 }
