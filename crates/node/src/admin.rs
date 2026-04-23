@@ -75,7 +75,7 @@ pub struct PeerView {
 impl PeerView {
     fn from_raw(raw: RawPeer) -> Self {
         Self {
-            node_id: hex_encode(&raw.node_id),
+            node_id: alloy::primitives::hex::encode(raw.node_id),
             region: raw.region,
             first_seen_us: raw.first_seen_us,
             last_seen_us: raw.last_seen_us,
@@ -86,7 +86,7 @@ impl PeerView {
 }
 
 /// Owned snapshot of one [`PeerEntry`]'s fields-of-interest, captured
-/// under the read lock so the lock can be dropped before [`hex_encode`]
+/// under the read lock so the lock can be dropped before hex encoding
 /// and final DTO assembly run. Hex-encoding the node id and allocating
 /// the wire-format `node_id` string don't need to see live state, so
 /// keeping them inside the locked region would block concurrent
@@ -238,19 +238,6 @@ pub async fn serve(
     Ok(())
 }
 
-const HEX: &[u8; 16] = b"0123456789abcdef";
-
-fn hex_encode(bytes: &[u8; 32]) -> String {
-    let mut out = String::with_capacity(64);
-    for b in bytes {
-        let hi = usize::from(b >> 4);
-        let lo = usize::from(b & 0x0f);
-        out.push(char::from(HEX.get(hi).copied().unwrap_or(b'0')));
-        out.push(char::from(HEX.get(lo).copied().unwrap_or(b'0')));
-    }
-    out
-}
-
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -336,17 +323,5 @@ mod tests {
         let resp = rpc.peers_list().await.expect("peers_list ok");
         let order: Vec<u64> = resp.peers.iter().map(|p| p.last_seen_us).collect();
         assert_eq!(order, vec![700, 600, 500]);
-    }
-
-    #[test]
-    fn hex_encode_round_trip_nibble_order() {
-        let mut buf = [0u8; 32];
-        buf[0] = 0x01;
-        buf[1] = 0x23;
-        buf[31] = 0xef;
-        let out = hex_encode(&buf);
-        assert!(out.starts_with("0123"));
-        assert!(out.ends_with("ef"));
-        assert_eq!(out.len(), 64);
     }
 }
