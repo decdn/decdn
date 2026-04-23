@@ -180,6 +180,32 @@ async fn cli_peers_surfaces_connection_refused() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `--timeout-ms 0` must be rejected up front — jsonrpsee interprets
+/// `Duration::ZERO` as "never time out" rather than "sub-millisecond
+/// deadline", which would hang an operator script that meant to cap
+/// the wait. The guard in `commands::peers` fires before the client
+/// is built, so any URL works here.
+#[tokio::test]
+async fn cli_peers_rejects_zero_timeout() -> anyhow::Result<()> {
+    let args = PeersArgs {
+        admin_url: Some("http://127.0.0.1:1".to_string()),
+        config: None,
+        region: None,
+        json: false,
+        timeout_ms: 0,
+    };
+    let err = commands::peers(&args, None)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("expected zero-timeout error"))?
+        .to_string();
+    assert!(
+        err.contains("--timeout-ms"),
+        "error should mention the flag, got: {err}"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn admin_shutdown_closes_listener() -> anyhow::Result<()> {
     let peer_table = Arc::new(RwLock::new(PeerTable::new(0)));

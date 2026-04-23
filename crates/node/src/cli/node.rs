@@ -34,9 +34,10 @@ pub struct PeersArgs {
     pub admin_url: Option<String>,
 
     /// Path to the TOML config file used to derive the admin URL when
-    /// `--admin-url` / `DECDN_ADMIN_URL` are unset. The global
-    /// `decdn --config` flag is not plumbed into `node` subcommands —
-    /// pass `--config` here if you need a non-default config path.
+    /// `--admin-url` / `DECDN_ADMIN_URL` are unset. Takes precedence
+    /// over the top-level `decdn --config`; if neither is set,
+    /// resolution falls through to `~/.decdn/node.toml` and then the
+    /// built-in default port.
     #[arg(long, value_name = "PATH")]
     pub config: Option<PathBuf>,
 

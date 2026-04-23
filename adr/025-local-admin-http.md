@@ -1,7 +1,7 @@
 # ADR 025: Local Admin HTTP Surface
 
 **Date:** 2026-04-17
-**Status:** Draft
+**Status:** Accepted
 
 ---
 

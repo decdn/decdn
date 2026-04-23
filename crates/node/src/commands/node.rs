@@ -285,10 +285,6 @@ fn write_peers_table(w: &mut impl io::Write, peers: &[PeerView], now_us: u64) ->
 fn short_node_id(hex: &str) -> String {
     // Unicode '…' (U+2026) rather than "..." so a pasted preview is
     // unambiguously a preview and never parses as hex.
-    //
-    // Single-pass: take 12 chars by ref, then peek the iterator to
-    // decide whether more were available — avoids iterating `hex`
-    // twice (once for `take`, once for `chars().count()`).
     let mut chars = hex.chars();
     let prefix: String = chars.by_ref().take(12).collect();
     if chars.next().is_some() {
@@ -299,8 +295,9 @@ fn short_node_id(hex: &str) -> String {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    let mut out: String = s.chars().take(max).collect();
-    if s.chars().count() > max {
+    let mut chars = s.chars();
+    let mut out: String = chars.by_ref().take(max).collect();
+    if chars.next().is_some() {
         out.push('…');
     }
     out
