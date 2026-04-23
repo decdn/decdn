@@ -4,6 +4,10 @@
 //! the functions here. Keeping them in the library target lets integration
 //! tests and downstream tools depend on them without `#[path]` tricks.
 
+pub mod node;
+
+pub use node::{node_dispatch, peers};
+
 use crate::{cli, config, identity, runtime};
 
 /// Run the deCDN node with resolved configuration.
@@ -406,6 +410,10 @@ pub fn write_validate_summary<W: std::io::Write>(
         "  metrics_port:             {}",
         resolved.observability.metrics_port
     )?;
+    match resolved.observability.admin_port {
+        Some(p) => writeln!(w, "  admin_port:               {p}")?,
+        None => writeln!(w, "  admin_port:               disabled")?,
+    }
     // otlp_endpoint URLs commonly carry bearer tokens or API keys in the
     // path or query, so redact like rpc_url.
     if let Some(otlp) = &resolved.observability.otlp_endpoint {
@@ -476,5 +484,6 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # log_level = "info"
 # log_format = "pretty"
 # metrics_port = 9090
+# admin_port = 9191                        # loopback-only; 0 disables (ADR 025)
 # otlp_endpoint = "http://localhost:4317"  # requires --features otlp
 "#;

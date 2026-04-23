@@ -17,6 +17,7 @@ use tokio::task::JoinSet;
 
 use decdn_gossip::{GossipMetrics, GossipRuntimeConfig, GossipService, PeerTable};
 
+use crate::admin;
 use crate::config::ResolvedConfig;
 use crate::handlers::probe::ProbeHandler;
 use crate::{identity, metrics};
@@ -88,6 +89,28 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
     let peer_table = Arc::new(RwLock::new(PeerTable::new(
         cfg.gossip.peer_ttl_sec.saturating_mul(1_000_000),
     )));
+
+    // Admin HTTP surface (ADR 025). Bound before the gossip service spawns so
+    // startup fails fast on a port collision rather than after side-effectful
+    // subscriptions have registered.
+    let admin_stop_tx = if let Some(admin_port) = cfg.observability.admin_port {
+        let admin_addr = std::net::SocketAddr::from(([127, 0, 0, 1], admin_port));
+        let admin_listener = admin::bind(admin_addr)
+            .await
+            .context("failed to bind admin listener")?;
+        let (tx, rx) = oneshot::channel::<()>();
+        let state = admin::AdminState::new(Arc::clone(&peer_table));
+        tasks.spawn(async move {
+            if let Err(err) = admin::serve(admin_listener, state, rx).await {
+                tracing::error!(%err, "admin server exited with error");
+            }
+        });
+        Some(tx)
+    } else {
+        tracing::info!("admin server disabled (observability.admin_port = 0)");
+        None
+    };
+
     let gossip_runtime_cfg = GossipRuntimeConfig {
         announce_interval_sec: cfg.gossip.announce_interval_sec,
         subscribe_global: cfg.gossip.subscribe_global,
@@ -127,6 +150,7 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
         region = cfg.identity.region.as_deref().unwrap_or(""),
         bind_port = cfg.network.bind_port,
         metrics_port = cfg.observability.metrics_port,
+        admin_port = ?cfg.observability.admin_port,
         rate_per_mb = cfg.payment.rate_per_mb,
         cache_dir = %cfg.cache.cache_dir.display(),
         has_origin = cfg.cache.origin_url.is_some() || cfg.cache.origin_path.is_some(),
@@ -137,19 +161,34 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
     let signal = shutdown_signal().await;
     tracing::info!(signal = %signal, "shutdown signal received; closing router");
 
+    // Signal the HTTP accept loops to stop *before* awaiting
+    // `router.shutdown()`. Router shutdown can block indefinitely if a
+    // protocol handler is slow, and while it's blocked the metrics/admin
+    // servers would otherwise keep accepting fresh loopback connections —
+    // wasting the outer `SHUTDOWN_DEADLINE` budget and emitting misleading
+    // "still serving" signals. The accept loops are cheap to unwind, so
+    // stopping them first is strictly cleaner.
+    if metrics_stop_tx.send(()).is_err() {
+        // Receiver dropped → the metrics server task already exited on
+        // its own. The spawn closure logs its own error on abnormal exit
+        // (see `metrics server exited with error` above), so this branch
+        // is purely informational: under a healthy shutdown we'd have
+        // been the ones signaling it.
+        tracing::warn!("metrics server exited before shutdown signal was sent");
+    }
+    if let Some(tx) = admin_stop_tx
+        && tx.send(()).is_err()
+    {
+        tracing::warn!("admin server exited before shutdown signal was sent");
+    }
+
     // Router::shutdown waits for ProtocolHandler::shutdown on each handler,
-    // then closes the endpoint. Unblock the metrics accept loop too, and
-    // abort gossip's infinite loops (publisher / subscriber / TTL sweeper)
-    // so the drain phase actually finishes rather than hitting the 15s
+    // then closes the endpoint. After this returns we can safely abort
+    // gossip's infinite loops (publisher / subscriber / TTL sweeper) so
+    // the drain phase actually finishes rather than hitting the 15s
     // timeout every time.
     if let Err(err) = router.shutdown().await {
         tracing::warn!(%err, "router shutdown reported an error");
-    }
-    if metrics_stop_tx.send(()).is_err() {
-        // Receiver already dropped → metrics server exited on its own
-        // (port died, bind listener errored, etc). Not fatal, but worth a
-        // breadcrumb for shutdown-order debugging.
-        tracing::debug!("metrics stop channel closed before shutdown signal");
     }
     for handle in &gossip_handles {
         handle.abort();

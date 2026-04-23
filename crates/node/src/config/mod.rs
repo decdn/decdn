@@ -33,6 +33,10 @@ const DEFAULT_MAX_BLOB_SIZE_MB: u64 = 1_024;
 const DEFAULT_RATE_PER_MB: u64 = 10;
 /// Default Prometheus metrics port.
 const DEFAULT_METRICS_PORT: u16 = 9090;
+/// Default loopback admin HTTP port (ADR 025). Exposed to the rest of
+/// the `node` crate so `decdn node <sub>` clients can fall back to the
+/// same default the server binds on, without duplicating the number.
+pub(crate) const DEFAULT_ADMIN_PORT: u16 = 9191;
 /// Default interval between outgoing `NodeAnnounce` messages (ADR 001).
 const DEFAULT_ANNOUNCE_INTERVAL_SEC: u64 = 60;
 /// Default peer-table entry TTL after which a stale entry is evicted.
@@ -98,39 +102,80 @@ fn ensure_region_when_publishing_global(
 }
 
 /// Cross-section check on the running node's port assignments. Lives at the
-/// resolver boundary because `bind_port` and `metrics_port` come from
-/// different sections — a collision rule is inherently cross-section, and
-/// operators who set the two equal almost certainly made a typo. Also emits
-/// a stderr warning for well-known ports (<1024), which bind on Unix only
-/// with elevated privilege and may collide with standardized services.
+/// resolver boundary because `bind_port`, `metrics_port`, and `admin_port`
+/// come from different sections — the collision rules are inherently
+/// cross-section, and operators who set two of them equal almost certainly
+/// made a typo. Also emits a stderr warning for well-known ports (<1024),
+/// which bind on Unix only with elevated privilege and may collide with
+/// standardized services.
+///
+/// Collision rules:
+/// - `bind_port` vs. `metrics_port` — QUIC (UDP) and metrics (TCP) would
+///   not collide at bind time, but sharing a number is an operator typo.
+/// - `bind_port` vs. `admin_port` — same UDP/TCP story as above.
+/// - `metrics_port` vs. `admin_port` — both TCP; sharing the port would
+///   silently make the second bind fail at startup.
 ///
 /// Port `0` is the sentinel for OS-assigned ephemeral ports: it collides
 /// with nothing (the OS picks distinct values) and needs no elevated
-/// privilege, so both checks skip it. Uses `eprintln!` rather than
-/// `tracing::warn!` because `tracing` is not yet initialized at
-/// `resolve_config` time (see `commands::run`).
+/// privilege, so every check skips it. Admin disabled (`None`) means we
+/// skip the pair checks that involve it.
+///
+/// Uses `eprintln!` rather than `tracing::warn!` because `tracing` is not
+/// yet initialized at `resolve_config` time (see `commands::run`).
 fn validate_port_layout(
     network: &ResolvedNetwork,
     observability: &ResolvedObservability,
 ) -> anyhow::Result<()> {
-    if network.bind_port != 0 && observability.metrics_port != 0 {
+    let bind = network.bind_port;
+    let metrics = observability.metrics_port;
+    let admin = observability.admin_port;
+
+    // bind vs metrics — UDP/TCP, same-number operator typo.
+    if bind != 0 && metrics != 0 {
         anyhow::ensure!(
-            network.bind_port != observability.metrics_port,
-            "network.bind_port ({}) must differ from observability.metrics_port ({}); \
+            bind != metrics,
+            "network.bind_port ({bind}) must differ from observability.metrics_port ({metrics}); \
              QUIC (UDP) and metrics (TCP) would not collide at bind time, but sharing \
              the same port number is almost certainly an operator typo",
-            network.bind_port,
-            observability.metrics_port,
+        );
+    }
+
+    // bind vs admin — UDP/TCP, same-number operator typo.
+    if let Some(admin) = admin
+        && bind != 0
+        && admin != 0
+    {
+        anyhow::ensure!(
+            bind != admin,
+            "network.bind_port ({bind}) must differ from observability.admin_port ({admin}); \
+             QUIC (UDP) and admin (TCP) would not collide at bind time, but sharing \
+             the same port number is almost certainly an operator typo",
+        );
+    }
+
+    // metrics vs admin — both TCP, second bind would fail silently.
+    if let Some(admin) = admin
+        && metrics != 0
+        && admin != 0
+    {
+        anyhow::ensure!(
+            admin != metrics,
+            "observability.admin_port ({admin}) must differ from observability.metrics_port ({metrics}); \
+             the two servers cannot share a TCP port",
         );
     }
 
     for (name, port) in [
-        ("network.bind_port", network.bind_port),
-        ("observability.metrics_port", observability.metrics_port),
+        ("network.bind_port", Some(bind)),
+        ("observability.metrics_port", Some(metrics)),
+        ("observability.admin_port", admin),
     ] {
-        if (1..1024).contains(&port) {
+        if let Some(p) = port
+            && (1..1024).contains(&p)
+        {
             eprintln!(
-                "warning: {name} = {port} is in the well-known range (<1024); \
+                "warning: {name} = {p} is in the well-known range (<1024); \
                  requires elevated privilege to bind on Unix and may collide with \
                  a standardized service"
             );
@@ -404,6 +449,12 @@ fn resolve_payment(
 }
 
 /// Resolve observability fields.
+///
+/// The admin port is merged with `0` as a first-class "disable" value so
+/// operators can turn the surface off without removing the line from their
+/// config. Cross-port collision checks (bind/metrics/admin) live in
+/// [`validate_port_layout`], which sees all three sections at once — see
+/// there for the full ruleset.
 fn resolve_observability(
     cli: &crate::cli::run::ObservabilityArgs,
     file: Option<&types::ObservabilityConfig>,
@@ -423,6 +474,16 @@ fn resolve_observability(
         .or_else(|| file.and_then(|o| o.metrics_port))
         .unwrap_or(DEFAULT_METRICS_PORT);
 
+    let admin_port_raw = cli
+        .admin_port
+        .or_else(|| file.and_then(|o| o.admin_port))
+        .unwrap_or(DEFAULT_ADMIN_PORT);
+    let admin_port = if admin_port_raw == 0 {
+        None
+    } else {
+        Some(admin_port_raw)
+    };
+
     let otlp_endpoint = cli
         .otlp_endpoint
         .clone()
@@ -432,6 +493,7 @@ fn resolve_observability(
         log_level,
         log_format,
         metrics_port,
+        admin_port,
         otlp_endpoint,
     }
 }
@@ -1148,6 +1210,7 @@ mod tests {
                     log_level: None,
                     log_format: None,
                     metrics_port: None,
+                    admin_port: None,
                     otlp_endpoint: Some(v.to_string()),
                 });
             }),
@@ -1425,6 +1488,19 @@ mod tests {
         Ok(())
     }
 
+    fn obs_cli(
+        metrics_port: Option<u16>,
+        admin_port: Option<u16>,
+    ) -> crate::cli::run::ObservabilityArgs {
+        crate::cli::run::ObservabilityArgs {
+            log_level: None,
+            log_format: None,
+            metrics_port,
+            admin_port,
+            otlp_endpoint: None,
+        }
+    }
+
     fn net(port: u16) -> ResolvedNetwork {
         ResolvedNetwork {
             bind_port: port,
@@ -1437,8 +1513,31 @@ mod tests {
             log_level: crate::cli::common::LogLevel::default(),
             log_format: crate::cli::common::LogFormat::default(),
             metrics_port: port,
+            admin_port: None,
             otlp_endpoint: None,
         }
+    }
+
+    fn obs_with_admin(metrics: u16, admin: u16) -> ResolvedObservability {
+        ResolvedObservability {
+            log_level: crate::cli::common::LogLevel::default(),
+            log_format: crate::cli::common::LogFormat::default(),
+            metrics_port: metrics,
+            admin_port: Some(admin),
+            otlp_endpoint: None,
+        }
+    }
+
+    #[test]
+    fn resolve_observability_defaults_admin_port_to_9191() -> anyhow::Result<()> {
+        let obs = resolve_observability(&obs_cli(None, None), None);
+        anyhow::ensure!(
+            obs.admin_port == Some(DEFAULT_ADMIN_PORT),
+            "got: {:?}",
+            obs.admin_port
+        );
+        anyhow::ensure!(obs.metrics_port == DEFAULT_METRICS_PORT);
+        Ok(())
     }
 
     #[test]
@@ -1459,11 +1558,60 @@ mod tests {
     }
 
     #[test]
+    fn resolve_observability_admin_port_zero_disables() -> anyhow::Result<()> {
+        let obs = resolve_observability(&obs_cli(None, Some(0)), None);
+        anyhow::ensure!(obs.admin_port.is_none(), "got: {:?}", obs.admin_port);
+        Ok(())
+    }
+
+    #[test]
     fn validate_port_layout_allows_well_known_port() -> anyhow::Result<()> {
         // Well-known range only warns (via eprintln), never hard-fails —
         // operators have legitimate reasons to bind there (QUIC on 443,
         // privileged setup scripts, CAP_NET_BIND_SERVICE).
         validate_port_layout(&net(443), &obs(9090))?;
+        Ok(())
+    }
+
+    #[test]
+    fn validate_port_layout_rejects_admin_eq_metrics() {
+        let err = validate_port_layout(&net(4433), &obs_with_admin(9090, 9090))
+            .expect_err("equal admin and metrics ports should be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("admin_port") && msg.contains("metrics_port"),
+            "error should name both fields: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_port_layout_rejects_bind_equal_admin() {
+        let err = validate_port_layout(&net(9191), &obs_with_admin(9090, 9191))
+            .expect_err("equal bind and admin ports should be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bind_port") && msg.contains("admin_port"),
+            "error should name both fields: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_port_layout_skips_admin_when_disabled() -> anyhow::Result<()> {
+        // admin_port = None means admin surface is disabled; collision
+        // rules that involve admin must be skipped even when other
+        // numbers happen to coincide.
+        validate_port_layout(&net(4433), &obs(9090))?;
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_observability_cli_admin_port_overrides_file() -> anyhow::Result<()> {
+        let file = types::ObservabilityConfig {
+            admin_port: Some(1111),
+            ..Default::default()
+        };
+        let obs = resolve_observability(&obs_cli(None, Some(2222)), Some(&file));
+        anyhow::ensure!(obs.admin_port == Some(2222), "got: {:?}", obs.admin_port);
         Ok(())
     }
 
@@ -1528,6 +1676,7 @@ mod tests {
             ("log_level", "DECDN_LOG_LEVEL"),
             ("log_format", "DECDN_LOG_FORMAT"),
             ("metrics_port", "DECDN_METRICS_PORT"),
+            ("admin_port", "DECDN_ADMIN_PORT"),
             ("otlp_endpoint", "DECDN_OTLP_ENDPOINT"),
         ];
 

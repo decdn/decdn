@@ -94,6 +94,9 @@ pub struct ResolvedObservability {
     pub log_format: LogFormat,
     /// Prometheus metrics HTTP port.
     pub metrics_port: u16,
+    /// Loopback admin HTTP port (ADR 025). `None` disables the admin
+    /// server entirely; `Some(port)` binds on `127.0.0.1:<port>`.
+    pub admin_port: Option<u16>,
     /// OTLP collector endpoint URL (if set, span export is enabled).
     pub otlp_endpoint: Option<String>,
 }
