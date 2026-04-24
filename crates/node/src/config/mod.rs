@@ -1565,6 +1565,33 @@ mod tests {
     }
 
     #[test]
+    fn resolve_observability_file_admin_port_zero_disables() -> anyhow::Result<()> {
+        // Closes #300. `Option<u16>` distinguishes absent (None) from
+        // explicit zero (Some(0)) under serde+toml, so the file leg of the
+        // merge can carry the operator's "disable" intent through to the
+        // resolved config without ambiguity.
+        let file = types::ObservabilityConfig {
+            admin_port: Some(0),
+            ..Default::default()
+        };
+        let obs = resolve_observability(&obs_cli(None, None), Some(&file));
+        anyhow::ensure!(obs.admin_port.is_none(), "got: {:?}", obs.admin_port);
+        Ok(())
+    }
+
+    #[test]
+    fn file_admin_port_zero_deserializes_as_some_zero() -> anyhow::Result<()> {
+        // Locks the deserializer invariant #300 was filed against: an
+        // explicit `admin_port = 0` must round-trip to Some(0), distinct
+        // from a missing key which round-trips to None.
+        let absent: types::ObservabilityConfig = toml::from_str("")?;
+        anyhow::ensure!(absent.admin_port.is_none(), "got: {:?}", absent.admin_port);
+        let zero: types::ObservabilityConfig = toml::from_str("admin_port = 0")?;
+        anyhow::ensure!(zero.admin_port == Some(0), "got: {:?}", zero.admin_port);
+        Ok(())
+    }
+
+    #[test]
     fn validate_port_layout_allows_well_known_port() -> anyhow::Result<()> {
         // Well-known range only warns (via eprintln), never hard-fails —
         // operators have legitimate reasons to bind there (QUIC on 443,
