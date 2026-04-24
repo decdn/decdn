@@ -41,7 +41,7 @@ jobs:
         with:
           shared-key: clippy
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
       - run: cargo clippy --workspace --all-targets -- -D warnings
         env:
           RUSTC_WRAPPER: sccache
@@ -57,7 +57,7 @@ jobs:
         with:
           shared-key: test
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
@@ -96,7 +96,7 @@ jobs:
         with:
           shared-key: msrv
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
       - run: cargo check --workspace --all-targets
         env:
           RUSTC_WRAPPER: sccache
