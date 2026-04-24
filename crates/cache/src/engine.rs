@@ -1,7 +1,9 @@
 //! Cache engine: local iroh-blobs store fronted by an [`Origin`] for misses.
 
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use bytes::Bytes;
 use iroh_blobs::Hash;
@@ -24,6 +26,8 @@ struct Inner {
     store: FsStore,
     origin: Option<Arc<dyn Origin>>,
     max_blob_bytes: u64,
+    /// Per-hash last-access timestamps for LRU eviction ordering.
+    access_times: Mutex<HashMap<Hash, Instant>>,
 }
 
 /// Coarse-grained cache statistics.
@@ -69,6 +73,7 @@ impl CacheEngine {
                 store,
                 origin,
                 max_blob_bytes,
+                access_times: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -97,10 +102,13 @@ impl CacheEngine {
     ///   cap tripped in the engine or in the origin, respectively.
     /// - [`CacheError::Store`] — local iroh-blobs store I/O failure.
     pub async fn get(&self, hash: Hash) -> CacheResult<Bytes> {
-        if self.has(hash).await? {
-            return self.read_local(hash).await;
-        }
-        self.pull_through(hash).await
+        let bytes = if self.has(hash).await? {
+            self.read_local(hash).await?
+        } else {
+            self.pull_through(hash).await?
+        };
+        self.touch(hash);
+        Ok(bytes)
     }
 
     /// Flush ephemeral state to disk. The iroh-blobs store does its own
@@ -128,6 +136,34 @@ impl CacheEngine {
         CacheStats {
             bytes_stored: 0,
             blob_count: 0,
+        }
+    }
+
+    /// Return the last access time for `hash`, or `None` if the hash has
+    /// never been accessed through [`Self::get`].
+    pub fn last_accessed(&self, hash: Hash) -> Option<Instant> {
+        self.inner
+            .access_times
+            .lock()
+            .ok()
+            .and_then(|guard| guard.get(&hash).copied())
+    }
+
+    /// Return a snapshot of all recorded access times. Eviction logic can
+    /// sort by value to determine LRU ordering.
+    pub fn access_times_snapshot(&self) -> HashMap<Hash, Instant> {
+        self.inner
+            .access_times
+            .lock()
+            .ok()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    /// Record an access for `hash` at the current instant.
+    fn touch(&self, hash: Hash) {
+        if let Ok(mut guard) = self.inner.access_times.lock() {
+            guard.insert(hash, Instant::now());
         }
     }
 
@@ -225,5 +261,154 @@ impl CacheEngine {
         }
 
         Ok(bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
+
+    use crate::origin::{Origin, OriginFetch};
+
+    /// A trivial in-memory origin for tests. Stores exactly one blob.
+    #[derive(Debug)]
+    struct StubOrigin {
+        data: Bytes,
+        hash: Hash,
+    }
+
+    impl StubOrigin {
+        fn new(payload: &[u8]) -> Self {
+            Self {
+                hash: Hash::new(payload),
+                data: Bytes::from(payload.to_vec()),
+            }
+        }
+    }
+
+    impl Origin for StubOrigin {
+        fn fetch(
+            &self,
+            hash: Hash,
+            _max_bytes: u64,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<OriginFetch>> + Send + '_>> {
+            let result = if hash == self.hash {
+                Ok(OriginFetch::Found(self.data.clone()))
+            } else {
+                Ok(OriginFetch::NotFound)
+            };
+            Box::pin(async move { result })
+        }
+    }
+
+    #[tokio::test]
+    async fn get_cache_hit_records_access_time() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"hello cache hit";
+        let hash = Hash::new(payload);
+        let origin = StubOrigin::new(payload);
+
+        let engine = CacheEngine::open(tmp.path(), Some(Arc::new(origin)), 10).await?;
+
+        // Prime the cache via pull-through.
+        let _ = engine.get(hash).await?;
+
+        // Clear the access time so the next get proves a cache-hit path.
+        if let Ok(mut guard) = engine.inner.access_times.lock() {
+            guard.clear();
+        }
+
+        // Read again — this time it's a local hit.
+        let _ = engine.get(hash).await?;
+
+        anyhow::ensure!(
+            engine.last_accessed(hash).is_some(),
+            "expected Some(Instant) after cache-hit get"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pull_through_records_access_time() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"hello pull-through";
+        let hash = Hash::new(payload);
+        let origin = StubOrigin::new(payload);
+
+        let engine = CacheEngine::open(tmp.path(), Some(Arc::new(origin)), 10).await?;
+
+        // First get triggers pull-through.
+        let _ = engine.get(hash).await?;
+
+        anyhow::ensure!(
+            engine.last_accessed(hash).is_some(),
+            "expected Some(Instant) after pull-through get"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn second_get_updates_access_time() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"hello update";
+        let hash = Hash::new(payload);
+        let origin = StubOrigin::new(payload);
+
+        let engine = CacheEngine::open(tmp.path(), Some(Arc::new(origin)), 10).await?;
+
+        // First access (pull-through).
+        let _ = engine.get(hash).await?;
+        let first = engine
+            .last_accessed(hash)
+            .ok_or_else(|| anyhow::anyhow!("expected Some after first get"))?;
+
+        // Burn a tiny bit of real wall-clock time so Instant::now() advances.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        // Second access (cache hit).
+        let _ = engine.get(hash).await?;
+        let second = engine
+            .last_accessed(hash)
+            .ok_or_else(|| anyhow::anyhow!("expected Some after second get"))?;
+
+        anyhow::ensure!(
+            second > first,
+            "access time should advance: first={first:?}, second={second:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn access_times_snapshot_contains_accessed_hash() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"hello snapshot";
+        let hash = Hash::new(payload);
+        let origin = StubOrigin::new(payload);
+
+        let engine = CacheEngine::open(tmp.path(), Some(Arc::new(origin)), 10).await?;
+
+        let _ = engine.get(hash).await?;
+
+        let snap = engine.access_times_snapshot();
+        anyhow::ensure!(
+            snap.contains_key(&hash),
+            "snapshot should contain the accessed hash"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn last_accessed_returns_none_for_unknown_hash() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let engine = CacheEngine::open(tmp.path(), None, 10).await?;
+        let unknown = Hash::new(b"never accessed");
+
+        anyhow::ensure!(
+            engine.last_accessed(unknown).is_none(),
+            "expected None for a hash that was never accessed"
+        );
+        Ok(())
     }
 }
