@@ -249,7 +249,7 @@ fn resolve_network(
 ///
 /// Requires `0x` prefix, 40 hex characters, and a correct EIP-55 checksum.
 /// Returns the canonical checksummed form.
-pub fn parse_contract_address(flag_name: &str, raw: &str) -> anyhow::Result<String> {
+fn parse_contract_address(flag_name: &str, raw: &str) -> anyhow::Result<String> {
     let trimmed = raw.trim();
     let addr = Address::parse_checksummed(trimmed, None).with_context(|| {
         format!(
@@ -778,6 +778,80 @@ mod tests {
         assert!(parse_node_id_hex(&"0".repeat(65)).is_err());
         assert!(parse_node_id_hex(&"g".repeat(64)).is_err());
         assert!(parse_node_id_hex("").is_err());
+    }
+
+    // vitalik.eth, known-good EIP-55 checksum.
+    const GOOD_ADDR: &str = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045";
+
+    #[test]
+    fn parse_contract_address_accepts_checksummed() -> anyhow::Result<()> {
+        let out = parse_contract_address("x", GOOD_ADDR)?;
+        assert_eq!(out, GOOD_ADDR);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_contract_address_trims_whitespace() -> anyhow::Result<()> {
+        let padded = format!("  {GOOD_ADDR}\n");
+        let out = parse_contract_address("x", &padded)?;
+        assert_eq!(out, GOOD_ADDR);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_contract_address_rejects_missing_0x_prefix() -> anyhow::Result<()> {
+        let s = GOOD_ADDR
+            .get(2..)
+            .ok_or_else(|| anyhow::anyhow!("GOOD_ADDR shorter than expected"))?;
+        assert!(parse_contract_address("x", s).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn parse_contract_address_rejects_wrong_length() {
+        assert!(parse_contract_address("x", "0xabc").is_err());
+        assert!(parse_contract_address("x", &format!("{GOOD_ADDR}00")).is_err());
+    }
+
+    #[test]
+    fn parse_contract_address_rejects_empty_and_bare_prefix() {
+        assert!(parse_contract_address("x", "").is_err());
+        assert!(parse_contract_address("x", "0x").is_err());
+    }
+
+    #[test]
+    fn parse_contract_address_rejects_all_lowercase() {
+        let lower = GOOD_ADDR.to_lowercase();
+        assert!(parse_contract_address("x", &lower).is_err());
+    }
+
+    #[test]
+    fn parse_contract_address_rejects_bad_checksum() {
+        let mut bad = String::from(GOOD_ADDR);
+        // Flip the case of the first hex nibble so the checksum no longer matches.
+        bad.replace_range(2..3, "D");
+        assert!(parse_contract_address("x", &bad).is_err());
+    }
+
+    #[test]
+    fn parse_contract_address_rejects_non_hex() {
+        let bad = "0xZZZZ6BF26964aF9D7eEd9e03E53415D37aA96045";
+        assert!(parse_contract_address("x", bad).is_err());
+    }
+
+    #[test]
+    fn parse_contract_address_error_names_field_and_format() -> anyhow::Result<()> {
+        let lower = GOOD_ADDR.to_lowercase();
+        let Err(err) = parse_contract_address("payment_channel_address", &lower) else {
+            anyhow::bail!("expected parse_contract_address to fail on lowercase input");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("invalid payment_channel_address"),
+            "missing flag name: {msg}"
+        );
+        assert!(msg.contains("EIP-55"), "missing format hint: {msg}");
+        Ok(())
     }
 
     #[test]
