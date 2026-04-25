@@ -828,7 +828,7 @@ mod tests {
     #[test]
     fn parse_contract_address_rejects_bad_checksum() {
         let mut bad = String::from(GOOD_ADDR);
-        // Flip the case of the first hex nibble so the checksum no longer matches.
+        // Flip the case of the first hex digit so the EIP-55 checksum no longer matches.
         bad.replace_range(2..3, "D");
         assert!(parse_contract_address("x", &bad).is_err());
     }
