@@ -152,12 +152,10 @@ impl CacheEngine {
     /// Return a snapshot of all recorded access times. Eviction logic can
     /// sort by value to determine LRU ordering.
     pub fn access_times_snapshot(&self) -> HashMap<Hash, Instant> {
-        self.inner
-            .access_times
-            .lock()
-            .ok()
-            .map(|guard| guard.clone())
-            .unwrap_or_default()
+        let Ok(guard) = self.inner.access_times.lock() else {
+            return HashMap::new();
+        };
+        guard.clone()
     }
 
     /// Record an access for `hash` at the current instant.
