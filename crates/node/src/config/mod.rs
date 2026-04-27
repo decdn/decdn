@@ -280,6 +280,17 @@ pub fn resolve_blockchain(
             )
         })?;
 
+    let parsed = url::Url::parse(&rpc_url).context("blockchain.rpc_url is not a valid URL")?;
+    anyhow::ensure!(
+        parsed.scheme() == "http" || parsed.scheme() == "https",
+        "blockchain.rpc_url must use http or https scheme (got {:?})",
+        parsed.scheme()
+    );
+    // Store the normalized form (lowercase scheme, trailing slash, etc.).
+    // Userinfo (basic auth) is preserved by url::Url::to_string and we
+    // depend on that for RPC providers that require it.
+    let rpc_url = parsed.to_string();
+
     let eth_keystore = cli
         .eth_keystore
         .clone()

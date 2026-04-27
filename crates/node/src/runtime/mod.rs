@@ -34,6 +34,11 @@ const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(15);
 /// server and gossip tasks, and run until a shutdown signal is received.
 #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
+    // Preflight: verify RPC endpoint is reachable before committing to
+    // port binding. A 5-second timeout keeps startup responsive on flaky
+    // networks while still catching typos and dead endpoints early.
+    check_rpc_reachability(&cfg.blockchain.rpc_url).await?;
+
     let node_metrics = Arc::new(metrics::Metrics::new());
     node_metrics.started();
 
@@ -370,6 +375,43 @@ async fn shutdown_signal() -> ShutdownSignal {
         let _ = tokio::signal::ctrl_c().await;
         ShutdownSignal::Sigint
     }
+}
+
+/// Verify that the JSON-RPC endpoint is reachable by sending a lightweight
+/// `net_version` request with a short timeout. Logs a warning and returns an
+/// error if the endpoint does not respond, letting operators catch typos and
+/// dead endpoints before the node binds ports and joins the gossip network.
+async fn check_rpc_reachability(rpc_url: &str) -> anyhow::Result<()> {
+    use std::time::Duration;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .context("failed to build HTTP client for RPC check")?;
+
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "net_version",
+        "params": [],
+        "id": 1
+    });
+
+    let resp = client
+        .post(rpc_url)
+        .json(&body)
+        .send()
+        .await
+        .context("blockchain.rpc_url is not reachable (timeout or connection refused)")?;
+
+    anyhow::ensure!(
+        resp.status().is_success(),
+        "blockchain.rpc_url returned unexpected status {}; \
+         verify the endpoint is a valid JSON-RPC server",
+        resp.status()
+    );
+
+    tracing::info!("RPC endpoint reachable");
+    Ok(())
 }
 
 #[cfg(test)]
