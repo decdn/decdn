@@ -151,9 +151,9 @@ async fn verify_binding_signature(
 
 **Caching:** Nodes SHOULD cache the result of `get_code_at` for known client addresses to avoid repeated RPC calls. The code at an address does not change after deployment (ignoring `SELFDESTRUCT`, which is deprecated and irrelevant for Safe wallets).
 
-### 5. Safe Infrastructure on Arbitrum Sepolia
+### 5. Safe Infrastructure on the Canonical Testnet
 
-The following Safe infrastructure is already deployed on Arbitrum Sepolia:
+The following Safe infrastructure is already deployed on the testnet sibling of the canonical L2 (Arbitrum Sepolia, per [ADR 021](021-l2-chain-selection.md)):
 
 | Contract | Status | Notes |
 | --- | --- | --- |

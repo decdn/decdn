@@ -33,7 +33,7 @@ Key parameters:
 
 ### Deposit Economics
 
-Opening, closing, and settling a channel requires three on-chain transactions totalling ~$0.23 on Arbitrum L2 (see [ADR 004](004-tokenomics.md) gas breakdown: `openChannel` ~$0.05, `closeChannel` ~$0.10, `settleChannel` ~$0.08). This estimate assumes an existing ERC-20 approval; first-time users incur an additional one-time `approve` transaction (~$0.03), bringing the true first-channel cost to ~$0.26. The table below uses the $0.23 lifecycle cost (excluding the one-time approval) as a percentage of various deposit sizes, with the optional watchtower minimum fee from [ADR 007](007-watchtower.md) modeled as a single 30-day monitoring period:
+Opening, closing, and settling a channel requires three on-chain transactions totalling ~$0.23 on the canonical L2 (see [ADR 021](021-l2-chain-selection.md) for the selected chain and [ADR 004](004-tokenomics.md) gas breakdown: `openChannel` ~$0.05, `closeChannel` ~$0.10, `settleChannel` ~$0.08). This estimate assumes an existing ERC-20 approval; first-time users incur an additional one-time `approve` transaction (~$0.03), bringing the true first-channel cost to ~$0.26. The table below uses the $0.23 lifecycle cost (excluding the one-time approval) as a percentage of various deposit sizes, with the optional watchtower minimum fee from [ADR 007](007-watchtower.md) modeled as a single 30-day monitoring period:
 
 | Deposit | Lifecycle gas ($0.23) | Gas % of deposit | + Watchtower ($0.50 / 30 days, optional) | Total overhead % (1 monitoring period) |
 |---------|----------------------|------------------|------------------------------------------|----------------------------------------|
@@ -51,7 +51,7 @@ Opening, closing, and settling a channel requires three on-chain transactions to
 
 All deCDN contracts use OpenZeppelin `SignatureChecker` for signature verification, supporting both EOA (via `ecrecover`) and smart account wallets (via ERC-1271 `isValidSignature`) from the PoC. Safe smart wallets are the recommended wallet type for both node operators and clients — see [ADR 024](024-account-abstraction.md).
 
-Two standards can further eliminate the requirement for clients to hold native L2 tokens (ETH on Arbitrum) for gas:
+Two standards can further eliminate the requirement for clients to hold the canonical L2's native gas token:
 
 - **ERC-2771 meta-transactions.** A relayer submits the `openChannel` transaction on behalf of the client, paying gas. The client signs an ERC-2771 forwarding request; the relayer recoups gas from the deposit or a separate sponsorship fund. Requires adding a trusted-forwarder check to the contract.
 - **ERC-4337 account abstraction.** Smart contract wallets batch USDC approval + channel open into a single user operation. A paymaster can sponsor gas in USDC rather than ETH. Works with unmodified contracts — no changes to `StablePaymentChannel` needed.
@@ -547,7 +547,7 @@ constructor() {
 }
 ```
 
-The domain separator binds every voucher to a specific contract deployment on a specific chain. A voucher signed for Arbitrum Sepolia cannot be replayed on mainnet, and a voucher signed for one `StablePaymentChannel` deployment cannot be replayed against an upgraded or redeployed contract at a different address.
+The domain separator binds every voucher to a specific contract deployment on a specific chain. A voucher signed for the testnet cannot be replayed on mainnet, and a voucher signed for one `StablePaymentChannel` deployment cannot be replayed against an upgraded or redeployed contract at a different address.
 
 **Voucher type:**
 

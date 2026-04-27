@@ -180,6 +180,10 @@ This ADR resolves the deferral in ADR 004 and formalises implicit assumptions in
 | Balancer V3 Router | `0xEAedc32a51c510d35ebC11088fD5fF2b47aACF2E` | Balancer deployments registry (`Router v2`) |
 | Sequencer forced-inclusion delay | ~24 h | Arbitrum delayed inbox |
 | L1 finality window | ~7 days | Nitro fraud-proof window |
+| Block time | ~250 ms | Arbitrum Nitro |
+| RIP-7212 Ed25519 precompile | Not deployed | Verified 2026-04 against both Arbitrum One and Sepolia |
+| Testnet sibling | Arbitrum Sepolia | Used for PoC; same Nitro architecture and tooling |
+| Reference gas price (early 2026) | ~$0.05/tx for ~150k gas | Used to ground gas-cost estimates in ADR 003, ADR 004, ADR 014 |
 
 > **Address verification.** Contract addresses MUST be re-confirmed against the
 > Arbitrum One deployment registry and Arbiscan at deployment time. The Balancer V3

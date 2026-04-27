@@ -62,9 +62,9 @@ Before any on-chain or protocol activity:
    sufficient funds:
    - **TOKEN:** at minimum 1,000 TOKEN for the minimum stake deposit.
      ([ADR 004](004-tokenomics.md#staking-parameters)).
-   - **ETH (for gas):** approximately $0.50–$1.00 for the Phase 2 transactions on
-     Arbitrum Sepolia / Arbitrum One at typical gas prices. See
-     [ADR 004 § Gas Cost Breakdown](004-tokenomics.md#gas-cost-breakdown-arbitrum).
+   - **Native gas token:** approximately $0.50–$1.00 for the Phase 2 transactions on
+     the canonical L2 (per [ADR 021](021-l2-chain-selection.md)) at typical gas prices.
+     See [ADR 004 § Gas Cost Breakdown](004-tokenomics.md#gas-cost-breakdown).
    - **Optional USDC:** only required if the operator intends to open outbound payment
      channels immediately (e.g., to pay origin-backed nodes for cache-miss pulls). Clients
      will open inbound channels to the node without any USDC on the node side.
@@ -149,7 +149,8 @@ prints the required parameters, signs locally, and submits the transaction).
 this is a one-time cost per node lifetime).
 
 **Emitted events:** `NodeRegistered`, `NodeIdBound` — off-chain indexers and other nodes'
-registry caches will reflect the new node within one block (~250 ms on Arbitrum Sepolia).
+registry caches will reflect the new node within one block (~250 ms on the canonical L2;
+see [ADR 021](021-l2-chain-selection.md)).
 
 ---
 
@@ -365,9 +366,10 @@ after re-registration to associate the new `nodeId` with the same `ethAddress` �
 **Negative:**
 
 - Phase 2 requires three on-chain transactions (`approve`, `stake`, `registerNode`),
-  which must be submitted in order and confirmed before the node can start. On Arbitrum
-  Sepolia, confirmation is fast (~250 ms/block), but the operator tooling must handle
-  nonce management across these transactions.
+  which must be submitted in order and confirmed before the node can start. On the
+  canonical L2 (per [ADR 021](021-l2-chain-selection.md)), confirmation is fast
+  (~250 ms/block), but the operator tooling must handle nonce management across these
+  transactions.
 - Multiaddr registration before iroh is started requires either a static IP/port
   (suitable for most VPS deployments) or a two-step workflow (start node, observe
   addresses, then register or update).

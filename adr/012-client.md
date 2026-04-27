@@ -269,7 +269,7 @@ decdn pull <hash> --max-channels <N> -o <output>
 
 ### Economic threshold
 
-Opening, closing, and settling a payment channel costs ~$0.23 on Arbitrum L2 ([ADR 003](003-payments.md)). For N nodes that is N × $0.23 in fixed overhead before a byte is delivered. At $0.01/GB, the fixed overhead of parallelism is significant; it is recommended only for large blobs (e.g., > 10 GiB) to amortize the per-channel cost. The `--min-blob-size` flag (default: 10 GiB) disables parallelism for smaller blobs.
+Opening, closing, and settling a payment channel costs ~$0.23 on the canonical L2 ([ADR 021](021-l2-chain-selection.md), [ADR 003](003-payments.md)). For N nodes that is N × $0.23 in fixed overhead before a byte is delivered. At $0.01/GB, the fixed overhead of parallelism is significant; it is recommended only for large blobs (e.g., > 10 GiB) to amortize the per-channel cost. The `--min-blob-size` flag (default: 10 GiB) disables parallelism for smaller blobs.
 
 ### Range assignment
 
