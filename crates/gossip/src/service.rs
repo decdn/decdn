@@ -208,6 +208,9 @@ fn subscriber_task(
                     }
                 };
                 metrics.inc_received(&topic_name);
+                // Snapshot the clock once so validation and peer-table insert
+                // share the same timestamp (avoids a race if the system clock
+                // moves between the two reads) and halves the syscall cost.
                 let now = now_us();
                 match validate_envelope(&msg.content, now, allowlist.as_ref()) {
                     Ok(announce) => {
@@ -218,6 +221,10 @@ fn subscriber_task(
                                     i64::try_from(table.len()).unwrap_or(i64::MAX),
                                 );
                             }
+                            // Exhaustive match on the typed error: adding a new
+                            // `PeerTable` failure mode is a compile error here,
+                            // so a future variant can't be silently mislabeled as
+                            // `stale_timestamp`.
                             Err(crate::StaleTimestamp { .. }) => {
                                 metrics.inc_rejected(AnnounceReject::StaleTimestamp.label());
                             }
@@ -227,28 +234,28 @@ fn subscriber_task(
                 }
             }
 
-            // Stream terminated — attempt reconnection with exponential backoff.
-            tracing::warn!(
-                topic = %topic_name,
-                backoff_ms = backoff.as_millis(),
-                "gossip subscription stream ended; reconnecting"
-            );
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(RECONNECT_MAX_BACKOFF);
+            // Stream terminated — enter reconnection loop.
+            tracing::warn!(topic = %topic_name, "gossip subscription stream ended; reconnecting");
 
-            match gossip.subscribe(topic_id, Vec::new()).await {
-                Ok(topic) => {
-                    let (_sender, new_receiver) = topic.split();
-                    receiver = new_receiver;
-                    metrics.inc_reconnected(&topic_name);
-                    tracing::info!(topic = %topic_name, "gossip subscription reconnected");
-                }
-                Err(err) => {
-                    tracing::error!(
-                        %err,
-                        topic = %topic_name,
-                        "gossip resubscribe failed; will retry"
-                    );
+            loop {
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(RECONNECT_MAX_BACKOFF);
+
+                match gossip.subscribe(topic_id, Vec::new()).await {
+                    Ok(topic) => {
+                        let (_sender, new_receiver) = topic.split();
+                        receiver = new_receiver;
+                        metrics.inc_reconnected(&topic_name);
+                        tracing::info!(topic = %topic_name, "gossip subscription reconnected");
+                        break; // Exit reconnection loop, back to event processing.
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            %err,
+                            topic = %topic_name,
+                            "gossip resubscribe failed; will retry"
+                        );
+                    }
                 }
             }
         }
