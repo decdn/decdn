@@ -167,11 +167,11 @@ The cross-contract call table above covers contract-to-contract interactions onl
 
 **Liveness caveat:** the registry is a cold-start *seed list*, not a liveness oracle. The chain has no liveness signal, so returned operators include staked-but-offline nodes. Clients filter to live peers via gossip (`NodeAnnounce` TTL) and probe RTT after bootstrap.
 
-##### Proposed: Settlement-Weighted Bootstrap Ranking
+##### Settlement-Weighted Bootstrap Ranking
 
-For a paid CDN, we have an on-chain signal stronger than registration order: **settlement activity**. Every `closeChannel` / `settleChannel` is on-chain proof that the operator served bytes to a paying client — backward-looking, expensive to fake (real counterparty paying real USDC), and already going on-chain via `StablePaymentChannel`. Surfacing it lets clients bias bootstrap toward proven deliverers; staked-but-dead nodes sink to the bottom but remain reachable.
+For a paid CDN, the registry exposes an on-chain signal stronger than registration order: **settlement activity**. Every `closeChannel` / `settleChannel` is on-chain proof that the operator served bytes to a paying client — backward-looking, expensive to fake (real counterparty paying real USDC), and already going on-chain via `StablePaymentChannel`. Clients use it to bias bootstrap toward proven deliverers; staked-but-dead nodes sink to the bottom but remain reachable.
 
-Sketch of the contract surface (open for review — see [#332](https://github.com/decdn/decdn/issues/332) for discussion):
+Contract surface:
 
 | Element | Purpose |
 | --- | --- |
