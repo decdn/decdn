@@ -404,7 +404,7 @@ async fn check_rpc_reachability(rpc_url: &str) -> anyhow::Result<()> {
         .context("blockchain.rpc_url is not reachable (timeout or connection refused)")?;
 
     anyhow::ensure!(
-        resp.status().is_success() || resp.status().as_u16() == 405,
+        resp.status().is_success(),
         "blockchain.rpc_url returned unexpected status {}; \
          verify the endpoint is a valid JSON-RPC server",
         resp.status()

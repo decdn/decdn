@@ -286,8 +286,9 @@ pub fn resolve_blockchain(
         "blockchain.rpc_url must use http or https scheme (got {:?})",
         parsed.scheme()
     );
-    // Store the normalized form (lowercase scheme, trailing slash, etc.)
-    // and avoid carrying the raw input which may contain credentials.
+    // Store the normalized form (lowercase scheme, trailing slash, etc.).
+    // Userinfo (basic auth) is preserved by url::Url::to_string and we
+    // depend on that for RPC providers that require it.
     let rpc_url = parsed.to_string();
 
     let eth_keystore = cli
