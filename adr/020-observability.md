@@ -137,6 +137,7 @@ for any of these requires immediate operator attention.
 | `decdn_peer_table_size` | Gauge | M | — | Number of distinct peers in the local peer table. |
 | `decdn_gossip_announces_sent_total` | Counter | R | — | `NodeAnnounce` messages published. |
 | `decdn_gossip_announces_received_total` | Counter | R | — | `NodeAnnounce` messages accepted (passed validation). |
+| `decdn_gossip_subscriber_reconnections_total` | Counter | R | — | Successful subscriber reconnections after a gossip stream drop. |
 
 ---
 
