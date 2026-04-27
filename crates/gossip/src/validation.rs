@@ -89,15 +89,21 @@ pub fn validate_envelope<S: std::hash::BuildHasher>(
     now_us: u64,
     allowlist: &HashSet<[u8; 32], S>,
 ) -> Result<NodeAnnounce, AnnounceReject> {
+    // Check the version byte *before* deserializing the payload. Postcard
+    // encodes a u8 as a single byte, so the first byte is always the
+    // envelope version. This ensures unknown versions produce
+    // `UnknownVersion` (silent drop per ADR 013) rather than `DecodeFailed`
+    // when a future v2 payload schema is incompatible with our types.
+    let version = bytes.first().ok_or(AnnounceReject::DecodeFailed)?;
+    if *version != GOSSIP_VERSION {
+        return Err(AnnounceReject::UnknownVersion);
+    }
+
     // ADR 013: trailing bytes are tolerated so future unsigned extensions on
     // the envelope don't break old decoders. Use `take_from_bytes` and drop
     // the remainder rather than `from_bytes`, which errors on trailing input.
     let (env, _rest): (GossipEnvelope, &[u8]) =
         postcard::take_from_bytes(bytes).map_err(|_| AnnounceReject::DecodeFailed)?;
-
-    if env.version != GOSSIP_VERSION {
-        return Err(AnnounceReject::UnknownVersion);
-    }
 
     // Only one variant today; future variants will need their own handling.
     #[allow(irrefutable_let_patterns)]
@@ -408,8 +414,15 @@ mod tests {
     #[test]
     fn garbage_bytes_rejected() {
         let allow = no_list();
+        // First byte 0xFF != GOSSIP_VERSION, so the version-first check
+        // rejects before attempting deserialization.
         assert_eq!(
             validate_envelope(&[0xFFu8, 0xFF], 1_700_000_000_000_000, &allow),
+            Err(AnnounceReject::UnknownVersion)
+        );
+        // Empty input has no version byte at all → DecodeFailed.
+        assert_eq!(
+            validate_envelope(&[], 1_700_000_000_000_000, &allow),
             Err(AnnounceReject::DecodeFailed)
         );
     }
