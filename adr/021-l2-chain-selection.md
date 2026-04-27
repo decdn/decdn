@@ -183,7 +183,7 @@ This ADR resolves the deferral in ADR 004 and formalises implicit assumptions in
 | Block time | ~250 ms | Arbitrum Nitro |
 | RIP-7212 Ed25519 precompile | Not deployed | Verified 2026-04 against both Arbitrum One and Sepolia |
 | Testnet sibling | Arbitrum Sepolia | Used for PoC; same Nitro architecture and tooling |
-| Reference gas price (early 2026) | ~$0.05/tx for ~150k gas | Used to ground gas-cost estimates in ADR 003, ADR 004, ADR 014 |
+| Reference gas price (early 2026) | ~$0.50 per 1M gas | Underlying rate behind the per-operation costs tabulated in [ADR 004 § Gas Cost Breakdown](004-tokenomics.md#gas-cost-breakdown); ADR 003 and ADR 014 derive their estimates from the same rate |
 
 > **Address verification.** Contract addresses MUST be re-confirmed against the
 > Arbitrum One deployment registry and Arbiscan at deployment time. The Balancer V3
