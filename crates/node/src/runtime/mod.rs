@@ -281,6 +281,9 @@ impl GossipMetrics for NodeGossipMetrics {
     fn set_peer_table_size(&self, n: i64) {
         self.metrics.gossip_peer_table_size(n);
     }
+    fn inc_reconnected(&self, topic: &str) {
+        self.metrics.gossip_reconnected(topic);
+    }
 }
 
 /// Log a `JoinError` from a shutdown-drained task with a phase label.
