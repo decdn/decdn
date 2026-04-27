@@ -33,6 +33,9 @@ const DEFAULT_MAX_BLOB_SIZE_MB: u64 = 1_024;
 const DEFAULT_RATE_PER_MB: u64 = 10;
 /// Default Prometheus metrics port.
 const DEFAULT_METRICS_PORT: u16 = 9090;
+/// Default metrics bind address (loopback). Operators in containerised
+/// deployments override to `0.0.0.0` via CLI/env/config.
+const DEFAULT_METRICS_BIND: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
 /// Default loopback admin HTTP port (ADR 025). Exposed to the rest of
 /// the `node` crate so `decdn node <sub>` clients can fall back to the
 /// same default the server binds on, without duplicating the number.
@@ -477,7 +480,7 @@ fn resolve_observability(
     let metrics_bind = cli
         .metrics_bind
         .or_else(|| file.and_then(|o| o.metrics_bind))
-        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        .unwrap_or(DEFAULT_METRICS_BIND);
 
     let admin_port_raw = cli
         .admin_port
@@ -1521,7 +1524,7 @@ mod tests {
             log_level: crate::cli::common::LogLevel::default(),
             log_format: crate::cli::common::LogFormat::default(),
             metrics_port: port,
-            metrics_bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            metrics_bind: DEFAULT_METRICS_BIND,
             admin_port: None,
             otlp_endpoint: None,
         }
@@ -1532,7 +1535,7 @@ mod tests {
             log_level: crate::cli::common::LogLevel::default(),
             log_format: crate::cli::common::LogFormat::default(),
             metrics_port: metrics,
-            metrics_bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            metrics_bind: DEFAULT_METRICS_BIND,
             admin_port: Some(admin),
             otlp_endpoint: None,
         }
