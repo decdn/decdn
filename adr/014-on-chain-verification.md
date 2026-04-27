@@ -16,7 +16,7 @@ A fifth offense, **double settlement** (submitting the same voucher to multiple 
 
 Three of these (phantom, rate, blacklist) require verifying cryptographic signatures from protocol messages. The fourth (corruption) requires adjudicating whether delivered bytes match the claimed BLAKE3 hash. Neither Ed25519 signature verification nor BLAKE3 mismatch adjudication is natively supported on EVM:
 
-- **Ed25519 signatures** (iroh NodeId keys, used for `ProbeResponse` and `StreamResponse` per [ADR 005](005-protocol.md)) have no EVM precompile. Solidity-based verification costs ~500k–1M gas per signature — economically unviable for routine slashing on Arbitrum.
+- **Ed25519 signatures** (iroh NodeId keys, used for `ProbeResponse` and `StreamResponse` per [ADR 005](005-protocol.md)) have no EVM precompile. Solidity-based verification costs ~500k–1M gas per signature — economically unviable for routine slashing.
 - **BLAKE3 hashes** have no EVM opcode. Submitting full blob data on-chain to prove a mismatch is gas-prohibitive for any non-trivial blob size. The PoC therefore uses an optimistic bond + counter-evidence scheme rather than cryptographic mismatch proof; a production Merkle proof design is specified but deferred.
 
 This ADR specifies concrete on-chain mechanisms for both: `ecrecover`-based signature verification for the three signature-dependent offenses, and an optimistic challenge-response for corruption — enabling all four slash evidence paths for the PoC.
@@ -97,7 +97,7 @@ The Ed25519 signature remains the primary authentication mechanism for the QUIC 
 
 | Approach | Gas Cost | PoC Suitability | Why Not |
 | --- | --- | --- | --- |
-| RIP-7212 Ed25519 precompile | ~3,000 | Not available | Not deployed on Arbitrum Sepolia or One as of 2026-04 |
+| RIP-7212 Ed25519 precompile | ~3,000 | Not available | Not yet deployed on the production L2 as of 2026-04 (see [ADR 021](021-l2-chain-selection.md)) |
 | Solidity Ed25519 library (e.g., `ed25519-sol`) | ~500k–1M | Too expensive | A single slash verification would cost $0.25–$0.50; two-signature offenses double that |
 | ZK proof of Ed25519 signature | ~300k verify | Too complex | Requires a proving circuit, prover infrastructure, and proof generation latency |
 | Optimistic (no signature verification) | ~50k | Insufficient security | A node could deny authorship of any message; counter-evidence alone is not enough |
@@ -316,7 +316,7 @@ See [ADR 005, Gossip — rate change announcements](005-protocol.md#gossip--rate
 | `counterChallenge` (corruption) | ~40k | Evidence verification + storage update |
 | `resolveChallenge` | ~80k | `StakingRegistry.slash()` + bond transfer + state cleanup |
 
-These estimates replace the `submitFraudProof()` placeholder (~250k gas) in [ADR 004](004-tokenomics.md#gas-cost-breakdown-arbitrum). The dual-key approach reduces per-signature verification from ~500k (Ed25519 library) to ~3k (`ecrecover`), making routine slashing economically viable.
+These estimates replace the `submitFraudProof()` placeholder (~250k gas) in [ADR 004](004-tokenomics.md#gas-cost-breakdown). The dual-key approach reduces per-signature verification from ~500k (Ed25519 library) to ~3k (`ecrecover`), making routine slashing economically viable.
 
 ### 4. Integration with Existing Contracts
 
