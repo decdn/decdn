@@ -110,6 +110,9 @@ pub struct ObservabilityConfig {
     pub log_format: Option<LogFormat>,
     /// Prometheus metrics HTTP port.
     pub metrics_port: Option<u16>,
+    /// IP address to bind the metrics HTTP server on. Defaults to
+    /// `127.0.0.1`. Set to `0.0.0.0` for containerised deployments.
+    pub metrics_bind: Option<std::net::IpAddr>,
     /// Loopback admin HTTP port (ADR 025). Explicit `0` disables the
     /// admin server; if the key is absent, resolution defaults to
     /// `9191`. Any positive value binds on `127.0.0.1:<port>`.

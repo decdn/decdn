@@ -94,6 +94,8 @@ pub struct ResolvedObservability {
     pub log_format: LogFormat,
     /// Prometheus metrics HTTP port.
     pub metrics_port: u16,
+    /// IP address to bind the metrics HTTP server on.
+    pub metrics_bind: std::net::IpAddr,
     /// Loopback admin HTTP port (ADR 025). `None` disables the admin
     /// server entirely; `Some(port)` binds on `127.0.0.1:<port>`.
     pub admin_port: Option<u16>,

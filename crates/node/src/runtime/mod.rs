@@ -68,10 +68,10 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
         .accept(GOSSIP_ALPN, gossip.clone())
         .spawn();
 
-    // Bind metrics to loopback: /metrics is unauthenticated HTTP and leaks
-    // operational data. Operators who want to scrape from another host should
-    // front it with a reverse proxy.
-    let metrics_addr = std::net::SocketAddr::from(([127, 0, 0, 1], cfg.observability.metrics_port));
+    let metrics_addr = std::net::SocketAddr::new(
+        cfg.observability.metrics_bind,
+        cfg.observability.metrics_port,
+    );
     let metrics_listener = metrics::bind(metrics_addr)
         .await
         .context("failed to bind metrics listener")?;
@@ -149,7 +149,7 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
         version = env!("CARGO_PKG_VERSION"),
         region = cfg.identity.region.as_deref().unwrap_or(""),
         bind_port = cfg.network.bind_port,
-        metrics_port = cfg.observability.metrics_port,
+        metrics_addr = %metrics_addr,
         admin_port = ?cfg.observability.admin_port,
         rate_per_mb = cfg.payment.rate_per_mb,
         cache_dir = %cfg.cache.cache_dir.display(),

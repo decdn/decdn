@@ -474,6 +474,11 @@ fn resolve_observability(
         .or_else(|| file.and_then(|o| o.metrics_port))
         .unwrap_or(DEFAULT_METRICS_PORT);
 
+    let metrics_bind = cli
+        .metrics_bind
+        .or_else(|| file.and_then(|o| o.metrics_bind))
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+
     let admin_port_raw = cli
         .admin_port
         .or_else(|| file.and_then(|o| o.admin_port))
@@ -493,6 +498,7 @@ fn resolve_observability(
         log_level,
         log_format,
         metrics_port,
+        metrics_bind,
         admin_port,
         otlp_endpoint,
     }
@@ -1210,6 +1216,7 @@ mod tests {
                     log_level: None,
                     log_format: None,
                     metrics_port: None,
+                    metrics_bind: None,
                     admin_port: None,
                     otlp_endpoint: Some(v.to_string()),
                 });
@@ -1496,6 +1503,7 @@ mod tests {
             log_level: None,
             log_format: None,
             metrics_port,
+            metrics_bind: None,
             admin_port,
             otlp_endpoint: None,
         }
@@ -1513,6 +1521,7 @@ mod tests {
             log_level: crate::cli::common::LogLevel::default(),
             log_format: crate::cli::common::LogFormat::default(),
             metrics_port: port,
+            metrics_bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             admin_port: None,
             otlp_endpoint: None,
         }
@@ -1523,6 +1532,7 @@ mod tests {
             log_level: crate::cli::common::LogLevel::default(),
             log_format: crate::cli::common::LogFormat::default(),
             metrics_port: metrics,
+            metrics_bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             admin_port: Some(admin),
             otlp_endpoint: None,
         }
@@ -1659,6 +1669,54 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn resolve_observability_metrics_bind_defaults_to_localhost() {
+        let obs = resolve_observability(&obs_cli(None, None), None);
+        assert_eq!(
+            obs.metrics_bind,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        );
+    }
+
+    #[test]
+    fn resolve_observability_metrics_bind_from_cli() {
+        let mut cli = obs_cli(None, None);
+        cli.metrics_bind = Some(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        let obs = resolve_observability(&cli, None);
+        assert_eq!(
+            obs.metrics_bind,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+        );
+    }
+
+    #[test]
+    fn resolve_observability_metrics_bind_from_file() {
+        let file = types::ObservabilityConfig {
+            metrics_bind: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+            ..Default::default()
+        };
+        let obs = resolve_observability(&obs_cli(None, None), Some(&file));
+        assert_eq!(
+            obs.metrics_bind,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+        );
+    }
+
+    #[test]
+    fn resolve_observability_metrics_bind_cli_overrides_file() {
+        let mut cli = obs_cli(None, None);
+        cli.metrics_bind = Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        let file = types::ObservabilityConfig {
+            metrics_bind: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+            ..Default::default()
+        };
+        let obs = resolve_observability(&cli, Some(&file));
+        assert_eq!(
+            obs.metrics_bind,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        );
+    }
+
     // Closes #268. The three-layer merge is CLI/env > TOML file > default;
     // `resolve_*_cli_overrides_file*` tests cover the "Option::Some on
     // RunArgs beats file" leg. The remaining leg — that clap populates
@@ -1703,6 +1761,7 @@ mod tests {
             ("log_level", "DECDN_LOG_LEVEL"),
             ("log_format", "DECDN_LOG_FORMAT"),
             ("metrics_port", "DECDN_METRICS_PORT"),
+            ("metrics_bind", "DECDN_METRICS_BIND"),
             ("admin_port", "DECDN_ADMIN_PORT"),
             ("otlp_endpoint", "DECDN_OTLP_ENDPOINT"),
         ];
