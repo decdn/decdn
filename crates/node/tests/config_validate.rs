@@ -205,6 +205,7 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             log_level: decdn_node::cli::common::LogLevel::Info,
             log_format: decdn_node::cli::LogFormat::Pretty,
             metrics_port: 9090,
+            metrics_bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             admin_port: Some(9191),
             otlp_endpoint: None,
         },

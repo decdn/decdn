@@ -133,6 +133,12 @@ pub struct ObservabilityArgs {
     #[arg(long, value_name = "PORT", env = "DECDN_METRICS_PORT")]
     pub metrics_port: Option<u16>,
 
+    /// IP address to bind the metrics HTTP server on [default: 127.0.0.1].
+    /// Set to 0.0.0.0 for containerised deployments where the Prometheus
+    /// scraper runs on a different host.
+    #[arg(long, value_name = "ADDR", env = "DECDN_METRICS_BIND")]
+    pub metrics_bind: Option<std::net::IpAddr>,
+
     /// Loopback admin HTTP port (ADR 025); `0` disables [default: 9191].
     #[arg(long, value_name = "PORT", env = "DECDN_ADMIN_PORT")]
     pub admin_port: Option<u16>,
