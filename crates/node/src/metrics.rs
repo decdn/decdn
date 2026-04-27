@@ -45,6 +45,8 @@ pub struct DecdnMetrics {
     pub gossip_announces_rejected_total: Counter,
     /// Current peer-table size.
     pub gossip_peer_table_size: Gauge,
+    /// Successful subscriber reconnections after a stream drop.
+    pub gossip_subscriber_reconnections_total: Counter,
 }
 
 /// Aggregated deCDN node metrics.
@@ -121,6 +123,10 @@ impl Metrics {
 
     pub fn gossip_peer_table_size(&self, n: i64) {
         self.decdn.gossip_peer_table_size.set(n);
+    }
+
+    pub fn gossip_reconnected(&self, _topic: &str) {
+        self.decdn.gossip_subscriber_reconnections_total.inc();
     }
 
     /// RAII guard that increments `active_connections` on construction and

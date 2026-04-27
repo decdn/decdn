@@ -85,13 +85,13 @@ impl GossipService {
         // and emit an error log; the topic is then skipped so the caller
         // isn't left with half-wired state.
         let mut senders: Vec<(String, GossipSender)> = Vec::new();
-        let mut receivers: Vec<(String, GossipReceiver)> = Vec::new();
+        let mut receivers: Vec<(String, TopicId, GossipReceiver)> = Vec::new();
         for (topic_name, topic_id) in topics {
             match gossip.subscribe(topic_id, Vec::new()).await {
                 Ok(topic) => {
                     let (sender, receiver) = topic.split();
                     senders.push((topic_name.clone(), sender));
-                    receivers.push((topic_name, receiver));
+                    receivers.push((topic_name, topic_id, receiver));
                 }
                 Err(err) => {
                     metrics.inc_rejected(SUBSCRIBE_FAILED_LABEL);
@@ -111,10 +111,12 @@ impl GossipService {
 
         let mut handles: Vec<JoinHandle<()>> = Vec::new();
 
-        for (topic_name, receiver) in receivers {
+        for (topic_name, tid, receiver) in receivers {
             handles.push(subscriber_task(
                 topic_name,
                 receiver,
+                gossip.clone(),
+                tid,
                 Arc::clone(&allowlist),
                 Arc::clone(&peer_table),
                 Arc::clone(&metrics),
@@ -168,51 +170,86 @@ fn topic_id(name: &str) -> TopicId {
     TopicId::from_bytes(*hash.as_bytes())
 }
 
+/// Maximum backoff between reconnection attempts (60 seconds).
+const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+/// Initial backoff after the first stream drop (1 second).
+const RECONNECT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+
 fn subscriber_task(
     topic_name: String,
-    mut receiver: GossipReceiver,
+    initial_receiver: GossipReceiver,
+    gossip: Gossip,
+    topic_id: TopicId,
     allowlist: Arc<HashSet<[u8; 32]>>,
     peer_table: Arc<RwLock<PeerTable>>,
     metrics: Arc<dyn GossipMetrics>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        while let Some(event) = receiver.next().await {
-            let msg = match event {
-                Ok(iroh_gossip::api::Event::Received(m)) => m,
-                Ok(
-                    iroh_gossip::api::Event::NeighborUp(_)
-                    | iroh_gossip::api::Event::NeighborDown(_)
-                    | iroh_gossip::api::Event::Lagged,
-                ) => continue,
-                Err(err) => {
-                    tracing::debug!(%err, topic = %topic_name, "gossip receive error");
-                    continue;
-                }
-            };
-            metrics.inc_received(&topic_name);
-            // Snapshot the clock once so validation and peer-table insert
-            // share the same timestamp (avoids a race if the system clock
-            // moves between the two reads) and halves the syscall cost.
-            let now = now_us();
-            match validate_envelope(&msg.content, now, allowlist.as_ref()) {
-                Ok(announce) => {
-                    let mut table = peer_table.write().await;
-                    match table.insert_or_refresh(announce, now) {
-                        Ok(InsertOutcome::Inserted | InsertOutcome::Refreshed) => {
-                            metrics.set_peer_table_size(
-                                i64::try_from(table.len()).unwrap_or(i64::MAX),
-                            );
-                        }
-                        // Exhaustive match on the typed error: adding a new
-                        // `PeerTable` failure mode is a compile error here,
-                        // so a future variant can't be silently mislabeled as
-                        // `stale_timestamp`.
-                        Err(crate::StaleTimestamp { .. }) => {
-                            metrics.inc_rejected(AnnounceReject::StaleTimestamp.label());
+        let mut receiver = initial_receiver;
+        let mut backoff = RECONNECT_INITIAL_BACKOFF;
+
+        loop {
+            // Consume events until the stream terminates.
+            while let Some(event) = receiver.next().await {
+                // Reset backoff on any successful receive — the connection is healthy.
+                backoff = RECONNECT_INITIAL_BACKOFF;
+
+                let msg = match event {
+                    Ok(iroh_gossip::api::Event::Received(m)) => m,
+                    Ok(
+                        iroh_gossip::api::Event::NeighborUp(_)
+                        | iroh_gossip::api::Event::NeighborDown(_)
+                        | iroh_gossip::api::Event::Lagged,
+                    ) => continue,
+                    Err(err) => {
+                        tracing::debug!(%err, topic = %topic_name, "gossip receive error");
+                        continue;
+                    }
+                };
+                metrics.inc_received(&topic_name);
+                let now = now_us();
+                match validate_envelope(&msg.content, now, allowlist.as_ref()) {
+                    Ok(announce) => {
+                        let mut table = peer_table.write().await;
+                        match table.insert_or_refresh(announce, now) {
+                            Ok(InsertOutcome::Inserted | InsertOutcome::Refreshed) => {
+                                metrics.set_peer_table_size(
+                                    i64::try_from(table.len()).unwrap_or(i64::MAX),
+                                );
+                            }
+                            Err(crate::StaleTimestamp { .. }) => {
+                                metrics.inc_rejected(AnnounceReject::StaleTimestamp.label());
+                            }
                         }
                     }
+                    Err(reject) => metrics.inc_rejected(reject.label()),
                 }
-                Err(reject) => metrics.inc_rejected(reject.label()),
+            }
+
+            // Stream terminated — attempt reconnection with exponential backoff.
+            tracing::warn!(
+                topic = %topic_name,
+                backoff_ms = backoff.as_millis(),
+                "gossip subscription stream ended; reconnecting"
+            );
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(RECONNECT_MAX_BACKOFF);
+
+            match gossip.subscribe(topic_id, Vec::new()).await {
+                Ok(topic) => {
+                    let (_sender, new_receiver) = topic.split();
+                    receiver = new_receiver;
+                    metrics.inc_reconnected(&topic_name);
+                    tracing::info!(topic = %topic_name, "gossip subscription reconnected");
+                }
+                Err(err) => {
+                    tracing::error!(
+                        %err,
+                        topic = %topic_name,
+                        "gossip resubscribe failed; will retry"
+                    );
+                }
             }
         }
     })

@@ -16,6 +16,8 @@ pub trait GossipMetrics: Send + Sync + 'static {
     fn inc_rejected(&self, reason: &'static str);
     /// Gauge set to the current peer-table size after each mutation.
     fn set_peer_table_size(&self, n: i64);
+    /// Called each time a subscriber successfully reconnects after a stream drop.
+    fn inc_reconnected(&self, topic: &str);
 }
 
 /// A no-op implementation convenient for tests.
@@ -27,4 +29,5 @@ impl GossipMetrics for NoopMetrics {
     fn inc_received(&self, _topic: &str) {}
     fn inc_rejected(&self, _reason: &'static str) {}
     fn set_peer_table_size(&self, _n: i64) {}
+    fn inc_reconnected(&self, _topic: &str) {}
 }
