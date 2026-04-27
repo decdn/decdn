@@ -12,5 +12,9 @@ postcard = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 
+[dev-dependencies]
+proptest = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }
+
 [lints]
 workspace = true
