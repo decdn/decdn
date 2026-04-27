@@ -153,6 +153,20 @@ graph LR
 
 **Note:** No contract calls governance functions on another deCDN contract. Cross-contract state mutations are limited to `ejectNode()` and `slash()`, both protected by dedicated roles.
 
+#### Off-Chain Read API (Client / Node Bootstrap)
+
+The cross-contract call table above covers contract-to-contract interactions only. Off-chain components — clients and nodes — also need a stable set of view functions for cold-start peer discovery and live state inspection. These are specified in detail in the referenced ADRs but were not surfaced here, leaving room for them to be missed during contract scaffolding.
+
+| Caller | Callee | Function | Used by | Reference |
+| --- | --- | --- | --- | --- |
+| Off-chain client/node | StakingRegistry | `getActiveNodeCount() returns (uint256)` | Bootstrap pagination loop | [ADR 001](001-network.md), [ADR 012](012-client.md), [ADR 019](019-node-onboarding.md) |
+| Off-chain client/node | StakingRegistry | `getActiveNodes(uint256 offset, uint256 limit) returns (NodeInfo[])` | Cold-start peer discovery | [ADR 001](001-network.md), [ADR 012](012-client.md), [ADR 019](019-node-onboarding.md) |
+| Off-chain client/node | StakingRegistry | `getFirstRegisteredAt(address) returns (uint256)` | Reputation cold-start bonus window | [ADR 001](001-network.md) |
+
+**Bootstrap pattern** (per [ADR 012 §Bootstrap](012-client.md#bootstrap-procedure)): paginated `getActiveNodes(offset, 100)` calls until a page returns fewer than `limit` results. For PoC scale (tens of nodes) a single call suffices; the pagination contract is preserved so the same code works at production scale.
+
+**Liveness caveat:** the registry is a cold-start *seed list*, not a liveness oracle. Returned operators include staked-but-offline nodes (the chain has no liveness signal). Clients filter to live peers via gossip (`NodeAnnounce` TTL) and probe RTT after bootstrap. See [#332](https://github.com/decdn/decdn/issues/332) for the open discussion on whether to surface settlement-activity as an additional bootstrap-ranking signal.
+
 ### 4. Fund Flow Diagrams
 
 #### USDC Flow (Payments)
