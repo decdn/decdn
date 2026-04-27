@@ -280,13 +280,15 @@ pub fn resolve_blockchain(
             )
         })?;
 
-    let parsed = url::Url::parse(&rpc_url)
-        .with_context(|| format!("blockchain.rpc_url is not a valid URL: {rpc_url:?}"))?;
+    let parsed = url::Url::parse(&rpc_url).context("blockchain.rpc_url is not a valid URL")?;
     anyhow::ensure!(
         parsed.scheme() == "http" || parsed.scheme() == "https",
         "blockchain.rpc_url must use http or https scheme (got {:?})",
         parsed.scheme()
     );
+    // Store the normalized form (lowercase scheme, trailing slash, etc.)
+    // and avoid carrying the raw input which may contain credentials.
+    let rpc_url = parsed.to_string();
 
     let eth_keystore = cli
         .eth_keystore
