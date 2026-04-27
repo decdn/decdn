@@ -68,7 +68,7 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
     )?;
     let cache = resolve_cache(&cli.cache, file.cache.as_ref(), &identity.data_dir)?;
     let payment = resolve_payment(&cli.payment, file.payment.as_ref())?;
-    let observability = resolve_observability(&cli.observability, file.observability.as_ref());
+    let observability = resolve_observability(&cli.observability, file.observability.as_ref())?;
     let gossip = resolve_gossip(file.gossip.as_ref())?;
 
     ensure_region_when_publishing_global(&identity, &gossip)?;
@@ -461,7 +461,7 @@ fn resolve_payment(
 fn resolve_observability(
     cli: &crate::cli::run::ObservabilityArgs,
     file: Option<&types::ObservabilityConfig>,
-) -> ResolvedObservability {
+) -> anyhow::Result<ResolvedObservability> {
     let log_level = cli
         .log_level
         .or_else(|| file.and_then(|o| o.log_level))
@@ -495,16 +495,26 @@ fn resolve_observability(
     let otlp_endpoint = cli
         .otlp_endpoint
         .clone()
-        .or_else(|| file.and_then(|o| o.otlp_endpoint.clone()));
+        .or_else(|| file.and_then(|o| o.otlp_endpoint.clone()))
+        .filter(|s| !s.is_empty());
 
-    ResolvedObservability {
+    if let Some(ref ep) = otlp_endpoint {
+        let lower = ep.to_ascii_lowercase();
+        anyhow::ensure!(
+            lower.starts_with("http://") || lower.starts_with("https://"),
+            "observability.otlp_endpoint must start with http:// or https:// \
+             (got {ep:?}); gRPC/OTLP collectors require an HTTP-scheme URL"
+        );
+    }
+
+    Ok(ResolvedObservability {
         log_level,
         log_format,
         metrics_port,
         metrics_bind,
         admin_port,
         otlp_endpoint,
-    }
+    })
 }
 
 /// Resolve gossip fields. Allowlist entries are parsed as 64-character hex
@@ -1543,7 +1553,7 @@ mod tests {
 
     #[test]
     fn resolve_observability_defaults_admin_port_to_9191() -> anyhow::Result<()> {
-        let obs = resolve_observability(&obs_cli(None, None), None);
+        let obs = resolve_observability(&obs_cli(None, None), None)?;
         anyhow::ensure!(
             obs.admin_port == Some(DEFAULT_ADMIN_PORT),
             "got: {:?}",
@@ -1572,7 +1582,7 @@ mod tests {
 
     #[test]
     fn resolve_observability_admin_port_zero_disables() -> anyhow::Result<()> {
-        let obs = resolve_observability(&obs_cli(None, Some(0)), None);
+        let obs = resolve_observability(&obs_cli(None, Some(0)), None)?;
         anyhow::ensure!(obs.admin_port.is_none(), "got: {:?}", obs.admin_port);
         Ok(())
     }
@@ -1587,7 +1597,7 @@ mod tests {
             admin_port: Some(0),
             ..Default::default()
         };
-        let obs = resolve_observability(&obs_cli(None, None), Some(&file));
+        let obs = resolve_observability(&obs_cli(None, None), Some(&file))?;
         anyhow::ensure!(obs.admin_port.is_none(), "got: {:?}", obs.admin_port);
         Ok(())
     }
@@ -1650,7 +1660,7 @@ mod tests {
             admin_port: Some(1111),
             ..Default::default()
         };
-        let obs = resolve_observability(&obs_cli(None, Some(2222)), Some(&file));
+        let obs = resolve_observability(&obs_cli(None, Some(2222)), Some(&file))?;
         anyhow::ensure!(obs.admin_port == Some(2222), "got: {:?}", obs.admin_port);
         Ok(())
     }
@@ -1673,51 +1683,77 @@ mod tests {
     }
 
     #[test]
-    fn resolve_observability_metrics_bind_defaults_to_localhost() {
-        let obs = resolve_observability(&obs_cli(None, None), None);
+    fn resolve_observability_metrics_bind_defaults_to_localhost() -> anyhow::Result<()> {
+        let obs = resolve_observability(&obs_cli(None, None), None)?;
         assert_eq!(
             obs.metrics_bind,
             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
         );
+        Ok(())
     }
 
     #[test]
-    fn resolve_observability_metrics_bind_from_cli() {
+    fn resolve_observability_metrics_bind_from_cli() -> anyhow::Result<()> {
         let mut cli = obs_cli(None, None);
         cli.metrics_bind = Some(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-        let obs = resolve_observability(&cli, None);
+        let obs = resolve_observability(&cli, None)?;
         assert_eq!(
             obs.metrics_bind,
             std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
         );
+        Ok(())
     }
 
     #[test]
-    fn resolve_observability_metrics_bind_from_file() {
+    fn resolve_observability_metrics_bind_from_file() -> anyhow::Result<()> {
         let file = types::ObservabilityConfig {
             metrics_bind: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
             ..Default::default()
         };
-        let obs = resolve_observability(&obs_cli(None, None), Some(&file));
+        let obs = resolve_observability(&obs_cli(None, None), Some(&file))?;
         assert_eq!(
             obs.metrics_bind,
             std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
         );
+        Ok(())
     }
 
     #[test]
-    fn resolve_observability_metrics_bind_cli_overrides_file() {
+    fn resolve_observability_metrics_bind_cli_overrides_file() -> anyhow::Result<()> {
         let mut cli = obs_cli(None, None);
         cli.metrics_bind = Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
         let file = types::ObservabilityConfig {
             metrics_bind: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
             ..Default::default()
         };
-        let obs = resolve_observability(&cli, Some(&file));
+        let obs = resolve_observability(&cli, Some(&file))?;
         assert_eq!(
             obs.metrics_bind,
             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_observability_rejects_otlp_endpoint_bad_scheme() {
+        let mut cli = obs_cli(None, None);
+        cli.otlp_endpoint = Some("grpc://collector:4317".to_string());
+        let err =
+            resolve_observability(&cli, None).expect_err("non-http scheme should be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("http://") && msg.contains("https://"),
+            "error should mention valid schemes: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_observability_accepts_valid_otlp_endpoint() -> anyhow::Result<()> {
+        let mut cli = obs_cli(None, None);
+        cli.otlp_endpoint = Some("http://collector:4317".to_string());
+        let obs = resolve_observability(&cli, None)?;
+        assert_eq!(obs.otlp_endpoint.as_deref(), Some("http://collector:4317"));
+        Ok(())
     }
 
     // Closes #268. The three-layer merge is CLI/env > TOML file > default;
