@@ -8,6 +8,7 @@ use std::time::Instant;
 use bytes::Bytes;
 use iroh_blobs::Hash;
 use iroh_blobs::store::fs::FsStore;
+use tokio::sync::Notify;
 
 use crate::error::{CacheError, CacheResult};
 use crate::origin::{Origin, OriginFetch};
@@ -28,6 +29,10 @@ struct Inner {
     max_blob_bytes: u64,
     /// Per-hash last-access timestamps for LRU eviction ordering.
     access_times: Mutex<HashMap<Hash, Instant>>,
+    /// In-flight pull-through requests. When a pull is in progress for a hash,
+    /// subsequent callers wait on the [`Notify`] rather than issuing a
+    /// duplicate origin fetch (coalescing, fixes #305).
+    inflight: Mutex<HashMap<Hash, Arc<Notify>>>,
 }
 
 /// Coarse-grained cache statistics.
@@ -41,6 +46,26 @@ pub struct CacheStats {
     pub bytes_stored: u64,
     /// Number of distinct blobs currently in the store.
     pub blob_count: u64,
+}
+
+/// RAII cleanup for an inflight pull-through entry. Removing the entry and
+/// waking waiters in `Drop` keeps the coalescing map consistent even if the
+/// owning task is cancelled (or panics) mid-fetch — without this, a cancelled
+/// pull would leave the entry in place and every subsequent request for the
+/// same hash would block forever on a `Notify` that never fires.
+struct InflightGuard<'a> {
+    hash: Hash,
+    inflight: &'a Mutex<HashMap<Hash, Arc<Notify>>>,
+    notify: &'a Arc<Notify>,
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.inflight.lock() {
+            guard.remove(&self.hash);
+        }
+        self.notify.notify_waiters();
+    }
 }
 
 impl CacheEngine {
@@ -74,6 +99,7 @@ impl CacheEngine {
                 origin,
                 max_blob_bytes,
                 access_times: Mutex::new(HashMap::new()),
+                inflight: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -102,10 +128,50 @@ impl CacheEngine {
     ///   cap tripped in the engine or in the origin, respectively.
     /// - [`CacheError::Store`] — local iroh-blobs store I/O failure.
     pub async fn get(&self, hash: Hash) -> CacheResult<Bytes> {
-        let bytes = if self.has(hash).await? {
-            self.read_local(hash).await?
-        } else {
-            self.pull_through(hash).await?
+        if self.has(hash).await? {
+            self.touch(hash);
+            return self.read_local(hash).await;
+        }
+
+        // Coalesce concurrent pull-through requests for the same hash (#305).
+        // A single lock acquisition atomically checks and inserts to avoid the
+        // race where multiple tasks see an empty map and all proceed to pull.
+        let bytes = loop {
+            let state = self.inner.inflight.lock().ok().map(|mut guard| {
+                if let Some(n) = guard.get(&hash) {
+                    Err(Arc::clone(n))
+                } else {
+                    let n = Arc::new(Notify::new());
+                    guard.insert(hash, Arc::clone(&n));
+                    Ok(n)
+                }
+            });
+
+            match state {
+                // Another task owns the pull — wait, then retry from the top.
+                Some(Err(notify)) => {
+                    notify.notified().await;
+                    if self.has(hash).await? {
+                        break self.read_local(hash).await?;
+                    }
+                    // First attempt failed — loop back and either wait on a
+                    // new owner or become the owner ourselves.
+                }
+                // We are the owner — perform the pull. The guard's Drop impl
+                // removes the inflight entry and wakes waiters even if this
+                // task is cancelled mid-await, preventing the leak that would
+                // otherwise hang every future request for `hash`.
+                Some(Ok(notify)) => {
+                    let _guard = InflightGuard {
+                        hash,
+                        inflight: &self.inner.inflight,
+                        notify: &notify,
+                    };
+                    break self.pull_through(hash).await?;
+                }
+                // Mutex poisoned — fall through to a direct pull.
+                None => break self.pull_through(hash).await?,
+            }
         };
         self.touch(hash);
         Ok(bytes)
@@ -267,6 +333,7 @@ mod tests {
     use super::*;
     use std::future::Future;
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::origin::{Origin, OriginFetch};
 
@@ -406,6 +473,130 @@ mod tests {
         anyhow::ensure!(
             engine.last_accessed(unknown).is_none(),
             "expected None for a hash that was never accessed"
+        );
+        Ok(())
+    }
+
+    /// An origin that sleeps before returning, counting how many times
+    /// `fetch` was invoked. Used to verify coalescing of concurrent pulls.
+    #[derive(Debug)]
+    struct SlowCountingOrigin {
+        data: Bytes,
+        hash: Hash,
+        fetch_count: AtomicUsize,
+        delay: std::time::Duration,
+    }
+
+    impl SlowCountingOrigin {
+        fn new(payload: &[u8], delay: std::time::Duration) -> Self {
+            Self {
+                hash: Hash::new(payload),
+                data: Bytes::from(payload.to_vec()),
+                fetch_count: AtomicUsize::new(0),
+                delay,
+            }
+        }
+    }
+
+    impl Origin for SlowCountingOrigin {
+        fn fetch(
+            &self,
+            hash: Hash,
+            _max_bytes: u64,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<OriginFetch>> + Send + '_>> {
+            self.fetch_count.fetch_add(1, Ordering::SeqCst);
+            let result = if hash == self.hash {
+                Ok(OriginFetch::Found(self.data.clone()))
+            } else {
+                Ok(OriginFetch::NotFound)
+            };
+            let delay = self.delay;
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                result
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_gets_coalesce_into_single_origin_fetch() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"coalesce me";
+        let hash = Hash::new(payload);
+        let origin = Arc::new(SlowCountingOrigin::new(
+            payload,
+            std::time::Duration::from_millis(50),
+        ));
+
+        let engine =
+            CacheEngine::open(tmp.path(), Some(origin.clone() as Arc<dyn Origin>), 10).await?;
+
+        // Spawn several concurrent gets for the same hash.
+        let mut handles = Vec::new();
+        for _ in 0..5 {
+            let e = engine.clone();
+            handles.push(tokio::spawn(async move { e.get(hash).await }));
+        }
+
+        // Await all — they should all succeed.
+        for handle in handles {
+            let result = handle
+                .await
+                .map_err(|e| anyhow::anyhow!("task join: {e}"))?;
+            anyhow::ensure!(result.is_ok(), "expected Ok, got {result:?}");
+        }
+
+        // The origin should have been called at most once (coalesced).
+        let count = origin.fetch_count.load(Ordering::SeqCst);
+        anyhow::ensure!(count == 1, "expected exactly 1 origin fetch, got {count}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn inflight_map_is_empty_after_pull_completes() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"cleanup check";
+        let hash = Hash::new(payload);
+        let origin = StubOrigin::new(payload);
+
+        let engine = CacheEngine::open(tmp.path(), Some(Arc::new(origin)), 10).await?;
+
+        let _ = engine.get(hash).await?;
+
+        let inflight_len = engine.inner.inflight.lock().ok().map_or(0, |g| g.len());
+        anyhow::ensure!(
+            inflight_len == 0,
+            "inflight map should be empty after pull, had {inflight_len} entries"
+        );
+        Ok(())
+    }
+
+    /// Cancelling the owner mid-pull must not leave the inflight entry
+    /// orphaned — otherwise every subsequent `get()` for the same hash hangs
+    /// on a `Notify` that never fires. The `InflightGuard`'s `Drop` impl
+    /// wakes waiters and clears the entry even on cancellation.
+    #[tokio::test]
+    async fn cancelled_owner_does_not_orphan_inflight_entry() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"cancel test";
+        let hash = Hash::new(payload);
+        let origin = SlowCountingOrigin::new(payload, std::time::Duration::from_secs(10));
+
+        let engine = CacheEngine::open(tmp.path(), Some(Arc::new(origin)), 10).await?;
+
+        // Spawn the owner with a tiny timeout so it gets cancelled mid-pull.
+        let owner_engine = engine.clone();
+        let owner = tokio::spawn(async move {
+            tokio::time::timeout(std::time::Duration::from_millis(50), owner_engine.get(hash)).await
+        });
+        // Wait for the owner task to finish (timeout fires → future dropped).
+        let _ = owner.await?;
+
+        // The inflight map must be empty — InflightGuard::drop ran on cancel.
+        let inflight_len = engine.inner.inflight.lock().ok().map_or(0, |g| g.len());
+        anyhow::ensure!(
+            inflight_len == 0,
+            "inflight map should be empty after cancellation, had {inflight_len} entries"
         );
         Ok(())
     }
