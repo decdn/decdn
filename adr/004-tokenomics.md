@@ -297,7 +297,7 @@ At a TOKEN price of $0.01 (conservative early production), the 200M TOKEN bootst
 
 Payment channels amortize gas effectively. A channel open for 30 sessions costs $0.23 total (open + close + settle) = ~$0.008 per session. `settleChannel` is callable by any address, so settlement bots or the counterparty can trigger it.
 
-Estimates assume the canonical L2's average gas price as of early 2026 (see [ADR 021](021-l2-chain-selection.md) for the selected chain). Actual costs vary with L2 congestion and L1 data availability pricing (post-EIP-4844). Costs may swing 10× in either direction.
+Estimates assume typical L2 gas prices as of early 2026 (see [ADR 021](021-l2-chain-selection.md) for the selected chain and reference price). Actual costs vary with L2 congestion and L1 data availability pricing (post-EIP-4844). Costs may swing 10× in either direction.
 
 ## Governance
 
@@ -308,7 +308,7 @@ See [ADR 009 — Governance Model](009-governance.md) for the full governance sp
 Not in PoC scope. High-level production approach:
 
 - TOKEN is **canonical on one L2** (the production chain). All staking, channel settlements, and governance happen on this chain.
-- Users on other chains use standard ERC-20 bridges (the canonical L2's native bridge, or cross-chain protocols like LayerZero/Wormhole) to move tokens to the canonical chain.
+- Users on other chains use standard ERC-20 bridges (the production L2's native bridge, or cross-chain protocols like LayerZero/Wormhole) to move tokens to the canonical chain.
 - **No cross-chain payment channels in v1.** Channels exist on one chain only. Cross-chain would require atomic swaps or a bridge-aware channel design — too complex for initial production.
 
 The production L2 choice determines available bridges, gas costs, finality time, and tooling. This decision is deferred until after PoC validation.
