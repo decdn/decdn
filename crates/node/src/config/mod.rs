@@ -499,8 +499,9 @@ fn resolve_observability(
         .filter(|s| !s.is_empty());
 
     if let Some(ref ep) = otlp_endpoint {
+        let lower = ep.to_ascii_lowercase();
         anyhow::ensure!(
-            ep.starts_with("http://") || ep.starts_with("https://"),
+            lower.starts_with("http://") || lower.starts_with("https://"),
             "observability.otlp_endpoint must start with http:// or https:// \
              (got {ep:?}); gRPC/OTLP collectors require an HTTP-scheme URL"
         );
