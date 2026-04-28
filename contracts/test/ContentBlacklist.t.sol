@@ -260,4 +260,18 @@ contract ContentBlacklistTest is Test {
         vm.warp(uint256(expiry) + 1);
         assertFalse(bl.isBlacklisted(HASH_A));
     }
+
+    function test_AddHash_RejectsBeyondIntervalLimit() public {
+        // Cap interval-history depth so `wasBlacklistedAt`'s O(intervals)
+        // walk stays bounded even under repeated add/remove churn.
+        uint256 max = bl.MAX_INTERVALS_PER_HASH();
+        vm.startPrank(governor);
+        for (uint256 i = 0; i < max; ++i) {
+            bl.addHash(HASH_A);
+            bl.removeHash(HASH_A);
+        }
+        vm.expectRevert(ContentBlacklist.IntervalLimitReached.selector);
+        bl.addHash(HASH_A);
+        vm.stopPrank();
+    }
 }

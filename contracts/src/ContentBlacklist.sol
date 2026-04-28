@@ -32,6 +32,15 @@ contract ContentBlacklist is IContentBlacklist, AccessControl, ReentrancyGuardTr
     /// governance (ADR 011).
     uint64 public constant EMERGENCY_EXPIRY = 14 days;
 
+    /// @dev Caps how many add/remove cycles can be retained per hash. The
+    ///      `wasBlacklistedAt` lookup is O(intervals) and called from
+    ///      `SlashJudge.submitBlacklistChallenge`; bounding the depth keeps
+    ///      that gas cost predictable even if a hash is repeatedly added
+    ///      and removed by governance churn or automated blacklist rotation.
+    ///      A value above ~16 is unrealistic for any honest content
+    ///      lifecycle; pick 32 to give comfortable headroom.
+    uint256 public constant MAX_INTERVALS_PER_HASH = 32;
+
     IStakingRegistry public immutable STAKING_REGISTRY;
 
     struct Interval {
@@ -59,6 +68,7 @@ contract ContentBlacklist is IContentBlacklist, AccessControl, ReentrancyGuardTr
     error AlreadyListed();
     error NotListed();
     error NotEmergencyEntry();
+    error IntervalLimitReached();
 
     // ---------------------------------------------------------------------
     //  Constructor
@@ -215,6 +225,10 @@ contract ContentBlacklist is IContentBlacklist, AccessControl, ReentrancyGuardTr
         if (hash == bytes32(0)) revert Errors.ZeroAddress();
         Interval[] storage ivs = _intervals[hash];
         if (ivs.length > 0 && _intervalActive(ivs[ivs.length - 1])) revert AlreadyListed();
+        // Bound `wasBlacklistedAt` lookup cost — the O(intervals) walk is
+        // hit on every blacklist-violation slash challenge, so unbounded
+        // history would let governance churn inflate slashing gas.
+        if (ivs.length >= MAX_INTERVALS_PER_HASH) revert IntervalLimitReached();
         ivs.push(
             Interval({
                 addedAt: block.timestamp.toUint64(),

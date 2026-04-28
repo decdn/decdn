@@ -621,6 +621,12 @@ contract StakingRegistry is
     /// happy-path withdraw and the slash-spill consumer — used to inline the
     /// same loop pair; centralising it removes a maintenance hazard. The
     /// caller is responsible for asserting `i <= len` before invoking.
+    ///
+    /// Cost: ~5K gas per shifted slot (one SSTORE) and ~5K per pop. With
+    /// `MAX_UNBONDING_ENTRIES = 32` the worst case is ~160K — comfortably
+    /// within the block gas limit but expensive enough that production
+    /// should switch to a circular buffer or head/tail-pointer queue for
+    /// O(1) removal. PoC accepts the simplicity tradeoff.
     function _compactQueueFront(
         UnbondRequest[] storage queue,
         uint256 i,
