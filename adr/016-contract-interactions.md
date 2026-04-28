@@ -178,7 +178,7 @@ Contract surface:
 | `StakingRegistry.lastSettlementAt[operator]` (`uint64`) | Timestamp of last settlement; updated by `StablePaymentChannel` |
 | `SETTLEMENT_REPORTER_ROLE` on `StakingRegistry` | Granted to `StablePaymentChannel` (and future `PaymentChannel`) |
 | `StakingRegistry.recordSettlement(operator)` | Single-purpose, role-gated; one SSTORE (~5K gas) |
-| `getActiveNodes(...)` returns `(operator, nodeId, lastSettlementAt, stakeMultiple)` tuples | Raw signals, not policy — clients sort off-chain |
+| `getActiveNodes(...)` returns `(operator, nodeId, lastSettlementAt)` tuples | Raw signals, not policy — clients sort off-chain. Stake-tier callers can fetch `getStakeMultiple(operator)` per-node on demand. |
 
 Design principles for forward compatibility:
 
