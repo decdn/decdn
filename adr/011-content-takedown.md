@@ -87,6 +87,8 @@ struct BlacklistEntry {
 
 > **Gas optimization (production):** The `region` field uses `string` for PoC readability. Production implementations SHOULD use `bytes2` for ISO 3166-1 alpha-2 codes (always exactly 2 ASCII characters), with `bytes2(0)` as the global sentinel. This reduces storage costs.
 
+> **Interval-history cap.** `wasBlacklistedAt(hash, timestamp)` (called from `SlashJudge.submitBlacklistChallenge` to verify slash evidence) walks the per-hash add/remove history list, with cost O(intervals). To bound the worst-case gas of slash challenges under governance churn or automated rotation, the implementation caps history depth at `MAX_INTERVALS_PER_HASH = 32` and reverts further `addHash` calls with `IntervalLimitReached` once the cap is reached. A value above ~16 is unrealistic for any honest content lifecycle; 32 gives comfortable headroom. Operators that exhaust the cap on a single hash are exhibiting governance-level dysfunction worth investigating; the cap exists to keep slashing predictable, not to constrain normal operations.
+
 **Blacklist version.** `getBlacklistVersion()` returns a monotonically increasing counter incremented on every add/remove operation across all paths. Nodes cache the last-seen version and only re-fetch deltas when the version advances, minimising RPC load.
 
 **Reason field.** Free-form string, stored on-chain for auditability. Operators can reference legal notice identifiers (e.g., DMCA case numbers, DSA notice IDs) or use short category labels.
