@@ -1899,7 +1899,7 @@ mod tests {
         let bogus = dir.path().join("does-not-exist.json");
         let cli = BlockchainArgs {
             rpc_url: Some("https://example/rpc".to_string()),
-            eth_keystore: Some(bogus.clone()),
+            eth_keystore: Some(bogus),
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             staking_registry_address: Some(GOOD_ADDR.to_string()),
         };
