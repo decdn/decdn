@@ -397,6 +397,96 @@ contract StablePaymentChannelTest is Test {
         ch.setFeeParams(500, 250, 20);
     }
 
+    function test_SetDisputeWindow_Updates() public {
+        vm.prank(admin);
+        ch.setDisputeWindow(36 hours);
+        assertEq(ch.disputeWindow(), 36 hours);
+    }
+
+    function test_SetDisputeWindow_RejectsBelowFloor() public {
+        vm.expectRevert(Errors.OutOfBounds.selector);
+        vm.prank(admin);
+        ch.setDisputeWindow(11 hours);
+    }
+
+    function test_SetDisputeWindow_RejectsAboveCeiling() public {
+        vm.expectRevert(Errors.OutOfBounds.selector);
+        vm.prank(admin);
+        ch.setDisputeWindow(73 hours);
+    }
+
+    function test_SetDisputeWindow_OnlyOwner() public {
+        vm.expectRevert(
+            abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, randomUser)
+        );
+        vm.prank(randomUser);
+        ch.setDisputeWindow(36 hours);
+    }
+
+    function test_SetMaxChannelDuration_Updates() public {
+        vm.prank(admin);
+        ch.setMaxChannelDuration(60 days);
+        assertEq(ch.maxChannelDuration(), 60 days);
+    }
+
+    function test_SetMaxChannelDuration_RejectsBelowFloor() public {
+        vm.expectRevert(Errors.OutOfBounds.selector);
+        vm.prank(admin);
+        ch.setMaxChannelDuration(6 days);
+    }
+
+    function test_SetMaxChannelDuration_RejectsAboveCeiling() public {
+        vm.expectRevert(Errors.OutOfBounds.selector);
+        vm.prank(admin);
+        ch.setMaxChannelDuration(366 days);
+    }
+
+    function test_SetTreasury_Updates() public {
+        address newTreasury = makeAddr("newTreasury");
+        vm.prank(admin);
+        ch.setTreasury(newTreasury);
+        assertEq(ch.treasury(), newTreasury);
+    }
+
+    function test_SetTreasury_RejectsZero() public {
+        vm.expectRevert(Errors.ZeroAddress.selector);
+        vm.prank(admin);
+        ch.setTreasury(address(0));
+    }
+
+    function test_Unpause_RestoresMutators() public {
+        vm.startPrank(admin);
+        ch.pause();
+        ch.unpause();
+        vm.stopPrank();
+        // openChannel works again — proves the unpause path executed.
+        vm.prank(client);
+        ch.openChannel(provider, 100e6);
+    }
+
+    function test_GetChannel_ReturnsZeroForUnknown() public view {
+        StablePaymentChannel.Channel memory c = ch.getChannel(bytes32(uint256(0x1234)));
+        assertEq(c.client, address(0));
+        assertEq(uint256(c.status), uint256(StablePaymentChannel.Status.None));
+    }
+
+    function test_ChannelClient_ReturnsClient() public {
+        bytes32 id = _openChannel(100e6);
+        assertEq(ch.channelClient(id), client);
+    }
+
+    function test_ChannelClient_ReturnsZeroForUnknown() public view {
+        assertEq(ch.channelClient(bytes32(uint256(0x9999))), address(0));
+    }
+
+    function test_NextChannelId_AdvancesAfterOpen() public {
+        bytes32 idBefore = ch.nextChannelId(client, provider);
+        bytes32 actual = _openChannel(100e6);
+        assertEq(actual, idBefore);
+        bytes32 idAfter = ch.nextChannelId(client, provider);
+        assertTrue(idBefore != idAfter, "nonce should advance after open");
+    }
+
     // ---------------- fuzz ----------------
 
     function testFuzz_Settle_FeeMath(

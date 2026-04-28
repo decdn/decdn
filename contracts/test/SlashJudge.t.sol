@@ -10,6 +10,7 @@ import { ContentBlacklist } from "../src/ContentBlacklist.sol";
 import { SlashJudge } from "../src/SlashJudge.sol";
 import { IStakingRegistry } from "../src/interfaces/IStakingRegistry.sol";
 import { IStablePaymentChannel } from "../src/interfaces/IStablePaymentChannel.sol";
+import { IContentBlacklist } from "../src/interfaces/IContentBlacklist.sol";
 import { Errors } from "../src/libraries/Errors.sol";
 import { Roles } from "../src/libraries/Roles.sol";
 
@@ -634,6 +635,102 @@ contract SlashJudgeTest is Test {
         vm.expectRevert(Errors.OutOfBounds.selector);
         vm.prank(admin);
         judge.setChallengeBond(1001e18);
+    }
+
+    function test_SetCounterWindow_Updates() public {
+        vm.prank(admin);
+        judge.setCounterWindow(36 hours);
+        assertEq(judge.counterWindow(), 36 hours);
+    }
+
+    function test_SetCounterWindow_RejectsBelowFloor() public {
+        vm.expectRevert(Errors.OutOfBounds.selector);
+        vm.prank(admin);
+        judge.setCounterWindow(11 hours);
+    }
+
+    function test_SetCounterWindow_RejectsAboveCeiling() public {
+        vm.expectRevert(Errors.OutOfBounds.selector);
+        vm.prank(admin);
+        judge.setCounterWindow(8 days);
+    }
+
+    function test_Unpause_RestoresMutators() public {
+        vm.startPrank(admin);
+        judge.pause();
+        judge.unpause();
+        vm.stopPrank();
+        // submitPhantomChallenge is reachable again post-unpause: a happy
+        // path call now succeeds, proving the unpause executed. (Failure
+        // would surface as EnforcedPause.)
+        SlashJudge.ProbeResponse memory probe = _probe(bytes32(uint256(1)), true, 10);
+        SlashJudge.StreamResponse memory sr = _stream(bytes32(uint256(1)), false, 10);
+        bytes memory ps = _signProbe(nodePk, probe);
+        bytes memory ss = _signStream(nodePk, sr);
+        vm.startPrank(challenger);
+        token.approve(address(judge), type(uint256).max);
+        judge.submitPhantomChallenge(node, probe, ps, sr, ss);
+        vm.stopPrank();
+    }
+
+    function test_Constructor_RejectsZeroAddresses() public {
+        // Each zero-address slot in the constructor must trip the revert.
+        vm.expectRevert(Errors.ZeroAddress.selector);
+        new SlashJudge(
+            IStakingRegistry(address(0)),
+            bl,
+            channelMock,
+            IERC20(address(token)),
+            admin,
+            100e18,
+            24 hours
+        );
+
+        vm.expectRevert(Errors.ZeroAddress.selector);
+        new SlashJudge(
+            reg,
+            IContentBlacklist(address(0)),
+            channelMock,
+            IERC20(address(token)),
+            admin,
+            100e18,
+            24 hours
+        );
+
+        vm.expectRevert(Errors.ZeroAddress.selector);
+        new SlashJudge(
+            reg,
+            bl,
+            IStablePaymentChannel(address(0)),
+            IERC20(address(token)),
+            admin,
+            100e18,
+            24 hours
+        );
+
+        vm.expectRevert(Errors.ZeroAddress.selector);
+        new SlashJudge(reg, bl, channelMock, IERC20(address(0)), admin, 100e18, 24 hours);
+
+        vm.expectRevert(Errors.ZeroAddress.selector);
+        new SlashJudge(reg, bl, channelMock, IERC20(address(token)), address(0), 100e18, 24 hours);
+    }
+
+    function test_CounterRate_RejectsWrongOffenseType() public {
+        // Submit a phantom challenge (not rate-manipulation), then try to
+        // counter via the rate path — must revert OffenseNotCounterable.
+        SlashJudge.ProbeResponse memory probe = _probe(bytes32(uint256(0xC0DE)), true, 10);
+        SlashJudge.StreamResponse memory sr = _stream(bytes32(uint256(0xC0DE)), false, 10);
+        bytes memory ps = _signProbe(nodePk, probe);
+        bytes memory ss = _signStream(nodePk, sr);
+
+        vm.startPrank(challenger);
+        token.approve(address(judge), type(uint256).max);
+        uint256 id = judge.submitPhantomChallenge(node, probe, ps, sr, ss);
+        vm.stopPrank();
+
+        vm.expectRevert(SlashJudge.OffenseNotCounterable.selector);
+        vm.prank(node);
+        judge.counterRateChallenge(id, 10, 20, uint64(block.timestamp), uint64(block.timestamp), "");
     }
 
     // ---------------- helpers ----------------

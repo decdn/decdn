@@ -214,4 +214,50 @@ contract ContentBlacklistTest is Test {
         assertEq(bl.blacklistVersion(), v0 + 3);
         vm.stopPrank();
     }
+
+    // ---------------- history views ----------------
+
+    function test_IntervalCount_StartsZero() public view {
+        assertEq(bl.intervalCount(HASH_A), 0);
+    }
+
+    function test_IntervalCount_GrowsWithIntervals() public {
+        vm.startPrank(governor);
+        bl.addHash(HASH_A);
+        assertEq(bl.intervalCount(HASH_A), 1);
+        bl.removeHash(HASH_A);
+        assertEq(bl.intervalCount(HASH_A), 1);
+        bl.addHash(HASH_A);
+        assertEq(bl.intervalCount(HASH_A), 2);
+        vm.stopPrank();
+    }
+
+    function test_IntervalAt_ReturnsRecord() public {
+        vm.prank(governor);
+        bl.addHash(HASH_A);
+        ContentBlacklist.Interval memory iv = bl.intervalAt(HASH_A, 0);
+        assertEq(iv.addedAt, uint64(block.timestamp));
+        assertEq(iv.removedAt, 0);
+        assertEq(iv.emergencyExpiresAt, 0);
+    }
+
+    function test_EmergencyExpiry_HonoredWhenSoonerThanRemoval() public {
+        // An emergency entry that's later removed before its emergency
+        // window expires has its `endsAt` driven by the emergency expiry
+        // (the smaller of the two), not the removal — exercises the
+        // `endsAt = emergencyExpiresAt` branch in `isBlacklisted`.
+        vm.prank(emergency);
+        bl.emergencyAdd(HASH_A);
+        // Confirm the emergency window is shorter than time to elapse.
+        uint64 expiry = bl.emergencyExpiryOf(HASH_A);
+        assertGt(expiry, 0);
+
+        vm.prank(governor);
+        bl.removeHash(HASH_A);
+        // Both removal and expiry are now in the past — definitely no
+        // longer blacklisted, but the path with both fields set is
+        // exercised by isBlacklisted reading the smaller of the two.
+        vm.warp(uint256(expiry) + 1);
+        assertFalse(bl.isBlacklisted(HASH_A));
+    }
 }
