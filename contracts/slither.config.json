@@ -1,0 +1,6 @@
+{
+  "filter_paths": "lib/|test/|script/",
+  "exclude_informational": true,
+  "exclude_low": true,
+  "detectors_to_exclude": "naming-convention,timestamp,assembly,pragma,solc-version,uninitialized-state"
+}

@@ -1,0 +1,15 @@
+{
+  "extends": "solhint:recommended",
+  "plugins": ["security"],
+  "rules": {
+    "compiler-version": ["error", "0.8.28"],
+    "func-visibility": ["error", { "ignoreConstructors": true }],
+    "no-inline-assembly": "warn",
+    "reason-string": ["warn", { "maxLength": 64 }],
+    "not-rely-on-time": "off",
+    "gas-custom-errors": "error",
+    "security/no-tx-origin": "error",
+    "security/reentrancy": "error",
+    "security/check-send-result": "error"
+  }
+}

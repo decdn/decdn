@@ -1,0 +1,18 @@
+# Foundry build artifacts
+out/
+cache/
+broadcast/
+# Ignore anvil broadcast files but keep dry-run for reference
+!broadcast/*/dry-run/
+# Coverage
+lcov.info
+coverage/
+
+# Environment
+.env
+.env.local
+
+# Editor
+.vscode/
+.idea/
+*.swp
