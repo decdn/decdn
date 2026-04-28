@@ -28,7 +28,7 @@ contract ContentBlacklistTest is Test {
 
     function setUp() public {
         token = new TOKEN(address(this), 10_000_000e18, address(this));
-        reg = new StakingRegistry(token, 1000e18, 7 days, admin);
+        reg = new StakingRegistry(token, 1000e18, 7 days, 90 days, admin);
         bl = new ContentBlacklist(reg, admin);
 
         vm.startPrank(admin);

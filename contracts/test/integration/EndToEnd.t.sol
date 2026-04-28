@@ -150,8 +150,9 @@ contract EndToEndTest is Test {
         uint256 challengerBefore = d.token.balanceOf(challenger);
         d.slashJudge.resolveChallenge(chId);
 
-        uint256 slashAmount = stakeBefore / 10;
-        uint256 expected = slashAmount / 2 + 100e18; // 50% reward + bond return
+        // First offense → tier 0 = 5% slash. Reward = 50% of slash + bond return.
+        uint256 slashAmount = (stakeBefore * 500) / 10_000;
+        uint256 expected = slashAmount / 2 + 100e18;
         assertEq(d.token.balanceOf(challenger) - challengerBefore, expected);
 
         // -----------------------------------------------------------------

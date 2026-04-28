@@ -30,13 +30,14 @@ contract StakingRegistryTest is Test {
 
     uint256 internal constant MIN_STAKE = 1000e18;
     uint64 internal constant UNBONDING = 7 days;
+    uint64 internal constant RESET_PERIOD = 90 days;
 
     function setUp() public {
         operator = vm.addr(operatorPk);
         other = vm.addr(otherPk);
 
         token = new TOKEN(address(this), 10_000_000e18, address(this));
-        reg = new StakingRegistry(token, MIN_STAKE, UNBONDING, admin);
+        reg = new StakingRegistry(token, MIN_STAKE, UNBONDING, RESET_PERIOD, admin);
 
         vm.startPrank(admin);
         reg.grantRole(Roles.SLASH_ROLE, slasher);
@@ -63,28 +64,28 @@ contract StakingRegistryTest is Test {
 
     function test_Constructor_RevertsOnZeroAddresses() public {
         vm.expectRevert(Errors.ZeroAddress.selector);
-        new StakingRegistry(TOKEN(address(0)), MIN_STAKE, UNBONDING, admin);
+        new StakingRegistry(TOKEN(address(0)), MIN_STAKE, UNBONDING, RESET_PERIOD, admin);
 
         vm.expectRevert(Errors.ZeroAddress.selector);
-        new StakingRegistry(token, MIN_STAKE, UNBONDING, address(0));
+        new StakingRegistry(token, MIN_STAKE, UNBONDING, RESET_PERIOD, address(0));
     }
 
     function test_Constructor_EnforcesBounds() public {
         vm.expectRevert(Errors.OutOfBounds.selector);
-        new StakingRegistry(token, 99e18, UNBONDING, admin);
+        new StakingRegistry(token, 99e18, UNBONDING, RESET_PERIOD, admin);
 
         vm.expectRevert(Errors.OutOfBounds.selector);
-        new StakingRegistry(token, 100_001e18, UNBONDING, admin);
+        new StakingRegistry(token, 100_001e18, UNBONDING, RESET_PERIOD, admin);
 
         vm.expectRevert(Errors.OutOfBounds.selector);
-        new StakingRegistry(token, MIN_STAKE, 2 days, admin);
+        new StakingRegistry(token, MIN_STAKE, 2 days, RESET_PERIOD, admin);
 
         vm.expectRevert(Errors.OutOfBounds.selector);
-        new StakingRegistry(token, MIN_STAKE, 31 days, admin);
+        new StakingRegistry(token, MIN_STAKE, 31 days, RESET_PERIOD, admin);
     }
 
     function test_Constructor_StartsPaused() public {
-        StakingRegistry reg2 = new StakingRegistry(token, MIN_STAKE, UNBONDING, admin);
+        StakingRegistry reg2 = new StakingRegistry(token, MIN_STAKE, UNBONDING, RESET_PERIOD, admin);
         assertTrue(reg2.paused());
     }
 
@@ -226,11 +227,12 @@ contract StakingRegistryTest is Test {
         reg.slash(operator, IStakingRegistry.OffenseType.PhantomBlob);
     }
 
-    function test_Slash_FlatTenPercent_SplitsRewardAndBurn() public {
+    function test_Slash_Tier0_SplitsRewardAndBurn() public {
         vm.prank(operator);
         reg.stake(10 * MIN_STAKE); // 10,000 TOKEN
 
-        uint256 expectedSlash = (10 * MIN_STAKE) / 10; // 1,000
+        // First offense → tier 0, 5% slash.
+        uint256 expectedSlash = (10 * MIN_STAKE * 500) / 10_000;
         uint256 expectedReward = expectedSlash / 2;
         uint256 expectedBurn = expectedSlash - expectedReward;
 
@@ -249,27 +251,115 @@ contract StakingRegistryTest is Test {
         vm.prank(operator);
         reg.stake(10 * MIN_STAKE);
         vm.prank(operator);
-        reg.unstake(9 * MIN_STAKE); // leaves 1x active, 9x unbonding
-        // slashable = 10x, 10% = 1x. All absorbed by active.
+        // Leave a tiny sliver active so the first slash has to spill into
+        // unbonding immediately. With tier 0 = 5% on 10x slashable, the
+        // slash amount is 0.5x — larger than 0.05x active, so the
+        // remainder pulls from the unbonding queue.
+        reg.unstake(9950e18); // 9.95x unbonding, 0.05x active
         vm.prank(slasher);
         reg.slash(operator, IStakingRegistry.OffenseType.Corruption);
 
+        // 5% of 10x = 0.5x = 500e18. Active had 0.05x = 50e18 → fully consumed.
+        // Remaining 0.45x = 450e18 spilled into unbonding (9950 - 450 = 9500).
         assertEq(reg.getStakeInfo(operator).active, 0);
-        assertEq(reg.getStakeInfo(operator).unbonding, 9 * MIN_STAKE);
-
-        // A second slash must spill into unbonding (active is zero).
-        vm.prank(slasher);
-        reg.slash(operator, IStakingRegistry.OffenseType.Corruption);
-
-        // slashable was 9x, 10% = 0.9x → pulled from first unbond entry.
-        assertEq(reg.getStakeInfo(operator).active, 0);
-        assertEq(reg.getStakeInfo(operator).unbonding, 9 * MIN_STAKE - (9 * MIN_STAKE) / 10);
+        assertEq(reg.getStakeInfo(operator).unbonding, 9500e18);
     }
 
     function test_Slash_RevertsWhenNotStaked() public {
         vm.expectRevert(StakingRegistry.NodeNotStaked.selector);
         vm.prank(slasher);
         reg.slash(operator, IStakingRegistry.OffenseType.PhantomBlob);
+    }
+
+    // ---------- escalating slash schedule (ADR 004) ----------
+
+    function test_Slash_TierEscalates_FromZeroToOneToTwo() public {
+        vm.prank(operator);
+        reg.stake(100 * MIN_STAKE);
+
+        // First offense → 5%. effectiveTier was 0 → bumps to 1.
+        vm.prank(slasher);
+        reg.slash(operator, IStakingRegistry.OffenseType.PhantomBlob);
+        assertEq(reg.currentTier(operator), 1);
+        assertEq(reg.getStakeInfo(operator).lifetimeOffenseCount, 1);
+
+        // Second offense (still within reset period) → 15%. Bumps to 2.
+        vm.prank(slasher);
+        reg.slash(operator, IStakingRegistry.OffenseType.PhantomBlob);
+        assertEq(reg.currentTier(operator), 2);
+        assertEq(reg.getStakeInfo(operator).lifetimeOffenseCount, 2);
+
+        // Third offense → 50%, tier already 2 stays at 2 (capped).
+        vm.prank(slasher);
+        reg.slash(operator, IStakingRegistry.OffenseType.PhantomBlob);
+        assertEq(reg.currentTier(operator), 2);
+        assertEq(reg.getStakeInfo(operator).lifetimeOffenseCount, 3);
+    }
+
+    function test_Slash_TierDecaysAfterResetPeriod() public {
+        vm.prank(operator);
+        reg.stake(100 * MIN_STAKE);
+
+        // Bring storedTier up to 2.
+        vm.prank(slasher);
+        reg.slash(operator, IStakingRegistry.OffenseType.PhantomBlob);
+        vm.prank(slasher);
+        reg.slash(operator, IStakingRegistry.OffenseType.PhantomBlob);
+        assertEq(reg.currentTier(operator), 2);
+
+        // Lifetime count = 2 → effective period is 2× the base.
+        uint64 effective = reg.effectiveResetPeriod(operator);
+        assertEq(effective, 2 * RESET_PERIOD);
+
+        // After exactly one effective period, tier drops to 1.
+        vm.warp(block.timestamp + effective);
+        assertEq(reg.currentTier(operator), 1);
+
+        // After another period, tier drops to 0.
+        vm.warp(block.timestamp + effective);
+        assertEq(reg.currentTier(operator), 0);
+    }
+
+    function test_Slash_LifetimeCountUsesIncreasingResetPeriod() public {
+        vm.prank(operator);
+        reg.stake(100 * MIN_STAKE);
+
+        // 0 lifetime offenses → 1× base period.
+        assertEq(reg.effectiveResetPeriod(operator), RESET_PERIOD);
+
+        vm.prank(slasher);
+        reg.slash(operator, IStakingRegistry.OffenseType.PhantomBlob);
+        // 1 → 1× (max(1,1)-1 = 0, mult = 1).
+        assertEq(reg.effectiveResetPeriod(operator), RESET_PERIOD);
+
+        vm.prank(slasher);
+        reg.slash(operator, IStakingRegistry.OffenseType.PhantomBlob);
+        // 2 → 2× base.
+        assertEq(reg.effectiveResetPeriod(operator), 2 * RESET_PERIOD);
+
+        vm.prank(slasher);
+        reg.slash(operator, IStakingRegistry.OffenseType.PhantomBlob);
+        // 3 → 4× cap.
+        assertEq(reg.effectiveResetPeriod(operator), 4 * RESET_PERIOD);
+
+        // Further offenses stay at the 4× cap.
+        vm.prank(slasher);
+        reg.slash(operator, IStakingRegistry.OffenseType.PhantomBlob);
+        assertEq(reg.effectiveResetPeriod(operator), 4 * RESET_PERIOD);
+    }
+
+    function test_SetBaseResetPeriod_Bounds() public {
+        vm.prank(admin);
+        reg.setBaseResetPeriod(180 days);
+        assertEq(reg.baseResetPeriod(), 180 days);
+
+        vm.expectRevert(Errors.OutOfBounds.selector);
+        vm.prank(admin);
+        reg.setBaseResetPeriod(29 days);
+
+        vm.expectRevert(Errors.OutOfBounds.selector);
+        vm.prank(admin);
+        reg.setBaseResetPeriod(366 days);
     }
 
     // ---------- ejectNode ----------
@@ -319,11 +409,11 @@ contract StakingRegistryTest is Test {
     function test_Slash_AutoEjectsBelowHalfMinStake() public {
         // ADR 004 §Auto-Ejection: a slash that drops the slashable pool
         // below 50% of `minStake` MUST auto-eject the operator.
-        // Stake exactly 5x MIN_STAKE so a single 10% slash leaves 4.5x
-        // (still above the 0.5x threshold), and a second slash leaves
-        // ~4.05x (still above) — we need to slash enough to cross.
-        // To trigger directly: stake 0.55x MIN_STAKE so 10% leaves 0.495x
-        // (below the 0.5x threshold).
+        // Tier 2 (50% slash) trips the threshold reliably for any node
+        // staked at the minimum: starting at 1.0x, slash leaves 0.5x —
+        // not strictly less than 0.5x, so we need 1× minus a tiny bit
+        // less than half, i.e. drop the pool first. Easiest path:
+        // build to tier 2 and slash, then verify ejection.
         bytes32 nodeId = keccak256("auto-eject");
         bytes memory sigOp = _signBind(operatorPk, nodeId, 0);
         vm.prank(operator);
@@ -331,23 +421,17 @@ contract StakingRegistryTest is Test {
         vm.prank(operator);
         reg.registerNode(nodeId, sigOp);
 
-        // Drop the operator's effective stake to ~0.55x via repeated unstake.
-        // unstake moves to unbonding (still slashable) — the threshold is
-        // checked against `active + unbonding`, not `active` alone, so we
-        // need to actually shrink the pool. Skip ahead, withdraw, then
-        // re-stake to a level that yields a single below-threshold slash.
-        vm.prank(operator);
-        reg.unstake(MIN_STAKE);
-        vm.warp(block.timestamp + UNBONDING + 1);
-        vm.prank(operator);
-        reg.withdrawUnbonded();
-
-        // Now stake 0.55x MIN_STAKE (550 TOKEN). 10% slash → 0.495x left.
-        vm.prank(operator);
-        reg.stake(550e18);
-        assertEq(reg.getActiveNodeCount(), 1);
+        // First slash → tier 0 (5%): 950 TOKEN remaining. Above threshold.
+        vm.prank(slasher);
+        reg.slash(operator, IStakingRegistry.OffenseType.PhantomBlob);
         assertTrue(reg.getStakeInfo(operator).state == StakingRegistry.OperatorState.Registered);
 
+        // Second slash → tier 1 (15%): 950 * 0.85 = 807.5 TOKEN. Above threshold.
+        vm.prank(slasher);
+        reg.slash(operator, IStakingRegistry.OffenseType.PhantomBlob);
+        assertTrue(reg.getStakeInfo(operator).state == StakingRegistry.OperatorState.Registered);
+
+        // Third slash → tier 2 (50%): 807.5 * 0.5 ≈ 403.75 TOKEN < 500 = 0.5x minStake.
         vm.prank(slasher);
         reg.slash(operator, IStakingRegistry.OffenseType.PhantomBlob);
 
@@ -357,8 +441,8 @@ contract StakingRegistryTest is Test {
     }
 
     function test_Slash_DoesNotAutoEjectAboveThreshold() public {
-        // 10% slash on a healthy 1x stake leaves 0.9x — well above 0.5x,
-        // so no ejection.
+        // First-offense 5% slash on a healthy 1x stake leaves 0.95x — well
+        // above 0.5x, so no ejection.
         bytes32 nodeId = keccak256("healthy");
         bytes memory sigOp = _signBind(operatorPk, nodeId, 0);
         vm.prank(operator);
@@ -549,52 +633,44 @@ contract StakingRegistryTest is Test {
     // ---------- multi-entry slash spill ----------
 
     function test_Slash_MultiEntry_SpillAcrossQueue() public {
-        // Stake 20× MIN_STAKE, unstake three times of 5× each.
+        // Stake 20× MIN_STAKE, queue four 5× entries (full unstake), so
+        // active is zero and any slash must consume from the queue.
         vm.prank(operator);
         reg.stake(20 * MIN_STAKE);
-        for (uint256 i = 0; i < 3; ++i) {
+        for (uint256 i = 0; i < 4; ++i) {
             vm.prank(operator);
             reg.unstake(5 * MIN_STAKE);
         }
-        assertEq(reg.unbondingQueueLength(operator), 3);
-        assertEq(reg.getStakeInfo(operator).active, 5 * MIN_STAKE);
-        assertEq(reg.getStakeInfo(operator).unbonding, 15 * MIN_STAKE);
-
-        // slashable = 20×, 10% = 2×. Pulls 5× from active (only 5× there),
-        // then spills 2× - 5× = no spill needed. Need bigger slash; stake
-        // 90× more and set up so slash spills.
-        // Better: unstake ALL and slash to force pure-queue spill across
-        // entries.
-        vm.prank(operator);
-        reg.unstake(5 * MIN_STAKE); // active -> 0, 4 entries
-        assertEq(reg.getStakeInfo(operator).active, 0);
         assertEq(reg.unbondingQueueLength(operator), 4);
+        assertEq(reg.getStakeInfo(operator).active, 0);
 
-        // slashable = 20×, slashAmount = 2×. Must consume the first entry
-        // (5× full? no, 2× partial).
+        // First offense, tier 0 = 5%. slashable = 20×, slashAmount = 1×.
+        // Entry 0 has 5×; partial-consume by 1× leaves 4×, queue depth
+        // unchanged.
         vm.prank(slasher);
         reg.slash(operator, IStakingRegistry.OffenseType.PhantomBlob);
-        // First entry was 5× → partial consume by 2× → leaves 3×. Queue
-        // retains all 4 entries (no full consumption).
         assertEq(reg.unbondingQueueLength(operator), 4);
         StakingRegistry.UnbondRequest memory e0 = reg.unbondingEntry(operator, 0);
-        assertEq(uint256(e0.amount), 3 * MIN_STAKE);
-        assertEq(reg.getStakeInfo(operator).unbonding, 18 * MIN_STAKE);
+        assertEq(uint256(e0.amount), 4 * MIN_STAKE);
+        assertEq(reg.getStakeInfo(operator).unbonding, 19 * MIN_STAKE);
 
-        // Second slash: slashable = 18×, slashAmount = 1.8×. Consumes
-        // entry0 fully (3×) and partial on entry1 ... actually 1.8× < 3×,
-        // so only partial entry0.
+        // Second offense within reset period → tier 1 = 15%.
+        // slashable = 19×, slashAmount = 19 * 1500 / 10_000 = 2.85×.
+        // entry 0 (4×) absorbs the full 2.85×, leaving 1.15× in entry 0
+        // and the remaining three entries untouched.
         vm.prank(slasher);
         reg.slash(operator, IStakingRegistry.OffenseType.PhantomBlob);
         e0 = reg.unbondingEntry(operator, 0);
-        assertEq(uint256(e0.amount), 3 * MIN_STAKE - (18 * MIN_STAKE) / 10);
+        // Be careful with the arithmetic: 4*MIN_STAKE - 19*MIN_STAKE*1500/10_000.
+        uint256 secondSlash = (19 * MIN_STAKE * 1500) / 10_000;
+        assertEq(uint256(e0.amount), 4 * MIN_STAKE - secondSlash);
     }
 
     // ---------- reentrancy ----------
 
     function test_Reentrancy_BlocksWithdrawUnbonded() public {
         ReentrantERC20 bad = new ReentrantERC20();
-        StakingRegistry reg2 = new StakingRegistry(bad, MIN_STAKE, UNBONDING, admin);
+        StakingRegistry reg2 = new StakingRegistry(bad, MIN_STAKE, UNBONDING, RESET_PERIOD, admin);
 
         vm.prank(admin);
         reg2.unpause();

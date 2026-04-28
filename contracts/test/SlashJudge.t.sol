@@ -49,7 +49,7 @@ contract SlashJudgeTest is Test {
         node = vm.addr(nodePk);
 
         token = new TOKEN(address(this), 100_000_000e18, address(this));
-        reg = new StakingRegistry(token, MIN_STAKE, 7 days, admin);
+        reg = new StakingRegistry(token, MIN_STAKE, 7 days, 90 days, admin);
         bl = new ContentBlacklist(reg, admin);
         channelMock = new MockPaymentChannel();
         judge = new SlashJudge(reg, bl, channelMock, IERC20(address(token)), admin, BOND, COUNTER);
@@ -127,8 +127,9 @@ contract SlashJudgeTest is Test {
         uint256 before = token.balanceOf(challenger);
         judge.resolveChallenge(id);
 
-        // slashReward = 50% of (10,000e18 * 10%) = 500e18 ; bond returned.
-        uint256 expected = (10_000e18 * 10 / 100) / 2 + BOND;
+        // First offense → tier 0 = 5%. slashReward = 50% of (10,000e18 * 5%) = 250e18 ; bond
+        // returned.
+        uint256 expected = (10_000e18 * 500 / 10_000) / 2 + BOND;
         assertEq(token.balanceOf(challenger) - before, expected);
         assertEq(judge.activeChallengeCount(node), 0);
     }

@@ -34,7 +34,7 @@ contract StablePaymentChannelTest is Test {
 
         token = new TOKEN(address(this), 10_000_000e18, address(this));
         usdc = new MockUSDC();
-        reg = new StakingRegistry(token, MIN_STAKE, 7 days, admin);
+        reg = new StakingRegistry(token, MIN_STAKE, 7 days, 90 days, admin);
         ch = new StablePaymentChannel(
             usdc, reg, treasury, admin, 300, 150, 10, DISPUTE_WINDOW, MAX_DURATION, 1, 1000
         );

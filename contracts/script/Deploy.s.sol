@@ -149,7 +149,13 @@ contract Deploy is Script {
 
         d.token = new TOKEN(deployer, initialSupply, self);
 
-        d.stakingRegistry = new StakingRegistry(IERC20(address(d.token)), 1000e18, 7 days, self);
+        d.stakingRegistry = new StakingRegistry(
+            IERC20(address(d.token)),
+            1000e18, // minStake
+            7 days, // unbondingPeriod
+            90 days, // baseResetPeriod (ADR 004 §Slash Amounts)
+            self
+        );
 
         d.paymentChannel = new StablePaymentChannel(
             d.usdc,

@@ -19,9 +19,11 @@ import { Errors } from "./libraries/Errors.sol";
 import { Roles } from "./libraries/Roles.sol";
 
 /// @title StakingRegistry
-/// @notice Custody of operator and client TOKEN stakes for the deCDN PoC.
+/// @notice Custody of operator and client TOKEN stakes for the deCDN.
 /// @dev See ADR 003 §Staking, ADR 004 §Slashing, ADR 016 §3 (call graph), ADR
-///      024 (SignatureChecker). PoC uses a flat 10% slash schedule per ADR 004.
+///      024 (SignatureChecker). Implements the production escalating slash
+///      schedule from ADR 004: tier 0 = 5%, tier 1 = 15%, tier 2 = 50%, with
+///      tier decay based on `baseResetPeriod` × an offense-history multiplier.
 ///      Each operator holds a single active stake slot; `stake()` tops up the
 ///      existing slot rather than creating a new one.
 ///
@@ -56,9 +58,23 @@ contract StakingRegistry is
     /// past the block limit. Honest operators should rarely exceed 2 or 3.
     uint256 public constant MAX_UNBONDING_ENTRIES = 32;
 
-    /// @dev Flat PoC slash percentage, in basis points. ADR 004.
-    uint256 public constant SLASH_BPS_POC = 1000; // 10%
+    /// @dev Escalating slash schedule per ADR 004 §Slash Amounts. The
+    ///      effective tier is `currentTier(operator)` which decays from the
+    ///      stored tier based on elapsed clean time. After a slash, the
+    ///      stored tier increments (capped at 2) and the lifetime offense
+    ///      counter advances. Tier 2 (50%) reliably trips auto-ejection
+    ///      because the post-slash slashable falls below the 50% threshold
+    ///      (`min_stake / 2`) for any node staked at exactly `minStake`.
+    uint16 public constant SLASH_BPS_TIER_0 = 500; //  5% — first offense
+    uint16 public constant SLASH_BPS_TIER_1 = 1500; // 15% — second offense within reset period
+    uint16 public constant SLASH_BPS_TIER_2 = 5000; // 50% — third or higher
+    uint8 public constant MAX_TIER = 2;
+
     uint256 public constant BPS_DENOMINATOR = 10_000;
+
+    /// @dev Safety envelope on the governable `baseResetPeriod`.
+    uint64 public constant RESET_PERIOD_FLOOR = 30 days;
+    uint64 public constant RESET_PERIOD_CEILING = 365 days;
 
     /// @dev EIP-712 typehash for binding an iroh NodeId to an EVM address.
     ///      ADR 024 mandates EIP-712 + SignatureChecker for all client-signed
@@ -88,6 +104,12 @@ contract StakingRegistry is
         bytes32 nodeId; // bound iroh pubkey, zero when unregistered
         OperatorState state;
         uint64 bindingNonce; // monotonic nonce for binding signatures
+        // Escalating-slash bookkeeping (ADR 004). All zeroed on first
+        // registration; lifetime counter is monotonic across all life events
+        // including ejection + re-registration from a different address.
+        uint8 storedTier; // tier reached on most recent slash, capped at MAX_TIER
+        uint32 lifetimeOffenseCount; // monotonic, never decreases
+        uint64 lastOffenseTimestamp; // for tier decay computation
     }
 
     struct UnbondRequest {
@@ -106,6 +128,11 @@ contract StakingRegistry is
 
     /// @notice Seconds an unbonded amount must wait before withdrawal.
     uint64 public unbondingPeriod;
+
+    /// @notice Base period (seconds) for one tier drop in the escalating
+    /// slash schedule (ADR 004). Effective period scales with lifetime
+    /// offense count via `_effectiveResetPeriod`.
+    uint64 public baseResetPeriod;
 
     mapping(address operator => StakeInfo) internal _stakes;
     mapping(address operator => UnbondRequest[]) internal _unbondQueue;
@@ -156,6 +183,7 @@ contract StakingRegistry is
     event ClientUnstaked(address indexed client, uint256 amount, uint256 newTotal);
     event MinStakeUpdated(uint256 oldValue, uint256 newValue);
     event UnbondingPeriodUpdated(uint64 oldValue, uint64 newValue);
+    event BaseResetPeriodUpdated(uint64 oldValue, uint64 newValue);
 
     // ---------------------------------------------------------------------
     //  Errors
@@ -182,6 +210,7 @@ contract StakingRegistry is
         IERC20 token,
         uint256 initialMinStake,
         uint64 initialUnbondingPeriod,
+        uint64 initialBaseResetPeriod,
         address admin
     ) EIP712("StakingRegistry", "1") {
         if (address(token) == address(0) || admin == address(0)) revert Errors.ZeroAddress();
@@ -192,10 +221,17 @@ contract StakingRegistry is
         {
             revert Errors.OutOfBounds();
         }
+        if (
+            initialBaseResetPeriod < RESET_PERIOD_FLOOR
+                || initialBaseResetPeriod > RESET_PERIOD_CEILING
+        ) {
+            revert Errors.OutOfBounds();
+        }
 
         TOKEN_CONTRACT = token;
         minStake = initialMinStake;
         unbondingPeriod = initialUnbondingPeriod;
+        baseResetPeriod = initialBaseResetPeriod;
 
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
         _pause(); // deploy script unpauses after all role grants land (ADR 016 §2)
@@ -375,12 +411,29 @@ contract StakingRegistry is
         uint256 slashable = s.active + s.unbonding;
         if (slashable == 0) revert NodeNotStaked();
 
-        slashed = (slashable * SLASH_BPS_POC) / BPS_DENOMINATOR;
-        // Reject dust stakes outright rather than silently zero the challenger
-        // reward. Under the 10% PoC schedule this fires when slashable < 10
-        // wei — within noise of the min-stake bound, so this is a no-op for
-        // honest operators.
+        // Apply tier decay before incrementing — without this a stale
+        // stored tier would be bumped past the correct level (ADR 004).
+        uint8 effectiveTier = _currentTier(s);
+        uint16 bps = _bpsForTier(effectiveTier);
+        slashed = (slashable * bps) / BPS_DENOMINATOR;
+        // Reject dust stakes outright rather than silently zero the
+        // challenger reward.
         if (slashed == 0) revert StakeTooSmallToSlash();
+
+        // Bookkeeping: store the new tier (capped), bump the lifetime
+        // counter, stamp the offense timestamp. These survive ejection
+        // because re-registration of the same address is impossible —
+        // a different address re-registering the same NodeId is blocked
+        // by the persisted `nodeIdToOperator` binding.
+        uint8 newTier = effectiveTier < MAX_TIER ? effectiveTier + 1 : MAX_TIER;
+        s.storedTier = newTier;
+        unchecked {
+            // Saturating increment to be safe against the ~4.3B-offense edge.
+            s.lifetimeOffenseCount = s.lifetimeOffenseCount == type(uint32).max
+                ? type(uint32).max
+                : s.lifetimeOffenseCount + 1;
+        }
+        s.lastOffenseTimestamp = block.timestamp.toUint64();
 
         // Pull from active first, then spill into oldest unbonding entries.
         if (slashed <= s.active) {
@@ -413,6 +466,54 @@ contract StakingRegistry is
             emit NodeAutoEjected(node, remainingSlashable, threshold);
             _ejectInternal(node);
         }
+    }
+
+    /// @notice Compute the effective slash tier for `operator` factoring in
+    /// elapsed clean time since their last offense. Returns 0 (first-offense
+    /// rate) for nodes with no prior offenses or whose tier has fully decayed.
+    function currentTier(
+        address operator
+    ) external view returns (uint8) {
+        return _currentTier(_stakes[operator]);
+    }
+
+    function _currentTier(
+        StakeInfo storage s
+    ) internal view returns (uint8) {
+        uint8 stored = s.storedTier;
+        if (stored == 0) return 0;
+        uint64 elapsed = block.timestamp.toUint64() - s.lastOffenseTimestamp;
+        uint64 period = _effectiveResetPeriod(s.lifetimeOffenseCount);
+        if (period == 0) return stored; // safety belt; bounds prevent zero
+        uint256 drops = elapsed / period;
+        return drops >= stored ? 0 : stored - uint8(drops);
+    }
+
+    /// @notice Reset period actually applied for a node with `lifetimeCount`
+    /// prior offenses. Doubles per offense up to a 4× cap (ADR 004).
+    function effectiveResetPeriod(
+        address operator
+    ) external view returns (uint64) {
+        return _effectiveResetPeriod(_stakes[operator].lifetimeOffenseCount);
+    }
+
+    function _effectiveResetPeriod(
+        uint32 lifetimeCount
+    ) internal view returns (uint64) {
+        // multiplier = min(2 ^ (max(lifetimeCount, 1) - 1), 4)
+        uint256 mult;
+        if (lifetimeCount <= 1) mult = 1;
+        else if (lifetimeCount == 2) mult = 2;
+        else mult = 4;
+        return uint64(uint256(baseResetPeriod) * mult);
+    }
+
+    function _bpsForTier(
+        uint8 tier
+    ) internal pure returns (uint16) {
+        if (tier == 0) return SLASH_BPS_TIER_0;
+        if (tier == 1) return SLASH_BPS_TIER_1;
+        return SLASH_BPS_TIER_2;
     }
 
     /// @inheritdoc IStakingRegistry
@@ -505,6 +606,16 @@ contract StakingRegistry is
         }
         emit UnbondingPeriodUpdated(unbondingPeriod, newPeriod);
         unbondingPeriod = newPeriod;
+    }
+
+    function setBaseResetPeriod(
+        uint64 newPeriod
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (newPeriod < RESET_PERIOD_FLOOR || newPeriod > RESET_PERIOD_CEILING) {
+            revert Errors.OutOfBounds();
+        }
+        emit BaseResetPeriodUpdated(baseResetPeriod, newPeriod);
+        baseResetPeriod = newPeriod;
     }
 
     function pause() external onlyRole(DEFAULT_ADMIN_ROLE) {
