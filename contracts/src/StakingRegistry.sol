@@ -242,6 +242,17 @@ contract StakingRegistry is
     }
 
     /// @notice Sweep all matured unbonding entries and pay out.
+    /// @dev Walks the queue front-to-back and stops at the first
+    /// non-matured entry. Entries are pushed in monotonic insertion order
+    /// using the `unbondingPeriod` in force *at insertion time*, so under
+    /// a constant period the queue is also sorted by `unlockTime`. If
+    /// governance decreases `unbondingPeriod`, a newer entry can mature
+    /// before an older one — a matured entry behind a non-matured one
+    /// will not be paid out by this call. The funds are not lost: the
+    /// next `withdrawUnbonded` after the older entry matures sweeps both.
+    /// `MAX_UNBONDING_ENTRIES` (32) caps the worst-case delay. A
+    /// production design that re-sorts on insertion is tracked for
+    /// post-PoC follow-up.
     function withdrawUnbonded() external nonReentrant whenNotPaused {
         UnbondRequest[] storage queue = _unbondQueue[msg.sender];
         StakeInfo storage s = _stakes[msg.sender];
@@ -260,13 +271,7 @@ contract StakingRegistry is
         }
         if (payout == 0) revert NothingToWithdraw();
 
-        // Shift tail down by `i` positions.
-        for (uint256 j = i; j < len; ++j) {
-            queue[j - i] = queue[j];
-        }
-        for (uint256 k = 0; k < i; ++k) {
-            queue.pop();
-        }
+        _compactQueueFront(queue, i, len);
 
         s.unbonding -= payout;
         emit UnstakeWithdrawn(msg.sender, payout);
@@ -603,16 +608,29 @@ contract StakingRegistry is
         }
         // Compact: drop fully-consumed leading entries.
         if (i > 0) {
-            for (uint256 j = i; j < len; ++j) {
-                queue[j - i] = queue[j];
-            }
-            for (uint256 k = 0; k < i; ++k) {
-                queue.pop();
-            }
+            _compactQueueFront(queue, i, len);
         }
         // Invariant: s.unbonding == sum(queue[i].amount) at entry, so the
         // loop above consumes the full requested amount. Any residual here
         // would mean storage corruption or a broken refactor — surface it.
         if (amount != 0) revert Errors.InvariantViolated();
+    }
+
+    /// @dev Drop the first `i` entries of `queue` (length `len`) by shifting
+    /// survivors down and popping the trailing `i` slots. Two callers — the
+    /// happy-path withdraw and the slash-spill consumer — used to inline the
+    /// same loop pair; centralising it removes a maintenance hazard. The
+    /// caller is responsible for asserting `i <= len` before invoking.
+    function _compactQueueFront(
+        UnbondRequest[] storage queue,
+        uint256 i,
+        uint256 len
+    ) internal {
+        for (uint256 j = i; j < len; ++j) {
+            queue[j - i] = queue[j];
+        }
+        for (uint256 k = 0; k < i; ++k) {
+            queue.pop();
+        }
     }
 }
