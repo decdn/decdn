@@ -146,6 +146,10 @@ contract StakingRegistry is
         address indexed challenger
     );
     event NodeEjected(address indexed operator, uint256 movedToUnbonding, uint64 unlockTime);
+    /// @dev Emitted when `slash()` drops a node's slashable pool below the
+    ///      auto-ejection threshold (50% of `minStake`). The event carries
+    ///      `slashable` so off-chain auditing can reconstruct the trigger.
+    event NodeAutoEjected(address indexed operator, uint256 slashable, uint256 threshold);
     event NodeRegistered(address indexed operator, bytes32 indexed nodeId, uint64 nonce);
     event SettlementRecorded(address indexed operator, uint64 timestamp);
     event ClientStaked(address indexed client, uint256 amount, uint256 newTotal);
@@ -397,6 +401,18 @@ contract StakingRegistry is
         // ADR 004's deflationary semantics intact (a dead-address transfer
         // would not).
         if (burn > 0) IBurnable(address(TOKEN_CONTRACT)).burn(burn);
+
+        // Auto-eject if the post-slash slashable pool fell below 50% of the
+        // current `minStake` (ADR 004 §Auto-Ejection). The threshold is
+        // computed against the *current* governance value rather than the
+        // value at registration so that a governance-raised `minStake`
+        // sweeps under-collateralized nodes on their next slash.
+        uint256 remainingSlashable = s.active + s.unbonding;
+        uint256 threshold = minStake / 2;
+        if (remainingSlashable < threshold && s.state == OperatorState.Registered) {
+            emit NodeAutoEjected(node, remainingSlashable, threshold);
+            _ejectInternal(node);
+        }
     }
 
     /// @inheritdoc IStakingRegistry
@@ -418,6 +434,17 @@ contract StakingRegistry is
     function ejectNode(
         address operator
     ) external override nonReentrant whenNotPaused onlyRole(Roles.BLACKLIST_ROLE) {
+        _ejectInternal(operator);
+    }
+
+    /// @dev Mark `operator` as ejected, remove from the active set, and
+    /// move any remaining `s.active` to a fresh unbonding entry. Shared
+    /// between role-gated `ejectNode` (BLACKLIST_ROLE) and the auto-eject
+    /// path inside `slash()` (ADR 004 §Auto-Ejection). Idempotent — a
+    /// second call after ejection is a no-op.
+    function _ejectInternal(
+        address operator
+    ) internal {
         StakeInfo storage s = _stakes[operator];
         if (s.state == OperatorState.Ejected) return; // idempotent
         s.state = OperatorState.Ejected;

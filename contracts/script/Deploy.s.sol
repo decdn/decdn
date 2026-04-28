@@ -160,7 +160,11 @@ contract Deploy is Script {
             150,
             10,
             48 hours,
-            90 days
+            90 days,
+            // Initial rate bounds per ADR 003 §Rate Bounds: $0.000001/MB
+            // floor (anti-zero safeguard), $0.001/MB ceiling (100x market).
+            1,
+            1000
         );
 
         d.buybackBurner = new BuybackBurner(IERC20(address(d.token)), d.usdc, router, self);

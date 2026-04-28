@@ -36,7 +36,7 @@ contract StablePaymentChannelTest is Test {
         usdc = new MockUSDC();
         reg = new StakingRegistry(token, MIN_STAKE, 7 days, admin);
         ch = new StablePaymentChannel(
-            usdc, reg, treasury, admin, 300, 150, 10, DISPUTE_WINDOW, MAX_DURATION
+            usdc, reg, treasury, admin, 300, 150, 10, DISPUTE_WINDOW, MAX_DURATION, 1, 1000
         );
 
         vm.startPrank(admin);
@@ -74,24 +74,53 @@ contract StablePaymentChannelTest is Test {
     function test_Constructor_RevertsOnBadParams() public {
         vm.expectRevert(Errors.ZeroAddress.selector);
         new StablePaymentChannel(
-            MockUSDC(address(0)), reg, treasury, admin, 300, 150, 10, DISPUTE_WINDOW, MAX_DURATION
+            MockUSDC(address(0)),
+            reg,
+            treasury,
+            admin,
+            300,
+            150,
+            10,
+            DISPUTE_WINDOW,
+            MAX_DURATION,
+            1,
+            1000
         );
         vm.expectRevert(Errors.OutOfBounds.selector);
         new StablePaymentChannel(
-            usdc, reg, treasury, admin, 2001, 150, 10, DISPUTE_WINDOW, MAX_DURATION
+            usdc, reg, treasury, admin, 2001, 150, 10, DISPUTE_WINDOW, MAX_DURATION, 1, 1000
         );
         vm.expectRevert(Errors.OutOfBounds.selector);
         new StablePaymentChannel(
-            usdc, reg, treasury, admin, 300, 400, 10, DISPUTE_WINDOW, MAX_DURATION
+            usdc, reg, treasury, admin, 300, 400, 10, DISPUTE_WINDOW, MAX_DURATION, 1, 1000
         );
         vm.expectRevert(Errors.OutOfBounds.selector);
         new StablePaymentChannel(
-            usdc, reg, treasury, admin, 300, 150, 0, DISPUTE_WINDOW, MAX_DURATION
+            usdc, reg, treasury, admin, 300, 150, 0, DISPUTE_WINDOW, MAX_DURATION, 1, 1000
         );
         vm.expectRevert(Errors.OutOfBounds.selector);
-        new StablePaymentChannel(usdc, reg, treasury, admin, 300, 150, 10, 1 hours, MAX_DURATION);
+        new StablePaymentChannel(
+            usdc, reg, treasury, admin, 300, 150, 10, 1 hours, MAX_DURATION, 1, 1000
+        );
         vm.expectRevert(Errors.OutOfBounds.selector);
-        new StablePaymentChannel(usdc, reg, treasury, admin, 300, 150, 10, DISPUTE_WINDOW, 1 days);
+        new StablePaymentChannel(
+            usdc, reg, treasury, admin, 300, 150, 10, DISPUTE_WINDOW, 1 days, 1, 1000
+        );
+        // Floor below safety minimum (RATE_FLOOR_MIN = 1).
+        vm.expectRevert(Errors.OutOfBounds.selector);
+        new StablePaymentChannel(
+            usdc, reg, treasury, admin, 300, 150, 10, DISPUTE_WINDOW, MAX_DURATION, 0, 1000
+        );
+        // Ceiling above safety maximum (RATE_CEILING_MAX = 10_000).
+        vm.expectRevert(Errors.OutOfBounds.selector);
+        new StablePaymentChannel(
+            usdc, reg, treasury, admin, 300, 150, 10, DISPUTE_WINDOW, MAX_DURATION, 1, 10_001
+        );
+        // Floor > ceiling.
+        vm.expectRevert(Errors.OutOfBounds.selector);
+        new StablePaymentChannel(
+            usdc, reg, treasury, admin, 300, 150, 10, DISPUTE_WINDOW, MAX_DURATION, 500, 100
+        );
     }
 
     // ---------------- open / topUp ----------------
@@ -477,6 +506,50 @@ contract StablePaymentChannelTest is Test {
 
     function test_ChannelClient_ReturnsZeroForUnknown() public view {
         assertEq(ch.channelClient(bytes32(uint256(0x9999))), address(0));
+    }
+
+    function test_GetRateBounds_ReturnsConstructorValues() public view {
+        (uint256 floor, uint256 ceiling) = ch.getRateBounds();
+        assertEq(floor, 1);
+        assertEq(ceiling, 1000);
+        assertEq(ch.deliveryFloor(), 1);
+        assertEq(ch.deliveryCeiling(), 1000);
+    }
+
+    function test_SetRateBounds_Updates() public {
+        vm.expectEmit(true, true, true, true);
+        emit StablePaymentChannel.RateBoundsUpdated(5, 2000);
+        vm.prank(admin);
+        ch.setRateBounds(5, 2000);
+        (uint256 floor, uint256 ceiling) = ch.getRateBounds();
+        assertEq(floor, 5);
+        assertEq(ceiling, 2000);
+    }
+
+    function test_SetRateBounds_RejectsBelowFloorMin() public {
+        vm.expectRevert(Errors.OutOfBounds.selector);
+        vm.prank(admin);
+        ch.setRateBounds(0, 1000);
+    }
+
+    function test_SetRateBounds_RejectsAboveCeilingMax() public {
+        vm.expectRevert(Errors.OutOfBounds.selector);
+        vm.prank(admin);
+        ch.setRateBounds(1, 10_001);
+    }
+
+    function test_SetRateBounds_RejectsInvertedBounds() public {
+        vm.expectRevert(Errors.OutOfBounds.selector);
+        vm.prank(admin);
+        ch.setRateBounds(500, 100);
+    }
+
+    function test_SetRateBounds_OnlyOwner() public {
+        vm.expectRevert(
+            abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, randomUser)
+        );
+        vm.prank(randomUser);
+        ch.setRateBounds(5, 2000);
     }
 
     function test_NextChannelId_AdvancesAfterOpen() public {

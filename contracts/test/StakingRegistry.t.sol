@@ -316,6 +316,63 @@ contract StakingRegistryTest is Test {
         assertGt(tailAfter.unlockTime, tailBefore.unlockTime);
     }
 
+    function test_Slash_AutoEjectsBelowHalfMinStake() public {
+        // ADR 004 §Auto-Ejection: a slash that drops the slashable pool
+        // below 50% of `minStake` MUST auto-eject the operator.
+        // Stake exactly 5x MIN_STAKE so a single 10% slash leaves 4.5x
+        // (still above the 0.5x threshold), and a second slash leaves
+        // ~4.05x (still above) — we need to slash enough to cross.
+        // To trigger directly: stake 0.55x MIN_STAKE so 10% leaves 0.495x
+        // (below the 0.5x threshold).
+        bytes32 nodeId = keccak256("auto-eject");
+        bytes memory sigOp = _signBind(operatorPk, nodeId, 0);
+        vm.prank(operator);
+        reg.stake(MIN_STAKE);
+        vm.prank(operator);
+        reg.registerNode(nodeId, sigOp);
+
+        // Drop the operator's effective stake to ~0.55x via repeated unstake.
+        // unstake moves to unbonding (still slashable) — the threshold is
+        // checked against `active + unbonding`, not `active` alone, so we
+        // need to actually shrink the pool. Skip ahead, withdraw, then
+        // re-stake to a level that yields a single below-threshold slash.
+        vm.prank(operator);
+        reg.unstake(MIN_STAKE);
+        vm.warp(block.timestamp + UNBONDING + 1);
+        vm.prank(operator);
+        reg.withdrawUnbonded();
+
+        // Now stake 0.55x MIN_STAKE (550 TOKEN). 10% slash → 0.495x left.
+        vm.prank(operator);
+        reg.stake(550e18);
+        assertEq(reg.getActiveNodeCount(), 1);
+        assertTrue(reg.getStakeInfo(operator).state == StakingRegistry.OperatorState.Registered);
+
+        vm.prank(slasher);
+        reg.slash(operator, IStakingRegistry.OffenseType.PhantomBlob);
+
+        // Auto-ejected: removed from active set, state == Ejected.
+        assertEq(reg.getActiveNodeCount(), 0);
+        assertTrue(reg.getStakeInfo(operator).state == StakingRegistry.OperatorState.Ejected);
+    }
+
+    function test_Slash_DoesNotAutoEjectAboveThreshold() public {
+        // 10% slash on a healthy 1x stake leaves 0.9x — well above 0.5x,
+        // so no ejection.
+        bytes32 nodeId = keccak256("healthy");
+        bytes memory sigOp = _signBind(operatorPk, nodeId, 0);
+        vm.prank(operator);
+        reg.stake(MIN_STAKE);
+        vm.prank(operator);
+        reg.registerNode(nodeId, sigOp);
+
+        vm.prank(slasher);
+        reg.slash(operator, IStakingRegistry.OffenseType.PhantomBlob);
+
+        assertEq(reg.getActiveNodeCount(), 1);
+        assertTrue(reg.getStakeInfo(operator).state == StakingRegistry.OperatorState.Registered);
+    }
+
     function test_Slash_RevertsOnDustStake() public {
         // `stake()` has no lower-bound check (only `registerNode` enforces
         // `minStake`), so we can deposit dust directly. 9 wei of slashable

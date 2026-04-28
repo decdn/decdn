@@ -40,6 +40,14 @@ contract StablePaymentChannel is Ownable, ReentrancyGuardTransient, Pausable, EI
     uint64 public constant CHANNEL_DURATION_FLOOR = 7 days;
     uint64 public constant CHANNEL_DURATION_CEILING = 365 days;
 
+    /// @dev Hardcoded safety envelope for the governable rate bounds (ADR
+    ///      003 §Rate Bounds). Both values are USDC base units (6 decimals)
+    ///      per MB. The ceiling envelope (10000 ≈ $0.01/MB) sits 10× above
+    ///      the PoC initial ceiling and well below any rate that could
+    ///      cause overflow when multiplied by realistic byte counts.
+    uint256 public constant RATE_FLOOR_MIN = 1; // 1 base unit (~$0.000001/MB)
+    uint256 public constant RATE_CEILING_MAX = 10_000; // ~$0.01/MB envelope
+
     /// @dev EIP-712 typehash for a cumulative payment voucher. Frozen —
     ///      changing any field invalidates every voucher clients have
     ///      already signed. Schema changes require a new typehash name.
@@ -84,6 +92,13 @@ contract StablePaymentChannel is Ownable, ReentrancyGuardTransient, Pausable, EI
     uint64 public disputeWindow; // seconds
     uint64 public maxChannelDuration; // seconds
 
+    /// @notice Governable rate floor, USDC base units per MB (ADR 003).
+    ///         Off-chain coordination only — not enforced at settlement;
+    ///         compliant nodes refuse to advertise outside [floor, ceiling].
+    uint256 public deliveryFloor;
+    /// @notice Governable rate ceiling, USDC base units per MB (ADR 003).
+    uint256 public deliveryCeiling;
+
     mapping(bytes32 channelId => Channel) internal _channels;
     mapping(address client => uint256) internal _clientChannelNonce;
 
@@ -119,6 +134,9 @@ contract StablePaymentChannel is Ownable, ReentrancyGuardTransient, Pausable, EI
     event DisputeWindowUpdated(uint64 oldValue, uint64 newValue);
     event MaxChannelDurationUpdated(uint64 oldValue, uint64 newValue);
     event TreasuryUpdated(address indexed oldTreasury, address indexed newTreasury);
+    /// @dev Emitted by `setRateBounds` so off-chain nodes refresh their
+    ///      cached coordination bounds without polling (ADR 003).
+    event RateBoundsUpdated(uint256 newDeliveryFloor, uint256 newDeliveryCeiling);
 
     // ---------------------------------------------------------------------
     //  Errors
@@ -151,7 +169,9 @@ contract StablePaymentChannel is Ownable, ReentrancyGuardTransient, Pausable, EI
         uint256 discountedFeeBps_,
         uint256 discountStakeMultiple_,
         uint64 disputeWindow_,
-        uint64 maxChannelDuration_
+        uint64 maxChannelDuration_,
+        uint256 deliveryFloor_,
+        uint256 deliveryCeiling_
     ) Ownable(admin) EIP712("StablePaymentChannel", "1") {
         if (
             address(usdc) == address(0) || address(stakingRegistry) == address(0)
@@ -168,6 +188,12 @@ contract StablePaymentChannel is Ownable, ReentrancyGuardTransient, Pausable, EI
         ) {
             revert Errors.OutOfBounds();
         }
+        if (
+            deliveryFloor_ < RATE_FLOOR_MIN || deliveryCeiling_ > RATE_CEILING_MAX
+                || deliveryFloor_ > deliveryCeiling_
+        ) {
+            revert Errors.OutOfBounds();
+        }
 
         USDC = usdc;
         STAKING_REGISTRY = stakingRegistry;
@@ -177,6 +203,8 @@ contract StablePaymentChannel is Ownable, ReentrancyGuardTransient, Pausable, EI
         discountStakeMultiple = discountStakeMultiple_;
         disputeWindow = disputeWindow_;
         maxChannelDuration = maxChannelDuration_;
+        deliveryFloor = deliveryFloor_;
+        deliveryCeiling = deliveryCeiling_;
     }
 
     // ---------------------------------------------------------------------
@@ -375,6 +403,31 @@ contract StablePaymentChannel is Ownable, ReentrancyGuardTransient, Pausable, EI
         if (newTreasury == address(0)) revert Errors.ZeroAddress();
         emit TreasuryUpdated(treasury, newTreasury);
         treasury = newTreasury;
+    }
+
+    /// @notice Update the rate floor/ceiling. Coordination-only — nodes
+    /// that follow the spec refuse to advertise outside the bounds, but
+    /// the contract does not enforce rate compliance during settlement
+    /// or slashing (ADR 003 §Rate Bounds).
+    function setRateBounds(
+        uint256 newDeliveryFloor,
+        uint256 newDeliveryCeiling
+    ) external onlyOwner {
+        if (
+            newDeliveryFloor < RATE_FLOOR_MIN || newDeliveryCeiling > RATE_CEILING_MAX
+                || newDeliveryFloor > newDeliveryCeiling
+        ) {
+            revert Errors.OutOfBounds();
+        }
+        deliveryFloor = newDeliveryFloor;
+        deliveryCeiling = newDeliveryCeiling;
+        emit RateBoundsUpdated(newDeliveryFloor, newDeliveryCeiling);
+    }
+
+    /// @notice Read both rate bounds in a single call so off-chain nodes
+    /// can refresh their cache atomically (ADR 003 §Rate Bounds Refresh).
+    function getRateBounds() external view returns (uint256, uint256) {
+        return (deliveryFloor, deliveryCeiling);
     }
 
     function pause() external onlyOwner {
