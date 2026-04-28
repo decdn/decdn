@@ -86,19 +86,29 @@ After all contracts are deployed, the deployer must execute these transactions b
    stakingRegistry.grantRole(SLASH_ROLE, address(slashJudge));
    ```
 
-3. **Add initial token to PaymentChannel** (production only):
+3. **Grant `SETTLEMENT_REPORTER_ROLE`** on StakingRegistry to the PaymentChannel:
+
+   ```solidity
+   stakingRegistry.grantRole(SETTLEMENT_REPORTER_ROLE, address(paymentChannel));
+   ```
+
+   Without this grant, every paying `settleChannel` call reverts. The grant
+   is part of the atomic role-wiring transaction (Section 3 Off-Chain Read
+   API documents the off-chain consumer side).
+
+4. **Add initial token to PaymentChannel** (production only):
 
    ```solidity
    paymentChannel.addToken(USDC_ADDRESS, rateFloor, rateCeiling);
    ```
 
-4. **Register regional governance bodies** (production, if applicable):
+5. **Register regional governance bodies** (production, if applicable):
 
    ```solidity
    contentBlacklist.registerRegionalBody(regionCode, bodyAddress);
    ```
 
-5. **Transfer admin roles** to Governor + timelock (production):
+6. **Transfer admin roles** to Governor + timelock (production):
 
    ```solidity
    // For each contract with AccessControl:
@@ -139,6 +149,7 @@ graph LR
 | Caller | Callee | Function | Authorization | Mutates Callee State |
 | --- | --- | --- | --- | --- |
 | StablePaymentChannel | StakingRegistry | `getStakeMultiple(provider)` | Public (read-only) | No |
+| StablePaymentChannel | StakingRegistry | `recordSettlement(provider)` | `SETTLEMENT_REPORTER_ROLE` | Yes (single SSTORE; see §3 Off-Chain Read API) |
 | StablePaymentChannel | IERC20 (USDC) | `safeTransferFrom()` | Caller must have allowance | Yes |
 | StablePaymentChannel | IERC20 (USDC) | `safeTransfer()` | Caller holds balance | Yes |
 | PaymentChannel | StakingRegistry | `getStakeMultiple(provider)` | Public (read-only) | No |
@@ -266,6 +277,7 @@ All role-based access uses OpenZeppelin `AccessControl`. The `DEFAULT_ADMIN_ROLE
 | `DEFAULT_ADMIN_ROLE` | All contracts | Grant/revoke roles, set parameters | Deployer EOA | `TimelockController` (2-day delay) |
 | `BLACKLIST_ROLE` | StakingRegistry | `ejectNode()` | ContentBlacklist contract | ContentBlacklist contract |
 | `SLASH_ROLE` | StakingRegistry | `slash()` | SlashJudge contract | SlashJudge contract |
+| `SETTLEMENT_REPORTER_ROLE` | StakingRegistry | `recordSettlement()` | StablePaymentChannel | StablePaymentChannel + future PaymentChannel(s) |
 | `KEEPER_ROLE` | BuybackBurner | `executeBuyback()` | Admin / disabled | Keeper bot or governance |
 | `GOVERNANCE_ROLE` | ContentBlacklist | `addHash()`, `removeHash()`, `addOrigin()`, `removeOrigin()`, `registerRegionalBody()` | Admin | Governor via timelock |
 | `EMERGENCY_ROLE` | ContentBlacklist (emergency functions), fund-holding contracts (`pause()`) | `emergencyAdd()`, `emergencyAddOrigin()`, `suspendRegionalBody()` (ContentBlacklist); `pause()` (Pausable contracts only) | Admin | 3-of-5 multisig (12-month sunset) |

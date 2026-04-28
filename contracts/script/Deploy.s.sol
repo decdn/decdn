@@ -181,6 +181,10 @@ contract Deploy is Script {
         // Atomic role wiring per ADR 016 §2.
         d.stakingRegistry.grantRole(Roles.BLACKLIST_ROLE, address(d.contentBlacklist));
         d.stakingRegistry.grantRole(Roles.SLASH_ROLE, address(d.slashJudge));
+        // PaymentChannel stamps `lastSettlementAt` after every paying settlement
+        // so off-chain clients can bias cold-start bootstrap toward proven
+        // deliverers (ADR 016 §3 Off-Chain Read API).
+        d.stakingRegistry.grantRole(Roles.SETTLEMENT_REPORTER_ROLE, address(d.paymentChannel));
         d.stakingRegistry.unpause();
 
         // Hand admin over to the requested deployer and renounce from self.

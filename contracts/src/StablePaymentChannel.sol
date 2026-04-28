@@ -291,7 +291,8 @@ contract StablePaymentChannel is Ownable, ReentrancyGuardTransient, Pausable, EI
 
         uint256 claimed = c.claimedAmount;
         uint256 deposit = c.deposit;
-        uint256 fee = (claimed * _effectiveFeeBps(c.provider)) / BPS_DENOMINATOR;
+        address provider = c.provider;
+        uint256 fee = (claimed * _effectiveFeeBps(provider)) / BPS_DENOMINATOR;
         uint256 providerPayout = claimed - fee;
         uint256 clientRefund = deposit - claimed;
 
@@ -299,7 +300,15 @@ contract StablePaymentChannel is Ownable, ReentrancyGuardTransient, Pausable, EI
 
         emit ChannelSettled(channelId, providerPayout, clientRefund, fee);
 
-        if (providerPayout > 0) USDC.safeTransfer(c.provider, providerPayout);
+        // Stamp the registry so off-chain clients can rank cold-start
+        // candidates by recent delivery activity (ADR 016 §3 Off-Chain Read
+        // API). Only on settlements that actually paid the provider —
+        // zero-claim channels carry no liveness signal. The registry must
+        // hold `SETTLEMENT_REPORTER_ROLE` for this caller; the call reverts
+        // if the deploy script never granted it (fail-fast).
+        if (providerPayout > 0) STAKING_REGISTRY.recordSettlement(provider);
+
+        if (providerPayout > 0) USDC.safeTransfer(provider, providerPayout);
         if (fee > 0) USDC.safeTransfer(treasury, fee);
         if (clientRefund > 0) USDC.safeTransfer(c.client, clientRefund);
     }

@@ -12,4 +12,9 @@ library Roles {
     bytes32 internal constant KEEPER_ROLE = keccak256("KEEPER_ROLE");
     bytes32 internal constant GOVERNANCE_ROLE = keccak256("GOVERNANCE_ROLE");
     bytes32 internal constant EMERGENCY_ROLE = keccak256("EMERGENCY_ROLE");
+    /// @dev Granted to PaymentChannel contracts so they can stamp
+    ///      `lastSettlementAt` on the registry — used by clients to bias
+    ///      cold-start bootstrap toward proven deliverers (ADR 016 §3
+    ///      Off-Chain Read API).
+    bytes32 internal constant SETTLEMENT_REPORTER_ROLE = keccak256("SETTLEMENT_REPORTER_ROLE");
 }

@@ -39,8 +39,13 @@ contract StablePaymentChannelTest is Test {
             usdc, reg, treasury, admin, 300, 150, 10, DISPUTE_WINDOW, MAX_DURATION
         );
 
-        vm.prank(admin);
+        vm.startPrank(admin);
+        // The deploy script grants this in production (ADR 016 §2 + Deploy.s.sol).
+        // Tests must mirror that wiring or settleChannel reverts on the
+        // recordSettlement callback for any non-zero claim.
+        reg.grantRole(Roles.SETTLEMENT_REPORTER_ROLE, address(ch));
         reg.unpause();
+        vm.stopPrank();
 
         usdc.mint(client, 1_000_000e6);
         vm.prank(client);
@@ -283,6 +288,36 @@ contract StablePaymentChannelTest is Test {
         ch.closeChannel(id, 100e6, 1, sig);
         vm.expectRevert(StablePaymentChannel.DisputeWindowOpen.selector);
         ch.settleChannel(id);
+    }
+
+    function test_Settle_StampsLastSettlementAt() public {
+        // Settlement of a paying channel stamps the registry so off-chain
+        // clients can rank cold-start candidates by recent delivery
+        // (ADR 016 §3 Off-Chain Read API).
+        bytes32 id = _openChannel(1000e6);
+        bytes memory sig = _signVoucher(clientPk, id, 800e6, 1);
+        vm.prank(provider);
+        ch.closeChannel(id, 800e6, 1, sig);
+        vm.warp(block.timestamp + DISPUTE_WINDOW + 1);
+
+        assertEq(reg.lastSettlementAt(provider), 0);
+        ch.settleChannel(id);
+        assertEq(reg.lastSettlementAt(provider), uint64(block.timestamp));
+    }
+
+    function test_Settle_DoesNotStampOnZeroClaim() public {
+        // A zero-claim settlement carries no liveness signal, so we don't
+        // stamp the registry. Avoids polluting the bootstrap signal with
+        // channels that opened and closed without delivering anything.
+        // Provider closes with the zero-voucher shortcut (claimedAmount=0,
+        // nonce=0 path) which channelClose explicitly allows.
+        bytes32 id = _openChannel(1000e6);
+        vm.prank(provider);
+        ch.closeChannel(id, 0, 0, "");
+        vm.warp(block.timestamp + DISPUTE_WINDOW + 1);
+
+        ch.settleChannel(id);
+        assertEq(reg.lastSettlementAt(provider), 0);
     }
 
     // ---------------- reclaimExpired ----------------

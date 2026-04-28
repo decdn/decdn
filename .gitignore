@@ -11,3 +11,4 @@
 # Foundry
 /contracts/out/
 /contracts/cache/
+.claude/worktrees/

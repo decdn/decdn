@@ -11,6 +11,7 @@ import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.s
 import { EIP712 } from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import { SignatureChecker } from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 import { SafeCast } from "@openzeppelin/contracts/utils/math/SafeCast.sol";
+import { EnumerableSet } from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 
 import { IStakingRegistry } from "./interfaces/IStakingRegistry.sol";
 import { IBurnable } from "./interfaces/IBurnable.sol";
@@ -37,6 +38,7 @@ contract StakingRegistry is
 {
     using SafeERC20 for IERC20;
     using SafeCast for uint256;
+    using EnumerableSet for EnumerableSet.AddressSet;
 
     // ---------------------------------------------------------------------
     //  Constants
@@ -110,6 +112,23 @@ contract StakingRegistry is
     mapping(address client => uint256) internal _clientStakes;
     mapping(bytes32 nodeId => address) public nodeIdToOperator;
 
+    /// @notice Set of currently-registered (non-ejected) operators. Mutated
+    ///         in `registerNode` and `ejectNode`; read by `getActiveNodes`
+    ///         for cold-start bootstrap (ADR 016 §3 Off-Chain Read API).
+    EnumerableSet.AddressSet internal _activeOperators;
+
+    /// @notice Unix timestamp (seconds) of the operator's first-ever
+    ///         `registerNode` call. Stable across re-registrations — used by
+    ///         the reputation cold-start bonus window (ADR 008).
+    mapping(address operator => uint64) internal _firstRegisteredAt;
+
+    /// @notice Unix timestamp (seconds) of the operator's most recent
+    ///         settlement. Stamped by PaymentChannel contracts holding
+    ///         `SETTLEMENT_REPORTER_ROLE`. Returned in `NodeInfo` so clients
+    ///         can rank cold-start candidates by recent delivery activity
+    ///         (ADR 016 §3 Off-Chain Read API).
+    mapping(address operator => uint64) internal _lastSettlementAt;
+
     // ---------------------------------------------------------------------
     //  Events
     // ---------------------------------------------------------------------
@@ -128,6 +147,7 @@ contract StakingRegistry is
     );
     event NodeEjected(address indexed operator, uint256 movedToUnbonding, uint64 unlockTime);
     event NodeRegistered(address indexed operator, bytes32 indexed nodeId, uint64 nonce);
+    event SettlementRecorded(address indexed operator, uint64 timestamp);
     event ClientStaked(address indexed client, uint256 amount, uint256 newTotal);
     event ClientUnstaked(address indexed client, uint256 amount, uint256 newTotal);
     event MinStakeUpdated(uint256 oldValue, uint256 newValue);
@@ -314,6 +334,11 @@ contract StakingRegistry is
             s.bindingNonce = nonce + 1;
         }
         nodeIdToOperator[nodeId] = msg.sender;
+        _activeOperators.add(msg.sender);
+        // Stable across re-registrations — only set on the very first call.
+        if (_firstRegisteredAt[msg.sender] == 0) {
+            _firstRegisteredAt[msg.sender] = block.timestamp.toUint64();
+        }
 
         emit NodeRegistered(msg.sender, nodeId, nonce);
     }
@@ -370,12 +395,28 @@ contract StakingRegistry is
     }
 
     /// @inheritdoc IStakingRegistry
+    function recordSettlement(
+        address operator
+    ) external override whenNotPaused onlyRole(Roles.SETTLEMENT_REPORTER_ROLE) {
+        // No reentrancy guard: single SSTORE, no external call, no fund
+        // movement. Caller is a trusted PaymentChannel that already holds
+        // its own nonReentrant guard. Off-chain ranking only — accuracy
+        // does not need to be enforced for non-existent operators (a stamp
+        // on an unregistered address is harmless and won't appear in
+        // `getActiveNodes`).
+        uint64 ts = block.timestamp.toUint64();
+        _lastSettlementAt[operator] = ts;
+        emit SettlementRecorded(operator, ts);
+    }
+
+    /// @inheritdoc IStakingRegistry
     function ejectNode(
         address operator
     ) external override nonReentrant whenNotPaused onlyRole(Roles.BLACKLIST_ROLE) {
         StakeInfo storage s = _stakes[operator];
         if (s.state == OperatorState.Ejected) return; // idempotent
         s.state = OperatorState.Ejected;
+        _activeOperators.remove(operator);
 
         // Intentionally do NOT clear `nodeIdToOperator[s.nodeId]`. Leaving
         // the mapping in place permanently locks that NodeId to the ejected
@@ -458,6 +499,52 @@ contract StakingRegistry is
         address operator
     ) external view override returns (bytes32) {
         return _stakes[operator].nodeId;
+    }
+
+    /// @inheritdoc IStakingRegistry
+    function getActiveNodeCount() external view override returns (uint256) {
+        return _activeOperators.length();
+    }
+
+    /// @inheritdoc IStakingRegistry
+    function getActiveNodes(
+        uint256 offset,
+        uint256 limit
+    ) external view override returns (NodeInfo[] memory) {
+        uint256 total = _activeOperators.length();
+        if (offset >= total) {
+            return new NodeInfo[](0);
+        }
+        uint256 end = offset + limit;
+        if (end > total) {
+            end = total;
+        }
+        uint256 count = end - offset;
+        NodeInfo[] memory out = new NodeInfo[](count);
+        for (uint256 i = 0; i < count; ++i) {
+            address op = _activeOperators.at(offset + i);
+            out[i] = NodeInfo({
+                operator: op, nodeId: _stakes[op].nodeId, lastSettlementAt: _lastSettlementAt[op]
+            });
+        }
+        return out;
+    }
+
+    /// @inheritdoc IStakingRegistry
+    function getFirstRegisteredAt(
+        address ethAddress
+    ) external view override returns (uint256) {
+        return _firstRegisteredAt[ethAddress];
+    }
+
+    /// @notice Direct getter for the settlement timestamp. Mirrors the
+    ///         field exposed in `NodeInfo` so callers that already hold an
+    ///         operator address can fetch it without paginating the active
+    ///         set. Returns 0 if the operator has never had a settlement.
+    function lastSettlementAt(
+        address operator
+    ) external view returns (uint64) {
+        return _lastSettlementAt[operator];
     }
 
     function getStakeInfo(

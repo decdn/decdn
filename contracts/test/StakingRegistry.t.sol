@@ -593,4 +593,174 @@ contract StakingRegistryTest is Test {
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, digest);
         return abi.encodePacked(r, s, v);
     }
+
+    // ---------- off-chain read API (ADR 016 §3) ----------
+
+    function test_GetActiveNodeCount_StartsZero() public view {
+        assertEq(reg.getActiveNodeCount(), 0);
+    }
+
+    function test_GetActiveNodes_EmptyWhenNoneRegistered() public view {
+        IStakingRegistry.NodeInfo[] memory nodes = reg.getActiveNodes(0, 100);
+        assertEq(nodes.length, 0);
+    }
+
+    function test_RegisterNode_AddsToActiveSet() public {
+        bytes32 nodeId = keccak256("op-node");
+        vm.prank(operator);
+        reg.stake(MIN_STAKE);
+        bytes memory sig = _signBind(operatorPk, nodeId, 0);
+        vm.prank(operator);
+        reg.registerNode(nodeId, sig);
+
+        assertEq(reg.getActiveNodeCount(), 1);
+        IStakingRegistry.NodeInfo[] memory nodes = reg.getActiveNodes(0, 100);
+        assertEq(nodes.length, 1);
+        assertEq(nodes[0].operator, operator);
+        assertEq(nodes[0].nodeId, nodeId);
+        assertEq(nodes[0].lastSettlementAt, 0);
+    }
+
+    function test_EjectNode_RemovesFromActiveSet() public {
+        bytes32 nodeId = keccak256("op-node");
+        vm.prank(operator);
+        reg.stake(MIN_STAKE);
+        bytes memory sig = _signBind(operatorPk, nodeId, 0);
+        vm.prank(operator);
+        reg.registerNode(nodeId, sig);
+
+        vm.prank(blacklister);
+        reg.ejectNode(operator);
+
+        assertEq(reg.getActiveNodeCount(), 0);
+        IStakingRegistry.NodeInfo[] memory nodes = reg.getActiveNodes(0, 100);
+        assertEq(nodes.length, 0);
+    }
+
+    function test_GetActiveNodes_PaginationCoversFullSet() public {
+        // Register three operators and verify pagination covers all of them.
+        address[] memory ops = new address[](3);
+        uint256[] memory pks = new uint256[](3);
+        ops[0] = operator;
+        pks[0] = operatorPk;
+        ops[1] = other;
+        pks[1] = otherPk;
+        // Third operator funded inline.
+        uint256 thirdPk = 0xDEADBEEF;
+        address third = vm.addr(thirdPk);
+        token.transfer(third, 1_000_000e18);
+        vm.prank(third);
+        token.approve(address(reg), type(uint256).max);
+        ops[2] = third;
+        pks[2] = thirdPk;
+
+        for (uint256 i = 0; i < 3; ++i) {
+            vm.prank(ops[i]);
+            reg.stake(MIN_STAKE);
+            bytes32 nid = keccak256(abi.encode("nid", i));
+            bytes memory sig = _signBind(pks[i], nid, 0);
+            vm.prank(ops[i]);
+            reg.registerNode(nid, sig);
+        }
+
+        assertEq(reg.getActiveNodeCount(), 3);
+
+        // First page of size 2.
+        IStakingRegistry.NodeInfo[] memory page0 = reg.getActiveNodes(0, 2);
+        assertEq(page0.length, 2);
+
+        // Second page picks up the remainder; partial page is OK.
+        IStakingRegistry.NodeInfo[] memory page1 = reg.getActiveNodes(2, 2);
+        assertEq(page1.length, 1);
+
+        // Offset past the end yields empty.
+        IStakingRegistry.NodeInfo[] memory pageEnd = reg.getActiveNodes(3, 100);
+        assertEq(pageEnd.length, 0);
+    }
+
+    function test_GetFirstRegisteredAt_ZeroBeforeRegister() public view {
+        assertEq(reg.getFirstRegisteredAt(operator), 0);
+    }
+
+    function test_GetFirstRegisteredAt_StableAcrossReRegister() public {
+        bytes32 nodeId = keccak256("op-node");
+        vm.warp(1_700_000_000);
+        vm.prank(operator);
+        reg.stake(MIN_STAKE);
+        bytes memory sig0 = _signBind(operatorPk, nodeId, 0);
+        vm.prank(operator);
+        reg.registerNode(nodeId, sig0);
+
+        uint256 firstTs = reg.getFirstRegisteredAt(operator);
+        assertEq(firstTs, 1_700_000_000);
+
+        // Eject and re-register from a *different* address (the original
+        // operator is permanently banned). Re-registration of the same
+        // operator address is impossible by design (`Ejected`), so we only
+        // verify that the first-registered timestamp does not move when
+        // *another* operator joins.
+        vm.prank(blacklister);
+        reg.ejectNode(operator);
+
+        vm.warp(1_700_001_000);
+        vm.prank(other);
+        reg.stake(MIN_STAKE);
+        bytes32 otherNode = keccak256("other-node");
+        bytes memory sigOther = _signBind(otherPk, otherNode, 0);
+        vm.prank(other);
+        reg.registerNode(otherNode, sigOther);
+
+        // Original operator's timestamp is preserved.
+        assertEq(reg.getFirstRegisteredAt(operator), firstTs);
+        // New operator gets the current timestamp.
+        assertEq(reg.getFirstRegisteredAt(other), 1_700_001_000);
+    }
+
+    // ---------- recordSettlement / settlement-weighted ranking ----------
+
+    function test_RecordSettlement_RequiresRole() public {
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector,
+                address(this),
+                Roles.SETTLEMENT_REPORTER_ROLE
+            )
+        );
+        reg.recordSettlement(operator);
+    }
+
+    function test_RecordSettlement_StampsTimestamp() public {
+        address reporter = makeAddr("reporter");
+        vm.prank(admin);
+        reg.grantRole(Roles.SETTLEMENT_REPORTER_ROLE, reporter);
+
+        vm.warp(1_700_000_500);
+        vm.prank(reporter);
+        reg.recordSettlement(operator);
+
+        assertEq(reg.lastSettlementAt(operator), 1_700_000_500);
+    }
+
+    function test_RecordSettlement_FlowsIntoNodeInfo() public {
+        // Register an operator, record a settlement, verify it appears in
+        // the NodeInfo tuple returned by getActiveNodes.
+        bytes32 nodeId = keccak256("op-node");
+        vm.prank(operator);
+        reg.stake(MIN_STAKE);
+        bytes memory sig = _signBind(operatorPk, nodeId, 0);
+        vm.prank(operator);
+        reg.registerNode(nodeId, sig);
+
+        address reporter = makeAddr("reporter");
+        vm.prank(admin);
+        reg.grantRole(Roles.SETTLEMENT_REPORTER_ROLE, reporter);
+
+        vm.warp(1_700_000_900);
+        vm.prank(reporter);
+        reg.recordSettlement(operator);
+
+        IStakingRegistry.NodeInfo[] memory nodes = reg.getActiveNodes(0, 100);
+        assertEq(nodes.length, 1);
+        assertEq(nodes[0].lastSettlementAt, 1_700_000_900);
+    }
 }
