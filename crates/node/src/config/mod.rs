@@ -252,7 +252,7 @@ fn resolve_network(
 ///
 /// Requires `0x` prefix, 40 hex characters, and a correct EIP-55 checksum.
 /// Returns the canonical checksummed form.
-pub fn parse_contract_address(flag_name: &str, raw: &str) -> anyhow::Result<String> {
+fn parse_contract_address(flag_name: &str, raw: &str) -> anyhow::Result<String> {
     let trimmed = raw.trim();
     let addr = Address::parse_checksummed(trimmed, None).with_context(|| {
         format!(
@@ -264,7 +264,7 @@ pub fn parse_contract_address(flag_name: &str, raw: &str) -> anyhow::Result<Stri
 }
 
 /// Resolve blockchain fields.
-pub fn resolve_blockchain(
+fn resolve_blockchain(
     cli: &crate::cli::run::BlockchainArgs,
     file: Option<&types::BlockchainConfig>,
     data_dir: &std::path::Path,
@@ -761,6 +761,8 @@ fn expand_braces(raw: &str, ctx: &'static str) -> anyhow::Result<String> {
 )]
 mod tests {
     use super::*;
+    use crate::cli::run::BlockchainArgs;
+    use tempfile::TempDir;
 
     #[test]
     fn normalize_region_accepts_and_uppercases() -> anyhow::Result<()> {
@@ -808,6 +810,80 @@ mod tests {
         assert!(parse_node_id_hex(&"0".repeat(65)).is_err());
         assert!(parse_node_id_hex(&"g".repeat(64)).is_err());
         assert!(parse_node_id_hex("").is_err());
+    }
+
+    // vitalik.eth, known-good EIP-55 checksum.
+    const GOOD_ADDR: &str = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045";
+
+    #[test]
+    fn parse_contract_address_accepts_checksummed() -> anyhow::Result<()> {
+        let out = parse_contract_address("x", GOOD_ADDR)?;
+        assert_eq!(out, GOOD_ADDR);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_contract_address_trims_whitespace() -> anyhow::Result<()> {
+        let padded = format!("  {GOOD_ADDR}\n");
+        let out = parse_contract_address("x", &padded)?;
+        assert_eq!(out, GOOD_ADDR);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_contract_address_rejects_missing_0x_prefix() -> anyhow::Result<()> {
+        let s = GOOD_ADDR
+            .get(2..)
+            .ok_or_else(|| anyhow::anyhow!("GOOD_ADDR shorter than expected"))?;
+        assert!(parse_contract_address("x", s).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn parse_contract_address_rejects_wrong_length() {
+        assert!(parse_contract_address("x", "0xabc").is_err());
+        assert!(parse_contract_address("x", &format!("{GOOD_ADDR}00")).is_err());
+    }
+
+    #[test]
+    fn parse_contract_address_rejects_empty_and_bare_prefix() {
+        assert!(parse_contract_address("x", "").is_err());
+        assert!(parse_contract_address("x", "0x").is_err());
+    }
+
+    #[test]
+    fn parse_contract_address_rejects_all_lowercase() {
+        let lower = GOOD_ADDR.to_lowercase();
+        assert!(parse_contract_address("x", &lower).is_err());
+    }
+
+    #[test]
+    fn parse_contract_address_rejects_bad_checksum() {
+        let mut bad = String::from(GOOD_ADDR);
+        // Flip the case of the first hex digit so the EIP-55 checksum no longer matches.
+        bad.replace_range(2..3, "D");
+        assert!(parse_contract_address("x", &bad).is_err());
+    }
+
+    #[test]
+    fn parse_contract_address_rejects_non_hex() {
+        let bad = "0xZZZZ6BF26964aF9D7eEd9e03E53415D37aA96045";
+        assert!(parse_contract_address("x", bad).is_err());
+    }
+
+    #[test]
+    fn parse_contract_address_error_names_field_and_format() -> anyhow::Result<()> {
+        let lower = GOOD_ADDR.to_lowercase();
+        let Err(err) = parse_contract_address("payment_channel_address", &lower) else {
+            anyhow::bail!("expected parse_contract_address to fail on lowercase input");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("invalid payment_channel_address"),
+            "missing flag name: {msg}"
+        );
+        assert!(msg.contains("EIP-55"), "missing format hint: {msg}");
+        Ok(())
     }
 
     #[test]
@@ -1846,5 +1922,129 @@ mod tests {
             "env-bearing args drifted; declared: {all_env_args:?}, expected {}",
             expected.len()
         );
+    }
+
+    fn data_dir_with_keystore() -> anyhow::Result<TempDir> {
+        let dir = TempDir::new()?;
+        std::fs::write(dir.path().join("keystore.json"), "")?;
+        Ok(dir)
+    }
+
+    #[test]
+    fn resolve_blockchain_names_correct_field_for_bad_address() -> anyhow::Result<()> {
+        let cli = BlockchainArgs {
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            staking_registry_address: Some("0xNOTHEX".to_string()),
+        };
+        let dir = data_dir_with_keystore()?;
+        let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
+            anyhow::bail!("expected resolve_blockchain to fail on bad staking address");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("staking_registry_address"),
+            "error should name staking_registry_address: {msg}"
+        );
+        assert!(
+            !msg.contains("payment_channel_address"),
+            "error must not name the valid field: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_names_correct_field_for_bad_payment_address() -> anyhow::Result<()> {
+        let cli = BlockchainArgs {
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            payment_channel_address: Some("0xNOTHEX".to_string()),
+            staking_registry_address: Some(GOOD_ADDR.to_string()),
+        };
+        let dir = data_dir_with_keystore()?;
+        let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
+            anyhow::bail!("expected resolve_blockchain to fail on bad payment address");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("payment_channel_address"),
+            "error should name payment_channel_address: {msg}"
+        );
+        assert!(
+            !msg.contains("staking_registry_address"),
+            "error must not name the valid field: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_fails_when_keystore_missing() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let cli = BlockchainArgs {
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            staking_registry_address: Some(GOOD_ADDR.to_string()),
+        };
+        let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
+            anyhow::bail!("expected resolve_blockchain to fail on missing keystore");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("invalid eth_keystore"),
+            "error should name eth_keystore: {msg}"
+        );
+        assert!(
+            msg.contains("cannot access"),
+            "error should describe access failure: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_fails_when_cli_keystore_override_missing() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let bogus = dir.path().join("does-not-exist.json");
+        let cli = BlockchainArgs {
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: Some(bogus),
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            staking_registry_address: Some(GOOD_ADDR.to_string()),
+        };
+        let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
+            anyhow::bail!("expected resolve_blockchain to fail on bogus --eth-keystore");
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("invalid eth_keystore"), "{msg}");
+        assert!(
+            msg.contains("does-not-exist.json"),
+            "error should cite the overridden path: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_rejects_directory_as_keystore() -> anyhow::Result<()> {
+        // `File::open` accepts a directory on Linux, so the explicit `is_file`
+        // check is the only thing standing between the node and a later panic.
+        let dir = TempDir::new()?;
+        std::fs::create_dir(dir.path().join("keystore.json"))?;
+        let cli = BlockchainArgs {
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            staking_registry_address: Some(GOOD_ADDR.to_string()),
+        };
+        let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
+            anyhow::bail!("expected resolve_blockchain to fail on directory keystore");
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("invalid eth_keystore"), "{msg}");
+        assert!(
+            msg.contains("not a regular file"),
+            "error should say 'not a regular file': {msg}"
+        );
+        Ok(())
     }
 }
