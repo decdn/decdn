@@ -92,7 +92,7 @@ The 20% floor on the node-base share guarantees operators always receive enough 
 
 [ADR 026](026-gauge-boost-tokenomics.md) replaces ADR 004's settlement-time fee skim and discount-stake mechanic; consequently the ADR 004-era "Protocol fee %", "Discounted fee %", and "Burn percentage of fees" rows are removed. Burn is now a fixed share of the `FeeRouter` split (governable within the burn-share bound above), not a percentage of an upstream fee skim.
 
-The 3-day voting period balances responsiveness with participation. Combined with the 2-day timelock, the total governance delay is 5 days minimum — comparable to standard OpenZeppelin Governor deployments.
+The 7-day voting period balances responsiveness with participation. Combined with the 48-hour timelock, the total governance delay is 9 days minimum — longer than the standard OpenZeppelin Governor defaults, reflecting ve-weighted participation cadence.
 
 Staking, slashing, and fee parameters are defined in [ADR 004](004-tokenomics.md). Payment channel parameters are defined in [ADR 003](003-payments.md). This ADR defines the governance mechanism that controls them.
 
@@ -144,7 +144,7 @@ The emergency multisig's fast-track authority over gate 2 is constrained by the 
 **Negative:**
 
 - ve-weighted governance shifts capture risk from large TOKEN holders to large ve-lockers; safety bounds limit damage but cannot prevent rent-seeking within allowed parameter ranges (e.g., setting the gauge-boost share to the 60% maximum). Operators who lock heavily for gauge boost (per [ADR 026](026-gauge-boost-tokenomics.md) §3) also accumulate disproportionate governance weight; this concentration is partially offset by team / seed / treasury vesting acting as a counterweight during the first ~3 years.
-- 3-day voting period + 2-day timelock means 5 days minimum to respond to non-emergency issues via governance
+- 7-day voting period + 48-hour timelock means 9 days minimum to respond to non-emergency issues via governance
 - Governance participation typically skews low; 4% quorum (against ve-supply) may be difficult to reach consistently, especially during the thin-ve-supply bootstrap window where the absolute quorum bar is small but the population of distinct lockers is also small
 - Without auto-ve-lock-on-vest ([ADR 026](026-gauge-boost-tokenomics.md) §1), early ve-supply is concentrated in self-locked seed/team/treasury and POL/airdrop participants who choose to lock; a treasury-funded ve-lock-on-claim airdrop is recommended in the first 6–12 months to broaden the active voter base
 - Regulatory risk: governance voting rights may contribute to TOKEN being classified as a security in some jurisdictions (see also [ADR 026](026-gauge-boost-tokenomics.md))

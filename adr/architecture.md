@@ -98,7 +98,7 @@ Clients pay nodes per MB. On a cache miss, nodes pay origin-backed nodes per MB 
 
 ### [ADR 004 — Dual-Currency Token Model](004-tokenomics.md)
 
-**USDC for payments. TOKEN for staking, governance, and fee discounts.**
+**USDC for payments. TOKEN for staking and governance.**
 
 > **Superseded by [ADR 026 — Gauge-Boost Tokenomics](026-gauge-boost-tokenomics.md).** ADR 026 is the canonical tokenomics source going forward. The summary below is preserved for historical context only.
 
@@ -157,9 +157,9 @@ Nodes are ranked by a reputation score (0.0–1.0) derived from local observatio
 
 ### [ADR 009 — Governance Model](009-governance.md)
 
-**Admin key for PoC. Token-weighted governance with safety bounds for production.**
+**Admin key for PoC. ve-weighted governance with safety bounds for production.**
 
-During the PoC, a single deployer address controls all contract parameters. Production governance uses OpenZeppelin Governor with TOKEN voting, 4% quorum, and a 2-day timelock. All governable parameters have hardcoded safety bounds that even governance cannot override (e.g., slash 5%–50%, dispute window 12h–72h; PoC deployments default the dispute window to 48h within this range). A 3-of-5 emergency multisig can only pause contracts and add emergency blacklist entries, with a 12-month sunset enforced via an immutable constructor deadline. A renewable sunset mechanism is recommended for production — governance can vote to extend the deadline by capped increments, preserving the anti-centralization default while maintaining emergency capability.
+During the PoC, a single deployer address controls all contract parameters. Production governance uses OpenZeppelin Governor with ve-weighted voting (per [ADR 026](026-gauge-boost-tokenomics.md) §4 / `VotingEscrow.balanceOfAt`), a 4% ve-supply quorum, a 7-day voting period, and a 48-hour timelock. All governable parameters have hardcoded safety bounds that even governance cannot override (e.g., slash 5%–50%, dispute window 12h–72h; PoC deployments default the dispute window to 48h within this range). A 3-of-5 emergency multisig can only pause contracts and add emergency blacklist entries, with a 12-month sunset enforced via an immutable constructor deadline. A renewable sunset mechanism is recommended for production — governance can vote to extend the deadline by capped increments, preserving the anti-centralization default while maintaining emergency capability.
 
 ---
 
