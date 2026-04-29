@@ -39,10 +39,10 @@ Watchtowers validate [ADR 027](027-distinct-client-receipts.md) delivery receipt
 
 #### 1c. Dispute-bond integration for receipt-fraud claims
 
-A watchtower that has evidence of receipt fraud — a forged signature, a colluding sybil client, a receipt batch whose distinct-client count is inflated by funder-clustered identities — challenges the operator's gauge-pool claim through the existing bonded-challenge path. The challenge bond, forfeiture, and reward mechanics already specified in [ADR 014](014-on-chain-verification.md#challenge-bond) carry over: the watchtower posts the standard challenge bond (PoC: 100 TOKEN, governable per [ADR 009](009-governance.md)) when challenging the operator's claim, the operator has the standard counter-evidence window (24h PoC) to produce valid distinct-client receipts that defeat the challenge, and resolution applies the existing rules:
+A watchtower that has evidence of receipt fraud — a forged signature, a colluding sybil client, a receipt batch whose distinct-client count is inflated by funder-clustered identities — challenges the operator's gauge-pool claim through the existing bonded-challenge path. The challenge bond, forfeiture, and reward mechanics already specified in [ADR 014](014-on-chain-verification.md#bond-handling) carry over: the watchtower posts the standard challenge bond (PoC: 100 TOKEN, governable per [ADR 009](009-governance.md)) when challenging the operator's claim, the operator has the standard counter-evidence window (24h PoC) to produce valid distinct-client receipts that defeat the challenge, and resolution applies the existing rules:
 
 - **Challenge upheld** (operator fails to produce sufficient counter-evidence). The operator's gauge-pool claim for the contested epoch is invalidated — the operator forfeits the gauge payout for that epoch — and the bond is returned to the watchtower along with a configurable challenger reward sourced from the forfeited gauge payout (sized by ADR 027 governance, not from the operator's stake). Stake slashing is **not** triggered by a routine receipt-fraud upheld challenge: per [ADR 027](027-distinct-client-receipts.md), gauge-eligibility forfeiture is the standard remedy. Stake slashing applies only when a stronger evidentiary bar is met — deliberate forgery, key compromise, or other operator offenses cataloged in [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn) and [ADR 014](014-on-chain-verification.md), in which case the existing 50% challenger / 30% safety / 20% burn distribution governs.
-- **Challenge dismissed** (operator produces valid counter-evidence). The bond is forfeit per the existing rule (50% burned, 50% to the operator per [ADR 014](014-on-chain-verification.md#challenge-bond)). This protects operators from frivolous receipt-fraud accusations and bounds the watchtower's incentive to challenge speculatively.
+- **Challenge dismissed** (operator produces valid counter-evidence). The bond is forfeit per the existing rule (50% burned, 50% to the operator per [ADR 014](014-on-chain-verification.md#bond-handling)). This protects operators from frivolous receipt-fraud accusations and bounds the watchtower's incentive to challenge speculatively.
 
 No new bond mechanism is introduced. The contract surface for receipt-fraud challenges is a new challenge type on `SlashJudge` (alongside the existing phantom / rate / blacklist / corruption types) with the same bond, counter-window, and resolution shape; the exact `submitReceiptFraudChallenge` interface lives in the ADR 027 / ADR 014 contract update, not in this ADR. Watchtower-side: the same `cdn/watchtower/v1` ALPN connection that streams voucher updates is the natural transport for receipt batches and watchtower validator attestations. A future protocol revision (`cdn/watchtower/v2`) may formalise the receipt-streaming sub-protocol; PoC implementations may piggyback on `v1`.
 
@@ -78,7 +78,7 @@ event ChannelSettled(
 
 Watchtowers use `ChannelCloseInitiated` and `ChannelDisputed` for active dispute intervention. `ChannelSettled` signals that the dispute window has closed and the channel is finalised — watchtowers use this to stop monitoring the channel and clean up stored voucher state.
 
-A successful `disputeChannel` call updates the on-chain `claimedAmount`, which changes the protocol fee computed at final settlement. See [ADR 003 — Fee Calculation on Disputed Closes](003-payments.md#fee-calculation-on-disputed-closes) for the full lifecycle. The `disputeChannel` function must also store `msg.sender` as `lastDisputor` in the `Channel` struct (or a dedicated mapping), so that the production `WatchtowerEscrow` contract can verify dispute authorship via a cross-contract static call (see [Contract: WatchtowerEscrow](#contract-watchtowerescrow)).
+A successful `disputeChannel` call updates the on-chain `claimedAmount` and `claimedBytes`, changing the values forwarded to `FeeRouter.routeSettlement` at final settlement. See [ADR 003 — Fee Routing on Disputed Closes](003-payments.md#fee-routing-on-disputed-closes) for the full lifecycle. The `disputeChannel` function must also store `msg.sender` as `lastDisputor` in the `Channel` struct (or a dedicated mapping), so that the production `WatchtowerEscrow` contract can verify dispute authorship via a cross-contract static call (see [Contract: WatchtowerEscrow](#contract-watchtowerescrow)).
 
 No separate watchtower registry contract is needed. The watchtower relationship is purely off-chain — the watched party shares voucher state with the watchtower, and the watchtower submits disputes using its own EOA and gas.
 
@@ -223,7 +223,7 @@ flowchart TD
 | Watchtower staking | N/A | Deferred |
 | Wash-trading detection (§1a) | N/A | Required (gauge-pool security per [ADR 026](026-gauge-boost-tokenomics.md)) |
 | Receipt validator role (§1b) | N/A | Required (gates gauge-pool eligibility per [ADR 027](027-distinct-client-receipts.md)) |
-| Receipt-fraud challenges (§1c) | N/A | Reuses `SlashJudge` bond mechanic per [ADR 014](014-on-chain-verification.md#challenge-bond) |
+| Receipt-fraud challenges (§1c) | N/A | Reuses `SlashJudge` bond mechanic per [ADR 014](014-on-chain-verification.md#bond-handling) |
 
 For PoC, the only action items are:
 
@@ -244,7 +244,7 @@ These three items future-proof the contract and node software for watchtower int
 - Multiple watchtowers per channel provide redundancy without requiring coordination, consensus, or shared state between watchtowers
 - Defense-in-depth layering (local monitor + watchtowers + dispute window) means no single component failure causes fund loss
 - The watchtower role extends naturally to gauge-pool security under [ADR 026](026-gauge-boost-tokenomics.md): the same off-chain monitoring infrastructure that streams voucher updates is positioned to detect wash-trading patterns and validate distinct-client delivery receipts ([ADR 027](027-distinct-client-receipts.md)) without a separate operator role
-- Receipt-fraud challenges reuse the `SlashJudge` challenge-bond mechanic from [ADR 014](014-on-chain-verification.md#challenge-bond) — no new bond contract or economic primitive
+- Receipt-fraud challenges reuse the `SlashJudge` challenge-bond mechanic from [ADR 014](014-on-chain-verification.md#bond-handling) — no new bond contract or economic primitive
 
 **Negative:**
 
@@ -530,7 +530,7 @@ This is the acknowledged ceiling of heuristic detection. Mitigations are layered
 
 A malicious watchtower, or a watchtower whose §1a heuristics misfire, raises a receipt-fraud challenge against an honest operator with no genuine evidence — purely to disrupt the operator's gauge-pool payout for the contested epoch.
 
-Mitigated by the existing challenge-bond mechanic ([ADR 014](014-on-chain-verification.md#challenge-bond)) carried over per §1c: a dismissed challenge forfeits the watchtower's bond (50% burned, 50% to the operator). The operator's counter-evidence path is the standard 24h window with valid distinct-client receipts. The bond cost is the rate limiter; an attacker would need to pay the bond per spurious challenge, and operators' counter-evidence path is well-defined. Repeated dismissed challenges from the same watchtower trigger reputation degradation in [ADR 008](008-reputation.md) and may warrant removal from the operator's configured watchtower set.
+Mitigated by the existing challenge-bond mechanic ([ADR 014](014-on-chain-verification.md#bond-handling)) carried over per §1c: a dismissed challenge forfeits the watchtower's bond (50% burned, 50% to the operator). The operator's counter-evidence path is the standard 24h window with valid distinct-client receipts. The bond cost is the rate limiter; an attacker would need to pay the bond per spurious challenge, and operators' counter-evidence path is well-defined. Repeated dismissed challenges from the same watchtower trigger reputation degradation in [ADR 008](008-reputation.md) and may warrant removal from the operator's configured watchtower set.
 
 ---
 

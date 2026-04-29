@@ -8,7 +8,7 @@
 
 ## Context
 
-Bootstrap supply-side incentive — capital that recruits operators in the gap between mainnet launch and treasury self-funding — is **$1M+ externally-raised USDC** (planning target $3M), per [ADR 026 §10](026-gauge-boost-tokenomics.md#10-bootstrap-mechanism--pre-seed-usdc). USDC denomination insulates subsidy purchasing power from TOKEN price; single-asset reflexivity in subsidy capacity was a tail risk that this denomination removes. ADR 026 commits the mechanism (USDC, externally raised) and the floor; this ADR is the program charter — capital structure, the five funded programs with per-program eligibility / allocation / success metrics / termination triggers, reporting cadence, `SafetyReserve` coordination, and the program-wide wind-down trigger.
+Bootstrap supply-side incentive — capital that recruits operators in the gap between mainnet launch and treasury self-funding — is **$1M+ externally-raised USDC** (planning target $3M), per [ADR 026 §10](026-gauge-boost-tokenomics.md#10-bootstrap-mechanism-pre-seed-usdc). USDC denomination insulates subsidy purchasing power from TOKEN price; single-asset reflexivity in subsidy capacity was a tail risk that this denomination removes. ADR 026 commits the mechanism (USDC, externally raised) and the floor; this ADR is the program charter — capital structure, the five funded programs with per-program eligibility / allocation / success metrics / termination triggers, reporting cadence, `SafetyReserve` coordination, and the program-wide wind-down trigger.
 
 A TOKEN-denominated bootstrap variant was considered and rejected; see [Alternatives Considered](#alternatives-considered).
 

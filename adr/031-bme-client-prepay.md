@@ -3,7 +3,7 @@
 **Date:** 2026-04-25
 **Status:** Deferred (target: post-launch follow-up after stability + pricing-oracle hardening)
 **Touches:** [ADR 003](003-payments.md), [ADR 010](010-multi-token.md), [ADR 026](026-gauge-boost-tokenomics.md)
-**Source design spec:** [`docs/superpowers/specs/2026-04-19-tokenomics-v2-survival-additions.md`](../docs/superpowers/specs/2026-04-19-tokenomics-v2-survival-additions.md) §2
+**Source design spec:** internal `tokenomics-v2-survival-additions` (2026-04-19) §2
 
 ---
 
@@ -13,7 +13,7 @@
 
 1. Operator stake (50K TOKEN minimum, slashable; [ADR 026 §7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake)).
 2. Gauge-pool ve-locking, where operators ve-lock TOKEN to capture a larger share of the 40% gauge boost pool ([ADR 026 §3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula)).
-3. The 7% delegator pool, which performs continuous TWAP USDC→TOKEN buys and routes the acquired TOKEN to ve-lockers ([ADR 026 §6](026-gauge-boost-tokenomics.md#6-delegator-pool--usdc--token-conversion)).
+3. The 7% delegator pool, which performs continuous TWAP USDC→TOKEN buys and routes the acquired TOKEN to ve-lockers ([ADR 026 §6](026-gauge-boost-tokenomics.md#6-delegator-pool-usdc-token-conversion)).
 
 Clients in the [ADR 026](026-gauge-boost-tokenomics.md) design pay only USDC, via the [ADR 003](003-payments.md) payment-channel rails. They never touch TOKEN. The full TOKEN-demand surface is therefore mediated by operator recruitment and operator capital allocation. If operator-side ve-lock adoption falters — for any reason: a competing protocol, regulatory friction in major operator regions, a TOKEN-price shock that makes Case B economics break down ([ADR 026 §7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake)) — the demand-side flywheel collapses and there is no usage-driven demand floor underneath it.
 

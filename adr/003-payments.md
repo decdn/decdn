@@ -539,7 +539,7 @@ This interface is the canonical specification for `BuybackBurner`. [ADR 004](004
 
 ### FeeRouter Integration
 
-Under [ADR 026](026-gauge-boost-tokenomics.md), `StablePaymentChannel.settleChannel` does not split fees inline. The full operator-bound USDC balance is forwarded to a `FeeRouter` contract, which applies the canonical six-bucket split (40% node base / 40% gauge boost / 7% delegator pool / 5% buyback-and-burn / 5% treasury / 3% safety reserve — full table and bounds in [ADR 026 §2](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553) and [§11](026-gauge-boost-tokenomics.md#11-governable-parameters-with-safety-bounds)). This ADR specifies the `FeeRouter` interface only as it relates to the settlement path; the gauge formula, ve-escrow mechanics, and bucket disbursement schedule live in ADR 026 and the design spec ([`docs/superpowers/specs/2026-04-18-tokenomics-v2-gauge-boost-design.md`](../docs/superpowers/specs/2026-04-18-tokenomics-v2-gauge-boost-design.md) §2.2 / §5).
+Under [ADR 026](026-gauge-boost-tokenomics.md), `StablePaymentChannel.settleChannel` does not split fees inline. The full operator-bound USDC balance is forwarded to a `FeeRouter` contract, which applies the canonical six-bucket split (40% node base / 40% gauge boost / 7% delegator pool / 5% buyback-and-burn / 5% treasury / 3% safety reserve — full table and bounds in [ADR 026 §2](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553) and [§11](026-gauge-boost-tokenomics.md#11-governable-parameters-with-safety-bounds)). This ADR specifies the `FeeRouter` interface only as it relates to the settlement path; the gauge formula, ve-escrow mechanics, and bucket disbursement schedule live in ADR 026 and its source design spec.
 
 #### Settlement-path interface
 

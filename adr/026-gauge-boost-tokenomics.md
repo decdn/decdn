@@ -3,8 +3,8 @@
 **Date:** 2026-04-25
 **Status:** Draft
 **Supersedes:** [ADR 004](004-tokenomics.md) in full
-**Source design spec:** [`docs/superpowers/specs/2026-04-18-tokenomics-v2-gauge-boost-design.md`](../docs/superpowers/specs/2026-04-18-tokenomics-v2-gauge-boost-design.md)
-**Economic source of truth:** [`docs/superpowers/specs/2026-04-25-decdn-economic-model-40-40-gauge-pool.md`](../docs/superpowers/specs/2026-04-25-decdn-economic-model-40-40-gauge-pool.md)
+**Source design spec:** internal `tokenomics-v2-gauge-boost-design` (2026-04-18)
+**Economic source of truth:** internal `decdn-economic-model-40-40-gauge-pool` (2026-04-25)
 
 ---
 
