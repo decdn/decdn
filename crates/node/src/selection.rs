@@ -435,12 +435,14 @@ mod tests {
     #[test]
     fn geo_diversity_prefers_unseen_region() {
         // Three candidates, all tied by score AND load. Two are in US, one in DE.
-        // Expected order: any one US, then DE, then the other US (geo prefers
-        // unseen region for the second pick).
+        // Use a fixed seed so the tier-4 random pick is deterministic; with this
+        // seed the first pick is US, after which the geo-diversity tier surfaces
+        // DE as the second pick (the only unseen region) before the remaining US.
         let us1 = with_region(with_load(make_candidate(1, 100, 10, 1.0), 0, 50), "US");
         let us2 = with_region(with_load(make_candidate(2, 100, 10, 1.0), 0, 50), "US");
         let de = with_region(with_load(make_candidate(3, 100, 10, 1.0), 0, 50), "DE");
-        let out = rank_candidates(vec![us1, us2, de]);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(2);
+        let out = rank_candidates_with_rng(vec![us1, us2, de], &mut rng);
         let regions: Vec<String> = out.iter().map(|r| r.candidate.region.clone()).collect();
         assert_eq!(regions.first().map(String::as_str), Some("US"));
         assert_eq!(regions.get(1).map(String::as_str), Some("DE"));
