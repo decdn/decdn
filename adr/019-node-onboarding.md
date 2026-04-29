@@ -6,7 +6,7 @@
 ## Context
 
 Existing ADRs specify individual components of the node lifecycle in isolation — staking
-in [ADR 026](026-tokenomics-v3.md) (which supersedes [ADR 004](004-tokenomics.md)),
+in [ADR 026](026-gauge-boost-tokenomics.md) (which supersedes [ADR 004](004-tokenomics.md)),
 on-chain registration in [ADR 001](001-network.md), payment channel bindings in
 [ADR 003](003-payments.md), gossip validation in [ADR 001](001-network.md), blacklist
 sync in [ADR 011](011-content-takedown.md), and contract deployment order in
@@ -62,10 +62,10 @@ Before any on-chain or protocol activity:
 4. **Prepare Ethereum key.** The operator needs an Ethereum address (`ethAddress`) with
    sufficient funds:
    - **TOKEN:** at minimum **50,000 TOKEN** for the minimum stake deposit
-     ([ADR 026 § 7](026-tokenomics-v3.md#7-operator-economics-and-minimum-stake)). The
+     ([ADR 026 § 7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake)). The
      v3 model removes the v2 / ADR 004 discount-stake threshold entirely; operators who
      want amplified return on capital ve-lock TOKEN in `VotingEscrow` for gauge boost
-     ([ADR 026 § 3](026-tokenomics-v3.md#3-gauge-boost-formula)) rather than staking
+     ([ADR 026 § 3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula)) rather than staking
      above a threshold for fee discount. Operators who lack the 50K minimum may qualify
      for a pre-seed-funded **staking loan** — see [Pre-seed USDC Bootstrap Programs](#pre-seed-usdc-bootstrap-programs)
      below.
@@ -95,7 +95,7 @@ All transactions must be confirmed on-chain before proceeding to Phase 3.
 #### Step 2.1 — Approve TOKEN transfer
 
 Call `TOKEN.approve(stakingRegistry, amount)` where `amount ≥ minStake` (**50,000 TOKEN**
-under [ADR 026 § 7](026-tokenomics-v3.md#7-operator-economics-and-minimum-stake)). This
+under [ADR 026 § 7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake)). This
 ERC-20 approval authorizes `StakingRegistry` to pull the stake deposit.
 
 **Gas:** ~$0.03 (one-time; subsequent re-stakes reuse the allowance if it was set above
@@ -107,10 +107,10 @@ Call `StakingRegistry.stake(amount)` with `amount ≥ 50,000 TOKEN`.
 
 The stake is locked immediately. It is slashable from this point forward, including
 during the unbonding period if the node later deregisters (7-day unbonding by default;
-governable per [ADR 026](026-tokenomics-v3.md)).
+governable per [ADR 026](026-gauge-boost-tokenomics.md)).
 
 **ve-position is separate.** Operator stake in `StakingRegistry` and any ve-locked
-TOKEN in `VotingEscrow` are independent positions per [ADR 026 § 4](026-tokenomics-v3.md#4-voting-escrow-votingescrow).
+TOKEN in `VotingEscrow` are independent positions per [ADR 026 § 4](026-gauge-boost-tokenomics.md#4-voting-escrow-votingescrow).
 ve-locked TOKEN is non-slashable and does not satisfy the minimum stake requirement;
 neither does staked TOKEN earn gauge boost. An operator who wants gauge boost must hold
 both.
@@ -334,7 +334,7 @@ entries. Each entry is a QUIC multiaddr string (e.g.,
 ### Re-Onboarding after Deregistration or Auto-Ejection
 
 A node that voluntarily deregistered or was auto-ejected (stake dropped below 50% of
-`minStake` due to slashing — see [ADR 026 § 8](026-tokenomics-v3.md#8-slashing-and-burn),
+`minStake` due to slashing — see [ADR 026 § 8](026-gauge-boost-tokenomics.md#8-slashing-and-burn),
 which carries over the auto-ejection rule from [ADR 004](004-tokenomics.md#auto-ejection))
 must re-onboard. The flow is identical to initial onboarding with two differences:
 
@@ -359,7 +359,7 @@ The phases above describe the canonical self-funded onboarding flow. Operators w
 the 50K-TOKEN minimum stake or the up-front infrastructure capital may qualify for one
 of the supplementary onboarding paths funded from the protocol's pre-seed USDC capital.
 
-**Funding mechanism.** Per [ADR 026 § 10](026-tokenomics-v3.md#10-bootstrap-mechanism--pre-seed-usdc),
+**Funding mechanism.** Per [ADR 026 § 10](026-gauge-boost-tokenomics.md#10-bootstrap-mechanism--pre-seed-usdc),
 the v2 / ADR 004 **200M-TOKEN node-bootstrap fund is removed in full**. Bootstrap
 supply-side incentive is now funded externally via **$1M+ pre-seed USDC capital**
 (planning target $3M). Switching the denomination from TOKEN to USDC eliminates the
@@ -370,12 +370,12 @@ were most needed.
 TOKEN subsidies for one year on delivery. Because v3 bootstrap is USDC-denominated and
 contains no TOKEN subsidies, this rule is dropped — there is nothing to auto-lock. ve-
 locking remains entirely opt-in for all operators (subsidized or self-funded), and is
-the lever that captures gauge-pool yield per [ADR 026 § 3](026-tokenomics-v3.md#3-gauge-boost-formula).
+the lever that captures gauge-pool yield per [ADR 026 § 3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula).
 
 **Supplementary onboarding paths.** The pre-seed program funds four supply-side paths
 in addition to the canonical self-funded flow. Each path's eligibility, sizing, and
 disbursement mechanics are deferred to **ADR 030 — Pre-seed USDC deployment program**
-(forward-referenced; not yet authored):
+([ADR 030](030-preseed-usdc-deployment.md) — companion ADR in this rollout):
 
 - **Hardware-leasing subsidies.** USDC-denominated lease (or lease-to-own) subsidies for
   verified high-reputation operators, paid out of the pre-seed pool. Reduces the

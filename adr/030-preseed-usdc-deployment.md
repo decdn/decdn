@@ -2,7 +2,7 @@
 
 **Date:** 2026-04-25
 **Status:** Draft
-**Funds:** [ADR 026](026-tokenomics-v3.md) §10 (bootstrap mechanism)
+**Funds:** [ADR 026](026-gauge-boost-tokenomics.md) §10 (bootstrap mechanism)
 **Replaces:** ADR 004's 200M-TOKEN node-bootstrap fund
 
 ---
@@ -12,9 +12,9 @@
 [ADR 004](004-tokenomics.md) allocated **200M TOKEN** as a node-bootstrap fund. This is
 reflexive: TOKEN price drops collapse subsidy purchasing power exactly when subsidies
 are most needed. Single-asset reflexivity was the dominant tail risk for early operator
-recruitment ([ADR 026](026-tokenomics-v3.md) §Context, item 4).
+recruitment ([ADR 026](026-gauge-boost-tokenomics.md) §Context, item 4).
 
-[ADR 026](026-tokenomics-v3.md) §10 replaces the 200M-TOKEN fund with **$1M+ pre-seed
+[ADR 026](026-gauge-boost-tokenomics.md) §10 replaces the 200M-TOKEN fund with **$1M+ pre-seed
 USDC capital** (planning target $3M), externally raised and USD-denominated. ADR 026
 commits the funding mechanism and the size floor; it forward-references this ADR for
 the program structure.
@@ -45,14 +45,14 @@ reflexivity bites hardest and treasury inflow has not yet caught up.
 | Planning target | $3,000,000 USDC |
 | Source | External pre-seed round (off-chain, raised by founding team / treasury) |
 | Denomination | USDC throughout — no TOKEN substitution at any disbursement stage |
-| Custody | Multisig USDC wallet, DAO-controlled; same Timelock-custodied wallet pattern as the [ADR 026](026-tokenomics-v3.md) §2 treasury share, with a dedicated sub-account so program flows are auditable separately from organic inflow |
+| Custody | Multisig USDC wallet, DAO-controlled; same Timelock-custodied wallet pattern as the [ADR 026](026-gauge-boost-tokenomics.md) §2 treasury share, with a dedicated sub-account so program flows are auditable separately from organic inflow |
 | Spending authority | Standard governance proposal per [ADR 009](009-governance.md), or fast-track emergency-multisig authorization within the hard caps below |
 
 **No protocol issuance.** This pool is **externally raised USDC**. The protocol does not
 mint TOKEN to fund it; ADR 004's 200M-TOKEN bootstrap supply does not exist under
-[ADR 026](026-tokenomics-v3.md) §1. **Raising at least the $1M floor is a prerequisite
+[ADR 026](026-gauge-boost-tokenomics.md) §1. **Raising at least the $1M floor is a prerequisite
 for v3 mainnet launch.** Contingency: governance can re-allocate from the 30% Protocol
-Treasury bucket per [ADR 026](026-tokenomics-v3.md) §1 at the cost of development
+Treasury bucket per [ADR 026](026-gauge-boost-tokenomics.md) §1 at the cost of development
 runway.
 
 **Hard caps (immutable at deploy time)** for the multisig fast-track path, paralleling
@@ -81,10 +81,10 @@ The pool funds five distinct, non-overlapping programs:
 #### 2a. Protocol-Owned Operators (POOs) — 30%
 
 **Charter.** DAO operates nodes directly in priority regions. Operator stake (50K
-TOKEN per node, [ADR 026](026-tokenomics-v3.md) §7) sources from the protocol-treasury
+TOKEN per node, [ADR 026](026-gauge-boost-tokenomics.md) §7) sources from the protocol-treasury
 TOKEN bucket; hardware, bandwidth, ops, and stake-equivalent USDC reserves come from
 this pool. POO revenue (40% direct USDC + share of the 40% gauge pool,
-[ADR 026](026-tokenomics-v3.md) §2) flows back to the treasury — the self-sustaining
+[ADR 026](026-gauge-boost-tokenomics.md) §2) flows back to the treasury — the self-sustaining
 flywheel from preseed-capital strategy §1.
 
 **Eligibility (region scope; operator is the DAO).** Both: aggregate observed client
@@ -117,14 +117,14 @@ continues until the trigger fires in every activated region.
 **Charter.** USDC-denominated hardware lease (or lease-to-own) subsidies for verified
 high-rep operators in regions with high bandwidth fixed costs (preseed-capital strategy
 §4). Insulates the operator-margin sensitivity flagged in
-[ADR 026](026-tokenomics-v3.md) §Risks: USDC subsidy is TOKEN-price-independent.
+[ADR 026](026-gauge-boost-tokenomics.md) §Risks: USDC subsidy is TOKEN-price-independent.
 
 **Eligibility.** All of: `final_score ≥ 0.7` per [ADR 008](008-reputation.md) for
 ≥ 90 days on a prior node (or referral from a `final_score ≥ 0.8` operator with
 co-signed performance guarantee — same pattern as §2c); operates in a region where
 the required tier's dollar cost exceeds the equivalent in lower-cost regions by
 ≥ 1.5× per economic-model spec §3; commits to a 12-month minimum term with claw-back
-if recipient deregisters or is auto-ejected ([ADR 026](026-tokenomics-v3.md) §8)
+if recipient deregisters or is auto-ejected ([ADR 026](026-gauge-boost-tokenomics.md) §8)
 before term.
 
 **Allocation.** 25%. Per-recipient cap: $25K (~12 months tier B 10G dedicated at
@@ -140,16 +140,16 @@ supported.
 **Termination trigger.** Per-region: program stops new leases when **both** the
 median per-byte settlement rate in the region falls within ±10% of the network median
 (capacity no longer binding), and the 90th-percentile regional operator clears Case B
-margins ([ADR 026](026-tokenomics-v3.md) §7) without subsidy for a rolling 90 days.
+margins ([ADR 026](026-gauge-boost-tokenomics.md) §7) without subsidy for a rolling 90 days.
 In-flight leases continue regardless of regional termination.
 
 #### 2c. Staking loans — 15%
 
 **Charter.** The pool lends the **50,000 TOKEN minimum stake**
-([ADR 026](026-tokenomics-v3.md) §7) to verified high-rep operators in underserved
+([ADR 026](026-gauge-boost-tokenomics.md) §7) to verified high-rep operators in underserved
 regions, denominated in USDC at lend time (default 30-day TOKEN/USDC TWAP). Loans are
 **collateralized by future earnings**: the recipient's 40% direct-USDC stream and
-gauge-pool payouts ([ADR 026](026-tokenomics-v3.md) §2) route to the program recovery
+gauge-pool payouts ([ADR 026](026-gauge-boost-tokenomics.md) §2) route to the program recovery
 account until the loan is repaid. Targets geographic-need recruitment over wealth-based
 recruitment.
 
@@ -171,10 +171,10 @@ allocation** (caps geographic concentration).
 
 - 100% of recipient's 40% direct-USDC settlement and gauge-pool payouts route to
   the recovery account until repaid. Recipient retains delegator-pool TOKEN
-  ([ADR 026](026-tokenomics-v3.md) §6) and any voluntary ve-lock yields.
+  ([ADR 026](026-gauge-boost-tokenomics.md) §6) and any voluntary ve-lock yields.
 - Repayment in USDC at TOKEN/USDC TWAP at repayment time (TOKEN-equivalent
   alternative permitted at the same rate).
-- Default = recipient auto-ejected per [ADR 026](026-tokenomics-v3.md) §8 or
+- Default = recipient auto-ejected per [ADR 026](026-gauge-boost-tokenomics.md) §8 or
   voluntarily deregisters before repayment. On default, the recovery account
   claims any remaining staked TOKEN plus the referrer's 25% co-signed liability.
 
@@ -240,7 +240,7 @@ Program funding ends only at the §6 global wind-down.
 #### 2e. Enterprise SLA guarantee fund — 10%
 
 **Charter.** Pre-seed capital reserved as **paired backing for the `SafetyReserve`**
-([ADR 026](026-tokenomics-v3.md) §5). The `SafetyReserve` accumulates organically from
+([ADR 026](026-gauge-boost-tokenomics.md) §5). The `SafetyReserve` accumulates organically from
 the 3% router share; in the early period when organic accumulation is small ($28K/mo
 at S0 per economic-model spec §2), pre-seed capital provides depth for contracts whose
 worst-case payout exceeds the early `SafetyReserve` balance. Implements the "Guarantee
@@ -255,7 +255,7 @@ when **both**:
   `SafetyReserve` + pre-seed pairing as the recourse mechanism.
 
 Eligible payout categories follow the canonical `SafetyReserve` list per
-[ADR 026](026-tokenomics-v3.md) §5; this program does not introduce new payout
+[ADR 026](026-gauge-boost-tokenomics.md) §5; this program does not introduce new payout
 categories. ADR 032 (Bandwidth Futures / Enterprise SLA tier, deferred to v2) will
 define the contract template; until then, individual Enterprise contracts are
 case-by-case under DAO governance.
@@ -271,13 +271,13 @@ on acceptance):
 
 1. Organic `SafetyReserve` balance, until exhausted.
 2. Slashing-replenished `SafetyReserve` balance (same wallet, same gates;
-   [ADR 026](026-tokenomics-v3.md) §8 routes 30% of slashed stake here).
+   [ADR 026](026-gauge-boost-tokenomics.md) §8 routes 30% of slashed stake here).
 3. Pre-seed paired allocation, only when 1+2 are insufficient for the authorized
    payout.
 
 The `SafetyReserve` evidence-bundle, multisig-fast-track-or-governance, 48-hour
 appeal, and post-incident-reporting gates per [ADR 009](009-governance.md) and
-[ADR 026](026-tokenomics-v3.md) §5 apply unchanged to the paired allocation. No
+[ADR 026](026-gauge-boost-tokenomics.md) §5 apply unchanged to the paired allocation. No
 separate authorization path.
 
 **Success metrics.**
@@ -314,7 +314,7 @@ Governance may override within the same bounds.
 ### 4. Reporting
 
 The DAO publishes a **quarterly pre-seed program report** to a public registry — same
-pattern as the `SafetyReserve` post-incident registry per [ADR 026](026-tokenomics-v3.md)
+pattern as the `SafetyReserve` post-incident registry per [ADR 026](026-gauge-boost-tokenomics.md)
 §5. Each report contains:
 
 - Capital deployed per program (cumulative + Q-over-Q delta) and remaining.
@@ -340,7 +340,7 @@ The program winds down — stops accepting new disbursements across all five
 sub-programs, completes in-flight commitments to term, returns remaining capital to
 treasury — when **all** of the following hold for **6 consecutive months**:
 
-- Treasury USDC inflow per [ADR 026](026-tokenomics-v3.md) §2 (5% of routed USDC)
+- Treasury USDC inflow per [ADR 026](026-gauge-boost-tokenomics.md) §2 (5% of routed USDC)
   exceeds combined run-rate operating expenditure plus a 50% safety margin. Per
   economic-model spec §2, this is S2 Growth scale (~$2M/mo treasury inflow,
   $1.97M/mo surplus net of $33K/mo team burn).
@@ -360,7 +360,7 @@ commitments (active loans, leases, regional grants) continue to term regardless.
 ### Positive
 
 - **Eliminates TOKEN-price reflexivity in bootstrap.** USDC throughout removes the
-  largest tail risk in [ADR 026](026-tokenomics-v3.md) §Context.
+  largest tail risk in [ADR 026](026-gauge-boost-tokenomics.md) §Context.
 - **Five distinct levers, non-overlapping.** Each program targets a different
   recruitment friction (capital access, geographic coverage, enterprise
   credibility); §3 lets the DAO tune the mix as different frictions dominate at
@@ -433,7 +433,7 @@ commitments (active loans, leases, regional grants) continue to term regardless.
 | --- | --- |
 | [ADR 008 — Reputation](008-reputation.md) | Document the `final_score ≥ 0.7` (90-day) and `final_score ≥ 0.8` (180-day) eligibility thresholds used by §2a–§2d. The reputation system is unchanged; this records that pre-seed program eligibility is a non-protocol consumer of `final_score`. |
 | [ADR 019 — Node Onboarding](019-node-onboarding.md) | Replace the existing "Pre-seed USDC Bootstrap Programs" section's forward-reference with a back-reference to this ADR. Document that Phase 2's stake source for staking-loan recipients is the pre-seed recovery account, and note the hardware-leasing path's relationship to Phase 1 step 1 (server provisioning). No phase-sequence change — pre-seed paths deliver capital, not protocol-flow shortcuts. |
-| [ADR 026 — Tokenomics v3](026-tokenomics-v3.md) | §10's forward-reference resolves; bootstrap-program structure now lives here. §5's `SafetyReserve` payout flow gains the §2e pre-seed paired allocation as a third-priority funding source per the §5 coordination rule. |
+| [ADR 026 — Tokenomics v3](026-gauge-boost-tokenomics.md) | §10's forward-reference resolves; bootstrap-program structure now lives here. §5's `SafetyReserve` payout flow gains the §2e pre-seed paired allocation as a third-priority funding source per the §5 coordination rule. |
 
 Additional ancillary updates: [ADR 009](009-governance.md) (the §1 hard caps on
 multisig fast-track parallel the existing `SafetyReserve` pattern; ADR 009's

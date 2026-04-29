@@ -2,32 +2,32 @@
 
 **Date:** 2026-04-25
 **Status:** Draft (deferred — adopt after governance dynamics observable post-v1)
-**Driver:** [ADR 026](026-tokenomics-v3.md) §Decision §11 (governable parameters)
-**Touches:** [ADR 026](026-tokenomics-v3.md), [ADR 009](009-governance.md), [ADR 018](018-liquidity-strategy.md)
+**Driver:** [ADR 026](026-gauge-boost-tokenomics.md) §Decision §11 (governable parameters)
+**Touches:** [ADR 026](026-gauge-boost-tokenomics.md), [ADR 009](009-governance.md), [ADR 018](018-liquidity-strategy.md)
 
 ---
 
 ## Context
 
-[ADR 026](026-tokenomics-v3.md) §11 makes the six `FeeRouter` shares and the
+[ADR 026](026-gauge-boost-tokenomics.md) §11 makes the six `FeeRouter` shares and the
 `boostFloor` governable within hard-coded safety bounds. Every change is a
 governance proposal: 7-day vote + 48-hour timelock minimum, per
 [ADR 009](009-governance.md). That cadence is appropriate for structural
 re-balancing (changing what the protocol *is*) but too slow for two
 state-driven feedback regimes that the v3 design surfaces but does not solve:
 
-1. **Lock-rate scenarios.** The gauge boost in [ADR 026](026-tokenomics-v3.md) §3
+1. **Lock-rate scenarios.** The gauge boost in [ADR 026](026-gauge-boost-tokenomics.md) §3
    only does its job at a healthy ve-lock rate. If `ve_locked / total_supply`
    sits **below ~15%**, gauge-boost has too few committed lockers to
    differentiate from the commodity floor, the system is dilutive to delegators,
-   and the operator-side TOKEN demand loop ([ADR 026](026-tokenomics-v3.md)
+   and the operator-side TOKEN demand loop ([ADR 026](026-gauge-boost-tokenomics.md)
    §Consequences) under-fires. If it sits **above ~50%**, the system is
    over-locked: each marginal locker captures a smaller boost share, the
    delegator pool is over-rewarding a saturated population, and treasury under-
    accrues relative to its useful work.
 
 2. **Price-floor scenarios.** [ADR 018](018-liquidity-strategy.md) buyback
-   pressure is fixed at 5% of routed USDC ([ADR 026](026-tokenomics-v3.md) §2,
+   pressure is fixed at 5% of routed USDC ([ADR 026](026-gauge-boost-tokenomics.md) §2,
    §8). Under sustained TOKEN drawdown that flow is invariant to the drawdown —
    the protocol does not lean into the buyback when buyback is most useful. A
    30-day TWAP price floor is a cheap signal for "the deflationary lever should
@@ -39,11 +39,11 @@ lock rate, the Balancer V3 80/20 pool for TWAP price (the same source
 [ADR 018](018-liquidity-strategy.md) already trusts for buyback MEV defense).
 
 This ADR specifies two automated feedback hooks within the
-[ADR 026](026-tokenomics-v3.md) §11 safety bounds. The hooks never violate
+[ADR 026](026-gauge-boost-tokenomics.md) §11 safety bounds. The hooks never violate
 those bounds; if a shift would, the shift is clamped. Governance retains an
 absolute veto and can disable either hook at any time.
 
-**Deferment.** [ADR 026](026-tokenomics-v3.md) §Forward references lists this
+**Deferment.** [ADR 026](026-gauge-boost-tokenomics.md) §Forward references lists this
 ADR as deferred. The recommendation here is to **author and merge the spec but
 not deploy** — adoption waits until v1 governance dynamics are observable. If
 governance rebalancing turns out to be fast enough in practice, the hooks may
@@ -57,17 +57,24 @@ below.
 Two automated feedback hooks are added to a new `AdaptiveFeeRouterController`
 (or, equivalently, methods on `FeeRouter` itself — implementation choice
 deferred). Both are evaluated at epoch rollover (1 week, per
-[ADR 026](026-tokenomics-v3.md) §2 epoch mechanics). Both are bounded by
-[ADR 026](026-tokenomics-v3.md) §11. Neither replaces governance — both are
+[ADR 026](026-gauge-boost-tokenomics.md) §2 epoch mechanics). Both are bounded by
+[ADR 026](026-gauge-boost-tokenomics.md) §11. Neither replaces governance — both are
 clamped, observable, and disable-able.
 
 ### 1. Lock-rate feedback hook
 
-**Read source.** `VotingEscrow.totalSupplyAt(now)` and the live TOKEN supply
+**Read source.** The underlying TOKEN balance locked in `VotingEscrow` —
+canonically `TOKEN.balanceOf(address(VotingEscrow))` — and the live TOKEN supply
 counter. No oracle. The lock rate is computed as
-`ve_locked_total / token_circulating_supply`. (Implementation note: the
-denominator is the live TOKEN total supply minus burned and minus locked
-contract reserves — fully on-chain, no off-chain feed.)
+`token_locked_underlying / token_circulating_supply`, where the numerator is
+underlying TOKEN held by the escrow contract, **not** the time-weighted
+ve-supply from `VotingEscrow.totalSupplyAt(...)`. The two have different units;
+using ve-supply would mis-fire the 15% / 50% thresholds because ve-balance
+decays linearly to lock expiry while the threshold is intended to track "% of
+circulating TOKEN that is currently committed". The same underlying-locked
+definition is exposed as the `decdn_ve_lock_rate` metric per [ADR 020](020-observability.md#210-tokenomics-v3-metrics).
+(Implementation note: the denominator is the live TOKEN total supply minus
+burned and minus locked contract reserves — fully on-chain, no off-chain feed.)
 
 **Action.** At epoch rollover, the controller reads the lock rate and applies
 the table below to the next epoch's router shares:
@@ -94,7 +101,7 @@ threshold:
 - The 50% activation requires `rate > 50%`; the deactivation requires
   `rate ≤ 48%`. Two-percentage-point band.
 
-**Clamping.** Per [ADR 026](026-tokenomics-v3.md) §11, `treasury` is bounded
+**Clamping.** Per [ADR 026](026-gauge-boost-tokenomics.md) §11, `treasury` is bounded
 `[0%, 20%]` and `delegator` is bounded `[0%, 30%]`. If a +2 pp shift would push
 either share outside its bound, the shift is reduced to whatever fits inside
 the bound (down to and including 0 pp). The controller emits an event when a
@@ -124,7 +131,7 @@ $0.01, the revert threshold is $0.011). Governance-adjustable per §3. The
 explicit hysteresis prevents single-epoch flicker around the floor and makes
 the hook trivially auditable from on-chain state.
 
-**Clamping.** Per [ADR 026](026-tokenomics-v3.md) §11, `treasury` is bounded
+**Clamping.** Per [ADR 026](026-gauge-boost-tokenomics.md) §11, `treasury` is bounded
 `[0%, 20%]` and `burn` is bounded `[0%, 25%]`. The +2 pp shift is clamped to
 whatever fits inside both bounds simultaneously; if either bound binds, the
 shift reduces accordingly (down to 0 pp). Clamping events are emitted.
@@ -175,7 +182,7 @@ band beyond achievable lock rates.
 ### 4. Trigger cadence
 
 Both hooks evaluate exactly once per epoch, at epoch rollover (1 week,
-[ADR 026](026-tokenomics-v3.md) §2.4). The controller is keeper-triggered (the
+[ADR 026](026-gauge-boost-tokenomics.md) §2.4). The controller is keeper-triggered (the
 same keeper class that already drives `BuybackBurner` and the delegator-pool
 swap path per [ADR 018](018-liquidity-strategy.md) is sufficient — no new
 keeper role). If the keeper fails to fire, the hook is simply skipped for that
@@ -185,7 +192,7 @@ fires do not retroactively apply.
 ### 5. Governance interaction (vote always wins)
 
 The adaptive hooks operate **strictly within** the bounds set by
-[ADR 026](026-tokenomics-v3.md) §11. Governance retains all of:
+[ADR 026](026-gauge-boost-tokenomics.md) §11. Governance retains all of:
 
 | Override | Mechanism | Effect |
 | --- | --- | --- |
@@ -250,7 +257,7 @@ This ADR is **Draft, deferred** for three reasons:
 If, six months post-mainnet, ve-lock rate or TWAP excursions measurably
 out-pace governance response, this ADR moves from Draft (deferred) to Accepted
 and the controller is deployed. If not, it closes as Rejected with the
-[ADR 026](026-tokenomics-v3.md) §11 bounds + manual governance loop providing
+[ADR 026](026-gauge-boost-tokenomics.md) §11 bounds + manual governance loop providing
 sufficient response surface.
 
 ---
@@ -280,7 +287,7 @@ sufficient response surface.
 
 - **Adds contract surface.** `AdaptiveFeeRouterController` (or equivalent
   methods on `FeeRouter`) is new code. Audit burden on top of
-  [ADR 026](026-tokenomics-v3.md)'s already-expanded surface.
+  [ADR 026](026-gauge-boost-tokenomics.md)'s already-expanded surface.
 - **Adds keeper responsibility.** The same keeper that drives buyback +
   delegator swap also fires the controller. A new failure mode (controller
   fires but cannot read TWAP; controller fires under thin pool depth) joins
@@ -337,7 +344,7 @@ sufficient response surface.
 
 This ADR depends on no follow-up ADRs. Its dependencies — `FeeRouter`,
 `VotingEscrow`, the Balancer V3 80/20 pool, the §11 safety bounds — are all
-defined in [ADR 026](026-tokenomics-v3.md), [ADR 018](018-liquidity-strategy.md),
+defined in [ADR 026](026-gauge-boost-tokenomics.md), [ADR 018](018-liquidity-strategy.md),
 and [ADR 009](009-governance.md). The keeper class is the existing buyback
 keeper from [ADR 018](018-liquidity-strategy.md).
 

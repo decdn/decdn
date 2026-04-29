@@ -5,7 +5,7 @@
 
 ## Context
 
-[ADR 004](004-tokenomics.md) defined the original dual-currency token model. [ADR 026](026-tokenomics-v3.md) supersedes ADR 004 in full and introduces three tokenomics primitives that this ADR depends on: a `VotingEscrow` contract (vote-escrowed TOKEN with linear decay), a six-bucket `FeeRouter` whose share parameters are governable within hard-coded bounds, and a `SafetyReserve` contract whose payouts are gated by governance-authorized rules. These are the economic primitives the production governance model assumes.
+[ADR 004](004-tokenomics.md) defined the original dual-currency token model. [ADR 026](026-gauge-boost-tokenomics.md) supersedes ADR 004 in full and introduces three tokenomics primitives that this ADR depends on: a `VotingEscrow` contract (vote-escrowed TOKEN with linear decay), a six-bucket `FeeRouter` whose share parameters are governable within hard-coded bounds, and a `SafetyReserve` contract whose payouts are gated by governance-authorized rules. These are the economic primitives the production governance model assumes.
 
 Governance — how protocol parameters are changed, who can change them, and what safety mechanisms exist — is a separate concern. During the PoC, governance is a single admin key. Production governance (ve-weighted voting, emergency multisig, parameter safety bounds, and SafetyReserve payout authorization) is complex enough to warrant its own ADR and will be implemented post-PoC.
 
@@ -25,31 +25,31 @@ A single deployer address (EOA or multisig) has admin rights on all contracts. C
 
 ### Production: ve-Weighted Governance
 
-Based on OpenZeppelin Governor, sourcing voting weight from `VotingEscrow` (per [ADR 026](026-tokenomics-v3.md) §4):
+Based on OpenZeppelin Governor, sourcing voting weight from `VotingEscrow` (per [ADR 026](026-gauge-boost-tokenomics.md) §4):
 
 | Parameter | Value |
 | --- | --- |
 | Voting source | `VotingEscrow.balanceOfAt(user, ts)` (was `TOKEN.getPastVotes()` in ADR 004) |
 | Voting weight | ve-balance — equals `amount × remaining_lock_time / 4y`, decaying linearly to zero at lock expiry |
 | Proposal threshold | 0.1% of total ve-supply at proposal snapshot |
-| Voting period | 3 days |
+| Voting period | 7 days |
 | Quorum | 4% of total ve-supply at proposal snapshot |
-| Timelock | 2 days between vote passing and execution |
+| Timelock | 48 hours between vote passing and execution |
 | Vote delegation | Supported — Governor Bravo delegation pattern, applied to ve-balance |
 
 Quorum and proposal threshold are calibrated against `VotingEscrow.totalSupplyAt(ts)`, **not** total TOKEN supply. ve-supply tracks active commitment rather than passive holdings; calibrating against it avoids the failure mode where the quorum bar trivially exceeds engaged voting power as TOKEN circulates.
 
-Traders, passive holders, and any TOKEN that has not been locked into `VotingEscrow` carry zero voting weight. Operator stake held in `StakingRegistry` is also not voting weight; per [ADR 026](026-tokenomics-v3.md) §4, operator stake and ve-positions are independent contracts with disjoint roles.
+Traders, passive holders, and any TOKEN that has not been locked into `VotingEscrow` carry zero voting weight. Operator stake held in `StakingRegistry` is also not voting weight; per [ADR 026](026-gauge-boost-tokenomics.md) §4, operator stake and ve-positions are independent contracts with disjoint roles.
 
-**Delegation.** ve-balance is delegatable using the Governor Bravo `delegate(address)` pattern: the underlying ve-position remains non-transferable (per [ADR 026](026-tokenomics-v3.md) §4) but its voting weight may be assigned to another address for the purpose of casting votes. The delegate's vote weight at proposal snapshot equals the sum of `VotingEscrow.balanceOfAt(delegator, ts)` over all delegators that have delegated to them, plus the delegate's own ve-balance if not delegated elsewhere. Delegation is revocable at any time and takes effect at the next snapshot.
+**Delegation.** ve-balance is delegatable using the Governor Bravo `delegate(address)` pattern: the underlying ve-position remains non-transferable (per [ADR 026](026-gauge-boost-tokenomics.md) §4) but its voting weight may be assigned to another address for the purpose of casting votes. The delegate's vote weight at proposal snapshot equals the sum of `VotingEscrow.balanceOfAt(delegator, ts)` over all delegators that have delegated to them, plus the delegate's own ve-balance if not delegated elsewhere. Delegation is revocable at any time and takes effect at the next snapshot.
 
-**Bootstrap consideration.** [ADR 026](026-tokenomics-v3.md) drops the auto-ve-lock-on-vest pattern from earlier v2 interim designs: vesting contracts release TOKEN unlocked, and locking into `VotingEscrow` is opt-in. Consequently the early ve-supply is concentrated in self-locked seed/team/treasury positions plus POL/airdrop recipients who choose to lock, and is materially smaller than under the auto-lock pattern. Quorum measured against `totalSupplyAt` is robust to this — a small ve-supply means a small absolute quorum bar — but the population of distinct lockers may be too thin to resist concentration. **Recommendation:** the protocol treasury should fund a ve-lock-on-claim airdrop (sourced from the community / ecosystem allocation or pre-seed) during the first 6–12 months post-launch, structured so participants receive TOKEN only by locking it in `VotingEscrow`. Sizing is open and tracked in the [ADR 026](026-tokenomics-v3.md) source design spec's open-question list.
+**Bootstrap consideration.** [ADR 026](026-gauge-boost-tokenomics.md) drops the auto-ve-lock-on-vest pattern from earlier v2 interim designs: vesting contracts release TOKEN unlocked, and locking into `VotingEscrow` is opt-in. Consequently the early ve-supply is concentrated in self-locked seed/team/treasury positions plus POL/airdrop recipients who choose to lock, and is materially smaller than under the auto-lock pattern. Quorum measured against `totalSupplyAt` is robust to this — a small ve-supply means a small absolute quorum bar — but the population of distinct lockers may be too thin to resist concentration. **Recommendation:** the protocol treasury should fund a ve-lock-on-claim airdrop (sourced from the community / ecosystem allocation or pre-seed) during the first 6–12 months post-launch, structured so participants receive TOKEN only by locking it in `VotingEscrow`. Sizing is open and tracked in the [ADR 026](026-gauge-boost-tokenomics.md) source design spec's open-question list.
 
 ### Governable Parameters with Safety Bounds
 
 All economic parameters across the protocol are governable within hardcoded safety bounds. Safety bounds are immutable — even a governance attack cannot set parameters outside these ranges.
 
-#### FeeRouter shares and boost floor (per [ADR 026](026-tokenomics-v3.md) §11)
+#### FeeRouter shares and boost floor (per [ADR 026](026-gauge-boost-tokenomics.md) §11)
 
 The six `FeeRouter` shares and the `boostFloor` parameter are governable within the bounds below. **Sum-to-100% invariant:** every governance update that modifies any share **must** leave the six shares summing to exactly 100% (10000 bps); updates that violate the sum or that exceed any individual bound revert at the contract layer.
 
@@ -63,7 +63,7 @@ The six `FeeRouter` shares and the `boostFloor` parameter are governable within 
 | Safety share | 3% | 0% | 15% |
 | `boostFloor` | 0.4 | 0.2 | 0.8 |
 
-The 20% floor on the node-base share guarantees operators always receive enough liquid USDC to cover at least a meaningful fraction of infrastructure costs even under extreme governance proposals — preserves the cashflow invariant. The `boostFloor` bounds prevent governance from collapsing the gauge pool to a winner-take-all distribution (lower bound) or flattening it into uselessness (upper bound). See [ADR 026](026-tokenomics-v3.md) §3 for the full gauge-boost formula.
+The 20% floor on the node-base share guarantees operators always receive enough liquid USDC to cover at least a meaningful fraction of infrastructure costs even under extreme governance proposals — preserves the cashflow invariant. The `boostFloor` bounds prevent governance from collapsing the gauge pool to a winner-take-all distribution (lower bound) or flattening it into uselessness (upper bound). See [ADR 026](026-gauge-boost-tokenomics.md) §3 for the full gauge-boost formula.
 
 #### Other protocol parameters
 
@@ -90,13 +90,13 @@ The 20% floor on the node-base share guarantees operators always receive enough 
 | Max active challenges per node | SlashJudge | 1 | 50 |
 | Max evidence age | SlashJudge | 1 day | 30 days |
 
-[ADR 026](026-tokenomics-v3.md) replaces ADR 004's settlement-time fee skim and discount-stake mechanic; consequently the ADR 004-era "Protocol fee %", "Discounted fee %", and "Burn percentage of fees" rows are removed. Burn is now a fixed share of the `FeeRouter` split (governable within the burn-share bound above), not a percentage of an upstream fee skim.
+[ADR 026](026-gauge-boost-tokenomics.md) replaces ADR 004's settlement-time fee skim and discount-stake mechanic; consequently the ADR 004-era "Protocol fee %", "Discounted fee %", and "Burn percentage of fees" rows are removed. Burn is now a fixed share of the `FeeRouter` split (governable within the burn-share bound above), not a percentage of an upstream fee skim.
 
 The 3-day voting period balances responsiveness with participation. Combined with the 2-day timelock, the total governance delay is 5 days minimum — comparable to standard OpenZeppelin Governor deployments.
 
 Staking, slashing, and fee parameters are defined in [ADR 004](004-tokenomics.md). Payment channel parameters are defined in [ADR 003](003-payments.md). This ADR defines the governance mechanism that controls them.
 
-**Treasury disbursement:** Spending from the protocol treasury wallet (the destination of the 5% `FeeRouter` treasury share per [ADR 026](026-tokenomics-v3.md) §2) — including operational expenditures, ecosystem grants, audits, and any onward transfers — requires a standard governance proposal in production. During the PoC, the admin key holder directs treasury spending. The emergency multisig cannot withdraw treasury funds (see [Emergency Multisig](#emergency-multisig)); its only fund-movement authority is the SafetyReserve fast-track path, which is bounded by hard caps and the four payout gates.
+**Treasury disbursement:** Spending from the protocol treasury wallet (the destination of the 5% `FeeRouter` treasury share per [ADR 026](026-gauge-boost-tokenomics.md) §2) — including operational expenditures, ecosystem grants, audits, and any onward transfers — requires a standard governance proposal in production. During the PoC, the admin key holder directs treasury spending. The emergency multisig cannot withdraw treasury funds (see [Emergency Multisig](#emergency-multisig)); its only fund-movement authority is the SafetyReserve fast-track path, which is bounded by hard caps and the four payout gates.
 
 **Safety bound rationale:**
 
@@ -108,16 +108,16 @@ Staking, slashing, and fee parameters are defined in [ADR 004](004-tokenomics.md
 
 ### SafetyReserve Payout Authorization
 
-The 3% `SafetyReserve` bucket introduced by [ADR 026](026-tokenomics-v3.md) §5 is a governance-gated incident reserve, not a passive yield source. Payouts cover SLA-failure compensation, incorrect-slashing reversals, relay/sequencer/payment-channel downtime, and bad-data incidents — see [ADR 026](026-tokenomics-v3.md) §5 for the full eligibility list.
+The 3% `SafetyReserve` bucket introduced by [ADR 026](026-gauge-boost-tokenomics.md) §5 is a governance-gated incident reserve, not a passive yield source. Payouts cover SLA-failure compensation, incorrect-slashing reversals, relay/sequencer/payment-channel downtime, and bad-data incidents — see [ADR 026](026-gauge-boost-tokenomics.md) §5 for the full eligibility list.
 
 `SafetyReserve.payout(bundle, recipient, amount)` checks all four of the following gates; absence of any of them causes the call to revert. There is no path for unattested or unreviewed payouts.
 
-1. **Attested incident bundle.** The caller must supply a cryptographic evidence bundle identifying the failure mode, the harmed party, and the proposed payout amount. Bundle attestation rules and accepted evidence types are tracked in the [ADR 026](026-tokenomics-v3.md) source design spec.
+1. **Attested incident bundle.** The caller must supply a cryptographic evidence bundle identifying the failure mode, the harmed party, and the proposed payout amount. Bundle attestation rules and accepted evidence types are tracked in the [ADR 026](026-gauge-boost-tokenomics.md) source design spec.
 2. **Authorization.** Either (a) a successful governance proposal that authorizes the specific bundle, or (b) emergency-multisig fast-track approval — the multisig may execute payouts under hard caps (per-incident and per-rolling-window USDC ceilings configured at deploy time and immutable thereafter; see [Emergency Multisig](#emergency-multisig)). Multisig fast-track is intended for time-critical incidents (active SLA breaches, ongoing outages) and does not bypass the other three gates.
 3. **48-hour appeal window.** After authorization, the bundle enters a 48-hour on-chain appeal window during which any party may submit a counter-bundle challenging the original. Successful challenges revert the authorization. The appeal window cannot be shortened (including by emergency multisig); only the gate-2 authorization step has a fast path.
 4. **Post-incident reporting.** On payout settlement, `SafetyReserve` writes an immutable record to its public on-chain registry (incident hash, payout amount, recipient, authorization path used, links to the evidence bundle and any successful appeals). Operators of the registry MUST publish a human-readable post-incident report referencing the on-chain record; the registry tracks completion of these reports and exposes outstanding-report counts as a public metric.
 
-The emergency multisig's fast-track authority over gate 2 is constrained by the same hard caps the multisig is bound by elsewhere in this ADR — it cannot withdraw treasury funds and cannot bypass the appeal window. Cross-reference [ADR 026](026-tokenomics-v3.md) §5 for the canonical rules; this ADR is the authority for the multisig's role in fast-track authorization and the immutable hard caps.
+The emergency multisig's fast-track authority over gate 2 is constrained by the same hard caps the multisig is bound by elsewhere in this ADR — it cannot withdraw treasury funds and cannot bypass the appeal window. Cross-reference [ADR 026](026-gauge-boost-tokenomics.md) §5 for the canonical rules; this ADR is the authority for the multisig's role in fast-track authorization and the immutable hard caps.
 
 ### Emergency Multisig
 
@@ -143,8 +143,8 @@ The emergency multisig's fast-track authority over gate 2 is constrained by the 
 
 **Negative:**
 
-- ve-weighted governance shifts capture risk from large TOKEN holders to large ve-lockers; safety bounds limit damage but cannot prevent rent-seeking within allowed parameter ranges (e.g., setting the gauge-boost share to the 60% maximum). Operators who lock heavily for gauge boost (per [ADR 026](026-tokenomics-v3.md) §3) also accumulate disproportionate governance weight; this concentration is partially offset by team / seed / treasury vesting acting as a counterweight during the first ~3 years.
+- ve-weighted governance shifts capture risk from large TOKEN holders to large ve-lockers; safety bounds limit damage but cannot prevent rent-seeking within allowed parameter ranges (e.g., setting the gauge-boost share to the 60% maximum). Operators who lock heavily for gauge boost (per [ADR 026](026-gauge-boost-tokenomics.md) §3) also accumulate disproportionate governance weight; this concentration is partially offset by team / seed / treasury vesting acting as a counterweight during the first ~3 years.
 - 3-day voting period + 2-day timelock means 5 days minimum to respond to non-emergency issues via governance
 - Governance participation typically skews low; 4% quorum (against ve-supply) may be difficult to reach consistently, especially during the thin-ve-supply bootstrap window where the absolute quorum bar is small but the population of distinct lockers is also small
-- Without auto-ve-lock-on-vest ([ADR 026](026-tokenomics-v3.md) §1), early ve-supply is concentrated in self-locked seed/team/treasury and POL/airdrop participants who choose to lock; a treasury-funded ve-lock-on-claim airdrop is recommended in the first 6–12 months to broaden the active voter base
-- Regulatory risk: governance voting rights may contribute to TOKEN being classified as a security in some jurisdictions (see also [ADR 026](026-tokenomics-v3.md))
+- Without auto-ve-lock-on-vest ([ADR 026](026-gauge-boost-tokenomics.md) §1), early ve-supply is concentrated in self-locked seed/team/treasury and POL/airdrop participants who choose to lock; a treasury-funded ve-lock-on-claim airdrop is recommended in the first 6–12 months to broaden the active voter base
+- Regulatory risk: governance voting rights may contribute to TOKEN being classified as a security in some jurisdictions (see also [ADR 026](026-gauge-boost-tokenomics.md))

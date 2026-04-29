@@ -1,4 +1,4 @@
-# ADR 026: Tokenomics v3 — Gauge-Boost Design
+# ADR 026: Gauge-Boost Tokenomics
 
 **Date:** 2026-04-25
 **Status:** Draft
@@ -19,7 +19,7 @@
 
 The v3 redesign is structural, not cosmetic. Burn becomes a secondary deflationary lever; real yield to delegators / ve-lockers, supply discipline via fixed-supply-plus-vesting (no auto-ve-lock-on-vest), USDC-denominated bootstrap, and a direct operator-compensation link to ve-commitment via a Curve-style gauge boost become primary.
 
-**Inputs assumed by this ADR.** Pre-launch design with no holder-compensation or contract-migration concerns. ~$1M+ pre-seed USDC capital secured (planning target $3M) — quantitatively addressed in [ADR 030](#forward-references-follow-up-adrs) (forward-referenced; not yet authored). 2026 unmetered-bandwidth provider economics per the design spec's input matrix (1 Gbps VPS, 10 Gbps dedicated, 100 Gbps edge tiers); dedicated-bandwidth nodes are realistic at every scale band the protocol is sized for.
+**Inputs assumed by this ADR.** Pre-launch design with no holder-compensation or contract-migration concerns. ~$1M+ pre-seed USDC capital secured (planning target $3M) — program structure defined in companion [ADR 030](030-preseed-usdc-deployment.md). 2026 unmetered-bandwidth provider economics per the design spec's input matrix (1 Gbps VPS, 10 Gbps dedicated, 100 Gbps edge tiers); dedicated-bandwidth nodes are realistic at every scale band the protocol is sized for.
 
 **ADR-numbering coordination.** Per the rollout plan §3:
 

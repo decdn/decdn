@@ -2,14 +2,14 @@
 
 **Date:** 2026-04-25
 **Status:** Draft (deferred — ship within 6 months of v1 mainnet)
-**Driver:** [ADR 026](026-tokenomics-v3.md) §Risks (Convex-capture risk)
-**Touches:** [ADR 026](026-tokenomics-v3.md), [ADR 009](009-governance.md), [ADR 018](018-liquidity-strategy.md)
+**Driver:** [ADR 026](026-gauge-boost-tokenomics.md) §Risks (Convex-capture risk)
+**Touches:** [ADR 026](026-gauge-boost-tokenomics.md), [ADR 009](009-governance.md), [ADR 018](018-liquidity-strategy.md)
 
 ---
 
 ## Context
 
-[ADR 026](026-tokenomics-v3.md) §4 defines `VotingEscrow` as a non-transferable, no-early-exit ve-position contract modeled on veCRV. The design is deliberate: a strict commitment device couples governance weight and gauge-boost yield to a multi-year capital lockup. The cost is illiquidity — once TOKEN enters a ve-lock, the only release path is the lock's natural decay to expiry.
+[ADR 026](026-gauge-boost-tokenomics.md) §4 defines `VotingEscrow` as a non-transferable, no-early-exit ve-position contract modeled on veCRV. The design is deliberate: a strict commitment device couples governance weight and gauge-boost yield to a multi-year capital lockup. The cost is illiquidity — once TOKEN enters a ve-lock, the only release path is the lock's natural decay to expiry.
 
 Curve Finance's veCRV experience is the canonical case study for what happens when an illiquid commitment device meets a market that wants liquidity:
 
@@ -25,7 +25,7 @@ For deCDN this is a structural risk to ADR 026:
 2. **Wrapper-economy leakage.** Wrapper deposit fees, bribe markets, and liquidity-mining rewards become revenue for the wrapper protocol, not the deCDN DAO that built the gauge system.
 3. **First-mover lock-in.** Once a third-party wrapper has liquidity depth and brand, displacing it is hard — Curve has not displaced Convex despite four years of trying.
 
-[ADR 026](026-tokenomics-v3.md) §Risks flags this as "Convex-capture risk" and forward-references this ADR as a priority-1 follow-up. The [gauge-boost design spec §2.3](../docs/superpowers/specs/2026-04-18-tokenomics-v2-gauge-boost-design.md) ("Liquid-ve wrapper consideration") and the [survival-additions spec §3](../docs/superpowers/specs/2026-04-19-tokenomics-v2-survival-additions.md) ("Native liquid-ve wrapper — don't let Convex eat your governance") both recommend the same defensive move: ship a *native* liquid wrapper under DAO control before a third party ships one outside it.
+[ADR 026](026-gauge-boost-tokenomics.md) §Risks flags this as "Convex-capture risk" and forward-references this ADR as a priority-1 follow-up. The [gauge-boost design spec §2.3](../docs/superpowers/specs/2026-04-18-tokenomics-v2-gauge-boost-design.md) ("Liquid-ve wrapper consideration") and the [survival-additions spec §3](../docs/superpowers/specs/2026-04-19-tokenomics-v2-survival-additions.md) ("Native liquid-ve wrapper — don't let Convex eat your governance") both recommend the same defensive move: ship a *native* liquid wrapper under DAO control before a third party ships one outside it.
 
 The reference implementation is Frax's `sfrxETH`: an ERC-20 wrapper around an internally-pooled illiquid yield-bearing position, with appreciation-based exchange rate evolution and no protocol-level redemption (secondary-market exit only). The Frax model captures the wrapper-economy economics inside the issuing DAO, defends against third-party capture, and gives users a liquid asset without breaking the underlying commitment device.
 
@@ -75,11 +75,11 @@ There is no `withdraw` or `redeem` entry point in the protocol — see §4.
 
 sveTOKEN appreciates against TOKEN over time. Three sources of appreciation:
 
-1. **Delegator-pool TOKEN yield** ([ADR 026](026-tokenomics-v3.md) §6). The pooled `VotingEscrow` lock accrues a share of the 7% delegator-pool TOKEN inflows, distributed pro-rata by ve-balance. `SveToken` claims on behalf of the pool via `FeeRouter.claimDelegator(epochs[])`, receives TOKEN, and either:
+1. **Delegator-pool TOKEN yield** ([ADR 026](026-gauge-boost-tokenomics.md) §6). The pooled `VotingEscrow` lock accrues a share of the 7% delegator-pool TOKEN inflows, distributed pro-rata by ve-balance. `SveToken` claims on behalf of the pool via `FeeRouter.claimDelegator(epochs[])`, receives TOKEN, and either:
    - Auto-compounds: calls `VotingEscrow.increaseAmount` to deposit the claimed TOKEN into the pooled lock. This grows `underlyingTokenBalance` without growing `totalSupply`, raising the exchange rate.
    - Or holds the claimed TOKEN in the `SveToken` contract's direct balance until a recompound batch (see §6); the direct balance is included in `underlyingTokenBalance`, so the exchange rate updates immediately even before the recompound transaction.
 
-2. **Gauge-pool USDC yield** ([ADR 026](026-tokenomics-v3.md) §3). If the pooled `VotingEscrow` lock holder is also a registered operator (the wrapper is **not** an operator in v1; this is forward-flagged for governance), gauge-pool USDC accrues. Otherwise this leg is zero. In v1 we assume zero — `SveToken` is a passive ve-holder, not an operator.
+2. **Gauge-pool USDC yield** ([ADR 026](026-gauge-boost-tokenomics.md) §3). If the pooled `VotingEscrow` lock holder is also a registered operator (the wrapper is **not** an operator in v1; this is forward-flagged for governance), gauge-pool USDC accrues. Otherwise this leg is zero. In v1 we assume zero — `SveToken` is a passive ve-holder, not an operator.
 
 3. **Auto-compound mechanism for delegator yield.** A keeper or any caller invokes `SveToken.harvestAndCompound()`. This:
    1. Calls `FeeRouter.claimDelegator(epochs)` for any unclaimed epoch buckets.
@@ -98,7 +98,7 @@ The exchange rate is read via `convertToAssets(sveAmount) → tokenAmount` and `
 
 **Why no protocol-level redemption?** A redemption path either:
 
-- Forces an early-exit penalty path inside `VotingEscrow` (which [ADR 026](026-tokenomics-v3.md) §4 explicitly forbids — "Early exit: None"), or
+- Forces an early-exit penalty path inside `VotingEscrow` (which [ADR 026](026-gauge-boost-tokenomics.md) §4 explicitly forbids — "Early exit: None"), or
 - Backs redemptions with a TOKEN reserve (which means the wrapper holds liquid TOKEN that is not earning ve-yield, defeating the wrapper's purpose), or
 - Uses a queue-and-wait model where redeemers are paid out from new deposits (which is just an internal secondary market with worse UX than a Balancer pool).
 
@@ -127,7 +127,7 @@ A small deposit fee captures wrapper-economy value for the DAO treasury rather t
 | `depositHaircut` | 0.10% | 0% | 0.50% |
 | `compoundTip` | 0.10% | 0% | 1.00% |
 
-`depositHaircut` is taken on the way in: of every TOKEN deposited, `(1 − depositHaircut)` is added to the pooled lock and `depositHaircut` flows to the protocol treasury (Timelock-custodied per [ADR 026](026-tokenomics-v3.md) §2). The haircut is governable inside the bounds shown.
+`depositHaircut` is taken on the way in: of every TOKEN deposited, `(1 − depositHaircut)` is added to the pooled lock and `depositHaircut` flows to the protocol treasury (Timelock-custodied per [ADR 026](026-gauge-boost-tokenomics.md) §2). The haircut is governable inside the bounds shown.
 
 **Why a haircut at all?** It is the wrapper's only deCDN-DAO revenue stream. Without it, the entire wrapper economy (deposit fees, secondary-market spreads, bribe revenue) accrues to wrapper-protocol arbitrageurs and to whatever bribe market eventually forms around sveTOKEN. The default of 0.10% is comparable to Frax sfrxETH's ~0% and to cvxCRV's 0% nominal but ~5% effective (via the staking-vs-not-staking spread), and is intentionally low to preserve user incentive to use the native wrapper rather than build a third-party fork around it. Governance can raise it later if usage proves sticky.
 
@@ -142,7 +142,7 @@ A small deposit fee captures wrapper-economy value for the DAO treasury rather t
 | Lock extension cadence | Per epoch + opportunistic-on-deposit | per-deposit | per-block | Yes | Default keeps decay ≤ 0.05% between extensions |
 | `depositHaircut` | 0.10% | 0% | 0.50% | Yes | Wrapper-economy revenue to treasury |
 | `compoundTip` | 0.10% of harvested | 0% | 1.00% | Yes | Permissionless-keeper subsidy; paid only on non-zero harvest |
-| Claim window inheritance | 26 epochs | — | — | No | Inherited from [ADR 026](026-tokenomics-v3.md) §2; wrapper claims internally |
+| Claim window inheritance | 26 epochs | — | — | No | Inherited from [ADR 026](026-gauge-boost-tokenomics.md) §2; wrapper claims internally |
 | Compound RPC routing | Private (Flashbots-style) | — | — | No | MEV defense; matches [ADR 018](018-liquidity-strategy.md) pattern |
 | sveTOKEN/TOKEN POL seed (target) | $200K–$500K notional | TBD | TBD | Yes | Seeded at launch; size landed in [ADR 018](018-liquidity-strategy.md) |
 | Wind-down vote outcome | Stop-extensions only | — | — | Yes | Per [ADR 009](009-governance.md) governance flow |
@@ -206,7 +206,7 @@ The exact pool seeding parameters (size, weights, fee tier) are **out of scope f
 
 **Why deferred to within 6 months of v1 — not at v1?** Shipping a native wrapper requires (a) observable veTOKEN supply and gauge-pool revenue to make the wrapper economically meaningful, (b) Balancer V3 POL depth to seed against, and (c) audit slots not consumed by the v1 contract surface (`FeeRouter`, `VotingEscrow`, `SafetyReserve`). A v1-concurrent wrapper has all three constraints binding simultaneously; a 6-month-deferred wrapper has none. The Convex-capture risk window is ~12–18 months, so 6 months is a comfortable margin while still preserving v1 launch focus.
 
-**Not blocking for v1.** v1 ships with [ADR 026](026-tokenomics-v3.md)'s `VotingEscrow` only. Third-party wrapper risk in the first 6 months is bounded by the same constraints (a) (b) above; it is unattractive to attack a wrapper economy with no liquid float.
+**Not blocking for v1.** v1 ships with [ADR 026](026-gauge-boost-tokenomics.md)'s `VotingEscrow` only. Third-party wrapper risk in the first 6 months is bounded by the same constraints (a) (b) above; it is unattractive to attack a wrapper economy with no liquid float.
 
 ### 10. Risks specific to wrapper design
 
@@ -214,7 +214,7 @@ The exact pool seeding parameters (size, weights, fee tier) are **out of scope f
 | --- | --- | --- | --- |
 | **De-peg risk (downside)** | sveTOKEN trades below `convertToAssets` on the secondary market — the standard liquid-staked-token discount | High likelihood, low-medium impact | Expected behavior, not pathological. Frax `sfrxETH` typically trades 0.5–2% below `convertToAssets`; cvxCRV has historically traded 5–25% below CRV. DAO seeds POL to keep the discount tight |
 | **De-peg risk (cascade)** | A large sveTOKEN holder dumps; the secondary pool moves; other holders panic-sell; discount widens; arbitrage doesn't close because there is no protocol redemption | Low-medium likelihood, high impact | Per-epoch liquidity caps on the sveTOKEN/TOKEN pool (per [ADR 018](018-liquidity-strategy.md) MEV-cap pattern); DAO POL absorbs at the pool's fair-value side; communications protocol around expected discount range |
-| **Contagion to TOKEN price** | sveTOKEN discount wides → secondary-market arbitrage involves selling TOKEN → TOKEN price drops → ve-lock value drops → compound case-B from [ADR 026](026-tokenomics-v3.md) §Risks | Medium likelihood, medium impact | Same set of POL / liquidity-cap defenses as the [ADR 018](018-liquidity-strategy.md) buyback flow; the [ADR 029](029-adaptive-fee-router.md) price-floor feedback hook provides an automatic counter-pressure |
+| **Contagion to TOKEN price** | sveTOKEN discount widens → secondary-market arbitrage involves selling TOKEN → TOKEN price drops → ve-lock value drops → compound case-B from [ADR 026](026-gauge-boost-tokenomics.md) §Risks | Medium likelihood, medium impact | Same set of POL / liquidity-cap defenses as the [ADR 018](018-liquidity-strategy.md) buyback flow; the [ADR 029](029-adaptive-fee-router.md) price-floor feedback hook provides an automatic counter-pressure |
 | **Governance capture by large sveTOKEN holders** | A whale accumulates sveTOKEN, then pressures the DAO multisig (Option B in §7) into mirroring their preferred votes | Medium likelihood, high impact | The vote-mirroring policy is the primary defense; sub-ADR specifies whether mirroring is "share-weighted" (whale wins) or "snapshot-weighted with caps" (whale capped); reserve right to publicly disregard a hostile mirror |
 | **Auto-compound griefing** | Adversary spams `harvestAndCompound` with zero pending yield, draining the `compoundTip` over time | Low likelihood, low impact | `compoundTip` is paid only on actual harvested amounts (`tip = compoundTip × harvested`, not flat); zero-harvest calls cost the caller gas without paying out |
 | **Oracle / mispricing scenarios** | An on-chain oracle misreads sveTOKEN value, a downstream protocol uses sveTOKEN as collateral at the wrong price | Low likelihood (no v1 collateral integrations), high impact if realized | Out of scope for v1 (wrapper is not collateral-eligible anywhere by default); document the risk for downstream protocols |
@@ -228,14 +228,14 @@ The exact pool seeding parameters (size, weights, fee tier) are **out of scope f
 ### Positive
 
 - **Convex-capture defense.** A native wrapper exists before a third party ships one. Wrapper-economy revenue (deposit haircut, future bribe-mediation fees) accrues to the deCDN DAO. Governance weight stays inside the DAO via Option B vote-mirroring.
-- **User liquidity without breaking the commitment device.** Holders gain a tradeable token; the underlying lock is untouched; [ADR 026](026-tokenomics-v3.md)'s "no early exit" invariant is preserved.
-- **Treasury revenue stream.** The 0.10% deposit haircut compounds with deposit volume. Modest in absolute terms but a non-zero recurring USD-denominated TOKEN flow to the treasury, separate from the [ADR 026](026-tokenomics-v3.md) §2 router buckets.
-- **Auto-compounding raises effective ve-locker yield.** sveTOKEN holders effectively receive the auto-compound benefit that direct ve-lockers must DIY. This is the v3 model's "real yield in TOKEN" lever (per [ADR 026](026-tokenomics-v3.md) §6) packaged for passive holders.
+- **User liquidity without breaking the commitment device.** Holders gain a tradeable token; the underlying lock is untouched; [ADR 026](026-gauge-boost-tokenomics.md)'s "no early exit" invariant is preserved.
+- **Treasury revenue stream.** The 0.10% deposit haircut compounds with deposit volume. Modest in absolute terms but a non-zero recurring USD-denominated TOKEN flow to the treasury, separate from the [ADR 026](026-gauge-boost-tokenomics.md) §2 router buckets.
+- **Auto-compounding raises effective ve-locker yield.** sveTOKEN holders effectively receive the auto-compound benefit that direct ve-lockers must DIY. This is the v3 model's "real yield in TOKEN" lever (per [ADR 026](026-gauge-boost-tokenomics.md) §6) packaged for passive holders.
 - **Frax sfrxETH precedent.** The reference implementation has run for 2+ years at $400M+ TVL with no exploits and a tight ~1% discount band. Audit playbook is well-developed.
 
 ### Negative
 
-- **Significant new contract surface.** `SveToken` proxy + implementation, vote-mirroring policy contract or multisig integration, possibly a `DelegatorClaimAdapter` if `FeeRouter.claimDelegator` is not directly callable by `SveToken`. Each is small individually; together they expand audit scope by ~30–40% over [ADR 026](026-tokenomics-v3.md)'s already-larger-than-ADR-004 contract surface.
+- **Significant new contract surface.** `SveToken` proxy + implementation, vote-mirroring policy contract or multisig integration, possibly a `DelegatorClaimAdapter` if `FeeRouter.claimDelegator` is not directly callable by `SveToken`. Each is small individually; together they expand audit scope by ~30–40% over [ADR 026](026-gauge-boost-tokenomics.md)'s already-larger-than-ADR-004 contract surface.
 - **Operational burden.** Compound keepers, deposit-flow monitoring, secondary-market discount tracking, vote-mirroring policy execution. Not contract-level burden but DAO-process burden.
 - **Discount UX.** Users will be confused that `1 sveTOKEN ≠ 1 TOKEN` on the open market even though `convertToAssets(1 sveTOKEN) ≥ 1 TOKEN`. Documentation, dashboards, and front-end displays must explain the discount and the appreciation rate clearly.
 - **Concentration of governance weight via Option B multisig.** Even with vote-mirroring policy, the multisig is a focal point for capture attempts. Mitigated by the multisig being a [ADR 009](009-governance.md) emergency-multisig topology with limited unilateral authority.
@@ -244,8 +244,8 @@ The exact pool seeding parameters (size, weights, fee tier) are **out of scope f
 ### Risks
 
 - **Liquid wrapper depeg risk.** Persistent secondary-market discount is the wrapper's signature failure mode. Frax handles it with auto-compounding and tight POL; cvxCRV historically didn't, and trades at a structural 5–25% discount. Our defenses (auto-compound + POL + per-epoch caps) lean toward the Frax pattern. If the discount widens past ~5% sustainedly, governance has the option to invoke wind-down (§5 termination clause).
-- **sveTOKEN→TOKEN price contagion.** A wide sveTOKEN discount creates arbitrage flows that move the underlying TOKEN price. The sveTOKEN/TOKEN pool's per-epoch caps bound the per-epoch contagion volume, but a multi-epoch drawdown is possible. Compounds with [ADR 026](026-tokenomics-v3.md) §Risks "Reflexive bootstrap intensified at the operator-margin layer" — a sveTOKEN depeg could intensify operator-margin pressure during a TOKEN drawdown.
-- **Protocol-complexity tax.** Each additional yield-routing contract is one more thing to audit, monitor, upgrade, and explain. The [ADR 026](026-tokenomics-v3.md) §Negative "Higher contract surface than ADR 004" remark applies again, compounded. The deferred ship date (within 6 months of mainnet) is partly a tax-amortization choice.
+- **sveTOKEN→TOKEN price contagion.** A wide sveTOKEN discount creates arbitrage flows that move the underlying TOKEN price. The sveTOKEN/TOKEN pool's per-epoch caps bound the per-epoch contagion volume, but a multi-epoch drawdown is possible. Compounds with [ADR 026](026-gauge-boost-tokenomics.md) §Risks "Reflexive bootstrap intensified at the operator-margin layer" — a sveTOKEN depeg could intensify operator-margin pressure during a TOKEN drawdown.
+- **Protocol-complexity tax.** Each additional yield-routing contract is one more thing to audit, monitor, upgrade, and explain. The [ADR 026](026-gauge-boost-tokenomics.md) §Negative "Higher contract surface than ADR 004" remark applies again, compounded. The deferred ship date (within 6 months of mainnet) is partly a tax-amortization choice.
 - **Vote-mirroring-policy capture.** The mirror policy is the entire defense against Option B becoming a single-point-of-failure for governance. Sub-ADR (provisionally 028.1) is required before sveTOKEN ships.
 - **Wrapper-on-wrapper risk.** Once sveTOKEN exists, third parties may build wrappers on sveTOKEN itself (a "Convex on the deCDN-Convex"). The defense is the same: native sveTOKEN should be liquid and useful enough that a third-party wrapper-of-wrapper doesn't add value. If it does, that's a v3 problem.
 

@@ -100,7 +100,7 @@ Clients pay nodes per MB. On a cache miss, nodes pay origin-backed nodes per MB 
 
 **USDC for payments. TOKEN for staking, governance, and fee discounts.**
 
-> **Superseded by [ADR 026 — Tokenomics v3](026-tokenomics-v3.md).** ADR 026 is the canonical tokenomics source going forward. The summary below is preserved for historical context only.
+> **Superseded by [ADR 026 — Gauge-Boost Tokenomics](026-gauge-boost-tokenomics.md).** ADR 026 is the canonical tokenomics source going forward. The summary below is preserved for historical context only.
 
 TOKEN is not used for payments. All nodes must stake TOKEN to participate. Staking cost creates accountability and Sybil resistance. 20% of protocol fees buy back and burn TOKEN (accumulate-only in PoC; buyback execution deferred to production). Fixed supply of 1B at genesis. Challenge bonds (100 TOKEN in PoC, 50 TOKEN in production) are required for slash claims, preventing zero-cost griefing. The buyback venue, pool type, and liquidity-seeding strategy are specified in [ADR 018](018-liquidity-strategy.md). Governance is covered separately in [ADR 009](009-governance.md).
 
@@ -277,7 +277,7 @@ Running nodes expose a loopback HTTP admin surface so operator CLIs (`decdn node
 
 ---
 
-### [ADR 026 — Tokenomics v3 (gauge-boost)](026-tokenomics-v3.md)
+### [ADR 026 — Gauge-Boost Tokenomics](026-gauge-boost-tokenomics.md)
 
 **1B fixed supply. `FeeRouter` 40/40/7/5/5/3 split with Curve-style gauge boost, delegator pool, and SafetyReserve. Supersedes [ADR 004](004-tokenomics.md) in full.**
 
@@ -291,9 +291,9 @@ The 40% gauge pool uses a Curve veCRV-style boost: `working_bytes_i = min(bytes_
 
 **Client-signed `DeliveryReceipt` Merkle-batched per epoch; gauge-pool eligibility gated on a distinct-client diversity threshold. Required for v1 production launch — without it, the gauge pool is gameable via wash-trading.**
 
-The [ADR 026](026-tokenomics-v3.md) gauge formula is bounded by `bytes_i`, but `bytes_i` itself is currently the operator-supplied `claimedBytes` from settlement vouchers. An operator can wash-trade by running both sides of a payment channel — the 60% non-base router skim is denominated in their own USDC and is not a deterrent at the intended TOKEN price levels. This ADR introduces a `DeliveryReceipt` EIP-712 typed message signed by the *requester's* secp256k1 key (the address that funded the channel), paired one-to-one with each voucher and bound to a `contentRoot` keccak256 Merkle root over 1024-byte chunks (matching the [ADR 014 §2](014-on-chain-verification.md) production path).
+The [ADR 026](026-gauge-boost-tokenomics.md) gauge formula is bounded by `bytes_i`, but `bytes_i` itself is currently the operator-supplied `claimedBytes` from settlement vouchers. An operator can wash-trade by running both sides of a payment channel — the 60% non-base router skim is denominated in their own USDC and is not a deterrent at the intended TOKEN price levels. This ADR introduces a `DeliveryReceipt` EIP-712 typed message signed by the *requester's* secp256k1 key (the address that funded the channel), paired one-to-one with each voucher and bound to a `contentRoot` keccak256 Merkle root over 1024-byte chunks (matching the [ADR 014 §2](014-on-chain-verification.md) production path).
 
-Receipts are batched into a Merkle tree per operator per epoch; only the root and a small summary land on chain at settlement, with individual receipts surfacing only on challenge (watchtower-monitored, [ADR 008](008-reputation.md)-reputation gated). Gauge-pool eligibility is gated on a distinct-client diversity threshold computed across recovered `clientPubKey` addresses. Vouchers without matching receipts are still fully redeemable for USDC — only gauge eligibility for the underlying bytes depends on the receipt. Forward-referenced from [ADR 026 §Risks](026-tokenomics-v3.md) as priority-1 and **not optional for production launch**.
+Receipts are batched into a Merkle tree per operator per epoch; only the root and a small summary land on chain at settlement, with individual receipts surfacing only on challenge (watchtower-monitored, [ADR 008](008-reputation.md)-reputation gated). Gauge-pool eligibility is gated on a distinct-client diversity threshold computed across recovered `clientPubKey` addresses. Vouchers without matching receipts are still fully redeemable for USDC — only gauge eligibility for the underlying bytes depends on the receipt. Forward-referenced from [ADR 026 §Risks](026-gauge-boost-tokenomics.md) as priority-1 and **not optional for production launch**.
 
 ---
 
@@ -301,19 +301,19 @@ Receipts are batched into a Merkle tree per operator per epoch; only the root an
 
 **Frax `sfrxETH`-style native ERC-20 wrapper around a pooled `VotingEscrow` lock. Pre-empts Convex-style third-party governance capture. Deferred — ship within 6 months of v1 mainnet.**
 
-[ADR 026](026-tokenomics-v3.md) §4 defines `VotingEscrow` as a strict no-early-exit commitment device. Curve veCRV's history shows that illiquid commitment devices attract third-party liquid wrappers (Convex `cvxCRV`, Aura for veBAL) which capture 30–50% of underlying ve-supply, leak wrapper-economy revenue (deposit fees, bribe markets) outside the issuing DAO, and concentrate gauge-vote weight in a third party. This ADR ships a *native* `SveToken` ERC-20 wrapper, owned and operated by the deCDN DAO, before a third party ships one outside it.
+[ADR 026](026-gauge-boost-tokenomics.md) §4 defines `VotingEscrow` as a strict no-early-exit commitment device. Curve veCRV's history shows that illiquid commitment devices attract third-party liquid wrappers (Convex `cvxCRV`, Aura for veBAL) which capture 30–50% of underlying ve-supply, leak wrapper-economy revenue (deposit fees, bribe markets) outside the issuing DAO, and concentrate gauge-vote weight in a third party. This ADR ships a *native* `SveToken` ERC-20 wrapper, owned and operated by the deCDN DAO, before a third party ships one outside it.
 
-`SveToken` holds exactly one pooled `VotingEscrow` lock, kept at max duration via continuous re-extension. `deposit(amount)` mints `sveTOKEN` at an ERC-4626-style appreciation rate; there is no protocol-level redemption — holders exit only via secondary-market sale or hold-to-natural-decay. Exchange rate appreciates from auto-compounded delegator-pool TOKEN yield ([ADR 026 §6](026-tokenomics-v3.md)). The deferment window exists because Convex-style capture takes time to develop (third-party wrappers depend on observable veTOKEN supply); shipping within 6 months stays ahead of that window without forcing the contract into a v1 audit slot.
+`SveToken` holds exactly one pooled `VotingEscrow` lock, kept at max duration via continuous re-extension. `deposit(amount)` mints `sveTOKEN` at an ERC-4626-style appreciation rate; there is no protocol-level redemption — holders exit only via secondary-market sale or hold-to-natural-decay. Exchange rate appreciates from auto-compounded delegator-pool TOKEN yield ([ADR 026 §6](026-gauge-boost-tokenomics.md)). The deferment window exists because Convex-style capture takes time to develop (third-party wrappers depend on observable veTOKEN supply); shipping within 6 months stays ahead of that window without forcing the contract into a v1 audit slot.
 
 ---
 
 ### [ADR 029 — Adaptive FeeRouter Parameters](029-adaptive-fee-router.md)
 
-**Two automated feedback hooks (lock-rate and price-floor) within [ADR 026 §11](026-tokenomics-v3.md) safety bounds. Deferred — adopt after v1 governance dynamics observable.**
+**Two automated feedback hooks (lock-rate and price-floor) within [ADR 026 §11](026-gauge-boost-tokenomics.md) safety bounds. Deferred — adopt after v1 governance dynamics observable.**
 
-[ADR 026 §11](026-tokenomics-v3.md) makes the six `FeeRouter` shares governable, but standard governance (7-day vote + 48h timelock per [ADR 009](009-governance.md)) is too slow for two state-driven feedback regimes the v3 design surfaces but does not solve: ve-lock-rate windows (the gauge boost under-fires below ~15% lock rate and over-rewards a saturated population above ~50%) and TOKEN-price-floor scenarios (the 5% buyback flow is invariant to drawdown when buyback would be most useful).
+[ADR 026 §11](026-gauge-boost-tokenomics.md) makes the six `FeeRouter` shares governable, but standard governance (7-day vote + 48h timelock per [ADR 009](009-governance.md)) is too slow for two state-driven feedback regimes the v3 design surfaces but does not solve: ve-lock-rate windows (the gauge boost under-fires below ~15% lock rate and over-rewards a saturated population above ~50%) and TOKEN-price-floor scenarios (the 5% buyback flow is invariant to drawdown when buyback would be most useful).
 
-This ADR adds an `AdaptiveFeeRouterController` evaluated at epoch rollover with two hooks: a lock-rate hook that shifts ±2pp between `treasury` and `delegator` shares based on `ve_locked / circulating_supply`, and a price-floor hook keyed off the [ADR 018](018-liquidity-strategy.md) Balancer V3 80/20 30-day TWAP. Both hooks are clamped to [ADR 026 §11](026-tokenomics-v3.md) safety bounds, observable via events, and disable-able by governance. Deferred status reflects a "merge the spec, do not deploy" stance — if v1 governance rebalancing turns out to be fast enough in practice, this ADR may close as Rejected.
+This ADR adds an `AdaptiveFeeRouterController` evaluated at epoch rollover with two hooks: a lock-rate hook that shifts ±2pp between `treasury` and `delegator` shares based on `ve_locked / circulating_supply`, and a price-floor hook keyed off the [ADR 018](018-liquidity-strategy.md) Balancer V3 80/20 30-day TWAP. Both hooks are clamped to [ADR 026 §11](026-gauge-boost-tokenomics.md) safety bounds, observable via events, and disable-able by governance. Deferred status reflects a "merge the spec, do not deploy" stance — if v1 governance rebalancing turns out to be fast enough in practice, this ADR may close as Rejected.
 
 ---
 
@@ -321,7 +321,7 @@ This ADR adds an `AdaptiveFeeRouterController` evaluated at epoch rollover with 
 
 **$1M floor / $3M target externally-raised USDC pre-seed capital, structured into five funded programs. Replaces ADR 004's 200M-TOKEN bootstrap fund and is a prerequisite for v3 mainnet launch.**
 
-Charters the externally-raised USDC pool that [ADR 026 §10](026-tokenomics-v3.md) substitutes for ADR 004's reflexive 200M-TOKEN node-bootstrap fund. Capital is held in a Timelock-custodied multisig sub-account with hard caps for a multisig fast-track path ($50K per incident / $250K per 30-day rolling) and standard governance proposals above those bounds. Five non-overlapping programs: 30% Protocol-Owned Operators (DAO-operated nodes in priority underserved regions), 25% hardware-leasing subsidies, 15% staking loans, 20% regional-deploy grants, and 10% Enterprise SLA guarantee fund (paired backing for [ADR 026](026-tokenomics-v3.md) `SafetyReserve`).
+Charters the externally-raised USDC pool that [ADR 026 §10](026-gauge-boost-tokenomics.md) substitutes for ADR 004's reflexive 200M-TOKEN node-bootstrap fund. Capital is held in a Timelock-custodied multisig sub-account with hard caps for a multisig fast-track path ($50K per incident / $250K per 30-day rolling) and standard governance proposals above those bounds. Five non-overlapping programs: 30% Protocol-Owned Operators (DAO-operated nodes in priority underserved regions), 25% hardware-leasing subsidies, 15% staking loans, 20% regional-deploy grants, and 10% Enterprise SLA guarantee fund (paired backing for [ADR 026](026-gauge-boost-tokenomics.md) `SafetyReserve`).
 
 The program runs in parallel with the canonical [ADR 019](019-node-onboarding.md) self-funded onboarding flow — it does not replace any phase, it supplies stake/hardware/regional capital/SLA backing to operators who would otherwise be filtered out at Phase 1 or Phase 2. Sized for the S0→S1 (~178 → ~1,778 nodes) transition where operator-side reflexivity bites hardest and treasury inflow has not yet caught up. Raising at least the $1M floor is a prerequisite for v3 mainnet launch; contingency is governance re-allocation from the 30% Protocol Treasury bucket at the cost of development runway.
 
@@ -331,7 +331,7 @@ The program runs in parallel with the canonical [ADR 019](019-node-onboarding.md
 
 **Optional client-side TOKEN-prepay path implementing Helium's Burn-and-Mint Equilibrium pattern as a demand-side TOKEN sink. Deferred to v2.**
 
-[ADR 026](026-tokenomics-v3.md)'s three TOKEN demand sources (operator stake, gauge ve-locking, delegator-pool TWAP buys) are all on the operator side; clients pay only USDC. If operator-side ve-lock adoption falters, the demand-side flywheel collapses with no usage-driven floor underneath it. This ADR pins a v2 design intent: a `BmePrepay` contract that lets clients optionally prepay bandwidth in TOKEN at a 5–8% discount to the equivalent USDC rate, with the prepaid TOKEN *burned* on consumption (no router skim, no treasury cut, no operator routing of the TOKEN itself).
+[ADR 026](026-gauge-boost-tokenomics.md)'s three TOKEN demand sources (operator stake, gauge ve-locking, delegator-pool TWAP buys) are all on the operator side; clients pay only USDC. If operator-side ve-lock adoption falters, the demand-side flywheel collapses with no usage-driven floor underneath it. This ADR pins a v2 design intent: a `BmePrepay` contract that lets clients optionally prepay bandwidth in TOKEN at a 5–8% discount to the equivalent USDC rate, with the prepaid TOKEN *burned* on consumption (no router skim, no treasury cut, no operator routing of the TOKEN itself).
 
 The BME path coexists with [ADR 003](003-payments.md) USDC channels — opt-in for clients and opt-in for operators (operators may refuse BME-routed traffic if cost-of-conversion exceeds the discount). Two operator-payment options are documented but not yet pinned: protocol-mints-USDC-equivalent against a managed reserve, vs. operator receives TOKEN and swaps separately. Deferred to v2 because the design has two unresolved dependencies — a hardened TOKEN→USDC pricing oracle (the [ADR 018](018-liquidity-strategy.md) TWAP needs v1-stability data and multi-source check / circuit breakers before clients can fund prepay positions against it) and a v1 contract scope that does not justify the additional audit surface.
 
@@ -339,7 +339,7 @@ The BME path coexists with [ADR 003](003-payments.md) USDC channels — opt-in f
 
 ### [ADR 032 — Bandwidth Futures and Enterprise SLA Tier](032-bandwidth-futures-enterprise.md)
 
-**TOKEN-denominated bandwidth futures + explicit Enterprise SLA contracts backed in priority order by `SafetyReserve` ([ADR 026 §5](026-tokenomics-v3.md)) and the pre-seed Enterprise SLA guarantee fund ([ADR 030 §2e](030-preseed-usdc-deployment.md)). Deferred to v2 mainnet.**
+**TOKEN-denominated bandwidth futures + explicit Enterprise SLA contracts backed in priority order by `SafetyReserve` ([ADR 026 §5](026-gauge-boost-tokenomics.md)) and the pre-seed Enterprise SLA guarantee fund ([ADR 030 §2e](030-preseed-usdc-deployment.md)). Deferred to v2 mainnet.**
 
 v1 deCDN serves best-effort delivery at $0.01/GB — sufficient for freemium / Pro tier clients but not for two adjacent client segments that the v3 economic model and market-dynamics analysis explicitly target: streaming startups and content aggregators that need cost certainty for capacity planning, and Enterprise clients that require contractually-binding availability/latency/throughput SLAs with credible recourse paths before they will migrate from Cloudflare/Akamai/Fastly. This ADR is the product-tier and contract-shape decision record for both segments.
 

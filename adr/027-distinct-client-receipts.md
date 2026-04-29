@@ -2,14 +2,14 @@
 
 **Date:** 2026-04-25
 **Status:** Draft
-**Required for:** [ADR 026](026-tokenomics-v3.md) gauge-pool security
+**Required for:** [ADR 026](026-gauge-boost-tokenomics.md) gauge-pool security
 **Touches:** [ADR 003](003-payments.md), [ADR 007](007-watchtower.md), [ADR 008](008-reputation.md), [ADR 014](014-on-chain-verification.md)
 
 ---
 
 ## Context
 
-[ADR 026](026-tokenomics-v3.md) §2 introduces a `FeeRouter` that distributes 40% of every settlement into a weekly **gauge boost pool**. Pool share is computed by the Curve-style formula in [ADR 026 §3](026-tokenomics-v3.md#3-gauge-boost-formula):
+[ADR 026](026-gauge-boost-tokenomics.md) §2 introduces a `FeeRouter` that distributes 40% of every settlement into a weekly **gauge boost pool**. Pool share is computed by the Curve-style formula in [ADR 026 §3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula):
 
 ```
 working_bytes_i = min(bytes_i, 0.4 × bytes_i + 0.6 × (ve_i / total_ve) × total_bytes)
@@ -18,7 +18,7 @@ boost_share_i   = working_bytes_i / Σ working_bytes
 
 The formula is bounded by `bytes_i` in both directions (invariant #3 in the gauge-boost design spec §3) — but **the formula says nothing about whether `bytes_i` itself is honest**. The on-chain input is `claimedBytes` from the final voucher submitted to `FeeRouter.routeSettlement(operator, bytesDelivered, amount)` ([ADR 003](003-payments.md) settlement flow). Today that field is supplied by the settling operator and signed by *some* address that opened a payment channel against them. Nothing prevents the operator from running both sides.
 
-**The wash-trading attack** ([ADR 026 §Risks](026-tokenomics-v3.md#risks); design-spec §6 Risks #3; market-dynamics §3; survival-additions §4):
+**The wash-trading attack** ([ADR 026 §Risks](026-gauge-boost-tokenomics.md#risks); design-spec §6 Risks #3; market-dynamics §3; survival-additions §4):
 
 1. Operator `O` controls a sybil client identity `C` (a fresh EOA or smart account).
 2. `C` opens a payment channel to `O` with a USDC deposit.
@@ -30,7 +30,7 @@ Settlement gas (~$0.08) is a per-event tax but does not scale with claimed bytes
 
 Defense: byte counters that feed the gauge formula must be attested by **distinct, verifiable client identities** — counterparties the operator does not control. The voucher protocol from [ADR 003](003-payments.md) already proves *bytes were paid for*; this ADR adds a parallel artifact that proves *bytes were paid for by independent counterparties* and gates gauge eligibility on that artifact.
 
-This ADR is forward-referenced from [ADR 026 §Risks](026-tokenomics-v3.md#risks) and [ADR 026 §Forward references](026-tokenomics-v3.md#forward-references-follow-up-adrs) as priority-1, **not optional for production launch**.
+This ADR is forward-referenced from [ADR 026 §Risks](026-gauge-boost-tokenomics.md#risks) and [ADR 026 §Forward references](026-gauge-boost-tokenomics.md#forward-references-follow-up-adrs) as priority-1, **not optional for production launch**.
 
 ---
 
@@ -124,7 +124,7 @@ Where `distinct_clients_e(operator)` counts the unique `clientPubKey` values app
 
 **Sizing rationale.** A single sybil costs the attacker the funded-channel minimum (10 USDC), the funding-age delay (24 h), and the cooldown (7 d). Five distinct sybils per week is 50 USDC of capital permanently parked in payment-channel deposits per operator per week, plus on-chain Tx fees to fund and rotate. Larger thresholds harden against sybils linearly at the cost of cold-start UX; 5 is a reasoned default for v1, sized for tens-of-nodes-scale. Production data should retune this — the parameter is governable and the safety bounds are wide.
 
-**Cold-start exception.** During the first 8 epochs of mainnet (governance-set `gaugeBootstrapEpochs`, default 8, max 26), `MIN_DISTINCT_CLIENTS_PER_EPOCH` is reduced to `1`. The intent is to let the gauge pool distribute meaningfully even when the network has fewer aggregate clients than the steady-state threshold; the wash-trading risk is bounded during this window because pre-seed USDC ([ADR 026 §10](026-tokenomics-v3.md#10-bootstrap-mechanism--pre-seed-usdc)) and the Protocol-Owned-Operators program (forward-referenced from [ADR 026](026-tokenomics-v3.md#forward-references-follow-up-adrs) as ADR 030) dominate early-epoch bytes anyway. Bootstrap-window receipts are still validated; only the *threshold* is lowered.
+**Cold-start exception.** During the first 8 epochs of mainnet (governance-set `gaugeBootstrapEpochs`, default 8, max 26), `MIN_DISTINCT_CLIENTS_PER_EPOCH` is reduced to `1`. The intent is to let the gauge pool distribute meaningfully even when the network has fewer aggregate clients than the steady-state threshold; the wash-trading risk is bounded during this window because pre-seed USDC ([ADR 026 §10](026-gauge-boost-tokenomics.md#10-bootstrap-mechanism--pre-seed-usdc)) and the Protocol-Owned-Operators program (forward-referenced from [ADR 026](026-gauge-boost-tokenomics.md#forward-references-follow-up-adrs) as ADR 030) dominate early-epoch bytes anyway. Bootstrap-window receipts are still validated; only the *threshold* is lowered.
 
 **Optional reputation-attested registry.** The protocol does not require a centralized identity registry. However, a `ClientIdentityRegistry` view contract may be supplied by reputation attesters ([ADR 008](008-reputation.md)) so well-known stable client identities (e.g., operators of large origin-backed services purchasing CDN bandwidth) can be vouched for and bypass the funding-age gate. The registry is opt-in and watchtower-validated; clients without a registry entry use the default funded-channel-and-cooldown rules unchanged.
 
@@ -167,7 +167,7 @@ Tree construction matches the [ADR 014](014-on-chain-verification.md) pattern: `
 | `claimedDistinctClients` | `uint32` | Operator-asserted count of unique `clientPubKey` across the receipt batches. Subject to challenge. |
 | `aggregateRoot` | `bytes32` | Merkle root of the per-settlement `receiptBatchRoot`s for `epochId` (a tree of trees). One inclusion proof reaches any individual receipt in two hops. |
 
-The `EpochReceiptSummary` is committed once per operator per epoch by the operator (or any third party) calling `FeeRouter.commitEpochSummary(operator, epochId, summary)` after the epoch closes and before the gauge claim window opens (claim-window timing per [ADR 026 §2 Epoch mechanics](026-tokenomics-v3.md#2-feerouter-split-40407553)). The contract verifies that `claimedBytes` matches the on-chain accumulated counter for the epoch and that `aggregateRoot` is consistent with the per-settlement roots already stored. `claimedDistinctClients` is taken at face value pending the challenge window.
+The `EpochReceiptSummary` is committed once per operator per epoch by the operator (or any third party) calling `FeeRouter.commitEpochSummary(operator, epochId, summary)` after the epoch closes and before the gauge claim window opens (claim-window timing per [ADR 026 §2 Epoch mechanics](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553)). The contract verifies that `claimedBytes` matches the on-chain accumulated counter for the epoch and that `aggregateRoot` is consistent with the per-settlement roots already stored. `claimedDistinctClients` is taken at face value pending the challenge window.
 
 **Challenge window.** A 7-day window (matches the gauge-claim-window opening) during which any address may submit a `ChallengeReceiptSummary` claim against an operator's summary. Watchtowers (§5) typically initiate. A successful challenge zeros `claimedDistinctClients` for the epoch — gauge eligibility is forfeited in line with §7. An unsuccessful challenge forfeits the challenger's bond per [ADR 014 Bond Handling](014-on-chain-verification.md).
 
@@ -222,7 +222,7 @@ The receipt protocol fails open for **payment** and fails closed for **gauge eli
 | Operator delivers bytes but gauge eligibility is forfeited for any reason in this table (zeroed batch, missing summary, sub-threshold distinct clients). | **Paid same-tx** at settlement. | Zero gauge share for the epoch. | None unless triggered separately. |
 | Operator below `MIN_DISTINCT_CLIENTS_PER_EPOCH` after honest validation (low traffic, regional cold-start). | **Paid same-tx** at settlement. | Zero gauge share for the epoch. | None. |
 
-**The cashflow invariant.** Settlement always pays the operator's 40% base ([ADR 026 §2 Same-transaction guarantees](026-tokenomics-v3.md#2-feerouter-split-40407553); [ADR 026 §3 Properties](026-tokenomics-v3.md#3-gauge-boost-formula)). Receipt validity gates only the **40% gauge pool share**, never the **40% base share**. An operator running honest delivery with an immature client base receives full base USDC and zero gauge — they are commodity operators in the [ADR 026 §7 Case A](026-tokenomics-v3.md#7-operator-economics-and-minimum-stake) sense. This is the designed incentive pressure, not a punishment.
+**The cashflow invariant.** Settlement always pays the operator's 40% base ([ADR 026 §2 Same-transaction guarantees](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553); [ADR 026 §3 Properties](026-gauge-boost-tokenomics.md#3-gauge-boost-formula)). Receipt validity gates only the **40% gauge pool share**, never the **40% base share**. An operator running honest delivery with an immature client base receives full base USDC and zero gauge — they are commodity operators in the [ADR 026 §7 Case A](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake) sense. This is the designed incentive pressure, not a punishment.
 
 **The slashing invariant.** Receipt protocol violations are **not by themselves slashable**. A successful Merkle-anchored challenge zeros gauge eligibility for the *current epoch only*. Slashing escalates only via the existing [ADR 004](004-tokenomics.md) schedule and only when watchtower evidence proves a deliberate forgery (e.g., a recovered signer that does not correspond to any channel `client` that ever existed, indicating an outright fabricated signature). Routine receipt invalidation — wrong root committed, late batch commit, signature on a closed channel — is corrected by zeroing the epoch and not by slashing.
 
@@ -250,11 +250,11 @@ This ADR ships the cleartext-receipt protocol. Privacy upgrades are a future-wor
 
 **The protocol can technically launch without distinct-client receipts.** The voucher path in [ADR 003](003-payments.md) is independent of receipts; settlements pass `bytesDelivered` to `FeeRouter` whether a receipt batch is committed or not. Operators receive their 40% base USDC. The 40% gauge pool, the 7% delegator pool, the 5% burn, the 5% treasury, and the 3% safety reserve all accumulate normally.
 
-**But the gauge pool MUST be paused until receipts ship.** From [ADR 026 §Risks](026-tokenomics-v3.md#risks), wash-trading at TOKEN price 3–5× genesis is net-profitable without the receipt gate. Distributing a 40% pool to byte-counters whose inputs are unattestable is an open invitation. Therefore:
+**But the gauge pool MUST be paused until receipts ship.** From [ADR 026 §Risks](026-gauge-boost-tokenomics.md#risks), wash-trading at TOKEN price 3–5× genesis is net-profitable without the receipt gate. Distributing a 40% pool to byte-counters whose inputs are unattestable is an open invitation. Therefore:
 
-> **v1 launch prerequisite.** Mainnet may launch the `FeeRouter`, `VotingEscrow`, `SafetyReserve`, and direct-base-payout flows without distinct-client receipts. **The 40% gauge boost pool MUST NOT pay out until distinct-client receipts are live and verified at scale.** Until that moment, the 40% gauge bucket either accumulates in `FeeRouter` (eventually claimable retroactively when receipts ship) or is governance-routed to treasury / SafetyReserve as a temporary measure. The operator-aligned share remains 80% of revenue ([ADR 026 §2](026-tokenomics-v3.md#2-feerouter-split-40407553)); the gauge half of that share is escrowed, not denied.
+> **v1 launch prerequisite.** Mainnet may launch the `FeeRouter`, `VotingEscrow`, `SafetyReserve`, and direct-base-payout flows without distinct-client receipts. **The 40% gauge boost pool MUST NOT pay out until distinct-client receipts are live and verified at scale.** Until that moment, the 40% gauge bucket either accumulates in `FeeRouter` (eventually claimable retroactively when receipts ship) or is governance-routed to treasury / SafetyReserve as a temporary measure. The operator-aligned share remains 80% of revenue ([ADR 026 §2](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553)); the gauge half of that share is escrowed, not denied.
 
-This is consistent with [ADR 026 §Forward references](026-tokenomics-v3.md#forward-references-follow-up-adrs) — ADR 027 is listed there as "priority-1; not optional for production launch". The wording above pins down what "not optional" means concretely.
+This is consistent with [ADR 026 §Forward references](026-gauge-boost-tokenomics.md#forward-references-follow-up-adrs) — ADR 027 is listed there as "priority-1; not optional for production launch". The wording above pins down what "not optional" means concretely.
 
 **Sequencing within the receipt rollout itself:**
 
@@ -272,7 +272,7 @@ Steps 1–4 may run in parallel-with-mainnet for one or more epochs of testing; 
 
 ### Positive
 
-- **Closes the wash-trading attack surface flagged in [ADR 026 §Risks](026-tokenomics-v3.md#risks).** Self-routed traffic now requires distinct, capital-funded sybil identities, raising the attack's effective cost to `MIN_DISTINCT_CLIENTS_PER_EPOCH × MIN_CHANNEL_FUNDING_USDC` of permanently-parked USDC plus per-sybil setup gas, plus a 7-day rotation cooldown. At default parameters: 50 USDC of permanent capital and a one-week rotation cycle per operator gauge-share inflated.
+- **Closes the wash-trading attack surface flagged in [ADR 026 §Risks](026-gauge-boost-tokenomics.md#risks).** Self-routed traffic now requires distinct, capital-funded sybil identities, raising the attack's effective cost to `MIN_DISTINCT_CLIENTS_PER_EPOCH × MIN_CHANNEL_FUNDING_USDC` of permanently-parked USDC plus per-sybil setup gas, plus a 7-day rotation cooldown. At default parameters: 50 USDC of permanent capital and a one-week rotation cycle per operator gauge-share inflated.
 - **Reuses existing primitives.** secp256k1 / EIP-712 / `SignatureChecker`, the keccak256 Merkle pattern from [ADR 014](014-on-chain-verification.md), the watchtower bond machinery from [ADR 007](007-watchtower.md), and the reputation surface from [ADR 008](008-reputation.md). No new cryptography, no new role, no new contract beyond a `FeeRouter` extension.
 - **Cleanly separates payment from gauge.** The 40% base USDC continues to flow same-tx for every settlement regardless of receipt validity — the cashflow invariant operators rely on is preserved.
 - **Composable with reputation.** Operators with strong reputation get cheaper gating; new and recently-slashed operators face tighter gating. Receipt validity is a *layer* over reputation, not a replacement.
@@ -308,6 +308,6 @@ Steps 1–4 may run in parallel-with-mainnet for one or more epochs of testing; 
 | [ADR 008 — Reputation](008-reputation.md) | `reputationOf(operator)` view exposed for `FeeRouter` consumption. Affiliated-address registry surface formalised (already implicit). Tighter receipt thresholds for low-reputation operators documented as a reputation consequence. |
 | [ADR 014 — On-chain verification](014-on-chain-verification.md) | The keccak256 Merkle-batch pattern this ADR uses is the same construction documented as the production path for corruption proofs. Cross-link added so toolchain reuse is explicit; no contract changes to `SlashJudge`. |
 | [ADR 017 — Privacy](017-privacy.md) | New section flagging per-receipt client-identity disclosure on challenge; zero-knowledge identity-diversity proofs and stealth-address client identities listed as future-work. Tension with funding-source diversity heuristic noted. |
-| [ADR 026 — Tokenomics v3](026-tokenomics-v3.md) | The forward reference to ADR 027 in §Risks and §Forward references is fulfilled. §9 Implementation sequencing's v1 prerequisite ("gauge pool MUST NOT pay out until receipts ship") is the binding rule; ADR 026 already contains the "Strongly recommended for production launch; not optional" wording, which carries through unchanged. |
+| [ADR 026 — Tokenomics v3](026-gauge-boost-tokenomics.md) | The forward reference to ADR 027 in §Risks and §Forward references is fulfilled. §9 Implementation sequencing's v1 prerequisite ("gauge pool MUST NOT pay out until receipts ship") is the binding rule; ADR 026 already contains the "Strongly recommended for production launch; not optional" wording, which carries through unchanged. |
 
 ---

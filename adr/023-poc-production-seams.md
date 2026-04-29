@@ -12,7 +12,7 @@ Every ADR from 001–022 contains a PoC vs production split: different contracts
 
 The goal is a clean mechanical answer to: **how does the codebase express the difference between PoC and production?**
 
-> **Cross-reference:** [ADR 026 — Tokenomics v3](026-tokenomics-v3.md) introduces a new contract surface (`FeeRouter`, `VotingEscrow`, `SafetyReserve`, swap helpers shared by `BuybackBurner` and the delegator-pool path). Seams 8–11 below cover the wiring-layer selectors for those contracts. The leaf-crate principle restated in §"Wiring Conventions" applies to v3 tokenomics with the same force as to ADRs 001–022: domain crates remain free of v3-mode-branching logic.
+> **Cross-reference:** [ADR 026 — Tokenomics v3](026-gauge-boost-tokenomics.md) introduces a new contract surface (`FeeRouter`, `VotingEscrow`, `SafetyReserve`, swap helpers shared by `BuybackBurner` and the delegator-pool path). Seams 8–11 below cover the wiring-layer selectors for those contracts. The leaf-crate principle restated in §"Wiring Conventions" applies to v3 tokenomics with the same force as to ADRs 001–022: domain crates remain free of v3-mode-branching logic.
 
 ### Inventory of PoC/Production differences (from prior ADRs)
 
@@ -187,7 +187,7 @@ Concrete values:
 
 ### 8. `FeeRouterClient` — `crates/incentive`
 
-Introduced by [ADR 026](026-tokenomics-v3.md) §2. The `FeeRouter` contract receives the full operator USDC balance from `PaymentChannel.settleChannel` and atomically splits it into the six v3 buckets. The wiring seam selects between an in-process PoC stub (a no-op or local accounting router) and the deployed production contract address per network.
+Introduced by [ADR 026](026-gauge-boost-tokenomics.md) §2. The `FeeRouter` contract receives the full operator USDC balance from `PaymentChannel.settleChannel` and atomically splits it into the six v3 buckets. The wiring seam selects between an in-process PoC stub (a no-op or local accounting router) and the deployed production contract address per network.
 
 ```rust
 pub trait FeeRouterClient: Send + Sync {
@@ -209,7 +209,7 @@ pub trait FeeRouterClient: Send + Sync {
 
 ### 9. `VotingEscrowReader` — `crates/incentive`
 
-Introduced by [ADR 026](026-tokenomics-v3.md) §4. ve-balance lookups are load-bearing for the gauge-boost epoch snapshot (§3 of ADR 026) and ve-weighted governance (§9 of ADR 026). The wiring seam selects between an in-memory fixture (deterministic ve-balances for tests / local dev) and an on-chain `VotingEscrow.balanceOfAt(user, ts)` reader.
+Introduced by [ADR 026](026-gauge-boost-tokenomics.md) §4. ve-balance lookups are load-bearing for the gauge-boost epoch snapshot (§3 of ADR 026) and ve-weighted governance (§9 of ADR 026). The wiring seam selects between an in-memory fixture (deterministic ve-balances for tests / local dev) and an on-chain `VotingEscrow.balanceOfAt(user, ts)` reader.
 
 ```rust
 pub trait VotingEscrowReader: Send + Sync {
@@ -228,7 +228,7 @@ pub trait VotingEscrowReader: Send + Sync {
 
 ### 10. `SwapHelper` — `crates/incentive`
 
-Introduced by [ADR 026](026-tokenomics-v3.md) §6 and consolidated with [ADR 018](018-liquidity-strategy.md). Both `BuybackBurner` (5% burn bucket) and the delegator-pool USDC→TOKEN path (7% bucket) require a swap backend with TWAP windows, `minOut` slippage protection, and per-epoch liquidity caps. Consolidating into a single seam reduces wiring surface.
+Introduced by [ADR 026](026-gauge-boost-tokenomics.md) §6 and consolidated with [ADR 018](018-liquidity-strategy.md). Both `BuybackBurner` (5% burn bucket) and the delegator-pool USDC→TOKEN path (7% bucket) require a swap backend with TWAP windows, `minOut` slippage protection, and per-epoch liquidity caps. Consolidating into a single seam reduces wiring surface.
 
 ```rust
 pub trait SwapHelper: Send + Sync {
@@ -246,7 +246,7 @@ pub trait SwapHelper: Send + Sync {
 
 ### 11. `SafetyReservePayout` — `crates/incentive`
 
-Introduced by [ADR 026](026-tokenomics-v3.md) §5. The 3% safety bucket is governance-gated; payouts require an attested incident bundle, governance proposal (or fast-track multisig within hard caps), 48-hour appeal window, and post-incident reporting. The wiring seam selects between a local approval mock (single-step approval for tests / local dev) and the Governor-gated production path.
+Introduced by [ADR 026](026-gauge-boost-tokenomics.md) §5. The 3% safety bucket is governance-gated; payouts require an attested incident bundle, governance proposal (or fast-track multisig within hard caps), 48-hour appeal window, and post-incident reporting. The wiring seam selects between a local approval mock (single-step approval for tests / local dev) and the Governor-gated production path.
 
 ```rust
 pub trait SafetyReservePayout: Send + Sync {
@@ -371,7 +371,7 @@ crates/
 3. **`NetworkConstants` is the single source of truth for all numeric differences.** No magic numbers elsewhere — always reference `constants.popular_hashes_max`, never literal `20`.
 4. **Both implementations must compile in CI.** The CI matrix builds with `--features poc` and without (production). This prevents either path from rotting and catches type errors in both concrete implementations.
 5. **PoC removal is mechanical.** To graduate to production-only: delete all `#[cfg(feature = "poc")]` functions, remove the `poc` feature from `Cargo.toml`, and strip the `#[cfg(not(feature = "poc"))]` attributes from the remaining functions. No logic changes required.
-6. **Leaf-crate principle applies to v3 tokenomics.** Domain crates (`cache`, `gossip`, `incentive`, `reputation`, `protocol`) MUST NOT contain mode-branching logic for the [ADR 026](026-tokenomics-v3.md) v3 contract surface (`FeeRouter`, `VotingEscrow`, `SafetyReserve`, swap helpers). All mode selection between PoC stubs / fixtures / mocks and production contracts lives in `crates/node/src/wiring.rs` behind seams 8–11 above — the same rule that governs seams 1–7. Adding `if v3_enabled` checks inside domain crate logic is forbidden.
+6. **Leaf-crate principle applies to v3 tokenomics.** Domain crates (`cache`, `gossip`, `incentive`, `reputation`, `protocol`) MUST NOT contain mode-branching logic for the [ADR 026](026-gauge-boost-tokenomics.md) v3 contract surface (`FeeRouter`, `VotingEscrow`, `SafetyReserve`, swap helpers). All mode selection between PoC stubs / fixtures / mocks and production contracts lives in `crates/node/src/wiring.rs` behind seams 8–11 above — the same rule that governs seams 1–7. Adding `if v3_enabled` checks inside domain crate logic is forbidden.
 
 ---
 

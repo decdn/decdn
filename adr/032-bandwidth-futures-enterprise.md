@@ -2,20 +2,20 @@
 
 **Date:** 2026-04-25
 **Status:** Deferred (target: v2 mainnet)
-**Prerequisites:** [ADR 026](026-tokenomics-v3.md) §5 SafetyReserve, [ADR 027](027-distinct-client-receipts.md) distinct-client delivery receipts, [ADR 030](030-preseed-usdc-deployment.md) §2e Enterprise SLA guarantee fund
-**Touches:** [ADR 026](026-tokenomics-v3.md), [ADR 030](030-preseed-usdc-deployment.md), [ADR 003](003-payments.md), [ADR 018](018-liquidity-strategy.md)
+**Prerequisites:** [ADR 026](026-gauge-boost-tokenomics.md) §5 SafetyReserve, [ADR 027](027-distinct-client-receipts.md) distinct-client delivery receipts, [ADR 030](030-preseed-usdc-deployment.md) §2e Enterprise SLA guarantee fund
+**Touches:** [ADR 026](026-gauge-boost-tokenomics.md), [ADR 030](030-preseed-usdc-deployment.md), [ADR 003](003-payments.md), [ADR 018](018-liquidity-strategy.md)
 
 ---
 
 ## Context
 
-v1 deCDN (per [ADR 003](003-payments.md) and [ADR 026](026-tokenomics-v3.md)) serves
+v1 deCDN (per [ADR 003](003-payments.md) and [ADR 026](026-gauge-boost-tokenomics.md)) serves
 **best-effort delivery** — clients open USDC payment channels, settle per-MB at
 $0.01/GB, and the protocol guarantees content integrity (BLAKE3-addressed bytes) but
 not availability, latency, or throughput. SLA is implicit: "the network is up, or it
 isn't." This is sufficient for the freemium / Pro tier of clients (developers, indie
 streaming, content sites, hobbyist deployments) and is the operational regime the v3
-tokenomics in [ADR 026](026-tokenomics-v3.md) is sized against.
+tokenomics in [ADR 026](026-gauge-boost-tokenomics.md) is sized against.
 
 It is **not** sufficient for two adjacent client segments that the v3 economic model
 and the market-dynamics analysis explicitly target:
@@ -34,7 +34,7 @@ and the market-dynamics analysis explicitly target:
    per-byte revenue tier the network can target and the moat against pure
    pay-as-you-go competition (market-dynamics §2; preseed-capital-strategy §3).
 
-[ADR 026](026-tokenomics-v3.md) §5 introduces `SafetyReserve` (3% of routed USDC) as a
+[ADR 026](026-gauge-boost-tokenomics.md) §5 introduces `SafetyReserve` (3% of routed USDC) as a
 governance-gated incident reserve with eligible payout categories that include
 "Enterprise SLA compensation (per [ADR 030](030-preseed-usdc-deployment.md) /
 [ADR 032](032-bandwidth-futures-enterprise.md))." [ADR 030](030-preseed-usdc-deployment.md)
@@ -88,7 +88,7 @@ structured settlement at expiry against verified delivery.
 | `bandwidthGB` | `uint256` | Total GB committed for the period |
 | `region` | `bytes32` | Regional gauge identifier per [ADR 030](030-preseed-usdc-deployment.md) §2d, or `bytes32(0)` for "any" |
 | `periodStart` | `uint64` | Block-timestamp start of delivery window |
-| `periodDuration` | `uint64` | Seconds; multiples of the 1-week epoch per [ADR 026](026-tokenomics-v3.md) §2 |
+| `periodDuration` | `uint64` | Seconds; multiples of the 1-week epoch per [ADR 026](026-gauge-boost-tokenomics.md) §2 |
 | `strikeToken` | `uint256` | TOKEN paid by buyer at contract creation |
 | `referenceUsdRate` | `uint256` | USD/GB reference at strike time (for under-delivery refund math) |
 | `settlementMode` | `enum` | `PhysicalDelivery` (consume bandwidth) or `CashSettle` (compare delivered vs. committed) |
@@ -107,12 +107,12 @@ designated reserve) commits to deliver bandwidth at a price expressed in
 - **Demand-side TOKEN sink.** Buyers must acquire TOKEN to purchase futures, creating
   organic demand independent of [ADR 031](031-bme-client-prepay.md)'s deferred BME path. Complements the
   operator-side (gauge boost) and delegator-side (delegator pool) TOKEN demand levers
-  in [ADR 026](026-tokenomics-v3.md).
+  in [ADR 026](026-gauge-boost-tokenomics.md).
 - **TOKEN-USD basis risk.** A TOKEN price drop between strike and expiry is shared:
   buyer keeps the discount-vs-USD; seller (DAO) absorbs the fiat-equivalent shortfall
   unless TOKEN appreciates above strike. Fixed-USD-rate futures with TOKEN-collateral
   are an alternative considered and rejected for v2 — they reintroduce the reflexive
-  bootstrap risk that the [ADR 026](026-tokenomics-v3.md) §10 USDC pre-seed structure
+  bootstrap risk that the [ADR 026](026-gauge-boost-tokenomics.md) §10 USDC pre-seed structure
   was designed to eliminate.
 
 #### 1.3 Settlement
@@ -135,7 +135,7 @@ cannot ship; this is the single hardest prerequisite.
 #### 1.4 Liquidity
 
 - **Initial market-making.** The DAO is the seller of record at v2 launch, drawing
-  TOKEN from the protocol-treasury allocation per [ADR 026](026-tokenomics-v3.md) §1
+  TOKEN from the protocol-treasury allocation per [ADR 026](026-gauge-boost-tokenomics.md) §1
   and using pre-seed Enterprise SLA fund capacity per
   [ADR 030](030-preseed-usdc-deployment.md) §2e for the SLA-paired tranche of
   contracts.
@@ -156,7 +156,7 @@ cannot ship; this is the single hardest prerequisite.
   receipts feed settlement. Without distinct-client identity verification, an operator
   can manufacture "delivery" against a self-issued future and capture the strike TOKEN —
   identical to the wash-trading attack surface flagged in
-  [ADR 026](026-tokenomics-v3.md) §Risks for the gauge pool. The mitigation is the
+  [ADR 026](026-gauge-boost-tokenomics.md) §Risks for the gauge pool. The mitigation is the
   same: receipts must come from independent, reputation-attested client identities.
 - **Strike-price MEV.** A searcher observing a large buyer's pending future-purchase
   could front-run the TOKEN buy. Mitigations: TWAP-priced strike (use the
@@ -199,12 +199,12 @@ governance proposal thereafter.
 The recourse stack is **strictly ordered** to prevent double-funding, matching the
 priority enforced by the `SafetyReserve.payout` resolution logic per
 [ADR 030](030-preseed-usdc-deployment.md) §2e and the
-[ADR 026](026-tokenomics-v3.md) §5 spending controls:
+[ADR 026](026-gauge-boost-tokenomics.md) §5 spending controls:
 
 | Priority | Source | Purpose | Origin |
 | --- | --- | --- | --- |
-| 1 | `SafetyReserve` organic balance | First line of defense | 3% of routed USDC per [ADR 026](026-tokenomics-v3.md) §2 |
-| 2 | `SafetyReserve` slashing-replenished balance | Same wallet, same gates | 30% of slashed stake per [ADR 026](026-tokenomics-v3.md) §8 |
+| 1 | `SafetyReserve` organic balance | First line of defense | 3% of routed USDC per [ADR 026](026-gauge-boost-tokenomics.md) §2 |
+| 2 | `SafetyReserve` slashing-replenished balance | Same wallet, same gates | 30% of slashed stake per [ADR 026](026-gauge-boost-tokenomics.md) §8 |
 | 3 | Pre-seed Enterprise SLA paired allocation | Second line of defense | [ADR 030](030-preseed-usdc-deployment.md) §2e (10% of pool, $100K–$300K) |
 
 **A single SLA breach draws on at most one source.** The `SafetyReserve.payout`
@@ -213,7 +213,7 @@ and 2 are insufficient for the authorized payout amount. This is identical to th
 [ADR 030](030-preseed-usdc-deployment.md) §2e / §5 single-source rule and reuses the
 same on-chain resolution code.
 
-The `SafetyReserve` payout gates ([ADR 026](026-tokenomics-v3.md) §5: evidence bundle,
+The `SafetyReserve` payout gates ([ADR 026](026-gauge-boost-tokenomics.md) §5: evidence bundle,
 multisig-or-governance authorization, 48-hour appeal window, post-incident registry)
 apply unchanged to all three sources. The pre-seed paired allocation is **not** a
 fast-track — it shares the full SafetyReserve gating regardless of which source funds
@@ -252,19 +252,19 @@ the wire protocol.
 
 | Tier | Pricing | SLA | Backing | Target client |
 | --- | --- | --- | --- | --- |
-| **Freemium / Developer** | Free or subsidized (governance-set monthly GB allowance) | None | Subsidy from community / ecosystem allocation per [ADR 026](026-tokenomics-v3.md) §1 | Indie devs, early-stage projects, integration testing |
-| **Pro** | $0.01/GB per [ADR 026](026-tokenomics-v3.md) §2 | Best-effort | None — implicit | Streaming startups, content sites, hobbyist deployments |
+| **Freemium / Developer** | Free or subsidized (governance-set monthly GB allowance) | None | Subsidy from community / ecosystem allocation per [ADR 026](026-gauge-boost-tokenomics.md) §1 | Indie devs, early-stage projects, integration testing |
+| **Pro** | $0.01/GB per [ADR 026](026-gauge-boost-tokenomics.md) §2 | Best-effort | None — implicit | Streaming startups, content sites, hobbyist deployments |
 | **Enterprise** | Per-contract; typically a premium over the Pro rate | Explicit per §2.1 | `SafetyReserve` + pre-seed pairing per §2.2 | Large-scale streaming, SaaS, regulated workloads |
 
 The freemium tier is **not** a free-forever offering — it is a customer-acquisition
 funnel sized against the community / ecosystem allocation in
-[ADR 026](026-tokenomics-v3.md) §1, with a monthly GB allowance per registered
+[ADR 026](026-gauge-boost-tokenomics.md) §1, with a monthly GB allowance per registered
 developer wallet. Sizing is governance-set at v2 launch and is not pinned in this ADR.
 
 The Enterprise tier is **invitation- or application-gated** — operators do not
 self-attest as Enterprise-eligible. Onboarding is run through a designated Enterprise
 sales channel (initially a multisig-supervised team funded out of the protocol
-treasury per [ADR 026](026-tokenomics-v3.md) §1; longer-term, a DAO-elected role).
+treasury per [ADR 026](026-gauge-boost-tokenomics.md) §1; longer-term, a DAO-elected role).
 
 ---
 
@@ -281,7 +281,7 @@ treasury per [ADR 026](026-tokenomics-v3.md) §1; longer-term, a DAO-elected rol
   the headline value-add the market-dynamics spec §2 identifies.
 - **TOKEN demand sink, demand-side.** Future-buyers must acquire TOKEN to purchase
   contracts. Combined with the operator-side gauge-boost demand and delegator-side
-  TWAP buys per [ADR 026](026-tokenomics-v3.md), this completes the
+  TWAP buys per [ADR 026](026-gauge-boost-tokenomics.md), this completes the
   three-pronged TOKEN demand curve (operator + delegator + client) without requiring
   the BME path in [ADR 031](031-bme-client-prepay.md).
 - **Reuses v1 infrastructure.** SafetyReserve, distinct-client receipts, and the
@@ -327,7 +327,7 @@ treasury per [ADR 026](026-tokenomics-v3.md) §1; longer-term, a DAO-elected rol
 - **Enterprise tier creates governance-credibility risk.** Where the DAO is both
   contract counterparty and dispute adjudicator (via SafetyReserve payout
   authorization), there is a structural conflict-of-interest. The 48-hour appeal
-  window and on-chain incident registry per [ADR 026](026-tokenomics-v3.md) §5 are
+  window and on-chain incident registry per [ADR 026](026-gauge-boost-tokenomics.md) §5 are
   the canonical mitigation; Enterprise contracts may additionally require an
   independent appeals path (e.g., Kleros-style arbitration) for disputes above a
   size threshold.
@@ -361,7 +361,7 @@ treasury per [ADR 026](026-tokenomics-v3.md) §1; longer-term, a DAO-elected rol
   in specific regions (e.g., Brazil, Southeast Asia per
   [ADR 030](030-preseed-usdc-deployment.md) §2d priorities), gauge votes routing
   delivery capacity to those regions become economically dominant. The governance-
-  weight-concentration risk in [ADR 026](026-tokenomics-v3.md) §Risks compounds in the
+  weight-concentration risk in [ADR 026](026-gauge-boost-tokenomics.md) §Risks compounds in the
   futures regime; [ADR 028](028-sve-token-wrapper.md) native sveTOKEN wrapper is the structural mitigation
   and is a strongly-recommended prerequisite for futures-at-scale.
 - **Regulatory action mid-contract.** If a jurisdiction reclassifies bandwidth futures
@@ -380,7 +380,7 @@ This ADR is deferred. Before v2 implementation begins, all of the following must
 | --- | --- | --- | --- |
 | 1 | `PaymentChannel` per-contract billing path exists | [ADR 003](003-payments.md) | Settlement path can carry per-contract metadata (contract identifier in voucher payload) without breaking changes. v1 design must accommodate this shape; implementation can land later |
 | 2 | Distinct-client delivery receipts live in production | [ADR 027](027-distinct-client-receipts.md) | Receipt format finalized, watchtower / reputation integration deployed, observed receipt-fraud rate below v2-readiness threshold |
-| 3 | `SafetyReserve` accumulates sufficient organic balance | [ADR 026](026-tokenomics-v3.md) §5 | Balance covers at least one expected single-incident worst case from the §2.1 contract templates without paired-allocation draws |
+| 3 | `SafetyReserve` accumulates sufficient organic balance | [ADR 026](026-gauge-boost-tokenomics.md) §5 | Balance covers at least one expected single-incident worst case from the §2.1 contract templates without paired-allocation draws |
 | 4 | Pre-seed Enterprise SLA fund funded | [ADR 030](030-preseed-usdc-deployment.md) §2e | At least the $100K floor allocation is custodied and operational |
 | 5 | Native sveTOKEN wrapper live | [ADR 028](028-sve-token-wrapper.md) (deferred follow-up to ADR 026) | Convex-capture risk mitigated before futures liquidity scales |
 | 6 | Regulatory review of futures product | External legal | Per-jurisdiction issuance posture defined; geo-fencing infrastructure in place where required |
@@ -396,7 +396,7 @@ launch in specific markets without delaying v2 globally.
 
 ## Forward references
 
-This ADR is itself a forward reference from [ADR 026](026-tokenomics-v3.md) and
+This ADR is itself a forward reference from [ADR 026](026-gauge-boost-tokenomics.md) and
 [ADR 030](030-preseed-usdc-deployment.md). v2 implementation will produce its own
 follow-up ADR set covering at minimum:
 
@@ -426,5 +426,5 @@ below land at v2 implementation, alongside the contract-level follow-up ADRs abo
 | --- | --- |
 | [ADR 003 — Payments](003-payments.md) | Voucher payload extension to carry per-contract identifier for Enterprise / futures-paired settlements. No breaking change for Pro / freemium settlements (contract identifier is optional). |
 | [ADR 018 — Liquidity Strategy](018-liquidity-strategy.md) | If a secondary market for futures lands on the same Balancer V3 pool, the per-epoch liquidity-cap accounting extends to cover futures-driven swap pressure alongside the buyback and delegator-pool flows. |
-| [ADR 026 — Tokenomics v3](026-tokenomics-v3.md) | §5 SafetyReserve eligible-payout categories cross-reference resolves: Enterprise SLA compensation now points to this ADR's §2.1 contract template. No mechanic change. |
+| [ADR 026 — Tokenomics v3](026-gauge-boost-tokenomics.md) | §5 SafetyReserve eligible-payout categories cross-reference resolves: Enterprise SLA compensation now points to this ADR's §2.1 contract template. No mechanic change. |
 | [ADR 030 — Pre-seed USDC Deployment](030-preseed-usdc-deployment.md) | §2e Enterprise SLA guarantee fund forward-reference resolves: "ADR 032 (Bandwidth Futures / Enterprise SLA tier, deferred to v2) will define the contract template; until then, individual Enterprise contracts are case-by-case under DAO governance" becomes "ADR 032 defines the contract template (§2.1); per-deal values remain governance-ratified." |

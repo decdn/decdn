@@ -2,20 +2,20 @@
 
 **Date:** 2026-04-25
 **Status:** Deferred (target: v2 mainnet, post v1 stability + pricing-oracle hardening)
-**Touches:** [ADR 003](003-payments.md), [ADR 010](010-multi-token.md), [ADR 026](026-tokenomics-v3.md)
+**Touches:** [ADR 003](003-payments.md), [ADR 010](010-multi-token.md), [ADR 026](026-gauge-boost-tokenomics.md)
 **Source design spec:** [`docs/superpowers/specs/2026-04-19-tokenomics-v2-survival-additions.md`](../docs/superpowers/specs/2026-04-19-tokenomics-v2-survival-additions.md) §2
 
 ---
 
 ## Context
 
-[ADR 026](026-tokenomics-v3.md) creates three TOKEN demand sources, all of them on the operator side of the protocol:
+[ADR 026](026-gauge-boost-tokenomics.md) creates three TOKEN demand sources, all of them on the operator side of the protocol:
 
-1. Operator stake (50K TOKEN minimum, slashable; [ADR 026 §7](026-tokenomics-v3.md#7-operator-economics-and-minimum-stake)).
-2. Gauge-pool ve-locking, where operators ve-lock TOKEN to capture a larger share of the 40% gauge boost pool ([ADR 026 §3](026-tokenomics-v3.md#3-gauge-boost-formula)).
-3. The 7% delegator pool, which performs continuous TWAP USDC→TOKEN buys and routes the acquired TOKEN to ve-lockers ([ADR 026 §6](026-tokenomics-v3.md#6-delegator-pool--usdc--token-conversion)).
+1. Operator stake (50K TOKEN minimum, slashable; [ADR 026 §7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake)).
+2. Gauge-pool ve-locking, where operators ve-lock TOKEN to capture a larger share of the 40% gauge boost pool ([ADR 026 §3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula)).
+3. The 7% delegator pool, which performs continuous TWAP USDC→TOKEN buys and routes the acquired TOKEN to ve-lockers ([ADR 026 §6](026-gauge-boost-tokenomics.md#6-delegator-pool--usdc--token-conversion)).
 
-Clients in the [ADR 026](026-tokenomics-v3.md) design pay only USDC, via the [ADR 003](003-payments.md) payment-channel rails. They never touch TOKEN. The full TOKEN-demand surface is therefore mediated by operator recruitment and operator capital allocation. If operator-side ve-lock adoption falters — for any reason: a competing protocol, regulatory friction in major operator regions, a TOKEN-price shock that makes Case B economics break down ([ADR 026 §7](026-tokenomics-v3.md#7-operator-economics-and-minimum-stake)) — the demand-side flywheel collapses and there is no usage-driven demand floor underneath it.
+Clients in the [ADR 026](026-gauge-boost-tokenomics.md) design pay only USDC, via the [ADR 003](003-payments.md) payment-channel rails. They never touch TOKEN. The full TOKEN-demand surface is therefore mediated by operator recruitment and operator capital allocation. If operator-side ve-lock adoption falters — for any reason: a competing protocol, regulatory friction in major operator regions, a TOKEN-price shock that makes Case B economics break down ([ADR 026 §7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake)) — the demand-side flywheel collapses and there is no usage-driven demand floor underneath it.
 
 This is a known structural fragility. The v3 source design spec (§2 of `2026-04-19-tokenomics-v2-survival-additions.md`) flags it explicitly: *"if operator recruitment falters, demand collapses with no floor."*
 
@@ -26,7 +26,7 @@ The BME mechanic does not replace USDC payment channels; it sits *alongside* the
 **Why this ADR is Deferred.** Two design dependencies are not yet ready for v1:
 
 1. **Pricing oracle.** Converting client-prepaid TOKEN into operator-receivable USDC at consumption time requires a robust TOKEN→USDC oracle. [ADR 018](018-liquidity-strategy.md)'s Balancer V3 80/20 TWAP is a starting point, but oracle-manipulation defenses (longer windows, multi-source price feeds, circuit breakers) need v1-stability data before they can be hardened to the level required for prepay flows that clients trust enough to fund.
-2. **v1 contract scope.** v1 launches on the [ADR 003](003-payments.md) USDC channel rail plus the [ADR 026](026-tokenomics-v3.md) `FeeRouter` / `VotingEscrow` / `SafetyReserve` surface. Adding `BmePrepay` to the v1 audit scope is not justified given the ambiguous oracle dependency and the fact that v1 must succeed on the USDC rails before the BME path delivers any benefit (low-usage networks see negligible BME burn — see Consequences).
+2. **v1 contract scope.** v1 launches on the [ADR 003](003-payments.md) USDC channel rail plus the [ADR 026](026-gauge-boost-tokenomics.md) `FeeRouter` / `VotingEscrow` / `SafetyReserve` surface. Adding `BmePrepay` to the v1 audit scope is not justified given the ambiguous oracle dependency and the fact that v1 must succeed on the USDC rails before the BME path delivers any benefit (low-usage networks see negligible BME burn — see Consequences).
 
 This ADR documents the design now so that v1's USDC payment-channel design ([ADR 003](003-payments.md)) does not preclude later integration. v2 will revisit and harden the design against then-current oracle and contract-tooling state.
 
@@ -64,7 +64,7 @@ Prepaid TOKEN held in `BmePrepay` is **burned** as bandwidth is consumed. No rou
 | Burn unit | TOKEN (ERC-20) | The deposited token; no intermediate conversion before burn |
 | Burn destination | `address(0)` or token-contract `_burn()` | Pinned to whatever the v3 TOKEN contract supports |
 
-**Why pure burn.** The 5% buyback-and-burn bucket in [ADR 026 §2](026-tokenomics-v3.md#2-feerouter-split-40407553) is *also* deflationary, but it is an operator-side flow funded from USDC revenue. The BME burn is a *demand-side* flow funded from client capital. Mixing the two — e.g., routing some BME-burned TOKEN to the treasury or the safety reserve — converts BME into a hybrid pay-and-skim mechanic, which is no longer the mechanism the rest of this ADR's economic argument relies on.
+**Why pure burn.** The 5% buyback-and-burn bucket in [ADR 026 §2](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553) is *also* deflationary, but it is an operator-side flow funded from USDC revenue. The BME burn is a *demand-side* flow funded from client capital. Mixing the two — e.g., routing some BME-burned TOKEN to the treasury or the safety reserve — converts BME into a hybrid pay-and-skim mechanic, which is no longer the mechanism the rest of this ADR's economic argument relies on.
 
 ### 3. Coexistence with USDC payment channels
 
@@ -77,8 +77,8 @@ v1 (USDC channels) and v2 (BME prepay + USDC channels) must both be supported in
 
 The two paths converge at the operator-payment boundary. There are two design options for how an operator receives compensation when a BME-prepay client consumes bandwidth, and this ADR does not pin one — v2 will choose:
 
-- **Option A — Protocol mints / disburses USDC equivalent.** The protocol holds (via the pre-seed program in [ADR 030](030-preseed-usdc-deployment.md), or a dedicated BME-USDC reserve) a USDC pool from which the operator's USDC equivalent is paid. The TOKEN is burned, the operator is paid in USDC, and the BME reserve is replenished by buyback flows or by a fraction of [ADR 026 §2](026-tokenomics-v3.md#2-feerouter-split-40407553)'s router output. This option keeps operator cashflow stable in USDC and concentrates oracle-pricing risk in one place (the protocol-managed pool), but requires non-trivial reserve management and is sensitive to large BME-prepay surges that drain the pool.
-- **Option B — Operator receives TOKEN, swaps separately.** The protocol pays the operator in TOKEN at a contract-computed rate (oracle-derived); the operator swaps to USDC themselves (or holds, voluntarily, as additional ve-lock material). This option pushes oracle-execution risk to the operator and removes the protocol-managed reserve, at the cost of fragmenting MEV exposure across many small operator-driven swaps. The 5% buyback-and-burn pool ([ADR 026 §2](026-tokenomics-v3.md#2-feerouter-split-40407553)) *would not* feed Option B's flow — operators would source their own TOKEN→USDC liquidity.
+- **Option A — Protocol mints / disburses USDC equivalent.** The protocol holds (via the pre-seed program in [ADR 030](030-preseed-usdc-deployment.md), or a dedicated BME-USDC reserve) a USDC pool from which the operator's USDC equivalent is paid. The TOKEN is burned, the operator is paid in USDC, and the BME reserve is replenished by buyback flows or by a fraction of [ADR 026 §2](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553)'s router output. This option keeps operator cashflow stable in USDC and concentrates oracle-pricing risk in one place (the protocol-managed pool), but requires non-trivial reserve management and is sensitive to large BME-prepay surges that drain the pool.
+- **Option B — Operator receives TOKEN, swaps separately.** The protocol pays the operator in TOKEN at a contract-computed rate (oracle-derived); the operator swaps to USDC themselves (or holds, voluntarily, as additional ve-lock material). This option pushes oracle-execution risk to the operator and removes the protocol-managed reserve, at the cost of fragmenting MEV exposure across many small operator-driven swaps. The 5% buyback-and-burn pool ([ADR 026 §2](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553)) *would not* feed Option B's flow — operators would source their own TOKEN→USDC liquidity.
 
 v2 will choose between A and B (or a hybrid) based on then-observed TOKEN/USDC liquidity depth ([ADR 018](018-liquidity-strategy.md) pool maturity), keeper-cost economics on the chosen L2 ([ADR 021](021-l2-chain-selection.md)), and operator UX preferences gathered from v1.
 
@@ -120,14 +120,14 @@ The latter is more elegant if the TOKEN-denominated channel is conceptually a "c
 
 ### 6. Demand-side flywheel
 
-The TOKEN burned on consumption is permanent supply reduction. Unlike the [ADR 026 §2](026-tokenomics-v3.md#2-feerouter-split-40407553) 5% buyback-and-burn flow — which scales with network *revenue in USDC*, of which only a small fraction (5%) reaches the burn — the BME burn scales **linearly with network usage**, dollar-for-dollar at the chosen discount. At mature scale this becomes the dominant deflationary mechanism, *if* sufficient client traffic chooses the BME path.
+The TOKEN burned on consumption is permanent supply reduction. Unlike the [ADR 026 §2](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553) 5% buyback-and-burn flow — which scales with network *revenue in USDC*, of which only a small fraction (5%) reaches the burn — the BME burn scales **linearly with network usage**, dollar-for-dollar at the chosen discount. At mature scale this becomes the dominant deflationary mechanism, *if* sufficient client traffic chooses the BME path.
 
 **The "if" is real.** A low-usage network sees negligible BME burn. The mechanism only matters at scale; this is a key honest constraint on the design and is reflected in the Deferred status (a v2 launch lets v1 build the usage base first).
 
 **Three-pronged demand structure with BME (forward-looking, post-v2):**
 
-1. **Operator-side TOKEN demand** — stake + ve-lock for gauge boost ([ADR 026 §3](026-tokenomics-v3.md#3-gauge-boost-formula), §7).
-2. **Delegator-side TOKEN demand** — 7% delegator-pool USDC→TOKEN buys ([ADR 026 §6](026-tokenomics-v3.md#6-delegator-pool--usdc--token-conversion)).
+1. **Operator-side TOKEN demand** — stake + ve-lock for gauge boost ([ADR 026 §3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula), §7).
+2. **Delegator-side TOKEN demand** — 7% delegator-pool USDC→TOKEN buys ([ADR 026 §6](026-gauge-boost-tokenomics.md#6-delegator-pool--usdc--token-conversion)).
 3. **Client-side TOKEN demand (this ADR)** — BME prepay deposits drive net TOKEN purchases off the open market.
 
 This is the demand-floor the v1 model lacks. v1 ships on (1) and (2) only; v2 adds (3).
@@ -137,8 +137,8 @@ This is the demand-floor the v1 model lacks. v1 ships on (1) and (2) only; v2 ad
 This ADR exists to reserve design space and to document v1 prerequisites. It is *not* a commitment to ship in v1. The deferral is justified by:
 
 - **Pricing oracle is not yet hardened.** [ADR 018](018-liquidity-strategy.md) TWAP is sufficient for a one-way protocol burn flow; it is not sufficient for a two-way prepay/consume flow against client capital. Fixing this requires v1-stability operating data.
-- **Contract complexity adds non-trivial v1 audit scope.** v1 already adds `FeeRouter`, `VotingEscrow`, `SafetyReserve`, and the `BuybackBurner` extension or `DelegatorBuyer` ([ADR 026 §10](026-tokenomics-v3.md)). Adding `BmePrepay` doubles the new-contract surface. v2 is the appropriate frame.
-- **v1 launch focuses on USDC rails.** Client onboarding, payment-channel UX, and the [ADR 026](026-tokenomics-v3.md) operator economics need v1 attention. Adding a parallel TOKEN-payment path before v1 stability fragments the launch story.
+- **Contract complexity adds non-trivial v1 audit scope.** v1 already adds `FeeRouter`, `VotingEscrow`, `SafetyReserve`, and the `BuybackBurner` extension or `DelegatorBuyer` ([ADR 026 §10](026-gauge-boost-tokenomics.md)). Adding `BmePrepay` doubles the new-contract surface. v2 is the appropriate frame.
+- **v1 launch focuses on USDC rails.** Client onboarding, payment-channel UX, and the [ADR 026](026-gauge-boost-tokenomics.md) operator economics need v1 attention. Adding a parallel TOKEN-payment path before v1 stability fragments the launch story.
 - **Low-usage networks see negligible benefit.** The BME flywheel is usage-driven. A v2 launch is timed to occur after v1 has built non-trivial baseline usage; otherwise the mechanism contributes little while costing meaningful v1 audit and development effort.
 
 ---
@@ -147,10 +147,10 @@ This ADR exists to reserve design space and to document v1 prerequisites. It is 
 
 ### Positive
 
-- **Demand-side TOKEN sink that scales with usage.** BME burn grows linearly with network consumption, independent of operator recruitment. This is the demand-floor the v1 [ADR 026](026-tokenomics-v3.md) design lacks.
+- **Demand-side TOKEN sink that scales with usage.** BME burn grows linearly with network consumption, independent of operator recruitment. This is the demand-floor the v1 [ADR 026](026-gauge-boost-tokenomics.md) design lacks.
 - **Coexistence preserves USDC rail.** Clients who don't want to touch TOKEN never have to. The default UX is unchanged from v1.
 - **Proven mechanism.** Helium's BME has operated at meaningful scale since 2021; the failure modes and tuning levers are documented in production.
-- **Deflationary at mature scale.** At sufficient client adoption, BME burn meaningfully exceeds the [ADR 026 §2](026-tokenomics-v3.md#2-feerouter-split-40407553) 5% buyback-and-burn rate per unit of revenue, since 100% of the BME unit is burned vs 5% of the USDC unit.
+- **Deflationary at mature scale.** At sufficient client adoption, BME burn meaningfully exceeds the [ADR 026 §2](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553) 5% buyback-and-burn rate per unit of revenue, since 100% of the BME unit is burned vs 5% of the USDC unit.
 - **Aligns long-term clients.** Clients who prepay are signaling commitment; the discount captures a fraction of that signal as a TOKEN-price-stability lever.
 - **Independent of operator dynamics.** A weakening operator base does not eliminate BME demand; client traffic continues regardless of who serves it.
 
@@ -178,18 +178,18 @@ This ADR exists to reserve design space and to document v1 prerequisites. It is 
 
 This ADR must not block v1; it must, however, ensure v1 design choices do not preclude v2's BME integration.
 
-- **[ADR 003](003-payments.md) payment-channel design must accommodate the future BME path without breaking changes.** Specifically: the `FeeRouter` interface ([ADR 026 §2](026-tokenomics-v3.md#2-feerouter-split-40407553)) and `PaymentChannel.settleChannel` flow must remain stable when a parallel `BmePrepay` consumption path is added. The `bytesDelivered` accounting is the natural shared input — both rails will produce per-operator byte counters that feed the gauge pool. v1 should ensure `FeeRouter.routeSettlement(operator, bytesDelivered, amount)` can plausibly be called by both `PaymentChannel` and a future `BmePrepay` consumption surface.
+- **[ADR 003](003-payments.md) payment-channel design must accommodate the future BME path without breaking changes.** Specifically: the `FeeRouter` interface ([ADR 026 §2](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553)) and `PaymentChannel.settleChannel` flow must remain stable when a parallel `BmePrepay` consumption path is added. The `bytesDelivered` accounting is the natural shared input — both rails will produce per-operator byte counters that feed the gauge pool. v1 should ensure `FeeRouter.routeSettlement(operator, bytesDelivered, amount)` can plausibly be called by both `PaymentChannel` and a future `BmePrepay` consumption surface.
 - **[ADR 018](018-liquidity-strategy.md) TWAP oracle must reach maturity sufficient for prepay pricing.** v1 hardens the buyback-side TWAP; v2 extends it to multi-source and adds circuit breakers. The v1 implementation should expose oracle-quality metrics (price-deviation alerts, manipulation-cost estimates, depth measurements) that v2 can use to validate readiness. Without this, v2 cannot launch BME safely.
 - **[ADR 010](010-multi-token.md) considerations.** BME does not introduce a *new* token; it changes the unit clients pay in. The [ADR 010](010-multi-token.md) governance-managed token allowlist is unchanged — TOKEN is a first-class allowed payment unit on the BME rail (and only on the BME rail), which means the per-token rate-bounds and channel-id-with-token machinery from [ADR 010](010-multi-token.md) carry over conceptually but apply only inside `BmePrepay` (or the channel extension). v1's [ADR 010](010-multi-token.md) implementation should not assume "non-USDC tokens are exotic" in any way that would block adding TOKEN as a privileged BME unit later.
-- **[ADR 026 §2](026-tokenomics-v3.md#2-feerouter-split-40407553) `FeeRouter` interface should remain stable.** The router's role in BME is open (does it intermediate the consume-side USDC disbursement, or is `BmePrepay` independent?) and is part of the v2 design choice. Either way, v1 should not bake assumptions into `FeeRouter` that would force a breaking change to add BME.
+- **[ADR 026 §2](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553) `FeeRouter` interface should remain stable.** The router's role in BME is open (does it intermediate the consume-side USDC disbursement, or is `BmePrepay` independent?) and is part of the v2 design choice. Either way, v1 should not bake assumptions into `FeeRouter` that would force a breaking change to add BME.
 - **[ADR 020](020-observability.md) observability surface.** v1 should add metrics for "USDC channel rail revenue per byte" and "USDC channel rail bytes per operator per epoch" with a label dimension that can later be split by payment-rail (USDC vs BME). Avoiding a label-shape change later costs less than retrofitting it under load.
-- **[ADR 023](023-poc-production-seams.md) PoC/production seams.** When v2 lands, `BmePrepay` should plug into the existing wiring layer the same way [ADR 026](026-tokenomics-v3.md)'s contracts do — selector pattern in the `node` crate, leaf-crate cleanliness preserved. v1 should not introduce node-crate patterns that make adding a second payment rail expensive.
+- **[ADR 023](023-poc-production-seams.md) PoC/production seams.** When v2 lands, `BmePrepay` should plug into the existing wiring layer the same way [ADR 026](026-gauge-boost-tokenomics.md)'s contracts do — selector pattern in the `node` crate, leaf-crate cleanliness preserved. v1 should not introduce node-crate patterns that make adding a second payment rail expensive.
 
 ---
 
 ## Forward references
 
-- This ADR is itself forward-referenced from [ADR 026 §"Forward references"](026-tokenomics-v3.md), where it appears as the demand-side counterpart to operator-side and delegator-side TOKEN demand.
+- This ADR is itself forward-referenced from [ADR 026 §"Forward references"](026-gauge-boost-tokenomics.md), where it appears as the demand-side counterpart to operator-side and delegator-side TOKEN demand.
 - v2 design work for this ADR should also revisit [ADR 032 — Bandwidth Futures / Enterprise SLA tier](032-bandwidth-futures-enterprise.md) (deferred). BME prepay and bandwidth-futures both involve client-side TOKEN commitment with a discount; the two designs interact and may share contract surface.
 
 ---
