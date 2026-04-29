@@ -355,48 +355,9 @@ after re-registration to associate the new `nodeId` with the same `ethAddress` �
 
 ### Pre-seed USDC Bootstrap Programs
 
-The phases above describe the canonical self-funded onboarding flow. Operators who lack
-the 50K-TOKEN minimum stake or the up-front infrastructure capital may qualify for one
-of the supplementary onboarding paths funded from the protocol's pre-seed USDC capital.
+Operators lacking the 50K-TOKEN minimum stake or up-front infrastructure capital may qualify for supplementary onboarding paths funded from the **$1M+ pre-seed USDC capital** ([ADR 026 §10](026-gauge-boost-tokenomics.md#10-bootstrap-mechanism--pre-seed-usdc); ADR 004's 200M-TOKEN bootstrap fund is removed). Path mechanics, eligibility, sizing, and governance live in [ADR 030](030-preseed-usdc-deployment.md): Protocol-Owned Operators, hardware-leasing subsidies, staking loans, regional-deploy grants, and the Enterprise SLA guarantee fund.
 
-**Funding mechanism.** Per [ADR 026 § 10](026-gauge-boost-tokenomics.md#10-bootstrap-mechanism--pre-seed-usdc),
-the v2 / ADR 004 **200M-TOKEN node-bootstrap fund is removed in full**. Bootstrap
-supply-side incentive is now funded externally via **$1M+ pre-seed USDC capital**
-(planning target $3M). Switching the denomination from TOKEN to USDC eliminates the
-reflexive failure mode where subsidy purchasing power collapsed exactly when subsidies
-were most needed.
-
-**No auto-ve-lock on bootstrap subsidies.** Earlier v2 interim designs auto-ve-locked
-TOKEN subsidies for one year on delivery. Because v3 bootstrap is USDC-denominated and
-contains no TOKEN subsidies, this rule is dropped — there is nothing to auto-lock. ve-
-locking remains entirely opt-in for all operators (subsidized or self-funded), and is
-the lever that captures gauge-pool yield per [ADR 026 § 3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula).
-
-**Supplementary onboarding paths.** The pre-seed program funds four supply-side paths
-in addition to the canonical self-funded flow. Each path's eligibility, sizing, and
-disbursement mechanics are deferred to **ADR 030 — Pre-seed USDC deployment program**
-([ADR 030](030-preseed-usdc-deployment.md) — companion ADR in this rollout):
-
-- **Hardware-leasing subsidies.** USDC-denominated lease (or lease-to-own) subsidies for
-  verified high-reputation operators, paid out of the pre-seed pool. Reduces the
-  up-front capex barrier for operators in regions where bandwidth provisioning carries
-  high fixed costs.
-- **Staking loans.** The pre-seed pool lends the 50K-TOKEN minimum stake to verified
-  operators in underserved regions, collateralized by the operator's future earnings
-  (the 40% direct-USDC settlement stream and gauge-pool payouts are claimable to the
-  pool's recovery account until the loan is repaid). Targets geographic-need
-  recruitment rather than wealth-based recruitment.
-- **Protocol-Owned Operators (POOs).** The DAO operates nodes directly in priority
-  regions via the pre-seed pool, generating organic USDC revenue that flows back to
-  treasury. Used to seed regions before community operators are willing to deploy.
-- **Regional-deploy grants.** Community-voted regional gauges combined with DAO-directed
-  deployment grants. Lets ve-lockers signal where additional capacity is most valuable;
-  the pre-seed pool funds qualified grant applications against those signals.
-
-Operators following any of these paths still complete Phases 1–5 above. The pre-seed
-program changes how the operator obtains stake / hardware, not the onboarding sequence
-itself. Eligibility verification, KYC requirements, repayment terms, and program
-governance are all defined in ADR 030.
+ve-locking is opt-in for all operators (subsidized or self-funded); v3 bootstrap is USDC-denominated and contains no TOKEN subsidies to auto-lock. Operators using any pre-seed path still complete Phases 1–5 above — the program changes how stake / hardware is obtained, not the onboarding sequence.
 
 ---
 
