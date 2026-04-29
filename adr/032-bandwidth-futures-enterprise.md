@@ -1,7 +1,7 @@
 # ADR 032: Bandwidth Futures and Enterprise SLA Tier
 
 **Date:** 2026-04-25
-**Status:** Deferred (target: v2 mainnet)
+**Status:** Deferred (target: post-launch follow-up)
 **Prerequisites:** [ADR 026](026-gauge-boost-tokenomics.md) §5 SafetyReserve, [ADR 027](027-distinct-client-receipts.md) distinct-client delivery receipts, [ADR 030](030-preseed-usdc-deployment.md) §2e Enterprise SLA guarantee fund
 **Touches:** [ADR 026](026-gauge-boost-tokenomics.md), [ADR 030](030-preseed-usdc-deployment.md), [ADR 003](003-payments.md), [ADR 018](018-liquidity-strategy.md)
 
@@ -9,16 +9,16 @@
 
 ## Context
 
-v1 deCDN (per [ADR 003](003-payments.md) and [ADR 026](026-gauge-boost-tokenomics.md)) serves
-**best-effort delivery** — clients open USDC payment channels, settle per-MB at
-$0.01/GB, and the protocol guarantees content integrity (BLAKE3-addressed bytes) but
+deCDN (per [ADR 003](003-payments.md) and [ADR 026](026-gauge-boost-tokenomics.md)) serves
+**best-effort delivery** at launch — clients open USDC payment channels, settle per-MB
+at $0.01/GB, and the protocol guarantees content integrity (BLAKE3-addressed bytes) but
 not availability, latency, or throughput. SLA is implicit: "the network is up, or it
 isn't." This is sufficient for the freemium / Pro tier of clients (developers, indie
-streaming, content sites, hobbyist deployments) and is the operational regime the v3
-tokenomics in [ADR 026](026-gauge-boost-tokenomics.md) is sized against.
+streaming, content sites, hobbyist deployments) and is the operational regime the
+[ADR 026](026-gauge-boost-tokenomics.md) tokenomics are sized against.
 
-It is **not** sufficient for two adjacent client segments that the v3 economic model
-and the market-dynamics analysis explicitly target:
+It is **not** sufficient for two adjacent client segments the economic model and
+market-dynamics analysis explicitly target:
 
 1. **Streaming startups and content-aggregator clients** that need cost certainty for
    capacity planning. Pay-as-you-go pricing with monthly volume swings forces these
@@ -45,22 +45,22 @@ forward-reference this ADR as the contract-format and product-tier authority.
 
 This ADR is the **product-tier and contract-shape decision record** — it defines what a
 Bandwidth Futures contract looks like, what an Enterprise SLA tier offers, how the two
-products compose, and which v1 prerequisites must be in place before v2 implementation.
+products compose, and which launch-time prerequisites must be in place before adoption.
 It is **not** a futures-DEX design (secondary-market mechanics are out of scope) and
 does **not** pin specific SLA values (uptime %, latency ms, throughput targets are
 per-contract and live with the Enterprise sales motion, not in this ADR).
 
-**Deferred to v2 mainnet.** v1 establishes the infrastructure (SafetyReserve, pre-seed
-Enterprise fund, distinct-client receipts, the freemium → Pro ladder) on which this ADR
-builds; v2 is when the futures and SLA-tier products turn on. The deferral is a
-**capability ordering** decision, not a "maybe later" — the prerequisites listed below
-are concrete and gate v2 implementation.
+**Deferred — post-launch follow-up.** Launch establishes the infrastructure (SafetyReserve,
+pre-seed Enterprise fund, distinct-client receipts, the freemium → Pro ladder) on which
+this ADR builds; the follow-up adoption pass is when futures and SLA-tier products turn
+on. The deferral is a **capability ordering** decision, not a "maybe later" — the
+prerequisites listed below are concrete and gate adoption.
 
 ---
 
 ## Decision
 
-Both products ship in v2:
+Both products ship together in the adoption pass:
 
 1. **Bandwidth Futures** — TOKEN-denominated bandwidth pre-purchase contracts with
    structured settlement against actual delivery, providing cost certainty for clients
@@ -70,7 +70,7 @@ Both products ship in v2:
    Enterprise SLA guarantee fund per [ADR 030](030-preseed-usdc-deployment.md) §2e.
 
 The freemium / Pro / Enterprise tier ladder is the canonical client-segmentation model
-for the network from v2 forward.
+once these products land.
 
 ### 1. Bandwidth Futures
 
@@ -84,7 +84,7 @@ structured settlement at expiry against verified delivery.
 | --- | --- | --- |
 | `contractId` | `bytes32` | Unique on-chain identifier |
 | `buyer` | `address` | Client purchasing the future |
-| `seller` | `address` | DAO treasury wallet (v2 launch) or designated operator pool |
+| `seller` | `address` | DAO treasury wallet (at adoption) or designated operator pool |
 | `bandwidthGB` | `uint256` | Total GB committed for the period |
 | `region` | `bytes32` | Regional gauge identifier per [ADR 030](030-preseed-usdc-deployment.md) §2d, or `bytes32(0)` for "any" |
 | `periodStart` | `uint64` | Block-timestamp start of delivery window |
@@ -95,8 +95,8 @@ structured settlement at expiry against verified delivery.
 | `breachCompensationCap` | `uint256` | Max USDC payable on under-delivery; references SafetyReserve / pre-seed pairing per §2 below |
 
 The format is intentionally compact — implementation details (event schemas, exact
-storage layout, ERC-721 vs. ERC-1155 contract identity) live in v2 implementation
-ADRs, not here.
+storage layout, ERC-721 vs. ERC-1155 contract identity) live in adoption-time
+implementation ADRs, not here.
 
 #### 1.2 TOKEN denomination
 
@@ -111,9 +111,9 @@ designated reserve) commits to deliver bandwidth at a price expressed in
 - **TOKEN-USD basis risk.** A TOKEN price drop between strike and expiry is shared:
   buyer keeps the discount-vs-USD; seller (DAO) absorbs the fiat-equivalent shortfall
   unless TOKEN appreciates above strike. Fixed-USD-rate futures with TOKEN-collateral
-  are an alternative considered and rejected for v2 — they reintroduce the reflexive
-  bootstrap risk that the [ADR 026](026-gauge-boost-tokenomics.md) §10 USDC pre-seed structure
-  was designed to eliminate.
+  were considered and rejected — they reintroduce the reflexive
+  bootstrap risk that the [ADR 026](026-gauge-boost-tokenomics.md) §10 USDC pre-seed
+  structure is designed to eliminate.
 
 #### 1.3 Settlement
 
@@ -134,7 +134,7 @@ cannot ship; this is the single hardest prerequisite.
 
 #### 1.4 Liquidity
 
-- **Initial market-making.** The DAO is the seller of record at v2 launch, drawing
+- **Initial market-making.** The DAO is the seller of record at adoption, drawing
   TOKEN from the protocol-treasury allocation per [ADR 026](026-gauge-boost-tokenomics.md) §1
   and using pre-seed Enterprise SLA fund capacity per
   [ADR 030](030-preseed-usdc-deployment.md) §2e for the SLA-paired tranche of
@@ -142,8 +142,8 @@ cannot ship; this is the single hardest prerequisite.
 - **Secondary market.** A Balancer V3 pool (per [ADR 018](018-liquidity-strategy.md))
   or a specialized perp-DEX integration may be added for futures-on-futures trading.
   **Out of scope for this ADR** — the secondary-market venue choice is its own
-  design problem and is deferred to a v2-implementation ADR. v2 launch is fine with
-  primary-only issuance.
+  design problem and is deferred to an adoption-time implementation ADR. Adoption is
+  fine with primary-only issuance.
 - **Operator participation.** Individual operators may also write futures against
   their own capacity. Operator-written futures default to `PhysicalDelivery` mode
   (the operator owns the delivery commitment) and are **not** SLA-paired by default —
@@ -178,7 +178,7 @@ given contract are per-deal and live with the Enterprise sales motion.
 | Renewal | Auto-renew with 60-day cancellation window |
 | Recourse priority | Order matches §2.2 below |
 
-The contract template itself is governance-ratified at v2 launch and updated by
+The contract template itself is governance-ratified at adoption and updated by
 governance proposal thereafter.
 
 #### 2.2 Backing — two layers in priority order
@@ -253,10 +253,10 @@ Three non-exclusive client segments differentiated contractually, not by the wir
   TWAP buys per [ADR 026](026-gauge-boost-tokenomics.md), this completes the
   three-pronged TOKEN demand curve (operator + delegator + client) without requiring
   the BME path in [ADR 031](031-bme-client-prepay.md).
-- **Reuses v1 infrastructure.** SafetyReserve, distinct-client receipts, and the
-  pre-seed pairing are all v1 deliverables. v2 wires them into a product surface
-  rather than introducing new on-chain primitives. Audit footprint is meaningfully
-  smaller than a from-scratch design.
+- **Reuses launch infrastructure.** SafetyReserve, distinct-client receipts, and the
+  pre-seed pairing are all launch deliverables. Adoption wires them into a product
+  surface rather than introducing new on-chain primitives. Audit footprint is
+  meaningfully smaller than a from-scratch design.
 - **Self-deprecating pre-seed pairing.** [ADR 030](030-preseed-usdc-deployment.md)
   §2e termination trigger ties pre-seed retirement to organic SafetyReserve depth —
   the second-line backing fades out exactly when it is no longer needed, without a
@@ -271,10 +271,10 @@ Three non-exclusive client segments differentiated contractually, not by the wir
   [ADR 027](027-distinct-client-receipts.md) being live and reliable in production.
   An oracle compromise (receipt-fraud at scale) is a settlement failure for futures
   *and* a SafetyReserve-draining attack vector for Enterprise SLAs simultaneously —
-  the same single-point-of-failure that the v3 risk analysis flags for the gauge
-  pool. ADR 027 must be production-hardened before this ADR ships.
+  the same single-point-of-failure that gauge-pool security depends on. ADR 027 must
+  be production-hardened before this ADR ships.
 - **Secondary-market depth is required for futures liquidity at scale.** Primary-only
-  issuance is fine at v2 launch but caps how large the Bandwidth Futures product can
+  issuance is fine at adoption but caps how large the Bandwidth Futures product can
   grow. Secondary market design is its own follow-up ADR; until that lands,
   forward-rolling-by-buyer is the only liquidity path.
 - **Operational overhead — Enterprise sales channel.** Running an Enterprise sales
@@ -282,7 +282,7 @@ Three non-exclusive client segments differentiated contractually, not by the wir
   management, and dispute handling are recurring DAO-funded work. The
   [ADR 030](030-preseed-usdc-deployment.md) §4 quarterly-report cadence partly covers
   this, but a dedicated Enterprise team is the realistic operating model.
-- **Regulatory exposure for futures.** Bandwidth futures may be classified as derivatives in some jurisdictions; per-jurisdiction issuance posture and geo-fencing infrastructure are v2 prerequisites. Legal review is on the critical path but not a launch-day blocker globally.
+- **Regulatory exposure for futures.** Bandwidth futures may be classified as derivatives in some jurisdictions; per-jurisdiction issuance posture and geo-fencing infrastructure are adoption-time prerequisites. Legal review is on the critical path but not a launch-day blocker globally.
 - **TOKEN-USD basis risk for the DAO.** §1.2 TOKEN-strike futures put the DAO on the short-TOKEN side of the basis. Per-contract size caps and TWAP-priced strikes mitigate but don't eliminate.
 - **Counterparty/adjudicator conflict.** The DAO is both Enterprise contract counterparty and `SafetyReserve` payout adjudicator. Mitigated by the [ADR 026](026-gauge-boost-tokenomics.md) §5 48h appeal window + public incident registry; large contracts may additionally require an independent appeals path (e.g. Kleros-style arbitration) above a size threshold.
 
@@ -304,13 +304,13 @@ Three non-exclusive client segments differentiated contractually, not by the wir
 - **Receipt-oracle compromise correlates failure modes.** Both products consume the
   same delivery oracle. A single oracle exploit harms futures settlement and SLA
   measurement simultaneously. [ADR 027](027-distinct-client-receipts.md) must be
-  resilient to this concentration; a v2 readiness gate on ADR 027 is "what fraction
-  of total contract notional depends on the receipt oracle being correct."
+  resilient to this concentration; an adoption readiness gate on ADR 027 is "what
+  fraction of total contract notional depends on the receipt oracle being correct."
 - **Enterprise SLA breach correlates with network-wide stress.** A regional outage
   triggers many Enterprise contracts simultaneously. SafetyReserve depth must be sized
   against **simultaneous breach scenarios**, not single-contract worst case.
   Sizing analysis lives in the [ADR 030](030-preseed-usdc-deployment.md) §2e success
-  metrics + economic-model spec §7; v2 launch readiness gate.
+  metrics + economic-model spec §7; adoption readiness gate.
 - **Convex-style capture on regional bandwidth gauges.** If futures markets concentrate
   in specific regions (e.g., Brazil, Southeast Asia per
   [ADR 030](030-preseed-usdc-deployment.md) §2d priorities), gauge votes routing
@@ -326,14 +326,14 @@ Three non-exclusive client segments differentiated contractually, not by the wir
 
 ---
 
-## v1 prerequisites for v2 implementation
+## Prerequisites for adoption
 
-This ADR is deferred. Before v2 implementation begins, all of the following must hold:
+This ADR is deferred. Before adoption begins, all of the following must hold:
 
 | # | Prerequisite | Source | Status gate |
 | --- | --- | --- | --- |
-| 1 | `PaymentChannel` per-contract billing path exists | [ADR 003](003-payments.md) | Settlement path can carry per-contract metadata (contract identifier in voucher payload) without breaking changes. v1 design must accommodate this shape; implementation can land later |
-| 2 | Distinct-client delivery receipts live in production | [ADR 027](027-distinct-client-receipts.md) | Receipt format finalized, watchtower / reputation integration deployed, observed receipt-fraud rate below v2-readiness threshold |
+| 1 | `PaymentChannel` per-contract billing path exists | [ADR 003](003-payments.md) | Settlement path can carry per-contract metadata (contract identifier in voucher payload) without breaking changes. Launch design must accommodate this shape; implementation can land later |
+| 2 | Distinct-client delivery receipts live in production | [ADR 027](027-distinct-client-receipts.md) | Receipt format finalized, watchtower / reputation integration deployed, observed receipt-fraud rate below readiness threshold |
 | 3 | `SafetyReserve` accumulates sufficient organic balance | [ADR 026](026-gauge-boost-tokenomics.md) §5 | Balance covers at least one expected single-incident worst case from the §2.1 contract templates without paired-allocation draws |
 | 4 | Pre-seed Enterprise SLA fund funded | [ADR 030](030-preseed-usdc-deployment.md) §2e | At least the $100K floor allocation is custodied and operational |
 | 5 | Native sveTOKEN wrapper live | [ADR 028](028-sve-token-wrapper.md) (deferred follow-up to ADR 026) | Convex-capture risk mitigated before futures liquidity scales |
@@ -341,24 +341,24 @@ This ADR is deferred. Before v2 implementation begins, all of the following must
 | 7 | Enterprise sales channel established | Operational | Designated multisig-supervised team or DAO-elected role; standard contract template ratified by governance |
 | 8 | SLA breach measurement infrastructure | [ADR 007](007-watchtower.md) + [ADR 020](020-observability.md) | Per-contract availability / latency / throughput metrics exported and challengeable via watchtower |
 
-Prerequisites 1–4 are **hard gates**: any one absent blocks v2 implementation.
-Prerequisites 5–8 are **strong recommendations**: a launch without one is possible but
-materially weakens the product. Prerequisite 6 is jurisdiction-dependent and may delay
-launch in specific markets without delaying v2 globally.
+Prerequisites 1–4 are **hard gates**: any one absent blocks adoption. Prerequisites 5–8
+are **strong recommendations**: adoption without one is possible but materially weakens
+the product. Prerequisite 6 is jurisdiction-dependent and may delay adoption in specific
+markets without delaying it globally.
 
 ---
 
 ## Forward references
 
 This ADR is itself a forward reference from [ADR 026](026-gauge-boost-tokenomics.md) and
-[ADR 030](030-preseed-usdc-deployment.md). v2 implementation will produce its own
-follow-up ADR set covering at minimum:
+[ADR 030](030-preseed-usdc-deployment.md). Adoption will produce its own follow-up ADR
+set covering at minimum:
 
 - **Bandwidth Futures contract implementation** — exact storage layout, ERC-721 vs.
   ERC-1155 choice, event schemas, on-chain registry.
 - **Secondary-market venue selection** — Balancer V3 weighted pool extension vs.
   specialized perp DEX vs. RFQ-style OTC; scoped against observed primary-market
-  demand at v2-launch + 6 months.
+  demand at adoption + 6 months.
 - **Enterprise contract template ratification** — the §2.1 shape with concrete
   default values for availability / latency / throughput targets, penalty schedule,
   and dispute-resolution path.
@@ -367,10 +367,10 @@ follow-up ADR set covering at minimum:
   contract restrictions.
 
 These follow-ups are out of scope for this ADR; the decision recorded here is the
-product shape and the v1 prerequisite set.
+product shape and the launch-time prerequisite set.
 
 ---
 
 ## ADRs to update on acceptance
 
-Deferred — no v1 ADRs change. At v2 implementation, deltas land in [003](003-payments.md) (per-contract voucher metadata), [018](018-liquidity-strategy.md) (per-epoch liquidity caps cover futures-driven swap pressure if secondary market shares the pool), [026](026-gauge-boost-tokenomics.md) (§5 SafetyReserve cross-ref resolves), [030](030-preseed-usdc-deployment.md) (§2e contract-template forward-ref resolves).
+Deferred — no launch-time ADRs change. At adoption, deltas land in [003](003-payments.md) (per-contract voucher metadata), [018](018-liquidity-strategy.md) (per-epoch liquidity caps cover futures-driven swap pressure if secondary market shares the pool), [026](026-gauge-boost-tokenomics.md) (§5 SafetyReserve cross-ref resolves), [030](030-preseed-usdc-deployment.md) (§2e contract-template forward-ref resolves).
