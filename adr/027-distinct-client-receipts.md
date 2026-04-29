@@ -9,24 +9,9 @@
 
 ## Context
 
-[ADR 026](026-gauge-boost-tokenomics.md) §2 introduces a `FeeRouter` that distributes 40% of every settlement into a weekly **gauge boost pool**. Pool share is computed by the Curve-style formula in [ADR 026 §3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula):
+[ADR 026 §3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula) defines the gauge-pool share as a function of `bytes_i` (verified bytes per operator) and `ve_i / total_ve` (the operator's ve-share). The formula bounds the *output* but says nothing about whether the *input* `bytes_i` is honest. The on-chain `claimedBytes` reaching `FeeRouter.routeSettlement` ([ADR 003](003-payments.md)) is signed by *some* address that opened a payment channel — nothing today prevents the operator from running both sides.
 
-```
-working_bytes_i = min(bytes_i, 0.4 × bytes_i + 0.6 × (ve_i / total_ve) × total_bytes)
-boost_share_i   = working_bytes_i / Σ working_bytes
-```
-
-The formula is bounded by `bytes_i` in both directions (invariant #3 in the gauge-boost design spec §3) — but **the formula says nothing about whether `bytes_i` itself is honest**. The on-chain input is `claimedBytes` from the final voucher submitted to `FeeRouter.routeSettlement(operator, bytesDelivered, amount)` ([ADR 003](003-payments.md) settlement flow). Today that field is supplied by the settling operator and signed by *some* address that opened a payment channel against them. Nothing prevents the operator from running both sides.
-
-**The wash-trading attack** ([ADR 026 §Risks](026-gauge-boost-tokenomics.md#risks); design-spec §6 Risks #3; market-dynamics §3; survival-additions §4):
-
-1. Operator `O` controls a sybil client identity `C` (a fresh EOA or smart account).
-2. `C` opens a payment channel to `O` with a USDC deposit.
-3. `O` self-routes "delivery" traffic — possibly serving real bytes back to itself, possibly not — and `C` signs cumulative vouchers covering whatever `bytesDelivered` figure `O` wants to inflate.
-4. `O` settles the channel. The 40% base flows back to `O`'s own wallet; the inflated `bytesDelivered` enters the gauge counter for the epoch.
-5. `O`'s effective cost is the router's non-base skim (≈60%) on `O`'s *own* USDC, which `O` already owned, plus a few cents of L2 gas per settlement. That is roughly a 5–8% net round-trip loss in USDC terms — a deterrent only if TOKEN price is flat and ve-yield is small. At TOKEN price 3–5× genesis, gauge share + ve appreciation more than compensates and the attack is *net profitable*.
-
-Settlement gas (~$0.08) is a per-event tax but does not scale with claimed bytes; an operator can pay one gas fee and inflate by terabytes. The router skim is denominated in the same USDC the attacker controls. **Neither cost is an effective deterrent at the intended TOKEN price levels.**
+**The wash-trading attack** ([ADR 026 §Risks](026-gauge-boost-tokenomics.md#risks); design-spec §6.3): an operator opens a channel from a sybil client identity to themselves, self-routes traffic, and signs vouchers inflating `bytesDelivered`. Effective cost is the ~60% router skim on the operator's *own* USDC plus a few cents of L2 gas — roughly a 5–8% net loss in USDC terms, more than offset by gauge-share + ve-appreciation gains at TOKEN price 3–5× genesis. Settlement gas does not scale with claimed bytes. **Neither cost is a deterrent at the intended TOKEN price levels.**
 
 Defense: byte counters that feed the gauge formula must be attested by **distinct, verifiable client identities** — counterparties the operator does not control. The voucher protocol from [ADR 003](003-payments.md) already proves *bytes were paid for*; this ADR adds a parallel artifact that proves *bytes were paid for by independent counterparties* and gates gauge eligibility on that artifact.
 
@@ -55,37 +40,9 @@ A `DeliveryReceipt` is an EIP-712 typed-data message signed by the **requester's
 | `epochId` | `uint64` | The `FeeRouter` epoch this receipt is intended to credit — set by the requester at signing time. Receipts whose `epochId` does not match the receipt-batch settlement epoch are rejected at root commitment. |
 | `timestamp` | `uint64` | Microsecond timestamp from the requester's clock at signing. Skew bounds match [ADR 014 Evidence Staleness](014-on-chain-verification.md): `MAX_FUTURE_SKEW_US = 60_000_000`, `MAX_RECEIPT_AGE_US = 432_000_000_000` (5 days). |
 
-**EIP-712 domain.** Receipts use a dedicated `FeeRouter` domain separator to prevent cross-contract replay against `StablePaymentChannel` voucher signatures or `SlashJudge` evidence:
+**EIP-712 domain.** Dedicated `FeeRouter` domain separator over the §1 field set, preventing cross-contract replay against `StablePaymentChannel` voucher signatures or `SlashJudge` evidence.
 
-```solidity
-EIP712Domain({
-    name: "deCDN FeeRouter",
-    version: "1",
-    chainId: <deployment chain>,
-    verifyingContract: <FeeRouter address>
-})
-
-bytes32 constant DELIVERY_RECEIPT_TYPEHASH = keccak256(
-    "DeliveryReceipt("
-        "bytes32 channelId,"
-        "uint256 voucherNonce,"
-        "uint256 bytesClaimed,"
-        "bytes32 contentRoot,"
-        "address clientPubKey,"
-        "address operatorAddress,"
-        "uint64 epochId,"
-        "uint64 timestamp"
-    ")"
-);
-```
-
-**Invariants enforced when a receipt is verified on challenge (§4, §5):**
-
-1. The signature recovers to `clientPubKey` and that address equals `channel.client` of `channelId`.
-2. `bytesClaimed` matches the `bytesDelivered` field of the voucher with nonce `voucherNonce` in `channelId` (cross-checked against the on-chain `claimedBytes` for the channel's final voucher, or against any voucher provided as evidence). Receipts that disagree with the paired voucher are invalid — wash-trading defense relies on the receipt and the voucher being two views of the *same* delivery, signed once each.
-3. `operatorAddress` matches `channel.provider`.
-4. `epochId` matches the operator's settlement epoch the root was committed in.
-5. `timestamp` passes the staleness check and is within the receipt's `epochId`'s settlement window.
+**Invariants enforced on challenge (§4, §5):** signature recovers to `clientPubKey == channel.client`; `bytesClaimed` matches the paired voucher's `bytesDelivered` (the receipt and voucher must be two views of the *same* delivery); `operatorAddress == channel.provider`; `epochId` matches the settlement epoch; `timestamp` passes [ADR 014](014-on-chain-verification.md) staleness bounds.
 
 **Pairing with vouchers, not replacing them.** [ADR 003](003-payments.md)'s `Voucher` is the on-chain payment instrument and remains the authoritative settlement input for `claimedAmount` and `claimedBytes`. The `DeliveryReceipt` is a separate signature over an overlapping field set (`bytesClaimed` mirrors `bytesDelivered`; `channelId` and `voucherNonce` pin the pairing). A voucher without a matching receipt is fully redeemable for USDC at settlement — only **gauge eligibility for the underlying bytes** depends on the receipt. See §7 for failure semantics.
 
@@ -95,7 +52,7 @@ bytes32 constant DELIVERY_RECEIPT_TYPEHASH = keccak256(
 
 **Verifier.** OpenZeppelin `SignatureChecker.isValidSignatureNow` so EOAs (`ecrecover`, ~3k gas) and ERC-1271 smart accounts ([ADR 024](024-account-abstraction.md), ~15k gas for Safe) are both supported with no special-casing in `FeeRouter` or `SlashJudge`. Production clients running smart-account wallets sign receipts via the same path as vouchers.
 
-**Why not Ed25519.** Operators' iroh NodeIds are Ed25519, but receipts are signed by *requester* Ethereum keys — receivers, not operators — and identity diversity is computed in the EVM-address space because the channel deposit is itself in the EVM-address space (USDC ERC-20). The protocol already provides Ed25519-only counterparts for wire-level authentication ([ADR 005](005-protocol.md) `signature` field); this ADR uses the secp256k1 lane that already exists for on-chain evidence ([ADR 014 §1](014-on-chain-verification.md) dual-key slash signatures). Mixing curves would add no security and force on-chain Ed25519 verification we already rejected as too expensive (see [ADR 014 Alternatives Considered](014-on-chain-verification.md#alternatives-considered)).
+**Why secp256k1.** Receipts are signed by *requester* EVM keys (channel funder, not operator), and identity diversity is computed in the EVM-address space because channel deposits are USDC. Ed25519 is reserved for wire-level operator authentication ([ADR 005](005-protocol.md)); on-chain Ed25519 verification was already rejected as too expensive ([ADR 014 Alternatives](014-on-chain-verification.md#alternatives-considered)).
 
 ### 3. Identity-diversity gating
 
@@ -136,26 +93,7 @@ The protocol mirrors the **keccak256 Merkle-batch pattern** from [ADR 014 §2 Pr
 
 **Per-settlement commitment.** `StablePaymentChannel.settleChannel` is extended to accept a `bytes32 receiptBatchRoot` argument, forwarded to `FeeRouter.routeSettlement(operator, bytesDelivered, amount, receiptBatchRoot)`. A zero root signals "this settlement contributes nothing to gauge eligibility" — see §7.
 
-**Batch shape.** A `ReceiptBatch` for a single operator within one settlement is a keccak256 Merkle tree over the leaves:
-
-```solidity
-leaf_i = keccak256(
-    abi.encode(
-        DELIVERY_RECEIPT_TYPEHASH,
-        receipt_i.channelId,
-        receipt_i.voucherNonce,
-        receipt_i.bytesClaimed,
-        receipt_i.contentRoot,
-        receipt_i.clientPubKey,
-        receipt_i.operatorAddress,
-        receipt_i.epochId,
-        receipt_i.timestamp,
-        keccak256(receipt_i.signature)   // canonicalises 65-byte EOA / arbitrary ERC-1271
-    )
-)
-```
-
-Tree construction matches the [ADR 014](014-on-chain-verification.md) pattern: `keccak256(left || right)` internal nodes; left-padded with zero hashes for non-power-of-2 leaf counts; index-prefixed leaves prevent second-preimage attacks. A 30k-receipt monthly batch produces a 15-deep tree (~480 bytes per challenge proof).
+**Batch shape.** A `ReceiptBatch` is a keccak256 Merkle tree over the §1 field set plus `keccak256(signature)` (which canonicalises EOA vs. arbitrary ERC-1271 signatures into a fixed-width leaf). Tree construction matches the [ADR 014](014-on-chain-verification.md) pattern: `keccak256(left || right)` internal nodes, zero-padded for non-power-of-2 leaf counts, index-prefixed leaves to prevent second-preimage. A 30k-receipt monthly batch produces a 15-deep tree (~480 bytes per challenge proof).
 
 **Per-epoch summary.** At epoch rollover, `FeeRouter` aggregates all `receiptBatchRoot` commitments observed for an operator during the epoch into a single per-epoch `EpochReceiptSummary`:
 
@@ -179,13 +117,7 @@ A receipt attester subscribed to an operator's epoch performs:
 
 1. **Signature validity.** For each receipt in the batch, recompute the EIP-712 digest, verify the signature with `SignatureChecker`, and verify all five invariants in §1.
 2. **Identity diversity over recent epochs.** Apply the §3 rules — funded-channel minimum, funding-age, per-operator cooldown, funding-source diversity — and compute the actual distinct-client count. Compare with `claimedDistinctClients` in the operator's `EpochReceiptSummary`.
-3. **Cross-checks against suspicious clustering.** Heuristics including:
-   - All receipts in an epoch arriving from a contiguous block of EOA addresses ("address generator pattern").
-   - Receipts whose `clientPubKey` was funded from a small set of common ancestors.
-   - Receipts whose `bytesClaimed` distribution is anomalous relative to the network mean (e.g., uniformly maxed-out at the negotiated voucher interval, with no jitter).
-   - Receipts whose `timestamp` clusters tightly within tens of seconds, characteristic of automated wash-routing rather than organic traffic.
-
-   Exact heuristic catalogue is implementation-defined and can evolve; what is fixed is the **interface**: a heuristic flag is sufficient grounds to open a `ChallengeReceiptSummary`, and the on-chain dispute resolves on cryptographic evidence (signature validity, channel-funding ancestry traces) rather than on the heuristic itself. Heuristics are a *prioritisation* signal for the attester, never a slashing input.
+3. **Cross-checks against suspicious clustering.** Heuristics flag ancestry / timing / byte-distribution patterns characteristic of self-routed traffic (e.g., contiguous-EOA "address generator" patterns, common-ancestor funding, jitter-free byte counts). Exact catalogue is implementation-defined; what is fixed is the **interface** — a heuristic flag is sufficient grounds to open a `ChallengeReceiptSummary`, but the on-chain dispute resolves on cryptographic evidence (signature validity, channel-funding ancestry traces), never on the heuristic itself.
 
 **Bond model.** Receipt-fraud challenges use the existing watchtower bond mechanism in [ADR 007](007-watchtower.md). Successful challenges award the bond plus a configurable receipt-fraud reward to the challenger; unsuccessful challenges forfeit the bond per [ADR 014 Bond Handling](014-on-chain-verification.md). Receipt attesters are not a new on-chain role — they are watchtowers running an additional module against the same `WatchtowerEscrow` contract.
 
@@ -232,19 +164,9 @@ Per-receipt client identity is **observable on-chain when challenged**. The Merk
 
 This is a real privacy regression from the [ADR 003](003-payments.md) baseline, where channel deposits are on-chain (identifying the *funder*) but per-stream byte counts are not. Adding per-stream attestation signed by the funder makes the funder's per-stream activity legible whenever a challenge surfaces them.
 
-**Mitigations possible within this ADR (do *not* change the protocol):**
+**Mitigations within this ADR (no protocol change):** receipts are stored off-chain and surface only on challenge; `contentRoot` is a chunk Merkle root, not a blob hash; per-epoch batching limits each challenge's disclosure to the batch's leaves.
 
-- Receipts are batched per epoch — challenges reveal the batch's leaves only, not all of an operator's history.
-- The `contentRoot` field is a Merkle root over chunks, not a content hash; it does not reveal which blob the client requested.
-- Operators are expected to store receipts off-chain and only surface them on challenge; they are not gossiped or published.
-
-**Mitigations requiring future work, forward-referenced to [ADR 017](017-privacy.md):**
-
-- **Zero-knowledge identity-diversity proofs.** A SNARK / STARK construction proving "this batch contains at least N receipts signed by N distinct addresses, all meeting the §3 gating rules, against operator O" without revealing individual `clientPubKey`s. Would replace the cleartext leaves with a proof and a public "distinct count". Major engineering effort; defer.
-- **Stealth-address client identities.** Each per-channel client identity could be a fresh stealth address derived from a master client key. Sidesteps trivial address-graph clustering at the cost of a more complex client wallet UX. Defer.
-- **Mixer-funded sybils as anti-defense.** A privacy-improving mixer would also degrade funding-source diversity heuristics (§5). Tension to be resolved in [ADR 017](017-privacy.md).
-
-This ADR ships the cleartext-receipt protocol. Privacy upgrades are a future-work track and **not** a launch blocker — wash-trading defense is the v1 priority, and shipping receipts late is a worse outcome than shipping them with a known privacy regression that [ADR 017](017-privacy.md) addresses on its own timeline.
+**Future work in [ADR 017](017-privacy.md):** zero-knowledge identity-diversity proofs (replace cleartext leaves with a "distinct count" proof) and stealth-address client identities are the canonical paths. Both are significant work and **not** v1-launch blockers; this ADR ships the cleartext protocol because shipping wash-trading defense late is the worse outcome.
 
 ### 9. Implementation sequencing and v1 prerequisite
 
@@ -256,15 +178,7 @@ This ADR ships the cleartext-receipt protocol. Privacy upgrades are a future-wor
 
 This is consistent with [ADR 026 §Forward references](026-gauge-boost-tokenomics.md#forward-references-follow-up-adrs) — ADR 027 is listed there as "priority-1; not optional for production launch". The wording above pins down what "not optional" means concretely.
 
-**Sequencing within the receipt rollout itself:**
-
-1. Receipt format, signing, EIP-712 domain finalised. Client-side and operator-side libraries shipped.
-2. `FeeRouter.commitEpochSummary` and `commitSettlementBatch` paths deployed; receipts collected but no enforcement (parallel-run).
-3. Watchtower receipt-validation module shipped ([ADR 007](007-watchtower.md) updated). Heuristic library populated.
-4. Reputation integration ([ADR 008](008-reputation.md)) shipped — `reputationOf(operator)` view live.
-5. **Gauge gating turned on.** `MIN_DISTINCT_CLIENTS_PER_EPOCH` becomes active. The 40% gauge pool begins paying out per the gated formula. v1 mainnet-readiness reached.
-
-Steps 1–4 may run in parallel-with-mainnet for one or more epochs of testing; step 5 is the cutover.
+**Sequencing.** Format and client/operator libraries → contract paths deployed in parallel-run mode (no enforcement) → watchtower module + heuristic library → reputation integration → cutover (gauge gating on, `MIN_DISTINCT_CLIENTS_PER_EPOCH` active). The cutover is v1 mainnet-readiness.
 
 ---
 
@@ -301,13 +215,6 @@ Steps 1–4 may run in parallel-with-mainnet for one or more epochs of testing; 
 
 ## ADRs to update on acceptance
 
-| ADR | What changes |
-| --- | --- |
-| [ADR 003 — Payments](003-payments.md) | `StablePaymentChannel.settleChannel` accepts `bytes32 receiptBatchRoot`; forwards to `FeeRouter.routeSettlement(operator, bytesDelivered, amount, receiptBatchRoot)`. The `Voucher` typedef is unchanged; receipts are a parallel artifact. Voucher protocol description updated to document the *paired-with-receipt* expectation in v1+. |
-| [ADR 007 — Watchtower](007-watchtower.md) | New "receipt-attester" role layered on the existing watchtower contract surface. New duty: signature validation, identity-diversity rules, suspicious-clustering heuristics. New on-chain entry: `WatchtowerEscrow.challengeReceiptSummary(operator, epochId, evidence)`. Bond model unchanged; receipt-fraud bounty added to the fee structure. |
-| [ADR 008 — Reputation](008-reputation.md) | `reputationOf(operator)` view exposed for `FeeRouter` consumption. Affiliated-address registry surface formalised (already implicit). Tighter receipt thresholds for low-reputation operators documented as a reputation consequence. |
-| [ADR 014 — On-chain verification](014-on-chain-verification.md) | The keccak256 Merkle-batch pattern this ADR uses is the same construction documented as the production path for corruption proofs. Cross-link added so toolchain reuse is explicit; no contract changes to `SlashJudge`. |
-| [ADR 017 — Privacy](017-privacy.md) | New section flagging per-receipt client-identity disclosure on challenge; zero-knowledge identity-diversity proofs and stealth-address client identities listed as future-work. Tension with funding-source diversity heuristic noted. |
-| [ADR 026 — Tokenomics v3](026-gauge-boost-tokenomics.md) | The forward reference to ADR 027 in §Risks and §Forward references is fulfilled. §9 Implementation sequencing's v1 prerequisite ("gauge pool MUST NOT pay out until receipts ship") is the binding rule; ADR 026 already contains the "Strongly recommended for production launch; not optional" wording, which carries through unchanged. |
+Cross-cutting deltas live in each touched ADR. Touched: [003](003-payments.md), [007](007-watchtower.md), [008](008-reputation.md), [014](014-on-chain-verification.md), [017](017-privacy.md), [026](026-gauge-boost-tokenomics.md).
 
 ---
