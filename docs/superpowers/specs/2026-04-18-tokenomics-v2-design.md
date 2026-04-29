@@ -262,7 +262,7 @@ Modified contracts:
 
 Work is done when:
 
-1. `FeeRouter`, `VotingEscrow`, `VestingWithAutoLock` are deployed, unit-tested, and integration-tested against a local Arbitrum fork with representative channel-settlement load.
+1. `FeeRouter`, `VotingEscrow`, `VestingWithAutoLock` are deployed, unit-tested, and integration-tested against a local fork of the canonical L2 (per [ADR 021](../../../adr/021-l2-chain-selection.md)) with representative channel-settlement load.
 2. `PaymentChannel.settleChannel` routes to `FeeRouter.routeSettlement` in a single transaction; operator receives 80% in the same tx; remaining splits land in the correct contracts.
 3. Governance change to router splits requires 48h timelock and enforces the min/max bounds in Section 2.2.
 4. ve-locker `claim(epochs[])` correctly computes pro-rata share from historical ve-balance snapshots; unclaimed epochs past 26-week window sweep to treasury.

@@ -290,14 +290,14 @@ Modified contracts:
 4. **Cold-start fairness.** Should new operators receive a one-time ve-equivalent grant to avoid the Case-A cold-start penalty? Could be funded from bootstrap subsidies. Product/UX concern.
 5. **Byte-counter manipulation watchtower.** Is an off-chain monitoring service needed to detect self-settlement patterns? Defer to watchtower ADR (007).
 6. **Operator withdrawal UX.** Operators must call `claimBoost(epochs[])` to receive boost-pool share. Batching across multiple epochs is supported; frequency-vs-gas tradeoff is operator choice. Should the protocol auto-claim for operators via a keeper? Nice-to-have.
-7. **Per-operator gas overhead.** Per-settlement byte-counter increment adds ~5K–15K gas. At 100K settlements/year for a medium operator, that's $8–$1500/yr in gas on Arbitrum. Acceptable but worth measuring.
+7. **Per-operator gas overhead.** Per-settlement byte-counter increment adds ~5K–15K gas. At 100K settlements/year for a medium operator, that's $8–$1500/yr at typical L2 gas prices. Acceptable but worth measuring.
 8. **Governance of `boostFloor`.** A low value encourages ve-locking (harsh penalty for non-lockers) but may scare off commodity operators. A high value is operator-friendly but weakens the mechanism. Default 0.4 matches Curve; other values defensible.
 
 ---
 
 ## 8. Acceptance criteria for implementation
 
-1. `FeeRouter`, `VotingEscrow`, `VestingWithAutoLock` are deployed, unit-tested, and integration-tested against a local Arbitrum fork with representative channel-settlement load.
+1. `FeeRouter`, `VotingEscrow`, `VestingWithAutoLock` are deployed, unit-tested, and integration-tested against a local fork of the canonical L2 (per [ADR 021](../../../adr/021-l2-chain-selection.md)) with representative channel-settlement load.
 2. `PaymentChannel.settleChannel` routes to `FeeRouter.routeSettlement(operator, bytesDelivered, amount)` in a single transaction; operator receives 40% base in the same tx.
 3. Per-epoch `bytes_delivered[operator]` is correctly accumulated; resets at epoch rollover.
 4. `claimBoost(epochs[])` correctly computes `working_bytes` using the Curve formula and snapshotted ve-balance; payout matches expected share.
