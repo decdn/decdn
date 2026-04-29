@@ -11,21 +11,9 @@
 
 [ADR 026](026-gauge-boost-tokenomics.md) §4 defines `VotingEscrow` as a non-transferable, no-early-exit ve-position contract modeled on veCRV. The design is deliberate: a strict commitment device couples governance weight and gauge-boost yield to a multi-year capital lockup. The cost is illiquidity — once TOKEN enters a ve-lock, the only release path is the lock's natural decay to expiry.
 
-Curve Finance's veCRV experience is the canonical case study for what happens when an illiquid commitment device meets a market that wants liquidity:
+Third-party liquid wrappers historically capture 30–50% of ve-supply on illiquid commitment devices (Convex/veCRV reached ~50% within 18 months; Votium and Aura play similar roles for cvxCRV and veBAL). Wrapper holders trade governance influence to a third party for liquidity; the wrapper economy — issuance fees, bribe revenue, secondary spreads — accrues outside the issuing DAO. For deCDN this is a structural risk to ADR 026: governance capture (third-party wrapper concentrates §9 voting weight outside the DAO), wrapper-economy leakage (revenue accrues to the wrapper protocol), first-mover lock-in (Curve hasn't displaced Convex in four years).
 
-- **Convex Finance** launched a liquid wrapper (`cvxCRV`) on top of veCRV positions, accepting CRV deposits, locking them at maximum duration on a pooled basis, and issuing transferable cvxCRV at a 1:1 ratio.
-- **Votium** built a vote-bribe market on top of cvxCRV's pooled voting power.
-- **Aura** plays the same role for Balancer's veBAL.
-
-Within ~18 months of veCRV launching, Convex held roughly 50% of veCRV supply. Wrapper holders trade governance influence to a third party in exchange for liquidity; the third party then directs gauge votes (and accepts bribes for them). The wrapper economy — wrapper-issuance fees, bribe revenue, secondary-market spreads — accrues entirely outside the issuing protocol's DAO.
-
-For deCDN this is a structural risk to ADR 026:
-
-1. **Governance capture.** A third-party wrapper holding 30–50% of veTOKEN concentrates ADR 026 §9 voting weight outside the deCDN DAO. The §11 safety bounds bound parameter changes but do not bound which gauges, payouts, or program directives the captured weight can push through.
-2. **Wrapper-economy leakage.** Wrapper deposit fees, bribe markets, and liquidity-mining rewards become revenue for the wrapper protocol, not the deCDN DAO that built the gauge system.
-3. **First-mover lock-in.** Once a third-party wrapper has liquidity depth and brand, displacing it is hard — Curve has not displaced Convex despite four years of trying.
-
-[ADR 026](026-gauge-boost-tokenomics.md) §Risks flags this as "Convex-capture risk" and forward-references this ADR as a priority-1 follow-up. The [gauge-boost design spec §2.3](../docs/superpowers/specs/2026-04-18-tokenomics-v2-gauge-boost-design.md) ("Liquid-ve wrapper consideration") and the [survival-additions spec §3](../docs/superpowers/specs/2026-04-19-tokenomics-v2-survival-additions.md) ("Native liquid-ve wrapper — don't let Convex eat your governance") both recommend the same defensive move: ship a *native* liquid wrapper under DAO control before a third party ships one outside it.
+[ADR 026](026-gauge-boost-tokenomics.md) §Risks flags this as "Convex-capture risk" and forward-references this ADR as priority-1. The defensive move (per design-spec §2.3 and survival-additions §3): ship a *native* liquid wrapper under DAO control before a third party ships one outside it.
 
 The reference implementation is Frax's `sfrxETH`: an ERC-20 wrapper around an internally-pooled illiquid yield-bearing position, with appreciation-based exchange rate evolution and no protocol-level redemption (secondary-market exit only). The Frax model captures the wrapper-economy economics inside the issuing DAO, defends against third-party capture, and gives users a liquid asset without breaking the underlying commitment device.
 
@@ -96,25 +84,11 @@ The exchange rate is read via `convertToAssets(sveAmount) → tokenAmount` and `
 1. **Secondary-market sale.** Sell sveTOKEN for TOKEN (or USDC) on a Balancer V3 / Curve / DEX pool. Market price is whatever the AMM pays — usually below `convertToAssets` (the implied "fair" rate), because the underlying TOKEN is genuinely locked for up to 4 years.
 2. **Hold to natural decay and redeem.** Once the pooled `VotingEscrow` lock expires (only happens if `SveToken` stops extending it — see §6 termination clause), `SveToken` enters a wind-down state: depositors can no longer mint, and any sveTOKEN holder can call `redeemAfterExpiry(sveAmount)` to claim their pro-rata share of the underlying TOKEN at the post-expiry exchange rate. This is the only direct-from-protocol exit, and it is unavailable while the wrapper is in normal operation (which it always is, by §6 design).
 
-**Why no protocol-level redemption?** A redemption path either:
-
-- Forces an early-exit penalty path inside `VotingEscrow` (which [ADR 026](026-gauge-boost-tokenomics.md) §4 explicitly forbids — "Early exit: None"), or
-- Backs redemptions with a TOKEN reserve (which means the wrapper holds liquid TOKEN that is not earning ve-yield, defeating the wrapper's purpose), or
-- Uses a queue-and-wait model where redeemers are paid out from new deposits (which is just an internal secondary market with worse UX than a Balancer pool).
-
-Frax `sfrxETH` and `cvxCRV` both reach the same conclusion: no protocol redemption, secondary-market exit only. We follow.
+**Why no protocol-level redemption?** Any redemption path either breaks the [ADR 026](026-gauge-boost-tokenomics.md) §4 "no early exit" invariant, holds a non-yielding TOKEN reserve that defeats the wrapper, or becomes an internal secondary market worse than a Balancer pool. Frax `sfrxETH` and `cvxCRV` both reach the same conclusion.
 
 ### 5. Lock-duration policy
 
-The pooled `VotingEscrow` lock is maintained at **maximum duration (4 years), rolling**. Two extension cadences are viable:
-
-| Cadence | When extension fires | Tradeoff |
-| --- | --- | --- |
-| **Per epoch** (default) | Once per 7-day epoch, called by a keeper or any caller | Lock duration drops by at most 1 week between extensions; ve-balance decay is bounded; cheap and predictable gas |
-| **Per deposit** | On every `deposit(amount)` call | Lock duration is always exactly 4 years immediately after a deposit; deposit gas higher; quiet periods see longer ve-balance decay |
-| **Hybrid** | Per deposit + per-epoch keeper as a backstop | Best ve-balance preservation; highest contract complexity |
-
-**Default: per-epoch keeper extension, with an opportunistic refresh inside `deposit` if the current lock has more than 1 week of decay since last extension.** This caps ve-balance decay at ~0.05% (1 week / 4 years) between extensions, which is below the noise floor of weekly delegator-pool yield variation.
+The pooled `VotingEscrow` lock is maintained at **maximum duration (4 years), rolling**. Default cadence: per-epoch keeper extension with an opportunistic refresh inside `deposit` when the lock has more than 1 week of decay since last extension. Caps ve-balance decay at ~0.05% (1 week / 4 years) between extensions — below the weekly delegator-pool yield variance.
 
 **Termination clause.** Governance can vote to stop extensions (a wind-down vote per [ADR 009](009-governance.md)). The pooled lock then decays to expiry over up to 4 years; deposits are disabled at the vote-execution timestamp; sveTOKEN remains transferable; `redeemAfterExpiry` activates after lock-decay completion.
 
@@ -148,24 +122,7 @@ A small deposit fee captures wrapper-economy value for the DAO treasury rather t
 | Wind-down vote outcome | Stop-extensions only | — | — | Yes | Per [ADR 009](009-governance.md) governance flow |
 | Vote-mirroring policy | Deferred to ADR 028.1 | — | — | Yes | Sub-ADR governs the multisig's casting rules |
 
-### 6.2 External interfaces (informative)
-
-The contract surface that downstream code will see (signatures shown for reference; final ABI lands with the implementation, not this ADR):
-
-```
-function deposit(uint256 tokenAmount) external returns (uint256 sveAmount);
-function harvestAndCompound(uint256[] calldata epochs) external returns (uint256 harvested);
-function convertToAssets(uint256 sveAmount) external view returns (uint256 tokenAmount);
-function convertToShares(uint256 tokenAmount) external view returns (uint256 sveAmount);
-function exchangeRate() external view returns (uint256 wadRate); // 1e18-scaled
-function redeemAfterExpiry(uint256 sveAmount) external returns (uint256 tokenAmount); // post-decay only
-event Deposit(address indexed from, uint256 tokenAmount, uint256 sveAmount, uint256 haircutAmount);
-event Compound(uint256 harvested, uint256 newUnderlyingBalance, uint256 newExchangeRate);
-event WindDownInitiated(uint256 expiryTimestamp);
-event RedeemAfterExpiry(address indexed to, uint256 sveAmount, uint256 tokenAmount);
-```
-
-`deposit` and `harvestAndCompound` are permissionless. `redeemAfterExpiry` is gated on the wrapper being in wind-down state (§5 termination clause) **and** the pooled lock having decayed past expiry. Wind-down is initiated only by Governor via Timelock per [ADR 009](009-governance.md). No other entry points mint, burn, or move the underlying TOKEN.
+**Entry-point shape (informative).** ERC-4626-style: `deposit`, `harvestAndCompound`, and the `convertToAssets` / `convertToShares` / `exchangeRate` views are permissionless. `redeemAfterExpiry` is gated on wind-down + post-decay; wind-down is Governor + Timelock only ([ADR 009](009-governance.md)). No other entry point mints, burns, or moves the underlying TOKEN. Final ABI lands with the implementation, not this ADR.
 
 ### 7. Governance pass-through
 
@@ -210,16 +167,12 @@ The exact pool seeding parameters (size, weights, fee tier) are **out of scope f
 
 ### 10. Risks specific to wrapper design
 
-| Risk | Mechanism | Severity | Mitigation |
-| --- | --- | --- | --- |
-| **De-peg risk (downside)** | sveTOKEN trades below `convertToAssets` on the secondary market — the standard liquid-staked-token discount | High likelihood, low-medium impact | Expected behavior, not pathological. Frax `sfrxETH` typically trades 0.5–2% below `convertToAssets`; cvxCRV has historically traded 5–25% below CRV. DAO seeds POL to keep the discount tight |
-| **De-peg risk (cascade)** | A large sveTOKEN holder dumps; the secondary pool moves; other holders panic-sell; discount widens; arbitrage doesn't close because there is no protocol redemption | Low-medium likelihood, high impact | Per-epoch liquidity caps on the sveTOKEN/TOKEN pool (per [ADR 018](018-liquidity-strategy.md) MEV-cap pattern); DAO POL absorbs at the pool's fair-value side; communications protocol around expected discount range |
-| **Contagion to TOKEN price** | sveTOKEN discount widens → secondary-market arbitrage involves selling TOKEN → TOKEN price drops → ve-lock value drops → compound case-B from [ADR 026](026-gauge-boost-tokenomics.md) §Risks | Medium likelihood, medium impact | Same set of POL / liquidity-cap defenses as the [ADR 018](018-liquidity-strategy.md) buyback flow; the [ADR 029](029-adaptive-fee-router.md) price-floor feedback hook provides an automatic counter-pressure |
-| **Governance capture by large sveTOKEN holders** | A whale accumulates sveTOKEN, then pressures the DAO multisig (Option B in §7) into mirroring their preferred votes | Medium likelihood, high impact | The vote-mirroring policy is the primary defense; sub-ADR specifies whether mirroring is "share-weighted" (whale wins) or "snapshot-weighted with caps" (whale capped); reserve right to publicly disregard a hostile mirror |
-| **Auto-compound griefing** | Adversary spams `harvestAndCompound` with zero pending yield, draining the `compoundTip` over time | Low likelihood, low impact | `compoundTip` is paid only on actual harvested amounts (`tip = compoundTip × harvested`, not flat); zero-harvest calls cost the caller gas without paying out |
-| **Oracle / mispricing scenarios** | An on-chain oracle misreads sveTOKEN value, a downstream protocol uses sveTOKEN as collateral at the wrong price | Low likelihood (no v1 collateral integrations), high impact if realized | Out of scope for v1 (wrapper is not collateral-eligible anywhere by default); document the risk for downstream protocols |
-| **Wind-down failure** | Governance votes wind-down but a contract bug prevents `redeemAfterExpiry` | Very low likelihood, very high impact | `redeemAfterExpiry` is in the v1 contract from day one and is exercised in tests via shortened-lock fixtures; emergency-multisig pause does not affect post-decay redemption (it is a one-shot withdraw) |
-| **Unbounded recompounding gas** | Pool of yield grows large; per-epoch `harvestAndCompound` runs into block gas limits | Low likelihood, low impact | `harvestAndCompound` accepts an `epochs[]` array and processes in chunks; permissionless callers can split work across multiple transactions |
+| Risk | Mitigation |
+| --- | --- |
+| **Persistent secondary-market discount** (the wrapper's signature failure mode; ~0.5–2% on Frax sfrxETH, historically 5–25% on cvxCRV) | DAO POL seed; per-epoch liquidity caps inheriting [ADR 018](018-liquidity-strategy.md) defenses; documented expected-discount range |
+| **Cascade depeg** (large dump → discount widens → no protocol redemption to arbitrage) | Per-epoch caps; POL absorbs fair-value side; wind-down is the structural escape valve |
+| **Contagion to TOKEN price** (depeg arbitrage routes through TOKEN) | Same POL/cap defenses as [ADR 018](018-liquidity-strategy.md); [ADR 029](029-adaptive-fee-router.md) price-floor hook provides automatic counter-pressure |
+| **Governance capture via Option B multisig** (whale accumulates sveTOKEN to pressure mirror policy) | Vote-mirroring policy specifies whether mirroring is share-weighted or capped; reserve the right to disregard a hostile mirror |
 
 ---
 
@@ -227,27 +180,23 @@ The exact pool seeding parameters (size, weights, fee tier) are **out of scope f
 
 ### Positive
 
-- **Convex-capture defense.** A native wrapper exists before a third party ships one. Wrapper-economy revenue (deposit haircut, future bribe-mediation fees) accrues to the deCDN DAO. Governance weight stays inside the DAO via Option B vote-mirroring.
-- **User liquidity without breaking the commitment device.** Holders gain a tradeable token; the underlying lock is untouched; [ADR 026](026-gauge-boost-tokenomics.md)'s "no early exit" invariant is preserved.
-- **Treasury revenue stream.** The 0.10% deposit haircut compounds with deposit volume. Modest in absolute terms but a non-zero recurring USD-denominated TOKEN flow to the treasury, separate from the [ADR 026](026-gauge-boost-tokenomics.md) §2 router buckets.
-- **Auto-compounding raises effective ve-locker yield.** sveTOKEN holders effectively receive the auto-compound benefit that direct ve-lockers must DIY. This is the v3 model's "real yield in TOKEN" lever (per [ADR 026](026-gauge-boost-tokenomics.md) §6) packaged for passive holders.
-- **Frax sfrxETH precedent.** The reference implementation has run for 2+ years at $400M+ TVL with no exploits and a tight ~1% discount band. Audit playbook is well-developed.
+- **Convex-capture defense.** Native wrapper exists before a third party ships one; wrapper-economy revenue accrues to the DAO; governance weight stays inside via Option B vote-mirroring.
+- **Liquidity without breaking the commitment device.** Underlying lock is untouched; [ADR 026](026-gauge-boost-tokenomics.md) §4 "no early exit" invariant preserved.
+- **Auto-compounded delegator-pool yield** (the v3 "real yield in TOKEN" lever) packaged for passive holders.
+- **Mature precedent.** Frax sfrxETH has 2+ years at $400M+ TVL with a tight ~1% discount band; audit playbook is known.
 
 ### Negative
 
-- **Significant new contract surface.** `SveToken` proxy + implementation, vote-mirroring policy contract or multisig integration, possibly a `DelegatorClaimAdapter` if `FeeRouter.claimDelegator` is not directly callable by `SveToken`. Each is small individually; together they expand audit scope by ~30–40% over [ADR 026](026-gauge-boost-tokenomics.md)'s already-larger-than-ADR-004 contract surface.
-- **Operational burden.** Compound keepers, deposit-flow monitoring, secondary-market discount tracking, vote-mirroring policy execution. Not contract-level burden but DAO-process burden.
-- **Discount UX.** Users will be confused that `1 sveTOKEN ≠ 1 TOKEN` on the open market even though `convertToAssets(1 sveTOKEN) ≥ 1 TOKEN`. Documentation, dashboards, and front-end displays must explain the discount and the appreciation rate clearly.
-- **Concentration of governance weight via Option B multisig.** Even with vote-mirroring policy, the multisig is a focal point for capture attempts. Mitigated by the multisig being a [ADR 009](009-governance.md) emergency-multisig topology with limited unilateral authority.
-- **Two competing ve-products.** Direct ve-lockers (governance + delegator-pool yield + gauge-boost yield, illiquid) and sveTOKEN holders (governance via mirror + delegator-pool yield via auto-compound, liquid). Differentiation is gauge-boost-yield: only direct ve-lockers can capture the §3 boost (because only they are operators). Documentation must not imply sveTOKEN replaces direct ve-locking for operators.
+- **New contract surface.** `SveToken` proxy + implementation + vote-mirroring policy expands [ADR 026](026-gauge-boost-tokenomics.md) audit scope ~30–40%.
+- **Operational burden.** Compound keepers, discount tracking, mirror-policy execution.
+- **Discount UX.** Users may conflate `1 sveTOKEN` with `1 TOKEN`; dashboards must surface `convertToAssets` and the appreciation rate.
+- **Two competing ve-products** (direct ve-lockers vs. sveTOKEN holders). Differentiation is gauge-boost yield: only direct ve-lockers capture it. Documentation must not imply sveTOKEN replaces direct ve-locking for operators.
 
 ### Risks
 
-- **Liquid wrapper depeg risk.** Persistent secondary-market discount is the wrapper's signature failure mode. Frax handles it with auto-compounding and tight POL; cvxCRV historically didn't, and trades at a structural 5–25% discount. Our defenses (auto-compound + POL + per-epoch caps) lean toward the Frax pattern. If the discount widens past ~5% sustainedly, governance has the option to invoke wind-down (§5 termination clause).
-- **sveTOKEN→TOKEN price contagion.** A wide sveTOKEN discount creates arbitrage flows that move the underlying TOKEN price. The sveTOKEN/TOKEN pool's per-epoch caps bound the per-epoch contagion volume, but a multi-epoch drawdown is possible. Compounds with [ADR 026](026-gauge-boost-tokenomics.md) §Risks "Reflexive bootstrap intensified at the operator-margin layer" — a sveTOKEN depeg could intensify operator-margin pressure during a TOKEN drawdown.
-- **Protocol-complexity tax.** Each additional yield-routing contract is one more thing to audit, monitor, upgrade, and explain. The [ADR 026](026-gauge-boost-tokenomics.md) §Negative "Higher contract surface than ADR 004" remark applies again, compounded. The deferred ship date (within 6 months of mainnet) is partly a tax-amortization choice.
-- **Vote-mirroring-policy capture.** The mirror policy is the entire defense against Option B becoming a single-point-of-failure for governance. Sub-ADR (provisionally 028.1) is required before sveTOKEN ships.
-- **Wrapper-on-wrapper risk.** Once sveTOKEN exists, third parties may build wrappers on sveTOKEN itself (a "Convex on the deCDN-Convex"). The defense is the same: native sveTOKEN should be liquid and useful enough that a third-party wrapper-of-wrapper doesn't add value. If it does, that's a v3 problem.
+- **Wrapper depeg.** Sustained secondary-market discount is the wrapper's signature failure mode (Frax: 0.5–2%, cvxCRV: 5–25% structurally). Defenses (auto-compound + POL + per-epoch caps) lean Frax; if the discount widens past ~5%, governance can invoke wind-down.
+- **sveTOKEN→TOKEN contagion.** Depeg arbitrage routes through TOKEN; per-epoch caps bound per-epoch volume but multi-epoch drawdowns are possible. Compounds with [ADR 026](026-gauge-boost-tokenomics.md) §Risks "Reflexive bootstrap intensified".
+- **Vote-mirroring capture.** The mirror policy is the only defense against Option B becoming a governance single-point-of-failure. Sub-ADR (provisionally 028.1) is a hard prerequisite.
 
 ---
 

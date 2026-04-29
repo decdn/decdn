@@ -63,97 +63,27 @@ clamped, observable, and disable-able.
 
 ### 1. Lock-rate feedback hook
 
-**Read source.** The underlying TOKEN balance locked in `VotingEscrow` —
-canonically `TOKEN.balanceOf(address(VotingEscrow))` — and the live TOKEN supply
-counter. No oracle. The lock rate is computed as
-`token_locked_underlying / token_circulating_supply`, where the numerator is
-underlying TOKEN held by the escrow contract, **not** the time-weighted
-ve-supply from `VotingEscrow.totalSupplyAt(...)`. The two have different units;
-using ve-supply would mis-fire the 15% / 50% thresholds because ve-balance
-decays linearly to lock expiry while the threshold is intended to track "% of
-circulating TOKEN that is currently committed". The same underlying-locked
-definition is exposed as the `decdn_ve_lock_rate` metric per [ADR 020](020-observability.md#210-tokenomics-v3-metrics).
-(Implementation note: the denominator is the live TOKEN total supply minus
-burned and minus locked contract reserves — fully on-chain, no off-chain feed.)
-
-**Action.** At epoch rollover, the controller reads the lock rate and applies
-the table below to the next epoch's router shares:
+Read `token_locked_underlying / token_circulating_supply` from `TOKEN.balanceOf(VotingEscrow)` and the live supply (no oracle; matches the `decdn_ve_lock_rate` metric in [ADR 020](020-observability.md)). At epoch rollover:
 
 | Lock rate window | Next-epoch shift | Direction |
 | --- | --- | --- |
-| `< 15%` | +2 pp | from `treasury` → `delegator` |
+| `< 15%` | +2 pp | `treasury` → `delegator` |
 | `15% ≤ rate ≤ 50%` | none | (steady state) |
-| `> 50%` | +2 pp | from `delegator` → `treasury` |
+| `> 50%` | +2 pp | `delegator` → `treasury` |
 
-**Rationale.** Below 15%, the system needs a stronger ve-locker incentive — the
-delegator pool's TOKEN-denominated yield is the cleanest "lock more TOKEN"
-signal. Above 50%, the system is over-locked and the marginal pp is more useful
-in treasury (working capital, ecosystem grants, runway) than in further
-incentivising lockers who are already saturated. The thresholds (15% / 50%)
-were the recommendation in the source design spec §2.7 and the survival-
-additions §6; production tuning is governance-adjustable per §3 below.
-
-**Hysteresis.** To prevent flipping when the lock rate sits exactly at a
-threshold:
-
-- The 15% activation requires `rate < 15%`; the deactivation (revert the +2 pp
-  to delegator) requires `rate ≥ 17%`. Two-percentage-point band.
-- The 50% activation requires `rate > 50%`; the deactivation requires
-  `rate ≤ 48%`. Two-percentage-point band.
-
-**Clamping.** Per [ADR 026](026-gauge-boost-tokenomics.md) §11, `treasury` is bounded
-`[0%, 20%]` and `delegator` is bounded `[0%, 30%]`. If a +2 pp shift would push
-either share outside its bound, the shift is reduced to whatever fits inside
-the bound (down to and including 0 pp). The controller emits an event when a
-shift is clamped so observers can detect saturation against the safety bounds.
+Thresholds per design spec §2.7. **Hysteresis:** 2 pp band on each threshold (revert at `≥ 17%` / `≤ 48%`). **Clamping:** shifts that would push `treasury` outside `[0, 20]` or `delegator` outside `[0, 30]` ([ADR 026](026-gauge-boost-tokenomics.md) §11) are reduced to fit (down to 0 pp); clamping events are emitted.
 
 ### 2. Price-floor feedback hook
 
-**Read source.** 30-day TWAP of TOKEN against USDC on the Balancer V3 80/20
-pool already used for buyback ([ADR 018](018-liquidity-strategy.md)). No new
-oracle infrastructure; the TWAP window is identical to the burn-side guard
-window. Cross-reference [ADR 018](018-liquidity-strategy.md) §"Buyback execution
-via Balancer V3" for the per-epoch liquidity cap and `subSwapMinBlockGap`
-machinery this hook reuses.
-
-**Action.** At epoch rollover, the controller reads TWAP. If TWAP is below the
-governance-set `priceFloor` (default `$0.01`, governable; see §3), the
-controller shifts +2 pp from `treasury` → `burn` for the next epoch.
+Read 30-day TWAP from the Balancer V3 80/20 pool already trusted by [ADR 018](018-liquidity-strategy.md) (no new oracle).
 
 | TWAP state | Next-epoch shift | Direction |
 | --- | --- | --- |
-| `TWAP < priceFloor` | +2 pp | from `treasury` → `burn` |
-| `TWAP ≥ priceFloor + hysteresis` | revert (shift back) | from `burn` → `treasury` |
-| in-between | no change | (state held from prior epoch) |
+| `TWAP < priceFloor` | +2 pp | `treasury` → `burn` |
+| `TWAP ≥ priceFloor + hysteresis` | revert | `burn` → `treasury` |
+| in-between | no change | (state held) |
 
-**Hysteresis.** Default hysteresis = `priceFloor × 10%` (i.e., at default floor
-$0.01, the revert threshold is $0.011). Governance-adjustable per §3. The
-explicit hysteresis prevents single-epoch flicker around the floor and makes
-the hook trivially auditable from on-chain state.
-
-**Clamping.** Per [ADR 026](026-gauge-boost-tokenomics.md) §11, `treasury` is bounded
-`[0%, 20%]` and `burn` is bounded `[0%, 25%]`. The +2 pp shift is clamped to
-whatever fits inside both bounds simultaneously; if either bound binds, the
-shift reduces accordingly (down to 0 pp). Clamping events are emitted.
-
-**TWAP-manipulation defenses.** A 30-day TWAP is intrinsically expensive to
-manipulate but not free. Two additional defenses, both reusing
-[ADR 018](018-liquidity-strategy.md) infrastructure:
-
-- **Pool-depth cap.** If the Balancer V3 pool's USDC depth at the read moment
-  is below a governance-set `minPoolDepth` (default $250K), the price-floor
-  hook is **skipped for that epoch**. Thin pools are precisely where TWAP
-  manipulation is cheapest; skipping the adaptive shift in that regime is safer
-  than firing it.
-- **Read-window staleness guard.** The TWAP read MUST cover at least 24 of the
-  trailing 30 days of pool data; if the pool was paused or had insufficient
-  trade volume to populate the TWAP, the hook is skipped for that epoch (same
-  failure mode as a thin pool).
-
-The price-floor hook does not introduce a new oracle; it is a thin consumer of
-the Balancer V3 TWAP that [ADR 018](018-liquidity-strategy.md) already relies
-on for the buyback path's `minTokenOut` MEV guard. This ADR does not specify
-oracle implementation beyond that.
+Default `priceFloor = $0.01`, hysteresis = 10% of floor (governable per §3). **Clamping:** as §1, against `treasury [0, 20]` and `burn [0, 25]`. **TWAP-manipulation defenses:** skip the hook for an epoch if pool USDC depth is below `minPoolDepth` (default $250K) or if the TWAP read fails to cover at least 24 of the trailing 30 days. Both reuse [ADR 018](018-liquidity-strategy.md) infrastructure.
 
 ### 3. Hook parameters
 
@@ -191,74 +121,15 @@ fires do not retroactively apply.
 
 ### 5. Governance interaction (vote always wins)
 
-The adaptive hooks operate **strictly within** the bounds set by
-[ADR 026](026-gauge-boost-tokenomics.md) §11. Governance retains all of:
-
-| Override | Mechanism | Effect |
-| --- | --- | --- |
-| Disable a single hook | Governance vote on `setHookEnabled(hook, false)` | Hook's epoch evaluation becomes a no-op until re-enabled |
-| Adjust hook parameters | Governance vote (table in §3) within outer bounds | Next-epoch evaluation uses new parameters |
-| Override an adaptive shift | Governance vote on the underlying `FeeRouter` shares | Vote always wins; subsequent hook fires evaluate against the new baseline |
-| Pause both hooks (emergency) | Emergency-multisig pause per [ADR 009](009-governance.md) | Hooks halted under the standard pause-deadline sunset |
-| Disable both hooks permanently | Governance vote on `setControllerEnabled(false)` | Controller becomes a no-op; underlying `FeeRouter` reverts to manual governance only |
-
-Two consequences of this design worth surfacing:
-
-- **The adaptive hook never violates the §11 safety bounds.** If a shift
-  would, it is clamped to the bound (potentially down to a 0-pp no-op). The
-  outer governance safety envelope is unchanged by this ADR.
-- **The vote always wins.** A direct governance update to the underlying
-  `FeeRouter` shares takes effect in the next-epoch settlement. The next hook
-  evaluation reads the new state and decides whether to apply a shift on top.
-  There is no path where the adaptive hook can "undo" a governance decision
-  within a single epoch — they compose by evaluation order, not by override.
+Each hook is individually disable-able (`setHookEnabled`), parameter-tunable, and pause-able (emergency multisig per [ADR 009](009-governance.md)); the controller is wholesale disable-able (`setControllerEnabled(false)`). Direct governance shares-updates take effect in the next-epoch settlement and the next hook evaluation reads the new baseline — vote always wins by evaluation order, not by override. The adaptive shifts never violate [ADR 026](026-gauge-boost-tokenomics.md) §11 (clamped to bounds, down to 0-pp if necessary).
 
 ### 6. Implementation
 
-A new `AdaptiveFeeRouterController` contract reads `VotingEscrow` and the
-Balancer V3 TWAP, computes the per-epoch shifts, and applies them via a
-privileged path on `FeeRouter` (`applyAdaptiveShift(deltaTreasuryToDelegator,
-deltaTreasuryToBurn)`). Equivalent: methods on `FeeRouter` itself — choice
-deferred to implementation review. Either way:
-
-- The privileged path checks both proposed shifts against §11 bounds and
-  reverts if the resulting shares would violate a bound (the controller is
-  expected to clamp first, but the contract enforces the invariant).
-- Every shift (including a clamped 0-pp no-op caused by hysteresis or bound
-  saturation) emits an event: `AdaptiveShift(epoch, hook, requestedDelta,
-  appliedDelta, reason)`. Observers MUST be able to reconstruct the shift
-  history from on-chain logs alone.
-- The sum-to-100% invariant on the six router shares is preserved: every
-  applied shift moves N pp from one bucket to another, leaving the sum
-  unchanged.
-- The price-floor read uses the same Balancer V3 oracle helper the
-  [ADR 018](018-liquidity-strategy.md) buyback path uses for `minTokenOut`;
-  no new oracle code, no new audit surface for the price feed itself.
+A new `AdaptiveFeeRouterController` (or methods on `FeeRouter` itself — choice deferred) reads `VotingEscrow` and the Balancer V3 TWAP, computes per-epoch shifts, and applies them via a privileged path on `FeeRouter`. The privileged path enforces the §11 bounds (the controller clamps first, the contract reverts on violation) and the sum-to-100% invariant on the six router shares. Every shift — including 0-pp no-ops from hysteresis or bound saturation — emits `AdaptiveShift(epoch, hook, requestedDelta, appliedDelta, reason)` so observers can reconstruct history from logs alone.
 
 ### 7. Deferment rationale
 
-This ADR is **Draft, deferred** for three reasons:
-
-1. **Governance dynamics aren't observable yet.** The cadence question — "is
-   manual governance fast enough?" — has no pre-launch answer. Curve and
-   similar protocols ship adaptive hooks because their governance is provably
-   slow at scale; deCDN does not yet have data on its own timelock-vs-state
-   gap.
-2. **Adaptive logic introduces a new code path that can mis-fire.** TWAP
-   manipulation under thin liquidity, edge cases at threshold boundaries, and
-   keeper-failure regressions all require post-mainnet observation. Adding
-   them at v1 means auditing a code path the protocol may never need.
-3. **The §11 safety bounds are sufficient as a hard floor.** Even without
-   adaptive feedback, governance can rebalance within bounds via the standard
-   timelock path. The cost of "governance is slow" is recoverable; the cost of
-   "adaptive logic mis-fires under stress" is operationally noisy and harder
-   to roll back inside a single epoch.
-
-If, six months post-mainnet, ve-lock rate or TWAP excursions measurably
-out-pace governance response, this ADR moves from Draft (deferred) to Accepted
-and the controller is deployed. If not, it closes as Rejected with the
-[ADR 026](026-gauge-boost-tokenomics.md) §11 bounds + manual governance loop providing
-sufficient response surface.
+Drafted but **not deployed at v1**. Governance dynamics aren't observable yet; adaptive logic introduces a new code path that can mis-fire under stress (TWAP manipulation, threshold-edge stutter, keeper drift); the §11 safety bounds + manual governance are a sufficient hard floor for v1. If, six months post-mainnet, lock-rate or TWAP excursions measurably out-pace governance response, this ADR moves to Accepted and the controller deploys; otherwise it closes as Rejected.
 
 ---
 
@@ -266,91 +137,25 @@ sufficient response surface.
 
 ### Positive
 
-- **Faster response inside the §11 envelope.** Lock-rate excursions and
-  drawdown regimes get a 1-epoch (1-week) automatic response instead of a
-  multi-week timelocked vote, without bypassing any safety bound.
-- **Reuses existing infrastructure.** No new oracle, no new keeper class, no
-  new external trust — the lock-rate read is on-chain native; the TWAP read
-  uses the same Balancer V3 pool [ADR 018](018-liquidity-strategy.md) already
-  trusts.
-- **Preserves governance veto.** Per §5, every adaptive shift can be disabled,
-  re-parameterised, or overridden by direct vote. The hooks compose with
-  manual governance; they do not displace it.
-- **Tight bound discipline.** Every shift is clamped to the §11 bounds at the
-  contract layer; the adaptive hook cannot enlarge governance's reachable
-  state space, only respond inside it.
-- **Auditable.** Every shift (including no-op clamps and skips for thin-pool /
-  staleness guards) emits an event. Hook behaviour is reconstructable from
-  logs alone.
+- **1-epoch response inside the §11 envelope.** Lock-rate and drawdown excursions get an automatic response instead of multi-week timelocked votes, without enlarging governance's reachable state space.
+- **No new oracle or keeper class.** Lock-rate is on-chain native; TWAP reuses the [ADR 018](018-liquidity-strategy.md) pool; the controller fires from the existing buyback keeper.
+- **Auditable.** Every shift (incl. no-op clamps and thin-pool/staleness skips) emits an event; behaviour is reconstructable from logs alone.
 
 ### Negative
 
-- **Adds contract surface.** `AdaptiveFeeRouterController` (or equivalent
-  methods on `FeeRouter`) is new code. Audit burden on top of
-  [ADR 026](026-gauge-boost-tokenomics.md)'s already-expanded surface.
-- **Adds keeper responsibility.** The same keeper that drives buyback +
-  delegator swap also fires the controller. A new failure mode (controller
-  fires but cannot read TWAP; controller fires under thin pool depth) joins
-  the existing keeper-failure surface.
-- **Threshold parameters are reasoned defaults.** The 15% / 50% lock-rate
-  bands and the $0.01 price floor are guesses informed by the source design
-  spec, not data. Production tuning will likely be needed within the §3 outer
-  bounds.
-- **Hysteresis adds state.** The controller maintains a small state machine
-  (which side of which threshold each hook last triggered on) so the revert
-  semantics work. Minor but non-zero added storage and complexity.
-- **The "vote always wins" semantics need clear UI.** Operators and lockers
-  need a dashboard surface showing both the manual share state and the
-  active adaptive shift; otherwise the difference between "governance set
-  the share" and "the hook shifted it for this epoch" is invisible to users.
+- **New contract surface and keeper failure mode.** `AdaptiveFeeRouterController` plus a new "controller fires but read fails" failure class on top of [ADR 026](026-gauge-boost-tokenomics.md)'s expanded surface.
+- **Threshold defaults are reasoned guesses.** The 15% / 50% lock-rate bands and $0.01 price floor are pre-launch estimates; production tuning expected within §3 outer bounds.
+- **UI overhead.** Dashboards must distinguish "governance set this share" from "the hook shifted it this epoch", or users will conflate the two.
 
 ### Risks
 
-- **TWAP manipulation under thin pool depth.** A 30-day TWAP is expensive but
-  not free to manipulate, and a price-floor hook is a clear attack target if
-  pool depth is thin. The pool-depth cap (§2) skips the hook in exactly that
-  regime, but the calibration of `minPoolDepth` (default $250K) is a
-  reasoned guess. Mitigation: per-epoch liquidity cap from
-  [ADR 018](018-liquidity-strategy.md) bounds the maximum shift's market impact,
-  and the staleness guard skips the hook on suspicious read windows.
-  Residual risk: a sophisticated adversary trading at the floor over weeks to
-  cheaply move the TWAP. Acceptable post-launch monitoring target; explicit
-  reason for the deferment.
-- **Governance-bypass perception.** Even though §5 preserves the veto, the
-  hooks shift parameters without per-event vote. Sophisticated holders may
-  perceive this as governance dilution. Mitigation: explicit `setHookEnabled`
-  toggle, explicit clamping events, and a standing recommendation that the
-  hooks be **disabled by default at deployment** and turned on by an explicit
-  governance vote once dynamics are observable.
-- **Mis-fire under stress.** The most failure-prone window is exactly when
-  the hooks should be most useful: lock-rate at 14.9%, TWAP at $0.0099. Hook
-  stutter at thresholds, keeper drift, oracle staleness during an active
-  drawdown. The hysteresis band, the staleness guard, and the pool-depth cap
-  are designed to fail-safe (no-op) in these cases — the hook does nothing
-  rather than shift in the wrong direction. Confirm under chaos-test before
-  enabling in production.
-- **Composition surprise.** If governance moves shares manually in the same
-  epoch the controller fires, the adaptive shift composes on top (per §5).
-  The contract enforces sum-to-100% and per-share bounds, but the interaction
-  may surprise observers. Mitigation: `AdaptiveShift` events carry the
-  pre-shift baseline so observers can always reconstruct what the shift saw.
-- **Deferred adoption may not happen.** If post-launch governance is fast
-  enough, this ADR closes as Rejected. The drafting cost is small; the
-  alternative (shipping adaptive hooks at v1 without observability) is worse.
+- **TWAP manipulation under thin pools.** Pool-depth cap and staleness guard skip the hook in exactly that regime, but `minPoolDepth = $250K` is a reasoned guess. Residual: sustained-floor trading to cheaply move the 30-day TWAP — explicit reason for the deferment.
+- **Governance-bypass perception.** Recommended deployment posture: hooks **disabled by default**, turned on by explicit vote once dynamics are observable.
+- **Mis-fire at the threshold edge** (lock-rate at 14.9%, TWAP at $0.0099). The hysteresis band + staleness guard + pool-depth cap are designed to fail-safe (no-op) rather than shift in the wrong direction. Chaos-test before enabling.
+- **Deferred adoption may not happen.** If post-launch governance is fast enough, this ADR closes as Rejected — drafting cost is small.
 
 ---
 
 ## Forward references
 
-This ADR depends on no follow-up ADRs. Its dependencies — `FeeRouter`,
-`VotingEscrow`, the Balancer V3 80/20 pool, the §11 safety bounds — are all
-defined in [ADR 026](026-gauge-boost-tokenomics.md), [ADR 018](018-liquidity-strategy.md),
-and [ADR 009](009-governance.md). The keeper class is the existing buyback
-keeper from [ADR 018](018-liquidity-strategy.md).
-
-If adopted, this ADR adds a new contract (`AdaptiveFeeRouterController`) or a
-set of methods on `FeeRouter`; either way [ADR 016](016-contract-interactions.md)
-is updated to register the new surface, and [ADR 020](020-observability.md) is
-updated to expose the new metrics (lock rate, TWAP read, last-shift event,
-clamp counters). Both updates are deferred until this ADR moves out of
-deferred status.
+No follow-up ADRs. Dependencies — `FeeRouter`, `VotingEscrow`, the Balancer V3 80/20 pool, §11 safety bounds — already exist in [ADR 026](026-gauge-boost-tokenomics.md), [ADR 018](018-liquidity-strategy.md), [ADR 009](009-governance.md). On adoption, [ADR 016](016-contract-interactions.md) and [ADR 020](020-observability.md) update to register the new surface and metrics; both updates wait for this ADR to move out of deferred status.
