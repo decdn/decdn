@@ -12,7 +12,7 @@ pub const MAX_PROVIDER_ATTEMPTS: usize = 3;
 
 /// Reputation floor in the score denominator (ADR 001).
 #[allow(dead_code)]
-const REPUTATION_FLOOR: f64 = 0.1;
+const REPUTATION_FLOOR: f32 = 0.1;
 
 /// Score-equivalence threshold for tie-break activation (ADR 001 — "scores
 /// within 1% of each other").
@@ -48,4 +48,81 @@ pub struct Candidate {
 pub struct RankedCandidate {
     pub candidate: Candidate,
     pub score: f64,
+}
+
+/// Compute the unified selection score (ADR 001). Lower is better.
+///
+/// `score = rate_per_mb × rtt_ms × (1 / max(reputation, 0.1)²)`
+///
+/// Reputation is clamped to [`REPUTATION_FLOOR`] before squaring; this both
+/// prevents division by zero and caps the worst-case multiplier at 100×.
+#[allow(dead_code)]
+#[allow(clippy::cast_precision_loss)]
+// f64 has 53-bit mantissa; ULP-level imprecision on huge u64 rates does not
+// affect ordering decisions here.
+fn compute_score(rate_per_mb: u64, rtt_ms: u32, reputation: f32) -> f64 {
+    let rate = rate_per_mb as f64;
+    let rtt = f64::from(rtt_ms);
+    let rep_clamped = reputation.max(REPUTATION_FLOOR);
+    let rep = f64::from(rep_clamped);
+    rate * rtt / (rep * rep)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::float_cmp)]
+mod tests {
+    use super::*;
+
+    // ADR 001 multiplier table: rep=1.0 → 1×, 0.8 → 1.56×, 0.5 → 4×, 0.3 → 11.1×, 0.1 → 100×.
+
+    #[test]
+    fn score_reputation_1_0_is_baseline() {
+        let s = compute_score(100, 10, 1.0);
+        assert!((s - 1000.0).abs() < 1e-9, "got {s}");
+    }
+
+    #[test]
+    fn score_reputation_0_5_is_4x_baseline() {
+        let baseline = compute_score(100, 10, 1.0);
+        let s = compute_score(100, 10, 0.5);
+        assert!(
+            (s / baseline - 4.0).abs() < 1e-3,
+            "got ratio {}",
+            s / baseline
+        );
+    }
+
+    #[test]
+    fn score_reputation_0_1_is_100x_baseline() {
+        let baseline = compute_score(100, 10, 1.0);
+        let s = compute_score(100, 10, 0.1);
+        assert!(
+            (s / baseline - 100.0).abs() < 1e-3,
+            "got ratio {}",
+            s / baseline
+        );
+    }
+
+    #[test]
+    fn score_reputation_0_0_clamps_to_floor() {
+        let at_zero = compute_score(100, 10, 0.0);
+        let at_floor = compute_score(100, 10, 0.1);
+        assert!((at_zero - at_floor).abs() < 1e-9);
+    }
+
+    #[test]
+    fn score_negative_reputation_clamps_to_floor() {
+        // Defensive: ReputationEngine::score() returns f32 in [0,1], but if a
+        // bug produces a negative we must still not panic and must clamp.
+        let s = compute_score(100, 10, -0.5);
+        let at_floor = compute_score(100, 10, 0.1);
+        assert!((s - at_floor).abs() < 1e-9);
+    }
+
+    #[test]
+    fn score_handles_max_inputs_without_overflow() {
+        // u64::MAX × u32::MAX is well within f64 range (~1.6e28 < 1.8e308).
+        let s = compute_score(u64::MAX, u32::MAX, 1.0);
+        assert!(s.is_finite(), "got {s}");
+    }
 }
