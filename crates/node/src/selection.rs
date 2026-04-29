@@ -5,6 +5,7 @@
 //! result in order and stops after `MAX_PROVIDER_ATTEMPTS` failed providers.
 
 use decdn_protocol::gossip::LoadHint;
+use rand::RngExt;
 use std::collections::HashSet;
 
 /// Maximum providers to attempt before reporting a fetch failure to the
@@ -81,7 +82,7 @@ pub fn rank_candidates(candidates: Vec<Candidate>) -> Vec<RankedCandidate> {
 /// tests for deterministic random tie-breaking.
 fn rank_candidates_with_rng(
     candidates: Vec<Candidate>,
-    _rng: &mut impl rand::Rng,
+    rng: &mut impl rand::Rng,
 ) -> Vec<RankedCandidate> {
     let mut ranked: Vec<RankedCandidate> = candidates
         .into_iter()
@@ -91,7 +92,7 @@ fn rank_candidates_with_rng(
         })
         .collect();
     ranked.sort_by(|a, b| a.score.total_cmp(&b.score));
-    apply_tiebreaker(&mut ranked);
+    apply_tiebreaker(&mut ranked, rng);
     ranked
 }
 
@@ -99,7 +100,7 @@ fn rank_candidates_with_rng(
 /// ADR 008 §9 tie-break tiers. Geo diversity is stateful — once a region has
 /// been emitted to the output, candidates in unseen regions are preferred for
 /// the next pick within the current tie group.
-fn apply_tiebreaker(ranked: &mut Vec<RankedCandidate>) {
+fn apply_tiebreaker(ranked: &mut Vec<RankedCandidate>, rng: &mut impl rand::Rng) {
     let mut emitted_regions: HashSet<String> = HashSet::new();
     let mut output: Vec<RankedCandidate> = Vec::with_capacity(ranked.len());
 
@@ -113,7 +114,7 @@ fn apply_tiebreaker(ranked: &mut Vec<RankedCandidate>) {
             .get(start..end)
             .map_or_else(Vec::new, <[RankedCandidate]>::to_vec);
         while !group.is_empty() {
-            let pick_idx = pick_best_in_group(&group, &emitted_regions);
+            let pick_idx = pick_best_in_group(&group, &emitted_regions, rng);
             // pick_best_in_group always returns a valid index when the slice
             // is non-empty; defensive default is index 0.
             let pick = if pick_idx < group.len() {
@@ -130,9 +131,12 @@ fn apply_tiebreaker(ranked: &mut Vec<RankedCandidate>) {
 }
 
 /// Return the index in `group` of the candidate that wins the tie under the
-/// load → geo (relative to `emitted_regions`) → stake tiers. (Random tier
-/// lands in task 7.)
-fn pick_best_in_group(group: &[RankedCandidate], emitted_regions: &HashSet<String>) -> usize {
+/// load → geo (relative to `emitted_regions`) → stake → random tiers.
+fn pick_best_in_group(
+    group: &[RankedCandidate],
+    emitted_regions: &HashSet<String>,
+    rng: &mut impl rand::Rng,
+) -> usize {
     // Find candidates with the lowest load.
     let load_winner_load = group
         .iter()
@@ -162,9 +166,9 @@ fn pick_best_in_group(group: &[RankedCandidate], emitted_regions: &HashSet<Strin
         })
         .collect();
     let pool = if geo_pool.is_empty() {
-        &load_tied
+        load_tied.clone()
     } else {
-        &geo_pool
+        geo_pool
     };
 
     // Tier 3: higher stake wins. `None` is treated as the lowest possible
@@ -185,12 +189,16 @@ fn pick_best_in_group(group: &[RankedCandidate], emitted_regions: &HashSet<Strin
     let pool = if stake_pool.is_empty() {
         pool
     } else {
-        &stake_pool
+        stake_pool
     };
 
-    // Defensive: pool is non-empty if group is non-empty (load_tied always
-    // contains at least the candidate that supplied load_winner_load).
-    pool.first().copied().unwrap_or(0)
+    // Tier 4: random tie-break. Uniformly pick from the remaining pool.
+    if pool.is_empty() {
+        0
+    } else {
+        let idx = rng.random_range(0..pool.len());
+        pool.get(idx).copied().unwrap_or(0)
+    }
 }
 
 /// Return the exclusive end index of the tie group beginning at `start`.
@@ -228,6 +236,7 @@ fn compare_load(a: LoadHint, b: LoadHint) -> core::cmp::Ordering {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::float_cmp)]
 mod tests {
     use super::*;
+    use rand::SeedableRng;
 
     // ADR 001 multiplier table: rep=1.0 → 1×, 0.8 → 1.56×, 0.5 → 4×, 0.3 → 11.1×, 0.1 → 100×.
 
@@ -445,5 +454,39 @@ mod tests {
         let de = with_region(make_candidate(2, 100, 10, 1.0), "DE"); // score 1000
         let out = rank_candidates(vec![us, de]);
         assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(2));
+    }
+
+    #[test]
+    fn random_breaks_full_ties_deterministically_with_seed() {
+        let a = make_candidate(1, 100, 10, 1.0);
+        let b = make_candidate(2, 100, 10, 1.0);
+        let mut rng_1 = rand::rngs::StdRng::seed_from_u64(42);
+        let out_1 = rank_candidates_with_rng(vec![a.clone(), b.clone()], &mut rng_1);
+        let mut rng_2 = rand::rngs::StdRng::seed_from_u64(42);
+        let out_2 = rank_candidates_with_rng(vec![a, b], &mut rng_2);
+        let ids_1: Vec<u8> = out_1.iter().map(|r| r.candidate.node_id[0]).collect();
+        let ids_2: Vec<u8> = out_2.iter().map(|r| r.candidate.node_id[0]).collect();
+        assert_eq!(ids_1, ids_2, "same seed must produce same order");
+    }
+
+    #[test]
+    fn random_tier_yields_different_orders_for_different_seeds() {
+        let a = make_candidate(1, 100, 10, 1.0);
+        let b = make_candidate(2, 100, 10, 1.0);
+        let mut saw_ab = false;
+        let mut saw_ba = false;
+        for seed in 0u64..32 {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            let out = rank_candidates_with_rng(vec![a.clone(), b.clone()], &mut rng);
+            match out.first().map(|r| r.candidate.node_id[0]) {
+                Some(1) => saw_ab = true,
+                Some(2) => saw_ba = true,
+                _ => {}
+            }
+            if saw_ab && saw_ba {
+                break;
+            }
+        }
+        assert!(saw_ab && saw_ba, "expected both orderings across 32 seeds");
     }
 }
