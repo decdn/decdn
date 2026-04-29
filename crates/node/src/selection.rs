@@ -11,7 +11,6 @@ use decdn_protocol::gossip::LoadHint;
 pub const MAX_PROVIDER_ATTEMPTS: usize = 3;
 
 /// Reputation floor in the score denominator (ADR 001).
-#[allow(dead_code)]
 const REPUTATION_FLOOR: f32 = 0.1;
 
 /// Score-equivalence threshold for tie-break activation (ADR 001 — "scores
@@ -56,7 +55,6 @@ pub struct RankedCandidate {
 ///
 /// Reputation is clamped to [`REPUTATION_FLOOR`] before squaring; this both
 /// prevents division by zero and caps the worst-case multiplier at 100×.
-#[allow(dead_code)]
 #[allow(clippy::cast_precision_loss)]
 // f64 has 53-bit mantissa; ULP-level imprecision on huge u64 rates does not
 // affect ordering decisions here.
@@ -66,6 +64,34 @@ fn compute_score(rate_per_mb: u64, rtt_ms: u32, reputation: f32) -> f64 {
     let rep_clamped = reputation.max(REPUTATION_FLOOR);
     let rep = f64::from(rep_clamped);
     rate * rtt / (rep * rep)
+}
+
+/// Rank candidates by selection score, lowest (best) first.
+///
+/// Within-1%-score tie groups are reordered by the four-tier ADR 008
+/// tie-breaker (load → geo → stake → random). The random tier uses a
+/// fresh thread-local RNG; for deterministic tests use
+/// [`rank_candidates_with_rng`].
+pub fn rank_candidates(candidates: Vec<Candidate>) -> Vec<RankedCandidate> {
+    let mut rng = rand::rng();
+    rank_candidates_with_rng(candidates, &mut rng)
+}
+
+/// Variant of [`rank_candidates`] taking an explicit RNG. Internal — used by
+/// tests for deterministic random tie-breaking.
+fn rank_candidates_with_rng(
+    candidates: Vec<Candidate>,
+    _rng: &mut impl rand::Rng,
+) -> Vec<RankedCandidate> {
+    let mut ranked: Vec<RankedCandidate> = candidates
+        .into_iter()
+        .map(|c| RankedCandidate {
+            score: compute_score(c.rate_per_mb, c.rtt_ms, c.reputation),
+            candidate: c,
+        })
+        .collect();
+    ranked.sort_by(|a, b| a.score.total_cmp(&b.score));
+    ranked
 }
 
 #[cfg(test)]
@@ -124,5 +150,47 @@ mod tests {
         // u64::MAX × u32::MAX is well within f64 range (~1.6e28 < 1.8e308).
         let s = compute_score(u64::MAX, u32::MAX, 1.0);
         assert!(s.is_finite(), "got {s}");
+    }
+
+    fn make_candidate(node_id: u8, rate: u64, rtt: u32, rep: f32) -> Candidate {
+        Candidate {
+            node_id: [node_id; 32],
+            rate_per_mb: rate,
+            rtt_ms: rtt,
+            reputation: rep,
+            load: LoadHint {
+                active_streams: 0,
+                bandwidth_utilization: 0,
+            },
+            region: "US".to_string(),
+            stake: None,
+        }
+    }
+
+    #[test]
+    fn rank_empty_returns_empty() {
+        let out = rank_candidates(vec![]);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn rank_single_candidate_returns_it() {
+        let c = make_candidate(1, 100, 10, 1.0);
+        let out = rank_candidates(vec![c.clone()]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out.first().map(|r| r.candidate.node_id), Some(c.node_id));
+    }
+
+    #[test]
+    fn rank_orders_by_score_ascending() {
+        // c_cheap: rate=1, rtt=10, rep=1.0 → score 10
+        // c_mid:   rate=10, rtt=10, rep=1.0 → score 100
+        // c_dear:  rate=100, rtt=10, rep=1.0 → score 1000
+        let c_dear = make_candidate(3, 100, 10, 1.0);
+        let c_cheap = make_candidate(1, 1, 10, 1.0);
+        let c_mid = make_candidate(2, 10, 10, 1.0);
+        let out = rank_candidates(vec![c_dear, c_cheap, c_mid]);
+        let ids: Vec<u8> = out.iter().map(|r| r.candidate.node_id[0]).collect();
+        assert_eq!(ids, vec![1, 2, 3]);
     }
 }
