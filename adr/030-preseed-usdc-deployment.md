@@ -3,25 +3,14 @@
 **Date:** 2026-04-25
 **Status:** Draft
 **Funds:** [ADR 026](026-gauge-boost-tokenomics.md) §10 (bootstrap mechanism)
-**Replaces:** ADR 004's 200M-TOKEN node-bootstrap fund
 
 ---
 
 ## Context
 
-[ADR 004](004-tokenomics.md) allocated **200M TOKEN** as a node-bootstrap fund. This is
-reflexive: TOKEN price drops collapse subsidy purchasing power exactly when subsidies
-are most needed. Single-asset reflexivity was the dominant tail risk for early operator
-recruitment ([ADR 026](026-gauge-boost-tokenomics.md) §Context, item 4).
+Bootstrap supply-side incentive — capital that recruits operators in the gap between mainnet launch and treasury self-funding — is **$1M+ externally-raised USDC** (planning target $3M), per [ADR 026 §10](026-gauge-boost-tokenomics.md#10-bootstrap-mechanism--pre-seed-usdc). USDC denomination insulates subsidy purchasing power from TOKEN price; single-asset reflexivity in subsidy capacity was a tail risk that this denomination removes. ADR 026 commits the mechanism (USDC, externally raised) and the floor; this ADR is the program charter — capital structure, the five funded programs with per-program eligibility / allocation / success metrics / termination triggers, reporting cadence, `SafetyReserve` coordination, and the program-wide wind-down trigger.
 
-[ADR 026](026-gauge-boost-tokenomics.md) §10 replaces the 200M-TOKEN fund with **$1M+ pre-seed
-USDC capital** (planning target $3M), externally raised and USD-denominated. ADR 026
-commits the funding mechanism and the size floor; it forward-references this ADR for
-the program structure.
-
-This ADR is the program charter — capital structure, the five funded programs with
-per-program eligibility / allocation / success metrics / termination triggers,
-reporting cadence, `SafetyReserve` coordination, and the program-wide wind-down trigger.
+A TOKEN-denominated bootstrap variant was considered and rejected; see [Alternatives Considered](#alternatives-considered).
 
 The pre-seed program runs **in parallel** with the canonical self-funded onboarding
 flow in [ADR 019](019-node-onboarding.md). It does not replace any phase of onboarding;
@@ -46,11 +35,9 @@ otherwise be filtered out at Phase 1 (server provisioning) or Phase 2 (on-chain 
 | Spending authority | Standard governance proposal per [ADR 009](009-governance.md), or fast-track emergency-multisig authorization within the hard caps below |
 
 **No protocol issuance.** This pool is **externally raised USDC**. The protocol does not
-mint TOKEN to fund it; ADR 004's 200M-TOKEN bootstrap supply does not exist under
-[ADR 026](026-gauge-boost-tokenomics.md) §1. **Raising at least the $1M floor is a prerequisite
-for v3 mainnet launch.** Contingency: governance can re-allocate from the 30% Protocol
-Treasury bucket per [ADR 026](026-gauge-boost-tokenomics.md) §1 at the cost of development
-runway.
+mint TOKEN to fund it. **Raising at least the $1M floor is a prerequisite for mainnet
+launch.** Contingency: governance can re-allocate from the 30% Protocol Treasury bucket
+per [ADR 026](026-gauge-boost-tokenomics.md) §1 at the cost of development runway.
 
 **Hard caps (immutable at deploy time)** for the multisig fast-track path, paralleling
 the `SafetyReserve` fast-track gates per [ADR 009](009-governance.md):
@@ -332,7 +319,7 @@ commitments (active loans, leases, regional grants) continue to term regardless.
 - **POO political optics.** DAO operating competitor nodes is a credibility risk; §2a's wind-down trigger forces exit where independent coverage matures.
 - **Staking-loan default risk.** Bounded by the 25% pause-trigger and 15% target; the 30%-per-region cap + 25% referrer co-sign give two loss layers.
 - **Hardware-lease claw-back is partial.** Realistic loss on a mid-term default: 30–50% of subsidy paid.
-- **Pre-seed must actually be raised.** The $1M floor is a hard prerequisite for v3 mainnet — on the critical path.
+- **Pre-seed must actually be raised.** The $1M floor is a hard prerequisite for mainnet — on the critical path.
 - **USDC concentration risk.** Mitigated at the DAO-treasury level (stablecoin diversification), not in this ADR.
 
 ### Risks
@@ -342,6 +329,22 @@ commitments (active loans, leases, regional grants) continue to term regardless.
 - **POO governance-weight concentration.** POO ve-positions are policy-bound to abstain on regional-priority votes affecting their own regions; enforcement is policy, not on-chain.
 - **Multisig compromise** is a $1M–$3M loss. Standard [ADR 009](009-governance.md) multisig hygiene applies.
 - **Slow ramp on the §6 wind-down trigger** if treasury inflow plateaus at S1 — year-3 governance review re-evaluates structure if S2 has not been reached.
+
+---
+
+## Alternatives Considered
+
+### TOKEN-denominated node-bootstrap fund
+
+A protocol-issued multi-hundred-million-TOKEN bootstrap fund (the original [ADR 004](004-tokenomics.md) shape: 200M TOKEN allocated for operator subsidies) was considered.
+
+Rejected because:
+
+- **Reflexive purchasing power.** Subsidies denominated in TOKEN are most valuable when TOKEN price is healthy and least valuable when subsidies are most needed. Single-asset reflexivity was the dominant tail risk for early operator recruitment.
+- **Concentrated dilution.** A multi-hundred-million-TOKEN allocation is non-trivial dilution that ties to bootstrap duration rather than network outcomes.
+- **TOKEN-price-independent program structure.** USDC-denominated programs (POOs, hardware-leasing, staking loans, regional grants, Enterprise SLA fund) can be sized against dollar-denominated regional infrastructure costs; the same programs in TOKEN need a separate mental model that depends on TOKEN price at every disbursement.
+
+The chosen design routes externally-raised USDC into outcome-targeted programs and reserves the protocol-treasury TOKEN bucket ([ADR 026 §1](026-gauge-boost-tokenomics.md#1-supply-and-distribution)) for governance-driven uses.
 
 ---
 
