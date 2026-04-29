@@ -28,10 +28,7 @@ flow in [ADR 019](019-node-onboarding.md). It does not replace any phase of onbo
 it supplies stake, hardware, regional capital, or SLA backing to operators who would
 otherwise be filtered out at Phase 1 (server provisioning) or Phase 2 (on-chain stake).
 
-**Sizing context.** Per the economic-model spec §0–§3: S0 (Bootstrap, ~178 nodes)
-treasury USDC inflow ~$20K/mo; S1 (Early, ~1,778 nodes) ~$200K/mo (self-funding); S2
-(Growth) ~$2M/mo. Pre-seed is sized for the S0→S1 transition — where operator-side
-reflexivity bites hardest and treasury inflow has not yet caught up.
+**Sizing context.** S0 (Bootstrap) treasury USDC inflow is small and not self-funding; S1 (Early) reaches self-funding; S2 (Growth) generates surplus. Pre-seed is sized for the S0→S1 transition where operator-side reflexivity bites hardest and treasury inflow has not yet caught up. Absolute scale figures (node counts, monthly inflows by scenario) live in `finance/notebooks/` and the economic-model spec §§0–3.
 
 ---
 
@@ -95,9 +92,7 @@ Initial priority regions per preseed-capital strategy §1 and market-dynamics §
 Brazil, Southeast Asia (ID/SG/VN), India, West Africa, Eastern Europe. Specific
 country selection is the first DAO vote authorizing POO disbursement.
 
-**Allocation.** 30%. At $1M, ~6–10 POO nodes / 12 months on tier B/D infrastructure
-(economic-model spec §3); at $3M, ~20–30 nodes. Tier A (1G VPS) excluded — too small
-to materially seed a region.
+**Allocation.** 30%. Sizing per economic-model spec §3 — supports tens of POO nodes / 12 months on tier B/D infrastructure across the floor-to-target range. Tier A (1G VPS) excluded as too small to materially seed a region.
 
 **Success metrics.**
 
@@ -163,9 +158,7 @@ recruitment.
 - No prior pre-seed-loan default. A single prior default is permanent
   disqualification.
 
-**Allocation.** 15% of pool. At $0.05 TOKEN, 50K TOKEN ≈ $2,500 USDC equivalent;
-$150K supports ~60 loans, $450K ~180. Per-region principal cap: **20% of program
-allocation** (caps geographic concentration).
+**Allocation.** 15% of pool. Loan principal scales with TOKEN/USDC at lend time; the floor-to-target range supports tens to low-hundreds of loans (sizing arithmetic in `finance/notebooks/`). Per-region principal cap: **20% of program allocation** (geographic-concentration cap).
 
 **Repayment.**
 
@@ -260,9 +253,7 @@ categories. ADR 032 (Bandwidth Futures / Enterprise SLA tier, deferred to v2) wi
 define the contract template; until then, individual Enterprise contracts are
 case-by-case under DAO governance.
 
-**Allocation.** 10% of pool — $100K (floor) covers a single $100K incident at full
-scale per economic-model spec §7; $300K (target) covers a single $1M incident at 30%
-or three $100K incidents in series.
+**Allocation.** 10% of pool. Coverage capacity (single high-severity incident vs. multiple lower-severity in series) per economic-model spec §7.
 
 **Coordination with `SafetyReserve` (avoid double-funding).** A single incident draws
 on **at most one** funding source, in this priority order, enforced by the
@@ -294,45 +285,15 @@ redirect to other pre-seed programs whose triggers have not fired).
 
 ### 3. Allocation flexibility
 
-The 30/25/15/20/10 default is a starting point. Governance may rebalance within:
-
-| Constraint | Value |
-| --- | --- |
-| Maximum per-program shift per quarter | ±10 percentage points |
-| Maximum cumulative deviation from default | ±20 percentage points per program |
-| Sum-to-100% across the five programs | Enforced; non-conforming proposals revert |
-| Timelock | Per [ADR 009](009-governance.md): 48-hour timelock, 7-day voting period |
-
-Rebalancing **cannot** introduce a new program (this ADR is the canonical list; new
-programs require an ADR amendment). Rebalancing **cannot** reduce a non-terminated
-program below 0%.
-
-When a program's termination trigger fires, its remaining allocation auto-redistributes
-to the four remaining programs in proportion to their then-current allocations.
-Governance may override within the same bounds.
+Governance rebalancing is bounded: **±10 pp per program per quarter, ±20 pp cumulative**, sum-to-100% enforced, [ADR 009](009-governance.md) timelock applied. New programs require an ADR amendment; terminated programs' allocations auto-redistribute pro-rata to the surviving programs (governance-overrideable within the same bounds).
 
 ### 4. Reporting
 
-The DAO publishes a **quarterly pre-seed program report** to a public registry — same
-pattern as the `SafetyReserve` post-incident registry per [ADR 026](026-gauge-boost-tokenomics.md)
-§5. Each report contains:
-
-- Capital deployed per program (cumulative + Q-over-Q delta) and remaining.
-- Per-program success-metric values vs. targets.
-- Termination triggers met (or rationale for not).
-- Governance rebalancing actions in the quarter.
-- Cross-program flows from termination-trigger redistributions.
-
-Reports are signed by the multisig and published on-chain via a quarterly-report
-event emitted by the program-accounting contract. Off-chain mirrors are documentation
-hygiene, not protocol invariants.
+Quarterly pre-seed program report (capital deployed, success-metric deltas, triggers met, rebalancing actions, cross-program flows) signed by the multisig and published on-chain via the program-accounting contract — same pattern as the `SafetyReserve` post-incident registry ([ADR 026](026-gauge-boost-tokenomics.md) §5). Off-chain mirrors are documentation hygiene, not protocol invariants.
 
 ### 5. Coordination with `SafetyReserve` (summary)
 
-§2e defines the rules. One-line summary: **a single incident draws on at most one
-funding source** (organic `SafetyReserve`, slashing-replenished `SafetyReserve`, or
-pre-seed paired allocation) in that priority order. No double-funding. The
-`SafetyReserve` payout flow's gates apply unchanged to the paired allocation.
+§2e is the rule. **A single incident draws on at most one funding source** — organic `SafetyReserve` → slashing-replenished `SafetyReserve` → pre-seed paired allocation, in that order. No double-funding. The `SafetyReserve` evidence-bundle / multisig-fast-track / appeal / reporting gates apply unchanged to the paired allocation.
 
 ### 6. Termination of the pre-seed program as a whole
 
@@ -359,85 +320,31 @@ commitments (active loans, leases, regional grants) continue to term regardless.
 
 ### Positive
 
-- **Eliminates TOKEN-price reflexivity in bootstrap.** USDC throughout removes the
-  largest tail risk in [ADR 026](026-gauge-boost-tokenomics.md) §Context.
-- **Five distinct levers, non-overlapping.** Each program targets a different
-  recruitment friction (capital access, geographic coverage, enterprise
-  credibility); §3 lets the DAO tune the mix as different frictions dominate at
-  different scales.
-- **POO flywheel is self-sustaining.** §2a's metric — cumulative POO net revenue
-  back to treasury exceeding 50% of capital deployed within 24 months — makes the
-  program net-positive in dollar terms before network-wide externalities.
-- **Tight `SafetyReserve` coordination.** §2e and §5's single-source rule prevent
-  double-funding by construction.
-- **Hard caps preserve safety without slowing legitimate spend.** §1 fast-track
-  caps ($50K incident, $250K rolling) bound worst-case multisig exposure;
-  standard governance is unbounded per-incident.
-- **Wind-down is principled.** §6 ties termination to a measurable treasury-inflow
-  regime; capital returns to treasury when organic flows sustain continuing
-  programs.
+- **Eliminates TOKEN-price reflexivity in bootstrap.** USDC throughout removes the largest tail risk from [ADR 026](026-gauge-boost-tokenomics.md) §Context.
+- **Five non-overlapping recruitment levers**, governance-tunable at the §3 bounds as different frictions dominate.
+- **POO flywheel is self-sustaining** by design — net revenue back to treasury exceeds capital deployed within 24 months (§2a metric).
+- **`SafetyReserve` single-source rule** prevents double-funding by construction (§2e, §5).
+- **Wind-down is principled** — §6 ties termination to a measurable treasury-inflow regime.
 
 ### Negative
 
-- **Governance overhead.** Five programs, quarterly reports, regional priority
-  lists, per-program eligibility verification — substantial recurring DAO
-  workload. Delegating verification to a multisig-supervised program-operator
-  team (`SafetyReserve` pattern) helps, but the footprint is real.
-- **POO political optics.** A DAO operating competitor nodes in regions where it
-  also subsidizes independent operators is a governance-credibility risk. The
-  §2a termination trigger forces wind-down where independent coverage matures —
-  POOs are a seeding tool, not a permanent fixture.
-- **Staking-loan repayment risk.** Defaults bounded by the 25% pause-trigger and
-  15% target rate, but a regional shock could cluster defaults. The 30%-per-region
-  principal cap and referrer co-signed liability provide two loss layers.
-- **Hardware-lease claw-back has limits.** A subsidized operator deregistering
-  mid-term forfeits ownership conversion, but recovering in-progress monthly
-  subsidy depends on operator cooperation. Realistic expected loss on a
-  defaulted lease: 30–50% of subsidy paid to date.
-- **Pre-seed must actually be raised.** $1M floor is a hard prerequisite for v3
-  mainnet. Unlike ADR 004's TOKEN bootstrap, the protocol cannot mint this fund
-  into existence. **On the critical path for v3 launch.**
-- **USDC concentration risk.** $1M–$3M in a single stablecoin. A depeg or
-  regulatory action impairs funding directly. Mitigation is at the DAO-treasury
-  level (USDC / USDT / DAI diversification), not in this ADR.
+- **Recurring DAO workload.** Five programs, quarterly reports, eligibility verification — delegable to a multisig-supervised team but real.
+- **POO political optics.** DAO operating competitor nodes is a credibility risk; §2a's wind-down trigger forces exit where independent coverage matures.
+- **Staking-loan default risk.** Bounded by the 25% pause-trigger and 15% target; the 30%-per-region cap + 25% referrer co-sign give two loss layers.
+- **Hardware-lease claw-back is partial.** Realistic loss on a mid-term default: 30–50% of subsidy paid.
+- **Pre-seed must actually be raised.** The $1M floor is a hard prerequisite for v3 mainnet — on the critical path.
+- **USDC concentration risk.** Mitigated at the DAO-treasury level (stablecoin diversification), not in this ADR.
 
 ### Risks
 
-- **Sybil exploitation of staking loans.** Multiple loans via fake referrer
-  relationships. Mitigation: the `final_score ≥ 0.8` for ≥ 180-day referrer
-  threshold ([ADR 008](008-reputation.md)) is hard to fake; co-signed 25%
-  liability creates a self-policing incentive.
-- **Regional-grant capture.** A small clique rotating gauge votes to keep a
-  region perpetually on the priority list. Mitigation: auto-eligibility is
-  governance-overrideable; sustained patterns trigger governance review.
-- **Program complexity invites mismanagement.** Five programs with separate
-  state is a lot to track. §3's bounds and §4's quarterly reporting force
-  regular per-program review; a program nobody reports on is itself a
-  governance-failure signal.
-- **POO governance-weight concentration.** POOs hold operator stake and may
-  ve-lock for gauge boost. POO ve-positions are governance-policy bound to
-  abstain on regional-priority votes affecting their own regions; enforcement
-  is policy, not on-chain.
-- **Multisig compromise.** Signer collusion or compromise is a $1M–$3M loss.
-  Standard multisig hygiene per [ADR 009](009-governance.md); not a new
-  mitigation.
-- **Slow ramp on the wind-down trigger.** If treasury inflow plateaus at S1
-  rather than reaching S2, the program runs longer than designed. Year-3
-  governance review should re-evaluate structure if S2 has not been reached.
+- **Sybil exploitation of staking loans** via fake referrer relationships. The `final_score ≥ 0.8 / 180-day` referrer threshold and 25% co-signed liability make it self-policing.
+- **Regional-grant capture** by a clique rotating gauge votes. Mitigation: auto-eligibility is governance-overrideable; sustained patterns trigger review.
+- **POO governance-weight concentration.** POO ve-positions are policy-bound to abstain on regional-priority votes affecting their own regions; enforcement is policy, not on-chain.
+- **Multisig compromise** is a $1M–$3M loss. Standard [ADR 009](009-governance.md) multisig hygiene applies.
+- **Slow ramp on the §6 wind-down trigger** if treasury inflow plateaus at S1 — year-3 governance review re-evaluates structure if S2 has not been reached.
 
 ---
 
 ## ADRs to update on acceptance
 
-| ADR | What changes |
-| --- | --- |
-| [ADR 008 — Reputation](008-reputation.md) | Document the `final_score ≥ 0.7` (90-day) and `final_score ≥ 0.8` (180-day) eligibility thresholds used by §2a–§2d. The reputation system is unchanged; this records that pre-seed program eligibility is a non-protocol consumer of `final_score`. |
-| [ADR 019 — Node Onboarding](019-node-onboarding.md) | Replace the existing "Pre-seed USDC Bootstrap Programs" section's forward-reference with a back-reference to this ADR. Document that Phase 2's stake source for staking-loan recipients is the pre-seed recovery account, and note the hardware-leasing path's relationship to Phase 1 step 1 (server provisioning). No phase-sequence change — pre-seed paths deliver capital, not protocol-flow shortcuts. |
-| [ADR 026 — Tokenomics v3](026-gauge-boost-tokenomics.md) | §10's forward-reference resolves; bootstrap-program structure now lives here. §5's `SafetyReserve` payout flow gains the §2e pre-seed paired allocation as a third-priority funding source per the §5 coordination rule. |
-
-Additional ancillary updates: [ADR 009](009-governance.md) (the §1 hard caps on
-multisig fast-track parallel the existing `SafetyReserve` pattern; ADR 009's
-emergency-multisig section should reference this ADR's caps as a second instance
-of the pattern), [ADR 016](016-contract-interactions.md) (program-accounting
-contract for §4's public registry — single-purpose, emits the quarterly-report
-event; minimal interface).
+Cross-cutting deltas live in each touched ADR. Touched: [008](008-reputation.md) (program-eligibility consumer of `final_score`), [009](009-governance.md) (parallel multisig fast-track caps), [016](016-contract-interactions.md) (program-accounting contract for §4 reporting), [019](019-node-onboarding.md) (back-reference to this ADR), [026](026-gauge-boost-tokenomics.md) (§10 resolved; §5 gains §2e pairing as third-priority funding source).
