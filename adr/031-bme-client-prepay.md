@@ -75,12 +75,7 @@ v1 (USDC channels) and v2 (BME prepay + USDC channels) must both be supported in
 | USDC channel rail (default) | USDC | USDC, via `FeeRouter` | `PaymentChannel` ([ADR 003](003-payments.md), [ADR 010](010-multi-token.md)) | v1 (live) |
 | BME prepay (opt-in) | TOKEN (burned) | USDC equivalent | `BmePrepay` (or `PaymentChannel` extension; see §5) | v2 (deferred) |
 
-The two paths converge at the operator-payment boundary. There are two design options for how an operator receives compensation when a BME-prepay client consumes bandwidth, and this ADR does not pin one — v2 will choose:
-
-- **Option A — Protocol mints / disburses USDC equivalent.** The protocol holds (via the pre-seed program in [ADR 030](030-preseed-usdc-deployment.md), or a dedicated BME-USDC reserve) a USDC pool from which the operator's USDC equivalent is paid. The TOKEN is burned, the operator is paid in USDC, and the BME reserve is replenished by buyback flows or by a fraction of [ADR 026 §2](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553)'s router output. This option keeps operator cashflow stable in USDC and concentrates oracle-pricing risk in one place (the protocol-managed pool), but requires non-trivial reserve management and is sensitive to large BME-prepay surges that drain the pool.
-- **Option B — Operator receives TOKEN, swaps separately.** The protocol pays the operator in TOKEN at a contract-computed rate (oracle-derived); the operator swaps to USDC themselves (or holds, voluntarily, as additional ve-lock material). This option pushes oracle-execution risk to the operator and removes the protocol-managed reserve, at the cost of fragmenting MEV exposure across many small operator-driven swaps. The 5% buyback-and-burn pool ([ADR 026 §2](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553)) *would not* feed Option B's flow — operators would source their own TOKEN→USDC liquidity.
-
-v2 will choose between A and B (or a hybrid) based on then-observed TOKEN/USDC liquidity depth ([ADR 018](018-liquidity-strategy.md) pool maturity), keeper-cost economics on the chosen L2 ([ADR 021](021-l2-chain-selection.md)), and operator UX preferences gathered from v1.
+v2 will pin one of two operator-payment options: **(A)** protocol disburses USDC equivalent from a managed reserve (stable operator cashflow, concentrates oracle risk in the reserve); **(B)** operator receives TOKEN and swaps independently (no reserve, but fragmented per-operator MEV exposure). The choice depends on then-observed TOKEN/USDC liquidity depth and L2 keeper-cost economics.
 
 ### 4. Pricing oracle dependency
 
@@ -111,12 +106,7 @@ A new contract `BmePrepay` (or, alternatively, an extension of `PaymentChannel` 
 | Pricing source | Oracle hook (see §4) | Pluggable to allow v2 hardening without redeploy |
 | Oracle failure | Revert on `consume`; allow `withdraw` | Liveness preserved for clients |
 
-**Design intent, not specification.** This ADR is Deferred; the surface above is illustrative. v2 will produce a concrete contract specification, choose between `BmePrepay`-as-new-contract and `PaymentChannel`-extension, and audit accordingly. The explicit decision deferred is between:
-
-- **A separate `BmePrepay` contract.** Simpler audit boundaries; clean separation between USDC and TOKEN flows; the existing `PaymentChannel` interface is unchanged.
-- **An extension of `PaymentChannel`.** Reuses the channel-lifecycle, voucher, and dispute-window machinery; clients who already understand channels also understand BME-prepay. Higher contract complexity and harder audit boundary.
-
-The latter is more elegant if the TOKEN-denominated channel is conceptually a "channel that burns instead of forwarding," but the per-consumption oracle hook does not naturally fit the [ADR 003](003-payments.md) close-and-settle lifecycle. v2 will weigh both.
+**Design intent, not specification.** v2 chooses between a separate `BmePrepay` contract (cleaner audit boundary) or a `PaymentChannel` extension (reuses channel lifecycle but doesn't fit the per-consumption oracle hook naturally).
 
 ### 6. Demand-side flywheel
 
@@ -124,13 +114,7 @@ The TOKEN burned on consumption is permanent supply reduction. Unlike the [ADR 0
 
 **The "if" is real.** A low-usage network sees negligible BME burn. The mechanism only matters at scale; this is a key honest constraint on the design and is reflected in the Deferred status (a v2 launch lets v1 build the usage base first).
 
-**Three-pronged demand structure with BME (forward-looking, post-v2):**
-
-1. **Operator-side TOKEN demand** — stake + ve-lock for gauge boost ([ADR 026 §3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula), §7).
-2. **Delegator-side TOKEN demand** — 7% delegator-pool USDC→TOKEN buys ([ADR 026 §6](026-gauge-boost-tokenomics.md#6-delegator-pool--usdc--token-conversion)).
-3. **Client-side TOKEN demand (this ADR)** — BME prepay deposits drive net TOKEN purchases off the open market.
-
-This is the demand-floor the v1 model lacks. v1 ships on (1) and (2) only; v2 adds (3).
+v1 ships on operator-side and delegator-side TOKEN demand only ([ADR 026 §3, §6, §7](026-gauge-boost-tokenomics.md)); v2 adds client-side BME-prepay demand and produces the demand-floor the v1 model lacks.
 
 ### 7. Defer rationale
 
@@ -168,9 +152,7 @@ This ADR exists to reserve design space and to document v1 prerequisites. It is 
 - **Oracle manipulation.** A determined attacker pushes the TOKEN/USDC TWAP and then triggers a profitable consume/withdraw cycle. Multi-source oracle, longer TWAP windows, per-epoch liquidity caps, and circuit breakers are required at v2 launch. Failure to harden the oracle invalidates the entire mechanism — this is the single largest risk and is the explicit reason for v1 deferral.
 - **Reserve drain (Option A).** If the protocol mints USDC equivalent from a managed reserve, a coordinated BME-prepay surge could drain it. v2 must size the reserve against worst-case adoption rates and have a circuit-breaker (pause new BME deposits, accept consume against existing deposits) ready.
 - **Operator MEV exposure (Option B).** If operators receive TOKEN and swap themselves, each operator faces independent MEV exposure on their TOKEN→USDC swap. Aggregate this across many small operators and total MEV leakage may exceed Option A's reserve-management cost.
-- **Discount tuning is reflexive.** The discount must be small enough not to subsidize the path past sustainability, but large enough to motivate adoption. The optimal value depends on TOKEN price (low TOKEN price means a USDC-equivalent discount in TOKEN terms is a smaller absolute incentive); v2 must monitor and adjust under [ADR 009](009-governance.md) timelock.
-- **Client-side speculation.** Clients with large prepay deposits hold TOKEN-price exposure they didn't necessarily intend. Mitigated by allowing free withdraw, but still a UX concern. Documentation must be clear: BME prepay is *not* hedged.
-- **Adoption risk.** Even with a discount, clients may prefer the simpler USDC rail. If BME adoption is low, the demand-floor argument doesn't materialize and the contract complexity was not worth it. v2 should set adoption-rate KPIs and be prepared to deprecate BME if the data doesn't support it within a defined window.
+- **Adoption risk.** Even with a discount, clients may prefer the simpler USDC rail. If BME adoption stays low, the demand-floor argument doesn't materialize. v2 should set adoption-rate KPIs and be prepared to deprecate BME if the data doesn't support it within a defined window.
 
 ---
 

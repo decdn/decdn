@@ -150,22 +150,9 @@ cannot ship; this is the single hardest prerequisite.
   SLA pairing is reserved for DAO-issued contracts to keep the recourse path
   centralised.
 
-#### 1.5 Oracle and MEV considerations
+#### 1.5 Oracle and MEV
 
-- **Delivery oracle.** [ADR 027](027-distinct-client-receipts.md) signed delivery
-  receipts feed settlement. Without distinct-client identity verification, an operator
-  can manufacture "delivery" against a self-issued future and capture the strike TOKEN —
-  identical to the wash-trading attack surface flagged in
-  [ADR 026](026-gauge-boost-tokenomics.md) §Risks for the gauge pool. The mitigation is the
-  same: receipts must come from independent, reputation-attested client identities.
-- **Strike-price MEV.** A searcher observing a large buyer's pending future-purchase
-  could front-run the TOKEN buy. Mitigations: TWAP-priced strike (use the
-  [ADR 018](018-liquidity-strategy.md) TWAP window), private-RPC routing for the
-  TOKEN purchase, and per-contract size caps for a 30-day rolling window.
-- **Settlement MEV.** At expiry, the TOKEN release to seller and any USDC compensation
-  draw are observable. Standard MEV-defense from [ADR 018](018-liquidity-strategy.md)
-  (Flashbots-style private RPC, per-epoch liquidity caps) applies to any TOKEN
-  movement involved.
+Delivery oracle is [ADR 027](027-distinct-client-receipts.md) receipts — same wash-trading defense applies (operator self-issuing futures against sybil clients fails the same identity-diversity gate as the gauge pool). Strike and settlement MEV defenses inherit [ADR 018](018-liquidity-strategy.md): TWAP-priced strike, private-RPC routing for TOKEN moves, per-contract 30-day size caps.
 
 ### 2. Enterprise SLA Tier
 
@@ -246,25 +233,7 @@ for Enterprise-tier credibility.
 
 ### 3. Freemium → Enterprise ladder
 
-The three tiers are **non-exclusive client segments**, not protocol-level access
-gates. Any client may use any tier; differentiation is contractual, not enforced by
-the wire protocol.
-
-| Tier | Pricing | SLA | Backing | Target client |
-| --- | --- | --- | --- | --- |
-| **Freemium / Developer** | Free or subsidized (governance-set monthly GB allowance) | None | Subsidy from community / ecosystem allocation per [ADR 026](026-gauge-boost-tokenomics.md) §1 | Indie devs, early-stage projects, integration testing |
-| **Pro** | $0.01/GB per [ADR 026](026-gauge-boost-tokenomics.md) §2 | Best-effort | None — implicit | Streaming startups, content sites, hobbyist deployments |
-| **Enterprise** | Per-contract; typically a premium over the Pro rate | Explicit per §2.1 | `SafetyReserve` + pre-seed pairing per §2.2 | Large-scale streaming, SaaS, regulated workloads |
-
-The freemium tier is **not** a free-forever offering — it is a customer-acquisition
-funnel sized against the community / ecosystem allocation in
-[ADR 026](026-gauge-boost-tokenomics.md) §1, with a monthly GB allowance per registered
-developer wallet. Sizing is governance-set at v2 launch and is not pinned in this ADR.
-
-The Enterprise tier is **invitation- or application-gated** — operators do not
-self-attest as Enterprise-eligible. Onboarding is run through a designated Enterprise
-sales channel (initially a multisig-supervised team funded out of the protocol
-treasury per [ADR 026](026-gauge-boost-tokenomics.md) §1; longer-term, a DAO-elected role).
+Three non-exclusive client segments differentiated contractually, not by the wire protocol. Freemium / Developer tier is a customer-acquisition funnel sized against the community / ecosystem allocation ([ADR 026](026-gauge-boost-tokenomics.md) §1) with a governance-set monthly GB allowance — not a free-forever offering. Pro tier is the [ADR 026](026-gauge-boost-tokenomics.md) §2 default ($0.01/GB, best-effort). Enterprise tier is application-gated through a designated multisig-supervised sales channel and uses the §2.2 backing stack.
 
 ---
 
@@ -313,24 +282,9 @@ treasury per [ADR 026](026-gauge-boost-tokenomics.md) §1; longer-term, a DAO-el
   management, and dispute handling are recurring DAO-funded work. The
   [ADR 030](030-preseed-usdc-deployment.md) §4 quarterly-report cadence partly covers
   this, but a dedicated Enterprise team is the realistic operating model.
-- **Regulatory exposure for futures.** TOKEN-denominated bandwidth futures are
-  contractually a derivative in some jurisdictions (CFTC interpretive guidance, EU
-  MiCA Art. 3 financial instrument classification, UK FCA derivatives rules).
-  Geo-fencing or jurisdiction-specific issuance restrictions may be required at
-  launch. Legal review is a v2 prerequisite, not a launch-day blocker, but is
-  on the critical path.
-- **TOKEN-USD basis risk for the DAO.** §1.2's TOKEN-strike futures put the seller
-  (the DAO at v2 launch) on the short-TOKEN side of the basis. A protracted TOKEN
-  price drop during a contract's delivery window is a fiat loss for the DAO. The
-  mitigation is per-contract size caps and TWAP-priced strikes, neither of which
-  fully eliminates the exposure.
-- **Enterprise tier creates governance-credibility risk.** Where the DAO is both
-  contract counterparty and dispute adjudicator (via SafetyReserve payout
-  authorization), there is a structural conflict-of-interest. The 48-hour appeal
-  window and on-chain incident registry per [ADR 026](026-gauge-boost-tokenomics.md) §5 are
-  the canonical mitigation; Enterprise contracts may additionally require an
-  independent appeals path (e.g., Kleros-style arbitration) for disputes above a
-  size threshold.
+- **Regulatory exposure for futures.** Bandwidth futures may be classified as derivatives in some jurisdictions; per-jurisdiction issuance posture and geo-fencing infrastructure are v2 prerequisites. Legal review is on the critical path but not a launch-day blocker globally.
+- **TOKEN-USD basis risk for the DAO.** §1.2 TOKEN-strike futures put the DAO on the short-TOKEN side of the basis. Per-contract size caps and TWAP-priced strikes mitigate but don't eliminate.
+- **Counterparty/adjudicator conflict.** The DAO is both Enterprise contract counterparty and `SafetyReserve` payout adjudicator. Mitigated by the [ADR 026](026-gauge-boost-tokenomics.md) §5 48h appeal window + public incident registry; large contracts may additionally require an independent appeals path (e.g. Kleros-style arbitration) above a size threshold.
 
 ### Risks
 
@@ -419,12 +373,4 @@ product shape and the v1 prerequisite set.
 
 ## ADRs to update on acceptance
 
-This ADR is deferred — no v1 ADRs change at acceptance time. The cross-ADR updates
-below land at v2 implementation, alongside the contract-level follow-up ADRs above.
-
-| ADR | What changes at v2 implementation |
-| --- | --- |
-| [ADR 003 — Payments](003-payments.md) | Voucher payload extension to carry per-contract identifier for Enterprise / futures-paired settlements. No breaking change for Pro / freemium settlements (contract identifier is optional). |
-| [ADR 018 — Liquidity Strategy](018-liquidity-strategy.md) | If a secondary market for futures lands on the same Balancer V3 pool, the per-epoch liquidity-cap accounting extends to cover futures-driven swap pressure alongside the buyback and delegator-pool flows. |
-| [ADR 026 — Tokenomics v3](026-gauge-boost-tokenomics.md) | §5 SafetyReserve eligible-payout categories cross-reference resolves: Enterprise SLA compensation now points to this ADR's §2.1 contract template. No mechanic change. |
-| [ADR 030 — Pre-seed USDC Deployment](030-preseed-usdc-deployment.md) | §2e Enterprise SLA guarantee fund forward-reference resolves: "ADR 032 (Bandwidth Futures / Enterprise SLA tier, deferred to v2) will define the contract template; until then, individual Enterprise contracts are case-by-case under DAO governance" becomes "ADR 032 defines the contract template (§2.1); per-deal values remain governance-ratified." |
+Deferred — no v1 ADRs change. At v2 implementation, deltas land in [003](003-payments.md) (per-contract voucher metadata), [018](018-liquidity-strategy.md) (per-epoch liquidity caps cover futures-driven swap pressure if secondary market shares the pool), [026](026-gauge-boost-tokenomics.md) (§5 SafetyReserve cross-ref resolves), [030](030-preseed-usdc-deployment.md) (§2e contract-template forward-ref resolves).
