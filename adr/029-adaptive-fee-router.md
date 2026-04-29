@@ -1,7 +1,7 @@
 # ADR 029: Adaptive FeeRouter Parameters
 
 **Date:** 2026-04-25
-**Status:** Draft (deferred — adopt after governance dynamics observable post-v1)
+**Status:** Draft (deferred — adopt after post-launch governance dynamics observable)
 **Driver:** [ADR 026](026-gauge-boost-tokenomics.md) §Decision §11 (governable parameters)
 **Touches:** [ADR 026](026-gauge-boost-tokenomics.md), [ADR 009](009-governance.md), [ADR 018](018-liquidity-strategy.md)
 
@@ -14,7 +14,7 @@
 governance proposal: 7-day vote + 48-hour timelock minimum, per
 [ADR 009](009-governance.md). That cadence is appropriate for structural
 re-balancing (changing what the protocol *is*) but too slow for two
-state-driven feedback regimes that the v3 design surfaces but does not solve:
+state-driven feedback regimes the design surfaces but does not solve directly:
 
 1. **Lock-rate scenarios.** The gauge boost in [ADR 026](026-gauge-boost-tokenomics.md) §3
    only does its job at a healthy ve-lock rate. If `ve_locked / total_supply`
@@ -45,10 +45,10 @@ absolute veto and can disable either hook at any time.
 
 **Deferment.** [ADR 026](026-gauge-boost-tokenomics.md) §Forward references lists this
 ADR as deferred. The recommendation here is to **author and merge the spec but
-not deploy** — adoption waits until v1 governance dynamics are observable. If
-governance rebalancing turns out to be fast enough in practice, the hooks may
-not be needed at all and this ADR closes as Rejected. See §Deferment rationale
-below.
+not deploy** — adoption waits until post-launch governance dynamics are
+observable. If governance rebalancing turns out to be fast enough in practice,
+the hooks may not be needed at all and this ADR closes as Rejected. See
+§Deferment rationale below.
 
 ---
 
@@ -129,7 +129,7 @@ A new `AdaptiveFeeRouterController` (or methods on `FeeRouter` itself — choice
 
 ### 7. Deferment rationale
 
-Drafted but **not deployed at v1**. Governance dynamics aren't observable yet; adaptive logic introduces a new code path that can mis-fire under stress (TWAP manipulation, threshold-edge stutter, keeper drift); the §11 safety bounds + manual governance are a sufficient hard floor for v1. If, six months post-mainnet, lock-rate or TWAP excursions measurably out-pace governance response, this ADR moves to Accepted and the controller deploys; otherwise it closes as Rejected.
+Drafted but **not deployed at launch**. Governance dynamics aren't observable yet; adaptive logic introduces a new code path that can mis-fire under stress (TWAP manipulation, threshold-edge stutter, keeper drift); the §11 safety bounds + manual governance are a sufficient hard floor at launch. If, six months post-mainnet, lock-rate or TWAP excursions measurably out-pace governance response, this ADR moves to Accepted and the controller deploys; otherwise it closes as Rejected.
 
 ---
 

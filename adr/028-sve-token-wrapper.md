@@ -1,7 +1,7 @@
 # ADR 028: Native sveTOKEN Liquid-ve Wrapper
 
 **Date:** 2026-04-25
-**Status:** Draft (deferred — ship within 6 months of v1 mainnet)
+**Status:** Draft (deferred — ship within 6 months of mainnet)
 **Driver:** [ADR 026](026-gauge-boost-tokenomics.md) §Risks (Convex-capture risk)
 **Touches:** [ADR 026](026-gauge-boost-tokenomics.md), [ADR 009](009-governance.md), [ADR 018](018-liquidity-strategy.md)
 
@@ -19,7 +19,7 @@ The reference implementation is Frax's `sfrxETH`: an ERC-20 wrapper around an in
 
 This ADR specifies the deCDN-native equivalent: `SveToken`.
 
-**Status note.** Draft, with a deferred ship-by date of **6 months after v1 mainnet**. Not blocking for v1 launch. The window exists because Convex-style capture takes time to develop — third-party wrappers depend on observable veTOKEN supply and gauge-pool size to be worth building. Shipping within 6 months stays ahead of that window without forcing the contract into a v1 audit slot.
+**Status note.** Draft, with a deferred ship-by date of **6 months after mainnet**. Not blocking for launch. The window exists because Convex-style capture takes time to develop — third-party wrappers depend on observable veTOKEN supply and gauge-pool size to be worth building. Shipping within 6 months stays ahead of that window without forcing the contract into the launch audit slot.
 
 ---
 
@@ -53,7 +53,7 @@ The contract holds exactly one `VotingEscrow` lock at any time. All deposits ext
 4. `SveToken` calls into `VotingEscrow` to either:
    - Create the pooled lock at max duration (4 years) on the first-ever deposit, or
    - `extendLock` the existing pooled lock back to max duration **and** `increaseAmount` by `amount` on every subsequent deposit (see §6 for cadence).
-5. `SveToken` mints `sveAmount = amount * totalSupply / underlyingTokenBalance` to the depositor (the standard ERC-4626-style appreciation formula). On the first-ever deposit, `sveAmount = amount` (initial 1:1 exchange rate, matching Frax v1 sfrxETH).
+5. `SveToken` mints `sveAmount = amount * totalSupply / underlyingTokenBalance` to the depositor (the standard ERC-4626-style appreciation formula). On the first-ever deposit, `sveAmount = amount` (initial 1:1 exchange rate, matching Frax sfrxETH).
 
 `underlyingTokenBalance` is the TOKEN amount currently held by the pooled `VotingEscrow` lock plus any TOKEN sitting in `SveToken`'s direct balance from accrued yield not yet recompounded.
 
@@ -67,7 +67,7 @@ sveTOKEN appreciates against TOKEN over time. Three sources of appreciation:
    - Auto-compounds: calls `VotingEscrow.increaseAmount` to deposit the claimed TOKEN into the pooled lock. This grows `underlyingTokenBalance` without growing `totalSupply`, raising the exchange rate.
    - Or holds the claimed TOKEN in the `SveToken` contract's direct balance until a recompound batch (see §6); the direct balance is included in `underlyingTokenBalance`, so the exchange rate updates immediately even before the recompound transaction.
 
-2. **Gauge-pool USDC yield** ([ADR 026](026-gauge-boost-tokenomics.md) §3). If the pooled `VotingEscrow` lock holder is also a registered operator (the wrapper is **not** an operator in v1; this is forward-flagged for governance), gauge-pool USDC accrues. Otherwise this leg is zero. In v1 we assume zero — `SveToken` is a passive ve-holder, not an operator.
+2. **Gauge-pool USDC yield** ([ADR 026](026-gauge-boost-tokenomics.md) §3). The wrapper is not an operator (this is forward-flagged for governance), so this leg is zero — `SveToken` is a passive ve-holder.
 
 3. **Auto-compound mechanism for delegator yield.** A keeper or any caller invokes `SveToken.harvestAndCompound()`. This:
    1. Calls `FeeRouter.claimDelegator(epochs)` for any unclaimed epoch buckets.
@@ -111,7 +111,7 @@ A small deposit fee captures wrapper-economy value for the DAO treasury rather t
 
 | Parameter | Default | Min | Max | Governable | Notes |
 | --- | ---: | ---: | ---: | --- | --- |
-| Initial exchange rate | 1.0 sveTOKEN / TOKEN | — | — | No | Frax v1 sfrxETH parity; first-deposit invariant |
+| Initial exchange rate | 1.0 sveTOKEN / TOKEN | — | — | No | Frax sfrxETH parity; first-deposit invariant |
 | Pooled lock target duration | 4 years (max) | 1 week | 4 years | No | Always extended back to max per §5 |
 | Lock extension cadence | Per epoch + opportunistic-on-deposit | per-deposit | per-block | Yes | Default keeps decay ≤ 0.05% between extensions |
 | `depositHaircut` | 0.10% | 0% | 0.50% | Yes | Wrapper-economy revenue to treasury |
@@ -128,21 +128,21 @@ A small deposit fee captures wrapper-economy value for the DAO treasury rather t
 
 The largest open design question. Three options, all viable:
 
-| Option | What sveTOKEN holders get | What the DAO gets | Verdict for v1 |
+| Option | What sveTOKEN holders get | What the DAO gets | Verdict |
 | --- | --- | --- | --- |
 | **A. Direct pass-through** | Each sveTOKEN holder votes their pro-rata share of the underlying ve-balance | Voting power scales with sveTOKEN distribution; resembles direct veTOKEN voting | High UX cost (every sveTOKEN holder needs to vote on every proposal); negates one of the wrapper's main benefits (passive holding) |
-| **B. Wrapper delegates to a DAO multisig with vote-mirroring policy** | Holders enjoy passive yield; do not vote | DAO retains effective control via the multisig; multisig is bound by published mirroring policy | **Recommended for v1** — preserves wrapper's passive-holding utility, keeps governance weight inside the DAO, defers the harder vote-mirroring details to a sub-ADR |
-| **C. Hybrid: snapshot-style off-chain vote of sveTOKEN holders, executed on-chain by a wrapper-controlled relay** | Holders vote off-chain by holding sveTOKEN at snapshot block | DAO sees aggregated sveTOKEN preferences as an input to the on-chain vote | Highest infrastructure burden; best holder representation; defer to v2 |
+| **B. Wrapper delegates to a DAO multisig with vote-mirroring policy** | Holders enjoy passive yield; do not vote | DAO retains effective control via the multisig; multisig is bound by published mirroring policy | **Chosen** — preserves wrapper's passive-holding utility, keeps governance weight inside the DAO, defers the harder vote-mirroring details to a follow-up ADR |
+| **C. Hybrid: snapshot-style off-chain vote of sveTOKEN holders, executed on-chain by a wrapper-controlled relay** | Holders vote off-chain by holding sveTOKEN at snapshot block | DAO sees aggregated sveTOKEN preferences as an input to the on-chain vote | Highest infrastructure burden; best holder representation; deferred follow-up |
 
-**Recommendation for v1: Option B.** The wrapper contract holds the ve-position, the ve-position's voting weight is delegated to a DAO-controlled multisig (per [ADR 009](009-governance.md) emergency multisig topology), and the multisig is bound by a published vote-mirroring policy that defines how it casts the sveTOKEN-attributable votes (e.g., mirror the unwrapped-veTOKEN vote distribution, or default to "abstain" on contentious proposals, etc.).
+**Decision: Option B.** The wrapper contract holds the ve-position, the ve-position's voting weight is delegated to a DAO-controlled multisig (per [ADR 009](009-governance.md) emergency multisig topology), and the multisig is bound by a published vote-mirroring policy that defines how it casts the sveTOKEN-attributable votes (e.g., mirror the unwrapped-veTOKEN vote distribution, or default to "abstain" on contentious proposals, etc.).
 
-**Vote-mirroring policy is deferred to a sub-ADR (provisionally ADR 028.1).** The policy gets contentious — it is a gating choice on what kinds of governance pressure sveTOKEN holders can exert, and on how the DAO can be challenged about the exercise of the wrapper-attributable weight. Pinning down the policy in this ADR would either undersell the question (vague enough to allow capture) or oversell it (specific enough to require a re-vote when reality contradicts it). The sub-ADR slot is reserved for that conversation.
+**Vote-mirroring policy is deferred to a follow-up ADR (provisionally ADR 028.1).** The policy gets contentious — it is a gating choice on what kinds of governance pressure sveTOKEN holders can exert, and on how the DAO can be challenged about the exercise of the wrapper-attributable weight. Pinning it down here would either undersell the question (vague enough to allow capture) or oversell it (specific enough to require a re-vote when reality contradicts it). The follow-up slot is reserved for that conversation.
 
 ### 8. MEV / liquidity considerations
 
 sveTOKEN's utility is entirely a function of secondary-market depth. A liquid secondary market lets holders rotate out at close to fair value; a thin one means sveTOKEN trades at a steep discount to `convertToAssets` and the wrapper provides little usable liquidity over a direct ve-lock.
 
-**DAO seeds initial liquidity.** When `SveToken` launches, the DAO seeds a Balancer V3 80/20 sveTOKEN/TOKEN pool from the protocol treasury (allocation TBD; estimate $200K–$500K notional at v1 prices, governable). The pool is Protocol-Owned-Liquidity per the [ADR 018](018-liquidity-strategy.md) pattern: treasury holds the BPT, no liquidity-mining rewards, MEV defenses (TWAP, private-RPC routing, per-epoch caps) inherited from [ADR 018](018-liquidity-strategy.md).
+**DAO seeds initial liquidity.** When `SveToken` launches, the DAO seeds a Balancer V3 80/20 sveTOKEN/TOKEN pool from the protocol treasury (allocation TBD; estimate $200K–$500K notional at then-current prices, governable). The pool is Protocol-Owned-Liquidity per the [ADR 018](018-liquidity-strategy.md) pattern: treasury holds the BPT, no liquidity-mining rewards, MEV defenses (TWAP, private-RPC routing, per-epoch caps) inherited from [ADR 018](018-liquidity-strategy.md).
 
 The exact pool seeding parameters (size, weights, fee tier) are **out of scope for this ADR** — they are a [ADR 018](018-liquidity-strategy.md) decision and should land there if and when sveTOKEN ships. The commitment this ADR makes is that DAO liquidity seeding **must happen** on or before sveTOKEN launch; without it the wrapper is underwater on day one.
 
@@ -156,14 +156,14 @@ The exact pool seeding parameters (size, weights, fee tier) are **out of scope f
 
 | Phase | Trigger | Action |
 | --- | --- | --- |
-| Pre-launch (v1) | Mainnet launch | sveTOKEN **does not exist**. veTOKEN is the only ve-position type. |
-| Launch window | Within 6 months of v1 mainnet | Audit `SveToken`; seed Balancer V3 sveTOKEN/TOKEN POL; deploy under Timelock; initial deposits open |
+| Pre-launch | Mainnet launch | sveTOKEN **does not exist**. veTOKEN is the only ve-position type. |
+| Launch window | Within 6 months of mainnet | Audit `SveToken`; seed Balancer V3 sveTOKEN/TOKEN POL; deploy under Timelock; initial deposits open |
 | Steady state | 6+ months after launch | Auto-compound keepers active; haircut accruing to treasury; secondary market provides exit |
 | Wind-down (only if invoked) | Governance vote to stop extensions | Lock decays to expiry; `redeemAfterExpiry` opens after decay completes |
 
-**Why deferred to within 6 months of v1 — not at v1?** Shipping a native wrapper requires (a) observable veTOKEN supply and gauge-pool revenue to make the wrapper economically meaningful, (b) Balancer V3 POL depth to seed against, and (c) audit slots not consumed by the v1 contract surface (`FeeRouter`, `VotingEscrow`, `SafetyReserve`). A v1-concurrent wrapper has all three constraints binding simultaneously; a 6-month-deferred wrapper has none. The Convex-capture risk window is ~12–18 months, so 6 months is a comfortable margin while still preserving v1 launch focus.
+**Why deferred — not at launch?** Shipping a native wrapper requires (a) observable veTOKEN supply and gauge-pool revenue to make the wrapper economically meaningful, (b) Balancer V3 POL depth to seed against, and (c) audit slots not consumed by the launch contract surface (`FeeRouter`, `VotingEscrow`, `SafetyReserve`). A launch-concurrent wrapper has all three constraints binding simultaneously; a 6-month-deferred wrapper has none. The Convex-capture risk window is ~12–18 months, so 6 months is a comfortable margin.
 
-**Not blocking for v1.** v1 ships with [ADR 026](026-gauge-boost-tokenomics.md)'s `VotingEscrow` only. Third-party wrapper risk in the first 6 months is bounded by the same constraints (a) (b) above; it is unattractive to attack a wrapper economy with no liquid float.
+**Not blocking for launch.** The launch deployment ships with [ADR 026](026-gauge-boost-tokenomics.md)'s `VotingEscrow` only. Third-party wrapper risk in the first 6 months is bounded by the same constraints (a) (b) above; it is unattractive to attack a wrapper economy with no liquid float.
 
 ### 10. Risks specific to wrapper design
 
@@ -182,7 +182,7 @@ The exact pool seeding parameters (size, weights, fee tier) are **out of scope f
 
 - **Convex-capture defense.** Native wrapper exists before a third party ships one; wrapper-economy revenue accrues to the DAO; governance weight stays inside via Option B vote-mirroring.
 - **Liquidity without breaking the commitment device.** Underlying lock is untouched; [ADR 026](026-gauge-boost-tokenomics.md) §4 "no early exit" invariant preserved.
-- **Auto-compounded delegator-pool yield** (the v3 "real yield in TOKEN" lever) packaged for passive holders.
+- **Auto-compounded delegator-pool yield** (the "real yield in TOKEN" lever) packaged for passive holders.
 - **Mature precedent.** Frax sfrxETH has 2+ years at $400M+ TVL with a tight ~1% discount band; audit playbook is known.
 
 ### Negative
