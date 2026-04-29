@@ -97,24 +97,26 @@ fn rank_candidates_with_rng(
 }
 
 /// Walk the score-sorted slice and emit each within-1% tie group using the
-/// ADR 008 §9 tie-break tiers. Geo diversity is stateful — once a region has
-/// been emitted to the output, candidates in unseen regions are preferred for
-/// the next pick within the current tie group.
+/// ADR 008 §9 tie-break tiers. Geo diversity is scoped to the current tie
+/// group: candidates within a single within-1% group are spread across
+/// regions, but the tracker is reset between groups so unrelated tie groups
+/// don't bias each other's geo tier.
 fn apply_tiebreaker(ranked: &mut Vec<RankedCandidate>, rng: &mut impl rand::Rng) {
-    let mut emitted_regions: HashSet<String> = HashSet::new();
     let mut output: Vec<RankedCandidate> = Vec::with_capacity(ranked.len());
 
     let mut start = 0;
     while start < ranked.len() {
         let end = tie_group_end(ranked, start);
-        // Drain the tie group from the input slice. We re-pick into `output`
-        // one at a time, refreshing `emitted_regions` between picks so geo
-        // diversity reflects what has actually been emitted.
+        // Geo diversity is scoped to the current tie group: candidates within
+        // a single within-1% group are spread across regions, but the tracker
+        // is reset between groups so unrelated tie groups don't bias each
+        // other's geo tier (ADR 008 §9 — tie-break is per group).
+        let mut group_regions: HashSet<String> = HashSet::new();
         let mut group: Vec<RankedCandidate> = ranked
             .get(start..end)
             .map_or_else(Vec::new, <[RankedCandidate]>::to_vec);
         while !group.is_empty() {
-            let pick_idx = pick_best_in_group(&group, &emitted_regions, rng);
+            let pick_idx = pick_best_in_group(&group, &group_regions, rng);
             // pick_best_in_group always returns a valid index when the slice
             // is non-empty; defensive default is index 0.
             let pick = if pick_idx < group.len() {
@@ -122,7 +124,7 @@ fn apply_tiebreaker(ranked: &mut Vec<RankedCandidate>, rng: &mut impl rand::Rng)
             } else {
                 group.remove(0)
             };
-            emitted_regions.insert(pick.candidate.region.clone());
+            group_regions.insert(pick.candidate.region.clone());
             output.push(pick);
         }
         start = end;
@@ -547,5 +549,53 @@ mod tests {
         let out = top_n(vec![dear, cheap, mid], 2);
         let ids: Vec<u8> = out.iter().map(|r| r.candidate.node_id[0]).collect();
         assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn geo_tier_resets_between_tie_groups() {
+        // Two tie groups, each with two candidates. Tier 1 group has score ~10
+        // (rate 1, rtt 10, rep 1.0). Tier 2 group has score ~1000 (rate 100,
+        // rtt 10, rep 1.0). Within each group candidates are tied by score and
+        // load. Each group has one US and one non-US candidate. If geo tracking
+        // leaked across groups, the second group's first pick would be biased
+        // away from whatever region the first group emitted; with proper
+        // per-group reset, both groups behave independently.
+        //
+        // Concretely: pick a seeded RNG that, for the FIRST group,
+        // deterministically picks US first (so group_regions={US} at that
+        // moment). Then verify the SECOND group's first pick can be either US
+        // or non-US (i.e., across many seeds we observe both — proving group 2
+        // wasn't biased by group 1's US).
+        let g1_us = with_region(with_load(make_candidate(1, 1, 10, 1.0), 0, 50), "US");
+        let g1_de = with_region(with_load(make_candidate(2, 1, 10, 1.0), 0, 50), "DE");
+        let g2_us = with_region(with_load(make_candidate(3, 100, 10, 1.0), 0, 50), "US");
+        let g2_jp = with_region(with_load(make_candidate(4, 100, 10, 1.0), 0, 50), "JP");
+
+        // Run with many seeds. We want to find at least one seed where group 1
+        // emits US first AND group 2 emits US first. With per-group reset that's
+        // possible (~1/4 of seeds); with cross-group leak group 2 always avoids
+        // US after group 1 emits US, so we'd never see this.
+        let mut saw_g2_us_after_g1_us = false;
+        for seed in 0u64..64 {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            let out = rank_candidates_with_rng(
+                vec![g1_us.clone(), g1_de.clone(), g2_us.clone(), g2_jp.clone()],
+                &mut rng,
+            );
+            let regions: Vec<String> = out.iter().map(|r| r.candidate.region.clone()).collect();
+            // Group 1 (lower score) is at indices 0..2; group 2 at 2..4.
+            // We need: regions[0] == "US" (group 1 first emit) AND
+            //         regions[2] == "US" (group 2 first emit).
+            let g1_first_us = regions.first().map(String::as_str) == Some("US");
+            let g2_first_us = regions.get(2).map(String::as_str) == Some("US");
+            if g1_first_us && g2_first_us {
+                saw_g2_us_after_g1_us = true;
+                break;
+            }
+        }
+        assert!(
+            saw_g2_us_after_g1_us,
+            "geo tier should reset between tie groups; without reset, group 2 would never pick US first after group 1 picked US"
+        );
     }
 }
