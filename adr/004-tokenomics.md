@@ -1,7 +1,15 @@
 # ADR 004: Dual-Currency Token Model
 
 **Date:** 2026-03-28
-**Status:** Draft
+**Status:** Superseded by [ADR 026](026-tokenomics-v3.md)
+
+## Superseded
+
+This ADR is fully superseded by [ADR 026](026-tokenomics-v3.md), which adopts the v3 economic model: 1B fixed supply, 30/24/19/15/10/2 allocation, 40/40/7/5/5/3 FeeRouter split with safety reserve, Curve-style gauge-boost mechanism, opt-in `VotingEscrow` (no auto-ve-lock-on-vest), and USDC pre-seed bootstrap (replacing the TOKEN bootstrap fund).
+
+Token distribution, fee allocation, fee discount mechanic, bootstrap fund design, slashing distribution, and node unit-economics in the sections below are no longer current. The slashing rate schedule (5%/15%/50%) carries over; the burn/challenger split is updated to 50% challenger / 30% safety reserve / 20% burn under ADR 026.
+
+The remainder of this ADR is preserved as historical record only.
 
 ## Context
 

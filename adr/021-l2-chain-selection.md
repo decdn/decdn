@@ -196,6 +196,54 @@ This ADR resolves the deferral in ADR 004 and formalises implicit assumptions in
 The production deployment runbook (ADR 016) should substitute Arbitrum Sepolia addresses
 for Arbitrum One mainnet equivalents at each step. No contract logic changes are required.
 
+### v3 Tokenomics Validation Requirements
+
+[ADR 026](026-tokenomics-v3.md) introduces two new gas-cost surfaces that the L2 selection
+in this ADR must be re-validated against before mainnet deployment of v3 contracts. Both
+surfaces are economic, not architectural — they do not invalidate the Arbitrum One choice
+above, but they must be quantified on the chosen L2 with measured (not estimated) gas
+numbers prior to mainnet launch.
+
+1. **`FeeRouter` byte-counter overhead per settlement.** Every `settleChannel` call in v3
+   routes through `FeeRouter.routeSettlement(operator, bytesDelivered, amount)`, which
+   increments an operator's per-epoch `bytes_delivered` counter (ADR 026 §2 epoch
+   mechanics). This is **5–15K gas of overhead** on top of the existing settlement
+   transaction. At 100K settlements/year for a medium operator, the overhead alone is
+   roughly **$8–$1,500/yr** at typical L2 gas prices — the spread is wide, and the
+   actual cost on Arbitrum One must be measured against current fee markets rather than
+   estimated. The aggregate per-settlement gas (including this overhead) must remain
+   within operator-affordability bounds — cite the operator P&L cases in
+   [ADR 026 §7](026-tokenomics-v3.md) as the affordability reference.
+
+2. **Per-epoch keeper-call gas economics.** v3 requires **two TWAP-protected USDC→TOKEN
+   swap keeper calls per epoch**: one for `BuybackBurner` (5% buyback-and-burn flow,
+   inflow source change per [ADR 018](018-liquidity-strategy.md)) and one for the
+   delegator-pool USDC→TOKEN conversion (7% delegator-pool flow per
+   [ADR 026 §6](026-tokenomics-v3.md)). At a 1-week epoch length, that is
+   **52+ swap executions per year minimum**, both routed through the Balancer V3 80/20
+   TOKEN/USDC pool with TWAP windows, `minOut` bounds, and per-epoch liquidity caps.
+   Per-epoch keeper costs must be sized at S2/S3 scale (the regimes where
+   liquidity caps bind per [ADR 026 §8](026-tokenomics-v3.md) and the economic-model
+   spec) and confirmed not to be cost-prohibitive against the inflow each call routes.
+
+3. **Combined L2-selection validation gate.** Before mainnet deployment of v3 contracts,
+   the selection criteria in this ADR MUST additionally verify that:
+   - Aggregate per-settlement gas (USDC-equivalent per settlement, including the
+     `FeeRouter` byte-counter overhead) is within the operator-affordability bounds set
+     by the operator P&L cases in [ADR 026 §7](026-tokenomics-v3.md).
+   - Per-epoch keeper costs for the two TWAP swaps are not cost-prohibitive at S2/S3
+     network scale and remain a small fraction of the inflow each call routes.
+   - The chosen L2 supports private-RPC routing (Flashbots-style transaction bundles)
+     to satisfy the hardened MEV-protection requirement that [ADR 018](018-liquidity-strategy.md)
+     adopts under v3 (private RPC required, per-epoch liquidity caps required — both
+     mandatory, not optional). If the L2 lacks a viable private-RPC route, the v3
+     swap path's MEV defense is not deployable as designed.
+
+These requirements are additive to (not a replacement for) the selection criteria in
+this ADR. Specific gas tables are intentionally omitted here — they must be measured
+during v3 contract integration testing on Arbitrum Sepolia and re-confirmed against
+Arbitrum One fee markets at deployment time, not estimated in advance.
+
 ### Re-evaluation Triggers
 
 This decision SHOULD be revisited by governance if:
