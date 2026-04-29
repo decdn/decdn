@@ -543,57 +543,15 @@ Under [ADR 026](026-gauge-boost-tokenomics.md), `StablePaymentChannel.settleChan
 
 #### Settlement-path interface
 
-```solidity
-interface IFeeRouter {
-    /// Routes a single channel settlement.
-    /// MUST be invoked by `StablePaymentChannel.settleChannel` in the same
-    /// transaction as the USDC `safeTransferFrom` of `amount` from the channel
-    /// contract to the router. The router pays the operator's 40% base share
-    /// to `operator` in this same transaction; remaining buckets are
-    /// dispatched per ADR 026 §2 (5% / 5% / 3% same-tx, 40% / 7% epoch-bucketed).
-    /// Increments `bytesPerEpoch[operator]` for the current epoch.
-    function routeSettlement(address operator, uint256 bytesDelivered, uint256 amount) external;
-
-    // Pull-based claim paths (operators / delegators); not invoked by StablePaymentChannel.
-    function claimBoost(uint256[] calldata epochs) external;
-    function claimDelegator(uint256[] calldata epochs) external;
-
-    // Views
-    function bytesPerEpoch(address operator, uint256 epoch) external view returns (uint256);
-    function workingBytes(address operator, uint256 epoch) external view returns (uint256);
-    function currentEpoch() external view returns (uint256);
-}
-```
-
-#### Events (settlement-relevant subset)
-
-```solidity
-// Emitted once per routeSettlement call. The router emits its own bucket-level
-// events in addition; ChannelSettled (above) is emitted by StablePaymentChannel.
-event SettlementRouted(
-    address indexed operator,
-    uint256 indexed epoch,
-    uint256 bytesDelivered,
-    uint256 amount,           // total USDC received from StablePaymentChannel
-    uint256 baseShare,        // 40% paid same-tx to operator
-    uint256 boostPoolDelta,   // 40% added to gauge-pool epoch bucket
-    uint256 delegatorDelta,   // 7% added to delegator-pool epoch bucket
-    uint256 burnShare,        // 5% forwarded to BuybackBurner
-    uint256 treasuryShare,    // 5% forwarded to treasury
-    uint256 safetyShare       // 3% forwarded to SafetyReserve
-);
-```
-
-The full event set (epoch rollover, claim events, governance updates, swap events) is owned by [ADR 016](016-contract-interactions.md) and ADR 026; this ADR documents only the settlement-path event so the `StablePaymentChannel` ↔ `FeeRouter` boundary is unambiguous.
+`StablePaymentChannel.settleChannel` MUST invoke `FeeRouter.routeSettlement(address operator, uint256 bytesDelivered, uint256 amount)` in the same transaction as the USDC `safeTransferFrom` to the router. The router pays the operator's 40% base share in that transaction, dispatches the 5% / 5% / 3% same-tx legs, and increments `bytesPerEpoch[operator]` for the current epoch. The full `IFeeRouter` interface (claim paths, epoch views) is canonical in [ADR 016](016-contract-interactions.md).
 
 #### Settlement-path invariants
 
-1. **Atomic base-share payout.** The operator's 40% base share MUST land in the operator's wallet in the same transaction as `StablePaymentChannel.settleChannel`. No claim step, no keeper, no off-chain queue. This is the Case A cashflow guarantee from [ADR 026 §7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake).
-2. **Same-tx satellite legs.** The 5% buyback, 5% treasury, and 3% safety legs MUST also transfer in the same transaction. Only the 40% gauge and 7% delegator buckets accumulate (epoch-bucketed; pull-based claim per [ADR 026 §2](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553)).
-3. **Conservation.** The sum of `baseShare + boostPoolDelta + delegatorDelta + burnShare + treasuryShare + safetyShare` MUST equal `amount`. Rounding dust (sub-USDC-base-unit) accrues to the treasury bucket; the router MUST NOT retain unaccounted USDC.
-4. **Epoch consistency.** `bytesPerEpoch[operator]` is incremented atomically with the share calculation; the bucket deltas use the same epoch index that frames the byte counter increment. No cross-epoch settlement is permitted.
-5. **No reentry.** `routeSettlement` MUST follow checks-effects-interactions. `StablePaymentChannel.settleChannel` MUST hold a `nonReentrant` guard for the duration of the router call (the router itself does not invoke back into `StablePaymentChannel`).
-6. **One settlement per channel.** `StablePaymentChannel` enforces the existing "settle once per channel" rule via its `Closed` status; the router does not need to re-enforce it but MUST tolerate duplicate calls in adversarial scenarios (idempotency or revert; this ADR does not pin the choice — see [ADR 016](016-contract-interactions.md)).
+1. **Atomic base-share payout.** The 40% base share MUST land in the operator's wallet in the same transaction as `settleChannel` — no claim step, no keeper, no off-chain queue. This is the Case A cashflow guarantee from [ADR 026 §7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake).
+2. **No reentry.** `settleChannel` holds a `nonReentrant` guard for the duration of the router call.
+3. **One settlement per channel.** Enforced by the existing `Closed` status; the router need only tolerate duplicate calls (idempotency or revert — pinned in [ADR 016](016-contract-interactions.md)).
+
+Conservation, same-tx satellite legs (5%/5%/3%), and epoch-consistency invariants live with the router itself in [ADR 026 §2](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553) / [ADR 016](016-contract-interactions.md). The `SettlementRouted` event (operator + epoch + per-bucket deltas) is emitted by the router; full event set is in [ADR 016](016-contract-interactions.md).
 
 #### Cache-miss bypass (node-to-node paid pulls)
 
@@ -606,47 +564,7 @@ The full event set (epoch rollover, claim events, governance updates, swap event
 
 #### Settlement sequence
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Cli as Client
-    participant PC as StablePaymentChannel
-    participant USDC as USDC (ERC-20)
-    participant FR as FeeRouter
-    participant Op as Operator
-    participant BB as BuybackBurner
-    participant T as Treasury
-    participant SR as SafetyReserve
-
-    Note over Cli,SR: Channel close → dispute window → settlement (client→node path)
-    Cli->>PC: closeChannel(channelId, amount, nonce, bytesDelivered, sig)
-    PC->>PC: status = Closing<br/>claimedAmount, claimedNonce, claimedBytes recorded
-    Note over PC: Dispute window<br/>(default 48 h)
-    Cli-->>PC: (optional) disputeChannel(...) — higher-nonce voucher
-    Note over PC: After disputeDeadline...
-    Op->>PC: settleChannel(channelId)
-    PC->>USDC: safeTransfer(client, deposit - claimedAmount)
-    PC->>USDC: safeTransfer(FeeRouter, claimedAmount)
-    PC->>FR: routeSettlement(operator, claimedBytes, claimedAmount)
-    FR->>USDC: transfer(operator, 40% × amount)
-    FR->>USDC: transfer(BuybackBurner, 5% × amount)
-    FR->>USDC: transfer(Treasury, 5% × amount)
-    FR->>USDC: transfer(SafetyReserve, 3% × amount)
-    Note over FR: bytesPerEpoch[op][e] += claimedBytes<br/>boostPool[e]    += 40% × amount<br/>delegatorPool[e] += 7% × amount
-    FR-->>PC: (return)
-    PC->>PC: status = Closed<br/>emit ChannelSettled
-    Note over Op,FR: Operator claims gauge / delegator pool<br/>via FeeRouter.claimBoost / claimDelegator<br/>(epoch-bucketed, see ADR 026 §2)
-
-    participant N as Pulling node
-    participant O as Origin-backed node
-    Note over N,O: Node-to-node cache-miss paid pull (bypass — no router involvement)
-    rect rgba(255, 240, 220, 0.6)
-        N->>PC: settleChannel(channelId)
-        PC->>USDC: safeTransfer(N, deposit - claimedAmount)
-        PC->>USDC: safeTransfer(O, claimedAmount)
-        Note over PC,O: No FeeRouter call.<br/>No bytesPerEpoch increment.<br/>Watchtowers still observe.
-    end
-```
+End-to-end USDC flow (client→node settlement, then the parallel cache-miss bypass) is diagrammed in [ADR 016 §"FeeRouter integration"](016-contract-interactions.md). This ADR documents only the `StablePaymentChannel ↔ FeeRouter` interface contract.
 
 #### PoC stub
 

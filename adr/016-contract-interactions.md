@@ -314,29 +314,7 @@ Cold-start operators (`lastSettlementAt == 0`) sink to the bottom by recency but
 
 #### USDC Flow (Payments)
 
-**PoC (StablePaymentChannel; ADR 004 fee model):**
-
-```mermaid
-flowchart TD
-    Client["Client (USDC holder)"]
-    SPC["StablePaymentChannel<br/>(escrow)"]
-    Provider["Provider (node operator)"]
-    Treasury["Treasury (EOA)"]
-    BB["BuybackBurner"]
-    BAL["Balancer V3 Router<br/>(→ 80/20 TOKEN/USDC Weighted Pool)"]
-    BURN["Burn Address<br/>(0x...dEaD)"]
-
-    Client -->|"openChannel() / topUp()<br/>deposit USDC"| SPC
-    SPC -->|"settleChannel()<br/>earned fees"| Provider
-    SPC -->|"settleChannel()<br/>protocol fee (default 3% / 1.5% discounted)"| Treasury
-    SPC -->|"settleChannel()<br/>unused balance"| Client
-    Treasury -->|"20% of fees (manual PoC)"| BB
-    BB -->|"Router.swapSingleTokenExactIn() (see ADR 018)"| BAL
-    BAL -->|"TOKEN"| BB
-    BB -->|"burn()"| BURN
-```
-
-**v3 production (PaymentChannel + FeeRouter; ADR 026 split):**
+The PoC flow (`StablePaymentChannel` + manual treasury → buyback) is documented in [ADR 003](003-payments.md) and [ADR 004](004-tokenomics.md). The v3 production flow:
 
 ```mermaid
 flowchart TD
@@ -372,18 +350,7 @@ flowchart TD
     DELE -->|"claimDelegator(epochs[])"| LockerClaim
 ```
 
-**Fee allocation (PoC, ADR 004 protocol-fee buckets):**
-
-| Allocation | Share | Recipient |
-| --- | --- | --- |
-| Development fund | 40% | Treasury |
-| Bug bounties & audits | 20% | Treasury |
-| Ecosystem grants | 20% | Treasury |
-| Token buyback & burn | 20% | BuybackBurner |
-
-In PoC, sub-allocation is manual (admin key).
-
-**Fee allocation (v3 production, FeeRouter six-bucket split):** see [ADR 026](026-gauge-boost-tokenomics.md) §2 for the canonical 40/40/7/5/5/3 table — node base / gauge boost pool / delegator pool / buyback-and-burn / treasury / safety reserve. This ADR does not duplicate the bucket table. Treasury disbursement requires a governance proposal ([ADR 009](009-governance.md)).
+The canonical 40/40/7/5/5/3 split is in [ADR 026](026-gauge-boost-tokenomics.md) §2; this ADR does not duplicate the bucket table. Treasury disbursement requires a governance proposal ([ADR 009](009-governance.md)).
 
 #### TOKEN Flow (Staking & Slashing)
 
@@ -463,16 +430,9 @@ Full parameter table with safety bounds is in [ADR 009](009-governance.md#govern
 | **Minimum stake (v3 production)** | **50,000 TOKEN (default)** | **per [ADR 026](026-gauge-boost-tokenomics.md) §7** | **StakingRegistry — discount-threshold logic removed** |
 | Challenge bond | 1 TOKEN | 1,000 TOKEN | SlashJudge (note: [ADR 009](009-governance.md) lists this under StakingRegistry; SlashJudge is correct per [ADR 014](014-on-chain-verification.md)) |
 | Unbonding period | 3 days | 30 days | StakingRegistry |
-| **FeeRouter share — node base (v3)** | **20%** | **80%** | **FeeRouter (default 40%)** |
-| **FeeRouter share — gauge boost (v3)** | **0%** | **60%** | **FeeRouter (default 40%)** |
-| **FeeRouter share — delegator pool (v3)** | **0%** | **30%** | **FeeRouter (default 7%)** |
-| **FeeRouter share — burn (v3)** | **0%** | **25%** | **FeeRouter (default 5%)** |
-| **FeeRouter share — treasury (v3)** | **0%** | **20%** | **FeeRouter (default 5%)** |
-| **FeeRouter share — safety (v3)** | **0%** | **15%** | **FeeRouter (default 3%)** |
-| **`boostFloor` (v3)** | **0.2** | **0.8** | **FeeRouter (default 0.4)** |
 | **VotingEscrow lock duration (v3)** | **1 week (min)** | **4 years (max)** | **VotingEscrow** (`immutable`) |
 
-Safety bounds are `immutable` — hardcoded in constructors, not overridable by governance or admin. v3 FeeRouter shares are governable within the bounds above; sum-to-100% across the six router shares is enforced on every governance update ([ADR 026](026-gauge-boost-tokenomics.md) §11).
+The six v3 FeeRouter shares (with their bounds and defaults) and `boostFloor` are governed in `FeeRouter` per [ADR 026 §11](026-gauge-boost-tokenomics.md#11-governable-parameters-with-safety-bounds); sum-to-100% across the six shares is enforced on every governance update. Other safety bounds are `immutable` — hardcoded in constructors, not overridable by governance or admin.
 
 #### Emergency Multisig (Production)
 
