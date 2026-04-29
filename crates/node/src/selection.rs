@@ -5,6 +5,7 @@
 //! result in order and stops after `MAX_PROVIDER_ATTEMPTS` failed providers.
 
 use decdn_protocol::gossip::LoadHint;
+use std::collections::HashSet;
 
 /// Maximum providers to attempt before reporting a fetch failure to the
 /// caller (issue #322 — "max 3 provider attempts before returning error").
@@ -94,18 +95,81 @@ fn rank_candidates_with_rng(
     ranked
 }
 
-/// Walk the score-sorted slice and re-order each within-1% tie group using
-/// the load tie-break (Tier 1 of ADR 008 §9). Tiers 2–4 are layered on top
-/// in subsequent tasks.
-fn apply_tiebreaker(ranked: &mut [RankedCandidate]) {
+/// Walk the score-sorted slice and emit each within-1% tie group using the
+/// ADR 008 §9 tie-break tiers. Geo diversity is stateful — once a region has
+/// been emitted to the output, candidates in unseen regions are preferred for
+/// the next pick within the current tie group.
+fn apply_tiebreaker(ranked: &mut Vec<RankedCandidate>) {
+    let mut emitted_regions: HashSet<String> = HashSet::new();
+    let mut output: Vec<RankedCandidate> = Vec::with_capacity(ranked.len());
+
     let mut start = 0;
     while start < ranked.len() {
         let end = tie_group_end(ranked, start);
-        if let Some(group) = ranked.get_mut(start..end) {
-            group.sort_by(|a, b| compare_load(a.candidate.load, b.candidate.load));
+        // Drain the tie group from the input slice. We re-pick into `output`
+        // one at a time, refreshing `emitted_regions` between picks so geo
+        // diversity reflects what has actually been emitted.
+        let mut group: Vec<RankedCandidate> = ranked
+            .get(start..end)
+            .map_or_else(Vec::new, <[RankedCandidate]>::to_vec);
+        while !group.is_empty() {
+            let pick_idx = pick_best_in_group(&group, &emitted_regions);
+            // pick_best_in_group always returns a valid index when the slice
+            // is non-empty; defensive default is index 0.
+            let pick = if pick_idx < group.len() {
+                group.remove(pick_idx)
+            } else {
+                group.remove(0)
+            };
+            emitted_regions.insert(pick.candidate.region.clone());
+            output.push(pick);
         }
         start = end;
     }
+    *ranked = output;
+}
+
+/// Return the index in `group` of the candidate that wins the tie under the
+/// load → geo (relative to `emitted_regions`) tiers. (Stake + random tiers
+/// land in tasks 6 and 7.)
+fn pick_best_in_group(group: &[RankedCandidate], emitted_regions: &HashSet<String>) -> usize {
+    // Find candidates with the lowest load.
+    let load_winner_load = group
+        .iter()
+        .map(|r| &r.candidate.load)
+        .min_by(|a, b| compare_load(**a, **b));
+    let load_winner_load = match load_winner_load {
+        Some(l) => *l,
+        None => return 0,
+    };
+    // Build the set of candidates tied at the lowest load.
+    let load_tied: Vec<usize> = group
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| compare_load(r.candidate.load, load_winner_load).is_eq())
+        .map(|(i, _)| i)
+        .collect();
+
+    // Tier 2: prefer regions not in `emitted_regions`. If any load-tied
+    // candidate is in an unseen region, restrict to those.
+    let geo_pool: Vec<usize> = load_tied
+        .iter()
+        .copied()
+        .filter(|i| {
+            group
+                .get(*i)
+                .is_some_and(|r| !emitted_regions.contains(&r.candidate.region))
+        })
+        .collect();
+    let pool = if geo_pool.is_empty() {
+        &load_tied
+    } else {
+        &geo_pool
+    };
+
+    // Defensive: pool is non-empty if group is non-empty (load_tied always
+    // contains at least the candidate that supplied load_winner_load).
+    pool.first().copied().unwrap_or(0)
 }
 
 /// Return the exclusive end index of the tie group beginning at `start`.
@@ -220,6 +284,11 @@ mod tests {
         c
     }
 
+    fn with_region(mut c: Candidate, region: &str) -> Candidate {
+        c.region = region.to_string();
+        c
+    }
+
     #[test]
     fn rank_empty_returns_empty() {
         let out = rank_candidates(vec![]);
@@ -282,5 +351,29 @@ mod tests {
         let dear = with_load(make_candidate(2, 1020, 1, 1.0), 0, 10); // score 1020
         let out = rank_candidates(vec![cheap, dear]);
         assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(1));
+    }
+
+    #[test]
+    fn geo_diversity_prefers_unseen_region() {
+        // Three candidates, all tied by score AND load. Two are in US, one in DE.
+        // Expected order: any one US, then DE, then the other US (geo prefers
+        // unseen region for the second pick).
+        let us1 = with_region(with_load(make_candidate(1, 100, 10, 1.0), 0, 50), "US");
+        let us2 = with_region(with_load(make_candidate(2, 100, 10, 1.0), 0, 50), "US");
+        let de = with_region(with_load(make_candidate(3, 100, 10, 1.0), 0, 50), "DE");
+        let out = rank_candidates(vec![us1, us2, de]);
+        let regions: Vec<String> = out.iter().map(|r| r.candidate.region.clone()).collect();
+        assert_eq!(regions.first().map(String::as_str), Some("US"));
+        assert_eq!(regions.get(1).map(String::as_str), Some("DE"));
+        assert_eq!(regions.get(2).map(String::as_str), Some("US"));
+    }
+
+    #[test]
+    fn geo_diversity_only_applies_within_tie_group() {
+        // Distinct scores → geo tier irrelevant, raw score order wins.
+        let us = with_region(make_candidate(1, 1000, 10, 1.0), "US"); // score 10000
+        let de = with_region(make_candidate(2, 100, 10, 1.0), "DE"); // score 1000
+        let out = rank_candidates(vec![us, de]);
+        assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(2));
     }
 }
