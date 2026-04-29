@@ -10,24 +10,24 @@
 
 ## Context
 
-[ADR 004](004-tokenomics.md) defined the original 1B-token model with a 3% protocol fee, 80/20 dev/audit/eco/burn allocation, a 200M-TOKEN node-bootstrap fund, a regressive fee-discount mechanic for large stakers, and 50/50 burn/challenger slashing distribution. Eighteen months of design iteration (captured in the source design spec §1 and the v3-era specs in `docs/superpowers/specs/`) surfaced four structural weaknesses that the cosmetic-fix surface area in ADR 004 cannot reach:
+A bandwidth-CDN protocol with paid byte delivery, slashable operator stake, and on-chain settlement needs an economic model that holds up under four pressures:
 
-1. **Burn flow is structurally noise.** At a 1,000-node mature network, ADR 004's burn rate is ~0.014%/yr of supply (20% of 3% of revenue at $0.05 TOKEN), well below the ~22%/yr circulating-supply growth from vesting unlocks. Burn is the only deflationary lever in ADR 004; it is not enough.
-2. **No yield path to token holders.** ADR 004's only utilities for TOKEN are stake-to-operate, fee discount, and governance. Passive holders earn nothing from network usage; long-term lockers have no compensation lever distinct from short-term holders.
-3. **Regressive fee discount.** "Stake 10× minimum for 1.5% fee" reduces the buyback flow as more operators qualify — large stakers weaken the deflationary sink. The mechanic is non-progressive and non-aligned with long-term commitment.
-4. **TOKEN-denominated bootstrap is reflexive.** The 200M-TOKEN bootstrap fund is most valuable when TOKEN is healthy and least valuable when subsidies are most needed. Single-asset reflexivity is the dominant tail risk for early operator recruitment.
+1. **A deflationary lever that scales with network usage.** A nominally "deflationary" token model whose burn rate sits well below circulating-supply growth from vesting unlocks is structurally inflationary in practice. Burn must be sized to compete with vesting flows at mature scale.
+2. **A real-yield path to token holders.** Passive holders need compensation tied to network usage; long-term lockers need a compensation lever distinct from short-term holders. Without one, governance weight, liquidity provision, and long-term capital formation all weaken.
+3. **A progressive operator incentive.** Per-operator return must scale with long-term commitment, not with stake size alone. A flat-rate or regressive mechanic (e.g., a fee discount that grows with raw stake) attracts capital without aligning it.
+4. **A TOKEN-price-insulated bootstrap.** Subsidies denominated in the token they're meant to bootstrap collapse in purchasing power exactly when most needed. Bootstrap capital must be denominated in a unit independent of the protocol's own TOKEN price.
 
-The v3 redesign is structural, not cosmetic. Burn becomes a secondary deflationary lever; real yield to delegators / ve-lockers, supply discipline via fixed-supply-plus-vesting (no auto-ve-lock-on-vest), USDC-denominated bootstrap, and a direct operator-compensation link to ve-commitment via a Curve-style gauge boost become primary.
+This ADR is the canonical economic model addressing all four. Burn is one of several deflationary levers; real yield in TOKEN flows to delegators and ve-lockers; operator compensation differentiates by long-term ve-commitment via a Curve-style gauge boost rather than by a discounted skim percentage; bootstrap is USDC-denominated. Full design reasoning, MEV-defense analysis, equilibrium-stability argument, and reference-implementation pointers live in the source design spec; this ADR is the decision layer.
 
 **Inputs assumed by this ADR.** Pre-launch design with no holder-compensation or contract-migration concerns. ~$1M+ pre-seed USDC capital secured (planning target $3M) — program structure defined in companion [ADR 030](030-preseed-usdc-deployment.md). 2026 unmetered-bandwidth provider economics per the design spec's input matrix (1 Gbps VPS, 10 Gbps dedicated, 100 Gbps edge tiers); dedicated-bandwidth nodes are realistic at every scale band the protocol is sized for.
+
+Earlier internal drafts of the tokenomics model (the original [ADR 004](004-tokenomics.md) and intermediate variants) explored alternative shapes — a flat protocol-fee skim, a 200M-TOKEN bootstrap fund, a regressive fee-discount mechanic, auto-ve-lock-on-vest. Those are documented in [Alternatives Considered](#alternatives-considered) below.
 
 ---
 
 ## Decision
 
-The protocol adopts the v3 economic model in full. Token distribution, fee allocation, fee-discount mechanic, bootstrap fund, and slashing distribution from ADR 004 are replaced. The slashing rate schedule (5% / 15% / 50%) and the lifetime offense counter from ADR 004 carry over unchanged.
-
-The full design reasoning, MEV-defense analysis, equilibrium-stability argument, and reference-implementation pointers live in the source design spec; this ADR is the decision layer. Where a table fully duplicates one in the spec, this ADR shows the canonical defaults and points to the spec for the surrounding analysis.
+The protocol's economic model is defined by the following sections. Where a table fully duplicates one in the source design spec, this ADR shows the canonical defaults and points to the spec for the surrounding analysis.
 
 ### 1. Supply and distribution
 
@@ -47,13 +47,13 @@ The full design reasoning, MEV-defense analysis, equilibrium-stability argument,
 
 **Genesis liquid supply.** 120,000,000 TOKEN (POL + public sale / airdrop). All other buckets release on vesting schedules.
 
-**No auto-ve-lock on vest.** Vesting contracts release TOKEN unlocked into the recipient's wallet. Locking into `VotingEscrow` is opt-in. Rationale: the gauge-boost mechanism (§2) supplies a stronger and voluntary economic incentive to ve-lock than auto-lock did, the v3 model removes the "force long-term alignment via vesting contract" pattern in favor of "compensate long-term alignment via gauge boost," and seed/team term sheets are simpler under this design. The cost is a thinner initial veTOKEN base than the v2 interim designs; governance bootstrap may require treasury-funded ve-lock-on-claim airdrops in the first 6–12 months (see §9).
+**No auto-ve-lock on vest.** Vesting contracts release TOKEN unlocked into the recipient's wallet. Locking into `VotingEscrow` is opt-in. Rationale: the gauge-boost mechanism (§2) supplies a strong voluntary economic incentive to ve-lock without forcing long-term alignment via the vesting contract — seed/team term sheets are simpler, and lockers self-select. The cost is a thinner initial veTOKEN base; governance bootstrap may require treasury-funded ve-lock-on-claim airdrops in the first 6–12 months (see §9).
 
-**No protocol-issued node-bootstrap fund.** ADR 004's 200M-TOKEN bootstrap fund is removed entirely. Bootstrap supply-side incentive is funded externally via $1M+ pre-seed USDC capital. Eliminates the TOKEN-price reflexivity in subsidy purchasing power. Program structure deferred to [ADR 030](030-preseed-usdc-deployment.md).
+**No protocol-issued node-bootstrap fund.** Bootstrap supply-side incentive is funded externally via $1M+ pre-seed USDC capital, eliminating TOKEN-price reflexivity in subsidy purchasing power. Program structure in [ADR 030](030-preseed-usdc-deployment.md).
 
 ### 2. FeeRouter split (40/40/7/5/5/3)
 
-A new contract `FeeRouter` receives the full operator USDC balance from `PaymentChannel.settleChannel` and atomically splits it into six buckets. Replaces ADR 003's settlement-time fee-skim pattern in full. Full mechanic per design spec §2.2.
+`FeeRouter` receives the full operator USDC balance from `PaymentChannel.settleChannel` and atomically splits it into six buckets (full mechanic per design spec §2.2). `PaymentChannel` does not skim a protocol fee inline; all bucket distribution happens in `FeeRouter`.
 
 | Destination | Share | Unit | Distribution mechanic |
 | --- | ---: | --- | --- |
@@ -65,7 +65,7 @@ A new contract `FeeRouter` receives the full operator USDC balance from `Payment
 | Safety & insurance reserve | 3% | USDC | Direct same-tx to `SafetyReserve`; governance-gated incident payouts (§5) |
 | **Total** | **100%** | | |
 
-**Aggregate operator-aligned compensation = 80%** (40% direct + 40% gauge pool). Identical headline operator share to ADR 004 and the v2 interim designs; the v3 split changes *how* the bucket is distributed, not its size.
+**Aggregate operator-aligned compensation = 80%** (40% direct + 40% gauge pool). The 60% non-base buckets capture deflationary, governance, real-yield-to-lockers, and incident-recourse flows; the 40% gauge pool routes operator yield by long-term ve-commitment rather than by raw byte count.
 
 **Same-transaction guarantees.** The 40% base, 5% burn, 5% treasury, and 3% safety legs all transfer in the settlement transaction. The 40% gauge and 7% delegator buckets accumulate in per-epoch buckets and are claim-based.
 
@@ -107,7 +107,7 @@ Vote-escrowed TOKEN. Modeled on veCRV with deliberate deviations.
 | Early exit | **None** — no penalty-exit option (stricter than Convex; matches veCRV) |
 | Transferability | **Non-transferable** — no `transfer` / `approve` for ve-positions |
 | Slashing on ve-position | **No** — ve-locked TOKEN is never slashable, even if the locker is also a node operator |
-| `create_lock_for` privileged path | **None** — auto-ve-lock-on-vest is removed in v3 |
+| `create_lock_for` privileged path | **None** — no auto-ve-lock path |
 
 **Historical checkpointing.** `VotingEscrow.balanceOfAt(user, ts)` and `totalSupplyAt(ts)` are load-bearing for the epoch-snapshot pattern in §2 and the governance pattern in §8. Per-lock checkpoints; reads O(log n) on the checkpoint array; writes O(1) amortized.
 
@@ -142,15 +142,15 @@ The 7% delegator bucket flows through a USDC→TOKEN buy-and-distribute pipeline
 
 **Distinction from buyback-and-burn.** Both are buy-side market pressure on USDC→TOKEN. Burn removes TOKEN from circulation; the delegator pool routes TOKEN to long-term ve-locked holders. Both are required.
 
-**Why TOKEN-denominated, not USDC?** Routes acquired TOKEN to the participants with the longest commitment horizon and couples ve-locker yield to TOKEN value rather than to network revenue alone — when network revenue grows, TOKEN buy pressure grows, ve-locker positions appreciate. This is the v3 model's primary "real yield in TOKEN" lever, replacing the v2 interim "real yield in USDC via passive ve-pool" pattern.
+**Why TOKEN-denominated, not USDC?** Routes acquired TOKEN to the participants with the longest commitment horizon and couples ve-locker yield to TOKEN value rather than to network revenue alone — when network revenue grows, TOKEN buy pressure grows, ve-locker positions appreciate. This is the model's primary "real yield in TOKEN" lever; an alternative pattern (USDC distribution to a passive ve-pool) is documented in [Alternatives Considered](#alternatives-considered).
 
 **MEV / slippage.** TWAP windows + per-epoch liquidity caps + private-RPC routing (Flashbots-style bundles) for the swap. Same defenses as the [ADR 018](018-liquidity-strategy.md) buyback flow; per-epoch liquidity caps are a hard requirement on this path, not optional.
 
 ### 7. Operator economics and minimum stake
 
-**Minimum stake.** **50,000 TOKEN.** Slashable (rates per §8), 7-day unbonding, slashable during unbonding. Up from ADR 004's 1,000-TOKEN minimum, sized for the v3 expectation that operators will additionally hold ve-positions for gauge boost (a low operator-stake floor with a separate ve-lock incentive splits the two roles cleanly).
+**Minimum stake.** **50,000 TOKEN.** Slashable (rates per §8), 7-day unbonding, slashable during unbonding. Sized so operator stake is a meaningful skin-in-the-game floor while keeping the gauge-boost ve-position the differentiating capital channel — the two roles are split cleanly.
 
-**Discount-stake threshold removed.** ADR 004's "stake 10× minimum for 1.5% fee" mechanic is removed in full. Replaced structurally by the gauge boost: operators who want more return from capital ve-lock and earn a larger gauge-pool share, rather than paying lower fees. Simpler, non-regressive, and the core incentive loop the v3 model is designed around.
+**No fee-discount mechanic.** Operator yield differentiates by long-term ve-commitment via the gauge boost (§3), not by stake-multiple-keyed fee discounts. A discount-on-stake pattern is documented in [Alternatives Considered](#alternatives-considered).
 
 **Revenue streams** (per design spec §2.4):
 
@@ -162,20 +162,11 @@ The 7% delegator bucket flows through a USDC→TOKEN buy-and-distribute pipeline
 
 ### 8. Slashing and burn
 
-**Slashing rates unchanged from ADR 004:** 5% / 15% / 50% escalation tiers, lifetime offense counter (`uint32`, monotonically increasing), increasing reset periods, auto-ejection at 50% of minimum stake, challenge-bond mechanics. Carried over verbatim.
+**Slashing rates.** 5% / 15% / 50% escalation tiers, lifetime offense counter (`uint32`, monotonically increasing), increasing reset periods, auto-ejection at 50% of minimum stake, challenge-bond mechanics.
 
-**Slashing distribution updated:**
+**Slashing distribution.** **50% challenger / 30% SafetyReserve / 20% burn.** The challenger share is the deterrent that pays for active enforcement; the SafetyReserve share funds user-harm incident recourse beyond pure deflation; the burn share preserves the deflationary deterrent at a level governance can recalibrate within §11 bounds. Pure-burn variants are documented in [Alternatives Considered](#alternatives-considered).
 
-| Destination | ADR 004 | ADR 026 (this ADR) |
-| --- | ---: | ---: |
-| Challenger reward | 50% | 50% |
-| Safety & insurance reserve | 0% | 30% |
-| Burn | 50% | 20% |
-| **Total** | **100%** | **100%** |
-
-Half of the prior burn share is redirected to `SafetyReserve` so user-harm incidents have a recourse path beyond pure deflation. The challenger share is unchanged — the reduction comes entirely from the burn share. Security review should confirm that the 20% remaining burn share preserves the deterrence argument materially; if not, the safety bound on the burn share (§11) leaves room for governance to recalibrate.
-
-**Buyback-and-burn inflow rate.** 5% of fee inflow flows to `BuybackBurner` (vs ADR 004's 20% × 3% = 0.6% effective — an ~8× increase in USDC flow per unit of network revenue). [ADR 018](018-liquidity-strategy.md) mechanics, MEV protection, and POL custody are unchanged; only the inflow source (now `FeeRouter`, not manual treasury transfer) and rate change.
+**Buyback-and-burn inflow.** 5% of routed USDC flows to `BuybackBurner` from `FeeRouter`. [ADR 018](018-liquidity-strategy.md) mechanics (Balancer V3 80/20 swap, TWAP, `minTokenOut`, POL custody) are inherited.
 
 **Mature-scale burn estimate.** ~0.3–0.4%/yr of 1B supply at S2 reference scale (full burn-vs-vesting and burn-sensitivity tables across S0–S3 × $0.001–$1.00 TOKEN price live in economic-model spec §§4–5).
 
@@ -194,13 +185,13 @@ Half of the prior burn share is redirected to `SafetyReserve` so user-harm incid
 | Timelock | 48 hours (matches [ADR 009](009-governance.md)) |
 | Delegation | ve-balance delegatable, Governor Bravo pattern |
 
-Traders with no ve-position cannot vote. With v3 dropping auto-ve-lock-on-vest, the early veTOKEN base is concentrated in self-locked seed/team/treasury positions and POL/airdrop recipients who choose to lock — a smaller initial veTOKEN base than the v2 interim designs anticipated. **Governance bootstrapping may require a treasury-funded ve-lock-on-claim airdrop in the first 6–12 months** (sourced from the community / ecosystem allocation or pre-seed); sizing is open and tracked in the design spec's open-question list. Rest of [ADR 009](009-governance.md) (emergency multisig, hard-cap pause powers, etc.) unchanged.
+Traders with no ve-position cannot vote. The early veTOKEN base is concentrated in self-locked seed/team/treasury positions and POL/airdrop recipients who choose to lock; **governance bootstrapping may require a treasury-funded ve-lock-on-claim airdrop in the first 6–12 months** (sourced from the community / ecosystem allocation or pre-seed). Sizing is open and tracked in the design spec's open-question list. Rest of [ADR 009](009-governance.md) (emergency multisig, hard-cap pause powers, etc.) unchanged.
 
 ### 10. Bootstrap mechanism — pre-seed USDC
 
-ADR 004's 200M-TOKEN node-bootstrap fund is replaced by **$1M+ pre-seed USDC capital** (planning target: $3M). Removes the v2 / ADR 004 reflexive dependency on TOKEN price for bootstrap purchasing power. Program structure (Protocol-Owned Operators, hardware-leasing subsidies, staking loans, regional-deploy grants, Enterprise SLA guarantee fund) is forward-referenced to [ADR 030](030-preseed-usdc-deployment.md); this ADR commits only to the funding mechanism (USDC, externally raised) and the size floor ($1M).
+Bootstrap supply-side incentive is **$1M+ pre-seed USDC capital** (planning target: $3M), externally raised. USDC denomination insulates subsidy purchasing power from TOKEN price. Program structure (Protocol-Owned Operators, hardware-leasing subsidies, staking loans, regional-deploy grants, Enterprise SLA guarantee fund) lives in [ADR 030](030-preseed-usdc-deployment.md); this ADR commits the funding mechanism (USDC, externally raised) and the size floor ($1M).
 
-[ADR 019](019-node-onboarding.md) is the canonical onboarding flow and is updated under §"ADRs to update on acceptance" below.
+[ADR 019](019-node-onboarding.md) is the canonical onboarding flow.
 
 ### 11. Governable parameters with safety bounds
 
@@ -224,49 +215,105 @@ The 20% floor on the node-base share guarantees operators always receive enough 
 
 ### Positive
 
-- **Operator-driven ve-lock adoption.** Case B materially out-earns Case A — operators have a direct and persistent economic reason to ve-lock that ADR 004's flat-share design lacked. Likely converges to a steady-state ve-lock rate of 30–50% of total supply, matching Curve's 40–60% veCRV lock rate.
-- **Stronger TOKEN demand loop, three-pronged.** Operators ve-lock to capture gauge boost (operator-side TOKEN demand). 7% delegator pool performs continuous TWAP USDC→TOKEN buys (delegator-side, proportional to revenue). 5% buyback-and-burn provides permanent supply reduction (deflationary).
+- **Operator-driven ve-lock adoption.** The gauge boost gives operators a direct and persistent economic reason to ve-lock; the system is expected to converge to a steady-state ve-lock rate of 30–50% of total supply, matching Curve's 40–60% veCRV lock rate.
+- **Three-pronged TOKEN demand loop.** Operators ve-lock to capture gauge boost (operator side); the 7% delegator pool performs continuous TWAP USDC→TOKEN buys (delegator side, proportional to revenue); 5% buyback-and-burn provides permanent supply reduction.
 - **Proven mechanism.** Curve's gauge + veCRV system has operated for 4+ years with billions in TVL. Reference implementations are open-source and auditable.
-- **No cashflow crisis at the operator layer.** 40% liquid USDC per settlement is sufficient to cover infrastructure costs at the reference 1 Gbps / 30K GB/mo node (Case A is positive). Operators are never starved of USDC by the design.
-- **USDC pre-seed eliminates TOKEN-price reflexivity in bootstrap.** Subsidy purchasing power does not collapse with TOKEN price — the largest tail risk of ADR 004's bootstrap design is removed.
+- **No cashflow crisis at the operator layer.** 40% liquid USDC per settlement covers infrastructure costs at the reference 1 Gbps / 30K GB/mo node — operators are never starved of USDC by the design.
+- **USDC pre-seed eliminates TOKEN-price reflexivity in bootstrap.** Subsidy purchasing power does not collapse with TOKEN price.
 - **Self-funding treasury at S1+.** Per economic-model spec §2, treasury net of $33K/mo team burn is positive from S1 (Early) onward.
 - **Safety reserve creates enterprise-tier credibility.** Funded SLA-failure compensation makes the Enterprise tier sellable rather than purely best-effort decentralized.
-- **Slashing redirected to user recourse.** 30% of slashed stake now funds incident payouts via `SafetyReserve` rather than disappearing to burn. User-harm incidents have a structural recourse path.
+- **Slashing funds user recourse.** 30% of slashed stake funds incident payouts via `SafetyReserve` — user-harm incidents have a structural recourse path.
 
 ### Negative
 
-- **Higher contract surface than ADR 004.** `FeeRouter` (with two pool types and the delegator-swap path), `VotingEscrow`, `SafetyReserve`, and the optional `DelegatorBuyer` add audit burden vs ADR 004's simpler `BuybackBurner` + `StakingRegistry` surface.
+- **Significant contract surface.** `FeeRouter` (with two pool types and the delegator-swap path), `VotingEscrow`, `SafetyReserve`, and the optional `DelegatorBuyer` add meaningful audit burden.
 - **Per-epoch byte accounting adds gas.** Every settlement increments an operator's byte counter — 5K–15K gas on top of router forwarding. Minor but non-zero; needs validation on the chosen L2 (see [ADR 021](021-l2-chain-selection.md)).
-- **Case A operators may exit.** Commodity operators who refuse to ve-lock see lower margins than Case B. This is the designed incentive pressure, but the failure mode is under-supply of operators if the filter is too sharp. Pre-seed staking-loan and hardware-lease programs ([ADR 030](030-preseed-usdc-deployment.md)) partially offset.
-- **Governance bootstrap thinner without auto-ve-lock-on-vest.** Initial veTOKEN supply depends on voluntary locking; first 6–12 months may need treasury-funded lock incentives.
+- **Commodity operators face thin margins.** Operators who refuse to ve-lock see lower margins than fair-share-ve operators. This is the designed incentive pressure, but the failure mode is under-supply of operators if the filter is too sharp. Pre-seed staking-loan and hardware-lease programs ([ADR 030](030-preseed-usdc-deployment.md)) partially offset.
+- **Governance bootstrap depends on voluntary locking.** Initial veTOKEN supply tracks self-locking decisions; first 6–12 months may need treasury-funded lock incentives.
 - **Delegator-pool swap adds keeper dependency.** USDC→TOKEN conversion needs a keeper trigger (or fold into `BuybackBurner`'s existing keeper). Not a new failure mode — [ADR 018](018-liquidity-strategy.md) already has keeper dependency — but it expands the keeper's responsibilities.
 - **Load-bearing math is harder to explain.** The Curve formula and the delegator-conversion mechanic are not intuitive to casual readers. UI, documentation, and operator dashboards need to expose "your boost factor," "your delegator-pool TOKEN earnings," and "delegator-pool slippage" clearly.
-- **Effective supply growth ~24%/yr during vesting window.** Without auto-ve-lock-on-vest to slow it, the model relies on burn flow plus scenario-driven revenue growth to outweigh release pressure. Per economic-model spec §4, burn dominates monthly vesting only at S2+ at $0.05/TOKEN.
-- **Replaces a familiar discount mechanic.** Operators who modeled ADR 004's fee discount must re-model under the gauge boost. Net P&L improves at fair-share ve, but the framing is unfamiliar.
+- **Effective supply growth ~24%/yr during vesting window.** With ve-locking opt-in, the model relies on burn flow plus scenario-driven revenue growth to outweigh release pressure. Per economic-model spec §4, burn dominates monthly vesting only at S2+ at $0.05/TOKEN.
 
 ### Risks
 
 - **Equilibrium fragility.** The Curve-style model converges to a stable equilibrium *if* the boost is valuable enough to lock for but not so valuable that a winner-take-all dynamic emerges. The 40% gauge-pool default is sized in the middle by reasoned default; production tuning may be needed.
-- **Reflexive bootstrap intensified at the operator-margin layer.** TOKEN price drop → ve-lock value drops → Case B margins shrink → operators unwind commitment. Pre-seed USDC insulates the *funding* side; the *operator-recruitment* side still depends on TOKEN price for ve-incentive strength. Mitigated, not eliminated.
+- **Reflexive operator-margin layer.** TOKEN price drop → ve-lock value drops → fair-share-ve margins shrink → operators unwind commitment. Pre-seed USDC insulates the *funding* side; the *operator-recruitment* side still depends on TOKEN price for ve-incentive strength. Mitigated, not eliminated.
 - **Delegator-conversion MEV risk.** TWAP + private-RPC routing mitigates front-running, but the swap is observable on-chain post-fact. Flashbots-style bundles and per-epoch liquidity caps are required on this path, not optional. Keeper-cost economics under L2 gas conditions ([ADR 021](021-l2-chain-selection.md)) need validation.
 - **Wash-trading / self-routed traffic.** An operator could induce noise settlements to inflate gauge-pool share. Mitigations are per-event settlement gas cost (~$0.08), watchtower observation of self-settlement patterns ([ADR 007](007-watchtower.md)), and most importantly **client-signed delivery receipts from distinct identities** tied to funded payment channels — the latter is the strongest invariant in the gauge-pool security model and is forward-referenced as [ADR 027](027-distinct-client-receipts.md). **Strongly recommended for production launch; not optional.**
 - **Governance-weight concentration.** Operators who lock heavily for boost also accumulate disproportionate governance weight. [ADR 009](009-governance.md) safety bounds prevent extreme abuse; team / seed / treasury vesting acts as a counterweight during the first ~3 years.
 - **Convex-capture risk.** Third-party liquid-ve wrappers (Convex / Votium / Aura analogs) can concentrate governance power outside the DAO. Native `SveToken` (Frax sfrxETH model) is recommended; forward-referenced as [ADR 028](028-sve-token-wrapper.md). Treat as priority-1 follow-up after launch.
-- **Reduced burn-share deterrence.** Slashing distribution shift from 50% → 20% burn weakens pure-deflationary deterrence. The design relies on the 50% challenger share (unchanged) plus the new safety-reserve recourse path to keep deterrence net-positive. Security review should validate.
+- **20% burn share deterrence.** A higher burn share would weight slashing more toward pure deflation; the chosen 50/30/20 distribution prefers user-harm recourse via `SafetyReserve`. The §11 safety bound on the burn share leaves room for governance recalibration; security review should confirm 20% preserves slashing's deterrent value.
+
+---
+
+## Alternatives Considered
+
+Earlier internal drafts of the tokenomics model explored alternative shapes. The following were considered and rejected for the reasons noted; this section is the canonical record so future readers can see what was on the table without inferring it from the current design.
+
+### Original tokenomics ([ADR 004](004-tokenomics.md))
+
+A 1B-token model with a 3% protocol fee, 80/20/0/20 dev/audit/eco/burn allocation of the fee bucket, a regressive fee-discount mechanic ("stake 10× minimum to pay 1.5% fee instead of 3%"), a 200M-TOKEN node-bootstrap fund, and 50/50 burn/challenger slashing distribution.
+
+Rejected because:
+
+- **Burn flow was structurally noise.** ~0.014%/yr of supply at a 1,000-node mature network ($0.05 TOKEN), well below the ~22%/yr circulating-supply growth from vesting. Burn alone could not bound supply.
+- **No yield path to passive holders or long-term lockers.** Stake-to-operate, fee discount, and governance were the only TOKEN utilities; long-term lockers had no compensation lever distinct from short-term holders.
+- **Regressive fee discount.** The discount-on-stake-multiple pattern reduced buyback flow as more operators qualified — large stakers weakened the deflationary sink. Non-progressive and non-aligned with long-term commitment.
+- **TOKEN-denominated bootstrap was reflexive.** The 200M-TOKEN bootstrap fund's purchasing power collapsed exactly when subsidies were most needed.
+
+ADR 004 is marked Superseded; this ADR carries the slashing rate schedule (5% / 15% / 50%) and lifetime offense counter forward unchanged.
+
+### Auto-ve-lock-on-vest
+
+Variant: vesting contracts auto-lock released TOKEN into `VotingEscrow` for a fixed term (commonly 1 year) before delivering to the recipient. Intent: forced long-term alignment and a thicker veTOKEN base from genesis.
+
+Rejected because:
+
+- The gauge boost (§3) is a stronger *voluntary* incentive than a vesting-imposed lock — recipients who would benefit from ve-locking choose to, others don't. Forced locking is not load-bearing for the equilibrium.
+- Term sheets get more complex (seed / team locking semantics interact with the existing 4-year vest), and the auto-lock contract is a new audit surface.
+- The cost is a thinner initial veTOKEN base; the design absorbs that cost via §9's optional treasury-funded ve-lock-on-claim airdrop in the first 6–12 months.
+
+### USDC distribution to a passive ve-pool
+
+Variant for §6 delegator pool: distribute the 7% bucket as USDC directly to ve-lockers, rather than performing the USDC→TOKEN swap.
+
+Rejected because:
+
+- Decouples ve-locker yield from TOKEN appreciation — the "real yield in TOKEN" lever is the larger long-term value driver and creates the demand-side TWAP buy pressure that compounds with operator-side ve-locking.
+- USDC distribution to ve-lockers is structurally a stablecoin-yield product, which fits poorly with the ve-position's role as a long-duration commitment device.
+
+### Pure-deflationary slashing (50/50 challenger/burn)
+
+Variant for §8: keep the original 50% challenger / 50% burn distribution, omit the SafetyReserve share.
+
+Rejected because:
+
+- User-harm incidents have no structural recourse path under pure-deflationary slashing. Enterprise SLA credibility, incorrect-slash appeals, and bad-data incident compensation all need a funded reserve, and the 3% router share alone is insufficient to seed it at early scale.
+- The 20% burn share (vs. the original 50%) preserves a meaningful pure-deflationary lever and the §11 safety bound `[0%, 25%]` lets governance recalibrate post-launch if deterrence proves insufficient.
+
+### TOKEN-denominated node-bootstrap fund
+
+Variant: a protocol-issued multi-hundred-million-TOKEN bootstrap fund that disburses TOKEN to early operators (the [ADR 004](004-tokenomics.md) shape).
+
+Rejected because:
+
+- Subsidy purchasing power tracks TOKEN price; subsidies become least valuable exactly when most needed.
+- Concentrates pre-launch dilution in a single allocation tied to bootstrap duration rather than network outcomes.
+- Externally-raised USDC pre-seed ([ADR 030](030-preseed-usdc-deployment.md)) is the chosen alternative — TOKEN-price-independent, externally-priced, and structured into the five outcome-targeted programs in ADR 030 §2.
 
 ---
 
 ## Forward references (follow-up ADRs)
 
-- **[ADR 027 — Distinct-client delivery receipts](027-distinct-client-receipts.md)** — priority-1; required for gauge-pool security at v1 launch.
+- **[ADR 027 — Distinct-client delivery receipts](027-distinct-client-receipts.md)** — priority-1; required for gauge-pool security at mainnet launch.
 - **[ADR 028 — Native sveTOKEN liquid-ve wrapper](028-sve-token-wrapper.md)** — within 6 months of mainnet; pre-empts third-party Convex-capture.
-- **[ADR 029 — Adaptive FeeRouter parameters](029-adaptive-fee-router.md)** — deferred; bounded automated feedback hooks within §11 limits.
+- **[ADR 029 — Adaptive FeeRouter parameters](029-adaptive-fee-router.md)** — post-launch; bounded automated feedback hooks within §11 limits.
 - **[ADR 030 — Pre-seed USDC deployment program](030-preseed-usdc-deployment.md)** — charter for the $1M+ pre-seed capital.
-- **[ADR 031 — Burn-and-Mint client TOKEN prepay path](031-bme-client-prepay.md)** — deferred to v2; demand-side TOKEN sink.
-- **[ADR 032 — Bandwidth Futures / Enterprise SLA tier](032-bandwidth-futures-enterprise.md)** — deferred to v2; TOKEN-denominated pre-purchase + Enterprise SLA tier.
+- **[ADR 031 — Burn-and-Mint client TOKEN prepay path](031-bme-client-prepay.md)** — post-launch follow-up; demand-side TOKEN sink.
+- **[ADR 032 — Bandwidth Futures / Enterprise SLA tier](032-bandwidth-futures-enterprise.md)** — post-launch follow-up; TOKEN-denominated pre-purchase + Enterprise SLA tier.
 
 ---
 
 ## ADRs to update on acceptance
 
-Cross-cutting v3 deltas are documented in each touched ADR, not duplicated here. Touched: [003](003-payments.md), [004](004-tokenomics.md) (superseded), [007](007-watchtower.md), [008](008-reputation.md), [009](009-governance.md), [016](016-contract-interactions.md), [018](018-liquidity-strategy.md), [019](019-node-onboarding.md), [020](020-observability.md), [021](021-l2-chain-selection.md), [023](023-poc-production-seams.md).
+Cross-cutting deltas are documented in each touched ADR, not duplicated here. Touched: [003](003-payments.md), [004](004-tokenomics.md) (superseded), [007](007-watchtower.md), [008](008-reputation.md), [009](009-governance.md), [016](016-contract-interactions.md), [018](018-liquidity-strategy.md), [019](019-node-onboarding.md), [020](020-observability.md), [021](021-l2-chain-selection.md), [023](023-poc-production-seams.md).
