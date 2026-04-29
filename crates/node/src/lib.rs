@@ -13,3 +13,4 @@ pub mod handlers;
 pub mod identity;
 pub mod metrics;
 pub mod runtime;
+pub mod selection;
