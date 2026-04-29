@@ -18,7 +18,7 @@ Concretely, the following questions were unanswered before this ADR:
 3. Which venue and pool type — Uniswap V3 concentrated, Uniswap V2 full-range, Balancer weighted, or other?
 4. How does buyback execution interact with the pool to avoid self-inflicted price impact?
 
-The treasury is TOKEN-rich (200M TOKEN bootstrap fund, 100M TOKEN liquidity allocation) and USDC-poor — at PoC scale there is no meaningful USDC reserve to pair 50/50 against TOKEN. The protocol team is small and does not have bandwidth to operate a concentrated-liquidity keeper stack. Both constraints favour a venue that minimizes USDC requirements and operational burden.
+The treasury holds the 100M TOKEN POL allocation per [ADR 026 §1](026-gauge-boost-tokenomics.md#1-supply-and-distribution) and is USDC-poor at PoC scale — there is no meaningful USDC reserve to pair 50/50 against TOKEN. The protocol team is small and does not have bandwidth to operate a concentrated-liquidity keeper stack. Both constraints favour a venue that minimizes USDC requirements and operational burden.
 
 ## Decision
 

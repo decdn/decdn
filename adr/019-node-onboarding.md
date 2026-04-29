@@ -44,7 +44,7 @@ flowchart TD
 Before any on-chain or protocol activity:
 
 1. **Provision server.** Minimum recommended spec: 4 vCPU, 8 GB RAM, 1 TB SSD, 5 TB/month
-   egress. See [ADR 004 § Node Unit Economics](004-tokenomics.md#node-unit-economics).
+   egress. See [ADR 026 §7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake) for operator economics.
 
 2. **Synchronize clock.** The node MUST run NTP (or equivalent) and MUST verify the local
    clock offset is within 10 seconds of UTC before proceeding. Clock skew ≥ 60 s causes
@@ -62,12 +62,12 @@ Before any on-chain or protocol activity:
 4. **Prepare Ethereum key.** The operator needs an Ethereum address (`ethAddress`) with
    sufficient funds:
    - **TOKEN:** at minimum **50,000 TOKEN** for the minimum stake deposit
-     ([ADR 026 § 7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake)). The
-     v3 model removes the v2 / ADR 004 discount-stake threshold entirely; operators who
-     want amplified return on capital ve-lock TOKEN in `VotingEscrow` for gauge boost
-     ([ADR 026 § 3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula)) rather than staking
-     above a threshold for fee discount. Operators who lack the 50K minimum may qualify
-     for a pre-seed-funded **staking loan** — see [Pre-seed USDC Bootstrap Programs](#pre-seed-usdc-bootstrap-programs)
+     ([ADR 026 § 7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake)).
+     There is no discount-stake threshold; operators who want amplified return on
+     capital ve-lock TOKEN in `VotingEscrow` for gauge boost
+     ([ADR 026 § 3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula)) rather than
+     staking above a threshold for fee discount. Operators who lack the 50K minimum may
+     qualify for a pre-seed-funded **staking loan** — see [Pre-seed USDC Bootstrap Programs](#pre-seed-usdc-bootstrap-programs)
      below.
    - **Native gas token:** approximately $0.50–$1.00 for the Phase 2 transactions
      at typical L2 gas prices.
@@ -334,8 +334,7 @@ entries. Each entry is a QUIC multiaddr string (e.g.,
 ### Re-Onboarding after Deregistration or Auto-Ejection
 
 A node that voluntarily deregistered or was auto-ejected (stake dropped below 50% of
-`minStake` due to slashing — see [ADR 026 § 8](026-gauge-boost-tokenomics.md#8-slashing-and-burn),
-which carries over the auto-ejection rule from [ADR 004](004-tokenomics.md#auto-ejection))
+`minStake` due to slashing — see [ADR 026 § 8](026-gauge-boost-tokenomics.md#8-slashing-and-burn))
 must re-onboard. The flow is identical to initial onboarding with two differences:
 
 1. **`firstRegisteredAt` is preserved.** The cold-start bootstrap bonus (ADR 008) is
@@ -355,9 +354,9 @@ after re-registration to associate the new `nodeId` with the same `ethAddress` �
 
 ### Pre-seed USDC Bootstrap Programs
 
-Operators lacking the 50K-TOKEN minimum stake or up-front infrastructure capital may qualify for supplementary onboarding paths funded from the **$1M+ pre-seed USDC capital** ([ADR 026 §10](026-gauge-boost-tokenomics.md#10-bootstrap-mechanism-pre-seed-usdc); ADR 004's 200M-TOKEN bootstrap fund is removed). Path mechanics, eligibility, sizing, and governance live in [ADR 030](030-preseed-usdc-deployment.md): Protocol-Owned Operators, hardware-leasing subsidies, staking loans, regional-deploy grants, and the Enterprise SLA guarantee fund.
+Operators lacking the 50K-TOKEN minimum stake or up-front infrastructure capital may qualify for supplementary onboarding paths funded from the **$1M+ pre-seed USDC capital** ([ADR 026 §10](026-gauge-boost-tokenomics.md#10-bootstrap-mechanism-pre-seed-usdc)). Path mechanics, eligibility, sizing, and governance live in [ADR 030](030-preseed-usdc-deployment.md): Protocol-Owned Operators, hardware-leasing subsidies, staking loans, regional-deploy grants, and the Enterprise SLA guarantee fund.
 
-ve-locking is opt-in for all operators (subsidized or self-funded); v3 bootstrap is USDC-denominated and contains no TOKEN subsidies to auto-lock. Operators using any pre-seed path still complete Phases 1–5 above — the program changes how stake / hardware is obtained, not the onboarding sequence.
+ve-locking is opt-in for all operators (subsidized or self-funded); the bootstrap mechanism is USDC-denominated and contains no TOKEN subsidies to auto-lock. Operators using any pre-seed path still complete Phases 1–5 above — the program changes how stake / hardware is obtained, not the onboarding sequence.
 
 ---
 

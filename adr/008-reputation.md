@@ -43,7 +43,7 @@ Where interaction_score is:
 
 Formula: `interaction_score = 0.4 * speed_score + 0.4 * correctness + 0.2 * reachability`
 
-> **¹ Why 40% for data correctness — same as delivery speed?** The reputation system measures *service quality*, not *honesty*. Data correctness is one quality signal among several, and the primary deterrent for corruption is economic, not reputational. A BLAKE3 mismatch triggers on-chain slashing via the challenge-response mechanism in [ADR 014](014-on-chain-verification.md): 10% stake slash per offense (PoC), escalating 5%/15%/50% (production), with auto-ejection when remaining stake falls below 50% of the minimum ([ADR 004](004-tokenomics.md)). The reputation impact compounds on top of this: a single corruption event (a) zeros the correctness component (−0.4 on `interaction_score`), (b) drops `local_score` via EWMA, and (c) degrades node selection via the quadratic reputation penalty (`1/max(reputation, 0.1)²` — [ADR 001](001-network.md#node-selection-algorithm)). Together, economic slashing and traffic loss make corruption irrational for any staked node. A higher reputation weight or immediate local blacklist would duplicate the slashing mechanism without improving security.
+> **¹ Why 40% for data correctness — same as delivery speed?** The reputation system measures *service quality*, not *honesty*. Data correctness is one quality signal among several, and the primary deterrent for corruption is economic, not reputational. A BLAKE3 mismatch triggers on-chain slashing via the challenge-response mechanism in [ADR 014](014-on-chain-verification.md): 10% stake slash per offense (PoC), escalating 5%/15%/50% (production), with auto-ejection when remaining stake falls below 50% of the minimum ([ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn)). The reputation impact compounds on top of this: a single corruption event (a) zeros the correctness component (−0.4 on `interaction_score`), (b) drops `local_score` via EWMA, and (c) degrades node selection via the quadratic reputation penalty (`1/max(reputation, 0.1)²` — [ADR 001](001-network.md#node-selection-algorithm)). Together, economic slashing and traffic loss make corruption irrational for any staked node. A higher reputation weight or immediate local blacklist would duplicate the slashing mechanism without improving security.
 
 Normalization: `speed_score = min(1.0, actual_bps / expected_bps)` where `expected_bps` is a node-local configurable baseline (default: 10 MiB/s = 10,485,760 bytes/sec).
 
@@ -82,13 +82,13 @@ diversity_factor = min(distinct_counterparties / min_counterparties, 1.0)
 
 Where `min_counterparties = 5` (governance-tunable; hardcoded floor: 2).
 
-**Effect on wash trading:** An attacker cycling funds between two self-owned addresses has `distinct_counterparties = 1`, yielding `diversity_factor = 0.2` — an 80% reduction in effective weight. To reach full credit, the attacker needs settlements with 5+ distinct counterparties, each requiring a separate staking deposit (minimum 1,000 TOKEN per [ADR 004](004-tokenomics.md)) and its own capital cycling fees.
+**Effect on wash trading:** An attacker cycling funds between two self-owned addresses has `distinct_counterparties = 1`, yielding `diversity_factor = 0.2` — an 80% reduction in effective weight. To reach full credit, the attacker needs settlements with 5+ distinct counterparties, each requiring a separate staking deposit (minimum 50,000 TOKEN per [ADR 026 §7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake)) and its own capital cycling fees.
 
 **Counterparty validation:** Only counterparty addresses that had a `StakingRegistry` NodeId binding at the time of channel settlement count toward `distinct_counterparties`. Unregistered addresses (pure clients without stake) do not count, because only staked nodes submit gossip reports (Section 6) and counterparty diversity is only relevant for reporter weight in the network score.
 
 #### 4.2 Settled-Value Time Decay
 
-Individual settlement contributions decay exponentially with age, forcing an attacker to continuously cycle capital (incurring the protocol fee — 3% standard or 1.5% for providers staking ≥10× minimum per [ADR 003](003-payments.md)) to maintain reporter weight:
+Individual settlement contributions decay exponentially with age, forcing an attacker to continuously cycle capital (incurring the `FeeRouter` non-base skim of 60% per [ADR 026 §2](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553) plus L2 gas per cycle, on the attacker's own USDC) to maintain reporter weight:
 
 ```
 settlement_weight_i = exp(-lambda * age_weeks_i)
@@ -336,7 +336,7 @@ PoC action items:
 ### Positive
 
 - Interaction-weighted scoring makes reputation manipulation expensive — you need real economic activity (settled payment channels), not just stake
-- Distinct-counterparty discount and settlement time decay raise the cost of wash trading from ~$30 in protocol fees (cycling $1,000 through one self-dealing pair at 3%) to requiring 5+ staking deposits (minimum 1,000 TOKEN each) plus continuous per-cycle fees (1.5–3% depending on stake level per [ADR 003](003-payments.md)) across 5+ counterparties — an order-of-magnitude increase in capital requirements
+- Distinct-counterparty discount and settlement time decay raise the cost of wash trading from a single self-dealing pair to requiring 5+ staking deposits (50,000 TOKEN each per [ADR 026 §7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake)) plus the per-cycle `FeeRouter` non-base skim (60% per [ADR 026 §2](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553)) across 5+ counterparties — an order-of-magnitude increase in capital requirements
 - Local observations dominate (70%), so a node's own experience always outweighs the crowd
 - Score clamping limits the damage from individual malicious reports
 - Cold-start bootstrap gives new nodes enough traffic to build a real track record

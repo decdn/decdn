@@ -58,9 +58,9 @@ blocker, but operators lose visibility into specific subsystems.
 
 #### 2.1 Slash-Safety Metrics (all Mandatory)
 
-These metrics provide early warning for the five slashable offenses defined in
-[ADR 004](004-tokenomics.md#staking-and-slashing-schedule). A sustained non-zero value
-for any of these requires immediate operator attention.
+These metrics provide early warning for the five slashable offenses on the slashing
+schedule in [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn). A sustained
+non-zero value for any of these requires immediate operator attention.
 
 | Metric | Type | Tier | Description |
 |--------|------|------|-------------|
