@@ -236,7 +236,7 @@ when **both**:
 
 Eligible payout categories follow the canonical `SafetyReserve` list per
 [ADR 026](026-gauge-boost-tokenomics.md) §5; this program does not introduce new payout
-categories. ADR 032 (Bandwidth Futures / Enterprise SLA tier, deferred to v2) will
+categories. ADR 032 (Bandwidth Futures / Enterprise SLA tier, post-launch follow-up) will
 define the contract template; until then, individual Enterprise contracts are
 case-by-case under DAO governance.
 

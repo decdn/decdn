@@ -359,3 +359,4 @@ These estimates replace the `submitFraudProof()` placeholder (~250k gas) in [ADR
 - **[ADR 005](005-protocol.md):** Signer binding section updated to reference dual signatures; `slash_sig` field added to `ProbeResponse` and `StreamResponse`.
 - **[ADR 011](011-content-takedown.md):** Ed25519-library assumption for slash evidence → updated to dual-key `ecrecover` scheme (this ADR).
 - **[ADR 004](004-tokenomics.md):** `submitFraudProof()` gas estimate → replaced by per-offense `SlashJudge` estimates.
+- **[ADR 027](027-distinct-client-receipts.md):** Extends the keccak256 Merkle-batch pattern from §2 to anchor `DeliveryReceipt` batches per operator per epoch; reuses the `Bond Handling` model for receipt-fraud challenges.

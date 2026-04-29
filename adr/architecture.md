@@ -281,7 +281,7 @@ Running nodes expose a loopback HTTP admin surface so operator CLIs (`decdn node
 
 **1B fixed supply. `FeeRouter` six-bucket split with Curve-style gauge boost, delegator pool, and SafetyReserve. Supersedes [ADR 004](004-tokenomics.md) in full.**
 
-Canonical economic model: genesis allocation across six vesting buckets, no auto-ve-lock on vest, a `FeeRouter` contract atomically splitting operator USDC settlement across direct node base, weekly gauge-boost pool, delegator pool, buyback-and-burn, treasury, and `SafetyReserve` (canonical shares and bounds in §2 / §11). Gross client rate is $0.01/GB. The gauge pool ties operator compensation to long-term ve-commitment via the Curve veCRV-style `working_bytes` formula (§3). Bootstrap supply-side incentive is externally-raised pre-seed USDC capital ([ADR 030](030-preseed-usdc-deployment.md)); slashing rate schedule (5%/15%/50%) is the existing schedule from prior tokenomics drafts. Six follow-up ADRs (027–032) close out the surface.
+Canonical economic model: genesis allocation across six buckets (four vesting, two unlocked at genesis), no auto-ve-lock on vest, a `FeeRouter` contract atomically splitting operator USDC settlement across direct node base, weekly gauge-boost pool, delegator pool, buyback-and-burn, treasury, and `SafetyReserve` (canonical shares and bounds in §2 / §11). Gross client rate is $0.01/GB. The gauge pool ties operator compensation to long-term ve-commitment via the Curve veCRV-style `working_bytes` formula (§3). Bootstrap supply-side incentive is externally-raised pre-seed USDC capital ([ADR 030](030-preseed-usdc-deployment.md)); slashing rate schedule (5%/15%/50%) is the existing schedule from prior tokenomics drafts. Six follow-up ADRs (027–032) close out the surface.
 
 ---
 

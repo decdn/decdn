@@ -183,6 +183,7 @@ The 7% delegator bucket flows through a USDC→TOKEN buy-and-distribute pipeline
 | Quorum | 4% of total ve-supply |
 | Voting period | 7 days (matches [ADR 009](009-governance.md)) |
 | Timelock | 48 hours (matches [ADR 009](009-governance.md)) |
+| Total governance latency | ≈9 days (7-day vote + 48-hour timelock) |
 | Delegation | ve-balance delegatable, Governor Bravo pattern |
 
 Traders with no ve-position cannot vote. The early veTOKEN base is concentrated in self-locked seed/team/treasury positions and POL/airdrop recipients who choose to lock; **governance bootstrapping may require a treasury-funded ve-lock-on-claim airdrop in the first 6–12 months** (sourced from the community / ecosystem allocation or pre-seed). Sizing is open and tracked in the design spec's open-question list. Rest of [ADR 009](009-governance.md) (emergency multisig, hard-cap pause powers, etc.) unchanged.
