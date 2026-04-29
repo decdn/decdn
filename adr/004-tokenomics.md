@@ -166,7 +166,7 @@ Open payment channels are unaffected by ejection — see [ADR 003](003-payments.
 
 ## Fee Allocation
 
-Protocol fees (3%, collected in USDC at channel settlement — see [ADR 003](003-payments.md#fee-calculation-on-disputed-closes)) are allocated:
+Protocol fees (3%, collected in USDC at channel settlement — see [ADR 003](003-payments.md#fee-routing-on-disputed-closes)) are allocated:
 
 | Use | % of Fees | Currency | Mechanism |
 | --- | --- | --- | --- |
@@ -185,7 +185,7 @@ pie title Protocol Fee Allocation (3% at channel settlement)
 
 ### Treasury Splitting Mechanism
 
-`settleChannel` transfers the full protocol fee to a single treasury address (see [ADR 003](003-payments.md#fee-calculation-on-disputed-closes)). The 40/20/20/20 allocation above is a **spending policy** — no on-chain splitting occurs at settlement time. Fee distribution from the treasury to the four buckets is a separate, off-contract process:
+`settleChannel` transfers the full protocol fee to a single treasury address (see [ADR 003](003-payments.md#fee-routing-on-disputed-closes)). The 40/20/20/20 allocation above is a **spending policy** — no on-chain splitting occurs at settlement time. Fee distribution from the treasury to the four buckets is a separate, off-contract process:
 
 - **PoC:** The admin key holder manually transfers from the treasury address. The 20% buyback allocation is sent to `BuybackBurner` (see below); the 80% non-buyback allocation is held as stablecoin for the development fund, bug bounties & audits, and ecosystem grants. No on-chain sub-split is enforced — at ~$0.90/month in total protocol fees ([PoC Reality](#revenue-model-poc-reality)), automation adds gas cost and contract surface area without benefit.
 - **Production:** Governance proposals direct treasury disbursements per the allocation policy. The on-chain burn percentage is governable (0%–100%, see [ADR 009](009-governance.md)); the non-buyback sub-split (40/20/20) is a policy target that governance can adjust by proposal without contract changes. A dedicated `TreasurySplitter` contract that automatically routes incoming fees to per-bucket addresses may be introduced in a future ADR once fee volumes justify the gas and complexity overhead.

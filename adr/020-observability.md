@@ -271,7 +271,7 @@ node observes the corresponding event log.
 
 | `status` | Meaning |
 |----------|---------|
-| `ready` | All Phase 5 acceptance criteria satisfied ([ADR 019](019-node-onboarding.md#phase-5--accepting-paid-delivery)); node is serving traffic. |
+| `ready` | All Phase 5 acceptance criteria satisfied ([ADR 019](019-node-onboarding.md#phase-5-accepting-paid-delivery)); node is serving traffic. |
 | `degraded` | Node is running but one or more non-critical conditions are impaired (e.g., gossip mesh thin, 0-RTT cache cold). Traffic is still accepted. |
 | `not_ready` | A mandatory startup check has failed or not yet completed (blacklist un-synced, rate bounds not loaded, not registered). Node is not accepting traffic. |
 

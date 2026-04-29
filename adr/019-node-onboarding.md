@@ -175,7 +175,7 @@ listener or accepting incoming connections.
 
 Call `StablePaymentChannel.getRateBounds()` (PoC) or `PaymentChannel.getRateBounds(token)`
 (production). Verify that both `deliveryFloor` and `deliveryCeiling` fit in `u64` (see
-[ADR 003 § Startup](003-payments.md#startup)). If either value exceeds `u64::MAX`, the
+[ADR 003 § Startup](003-payments.md#rate-bounds-refresh)). If either value exceeds `u64::MAX`, the
 node MUST refuse to start and log an error.
 
 The node SHOULD subscribe to on-chain `RateBoundsUpdated` events for real-time updates.
@@ -187,7 +187,7 @@ Periodic polling (`rate_bounds_poll_interval`, default 1 hour) is the fallback
 Fetch the full current blacklist (global entries + the node's declared region entries)
 from the `ContentBlacklist` contract. Record the current `blacklistVersion`. The node
 MUST NOT accept connections until this sync completes successfully
-([ADR 011](011-content-takedown.md#startup-sync)).
+([ADR 011](011-content-takedown.md#polling)).
 
 After initial sync, the node polls `getBlacklistVersion()` every `blacklist_poll_interval`
 (default 10 minutes) for incremental updates.
@@ -347,7 +347,7 @@ must re-onboard. The flow is identical to initial onboarding with two difference
 
 If the node's iroh identity has been replaced (key rotation), use `StakingRegistry.bindNodeId()`
 after re-registration to associate the new `nodeId` with the same `ethAddress` — see
-[ADR 003 § NodeId Binding](003-payments.md#nodeid-binding-and-rebinding). The old
+[ADR 003 § NodeId Binding](003-payments.md#nodeid-to-ethereum-binding). The old
 `nodeId` mapping is cleared.
 
 ---
