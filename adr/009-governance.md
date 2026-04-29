@@ -13,7 +13,7 @@ This ADR covers:
 
 1. The PoC governance model (admin key)
 2. The production governance model (OpenZeppelin Governor against `VotingEscrow`)
-3. Governable parameters and their hardcoded safety bounds (including the v3 `FeeRouter` shares and `boostFloor`)
+3. Governable parameters and their hardcoded safety bounds (including the `FeeRouter` shares and `boostFloor`)
 4. Emergency multisig design
 5. SafetyReserve payout authorization rules
 

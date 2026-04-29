@@ -5,7 +5,7 @@
 
 ## Context
 
-> **Tokenomics v3 cross-reference.** [ADR 026](026-gauge-boost-tokenomics.md) introduces a gauge-boost reward pool whose payout is weighted by `working_bytes` per operator. The byte counter alone is gameable via self-routed traffic (an operator settles channels with itself or with thinly-funded sybil clients to inflate `bytes_delivered`). ADR 026's §Risks identifies client-signed delivery receipts from distinct identities as the strongest mitigation and forward-references future ADR 027 for the receipt protocol. This ADR adds the reputation-side half of that defense: receipt acceptance into gauge-pool eligibility is gated on operator reputation tiers (Section 12). Reputation governs *which* receipts count, not how byte counts are computed.
+> **Tokenomics cross-reference.** [ADR 026](026-gauge-boost-tokenomics.md) introduces a gauge-boost reward pool whose payout is weighted by `working_bytes` per operator. The byte counter alone is gameable via self-routed traffic (an operator settles channels with itself or with thinly-funded sybil clients to inflate `bytes_delivered`). ADR 026's §Risks identifies client-signed delivery receipts from distinct identities as the strongest mitigation and forward-references future ADR 027 for the receipt protocol. This ADR adds the reputation-side half of that defense: receipt acceptance into gauge-pool eligibility is gated on operator reputation tiers (Section 12). Reputation governs *which* receipts count, not how byte counts are computed.
 
 The network needs a mechanism to rank nodes beyond staking alone. Staking provides Sybil resistance but does not measure service quality. Clients need a way to prefer fast, reliable nodes and avoid slow or unresponsive ones without requiring on-chain proof for every quality metric. A gossip-based reputation system using interaction-weighted scoring fills this gap.
 
@@ -292,7 +292,7 @@ Reputation-recovery does *not* retroactively re-include receipts from epochs spe
 #### 12.4 Cross-references
 
 - ADR 027 (forward-referenced) defines receipt format, signature scheme, identity-diversity heuristics, on-chain anchoring, and the concrete `N_std` / `B_std` defaults.
-- [ADR 007](007-watchtower.md) (modified per the v3 rollout plan) defines watchtower validation of receipts, including dispute-bond handling for receipt-fraud claims.
+- [ADR 007](007-watchtower.md) defines watchtower validation of receipts, including dispute-bond handling for receipt-fraud claims.
 - [ADR 026](026-gauge-boost-tokenomics.md) §3 specifies how `bytes_delivered` (after this ADR's gating) feeds into the gauge formula. ADR 026 §Risks identifies receipt-based gating as the strongest invariant in the gauge-pool security model.
 
 ### 13. Regional-Coverage Reputation Signal

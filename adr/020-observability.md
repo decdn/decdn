@@ -6,7 +6,7 @@
 ## Context
 
 Metrics are referenced throughout the existing ADRs (001, 004, 005, 011, 015, and the
-v3 tokenomics surface introduced by [ADR 026](026-gauge-boost-tokenomics.md)) and listed
+tokenomics surface introduced by [ADR 026](026-gauge-boost-tokenomics.md)) and listed
 informally in `architecture.md § Observability`, but no single document defines:
 
 - A canonical metric naming convention
@@ -175,9 +175,9 @@ canonical naming regime.
 
 ---
 
-#### 2.10 Tokenomics v3 Metrics
+#### 2.10 Tokenomics Metrics
 
-Per [ADR 026](026-gauge-boost-tokenomics.md). These metrics expose the v3 `FeeRouter`,
+Per [ADR 026](026-gauge-boost-tokenomics.md). These metrics expose the `FeeRouter`,
 `VotingEscrow`, and `SafetyReserve` contract surfaces to operator dashboards,
 keeper monitoring, gauge-claim debugging, governance dashboards, and the
 public reporting required by the `SafetyReserve` transparency rules
