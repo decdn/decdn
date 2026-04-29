@@ -130,8 +130,8 @@ fn apply_tiebreaker(ranked: &mut Vec<RankedCandidate>) {
 }
 
 /// Return the index in `group` of the candidate that wins the tie under the
-/// load → geo (relative to `emitted_regions`) tiers. (Stake + random tiers
-/// land in tasks 6 and 7.)
+/// load → geo (relative to `emitted_regions`) → stake tiers. (Random tier
+/// lands in task 7.)
 fn pick_best_in_group(group: &[RankedCandidate], emitted_regions: &HashSet<String>) -> usize {
     // Find candidates with the lowest load.
     let load_winner_load = group
@@ -165,6 +165,27 @@ fn pick_best_in_group(group: &[RankedCandidate], emitted_regions: &HashSet<Strin
         &load_tied
     } else {
         &geo_pool
+    };
+
+    // Tier 3: higher stake wins. `None` is treated as the lowest possible
+    // stake (since on-chain integration is deferred — see ADR 023 wiring).
+    let max_stake = pool
+        .iter()
+        .filter_map(|i| group.get(*i).and_then(|r| r.candidate.stake))
+        .max();
+    let stake_pool: Vec<usize> = match max_stake {
+        Some(top) => pool
+            .iter()
+            .copied()
+            .filter(|i| group.get(*i).and_then(|r| r.candidate.stake) == Some(top))
+            .collect(),
+        // No candidate in pool has a known stake → all are equal in this tier.
+        None => pool.clone(),
+    };
+    let pool = if stake_pool.is_empty() {
+        pool
+    } else {
+        &stake_pool
     };
 
     // Defensive: pool is non-empty if group is non-empty (load_tied always
@@ -287,6 +308,55 @@ mod tests {
     fn with_region(mut c: Candidate, region: &str) -> Candidate {
         c.region = region.to_string();
         c
+    }
+
+    fn with_stake(mut c: Candidate, stake: Option<u64>) -> Candidate {
+        c.stake = stake;
+        c
+    }
+
+    #[test]
+    fn higher_stake_wins_when_load_and_geo_tied() {
+        // Same score, same load, same region. Higher stake wins.
+        let small_stake = with_stake(
+            with_region(with_load(make_candidate(1, 100, 10, 1.0), 0, 50), "US"),
+            Some(1_000),
+        );
+        let big_stake = with_stake(
+            with_region(with_load(make_candidate(2, 100, 10, 1.0), 0, 50), "US"),
+            Some(10_000),
+        );
+        let out = rank_candidates(vec![small_stake, big_stake]);
+        assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(2));
+    }
+
+    #[test]
+    fn some_stake_beats_none_stake() {
+        let known = with_stake(
+            with_region(with_load(make_candidate(1, 100, 10, 1.0), 0, 50), "US"),
+            Some(1_000),
+        );
+        let unknown = with_stake(
+            with_region(with_load(make_candidate(2, 100, 10, 1.0), 0, 50), "US"),
+            None,
+        );
+        let out = rank_candidates(vec![unknown, known]);
+        assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(1));
+    }
+
+    #[test]
+    fn stake_tier_only_runs_when_load_and_geo_tied() {
+        // Different load → stake doesn't matter, lower load wins.
+        let busy_rich = with_stake(
+            with_region(with_load(make_candidate(1, 100, 10, 1.0), 0, 90), "US"),
+            Some(10_000),
+        );
+        let idle_poor = with_stake(
+            with_region(with_load(make_candidate(2, 100, 10, 1.0), 0, 10), "US"),
+            Some(1_000),
+        );
+        let out = rank_candidates(vec![busy_rich, idle_poor]);
+        assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(2));
     }
 
     #[test]
