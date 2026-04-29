@@ -15,7 +15,6 @@ const REPUTATION_FLOOR: f32 = 0.1;
 
 /// Score-equivalence threshold for tie-break activation (ADR 001 — "scores
 /// within 1% of each other").
-#[allow(dead_code)]
 const TIE_THRESHOLD: f64 = 0.01;
 
 /// A candidate provider produced by content discovery, ready to be ranked.
@@ -91,7 +90,53 @@ fn rank_candidates_with_rng(
         })
         .collect();
     ranked.sort_by(|a, b| a.score.total_cmp(&b.score));
+    apply_tiebreaker(&mut ranked);
     ranked
+}
+
+/// Walk the score-sorted slice and re-order each within-1% tie group using
+/// the load tie-break (Tier 1 of ADR 008 §9). Tiers 2–4 are layered on top
+/// in subsequent tasks.
+fn apply_tiebreaker(ranked: &mut [RankedCandidate]) {
+    let mut start = 0;
+    while start < ranked.len() {
+        let end = tie_group_end(ranked, start);
+        if let Some(group) = ranked.get_mut(start..end) {
+            group.sort_by(|a, b| compare_load(a.candidate.load, b.candidate.load));
+        }
+        start = end;
+    }
+}
+
+/// Return the exclusive end index of the tie group beginning at `start`.
+/// Two adjacent candidates are in the same group iff their relative score
+/// difference is ≤ [`TIE_THRESHOLD`].
+fn tie_group_end(ranked: &[RankedCandidate], start: usize) -> usize {
+    let pivot = match ranked.get(start) {
+        Some(r) => r.score,
+        None => return start,
+    };
+    let mut end = start + 1;
+    while end < ranked.len() {
+        let next = match ranked.get(end) {
+            Some(r) => r.score,
+            None => break,
+        };
+        let denom = pivot.min(next);
+        if denom <= 0.0 || (next - pivot).abs() / denom > TIE_THRESHOLD {
+            break;
+        }
+        end += 1;
+    }
+    end
+}
+
+/// Tier 1: lower load wins. Compare `bandwidth_utilization` first, then
+/// `active_streams` to break sub-ties.
+fn compare_load(a: LoadHint, b: LoadHint) -> core::cmp::Ordering {
+    a.bandwidth_utilization
+        .cmp(&b.bandwidth_utilization)
+        .then(a.active_streams.cmp(&b.active_streams))
 }
 
 #[cfg(test)]
@@ -167,6 +212,14 @@ mod tests {
         }
     }
 
+    fn with_load(mut c: Candidate, active_streams: u32, util: u8) -> Candidate {
+        c.load = LoadHint {
+            active_streams,
+            bandwidth_utilization: util,
+        };
+        c
+    }
+
     #[test]
     fn rank_empty_returns_empty() {
         let out = rank_candidates(vec![]);
@@ -192,5 +245,42 @@ mod tests {
         let out = rank_candidates(vec![c_dear, c_cheap, c_mid]);
         let ids: Vec<u8> = out.iter().map(|r| r.candidate.node_id[0]).collect();
         assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn tied_scores_lower_utilization_wins() {
+        // Both score exactly the same. busy has higher bandwidth_utilization.
+        let busy = with_load(make_candidate(1, 100, 10, 1.0), 5, 90);
+        let idle = with_load(make_candidate(2, 100, 10, 1.0), 5, 10);
+        let out = rank_candidates(vec![busy, idle]);
+        assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(2));
+    }
+
+    #[test]
+    fn tied_scores_break_streams_when_util_equal() {
+        // Equal bandwidth_utilization → fall back to active_streams.
+        let many = with_load(make_candidate(1, 100, 10, 1.0), 50, 50);
+        let few = with_load(make_candidate(2, 100, 10, 1.0), 1, 50);
+        let out = rank_candidates(vec![many, few]);
+        assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(2));
+    }
+
+    #[test]
+    fn within_1_percent_counts_as_tied() {
+        // score_a = 1000, score_b = 1005 → within 0.5%, should tie-break by load.
+        let high_load = with_load(make_candidate(1, 100, 10, 1.0), 0, 90); // score 1000
+        let low_load = with_load(make_candidate(2, 1005, 1, 1.0), 0, 10); // score 1005
+        let out = rank_candidates(vec![high_load, low_load]);
+        // Tied → lower-load (id 2) wins despite higher raw score.
+        assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(2));
+    }
+
+    #[test]
+    fn outside_1_percent_does_not_tie_break() {
+        // 1000 vs 1020 → 2% gap, no tie-break.
+        let cheap = with_load(make_candidate(1, 100, 10, 1.0), 0, 90); // score 1000
+        let dear = with_load(make_candidate(2, 1020, 1, 1.0), 0, 10); // score 1020
+        let out = rank_candidates(vec![cheap, dear]);
+        assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(1));
     }
 }
