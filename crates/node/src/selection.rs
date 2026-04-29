@@ -197,6 +197,9 @@ fn pick_best_in_group(
         0
     } else {
         let idx = rng.random_range(0..pool.len());
+        // pool.get(idx) is always Some — random_range stays within 0..pool.len();
+        // the unwrap_or(0) keeps us off the indexing_slicing-denied path without
+        // using expect/unwrap.
         pool.get(idx).copied().unwrap_or(0)
     }
 }
@@ -434,19 +437,35 @@ mod tests {
 
     #[test]
     fn geo_diversity_prefers_unseen_region() {
-        // Three candidates, all tied by score AND load. Two are in US, one in DE.
-        // Use a fixed seed so the tier-4 random pick is deterministic; with this
-        // seed the first pick is US, after which the geo-diversity tier surfaces
-        // DE as the second pick (the only unseen region) before the remaining US.
+        // Three candidates fully tied by score AND load; two in US, one in DE.
+        // With tier-4 randomness the first pick may be any of the three, so the
+        // test verifies the geo invariant directly: WHEN a US candidate is picked
+        // first (the path where the geo tier matters), the second pick MUST be DE
+        // — the only unseen region left in the tie group. Iterating seeds keeps
+        // the test robust to RNG implementation changes.
         let us1 = with_region(with_load(make_candidate(1, 100, 10, 1.0), 0, 50), "US");
         let us2 = with_region(with_load(make_candidate(2, 100, 10, 1.0), 0, 50), "US");
         let de = with_region(with_load(make_candidate(3, 100, 10, 1.0), 0, 50), "DE");
-        let mut rng = rand::rngs::StdRng::seed_from_u64(2);
-        let out = rank_candidates_with_rng(vec![us1, us2, de], &mut rng);
-        let regions: Vec<String> = out.iter().map(|r| r.candidate.region.clone()).collect();
-        assert_eq!(regions.first().map(String::as_str), Some("US"));
-        assert_eq!(regions.get(1).map(String::as_str), Some("DE"));
-        assert_eq!(regions.get(2).map(String::as_str), Some("US"));
+        let mut tested_first_us = false;
+        for seed in 0u64..32 {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            let out =
+                rank_candidates_with_rng(vec![us1.clone(), us2.clone(), de.clone()], &mut rng);
+            let regions: Vec<String> = out.iter().map(|r| r.candidate.region.clone()).collect();
+            assert_eq!(regions.len(), 3);
+            if regions.first().map(String::as_str) == Some("US") {
+                assert_eq!(
+                    regions.get(1).map(String::as_str),
+                    Some("DE"),
+                    "seed {seed}: after first US pick, geo tier must surface DE next"
+                );
+                tested_first_us = true;
+            }
+        }
+        assert!(
+            tested_first_us,
+            "expected at least one seed in 0..32 to produce first-pick=US"
+        );
     }
 
     #[test]
