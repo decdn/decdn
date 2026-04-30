@@ -233,7 +233,7 @@ The client queries all configured seed domains, cross-checks returned NodeIds ag
 
 **Positive:**
 
-- Consolidates all client behaviour scattered across ADRs 001, 003, 005, 006, and 008 into a single canonical specification
+- Consolidates all client behaviour scattered across ADRs 001, 003, 005, 008, and the encrypted-content-publishing appendix into a single canonical specification
 - Resolves the eclipse attack open question from ADR 003 with a concrete decision (Option B for production)
 - Establishes an explicit trust boundary, making security assumptions auditable
 - PoC key management is simple (file-based EOA or Safe wallet) with a clear production upgrade path (Safe multisig with session keys — see [ADR 024](024-account-abstraction.md))
