@@ -2,11 +2,11 @@
 
 > **This is an appendix, not a core protocol ADR.** The deCDN protocol is encryption-agnostic — content addressing means the network shuttles bytes, and whether those bytes are plaintext or ciphertext is the publisher's choice. This document specifies one deployment pattern for building an encrypted-content publishing system on top of deCDN, including the companion app server and `cdn/keys/v1` ALPN — neither of which are CDN protocol participants. Alternative encryption schemes (e.g., direct symmetric distribution, group-keyed) are acceptable.
 
-> **Not end-to-end encryption.** True E2E means per-recipient encryption — incompatible with content-addressed caching where one blob is served to many clients. This appendix specifies **subscription-gated access to commonly-encrypted content**: each blob is encrypted once at rest with a random `K_blob`; the same ciphertext is served to all authorized clients; access is granted (and revoked) at the key-distribution layer via epoch-rotated wrapping. The closest formal analogues are **broadcast encryption** and **conditional access**.
+> **Not end-to-end encryption.** True E2E means per-recipient encryption — incompatible with content-addressed caching where one blob is served to many clients. This appendix specifies **subscription-gated access to commonly-encrypted content**: each blob undergoes content-level encryption once at ingest with a random `K_blob`; the same ciphertext is served to all authorized clients; access is granted (and revoked) at the key-distribution layer via epoch-rotated wrapping. The closest formal analogues are **broadcast encryption** and **conditional access**.
 
 ## Context
 
-CDN nodes deliver content but should not be able to read it. QUIC provides transport encryption, but nodes see plaintext at rest and during forwarding. For applications like subscription-gated streaming (e.g., a Spotify-clone scenario), content must be encrypted at rest with subscription-gated decryption: only authorized, actively-subscribed clients can decrypt delivered blobs, and revocation must be possible without re-encrypting content.
+CDN nodes deliver content but should not be able to read it. QUIC provides transport encryption, but nodes see plaintext at rest and during forwarding for unencrypted blobs. For applications like subscription-gated streaming (e.g., a Spotify-clone scenario), content must use content-level encryption with subscription-gated decryption: only authorized, actively-subscribed clients can decrypt delivered blobs, and revocation must be possible without re-encrypting content.
 
 The encryption scheme must satisfy these constraints:
 
