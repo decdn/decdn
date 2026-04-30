@@ -313,8 +313,8 @@ complementary — logs are not a substitute for metrics.
 | Log format | Either (configurable) | JSON mandatory |
 | Reputation metrics | Not required (reputation system simplified) | Recommended |
 | Watchtower metrics | Not required | Recommended (`decdn_channel_disputes_total`) |
-| Alerting | Operator's choice; thresholds from Section 2.1 are guidelines | PagerDuty / Alertmanager integration recommended |
-| Dashboard | Not provided; Grafana dashboard template is future work | — |
+| Alerting | Operator's choice; reference rules at [`monitoring/prometheus-alerts.yml`](../monitoring/prometheus-alerts.yml) | PagerDuty / Alertmanager integration recommended |
+| Dashboard | Reference Grafana dashboard at [`monitoring/grafana-dashboard.json`](../monitoring/grafana-dashboard.json) | Same dashboard, plus operator-specific extensions |
 
 ---
 
@@ -350,6 +350,23 @@ instrumentation names only.
 | `cache_misses` | `decdn_cache_misses_total` | architecture.md |
 | `cache_bytes` | `decdn_cache_bytes` | architecture.md |
 
+### 7. Reference dashboards and alerts
+
+A reference Grafana dashboard and starter Prometheus alerting rules ship in the top-level [`monitoring/`](../monitoring/) directory. They consume only the canonical metric names from §2 — no new metrics are introduced — and are intended as an onboarding starting point, not a normative deliverable.
+
+| File | Purpose |
+|------|---------|
+| [`monitoring/prometheus-alerts.yml`](../monitoring/prometheus-alerts.yml) | Three rule groups: `decdn-slash-safety` (thresholds copied verbatim from §2.1), `decdn-liveness`, `decdn-delivery`. |
+| [`monitoring/grafana-dashboard.json`](../monitoring/grafana-dashboard.json) | Single overview dashboard (`uid: decdn-poc-overview`) with rows for health, slash safety, delivery, cache, probes, and payments. Datasource is parameterised via `${DS_PROMETHEUS}`; node selection via the `instance` template variable. |
+
+**Importing the dashboard.** In Grafana, *Dashboards → New → Import* and either upload the JSON file or paste its contents. Select your Prometheus datasource at the import prompt; the `instance` variable auto-populates from `decdn_node_uptime_seconds`.
+
+**Using the alerts.** Add the file to Prometheus via `rule_files:` and reload. Validate locally with `promtool check rules monitoring/prometheus-alerts.yml`. Operators are expected to tune `for:` durations and thresholds for their fleet size before paging on them.
+
+**Scope.** The reference set covers M-tier slash-safety metrics and the most common R-tier panels for an operator's first dashboard. It is deliberately not exhaustive: §2.10 tokenomics, reputation, and 0-RTT panels are left to deployment-specific dashboards.
+
+---
+
 ## Consequences
 
 **Positive:**
@@ -376,11 +393,12 @@ instrumentation names only.
 
 ## Future Work
 
-- **Grafana dashboard template.** A reference `dashboard.json` for the PoC testnet,
-  pre-wired to all M-tier metrics with the recommended alert thresholds, would reduce
-  new operator setup time from hours to minutes.
-- **Prometheus alerting rules file.** A `decdn_alerts.yml` with the thresholds from
-  Section 2.1 as Alertmanager rules.
 - **OpenMetrics migration.** Prometheus text format 0.0.4 is sufficient for PoC; the
   OpenMetrics exposition format (used by `prometheus_client` crate's `MetricsEncoder`)
   adds exemplars and native histograms — evaluate at production scale.
+- **Tokenomics + reputation dashboard panels.** The reference dashboard in
+  [`monitoring/grafana-dashboard.json`](../monitoring/grafana-dashboard.json) is
+  deliberately scoped to M-tier core operations. §2.7 reputation and §2.10
+  tokenomics metrics warrant their own dedicated dashboards (governance,
+  delegator-yield, gauge-claim debugging) — these are deployment-specific and
+  belong outside the reference set.
