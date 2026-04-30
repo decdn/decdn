@@ -55,14 +55,6 @@ crates/
 | iroh-gossip (built-in) | Node metadata broadcast (`NodeAnnounce`), node discovery |
 | `cdn/reputation/v1` (gossip topic) | Reputation reports over iroh-gossip |
 
-### Companion Protocol (App Server)
-
-| ALPN | Purpose |
-|------|---------|
-| `cdn/keys/v1` | Epoch key delivery, play requests, offline leases (app server) |
-
-> The app server is not a CDN protocol participant — see [adr/appendix-encrypted-content-publishing.md](adr/appendix-encrypted-content-publishing.md).
-
 ### Key Design Decisions
 
 - Content is BLAKE3-addressed; clients verify hashes on received bytes

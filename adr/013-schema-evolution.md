@@ -7,12 +7,7 @@
 
 All wire messages in the deCDN protocol are serialized with [postcard](https://docs.rs/postcard) — a compact, no-std-friendly, serde-based binary format standard in the iroh ecosystem ([ADR 005](005-protocol.md)). Postcard is positional: it encodes struct fields in declaration order with no field tags, no length delimiters around individual fields, and no built-in schema versioning. `postcard::from_bytes` silently ignores trailing bytes after deserialization (it does not return or report them), while `postcard::take_from_bytes` returns the unconsumed remainder. Neither function fails on trailing bytes — but on a QUIC byte stream with no inherent message boundaries, the receiver cannot know when one message ends and the next begins without explicit framing. [ADR 005](005-protocol.md) identified the broader limitation: "Postcard has no schema evolution story — adding fields requires a new ALPN version (`cdn/client/v2`); version negotiation must be planned before the first breaking change."
 
-The codebase already contains two ad-hoc evolution patterns:
-
-1. **Optional trailing fields.** `StreamRequest` appends `ethereum_address: Option<Address>` and `binding_signature: Option<Bytes>` with `#[serde(default)]` ([ADR 005](005-protocol.md)). ADR 005 called this a "one-time workaround" and stated that "any future mandatory field addition still requires `cdn/client/v2`."
-2. **1-byte message type prefix.** `cdn/keys/v1` (the companion app-server protocol) differentiates three stream types with a raw byte prefix (`0x01`, `0x02`, `0x03`) ([Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md)). This is an ad-hoc discrimination scheme specific to one ALPN.
-
-These patterns address real needs but are inconsistent with each other and unscalable. Meanwhile, gossip messages (`NodeAnnounce`, `ReputationReport`) have no ALPN negotiation at all — they are published to iroh-gossip topics whose names embed a version (`cdn/global/v1`), but changing a topic name partitions the gossip network.
+The codebase already contains an ad-hoc evolution pattern: `StreamRequest` appends `ethereum_address: Option<Address>` and `binding_signature: Option<Bytes>` with `#[serde(default)]` ([ADR 005](005-protocol.md)). ADR 005 called this a "one-time workaround" and stated that "any future mandatory field addition still requires `cdn/client/v2`." The pattern addresses a real need but is unscalable. Meanwhile, gossip messages (`NodeAnnounce`, `ReputationReport`) have no ALPN negotiation at all — they are published to iroh-gossip topics whose names embed a version (`cdn/global/v1`), but changing a topic name partitions the gossip network.
 
 Additionally, several protocol messages contain cryptographically signed fields ([ADR 005](005-protocol.md)). Signatures create a byte-level commitment: if a new field is appended to a signed struct, old verifiers compute the signature over fewer bytes than the signer intended, causing verification failure. Signed field sets must be explicitly frozen per protocol version.
 
@@ -99,23 +94,9 @@ enum WatchtowerMessage {
     Revoke(WatchtowerRevoke),         // 4
     RevokeAck(WatchtowerRevokeAck),   // 5
 }
-
-/// cdn/keys/v1 — companion protocol (app server). Replaces the 1-byte type prefix from the encrypted-content appendix
-#[derive(Serialize, Deserialize)]
-enum KeysMessage {
-    EpochKeyAuth(EpochKeyAuth),               // 0
-    EpochKey(EpochKey),                       // 1
-    EpochKeyRevoked(EpochKeyRevoked),         // 2
-    PlayRequest(PlayRequest),                 // 3
-    PlayResponse(PlayResponse),               // 4
-    OfflineLeaseRequest(OfflineLeaseRequest), // 5
-    OfflineLeaseResponse(OfflineLeaseResponse), // 6
-}
 ```
 
 **Variant ordering rule.** Discriminants are assigned in declaration order (postcard default). New variants MUST be appended at the end. Reordering or removing variants is a major (breaking) change requiring an ALPN version bump.
-
-**`KeysMessage` supersedes the encrypted-content-publishing appendix's 1-byte prefix.** (This enum is part of the companion app-server protocol, not the core CDN protocol suite — see [Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md).) Since the project is pre-implementation, the `0x01`/`0x02`/`0x03` prefix scheme from [Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md) has never been deployed. `cdn/keys/v1` uses the same protocol-enum framing as all other ALPNs. The functional mapping is: `0x01` (epoch key stream) → `EpochKeyAuth`/`EpochKey`/`EpochKeyRevoked`; `0x02` (play request) → `PlayRequest`/`PlayResponse`; `0x03` (offline lease) → `OfflineLeaseRequest`/`OfflineLeaseResponse`. The finer-grained enum variants allow request and response messages to be distinguished by type rather than by stream direction.
 
 **Unknown variant handling.** When a peer receives a message with an unknown enum discriminant:
 
@@ -448,7 +429,6 @@ Additional application error codes defined by other ADRs are unaffected. The cod
 ## ADRs Affected
 
 - **[ADR 005](005-protocol.md):** Serialization section updated to reference this ADR. Schema evolution negative consequence resolved. The `voucher_interval_mb` "one-time workaround" language replaced with reference to the standard minor evolution mechanism.
-- **[Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md):** The 1-byte message type prefix for `cdn/keys/v1` is superseded by the `KeysMessage` protocol enum defined here. `cdn/keys/v1` is a companion protocol operated by the app server, not a core CDN protocol — this ADR standardizes its framing for consistency but does not change its architectural role.
 - **[ADR 001](001-network.md):** Gossip validation now operates on payloads unwrapped from `GossipEnvelope`.
 - **[architecture.md](architecture.md):** New ADR 013 entry added to the Architectural Decisions section.
 

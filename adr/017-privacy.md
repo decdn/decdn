@@ -33,7 +33,7 @@ Each row identifies a discrete data exposure. The **ID** column is used for back
 | P-01 | `popular_hashes` in `NodeAnnounce` | Top-20 most-requested content hashes per node, broadcast to all peers | T1 | [001](001-network.md) §NodeAnnounce |
 | P-02 | On-chain payment channels | Channel IDs, client/provider Ethereum addresses, deposit amounts, settlement events | T1 | [003](003-payments.md) |
 | P-03 | On-chain staking registry | `nodeId`, `ethAddress`, `multiaddrs`, `regionHint`, registration timestamps | T1 | [001](001-network.md), [architecture.md](architecture.md) |
-| P-04 | ALPN protocol identification | QUIC TLS ClientHello reveals which ALPN is negotiated (`cdn/probe/v1`, `cdn/client/v1`, `cdn/watchtower/v1`, `cdn/keys/v1`) | T1 | [005](005-protocol.md) |
+| P-04 | ALPN protocol identification | QUIC TLS ClientHello reveals which ALPN is negotiated (`cdn/probe/v1`, `cdn/client/v1`, `cdn/watchtower/v1`) | T1 | [005](005-protocol.md) |
 | P-05 | `ReputationReport` gossip | Provider, reporter, metrics (delivery speed, correctness, uptime), timestamps — signed and broadcast on `cdn/reputation/v1` | T1 | [008](008-reputation.md) §6 |
 | P-06 | `RateChange` gossip | Node pricing updates broadcast on `cdn/global/v1` | T1 | [005](005-protocol.md), [architecture.md](architecture.md) |
 | P-07 | Node earnings inference | Channel closures and settlement amounts are on-chain; node revenue is computable | T1 | [003](003-payments.md) |

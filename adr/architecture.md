@@ -34,7 +34,6 @@ graph TD
 
     subgraph "Provider Infrastructure (external)"
         S3[("Hidden Origin Backend<br/>S3 / R2 / B2")]
-        A["App Server<br/>(appendix)"]
     end
 
     N1 <-->|"cdn/client/v1<br/>paid per-MB"| N2
@@ -49,11 +48,6 @@ graph TD
 
     N1 <-.->|"iroh-gossip<br/>NodeAnnounce, RateChange"| N2
     N2 <-.->|"iroh-gossip<br/>NodeAnnounce, RateChange"| N3
-
-    S3 -.->|"K_blob at ingest"| A
-    A -.->|"cdn/keys/v1<br/>epoch keys + envelopes"| C1
-    A -.->|"cdn/keys/v1<br/>epoch keys + envelopes"| C2
-    A -.->|"cdn/keys/v1<br/>epoch keys + envelopes"| C3
 ```
 
 **Note:** PoC payments use USDC only; production supports multiple governance-approved ERC-20 tokens (see [ADR 010](010-multi-token.md)).
@@ -176,14 +170,6 @@ Clients pay nodes per MB. On a cache miss, nodes pay origin-backed nodes per MB 
 | `cdn/watchtower/v1` | Channel-dispute monitoring ([ADR 007](007-watchtower.md)) |
 | iroh-gossip (built-in) | Node metadata broadcast (`NodeAnnounce`), rate change announcements (`RateChange`), watchtower discovery (`WatchtowerAnnounce`, production), node discovery |
 
-**Companion protocol (app server — not a CDN protocol participant):**
-
-| Protocol | Purpose |
-| --- | --- |
-| `cdn/keys/v1` | Epoch key delivery, play requests, offline leases ([Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md)) |
-
-The app server shares the iroh QUIC transport but does not participate in gossip, probing, or staking. See [External Components](#external-components).
-
 Gossip topics: `cdn/global/v1` (all nodes — `NodeAnnounce`, `RateChange`, `WatchtowerAnnounce` (production)), `cdn/region/{cc}/v1` (regional — `NodeAnnounce`), `cdn/reputation/v1` (reputation reports — [ADR 008](008-reputation.md)).
 
 `redirect` in `StreamResponse` always points to a NodeId, never an external URL. The origin backend is never revealed.
@@ -258,7 +244,7 @@ All four slashable offenses (corrupted delivery, phantom announcements, rate man
 
 **0-RTT early data for latency-sensitive protocols.**
 
-QUIC 0-RTT eliminates the TLS handshake round trip on repeat connections. `cdn/probe/v1` is the sole beneficiary — after the first probe cycle, subsequent cache-miss fan-outs send `ProbeRequest` alongside the ClientHello with zero handshake delay. All other protocols reject 0-RTT: payment-bearing (`cdn/client/v1`) and state-changing (`cdn/watchtower/v1`) to prevent replay-based accounting confusion, and `cdn/keys/v1` because authentication sequencing ([Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md)) requires `EpochKeyAuth` before any request stream. Session tickets are cached per `(remote_node_id, ALPN)` in an in-memory LRU (max 1,000 entries).
+QUIC 0-RTT eliminates the TLS handshake round trip on repeat connections. `cdn/probe/v1` is the sole beneficiary — after the first probe cycle, subsequent cache-miss fan-outs send `ProbeRequest` alongside the ClientHello with zero handshake delay. All other protocols reject 0-RTT: payment-bearing (`cdn/client/v1`) and state-changing (`cdn/watchtower/v1`) to prevent replay-based accounting confusion. Session tickets are cached per `(remote_node_id, ALPN)` in an in-memory LRU (max 1,000 entries).
 
 ---
 
@@ -552,25 +538,9 @@ graph TD
 
 ## External Components
 
-Components referenced by ADRs that are operated by content providers, not part of the CDN protocol or workspace.
+Components referenced by appendices that are operated by content providers, not part of the CDN protocol or workspace.
 
-### App Server ([Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md))
-
-The app server is operated by the content provider (e.g., a streaming platform's backend). It shares the iroh QUIC transport layer with the CDN but is **not** a CDN protocol participant — it does not participate in gossip, probing, or paid delivery.
-
-**Responsibilities:**
-
-- Stores blob encryption keys (`K_blob`) received from the origin at ingest time
-- Authenticates client sessions and validates subscription status
-- Delivers epoch keys over an authenticated `cdn/keys/v1` QUIC stream; signals `server_secret` rotation via `epoch_key_revoked` events on the same stream
-- Issues envelopes containing epoch-key-wrapped `K_blob` on play requests
-- Builds and returns offline playback leases (client seals locally to device keystore)
-
-**Why iroh QUIC:** Key delivery is tightly coupled to the client's iroh identity — the QUIC handshake provides mutual authentication (client NodeId ↔ app server NodeId) and TLS 1.3 confidentiality in a single step, eliminating the need for `crypto_box_seal` and X25519 key management. This gives clients a single transport stack for both CDN delivery and key delivery, and makes iroh key rotation seamless (reconnect with new NodeId, re-authenticate with session token). The app server still handles subscription billing, OAuth/session auth, and key management — content providers integrate an `iroh::Endpoint` accepting `cdn/keys/v1` connections alongside their existing auth/billing infrastructure.
-
-**Scaling model:** One iroh QUIC connection per active subscriber. Standard QUIC server scaling applies (connection migration, load balancer affinity). The app server scales with subscriber count, not CDN node count.
-
-**PoC scope:** A minimal reference implementation may be provided in a separate repository. The CDN crates do not depend on it.
+- **App Server** — companion to the [encrypted-content publishing pattern](appendix-encrypted-content-publishing.md). Operated by the content provider; shares the iroh QUIC transport layer with the CDN but does not participate in gossip, probing, or paid delivery. The CDN crates do not depend on it.
 
 ---
 

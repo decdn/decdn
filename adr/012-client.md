@@ -127,7 +127,7 @@ Client identity bindings are **ephemeral and per-connection**, as specified in [
 
 | Compromised key | Impact | Response |
 | --- | --- | --- |
-| iroh Ed25519 | Attacker can impersonate client NodeId (connect to nodes, receive gossip) but cannot sign vouchers or move funds. Attacker can connect to the app server as this NodeId via `cdn/keys/v1`, but cannot authenticate without the session token — no content access. | Generate new iroh key, reconnect |
+| iroh Ed25519 | Attacker can impersonate client NodeId (connect to nodes, receive gossip) but cannot sign vouchers or move funds. If the client uses a companion app server (see [Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md)), the attacker can also connect to it as this NodeId, but cannot authenticate without the session token — no content access. | Generate new iroh key, reconnect |
 | Ethereum secp256k1 | Attacker can sign vouchers draining the payment channel balance | Race to close channels: call `closeChannel` with the latest voucher nonce. If attacker has already submitted a close with a higher-nonce voucher, dispute within the challenge window ([ADR 003](003-payments.md)). No revocation mechanism exists beyond racing to close. |
 | Both | Full impersonation | Close all channels immediately. Generate new iroh key. Use a new Ethereum address for future sessions. |
 

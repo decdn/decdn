@@ -20,12 +20,6 @@ Three core protocols negotiated via ALPN, plus the built-in iroh-gossip protocol
 | `cdn/watchtower/v1` | watched party (typically node) ↔ watchtower | Channel-dispute monitoring: voucher registration and updates (see ADR 007) |
 | iroh-gossip (built-in) | all nodes | Node metadata announcements (`NodeAnnounce`), rate announcements (`RateChange`), node discovery |
 
-Companion protocol (app server — external to the CDN protocol):
-
-| Protocol | Participants | Purpose |
-| --- | --- | --- |
-| `cdn/keys/v1` | client ↔ app server | Epoch key delivery, play requests, offline leases (see [Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md)) |
-
 **Gossip topics.** The iroh-gossip protocol carries multiple message types on distinct topics:
 
 | Topic | Message Type | Source ADR |
@@ -36,8 +30,6 @@ Companion protocol (app server — external to the CDN protocol):
 | `cdn/global/v1` (production) | `WatchtowerAnnounce` | [ADR 007](007-watchtower.md) |
 
 All gossip topics use the `cdn/` namespace prefix. `NodeAnnounce`, `RateChange`, and `ReputationReport` are active in production; `WatchtowerAnnounce` is a planned production extension for watchtower discovery at scale (PoC uses static watchtower lists — see [ADR 007](007-watchtower.md)).
-
-**Note:** See [Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md) for `cdn/keys/v1` stream types and the full key delivery protocol.
 
 #### Gossip — rate change announcements
 
@@ -208,7 +200,7 @@ One QUIC connection per `(local_node, remote_node, ALPN)` tuple. Multiple reques
 
 Different ALPNs require separate connections (TLS ALPN is negotiated at connection establishment). A `cdn/probe/v1` connection and a `cdn/client/v1` connection to the same node are always distinct.
 
-**0-RTT early data** is permitted on `cdn/probe/v1` only (idempotent, read-only probes). All other protocols reject 0-RTT: `cdn/client/v1` and `cdn/watchtower/v1` to prevent replay-based accounting or registration confusion, and `cdn/keys/v1` because authentication sequencing ([Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md)) requires `EpochKeyAuth` before any request stream. See [ADR 015](015-zero-rtt.md) for the full replay safety analysis and session ticket management.
+**0-RTT early data** is permitted on `cdn/probe/v1` only (idempotent, read-only probes). All other protocols reject 0-RTT: `cdn/client/v1` and `cdn/watchtower/v1` to prevent replay-based accounting or registration confusion. See [ADR 015](015-zero-rtt.md) for the full replay safety analysis and session ticket management.
 
 #### Concurrent stream limits
 
@@ -219,12 +211,6 @@ Maximum concurrent bidirectional streams per connection, set via QUIC transport 
 | `cdn/client/v1` | 100 | Enough parallelism for bulk fetching (e.g., video manifest + segments) without exhausting server resources |
 | `cdn/probe/v1` | 1 | Single request-response; the connection is reused for sequential probes to the same node |
 | `cdn/watchtower/v1` | 10 | Allows concurrent updates for up to 10 registered channels; a node with more channels multiplexes updates over the available streams (sufficient for PoC; production nodes with many concurrent channels should open multiple connections or increase this limit via transport parameter negotiation) |
-
-For the companion protocol on the app server:
-
-| ALPN | Max streams | Rationale |
-| --- | --- | --- |
-| `cdn/keys/v1` | 10 | 1 long-lived epoch key stream + up to 9 concurrent play/lease request streams; sufficient for streaming playback with look-ahead prefetch |
 
 Stream concurrency is enforced via QUIC's `MAX_STREAMS` transport parameter: a peer MUST NOT open a new bidirectional stream beyond the advertised limit (doing so is a protocol violation resulting in `STREAM_LIMIT_ERROR` and connection close). The receiver grants additional credit by sending `MAX_STREAMS` updates as existing streams close.
 
