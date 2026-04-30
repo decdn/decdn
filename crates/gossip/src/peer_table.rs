@@ -171,7 +171,10 @@ mod tests {
     fn monotonic_rejects_regression() {
         let mut t = PeerTable::new(0);
         let id = [2u8; 32];
-        t.insert_or_refresh(mk_announce(id, 10), 100).ok();
+        assert_eq!(
+            t.insert_or_refresh(mk_announce(id, 10), 100).unwrap(),
+            InsertOutcome::Inserted
+        );
         let err = t.insert_or_refresh(mk_announce(id, 9), 200);
         assert_eq!(err, Err(StaleTimestamp { existing_us: 10 }));
         let err_eq = t.insert_or_refresh(mk_announce(id, 10), 200);
@@ -183,8 +186,14 @@ mod tests {
         let mut t = PeerTable::new(1_000); // 1000 µs TTL
         let a = [3u8; 32];
         let b = [4u8; 32];
-        t.insert_or_refresh(mk_announce(a, 1), 100).ok();
-        t.insert_or_refresh(mk_announce(b, 1), 500).ok();
+        assert_eq!(
+            t.insert_or_refresh(mk_announce(a, 1), 100).unwrap(),
+            InsertOutcome::Inserted
+        );
+        assert_eq!(
+            t.insert_or_refresh(mk_announce(b, 1), 500).unwrap(),
+            InsertOutcome::Inserted
+        );
         // now_us = 1200 → cutoff = 200, so `a` (last_seen=100) gets evicted, `b` stays.
         let evicted = t.evict_expired(1_200);
         assert_eq!(evicted, 1);
@@ -196,7 +205,10 @@ mod tests {
     fn ttl_zero_is_noop() {
         let mut t = PeerTable::new(0);
         let id = [5u8; 32];
-        t.insert_or_refresh(mk_announce(id, 1), 10).ok();
+        assert_eq!(
+            t.insert_or_refresh(mk_announce(id, 1), 10).unwrap(),
+            InsertOutcome::Inserted
+        );
         assert_eq!(t.evict_expired(u64::MAX), 0);
         assert!(t.get(&id).is_some());
     }
@@ -206,7 +218,10 @@ mod tests {
         // ttl=100, last_seen=100, now=200 → cutoff=100, 100 >= 100 so entry stays.
         let mut t = PeerTable::new(100);
         let id = [6u8; 32];
-        t.insert_or_refresh(mk_announce(id, 1), 100).ok();
+        assert_eq!(
+            t.insert_or_refresh(mk_announce(id, 1), 100).unwrap(),
+            InsertOutcome::Inserted
+        );
         let evicted = t.evict_expired(200);
         assert_eq!(evicted, 0);
         assert!(t.get(&id).is_some());
@@ -217,7 +232,10 @@ mod tests {
         // ttl=100, last_seen=100, now=201 → cutoff=101, 100 < 101 so entry is evicted.
         let mut t = PeerTable::new(100);
         let id = [7u8; 32];
-        t.insert_or_refresh(mk_announce(id, 1), 100).ok();
+        assert_eq!(
+            t.insert_or_refresh(mk_announce(id, 1), 100).unwrap(),
+            InsertOutcome::Inserted
+        );
         let evicted = t.evict_expired(201);
         assert_eq!(evicted, 1);
         assert!(t.get(&id).is_none());
@@ -229,7 +247,10 @@ mod tests {
         // so 10 >= 0 and the entry stays. Guards the saturating_sub path.
         let mut t = PeerTable::new(1_000);
         let id = [8u8; 32];
-        t.insert_or_refresh(mk_announce(id, 1), 10).ok();
+        assert_eq!(
+            t.insert_or_refresh(mk_announce(id, 1), 10).unwrap(),
+            InsertOutcome::Inserted
+        );
         let evicted = t.evict_expired(50);
         assert_eq!(evicted, 0);
         assert!(t.get(&id).is_some());
@@ -241,9 +262,15 @@ mod tests {
         // with ttl=100 → cutoff=100, refreshed last_seen=200 >= 100 so entry stays.
         let mut t = PeerTable::new(100);
         let id = [9u8; 32];
-        t.insert_or_refresh(mk_announce(id, 1), 100).ok();
+        assert_eq!(
+            t.insert_or_refresh(mk_announce(id, 1), 100).unwrap(),
+            InsertOutcome::Inserted
+        );
         // Bump announce timestamp so the refresh is accepted (monotonicity).
-        t.insert_or_refresh(mk_announce(id, 2), 200).ok();
+        assert_eq!(
+            t.insert_or_refresh(mk_announce(id, 2), 200).unwrap(),
+            InsertOutcome::Refreshed
+        );
         let evicted = t.evict_expired(200);
         assert_eq!(evicted, 0);
         let entry = t.get(&id).expect("entry should still be present");
@@ -257,9 +284,15 @@ mod tests {
         // should keep it alive (250 >= 200).
         let mut t = PeerTable::new(100);
         let id = [10u8; 32];
-        t.insert_or_refresh(mk_announce(id, 1), 100).ok();
+        assert_eq!(
+            t.insert_or_refresh(mk_announce(id, 1), 100).unwrap(),
+            InsertOutcome::Inserted
+        );
         // Bump announce timestamp so the refresh is accepted.
-        t.insert_or_refresh(mk_announce(id, 2), 250).ok();
+        assert_eq!(
+            t.insert_or_refresh(mk_announce(id, 2), 250).unwrap(),
+            InsertOutcome::Refreshed
+        );
         let evicted = t.evict_expired(300);
         assert_eq!(evicted, 0);
         let entry = t.get(&id).expect("entry should still be present");
