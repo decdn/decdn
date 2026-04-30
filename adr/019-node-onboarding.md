@@ -6,12 +6,13 @@
 ## Context
 
 Existing ADRs specify individual components of the node lifecycle in isolation — staking
-in [ADR 004](004-tokenomics.md), on-chain registration in [ADR 001](001-network.md),
-payment channel bindings in [ADR 003](003-payments.md), gossip validation in
-[ADR 001](001-network.md), blacklist sync in [ADR 011](011-content-takedown.md), and
-contract deployment order in [ADR 016](016-contract-interactions.md). No single document
-describes the complete, ordered procedure that takes a node from "operator has a server"
-to "actively accepting paid delivery requests."
+in [ADR 026](026-gauge-boost-tokenomics.md) (which supersedes [ADR 004](004-tokenomics.md)),
+on-chain registration in [ADR 001](001-network.md), payment channel bindings in
+[ADR 003](003-payments.md), gossip validation in [ADR 001](001-network.md), blacklist
+sync in [ADR 011](011-content-takedown.md), and contract deployment order in
+[ADR 016](016-contract-interactions.md). No single document describes the complete,
+ordered procedure that takes a node from "operator has a server" to "actively accepting
+paid delivery requests."
 
 This gap blocks PoC testnet participation — node operators have no canonical reference,
 and missing or mis-ordered steps produce silent protocol failures (e.g., gossip messages
@@ -43,7 +44,7 @@ flowchart TD
 Before any on-chain or protocol activity:
 
 1. **Provision server.** Minimum recommended spec: 4 vCPU, 8 GB RAM, 1 TB SSD, 5 TB/month
-   egress. See [ADR 004 § Node Unit Economics](004-tokenomics.md#node-unit-economics).
+   egress. See [ADR 026 §7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake) for operator economics.
 
 2. **Synchronize clock.** The node MUST run NTP (or equivalent) and MUST verify the local
    clock offset is within 10 seconds of UTC before proceeding. Clock skew ≥ 60 s causes
@@ -60,10 +61,16 @@ Before any on-chain or protocol activity:
 
 4. **Prepare Ethereum key.** The operator needs an Ethereum address (`ethAddress`) with
    sufficient funds:
-   - **TOKEN:** at minimum 1,000 TOKEN for the minimum stake deposit.
-     ([ADR 004](004-tokenomics.md#staking-parameters)).
+   - **TOKEN:** at minimum **50,000 TOKEN** for the minimum stake deposit
+     ([ADR 026 § 7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake)).
+     There is no discount-stake threshold; operators who want amplified return on
+     capital ve-lock TOKEN in `VotingEscrow` for gauge boost
+     ([ADR 026 § 3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula)) rather than
+     staking above a threshold for fee discount. Operators who lack the 50K minimum may
+     qualify for a pre-seed-funded **staking loan** — see [Pre-seed USDC Bootstrap Programs](#pre-seed-usdc-bootstrap-programs)
+     below.
    - **Native gas token:** approximately $0.50–$1.00 for the Phase 2 transactions
-     at typical L2 gas prices. See [ADR 004 § Gas Cost Breakdown](004-tokenomics.md#gas-cost-breakdown).
+     at typical L2 gas prices.
    - **Optional USDC:** only required if the operator intends to open outbound payment
      channels immediately (e.g., to pay origin-backed nodes for cache-miss pulls). Clients
      will open inbound channels to the node without any USDC on the node side.
@@ -87,19 +94,26 @@ All transactions must be confirmed on-chain before proceeding to Phase 3.
 
 #### Step 2.1 — Approve TOKEN transfer
 
-Call `TOKEN.approve(stakingRegistry, amount)` where `amount ≥ minStake` (1,000 TOKEN).
-This ERC-20 approval authorizes `StakingRegistry` to pull the stake deposit.
+Call `TOKEN.approve(stakingRegistry, amount)` where `amount ≥ minStake` (**50,000 TOKEN**
+under [ADR 026 § 7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake)). This
+ERC-20 approval authorizes `StakingRegistry` to pull the stake deposit.
 
 **Gas:** ~$0.03 (one-time; subsequent re-stakes reuse the allowance if it was set above
 `minStake`).
 
 #### Step 2.2 — Stake TOKEN
 
-Call `StakingRegistry.stake(amount)` with `amount ≥ 1,000 TOKEN`.
+Call `StakingRegistry.stake(amount)` with `amount ≥ 50,000 TOKEN`.
 
 The stake is locked immediately. It is slashable from this point forward, including
 during the unbonding period if the node later deregisters (7-day unbonding by default;
-governable per [ADR 004](004-tokenomics.md#staking-parameters)).
+governable per [ADR 026](026-gauge-boost-tokenomics.md)).
+
+**ve-position is separate.** Operator stake in `StakingRegistry` and any ve-locked
+TOKEN in `VotingEscrow` are independent positions per [ADR 026 § 4](026-gauge-boost-tokenomics.md#4-voting-escrow-votingescrow).
+ve-locked TOKEN is non-slashable and does not satisfy the minimum stake requirement;
+neither does staked TOKEN earn gauge boost. An operator who wants gauge boost must hold
+both.
 
 **Gas:** ~$0.05.
 
@@ -161,7 +175,7 @@ listener or accepting incoming connections.
 
 Call `StablePaymentChannel.getRateBounds()` (PoC) or `PaymentChannel.getRateBounds(token)`
 (production). Verify that both `deliveryFloor` and `deliveryCeiling` fit in `u64` (see
-[ADR 003 § Startup](003-payments.md#startup)). If either value exceeds `u64::MAX`, the
+[ADR 003 § Startup](003-payments.md#rate-bounds-refresh)). If either value exceeds `u64::MAX`, the
 node MUST refuse to start and log an error.
 
 The node SHOULD subscribe to on-chain `RateBoundsUpdated` events for real-time updates.
@@ -173,7 +187,7 @@ Periodic polling (`rate_bounds_poll_interval`, default 1 hour) is the fallback
 Fetch the full current blacklist (global entries + the node's declared region entries)
 from the `ContentBlacklist` contract. Record the current `blacklistVersion`. The node
 MUST NOT accept connections until this sync completes successfully
-([ADR 011](011-content-takedown.md#startup-sync)).
+([ADR 011](011-content-takedown.md#polling)).
 
 After initial sync, the node polls `getBlacklistVersion()` every `blacklist_poll_interval`
 (default 10 minutes) for incremental updates.
@@ -320,8 +334,8 @@ entries. Each entry is a QUIC multiaddr string (e.g.,
 ### Re-Onboarding after Deregistration or Auto-Ejection
 
 A node that voluntarily deregistered or was auto-ejected (stake dropped below 50% of
-`minStake` due to slashing — see [ADR 004](004-tokenomics.md#auto-ejection)) must
-re-onboard. The flow is identical to initial onboarding with two differences:
+`minStake` due to slashing — see [ADR 026 § 8](026-gauge-boost-tokenomics.md#8-slashing-and-burn))
+must re-onboard. The flow is identical to initial onboarding with two differences:
 
 1. **`firstRegisteredAt` is preserved.** The cold-start bootstrap bonus (ADR 008) is
    not re-granted — the `firstRegisteredAt` field in `StakingRegistry` is immutable once
@@ -333,8 +347,16 @@ re-onboard. The flow is identical to initial onboarding with two differences:
 
 If the node's iroh identity has been replaced (key rotation), use `StakingRegistry.bindNodeId()`
 after re-registration to associate the new `nodeId` with the same `ethAddress` — see
-[ADR 003 § NodeId Binding](003-payments.md#nodeid-binding-and-rebinding). The old
+[ADR 003 § NodeId Binding](003-payments.md#nodeid-to-ethereum-binding). The old
 `nodeId` mapping is cleared.
+
+---
+
+### Pre-seed USDC Bootstrap Programs
+
+Operators lacking the 50K-TOKEN minimum stake or up-front infrastructure capital may qualify for supplementary onboarding paths funded from the **$1M+ pre-seed USDC capital** ([ADR 026 §10](026-gauge-boost-tokenomics.md#10-bootstrap-mechanism-pre-seed-usdc)). Path mechanics, eligibility, sizing, and governance live in [ADR 030](030-preseed-usdc-deployment.md): Protocol-Owned Operators, hardware-leasing subsidies, staking loans, regional-deploy grants, and the Enterprise SLA guarantee fund.
+
+ve-locking is opt-in for all operators (subsidized or self-funded); the bootstrap mechanism is USDC-denominated and contains no TOKEN subsidies to auto-lock. Operators using any pre-seed path still complete Phases 1–5 above — the program changes how stake / hardware is obtained, not the onboarding sequence.
 
 ---
 

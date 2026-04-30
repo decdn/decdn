@@ -12,6 +12,8 @@ Every ADR from 001–022 contains a PoC vs production split: different contracts
 
 The goal is a clean mechanical answer to: **how does the codebase express the difference between PoC and production?**
 
+> **Cross-reference:** [ADR 026 — Gauge-Boost Tokenomics](026-gauge-boost-tokenomics.md) introduces a new contract surface (`FeeRouter`, `VotingEscrow`, `SafetyReserve`, swap helpers shared by `BuybackBurner` and the delegator-pool path). Seams 8–11 below cover the wiring-layer selectors for those contracts. The leaf-crate principle restated in §"Wiring Conventions" applies to ADR 026's tokenomics with the same force as to ADRs 001–022: domain crates remain free of ADR-026-mode-branching logic.
+
 ### Inventory of PoC/Production differences (from prior ADRs)
 
 | Dimension | PoC | Production | Source |
@@ -183,6 +185,88 @@ Concrete values:
 | `dispute_window_secs` | 48 × 3600 (172800) | Governable 12h–72h; default 48h at genesis |
 | `min_bootstrap_peers` | 3 | 8 |
 
+### 8. `FeeRouterClient` — `crates/incentive`
+
+Introduced by [ADR 026](026-gauge-boost-tokenomics.md) §2. The `FeeRouter` contract receives the full operator USDC balance from `PaymentChannel.settleChannel` and atomically splits it into the six buckets. The wiring seam selects between an in-process PoC stub (a no-op or local accounting router) and the deployed production contract address per network.
+
+```rust
+pub trait FeeRouterClient: Send + Sync {
+    /// Address of the FeeRouter contract for the active chain.
+    /// Returns `None` for the no-op PoC variant.
+    fn router_address(&self) -> Option<Address>;
+    /// Voucher-payload byte counts are forwarded into the router by the
+    /// settlement transaction; this hook lets observers (metrics, watchtower)
+    /// snapshot per-settlement byte deltas without reading chain state.
+    fn on_settlement(&self, operator: &Address, bytes_delivered: u64, amount_usdc: u64);
+}
+```
+
+| | PoC | Production |
+|---|-----|------------|
+| Implementation | `NoopFeeRouterClient` — in-process no-op (or local accounting) router; settlement skips the on-chain split | `OnchainFeeRouterClient` — deployed `FeeRouter` contract address per network (configured) |
+| Settlement path | `PaymentChannel.settleChannel` pays operator the full balance; downstream buckets simulated for tests | `PaymentChannel.settleChannel` calls `FeeRouter.routeSettlement(operator, bytesDelivered, amount)` in the same transaction |
+| Per-network config | N/A | Address sourced from chain-id-keyed config; sum-to-100% safety bounds enforced on chain |
+
+### 9. `VotingEscrowReader` — `crates/incentive`
+
+Introduced by [ADR 026](026-gauge-boost-tokenomics.md) §4. ve-balance lookups are load-bearing for the gauge-boost epoch snapshot (§3 of ADR 026) and ve-weighted governance (§9 of ADR 026). The wiring seam selects between an in-memory fixture (deterministic ve-balances for tests / local dev) and an on-chain `VotingEscrow.balanceOfAt(user, ts)` reader.
+
+```rust
+pub trait VotingEscrowReader: Send + Sync {
+    /// ve-balance of `user` at the epoch-boundary timestamp `ts`.
+    fn balance_of_at(&self, user: &Address, ts: u64) -> Result<U256>;
+    /// Total ve-supply at the epoch-boundary timestamp `ts`.
+    fn total_supply_at(&self, ts: u64) -> Result<U256>;
+}
+```
+
+| | PoC | Production |
+|---|-----|------------|
+| Source | `FixtureVotingEscrowReader` — in-memory ve-balances seeded from config or test scaffolding | `OnchainVotingEscrowReader` — calls `VotingEscrow.balanceOfAt` / `totalSupplyAt` |
+| Determinism | Fully deterministic; no chain dependency | Reads checkpoint array on the deployed `VotingEscrow` contract |
+| Use sites | Gauge-boost share computation; ve-weighted governance simulations | Same call sites; selection happens in the wiring layer |
+
+### 10. `SwapHelper` — `crates/incentive`
+
+Introduced by [ADR 026](026-gauge-boost-tokenomics.md) §6 and consolidated with [ADR 018](018-liquidity-strategy.md). Both `BuybackBurner` (5% burn bucket) and the delegator-pool USDC→TOKEN path (7% bucket) require a swap backend with TWAP windows, `minOut` slippage protection, and per-epoch liquidity caps. Consolidating into a single seam reduces wiring surface.
+
+```rust
+pub trait SwapHelper: Send + Sync {
+    /// Execute a USDC→TOKEN swap subject to TWAP + minOut + per-epoch cap.
+    /// Used by both BuybackBurner and the delegator-pool buy path.
+    fn swap_usdc_for_token(&self, params: SwapParams) -> Result<SwapReceipt>;
+}
+```
+
+| | PoC | Production |
+|---|-----|------------|
+| Backend | `MockPoolSwapHelper` — deterministic local pool with configurable price + slippage; no chain interaction | `BalancerV3SwapHelper` — Balancer V3 80/20 pool per [ADR 018](018-liquidity-strategy.md); private-RPC routing (Flashbots-style bundles); per-epoch liquidity caps enforced |
+| Used by | `BuybackBurner` (burn) and `DelegatorBuyer` (or `BuybackBurner` multi-output mode) | Same call sites |
+| MEV protection | N/A (deterministic mock) | TWAP windows, `minOut`, private RPC, per-epoch caps (hard requirement, not optional) |
+
+### 11. `SafetyReservePayout` — `crates/incentive`
+
+Introduced by [ADR 026](026-gauge-boost-tokenomics.md) §5. The 3% safety bucket is governance-gated; payouts require an attested incident bundle, governance proposal (or fast-track multisig within hard caps), 48-hour appeal window, and post-incident reporting. The wiring seam selects between a local approval mock (single-step approval for tests / local dev) and the Governor-gated production path.
+
+```rust
+pub trait SafetyReservePayout: Send + Sync {
+    /// Submit an incident bundle for payout. PoC variant approves immediately;
+    /// production variant queues either a governance proposal or fast-track
+    /// emergency-multisig authorization (within the hard caps per ADR 009),
+    /// subject to all four gates (evidence bundle, authorization, 48h appeal,
+    /// post-incident reporting).
+    fn submit_payout(&self, bundle: IncidentBundle) -> Result<PayoutHandle>;
+    /// Status of a previously submitted bundle.
+    fn payout_status(&self, handle: &PayoutHandle) -> Result<PayoutStatus>;
+}
+```
+
+| | PoC | Production |
+|---|-----|------------|
+| Approval flow | `LocalApprovalSafetyReservePayout` — single-step approval; bypasses governance, appeal window, registry write | `GovernorSafetyReservePayout` — calls `SafetyReserve.payout(bundle, recipient, amount)` which enforces evidence bundle + governance proposal + 48h appeal + public registry post |
+| Governance dependency | None | OpenZeppelin Governor + Timelock per [ADR 009](009-governance.md); emergency multisig under hard caps |
+| Registry | Optional in-memory log | Public on-chain registry maintained by `SafetyReserve` |
+
 ---
 
 ## Cargo Feature: `poc`
@@ -290,6 +374,7 @@ crates/
 3. **`NetworkConstants` is the single source of truth for all numeric differences.** No magic numbers elsewhere — always reference `constants.popular_hashes_max`, never literal `20`.
 4. **Both implementations must compile in CI.** The CI matrix builds with `--features poc` and without (production). This prevents either path from rotting and catches type errors in both concrete implementations.
 5. **PoC removal is mechanical.** To graduate to production-only: delete all `#[cfg(feature = "poc")]` functions, remove the `poc` feature from `Cargo.toml`, and strip the `#[cfg(not(feature = "poc"))]` attributes from the remaining functions. No logic changes required.
+6. **Leaf-crate principle applies to ADR 026 tokenomics.** Domain crates (`cache`, `gossip`, `incentive`, `reputation`, `protocol`) MUST NOT contain mode-branching logic for the [ADR 026](026-gauge-boost-tokenomics.md) contract surface (`FeeRouter`, `VotingEscrow`, `SafetyReserve`, swap helpers). All mode selection between PoC stubs / fixtures / mocks and production contracts lives in the `node` crate's wiring layer behind seams 8–11 above — the same rule that governs seams 1–7. Adding `if production_enabled` checks inside domain crate logic is forbidden.
 
 ---
 
@@ -368,3 +453,5 @@ Rejected. Scatters the PoC/production boundary into every crate, making it hard 
 | ADR 012 | `KeyStore` | File-based vs keychain/HW wallet |
 | ADR 014 | `CorruptionChallenger` | Optimistic vs Merkle proof |
 | ADR 017 | `NetworkConstants.popular_hashes_max` | 20 (PoC) vs 5 (production) |
+| ADR 018 | `SwapHelper` | Mock pool (PoC) vs Balancer V3 (production); shared by `BuybackBurner` and delegator-pool path |
+| ADR 026 | `FeeRouterClient`, `VotingEscrowReader`, `SwapHelper`, `SafetyReservePayout` | production contract surface; PoC stubs / fixtures / mocks vs deployed contracts per network |

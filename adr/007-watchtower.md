@@ -11,6 +11,8 @@ ADR 003 identifies this liveness gap explicitly (stale close, Option A) and prop
 
 The threat is asymmetric in unidirectional channels. Vouchers are client-signed cumulative amounts; the node submits the highest voucher to maximise its payout. The stale-close attack is therefore a client submitting an old low-amount voucher to underpay the node. The reverse — a node submitting a lower voucher than it holds — harms only the node itself (the client gets a larger refund). Despite this asymmetry, the mechanism described here is symmetric: either party can delegate dispute protection to a watchtower.
 
+**ADR 026 driver.** [ADR 026](026-gauge-boost-tokenomics.md) introduces a gauge-boost pool whose payout is weighted by per-operator `bytes_delivered`. Raw byte counters are gameable by self-routed traffic (an operator settling against itself or against thinly-funded sybil channels to inflate gauge-pool share — see ADR 026 §Risks "Wash-trading / self-routed traffic"). ADR 026 cites watchtower observation of self-settlement patterns and forward-references [ADR 027 — Distinct-client delivery receipts](027-distinct-client-receipts.md) as the strongest invariant in the gauge-pool security model. This ADR therefore extends the watchtower role beyond stale-close defense to also cover wash-trading detection and validation of ADR 027 delivery receipts. The ADR 027 receipt cryptographic protocol (format, signature scheme, on-chain anchoring) is out of scope here — this ADR only specifies the watchtower-side responsibilities.
+
 ## Decision
 
 ### 1. Watchtower Role
@@ -20,8 +22,29 @@ A watchtower is a non-custodial monitoring service that:
 1. Watches for `ChannelCloseInitiated` events on the `StablePaymentChannel` contract
 2. Holds the latest voucher for each registered channel
 3. Submits a `disputeChannel` transaction if the on-chain close uses a lower-nonce voucher than what the watchtower holds
+4. **Detects wash-trading / self-routed-traffic patterns** that inflate an operator's gauge-pool share under [ADR 026](026-gauge-boost-tokenomics.md) §3 (see [§1a Wash-trading detection](#1a-wash-trading-detection) below)
+5. **Validates distinct-client delivery receipts** from [ADR 027](027-distinct-client-receipts.md) before they are accepted into gauge-pool eligibility (see [§1b Receipt validator role](#1b-receipt-validator-role) below)
 
-A watchtower **cannot steal funds** — vouchers authorise payment to the node, not to the watchtower. A watchtower **cannot worsen settlement** — `disputeChannel` only accepts vouchers with a strictly higher nonce than the current on-chain state. A watchtower **cannot grief** — submitting a higher-nonce voucher corrects settlement toward the true state.
+A watchtower **cannot steal funds** — vouchers authorise payment to the node, not to the watchtower. A watchtower **cannot worsen settlement** — `disputeChannel` only accepts vouchers with a strictly higher nonce than the current on-chain state. A watchtower **cannot grief** — submitting a higher-nonce voucher corrects settlement toward the true state. The wash-trading and receipt-validator responsibilities (4, 5) extend the same non-custodial monitoring posture: the watchtower produces evidence and, on suspicion, files a bonded challenge — it never adjudicates settlement directly.
+
+#### 1a. Wash-trading detection
+
+Watchtowers surface signals that distinguish demand-driven traffic from operator self-routing inflating gauge-pool share ([ADR 026 §Risks](026-gauge-boost-tokenomics.md#risks)). Each watchtower SHOULD compute and publish per-operator-per-epoch indicators including: operator-as-client overlap (channel `client` matches `provider` directly or via known affiliates), funder clustering (channel deposits sourced from a small ancestor set), settlement-cadence anomalies (near-constant intervals or byte counts inconsistent with organic traffic), and distinct-counterparty count (the positive corroborating signal feeding [ADR 027](027-distinct-client-receipts.md)'s N-distinct gate).
+
+These indicators are not themselves slashable — they prioritise watchtower attention and feed the bonded-challenge path (§1c). Detection is heuristic; defense-in-depth is provided by ADR 027 receipts, ADR 008 reputation gates, and the per-settlement gas / FeeRouter skim cost.
+
+#### 1b. Receipt validator role
+
+Watchtowers validate [ADR 027](027-distinct-client-receipts.md) delivery receipts as a precondition for gauge-pool payout. Per-receipt checks: signature recovers to `channel.client` under the ADR 027 EIP-712 domain; format / on-chain channel + operator references resolve; identity-diversity rolling window respects the N-distinct policy; clients flagged by §1a clustering are held for the bonded-challenge path (§1c) rather than counted. Output is a watchtower-signed attestation per receipt batch consumed by [ADR 008](008-reputation.md) reputation gating. Receipt format, attester selection, the N parameter, and on-chain batch anchoring are owned by ADR 027.
+
+#### 1c. Dispute-bond integration for receipt-fraud claims
+
+A watchtower that has evidence of receipt fraud — a forged signature, a colluding sybil client, a receipt batch whose distinct-client count is inflated by funder-clustered identities — challenges the operator's gauge-pool claim through the existing bonded-challenge path. **Only the bond mechanism carries over from [ADR 014 §Bond Handling](014-on-chain-verification.md#bond-handling); the reward and remedy do NOT come from the slashing-distribution rule.** The watchtower posts the standard challenge bond (PoC: 100 TOKEN, governable per [ADR 009](009-governance.md)), the operator has the standard counter-evidence window (24h PoC) to produce valid distinct-client receipts that defeat the challenge, and resolution applies the receipt-specific rules below:
+
+- **Challenge upheld** (operator fails to produce sufficient counter-evidence). The operator's gauge-pool claim for the contested epoch is invalidated — the operator forfeits the gauge payout for that epoch — and the watchtower receives back its bond plus a configurable challenger reward sourced from **the forfeited gauge payout** (sized by ADR 027 governance). The operator's stake is **not** touched. This honours [ADR 027 §7 failure semantics](027-distinct-client-receipts.md): gauge-eligibility forfeiture is the standard remedy for receipt-protocol violations. Stake slashing applies **only** under the stronger evidentiary bar in ADR 027 — deliberate forgery (e.g., a recovered signer that does not correspond to any channel `client` that ever existed) or key compromise — in which case the existing offense escalates per [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn) and the 50/30/20 slashing distribution governs only that path.
+- **Challenge dismissed** (operator produces valid counter-evidence). The bond is forfeit per the existing rule (50% burned, 50% to the operator per [ADR 014](014-on-chain-verification.md#bond-handling)). This protects operators from frivolous receipt-fraud accusations and bounds the watchtower's incentive to challenge speculatively.
+
+No new bond mechanism is introduced. The contract surface for receipt-fraud challenges is a new challenge type on `SlashJudge` (alongside the existing phantom / rate / blacklist / corruption types) with the same bond, counter-window, and resolution shape; the exact `submitReceiptFraudChallenge` interface lives in the ADR 027 / ADR 014 contract update, not in this ADR. Watchtower-side: the same `cdn/watchtower/v1` ALPN connection that streams voucher updates is the natural transport for receipt batches and watchtower validator attestations. A future protocol revision (`cdn/watchtower/v2`) may formalise the receipt-streaming sub-protocol; PoC implementations may piggyback on `v1`.
 
 ### 2. Contract Integration
 
@@ -55,7 +78,7 @@ event ChannelSettled(
 
 Watchtowers use `ChannelCloseInitiated` and `ChannelDisputed` for active dispute intervention. `ChannelSettled` signals that the dispute window has closed and the channel is finalised — watchtowers use this to stop monitoring the channel and clean up stored voucher state.
 
-A successful `disputeChannel` call updates the on-chain `claimedAmount`, which changes the protocol fee computed at final settlement. See [ADR 003 — Fee Calculation on Disputed Closes](003-payments.md#fee-calculation-on-disputed-closes) for the full lifecycle. The `disputeChannel` function must also store `msg.sender` as `lastDisputor` in the `Channel` struct (or a dedicated mapping), so that the production `WatchtowerEscrow` contract can verify dispute authorship via a cross-contract static call (see [Contract: WatchtowerEscrow](#contract-watchtowerescrow)).
+A successful `disputeChannel` call updates the on-chain `claimedAmount` and `claimedBytes`, changing the values forwarded to `FeeRouter.routeSettlement` at final settlement. See [ADR 003 — Fee Routing on Disputed Closes](003-payments.md#fee-routing-on-disputed-closes) for the full lifecycle. The `disputeChannel` function must also store `msg.sender` as `lastDisputor` in the `Channel` struct (or a dedicated mapping), so that the production `WatchtowerEscrow` contract can verify dispute authorship via a cross-contract static call (see [Contract: WatchtowerEscrow](#contract-watchtowerescrow)).
 
 No separate watchtower registry contract is needed. The watchtower relationship is purely off-chain — the watched party shares voucher state with the watchtower, and the watchtower submits disputes using its own EOA and gas.
 
@@ -198,6 +221,9 @@ flowchart TD
 | Fee model | N/A | 0.1% with 0.50 USDC floor |
 | `WatchtowerEscrow` contract | N/A | Required (prepaid escrow with heartbeat accountability) |
 | Watchtower staking | N/A | Deferred |
+| Wash-trading detection (§1a) | N/A | Required (gauge-pool security per [ADR 026](026-gauge-boost-tokenomics.md)) |
+| Receipt validator role (§1b) | N/A | Required (gates gauge-pool eligibility per [ADR 027](027-distinct-client-receipts.md)) |
+| Receipt-fraud challenges (§1c) | N/A | Reuses `SlashJudge` bond mechanic per [ADR 014](014-on-chain-verification.md#bond-handling) |
 
 For PoC, the only action items are:
 
@@ -217,6 +243,8 @@ These three items future-proof the contract and node software for watchtower int
 - The `cdn/watchtower/v1` protocol reuses iroh QUIC transport, consistent with the networking stack in ADR 000
 - Multiple watchtowers per channel provide redundancy without requiring coordination, consensus, or shared state between watchtowers
 - Defense-in-depth layering (local monitor + watchtowers + dispute window) means no single component failure causes fund loss
+- The watchtower role extends naturally to gauge-pool security under [ADR 026](026-gauge-boost-tokenomics.md): the same off-chain monitoring infrastructure that streams voucher updates is positioned to detect wash-trading patterns and validate distinct-client delivery receipts ([ADR 027](027-distinct-client-receipts.md)) without a separate operator role
+- Receipt-fraud challenges reuse the `SlashJudge` challenge-bond mechanic from [ADR 014](014-on-chain-verification.md#bond-handling) — no new bond contract or economic primitive
 
 **Negative:**
 
@@ -225,6 +253,8 @@ These three items future-proof the contract and node software for watchtower int
 - The watchtower must maintain a hot wallet with ETH for gas and monitor the chain continuously — non-trivial operational overhead that may limit the supply of watchtower operators
 - Voucher sharing exposes channel activity patterns (amounts, frequency) to the watchtower. The privacy impact is low — vouchers are not secret (the counterparty already has them) — but it is a new data surface
 - No on-chain accountability for watchtower liveness failure in the initial design. A watchtower that accepts fees but fails to dispute cannot be provably slashed until watchtower staking is implemented
+- Wash-trading detection is heuristic (§1a). A determined attacker who funds distinct identities through distinct on-ramps and varies the traffic profile defeats single-watchtower detection; the design relies on layered defenses (per-settlement gas, FeeRouter skim, ADR 027 receipts, redundant watchtowers) rather than any single mechanism
+- The receipt-validator role expands the watchtower's per-epoch compute and storage footprint (per-receipt signature verification, rolling distinct-client tracking) and depends on [ADR 027](027-distinct-client-receipts.md) being authored and shipped — gauge-pool security is incomplete until that ADR lands
 
 ### Fee Accountability
 
@@ -485,3 +515,27 @@ The QUIC connection between the watched party and watchtower drops. The watchtow
 This is a partial-protection scenario, not a total failure. Mitigation: the watched party's software treats watchtower connection health as critical and alerts on disconnection. Automatic reconnection with full voucher resync on reconnect. The local dispute monitor covers the gap if the node is online. For the node-offline case, the most recent voucher the watchtower holds is still better than the stale voucher — the node recovers most of its earnings even if the absolute latest voucher is lost.
 
 With negotiable voucher intervals ([ADR 003](003-payments.md#voucher-interval-negotiation)), larger gaps between voucher updates increase the potential value lost during a desynchronisation event. At a 100 MB interval and market rate, the worst case is the watchtower is one interval behind — a $0.001 discrepancy. At the governance maximum (~1 GB) and ceiling rate ($0.001/MB), the worst-case discrepancy is $1.024. Operators delivering high-value large blobs should weigh the tradeoff between fewer voucher round-trips and larger desynchronisation exposure when choosing an interval.
+
+---
+
+### Sophisticated wash-trading defeats §1a heuristics
+
+A determined attacker funds N distinct addresses through N distinct on-ramps (separate CEX accounts, separate fiat sources, separate KYC identities) and runs a varied traffic-generation profile that avoids the periodicity and byte-pattern signatures the watchtower flags in §1a.
+
+This is the acknowledged ceiling of heuristic detection. Mitigations are layered, per [ADR 026](026-gauge-boost-tokenomics.md) §Risks: (1) per-settlement gas raises the per-fake-byte cost; (2) the FeeRouter skim ensures self-routed traffic is net-negative without significant TOKEN appreciation; (3) [ADR 027](027-distinct-client-receipts.md) distinct-client receipts require *signed* counterparty distinctness from identities that pass [ADR 008](008-reputation.md) reputation gating, raising the cost of obtaining the underlying client identities; (4) multiple independent watchtowers cross-check each other's flag outputs, and a single watchtower's failure to detect does not prevent another from challenging. The watchtower's job is to make the cheap, single-funder, periodic-pattern attacks visible — not to provide a cryptographic proof of honesty.
+
+---
+
+### False-positive wash-trading accusations (griefing operators)
+
+A malicious watchtower, or a watchtower whose §1a heuristics misfire, raises a receipt-fraud challenge against an honest operator with no genuine evidence — purely to disrupt the operator's gauge-pool payout for the contested epoch.
+
+Mitigated by the existing challenge-bond mechanic ([ADR 014](014-on-chain-verification.md#bond-handling)) carried over per §1c: a dismissed challenge forfeits the watchtower's bond (50% burned, 50% to the operator). The operator's counter-evidence path is the standard 24h window with valid distinct-client receipts. The bond cost is the rate limiter; an attacker would need to pay the bond per spurious challenge, and operators' counter-evidence path is well-defined. Repeated dismissed challenges from the same watchtower trigger reputation degradation in [ADR 008](008-reputation.md) and may warrant removal from the operator's configured watchtower set.
+
+---
+
+### Receipt validator collusion with operator
+
+A watchtower colludes with an operator: it accepts forged or non-distinct receipts as valid (failing §1b checks 3–4), inflating the operator's distinct-client count for gauge-pool eligibility.
+
+Mitigated by redundant validation: per §1b, receipt validation by a single watchtower is not sufficient — gauge-pool eligibility under [ADR 027](027-distinct-client-receipts.md) requires attestations from a quorum of independent watchtowers (specific N defined in ADR 027). A colluding watchtower is detectable when its attestations diverge from peers' attestations on the same receipt batch. Reputation gating ([ADR 008](008-reputation.md)) consumes attestation-divergence signals, and receipt-fraud challenges (§1c) provide the on-chain recourse path. The exact quorum, attestation aggregation, and divergence-detection rules are ADR 027's responsibility.

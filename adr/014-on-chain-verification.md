@@ -275,7 +275,7 @@ The challenged node may call `counterChallenge(challengeId, evidence)` within 24
 
 If all six conditions pass, the challenge is dismissed and the challenger's bond is forfeited (50% burned, 50% to node). If the 24-hour window expires without valid counter-evidence, the slash executes via `StakingRegistry.slash()`.
 
-See [ADR 005, Gossip — rate change announcements](005-protocol.md#gossip--rate-change-announcements) for the `RateChange` gossip message that produces this counter-evidence.
+See [ADR 005, Gossip — rate change announcements](005-protocol.md#gossip-rate-change-announcements) for the `RateChange` gossip message that produces this counter-evidence.
 
 **Blacklist violation:**
 
@@ -359,3 +359,4 @@ These estimates replace the `submitFraudProof()` placeholder (~250k gas) in [ADR
 - **[ADR 005](005-protocol.md):** Signer binding section updated to reference dual signatures; `slash_sig` field added to `ProbeResponse` and `StreamResponse`.
 - **[ADR 011](011-content-takedown.md):** Ed25519-library assumption for slash evidence → updated to dual-key `ecrecover` scheme (this ADR).
 - **[ADR 004](004-tokenomics.md):** `submitFraudProof()` gas estimate → replaced by per-offense `SlashJudge` estimates.
+- **[ADR 027](027-distinct-client-receipts.md):** Extends the keccak256 Merkle-batch pattern from §2 to anchor `DeliveryReceipt` batches per operator per epoch; reuses the `Bond Handling` model for receipt-fraud challenges.
