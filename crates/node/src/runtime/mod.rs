@@ -439,15 +439,35 @@ impl HupStream {
     /// Wait for the next SIGHUP on the persistent stream. If
     /// installation failed (`None`) or the platform isn't Unix, this
     /// future never resolves.
+    ///
+    /// `Signal::recv` resolves to `Option<()>`. `None` indicates the
+    /// underlying stream has been closed (the driver dropped, signal
+    /// handler torn down) — once that happens the future would resolve
+    /// *immediately, forever*, and the runtime select-loop would
+    /// hot-spin. Park on `pending` in that branch instead so hot-reload
+    /// is silently disabled rather than turning into a spin-loop.
     async fn recv(&mut self) {
         #[cfg(unix)]
         {
-            match self.hup.as_mut() {
-                Some(stream) => {
-                    let _ = stream.recv().await;
+            // Three cases:
+            //   1. install succeeded + stream yielded a real signal →
+            //      return so the caller runs the reload arm.
+            //   2. install succeeded but the stream is now closed →
+            //      `recv()` returns `None`, which would otherwise
+            //      resolve *immediately, forever* and hot-spin the
+            //      runtime's select. Take ownership, log once, and park
+            //      on `pending` for the rest of the process.
+            //   3. install failed at startup (`self.hup` is `None`) →
+            //      already logged a warning at install time; just park
+            //      on `pending`.
+            if let Some(stream) = self.hup.as_mut() {
+                if stream.recv().await.is_some() {
+                    return;
                 }
-                None => std::future::pending::<()>().await,
+                self.hup = None;
+                tracing::warn!("SIGHUP stream closed; hot-reload disabled for this process");
             }
+            std::future::pending::<()>().await;
         }
         #[cfg(not(unix))]
         {
@@ -496,18 +516,32 @@ impl ShutdownStreams {
     /// one fired. The persistent SIGTERM stream lives on `self`, so
     /// successive calls observe successive signals — there's no
     /// race window between iterations of the runtime's select loop.
+    ///
+    /// `Signal::recv` resolves to `Option<()>`. A `None` from the
+    /// SIGTERM arm would otherwise resolve immediately forever and
+    /// short-circuit the select to a spurious shutdown; demote that
+    /// branch to a `pending` future so we wait for a real SIGINT
+    /// instead. (`tokio::signal::ctrl_c` re-registers internally and
+    /// is safe to await directly.)
     async fn recv(&mut self) -> ShutdownSignal {
         #[cfg(unix)]
         {
             if let Some(term) = self.term.as_mut() {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => ShutdownSignal::Sigint,
-                    _ = term.recv() => ShutdownSignal::Sigterm,
+                let race = tokio::select! {
+                    _ = tokio::signal::ctrl_c() => Some(ShutdownSignal::Sigint),
+                    res = term.recv() => res.map(|()| ShutdownSignal::Sigterm),
+                };
+                if let Some(sig) = race {
+                    return sig;
                 }
-            } else {
-                let _ = tokio::signal::ctrl_c().await;
-                ShutdownSignal::Sigint
+                // SIGTERM arm closed (`None`). Drop the stream so we
+                // don't keep racing a future that resolves immediately
+                // forever, then wait for a real SIGINT.
+                tracing::warn!("SIGTERM stream closed; falling back to SIGINT only");
+                self.term = None;
             }
+            let _ = tokio::signal::ctrl_c().await;
+            ShutdownSignal::Sigint
         }
         #[cfg(not(unix))]
         {

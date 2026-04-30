@@ -38,9 +38,10 @@ pub type LogLevelSetter = Box<dyn Fn(LogLevel) -> anyhow::Result<()> + Send + Sy
 /// Held inside an `Arc` so the SIGHUP handler and the `ProbeHandler` can
 /// both observe updates. Values are updated in place by
 /// [`reload_runtime_config`]; readers (e.g. the probe handler) load
-/// `rate_per_mb` with `Ordering::Relaxed` because it's a single-word
-/// monotonic-ish counter without ordering requirements relative to other
-/// state.
+/// `rate_per_mb` with `Ordering::Relaxed` because the atomic carries no
+/// happens-before obligation to other state — it's a standalone config
+/// knob (the rate may move up *or* down across a SIGHUP), and readers
+/// tolerate seeing either generation across the swap.
 pub struct RuntimeReloadState {
     /// CLI overrides as parsed at startup. CLI > file > default precedence
     /// is preserved across reloads — a CLI flag set once at launch keeps
@@ -88,21 +89,44 @@ struct FileSectionSnapshot {
 
 impl FileSectionSnapshot {
     /// Capture a snapshot from a freshly parsed `FileConfig`. Serialisation
-    /// failures collapse to `None` (treated as "section absent") — the
+    /// failures collapse to `None` (treated as "section absent"), with a
+    /// `debug!` line per failure so an operator chasing phantom
+    /// "ignored (requires restart)" warnings has a thread to pull. The
     /// tracking is best-effort noise reduction, not a correctness gate.
     fn capture(file: &FileConfig) -> Self {
-        fn snap<T: serde::Serialize>(v: Option<&T>) -> Option<serde_json::Value> {
-            v.and_then(|s| serde_json::to_value(s).ok())
-        }
         Self {
-            identity: snap(file.identity.as_ref()),
-            network: snap(file.network.as_ref()),
-            blockchain: snap(file.blockchain.as_ref()),
-            cache: snap(file.cache.as_ref()),
-            gossip: snap(file.gossip.as_ref()),
-            observability: snap(file.observability.as_ref()),
+            identity: snap_section("identity", file.identity.as_ref()),
+            network: snap_section("network", file.network.as_ref()),
+            blockchain: snap_section("blockchain", file.blockchain.as_ref()),
+            cache: snap_section("cache", file.cache.as_ref()),
+            gossip: snap_section("gossip", file.gossip.as_ref()),
+            observability: snap_section("observability", file.observability.as_ref()),
         }
     }
+}
+
+/// Serialise a config section to `serde_json::Value`, logging serialisation
+/// failures at `debug!` instead of swallowing them silently. A poisoned
+/// baseline would cause subsequent unchanged reloads to spuriously emit
+/// "ignored (requires restart)" warnings forever — exactly the noise the
+/// diff was meant to suppress — so we want the failure visible to anyone
+/// who turns up the log level.
+fn snap_section<T: serde::Serialize>(
+    section: &'static str,
+    value: Option<&T>,
+) -> Option<serde_json::Value> {
+    value.and_then(|v| {
+        serde_json::to_value(v)
+            .map_err(|err| {
+                tracing::debug!(
+                    section,
+                    %err,
+                    "config diff snapshot serialisation failed; treating as unchanged"
+                );
+                err
+            })
+            .ok()
+    })
 }
 
 impl std::fmt::Debug for RuntimeReloadState {
@@ -157,12 +181,12 @@ impl RuntimeReloadState {
 /// malformed reload never propagates and stops the node.
 ///
 /// Ordering matters: every fallible step (file parse, sub-section
-/// resolution, mutex lock, log-level apply) runs *before* the only
-/// committing side-effect — the atomic `store` of `rate_per_mb`. This
-/// preserves the documented "previous values retained on error"
-/// contract; a partial reload that mutates the rate then fails the log
-/// apply would leave the running node in a state the operator never saw
-/// in the file. The atomic is the last thing we touch, after success.
+/// resolution, both mutex locks) runs *before* any committing
+/// side-effect (log-level setter, atomic swap, snapshot write-back). A
+/// partial reload that swapped the live tracing filter and *then* hit a
+/// poisoned snapshot mutex would leave the running node in a state the
+/// operator never saw in the file. Lock both mutexes first, then commit
+/// in a single fall-through block where nothing else can fail.
 ///
 /// Fields outside the reloadable set are diffed against the previously
 /// seen file contents (snapshot stored on `state`) and a single info
@@ -200,16 +224,27 @@ pub async fn reload_runtime_config(path: &Path, state: &RuntimeReloadState) -> a
         }
     };
 
-    // Lock the log-level cache *before* any mutation. Holding the guard
-    // across the optional setter call serialises concurrent reloads (a
-    // second SIGHUP racing the first one waits here) and lets us treat
-    // the whole "apply log level + write back" sequence as one critical
-    // section. We acquire the lock here, but commit the `*current = ...`
-    // write only after the rate atomic is stored.
+    // Lock both caches *before* any committing side-effect. Holding both
+    // guards across the rest of the function serialises concurrent
+    // reloads (a second SIGHUP racing the first one waits here) and lets
+    // us treat the whole "apply log level + swap rate + write back" path
+    // as one critical section. Acquiring the locks here is the *last*
+    // fallible step: PoisonError must surface before the setter or the
+    // atomic swap commit anything to live state.
     let mut current = state
         .current_log_level
         .lock()
         .map_err(|_| anyhow::anyhow!("log-level mutex poisoned"))?;
+    let mut sections = state
+        .last_file_sections
+        .lock()
+        .map_err(|_| anyhow::anyhow!("file-section snapshot mutex poisoned"))?;
+
+    // Diff non-reloadable sections against the previous snapshot before
+    // committing. Emitting "ignored" lines is read-only and we want them
+    // out of the way before the commit step.
+    log_ignored_fields(&file, &new_observability, &sections);
+
     let new_level = new_observability.log_level;
     // First reload (current is `None`) always applies, regardless of
     // whether the file value matches the resolved-at-startup level — the
@@ -220,24 +255,19 @@ pub async fn reload_runtime_config(path: &Path, state: &RuntimeReloadState) -> a
         None => true,
         Some(prev) => prev != new_level,
     };
+
+    // Commit step. Order within the commit:
+    //   1. log-level setter (only fallible commit; tracing filter swap)
+    //   2. atomic swap of rate_per_mb (infallible)
+    //   3. write-back of cached values via the held guards (infallible)
+    // If the setter fails we bail before touching the rate atomic or the
+    // snapshot caches, preserving the "previous values retained on
+    // error" contract. AtomicU64::swap and the guard writes themselves
+    // cannot fail.
     if log_level_changed && let Err(err) = (state.log_level_setter)(new_level) {
         tracing::warn!(%err, ?new_level, "failed to apply new log level; previous level retained");
         return Err(err);
     }
-
-    // Diff non-reloadable sections against the previous snapshot before
-    // we commit anything: emitting "ignored" lines is read-only and we
-    // want them out of the way before the commit step. Snapshot is
-    // updated post-commit so a still-failing reload (rate atomic or
-    // mutex write) doesn't poison the diff baseline.
-    let mut sections = state
-        .last_file_sections
-        .lock()
-        .map_err(|_| anyhow::anyhow!("file-section snapshot mutex poisoned"))?;
-    log_ignored_fields(&file, &new_observability, &sections);
-
-    // Commit step. Atomic store happens last so any earlier failure
-    // leaves rate_per_mb unchanged.
     let prev_rate = state
         .rate_per_mb
         .swap(new_payment.rate_per_mb, Ordering::Relaxed);
@@ -298,7 +328,7 @@ fn log_ignored_observability(
     // before the per-field diffs to keep the common no-change reload
     // silent.
     if let Some(prev) = prev_obs_json
-        && let Ok(curr) = serde_json::to_value(obs)
+        && let Some(curr) = snap_section("observability", Some(obs))
         && *prev == curr
     {
         return;
@@ -337,27 +367,42 @@ fn log_ignored_observability(
 /// as a change so the operator still gets the "ignored" notice once;
 /// thereafter we stay silent unless the section actually moved.
 fn log_ignored_other_sections(file: &crate::config::FileConfig, prev: &FileSectionSnapshot) {
-    fn changed<T: serde::Serialize>(curr: Option<&T>, prev: Option<&serde_json::Value>) -> bool {
+    /// Compare a freshly parsed section to its baseline snapshot. A
+    /// serialisation failure is treated as a change ("can't prove it
+    /// didn't move, so warn"); the underlying error is logged at
+    /// `debug!` via [`snap_section`] so the noise is traceable.
+    fn changed<T: serde::Serialize>(
+        section: &'static str,
+        curr: Option<&T>,
+        prev: Option<&serde_json::Value>,
+    ) -> bool {
         match (curr, prev) {
             (None, None) => false,
-            (Some(c), Some(p)) => serde_json::to_value(c).map_or(true, |c| &c != p),
+            (Some(c), Some(p)) => snap_section(section, Some(c)).is_none_or(|c| &c != p),
             // Section appearing or disappearing counts as a change.
             (Some(_), None) | (None, Some(_)) => true,
         }
     }
-    if changed(file.identity.as_ref(), prev.identity.as_ref()) && file.identity.is_some() {
+    if changed("identity", file.identity.as_ref(), prev.identity.as_ref())
+        && file.identity.is_some()
+    {
         warn_ignored("identity.* (data_dir, region)");
     }
-    if changed(file.network.as_ref(), prev.network.as_ref()) && file.network.is_some() {
+    if changed("network", file.network.as_ref(), prev.network.as_ref()) && file.network.is_some() {
         warn_ignored("network.* (bind_port, relay_url)");
     }
-    if changed(file.blockchain.as_ref(), prev.blockchain.as_ref()) && file.blockchain.is_some() {
+    if changed(
+        "blockchain",
+        file.blockchain.as_ref(),
+        prev.blockchain.as_ref(),
+    ) && file.blockchain.is_some()
+    {
         warn_ignored("blockchain.* (rpc_url, eth_keystore, contract addresses)");
     }
-    if changed(file.cache.as_ref(), prev.cache.as_ref()) && file.cache.is_some() {
+    if changed("cache", file.cache.as_ref(), prev.cache.as_ref()) && file.cache.is_some() {
         warn_ignored("cache.* (cache_dir, sizes, origin)");
     }
-    if changed(file.gossip.as_ref(), prev.gossip.as_ref()) && file.gossip.is_some() {
+    if changed("gossip", file.gossip.as_ref(), prev.gossip.as_ref()) && file.gossip.is_some() {
         warn_ignored("gossip.* (announce_interval, peer_ttl, allowlist, subscribe_global)");
     }
 }
@@ -623,6 +668,59 @@ mod tests {
         assert!(format!("{err:#}").contains("log-level mutex poisoned"));
         // Rate atomic must not have moved.
         assert_eq!(st.rate_per_mb().load(Ordering::Relaxed), 33);
+    }
+
+    /// Transactional contract for the *snapshot* mutex: if
+    /// `last_file_sections` is poisoned the reload must surface an
+    /// error before the live tracing filter is mutated and before the
+    /// rate atomic is swapped. The setter committing while a later
+    /// fallible step (snapshot lock) blew up was the original bug —
+    /// keep that path in the regression suite.
+    #[tokio::test]
+    async fn reload_keeps_log_level_when_sections_mutex_poisoned() {
+        let dir = tempfile::tempdir().unwrap();
+        // File asks for a log-level change *and* a rate change so the
+        // setter would be exercised if we reached the commit step.
+        let path = write_config(
+            dir.path(),
+            "[payment]\nrate_per_mb = 99\n\n[observability]\nlog_level = \"debug\"\n",
+        );
+
+        let initial = seed_resolved(42, LogLevel::Info);
+        let (setter, captured) = recording_setter();
+        let state = RuntimeReloadState::new(
+            PaymentArgs { rate_per_mb: None },
+            ObservabilityArgs {
+                log_level: None,
+                log_format: None,
+                metrics_port: None,
+                metrics_bind: None,
+                admin_port: None,
+                otlp_endpoint: None,
+            },
+            &initial,
+            setter,
+        );
+
+        // Same poisoning pattern as the log-level variant: hold the
+        // guard on a thread that panics, swallow the join payload to
+        // keep the test running.
+        let st = Arc::new(state);
+        let st_for_thread = Arc::clone(&st);
+        let join = std::thread::spawn(move || {
+            let _guard = st_for_thread.last_file_sections.lock().unwrap();
+            panic!("intentional panic to poison snapshot mutex");
+        });
+        let _ = join.join();
+        assert!(st.last_file_sections.is_poisoned());
+
+        let err = reload_runtime_config(&path, &st).await.unwrap_err();
+        assert!(format!("{err:#}").contains("file-section snapshot mutex poisoned"));
+        // The setter must NOT have been called — that's the whole point
+        // of locking both mutexes before any committing side-effect.
+        assert!(captured.lock().unwrap().is_none());
+        // Rate atomic must not have moved either.
+        assert_eq!(st.rate_per_mb().load(Ordering::Relaxed), 42);
     }
 
     /// Diff-based ignored-section logging: a second reload of the same
