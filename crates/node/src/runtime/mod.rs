@@ -380,7 +380,7 @@ async fn build_cache(cfg: &ResolvedConfig) -> anyhow::Result<CacheEngine> {
         .context("failed to open cache engine")
 }
 
-/// Which OS signal triggered shutdown. Returned by [`shutdown_signal`] so
+/// Which OS signal triggered shutdown. Returned by [`ShutdownStreams::recv`] so
 /// the "shutdown signal received" log line records the cause (SIGINT vs.
 /// SIGTERM) — operators need that distinction for post-incident analysis,
 /// and a future drain path can branch on it (immediate on SIGINT, graceful
