@@ -49,8 +49,8 @@
       "targets": [
         {
           "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "sum(decdn_streams_active{instance=~\"$instance\"})",
-          "legendFormat": "Active streams",
+          "expr": "sum by (instance) (decdn_streams_active{instance=~\"$instance\"})",
+          "legendFormat": "{{instance}}",
           "refId": "A"
         }
       ],
