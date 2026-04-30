@@ -97,7 +97,7 @@ The Ed25519 signature remains the primary authentication mechanism for the QUIC 
 
 | Approach | Gas Cost | PoC Suitability | Why Not |
 | --- | --- | --- | --- |
-| RIP-7212 Ed25519 precompile | ~3,000 | Not available | Not yet deployed on the production L2 as of 2026-04 (see [ADR 021](021-l2-chain-selection.md)) |
+| RIP-7212 Ed25519 precompile | ~3,000 | Not available | Not yet deployed on the production L2 as of 2026-04 (see [Appendix: L2 Deployment](appendix-l2-deployment.md)) |
 | Solidity Ed25519 library (e.g., `ed25519-sol`) | ~500k–1M | Too expensive | A single slash verification would cost $0.25–$0.50; two-signature offenses double that |
 | ZK proof of Ed25519 signature | ~300k verify | Too complex | Requires a proving circuit, prover infrastructure, and proof generation latency |
 | Optimistic (no signature verification) | ~50k | Insufficient security | A node could deny authorship of any message; counter-evidence alone is not enough |

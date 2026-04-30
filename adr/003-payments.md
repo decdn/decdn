@@ -573,7 +573,7 @@ End-to-end USDC flow (client→node settlement, then the parallel cache-miss byp
 
 #### PoC stub
 
-For the PoC, the wiring layer in the `node` crate (per [ADR 023](023-poc-production-seams.md)) selects the `FeeRouter` deployment per network. A PoC stub `FeeRouter` MAY perform only the 40% same-tx base payout to the operator and accumulate the remaining 60% in a single forwarding wallet (treasury), to keep the PoC contract surface bounded while preserving the `StablePaymentChannel` ↔ `FeeRouter` interface contract. Production deployments MUST implement the full six-bucket split with epoch-bucketed gauge and delegator pools.
+For the PoC, the wiring layer in the `node` crate (per [Appendix: PoC/Production Seams](appendix-poc-production-seams.md)) selects the `FeeRouter` deployment per network. A PoC stub `FeeRouter` MAY perform only the 40% same-tx base payout to the operator and accumulate the remaining 60% in a single forwarding wallet (treasury), to keep the PoC contract surface bounded while preserving the `StablePaymentChannel` ↔ `FeeRouter` interface contract. Production deployments MUST implement the full six-bucket split with epoch-bucketed gauge and delegator pools.
 
 ### EIP-712 Voucher Signature
 

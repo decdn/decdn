@@ -1,10 +1,6 @@
-# ADR 023 — PoC/Production Seam Architecture
+# Appendix: PoC/Production Seam Architecture (Rust implementation)
 
-**Status:** Accepted
-**Date:** 2026-04-08
-**Deciders:** Core team
-
----
+> **This is an appendix, not a core protocol ADR.** The principle "PoC and production must be visibly distinct, with mode selection happening at composition boundaries rather than threaded through domain logic" is a protocol design rule. The specific implementation pattern documented here — Rust crate structure with leaf domain crates and a `node`-crate wiring layer, `#[cfg(feature = "poc")]` placement rules, and the mechanical-deletion graduation path — applies to this codebase. Other implementations are free to express the same principle differently (e.g., Go build tags, Python factories, runtime configuration).
 
 ## Context
 

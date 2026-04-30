@@ -1,7 +1,6 @@
-# ADR 006: End-to-End Encryption and Key Distribution
+# Appendix: Encrypted Content Publishing on deCDN
 
-**Date:** 2026-03-29
-**Status:** Draft
+> **This is an appendix, not a core protocol ADR.** The deCDN protocol is encryption-agnostic — content addressing means the network shuttles bytes, and whether those bytes are plaintext or ciphertext is the publisher's choice. This document specifies one deployment pattern for building an encrypted-content publishing system on top of deCDN, including the companion app server and `cdn/keys/v1` ALPN — neither of which are CDN protocol participants. Alternative encryption schemes (e.g., direct symmetric distribution, group-keyed) are acceptable.
 
 ## Context
 

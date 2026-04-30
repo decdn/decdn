@@ -22,7 +22,7 @@ This ADR defines which protocols are eligible for 0-RTT, the replay safety ratio
 | `cdn/probe/v1` | **Yes** | `ProbeRequest` is read-only and idempotent. A replayed probe produces a duplicate `ProbeResponse` that the requester deduplicates by `NodeId` in the probe cache. No state change on the responder. |
 | `cdn/client/v1` | **No** | `StreamRequest` initiates a payment relationship. Replay could cause duplicate byte delivery or voucher accounting confusion. Subsequent streams on an established connection already benefit from QUIC stream multiplexing (zero additional handshake cost). |
 | `cdn/watchtower/v1` | **No** | `WatchtowerRegister` has side effects (begins channel monitoring, allocates state). Connections are long-lived — handshake cost is amortized over hours or days. |
-| `cdn/keys/v1` | **No** | ADR 006 requires an authenticated `EpochKeyAuth` stream before `PlayRequest` or `OfflineLeaseRequest` streams are accepted. Since `EpochKeyAuth` has authentication side effects (not 0-RTT safe), and all other stream types depend on it, 0-RTT is not viable for any `KeysMessage` variant on a new connection. On an existing connection the handshake is already complete. |
+| `cdn/keys/v1` | **No** | The encrypted-content-publishing appendix requires an authenticated `EpochKeyAuth` stream before `PlayRequest` or `OfflineLeaseRequest` streams are accepted. Since `EpochKeyAuth` has authentication side effects (not 0-RTT safe), and all other stream types depend on it, 0-RTT is not viable for any `KeysMessage` variant on a new connection. On an existing connection the handshake is already complete. |
 
 ### Replay Safety Analysis
 
@@ -32,7 +32,7 @@ Responders MUST NOT use `ProbeRequest` receipt to trigger any state change (e.g.
 
 > **Implementation note:** Probe-receipt handling functions MUST be annotated as 0-RTT-safe (no side effects). If future implementations add demand-signal tracking or cache-priority boosting to probe handling, they MUST check the QUIC transport layer's early-data/replayed indicator before applying side effects.
 
-**`KeysMessage::PlayRequest` (side-effect-free but blocked by auth sequencing):** Contains `{blob_hash}`. The app server wraps the blob key with the current epoch key and a fresh random nonce per response — the operation is side-effect-free and read-only, but response bytes are not deterministic across calls (due to `nonce_wrap`). Despite being replay-safe in isolation, `PlayRequest` cannot be sent as 0-RTT early data because ADR 006 requires an authenticated `EpochKeyAuth` stream on the connection before the server will accept it. On a new 0-RTT connection, no auth stream exists yet, so the server would reject the request.
+**`KeysMessage::PlayRequest` (side-effect-free but blocked by auth sequencing):** Contains `{blob_hash}`. The app server wraps the blob key with the current epoch key and a fresh random nonce per response — the operation is side-effect-free and read-only, but response bytes are not deterministic across calls (due to `nonce_wrap`). Despite being replay-safe in isolation, `PlayRequest` cannot be sent as 0-RTT early data because The encrypted-content-publishing appendix requires an authenticated `EpochKeyAuth` stream on the connection before the server will accept it. On a new 0-RTT connection, no auth stream exists yet, so the server would reject the request.
 
 **`StreamRequest` (unsafe):** Initiates paid byte delivery. Replay could cause a node to begin streaming bytes and expect voucher payment for a transfer the client did not request. Even if the node detects the duplicate `channel_id` + `byte_offset` combination, the window between replay receipt and detection creates accounting ambiguity.
 
@@ -64,7 +64,7 @@ Nodes MUST configure 0-RTT acceptance per ALPN:
 - **`cdn/probe/v1`:** Accept 0-RTT. Process early-data `ProbeRequest` immediately.
 - **`cdn/client/v1`:** Reject 0-RTT (do not configure `max_early_data_size`). This is the default — QUIC servers that do not explicitly enable 0-RTT will reject it.
 - **`cdn/watchtower/v1`:** Reject 0-RTT.
-- **`cdn/keys/v1`:** Reject 0-RTT. Authentication sequencing ([ADR 006](006-e2e-encryption.md)) requires `EpochKeyAuth` before any other stream type, which is incompatible with 0-RTT early data.
+- **`cdn/keys/v1`:** Reject 0-RTT. Authentication sequencing ([Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md)) requires `EpochKeyAuth` before any other stream type, which is incompatible with 0-RTT early data.
 
 ### Impact on Probe Fan-Out Latency
 
@@ -98,7 +98,7 @@ The `probe_fanout_latency_seconds` histogram with the `0rtt` label enables opera
 - **No change to payment security.** `cdn/client/v1` and `cdn/watchtower/v1` remain 1-RTT-only. Payment channel setup, voucher exchange, and watchtower registration are never sent as early data.
 - **Session ticket storage** adds a small memory footprint (~200 bytes per ticket x 1,000 max = ~200 KB).
 - **Complexity cost** is modest: iroh's `connect_with_0rtt()` handles the transport-level details. The implementation burden is the ticket cache, the per-ALPN accept/reject configuration, and the fallback path.
-- **Future protocol versions** that add state-changing behavior to `ProbeRequest` must re-evaluate 0-RTT eligibility. The replay safety analysis in this ADR is tied to the current message semantics. If ADR 006's authentication sequencing for `cdn/keys/v1` is relaxed in the future, `PlayRequest` could become 0-RTT eligible (it is side-effect-free), but that would require a separate decision.
+- **Future protocol versions** that add state-changing behavior to `ProbeRequest` must re-evaluate 0-RTT eligibility. The replay safety analysis in this ADR is tied to the current message semantics. If the encrypted-content appendix's authentication sequencing for `cdn/keys/v1` is relaxed in the future, `PlayRequest` could become 0-RTT eligible (it is side-effect-free), but that would require a separate decision.
 
 ## References
 
@@ -106,5 +106,5 @@ The `probe_fanout_latency_seconds` histogram with the `0rtt` label enables opera
 - [RFC 8446 Section 8](https://www.rfc-editor.org/rfc/rfc8446#section-8) — TLS 1.3 0-RTT and anti-replay
 - [ADR 001 — Probe Fan-Out](001-network.md#content-discovery-dht--probe)
 - [ADR 005 — Connection Management](005-protocol.md#connection-management)
-- [ADR 006 — E2E Encryption and Key Distribution](006-e2e-encryption.md) — authentication sequencing that precludes `cdn/keys/v1` 0-RTT
+- [Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md) — authentication sequencing that precludes `cdn/keys/v1` 0-RTT
 - [ADR 013 — Schema Evolution](013-schema-evolution.md) — `KeysMessage` enum framing

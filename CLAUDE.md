@@ -61,7 +61,7 @@ crates/
 |------|---------|
 | `cdn/keys/v1` | Epoch key delivery, play requests, offline leases (app server) |
 
-> The app server is not a CDN protocol participant — see [ADR 006](adr/006-e2e-encryption.md).
+> The app server is not a CDN protocol participant — see [adr/appendix-encrypted-content-publishing.md](adr/appendix-encrypted-content-publishing.md).
 
 ### Key Design Decisions
 
@@ -69,5 +69,5 @@ crates/
 - No external origin URLs are ever exposed — origin backends (S3/R2/B2) are opaque per-node config
 - All byte transfers are paid, including node-to-node cache-miss pulls
 - TOKEN for staking/governance, USDC for payments (dual-currency model)
-- Per ADR 023: domain crates (`cache`, `gossip`, etc.) are "leaf" — no mode branching or `#[cfg(feature = "poc")]`. The `node` crate's wiring layer selects backends/implementations.
+- Domain crates (`cache`, `gossip`, etc.) are "leaf" — no mode branching or `#[cfg(feature = "poc")]`. The `node` crate's wiring layer selects backends/implementations. See [adr/appendix-poc-production-seams.md](adr/appendix-poc-production-seams.md) for the full Rust implementation pattern.
 - ADRs in `adr/` document all major decisions; `adr/architecture.md` is the living overview

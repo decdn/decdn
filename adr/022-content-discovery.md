@@ -239,7 +239,7 @@ DHT STORE and FIND_VALUE operations carry no protocol-level fee. The incentive t
 5. A false STORE record (node claims to hold a blob it doesn't) fails at the probe step; the publishing node incurs a reputation penalty within one gossip cycle.
 6. During bootstrap (routing table < k entries), broadcast probe fan-out is used as fallback; the fallback window completes within 2 self-lookup rounds.
 7. A node observing ≥5 FIND_VALUE queries for hash H within 5 minutes initiates a prefetch for H.
-8. A node suppressing `popular_hashes` entries for a popular blob experiences measurable `LoadHint` increase under sustained demand, verifiable in [ADR 020](020-observability.md) metrics.
+8. A node suppressing `popular_hashes` entries for a popular blob experiences measurable `LoadHint` increase under sustained demand, verifiable in [Appendix: Observability](appendix-observability.md) metrics.
 
 ---
 
@@ -278,4 +278,4 @@ Deferred. `libp2p-kad` is battle-tested but built on libp2p's transport stack. B
 - **ADR 008** reputation penalties for delivery failure cover false STORE record publishers.
 - **ADR 012** client discovery uses DHT FIND_VALUE; probe fan-out bootstrap fallback applies to clients equally.
 - **ADR 013** schema evolution rules apply to `cdn/dht/v1`.
-- **ADR 020** SHOULD add DHT subsystem metrics: `decdn_dht_store_published_total`, `decdn_dht_findvalue_queries_total`, `decdn_dht_routing_table_size`.
+- **the observability appendix** SHOULD add DHT subsystem metrics: `decdn_dht_store_published_total`, `decdn_dht_findvalue_queries_total`, `decdn_dht_routing_table_size`.

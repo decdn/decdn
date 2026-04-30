@@ -39,7 +39,7 @@ Decentralized CDN where nodes cache and serve content-addressed blobs over [iroh
 |------|---------|
 | `cdn/keys/v1` | Epoch key delivery, play requests, offline leases (app server) |
 
-> The app server is not a CDN protocol participant — see [ADR 006](adr/006-e2e-encryption.md).
+> The app server is not a CDN protocol participant — see [adr/appendix-encrypted-content-publishing.md](adr/appendix-encrypted-content-publishing.md).
 
 ### Crate Structure
 

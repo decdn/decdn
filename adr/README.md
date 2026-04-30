@@ -79,6 +79,15 @@ Terms used across multiple ADRs without inline definition.
 | **Slash signature** | An EIP-712 secp256k1 signature (`slash_sig`) on protocol messages, used for on-chain slash evidence via `ecrecover`. Distinct from the Ed25519 wire signature — see [ADR 014](014-on-chain-verification.md). |
 | **Challenge bond** | The 100 TOKEN amount a challenger must post when submitting slash evidence. Returned on successful slash, forfeited on successful node counter (50% burned, 50% to node) — see [ADR 014 § Bond Handling](014-on-chain-verification.md#bond-handling). |
 
+## ADRs vs appendices
+
+This directory contains two kinds of documents:
+
+- **Core protocol ADRs** (`NNN-name.md`) — invariants every conforming node, client, or contract must implement the same way for the network to function. These are the canonical specification.
+- **Appendices** (`appendix-name.md`) — patterns, reference implementations, and operational guidance built **on top of** the protocol. Alternative implementations are acceptable. Examples: encrypted content publishing (companion app server, `cdn/keys/v1`), the recommended observability metric registry, the Arbitrum One deployment selection, the Rust implementation pattern for PoC/production seams, and the local admin HTTP surface.
+
+Appendices are listed in [`architecture.md` § Appendices — Reference Patterns](architecture.md#appendices-reference-patterns). They are deliberately **not** numbered as ADRs because they document optional patterns rather than core protocol decisions.
+
 ## Decision-record context
 
 ADRs are **decision records**: they capture both the canonical design and the alternatives that were considered and rejected, so future contributors can see what was on the table without inferring it from the current design. Each ADR with rejected alternatives carries a `## Alternatives Considered` section covering the alternatives, the rationale for rejection, and the design that replaced them.

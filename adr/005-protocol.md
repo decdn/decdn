@@ -24,7 +24,7 @@ Companion protocol (app server — external to the CDN protocol):
 
 | Protocol | Participants | Purpose |
 | --- | --- | --- |
-| `cdn/keys/v1` | client ↔ app server | Epoch key delivery, play requests, offline leases (see [ADR 006](006-e2e-encryption.md)) |
+| `cdn/keys/v1` | client ↔ app server | Epoch key delivery, play requests, offline leases (see [Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md)) |
 
 **Gossip topics.** The iroh-gossip protocol carries multiple message types on distinct topics:
 
@@ -37,7 +37,7 @@ Companion protocol (app server — external to the CDN protocol):
 
 All gossip topics use the `cdn/` namespace prefix. `NodeAnnounce`, `RateChange`, and `ReputationReport` are active in production; `WatchtowerAnnounce` is a planned production extension for watchtower discovery at scale (PoC uses static watchtower lists — see [ADR 007](007-watchtower.md)).
 
-**Note:** See [ADR 006](006-e2e-encryption.md) for `cdn/keys/v1` stream types and the full key delivery protocol.
+**Note:** See [Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md) for `cdn/keys/v1` stream types and the full key delivery protocol.
 
 #### Gossip — rate change announcements
 
@@ -208,7 +208,7 @@ One QUIC connection per `(local_node, remote_node, ALPN)` tuple. Multiple reques
 
 Different ALPNs require separate connections (TLS ALPN is negotiated at connection establishment). A `cdn/probe/v1` connection and a `cdn/client/v1` connection to the same node are always distinct.
 
-**0-RTT early data** is permitted on `cdn/probe/v1` only (idempotent, read-only probes). All other protocols reject 0-RTT: `cdn/client/v1` and `cdn/watchtower/v1` to prevent replay-based accounting or registration confusion, and `cdn/keys/v1` because authentication sequencing ([ADR 006](006-e2e-encryption.md)) requires `EpochKeyAuth` before any request stream. See [ADR 015](015-zero-rtt.md) for the full replay safety analysis and session ticket management.
+**0-RTT early data** is permitted on `cdn/probe/v1` only (idempotent, read-only probes). All other protocols reject 0-RTT: `cdn/client/v1` and `cdn/watchtower/v1` to prevent replay-based accounting or registration confusion, and `cdn/keys/v1` because authentication sequencing ([Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md)) requires `EpochKeyAuth` before any request stream. See [ADR 015](015-zero-rtt.md) for the full replay safety analysis and session ticket management.
 
 #### Concurrent stream limits
 

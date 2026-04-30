@@ -63,7 +63,7 @@ clamped, observable, and disable-able.
 
 ### 1. Lock-rate feedback hook
 
-Read lock rate as `TOKEN.balanceOf(address(VotingEscrow)) / TOKEN.totalSupply()` (no oracle; matches the canonical `decdn_ve_lock_rate` metric in [ADR 020](020-observability.md) — underlying TOKEN locked, **not** ve-supply from `VotingEscrow.totalSupply()` / `totalSupplyAt(...)`). At epoch rollover:
+Read lock rate as `TOKEN.balanceOf(address(VotingEscrow)) / TOKEN.totalSupply()` (no oracle; matches the canonical `decdn_ve_lock_rate` metric in [Appendix: Observability](appendix-observability.md) — underlying TOKEN locked, **not** ve-supply from `VotingEscrow.totalSupply()` / `totalSupplyAt(...)`). At epoch rollover:
 
 | Lock rate window | Next-epoch shift | Direction |
 | --- | --- | --- |
@@ -158,4 +158,4 @@ Drafted but **not deployed at launch**. Governance dynamics aren't observable ye
 
 ## Forward references
 
-No follow-up ADRs. Dependencies — `FeeRouter`, `VotingEscrow`, the Balancer V3 80/20 pool, §11 safety bounds — already exist in [ADR 026](026-gauge-boost-tokenomics.md), [ADR 018](018-liquidity-strategy.md), [ADR 009](009-governance.md). On adoption, [ADR 016](016-contract-interactions.md) and [ADR 020](020-observability.md) update to register the new surface and metrics; both updates wait for this ADR to move out of deferred status.
+No follow-up ADRs. Dependencies — `FeeRouter`, `VotingEscrow`, the Balancer V3 80/20 pool, §11 safety bounds — already exist in [ADR 026](026-gauge-boost-tokenomics.md), [ADR 018](018-liquidity-strategy.md), [ADR 009](009-governance.md). On adoption, [ADR 016](016-contract-interactions.md) and [Appendix: Observability](appendix-observability.md) update to register the new surface and metrics; both updates wait for this ADR to move out of deferred status.

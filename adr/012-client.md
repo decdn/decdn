@@ -84,7 +84,7 @@ Clients manage two independent cryptographic keys.
 
 #### iroh Identity Key (Ed25519)
 
-- **Purpose:** Defines the client's `NodeId` in the peer mesh. Used for QUIC connection authentication — both for CDN delivery (`cdn/client/v1`, `cdn/probe/v1`) and for key delivery from the app server (`cdn/keys/v1`, [ADR 006](006-e2e-encryption.md)).
+- **Purpose:** Defines the client's `NodeId` in the peer mesh. Used for QUIC connection authentication — both for CDN delivery (`cdn/client/v1`, `cdn/probe/v1`) and for key delivery from the app server (`cdn/keys/v1`, [Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md)).
 - **Generation:** Created at first startup via `iroh::SecretKey::generate()`.
 - **Storage (PoC):** File at `~/.decdn/iroh_key`, permissions `0600`. No encryption — the file contains the raw 32-byte secret key.
 - **Storage (production):** Platform keychain (macOS Keychain, Windows Credential Manager, Linux Secret Service API).
@@ -165,7 +165,7 @@ Each client release ships with a built-in default seed list compiled into the bi
 - **RPC endpoint:** Returns correct registry data. A compromised RPC can return a fabricated node list (eclipse). Mitigated in production by multi-source bootstrap (Option B above).
 - **Registry correctness:** The `StakingRegistry` contract accurately reflects staked nodes. Enforced by EVM execution — trust in the chain, not any specific party.
 - **Gossip integrity:** `NodeAnnounce` messages are signed by the announcing node's registered key and validated against the registry. A node cannot forge another's announcement. However, `LoadHint` and `popular_hashes` are advisory — a node can lie, affecting selection quality but not safety.
-- **App server:** For encrypted content ([ADR 006](006-e2e-encryption.md)), the client trusts the app server to deliver correct epoch keys and envelopes over `cdn/keys/v1`. The QUIC handshake authenticates the app server's NodeId; the session token binds the client to its subscriber account. The app server is outside the CDN protocol boundary but shares the iroh transport layer.
+- **App server:** For encrypted content ([Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md)), the client trusts the app server to deliver correct epoch keys and envelopes over `cdn/keys/v1`. The QUIC handshake authenticates the app server's NodeId; the session token binds the client to its subscriber account. The app server is outside the CDN protocol boundary but shares the iroh transport layer.
 - **Clock:** NTP-synchronized local clock, used for gossip validation (±60 s freshness). Drift beyond this window causes the client to reject valid gossip.
 
 **Not trusted — the client does not rely on these:**
@@ -200,7 +200,7 @@ dns_seeds = []
 min_peer_diversity = 3                       # Option C threshold (production)
 
 [app_server]
-# Required for encrypted content (ADR 006). Omit for plaintext PoC.
+# Required for encrypted content (see encrypted-content-publishing appendix). Omit for plaintext PoC.
 node_id = ""                                 # app server's iroh NodeId (hex)
 addrs = []                                   # app server multiaddrs
 
@@ -403,7 +403,7 @@ struct ChunkEntry {
 }
 
 struct ChunkEncryption {
-    epoch_id: u32,        // epoch under which K_blob is wrapped (see ADR 006)
+    epoch_id: u32,        // epoch under which K_blob is wrapped (see appendix-encrypted-content-publishing.md)
     // K_blob itself is NOT in the manifest; delivered by the app server only
 }
 ```
@@ -418,7 +418,7 @@ The manifest blob is pushed to the CDN like any other blob. It is typically < 1 
    `~/.decdn/downloads/<H_manifest>/chunk-<index>.part`, verify BLAKE3.
 3. After all chunks verified: concatenate in order → output file; delete part files.
 
-For encrypted files, fetch `K_blob` per chunk from the app server (`cdn/keys/v1` — [ADR 006](006-e2e-encryption.md))
+For encrypted files, fetch `K_blob` per chunk from the app server (`cdn/keys/v1` — [Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md))
 and decrypt before writing. Chunk boundaries align with the parallel download range assignment
 (see above).
 
