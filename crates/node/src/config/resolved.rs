@@ -38,6 +38,9 @@ pub struct ResolvedBlockchain {
     pub payment_channel_address: String,
     /// `StakingRegistry` contract address.
     pub staking_registry_address: String,
+    /// Seconds between RPC connectivity watchdog probes. `0` disables the
+    /// watchdog entirely.
+    pub rpc_watchdog_interval_sec: u64,
 }
 
 /// Resolved cache fields.

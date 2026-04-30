@@ -114,6 +114,41 @@ pub async fn run(
         }
     });
 
+    // RPC connectivity watchdog (issue #283). Updates `decdn_rpc_healthy`
+    // each tick; a sustained transition fires an alert. `interval == 0`
+    // disables the watchdog entirely (operators can opt out for offline
+    // dev). Spawned outside the `JoinSet` because we drive it via its own
+    // `oneshot` and an explicit `await` during drain — same shape as the
+    // gossip handles, since `JoinSet::abort_all` cancels eagerly and we'd
+    // rather let the watchdog observe its `shutdown` arm.
+    //
+    // Seed the gauge to `1` here unconditionally: the startup
+    // `check_rpc_reachability` above already established the endpoint is
+    // reachable, and registered Prometheus gauges otherwise default to 0
+    // — which alerts would (correctly, by their own logic) read as an
+    // outage. Seeding before the watchdog-spawn branch covers the
+    // `interval == 0` case too.
+    node_metrics.rpc_healthy(true);
+    let rpc_watchdog = if cfg.blockchain.rpc_watchdog_interval_sec > 0 {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .context("failed to build HTTP client for RPC watchdog")?;
+        let interval = Duration::from_secs(cfg.blockchain.rpc_watchdog_interval_sec);
+        let (tx, rx) = oneshot::channel::<()>();
+        let handle = spawn_rpc_watchdog(
+            client,
+            cfg.blockchain.rpc_url.clone(),
+            interval,
+            Arc::clone(&node_metrics),
+            rx,
+        );
+        Some((tx, handle))
+    } else {
+        tracing::info!("RPC watchdog disabled (blockchain.rpc_watchdog_interval_sec = 0)");
+        None
+    };
+
     let peer_table = Arc::new(RwLock::new(PeerTable::new(
         cfg.gossip.peer_ttl_sec.saturating_mul(1_000_000),
     )));
@@ -234,6 +269,14 @@ pub async fn run(
     {
         tracing::warn!("admin server exited before shutdown signal was sent");
     }
+    let rpc_watchdog_handle = if let Some((tx, handle)) = rpc_watchdog {
+        if tx.send(()).is_err() {
+            tracing::warn!("RPC watchdog exited before shutdown signal was sent");
+        }
+        Some(handle)
+    } else {
+        None
+    };
 
     // Router::shutdown waits for ProtocolHandler::shutdown on each handler,
     // then closes the endpoint. After this returns we can safely abort
@@ -273,6 +316,15 @@ pub async fn run(
             {
                 tracing::warn!(%err, "gossip task panicked during shutdown");
             }
+        }
+        // Await the RPC watchdog. We signalled it via oneshot above, so
+        // a healthy run resolves cleanly here. A panic surfaces as a
+        // warning; cancellation is silent (matches gossip handling).
+        if let Some(handle) = rpc_watchdog_handle
+            && let Err(err) = handle.await
+            && !err.is_cancelled()
+        {
+            tracing::warn!(%err, "RPC watchdog task panicked during shutdown");
         }
     };
     if tokio::time::timeout(SHUTDOWN_DEADLINE, drain).await.is_ok() {
@@ -553,13 +605,21 @@ impl ShutdownStreams {
 /// error if the endpoint does not respond, letting operators catch typos and
 /// dead endpoints before the node binds ports and joins the gossip network.
 async fn check_rpc_reachability(rpc_url: &str) -> anyhow::Result<()> {
-    use std::time::Duration;
-
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
         .context("failed to build HTTP client for RPC check")?;
+    probe_rpc(&client, rpc_url).await?;
+    tracing::info!("RPC endpoint reachable");
+    Ok(())
+}
 
+/// Issue a single `net_version` JSON-RPC probe against `rpc_url` using the
+/// given client. Returns `Ok(())` on a 2xx response, an error otherwise.
+/// Extracted so the startup check and the watchdog share identical
+/// success/failure semantics — a deviation between the two would mean
+/// "startup says healthy, gauge says unhealthy" or vice versa.
+pub(crate) async fn probe_rpc(client: &reqwest::Client, rpc_url: &str) -> anyhow::Result<()> {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "net_version",
@@ -581,14 +641,76 @@ async fn check_rpc_reachability(rpc_url: &str) -> anyhow::Result<()> {
         resp.status()
     );
 
-    tracing::info!("RPC endpoint reachable");
     Ok(())
 }
 
+/// Spawn the RPC connectivity watchdog. On each tick of `interval`, calls
+/// [`probe_rpc`] and updates `metrics.rpc_healthy(...)`. Logs a `warn`
+/// when health transitions down and an `info` when it transitions back
+/// up; steady-state ticks are silent. Stops when `shutdown` resolves.
+///
+/// The caller is responsible for seeding the gauge before this is
+/// spawned — `run()` does so right after the successful
+/// `check_rpc_reachability` startup probe. The watchdog only writes the
+/// gauge on tick boundaries. The previous-state tracking starts
+/// assuming the endpoint is healthy for the same reason, which prevents
+/// a spurious "recovered" log on the first tick.
+fn spawn_rpc_watchdog(
+    client: reqwest::Client,
+    rpc_url: String,
+    interval: Duration,
+    metrics: Arc<metrics::Metrics>,
+    mut shutdown: oneshot::Receiver<()>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // Caller seeded the gauge from the startup probe; see fn docs.
+        let mut prev_healthy = true;
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut shutdown => {
+                    tracing::debug!("RPC watchdog shutdown signal received");
+                    return;
+                }
+                () = tokio::time::sleep(interval) => {}
+            }
+
+            let now_healthy = match probe_rpc(&client, &rpc_url).await {
+                Ok(()) => {
+                    if !prev_healthy {
+                        // Deliberately omit the URL: the node configures one
+                        // RPC endpoint, and it may carry basic-auth credentials
+                        // in the userinfo component.
+                        tracing::info!("RPC endpoint healthy");
+                    }
+                    true
+                }
+                Err(err) => {
+                    if prev_healthy {
+                        // URL omitted for the same reason as the recovery log
+                        // above; `%err` keeps the actionable context.
+                        tracing::warn!(%err, "RPC endpoint unhealthy");
+                    }
+                    false
+                }
+            };
+            metrics.rpc_healthy(now_healthy);
+            prev_healthy = now_healthy;
+        }
+    })
+}
+
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     // Operators grep `signal=SIGINT` / `signal=SIGTERM` in the structured
     // "shutdown signal received" log line; a rename here would silently
@@ -598,6 +720,96 @@ mod tests {
         assert_eq!(ShutdownSignal::Sigint.to_string(), "SIGINT");
         #[cfg(unix)]
         assert_eq!(ShutdownSignal::Sigterm.to_string(), "SIGTERM");
+    }
+
+    /// Mount a JSON-RPC `200 OK` POST handler. The mount lives on
+    /// `server` until the next `server.reset().await`; callers flip
+    /// state by resetting and mounting `mount_unhealthy` instead.
+    async fn mount_healthy(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(server)
+            .await;
+    }
+
+    /// Mount a JSON-RPC `500` POST handler. Used to flip the watchdog
+    /// from healthy to unhealthy without tearing the listener down.
+    async fn mount_unhealthy(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(server)
+            .await;
+    }
+
+    /// Poll `metrics.rpc_healthy_value()` until it equals `expected` or
+    /// the deadline expires. Returns the observed value either way so
+    /// failures show what we actually saw rather than just timing out.
+    async fn wait_for_gauge(metrics: &Arc<metrics::Metrics>, expected: i64) -> i64 {
+        let deadline = std::time::Instant::now() + Duration::from_millis(1500);
+        loop {
+            let v = metrics.rpc_healthy_value();
+            if v == expected || std::time::Instant::now() >= deadline {
+                return v;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn rpc_watchdog_tracks_endpoint_transitions() {
+        // Healthy -> unhealthy -> healthy transitions, all observed via
+        // the `rpc_healthy` gauge. Tight 100ms tick keeps the test under
+        // 5s wall-clock while still exercising multiple poll cycles.
+        let server = MockServer::start().await;
+        mount_healthy(&server).await;
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let metrics = Arc::new(metrics::Metrics::new());
+        // Mirror `run()`: the caller seeds the gauge from the startup
+        // probe, so the watchdog can assume `prev_healthy = true` without
+        // emitting a spurious "recovered" log on the first tick.
+        metrics.rpc_healthy(true);
+        let (tx, rx) = oneshot::channel::<()>();
+        let handle = spawn_rpc_watchdog(
+            client,
+            server.uri(),
+            Duration::from_millis(100),
+            Arc::clone(&metrics),
+            rx,
+        );
+
+        // Caller-seeded above; the wait still confirms the loop is
+        // running and has observed at least one healthy probe.
+        assert_eq!(wait_for_gauge(&metrics, 1).await, 1, "should be healthy");
+
+        // Flip to unhealthy. wiremock's last-mounted response wins for
+        // matching POSTs, so the next probe sees a 500.
+        server.reset().await;
+        mount_unhealthy(&server).await;
+        assert_eq!(
+            wait_for_gauge(&metrics, 0).await,
+            0,
+            "should detect unhealthy",
+        );
+
+        // Bring it back. Watchdog should recover within a few ticks.
+        server.reset().await;
+        mount_healthy(&server).await;
+        assert_eq!(
+            wait_for_gauge(&metrics, 1).await,
+            1,
+            "should detect recovery",
+        );
+
+        // Clean shutdown.
+        let _ = tx.send(());
+        let join_res = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(join_res.is_ok(), "watchdog should exit on shutdown signal");
     }
 
     /// Smoke test for the post-fixup `ShutdownStreams::recv` contract:

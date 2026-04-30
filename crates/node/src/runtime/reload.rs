@@ -466,6 +466,7 @@ mod tests {
                 eth_keystore: PathBuf::from("/tmp/keystore.json"),
                 payment_channel_address: "0x0000000000000000000000000000000000000001".into(),
                 staking_registry_address: "0x0000000000000000000000000000000000000002".into(),
+                rpc_watchdog_interval_sec: 30,
             },
             cache: ResolvedCache {
                 cache_dir: PathBuf::from("/tmp/cache"),

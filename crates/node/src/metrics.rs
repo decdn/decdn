@@ -47,6 +47,12 @@ pub struct DecdnMetrics {
     pub gossip_peer_table_size: Gauge,
     /// Successful subscriber reconnections after a stream drop.
     pub gossip_subscriber_reconnections_total: Counter,
+    /// JSON-RPC endpoint reachability per the watchdog task. `1` =
+    /// reachable, `0` = unreachable. ADR 020 names operational gauges in
+    /// the `decdn_*` family; this is the per-tick mirror of the startup
+    /// `check_rpc_reachability` probe so dashboards/alerts can fire on
+    /// a sustained outage rather than relying on a one-shot startup line.
+    pub rpc_healthy: Gauge,
 }
 
 /// Aggregated deCDN node metrics.
@@ -127,6 +133,21 @@ impl Metrics {
 
     pub fn gossip_reconnected(&self, _topic: &str) {
         self.decdn.gossip_subscriber_reconnections_total.inc();
+    }
+
+    /// Set the RPC health gauge. `true` -> 1 (reachable), `false` -> 0
+    /// (unreachable). Driven by the watchdog task spawned in
+    /// `runtime::run`.
+    pub fn rpc_healthy(&self, ok: bool) {
+        self.decdn.rpc_healthy.set(i64::from(ok));
+    }
+
+    /// Read the current value of the `rpc_healthy` gauge. Test-only —
+    /// production code should rely on the `OpenMetrics` endpoint rather
+    /// than reaching into individual gauges.
+    #[cfg(test)]
+    pub(crate) fn rpc_healthy_value(&self) -> i64 {
+        self.decdn.rpc_healthy.get()
     }
 
     /// RAII guard that increments `active_connections` on construction and

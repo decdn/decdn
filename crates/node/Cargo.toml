@@ -60,6 +60,7 @@ tempfile = { workspace = true }
 # without violating the workspace `unsafe_code = "forbid"` lint that would
 # otherwise force us to use `libc::raise` directly.
 nix = { version = "0.30", default-features = false, features = ["signal"] }
+wiremock = { workspace = true }
 
 [lints]
 workspace = true
