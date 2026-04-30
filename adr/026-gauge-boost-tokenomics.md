@@ -88,6 +88,12 @@ Per-operator pool share = `working_bytes_i / sum(working_bytes)`, where `working
 - **Over-ve:** `working` capped at `bytes_i` — no over-boost in the gauge pool. Excess ve still earns from the 7% delegator pool linearly.
 - **Maximum boost ratio = 1 / 0.4 = 2.5×** between a max-ve-locker and a zero-ve-locker delivering the same byte count.
 
+**Degenerate-input fallbacks** (required to prevent division-by-zero at launch and on quiet epochs):
+
+- `total_ve == 0` (no ve-locks exist anywhere — bootstrap window): the `ve_i / total_ve` term is undefined. The contract MUST treat `working_bytes_i = boostFloor × bytes_i = 0.4 × bytes_i` for every operator — every operator receives the commodity floor, share is purely byte-proportional. This is the natural limit of the Curve formula as ve-supply approaches zero.
+- `sum(working_bytes) == 0` (no operator delivered any verified bytes in the epoch): the per-operator share is undefined. The epoch's gauge bucket is **not** distributed; it remains in `FeeRouter`'s gauge accumulator and is included in the next epoch's bucket. This is preferred over sweeping to treasury immediately because the empty-epoch case is most likely an outage, not a permanent state — the next active epoch should benefit from the rolled-over USDC. The 26-epoch claim window (§2 Epoch mechanics) caps the total rollover; unclaimed-after-26-epochs USDC sweeps to treasury per the existing rule.
+- `bytes_i == 0` (operator delivered nothing this epoch): trivially `working_bytes_i = 0` and that operator's share is `0`. No special-case required — the formula handles this directly.
+
 The Curve formula is bounded by `bytes` in both directions (a non-locker still earns 40% of fair-share, a whale-locker cannot exceed fair-share), which prevents both the "starve commodity operators" and "ve-whale captures the pool" failure modes of simpler `boost = 1 + k × ve` mechanics. The fair-share normalization gives the system a stable equilibrium where operators who match their ve-share to their byte-share collectively neither over- nor under-claim — matching Curve's gauge-equilibrium pattern.
 
 The boost-floor parameter (default `boostFloor = 0.4`) is governable within `[0.2, 0.8]`. A lower floor sharpens the penalty for non-lockers and raises the max boost ratio; a higher floor softens differentiation. See §11 for the safety-bound table.

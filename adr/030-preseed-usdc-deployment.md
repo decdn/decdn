@@ -158,6 +158,15 @@ recruitment.
   voluntarily deregisters before repayment. On default, the recovery account
   claims any remaining staked TOKEN plus the referrer's 25% co-signed liability.
 
+**Implementation surface — payout redirection.** The "100% routes to recovery account" rule in the repayment bullet above requires a redirection mechanism, since `FeeRouter.routeSettlement` ([ADR 016](016-contract-interactions.md)) otherwise sends the 40% base share directly to the operator address. The mechanism:
+
+- `StakingRegistry.setPayoutDestination(address operator, address recoveryAccount, uint256 expiresAt)` — gated by a new `LOAN_GRANTOR_ROLE` held by this program's contract; sets a per-operator redirect destination with an explicit expiry timestamp. Set on loan disbursement.
+- `StakingRegistry.clearPayoutDestination(address operator)` — same role; called on loan repayment, and also (no-op) callable by anyone after `expiresAt` to clean up stale entries.
+- `StakingRegistry.payoutDestinationOf(address operator) view returns (address dest, uint256 expiresAt)` — public view.
+- `FeeRouter.routeSettlement` reads `payoutDestinationOf(operator)` once per call. If `dest != address(0) && block.timestamp < expiresAt`, the 40% base share routes to `dest` instead of `operator`. The same redirection applies to gauge-pool claims (`claimBoost` consults the destination at claim time) so the recovery account can pull both legs through the standard claim flow.
+
+This is an additive interface — it does not change `FeeRouter`'s six-bucket split, settlement timing, or any other invariant. Operators who never take a staking loan see no behaviour change. The redirect's expiry bound prevents the LOAN_GRANTOR from indefinitely siphoning revenue past the loan's intended duration; loan recipients can audit the on-chain destination + expiry at any time.
+
 **Success metrics.**
 
 - ≥ 80% repaid in full within 24 months of disbursement.
