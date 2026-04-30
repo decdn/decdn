@@ -12,7 +12,7 @@ This appendix preserves that analysis as operator-facing reference material, wit
 
 ## Monthly cost model (per watchtower)
 
-Heartbeats are batched per [ADR 007 §5 Break-Even Economics → Batched heartbeats](007-watchtower.md): one on-chain transaction per 6-hour window covers all active escrows for a given watchtower. This makes heartbeat gas cost fixed rather than per-channel.
+Heartbeats are batched per [ADR 007 §Heartbeat batching](007-watchtower.md#heartbeat-batching): one on-chain transaction per 6-hour window covers all active escrows for a given watchtower. This makes heartbeat gas cost fixed rather than per-channel.
 
 | Cost component | Monthly estimate | Notes |
 | --- | --- | --- |
