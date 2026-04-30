@@ -69,3 +69,7 @@ Architecture decision records live in [`adr/`](adr/), with [`adr/architecture.md
 ## Development
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development environment setup, build commands, coding standards, and contribution guidelines.
+
+## Operations
+
+- [Operator runbook](docs/runbook.md)

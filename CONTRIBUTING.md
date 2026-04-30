@@ -156,6 +156,8 @@ cargo deny check                     # license + advisory audit (deny.toml)
 
 ADRs in `adr/` are the primary deliverables right now. `adr/architecture.md` is the living overview and index of all decisions; numbered files cover individual decisions.
 
+Operator runbook entries go in [docs/runbook.md](docs/runbook.md); cross-reference the alert or metric that surfaces the failure.
+
 **Conventions:**
 
 - File naming: `NNN-topic.md` (zero-padded 3-digit prefix). Check `adr/` for the current highest number to determine the next sequence.
