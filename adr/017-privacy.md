@@ -228,4 +228,4 @@ Endpoint compromise yields secrets specific to that endpoint.
 - [ADR 008 — Reputation System](008-reputation.md): `ReputationReport` gossip, reporter credibility weighting
 - [ADR 012 — Client Architecture, Bootstrap, and Trust Model](012-client.md): client NodeId, key storage, rotation
 - [ADR 014 — On-Chain Verification for Slashing Evidence](014-on-chain-verification.md): on-chain verification data surface
-- [Architecture Overview](architecture.md): trust assumptions (RPC provider, relay, app server), system diagram
+- [Architecture Overview](architecture.md): trust assumptions (NTP, RPC provider, relay), system diagram

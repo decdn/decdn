@@ -23,8 +23,10 @@ For first-time readers, follow this thematic order rather than the numeric one. 
 4. **Tokenomics & incentives** — gauge-boost, delivery receipts, liquidity strategy, deferred follow-ups.
 5. **Verification & enforcement** — on-chain slashing evidence, watchtower, reputation, content takedown.
 6. **Governance & contracts** — Governor + Timelock model, contract interaction map.
-7. **Operations** — node onboarding, observability, PoC/production seams, local admin surface.
-8. **Supporting infrastructure** — L2 chain selection, schema evolution, privacy analysis, end-to-end encryption (companion app server).
+7. **Operations** — node onboarding.
+8. **Supporting infrastructure** — schema evolution, privacy analysis.
+
+Plus a set of **appendices** documenting reference patterns built on top of the protocol (encrypted content publishing, observability, L2 deployment selection, PoC/production seam architecture, local admin HTTP surface).
 
 The numeric index in [`architecture.md` § Architectural Decisions](architecture.md#architectural-decisions) stays as the canonical per-ADR reference.
 
