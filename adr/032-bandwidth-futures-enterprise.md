@@ -225,7 +225,7 @@ aggregate Enterprise SLA exposure for 6 consecutive months**. At that point:
   redirected to other pre-seed programs whose triggers have not fired).
 - All Enterprise SLA contracts continue with `SafetyReserve` as the sole backing
   source.
-- New contracts use `SafetyReserve` directly; the §2.2 priority-3 source is retired
+- New contracts use `SafetyReserve` directly; the §2.2 priority-2 source is retired
   from the contract template.
 
 This is the canonical signal that the network has matured past the bootstrap regime

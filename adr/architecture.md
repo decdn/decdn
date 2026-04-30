@@ -305,7 +305,7 @@ Canonical economic model: genesis allocation across six buckets (four vesting, t
 
 **Two automated feedback hooks (lock-rate and price-floor) within [ADR 026 §11](026-gauge-boost-tokenomics.md) safety bounds. Deferred — adopt after post-launch governance dynamics observable.**
 
-`AdaptiveFeeRouterController` evaluates at epoch rollover and shifts ±2pp between FeeRouter buckets based on a lock-rate read (`TOKEN.balanceOf(address(VotingEscrow)) / token_circulating_supply` — underlying TOKEN locked, not ve-supply, per ADR 029 §1) and a Balancer V3 30-day TWAP price-floor read. Both hooks are clamped to [ADR 026 §11](026-gauge-boost-tokenomics.md) bounds, observable via events, and disable-able by governance. Deferred reflects a "merge the spec, do not deploy" stance — if post-launch governance rebalancing is fast enough, this ADR may close as Rejected.
+`AdaptiveFeeRouterController` evaluates at epoch rollover and shifts ±2pp between FeeRouter buckets based on a lock-rate read (`TOKEN.balanceOf(address(VotingEscrow)) / TOKEN.totalSupply()` — underlying TOKEN locked, not ve-supply, per ADR 029 §1 / ADR 020) and a Balancer V3 30-day TWAP price-floor read. Both hooks are clamped to [ADR 026 §11](026-gauge-boost-tokenomics.md) bounds, observable via events, and disable-able by governance. Deferred reflects a "merge the spec, do not deploy" stance — if post-launch governance rebalancing is fast enough, this ADR may close as Rejected.
 
 ---
 

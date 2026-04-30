@@ -63,7 +63,7 @@ clamped, observable, and disable-able.
 
 ### 1. Lock-rate feedback hook
 
-Read `token_locked_underlying / token_circulating_supply` from `TOKEN.balanceOf(VotingEscrow)` and the live supply (no oracle; matches the `decdn_ve_lock_rate` metric in [ADR 020](020-observability.md)). At epoch rollover:
+Read lock rate as `TOKEN.balanceOf(address(VotingEscrow)) / TOKEN.totalSupply()` (no oracle; matches the canonical `decdn_ve_lock_rate` metric in [ADR 020](020-observability.md) — underlying TOKEN locked, **not** ve-supply from `VotingEscrow.totalSupply()` / `totalSupplyAt(...)`). At epoch rollover:
 
 | Lock rate window | Next-epoch shift | Direction |
 | --- | --- | --- |
