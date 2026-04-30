@@ -37,11 +37,13 @@ A new ERC-20 contract, transferable, with the following properties:
 | Standard | ERC-20 (full `transfer` / `approve` / `permit`) |
 | Underlying asset | TOKEN locked in `VotingEscrow` via the `SveToken` contract's own ve-position |
 | Ownership | DAO (Governor + Timelock per [ADR 009](009-governance.md)) |
-| Upgrade path | Proxied; upgrades governed by Timelock |
+| Upgrade path | Non-proxied; upgrades ship via DAO-governed redeploy + migration, consistent with [ADR 016](016-contract-interactions.md) |
 | Total supply | Mints on deposit, burns only on natural lock-decay redemption (§4) |
 | Position model | Single pooled `VotingEscrow` lock owned by `SveToken`; each sveTOKEN = a fractional claim on that pooled position |
 
 The contract holds exactly one `VotingEscrow` lock at any time. All deposits extend or top up that lock; all sveTOKEN claims are pro-rata over its current TOKEN balance. There is no per-user lock under the wrapper — that is the entire point of the abstraction.
+
+`SveToken` is intentionally **not** deployed behind a proxy. This keeps the wrapper aligned with [ADR 016](016-contract-interactions.md)'s no-proxy deployment rule and preserves the standard ERC-20 `permit` / EIP-712 assumption that signatures are bound to the concrete deployed contract address and its domain separator. If a future version is needed, the DAO deploys a new wrapper at a new address and executes an explicit migration rather than upgrading logic in place.
 
 ### 2. Deposit mechanics
 
