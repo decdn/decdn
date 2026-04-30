@@ -16,27 +16,32 @@ Companion assets:
 ## Disk full
 
 **Symptoms:** origin pull-through fails with I/O errors; cache writes blocked;
-`decdn_streams_failed_total{reason="other"}` rises; new content cannot be
-admitted.
+new content cannot be admitted.
 
 **Detect:**
 
-- `df -h $cache_dir` against the configured `cache.cache_dir`.
-- `decdn_cache_bytes` gauge approaching `cache.cache_size_mb × 1_000_000`.
-- No dedicated alert today; covered by the `decdn_cache_bytes` Grafana panel
-  and by `DecdnHighStreamErrorRate` once origin writes start to fail.
+- `df -h $cache_dir` against the configured `cache.cache_dir` — this is the
+  authoritative signal today.
+- No dedicated cache-capacity metric is exported yet (the cache crate has
+  no metrics; `cache.cache_size_mb` is parsed but the engine does not
+  enforce it). Track host-level disk usage until cache instrumentation
+  lands.
+- Existing alert `DecdnHighStreamErrorRate` will fire downstream once
+  origin writes start to fail, but it is not capacity-specific.
 
 **Remediate:**
 
-1. Raise `cache.cache_size_mb` in the config file, **or** prune the cache
-   directory manually, **or** move `cache.cache_dir` to a larger volume.
-2. Restart the node to pick up the new value. SIGHUP reload for live re-tune
-   lands with [#236](https://github.com/decdn/decdn/issues/236); until then,
-   restart is the only path.
+1. Prune the cache directory manually, **or** move `cache.cache_dir` to a
+   larger volume, **or** provision more disk on the host. Raising
+   `cache.cache_size_mb` is a no-op today: the engine accepts only
+   `max_blob_size_mb` as input and performs no eviction.
+2. If you moved `cache.cache_dir`, restart the node to pick up the new
+   value. SIGHUP reload for live re-tune lands with
+   [#236](https://github.com/decdn/decdn/issues/236); until then, restart
+   is the only path for a `cache_dir` change.
 3. If pruning manually, prefer evicting whole blob files — never truncate.
-   Truncated bytes will fail BLAKE3 verification and surface as
-   `decdn_streams_failed_total{reason="hash_mismatch"}`, which is a slashing
-   signal (see [Slashing risk](#slashing-risk)).
+   Truncated bytes will fail BLAKE3 verification on read, which is a
+   slashing signal (see [Slashing risk](#slashing-risk)).
 
 ## RPC unreachable
 
@@ -60,6 +65,11 @@ blacklist updates and stop being able to settle channels. Once
     -d '{"jsonrpc":"2.0","method":"net_version","params":[],"id":1}' \
     "$RPC_URL"
   ```
+
+  A `405 Method Not Allowed` response indicates an invalid endpoint URL
+  (e.g. wrong path) rather than a provider outage — JSON-RPC 2.0 requires
+  `POST`, so a 405 is the server saying the URL is wrong, not that it is
+  down.
 
 - Provider status page.
 
@@ -112,10 +122,17 @@ blacklist updates and stop being able to settle channels. Once
    The procedure is defined in
    [ADR 014](../adr/014-on-chain-verification.md); deadlines are absolute
    wall-clock — once the window closes the slash is final.
-3. **For phantom announces (`DecdnProbeHoldViolations`):** reduce admission
-   pressure or raise `max_probe_holds` per the alert annotation; investigate
-   OOM. See
-   [ADR 005 § Probe-Triggered Eviction Hold](../adr/005-protocol.md#probe-triggered-eviction-hold).
+3. **For phantom announces (`DecdnProbeHoldViolations`):** investigate OOM
+   and resource pressure on the node — the violations indicate that signed
+   `has_blob: true` answers are not being honoured by the eviction-hold
+   mechanism. There is no operator-tunable knob for hold capacity in
+   `crates/node/src/config/types.rs` today; the alert annotations reference
+   `max_probe_holds` but it is not yet a config field. Until that lands,
+   the practical levers are reducing offered load, increasing host
+   memory, and following
+   [ADR 005 § Probe-Triggered Eviction Hold](../adr/005-protocol.md#probe-triggered-eviction-hold)
+   for context. See also
+   [ADR 008](../adr/008-reputation.md) for reputation impact.
 4. **For self-detected exposure (`DecdnSlashEvidenceExposure`):** stop the
    node immediately and file a bug — this signals a code-path defect, not an
    operator misconfiguration.
@@ -127,25 +144,34 @@ blacklist updates and stop being able to settle channels. Once
 
 **Detect:**
 
-- `DecdnPeerTableThin` (warning) — `decdn_peer_table_size < 3` for 10
-  minutes.
+- `DecdnPeerTableThin` (warning) — `decdn_gossip_peer_table_size < 3` for
+  10 minutes (the alert and metric are registered as
+  `decdn_gossip_peer_table_size` in `crates/node/src/metrics.rs`).
 - `DecdnNoActiveStreams` (warning) — `decdn_streams_active == 0` across all
-  directions for 15 minutes (gossip degradation is one of several causes).
+  directions for 15 minutes (gossip degradation is one of several causes;
+  note the underlying `decdn_streams_active` metric is not yet exported by
+  the node — track in `monitoring/prometheus-alerts.yml` until stream
+  instrumentation lands).
 - `decdn_iroh_*` transport-level metrics for connection failures (registered
   under the `decdn_iroh_` prefix per `crates/node/src/metrics.rs`).
 
-**Causes:** NAT traversal failure, firewall blocking the QUIC port, stale
-bootstrap peer list, host clock skew breaking TLS.
+**Causes:** NAT traversal failure, firewall blocking the QUIC port, peer
+identity rotation, host clock skew breaking TLS.
 
 **Remediate:**
 
-1. Verify the QUIC bind port is reachable from the public internet. If
-   bound to a private interface, switch to `0.0.0.0` or configure NAT/port
-   forwarding.
-2. Confirm the bootstrap peer list in the node config is current — old peer
-   IDs that have rotated their iroh keys (see
-   [`adr/appendix-operator-key-rotation.md`](../adr/appendix-operator-key-rotation.md))
-   will never connect.
+1. Verify the configured `network.bind_port` is reachable from the public
+   internet. The node already binds `Ipv4Addr::UNSPECIFIED` (`0.0.0.0`) in
+   `crates/node/src/runtime/mod.rs::build_endpoint`, so there is no
+   operator-tunable bind interface; fixes here are at the firewall, NAT,
+   or port-forwarding layer.
+2. If a peer's iroh key was rotated, neighbours referring to its prior
+   `NodeId` will not reconnect until they re-discover the new identity via
+   gossip. There is no static bootstrap-peer list in the node config
+   (`crates/node/src/config/types.rs` exposes only `network.bind_port` and
+   `network.relay_url`); follow
+   [`adr/appendix-operator-key-rotation.md`](../adr/appendix-operator-key-rotation.md)
+   for the staged-rotation procedure that keeps connectivity continuous.
 3. Inspect `decdn_iroh_magicsock_*` metrics for connect failures; high
    failure rates with low success rates indicate NAT/firewall problems
    rather than gossip-layer issues.
