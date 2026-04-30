@@ -262,56 +262,11 @@ The 20% floor on the node-base share guarantees operators always receive enough 
 
 ## Alternatives Considered
 
-Earlier internal drafts of the tokenomics model explored alternative shapes. The following were considered and rejected for the reasons noted; this section is the canonical record so future readers can see what was on the table without inferring it from the current design.
-
-### Original tokenomics shape
-
-A 1B-token model with a 3% protocol fee, 80/20/0/20 dev/audit/eco/burn allocation of the fee bucket, a regressive fee-discount mechanic ("stake 10× minimum to pay 1.5% fee instead of 3%"), a 200M-TOKEN node-bootstrap fund, and 50/50 burn/challenger slashing distribution.
-
-Rejected because:
-
-- **Burn flow was structurally noise.** ~0.014%/yr of supply at a 1,000-node mature network ($0.05 TOKEN), well below the ~22%/yr circulating-supply growth from vesting. Burn alone could not bound supply.
-- **No yield path to passive holders or long-term lockers.** Stake-to-operate, fee discount, and governance were the only TOKEN utilities; long-term lockers had no compensation lever distinct from short-term holders.
-- **Regressive fee discount.** The discount-on-stake-multiple pattern reduced buyback flow as more operators qualified — large stakers weakened the deflationary sink. Non-progressive and non-aligned with long-term commitment.
-- **TOKEN-denominated bootstrap was reflexive.** The 200M-TOKEN bootstrap fund's purchasing power collapsed exactly when subsidies were most needed.
-
-### Auto-ve-lock-on-vest
-
-Variant: vesting contracts auto-lock released TOKEN into `VotingEscrow` for a fixed term (commonly 1 year) before delivering to the recipient. Intent: forced long-term alignment and a thicker veTOKEN base from genesis.
-
-Rejected because:
-
-- The gauge boost (§3) is a stronger *voluntary* incentive than a vesting-imposed lock — recipients who would benefit from ve-locking choose to, others don't. Forced locking is not load-bearing for the equilibrium.
-- Term sheets get more complex (seed / team locking semantics interact with the existing 4-year vest), and the auto-lock contract is a new audit surface.
-- The cost is a thinner initial veTOKEN base; the design absorbs that cost via §9's optional treasury-funded ve-lock-on-claim airdrop in the first 6–12 months.
-
-### USDC distribution to a passive ve-pool
-
-Variant for §6 delegator pool: distribute the 7% bucket as USDC directly to ve-lockers, rather than performing the USDC→TOKEN swap.
-
-Rejected because:
-
-- Decouples ve-locker yield from TOKEN appreciation — the "real yield in TOKEN" lever is the larger long-term value driver and creates the demand-side TWAP buy pressure that compounds with operator-side ve-locking.
-- USDC distribution to ve-lockers is structurally a stablecoin-yield product, which fits poorly with the ve-position's role as a long-duration commitment device.
-
-### Pure-deflationary slashing (50/50 challenger/burn)
-
-Variant for §8: keep the original 50% challenger / 50% burn distribution, omit the SafetyReserve share.
-
-Rejected because:
-
-- User-harm incidents have no structural recourse path under pure-deflationary slashing. Incorrect-slash appeals, bad-data incident compensation, and future incident-response contracts all need a funded reserve, and the 3% router share alone is insufficient to seed it at early scale.
-- The 20% burn share (vs. the original 50%) preserves a meaningful pure-deflationary lever and the §11 safety bound `[0%, 25%]` lets governance recalibrate post-launch if deterrence proves insufficient.
-
-### TOKEN-denominated node-bootstrap fund
-
-Variant: a protocol-issued multi-hundred-million-TOKEN bootstrap fund that disburses TOKEN to early operators.
-
-Rejected because:
-
-- Subsidy purchasing power tracks TOKEN price; subsidies become least valuable exactly when most needed.
-- Concentrates pre-launch dilution in a single allocation tied to bootstrap duration rather than network outcomes.
-- Externally-raised USDC pre-seed (operational; tracked separately) is the chosen alternative — TOKEN-price-independent and externally-priced.
+- **Original tokenomics shape** — 3% flat protocol fee, regressive stake-multiple fee discount, 200M-TOKEN bootstrap fund, 50/50 challenger/burn slashing. **Rejected:** burn was structurally noise (~0.014%/yr supply vs. ~24%/yr vesting per §1); no yield path for passive holders or long-term lockers; the stake-multiple discount weakened the deflationary sink as operators qualified; TOKEN-denominated bootstrap was reflexive against price drops.
+- **Auto-ve-lock-on-vest** — vesting contracts auto-lock released TOKEN into `VotingEscrow` for a fixed term before delivery. **Rejected:** the §3 gauge boost is a stronger voluntary incentive than a forced lock; auto-lock complicates seed/team term sheets and adds audit surface; the thinner-initial-veTOKEN cost is absorbed by §9's optional ve-lock-on-claim airdrop.
+- **USDC distribution to a passive ve-pool** — distribute §6's 7% delegator bucket as USDC directly to ve-lockers (skip USDC→TOKEN swap). **Rejected:** decouples ve-locker yield from TOKEN appreciation, removing the "real yield in TOKEN" lever and the demand-side TWAP buy pressure that compounds with operator-side ve-locking.
+- **Pure-deflationary slashing (50/50 challenger/burn)** — §8 with no SafetyReserve share. **Rejected:** user-harm incidents need a funded recourse path; the 3% router share alone can't seed it at early scale; the 20% burn share preserves a meaningful deflationary lever within §11's `[0%, 25%]` bound.
+- **TOKEN-denominated node-bootstrap fund** — protocol-issued multi-hundred-million-TOKEN fund disbursed to early operators. **Rejected:** subsidy purchasing power tracks TOKEN price (least valuable when most needed); concentrates pre-launch dilution against bootstrap duration rather than network outcomes. Replaced by §10's externally-raised USDC pre-seed.
 
 ---
 
