@@ -404,6 +404,8 @@ sequenceDiagram
 
 Deprecation schedules are announced via governance ([ADR 009](009-governance.md)). A future governance-maintained on-chain `ProtocolVersions` registry could formalize version sunset dates — deferred, not required for PoC.
 
+> **See also:** [`appendix-operator-upgrade-path.md`](appendix-operator-upgrade-path.md) sequences the operator-side actions for each tier — Tier 1/2 checklists, the Tier 3 rolling-upgrade procedure, and the watchtower / client / governance coordination touchpoints.
+
 ### Application Error Codes
 
 QUIC application error codes used by this ADR:
