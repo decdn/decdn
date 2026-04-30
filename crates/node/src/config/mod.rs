@@ -2047,4 +2047,642 @@ mod tests {
         );
         Ok(())
     }
+
+    // -- helpers for full RunArgs construction (issue #217) ---------------
+
+    fn empty_identity_args() -> crate::cli::run::IdentityArgs {
+        crate::cli::run::IdentityArgs {
+            data_dir: None,
+            region: None,
+        }
+    }
+
+    fn empty_network_args() -> crate::cli::run::NetworkArgs {
+        crate::cli::run::NetworkArgs {
+            bind_port: None,
+            relay_url: None,
+        }
+    }
+
+    fn empty_blockchain_args() -> crate::cli::run::BlockchainArgs {
+        crate::cli::run::BlockchainArgs {
+            rpc_url: None,
+            eth_keystore: None,
+            payment_channel_address: None,
+            staking_registry_address: None,
+        }
+    }
+
+    fn empty_cache_args() -> crate::cli::run::CacheArgs {
+        crate::cli::run::CacheArgs {
+            cache_dir: None,
+            cache_size_mb: None,
+            max_blob_size_mb: None,
+            origin_url: None,
+            origin_path: None,
+        }
+    }
+
+    fn empty_payment_args() -> crate::cli::run::PaymentArgs {
+        crate::cli::run::PaymentArgs { rate_per_mb: None }
+    }
+
+    fn empty_observability_args() -> crate::cli::run::ObservabilityArgs {
+        crate::cli::run::ObservabilityArgs {
+            log_level: None,
+            log_format: None,
+            metrics_port: None,
+            metrics_bind: None,
+            admin_port: None,
+            otlp_endpoint: None,
+        }
+    }
+
+    fn empty_run_args() -> RunArgs {
+        RunArgs {
+            identity: empty_identity_args(),
+            network: empty_network_args(),
+            blockchain: empty_blockchain_args(),
+            cache: empty_cache_args(),
+            payment: empty_payment_args(),
+            observability: empty_observability_args(),
+        }
+    }
+
+    // ---- resolve_identity: CLI > file, file used when CLI omits ----------
+
+    #[test]
+    fn resolve_identity_cli_region_overrides_file() -> anyhow::Result<()> {
+        let mut cli = empty_identity_args();
+        cli.region = Some("de".to_string());
+        cli.data_dir = Some(PathBuf::from("/tmp/cli-data"));
+        let file = types::IdentityConfig {
+            data_dir: Some(PathBuf::from("/tmp/file-data")),
+            region: Some("us".to_string()),
+        };
+        let resolved = resolve_identity(&cli, Some(&file))?;
+        assert_eq!(resolved.region.as_deref(), Some("DE"));
+        assert_eq!(resolved.data_dir, PathBuf::from("/tmp/cli-data"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_identity_falls_back_to_file_when_cli_absent() -> anyhow::Result<()> {
+        let cli = empty_identity_args();
+        let file = types::IdentityConfig {
+            data_dir: Some(PathBuf::from("/tmp/file-data")),
+            region: Some("sg".to_string()),
+        };
+        let resolved = resolve_identity(&cli, Some(&file))?;
+        // Region is normalized to upper case.
+        assert_eq!(resolved.region.as_deref(), Some("SG"));
+        assert_eq!(resolved.data_dir, PathBuf::from("/tmp/file-data"));
+        Ok(())
+    }
+
+    // ---- resolve_network: CLI > file, default when both omit -------------
+
+    #[test]
+    fn resolve_network_cli_bind_port_overrides_file() {
+        let mut cli = empty_network_args();
+        cli.bind_port = Some(5555);
+        let file = types::NetworkConfig {
+            bind_port: Some(6666),
+            relay_url: None,
+        };
+        let resolved = resolve_network(&cli, Some(&file));
+        assert_eq!(resolved.bind_port, 5555);
+    }
+
+    #[test]
+    fn resolve_network_uses_file_when_cli_absent() {
+        let cli = empty_network_args();
+        let file = types::NetworkConfig {
+            bind_port: Some(6666),
+            relay_url: Some("https://relay.example".to_string()),
+        };
+        let resolved = resolve_network(&cli, Some(&file));
+        assert_eq!(resolved.bind_port, 6666);
+        assert_eq!(resolved.relay_url.as_deref(), Some("https://relay.example"));
+    }
+
+    #[test]
+    fn resolve_network_default_bind_port_when_unset() {
+        let cli = empty_network_args();
+        let resolved = resolve_network(&cli, None);
+        assert_eq!(resolved.bind_port, DEFAULT_BIND_PORT);
+        assert!(resolved.relay_url.is_none());
+    }
+
+    // ---- resolve_blockchain: CLI > file, missing-required errors ---------
+
+    #[test]
+    fn resolve_blockchain_cli_rpc_url_overrides_file() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            rpc_url: Some("https://cli-wins.example/rpc".to_string()),
+            eth_keystore: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            staking_registry_address: Some(GOOD_ADDR.to_string()),
+        };
+        let file = types::BlockchainConfig {
+            rpc_url: Some("https://file-loses.example/rpc".to_string()),
+            eth_keystore: None,
+            payment_channel_address: None,
+            staking_registry_address: None,
+        };
+        let resolved = resolve_blockchain(&cli, Some(&file), dir.path())?;
+        // url::Url normalisation appends a trailing path on bare-host URLs;
+        // both inputs already include `/rpc`, so the prefix match suffices
+        // and is robust against future normalisation tweaks.
+        assert!(
+            resolved.rpc_url.starts_with("https://cli-wins.example/rpc"),
+            "expected CLI rpc_url to win, got {}",
+            resolved.rpc_url,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_uses_file_rpc_url_when_cli_absent() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let cli = empty_blockchain_args();
+        let file = types::BlockchainConfig {
+            rpc_url: Some("https://file-only.example/rpc".to_string()),
+            eth_keystore: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            staking_registry_address: Some(GOOD_ADDR.to_string()),
+        };
+        let resolved = resolve_blockchain(&cli, Some(&file), dir.path())?;
+        assert!(
+            resolved
+                .rpc_url
+                .starts_with("https://file-only.example/rpc"),
+            "expected file rpc_url to be used, got {}",
+            resolved.rpc_url,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_errors_when_rpc_url_missing() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            rpc_url: None,
+            eth_keystore: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            staking_registry_address: Some(GOOD_ADDR.to_string()),
+        };
+        let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
+            anyhow::bail!("expected error when rpc_url missing");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--rpc-url") && msg.contains("rpc_url"),
+            "error should mention rpc_url and the flag form: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_errors_when_payment_channel_address_missing() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            payment_channel_address: None,
+            staking_registry_address: Some(GOOD_ADDR.to_string()),
+        };
+        let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
+            anyhow::bail!("expected error when payment_channel_address missing");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("payment_channel_address"),
+            "error should mention payment_channel_address: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_errors_when_staking_registry_address_missing() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            staking_registry_address: None,
+        };
+        let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
+            anyhow::bail!("expected error when staking_registry_address missing");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("staking_registry_address"),
+            "error should mention staking_registry_address: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_treats_empty_string_rpc_url_as_missing() -> anyhow::Result<()> {
+        // Mirror the `.filter(|s| !s.is_empty())` guard: a blank value (e.g.
+        // `DECDN_RPC_URL=""`) must surface the same "missing" diagnostic as
+        // an absent value rather than silently passing `""` to url::Url.
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            rpc_url: Some(String::new()),
+            eth_keystore: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            staking_registry_address: Some(GOOD_ADDR.to_string()),
+        };
+        let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
+            anyhow::bail!("expected error when rpc_url is empty string");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--rpc-url"),
+            "empty rpc_url should surface as missing: {msg}"
+        );
+        Ok(())
+    }
+
+    // ---- resolve_cache: CLI > file, defaults, tilde expansion ------------
+
+    #[test]
+    fn resolve_cache_cli_cache_dir_overrides_file_and_expands_tilde() -> anyhow::Result<()> {
+        let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("test requires home dir"))?;
+        let mut cli = empty_cache_args();
+        cli.cache_dir = Some(PathBuf::from("~/from-cli"));
+        let file = types::CacheConfig {
+            cache_dir: Some(PathBuf::from("/from/file")),
+            cache_size_mb: None,
+            max_blob_size_mb: None,
+            origin_url: None,
+            origin_path: None,
+        };
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/data-dir"))?;
+        assert_eq!(resolved.cache_dir, home.join("from-cli"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_uses_file_cache_dir_when_cli_absent() -> anyhow::Result<()> {
+        let cli = empty_cache_args();
+        let file = types::CacheConfig {
+            cache_dir: Some(PathBuf::from("/from/file")),
+            cache_size_mb: None,
+            max_blob_size_mb: None,
+            origin_url: None,
+            origin_path: None,
+        };
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/data-dir"))?;
+        assert_eq!(resolved.cache_dir, PathBuf::from("/from/file"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_falls_back_to_data_dir_subdirectory() -> anyhow::Result<()> {
+        // No CLI, no file: the documented fallback is `<data-dir>/cache`.
+        let cli = empty_cache_args();
+        let resolved = resolve_cache(&cli, None, Path::new("/data-dir"))?;
+        assert_eq!(resolved.cache_dir, PathBuf::from("/data-dir/cache"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_default_size_constants_apply_when_unset() -> anyhow::Result<()> {
+        let cli = empty_cache_args();
+        let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
+        assert_eq!(resolved.cache_size_mb, DEFAULT_CACHE_SIZE_MB);
+        assert_eq!(resolved.max_blob_size_mb, DEFAULT_MAX_BLOB_SIZE_MB);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_cli_size_overrides_file_size() -> anyhow::Result<()> {
+        let mut cli = empty_cache_args();
+        cli.cache_size_mb = Some(2_048);
+        cli.max_blob_size_mb = Some(256);
+        let file = types::CacheConfig {
+            cache_dir: None,
+            cache_size_mb: Some(99_999),
+            max_blob_size_mb: Some(50_000),
+            origin_url: None,
+            origin_path: None,
+        };
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        assert_eq!(resolved.cache_size_mb, 2_048);
+        assert_eq!(resolved.max_blob_size_mb, 256);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_uses_file_size_when_cli_absent() -> anyhow::Result<()> {
+        let cli = empty_cache_args();
+        let file = types::CacheConfig {
+            cache_dir: None,
+            cache_size_mb: Some(2_048),
+            max_blob_size_mb: Some(256),
+            origin_url: None,
+            origin_path: None,
+        };
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        assert_eq!(resolved.cache_size_mb, 2_048);
+        assert_eq!(resolved.max_blob_size_mb, 256);
+        Ok(())
+    }
+
+    // ---- resolve_payment: CLI > file (positive value path) ---------------
+
+    #[test]
+    fn resolve_payment_cli_rate_overrides_file_rate() -> anyhow::Result<()> {
+        let cli = crate::cli::run::PaymentArgs {
+            rate_per_mb: Some(99),
+        };
+        let file = types::PaymentConfig {
+            rate_per_mb: Some(1),
+        };
+        let resolved = resolve_payment(&cli, Some(&file))?;
+        assert_eq!(resolved.rate_per_mb, 99);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_payment_uses_file_when_cli_absent() -> anyhow::Result<()> {
+        let cli = empty_payment_args();
+        let file = types::PaymentConfig {
+            rate_per_mb: Some(50),
+        };
+        let resolved = resolve_payment(&cli, Some(&file))?;
+        assert_eq!(resolved.rate_per_mb, 50);
+        Ok(())
+    }
+
+    // ---- resolve_observability: CLI > file, defaults ---------------------
+
+    #[test]
+    fn resolve_observability_cli_log_level_overrides_file() -> anyhow::Result<()> {
+        let mut cli = empty_observability_args();
+        cli.log_level = Some(crate::cli::common::LogLevel::Trace);
+        let file = types::ObservabilityConfig {
+            log_level: Some(crate::cli::common::LogLevel::Error),
+            ..Default::default()
+        };
+        let resolved = resolve_observability(&cli, Some(&file))?;
+        assert_eq!(resolved.log_level, crate::cli::common::LogLevel::Trace);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_observability_uses_file_log_level_when_cli_absent() -> anyhow::Result<()> {
+        let cli = empty_observability_args();
+        let file = types::ObservabilityConfig {
+            log_level: Some(crate::cli::common::LogLevel::Debug),
+            ..Default::default()
+        };
+        let resolved = resolve_observability(&cli, Some(&file))?;
+        assert_eq!(resolved.log_level, crate::cli::common::LogLevel::Debug);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_observability_default_metrics_port_when_unset() -> anyhow::Result<()> {
+        let cli = empty_observability_args();
+        let resolved = resolve_observability(&cli, None)?;
+        assert_eq!(resolved.metrics_port, DEFAULT_METRICS_PORT);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_observability_cli_metrics_port_overrides_file() -> anyhow::Result<()> {
+        let mut cli = empty_observability_args();
+        cli.metrics_port = Some(8888);
+        let file = types::ObservabilityConfig {
+            metrics_port: Some(7777),
+            ..Default::default()
+        };
+        let resolved = resolve_observability(&cli, Some(&file))?;
+        assert_eq!(resolved.metrics_port, 8888);
+        Ok(())
+    }
+
+    // ---- end-to-end resolve_config: file path, default lookup, e2e -------
+
+    fn write_minimal_toml(dir: &TempDir, body: &str) -> anyhow::Result<PathBuf> {
+        let path = dir.path().join("node.toml");
+        std::fs::write(&path, body)?;
+        Ok(path)
+    }
+
+    fn complete_toml_body() -> &'static str {
+        r#"
+[blockchain]
+rpc_url = "https://example/rpc"
+payment_channel_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+staking_registry_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+
+[gossip]
+subscribe_global = false
+"#
+    }
+
+    /// Build a minimal `RunArgs` that, combined with `complete_toml_body`,
+    /// produces a successfully-resolving config.  `data_dir` points at a
+    /// tempdir holding a fake `keystore.json`, which lets `resolve_blockchain`
+    /// validate the keystore without touching `$HOME`.
+    fn run_args_with_data_dir(data_dir: &Path) -> RunArgs {
+        let mut args = empty_run_args();
+        args.identity.data_dir = Some(data_dir.to_path_buf());
+        args
+    }
+
+    #[test]
+    fn resolve_config_end_to_end_three_layer_merge() -> anyhow::Result<()> {
+        // CLI > file > default exercised together: TOML supplies blockchain
+        // required fields and disables global gossip; CLI overrides the bind
+        // port; defaults fill metrics_port + admin_port.
+        let dir = data_dir_with_keystore()?;
+        let path = write_minimal_toml(&dir, complete_toml_body())?;
+        let mut args = run_args_with_data_dir(dir.path());
+        args.network.bind_port = Some(31_337);
+
+        let resolved = resolve_config(Some(&path), &args)?;
+
+        // CLI value wins for bind_port.
+        assert_eq!(resolved.network.bind_port, 31_337);
+        // File supplied required blockchain values.
+        assert!(
+            resolved
+                .blockchain
+                .rpc_url
+                .starts_with("https://example/rpc")
+        );
+        // Defaults fill in.
+        assert_eq!(resolved.observability.metrics_port, DEFAULT_METRICS_PORT);
+        assert_eq!(resolved.observability.admin_port, Some(DEFAULT_ADMIN_PORT));
+        assert_eq!(resolved.cache.cache_size_mb, DEFAULT_CACHE_SIZE_MB);
+        assert_eq!(resolved.payment.rate_per_mb, DEFAULT_RATE_PER_MB);
+        assert_eq!(
+            resolved.gossip.announce_interval_sec,
+            DEFAULT_ANNOUNCE_INTERVAL_SEC
+        );
+        assert_eq!(resolved.gossip.peer_ttl_sec, DEFAULT_PEER_TTL_SEC);
+        // gossip.subscribe_global = false in the TOML => identity.region is
+        // not required (covers `ensure_region_when_publishing_global` happy
+        // path through resolve_config).
+        assert!(!resolved.gossip.subscribe_global);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_config_errors_when_subscribe_global_set_without_region() -> anyhow::Result<()> {
+        // subscribe_global defaults to true; without identity.region the
+        // cross-section invariant fires through resolve_config.
+        let body = r#"
+[blockchain]
+rpc_url = "https://example/rpc"
+payment_channel_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+staking_registry_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+"#;
+        let dir = data_dir_with_keystore()?;
+        let path = write_minimal_toml(&dir, body)?;
+        let args = run_args_with_data_dir(dir.path());
+        let Err(err) = resolve_config(Some(&path), &args) else {
+            anyhow::bail!("expected resolve_config to error on missing region");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("identity.region") && msg.contains("gossip.subscribe_global"),
+            "error should reference both fields: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_config_errors_when_bind_port_equals_metrics_port() -> anyhow::Result<()> {
+        // Drive validate_port_layout through resolve_config end-to-end —
+        // separate from the helper-level coverage above.
+        let dir = data_dir_with_keystore()?;
+        let path = write_minimal_toml(&dir, complete_toml_body())?;
+        let mut args = run_args_with_data_dir(dir.path());
+        args.network.bind_port = Some(9090);
+        args.observability.metrics_port = Some(9090);
+        let Err(err) = resolve_config(Some(&path), &args) else {
+            anyhow::bail!("expected port-collision error");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("network.bind_port") && msg.contains("metrics_port"),
+            "error should name both colliding ports: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_config_errors_when_origin_url_and_path_both_set() -> anyhow::Result<()> {
+        // resolve_cache enforces mutual exclusion; this end-to-end check
+        // confirms the same diagnostic surfaces from resolve_config so
+        // operators see it at startup.
+        let dir = data_dir_with_keystore()?;
+        let path = write_minimal_toml(&dir, complete_toml_body())?;
+        let mut args = run_args_with_data_dir(dir.path());
+        args.cache.origin_url = Some("https://origin.example/".to_string());
+        args.cache.origin_path = Some(PathBuf::from("/var/cache/decdn/origin"));
+        let Err(err) = resolve_config(Some(&path), &args) else {
+            anyhow::bail!("expected mutex error");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("mutually exclusive"),
+            "error should call out mutual exclusion: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn load_file_config_returns_default_when_path_is_none_and_default_absent() -> anyhow::Result<()>
+    {
+        // Implicit-path branch of load_file_config: when no explicit path
+        // is given and the documented default location does not exist,
+        // resolution must fall back to FileConfig::default() — operators
+        // running `decdn` without a config file rely on this.
+        //
+        // Test invariant: the user's own ~/.decdn/node.toml may or may not
+        // exist on this host; this test asserts the *contract* (default ↔
+        // `FileConfig::default()`) only when the precondition holds.
+        let default_path = common::default_config_path();
+        match default_path {
+            Some(p) if p.exists() => {
+                // Test host has a real config file at the default location;
+                // the "absent default" branch can't be exercised without
+                // mutating $HOME, which is unsafe under edition 2024.
+                eprintln!(
+                    "skipping: default config path exists at {} (would be \
+                     the wrong precondition for this branch)",
+                    p.display()
+                );
+            }
+            _ => {
+                let cfg = load_file_config(None)?;
+                // FileConfig::default() leaves every section as None.
+                assert!(cfg.identity.is_none());
+                assert!(cfg.network.is_none());
+                assert!(cfg.blockchain.is_none());
+                assert!(cfg.cache.is_none());
+                assert!(cfg.payment.is_none());
+                assert!(cfg.observability.is_none());
+                assert!(cfg.gossip.is_none());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn load_file_config_errors_when_explicit_path_missing() {
+        // Sibling of the implicit-path test above: an *explicit* missing
+        // path must error rather than silently fall through to defaults.
+        let dir = TempDir::new().expect("tempdir");
+        let bogus = dir.path().join("does-not-exist.toml");
+        let err = load_file_config(Some(&bogus)).expect_err("explicit missing path should error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does-not-exist.toml"),
+            "error should name the missing file: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_file_config_reads_and_parses_explicit_path() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let path = dir.path().join("node.toml");
+        std::fs::write(
+            &path,
+            r"
+[network]
+bind_port = 12345
+",
+        )?;
+        let cfg = load_file_config(Some(&path))?;
+        let bind = cfg
+            .network
+            .as_ref()
+            .and_then(|n| n.bind_port)
+            .ok_or_else(|| anyhow::anyhow!("expected network.bind_port to deserialise"))?;
+        assert_eq!(bind, 12345);
+        Ok(())
+    }
+
+    #[test]
+    fn load_file_config_errors_on_bad_toml() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("node.toml");
+        std::fs::write(&path, "this is not = valid = toml = at = all").expect("write");
+        let err = load_file_config(Some(&path)).expect_err("invalid TOML should fail to parse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("failed to parse config file"),
+            "error should describe the parse failure: {msg}"
+        );
+    }
 }
