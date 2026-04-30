@@ -98,6 +98,14 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
     // `oneshot` and an explicit `await` during drain — same shape as the
     // gossip handles, since `JoinSet::abort_all` cancels eagerly and we'd
     // rather let the watchdog observe its `shutdown` arm.
+    //
+    // Seed the gauge to `1` here unconditionally: the startup
+    // `check_rpc_reachability` above already established the endpoint is
+    // reachable, and registered Prometheus gauges otherwise default to 0
+    // — which alerts would (correctly, by their own logic) read as an
+    // outage. Seeding before the watchdog-spawn branch covers the
+    // `interval == 0` case too.
+    node_metrics.rpc_healthy(true);
     let rpc_watchdog = if cfg.blockchain.rpc_watchdog_interval_sec > 0 {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
@@ -470,11 +478,12 @@ pub(crate) async fn probe_rpc(client: &reqwest::Client, rpc_url: &str) -> anyhow
 /// when health transitions down and an `info` when it transitions back
 /// up; steady-state ticks are silent. Stops when `shutdown` resolves.
 ///
-/// The caller seeds the gauge — the watchdog only writes on
-/// transitions/each tick. The previous-state tracking starts assuming
-/// the endpoint is healthy because `check_rpc_reachability` ran
-/// successfully at startup; that prevents a spurious "recovered" log on
-/// the first tick.
+/// The caller is responsible for seeding the gauge before this is
+/// spawned — `run()` does so right after the successful
+/// `check_rpc_reachability` startup probe. The watchdog only writes the
+/// gauge on tick boundaries. The previous-state tracking starts
+/// assuming the endpoint is healthy for the same reason, which prevents
+/// a spurious "recovered" log on the first tick.
 fn spawn_rpc_watchdog(
     client: reqwest::Client,
     rpc_url: String,
@@ -483,9 +492,8 @@ fn spawn_rpc_watchdog(
     mut shutdown: oneshot::Receiver<()>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        // Seeded from the successful startup probe; see fn docs.
+        // Caller seeded the gauge from the startup probe; see fn docs.
         let mut prev_healthy = true;
-        metrics.rpc_healthy(true);
         loop {
             tokio::select! {
                 biased;
@@ -499,13 +507,18 @@ fn spawn_rpc_watchdog(
             let now_healthy = match probe_rpc(&client, &rpc_url).await {
                 Ok(()) => {
                     if !prev_healthy {
-                        tracing::info!(url = %rpc_url, "RPC endpoint healthy");
+                        // Deliberately omit the URL: the node configures one
+                        // RPC endpoint, and it may carry basic-auth credentials
+                        // in the userinfo component.
+                        tracing::info!("RPC endpoint healthy");
                     }
                     true
                 }
                 Err(err) => {
                     if prev_healthy {
-                        tracing::warn!(url = %rpc_url, %err, "RPC endpoint unhealthy");
+                        // URL omitted for the same reason as the recovery log
+                        // above; `%err` keeps the actionable context.
+                        tracing::warn!(%err, "RPC endpoint unhealthy");
                     }
                     false
                 }
@@ -538,8 +551,9 @@ mod tests {
         assert_eq!(ShutdownSignal::Sigterm.to_string(), "SIGTERM");
     }
 
-    /// Mount a JSON-RPC `200 OK` POST handler. Returns a guard that
-    /// `wiremock` resets when dropped.
+    /// Mount a JSON-RPC `200 OK` POST handler. The mount lives on
+    /// `server` until the next `server.reset().await`; callers flip
+    /// state by resetting and mounting `mount_unhealthy` instead.
     async fn mount_healthy(server: &MockServer) {
         Mock::given(method("POST"))
             .and(path("/"))
@@ -585,6 +599,10 @@ mod tests {
             .build()
             .unwrap();
         let metrics = Arc::new(metrics::Metrics::new());
+        // Mirror `run()`: the caller seeds the gauge from the startup
+        // probe, so the watchdog can assume `prev_healthy = true` without
+        // emitting a spurious "recovered" log on the first tick.
+        metrics.rpc_healthy(true);
         let (tx, rx) = oneshot::channel::<()>();
         let handle = spawn_rpc_watchdog(
             client,
@@ -594,9 +612,8 @@ mod tests {
             rx,
         );
 
-        // The watchdog seeds the gauge to `1` immediately on spawn, but
-        // we still wait to confirm the loop is running and observed the
-        // healthy mock at least once.
+        // Caller-seeded above; the wait still confirms the loop is
+        // running and has observed at least one healthy probe.
         assert_eq!(wait_for_gauge(&metrics, 1).await, 1, "should be healthy");
 
         // Flip to unhealthy. wiremock's last-mounted response wins for
