@@ -204,7 +204,7 @@ The response does not distinguish between governance and local denylist sources.
 
 ## Slashing
 
-Serving a blacklisted hash after the compliance window is a slashable offense, subject to the escalating schedule in [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn). Repeated offenses trigger cumulative stake loss; nodes whose stake drops below 50% of the minimum are auto-ejected. Individual slash percentages are capped at 50% per offense ([ADR 009 § Safety bounds](009-governance.md#governable-parameters-with-safety-bounds)). The standard challenge bond from [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn) applies (100 TOKEN PoC / 50 TOKEN production).
+Serving a blacklisted hash after the compliance window is a slashable offense, subject to the escalating schedule in [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn). Repeated offenses trigger cumulative stake loss; nodes whose stake drops below 50% of the minimum are auto-ejected. Individual slash percentages are capped at 50% per offense ([ADR 009 § Safety bounds](009-governance.md#governable-parameters-with-safety-bounds)). The standard 100 TOKEN challenge bond from [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn) applies.
 
 **Slash evidence.** The challenger submits:
 

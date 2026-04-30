@@ -77,7 +77,7 @@ Terms used across multiple ADRs without inline definition.
 | **`WatchtowerEscrow`** | The on-chain contract managing prepaid watchtower monitoring fees and heartbeat-based liveness accountability. Standalone — reads channel state but does not modify the payment channel — see [ADR 007](007-watchtower.md). |
 | **`BuybackBurner`** | The contract that swaps the 5% burn-bucket USDC into TOKEN via Balancer V3 80/20 weighted pool and burns the proceeds — see [ADR 003 § BuybackBurner](003-payments.md#buybackburner) and [ADR 018](018-liquidity-strategy.md). |
 | **Slash signature** | An EIP-712 secp256k1 signature (`slash_sig`) on protocol messages, used for on-chain slash evidence via `ecrecover`. Distinct from the Ed25519 wire signature — see [ADR 014](014-on-chain-verification.md). |
-| **Challenge bond** | The TOKEN amount (100 PoC / 50 production) a challenger must post when submitting slash evidence. Returned on successful slash, forfeited on successful node counter (50% burned, 50% to node) — see [ADR 014 § Bond Handling](014-on-chain-verification.md#bond-handling). |
+| **Challenge bond** | The 100 TOKEN amount a challenger must post when submitting slash evidence. Returned on successful slash, forfeited on successful node counter (50% burned, 50% to node) — see [ADR 014 § Bond Handling](014-on-chain-verification.md#bond-handling). |
 
 ## Decision-record context
 
