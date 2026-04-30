@@ -6,6 +6,7 @@
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use decdn_node::handlers::probe::ProbeHandler;
@@ -73,7 +74,7 @@ async fn probe_roundtrip() -> anyhow::Result<()> {
     let metrics = Arc::new(Metrics::new());
     let handler = Arc::new(ProbeHandler::new(
         server_id,
-        rate_per_mb,
+        Arc::new(AtomicU64::new(rate_per_mb)),
         Arc::clone(&metrics),
     ));
 
@@ -157,7 +158,11 @@ async fn spin_up_probe_harness() -> anyhow::Result<Harness> {
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let metrics = Arc::new(Metrics::new());
-    let handler = Arc::new(ProbeHandler::new(server_id, 1, metrics));
+    let handler = Arc::new(ProbeHandler::new(
+        server_id,
+        Arc::new(AtomicU64::new(1)),
+        metrics,
+    ));
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_PROBE.to_vec()]).await?;
 
     let server_ep_bg = server_ep.clone();

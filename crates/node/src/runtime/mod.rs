@@ -1,7 +1,12 @@
 //! Node runtime: owns the iroh endpoint, metrics server, and protocol router.
 
+pub mod reload;
+
+pub use reload::{LogLevelSetter, RuntimeReloadState, reload_runtime_config};
+
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddrV4};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,8 +37,16 @@ const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(15);
 
 /// Build the endpoint, register handlers on a `Router`, spawn the metrics
 /// server and gossip tasks, and run until a shutdown signal is received.
+///
+/// SIGHUP triggers a hot-reload of mutable config fields via
+/// [`RuntimeReloadState`] (see ADR-... TODO and issue #236). Other signals
+/// (SIGINT/SIGTERM) trigger graceful shutdown.
 #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
-pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
+pub async fn run(
+    cfg: ResolvedConfig,
+    config_path: Option<PathBuf>,
+    reload_state: Arc<RuntimeReloadState>,
+) -> anyhow::Result<()> {
     // Preflight: verify RPC endpoint is reachable before committing to
     // port binding. A 5-second timeout keeps startup responsive on flaky
     // networks while still catching typos and dead endpoints early.
@@ -64,7 +77,7 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
 
     let probe_handler = Arc::new(ProbeHandler::new(
         secret_key.public(),
-        cfg.payment.rate_per_mb,
+        reload_state.rate_per_mb(),
         Arc::clone(&node_metrics),
     ));
 
@@ -163,7 +176,27 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
         "node runtime ready"
     );
 
-    let signal = shutdown_signal().await;
+    let signal = loop {
+        tokio::select! {
+            sig = shutdown_signal() => break sig,
+            () = reload_signal() => {
+                match config_path.as_deref() {
+                    Some(path) => {
+                        if let Err(err) =
+                            reload_runtime_config(path, &reload_state).await
+                        {
+                            tracing::warn!(%err, "config reload error");
+                        }
+                    }
+                    None => {
+                        tracing::warn!(
+                            "SIGHUP received but no config file path is in use; ignoring"
+                        );
+                    }
+                }
+            }
+        }
+    };
     tracing::info!(signal = %signal, "shutdown signal received; closing router");
 
     // Signal the HTTP accept loops to stop *before* awaiting
@@ -350,6 +383,32 @@ impl std::fmt::Display for ShutdownSignal {
             Self::Sigterm => f.write_str("SIGTERM"),
         }
     }
+}
+
+/// Wait for SIGHUP. On non-Unix targets returns a future that never
+/// resolves, so the surrounding `select!` collapses to the
+/// shutdown-signal arm — Windows operators don't have SIGHUP and don't
+/// expect hot-reload via signal.
+#[cfg(unix)]
+async fn reload_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut hup = match signal(SignalKind::hangup()) {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::warn!(%err, "failed to install SIGHUP handler; hot-reload disabled");
+            std::future::pending::<()>().await;
+            return;
+        }
+    };
+    // `recv()` returns Some(()) for each signal; we treat any signal as
+    // "reload now" and let the caller drive a fresh reload pass next
+    // iteration of the select loop.
+    let _ = hup.recv().await;
+}
+
+#[cfg(not(unix))]
+async fn reload_signal() {
+    std::future::pending::<()>().await;
 }
 
 /// Wait for either SIGINT or (on Unix) SIGTERM; return which one fired.

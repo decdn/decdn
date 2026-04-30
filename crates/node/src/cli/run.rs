@@ -7,7 +7,7 @@ use clap::Args;
 use super::common::{LogFormat, LogLevel};
 
 /// Run the deCDN node.
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 pub struct RunArgs {
     /// Identity and data storage options.
     #[command(flatten)]
@@ -35,7 +35,7 @@ pub struct RunArgs {
 }
 
 /// Node identity and data storage.
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 #[command(next_help_heading = "Identity")]
 pub struct IdentityArgs {
     /// Directory for node data (keys, cache, state) [default: ~/.decdn].
@@ -48,7 +48,7 @@ pub struct IdentityArgs {
 }
 
 /// Network binding and relay configuration.
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 #[command(next_help_heading = "Network")]
 pub struct NetworkArgs {
     /// QUIC bind port [default: 4433].
@@ -61,7 +61,7 @@ pub struct NetworkArgs {
 }
 
 /// Blockchain / EVM connection settings.
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 #[command(next_help_heading = "Blockchain")]
 pub struct BlockchainArgs {
     /// Arbitrum Sepolia JSON-RPC endpoint URL.
@@ -82,7 +82,7 @@ pub struct BlockchainArgs {
 }
 
 /// Cache storage configuration.
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 #[command(next_help_heading = "Cache")]
 pub struct CacheArgs {
     /// Directory for cached blobs \[default: \<data-dir\>/cache\].
@@ -109,7 +109,7 @@ pub struct CacheArgs {
 }
 
 /// Payment rate configuration.
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 #[command(next_help_heading = "Payment")]
 pub struct PaymentArgs {
     /// Rate per MB in USDC base units (6 decimals; 10 = $0.00001/MB) [default: 10].
@@ -118,7 +118,7 @@ pub struct PaymentArgs {
 }
 
 /// Observability settings (logging, metrics).
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 #[command(next_help_heading = "Observability")]
 pub struct ObservabilityArgs {
     /// Log verbosity level [default: info].
