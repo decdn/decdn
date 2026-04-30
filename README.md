@@ -33,14 +33,6 @@ Decentralized CDN where nodes cache and serve content-addressed blobs over [iroh
 | `cdn/dht/v1` | Content discovery via Kademlia DHT (see [ADR 022](adr/022-content-discovery.md)) |
 | iroh-gossip (built-in) | Node metadata broadcast (`NodeAnnounce`), node discovery |
 
-### Companion Protocol (App Server)
-
-| ALPN | Purpose |
-|------|---------|
-| `cdn/keys/v1` | Epoch key delivery, play requests, offline leases (app server) |
-
-> The app server is not a CDN protocol participant — see [ADR 006](adr/006-e2e-encryption.md).
-
 ### Crate Structure
 
 ```
@@ -60,7 +52,7 @@ Architecture decision records live in [`adr/`](adr/), with [`adr/architecture.md
 - **Content addressing:** BLAKE3 hashes; clients verify on receipt
 - **Dual currency:** USDC for payments, TOKEN for staking/governance
 - **No exposed origins:** Origin backends (S3/R2/B2) are opaque per-node config
-- **E2E encryption:** Envelope encryption with epoch-rotated keys; CDN nodes only see ciphertext
+- **Encryption-agnostic protocol:** the CDN shuttles bytes; ciphertext vs plaintext is the publisher's choice. An optional [encrypted-content publishing](adr/appendix-encrypted-content-publishing.md) appendix documents one deployment pattern (companion app server, epoch-rotated keys).
 - **Watchtowers:** Non-custodial dispute monitors for payment channel safety
 - **Discovery:** `cdn/dht/v1` Kademlia DHT for content discovery from PoC onward; broadcast probe fan-out as bootstrap fallback
 - **Reputation:** Interaction-weighted scoring propagated via gossip

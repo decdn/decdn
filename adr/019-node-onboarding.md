@@ -50,7 +50,7 @@ Before any on-chain or protocol activity:
    clock offset is within 10 seconds of UTC before proceeding. Clock skew ≥ 60 s causes
    gossip messages to be silently rejected by all peers ([ADR 001](001-network.md#clock-synchronization)).
    Nodes SHOULD expose a `decdn_gossip_messages_rejected_total` Prometheus counter with the
-   `reason="clock_skew"` label ([ADR 020](020-observability.md#26-gossip-metrics)).
+   `reason="clock_skew"` label ([Appendix: Observability](appendix-observability.md#26-gossip-metrics)).
 
 3. **Generate iroh identity.** Run the node binary with a `keys generate` (or equivalent)
    subcommand. This produces an **ed25519 key pair** whose public key is the iroh `NodeId`.

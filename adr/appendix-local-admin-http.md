@@ -1,9 +1,6 @@
-# ADR 025: Local Admin HTTP Surface
+# Appendix: Local Admin HTTP Surface
 
-**Date:** 2026-04-17
-**Status:** Accepted
-
----
+> **This is an appendix, not a core protocol ADR.** The local admin HTTP surface is a binary-internal interface for operator runbook automation — other nodes/clients on the network do not interact with it. Alternative implementations could expose admin via gRPC, Unix socket, signal handlers, or a dedicated CLI without breaking interop. This appendix specifies the loopback-bound HTTP API used by the reference implementation.
 
 ## Context
 

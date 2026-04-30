@@ -339,7 +339,7 @@ This ADR is deferred. Before adoption begins, all of the following must hold:
 | 5 | Native sveTOKEN wrapper live | [ADR 028](028-sve-token-wrapper.md) (deferred follow-up to ADR 026) | Convex-capture risk mitigated before futures liquidity scales |
 | 6 | Regulatory review of futures product | External legal | Per-jurisdiction issuance posture defined; geo-fencing infrastructure in place where required |
 | 7 | Enterprise sales channel established | Operational | Designated multisig-supervised team or DAO-elected role; standard contract template ratified by governance |
-| 8 | SLA breach measurement infrastructure | [ADR 007](007-watchtower.md) + [ADR 020](020-observability.md) | Per-contract availability / latency / throughput metrics exported and challengeable via watchtower |
+| 8 | SLA breach measurement infrastructure | [ADR 007](007-watchtower.md) + [Appendix: Observability](appendix-observability.md) | Per-contract availability / latency / throughput metrics exported and challengeable via watchtower |
 
 Prerequisites 1–4 are **hard gates**: any one absent blocks adoption. Prerequisites 5–8
 are **strong recommendations**: adoption without one is possible but materially weakens

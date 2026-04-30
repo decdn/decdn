@@ -153,7 +153,7 @@ async fn verify_binding_signature(
 
 ### 5. Safe Infrastructure on the Canonical Testnet
 
-The following Safe infrastructure is already deployed on the testnet sibling of the canonical L2 (Arbitrum Sepolia, per [ADR 021](021-l2-chain-selection.md)):
+The following Safe infrastructure is already deployed on the testnet sibling of the canonical L2 (Arbitrum Sepolia, per [Appendix: L2 Deployment](appendix-l2-deployment.md)):
 
 | Contract | Status | Notes |
 | --- | --- | --- |

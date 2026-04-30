@@ -1,7 +1,6 @@
-# ADR 021: Production L2 Chain Selection
+# Appendix: Production L2 Deployment Target
 
-**Date:** 2026-04-08
-**Status:** Draft
+> **This is an appendix, not a core protocol ADR.** The protocol depends on Arbitrum-class L2 properties (forced-inclusion delay ≤ 24h per [ADR 007](007-watchtower.md), gas-cost calibration consistent with [ADR 003 § Deposit Economics](003-payments.md#deposit-economics), Balancer V3 Router availability per [ADR 018](018-liquidity-strategy.md)), but the choice of *which* Arbitrum-class L2 is a deployment decision. This appendix records the canonical selection (Arbitrum One) and the comparison against alternatives. A future deployment on Base, OP Mainnet, or another OP-Stack/Nitro chain would require re-validating the property constraints.
 
 ## Context
 

@@ -5,11 +5,11 @@
 
 ## Context
 
-The protocol makes several deliberate privacy tradeoffs favoring decentralization and accountability over confidentiality. These decisions are scattered across [ADR 001](001-network.md), [ADR 002](002-content-addressing.md), [ADR 003](003-payments.md), [ADR 005](005-protocol.md), [ADR 006](006-e2e-encryption.md), [ADR 007](007-watchtower.md), [ADR 008](008-reputation.md), [ADR 012](012-client.md), and [architecture.md](architecture.md). No single document maps the full privacy surface, making it difficult to reason about the cumulative exposure or prioritize mitigations.
+The protocol makes several deliberate privacy tradeoffs favoring decentralization and accountability over confidentiality. These decisions are scattered across [ADR 001](001-network.md), [ADR 002](002-content-addressing.md), [ADR 003](003-payments.md), [ADR 005](005-protocol.md), [Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md), [ADR 007](007-watchtower.md), [ADR 008](008-reputation.md), [ADR 012](012-client.md), and [architecture.md](architecture.md). No single document maps the full privacy surface, making it difficult to reason about the cumulative exposure or prioritize mitigations.
 
 This ADR consolidates that analysis into a single reference. It does not introduce new functionality — it systematizes privacy properties that other ADRs already specify, assigns an explicit disposition to each, and prioritizes mitigations for PoC versus production.
 
-**Scope boundary:** This ADR covers protocol-level privacy — data observable through participation in the CDN protocol, on-chain interactions, and gossip. Application-level privacy (what a content provider's app server does with subscriber data) is out of scope; it is the content provider's responsibility, as noted in [ADR 006](006-e2e-encryption.md).
+**Scope boundary:** This ADR covers protocol-level privacy — data observable through participation in the CDN protocol, on-chain interactions, and gossip. Application-level privacy (what a content provider's app server does with subscriber data) is out of scope; it is the content provider's responsibility, as noted in [Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md).
 
 ## Decision
 
@@ -33,7 +33,7 @@ Each row identifies a discrete data exposure. The **ID** column is used for back
 | P-01 | `popular_hashes` in `NodeAnnounce` | Top-20 most-requested content hashes per node, broadcast to all peers | T1 | [001](001-network.md) §NodeAnnounce |
 | P-02 | On-chain payment channels | Channel IDs, client/provider Ethereum addresses, deposit amounts, settlement events | T1 | [003](003-payments.md) |
 | P-03 | On-chain staking registry | `nodeId`, `ethAddress`, `multiaddrs`, `regionHint`, registration timestamps | T1 | [001](001-network.md), [architecture.md](architecture.md) |
-| P-04 | ALPN protocol identification | QUIC TLS ClientHello reveals which ALPN is negotiated (`cdn/probe/v1`, `cdn/client/v1`, `cdn/watchtower/v1`, `cdn/keys/v1`) | T1 | [005](005-protocol.md) |
+| P-04 | ALPN protocol identification | QUIC TLS ClientHello reveals which ALPN is negotiated (`cdn/probe/v1`, `cdn/client/v1`, `cdn/watchtower/v1`) | T1 | [005](005-protocol.md) |
 | P-05 | `ReputationReport` gossip | Provider, reporter, metrics (delivery speed, correctness, uptime), timestamps — signed and broadcast on `cdn/reputation/v1` | T1 | [008](008-reputation.md) §6 |
 | P-06 | `RateChange` gossip | Node pricing updates broadcast on `cdn/global/v1` | T1 | [005](005-protocol.md), [architecture.md](architecture.md) |
 | P-07 | Node earnings inference | Channel closures and settlement amounts are on-chain; node revenue is computable | T1 | [003](003-payments.md) |
@@ -48,8 +48,8 @@ Each row identifies a discrete data exposure. The **ID** column is used for back
 | P-16 | Watchtower voucher patterns | Voucher updates expose cumulative bytes delivered, update frequency, and session duration | T3 | [007](007-watchtower.md) |
 | P-17 | Relay connection metadata | iroh relays see source/destination IP pairs and connection timing for relayed connections | T3 | [architecture.md](architecture.md) §Trust Assumptions |
 | P-18 | Unencrypted iroh key (PoC) | Client's Ed25519 secret key stored at `~/.decdn/iroh_key` with `0600` permissions, no encryption | T4 | [012](012-client.md) §iroh Identity Key |
-| P-19 | Offline lease blast radius | Up to 500 `K_blob` values extractable from a compromised device's sealed lease | T4 | [006](006-e2e-encryption.md) §Offline Leases |
-| P-20 | No forward secrecy for epoch keys | Compromising `server_secret` retroactively exposes all past and future epoch keys until rotation | T4 | [006](006-e2e-encryption.md) §Consequences |
+| P-19 | Offline lease blast radius | Up to 500 `K_blob` values extractable from a compromised device's sealed lease | T4 | [Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md) §Offline Leases |
+| P-20 | No forward secrecy for epoch keys | Compromising `server_secret` retroactively exposes all past and future epoch keys until rotation | T4 | [Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md) §Consequences |
 | P-21 | Permanent client NodeId | Ed25519 identity is persistent across sessions; all content requests are correlatable under one identity | T2 | [012](012-client.md) §iroh Identity Key |
 | P-22 | On-chain settlement volume leakage | Voucher nonce and cumulative amount at `settleChannel` reveal per-channel delivery volume; nonce spacing reveals session granularity | T1 | [003](003-payments.md) §settleChannel |
 | P-23 | `slash_sig` as content inventory proof | A node's `slash_sig` on `ProbeResponse` with `has_blob: true` constitutes non-repudiable cryptographic proof that the node held specific content at a specific time; accumulated signatures build a verifiable content inventory | T2 | [014](014-on-chain-verification.md) §slash_sig |
@@ -100,9 +100,9 @@ Endpoint compromise yields secrets specific to that endpoint.
 
 **Client key material (P-18).** The PoC stores the iroh secret key unencrypted at `~/.decdn/iroh_key` ([ADR 012](012-client.md)). An attacker with file access gains the client's network identity. Production uses the platform keychain.
 
-**Offline lease extraction (P-19).** A compromised device yields up to 500 `K_blob` values from the sealed offline lease ([ADR 006](006-e2e-encryption.md)). Mitigations are operational: device attestation, per-account device limits (3-5), audio watermarking, and behavioral detection. This is the same tradeoff every major streaming service makes.
+**Offline lease extraction (P-19).** A compromised device yields up to 500 `K_blob` values from the sealed offline lease ([Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md)). Mitigations are operational: device attestation, per-account device limits (3-5), audio watermarking, and behavioral detection. This is the same tradeoff every major streaming service makes.
 
-**Epoch key derivation (P-20).** Compromising `server_secret` exposes all past and future epoch keys until rotation ([ADR 006](006-e2e-encryption.md)). Production mitigations (HSM-backed derivation, periodic rotation, audit log) are already specified in ADR 006. This is the most significant cryptographic limitation but is a server-side concern, not a protocol privacy issue per se.
+**Epoch key derivation (P-20).** Compromising `server_secret` exposes all past and future epoch keys until rotation ([Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md)). Production mitigations (HSM-backed derivation, periodic rotation, audit log) are already specified in the encrypted-content-publishing appendix. This is the most significant cryptographic limitation but is a server-side concern, not a protocol privacy issue per se.
 
 ### 4. Disposition Summary
 
@@ -126,8 +126,8 @@ Endpoint compromise yields secrets specific to that endpoint.
 | P-16 | Watchtower voucher patterns | Accept | Counterparty already has vouchers; low incremental exposure | — |
 | P-17 | Relay connection metadata | Accept | Standard relay behavior; traffic is E2E encrypted | — |
 | P-18 | Unencrypted iroh key | Mitigate | Already planned: platform keychain in production | Pre-mainnet |
-| P-19 | Offline lease blast radius | Accept | Industry-standard tradeoff; operational mitigations in [ADR 006](006-e2e-encryption.md) | — |
-| P-20 | No epoch key forward secrecy | Mitigate | HSM-backed derivation and rotation already specified in [ADR 006](006-e2e-encryption.md) | Pre-mainnet |
+| P-19 | Offline lease blast radius | Accept | Industry-standard tradeoff; operational mitigations in [Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md) | — |
+| P-20 | No epoch key forward secrecy | Mitigate | HSM-backed derivation and rotation already specified in [Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md) | Pre-mainnet |
 | P-21 | Permanent client NodeId | Mitigate | Breaks cross-session linkability at low cost | Pre-mainnet |
 | P-22 | Settlement volume leakage | Accept | Inherent to on-chain settlement; settlement amount must be public for dispute resolution | — |
 | P-23 | `slash_sig` content inventory | Accept | Required for on-chain accountability; removing `slash_sig` eliminates slashability | — |
@@ -170,7 +170,7 @@ Endpoint compromise yields secrets specific to that endpoint.
 
 #### 5.5 Epoch Key Forward Secrecy (P-20)
 
-**Current state:** [ADR 006](006-e2e-encryption.md) already specifies three mitigations: HSM-backed derivation, periodic `server_secret` rotation, and an append-only key rotation log. No additional design needed — these mitigations are already specified and should be completed pre-mainnet as part of mainnet readiness.
+**Current state:** [Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md) already specifies three mitigations: HSM-backed derivation, periodic `server_secret` rotation, and an append-only key rotation log. No additional design needed — these mitigations are already specified and should be completed pre-mainnet as part of mainnet readiness.
 
 #### 5.6 Dummy Probes (Not Recommended)
 
@@ -196,7 +196,7 @@ Endpoint compromise yields secrets specific to that endpoint.
 | 2 | `popular_hashes` cap reduction to 5 (§5.2) | Pre-mainnet | Low | Medium — reduces explicit demand signal by 75% |
 | 3 | Client iroh key encryption (§5.4) | Pre-mainnet | Low | Medium — protects identity from T4 on client devices |
 | 4 | Operational RPC guidance (§5.3) | Pre-mainnet | Minimal | Medium — documents trust boundary as privacy concern |
-| 5 | Epoch key forward secrecy (§5.5) | Pre-mainnet | Medium | High — but already specified in ADR 006; implementation priority |
+| 5 | Epoch key forward secrecy (§5.5) | Pre-mainnet | Medium | High — but already specified in the encrypted-content-publishing appendix; implementation priority |
 | 6 | Dummy probes (§5.6) | Post-mainnet | Medium | Low — probes are public by design |
 | 7 | Payment channel mixing (§5.7) | Post-mainnet | High | Medium — requires regulatory analysis first |
 
@@ -223,9 +223,9 @@ Endpoint compromise yields secrets specific to that endpoint.
 - [ADR 002 — Content Addressing](002-content-addressing.md): BLAKE3 as global content identifier
 - [ADR 003 — Payment Model](003-payments.md): payment channel on-chain visibility, probe fishing rate limits
 - [ADR 005 — Wire Protocol](005-protocol.md): probe publicity statement, ALPN definitions, `RateChange` gossip
-- [ADR 006 — End-to-End Encryption and Key Distribution](006-e2e-encryption.md): epoch keys, forward secrecy, offline lease blast radius, app server privacy boundary
+- [Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md): epoch keys, forward secrecy, offline lease blast radius, app server privacy boundary
 - [ADR 007 — Watchtower Design for Channel Disputes](007-watchtower.md): voucher sharing privacy impact
 - [ADR 008 — Reputation System](008-reputation.md): `ReputationReport` gossip, reporter credibility weighting
 - [ADR 012 — Client Architecture, Bootstrap, and Trust Model](012-client.md): client NodeId, key storage, rotation
 - [ADR 014 — On-Chain Verification for Slashing Evidence](014-on-chain-verification.md): on-chain verification data surface
-- [Architecture Overview](architecture.md): trust assumptions (RPC provider, relay, app server), system diagram
+- [Architecture Overview](architecture.md): trust assumptions (NTP, RPC provider, relay), system diagram

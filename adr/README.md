@@ -23,8 +23,10 @@ For first-time readers, follow this thematic order rather than the numeric one. 
 4. **Tokenomics & incentives** — gauge-boost, delivery receipts, liquidity strategy, deferred follow-ups.
 5. **Verification & enforcement** — on-chain slashing evidence, watchtower, reputation, content takedown.
 6. **Governance & contracts** — Governor + Timelock model, contract interaction map.
-7. **Operations** — node onboarding, observability, PoC/production seams, local admin surface.
-8. **Supporting infrastructure** — L2 chain selection, schema evolution, privacy analysis, end-to-end encryption (companion app server).
+7. **Operations** — node onboarding.
+8. **Supporting infrastructure** — schema evolution, privacy analysis.
+
+Plus a set of **appendices** documenting reference patterns built on top of the protocol (encrypted content publishing, observability, L2 deployment selection, PoC/production seam architecture, local admin HTTP surface).
 
 The numeric index in [`architecture.md` § Architectural Decisions](architecture.md#architectural-decisions) stays as the canonical per-ADR reference.
 
@@ -78,6 +80,15 @@ Terms used across multiple ADRs without inline definition.
 | **`BuybackBurner`** | The contract that swaps the 5% burn-bucket USDC into TOKEN via Balancer V3 80/20 weighted pool and burns the proceeds — see [ADR 003 § BuybackBurner](003-payments.md#buybackburner) and [ADR 018](018-liquidity-strategy.md). |
 | **Slash signature** | An EIP-712 secp256k1 signature (`slash_sig`) on protocol messages, used for on-chain slash evidence via `ecrecover`. Distinct from the Ed25519 wire signature — see [ADR 014](014-on-chain-verification.md). |
 | **Challenge bond** | The 100 TOKEN amount a challenger must post when submitting slash evidence. Returned on successful slash, forfeited on successful node counter (50% burned, 50% to node) — see [ADR 014 § Bond Handling](014-on-chain-verification.md#bond-handling). |
+
+## ADRs vs appendices
+
+This directory contains two kinds of documents:
+
+- **Core protocol ADRs** (`NNN-name.md`) — invariants every conforming node, client, or contract must implement the same way for the network to function. These are the canonical specification.
+- **Appendices** (`appendix-name.md`) — patterns, reference implementations, and operational guidance built **on top of** the protocol. Alternative implementations are acceptable. Examples: encrypted content publishing (companion app server, `cdn/keys/v1`), the recommended observability metric registry, the Arbitrum One deployment selection, the Rust implementation pattern for PoC/production seams, and the local admin HTTP surface.
+
+Appendices are listed in [`architecture.md` § Appendices — Reference Patterns](architecture.md#appendices-reference-patterns). They are deliberately **not** numbered as ADRs because they document optional patterns rather than core protocol decisions.
 
 ## Decision-record context
 

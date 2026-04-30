@@ -1,13 +1,10 @@
-# ADR 020: Observability and Metrics Standard
+# Appendix: Observability and Metrics
 
-**Date:** 2026-04-08
-**Status:** Draft
+> **This is an appendix, not a core protocol ADR.** Metric implementation is consumer-side — operators choose their own monitoring stack, dashboards, and alerting. This appendix specifies a recommended naming convention, the canonical metric registry, and slash-risk alert thresholds, so that monitoring tooling and operator runbooks can converge on a common vocabulary. Where a specific metric is load-bearing for a protocol invariant (e.g., the lock-rate read consumed by [ADR 029](029-adaptive-fee-router.md)), the invariant lives in the consuming ADR; this document specifies the metric exposure.
 
 ## Context
 
-Metrics are referenced throughout the existing ADRs (001, 004, 005, 011, 015, and the
-tokenomics surface introduced by [ADR 026](026-gauge-boost-tokenomics.md)) and listed
-informally in `architecture.md § Observability`, but no single document defines:
+Metrics are referenced throughout the protocol ADRs and listed informally in `architecture.md § Observability`, but no single document defines:
 
 - A canonical metric naming convention
 - The complete registry of metric names, types, and labels

@@ -34,7 +34,6 @@ graph TD
 
     subgraph "Provider Infrastructure (external)"
         S3[("Hidden Origin Backend<br/>S3 / R2 / B2")]
-        A["App Server<br/>(ADR 006)"]
     end
 
     N1 <-->|"cdn/client/v1<br/>paid per-MB"| N2
@@ -49,11 +48,6 @@ graph TD
 
     N1 <-.->|"iroh-gossip<br/>NodeAnnounce, RateChange"| N2
     N2 <-.->|"iroh-gossip<br/>NodeAnnounce, RateChange"| N3
-
-    S3 -.->|"K_blob at ingest"| A
-    A -.->|"cdn/keys/v1<br/>epoch keys + envelopes"| C1
-    A -.->|"cdn/keys/v1<br/>epoch keys + envelopes"| C2
-    A -.->|"cdn/keys/v1<br/>epoch keys + envelopes"| C3
 ```
 
 **Note:** PoC payments use USDC only; production supports multiple governance-approved ERC-20 tokens (see [ADR 010](010-multi-token.md)).
@@ -111,18 +105,23 @@ For readers approaching the protocol top-to-bottom, follow this thematic order r
 ### Chapter 7 — Operations
 
 1. [ADR 019 — Node Onboarding and Bootstrapping Flow](019-node-onboarding.md)
-2. [ADR 020 — Observability and Metrics Standard](020-observability.md)
-3. [ADR 023 — PoC/Production Seam Architecture](023-poc-production-seams.md)
-4. [ADR 025 — Local Admin HTTP Surface](025-local-admin-http.md)
 
 ### Chapter 8 — Supporting infrastructure
 
-1. [ADR 021 — Production L2 Chain Selection](021-l2-chain-selection.md)
-2. [ADR 013 — Schema Evolution](013-schema-evolution.md)
-3. [ADR 017 — Privacy Analysis](017-privacy.md)
-4. [ADR 006 — End-to-End Encryption and Key Distribution](006-e2e-encryption.md)
+1. [ADR 013 — Schema Evolution](013-schema-evolution.md)
+2. [ADR 017 — Privacy Analysis](017-privacy.md)
 
 The numeric per-ADR index below stays as the canonical reference.
+
+### Appendices — Reference Patterns
+
+Appendices document patterns, reference implementations, and operational guidance built **on top of** the protocol. They are not part of the core spec — alternative implementations are acceptable. See [`README.md` § Decision-record context](README.md#decision-record-context) for the ADR-vs-appendix distinction.
+
+1. [Encrypted Content Publishing](appendix-encrypted-content-publishing.md) — pattern for building an encrypted-content publishing system on top of deCDN; companion app server and `cdn/keys/v1` ALPN
+2. [Observability and Metrics](appendix-observability.md) — recommended metric naming, registry, and slash-risk alert thresholds
+3. [Production L2 Deployment Target](appendix-l2-deployment.md) — Arbitrum One selection (deployment decision; protocol depends on Arbitrum-class properties calibrated in core ADRs)
+4. [PoC/Production Seam Architecture (Rust)](appendix-poc-production-seams.md) — leaf-crate principle, wiring-layer mode selection, mechanical-deletion graduation path
+5. [Local Admin HTTP Surface](appendix-local-admin-http.md) — loopback-bound admin API for operator runbook automation
 
 ---
 
@@ -171,25 +170,9 @@ Clients pay nodes per MB. On a cache miss, nodes pay origin-backed nodes per MB 
 | `cdn/watchtower/v1` | Channel-dispute monitoring ([ADR 007](007-watchtower.md)) |
 | iroh-gossip (built-in) | Node metadata broadcast (`NodeAnnounce`), rate change announcements (`RateChange`), watchtower discovery (`WatchtowerAnnounce`, production), node discovery |
 
-**Companion protocol (app server — not a CDN protocol participant):**
-
-| Protocol | Purpose |
-| --- | --- |
-| `cdn/keys/v1` | Epoch key delivery, play requests, offline leases ([ADR 006](006-e2e-encryption.md)) |
-
-The app server shares the iroh QUIC transport but does not participate in gossip, probing, or staking. See [External Components](#external-components).
-
 Gossip topics: `cdn/global/v1` (all nodes — `NodeAnnounce`, `RateChange`, `WatchtowerAnnounce` (production)), `cdn/region/{cc}/v1` (regional — `NodeAnnounce`), `cdn/reputation/v1` (reputation reports — [ADR 008](008-reputation.md)).
 
 `redirect` in `StreamResponse` always points to a NodeId, never an external URL. The origin backend is never revealed.
-
----
-
-### [ADR 006 — End-to-End Encryption and Key Distribution](006-e2e-encryption.md)
-
-**Envelope encryption with epoch-rotated key distribution.**
-
-Each blob is encrypted once at ingest with a random symmetric key (XChaCha20-Poly1305). The ciphertext is content-addressed and cached normally — one hash, one copy for all clients. An **app server** — an external component operated by the content provider — gates access: on each play request it wraps the blob key with a rotating epoch key and sends it over an authenticated `cdn/keys/v1` QUIC stream. Closing the epoch key stream revokes access within one epoch (5 minutes). CDN nodes only ever see ciphertext. See [External Components](#external-components) for the app server's role and deployment model.
 
 ---
 
@@ -237,7 +220,7 @@ A `ContentBlacklist` contract supports global (network-wide) and regional (juris
 
 Clients are lightweight QUIC endpoints that subscribe to gossip (but do not publish), maintain local peer tables and reputation scores, and pay for content via off-chain vouchers. The bootstrap procedure covers iroh key generation, Ethereum key import, registry query with exponential-backoff retry and `peers.json` fallback, gossip subscription, and periodic registry refresh. Key management distinguishes PoC (file-based) from production (platform keychain, hardware wallet with derived hot key for voucher signing). Ephemeral NodeId-to-Ethereum bindings are per-connection with `nonce=0` sentinel. Eclipse attack mitigation is resolved: registry-only for PoC; multi-source bootstrap (Option B — on-chain registry + DNS seed list) for production, with minimum peer diversity (Option C) as supplementary client-side policy. An explicit three-tier trust boundary classifies what the client verifies, trusts, and does not trust.
 
-Also specifies three client-side features: **multi-node parallel download** (`--max-channels N`; one channel per node; economical above ~10 GiB at N=4; incompatible with streaming output; PoC capped at 1); **crash recovery and resume** (atomic `state.json` under `~/.decdn/downloads/<hash>/`; resume from last BLAKE3-verified byte; voucher nonce persisted on every send; 64 MiB flush cadence); and **file manifests** (256 MiB chunks; postcard-encoded manifest blob whose BLAKE3 hash is the canonical file ID; client fetches manifest first then chunks; per-chunk BLAKE3 verification; blob retention for re-serving; per-chunk encryption via ADR 006 epoch keys).
+Also specifies three client-side features: **multi-node parallel download** (`--max-channels N`; one channel per node; economical above ~10 GiB at N=4; incompatible with streaming output; PoC capped at 1); **crash recovery and resume** (atomic `state.json` under `~/.decdn/downloads/<hash>/`; resume from last BLAKE3-verified byte; voucher nonce persisted on every send; 64 MiB flush cadence); and **file manifests** (256 MiB chunks; postcard-encoded manifest blob whose BLAKE3 hash is the canonical file ID; client fetches manifest first then chunks; per-chunk BLAKE3 verification; blob retention for re-serving).
 
 ---
 
@@ -261,7 +244,7 @@ All four slashable offenses (corrupted delivery, phantom announcements, rate man
 
 **0-RTT early data for latency-sensitive protocols.**
 
-QUIC 0-RTT eliminates the TLS handshake round trip on repeat connections. `cdn/probe/v1` is the sole beneficiary — after the first probe cycle, subsequent cache-miss fan-outs send `ProbeRequest` alongside the ClientHello with zero handshake delay. All other protocols reject 0-RTT: payment-bearing (`cdn/client/v1`) and state-changing (`cdn/watchtower/v1`) to prevent replay-based accounting confusion, and `cdn/keys/v1` because authentication sequencing ([ADR 006](006-e2e-encryption.md)) requires `EpochKeyAuth` before any request stream. Session tickets are cached per `(remote_node_id, ALPN)` in an in-memory LRU (max 1,000 entries).
+QUIC 0-RTT eliminates the TLS handshake round trip on repeat connections. `cdn/probe/v1` is the sole beneficiary — after the first probe cycle, subsequent cache-miss fan-outs send `ProbeRequest` alongside the ClientHello with zero handshake delay. All other protocols reject 0-RTT: payment-bearing (`cdn/client/v1`) and state-changing (`cdn/watchtower/v1`) to prevent replay-based accounting confusion. Session tickets are cached per `(remote_node_id, ALPN)` in an in-memory LRU (max 1,000 entries).
 
 ---
 
@@ -277,7 +260,7 @@ Consolidates the interaction model across all on-chain contracts (StakingRegistr
 
 **Unified privacy surface inventory, adversary model, and mitigation roadmap.**
 
-Consolidates privacy properties scattered across ADRs 001, 003, 005, 006, 007, 008, 012, and 014 into a single reference. Defines a four-tier adversary model (passive observer, active participant, infrastructure operator, compromised endpoint) and catalogs 23 privacy surfaces with explicit dispositions (accept or mitigate), including on-chain settlement volume leakage (P-22) and `slash_sig` as non-repudiable content inventory proof (P-23). Most surfaces are accepted as inherent to the accountability-first design (probes are public, on-chain channels enable disputes, gossip enables discovery). Five pre-mainnet mitigations are prioritized: client NodeId rotation, `popular_hashes` cardinality reduction from 20 to 5, client key encryption via platform keychain, operational RPC provider guidance, and epoch key forward secrecy (already specified in ADR 006). Dummy probes and payment channel mixing are deferred post-mainnet.
+Consolidates privacy properties scattered across ADRs 001, 003, 005, 007, 008, 012, 014 and the encrypted-content-publishing appendix into a single reference. Defines a four-tier adversary model (passive observer, active participant, infrastructure operator, compromised endpoint) and catalogs 23 privacy surfaces with explicit dispositions (accept or mitigate), including on-chain settlement volume leakage (P-22) and `slash_sig` as non-repudiable content inventory proof (P-23). Most surfaces are accepted as inherent to the accountability-first design (probes are public, on-chain channels enable disputes, gossip enables discovery). Five pre-mainnet mitigations are prioritized: client NodeId rotation, `popular_hashes` cardinality reduction from 20 to 5, client key encryption via platform keychain, operational RPC provider guidance, and epoch key forward secrecy (already specified in the encrypted-content-publishing appendix). Dummy probes and payment channel mixing are deferred post-mainnet.
 
 ---
 
@@ -293,41 +276,17 @@ Reverses the implicit Uniswap V3 venue choice in prior ADRs. Balancer 80/20 weig
 
 Formalizes the complete ordered flow that existing ADRs left implicit: Phase 1 (pre-flight: clock sync, iroh key generation, Ethereum key funding, region selection); Phase 2 (on-chain setup: TOKEN approval, staking, atomic `registerNode` with ed25519 + EIP-712 signatures); Phase 3 (node startup: rate bounds fetch, blacklist sync, peer table bootstrap from registry); Phase 4 (gossip subscription: join `cdn/global/v1` and regional topic, publish first `NodeAnnounce`); Phase 5 (accepting paid delivery: seven acceptance criteria for operational readiness). Also covers NAT/multiaddr handling (iroh hole-punching, when to call `updateMultiaddrs`), re-onboarding after deregistration or auto-ejection (nonce increment, preserved `firstRegisteredAt`), and PoC vs. production differences. Resolves the bootstrapping gap identified in Issue #190.
 
-### [ADR 020 — Observability and Metrics Standard](020-observability.md)
-
-**Canonical Prometheus metric registry, naming convention, alert thresholds, and `/health` endpoint contract.**
-
-Consolidates metrics scattered across ADRs 001, 005, 011, 015 and `architecture.md § Observability` into a single reference. Defines a `decdn_` prefix + `_total`/unit-suffix naming convention; splits 35 metrics across eight subsystems into **mandatory** (M) and **recommended** (R) tiers; provides recommended alert thresholds for the seven slash-safety metrics; specifies the `/health` JSON endpoint with `ready`/`degraded`/`not_ready` semantics; and supplies a cross-reference table mapping all informal prior-ADR metric names to their canonical replacements. Resolves the observability gap identified in Issue #190.
-
-### [ADR 021 — Production L2 Chain Selection](021-l2-chain-selection.md)
-
-**Arbitrum One (chain ID 42161) is the canonical production chain for all deCDN contracts.**
-
-Arbitrum One is selected over Base and OP Mainnet on the basis of: PoC continuity (Arbitrum Sepolia → Arbitrum One is a same-family migration), highest DeFi TVL and aggregator routing density for Balancer V3 buybacks, cross-ADR consistency (gas estimates, forced-inclusion delay, Balancer V3 Router address all calibrated for Arbitrum One), and battle-tested OpenZeppelin Governor + TimelockController deployments. Native USDC (Circle CCTP, `0xaf88d065e77c8cC2239327C5EDb3A432268e5831`) is used — not bridged USDC.e. Cross-chain payment channels are excluded from v1. Re-evaluation triggers are defined for gas cost spikes, fraud-proof vulnerabilities, and sequencer censorship events.
-
 ### [ADR 022 — Content Discovery at Scale](022-content-discovery.md)
 
 **`cdn/dht/v1` Kademlia subset for content discovery — primary mechanism from PoC onward. `cdn/probe/v1` broadcast fan-out retained as bootstrap/emergency fallback. Two popularity signals: `popular_hashes` gossip (advisory) and DHT FIND_VALUE query frequency (non-suppressible oracle). No discovery fees.**
 
 Probe fan-out is O(N) per cache miss and does not scale beyond ~100 nodes. Gossip content announcements were rejected (unbounded traffic proportional to cache churn). Hash-prefix range hints were rejected (economically irrational — nodes cache popular content regardless of hash prefix). The production path is a lightweight Kademlia subset (`cdn/dht/v1` ALPN): nodes self-publish `(hash → NodeId)` STORE records when caching a blob, attracting paying clients; FIND_VALUE lookups are O(log N). No discovery fees — all revenue stays on delivery. Popularity is surfaced by two complementary signals: `popular_hashes` gossip (advisory, self-reported; suppression is self-limiting via `LoadHint`/selection score) and DHT FIND_VALUE query frequency (non-suppressible — routing traffic reaches nearby-keyspace nodes regardless of gossip). The probe step (`cdn/probe/v1`) is preserved as the final availability confirmation before any delivery commitment.
 
-### [ADR 023 — PoC/Production Seam Architecture](023-poc-production-seams.md)
-
-**Trait-based seams for PoC/production differences; single `poc` Cargo feature on the `node` crate only; `NetworkConstants` as the single source of truth for all numeric differences.**
-
-All PoC/production behavioral differences are expressed as Rust traits with separate concrete implementations (`file.rs` / `keychain.rs`, `simple.rs` / `weighted.rs`, etc.). The `node` crate wires the correct implementations at compile time via a single `poc` Cargo feature declared only on that crate. No `#[cfg(feature = "poc")]` appears in leaf crates. Seven seams are defined: `KeyStore`, `ReputationEngine`, `PaymentChannelClient`, `GovernanceClient`, `WatchtowerClient`, `CorruptionChallenger`, and `NetworkConstants`. Production is the default compile target — the `poc` feature must be explicitly opted in. Solidity contract differences (admin key vs Governor, `adminReclaimNodeId` presence) are managed via separate Foundry deploy scripts rather than Rust feature flags.
-
 ### [ADR 024 — Account Abstraction and Safe Smart Wallet Support](024-account-abstraction.md)
 
 **Universal `SignatureChecker` across all contracts; Safe as the recommended wallet for nodes and clients; session keys via ERC-7579 `smartsessions` deferred to production.**
 
 Every signature verification site (voucher close/dispute, node registration, slash challenges) uses OpenZeppelin's `SignatureChecker.isValidSignatureNow` rather than `ECDSA.recover` — transparently supporting both EOAs (`ecrecover`, ~5.6K gas) and smart accounts (ERC-1271 `isValidSignature`, ~12–15K gas for Safe). EIP-712 domains, typed data hashes, and voucher formats are unchanged. PoC configuration: node operators and high-value clients run a 1-of-1 Safe with a software-held owner key on the signing host — same trust posture as today's `eth_keystore`, but routed through Safe for ERC-1271 compatibility on day one. `SlashJudge`'s verification pattern shifts from "recover-then-lookup" to "verify-against-provided-address" because ERC-1271 has no recovery. Production migrates the hot signing path (per-MB vouchers, per-probe/stream `slash_sig`) to Safe-7579 + [`erc7579/smartsessions`](https://github.com/erc7579/smartsessions) — a standardized session-key module with ERC-1271 validation, time windows, selector/domain-scoped action policies, per-session spending caps, and first-class revocation. EOAs remain fully functional for clients who prefer them; `SignatureChecker` makes wallet type transparent at the protocol level.
-
-### [ADR 025 — Local Admin HTTP Surface](025-local-admin-http.md)
-
-**Loopback-only JSON admin HTTP on `observability.admin_port` (default `9191`); versioned `/v1/...` routes; operator-local surface, distinct from `/metrics` and from any node-to-node ALPN.**
-
-Running nodes expose a loopback HTTP admin surface so operator CLIs (`decdn node peers`, and later `decdn node drain` etc.) can read live state and trigger local control actions without going through either the Prometheus `/metrics` endpoint (read-only, text-only, aggregate) or an iroh ALPN (node-to-node, not local-operator). Transport mirrors the existing metrics server (hyper `service_fn`, loopback `TcpListener`, oneshot shutdown, semaphore-bounded concurrency). JSON responses on `/v1/...` paths leave room for schema evolution within the major version. No auth is required in the PoC — the loopback binding is the trust boundary; a later ADR can layer a shared-secret header if multi-tenant hosts ever enter scope.
 
 ---
 
@@ -359,7 +318,7 @@ Canonical economic model: genesis allocation across six buckets (four vesting, t
 
 **Two automated feedback hooks (lock-rate and price-floor) within [ADR 026 §11](026-gauge-boost-tokenomics.md) safety bounds. Deferred — adopt after post-launch governance dynamics observable.**
 
-`AdaptiveFeeRouterController` evaluates at epoch rollover and shifts ±2pp between FeeRouter buckets based on a lock-rate read (`TOKEN.balanceOf(address(VotingEscrow)) / TOKEN.totalSupply()` — underlying TOKEN locked, not ve-supply, per ADR 029 §1 / ADR 020) and a Balancer V3 30-day TWAP price-floor read. Both hooks are clamped to [ADR 026 §11](026-gauge-boost-tokenomics.md) bounds, observable via events, and disable-able by governance. Deferred reflects a "merge the spec, do not deploy" stance — if post-launch governance rebalancing is fast enough, this ADR may close as Rejected.
+`AdaptiveFeeRouterController` evaluates at epoch rollover and shifts ±2pp between FeeRouter buckets based on a lock-rate read (`TOKEN.balanceOf(address(VotingEscrow)) / TOKEN.totalSupply()` — underlying TOKEN locked, not ve-supply, per ADR 029 §1 / observability appendix) and a Balancer V3 30-day TWAP price-floor read. Both hooks are clamped to [ADR 026 §11](026-gauge-boost-tokenomics.md) bounds, observable via events, and disable-able by governance. Deferred reflects a "merge the spec, do not deploy" stance — if post-launch governance rebalancing is fast enough, this ADR may close as Rejected.
 
 ---
 
@@ -409,8 +368,6 @@ The system relies on several infrastructure-level assumptions beyond the cryptog
 - **NTP availability and correctness.** Gossip validation depends on loose clock agreement: ±60 s for `NodeAnnounce` freshness ([ADR 001](001-network.md)), and for `ReputationReport`, a maximum age of 1 h with up to +5 min allowed future skew ([ADR 008](008-reputation.md)). A compromised or unavailable NTP source could cause mesh partitions or cause nodes to reject valid gossip. Mitigation: nodes detect relative drift via peer timestamp comparison; the tolerance windows are generous enough to absorb typical NTP jitter.
 
 - **L2 RPC provider honesty.** Nodes and clients trust their RPC provider to return correct event logs for registry queries, blacklist polling, and rate-bounds lookups. A malicious RPC provider could hide `ChannelCloseInitiated` events from watchtowers, defeating dispute protection, or return a fabricated node list to eclipse a client. Mitigation: PoC accepts single-RPC trust; production plans multi-source bootstrap ([ADR 012](012-client.md) Option B) and multiple independent RPC providers.
-
-- **App server as trusted infrastructure.** The app server holds all blob encryption keys (`K_blob`) for encrypted content ([ADR 006](006-e2e-encryption.md)). Compromise of the app server key store exposes all content. Mitigation: epoch key rotation limits the blast radius for epoch-level access control, but does not provide forward secrecy for stored blob keys — this is an accepted trade-off documented in ADR 006.
 
 - **Encrypted transport integrity for voucher confidentiality.** Vouchers are bearer instruments — a leaked voucher is valid regardless of how it was obtained. The system assumes vouchers only traverse encrypted authenticated channels between the relevant parties: client↔node, node↔watchtower ([ADR 007](007-watchtower.md)), and node↔node cache-miss pulls. Mitigation: QUIC/TLS provides in-transit encryption on all these links; vouchers are never logged or persisted in plaintext. Endpoint compromise or debug output leaking vouchers remains an operational risk.
 
@@ -525,7 +482,7 @@ decdn/
 │   └── contracts/                # Solidity contracts + Foundry
 ├── tests/                        # Integration tests
 └── adr/                          # Architecture decision records
-# The app server (ADR 006) is an external component, not part of this workspace.
+# The app server (encrypted-content-publishing appendix) is an external component, not part of this workspace.
 # Content providers build it using their own stack. A reference implementation
 # may be provided as a separate repository.
 ```
@@ -579,25 +536,9 @@ graph TD
 
 ## External Components
 
-Components referenced by ADRs that are operated by content providers, not part of the CDN protocol or workspace.
+Components referenced by appendices that are operated by content providers, not part of the CDN protocol or workspace.
 
-### App Server ([ADR 006](006-e2e-encryption.md))
-
-The app server is operated by the content provider (e.g., a streaming platform's backend). It shares the iroh QUIC transport layer with the CDN but is **not** a CDN protocol participant — it does not participate in gossip, probing, or paid delivery.
-
-**Responsibilities:**
-
-- Stores blob encryption keys (`K_blob`) received from the origin at ingest time
-- Authenticates client sessions and validates subscription status
-- Delivers epoch keys over an authenticated `cdn/keys/v1` QUIC stream; signals `server_secret` rotation via `epoch_key_revoked` events on the same stream
-- Issues envelopes containing epoch-key-wrapped `K_blob` on play requests
-- Builds and returns offline playback leases (client seals locally to device keystore)
-
-**Why iroh QUIC:** Key delivery is tightly coupled to the client's iroh identity — the QUIC handshake provides mutual authentication (client NodeId ↔ app server NodeId) and TLS 1.3 confidentiality in a single step, eliminating the need for `crypto_box_seal` and X25519 key management. This gives clients a single transport stack for both CDN delivery and key delivery, and makes iroh key rotation seamless (reconnect with new NodeId, re-authenticate with session token). The app server still handles subscription billing, OAuth/session auth, and key management — content providers integrate an `iroh::Endpoint` accepting `cdn/keys/v1` connections alongside their existing auth/billing infrastructure.
-
-**Scaling model:** One iroh QUIC connection per active subscriber. Standard QUIC server scaling applies (connection migration, load balancer affinity). The app server scales with subscriber count, not CDN node count.
-
-**PoC scope:** A minimal reference implementation may be provided in a separate repository. The CDN crates do not depend on it.
+- **App Server** — companion to the [encrypted-content publishing pattern](appendix-encrypted-content-publishing.md). Operated by the content provider; shares the iroh QUIC transport layer with the CDN but does not participate in gossip, probing, or paid delivery. The CDN crates do not depend on it.
 
 ---
 
@@ -605,8 +546,8 @@ The app server is operated by the content provider (e.g., a streaming platform's
 
 The canonical metric registry, naming convention (`decdn_` prefix, `_total` suffix for
 counters), mandatory vs. recommended tiers, alert thresholds, and `/health` endpoint
-contract are defined in [ADR 020](020-observability.md). The summary below is for
-orientation only — ADR 020 is authoritative.
+contract are defined in [Appendix: Observability](appendix-observability.md). The summary below is for
+orientation only — the observability appendix is authoritative.
 
 - **Structured logging** via `tracing` crate (JSON in production).
 - **Metrics** via `prometheus` crate, exposed at `:{port}/metrics` (default port 9090).
@@ -665,9 +606,9 @@ Not in PoC scope. iroh's KV-CRDT protocol (`iroh-docs`) provides a replicated ke
 
 ## What Is Not Decided Yet
 
-- ~~Production L2 choice~~: decided — [ADR 021](021-l2-chain-selection.md) selects Arbitrum One (chain ID 42161). Sequencer censorship mitigation uses Arbitrum's 24h forced-inclusion path; see [ADR 007](007-watchtower.md#l2-sequencer-censorship)
+- ~~Production L2 choice~~: decided — [Appendix: L2 Deployment](appendix-l2-deployment.md) selects Arbitrum One (chain ID 42161). Sequencer censorship mitigation uses Arbitrum's 24h forced-inclusion path; see [ADR 007](007-watchtower.md#l2-sequencer-censorship)
 - ~~Content discovery scaling strategy (DHT vs gossip hints)~~: decided — [ADR 022](022-content-discovery.md) specifies `cdn/dht/v1` as the primary discovery mechanism from day one, with broadcast probe fan-out as a bootstrap/emergency fallback; gossip content hints rejected
-- ~~PoC→production feature-flag / toggle architecture~~: decided — [ADR 023](023-poc-production-seams.md) defines trait-based seams with a single `poc` Cargo feature on the `node` crate; `NetworkConstants` as the single source of truth for all numeric differences
+- ~~PoC→production feature-flag / toggle architecture~~: decided — [Appendix: PoC/Production Seams](appendix-poc-production-seams.md) defines trait-based seams with a single `poc` Cargo feature on the `node` crate; `NetworkConstants` as the single source of truth for all numeric differences
 - Parallel streaming from multiple nodes for a single blob (protocol supports it, not prioritised)
 - ~~Maximum blob size~~: decided — nodes may configure a `max_blob_size` limit (PoC recommended default: 10 GB). Requests exceeding a node's limit are rejected with `StreamError::BlobTooLarge` ([ADR 005](005-protocol.md#error-handling-and-retry-semantics)). This is a per-node operational policy, not an on-chain governance parameter, because different nodes have different storage and bandwidth budgets
 - ~~Schema evolution strategy for postcard wire messages~~: decided — [ADR 013](013-schema-evolution.md) defines varint-length framing, protocol enums, a three-tier evolution model, and a gossip envelope
