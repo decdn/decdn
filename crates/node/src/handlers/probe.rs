@@ -1,6 +1,7 @@
 //! `cdn/probe/v1` handler — unauthenticated latency + rate probe.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use decdn_protocol::{
@@ -31,10 +32,17 @@ const APP_ERR_MALFORMED_MESSAGE: u32 = 0x03;
 
 /// Serves `cdn/probe/v1`: reads a framed [`ProbeMessage::Request`], writes a
 /// framed [`ProbeMessage::Response`].
+///
+/// `rate_per_mb` is held behind a shared `AtomicU64` so SIGHUP-driven
+/// config reload (#236) can swap the value without rebuilding the handler
+/// or touching the iroh `Router`. Reads use `Ordering::Relaxed`: the rate
+/// is a single-word counter with no ordering relationship to other state,
+/// and any in-flight probe simply observes whichever generation of the
+/// rate the load happens to see.
 #[derive(Debug)]
 pub struct ProbeHandler {
     node_id: PublicKey,
-    rate_per_mb: u64,
+    rate_per_mb: Arc<AtomicU64>,
     metrics: Arc<Metrics>,
 }
 
@@ -42,7 +50,7 @@ impl ProbeHandler {
     pub const ALPN: &'static [u8] = ALPN_PROBE;
 
     #[allow(clippy::missing_const_for_fn)] // Arc::new isn't const.
-    pub fn new(node_id: PublicKey, rate_per_mb: u64, metrics: Arc<Metrics>) -> Self {
+    pub fn new(node_id: PublicKey, rate_per_mb: Arc<AtomicU64>, metrics: Arc<Metrics>) -> Self {
         Self {
             node_id,
             rate_per_mb,
@@ -81,7 +89,7 @@ impl ProbeHandler {
             nonce: req.nonce,
             measured_at_unix_ms,
             node_id: *self.node_id.as_bytes(),
-            rate_per_mb: self.rate_per_mb,
+            rate_per_mb: self.rate_per_mb.load(Ordering::Relaxed),
         };
 
         let payload = encode_message(&ProbeMessage::Response(resp))

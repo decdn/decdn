@@ -29,7 +29,7 @@ pub async fn run(
         }
     };
 
-    init_tracing(filter, &resolved)?;
+    let log_level_setter = init_tracing(filter, &resolved)?;
 
     tracing::info!("deCDN node starting");
     tracing::debug!(
@@ -43,15 +43,33 @@ pub async fn run(
         "resolved configuration"
     );
 
-    runtime::run(resolved).await
+    let reload_state = std::sync::Arc::new(runtime::RuntimeReloadState::new(
+        run_args.payment.clone(),
+        run_args.observability.clone(),
+        &resolved,
+        log_level_setter,
+    ));
+
+    runtime::run(
+        resolved,
+        config_path.map(std::path::Path::to_path_buf),
+        reload_state,
+    )
+    .await
 }
 
 /// Initialize the tracing subscriber with fmt layer and optional OTLP layer.
+///
+/// Returns a [`runtime::LogLevelSetter`] closure that swaps the live
+/// `EnvFilter` to one matching a new `LogLevel` — used by the SIGHUP
+/// hot-reload path (#236). The closure captures a `reload::Handle` to the
+/// `EnvFilter` layer; calls to `modify` must respect any errors from the
+/// handle (e.g. the registry was dropped) by surfacing them.
 #[allow(clippy::unnecessary_wraps)] // Returns Result only when otlp feature is enabled.
 fn init_tracing(
     filter: tracing_subscriber::EnvFilter,
     resolved: &config::ResolvedConfig,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<runtime::LogLevelSetter> {
     use tracing_subscriber::prelude::*;
 
     let fmt_layer = match resolved.observability.log_format {
@@ -59,7 +77,13 @@ fn init_tracing(
         cli::LogFormat::Pretty => tracing_subscriber::fmt::layer().boxed(),
     };
 
-    let registry = tracing_subscriber::registry().with(filter).with(fmt_layer);
+    // Wrap the EnvFilter in a `reload::Layer` so the SIGHUP reload path
+    // can swap it without rebuilding the rest of the subscriber stack.
+    let (reload_filter, reload_handle) = tracing_subscriber::reload::Layer::new(filter);
+
+    let registry = tracing_subscriber::registry()
+        .with(reload_filter)
+        .with(fmt_layer);
 
     #[cfg(feature = "otlp")]
     {
@@ -80,7 +104,20 @@ fn init_tracing(
         registry.init();
     }
 
-    Ok(())
+    let setter: runtime::LogLevelSetter = Box::new(move |lvl| {
+        // Build a fresh EnvFilter from the level's lowercase name. This
+        // matches the startup default-filter construction above; we don't
+        // attempt to honour `RUST_LOG` here because reload is driven by
+        // the file, not the launching shell.
+        let new_filter = tracing_subscriber::EnvFilter::try_new(lvl.to_string())
+            .map_err(|e| anyhow::anyhow!("invalid log_level {lvl}: {e}"))?;
+        reload_handle
+            .modify(|f| *f = new_filter)
+            .map_err(|e| anyhow::anyhow!("failed to swap tracing filter: {e}"))?;
+        Ok(())
+    });
+
+    Ok(setter)
 }
 
 /// Build an OTLP span exporter and tracer provider.

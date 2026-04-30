@@ -109,7 +109,7 @@ pub struct CacheArgs {
 }
 
 /// Payment rate configuration.
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 #[command(next_help_heading = "Payment")]
 pub struct PaymentArgs {
     /// Rate per MB in USDC base units (6 decimals; 10 = $0.00001/MB) [default: 10].
@@ -118,7 +118,7 @@ pub struct PaymentArgs {
 }
 
 /// Observability settings (logging, metrics).
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 #[command(next_help_heading = "Observability")]
 pub struct ObservabilityArgs {
     /// Log verbosity level [default: info].

@@ -454,7 +454,7 @@ fn resolve_cache(
 /// make this node trivially win every client selection while earning no
 /// payable revenue — an obvious misconfiguration that should fail startup, not
 /// silently degrade the network.
-fn resolve_payment(
+pub(crate) fn resolve_payment(
     cli: &crate::cli::run::PaymentArgs,
     file: Option<&types::PaymentConfig>,
 ) -> anyhow::Result<ResolvedPayment> {
@@ -477,7 +477,7 @@ fn resolve_payment(
 /// config. Cross-port collision checks (bind/metrics/admin) live in
 /// [`validate_port_layout`], which sees all three sections at once — see
 /// there for the full ruleset.
-fn resolve_observability(
+pub(crate) fn resolve_observability(
     cli: &crate::cli::run::ObservabilityArgs,
     file: Option<&types::ObservabilityConfig>,
 ) -> anyhow::Result<ResolvedObservability> {
@@ -605,7 +605,7 @@ fn hex_val(b: u8) -> anyhow::Result<u8> {
 /// - If `explicit_path` is `Some`, reads that file (errors if missing).
 /// - If `explicit_path` is `None`, tries the default path; returns
 ///   `FileConfig::default()` if the file does not exist.
-fn load_file_config(explicit_path: Option<&Path>) -> anyhow::Result<FileConfig> {
+pub(crate) fn load_file_config(explicit_path: Option<&Path>) -> anyhow::Result<FileConfig> {
     let path = match explicit_path {
         Some(p) => p.to_path_buf(),
         None => match common::default_config_path() {
@@ -2198,6 +2198,7 @@ mod tests {
             eth_keystore: None,
             payment_channel_address: None,
             staking_registry_address: None,
+            rpc_watchdog_interval_sec: None,
         };
         let resolved = resolve_blockchain(&cli, Some(&file), dir.path())?;
         // url::Url normalisation appends a trailing path on bare-host URLs;
@@ -2220,6 +2221,7 @@ mod tests {
             eth_keystore: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             staking_registry_address: Some(GOOD_ADDR.to_string()),
+            rpc_watchdog_interval_sec: None,
         };
         let resolved = resolve_blockchain(&cli, Some(&file), dir.path())?;
         assert!(

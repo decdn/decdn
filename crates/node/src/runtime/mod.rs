@@ -1,7 +1,12 @@
 //! Node runtime: owns the iroh endpoint, metrics server, and protocol router.
 
+pub mod reload;
+
+pub use reload::{LogLevelSetter, RuntimeReloadState};
+
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddrV4};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,8 +37,26 @@ const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(15);
 
 /// Build the endpoint, register handlers on a `Router`, spawn the metrics
 /// server and gossip tasks, and run until a shutdown signal is received.
+///
+/// SIGHUP triggers a hot-reload of mutable config fields via
+/// [`RuntimeReloadState`] (see issue #236). Other signals
+/// (SIGINT/SIGTERM) trigger graceful shutdown.
+///
+/// The signal streams (SIGHUP, SIGTERM) are registered **once** before
+/// the select loop and reused on every iteration. Re-creating
+/// `tokio::signal::unix::Signal` each iteration would race with signal
+/// delivery: a SIGHUP that arrives while `reload_runtime_config(..)` is
+/// running would have nowhere to land if the future holding the
+/// `Signal` had already been dropped, and would be silently lost. The
+/// persistent stream queues the signal until the next `recv()` call
+/// (kernel-managed, with coalescing) so concurrent or rapidly-repeated
+/// signals are observed deterministically.
 #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
-pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
+pub async fn run(
+    cfg: ResolvedConfig,
+    config_path: Option<PathBuf>,
+    reload_state: Arc<RuntimeReloadState>,
+) -> anyhow::Result<()> {
     // Preflight: verify RPC endpoint is reachable before committing to
     // port binding. A 5-second timeout keeps startup responsive on flaky
     // networks while still catching typos and dead endpoints early.
@@ -64,7 +87,7 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
 
     let probe_handler = Arc::new(ProbeHandler::new(
         secret_key.public(),
-        cfg.payment.rate_per_mb,
+        reload_state.rate_per_mb(),
         Arc::clone(&node_metrics),
     ));
 
@@ -198,7 +221,32 @@ pub async fn run(cfg: ResolvedConfig) -> anyhow::Result<()> {
         "node runtime ready"
     );
 
-    let signal = shutdown_signal().await;
+    // Install signal streams once, before entering the select loop.
+    // tokio docs are explicit that `Signal::recv` is the supported way
+    // to await repeated signals, and re-creating the stream per signal
+    // is not — see `tokio::signal::unix::signal` for the reasoning.
+    let mut shutdown_streams = ShutdownStreams::install();
+    let mut hup_stream = HupStream::install();
+
+    let signal = loop {
+        tokio::select! {
+            sig = shutdown_streams.recv() => break sig,
+            () = hup_stream.recv() => {
+                match config_path.as_deref() {
+                    Some(path) => {
+                        if let Err(err) = reload_state.reload(path).await {
+                            tracing::warn!(%err, "config reload error");
+                        }
+                    }
+                    None => {
+                        tracing::warn!(
+                            "SIGHUP received but no config file path is in use; ignoring"
+                        );
+                    }
+                }
+            }
+        }
+    };
     tracing::info!(signal = %signal, "shutdown signal received; closing router");
 
     // Signal the HTTP accept loops to stop *before* awaiting
@@ -382,11 +430,10 @@ async fn build_cache(cfg: &ResolvedConfig) -> anyhow::Result<CacheEngine> {
         .context("failed to open cache engine")
 }
 
-/// Which OS signal triggered shutdown. Returned by [`shutdown_signal`] so
+/// Which OS signal triggered shutdown. Returned by [`ShutdownStreams::recv`] so
 /// the "shutdown signal received" log line records the cause (SIGINT vs.
-/// SIGTERM) — operators need that distinction for post-incident analysis,
-/// and a future drain path can branch on it (immediate on SIGINT, graceful
-/// on SIGTERM). `Sigterm` is unreachable on non-unix targets.
+/// SIGTERM) — operators grep that field for post-incident analysis.
+/// `Sigterm` is unreachable on non-unix targets.
 #[derive(Debug, Clone, Copy)]
 enum ShutdownSignal {
     Sigint,
@@ -404,28 +451,152 @@ impl std::fmt::Display for ShutdownSignal {
     }
 }
 
-/// Wait for either SIGINT or (on Unix) SIGTERM; return which one fired.
-async fn shutdown_signal() -> ShutdownSignal {
+/// Persistent SIGHUP stream, installed once at startup. The
+/// `Signal` instance lives on `self` for the lifetime of the runtime
+/// so successive SIGHUPs delivered while a reload is in progress are
+/// queued by tokio (kernel-coalesced) rather than dropped. Re-creating
+/// the `Signal` per iteration of the select loop would race signal
+/// delivery — that's the bug this struct exists to prevent.
+///
+/// On non-Unix targets `recv` returns a `pending` future since SIGHUP
+/// doesn't exist there.
+struct HupStream {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut term = match signal(SignalKind::terminate()) {
-            Ok(s) => s,
-            Err(err) => {
-                tracing::warn!(%err, "failed to install SIGTERM handler; falling back to SIGINT only");
-                let _ = tokio::signal::ctrl_c().await;
-                return ShutdownSignal::Sigint;
-            }
-        };
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => ShutdownSignal::Sigint,
-            _ = term.recv() => ShutdownSignal::Sigterm,
+    hup: Option<tokio::signal::unix::Signal>,
+}
+
+impl HupStream {
+    fn install() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let hup = match signal(SignalKind::hangup()) {
+                Ok(s) => Some(s),
+                Err(err) => {
+                    tracing::warn!(%err, "failed to install SIGHUP handler; hot-reload disabled");
+                    None
+                }
+            };
+            Self { hup }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {}
         }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-        ShutdownSignal::Sigint
+
+    /// Wait for the next SIGHUP on the persistent stream. If
+    /// installation failed (`None`) or the platform isn't Unix, this
+    /// future never resolves.
+    ///
+    /// `Signal::recv` resolves to `Option<()>`. `None` indicates the
+    /// underlying stream has been closed (the driver dropped, signal
+    /// handler torn down) — once that happens the future would resolve
+    /// *immediately, forever*, and the runtime select-loop would
+    /// hot-spin. Park on `pending` in that branch instead so hot-reload
+    /// is silently disabled rather than turning into a spin-loop.
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        {
+            // Three cases:
+            //   1. install succeeded + stream yielded a real signal →
+            //      return so the caller runs the reload arm.
+            //   2. install succeeded but the stream is now closed →
+            //      `recv()` returns `None`, which would otherwise
+            //      resolve *immediately, forever* and hot-spin the
+            //      runtime's select. Take ownership, log once, and park
+            //      on `pending` for the rest of the process.
+            //   3. install failed at startup (`self.hup` is `None`) →
+            //      already logged a warning at install time; just park
+            //      on `pending`.
+            if let Some(stream) = self.hup.as_mut() {
+                if stream.recv().await.is_some() {
+                    return;
+                }
+                self.hup = None;
+                tracing::warn!("SIGHUP stream closed; hot-reload disabled for this process");
+            }
+            std::future::pending::<()>().await;
+        }
+        #[cfg(not(unix))]
+        {
+            std::future::pending::<()>().await
+        }
+    }
+}
+
+/// Persistent SIGINT/SIGTERM streams. Installed once at startup so
+/// rapid-fire shutdown signals (e.g. operator pressing Ctrl-C twice)
+/// are coalesced by the kernel rather than potentially lost between
+/// re-registrations of `Signal`.
+struct ShutdownStreams {
+    /// `tokio::signal::ctrl_c` is itself a one-shot future that
+    /// re-registers internally — but `tokio::signal::unix::signal`
+    /// (used for SIGTERM) is not. We park `ctrl_c()` inside `recv`
+    /// directly and rely on tokio's own implementation for SIGINT.
+    #[cfg(unix)]
+    term: Option<tokio::signal::unix::Signal>,
+}
+
+impl ShutdownStreams {
+    fn install() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let term = match signal(SignalKind::terminate()) {
+                Ok(s) => Some(s),
+                Err(err) => {
+                    tracing::warn!(
+                        %err,
+                        "failed to install SIGTERM handler; falling back to SIGINT only",
+                    );
+                    None
+                }
+            };
+            Self { term }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {}
+        }
+    }
+
+    /// Wait for the next SIGINT or (on Unix) SIGTERM and report which
+    /// one fired. The persistent SIGTERM stream lives on `self`, so
+    /// successive calls observe successive signals — there's no
+    /// race window between iterations of the runtime's select loop.
+    ///
+    /// `Signal::recv` resolves to `Option<()>`. A `None` from the
+    /// SIGTERM arm would otherwise resolve immediately forever and
+    /// short-circuit the select to a spurious shutdown; demote that
+    /// branch to a `pending` future so we wait for a real SIGINT
+    /// instead. (`tokio::signal::ctrl_c` re-registers internally and
+    /// is safe to await directly.)
+    async fn recv(&mut self) -> ShutdownSignal {
+        #[cfg(unix)]
+        {
+            if let Some(term) = self.term.as_mut() {
+                let race = tokio::select! {
+                    _ = tokio::signal::ctrl_c() => Some(ShutdownSignal::Sigint),
+                    res = term.recv() => res.map(|()| ShutdownSignal::Sigterm),
+                };
+                if let Some(sig) = race {
+                    return sig;
+                }
+                // SIGTERM arm closed (`None`). Drop the stream so we
+                // don't keep racing a future that resolves immediately
+                // forever, then wait for a real SIGINT.
+                tracing::warn!("SIGTERM stream closed; falling back to SIGINT only");
+                self.term = None;
+            }
+            let _ = tokio::signal::ctrl_c().await;
+            ShutdownSignal::Sigint
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            ShutdownSignal::Sigint
+        }
     }
 }
 
@@ -639,5 +810,36 @@ mod tests {
         let _ = tx.send(());
         let join_res = tokio::time::timeout(Duration::from_secs(2), handle).await;
         assert!(join_res.is_ok(), "watchdog should exit on shutdown signal");
+    }
+
+    /// Smoke test for the post-fixup `ShutdownStreams::recv` contract:
+    /// a real SIGTERM raised from inside the test process must resolve
+    /// the future to `ShutdownSignal::Sigterm`. nextest runs each test
+    /// in its own process so the signal cannot leak across tests.
+    /// `nix::sys::signal::raise` keeps the workspace `unsafe_code =
+    /// "forbid"` lint clean.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_streams_recv_resolves_on_sigterm() {
+        use std::time::Duration;
+
+        use nix::sys::signal::{Signal, raise};
+
+        let mut streams = ShutdownStreams::install();
+        // Spawn the raise on a separate task so `recv()` is awaiting
+        // on the SIGTERM stream by the time the signal arrives. The
+        // small sleep gives `install()` a chance to register tokio's
+        // handler — without it the kernel could deliver SIGTERM with
+        // the default disposition (terminate the process) before the
+        // tokio handler is in place. 20ms is far longer than the
+        // install path needs.
+        tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            raise(Signal::SIGTERM).expect("raise SIGTERM");
+        });
+        let signal = tokio::time::timeout(Duration::from_millis(500), streams.recv())
+            .await
+            .expect("ShutdownStreams::recv did not resolve within 500ms of SIGTERM");
+        assert!(matches!(signal, ShutdownSignal::Sigterm));
     }
 }
