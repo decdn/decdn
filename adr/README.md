@@ -26,7 +26,7 @@ For first-time readers, follow this thematic order rather than the numeric one. 
 7. **Operations** — node onboarding.
 8. **Supporting infrastructure** — schema evolution, privacy analysis.
 
-Plus a set of **appendices** documenting reference patterns and operator runbooks built on top of the protocol (encrypted content publishing, observability, L2 deployment selection, PoC/production seam architecture, local admin HTTP surface, operator key rotation).
+Plus a set of **appendices** documenting reference patterns and operator runbooks built on top of the protocol (encrypted content publishing, observability, L2 deployment selection, PoC/production seam architecture, local admin HTTP surface, operator key rotation, operator protocol-upgrade runbook).
 
 The numeric index in [`architecture.md` § Architectural Decisions](architecture.md#architectural-decisions) stays as the canonical per-ADR reference.
 
@@ -85,7 +85,7 @@ Terms used across multiple ADRs without inline definition.
 This directory contains two kinds of documents:
 
 - **Core protocol ADRs** (`NNN-name.md`) — invariants every conforming node, client, or contract must implement the same way for the network to function. These are the canonical specification.
-- **Appendices** (`appendix-name.md`) — patterns, reference implementations, and operational guidance built **on top of** the protocol. Alternative implementations are acceptable. Examples: encrypted content publishing (companion app server, `cdn/keys/v1`), the recommended observability metric registry, the Arbitrum One deployment selection, the Rust implementation pattern for PoC/production seams, the local admin HTTP surface, and the operator key-rotation runbook.
+- **Appendices** (`appendix-name.md`) — patterns, reference implementations, and operational guidance built **on top of** the protocol. Alternative implementations are acceptable. Examples: encrypted content publishing (companion app server, `cdn/keys/v1`), the recommended observability metric registry, the Arbitrum One deployment selection, the Rust implementation pattern for PoC/production seams, the local admin HTTP surface, the operator key-rotation runbook, and the operator protocol-upgrade runbook.
 
 Appendices are listed in [`architecture.md` § Appendices — Reference Patterns](architecture.md#appendices-reference-patterns). They are deliberately **not** numbered as ADRs because they document optional patterns rather than core protocol decisions.
 
