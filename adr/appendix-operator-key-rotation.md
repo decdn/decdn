@@ -8,9 +8,9 @@ A node operator routinely holds three keys:
 
 | Key | Curve / scheme | Purpose | Where it lives |
 |-----|----------------|---------|----------------|
-| **iroh node-key** | Ed25519 | Wire identity (`NodeId`); signs `ProbeResponse`, `StreamResponse`, `NodeAnnounce`, `slash_sig` payloads at wire speed | iroh keystore on the signing host |
-| **Ethereum signing key** | secp256k1 | On-chain identity for staking, channel ops, voucher receipt; signs the EIP-712 `BindNodeId` and `bindingSignature` (ADR 003 §NodeId-to-Ethereum Binding) | EVM keystore (EOA) **or** Safe owner key (PoC 1-of-1) **or** session key delegated by a Safe (production §3 of [ADR 024](024-account-abstraction.md)) |
-| **Voucher session key** *(production only)* | secp256k1 | Hot-signing of slash-evidence digests (`slash_sig`) when the operator runs a Safe; authorised via `erc7579/smartsessions` ([ADR 024 §3](024-account-abstraction.md)) | Signing host, scoped by the session-key policy |
+| **iroh node-key** | Ed25519 | Wire identity (`NodeId`); signs the `signature` field on `ProbeResponse`, `StreamResponse`, and `NodeAnnounce` for connection-level authentication ([ADR 005](005-protocol.md)) | iroh keystore on the signing host |
+| **Ethereum signing key** | secp256k1 | On-chain identity for staking, channel ops, voucher receipt. Signs the EIP-712 `BindNodeId` and `bindingSignature` ([ADR 003 §NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)) **and** the `slash_sig` field on every `ProbeResponse` / `StreamResponse` for on-chain accountability ([ADR 014](014-on-chain-verification.md)). The hot-signing burden of the latter motivates the production session-key path below. | EVM keystore (EOA) **or** Safe owner key (PoC 1-of-1) **or** session key delegated by a Safe (production §3 of [ADR 024](024-account-abstraction.md)) |
+| **Slash-sig session key** *(production only)* | secp256k1 | Per-message hot-signing of `slash_sig` digests on `ProbeResponse` / `StreamResponse` at wire speed when the operator runs a 2-of-3 Safe; authorised via `erc7579/smartsessions` ([ADR 024](024-account-abstraction.md) §3). Note: client-side voucher session keys (also production-only, also via smartsessions) are a separate concern owned by clients, not operators. | Signing host, scoped by the session-key policy |
 
 Rotation reasons:
 
@@ -29,18 +29,17 @@ The rotation path differs by which key and by account type. This runbook is a se
             ┌───────────────────┼───────────────────┐
             ▼                   ▼                   ▼
    ┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐
-   │ iroh node-key    │ │ Ethereum signing │ │ Voucher session  │
+   │ iroh node-key    │ │ Ethereum signing │ │ slash-sig session│
    │ (Ed25519)        │ │ key (secp256k1)  │ │ key (production) │
    └─────────┬────────┘ └────────┬─────────┘ └────────┬─────────┘
              │                   │                    │
              ▼                   ▼                    ▼
-        §1 procedure        §2 procedure          §3 procedure
-                            ┌─────┴─────┐
-                            │ Account?  │
-                            └─────┬─────┘
-                       ┌──────────┴──────────┐
-                       ▼                     ▼
-                  EOA: §2.1             Safe: §2.2
+        §1 procedure       Account / goal?         §3 procedure
+                                 │
+              ┌──────────────────┼──────────────────┐
+              ▼                  ▼                  ▼
+        EOA staying EOA   EOA → Safe (one-time)   Already on Safe
+            §2.1                §2.2                  §2.3
 ```
 
 If both the iroh and Ethereum keys must rotate, rotate the **iroh key first** (cheap, atomic on-chain, preserves Ethereum identity) and the Ethereum key second (heavyweight). See §4.
@@ -86,7 +85,7 @@ The standalone `bindNodeId` function is intended for rebinding only — it delet
    - `decdn_node_uptime_seconds` advancing
    - Outgoing `NodeAnnounce` carries the new NodeId (visible in peers' gossip logs)
 8. **Un-drain** — accept inbound connections again.
-9. **Archive** the old iroh keystore offline. Do **not** delete it for at least the unbonding window (default 7 days, [ADR 009](009-governance.md)) — slashing evidence accepted in that window may reference signatures by the old key, and the operator may need the old keystore to produce counter-evidence.
+9. **Archive** the old iroh keystore offline. Retain it for at least `MAX_EVIDENCE_AGE_US` (default 5 days, governable [1d, 30d] per [ADR 014](014-on-chain-verification.md) §3 Evidence Verification Per Offense Type) — that is the staleness ceiling beyond which slash evidence containing signatures from the old key cannot be submitted on-chain. The retention is for forensic inspection (which signatures the old key produced); `bindNodeId` does not initiate unbonding, and slash counter-evidence on this protocol is not produced by the old iroh key (corruption challenges are countered with fresh BLAKE3 reads; phantom and rate offenses are immediate per ADR 014). Holding longer is harmless; deleting earlier means losing the ability to forensically reconstruct what the old key signed.
 
 ### Failure modes
 
@@ -121,8 +120,8 @@ Procedure:
 4. **Wait** the full unbonding period (default 7d, minimum 3d governable). Stake remains slashable in this window — do not relax monitoring.
 5. **`StakingRegistry.withdraw()`** to the old address.
 6. **Generate** the new EOA. Fund it with TOKEN (transfer from old, or from treasury) and a small ETH float for gas.
-7. **Settle any remaining channel-state liabilities** using the old keystore. Specifically: if any voucher you signed under the old address has not been redeemed, the counterparty has 1 epoch (default 7d, [ADR 026](026-gauge-boost-tokenomics.md)) to call `closeChannel` against you. Keep the old keystore reachable for this window.
-8. **Re-stake from the new address**: `TOKEN.approve` → `StakingRegistry.stake` → atomic `registerNode(nodeId, multiaddrs, regionHint, bindingSignature, ed25519Signature)` (see [ADR 019](019-node-onboarding.md) §Phase 2 — On-chain Setup). The `nodeId` may be the same one rotated in §1 or a fresh one; either way the ed25519 ownership proof is required.
+7. **Keep the old EVM keystore reachable while any outbound channels remain open.** Vouchers are *client*-signed ([ADR 003](003-payments.md)), so as a node-operator-as-client (cache-miss pulls upstream) you have signed vouchers paying upstream nodes under the old Ethereum address. Until those channels are settled, the upstream counterparty may submit your latest signed voucher via `closeChannel` and trigger the 48h dispute window. Channels live up to `maxChannelDuration` (default 90 days per [ADR 010](010-multi-token.md)); the practical window for keeping the old keystore reachable is "until your last open outbound channel settles or expires." As a node-operator-as-provider you do not sign vouchers, so inbound channels carry no key-side liability after deregistration.
+8. **Re-stake from the new address with a fresh NodeId.** `TOKEN.approve` → `StakingRegistry.stake` → atomic `registerNode(newNodeId, multiaddrs, regionHint, bindingSignature, ed25519Signature)` (see [ADR 019](019-node-onboarding.md) §Phase 2 — On-chain Setup). **Reusing the original NodeId is not possible** without a separate `bindNodeId` step on the *old* address before deregister: `deregisterNode` only sets `active = false` and increments `registrationNonce`; it does **not** clear `nodeIdToAddress[originalNodeId]` ([ADR 001](001-network.md) §340–342, [ADR 003](003-payments.md#nodeid-to-ethereum-binding)), so a fresh address calling `registerNode(originalNodeId, …)` reverts with `"NodeId bound to another address"`. If reusing the original NodeId is important (e.g., for historical reputation continuity), chain §1 → §2.1 instead: §1's `bindNodeId` to a temporary new NodeId clears the original mapping, then §2.1 re-registers the original NodeId from the new address.
 9. **Restart** the node with config pointing at the new EVM keystore. Confirm `/health` reports `ready` and `decdn_channel_deposit_usdc` is zero (no channels yet).
 10. **Re-open outbound channels** as needed for cache-miss pulls — there is no carry-over.
 
@@ -165,9 +164,8 @@ This is the same as [§2.3 — production](#23-safe-owner--session-key-rotation-
 
 Rotate **iroh first**, then Ethereum. Specifically:
 
-1. Run §1 to completion.
-2. Wait for the unbonding window to elapse from the §1 rebinding before starting §2 — this avoids overlapping the iroh-rebinding-replay window with the Ethereum-deregistration window.
-3. Run §2.1, §2.2, or §2.3 depending on the account type.
+1. Run §1 to completion. `bindNodeId` finality is one block confirmation plus the `NodeIdBound` event — there is no unbonding period (only `deregisterNode` triggers unbonding per [ADR 001](001-network.md#contract-interface-node-registry)).
+2. Run §2.1, §2.2, or §2.3 depending on the account-type goal. Replay protection between the two steps is handled by the per-address `bindingNonce`, which incremented when §1 ran ([ADR 003 §NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)) — no additional cooling-off window is required.
 
 The reverse order works but is wasteful: §2 takes the node offline for the unbonding window anyway, so any §1 work performed after §2 is a no-op against an already-deregistered node.
 
@@ -184,7 +182,7 @@ Exception: **emergency compromise of the Ethereum key.** If the Ethereum key is 
 
 ## §6. What this runbook does not cover
 
-- **Client-side iroh-key rotation.** See [ADR 012 §Key rotation](012-client.md) (line 124). Open client→node channels survive client iroh-key rotation because they are keyed by the client's Ethereum address, mirroring the operator-side carry-over in §1.
+- **Client-side iroh-key rotation.** See [ADR 012](012-client.md), the inline "Key rotation" paragraph: open client→node channels survive client iroh-key rotation because they are keyed by the client's Ethereum address, mirroring the operator-side carry-over in §1.
 - **Deferred design decisions:**
   - Hardware-wallet-based hot signing for production EOA operators ([ADR 012 §HW-wallet pattern](012-client.md)). The runbook assumes software keystores; HSM/HW-wallet flows are a deployment concern.
   - Delegated voucher-signer support for clients without smart-account migration (tracked as the unresolved item in [#190](https://github.com/decdn/decdn/issues/190)).
