@@ -211,8 +211,7 @@ in gossip or probe fan-outs).
 
 Set the node's `rate_per_mb` within the bounds fetched in Step 3.1. This rate is
 advertised in `ProbeResponse` messages and must satisfy
-`deliveryFloor ≤ rate_per_mb ≤ deliveryCeiling`. Rate changes are announced via
-`RateChange` gossip messages ([ADR 005](005-protocol.md)).
+`deliveryFloor ≤ rate_per_mb ≤ deliveryCeiling`. Probes are the canonical rate-discovery channel; rate changes propagate through fresh probe responses ([ADR 005](005-protocol.md)).
 
 ---
 

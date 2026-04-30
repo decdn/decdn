@@ -123,7 +123,6 @@ enum GossipPayload {
     NodeAnnounce(NodeAnnounce),             // 0
     ReputationReport(ReputationReport),     // 1
     WatchtowerAnnounce(WatchtowerAnnounce), // 2 (planned — ADR 007)
-    RateChange(RateChange),                 // 3 (ADR 005)
 }
 ```
 
