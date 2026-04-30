@@ -72,7 +72,7 @@ The release ships a binary that registers **both** ALPN handlers (`v1` and `v2`)
 
 For each node in the fleet, in any order:
 
-1. **Drain** new inbound connections (`admin_v1_drain`, see [`appendix-local-admin-http.md`](appendix-local-admin-http.md)). Confirm:
+1. **Drain** new inbound connections. The `admin_v1_drain` admin RPC method is the intended invocation surface and is listed in [`appendix-local-admin-http.md`](appendix-local-admin-http.md) but is not yet implemented (tracked as [#244](https://github.com/decdn/decdn/issues/244)); until it ships, drain via your external load balancer (stop forwarding new connections to the node) or block the node's QUIC port at the firewall. Either way, confirm:
    - `decdn_streams_active{direction="inbound"} == 0`
    - `decdn_probe_hold_slots_used == 0` (avoids the phantom-slash window per [ADR 005 §Probe-Triggered Eviction Hold](005-protocol.md#probe-triggered-eviction-hold))
 2. **Stop** the node.
@@ -97,9 +97,9 @@ By T+4 weeks the entire fleet should be running the dual-version binary. Clients
 | **T+4 to T+8 weeks** | Monitor the `decdn_streams_completed_total` mix between `v1` and `v2`. When `v1` traffic drops below ~5% of total, you can plan removal. |
 | **T+12 weeks** | The release schedule **may** ship a `v1`-removal binary. Operators upgrade per §3.2 again. After this rollout, peers still running `v1`-only become unreachable. |
 
-**You MAY remove `v1` support earlier than T+12 weeks**, but only if your traffic share of `v1` is negligible. Removing it before deprecation makes you unreachable to legacy clients prematurely.
+**You MUST keep `v1` support until T+12 weeks.** [ADR 013 §Multi-version support](013-schema-evolution.md#alpn-version-negotiation) makes this a protocol-level guarantee: "a node MUST support at least the current and previous major version simultaneously during a transition period." T+12 weeks is the earliest point at which the deprecation timeline permits old-version removal. Operators who unilaterally drop `v1` earlier break the guarantee — legacy clients on the old ALPN see `no_application_protocol` TLS alerts and fall through to the next probe candidate, which is observably indistinguishable from a node outage.
 
-**You MAY NOT remove `v1` support before T+4 weeks.** The protocol guarantees both versions are supported during the dual-version window; unilaterally dropping early breaks the guarantee.
+**At T+12 weeks**, the deprecation timeline says old-version support MAY be removed. Whether to actually remove it depends on the operator-visible traffic mix; it is permitted, not required.
 
 ## §4. Coordination touchpoints
 
@@ -131,7 +131,7 @@ For Tier 3 upgrades that touch governance-controlled parameters (rate bounds in 
 
 | Symptom during Tier 3 rollout | Likely cause | Rollback |
 |-------------------------------|--------------|----------|
-| Restarted node reports `not_ready` for `rate_bounds_loaded` | Tier 3 changed the rate-bounds RPC response format and the node parsed an old-format response | Hold the rollout; wait for the governance flag to flip; restart. Do not roll back the binary. |
+| Restarted node reports `not_ready` for `rate_bounds_loaded` | Tier 3 changed the rate-bounds RPC response format and the node parsed an old-format response | Roll back to the previous stable binary or to the dual-version binary (whichever was last green) to restore service. The governance flag may take up to 48h to flip per [ADR 009](009-governance.md) timelock; do not block availability waiting for it. After the flag flips, redo the §3.2 cutover for that node. |
 | `decdn_streams_failed_total{reason="protocol_error"}` spikes after restart | Old peers receiving the new ALPN version's framing | Expected during the dual-version window. Investigate only if rate is sustained from peers known to have already upgraded. |
 | `closeChannel` reverts with new contract | Voucher format changed; old vouchers no longer valid against the new `PaymentChannel` | Use `forceCloseChannel` per [ADR 010](010-multi-token.md). The dispute window applies. |
 | `decdn_quic_0rtt_rejected_total` spikes after restart | Old session tickets cached by clients are not 0-RTT-replayable on the new ALPN | Self-corrects within one session-ticket lifetime. No action needed. |
@@ -154,4 +154,3 @@ For Tier 3 upgrades that touch governance-controlled parameters (rate bounds in 
 - [ADR 027 — Receipt format and gauge-claim continuity](027-distinct-client-receipts.md)
 - [`appendix-local-admin-http.md` — `admin_v1_drain` invocation](appendix-local-admin-http.md)
 - [`appendix-observability.md` — metrics referenced in the smoke-test checklist](appendix-observability.md)
-- [`appendix-operator-key-rotation.md` — sibling runbook with overlapping drain procedure](appendix-operator-key-rotation.md)
