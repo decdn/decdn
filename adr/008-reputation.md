@@ -297,7 +297,7 @@ Reputation-recovery does *not* retroactively re-include receipts from epochs spe
 
 ### 13. Regional-Coverage Reputation Signal
 
-The reputation system can expose a per-operator **regional-coverage signal** — a derived metric (not an additional component of `final_score`) summarizing where an operator's verified deliveries originate geographically. Operators serving high-demand low-coverage regions (e.g., Brazil, Southeast Asia, per the pre-seed regional-deployment priorities) receive a positive regional-coverage signal; operators serving only oversaturated regions receive a neutral signal.
+The reputation system can expose a per-operator **regional-coverage signal** — a derived metric (not an additional component of `final_score`) summarizing where an operator's verified deliveries originate geographically. Operators serving high-demand low-coverage regions receive a positive regional-coverage signal; operators serving only oversaturated regions receive a neutral signal.
 
 **This signal is not an input to `final_score` or to gauge-pool eligibility (Section 12).** It is an externally-readable per-operator attribute computed from the same gossip reports and local observations that drive Sections 3–4, exposed via the same gossip topic (`cdn/reputation/v1`) for downstream programs to consume.
 

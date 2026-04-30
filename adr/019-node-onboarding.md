@@ -66,9 +66,9 @@ Before any on-chain or protocol activity:
      There is no discount-stake threshold; operators who want amplified return on
      capital ve-lock TOKEN in `VotingEscrow` for gauge boost
      ([ADR 026 § 3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula)) rather than
-     staking above a threshold for fee discount. Operators who lack the 50K minimum may
-     qualify for a pre-seed-funded **staking loan** — see [Pre-seed USDC Bootstrap Programs](#pre-seed-usdc-bootstrap-programs)
-     below.
+     staking above a threshold for fee discount. Operators who lack the 50K minimum
+     may qualify for externally-funded operator-onboarding programs (see
+     [ADR 026 §10](026-gauge-boost-tokenomics.md#10-bootstrap-mechanism-pre-seed-usdc)).
    - **Native gas token:** approximately $0.50–$1.00 for the Phase 2 transactions
      at typical L2 gas prices.
    - **Optional USDC:** only required if the operator intends to open outbound payment
