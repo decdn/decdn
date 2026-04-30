@@ -87,7 +87,7 @@ Off-chain payment channels for per-MB delivery, with on-chain settlement. Multi-
 
 ### Chapter 4 — Tokenomics & incentives
 
-The economic model that ties the protocol together. Read [ADR 026](026-gauge-boost-tokenomics.md) first (canonical) and [ADR 027](027-distinct-client-receipts.md) second (its launch prerequisite); the rest are extensions, programs, and post-launch follow-ups.
+The economic model that ties the protocol together. The launch-required path is [ADR 026](026-gauge-boost-tokenomics.md) (canonical), [ADR 027](027-distinct-client-receipts.md) (gauge-security prerequisite), [ADR 018](018-liquidity-strategy.md) (Balancer V3 POL — destination for the 10% genesis liquidity allocation, required for buyback and delegator-pool mechanics), and [ADR 030](030-preseed-usdc-deployment.md) (pre-seed USDC pool — $1M floor is a mainnet-launch prerequisite). [ADR 028](028-sve-token-wrapper.md) and [ADR 029](029-adaptive-fee-router.md) are deferred — spec lands now, deployment decision waits on post-launch dynamics. [ADR 031](031-bme-client-prepay.md) and [ADR 032](032-bandwidth-futures-enterprise.md) are post-launch additions to the economic model — they build on launch-time infrastructure (SafetyReserve, distinct-client receipts, freemium → Pro tier) to deliver the demand-side TOKEN sink (BME prepay) and the Enterprise revenue tier (bandwidth futures + SLAs). Deferred from launch, not from the design.
 
 1. [ADR 026 — Gauge-Boost Tokenomics](026-gauge-boost-tokenomics.md) (canonical)
 2. [ADR 027 — Distinct-Client Delivery Receipts](027-distinct-client-receipts.md) (gauge security; launch prerequisite)
