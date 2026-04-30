@@ -96,16 +96,6 @@ Clients pay nodes per MB. On a cache miss, nodes pay origin-backed nodes per MB 
 
 ---
 
-### [ADR 004 — Dual-Currency Token Model](004-tokenomics.md)
-
-**USDC for payments. TOKEN for staking and governance.**
-
-> **Superseded by [ADR 026 — Gauge-Boost Tokenomics](026-gauge-boost-tokenomics.md).** ADR 026 is the canonical tokenomics source going forward. The summary below is preserved for historical context only.
-
-TOKEN is not used for payments. All nodes must stake TOKEN to participate. Staking cost creates accountability and Sybil resistance. 20% of protocol fees buy back and burn TOKEN (accumulate-only in PoC; buyback execution deferred to production). Fixed supply of 1B at genesis. Challenge bonds (100 TOKEN in PoC, 50 TOKEN in production) are required for slash claims, preventing zero-cost griefing. The buyback venue, pool type, and liquidity-seeding strategy are specified in [ADR 018](018-liquidity-strategy.md). Governance is covered separately in [ADR 009](009-governance.md).
-
----
-
 ### [ADR 005 — Wire Protocol](005-protocol.md)
 
 **Three core protocols (ALPN-negotiated) plus iroh-gossip. `cdn/client/v1` covers all paid delivery.**
@@ -249,7 +239,7 @@ Consolidates metrics scattered across ADRs 001, 005, 011, 015 and `architecture.
 
 **Arbitrum One (chain ID 42161) is the canonical production chain for all deCDN contracts.**
 
-Resolves the explicit deferral in ADR 004 and formalises the Arbitrum assumptions already embedded in ADRs 004, 007, and 018. Arbitrum One is selected over Base and OP Mainnet on the basis of: PoC continuity (Arbitrum Sepolia → Arbitrum One is a same-family migration), highest DeFi TVL and aggregator routing density for Balancer V3 buybacks, prior ADR consistency (gas estimates, forced-inclusion delay, Balancer V3 Router address all calibrated for Arbitrum One), and battle-tested OpenZeppelin Governor + TimelockController deployments. Native USDC (Circle CCTP, `0xaf88d065e77c8cC2239327C5EDb3A432268e5831`) is used — not bridged USDC.e. Cross-chain payment channels are excluded from v1. Re-evaluation triggers are defined for gas cost spikes, fraud-proof vulnerabilities, and sequencer censorship events.
+Arbitrum One is selected over Base and OP Mainnet on the basis of: PoC continuity (Arbitrum Sepolia → Arbitrum One is a same-family migration), highest DeFi TVL and aggregator routing density for Balancer V3 buybacks, cross-ADR consistency (gas estimates, forced-inclusion delay, Balancer V3 Router address all calibrated for Arbitrum One), and battle-tested OpenZeppelin Governor + TimelockController deployments. Native USDC (Circle CCTP, `0xaf88d065e77c8cC2239327C5EDb3A432268e5831`) is used — not bridged USDC.e. Cross-chain payment channels are excluded from v1. Re-evaluation triggers are defined for gas cost spikes, fraud-proof vulnerabilities, and sequencer censorship events.
 
 ### [ADR 022 — Content Discovery at Scale](022-content-discovery.md)
 
@@ -279,7 +269,7 @@ Running nodes expose a loopback HTTP admin surface so operator CLIs (`decdn node
 
 ### [ADR 026 — Gauge-Boost Tokenomics](026-gauge-boost-tokenomics.md)
 
-**1B fixed supply. `FeeRouter` six-bucket split with Curve-style gauge boost, delegator pool, and SafetyReserve. Supersedes [ADR 004](004-tokenomics.md) in full.**
+**1B fixed supply. `FeeRouter` six-bucket split with Curve-style gauge boost, delegator pool, and SafetyReserve.**
 
 Canonical economic model: genesis allocation across six buckets (four vesting, two unlocked at genesis), no auto-ve-lock on vest, a `FeeRouter` contract atomically splitting operator USDC settlement across direct node base, weekly gauge-boost pool, delegator pool, buyback-and-burn, treasury, and `SafetyReserve` (canonical shares and bounds in §2 / §11). Gross client rate is $0.01/GB. The gauge pool ties operator compensation to long-term ve-commitment via the Curve veCRV-style `working_bytes` formula (§3). Bootstrap supply-side incentive is externally-raised pre-seed USDC capital ([ADR 030](030-preseed-usdc-deployment.md)); slashing rate schedule (5%/15%/50%) is the existing schedule from prior tokenomics drafts. Six follow-up ADRs (027–032) close out the surface.
 

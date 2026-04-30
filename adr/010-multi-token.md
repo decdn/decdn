@@ -17,7 +17,7 @@ The EIP-712 `token` field was retained in ADR 003 specifically for this extensio
 
 ## Decision
 
-The payment protocol is token-agnostic but governed. The `PaymentChannel` contract maintains a governance-managed allowlist of approved ERC-20 token addresses. `openChannel` reverts if the token is not on the allowlist. This is consistent with how governance already controls rate bounds, fees, and staking parameters (ADR 004).
+The payment protocol is token-agnostic but governed. The `PaymentChannel` contract maintains a governance-managed allowlist of approved ERC-20 token addresses. `openChannel` reverts if the token is not on the allowlist. This is consistent with how governance already controls rate bounds, fees, and staking parameters ([ADR 026 §11](026-gauge-boost-tokenomics.md#11-governable-parameters-with-safety-bounds)).
 
 Within the set of allowed tokens, each node independently configures which it accepts; each client selects from the intersection of what it holds and what the target node advertises.
 
@@ -261,7 +261,7 @@ struct SignedRate {
 - **Governance bottleneck.** Adding a new payment token requires a governance action (admin call for PoC, Governor proposal for production). This adds latency for operators who want to use a token not yet approved. Mitigated by the fact that token additions are infrequent and low-risk governance actions.
 - **Token removal complexity.** `removeToken` blocks new channels but existing open channels in that token remain valid until force-closed or expired. `forceCloseChannel` (see contract interface above) allows any address to close these channels immediately, bounding the effective sunset to the dispute window duration (48h default) rather than `maxChannelDuration` (90 days). Because the contract provides no on-chain enumeration of channels, callers must maintain an off-chain inventory of channel IDs (persisted from channel creation) to identify channels to force-close after a token is removed.
 - **Per-token rate bounds governance burden.** Governance must set meaningful bounds for each token at `addToken` time. Bounds can be adjusted later via `setRateBounds`, but the floor can never drop below 1 base unit.
-- **Slashing is always in TOKEN (resolved).** ADR 004's slashing schedule is denominated in TOKEN stake, and this remains unchanged with multi-token payments. Slashing operates on the `StakingRegistry` (TOKEN stake), not on payment channel deposits (which may be in any approved token). A node paid exclusively in DAI is still slashed in TOKEN — the node must hold TOKEN stake to participate in the network regardless of which payment tokens it accepts. No price oracle or cross-token conversion is needed. The slash amount is a percentage of TOKEN stake, not a percentage of delivery revenue.
+- **Slashing is always in TOKEN (resolved).** The slashing schedule per [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn) is denominated in TOKEN stake, and this remains unchanged with multi-token payments. Slashing operates on the `StakingRegistry` (TOKEN stake), not on payment channel deposits (which may be in any approved token). A node paid exclusively in DAI is still slashed in TOKEN — the node must hold TOKEN stake to participate in the network regardless of which payment tokens it accepts. No price oracle or cross-token conversion is needed. The slash amount is a percentage of TOKEN stake, not a percentage of delivery revenue.
 
 ## Migration from ADR 003
 

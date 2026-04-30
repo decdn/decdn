@@ -2,7 +2,6 @@
 
 **Date:** 2026-04-25
 **Status:** Draft
-**Supersedes:** [ADR 004](004-tokenomics.md) in full
 **Source design spec:** internal `tokenomics-v2-gauge-boost-design` (2026-04-18)
 **Economic source of truth:** internal `decdn-economic-model-40-40-gauge-pool` (2026-04-25)
 
@@ -21,7 +20,7 @@ This ADR is the canonical economic model addressing all four. Burn is one of sev
 
 **Inputs assumed by this ADR.** Pre-launch design with no holder-compensation or contract-migration concerns. ~$1M+ pre-seed USDC capital secured (planning target $3M) — program structure defined in companion [ADR 030](030-preseed-usdc-deployment.md). 2026 unmetered-bandwidth provider economics per the design spec's input matrix (1 Gbps VPS, 10 Gbps dedicated, 100 Gbps edge tiers); dedicated-bandwidth nodes are realistic at every scale band the protocol is sized for.
 
-Earlier internal drafts of the tokenomics model (the original [ADR 004](004-tokenomics.md) and intermediate variants) explored alternative shapes — a flat protocol-fee skim, a 200M-TOKEN bootstrap fund, a regressive fee-discount mechanic, auto-ve-lock-on-vest. Those are documented in [Alternatives Considered](#alternatives-considered) below.
+Earlier internal drafts explored alternative shapes — a flat protocol-fee skim, a 200M-TOKEN bootstrap fund, a regressive fee-discount mechanic, auto-ve-lock-on-vest. Those are documented in [Alternatives Considered](#alternatives-considered) below.
 
 ---
 
@@ -257,7 +256,7 @@ The 20% floor on the node-base share guarantees operators always receive enough 
 
 Earlier internal drafts of the tokenomics model explored alternative shapes. The following were considered and rejected for the reasons noted; this section is the canonical record so future readers can see what was on the table without inferring it from the current design.
 
-### Original tokenomics ([ADR 004](004-tokenomics.md))
+### Original tokenomics shape
 
 A 1B-token model with a 3% protocol fee, 80/20/0/20 dev/audit/eco/burn allocation of the fee bucket, a regressive fee-discount mechanic ("stake 10× minimum to pay 1.5% fee instead of 3%"), a 200M-TOKEN node-bootstrap fund, and 50/50 burn/challenger slashing distribution.
 
@@ -267,8 +266,6 @@ Rejected because:
 - **No yield path to passive holders or long-term lockers.** Stake-to-operate, fee discount, and governance were the only TOKEN utilities; long-term lockers had no compensation lever distinct from short-term holders.
 - **Regressive fee discount.** The discount-on-stake-multiple pattern reduced buyback flow as more operators qualified — large stakers weakened the deflationary sink. Non-progressive and non-aligned with long-term commitment.
 - **TOKEN-denominated bootstrap was reflexive.** The 200M-TOKEN bootstrap fund's purchasing power collapsed exactly when subsidies were most needed.
-
-ADR 004 is marked Superseded; this ADR carries the slashing rate schedule (5% / 15% / 50%) and lifetime offense counter forward unchanged.
 
 ### Auto-ve-lock-on-vest
 
@@ -300,7 +297,7 @@ Rejected because:
 
 ### TOKEN-denominated node-bootstrap fund
 
-Variant: a protocol-issued multi-hundred-million-TOKEN bootstrap fund that disburses TOKEN to early operators (the [ADR 004](004-tokenomics.md) shape).
+Variant: a protocol-issued multi-hundred-million-TOKEN bootstrap fund that disburses TOKEN to early operators.
 
 Rejected because:
 
@@ -318,9 +315,3 @@ Rejected because:
 - **[ADR 030 — Pre-seed USDC deployment program](030-preseed-usdc-deployment.md)** — charter for the $1M+ pre-seed capital.
 - **[ADR 031 — Burn-and-Mint client TOKEN prepay path](031-bme-client-prepay.md)** — post-launch follow-up; demand-side TOKEN sink.
 - **[ADR 032 — Bandwidth Futures / Enterprise SLA tier](032-bandwidth-futures-enterprise.md)** — post-launch follow-up; TOKEN-denominated pre-purchase + Enterprise SLA tier.
-
----
-
-## ADRs to update on acceptance
-
-Cross-cutting deltas are documented in each touched ADR, not duplicated here. Touched: [003](003-payments.md), [004](004-tokenomics.md) (superseded), [007](007-watchtower.md), [008](008-reputation.md), [009](009-governance.md), [016](016-contract-interactions.md), [018](018-liquidity-strategy.md), [019](019-node-onboarding.md), [020](020-observability.md), [021](021-l2-chain-selection.md), [023](023-poc-production-seams.md).

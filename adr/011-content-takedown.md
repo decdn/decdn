@@ -123,12 +123,12 @@ Hash-based blacklisting covers only exact copies of a blob. A one-byte change pr
 
 **The protocol's primary response is origin blacklisting.** If an origin-backed node repeatedly sources blacklisted content — whether the same blob or trivially re-encoded variants — governance can blacklist the operator's Ethereum address. `ContentBlacklist.addOrigin()` calls `StakingRegistry.ejectNode(operatorAddress)` via a cross-contract call; the `StakingRegistry` grants the `ContentBlacklist` contract address the `BLACKLIST_ROLE`, permitting this call. A blacklisted origin:
 
-- **Ejected from `StakingRegistry`** — sets `active = false`, emits `NodeAutoEjected` ([ADR 001](001-network.md)). This follows the same code path as stake-based auto-ejection ([ADR 004 § Auto-ejection](004-tokenomics.md#auto-ejection))
-- **Remaining stake enters forced unbonding** — the standard unbonding period applies (7 days PoC / governable in production, minimum 3 days). Stake remains slashable during unbonding ([ADR 004 § Staking Parameters](004-tokenomics.md#staking-parameters))
-- **Address banned while blacklisted** — cannot register new nodes under the same Ethereum address unless governance removes the blacklist entry via `removeOrigin(operatorAddress)`. Re-entry otherwise requires a new identity funded with fresh stake (minimum 1,000 TOKEN — [ADR 004 § Staking Parameters](004-tokenomics.md#staking-parameters))
+- **Ejected from `StakingRegistry`** — sets `active = false`, emits `NodeAutoEjected` ([ADR 001](001-network.md)). This follows the same code path as stake-based auto-ejection ([ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn))
+- **Remaining stake enters forced unbonding** — the standard unbonding period applies (7 days PoC / governable in production, minimum 3 days). Stake remains slashable during unbonding ([ADR 026 §7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake))
+- **Address banned while blacklisted** — cannot register new nodes under the same Ethereum address unless governance removes the blacklist entry via `removeOrigin(operatorAddress)`. Re-entry otherwise requires a new identity funded with fresh stake (minimum 50,000 TOKEN — [ADR 026 §7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake))
 - **The operator's registered NodeId is excluded from peer tables** — gossip validation rejects messages from that blacklisted node
 
-> **Ejection vs. slashing.** Origin blacklisting triggers ejection (forced unbonding of remaining stake), *not* the escalating slash schedule. The operator's stake is not burned — it is returned after the unbonding period, assuming no separate slashable offense occurs during unbonding. By contrast, *serving* a blacklisted hash after the compliance window is a slashable offense under the escalating schedule in [ADR 004](004-tokenomics.md#slash-amounts-escalating), where stake is partially burned and the challenger is rewarded. A node operator can face both: slashing for serving blacklisted content, followed by origin blacklisting and ejection if the behaviour persists.
+> **Ejection vs. slashing.** Origin blacklisting triggers ejection (forced unbonding of remaining stake), *not* the escalating slash schedule. The operator's stake is not burned — it is returned after the unbonding period, assuming no separate slashable offense occurs during unbonding. By contrast, *serving* a blacklisted hash after the compliance window is a slashable offense under the escalating schedule in [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn), where stake is partially burned and the challenger is rewarded. A node operator can face both: slashing for serving blacklisted content, followed by origin blacklisting and ejection if the behaviour persists.
 
 This raises the cost of re-upload evasion from trivial (change a byte) to significant: the operator must fund and register a new identity with fresh stake. Repeat evasion becomes progressively more expensive.
 
@@ -162,7 +162,7 @@ When a node receives a new blacklisted hash, it must, **in order**:
 2. **Stop serving** — reject any new `StreamRequest` for the hash immediately, returning `HashBlacklisted`
 3. **Evict from cache** — delete the blob from local storage within the compliance window
 
-The announce-first ordering is critical: announcing content that is then not delivered triggers the phantom-blob detection path ([ADR 005](005-protocol.md#phantom-announcement-slashing)). Eviction from disk can be async; announcement suppression must be synchronous.
+The announce-first ordering is critical: announcing content that is then not delivered triggers the phantom-blob detection path ([ADR 005 — `cdn/probe/v1`](005-protocol.md#cdnprobev1-latency-probe)). Eviction from disk can be async; announcement suppression must be synchronous.
 
 When a node receives a blacklisted origin address, it additionally stops accepting any `StreamRequest` that presents a channel funded by that operator address, and removes all of that origin's NodeIds from its local peer table.
 
@@ -204,7 +204,7 @@ The response does not distinguish between governance and local denylist sources.
 
 ## Slashing
 
-Serving a blacklisted hash after the compliance window is a slashable offense, subject to the escalating schedule in [ADR 004](004-tokenomics.md#slash-amounts-escalating). Repeated offenses trigger cumulative stake loss; nodes whose stake drops below 50% of the minimum are auto-ejected ([ADR 004 § Auto-ejection](004-tokenomics.md#auto-ejection)). Individual slash percentages are capped at 50% per offense ([ADR 009 § Safety bounds](009-governance.md#governable-parameters-with-safety-bounds)). The standard challenge bond from [ADR 004](004-tokenomics.md#challenge-bond) applies (100 TOKEN PoC / 50 TOKEN production).
+Serving a blacklisted hash after the compliance window is a slashable offense, subject to the escalating schedule in [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn). Repeated offenses trigger cumulative stake loss; nodes whose stake drops below 50% of the minimum are auto-ejected. Individual slash percentages are capped at 50% per offense ([ADR 009 § Safety bounds](009-governance.md#governable-parameters-with-safety-bounds)). The standard challenge bond from [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn) applies (100 TOKEN PoC / 50 TOKEN production).
 
 **Slash evidence.** The challenger submits:
 
@@ -252,5 +252,5 @@ The minimum viable process for PoC:
 
 - **ADR 001** (Network Topology) — `NodeAnnounce` must suppress blacklisted hashes from `popular_hashes`; blacklisted origin NodeIds are excluded from peer tables; `StreamError::HashBlacklisted` and `StreamError::OriginBlacklisted` are new error variants
 - **ADR 002** (Content Addressing) — content-addressed blobs can be removed from the network layer even though the hash remains valid; this is explicitly accepted
-- **ADR 004** (Tokenomics) — serving blacklisted content added to the slashable offense list; origin blacklisting triggers same stake ejection path as repeated slashing
+- **[ADR 026](026-gauge-boost-tokenomics.md)** (Tokenomics) — serving blacklisted content added to the slashable offense list; origin blacklisting triggers same stake ejection path as repeated slashing
 - **ADR 009** (Governance) — `ContentBlacklist` contract added to governance-controlled contracts; emergency multisig scope documented in ADR 009 as the single source of truth, covering both contract pausing and content/origin blacklisting; regional body registry introduced as a new governance primitive

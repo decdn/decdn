@@ -5,14 +5,10 @@
 
 ## Context
 
-The PoC runs on **Arbitrum Sepolia**. The production chain has been explicitly deferred
-since ADR 004:
+The PoC runs on **Arbitrum Sepolia**. TOKEN is canonical on one L2 — all staking, channel
+settlements, and governance happen on this chain. This ADR selects the production L2.
 
-> "TOKEN is canonical on one L2 (the production chain). All staking, channel settlements,
-> and governance happen on this chain. This decision is deferred until after PoC
-> validation." — ADR 004 § Multi-Chain
-
-This ADR makes the deferral concrete. The choice affects:
+The choice affects:
 
 - Gas costs and EIP-4844 data-fee characteristics
 - Sequencer forced-inclusion delay (lower-bounds the dispute window — ADR 003/007)
@@ -21,15 +17,12 @@ This ADR makes the deferral concrete. The choice affects:
 - DeFi ecosystem depth for TOKEN/USDC liquidity (ADR 018)
 - Bridge tooling for users moving assets from Ethereum L1
 
-Several prior ADRs have implicitly assumed Arbitrum mainnet without stating it explicitly:
+Several other ADRs depend on the chain selection:
 
-- **ADR 004** — gas estimates ("assume Arbitrum average gas price as of early 2026")
+- **ADR 003 / ADR 014** — gas estimates assume Arbitrum-class L2 fee markets
 - **ADR 007** — forced-inclusion delay assumed ≤ 24 hours (Arbitrum value)
 - **ADR 018** — Balancer V3 Router address (canonical: see [ADR 018 §"Buyback execution via Balancer V3"](018-liquidity-strategy.md#buyback-execution-via-balancer-v3))
   labelled as the Arbitrum mainnet address
-
-Formalizing this decision resolves the ambiguity and allows remaining mainnet planning to
-proceed.
 
 ## Candidate Chains
 
@@ -40,7 +33,7 @@ Three OP-Stack / Nitro L2s on Ethereum were evaluated: **Arbitrum One**, **Base*
 
 | Factor | Relevance to deCDN |
 |--------|--------------------|
-| Gas costs at current fee market | Directly affects channel open/close/settle economics (ADR 004 gas table) |
+| Gas costs at current fee market | Directly affects channel open/close/settle economics (ADR 003 §Deposit Economics) |
 | Sequencer forced-inclusion delay | Hard lower-bound on dispute window; must exceed this value (ADR 003/007) |
 | Native USDC availability | Eliminates Circle bridge counterparty risk for payment channels |
 | Balancer V3 deployment | ADR 018 requires a Balancer V3 Weighted Pool for TOKEN/USDC POL |
@@ -74,10 +67,10 @@ All three chains are viable. The differentiating factors are explored below.
 Arbitrum Nitro uses WASM-based fraud proofs and its own calldata compression scheme,
 historically producing lower L1 data fees than OP Stack for calldata-heavy transactions.
 Post-EIP-4844 (blob transactions), all three chains use blob data for L2 state
-submissions, significantly reducing L1 data costs on all candidates. The gas estimates
-in ADR 004 (`stake` ~$0.05, `openChannel` ~$0.05, `closeChannel` ~$0.10,
-`settleChannel` ~$0.08) are calibrated for Arbitrum and remain accurate for 2026 fee
-markets on any of the three candidates within an order of magnitude.
+submissions, significantly reducing L1 data costs on all candidates. The gas estimates in [ADR 003 §Deposit Economics](003-payments.md#deposit-economics)
+(`openChannel` ~$0.05, `closeChannel` ~$0.10, `settleChannel` ~$0.08) are calibrated for
+Arbitrum and remain accurate for 2026 fee markets on any of the three candidates within
+an order of magnitude.
 
 ### Sequencer Censorship and Dispute Window
 
@@ -126,9 +119,9 @@ Rationale:
    during early production; better buyback execution quality.
 3. **PoC continuity** — Arbitrum Sepolia → Arbitrum One is a straight path with no
    architecture changes.
-4. **Prior ADR consistency** — ADR 004 gas estimates, ADR 007 forced-inclusion window,
-   and ADR 018 contract addresses all assume Arbitrum One. This ADR retroactively
-   formalises those assumptions rather than forcing updates to multiple ADRs.
+4. **Cross-ADR consistency** — gas estimates (ADR 003), forced-inclusion window
+   (ADR 007), and Balancer V3 contract addresses (ADR 018) are all calibrated against
+   Arbitrum One.
 5. **Mature ecosystem** — Governor + TimelockController deployments, Foundry support,
    Etherscan explorer, block explorer APIs, and watchtower infrastructure are all
    well-established on Arbitrum One.
@@ -156,18 +149,17 @@ logic that is out of scope for initial production.
 
 ## Consequences
 
-### Updates to Prior ADRs
+### Cross-ADR alignment
 
-This ADR resolves the deferral in ADR 004 and formalises implicit assumptions in ADRs
-004, 007, and 018. No numerical parameters in those ADRs change.
+The chain selection here is the canonical reference for Arbitrum-specific assumptions
+elsewhere in the ADR set:
 
-| ADR | Prior state | After this ADR |
-|-----|-------------|----------------|
-| ADR 004 § Multi-Chain | "Production L2 deferred" | Resolved: Arbitrum One |
-| ADR 004 § Gas Cost Breakdown | "Assume Arbitrum" (implicit) | Explicit |
-| ADR 007 § L2 Sequencer Censorship | "forced inclusion delay ≤ 24 h" | Confirmed for Arbitrum One |
-| ADR 018 § Buyback execution | Arbitrum mainnet Router address embedded | Chain selection now explicit |
-| ADR 016 § Deployment | "Arbitrum mainnet" in BuybackBurner row | Chain selection now explicit |
+| ADR | Assumption |
+|-----|------------|
+| ADR 003 § Deposit Economics | Gas table calibrated against Arbitrum One fee market |
+| ADR 007 § L2 Sequencer Censorship | Forced-inclusion delay ≤ 24 h (Arbitrum value) |
+| ADR 018 § Buyback execution | Balancer V3 Router address is the Arbitrum One deployment |
+| ADR 016 § Deployment | "Arbitrum mainnet" in the BuybackBurner row |
 
 ### Chain-Specific Constants
 
@@ -183,7 +175,7 @@ This ADR resolves the deferral in ADR 004 and formalises implicit assumptions in
 | Block time | ~250 ms | Arbitrum Nitro |
 | RIP-7212 Ed25519 precompile | Not deployed | Verified 2026-04 against both Arbitrum One and Sepolia |
 | Testnet sibling | Arbitrum Sepolia | Used for PoC; same Nitro architecture and tooling |
-| Reference gas price (early 2026) | ~$0.50 per 1M gas | Underlying rate behind the per-operation costs tabulated in [ADR 004 § Gas Cost Breakdown](004-tokenomics.md#gas-cost-breakdown); ADR 003 and ADR 014 derive their estimates from the same rate |
+| Reference gas price (early 2026) | ~$0.50 per 1M gas | Underlying rate behind the per-operation costs cited in ADR 003 and ADR 014 |
 
 > **Address verification.** Contract addresses MUST be re-confirmed against the
 > Arbitrum One deployment registry and Arbiscan at deployment time. The Balancer V3
@@ -196,15 +188,15 @@ This ADR resolves the deferral in ADR 004 and formalises implicit assumptions in
 The production deployment runbook (ADR 016) should substitute Arbitrum Sepolia addresses
 for Arbitrum One mainnet equivalents at each step. No contract logic changes are required.
 
-### v3 Tokenomics Validation Requirements
+### Tokenomics Validation Requirements
 
 [ADR 026](026-gauge-boost-tokenomics.md) introduces two new gas-cost surfaces that the L2 selection
-in this ADR must be re-validated against before mainnet deployment of v3 contracts. Both
+in this ADR must be re-validated against before mainnet deployment. Both
 surfaces are economic, not architectural — they do not invalidate the Arbitrum One choice
 above, but they must be quantified on the chosen L2 with measured (not estimated) gas
 numbers prior to mainnet launch.
 
-1. **`FeeRouter` byte-counter overhead per settlement.** Every `settleChannel` call in v3
+1. **`FeeRouter` byte-counter overhead per settlement.** Every `settleChannel` call
    routes through `FeeRouter.routeSettlement(operator, bytesDelivered, amount)`, which
    increments an operator's per-epoch `bytes_delivered` counter (ADR 026 §2 epoch
    mechanics). This is **5–15K gas of overhead** on top of the existing settlement
@@ -215,9 +207,9 @@ numbers prior to mainnet launch.
    within operator-affordability bounds — cite the operator P&L cases in
    [ADR 026 §7](026-gauge-boost-tokenomics.md) as the affordability reference.
 
-2. **Per-epoch keeper-call gas economics.** v3 requires **two TWAP-protected USDC→TOKEN
-   swap keeper calls per epoch**: one for `BuybackBurner` (5% buyback-and-burn flow,
-   inflow source change per [ADR 018](018-liquidity-strategy.md)) and one for the
+2. **Per-epoch keeper-call gas economics.** The design requires **two TWAP-protected
+   USDC→TOKEN swap keeper calls per epoch**: one for `BuybackBurner` (5% buyback-and-burn
+   flow, inflow source per [ADR 018](018-liquidity-strategy.md)) and one for the
    delegator-pool USDC→TOKEN conversion (7% delegator-pool flow per
    [ADR 026 §6](026-gauge-boost-tokenomics.md)). At a 1-week epoch length, that is
    **52+ swap executions per year minimum**, both routed through the Balancer V3 80/20
@@ -226,22 +218,22 @@ numbers prior to mainnet launch.
    liquidity caps bind per [ADR 026 §8](026-gauge-boost-tokenomics.md) and the economic-model
    spec) and confirmed not to be cost-prohibitive against the inflow each call routes.
 
-3. **Combined L2-selection validation gate.** Before mainnet deployment of v3 contracts,
-   the selection criteria in this ADR MUST additionally verify that:
+3. **Combined L2-selection validation gate.** Before mainnet deployment, the selection
+   criteria in this ADR MUST additionally verify that:
    - Aggregate per-settlement gas (USDC-equivalent per settlement, including the
      `FeeRouter` byte-counter overhead) is within the operator-affordability bounds set
      by the operator P&L cases in [ADR 026 §7](026-gauge-boost-tokenomics.md).
    - Per-epoch keeper costs for the two TWAP swaps are not cost-prohibitive at S2/S3
      network scale and remain a small fraction of the inflow each call routes.
    - The chosen L2 supports private-RPC routing (Flashbots-style transaction bundles)
-     to satisfy the hardened MEV-protection requirement that [ADR 018](018-liquidity-strategy.md)
-     adopts under v3 (private RPC required, per-epoch liquidity caps required — both
-     mandatory, not optional). If the L2 lacks a viable private-RPC route, the v3
-     swap path's MEV defense is not deployable as designed.
+     to satisfy the hardened MEV-protection requirement in
+     [ADR 018](018-liquidity-strategy.md) (private RPC required, per-epoch liquidity
+     caps required — both mandatory, not optional). If the L2 lacks a viable private-RPC
+     route, the swap path's MEV defense is not deployable as designed.
 
 These requirements are additive to (not a replacement for) the selection criteria in
 this ADR. Specific gas tables are intentionally omitted here — they must be measured
-during v3 contract integration testing on Arbitrum Sepolia and re-confirmed against
+during contract integration testing on Arbitrum Sepolia and re-confirmed against
 Arbitrum One fee markets at deployment time, not estimated in advance.
 
 ### Re-evaluation Triggers

@@ -226,7 +226,7 @@ DHT STORE and FIND_VALUE operations carry no protocol-level fee. The incentive t
 - **Medium** (new mandatory fields): `cdn/dht/v2` ALPN.
 - **Major** (incompatible routing changes): new ALPN + migration period.
 
-`DhtMessage` uses a top-level enum consistent with the per-ALPN protocol enum pattern in [ADR 013](013-schema-evolution.md#schema-evolution-strategy). Unknown variants are silently dropped.
+`DhtMessage` uses a top-level enum consistent with the per-ALPN protocol enum pattern in [ADR 013 — Protocol Enums](013-schema-evolution.md#protocol-enums). Unknown variants are silently dropped.
 
 ---
 

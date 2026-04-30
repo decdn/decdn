@@ -6,7 +6,7 @@
 ## Context
 
 Existing ADRs specify individual components of the node lifecycle in isolation — staking
-in [ADR 026](026-gauge-boost-tokenomics.md) (which supersedes [ADR 004](004-tokenomics.md)),
+in [ADR 026](026-gauge-boost-tokenomics.md),
 on-chain registration in [ADR 001](001-network.md), payment channel bindings in
 [ADR 003](003-payments.md), gossip validation in [ADR 001](001-network.md), blacklist
 sync in [ADR 011](011-content-takedown.md), and contract deployment order in
