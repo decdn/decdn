@@ -12,7 +12,7 @@ Every ADR from 001–022 contains a PoC vs production split: different contracts
 
 The goal is a clean mechanical answer to: **how does the codebase express the difference between PoC and production?**
 
-> **Cross-reference:** [ADR 026 — Tokenomics v3](026-gauge-boost-tokenomics.md) introduces a new contract surface (`FeeRouter`, `VotingEscrow`, `SafetyReserve`, swap helpers shared by `BuybackBurner` and the delegator-pool path). Seams 8–11 below cover the wiring-layer selectors for those contracts. The leaf-crate principle restated in §"Wiring Conventions" applies to v3 tokenomics with the same force as to ADRs 001–022: domain crates remain free of v3-mode-branching logic.
+> **Cross-reference:** [ADR 026 — Gauge-Boost Tokenomics](026-gauge-boost-tokenomics.md) introduces a new contract surface (`FeeRouter`, `VotingEscrow`, `SafetyReserve`, swap helpers shared by `BuybackBurner` and the delegator-pool path). Seams 8–11 below cover the wiring-layer selectors for those contracts. The leaf-crate principle restated in §"Wiring Conventions" applies to ADR 026's tokenomics with the same force as to ADRs 001–022: domain crates remain free of ADR-026-mode-branching logic.
 
 ### Inventory of PoC/Production differences (from prior ADRs)
 
@@ -187,7 +187,7 @@ Concrete values:
 
 ### 8. `FeeRouterClient` — `crates/incentive`
 
-Introduced by [ADR 026](026-gauge-boost-tokenomics.md) §2. The `FeeRouter` contract receives the full operator USDC balance from `PaymentChannel.settleChannel` and atomically splits it into the six v3 buckets. The wiring seam selects between an in-process PoC stub (a no-op or local accounting router) and the deployed production contract address per network.
+Introduced by [ADR 026](026-gauge-boost-tokenomics.md) §2. The `FeeRouter` contract receives the full operator USDC balance from `PaymentChannel.settleChannel` and atomically splits it into the six buckets. The wiring seam selects between an in-process PoC stub (a no-op or local accounting router) and the deployed production contract address per network.
 
 ```rust
 pub trait FeeRouterClient: Send + Sync {
@@ -371,7 +371,7 @@ crates/
 3. **`NetworkConstants` is the single source of truth for all numeric differences.** No magic numbers elsewhere — always reference `constants.popular_hashes_max`, never literal `20`.
 4. **Both implementations must compile in CI.** The CI matrix builds with `--features poc` and without (production). This prevents either path from rotting and catches type errors in both concrete implementations.
 5. **PoC removal is mechanical.** To graduate to production-only: delete all `#[cfg(feature = "poc")]` functions, remove the `poc` feature from `Cargo.toml`, and strip the `#[cfg(not(feature = "poc"))]` attributes from the remaining functions. No logic changes required.
-6. **Leaf-crate principle applies to v3 tokenomics.** Domain crates (`cache`, `gossip`, `incentive`, `reputation`, `protocol`) MUST NOT contain mode-branching logic for the [ADR 026](026-gauge-boost-tokenomics.md) v3 contract surface (`FeeRouter`, `VotingEscrow`, `SafetyReserve`, swap helpers). All mode selection between PoC stubs / fixtures / mocks and production contracts lives in `crates/node/src/wiring.rs` behind seams 8–11 above — the same rule that governs seams 1–7. Adding `if v3_enabled` checks inside domain crate logic is forbidden.
+6. **Leaf-crate principle applies to ADR 026 tokenomics.** Domain crates (`cache`, `gossip`, `incentive`, `reputation`, `protocol`) MUST NOT contain mode-branching logic for the [ADR 026](026-gauge-boost-tokenomics.md) contract surface (`FeeRouter`, `VotingEscrow`, `SafetyReserve`, swap helpers). All mode selection between PoC stubs / fixtures / mocks and production contracts lives in `crates/node/src/wiring.rs` behind seams 8–11 above — the same rule that governs seams 1–7. Adding `if production_enabled` checks inside domain crate logic is forbidden.
 
 ---
 
@@ -451,4 +451,4 @@ Rejected. Scatters the PoC/production boundary into every crate, making it hard 
 | ADR 014 | `CorruptionChallenger` | Optimistic vs Merkle proof |
 | ADR 017 | `NetworkConstants.popular_hashes_max` | 20 (PoC) vs 5 (production) |
 | ADR 018 | `SwapHelper` | Mock pool (PoC) vs Balancer V3 (production); shared by `BuybackBurner` and delegator-pool path |
-| ADR 026 | `FeeRouterClient`, `VotingEscrowReader`, `SwapHelper`, `SafetyReservePayout` | v3 contract surface; PoC stubs / fixtures / mocks vs deployed contracts per network |
+| ADR 026 | `FeeRouterClient`, `VotingEscrowReader`, `SwapHelper`, `SafetyReservePayout` | production contract surface; PoC stubs / fixtures / mocks vs deployed contracts per network |
