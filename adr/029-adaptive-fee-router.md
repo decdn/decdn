@@ -100,8 +100,8 @@ The hook parameters themselves are governable, gated by 48-hour timelock per
 | Price hysteresis (fraction of floor) | 10% | 1% | 25% | Yes |
 | Price-shift size | 2 pp | 1 pp | 5 pp | Yes |
 | `minPoolDepth` (pool-depth cap) | $250K | $50K | $5M | Yes |
-| Lock-rate hook enabled | true | — | — | Yes (boolean) |
-| Price-floor hook enabled | true | — | — | Yes (boolean) |
+| Lock-rate hook enabled | false | — | — | Yes (boolean) |
+| Price-floor hook enabled | false | — | — | Yes (boolean) |
 
 The shift-size cap of 5 pp prevents the hooks from making outsized changes
 between epochs (multiple successive +5 pp shifts can still re-shape the split,

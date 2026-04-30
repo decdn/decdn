@@ -31,23 +31,20 @@ otherwise be filtered out at Phase 1 (server provisioning) or Phase 2 (on-chain 
 | Planning target | $3,000,000 USDC |
 | Source | External pre-seed round (off-chain, raised by founding team / treasury) |
 | Denomination | USDC throughout — no TOKEN substitution at any disbursement stage |
-| Custody | Multisig USDC wallet, DAO-controlled; same Timelock-custodied wallet pattern as the [ADR 026](026-gauge-boost-tokenomics.md) §2 treasury share, with a dedicated sub-account so program flows are auditable separately from organic inflow |
-| Spending authority | Standard governance proposal per [ADR 009](009-governance.md), or fast-track emergency-multisig authorization within the hard caps below |
+| Custody | Dedicated Timelock-custodied USDC account, DAO-controlled; same Timelock-custodied wallet pattern as the [ADR 026](026-gauge-boost-tokenomics.md) §2 treasury share, with a dedicated sub-account so program flows are auditable separately from organic inflow |
+| Spending authority | Standard governance proposal per [ADR 009](009-governance.md); the [ADR 009](009-governance.md) emergency multisig has **no withdrawal authority** over this pool |
 
 **No protocol issuance.** This pool is **externally raised USDC**. The protocol does not
 mint TOKEN to fund it. **Raising at least the $1M floor is a prerequisite for mainnet
 launch.** Contingency: governance can re-allocate from the 30% Protocol Treasury bucket
 per [ADR 026](026-gauge-boost-tokenomics.md) §1 at the cost of development runway.
 
-**Hard caps (immutable at deploy time)** for the multisig fast-track path, paralleling
-the `SafetyReserve` fast-track gates per [ADR 009](009-governance.md):
-
-| Path | Per-incident cap | Per-30-day rolling cap |
-| --- | --- | --- |
-| Multisig fast-track | $50,000 | $250,000 |
-| Standard governance proposal | program-allocation-bounded | program-allocation-bounded |
-
-Disbursements above either cap require a full governance proposal.
+**Authority clarification.** This program does **not** introduce a separate emergency
+withdrawal path. Unlike `SafetyReserve` payouts in [ADR 009](009-governance.md), this
+pool is not spendable via emergency-multisig fast-track authorization; all disbursements
+remain subject to standard governance approvals and the per-program allocation limits in
+this ADR. Disbursements are bounded only by the per-program allocation ranges in §2 and
+the rebalancing rules in §3.
 
 ### 2. Five funded programs
 
@@ -293,7 +290,7 @@ Governance rebalancing is bounded: **±10 pp per program per quarter, ±20 pp cu
 
 ### 4. Reporting
 
-Quarterly pre-seed program report (capital deployed, success-metric deltas, triggers met, rebalancing actions, cross-program flows) signed by the multisig and published on-chain via the program-accounting contract — same pattern as the `SafetyReserve` post-incident registry ([ADR 026](026-gauge-boost-tokenomics.md) §5). Off-chain mirrors are documentation hygiene, not protocol invariants.
+Quarterly pre-seed program report (capital deployed, success-metric deltas, triggers met, rebalancing actions, cross-program flows) authorized via standard governance proposal and published on-chain via the program-accounting contract — same pattern as the `SafetyReserve` post-incident registry ([ADR 026](026-gauge-boost-tokenomics.md) §5). Off-chain mirrors are documentation hygiene, not protocol invariants.
 
 ### 5. Coordination with `SafetyReserve` (summary)
 
@@ -344,7 +341,7 @@ commitments (active loans, leases, regional grants) continue to term regardless.
 - **Sybil exploitation of staking loans** via fake referrer relationships. The `final_score ≥ 0.8 / 180-day` referrer threshold and 25% co-signed liability make it self-policing.
 - **Regional-grant capture** by a clique rotating gauge votes. Mitigation: auto-eligibility is governance-overrideable; sustained patterns trigger review.
 - **POO governance-weight concentration.** POO ve-positions are policy-bound to abstain on regional-priority votes affecting their own regions; enforcement is policy, not on-chain.
-- **Multisig compromise** is a $1M–$3M loss. Standard [ADR 009](009-governance.md) multisig hygiene applies.
+- **Timelock / governance-key compromise** is a $1M–$3M loss. Standard [ADR 009](009-governance.md) Timelock + governance-multisig hygiene applies.
 - **Slow ramp on the §6 wind-down trigger** if treasury inflow plateaus at S1 — year-3 governance review re-evaluates structure if S2 has not been reached.
 
 ---
@@ -367,4 +364,4 @@ The chosen design routes externally-raised USDC into outcome-targeted programs a
 
 ## ADRs to update on acceptance
 
-Cross-cutting deltas live in each touched ADR. Touched: [008](008-reputation.md) (program-eligibility consumer of `final_score`), [009](009-governance.md) (parallel multisig fast-track caps), [016](016-contract-interactions.md) (program-accounting contract for §4 reporting), [019](019-node-onboarding.md) (back-reference to this ADR), [026](026-gauge-boost-tokenomics.md) (§10 resolved; §5 gains §2e pairing as third-priority funding source).
+Cross-cutting deltas live in each touched ADR. Touched: [008](008-reputation.md) (program-eligibility consumer of `final_score`), [016](016-contract-interactions.md) (program-accounting contract for §4 reporting), [019](019-node-onboarding.md) (back-reference to this ADR), [026](026-gauge-boost-tokenomics.md) (§10 resolved; §5 gains §2e pairing as second-priority funding source).
