@@ -589,6 +589,7 @@ async fn check_rpc_reachability(rpc_url: &str) -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -600,5 +601,36 @@ mod tests {
         assert_eq!(ShutdownSignal::Sigint.to_string(), "SIGINT");
         #[cfg(unix)]
         assert_eq!(ShutdownSignal::Sigterm.to_string(), "SIGTERM");
+    }
+
+    /// Smoke test for the post-fixup `ShutdownStreams::recv` contract:
+    /// a real SIGTERM raised from inside the test process must resolve
+    /// the future to `ShutdownSignal::Sigterm`. nextest runs each test
+    /// in its own process so the signal cannot leak across tests.
+    /// `nix::sys::signal::raise` keeps the workspace `unsafe_code =
+    /// "forbid"` lint clean.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_streams_recv_resolves_on_sigterm() {
+        use std::time::Duration;
+
+        use nix::sys::signal::{Signal, raise};
+
+        let mut streams = ShutdownStreams::install();
+        // Spawn the raise on a separate task so `recv()` is awaiting
+        // on the SIGTERM stream by the time the signal arrives. The
+        // small sleep gives `install()` a chance to register tokio's
+        // handler — without it the kernel could deliver SIGTERM with
+        // the default disposition (terminate the process) before the
+        // tokio handler is in place. 20ms is far longer than the
+        // install path needs.
+        tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            raise(Signal::SIGTERM).expect("raise SIGTERM");
+        });
+        let signal = tokio::time::timeout(Duration::from_millis(500), streams.recv())
+            .await
+            .expect("ShutdownStreams::recv did not resolve within 500ms of SIGTERM");
+        assert!(matches!(signal, ShutdownSignal::Sigterm));
     }
 }

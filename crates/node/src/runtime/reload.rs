@@ -848,4 +848,58 @@ mod tests {
         reload_runtime_config(&path, &state).await.unwrap();
         assert_eq!(state.rate_per_mb().load(Ordering::Relaxed), 50);
     }
+
+    /// A malformed TOML body must reject the reload before any commit
+    /// side-effect runs: the setter is never called, the rate atomic
+    /// stays at its previous value, and the snapshot baseline (which
+    /// other reloads diff against) is unchanged. Without this test the
+    /// transactional guarantees only get exercised on the *resolution*
+    /// failure paths, not on the parse failure path.
+    #[tokio::test]
+    async fn reload_returns_error_on_malformed_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        // Unterminated section header + dangling assignment — guaranteed
+        // to fail the TOML parser without depending on any specific
+        // diagnostic message.
+        let path = write_config(dir.path(), "[payment\nrate_per_mb = ");
+
+        let initial = seed_resolved(42, LogLevel::Info);
+        let (setter, captured) = recording_setter();
+        let state = RuntimeReloadState::new(
+            PaymentArgs { rate_per_mb: None },
+            ObservabilityArgs {
+                log_level: None,
+                log_format: None,
+                metrics_port: None,
+                metrics_bind: None,
+                admin_port: None,
+                otlp_endpoint: None,
+            },
+            &initial,
+            setter,
+        );
+
+        // Sample the snapshot before the reload to compare against the
+        // post-reload value. `FileSectionSnapshot` derives `Clone` so
+        // we can take a structural copy through the guard.
+        let snapshot_before = state.last_file_sections.lock().unwrap().clone();
+
+        let err = reload_runtime_config(&path, &state).await.unwrap_err();
+        // Don't bind the test to a specific TOML diagnostic; just check
+        // the call failed.
+        assert!(!format!("{err:#}").is_empty());
+
+        assert_eq!(state.rate_per_mb().load(Ordering::Relaxed), 42);
+        assert!(captured.lock().unwrap().is_none());
+
+        let snapshot_after = state.last_file_sections.lock().unwrap().clone();
+        // Snapshots cmp by serde_json::Value equality — any drift across
+        // a rejected parse would mean we mutated the diff baseline,
+        // which is exactly what the test guards against.
+        assert_eq!(
+            format!("{snapshot_before:?}"),
+            format!("{snapshot_after:?}"),
+            "snapshot baseline must not move on parse-failed reload"
+        );
+    }
 }

@@ -55,6 +55,11 @@ tracing-opentelemetry = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# `nix` provides a safe wrapper around `raise(2)` so the SIGHUP/SIGTERM
+# integration tests can deliver real signals from inside the test process
+# without violating the workspace `unsafe_code = "forbid"` lint that would
+# otherwise force us to use `libc::raise` directly.
+nix = { version = "0.30", default-features = false, features = ["signal"] }
 
 [lints]
 workspace = true
