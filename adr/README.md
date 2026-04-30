@@ -37,7 +37,7 @@ Terms used across multiple ADRs without inline definition.
 | Term | Definition |
 | --- | --- |
 | **Blob** | A content-addressed byte sequence identified by its BLAKE3 hash. |
-| **Chunk** | The BLAKE3 hash-tree leaf size (1024 bytes). iroh-blobs uses this for verified streaming; on-chain Merkle proofs for slash evidence reference this leaf size — see [ADR 002](002-content-addressing.md). |
+| **Chunk** | The BLAKE3 hash-tree leaf size (1024 bytes). iroh-blobs uses this for verified streaming; on-chain Merkle proofs for slash evidence reference this leaf size — see [ADR 002](002-content-addressing.md) for the addressing scheme and [ADR 014](014-on-chain-verification.md) for the slash-evidence verification flow. |
 | **Hash sequence** | An ordered collection of blob hashes (iroh's equivalent of a directory/manifest). |
 | **NodeId** | An iroh public-key identifier; the on-wire identity of a node. Bound to an Ethereum address on-chain via EIP-712 signature in `StakingRegistry.registerNode` ([ADR 001](001-network.md)). |
 | **Node** | A staked participant that caches and serves blobs. Some nodes are configured with an origin backend; others are pure caches. |
@@ -62,7 +62,7 @@ Terms used across multiple ADRs without inline definition.
 | **Slashing** | Punitive reduction of staked TOKEN on detected protocol violations. Escalating tiers 5%/15%/50% by lifetime offense count; distribution 50% challenger / 30% safety reserve / 20% burn — see [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn). |
 | **Epoch** | The 1-week settlement and ve-snapshot window. Gauge buckets, delegator buckets, and `bytes_delivered` counters reset at epoch rollover — see [ADR 026 §2](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553). |
 | **Gauge / gauge-boost** | Curve-style mechanism that scales an operator's share of the 40% gauge pool by ve-weighted commitment, not raw bytes. The boost-floor parameter caps the worst-case ratio between an unboosted and fully-boosted operator. |
-| **`working_bytes`** | The gauge-formula input. Per-operator: `min(bytes_i, 0.4·bytes_i + 0.6·(ve_i / total_ve)·total_bytes)`. Replaces Curve's LP-deposit primitive with verified-bytes-delivered. |
+| **`working_bytes`** | The gauge-formula input. Per-operator: `min(bytes_i, 0.4 * bytes_i + 0.6 * (ve_i / total_ve) * total_bytes)`. Replaces Curve's LP-deposit primitive with verified-bytes-delivered. |
 | **ve / VotingEscrow** | Vote-escrowed TOKEN: a non-transferable, time-decaying lock of underlying TOKEN that grants gauge-boost and governance weight. Opt-in (no auto-ve-lock-on-vest) — see [ADR 026 §4](026-gauge-boost-tokenomics.md#4-voting-escrow-votingescrow). |
 | **sveTOKEN** | A native Frax-sfrxETH-style liquid-ve wrapper that holds a single pooled `VotingEscrow` lock, against which transferable sveTOKEN claims are issued. Deferred — see [ADR 028](028-sve-token-wrapper.md). |
 | **FeeRouter** | The settlement-time six-bucket USDC distributor. Split: 40 node base / 40 gauge / 7 delegator / 5 burn / 5 treasury / 3 safety. Atomic same-tx for the 40+5+5+3 legs; epoch-bucketed for the 40 gauge / 7 delegator legs. |
