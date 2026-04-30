@@ -36,7 +36,6 @@ All on-chain contracts inherit from [OpenZeppelin Contracts](https://docs.openze
 | Contract | ADR | Status |
 | --- | --- | --- |
 | DelegatorBuyer (or `BuybackBurner` multi-output extension) | [026](026-gauge-boost-tokenomics.md) §6 | Implementation choice deferred — either a parallel contract or a `BuybackBurner` mode performs the delegator-pool 7% USDC→TOKEN swap. Selected during implementation. |
-| SveToken (native liquid-ve wrapper) | future ADR 028 | Frax sfrxETH-style wrapper around `VotingEscrow` ve-positions. Deferred; targeted for ship within 6 months of mainnet to pre-empt third-party Convex-capture. |
 
 #### Contract Architecture (classDiagram)
 

@@ -87,13 +87,11 @@ Off-chain payment channels for per-MB delivery, with on-chain settlement. Multi-
 
 ### Chapter 4 — Tokenomics & incentives
 
-The economic model that ties the protocol together. Launch-required path: [ADR 026](026-gauge-boost-tokenomics.md) (canonical), [ADR 027](027-distinct-client-receipts.md) (gauge-security prerequisite), [ADR 018](018-liquidity-strategy.md) (Balancer V3 POL). [ADRs 028, 029](028-sve-token-wrapper.md) are deferred — spec lands; deployment waits on post-launch dynamics. The launch contract surface is forward-compatible (additive integration via standard `AccessControl` role grants) so future economic-layer products can land without changing existing contracts.
+The economic model that ties the protocol together. Three ADRs: [ADR 026](026-gauge-boost-tokenomics.md) (canonical), [ADR 027](027-distinct-client-receipts.md) (gauge-security prerequisite), [ADR 018](018-liquidity-strategy.md) (Balancer V3 POL). The launch contract surface is forward-compatible (additive integration via standard `AccessControl` role grants per [ADR 016 §5](016-contract-interactions.md#5-access-control-matrix)) so future economic-layer products can land as additive top-level contracts without changing existing contracts.
 
 1. [ADR 026 — Gauge-Boost Tokenomics](026-gauge-boost-tokenomics.md) (canonical)
 2. [ADR 027 — Distinct-Client Delivery Receipts](027-distinct-client-receipts.md) (gauge security; launch prerequisite)
 3. [ADR 018 — Liquidity Strategy (Balancer 80/20 POL)](018-liquidity-strategy.md)
-4. [ADR 028 — Native sveTOKEN Liquid-ve Wrapper](028-sve-token-wrapper.md) (deferred)
-5. [ADR 029 — Adaptive FeeRouter Parameters](029-adaptive-fee-router.md) (deferred)
 
 ### Chapter 5 — Verification & enforcement
 
@@ -316,22 +314,6 @@ Canonical economic model: genesis allocation across six buckets (four vesting, t
 **Client-signed `DeliveryReceipt` Merkle-batched per epoch; gauge-pool eligibility gated on distinct-client diversity. Required for mainnet launch — without it, the gauge pool is gameable via wash-trading.**
 
 `DeliveryReceipt` is an EIP-712 message signed by the channel-funder's secp256k1 key, paired one-to-one with each voucher. Receipts are batched per operator per epoch into a Merkle tree; only the root + summary land on chain, with individual receipts surfacing only on challenge (watchtower-monitored, reputation-gated). Gauge-pool eligibility is gated on a distinct-client diversity threshold across recovered `clientPubKey` addresses. Vouchers without matching receipts remain fully USDC-redeemable — only gauge eligibility for the underlying bytes depends on the receipt. Forward-referenced from [ADR 026 §Risks](026-gauge-boost-tokenomics.md) as priority-1 and **not optional for production launch**.
-
----
-
-### [ADR 028 — Native sveTOKEN Liquid-ve Wrapper](028-sve-token-wrapper.md)
-
-**Frax `sfrxETH`-style native ERC-20 wrapper around a pooled `VotingEscrow` lock. Pre-empts Convex-style third-party capture. Deferred — ship within 6 months of mainnet.**
-
-`SveToken` is a DAO-operated ERC-20 wrapper holding exactly one pooled max-duration `VotingEscrow` lock, with appreciation funded by auto-compounded delegator-pool TOKEN yield ([ADR 026 §6](026-gauge-boost-tokenomics.md)) and no protocol-level redemption (holders exit via secondary market or hold-to-decay). Defends against the Convex/cvxCRV pattern where third-party wrappers capture 30–50% of underlying ve-supply and leak wrapper-economy revenue outside the issuing DAO. Deferred 6-month window matches the time for third-party capture to develop.
-
----
-
-### [ADR 029 — Adaptive FeeRouter Parameters](029-adaptive-fee-router.md)
-
-**Two automated feedback hooks (lock-rate and price-floor) within [ADR 026 §11](026-gauge-boost-tokenomics.md) safety bounds. Deferred — adopt after post-launch governance dynamics observable.**
-
-`AdaptiveFeeRouterController` evaluates at epoch rollover and shifts ±2pp between FeeRouter buckets based on a lock-rate read (`TOKEN.balanceOf(address(VotingEscrow)) / TOKEN.totalSupply()` — underlying TOKEN locked, not ve-supply, per ADR 029 §1 / observability appendix) and a Balancer V3 30-day TWAP price-floor read. Both hooks are clamped to [ADR 026 §11](026-gauge-boost-tokenomics.md) bounds, observable via events, and disable-able by governance. Deferred reflects a "merge the spec, do not deploy" stance — if post-launch governance rebalancing is fast enough, this ADR may close as Rejected.
 
 ---
 
