@@ -251,7 +251,10 @@ Introduced by [ADR 026](026-gauge-boost-tokenomics.md) §5. The 3% safety bucket
 ```rust
 pub trait SafetyReservePayout: Send + Sync {
     /// Submit an incident bundle for payout. PoC variant approves immediately;
-    /// production variant queues a governance proposal subject to all four gates.
+    /// production variant queues either a governance proposal or fast-track
+    /// emergency-multisig authorization (within the hard caps per ADR 009),
+    /// subject to all four gates (evidence bundle, authorization, 48h appeal,
+    /// post-incident reporting).
     fn submit_payout(&self, bundle: IncidentBundle) -> Result<PayoutHandle>;
     /// Status of a previously submitted bundle.
     fn payout_status(&self, handle: &PayoutHandle) -> Result<PayoutStatus>;

@@ -189,7 +189,7 @@ The exact pool seeding parameters (size, weights, fee tier) are **out of scope f
 
 ### Negative
 
-- **New contract surface.** `SveToken` proxy + implementation + vote-mirroring policy expands [ADR 026](026-gauge-boost-tokenomics.md) audit scope ~30–40%.
+- **New contract surface.** `SveToken` contract surface / ABI + vote-mirroring policy expands [ADR 026](026-gauge-boost-tokenomics.md) audit scope ~30–40%.
 - **Operational burden.** Compound keepers, discount tracking, mirror-policy execution.
 - **Discount UX.** Users may conflate `1 sveTOKEN` with `1 TOKEN`; dashboards must surface `convertToAssets` and the appreciation rate.
 - **Two competing ve-products** (direct ve-lockers vs. sveTOKEN holders). Differentiation is gauge-boost yield: only direct ve-lockers capture it. Documentation must not imply sveTOKEN replaces direct ve-locking for operators.
