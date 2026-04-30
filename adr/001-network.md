@@ -151,7 +151,7 @@ The strict rate limits (Section 11 of [ADR 008](008-reputation.md)) keep reputat
 
 #### RateChange (`cdn/global/v1`, event-driven)
 
-`RateChange` messages ([ADR 005](005-protocol.md#gossip-rate-change-announcements)) are published when a node changes its `rate_per_mb`. Unlike `NodeAnnounce`, these are event-driven — not periodic. Each message is ~200 bytes (32B node_id + 8B old_rate + 8B new_rate + 8B timestamp + 64B Ed25519 signature + 65B secp256k1 `slash_sig` + ~15B framing).
+`RateChange` messages ([ADR 005](005-protocol.md#gossip--rate-change-announcements)) are published when a node changes its `rate_per_mb`. Unlike `NodeAnnounce`, these are event-driven — not periodic. Each message is ~200 bytes (32B node_id + 8B old_rate + 8B new_rate + 8B timestamp + 64B Ed25519 signature + 65B secp256k1 `slash_sig` + ~15B framing).
 
 Worst-case assumption: every node changes rate once per hour (generous — operators typically change rates daily or weekly).
 

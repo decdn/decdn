@@ -162,7 +162,7 @@ When a node receives a new blacklisted hash, it must, **in order**:
 2. **Stop serving** — reject any new `StreamRequest` for the hash immediately, returning `HashBlacklisted`
 3. **Evict from cache** — delete the blob from local storage within the compliance window
 
-The announce-first ordering is critical: announcing content that is then not delivered triggers the phantom-blob detection path ([ADR 005 — `cdn/probe/v1`](005-protocol.md#cdnprobev1-latency-probe)). Eviction from disk can be async; announcement suppression must be synchronous.
+The announce-first ordering is critical: announcing content that is then not delivered triggers the phantom-blob detection path ([ADR 005 — `cdn/probe/v1`](005-protocol.md#cdnprobev1--latency-probe)). Eviction from disk can be async; announcement suppression must be synchronous.
 
 When a node receives a blacklisted origin address, it additionally stops accepting any `StreamRequest` that presents a channel funded by that operator address, and removes all of that origin's NodeIds from its local peer table.
 

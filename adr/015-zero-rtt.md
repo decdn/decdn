@@ -5,7 +5,7 @@
 
 ## Context
 
-Every QUIC connection begins with a TLS 1.3 handshake that costs one round trip (1-RTT) before application data can flow. In a CDN where probe fan-out is the critical latency path — a cache miss at PoC scale sends `ProbeRequest` to 30 peers, each requiring a separate QUIC connection when no connection to that peer already exists — this overhead is significant. At inter-continental RTTs (250-300ms), the handshake alone can consume half the probe collection window (`probe_max_wait` = 500ms, [ADR 001](001-network.md#content-discovery-dht-probe)).
+Every QUIC connection begins with a TLS 1.3 handshake that costs one round trip (1-RTT) before application data can flow. In a CDN where probe fan-out is the critical latency path — a cache miss at PoC scale sends `ProbeRequest` to 30 peers, each requiring a separate QUIC connection when no connection to that peer already exists — this overhead is significant. At inter-continental RTTs (250-300ms), the handshake alone can consume half the probe collection window (`probe_max_wait` = 500ms, [ADR 001](001-network.md#content-discovery-dht--probe)).
 
 TLS 1.3 defines a **0-RTT** mode: after a successful 1-RTT handshake, the server issues a session ticket. On the next connection to that server, the client sends early data (application bytes) alongside the TLS ClientHello, eliminating the round-trip wait. The trade-off is that 0-RTT data is **replayable** — a network adversary can capture and resend the early-data packet, causing the server to process the same request twice. This is acceptable for idempotent, read-only operations but dangerous for state-changing ones.
 
@@ -76,7 +76,7 @@ At PoC scale with 30 peers, a cache miss sends `ProbeRequest` to all known nodes
 | Warm (cached ticket, 0-RTT accepted) | 0 RTT | Probe sent with ClientHello |
 | Warm (cached ticket, 0-RTT rejected) | 1 RTT | Fallback to 1-RTT, re-send |
 
-After the first probe cycle, all 30 peer connections have cached tickets. Subsequent cache misses send probes with zero handshake delay. Combined with the adaptive early-exit mechanism ([ADR 001](001-network.md#content-discovery-dht-probe)), this reduces P50 cache-miss latency for reconnections by eliminating the handshake round trip — probes complete in one RTT (probe send + response) rather than two (handshake + probe), making `probe_min_wait` the dominant factor for nearby peers.
+After the first probe cycle, all 30 peer connections have cached tickets. Subsequent cache misses send probes with zero handshake delay. Combined with the adaptive early-exit mechanism ([ADR 001](001-network.md#content-discovery-dht--probe)), this reduces P50 cache-miss latency for reconnections by eliminating the handshake round trip — probes complete in one RTT (probe send + response) rather than two (handshake + probe), making `probe_min_wait` the dominant factor for nearby peers.
 
 ### Observability
 
@@ -104,7 +104,7 @@ The `probe_fanout_latency_seconds` histogram with the `0rtt` label enables opera
 
 - [iroh-experiments/content-discovery](https://github.com/n0-computer/iroh-experiments/tree/main/content-discovery) — demonstrates 0-RTT for tracker queries over iroh QUIC
 - [RFC 8446 Section 8](https://www.rfc-editor.org/rfc/rfc8446#section-8) — TLS 1.3 0-RTT and anti-replay
-- [ADR 001 — Probe Fan-Out](001-network.md#content-discovery-dht-probe)
+- [ADR 001 — Probe Fan-Out](001-network.md#content-discovery-dht--probe)
 - [ADR 005 — Connection Management](005-protocol.md#connection-management)
 - [ADR 006 — E2E Encryption and Key Distribution](006-e2e-encryption.md) — authentication sequencing that precludes `cdn/keys/v1` 0-RTT
 - [ADR 013 — Schema Evolution](013-schema-evolution.md) — `KeysMessage` enum framing

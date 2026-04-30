@@ -62,7 +62,7 @@ async fn write_frame(stream: &mut SendStream, payload: &[u8]) -> Result<()> {
 }
 ```
 
-These are low-level framing helpers. Application-layer deserialization is handled separately — the caller deserializes the protocol enum from the frame bytes using `take_from_bytes`, then optionally deserializes extensions from the remainder (see [Tier 1 — Minor](#tier-1-minor-no-coordination) and [Wire Layout](#wire-layout) for the full deserialization flow).
+These are low-level framing helpers. Application-layer deserialization is handled separately — the caller deserializes the protocol enum from the frame bytes using `take_from_bytes`, then optionally deserializes extensions from the remainder (see [Tier 1 — Minor](#tier-1--minor-no-coordination) and [Wire Layout](#wire-layout) for the full deserialization flow).
 
 **`ChunkData` exemption.** `ChunkData` payloads (1024-byte blob chunks in the delivery protocol) are already implicitly length-delimited by the QUIC stream's byte count and the voucher interval. However, they MUST still use varint-length framing for consistency — the receiver must be able to distinguish `ChunkData` from `Voucher` or `VoucherAck` messages on the same stream via the protocol enum discriminant. The 1–2 byte framing overhead on 1024-byte chunks is ~0.1%.
 
@@ -375,7 +375,7 @@ struct NodeAnnounceExt {
 }
 ```
 
-This pattern cleanly separates the frozen signed region from the evolvable unsigned region via two-phase deserialization (see [Tier 1](#tier-1-minor-no-coordination)). The same pattern applies to `ProbeResponse`, `StreamResponse`, and `ReputationReport`.
+This pattern cleanly separates the frozen signed region from the evolvable unsigned region via two-phase deserialization (see [Tier 1](#tier-1--minor-no-coordination)). The same pattern applies to `ProbeResponse`, `StreamResponse`, and `ReputationReport`.
 
 **Cross-ADR struct alignment.** The `Body` + extensions pattern and type definitions here are the canonical reference for implementation. Struct definitions in [ADR 001](001-network.md), [ADR 005](005-protocol.md), and [ADR 008](008-reputation.md) retain their existing flat-struct representations for readability; implementations MUST follow the body/extensions split defined here. The flat-struct definitions in those ADRs will be updated when implementation begins.
 
