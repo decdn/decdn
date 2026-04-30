@@ -20,9 +20,9 @@ The goal is a clean mechanical answer to: **how does the codebase express the di
 |-----------|-----|------------|--------|
 | Payment contract | `StablePaymentChannel` (USDC-only) | `PaymentChannel` (multi-token allowlist) | ADR 003, 010 |
 | Governance | Single admin key (`onlyOwner`) | OpenZeppelin Governor + 2-day Timelock | ADR 009 |
-| Challenge bond | 100 TOKEN | 50 TOKEN | ADR 004 |
+| Challenge bond | 100 TOKEN | 50 TOKEN | ADR 026 |
 | Corruption verification | Optimistic challenge-response (signed `StreamResponse`) | Interactive keccak256 Merkle proof over 1 KiB chunks | ADR 014 |
-| Buyback | Accumulate-only (`executeBuyback` never called) | Active execution via `BuybackBurner` after activation criteria met | ADR 004, 018 |
+| Buyback | Accumulate-only (`executeBuyback` never called) | Active execution via `BuybackBurner` after activation criteria met | ADR 018, 026 |
 | Key management (node) | File-based (`~/.decdn/node.key`) | Platform keychain + hardware wallet via delegated hot key | ADR 012 |
 | Key management (client) | File-based | Platform keychain; hardware wallet + derived hot key for voucher signing | ADR 012 |
 | Reputation engine | Simplified stand-in (local observations only, no gossip weighting) | Full gossip-weighted scoring (70% local / 30% gossip, decay, cold-start) | ADR 008 |
@@ -445,7 +445,6 @@ Rejected. Scatters the PoC/production boundary into every crate, making it hard 
 | ADR | Seam used | Notes |
 |-----|-----------|-------|
 | ADR 003 | `PaymentChannelClient` | `StablePaymentChannel` is PoC concrete impl |
-| ADR 004 | `GovernanceClient`, `NetworkConstants` | Challenge bond, dispute window, buyback |
 | ADR 007 | `WatchtowerClient` | `NoopWatchtowerClient` for PoC |
 | ADR 008 | `ReputationEngine` | `SimpleReputationEngine` for PoC |
 | ADR 009 | `GovernanceClient` | Admin key vs Governor |

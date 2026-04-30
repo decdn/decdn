@@ -5,14 +5,14 @@
 
 ## Context
 
-Four slashable offenses require on-chain evidence verification ([ADR 004](004-tokenomics.md#slash-amounts-escalating)):
+Four slashable offenses require on-chain evidence verification ([ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn)):
 
 1. **Corrupted delivery** — node serves bytes that fail BLAKE3 hash verification
 2. **Phantom announcement** — node signs `has_blob: true` then cannot deliver
 3. **Rate manipulation** — node advertises one rate in probe, charges higher in stream
 4. **Blacklist violation** — node serves a blacklisted hash after the compliance window ([ADR 011](011-content-takedown.md))
 
-A fifth offense, **double settlement** (submitting the same voucher to multiple channels), is defined in [ADR 004](004-tokenomics.md) as production-only and is not covered by on-chain verification in the PoC.
+A fifth offense, **double settlement** (submitting the same voucher to multiple channels), is production-only and is not covered by on-chain verification in the PoC.
 
 Three of these (phantom, rate, blacklist) require verifying cryptographic signatures from protocol messages. The fourth (corruption) requires adjudicating whether delivered bytes match the claimed BLAKE3 hash. Neither Ed25519 signature verification nor BLAKE3 mismatch adjudication is natively supported on EVM:
 
@@ -125,7 +125,7 @@ The challenger calls `SlashJudge.submitCorruptionChallenge()` with:
 - `blobHash` — the BLAKE3 hash of the content that was requested
 - `streamResponse` — the serialized `StreamResponse` fields (with `ok: true` for the challenged blob)
 - `slashSig` — the secp256k1 `slash_sig` from the `StreamResponse`
-- Challenge bond: 100 TOKEN ([ADR 004](004-tokenomics.md#challenge-bond))
+- Challenge bond: 100 TOKEN ([ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn))
 
 The contract verifies:
 
@@ -157,8 +157,8 @@ The receipt uses the `SlashJudge` EIP-712 domain (same domain separator as slash
 
 **Resolution:**
 
-- If the node does not counter within 24 hours: `resolveChallenge()` slashes the node per [ADR 004](004-tokenomics.md#slash-amounts-escalating) and returns the bond to the challenger.
-- If the node counters successfully: the challenge is dismissed, and the bond is forfeited (50% burned, 50% to the node per [ADR 004](004-tokenomics.md#challenge-bond)).
+- If the node does not counter within 24 hours: `resolveChallenge()` slashes the node per [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn) and returns the bond to the challenger.
+- If the node counters successfully: the challenge is dismissed, and the bond is forfeited (50% burned, 50% to the node per [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn)).
 
 **Why single-round for PoC:** The 100 TOKEN bond makes frivolous challenges expensive (100 TOKEN PoC testnet bond >> the cost of a legitimate slash). A node that actually served corrupt data has no valid counter-evidence to produce. The simplicity of a single-round model reduces contract complexity and audit surface for the PoC.
 
@@ -275,7 +275,7 @@ The challenged node may call `counterChallenge(challengeId, evidence)` within 24
 
 If all six conditions pass, the challenge is dismissed and the challenger's bond is forfeited (50% burned, 50% to node). If the 24-hour window expires without valid counter-evidence, the slash executes via `StakingRegistry.slash()`.
 
-See [ADR 005, Gossip — rate change announcements](005-protocol.md#gossip-rate-change-announcements) for the `RateChange` gossip message that produces this counter-evidence.
+See [ADR 005, Gossip — rate change announcements](005-protocol.md#gossip--rate-change-announcements) for the `RateChange` gossip message that produces this counter-evidence.
 
 **Blacklist violation:**
 
@@ -300,7 +300,7 @@ See [ADR 005, Gossip — rate change announcements](005-protocol.md#gossip-rate-
 
 - Challengers must `TOKEN.approve(slashJudge, bondAmount)` before calling any `submit*Challenge()` function. The contract transfers the bond on submission.
 - **Successful challenge:** bond returned to challenger; node slashed via `StakingRegistry.slash()`.
-- **Successful counter:** bond forfeited — 50% burned, 50% transferred to the challenged node ([ADR 004](004-tokenomics.md#challenge-bond)).
+- **Successful counter:** bond forfeited — 50% burned, 50% transferred to the challenged node ([ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn)).
 - **Immediate offenses** (phantom, blacklist): if on-chain verification passes, the slash executes immediately (no counter-evidence window). The node's recourse is to not commit the offense.
 - **Deferred offenses** (corruption, rate manipulation): 24-hour counter-evidence window before resolution. For rate manipulation, the node may submit a signed `RateChange` message proving a legitimate rate change between the two timestamps (see [Rate manipulation counter-evidence](#rate-manipulation-counter-evidence)). For corruption, the node may submit a valid delivery receipt.
 
@@ -316,13 +316,13 @@ See [ADR 005, Gossip — rate change announcements](005-protocol.md#gossip-rate-
 | `counterChallenge` (corruption) | ~40k | Evidence verification + storage update |
 | `resolveChallenge` | ~80k | `StakingRegistry.slash()` + bond transfer + state cleanup |
 
-These estimates replace the `submitFraudProof()` placeholder (~250k gas) in [ADR 004](004-tokenomics.md#gas-cost-breakdown). The dual-key approach reduces per-signature verification from ~500k (Ed25519 library) to ~3k (`ecrecover`), making routine slashing economically viable.
+The dual-key approach reduces per-signature verification from ~500k (Ed25519 library) to ~3k (`ecrecover`), making routine slashing economically viable.
 
 ### 4. Integration with Existing Contracts
 
-**StakingRegistry ([ADR 001](001-network.md), [ADR 003](003-payments.md), [ADR 004](004-tokenomics.md)):**
+**StakingRegistry ([ADR 001](001-network.md), [ADR 003](003-payments.md), [ADR 026 §7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake)):**
 
-- Adds `slash(address node, uint8 offenseType) external` callable only by the `SlashJudge` contract address. Implements the escalating schedule from [ADR 004](004-tokenomics.md#slash-amounts-escalating) (10% flat for PoC; 5/15/50% with lifetime counter for production). Checks auto-ejection threshold (50% of `minStake`).
+- Adds `slash(address node, uint8 offenseType) external` callable only by the `SlashJudge` contract address. Implements the escalating schedule from [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn) (10% flat for PoC; 5/15/50% with lifetime counter for production). Checks auto-ejection threshold (50% of `minStake`).
 - No new fields in `NodeInfo` for PoC — the existing `msg.sender` Ethereum address serves as the slash key.
 
 **StablePaymentChannel ([ADR 003](003-payments.md)):**
@@ -358,5 +358,4 @@ These estimates replace the `submitFraudProof()` placeholder (~250k gas) in [ADR
 - **[ADR 003](003-payments.md):** Options A/B/C for corruption evidence → resolved as Option A (optimistic challenge-response).
 - **[ADR 005](005-protocol.md):** Signer binding section updated to reference dual signatures; `slash_sig` field added to `ProbeResponse` and `StreamResponse`.
 - **[ADR 011](011-content-takedown.md):** Ed25519-library assumption for slash evidence → updated to dual-key `ecrecover` scheme (this ADR).
-- **[ADR 004](004-tokenomics.md):** `submitFraudProof()` gas estimate → replaced by per-offense `SlashJudge` estimates.
 - **[ADR 027](027-distinct-client-receipts.md):** Extends the keccak256 Merkle-batch pattern from §2 to anchor `DeliveryReceipt` batches per operator per epoch; reuses the `Bond Handling` model for receipt-fraud challenges.

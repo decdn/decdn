@@ -151,7 +151,7 @@ The strict rate limits (Section 11 of [ADR 008](008-reputation.md)) keep reputat
 
 #### RateChange (`cdn/global/v1`, event-driven)
 
-`RateChange` messages ([ADR 005](005-protocol.md#gossip-rate-change-announcements)) are published when a node changes its `rate_per_mb`. Unlike `NodeAnnounce`, these are event-driven — not periodic. Each message is ~200 bytes (32B node_id + 8B old_rate + 8B new_rate + 8B timestamp + 64B Ed25519 signature + 65B secp256k1 `slash_sig` + ~15B framing).
+`RateChange` messages ([ADR 005](005-protocol.md#gossip--rate-change-announcements)) are published when a node changes its `rate_per_mb`. Unlike `NodeAnnounce`, these are event-driven — not periodic. Each message is ~200 bytes (32B node_id + 8B old_rate + 8B new_rate + 8B timestamp + 64B Ed25519 signature + 65B secp256k1 `slash_sig` + ~15B framing).
 
 Worst-case assumption: every node changes rate once per hour (generous — operators typically change rates daily or weekly).
 
@@ -277,7 +277,7 @@ The three strategies considered here are resolved in [ADR 022](022-content-disco
 
 ## Contract Interface: Node Registry
 
-The node registry is part of the `StakingRegistry` contract — not a separate contract. Staking is a prerequisite for registration ([ADR 004](004-tokenomics.md)), so co-locating them avoids cross-contract calls and simplifies the atomic stake-then-register flow.
+The node registry is part of the `StakingRegistry` contract — not a separate contract. Staking is a prerequisite for registration ([ADR 026 §7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake)), so co-locating them avoids cross-contract calls and simplifies the atomic stake-then-register flow.
 
 ### Data Structure
 
@@ -354,10 +354,10 @@ event NodeIdReclaimed(bytes32 indexed nodeId, address indexed previousOwner);
 
 ### Constraints
 
-- **One-to-one mapping.** Each `nodeId` maps to exactly one `ethAddress` and vice versa. Enforced with `require(nodeByAddress[msg.sender].nodeId == bytes32(0))` and `require(nodes[nodeId].ethAddress == address(0))`, where `bytes32(0)` is the sentinel for "unregistered". This aligns with [ADR 004](004-tokenomics.md): "Max stake registrations per node: 1."
+- **One-to-one mapping.** Each `nodeId` maps to exactly one `ethAddress` and vice versa. Enforced with `require(nodeByAddress[msg.sender].nodeId == bytes32(0))` and `require(nodes[nodeId].ethAddress == address(0))`, where `bytes32(0)` is the sentinel for "unregistered". This enforces a one-stake-position-per-node invariant.
 - **`registerNode` rejects `nodeId == bytes32(0)`**, since this value is reserved as the unregistered sentinel. It binds `msg.sender` to `nodeId` — the caller's Ethereum address becomes `ethAddress`. This binding is on-chain and permanent until deregistration, distinct from the ephemeral per-session `NodeId`-to-address binding described in ADR 003 for clients. The function performs two signature verifications: (1) the `bindingSignature` parameter is an EIP-712 signature over `BindNodeId(nodeId, bindingNonce[msg.sender])` (see [ADR 003](003-payments.md)); `registerNode` verifies this against the caller's current `bindingNonce`, then atomically writes the `nodeIdToAddress`/`addressToNodeId` mappings and increments `bindingNonce[msg.sender]`. (2) The `ed25519Signature` parameter proves ownership of the NodeId's ed25519 private key — see [NodeId Ownership Verification](#nodeid-ownership-verification) below. This shares the per-address `bindingNonce` counter with `bindNodeId`, ensuring replay protection across both registration and rebinding. Every registered node is immediately slashable — there is no window in which a node can be active in the mesh without a verifiable binding. The separate `StakingRegistry.bindNodeId()` function in [ADR 003](003-payments.md) remains available for rebinding (key rotation) after initial registration.
 - **`deregisterNode` triggers unbonding.** Sets `active = false`, starts the current unbonding period (default 7 days, minimum 3 days per [ADR 009](009-governance.md)), and increments `registrationNonce[nodeId]` to invalidate any previously issued ed25519 registration signatures for this NodeId. Stake remains slashable during unbonding to prevent slash-then-run.
-- **Auto-ejection.** When slashing drops a node's stake below 50% of the minimum stake requirement ([ADR 004](004-tokenomics.md)), the contract sets `active = false` and emits `NodeAutoEjected`. The node must re-stake at full minimum to rejoin.
+- **Auto-ejection.** When slashing drops a node's stake below 50% of the minimum stake requirement ([ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn)), the contract sets `active = false` and emits `NodeAutoEjected`. The node must re-stake at full minimum to rejoin.
 - **`firstRegisteredAt` is write-once.** `registerNode` sets `firstRegisteredAt = block.timestamp` only if the stored value is 0 (first-ever registration for this address). On re-registration after deregistration or auto-ejection, `firstRegisteredAt` retains its original value. This field is never cleared by `deregisterNode` or auto-ejection. Used by clients to determine cold-start bootstrap eligibility ([ADR 008](008-reputation.md#10-cold-start-bootstrap)).
 
 ### Multiaddr Update Policy

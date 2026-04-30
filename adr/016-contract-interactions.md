@@ -5,7 +5,7 @@
 
 ## Context
 
-The deCDN deploys multiple interacting smart contracts with cross-contract calls, role-based access control, and funds custody. Individual contracts are specified across [ADR 003](003-payments.md), [ADR 004](004-tokenomics.md) (superseded by [ADR 026](026-gauge-boost-tokenomics.md)), [ADR 007](007-watchtower.md), [ADR 009](009-governance.md), [ADR 010](010-multi-token.md), [ADR 011](011-content-takedown.md), [ADR 014](014-on-chain-verification.md), and [ADR 026](026-gauge-boost-tokenomics.md). However, no single document maps the full interaction surface: who calls whom, which contracts hold funds, who is authorized to do what, and where reentrancy risks exist.
+The deCDN deploys multiple interacting smart contracts with cross-contract calls, role-based access control, and funds custody. Individual contracts are specified across [ADR 003](003-payments.md), [ADR 007](007-watchtower.md), [ADR 009](009-governance.md), [ADR 010](010-multi-token.md), [ADR 011](011-content-takedown.md), [ADR 014](014-on-chain-verification.md), and [ADR 026](026-gauge-boost-tokenomics.md). However, no single document maps the full interaction surface: who calls whom, which contracts hold funds, who is authorized to do what, and where reentrancy risks exist.
 
 This ADR consolidates that analysis into a single reference for security audits and implementation. It does not introduce new functionality — it systematizes what other ADRs already specify.
 
@@ -19,14 +19,14 @@ All on-chain contracts inherit from [OpenZeppelin Contracts](https://docs.openze
 
 | Contract | ADR | Holds Funds | Token Types | OZ Base Contracts | Phase |
 | --- | --- | --- | --- | --- | --- |
-| TOKEN (ERC-20) | [004](004-tokenomics.md), [026](026-gauge-boost-tokenomics.md) | No (fungible token) | — | `ERC20`, `ERC20Permit` (recommended; enables gasless approvals) | PoC + Production |
-| StakingRegistry | [003](003-payments.md), [004](004-tokenomics.md), [026](026-gauge-boost-tokenomics.md) | Yes | TOKEN | `AccessControl`, `ReentrancyGuard`, `Pausable` | PoC + Production |
+| TOKEN (ERC-20) | [026](026-gauge-boost-tokenomics.md) | No (fungible token) | — | `ERC20`, `ERC20Permit` (recommended; enables gasless approvals) | PoC + Production |
+| StakingRegistry | [003](003-payments.md), [026](026-gauge-boost-tokenomics.md) | Yes | TOKEN | `AccessControl`, `ReentrancyGuard`, `Pausable` | PoC + Production |
 | StablePaymentChannel | [003](003-payments.md) | Yes | USDC | `Ownable`, `ReentrancyGuard`, `Pausable`, `EIP712` | PoC only |
 | PaymentChannel | [010](010-multi-token.md), [026](026-gauge-boost-tokenomics.md) | Yes | Governance-approved ERC-20s | `AccessControl`, `ReentrancyGuard`, `Pausable`, `EIP712` | Production only |
-| FeeRouter | [026](026-gauge-boost-tokenomics.md) | Yes | USDC (transient + epoch buckets), TOKEN (delegator-pool epoch buckets) | `AccessControl`, `ReentrancyGuard`, `Pausable` | Production (production) |
-| VotingEscrow | [026](026-gauge-boost-tokenomics.md) | Yes | TOKEN (locked, non-transferable) | `ReentrancyGuard`, `Pausable` | Production (production) |
-| SafetyReserve | [026](026-gauge-boost-tokenomics.md) | Yes | USDC (3% bucket + slashing redirect) | `AccessControl`, `ReentrancyGuard`, `Pausable` | Production (production) |
-| BuybackBurner | [004](004-tokenomics.md), [018](018-liquidity-strategy.md), [026](026-gauge-boost-tokenomics.md) | Yes | USDC, TOKEN (transient) | `AccessControl`, `ReentrancyGuard`, `Pausable` | PoC (accumulate-only) + Production |
+| FeeRouter | [026](026-gauge-boost-tokenomics.md) | Yes | USDC (transient + epoch buckets), TOKEN (delegator-pool epoch buckets) | `AccessControl`, `ReentrancyGuard`, `Pausable` | Production only |
+| VotingEscrow | [026](026-gauge-boost-tokenomics.md) | Yes | TOKEN (locked, non-transferable) | `ReentrancyGuard`, `Pausable` | Production only |
+| SafetyReserve | [026](026-gauge-boost-tokenomics.md) | Yes | USDC (3% bucket + slashing redirect) | `AccessControl`, `ReentrancyGuard`, `Pausable` | Production only |
+| BuybackBurner | [018](018-liquidity-strategy.md), [026](026-gauge-boost-tokenomics.md) | Yes | USDC, TOKEN (transient) | `AccessControl`, `ReentrancyGuard`, `Pausable` | PoC (accumulate-only) + Production |
 | ContentBlacklist | [011](011-content-takedown.md) | No | — | `AccessControl`, `ReentrancyGuard` | PoC + Production |
 | SlashJudge | [014](014-on-chain-verification.md) | Yes | TOKEN (challenge bonds) | `AccessControl`, `ReentrancyGuard`, `Pausable`, `EIP712` | PoC + Production |
 | WatchtowerEscrow | [007](007-watchtower.md) | Yes | USDC | `ReentrancyGuard`, `Pausable`, `EIP712` | Production only |
@@ -138,9 +138,9 @@ graph TD
 
 | Step | Contract | Constructor Requires |
 | --- | --- | --- |
-| 1 | TOKEN | None. **PoC:** freely mintable testnet token with `onlyOwner` mint ([ADR 004](004-tokenomics.md)). **Production:** fixed 1B supply, no mint function ([ADR 026](026-gauge-boost-tokenomics.md) §1). |
+| 1 | TOKEN | None. **PoC:** freely mintable testnet token with `onlyOwner` mint. **Production:** fixed 1B supply, no mint function ([ADR 026](026-gauge-boost-tokenomics.md) §1). |
 | 2 | USDC | External (testnet faucet or mainnet address) |
-| 3 | StakingRegistry | TOKEN address, `minStake` (PoC 1,000 TOKEN; **production: 50,000 TOKEN** per [ADR 026](026-gauge-boost-tokenomics.md) §7), `unbondingPeriod` (7 days). **Production:** discount-threshold parameters removed; the discounted-fee mechanic is replaced by the gauge-boost flow in `FeeRouter`. |
+| 3 | StakingRegistry | TOKEN address, `minStake` (**50,000 TOKEN** per [ADR 026](026-gauge-boost-tokenomics.md) §7), `unbondingPeriod` (7 days). No discount-threshold parameters; operator return is differentiated through the gauge-boost flow in `FeeRouter`. |
 | 4 | VotingEscrow (production) | TOKEN address, `minLockDuration` (1 week), `maxLockDuration` (4 years). No `create_lock_for` privileged path; auto-ve-lock not exposed. Implements `balanceOfAt(user, ts)` and `totalSupplyAt(ts)` historical checkpointing ([ADR 026](026-gauge-boost-tokenomics.md) §4). |
 | 5 | SafetyReserve (production) | USDC address, Governor address (payout authorizer), emergency-multisig address (fast-track approver under hard caps), `appealWindow` (48h) ([ADR 026](026-gauge-boost-tokenomics.md) §5). |
 | 6 | BuybackBurner | TOKEN address, USDC address, Balancer V3 Router address, initial pool contract `address` (may be zero-address at deploy and set later via `setPool(address)` — see [ADR 003](003-payments.md#buybackburner) for the interface and [ADR 018](018-liquidity-strategy.md) for the venue rationale). The pool address remains governance-mutable post-deploy via `setPool(address)`; the constructor value is an initial convenience, not a hard requirement. **Production inflow source:** `FeeRouter` rather than manual treasury transfer ([ADR 026](026-gauge-boost-tokenomics.md) §8); the contract surface is otherwise unchanged. **Router address and naming:** see [ADR 018 §"Buyback execution via Balancer V3"](018-liquidity-strategy.md#buyback-execution-via-balancer-v3) for the canonical Balancer V3 Router address and the `Router v2` label disambiguation. **Approvals note:** `BuybackBurner` MUST self-approve the Balancer V3 **Vault** address (distinct from the Router) during initialization — the Vault pulls input tokens from `msg.sender`, which is `BuybackBurner`. The V3 footgun reference and Vault address live in [ADR 018](018-liquidity-strategy.md#buyback-execution-via-balancer-v3). |
@@ -314,7 +314,7 @@ Cold-start operators (`lastSettlementAt == 0`) sink to the bottom by recency but
 
 #### USDC Flow (Payments)
 
-The PoC flow (`StablePaymentChannel` + manual treasury → buyback) is documented in [ADR 003](003-payments.md) and [ADR 004](004-tokenomics.md). The production flow:
+The PoC flow (`StablePaymentChannel` + manual treasury → buyback) is documented in [ADR 003](003-payments.md). The production flow:
 
 ```mermaid
 flowchart TD
@@ -379,7 +379,7 @@ flowchart TD
 
 **Slashing distribution by phase:**
 
-| Destination | PoC ([ADR 004](004-tokenomics.md)) | production ([ADR 026](026-gauge-boost-tokenomics.md) §8) |
+| Destination | PoC | Production ([ADR 026](026-gauge-boost-tokenomics.md) §8) |
 | --- | ---: | ---: |
 | Challenger reward | 50% | 50% |
 | SafetyReserve | 0% | 30% |
@@ -492,7 +492,7 @@ Every state-mutating function that makes an external call is listed below with i
 
 > **MEV protection (production).** See [ADR 018 — Buyback execution via Balancer V3](018-liquidity-strategy.md#buyback-execution-via-balancer-v3) for the authoritative policy. In summary: Balancer's weighted-pool curve reduces (but does not eliminate) price-impact concerns compared to concentrated liquidity, and `executeBuyback` MAY split large buybacks into `subSwapCount` sub-swaps spaced by `subSwapMinBlockGap` blocks. **Direct Router execution with TWAP + `minTokenOut` guards is the primary production path and the required fallback.** Routing through CoW Swap is a conditional add-on that requires operator verification of CoW solver routing against the deployed Balancer V3 pool (per ADR 018's activation criteria); if CoW routing is unavailable or regresses, direct Router + TWAP remains correct. The `maxBuybackAmount` parameter MUST be enforced to limit per-transaction MEV exposure regardless of venue.
 
-> **Production inflow source.** Under [ADR 026](026-gauge-boost-tokenomics.md) §8, `BuybackBurner` no longer receives USDC via manual treasury transfer — it receives 5% of every settlement same-tx from `FeeRouter`. Inflow rate is ~8× higher per unit network revenue (5% of 100% vs ADR 004's 20% × 3% = 0.6% effective). The `executeBuyback` mechanics, `KEEPER_ROLE`-gating, and Vault-scoped self-approval pattern are unchanged.
+> **Production inflow source.** Under [ADR 026](026-gauge-boost-tokenomics.md) §8, `BuybackBurner` receives 5% of every settlement same-tx from `FeeRouter`. The `executeBuyback` mechanics, `KEEPER_ROLE`-gating, and Vault-scoped self-approval pattern are unchanged.
 
 #### FeeRouter (production)
 
@@ -563,7 +563,7 @@ Every deCDN contract should inherit from audited OpenZeppelin base contracts rat
 | `SignatureChecker` | StablePaymentChannel, PaymentChannel, StakingRegistry, SlashJudge, SafetyReserve | Unified EOA + ERC-1271 smart account signature verification ([ADR 024](024-account-abstraction.md)) |
 | `ERC20` + `ERC20Permit` | TOKEN | Standard fungible token with gasless approvals |
 | `Governor` | Production governance | Token-weighted voting (production: voting weight sourced from `VotingEscrow.balanceOfAt` rather than `TOKEN.getPastVotes`) |
-| `GovernorVotes` | Production governance | **PoC/ADR 004:** TOKEN as voting token. **Production:** replaced by a `VotingEscrow`-backed vote source per [ADR 026](026-gauge-boost-tokenomics.md) §9 |
+| `GovernorVotes` | Production governance | **PoC:** TOKEN as voting token. **Production:** `VotingEscrow`-backed vote source per [ADR 026](026-gauge-boost-tokenomics.md) §9 |
 | `GovernorTimelockControl` | Production governance | 2-day timelock on parameter changes |
 | `TimelockController` | Production governance | Queued execution of governance proposals; custodian of the protocol-treasury 5% bucket |
 
@@ -601,14 +601,13 @@ Every deCDN contract should inherit from audited OpenZeppelin base contracts rat
 
 **Negative:**
 
-- Must be kept in sync as other ADRs evolve — any change to contract interfaces in ADRs 003, 004, 007, 009, 010, 011, 014, or 026 requires updating this document
+- Must be kept in sync as other ADRs evolve — any change to contract interfaces in ADRs 003, 007, 009, 010, 011, 014, or 026 requires updating this document
 - Does not cover off-chain interaction patterns (voucher exchange, gossip, probing) — those remain in their respective ADRs
-- The new surface adds three new fund-holding contracts (`FeeRouter`, `VotingEscrow`, `SafetyReserve`) plus optional `DelegatorBuyer`, materially expanding audit scope vs the ADR 004 baseline
+- The contract surface includes three fund-holding contracts (`FeeRouter`, `VotingEscrow`, `SafetyReserve`) plus optional `DelegatorBuyer`, materially expanding audit scope
 
 ## References
 
 - [ADR 003 — Payment Model](003-payments.md): StablePaymentChannel specification, production `PaymentChannel.settleChannel` → `FeeRouter` routing
-- [ADR 004 — Dual-Currency Token Model](004-tokenomics.md) (superseded by ADR 026): StakingRegistry, BuybackBurner, slashing schedule
 - [ADR 007 — Watchtower Design](007-watchtower.md): WatchtowerEscrow
 - [ADR 009 — Governance Model](009-governance.md): Safety bounds, Governor, emergency multisig
 - [ADR 010 — Multi-Token Payment Support](010-multi-token.md): PaymentChannel, token allowlist

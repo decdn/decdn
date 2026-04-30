@@ -368,9 +368,3 @@ set covering at minimum:
 
 These follow-ups are out of scope for this ADR; the decision recorded here is the
 product shape and the launch-time prerequisite set.
-
----
-
-## ADRs to update on acceptance
-
-Deferred — no launch-time ADRs change. At adoption, deltas land in [003](003-payments.md) (per-contract voucher metadata), [018](018-liquidity-strategy.md) (per-epoch liquidity caps cover futures-driven swap pressure if secondary market shares the pool), [026](026-gauge-boost-tokenomics.md) (§5 SafetyReserve cross-ref resolves), [030](030-preseed-usdc-deployment.md) (§2e contract-template forward-ref resolves).

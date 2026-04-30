@@ -222,9 +222,3 @@ This is consistent with [ADR 026 §Forward references](026-gauge-boost-tokenomic
 - **Non-receipt-aware client wallets.** Clients without receipt-aware wallets produce voucher-only deliveries that are settled and paid normally, but their bytes do not credit gauge eligibility. Operators receiving such traffic carry the cost of pure-base economics for it. Acceptable — receipt-aware client libraries ship in the launch SDK; non-receipt-aware traffic is an asymptote that shrinks as the SDK propagates.
 
 ---
-
-## ADRs to update on acceptance
-
-Cross-cutting deltas live in each touched ADR. Touched: [003](003-payments.md), [007](007-watchtower.md), [008](008-reputation.md), [014](014-on-chain-verification.md), [017](017-privacy.md), [026](026-gauge-boost-tokenomics.md).
-
----

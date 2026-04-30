@@ -5,7 +5,7 @@
 
 ## Context
 
-[ADR 004](004-tokenomics.md) defined the original dual-currency token model. [ADR 026](026-gauge-boost-tokenomics.md) supersedes ADR 004 in full and introduces three tokenomics primitives that this ADR depends on: a `VotingEscrow` contract (vote-escrowed TOKEN with linear decay), a six-bucket `FeeRouter` whose share parameters are governable within hard-coded bounds, and a `SafetyReserve` contract whose payouts are gated by governance-authorized rules. These are the economic primitives the production governance model assumes.
+[ADR 026](026-gauge-boost-tokenomics.md) introduces three tokenomics primitives that this ADR depends on: a `VotingEscrow` contract (vote-escrowed TOKEN with linear decay), a six-bucket `FeeRouter` whose share parameters are governable within hard-coded bounds, and a `SafetyReserve` contract whose payouts are gated by governance-authorized rules. These are the economic primitives the production governance model assumes.
 
 Governance — how protocol parameters are changed, who can change them, and what safety mechanisms exist — is a separate concern. During the PoC, governance is a single admin key. Production governance (ve-weighted voting, emergency multisig, parameter safety bounds, and SafetyReserve payout authorization) is complex enough to warrant its own ADR and will be implemented post-PoC.
 
@@ -29,7 +29,7 @@ Based on OpenZeppelin Governor, sourcing voting weight from `VotingEscrow` (per 
 
 | Parameter | Value |
 | --- | --- |
-| Voting source | `VotingEscrow.balanceOfAt(user, ts)` (was `TOKEN.getPastVotes()` in ADR 004) |
+| Voting source | `VotingEscrow.balanceOfAt(user, ts)` |
 | Voting weight | ve-balance — equals `amount × remaining_lock_time / 4y`, decaying linearly to zero at lock expiry |
 | Proposal threshold | 0.1% of total ve-supply at proposal snapshot |
 | Voting period | 7 days |
@@ -43,7 +43,7 @@ Traders, passive holders, and any TOKEN that has not been locked into `VotingEsc
 
 **Delegation.** ve-balance is delegatable using the Governor Bravo `delegate(address)` pattern: the underlying ve-position remains non-transferable (per [ADR 026](026-gauge-boost-tokenomics.md) §4) but its voting weight may be assigned to another address for the purpose of casting votes. The delegate's vote weight at proposal snapshot equals the sum of `VotingEscrow.balanceOfAt(delegator, ts)` over all delegators that have delegated to them, plus the delegate's own ve-balance if not delegated elsewhere. Delegation is revocable at any time and takes effect at the next snapshot.
 
-**Bootstrap consideration.** [ADR 026](026-gauge-boost-tokenomics.md) drops the auto-ve-lock-on-vest pattern from earlier v2 interim designs: vesting contracts release TOKEN unlocked, and locking into `VotingEscrow` is opt-in. Consequently the early ve-supply is concentrated in self-locked seed/team/treasury positions plus POL/airdrop recipients who choose to lock, and is materially smaller than under the auto-lock pattern. Quorum measured against `totalSupplyAt` is robust to this — a small ve-supply means a small absolute quorum bar — but the population of distinct lockers may be too thin to resist concentration. **Recommendation:** the protocol treasury should fund a ve-lock-on-claim airdrop (sourced from the community / ecosystem allocation or pre-seed) during the first 6–12 months post-launch, structured so participants receive TOKEN only by locking it in `VotingEscrow`. Sizing is open and tracked in the [ADR 026](026-gauge-boost-tokenomics.md) source design spec's open-question list.
+**Bootstrap consideration.** Under [ADR 026](026-gauge-boost-tokenomics.md), vesting contracts release TOKEN unlocked and locking into `VotingEscrow` is opt-in (no auto-ve-lock-on-vest). Consequently the early ve-supply is concentrated in self-locked seed/team/treasury positions plus POL/airdrop recipients who choose to lock, and is materially smaller than it would be under an auto-lock model. Quorum measured against `totalSupplyAt` is robust to this — a small ve-supply means a small absolute quorum bar — but the population of distinct lockers may be too thin to resist concentration. **Recommendation:** the protocol treasury should fund a ve-lock-on-claim airdrop (sourced from the community / ecosystem allocation or pre-seed) during the first 6–12 months post-launch, structured so participants receive TOKEN only by locking it in `VotingEscrow`. Sizing is open and tracked in the [ADR 026](026-gauge-boost-tokenomics.md) source design spec's open-question list.
 
 ### Governable Parameters with Safety Bounds
 
@@ -90,7 +90,7 @@ The 20% floor on the node-base share guarantees operators always receive enough 
 | Max active challenges per node | SlashJudge | 1 | 50 |
 | Max evidence age | SlashJudge | 1 day | 30 days |
 
-[ADR 026](026-gauge-boost-tokenomics.md) replaces ADR 004's settlement-time fee skim and discount-stake mechanic; consequently the ADR 004-era "Protocol fee %", "Discounted fee %", and "Burn percentage of fees" rows are removed. Burn is now a fixed share of the `FeeRouter` split (governable within the burn-share bound above), not a percentage of an upstream fee skim.
+There is no settlement-time fee skim or discount-stake mechanic on the channel contract — accordingly there are no "Protocol fee %" / "Discounted fee %" / "Burn percentage of fees" parameters. Burn is a fixed share of the [ADR 026](026-gauge-boost-tokenomics.md) `FeeRouter` split (governable within the burn-share bound above).
 
 The 7-day voting period balances responsiveness with participation. Combined with the 48-hour timelock, the total governance delay is 9 days minimum — longer than the standard OpenZeppelin Governor defaults, reflecting ve-weighted participation cadence.
 

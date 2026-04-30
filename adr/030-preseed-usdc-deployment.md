@@ -350,7 +350,7 @@ commitments (active loans, leases, regional grants) continue to term regardless.
 
 ### TOKEN-denominated node-bootstrap fund
 
-A protocol-issued multi-hundred-million-TOKEN bootstrap fund (the original [ADR 004](004-tokenomics.md) shape: 200M TOKEN allocated for operator subsidies) was considered.
+A protocol-issued multi-hundred-million-TOKEN bootstrap fund (200M TOKEN allocated for operator subsidies) was considered.
 
 Rejected because:
 
@@ -359,9 +359,3 @@ Rejected because:
 - **TOKEN-price-independent program structure.** USDC-denominated programs (POOs, hardware-leasing, staking loans, regional grants, Enterprise SLA fund) can be sized against dollar-denominated regional infrastructure costs; the same programs in TOKEN need a separate mental model that depends on TOKEN price at every disbursement.
 
 The chosen design routes externally-raised USDC into outcome-targeted programs and reserves the protocol-treasury TOKEN bucket ([ADR 026 §1](026-gauge-boost-tokenomics.md#1-supply-and-distribution)) for governance-driven uses.
-
----
-
-## ADRs to update on acceptance
-
-Cross-cutting deltas live in each touched ADR. Touched: [008](008-reputation.md) (program-eligibility consumer of `final_score`), [016](016-contract-interactions.md) (program-accounting contract for §4 reporting), [019](019-node-onboarding.md) (back-reference to this ADR), [026](026-gauge-boost-tokenomics.md) (§10 resolved; §5 gains §2e pairing as second-priority funding source).
