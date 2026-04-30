@@ -254,7 +254,7 @@ interface ISlashJudge {
 4. Verify `streamResponse.rate_per_mb > probeResponse.rate_per_mb`
 5. Verify `probeResponse.hash == streamResponse.hash` (same blob)
 6–8. Same timestamp and registration checks as phantom
-9. Slash immediately via `StakingRegistry.slash()` — no counter-evidence window. Two signed messages from the same NodeId disagreeing about that node's own rate within 30 seconds are non-repudiable; the node's last probe-quoted rate is binding for the slashing window. Legitimate rate changes are handled by waiting out the 30-second window before serving a stream at the new rate (see [ADR 005 §Connection Management](005-protocol.md#connection-management)).
+9. Slash immediately via `StakingRegistry.slash()` — no counter-evidence window. Two signed messages from the same NodeId disagreeing about that node's own rate within 30 seconds are non-repudiable; the node's last probe-quoted rate is binding for the slashing window. Legitimate rate changes are handled by waiting out the 30-second window before serving a stream at the new rate.
 
 **Blacklist violation:**
 
