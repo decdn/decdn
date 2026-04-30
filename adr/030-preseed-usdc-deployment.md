@@ -163,9 +163,15 @@ recruitment.
 - `StakingRegistry.setPayoutDestination(address operator, address recoveryAccount, uint256 expiresAt)` — gated by a new `LOAN_GRANTOR_ROLE` held by this program's contract; sets a per-operator redirect destination with an explicit expiry timestamp. Set on loan disbursement.
 - `StakingRegistry.clearPayoutDestination(address operator)` — same role; called on loan repayment, and also (no-op) callable by anyone after `expiresAt` to clean up stale entries.
 - `StakingRegistry.payoutDestinationOf(address operator) view returns (address dest, uint256 expiresAt)` — public view.
-- `FeeRouter.routeSettlement` reads `payoutDestinationOf(operator)` once per call. If `dest != address(0) && block.timestamp < expiresAt`, the 40% base share routes to `dest` instead of `operator`. The same redirection applies to gauge-pool claims (`claimBoost` consults the destination at claim time) so the recovery account can pull both legs through the standard claim flow.
+- `StakingRegistry.payoutDestinationAt(address operator, uint64 epochId) view returns (address dest)` — historical view, returns the destination that was active at the boundary timestamp of `epochId`. Implementation: per-operator destination history is appended on each `setPayoutDestination` / `clearPayoutDestination` call, with `(epochId, dest)` records; reads do an O(log n) binary search over the history.
 
-This is an additive interface — it does not change `FeeRouter`'s six-bucket split, settlement timing, or any other invariant. Operators who never take a staking loan see no behaviour change. The redirect's expiry bound prevents the LOAN_GRANTOR from indefinitely siphoning revenue past the loan's intended duration; loan recipients can audit the on-chain destination + expiry at any time.
+**Routing rules — pinned to commit time, not claim time:**
+
+- `FeeRouter.routeSettlement(operator, ...)`: reads `payoutDestinationOf(operator)` and routes the 40% base share to `dest` if `dest != address(0) && block.timestamp < expiresAt`, else to operator. Pin point is the settlement transaction (which is contemporaneous with byte delivery).
+- `FeeRouter.claimBoost(operator, epochs[])`: for each epoch in the call, reads `payoutDestinationAt(operator, epochId)` — i.e., the destination that was active **at the epoch boundary** of the epoch being claimed. This prevents the bypass where an operator waits until the loan is repaid and the destination is cleared before claiming gauge-boost rewards for epochs that occurred during the loan period. Funds for an epoch are routed to whichever destination was effective when the bytes were earned, not when the claim is filed.
+- `FeeRouter.claimDelegator(epochs[])`: claims by ve-locker, not by operator. The redirect does **not** apply — delegator-pool yield was never the borrower's revenue stream and was never pledged to the loan recovery.
+
+This is an additive interface — it does not change `FeeRouter`'s six-bucket split, settlement timing, or any other invariant. Operators who never take a staking loan see no behaviour change. The expiry bound prevents the LOAN_GRANTOR from indefinitely siphoning revenue past the loan's intended duration; loan recipients can audit the on-chain destination history + expiry at any time.
 
 **Success metrics.**
 

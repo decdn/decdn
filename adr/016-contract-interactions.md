@@ -167,7 +167,7 @@ After all contracts are deployed, the deployer must execute these transactions b
    stakingRegistry.grantRole(SLASH_ROLE, address(slashJudge));
    ```
 
-   **Production:** also grant a slashing-redirect role so SlashJudge can route 30% of slashed stake to `SafetyReserve` per [ADR 026](026-gauge-boost-tokenomics.md) §8 (challenger 50% / SafetyReserve 30% / burn 20%); the address `SafetyReserve` becomes a recipient of slashed USDC (or TOKEN swapped via the existing Balancer V3 path — implementation choice deferred).
+   **Production:** also grant a slashing-redirect role so SlashJudge can route 30% of slashed stake to `SafetyReserve` per [ADR 026](026-gauge-boost-tokenomics.md) §8 (challenger 50% / SafetyReserve 30% / burn 20%). **Slash currency:** stake is denominated in TOKEN, so the 30% share lands in `SafetyReserve` as TOKEN. `SafetyReserve` exposes a keeper-triggered swap into the [ADR 018](018-liquidity-strategy.md) Balancer V3 80/20 pool (same Vault-scoped self-approval, TWAP, `minOut`, private-RPC, and per-epoch liquidity-cap defenses as `BuybackBurner` and the delegator-pool swap path). USDC is the only currency available for `payout`; until swapped, slashed TOKEN is held as part of `SafetyReserve`'s assets-under-management.
 
 3. **Grant `ROUTER_CALLER_ROLE` on FeeRouter to PaymentChannel:**
 
@@ -240,7 +240,7 @@ graph LR
     SJ -->|"slash(node, offenseType)"| SR
     SJ -->|"safeTransferFrom / safeTransfer"| ERC
     SR -->|"safeTransferFrom / safeTransfer"| ERC
-    SR -->|"30% slashed USDC"| SAFE
+    SR -->|"30% slashed TOKEN"| SAFE
     BB -->|"Router.swapSingleTokenExactIn()"| BAL
     BB -->|"safeTransferFrom / safeTransfer"| ERC
     WE -->|"read channel state"| SPC
@@ -269,7 +269,7 @@ graph LR
 | SlashJudge | StakingRegistry | `slash(node, offenseType)` | `SLASH_ROLE` | Yes |
 | SlashJudge | IERC20 (TOKEN) | `safeTransferFrom()` / `safeTransfer()` | Caller must have allowance/balance | Yes |
 | StakingRegistry | IERC20 (TOKEN) | `safeTransferFrom()` / `safeTransfer()` | Caller must have allowance/balance | Yes |
-| StakingRegistry | SafetyReserve | `safeTransfer()` (30% of slashed stake; the remaining 50% goes to the challenger and 20% burns per [ADR 026](026-gauge-boost-tokenomics.md) §8) | Caller holds balance | Yes |
+| StakingRegistry | SafetyReserve | `safeTransfer()` of TOKEN (30% of slashed stake; the remaining 50% goes to the challenger and 20% burns per [ADR 026](026-gauge-boost-tokenomics.md) §8). `SafetyReserve` swaps the accumulated TOKEN balance to USDC via a keeper-triggered call into the [ADR 018](018-liquidity-strategy.md) Balancer V3 80/20 pool. | Caller holds balance | Yes |
 | BuybackBurner | Balancer V3 Router | `swapSingleTokenExactIn(pool, tokenIn, tokenOut, exactAmountIn, minAmountOut, deadline, wethIsEth, userData)` | `BuybackBurner` self-approves the **Balancer V3 Vault** address (NOT the Router) during its initialization — the Vault pulls input tokens from the `msg.sender` of the Router call. This is the V3 footgun; see [ADR 018](018-liquidity-strategy.md#buyback-execution-via-balancer-v3) | Yes |
 | BuybackBurner | IERC20 (USDC, TOKEN) | `safeTransferFrom()` / `safeTransfer()` | Caller must have allowance/balance | Yes |
 | WatchtowerEscrow | StablePaymentChannel / PaymentChannel | Channel state reads | Public (read-only) | No |
@@ -392,7 +392,7 @@ flowchart TD
 | StablePaymentChannel / PaymentChannel | USDC (PoC) / approved ERC-20s (production) | Client deposits | `settleChannel()`, `reclaimExpired()`, `forceCloseChannel()` |
 | FeeRouter | USDC (gauge + delegator epoch buckets, transient base/treasury/burn/safety legs); TOKEN (delegator-pool epoch buckets after USDC→TOKEN swap) | `PaymentChannel.settleChannel` | `claimBoost(epochs[])` (operators); `claimDelegator(epochs[])` (ve-lockers); same-tx forwards to BuybackBurner / Treasury / SafetyReserve / operator base (40%); 26-epoch claim window then sweep to treasury |
 | VotingEscrow | TOKEN (locked, non-transferable) | User `createLock` deposits | `withdraw()` after lock expiry only; no early exit, no `create_lock_for` privileged path ([ADR 026](026-gauge-boost-tokenomics.md) §4) |
-| SafetyReserve | USDC (3% router bucket + 30% slashing redirect) | `FeeRouter`, `StakingRegistry` slashing path | `payout(bundle, recipient, amount)` after evidence bundle, Governor (or emergency-multisig within hard caps), and 48h appeal window ([ADR 026](026-gauge-boost-tokenomics.md) §5) |
+| SafetyReserve | USDC (3% router bucket; primary holding) + TOKEN (30% slashing redirect; swapped to USDC via keeper) | `FeeRouter`, `StakingRegistry` slashing path | `payout(bundle, recipient, amount)` USDC-only after evidence bundle, Governor (or emergency-multisig within hard caps), and 48h appeal window ([ADR 026](026-gauge-boost-tokenomics.md) §5) |
 | StakingRegistry | TOKEN | Node operator stakes, client priority stakes | `unstake()` after unbonding (operators), `clientUnstake()` anytime (clients) |
 | SlashJudge | TOKEN | Challenger bond deposits | `resolveChallenge()` (slash reward + bond return to challenger) or bond forfeiture |
 | BuybackBurner | USDC (accumulated), TOKEN (transient) | PoC: treasury transfers. Production: 5% USDC same-tx from `FeeRouter` ([ADR 026](026-gauge-boost-tokenomics.md) §8) | `executeBuyback()` (production; accumulate-only in PoC) |
@@ -577,7 +577,7 @@ Every deCDN contract should inherit from audited OpenZeppelin base contracts rat
 | Settlement-fee mechanic | Skim at settlement contract (3% / 1.5% discounted) | `FeeRouter` six-bucket split (40/40/7/5/5/3) per [ADR 026](026-gauge-boost-tokenomics.md) §2 |
 | FeeRouter | Not deployed | Deployed; epoch buckets, claim-based gauge / delegator pools |
 | VotingEscrow | Not deployed | Deployed; voluntary ve-locking, no `create_lock_for` |
-| SafetyReserve | Not deployed | Deployed; receives 3% router bucket + 30% slashing redirect; payouts gated per [ADR 026](026-gauge-boost-tokenomics.md) §5 |
+| SafetyReserve | Not deployed | Deployed; receives 3% router bucket (USDC) + 30% slashing redirect (TOKEN, swapped via keeper to USDC); payouts gated per [ADR 026](026-gauge-boost-tokenomics.md) §5 |
 | Governance | Admin key (single EOA) | OpenZeppelin Governor + 2-day timelock; voting weight = `VotingEscrow.balanceOfAt` |
 | Emergency multisig | Admin key | 3-of-5 multisig with 12-month sunset (also fast-track SafetyReserve payouts under hard caps) |
 | BuybackBurner | Accumulate-only (execution disabled) | Active (keeper or governance triggered); inflow from `FeeRouter` (5% same-tx) rather than manual treasury transfer |
