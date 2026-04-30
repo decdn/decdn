@@ -50,9 +50,9 @@ The contract holds exactly one `VotingEscrow` lock at any time. All deposits ext
 1. User calls `TOKEN.approve(SveToken, amount)`.
 2. User calls `SveToken.deposit(amount)`.
 3. `SveToken` pulls `amount` TOKEN from the user.
-4. `SveToken` calls into `VotingEscrow` to either:
-   - Create the pooled lock at max duration (4 years) on the first-ever deposit, or
-   - `extendLock` the existing pooled lock back to max duration **and** `increaseAmount` by `amount` on every subsequent deposit (see §6 for cadence).
+4. `SveToken` accumulates the deposit and lazily folds it into the pooled `VotingEscrow` lock:
+   - Create the pooled lock at max duration (4 years) on the first-ever deposit (with `increaseAmount` by `amount`), or
+   - On subsequent deposits, the deposited TOKEN sits in `SveToken`'s direct balance until the next batched fold (per §5 / §6.1 cadence). At fold time, a single transaction calls `extendLock` back to max duration and `increaseAmount` by the accumulated balance. This batching is gas-essential: per-deposit `increaseAmount` calls are gas-prohibitive for small deposits, and exchange-rate accuracy is preserved in the interim because `underlyingTokenBalance` already includes `SveToken`'s direct balance (see formula below).
 5. `SveToken` mints `sveAmount = amount * totalSupply / underlyingTokenBalance` to the depositor (the standard ERC-4626-style appreciation formula). On the first-ever deposit, `sveAmount = amount` (initial 1:1 exchange rate, matching Frax sfrxETH).
 
 `underlyingTokenBalance` is the TOKEN amount currently held by the pooled `VotingEscrow` lock plus any TOKEN sitting in `SveToken`'s direct balance from accrued yield not yet recompounded.

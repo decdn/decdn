@@ -122,7 +122,7 @@ At `periodStart + periodDuration`:
 | Outcome | Settlement |
 | --- | --- |
 | Fully delivered | Strike TOKEN released to seller; contract closes |
-| Under-delivered (no SLA pairing) | Pro-rata TOKEN refund to buyer = `strikeToken × (bandwidthGB − delivered) / bandwidthGB`; remainder to seller |
+| Under-delivered (no SLA pairing) | Pro-rata TOKEN refund to buyer = `strikeToken × (bandwidthGB − min(delivered, bandwidthGB)) / bandwidthGB`; remainder to seller. The `min(...)` clamp prevents arithmetic underflow when over-delivery is reported (the over-delivered case is handled separately below; the clamp is defense-in-depth). |
 | Under-delivered with SLA pairing breached | Pro-rata TOKEN refund **plus** USDC compensation drawn from `SafetyReserve` per §2 (capped at `breachCompensationCap`) |
 | Over-delivered | Excess delivery is unbilled; future compensates only up to `bandwidthGB` |
 
