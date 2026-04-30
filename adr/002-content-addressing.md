@@ -15,7 +15,7 @@ The protocol is content-agnostic. It stores and delivers arbitrary blobs with no
 
 Blob identity is intrinsic to the content: the same bytes always produce the same hash, regardless of which node holds them. Clients verify every received blob against its known hash — no node can serve corrupted data without immediate detection.
 
-When end-to-end encryption is active ([Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md)), the BLAKE3 hash covers the ciphertext — not the plaintext. The origin encrypts content once at ingest, producing `nonce || AEAD output`, and the hash is computed over that entire byte sequence. This preserves global content-addressing: one ciphertext, one hash, one cached copy for all clients. CDN nodes never see or hash plaintext. When encryption is not active, the hash covers the raw blob bytes directly.
+When content-level encryption is active ([Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md)), the BLAKE3 hash covers the ciphertext — not the plaintext. The origin encrypts content once at ingest, producing `nonce || AEAD output`, and the hash is computed over that entire byte sequence. This preserves global content-addressing: one ciphertext, one hash, one cached copy for all clients. CDN nodes never see or hash plaintext. When encryption is not active, the hash covers the raw blob bytes directly.
 
 Encrypted and unencrypted versions of the same logical content are distinct blobs with distinct hashes. Content providers choose the encryption mode at ingest time; there is no protocol-level link between an encrypted and unencrypted variant of the same content.
 

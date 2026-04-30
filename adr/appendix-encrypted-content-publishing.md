@@ -2,9 +2,11 @@
 
 > **This is an appendix, not a core protocol ADR.** The deCDN protocol is encryption-agnostic — content addressing means the network shuttles bytes, and whether those bytes are plaintext or ciphertext is the publisher's choice. This document specifies one deployment pattern for building an encrypted-content publishing system on top of deCDN, including the companion app server and `cdn/keys/v1` ALPN — neither of which are CDN protocol participants. Alternative encryption schemes (e.g., direct symmetric distribution, group-keyed) are acceptable.
 
+> **Not end-to-end encryption.** True E2E means per-recipient encryption — incompatible with content-addressed caching where one blob is served to many clients. This appendix specifies **subscription-gated access to commonly-encrypted content**: each blob is encrypted once at rest with a random `K_blob`; the same ciphertext is served to all authorized clients; access is granted (and revoked) at the key-distribution layer via epoch-rotated wrapping. The closest formal analogues are **broadcast encryption** and **conditional access**.
+
 ## Context
 
-CDN nodes deliver content but should not be able to read it. QUIC provides transport encryption, but nodes see plaintext at rest and during forwarding. For applications like subscription-gated streaming (e.g., a Spotify-clone scenario), content must be encrypted end-to-end: only authorized, actively-subscribed clients can decrypt delivered blobs.
+CDN nodes deliver content but should not be able to read it. QUIC provides transport encryption, but nodes see plaintext at rest and during forwarding. For applications like subscription-gated streaming (e.g., a Spotify-clone scenario), content must be encrypted at rest with subscription-gated decryption: only authorized, actively-subscribed clients can decrypt delivered blobs, and revocation must be possible without re-encrypting content.
 
 The encryption scheme must satisfy these constraints:
 
@@ -295,7 +297,7 @@ Rejected because a hacked client can ignore the timestamp. Expiry becomes adviso
 
 A proxy fetches ciphertext from the CDN, decrypts with K_blob, and streams plaintext to the client over TLS. The client never sees any key.
 
-Rejected because it breaks end-to-end encryption — the proxy sees plaintext. It also introduces a centralized bottleneck that undermines the decentralized CDN architecture.
+Rejected because it exposes plaintext to a non-authorized intermediary, defeating the "only authorized clients can decrypt" property. It also introduces a centralized bottleneck that undermines the decentralized CDN architecture.
 
 ### Proxy re-encryption (PRE)
 
@@ -313,7 +315,7 @@ Rejected because it destroys global content-addressing. The same track would hav
 
 | Aspect | PoC | Production |
 | --- | --- | --- |
-| E2E encryption | Not implemented. Content is delivered as plaintext blobs. | Full implementation as described |
+| Encrypted publishing | Not implemented. Content is delivered as plaintext blobs. | Full implementation as described |
 | Epoch key rotation | N/A | 5-minute rotation via BLAKE3_KDF |
 | Key delivery infrastructure | N/A | `cdn/keys/v1` iroh QUIC (epoch key stream + play request streams) |
 | Envelopes | N/A | XChaCha20-Poly1305 wrapped `K_blob` over authenticated QUIC |
@@ -350,6 +352,6 @@ For PoC, no action items from this ADR are required. Content-addressed blobs are
   2. **Periodic `server_secret` rotation on epoch boundaries.** Rotate `server_secret` on a fixed schedule (e.g., every 24–72 hours), aligning each rotation to an epoch boundary so that each `epoch_id` maps to exactly one `server_secret`. The new secret is used to derive `epoch_key` values only for future `epoch_id`s; the outgoing secret handles the current epoch and is destroyed once that epoch expires. This keeps `epoch_key = KDF(server_secret, epoch_id)` and the envelope `{wrapped, epoch_id, blob_hash}` unambiguous — no version identifier is needed because each epoch_id is associated with exactly one secret. The blast radius of a compromise is bounded to the rotation interval rather than the full lifetime of the service. The rotation cadence is a tradeoff: shorter intervals reduce exposure but increase coordination cost (all app server instances must converge on the new secret before the first epoch that uses it).
   3. **Append-only key rotation log.** The app server maintains a signed, append-only log of `server_secret` rotation events (HSM/KMS key identifier and version, rotation timestamp, operator identity, and a hash-chained log record). This does not prevent compromise but provides auditability — after an incident, the log establishes which secrets (by key identifier and version) were active during which periods, bounding the forensic scope without exposing or fingerprinting the raw secret material.
 
-  For the PoC, none of these mitigations apply (E2E encryption is not implemented). The deterministic derivation is acceptable for the design document because it is simple, stateless, and sufficient for the threat model where the app server is trusted infrastructure. Forward secrecy becomes critical when the production deployment handles real subscriber content.
+  For the PoC, none of these mitigations apply (encrypted publishing is not implemented). The deterministic derivation is acceptable for the design document because it is simple, stateless, and sufficient for the threat model where the app server is trusted infrastructure. Forward secrecy becomes critical when the production deployment handles real subscriber content.
 - Offline leases trade revocation speed for availability: a canceled subscription may retain offline playback for up to the lease TTL (default 30 days). This is an accepted industry-standard tradeoff.
 - Offline leases persist K_blob values on disk (sealed to device key), increasing the blast radius of a device compromise from one epoch's tracks to the full lease (up to 500 tracks). Device attestation and watermarking are operational mitigations, not cryptographic guarantees.
