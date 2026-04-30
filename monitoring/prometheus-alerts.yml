@@ -1,0 +1,227 @@
+# deCDN reference Prometheus alerting rules
+#
+# Companion to adr/appendix-observability.md. Thresholds in the
+# `decdn-slash-safety` group are copied verbatim from §2.1
+# "Recommended alert thresholds"; the others are operator-onboarding
+# defaults, not normative.
+#
+# Validate locally:
+#   promtool check rules monitoring/prometheus-alerts.yml
+#
+# Wire into Prometheus via:
+#   rule_files:
+#     - /etc/prometheus/prometheus-alerts.yml
+# (or copy the file under whatever filename your Prometheus deployment expects).
+
+groups:
+  # ---------------------------------------------------------------
+  # Slash-safety — copied from appendix-observability §2.1.
+  # A sustained alert here means the operator is at slash risk.
+  # ---------------------------------------------------------------
+  - name: decdn-slash-safety
+    interval: 30s
+    rules:
+      - alert: DecdnProbeHoldViolations
+        expr: rate(decdn_probe_hold_violations_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+          slash_risk: phantom_announcement
+        annotations:
+          summary: "Phantom-announcement slash risk on {{ $labels.instance }}"
+          description: |
+            decdn_probe_hold_violations_total has been incrementing for 5m on
+            {{ $labels.instance }}. Each increment is a blob evicted within
+            probe_hold_duration after signing has_blob: true — valid phantom
+            slash evidence. Reduce load or raise max_probe_holds; investigate
+            OOM. See adr/005-protocol.md#probe-triggered-eviction-hold.
+
+      - alert: DecdnBlacklistSyncLagWarning
+        expr: decdn_blacklist_sync_lag_seconds > 600
+        for: 2m
+        labels:
+          severity: warning
+          slash_risk: blacklist_violation
+        annotations:
+          summary: "Blacklist poll lagging on {{ $labels.instance }}"
+          description: |
+            One full poll interval has elapsed without a successful
+            getBlacklistVersion(). Check RPC provider availability.
+            See adr/011-content-takedown.md.
+
+      - alert: DecdnBlacklistSyncLagCritical
+        expr: decdn_blacklist_sync_lag_seconds > 1800
+        for: 1m
+        labels:
+          severity: critical
+          slash_risk: blacklist_violation
+        annotations:
+          summary: "Blacklist sync stale (>30m) on {{ $labels.instance }}"
+          description: |
+            Serving any recently-blacklisted hash is now slashable.
+            Investigate the RPC provider or perform a manual sync.
+
+      - alert: DecdnBlacklistVersionBehind
+        expr: decdn_blacklist_version_behind > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Blacklist version drift on {{ $labels.instance }}"
+          description: |
+            on_chain_version - local_version > 0 for 10 minutes. The node
+            has not yet fetched the latest entries.
+
+      - alert: DecdnBlacklistVersionFarBehind
+        expr: decdn_blacklist_version_behind > 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Blacklist >1 version behind on {{ $labels.instance }}"
+          description: |
+            Multiple blacklist versions missed. Investigate RPC / poll failure
+            immediately.
+
+      - alert: DecdnRateBoundsClamp
+        expr: rate(decdn_rate_bounds_clamp_events_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "rate_per_mb being clamped to governance bounds on {{ $labels.instance }}"
+          description: |
+            The configured rate_per_mb is outside the current governance
+            window and is being clamped before signing ProbeResponse.
+            Update operator config to within bounds.
+
+      - alert: DecdnSlashEvidenceExposure
+        expr: rate(decdn_slash_evidence_exposure_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+          slash_risk: phantom_announcement
+        annotations:
+          summary: "Self-detected slash-evidence exposure on {{ $labels.instance }}"
+          description: |
+            The node produced a signed has_blob: true probe followed by a
+            stream response within the 30s slashing window — valid phantom
+            slash evidence. This is a critical bug signal. Stop the node
+            and file a bug. See adr/005-protocol.md.
+
+  # ---------------------------------------------------------------
+  # Liveness / capacity — operator-onboarding defaults.
+  # Tune `for:` and thresholds for your fleet size before paging.
+  # ---------------------------------------------------------------
+  - name: decdn-liveness
+    interval: 30s
+    rules:
+      - alert: DecdnNodeDown
+        expr: up{job=~".*decdn.*"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Node {{ $labels.instance }} unreachable for 1m"
+          description: |
+            Prometheus has been unable to scrape this node for at least
+            one minute (the standard `up` metric is 0). This catches the
+            crash-and-stay-down case that decdn_node_uptime_seconds
+            cannot — once the process is gone, no decdn_* metric is
+            exported. Adjust the `job=~".*decdn.*"` selector to match
+            your scrape-config job name(s).
+
+      - alert: DecdnNodeRestarted
+        expr: decdn_node_uptime_seconds < 300
+        for: 0m
+        labels:
+          severity: info
+        annotations:
+          summary: "{{ $labels.instance }} restarted recently"
+          description: |
+            decdn_node_uptime_seconds reset within the last 5 minutes —
+            the node process restarted. Correlate with deploy events.
+
+      - alert: DecdnNoActiveStreams
+        expr: sum without (direction) (decdn_streams_active) == 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No active streams on {{ $labels.instance }} for 15m"
+          description: |
+            decdn_streams_active has been zero across all directions
+            (inbound + outbound) for 15 minutes. Either traffic dried up,
+            the node was de-prioritised by client selection, or it stopped
+            accepting connections. The sum-without(direction) aggregation
+            avoids false alerts when only one direction is idle.
+
+      - alert: DecdnPeerTableThin
+        expr: decdn_peer_table_size < 3
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Peer table thin on {{ $labels.instance }} ({{ $value }} peers)"
+          description: |
+            Fewer than 3 peers known via gossip for 10 minutes. Check gossip
+            connectivity; client selection will be impaired.
+
+      # NOTE: /health 503 detection requires an external prober (e.g.
+      # blackbox_exporter) — it is not surfaced as a decdn_* metric. Add
+      # an alert in your blackbox rules file along the lines of
+      #   probe_http_status_code{job="decdn_health"} == 503
+      # if you want to page on not_ready. See adr/appendix-observability.md §3.
+
+  # ---------------------------------------------------------------
+  # Delivery health — operator-tunable.
+  # ---------------------------------------------------------------
+  - name: decdn-delivery
+    interval: 30s
+    rules:
+      - alert: DecdnHighStreamErrorRate
+        expr: |
+          (
+            sum by (instance) (rate(decdn_streams_failed_total[5m]))
+            /
+            clamp_min(
+              sum by (instance) (rate(decdn_streams_failed_total[5m]))
+                + sum by (instance) (rate(decdn_streams_completed_total[5m])),
+              1
+            )
+          ) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Stream failure rate >5% on {{ $labels.instance }}"
+          description: |
+            More than 5% of streams have failed over the last 5 minutes.
+            Break down by `reason` label to localise the cause.
+
+      - alert: DecdnHashMismatchAppearing
+        expr: rate(decdn_streams_failed_total{reason="hash_mismatch"}[10m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Hash-mismatch failures on {{ $labels.instance }}"
+          description: |
+            Streams are failing with reason=hash_mismatch. Either the origin
+            store is corrupted or the operator served a blob whose stored
+            bytes do not match its address. Hash mismatch is a critical
+            data-integrity signal; the short `for:` reflects that. See
+            adr/002-content-addressing.md.
+
+      - alert: DecdnProbeHoldsSaturated
+        expr: |
+          (decdn_probe_hold_slots_used / clamp_min(decdn_probe_hold_slots_max, 1)) > 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Probe-hold slots >90% used on {{ $labels.instance }}"
+          description: |
+            Saturation forces has_blob: false answers for cached content,
+            losing revenue. Increase max_probe_holds proportional to cache
+            size (recommended: ≥25% of cache capacity).
