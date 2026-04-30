@@ -25,7 +25,7 @@ Several prior ADRs have implicitly assumed Arbitrum mainnet without stating it e
 
 - **ADR 004** — gas estimates ("assume Arbitrum average gas price as of early 2026")
 - **ADR 007** — forced-inclusion delay assumed ≤ 24 hours (Arbitrum value)
-- **ADR 018** — Balancer V3 Router address `0xEAedc32a51c510d35ebC11088fD5fF2b47aACF2E`
+- **ADR 018** — Balancer V3 Router address (canonical: see [ADR 018 §"Buyback execution via Balancer V3"](018-liquidity-strategy.md#buyback-execution-via-balancer-v3))
   labelled as the Arbitrum mainnet address
 
 Formalizing this decision resolves the ambiguity and allows remaining mainnet planning to
@@ -98,7 +98,7 @@ ADR 018 committed to a Balancer V3 80/20 TOKEN/USDC Weighted Pool as the POL ven
 Balancer V3 is deployed on Arbitrum One, Base, and OP Mainnet. However:
 
 - ADR 018 already embedded the Arbitrum mainnet Balancer V3 Router address
-  (`0xEAedc32a51c510d35ebC11088fD5fF2b47aACF2E` / `Router v2` in Balancer's registry).
+  (canonical reference: [ADR 018](018-liquidity-strategy.md#buyback-execution-via-balancer-v3)).
 - CoW Swap solver coverage of Balancer V3 pools is most mature on Arbitrum One. ADR 018
   requires the operator to verify CoW routing availability before production, but the
   probability of a successful verification is highest on Arbitrum.

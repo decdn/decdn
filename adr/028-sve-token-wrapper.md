@@ -120,7 +120,7 @@ A small deposit fee captures wrapper-economy value for the DAO treasury rather t
 | Compound RPC routing | Private (Flashbots-style) | — | — | No | MEV defense; matches [ADR 018](018-liquidity-strategy.md) pattern |
 | sveTOKEN/TOKEN POL seed (target) | $200K–$500K notional | TBD | TBD | Yes | Seeded at launch; size landed in [ADR 018](018-liquidity-strategy.md) |
 | Wind-down vote outcome | Stop-extensions only | — | — | Yes | Per [ADR 009](009-governance.md) governance flow |
-| Vote-mirroring policy | Deferred to ADR 028.1 | — | — | Yes | Sub-ADR governs the multisig's casting rules |
+| Vote-mirroring policy | Deferred to a follow-up ADR | — | — | Yes | Follow-up ADR governs the multisig's casting rules |
 
 **Entry-point shape (informative).** ERC-4626-style: `deposit`, `harvestAndCompound`, and the `convertToAssets` / `convertToShares` / `exchangeRate` views are permissionless. `redeemAfterExpiry` is gated on wind-down + post-decay; wind-down is Governor + Timelock only ([ADR 009](009-governance.md)). No other entry point mints, burns, or moves the underlying TOKEN. Final ABI lands with the implementation, not this ADR.
 
@@ -136,7 +136,7 @@ The largest open design question. Three options, all viable:
 
 **Decision: Option B.** The wrapper contract holds the ve-position, the ve-position's voting weight is delegated to a DAO-controlled multisig (per [ADR 009](009-governance.md) emergency multisig topology), and the multisig is bound by a published vote-mirroring policy that defines how it casts the sveTOKEN-attributable votes (e.g., mirror the unwrapped-veTOKEN vote distribution, or default to "abstain" on contentious proposals, etc.).
 
-**Vote-mirroring policy is deferred to a follow-up ADR (provisionally ADR 028.1).** The policy gets contentious — it is a gating choice on what kinds of governance pressure sveTOKEN holders can exert, and on how the DAO can be challenged about the exercise of the wrapper-attributable weight. Pinning it down here would either undersell the question (vague enough to allow capture) or oversell it (specific enough to require a re-vote when reality contradicts it). The follow-up slot is reserved for that conversation.
+**Vote-mirroring policy is deferred to a follow-up ADR.** The policy gets contentious — it is a gating choice on what kinds of governance pressure sveTOKEN holders can exert, and on how the DAO can be challenged about the exercise of the wrapper-attributable weight. Pinning it down here would either undersell the question (vague enough to allow capture) or oversell it (specific enough to require a re-vote when reality contradicts it). The follow-up ADR is authored at the next available slot when the conversation opens.
 
 ### 8. MEV / liquidity considerations
 
@@ -169,7 +169,7 @@ The exact pool seeding parameters (size, weights, fee tier) are **out of scope f
 
 | Risk | Mitigation |
 | --- | --- |
-| **Persistent secondary-market discount** (the wrapper's signature failure mode; ~0.5–2% on Frax sfrxETH, historically 5–25% on cvxCRV) | DAO POL seed; per-epoch liquidity caps inheriting [ADR 018](018-liquidity-strategy.md) defenses; documented expected-discount range |
+| **Persistent secondary-market discount** (the wrapper's signature failure mode; ~0.5–2% on Frax sfrxETH, historically 5–25% on cvxCRV as of 2026-Q1) | DAO POL seed; per-epoch liquidity caps inheriting [ADR 018](018-liquidity-strategy.md) defenses; documented expected-discount range |
 | **Cascade depeg** (large dump → discount widens → no protocol redemption to arbitrage) | Per-epoch caps; POL absorbs fair-value side; wind-down is the structural escape valve |
 | **Contagion to TOKEN price** (depeg arbitrage routes through TOKEN) | Same POL/cap defenses as [ADR 018](018-liquidity-strategy.md); [ADR 029](029-adaptive-fee-router.md) price-floor hook provides automatic counter-pressure |
 | **Governance capture via Option B multisig** (whale accumulates sveTOKEN to pressure mirror policy) | Vote-mirroring policy specifies whether mirroring is share-weighted or capped; reserve the right to disregard a hostile mirror |
@@ -194,14 +194,14 @@ The exact pool seeding parameters (size, weights, fee tier) are **out of scope f
 
 ### Risks
 
-- **Wrapper depeg.** Sustained secondary-market discount is the wrapper's signature failure mode (Frax: 0.5–2%, cvxCRV: 5–25% structurally). Defenses (auto-compound + POL + per-epoch caps) lean Frax; if the discount widens past ~5%, governance can invoke wind-down.
+- **Wrapper depeg.** Sustained secondary-market discount is the wrapper's signature failure mode (Frax: 0.5–2%, cvxCRV: 5–25% structurally as of 2026-Q1). Defenses (auto-compound + POL + per-epoch caps) lean Frax; if the discount widens past ~5%, governance can invoke wind-down.
 - **sveTOKEN→TOKEN contagion.** Depeg arbitrage routes through TOKEN; per-epoch caps bound per-epoch volume but multi-epoch drawdowns are possible. Compounds with [ADR 026](026-gauge-boost-tokenomics.md) §Risks "Reflexive bootstrap intensified".
-- **Vote-mirroring capture.** The mirror policy is the only defense against Option B becoming a governance single-point-of-failure. Sub-ADR (provisionally 028.1) is a hard prerequisite.
+- **Vote-mirroring capture.** The mirror policy is the only defense against Option B becoming a governance single-point-of-failure. The follow-up ADR is a hard prerequisite for sveTOKEN shipping.
 
 ---
 
 ## Forward references
 
-- **ADR 028.1 — sveTOKEN vote-mirroring policy** *(sub-ADR; deferred until vote-mirroring details become contentious or the launch slot opens, whichever first).* Specifies how the wrapper-controlled multisig (Option B above) casts sveTOKEN-attributable votes. Topics: snapshot vs continuous mirror, weighting (raw sveTOKEN balance vs caps), abstain rules, contentious-proposal handling, override conditions.
+- **sveTOKEN vote-mirroring policy** *(deferred follow-up ADR; authored when vote-mirroring details become contentious or the launch slot opens, whichever first).* Specifies how the wrapper-controlled multisig (Option B above) casts sveTOKEN-attributable votes. Topics: snapshot vs continuous mirror, weighting (raw sveTOKEN balance vs caps), abstain rules, contentious-proposal handling, override conditions.
 - **[ADR 018](018-liquidity-strategy.md) update** *(at sveTOKEN launch).* Add the sveTOKEN/TOKEN Balancer V3 80/20 POL pool to the [ADR 018](018-liquidity-strategy.md) liquidity strategy, including seed size, MEV defenses (inheriting the existing TWAP / private-RPC / per-epoch-cap pattern), and BPT custody.
 - **[ADR 020](020-observability.md) update** *(at sveTOKEN launch).* Surface metrics: sveTOKEN total supply, exchange rate, secondary-market discount, compound frequency, deposit haircut accrual, POL pool depth.
