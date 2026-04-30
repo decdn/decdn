@@ -149,31 +149,14 @@ Per ADR 008 rate limits: max 10 reports per reporter per hour, max 1 per (report
 
 The strict rate limits (Section 11 of [ADR 008](008-reputation.md)) keep reputation gossip modest relative to `NodeAnnounce`.
 
-#### RateChange (`cdn/global/v1`, event-driven)
-
-`RateChange` messages ([ADR 005](005-protocol.md#gossip--rate-change-announcements)) are published when a node changes its `rate_per_mb`. Unlike `NodeAnnounce`, these are event-driven — not periodic. Each message is ~200 bytes (32B node_id + 8B old_rate + 8B new_rate + 8B timestamp + 64B Ed25519 signature + 65B secp256k1 `slash_sig` + ~15B framing).
-
-Worst-case assumption: every node changes rate once per hour (generous — operators typically change rates daily or weekly).
-
-Per-node ingress: `(N−1) × 200 bytes × changes_per_hr`
-
-| Nodes | Changes/node/hr (worst) | Ingress/node/hr |
-| --- | --- | --- |
-| 30 (PoC) | 1 | ~0.006 MB |
-| 100 | 1 | ~0.02 MB |
-| 500 | 1 | ~0.1 MB |
-| 1,000 | 1 | ~0.2 MB |
-
-Event-driven and negligible relative to `NodeAnnounce` (~48 MB/hr at 1,000 nodes). Even at 10 changes/node/hr, `RateChange` contributes <4% of total gossip bandwidth at 1,000 nodes.
-
 #### Combined per-node budget (60-second announce interval)
 
-| Nodes | NodeAnnounce | ReputationReport | RateChange | Combined/node/hr | Sustained rate | ed25519 verify/s |
-| --- | --- | --- | --- | --- | --- | --- |
-| 30 (PoC) | ~1.4 MB | ~0.0 MB | ~0.0 MB | ~1.4 MB | ~3 Kbps | <1 |
-| 100 | ~4.8 MB | ~0.2 MB | ~0.0 MB | ~5.0 MB | ~11 Kbps | ~2 |
-| 500 | ~24.0 MB | ~1.0 MB | ~0.1 MB | ~25.1 MB | ~56 Kbps | ~10 |
-| 1,000 | ~48.0 MB | ~2.0 MB | ~0.2 MB | ~50.2 MB | ~112 Kbps | ~19 |
+| Nodes | NodeAnnounce | ReputationReport | Combined/node/hr | Sustained rate | ed25519 verify/s |
+| --- | --- | --- | --- | --- | --- |
+| 30 (PoC) | ~1.4 MB | ~0.0 MB | ~1.4 MB | ~3 Kbps | <1 |
+| 100 | ~4.8 MB | ~0.2 MB | ~5.0 MB | ~11 Kbps | ~2 |
+| 500 | ~24.0 MB | ~1.0 MB | ~25.0 MB | ~56 Kbps | ~10 |
+| 1,000 | ~48.0 MB | ~2.0 MB | ~50.0 MB | ~112 Kbps | ~19 |
 
 **CPU cost:** Modern hardware handles ~50,000–100,000 ed25519 verifications/sec/core. At 1,000 nodes, ~19 verify/sec is negligible. CPU is not the gossip bottleneck.
 

@@ -18,41 +18,19 @@ Three core protocols negotiated via ALPN, plus the built-in iroh-gossip protocol
 | `cdn/probe/v1` | any node ↔ any node | Latency and availability check before committing to a node |
 | `cdn/client/v1` | payer ↔ delivering node | Paid blob delivery with payment vouchers (client→node, node→node on cache miss) |
 | `cdn/watchtower/v1` | watched party (typically node) ↔ watchtower | Channel-dispute monitoring: voucher registration and updates (see ADR 007) |
-| iroh-gossip (built-in) | all nodes | Node metadata announcements (`NodeAnnounce`), rate announcements (`RateChange`), node discovery |
+| iroh-gossip (built-in) | all nodes | Node metadata announcements (`NodeAnnounce`), node discovery |
 
 **Gossip topics.** The iroh-gossip protocol carries multiple message types on distinct topics:
 
 | Topic | Message Type | Source ADR |
 | --- | --- | --- |
 | `cdn/global/v1`, `cdn/region/{cc}/v1` | `NodeAnnounce` | [ADR 001](001-network.md) |
-| `cdn/global/v1` | `RateChange` | ADR 005 (below) |
 | `cdn/reputation/v1` | `ReputationReport` | [ADR 008](008-reputation.md) |
 | `cdn/global/v1` (production) | `WatchtowerAnnounce` | [ADR 007](007-watchtower.md) |
 
-All gossip topics use the `cdn/` namespace prefix. `NodeAnnounce`, `RateChange`, and `ReputationReport` are active in production; `WatchtowerAnnounce` is a planned production extension for watchtower discovery at scale (PoC uses static watchtower lists — see [ADR 007](007-watchtower.md)).
+All gossip topics use the `cdn/` namespace prefix. `NodeAnnounce` and `ReputationReport` are active in production; `WatchtowerAnnounce` is a planned production extension for watchtower discovery at scale (PoC uses static watchtower lists — see [ADR 007](007-watchtower.md)).
 
-#### Gossip — rate change announcements
-
-When a node changes its `rate_per_mb`, it MUST publish a `RateChange` message to the `cdn/global/v1` gossip topic before (or simultaneous with) the first `ProbeResponse` or `StreamResponse` that uses the new rate. A node that changes its rate without publishing a `RateChange` cannot counter a rate manipulation challenge ([ADR 014](014-on-chain-verification.md)).
-
-```
-struct RateChange {
-    node_id: NodeId,
-    old_rate_per_mb: u64,
-    new_rate_per_mb: u64,
-    effective_at_us: u64,       // node-generated microsecond timestamp
-    signature: Signature,        // Ed25519 over {node_id, old_rate_per_mb, new_rate_per_mb, effective_at_us}
-    slash_sig: Option<Bytes>,    // EIP-712 secp256k1 over same fields (for on-chain counter-evidence)
-}
-```
-
-Peers store the latest `RateChange` per `node_id` in their peer table alongside `NodeAnnounce` state. Peers SHOULD reject `RateChange` messages whose `effective_at_us` is more than 60 seconds in the past relative to the peer's local clock. This limits how far back a node can backdate a fabricated `RateChange` and reduces propagation of stale messages through the gossip network, but does not eliminate the timeliness limitation described below.
-
-`RateChange` messages are event-driven (not periodic like `NodeAnnounce`). Operators change rates infrequently — typically daily or weekly. Bandwidth impact is negligible; see [ADR 001, Gossip Bandwidth Analysis](001-network.md#gossip-bandwidth-analysis).
-
-**Clock-skew note:** The `effective_at_us` timestamp is node-generated, while the `timestamp_us` values in `ProbeResponse`/`StreamResponse` are requester-generated. On-chain counter-evidence verification ([ADR 014](014-on-chain-verification.md#rate-manipulation-counter-evidence)) compares these across clock domains. This is acceptable because: (1) the 30-second slashing window provides margin for reasonable clock skew (seconds); (2) the comparison establishes ordering, not precise timing — the node's rate change must fall roughly between the two requester timestamps; (3) a node whose clock is severely skewed will fail to produce valid counter-evidence, incentivizing clock synchronization.
-
-**Inherent limitation:** The `slash_sig` proves the node *signed* a `RateChange` but cannot prove *when* it was signed. A malicious node could fabricate a `RateChange` after being challenged during the 24-hour counter-evidence window, provided the fabricated `effective_at_us` falls within the gossip acceptance window. Mitigations: (1) gossip peers that received the `RateChange` before the challenge provide a witness layer — for PoC, this social attestation is sufficient; (2) the challenge bond ([ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn)) deters frivolous challenges; (3) production could require `RateChange` hashes to be anchored in a Merkle tree with periodic on-chain roots, providing cryptographic timeliness proof.
+**Rate discovery.** Nodes do not gossip rate changes. The current rate is included in every signed `ProbeResponse`; clients query rates by probing. A node's last probe-quoted rate is binding for any stream opened within the 30-second slashing window — see [`cdn/probe/v1` — latency probe](#cdnprobev1--latency-probe) and the rate-manipulation slashing path in [ADR 014](014-on-chain-verification.md).
 
 ### `cdn/probe/v1` — latency probe
 
@@ -338,4 +316,4 @@ All protocol messages use [postcard](https://docs.rs/postcard) — compact, no-s
 - Different ALPNs require separate QUIC connections; probing a node via `cdn/probe/v1` and then fetching via `cdn/client/v1` incurs two handshake costs to the same peer. **PoC acceptance:** two connections per node interaction is acceptable at PoC scale (tens of nodes, moderate traffic). **Production optimization:** investigate iroh ALPN multiplexing (negotiating multiple ALPNs on a single connection) or a unified `cdn/v2` ALPN that combines probe and delivery as sub-protocols within one connection. The two-connection overhead is ~1 additional RTT per node interaction — significant for latency-sensitive clients but not a correctness issue
 - ~~Postcard has no schema evolution story~~ — resolved by [ADR 013](013-schema-evolution.md), which defines varint-length framing, protocol enums, a three-tier evolution model (minor/medium/major), and a gossip envelope for version-less gossip messages
 - The `voucher_interval_mb` field in `StreamRequest`/`StreamResponse` is optional and defaults to 1 MB if absent. This follows the standard minor evolution mechanism defined in [ADR 013](013-schema-evolution.md); mandatory field additions require a major version bump (`cdn/client/v2`)
-- `StreamRequest` includes a requester-generated `timestamp_us` that the node echoes in `StreamResponse`. A malicious requester could craft timestamps to make a legitimate rate change (probe 60 seconds ago, rate changed since) appear within the 30-second slashing window. Rate manipulation is a **deferred offense** with a 24-hour counter-evidence window ([ADR 014](014-on-chain-verification.md)): the challenged node may submit a signed `RateChange` message (see [Gossip — rate change announcements](#gossip--rate-change-announcements)) whose `effective_at_us` falls between the two timestamps and whose `new_rate_per_mb` matches the `StreamResponse` rate. The `RateChange` carries an EIP-712 `slash_sig` verifiable on-chain via `ecrecover`. If the counter succeeds, the challenger's bond ([ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn)) is forfeited (50% burned, 50% to node). Without a previously published `RateChange`, the node has no counter-evidence and the slash executes after the 24-hour window expires
+- `StreamRequest` includes a requester-generated `timestamp_us` that the node echoes in `StreamResponse`. Rate manipulation is an **immediate offense** ([ADR 014](014-on-chain-verification.md)): two signed messages from the same NodeId — `ProbeResponse{rate=R₁, timestamp_us=T}` and `StreamResponse{rate=R₂, timestamp_us=T+Δ}` — with `Δ < 30s` and `R₂ > R₁` are non-repudiable on-chain evidence. The node's last probe-quoted rate is binding for any stream opened within the 30-second window; legitimate rate increases require honoring old quotes for that window or pausing new connections during the propagation gap. Rate decreases (`R₂ < R₁`) are unconstrained — slashing is one-directional

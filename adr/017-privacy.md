@@ -35,7 +35,6 @@ Each row identifies a discrete data exposure. The **ID** column is used for back
 | P-03 | On-chain staking registry | `nodeId`, `ethAddress`, `multiaddrs`, `regionHint`, registration timestamps | T1 | [001](001-network.md), [architecture.md](architecture.md) |
 | P-04 | ALPN protocol identification | QUIC TLS ClientHello reveals which ALPN is negotiated (`cdn/probe/v1`, `cdn/client/v1`, `cdn/watchtower/v1`) | T1 | [005](005-protocol.md) |
 | P-05 | `ReputationReport` gossip | Provider, reporter, metrics (delivery speed, correctness, uptime), timestamps — signed and broadcast on `cdn/reputation/v1` | T1 | [008](008-reputation.md) §6 |
-| P-06 | `RateChange` gossip | Node pricing updates broadcast on `cdn/global/v1` | T1 | [005](005-protocol.md), [architecture.md](architecture.md) |
 | P-07 | Node earnings inference | Channel closures and settlement amounts are on-chain; node revenue is computable | T1 | [003](003-payments.md) |
 | P-08 | BLAKE3 hash as global identifier | Same content always produces the same hash; repeated requests for a hash are correlatable | T1 | [002](002-content-addressing.md) |
 | P-09 | Probe fan-out content leakage | All probed nodes learn which content hash the requester wants | T2 | [005](005-protocol.md) §Probe |
@@ -60,7 +59,7 @@ Each row identifies a discrete data exposure. The **ID** column is used for back
 
 A passive observer sees gossip messages, on-chain state, and QUIC connection metadata. The key concern is whether aggregating these signals reveals more than any single signal.
 
-**Content demand patterns (P-01, P-06, P-08).** `popular_hashes` in `NodeAnnounce` is the most explicit content-interest signal: it broadcasts the top-20 most-requested hashes per node at the default interval of 60 seconds to all peers. Combined with `RateChange` events (which signal pricing adjustments that may correlate with demand shifts) and the deterministic nature of BLAKE3 hashes, a passive observer can build a per-node demand profile over time. This is a deliberate design choice — `popular_hashes` feeds the prefetching system ([ADR 001](001-network.md) §Prefetch Triggers) and cannot be removed without losing that capability.
+**Content demand patterns (P-01, P-08).** `popular_hashes` in `NodeAnnounce` is the most explicit content-interest signal: it broadcasts the top-20 most-requested hashes per node at the default interval of 60 seconds to all peers. Combined with the deterministic nature of BLAKE3 hashes, a passive observer can build a per-node demand profile over time. This is a deliberate design choice — `popular_hashes` feeds the prefetching system ([ADR 001](001-network.md) §Prefetch Triggers) and cannot be removed without losing that capability.
 
 **Payment and identity linkability (P-02, P-03, P-07, P-14).** On-chain data permanently links client Ethereum addresses to provider Ethereum addresses via payment channels. Settlement amounts make node revenue computable. The `StakingRegistry` publishes node identity and network location. Reporter credibility in the reputation system leaks a node's settlement history. These are inherent to the accountability model: staking, slashing, and dispute resolution require on-chain identities and state. For the PoC (testnet with no real economic value), this is acceptable.
 
@@ -113,7 +112,6 @@ Endpoint compromise yields secrets specific to that endpoint.
 | P-03 | On-chain staking registry | Accept | Required for node accountability and discovery | — |
 | P-04 | ALPN protocol identification | Accept | Standard QUIC behavior; protocols are not secret | — |
 | P-05 | Reputation gossip | Accept | Accountability requires observable reports; 70/30 local/network split limits exploitation | — |
-| P-06 | `RateChange` gossip | Accept | Pricing transparency is a design goal | — |
 | P-07 | Node earnings inference | Accept | Inherent to on-chain settlement; no mitigation without breaking dispute model | — |
 | P-08 | BLAKE3 global identifier | Accept | Fundamental to content-addressed delivery; no alternative without breaking the architecture | — |
 | P-09 | Probe content leakage | Accept | Probes are public by design ([ADR 005](005-protocol.md)); delivering node must know the hash | — |
@@ -222,7 +220,7 @@ Endpoint compromise yields secrets specific to that endpoint.
 - [ADR 001 — Network Topology and Peer Mesh](001-network.md): `NodeAnnounce`, `popular_hashes`, probe fan-out, gossip topics, prefetch triggers
 - [ADR 002 — Content Addressing](002-content-addressing.md): BLAKE3 as global content identifier
 - [ADR 003 — Payment Model](003-payments.md): payment channel on-chain visibility, probe fishing rate limits
-- [ADR 005 — Wire Protocol](005-protocol.md): probe publicity statement, ALPN definitions, `RateChange` gossip
+- [ADR 005 — Wire Protocol](005-protocol.md): probe publicity statement, ALPN definitions
 - [Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md): epoch keys, forward secrecy, offline lease blast radius, app server privacy boundary
 - [ADR 007 — Watchtower Design for Channel Disputes](007-watchtower.md): voucher sharing privacy impact
 - [ADR 008 — Reputation System](008-reputation.md): `ReputationReport` gossip, reporter credibility weighting

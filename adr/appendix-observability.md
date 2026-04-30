@@ -66,7 +66,7 @@ non-zero value for any of these requires immediate operator attention.
 | `decdn_probe_hold_slots_max` | Gauge | M | Configured `max_probe_holds` value. Paired with `decdn_probe_hold_slots_used` for a saturation ratio. |
 | `decdn_blacklist_sync_lag_seconds` | Gauge | M | Seconds elapsed since the last successful `getBlacklistVersion()` poll. Exceeding the compliance window makes serving any recently-blacklisted hash slashable ([ADR 011](011-content-takedown.md)). |
 | `decdn_blacklist_version_behind` | Gauge | M | `on_chain_version − local_version`. A positive value means the node has not yet fetched new blacklist entries. |
-| `decdn_rate_bounds_clamp_events_total` | Counter | M | Times `rate_per_mb` was clamped to governance bounds before signing a `ProbeResponse` or `RateChange`. Indicates the operator's configured rate is outside the current governance window ([ADR 003](003-payments.md), [ADR 005](005-protocol.md)). |
+| `decdn_rate_bounds_clamp_events_total` | Counter | M | Times `rate_per_mb` was clamped to governance bounds before signing a `ProbeResponse`. Indicates the operator's configured rate is outside the current governance window ([ADR 003](003-payments.md), [ADR 005](005-protocol.md)). |
 | `decdn_slash_evidence_exposure_total` | Counter | M | Self-detected instances where the node produced a signed `has_blob: true` probe followed by a stream response within the 30-second slashing window that would constitute valid phantom slash evidence ([ADR 005](005-protocol.md)). Non-zero is a critical bug signal. |
 
 **Recommended alert thresholds:**
