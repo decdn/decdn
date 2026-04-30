@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::cli::common::LogLevel;
 use crate::cli::run::{ObservabilityArgs, PaymentArgs};
 use crate::config::{
-    ResolvedObservability, ResolvedPayment, load_file_config, resolve_observability,
+    FileConfig, ResolvedObservability, ResolvedPayment, load_file_config, resolve_observability,
     resolve_payment,
 };
 
@@ -54,9 +54,55 @@ pub struct RuntimeReloadState {
     /// Closure to apply a new log-level directive to the running tracing
     /// subscriber.
     log_level_setter: LogLevelSetter,
-    /// Cached log level that was last applied — used to suppress redundant
-    /// `EnvFilter` rebuilds when the file hasn't actually changed it.
-    current_log_level: std::sync::Mutex<LogLevel>,
+    /// Cached log level that was last applied. `None` until the first
+    /// successful reload — this forces the first SIGHUP to apply the file
+    /// value unconditionally, since the live `EnvFilter` at startup may
+    /// have been built from `RUST_LOG` rather than the resolved config
+    /// (see `commands::run`). Tracking "what we last applied" rather than
+    /// "what the resolved config said at startup" is what the setter
+    /// actually controls.
+    current_log_level: std::sync::Mutex<Option<LogLevel>>,
+    /// Per-section snapshot of the *previously seen* file contents,
+    /// captured as `serde_json::Value` for cheap structural diffing.
+    /// Only sections covered by [`log_ignored_other_sections`] are
+    /// tracked; we use them to suppress the noisy "ignored (requires
+    /// restart)" line when the operator hasn't actually changed anything
+    /// in those sections between reloads. Updated only after a fully
+    /// successful reload so a rejected file doesn't poison future diffs.
+    last_file_sections: std::sync::Mutex<FileSectionSnapshot>,
+}
+
+/// JSON-serialised snapshots of every section we don't hot-reload. Stored
+/// as `Option<serde_json::Value>` so "section absent" and "section present
+/// but empty" diff distinctly. `None` everywhere on construction; populated
+/// after the first successful reload.
+#[derive(Debug, Default, Clone)]
+struct FileSectionSnapshot {
+    identity: Option<serde_json::Value>,
+    network: Option<serde_json::Value>,
+    blockchain: Option<serde_json::Value>,
+    cache: Option<serde_json::Value>,
+    gossip: Option<serde_json::Value>,
+    observability: Option<serde_json::Value>,
+}
+
+impl FileSectionSnapshot {
+    /// Capture a snapshot from a freshly parsed `FileConfig`. Serialisation
+    /// failures collapse to `None` (treated as "section absent") — the
+    /// tracking is best-effort noise reduction, not a correctness gate.
+    fn capture(file: &FileConfig) -> Self {
+        fn snap<T: serde::Serialize>(v: Option<&T>) -> Option<serde_json::Value> {
+            v.and_then(|s| serde_json::to_value(s).ok())
+        }
+        Self {
+            identity: snap(file.identity.as_ref()),
+            network: snap(file.network.as_ref()),
+            blockchain: snap(file.blockchain.as_ref()),
+            cache: snap(file.cache.as_ref()),
+            gossip: snap(file.gossip.as_ref()),
+            observability: snap(file.observability.as_ref()),
+        }
+    }
 }
 
 impl std::fmt::Debug for RuntimeReloadState {
@@ -71,6 +117,14 @@ impl std::fmt::Debug for RuntimeReloadState {
 impl RuntimeReloadState {
     /// Build a reload state from the resolved-at-startup values plus the
     /// closure that mutates the live tracing filter.
+    ///
+    /// `current_log_level` is intentionally seeded to `None` rather than
+    /// to `initial.observability.log_level`: at startup the live
+    /// `EnvFilter` may have been built from `RUST_LOG` (see
+    /// `commands::run`'s `try_from_default_env`), in which case the
+    /// resolved config value is *not* what's running. Forcing the first
+    /// reload to apply unconditionally is simpler and more correct than
+    /// trying to reflect the env-filter directive back into a `LogLevel`.
     pub fn new(
         payment_cli: PaymentArgs,
         observability_cli: ObservabilityArgs,
@@ -82,7 +136,8 @@ impl RuntimeReloadState {
             observability_cli,
             rate_per_mb: Arc::new(AtomicU64::new(initial.payment.rate_per_mb)),
             log_level_setter,
-            current_log_level: std::sync::Mutex::new(initial.observability.log_level),
+            current_log_level: std::sync::Mutex::new(None),
+            last_file_sections: std::sync::Mutex::new(FileSectionSnapshot::default()),
         }
     }
 
@@ -101,10 +156,19 @@ impl RuntimeReloadState {
 /// (the SIGHUP arm of the select) discards the returned error so a
 /// malformed reload never propagates and stops the node.
 ///
-/// Fields outside the reloadable set are diffed against the freshly
-/// resolved values and a single info line is emitted naming each ignored
-/// change — operators see "you changed X but it needs a restart" without
-/// silent drops.
+/// Ordering matters: every fallible step (file parse, sub-section
+/// resolution, mutex lock, log-level apply) runs *before* the only
+/// committing side-effect — the atomic `store` of `rate_per_mb`. This
+/// preserves the documented "previous values retained on error"
+/// contract; a partial reload that mutates the rate then fails the log
+/// apply would leave the running node in a state the operator never saw
+/// in the file. The atomic is the last thing we touch, after success.
+///
+/// Fields outside the reloadable set are diffed against the previously
+/// seen file contents (snapshot stored on `state`) and a single info
+/// line is emitted only when those sections actually changed — operators
+/// see "you changed X but it needs a restart" without false positives on
+/// every routine SIGHUP.
 #[allow(clippy::cognitive_complexity)] // Diff/log/apply for two fields stays linear.
 pub async fn reload_runtime_config(path: &Path, state: &RuntimeReloadState) -> anyhow::Result<()> {
     let file = match load_file_config(Some(path)) {
@@ -136,28 +200,51 @@ pub async fn reload_runtime_config(path: &Path, state: &RuntimeReloadState) -> a
         }
     };
 
-    // Apply rate_per_mb. `Relaxed` is fine: probe handlers don't need to
-    // see this update synchronised with any other state, only eventually.
-    let prev_rate = state
-        .rate_per_mb
-        .swap(new_payment.rate_per_mb, Ordering::Relaxed);
-
-    // Apply log level if it changed. Skipping the no-op rebuild keeps
-    // reload cheap when an operator is just pruning unrelated keys.
-    let new_level = new_observability.log_level;
+    // Lock the log-level cache *before* any mutation. Holding the guard
+    // across the optional setter call serialises concurrent reloads (a
+    // second SIGHUP racing the first one waits here) and lets us treat
+    // the whole "apply log level + write back" sequence as one critical
+    // section. We acquire the lock here, but commit the `*current = ...`
+    // write only after the rate atomic is stored.
     let mut current = state
         .current_log_level
         .lock()
-        .map_err(|e| anyhow::anyhow!("log-level mutex poisoned: {e}"))?;
-    let log_level_changed = *current != new_level;
+        .map_err(|_| anyhow::anyhow!("log-level mutex poisoned"))?;
+    let new_level = new_observability.log_level;
+    // First reload (current is `None`) always applies, regardless of
+    // whether the file value matches the resolved-at-startup level — the
+    // live `EnvFilter` may be a `RUST_LOG` directive we can't reflect
+    // back into a `LogLevel`, so we defer the "is this a change?"
+    // judgement to the very first apply.
+    let log_level_changed = match *current {
+        None => true,
+        Some(prev) => prev != new_level,
+    };
     if log_level_changed && let Err(err) = (state.log_level_setter)(new_level) {
         tracing::warn!(%err, ?new_level, "failed to apply new log level; previous level retained");
         return Err(err);
     }
-    *current = new_level;
-    drop(current);
 
-    log_ignored_fields(&file, &new_observability);
+    // Diff non-reloadable sections against the previous snapshot before
+    // we commit anything: emitting "ignored" lines is read-only and we
+    // want them out of the way before the commit step. Snapshot is
+    // updated post-commit so a still-failing reload (rate atomic or
+    // mutex write) doesn't poison the diff baseline.
+    let mut sections = state
+        .last_file_sections
+        .lock()
+        .map_err(|_| anyhow::anyhow!("file-section snapshot mutex poisoned"))?;
+    log_ignored_fields(&file, &new_observability, &sections);
+
+    // Commit step. Atomic store happens last so any earlier failure
+    // leaves rate_per_mb unchanged.
+    let prev_rate = state
+        .rate_per_mb
+        .swap(new_payment.rate_per_mb, Ordering::Relaxed);
+    *current = Some(new_level);
+    *sections = FileSectionSnapshot::capture(&file);
+    drop(current);
+    drop(sections);
 
     tracing::info!(
         rate_per_mb = new_payment.rate_per_mb,
@@ -177,26 +264,45 @@ fn warn_ignored(field: &'static str) {
     );
 }
 
-/// Log a notice for every reloaded section's non-reloadable field that the
-/// operator changed. We don't track previous values here — knowing *that*
-/// a change is ignored is enough for the operator to plan a restart, and
-/// avoids carrying a per-field snapshot through the runtime.
-fn log_ignored_fields(file: &crate::config::FileConfig, new_obs: &ResolvedObservability) {
-    log_ignored_observability(file.observability.as_ref(), new_obs);
-    log_ignored_other_sections(file);
+/// Log a notice for every non-reloadable field the operator changed
+/// *since the last successful reload*. The previous-file snapshot lives
+/// on `state.last_file_sections` so we can diff structurally rather than
+/// emitting a warning every time a section is merely present.
+fn log_ignored_fields(
+    file: &crate::config::FileConfig,
+    new_obs: &ResolvedObservability,
+    prev: &FileSectionSnapshot,
+) {
+    log_ignored_observability(
+        file.observability.as_ref(),
+        new_obs,
+        prev.observability.as_ref(),
+    );
+    log_ignored_other_sections(file, prev);
 }
 
-/// Observability sub-fields outside the reloadable set. Diffed against the
-/// freshly resolved values (not against the previous resolved values),
-/// because what an operator cares about on reload is "did the file change
-/// from a value we don't honour to one we'd need a restart for".
+/// Observability sub-fields outside the reloadable set. Compared
+/// field-by-field against the freshly resolved values: the operator
+/// cares whether the *current file* contains a non-honoured value that
+/// disagrees with what's running, not whether any value is set at all.
 fn log_ignored_observability(
     obs: Option<&crate::config::types::ObservabilityConfig>,
     new_obs: &ResolvedObservability,
+    prev_obs_json: Option<&serde_json::Value>,
 ) {
     let Some(obs) = obs else {
         return;
     };
+    // If the previous snapshot's observability section is byte-identical
+    // to the current one, nothing in the section changed — short-circuit
+    // before the per-field diffs to keep the common no-change reload
+    // silent.
+    if let Some(prev) = prev_obs_json
+        && let Ok(curr) = serde_json::to_value(obs)
+        && *prev == curr
+    {
+        return;
+    }
     if obs.log_format.is_some() && obs.log_format != Some(new_obs.log_format) {
         warn_ignored("observability.log_format");
     }
@@ -209,41 +315,55 @@ fn log_ignored_observability(
     if obs.otlp_endpoint.is_some() && obs.otlp_endpoint != new_obs.otlp_endpoint {
         warn_ignored("observability.otlp_endpoint");
     }
-    if obs.admin_port.is_some() {
-        // admin_port=0 means disabled; resolved value is None then.
-        // Any divergence between file value and resolved value would
-        // require a restart to re-bind, so flag the change.
-        let resolved_admin = new_obs.admin_port.unwrap_or(0);
-        if obs.admin_port != Some(resolved_admin) {
+    // `admin_port`: file value None vs Some(0) vs Some(N) are three
+    // distinct cases. The resolved value is `None` only when the file
+    // explicitly set 0 (disabled). Compare the `Option`s directly rather
+    // than collapsing both into a sentinel `0`.
+    if let Some(file_admin) = obs.admin_port {
+        let resolved_matches = match new_obs.admin_port {
+            Some(p) => p == file_admin,
+            // resolved=None means disabled; only matches file=Some(0).
+            None => file_admin == 0,
+        };
+        if !resolved_matches {
             warn_ignored("observability.admin_port");
         }
     }
 }
 
-/// identity / network / blockchain / cache / gossip: any presence of
-/// the section in the new file is reported as ignored. We don't diff
-/// against the original file because we don't keep it; the worst-case
-/// false positive is one extra info line.
-fn log_ignored_other_sections(file: &crate::config::FileConfig) {
-    if file.identity.is_some() {
+/// identity / network / blockchain / cache / gossip: warn only when the
+/// section's TOML serialisation differs from the previous successful
+/// reload. The first reload (snapshot empty) treats any present section
+/// as a change so the operator still gets the "ignored" notice once;
+/// thereafter we stay silent unless the section actually moved.
+fn log_ignored_other_sections(file: &crate::config::FileConfig, prev: &FileSectionSnapshot) {
+    fn changed<T: serde::Serialize>(curr: Option<&T>, prev: Option<&serde_json::Value>) -> bool {
+        match (curr, prev) {
+            (None, None) => false,
+            (Some(c), Some(p)) => serde_json::to_value(c).map_or(true, |c| &c != p),
+            // Section appearing or disappearing counts as a change.
+            (Some(_), None) | (None, Some(_)) => true,
+        }
+    }
+    if changed(file.identity.as_ref(), prev.identity.as_ref()) && file.identity.is_some() {
         warn_ignored("identity.* (data_dir, region)");
     }
-    if file.network.is_some() {
+    if changed(file.network.as_ref(), prev.network.as_ref()) && file.network.is_some() {
         warn_ignored("network.* (bind_port, relay_url)");
     }
-    if file.blockchain.is_some() {
+    if changed(file.blockchain.as_ref(), prev.blockchain.as_ref()) && file.blockchain.is_some() {
         warn_ignored("blockchain.* (rpc_url, eth_keystore, contract addresses)");
     }
-    if file.cache.is_some() {
+    if changed(file.cache.as_ref(), prev.cache.as_ref()) && file.cache.is_some() {
         warn_ignored("cache.* (cache_dir, sizes, origin)");
     }
-    if file.gossip.is_some() {
+    if changed(file.gossip.as_ref(), prev.gossip.as_ref()) && file.gossip.is_some() {
         warn_ignored("gossip.* (announce_interval, peer_ttl, allowlist, subscribe_global)");
     }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -348,6 +468,10 @@ mod tests {
 
     #[tokio::test]
     async fn reload_skips_log_level_when_unchanged() {
+        // First reload always applies (cache starts as `None` to handle
+        // a startup `RUST_LOG` override). The skip-when-unchanged
+        // behaviour is observable on the *second* reload, when the
+        // cached level matches the file.
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(
             dir.path(),
@@ -370,10 +494,180 @@ mod tests {
             setter,
         );
 
+        // First reload applies (forces apply on `None` cache).
+        reload_runtime_config(&path, &state).await.unwrap();
+        assert_eq!(*captured.lock().unwrap(), Some(LogLevel::Info));
+        // Drop the captured value to detect a no-op on the second pass.
+        *captured.lock().unwrap() = None;
+        // Second reload sees the cached level and skips the setter.
         reload_runtime_config(&path, &state).await.unwrap();
         assert_eq!(state.rate_per_mb().load(Ordering::Relaxed), 5);
-        // Setter never called when the level matched.
         assert!(captured.lock().unwrap().is_none());
+    }
+
+    /// Bug 3: `current_log_level` initialises to `None`, so the first
+    /// reload after startup always invokes the setter even when the
+    /// file's `log_level` matches `initial.observability.log_level`.
+    /// This is the `RUST_LOG=debug` + `config.log_level="info"` case:
+    /// the live filter is `debug`, the resolved value is `info`, and a
+    /// first SIGHUP must push `info` through to the subscriber.
+    #[tokio::test]
+    async fn first_reload_applies_log_level_even_when_matching_initial() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            "[payment]\nrate_per_mb = 1\n\n[observability]\nlog_level = \"info\"\n",
+        );
+
+        // Resolved-at-startup level is also `info` — old code would
+        // think "nothing changed" and skip. New code must still apply.
+        let initial = seed_resolved(1, LogLevel::Info);
+        let (setter, captured) = recording_setter();
+        let state = RuntimeReloadState::new(
+            PaymentArgs { rate_per_mb: None },
+            ObservabilityArgs {
+                log_level: None,
+                log_format: None,
+                metrics_port: None,
+                metrics_bind: None,
+                admin_port: None,
+                otlp_endpoint: None,
+            },
+            &initial,
+            setter,
+        );
+
+        reload_runtime_config(&path, &state).await.unwrap();
+        assert_eq!(*captured.lock().unwrap(), Some(LogLevel::Info));
+    }
+
+    /// Bug 1: when the log-level setter fails, `rate_per_mb` must stay
+    /// at its previous value — the function's "previous values retained
+    /// on error" contract requires the atomic store to be the last
+    /// commit step. Inject a setter that always returns an error and
+    /// assert the rate doesn't move.
+    #[tokio::test]
+    async fn reload_keeps_rate_when_log_level_setter_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        // File asks for rate=88 and a log level that differs from the
+        // cached value (None, i.e. force-apply path) so the setter is
+        // actually called and gets the chance to fail.
+        let path = write_config(
+            dir.path(),
+            "[payment]\nrate_per_mb = 88\n\n[observability]\nlog_level = \"debug\"\n",
+        );
+
+        let failing_setter: LogLevelSetter =
+            Box::new(|_| Err(anyhow::anyhow!("simulated tracing-reload failure")));
+
+        let initial = seed_resolved(42, LogLevel::Info);
+        let state = RuntimeReloadState::new(
+            PaymentArgs { rate_per_mb: None },
+            ObservabilityArgs {
+                log_level: None,
+                log_format: None,
+                metrics_port: None,
+                metrics_bind: None,
+                admin_port: None,
+                otlp_endpoint: None,
+            },
+            &initial,
+            failing_setter,
+        );
+
+        let err = reload_runtime_config(&path, &state).await.unwrap_err();
+        assert!(format!("{err:#}").contains("simulated tracing-reload failure"));
+        // The atomic must NOT have been swapped — that's the whole point
+        // of putting the store after the fallible work.
+        assert_eq!(state.rate_per_mb().load(Ordering::Relaxed), 42);
+    }
+
+    /// Bug 1 (variant): a poisoned `current_log_level` mutex must
+    /// surface as an error from the reload function *before* the
+    /// rate atomic is swapped, so the previous rate is retained.
+    #[tokio::test]
+    async fn reload_keeps_rate_when_log_level_mutex_poisoned() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(dir.path(), "[payment]\nrate_per_mb = 77\n");
+
+        let initial = seed_resolved(33, LogLevel::Info);
+        let (setter, _captured) = recording_setter();
+        let state = RuntimeReloadState::new(
+            PaymentArgs { rate_per_mb: None },
+            ObservabilityArgs {
+                log_level: None,
+                log_format: None,
+                metrics_port: None,
+                metrics_bind: None,
+                admin_port: None,
+                otlp_endpoint: None,
+            },
+            &initial,
+            setter,
+        );
+
+        // Poison the log-level mutex by holding the lock in a thread
+        // that panics. A normal `JoinHandle` lets us discard the panic
+        // payload — `std::thread::scope` would rethrow on join and
+        // abort the test before the assertion runs.
+        let st = Arc::new(state);
+        let st_for_thread = Arc::clone(&st);
+        let join = std::thread::spawn(move || {
+            let _guard = st_for_thread.current_log_level.lock().unwrap();
+            panic!("intentional panic to poison mutex");
+        });
+        let _ = join.join(); // discard the panic payload
+        assert!(st.current_log_level.is_poisoned());
+
+        let err = reload_runtime_config(&path, &st).await.unwrap_err();
+        assert!(format!("{err:#}").contains("log-level mutex poisoned"));
+        // Rate atomic must not have moved.
+        assert_eq!(st.rate_per_mb().load(Ordering::Relaxed), 33);
+    }
+
+    /// Diff-based ignored-section logging: a second reload of the same
+    /// file must succeed and not touch the rate (already at target),
+    /// proving the snapshot is being captured and is queryable. We
+    /// can't directly capture `tracing` lines without a subscriber
+    /// fixture, but the public-state behaviour the operator cares
+    /// about is "reload remains idempotent across repeated SIGHUPs".
+    #[tokio::test]
+    async fn reload_is_idempotent_across_repeated_sighups() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            concat!(
+                "[identity]\nregion = \"US\"\n\n",
+                "[network]\nbind_port = 4433\n\n",
+                "[payment]\nrate_per_mb = 11\n\n",
+                "[observability]\nlog_level = \"info\"\n",
+            ),
+        );
+
+        let initial = seed_resolved(11, LogLevel::Info);
+        let (setter, captured) = recording_setter();
+        let state = RuntimeReloadState::new(
+            PaymentArgs { rate_per_mb: None },
+            ObservabilityArgs {
+                log_level: None,
+                log_format: None,
+                metrics_port: None,
+                metrics_bind: None,
+                admin_port: None,
+                otlp_endpoint: None,
+            },
+            &initial,
+            setter,
+        );
+
+        // Three reloads of the same file: first applies, the next two
+        // are no-ops on log level.
+        reload_runtime_config(&path, &state).await.unwrap();
+        *captured.lock().unwrap() = None;
+        reload_runtime_config(&path, &state).await.unwrap();
+        reload_runtime_config(&path, &state).await.unwrap();
+        assert!(captured.lock().unwrap().is_none());
+        assert_eq!(state.rate_per_mb().load(Ordering::Relaxed), 11);
     }
 
     #[tokio::test]

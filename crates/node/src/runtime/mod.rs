@@ -39,8 +39,18 @@ const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(15);
 /// server and gossip tasks, and run until a shutdown signal is received.
 ///
 /// SIGHUP triggers a hot-reload of mutable config fields via
-/// [`RuntimeReloadState`] (see ADR-... TODO and issue #236). Other signals
+/// [`RuntimeReloadState`] (see issue #236). Other signals
 /// (SIGINT/SIGTERM) trigger graceful shutdown.
+///
+/// The signal streams (SIGHUP, SIGTERM) are registered **once** before
+/// the select loop and reused on every iteration. Re-creating
+/// `tokio::signal::unix::Signal` each iteration would race with signal
+/// delivery: a SIGHUP that arrives while `reload_runtime_config(..)` is
+/// running would have nowhere to land if the future holding the
+/// `Signal` had already been dropped, and would be silently lost. The
+/// persistent stream queues the signal until the next `recv()` call
+/// (kernel-managed, with coalescing) so concurrent or rapidly-repeated
+/// signals are observed deterministically.
 #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 pub async fn run(
     cfg: ResolvedConfig,
@@ -176,10 +186,17 @@ pub async fn run(
         "node runtime ready"
     );
 
+    // Install signal streams once, before entering the select loop.
+    // tokio docs are explicit that `Signal::recv` is the supported way
+    // to await repeated signals, and re-creating the stream per signal
+    // is not — see `tokio::signal::unix::signal` for the reasoning.
+    let mut shutdown_streams = ShutdownStreams::install();
+    let mut hup_stream = HupStream::install();
+
     let signal = loop {
         tokio::select! {
-            sig = shutdown_signal() => break sig,
-            () = reload_signal() => {
+            sig = shutdown_streams.recv() => break sig,
+            () = hup_stream.recv() => {
                 match config_path.as_deref() {
                     Some(path) => {
                         if let Err(err) =
@@ -385,54 +402,118 @@ impl std::fmt::Display for ShutdownSignal {
     }
 }
 
-/// Wait for SIGHUP. On non-Unix targets returns a future that never
-/// resolves, so the surrounding `select!` collapses to the
-/// shutdown-signal arm — Windows operators don't have SIGHUP and don't
-/// expect hot-reload via signal.
-#[cfg(unix)]
-async fn reload_signal() {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut hup = match signal(SignalKind::hangup()) {
-        Ok(s) => s,
-        Err(err) => {
-            tracing::warn!(%err, "failed to install SIGHUP handler; hot-reload disabled");
-            std::future::pending::<()>().await;
-            return;
-        }
-    };
-    // `recv()` returns Some(()) for each signal; we treat any signal as
-    // "reload now" and let the caller drive a fresh reload pass next
-    // iteration of the select loop.
-    let _ = hup.recv().await;
-}
-
-#[cfg(not(unix))]
-async fn reload_signal() {
-    std::future::pending::<()>().await;
-}
-
-/// Wait for either SIGINT or (on Unix) SIGTERM; return which one fired.
-async fn shutdown_signal() -> ShutdownSignal {
+/// Persistent SIGHUP stream, installed once at startup. The
+/// `Signal` instance lives on `self` for the lifetime of the runtime
+/// so successive SIGHUPs delivered while a reload is in progress are
+/// queued by tokio (kernel-coalesced) rather than dropped. Re-creating
+/// the `Signal` per iteration of the select loop would race signal
+/// delivery — that's the bug this struct exists to prevent.
+///
+/// On non-Unix targets `recv` returns a `pending` future since SIGHUP
+/// doesn't exist there.
+struct HupStream {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut term = match signal(SignalKind::terminate()) {
-            Ok(s) => s,
-            Err(err) => {
-                tracing::warn!(%err, "failed to install SIGTERM handler; falling back to SIGINT only");
-                let _ = tokio::signal::ctrl_c().await;
-                return ShutdownSignal::Sigint;
-            }
-        };
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => ShutdownSignal::Sigint,
-            _ = term.recv() => ShutdownSignal::Sigterm,
+    hup: Option<tokio::signal::unix::Signal>,
+}
+
+impl HupStream {
+    fn install() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let hup = match signal(SignalKind::hangup()) {
+                Ok(s) => Some(s),
+                Err(err) => {
+                    tracing::warn!(%err, "failed to install SIGHUP handler; hot-reload disabled");
+                    None
+                }
+            };
+            Self { hup }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {}
         }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-        ShutdownSignal::Sigint
+
+    /// Wait for the next SIGHUP on the persistent stream. If
+    /// installation failed (`None`) or the platform isn't Unix, this
+    /// future never resolves.
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        {
+            match self.hup.as_mut() {
+                Some(stream) => {
+                    let _ = stream.recv().await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            std::future::pending::<()>().await
+        }
+    }
+}
+
+/// Persistent SIGINT/SIGTERM streams. Installed once at startup so
+/// rapid-fire shutdown signals (e.g. operator pressing Ctrl-C twice)
+/// are coalesced by the kernel rather than potentially lost between
+/// re-registrations of `Signal`.
+struct ShutdownStreams {
+    /// `tokio::signal::ctrl_c` is itself a one-shot future that
+    /// re-registers internally — but `tokio::signal::unix::signal`
+    /// (used for SIGTERM) is not. We park `ctrl_c()` inside `recv`
+    /// directly and rely on tokio's own implementation for SIGINT.
+    #[cfg(unix)]
+    term: Option<tokio::signal::unix::Signal>,
+}
+
+impl ShutdownStreams {
+    fn install() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let term = match signal(SignalKind::terminate()) {
+                Ok(s) => Some(s),
+                Err(err) => {
+                    tracing::warn!(
+                        %err,
+                        "failed to install SIGTERM handler; falling back to SIGINT only",
+                    );
+                    None
+                }
+            };
+            Self { term }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {}
+        }
+    }
+
+    /// Wait for the next SIGINT or (on Unix) SIGTERM and report which
+    /// one fired. The persistent SIGTERM stream lives on `self`, so
+    /// successive calls observe successive signals — there's no
+    /// race window between iterations of the runtime's select loop.
+    async fn recv(&mut self) -> ShutdownSignal {
+        #[cfg(unix)]
+        {
+            if let Some(term) = self.term.as_mut() {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => ShutdownSignal::Sigint,
+                    _ = term.recv() => ShutdownSignal::Sigterm,
+                }
+            } else {
+                let _ = tokio::signal::ctrl_c().await;
+                ShutdownSignal::Sigint
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            ShutdownSignal::Sigint
+        }
     }
 }
 
