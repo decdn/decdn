@@ -92,8 +92,8 @@ The standalone `bindNodeId` function is intended for rebinding only — it delet
 
 | Symptom | Likely cause | Recovery |
 |---------|--------------|----------|
-| `bindNodeId` reverts with `NodeIdAlreadyBound` | A separate operator already registered `newNodeId` | Generate a different keypair and try again. The on-chain ed25519 ownership proof prevents squatting attacks, but pre-existing binding by a different *legitimate* owner is still a hard collision. |
-| `bindNodeId` reverts with `InvalidSignature` | `bindingNonce[ethAddress]` advanced (e.g. another operation incremented it) | Re-read the on-chain nonce, re-sign, resubmit |
+| `bindNodeId` reverts with `"NodeId bound to another address"` | A separate operator already registered `newNodeId` | Generate a different keypair and try again. The on-chain ed25519 ownership proof prevents squatting attacks, but pre-existing binding by a different *legitimate* owner is still a hard collision. |
+| `bindNodeId` reverts with `"invalid signature"` | `bindingNonce[ethAddress]` advanced (e.g. another operation incremented it) or the EIP-712 digest was mis-built | Re-read the on-chain nonce, re-sign, resubmit |
 | Restarted node throws phantom-announcement self-detection | Probe holds were not drained before stop | Stop immediately, file a bug, **do not restart** until the slash-evidence-exposure window (30s per [ADR 005](005-protocol.md)) has elapsed |
 | Peers continue to address the old NodeId | Gossip re-propagation lag | Up to one `node_announce_interval`; if it persists past two intervals, restart gossip subscription |
 
