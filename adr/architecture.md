@@ -62,6 +62,8 @@ For readers approaching the protocol top-to-bottom, follow this thematic order r
 
 ### Chapter 1 — Foundations
 
+The implementation language, the peer mesh's shape, the content-addressing primitive every other chapter inherits, and the wire-protocol surface that carries paid delivery.
+
 1. [ADR 000 — Language and Core Networking Stack](000-language.md)
 2. [ADR 001 — Network Topology and Peer Mesh](001-network.md)
 3. [ADR 002 — Content Addressing](002-content-addressing.md)
@@ -69,10 +71,14 @@ For readers approaching the protocol top-to-bottom, follow this thematic order r
 
 ### Chapter 2 — Discovery
 
+How a client or node finds the right peer for a given hash. The DHT is the primary mechanism; 0-RTT is the latency optimization for repeat probes.
+
 1. [ADR 022 — Content Discovery at Scale (DHT)](022-content-discovery.md)
 2. [ADR 015 — QUIC 0-RTT Connection Establishment](015-zero-rtt.md)
 
 ### Chapter 3 — Payments
+
+Off-chain payment channels for per-MB delivery, with on-chain settlement. Multi-token allowlist follows. Client-side architecture and smart-wallet support are included here because client trust boundaries and key management hang off the payment path.
 
 1. [ADR 003 — Payment Model](003-payments.md)
 2. [ADR 010 — Multi-Token Payment Support](010-multi-token.md)
@@ -80,6 +86,8 @@ For readers approaching the protocol top-to-bottom, follow this thematic order r
 4. [ADR 024 — Account Abstraction and Safe Smart Wallet Support](024-account-abstraction.md)
 
 ### Chapter 4 — Tokenomics & incentives
+
+The economic model that ties the protocol together. Read [ADR 026](026-gauge-boost-tokenomics.md) first (canonical) and [ADR 027](027-distinct-client-receipts.md) second (its launch prerequisite); the rest are extensions, programs, and post-launch follow-ups.
 
 1. [ADR 026 — Gauge-Boost Tokenomics](026-gauge-boost-tokenomics.md) (canonical)
 2. [ADR 027 — Distinct-Client Delivery Receipts](027-distinct-client-receipts.md) (gauge security; launch prerequisite)
@@ -92,6 +100,8 @@ For readers approaching the protocol top-to-bottom, follow this thematic order r
 
 ### Chapter 5 — Verification & enforcement
 
+How protocol violations are detected, adjudicated, and punished. The slashing schedule lives in [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn); this chapter is the evidence and adjudication path.
+
 1. [ADR 014 — On-Chain Verification for Slashing Evidence](014-on-chain-verification.md)
 2. [ADR 007 — Watchtower Design for Channel Disputes](007-watchtower.md)
 3. [ADR 008 — Reputation System](008-reputation.md)
@@ -99,14 +109,20 @@ For readers approaching the protocol top-to-bottom, follow this thematic order r
 
 ### Chapter 6 — Governance & contracts
 
+The governance model that sets the parameters earlier chapters consume, and the cross-contract interaction map that consolidates the on-chain surface.
+
 1. [ADR 009 — Governance Model](009-governance.md)
 2. [ADR 016 — Smart Contract Interaction Model](016-contract-interactions.md)
 
 ### Chapter 7 — Operations
 
+The operator-facing onboarding flow that takes a bare server through staking, registration, gossip warmup, and accepting paid delivery.
+
 1. [ADR 019 — Node Onboarding and Bootstrapping Flow](019-node-onboarding.md)
 
 ### Chapter 8 — Supporting infrastructure
+
+Wire-format evolution rules and the privacy-surface inventory. Both apply across the chapters above.
 
 1. [ADR 013 — Schema Evolution](013-schema-evolution.md)
 2. [ADR 017 — Privacy Analysis](017-privacy.md)
