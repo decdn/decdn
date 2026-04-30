@@ -258,15 +258,17 @@ case-by-case under DAO governance.
 **Allocation.** 10% of pool. Coverage capacity (single high-severity incident vs. multiple lower-severity in series) per economic-model spec §7.
 
 **Coordination with `SafetyReserve` (avoid double-funding).** A single incident draws
-on **at most one** funding source, in this priority order, enforced by the
+on **exactly one of two funding sources** for resolution, enforced by the
 `SafetyReserve.payout` resolution logic (added to [ADR 016](016-contract-interactions.md)
 on acceptance):
 
-1. Organic `SafetyReserve` balance, until exhausted.
-2. Slashing-replenished `SafetyReserve` balance (same wallet, same gates;
-   [ADR 026](026-gauge-boost-tokenomics.md) §8 routes 30% of slashed stake here).
-3. Pre-seed paired allocation, only when 1+2 are insufficient for the authorized
-   payout.
+1. `SafetyReserve`, treated as a **single source** from the contract's perspective.
+   Its available balance may include both:
+   - organic `SafetyReserve` balance; and
+   - slashing-replenished `SafetyReserve` balance (same wallet, same gates;
+     [ADR 026](026-gauge-boost-tokenomics.md) §8 routes 30% of slashed stake here).
+2. Pre-seed paired allocation, only when the authorized payout exceeds the total
+   `SafetyReserve` balance available at decision time.
 
 The `SafetyReserve` evidence-bundle, multisig-fast-track-or-governance, 48-hour
 appeal, and post-incident-reporting gates per [ADR 009](009-governance.md) and
@@ -295,7 +297,7 @@ Quarterly pre-seed program report (capital deployed, success-metric deltas, trig
 
 ### 5. Coordination with `SafetyReserve` (summary)
 
-§2e is the rule. **A single incident draws on at most one funding source** — organic `SafetyReserve` → slashing-replenished `SafetyReserve` → pre-seed paired allocation, in that order. No double-funding. The `SafetyReserve` evidence-bundle / multisig-fast-track / appeal / reporting gates apply unchanged to the paired allocation.
+§2e is the rule. **A single incident draws on exactly one of two funding sources** — `SafetyReserve` (single balance, organic + slashing-replenished commingled in the same wallet), or pre-seed paired allocation when the authorized payout exceeds the total `SafetyReserve` balance at decision time. No double-funding. The `SafetyReserve` evidence-bundle / multisig-fast-track / appeal / reporting gates apply unchanged to the paired allocation.
 
 ### 6. Termination of the pre-seed program as a whole
 
@@ -325,7 +327,7 @@ commitments (active loans, leases, regional grants) continue to term regardless.
 - **Eliminates TOKEN-price reflexivity in bootstrap.** USDC throughout removes the largest tail risk from [ADR 026](026-gauge-boost-tokenomics.md) §Context.
 - **Five non-overlapping recruitment levers**, governance-tunable at the §3 bounds as different frictions dominate.
 - **POO flywheel is self-sustaining** by design — net revenue back to treasury exceeds capital deployed within 24 months (§2a metric).
-- **`SafetyReserve` single-source rule** prevents double-funding by construction (§2e, §5).
+- **`SafetyReserve` two-source rule** (`SafetyReserve` as a single commingled balance, plus pre-seed paired allocation only when payout exceeds it) prevents double-funding by construction (§2e, §5).
 - **Wind-down is principled** — §6 ties termination to a measurable treasury-inflow regime.
 
 ### Negative

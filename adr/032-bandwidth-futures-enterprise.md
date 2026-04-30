@@ -183,26 +183,26 @@ governance proposal thereafter.
 
 #### 2.2 Backing — two layers in priority order
 
-The recourse stack is **strictly ordered** to prevent double-funding, matching the
-priority enforced by the `SafetyReserve.payout` resolution logic per
+The recourse stack uses **two funding sources**, ordered to prevent double-funding,
+matching the resolution logic enforced by `SafetyReserve.payout` per
 [ADR 030](030-preseed-usdc-deployment.md) §2e and the
 [ADR 026](026-gauge-boost-tokenomics.md) §5 spending controls:
 
 | Priority | Source | Purpose | Origin |
 | --- | --- | --- | --- |
-| 1 | `SafetyReserve` organic balance | First line of defense | 3% of routed USDC per [ADR 026](026-gauge-boost-tokenomics.md) §2 |
-| 2 | `SafetyReserve` slashing-replenished balance | Same wallet, same gates | 30% of slashed stake per [ADR 026](026-gauge-boost-tokenomics.md) §8 |
-| 3 | Pre-seed Enterprise SLA paired allocation | Second line of defense | [ADR 030](030-preseed-usdc-deployment.md) §2e (10% of pool, $100K–$300K) |
+| 1 | `SafetyReserve` (single commingled balance) | First line of defense | Organic: 3% of routed USDC per [ADR 026](026-gauge-boost-tokenomics.md) §2. Slashing-replenished: 30% of slashed stake per [ADR 026](026-gauge-boost-tokenomics.md) §8 (same wallet, same gates) |
+| 2 | Pre-seed Enterprise SLA paired allocation | Second line of defense | [ADR 030](030-preseed-usdc-deployment.md) §2e (10% of pool, $100K–$300K) |
 
-**A single SLA breach draws on at most one source.** The `SafetyReserve.payout`
-contract enforces priority — pre-seed paired allocation only releases when sources 1
-and 2 are insufficient for the authorized payout amount. This is identical to the
-[ADR 030](030-preseed-usdc-deployment.md) §2e / §5 single-source rule and reuses the
+**A single SLA breach draws on exactly one of these two sources.** The
+`SafetyReserve.payout` contract enforces priority — pre-seed paired allocation only
+releases when the authorized payout amount exceeds the total `SafetyReserve` balance
+available at decision time. This is identical to the
+[ADR 030](030-preseed-usdc-deployment.md) §2e / §5 two-source rule and reuses the
 same on-chain resolution code.
 
 The `SafetyReserve` payout gates ([ADR 026](026-gauge-boost-tokenomics.md) §5: evidence bundle,
 multisig-or-governance authorization, 48-hour appeal window, post-incident registry)
-apply unchanged to all three sources. The pre-seed paired allocation is **not** a
+apply unchanged to both sources. The pre-seed paired allocation is **not** a
 fast-track — it shares the full SafetyReserve gating regardless of which source funds
 the payout.
 
@@ -210,7 +210,7 @@ the payout.
 
 | Mechanism | Where enforced |
 | --- | --- |
-| Single funding source per incident | `SafetyReserve.payout` (priority order in §2.2) |
+| Exactly one of two funding sources per incident | `SafetyReserve.payout` (priority order in §2.2) |
 | One pending payout per `(contract, breach-window)` | Contract-level invariant |
 | Cumulative paired-allocation cap | [ADR 030](030-preseed-usdc-deployment.md) §2e success metrics (no cross-program raids) |
 | Quarterly reporting | [ADR 030](030-preseed-usdc-deployment.md) §4 public registry |
