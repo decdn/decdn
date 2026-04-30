@@ -62,6 +62,70 @@ Clients probe candidate nodes, pick the best by the unified selection score (see
 
 ---
 
+## Reading Order
+
+For readers approaching the protocol top-to-bottom, follow this thematic order rather than the numeric one. Each chapter assumes the previous chapters are read. (See also [`README.md` § Design principles](README.md#design-principles) for the protocol's framing before diving in.)
+
+### Chapter 1 — Foundations
+
+1. [ADR 000 — Language and Core Networking Stack](000-language.md)
+2. [ADR 001 — Network Topology and Peer Mesh](001-network.md)
+3. [ADR 002 — Content Addressing](002-content-addressing.md)
+4. [ADR 005 — Wire Protocol](005-protocol.md)
+
+### Chapter 2 — Discovery
+
+1. [ADR 022 — Content Discovery at Scale (DHT)](022-content-discovery.md)
+2. [ADR 015 — QUIC 0-RTT Connection Establishment](015-zero-rtt.md)
+
+### Chapter 3 — Payments
+
+1. [ADR 003 — Payment Model](003-payments.md)
+2. [ADR 010 — Multi-Token Payment Support](010-multi-token.md)
+3. [ADR 012 — Client Architecture, Bootstrap, and Trust Model](012-client.md)
+4. [ADR 024 — Account Abstraction and Safe Smart Wallet Support](024-account-abstraction.md)
+
+### Chapter 4 — Tokenomics & incentives
+
+1. [ADR 026 — Gauge-Boost Tokenomics](026-gauge-boost-tokenomics.md) (canonical)
+2. [ADR 027 — Distinct-Client Delivery Receipts](027-distinct-client-receipts.md) (gauge security; launch prerequisite)
+3. [ADR 018 — Liquidity Strategy (Balancer 80/20 POL)](018-liquidity-strategy.md)
+4. [ADR 028 — Native sveTOKEN Liquid-ve Wrapper](028-sve-token-wrapper.md) (deferred)
+5. [ADR 029 — Adaptive FeeRouter Parameters](029-adaptive-fee-router.md) (deferred)
+6. [ADR 030 — Pre-Seed USDC Deployment Program](030-preseed-usdc-deployment.md)
+7. [ADR 031 — Burn-and-Mint Client TOKEN Prepay](031-bme-client-prepay.md) (post-launch)
+8. [ADR 032 — Bandwidth Futures and Enterprise SLA Tier](032-bandwidth-futures-enterprise.md) (post-launch)
+
+### Chapter 5 — Verification & enforcement
+
+1. [ADR 014 — On-Chain Verification for Slashing Evidence](014-on-chain-verification.md)
+2. [ADR 007 — Watchtower Design for Channel Disputes](007-watchtower.md)
+3. [ADR 008 — Reputation System](008-reputation.md)
+4. [ADR 011 — Content Takedown and Hash Blacklisting](011-content-takedown.md)
+
+### Chapter 6 — Governance & contracts
+
+1. [ADR 009 — Governance Model](009-governance.md)
+2. [ADR 016 — Smart Contract Interaction Model](016-contract-interactions.md)
+
+### Chapter 7 — Operations
+
+1. [ADR 019 — Node Onboarding and Bootstrapping Flow](019-node-onboarding.md)
+2. [ADR 020 — Observability and Metrics Standard](020-observability.md)
+3. [ADR 023 — PoC/Production Seam Architecture](023-poc-production-seams.md)
+4. [ADR 025 — Local Admin HTTP Surface](025-local-admin-http.md)
+
+### Chapter 8 — Supporting infrastructure
+
+1. [ADR 021 — Production L2 Chain Selection](021-l2-chain-selection.md)
+2. [ADR 013 — Schema Evolution](013-schema-evolution.md)
+3. [ADR 017 — Privacy Analysis](017-privacy.md)
+4. [ADR 006 — End-to-End Encryption and Key Distribution](006-e2e-encryption.md)
+
+The numeric per-ADR index below stays as the canonical reference.
+
+---
+
 ## Architectural Decisions
 
 ### [ADR 000 — Language and Core Networking Stack](000-language.md)
@@ -372,19 +436,7 @@ The system relies on several infrastructure-level assumptions beyond the cryptog
 
 ## Glossary
 
-| Term | Definition |
-| --- | --- |
-| **Blob** | A content-addressed byte sequence identified by its BLAKE3 hash |
-| **Chunk** | The BLAKE3 hash tree leaf size (1024 bytes). iroh-blobs uses this for verified streaming. On-chain Merkle proofs for slash evidence reference this leaf size — see [ADR 002](002-content-addressing.md) |
-| **Hash sequence** | An ordered collection of blob hashes (iroh's equivalent of a directory/manifest) |
-| **Voucher** | A signed off-chain payment message: `{channelId, amount, nonce, token, signature}` |
-| **ALPN** | Application-Layer Protocol Negotiation — identifies which protocol a QUIC connection uses |
-| **Node** | A staked participant that caches and serves blobs. Some are configured with an origin backend; others are pure caches. |
-| **Client** | A lightweight QUIC endpoint that streams content and pays per MB |
-| **Origin-backed node** | A node configured with an S3-compatible object store (e.g., S3/R2/B2/MinIO), NFS mount, or local disk — can serve any blob in that store, never experiences a true cache miss |
-| **Slash signature** | An EIP-712 secp256k1 signature (`slash_sig`) on protocol messages, used for on-chain slash evidence via `ecrecover`. Distinct from the Ed25519 wire signature — see [ADR 014](014-on-chain-verification.md) |
-| **SlashJudge** | The on-chain contract that adjudicates all slashable offenses, verifies slash signatures, manages challenge bonds, and calls `StakingRegistry.slash()` — see [ADR 014](014-on-chain-verification.md) |
-| **WatchtowerEscrow** | The on-chain contract that manages prepaid watchtower monitoring fees and enforces heartbeat-based liveness accountability. Standalone contract that reads channel state but does not modify the payment channel contract — see [ADR 007](007-watchtower.md) |
+The canonical glossary lives in [`README.md` § Glossary](README.md#glossary), grouped into four categories: wire protocol & content, payments, tokenomics & incentives, and on-chain enforcement.
 
 ---
 

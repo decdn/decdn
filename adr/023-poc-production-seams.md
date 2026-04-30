@@ -20,7 +20,7 @@ The goal is a clean mechanical answer to: **how does the codebase express the di
 |-----------|-----|------------|--------|
 | Payment contract | `StablePaymentChannel` (USDC-only) | `PaymentChannel` (multi-token allowlist) | ADR 003, 010 |
 | Governance | Single admin key (`onlyOwner`) | OpenZeppelin Governor + 2-day Timelock | ADR 009 |
-| Challenge bond | 100 TOKEN | 50 TOKEN | ADR 026 |
+| Challenge bond | 100 TOKEN | 100 TOKEN | ADR 026 |
 | Corruption verification | Optimistic challenge-response (signed `StreamResponse`) | Interactive keccak256 Merkle proof over 1 KiB chunks | ADR 014 |
 | Buyback | Accumulate-only (`executeBuyback` never called) | Active execution via `BuybackBurner` after activation criteria met | ADR 018, 026 |
 | Key management (node) | File-based (`~/.decdn/node.key`) | Platform keychain + hardware wallet via delegated hot key | ADR 012 |
@@ -117,7 +117,7 @@ pub trait GovernanceClient: Send + Sync {
 | | PoC | Production |
 |---|-----|------------|
 | Source | Direct RPC call to `StakingRegistry` (admin key controls params) | RPC call to Governor-managed params via Timelock |
-| Challenge bond | 100 TOKEN | 50 TOKEN |
+| Challenge bond | 100 TOKEN | 100 TOKEN |
 | Buyback | `BuybackBurner` receives fees; `executeBuyback` never called | Called by keeper after activation criteria met (ADR 018) |
 
 ### 5. `WatchtowerClient` — `crates/incentive`
@@ -179,7 +179,7 @@ Concrete values:
 | Constant | PoC | Production |
 |----------|-----|------------|
 | `popular_hashes_max` | 20 | 5 (ADR 017 — reduces content inventory leakage) |
-| `challenge_bond_token` | 100 TOKEN (1e20 base units) | 50 TOKEN |
+| `challenge_bond_token` | 100 TOKEN (1e20 base units) | 100 TOKEN (1e20 base units) |
 | `announce_interval_secs` | 60 | 60 (same; tunable by governance) |
 | `min_stake_token` | Operator-configured | Operator-configured; min enforced by contract |
 | `dispute_window_secs` | 48 × 3600 (172800) | Governable 12h–72h; default 48h at genesis |
