@@ -1,7 +1,7 @@
 //! Persistent-signal-stream contract for SIGHUP and SIGTERM.
 //!
 //! The unit tests in `runtime::reload::tests` stub out signal delivery
-//! and call `reload_runtime_config` directly. That covers the reload
+//! and call `RuntimeReloadState::reload` directly. That covers the reload
 //! semantics, but it can't catch the bug the SIGHUP path was originally
 //! refactored to fix: re-creating the `tokio::signal::unix::Signal`
 //! every iteration of the runtime select loop drops signals delivered
@@ -30,7 +30,7 @@ use decdn_node::config::{
     ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedGossip, ResolvedIdentity,
     ResolvedNetwork, ResolvedObservability, ResolvedPayment,
 };
-use decdn_node::runtime::{LogLevelSetter, RuntimeReloadState, reload_runtime_config};
+use decdn_node::runtime::{LogLevelSetter, RuntimeReloadState};
 use nix::sys::signal::{Signal, raise};
 
 /// Build the same minimal `ResolvedConfig` the unit tests use.
@@ -95,7 +95,7 @@ fn write_config(path: &Path, body: &str) {
 
 /// Drives a `HupStream`-style reload loop on the current task. Each
 /// iteration: wait for the next SIGHUP, then call
-/// `reload_runtime_config`. The loop terminates after `expected`
+/// `RuntimeReloadState::reload`. The loop terminates after `expected`
 /// successful reloads so the test doesn't hang on a missing signal.
 async fn run_reload_loop(
     state: Arc<RuntimeReloadState>,
@@ -111,7 +111,7 @@ async fn run_reload_loop(
         if hup.recv().await.is_none() {
             anyhow::bail!("SIGHUP stream closed before {expected} reloads");
         }
-        if let Err(err) = reload_runtime_config(&path, &state).await {
+        if let Err(err) = state.reload(&path).await {
             anyhow::bail!("reload failed at iteration {applied}: {err:#}");
         }
         applied += 1;

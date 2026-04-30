@@ -2,7 +2,7 @@
 
 pub mod reload;
 
-pub use reload::{LogLevelSetter, RuntimeReloadState, reload_runtime_config};
+pub use reload::{LogLevelSetter, RuntimeReloadState};
 
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -199,9 +199,7 @@ pub async fn run(
             () = hup_stream.recv() => {
                 match config_path.as_deref() {
                     Some(path) => {
-                        if let Err(err) =
-                            reload_runtime_config(path, &reload_state).await
-                        {
+                        if let Err(err) = reload_state.reload(path).await {
                             tracing::warn!(%err, "config reload error");
                         }
                     }
@@ -382,9 +380,8 @@ async fn build_cache(cfg: &ResolvedConfig) -> anyhow::Result<CacheEngine> {
 
 /// Which OS signal triggered shutdown. Returned by [`ShutdownStreams::recv`] so
 /// the "shutdown signal received" log line records the cause (SIGINT vs.
-/// SIGTERM) — operators need that distinction for post-incident analysis,
-/// and a future drain path can branch on it (immediate on SIGINT, graceful
-/// on SIGTERM). `Sigterm` is unreachable on non-unix targets.
+/// SIGTERM) — operators grep that field for post-incident analysis.
+/// `Sigterm` is unreachable on non-unix targets.
 #[derive(Debug, Clone, Copy)]
 enum ShutdownSignal {
     Sigint,
