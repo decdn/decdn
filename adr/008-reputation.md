@@ -301,9 +301,9 @@ The reputation system can expose a per-operator **regional-coverage signal** —
 
 **This signal is not an input to `final_score` or to gauge-pool eligibility (Section 12).** It is an externally-readable per-operator attribute computed from the same gossip reports and local observations that drive Sections 3–4, exposed via the same gossip topic (`cdn/reputation/v1`) for downstream programs to consume.
 
-**Forward reference: ADR 030 (pre-seed USDC deployment program)** — the program defined there may consult the regional-coverage signal as one input to **regional-deploy grant eligibility**, hardware-leasing subsidies, and staking-loan approval decisions. The deployment program owns that decision and its threshold; this ADR commits only to publishing the signal in a form the program can read.
+**Consumer.** Downstream operational programs (e.g., regional deployment grants, hardware-leasing subsidies, staking-loan approvals) may consult this signal as one input to their own decisions. The reputation system commits only to publishing the signal in a form those programs can read; eligibility decisions and thresholds belong to the consuming programs.
 
-The signal is intentionally lightweight (e.g., a small set of region-bucketed delivery-volume counters with the same EWMA / decay treatment as `local_score`); the precise aggregation mechanic and region taxonomy are deferred to ADR 030. The reputation system carries no logic that would deny eligibility based on region — that is the deployment program's sole prerogative.
+The signal is intentionally lightweight (e.g., a small set of region-bucketed delivery-volume counters with the same EWMA / decay treatment as `local_score`); the precise aggregation mechanic and region taxonomy are out of scope for this ADR. The reputation system carries no logic that would deny eligibility based on region — that is each consuming program's sole prerogative.
 
 ### 14. PoC Scope
 
@@ -319,7 +319,7 @@ The signal is intentionally lightweight (e.g., a small set of region-bucketed de
 | ReputationReport gossip | Not implemented | Signed reports on `cdn/reputation/v1` topic |
 | Anti-wash-trading (Sections 4.1–4.2) | Not implemented (no gossip, no reporter weight) | Distinct-counterparty discount + settlement time decay |
 | Gauge-pool eligibility gating (Section 12) | Not implemented (no gauge pool in PoC; ADR 026 + ADR 027 are post-PoC) | High/Medium/Low receipt-tier gating wired into ADR 027 receipt validation |
-| Regional-coverage signal (Section 13) | Not implemented | Per-operator regional bucket counters published on `cdn/reputation/v1`; consumed by ADR 030 |
+| Regional-coverage signal (Section 13) | Not implemented | Per-operator regional bucket counters published on `cdn/reputation/v1`; consumed by downstream operational programs |
 | Tie-breaking | Simplified: lower load → random | Full 4-tier (load → geo → stake → random) |
 | Initial score | 0.5 (same) | 0.5 |
 
@@ -342,7 +342,7 @@ PoC action items:
 - Cold-start bootstrap gives new nodes enough traffic to build a real track record
 - Decay prevents stale high scores from persisting indefinitely
 - Gauge-pool eligibility gating (Section 12) reuses the existing reputation surface to harden ADR 026's gauge formula against wash-traded byte counts, with no new scoring mechanism — the High/Medium/Low tiers are derived from `final_score` and add multiplicative cost (2× receipt requirement at Medium, full exclusion at Low) to operators with degraded service quality
-- Regional-coverage signal (Section 13) is exposed but not coupled to scoring or selection — ADR 030 owns the deployment-grant decisions, keeping the reputation system narrowly focused on service-quality measurement
+- Regional-coverage signal (Section 13) is exposed but not coupled to scoring or selection — downstream operational programs own deployment-grant decisions, keeping the reputation system narrowly focused on service-quality measurement
 
 ### Negative
 

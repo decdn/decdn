@@ -352,14 +352,6 @@ after re-registration to associate the new `nodeId` with the same `ethAddress` �
 
 ---
 
-### Pre-seed USDC Bootstrap Programs
-
-Operators lacking the 50K-TOKEN minimum stake or up-front infrastructure capital may qualify for supplementary onboarding paths funded from the **$1M+ pre-seed USDC capital** ([ADR 026 §10](026-gauge-boost-tokenomics.md#10-bootstrap-mechanism-pre-seed-usdc)). Path mechanics, eligibility, sizing, and governance live in [ADR 030](030-preseed-usdc-deployment.md): Protocol-Owned Operators, hardware-leasing subsidies, staking loans, regional-deploy grants, and the Enterprise SLA guarantee fund.
-
-ve-locking is opt-in for all operators (subsidized or self-funded); the bootstrap mechanism is USDC-denominated and contains no TOKEN subsidies to auto-lock. Operators using any pre-seed path still complete Phases 1–5 above — the program changes how stake / hardware is obtained, not the onboarding sequence.
-
----
-
 ### PoC Simplifications
 
 | Area | PoC | Production |
