@@ -84,7 +84,7 @@ Clients manage two independent cryptographic keys.
 
 #### iroh Identity Key (Ed25519)
 
-- **Purpose:** Defines the client's `NodeId` in the peer mesh. Used for QUIC connection authentication — both for CDN delivery (`cdn/client/v1`, `cdn/probe/v1`) and for key delivery from the app server (`cdn/keys/v1`, [Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md)).
+- **Purpose:** Defines the client's `NodeId` in the peer mesh. Used for QUIC connection authentication on `cdn/client/v1` and `cdn/probe/v1`.
 - **Generation:** Created at first startup via `iroh::SecretKey::generate()`.
 - **Storage (PoC):** File at `~/.decdn/iroh_key`, permissions `0600`. No encryption — the file contains the raw 32-byte secret key.
 - **Storage (production):** Platform keychain (macOS Keychain, Windows Credential Manager, Linux Secret Service API).
@@ -127,7 +127,7 @@ Client identity bindings are **ephemeral and per-connection**, as specified in [
 
 | Compromised key | Impact | Response |
 | --- | --- | --- |
-| iroh Ed25519 | Attacker can impersonate client NodeId (connect to nodes, receive gossip) but cannot sign vouchers or move funds. If the client uses a companion app server (see [Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md)), the attacker can also connect to it as this NodeId, but cannot authenticate without the session token — no content access. | Generate new iroh key, reconnect |
+| iroh Ed25519 | Attacker can impersonate client NodeId (connect to nodes, receive gossip) but cannot sign vouchers or move funds. | Generate new iroh key, reconnect |
 | Ethereum secp256k1 | Attacker can sign vouchers draining the payment channel balance | Race to close channels: call `closeChannel` with the latest voucher nonce. If attacker has already submitted a close with a higher-nonce voucher, dispute within the challenge window ([ADR 003](003-payments.md)). No revocation mechanism exists beyond racing to close. |
 | Both | Full impersonation | Close all channels immediately. Generate new iroh key. Use a new Ethereum address for future sessions. |
 
@@ -165,7 +165,6 @@ Each client release ships with a built-in default seed list compiled into the bi
 - **RPC endpoint:** Returns correct registry data. A compromised RPC can return a fabricated node list (eclipse). Mitigated in production by multi-source bootstrap (Option B above).
 - **Registry correctness:** The `StakingRegistry` contract accurately reflects staked nodes. Enforced by EVM execution — trust in the chain, not any specific party.
 - **Gossip integrity:** `NodeAnnounce` messages are signed by the announcing node's registered key and validated against the registry. A node cannot forge another's announcement. However, `LoadHint` and `popular_hashes` are advisory — a node can lie, affecting selection quality but not safety.
-- **App server:** For encrypted content ([Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md)), the client trusts the app server to deliver correct epoch keys and envelopes over `cdn/keys/v1`. The QUIC handshake authenticates the app server's NodeId; the session token binds the client to its subscriber account. The app server is outside the CDN protocol boundary but shares the iroh transport layer.
 - **Clock:** NTP-synchronized local clock, used for gossip validation (±60 s freshness). Drift beyond this window causes the client to reject valid gossip.
 
 **Not trusted — the client does not rely on these:**
@@ -199,11 +198,6 @@ registry_refresh_secs = 600                  # 10 minutes
 dns_seeds = []
 min_peer_diversity = 3                       # Option C threshold (production)
 
-[app_server]
-# Required for encrypted content (see encrypted-content-publishing appendix). Omit for plaintext PoC.
-node_id = ""                                 # app server's iroh NodeId (hex)
-addrs = []                                   # app server multiaddrs
-
 [keys]
 # Paths use ~ as shorthand; the client MUST perform home-directory expansion.
 iroh_key_path = "~/.decdn/iroh_key"
@@ -233,7 +227,7 @@ The client queries all configured seed domains, cross-checks returned NodeIds ag
 
 **Positive:**
 
-- Consolidates all client behaviour scattered across ADRs 001, 003, 005, 008, and the encrypted-content-publishing appendix into a single canonical specification
+- Consolidates all client behaviour scattered across ADRs 001, 003, 005, and 008 into a single canonical specification
 - Resolves the eclipse attack open question from ADR 003 with a concrete decision (Option B for production)
 - Establishes an explicit trust boundary, making security assumptions auditable
 - PoC key management is simple (file-based EOA or Safe wallet) with a clear production upgrade path (Safe multisig with session keys — see [ADR 024](024-account-abstraction.md))
@@ -397,14 +391,8 @@ struct Manifest {
 }
 
 struct ChunkEntry {
-    hash: [u8; 32],       // BLAKE3 hash of the chunk blob (ciphertext if encrypted)
+    hash: [u8; 32],       // BLAKE3 hash of the chunk blob
     size: u64,
-    encryption: Option<ChunkEncryption>,  // None for unencrypted
-}
-
-struct ChunkEncryption {
-    epoch_id: u32,        // epoch under which K_blob is wrapped (see appendix-encrypted-content-publishing.md)
-    // K_blob itself is NOT in the manifest; delivered by the app server only
 }
 ```
 
@@ -417,10 +405,6 @@ The manifest blob is pushed to the CDN like any other blob. It is typically < 1 
 2. For each chunk in order: `StreamRequest{hash: chunk.hash}`, write to
    `~/.decdn/downloads/<H_manifest>/chunk-<index>.part`, verify BLAKE3.
 3. After all chunks verified: concatenate in order → output file; delete part files.
-
-For encrypted files, fetch `K_blob` per chunk from the app server (`cdn/keys/v1` — [Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md))
-and decrypt before writing. Chunk boundaries align with the parallel download range assignment
-(see above).
 
 ### Blob retention
 
