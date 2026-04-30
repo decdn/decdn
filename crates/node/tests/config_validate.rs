@@ -192,6 +192,7 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             eth_keystore: PathBuf::from("/var/lib/decdn/keystore.json"),
             payment_channel_address: "0x0000000000000000000000000000000000000001".to_string(),
             staking_registry_address: "0x0000000000000000000000000000000000000002".to_string(),
+            rpc_watchdog_interval_sec: 30,
         },
         cache: ResolvedCache {
             cache_dir: PathBuf::from("/var/lib/decdn/cache"),
