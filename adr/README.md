@@ -54,7 +54,7 @@ Terms used across multiple ADRs without inline definition.
 | **Channel** | An off-chain payment channel between a client and a node. Funded with USDC (or a governance-approved ERC-20 in production), settled on-chain after the dispute window — see [ADR 003](003-payments.md). |
 | **Voucher** | A signed off-chain payment message: `{channelId, amount, nonce, token, signature}`. The bearer instrument for per-MB payments. |
 | **TOKEN** | The protocol's native fixed-supply (1B) ERC-20. Used for staking, governance, gauge-boost, and slashing — see [ADR 026](026-gauge-boost-tokenomics.md). |
-| **USDC** | The payment-and-settlement currency. All channel deposits, fee distribution, and pre-seed programs are USDC-denominated — see [ADR 003](003-payments.md), [ADR 026](026-gauge-boost-tokenomics.md), [ADR 030](030-preseed-usdc-deployment.md). |
+| **USDC** | The payment-and-settlement currency. All channel deposits, fee distribution, and the externally-raised pre-seed pool are USDC-denominated — see [ADR 003](003-payments.md), [ADR 026](026-gauge-boost-tokenomics.md). |
 
 ### Tokenomics & incentives
 
@@ -66,9 +66,8 @@ Terms used across multiple ADRs without inline definition.
 | **Gauge / gauge-boost** | Curve-style mechanism that scales an operator's share of the 40% gauge pool by ve-weighted commitment, not raw bytes. The boost-floor parameter caps the worst-case ratio between an unboosted and fully-boosted operator. |
 | **`working_bytes`** | The gauge-formula input. Per-operator: `min(bytes_i, 0.4 * bytes_i + 0.6 * (ve_i / total_ve) * total_bytes)`. Replaces Curve's LP-deposit primitive with verified-bytes-delivered. |
 | **ve / VotingEscrow** | Vote-escrowed TOKEN: a non-transferable, time-decaying lock of underlying TOKEN that grants gauge-boost and governance weight. Opt-in (no auto-ve-lock-on-vest) — see [ADR 026 §4](026-gauge-boost-tokenomics.md#4-voting-escrow-votingescrow). |
-| **sveTOKEN** | A native Frax-sfrxETH-style liquid-ve wrapper that holds a single pooled `VotingEscrow` lock, against which transferable sveTOKEN claims are issued. Deferred — see [ADR 028](028-sve-token-wrapper.md). |
 | **FeeRouter** | The settlement-time six-bucket USDC distributor. Split: 40 node base / 40 gauge / 7 delegator / 5 burn / 5 treasury / 3 safety. Atomic same-tx for the 40+5+5+3 legs; epoch-bucketed for the 40 gauge / 7 delegator legs. |
-| **SafetyReserve** | A governance-gated USDC incident reserve (3% bucket). Payouts cover SLA failures, incorrect-slashing reversals, payment-channel downtime, and bad-data incidents — see [ADR 026 §5](026-gauge-boost-tokenomics.md#5-safety-and-insurance-reserve-3-bucket). |
+| **SafetyReserve** | A governance-gated USDC incident reserve (3% bucket). Payouts cover incorrect-slashing reversals, payment-channel downtime, and bad-data incidents — see [ADR 026 §5](026-gauge-boost-tokenomics.md#5-safety-and-insurance-reserve-3-bucket). |
 
 ### On-chain enforcement
 

@@ -18,7 +18,7 @@ The economic model — sitting on top of paid byte delivery ([ADR 003](003-payme
 
 This ADR is the canonical economic model addressing all four. Burn is one of several deflationary levers; real yield in TOKEN flows to delegators and ve-lockers; operator compensation differentiates by long-term ve-commitment via a Curve-style gauge boost rather than by a discounted skim percentage; bootstrap is USDC-denominated. Full design reasoning, MEV-defense analysis, equilibrium-stability argument, and reference-implementation pointers live in the source design spec; this ADR is the decision layer.
 
-**Inputs assumed by this ADR.** Pre-launch design with no holder-compensation or contract-migration concerns. ~$1M+ pre-seed USDC capital secured (planning target $3M) — program structure defined in companion [ADR 030](030-preseed-usdc-deployment.md). 2026 unmetered-bandwidth provider economics per the design spec's input matrix (1 Gbps VPS, 10 Gbps dedicated, 100 Gbps edge tiers); dedicated-bandwidth nodes are realistic at every scale band the protocol is sized for.
+**Inputs assumed by this ADR.** Pre-launch design with no holder-compensation or contract-migration concerns. ~$1M+ pre-seed USDC capital secured (planning target $3M); program structure is operational and tracked separately. 2026 unmetered-bandwidth provider economics per the design spec's input matrix (1 Gbps VPS, 10 Gbps dedicated, 100 Gbps edge tiers); dedicated-bandwidth nodes are realistic at every scale band the protocol is sized for.
 
 Earlier internal drafts explored alternative shapes — a flat protocol-fee skim, a 200M-TOKEN bootstrap fund, a regressive fee-discount mechanic, auto-ve-lock-on-vest. Those are documented in [Alternatives Considered](#alternatives-considered) below.
 
@@ -31,6 +31,8 @@ The protocol's economic model is defined by the following sections. Where a tabl
 ### 1. Supply and distribution
 
 **Supply.** 1,000,000,000 TOKEN, fixed at genesis. No post-genesis minting function exists on the production token contract.
+
+**Burnability.** TOKEN is `ERC20Burnable`; any contract may burn TOKEN it holds via `burn` / `burnFrom`. Burns reduce `totalSupply` and emit `Transfer(from, address(0), amount)`. The §8 slashing-burn path uses this; future contract surfaces that need a TOKEN sink integrate via the same standard interface without contract changes.
 
 **Allocation (1B total).** Six buckets summing to 100%. Vesting profile per the design spec §2.1; effective release rate is ~24%/yr during the active vesting window (Y1–Y3), 16%/yr in Y4, then zero.
 
@@ -48,7 +50,7 @@ The protocol's economic model is defined by the following sections. Where a tabl
 
 **No auto-ve-lock on vest.** Vesting contracts release TOKEN unlocked into the recipient's wallet. Locking into `VotingEscrow` is opt-in. Rationale: the gauge-boost mechanism (§2) supplies a strong voluntary economic incentive to ve-lock without forcing long-term alignment via the vesting contract — seed/team term sheets are simpler, and lockers self-select. The cost is a thinner initial veTOKEN base; governance bootstrap may require treasury-funded ve-lock-on-claim airdrops in the first 6–12 months (see §9).
 
-**No protocol-issued node-bootstrap fund.** Bootstrap supply-side incentive is funded externally via $1M+ pre-seed USDC capital, eliminating TOKEN-price reflexivity in subsidy purchasing power. Program structure in [ADR 030](030-preseed-usdc-deployment.md).
+**No protocol-issued node-bootstrap fund.** Bootstrap supply-side incentive is funded externally via $1M+ pre-seed USDC capital, eliminating TOKEN-price reflexivity in subsidy purchasing power. Program structure is operational and tracked separately.
 
 ### 2. FeeRouter split (40/40/7/5/5/3)
 
@@ -70,7 +72,7 @@ The protocol's economic model is defined by the following sections. Where a tabl
 
 **Node-to-node cache-miss paid pulls bypass the router.** Direct peer USDC payment, no skim. Internal cost-recovery flow, not net protocol revenue.
 
-**Gross client rate.** $0.01/GB — at parity with Bunny.net's budget tier and 7–20× cheaper than major traditional CDNs. No deCDN-specific premium. The router's 60% aggregate non-base skim is absorbed by operator net revenue, recovered through gauge-boost yield (§7), TOKEN-economy exposure, and the pre-seed USDC subsidy programs ([ADR 030](030-preseed-usdc-deployment.md)) — never passed to clients.
+**Gross client rate.** $0.01/GB — at parity with Bunny.net's budget tier and 7–20× cheaper than major traditional CDNs. No deCDN-specific premium. The router's 60% aggregate non-base skim is absorbed by operator net revenue, recovered through gauge-boost yield (§7), TOKEN-economy exposure, and externally-funded pre-seed USDC subsidies — never passed to clients.
 
 **Epoch mechanics.** Epoch length is 1 week (7 × 86400 s, block-timestamp-aligned). At epoch rollover the gauge and delegator buckets freeze, new buckets open, and per-operator `bytes_delivered` counters reset. ve-balance snapshots are taken at the epoch-boundary timestamp via `VotingEscrow.balanceOfAt(user, ts)`. Claim window is 26 epochs (~6 months); unclaimed allocations sweep to the treasury.
 
@@ -116,16 +118,18 @@ Vote-escrowed TOKEN. Modeled on veCRV with deliberate deviations.
 
 **Historical checkpointing.** `VotingEscrow.balanceOfAt(user, ts)` and `totalSupplyAt(ts)` are load-bearing for the epoch-snapshot pattern in §2 and the governance pattern in §8. Per-lock checkpoints; reads O(log n) on the checkpoint array; writes O(1) amortized.
 
+**Lock ownership.** Locks may be held by any address — EOA or contract. Lock creation (`createLock`), amount increase (`increaseAmount`), and time extension (`increaseUnlockTime`) are stable for cross-contract integration. A future contract that holds a pooled lock on behalf of multiple beneficiaries (e.g., a liquid-ve wrapper) integrates as an additive top-level contract via these interfaces without changing `VotingEscrow`.
+
 **Operator stake and ve-positions are separate.** A node's operator stake is held in `StakingRegistry` and is slashable (rates per §8). A ve-position is held in `VotingEscrow` and is not. Neither satisfies the other's requirements; an operator may hold any combination. This separation is a hard invariant — no contract path lets ve-locked TOKEN be slashed.
 
 ### 5. Safety and insurance reserve (3% bucket)
 
 The 3% safety bucket is held in `SafetyReserve`, a governance-gated incident reserve. Eligible payout categories per design spec §2.2.5:
 
-- Enterprise SLA compensation (per [ADR 030](030-preseed-usdc-deployment.md) / [ADR 032](032-bandwidth-futures-enterprise.md)).
 - Incorrect slashing / appeal reversals.
 - Relay, sequencer, or payment-channel downtime.
 - Bad-data incidents where user recourse is more valuable than pure burn.
+- Future incident-response contracts that integrate via the stable `payout(bundleHash, recipient, amount)` interface.
 
 **Spending controls.** Disbursements require all of:
 
@@ -134,7 +138,9 @@ The 3% safety bucket is held in `SafetyReserve`, a governance-gated incident res
 3. A 48-hour appeal window during which the bundle is challengeable on-chain.
 4. Post-incident reporting published to a public registry maintained by `SafetyReserve`.
 
-No path exists for unattested payouts; the `payout(bundle, recipient, amount)` entry point checks all four gates. Sizing analysis (number of $100K and $1M incidents covered per year per scenario) lives in the economic-model spec §7; this ADR does not duplicate the table.
+No path exists for unattested payouts; the `payout(bundleHash, recipient, amount)` entry point checks all four gates. Sizing analysis (number of $100K and $1M incidents covered per year per scenario) lives in the economic-model spec §7; this ADR does not duplicate the table.
+
+**Interface stability.** The `payout(bundleHash, recipient, amount)` signature is contract-stable: future incident-response tooling, insurance products, and SLA-style contracts integrate via this entry point without contract changes. Evidence formats live off-chain and are referenced by hash on-chain; the contract enforces the four payout gates uniformly regardless of caller identity (subject to `AccessControl` role grants per [ADR 016 §5](016-contract-interactions.md#5-access-control-matrix)).
 
 ### 6. Delegator pool — USDC → TOKEN conversion
 
@@ -163,7 +169,7 @@ The 7% delegator bucket flows through a USDC→TOKEN buy-and-distribute pipeline
 2. **Share of the 40% gauge-boost pool** — USDC, weekly distribution, weighted by `working_bytes`. Non-ve-lockers receive ~40% of fair-share; max-ve-lockers receive 100% of fair-share (2.5× more per byte than non-lockers).
 3. **Optional delegator-pool yield** (TOKEN-denominated) on any TOKEN they ve-lock. Disjoint from the gauge pool; uncapped relative to byte share.
 
-**Sample 1 Gbps node P&L** (full multi-scenario model, including absolute figures and the S0–S3 × node-type-A–E unmetered-infra cost matrix, lives in design spec §2.4 / §3). Qualitative shape: fair-share ve materially out-earns no-ve at the reference 30K GB/mo node (the commodity operator is positive but thin and is the design's intended filter); over-ve is gauge-flat and earns its marginal yield via the delegator pool. Pre-seed staking-loan and hardware-lease programs ([ADR 030](030-preseed-usdc-deployment.md)) soften the filter for new operators.
+**Sample 1 Gbps node P&L** (full multi-scenario model, including absolute figures and the S0–S3 × node-type-A–E unmetered-infra cost matrix, lives in design spec §2.4 / §3). Qualitative shape: fair-share ve materially out-earns no-ve at the reference 30K GB/mo node (the commodity operator is positive but thin and is the design's intended filter); over-ve is gauge-flat and earns its marginal yield via the delegator pool. Externally-funded operator-onboarding programs soften the filter for new operators.
 
 ### 8. Slashing and burn
 
@@ -195,7 +201,7 @@ Traders with no ve-position cannot vote. The early veTOKEN base is concentrated 
 
 ### 10. Bootstrap mechanism — pre-seed USDC
 
-Bootstrap supply-side incentive is **$1M+ pre-seed USDC capital** (planning target: $3M), externally raised. USDC denomination insulates subsidy purchasing power from TOKEN price. Program structure (Protocol-Owned Operators, hardware-leasing subsidies, staking loans, regional-deploy grants, Enterprise SLA guarantee fund) lives in [ADR 030](030-preseed-usdc-deployment.md); this ADR commits the funding mechanism (USDC, externally raised) and the size floor ($1M).
+Bootstrap supply-side incentive is **$1M+ pre-seed USDC capital** (planning target: $3M), externally raised. USDC denomination insulates subsidy purchasing power from TOKEN price. The protocol commits to the funding mechanism (USDC, externally raised) and the size floor ($1M); the operational program structure (allocation across operator-recruitment programs, eligibility, success metrics, governance flow) is tracked separately as a foundation/team operational concern, not as a protocol decision.
 
 [ADR 019](019-node-onboarding.md) is the canonical onboarding flow.
 
@@ -214,6 +220,8 @@ Router shares and the boost-floor parameter are governable, gated by 48-hour tim
 | `boostFloor` | 0.4 | 0.2 | 0.8 |
 
 The 20% floor on the node-base share guarantees operators always receive enough liquid USDC to cover at least a meaningful fraction of infrastructure costs even under extreme governance proposals — preserves the cashflow invariant. The `boostFloor` bounds prevent governance from collapsing the gauge pool to a winner-take-all distribution (lower-bound) or flattening it into uselessness (upper-bound).
+
+**Setter contract-level bound enforcement.** Parameter setters on `FeeRouter` and `VotingEscrow` are role-gated via `AccessControl` and bound-checked at the contract level — bounds are enforced regardless of caller. A future automated controller granted the parameter-setter role operates within the same bounds; out-of-range writes revert. This makes the bounds above effective for any caller (governance proposals or additive controllers), without trusting the caller to self-clamp.
 
 ---
 
@@ -234,7 +242,7 @@ The 20% floor on the node-base share guarantees operators always receive enough 
 
 - **Significant contract surface.** `FeeRouter` (with two pool types and the delegator-swap path), `VotingEscrow`, `SafetyReserve`, and the optional `DelegatorBuyer` add meaningful audit burden.
 - **Per-epoch byte accounting adds gas.** Every settlement increments an operator's byte counter — 5K–15K gas on top of router forwarding. Minor but non-zero; needs validation on the chosen L2 (see [Appendix: L2 Deployment](appendix-l2-deployment.md)).
-- **Commodity operators face thin margins.** Operators who refuse to ve-lock see lower margins than fair-share-ve operators. This is the designed incentive pressure, but the failure mode is under-supply of operators if the filter is too sharp. Pre-seed staking-loan and hardware-lease programs ([ADR 030](030-preseed-usdc-deployment.md)) partially offset.
+- **Commodity operators face thin margins.** Operators who refuse to ve-lock see lower margins than fair-share-ve operators. This is the designed incentive pressure, but the failure mode is under-supply of operators if the filter is too sharp. Externally-funded operator-onboarding programs partially offset.
 - **Governance bootstrap depends on voluntary locking.** Initial veTOKEN supply tracks self-locking decisions; first 6–12 months may need treasury-funded lock incentives.
 - **Delegator-pool swap adds keeper dependency.** USDC→TOKEN conversion needs a keeper trigger (or fold into `BuybackBurner`'s existing keeper). Not a new failure mode — [ADR 018](018-liquidity-strategy.md) already has keeper dependency — but it expands the keeper's responsibilities.
 - **Load-bearing math is harder to explain.** The Curve formula and the delegator-conversion mechanic are not intuitive to casual readers. UI, documentation, and operator dashboards need to expose "your boost factor," "your delegator-pool TOKEN earnings," and "delegator-pool slippage" clearly.
@@ -247,7 +255,7 @@ The 20% floor on the node-base share guarantees operators always receive enough 
 - **Delegator-conversion MEV risk.** TWAP + private-RPC routing mitigates front-running, but the swap is observable on-chain post-fact. Flashbots-style bundles and per-epoch liquidity caps are required on this path, not optional. Keeper-cost economics under L2 gas conditions ([Appendix: L2 Deployment](appendix-l2-deployment.md)) need validation.
 - **Wash-trading / self-routed traffic.** An operator could induce noise settlements to inflate gauge-pool share. Mitigations are per-event settlement gas cost (~$0.08), watchtower observation of self-settlement patterns ([ADR 007](007-watchtower.md)), and most importantly **client-signed delivery receipts from distinct identities** tied to funded payment channels — the latter is the strongest invariant in the gauge-pool security model and is forward-referenced as [ADR 027](027-distinct-client-receipts.md). **The protocol can launch with the gauge pool paused, but enabling and paying the gauge pool requires distinct-client receipts to be live** (see [ADR 027 §9 — Implementation sequencing and launch prerequisite](027-distinct-client-receipts.md#9-implementation-sequencing-and-launch-prerequisite)).
 - **Governance-weight concentration.** Operators who lock heavily for boost also accumulate disproportionate governance weight. [ADR 009](009-governance.md) safety bounds prevent extreme abuse; team / seed / treasury vesting acts as a counterweight during the first ~3 years.
-- **Convex-capture risk.** Third-party liquid-ve wrappers (Convex / Votium / Aura analogs) can concentrate governance power outside the DAO. Native `SveToken` (Frax sfrxETH model) is recommended; forward-referenced as [ADR 028](028-sve-token-wrapper.md). Treat as priority-1 follow-up after launch.
+- **Convex-capture risk.** Third-party liquid-ve wrappers (Convex / Votium / Aura analogs) can concentrate governance power outside the DAO. Mitigation is operational — the DAO may ship a native liquid-ve wrapper as an additive top-level contract (integrating with `VotingEscrow` via the standard lock-creation / increase-amount / snapshot interfaces per §4) without changing the launch contract surface.
 - **20% burn share deterrence.** A higher burn share would weight slashing more toward pure deflation; the chosen 50/30/20 distribution prefers user-harm recourse via `SafetyReserve`. The §11 safety bound on the burn share leaves room for governance recalibration; security review should confirm 20% preserves slashing's deterrent value.
 
 ---
@@ -292,7 +300,7 @@ Variant for §8: keep the original 50% challenger / 50% burn distribution, omit 
 
 Rejected because:
 
-- User-harm incidents have no structural recourse path under pure-deflationary slashing. Enterprise SLA credibility, incorrect-slash appeals, and bad-data incident compensation all need a funded reserve, and the 3% router share alone is insufficient to seed it at early scale.
+- User-harm incidents have no structural recourse path under pure-deflationary slashing. Incorrect-slash appeals, bad-data incident compensation, and future incident-response contracts all need a funded reserve, and the 3% router share alone is insufficient to seed it at early scale.
 - The 20% burn share (vs. the original 50%) preserves a meaningful pure-deflationary lever and the §11 safety bound `[0%, 25%]` lets governance recalibrate post-launch if deterrence proves insufficient.
 
 ### TOKEN-denominated node-bootstrap fund
@@ -303,15 +311,10 @@ Rejected because:
 
 - Subsidy purchasing power tracks TOKEN price; subsidies become least valuable exactly when most needed.
 - Concentrates pre-launch dilution in a single allocation tied to bootstrap duration rather than network outcomes.
-- Externally-raised USDC pre-seed ([ADR 030](030-preseed-usdc-deployment.md)) is the chosen alternative — TOKEN-price-independent, externally-priced, and structured into the five outcome-targeted programs in ADR 030 §2.
+- Externally-raised USDC pre-seed (operational; tracked separately) is the chosen alternative — TOKEN-price-independent and externally-priced.
 
 ---
 
 ## Forward references (follow-up ADRs)
 
 - **[ADR 027 — Distinct-client delivery receipts](027-distinct-client-receipts.md)** — priority-1; required for gauge-pool security at mainnet launch.
-- **[ADR 028 — Native sveTOKEN liquid-ve wrapper](028-sve-token-wrapper.md)** — within 6 months of mainnet; pre-empts third-party Convex-capture.
-- **[ADR 029 — Adaptive FeeRouter parameters](029-adaptive-fee-router.md)** — post-launch; bounded automated feedback hooks within §11 limits.
-- **[ADR 030 — Pre-seed USDC deployment program](030-preseed-usdc-deployment.md)** — charter for the $1M+ pre-seed capital.
-- **[ADR 031 — Burn-and-Mint client TOKEN prepay path](031-bme-client-prepay.md)** — post-launch follow-up; demand-side TOKEN sink.
-- **[ADR 032 — Bandwidth Futures / Enterprise SLA tier](032-bandwidth-futures-enterprise.md)** — post-launch follow-up; TOKEN-denominated pre-purchase + Enterprise SLA tier.

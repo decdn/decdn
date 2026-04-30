@@ -66,9 +66,9 @@ Before any on-chain or protocol activity:
      There is no discount-stake threshold; operators who want amplified return on
      capital ve-lock TOKEN in `VotingEscrow` for gauge boost
      ([ADR 026 § 3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula)) rather than
-     staking above a threshold for fee discount. Operators who lack the 50K minimum may
-     qualify for a pre-seed-funded **staking loan** — see [Pre-seed USDC Bootstrap Programs](#pre-seed-usdc-bootstrap-programs)
-     below.
+     staking above a threshold for fee discount. Operators who lack the 50K minimum
+     may qualify for externally-funded operator-onboarding programs (see
+     [ADR 026 §10](026-gauge-boost-tokenomics.md#10-bootstrap-mechanism-pre-seed-usdc)).
    - **Native gas token:** approximately $0.50–$1.00 for the Phase 2 transactions
      at typical L2 gas prices.
    - **Optional USDC:** only required if the operator intends to open outbound payment
@@ -349,14 +349,6 @@ If the node's iroh identity has been replaced (key rotation), use `StakingRegist
 after re-registration to associate the new `nodeId` with the same `ethAddress` — see
 [ADR 003 § NodeId Binding](003-payments.md#nodeid-to-ethereum-binding). The old
 `nodeId` mapping is cleared.
-
----
-
-### Pre-seed USDC Bootstrap Programs
-
-Operators lacking the 50K-TOKEN minimum stake or up-front infrastructure capital may qualify for supplementary onboarding paths funded from the **$1M+ pre-seed USDC capital** ([ADR 026 §10](026-gauge-boost-tokenomics.md#10-bootstrap-mechanism-pre-seed-usdc)). Path mechanics, eligibility, sizing, and governance live in [ADR 030](030-preseed-usdc-deployment.md): Protocol-Owned Operators, hardware-leasing subsidies, staking loans, regional-deploy grants, and the Enterprise SLA guarantee fund.
-
-ve-locking is opt-in for all operators (subsidized or self-funded); the bootstrap mechanism is USDC-denominated and contains no TOKEN subsidies to auto-lock. Operators using any pre-seed path still complete Phases 1–5 above — the program changes how stake / hardware is obtained, not the onboarding sequence.
 
 ---
 

@@ -1,6 +1,6 @@
 # Appendix: Observability and Metrics
 
-> **This is an appendix, not a core protocol ADR.** Metric implementation is consumer-side — operators choose their own monitoring stack, dashboards, and alerting. This appendix specifies a recommended naming convention, the canonical metric registry, and slash-risk alert thresholds, so that monitoring tooling and operator runbooks can converge on a common vocabulary. Where a specific metric is load-bearing for a protocol invariant (e.g., the lock-rate read consumed by [ADR 029](029-adaptive-fee-router.md)), the invariant lives in the consuming ADR; this document specifies the metric exposure.
+> **This is an appendix, not a core protocol ADR.** Metric implementation is consumer-side — operators choose their own monitoring stack, dashboards, and alerting. This appendix specifies a recommended naming convention, the canonical metric registry, and slash-risk alert thresholds, so that monitoring tooling and operator runbooks can converge on a common vocabulary.
 
 ## Context
 
@@ -230,7 +230,7 @@ node observes the corresponding event log.
 | Metric | Type | Tier | Labels | Source | Consumer | Description |
 |--------|------|------|--------|--------|----------|-------------|
 | `decdn_ve_total_supply` | Gauge | R | — | `VotingEscrow.totalSupply()` (RPC) | Governance dashboard, gauge-share denominator sanity-check | Current total ve-supply (sum of ve-balances across all live locks). |
-| `decdn_ve_lock_rate` | Gauge | R | — | Derived (`TOKEN.balanceOf(address(VotingEscrow)) / TOKEN.totalSupply()`) | Governance dashboard, adaptive-feedback heuristic input ([ADR 029](029-adaptive-fee-router.md)) | Fraction of TOKEN supply currently locked in `VotingEscrow`, in `[0, 1]`. The canonical numerator is the underlying TOKEN balance held by the escrow contract — i.e. `TOKEN.balanceOf(address(VotingEscrow))` — **not** the time-weighted ve-supply from `VotingEscrow.totalSupply()` / `totalSupplyAt(...)`. ADR 029's lock-rate feedback hook MUST key off this same underlying-locked definition; ve-supply has different units and would mis-fire the 15% / 50% thresholds. |
+| `decdn_ve_lock_rate` | Gauge | R | — | Derived (`TOKEN.balanceOf(address(VotingEscrow)) / TOKEN.totalSupply()`) | Governance dashboard, adaptive-feedback heuristic input | Fraction of TOKEN supply currently locked in `VotingEscrow`, in `[0, 1]`. The canonical numerator is the underlying TOKEN balance held by the escrow contract — i.e. `TOKEN.balanceOf(address(VotingEscrow))` — **not** the time-weighted ve-supply from `VotingEscrow.totalSupply()` / `totalSupplyAt(...)`. Any consumer of this metric (governance dashboards, automated controllers) MUST key off this same underlying-locked definition; ve-supply has different units. |
 | `decdn_ve_lock_duration_median_seconds` | Gauge | R | — | `VotingEscrow` per-lock checkpoint scan (RPC) | Governance dashboard, ve-economy health view | Median remaining lock duration across all live locks, in seconds. Distribution-shape signal complementing the aggregate `decdn_ve_total_supply` and `decdn_ve_lock_rate`. |
 
 ---
