@@ -135,6 +135,7 @@ Appendices document patterns, reference implementations, and operational guidanc
 5. [Local Admin HTTP Surface](appendix-local-admin-http.md) — loopback-bound admin API for operator runbook automation
 6. [Operator Key Rotation Runbook](appendix-operator-key-rotation.md) — sequenced procedure for rotating the operator's iroh node-key, Ethereum signing key, and (production) session keys via `bindNodeId`, deregister-and-re-stake, or `erc7579/smartsessions`
 7. [Operator Protocol-Upgrade Runbook](appendix-operator-upgrade-path.md) — sequenced operator actions for each ADR 013 tier (Tier 1/2 checklists; Tier 3 rolling-upgrade procedure; watchtower, client, and governance coordination)
+8. [Watchtower Operating Economics](appendix-watchtower-economics.md) — operator-facing cost model and break-even analysis previously inlined in ADR 007
 
 ---
 
