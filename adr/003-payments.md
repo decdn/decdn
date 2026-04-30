@@ -363,6 +363,7 @@ interface IStablePaymentChannel {
     function getChannel(bytes32 channelId) external view returns (Channel memory);
     function getRateBounds() external view returns (uint256 deliveryFloor, uint256 deliveryCeiling);
     function feeRouter() external view returns (address); // configured FeeRouter target (ADR 026)
+    function lifetimeDepositOf(address client) external view returns (uint256); // monotonic per-client cumulative deposit counter — added per ADR 027 §3 distinct-client gating
 
     // Governance
     function setFeeRouter(address router) external;       // routeSettlement target; replaces ADR 003 inline-skim governance per ADR 026
@@ -383,9 +384,11 @@ interface IStablePaymentChannel {
 
 - **Status precondition:** MUST require status `Open` and `block.timestamp < expiresAt` (reverts on `Closing`, `Closed`, or expired).
 - **Caller:** client only (`require(msg.sender == channel.client)`).
-- **Effects:** Transfers `additionalDeposit` from `msg.sender` to the contract via `safeTransferFrom`. Updates `channel.deposit += additionalDeposit`. Does NOT extend `expiresAt` (to prevent indefinite lock-in — the channel's utility is bounded by the initial `maxChannelDuration`).
+- **Effects:** Transfers `additionalDeposit` from `msg.sender` to the contract via `safeTransferFrom`. Updates `channel.deposit += additionalDeposit`. Increments the per-client lifetime-deposit counter `lifetimeDeposit[msg.sender] += additionalDeposit` (also incremented on `openChannel` by the funded `deposit`). Does NOT extend `expiresAt` (to prevent indefinite lock-in — the channel's utility is bounded by the initial `maxChannelDuration`).
 - **Modifiers:** `nonReentrant`.
 - **Emits:** `ChannelToppedUp(channelId, additionalDeposit, newDeposit)`.
+
+**`lifetimeDepositOf` semantics (added per [ADR 027 §3](027-distinct-client-receipts.md#3-identity-diversity-gating)).** Per-client cumulative-deposit counter exposed via `lifetimeDepositOf(client) view returns (uint256)`. Backed by a `mapping(address => uint256) lifetimeDeposit` storage slot. Incremented by the funded amount on every `openChannel` (by `deposit`) and every `topUp` (by `additionalDeposit`) attributable to the client. **Monotonic** — settlement, withdrawal, channel closure, expiry, or slashing MUST NOT decrease it. Returns `0` for an address with no prior channel funding history. Used by ADR 027 distinct-client gating as a cheap on-chain signal of cumulative capital ever bonded by this client (one SSTORE per `openChannel` / `topUp`).
 
 **Initial deployment values.** The constructor (or initializer for proxy deployments) sets governable parameters to their PoC defaults. All values are within the hardcoded safety bounds table further below (see also [ADR 009](009-governance.md) for governance ranges):
 
