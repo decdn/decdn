@@ -147,27 +147,11 @@ The fee is deterministic and non-negotiable (per 30-day monitoring period): both
 
 **Gas economics:** A `disputeChannel` call on an L2 costs approximately $0.05–0.10. The dispute gas bonus (2× gas cost) ensures watchtowers are not penalised for actually performing their function. The bonus is paid off-chain by the watched party after the dispute settles — the watchtower provides the transaction hash as proof. The off-chain bonus is unenforceable — the watched party can refuse to pay after the dispute is submitted. This is an accepted PoC limitation. Production mitigates this via the prepaid escrow described below, which includes the dispute gas bonus in the escrowed amount.
 
-### Break-Even Economics
+### Heartbeat batching
 
-Heartbeats are batched — one on-chain transaction per 6-hour window covers all active escrows for a given watchtower (see [Contract: WatchtowerEscrow](#contract-watchtowerescrow)). This makes the heartbeat gas cost fixed rather than per-channel.
+Heartbeats are batched — one on-chain transaction per 6-hour window covers all active escrows for a given watchtower (see [Contract: WatchtowerEscrow](#contract-watchtowerescrow)). This makes the heartbeat gas cost fixed rather than per-channel and is what makes the role economically viable as a side activity.
 
-**Monthly cost model (per watchtower):**
-
-| Cost component | Monthly estimate | Notes |
-| --- | --- | --- |
-| Heartbeat gas (120 batched tx) | $1.20–$2.40 | Fixed cost, amortised across all channels |
-| Infrastructure (VPS + monitoring) | $20–$50 | Shared with node operation if co-located |
-| Dispute gas (rare) | $0.05–$0.10 per event | Covered by 2× gas bonus from escrow |
-
-**Break-even at various fee levels:**
-
-| Average fee/channel/month | Fixed cost assumption | Channels to break even |
-| --- | --- | --- |
-| $0.50 (minimum, deposits ≤ 500 USDC) | $25 | ~50 |
-| $1.00 (deposits ~1,000 USDC) | $25 | ~25 |
-| $5.00 (deposits ~5,000 USDC) | $25 | ~5 |
-
-**Implication:** Watchtower operation is viable as a side activity for existing node operators — who already run infrastructure and monitor the chain — but unlikely to sustain a standalone business at PoC scale. This is acceptable: the PoC does not implement watchtowers (see [PoC Scope](#8-poc-scope)), and production economics improve with channel volume and deposit sizes.
+> **Operator-facing cost model and break-even analysis** — including monthly fixed-cost estimates and channel-volume break-even tables under various fee levels — live in [`appendix-watchtower-economics.md`](appendix-watchtower-economics.md). Those numbers are illustrative and operator-decision territory; this protocol ADR specifies the mechanism, not the side-business viability calculation.
 
 ### 6. Redundancy
 
