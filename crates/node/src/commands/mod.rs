@@ -382,6 +382,11 @@ pub fn write_validate_summary<W: std::io::Write>(
     )?;
     writeln!(
         w,
+        "  rpc_watchdog_interval_sec: {}",
+        resolved.blockchain.rpc_watchdog_interval_sec
+    )?;
+    writeln!(
+        w,
         "  cache_dir:                {}",
         resolved.cache.cache_dir.display()
     )?;
@@ -471,6 +476,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # eth_keystore = "~/.decdn/keystore.json"
 # payment_channel_address = ""       # REQUIRED: 0x-prefixed hex
 # staking_registry_address = ""      # REQUIRED: 0x-prefixed hex
+# rpc_watchdog_interval_sec = 30     # 0 disables the connectivity watchdog
 
 [cache]
 # cache_dir = "~/.decdn/cache"

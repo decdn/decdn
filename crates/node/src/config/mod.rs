@@ -40,6 +40,9 @@ const DEFAULT_METRICS_BIND: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ip
 /// the `node` crate so `decdn node <sub>` clients can fall back to the
 /// same default the server binds on, without duplicating the number.
 pub(crate) const DEFAULT_ADMIN_PORT: u16 = 9191;
+/// Default interval between RPC connectivity watchdog probes. `0`
+/// disables the watchdog; absent in config => this value.
+const DEFAULT_RPC_WATCHDOG_INTERVAL_SEC: u64 = 30;
 /// Default interval between outgoing `NodeAnnounce` messages (ADR 001).
 const DEFAULT_ANNOUNCE_INTERVAL_SEC: u64 = 60;
 /// Default peer-table entry TTL after which a stale entry is evicted.
@@ -351,11 +354,16 @@ fn resolve_blockchain(
     let staking_registry_address =
         parse_contract_address("staking_registry_address", &staking_registry_address)?;
 
+    let rpc_watchdog_interval_sec = file
+        .and_then(|b| b.rpc_watchdog_interval_sec)
+        .unwrap_or(DEFAULT_RPC_WATCHDOG_INTERVAL_SEC);
+
     Ok(ResolvedBlockchain {
         rpc_url,
         eth_keystore,
         payment_channel_address,
         staking_registry_address,
+        rpc_watchdog_interval_sec,
     })
 }
 
