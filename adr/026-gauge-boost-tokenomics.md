@@ -9,7 +9,7 @@
 
 ## Context
 
-A bandwidth-CDN protocol with paid byte delivery, slashable operator stake, and on-chain settlement needs an economic model that holds up under four pressures:
+The economic model — sitting on top of paid byte delivery ([ADR 003](003-payments.md)) and the slashing primitive ([ADR 014](014-on-chain-verification.md)) — has to hold up under four pressures:
 
 1. **A deflationary lever that scales with network usage.** A nominally "deflationary" token model whose burn rate sits well below circulating-supply growth from vesting unlocks is structurally inflationary in practice. Burn must be sized to compete with vesting flows at mature scale.
 2. **A real-yield path to token holders.** Passive holders need compensation tied to network usage; long-term lockers need a compensation lever distinct from short-term holders. Without one, governance weight, liquidity provision, and long-term capital formation all weaken.
