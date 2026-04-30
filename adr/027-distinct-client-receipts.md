@@ -64,7 +64,7 @@ A "distinct client identity" for gauge eligibility purposes is a `clientPubKey` 
 | **Funding age.** First channel deposit by this address occurred at least `MIN_CLIENT_AGE` before the receipt's `timestamp`. | 24 h | `[1 h, 30 d]` |
 | **Per-channel cooldown.** A client identity is counted at most once per `IDENTITY_COOLDOWN` window per operator, regardless of how many channels or how many receipts it produces. | 7 d | `[1 d, 30 d]` |
 | **Funding-source diversity.** The address's USDC balance for the qualifying channel deposit was not received from `operatorAddress`, the operator's known affiliated addresses (registered per [ADR 008](008-reputation.md)), or any other client identity already counted toward this operator's distinct-client set in the current epoch. **Watchtowers compute this signal off-chain** by indexing public USDC `Transfer` events from L2 RPC at the time of channel funding; the diversity attestation enters the watchtower-signed receipt-validation output (§5). On-chain enforcement at challenge time is bounded by the EVM's 256-block `BLOCKHASH` window — a full Merkle proof of the historical funding tx is **not** practical without a dedicated block-hash oracle or storage-proof verifier (`reth`-style execution-state proof against an L1-anchored root, deferred to [ADR 017](017-privacy.md) future work). For now, on-chain challenge resolution accepts the attesting watchtower's signature plus a corroborating attester (per §5 quorum); deeper cryptographic proof is a v2 hardening. | — | — |
-| **Reputation gate (forward to §6).** If the operator's reputation score is below `LOW_REP_THRESHOLD`, the funded-channel minimum and funding age are tightened (see §6). | — | — |
+| **Reputation gate (forward to §6).** If the operator's reputation score is below `medium_rep_threshold`, the funded-channel minimum and funding age are tightened (see §6). | — | — |
 
 **Per-epoch eligibility threshold.** An operator is eligible for the gauge pool in epoch `e` only if:
 
@@ -77,7 +77,7 @@ Where `distinct_clients_e(operator)` counts the unique `clientPubKey` values app
 | Parameter | Default | Bounds |
 | --- | ---: | --- |
 | `MIN_DISTINCT_CLIENTS_PER_EPOCH` | 5 | `[1, 50]` |
-| `LOW_REP_THRESHOLD` | network 25th percentile | governable |
+| `medium_rep_threshold` | 0.50 (per [ADR 008 §12.1](008-reputation.md#121-receipt-tiers)) | governable within `[0.30, 0.70]` per ADR 008 |
 
 **Sizing rationale.** A single sybil costs the attacker the funded-channel minimum (10 USDC), the funding-age delay (24 h), and the cooldown (7 d). Five distinct sybils per week is 50 USDC of capital permanently parked in payment-channel deposits per operator per week, plus on-chain Tx fees to fund and rotate. Larger thresholds harden against sybils linearly at the cost of cold-start UX; 5 is a reasoned default at tens-of-nodes-scale. Production data should retune this — the parameter is governable and the safety bounds are wide.
 
@@ -137,7 +137,7 @@ A receipt attester subscribed to an operator's epoch performs:
 
 Receipts function without reputation. Reputation hardens them.
 
-Operators below `LOW_REP_THRESHOLD` (default network 25th percentile, governable) face stricter receipt requirements:
+Operators below `medium_rep_threshold` (default **0.50**, governable within `[0.30, 0.70]` per [ADR 008 §12.1](008-reputation.md#121-receipt-tiers) — that ADR is the canonical home for the threshold value and bounds) face stricter receipt requirements:
 
 | Parameter | Above threshold | Below threshold |
 | --- | --- | --- |
@@ -148,7 +148,7 @@ Operators below `LOW_REP_THRESHOLD` (default network 25th percentile, governable
 
 The intent: a high-reputation operator with stable historical traffic has a high cost of false-flagging by an attacker (loss of historical reputation > epoch-level gauge gain), so a thinner identity-diversity threshold is acceptable. A new or recently-slashed operator faces tighter gates, raising the capital cost of wash-trading proportional to the trust deficit.
 
-**Integration is non-blocking.** The receipt protocol does not require reputation to function — `LOW_REP_THRESHOLD` may be configured to "always above" in early production, in which case all operators get the relaxed thresholds. The protocol upgrades when reputation is online, not when it ships.
+**Integration is non-blocking.** The receipt protocol does not require reputation to function — `medium_rep_threshold` may be configured to its lower bound (0.30) in early production so almost all operators clear it and get the relaxed thresholds. The protocol upgrades when reputation is online, not when it ships.
 
 **Forward-compatible.** [ADR 008](008-reputation.md) is updated separately to expose `reputationOf(operator)` as an on-chain view that `FeeRouter.commitEpochSummary` reads at commit time.
 

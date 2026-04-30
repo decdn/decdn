@@ -262,7 +262,7 @@ An operator's `final_score` (Section 5, after the per-report clamp in Section 8)
 | **Medium** | `[medium_rep_threshold, high_rep_threshold)` (default **[0.50, 0.70)**) | Stricter: `2 × N_std` distinct clients **and** `2 × B_std` minimum balance per contributing channel | Eligible — only receipts meeting the stricter thresholds count toward `bytes_delivered` |
 | **Low** | `< medium_rep_threshold` (default **< 0.50**) | n/a — receipts not accepted into the gauge counter | **Ineligible** — `bytes_delivered = 0` for gauge-share purposes until reputation recovers above `medium_rep_threshold` |
 
-**Concrete thresholds (`N_std`, `B_std`) live in ADR 027.** Treat them as parameters here; the scale factor (`1×` for High, `2×` for Medium, gating off at Low) is the load-bearing decision in this ADR. The Medium tier corresponds to ADR 027's "below `LOW_REP_THRESHOLD`" regime — scale factors and threshold names differ between the two ADRs but the numeric defaults (2× distinct clients, 2× channel funding) line up.
+**Concrete thresholds (`N_std`, `B_std`) live in ADR 027.** Treat them as parameters here; the scale factor (`1×` for High, `2×` for Medium, gating off at Low) is the load-bearing decision in this ADR. ADR 027's "below `medium_rep_threshold`" regime references the same parameter defined here (default 0.50, governable within `[0.30, 0.70]`); §12.1 is the canonical home for the value and bounds.
 
 **Parameter table:**
 
