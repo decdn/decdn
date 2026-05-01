@@ -202,28 +202,4 @@ CLI shape:
 
 ## Alternatives Considered
 
-- **Hand-rolled hyper with REST-style routes.** The original draft of
-  this ADR (and the initial #247 implementation) went this way. It
-  works, but the ergonomic cost grows per-method: paired server handler
-  and client parser, no shared schema between them, verb/URI choices
-  argued case by case. Migrated to jsonrpsee before the first follow-up
-  method (`drain`, #244) would have doubled that maintenance surface.
-- **jsonrpsee + OpenRPC spec generation (`typed-openrpc`, `yerpc`).**
-  OpenRPC is the JSON-RPC analog of OpenAPI; both ecosystem crates that
-  generate it from Rust are thin/early (handful of stars, one-person
-  maintenance). For a loopback surface with a small method count,
-  hand-maintained docs in this ADR are cheaper than a generator
-  dependency. Revisit if the surface outgrows ~10 methods.
-- **Unix domain socket.** Better multi-user isolation; worse portability
-  and higher client-side friction. Revisit if multi-tenant hosts enter
-  scope.
-- **New iroh ALPN (e.g. `cdn/admin/v1`).** NodeId-based auth is
-  attractive for remote admin, but this surface is specifically not
-  remote — running it over iroh would pull in relay traffic, QUIC
-  handshakes, and the iroh connection lifecycle for what needs to be a
-  zero-dependency, always-on-localhost debug channel. Keeping admin off
-  the iroh ALPNs also means a buggy admin route cannot affect the CDN
-  wire protocol.
-- **Extending `/metrics` with non-Prometheus routes.** Mixes a scraped
-  time-series surface with mutating operations; operators would have to
-  lock down the metrics endpoint more aggressively than they do today.
+The five admin-surface alternatives evaluated against jsonrpsee-on-loopback (hand-rolled hyper REST, jsonrpsee + OpenRPC, Unix domain socket, new iroh ALPN, extending `/metrics`) are recorded in [`_history/alternatives-pre-launch.md` § Local Admin HTTP Surface (appendix)](_history/alternatives-pre-launch.md#local-admin-http-surface-appendix).

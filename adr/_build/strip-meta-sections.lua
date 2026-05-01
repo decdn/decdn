@@ -2,9 +2,11 @@
 --
 -- Drops Alternatives Considered / Considered Alternatives / Open Questions /
 -- Future Work / "Why not …" sections from the rendered PDF while leaving the
--- source `.md` files untouched. Also rewrites internal cross-references
--- pointing at the stripped sections (same-file and cross-file) to plain
--- text so typst doesn't choke on dangling labels.
+-- source `.md` files untouched. Also drops the per-ADR `**Date:** … /
+-- **Status:** …` preamble paragraphs (book-formatting noise that ages
+-- poorly) and rewrites internal cross-references pointing at the
+-- stripped sections (same-file and cross-file) to plain text so typst
+-- doesn't choke on dangling labels.
 --
 -- Wired into the reading-order book build only (see adr/README.md
 -- § Building a single PDF). The numeric build keeps everything so it stays
@@ -93,10 +95,21 @@ function Pandoc(doc)
 
   doc.blocks = out_blocks
 
-  -- Rewrite Links whose anchor portion matches a stripped ID. Replace with
-  -- the link's display content so the surrounding prose still reads as
-  -- plain text. Handles both `#anchor` (same-file) and
-  -- `file.md#anchor` (cross-file → internal after concatenation) targets.
+  -- Two transformations in the same `doc:walk` pass:
+  --
+  -- 1. Link rewriting — replace links whose anchor portion matches a
+  --    stripped ID with the link's display content so the surrounding
+  --    prose still reads as plain text. Handles both `#anchor` (same-
+  --    file) and `file.md#anchor` (cross-file → internal after
+  --    concatenation) targets.
+  --
+  -- 2. Per-ADR Date/Status preamble — each ADR opens with
+  --    `**Date:** YYYY-MM-DD` followed by `**Status:** Draft` (or
+  --    similar) between the H1 title and `## Context`. Without a
+  --    blank line between them pandoc parses the pair as a single
+  --    Para containing a SoftBreak; with a blank line (e.g. ADR 022)
+  --    they parse as two separate Paras. The leading stringified text
+  --    starts with `Date:` or `Status:` either way — drop those.
   doc = doc:walk({
     Link = function(link)
       local target = link.target
@@ -106,6 +119,13 @@ function Pandoc(doc)
       local anchor = target:sub(hash_pos + 1)
       if stripped_ids[anchor] then
         return link.content
+      end
+      return nil
+    end,
+    Para = function(p)
+      local text = pandoc.utils.stringify(p)
+      if text:match("^Date:%s") or text:match("^Status:%s") then
+        return {}
       end
       return nil
     end,

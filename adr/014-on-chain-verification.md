@@ -89,13 +89,7 @@ The Ed25519 signature remains the primary authentication mechanism for the QUIC 
 
 #### Alternatives Considered
 
-| Approach | Gas Cost | PoC Suitability | Why Not |
-| --- | --- | --- | --- |
-| RIP-7212 Ed25519 precompile | ~3,000 | Not available | Not yet deployed on the production L2 as of 2026-04 (see [Appendix: L2 Deployment](appendix-l2-deployment.md)) |
-| Solidity Ed25519 library (e.g., `ed25519-sol`) | ~500k–1M | Too expensive | A single slash verification would cost $0.25–$0.50; two-signature offenses double that |
-| ZK proof of Ed25519 signature | ~300k verify | Too complex | Requires a proving circuit, prover infrastructure, and proof generation latency |
-| Optimistic (no signature verification) | ~50k | Insufficient security | A node could deny authorship of any message; counter-evidence alone is not enough |
-| **Dual-key slash signatures (chosen)** | **~3,000** | **Recommended** | Uses proven `ecrecover`; adds one `Option` field per message; no new infrastructure |
+The signature-scheme alternatives table (RIP-7212, Solidity library, ZK, optimistic) is recorded in [`_history/alternatives-pre-launch.md` § ADR 014 — Slash Signature Scheme](_history/alternatives-pre-launch.md#adr-014--slash-signature-scheme).
 
 > **Note:** [ADR 001](001-network.md#nodeid-ownership-verification) uses direct ed25519 verification (Solidity library, ~500k–1M gas) for node registration ownership proof. This is acceptable because registration is a one-time cost per node lifetime, unlike slash evidence which may be submitted frequently.
 
