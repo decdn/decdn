@@ -183,8 +183,10 @@ pub struct ReloadArgs {
 /// `admin_v1_drain` (issue #244, ADR 025). Fires the same runtime shutdown
 /// path as SIGTERM without needing the process PID. The response
 /// (`drain_initiated=true`) means "shutdown has been requested", not that
-/// it has completed — the admin server is the first surface to stop, so the
-/// connection will close before the node fully exits.
+/// it has completed — the admin server is one of the first surfaces to
+/// stop (metrics is signalled first, then admin, both before
+/// `router.shutdown`), so the connection will close before the node
+/// fully exits.
 #[derive(Args, Debug)]
 pub struct DrainArgs {
     /// Base URL of the node's admin HTTP surface. See `health --admin-url`

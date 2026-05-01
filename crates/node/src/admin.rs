@@ -70,10 +70,11 @@ pub struct AdminState {
     /// unset" error so the operator gets a specific message instead of
     /// silently no-op'ing.
     reload_hook: Option<ReloadHook>,
-    /// Drain trigger for `admin_v1_drain` (issue #244). Always `Some` when
-    /// the admin server is running — drain has no preconditions analogous
-    /// to "publisher disabled" or "no config path", so this is wired
-    /// unconditionally.
+    /// Drain trigger for `admin_v1_drain` (issue #244). Always present —
+    /// drain has no preconditions analogous to "publisher disabled" or
+    /// "no config path", so this field is `Arc<DrainTrigger>` (not
+    /// `Option<…>` like `announce_trigger` / `reload_hook`) and the
+    /// runtime wires it unconditionally.
     drain_trigger: Arc<DrainTrigger>,
 }
 
@@ -295,16 +296,17 @@ pub struct ReloadResponse {
 /// Response body for `admin_v1_drain` (issue #244). Always `initiated:
 /// true` on a non-error response — drain is fire-and-forget; the runtime
 /// begins the same graceful sequence SIGTERM triggers, and the admin server
-/// itself is among the first things to stop, so an operator that needs to
-/// observe completion polls process exit (systemd/K8s) or `decdn node
-/// health` until the connection is refused.
+/// is among the first surfaces to stop (metrics first, then admin, both
+/// before `router.shutdown`), so an operator that needs to observe
+/// completion polls process exit (systemd/K8s) or `decdn node health`
+/// until the connection is refused.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DrainResponse {
     /// Always `true` on a non-error response — the trigger has been fired
     /// and the runtime's shutdown sequence is underway. "Initiated", not
     /// "completed": the admin server may close before the response
-    /// returns because the admin server is intentionally the first surface
-    /// to stop during shutdown.
+    /// returns because the admin server is intentionally one of the first
+    /// surfaces to stop during shutdown.
     pub initiated: bool,
 }
 
