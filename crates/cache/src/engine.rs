@@ -44,11 +44,12 @@ struct Inner {
     /// 166ae41); pinning sets aren't `Copy`, so `ArcSwap` is the
     /// non-blocking equivalent for `HashSet<Hash>`.
     ///
-    /// Pinning interacts with [`Self::evicted`] in one direction only:
+    /// Pinning interacts with the `evicted` field in one direction only:
     /// pinning prevents *LRU* eviction (issue #276) but does not protect
-    /// against an explicit operator [`Self::evict`] (#279) — an operator
-    /// running a DMCA takedown on a pinned hash gets the takedown, full
-    /// stop. The pin just keeps the hash off the LRU candidate list.
+    /// against an explicit operator [`CacheEngine::evict`] (#279) — an
+    /// operator running a DMCA takedown on a pinned hash gets the
+    /// takedown, full stop. The pin just keeps the hash off the LRU
+    /// candidate list.
     pinned: ArcSwap<HashSet<Hash>>,
     /// Hashes the operator has explicitly evicted via [`CacheEngine::evict`]
     /// (issue #279). Membership is honored by [`CacheEngine::has`] and

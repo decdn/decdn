@@ -165,9 +165,9 @@ pub enum DecompressMode {
     /// Decode `gzip` / `zstd` bodies transparently; identity passes
     /// through; unknown encodings raise [`OriginError::UnsupportedEncoding`].
     /// This is the default — most object stores serve compressed bodies
-    /// and the BLAKE3 verify in [`crate::CacheEngine::pull_through`] runs
-    /// over the canonical (decompressed) form, so pass-through would
-    /// always fail verification.
+    /// and the BLAKE3 verify in [`crate::CacheEngine`] runs over the
+    /// canonical (decompressed) form, so pass-through would always fail
+    /// verification.
     #[default]
     Auto,
     /// Reject any non-identity `Content-Encoding`. The origin must serve

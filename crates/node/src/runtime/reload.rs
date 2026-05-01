@@ -198,12 +198,12 @@ impl RuntimeReloadState {
 
     /// Seed the file-section snapshot from the config file loaded at
     /// startup. Without this, the very first SIGHUP after startup falls
-    /// into the "no baseline → warn once" branch in
-    /// [`cache_changed_only_reloadable_fields`], which means an operator
-    /// who only changed `cache.pinned_hashes` between startup and the
-    /// first SIGHUP gets a misleading `cache.* (cache_dir, sizes,
-    /// origin, decompress)` "requires restart" warning alongside the
-    /// "config reload applied" success line.
+    /// into the "no baseline → warn once" branch of the cache-section
+    /// diff (`cache_changed_only_reloadable_fields`), which means an
+    /// operator who only changed `cache.pinned_hashes` between startup
+    /// and the first SIGHUP gets a misleading `cache.* (cache_dir,
+    /// sizes, origin, decompress)` "requires restart" warning alongside
+    /// the "config reload applied" success line.
     ///
     /// Idempotent. A poisoned mutex is recovered the same way
     /// [`Self::attach_cache`] handles its slot — silently no-op'ing on
