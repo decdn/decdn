@@ -431,7 +431,7 @@ async fn build_cache(cfg: &ResolvedConfig) -> anyhow::Result<CacheEngine> {
             (Some(url), None) => Some(Arc::new(
                 HttpOrigin::new(url)
                     .context("failed to build HTTP origin client")?
-                    .with_decompression(cfg.cache.decompress),
+                    .with_decompress_mode(cfg.cache.decompress),
             )),
             (None, Some(path)) => Some(Arc::new(
                 FilesystemOrigin::new(path)

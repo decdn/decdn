@@ -49,6 +49,17 @@ pub async fn run(
         &resolved,
         log_level_setter,
     ));
+    // Seed the file-section diff baseline so the first SIGHUP after
+    // startup doesn't fall into the "no baseline → warn once" branch
+    // and emit a spurious `cache.* (cache_dir, sizes, origin,
+    // decompress) requires restart` line for an operator who only
+    // changed `cache.pinned_hashes`. Re-loading the file is microseconds
+    // and stays at the configuration boundary — the alternative
+    // (threading `FileConfig` through `resolve_config`'s return value)
+    // would ripple through every test that asserts on the resolver.
+    if let Ok(file) = config::load_file_config(config_path) {
+        reload_state.seed_initial_file_snapshot(&file);
+    }
 
     runtime::run(
         resolved,

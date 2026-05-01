@@ -437,12 +437,13 @@ fn resolve_cache(
         );
     }
 
-    // Decompression is on by default — most object stores serve compressed
-    // bodies and the BLAKE3 verify in the engine runs over the canonical
-    // (decompressed) form, so silently passing through compressed bytes
-    // would always fail. CLI has no override for this knob (no operator
-    // policy reason to flip it ad-hoc); file-only is sufficient.
-    let decompress = file.and_then(|c| c.decompress).unwrap_or(true);
+    // Decompression defaults to Auto — most object stores serve
+    // compressed bodies and the BLAKE3 verify in the engine runs over
+    // the canonical (decompressed) form, so silently passing through
+    // compressed bytes would always fail. CLI has no override for
+    // this knob (no operator policy reason to flip it ad-hoc);
+    // file-only is sufficient.
+    let decompress = file.and_then(|c| c.decompress).unwrap_or_default();
 
     let pinned_hashes = parse_pinned_hashes(file.and_then(|c| c.pinned_hashes.as_deref()))
         .context("invalid cache.pinned_hashes")?;
@@ -459,20 +460,20 @@ fn resolve_cache(
 }
 
 /// Parse the operator-supplied `cache.pinned_hashes` list (#276) into a
-/// `HashSet<iroh_blobs::Hash>`. Each entry must be 64 lowercase hex chars
-/// (BLAKE3 digest size); anything else fails resolution. Duplicates are
-/// silently de-duplicated by the `HashSet` — they're harmless.
+/// [`decdn_cache::PinnedHashes`]. Each entry must be 64 lowercase hex
+/// chars (BLAKE3 digest size); anything else fails resolution. Duplicates
+/// are silently de-duplicated — they're harmless.
 ///
 /// `None` and the empty list both resolve to the empty set, so an absent
 /// or empty `pinned_hashes` key just means "no pinning".
 pub(crate) fn parse_pinned_hashes(
     raw: Option<&[String]>,
-) -> anyhow::Result<std::collections::HashSet<decdn_cache::Hash>> {
+) -> anyhow::Result<decdn_cache::PinnedHashes> {
     use std::str::FromStr;
 
     let mut out = std::collections::HashSet::new();
     let Some(entries) = raw else {
-        return Ok(out);
+        return Ok(decdn_cache::PinnedHashes::empty());
     };
     for (idx, entry) in entries.iter().enumerate() {
         let trimmed = entry.trim();
@@ -487,9 +488,8 @@ pub(crate) fn parse_pinned_hashes(
             trimmed.len()
         );
         anyhow::ensure!(
-            trimmed
-                .chars()
-                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+            trimmed.chars().all(|c| c.is_ascii_hexdigit())
+                && !trimmed.chars().any(|c| c.is_ascii_uppercase()),
             "cache.pinned_hashes[{idx}] must be lowercase hex (0-9, a-f)"
         );
         let parsed = decdn_cache::Hash::from_str(trimmed).with_context(|| {
@@ -497,7 +497,7 @@ pub(crate) fn parse_pinned_hashes(
         })?;
         out.insert(parsed);
     }
-    Ok(out)
+    Ok(decdn_cache::PinnedHashes::new(out))
 }
 
 /// Resolve payment fields.
@@ -1749,23 +1749,29 @@ mod tests {
     }
 
     #[test]
-    fn resolve_cache_defaults_decompress_on_and_pinned_empty() -> anyhow::Result<()> {
+    fn resolve_cache_defaults_decompress_auto_and_pinned_empty() -> anyhow::Result<()> {
         let cli = cache_cli(None, None);
         let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
-        anyhow::ensure!(resolved.decompress, "decompress should default to true");
+        anyhow::ensure!(
+            matches!(resolved.decompress, decdn_cache::DecompressMode::Auto),
+            "decompress should default to Auto"
+        );
         anyhow::ensure!(resolved.pinned_hashes.is_empty());
         Ok(())
     }
 
     #[test]
-    fn resolve_cache_decompress_off_via_file() -> anyhow::Result<()> {
+    fn resolve_cache_decompress_strict_via_file() -> anyhow::Result<()> {
         let cli = cache_cli(None, None);
         let file = types::CacheConfig {
-            decompress: Some(false),
+            decompress: Some(decdn_cache::DecompressMode::Strict),
             ..types::CacheConfig::default()
         };
         let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
-        anyhow::ensure!(!resolved.decompress);
+        anyhow::ensure!(matches!(
+            resolved.decompress,
+            decdn_cache::DecompressMode::Strict
+        ));
         Ok(())
     }
 

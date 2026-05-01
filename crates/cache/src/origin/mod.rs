@@ -13,7 +13,7 @@ use bytes::Bytes;
 use iroh_blobs::Hash;
 
 pub use fs::FilesystemOrigin;
-pub use http::{HttpOrigin, OriginUrl, parse_origin_url};
+pub use http::{DecompressMode, HttpOrigin, OriginUrl, parse_origin_url};
 
 /// Result of an [`Origin::fetch`] call.
 #[derive(Debug)]

@@ -15,9 +15,10 @@ use bytes::{Bytes, BytesMut};
 use iroh_blobs::Hash;
 use reqwest::StatusCode;
 use reqwest::header::CONTENT_ENCODING;
+use serde::{Deserialize, Serialize};
 
 use super::{Origin, OriginFetch};
-use crate::error::OriginError;
+use crate::error::{OriginError, SupportedEncoding};
 
 /// How long to wait for the TCP/TLS handshake to complete. Per-request total
 /// duration is intentionally *not* bounded because `max_blob_size_mb` can be
@@ -148,6 +149,35 @@ pub fn parse_origin_url(raw: &str) -> anyhow::Result<OriginUrl> {
     Ok(OriginUrl(url))
 }
 
+/// How [`HttpOrigin`] handles `Content-Encoding` on the response.
+///
+/// `bool` was the original config knob, but the two states have richer
+/// semantics than "on / off" — `Strict` is not "no decompression", it
+/// is "I will refuse anything other than identity". Using a typed enum
+/// keeps that distinction visible at every call site (config, runtime,
+/// fetch path) and on operator-facing config files.
+///
+/// The TOML representation uses lowercase tag names: `decompress = "auto"`
+/// or `decompress = "strict"`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DecompressMode {
+    /// Decode `gzip` / `zstd` bodies transparently; identity passes
+    /// through; unknown encodings raise [`OriginError::UnsupportedEncoding`].
+    /// This is the default — most object stores serve compressed bodies
+    /// and the BLAKE3 verify in [`crate::CacheEngine::pull_through`] runs
+    /// over the canonical (decompressed) form, so pass-through would
+    /// always fail verification.
+    #[default]
+    Auto,
+    /// Reject any non-identity `Content-Encoding`. The origin must serve
+    /// canonical bytes; gzip / zstd / unknown encodings all return
+    /// [`OriginError::UnsupportedEncoding`] before any decode runs.
+    /// Useful only for origins that pre-canonicalise (e.g. an internal
+    /// pre-warmed mirror).
+    Strict,
+}
+
 /// Origin backed by a plain HTTP(S) endpoint serving content-addressed blobs
 /// at `{base_url}/{blake3_hex}`.
 #[derive(Debug, Clone)]
@@ -156,17 +186,10 @@ pub struct HttpOrigin {
     base_url: OriginUrl,
     response_headers_timeout: Duration,
     chunk_idle_timeout: Duration,
-    /// When true (default), inspect the response's `Content-Encoding` and
-    /// decompress `gzip` / `zstd` bodies before returning. The BLAKE3
-    /// verify in [`crate::CacheEngine::pull_through`] runs over the
-    /// decompressed (canonical) bytes; passing through compressed bytes
-    /// would always fail verification because the content-address is
-    /// computed over the canonical form.
-    ///
-    /// Operators with origins that pre-canonicalise (e.g. an internal
-    /// pre-warmed mirror) can flip this off via
-    /// [`Self::with_decompression`].
-    decompress: bool,
+    /// How to handle `Content-Encoding` on the response. Defaults to
+    /// [`DecompressMode::Auto`] — see that type for the full semantics.
+    /// Override with [`Self::with_decompress_mode`].
+    decompress: DecompressMode,
 }
 
 impl HttpOrigin {
@@ -195,7 +218,7 @@ impl HttpOrigin {
             base_url,
             response_headers_timeout: RESPONSE_HEADERS_TIMEOUT,
             chunk_idle_timeout: CHUNK_IDLE_TIMEOUT,
-            decompress: true,
+            decompress: DecompressMode::Auto,
         })
     }
 
@@ -220,14 +243,11 @@ impl HttpOrigin {
         self
     }
 
-    /// Toggle transparent decompression of `gzip` / `zstd` response bodies.
-    /// Defaults to `true`. Disabling makes the origin layer behave like a
-    /// dumb byte pipe — useful only when the origin is guaranteed to serve
-    /// the canonical (already-decompressed) form, since the engine's
-    /// BLAKE3 verify always runs over the canonical bytes.
+    /// Set the [`DecompressMode`]. See that type for the semantics of
+    /// `Auto` vs `Strict`. Defaults to `Auto`.
     #[must_use]
-    pub const fn with_decompression(mut self, decompress: bool) -> Self {
-        self.decompress = decompress;
+    pub const fn with_decompress_mode(mut self, mode: DecompressMode) -> Self {
+        self.decompress = mode;
         self
     }
 }
@@ -238,6 +258,26 @@ impl HttpOrigin {
 /// The engine still enforces `max_blob_bytes` on the final result, so this
 /// is just an inner-loop guard against pathological allocators.
 const DECOMPRESS_READ_BUFFER: usize = 64 * 1024;
+
+/// Classify a (trimmed) `Content-Encoding` token: identity / supported /
+/// unsupported. Returns `None` for the identity case (empty or
+/// `identity`), `Some(Ok(_))` for known decoders, and `Some(Err(_))`
+/// for unknown encodings. Centralises the case-folding so callers can't
+/// disagree on whether `GZIP` is gzip.
+fn classify_encoding(trimmed: &str) -> Option<Result<SupportedEncoding, OriginError>> {
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("identity") {
+        return None;
+    }
+    if trimmed.eq_ignore_ascii_case("gzip") || trimmed.eq_ignore_ascii_case("x-gzip") {
+        return Some(Ok(SupportedEncoding::Gzip));
+    }
+    if trimmed.eq_ignore_ascii_case("zstd") {
+        return Some(Ok(SupportedEncoding::Zstd));
+    }
+    Some(Err(OriginError::UnsupportedEncoding {
+        encoding: trimmed.into(),
+    }))
+}
 
 /// Decompress `body` according to `encoding`. Identity (empty / `identity`)
 /// passes through. Anything else returns
@@ -250,25 +290,27 @@ const DECOMPRESS_READ_BUFFER: usize = 64 * 1024;
 /// growing past memory before the engine ever sees it.
 fn decompress_body(body: Bytes, encoding: &str, max_bytes: u64) -> Result<Bytes, OriginError> {
     let trimmed = encoding.trim();
-    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("identity") {
-        return Ok(body);
+    let supported = match classify_encoding(trimmed) {
+        None => return Ok(body),
+        Some(Ok(s)) => s,
+        Some(Err(e)) => return Err(e),
+    };
+    match supported {
+        SupportedEncoding::Gzip => {
+            let mut decoder = flate2::read::GzDecoder::new(body.as_ref());
+            read_capped(&mut decoder, max_bytes, supported)
+        }
+        SupportedEncoding::Zstd => {
+            let mut decoder =
+                zstd::stream::read::Decoder::new(body.as_ref()).map_err(|source| {
+                    OriginError::DecompressionFailed {
+                        encoding: supported,
+                        source,
+                    }
+                })?;
+            read_capped(&mut decoder, max_bytes, supported)
+        }
     }
-    if trimmed.eq_ignore_ascii_case("gzip") || trimmed.eq_ignore_ascii_case("x-gzip") {
-        let mut decoder = flate2::read::GzDecoder::new(body.as_ref());
-        return read_capped(&mut decoder, max_bytes, "gzip");
-    }
-    if trimmed.eq_ignore_ascii_case("zstd") {
-        let mut decoder = zstd::stream::read::Decoder::new(body.as_ref()).map_err(|source| {
-            OriginError::DecompressionFailed {
-                encoding: "zstd".to_string(),
-                source,
-            }
-        })?;
-        return read_capped(&mut decoder, max_bytes, "zstd");
-    }
-    Err(OriginError::UnsupportedEncoding {
-        encoding: trimmed.to_string(),
-    })
 }
 
 /// Read from `decoder` into a growing buffer, bailing as soon as the total
@@ -278,17 +320,14 @@ fn decompress_body(body: Bytes, encoding: &str, max_bytes: u64) -> Result<Bytes,
 fn read_capped<R: Read>(
     decoder: &mut R,
     max_bytes: u64,
-    encoding: &'static str,
+    encoding: SupportedEncoding,
 ) -> Result<Bytes, OriginError> {
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = vec![0u8; DECOMPRESS_READ_BUFFER];
     loop {
         let n = decoder
             .read(&mut chunk)
-            .map_err(|source| OriginError::DecompressionFailed {
-                encoding: encoding.to_string(),
-                source,
-            })?;
+            .map_err(|source| OriginError::DecompressionFailed { encoding, source })?;
         if n == 0 {
             break;
         }
@@ -298,7 +337,7 @@ fn read_capped<R: Read>(
         let next_total = (buf.len() as u64).saturating_add(n as u64);
         if next_total > max_bytes {
             return Err(OriginError::DecompressionFailed {
-                encoding: encoding.to_string(),
+                encoding,
                 source: std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!("decompressed body exceeds max_bytes={max_bytes} mid-stream"),
@@ -349,28 +388,35 @@ impl Origin for HttpOrigin {
                 anyhow::bail!("origin GET {url_log} returned {status}");
             }
 
-            // Capture the encoding before consuming the body. We can't
-            // trust the post-decompression byte count to match
-            // `Content-Length` (which describes the encoded size), so the
-            // cap check below intentionally guards the *encoded* stream
-            // and `decompress_body` re-checks the decompressed total.
-            let encoding = resp
-                .headers()
-                .get(CONTENT_ENCODING)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_string();
-            let is_compressed =
-                !encoding.trim().is_empty() && !encoding.trim().eq_ignore_ascii_case("identity");
+            // Capture the encoding before consuming the body. The
+            // header is RFC 9110 § 5.6.7 — restricted to ASCII tokens —
+            // so a header value that fails `to_str()` (non-ASCII bytes,
+            // illegal control chars, etc.) is a malformed origin
+            // response, not "no encoding". Surfacing
+            // `MalformedEncoding` keeps a buggy or hostile origin from
+            // smuggling raw compressed bytes past the decompression
+            // layer by sending an unparsable header.
+            let encoding = match resp.headers().get(CONTENT_ENCODING) {
+                None => String::new(),
+                Some(v) => match v.to_str() {
+                    Ok(s) => s.to_string(),
+                    Err(_) => return Err(OriginError::MalformedEncoding.into()),
+                },
+            };
+            let trimmed = encoding.trim();
+            let is_compressed = !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("identity");
 
             // Fast-path rejection using the advertised length before we
-            // read anything. Only safe to compare against `max_bytes` for
-            // identity-encoded bodies — for compressed bodies the encoded
-            // length is unrelated to the final byte count, so we let the
-            // streaming loop and `read_capped` enforce the cap on the
-            // decompressed side.
+            // read anything. For identity bodies the encoded length is
+            // the payload length and must not exceed `max_bytes`. For
+            // compressed bodies the encoded length is decoupled from
+            // the post-decompression byte count, but it can never
+            // *legitimately* exceed `max_bytes` — a compression ratio
+            // < 1 (encoded smaller than decoded) is universal in
+            // practice. An origin advertising a compressed length above
+            // the decompressed cap is either malicious or misconfigured;
+            // either way we burn no bandwidth.
             if let Some(len) = resp.content_length()
-                && !is_compressed
                 && len > max_bytes
             {
                 anyhow::bail!(
@@ -419,15 +465,17 @@ impl Origin for HttpOrigin {
             }
             let raw = buf.freeze();
 
-            // Decompression layer (#312). When the operator opts out via
-            // `decompress=false` we still validate the encoding: a
-            // gzip-encoded response served as raw bytes would later trip
-            // a BLAKE3 mismatch in the engine, which is a much harder
-            // failure mode to debug than a clear `UnsupportedEncoding`
-            // error here.
-            if !self.decompress {
+            // Decompression layer (#312). In `DecompressMode::Strict`
+            // we still validate the encoding: a gzip-encoded response
+            // served as raw bytes would later trip a BLAKE3 mismatch
+            // in the engine, which is a much harder failure mode to
+            // debug than a clear `UnsupportedEncoding` error here.
+            if matches!(self.decompress, DecompressMode::Strict) {
                 if is_compressed {
-                    return Err(crate::error::OriginError::UnsupportedEncoding { encoding }.into());
+                    return Err(OriginError::UnsupportedEncoding {
+                        encoding: trimmed.into(),
+                    }
+                    .into());
                 }
                 return Ok(OriginFetch::Found(raw));
             }
@@ -435,8 +483,15 @@ impl Origin for HttpOrigin {
             // worker the same way BLAKE3 does (engine.rs uses
             // `spawn_blocking` above 1 MiB). Mirror that policy here so
             // a 10 GB gzipped origin can't starve the executor.
+            //
+            // The `OriginError` is propagated *typed* (no
+            // `with_context` wrapping it directly) so
+            // [`crate::CacheError::origin_error_kind`] can recover the
+            // variant from the chain without a string match. The outer
+            // `?` converts via `From<OriginError> for anyhow::Error`,
+            // which preserves downcastability.
             let decoded = if raw.len() <= DECOMPRESS_BLOCKING_THRESHOLD {
-                decompress_body(raw, &encoding, max_bytes)
+                decompress_body(raw, &encoding, max_bytes)?
             } else {
                 let raw_for_decode = raw;
                 let encoding_for_decode = encoding.clone();
@@ -446,9 +501,8 @@ impl Origin for HttpOrigin {
                 .await
                 .with_context(|| {
                     format!("origin GET {url_log} body decompression task failed to join")
-                })?
-            }
-            .with_context(|| format!("origin GET {url_log} body decompression failed"))?;
+                })??
+            };
             Ok(OriginFetch::Found(decoded))
         })
     }

@@ -78,14 +78,13 @@ pub struct CacheConfig {
     /// Local filesystem origin root; blobs live at
     /// `{path}/{hex[0..2]}/{hex}`. Mutually exclusive with `origin_url`.
     pub origin_path: Option<PathBuf>,
-    /// Transparently decompress `Content-Encoding: gzip` / `zstd`
-    /// responses from the HTTP origin (#312). Defaults to `true` because
-    /// many object stores serve compressed bodies and the BLAKE3
+    /// How to handle `Content-Encoding` on the HTTP origin response
+    /// (#312). `"auto"` (default) decompresses gzip/zstd transparently;
+    /// `"strict"` refuses any non-identity encoding. The BLAKE3
     /// content-address is computed over the canonical (decompressed)
-    /// form, so pass-through would always fail verification. Operators
-    /// whose origin is guaranteed to serve canonical bytes can set this
-    /// to `false` to skip the decoder.
-    pub decompress: Option<bool>,
+    /// form, so `"strict"` is only safe for origins guaranteed to
+    /// serve already-canonical bytes.
+    pub decompress: Option<decdn_cache::DecompressMode>,
     /// Hex-encoded BLAKE3 hashes that must stay cached regardless of LRU
     /// pressure (#276). Each entry is 64 lowercase hex chars (BLAKE3
     /// digest size). Invalid hex or wrong-length entries cause config
