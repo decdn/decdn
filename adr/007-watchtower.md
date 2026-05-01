@@ -194,11 +194,11 @@ flowchart TD
 
 ### 8. PoC Scope
 
+`disputeChannel` carries no `msg.sender` restriction (voucher signature is the sole authoriser) and the contract emits `ChannelCloseInitiated`, `ChannelDisputed`, and `ChannelSettled` events in both PoC and production. The table below lists only the differences:
+
 | Aspect | PoC | Production |
 | --- | --- | --- |
 | Watchtower service | Not implemented | Required |
-| `disputeChannel` access | No sender restriction (future-proof) | Same |
-| Contract events | `ChannelCloseInitiated`, `ChannelDisputed`, `ChannelSettled` emitted | Same |
 | Local dispute monitor | Recommended | Required |
 | Discovery | N/A | Config-based → gossip → on-chain registry |
 | Redundancy | N/A | 2–3 per channel |

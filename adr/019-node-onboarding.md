@@ -361,7 +361,7 @@ after re-registration to associate the new `nodeId` with the same `ethAddress` â
 | Multiaddr cooldown | None | Governable (default 0, can be tightened) |
 | Origin assignment | Operator self-configures | Evaluated in [Issue #189](https://github.com/thiras/decdn/issues/189) |
 | Geolocation verification | Self-reported `regionHint` | Deferred â€” see Issue #190 gap 7 |
-| NTP enforcement | Logged warning if offset > 10s | Same (SHOULD, not MUST) |
+| NTP enforcement | Logged warning if offset > 10s | SHOULD, not MUST |
 
 ## Consequences
 
