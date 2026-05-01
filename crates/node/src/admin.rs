@@ -177,14 +177,10 @@ pub struct HealthResponse {
 /// Request body for `admin_v1_evict` (issue #279).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvictRequest {
-    /// Lowercase hex of the BLAKE3 hash to evict. Must be exactly 64 hex
-    /// characters; rejected at the server with `INVALID_PARAMS` otherwise.
+    /// Hex of the BLAKE3 hash to evict. Must be exactly 64 hex characters
+    /// (mixed case accepted, optional `0x`/`0X` prefix tolerated); rejected
+    /// at the server with `INVALID_PARAMS` otherwise.
     pub hash: String,
-    /// If `true`, after evicting clear the eviction flag and re-pull the
-    /// blob from the configured origin. Used by `decdn node evict
-    /// --re-pin` to forcibly refresh a corrupted local copy.
-    #[serde(default)]
-    pub re_pin: bool,
 }
 
 /// Response body for `admin_v1_evict`.
@@ -192,12 +188,10 @@ pub struct EvictRequest {
 pub struct EvictResponse {
     /// Whether the hash was present in the cache *before* the evict ran.
     /// `false` means the operator's evict was a no-op safety measure (the
-    /// blob was never cached or had already been evicted).
+    /// blob was never cached or had already been evicted). The eviction
+    /// is durable in either case — a future `decdn run` against the same
+    /// cache directory will continue to refuse to serve the hash.
     pub was_present: bool,
-    /// `true` only when `re_pin: true` was requested AND the subsequent
-    /// pull-through from the origin succeeded. `false` otherwise — including
-    /// when `re_pin` was not requested.
-    pub repinned: bool,
 }
 
 /// Response body for `admin_v1_announce` (issue #280).
@@ -258,10 +252,10 @@ fn cache_error_to_rpc(err: &CacheError) -> ErrorObjectOwned {
     ErrorObjectOwned::owned(CACHE_ERROR_CODE, err.to_string(), None::<()>)
 }
 
-/// Decode a 64-character hex BLAKE3 hash into [`Hash`].
+/// Decode a 64-character hex BLAKE3 hash into [`struct@Hash`].
 ///
 /// Goes through `alloy::primitives::hex::decode` (case-insensitive,
-/// `0x`-prefix-tolerant) rather than `Hash::from_str` because the
+/// `0x`/`0X`-prefix-tolerant) rather than `Hash::from_str` because the
 /// iroh-blobs implementation falls through to `data_encoding`'s base32
 /// decoder for short inputs and **panics** when the decoder's output
 /// buffer is the wrong size for the requested decoding. Operator-driven
@@ -269,7 +263,10 @@ fn cache_error_to_rpc(err: &CacheError) -> ErrorObjectOwned {
 /// admin RPC handler thread instead of returning an `INVALID_PARAMS`
 /// error to the caller.
 fn parse_hash_arg(hex: &str) -> Result<Hash, ErrorObjectOwned> {
-    let trimmed = hex.strip_prefix("0x").unwrap_or(hex);
+    let trimmed = hex
+        .strip_prefix("0x")
+        .or_else(|| hex.strip_prefix("0X"))
+        .unwrap_or(hex);
     let bytes = alloy::primitives::hex::decode(trimmed).map_err(|err| {
         ErrorObjectOwned::owned(
             INVALID_PARAMS_CODE,
@@ -325,30 +322,16 @@ impl AdminRpcServer for AdminRpcImpl {
             .await
             .map_err(|err| cache_error_to_rpc(&err))?;
 
-        self.state.cache.evict(hash);
+        // `evict` returns `Err` if it can't durably persist the eviction
+        // (e.g. evicted-log fsync failed). For DMCA takedowns the
+        // operator must learn about that failure rather than getting an
+        // "ok" response that silently degraded to in-memory-only.
+        self.state
+            .cache
+            .evict(hash)
+            .map_err(|err| cache_error_to_rpc(&err))?;
 
-        let repinned = if req.re_pin {
-            // Clear the eviction flag so `get` is allowed to pull from
-            // the origin instead of short-circuiting on the flag (#279).
-            self.state.cache.unevict(hash);
-            match self.state.cache.get(hash).await {
-                Ok(_) => true,
-                Err(err) => {
-                    // Pull-through failed: re-evict so the node doesn't
-                    // serve a possibly-stale local copy and surface the
-                    // origin's error to the operator.
-                    self.state.cache.evict(hash);
-                    return Err(cache_error_to_rpc(&err));
-                }
-            }
-        } else {
-            false
-        };
-
-        Ok(EvictResponse {
-            was_present,
-            repinned,
-        })
+        Ok(EvictResponse { was_present })
     }
 
     async fn announce(&self) -> RpcResult<AnnounceResponse> {
@@ -658,12 +641,10 @@ mod tests {
         let resp = rpc
             .evict(EvictRequest {
                 hash: alloy::primitives::hex::encode(hash.as_bytes()),
-                re_pin: false,
             })
             .await
             .expect("evict ok");
         assert!(resp.was_present, "expected was_present=true");
-        assert!(!resp.repinned, "expected repinned=false (no --re-pin)");
 
         match cache.get(hash).await {
             Err(CacheError::NotFound { .. }) => Ok(()),
@@ -680,13 +661,40 @@ mod tests {
         let err = rpc
             .evict(EvictRequest {
                 hash: "not-hex".into(),
-                re_pin: false,
             })
             .await
             .expect_err("expected invalid-params error");
         // INVALID_PARAMS_CODE; double-checked here so a typo'd code constant
         // still surfaces as a test failure.
         assert_eq!(err.code(), -32_602);
+    }
+
+    #[tokio::test]
+    async fn admin_evict_accepts_uppercase_0x_prefix() {
+        // `0X` and uppercase hex must both be tolerated; this guards
+        // against the case-sensitive `strip_prefix("0x")` regression
+        // flagged in PR review.
+        let (cache, _tmp) = test_cache().await;
+        let state = AdminState::new(
+            Arc::new(RwLock::new(PeerTable::new(0))),
+            [0u8; 32],
+            Instant::now(),
+            cache,
+            None,
+        );
+        let rpc = AdminRpcImpl::new(state);
+        let hash = Hash::new(b"prefix-test");
+        let upper = format!(
+            "0X{}",
+            alloy::primitives::hex::encode(hash.as_bytes()).to_uppercase()
+        );
+        let resp = rpc
+            .evict(EvictRequest { hash: upper })
+            .await
+            .expect("0X-prefixed uppercase hex should parse");
+        // was_present=false because the test cache has no origin and we
+        // never `get`-ed the hash; the parse alone must succeed.
+        assert!(!resp.was_present);
     }
 
     #[tokio::test]

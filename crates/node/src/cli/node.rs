@@ -65,20 +65,19 @@ pub struct HealthArgs {
 
 /// `decdn node evict` — forcibly remove a blob from the local cache via
 /// `admin_v1_evict` (issue #279).
+///
+/// The eviction is *logical* in this version (the iroh-blobs store still
+/// holds the bytes — see issue #233 for the disk-reclaim follow-up) but
+/// is persisted to `<cache_dir>/evicted.log` so it survives restarts.
+/// Operators using this for DMCA takedowns can rely on the takedown
+/// being durable across `decdn run` invocations.
 #[derive(Args, Debug)]
 pub struct EvictArgs {
-    /// BLAKE3 hash of the blob to evict, encoded as 64 lowercase hex
-    /// characters. Operators paste this from access logs / takedown
-    /// notices; mixed-case input is accepted (the server normalizes).
+    /// BLAKE3 hash of the blob to evict, encoded as 64 hex characters.
+    /// Optional `0x` / `0X` prefix is tolerated; mixed case is accepted.
+    /// Operators paste this from access logs / takedown notices.
     #[arg(value_name = "HASH")]
     pub hash: String,
-
-    /// After evicting, clear the eviction flag and re-pull the blob from
-    /// the configured origin. Useful when an existing local copy is
-    /// suspected to be corrupted and the operator wants a fresh fetch
-    /// rather than just a removal.
-    #[arg(long)]
-    pub re_pin: bool,
 
     /// Base URL of the node's admin HTTP surface. See `health --admin-url`
     /// for resolution precedence (flag → env → config → default).
@@ -94,10 +93,8 @@ pub struct EvictArgs {
     #[arg(long)]
     pub json: bool,
 
-    /// Roundtrip timeout in milliseconds. The default is generous because
-    /// `--re-pin` may trigger an origin pull, which can take seconds for
-    /// large blobs over slow links.
-    #[arg(long, value_name = "MS", default_value_t = 30_000)]
+    /// Roundtrip timeout in milliseconds.
+    #[arg(long, value_name = "MS", default_value_t = 5_000)]
     pub timeout_ms: u64,
 }
 

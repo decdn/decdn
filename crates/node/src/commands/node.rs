@@ -126,7 +126,6 @@ pub async fn evict(args: &cli::EvictArgs, global_config: Option<&Path>) -> anyho
     let resp: EvictResponse = client
         .evict(EvictRequest {
             hash: args.hash.clone(),
-            re_pin: args.re_pin,
         })
         .await
         .map_err(|err| classify_client_error(&url, args.timeout_ms, err))?;
@@ -144,12 +143,7 @@ pub async fn evict(args: &cli::EvictArgs, global_config: Option<&Path>) -> anyho
             // can't tell success-with-no-effect from a hung command.
             "not present"
         };
-        if args.re_pin {
-            let outcome = if resp.repinned { "ok" } else { "failed" };
-            println!("hash={} status={presence} repinned={outcome}", args.hash);
-        } else {
-            println!("hash={} status={presence}", args.hash);
-        }
+        println!("hash={} status={presence}", args.hash);
     }
 
     Ok(())
