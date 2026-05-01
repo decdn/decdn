@@ -98,3 +98,18 @@ ADRs are **decision records**: they capture both the canonical design and the al
 ## Contributing
 
 See [CONTRIBUTING.md § Working with ADRs](../CONTRIBUTING.md#working-with-adrs) for ADR conventions, file naming, cross-reference checks, and the next-ADR-number protocol.
+
+## Building a single PDF
+
+Bundle every ADR (overview + numbered ADRs + appendices) into one printable PDF with a table of contents. Requires [`pandoc`](https://pandoc.org/) and [`typst`](https://typst.app/) (`brew install pandoc typst`):
+
+```bash
+cd adr
+pandoc --from=markdown+gfm_auto_identifiers \
+  --toc --toc-depth=2 \
+  --pdf-engine=typst \
+  -V title="deCDN — Architecture Decision Records" \
+  -V date="$(date +%Y-%m-%d)" \
+  architecture.md $(ls [0-9]*.md | sort) $(ls appendix-*.md | sort) \
+  -o adrs.pdf
+```

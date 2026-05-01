@@ -38,7 +38,7 @@ Label names: snake_case, no abbreviations. Label values: lowercase where possibl
 
 All metrics are exported in **Prometheus text format 0.0.4** on a configurable HTTP port
 (default `9090`) at path `/metrics`. The same port exposes `/health` (see [Health
-Endpoint](#health-endpoint)). The port MUST be configurable via operator config; it MUST
+Endpoint](#3-health-endpoint)). The port MUST be configurable via operator config; it MUST
 NOT be publicly accessible without authentication in production (firewall or auth proxy).
 
 ### 2. Metric Registry

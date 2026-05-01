@@ -12,3 +12,6 @@
 # Foundry
 /contracts/out/
 /contracts/cache/
+
+# ADR PDF build output
+/adr/adrs.pdf
