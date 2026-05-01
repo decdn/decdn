@@ -10,7 +10,7 @@ A node operator routinely holds three keys:
 |-----|----------------|---------|----------------|
 | **iroh node-key** | Ed25519 | Wire identity (`NodeId`); signs the `signature` field on `ProbeResponse`, `StreamResponse`, and `NodeAnnounce` for connection-level authentication ([ADR 005](005-protocol.md)) | iroh keystore on the signing host |
 | **Ethereum signing key** | secp256k1 | On-chain identity for staking, channel ops, voucher receipt. Signs the EIP-712 `BindNodeId` and `bindingSignature` ([ADR 003 §NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)) **and** the `slash_sig` field on every `ProbeResponse` / `StreamResponse` for on-chain accountability ([ADR 014](014-on-chain-verification.md)). The hot-signing burden of the latter motivates the production session-key path below. | EVM keystore (EOA) **or** Safe owner key (PoC 1-of-1) **or** session key delegated by a Safe (production §3 of [ADR 024](024-account-abstraction.md)) |
-| **Slash-sig session key** *(production only)* | secp256k1 | Per-message hot-signing of `slash_sig` digests on `ProbeResponse` / `StreamResponse` at wire speed when the operator runs a 2-of-3 Safe; authorised via `erc7579/smartsessions` ([ADR 024](024-account-abstraction.md) §3). Note: client-side voucher session keys (also production-only, also via smartsessions) are a separate concern owned by clients, not operators. | Signing host, scoped by the session-key policy |
+| **Slash-sig session key** *(production only)* | secp256k1 | Per-message hot-signing of `slash_sig` digests on `ProbeResponse` / `StreamResponse` at wire speed when the operator runs a 2-of-3 Safe; authorized via `erc7579/smartsessions` ([ADR 024](024-account-abstraction.md) §3). Note: client-side voucher session keys (also production-only, also via smartsessions) are a separate concern owned by clients, not operators. | Signing host, scoped by the session-key policy |
 
 Rotation reasons:
 
@@ -75,7 +75,7 @@ The standalone `bindNodeId` function is intended for rebinding only — it delet
    - `decdn_streams_active{direction="inbound"} == 0`
    - `decdn_probe_hold_slots_used == 0`
 
-   The probe-hold drain is critical: rotating before holds clear opens a phantom-slash window, since outstanding holds were signed by the *old* NodeId but the *new* NodeId would not honour them. See [ADR 005 §Probe-Triggered Eviction Hold](005-protocol.md#probe-triggered-eviction-hold).
+   The probe-hold drain is critical: rotating before holds clear opens a phantom-slash window, since outstanding holds were signed by the *old* NodeId but the *new* NodeId would not honor them. See [ADR 005 §Probe-Triggered Eviction Hold](005-protocol.md#probe-triggered-eviction-hold).
 3. **Stop** the node process.
 4. **Build the EIP-712 `BindNodeId` binding signature** with the operator's Ethereum key, using the current `bindingNonce[ethAddress]` — `bindingSignature = EIP-712 sign(ethKey, BindNodeId { nodeId: newNodeId, nonce: bindingNonce[ethAddress] })`.
 5. **Submit** `StakingRegistry.bindNodeId(newNodeId, bindingSignature)`. The transaction must originate from the same Ethereum address that owns the existing binding. Wait for one block confirmation and verify the `NodeIdBound` event.

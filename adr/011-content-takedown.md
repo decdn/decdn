@@ -11,7 +11,7 @@ No existing ADR addresses content removal. This ADR establishes:
 
 1. A governance-controlled on-chain hash blacklist
 2. Regional governance bodies for jurisdiction-scoped takedowns
-3. Node behaviour when a hash or origin is blacklisted
+3. Node behavior when a hash or origin is blacklisted
 4. An emergency fast-path for time-critical removals
 5. The slashing regime for non-compliance
 6. The known limitations of hash-based blacklisting and the mitigations available
@@ -128,7 +128,7 @@ Hash-based blacklisting covers only exact copies of a blob. A one-byte change pr
 - **Address banned while blacklisted** — cannot register new nodes under the same Ethereum address unless governance removes the blacklist entry via `removeOrigin(operatorAddress)`. Re-entry otherwise requires a new identity funded with fresh stake (minimum 50,000 TOKEN — [ADR 026 §7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake))
 - **The operator's registered NodeId is excluded from peer tables** — gossip validation rejects messages from that blacklisted node
 
-> **Ejection vs. slashing.** Origin blacklisting triggers ejection (forced unbonding of remaining stake), *not* the escalating slash schedule. The operator's stake is not burned — it is returned after the unbonding period, assuming no separate slashable offense occurs during unbonding. By contrast, *serving* a blacklisted hash after the compliance window is a slashable offense under the escalating schedule in [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn), where stake is partially burned and the challenger is rewarded. A node operator can face both: slashing for serving blacklisted content, followed by origin blacklisting and ejection if the behaviour persists.
+> **Ejection vs. slashing.** Origin blacklisting triggers ejection (forced unbonding of remaining stake), *not* the escalating slash schedule. The operator's stake is not burned — it is returned after the unbonding period, assuming no separate slashable offense occurs during unbonding. By contrast, *serving* a blacklisted hash after the compliance window is a slashable offense under the escalating schedule in [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn), where stake is partially burned and the challenger is rewarded. A node operator can face both: slashing for serving blacklisted content, followed by origin blacklisting and ejection if the behavior persists.
 
 This raises the cost of re-upload evasion from trivial (change a byte) to significant: the operator must fund and register a new identity with fresh stake. Repeat evasion becomes progressively more expensive.
 
@@ -136,7 +136,7 @@ This raises the cost of re-upload evasion from trivial (change a byte) to signif
 
 **Fast re-reporting path.** When a re-encoded variant of a known-bad blob is identified, governance can add the new hash via the emergency multisig path (2-hour compliance window). The combination of fast re-reporting and origin blacklisting makes sustained evasion operationally difficult even if no single mechanism closes the gap completely.
 
-## Node Behaviour
+## Node Behavior
 
 ### Polling
 

@@ -13,7 +13,7 @@ Clients are referenced throughout ADRs 001–011 — they pay for content, hold 
 4. **Eclipse attack resolution** — [ADR 003](003-payments.md) lists Options A/B/C with no decision.
 5. **Trust boundary** — what does the client verify vs. trust? This is implied across multiple ADRs but never stated explicitly.
 
-This ADR consolidates all client-specific behaviour into a single canonical specification.
+This ADR consolidates all client-specific behavior into a single canonical specification.
 
 ## Decision
 
@@ -65,7 +65,7 @@ For PoC, steps 4–5 are skipped (no DNS seeds configured). The registry is the 
 
 **Gossip participation policy:**
 
-| Behaviour | Client | Node |
+| Behavior | Client | Node |
 | --- | --- | --- |
 | Subscribe to gossip topics | Yes | Yes |
 | Publish `NodeAnnounce` | No | Yes |
@@ -76,7 +76,7 @@ For PoC, steps 4–5 are skipped (no DNS seeds configured). The registry is the 
 
 The client validates gossip messages using the same rules as nodes: signature verification, registry membership check, and ±60-second timestamp freshness ([ADR 001](001-network.md)). This requires NTP synchronization, as already mandated for "validating clients" in ADR 001.
 
-The registry query, retry schedule, and `peers.json` fallback behaviour defined here supersede the client-specific portions of [ADR 001 — Registry Unavailability](001-network.md#registry-unavailability). ADR 001 retains the specification for node bootstrap and registry interaction.
+The registry query, retry schedule, and `peers.json` fallback behavior defined here supersede the client-specific portions of [ADR 001 — Registry Unavailability](001-network.md#registry-unavailability). ADR 001 retains the specification for node bootstrap and registry interaction.
 
 ### Key Management
 
@@ -223,7 +223,7 @@ The client queries all configured seed domains, cross-checks returned NodeIds ag
 
 **Positive:**
 
-- Consolidates all client behaviour scattered across ADRs 001, 003, 005, and 008 into a single canonical specification
+- Consolidates all client behavior scattered across ADRs 001, 003, 005, and 008 into a single canonical specification
 - Resolves the eclipse attack open question from ADR 003 with a concrete decision (Option B for production)
 - Establishes an explicit trust boundary, making security assumptions auditable
 - PoC key management is simple (file-based EOA or Safe wallet) with a clear production upgrade path (Safe multisig with session keys — see [ADR 024](024-account-abstraction.md))
@@ -254,7 +254,7 @@ A client can split a large blob across N nodes and download each byte range in p
 decdn pull <hash> --max-channels <N> -o <output>
 ```
 
-**Default:** `--max-channels 1` (sequential, existing behaviour).
+**Default:** `--max-channels 1` (sequential, existing behavior).
 
 ### Economic threshold
 
@@ -413,7 +413,7 @@ manifest vs. raw out-of-band.
 
 ## ADRs Affected
 
-- **[ADR 001](001-network.md):** Client bootstrap and registry unavailability sections are superseded by this ADR for client-specific behaviour. ADR 001 retains the specification for node bootstrap.
+- **[ADR 001](001-network.md):** Client bootstrap and registry unavailability sections are superseded by this ADR for client-specific behavior. ADR 001 retains the specification for node bootstrap.
 - **[ADR 003](003-payments.md):** Eclipse attack options (A/B/C) are resolved — Option B for production, registry-only for PoC, Option C as supplementary policy.
 - **[ADR 005](005-protocol.md):** `StreamRequest` ephemeral binding fields are specified in full lifecycle context here.
 - **[ADR 008](008-reputation.md):** Client reputation contribution is clarified — local observations only, no gossip submissions.

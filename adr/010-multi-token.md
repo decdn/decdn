@@ -104,7 +104,7 @@ SafeERC20.safeTransferFrom(IERC20(token), msg.sender, address(this), deposit);
 
 Tokens with fee-on-transfer or rebase mechanics are unsupported — the contract assumes `deposit` equals the amount actually received. `SafeERC20` is used for all token interactions because some widely-deployed ERC-20s (notably USDT) do not return a `bool` on `transfer`/`approve`, causing a raw `IERC20.transfer()` call to revert on the missing return data. `SafeERC20` wraps these calls to handle both returning and non-returning tokens uniformly. This is a separate concern from fee-on-transfer rejection, which is enforced by the governance allowlist vetting process.
 
-The allowlist reduces exposure by letting governance reject tokens with known problematic behaviour (e.g., fee-on-transfer, pausable transfers, obvious reentrancy patterns) before they are used, but it does not by itself prevent reentrancy or other ERC-20-level attacks. The implementation must still use standard on-chain mitigations (`nonReentrant` guards, checks-effects-interactions pattern, `SafeERC20`), and governance should account for proxy/upgradability and admin controls when vetting tokens.
+The allowlist reduces exposure by letting governance reject tokens with known problematic behavior (e.g., fee-on-transfer, pausable transfers, obvious reentrancy patterns) before they are used, but it does not by itself prevent reentrancy or other ERC-20-level attacks. The implementation must still use standard on-chain mitigations (`nonReentrant` guards, checks-effects-interactions pattern, `SafeERC20`), and governance should account for proxy/upgradability and admin controls when vetting tokens.
 
 **Channel ID** incorporates the token address to allow the same client-provider pair to hold concurrent channels in different tokens:
 
@@ -251,7 +251,7 @@ struct SignedRate {
 - No issuer dependency. Governance can approve tokens with different trust profiles: Circle (USDC), MakerDAO (DAI), or operator-issued tokens on a private chain.
 - The EIP-712 voucher format already carries the token address — no signature scheme migration needed.
 - Operators advertising multiple tokens give clients the best chance of finding a compatible channel without pre-coordination.
-- **Malicious token exposure reduction.** The allowlist lets governance reject known-problematic ERC-20 contracts before they interact with `PaymentChannel` funds. This is a first line of defence; on-chain mitigations (`nonReentrant`, `SafeERC20`, checks-effects-interactions) remain required.
+- **Malicious token exposure reduction.** The allowlist lets governance reject known-problematic ERC-20 contracts before they interact with `PaymentChannel` funds. This is a first line of defense; on-chain mitigations (`nonReentrant`, `SafeERC20`, checks-effects-interactions) remain required.
 - **Garbage token prevention.** Only governance-approved tokens can be used in channels, eliminating the attack surface of worthless self-issued tokens polluting the network.
 
 **Negative:**
