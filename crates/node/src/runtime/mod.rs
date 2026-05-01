@@ -24,6 +24,7 @@ use decdn_gossip::{GossipMetrics, GossipRuntimeConfig, GossipService, PeerTable}
 
 use crate::admin;
 use crate::config::ResolvedConfig;
+use crate::dispatch::ConnectionLimiter;
 use crate::handlers::probe::ProbeHandler;
 use crate::{identity, metrics};
 
@@ -99,10 +100,16 @@ pub async fn run(
 
     let gossip = Gossip::builder().spawn(ep.clone());
 
+    let limiter = Arc::new(ConnectionLimiter::new(
+        &cfg.security,
+        Arc::clone(&node_metrics),
+    ));
+
     let probe_handler = Arc::new(ProbeHandler::new(
         secret_key.public(),
         reload_state.rate_per_mb(),
         Arc::clone(&node_metrics),
+        limiter,
     ));
 
     let router = Router::builder(ep.clone())

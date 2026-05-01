@@ -53,6 +53,16 @@ pub struct DecdnMetrics {
     /// `check_rpc_reachability` probe so dashboards/alerts can fire on
     /// a sustained outage rather than relying on a one-shot startup line.
     pub rpc_healthy: Gauge,
+    /// Connections rejected because the global concurrency semaphore was
+    /// exhausted (issue #235).
+    pub dispatch_rejected_global_total: Counter,
+    /// Connections rejected by the per-NodeID token bucket (issue #235).
+    pub dispatch_rejected_per_node_total: Counter,
+    /// Connections rejected by the per-IP token bucket (issue #235).
+    pub dispatch_rejected_per_ip_total: Counter,
+    /// Currently in-flight QUIC handler tasks holding a dispatch permit
+    /// (issue #235).
+    pub dispatch_in_flight: Gauge,
 }
 
 /// Aggregated deCDN node metrics.
@@ -140,6 +150,31 @@ impl Metrics {
     /// `runtime::run`.
     pub fn rpc_healthy(&self, ok: bool) {
         self.decdn.rpc_healthy.set(i64::from(ok));
+    }
+
+    /// Record a connection rejected by the global concurrency semaphore.
+    pub fn dispatch_rejected_global(&self) {
+        self.decdn.dispatch_rejected_global_total.inc();
+    }
+
+    /// Record a connection rejected by the per-NodeID token bucket.
+    pub fn dispatch_rejected_per_node(&self) {
+        self.decdn.dispatch_rejected_per_node_total.inc();
+    }
+
+    /// Record a connection rejected by the per-IP token bucket.
+    pub fn dispatch_rejected_per_ip(&self) {
+        self.decdn.dispatch_rejected_per_ip_total.inc();
+    }
+
+    /// Increment the in-flight dispatch permit gauge.
+    pub fn dispatch_permit_acquired(&self) {
+        self.decdn.dispatch_in_flight.inc();
+    }
+
+    /// Decrement the in-flight dispatch permit gauge.
+    pub fn dispatch_permit_released(&self) {
+        self.decdn.dispatch_in_flight.dec();
     }
 
     /// Read the current value of the `rpc_healthy` gauge. Test-only —

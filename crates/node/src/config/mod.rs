@@ -15,7 +15,7 @@ use crate::cli::run::RunArgs;
 
 pub use resolved::{
     ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedGossip, ResolvedIdentity,
-    ResolvedNetwork, ResolvedObservability, ResolvedPayment,
+    ResolvedNetwork, ResolvedObservability, ResolvedPayment, ResolvedSecurity,
 };
 pub use types::FileConfig;
 
@@ -47,6 +47,20 @@ const DEFAULT_RPC_WATCHDOG_INTERVAL_SEC: u64 = 30;
 const DEFAULT_ANNOUNCE_INTERVAL_SEC: u64 = 60;
 /// Default peer-table entry TTL after which a stale entry is evicted.
 const DEFAULT_PEER_TTL_SEC: u64 = 600;
+/// Default global cap on concurrent in-flight QUIC handler tasks (issue #235).
+const DEFAULT_MAX_CONCURRENT_HANDLERS: u32 = 256;
+/// Default per-NodeID token-bucket rate (tokens/second). Matches ADR 001's
+/// "20 probe requests per peer per second" inbound limit.
+const DEFAULT_PER_NODE_RATE_PER_SEC: f64 = 20.0;
+/// Default per-NodeID burst.
+const DEFAULT_PER_NODE_BURST: u32 = 20;
+/// Default per-IP token-bucket rate. More generous than per-NodeID because a
+/// single IP may legitimately host a fleet of nodes.
+const DEFAULT_PER_IP_RATE_PER_SEC: f64 = 100.0;
+/// Default per-IP burst.
+const DEFAULT_PER_IP_BURST: u32 = 200;
+/// Default hard cap on tracked source entries (per-NodeID map and per-IP map).
+const DEFAULT_MAX_TRACKED_SOURCES: usize = 4096;
 
 /// Load config from file (if present) and merge with CLI args.
 ///
@@ -73,6 +87,7 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
     let payment = resolve_payment(&cli.payment, file.payment.as_ref())?;
     let observability = resolve_observability(&cli.observability, file.observability.as_ref())?;
     let gossip = resolve_gossip(file.gossip.as_ref())?;
+    let security = resolve_security(file.security.as_ref())?;
 
     ensure_region_when_publishing_global(&identity, &gossip)?;
     validate_port_layout(&network, &observability)?;
@@ -85,6 +100,7 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
         payment,
         observability,
         gossip,
+        security,
     })
 }
 
@@ -620,6 +636,60 @@ fn resolve_gossip(file: Option<&types::GossipConfig>) -> anyhow::Result<Resolved
         peer_ttl_sec,
         subscribe_global,
         allowlist,
+    })
+}
+
+/// Resolve security / rate-limiting fields (issue #235).
+fn resolve_security(file: Option<&types::SecurityConfig>) -> anyhow::Result<ResolvedSecurity> {
+    let max_concurrent_handlers = file
+        .and_then(|s| s.max_concurrent_handlers)
+        .unwrap_or(DEFAULT_MAX_CONCURRENT_HANDLERS);
+    anyhow::ensure!(
+        max_concurrent_handlers > 0,
+        "security.max_concurrent_handlers must be > 0"
+    );
+
+    let per_node_rate_per_sec = file
+        .and_then(|s| s.per_node_rate_per_sec)
+        .unwrap_or(DEFAULT_PER_NODE_RATE_PER_SEC);
+    anyhow::ensure!(
+        per_node_rate_per_sec > 0.0,
+        "security.per_node_rate_per_sec must be > 0"
+    );
+
+    let per_node_burst = file
+        .and_then(|s| s.per_node_burst)
+        .unwrap_or(DEFAULT_PER_NODE_BURST);
+    anyhow::ensure!(per_node_burst > 0, "security.per_node_burst must be > 0");
+
+    let per_ip_rate_per_sec = file
+        .and_then(|s| s.per_ip_rate_per_sec)
+        .unwrap_or(DEFAULT_PER_IP_RATE_PER_SEC);
+    anyhow::ensure!(
+        per_ip_rate_per_sec > 0.0,
+        "security.per_ip_rate_per_sec must be > 0"
+    );
+
+    let per_ip_burst = file
+        .and_then(|s| s.per_ip_burst)
+        .unwrap_or(DEFAULT_PER_IP_BURST);
+    anyhow::ensure!(per_ip_burst > 0, "security.per_ip_burst must be > 0");
+
+    let max_tracked_sources = file
+        .and_then(|s| s.max_tracked_sources)
+        .unwrap_or(DEFAULT_MAX_TRACKED_SOURCES);
+    anyhow::ensure!(
+        max_tracked_sources > 0,
+        "security.max_tracked_sources must be > 0"
+    );
+
+    Ok(ResolvedSecurity {
+        max_concurrent_handlers,
+        per_node_rate_per_sec,
+        per_node_burst,
+        per_ip_rate_per_sec,
+        per_ip_burst,
+        max_tracked_sources,
     })
 }
 

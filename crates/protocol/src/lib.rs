@@ -36,3 +36,11 @@ pub const TOPIC_REGION_PREFIX: &str = "cdn/region/";
 
 /// Gossip topic for reputation reports.
 pub const TOPIC_REPUTATION: &str = "cdn/reputation/v1";
+
+/// Connection rejected by the per-source or global rate limiter (ADR 013 §0x10).
+///
+/// Delivered via `CONNECTION_CLOSE` immediately on accept so the peer sees a
+/// deterministic close code. Peers that receive this code SHOULD back off before
+/// reconnecting; they MUST NOT treat it as a protocol error (the server is
+/// functioning normally — the client is overloading it).
+pub const APP_ERR_RATE_LIMITED: u32 = 0x10;

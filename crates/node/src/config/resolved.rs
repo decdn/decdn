@@ -121,6 +121,24 @@ pub struct ResolvedObservability {
     pub otlp_endpoint: Option<String>,
 }
 
+/// Resolved security / rate-limiting fields (issue #235).
+#[derive(Debug, Clone)]
+pub struct ResolvedSecurity {
+    /// Global cap on concurrent in-flight QUIC handler tasks.
+    pub max_concurrent_handlers: u32,
+    /// Per-NodeID token-bucket refill rate (tokens/second).
+    pub per_node_rate_per_sec: f64,
+    /// Per-NodeID token-bucket burst capacity.
+    pub per_node_burst: u32,
+    /// Per-IP token-bucket refill rate (tokens/second).
+    pub per_ip_rate_per_sec: f64,
+    /// Per-IP token-bucket burst capacity.
+    pub per_ip_burst: u32,
+    /// Hard cap on the number of tracked sources (per-NodeID map and per-IP
+    /// map each respect this limit independently).
+    pub max_tracked_sources: usize,
+}
+
 /// Fully resolved node configuration.
 ///
 /// Every field has a value determined by the three-layer merge:
@@ -138,4 +156,5 @@ pub struct ResolvedConfig {
     pub payment: ResolvedPayment,
     pub observability: ResolvedObservability,
     pub gossip: ResolvedGossip,
+    pub security: ResolvedSecurity,
 }

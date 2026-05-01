@@ -5,13 +5,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use decdn_protocol::{
-    ALPN_PROBE, FrameError, ProbeMessage, decode_message, encode_message, message::ProbeResponse,
-    read_frame, write_frame,
+    ALPN_PROBE, APP_ERR_RATE_LIMITED, FrameError, ProbeMessage, decode_message, encode_message,
+    message::ProbeResponse, read_frame, write_frame,
 };
 use iroh::PublicKey;
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 
+use crate::dispatch::ConnectionLimiter;
 use crate::metrics::Metrics;
 
 /// Ceiling on how long we wait for the client to open the bi-directional
@@ -39,26 +40,48 @@ const APP_ERR_MALFORMED_MESSAGE: u32 = 0x03;
 /// is a single-word counter with no ordering relationship to other state,
 /// and any in-flight probe simply observes whichever generation of the
 /// rate the load happens to see.
-#[derive(Debug)]
 pub struct ProbeHandler {
     node_id: PublicKey,
     rate_per_mb: Arc<AtomicU64>,
     metrics: Arc<Metrics>,
+    limiter: Arc<ConnectionLimiter>,
+}
+
+impl std::fmt::Debug for ProbeHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProbeHandler")
+            .field("node_id", &self.node_id)
+            .field("rate_per_mb", &self.rate_per_mb)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ProbeHandler {
     pub const ALPN: &'static [u8] = ALPN_PROBE;
 
     #[allow(clippy::missing_const_for_fn)] // Arc::new isn't const.
-    pub fn new(node_id: PublicKey, rate_per_mb: Arc<AtomicU64>, metrics: Arc<Metrics>) -> Self {
+    pub fn new(
+        node_id: PublicKey,
+        rate_per_mb: Arc<AtomicU64>,
+        metrics: Arc<Metrics>,
+        limiter: Arc<ConnectionLimiter>,
+    ) -> Self {
         Self {
             node_id,
             rate_per_mb,
             metrics,
+            limiter,
         }
     }
 
     async fn serve(&self, conn: Connection) -> anyhow::Result<()> {
+        let _permit = match self.limiter.acquire(&conn) {
+            Ok(p) => p,
+            Err(_reason) => {
+                conn.close(VarInt::from_u32(APP_ERR_RATE_LIMITED), b"rate-limited");
+                return Ok(());
+            }
+        };
         let _guard = self.metrics.connection_guard();
 
         let (mut send, mut recv) = tokio::time::timeout(ACCEPT_BI_TIMEOUT, conn.accept_bi())

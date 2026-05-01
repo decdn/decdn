@@ -8,6 +8,7 @@ pub mod admin;
 pub mod cli;
 pub mod commands;
 pub mod config;
+pub mod dispatch;
 pub mod handlers;
 pub mod identity;
 pub mod metrics;

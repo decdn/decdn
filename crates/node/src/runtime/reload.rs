@@ -260,7 +260,7 @@ impl RuntimeReloadState {
 
         use crate::config::{
             ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedGossip, ResolvedIdentity,
-            ResolvedNetwork, ResolvedObservability, ResolvedPayment,
+            ResolvedNetwork, ResolvedObservability, ResolvedPayment, ResolvedSecurity,
         };
 
         let cfg = ResolvedConfig {
@@ -302,6 +302,14 @@ impl RuntimeReloadState {
                 peer_ttl_sec: 600,
                 subscribe_global: false,
                 allowlist: Vec::new(),
+            },
+            security: ResolvedSecurity {
+                max_concurrent_handlers: 256,
+                per_node_rate_per_sec: 20.0,
+                per_node_burst: 20,
+                per_ip_rate_per_sec: 100.0,
+                per_ip_burst: 200,
+                max_tracked_sources: 4096,
             },
         };
         Self::new(
@@ -704,7 +712,7 @@ mod tests {
     use crate::cli::common::LogLevel;
     use crate::config::{
         ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedGossip, ResolvedIdentity,
-        ResolvedNetwork, ResolvedObservability, ResolvedPayment,
+        ResolvedNetwork, ResolvedObservability, ResolvedPayment, ResolvedSecurity,
     };
 
     /// Build a no-op log-level setter that records the most recent level.
@@ -760,6 +768,14 @@ mod tests {
                 peer_ttl_sec: 600,
                 subscribe_global: false,
                 allowlist: Vec::new(),
+            },
+            security: ResolvedSecurity {
+                max_concurrent_handlers: 256,
+                per_node_rate_per_sec: 20.0,
+                per_node_burst: 20,
+                per_ip_rate_per_sec: 100.0,
+                per_ip_burst: 200,
+                max_tracked_sources: 4096,
             },
         }
     }

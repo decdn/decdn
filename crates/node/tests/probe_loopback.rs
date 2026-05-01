@@ -9,6 +9,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
+use decdn_node::config::ResolvedSecurity;
+use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::probe::ProbeHandler;
 use decdn_node::metrics::Metrics;
 use decdn_protocol::{
@@ -23,6 +25,20 @@ use iroh::protocol::ProtocolHandler;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
 use rand::Rng;
 use tokio::task::JoinHandle;
+
+/// Build a permissive `ConnectionLimiter` suitable for tests that don't
+/// exercise rate-limiting behaviour.
+fn permissive_limiter(metrics: &Arc<Metrics>) -> Arc<ConnectionLimiter> {
+    let cfg = ResolvedSecurity {
+        max_concurrent_handlers: u32::MAX,
+        per_node_rate_per_sec: 1_000_000.0,
+        per_node_burst: u32::MAX,
+        per_ip_rate_per_sec: 1_000_000.0,
+        per_ip_burst: u32::MAX,
+        max_tracked_sources: 4096,
+    };
+    Arc::new(ConnectionLimiter::new(&cfg, Arc::clone(metrics)))
+}
 
 /// Build a fresh `SecretKey` by drawing 32 random bytes and feeding them
 /// to `SecretKey::from_bytes`. We don't use
@@ -72,10 +88,12 @@ async fn probe_roundtrip() -> anyhow::Result<()> {
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
     let handler = Arc::new(ProbeHandler::new(
         server_id,
         Arc::new(AtomicU64::new(rate_per_mb)),
         Arc::clone(&metrics),
+        limiter,
     ));
 
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_PROBE.to_vec()]).await?;
@@ -158,10 +176,12 @@ async fn spin_up_probe_harness() -> anyhow::Result<Harness> {
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
     let handler = Arc::new(ProbeHandler::new(
         server_id,
         Arc::new(AtomicU64::new(1)),
-        metrics,
+        Arc::clone(&metrics),
+        limiter,
     ));
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_PROBE.to_vec()]).await?;
 

@@ -13,7 +13,7 @@ use decdn_node::cli::{ConfigValidateArgs, RunArgs};
 use decdn_node::commands;
 use decdn_node::config::{
     ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedGossip, ResolvedIdentity,
-    ResolvedNetwork, ResolvedObservability, ResolvedPayment,
+    ResolvedNetwork, ResolvedObservability, ResolvedPayment, ResolvedSecurity,
 };
 use tempfile::TempDir;
 
@@ -217,6 +217,14 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             peer_ttl_sec: 600,
             subscribe_global: true,
             allowlist: Vec::new(),
+        },
+        security: ResolvedSecurity {
+            max_concurrent_handlers: 256,
+            per_node_rate_per_sec: 20.0,
+            per_node_burst: 20,
+            per_ip_rate_per_sec: 100.0,
+            per_ip_burst: 200,
+            max_tracked_sources: 4096,
         },
     };
     overrides(&mut cfg);

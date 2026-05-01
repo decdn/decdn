@@ -26,6 +26,8 @@ pub struct FileConfig {
     pub observability: Option<ObservabilityConfig>,
     /// Gossip settings.
     pub gossip: Option<GossipConfig>,
+    /// Connection rate-limiting settings (issue #235).
+    pub security: Option<SecurityConfig>,
 }
 
 /// Identity section of the config file.
@@ -116,6 +118,34 @@ pub struct GossipConfig {
     /// (64 hex chars, either case). Absent/empty = accept any signature-valid
     /// announce. `PoC` replacement for ADR 001 rule 2 (staked-node check).
     pub allowlist: Option<Vec<String>>,
+}
+
+/// Security / rate-limiting section of the config file (issue #235).
+///
+/// All fields are optional; defaults produce a safe configuration out of the box.
+/// Values can only be changed by restarting the node — none of these fields are
+/// hot-reloadable because rebuilding the semaphore or resetting in-flight token
+/// buckets mid-run would transiently allow or deny traffic in unpredictable ways.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct SecurityConfig {
+    /// Maximum number of concurrently in-flight QUIC handler tasks across all
+    /// deCDN-authored ALPNs. New connections beyond this limit are closed
+    /// immediately with `APP_ERR_RATE_LIMITED`. Default: 256.
+    pub max_concurrent_handlers: Option<u32>,
+    /// Token-bucket refill rate for per-NodeID limiting (tokens per second).
+    /// Matches ADR 001's inbound probe limit. Default: 20.
+    pub per_node_rate_per_sec: Option<f64>,
+    /// Token-bucket burst capacity for per-NodeID limiting. Default: 20.
+    pub per_node_burst: Option<u32>,
+    /// Token-bucket refill rate for per-IP limiting (tokens per second).
+    /// More generous than per-NodeID because one IP may host a legitimate fleet.
+    /// Default: 100.
+    pub per_ip_rate_per_sec: Option<f64>,
+    /// Token-bucket burst capacity for per-IP limiting. Default: 200.
+    pub per_ip_burst: Option<u32>,
+    /// Hard cap on the number of distinct `NodeIDs` (and separately, IPs) tracked
+    /// in the rate-limit state. When full, the oldest entry is evicted. Default: 4096.
+    pub max_tracked_sources: Option<usize>,
 }
 
 /// Observability section of the config file.
