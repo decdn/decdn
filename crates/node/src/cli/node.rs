@@ -48,6 +48,19 @@ pub enum NodeCommand {
     /// --config <path>` — without a path on disk there's nothing to
     /// re-read.
     Reload(ReloadArgs),
+    /// Trigger graceful shutdown of the running node via `admin_v1_drain`
+    /// (issue #244, ADR 025). Equivalent to `kill -TERM <pid>` but goes
+    /// through the loopback admin surface, so operator tooling that already
+    /// speaks JSON-RPC doesn't need to also know which PID to signal. The
+    /// runtime begins the same graceful shutdown sequence SIGTERM triggers
+    /// (stops accept loops, waits for in-flight transfers, flushes cache).
+    ///
+    /// **Fire-and-forget semantics**: this command returns `drain_initiated=true`
+    /// as soon as the trigger is queued. The response does *not* mean shutdown
+    /// is complete — it means the runtime has been asked to shut down. Observe
+    /// completion via process exit (systemd/K8s will notice) or by polling
+    /// `decdn node health` until the connection is refused.
+    Drain(DrainArgs),
 }
 
 /// `decdn node health` — report identity (hex `node_id`) and process
@@ -158,6 +171,33 @@ pub struct ReloadArgs {
     pub config: Option<PathBuf>,
 
     /// Emit the admin response as JSON instead of two human-readable lines.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Roundtrip timeout in milliseconds.
+    #[arg(long, value_name = "MS", default_value_t = 5_000)]
+    pub timeout_ms: u64,
+}
+
+/// `decdn node drain` — trigger graceful shutdown of the running node via
+/// `admin_v1_drain` (issue #244, ADR 025). Fires the same runtime shutdown
+/// path as SIGTERM without needing the process PID. The response
+/// (`drain_initiated=true`) means "shutdown has been requested", not that
+/// it has completed — the admin server is the first surface to stop, so the
+/// connection will close before the node fully exits.
+#[derive(Args, Debug)]
+pub struct DrainArgs {
+    /// Base URL of the node's admin HTTP surface. See `health --admin-url`
+    /// for resolution precedence (flag → env → config → default).
+    #[arg(long, value_name = "URL", env = "DECDN_ADMIN_URL")]
+    pub admin_url: Option<String>,
+
+    /// Path to the TOML config file used to derive the admin URL when
+    /// `--admin-url` / `DECDN_ADMIN_URL` are unset.
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+
+    /// Emit the admin response as JSON instead of a one-line confirmation.
     #[arg(long)]
     pub json: bool,
 

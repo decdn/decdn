@@ -216,6 +216,13 @@ pub async fn run(
     .await
     .context("gossip service failed to start")?;
 
+    // Drain trigger for `admin_v1_drain` (issue #244). Constructed
+    // unconditionally so the admin handler always has a live target —
+    // there is no "drain disabled" state analogous to "no region" or
+    // "no config path". The `Arc` is shared with the admin state (via
+    // `Arc::clone`) and the select loop arm below.
+    let drain_trigger = Arc::new(admin::DrainTrigger::new());
+
     // Now that gossip is up and we know whether the publisher produced an
     // `AnnounceTrigger`, spawn the admin serve task with the full state.
     // Bind happened earlier (see `admin_listener` above) so a port collision
@@ -239,6 +246,7 @@ pub async fn run(
             cache.clone(),
             announce_trigger,
             reload_hook,
+            Arc::clone(&drain_trigger),
         );
         tasks.spawn(async move {
             if let Err(err) = admin::serve(listener, state, rx).await {
@@ -292,6 +300,10 @@ pub async fn run(
                         );
                     }
                 }
+            }
+            () = drain_trigger.wait() => {
+                tracing::info!("admin_v1_drain received; initiating graceful shutdown");
+                break ShutdownSignal::AdminDrain;
             }
         }
     };
@@ -485,15 +497,18 @@ async fn build_cache(cfg: &ResolvedConfig) -> anyhow::Result<CacheEngine> {
     .context("failed to open cache engine")
 }
 
-/// Which OS signal triggered shutdown. Returned by [`ShutdownStreams::recv`] so
-/// the "shutdown signal received" log line records the cause (SIGINT vs.
-/// SIGTERM) — operators grep that field for post-incident analysis.
-/// `Sigterm` is unreachable on non-unix targets.
+/// Which OS signal (or admin RPC call) triggered shutdown. Returned by
+/// [`ShutdownStreams::recv`] or synthesised by the `drain_trigger` arm so
+/// the "shutdown signal received" log line records the cause (SIGINT,
+/// SIGTERM, or admin drain) — operators grep that field for post-incident
+/// analysis. `Sigterm` is unreachable on non-unix targets.
 #[derive(Debug, Clone, Copy)]
 enum ShutdownSignal {
     Sigint,
     #[cfg(unix)]
     Sigterm,
+    /// Graceful shutdown requested via `admin_v1_drain` (issue #244).
+    AdminDrain,
 }
 
 impl std::fmt::Display for ShutdownSignal {
@@ -502,6 +517,7 @@ impl std::fmt::Display for ShutdownSignal {
             Self::Sigint => f.write_str("SIGINT"),
             #[cfg(unix)]
             Self::Sigterm => f.write_str("SIGTERM"),
+            Self::AdminDrain => f.write_str("admin-drain"),
         }
     }
 }
@@ -767,14 +783,15 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    // Operators grep `signal=SIGINT` / `signal=SIGTERM` in the structured
-    // "shutdown signal received" log line; a rename here would silently
-    // break dashboards and runbooks.
+    // Operators grep `signal=SIGINT` / `signal=SIGTERM` / `signal=admin-drain`
+    // in the structured "shutdown signal received" log line; a rename here
+    // would silently break dashboards and runbooks.
     #[test]
     fn shutdown_signal_display_is_stable() {
         assert_eq!(ShutdownSignal::Sigint.to_string(), "SIGINT");
         #[cfg(unix)]
         assert_eq!(ShutdownSignal::Sigterm.to_string(), "SIGTERM");
+        assert_eq!(ShutdownSignal::AdminDrain.to_string(), "admin-drain");
     }
 
     /// Mount a JSON-RPC `200 OK` POST handler. The mount lives on

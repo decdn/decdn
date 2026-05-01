@@ -285,6 +285,8 @@ impl RuntimeReloadState {
                 max_blob_size_mb: 128,
                 origin_url: None,
                 origin_path: None,
+                decompress: decdn_cache::DecompressMode::Auto,
+                pinned_hashes: decdn_cache::PinnedHashes::empty(),
             },
             payment: ResolvedPayment { rate_per_mb },
             observability: ResolvedObservability {

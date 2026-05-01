@@ -11,8 +11,8 @@ use jsonrpsee::http_client::HttpClientBuilder;
 use serde::Deserialize;
 
 use crate::admin::{
-    AdminRpcClient, AnnounceResponse, EvictRequest, EvictResponse, HealthResponse, PeerView,
-    PeersResponse, ReloadResponse,
+    AdminRpcClient, AnnounceResponse, DrainResponse, EvictRequest, EvictResponse, HealthResponse,
+    PeerView, PeersResponse, ReloadResponse,
 };
 use crate::cli;
 use crate::cli::common::expand_tilde;
@@ -66,6 +66,7 @@ pub async fn node_dispatch(
         cli::NodeCommand::Evict(e) => evict(e, global_config).await,
         cli::NodeCommand::Announce(a) => announce(a, global_config).await,
         cli::NodeCommand::Reload(r) => reload(r, global_config).await,
+        cli::NodeCommand::Drain(d) => drain(d, global_config).await,
     }
 }
 
@@ -228,6 +229,46 @@ pub async fn reload(args: &cli::ReloadArgs, global_config: Option<&Path>) -> any
         // Same shape as `decdn node health`'s plain output.
         println!("rate_per_mb={}", resp.rate_per_mb);
         println!("log_level={}", resp.log_level);
+    }
+
+    Ok(())
+}
+
+/// `decdn node drain`: call `admin_v1_drain` on the running node to trigger
+/// graceful shutdown (issue #244, ADR 025). Fire-and-forget: returns
+/// `drain_initiated=true` as soon as the trigger is queued; the runtime
+/// then begins the same shutdown sequence SIGTERM triggers. Observe
+/// completion via process exit or `decdn node health` until ECONNREFUSED.
+pub async fn drain(args: &cli::DrainArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        args.timeout_ms > 0,
+        "--timeout-ms must be > 0 (jsonrpsee treats Duration::ZERO as \
+         'never' rather than 'sub-millisecond deadline')"
+    );
+
+    let config_path = args.config.as_deref().or(global_config);
+    let url = resolve_admin_url(args.admin_url.as_deref(), config_path)?;
+
+    let client = HttpClientBuilder::default()
+        .request_timeout(Duration::from_millis(args.timeout_ms))
+        .build(&url)
+        .with_context(|| format!("failed to build admin JSON-RPC client for {url}"))?;
+
+    let resp: DrainResponse = client
+        .drain()
+        .await
+        .map_err(|err| classify_client_error(&url, args.timeout_ms, err))?;
+
+    if args.json {
+        let pretty =
+            serde_json::to_string_pretty(&resp).context("failed to encode drain response")?;
+        println!("{pretty}");
+    } else {
+        // One stable, grep-friendly line. "Initiated", not "completed":
+        // fire-and-forget semantics mean the process is still running when
+        // this prints. Observe completion via `decdn node health` until
+        // ECONNREFUSED, or let the process supervisor (systemd/K8s) notify.
+        println!("drain_initiated={}", resp.initiated);
     }
 
     Ok(())

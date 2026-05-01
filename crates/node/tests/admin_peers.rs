@@ -20,8 +20,8 @@ use std::time::Instant;
 
 use decdn_cache::CacheEngine;
 use decdn_gossip::PeerTable;
-use decdn_node::admin::{self, AdminRpcClient, AdminState};
-use decdn_node::cli::{AnnounceArgs, EvictArgs, HealthArgs, PeersArgs, ReloadArgs};
+use decdn_node::admin::{self, AdminRpcClient, AdminState, DrainTrigger};
+use decdn_node::cli::{AnnounceArgs, DrainArgs, EvictArgs, HealthArgs, PeersArgs, ReloadArgs};
 use decdn_node::commands;
 use decdn_protocol::{LoadHint, NodeAnnounce, NodeAnnounceBody};
 use jsonrpsee::core::ClientError;
@@ -81,7 +81,15 @@ async fn spawn_admin(
 async fn peers_list_empty_peer_table() -> anyhow::Result<()> {
     let peer_table = Arc::new(RwLock::new(PeerTable::new(0)));
     let (cache, _tmp) = test_cache().await?;
-    let state = AdminState::new(peer_table, [0u8; 32], Instant::now(), cache, None, None);
+    let state = AdminState::new(
+        peer_table,
+        [0u8; 32],
+        Instant::now(),
+        cache,
+        None,
+        None,
+        Arc::new(DrainTrigger::new()),
+    );
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
     let client = HttpClientBuilder::default().build(&url)?;
@@ -117,6 +125,7 @@ async fn peers_list_seeded_entries_sorted_desc() -> anyhow::Result<()> {
         cache,
         None,
         None,
+        Arc::new(DrainTrigger::new()),
     );
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
@@ -152,7 +161,15 @@ async fn health_returns_hex_node_id_and_uptime() -> anyhow::Result<()> {
     let peer_table = Arc::new(RwLock::new(PeerTable::new(0)));
     let id = [0xABu8; 32];
     let (cache, _tmp) = test_cache().await?;
-    let state = AdminState::new(peer_table, id, Instant::now(), cache, None, None);
+    let state = AdminState::new(
+        peer_table,
+        id,
+        Instant::now(),
+        cache,
+        None,
+        None,
+        Arc::new(DrainTrigger::new()),
+    );
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
     let client = HttpClientBuilder::default().build(&url)?;
@@ -179,7 +196,15 @@ async fn health_returns_hex_node_id_and_uptime() -> anyhow::Result<()> {
 async fn unknown_method_returns_method_not_found() -> anyhow::Result<()> {
     let peer_table = Arc::new(RwLock::new(PeerTable::new(0)));
     let (cache, _tmp) = test_cache().await?;
-    let state = AdminState::new(peer_table, [0u8; 32], Instant::now(), cache, None, None);
+    let state = AdminState::new(
+        peer_table,
+        [0u8; 32],
+        Instant::now(),
+        cache,
+        None,
+        None,
+        Arc::new(DrainTrigger::new()),
+    );
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
     let client = HttpClientBuilder::default().build(&url)?;
@@ -440,11 +465,101 @@ async fn cli_reload_rejects_zero_timeout() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `admin_v1_drain` over a live server fires the trigger and returns
+/// `initiated: true`. The trigger itself wakes up the `wait()` call on the
+/// other end — here we check just the wire-level response because wiring
+/// the trigger into a real runtime is the runtime's integration test
+/// territory (that would require starting `run()` in a background task,
+/// which is test-infrastructure cost). The unit tests in `admin.rs`
+/// prove the trigger fires; this test proves the RPC path reaches it.
+#[tokio::test]
+async fn admin_v1_drain_returns_initiated_true() -> anyhow::Result<()> {
+    let peer_table = Arc::new(RwLock::new(PeerTable::new(0)));
+    let (cache, _tmp) = test_cache().await?;
+    let drain_trigger = Arc::new(DrainTrigger::new());
+    let state = AdminState::new(
+        peer_table,
+        [0u8; 32],
+        Instant::now(),
+        cache,
+        None,
+        None,
+        Arc::clone(&drain_trigger),
+    );
+    let (url, stop_tx, join) = spawn_admin(state).await?;
+
+    let client = HttpClientBuilder::default().build(&url)?;
+    let resp = client.drain().await?;
+    assert!(resp.initiated, "expected initiated=true");
+
+    // The RPC handler should have fired the trigger.
+    let waited =
+        tokio::time::timeout(std::time::Duration::from_millis(100), drain_trigger.wait()).await;
+    assert!(waited.is_ok(), "drain RPC did not fire the DrainTrigger");
+
+    let _ = stop_tx.send(());
+    join.await?;
+    Ok(())
+}
+
+/// Mirror the connection-refused coverage onto `decdn node drain` so the
+/// CLI path is guarded the same way as `peers`, `health`, `reload`, etc.
+#[tokio::test]
+async fn cli_drain_surfaces_connection_refused() -> anyhow::Result<()> {
+    let (listener, addr) = bind_loopback().await?;
+    drop(listener);
+
+    let args = DrainArgs {
+        admin_url: Some(format!("http://{addr}")),
+        config: None,
+        json: false,
+        timeout_ms: 2_000,
+    };
+    let err = commands::drain(&args, None)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("expected connection-refused error"))?
+        .to_string();
+    assert!(
+        err.contains("refused"),
+        "error should mention 'refused', got: {err}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn cli_drain_rejects_zero_timeout() -> anyhow::Result<()> {
+    let args = DrainArgs {
+        admin_url: Some("http://127.0.0.1:1".to_string()),
+        config: None,
+        json: false,
+        timeout_ms: 0,
+    };
+    let err = commands::drain(&args, None)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("expected zero-timeout error"))?
+        .to_string();
+    assert!(
+        err.contains("--timeout-ms"),
+        "error should mention the flag, got: {err}"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn admin_shutdown_closes_listener() -> anyhow::Result<()> {
     let peer_table = Arc::new(RwLock::new(PeerTable::new(0)));
     let (cache, _tmp) = test_cache().await?;
-    let state = AdminState::new(peer_table, [0u8; 32], Instant::now(), cache, None, None);
+    let state = AdminState::new(
+        peer_table,
+        [0u8; 32],
+        Instant::now(),
+        cache,
+        None,
+        None,
+        Arc::new(DrainTrigger::new()),
+    );
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
     // Baseline: server is up.

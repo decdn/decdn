@@ -28,7 +28,7 @@ use jsonrpsee::server::{Server, ServerConfig};
 use jsonrpsee::types::ErrorObjectOwned;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
-use tokio::sync::{RwLock, oneshot};
+use tokio::sync::{Notify, RwLock, oneshot};
 
 use crate::runtime::RuntimeReloadState;
 
@@ -70,6 +70,42 @@ pub struct AdminState {
     /// unset" error so the operator gets a specific message instead of
     /// silently no-op'ing.
     reload_hook: Option<ReloadHook>,
+    /// Drain trigger for `admin_v1_drain` (issue #244). Always `Some` when
+    /// the admin server is running — drain has no preconditions analogous
+    /// to "publisher disabled" or "no config path", so this is wired
+    /// unconditionally.
+    drain_trigger: Arc<DrainTrigger>,
+}
+
+/// One-shot trigger that lets `admin_v1_drain` wake the runtime's main
+/// select loop and request graceful shutdown (issue #244). Modelled on
+/// [`tokio::sync::Notify`] so the RPC handler can fire-and-return without
+/// blocking on the runtime's shutdown latency. The runtime side awaits
+/// `wait()` in its select loop; firing twice is a no-op (the second
+/// `notify_one` coalesces, same as `Notify`).
+#[derive(Debug, Default)]
+pub struct DrainTrigger {
+    notify: Notify,
+}
+
+impl DrainTrigger {
+    /// Create a new `DrainTrigger`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Signal the runtime to begin graceful shutdown. Fire-and-forget:
+    /// calling this more than once is a no-op (the second `notify_one`
+    /// coalesces into the pending permit the first call stored).
+    pub fn fire(&self) {
+        self.notify.notify_one();
+    }
+
+    /// Wait until [`fire`](Self::fire) is called. Returns immediately if
+    /// `fire` was already called before `wait` was polled.
+    pub async fn wait(&self) {
+        self.notify.notified().await;
+    }
 }
 
 /// Pair of values needed by `admin_v1_reload`: the runtime's reload state
@@ -91,6 +127,7 @@ impl AdminState {
         cache: CacheEngine,
         announce_trigger: Option<Arc<AnnounceTrigger>>,
         reload_hook: Option<ReloadHook>,
+        drain_trigger: Arc<DrainTrigger>,
     ) -> Self {
         Self {
             peer_table,
@@ -99,6 +136,7 @@ impl AdminState {
             cache,
             announce_trigger,
             reload_hook,
+            drain_trigger,
         }
     }
 }
@@ -254,6 +292,22 @@ pub struct ReloadResponse {
     pub log_level: String,
 }
 
+/// Response body for `admin_v1_drain` (issue #244). Always `initiated:
+/// true` on a non-error response — drain is fire-and-forget; the runtime
+/// begins the same graceful sequence SIGTERM triggers, and the admin server
+/// itself is among the first things to stop, so an operator that needs to
+/// observe completion polls process exit (systemd/K8s) or `decdn node
+/// health` until the connection is refused.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DrainResponse {
+    /// Always `true` on a non-error response — the trigger has been fired
+    /// and the runtime's shutdown sequence is underway. "Initiated", not
+    /// "completed": the admin server may close before the response
+    /// returns because the admin server is intentionally the first surface
+    /// to stop during shutdown.
+    pub initiated: bool,
+}
+
 /// JSON-RPC error code: the request shape was wrong (bad hex, etc.).
 /// Matches the standard JSON-RPC 2.0 `Invalid params` code.
 const INVALID_PARAMS_CODE: i32 = -32_602;
@@ -325,6 +379,18 @@ pub trait AdminRpc {
     ///   `rate_per_mb` and `log_level`.
     #[method(name = "reload")]
     async fn reload(&self) -> RpcResult<ReloadResponse>;
+
+    /// Trigger graceful shutdown via the same path SIGTERM exercises (issue
+    /// #244, ADR 025). Stops the iroh router's accept loop, waits for
+    /// in-flight `ProtocolHandler::shutdown` calls to drain (bounded by the
+    /// runtime's 15s `SHUTDOWN_DEADLINE`), then exits. Fire-and-forget: the
+    /// response returns as soon as the trigger lands, not when shutdown
+    /// completes — the admin server is one of the first surfaces to stop, so
+    /// a blocking-until-drained RPC would race its own listener closing.
+    /// Equivalent to `kill -TERM <pid>` for operators who'd rather not stat
+    /// the PID.
+    #[method(name = "drain")]
+    async fn drain(&self) -> RpcResult<DrainResponse>;
 }
 
 /// Convert a [`CacheError`] into a JSON-RPC error suitable for
@@ -469,6 +535,11 @@ impl AdminRpcServer for AdminRpcImpl {
                 .log_level
                 .map_or_else(|| "unknown".to_string(), |l| l.to_string()),
         })
+    }
+
+    async fn drain(&self) -> RpcResult<DrainResponse> {
+        self.state.drain_trigger.fire();
+        Ok(DrainResponse { initiated: true })
     }
 
     async fn peers_list(&self) -> RpcResult<PeersResponse> {
@@ -618,6 +689,7 @@ mod tests {
             cache,
             None,
             None,
+            Arc::new(DrainTrigger::new()),
         );
         (state, tmp)
     }
@@ -652,6 +724,7 @@ mod tests {
             cache,
             None,
             None,
+            Arc::new(DrainTrigger::new()),
         );
         let rpc = AdminRpcImpl::new(state);
 
@@ -677,6 +750,7 @@ mod tests {
             cache,
             None,
             None,
+            Arc::new(DrainTrigger::new()),
         );
         let rpc = AdminRpcImpl::new(state);
 
@@ -765,6 +839,7 @@ mod tests {
             cache.clone(),
             None,
             None,
+            Arc::new(DrainTrigger::new()),
         );
         let rpc = AdminRpcImpl::new(state);
 
@@ -812,6 +887,7 @@ mod tests {
             cache,
             None,
             None,
+            Arc::new(DrainTrigger::new()),
         );
         let rpc = AdminRpcImpl::new(state);
         let hash = Hash::new(b"prefix-test");
@@ -861,6 +937,7 @@ mod tests {
             cache,
             Some(trigger),
             None,
+            Arc::new(DrainTrigger::new()),
         );
         let rpc = AdminRpcImpl::new(state);
 
@@ -927,12 +1004,77 @@ mod tests {
             cache,
             None,
             Some(hook),
+            Arc::new(DrainTrigger::new()),
         );
         let rpc = AdminRpcImpl::new(state);
 
         let resp = rpc.reload().await.expect("reload ok");
         assert_eq!(resp.rate_per_mb, 99);
         assert_eq!(resp.log_level, "debug");
+    }
+
+    /// `DrainTrigger::fire` followed by `wait()` resolves. The Notify
+    /// stores a permit when no waiter is present, so the `notified()`
+    /// future claims it immediately — no race window or ordering
+    /// requirement between `fire` and `wait` in tests.
+    #[tokio::test]
+    async fn drain_trigger_fire_then_wait_resolves() {
+        let trigger = DrainTrigger::new();
+        trigger.fire();
+        let waited =
+            tokio::time::timeout(std::time::Duration::from_millis(100), trigger.wait()).await;
+        assert!(waited.is_ok(), "wait() did not resolve after fire()");
+    }
+
+    /// Firing twice must not deadlock a subsequent `wait`. `Notify`
+    /// coalesces multiple `notify_one` calls into a single permit, so a
+    /// second `fire` while no waiter is pending is a no-op, and the *first*
+    /// permit is still available for the next `wait`. A regression that
+    /// accidentally consumed the permit on the second fire (e.g. by
+    /// replacing `Notify` with a `oneshot`) would surface here.
+    #[tokio::test]
+    async fn drain_trigger_double_fire_does_not_deadlock_wait() {
+        let trigger = DrainTrigger::new();
+        trigger.fire();
+        trigger.fire(); // second fire — coalesces, permit still available
+        let waited =
+            tokio::time::timeout(std::time::Duration::from_millis(100), trigger.wait()).await;
+        assert!(
+            waited.is_ok(),
+            "wait() did not resolve after two fire() calls"
+        );
+    }
+
+    /// `admin_v1_drain` fires the trigger and returns `initiated: true`.
+    /// Mirrors the `admin_announce_fires_trigger_when_publisher_present`
+    /// test — we verify the RPC handler -> trigger -> Notify chain end-to-end
+    /// without spinning up a full runtime.
+    #[tokio::test]
+    async fn admin_drain_fires_trigger_and_returns_initiated() {
+        let trigger = Arc::new(DrainTrigger::new());
+        let (cache, _tmp) = test_cache().await;
+        let state = AdminState::new(
+            Arc::new(RwLock::new(PeerTable::new(0))),
+            [0u8; 32],
+            Instant::now(),
+            cache,
+            None,
+            None,
+            Arc::clone(&trigger),
+        );
+        let rpc = AdminRpcImpl::new(state);
+
+        let resp = rpc.drain().await.expect("drain ok");
+        assert!(resp.initiated, "expected initiated=true");
+
+        // Verify the trigger actually fired: `wait()` should resolve
+        // immediately because the Notify stored a permit.
+        let waited =
+            tokio::time::timeout(std::time::Duration::from_millis(100), trigger.wait()).await;
+        assert!(
+            waited.is_ok(),
+            "drain RPC did not fire the underlying DrainTrigger"
+        );
     }
 
     /// Failure path: a hook pointing at a missing file must surface
@@ -969,6 +1111,7 @@ mod tests {
             cache,
             None,
             Some(hook),
+            Arc::new(DrainTrigger::new()),
         );
         let rpc = AdminRpcImpl::new(state);
 
