@@ -6,7 +6,7 @@
 
 pub mod node;
 
-pub use node::{node_dispatch, peers};
+pub use node::{health, node_dispatch, peers};
 
 use crate::{cli, config, identity, runtime};
 

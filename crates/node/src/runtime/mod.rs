@@ -65,6 +65,12 @@ pub async fn run(
     let node_metrics = Arc::new(metrics::Metrics::new());
     node_metrics.started();
 
+    // Captured early so `admin_v1_health.uptime_s` reflects the entire
+    // bring-up — operators reasoning about "how long has this node been
+    // up?" want everything after `decdn run` started, not just after
+    // the admin server bound.
+    let started_at = std::time::Instant::now();
+
     let secret_key = identity::load_or_generate(&cfg.identity.data_dir)?;
     tracing::info!(node_id = %secret_key.public(), "loaded node identity");
 
@@ -162,7 +168,11 @@ pub async fn run(
             .await
             .context("failed to bind admin listener")?;
         let (tx, rx) = oneshot::channel::<()>();
-        let state = admin::AdminState::new(Arc::clone(&peer_table));
+        let state = admin::AdminState::new(
+            Arc::clone(&peer_table),
+            *secret_key.public().as_bytes(),
+            started_at,
+        );
         tasks.spawn(async move {
             if let Err(err) = admin::serve(admin_listener, state, rx).await {
                 tracing::error!(%err, "admin server exited with error");
