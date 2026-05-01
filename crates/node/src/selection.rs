@@ -71,8 +71,8 @@ fn compute_score(rate_per_mb: u64, rtt_ms: u32, reputation: f32) -> f64 {
 ///
 /// Within-1%-score tie groups are reordered by the four-tier ADR 008
 /// tie-breaker (load → geo → stake → random). The random tier uses a
-/// fresh thread-local RNG; for deterministic tests use
-/// [`rank_candidates_with_rng`].
+/// fresh thread-local RNG; tests inside this module use the private
+/// `rank_candidates_with_rng` variant for determinism.
 pub fn rank_candidates(candidates: Vec<Candidate>) -> Vec<RankedCandidate> {
     let mut rng = rand::rng();
     rank_candidates_with_rng(candidates, &mut rng)
