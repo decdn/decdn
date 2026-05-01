@@ -21,8 +21,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::cli::common::LogLevel;
 use crate::cli::run::{ObservabilityArgs, PaymentArgs};
 use crate::config::{
-    FileConfig, ResolvedObservability, ResolvedPayment, load_file_config, resolve_observability,
-    resolve_payment,
+    FileConfig, ResolvedObservability, ResolvedPayment, load_file_config, parse_pinned_hashes,
+    resolve_observability, resolve_payment,
 };
 
 /// Read-only snapshot of the reloadable fields, returned by
@@ -70,6 +70,14 @@ pub struct RuntimeReloadState {
     /// Closure to apply a new log-level directive to the running tracing
     /// subscriber.
     log_level_setter: LogLevelSetter,
+    /// Optional handle to the live cache engine. When present, SIGHUP
+    /// reloads re-parse `cache.pinned_hashes` and atomically swap the
+    /// engine's pinned set (#276). Held as `Option` so unit tests that
+    /// exercise reload semantics without a real cache engine can pass
+    /// `None` — the cache is initialised after `RuntimeReloadState::new`
+    /// in the runtime startup sequence, then attached via
+    /// [`Self::attach_cache`].
+    cache: std::sync::Mutex<Option<decdn_cache::CacheEngine>>,
     /// Cached log level that was last applied. `None` until the first
     /// successful reload — this forces the first SIGHUP to apply the file
     /// value unconditionally, since the live `EnvFilter` at startup may
@@ -175,8 +183,57 @@ impl RuntimeReloadState {
             observability_cli,
             rate_per_mb: Arc::new(AtomicU64::new(initial.payment.rate_per_mb)),
             log_level_setter,
+            cache: std::sync::Mutex::new(None),
             current_log_level: std::sync::Mutex::new(None),
             last_file_sections: std::sync::Mutex::new(FileSectionSnapshot::default()),
+        }
+    }
+
+    /// Attach the live cache engine after it's been built. Must be called
+    /// before the SIGHUP select loop runs — see `runtime::run`.
+    /// Detaching is permitted (pass `None`) but production code never
+    /// needs to: the engine outlives the reload state by construction.
+    ///
+    /// A poisoned mutex during attach is recovered (the `PoisonError` is
+    /// owned by `std::sync::Mutex` and lets us still grab the inner
+    /// guard) — silently no-op'ing here would leave reloads as a silent
+    /// no-op forever after a panic on some other thread, which is
+    /// exactly the silent-failure mode this pattern exists to prevent.
+    pub fn attach_cache(&self, engine: Option<decdn_cache::CacheEngine>) {
+        match self.cache.lock() {
+            Ok(mut guard) => *guard = engine,
+            Err(poisoned) => {
+                tracing::error!(
+                    "runtime reload cache mutex poisoned during attach; recovering inner state"
+                );
+                *poisoned.into_inner() = engine;
+            }
+        }
+    }
+
+    /// Seed the file-section snapshot from the config file loaded at
+    /// startup. Without this, the very first SIGHUP after startup falls
+    /// into the "no baseline → warn once" branch of the cache-section
+    /// diff (`cache_changed_only_reloadable_fields`), which means an
+    /// operator who only changed `cache.pinned_hashes` between startup
+    /// and the first SIGHUP gets a misleading `cache.* (cache_dir,
+    /// sizes, origin, decompress)` "requires restart" warning alongside
+    /// the "config reload applied" success line.
+    ///
+    /// Idempotent. A poisoned mutex is recovered the same way
+    /// [`Self::attach_cache`] handles its slot — silently no-op'ing on
+    /// a poison would re-introduce the very UX bug this method exists
+    /// to fix.
+    pub fn seed_initial_file_snapshot(&self, file: &crate::config::FileConfig) {
+        let snapshot = FileSectionSnapshot::capture(file);
+        match self.last_file_sections.lock() {
+            Ok(mut guard) => *guard = snapshot,
+            Err(poisoned) => {
+                tracing::error!(
+                    "runtime reload snapshot mutex poisoned during seed; recovering inner state"
+                );
+                *poisoned.into_inner() = snapshot;
+            }
         }
     }
 
@@ -350,14 +407,37 @@ impl RuntimeReloadState {
             }
         };
 
-        // Lock both caches *before* any committing side-effect. Holding
-        // both guards across the rest of the function serialises
-        // concurrent reloads (a second SIGHUP racing the first one
-        // waits here) and lets us treat the whole "apply log level +
-        // swap rate + write back" path as one critical section.
-        // Acquiring the locks here is the *last* fallible step:
-        // PoisonError must surface before the setter or the atomic
-        // swap commit anything to live state.
+        // Re-parse `cache.pinned_hashes`. The vast majority of fields in
+        // `cache.*` aren't reloadable (cache_dir, sizes, origin), but
+        // pinned_hashes is — see #276. Parse here (fallible) so a
+        // malformed entry rejects the whole reload before any side
+        // effect runs, consistent with the "previous values retained on
+        // error" contract.
+        let new_pinned =
+            match parse_pinned_hashes(file.cache.as_ref().and_then(|c| c.pinned_hashes.as_deref()))
+            {
+                Ok(p) => p,
+                Err(err) => {
+                    tracing::warn!(
+                        %err,
+                        "config reload rejected (cache.pinned_hashes); previous values retained"
+                    );
+                    return Err(err);
+                }
+            };
+
+        // Lock the snapshot mutexes *and* the cache attach slot before
+        // any committing side-effect. Holding all three guards across
+        // the rest of the function serialises concurrent reloads (a
+        // second SIGHUP racing the first one waits here) and lets us
+        // treat the whole "apply log level + swap rate + swap pinned
+        // set + write back" path as one critical section. Acquiring
+        // the locks here is the *last* fallible step: a `PoisonError`
+        // on any of them must surface before the setter, the atomic
+        // swap, or the pinned-set swap commit anything to live state —
+        // otherwise a poisoned cache mutex would let `rate_per_mb`
+        // update while the pinned set silently drops, violating the
+        // "previous values retained on error" contract.
         let mut current = self
             .current_log_level
             .lock()
@@ -366,6 +446,10 @@ impl RuntimeReloadState {
             .last_file_sections
             .lock()
             .map_err(|_| anyhow::anyhow!("file-section snapshot mutex poisoned"))?;
+        let cache_guard = self
+            .cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("cache attach mutex poisoned"))?;
 
         // Diff non-reloadable sections against the previous snapshot
         // before committing. Emitting "ignored" lines is read-only and
@@ -386,11 +470,12 @@ impl RuntimeReloadState {
         // Commit step. Order within the commit:
         //   1. log-level setter (only fallible commit; tracing filter swap)
         //   2. atomic swap of rate_per_mb (infallible)
-        //   3. write-back of cached values via the held guards (infallible)
-        // If the setter fails we bail before touching the rate atomic
-        // or the snapshot caches, preserving the "previous values
-        // retained on error" contract. AtomicU64::swap and the guard
-        // writes themselves cannot fail.
+        //   3. ArcSwap of cache.pinned set (infallible)
+        //   4. write-back of cached values via the held guards (infallible)
+        // If the setter fails we bail before touching the rate atomic,
+        // pinned set, or the snapshot caches, preserving the "previous
+        // values retained on error" contract. AtomicU64::swap, ArcSwap,
+        // and the guard writes themselves cannot fail.
         if log_level_changed && let Err(err) = (self.log_level_setter)(new_level) {
             tracing::warn!(%err, ?new_level, "failed to apply new log level; previous level retained");
             return Err(err);
@@ -398,20 +483,85 @@ impl RuntimeReloadState {
         let prev_rate = self
             .rate_per_mb
             .swap(new_payment.rate_per_mb, Ordering::Relaxed);
+        let pinned_count = new_pinned.len();
+        // Swap the cache engine's pinned set if a cache is attached.
+        // `cache_guard` was acquired up top with the rest of the
+        // mutexes, so a poisoned mutex was already returned as an error
+        // before any commit step. `None` here is the no-cache-attached
+        // case (unit tests, very early startup) and a routine no-op.
+        // The `PinDiff` lets the success log line distinguish "applied
+        // (engine swapped)" from "parsed (no engine attached)" — log
+        // scrapers and operators reasoning about pin/unpin events
+        // shouldn't have to reverse-engineer the difference from a
+        // trailing pinned-set count alone.
+        let pin_diff = cache_guard
+            .as_ref()
+            .map(|engine| engine.set_pinned(&new_pinned));
         *current = Some(new_level);
         *sections = FileSectionSnapshot::capture(&file);
         drop(current);
         drop(sections);
+        drop(cache_guard);
 
         tracing::info!(
             rate_per_mb = new_payment.rate_per_mb,
             prev_rate_per_mb = prev_rate,
             log_level = %new_level,
             log_level_changed,
+            pinned_hashes = pinned_count,
+            pinned_added = pin_diff.map_or(0, |d| d.added),
+            pinned_removed = pin_diff.map_or(0, |d| d.removed),
+            cache_attached = pin_diff.is_some(),
             "config reload applied"
         );
         Ok(())
     }
+}
+
+/// Return true iff every cache field outside the reloadable set is
+/// byte-identical between the new file and the previous snapshot — i.e.
+/// the operator only changed reloadable fields (`pinned_hashes` today)
+/// and no "requires restart" warning is needed.
+///
+/// Returning `false` means "I can't prove the operator only changed
+/// reloadable fields", which the caller turns into the warning. The
+/// failure modes (no baseline yet; serialisation failed) are
+/// deliberately conservative — they emit a one-shot warning rather than
+/// silently swallowing a real change.
+fn cache_changed_only_reloadable_fields(
+    file_cache: Option<&crate::config::types::CacheConfig>,
+    prev_cache_json: Option<&serde_json::Value>,
+) -> bool {
+    let Some(file_cache) = file_cache else {
+        return false;
+    };
+    let Some(prev) = prev_cache_json else {
+        // First reload after startup with a populated cache section:
+        // we have no baseline to compare. Conservative: warn once so
+        // the operator sees the "requires restart" notice for any
+        // non-reloadable change. Better than swallowing a real change
+        // because we happened to lack a baseline.
+        return false;
+    };
+    // Strip pinned_hashes from both sides before diffing. Easiest way is
+    // to serialise both sides without that field. Since prev is a
+    // serde_json::Value, we can clone-and-remove. For the new file we
+    // serialise into Value first.
+    let Some(mut curr_val) = snap_section("cache", Some(file_cache)) else {
+        // Serialisation failed: we cannot prove the non-reloadable
+        // fields are unchanged. Conservatively assume they changed and
+        // emit the "requires restart" warning — silent suppression here
+        // is exactly the failure mode the diff was meant to surface.
+        return false;
+    };
+    let mut prev_val = prev.clone();
+    if let Some(obj) = curr_val.as_object_mut() {
+        obj.remove("pinned_hashes");
+    }
+    if let Some(obj) = prev_val.as_object_mut() {
+        obj.remove("pinned_hashes");
+    }
+    curr_val == prev_val
 }
 
 /// Emit a single info line per ignored-but-changed field.
@@ -528,7 +678,14 @@ fn log_ignored_other_sections(file: &crate::config::FileConfig, prev: &FileSecti
         warn_ignored("blockchain.* (rpc_url, eth_keystore, contract addresses)");
     }
     if changed("cache", file.cache.as_ref(), prev.cache.as_ref()) && file.cache.is_some() {
-        warn_ignored("cache.* (cache_dir, sizes, origin)");
+        // Suppress the "ignored" notice when the only fields that
+        // changed inside `cache.*` are reloadable ones (pinned_hashes
+        // today). Otherwise an operator who pinned/unpinned a hash
+        // would see a misleading "requires restart" warning right
+        // alongside the "config reload applied" success line.
+        if !cache_changed_only_reloadable_fields(file.cache.as_ref(), prev.cache.as_ref()) {
+            warn_ignored("cache.* (cache_dir, sizes, origin, decompress)");
+        }
     }
     if changed("gossip", file.gossip.as_ref(), prev.gossip.as_ref()) && file.gossip.is_some() {
         warn_ignored("gossip.* (announce_interval, peer_ttl, allowlist, subscribe_global)");
@@ -584,6 +741,8 @@ mod tests {
                 max_blob_size_mb: 128,
                 origin_url: None,
                 origin_path: None,
+                decompress: decdn_cache::DecompressMode::Auto,
+                pinned_hashes: decdn_cache::PinnedHashes::empty(),
             },
             payment: ResolvedPayment { rate_per_mb: rate },
             observability: ResolvedObservability {
@@ -1031,6 +1190,297 @@ mod tests {
             format!("{snapshot_before:?}"),
             format!("{snapshot_after:?}"),
             "snapshot baseline must not move on parse-failed reload"
+        );
+    }
+
+    // ----- pinned_hashes hot-reload (#276) -----
+
+    /// Build a 64-char lowercase hex hash for tests.
+    fn make_hex_hash(seed: u8) -> String {
+        use std::fmt::Write as _;
+
+        let mut bytes = [0u8; 32];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            let i_u8 = u8::try_from(i).unwrap_or(0);
+            *b = i_u8.wrapping_add(seed);
+        }
+        let mut s = String::with_capacity(64);
+        for b in bytes {
+            let _ = write!(s, "{b:02x}");
+        }
+        s
+    }
+
+    /// Construct a real (filesystem-backed) cache engine in a temp dir
+    /// for pinning-reload tests. Tests that don't need a full cache
+    /// just leave the engine unattached.
+    async fn build_test_cache() -> (decdn_cache::CacheEngine, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = decdn_cache::CacheEngine::open(tmp.path(), None, 16)
+            .await
+            .unwrap();
+        (engine, tmp)
+    }
+
+    #[tokio::test]
+    async fn reload_swaps_pinned_hashes_on_attached_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let h1 = make_hex_hash(1);
+        let h2 = make_hex_hash(2);
+        let body = format!("[cache]\npinned_hashes = [\"{h1}\", \"{h2}\"]\n");
+        let path = write_config(dir.path(), &body);
+
+        let initial = seed_resolved(10, LogLevel::Info);
+        let (setter, _captured) = recording_setter();
+        let state = RuntimeReloadState::new(
+            PaymentArgs { rate_per_mb: None },
+            ObservabilityArgs {
+                log_level: None,
+                log_format: None,
+                metrics_port: None,
+                metrics_bind: None,
+                admin_port: None,
+                otlp_endpoint: None,
+            },
+            &initial,
+            setter,
+        );
+        let (cache, _tmp_cache) = build_test_cache().await;
+        state.attach_cache(Some(cache.clone()));
+
+        // Before reload: empty pinned set.
+        assert_eq!(cache.pinned_snapshot().len(), 0);
+
+        state.reload(&path).await.unwrap();
+
+        // After reload: both hashes pinned.
+        let pinned = cache.pinned_snapshot();
+        assert_eq!(pinned.len(), 2, "expected both hashes pinned");
+    }
+
+    #[tokio::test]
+    async fn reload_rejects_invalid_pinned_hash_and_keeps_previous_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let h_good = make_hex_hash(3);
+        // First reload: pin a valid hash.
+        let path = write_config(
+            dir.path(),
+            &format!("[cache]\npinned_hashes = [\"{h_good}\"]\n"),
+        );
+
+        let initial = seed_resolved(10, LogLevel::Info);
+        let (setter, _captured) = recording_setter();
+        let state = RuntimeReloadState::new(
+            PaymentArgs { rate_per_mb: None },
+            ObservabilityArgs {
+                log_level: None,
+                log_format: None,
+                metrics_port: None,
+                metrics_bind: None,
+                admin_port: None,
+                otlp_endpoint: None,
+            },
+            &initial,
+            setter,
+        );
+        let (cache, _tmp_cache) = build_test_cache().await;
+        state.attach_cache(Some(cache.clone()));
+        state.reload(&path).await.unwrap();
+        assert_eq!(cache.pinned_snapshot().len(), 1);
+
+        // Second reload: invalid hash. Must reject and keep the previous set.
+        let bad_path = write_config(dir.path(), "[cache]\npinned_hashes = [\"zzz-not-hex\"]\n");
+        let err = state.reload(&bad_path).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("pinned_hashes") || format!("{err:#}").contains("64 hex"),
+            "error should reference the invalid pinned hash: {err:#}"
+        );
+        // Previous pinned set retained.
+        assert_eq!(
+            cache.pinned_snapshot().len(),
+            1,
+            "previous pinned set must survive a rejected reload"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_without_attached_cache_is_noop_for_pinning() {
+        // Confirms the reload path doesn't blow up when no cache has
+        // been attached yet (early startup window) — `attach_cache(None)`
+        // is the default, and parse_pinned_hashes still runs but the
+        // ArcSwap never happens.
+        let dir = tempfile::tempdir().unwrap();
+        let h = make_hex_hash(9);
+        let path = write_config(dir.path(), &format!("[cache]\npinned_hashes = [\"{h}\"]\n"));
+
+        let initial = seed_resolved(10, LogLevel::Info);
+        let (setter, _captured) = recording_setter();
+        let state = RuntimeReloadState::new(
+            PaymentArgs { rate_per_mb: None },
+            ObservabilityArgs {
+                log_level: None,
+                log_format: None,
+                metrics_port: None,
+                metrics_bind: None,
+                admin_port: None,
+                otlp_endpoint: None,
+            },
+            &initial,
+            setter,
+        );
+        // Intentionally NOT calling attach_cache.
+
+        // Reload should still succeed; pinned hashes are parsed (so a
+        // malformed entry would still reject), they just don't land
+        // anywhere.
+        state.reload(&path).await.unwrap();
+    }
+
+    /// N → 0 transition: operator removes pinned hashes between
+    /// reloads. Without this test, a regression where `set_pinned`
+    /// short-circuits on empty input (e.g. `if new.is_empty() {
+    /// return; }`) would slip through silently — pinned hashes would
+    /// stay pinned forever, resisting eviction even after the operator
+    /// took them off the list.
+    #[tokio::test]
+    async fn reload_unpins_when_pinned_hashes_emptied() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = make_hex_hash(11);
+
+        let initial = seed_resolved(10, LogLevel::Info);
+        let (setter, _captured) = recording_setter();
+        let state = RuntimeReloadState::new(
+            PaymentArgs { rate_per_mb: None },
+            ObservabilityArgs {
+                log_level: None,
+                log_format: None,
+                metrics_port: None,
+                metrics_bind: None,
+                admin_port: None,
+                otlp_endpoint: None,
+            },
+            &initial,
+            setter,
+        );
+        let (cache, _tmp_cache) = build_test_cache().await;
+        state.attach_cache(Some(cache.clone()));
+
+        // First reload pins one hash.
+        let pin_path = write_config(dir.path(), &format!("[cache]\npinned_hashes = [\"{h}\"]\n"));
+        state.reload(&pin_path).await.unwrap();
+        assert_eq!(cache.pinned_snapshot().len(), 1);
+
+        // Second reload presents an empty list — the engine's pinned
+        // set must shrink to zero.
+        let empty_path = write_config(dir.path(), "[cache]\npinned_hashes = []\n");
+        state.reload(&empty_path).await.unwrap();
+        assert!(
+            cache.pinned_snapshot().is_empty(),
+            "pinned set must be empty after operator removes all entries"
+        );
+    }
+
+    /// Direct test for the poison-recovery branch in `attach_cache`.
+    /// The existing `reload_keeps_*_when_*_mutex_poisoned` tests
+    /// poison `current_log_level` and `last_file_sections`, but never
+    /// the cache slot itself. This locks in the recovery path that
+    /// commit `a148c02` introduced — silently no-op'ing on a poisoned
+    /// cache mutex would turn every subsequent reload into a silent
+    /// no-op for pinning.
+    #[tokio::test]
+    async fn attach_cache_recovers_from_poisoned_mutex() {
+        let initial = seed_resolved(10, LogLevel::Info);
+        let (setter, _captured) = recording_setter();
+        let state = Arc::new(RuntimeReloadState::new(
+            PaymentArgs { rate_per_mb: None },
+            ObservabilityArgs {
+                log_level: None,
+                log_format: None,
+                metrics_port: None,
+                metrics_bind: None,
+                admin_port: None,
+                otlp_endpoint: None,
+            },
+            &initial,
+            setter,
+        ));
+
+        // Poison the cache mutex by panicking inside a held guard.
+        let st_for_thread = Arc::clone(&state);
+        let join = std::thread::spawn(move || {
+            let _guard = st_for_thread.cache.lock().unwrap();
+            panic!("intentional panic to poison cache mutex");
+        });
+        let _ = join.join();
+        assert!(
+            state.cache.is_poisoned(),
+            "test setup: cache mutex should be poisoned"
+        );
+
+        // Recovery path: `attach_cache` must accept the new engine
+        // despite the poison and a subsequent reload must actually
+        // swap pinned hashes on it (proving recovery wasn't a silent
+        // no-op).
+        let (cache, _tmp_cache) = build_test_cache().await;
+        state.attach_cache(Some(cache.clone()));
+
+        // `attach_cache`'s `into_inner` recovery updates the slot but
+        // leaves the mutex's poison flag set (we don't call
+        // `clear_poison`). Subsequent `reload` calls will surface
+        // "cache attach mutex poisoned" — that's the deliberate
+        // fail-stop. The contract we lock in here is the narrower one:
+        // the new engine *was* stored, not silently dropped.
+        let stored = state
+            .cache
+            .lock()
+            .map_or_else(|p| p.into_inner().is_some(), |g| g.is_some());
+        assert!(stored, "attach_cache must store engine despite poison");
+    }
+
+    /// `seed_initial_file_snapshot` primes the diff baseline from the
+    /// startup config, so the first SIGHUP after startup doesn't fall
+    /// into the "no baseline → warn once" branch in
+    /// `cache_changed_only_reloadable_fields`. The behaviour we can
+    /// assert directly: after seeding, `last_file_sections` reflects
+    /// the populated cache section instead of `Default::default()`.
+    #[test]
+    fn seed_initial_file_snapshot_primes_diff_baseline() {
+        use crate::config::FileConfig;
+        use crate::config::types::CacheConfig;
+
+        let initial = seed_resolved(10, LogLevel::Info);
+        let (setter, _captured) = recording_setter();
+        let state = RuntimeReloadState::new(
+            PaymentArgs { rate_per_mb: None },
+            ObservabilityArgs {
+                log_level: None,
+                log_format: None,
+                metrics_port: None,
+                metrics_bind: None,
+                admin_port: None,
+                otlp_endpoint: None,
+            },
+            &initial,
+            setter,
+        );
+
+        // Default state: cache snapshot is `None`.
+        let before = state.last_file_sections.lock().unwrap().clone();
+        assert!(before.cache.is_none(), "baseline should start empty");
+
+        let file = FileConfig {
+            cache: Some(CacheConfig {
+                cache_size_mb: Some(2048),
+                ..CacheConfig::default()
+            }),
+            ..FileConfig::default()
+        };
+        state.seed_initial_file_snapshot(&file);
+
+        let after = state.last_file_sections.lock().unwrap().clone();
+        assert!(
+            after.cache.is_some(),
+            "seeded snapshot should populate cache section"
         );
     }
 }

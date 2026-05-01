@@ -77,9 +77,15 @@ pub async fn run(
     tracing::info!(node_id = %secret_key.public(), "loaded node identity");
 
     let cache = build_cache(&cfg).await?;
+    // Attach the cache to the reload state so SIGHUP handlers can swap
+    // the pinned-hashes set atomically (#276). Done immediately after
+    // `build_cache` succeeds so a SIGHUP delivered during the rest of
+    // startup will still find a target.
+    reload_state.attach_cache(Some(cache.clone()));
     tracing::info!(
         cache_dir = %cfg.cache.cache_dir.display(),
         has_origin = cfg.cache.origin_url.is_some() || cfg.cache.origin_path.is_some(),
+        pinned_hashes = cfg.cache.pinned_hashes.len(),
         "cache engine ready",
     );
 
@@ -453,7 +459,9 @@ async fn build_cache(cfg: &ResolvedConfig) -> anyhow::Result<CacheEngine> {
     let origin: Option<Arc<dyn Origin>> =
         match (cfg.cache.origin_url.clone(), cfg.cache.origin_path.clone()) {
             (Some(url), None) => Some(Arc::new(
-                HttpOrigin::new(url).context("failed to build HTTP origin client")?,
+                HttpOrigin::new(url)
+                    .context("failed to build HTTP origin client")?
+                    .with_decompress_mode(cfg.cache.decompress),
             )),
             (None, Some(path)) => Some(Arc::new(
                 FilesystemOrigin::new(path)
@@ -467,9 +475,14 @@ async fn build_cache(cfg: &ResolvedConfig) -> anyhow::Result<CacheEngine> {
                 anyhow::bail!("cache.origin_url and cache.origin_path are mutually exclusive")
             }
         };
-    CacheEngine::open(&cfg.cache.cache_dir, origin, cfg.cache.max_blob_size_mb)
-        .await
-        .context("failed to open cache engine")
+    CacheEngine::open_with_pinned(
+        &cfg.cache.cache_dir,
+        origin,
+        cfg.cache.max_blob_size_mb,
+        cfg.cache.pinned_hashes.clone(),
+    )
+    .await
+    .context("failed to open cache engine")
 }
 
 /// Which OS signal triggered shutdown. Returned by [`ShutdownStreams::recv`] so

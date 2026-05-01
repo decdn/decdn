@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 use iroh_blobs::Hash;
 use iroh_blobs::store::fs::FsStore;
@@ -35,6 +36,21 @@ struct Inner {
     /// subsequent callers wait on the [`Notify`] rather than issuing a
     /// duplicate origin fetch (coalescing, fixes #305).
     inflight: Mutex<HashMap<Hash, Arc<Notify>>>,
+    /// Operator-pinned blob hashes (#276). Pinned hashes are excluded from
+    /// the eviction-candidates snapshot and therefore survive any LRU
+    /// pressure. Held in [`ArcSwap`] so SIGHUP reloads can swap in a new
+    /// set atomically without rebuilding the engine — the pattern mirrors
+    /// the `Arc<AtomicU64>` used for `payment.rate_per_mb` (commit
+    /// 166ae41); pinning sets aren't `Copy`, so `ArcSwap` is the
+    /// non-blocking equivalent for `HashSet<Hash>`.
+    ///
+    /// Pinning interacts with the `evicted` field in one direction only:
+    /// pinning prevents *LRU* eviction (issue #276) but does not protect
+    /// against an explicit operator [`CacheEngine::evict`] (#279) — an
+    /// operator running a DMCA takedown on a pinned hash gets the
+    /// takedown, full stop. The pin just keeps the hash off the LRU
+    /// candidate list.
+    pinned: ArcSwap<HashSet<Hash>>,
     /// Hashes the operator has explicitly evicted via [`CacheEngine::evict`]
     /// (issue #279). Membership is honored by [`CacheEngine::has`] and
     /// [`CacheEngine::get`] so an evicted blob is not served, even though
@@ -70,6 +86,149 @@ pub struct CacheStats {
     pub bytes_stored: u64,
     /// Number of distinct blobs currently in the store.
     pub blob_count: u64,
+}
+
+/// Operator-pinned blob hashes (#276). Hashes here are excluded from the
+/// LRU eviction-candidate snapshot. Constructing this type is the only
+/// way to feed pinned hashes into [`CacheEngine::open_with_pinned`] or
+/// [`CacheEngine::set_pinned`], so a future "blocklist" or similar
+/// `HashSet<Hash>`-shaped feature can't be silently passed into the
+/// pinning slot.
+///
+/// Held as `Arc<HashSet<Hash>>` internally so reload paths that swap the
+/// active set don't need to clone the underlying map.
+#[derive(Debug, Clone)]
+pub struct PinnedHashes(Arc<HashSet<Hash>>);
+
+impl PinnedHashes {
+    /// Build a [`PinnedHashes`] from a freshly parsed set.
+    #[must_use]
+    pub fn new(set: HashSet<Hash>) -> Self {
+        Self(Arc::new(set))
+    }
+
+    /// The empty pinned set.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self(Arc::new(HashSet::new()))
+    }
+
+    /// Number of pinned hashes.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Is the pinned set empty?
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Is `hash` pinned?
+    #[must_use]
+    pub fn contains(&self, hash: &Hash) -> bool {
+        self.0.contains(hash)
+    }
+
+    /// Iterate over the pinned hashes.
+    pub fn iter(&self) -> std::collections::hash_set::Iter<'_, Hash> {
+        self.0.iter()
+    }
+
+    /// Compute counts of additions / removals / unchanged hashes between
+    /// `prev` (older snapshot) and `self` (newer). Used by the SIGHUP
+    /// reload path to log a diff line — operators pin/unpin individual
+    /// hashes and want to see the delta in the success log without
+    /// scraping the full set.
+    #[must_use]
+    pub fn diff(&self, prev: &Self) -> PinDiff {
+        let added = self.0.iter().filter(|h| !prev.0.contains(*h)).count();
+        let removed = prev.0.iter().filter(|h| !self.0.contains(*h)).count();
+        PinDiff { added, removed }
+    }
+}
+
+impl<'a> IntoIterator for &'a PinnedHashes {
+    type Item = &'a Hash;
+    type IntoIter = std::collections::hash_set::Iter<'a, Hash>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl Default for PinnedHashes {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+/// Cheap diff of two [`PinnedHashes`] snapshots, for the reload log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PinDiff {
+    /// Number of hashes present in the new set but not the old.
+    pub added: usize,
+    /// Number of hashes present in the old set but not the new.
+    pub removed: usize,
+}
+
+/// Snapshot of access times for blobs that are eligible for LRU
+/// eviction — i.e. **pinned hashes are already excluded**. Returned by
+/// [`CacheEngine::eviction_candidates`].
+///
+/// The newtype makes "pinned-already-excluded" a *type-level* property:
+/// any future eviction-policy implementation that takes
+/// `EvictionCandidates` is guaranteed by the compiler not to evict
+/// pinned hashes. With a raw `HashMap<Hash, Instant>` return that
+/// guarantee would live only in a doc comment, and a future caller
+/// could substitute [`CacheEngine::access_times_snapshot`] (which
+/// includes pinned) by mistake.
+#[derive(Debug, Default)]
+pub struct EvictionCandidates(HashMap<Hash, Instant>);
+
+impl EvictionCandidates {
+    /// Number of eviction candidates.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Are there no eviction candidates?
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Does `hash` appear in the candidate set?
+    #[must_use]
+    pub fn contains_key(&self, hash: &Hash) -> bool {
+        self.0.contains_key(hash)
+    }
+
+    /// Iterate `(hash, last-access)` pairs.
+    pub fn iter(&self) -> std::collections::hash_map::Iter<'_, Hash, Instant> {
+        self.0.iter()
+    }
+
+    /// Consume into the underlying `HashMap`. Eviction policies that
+    /// need to sort by access time and pop top-K can call this once at
+    /// the start of their loop. The newtype's invariant
+    /// (pinned-already-excluded) is preserved by the time this returns
+    /// — the caller just gets a plain map to work with.
+    #[must_use]
+    pub fn into_inner(self) -> HashMap<Hash, Instant> {
+        self.0
+    }
+}
+
+impl<'a> IntoIterator for &'a EvictionCandidates {
+    type Item = (&'a Hash, &'a Instant);
+    type IntoIter = std::collections::hash_map::Iter<'a, Hash, Instant>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
 }
 
 /// RAII cleanup for an inflight pull-through entry. Removing the entry and
@@ -208,6 +367,18 @@ impl CacheEngine {
         origin: Option<Arc<dyn Origin>>,
         max_blob_mb: u64,
     ) -> CacheResult<Self> {
+        Self::open_with_pinned(cache_dir, origin, max_blob_mb, PinnedHashes::empty()).await
+    }
+
+    /// Open the cache with an initial pinning set. The set is held in an
+    /// [`ArcSwap`] internally so subsequent SIGHUP reloads can call
+    /// [`Self::set_pinned`] without rebuilding the engine.
+    pub async fn open_with_pinned(
+        cache_dir: &Path,
+        origin: Option<Arc<dyn Origin>>,
+        max_blob_mb: u64,
+        pinned: PinnedHashes,
+    ) -> CacheResult<Self> {
         tokio::fs::create_dir_all(cache_dir)
             .await
             .map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
@@ -231,10 +402,38 @@ impl CacheEngine {
                 max_blob_bytes,
                 access_times: Mutex::new(HashMap::new()),
                 inflight: Mutex::new(HashMap::new()),
+                pinned: ArcSwap::from(pinned.0),
                 evicted: Mutex::new(evicted),
                 evicted_log_path,
             }),
         })
+    }
+
+    /// Atomically swap the pinned-hashes set. Called by the runtime's
+    /// SIGHUP handler when `cache.pinned_hashes` changes — readers (the
+    /// eviction-candidate snapshot) observe either the old or the new set,
+    /// never a partial mix. Returns a [`PinDiff`] so callers can log
+    /// "added X, removed Y" without re-walking either set.
+    ///
+    /// Takes `&PinnedHashes` rather than ownership: the inner `Arc`
+    /// is cheap to clone for the swap, and callers commonly want to
+    /// compute the diff without giving up their own copy.
+    pub fn set_pinned(&self, new: &PinnedHashes) -> PinDiff {
+        let prev_arc = self.inner.pinned.swap(Arc::clone(&new.0));
+        let prev = PinnedHashes(prev_arc);
+        new.diff(&prev)
+    }
+
+    /// Borrow a snapshot of the current pinned set. Cheap (one
+    /// `Arc::clone`); the underlying [`ArcSwap`] returns a `Guard` that
+    /// resolves to an `Arc<HashSet<Hash>>` we then own.
+    pub fn pinned_snapshot(&self) -> PinnedHashes {
+        PinnedHashes(self.inner.pinned.load_full())
+    }
+
+    /// Is `hash` currently pinned? Cheap O(1) lookup against the live set.
+    pub fn is_pinned(&self, hash: Hash) -> bool {
+        self.inner.pinned.load().contains(&hash)
     }
 
     /// Is this blob already present in the local store?
@@ -454,11 +653,50 @@ impl CacheEngine {
 
     /// Return a snapshot of all recorded access times. Eviction logic can
     /// sort by value to determine LRU ordering.
+    ///
+    /// **Note:** this snapshot is the *raw* access map and includes pinned
+    /// hashes. Eviction implementations should use
+    /// [`Self::eviction_candidates`] instead, which filters pinned hashes
+    /// out so they survive LRU pressure (#276). The raw snapshot is still
+    /// exposed because tests and observability paths sometimes want the
+    /// unfiltered view.
     pub fn access_times_snapshot(&self) -> HashMap<Hash, Instant> {
         let Ok(guard) = self.inner.access_times.lock() else {
             return HashMap::new();
         };
         guard.clone()
+    }
+
+    /// Return a snapshot of access times **excluding pinned hashes**.
+    /// This is the canonical input to LRU eviction (#276): a pinned hash
+    /// never appears here, so any candidate-picking sort or top-K query
+    /// run against the result inherently respects the pinning policy.
+    ///
+    /// The return type ([`EvictionCandidates`]) is a newtype with no
+    /// public constructor — callers can iterate or `into_inner` but
+    /// cannot fabricate one. This makes "pinned-already-excluded" a
+    /// type-level invariant rather than a documentation claim.
+    ///
+    /// The pinned set is loaded once at the start of the call so a
+    /// concurrent `set_pinned` swap doesn't change which hashes get
+    /// filtered mid-iteration — the snapshot is consistent against
+    /// *some* pinned generation, just not necessarily the very latest.
+    pub fn eviction_candidates(&self) -> EvictionCandidates {
+        let pinned = self.inner.pinned.load();
+        let Ok(guard) = self.inner.access_times.lock() else {
+            return EvictionCandidates(HashMap::new());
+        };
+        let map = guard
+            .iter()
+            .filter_map(|(h, t)| {
+                if pinned.contains(h) {
+                    None
+                } else {
+                    Some((*h, *t))
+                }
+            })
+            .collect();
+        EvictionCandidates(map)
     }
 
     /// Record an access for `hash` at the current instant.
@@ -837,6 +1075,121 @@ mod tests {
         );
         Ok(())
     }
+
+    // ----- Pinning (#276) -----
+
+    #[tokio::test]
+    async fn pinned_hash_is_excluded_from_eviction_candidates() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pinned_payload = b"pinned blob";
+        let evictable_payload = b"evictable blob";
+        let pinned_hash = Hash::new(pinned_payload);
+        let evictable_hash = Hash::new(evictable_payload);
+
+        // Build the engine with pinned_hash in the pinning set.
+        let mut pinned_set = HashSet::new();
+        pinned_set.insert(pinned_hash);
+        let engine =
+            CacheEngine::open_with_pinned(tmp.path(), None, 10, PinnedHashes::new(pinned_set))
+                .await?;
+
+        // Touch both hashes via direct access-time insertion (we don't
+        // need actual blob content for this test).
+        if let Ok(mut g) = engine.inner.access_times.lock() {
+            g.insert(pinned_hash, Instant::now());
+            g.insert(evictable_hash, Instant::now());
+        }
+
+        let raw = engine.access_times_snapshot();
+        anyhow::ensure!(raw.len() == 2, "raw snapshot must include pinned");
+
+        let candidates = engine.eviction_candidates();
+        anyhow::ensure!(
+            candidates.len() == 1,
+            "candidates should exclude pinned, got {} entries",
+            candidates.len()
+        );
+        anyhow::ensure!(
+            candidates.contains_key(&evictable_hash),
+            "evictable hash should be a candidate"
+        );
+        anyhow::ensure!(
+            !candidates.contains_key(&pinned_hash),
+            "pinned hash must NOT be a candidate"
+        );
+        anyhow::ensure!(engine.is_pinned(pinned_hash));
+        anyhow::ensure!(!engine.is_pinned(evictable_hash));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn set_pinned_atomically_updates_filter() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let h1 = Hash::new(b"one");
+        let h2 = Hash::new(b"two");
+
+        let engine = CacheEngine::open(tmp.path(), None, 10).await?;
+        if let Ok(mut g) = engine.inner.access_times.lock() {
+            g.insert(h1, Instant::now());
+            g.insert(h2, Instant::now());
+        }
+
+        // No pinning yet — both candidates.
+        anyhow::ensure!(engine.eviction_candidates().len() == 2);
+
+        // Pin h1.
+        let mut s = HashSet::new();
+        s.insert(h1);
+        let diff = engine.set_pinned(&PinnedHashes::new(s));
+        anyhow::ensure!(
+            diff.added == 1 && diff.removed == 0,
+            "expected diff (added=1, removed=0), got {diff:?}"
+        );
+
+        let candidates = engine.eviction_candidates();
+        anyhow::ensure!(candidates.len() == 1, "h1 should now be excluded");
+        anyhow::ensure!(candidates.contains_key(&h2));
+
+        // Replace with empty set — h1 becomes a candidate again.
+        let diff2 = engine.set_pinned(&PinnedHashes::empty());
+        anyhow::ensure!(
+            diff2.added == 0 && diff2.removed == 1,
+            "expected diff (added=0, removed=1), got {diff2:?}"
+        );
+        anyhow::ensure!(engine.eviction_candidates().len() == 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pinned_hashes_diff_counts_added_and_removed() -> anyhow::Result<()> {
+        // Direct unit test of the diff helper, independent of the
+        // engine swap path. Locks the API: a future caller stitching
+        // log messages from `PinDiff` shouldn't break silently if the
+        // counting changes shape.
+        let h1 = Hash::new(b"one");
+        let h2 = Hash::new(b"two");
+        let h3 = Hash::new(b"three");
+
+        let mut prev_set = HashSet::new();
+        prev_set.insert(h1);
+        prev_set.insert(h2);
+        let prev = PinnedHashes::new(prev_set);
+
+        let mut new_set = HashSet::new();
+        new_set.insert(h2);
+        new_set.insert(h3);
+        let new = PinnedHashes::new(new_set);
+
+        let diff = new.diff(&prev);
+        anyhow::ensure!(diff.added == 1 && diff.removed == 1, "got {diff:?}");
+
+        // Same set on both sides: zero diff.
+        let no_change = new.diff(&new);
+        anyhow::ensure!(no_change.added == 0 && no_change.removed == 0);
+        Ok(())
+    }
+
+    // ----- Operator-evict (#279) -----
 
     /// `evict` must take a previously-cached hash off the served set. After
     /// evict, `has` reports false and `get` returns `NotFound` rather than

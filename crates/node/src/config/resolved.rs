@@ -65,6 +65,21 @@ pub struct ResolvedCache {
     /// config resolution carries the raw path so resolution stays
     /// filesystem-free and testable without real I/O.
     pub origin_path: Option<PathBuf>,
+    /// How to handle `Content-Encoding` on the HTTP origin response
+    /// (#312). Defaults to [`decdn_cache::DecompressMode::Auto`].
+    pub decompress: decdn_cache::DecompressMode,
+    /// Operator-pinned blob hashes (#276). Hashes here are excluded from
+    /// LRU eviction candidates by [`decdn_cache::CacheEngine`]. Resolved
+    /// from the hex-encoded TOML form at load time, so any wrong-length
+    /// or non-hex entry fails config loading rather than turning into a
+    /// silent "this hash will be ignored" surprise.
+    ///
+    /// Held as [`decdn_cache::PinnedHashes`] (a typed wrapper around
+    /// `Arc<HashSet<Hash>>`) so the engine, runtime, and resolver
+    /// share one nominal type — a future "blocklist" or similar
+    /// `HashSet<Hash>`-shaped feature can't be silently swapped into
+    /// the pinning slot.
+    pub pinned_hashes: decdn_cache::PinnedHashes,
 }
 
 /// Resolved payment fields.

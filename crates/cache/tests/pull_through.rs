@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use decdn_cache::{
-    CacheEngine, CacheError, FilesystemOrigin, Hash, HttpOrigin, Origin, OriginFetch,
+    CacheEngine, CacheError, DecompressMode, FilesystemOrigin, Hash, HttpOrigin, Origin,
+    OriginError, OriginFetch, SupportedEncoding,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wiremock::matchers::{method, path};
@@ -504,5 +505,524 @@ async fn miss_without_origin_returns_no_origin() -> anyhow::Result<()> {
         matches!(err, CacheError::NoOrigin { .. }),
         "expected NoOrigin, got: {err:?}"
     );
+    Ok(())
+}
+
+// ----- Decompression (#312) -----
+//
+// `HttpOrigin` must transparently decompress `Content-Encoding: gzip` and
+// `Content-Encoding: zstd` responses before the engine's BLAKE3 verify
+// runs. The content-address is computed over the canonical (decompressed)
+// form, so a raw-bytes pass-through would fail every verify.
+
+use std::io::Write;
+
+fn gzip(payload: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    e.write_all(payload)?;
+    Ok(e.finish()?)
+}
+
+fn zstd_compress(payload: &[u8]) -> anyhow::Result<Vec<u8>> {
+    Ok(zstd::stream::encode_all(payload, 1)?)
+}
+
+#[tokio::test]
+async fn http_origin_decompresses_gzip_response() -> anyhow::Result<()> {
+    let payload: &[u8] = b"hello, gzipped world! repeat repeat repeat repeat";
+    let hash = Hash::new(payload);
+    let server = MockServer::start().await;
+    let compressed = gzip(payload)?;
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Encoding", "gzip")
+                .set_body_bytes(compressed),
+        )
+        .mount(&server)
+        .await;
+
+    let (engine, _tmp) = build_engine(&server.uri()).await?;
+    let got = engine.get(hash).await?;
+    anyhow::ensure!(
+        &got[..] == payload,
+        "decompressed bytes should match canonical payload"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn http_origin_decompresses_zstd_response() -> anyhow::Result<()> {
+    let payload: &[u8] = b"hello, zstd! and a longer body to compress meaningfully xxxxx";
+    let hash = Hash::new(payload);
+    let server = MockServer::start().await;
+    let compressed = zstd_compress(payload)?;
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Encoding", "zstd")
+                .set_body_bytes(compressed),
+        )
+        .mount(&server)
+        .await;
+
+    let (engine, _tmp) = build_engine(&server.uri()).await?;
+    let got = engine.get(hash).await?;
+    anyhow::ensure!(&got[..] == payload, "decompressed bytes should match");
+    Ok(())
+}
+
+#[tokio::test]
+async fn http_origin_passes_through_identity_encoding() -> anyhow::Result<()> {
+    let payload: &[u8] = b"plain identity payload";
+    let hash = Hash::new(payload);
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Encoding", "identity")
+                .set_body_bytes(payload),
+        )
+        .mount(&server)
+        .await;
+
+    let (engine, _tmp) = build_engine(&server.uri()).await?;
+    let got = engine.get(hash).await?;
+    anyhow::ensure!(&got[..] == payload);
+    Ok(())
+}
+
+#[tokio::test]
+async fn http_origin_rejects_unknown_encoding() -> anyhow::Result<()> {
+    let payload: &[u8] = b"who knows what encoding";
+    let hash = Hash::new(payload);
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Encoding", "br") // Brotli — not supported.
+                .set_body_bytes(payload),
+        )
+        .mount(&server)
+        .await;
+
+    let (engine, _tmp) = build_engine(&server.uri()).await?;
+    let err = err_of(engine.get(hash).await)?;
+    // Surfaced as an OriginError wrapping the UnsupportedEncoding source.
+    let formatted = format!("{err:?}");
+    anyhow::ensure!(
+        matches!(err, CacheError::OriginError { .. }),
+        "expected OriginError, got: {formatted}"
+    );
+    anyhow::ensure!(
+        formatted.contains("Content-Encoding") || formatted.contains("br"),
+        "error should mention the unsupported encoding: {formatted}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn http_origin_decompress_off_rejects_compressed_response() -> anyhow::Result<()> {
+    // With `decompress=false`, an origin that still returns
+    // `Content-Encoding: gzip` is a configuration mistake. We refuse
+    // up-front rather than passing the raw bytes through and letting
+    // the engine surface a confusing `HashMismatch` — operators get a
+    // precise "your origin is using an encoding I'm not handling"
+    // message they can act on.
+    let payload: &[u8] = b"canonical payload";
+    let hash = Hash::new(payload);
+    let server = MockServer::start().await;
+    let compressed = gzip(payload)?;
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Encoding", "gzip")
+                .set_body_bytes(compressed),
+        )
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir()?;
+    let origin = Arc::new(
+        HttpOrigin::parse(&server.uri())?.with_decompress_mode(decdn_cache::DecompressMode::Strict),
+    );
+    let engine = CacheEngine::open(tmp.path(), Some(origin), 16).await?;
+    let err = err_of(engine.get(hash).await)?;
+    let formatted = format!("{err:?}");
+    anyhow::ensure!(
+        matches!(err, CacheError::OriginError { .. }),
+        "expected OriginError when decompression is off and encoding is set, got: {formatted}"
+    );
+    anyhow::ensure!(
+        formatted.contains("unsupported Content-Encoding") || formatted.contains("gzip"),
+        "error should name the unsupported encoding: {formatted}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn http_origin_decompress_off_passes_through_identity() -> anyhow::Result<()> {
+    // The opt-out path is still useful for origins that legitimately
+    // serve raw bytes (no Content-Encoding, or `identity`). The hash
+    // must match because we never touched the bytes.
+    let payload: &[u8] = b"canonical payload";
+    let hash = Hash::new(payload);
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload.to_vec()))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir()?;
+    let origin =
+        Arc::new(HttpOrigin::parse(&server.uri())?.with_decompress_mode(DecompressMode::Strict));
+    let engine = CacheEngine::open(tmp.path(), Some(origin), 16).await?;
+    let bytes = engine.get(hash).await?;
+    anyhow::ensure!(bytes.as_ref() == payload, "unexpected payload");
+    Ok(())
+}
+
+// ----- Decompression: typed-error access, bombs, edge cases (#312) -----
+//
+// The variants on `OriginError` (UnsupportedEncoding, DecompressionFailed,
+// MalformedEncoding) survive the `anyhow::Error → CacheError::OriginError`
+// boundary via `CacheError::origin_error_kind`, which walks the source
+// chain. Asserting on the typed variant locks in the contract — a future
+// refactor that wraps a context layer above the typed error in a way
+// that breaks downcast (e.g. flattening into a string) would fail these
+// tests rather than silently degrading observability.
+
+/// Build a wiremock origin that serves `body` with `Content-Encoding: encoding`
+/// at `/<hash>`. Returns `(server, hash)`.
+async fn serve_encoded(encoding: &'static str, body: Vec<u8>, canonical_hash: Hash) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", canonical_hash.to_hex())))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Encoding", encoding)
+                .set_body_bytes(body),
+        )
+        .mount(&server)
+        .await;
+    server
+}
+
+/// Force `read_capped`'s mid-stream cap to fire: gzip a small payload
+/// that decompresses well past `max_blob_mb`. Critical security path —
+/// without this test, a regression flipping `>` to `>=` (or removing
+/// the cap) is a memory-exhaustion `DoS` via a malicious origin.
+#[tokio::test]
+async fn http_origin_rejects_decompression_bomb() -> anyhow::Result<()> {
+    // 4 MiB of zeros gzips to ~4 KiB. Engine cap = 1 MiB so the
+    // mid-stream check inside `read_capped` is the only thing that
+    // catches this — both the Content-Length fast-path (4 KiB encoded)
+    // and the engine post-receive cap would let it through.
+    let payload = vec![0u8; 4 * 1024 * 1024];
+    let canonical = Hash::new(&payload);
+    let compressed = gzip(&payload)?;
+    anyhow::ensure!(
+        compressed.len() < 1024 * 1024,
+        "test setup: compressed body must be smaller than the cap to \
+         exercise the mid-stream check, was {} bytes",
+        compressed.len()
+    );
+    let server = serve_encoded("gzip", compressed, canonical).await;
+
+    let tmp = tempfile::tempdir()?;
+    let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
+    let engine = CacheEngine::open(tmp.path(), Some(origin), 1).await?;
+
+    let err = err_of(engine.get(canonical).await)?;
+    anyhow::ensure!(
+        matches!(err, CacheError::OriginError { .. }),
+        "expected OriginError from bomb cap, got: {err:?}"
+    );
+    let kind = err
+        .origin_error_kind()
+        .ok_or_else(|| anyhow::anyhow!("expected typed OriginError downcast, got: {err:?}"))?;
+    anyhow::ensure!(
+        matches!(
+            kind,
+            OriginError::DecompressionFailed {
+                encoding: SupportedEncoding::Gzip,
+                ..
+            }
+        ),
+        "expected DecompressionFailed(Gzip), got: {kind:?}"
+    );
+    let msg = format!("{err:#}");
+    anyhow::ensure!(
+        msg.contains("mid-stream"),
+        "error message should name the mid-stream cap: {msg}"
+    );
+    Ok(())
+}
+
+/// Truncated gzip body: the decoder emits an `io::Error` mid-stream.
+/// The whole point of `OriginError::DecompressionFailed` is to produce
+/// a clear "decoder rejected the body" message rather than the
+/// downstream `CacheError::HashMismatch` an operator would otherwise
+/// see (the engine never gets to verify because there's nothing to
+/// verify).
+#[tokio::test]
+async fn http_origin_truncated_gzip_surfaces_decompression_failed() -> anyhow::Result<()> {
+    let payload: &[u8] = b"truncate me, please, but only the gzip wrapper";
+    let canonical = Hash::new(payload);
+    let mut compressed = gzip(payload)?;
+    // Lop off the gzip trailer + the final byte of the deflate stream.
+    // 12+ bytes is enough to break the CRC and length checks.
+    let drop = compressed.len().saturating_sub(20);
+    compressed.truncate(drop);
+    let server = serve_encoded("gzip", compressed, canonical).await;
+
+    let (engine, _tmp) = build_engine(&server.uri()).await?;
+    let err = err_of(engine.get(canonical).await)?;
+    anyhow::ensure!(
+        matches!(err, CacheError::OriginError { .. }),
+        "expected OriginError, got: {err:?}"
+    );
+    let kind = err
+        .origin_error_kind()
+        .ok_or_else(|| anyhow::anyhow!("expected typed downcast"))?;
+    anyhow::ensure!(
+        matches!(
+            kind,
+            OriginError::DecompressionFailed {
+                encoding: SupportedEncoding::Gzip,
+                ..
+            }
+        ),
+        "expected DecompressionFailed(Gzip), got: {kind:?}"
+    );
+    Ok(())
+}
+
+/// Unknown encoding surfaces typed `UnsupportedEncoding` — exercises the
+/// downcast helper, complementing `http_origin_rejects_unknown_encoding`
+/// which only asserts on the formatted message.
+#[tokio::test]
+async fn http_origin_unknown_encoding_is_typed() -> anyhow::Result<()> {
+    let payload: &[u8] = b"who knows";
+    let hash = Hash::new(payload);
+    let server = serve_encoded("br", payload.to_vec(), hash).await;
+    let (engine, _tmp) = build_engine(&server.uri()).await?;
+
+    let err = err_of(engine.get(hash).await)?;
+    let kind = err
+        .origin_error_kind()
+        .ok_or_else(|| anyhow::anyhow!("expected typed downcast"))?;
+    let OriginError::UnsupportedEncoding { encoding } = kind else {
+        anyhow::bail!("expected UnsupportedEncoding, got: {kind:?}");
+    };
+    anyhow::ensure!(
+        encoding.as_ref() == "br",
+        "encoding string should round-trip: {encoding:?}"
+    );
+    Ok(())
+}
+
+/// Case-insensitive matching: `Content-Encoding: GZIP` is RFC-compliant
+/// and must be handled identically to lowercase `gzip`. Without an
+/// explicit test, a refactor swapping `eq_ignore_ascii_case` for `==`
+/// would silently break interop with origins that upper-case the value.
+#[tokio::test]
+async fn http_origin_accepts_uppercase_gzip_encoding() -> anyhow::Result<()> {
+    let payload: &[u8] = b"upper case is fine, RFC says so";
+    let hash = Hash::new(payload);
+    let server = serve_encoded("GZIP", gzip(payload)?, hash).await;
+    let (engine, _tmp) = build_engine(&server.uri()).await?;
+    let got = engine.get(hash).await?;
+    anyhow::ensure!(&got[..] == payload);
+    Ok(())
+}
+
+/// Legacy `x-gzip` alias — ancient origins serve this. Same behaviour
+/// as `gzip`.
+#[tokio::test]
+async fn http_origin_accepts_x_gzip_encoding() -> anyhow::Result<()> {
+    let payload: &[u8] = b"the x prefix predates RFC 2616";
+    let hash = Hash::new(payload);
+    let server = serve_encoded("x-gzip", gzip(payload)?, hash).await;
+    let (engine, _tmp) = build_engine(&server.uri()).await?;
+    let got = engine.get(hash).await?;
+    anyhow::ensure!(&got[..] == payload);
+    Ok(())
+}
+
+/// Multi-encoding `gzip, zstd` must be rejected. The current
+/// implementation doesn't split commas; future "smart" parsing would
+/// silently change semantics, and this test locks the explicit
+/// rejection in.
+#[tokio::test]
+async fn http_origin_rejects_multi_encoding_header() -> anyhow::Result<()> {
+    let payload: &[u8] = b"don't try to be clever";
+    let hash = Hash::new(payload);
+    let server = serve_encoded("gzip, zstd", gzip(payload)?, hash).await;
+    let (engine, _tmp) = build_engine(&server.uri()).await?;
+
+    let err = err_of(engine.get(hash).await)?;
+    let kind = err
+        .origin_error_kind()
+        .ok_or_else(|| anyhow::anyhow!("expected typed downcast"))?;
+    anyhow::ensure!(
+        matches!(kind, OriginError::UnsupportedEncoding { .. }),
+        "expected UnsupportedEncoding for multi-encoding, got: {kind:?}"
+    );
+    Ok(())
+}
+
+/// Above the 1 MiB `DECOMPRESS_BLOCKING_THRESHOLD`, decompression runs
+/// inside `spawn_blocking`. A regression dropping the `.await` or
+/// flipping the comparator would fail this test (the current
+/// `pull_through_succeeds_above_blocking_hash_threshold` only exercises
+/// the *hash* threshold via `FilesystemOrigin` and never decompresses).
+#[tokio::test]
+async fn http_origin_decompresses_above_blocking_threshold() -> anyhow::Result<()> {
+    // 2 MiB decompressed → crosses the 1 MiB threshold for both the
+    // raw read AND the spawn_blocking path inside the decoder.
+    let payload = vec![0xC0u8; 2 * 1024 * 1024];
+    let hash = Hash::new(&payload);
+    let server = serve_encoded("gzip", gzip(&payload)?, hash).await;
+
+    let tmp = tempfile::tempdir()?;
+    let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
+    let engine = CacheEngine::open(tmp.path(), Some(origin), 16).await?;
+    let got = engine.get(hash).await?;
+    anyhow::ensure!(got.len() == payload.len(), "size mismatch: {}", got.len());
+    anyhow::ensure!(got[..] == payload[..], "decompressed content mismatch");
+    Ok(())
+}
+
+/// Pre-stream Content-Length rejection now applies to compressed bodies
+/// too: an origin that advertises a compressed body larger than
+/// `max_bytes` is malicious or misconfigured (compression ratios < 1
+/// are universal in practice). Catching it before any byte streams
+/// saves bandwidth and surfaces a clearer error.
+#[tokio::test]
+async fn http_origin_rejects_oversized_compressed_content_length() -> anyhow::Result<()> {
+    // 2 MiB of repeating bytes gzips to about a few KiB, but we lie to
+    // the client: serve a 5 MiB compressed body with `Content-Encoding:
+    // gzip` and `Content-Length: 5 MiB`, then cap at 1 MiB.
+    let canonical = Hash::new(b"doesn't matter");
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", canonical.to_hex())))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Encoding", "gzip")
+                // Honest C-L describing the body; mock-server's HTTP
+                // layer fills the actual length, but it'll exceed the
+                // cap anyway.
+                .set_body_bytes(vec![0u8; 5 * 1024 * 1024]),
+        )
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir()?;
+    let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
+    let engine = CacheEngine::open(tmp.path(), Some(origin), 1).await?;
+
+    let err = err_of(engine.get(canonical).await)?;
+    let msg = format!("{err:#}");
+    anyhow::ensure!(
+        matches!(err, CacheError::OriginError { .. }),
+        "expected OriginError from compressed C-L cap, got: {err:?}"
+    );
+    anyhow::ensure!(
+        msg.contains("exceeds max"),
+        "error should name the cap: {msg}"
+    );
+    Ok(())
+}
+
+/// Empty compressed body (the `Content-Encoding: gzip` is present but
+/// the body has zero bytes) is malformed — gzip frames have minimum
+/// header overhead. The decoder rejects mid-stream with
+/// `DecompressionFailed`.
+#[tokio::test]
+async fn http_origin_empty_gzip_body_surfaces_decompression_failed() -> anyhow::Result<()> {
+    let canonical = Hash::new(b"phantom");
+    let server = serve_encoded("gzip", Vec::new(), canonical).await;
+    let (engine, _tmp) = build_engine(&server.uri()).await?;
+
+    let err = err_of(engine.get(canonical).await)?;
+    let kind = err
+        .origin_error_kind()
+        .ok_or_else(|| anyhow::anyhow!("expected typed downcast"))?;
+    anyhow::ensure!(
+        matches!(
+            kind,
+            OriginError::DecompressionFailed {
+                encoding: SupportedEncoding::Gzip,
+                ..
+            }
+        ),
+        "expected DecompressionFailed(Gzip), got: {kind:?}"
+    );
+    Ok(())
+}
+
+/// `BLAKE3` verify must run over the *decompressed* form (the whole
+/// point of #312). Flipping a single byte of the canonical payload
+/// before computing the expected hash would let a buggy implementation
+/// (one that hashes the raw compressed bytes) pass — this test asserts
+/// the verify happens after decompression by deliberately requesting
+/// a hash that matches the compressed bytes, not the canonical ones,
+/// and expecting `HashMismatch`.
+#[tokio::test]
+async fn http_origin_blake3_verify_runs_over_decompressed_bytes() -> anyhow::Result<()> {
+    let payload: &[u8] = b"verify-after-decompress, not before";
+    let canonical = Hash::new(payload);
+    let compressed = gzip(payload)?;
+    // Hash of the *compressed* bytes — what a regression would match.
+    let raw_hash = Hash::new(&compressed);
+    anyhow::ensure!(canonical != raw_hash, "test premise: hashes differ");
+
+    let server = serve_encoded("gzip", compressed, raw_hash).await;
+    let (engine, _tmp) = build_engine(&server.uri()).await?;
+
+    // Asking for the raw-bytes hash: the decoded body has a different
+    // BLAKE3 → engine surfaces HashMismatch (proving the verify saw
+    // the canonical bytes, not the compressed ones).
+    let err = err_of(engine.get(raw_hash).await)?;
+    anyhow::ensure!(
+        matches!(err, CacheError::HashMismatch { .. }),
+        "expected HashMismatch (verify ran over decompressed form), got: {err:?}"
+    );
+    Ok(())
+}
+
+/// Strict mode passes through identity, regression-locks the opt-out
+/// path. (The companion test
+/// `http_origin_decompress_off_passes_through_identity` already exists;
+/// this is the "encoding header explicitly set to `identity`" variant.)
+#[tokio::test]
+async fn http_origin_strict_mode_accepts_explicit_identity() -> anyhow::Result<()> {
+    let payload: &[u8] = b"explicit identity";
+    let hash = Hash::new(payload);
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Encoding", "identity")
+                .set_body_bytes(payload),
+        )
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir()?;
+    let origin =
+        Arc::new(HttpOrigin::parse(&server.uri())?.with_decompress_mode(DecompressMode::Strict));
+    let engine = CacheEngine::open(tmp.path(), Some(origin), 16).await?;
+    let got = engine.get(hash).await?;
+    anyhow::ensure!(&got[..] == payload);
     Ok(())
 }

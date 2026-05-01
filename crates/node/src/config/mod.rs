@@ -437,13 +437,67 @@ fn resolve_cache(
         );
     }
 
+    // Decompression defaults to Auto — most object stores serve
+    // compressed bodies and the BLAKE3 verify in the engine runs over
+    // the canonical (decompressed) form, so silently passing through
+    // compressed bytes would always fail. CLI has no override for
+    // this knob (no operator policy reason to flip it ad-hoc);
+    // file-only is sufficient.
+    let decompress = file.and_then(|c| c.decompress).unwrap_or_default();
+
+    let pinned_hashes = parse_pinned_hashes(file.and_then(|c| c.pinned_hashes.as_deref()))
+        .context("invalid cache.pinned_hashes")?;
+
     Ok(ResolvedCache {
         cache_dir,
         cache_size_mb,
         max_blob_size_mb,
         origin_url,
         origin_path,
+        decompress,
+        pinned_hashes,
     })
+}
+
+/// Parse the operator-supplied `cache.pinned_hashes` list (#276) into a
+/// [`decdn_cache::PinnedHashes`]. Each entry must be 64 lowercase hex
+/// chars (BLAKE3 digest size); anything else fails resolution. Duplicates
+/// are silently de-duplicated — they're harmless.
+///
+/// `None` and the empty list both resolve to the empty set, so an absent
+/// or empty `pinned_hashes` key just means "no pinning".
+pub(crate) fn parse_pinned_hashes(
+    raw: Option<&[String]>,
+) -> anyhow::Result<decdn_cache::PinnedHashes> {
+    use std::str::FromStr;
+
+    let mut out = std::collections::HashSet::new();
+    let Some(entries) = raw else {
+        return Ok(decdn_cache::PinnedHashes::empty());
+    };
+    for (idx, entry) in entries.iter().enumerate() {
+        let trimmed = entry.trim();
+        // BLAKE3 lowercase hex is 64 chars. We require lowercase rather
+        // than letting `Hash::from_str` accept either case because
+        // mixed-case entries are almost always a copy-paste mistake from
+        // somewhere they got upper-cased; surfacing it as a config error
+        // now beats a silent "did the operator pin this or not?" later.
+        anyhow::ensure!(
+            trimmed.len() == 64,
+            "cache.pinned_hashes[{idx}] must be 64 hex chars (BLAKE3); got {} chars",
+            trimmed.len()
+        );
+        anyhow::ensure!(
+            trimmed.chars().all(|c| c.is_ascii_hexdigit())
+                && !trimmed.chars().any(|c| c.is_ascii_uppercase()),
+            "cache.pinned_hashes[{idx}] must be lowercase hex (0-9, a-f)"
+        );
+        let parsed = decdn_cache::Hash::from_str(trimmed).with_context(|| {
+            format!("cache.pinned_hashes[{idx}] failed to parse as a BLAKE3 hash")
+        })?;
+        out.insert(parsed);
+    }
+    Ok(decdn_cache::PinnedHashes::new(out))
 }
 
 /// Resolve payment fields.
@@ -1142,6 +1196,7 @@ mod tests {
                 max_blob_size_mb: None,
                 origin_url: None,
                 origin_path: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1183,6 +1238,7 @@ mod tests {
                 max_blob_size_mb: None,
                 origin_url: None,
                 origin_path: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1221,6 +1277,7 @@ mod tests {
                 max_blob_size_mb: None,
                 origin_url: None,
                 origin_path: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1241,6 +1298,11 @@ mod tests {
     // `expand_env` — every expandable field must surface its own dotted
     // path in the error message.
     #[test]
+    // Length crept past 100 lines after `..Default::default()` was
+    // added to every CacheConfig literal in the field-setter table
+    // (#312/#276 PR). The body is a flat list of cases — splitting
+    // wouldn't compress information density.
+    #[allow(clippy::too_many_lines)]
     fn expand_env_per_field_error_context() -> anyhow::Result<()> {
         let missing = "DECDN_UNSET_PER_FIELD_VAR_ZZZ";
         anyhow::ensure!(
@@ -1299,6 +1361,7 @@ mod tests {
                     max_blob_size_mb: None,
                     origin_url: None,
                     origin_path: None,
+                    ..Default::default()
                 });
             }),
             ("cache.origin_url", |c, v| {
@@ -1308,6 +1371,7 @@ mod tests {
                     max_blob_size_mb: None,
                     origin_url: Some(v.to_string()),
                     origin_path: None,
+                    ..Default::default()
                 });
             }),
             ("cache.origin_path", |c, v| {
@@ -1317,6 +1381,7 @@ mod tests {
                     max_blob_size_mb: None,
                     origin_url: None,
                     origin_path: Some(PathBuf::from(v)),
+                    ..Default::default()
                 });
             }),
             ("observability.otlp_endpoint", |c, v| {
@@ -1359,6 +1424,7 @@ mod tests {
                 max_blob_size_mb: None,
                 origin_url: Some("https://origin.example/${HOME}/bucket".to_string()),
                 origin_path: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1430,6 +1496,7 @@ mod tests {
             max_blob_size_mb: None,
             origin_url: Some("https://toml-loses.example/".to_string()),
             origin_path: None,
+            ..Default::default()
         };
         let resolved = resolve_cache(&cli, Some(&toml), std::path::Path::new("/tmp"))?;
         let url = resolved
@@ -1583,6 +1650,162 @@ mod tests {
             resolved.max_blob_size_mb == 512,
             "max_blob: {}",
             resolved.max_blob_size_mb
+        );
+        Ok(())
+    }
+
+    // ----- pinned_hashes / decompress (#276, #312) -----
+
+    fn make_hex_hash(seed: u8) -> String {
+        use std::fmt::Write as _;
+
+        let mut bytes = [0u8; 32];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            // 32-element array, so usize→u8 always fits.
+            let i_u8 = u8::try_from(i).unwrap_or(0);
+            *b = i_u8.wrapping_add(seed);
+        }
+        // 64 lowercase hex chars — matches the BLAKE3 wire form.
+        let mut s = String::with_capacity(64);
+        for b in bytes {
+            // write! to a String is infallible; the `_` swallows the
+            // formal Result without invoking the workspace's expect_used
+            // lint.
+            let _ = write!(s, "{b:02x}");
+        }
+        s
+    }
+
+    #[test]
+    fn parse_pinned_hashes_accepts_valid_lowercase_hex() -> anyhow::Result<()> {
+        let h1 = make_hex_hash(1);
+        let h2 = make_hex_hash(2);
+        let raw = vec![h1.clone(), h2.clone()];
+        let parsed = parse_pinned_hashes(Some(&raw))?;
+        anyhow::ensure!(parsed.len() == 2, "expected 2 hashes, got {}", parsed.len());
+        Ok(())
+    }
+
+    #[test]
+    fn parse_pinned_hashes_deduplicates() -> anyhow::Result<()> {
+        let h = make_hex_hash(7);
+        let raw = vec![h.clone(), h.clone(), h];
+        let parsed = parse_pinned_hashes(Some(&raw))?;
+        anyhow::ensure!(parsed.len() == 1, "duplicates should collapse");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_pinned_hashes_rejects_wrong_length() -> anyhow::Result<()> {
+        let raw = vec!["abcd".to_string()]; // 4 chars, not 64
+        let err = parse_pinned_hashes(Some(&raw))
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected error"))?;
+        let msg = format!("{err:#}");
+        anyhow::ensure!(
+            msg.contains("64 hex chars"),
+            "error should mention length: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_pinned_hashes_rejects_non_hex_chars() -> anyhow::Result<()> {
+        // 64 chars but contains 'z' which is not hex.
+        let bad: String = std::iter::repeat_n('z', 64).collect();
+        let raw = vec![bad];
+        let err = parse_pinned_hashes(Some(&raw))
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected error"))?;
+        let msg = format!("{err:#}");
+        anyhow::ensure!(
+            msg.contains("lowercase hex"),
+            "error should mention hex: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_pinned_hashes_rejects_uppercase_hex() -> anyhow::Result<()> {
+        // A copy-paste from a UI that upper-cased the digest is the most
+        // likely operator mistake. Reject explicitly so they get a clear
+        // error rather than a half-pinned set.
+        let bad: String = std::iter::repeat_n('A', 64).collect();
+        let raw = vec![bad];
+        let err = parse_pinned_hashes(Some(&raw))
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected error"))?;
+        let msg = format!("{err:#}");
+        anyhow::ensure!(msg.contains("lowercase"), "got: {msg}");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_pinned_hashes_empty_or_none_yields_empty_set() -> anyhow::Result<()> {
+        anyhow::ensure!(parse_pinned_hashes(None)?.is_empty());
+        let raw: Vec<String> = vec![];
+        anyhow::ensure!(parse_pinned_hashes(Some(&raw))?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_defaults_decompress_auto_and_pinned_empty() -> anyhow::Result<()> {
+        let cli = cache_cli(None, None);
+        let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
+        anyhow::ensure!(
+            matches!(resolved.decompress, decdn_cache::DecompressMode::Auto),
+            "decompress should default to Auto"
+        );
+        anyhow::ensure!(resolved.pinned_hashes.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_decompress_strict_via_file() -> anyhow::Result<()> {
+        let cli = cache_cli(None, None);
+        let file = types::CacheConfig {
+            decompress: Some(decdn_cache::DecompressMode::Strict),
+            ..types::CacheConfig::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        anyhow::ensure!(matches!(
+            resolved.decompress,
+            decdn_cache::DecompressMode::Strict
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_pinned_hashes_propagate_through_file() -> anyhow::Result<()> {
+        let h = make_hex_hash(5);
+        let cli = cache_cli(None, None);
+        let file = types::CacheConfig {
+            pinned_hashes: Some(vec![h.clone()]),
+            ..types::CacheConfig::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        anyhow::ensure!(
+            resolved.pinned_hashes.len() == 1,
+            "expected one pinned hash, got {}",
+            resolved.pinned_hashes.len()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_invalid_pinned_hash_fails_resolution() -> anyhow::Result<()> {
+        let cli = cache_cli(None, None);
+        let file = types::CacheConfig {
+            pinned_hashes: Some(vec!["not-a-hash".to_string()]),
+            ..types::CacheConfig::default()
+        };
+        let err = resolve_cache(&cli, Some(&file), Path::new("/tmp"))
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected error"))?;
+        let msg = format!("{err:#}");
+        anyhow::ensure!(
+            msg.contains("invalid cache.pinned_hashes"),
+            "error should be contextualized: {msg}"
         );
         Ok(())
     }
@@ -2335,6 +2558,7 @@ mod tests {
             max_blob_size_mb: None,
             origin_url: None,
             origin_path: None,
+            ..Default::default()
         };
         let resolved = common::test_support::with_home_override(Some(&home), || {
             resolve_cache(&cli, Some(&file), Path::new("/data-dir"))
@@ -2366,6 +2590,7 @@ mod tests {
             max_blob_size_mb: None,
             origin_url: None,
             origin_path: None,
+            ..Default::default()
         };
         let resolved = resolve_cache(&cli, Some(&file), Path::new("/data-dir"))?;
         assert_eq!(resolved.cache_dir, PathBuf::from("/from/file"));
@@ -2401,6 +2626,7 @@ mod tests {
             max_blob_size_mb: Some(50_000),
             origin_url: None,
             origin_path: None,
+            ..Default::default()
         };
         let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
         assert_eq!(resolved.cache_size_mb, 2_048);
@@ -2417,6 +2643,7 @@ mod tests {
             max_blob_size_mb: Some(256),
             origin_url: None,
             origin_path: None,
+            ..Default::default()
         };
         let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
         assert_eq!(resolved.cache_size_mb, 2_048);

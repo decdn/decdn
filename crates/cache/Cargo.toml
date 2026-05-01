@@ -18,6 +18,15 @@ chacha20poly1305 = { workspace = true }
 bytes = { workspace = true }
 serde = { workspace = true }
 reqwest = { workspace = true }
+# Decompression for HttpOrigin (#312). flate2 covers gzip; zstd covers zstd.
+# Both are MIT/Apache-2.0, allowed by deny.toml.
+flate2 = "1"
+zstd = "0.13"
+# Atomic swap of the pinned-hashes set on SIGHUP (#276). Matches the
+# Arc<AtomicU64> pattern used for payment.rate_per_mb (commit 166ae41) — the
+# pinned set is non-Copy so AtomicU64 can't carry it; ArcSwap is the
+# standard fix and is MIT/Apache-2.0.
+arc-swap = "1"
 
 [dev-dependencies]
 tempfile = { workspace = true }
