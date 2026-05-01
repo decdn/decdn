@@ -108,7 +108,7 @@ The core `executeBuyback(address token, uint256 amount, uint256 minTokenOut)` ca
 | Parameter | PoC | Production | Governable |
 | --- | --- | --- | --- |
 | Venue (`setSwapRouter`) | Balancer V3 Router (address on L2) | Balancer V3 Router (address on L2) | Yes (via `setSwapRouter`) |
-| Token approvals spender | Balancer V3 Vault (distinct from Router — approvals go to the Vault even though calls go to the Router) | Same | No (structural V3 requirement) |
+| Token approvals spender | Balancer V3 Vault (distinct from Router — approvals go to the Vault even though calls go to the Router) | Balancer V3 Vault | No (structural V3 requirement) |
 | Pool identifier (`pool`, `address`) | Deployed pool contract address | Deployed pool contract address | Yes (via `setPool`) |
 | Pool weights | 80% TOKEN / 20% USDC | 80% TOKEN / 20% USDC | No (fixed at pool creation) |
 | Pool swap fee | 1% (100 bps) | 1% (100 bps) | Governable on the Balancer pool itself |
@@ -140,7 +140,9 @@ Buyback execution should be enabled by governance vote only when all of the foll
 
 Criteria 1–4 are quantitative; governance voters verify them off-chain before enabling execution. Criterion 2 is a one-time deployment check. Criteria 6 and 7 are hard structural requirements (non-negotiable); criterion 8 is venue-integration health, not a gating requirement.
 
-### Why not Uniswap V3, and when to revisit
+## Alternatives Considered
+
+### Uniswap V3 (and when to revisit)
 
 Uniswap V3 concentrated liquidity remains a reasonable choice *if and when*:
 

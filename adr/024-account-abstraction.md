@@ -40,7 +40,8 @@ This is a mechanical replacement. The EIP-712 domain separators, typed data hash
 | Function | Current | After |
 | --- | --- | --- |
 | `closeChannel` — voucher signature | `ECDSA.recover(digest, sig) == channel.client` | `SignatureChecker.isValidSignatureNow(channel.client, digest, sig)` |
-| `disputeChannel` — voucher signature | Same as `closeChannel` | Same |
+
+`disputeChannel` validates the voucher signature using the same scheme as `closeChannel` and migrates the same way.
 
 **StakingRegistry ([ADR 003](003-payments.md)):**
 
@@ -54,7 +55,6 @@ This is a mechanical replacement. The EIP-712 domain separators, typed data hash
 | Function | Current | After |
 | --- | --- | --- |
 | `submitPhantomChallenge` | `ecrecover` → address A, `ecrecover` → address B, verify A == B | `SignatureChecker.isValidSignatureNow(challengedNode, probeDigest, probeSig)` + `SignatureChecker.isValidSignatureNow(challengedNode, streamDigest, streamSig)` |
-| `submitRateChallenge` | Same pattern as phantom | Same pattern |
 | `submitBlacklistChallenge` | `ecrecover` → address, verify registered | `SignatureChecker.isValidSignatureNow(challengedNode, digest, sig)` |
 | `submitCorruptionChallenge` | `ecrecover` → address, verify registered | `SignatureChecker.isValidSignatureNow(challengedNode, digest, sig)` |
 | `counterChallenge` (rate) | `ecrecover` → verify same node | `SignatureChecker.isValidSignatureNow(challengedNode, digest, sig)` |

@@ -47,13 +47,13 @@ iroh's built-in `DhtDiscovery` (mainline BitTorrent DHT via pkarr) is unrelated 
 
 ---
 
-## §1 — `cdn/dht/v1` Protocol
+### 1. `cdn/dht/v1` Protocol
 
-### §1.1 ALPN and Transport
+#### 1.1 ALPN and Transport
 
 All DHT messages use the ALPN `cdn/dht/v1` over iroh QUIC. Connections are short-lived and request/response oriented — no persistent streams. The same iroh endpoint used for `cdn/probe/v1` and `cdn/client/v1` handles DHT connections.
 
-### §1.2 Message Types
+#### 1.2 Message Types
 
 ```rust
 /// Top-level DHT protocol enum (one variant per request/response pair)
@@ -104,7 +104,7 @@ struct FindNodeResponse {
 }
 ```
 
-### §1.3 Routing Table
+#### 1.3 Routing Table
 
 Each node maintains a Kademlia routing table: **k-buckets** partitioned by XOR distance from the node's own `NodeId` in 256-bit keyspace. NodeIds are already 32-byte ed25519 public keys — no separate DHT key needed.
 
@@ -115,7 +115,7 @@ Each node maintains a Kademlia routing table: **k-buckets** partitioned by XOR d
 | Bucket refresh interval | 1 hour | Keeps routing table fresh |
 | Routing table storage | In-memory | Rebuilt via bootstrap on restart |
 
-### §1.4 Content Records and TTL
+#### 1.4 Content Records and TTL
 
 Content records are stored in-memory at the K nodes closest to the hash in keyspace.
 
@@ -128,7 +128,7 @@ Content records are stored in-memory at the K nodes closest to the hash in keysp
 
 A node **stops re-publishing** when it evicts the blob. Stale records self-expire within TTL — no explicit retraction messages needed.
 
-### §1.5 STORE Flow (Cache Event → DHT Publish)
+#### 1.5 STORE Flow (Cache Event → DHT Publish)
 
 When a node caches blob H:
 
@@ -138,7 +138,7 @@ When a node caches blob H:
 
 The `StoreRequest` signature (ed25519 over `hash || published_at_us`) lets receiving nodes verify the record was created by the claimed holder. Receiving nodes do **not** verify that the holder actually has the blob — that is the probe step's job. A false publisher fails at probe time, degrading its reputation.
 
-### §1.6 FIND_VALUE Flow (Cache Miss → DHT Lookup)
+#### 1.6 FIND_VALUE Flow (Cache Miss → DHT Lookup)
 
 When a node gets a cache miss for hash H and the probe cache is empty:
 
@@ -151,7 +151,7 @@ When a node gets a cache miss for hash H and the probe cache is empty:
 
 **Fallback:** if DHT returns no providers, fall back to broadcast probe fan-out across all known peers (the existing mechanism). If that also returns nothing, the blob is not available in the network.
 
-### §1.7 Bootstrap
+#### 1.7 Bootstrap
 
 On node startup:
 
@@ -163,11 +163,11 @@ At PoC scale (30 nodes) the routing table is fully populated after a single self
 
 ---
 
-## §2 — Popularity Signals and Market Dynamics
+### 2. Popularity Signals and Market Dynamics
 
 Content discovery in an incentive-driven network requires nodes to learn what content is in demand *before* being asked to serve it. Two complementary signals provide this.
 
-### §2.1 Signal 1: `popular_hashes` Gossip (Advisory)
+#### 2.1 Signal 1: `popular_hashes` Gossip (Advisory)
 
 `NodeAnnounce` carries `popular_hashes` (up to 20 hashes, per [ADR 001](001-network.md)) — a self-reported list of the most-requested hashes a node is actively serving. A node observing hash H in multiple peers' `popular_hashes` lists (default: 3+ peers within 10 minutes) treats H as network-popular and prefetches proactively.
 
@@ -175,7 +175,7 @@ Content discovery in an incentive-driven network requires nodes to learn what co
 
 **Suppression is economically self-limiting.** A node hiding popular hash H concentrates all demand on itself. Concentrated demand raises its `LoadHint`. Higher `LoadHint` depresses its unified selection score, causing clients to route around it. Under sustained load, suppressing `popular_hashes` reduces earnings — the market corrects without protocol enforcement. This is accepted: `popular_hashes` affects selection quality, not safety.
 
-### §2.2 Signal 2: DHT FIND_VALUE Query Frequency (Non-Suppressible)
+#### 2.2 Signal 2: DHT FIND_VALUE Query Frequency (Non-Suppressible)
 
 In Kademlia, `FindValueRequest` messages for hash H are routed to nodes closest to H in keyspace **regardless of whether those nodes hold H**. A node close to H in keyspace receives all FIND_VALUE queries for H from the entire network without holding H and without receiving any gossip.
 
@@ -187,7 +187,7 @@ This creates a **natural popularity oracle that cannot be suppressed**:
 
 The signal is honest by construction: FIND_VALUE traffic reflects real client demand, not voluntary self-reporting. No node can suppress it — the routing traffic arrives regardless of what anyone gossips.
 
-### §2.3 Prefetch Decision
+#### 2.3 Prefetch Decision
 
 A node prefetches hash H when **any** signal crosses its threshold:
 
@@ -199,13 +199,13 @@ A node prefetches hash H when **any** signal crosses its threshold:
 
 All three thresholds are configurable. All three trigger the same action: DHT FIND_VALUE lookup to find a provider, pull via `cdn/client/v1` (paid), cache locally, publish STORE record.
 
-### §2.4 No Discovery Fees
+#### 2.4 No Discovery Fees
 
 DHT STORE and FIND_VALUE operations carry no protocol-level fee. The incentive to publish STORE records is indirect: advertising that you hold a blob attracts probe traffic, which converts to paid delivery. Charging for DHT operations would create a new attack surface (collect fee, fail to hold) requiring a new slash condition. All fees remain on delivery.
 
 ---
 
-## §3 — Interaction with Existing Protocols
+### 3. Interaction with Existing Protocols
 
 | Mechanism | Interaction with DHT |
 |-----------|---------------------|
@@ -218,7 +218,7 @@ DHT STORE and FIND_VALUE operations carry no protocol-level fee. The incentive t
 
 ---
 
-## §4 — Schema Evolution
+### 4. Schema Evolution
 
 `cdn/dht/v1` follows the standard evolution model from [ADR 013](013-schema-evolution.md):
 
@@ -230,7 +230,7 @@ DHT STORE and FIND_VALUE operations carry no protocol-level fee. The incentive t
 
 ---
 
-## §5 — Acceptance Criteria
+### 5. Acceptance Criteria
 
 1. A node in a 30-node PoC network can discover providers for a cached blob in ≤3 FIND_VALUE hops.
 2. A node in a 500-node network can discover providers in ≤5 FIND_VALUE hops.
@@ -243,7 +243,7 @@ DHT STORE and FIND_VALUE operations carry no protocol-level fee. The incentive t
 
 ---
 
-## §6 — Alternatives Considered
+## Alternatives Considered
 
 ### Broadcast probe fan-out as primary mechanism
 
@@ -271,7 +271,7 @@ Deferred. `libp2p-kad` is battle-tested but built on libp2p's transport stack. B
 
 ---
 
-## §7 — Cross-ADR Consistency
+## Cross-ADR Consistency
 
 - **ADR 001** Future Work section ("Scaling Content Discovery") is superseded by this ADR. The three strategies listed there are resolved: selective fan-out is subsumed by DHT, content DHT is formalised here, gossip content hints are rejected.
 - **ADR 005** probe protocol is unchanged. DHT provides candidates only.

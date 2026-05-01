@@ -15,4 +15,5 @@
 
 # ADR PDF build output
 /adr/adrs.pdf
+/adr/adrs-book.pdf
 mermaid-filter.err

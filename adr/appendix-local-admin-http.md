@@ -143,16 +143,6 @@ CLI shape:
   method cost with jsonrpsee is one trait method vs. one handler plus
   a routing entry.
 
-### Why not a new iroh ALPN (e.g. `cdn/admin/v1`)?
-
-- The admin surface is a **local operator** tool, not a node-to-node
-  protocol. Running it over iroh would give it NodeId-based auth — useful
-  — but also pull in relay traffic, QUIC handshakes, and the iroh
-  connection lifecycle for what needs to be a zero-dependency,
-  always-on-localhost debug channel.
-- Separating admin from node-to-node protocol boundaries means a buggy
-  admin route cannot affect the CDN wire protocol ALPNs.
-
 ### Why versioned method names (`admin_v1_...`)?
 
 - Admin surfaces accrete methods over time. A version prefix lets us
@@ -210,7 +200,7 @@ CLI shape:
 
 ---
 
-## Alternatives considered
+## Alternatives Considered
 
 - **Hand-rolled hyper with REST-style routes.** The original draft of
   this ADR (and the initial #247 implementation) went this way. It
@@ -227,8 +217,13 @@ CLI shape:
 - **Unix domain socket.** Better multi-user isolation; worse portability
   and higher client-side friction. Revisit if multi-tenant hosts enter
   scope.
-- **New iroh ALPN.** NodeId-based auth is attractive for remote admin,
-  but this surface is specifically not remote.
+- **New iroh ALPN (e.g. `cdn/admin/v1`).** NodeId-based auth is
+  attractive for remote admin, but this surface is specifically not
+  remote — running it over iroh would pull in relay traffic, QUIC
+  handshakes, and the iroh connection lifecycle for what needs to be a
+  zero-dependency, always-on-localhost debug channel. Keeping admin off
+  the iroh ALPNs also means a buggy admin route cannot affect the CDN
+  wire protocol.
 - **Extending `/metrics` with non-Prometheus routes.** Mixes a scraped
   time-series surface with mutating operations; operators would have to
   lock down the metrics endpoint more aggressively than they do today.

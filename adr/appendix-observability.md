@@ -314,7 +314,7 @@ complementary — logs are not a substitute for metrics.
 | Reputation metrics | Not required (reputation system simplified) | Recommended |
 | Watchtower metrics | Not required | Recommended (`decdn_channel_disputes_total`) |
 | Alerting | Operator's choice; reference rules at [`monitoring/prometheus-alerts.yml`](../monitoring/prometheus-alerts.yml) | PagerDuty / Alertmanager integration recommended |
-| Dashboard | Reference Grafana dashboard at [`monitoring/grafana-dashboard.json`](../monitoring/grafana-dashboard.json) | Same dashboard, plus operator-specific extensions |
+| Dashboard | Reference Grafana dashboard at [`monitoring/grafana-dashboard.json`](../monitoring/grafana-dashboard.json) | Reference dashboard plus operator-specific extensions |
 
 ---
 

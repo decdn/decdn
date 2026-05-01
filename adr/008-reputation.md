@@ -307,9 +307,10 @@ The signal is intentionally lightweight (e.g., a small set of region-bucketed de
 
 ### 14. PoC Scope
 
+Local score calculation (EWMA from delivery interactions), initial score (0.5), and the selection floor `max(reputation, 0.1)` apply in both PoC and production. The table below lists only the differences:
+
 | Aspect | PoC | Production |
 | --- | --- | --- |
-| Local score calculation | Implemented (EWMA from delivery interactions) | Same |
 | Network gossip scores | Not implemented (no gossip aggregation) | Full implementation as described |
 | Combined score | Local-only (`final_score = local_score`; no network component) | 70/30 local/network blend |
 | Score decay | Not implemented (scores persist indefinitely) | 10%/week toward 0.5 |
@@ -321,7 +322,6 @@ The signal is intentionally lightweight (e.g., a small set of region-bucketed de
 | Gauge-pool eligibility gating (Section 12) | Not implemented (no gauge pool in PoC; ADR 026 + ADR 027 are post-PoC) | High/Medium/Low receipt-tier gating wired into ADR 027 receipt validation |
 | Regional-coverage signal (Section 13) | Not implemented | Per-operator regional bucket counters published on `cdn/reputation/v1`; consumed by downstream operational programs |
 | Tie-breaking | Simplified: lower load → random | Full 4-tier (load → geo → stake → random) |
-| Initial score | 0.5 (same) | 0.5 |
 
 For PoC, reputation is local-only — each client tracks its own observations of node performance (delivery speed, correctness, reachability) via EWMA. There is no gossip propagation, no decay, and no per-report clamping (the selection floor `max(reputation, 0.1)` from [ADR 001](001-network.md#node-selection-algorithm) still applies). The node selection algorithm in [ADR 001](001-network.md#node-selection-algorithm) uses `final_score = local_score` directly. This exercises the core scoring path (interaction → EWMA → selection weight) without the complexity of cross-node reputation aggregation.
 
