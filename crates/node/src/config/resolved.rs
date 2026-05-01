@@ -65,6 +65,9 @@ pub struct ResolvedCache {
     /// config resolution carries the raw path so resolution stays
     /// filesystem-free and testable without real I/O.
     pub origin_path: Option<PathBuf>,
+    /// Whether to transparently decompress `Content-Encoding: gzip` /
+    /// `zstd` responses from the HTTP origin (#312). Defaults to `true`.
+    pub decompress: bool,
 }
 
 /// Resolved payment fields.

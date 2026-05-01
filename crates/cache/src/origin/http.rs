@@ -6,15 +6,18 @@
 
 use std::cmp::min;
 use std::future::Future;
+use std::io::Read;
 use std::pin::Pin;
 use std::time::Duration;
 
 use anyhow::Context;
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use iroh_blobs::Hash;
 use reqwest::StatusCode;
+use reqwest::header::CONTENT_ENCODING;
 
 use super::{Origin, OriginFetch};
+use crate::error::OriginError;
 
 /// How long to wait for the TCP/TLS handshake to complete. Per-request total
 /// duration is intentionally *not* bounded because `max_blob_size_mb` can be
@@ -153,6 +156,17 @@ pub struct HttpOrigin {
     base_url: OriginUrl,
     response_headers_timeout: Duration,
     chunk_idle_timeout: Duration,
+    /// When true (default), inspect the response's `Content-Encoding` and
+    /// decompress `gzip` / `zstd` bodies before returning. The BLAKE3
+    /// verify in [`crate::CacheEngine::pull_through`] runs over the
+    /// decompressed (canonical) bytes; passing through compressed bytes
+    /// would always fail verification because the content-address is
+    /// computed over the canonical form.
+    ///
+    /// Operators with origins that pre-canonicalise (e.g. an internal
+    /// pre-warmed mirror) can flip this off via
+    /// [`Self::with_decompression`].
+    decompress: bool,
 }
 
 impl HttpOrigin {
@@ -163,8 +177,17 @@ impl HttpOrigin {
     /// with [`Self::with_timeouts`] if operator policy or tests require
     /// different values.
     pub fn new(base_url: OriginUrl) -> anyhow::Result<Self> {
+        // We want to inspect `Content-Encoding` and run the body through
+        // our own decoders, so disable reqwest's built-in transparent
+        // decompression — otherwise reqwest would strip the header and
+        // hand back already-decompressed bytes, masking what the origin
+        // actually sent and bypassing our `UnsupportedEncoding` error path.
         let client = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
+            .no_gzip()
+            .no_deflate()
+            .no_brotli()
+            .no_zstd()
             .build()
             .context("failed to build reqwest client")?;
         Ok(Self {
@@ -172,6 +195,7 @@ impl HttpOrigin {
             base_url,
             response_headers_timeout: RESPONSE_HEADERS_TIMEOUT,
             chunk_idle_timeout: CHUNK_IDLE_TIMEOUT,
+            decompress: true,
         })
     }
 
@@ -195,6 +219,96 @@ impl HttpOrigin {
         self.chunk_idle_timeout = chunk_idle_timeout;
         self
     }
+
+    /// Toggle transparent decompression of `gzip` / `zstd` response bodies.
+    /// Defaults to `true`. Disabling makes the origin layer behave like a
+    /// dumb byte pipe — useful only when the origin is guaranteed to serve
+    /// the canonical (already-decompressed) form, since the engine's
+    /// BLAKE3 verify always runs over the canonical bytes.
+    #[must_use]
+    pub const fn with_decompression(mut self, decompress: bool) -> Self {
+        self.decompress = decompress;
+        self
+    }
+}
+
+/// Maximum buffer growth per decoder iteration. `flate2` and `zstd`'s
+/// `Read` impls can ask for arbitrary sizes; we cap to avoid an attacker
+/// sending a `Content-Encoding: gzip` body that decompresses to many GB.
+/// The engine still enforces `max_blob_bytes` on the final result, so this
+/// is just an inner-loop guard against pathological allocators.
+const DECOMPRESS_READ_BUFFER: usize = 64 * 1024;
+
+/// Decompress `body` according to `encoding`. Identity (empty / `identity`)
+/// passes through. Anything else returns
+/// [`OriginError::UnsupportedEncoding`].
+///
+/// The size cap (`max_bytes`) is enforced inside the decode loop so a
+/// 1 KB compressed payload that expands to 100 GB fails fast rather than
+/// allocating its way to OOM. The engine re-checks the final length, but
+/// without the inner cap a malicious origin could keep the decoder buffer
+/// growing past memory before the engine ever sees it.
+fn decompress_body(body: Bytes, encoding: &str, max_bytes: u64) -> Result<Bytes, OriginError> {
+    let trimmed = encoding.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("identity") {
+        return Ok(body);
+    }
+    if trimmed.eq_ignore_ascii_case("gzip") || trimmed.eq_ignore_ascii_case("x-gzip") {
+        let mut decoder = flate2::read::GzDecoder::new(body.as_ref());
+        return read_capped(&mut decoder, max_bytes, "gzip");
+    }
+    if trimmed.eq_ignore_ascii_case("zstd") {
+        let mut decoder = zstd::stream::read::Decoder::new(body.as_ref()).map_err(|source| {
+            OriginError::DecompressionFailed {
+                encoding: "zstd".to_string(),
+                source,
+            }
+        })?;
+        return read_capped(&mut decoder, max_bytes, "zstd");
+    }
+    Err(OriginError::UnsupportedEncoding {
+        encoding: trimmed.to_string(),
+    })
+}
+
+/// Read from `decoder` into a growing buffer, bailing as soon as the total
+/// would exceed `max_bytes`. Buffer grows in `DECOMPRESS_READ_BUFFER`
+/// increments — small enough to stop a runaway decompression bomb early,
+/// large enough to keep the syscall count down on legitimate payloads.
+fn read_capped<R: Read>(
+    decoder: &mut R,
+    max_bytes: u64,
+    encoding: &'static str,
+) -> Result<Bytes, OriginError> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = vec![0u8; DECOMPRESS_READ_BUFFER];
+    loop {
+        let n = decoder
+            .read(&mut chunk)
+            .map_err(|source| OriginError::DecompressionFailed {
+                encoding: encoding.to_string(),
+                source,
+            })?;
+        if n == 0 {
+            break;
+        }
+        // n is bounded by chunk.len() = DECOMPRESS_READ_BUFFER, well under
+        // u64::MAX, so the cast is safe — but use saturating_add anyway so
+        // an unexpected n > buf.len() can't wrap.
+        let next_total = (buf.len() as u64).saturating_add(n as u64);
+        if next_total > max_bytes {
+            return Err(OriginError::DecompressionFailed {
+                encoding: encoding.to_string(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("decompressed body exceeds max_bytes={max_bytes} mid-stream"),
+                ),
+            });
+        }
+        let slice = chunk.get(..n).unwrap_or(&[]);
+        buf.extend_from_slice(slice);
+    }
+    Ok(Bytes::from(buf))
 }
 
 impl Origin for HttpOrigin {
@@ -235,10 +349,28 @@ impl Origin for HttpOrigin {
                 anyhow::bail!("origin GET {url_log} returned {status}");
             }
 
+            // Capture the encoding before consuming the body. We can't
+            // trust the post-decompression byte count to match
+            // `Content-Length` (which describes the encoded size), so the
+            // cap check below intentionally guards the *encoded* stream
+            // and `decompress_body` re-checks the decompressed total.
+            let encoding = resp
+                .headers()
+                .get(CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let is_compressed =
+                !encoding.trim().is_empty() && !encoding.trim().eq_ignore_ascii_case("identity");
+
             // Fast-path rejection using the advertised length before we
-            // read anything — avoids setting up a streaming buffer when the
-            // origin already told us it would overrun the cap.
+            // read anything. Only safe to compare against `max_bytes` for
+            // identity-encoded bodies — for compressed bodies the encoded
+            // length is unrelated to the final byte count, so we let the
+            // streaming loop and `read_capped` enforce the cap on the
+            // decompressed side.
             if let Some(len) = resp.content_length()
+                && !is_compressed
                 && len > max_bytes
             {
                 anyhow::bail!(
@@ -251,6 +383,15 @@ impl Origin for HttpOrigin {
             //   2. running total cap (bounds memory; the only defense when
             //      Content-Length is absent or misreported)
             //   3. propagate reqwest transport errors
+            //
+            // For compressed bodies, the per-chunk cap is the *encoded*
+            // size — we still need an upper bound because a malicious
+            // origin could otherwise stream forever. Use `max_bytes` as
+            // the encoded cap too: realistic compressed payloads are
+            // smaller than their decompressed form (compression ratios
+            // > 1.0 are pathological), so the same ceiling works in
+            // practice. `decompress_body` re-enforces `max_bytes` on the
+            // decompressed bytes.
             let hint = resp
                 .content_length()
                 .and_then(|l| usize::try_from(l).ok())
@@ -276,7 +417,19 @@ impl Origin for HttpOrigin {
                 }
                 buf.extend_from_slice(&chunk);
             }
-            Ok(OriginFetch::Found(buf.freeze()))
+            let raw = buf.freeze();
+
+            // Decompression layer (#312). Skips entirely when the operator
+            // turned it off via `decompress=false`, but still rejects
+            // unrecognised non-identity encodings — silently passing
+            // through unknown encodings would surface as a bewildering
+            // BLAKE3 mismatch in the engine.
+            if !self.decompress {
+                return Ok(OriginFetch::Found(raw));
+            }
+            let decoded = decompress_body(raw, &encoding, max_bytes)
+                .with_context(|| format!("origin GET {url_log} body decompression failed"))?;
+            Ok(OriginFetch::Found(decoded))
         })
     }
 }

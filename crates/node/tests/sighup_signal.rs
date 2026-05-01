@@ -57,6 +57,7 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
             max_blob_size_mb: 128,
             origin_url: None,
             origin_path: None,
+            decompress: true,
         },
         payment: ResolvedPayment { rate_per_mb: rate },
         observability: ResolvedObservability {

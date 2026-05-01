@@ -437,12 +437,20 @@ fn resolve_cache(
         );
     }
 
+    // Decompression is on by default — most object stores serve compressed
+    // bodies and the BLAKE3 verify in the engine runs over the canonical
+    // (decompressed) form, so silently passing through compressed bytes
+    // would always fail. CLI has no override for this knob (no operator
+    // policy reason to flip it ad-hoc); file-only is sufficient.
+    let decompress = file.and_then(|c| c.decompress).unwrap_or(true);
+
     Ok(ResolvedCache {
         cache_dir,
         cache_size_mb,
         max_blob_size_mb,
         origin_url,
         origin_path,
+        decompress,
     })
 }
 
@@ -1142,6 +1150,7 @@ mod tests {
                 max_blob_size_mb: None,
                 origin_url: None,
                 origin_path: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1183,6 +1192,7 @@ mod tests {
                 max_blob_size_mb: None,
                 origin_url: None,
                 origin_path: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1221,6 +1231,7 @@ mod tests {
                 max_blob_size_mb: None,
                 origin_url: None,
                 origin_path: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1241,6 +1252,11 @@ mod tests {
     // `expand_env` — every expandable field must surface its own dotted
     // path in the error message.
     #[test]
+    // Length crept past 100 lines after `..Default::default()` was
+    // added to every CacheConfig literal in the field-setter table
+    // (#312/#276 PR). The body is a flat list of cases — splitting
+    // wouldn't compress information density.
+    #[allow(clippy::too_many_lines)]
     fn expand_env_per_field_error_context() -> anyhow::Result<()> {
         let missing = "DECDN_UNSET_PER_FIELD_VAR_ZZZ";
         anyhow::ensure!(
@@ -1299,6 +1315,7 @@ mod tests {
                     max_blob_size_mb: None,
                     origin_url: None,
                     origin_path: None,
+                    ..Default::default()
                 });
             }),
             ("cache.origin_url", |c, v| {
@@ -1308,6 +1325,7 @@ mod tests {
                     max_blob_size_mb: None,
                     origin_url: Some(v.to_string()),
                     origin_path: None,
+                    ..Default::default()
                 });
             }),
             ("cache.origin_path", |c, v| {
@@ -1317,6 +1335,7 @@ mod tests {
                     max_blob_size_mb: None,
                     origin_url: None,
                     origin_path: Some(PathBuf::from(v)),
+                    ..Default::default()
                 });
             }),
             ("observability.otlp_endpoint", |c, v| {
@@ -1359,6 +1378,7 @@ mod tests {
                 max_blob_size_mb: None,
                 origin_url: Some("https://origin.example/${HOME}/bucket".to_string()),
                 origin_path: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1430,6 +1450,7 @@ mod tests {
             max_blob_size_mb: None,
             origin_url: Some("https://toml-loses.example/".to_string()),
             origin_path: None,
+            ..Default::default()
         };
         let resolved = resolve_cache(&cli, Some(&toml), std::path::Path::new("/tmp"))?;
         let url = resolved
@@ -1584,6 +1605,28 @@ mod tests {
             "max_blob: {}",
             resolved.max_blob_size_mb
         );
+        Ok(())
+    }
+
+    // ----- decompress (#312) -----
+
+    #[test]
+    fn resolve_cache_defaults_decompress_on() -> anyhow::Result<()> {
+        let cli = cache_cli(None, None);
+        let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
+        anyhow::ensure!(resolved.decompress, "decompress should default to true");
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_decompress_off_via_file() -> anyhow::Result<()> {
+        let cli = cache_cli(None, None);
+        let file = types::CacheConfig {
+            decompress: Some(false),
+            ..types::CacheConfig::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        anyhow::ensure!(!resolved.decompress);
         Ok(())
     }
 
@@ -2335,6 +2378,7 @@ mod tests {
             max_blob_size_mb: None,
             origin_url: None,
             origin_path: None,
+            ..Default::default()
         };
         let resolved = common::test_support::with_home_override(Some(&home), || {
             resolve_cache(&cli, Some(&file), Path::new("/data-dir"))
@@ -2366,6 +2410,7 @@ mod tests {
             max_blob_size_mb: None,
             origin_url: None,
             origin_path: None,
+            ..Default::default()
         };
         let resolved = resolve_cache(&cli, Some(&file), Path::new("/data-dir"))?;
         assert_eq!(resolved.cache_dir, PathBuf::from("/from/file"));
@@ -2401,6 +2446,7 @@ mod tests {
             max_blob_size_mb: Some(50_000),
             origin_url: None,
             origin_path: None,
+            ..Default::default()
         };
         let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
         assert_eq!(resolved.cache_size_mb, 2_048);
@@ -2417,6 +2463,7 @@ mod tests {
             max_blob_size_mb: Some(256),
             origin_url: None,
             origin_path: None,
+            ..Default::default()
         };
         let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
         assert_eq!(resolved.cache_size_mb, 2_048);

@@ -78,6 +78,14 @@ pub struct CacheConfig {
     /// Local filesystem origin root; blobs live at
     /// `{path}/{hex[0..2]}/{hex}`. Mutually exclusive with `origin_url`.
     pub origin_path: Option<PathBuf>,
+    /// Transparently decompress `Content-Encoding: gzip` / `zstd`
+    /// responses from the HTTP origin (#312). Defaults to `true` because
+    /// many object stores serve compressed bodies and the BLAKE3
+    /// content-address is computed over the canonical (decompressed)
+    /// form, so pass-through would always fail verification. Operators
+    /// whose origin is guaranteed to serve canonical bytes can set this
+    /// to `false` to skip the decoder.
+    pub decompress: Option<bool>,
 }
 
 /// Payment section of the config file.

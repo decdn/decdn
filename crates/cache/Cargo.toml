@@ -18,6 +18,10 @@ chacha20poly1305 = { workspace = true }
 bytes = { workspace = true }
 serde = { workspace = true }
 reqwest = { workspace = true }
+# Decompression for HttpOrigin (#312). flate2 covers gzip; zstd covers zstd.
+# Both are MIT/Apache-2.0, allowed by deny.toml.
+flate2 = "1"
+zstd = "0.13"
 
 [dev-dependencies]
 tempfile = { workspace = true }
