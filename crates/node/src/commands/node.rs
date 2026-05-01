@@ -12,7 +12,7 @@ use serde::Deserialize;
 
 use crate::admin::{
     AdminRpcClient, AnnounceResponse, EvictRequest, EvictResponse, HealthResponse, PeerView,
-    PeersResponse,
+    PeersResponse, ReloadResponse,
 };
 use crate::cli;
 use crate::cli::common::expand_tilde;
@@ -65,6 +65,7 @@ pub async fn node_dispatch(
         cli::NodeCommand::Health(h) => health(h, global_config).await,
         cli::NodeCommand::Evict(e) => evict(e, global_config).await,
         cli::NodeCommand::Announce(a) => announce(a, global_config).await,
+        cli::NodeCommand::Reload(r) => reload(r, global_config).await,
     }
 }
 
@@ -187,6 +188,46 @@ pub async fn announce(
         // (no neighbors, transport error) surface as `warn!` lines in the
         // node's own log.
         println!("announce_queued={}", resp.triggered);
+    }
+
+    Ok(())
+}
+
+/// `decdn node reload`: call `admin_v1_reload` on the running node to
+/// re-read the config file it was started with and apply the
+/// hot-reloadable subset (issue #373). Equivalent to `kill -HUP <pid>`
+/// for operators who'd rather not stat the PID — and shares the same
+/// internal mutex, so concurrent SIGHUPs queue rather than race.
+pub async fn reload(args: &cli::ReloadArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        args.timeout_ms > 0,
+        "--timeout-ms must be > 0 (jsonrpsee treats Duration::ZERO as \
+         'never' rather than 'sub-millisecond deadline')"
+    );
+
+    let config_path = args.config.as_deref().or(global_config);
+    let url = resolve_admin_url(args.admin_url.as_deref(), config_path)?;
+
+    let client = HttpClientBuilder::default()
+        .request_timeout(Duration::from_millis(args.timeout_ms))
+        .build(&url)
+        .with_context(|| format!("failed to build admin JSON-RPC client for {url}"))?;
+
+    let resp: ReloadResponse = client
+        .reload()
+        .await
+        .map_err(|err| classify_client_error(&url, args.timeout_ms, err))?;
+
+    if args.json {
+        let pretty =
+            serde_json::to_string_pretty(&resp).context("failed to encode reload response")?;
+        println!("{pretty}");
+    } else {
+        // Two stable, grep-friendly lines so an operator can do
+        // `decdn node reload | grep rate_per_mb=` without `--json`.
+        // Same shape as `decdn node health`'s plain output.
+        println!("rate_per_mb={}", resp.rate_per_mb);
+        println!("log_level={}", resp.log_level);
     }
 
     Ok(())

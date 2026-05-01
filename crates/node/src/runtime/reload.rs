@@ -25,6 +25,21 @@ use crate::config::{
     resolve_payment,
 };
 
+/// Read-only snapshot of the reloadable fields, returned by
+/// [`RuntimeReloadState::current`]. Used by `admin_v1_reload` to report
+/// what's running after a successful reload — operators get back the
+/// values their RPC just applied without having to scrape logs.
+///
+/// `log_level` is `Option` for the same reason `current_log_level` is on
+/// the parent state: the startup `EnvFilter` may have been built from
+/// `RUST_LOG`, in which case there is no `LogLevel` to report until the
+/// first reload commits one.
+#[derive(Debug, Clone, Copy)]
+pub struct ReloadSnapshot {
+    pub rate_per_mb: u64,
+    pub log_level: Option<crate::cli::common::LogLevel>,
+}
+
 /// Closure that swaps the live `EnvFilter` to one matching `level`.
 ///
 /// Boxed so the runtime can hold it without naming the (large, layered)
@@ -170,6 +185,101 @@ impl RuntimeReloadState {
     /// rebuilding the handler.
     pub fn rate_per_mb(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.rate_per_mb)
+    }
+
+    /// Build a state for tests outside `runtime::reload::tests` that need
+    /// to drive `reload()` end-to-end (e.g. `admin::tests` exercising
+    /// `admin_v1_reload`). Centralised here rather than duplicated per
+    /// test module so the boilerplate `ResolvedConfig` for which fields
+    /// reload reads stays in one place — drift between two copies would
+    /// give different test surfaces for the same code path.
+    #[cfg(test)]
+    pub(crate) fn for_test_with_setter(
+        rate_per_mb: u64,
+        level: crate::cli::common::LogLevel,
+        log_level_setter: LogLevelSetter,
+    ) -> Self {
+        use std::path::PathBuf;
+
+        use crate::config::{
+            ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedGossip, ResolvedIdentity,
+            ResolvedNetwork, ResolvedObservability, ResolvedPayment,
+        };
+
+        let cfg = ResolvedConfig {
+            identity: ResolvedIdentity {
+                data_dir: PathBuf::from("/tmp/decdn-test"),
+                region: None,
+            },
+            network: ResolvedNetwork {
+                bind_port: 4433,
+                relay_url: None,
+            },
+            blockchain: ResolvedBlockchain {
+                rpc_url: "http://localhost:8545".into(),
+                eth_keystore: PathBuf::from("/tmp/keystore.json"),
+                payment_channel_address: "0x0000000000000000000000000000000000000001".into(),
+                staking_registry_address: "0x0000000000000000000000000000000000000002".into(),
+                rpc_watchdog_interval_sec: 30,
+            },
+            cache: ResolvedCache {
+                cache_dir: PathBuf::from("/tmp/cache"),
+                cache_size_mb: 1024,
+                max_blob_size_mb: 128,
+                origin_url: None,
+                origin_path: None,
+            },
+            payment: ResolvedPayment { rate_per_mb },
+            observability: ResolvedObservability {
+                log_level: level,
+                log_format: crate::cli::common::LogFormat::Pretty,
+                metrics_port: 9090,
+                metrics_bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                admin_port: Some(9191),
+                otlp_endpoint: None,
+            },
+            gossip: ResolvedGossip {
+                announce_interval_sec: 60,
+                peer_ttl_sec: 600,
+                subscribe_global: false,
+                allowlist: Vec::new(),
+            },
+        };
+        Self::new(
+            crate::cli::run::PaymentArgs { rate_per_mb: None },
+            crate::cli::run::ObservabilityArgs {
+                log_level: None,
+                log_format: None,
+                metrics_port: None,
+                metrics_bind: None,
+                admin_port: None,
+                otlp_endpoint: None,
+            },
+            &cfg,
+            log_level_setter,
+        )
+    }
+
+    /// Snapshot the post-reload values an operator wants to confirm: the
+    /// current `rate_per_mb` and the most recently applied log level.
+    ///
+    /// `log_level` is `None` until the first successful reload — the
+    /// startup `EnvFilter` may have been built from `RUST_LOG` rather
+    /// than the resolved config (see [`Self::new`]'s docs), so reporting
+    /// the resolved-at-startup level there would be misleading. After
+    /// any successful reload the field tracks what the setter actually
+    /// applied.
+    ///
+    /// A poisoned `current_log_level` mutex collapses to `None` rather
+    /// than propagating: the caller is `admin_v1_reload`, which has
+    /// already received an `Ok(())` from `reload()` (so the rate value
+    /// is authoritative); the snapshot is best-effort metadata.
+    pub fn current(&self) -> ReloadSnapshot {
+        let log_level = self.current_log_level.lock().ok().and_then(|guard| *guard);
+        ReloadSnapshot {
+            rate_per_mb: self.rate_per_mb.load(Ordering::Relaxed),
+            log_level,
+        }
     }
 
     /// Re-read the config file at `path` and apply changes to reloadable

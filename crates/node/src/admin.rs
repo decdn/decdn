@@ -16,6 +16,7 @@
 //! same trait without requiring a new transport.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -28,6 +29,8 @@ use jsonrpsee::types::ErrorObjectOwned;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::{RwLock, oneshot};
+
+use crate::runtime::RuntimeReloadState;
 
 /// Cap concurrent admin connections. The surface is local-operator-only,
 /// but an errant operator script looping requests must not be able to
@@ -60,6 +63,24 @@ pub struct AdminState {
     /// RPC method translates that into a "publisher disabled" error so the
     /// operator gets a specific message rather than a generic failure.
     announce_trigger: Option<Arc<AnnounceTrigger>>,
+    /// Hot-reload hook for `admin_v1_reload` (issue #373). `None` when
+    /// the node was started without a config file path (CLI-only flag
+    /// invocation), in which case there's nothing on disk for reload to
+    /// re-read; the RPC method translates that into a "config path
+    /// unset" error so the operator gets a specific message instead of
+    /// silently no-op'ing.
+    reload_hook: Option<ReloadHook>,
+}
+
+/// Pair of values needed by `admin_v1_reload`: the runtime's reload state
+/// (the same `Arc` the SIGHUP arm holds in `runtime::run`'s select loop)
+/// and the path to the config file the operator started with. Bundled so
+/// `AdminState` can carry "both or neither" as a single `Option`, matching
+/// the runtime's "no path → no reload" invariant.
+#[derive(Debug, Clone)]
+pub struct ReloadHook {
+    pub reload_state: Arc<RuntimeReloadState>,
+    pub config_path: PathBuf,
 }
 
 impl AdminState {
@@ -69,6 +90,7 @@ impl AdminState {
         started_at: Instant,
         cache: CacheEngine,
         announce_trigger: Option<Arc<AnnounceTrigger>>,
+        reload_hook: Option<ReloadHook>,
     ) -> Self {
         Self {
             peer_table,
@@ -76,6 +98,7 @@ impl AdminState {
             started_at,
             cache,
             announce_trigger,
+            reload_hook,
         }
     }
 }
@@ -208,6 +231,29 @@ pub struct AnnounceResponse {
     pub triggered: bool,
 }
 
+/// Response body for `admin_v1_reload` (issue #373). Reports the
+/// post-reload values the SIGHUP arm logs to stdout, so operators using
+/// the RPC path get the same after-state confirmation without scraping
+/// `tracing` output. Only the *reloadable* fields appear here: changes
+/// to non-reloadable sections are logged by the reload path itself
+/// (one `info!` per changed-but-ignored field) and aren't echoed in
+/// the RPC response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReloadResponse {
+    /// `payment.rate_per_mb` after the reload. Atomic-loaded *after*
+    /// `RuntimeReloadState::reload` returns `Ok`, so the reported value
+    /// is the one any new probe handler request will see.
+    pub rate_per_mb: u64,
+    /// `observability.log_level` after the reload, lowercase
+    /// (`"trace"` / `"debug"` / `"info"` / `"warn"` / `"error"`) — same
+    /// spelling the resolver and config file accept. `"unknown"` only
+    /// appears on the (unreachable post-success) path where the reload
+    /// committed a level but the snapshot mutex was poisoned by a
+    /// concurrent reader; emitted as a string rather than a literal so
+    /// operator scripts can parse one stable shape.
+    pub log_level: String,
+}
+
 /// JSON-RPC error code: the request shape was wrong (bad hex, etc.).
 /// Matches the standard JSON-RPC 2.0 `Invalid params` code.
 const INVALID_PARAMS_CODE: i32 = -32_602;
@@ -222,6 +268,20 @@ const PUBLISHER_DISABLED_CODE: i32 = -32_001;
 /// (e.g. the underlying iroh-blobs store I/O failed when persisting the
 /// evicted-hash log).
 const CACHE_ERROR_CODE: i32 = -32_002;
+
+/// JSON-RPC error code: the node was started without a config file
+/// path, so `admin_v1_reload` has nothing to re-read. Distinct from
+/// `RELOAD_ERROR_CODE` so an operator script can tell "this node
+/// can't reload, ever, until it's restarted with `--config <path>`"
+/// from "this node tried and failed".
+const CONFIG_PATH_UNSET_CODE: i32 = -32_003;
+
+/// JSON-RPC error code: `RuntimeReloadState::reload` returned an error
+/// (file unreadable, malformed TOML, rejected resolution, mutex poison,
+/// log-level setter failed). Mirrors the SIGHUP arm's "previous values
+/// retained" guarantee — by the time this surfaces, the running config
+/// is unchanged.
+const RELOAD_ERROR_CODE: i32 = -32_004;
 
 /// Admin RPC surface. Versioned via the namespace prefix
 /// (`admin_v1_...`): new methods may be added backwards-compatibly
@@ -248,6 +308,23 @@ pub trait AdminRpc {
     /// `PUBLISHER_DISABLED_CODE` when the publisher is off (no region).
     #[method(name = "announce")]
     async fn announce(&self) -> RpcResult<AnnounceResponse>;
+
+    /// Re-read the config file the node was started with and apply the
+    /// reloadable subset (issue #373) — the same path SIGHUP triggers,
+    /// exposed over the loopback admin surface for operators who want
+    /// scripted control without `kill -HUP`. Both paths share the same
+    /// `RuntimeReloadState::reload`, whose internal mutexes serialise
+    /// concurrent reloads, so a SIGHUP racing this RPC waits behind it
+    /// rather than corrupting state. Returns:
+    ///
+    /// - `CONFIG_PATH_UNSET_CODE` when the node was started without a
+    ///   config path (CLI-only flag invocation has nothing to re-read).
+    /// - `RELOAD_ERROR_CODE` when the reload itself fails — previous
+    ///   values are retained, matching the SIGHUP behaviour.
+    /// - On success: `ReloadResponse` carrying the post-reload
+    ///   `rate_per_mb` and `log_level`.
+    #[method(name = "reload")]
+    async fn reload(&self) -> RpcResult<ReloadResponse>;
 }
 
 /// Convert a [`CacheError`] into a JSON-RPC error suitable for
@@ -351,6 +428,47 @@ impl AdminRpcServer for AdminRpcImpl {
         })?;
         trigger.announce_now();
         Ok(AnnounceResponse { triggered: true })
+    }
+
+    async fn reload(&self) -> RpcResult<ReloadResponse> {
+        let hook = self.state.reload_hook.as_ref().ok_or_else(|| {
+            ErrorObjectOwned::owned(
+                CONFIG_PATH_UNSET_CODE,
+                "no config file path is in use; restart the node with \
+                 --config <path> to enable admin_v1_reload",
+                None::<()>,
+            )
+        })?;
+        // Delegating to `RuntimeReloadState::reload` keeps the SIGHUP
+        // and RPC paths byte-identical: same parse, same resolution,
+        // same "previous values retained on error" contract, and the
+        // same internal mutexes serialise concurrent reloads (a SIGHUP
+        // arriving mid-RPC waits, and vice versa). Surface the error
+        // text via `{err:#}` so the operator sees the underlying
+        // resolution failure rather than a generic wrapper.
+        hook.reload_state
+            .reload(&hook.config_path)
+            .await
+            .map_err(|err| {
+                ErrorObjectOwned::owned(
+                    RELOAD_ERROR_CODE,
+                    format!("config reload failed: {err:#}"),
+                    None::<()>,
+                )
+            })?;
+        let snap = hook.reload_state.current();
+        Ok(ReloadResponse {
+            rate_per_mb: snap.rate_per_mb,
+            // After a successful reload `current_log_level` is `Some`;
+            // the `unwrap_or` branch is the (unreachable in practice)
+            // poisoned-mutex case where `current()` returned `None`.
+            // Returning a stable string ("unknown") rather than the
+            // empty string makes operator scripts that parse the
+            // response trivially unambiguous.
+            log_level: snap
+                .log_level
+                .map_or_else(|| "unknown".to_string(), |l| l.to_string()),
+        })
     }
 
     async fn peers_list(&self) -> RpcResult<PeersResponse> {
@@ -499,6 +617,7 @@ mod tests {
             Instant::now(),
             cache,
             None,
+            None,
         );
         (state, tmp)
     }
@@ -532,6 +651,7 @@ mod tests {
             Instant::now(),
             cache,
             None,
+            None,
         );
         let rpc = AdminRpcImpl::new(state);
 
@@ -555,6 +675,7 @@ mod tests {
             id,
             started,
             cache,
+            None,
             None,
         );
         let rpc = AdminRpcImpl::new(state);
@@ -643,6 +764,7 @@ mod tests {
             Instant::now(),
             cache.clone(),
             None,
+            None,
         );
         let rpc = AdminRpcImpl::new(state);
 
@@ -688,6 +810,7 @@ mod tests {
             [0u8; 32],
             Instant::now(),
             cache,
+            None,
             None,
         );
         let rpc = AdminRpcImpl::new(state);
@@ -737,6 +860,7 @@ mod tests {
             Instant::now(),
             cache,
             Some(trigger),
+            None,
         );
         let rpc = AdminRpcImpl::new(state);
 
@@ -752,6 +876,111 @@ mod tests {
         assert!(
             waited.is_ok(),
             "announce_now did not fire the underlying Notify"
+        );
+    }
+
+    /// `admin_v1_reload` on a node with no `ReloadHook` (started without
+    /// `--config`) must surface `CONFIG_PATH_UNSET_CODE` rather than a
+    /// generic failure, so an operator script can tell "no path on disk
+    /// to re-read" from "reload tried and failed".
+    #[tokio::test]
+    async fn admin_reload_without_hook_returns_config_path_unset() {
+        let (state, _tmp) = state_with(vec![]).await;
+        let rpc = AdminRpcImpl::new(state);
+        let err = rpc.reload().await.expect_err("expected error");
+        assert_eq!(err.code(), -32_003);
+    }
+
+    /// Happy path: a hook pointing at a valid config file applies the
+    /// reload via the same `RuntimeReloadState::reload` SIGHUP uses, and
+    /// the response carries the post-reload `rate_per_mb` and
+    /// `log_level`. Asserts both wire-format fields so a regression that
+    /// dropped one (or stringified the level wrong) fails the unit test.
+    #[tokio::test]
+    async fn admin_reload_applies_and_returns_post_reload_values() {
+        use crate::cli::common::LogLevel;
+        use crate::runtime::RuntimeReloadState;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("node.toml");
+        std::fs::write(
+            &path,
+            "[payment]\nrate_per_mb = 99\n\n[observability]\nlog_level = \"debug\"\n",
+        )
+        .expect("write config");
+
+        let setter: crate::runtime::LogLevelSetter = Box::new(|_| Ok(()));
+        let reload_state = Arc::new(RuntimeReloadState::for_test_with_setter(
+            10,
+            LogLevel::Info,
+            setter,
+        ));
+        let hook = ReloadHook {
+            reload_state: Arc::clone(&reload_state),
+            config_path: path.clone(),
+        };
+        let (cache, _tmp) = test_cache().await;
+        let state = AdminState::new(
+            Arc::new(RwLock::new(PeerTable::new(0))),
+            [0u8; 32],
+            Instant::now(),
+            cache,
+            None,
+            Some(hook),
+        );
+        let rpc = AdminRpcImpl::new(state);
+
+        let resp = rpc.reload().await.expect("reload ok");
+        assert_eq!(resp.rate_per_mb, 99);
+        assert_eq!(resp.log_level, "debug");
+    }
+
+    /// Failure path: a hook pointing at a missing file must surface
+    /// `RELOAD_ERROR_CODE` and the underlying reload state must keep its
+    /// previous values (the SIGHUP arm's "previous values retained"
+    /// contract — we route through the same code, so this is a check
+    /// that the RPC layer didn't accidentally swap an `Ok(...)` somewhere
+    /// in the error mapping).
+    #[tokio::test]
+    async fn admin_reload_with_missing_config_returns_reload_error() {
+        use crate::cli::common::LogLevel;
+        use crate::runtime::RuntimeReloadState;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Path inside a tempdir that we never write to — guaranteed
+        // missing without depending on filesystem state outside the test.
+        let path = dir.path().join("does-not-exist.toml");
+
+        let setter: crate::runtime::LogLevelSetter = Box::new(|_| Ok(()));
+        let reload_state = Arc::new(RuntimeReloadState::for_test_with_setter(
+            42,
+            LogLevel::Info,
+            setter,
+        ));
+        let hook = ReloadHook {
+            reload_state: Arc::clone(&reload_state),
+            config_path: path,
+        };
+        let (cache, _tmp) = test_cache().await;
+        let state = AdminState::new(
+            Arc::new(RwLock::new(PeerTable::new(0))),
+            [0u8; 32],
+            Instant::now(),
+            cache,
+            None,
+            Some(hook),
+        );
+        let rpc = AdminRpcImpl::new(state);
+
+        let err = rpc.reload().await.expect_err("expected error");
+        assert_eq!(err.code(), -32_004);
+        // Previous rate retained — RPC error path didn't accidentally
+        // commit anything to the live state.
+        assert_eq!(
+            reload_state
+                .rate_per_mb()
+                .load(std::sync::atomic::Ordering::Relaxed),
+            42,
         );
     }
 }
