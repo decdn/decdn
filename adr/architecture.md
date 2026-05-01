@@ -539,7 +539,7 @@ orientation only — the observability appendix is authoritative.
 
 ---
 
-## Considered Alternatives
+## Alternatives Considered
 
 A fully decentralized storage model was evaluated: nodes would commit to durable storage with replication factor N, pinning deals, and replication maintenance protocols. This was rejected in favor of centralized storage (S3/R2) + decentralized delivery because:
 

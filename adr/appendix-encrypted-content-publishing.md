@@ -285,7 +285,7 @@ The offline lease intentionally weakens two properties of the online scheme: K_b
 - Per-account audio watermarking — pirated tracks trace back to the source account
 - Behavioral detection — flag accounts that download max tracks, never stream online, and churn subscriptions
 
-## Considered Alternatives
+## Alternatives Considered
 
 ### Client-enforced expiry (timestamp in envelope, no epoch keys)
 

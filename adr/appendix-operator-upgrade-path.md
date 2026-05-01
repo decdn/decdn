@@ -8,7 +8,7 @@ The protocol evolves under the three-tier scheme in ADR 013 (Tier 1 minor, Tier 
 
 This runbook fills that gap. It does not redefine any protocol mechanism.
 
-## §1. Tier overview
+## 1. Tier overview
 
 Per [ADR 013 §Decision](013-schema-evolution.md), each schema change falls into exactly one of three tiers:
 
@@ -20,9 +20,9 @@ Per [ADR 013 §Decision](013-schema-evolution.md), each schema change falls into
 
 The deprecation timeline in [ADR 013 §Deprecation Timeline](013-schema-evolution.md#deprecation-timeline) gives the production schedule (T+0 release, T+4 weeks adoption target, T+12 weeks old-version removal). Operators MUST plan their fleet upgrades against that schedule.
 
-## §2. Tier 1 and Tier 2 operator checklists
+## 2. Tier 1 and Tier 2 operator checklists
 
-### §2.1 Tier 1 — minor evolution
+### 2.1 Tier 1 — minor evolution
 
 A Tier 1 release adds optional fields to existing structs. By construction:
 
@@ -35,7 +35,7 @@ A Tier 1 release adds optional fields to existing structs. By construction:
 
 If you skip a Tier 1 release entirely you remain interoperable indefinitely — peers on the new version simply will not see the optional fields you do not emit.
 
-### §2.2 Tier 2 — medium evolution
+### 2.2 Tier 2 — medium evolution
 
 A Tier 2 release adds new optional message variants (e.g. a `Ping`/`Pong` keepalive on `cdn/client/v1`) or a new gossip envelope version. The ALPN string is unchanged; legacy peers that don't understand the new variant close the stream with `UNSUPPORTED_MESSAGE` and the sender falls back ([ADR 013 §Tier 2](013-schema-evolution.md)).
 
@@ -48,13 +48,13 @@ A Tier 2 release adds new optional message variants (e.g. a `Ping`/`Pong` keepal
 
 Payment channels, watchtower escrows, and stake state are unaffected.
 
-## §3. Tier 3 — major ALPN bump
+## 3. Tier 3 — major ALPN bump
 
 This is the only tier with cross-fleet coordination cost. The ALPN string changes (`cdn/client/v1` → `cdn/client/v2`); a node running only `v1` becomes invisible to clients that have rotated to `v2`-only after the deprecation window.
 
 **Read [ADR 013 §ALPN Version Negotiation](013-schema-evolution.md#alpn-version-negotiation) before starting** — it explains why both versions can run on a single `iroh::Endpoint` simultaneously, which is the entire basis of the rolling-upgrade procedure below.
 
-### §3.1 Pre-cutover (T+0 to T+4 weeks)
+### 3.1 Pre-cutover (T+0 to T+4 weeks)
 
 When a Tier 3 release is announced, you have four weeks of dual-version-supported time to migrate. The release ships a node binary that supports both versions; you do not need to do anything on day zero except read the change set.
 
@@ -66,7 +66,7 @@ When a Tier 3 release is announced, you have four weeks of dual-version-supporte
 | **Watchtower re-coordination.** Watchtowers ([ADR 007](007-watchtower.md)) maintain `voucherStateHash` commitments per channel; a Tier 3 voucher-format change means existing watchtower escrows cover obsolete state. New escrows must be opened against the new format, and the watchtower itself must be on a compatible binary. | Watchtower disputes during the transition are otherwise unwinnable. |
 | **Reputation / receipt continuity.** Receipts ([ADR 027](027-distinct-client-receipts.md)) are signed by the *requester* key; their verifier lives in the node. A Tier 3 receipt-format change is rare but possible — release notes flag it explicitly. | Operators must coordinate with their downstream receipt-using infrastructure (gauge claim) before the cutover. |
 
-### §3.2 Cutover — rolling upgrade (per node)
+### 3.2 Cutover — rolling upgrade (per node)
 
 The release ships a binary that registers **both** ALPN handlers (`v1` and `v2`) on the same `iroh::Endpoint`, per [ADR 013 §Multi-version support](013-schema-evolution.md). This makes the rolling upgrade per-node and zero-downtime in aggregate.
 
@@ -88,7 +88,7 @@ For each node in the fleet, in any order:
 
 If the smoke test fails on the first node, **stop the rollout**, roll the binary back on that node, and investigate. Fleet-wide failures during the dual-version window are recoverable; failures during §3.3 (post-removal) are not.
 
-### §3.3 Post-cutover (T+4 to T+12 weeks)
+### 3.3 Post-cutover (T+4 to T+12 weeks)
 
 By T+4 weeks the entire fleet should be running the dual-version binary. Clients begin preferring the new version per [ADR 013 §Deprecation Timeline](013-schema-evolution.md#deprecation-timeline) — your traffic mix will shift toward `v2`.
 
@@ -101,11 +101,11 @@ By T+4 weeks the entire fleet should be running the dual-version binary. Clients
 
 **At T+12 weeks**, the deprecation timeline says old-version support MAY be removed. Whether to actually remove it depends on the operator-visible traffic mix; it is permitted, not required.
 
-## §4. Coordination touchpoints
+## 4. Coordination touchpoints
 
 A Tier 3 upgrade has three out-of-protocol coordination surfaces. None are automated; all are operator responsibilities.
 
-### §4.1 Watchtowers
+### 4.1 Watchtowers
 
 If you contract with a watchtower ([ADR 007](007-watchtower.md)):
 
@@ -113,21 +113,21 @@ If you contract with a watchtower ([ADR 007](007-watchtower.md)):
 - **For voucher-format changes:** open new watchtower escrows against the new format **before** opening any new payment channels under the new format. Existing escrows for old-format channels remain valid until those channels settle.
 - **Heartbeat continuity:** the watchtower's `voucherStateHash` ([ADR 007](007-watchtower.md)) cycles per heartbeat; a watchtower mid-upgrade may briefly publish a hash for a no-longer-canonical state. Tolerate up to one heartbeat window of inconsistency before alarming.
 
-### §4.2 Clients
+### 4.2 Clients
 
 For Tier 3, clients control the ALPN proposal order. You do not negotiate with them directly, but:
 
 - **Public-facing operators** should coordinate with major client deployments (CDN consumers, not end-users) ahead of the T+0 release. The list of "major clients" is your own operator concern; the protocol does not enumerate them.
 - **Probe traffic during the dual-version window** will arrive on both ALPNs. Both must be answered correctly.
 
-### §4.3 Governance
+### 4.3 Governance
 
 For Tier 3 upgrades that touch governance-controlled parameters (rate bounds in [ADR 003 §Rate Bounds Refresh](003-payments.md), token allowlist in [ADR 010](010-multi-token.md), slashing schedule in [ADR 026 §8](026-gauge-boost-tokenomics.md)):
 
 - The governance proposal that authorises the new behaviour is on its own timeline ([ADR 009](009-governance.md): 7-day vote + 48-hour timelock). The protocol release usually ships **before** the governance vote concludes, with the new behaviour gated on an on-chain flag.
 - Operators MUST verify the relevant on-chain governance state before activating the new behaviour locally — consult the release notes for the specific contract call (e.g. `Governance.upgradeActivated(uint256 versionId)` returns true).
 
-## §5. Failure modes and rollback
+## 5. Failure modes and rollback
 
 | Symptom during Tier 3 rollout | Likely cause | Rollback |
 |-------------------------------|--------------|----------|
@@ -138,7 +138,7 @@ For Tier 3 upgrades that touch governance-controlled parameters (rate bounds in 
 | Watchtower disputes a channel mid-upgrade | Watchtower running an older binary saw a new-format voucher and could not parse it | Resolve via the standard counter-evidence path ([ADR 007](007-watchtower.md)); upgrade the watchtower; do not re-open the channel until both sides are on the new format. |
 | Mass `closeChannel` calls clog the L2 sequencer | Large fleets force-closing all old-format channels at once | Batch the closes across operators; use `forceCloseChannel` only for tokens that were removed from the allowlist; let unforced channels settle naturally over their `maxChannelDuration` (default 90 days per [ADR 010](010-multi-token.md)). |
 
-## §6. What this runbook does not cover
+## 6. What this runbook does not cover
 
 - **In-place protocol downgrades.** Once a Tier 3 release ships, the deprecation timeline is one-directional. Operator software may roll back to the dual-version binary in an emergency, but the protocol does not support reverting from a `v2`-only binary back to `v1`-only after `v1` has been removed.
 - **Cross-chain protocol coordination.** This runbook assumes a single L2 deployment ([`appendix-l2-deployment.md`](appendix-l2-deployment.md)). Future multi-L2 deployments will require a separate per-deployment-coordinator pattern.

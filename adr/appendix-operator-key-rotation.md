@@ -44,7 +44,7 @@ The rotation path differs by which key and by account type. This runbook is a se
 
 If both the iroh and Ethereum keys must rotate, rotate the **iroh key first** (cheap, atomic on-chain, preserves Ethereum identity) and the Ethereum key second (heavyweight). See §4.
 
-## §1. iroh node-key rotation only
+## 1. iroh node-key rotation only
 
 **API used:** `StakingRegistry.bindNodeId(newNodeId, signature)` ([ADR 003 §NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)).
 
@@ -96,7 +96,7 @@ The standalone `bindNodeId` function is intended for rebinding only — it delet
 | Restarted node throws phantom-announcement self-detection | Probe holds were not drained before stop | Stop immediately, file a bug, **do not restart** until the slash-evidence-exposure window (30s per [ADR 005](005-protocol.md)) has elapsed |
 | Peers continue to address the old NodeId | Gossip re-propagation lag | Up to one `node_announce_interval`; if it persists past two intervals, restart gossip subscription |
 
-## §2. Ethereum signing-key rotation only
+## 2. Ethereum signing-key rotation only
 
 The path is account-type-dependent. **Identify the account** before starting:
 
@@ -108,7 +108,7 @@ cast code <addr>      # returns 0x
 cast code <addr>      # returns deployed proxy code
 ```
 
-### §2.1 EOA → EOA migration (PoC default)
+### 2.1 EOA → EOA migration (PoC default)
 
 **There is no rebinding API for the on-chain Ethereum address.** The address is the stake owner — to rotate, the operator must move the entire identity. Expect downtime and a loss of `firstRegisteredAt` (the cold-start bootstrap signal in [ADR 008 §10](008-reputation.md#10-cold-start-bootstrap)).
 
@@ -129,13 +129,13 @@ Procedure:
 
 > **Recommendation.** Treat EOA rotation as a last resort. If at all possible, perform the **one-time migration to a Safe smart account** (§2.2 path) instead of rotating EOA-to-EOA — once on a Safe, all future "key rotations" are owner/session-key swaps with no on-chain identity change.
 
-### §2.2 EOA → Safe migration (one-time, recommended)
+### 2.2 EOA → Safe migration (one-time, recommended)
 
 `SignatureChecker` is wired across every contract per [ADR 024 §1](024-account-abstraction.md), so a Safe is a drop-in replacement for an EOA. The migration itself follows §2.1 (deregister → unbond → withdraw → re-stake from the Safe), but is performed once and yields a stable on-chain identity for all subsequent rotations.
 
 After migration, the Safe holds TOKEN and executes `stake` / `registerNode` / `openChannel` / `closeChannel` / `topUp`. The Safe's owner key is what rotates from then on (§2.3).
 
-### §2.3 Safe owner / session-key rotation (production preferred path)
+### 2.3 Safe owner / session-key rotation (production preferred path)
 
 This is the cheap path — the on-chain Safe address does not change.
 
@@ -156,11 +156,11 @@ Procedure (session-key rotation):
 
 If the old session key is *suspected compromised*, reverse the order: revoke first, then install the new key. Brief slash-signing outage is acceptable to ensure the compromised key cannot be used.
 
-## §3. Voucher session-key rotation (production)
+## 3. Voucher session-key rotation (production)
 
 This is the same as [§2.3 — production](#23-safe-owner--session-key-rotation-production-preferred-path), with no caveats for an iroh-side action.
 
-## §4. Rotating both the iroh and Ethereum keys
+## 4. Rotating both the iroh and Ethereum keys
 
 Rotate **iroh first**, then Ethereum. Specifically:
 
@@ -171,7 +171,7 @@ The reverse order works but is wasteful: §2 takes the node offline for the unbo
 
 Exception: **emergency compromise of the Ethereum key.** If the Ethereum key is the compromised one, run §2 immediately and skip §1 unless the iroh key is also suspected. The on-chain identity is the higher-value target — protect it first.
 
-## §5. Failure modes and rollback
+## 5. Failure modes and rollback
 
 | Scenario | Detection | Rollback |
 |----------|-----------|----------|
@@ -180,7 +180,7 @@ Exception: **emergency compromise of the Ethereum key.** If the Ethereum key is 
 | §2.1 step 7: latent voucher submitted by a counterparty | `closeChannel` event against the old address after deregister | The old keystore must be reachable; the `closeChannel` flow runs against the old address regardless of your registration state |
 | §2.3 session-key revocation fails | Module revert | Revert to the old session key, file a bug; the protocol-level slash signing degrades gracefully (signatures from the still-valid old key continue to be accepted) |
 
-## §6. What this runbook does not cover
+## 6. What this runbook does not cover
 
 - **Client-side iroh-key rotation.** See [ADR 012](012-client.md), the inline "Key rotation" paragraph: open client→node channels survive client iroh-key rotation because they are keyed by the client's Ethereum address, mirroring the operator-side carry-over in §1.
 - **Deferred design decisions:**
