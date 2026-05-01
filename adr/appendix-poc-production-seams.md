@@ -398,41 +398,7 @@ crates/
 
 ## Alternatives Considered
 
-### `cfg!()` macro with `if`/`else` in a single function
-
-Considered (and initially implemented) as:
-
-```rust
-fn network_constants() -> NetworkConstants {
-    if cfg!(feature = "poc") {
-        NetworkConstants::poc()
-    } else {
-        NetworkConstants::production()
-    }
-}
-```
-
-Rejected. `cfg!()` is a macro that evaluates to `true`/`false` at compile time, but **both branches are still compiled**. The compiler may optimize away the dead branch, but this is not guaranteed — PoC types (`FileKeyStore`, `NoopWatchtowerClient`) may be present in the production binary. The `#[cfg()]` attribute form on separate function definitions provides a hard guarantee: excluded code is never compiled, never linked, and never present in the binary.
-
-### Two explicit features: `poc` and `prod`
-
-Considered as an alternative to single `poc` with `not(poc)`. Rejected because it introduces a third invalid state (neither feature set, or both set simultaneously) that requires a `compile_error!` guard to catch. It also makes PoC removal harder: after migration, every `#[cfg(feature = "prod")]` attribute must be stripped from what are now the only implementations. With single `poc` + `not(poc)`, production functions need no attribute changes at all — the `not(poc)` attribute simply disappears with the feature declaration.
-
-### Runtime `NetworkMode` enum throughout
-
-Rejected. Leads to `if mode == PoC` branches scattered across all crates. Makes it impossible to statically verify that no PoC code runs in a production binary.
-
-### Single implementation with `Option`-typed production fields
-
-Rejected. `Option<WatchtowerClient>` forces every call site to unwrap and handle the None case, which is just a verbose runtime mode-check with worse ergonomics.
-
-### Two separate repositories
-
-Rejected. Shared protocol types, cache logic, and contract interaction code is large enough that duplication would create divergence. The trait abstraction achieves the same clean separation within a monorepo.
-
-### Compile-time `#[cfg(feature = "poc")]` throughout all crates
-
-Rejected. Scatters the PoC/production boundary into every crate, making it hard to track all the differences and audit the production surface. Centralizing in `wiring.rs` gives a single readable inventory.
+The six wiring-shape alternatives evaluated against centralised `#[cfg]`-keyed seams (`cfg!()` macro branching, two explicit features, runtime `NetworkMode`, single-impl with `Option` fields, two repositories, scattered `#[cfg]`) are recorded in [`_history/alternatives-pre-launch.md` § PoC/Production Seam Architecture (appendix)](_history/alternatives-pre-launch.md#pocproduction-seam-architecture-appendix).
 
 ---
 

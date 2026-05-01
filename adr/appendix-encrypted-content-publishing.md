@@ -287,29 +287,7 @@ The offline lease intentionally weakens two properties of the online scheme: K_b
 
 ## Alternatives Considered
 
-### Client-enforced expiry (timestamp in envelope, no epoch keys)
-
-The app server wraps `{K_blob, expires_at}` and sends it to the client. The client checks the timestamp before decrypting.
-
-Rejected because a hacked client can ignore the timestamp. Expiry becomes advisory, not enforced. Acceptable for a PoC but not for production subscription gating.
-
-### Decryption proxy (server-side decryption)
-
-A proxy fetches ciphertext from the CDN, decrypts with K_blob, and streams plaintext to the client over TLS. The client never sees any key.
-
-Rejected because it exposes plaintext to a non-authorized intermediary, defeating the "only authorized clients can decrypt" property. It also introduces a centralized bottleneck that undermines the decentralized CDN architecture.
-
-### Proxy re-encryption (PRE)
-
-The origin encrypts under its own key. A re-encryption proxy transforms ciphertext for each authorized client without learning the plaintext.
-
-Rejected for the PoC due to complexity (BLS12-381 pairing-based crypto), performance overhead, and a significant new dependency (`recrypt`). May be revisited post-PoC if delegated access without origin involvement becomes a requirement.
-
-### Per-client encrypted blobs (ECIES per recipient)
-
-Each blob is re-encrypted per client, producing different ciphertexts and different BLAKE3 hashes.
-
-Rejected because it destroys global content-addressing. The same track would have a different hash per client, breaking CDN caching, deduplication, and gossip announcements.
+The four publishing-shape alternatives evaluated against the chosen design (client-enforced expiry, decryption proxy, proxy re-encryption, per-client ECIES) are recorded in [`_history/alternatives-pre-launch.md` § Encrypted Content Publishing (appendix)](_history/alternatives-pre-launch.md#encrypted-content-publishing-appendix).
 
 ## PoC Scope
 

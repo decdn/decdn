@@ -142,24 +142,7 @@ Criteria 1–4 are quantitative; governance voters verify them off-chain before 
 
 ## Alternatives Considered
 
-### Uniswap V3 (and when to revisit)
-
-Uniswap V3 concentrated liquidity remains a reasonable choice *if and when*:
-
-- The treasury has sufficient USDC reserves to seed a 50/50 concentrated range without depleting operational runway, and
-- The team has bandwidth to operate a range-management keeper, and
-- Fee revenue from active management materially exceeds the operational cost.
-
-None of these hold at PoC or early production. A future ADR may introduce a supplemental V3 position alongside the Balancer pool once the treasury accumulates USDC from organic fee flow. Because `IBuybackBurner` is venue-agnostic, adding a second venue does not require changes to this ADR.
-
-**Quantitative revisit triggers (placeholders).** Governance SHOULD consider revisiting the venue decision when any of the following hold. The specific thresholds are placeholders to be tuned in the revisiting ADR once production data is available:
-
-- Treasury USDC reserves exceed 12 months of projected operational runway, freeing capital for a 50/50 V3 range without risking bootstrap subsidies.
-- Monthly Balancer LP fee revenue on the POL position falls below a threshold of protocol fee revenue (placeholder: 5%) for a sustained period (placeholder: 3 months), indicating the pool is under-trafficked.
-- The `BuybackBurner` has been unable to execute a buyback within `slippageBps` for a sustained period due to pool depth, even after POL top-ups.
-- Aggregator routing or CoW Swap coverage of the Balancer pool regresses materially, reducing effective MEV protection or price discovery.
-
-These are governance-policy guidelines, not on-chain enforcement. The revisiting ADR is responsible for setting concrete thresholds informed by production data.
+The Uniswap V3 alternative — including the *if and when to revisit* triggers governance can act on — is recorded in [`_history/alternatives-pre-launch.md` § ADR 018 — Liquidity Strategy](_history/alternatives-pre-launch.md#adr-018--liquidity-strategy).
 
 ## Consequences
 

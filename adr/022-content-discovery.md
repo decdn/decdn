@@ -245,29 +245,7 @@ DHT STORE and FIND_VALUE operations carry no protocol-level fee. The incentive t
 
 ## Alternatives Considered
 
-### Broadcast probe fan-out as primary mechanism
-
-The existing approach in [ADR 001](001-network.md). Generates O(N) probe messages per cache miss. Retained as a bootstrap fallback and emergency fallback when DHT returns no providers. Not suitable as the primary mechanism even at PoC scale, because the O(N) cost is a design ceiling rather than an operational limit — the network should not be architected around it. Probe fan-out is a sound fallback because it is maximally complete: a miss definitively means no node holds the blob.
-
-### Gossip content announcements
-
-Each cache/evict event generates a gossip message. Rejected: unbounded traffic proportional to cache churn, retraction storms under high eviction rates. See Context section.
-
-### Hash-prefix range hints in `NodeAnnounce`
-
-Rejected: economically irrational in an incentive-driven network where nodes cache popular content regardless of hash prefix. See Context section.
-
-### iroh mainline DHT (`DhtDiscovery` / pkarr)
-
-Rejected for this use case. iroh's built-in DHT resolves `NodeId → address` on the public mainline BitTorrent DHT. It does not support content-hash records, is not scoped to the deCDN registered-node set, and exposes lookup patterns to the public internet.
-
-### Indexer nodes (`cdn/search/v1`)
-
-Not rejected — deferred. Dedicated indexer nodes aggregating DHT records into a searchable catalog are a natural complement once the network grows large enough to justify a separate indexing tier. Out of scope for this ADR.
-
-### Full libp2p Kademlia
-
-Deferred. `libp2p-kad` is battle-tested but built on libp2p's transport stack. Bridging to iroh QUIC adds a large dependency and upstream governance coupling. The lightweight subset specified here covers the deCDN use case with ~300–500 lines of Rust.
+The six discovery alternatives evaluated against `cdn/dht/v1` (broadcast probe fan-out as primary, gossip content announcements, hash-prefix range hints, iroh mainline DHT, indexer nodes, full libp2p Kademlia) are recorded in [`_history/alternatives-pre-launch.md` § ADR 022 — Content Discovery at Scale](_history/alternatives-pre-launch.md#adr-022--content-discovery-at-scale).
 
 ---
 

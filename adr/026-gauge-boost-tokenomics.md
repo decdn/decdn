@@ -262,11 +262,7 @@ The 20% floor on the node-base share guarantees operators always receive enough 
 
 ## Alternatives Considered
 
-- **Original tokenomics shape** — 3% flat protocol fee, regressive stake-multiple fee discount, 200M-TOKEN bootstrap fund, 50/50 challenger/burn slashing. **Rejected:** burn was structurally noise (~0.014%/yr supply vs. ~24%/yr vesting per §1); no yield path for passive holders or long-term lockers; the stake-multiple discount weakened the deflationary sink as operators qualified; TOKEN-denominated bootstrap was reflexive against price drops.
-- **Auto-ve-lock-on-vest** — vesting contracts auto-lock released TOKEN into `VotingEscrow` for a fixed term before delivery. **Rejected:** the §3 gauge boost is a stronger voluntary incentive than a forced lock; auto-lock complicates seed/team term sheets and adds audit surface; the thinner-initial-veTOKEN cost is absorbed by §9's optional ve-lock-on-claim airdrop.
-- **USDC distribution to a passive ve-pool** — distribute §6's 7% delegator bucket as USDC directly to ve-lockers (skip USDC→TOKEN swap). **Rejected:** decouples ve-locker yield from TOKEN appreciation, removing the "real yield in TOKEN" lever and the demand-side TWAP buy pressure that compounds with operator-side ve-locking.
-- **Pure-deflationary slashing (50/50 challenger/burn)** — §8 with no SafetyReserve share. **Rejected:** user-harm incidents need a funded recourse path; the 3% router share alone can't seed it at early scale; the 20% burn share preserves a meaningful deflationary lever within §11's `[0%, 25%]` bound.
-- **TOKEN-denominated node-bootstrap fund** — protocol-issued multi-hundred-million-TOKEN fund disbursed to early operators. **Rejected:** subsidy purchasing power tracks TOKEN price (least valuable when most needed); concentrates pre-launch dilution against bootstrap duration rather than network outcomes. Replaced by §10's externally-raised USDC pre-seed.
+The five tokenomics shapes evaluated against this design (original 3%-flat / stake-multiple-discount / 200M-TOKEN-bootstrap / 50-50-burn shape, auto-ve-lock-on-vest, USDC distribution to a passive ve-pool, pure-deflationary slashing, TOKEN-denominated bootstrap fund) are recorded in [`_history/alternatives-pre-launch.md` § ADR 026 — Gauge-Boost Tokenomics](_history/alternatives-pre-launch.md#adr-026--gauge-boost-tokenomics).
 
 ---
 
