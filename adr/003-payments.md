@@ -232,7 +232,7 @@ Node announces a blob as cached (`has_blob: true` in a signed `ProbeResponse`) t
 
 **Resolved: slashable offense.** A same-NodeId signed `ProbeResponse(has_blob: true)` paired with a signed `StreamResponse(ok: false)` or redirect for the same hash within a 30-second requester-anchored timestamp window is on-chain-verifiable evidence. The bare timeout / non-response case is reputation-only (no second signed message → not slashable on-chain). Slash schedule per [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn); on-chain verifier per [ADR 014 § 1](014-on-chain-verification.md#1-ed25519-signature-verification--dual-key-slash-signatures); 24-hour counter-evidence window.
 
-To prevent legitimate cache eviction from producing false slash evidence inside the 30-second window, nodes MUST honour a **probe-triggered eviction hold** (35s, 30s slash window + 5s margin) — see [ADR 005 § Probe-Triggered Eviction Hold](005-protocol.md#probe-triggered-eviction-hold) for the requirement and dependent parameters (probe cache TTL, `probe_hold_duration`). Hold violations under OOM / under-provisioning fall to the same 24-hour counter-window; eviction logs are not on-chain verifiable, so only delivery-receipt counter-evidence rebuts. The protocol does not subsidise under-provisioning.
+To prevent legitimate cache eviction from producing false slash evidence inside the 30-second window, nodes MUST honor a **probe-triggered eviction hold** (35s, 30s slash window + 5s margin) — see [ADR 005 § Probe-Triggered Eviction Hold](005-protocol.md#probe-triggered-eviction-hold) for the requirement and dependent parameters (probe cache TTL, `probe_hold_duration`). Hold violations under OOM / under-provisioning fall to the same 24-hour counter-window; eviction logs are not on-chain verifiable, so only delivery-receipt counter-evidence rebuts. The protocol does not subsidize under-provisioning.
 
 ---
 
@@ -439,7 +439,7 @@ For how nodes validate `rate_per_mb` against cached bounds before signing protoc
 | Function | Purpose |
 | --- | --- |
 | `executeBuyback(token, amount, minTokenOut)` | Governance multisig or `keeper`: swap `amount` of `token` for ≥ `minTokenOut` TOKEN and burn the proceeds. |
-| `setKeeper(addr)` / `setSwapRouter(addr)` / `setPool(addr)` | Governance: rotate the authorised keeper, swap router, or pool. |
+| `setKeeper(addr)` / `setSwapRouter(addr)` / `setPool(addr)` | Governance: rotate the authorized keeper, swap router, or pool. |
 | `setSlippageTolerance(bps)` / `setMinBuybackAmount(n)` / `setMaxBuybackAmount(n)` | Governance: per-call execution guards. |
 | `keeper() → address` / `getAccumulatedFees(token) → uint256` | Views: current keeper and accumulated buyback inflow per token. |
 
