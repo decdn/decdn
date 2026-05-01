@@ -57,6 +57,14 @@ pub async fn run(
     config_path: Option<PathBuf>,
     reload_state: Arc<RuntimeReloadState>,
 ) -> anyhow::Result<()> {
+    // Captured at the very top of `run()`, before any `await` or I/O,
+    // so `admin_v1_health.uptime_s` reflects the entire process lifetime
+    // — including the RPC reachability preflight below (which can spend
+    // up to its 5s timeout on flaky networks). Operators reasoning about
+    // "how long has this node been up?" want every second since `decdn
+    // run` was invoked, not just everything after the admin server bound.
+    let started_at = std::time::Instant::now();
+
     // Preflight: verify RPC endpoint is reachable before committing to
     // port binding. A 5-second timeout keeps startup responsive on flaky
     // networks while still catching typos and dead endpoints early.
@@ -64,12 +72,6 @@ pub async fn run(
 
     let node_metrics = Arc::new(metrics::Metrics::new());
     node_metrics.started();
-
-    // Captured early so `admin_v1_health.uptime_s` reflects the entire
-    // bring-up — operators reasoning about "how long has this node been
-    // up?" want everything after `decdn run` started, not just after
-    // the admin server bound.
-    let started_at = std::time::Instant::now();
 
     let secret_key = identity::load_or_generate(&cfg.identity.data_dir)?;
     tracing::info!(node_id = %secret_key.public(), "loaded node identity");

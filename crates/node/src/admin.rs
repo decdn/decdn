@@ -41,10 +41,13 @@ pub struct AdminState {
     /// wire by `admin_v1_health`, matching the encoding `PeerView`
     /// already uses for peer node ids on `admin_v1_peersList`.
     node_id: [u8; 32],
-    /// Instant the runtime captured "we're up" — used as the origin of
-    /// the `uptime_s` field returned by `admin_v1_health`.
-    /// `Instant` (not `SystemTime`) so wall-clock skew during the
-    /// process's lifetime can't make uptime go backwards.
+    /// Process-start `Instant`, captured by the runtime at the top of
+    /// `run()` before any `await` or I/O. Used as the origin of the
+    /// `uptime_s` field returned by `admin_v1_health`. `Instant` (not
+    /// `SystemTime`) so wall-clock skew during the process's lifetime
+    /// can't make uptime go backwards. May predate `AdminState`
+    /// construction by the time the RPC preflight, identity load, and
+    /// cache open take.
     started_at: Instant,
 }
 
@@ -149,9 +152,10 @@ pub struct HealthResponse {
     /// Lowercase hex of this node's iroh `PublicKey` — same encoding as
     /// `PeerView::node_id`.
     pub node_id: String,
-    /// Whole seconds since the runtime constructed `AdminState`,
-    /// computed from a monotonic `Instant` so wall-clock skew can't
-    /// produce a negative or non-monotonic value.
+    /// Whole seconds since the runtime captured the process-start
+    /// `Instant` at the top of `decdn run` (before any `await`, before
+    /// the RPC preflight). Computed from a monotonic `Instant` so
+    /// wall-clock skew can't produce a negative or non-monotonic value.
     pub uptime_s: u64,
 }
 
