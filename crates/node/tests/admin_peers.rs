@@ -21,7 +21,7 @@ use std::time::Instant;
 use decdn_cache::CacheEngine;
 use decdn_gossip::PeerTable;
 use decdn_node::admin::{self, AdminRpcClient, AdminState};
-use decdn_node::cli::{AnnounceArgs, EvictArgs, HealthArgs, PeersArgs};
+use decdn_node::cli::{AnnounceArgs, EvictArgs, HealthArgs, PeersArgs, ReloadArgs};
 use decdn_node::commands;
 use decdn_protocol::{LoadHint, NodeAnnounce, NodeAnnounceBody};
 use jsonrpsee::core::ClientError;
@@ -81,7 +81,7 @@ async fn spawn_admin(
 async fn peers_list_empty_peer_table() -> anyhow::Result<()> {
     let peer_table = Arc::new(RwLock::new(PeerTable::new(0)));
     let (cache, _tmp) = test_cache().await?;
-    let state = AdminState::new(peer_table, [0u8; 32], Instant::now(), cache, None);
+    let state = AdminState::new(peer_table, [0u8; 32], Instant::now(), cache, None, None);
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
     let client = HttpClientBuilder::default().build(&url)?;
@@ -115,6 +115,7 @@ async fn peers_list_seeded_entries_sorted_desc() -> anyhow::Result<()> {
         [0u8; 32],
         Instant::now(),
         cache,
+        None,
         None,
     );
     let (url, stop_tx, join) = spawn_admin(state).await?;
@@ -151,7 +152,7 @@ async fn health_returns_hex_node_id_and_uptime() -> anyhow::Result<()> {
     let peer_table = Arc::new(RwLock::new(PeerTable::new(0)));
     let id = [0xABu8; 32];
     let (cache, _tmp) = test_cache().await?;
-    let state = AdminState::new(peer_table, id, Instant::now(), cache, None);
+    let state = AdminState::new(peer_table, id, Instant::now(), cache, None, None);
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
     let client = HttpClientBuilder::default().build(&url)?;
@@ -178,7 +179,7 @@ async fn health_returns_hex_node_id_and_uptime() -> anyhow::Result<()> {
 async fn unknown_method_returns_method_not_found() -> anyhow::Result<()> {
     let peer_table = Arc::new(RwLock::new(PeerTable::new(0)));
     let (cache, _tmp) = test_cache().await?;
-    let state = AdminState::new(peer_table, [0u8; 32], Instant::now(), cache, None);
+    let state = AdminState::new(peer_table, [0u8; 32], Instant::now(), cache, None, None);
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
     let client = HttpClientBuilder::default().build(&url)?;
@@ -391,11 +392,59 @@ async fn cli_announce_rejects_zero_timeout() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Same coverage on `decdn node reload`: surface the connection-refused
+/// hint when the admin port is dead. The unit tests in `admin.rs` cover
+/// the server-side branches; this guards the CLI's
+/// `classify_client_error` path so a regression there can't reach
+/// operators as a silent hang or unhelpful message.
+#[tokio::test]
+async fn cli_reload_surfaces_connection_refused() -> anyhow::Result<()> {
+    let (listener, addr) = bind_loopback().await?;
+    drop(listener);
+
+    let args = ReloadArgs {
+        admin_url: Some(format!("http://{addr}")),
+        config: None,
+        json: false,
+        timeout_ms: 2_000,
+    };
+    let err = commands::reload(&args, None)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("expected connection-refused error"))?
+        .to_string();
+    assert!(
+        err.contains("refused"),
+        "error should mention 'refused', got: {err}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn cli_reload_rejects_zero_timeout() -> anyhow::Result<()> {
+    let args = ReloadArgs {
+        admin_url: Some("http://127.0.0.1:1".to_string()),
+        config: None,
+        json: false,
+        timeout_ms: 0,
+    };
+    let err = commands::reload(&args, None)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("expected zero-timeout error"))?
+        .to_string();
+    assert!(
+        err.contains("--timeout-ms"),
+        "error should mention the flag, got: {err}"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn admin_shutdown_closes_listener() -> anyhow::Result<()> {
     let peer_table = Arc::new(RwLock::new(PeerTable::new(0)));
     let (cache, _tmp) = test_cache().await?;
-    let state = AdminState::new(peer_table, [0u8; 32], Instant::now(), cache, None);
+    let state = AdminState::new(peer_table, [0u8; 32], Instant::now(), cache, None, None);
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
     // Baseline: server is up.

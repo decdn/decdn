@@ -6,7 +6,7 @@
 
 pub mod node;
 
-pub use node::{announce, evict, health, node_dispatch, peers};
+pub use node::{announce, evict, health, node_dispatch, peers, reload};
 
 use crate::{cli, config, identity, runtime};
 

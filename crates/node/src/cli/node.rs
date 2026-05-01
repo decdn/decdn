@@ -36,6 +36,18 @@ pub enum NodeCommand {
     /// `decdn-gossip::AnnounceTrigger`), and a successful response means
     /// the request was queued, not that it has hit the wire.
     Announce(AnnounceArgs),
+    /// Re-read the running node's config file and apply hot-reloadable
+    /// fields (issue #373). Equivalent to `kill -HUP <pid>` but goes
+    /// through the loopback admin surface, so operator tooling that
+    /// already speaks JSON-RPC doesn't need to also know which PID to
+    /// signal. Currently `payment.rate_per_mb` and
+    /// `observability.log_level` are reloadable; other fields are logged
+    /// as ignored. Both paths share the same internal mutex, so a
+    /// concurrent SIGHUP and `decdn node reload` queue rather than
+    /// race. Requires the node to have been started with `decdn run
+    /// --config <path>` — without a path on disk there's nothing to
+    /// re-read.
+    Reload(ReloadArgs),
 }
 
 /// `decdn node health` — report identity (hex `node_id`) and process
@@ -119,6 +131,33 @@ pub struct AnnounceArgs {
     pub config: Option<PathBuf>,
 
     /// Emit the admin response as JSON instead of a one-line confirmation.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Roundtrip timeout in milliseconds.
+    #[arg(long, value_name = "MS", default_value_t = 5_000)]
+    pub timeout_ms: u64,
+}
+
+/// `decdn node reload` — re-read the running node's config file via
+/// `admin_v1_reload` (issue #373) and print the post-reload `rate_per_mb`
+/// and `log_level`.
+#[derive(Args, Debug)]
+pub struct ReloadArgs {
+    /// Base URL of the node's admin HTTP surface. See `health --admin-url`
+    /// for resolution precedence (flag → env → config → default).
+    #[arg(long, value_name = "URL", env = "DECDN_ADMIN_URL")]
+    pub admin_url: Option<String>,
+
+    /// Path to the TOML config file used to derive the admin URL when
+    /// `--admin-url` / `DECDN_ADMIN_URL` are unset. Note: this argument
+    /// only locates the *running node's admin port*; the node re-reads
+    /// the path it was started with, not this one — passing a different
+    /// file here will not redirect the reload.
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+
+    /// Emit the admin response as JSON instead of two human-readable lines.
     #[arg(long)]
     pub json: bool,
 

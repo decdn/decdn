@@ -2,7 +2,7 @@
 
 pub mod reload;
 
-pub use reload::{LogLevelSetter, RuntimeReloadState};
+pub use reload::{LogLevelSetter, ReloadSnapshot, RuntimeReloadState};
 
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -216,12 +216,23 @@ pub async fn run(
     // would have failed startup before any side-effectful subscribes ran.
     let admin_stop_tx = if let Some(listener) = admin_listener {
         let (tx, rx) = oneshot::channel::<()>();
+        // Build the reload hook only when a config file path was passed
+        // (CLI-only invocation has nothing on disk to re-read). The
+        // hook hands `admin_v1_reload` the same `RuntimeReloadState` and
+        // file path the SIGHUP arm uses, so both paths converge on a
+        // single mutex-serialised reload — see `admin::AdminRpcImpl::reload`
+        // and the SIGHUP arm of the select loop below.
+        let reload_hook = config_path.as_ref().map(|path| admin::ReloadHook {
+            reload_state: Arc::clone(&reload_state),
+            config_path: path.clone(),
+        });
         let state = admin::AdminState::new(
             Arc::clone(&peer_table),
             *secret_key.public().as_bytes(),
             started_at,
             cache.clone(),
             announce_trigger,
+            reload_hook,
         );
         tasks.spawn(async move {
             if let Err(err) = admin::serve(listener, state, rx).await {
