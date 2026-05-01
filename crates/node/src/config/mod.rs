@@ -2321,7 +2321,12 @@ mod tests {
 
     #[test]
     fn resolve_cache_cli_cache_dir_overrides_file_and_expands_tilde() -> anyhow::Result<()> {
-        let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("test requires home dir"))?;
+        // Hermetic: inject a stub home so the assertion holds whether or
+        // not the host's `dirs::home_dir()` returns Some, and so the
+        // assertion exercises the documented production behaviour
+        // (tilde-expand against $HOME).
+        let home_dir = TempDir::new()?;
+        let home = home_dir.path().to_path_buf();
         let mut cli = empty_cache_args();
         cli.cache_dir = Some(PathBuf::from("~/from-cli"));
         let file = types::CacheConfig {
@@ -2331,8 +2336,24 @@ mod tests {
             origin_url: None,
             origin_path: None,
         };
-        let resolved = resolve_cache(&cli, Some(&file), Path::new("/data-dir"))?;
+        let resolved = common::test_support::with_home_override(Some(&home), || {
+            resolve_cache(&cli, Some(&file), Path::new("/data-dir"))
+        })?;
         assert_eq!(resolved.cache_dir, home.join("from-cli"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_cli_cache_dir_passes_through_when_home_unavailable() -> anyhow::Result<()> {
+        // Sibling of the above: the production contract is "log + leave
+        // path unchanged" when `dirs::home_dir()` is None (see
+        // `cli::common::expand_tilde`). Verify resolve_cache honours it.
+        let mut cli = empty_cache_args();
+        cli.cache_dir = Some(PathBuf::from("~/from-cli"));
+        let resolved = common::test_support::with_home_override(None, || {
+            resolve_cache(&cli, None, Path::new("/data-dir"))
+        })?;
+        assert_eq!(resolved.cache_dir, PathBuf::from("~/from-cli"));
         Ok(())
     }
 
@@ -2613,38 +2634,43 @@ staking_registry_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
     #[test]
     fn load_file_config_returns_default_when_path_is_none_and_default_absent() -> anyhow::Result<()>
     {
-        // Implicit-path branch of load_file_config: when no explicit path
-        // is given and the documented default location does not exist,
-        // resolution must fall back to FileConfig::default() — operators
-        // running `decdn` without a config file rely on this.
+        // Implicit-path branch of load_file_config: when no explicit
+        // path is given and the documented default location does not
+        // exist, resolution must fall back to FileConfig::default() —
+        // operators running `decdn` without a config file rely on this.
         //
-        // Test invariant: the user's own ~/.decdn/node.toml may or may not
-        // exist on this host; this test asserts the *contract* (default ↔
-        // `FileConfig::default()`) only when the precondition holds.
-        let default_path = common::default_config_path();
-        match default_path {
-            Some(p) if p.exists() => {
-                // Test host has a real config file at the default location;
-                // the "absent default" branch can't be exercised without
-                // mutating $HOME, which is unsafe under edition 2024.
-                eprintln!(
-                    "skipping: default config path exists at {} (would be \
-                     the wrong precondition for this branch)",
-                    p.display()
-                );
-            }
-            _ => {
-                let cfg = load_file_config(None)?;
-                // FileConfig::default() leaves every section as None.
-                assert!(cfg.identity.is_none());
-                assert!(cfg.network.is_none());
-                assert!(cfg.blockchain.is_none());
-                assert!(cfg.cache.is_none());
-                assert!(cfg.payment.is_none());
-                assert!(cfg.observability.is_none());
-                assert!(cfg.gossip.is_none());
-            }
-        }
+        // Hermetic: pin the home directory to a fresh TempDir so the
+        // default config path (`<home>/.decdn/node.toml`) is guaranteed
+        // absent regardless of the test host's real `~/.decdn/`.
+        let home_dir = TempDir::new()?;
+        let cfg = common::test_support::with_home_override(Some(home_dir.path()), || {
+            load_file_config(None)
+        })?;
+        // FileConfig::default() leaves every section as None.
+        assert!(cfg.identity.is_none());
+        assert!(cfg.network.is_none());
+        assert!(cfg.blockchain.is_none());
+        assert!(cfg.cache.is_none());
+        assert!(cfg.payment.is_none());
+        assert!(cfg.observability.is_none());
+        assert!(cfg.gossip.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn load_file_config_returns_default_when_home_unavailable() -> anyhow::Result<()> {
+        // Sibling of the above: when `dirs::home_dir()` is None (e.g.
+        // minimal containers) `default_config_path()` is None, and the
+        // implicit-path branch must still fall back to defaults rather
+        // than erroring.
+        let cfg = common::test_support::with_home_override(None, || load_file_config(None))?;
+        assert!(cfg.identity.is_none());
+        assert!(cfg.network.is_none());
+        assert!(cfg.blockchain.is_none());
+        assert!(cfg.cache.is_none());
+        assert!(cfg.payment.is_none());
+        assert!(cfg.observability.is_none());
+        assert!(cfg.gossip.is_none());
         Ok(())
     }
 
