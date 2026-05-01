@@ -419,20 +419,46 @@ impl Origin for HttpOrigin {
             }
             let raw = buf.freeze();
 
-            // Decompression layer (#312). Skips entirely when the operator
-            // turned it off via `decompress=false`, but still rejects
-            // unrecognised non-identity encodings — silently passing
-            // through unknown encodings would surface as a bewildering
-            // BLAKE3 mismatch in the engine.
+            // Decompression layer (#312). When the operator opts out via
+            // `decompress=false` we still validate the encoding: a
+            // gzip-encoded response served as raw bytes would later trip
+            // a BLAKE3 mismatch in the engine, which is a much harder
+            // failure mode to debug than a clear `UnsupportedEncoding`
+            // error here.
             if !self.decompress {
+                if is_compressed {
+                    return Err(crate::error::OriginError::UnsupportedEncoding { encoding }.into());
+                }
                 return Ok(OriginFetch::Found(raw));
             }
-            let decoded = decompress_body(raw, &encoding, max_bytes)
-                .with_context(|| format!("origin GET {url_log} body decompression failed"))?;
+            // Sync decompression on big payloads would block a tokio
+            // worker the same way BLAKE3 does (engine.rs uses
+            // `spawn_blocking` above 1 MiB). Mirror that policy here so
+            // a 10 GB gzipped origin can't starve the executor.
+            let decoded = if raw.len() <= DECOMPRESS_BLOCKING_THRESHOLD {
+                decompress_body(raw, &encoding, max_bytes)
+            } else {
+                let raw_for_decode = raw;
+                let encoding_for_decode = encoding.clone();
+                tokio::task::spawn_blocking(move || {
+                    decompress_body(raw_for_decode, &encoding_for_decode, max_bytes)
+                })
+                .await
+                .with_context(|| {
+                    format!("origin GET {url_log} body decompression task failed to join")
+                })?
+            }
+            .with_context(|| format!("origin GET {url_log} body decompression failed"))?;
             Ok(OriginFetch::Found(decoded))
         })
     }
 }
+
+/// Above this size we pay the `spawn_blocking` round-trip rather than
+/// hold a tokio worker through a synchronous `flate2`/`zstd` decode.
+/// Mirrors `engine.rs::CacheEngine::BLOCKING_HASH_THRESHOLD` so the
+/// crossover point is consistent across the cache hot path.
+const DECOMPRESS_BLOCKING_THRESHOLD: usize = 1 << 20; // 1 MiB
 
 #[cfg(test)]
 mod tests {

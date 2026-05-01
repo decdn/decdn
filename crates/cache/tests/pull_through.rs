@@ -625,13 +625,13 @@ async fn http_origin_rejects_unknown_encoding() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn http_origin_decompress_off_passes_through_compressed_bytes() -> anyhow::Result<()> {
-    // With `decompress=false`, the origin returns raw compressed bytes —
-    // and the engine's BLAKE3 verify must reject them, because the
-    // content-address is computed over the *canonical* form. This
-    // confirms (a) the toggle takes effect and (b) the verify still
-    // catches the configuration mistake instead of silently caching
-    // garbage.
+async fn http_origin_decompress_off_rejects_compressed_response() -> anyhow::Result<()> {
+    // With `decompress=false`, an origin that still returns
+    // `Content-Encoding: gzip` is a configuration mistake. We refuse
+    // up-front rather than passing the raw bytes through and letting
+    // the engine surface a confusing `HashMismatch` — operators get a
+    // precise "your origin is using an encoding I'm not handling"
+    // message they can act on.
     let payload: &[u8] = b"canonical payload";
     let hash = Hash::new(payload);
     let server = MockServer::start().await;
@@ -650,9 +650,36 @@ async fn http_origin_decompress_off_passes_through_compressed_bytes() -> anyhow:
     let origin = Arc::new(HttpOrigin::parse(&server.uri())?.with_decompression(false));
     let engine = CacheEngine::open(tmp.path(), Some(origin), 16).await?;
     let err = err_of(engine.get(hash).await)?;
+    let formatted = format!("{err:?}");
     anyhow::ensure!(
-        matches!(err, CacheError::HashMismatch { .. }),
-        "expected HashMismatch when decompression is off, got: {err:?}"
+        matches!(err, CacheError::OriginError { .. }),
+        "expected OriginError when decompression is off and encoding is set, got: {formatted}"
     );
+    anyhow::ensure!(
+        formatted.contains("unsupported Content-Encoding") || formatted.contains("gzip"),
+        "error should name the unsupported encoding: {formatted}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn http_origin_decompress_off_passes_through_identity() -> anyhow::Result<()> {
+    // The opt-out path is still useful for origins that legitimately
+    // serve raw bytes (no Content-Encoding, or `identity`). The hash
+    // must match because we never touched the bytes.
+    let payload: &[u8] = b"canonical payload";
+    let hash = Hash::new(payload);
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload.to_vec()))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir()?;
+    let origin = Arc::new(HttpOrigin::parse(&server.uri())?.with_decompression(false));
+    let engine = CacheEngine::open(tmp.path(), Some(origin), 16).await?;
+    let bytes = engine.get(hash).await?;
+    anyhow::ensure!(bytes.as_ref() == payload, "unexpected payload");
     Ok(())
 }

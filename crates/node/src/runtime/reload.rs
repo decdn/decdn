@@ -178,9 +178,21 @@ impl RuntimeReloadState {
     /// before the SIGHUP select loop runs — see `runtime::run`.
     /// Detaching is permitted (pass `None`) but production code never
     /// needs to: the engine outlives the reload state by construction.
+    ///
+    /// A poisoned mutex during attach is recovered (the `PoisonError` is
+    /// owned by `std::sync::Mutex` and lets us still grab the inner
+    /// guard) — silently no-op'ing here would leave reloads as a silent
+    /// no-op forever after a panic on some other thread, which is
+    /// exactly the silent-failure mode this pattern exists to prevent.
     pub fn attach_cache(&self, engine: Option<decdn_cache::CacheEngine>) {
-        if let Ok(mut guard) = self.cache.lock() {
-            *guard = engine;
+        match self.cache.lock() {
+            Ok(mut guard) => *guard = engine,
+            Err(poisoned) => {
+                tracing::error!(
+                    "runtime reload cache mutex poisoned during attach; recovering inner state"
+                );
+                *poisoned.into_inner() = engine;
+            }
         }
     }
 
@@ -278,14 +290,18 @@ impl RuntimeReloadState {
                 }
             };
 
-        // Lock both caches *before* any committing side-effect. Holding
-        // both guards across the rest of the function serialises
-        // concurrent reloads (a second SIGHUP racing the first one
-        // waits here) and lets us treat the whole "apply log level +
-        // swap rate + write back" path as one critical section.
-        // Acquiring the locks here is the *last* fallible step:
-        // PoisonError must surface before the setter or the atomic
-        // swap commit anything to live state.
+        // Lock the snapshot mutexes *and* the cache attach slot before
+        // any committing side-effect. Holding all three guards across
+        // the rest of the function serialises concurrent reloads (a
+        // second SIGHUP racing the first one waits here) and lets us
+        // treat the whole "apply log level + swap rate + swap pinned
+        // set + write back" path as one critical section. Acquiring
+        // the locks here is the *last* fallible step: a `PoisonError`
+        // on any of them must surface before the setter, the atomic
+        // swap, or the pinned-set swap commit anything to live state —
+        // otherwise a poisoned cache mutex would let `rate_per_mb`
+        // update while the pinned set silently drops, violating the
+        // "previous values retained on error" contract.
         let mut current = self
             .current_log_level
             .lock()
@@ -294,6 +310,10 @@ impl RuntimeReloadState {
             .last_file_sections
             .lock()
             .map_err(|_| anyhow::anyhow!("file-section snapshot mutex poisoned"))?;
+        let cache_guard = self
+            .cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("cache attach mutex poisoned"))?;
 
         // Diff non-reloadable sections against the previous snapshot
         // before committing. Emitting "ignored" lines is read-only and
@@ -328,19 +348,19 @@ impl RuntimeReloadState {
             .rate_per_mb
             .swap(new_payment.rate_per_mb, Ordering::Relaxed);
         let pinned_count = new_pinned.len();
-        // Swap the cache engine's pinned set if a cache is attached. The
-        // `if let` does nothing when the runtime hasn't attached one yet
-        // (unit tests, early startup) — that's fine; tests assert the
-        // count behaviour separately.
-        if let Ok(cache_guard) = self.cache.lock()
-            && let Some(engine) = cache_guard.as_ref()
-        {
+        // Swap the cache engine's pinned set if a cache is attached.
+        // `cache_guard` was acquired up top with the rest of the
+        // mutexes, so a poisoned mutex was already returned as an error
+        // before any commit step. `None` here is the no-cache-attached
+        // case (unit tests, very early startup) and a routine no-op.
+        if let Some(engine) = cache_guard.as_ref() {
             let _prev_pinned = engine.set_pinned(new_pinned);
         }
         *current = Some(new_level);
         *sections = FileSectionSnapshot::capture(&file);
         drop(current);
         drop(sections);
+        drop(cache_guard);
 
         tracing::info!(
             rate_per_mb = new_payment.rate_per_mb,
@@ -1062,7 +1082,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let h1 = make_hex_hash(1);
         let h2 = make_hex_hash(2);
-        let body = format!("[cache]\npinned_hashes = [\"{h1}\", \"{h2}\"]\n",);
+        let body = format!("[cache]\npinned_hashes = [\"{h1}\", \"{h2}\"]\n");
         let path = write_config(dir.path(), &body);
 
         let initial = seed_resolved(10, LogLevel::Info);
