@@ -19,10 +19,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
-use decdn_gossip::{PeerEntry, PeerTable};
+use decdn_cache::{CacheEngine, CacheError, Hash};
+use decdn_gossip::{AnnounceTrigger, PeerEntry, PeerTable};
 use jsonrpsee::core::{RpcResult, async_trait};
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::server::{Server, ServerConfig};
+use jsonrpsee::types::ErrorObjectOwned;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::{RwLock, oneshot};
@@ -49,6 +51,15 @@ pub struct AdminState {
     /// construction by the time the RPC preflight, identity load, and
     /// cache open take.
     started_at: Instant,
+    /// Cache engine handle for `admin_v1_evict` (issue #279). The engine
+    /// is `Clone` (its `Arc<Inner>` is shared), so cloning into
+    /// `AdminState` is cheap.
+    cache: CacheEngine,
+    /// One-shot announce trigger for `admin_v1_announce` (issue #280).
+    /// `None` when the publisher is disabled (no region configured); the
+    /// RPC method translates that into a "publisher disabled" error so the
+    /// operator gets a specific message rather than a generic failure.
+    announce_trigger: Option<Arc<AnnounceTrigger>>,
 }
 
 impl AdminState {
@@ -56,11 +67,15 @@ impl AdminState {
         peer_table: Arc<RwLock<PeerTable>>,
         node_id: [u8; 32],
         started_at: Instant,
+        cache: CacheEngine,
+        announce_trigger: Option<Arc<AnnounceTrigger>>,
     ) -> Self {
         Self {
             peer_table,
             node_id,
             started_at,
+            cache,
+            announce_trigger,
         }
     }
 }
@@ -159,6 +174,55 @@ pub struct HealthResponse {
     pub uptime_s: u64,
 }
 
+/// Request body for `admin_v1_evict` (issue #279).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvictRequest {
+    /// Hex of the BLAKE3 hash to evict. Must be exactly 64 hex characters
+    /// (mixed case accepted, optional `0x`/`0X` prefix tolerated); rejected
+    /// at the server with `INVALID_PARAMS` otherwise.
+    pub hash: String,
+}
+
+/// Response body for `admin_v1_evict`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvictResponse {
+    /// Whether the hash was present in the cache *before* the evict ran.
+    /// `false` means the operator's evict was a no-op safety measure (the
+    /// blob was never cached or had already been evicted). The eviction
+    /// is durable in either case — a future `decdn run` against the same
+    /// cache directory will continue to refuse to serve the hash.
+    pub was_present: bool,
+}
+
+/// Response body for `admin_v1_announce` (issue #280).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnnounceResponse {
+    /// Always `true` on a non-error response — the request landed on the
+    /// publisher task's notify slot. This is "queued", not "delivered":
+    /// the actual gossip broadcast happens asynchronously after this RPC
+    /// returns and may still fail (no neighbors, transport error), in
+    /// which case the publisher emits a `warn!` log line. The "publisher
+    /// disabled" case (no region configured) returns
+    /// `PUBLISHER_DISABLED_CODE` rather than `triggered: false` so
+    /// operators get a specific message.
+    pub triggered: bool,
+}
+
+/// JSON-RPC error code: the request shape was wrong (bad hex, etc.).
+/// Matches the standard JSON-RPC 2.0 `Invalid params` code.
+const INVALID_PARAMS_CODE: i32 = -32_602;
+
+/// JSON-RPC error code: the server can't satisfy this method right now.
+/// Used when `admin_v1_announce` is invoked on a node whose gossip
+/// publisher is disabled (no region configured) — operators get a
+/// specific message instead of a generic failure.
+const PUBLISHER_DISABLED_CODE: i32 = -32_001;
+
+/// JSON-RPC error code: the cache layer reported an error during evict
+/// (e.g. the underlying iroh-blobs store I/O failed when persisting the
+/// evicted-hash log).
+const CACHE_ERROR_CODE: i32 = -32_002;
+
 /// Admin RPC surface. Versioned via the namespace prefix
 /// (`admin_v1_...`): new methods may be added backwards-compatibly
 /// within `v1`, a breaking change cuts over to `admin_v2_...`.
@@ -172,6 +236,61 @@ pub trait AdminRpc {
     /// Return this node's identity and process uptime.
     #[method(name = "health")]
     async fn health(&self) -> RpcResult<HealthResponse>;
+
+    /// Evict a single blob from the local cache (issue #279). The
+    /// eviction is logical (the iroh-blobs store still holds the bytes
+    /// until #233 lands a public `delete`) but is persisted to
+    /// `<cache_dir>/evicted.log` so it survives a restart.
+    #[method(name = "evict")]
+    async fn evict(&self, req: EvictRequest) -> RpcResult<EvictResponse>;
+
+    /// Trigger an immediate `NodeAnnounce` broadcast (issue #280). Returns
+    /// `PUBLISHER_DISABLED_CODE` when the publisher is off (no region).
+    #[method(name = "announce")]
+    async fn announce(&self) -> RpcResult<AnnounceResponse>;
+}
+
+/// Convert a [`CacheError`] into a JSON-RPC error suitable for
+/// `admin_v1_evict`. Distinguished mainly so the operator-facing message
+/// can name the underlying failure mode (`NotFound`, `OriginError`, etc.)
+/// rather than a generic "cache failed".
+fn cache_error_to_rpc(err: &CacheError) -> ErrorObjectOwned {
+    ErrorObjectOwned::owned(CACHE_ERROR_CODE, err.to_string(), None::<()>)
+}
+
+/// Decode a 64-character hex BLAKE3 hash into [`struct@Hash`].
+///
+/// Goes through `alloy::primitives::hex::decode` (case-insensitive,
+/// `0x`/`0X`-prefix-tolerant) rather than `Hash::from_str` because the
+/// iroh-blobs implementation falls through to `data_encoding`'s base32
+/// decoder for short inputs and **panics** when the decoder's output
+/// buffer is the wrong size for the requested decoding. Operator-driven
+/// inputs reach this path; a panic on malformed hex would tear down the
+/// admin RPC handler thread instead of returning an `INVALID_PARAMS`
+/// error to the caller.
+fn parse_hash_arg(hex: &str) -> Result<Hash, ErrorObjectOwned> {
+    let trimmed = hex
+        .strip_prefix("0x")
+        .or_else(|| hex.strip_prefix("0X"))
+        .unwrap_or(hex);
+    let bytes = alloy::primitives::hex::decode(trimmed).map_err(|err| {
+        ErrorObjectOwned::owned(
+            INVALID_PARAMS_CODE,
+            format!("invalid hash {hex:?}: {err}"),
+            None::<()>,
+        )
+    })?;
+    let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+        ErrorObjectOwned::owned(
+            INVALID_PARAMS_CODE,
+            format!(
+                "invalid hash {hex:?}: expected 32 bytes (64 hex chars), got {}",
+                bytes.len()
+            ),
+            None::<()>,
+        )
+    })?;
+    Ok(Hash::from_bytes(arr))
 }
 
 /// Concrete server implementation backed by the live gossip peer table.
@@ -193,6 +312,45 @@ impl AdminRpcServer for AdminRpcImpl {
             node_id: alloy::primitives::hex::encode(self.state.node_id),
             uptime_s: self.state.started_at.elapsed().as_secs(),
         })
+    }
+
+    async fn evict(&self, req: EvictRequest) -> RpcResult<EvictResponse> {
+        let hash = parse_hash_arg(&req.hash)?;
+
+        // Snapshot presence first so we can report a meaningful
+        // `was_present` to the operator. Any cache I/O failure here is a
+        // genuine problem (the iroh-blobs store is misbehaving), not a
+        // routine "blob is absent" path — surface it.
+        let was_present = self
+            .state
+            .cache
+            .has(hash)
+            .await
+            .map_err(|err| cache_error_to_rpc(&err))?;
+
+        // `evict` returns `Err` if it can't durably persist the eviction
+        // (e.g. evicted-log fsync failed). For DMCA takedowns the
+        // operator must learn about that failure rather than getting an
+        // "ok" response that silently degraded to in-memory-only.
+        self.state
+            .cache
+            .evict(hash)
+            .map_err(|err| cache_error_to_rpc(&err))?;
+
+        Ok(EvictResponse { was_present })
+    }
+
+    async fn announce(&self) -> RpcResult<AnnounceResponse> {
+        let trigger = self.state.announce_trigger.as_ref().ok_or_else(|| {
+            ErrorObjectOwned::owned(
+                PUBLISHER_DISABLED_CODE,
+                "gossip publisher is disabled (no identity.region configured); \
+                 set a region in the node config and restart to enable announces",
+                None::<()>,
+            )
+        })?;
+        trigger.announce_now();
+        Ok(AnnounceResponse { triggered: true })
     }
 
     async fn peers_list(&self) -> RpcResult<PeersResponse> {
@@ -314,19 +472,41 @@ mod tests {
         }
     }
 
-    fn state_with(peers: Vec<([u8; 32], &str, u64, u64)>) -> AdminState {
+    /// Build a throwaway tempdir-backed cache for tests. The peers /
+    /// health methods don't touch it, but `AdminState::new` requires one
+    /// — wrapping the engine over a `tempfile::TempDir` keeps each test
+    /// self-contained, and the returned `TempDir` must outlive the engine
+    /// (callers bind it with `_tmp` so RAII handles cleanup at end of test).
+    async fn test_cache() -> (CacheEngine, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cache = CacheEngine::open(tmp.path(), None, 1)
+            .await
+            .expect("cache open");
+        (cache, tmp)
+    }
+
+    async fn state_with(peers: Vec<([u8; 32], &str, u64, u64)>) -> (AdminState, tempfile::TempDir) {
         let mut table = PeerTable::new(0);
         for (id, region, ts_us, now_us) in peers {
             table
                 .insert_or_refresh(mk_announce(id, region, ts_us), now_us)
                 .expect("seed insert succeeds");
         }
-        AdminState::new(Arc::new(RwLock::new(table)), [0u8; 32], Instant::now())
+        let (cache, tmp) = test_cache().await;
+        let state = AdminState::new(
+            Arc::new(RwLock::new(table)),
+            [0u8; 32],
+            Instant::now(),
+            cache,
+            None,
+        );
+        (state, tmp)
     }
 
     #[tokio::test]
     async fn empty_peer_table_returns_empty_vec() {
-        let rpc = AdminRpcImpl::new(state_with(vec![]));
+        let (state, _tmp) = state_with(vec![]).await;
+        let rpc = AdminRpcImpl::new(state);
         let resp = rpc.peers_list().await.expect("peers_list ok");
         assert!(resp.peers.is_empty());
     }
@@ -345,7 +525,14 @@ mod tests {
         table
             .insert_or_refresh(mk_announce(id, "US", 20), 300)
             .expect("refresh insert");
-        let state = AdminState::new(Arc::new(RwLock::new(table)), [0u8; 32], Instant::now());
+        let (cache, _tmp) = test_cache().await;
+        let state = AdminState::new(
+            Arc::new(RwLock::new(table)),
+            [0u8; 32],
+            Instant::now(),
+            cache,
+            None,
+        );
         let rpc = AdminRpcImpl::new(state);
 
         let resp = rpc.peers_list().await.expect("peers_list ok");
@@ -362,7 +549,14 @@ mod tests {
     async fn health_returns_hex_node_id_and_nondecreasing_uptime() {
         let id = [0xCDu8; 32];
         let started = Instant::now();
-        let state = AdminState::new(Arc::new(RwLock::new(PeerTable::new(0))), id, started);
+        let (cache, _tmp) = test_cache().await;
+        let state = AdminState::new(
+            Arc::new(RwLock::new(PeerTable::new(0))),
+            id,
+            started,
+            cache,
+            None,
+        );
         let rpc = AdminRpcImpl::new(state);
 
         let first = rpc.health().await.expect("health ok");
@@ -386,13 +580,178 @@ mod tests {
         let b = [2u8; 32];
         let c = [3u8; 32];
         // (id, region, announce ts, now_us) — `now_us` becomes last_seen_us.
-        let rpc = AdminRpcImpl::new(state_with(vec![
+        let (state, _tmp) = state_with(vec![
             (a, "US", 1, 500),
             (b, "EU", 1, 700),
             (c, "AP", 1, 600),
-        ]));
+        ])
+        .await;
+        let rpc = AdminRpcImpl::new(state);
         let resp = rpc.peers_list().await.expect("peers_list ok");
         let order: Vec<u64> = resp.peers.iter().map(|p| p.last_seen_us).collect();
         assert_eq!(order, vec![700, 600, 500]);
+    }
+
+    /// Evict round-trip: `admin_v1_evict` of a hex hash that's been pulled
+    /// into the cache returns `was_present: true` and subsequent gets fail
+    /// with `NotFound`. Without this, a regression that no-op'd
+    /// `admin_v1_evict` would leak through unit tests.
+    #[tokio::test]
+    async fn admin_evict_blocks_subsequent_serve() -> anyhow::Result<()> {
+        use bytes::Bytes;
+        use std::future::Future;
+        use std::pin::Pin;
+
+        // Inline stub origin so we don't have to depend on a test-only
+        // `decdn-cache` export. Single-blob, hash matches payload.
+        #[derive(Debug)]
+        struct StubOrigin {
+            data: Bytes,
+            hash: Hash,
+        }
+        impl decdn_cache::Origin for StubOrigin {
+            fn fetch(
+                &self,
+                hash: Hash,
+                _max_bytes: u64,
+            ) -> Pin<Box<dyn Future<Output = anyhow::Result<decdn_cache::OriginFetch>> + Send + '_>>
+            {
+                let result = if hash == self.hash {
+                    Ok(decdn_cache::OriginFetch::Found(self.data.clone()))
+                } else {
+                    Ok(decdn_cache::OriginFetch::NotFound)
+                };
+                Box::pin(async move { result })
+            }
+        }
+
+        let payload = b"admin evict";
+        let hash = Hash::new(payload);
+        let tmp = tempfile::tempdir()?;
+        let origin = Arc::new(StubOrigin {
+            data: Bytes::from(payload.to_vec()),
+            hash,
+        }) as Arc<dyn decdn_cache::Origin>;
+        let cache = CacheEngine::open(tmp.path(), Some(origin), 1).await?;
+
+        // Prime the cache with the blob so the evict has something to remove.
+        let _ = cache.get(hash).await?;
+
+        let state = AdminState::new(
+            Arc::new(RwLock::new(PeerTable::new(0))),
+            [0u8; 32],
+            Instant::now(),
+            cache.clone(),
+            None,
+        );
+        let rpc = AdminRpcImpl::new(state);
+
+        let resp = rpc
+            .evict(EvictRequest {
+                hash: alloy::primitives::hex::encode(hash.as_bytes()),
+            })
+            .await
+            .expect("evict ok");
+        assert!(resp.was_present, "expected was_present=true");
+
+        match cache.get(hash).await {
+            Err(CacheError::NotFound { .. }) => Ok(()),
+            other => Err(anyhow::anyhow!(
+                "expected NotFound after admin evict, got {other:?}"
+            )),
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_evict_rejects_bad_hex() {
+        let (state, _tmp) = state_with(vec![]).await;
+        let rpc = AdminRpcImpl::new(state);
+        let err = rpc
+            .evict(EvictRequest {
+                hash: "not-hex".into(),
+            })
+            .await
+            .expect_err("expected invalid-params error");
+        // INVALID_PARAMS_CODE; double-checked here so a typo'd code constant
+        // still surfaces as a test failure.
+        assert_eq!(err.code(), -32_602);
+    }
+
+    #[tokio::test]
+    async fn admin_evict_accepts_uppercase_0x_prefix() {
+        // `0X` and uppercase hex must both be tolerated; this guards
+        // against the case-sensitive `strip_prefix("0x")` regression
+        // flagged in PR review.
+        let (cache, _tmp) = test_cache().await;
+        let state = AdminState::new(
+            Arc::new(RwLock::new(PeerTable::new(0))),
+            [0u8; 32],
+            Instant::now(),
+            cache,
+            None,
+        );
+        let rpc = AdminRpcImpl::new(state);
+        let hash = Hash::new(b"prefix-test");
+        let upper = format!(
+            "0X{}",
+            alloy::primitives::hex::encode(hash.as_bytes()).to_uppercase()
+        );
+        let resp = rpc
+            .evict(EvictRequest { hash: upper })
+            .await
+            .expect("0X-prefixed uppercase hex should parse");
+        // was_present=false because the test cache has no origin and we
+        // never `get`-ed the hash; the parse alone must succeed.
+        assert!(!resp.was_present);
+    }
+
+    #[tokio::test]
+    async fn admin_announce_without_publisher_returns_publisher_disabled() {
+        // No region configured → AnnounceTrigger absent → method must
+        // return PUBLISHER_DISABLED rather than silently succeeding.
+        let (state, _tmp) = state_with(vec![]).await;
+        let rpc = AdminRpcImpl::new(state);
+        let err = rpc.announce().await.expect_err("expected error");
+        assert_eq!(err.code(), -32_001);
+    }
+
+    #[tokio::test]
+    async fn admin_announce_fires_trigger_when_publisher_present() {
+        use tokio::sync::Notify;
+
+        // `AnnounceTrigger::announce_now` is a thin wrapper that calls
+        // `notify_one` on the inner `Arc<Notify>`. We construct the
+        // trigger with a `Notify` we own (via the `for_test` seam, which
+        // is `#[doc(hidden)]` and exists for exactly this assertion path)
+        // so we can `.notified()` after the RPC fires and observe that
+        // the permit landed. This proves the admin handler -> trigger ->
+        // notify chain end-to-end without spinning up a real publisher
+        // task; the publisher's own `select!` arm is exercised by
+        // `service::tests::publisher_publishes_on_announce_trigger`.
+        let notify = Arc::new(Notify::new());
+        let trigger = Arc::new(decdn_gossip::AnnounceTrigger::for_test(Arc::clone(&notify)));
+        let (cache, _tmp) = test_cache().await;
+        let state = AdminState::new(
+            Arc::new(RwLock::new(PeerTable::new(0))),
+            [0u8; 32],
+            Instant::now(),
+            cache,
+            Some(trigger),
+        );
+        let rpc = AdminRpcImpl::new(state);
+
+        let resp = rpc.announce().await.expect("announce ok");
+        assert!(resp.triggered);
+
+        // `Notify::notify_one` stores a permit if no waiter is pending;
+        // calling `notified()` after the RPC claims that permit
+        // immediately. A short timeout makes a regression that lost the
+        // notify fail fast rather than hanging the test runner.
+        let waited =
+            tokio::time::timeout(std::time::Duration::from_millis(100), notify.notified()).await;
+        assert!(
+            waited.is_ok(),
+            "announce_now did not fire the underlying Notify"
+        );
     }
 }

@@ -1,8 +1,10 @@
 //! Cache engine: local iroh-blobs store fronted by an [`Origin`] for misses.
 
-use std::collections::HashMap;
-use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -33,6 +35,28 @@ struct Inner {
     /// subsequent callers wait on the [`Notify`] rather than issuing a
     /// duplicate origin fetch (coalescing, fixes #305).
     inflight: Mutex<HashMap<Hash, Arc<Notify>>>,
+    /// Hashes the operator has explicitly evicted via [`CacheEngine::evict`]
+    /// (issue #279). Membership is honored by [`CacheEngine::has`] and
+    /// [`CacheEngine::get`] so an evicted blob is not served, even though
+    /// the underlying iroh-blobs store may still hold the bytes — iroh-blobs
+    /// 0.99 does not expose a public delete (`Blobs::delete` is `pub(crate)`,
+    /// reserved for the GC task, see issue #233). Reclaim of disk bytes
+    /// happens on the next GC sweep once that lands.
+    ///
+    /// Persisted alongside the iroh-blobs store at `<cache_dir>/evicted.log`
+    /// on every successful [`CacheEngine::evict`] call so DMCA takedowns and
+    /// corruption-recovery evicts survive a process restart — an
+    /// in-memory-only set would silently let evicted content resume serving
+    /// after `decdn run` is restarted, which is exactly the failure mode
+    /// #279 needs to prevent.
+    evicted: Mutex<HashSet<Hash>>,
+    /// Append-only file holding lowercase-hex evicted hashes, one per line.
+    /// Loaded on [`CacheEngine::open`]; appended to (with `fsync`) on every
+    /// successful [`CacheEngine::evict`]. Lives at `<cache_dir>/evicted.log`.
+    /// The format is intentionally trivial so operators can grep / inspect /
+    /// hand-edit it during incident response; duplicate lines are tolerated
+    /// (loading deduplicates via the `HashSet`).
+    evicted_log_path: PathBuf,
 }
 
 /// Coarse-grained cache statistics.
@@ -68,6 +92,110 @@ impl Drop for InflightGuard<'_> {
     }
 }
 
+/// Hard cap on the number of distinct hashes the in-memory `evicted`
+/// set may hold. Bounds (a) the resident memory of the set itself and
+/// (b) the unbounded growth of `<cache_dir>/evicted.log` under e.g. a
+/// mass-evict automation gone wrong. At ~64 bytes per `HashSet<Hash>`
+/// entry the cap is ~64 MB resident. Operators legitimately hitting
+/// this are operating well outside normal DMCA-takedown caseloads and
+/// should investigate before raising it. Loading from `evicted.log` on
+/// `open()` is *not* gated by this cap — entries persisted by a previous
+/// run always replay (silently dropping a persisted DMCA takedown to
+/// stay under cap is the worst-case the cap was meant to prevent).
+pub(crate) const MAX_EVICTED_ENTRIES: usize = 1_000_000;
+
+/// Read the evicted-hash log into a [`HashSet`]. A missing file is the
+/// normal "no evictions yet" case and yields an empty set; any other I/O
+/// or parse error is fatal because silently dropping persisted evictions
+/// would resume serving DMCA-flagged content (issue #279). Lines that
+/// don't parse as a 64-character hex hash are skipped with a `warn` log
+/// — operators may have hand-edited the file during incident response,
+/// and one corrupt line shouldn't take the whole log down.
+fn load_evicted_log(path: &Path) -> CacheResult<HashSet<Hash>> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
+        Err(err) => {
+            return Err(CacheError::Store(anyhow::Error::from(err).context(
+                format!("failed to read evicted-hash log at {}", path.display()),
+            )));
+        }
+    };
+    let mut out = HashSet::new();
+    for raw in contents.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        match parse_hex_hash(line) {
+            Some(h) => {
+                out.insert(h);
+            }
+            None => {
+                tracing::warn!(
+                    line = %line,
+                    path = %path.display(),
+                    "skipping malformed entry in evicted-hash log",
+                );
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Parse a 64-char hex BLAKE3 hash. Accepts either case so hand-edited
+/// log entries (operators pasting a hash from access logs / takedown
+/// notices, which may use either case) round-trip through the same
+/// parser the admin RPC accepts. The persisted format is canonically
+/// lowercase via `Hash::Display`'s `to_hex()`, so this only relaxes the
+/// read path — writes remain lowercase, and load-then-save normalizes
+/// silently. Strict on length: a corrupted log line surfaces as `None`
+/// (logged + skipped at load time) rather than silently turning into
+/// the wrong hash.
+fn parse_hex_hash(s: &str) -> Option<Hash> {
+    if s.len() != 64 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut bytes = [0u8; 32];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        // First nibble is the high nibble (bits 7..4): hex `ab` decodes
+        // to `0xab`, not `0xba`. Naming follows that semantic so an
+        // audit-sensitive DMCA-takedown codepath isn't decoded against
+        // mis-labeled variables.
+        let hi = s.as_bytes().get(i * 2)?;
+        let lo = s.as_bytes().get(i * 2 + 1)?;
+        *byte = (hex_digit(*hi)? << 4) | hex_digit(*lo)?;
+    }
+    Some(Hash::from_bytes(bytes))
+}
+
+const fn hex_digit(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Append `hash` to the evicted log with `fsync` before returning. The
+/// caller relies on the durability guarantee — a return-without-error
+/// means a crash now will replay the eviction on the next `open`.
+fn append_evicted_log(path: &Path, hash: Hash) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    // POSIX guarantees `write` calls under PIPE_BUF (typically 4 KiB) are
+    // atomic on append-mode file handles. A 64-char hash + newline is
+    // 65 bytes, well under the limit, so concurrent writers from a
+    // misconfigured shared cache_dir won't interleave bytes mid-line.
+    let line = format!("{hash}\n");
+    file.write_all(line.as_bytes())?;
+    file.sync_all()?;
+    Ok(())
+}
+
 impl CacheEngine {
     /// Open or create the store at `cache_dir`. `max_blob_mb` caps the size
     /// of any single blob pulled from the origin. Oversize payloads typically
@@ -93,6 +221,9 @@ impl CacheEngine {
         // rather than overflow-wrap to zero.
         let max_blob_bytes = max_blob_mb.saturating_mul(1024 * 1024);
 
+        let evicted_log_path = cache_dir.join("evicted.log");
+        let evicted = load_evicted_log(&evicted_log_path)?;
+
         Ok(Self {
             inner: Arc::new(Inner {
                 store,
@@ -100,18 +231,114 @@ impl CacheEngine {
                 max_blob_bytes,
                 access_times: Mutex::new(HashMap::new()),
                 inflight: Mutex::new(HashMap::new()),
+                evicted: Mutex::new(evicted),
+                evicted_log_path,
             }),
         })
     }
 
     /// Is this blob already present in the local store?
+    ///
+    /// Returns `Ok(false)` when the hash has been logically evicted (issue
+    /// #279) even if the underlying store still holds the bytes — operators
+    /// who call `evict` expect the node to stop serving immediately, so
+    /// `has` reports the blob as absent.
     pub async fn has(&self, hash: Hash) -> CacheResult<bool> {
+        if self.is_evicted(hash) {
+            return Ok(false);
+        }
         self.inner
             .store
             .blobs()
             .has(hash)
             .await
             .map_err(|e| CacheError::Store(anyhow::Error::from(e)))
+    }
+
+    /// Mark `hash` as evicted: subsequent [`Self::has`] / [`Self::get`] calls
+    /// behave as if the blob is absent (returning `false` / `NotFound`
+    /// respectively). The corresponding [`Self::access_times_snapshot`] entry
+    /// is cleared so future LRU sweeps don't re-surface the hash.
+    ///
+    /// This is a *logical* evict: iroh-blobs 0.99 does not expose a public
+    /// `delete` API (see issue #233), so the bytes remain on disk until the
+    /// internal GC sweep reclaims them. The operator-visible behavior — the
+    /// node stops serving the blob immediately — is what `decdn node evict`
+    /// (issue #279) needs for use cases like DMCA takedown and corruption
+    /// recovery.
+    ///
+    /// Persisted: the eviction is appended (with `fsync`) to
+    /// `<cache_dir>/evicted.log` before this call returns successfully, so
+    /// the takedown survives a process restart. A persistence failure is
+    /// surfaced as `Err` rather than silently downgrading to in-memory-only —
+    /// for DMCA-driven evicts the operator must be able to tell whether
+    /// the takedown is durable, otherwise a node restart could resume
+    /// serving the content.
+    pub fn evict(&self, hash: Hash) -> CacheResult<()> {
+        // Pre-check under one lock acquisition: short-circuit on
+        // already-evicted (idempotent — don't grow `evicted.log` with a
+        // duplicate line) and reject on cap (DoS bound on an unbounded
+        // public-ish surface). The cap check is racy against concurrent
+        // evicts but the cap itself is a soft DoS bound, not a hard
+        // invariant — going +ε over by a handful of races is fine.
+        {
+            let guard = self
+                .inner
+                .evicted
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if guard.contains(&hash) {
+                return Ok(());
+            }
+            if guard.len() >= MAX_EVICTED_ENTRIES {
+                return Err(CacheError::EvictionLimitExceeded {
+                    limit: MAX_EVICTED_ENTRIES,
+                });
+            }
+        }
+
+        // Persist FIRST, then commit to the in-memory set: a crash between
+        // these two steps will at worst replay a successful evict on the
+        // next open, which is idempotent. The opposite ordering would
+        // briefly stop serving but lose durability if the fsync failed —
+        // the worst-case scenario for a takedown.
+        append_evicted_log(&self.inner.evicted_log_path, hash).map_err(|err| {
+            CacheError::Store(anyhow::Error::from(err).context("persist eviction"))
+        })?;
+
+        // `unwrap_or_else(PoisonError::into_inner)` rather than the project's
+        // usual `if let Ok(...) = lock()` pattern: a poisoned lock here
+        // would silently skip the in-memory commit and the node would keep
+        // serving the supposedly-evicted blob until the next restart loaded
+        // `evicted.log`. For a DMCA takedown that is the canonical worst
+        // case. Recovering the inner guard preserves the contract that
+        // `evict() -> Ok(())` implies the in-memory set was updated.
+        self.inner
+            .evicted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(hash);
+        self.inner
+            .access_times
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&hash);
+        Ok(())
+    }
+
+    /// Has this hash been logically evicted via [`Self::evict`]?
+    ///
+    /// Recovers from a poisoned mutex via [`PoisonError::into_inner`]
+    /// rather than treating poison as "not evicted": a poisoned lock
+    /// returning `false` here would let evicted DMCA-flagged content
+    /// resume serving — exactly what `<cache_dir>/evicted.log`'s
+    /// durability guarantee was designed to prevent.
+    pub fn is_evicted(&self, hash: Hash) -> bool {
+        self.inner
+            .evicted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&hash)
     }
 
     /// Fetch the blob by hash. Hits the local store on a cache hit; on a miss
@@ -131,6 +358,16 @@ impl CacheEngine {
         if self.has(hash).await? {
             self.touch(hash);
             return self.read_local(hash).await;
+        }
+
+        // Logical-eviction guard (#279): once an operator has run
+        // `decdn node evict <hash>`, a subsequent `get` must not silently
+        // re-pull from the origin and undo the eviction. The eviction is
+        // sticky for the life of `<cache_dir>/evicted.log` — there is no
+        // "unevict" path; an operator who needs to re-cache a previously
+        // evicted hash hand-edits the log and restarts.
+        if self.is_evicted(hash) {
+            return Err(CacheError::NotFound { hash });
         }
 
         // Coalesce concurrent pull-through requests for the same hash (#305).
@@ -597,6 +834,193 @@ mod tests {
         anyhow::ensure!(
             inflight_len == 0,
             "inflight map should be empty after cancellation, had {inflight_len} entries"
+        );
+        Ok(())
+    }
+
+    /// `evict` must take a previously-cached hash off the served set. After
+    /// evict, `has` reports false and `get` returns `NotFound` rather than
+    /// silently re-pulling from the origin (which would defeat the point of
+    /// the takedown / corruption-recovery use case behind issue #279).
+    #[tokio::test]
+    async fn evict_blocks_subsequent_serve() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"evict me";
+        let hash = Hash::new(payload);
+        let origin = StubOrigin::new(payload);
+
+        let engine = CacheEngine::open(tmp.path(), Some(Arc::new(origin)), 10).await?;
+
+        // Prime the cache so we evict a real, served blob — covers the
+        // hot path the operator would actually be evicting.
+        let _ = engine.get(hash).await?;
+        anyhow::ensure!(
+            engine.has(hash).await?,
+            "expected blob present before evict"
+        );
+
+        engine.evict(hash)?;
+
+        anyhow::ensure!(engine.is_evicted(hash), "evict flag not set");
+        anyhow::ensure!(
+            !engine.has(hash).await?,
+            "has() should report absent after evict"
+        );
+        match engine.get(hash).await {
+            Err(CacheError::NotFound { .. }) => Ok(()),
+            other => Err(anyhow::anyhow!(
+                "expected NotFound after evict, got {other:?}"
+            )),
+        }
+    }
+
+    /// Eviction must survive a process restart — operators running DMCA
+    /// takedowns rely on the evict being durable. The on-disk
+    /// `evicted.log` is replayed by a fresh `open()`. Without this test,
+    /// a regression that dropped the persistence path (e.g. moved to
+    /// in-memory-only) would let evicted content silently resume serving
+    /// after a restart.
+    #[tokio::test]
+    async fn evict_persists_across_open() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"persist me";
+        let hash = Hash::new(payload);
+
+        // First open: prime + evict.
+        {
+            let origin = Arc::new(StubOrigin::new(payload));
+            let engine = CacheEngine::open(tmp.path(), Some(origin), 10).await?;
+            let _ = engine.get(hash).await?;
+            engine.evict(hash)?;
+            engine.shutdown().await?;
+        }
+
+        // Second open: same cache_dir, no origin so a re-pull would fail
+        // loudly. The evicted set must reload from disk.
+        let engine2 = CacheEngine::open(tmp.path(), None, 10).await?;
+        anyhow::ensure!(
+            engine2.is_evicted(hash),
+            "evict flag should reload from <cache_dir>/evicted.log"
+        );
+        anyhow::ensure!(
+            !engine2.has(hash).await?,
+            "has() should report absent after restart"
+        );
+        Ok(())
+    }
+
+    /// Malformed lines in `evicted.log` (manual edit gone wrong, partial
+    /// write from an old crash) must not stop the engine from opening;
+    /// they get logged + skipped, and the well-formed lines still load.
+    #[tokio::test]
+    async fn evicted_log_skips_malformed_lines() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let log_path = tmp.path().join("evicted.log");
+        let good = Hash::new(b"good entry");
+        std::fs::write(
+            &log_path,
+            format!("\n# operator note\n{good}\nnot-a-hash\n{good}\n"),
+        )?;
+
+        let engine = CacheEngine::open(tmp.path(), None, 10).await?;
+        anyhow::ensure!(engine.is_evicted(good), "valid hash line not loaded");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn evict_unknown_hash_is_a_no_op() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let engine = CacheEngine::open(tmp.path(), None, 10).await?;
+        let unknown = Hash::new(b"never seen");
+        // Evicting a hash we've never cached is fine — operators may run
+        // `decdn node evict` ahead of time as a precaution.
+        engine.evict(unknown)?;
+        anyhow::ensure!(engine.is_evicted(unknown), "evict flag not set");
+        Ok(())
+    }
+
+    /// Evicting the same hash twice must not append a duplicate line to
+    /// `<cache_dir>/evicted.log`. Without this contract a stuck
+    /// automation that mass-replays the same DMCA-takedown hash would
+    /// grow the log unboundedly. The first evict appends one line, the
+    /// second short-circuits via the `contains(&hash)` check at the top
+    /// of `evict()`.
+    #[tokio::test]
+    async fn evict_is_idempotent_and_does_not_grow_log() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let log_path = tmp.path().join("evicted.log");
+        let engine = CacheEngine::open(tmp.path(), None, 10).await?;
+        let hash = Hash::new(b"dup-evict");
+
+        engine.evict(hash)?;
+        let after_first = std::fs::read_to_string(&log_path)?;
+        let lines_first = after_first.lines().count();
+
+        engine.evict(hash)?;
+        engine.evict(hash)?;
+        let after_third = std::fs::read_to_string(&log_path)?;
+        let lines_third = after_third.lines().count();
+
+        anyhow::ensure!(
+            lines_first == 1 && lines_third == 1,
+            "expected 1 log line both times, got first={lines_first}, third={lines_third}"
+        );
+        Ok(())
+    }
+
+    /// Hand-edited uppercase hex in `evicted.log` must be tolerated by
+    /// `parse_hex_hash` — the persisted format is canonically lowercase
+    /// (`Hash::Display` calls `to_hex()`), but operators pasting from
+    /// access logs / takedown notices may use either case. Without this,
+    /// a mixed-case hand-edit would silently get dropped at next open
+    /// and the takedown would resume serving content.
+    #[tokio::test]
+    async fn evicted_log_accepts_uppercase_hex() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let log_path = tmp.path().join("evicted.log");
+        let hash = Hash::new(b"upper-hex");
+        let upper = hash.to_string().to_uppercase();
+        std::fs::write(&log_path, format!("{upper}\n"))?;
+
+        let engine = CacheEngine::open(tmp.path(), None, 10).await?;
+        anyhow::ensure!(
+            engine.is_evicted(hash),
+            "uppercase hex line should load as the same hash",
+        );
+        Ok(())
+    }
+
+    /// `evict()` must surface a persistence failure as `Err` rather than
+    /// silently degrading to in-memory-only — for DMCA-driven evicts the
+    /// operator must be able to tell whether the takedown is durable.
+    /// Forcing the failure: place a *directory* at the `evicted.log`
+    /// path so `OpenOptions::open(...)` fails (`EISDIR`) when
+    /// `append_evicted_log` runs. Avoids relying on filesystem
+    /// permission games that may not work uniformly across CI hosts.
+    #[tokio::test]
+    async fn evict_returns_err_when_persistence_fails() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let engine = CacheEngine::open(tmp.path(), None, 10).await?;
+        // Engine opened cleanly with no log file yet. Now plant a
+        // directory at the path the engine will try to append to.
+        std::fs::create_dir(tmp.path().join("evicted.log"))?;
+
+        let hash = Hash::new(b"persist-fail");
+        match engine.evict(hash) {
+            Err(CacheError::Store(_)) => Ok(()),
+            other => Err(anyhow::anyhow!(
+                "expected Store error from persistence failure, got {other:?}"
+            )),
+        }?;
+
+        // And the in-memory set must NOT have been updated — otherwise
+        // an operator seeing the error would (correctly) assume the
+        // takedown didn't land, but the running node would actually have
+        // already stopped serving. Either contract is reasonable on its
+        // own; mixing them is the worst case.
+        anyhow::ensure!(
+            !engine.is_evicted(hash),
+            "in-memory set must not commit when persistence fails",
         );
         Ok(())
     }

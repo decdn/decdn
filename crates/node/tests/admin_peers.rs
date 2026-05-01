@@ -18,9 +18,10 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::Instant;
 
+use decdn_cache::CacheEngine;
 use decdn_gossip::PeerTable;
 use decdn_node::admin::{self, AdminRpcClient, AdminState};
-use decdn_node::cli::{HealthArgs, PeersArgs};
+use decdn_node::cli::{AnnounceArgs, EvictArgs, HealthArgs, PeersArgs};
 use decdn_node::commands;
 use decdn_protocol::{LoadHint, NodeAnnounce, NodeAnnounceBody};
 use jsonrpsee::core::ClientError;
@@ -52,6 +53,16 @@ async fn bind_loopback() -> anyhow::Result<(TcpListener, SocketAddr)> {
     Ok((listener, addr))
 }
 
+/// Build a throwaway cache engine for tests that don't exercise cache
+/// behavior — `AdminState::new` requires one and these tests only check
+/// peers / health round-tripping. The returned `TempDir` must outlive the
+/// engine; callers bind it with `_tmp` to keep RAII in scope.
+async fn test_cache() -> anyhow::Result<(CacheEngine, tempfile::TempDir)> {
+    let tmp = tempfile::tempdir()?;
+    let cache = CacheEngine::open(tmp.path(), None, 1).await?;
+    Ok((cache, tmp))
+}
+
 /// Spawn an admin server with the given state, returning its URL and a
 /// `(stop_tx, join)` pair. The join handle must be awaited after
 /// sending on `stop_tx` so the test doesn't leak a background task.
@@ -69,7 +80,8 @@ async fn spawn_admin(
 #[tokio::test]
 async fn peers_list_empty_peer_table() -> anyhow::Result<()> {
     let peer_table = Arc::new(RwLock::new(PeerTable::new(0)));
-    let state = AdminState::new(peer_table, [0u8; 32], Instant::now());
+    let (cache, _tmp) = test_cache().await?;
+    let state = AdminState::new(peer_table, [0u8; 32], Instant::now(), cache, None);
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
     let client = HttpClientBuilder::default().build(&url)?;
@@ -97,7 +109,14 @@ async fn peers_list_seeded_entries_sorted_desc() -> anyhow::Result<()> {
             .insert_or_refresh(mk_announce([3u8; 32], "AP", 3), 600)
             .ok();
     }
-    let state = AdminState::new(Arc::clone(&peer_table), [0u8; 32], Instant::now());
+    let (cache, _tmp) = test_cache().await?;
+    let state = AdminState::new(
+        Arc::clone(&peer_table),
+        [0u8; 32],
+        Instant::now(),
+        cache,
+        None,
+    );
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
     let client = HttpClientBuilder::default().build(&url)?;
@@ -131,7 +150,8 @@ async fn peers_list_seeded_entries_sorted_desc() -> anyhow::Result<()> {
 async fn health_returns_hex_node_id_and_uptime() -> anyhow::Result<()> {
     let peer_table = Arc::new(RwLock::new(PeerTable::new(0)));
     let id = [0xABu8; 32];
-    let state = AdminState::new(peer_table, id, Instant::now());
+    let (cache, _tmp) = test_cache().await?;
+    let state = AdminState::new(peer_table, id, Instant::now(), cache, None);
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
     let client = HttpClientBuilder::default().build(&url)?;
@@ -157,7 +177,8 @@ async fn health_returns_hex_node_id_and_uptime() -> anyhow::Result<()> {
 #[tokio::test]
 async fn unknown_method_returns_method_not_found() -> anyhow::Result<()> {
     let peer_table = Arc::new(RwLock::new(PeerTable::new(0)));
-    let state = AdminState::new(peer_table, [0u8; 32], Instant::now());
+    let (cache, _tmp) = test_cache().await?;
+    let state = AdminState::new(peer_table, [0u8; 32], Instant::now(), cache, None);
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
     let client = HttpClientBuilder::default().build(&url)?;
@@ -277,10 +298,104 @@ async fn cli_peers_rejects_zero_timeout() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Mirror the connection-refused coverage onto `decdn node evict`. The
+/// new CLI subcommand routes through the same `classify_client_error`
+/// path as `peers` / `health`, but a regression that swallowed the
+/// classification (or printed a misleading "evicted" line on failure)
+/// would not be caught by the admin-RPC unit tests alone.
+#[tokio::test]
+async fn cli_evict_surfaces_connection_refused() -> anyhow::Result<()> {
+    let (listener, addr) = bind_loopback().await?;
+    drop(listener);
+
+    let args = EvictArgs {
+        hash: "0".repeat(64),
+        admin_url: Some(format!("http://{addr}")),
+        config: None,
+        json: false,
+        timeout_ms: 2_000,
+    };
+    let err = commands::evict(&args, None)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("expected connection-refused error"))?
+        .to_string();
+    assert!(
+        err.contains("refused"),
+        "error should mention 'refused', got: {err}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn cli_evict_rejects_zero_timeout() -> anyhow::Result<()> {
+    let args = EvictArgs {
+        hash: "0".repeat(64),
+        admin_url: Some("http://127.0.0.1:1".to_string()),
+        config: None,
+        json: false,
+        timeout_ms: 0,
+    };
+    let err = commands::evict(&args, None)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("expected zero-timeout error"))?
+        .to_string();
+    assert!(
+        err.contains("--timeout-ms"),
+        "error should mention the flag, got: {err}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn cli_announce_surfaces_connection_refused() -> anyhow::Result<()> {
+    let (listener, addr) = bind_loopback().await?;
+    drop(listener);
+
+    let args = AnnounceArgs {
+        admin_url: Some(format!("http://{addr}")),
+        config: None,
+        json: false,
+        timeout_ms: 2_000,
+    };
+    let err = commands::announce(&args, None)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("expected connection-refused error"))?
+        .to_string();
+    assert!(
+        err.contains("refused"),
+        "error should mention 'refused', got: {err}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn cli_announce_rejects_zero_timeout() -> anyhow::Result<()> {
+    let args = AnnounceArgs {
+        admin_url: Some("http://127.0.0.1:1".to_string()),
+        config: None,
+        json: false,
+        timeout_ms: 0,
+    };
+    let err = commands::announce(&args, None)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("expected zero-timeout error"))?
+        .to_string();
+    assert!(
+        err.contains("--timeout-ms"),
+        "error should mention the flag, got: {err}"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn admin_shutdown_closes_listener() -> anyhow::Result<()> {
     let peer_table = Arc::new(RwLock::new(PeerTable::new(0)));
-    let state = AdminState::new(peer_table, [0u8; 32], Instant::now());
+    let (cache, _tmp) = test_cache().await?;
+    let state = AdminState::new(peer_table, [0u8; 32], Instant::now(), cache, None);
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
     // Baseline: server is up.

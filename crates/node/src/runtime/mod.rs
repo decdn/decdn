@@ -161,26 +161,18 @@ pub async fn run(
         cfg.gossip.peer_ttl_sec.saturating_mul(1_000_000),
     )));
 
-    // Admin HTTP surface (ADR 025). Bound before the gossip service spawns so
-    // startup fails fast on a port collision rather than after side-effectful
-    // subscriptions have registered.
-    let admin_stop_tx = if let Some(admin_port) = cfg.observability.admin_port {
+    // Admin HTTP surface (ADR 025). Bind here — *before* the gossip service
+    // spawns — so startup fails fast on a port collision rather than after
+    // side-effectful subscriptions have registered. The `serve` task is
+    // spawned later, once gossip has produced its `AnnounceTrigger`, so the
+    // `admin_v1_announce` method has somewhere to forward to.
+    let admin_listener = if let Some(admin_port) = cfg.observability.admin_port {
         let admin_addr = std::net::SocketAddr::from(([127, 0, 0, 1], admin_port));
-        let admin_listener = admin::bind(admin_addr)
-            .await
-            .context("failed to bind admin listener")?;
-        let (tx, rx) = oneshot::channel::<()>();
-        let state = admin::AdminState::new(
-            Arc::clone(&peer_table),
-            *secret_key.public().as_bytes(),
-            started_at,
-        );
-        tasks.spawn(async move {
-            if let Err(err) = admin::serve(admin_listener, state, rx).await {
-                tracing::error!(%err, "admin server exited with error");
-            }
-        });
-        Some(tx)
+        Some(
+            admin::bind(admin_addr)
+                .await
+                .context("failed to bind admin listener")?,
+        )
     } else {
         tracing::info!("admin server disabled (observability.admin_port = 0)");
         None
@@ -204,7 +196,10 @@ pub async fn run(
     // CancellationToken or expose `shutdown().await`) so the runtime
     // doesn't have to reach in with `.abort()`. Tracked for follow-up;
     // PoC keeps the parent-driven abort to stay minimal.
-    let gossip_handles = GossipService::spawn(
+    let decdn_gossip::GossipHandles {
+        tasks: gossip_handles,
+        announce_trigger,
+    } = GossipService::spawn(
         ep.clone(),
         secret_key.clone(),
         gossip.clone(),
@@ -212,7 +207,31 @@ pub async fn run(
         Arc::clone(&peer_table),
         gossip_metrics,
     )
-    .await;
+    .await
+    .context("gossip service failed to start")?;
+
+    // Now that gossip is up and we know whether the publisher produced an
+    // `AnnounceTrigger`, spawn the admin serve task with the full state.
+    // Bind happened earlier (see `admin_listener` above) so a port collision
+    // would have failed startup before any side-effectful subscribes ran.
+    let admin_stop_tx = if let Some(listener) = admin_listener {
+        let (tx, rx) = oneshot::channel::<()>();
+        let state = admin::AdminState::new(
+            Arc::clone(&peer_table),
+            *secret_key.public().as_bytes(),
+            started_at,
+            cache.clone(),
+            announce_trigger,
+        );
+        tasks.spawn(async move {
+            if let Err(err) = admin::serve(listener, state, rx).await {
+                tracing::error!(%err, "admin server exited with error");
+            }
+        });
+        Some(tx)
+    } else {
+        None
+    };
 
     // Startup banner (#274). One structured INFO event per restart lets
     // operators correlate log streams across a fleet and across restarts

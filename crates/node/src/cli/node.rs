@@ -21,6 +21,21 @@ pub enum NodeCommand {
     Peers(PeersArgs),
     /// Print a running node's identity and process uptime.
     Health(HealthArgs),
+    /// Forcibly remove a single blob from the local cache (issue #279).
+    /// Useful for DMCA takedown, corruption recovery, and storage
+    /// reclamation.
+    Evict(EvictArgs),
+    /// Publish a one-shot `NodeAnnounce` to gossip peers immediately
+    /// rather than waiting for the periodic announce interval (issue
+    /// #280). Useful after a config edit changes a field carried in the
+    /// announce body — see `decdn-protocol::NodeAnnounceBody` — or as a
+    /// post-restart "I'm here" nudge so peers don't wait the full
+    /// `announce_interval_sec` to learn about us. The trigger is a
+    /// queue-and-coalesce signal: rapid back-to-back invocations within a
+    /// single publisher cycle fold into one extra broadcast (see
+    /// `decdn-gossip::AnnounceTrigger`), and a successful response means
+    /// the request was queued, not that it has hit the wire.
+    Announce(AnnounceArgs),
 }
 
 /// `decdn node health` — report identity (hex `node_id`) and process
@@ -46,6 +61,64 @@ pub struct HealthArgs {
 
     /// Emit the admin response body as JSON instead of two human-
     /// readable lines.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Roundtrip timeout in milliseconds.
+    #[arg(long, value_name = "MS", default_value_t = 5_000)]
+    pub timeout_ms: u64,
+}
+
+/// `decdn node evict` — forcibly remove a blob from the local cache via
+/// `admin_v1_evict` (issue #279).
+///
+/// The eviction is *logical* in this version (the iroh-blobs store still
+/// holds the bytes — see issue #233 for the disk-reclaim follow-up) but
+/// is persisted to `<cache_dir>/evicted.log` so it survives restarts.
+/// Operators using this for DMCA takedowns can rely on the takedown
+/// being durable across `decdn run` invocations.
+#[derive(Args, Debug)]
+pub struct EvictArgs {
+    /// BLAKE3 hash of the blob to evict, encoded as 64 hex characters.
+    /// Optional `0x` / `0X` prefix is tolerated; mixed case is accepted.
+    /// Operators paste this from access logs / takedown notices.
+    #[arg(value_name = "HASH")]
+    pub hash: String,
+
+    /// Base URL of the node's admin HTTP surface. See `health --admin-url`
+    /// for resolution precedence (flag → env → config → default).
+    #[arg(long, value_name = "URL", env = "DECDN_ADMIN_URL")]
+    pub admin_url: Option<String>,
+
+    /// Path to the TOML config file used to derive the admin URL when
+    /// `--admin-url` / `DECDN_ADMIN_URL` are unset.
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+
+    /// Emit the admin response body as JSON instead of a human-readable line.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Roundtrip timeout in milliseconds.
+    #[arg(long, value_name = "MS", default_value_t = 5_000)]
+    pub timeout_ms: u64,
+}
+
+/// `decdn node announce` — publish a one-shot `NodeAnnounce` to gossip
+/// peers via `admin_v1_announce` (issue #280).
+#[derive(Args, Debug)]
+pub struct AnnounceArgs {
+    /// Base URL of the node's admin HTTP surface. See `health --admin-url`
+    /// for resolution precedence.
+    #[arg(long, value_name = "URL", env = "DECDN_ADMIN_URL")]
+    pub admin_url: Option<String>,
+
+    /// Path to the TOML config file used to derive the admin URL when
+    /// `--admin-url` / `DECDN_ADMIN_URL` are unset.
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+
+    /// Emit the admin response as JSON instead of a one-line confirmation.
     #[arg(long)]
     pub json: bool,
 
