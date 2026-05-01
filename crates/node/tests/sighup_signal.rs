@@ -58,6 +58,7 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
             origin_url: None,
             origin_path: None,
             decompress: true,
+            pinned_hashes: std::collections::HashSet::new(),
         },
         payment: ResolvedPayment { rate_per_mb: rate },
         observability: ResolvedObservability {

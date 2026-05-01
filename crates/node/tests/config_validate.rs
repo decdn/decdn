@@ -201,6 +201,7 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             origin_url: None::<decdn_cache::OriginUrl>,
             origin_path: None,
             decompress: true,
+            pinned_hashes: std::collections::HashSet::new(),
         },
         payment: ResolvedPayment { rate_per_mb: 10 },
         observability: ResolvedObservability {

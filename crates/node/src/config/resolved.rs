@@ -5,7 +5,10 @@
 
 #![allow(dead_code)] // Fields will be consumed by the node runtime.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
+
+use decdn_cache::Hash;
 
 use crate::cli::common::{LogFormat, LogLevel};
 
@@ -68,6 +71,12 @@ pub struct ResolvedCache {
     /// Whether to transparently decompress `Content-Encoding: gzip` /
     /// `zstd` responses from the HTTP origin (#312). Defaults to `true`.
     pub decompress: bool,
+    /// Operator-pinned blob hashes (#276). Hashes here are excluded from
+    /// LRU eviction candidates by [`decdn_cache::CacheEngine`]. Resolved
+    /// from the hex-encoded TOML form at load time, so any wrong-length
+    /// or non-hex entry fails config loading rather than turning into a
+    /// silent "this hash will be ignored" surprise.
+    pub pinned_hashes: HashSet<Hash>,
 }
 
 /// Resolved payment fields.

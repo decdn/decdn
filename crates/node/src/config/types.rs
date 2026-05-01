@@ -86,6 +86,13 @@ pub struct CacheConfig {
     /// whose origin is guaranteed to serve canonical bytes can set this
     /// to `false` to skip the decoder.
     pub decompress: Option<bool>,
+    /// Hex-encoded BLAKE3 hashes that must stay cached regardless of LRU
+    /// pressure (#276). Each entry is 64 lowercase hex chars (BLAKE3
+    /// digest size). Invalid hex or wrong-length entries cause config
+    /// resolution to fail — fail-fast at load time beats a silent
+    /// "entry was ignored" surprise hours later when the operator
+    /// discovers the blob got evicted anyway.
+    pub pinned_hashes: Option<Vec<String>>,
 }
 
 /// Payment section of the config file.
