@@ -109,8 +109,11 @@ Dependencies:
 - [`typst`](https://typst.app/) — `brew install typst` (PDF engine)
 - [`mermaid-filter`](https://github.com/raghur/mermaid-filter) — `npm install -g mermaid-filter` (renders ` ```mermaid ` blocks via headless Chromium pulled in by puppeteer; first install is ~150 MB)
 
+The `PATH` prefix below makes the build work even when your shell hasn't picked up npm's global bin directory:
+
 ```bash
 cd adr
+PATH="$(npm config get prefix)/bin:$PATH" \
 pandoc --from=markdown+gfm_auto_identifiers \
   --toc --toc-depth=2 \
   --pdf-engine=typst \
