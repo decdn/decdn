@@ -26,6 +26,27 @@ local function should_strip(text)
   return false
 end
 
+-- Collect every identifier from `node` and its full subtree into `into`.
+-- Headers are the common case but Div, CodeBlock, Figure, Table, and
+-- Inline elements (Span, Link) can also carry IDs that other parts of
+-- the doc reference; missing them produces dangling-label errors in
+-- typst when the host section gets stripped.
+local function collect_ids(node, into)
+  if node.identifier and node.identifier ~= "" then
+    into[node.identifier] = true
+  end
+  if node.walk then
+    node:walk({
+      Block = function(b)
+        if b.identifier and b.identifier ~= "" then into[b.identifier] = true end
+      end,
+      Inline = function(i)
+        if i.identifier and i.identifier ~= "" then into[i.identifier] = true end
+      end,
+    })
+  end
+end
+
 -- Run as a single document-level pass so the link-rewrite step can see the
 -- complete set of stripped IDs. Defining only `Pandoc` (not `Block`/`Link`)
 -- avoids the ordering hazard where a Block filter that drops a header runs
@@ -46,22 +67,25 @@ function Pandoc(doc)
       local text = pandoc.utils.stringify(el):lower()
       if (not stripping_at_level) and should_strip(text) then
         stripping_at_level = el.level
-        if el.identifier and el.identifier ~= "" then
-          stripped_ids[el.identifier] = true
-        end
+        collect_ids(el, stripped_ids)
       else
         if stripping_at_level then
-          -- Header nested under a stripped section — collect its ID so
-          -- inbound links to *sub*-sections also rewrite cleanly.
-          if el.identifier and el.identifier ~= "" then
-            stripped_ids[el.identifier] = true
-          end
+          -- Header nested under a stripped section — collect its ID
+          -- and any descendant IDs so inbound links to *sub*-elements
+          -- also rewrite cleanly.
+          collect_ids(el, stripped_ids)
         else
           table.insert(out_blocks, el)
         end
       end
     else
-      if not stripping_at_level then
+      if stripping_at_level then
+        -- Non-header block inside a stripped section. Walk its full
+        -- subtree for any identifier (Div, CodeBlock, Figure, Table,
+        -- Span, Link, …) before discarding so links pointing at those
+        -- IDs from elsewhere can be rewritten to plain text.
+        collect_ids(el, stripped_ids)
+      else
         table.insert(out_blocks, el)
       end
     end
