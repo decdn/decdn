@@ -10,7 +10,9 @@ pub mod run;
 pub use common::{LogFormat, default_config_path, default_data_dir};
 pub use config_cmd::{ConfigArgs, ConfigCommand, ConfigInitArgs, ConfigValidateArgs};
 pub use key_gen::KeyGenArgs;
-pub use node::{AnnounceArgs, EvictArgs, HealthArgs, NodeArgs, NodeCommand, PeersArgs, ReloadArgs};
+pub use node::{
+    AnnounceArgs, DrainArgs, EvictArgs, HealthArgs, NodeArgs, NodeCommand, PeersArgs, ReloadArgs,
+};
 pub use probe::ProbeArgs;
 pub use run::RunArgs;
 
