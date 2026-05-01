@@ -10,7 +10,7 @@ Sections below are anchored by source ADR. Cross-references back to each source 
 
 ## ADR 014 — Slash Signature Scheme
 
-Source: [ADR 014 § 1 — ECDSA Signature for `slash_sig`](../014-on-chain-verification.md#1-poc-approach-eip-712-secp256k1-on-existing-fields).
+Source: [ADR 014 § 1 — Ed25519 Signature Verification — Dual-Key Slash Signatures](../014-on-chain-verification.md#1-ed25519-signature-verification--dual-key-slash-signatures).
 
 The alternatives below are scoped to the choice of signature scheme used for on-chain slash evidence (`slash_sig` field on signed wire messages). The chosen design — dual-key slash signatures with secp256k1 `ecrecover` — is documented in ADR 014 § 1.
 
