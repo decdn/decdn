@@ -122,14 +122,16 @@ impl<K: std::hash::Hash + Eq + Clone> BoundedRateMap<K> {
 
     /// Consume one token for `key`. Returns `true` if the connection is allowed.
     fn try_consume(&mut self, key: &K, now: Instant) -> bool {
-        if !self.inner.contains_key(key) {
-            if self.inner.len() >= self.cap {
-                self.evict_oldest();
-            }
-            self.inner
-                .insert(key.clone(), TokenBucket::new(self.rate, self.burst));
+        if let Some(bucket) = self.inner.get_mut(key) {
+            return bucket.try_consume(now);
         }
-        self.inner.get_mut(key).is_some_and(|b| b.try_consume(now))
+        if self.inner.len() >= self.cap {
+            self.evict_oldest();
+        }
+        self.inner
+            .entry(key.clone())
+            .or_insert_with(|| TokenBucket::new(self.rate, self.burst))
+            .try_consume(now)
     }
 
     /// Evict the entry with the smallest `last_refill` (least recently touched).

@@ -108,6 +108,7 @@ struct FileSectionSnapshot {
     cache: Option<serde_json::Value>,
     gossip: Option<serde_json::Value>,
     observability: Option<serde_json::Value>,
+    security: Option<serde_json::Value>,
 }
 
 impl FileSectionSnapshot {
@@ -124,6 +125,7 @@ impl FileSectionSnapshot {
             cache: snap_section("cache", file.cache.as_ref()),
             gossip: snap_section("gossip", file.gossip.as_ref()),
             observability: snap_section("observability", file.observability.as_ref()),
+            security: snap_section("security", file.security.as_ref()),
         }
     }
 }
@@ -699,6 +701,11 @@ fn log_ignored_other_sections(file: &crate::config::FileConfig, prev: &FileSecti
     }
     if changed("gossip", file.gossip.as_ref(), prev.gossip.as_ref()) && file.gossip.is_some() {
         warn_ignored("gossip.* (announce_interval, peer_ttl, allowlist, subscribe_global)");
+    }
+    if changed("security", file.security.as_ref(), prev.security.as_ref())
+        && file.security.is_some()
+    {
+        warn_ignored("security.* (requires restart to take effect)");
     }
 }
 

@@ -653,8 +653,8 @@ fn resolve_security(file: Option<&types::SecurityConfig>) -> anyhow::Result<Reso
         .and_then(|s| s.per_node_rate_per_sec)
         .unwrap_or(DEFAULT_PER_NODE_RATE_PER_SEC);
     anyhow::ensure!(
-        per_node_rate_per_sec > 0.0,
-        "security.per_node_rate_per_sec must be > 0"
+        per_node_rate_per_sec.is_finite() && per_node_rate_per_sec > 0.0,
+        "security.per_node_rate_per_sec must be a finite positive number"
     );
 
     let per_node_burst = file
@@ -666,8 +666,8 @@ fn resolve_security(file: Option<&types::SecurityConfig>) -> anyhow::Result<Reso
         .and_then(|s| s.per_ip_rate_per_sec)
         .unwrap_or(DEFAULT_PER_IP_RATE_PER_SEC);
     anyhow::ensure!(
-        per_ip_rate_per_sec > 0.0,
-        "security.per_ip_rate_per_sec must be > 0"
+        per_ip_rate_per_sec.is_finite() && per_ip_rate_per_sec > 0.0,
+        "security.per_ip_rate_per_sec must be a finite positive number"
     );
 
     let per_ip_burst = file
