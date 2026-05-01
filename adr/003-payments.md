@@ -179,11 +179,7 @@ The financial cost to the attacker remains bounded: at the recommended 10 USDC p
 **Stale close**
 Client submits an old voucher (lower amount) to close the channel, underpaying the node.
 
-The dispute window (default 48 hours for PoC — raised from 24 hours to account for L2 forced inclusion delay; see [ADR 007](007-watchtower.md#l2-sequencer-censorship)) works if the node is online. The gap is liveness: if the node goes offline after a stale close is submitted and misses the dispute window, it loses the difference. Production deployments add a forced-inclusion deadline extension mechanism ([ADR 007](007-watchtower.md#l2-sequencer-censorship)) that provides additional safety margin, though the dispute window must still exceed the L2's maximum forced-inclusion delay for the extension to be effective. Options:
-
-- **Option A — Watchtowers.** A separate monitoring service holds the latest voucher and submits it on the node's behalf if a dispute is detected. Adds operational complexity but fully closes the gap.
-- **Option B — Longer dispute window.** Increase beyond 48 hours (up to the 72h governance max), giving operators more time to respond. Delays legitimate channel closes for everyone.
-- **Option C — Persistent monitoring process.** The node binary runs a lightweight dispute monitor as a separate thread that only watches the chain for close events, independent of the serving process. Simpler than a watchtower but still single-node.
+The dispute window (default 48 hours for PoC, raised from 24 hours to account for L2 forced-inclusion delay; see [ADR 007](007-watchtower.md#l2-sequencer-censorship)) covers this if the node is online. The liveness gap — node offline during the window — is the entire problem [ADR 007](007-watchtower.md) addresses: non-custodial watchtowers + an in-process dispute monitor + (production) a forced-inclusion deadline extension.
 
 ---
 
@@ -220,28 +216,23 @@ Fully solved by the self-enforcing protocol. The node cannot extract more paymen
 **Corrupted delivery**
 Node serves bytes that don't match the advertised BLAKE3 hash.
 
-BLAKE3 verification catches this immediately at the client. The remaining gap is the slash evidence path: submitting the full bad bytes on-chain to prove a BLAKE3 mismatch is gas-expensive for large blobs. **Resolved:** [ADR 014](014-on-chain-verification.md) specifies a single-round optimistic challenge-response for the PoC — the challenger submits the node's signed `StreamResponse` (proving commitment to serve the blob) plus a 100 TOKEN bond. The node has 24 hours to counter with delivery proof. If it cannot, it is slashed. The production path upgrades to an interactive keccak256 Merkle proof over 1024-byte chunks.
+Caught at the client by BLAKE3 verification. The on-chain slash-evidence path is in [ADR 014 § 2](014-on-chain-verification.md#2-blake3-content-corruption--optimistic-challenge-response): single-round optimistic challenge-response for PoC (signed `StreamResponse` + 100 TOKEN bond, 24h counter window), upgraded to an interactive keccak256 Merkle proof over 1024-byte chunks for production.
 
 ---
 
 **Rate bait-and-switch**
 Node advertises a low rate in probe responses then returns a higher rate in `StreamResponse`.
 
-**Resolved: slashable offense.** Both `ProbeResponse` and `StreamResponse` include cryptographic signatures over the advertised rate (see ADR 005). The on-chain verifier checks: (1) both signatures are valid and from the same NodeId, (2) `StreamResponse.rate_per_mb > ProbeResponse.rate_per_mb`, (3) `stream_response.timestamp_us >= probe_response.timestamp_us` (prevents unsigned underflow), and (4) `stream_response.timestamp_us - probe_response.timestamp_us < 30_000_000` (30 seconds in microseconds). Both `timestamp_us` values are requester-generated — the probe timestamp is echoed in `ProbeResponse`, and a separate requester timestamp from `StreamRequest` is echoed in `StreamResponse` — so the delta is computed from a single clock with no wall-clock reference or time oracle needed. **Clock skew immunity:** because both timestamps originate from the requester's clock (the node merely echoes them back in its signed response), clock skew between the requester and the node is irrelevant. The on-chain verifier never compares timestamps from different clocks — it only computes the delta between two requester-generated values extracted from signed messages. A node with a clock 5 minutes ahead or behind has zero effect on the 30-second window check. The node is slashed per the escalating schedule in [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn). The 30-second window allows legitimate rate changes between sessions while catching same-session bait-and-switch.
+**Resolved: slashable offense.** Both responses are signed over the advertised rate ([ADR 005](005-protocol.md)); a same-NodeId signed pair where `StreamResponse.rate_per_mb > ProbeResponse.rate_per_mb` and the requester-anchored timestamp delta is under 30 seconds is on-chain-verifiable evidence. Clock-skew immune (both timestamps originate from the requester's clock; the node echoes them back in its signed response). The slash schedule lives in [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn); see [ADR 014 § 1](014-on-chain-verification.md#1-ed25519-signature-verification--dual-key-slash-signatures) for the on-chain verifier.
 
 ---
 
 **Phantom blob announcement**
-Node announces a blob as cached then fails or redirects on actual request.
+Node announces a blob as cached (`has_blob: true` in a signed `ProbeResponse`) then fails or redirects on actual request.
 
-**Resolved: slashable offense.** The `ProbeResponse` includes a cryptographic signature over `{hash, has_blob, rate_per_mb, timestamp_us}` (see ADR 005). Two evidence paths exist:
+**Resolved: slashable offense.** A same-NodeId signed `ProbeResponse(has_blob: true)` paired with a signed `StreamResponse(ok: false)` or redirect for the same hash within a 30-second requester-anchored timestamp window is on-chain-verifiable evidence. The bare timeout / non-response case is reputation-only (no second signed message → not slashable on-chain). Slash schedule per [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn); on-chain verifier per [ADR 014 § 1](014-on-chain-verification.md#1-ed25519-signature-verification--dual-key-slash-signatures); 24-hour counter-evidence window.
 
-- **Signed refusal:** If the node returns a signed `StreamResponse` with `ok: false` or a redirect for the same blob hash, and `stream_response.timestamp_us >= probe_response.timestamp_us` and `stream_response.timestamp_us - probe_response.timestamp_us < 30_000_000` (30 seconds), the two signed messages constitute on-chain-verifiable evidence. Both `timestamp_us` values are requester-generated, so the delta is computed from a single clock with no wall-clock reference needed.
-- **Timeout / non-response:** If the node accepts the connection but never sends a `StreamResponse` (or drops the QUIC stream), there is no second signed message. The signed `ProbeResponse` alone is not sufficient for on-chain slashing. This case is handled by reputation penalties (immediate score reduction) rather than on-chain slashing — the absence of a signed response is not provable on-chain.
-
-The 30-second validity window is long enough for normal protocol flow (probe, selection, channel open, stream request). To prevent legitimate cache eviction from producing false slash evidence within this window, nodes MUST implement a **probe-triggered eviction hold**: when signing `has_blob: true` in a `ProbeResponse`, the node pins the blob against LRU/LFU eviction for at least `probe_hold_duration` (currently 35 seconds: the 30-second slashing window plus 5-second margin). A node that cannot guarantee the hold (hold budget exhausted or cache under extreme pressure) MUST respond `has_blob: false`. See [ADR 005, Probe-Triggered Eviction Hold](005-protocol.md#probe-triggered-eviction-hold) for implementation requirements. This design treats `has_blob: true` as a cryptographic availability commitment backed by a local resource reservation, consistent with the existing principle that nodes MUST NOT sign `has_blob: true` for blobs exceeding `max_blob_size` ([ADR 005](005-protocol.md#error-handling-and-retry-semantics)). The node is slashed per the escalating schedule in [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn). The challenged node has a 24-hour window to counter by proving it delivered the blob (signed delivery receipt from the same requester within the relevant time window). **Dependent parameters:** The probe cache TTL in [ADR 001](001-network.md) is set to half this 30-second window (15 seconds) to guarantee cached probes remain slashable. The `probe_hold_duration` ([ADR 005](005-protocol.md#probe-triggered-eviction-hold)) is set to this window plus 5 seconds. Changes to this window must be coordinated with both the probe cache TTL and the hold duration.
-
-**Edge case: hold violation.** If a node's eviction hold fails due to an implementation bug, operator misconfiguration, or extreme memory pressure (OOM), and the node signs `has_blob: true` but later returns `ok: false`, the existing 24-hour counter-window applies. However, eviction logs are self-generated and not on-chain verifiable, so the only valid counter-evidence remains proving delivery of the same blob to the same requester within the relevant time window. A node that experiences hold violations should increase its `max_probe_holds` budget, increase its cache size, or accept the slash as the cost of under-provisioning. This is intentional: the protocol does not subsidize under-provisioned nodes at the expense of slashing deterrence.
+To prevent legitimate cache eviction from producing false slash evidence inside the 30-second window, nodes MUST honor a **probe-triggered eviction hold** (35s, 30s slash window + 5s margin) — see [ADR 005 § Probe-Triggered Eviction Hold](005-protocol.md#probe-triggered-eviction-hold) for the requirement and dependent parameters (probe cache TTL, `probe_hold_duration`). Hold violations under OOM / under-provisioning fall to the same 24-hour counter-window; eviction logs are not on-chain verifiable, so only delivery-receipt counter-evidence rebuts. The protocol does not subsidize under-provisioning.
 
 ---
 
@@ -264,13 +255,7 @@ A third party holding a valid voucher calls `closeChannel` to force the channel 
 **Eclipse attack**
 Attacker surrounds a client with malicious nodes so all probe responses come from nodes under attacker control.
 
-BLAKE3 verification catches data corruption regardless of which nodes are in the peer table. The remaining gap is a denial-of-service variant: an attacker controlling all of a client's known nodes can simply refuse to serve. Options:
-
-- **Option A — Origin-backed nodes as fallback.** Clients can specifically query the registry for well-known origin-backed nodes for a given blob, bypassing the general peer table. An eclipse must also control all origin-backed nodes for the target content — which requires capital proportional to the number of origin-backed nodes for that content.
-- **Option B — Multi-source bootstrap.** Clients discover initial peers from at least two independent sources (on-chain registry + a hardcoded DNS seed list). An attacker must compromise both to fully eclipse a client.
-- **Option C — Minimum honest-peer diversity.** Clients maintain connections to at least N nodes discovered via different paths. All N would need to be attacker-controlled for a full eclipse.
-
-> **Resolved in [ADR 012](012-client.md):** Option B (multi-source bootstrap) for production; registry-only for PoC. Option C adopted as supplementary client-side policy.
+BLAKE3 verification catches data corruption regardless of peer-table composition; the remaining DoS variant (attacker-controlled peer set refuses to serve) is resolved in [ADR 012 § Bootstrap and Trust Model](012-client.md): production uses multi-source bootstrap (on-chain registry + hardcoded DNS seeds) so an attacker must compromise both to fully eclipse a client; minimum honest-peer diversity is a supplementary client-side policy. PoC is registry-only.
 
 ---
 
@@ -345,38 +330,27 @@ struct Channel {
 
 > **Terminology:** `channelNonce` (the channel creation counter) is distinct from the voucher `nonce` (the monotonic sequence number within a channel used in EIP-712 voucher signatures). The former uniquely identifies channels; the latter orders vouchers within a channel. [ADR 010](010-multi-token.md) extends this formula to `keccak256(client, provider, token, channelNonce)` for multi-token support. In implementation, consider naming the on-chain mapping `clientChannelCounter` to avoid confusion with voucher nonces.
 
-```solidity
-interface IStablePaymentChannel {
-    // Channel nonce tracking (see "Channel ID" above for terminology)
-    function clientChannelNonce(address client) external view returns (uint256);
+| Group | Function | Purpose |
+| --- | --- | --- |
+| Nonce | `clientChannelNonce(client) → uint256` | Per-client monotonic counter used in `channelId` derivation. |
+| Lifecycle | `openChannel(provider, deposit) → channelId` | Open a USDC channel; increments `clientChannelNonce[msg.sender]` then derives `channelId`. |
+| Lifecycle | `topUp(channelId, additionalDeposit)` | Client-only: add funds to an open channel (does not extend `expiresAt`). |
+| Lifecycle | `closeChannel(channelId, amount, nonce, bytesDelivered, signature)` | Client or provider: initiate close with the latest voucher; starts dispute window. |
+| Lifecycle | `disputeChannel(channelId, amount, nonce, bytesDelivered, signature)` | Any address: submit a higher-nonce voucher during the dispute window. |
+| Lifecycle | `commitReceiptRoot(channelId, receiptBatchRoot)` | Provider-only: store the ADR 027 §4 batch root for gauge-eligibility credit at settlement. |
+| Lifecycle | `settleChannel(channelId)` | Post-dispute-window: forward `claimedAmount` USDC + stored receipt root to `FeeRouter`; refund unused deposit. |
+| Lifecycle | `reclaimExpired(channelId)` | Client or provider: refund full deposit on an expired channel that was never closed. |
+| View | `getChannel(channelId) → Channel` | Read the on-chain `Channel` struct. |
+| View | `getRateBounds() → (floor, ceiling)` | Current `RateBounds` in token base units. |
+| View | `feeRouter() → address` | Configured `FeeRouter` target ([ADR 026](026-gauge-boost-tokenomics.md)). |
+| View | `lifetimeDepositOf(client) → uint256` | Monotonic per-client cumulative deposit counter (per [ADR 027 §3](027-distinct-client-receipts.md#3-identity-diversity-gating)). |
+| Governance | `setFeeRouter(addr)` | Replace router target; replaces ADR 003 inline-skim governance per ADR 026. |
+| Governance | `setMinDeposit(amount)` | Minimum channel deposit. |
+| Governance | `setDisputeWindow(seconds)` | Dispute window (bounded 43200–259200 — 12h–72h). |
+| Governance | `setRateBounds(floor, ceiling)` | Rate floor and ceiling in token base units. |
+| Governance | `setMaxVoucherIntervalMb(mb)` | Max negotiable voucher interval (bounded 1–1024 MB). |
 
-    // Channel lifecycle (openChannel increments clientChannelNonce[msg.sender] and uses it in channelId)
-    function openChannel(address provider, uint256 deposit) external returns (bytes32 channelId);
-    function topUp(bytes32 channelId, uint256 additionalDeposit) external;
-    function closeChannel(bytes32 channelId, uint256 amount, uint256 nonce, uint256 bytesDelivered, bytes calldata signature) external;
-    function disputeChannel(bytes32 channelId, uint256 amount, uint256 nonce, uint256 bytesDelivered, bytes calldata signature) external;
-    function commitReceiptRoot(bytes32 channelId, bytes32 receiptBatchRoot) external; // provider-only; stores root for gauge-eligibility credit at settlement (ADR 027 §4)
-    function settleChannel(bytes32 channelId) external; // forwards claimedAmount USDC + stored receiptBatchRoot to FeeRouter (see FeeRouter Integration)
-    function reclaimExpired(bytes32 channelId) external;
-
-    // Views
-    function getChannel(bytes32 channelId) external view returns (Channel memory);
-    function getRateBounds() external view returns (uint256 deliveryFloor, uint256 deliveryCeiling);
-    function feeRouter() external view returns (address); // configured FeeRouter target (ADR 026)
-    function lifetimeDepositOf(address client) external view returns (uint256); // monotonic per-client cumulative deposit counter — added per ADR 027 §3 distinct-client gating
-
-    // Governance
-    function setFeeRouter(address router) external;       // routeSettlement target; replaces ADR 003 inline-skim governance per ADR 026
-    function setMinDeposit(uint256 amount) external;
-    function setDisputeWindow(uint256 seconds_) external;
-    function setRateBounds(uint256 deliveryFloor, uint256 deliveryCeiling) external;
-    function setMaxVoucherIntervalMb(uint256 mb) external;
-
-    // Removed under ADR 026: setFeePercentage, setDiscountedFeePercentage, setTreasuryAddress.
-    // Bucket shares (40/40/7/5/5/3) are governed on FeeRouter, not StablePaymentChannel; the
-    // treasury share (5%) is configured on FeeRouter and not addressed here.
-}
-```
+Under [ADR 026](026-gauge-boost-tokenomics.md) the `setFeePercentage`, `setDiscountedFeePercentage`, and `setTreasuryAddress` setters from earlier drafts are removed — bucket shares (40/40/7/5/5/3) are governed on `FeeRouter`, not on `StablePaymentChannel`; the treasury share (5%) is configured on `FeeRouter`.
 
 > **Reentrancy protection:** All state-mutating functions that perform external calls (ERC-20 transfers) — `openChannel`, `topUp`, `settleChannel`, `reclaimExpired` — MUST use `nonReentrant` guards and follow checks-effects-interactions. This is especially critical for the production multi-token contract ([ADR 010](010-multi-token.md)) which accepts arbitrary governance-approved tokens.
 
@@ -390,83 +364,23 @@ interface IStablePaymentChannel {
 
 **`lifetimeDepositOf` semantics (added per [ADR 027 §3](027-distinct-client-receipts.md#3-identity-diversity-gating)).** Per-client cumulative-deposit counter exposed via `lifetimeDepositOf(client) view returns (uint256)`. Backed by a `mapping(address => uint256) lifetimeDeposit` storage slot. Incremented by the funded amount on every `openChannel` (by `deposit`) and every `topUp` (by `additionalDeposit`) attributable to the client. **Monotonic** — settlement, withdrawal, channel closure, expiry, or slashing MUST NOT decrease it. Returns `0` for an address with no prior channel funding history. Used by ADR 027 distinct-client gating as a cheap on-chain signal of cumulative capital ever bonded by this client (one SSTORE per `openChannel` / `topUp`).
 
-**Initial deployment values.** The constructor (or initializer for proxy deployments) sets governable parameters to their PoC defaults. All values are within the hardcoded safety bounds table further below (see also [ADR 009](009-governance.md) for governance ranges):
+**Initial deployment values.** The constructor takes `(usdc, feeRouter, disputeWindow)` and sets the remaining governable parameters to their PoC defaults: `maxVoucherIntervalMb = 1` (1 MB) and `maxChannelDuration = 7776000` (90 days). All values are within the hardcoded safety bounds table further below (see also [ADR 009](009-governance.md) for governance ranges). The constructor MUST reject `feeRouter == address(0)` and a `feeRouter` whose code size is zero (EOA / undeployed address).
 
-```solidity
-constructor(address usdc_, address feeRouter_, uint256 disputeWindow_) {
-    require(disputeWindow_ >= 43200 && disputeWindow_ <= 259200, "out of bounds");
-    require(feeRouter_ != address(0), "router required");
-    require(feeRouter_.code.length > 0, "router not a contract"); // extcodesize > 0; rejects EOA / undeployed addresses
-    usdc = usdc_;
-    feeRouter = feeRouter_;
-    disputeWindow = disputeWindow_;   // PoC default: 172800 (48 hours)
-    maxVoucherIntervalMb = 1;         // 1 MB
-    maxChannelDuration = 7776000;     // 90 days
-}
-```
+Default PoC deployment value for `disputeWindow`: **172800 seconds (48 hours)** — raised from 24 hours to guarantee effective dispute response time under L2 sequencer censorship (see [ADR 007](007-watchtower.md#l2-sequencer-censorship)). Safety bounds per [ADR 009](009-governance.md): 43200–259200 seconds (12h–72h). Under ADR 026 the `feePercentage` / `discountedFeePercentage` / treasury-address constructor parameters from earlier drafts are removed; bucket shares are governed on `FeeRouter` instead, and the treasury bucket is one of `FeeRouter`'s six buckets (see [FeeRouter Integration](#feerouter-integration)).
 
-Under [ADR 026](026-gauge-boost-tokenomics.md), `feePercentage` and `discountedFeePercentage` no longer exist on `StablePaymentChannel`; bucket shares are governed on `FeeRouter` instead. The constructor takes the deployed `FeeRouter` address rather than a treasury address; the treasury bucket is one of `FeeRouter`'s six buckets (see [FeeRouter Integration](#feerouter-integration)).
+**Events.** All events use indexed `channelId` plus an indexed actor field where applicable.
 
-Default PoC deployment value for `disputeWindow`: **172800 seconds (48 hours)** — raised from 24 hours to guarantee effective dispute response time under L2 sequencer censorship (see [ADR 007](007-watchtower.md#l2-sequencer-censorship)). Safety bounds per [ADR 009](009-governance.md): 43200–259200 seconds (12h–72h).
+| Event | Emitted by | Non-indexed fields |
+| --- | --- | --- |
+| `ChannelCloseInitiated(channelId, initiator, …)` | `closeChannel` | `amount, nonce, bytesDelivered, disputeDeadline` |
+| `ChannelDisputed(channelId, disputor, …)` | `disputeChannel` | `newAmount, newNonce, newBytes` |
+| `ChannelSettled(channelId, provider, …)` | `settleChannel` | `routedAmount` (USDC forwarded to `FeeRouter` = `claimedAmount`), `bytesDelivered` (counted toward operator's epoch byte counter), `clientRefund` |
+| `ChannelExpiredReclaimed(channelId, client, …)` | `reclaimExpired` | `deposit` |
+| `ChannelToppedUp(channelId, …)` | `topUp` | `additionalDeposit, newDeposit` |
+| `ChannelForceClosedByTokenRemoval(channelId, token, caller, …)` | `forceCloseChannel` (production `PaymentChannel` only — see [ADR 010](010-multi-token.md)) | `disputeDeadline` |
+| `RateBoundsUpdated` | `setRateBounds` | `newDeliveryFloor, newDeliveryCeiling` |
 
-**Channel close events:**
-
-```solidity
-event ChannelCloseInitiated(
-    bytes32 indexed channelId,
-    address indexed initiator,
-    uint256 amount,
-    uint256 nonce,
-    uint256 bytesDelivered,
-    uint256 disputeDeadline
-);
-
-event ChannelDisputed(
-    bytes32 indexed channelId,
-    address indexed disputor,
-    uint256 newAmount,
-    uint256 newNonce,
-    uint256 newBytes
-);
-
-event ChannelSettled(
-    bytes32 indexed channelId,
-    address indexed provider,
-    uint256 routedAmount,     // USDC forwarded to FeeRouter (= claimedAmount)
-    uint256 bytesDelivered,   // bytes counted toward operator's epoch byte counter
-    uint256 clientRefund
-);
-
-// Note: there is no `protocolFee` field — `settleChannel` does not skim a fee
-// inline. The bucket distribution emits its own events from FeeRouter
-// (see FeeRouter Integration).
-
-event ChannelExpiredReclaimed(
-    bytes32 indexed channelId,
-    address indexed client,
-    uint256 deposit
-);
-
-// Production PaymentChannel only (ADR 010); not part of the PoC StablePaymentChannel interface
-event ChannelForceClosedByTokenRemoval(
-    bytes32 indexed channelId,
-    address indexed token,
-    address indexed caller,
-    uint256 disputeDeadline
-);
-
-event ChannelToppedUp(
-    bytes32 indexed channelId,
-    uint256 additionalDeposit,
-    uint256 newDeposit
-);
-
-// Governance events (emitted by setRateBounds)
-event RateBoundsUpdated(
-    uint256 newDeliveryFloor,
-    uint256 newDeliveryCeiling
-);
-```
+`ChannelSettled` carries no `protocolFee` field — `settleChannel` does not skim a fee inline. The bucket distribution emits its own events from `FeeRouter` (see [FeeRouter Integration](#feerouter-integration)).
 
 **Channel expiry:** `expiresAt` is set at channel open: `expiresAt = block.timestamp + maxChannelDuration`. The `maxChannelDuration` parameter defaults to 90 days and is governable within hardcoded bounds (minimum 7 days, maximum 365 days). Channel expiry protects clients from indefinitely locked funds when a node disappears without closing the channel.
 
@@ -522,21 +436,14 @@ For how nodes validate `rate_per_mb` against cached bounds before signing protoc
 
 ### BuybackBurner
 
-```solidity
-interface IBuybackBurner {
-    function executeBuyback(address token, uint256 amount, uint256 minTokenOut) external;
-    function setKeeper(address keeper) external;
-    function setSwapRouter(address router) external;
-    function setPool(address pool) external;
-    function setSlippageTolerance(uint256 bps) external;
-    function setMinBuybackAmount(uint256 amount) external;
-    function setMaxBuybackAmount(uint256 amount) external;
-    function keeper() external view returns (address);
-    function getAccumulatedFees(address token) external view returns (uint256);
-}
-```
+| Function | Purpose |
+| --- | --- |
+| `executeBuyback(token, amount, minTokenOut)` | Governance multisig or `keeper`: swap `amount` of `token` for ≥ `minTokenOut` TOKEN and burn the proceeds. |
+| `setKeeper(addr)` / `setSwapRouter(addr)` / `setPool(addr)` | Governance: rotate the authorized keeper, swap router, or pool. |
+| `setSlippageTolerance(bps)` / `setMinBuybackAmount(n)` / `setMaxBuybackAmount(n)` | Governance: per-call execution guards. |
+| `keeper() → address` / `getAccumulatedFees(token) → uint256` | Views: current keeper and accumulated buyback inflow per token. |
 
-This interface is the canonical specification for `BuybackBurner`. [ADR 026 §2](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553) defines the economic parameters and the inflow source (5% router-fed). [ADR 018](018-liquidity-strategy.md) specifies the venue (Balancer V3 Router + 80/20 weighted pool) and how `setSwapRouter` and `setPool` are configured at deployment. **V3 integration note:** `setSwapRouter` holds the Balancer V3 **Router** address, but the `BuybackBurner` contract itself MUST self-approve the Balancer V3 **Vault** address (a separate contract) during initialization — the Vault pulls input tokens from the `msg.sender` of the Router call. See [ADR 018 — Buyback execution via Balancer V3](018-liquidity-strategy.md#buyback-execution-via-balancer-v3).
+This is the canonical `BuybackBurner` interface. [ADR 026 §2](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553) defines the economic parameters and the inflow source (5% router-fed). [ADR 018](018-liquidity-strategy.md) specifies the venue (Balancer V3 Router + 80/20 weighted pool) and how `setSwapRouter` / `setPool` are configured at deployment. **V3 integration note:** `setSwapRouter` holds the Balancer V3 **Router** address, but `BuybackBurner` MUST self-approve the Balancer V3 **Vault** address (a separate contract) during initialization — the Vault pulls input tokens from the `msg.sender` of the Router call. See [ADR 018 — Buyback execution via Balancer V3](018-liquidity-strategy.md#buyback-execution-via-balancer-v3).
 
 `executeBuyback` is callable by governance multisig or the authorized `keeper` address. All `set*` functions are governance-only behind a timelock.
 
@@ -638,32 +545,13 @@ The full node registry interface (`NodeInfo`, `registerNode` with atomic binding
 
 The remaining payment-specific `StakingRegistry` extension is the optional client-priority-staking mechanism below.
 
-```solidity
-using SafeERC20 for IERC20;
+| Function | Purpose |
+| --- | --- |
+| `clientStake(amount)` | `nonReentrant`: pull `amount` TOKEN via `safeTransferFrom`; bump `clientStakes[msg.sender]`; emit `ClientStaked`. No slashing. |
+| `clientUnstake(amount)` | `nonReentrant`: require sufficient stake; decrement `clientStakes[msg.sender]`; transfer back via `safeTransfer`; emit `ClientUnstaked`. |
+| `clientStakeOf(client) → uint256` | View the address's current stake. |
 
-// Client staking (optional, no slashing)
-mapping(address => uint256) public clientStakes;
-
-event ClientStaked(address indexed client, uint256 amount, uint256 newTotal);
-event ClientUnstaked(address indexed client, uint256 amount, uint256 newTotal);
-
-function clientStake(uint256 amount) external nonReentrant {
-    token.safeTransferFrom(msg.sender, address(this), amount);
-    clientStakes[msg.sender] += amount;
-    emit ClientStaked(msg.sender, amount, clientStakes[msg.sender]);
-}
-
-function clientUnstake(uint256 amount) external nonReentrant {
-    require(clientStakes[msg.sender] >= amount);
-    clientStakes[msg.sender] -= amount;
-    token.safeTransfer(msg.sender, amount);
-    emit ClientUnstaked(msg.sender, amount, clientStakes[msg.sender]);
-}
-
-function clientStakeOf(address client) external view returns (uint256) {
-    return clientStakes[client];
-}
-```
+Storage: `mapping(address => uint256) public clientStakes`. Events: `ClientStaked(client, amount, newTotal)`, `ClientUnstaked(client, amount, newTotal)`. Uses `SafeERC20` for the `IERC20` token (the protocol's TOKEN, per [ADR 026](026-gauge-boost-tokenomics.md)).
 
 ## Client Priority Staking
 
