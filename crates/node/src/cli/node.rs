@@ -21,6 +21,15 @@ pub enum NodeCommand {
     Peers(PeersArgs),
     /// Print a running node's identity and process uptime.
     Health(HealthArgs),
+    /// Forcibly remove a single blob from the local cache (issue #279).
+    /// Useful for DMCA takedown, corruption recovery, and storage
+    /// reclamation. Optionally re-pulls the blob from the configured
+    /// origin afterward via `--re-pin`.
+    Evict(EvictArgs),
+    /// Publish a one-shot `NodeAnnounce` to gossip peers immediately
+    /// rather than waiting for the periodic announce interval (issue
+    /// #280). Useful after editing `rate_per_mb` or `region` in config.
+    Announce(AnnounceArgs),
 }
 
 /// `decdn node health` — report identity (hex `node_id`) and process
@@ -46,6 +55,67 @@ pub struct HealthArgs {
 
     /// Emit the admin response body as JSON instead of two human-
     /// readable lines.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Roundtrip timeout in milliseconds.
+    #[arg(long, value_name = "MS", default_value_t = 5_000)]
+    pub timeout_ms: u64,
+}
+
+/// `decdn node evict` — forcibly remove a blob from the local cache via
+/// `admin_v1_evict` (issue #279).
+#[derive(Args, Debug)]
+pub struct EvictArgs {
+    /// BLAKE3 hash of the blob to evict, encoded as 64 lowercase hex
+    /// characters. Operators paste this from access logs / takedown
+    /// notices; mixed-case input is accepted (the server normalizes).
+    #[arg(value_name = "HASH")]
+    pub hash: String,
+
+    /// After evicting, clear the eviction flag and re-pull the blob from
+    /// the configured origin. Useful when an existing local copy is
+    /// suspected to be corrupted and the operator wants a fresh fetch
+    /// rather than just a removal.
+    #[arg(long)]
+    pub re_pin: bool,
+
+    /// Base URL of the node's admin HTTP surface. See `health --admin-url`
+    /// for resolution precedence (flag → env → config → default).
+    #[arg(long, value_name = "URL", env = "DECDN_ADMIN_URL")]
+    pub admin_url: Option<String>,
+
+    /// Path to the TOML config file used to derive the admin URL when
+    /// `--admin-url` / `DECDN_ADMIN_URL` are unset.
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+
+    /// Emit the admin response body as JSON instead of a human-readable line.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Roundtrip timeout in milliseconds. The default is generous because
+    /// `--re-pin` may trigger an origin pull, which can take seconds for
+    /// large blobs over slow links.
+    #[arg(long, value_name = "MS", default_value_t = 30_000)]
+    pub timeout_ms: u64,
+}
+
+/// `decdn node announce` — publish a one-shot `NodeAnnounce` to gossip
+/// peers via `admin_v1_announce` (issue #280).
+#[derive(Args, Debug)]
+pub struct AnnounceArgs {
+    /// Base URL of the node's admin HTTP surface. See `health --admin-url`
+    /// for resolution precedence.
+    #[arg(long, value_name = "URL", env = "DECDN_ADMIN_URL")]
+    pub admin_url: Option<String>,
+
+    /// Path to the TOML config file used to derive the admin URL when
+    /// `--admin-url` / `DECDN_ADMIN_URL` are unset.
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+
+    /// Emit the admin response as JSON instead of a one-line confirmation.
     #[arg(long)]
     pub json: bool,
 

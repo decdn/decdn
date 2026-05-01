@@ -1,6 +1,6 @@
 //! Cache engine: local iroh-blobs store fronted by an [`Origin`] for misses.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -33,6 +33,16 @@ struct Inner {
     /// subsequent callers wait on the [`Notify`] rather than issuing a
     /// duplicate origin fetch (coalescing, fixes #305).
     inflight: Mutex<HashMap<Hash, Arc<Notify>>>,
+    /// Hashes the operator has explicitly evicted via [`CacheEngine::evict`]
+    /// (issue #279). Membership is honored by [`CacheEngine::has`] and
+    /// [`CacheEngine::get`] so an evicted blob is not served, even though
+    /// the underlying iroh-blobs store may still hold the bytes — iroh-blobs
+    /// 0.99 does not expose a public delete (`Blobs::delete` is `pub(crate)`,
+    /// reserved for the GC task, see issue #233). Reclaim of disk bytes
+    /// happens on the next GC sweep once that lands. Calling
+    /// [`CacheEngine::unevict`] re-arms the hash for serving, used by the
+    /// admin `--re-pin` path.
+    evicted: Mutex<HashSet<Hash>>,
 }
 
 /// Coarse-grained cache statistics.
@@ -100,18 +110,65 @@ impl CacheEngine {
                 max_blob_bytes,
                 access_times: Mutex::new(HashMap::new()),
                 inflight: Mutex::new(HashMap::new()),
+                evicted: Mutex::new(HashSet::new()),
             }),
         })
     }
 
     /// Is this blob already present in the local store?
+    ///
+    /// Returns `Ok(false)` when the hash has been logically evicted (issue
+    /// #279) even if the underlying store still holds the bytes — operators
+    /// who call `evict` expect the node to stop serving immediately, so
+    /// `has` reports the blob as absent.
     pub async fn has(&self, hash: Hash) -> CacheResult<bool> {
+        if self.is_evicted(hash) {
+            return Ok(false);
+        }
         self.inner
             .store
             .blobs()
             .has(hash)
             .await
             .map_err(|e| CacheError::Store(anyhow::Error::from(e)))
+    }
+
+    /// Mark `hash` as evicted: subsequent [`Self::has`] / [`Self::get`] calls
+    /// behave as if the blob is absent (returning `false` / `NotFound`
+    /// respectively). The corresponding [`Self::access_times_snapshot`] entry
+    /// is cleared so future LRU sweeps don't re-surface the hash.
+    ///
+    /// This is a *logical* evict: iroh-blobs 0.99 does not expose a public
+    /// `delete` API (see issue #233), so the bytes remain on disk until the
+    /// internal GC sweep reclaims them. The operator-visible behavior — the
+    /// node stops serving the blob immediately — is what `decdn node evict`
+    /// (issue #279) needs for use cases like DMCA takedown and corruption
+    /// recovery. Use [`Self::unevict`] to re-arm a hash for serving.
+    pub fn evict(&self, hash: Hash) {
+        if let Ok(mut guard) = self.inner.evicted.lock() {
+            guard.insert(hash);
+        }
+        if let Ok(mut guard) = self.inner.access_times.lock() {
+            guard.remove(&hash);
+        }
+    }
+
+    /// Reverse [`Self::evict`]: clear the logical-eviction flag for `hash`
+    /// so it can be served again. Used by the admin `--re-pin` path before
+    /// a fresh `get` triggers a pull-through from the configured origin.
+    pub fn unevict(&self, hash: Hash) {
+        if let Ok(mut guard) = self.inner.evicted.lock() {
+            guard.remove(&hash);
+        }
+    }
+
+    /// Has this hash been logically evicted via [`Self::evict`]?
+    pub fn is_evicted(&self, hash: Hash) -> bool {
+        self.inner
+            .evicted
+            .lock()
+            .ok()
+            .is_some_and(|guard| guard.contains(&hash))
     }
 
     /// Fetch the blob by hash. Hits the local store on a cache hit; on a miss
@@ -131,6 +188,15 @@ impl CacheEngine {
         if self.has(hash).await? {
             self.touch(hash);
             return self.read_local(hash).await;
+        }
+
+        // Logical-eviction guard (#279): once an operator has run
+        // `decdn node evict <hash>`, a subsequent `get` must not silently
+        // re-pull from the origin and undo the eviction. The admin
+        // `--re-pin` flow is responsible for clearing the flag via
+        // [`Self::unevict`] before issuing a fresh fetch.
+        if self.is_evicted(hash) {
+            return Err(CacheError::NotFound { hash });
         }
 
         // Coalesce concurrent pull-through requests for the same hash (#305).
@@ -598,6 +664,83 @@ mod tests {
             inflight_len == 0,
             "inflight map should be empty after cancellation, had {inflight_len} entries"
         );
+        Ok(())
+    }
+
+    /// `evict` must take a previously-cached hash off the served set. After
+    /// evict, `has` reports false and `get` returns `NotFound` rather than
+    /// silently re-pulling from the origin (which would defeat the point of
+    /// the takedown / corruption-recovery use case behind issue #279).
+    #[tokio::test]
+    async fn evict_blocks_subsequent_serve() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"evict me";
+        let hash = Hash::new(payload);
+        let origin = StubOrigin::new(payload);
+
+        let engine = CacheEngine::open(tmp.path(), Some(Arc::new(origin)), 10).await?;
+
+        // Prime the cache so we evict a real, served blob — covers the
+        // hot path the operator would actually be evicting.
+        let _ = engine.get(hash).await?;
+        anyhow::ensure!(
+            engine.has(hash).await?,
+            "expected blob present before evict"
+        );
+
+        engine.evict(hash);
+
+        anyhow::ensure!(engine.is_evicted(hash), "evict flag not set");
+        anyhow::ensure!(
+            !engine.has(hash).await?,
+            "has() should report absent after evict"
+        );
+        match engine.get(hash).await {
+            Err(CacheError::NotFound { .. }) => Ok(()),
+            other => Err(anyhow::anyhow!(
+                "expected NotFound after evict, got {other:?}"
+            )),
+        }
+    }
+
+    /// `unevict` clears the flag so `get` can re-pull from the origin (the
+    /// `--re-pin` flow in issue #279). Without this test, a regression that
+    /// left `evicted` populated forever — e.g. a typo'd `insert` instead of
+    /// `remove` in `unevict` — would still pass `evict_blocks_subsequent_serve`.
+    #[tokio::test]
+    async fn unevict_re_arms_serve_path() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"unevict me";
+        let hash = Hash::new(payload);
+        let origin = StubOrigin::new(payload);
+
+        let engine = CacheEngine::open(tmp.path(), Some(Arc::new(origin)), 10).await?;
+        let _ = engine.get(hash).await?;
+
+        engine.evict(hash);
+        engine.unevict(hash);
+
+        anyhow::ensure!(!engine.is_evicted(hash), "evict flag should be cleared");
+        // After unevict, `has` may report true (bytes never left the iroh
+        // store) OR false (depending on iroh's internal state); `get`
+        // is the operator-facing contract — it must succeed.
+        let bytes = engine.get(hash).await?;
+        anyhow::ensure!(
+            bytes == payload.as_ref(),
+            "unexpected payload after unevict"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn evict_unknown_hash_is_a_no_op() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let engine = CacheEngine::open(tmp.path(), None, 10).await?;
+        let unknown = Hash::new(b"never seen");
+        // Evicting a hash we've never cached is fine — operators may run
+        // `decdn node evict` ahead of time as a precaution.
+        engine.evict(unknown);
+        anyhow::ensure!(engine.is_evicted(unknown), "evict flag not set");
         Ok(())
     }
 }

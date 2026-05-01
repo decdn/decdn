@@ -10,7 +10,10 @@ use jsonrpsee::core::client::Error as JsonRpcClientError;
 use jsonrpsee::http_client::HttpClientBuilder;
 use serde::Deserialize;
 
-use crate::admin::{AdminRpcClient, HealthResponse, PeerView, PeersResponse};
+use crate::admin::{
+    AdminRpcClient, AnnounceResponse, EvictRequest, EvictResponse, HealthResponse, PeerView,
+    PeersResponse,
+};
 use crate::cli;
 use crate::cli::common::expand_tilde;
 use crate::config::DEFAULT_ADMIN_PORT;
@@ -60,6 +63,8 @@ pub async fn node_dispatch(
     match &args.cmd {
         cli::NodeCommand::Peers(p) => peers(p, global_config).await,
         cli::NodeCommand::Health(h) => health(h, global_config).await,
+        cli::NodeCommand::Evict(e) => evict(e, global_config).await,
+        cli::NodeCommand::Announce(a) => announce(a, global_config).await,
     }
 }
 
@@ -95,6 +100,96 @@ pub async fn health(args: &cli::HealthArgs, global_config: Option<&Path>) -> any
         // node_id=` works in operator scripts without `--json`.
         println!("node_id={}", resp.node_id);
         println!("uptime_s={}", resp.uptime_s);
+    }
+
+    Ok(())
+}
+
+/// `decdn node evict`: call `admin_v1_evict` on the running node to
+/// forcibly remove a single blob from the local cache (issue #279).
+/// Optionally re-pulls from the configured origin via `--re-pin`.
+pub async fn evict(args: &cli::EvictArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        args.timeout_ms > 0,
+        "--timeout-ms must be > 0 (jsonrpsee treats Duration::ZERO as \
+         'never' rather than 'sub-millisecond deadline')"
+    );
+
+    let config_path = args.config.as_deref().or(global_config);
+    let url = resolve_admin_url(args.admin_url.as_deref(), config_path)?;
+
+    let client = HttpClientBuilder::default()
+        .request_timeout(Duration::from_millis(args.timeout_ms))
+        .build(&url)
+        .with_context(|| format!("failed to build admin JSON-RPC client for {url}"))?;
+
+    let resp: EvictResponse = client
+        .evict(EvictRequest {
+            hash: args.hash.clone(),
+            re_pin: args.re_pin,
+        })
+        .await
+        .map_err(|err| classify_client_error(&url, args.timeout_ms, err))?;
+
+    if args.json {
+        let pretty =
+            serde_json::to_string_pretty(&resp).context("failed to encode evict response")?;
+        println!("{pretty}");
+    } else {
+        let presence = if resp.was_present {
+            "evicted"
+        } else {
+            // Operator ran evict on a hash the node never held — log it
+            // explicitly rather than printing nothing, otherwise scripts
+            // can't tell success-with-no-effect from a hung command.
+            "not present"
+        };
+        if args.re_pin {
+            let outcome = if resp.repinned { "ok" } else { "failed" };
+            println!("hash={} status={presence} repinned={outcome}", args.hash);
+        } else {
+            println!("hash={} status={presence}", args.hash);
+        }
+    }
+
+    Ok(())
+}
+
+/// `decdn node announce`: call `admin_v1_announce` on the running node to
+/// publish a one-shot `NodeAnnounce` outside the periodic interval (issue
+/// #280).
+pub async fn announce(
+    args: &cli::AnnounceArgs,
+    global_config: Option<&Path>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        args.timeout_ms > 0,
+        "--timeout-ms must be > 0 (jsonrpsee treats Duration::ZERO as \
+         'never' rather than 'sub-millisecond deadline')"
+    );
+
+    let config_path = args.config.as_deref().or(global_config);
+    let url = resolve_admin_url(args.admin_url.as_deref(), config_path)?;
+
+    let client = HttpClientBuilder::default()
+        .request_timeout(Duration::from_millis(args.timeout_ms))
+        .build(&url)
+        .with_context(|| format!("failed to build admin JSON-RPC client for {url}"))?;
+
+    let resp: AnnounceResponse = client
+        .announce()
+        .await
+        .map_err(|err| classify_client_error(&url, args.timeout_ms, err))?;
+
+    if args.json {
+        let pretty =
+            serde_json::to_string_pretty(&resp).context("failed to encode announce response")?;
+        println!("{pretty}");
+    } else {
+        // The trigger is fire-and-forget on the publisher side, so this
+        // confirms only that the node accepted the request — actual peer
+        // delivery is observable via `decdn node peers` on a peer.
+        println!("announce_triggered=true");
     }
 
     Ok(())

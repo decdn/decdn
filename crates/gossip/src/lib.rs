@@ -13,5 +13,5 @@ pub mod validation;
 
 pub use metrics::GossipMetrics;
 pub use peer_table::{InsertOutcome, PeerEntry, PeerTable, StaleTimestamp};
-pub use service::{GossipRuntimeConfig, GossipService};
+pub use service::{AnnounceTrigger, GossipHandles, GossipRuntimeConfig, GossipService};
 pub use validation::{AnnounceReject, validate_envelope};

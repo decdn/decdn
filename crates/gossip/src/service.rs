@@ -14,7 +14,7 @@ use iroh::{Endpoint, SecretKey};
 use iroh_gossip::api::{GossipReceiver, GossipSender};
 use iroh_gossip::net::Gossip;
 use iroh_gossip::proto::TopicId;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 
@@ -43,9 +43,62 @@ pub struct GossipRuntimeConfig {
     pub allowlist: HashSet<[u8; 32]>,
 }
 
+/// Operator-facing handle to fire an immediate `NodeAnnounce` outside the
+/// publisher task's normal interval (issue #280). Created by
+/// [`GossipService::spawn`] when a region is configured (the publisher
+/// runs); `None` when no region is set, since publishing without a region
+/// fails peer-side validation and there's nothing useful for the trigger
+/// to fire.
+///
+/// Backed by a [`Notify`]: `notify_one()` is a fire-and-forget signal that
+/// the publisher task observes via `tokio::select!`. If the publisher is
+/// already inside an interval-driven publish when the trigger fires, the
+/// notification is queued for one additional pass (Notify's permit slot)
+/// so a fast-firing operator script can't drop a manual announce on the
+/// floor.
+#[derive(Debug)]
+pub struct AnnounceTrigger {
+    notify: Arc<Notify>,
+}
+
+impl AnnounceTrigger {
+    /// Ask the publisher task to broadcast a fresh `NodeAnnounce` on its
+    /// next select boundary. Idempotent: if multiple calls land between
+    /// publisher select boundaries, [`Notify`] coalesces them into a single
+    /// extra publish.
+    pub fn announce_now(&self) {
+        self.notify.notify_one();
+    }
+
+    /// Construct an `AnnounceTrigger` around a caller-supplied
+    /// [`Notify`]. Exposed so consumers (notably the node admin RPC unit
+    /// tests) can observe that `announce_now` fires the underlying
+    /// notify without spinning up a real gossip publisher. Outside of
+    /// tests, callers should use [`GossipService::spawn`] which returns
+    /// a fully-wired trigger.
+    #[doc(hidden)]
+    pub const fn for_test(notify: Arc<Notify>) -> Self {
+        Self { notify }
+    }
+}
+
 /// Owns the gossip publisher/subscriber tasks.
 #[derive(Debug)]
 pub struct GossipService;
+
+/// Returned by [`GossipService::spawn`]: the spawned task handles plus an
+/// optional [`AnnounceTrigger`] for the publisher task. The trigger is
+/// `None` when the publisher is disabled (no region configured) — see
+/// [`GossipRuntimeConfig::region`].
+#[derive(Debug)]
+pub struct GossipHandles {
+    /// Background tasks owned by the gossip service. Caller is responsible
+    /// for awaiting / aborting these during shutdown.
+    pub tasks: Vec<JoinHandle<()>>,
+    /// One-shot announce trigger for the publisher. `None` iff the
+    /// publisher task wasn't spawned (region-less subscribe-only mode).
+    pub announce_trigger: Option<Arc<AnnounceTrigger>>,
+}
 
 impl GossipService {
     /// Spawn publisher + subscriber tasks for the configured topics and
@@ -70,11 +123,14 @@ impl GossipService {
         cfg: GossipRuntimeConfig,
         peer_table: Arc<RwLock<PeerTable>>,
         metrics: Arc<dyn GossipMetrics>,
-    ) -> Vec<JoinHandle<()>> {
+    ) -> GossipHandles {
         let topics = build_topic_list(&cfg);
         if topics.is_empty() {
             tracing::warn!("gossip: no topics to subscribe; service is idle");
-            return Vec::new();
+            return GossipHandles {
+                tasks: Vec::new(),
+                announce_trigger: None,
+            };
         }
 
         let allowlist = Arc::new(cfg.allowlist.clone());
@@ -106,7 +162,10 @@ impl GossipService {
 
         if receivers.is_empty() {
             tracing::error!("gossip: every topic subscribe failed; service exiting");
-            return Vec::new();
+            return GossipHandles {
+                tasks: Vec::new(),
+                announce_trigger: None,
+            };
         }
 
         let mut handles: Vec<JoinHandle<()>> = Vec::new();
@@ -126,26 +185,33 @@ impl GossipService {
         // Skip publishing entirely when no region is configured: an announce
         // without a region fails peer-side validation, so emitting silence
         // beats emitting announces everyone drops.
-        if let Some(region_code) = region {
+        let announce_trigger = if let Some(region_code) = region {
+            let notify = Arc::new(Notify::new());
             handles.push(publisher_task(
                 secret_key,
                 region_code,
                 announce_interval,
                 senders,
                 Arc::clone(&metrics),
+                Arc::clone(&notify),
             ));
+            Some(Arc::new(AnnounceTrigger { notify }))
         } else {
             tracing::warn!(
                 "gossip: identity.region not set; publisher disabled (subscribe-only mode)"
             );
-        }
+            None
+        };
 
         handles.push(ttl_sweeper_task(
             Arc::clone(&peer_table),
             Arc::clone(&metrics),
         ));
 
-        handles
+        GossipHandles {
+            tasks: handles,
+            announce_trigger,
+        }
     }
 }
 
@@ -268,6 +334,7 @@ fn publisher_task(
     interval: Duration,
     senders: Vec<(String, GossipSender)>,
     metrics: Arc<dyn GossipMetrics>,
+    announce_now: Arc<Notify>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let node_id = *secret_key.public().as_bytes();
@@ -275,7 +342,15 @@ fn publisher_task(
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            ticker.tick().await;
+            // Both arms drive the same publish; the trigger arm exists so
+            // operators running `decdn node announce` (issue #280) can push
+            // a fresh announce immediately after editing config — they
+            // shouldn't have to wait up to `interval` seconds for peers to
+            // see the new rate / region / load.
+            tokio::select! {
+                _ = ticker.tick() => {}
+                () = announce_now.notified() => {}
+            }
             let ts = now_us();
             let body = NodeAnnounceBody {
                 node_id,
