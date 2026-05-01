@@ -14,7 +14,7 @@ use iroh::{Endpoint, SecretKey};
 use iroh_gossip::api::{GossipReceiver, GossipSender};
 use iroh_gossip::net::Gossip;
 use iroh_gossip::proto::TopicId;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 
@@ -43,9 +43,81 @@ pub struct GossipRuntimeConfig {
     pub allowlist: HashSet<[u8; 32]>,
 }
 
+/// Operator-facing handle to fire an immediate `NodeAnnounce` outside the
+/// publisher task's normal interval (issue #280). Created by
+/// [`GossipService::spawn`] when a region is configured (the publisher
+/// runs); `None` when no region is set, since publishing without a region
+/// fails peer-side validation and there's nothing useful for the trigger
+/// to fire.
+///
+/// Backed by a [`Notify`]: `notify_one()` is a fire-and-forget signal that
+/// the publisher task observes via `tokio::select!`. If the publisher is
+/// already inside an interval-driven publish when the trigger fires, the
+/// notification is queued for one additional pass (Notify's permit slot)
+/// so a fast-firing operator script can't drop a manual announce on the
+/// floor.
+#[derive(Debug)]
+pub struct AnnounceTrigger {
+    notify: Arc<Notify>,
+}
+
+impl AnnounceTrigger {
+    /// Ask the publisher task to broadcast a fresh `NodeAnnounce` on its
+    /// next select boundary. Idempotent: if multiple calls land between
+    /// publisher select boundaries, [`Notify`] coalesces them into a single
+    /// extra publish.
+    pub fn announce_now(&self) {
+        self.notify.notify_one();
+    }
+
+    /// Construct an `AnnounceTrigger` around a caller-supplied
+    /// [`Notify`]. Exposed so consumers (notably the node admin RPC unit
+    /// tests) can observe that `announce_now` fires the underlying
+    /// notify without spinning up a real gossip publisher. Outside of
+    /// tests, callers should use [`GossipService::spawn`] which returns
+    /// a fully-wired trigger.
+    #[doc(hidden)]
+    pub const fn for_test(notify: Arc<Notify>) -> Self {
+        Self { notify }
+    }
+}
+
 /// Owns the gossip publisher/subscriber tasks.
 #[derive(Debug)]
 pub struct GossipService;
+
+/// Reasons [`GossipService::spawn`] can fail in a way the caller should
+/// treat as a startup error rather than soldiering on into a degraded
+/// state. Distinguished from the "intentional subscribe-only" case
+/// (caller configured neither global nor region) which still returns
+/// `Ok` with empty handles.
+#[derive(Debug, thiserror::Error)]
+pub enum GossipSpawnError {
+    /// At least one topic was configured, but every `subscribe()` call
+    /// failed. The caller should bail rather than continue: a runtime
+    /// that proceeds with no topics would later report
+    /// `PUBLISHER_DISABLED` from `admin_v1_announce` for the wrong
+    /// reason (region IS configured; gossip is just dead).
+    #[error("gossip: every topic subscribe failed ({attempted} attempted); service cannot start")]
+    AllSubscribesFailed {
+        /// Number of distinct topics the caller asked to subscribe to.
+        attempted: usize,
+    },
+}
+
+/// Returned by [`GossipService::spawn`]: the spawned task handles plus an
+/// optional [`AnnounceTrigger`] for the publisher task. The trigger is
+/// `None` when the publisher is disabled (no region configured) — see
+/// [`GossipRuntimeConfig::region`].
+#[derive(Debug)]
+pub struct GossipHandles {
+    /// Background tasks owned by the gossip service. Caller is responsible
+    /// for awaiting / aborting these during shutdown.
+    pub tasks: Vec<JoinHandle<()>>,
+    /// One-shot announce trigger for the publisher. `None` iff the
+    /// publisher task wasn't spawned (region-less subscribe-only mode).
+    pub announce_trigger: Option<Arc<AnnounceTrigger>>,
+}
 
 impl GossipService {
     /// Spawn publisher + subscriber tasks for the configured topics and
@@ -70,16 +142,25 @@ impl GossipService {
         cfg: GossipRuntimeConfig,
         peer_table: Arc<RwLock<PeerTable>>,
         metrics: Arc<dyn GossipMetrics>,
-    ) -> Vec<JoinHandle<()>> {
+    ) -> Result<GossipHandles, GossipSpawnError> {
         let topics = build_topic_list(&cfg);
         if topics.is_empty() {
+            // Caller configured neither global nor region — intentional
+            // subscribe-only mode. Returning `Ok` with empty handles
+            // matches the documented "subscribe-only by config" state;
+            // operators see one warn at startup and `admin_v1_announce`
+            // returns `PUBLISHER_DISABLED` later (the right reason).
             tracing::warn!("gossip: no topics to subscribe; service is idle");
-            return Vec::new();
+            return Ok(GossipHandles {
+                tasks: Vec::new(),
+                announce_trigger: None,
+            });
         }
 
         let allowlist = Arc::new(cfg.allowlist.clone());
         let announce_interval = Duration::from_secs(cfg.announce_interval_sec);
         let region = cfg.region.clone();
+        let attempted = topics.len();
 
         // Open one subscription per topic up front. Failures bump a metric
         // and emit an error log; the topic is then skipped so the caller
@@ -105,8 +186,10 @@ impl GossipService {
         }
 
         if receivers.is_empty() {
-            tracing::error!("gossip: every topic subscribe failed; service exiting");
-            return Vec::new();
+            // Caller asked for at least one topic and got none. This is
+            // a startup failure the runtime must surface, not a soft
+            // degraded state — see `GossipSpawnError::AllSubscribesFailed`.
+            return Err(GossipSpawnError::AllSubscribesFailed { attempted });
         }
 
         let mut handles: Vec<JoinHandle<()>> = Vec::new();
@@ -126,26 +209,33 @@ impl GossipService {
         // Skip publishing entirely when no region is configured: an announce
         // without a region fails peer-side validation, so emitting silence
         // beats emitting announces everyone drops.
-        if let Some(region_code) = region {
+        let announce_trigger = if let Some(region_code) = region {
+            let notify = Arc::new(Notify::new());
             handles.push(publisher_task(
                 secret_key,
                 region_code,
                 announce_interval,
                 senders,
                 Arc::clone(&metrics),
+                Arc::clone(&notify),
             ));
+            Some(Arc::new(AnnounceTrigger { notify }))
         } else {
             tracing::warn!(
                 "gossip: identity.region not set; publisher disabled (subscribe-only mode)"
             );
-        }
+            None
+        };
 
         handles.push(ttl_sweeper_task(
             Arc::clone(&peer_table),
             Arc::clone(&metrics),
         ));
 
-        handles
+        Ok(GossipHandles {
+            tasks: handles,
+            announce_trigger,
+        })
     }
 }
 
@@ -268,6 +358,7 @@ fn publisher_task(
     interval: Duration,
     senders: Vec<(String, GossipSender)>,
     metrics: Arc<dyn GossipMetrics>,
+    announce_now: Arc<Notify>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let node_id = *secret_key.public().as_bytes();
@@ -275,7 +366,19 @@ fn publisher_task(
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            ticker.tick().await;
+            // Both arms drive the same publish; the trigger arm exists so
+            // operators running `decdn node announce` (issue #280) can push
+            // a fresh announce immediately rather than waiting up to
+            // `interval` seconds for peers to see a refreshed `LoadHint` /
+            // `popular_hashes` (the fields in `NodeAnnounceBody` that vary
+            // between iterations). `region_code` is captured by-value
+            // above and does not re-read from config inside this loop —
+            // changing region requires a restart, which respawns the
+            // publisher and obviates the trigger anyway.
+            tokio::select! {
+                _ = ticker.tick() => {}
+                () = announce_now.notified() => {}
+            }
             let ts = now_us();
             let body = NodeAnnounceBody {
                 node_id,
@@ -308,7 +411,14 @@ fn publisher_task(
             };
             for (name, sender) in &senders {
                 if let Err(err) = sender.broadcast(encoded.clone()).await {
-                    tracing::debug!(%err, topic = %name, "gossip publish failed");
+                    // `warn!` rather than `debug!`: a broadcast failure on
+                    // the manual-trigger path (operator running `decdn node
+                    // announce`) would otherwise be invisible at default
+                    // log levels, while the admin RPC happily returned
+                    // `triggered: true`. Operators investigating "why
+                    // didn't my announce land" need this in the default
+                    // log stream.
+                    tracing::warn!(%err, topic = %name, "gossip publish failed");
                 } else {
                     metrics.inc_published(name);
                 }
@@ -401,5 +511,61 @@ mod tests {
         assert_eq!(topics.len(), 2);
         assert_eq!(topics[0].0, "cdn/global/v1");
         assert_eq!(topics[1].0, "cdn/region/US/v1");
+    }
+
+    /// `AnnounceTrigger::announce_now()` must actually wake a waiting
+    /// `notified()` future on the same `Notify`. This is the contract
+    /// `publisher_task`'s `tokio::select!` arm depends on — a regression
+    /// that re-defined `announce_now` to (say) call `notify_waiters()`
+    /// or do nothing would silently break manual announces.
+    #[tokio::test]
+    async fn announce_trigger_announce_now_wakes_notified() {
+        let notify = Arc::new(Notify::new());
+        let trigger = AnnounceTrigger::for_test(Arc::clone(&notify));
+
+        // Park a `notified()` future on a separate task so the trigger
+        // sees a registered waiter when `announce_now` calls `notify_one`.
+        let waiter_notify = Arc::clone(&notify);
+        let waiter = tokio::spawn(async move { waiter_notify.notified().await });
+
+        // Yield so the spawned task reaches `notified().await`.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        trigger.announce_now();
+
+        tokio::time::timeout(Duration::from_millis(200), waiter)
+            .await
+            .expect("waiter should resolve within 200ms of announce_now")
+            .expect("waiter task should complete cleanly");
+    }
+
+    /// Back-to-back `announce_now()` calls before the publisher consumes
+    /// the permit must coalesce into a single extra publish — Notify's
+    /// stored-permit semantics. Locks in the doc-comment claim on
+    /// `AnnounceTrigger` so an operator who automation-loops
+    /// `decdn node announce` 100x doesn't get 100 broadcasts.
+    #[tokio::test]
+    async fn announce_trigger_coalesces_back_to_back_calls() {
+        let notify = Arc::new(Notify::new());
+        let trigger = AnnounceTrigger::for_test(Arc::clone(&notify));
+
+        // Three triggers before any waiter — Notify stores at most one
+        // permit. The first `notified()` claims the permit; the second
+        // would have to wait for a fresh `notify_one()`.
+        trigger.announce_now();
+        trigger.announce_now();
+        trigger.announce_now();
+
+        let first = tokio::time::timeout(Duration::from_millis(50), notify.notified()).await;
+        assert!(
+            first.is_ok(),
+            "first notified() should claim the stored permit"
+        );
+
+        let second = tokio::time::timeout(Duration::from_millis(50), notify.notified()).await;
+        assert!(
+            second.is_err(),
+            "second notified() must NOT resolve — three calls coalesce to one permit"
+        );
     }
 }

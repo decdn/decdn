@@ -4,6 +4,7 @@
 
 # Git worktrees
 /.worktrees/
+.claude/worktrees
 
 # Rust / Cargo
 /target/
@@ -11,3 +12,7 @@
 # Foundry
 /contracts/out/
 /contracts/cache/
+
+# ADR PDF build output
+/adr/adrs.pdf
+mermaid-filter.err

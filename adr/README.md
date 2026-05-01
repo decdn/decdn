@@ -98,3 +98,27 @@ ADRs are **decision records**: they capture both the canonical design and the al
 ## Contributing
 
 See [CONTRIBUTING.md § Working with ADRs](../CONTRIBUTING.md#working-with-adrs) for ADR conventions, file naming, cross-reference checks, and the next-ADR-number protocol.
+
+## Building a single PDF
+
+Bundle every ADR (overview + numbered ADRs + appendices) into one printable PDF with a table of contents and rendered Mermaid diagrams.
+
+Dependencies:
+
+- [`pandoc`](https://pandoc.org/) — `brew install pandoc`
+- [`typst`](https://typst.app/) — `brew install typst` (PDF engine)
+- [`mermaid-filter`](https://github.com/raghur/mermaid-filter) — `npm install -g mermaid-filter` (renders ` ```mermaid ` blocks via headless Chromium pulled in by puppeteer; first install is ~150 MB)
+
+```bash
+cd adr
+pandoc --from=markdown+gfm_auto_identifiers \
+  --toc --toc-depth=2 \
+  --pdf-engine=typst \
+  -F mermaid-filter \
+  -V title="deCDN — Architecture Decision Records" \
+  -V date="$(date +%Y-%m-%d)" \
+  architecture.md $(ls [0-9]*.md | sort) $(ls appendix-*.md | sort) \
+  -o adrs.pdf
+```
+
+Build takes ~1 minute (most of it spent rendering Mermaid diagrams). Without `-F mermaid-filter` the diagrams ship as raw source text.
