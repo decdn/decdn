@@ -22,7 +22,7 @@ use crate::cli::common::LogLevel;
 use crate::cli::run::{ObservabilityArgs, PaymentArgs};
 use crate::config::{
     FileConfig, ResolvedObservability, ResolvedPayment, load_file_config, parse_pinned_hashes,
-    resolve_observability, resolve_payment,
+    resolve_observability, resolve_payment, resolve_security,
 };
 
 /// Read-only snapshot of the reloadable fields, returned by
@@ -308,7 +308,7 @@ impl RuntimeReloadState {
             security: ResolvedSecurity {
                 max_concurrent_handlers: 256,
                 per_node_rate_per_sec: 20.0,
-                per_node_burst: 20,
+                per_node_burst: 40,
                 per_ip_rate_per_sec: 100.0,
                 per_ip_burst: 200,
                 max_tracked_sources: 4096,
@@ -706,6 +706,15 @@ fn log_ignored_other_sections(file: &crate::config::FileConfig, prev: &FileSecti
         && file.security.is_some()
     {
         warn_ignored("security.* (requires restart to take effect)");
+        // Pre-validate so the operator finds out *now* if their next
+        // restart will fail, rather than discovering it the next time
+        // they actually restart (potentially under pressure).
+        if let Err(err) = resolve_security(file.security.as_ref()) {
+            tracing::warn!(
+                %err,
+                "security.* values are invalid; the next restart will fail to start with this error"
+            );
+        }
     }
 }
 
@@ -779,7 +788,7 @@ mod tests {
             security: ResolvedSecurity {
                 max_concurrent_handlers: 256,
                 per_node_rate_per_sec: 20.0,
-                per_node_burst: 20,
+                per_node_burst: 40,
                 per_ip_rate_per_sec: 100.0,
                 per_ip_burst: 200,
                 max_tracked_sources: 4096,

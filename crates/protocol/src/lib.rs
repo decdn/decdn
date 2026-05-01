@@ -39,8 +39,11 @@ pub const TOPIC_REPUTATION: &str = "cdn/reputation/v1";
 
 /// Connection rejected by the per-source or global rate limiter (ADR 013 §0x10).
 ///
-/// Delivered via `CONNECTION_CLOSE` immediately on accept so the peer sees a
-/// deterministic close code. Peers that receive this code SHOULD back off before
+/// Unlike `0x01`–`0x03`, this code is delivered via `CONNECTION_CLOSE` rather
+/// than `RESET_STREAM` because the rejection happens before any application
+/// stream is opened. The close-frame reason bytes carry a short layer label
+/// (`global-full`, `per-ip`, or `per-node-id`) so the peer can pick an
+/// appropriate backoff. Peers that receive this code SHOULD back off before
 /// reconnecting; they MUST NOT treat it as a protocol error (the server is
 /// functioning normally — the client is overloading it).
 pub const APP_ERR_RATE_LIMITED: u32 = 0x10;

@@ -14,7 +14,8 @@ use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::probe::ProbeHandler;
 use decdn_node::metrics::Metrics;
 use decdn_protocol::{
-    ALPN_PROBE, MAX_MESSAGE_SIZE, ProbeMessage, decode_message, encode_message,
+    ALPN_PROBE, APP_ERR_RATE_LIMITED, MAX_MESSAGE_SIZE, ProbeMessage, decode_message,
+    encode_message,
     message::{ProbeRequest, ProbeResponse},
     read_frame, write_frame,
 };
@@ -389,5 +390,109 @@ async fn probe_accept_bi_timeout_errors_handler() -> anyhow::Result<()> {
     h.client_conn.close(0u32.into(), b"bye");
     h.client_ep.close().await;
     h.server_ep.close().await;
+    Ok(())
+}
+
+/// End-to-end check that the rate limiter rejects with `APP_ERR_RATE_LIMITED`
+/// (`0x10`) on the wire. Without this, the dispatch reject path is dead code
+/// under tests — every other test in this file uses `permissive_limiter`.
+///
+/// Strict per-IP burst=1 limiter; the server runs `ProbeHandler::accept` in a
+/// loop so two back-to-back client connections both reach the handler. The
+/// first one drains the bucket and serves a normal probe (close code 0); the
+/// second one is rejected by `ConnectionLimiter::acquire` and observes
+/// `APP_ERR_RATE_LIMITED` on its `CONNECTION_CLOSE`.
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_rate_limit_returns_rate_limited_close_code() -> anyhow::Result<()> {
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let metrics = Arc::new(Metrics::new());
+
+    // burst=1 per-IP so the second connection from the same client IP
+    // unconditionally rejects. Per-NodeID and global are loose so they
+    // don't interfere.
+    let strict = ResolvedSecurity {
+        max_concurrent_handlers: 64,
+        per_node_rate_per_sec: 1_000.0,
+        per_node_burst: 1_000,
+        per_ip_rate_per_sec: 0.001, // negligible refill within the test window
+        per_ip_burst: 1,
+        max_tracked_sources: 32,
+    };
+    let limiter = Arc::new(ConnectionLimiter::new(&strict, Arc::clone(&metrics)));
+    let handler = Arc::new(ProbeHandler::new(
+        server_id,
+        Arc::new(AtomicU64::new(1)),
+        Arc::clone(&metrics),
+        limiter,
+    ));
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_PROBE.to_vec()]).await?;
+    let server_ep_bg = server_ep.clone();
+    let handler_bg = Arc::clone(&handler);
+    let accept_loop = tokio::spawn(async move {
+        // Accept up to two connections — the test only drives two clients.
+        for _ in 0..2 {
+            let Some(incoming) = server_ep_bg.accept().await else {
+                break;
+            };
+            let Ok(connecting) = incoming.accept() else {
+                continue;
+            };
+            let Ok(conn) = connecting.await else {
+                continue;
+            };
+            let h = Arc::clone(&handler_bg);
+            // Spawn so a slow first probe doesn't block the second accept.
+            tokio::spawn(async move {
+                let _ = h.accept(conn).await;
+            });
+        }
+    });
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    // First connection: completes a normal probe round-trip so the per-IP
+    // bucket is drained when the second client arrives.
+    let conn1 = client_ep
+        .connect(target.clone(), ALPN_PROBE)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect 1: {e}"))?;
+    let (mut s, mut r) = conn1
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi 1: {e}"))?;
+    let req = ProbeRequest { nonce: 1 };
+    write_frame(&mut s, &encode_message(&ProbeMessage::Request(req))?)
+        .await
+        .map_err(|e| anyhow::anyhow!("write 1: {e}"))?;
+    s.finish().map_err(|e| anyhow::anyhow!("finish 1: {e}"))?;
+    let _ = read_frame(&mut r)
+        .await
+        .map_err(|e| anyhow::anyhow!("read 1: {e}"))?;
+    conn1.close(0u32.into(), b"bye");
+
+    // Second connection from the same client (same NodeID + IP). The
+    // limiter rejects on accept and the server closes with
+    // APP_ERR_RATE_LIMITED.
+    let conn2 = client_ep
+        .connect(target, ALPN_PROBE)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect 2: {e}"))?;
+    // Wait for the connection to be closed by the server. `closed()`
+    // resolves with the application close code, which iroh exposes as
+    // ConnectionError.
+    let close_err = conn2.closed().await;
+    let expected = VarInt::from_u32(APP_ERR_RATE_LIMITED);
+    match close_err {
+        ConnectionError::ApplicationClosed(ApplicationClose { error_code, .. })
+            if error_code == expected => {}
+        other => anyhow::bail!("expected ApplicationClosed({expected:?}), got {other:?}"),
+    }
+
+    client_ep.close().await;
+    let _ = accept_loop.await;
+    server_ep.close().await;
     Ok(())
 }

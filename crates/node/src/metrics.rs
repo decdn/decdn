@@ -54,14 +54,16 @@ pub struct DecdnMetrics {
     /// a sustained outage rather than relying on a one-shot startup line.
     pub rpc_healthy: Gauge,
     /// Connections rejected because the global concurrency semaphore was
-    /// exhausted (issue #235).
+    /// exhausted.
     pub dispatch_rejected_global_total: Counter,
-    /// Connections rejected by the per-NodeID token bucket (issue #235).
+    /// Connections rejected by the per-NodeID token bucket.
     pub dispatch_rejected_per_node_total: Counter,
-    /// Connections rejected by the per-IP token bucket (issue #235).
+    /// Connections rejected by the per-IP token bucket.
     pub dispatch_rejected_per_ip_total: Counter,
-    /// Currently in-flight QUIC handler tasks holding a dispatch permit
-    /// (issue #235).
+    /// Currently in-flight QUIC handler tasks holding a dispatch permit.
+    /// Diverges from `active_connections` once non-probe ALPNs gain limiter
+    /// integration: this counts limiter permits across every gated ALPN,
+    /// while `active_connections` counts post-handshake probe connections only.
     pub dispatch_in_flight: Gauge,
 }
 

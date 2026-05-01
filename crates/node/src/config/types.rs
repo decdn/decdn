@@ -26,7 +26,7 @@ pub struct FileConfig {
     pub observability: Option<ObservabilityConfig>,
     /// Gossip settings.
     pub gossip: Option<GossipConfig>,
-    /// Connection rate-limiting settings (issue #235).
+    /// Connection rate-limiting settings.
     pub security: Option<SecurityConfig>,
 }
 
@@ -120,12 +120,14 @@ pub struct GossipConfig {
     pub allowlist: Option<Vec<String>>,
 }
 
-/// Security / rate-limiting section of the config file (issue #235).
+/// Security / rate-limiting section of the config file.
 ///
 /// All fields are optional; defaults produce a safe configuration out of the box.
-/// Values can only be changed by restarting the node — none of these fields are
-/// hot-reloadable because rebuilding the semaphore or resetting in-flight token
-/// buckets mid-run would transiently allow or deny traffic in unpredictable ways.
+/// None of these fields are hot-reloadable: the live `ConnectionLimiter` owns
+/// an `Arc<Semaphore>` whose identity must remain stable across the lifetime
+/// of every in-flight permit, and the in-flight token-bucket state cannot be
+/// reset without losing fairness across the swap. Edits take effect on the
+/// next process restart.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct SecurityConfig {
     /// Maximum number of concurrently in-flight QUIC handler tasks across all
@@ -135,13 +137,16 @@ pub struct SecurityConfig {
     /// Token-bucket refill rate for per-NodeID limiting (tokens per second).
     /// Matches ADR 001's inbound probe limit. Default: 20.
     pub per_node_rate_per_sec: Option<f64>,
-    /// Token-bucket burst capacity for per-NodeID limiting. Default: 20.
+    /// Token-bucket burst capacity for per-NodeID limiting. Default: 40
+    /// (2× the rate, providing headroom for jitter so well-behaved peers
+    /// don't trip the limit on naturally-clumped requests).
     pub per_node_burst: Option<u32>,
     /// Token-bucket refill rate for per-IP limiting (tokens per second).
     /// More generous than per-NodeID because one IP may host a legitimate fleet.
     /// Default: 100.
     pub per_ip_rate_per_sec: Option<f64>,
-    /// Token-bucket burst capacity for per-IP limiting. Default: 200.
+    /// Token-bucket burst capacity for per-IP limiting. Default: 200
+    /// (2× the rate; same headroom rationale as per-NodeID).
     pub per_ip_burst: Option<u32>,
     /// Hard cap on the number of distinct `NodeIDs` (and separately, IPs) tracked
     /// in the rate-limit state. When full, the oldest entry is evicted. Default: 4096.

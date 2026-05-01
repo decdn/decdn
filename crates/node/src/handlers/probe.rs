@@ -77,8 +77,17 @@ impl ProbeHandler {
     async fn serve(&self, conn: Connection) -> anyhow::Result<()> {
         let _permit = match self.limiter.acquire(&conn) {
             Ok(p) => p,
-            Err(_reason) => {
-                conn.close(VarInt::from_u32(APP_ERR_RATE_LIMITED), b"rate-limited");
+            Err(reason) => {
+                // Rate-limited rejection is normal load-shedding, not a
+                // protocol fault: returning `Err` here would have iroh log
+                // every rejection as an `AcceptError`, amplifying log
+                // volume under flood (exactly what the attacker wants).
+                // The dispatch layer already emits a structured debug log
+                // and a metric counter for the rejection.
+                conn.close(
+                    VarInt::from_u32(APP_ERR_RATE_LIMITED),
+                    reason.as_str().as_bytes(),
+                );
                 return Ok(());
             }
         };

@@ -121,7 +121,7 @@ pub struct ResolvedObservability {
     pub otlp_endpoint: Option<String>,
 }
 
-/// Resolved security / rate-limiting fields (issue #235).
+/// Resolved security / rate-limiting fields.
 #[derive(Debug, Clone)]
 pub struct ResolvedSecurity {
     /// Global cap on concurrent in-flight QUIC handler tasks.
