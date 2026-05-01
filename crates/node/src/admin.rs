@@ -197,10 +197,14 @@ pub struct EvictResponse {
 /// Response body for `admin_v1_announce` (issue #280).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnnounceResponse {
-    /// Always `true` on success — the trigger landed on the publisher's
-    /// notify slot. The actual broadcast is racy with concurrent ticker
-    /// fires, so a `true` here means "your request was queued", not "your
-    /// announce hit the wire by the time this RPC returned."
+    /// Always `true` on a non-error response — the request landed on the
+    /// publisher task's notify slot. This is "queued", not "delivered":
+    /// the actual gossip broadcast happens asynchronously after this RPC
+    /// returns and may still fail (no neighbors, transport error), in
+    /// which case the publisher emits a `warn!` log line. The "publisher
+    /// disabled" case (no region configured) returns
+    /// `PUBLISHER_DISABLED_CODE` rather than `triggered: false` so
+    /// operators get a specific message.
     pub triggered: bool,
 }
 
@@ -215,8 +219,8 @@ const INVALID_PARAMS_CODE: i32 = -32_602;
 const PUBLISHER_DISABLED_CODE: i32 = -32_001;
 
 /// JSON-RPC error code: the cache layer reported an error during evict
-/// (e.g. the underlying iroh-blobs store I/O failed, or the origin
-/// returned an error during the optional `--re-pin` pull-through).
+/// (e.g. the underlying iroh-blobs store I/O failed when persisting the
+/// evicted-hash log).
 const CACHE_ERROR_CODE: i32 = -32_002;
 
 /// Admin RPC surface. Versioned via the namespace prefix
@@ -233,8 +237,10 @@ pub trait AdminRpc {
     #[method(name = "health")]
     async fn health(&self) -> RpcResult<HealthResponse>;
 
-    /// Evict a single blob from the local cache (issue #279). Optionally
-    /// re-pull from the configured origin afterward.
+    /// Evict a single blob from the local cache (issue #279). The
+    /// eviction is logical (the iroh-blobs store still holds the bytes
+    /// until #233 lands a public `delete`) but is persisted to
+    /// `<cache_dir>/evicted.log` so it survives a restart.
     #[method(name = "evict")]
     async fn evict(&self, req: EvictRequest) -> RpcResult<EvictResponse>;
 
@@ -466,9 +472,11 @@ mod tests {
         }
     }
 
-    /// Build a minimal in-memory cache for tests. The peers / health
-    /// methods don't touch it, but `AdminState::new` requires one — using
-    /// a tempdir keeps each test self-contained.
+    /// Build a throwaway tempdir-backed cache for tests. The peers /
+    /// health methods don't touch it, but `AdminState::new` requires one
+    /// — wrapping the engine over a `tempfile::TempDir` keeps each test
+    /// self-contained, and the returned `TempDir` must outlive the engine
+    /// (callers bind it with `_tmp` so RAII handles cleanup at end of test).
     async fn test_cache() -> (CacheEngine, tempfile::TempDir) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cache = CacheEngine::open(tmp.path(), None, 1)
@@ -711,12 +719,16 @@ mod tests {
     async fn admin_announce_fires_trigger_when_publisher_present() {
         use tokio::sync::Notify;
 
+        // `AnnounceTrigger::announce_now` is a thin wrapper that calls
+        // `notify_one` on the inner `Arc<Notify>`. We construct the
+        // trigger with a `Notify` we own (via the `for_test` seam, which
+        // is `#[doc(hidden)]` and exists for exactly this assertion path)
+        // so we can `.notified()` after the RPC fires and observe that
+        // the permit landed. This proves the admin handler -> trigger ->
+        // notify chain end-to-end without spinning up a real publisher
+        // task; the publisher's own `select!` arm is exercised by
+        // `service::tests::publisher_publishes_on_announce_trigger`.
         let notify = Arc::new(Notify::new());
-        // `AnnounceTrigger::announce_now` calls `notify_one` on this same
-        // `Notify`. We construct one matching the trigger's internal
-        // shape via a public helper or bypass — since `AnnounceTrigger`'s
-        // field is private, we route through `notify_one` indirectly by
-        // using the public `from_notify` test seam below.
         let trigger = Arc::new(decdn_gossip::AnnounceTrigger::for_test(Arc::clone(&notify)));
         let (cache, _tmp) = test_cache().await;
         let state = AdminState::new(
@@ -728,15 +740,13 @@ mod tests {
         );
         let rpc = AdminRpcImpl::new(state);
 
-        // Park a `notified()` future so the announce_now permit is
-        // observable. Notify::notify_one stores a permit if no waiter is
-        // pending; the awaitable below claims it.
         let resp = rpc.announce().await.expect("announce ok");
         assert!(resp.triggered);
 
-        // The published permit is observable as an immediate `notified()`
-        // resolution. Use a short timeout so a regression that lost the
-        // notify still fails fast.
+        // `Notify::notify_one` stores a permit if no waiter is pending;
+        // calling `notified()` after the RPC claims that permit
+        // immediately. A short timeout makes a regression that lost the
+        // notify fail fast rather than hanging the test runner.
         let waited =
             tokio::time::timeout(std::time::Duration::from_millis(100), notify.notified()).await;
         assert!(

@@ -207,7 +207,8 @@ pub async fn run(
         Arc::clone(&peer_table),
         gossip_metrics,
     )
-    .await;
+    .await
+    .context("gossip service failed to start")?;
 
     // Now that gossip is up and we know whether the publisher produced an
     // `AnnounceTrigger`, spawn the admin serve task with the full state.

@@ -23,12 +23,18 @@ pub enum NodeCommand {
     Health(HealthArgs),
     /// Forcibly remove a single blob from the local cache (issue #279).
     /// Useful for DMCA takedown, corruption recovery, and storage
-    /// reclamation. Optionally re-pulls the blob from the configured
-    /// origin afterward via `--re-pin`.
+    /// reclamation.
     Evict(EvictArgs),
     /// Publish a one-shot `NodeAnnounce` to gossip peers immediately
     /// rather than waiting for the periodic announce interval (issue
-    /// #280). Useful after editing `rate_per_mb` or `region` in config.
+    /// #280). Useful after a config edit changes a field carried in the
+    /// announce body — see `decdn-protocol::NodeAnnounceBody` — or as a
+    /// post-restart "I'm here" nudge so peers don't wait the full
+    /// `announce_interval_sec` to learn about us. The trigger is a
+    /// queue-and-coalesce signal: rapid back-to-back invocations within a
+    /// single publisher cycle fold into one extra broadcast (see
+    /// `decdn-gossip::AnnounceTrigger`), and a successful response means
+    /// the request was queued, not that it has hit the wire.
     Announce(AnnounceArgs),
 }
 

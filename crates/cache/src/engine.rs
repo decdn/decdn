@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -92,6 +92,18 @@ impl Drop for InflightGuard<'_> {
     }
 }
 
+/// Hard cap on the number of distinct hashes the in-memory `evicted`
+/// set may hold. Bounds (a) the resident memory of the set itself and
+/// (b) the unbounded growth of `<cache_dir>/evicted.log` under e.g. a
+/// mass-evict automation gone wrong. At ~64 bytes per `HashSet<Hash>`
+/// entry the cap is ~64 MB resident. Operators legitimately hitting
+/// this are operating well outside normal DMCA-takedown caseloads and
+/// should investigate before raising it. Loading from `evicted.log` on
+/// `open()` is *not* gated by this cap — entries persisted by a previous
+/// run always replay (silently dropping a persisted DMCA takedown to
+/// stay under cap is the worst-case the cap was meant to prevent).
+pub(crate) const MAX_EVICTED_ENTRIES: usize = 1_000_000;
+
 /// Read the evicted-hash log into a [`HashSet`]. A missing file is the
 /// normal "no evictions yet" case and yields an empty set; any other I/O
 /// or parse error is fatal because silently dropping persisted evictions
@@ -131,22 +143,28 @@ fn load_evicted_log(path: &Path) -> CacheResult<HashSet<Hash>> {
     Ok(out)
 }
 
-/// Parse a 64-char lowercase-hex BLAKE3 hash. Strict on case + length so
-/// a corrupted log line surfaces as `None` (logged + skipped) rather than
-/// silently turning into the wrong hash.
+/// Parse a 64-char hex BLAKE3 hash. Accepts either case so hand-edited
+/// log entries (operators pasting a hash from access logs / takedown
+/// notices, which may use either case) round-trip through the same
+/// parser the admin RPC accepts. The persisted format is canonically
+/// lowercase via `Hash::Display`'s `to_hex()`, so this only relaxes the
+/// read path — writes remain lowercase, and load-then-save normalizes
+/// silently. Strict on length: a corrupted log line surfaces as `None`
+/// (logged + skipped at load time) rather than silently turning into
+/// the wrong hash.
 fn parse_hex_hash(s: &str) -> Option<Hash> {
-    if s.len() != 64
-        || !s
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
-    {
+    if s.len() != 64 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
     }
     let mut bytes = [0u8; 32];
     for (i, byte) in bytes.iter_mut().enumerate() {
-        let lo = s.as_bytes().get(i * 2)?;
-        let hi = s.as_bytes().get(i * 2 + 1)?;
-        *byte = (hex_digit(*lo)? << 4) | hex_digit(*hi)?;
+        // First nibble is the high nibble (bits 7..4): hex `ab` decodes
+        // to `0xab`, not `0xba`. Naming follows that semantic so an
+        // audit-sensitive DMCA-takedown codepath isn't decoded against
+        // mis-labeled variables.
+        let hi = s.as_bytes().get(i * 2)?;
+        let lo = s.as_bytes().get(i * 2 + 1)?;
+        *byte = (hex_digit(*hi)? << 4) | hex_digit(*lo)?;
     }
     Some(Hash::from_bytes(bytes))
 }
@@ -155,6 +173,7 @@ const fn hex_digit(c: u8) -> Option<u8> {
     match c {
         b'0'..=b'9' => Some(c - b'0'),
         b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
         _ => None,
     }
 }
@@ -256,6 +275,28 @@ impl CacheEngine {
     /// the takedown is durable, otherwise a node restart could resume
     /// serving the content.
     pub fn evict(&self, hash: Hash) -> CacheResult<()> {
+        // Pre-check under one lock acquisition: short-circuit on
+        // already-evicted (idempotent — don't grow `evicted.log` with a
+        // duplicate line) and reject on cap (DoS bound on an unbounded
+        // public-ish surface). The cap check is racy against concurrent
+        // evicts but the cap itself is a soft DoS bound, not a hard
+        // invariant — going +ε over by a handful of races is fine.
+        {
+            let guard = self
+                .inner
+                .evicted
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if guard.contains(&hash) {
+                return Ok(());
+            }
+            if guard.len() >= MAX_EVICTED_ENTRIES {
+                return Err(CacheError::EvictionLimitExceeded {
+                    limit: MAX_EVICTED_ENTRIES,
+                });
+            }
+        }
+
         // Persist FIRST, then commit to the in-memory set: a crash between
         // these two steps will at worst replay a successful evict on the
         // next open, which is idempotent. The opposite ordering would
@@ -265,22 +306,39 @@ impl CacheEngine {
             CacheError::Store(anyhow::Error::from(err).context("persist eviction"))
         })?;
 
-        if let Ok(mut guard) = self.inner.evicted.lock() {
-            guard.insert(hash);
-        }
-        if let Ok(mut guard) = self.inner.access_times.lock() {
-            guard.remove(&hash);
-        }
+        // `unwrap_or_else(PoisonError::into_inner)` rather than the project's
+        // usual `if let Ok(...) = lock()` pattern: a poisoned lock here
+        // would silently skip the in-memory commit and the node would keep
+        // serving the supposedly-evicted blob until the next restart loaded
+        // `evicted.log`. For a DMCA takedown that is the canonical worst
+        // case. Recovering the inner guard preserves the contract that
+        // `evict() -> Ok(())` implies the in-memory set was updated.
+        self.inner
+            .evicted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(hash);
+        self.inner
+            .access_times
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&hash);
         Ok(())
     }
 
     /// Has this hash been logically evicted via [`Self::evict`]?
+    ///
+    /// Recovers from a poisoned mutex via [`PoisonError::into_inner`]
+    /// rather than treating poison as "not evicted": a poisoned lock
+    /// returning `false` here would let evicted DMCA-flagged content
+    /// resume serving — exactly what `<cache_dir>/evicted.log`'s
+    /// durability guarantee was designed to prevent.
     pub fn is_evicted(&self, hash: Hash) -> bool {
         self.inner
             .evicted
             .lock()
-            .ok()
-            .is_some_and(|guard| guard.contains(&hash))
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&hash)
     }
 
     /// Fetch the blob by hash. Hits the local store on a cache hit; on a miss
@@ -304,9 +362,10 @@ impl CacheEngine {
 
         // Logical-eviction guard (#279): once an operator has run
         // `decdn node evict <hash>`, a subsequent `get` must not silently
-        // re-pull from the origin and undo the eviction. The admin
-        // `--re-pin` flow is responsible for clearing the flag via
-        // [`Self::unevict`] before issuing a fresh fetch.
+        // re-pull from the origin and undo the eviction. The eviction is
+        // sticky for the life of `<cache_dir>/evicted.log` — there is no
+        // "unevict" path; an operator who needs to re-cache a previously
+        // evicted hash hand-edits the log and restarts.
         if self.is_evicted(hash) {
             return Err(CacheError::NotFound { hash });
         }
@@ -877,6 +936,92 @@ mod tests {
         // `decdn node evict` ahead of time as a precaution.
         engine.evict(unknown)?;
         anyhow::ensure!(engine.is_evicted(unknown), "evict flag not set");
+        Ok(())
+    }
+
+    /// Evicting the same hash twice must not append a duplicate line to
+    /// `<cache_dir>/evicted.log`. Without this contract a stuck
+    /// automation that mass-replays the same DMCA-takedown hash would
+    /// grow the log unboundedly. The first evict appends one line, the
+    /// second short-circuits via the `contains(&hash)` check at the top
+    /// of `evict()`.
+    #[tokio::test]
+    async fn evict_is_idempotent_and_does_not_grow_log() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let log_path = tmp.path().join("evicted.log");
+        let engine = CacheEngine::open(tmp.path(), None, 10).await?;
+        let hash = Hash::new(b"dup-evict");
+
+        engine.evict(hash)?;
+        let after_first = std::fs::read_to_string(&log_path)?;
+        let lines_first = after_first.lines().count();
+
+        engine.evict(hash)?;
+        engine.evict(hash)?;
+        let after_third = std::fs::read_to_string(&log_path)?;
+        let lines_third = after_third.lines().count();
+
+        anyhow::ensure!(
+            lines_first == 1 && lines_third == 1,
+            "expected 1 log line both times, got first={lines_first}, third={lines_third}"
+        );
+        Ok(())
+    }
+
+    /// Hand-edited uppercase hex in `evicted.log` must be tolerated by
+    /// `parse_hex_hash` — the persisted format is canonically lowercase
+    /// (`Hash::Display` calls `to_hex()`), but operators pasting from
+    /// access logs / takedown notices may use either case. Without this,
+    /// a mixed-case hand-edit would silently get dropped at next open
+    /// and the takedown would resume serving content.
+    #[tokio::test]
+    async fn evicted_log_accepts_uppercase_hex() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let log_path = tmp.path().join("evicted.log");
+        let hash = Hash::new(b"upper-hex");
+        let upper = hash.to_string().to_uppercase();
+        std::fs::write(&log_path, format!("{upper}\n"))?;
+
+        let engine = CacheEngine::open(tmp.path(), None, 10).await?;
+        anyhow::ensure!(
+            engine.is_evicted(hash),
+            "uppercase hex line should load as the same hash",
+        );
+        Ok(())
+    }
+
+    /// `evict()` must surface a persistence failure as `Err` rather than
+    /// silently degrading to in-memory-only — for DMCA-driven evicts the
+    /// operator must be able to tell whether the takedown is durable.
+    /// Forcing the failure: place a *directory* at the `evicted.log`
+    /// path so `OpenOptions::open(...)` fails (`EISDIR`) when
+    /// `append_evicted_log` runs. Avoids relying on filesystem
+    /// permission games that may not work uniformly across CI hosts.
+    #[tokio::test]
+    async fn evict_returns_err_when_persistence_fails() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let engine = CacheEngine::open(tmp.path(), None, 10).await?;
+        // Engine opened cleanly with no log file yet. Now plant a
+        // directory at the path the engine will try to append to.
+        std::fs::create_dir(tmp.path().join("evicted.log"))?;
+
+        let hash = Hash::new(b"persist-fail");
+        match engine.evict(hash) {
+            Err(CacheError::Store(_)) => Ok(()),
+            other => Err(anyhow::anyhow!(
+                "expected Store error from persistence failure, got {other:?}"
+            )),
+        }?;
+
+        // And the in-memory set must NOT have been updated — otherwise
+        // an operator seeing the error would (correctly) assume the
+        // takedown didn't land, but the running node would actually have
+        // already stopped serving. Either contract is reasonable on its
+        // own; mixing them is the worst case.
+        anyhow::ensure!(
+            !engine.is_evicted(hash),
+            "in-memory set must not commit when persistence fails",
+        );
         Ok(())
     }
 }

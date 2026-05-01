@@ -54,6 +54,19 @@ pub enum CacheError {
     /// The underlying iroh-blobs store failed.
     #[error("store error: {0}")]
     Store(#[source] anyhow::Error),
+
+    /// The local evicted-hash set is full. Hard cap on the number of
+    /// distinct hashes the operator may evict in a single cache lifetime
+    /// (issue #279) — protects the in-memory `HashSet` and the on-disk
+    /// `evicted.log` from unbounded growth under e.g. an automation
+    /// gone-wrong that mass-evicts on every request. Hitting this is
+    /// well outside normal usage; the operator should investigate the
+    /// caller before raising the cap.
+    #[error("evicted-hash set full ({limit} entries); refusing to add more")]
+    EvictionLimitExceeded {
+        /// The cap that was reached.
+        limit: usize,
+    },
 }
 
 /// Convenience result alias.

@@ -21,7 +21,7 @@ use std::time::Instant;
 use decdn_cache::CacheEngine;
 use decdn_gossip::PeerTable;
 use decdn_node::admin::{self, AdminRpcClient, AdminState};
-use decdn_node::cli::{HealthArgs, PeersArgs};
+use decdn_node::cli::{AnnounceArgs, EvictArgs, HealthArgs, PeersArgs};
 use decdn_node::commands;
 use decdn_protocol::{LoadHint, NodeAnnounce, NodeAnnounceBody};
 use jsonrpsee::core::ClientError;
@@ -287,6 +287,99 @@ async fn cli_peers_rejects_zero_timeout() -> anyhow::Result<()> {
         timeout_ms: 0,
     };
     let err = commands::peers(&args, None)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("expected zero-timeout error"))?
+        .to_string();
+    assert!(
+        err.contains("--timeout-ms"),
+        "error should mention the flag, got: {err}"
+    );
+    Ok(())
+}
+
+/// Mirror the connection-refused coverage onto `decdn node evict`. The
+/// new CLI subcommand routes through the same `classify_client_error`
+/// path as `peers` / `health`, but a regression that swallowed the
+/// classification (or printed a misleading "evicted" line on failure)
+/// would not be caught by the admin-RPC unit tests alone.
+#[tokio::test]
+async fn cli_evict_surfaces_connection_refused() -> anyhow::Result<()> {
+    let (listener, addr) = bind_loopback().await?;
+    drop(listener);
+
+    let args = EvictArgs {
+        hash: "0".repeat(64),
+        admin_url: Some(format!("http://{addr}")),
+        config: None,
+        json: false,
+        timeout_ms: 2_000,
+    };
+    let err = commands::evict(&args, None)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("expected connection-refused error"))?
+        .to_string();
+    assert!(
+        err.contains("refused"),
+        "error should mention 'refused', got: {err}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn cli_evict_rejects_zero_timeout() -> anyhow::Result<()> {
+    let args = EvictArgs {
+        hash: "0".repeat(64),
+        admin_url: Some("http://127.0.0.1:1".to_string()),
+        config: None,
+        json: false,
+        timeout_ms: 0,
+    };
+    let err = commands::evict(&args, None)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("expected zero-timeout error"))?
+        .to_string();
+    assert!(
+        err.contains("--timeout-ms"),
+        "error should mention the flag, got: {err}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn cli_announce_surfaces_connection_refused() -> anyhow::Result<()> {
+    let (listener, addr) = bind_loopback().await?;
+    drop(listener);
+
+    let args = AnnounceArgs {
+        admin_url: Some(format!("http://{addr}")),
+        config: None,
+        json: false,
+        timeout_ms: 2_000,
+    };
+    let err = commands::announce(&args, None)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("expected connection-refused error"))?
+        .to_string();
+    assert!(
+        err.contains("refused"),
+        "error should mention 'refused', got: {err}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn cli_announce_rejects_zero_timeout() -> anyhow::Result<()> {
+    let args = AnnounceArgs {
+        admin_url: Some("http://127.0.0.1:1".to_string()),
+        config: None,
+        json: false,
+        timeout_ms: 0,
+    };
+    let err = commands::announce(&args, None)
         .await
         .err()
         .ok_or_else(|| anyhow::anyhow!("expected zero-timeout error"))?

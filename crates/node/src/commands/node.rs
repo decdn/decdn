@@ -107,7 +107,6 @@ pub async fn health(args: &cli::HealthArgs, global_config: Option<&Path>) -> any
 
 /// `decdn node evict`: call `admin_v1_evict` on the running node to
 /// forcibly remove a single blob from the local cache (issue #279).
-/// Optionally re-pulls from the configured origin via `--re-pin`.
 pub async fn evict(args: &cli::EvictArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
     anyhow::ensure!(
         args.timeout_ms > 0,
@@ -181,9 +180,13 @@ pub async fn announce(
         println!("{pretty}");
     } else {
         // The trigger is fire-and-forget on the publisher side, so this
-        // confirms only that the node accepted the request — actual peer
-        // delivery is observable via `decdn node peers` on a peer.
-        println!("announce_triggered=true");
+        // confirms only that the node accepted the request — `queued`
+        // rather than `triggered` so a script reader can't mistake this
+        // for "broadcast hit the wire". Actual peer delivery is
+        // observable via `decdn node peers` on a peer; broadcast failures
+        // (no neighbors, transport error) surface as `warn!` lines in the
+        // node's own log.
+        println!("announce_queued={}", resp.triggered);
     }
 
     Ok(())
