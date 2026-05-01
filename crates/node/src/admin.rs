@@ -383,14 +383,16 @@ pub trait AdminRpc {
     async fn reload(&self) -> RpcResult<ReloadResponse>;
 
     /// Trigger graceful shutdown via the same path SIGTERM exercises (issue
-    /// #244, ADR 025). Stops the iroh router's accept loop, waits for
-    /// in-flight `ProtocolHandler::shutdown` calls to drain (bounded by the
-    /// runtime's 15s `SHUTDOWN_DEADLINE`), then exits. Fire-and-forget: the
-    /// response returns as soon as the trigger lands, not when shutdown
-    /// completes — the admin server is one of the first surfaces to stop, so
-    /// a blocking-until-drained RPC would race its own listener closing.
-    /// Equivalent to `kill -TERM <pid>` for operators who'd rather not stat
-    /// the PID.
+    /// #244, ADR 025). Stops the iroh router's accept loop and awaits
+    /// in-flight `ProtocolHandler::shutdown` calls; the subsequent task
+    /// drain is bounded by the runtime's 15s `SHUTDOWN_DEADLINE` (the
+    /// router-shutdown step itself is unbounded — a stuck handler hangs
+    /// the runtime, only the post-router task join is timeout-gated).
+    /// Fire-and-forget: the response returns as soon as the trigger lands,
+    /// not when shutdown completes — the admin server is one of the first
+    /// surfaces to stop, so a blocking-until-drained RPC would race its
+    /// own listener closing. Equivalent to `kill -TERM <pid>` for
+    /// operators who'd rather not stat the PID.
     #[method(name = "drain")]
     async fn drain(&self) -> RpcResult<DrainResponse>;
 }
@@ -540,6 +542,13 @@ impl AdminRpcServer for AdminRpcImpl {
     }
 
     async fn drain(&self) -> RpcResult<DrainResponse> {
+        // `initiated: true` reflects "the trigger was fired", not "the
+        // runtime is now in the AdminDrain branch". If shutdown is
+        // already underway (a SIGTERM/SIGINT raced this RPC) the runtime
+        // has already passed `drain_trigger.wait()` in its select loop,
+        // so this `fire()` lands in an abandoned arm. Functionally fine
+        // — shutdown is happening anyway — but a future reader shouldn't
+        // infer causation from the response.
         self.state.drain_trigger.fire();
         Ok(DrainResponse { initiated: true })
     }
@@ -1028,22 +1037,29 @@ mod tests {
         assert!(waited.is_ok(), "wait() did not resolve after fire()");
     }
 
-    /// Firing twice must not deadlock a subsequent `wait`. `Notify`
-    /// coalesces multiple `notify_one` calls into a single permit, so a
-    /// second `fire` while no waiter is pending is a no-op, and the *first*
-    /// permit is still available for the next `wait`. A regression that
-    /// accidentally consumed the permit on the second fire (e.g. by
-    /// replacing `Notify` with a `oneshot`) would surface here.
+    /// Firing repeatedly must not deadlock a subsequent `wait`. `Notify`
+    /// coalesces multiple `notify_one` calls into a single permit, so the
+    /// second and third `fire` while no waiter is pending are no-ops and
+    /// the *first* permit is still available for the next `wait`. Catches
+    /// a future reimplementation that internally tracks "fired" state and
+    /// burns one permit per call (e.g. a hand-rolled `Mutex<bool>` that
+    /// returns a never-resolving future on the second call). The third
+    /// fire makes the test robust against a "burns one permit per fire"
+    /// bug — two would still resolve under that buggy implementation if
+    /// the first fire stored a permit and the second consumed it before
+    /// `wait` was polled.
     #[tokio::test]
-    async fn drain_trigger_double_fire_does_not_deadlock_wait() {
+    async fn drain_trigger_repeated_fire_does_not_deadlock_wait() {
         let trigger = DrainTrigger::new();
         trigger.fire();
         trigger.fire(); // second fire — coalesces, permit still available
+        trigger.fire(); // third fire — same coalesce; defends against the
+        // "burns one permit per fire" regression class
         let waited =
             tokio::time::timeout(std::time::Duration::from_millis(100), trigger.wait()).await;
         assert!(
             waited.is_ok(),
-            "wait() did not resolve after two fire() calls"
+            "wait() did not resolve after three fire() calls"
         );
     }
 

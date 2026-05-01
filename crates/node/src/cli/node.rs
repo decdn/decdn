@@ -57,9 +57,11 @@ pub enum NodeCommand {
     ///
     /// **Fire-and-forget semantics**: this command returns `drain_initiated=true`
     /// as soon as the trigger is queued. The response does *not* mean shutdown
-    /// is complete — it means the runtime has been asked to shut down. Observe
-    /// completion via process exit (systemd/K8s will notice) or by polling
-    /// `decdn node health` until the connection is refused.
+    /// is complete — it means the runtime has been asked to shut down, and
+    /// the connection may close before the node fully exits because the
+    /// admin server is one of the first surfaces to stop. Observe completion
+    /// via process exit (systemd/K8s will notice) or by polling `decdn
+    /// node health` until the connection is refused.
     Drain(DrainArgs),
 }
 
