@@ -12,9 +12,9 @@ Metrics are referenced throughout the protocol ADRs and listed informally in `ar
 - Alert thresholds for slash-risk metrics
 - The HTTP export format and endpoint contract
 
-Without this, operators running PoC nodes cannot build monitoring dashboards, cannot
-detect slashable conditions before they occur, and cannot compare metrics across nodes.
-Instrumentation becomes ad-hoc, making cross-node analysis impossible.
+Without this, operators cannot build monitoring dashboards, cannot detect slashable
+conditions before they occur, and cannot compare metrics across nodes. Instrumentation
+becomes ad-hoc, making cross-node analysis impossible.
 
 **Note on existing ADR names.** Several ADRs reference informal metric names
 (e.g., `gossip_messages_rejected_clock_skew`, `probe_hold_violations`,
@@ -139,7 +139,9 @@ non-zero value for any of these requires immediate operator attention.
 
 ---
 
-#### 2.7 Reputation Metrics (production only)
+#### 2.7 Reputation Metrics
+
+The metrics below apply once the reputation gossip layer in [ADR 008](008-reputation.md) is implemented; nodes running with reputation simplified to local-only scoring expose only `decdn_reputation_score`.
 
 | Metric | Type | Tier | Description |
 |--------|------|------|-------------|
@@ -305,20 +307,7 @@ complementary — logs are not a substitute for metrics.
 
 ---
 
-### 5. PoC vs. Production Differences
-
-| Area | PoC | Production |
-|------|-----|------------|
-| Metrics port auth | None (firewall-protected) | Auth proxy (basic auth or mTLS) |
-| Log format | Either (configurable) | JSON mandatory |
-| Reputation metrics | Not required (reputation system simplified) | Recommended |
-| Watchtower metrics | Not required | Recommended (`decdn_channel_disputes_total`) |
-| Alerting | Operator's choice; reference rules at [`monitoring/prometheus-alerts.yml`](../monitoring/prometheus-alerts.yml) | PagerDuty / Alertmanager integration recommended |
-| Dashboard | Reference Grafana dashboard at [`monitoring/grafana-dashboard.json`](../monitoring/grafana-dashboard.json) | Reference dashboard plus operator-specific extensions |
-
----
-
-### 6. Canonical Metric Name Cross-Reference
+### 5. Canonical Metric Name Cross-Reference
 
 Earlier ADRs used informal metric names. This table maps them to their canonical
 replacements. **No wire protocol or on-chain change is required** — these are
@@ -350,7 +339,7 @@ instrumentation names only.
 | `cache_misses` | `decdn_cache_misses_total` | architecture.md |
 | `cache_bytes` | `decdn_cache_bytes` | architecture.md |
 
-### 7. Reference dashboards and alerts
+### 6. Reference dashboards and alerts
 
 A reference Grafana dashboard and starter Prometheus alerting rules ship in the top-level [`monitoring/`](../monitoring/) directory. They consume only the canonical metric names from §2 — no new metrics are introduced — and are intended as an onboarding starting point, not a normative deliverable.
 
@@ -393,9 +382,9 @@ A reference Grafana dashboard and starter Prometheus alerting rules ship in the 
 
 ## Future Work
 
-- **OpenMetrics migration.** Prometheus text format 0.0.4 is sufficient for PoC; the
+- **OpenMetrics migration.** Prometheus text format 0.0.4 is the current default; the
   OpenMetrics exposition format (used by `prometheus_client` crate's `MetricsEncoder`)
-  adds exemplars and native histograms — evaluate at production scale.
+  adds exemplars and native histograms — evaluate once tooling support is broader.
 - **Tokenomics + reputation dashboard panels.** The reference dashboard in
   [`monitoring/grafana-dashboard.json`](../monitoring/grafana-dashboard.json) is
   deliberately scoped to M-tier core operations. §2.7 reputation and §2.10

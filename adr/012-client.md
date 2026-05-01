@@ -135,11 +135,7 @@ Client identity bindings are **ephemeral and per-connection**, as specified in [
 
 This section resolves the open question in [ADR 003](003-payments.md) regarding eclipse attack options.
 
-**PoC:** The on-chain registry is the single source of truth for peer discovery. Eclipse attacks require both Sybil-scale capital (staking enough nodes to dominate the registry) and RPC endpoint compromise (returning a fabricated node list). This is out of scope for a PoC threat model with tens of known-operator nodes on a testnet.
-
-**Production:** Adopt **Option B — Multi-source bootstrap.**
-
-Clients discover initial peers from at least two independent sources:
+At small mesh scale, eclipse attacks require both Sybil-scale capital (staking enough nodes to dominate the registry) and RPC endpoint compromise (returning a fabricated node list); the on-chain registry alone is sufficient as the discovery source. As the mesh grows and operator-set diversity increases, clients adopt **multi-source bootstrap (Option B)** — discovering initial peers from at least two independent sources:
 
 1. **On-chain registry** — `StakingRegistry.getActiveNodes()` via the configured RPC endpoint.
 2. **DNS seed list** — TXT records at `_decdn-seeds.{domain}` for each domain in a governance-maintained seed list. Record format: `nodeId=<hex>; addrs=<multiaddr>,<multiaddr>`.
@@ -259,7 +255,6 @@ decdn pull <hash> --max-channels <N> -o <output>
 ```
 
 **Default:** `--max-channels 1` (sequential, existing behaviour).
-**PoC:** `--max-channels` is accepted but capped at 1; parallel logic is a production feature.
 
 ### Economic threshold
 
@@ -363,9 +358,6 @@ decdn downloads clean --all       # remove all downloads including in-progress
 State directories older than 30 days with no progress (`verified_offset = -1`) are treated as
 abandoned and purged by `clean`.
 
-**PoC simplification:** single-channel mode only; state flush cadence is 256 MiB;
-`decdn downloads` subcommands not implemented.
-
 ---
 
 ## File Manifests and Reconstruction
@@ -416,9 +408,6 @@ them via iroh-blobs. Pass `--no-keep-blobs` to delete immediately after reconstr
 Raw single-blob downloads are unchanged. The client checks the `DECDNMAN` magic header; on
 failure (wrong or missing magic) it treats the bytes as a raw blob. Content providers signal
 manifest vs. raw out-of-band.
-
-**PoC simplification:** single-chunk manifests only (validates the format end-to-end);
-blob retention not implemented.
 
 ---
 

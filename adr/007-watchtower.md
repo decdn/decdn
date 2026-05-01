@@ -3,6 +3,8 @@
 **Date:** 2026-03-29
 **Status:** Draft
 
+> **Scope.** This ADR specifies the **production** watchtower design — the on-chain `WatchtowerEscrow` contract, the heartbeat protocol, discovery and redundancy, fee economics, wash-trading detection, and the [ADR 027](027-distinct-client-receipts.md) receipt-validator role. The PoC does **not** implement watchtowers; it only carries the contract-level shims that keep production watchtowers integrable later — see [§ 8 PoC Forward-Compatibility Checklist](#8-poc-forward-compatibility-checklist).
+
 ## Context
 
 ADR 003 defines a dispute window (default 48 hours for PoC, governable within 12h–72h) for payment channel settlement. Either party can counter a stale or fraudulent close by submitting a higher-nonce voucher during the window. This works if the counterparty is online — but if a node goes offline after a client submits a stale (low-amount) voucher, the node misses the dispute window and loses the difference between what it earned and what the stale voucher claims.
@@ -145,7 +147,7 @@ The fee is deterministic and non-negotiable (per 30-day monitoring period): both
 
 **Payment method:** The watched party pays via a direct USDC transfer (signed ERC-20 `transfer` or `permit` + `transferFrom`) to the watchtower's Ethereum address at registration time. No contract modification needed. The watchtower verifies payment on-chain before accepting the registration.
 
-**Gas economics:** A `disputeChannel` call on an L2 costs approximately $0.05–0.10. The dispute gas bonus (2× gas cost) ensures watchtowers are not penalised for actually performing their function. The bonus is paid off-chain by the watched party after the dispute settles — the watchtower provides the transaction hash as proof. The off-chain bonus is unenforceable — the watched party can refuse to pay after the dispute is submitted. This is an accepted PoC limitation. Production mitigates this via the prepaid escrow described below, which includes the dispute gas bonus in the escrowed amount.
+**Gas economics:** A `disputeChannel` call on an L2 costs approximately $0.05–0.10. The dispute gas bonus (2× gas cost) ensures watchtowers are not penalised for actually performing their function. The bonus is included in the prepaid escrow described below — the `WatchtowerEscrow` contract holds the bonus alongside the monitoring fee and releases it to the watchtower on successful dispute submission, removing the need for an unenforceable off-chain payment.
 
 ### Heartbeat batching
 
@@ -192,30 +194,13 @@ flowchart TD
     DISPUTE --> SETTLED[Settlement corrected to highest-nonce voucher]
 ```
 
-### 8. PoC Scope
+### 8. PoC Forward-Compatibility Checklist
 
-`disputeChannel` carries no `msg.sender` restriction (voucher signature is the sole authoriser) and the contract emits `ChannelCloseInitiated`, `ChannelDisputed`, and `ChannelSettled` events in both PoC and production. The table below lists only the differences:
+The PoC does not implement watchtowers, the `WatchtowerEscrow` contract, or any of the §1a-§1c gauge-pool security roles. Per the scope note at the top of this ADR, the PoC implementation is responsible only for these forward-compatibility shims so production watchtowers can be added without contract or wire-protocol changes:
 
-| Aspect | PoC | Production |
-| --- | --- | --- |
-| Watchtower service | Not implemented | Required |
-| Local dispute monitor | Recommended | Required |
-| Discovery | N/A | Config-based → gossip → on-chain registry |
-| Redundancy | N/A | 2–3 per channel |
-| Fee model | N/A | 0.1% with 0.50 USDC floor |
-| `WatchtowerEscrow` contract | N/A | Required (prepaid escrow with heartbeat accountability) |
-| Watchtower staking | N/A | Deferred |
-| Wash-trading detection (§1a) | N/A | Required (gauge-pool security per [ADR 026](026-gauge-boost-tokenomics.md)) |
-| Receipt validator role (§1b) | N/A | Required (gates gauge-pool eligibility per [ADR 027](027-distinct-client-receipts.md)) |
-| Receipt-fraud challenges (§1c) | N/A | Reuses `SlashJudge` bond mechanic per [ADR 014](014-on-chain-verification.md#bond-handling) |
-
-For PoC, the only action items are:
-
-1. Ensure `disputeChannel` has no `msg.sender` restriction — voucher signature is the only authorisation
-2. Emit `ChannelCloseInitiated`, `ChannelDisputed`, and `ChannelSettled` events
-3. Optionally implement the local dispute monitor thread (Option C from ADR 003)
-
-These three items future-proof the contract and node software for watchtower integration without implementing the watchtower service itself.
+1. `disputeChannel` MUST have no `msg.sender` restriction — voucher signature is the sole authorisation.
+2. The payment channel contract MUST emit `ChannelCloseInitiated`, `ChannelDisputed`, and `ChannelSettled` events.
+3. SHOULD: run the local dispute-monitor thread (Option C from [ADR 003](003-payments.md)) as defense-in-depth for the node-is-online case.
 
 ## Consequences
 
@@ -242,9 +227,7 @@ These three items future-proof the contract and node software for watchtower int
 
 ### Fee Accountability
 
-**PoC:** Fee payment is trust-based — the watched party sends USDC directly to the watchtower's address at registration. No escrow, no refund mechanism, no on-chain proof of service. A watchtower that accepts payment and disappears has no penalty. This is an accepted PoC limitation — the PoC does not implement watchtowers at all (see PoC Scope above), so the fee model is theoretical.
-
-**Production:** Prepaid escrow with proof-of-monitoring. The watched party deposits the monitoring fee into a `WatchtowerEscrow` contract. The watchtower must submit periodic signed heartbeats (e.g., every 6 hours) proving it is monitoring the chain — each heartbeat includes the latest `ChannelCloseInitiated` event block number the watchtower has processed. If the watchtower misses N consecutive heartbeats (default: 3, i.e., 18 hours), the watched party can reclaim the escrowed fee. On successful completion of the monitoring period (no missed heartbeats, or a dispute was correctly submitted), the watchtower claims the escrowed fee. This provides on-chain accountability without requiring watchtower staking — the escrowed fee itself is the watchtower's bond.
+Prepaid escrow with proof-of-monitoring. The watched party deposits the monitoring fee into a `WatchtowerEscrow` contract. The watchtower must submit periodic signed heartbeats (e.g., every 6 hours) proving it is monitoring the chain — each heartbeat includes the latest `ChannelCloseInitiated` event block number the watchtower has processed. If the watchtower misses N consecutive heartbeats (default: 3, i.e., 18 hours), the watched party can reclaim the escrowed fee. On successful completion of the monitoring period (no missed heartbeats, or a dispute was correctly submitted), the watchtower claims the escrowed fee. This provides on-chain accountability without requiring watchtower staking — the escrowed fee itself is the watchtower's bond.
 
 **Voucher state attestation:** Heartbeats MUST include a BLAKE3 hash commitment (`voucherStateHash`) over the sorted set of `(channel_id, latest_nonce)` pairs the watchtower holds. The `submitHeartbeat` function reverts if `voucherStateHash == bytes32(0)`. The watched party verifies this commitment off-chain against its own state after each `HeartbeatSubmitted` event. A mismatch signals stale voucher data, triggering a resync via the voucher sharing protocol or watchtower replacement.
 
@@ -470,9 +453,9 @@ The L2 sequencer censors the watchtower's `disputeChannel` transaction during th
 
 **Attack scenario.** A malicious closer (or a colluding sequencer) submits `closeChannel` with a stale voucher, then ensures all `disputeChannel` transactions are censored for the full dispute window. The watchtower falls back to L1 forced inclusion, but this takes up to ~24 hours (Arbitrum delayed inbox; OP Stack has a similar path). If the dispute window is also 24 hours, the effective dispute response time is **zero** — by the time the forced-inclusion transaction is processed, the window has expired.
 
-**PoC mitigation.** The PoC default dispute window is raised to **48 hours** (172800 seconds). This guarantees at least 24 hours of effective dispute response time even under worst-case sequencer censorship on any L2 with a forced inclusion delay ≤ 24 hours. This is simple, L2-agnostic, and stays within the governance bounds (12h–72h, [ADR 009](009-governance.md)).
+**Mitigation — layered defence.** The dispute window default is **48 hours** (172800 seconds), which guarantees at least 24 hours of effective dispute response time on any L2 with a forced-inclusion delay ≤ 24 hours. The setting is simple, L2-agnostic, and stays within the governance bounds (12h–72h, [ADR 009](009-governance.md)).
 
-**Production mitigation — forced-inclusion deadline extension.** For production, the payment channel contract implements a deadline extension mechanism: if a `disputeChannel` transaction arrives via L1 forced inclusion and the remaining dispute time is less than 24 hours, the `disputeDeadline` is set to `block.timestamp + 24 hours` (i.e., guaranteeing at least 24 hours of dispute time from the moment the forced-inclusion transaction is processed). This provides an additional safety margin for dispute windows that are above but close to the L2's forced-inclusion delay.
+On top of that baseline, the payment channel contract implements a **forced-inclusion deadline extension**: if a `disputeChannel` transaction arrives via L1 forced inclusion and the remaining dispute time is less than 24 hours, `disputeDeadline` is set to `block.timestamp + 24 hours` — guaranteeing at least 24 hours of dispute time from the moment the forced-inclusion transaction is processed. This adds safety margin for dispute windows that are above but close to the L2's forced-inclusion delay.
 
 **Important constraint:** the extension mechanism only helps if the forced-inclusion transaction is processed *before* the original `disputeDeadline` expires. If the dispute window is shorter than the L2's maximum forced-inclusion delay, `settleChannel` becomes callable before the forced-inclusion `disputeChannel` arrives — the extension logic never executes. Therefore, **governance must not set the dispute window below the L2's maximum forced-inclusion delay** (e.g., ≥ 25h for an L2 with ~24h forced inclusion). The 12h governance floor remains as a hardcoded safety bound for L2s with shorter forced-inclusion paths, but is not safe on L2s with ~24h forced inclusion without additional mitigation.
 

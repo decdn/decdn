@@ -101,9 +101,9 @@ The signature-scheme alternatives table (RIP-7212, Solidity library, ZK, optimis
 
 When a client detects a BLAKE3 hash mismatch on received bytes, it needs an on-chain path to slash the delivering node. BLAKE3 is not an EVM precompile, so the contract cannot independently verify the mismatch. Submitting full blob data on-chain is gas-prohibitive.
 
-#### PoC Approach: Single-Round Optimistic Challenge
+#### Single-Round Optimistic Challenge
 
-For the PoC, the corruption slash path uses a single-round optimistic model. The challenger's signed `StreamResponse` proves the node committed to serving the blob; the bond prevents frivolous claims.
+The corruption slash path uses a single-round optimistic model. The challenger's signed `StreamResponse` proves the node committed to serving the blob; the bond prevents frivolous claims.
 
 **Challenge submission:**
 
@@ -148,24 +148,11 @@ The receipt uses the `SlashJudge` EIP-712 domain (same domain separator as slash
 - If the node does not counter within 24 hours: `resolveChallenge()` slashes the node per [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn) and returns the bond to the challenger.
 - If the node counters successfully: the challenge is dismissed, and the bond is forfeited (50% burned, 50% to the node per [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn)).
 
-**Why single-round for PoC:** The 100 TOKEN bond makes frivolous challenges expensive (100 TOKEN PoC testnet bond >> the cost of a legitimate slash). A node that actually served corrupt data has no valid counter-evidence to produce. The simplicity of a single-round model reduces contract complexity and audit surface for the PoC.
+**Why single-round:** The 100 TOKEN bond makes frivolous challenges expensive (>> the cost of a legitimate slash). A node that actually served corrupt data has no valid counter-evidence to produce. The simplicity of a single-round model keeps contract complexity and audit surface bounded.
 
-#### Production Path: Interactive keccak256 Merkle Proof (Future ADR)
+#### Future evolution
 
-For production, the corruption slash path should upgrade to a two-round interactive protocol with cryptographic verification:
-
-1. **Challenger submits** a keccak256 Merkle commitment of the received data, the index of the corrupt chunk, and the corrupt chunk bytes with a Merkle proof.
-2. **Contract verifies** the Merkle proof on-chain (cheap: keccak256 is a native EVM opcode at 30 gas + 6 gas per 32-byte word).
-3. **Node responds** (24 hours) with the correct chunk at the same index and a Merkle proof against the correct keccak256 Merkle root for the BLAKE3-addressed blob.
-
-**Merkle tree construction:**
-
-- A blob of `N` bytes is divided into `ceil(N / 1024)` chunks of 1024 bytes (last chunk may be shorter). The 1024-byte leaf size matches the iroh-blobs BLAKE3 hash tree leaf size ([architecture.md glossary](architecture.md#glossary)).
-- Each leaf is `keccak256(chunk_index || chunk_bytes)` — including the index prevents second-preimage attacks.
-- Internal nodes are `keccak256(left || right)`. Standard binary Merkle tree, left-padded with zero-hashes for non-power-of-2 leaf counts.
-- A 1 GB blob has ~1M chunks, producing a tree of depth 20. A proof is 20 hashes (640 bytes). On-chain verification: ~20 keccak256 calls ≈ 840 gas for hashing + calldata costs. Total well under 100k gas.
-
-**Binding Merkle root to BLAKE3 hash:** The contract cannot independently verify that a keccak256 Merkle root corresponds to a given BLAKE3 hash (BLAKE3 is not available on-chain). The production protocol addresses this by requiring the node to commit a keccak256 Merkle root for each blob it serves, either at delivery time (included in `StreamResponse` as an additional field) or registered on-chain. This commitment is the subject of a future ADR.
+A cryptographic upgrade path — interactive keccak256 Merkle proofs over 1024-byte chunks — is tracked in [issue #387](https://github.com/decdn/decdn/issues/387). It would replace the bond-economics + counter-evidence-ambiguity dependencies of the optimistic path with on-chain Merkle verification, but requires open design work (chiefly: how to bind a keccak256 Merkle root to a BLAKE3 hash on-chain). Out of scope for this ADR until that future ADR lands.
 
 ### 3. SlashJudge Contract
 
