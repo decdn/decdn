@@ -125,3 +125,42 @@ pandoc --from=markdown+gfm_auto_identifiers \
 ```
 
 Build takes ~1 minute (most of it spent rendering Mermaid diagrams). Without `-F mermaid-filter` the diagrams ship as raw source text.
+
+### Reading-order build (book layout)
+
+The numeric build above is the canonical per-ADR reference. For a top-to-bottom read, build the same set in the thematic chapter order from [`architecture.md` § Reading Order](architecture.md#reading-order) — Foundations → Discovery → Payments → Tokenomics → Verification → Governance → Operations → Supporting → Appendices. Output goes to `adrs-book.pdf` so both PDFs can coexist.
+
+This build also strips *Alternatives Considered*, *Considered Alternatives*, *Open Questions*, *Future Work*, and *"Why not …"* sections at render time via [`_build/strip-meta-sections.lua`](_build/strip-meta-sections.lua), so the document reads as a single canonical design rather than a debate transcript. The source `.md` files keep those sections untouched, and the numeric `adrs.pdf` build above includes them for readers who want the full decision-record context. A short notice on the first page ([`_build/preface.md`](_build/preface.md)) tells readers what was omitted and where to find it.
+
+```bash
+cd adr
+PATH="$(npm config get prefix)/bin:$PATH" \
+pandoc --from=markdown+gfm_auto_identifiers \
+  --toc --toc-depth=2 \
+  --pdf-engine=typst \
+  -F mermaid-filter \
+  --lua-filter=_build/strip-meta-sections.lua \
+  -V title="deCDN — Architecture Decision Records (Reading Order)" \
+  -V date="$(date +%Y-%m-%d)" \
+  _build/preface.md \
+  architecture.md \
+  000-language.md 001-network.md 002-content-addressing.md 005-protocol.md \
+  022-content-discovery.md 015-zero-rtt.md \
+  003-payments.md 010-multi-token.md 012-client.md 024-account-abstraction.md \
+  026-gauge-boost-tokenomics.md 027-distinct-client-receipts.md 018-liquidity-strategy.md \
+  014-on-chain-verification.md 007-watchtower.md 008-reputation.md 011-content-takedown.md \
+  009-governance.md 016-contract-interactions.md \
+  019-node-onboarding.md \
+  013-schema-evolution.md 017-privacy.md \
+  appendix-encrypted-content-publishing.md \
+  appendix-observability.md \
+  appendix-l2-deployment.md \
+  appendix-poc-production-seams.md \
+  appendix-local-admin-http.md \
+  appendix-operator-key-rotation.md \
+  appendix-operator-upgrade-path.md \
+  appendix-watchtower-economics.md \
+  -o adrs-book.pdf
+```
+
+If `architecture.md`'s Reading Order changes, this file list needs to be updated by hand — there's no auto-generation. The build itself takes the same ~1 minute.
