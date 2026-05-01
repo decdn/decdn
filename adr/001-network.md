@@ -243,7 +243,7 @@ This schedule is tuned for PoC with a single RPC endpoint. Production deployment
 - Cold cache miss adds up to 500ms latency (probe maximum wait) compared to a pre-built content index lookup; mitigated by probe cache for repeated lookups within 15 seconds and by adaptive early exit (see Collect step above) which reduces P50 latency to ~50-100ms once the node has sufficient score history
 - Probe cache introduces a brief staleness window (up to 15s) where a node may attempt to pull from a provider that has evicted the blob; mitigated by the probe-triggered eviction hold ([ADR 005](005-protocol.md#probe-triggered-eviction-hold)), with fallback to the next cached provider, then a fresh fan-out
 - `popular_hashes` in `NodeAnnounce` explicitly gossips which blobs are in high demand — a new, compactly gossiped signal distinct from content availability (which is now only probe-discoverable)
-- Self-reported region hints (ISO 3166-1 alpha-2) are unverified; a node could misreport its region to appear in more gossip topics. **PoC mitigation:** region misreporting is detectable via latency — a node claiming "US" but responding with 200ms RTT from a US client is suspicious. Clients apply a reputation penalty when observed latency contradicts the claimed region (e.g., RTT > 150ms to a node in the same claimed region). **Production:** IP-geolocation verification via a decentralized oracle or third-party attestation service is deferred to production. The PoC accepts the residual risk that a small number of nodes may misreport regions
+- Self-reported region hints (ISO 3166-1 alpha-2) are unverified; a node could misreport its region to appear in more gossip topics. Mitigation: clients apply a reputation penalty when observed latency contradicts the claimed region (e.g., RTT > 150ms to a node in the same claimed region). Cryptographic hardening via an IP-geolocation oracle or third-party attestation is tracked as future work; the latency-based signal is the working mitigation either way.
 - Every transfer is paid, so nodes pulling content on cache miss incur a cost that must be recouped through subsequent client deliveries; this creates a natural economic barrier to speculative caching
 - Origin-backed nodes become the last line of defence for content availability — if all origin-backed nodes for a given blob go offline or are deregistered, the content becomes permanently unavailable (unless cached elsewhere). Content owners are responsible for origin node uptime.
 - `registerNode` gas cost increases ~4–7× due to on-chain ed25519 signature verification (~650k–1.15M gas vs. ~150k without); acceptable as a one-time cost per node lifetime
@@ -345,9 +345,7 @@ event NodeIdReclaimed(bytes32 indexed nodeId, address indexed previousOwner);
 
 ### Multiaddr Update Policy
 
-**PoC:** No cooldown. `updateMultiaddrs` costs approximately $0.03 per call at typical L2 gas prices, so for tens of nodes updating occasionally (IP change, port rotation), no rate limiting is needed.
-
-**Production:** A governable cooldown (0–86400 seconds, see [ADR 009](009-governance.md)) prevents a compromised node key from rapidly flipping multiaddrs to redirect traffic. The default is 0 (disabled) — governance can tighten this if abuse is observed.
+A governable cooldown (0–86400 seconds, see [ADR 009](009-governance.md)) prevents a compromised node key from rapidly flipping multiaddrs to redirect traffic. The default is 0 (disabled) — `updateMultiaddrs` costs ~$0.03 per call at typical L2 gas prices, so a small mesh updating occasionally (IP change, port rotation) needs no rate limiting. Governance tightens the cooldown if abuse is observed.
 
 ### Gas Costs
 

@@ -89,12 +89,9 @@ Safe smart wallets are the **recommended** wallet type for both node operators a
 
 **Recommended PoC configuration: 1-of-1 Safe or plain EOA.** High-value client accounts migrate to 2-of-3 + session keys in Production (§3); the same threshold constraint that applies to node operators applies here.
 
-- **Channel operations:** The Safe (or EOA) deposits USDC into `StablePaymentChannel.openChannel()`. That address is the `channel.client`.
-- **Voucher signing — PoC:** The client process signs EIP-712 vouchers with its owner key directly. `SignatureChecker` on the channel contract validates against `channel.client` (EOA → ECDSA; 1-of-1 Safe → `checkSignatures` via stock handler).
-- **Voucher signing — Production:** A session key authorized via `erc7579/smartsessions` signs vouchers at delivery speed without exposing the Safe owner key (see §3).
+- **Channel operations:** The Safe (or EOA) deposits USDC into `StablePaymentChannel.openChannel()`. That address is the `channel.client`. Client software supports both wallet types — `SignatureChecker` makes the choice transparent to every contract.
+- **Voucher signing:** EIP-712 vouchers are signed with the `channel.client` key. `SignatureChecker` on the channel contract validates against `channel.client` (EOA → ECDSA; 1-of-1 Safe → `checkSignatures` via stock handler). The session-key path (signing at delivery speed via `erc7579/smartsessions` without exposing the Safe owner key) lands when § 3 ships.
 - **Priority staking:** If the client stakes TOKEN for priority ([ADR 003](003-payments.md)), the wallet holds the staked TOKEN.
-
-**PoC allowance:** Clients MAY use a plain EOA; the client software supports both. `SignatureChecker` makes the wallet type transparent to every contract.
 
 ### 3. Session Keys — Deferred to Production via ERC-7579 smartsessions
 
@@ -176,20 +173,6 @@ The following Safe infrastructure is already deployed on the testnet sibling of 
 - [`erc7579/smartsessions`](https://github.com/erc7579/smartsessions) session-key module (ERC-1271 validator)
 - ERC-4337 paymaster for gas-in-USDC (eliminates ETH requirement for clients)
 - Bundler integration for UserOperation submission
-
-### 6. PoC vs Production Scope
-
-| Capability | PoC | Production |
-| --- | --- | --- |
-| `SignatureChecker` in all contracts | Yes | Yes |
-| Safe wallet support (EOA + smart account) | Yes | Yes |
-| Recommended Safe threshold for hot-signing parties | 1-of-1 | 2-of-3 (hot signing via session keys) |
-| Session keys | No — direct owner-signature path | Yes (via `erc7579/smartsessions` on Safe-7579) |
-| Off-chain ERC-1271 verification | Yes | Yes |
-| ERC-4337 paymaster (gas-in-USDC) | No — operators hold ETH | Yes |
-| ERC-4337 bundler integration | No — direct Safe SDK tx | Yes |
-| Per-session spending / action policies | No | Yes (smartsessions policies) |
-| Mobile/web Safe integration | No | Evaluated separately |
 
 ## Consequences
 

@@ -289,22 +289,6 @@ The offline lease intentionally weakens two properties of the online scheme: K_b
 
 The four publishing-shape alternatives evaluated against the chosen design (client-enforced expiry, decryption proxy, proxy re-encryption, per-client ECIES) are recorded in [`_history/alternatives-pre-launch.md` § Encrypted Content Publishing (appendix)](_history/alternatives-pre-launch.md#encrypted-content-publishing-appendix).
 
-## PoC Scope
-
-| Aspect | PoC | Production |
-| --- | --- | --- |
-| Encrypted publishing | Not implemented. Content is delivered as plaintext blobs. | Full implementation as described |
-| Epoch key rotation | N/A | 5-minute rotation via BLAKE3_KDF |
-| Key delivery infrastructure | N/A | `cdn/keys/v1` iroh QUIC (epoch key stream + play request streams) |
-| Envelopes | N/A | XChaCha20-Poly1305 wrapped `K_blob` over authenticated QUIC |
-| Offline leases | N/A | 30-day TTL, device-bound keys |
-| Device attestation | N/A | iOS Secure Enclave, Android Keystore |
-| Audio watermarking | N/A | Per-account |
-| App server blob key store (`K_blob`) | N/A | KMS/HSM-protected blob encryption keys |
-| Epoch derivation root (`server_secret`) | N/A | Non-exportable HSM key with periodic rotation |
-
-For PoC, no action items from this ADR are required. Content-addressed blobs are stored and served as plaintext. The CDN protocol, payment channels, and caching are unchanged regardless of whether encryption is applied at the application layer. This ADR documents the post-PoC design so that the protocol and contract interfaces remain forward-compatible.
-
 ## Consequences
 
 **Positive:**
