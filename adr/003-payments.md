@@ -179,11 +179,7 @@ The financial cost to the attacker remains bounded: at the recommended 10 USDC p
 **Stale close**
 Client submits an old voucher (lower amount) to close the channel, underpaying the node.
 
-The dispute window (default 48 hours for PoC — raised from 24 hours to account for L2 forced inclusion delay; see [ADR 007](007-watchtower.md#l2-sequencer-censorship)) works if the node is online. The gap is liveness: if the node goes offline after a stale close is submitted and misses the dispute window, it loses the difference. Production deployments add a forced-inclusion deadline extension mechanism ([ADR 007](007-watchtower.md#l2-sequencer-censorship)) that provides additional safety margin, though the dispute window must still exceed the L2's maximum forced-inclusion delay for the extension to be effective. Options:
-
-- **Option A — Watchtowers.** A separate monitoring service holds the latest voucher and submits it on the node's behalf if a dispute is detected. Adds operational complexity but fully closes the gap.
-- **Option B — Longer dispute window.** Increase beyond 48 hours (up to the 72h governance max), giving operators more time to respond. Delays legitimate channel closes for everyone.
-- **Option C — Persistent monitoring process.** The node binary runs a lightweight dispute monitor as a separate thread that only watches the chain for close events, independent of the serving process. Simpler than a watchtower but still single-node.
+The dispute window (default 48 hours for PoC, raised from 24 hours to account for L2 forced-inclusion delay; see [ADR 007](007-watchtower.md#l2-sequencer-censorship)) covers this if the node is online. The liveness gap — node offline during the window — is the entire problem [ADR 007](007-watchtower.md) addresses: non-custodial watchtowers + an in-process dispute monitor + (production) a forced-inclusion deadline extension.
 
 ---
 
@@ -220,28 +216,23 @@ Fully solved by the self-enforcing protocol. The node cannot extract more paymen
 **Corrupted delivery**
 Node serves bytes that don't match the advertised BLAKE3 hash.
 
-BLAKE3 verification catches this immediately at the client. The remaining gap is the slash evidence path: submitting the full bad bytes on-chain to prove a BLAKE3 mismatch is gas-expensive for large blobs. **Resolved:** [ADR 014](014-on-chain-verification.md) specifies a single-round optimistic challenge-response for the PoC — the challenger submits the node's signed `StreamResponse` (proving commitment to serve the blob) plus a 100 TOKEN bond. The node has 24 hours to counter with delivery proof. If it cannot, it is slashed. The production path upgrades to an interactive keccak256 Merkle proof over 1024-byte chunks.
+Caught at the client by BLAKE3 verification. The on-chain slash-evidence path is in [ADR 014 § 2](014-on-chain-verification.md#2-blake3-content-corruption--optimistic-challenge-response): single-round optimistic challenge-response for PoC (signed `StreamResponse` + 100 TOKEN bond, 24h counter window), upgraded to an interactive keccak256 Merkle proof over 1024-byte chunks for production.
 
 ---
 
 **Rate bait-and-switch**
 Node advertises a low rate in probe responses then returns a higher rate in `StreamResponse`.
 
-**Resolved: slashable offense.** Both `ProbeResponse` and `StreamResponse` include cryptographic signatures over the advertised rate (see ADR 005). The on-chain verifier checks: (1) both signatures are valid and from the same NodeId, (2) `StreamResponse.rate_per_mb > ProbeResponse.rate_per_mb`, (3) `stream_response.timestamp_us >= probe_response.timestamp_us` (prevents unsigned underflow), and (4) `stream_response.timestamp_us - probe_response.timestamp_us < 30_000_000` (30 seconds in microseconds). Both `timestamp_us` values are requester-generated — the probe timestamp is echoed in `ProbeResponse`, and a separate requester timestamp from `StreamRequest` is echoed in `StreamResponse` — so the delta is computed from a single clock with no wall-clock reference or time oracle needed. **Clock skew immunity:** because both timestamps originate from the requester's clock (the node merely echoes them back in its signed response), clock skew between the requester and the node is irrelevant. The on-chain verifier never compares timestamps from different clocks — it only computes the delta between two requester-generated values extracted from signed messages. A node with a clock 5 minutes ahead or behind has zero effect on the 30-second window check. The node is slashed per the escalating schedule in [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn). The 30-second window allows legitimate rate changes between sessions while catching same-session bait-and-switch.
+**Resolved: slashable offense.** Both responses are signed over the advertised rate ([ADR 005](005-protocol.md)); a same-NodeId signed pair where `StreamResponse.rate_per_mb > ProbeResponse.rate_per_mb` and the requester-anchored timestamp delta is under 30 seconds is on-chain-verifiable evidence. Clock-skew immune (both timestamps originate from the requester's clock; the node echoes them back in its signed response). The slash schedule lives in [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn); see [ADR 014 § 1](014-on-chain-verification.md#1-ed25519-signature-verification--dual-key-slash-signatures) for the on-chain verifier.
 
 ---
 
 **Phantom blob announcement**
-Node announces a blob as cached then fails or redirects on actual request.
+Node announces a blob as cached (`has_blob: true` in a signed `ProbeResponse`) then fails or redirects on actual request.
 
-**Resolved: slashable offense.** The `ProbeResponse` includes a cryptographic signature over `{hash, has_blob, rate_per_mb, timestamp_us}` (see ADR 005). Two evidence paths exist:
+**Resolved: slashable offense.** A same-NodeId signed `ProbeResponse(has_blob: true)` paired with a signed `StreamResponse(ok: false)` or redirect for the same hash within a 30-second requester-anchored timestamp window is on-chain-verifiable evidence. The bare timeout / non-response case is reputation-only (no second signed message → not slashable on-chain). Slash schedule per [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn); on-chain verifier per [ADR 014 § 1](014-on-chain-verification.md#1-ed25519-signature-verification--dual-key-slash-signatures); 24-hour counter-evidence window.
 
-- **Signed refusal:** If the node returns a signed `StreamResponse` with `ok: false` or a redirect for the same blob hash, and `stream_response.timestamp_us >= probe_response.timestamp_us` and `stream_response.timestamp_us - probe_response.timestamp_us < 30_000_000` (30 seconds), the two signed messages constitute on-chain-verifiable evidence. Both `timestamp_us` values are requester-generated, so the delta is computed from a single clock with no wall-clock reference needed.
-- **Timeout / non-response:** If the node accepts the connection but never sends a `StreamResponse` (or drops the QUIC stream), there is no second signed message. The signed `ProbeResponse` alone is not sufficient for on-chain slashing. This case is handled by reputation penalties (immediate score reduction) rather than on-chain slashing — the absence of a signed response is not provable on-chain.
-
-The 30-second validity window is long enough for normal protocol flow (probe, selection, channel open, stream request). To prevent legitimate cache eviction from producing false slash evidence within this window, nodes MUST implement a **probe-triggered eviction hold**: when signing `has_blob: true` in a `ProbeResponse`, the node pins the blob against LRU/LFU eviction for at least `probe_hold_duration` (currently 35 seconds: the 30-second slashing window plus 5-second margin). A node that cannot guarantee the hold (hold budget exhausted or cache under extreme pressure) MUST respond `has_blob: false`. See [ADR 005, Probe-Triggered Eviction Hold](005-protocol.md#probe-triggered-eviction-hold) for implementation requirements. This design treats `has_blob: true` as a cryptographic availability commitment backed by a local resource reservation, consistent with the existing principle that nodes MUST NOT sign `has_blob: true` for blobs exceeding `max_blob_size` ([ADR 005](005-protocol.md#error-handling-and-retry-semantics)). The node is slashed per the escalating schedule in [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn). The challenged node has a 24-hour window to counter by proving it delivered the blob (signed delivery receipt from the same requester within the relevant time window). **Dependent parameters:** The probe cache TTL in [ADR 001](001-network.md) is set to half this 30-second window (15 seconds) to guarantee cached probes remain slashable. The `probe_hold_duration` ([ADR 005](005-protocol.md#probe-triggered-eviction-hold)) is set to this window plus 5 seconds. Changes to this window must be coordinated with both the probe cache TTL and the hold duration.
-
-**Edge case: hold violation.** If a node's eviction hold fails due to an implementation bug, operator misconfiguration, or extreme memory pressure (OOM), and the node signs `has_blob: true` but later returns `ok: false`, the existing 24-hour counter-window applies. However, eviction logs are self-generated and not on-chain verifiable, so the only valid counter-evidence remains proving delivery of the same blob to the same requester within the relevant time window. A node that experiences hold violations should increase its `max_probe_holds` budget, increase its cache size, or accept the slash as the cost of under-provisioning. This is intentional: the protocol does not subsidize under-provisioned nodes at the expense of slashing deterrence.
+To prevent legitimate cache eviction from producing false slash evidence inside the 30-second window, nodes MUST honour a **probe-triggered eviction hold** (35s, 30s slash window + 5s margin) — see [ADR 005 § Probe-Triggered Eviction Hold](005-protocol.md#probe-triggered-eviction-hold) for the requirement and dependent parameters (probe cache TTL, `probe_hold_duration`). Hold violations under OOM / under-provisioning fall to the same 24-hour counter-window; eviction logs are not on-chain verifiable, so only delivery-receipt counter-evidence rebuts. The protocol does not subsidise under-provisioning.
 
 ---
 
@@ -264,13 +255,7 @@ A third party holding a valid voucher calls `closeChannel` to force the channel 
 **Eclipse attack**
 Attacker surrounds a client with malicious nodes so all probe responses come from nodes under attacker control.
 
-BLAKE3 verification catches data corruption regardless of which nodes are in the peer table. The remaining gap is a denial-of-service variant: an attacker controlling all of a client's known nodes can simply refuse to serve. Options:
-
-- **Option A — Origin-backed nodes as fallback.** Clients can specifically query the registry for well-known origin-backed nodes for a given blob, bypassing the general peer table. An eclipse must also control all origin-backed nodes for the target content — which requires capital proportional to the number of origin-backed nodes for that content.
-- **Option B — Multi-source bootstrap.** Clients discover initial peers from at least two independent sources (on-chain registry + a hardcoded DNS seed list). An attacker must compromise both to fully eclipse a client.
-- **Option C — Minimum honest-peer diversity.** Clients maintain connections to at least N nodes discovered via different paths. All N would need to be attacker-controlled for a full eclipse.
-
-> **Resolved in [ADR 012](012-client.md):** Option B (multi-source bootstrap) for production; registry-only for PoC. Option C adopted as supplementary client-side policy.
+BLAKE3 verification catches data corruption regardless of peer-table composition; the remaining DoS variant (attacker-controlled peer set refuses to serve) is resolved in [ADR 012 § Bootstrap and Trust Model](012-client.md): production uses multi-source bootstrap (on-chain registry + hardcoded DNS seeds) so an attacker must compromise both to fully eclipse a client; minimum honest-peer diversity is a supplementary client-side policy. PoC is registry-only.
 
 ---
 
