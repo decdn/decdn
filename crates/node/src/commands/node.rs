@@ -10,7 +10,7 @@ use jsonrpsee::core::client::Error as JsonRpcClientError;
 use jsonrpsee::http_client::HttpClientBuilder;
 use serde::Deserialize;
 
-use crate::admin::{AdminRpcClient, PeerView, PeersResponse};
+use crate::admin::{AdminRpcClient, HealthResponse, PeerView, PeersResponse};
 use crate::cli;
 use crate::cli::common::expand_tilde;
 use crate::config::DEFAULT_ADMIN_PORT;
@@ -59,7 +59,45 @@ pub async fn node_dispatch(
 ) -> anyhow::Result<()> {
     match &args.cmd {
         cli::NodeCommand::Peers(p) => peers(p, global_config).await,
+        cli::NodeCommand::Health(h) => health(h, global_config).await,
     }
+}
+
+/// `decdn node health`: call `admin_v1_health` on the running node and
+/// print the result. Two-line plain text by default (`node_id=…` /
+/// `uptime_s=…`), or pretty JSON with `--json`.
+pub async fn health(args: &cli::HealthArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        args.timeout_ms > 0,
+        "--timeout-ms must be > 0 (jsonrpsee treats Duration::ZERO as \
+         'never' rather than 'sub-millisecond deadline')"
+    );
+
+    let config_path = args.config.as_deref().or(global_config);
+    let url = resolve_admin_url(args.admin_url.as_deref(), config_path)?;
+
+    let client = HttpClientBuilder::default()
+        .request_timeout(Duration::from_millis(args.timeout_ms))
+        .build(&url)
+        .with_context(|| format!("failed to build admin JSON-RPC client for {url}"))?;
+
+    let resp: HealthResponse = client
+        .health()
+        .await
+        .map_err(|err| classify_client_error(&url, args.timeout_ms, err))?;
+
+    if args.json {
+        let pretty =
+            serde_json::to_string_pretty(&resp).context("failed to encode health as JSON")?;
+        println!("{pretty}");
+    } else {
+        // Two stable, grep-friendly lines so `decdn node health | grep
+        // node_id=` works in operator scripts without `--json`.
+        println!("node_id={}", resp.node_id);
+        println!("uptime_s={}", resp.uptime_s);
+    }
+
+    Ok(())
 }
 
 /// `decdn node peers`: call `admin_v1_peersList` on the running node and

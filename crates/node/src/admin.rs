@@ -10,13 +10,14 @@
 //! `AdminRpc` name is not a linkable rustdoc item, hence the bare
 //! backticks rather than an intra-doc link.
 //!
-//! Today the trait exposes a single method, `admin_v1_peersList`, which
-//! returns the current gossip peer table as JSON. Future operational
-//! methods (drain, health, etc.) will land here as additional entries
-//! on the same trait without requiring a new transport.
+//! Today the trait exposes `admin_v1_peersList` (gossip peer table as
+//! JSON) and `admin_v1_health` (node id + uptime). Future operational
+//! methods (drain, etc.) will land here as additional entries on the
+//! same trait without requiring a new transport.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use decdn_gossip::{PeerEntry, PeerTable};
 use jsonrpsee::core::{RpcResult, async_trait};
@@ -36,11 +37,31 @@ const MAX_ADMIN_CONNECTIONS: u32 = 16;
 #[derive(Debug, Clone)]
 pub struct AdminState {
     peer_table: Arc<RwLock<PeerTable>>,
+    /// Raw bytes of this node's iroh `PublicKey`. Hex-encoded on the
+    /// wire by `admin_v1_health`, matching the encoding `PeerView`
+    /// already uses for peer node ids on `admin_v1_peersList`.
+    node_id: [u8; 32],
+    /// Process-start `Instant`, captured by the runtime at the top of
+    /// `run()` before any `await` or I/O. Used as the origin of the
+    /// `uptime_s` field returned by `admin_v1_health`. `Instant` (not
+    /// `SystemTime`) so wall-clock skew during the process's lifetime
+    /// can't make uptime go backwards. May predate `AdminState`
+    /// construction by the time the RPC preflight, identity load, and
+    /// cache open take.
+    started_at: Instant,
 }
 
 impl AdminState {
-    pub const fn new(peer_table: Arc<RwLock<PeerTable>>) -> Self {
-        Self { peer_table }
+    pub const fn new(
+        peer_table: Arc<RwLock<PeerTable>>,
+        node_id: [u8; 32],
+        started_at: Instant,
+    ) -> Self {
+        Self {
+            peer_table,
+            node_id,
+            started_at,
+        }
     }
 }
 
@@ -121,6 +142,23 @@ pub struct PeersResponse {
     pub peers: Vec<PeerView>,
 }
 
+/// Response body for `admin_v1_health`. Shared between the server
+/// (serializes) and `decdn node health` (deserializes via the generated
+/// client). Intentionally minimal: this method exists so an operator
+/// script can answer "is this admin port the node I think it is, and
+/// has it been up since I started watching?" with one RPC call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthResponse {
+    /// Lowercase hex of this node's iroh `PublicKey` — same encoding as
+    /// `PeerView::node_id`.
+    pub node_id: String,
+    /// Whole seconds since the runtime captured the process-start
+    /// `Instant` at the top of `decdn run` (before any `await`, before
+    /// the RPC preflight). Computed from a monotonic `Instant` so
+    /// wall-clock skew can't produce a negative or non-monotonic value.
+    pub uptime_s: u64,
+}
+
 /// Admin RPC surface. Versioned via the namespace prefix
 /// (`admin_v1_...`): new methods may be added backwards-compatibly
 /// within `v1`, a breaking change cuts over to `admin_v2_...`.
@@ -130,6 +168,10 @@ pub trait AdminRpc {
     /// seen first.
     #[method(name = "peersList")]
     async fn peers_list(&self) -> RpcResult<PeersResponse>;
+
+    /// Return this node's identity and process uptime.
+    #[method(name = "health")]
+    async fn health(&self) -> RpcResult<HealthResponse>;
 }
 
 /// Concrete server implementation backed by the live gossip peer table.
@@ -146,6 +188,13 @@ impl AdminRpcImpl {
 
 #[async_trait]
 impl AdminRpcServer for AdminRpcImpl {
+    async fn health(&self) -> RpcResult<HealthResponse> {
+        Ok(HealthResponse {
+            node_id: alloy::primitives::hex::encode(self.state.node_id),
+            uptime_s: self.state.started_at.elapsed().as_secs(),
+        })
+    }
+
     async fn peers_list(&self) -> RpcResult<PeersResponse> {
         // Two-pass snapshot: under the read lock we copy only the
         // owned data needed to build a PeerView (raw node_id bytes,
@@ -272,7 +321,7 @@ mod tests {
                 .insert_or_refresh(mk_announce(id, region, ts_us), now_us)
                 .expect("seed insert succeeds");
         }
-        AdminState::new(Arc::new(RwLock::new(table)))
+        AdminState::new(Arc::new(RwLock::new(table)), [0u8; 32], Instant::now())
     }
 
     #[tokio::test]
@@ -296,7 +345,7 @@ mod tests {
         table
             .insert_or_refresh(mk_announce(id, "US", 20), 300)
             .expect("refresh insert");
-        let state = AdminState::new(Arc::new(RwLock::new(table)));
+        let state = AdminState::new(Arc::new(RwLock::new(table)), [0u8; 32], Instant::now());
         let rpc = AdminRpcImpl::new(state);
 
         let resp = rpc.peers_list().await.expect("peers_list ok");
@@ -307,6 +356,28 @@ mod tests {
         assert_eq!(p.first_seen_us, 100);
         assert_eq!(p.last_seen_us, 300);
         assert_eq!(p.announced_at_us, 20);
+    }
+
+    #[tokio::test]
+    async fn health_returns_hex_node_id_and_nondecreasing_uptime() {
+        let id = [0xCDu8; 32];
+        let started = Instant::now();
+        let state = AdminState::new(Arc::new(RwLock::new(PeerTable::new(0))), id, started);
+        let rpc = AdminRpcImpl::new(state);
+
+        let first = rpc.health().await.expect("health ok");
+        assert_eq!(first.node_id, "cd".repeat(32));
+
+        // Uptime is monotonic non-decreasing across calls — `Instant`
+        // is monotonic, so a second call after at least one elapsed-tick
+        // worth of work must report a value >= the first.
+        let second = rpc.health().await.expect("health ok");
+        assert!(
+            second.uptime_s >= first.uptime_s,
+            "uptime regressed: {} -> {}",
+            first.uptime_s,
+            second.uptime_s,
+        );
     }
 
     #[tokio::test]

@@ -16,10 +16,11 @@
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
+use std::time::Instant;
 
 use decdn_gossip::PeerTable;
 use decdn_node::admin::{self, AdminRpcClient, AdminState};
-use decdn_node::cli::PeersArgs;
+use decdn_node::cli::{HealthArgs, PeersArgs};
 use decdn_node::commands;
 use decdn_protocol::{LoadHint, NodeAnnounce, NodeAnnounceBody};
 use jsonrpsee::core::ClientError;
@@ -68,7 +69,7 @@ async fn spawn_admin(
 #[tokio::test]
 async fn peers_list_empty_peer_table() -> anyhow::Result<()> {
     let peer_table = Arc::new(RwLock::new(PeerTable::new(0)));
-    let state = AdminState::new(peer_table);
+    let state = AdminState::new(peer_table, [0u8; 32], Instant::now());
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
     let client = HttpClientBuilder::default().build(&url)?;
@@ -96,7 +97,7 @@ async fn peers_list_seeded_entries_sorted_desc() -> anyhow::Result<()> {
             .insert_or_refresh(mk_announce([3u8; 32], "AP", 3), 600)
             .ok();
     }
-    let state = AdminState::new(Arc::clone(&peer_table));
+    let state = AdminState::new(Arc::clone(&peer_table), [0u8; 32], Instant::now());
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
     let client = HttpClientBuilder::default().build(&url)?;
@@ -126,13 +127,37 @@ async fn peers_list_seeded_entries_sorted_desc() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn health_returns_hex_node_id_and_uptime() -> anyhow::Result<()> {
+    let peer_table = Arc::new(RwLock::new(PeerTable::new(0)));
+    let id = [0xABu8; 32];
+    let state = AdminState::new(peer_table, id, Instant::now());
+    let (url, stop_tx, join) = spawn_admin(state).await?;
+
+    let client = HttpClientBuilder::default().build(&url)?;
+    let resp = client.health().await?;
+    assert_eq!(resp.node_id, "ab".repeat(32));
+    // `uptime_s` is whole-seconds-since-`started_at`; on a fast test
+    // host this is almost always 0. Just assert the type-correct
+    // round-trip — `health` returning at all proves the wire format.
+    assert!(
+        resp.uptime_s < 60,
+        "uptime_s suspiciously large: {}",
+        resp.uptime_s
+    );
+
+    let _ = stop_tx.send(());
+    join.await?;
+    Ok(())
+}
+
 /// JSON-RPC `-32601 Method not found` is the equivalent of the old
 /// HTTP `404` for an unknown route. Confirm the server returns it for
 /// a method name outside the `admin_v1_` namespace.
 #[tokio::test]
 async fn unknown_method_returns_method_not_found() -> anyhow::Result<()> {
     let peer_table = Arc::new(RwLock::new(PeerTable::new(0)));
-    let state = AdminState::new(peer_table);
+    let state = AdminState::new(peer_table, [0u8; 32], Instant::now());
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
     let client = HttpClientBuilder::default().build(&url)?;
@@ -180,6 +205,52 @@ async fn cli_peers_surfaces_connection_refused() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Mirror the connection-refused / zero-timeout coverage on the
+/// `decdn node health` path so the new CLI surface fails the same
+/// way operators already expect for `node peers`.
+#[tokio::test]
+async fn cli_health_surfaces_connection_refused() -> anyhow::Result<()> {
+    let (listener, addr) = bind_loopback().await?;
+    drop(listener);
+
+    let args = HealthArgs {
+        admin_url: Some(format!("http://{addr}")),
+        config: None,
+        json: false,
+        timeout_ms: 2_000,
+    };
+    let err = commands::health(&args, None)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("expected connection-refused error"))?
+        .to_string();
+    assert!(
+        err.contains("refused"),
+        "error should mention 'refused', got: {err}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn cli_health_rejects_zero_timeout() -> anyhow::Result<()> {
+    let args = HealthArgs {
+        admin_url: Some("http://127.0.0.1:1".to_string()),
+        config: None,
+        json: false,
+        timeout_ms: 0,
+    };
+    let err = commands::health(&args, None)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("expected zero-timeout error"))?
+        .to_string();
+    assert!(
+        err.contains("--timeout-ms"),
+        "error should mention the flag, got: {err}"
+    );
+    Ok(())
+}
+
 /// `--timeout-ms 0` must be rejected up front — jsonrpsee interprets
 /// `Duration::ZERO` as "never time out" rather than "sub-millisecond
 /// deadline", which would hang an operator script that meant to cap
@@ -209,7 +280,7 @@ async fn cli_peers_rejects_zero_timeout() -> anyhow::Result<()> {
 #[tokio::test]
 async fn admin_shutdown_closes_listener() -> anyhow::Result<()> {
     let peer_table = Arc::new(RwLock::new(PeerTable::new(0)));
-    let state = AdminState::new(peer_table);
+    let state = AdminState::new(peer_table, [0u8; 32], Instant::now());
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
     // Baseline: server is up.

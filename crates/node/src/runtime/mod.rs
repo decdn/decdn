@@ -57,6 +57,14 @@ pub async fn run(
     config_path: Option<PathBuf>,
     reload_state: Arc<RuntimeReloadState>,
 ) -> anyhow::Result<()> {
+    // Captured at the very top of `run()`, before any `await` or I/O,
+    // so `admin_v1_health.uptime_s` reflects the entire process lifetime
+    // — including the RPC reachability preflight below (which can spend
+    // up to its 5s timeout on flaky networks). Operators reasoning about
+    // "how long has this node been up?" want every second since `decdn
+    // run` was invoked, not just everything after the admin server bound.
+    let started_at = std::time::Instant::now();
+
     // Preflight: verify RPC endpoint is reachable before committing to
     // port binding. A 5-second timeout keeps startup responsive on flaky
     // networks while still catching typos and dead endpoints early.
@@ -162,7 +170,11 @@ pub async fn run(
             .await
             .context("failed to bind admin listener")?;
         let (tx, rx) = oneshot::channel::<()>();
-        let state = admin::AdminState::new(Arc::clone(&peer_table));
+        let state = admin::AdminState::new(
+            Arc::clone(&peer_table),
+            *secret_key.public().as_bytes(),
+            started_at,
+        );
         tasks.spawn(async move {
             if let Err(err) = admin::serve(admin_listener, state, rx).await {
                 tracing::error!(%err, "admin server exited with error");
