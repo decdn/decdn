@@ -345,38 +345,27 @@ struct Channel {
 
 > **Terminology:** `channelNonce` (the channel creation counter) is distinct from the voucher `nonce` (the monotonic sequence number within a channel used in EIP-712 voucher signatures). The former uniquely identifies channels; the latter orders vouchers within a channel. [ADR 010](010-multi-token.md) extends this formula to `keccak256(client, provider, token, channelNonce)` for multi-token support. In implementation, consider naming the on-chain mapping `clientChannelCounter` to avoid confusion with voucher nonces.
 
-```solidity
-interface IStablePaymentChannel {
-    // Channel nonce tracking (see "Channel ID" above for terminology)
-    function clientChannelNonce(address client) external view returns (uint256);
+| Group | Function | Purpose |
+| --- | --- | --- |
+| Nonce | `clientChannelNonce(client) → uint256` | Per-client monotonic counter used in `channelId` derivation. |
+| Lifecycle | `openChannel(provider, deposit) → channelId` | Open a USDC channel; increments `clientChannelNonce[msg.sender]` then derives `channelId`. |
+| Lifecycle | `topUp(channelId, additionalDeposit)` | Client-only: add funds to an open channel (does not extend `expiresAt`). |
+| Lifecycle | `closeChannel(channelId, amount, nonce, bytesDelivered, signature)` | Client or provider: initiate close with the latest voucher; starts dispute window. |
+| Lifecycle | `disputeChannel(channelId, amount, nonce, bytesDelivered, signature)` | Any address: submit a higher-nonce voucher during the dispute window. |
+| Lifecycle | `commitReceiptRoot(channelId, receiptBatchRoot)` | Provider-only: store the ADR 027 §4 batch root for gauge-eligibility credit at settlement. |
+| Lifecycle | `settleChannel(channelId)` | Post-dispute-window: forward `claimedAmount` USDC + stored receipt root to `FeeRouter`; refund unused deposit. |
+| Lifecycle | `reclaimExpired(channelId)` | Client or provider: refund full deposit on an expired channel that was never closed. |
+| View | `getChannel(channelId) → Channel` | Read the on-chain `Channel` struct. |
+| View | `getRateBounds() → (floor, ceiling)` | Current `RateBounds` in token base units. |
+| View | `feeRouter() → address` | Configured `FeeRouter` target ([ADR 026](026-gauge-boost-tokenomics.md)). |
+| View | `lifetimeDepositOf(client) → uint256` | Monotonic per-client cumulative deposit counter (per [ADR 027 §3](027-distinct-client-receipts.md#3-identity-diversity-gating)). |
+| Governance | `setFeeRouter(addr)` | Replace router target; replaces ADR 003 inline-skim governance per ADR 026. |
+| Governance | `setMinDeposit(amount)` | Minimum channel deposit. |
+| Governance | `setDisputeWindow(seconds)` | Dispute window (bounded 43200–259200 — 12h–72h). |
+| Governance | `setRateBounds(floor, ceiling)` | Rate floor and ceiling in token base units. |
+| Governance | `setMaxVoucherIntervalMb(mb)` | Max negotiable voucher interval (bounded 1–1024 MB). |
 
-    // Channel lifecycle (openChannel increments clientChannelNonce[msg.sender] and uses it in channelId)
-    function openChannel(address provider, uint256 deposit) external returns (bytes32 channelId);
-    function topUp(bytes32 channelId, uint256 additionalDeposit) external;
-    function closeChannel(bytes32 channelId, uint256 amount, uint256 nonce, uint256 bytesDelivered, bytes calldata signature) external;
-    function disputeChannel(bytes32 channelId, uint256 amount, uint256 nonce, uint256 bytesDelivered, bytes calldata signature) external;
-    function commitReceiptRoot(bytes32 channelId, bytes32 receiptBatchRoot) external; // provider-only; stores root for gauge-eligibility credit at settlement (ADR 027 §4)
-    function settleChannel(bytes32 channelId) external; // forwards claimedAmount USDC + stored receiptBatchRoot to FeeRouter (see FeeRouter Integration)
-    function reclaimExpired(bytes32 channelId) external;
-
-    // Views
-    function getChannel(bytes32 channelId) external view returns (Channel memory);
-    function getRateBounds() external view returns (uint256 deliveryFloor, uint256 deliveryCeiling);
-    function feeRouter() external view returns (address); // configured FeeRouter target (ADR 026)
-    function lifetimeDepositOf(address client) external view returns (uint256); // monotonic per-client cumulative deposit counter — added per ADR 027 §3 distinct-client gating
-
-    // Governance
-    function setFeeRouter(address router) external;       // routeSettlement target; replaces ADR 003 inline-skim governance per ADR 026
-    function setMinDeposit(uint256 amount) external;
-    function setDisputeWindow(uint256 seconds_) external;
-    function setRateBounds(uint256 deliveryFloor, uint256 deliveryCeiling) external;
-    function setMaxVoucherIntervalMb(uint256 mb) external;
-
-    // Removed under ADR 026: setFeePercentage, setDiscountedFeePercentage, setTreasuryAddress.
-    // Bucket shares (40/40/7/5/5/3) are governed on FeeRouter, not StablePaymentChannel; the
-    // treasury share (5%) is configured on FeeRouter and not addressed here.
-}
-```
+Under [ADR 026](026-gauge-boost-tokenomics.md) the `setFeePercentage`, `setDiscountedFeePercentage`, and `setTreasuryAddress` setters from earlier drafts are removed — bucket shares (40/40/7/5/5/3) are governed on `FeeRouter`, not on `StablePaymentChannel`; the treasury share (5%) is configured on `FeeRouter`.
 
 > **Reentrancy protection:** All state-mutating functions that perform external calls (ERC-20 transfers) — `openChannel`, `topUp`, `settleChannel`, `reclaimExpired` — MUST use `nonReentrant` guards and follow checks-effects-interactions. This is especially critical for the production multi-token contract ([ADR 010](010-multi-token.md)) which accepts arbitrary governance-approved tokens.
 
@@ -390,83 +379,23 @@ interface IStablePaymentChannel {
 
 **`lifetimeDepositOf` semantics (added per [ADR 027 §3](027-distinct-client-receipts.md#3-identity-diversity-gating)).** Per-client cumulative-deposit counter exposed via `lifetimeDepositOf(client) view returns (uint256)`. Backed by a `mapping(address => uint256) lifetimeDeposit` storage slot. Incremented by the funded amount on every `openChannel` (by `deposit`) and every `topUp` (by `additionalDeposit`) attributable to the client. **Monotonic** — settlement, withdrawal, channel closure, expiry, or slashing MUST NOT decrease it. Returns `0` for an address with no prior channel funding history. Used by ADR 027 distinct-client gating as a cheap on-chain signal of cumulative capital ever bonded by this client (one SSTORE per `openChannel` / `topUp`).
 
-**Initial deployment values.** The constructor (or initializer for proxy deployments) sets governable parameters to their PoC defaults. All values are within the hardcoded safety bounds table further below (see also [ADR 009](009-governance.md) for governance ranges):
+**Initial deployment values.** The constructor takes `(usdc, feeRouter, disputeWindow)` and sets the remaining governable parameters to their PoC defaults: `maxVoucherIntervalMb = 1` (1 MB) and `maxChannelDuration = 7776000` (90 days). All values are within the hardcoded safety bounds table further below (see also [ADR 009](009-governance.md) for governance ranges). The constructor MUST reject `feeRouter == address(0)` and a `feeRouter` whose code size is zero (EOA / undeployed address).
 
-```solidity
-constructor(address usdc_, address feeRouter_, uint256 disputeWindow_) {
-    require(disputeWindow_ >= 43200 && disputeWindow_ <= 259200, "out of bounds");
-    require(feeRouter_ != address(0), "router required");
-    require(feeRouter_.code.length > 0, "router not a contract"); // extcodesize > 0; rejects EOA / undeployed addresses
-    usdc = usdc_;
-    feeRouter = feeRouter_;
-    disputeWindow = disputeWindow_;   // PoC default: 172800 (48 hours)
-    maxVoucherIntervalMb = 1;         // 1 MB
-    maxChannelDuration = 7776000;     // 90 days
-}
-```
+Default PoC deployment value for `disputeWindow`: **172800 seconds (48 hours)** — raised from 24 hours to guarantee effective dispute response time under L2 sequencer censorship (see [ADR 007](007-watchtower.md#l2-sequencer-censorship)). Safety bounds per [ADR 009](009-governance.md): 43200–259200 seconds (12h–72h). Under ADR 026 the `feePercentage` / `discountedFeePercentage` / treasury-address constructor parameters from earlier drafts are removed; bucket shares are governed on `FeeRouter` instead, and the treasury bucket is one of `FeeRouter`'s six buckets (see [FeeRouter Integration](#feerouter-integration)).
 
-Under [ADR 026](026-gauge-boost-tokenomics.md), `feePercentage` and `discountedFeePercentage` no longer exist on `StablePaymentChannel`; bucket shares are governed on `FeeRouter` instead. The constructor takes the deployed `FeeRouter` address rather than a treasury address; the treasury bucket is one of `FeeRouter`'s six buckets (see [FeeRouter Integration](#feerouter-integration)).
+**Events.** All events use indexed `channelId` plus an indexed actor field where applicable.
 
-Default PoC deployment value for `disputeWindow`: **172800 seconds (48 hours)** — raised from 24 hours to guarantee effective dispute response time under L2 sequencer censorship (see [ADR 007](007-watchtower.md#l2-sequencer-censorship)). Safety bounds per [ADR 009](009-governance.md): 43200–259200 seconds (12h–72h).
+| Event | Emitted by | Non-indexed fields |
+| --- | --- | --- |
+| `ChannelCloseInitiated(channelId, initiator, …)` | `closeChannel` | `amount, nonce, bytesDelivered, disputeDeadline` |
+| `ChannelDisputed(channelId, disputor, …)` | `disputeChannel` | `newAmount, newNonce, newBytes` |
+| `ChannelSettled(channelId, provider, …)` | `settleChannel` | `routedAmount` (USDC forwarded to `FeeRouter` = `claimedAmount`), `bytesDelivered` (counted toward operator's epoch byte counter), `clientRefund` |
+| `ChannelExpiredReclaimed(channelId, client, …)` | `reclaimExpired` | `deposit` |
+| `ChannelToppedUp(channelId, …)` | `topUp` | `additionalDeposit, newDeposit` |
+| `ChannelForceClosedByTokenRemoval(channelId, token, caller, …)` | `forceCloseChannel` (production `PaymentChannel` only — see [ADR 010](010-multi-token.md)) | `disputeDeadline` |
+| `RateBoundsUpdated` | `setRateBounds` | `newDeliveryFloor, newDeliveryCeiling` |
 
-**Channel close events:**
-
-```solidity
-event ChannelCloseInitiated(
-    bytes32 indexed channelId,
-    address indexed initiator,
-    uint256 amount,
-    uint256 nonce,
-    uint256 bytesDelivered,
-    uint256 disputeDeadline
-);
-
-event ChannelDisputed(
-    bytes32 indexed channelId,
-    address indexed disputor,
-    uint256 newAmount,
-    uint256 newNonce,
-    uint256 newBytes
-);
-
-event ChannelSettled(
-    bytes32 indexed channelId,
-    address indexed provider,
-    uint256 routedAmount,     // USDC forwarded to FeeRouter (= claimedAmount)
-    uint256 bytesDelivered,   // bytes counted toward operator's epoch byte counter
-    uint256 clientRefund
-);
-
-// Note: there is no `protocolFee` field — `settleChannel` does not skim a fee
-// inline. The bucket distribution emits its own events from FeeRouter
-// (see FeeRouter Integration).
-
-event ChannelExpiredReclaimed(
-    bytes32 indexed channelId,
-    address indexed client,
-    uint256 deposit
-);
-
-// Production PaymentChannel only (ADR 010); not part of the PoC StablePaymentChannel interface
-event ChannelForceClosedByTokenRemoval(
-    bytes32 indexed channelId,
-    address indexed token,
-    address indexed caller,
-    uint256 disputeDeadline
-);
-
-event ChannelToppedUp(
-    bytes32 indexed channelId,
-    uint256 additionalDeposit,
-    uint256 newDeposit
-);
-
-// Governance events (emitted by setRateBounds)
-event RateBoundsUpdated(
-    uint256 newDeliveryFloor,
-    uint256 newDeliveryCeiling
-);
-```
+`ChannelSettled` carries no `protocolFee` field — `settleChannel` does not skim a fee inline. The bucket distribution emits its own events from `FeeRouter` (see [FeeRouter Integration](#feerouter-integration)).
 
 **Channel expiry:** `expiresAt` is set at channel open: `expiresAt = block.timestamp + maxChannelDuration`. The `maxChannelDuration` parameter defaults to 90 days and is governable within hardcoded bounds (minimum 7 days, maximum 365 days). Channel expiry protects clients from indefinitely locked funds when a node disappears without closing the channel.
 
@@ -522,21 +451,14 @@ For how nodes validate `rate_per_mb` against cached bounds before signing protoc
 
 ### BuybackBurner
 
-```solidity
-interface IBuybackBurner {
-    function executeBuyback(address token, uint256 amount, uint256 minTokenOut) external;
-    function setKeeper(address keeper) external;
-    function setSwapRouter(address router) external;
-    function setPool(address pool) external;
-    function setSlippageTolerance(uint256 bps) external;
-    function setMinBuybackAmount(uint256 amount) external;
-    function setMaxBuybackAmount(uint256 amount) external;
-    function keeper() external view returns (address);
-    function getAccumulatedFees(address token) external view returns (uint256);
-}
-```
+| Function | Purpose |
+| --- | --- |
+| `executeBuyback(token, amount, minTokenOut)` | Governance multisig or `keeper`: swap `amount` of `token` for ≥ `minTokenOut` TOKEN and burn the proceeds. |
+| `setKeeper(addr)` / `setSwapRouter(addr)` / `setPool(addr)` | Governance: rotate the authorised keeper, swap router, or pool. |
+| `setSlippageTolerance(bps)` / `setMinBuybackAmount(n)` / `setMaxBuybackAmount(n)` | Governance: per-call execution guards. |
+| `keeper() → address` / `getAccumulatedFees(token) → uint256` | Views: current keeper and accumulated buyback inflow per token. |
 
-This interface is the canonical specification for `BuybackBurner`. [ADR 026 §2](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553) defines the economic parameters and the inflow source (5% router-fed). [ADR 018](018-liquidity-strategy.md) specifies the venue (Balancer V3 Router + 80/20 weighted pool) and how `setSwapRouter` and `setPool` are configured at deployment. **V3 integration note:** `setSwapRouter` holds the Balancer V3 **Router** address, but the `BuybackBurner` contract itself MUST self-approve the Balancer V3 **Vault** address (a separate contract) during initialization — the Vault pulls input tokens from the `msg.sender` of the Router call. See [ADR 018 — Buyback execution via Balancer V3](018-liquidity-strategy.md#buyback-execution-via-balancer-v3).
+This is the canonical `BuybackBurner` interface. [ADR 026 §2](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553) defines the economic parameters and the inflow source (5% router-fed). [ADR 018](018-liquidity-strategy.md) specifies the venue (Balancer V3 Router + 80/20 weighted pool) and how `setSwapRouter` / `setPool` are configured at deployment. **V3 integration note:** `setSwapRouter` holds the Balancer V3 **Router** address, but `BuybackBurner` MUST self-approve the Balancer V3 **Vault** address (a separate contract) during initialization — the Vault pulls input tokens from the `msg.sender` of the Router call. See [ADR 018 — Buyback execution via Balancer V3](018-liquidity-strategy.md#buyback-execution-via-balancer-v3).
 
 `executeBuyback` is callable by governance multisig or the authorized `keeper` address. All `set*` functions are governance-only behind a timelock.
 
@@ -638,32 +560,13 @@ The full node registry interface (`NodeInfo`, `registerNode` with atomic binding
 
 The remaining payment-specific `StakingRegistry` extension is the optional client-priority-staking mechanism below.
 
-```solidity
-using SafeERC20 for IERC20;
+| Function | Purpose |
+| --- | --- |
+| `clientStake(amount)` | `nonReentrant`: pull `amount` TOKEN via `safeTransferFrom`; bump `clientStakes[msg.sender]`; emit `ClientStaked`. No slashing. |
+| `clientUnstake(amount)` | `nonReentrant`: require sufficient stake; decrement `clientStakes[msg.sender]`; transfer back via `safeTransfer`; emit `ClientUnstaked`. |
+| `clientStakeOf(client) → uint256` | View the address's current stake. |
 
-// Client staking (optional, no slashing)
-mapping(address => uint256) public clientStakes;
-
-event ClientStaked(address indexed client, uint256 amount, uint256 newTotal);
-event ClientUnstaked(address indexed client, uint256 amount, uint256 newTotal);
-
-function clientStake(uint256 amount) external nonReentrant {
-    token.safeTransferFrom(msg.sender, address(this), amount);
-    clientStakes[msg.sender] += amount;
-    emit ClientStaked(msg.sender, amount, clientStakes[msg.sender]);
-}
-
-function clientUnstake(uint256 amount) external nonReentrant {
-    require(clientStakes[msg.sender] >= amount);
-    clientStakes[msg.sender] -= amount;
-    token.safeTransfer(msg.sender, amount);
-    emit ClientUnstaked(msg.sender, amount, clientStakes[msg.sender]);
-}
-
-function clientStakeOf(address client) external view returns (uint256) {
-    return clientStakes[client];
-}
-```
+Storage: `mapping(address => uint256) public clientStakes`. Events: `ClientStaked(client, amount, newTotal)`, `ClientUnstaked(client, amount, newTotal)`. Uses `SafeERC20` for the `IERC20` token (the protocol's TOKEN, per [ADR 026](026-gauge-boost-tokenomics.md)).
 
 ## Client Priority Staking
 
