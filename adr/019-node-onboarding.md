@@ -75,6 +75,13 @@ Before any on-chain or protocol activity:
      channels immediately (e.g., to pay origin-backed nodes for cache-miss pulls). Clients
      will open inbound channels to the node without any USDC on the node side.
 
+   - **Wallet, gas sponsorship, and session keys.** PoC accepts a plain EOA. Production
+     migrates the operator wallet to a Safe (2-of-3 recommended) with ERC-7579 session
+     keys for the high-frequency `slash_sig` signing path and an ERC-4337 paymaster for
+     gas-in-USDC; see [ADR 024](024-account-abstraction.md) for the full design and the
+     [Operator Key-Rotation Runbook](appendix-operator-key-rotation.md) for the
+     EOA → Safe migration.
+
 5. **Choose region.** Determine the ISO 3166-1 alpha-2 country code that best represents
    the node's physical location. This value is self-reported and unverified in PoC
    ([ADR 001](001-network.md), [ADR 011](011-content-takedown.md)). It will be submitted
@@ -348,20 +355,6 @@ If the node's iroh identity has been replaced (key rotation), use `StakingRegist
 after re-registration to associate the new `nodeId` with the same `ethAddress` — see
 [ADR 003 § NodeId Binding](003-payments.md#nodeid-to-ethereum-binding). The old
 `nodeId` mapping is cleared.
-
----
-
-### PoC Simplifications
-
-| Area | PoC | Production |
-|------|-----|------------|
-| NODE key storage | Encrypted file | Platform keychain / HSM |
-| ETH gas sponsor | Operator provides ETH directly | ERC-4337 paymaster (gas-in-USDC) — see [ADR 024](024-account-abstraction.md) |
-| Operator wallet | EOA or Safe ([ADR 024](024-account-abstraction.md)) | Safe multisig recommended (2-of-3) with session keys |
-| Multiaddr cooldown | None | Governable (default 0, can be tightened) |
-| Origin assignment | Operator self-configures | Evaluated in [Issue #189](https://github.com/thiras/decdn/issues/189) |
-| Geolocation verification | Self-reported `regionHint` | Deferred — see Issue #190 gap 7 |
-| NTP enforcement | Logged warning if offset > 10s | SHOULD, not MUST |
 
 ## Consequences
 

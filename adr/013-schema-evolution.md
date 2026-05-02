@@ -391,10 +391,6 @@ sequenceDiagram
 
 ### Deprecation Timeline
 
-**PoC:** No formal deprecation period. All nodes are operator-controlled and can be updated simultaneously. Breaking changes are coordinated out-of-band.
-
-**Production:**
-
 | Milestone | Timeframe | Action |
 | --- | --- | --- |
 | New version released | T+0 | Nodes begin supporting both old and new versions |
@@ -402,7 +398,7 @@ sequenceDiagram
 | Old version removal | T+12 weeks | Old version support MAY be removed. Nodes that have not upgraded become unreachable by new clients |
 | Gossip topic removal | T+12 weeks | Old gossip topic subscriptions MAY be dropped. Peers on old topics become invisible |
 
-Deprecation schedules are announced via governance ([ADR 009](009-governance.md)). A future governance-maintained on-chain `ProtocolVersions` registry could formalize version sunset dates — deferred, not required for PoC.
+Deprecation schedules are announced via governance ([ADR 009](009-governance.md)). A future governance-maintained on-chain `ProtocolVersions` registry could formalize version sunset dates — deferred follow-up.
 
 > **See also:** [`appendix-operator-upgrade-path.md`](appendix-operator-upgrade-path.md) sequences the operator-side actions for each tier — Tier 1/2 checklists, the Tier 3 rolling-upgrade procedure, and the watchtower / client / governance coordination touchpoints.
 

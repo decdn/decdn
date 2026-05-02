@@ -124,8 +124,8 @@ For Tier 3, clients control the ALPN proposal order. You do not negotiate with t
 
 For Tier 3 upgrades that touch governance-controlled parameters (rate bounds in [ADR 003 §Rate Bounds Refresh](003-payments.md), token allowlist in [ADR 010](010-multi-token.md), slashing schedule in [ADR 026 §8](026-gauge-boost-tokenomics.md)):
 
-- The governance proposal that authorises the new behaviour is on its own timeline ([ADR 009](009-governance.md): 7-day vote + 48-hour timelock). The protocol release usually ships **before** the governance vote concludes, with the new behaviour gated on an on-chain flag.
-- Operators MUST verify the relevant on-chain governance state before activating the new behaviour locally — consult the release notes for the specific contract call (e.g. `Governance.upgradeActivated(uint256 versionId)` returns true).
+- The governance proposal that authorizes the new behavior is on its own timeline ([ADR 009](009-governance.md): 7-day vote + 48-hour timelock). The protocol release usually ships **before** the governance vote concludes, with the new behavior gated on an on-chain flag.
+- Operators MUST verify the relevant on-chain governance state before activating the new behavior locally — consult the release notes for the specific contract call (e.g. `Governance.upgradeActivated(uint256 versionId)` returns true).
 
 ## 5. Failure modes and rollback
 
@@ -142,7 +142,7 @@ For Tier 3 upgrades that touch governance-controlled parameters (rate bounds in 
 
 - **In-place protocol downgrades.** Once a Tier 3 release ships, the deprecation timeline is one-directional. Operator software may roll back to the dual-version binary in an emergency, but the protocol does not support reverting from a `v2`-only binary back to `v1`-only after `v1` has been removed.
 - **Cross-chain protocol coordination.** This runbook assumes a single L2 deployment ([`appendix-l2-deployment.md`](appendix-l2-deployment.md)). Future multi-L2 deployments will require a separate per-deployment-coordinator pattern.
-- **Client-side migration.** Client behaviour during a Tier 3 upgrade is governed by client deployment policy, not by this runbook. Client smart-wallet upgrades follow [ADR 024](024-account-abstraction.md).
+- **Client-side migration.** Client behavior during a Tier 3 upgrade is governed by client deployment policy, not by this runbook. Client smart-wallet upgrades follow [ADR 024](024-account-abstraction.md).
 
 ## Cross-references
 
