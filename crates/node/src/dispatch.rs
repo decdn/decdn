@@ -1542,12 +1542,11 @@ mod tests {
             .expect_err("post-reload reject");
 
         let text = metrics.encode().unwrap();
-        // OpenMetrics auto-appends `_total` to counter names, so the
-        // metric `decdn_dispatch_rejected_per_node_total` (already with
-        // the conventional `_total` suffix) is rendered as
-        // `decdn_dispatch_rejected_per_node_total_total`.
+        // OpenMetrics auto-appends `_total` to counter field names, so
+        // the field `dispatch_rejected_per_node` (under the `decdn`
+        // group) is exposed as `decdn_dispatch_rejected_per_node_total`.
         assert!(
-            text.contains("decdn_dispatch_rejected_per_node_total_total 1"),
+            text.contains("decdn_dispatch_rejected_per_node_total 1"),
             "post-reload reject must increment counter; got:\n{text}"
         );
     }

@@ -54,12 +54,16 @@ pub struct DecdnMetrics {
     /// a sustained outage rather than relying on a one-shot startup line.
     pub rpc_healthy: Gauge,
     /// Connections rejected because the global concurrency semaphore was
-    /// exhausted.
-    pub dispatch_rejected_global_total: Counter,
-    /// Connections rejected by the per-NodeID token bucket.
-    pub dispatch_rejected_per_node_total: Counter,
-    /// Connections rejected by the per-IP token bucket.
-    pub dispatch_rejected_per_ip_total: Counter,
+    /// exhausted. Field has no `_total` suffix because the `OpenMetrics`
+    /// encoder appends it automatically; the operator-visible name is
+    /// `decdn_dispatch_rejected_global_total`.
+    pub dispatch_rejected_global: Counter,
+    /// Connections rejected by the per-NodeID token bucket. Operator-
+    /// visible name: `decdn_dispatch_rejected_per_node_total`.
+    pub dispatch_rejected_per_node: Counter,
+    /// Connections rejected by the per-IP token bucket. Operator-visible
+    /// name: `decdn_dispatch_rejected_per_ip_total`.
+    pub dispatch_rejected_per_ip: Counter,
     /// Currently in-flight QUIC handler tasks holding a dispatch permit.
     /// Diverges from `active_connections` once non-probe ALPNs gain limiter
     /// integration: this counts limiter permits across every gated ALPN,
@@ -156,17 +160,17 @@ impl Metrics {
 
     /// Record a connection rejected by the global concurrency semaphore.
     pub fn dispatch_rejected_global(&self) {
-        self.decdn.dispatch_rejected_global_total.inc();
+        self.decdn.dispatch_rejected_global.inc();
     }
 
     /// Record a connection rejected by the per-NodeID token bucket.
     pub fn dispatch_rejected_per_node(&self) {
-        self.decdn.dispatch_rejected_per_node_total.inc();
+        self.decdn.dispatch_rejected_per_node.inc();
     }
 
     /// Record a connection rejected by the per-IP token bucket.
     pub fn dispatch_rejected_per_ip(&self) {
-        self.decdn.dispatch_rejected_per_ip_total.inc();
+        self.decdn.dispatch_rejected_per_ip.inc();
     }
 
     /// Increment the in-flight dispatch permit gauge.
