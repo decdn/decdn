@@ -115,9 +115,9 @@ graph TD
     BB["6. BuybackBurner"]
     FR["7. FeeRouter"]
     SPC["8. StablePaymentChannel (PoC)<br/>PaymentChannel (production)"]
-    CB["9. ContentBlacklist"]
-    PR["10. PublisherRegistry"]
-    OA["11. OriginAssignment"]
+    PR["9. PublisherRegistry"]
+    OA["10. OriginAssignment"]
+    CB["11. ContentBlacklist"]
     SJ["12. SlashJudge"]
     WE["13. WatchtowerEscrow (production)"]
 
@@ -133,10 +133,10 @@ graph TD
     SPC --> USDC
     SPC --> SR
     SPC --> FR
-    CB --> SR
-    CB --> OA
     OA --> SR
     OA --> PR
+    CB --> SR
+    CB --> OA
     SJ --> SR
     SJ --> TOKEN
     WE --> SPC
@@ -155,9 +155,9 @@ graph TD
 | 7 | FeeRouter (production) | USDC address, TOKEN address, VotingEscrow address, BuybackBurner address, SafetyReserve address, treasury wallet address, Balancer V3 Router + pool addresses (for the delegator-pool USDC→TOKEN swap; may share `BuybackBurner`'s configuration), `epochLength` (1 week), `claimWindow` (26 epochs), default split shares (40/40/7/5/5/3 per [ADR 026](026-gauge-boost-tokenomics.md) §2), and `boostFloor` (0.4) per [ADR 026](026-gauge-boost-tokenomics.md) §3. Sum-to-100% across the six router shares is enforced on every governance update. |
 | 8a | StablePaymentChannel (PoC) | Constructor args: USDC address, `treasuryAddress`, `disputeWindow` (48h). Initialized in constructor body: StakingRegistry address, `feePercentage` (300 bps), `discountedFeePercentage` (150 bps), `maxChannelDuration` (90 days), rate bounds ([ADR 003](003-payments.md)) |
 | 8b | PaymentChannel (production) | StakingRegistry address, Governor address, **FeeRouter address** ([ADR 026](026-gauge-boost-tokenomics.md) §2). `settleChannel` no longer skims a protocol fee; it transfers the full operator USDC balance to `FeeRouter.routeSettlement(operator, bytesDelivered, amount, receiptBatchRoot)` in the same transaction. The `feePercentage` / `discountedFeePercentage` constructor arguments from the PoC contract are removed. |
-| 9 | ContentBlacklist | `ContentBlacklist(address stakingRegistry, address originAssignment)`. StakingRegistry address is required for `ejectNode()`; OriginAssignment address is required for the `removeAllAssignments()` cross-contract call so that origin blacklisting also evicts the operator from every active namespace assignment ([ADR 011](011-content-takedown.md)). May be deployed with a zero `originAssignment` and updated post-deploy via a governance call if `OriginAssignment` is deployed afterwards. |
-| 10 | PublisherRegistry | None. Permissionless registration; namespace cap and transfer-timelock parameters are read from the governance-controlled parameter store at call time. See [ADR 002 § Contract: PublisherRegistry](002-content-addressing.md#contract-publisherregistry). |
-| 11 | OriginAssignment | StakingRegistry address (origin candidates must be active stakers), PublisherRegistry address (proposer must own the namespace). Min-redundancy floor and timelock parameters are governance-controlled; see [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority). |
+| 9 | PublisherRegistry | None. Permissionless registration; namespace cap and transfer-timelock parameters are read from the governance-controlled parameter store at call time. See [ADR 002 § Contract: PublisherRegistry](002-content-addressing.md#contract-publisherregistry). |
+| 10 | OriginAssignment | StakingRegistry address (origin candidates must be active stakers), PublisherRegistry address (proposer must own the namespace), ContentBlacklist address may be set to zero at construction and bound post-deploy via a governance call (the runtime `pruneBlacklistedAssignment` flow only activates once the address is bound; before that, no-op). Min-redundancy floor and timelock parameters are governance-controlled; see [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority). |
+| 11 | ContentBlacklist | `ContentBlacklist(address stakingRegistry)`. StakingRegistry address is required for `ejectNode()`. ContentBlacklist no longer cross-calls `OriginAssignment` (security relies on runtime checks; see [ADR 011 § Interaction with ContentBlacklist](011-content-takedown.md#interaction-with-contentblacklist)). After deployment, `OriginAssignment.setContentBlacklist(address)` is called once via the deployer / admin to wire the read direction (`OriginAssignment.pruneBlacklistedAssignment` queries `ContentBlacklist.isOriginBlacklisted`). |
 | 12 | SlashJudge | StakingRegistry address, TOKEN address, `challengeBond` (100 TOKEN), `counterEvidenceWindow` (24h) |
 | 13 | WatchtowerEscrow | StablePaymentChannel/PaymentChannel address, `heartbeatInterval`, `missThreshold`, `feeRateBps`, `minFee`, `monitoringPeriod` |
 
@@ -171,13 +171,13 @@ After all contracts are deployed, the deployer must execute these transactions b
    stakingRegistry.grantRole(BLACKLIST_ROLE, address(contentBlacklist));
    ```
 
-2. **Grant `BLACKLIST_ROLE`** on OriginAssignment to ContentBlacklist:
+2. **Bind ContentBlacklist into OriginAssignment** (one-shot read wiring):
 
    ```solidity
-   originAssignment.grantRole(BLACKLIST_ROLE, address(contentBlacklist));
+   originAssignment.setContentBlacklist(address(contentBlacklist));
    ```
 
-   This authorizes `ContentBlacklist.addOrigin` to call `OriginAssignment.removeAllAssignments(operator)` so that a blacklisted operator is automatically removed from every namespace's active origin set. Without this grant, blacklisting an operator would eject them from `StakingRegistry` but leave stale assignment entries pointing at the blacklisted address.
+   This authorizes `OriginAssignment.pruneBlacklistedAssignment` to query `ContentBlacklist.isOriginBlacklisted` for permissionless storage cleanup. Until this call is made, prune calls revert; runtime authorization checks (probe, peer table) consult both contracts directly via the off-chain RPC path and are unaffected.
 
 3. **Grant `SLASH_ROLE`** on StakingRegistry to SlashJudge:
 
@@ -257,9 +257,9 @@ graph LR
     GOV -->|"balanceOfAt / totalSupplyAt"| VE
     GOV -->|"payout(bundle, recipient, amount)"| SAFE
     CB -->|"ejectNode(operatorAddress)"| SR
-    CB -->|"removeAllAssignments(operator)"| OA
     OA -->|"isActive(operator)"| SR
     OA -->|"ownerOf(namespaceId)"| PR
+    OA -->|"isOriginBlacklisted(operator)"| CB
     GOV -->|"activateAssignment(...)"| OA
     SJ -->|"slash(node, offenseType)"| SR
     SJ -->|"safeTransferFrom / safeTransfer"| ERC
@@ -290,9 +290,9 @@ graph LR
 | Governor | VotingEscrow | `balanceOfAt(user, ts)`, `totalSupplyAt(ts)` | Public (read-only) | No |
 | Governor | SafetyReserve | `payout(bundle, recipient, amount)` | `PAYOUT_AUTHORIZER_ROLE` (Governor + emergency-multisig within hard caps; [ADR 026](026-gauge-boost-tokenomics.md) §5) | Yes |
 | ContentBlacklist | StakingRegistry | `ejectNode(operatorAddress)` | `BLACKLIST_ROLE` | Yes |
-| ContentBlacklist | OriginAssignment | `removeAllAssignments(operatorAddress)` | `BLACKLIST_ROLE` on OriginAssignment | Yes |
 | OriginAssignment | StakingRegistry | `isActive(operator)` | Public (read-only) | No |
 | OriginAssignment | PublisherRegistry | `ownerOf(namespaceId)` | Public (read-only) | No |
+| OriginAssignment | ContentBlacklist | `isOriginBlacklisted(operator)` | Public (read-only) | No |
 | Governor | OriginAssignment | `activateAssignment(namespaceId, operators[])`, `revokeAssignment(namespaceId, operator)` | `GOVERNANCE_ROLE` on OriginAssignment | Yes |
 | SlashJudge | StakingRegistry | `slash(node, offenseType)` | `SLASH_ROLE` | Yes |
 | SlashJudge | IERC20 (TOKEN) | `safeTransferFrom()` / `safeTransfer()` | Caller must have allowance/balance | Yes |
@@ -447,7 +447,6 @@ New top-level contracts integrate with the launch-time set via standard `AccessC
 | --- | --- | --- | --- | --- |
 | `DEFAULT_ADMIN_ROLE` | All contracts | Grant/revoke roles, set parameters | Deployer EOA | `TimelockController` (2-day delay) |
 | `BLACKLIST_ROLE` | StakingRegistry | `ejectNode()` | ContentBlacklist contract | ContentBlacklist contract |
-| `BLACKLIST_ROLE` | OriginAssignment | `removeAllAssignments(operator)` | ContentBlacklist contract | ContentBlacklist contract |
 | `GOVERNANCE_ROLE` | OriginAssignment | `activateAssignment()`, `revokeAssignment()`, `setMinRedundancy()`, `setAssignmentTimelock()` | Admin | Governor via timelock |
 | `SLASH_ROLE` | StakingRegistry | `slash()` | SlashJudge contract | SlashJudge contract |
 | `SETTLEMENT_REPORTER_ROLE` | StakingRegistry | `recordSettlement(operator)` | StablePaymentChannel | FeeRouter; see §3 |
@@ -596,14 +595,14 @@ No external calls; no funds held. `nonReentrant` is not required but is included
 
 | Function | External Calls | Guards |
 | --- | --- | --- |
-| `proposeAssignment(namespaceId, operators[])` | `PublisherRegistry.ownerOf(namespaceId)` (read) | Caller must own the namespace; `operators.length` within `[minRedundancy, maxOriginsPerNamespace]` |
+| `proposeAssignment(namespaceId, operators[])` | `PublisherRegistry.ownerOf(namespaceId)` (read), `StakingRegistry.isActive(operator)` per operator (read) | Caller must own the namespace; `operators.length` within `[minRedundancy, maxOriginsPerNamespace]`; `operators` array MUST contain unique addresses (duplicates revert) |
 | `activateAssignment(...)` | None (state change only) | `GOVERNANCE_ROLE`; pending proposal must exist; min-redundancy invariant enforced post-activation |
 | `revokeAssignment(namespaceId, operator)` | None (state change only) | Either `GOVERNANCE_ROLE` or namespace owner; revocation that would drop the active set below `minRedundancy` is allowed (publishers may shrink their assignment set; the constraint is on activation, not on revocation) |
-| `removeAllAssignments(operator)` | None (state change only) | `BLACKLIST_ROLE` (granted to ContentBlacklist) |
-| `setMinRedundancy(uint256)`, `setAssignmentTimelock(uint256)` | None (state change only) | `GOVERNANCE_ROLE`; safety bounds enforced ([ADR 009](009-governance.md)) |
-| `isAuthorizedOrigin()`, `getOrigins()`, `getPendingAssignment()` | None (read-only) | N/A |
+| `pruneBlacklistedAssignment(namespaceId, operator)` | `ContentBlacklist.isOriginBlacklisted(operator)` (read) | Permissionless; reverts if operator is not currently blacklisted in `ContentBlacklist` |
+| `setMinRedundancy(uint256)`, `setAssignmentTimelock(uint256)` | None (state change only) | `GOVERNANCE_ROLE`; safety bounds enforced ([ADR 009](009-governance.md)); cross-parameter invariant `1 ≤ minRedundancy ≤ maxOriginsPerNamespace` enforced at the contract layer |
+| `isAuthorizedOrigin()`, `isAuthorizedOriginAt(...)`, `getOrigins()`, `getPendingAssignment()` | None (read-only) | N/A |
 
-No external calls; no funds held. The contract maintains a `EnumerableSet` of authorized operators per namespace and reads `StakingRegistry.isActive` opportunistically (not enforced at activation time — a stake-holder who unbonds is filtered at probe time by clients, not by the contract; this avoids the gas cost of cross-contract checks on every assignment lookup).
+The contract holds no funds. It maintains an `EnumerableSet` of authorized operators per namespace plus per-(namespace, operator) `(activatedAt, revokedAt)` checkpoints supporting the `isAuthorizedOriginAt(uint256 namespaceId, address operator, uint64 timestamp)` historical view used by `SlashJudge` for phantom-origin evidence (see [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority)). Runtime authorization checks (probes, peer-table validation) consult both `OriginAssignment.isAuthorizedOrigin` AND `ContentBlacklist.isOriginBlacklisted` — a blacklisted operator is treated as unauthorized regardless of stale `OriginAssignment` state, so storage cleanup via `pruneBlacklistedAssignment` is a lazy optimisation rather than a security primitive.
 
 #### Multi-Token Reentrancy Considerations
 

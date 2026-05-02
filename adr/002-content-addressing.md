@@ -64,6 +64,10 @@ interface IPublisherRegistry {
 
     // Views
     function namespaceOf(bytes32 blake3Hash) external view returns (uint256 namespaceId);
+    // Historical view used by SlashJudge for phantom-origin evidence: returns
+    // the namespace this hash was bound to at `timestamp`. Returns 0 if the hash
+    // was unclaimed (default-open) at that time.
+    function namespaceOfAt(bytes32 blake3Hash, uint64 timestamp) external view returns (uint256 namespaceId);
     function ownerOf(uint256 namespaceId) external view returns (address);
     function namespaceCount(address publisher) external view returns (uint256);
     function pendingTransfer(uint256 namespaceId) external view returns (address newOwner, uint256 readyAt);
@@ -78,6 +82,8 @@ interface IPublisherRegistry {
 ```
 
 `namespaceOf(hash)` returns `0` for any hash not explicitly claimed; that is the default-open namespace. The view never reverts on unknown hashes — callers cannot distinguish "hash unknown to the protocol" from "hash served as default-open" via this view, which is correct: both states are operationally identical.
+
+`namespaceOfAt(hash, timestamp)` is the historical counterpart used by `SlashJudge` to evaluate phantom-origin evidence at the timestamp embedded in a signed `ProbeResponse` (see [ADR 005 § cdn/probe/v1](005-protocol.md#cdnprobev1--latency-probe)). It returns `0` for any timestamp before the hash was claimed, otherwise the namespace it was bound to at that time. Because content claims are append-only — a hash may move from default-open (`0`) to a non-zero namespace exactly once and never moves again — the historical lookup needs to store only a single `(namespaceId, claimedAt)` entry per claimed hash, and the view is `t < claimedAt[hash] ? 0 : namespaceId[hash]`.
 
 Per-publisher namespace cap and ownership-transfer timelock are governable parameters with safety bounds (see [ADR 009](009-governance.md)). The 7-day default transfer timelock is documented for clarity; the contract reads its current value from the governance-controlled parameter store at call time.
 
