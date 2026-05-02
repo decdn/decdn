@@ -664,6 +664,18 @@ pub(crate) fn resolve_security(
     let max_concurrent_handlers = file
         .and_then(|s| s.max_concurrent_handlers)
         .unwrap_or(DEFAULT_MAX_CONCURRENT_HANDLERS);
+    // `tokio::sync::Semaphore` panics if asked to hold more than
+    // `MAX_PERMITS` (= `usize::MAX >> 3`). On 64-bit this is ~2.3×10^18
+    // so any `u32` is safe; on 32-bit it's ~5.4×10^8 and any
+    // `max_concurrent_handlers > MAX_PERMITS` would crash startup *or*
+    // a SIGHUP-driven reload via `add_permits`. Reject at config time
+    // so the failure mode is "node refuses to boot with a clear
+    // error" rather than "node panics on next reload."
+    let max_permits = tokio::sync::Semaphore::MAX_PERMITS;
+    anyhow::ensure!(
+        usize::try_from(max_concurrent_handlers).is_ok_and(|v| v <= max_permits),
+        "security.max_concurrent_handlers={max_concurrent_handlers} exceeds tokio Semaphore::MAX_PERMITS={max_permits} on this target"
+    );
 
     let per_node_rate_per_sec = file
         .and_then(|s| s.per_node_rate_per_sec)

@@ -23,8 +23,8 @@
 //! subject to the global and per-NodeID limits.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::net::{IpAddr, Ipv6Addr};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -35,6 +35,27 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::config::ResolvedSecurity;
 use crate::metrics::Metrics;
+
+/// Bucket key for the per-IP rate limit. IPv4 addresses are used as-is; IPv6
+/// addresses are masked to their `/64` prefix.
+///
+/// Without the mask the per-IP layer is trivially defeated: a customer-grade
+/// IPv6 allocation is typically `/64` (or larger), giving an attacker `2^64`
+/// distinct `IpAddr`s inside one allocation. Each unique address would be a
+/// separate map key, both bypassing the rate limit and churning the eviction
+/// path so legitimate IPv4 victims' buckets get flushed.
+fn ip_bucket_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => {
+            let mut octets = v6.octets();
+            for b in &mut octets[8..] {
+                *b = 0;
+            }
+            IpAddr::V6(Ipv6Addr::from(octets))
+        }
+    }
+}
 
 /// Reason a connection was rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,18 +84,21 @@ impl RejectReason {
 
 /// RAII permit that holds a semaphore slot for the lifetime of a handler task.
 ///
-/// Construction (on the success path of [`ConnectionLimiter::acquire`],
-/// in `acquire_inner`) increments the `dispatch_in_flight` gauge; `Drop`
-/// decrements it. The pair must remain symmetric — if you split the
-/// construction site, keep the gauge bookkeeping adjacent so the
-/// invariant is locally checkable.
+/// On the success path of [`ConnectionLimiter::acquire`] (`acquire_inner`),
+/// the limiter calls `Metrics::dispatch_permit_acquired()` immediately before
+/// constructing this struct; `Drop` calls `Metrics::dispatch_permit_released()`
+/// unconditionally. The two calls must remain paired: every successful
+/// construction is matched by exactly one drop, and the gauge stays balanced.
 ///
-/// `_sem` is `Option` to support the `max_concurrent_handlers = 0`
-/// disabled-global-cap mode: when the global layer is disabled the
-/// acquire path doesn't take a semaphore permit at all, but it still
-/// returns a `Permit` so the in-flight gauge tracks the handler. The
-/// metric decrement on `Drop` is unconditional — that's the invariant
-/// the comment above is calling out.
+/// `_sem` is `Option` so the `max_concurrent_handlers = 0` disabled-cap mode
+/// can return a `Permit` without holding a semaphore slot — the in-flight
+/// gauge still tracks the handler, and `Drop` releases nothing (the
+/// `OwnedSemaphorePermit` is `None`).
+///
+/// `#[must_use]`: dropping the permit immediately (`let _ = limiter.acquire(&conn);`)
+/// would defeat the purpose of acquiring it — the slot is freed before the
+/// handler runs, so the cap fails to bound concurrency.
+#[must_use = "drop the Permit at end of handler scope; otherwise the in-flight slot is released immediately"]
 pub struct Permit {
     _sem: Option<OwnedSemaphorePermit>,
     metrics: Arc<Metrics>,
@@ -274,9 +298,8 @@ impl<K: std::hash::Hash + Eq + Clone> BoundedRateMap<K> {
     ///
     /// Bulk shrink path: collect the keys with their `last_refill`,
     /// `select_nth_unstable_by_key` to partition the oldest cohort, then
-    /// drop them. `select_nth_unstable_by_key` is average O(n) via
-    /// introselect (worst-case O(n²) under adversarial timestamps, still
-    /// bounded by `cap`). Calling `evict_oldest` in a loop here would be
+    /// drop them. `select_nth_unstable_by_key` is O(n) (introselect, since
+    /// stdlib 1.49). Calling `evict_oldest` in a loop here would be
     /// O(n²) — at the default `max_tracked_sources = 4096`, a shrink to
     /// 10 entries is ~16 M comparisons under the per-map `Mutex` held by
     /// every live acquire. The bulk path keeps the worst-case shrink in
@@ -363,6 +386,18 @@ pub struct ConnectionLimiter {
     target_lock: Mutex<()>,
     by_node: Mutex<BoundedRateMap<[u8; 32]>>,
     by_ip: Mutex<BoundedRateMap<IpAddr>>,
+    /// Mirrors `by_ip.rate > 0.0`. Read on the relay-only-connection
+    /// fast path so we can record `dispatch_per_ip_skipped_no_addr_total`
+    /// without taking the `by_ip` mutex on every relay accept. Written
+    /// only under `target_lock` during reload.
+    per_ip_enabled: AtomicBool,
+    /// One-shot poison-log gates. Set on the first observation of a
+    /// poisoned `by_ip` / `by_node` mutex so `tracing::error!` fires
+    /// once per process rather than once per acquire — under sustained
+    /// traffic on a poisoned mutex the unguarded form would emit
+    /// megabytes of identical log lines per second.
+    by_ip_poison_logged: AtomicBool,
+    by_node_poison_logged: AtomicBool,
     metrics: Arc<Metrics>,
 }
 
@@ -387,6 +422,7 @@ impl ConnectionLimiter {
             cfg.per_ip_rate_per_sec,
             f64::from(cfg.per_ip_burst),
         ));
+        let per_ip_enabled = AtomicBool::new(cfg.per_ip_rate_per_sec > 0.0);
         Self {
             semaphore,
             target_max_concurrent: AtomicU32::new(initial_size),
@@ -394,6 +430,9 @@ impl ConnectionLimiter {
             target_lock: Mutex::new(()),
             by_node,
             by_ip,
+            per_ip_enabled,
+            by_ip_poison_logged: AtomicBool::new(false),
+            by_node_poison_logged: AtomicBool::new(false),
             metrics,
         }
     }
@@ -447,15 +486,23 @@ impl ConnectionLimiter {
         // 1. Token-bucket maps: per-map mutex, in-place mutation.
         //    rate=0 → layer disabled; cap=0 → unbounded map.
         {
-            let mut g = lock_recover(&self.by_node, "per-node");
+            let mut g = lock_recover(&self.by_node, "per-node", &self.by_node_poison_logged);
             g.set_rate_burst(cfg.per_node_rate_per_sec, f64::from(cfg.per_node_burst));
             g.set_cap(cfg.max_tracked_sources);
         }
         {
-            let mut g = lock_recover(&self.by_ip, "per-ip");
+            let mut g = lock_recover(&self.by_ip, "per-ip", &self.by_ip_poison_logged);
             g.set_rate_burst(cfg.per_ip_rate_per_sec, f64::from(cfg.per_ip_burst));
             g.set_cap(cfg.max_tracked_sources);
         }
+        // Mirror the per-IP enabled state for the relay-only fast path.
+        // Stored under Relaxed because there's no happens-before
+        // relationship to the bucket's own state — the worst case across
+        // a swap is one accept observing the prior generation, which is
+        // operationally indistinguishable from arriving microseconds
+        // earlier.
+        self.per_ip_enabled
+            .store(cfg.per_ip_rate_per_sec > 0.0, Ordering::Relaxed);
 
         // 2. Semaphore: serialise reloads through `target_lock`. Resize
         //    math operates on `live_semaphore_size`, not `target`, so
@@ -495,15 +542,28 @@ impl ConnectionLimiter {
             // `live_semaphore_size`.
             let delta = live - next_target;
             let sem = Arc::clone(&self.semaphore);
+            let metrics = Arc::clone(&self.metrics);
             tokio::spawn(async move {
                 match sem.acquire_many_owned(delta).await {
                     Ok(p) => p.forget(),
                     Err(err) => {
-                        // The only documented `AcquireError` is "semaphore
-                        // closed", which only happens on shutdown today.
-                        // Bind `err` so a future `#[non_exhaustive]` variant
-                        // isn't silently swallowed.
-                        tracing::debug!(%err, "semaphore acquire failed during shrink; skipping forget");
+                        // `live_semaphore_size` already moved to the new
+                        // target, but the actual permit count did not —
+                        // accounting drifts permanently for the rest of
+                        // the process lifetime. Surface at `error!` and
+                        // bump a counter so dashboards can fire on it;
+                        // otherwise the discrepancy is invisible until
+                        // the operator notices the cap stopped behaving.
+                        // The only documented `AcquireError` today is
+                        // "semaphore closed" (shutdown only), but bind
+                        // `err` so a future `#[non_exhaustive]` variant
+                        // surfaces.
+                        metrics.dispatch_shrink_skipped();
+                        tracing::error!(
+                            %err,
+                            delta,
+                            "dispatch limiter shrink task failed; live_semaphore_size now drifts from actual permit count by `delta`"
+                        );
                     }
                 }
             });
@@ -555,8 +615,6 @@ impl ConnectionLimiter {
         peer_ip: Option<IpAddr>,
     ) -> Result<Permit, RejectReason> {
         // target == 0 disables the global cap; skip the semaphore.
-        // The in-flight gauge bookkeeping happens inside the `Permit`
-        // constructor regardless — see the `Permit` doc.
         let sem_permit = if self.target_max_concurrent.load(Ordering::Relaxed) > 0 {
             Some(
                 Arc::clone(&self.semaphore)
@@ -581,22 +639,36 @@ impl ConnectionLimiter {
         // Per-IP first (skip for relay-only connections). Checking the
         // scarcer-resource layer first means a per-IP rejection never
         // charges a per-NodeID token.
-        if let Some(ip) = peer_ip {
-            let mut map = lock_recover(&self.by_ip, "per-ip");
-            if !map.try_consume(&ip, now) {
-                self.metrics.dispatch_rejected_per_ip();
-                tracing::debug!(
-                    reason = RejectReason::PerIp.as_str(),
-                    node_id = %hex_short(&node_key),
-                    %ip,
-                    "dispatch rejected: per-IP token bucket exhausted"
-                );
-                return Err(RejectReason::PerIp);
+        match peer_ip {
+            Some(ip) => {
+                let mut map = lock_recover(&self.by_ip, "per-ip", &self.by_ip_poison_logged);
+                if !map.try_consume(&ip_bucket_key(ip), now) {
+                    self.metrics.dispatch_rejected_per_ip();
+                    tracing::debug!(
+                        reason = RejectReason::PerIp.as_str(),
+                        node_id = %hex_short(&node_key),
+                        %ip,
+                        "dispatch rejected: per-IP token bucket exhausted"
+                    );
+                    return Err(RejectReason::PerIp);
+                }
+            }
+            None => {
+                // Relay-only connection: no IP to charge. If the per-IP
+                // layer is enabled, the operator's intent ("bound rate
+                // from each source address") cannot be enforced for
+                // this connection — surface a counter so dashboards
+                // distinguish "legitimate relay-only peer" from
+                // "attacker exploiting the path-not-yet-selected race
+                // window described in `peer_ip`".
+                if self.per_ip_enabled.load(Ordering::Relaxed) {
+                    self.metrics.dispatch_per_ip_skipped_no_addr();
+                }
             }
         }
 
         {
-            let mut map = lock_recover(&self.by_node, "per-node");
+            let mut map = lock_recover(&self.by_node, "per-node", &self.by_node_poison_logged);
             if !map.try_consume(&node_key, now) {
                 self.metrics.dispatch_rejected_per_node();
                 tracing::debug!(
@@ -609,6 +681,10 @@ impl ConnectionLimiter {
             }
         }
 
+        // Increment the in-flight gauge before constructing the Permit
+        // so the "incremented on success" / "Drop decrements
+        // unconditionally" pair stays balanced even if the constructor
+        // is split or the assignment is reordered.
         self.metrics.dispatch_permit_acquired();
         Ok(Permit {
             _sem: sem_permit,
@@ -620,14 +696,27 @@ impl ConnectionLimiter {
 /// Lock a mutex, recovering from poisoning. A poisoned lock here means a
 /// previous caller panicked while holding the guard — the bounded-map state
 /// (a `HashMap` of independent token buckets) survives a poison without
-/// inconsistency, so silent recovery is correct. We emit `tracing::error!`
-/// once per observation so the recovery is at least grep-able.
-fn lock_recover<'a, T>(m: &'a Mutex<T>, label: &'static str) -> std::sync::MutexGuard<'a, T> {
+/// inconsistency, so silent recovery is correct.
+///
+/// `logged` is a per-mutex one-shot gate: the first poison observation
+/// emits `tracing::error!`, every subsequent recovery is silent. Without
+/// the gate, sustained traffic on a poisoned mutex would emit one error
+/// line per acquire — megabytes per second under flood.
+fn lock_recover<'a, T>(
+    m: &'a Mutex<T>,
+    label: &'static str,
+    logged: &AtomicBool,
+) -> std::sync::MutexGuard<'a, T> {
     m.lock().unwrap_or_else(|poisoned| {
-        tracing::error!(
-            map = label,
-            "dispatch rate-limit mutex poisoned; recovering inner state"
-        );
+        if logged
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            tracing::error!(
+                map = label,
+                "dispatch rate-limit mutex poisoned; recovering inner state (further occurrences suppressed)"
+            );
+        }
         poisoned.into_inner()
     })
 }
@@ -828,7 +917,7 @@ mod tests {
         // After dropping the first permit the slot frees and a third acquire
         // succeeds — proves the OwnedSemaphorePermit drop releases the slot.
         drop(permit);
-        limiter
+        let _p = limiter
             .acquire_inner([3u8; 32], Some(ip(10, 0, 0, 2)))
             .expect("acquire after drop should succeed");
     }
@@ -883,7 +972,7 @@ mod tests {
         assert_eq!(err, RejectReason::PerIp);
         // Same node id, fresh IP — must succeed if the per-NodeID token
         // wasn't burned by the rejected p2.
-        limiter
+        let _p = limiter
             .acquire_inner(attacker_node, Some(ip(10, 0, 0, 1)))
             .expect("per-node bucket should still have its first token");
     }
@@ -966,7 +1055,7 @@ mod tests {
         let _ = join.join();
         assert!(limiter.by_ip.is_poisoned());
         // acquire must still work — recovery branch returns the inner guard.
-        limiter
+        let _p = limiter
             .acquire_inner([1u8; 32], Some(ip(10, 0, 0, 1)))
             .expect("acquire after by_ip poison");
     }
@@ -1371,7 +1460,7 @@ mod tests {
         assert_eq!(err, RejectReason::PerIp);
     }
 
-    // --- Reload regression tests added per code review ------------------------
+    // --- Reload regression: concurrent reloads / disabled-baseline / metrics-handle ---
 
     /// `target_lock` exists specifically to serialise concurrent reloads
     /// so racing N→…→M operations converge. Run 8 concurrent reloads
@@ -1548,6 +1637,213 @@ mod tests {
         assert!(
             text.contains("decdn_dispatch_rejected_per_node_total 1"),
             "post-reload reject must increment counter; got:\n{text}"
+        );
+    }
+
+    /// Sibling of `reload_preserves_metrics_handle_for_post_reload_rejects`
+    /// covering the *global-cap* reject path. A regression that swapped the
+    /// `dispatch_rejected_global` and `dispatch_rejected_per_node` counter
+    /// calls would still pass `RejectReason`-equality assertions in other
+    /// tests; only an encoded-scrape assertion catches the typo.
+    #[tokio::test]
+    async fn rejection_counters_global_visible_in_scrape() {
+        let metrics = Arc::new(Metrics::new());
+        let limiter = ConnectionLimiter::new(&strict_security(1), Arc::clone(&metrics));
+        let _p = limiter
+            .acquire_inner([1u8; 32], Some(ip(10, 0, 0, 1)))
+            .unwrap();
+        let _err = limiter
+            .acquire_inner([2u8; 32], Some(ip(10, 0, 0, 2)))
+            .expect_err("global cap exhausted");
+        let text = metrics.encode().unwrap();
+        assert!(
+            text.contains("decdn_dispatch_rejected_global_total 1"),
+            "global reject must increment its own counter; got:\n{text}"
+        );
+        assert!(
+            !text.contains("decdn_dispatch_rejected_per_ip_total 1"),
+            "per-IP counter must not move on a global rejection"
+        );
+        assert!(
+            !text.contains("decdn_dispatch_rejected_per_node_total 1"),
+            "per-NodeID counter must not move on a global rejection"
+        );
+    }
+
+    /// Sibling covering the *per-IP* reject path against the encoded scrape.
+    #[tokio::test]
+    async fn rejection_counters_per_ip_visible_in_scrape() {
+        let metrics = Arc::new(Metrics::new());
+        let limiter = ConnectionLimiter::new(&strict_security(u32::MAX), Arc::clone(&metrics));
+        let same_ip = Some(ip(192, 0, 2, 7));
+        let _p = limiter
+            .acquire_inner([1u8; 32], same_ip)
+            .expect("first per-IP acquire");
+        let _err = limiter
+            .acquire_inner([2u8; 32], same_ip)
+            .expect_err("second per-IP acquire rejects");
+        let text = metrics.encode().unwrap();
+        assert!(
+            text.contains("decdn_dispatch_rejected_per_ip_total 1"),
+            "per-IP reject must increment its own counter; got:\n{text}"
+        );
+        assert!(
+            !text.contains("decdn_dispatch_rejected_global_total 1"),
+            "global counter must not move on a per-IP rejection"
+        );
+        assert!(
+            !text.contains("decdn_dispatch_rejected_per_node_total 1"),
+            "per-NodeID counter must not move on a per-IP rejection"
+        );
+    }
+
+    /// Per-IP layer enabled + relay-only connection (no peer IP):
+    /// `dispatch_per_ip_skipped_no_addr_total` increments. When the layer
+    /// is disabled, no skip is recorded (no enforcement intent => nothing
+    /// to skip).
+    #[tokio::test]
+    async fn per_ip_skipped_when_relay_only_and_layer_enabled() {
+        let metrics = Arc::new(Metrics::new());
+        let limiter = ConnectionLimiter::new(&strict_security(u32::MAX), Arc::clone(&metrics));
+        let _p = limiter
+            .acquire_inner([1u8; 32], None)
+            .expect("relay acquire under per-IP enabled");
+        let text = metrics.encode().unwrap();
+        assert!(
+            text.contains("decdn_dispatch_per_ip_skipped_no_addr_total 1"),
+            "relay-only acquire under enabled per-IP must increment skip counter; got:\n{text}"
+        );
+
+        // Disable per-IP via reload; a subsequent relay acquire must
+        // *not* increment the counter (no enforcement intent).
+        let mut c = strict_security(u32::MAX);
+        c.per_ip_rate_per_sec = 0.0;
+        c.per_ip_burst = 0;
+        limiter.reload(&c);
+        let _p2 = limiter
+            .acquire_inner([2u8; 32], None)
+            .expect("relay acquire under per-IP disabled");
+        let text = metrics.encode().unwrap();
+        assert!(
+            text.contains("decdn_dispatch_per_ip_skipped_no_addr_total 1"),
+            "disabled per-IP must not bump the skip counter past 1; got:\n{text}"
+        );
+    }
+
+    /// IPv6 addresses in the same /64 share a per-IP bucket. Without
+    /// `/64` grouping an attacker with a customer-grade IPv6 allocation
+    /// can trivially defeat the per-IP layer.
+    #[test]
+    fn per_ip_buckets_ipv6_by_64_prefix() {
+        use std::net::{IpAddr, Ipv6Addr};
+        let metrics = Arc::new(Metrics::new());
+        let limiter = ConnectionLimiter::new(&strict_security(u32::MAX), Arc::clone(&metrics));
+        // Two distinct IPv6 addresses inside the same /64 prefix
+        // (`2001:db8::1` and `2001:db8::ffff:ffff:ffff:ffff`). Without
+        // /64 grouping these would use independent buckets.
+        let v6_a = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+        let v6_b = IpAddr::V6(Ipv6Addr::new(
+            0x2001, 0xdb8, 0, 0, 0xffff, 0xffff, 0xffff, 0xffff,
+        ));
+        let _p1 = limiter
+            .acquire_inner([1u8; 32], Some(v6_a))
+            .expect("first acquire from /64");
+        // burst=1 per-IP — second acquire from any address in the same
+        // /64 must reject on per-IP.
+        let err = limiter
+            .acquire_inner([2u8; 32], Some(v6_b))
+            .expect_err("second IPv6 from same /64 must reject on per-IP");
+        assert_eq!(err, RejectReason::PerIp);
+
+        // Address in a *different* /64 must succeed — proves the mask
+        // isn't accidentally collapsing every IPv6 into one bucket.
+        let v6_c = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, 1));
+        let _p2 = limiter
+            .acquire_inner([3u8; 32], Some(v6_c))
+            .expect("acquire from a different /64 must succeed");
+    }
+
+    /// Multi-thread runtime: races N acquire loops against a reload
+    /// storm and asserts no panic + final permit count converges to one
+    /// of the targets the reload storm wrote. Acquire-vs-reload was
+    /// the untested seam: existing tests cover reload-vs-reload
+    /// (`concurrent_reloads_converge`) and reload-with-held-permits
+    /// (`connection_limiter_reload_*`), but never the cross pair.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn acquire_storm_during_reload_storm_does_not_panic() {
+        let metrics = Arc::new(Metrics::new());
+        let limiter = Arc::new(ConnectionLimiter::new(
+            &strict_security(8),
+            Arc::clone(&metrics),
+        ));
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut acquirers = Vec::new();
+        for w in 0..4u8 {
+            let l = Arc::clone(&limiter);
+            let stop = Arc::clone(&stop);
+            acquirers.push(tokio::spawn(async move {
+                let mut node = [0u8; 32];
+                node[0] = w;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    // Don't care about success/fail — only that we
+                    // never panic and the limiter remains internally
+                    // consistent across the race window.
+                    let _ = l.acquire_inner(node, Some(ip(10, 0, 0, w)));
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+
+        let l = Arc::clone(&limiter);
+        let reloader = tokio::spawn(async move {
+            let targets = [4u32, 12, 6, 16, 2, 10];
+            for _ in 0..6 {
+                for &t in &targets {
+                    let mut cfg = permissive_security();
+                    cfg.max_concurrent_handlers = t;
+                    l.reload(&cfg);
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+        reloader.await.unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for h in acquirers {
+            h.await.unwrap();
+        }
+
+        // Drain pending shrink tasks before the final convergence
+        // reload — same pattern as `concurrent_reloads_converge`.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let mut cfg = permissive_security();
+        cfg.max_concurrent_handlers = 5;
+        limiter.reload(&cfg);
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        // Operator-observable convergence proof: hold 5 permits; the
+        // 6th must reject under cap=5. If the racing acquires had
+        // poisoned the limiter's permit accounting, the 6th would
+        // either succeed (over-allocated) or this test would panic.
+        let mut held = Vec::with_capacity(5);
+        for i in 0..5u8 {
+            held.push(
+                limiter
+                    .acquire_inner([i; 32], Some(ip(192, 168, 1, i)))
+                    .expect("5 acquires under cap=5"),
+            );
+        }
+        assert!(
+            limiter
+                .acquire_inner([99u8; 32], Some(ip(192, 168, 1, 99)))
+                .is_err(),
+            "6th acquire must reject at cap=5 after acquire+reload storm converges"
         );
     }
 }

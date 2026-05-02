@@ -65,10 +65,21 @@ pub struct DecdnMetrics {
     /// name: `decdn_dispatch_rejected_per_ip_total`.
     pub dispatch_rejected_per_ip: Counter,
     /// Currently in-flight QUIC handler tasks holding a dispatch permit.
-    /// Diverges from `active_connections` once non-probe ALPNs gain limiter
-    /// integration: this counts limiter permits across every gated ALPN,
-    /// while `active_connections` counts post-handshake probe connections only.
     pub dispatch_in_flight: Gauge,
+    /// Number of times the limiter's semaphore-shrink task failed to
+    /// acquire (and `forget`) the surplus permits during a hot-reload
+    /// cap reduction. Each increment means `live_semaphore_size` and
+    /// the actual permit count have drifted apart by the corresponding
+    /// `delta`. Operator-visible name: `decdn_dispatch_shrink_skipped_total`.
+    pub dispatch_shrink_skipped: Counter,
+    /// Connections accepted on a relay-only path (no resolvable peer
+    /// IP) while the per-IP layer was enabled. The per-IP rate limit
+    /// cannot be enforced for these — operators chasing
+    /// `dispatch_rejected_per_ip` anomalies need this counter to
+    /// distinguish "the layer didn't fire" from "the layer wasn't
+    /// applicable." Operator-visible name:
+    /// `decdn_dispatch_per_ip_skipped_no_addr_total`.
+    pub dispatch_per_ip_skipped_no_addr: Counter,
 }
 
 /// Aggregated deCDN node metrics.
@@ -181,6 +192,19 @@ impl Metrics {
     /// Decrement the in-flight dispatch permit gauge.
     pub fn dispatch_permit_released(&self) {
         self.decdn.dispatch_in_flight.dec();
+    }
+
+    /// Record a hot-reload semaphore-shrink task that failed to forget
+    /// its surplus permits — `live_semaphore_size` now drifts from the
+    /// real permit count by the spawned task's `delta`.
+    pub fn dispatch_shrink_skipped(&self) {
+        self.decdn.dispatch_shrink_skipped.inc();
+    }
+
+    /// Record a relay-only connection accepted while the per-IP layer
+    /// was enabled but no peer IP could be resolved at accept time.
+    pub fn dispatch_per_ip_skipped_no_addr(&self) {
+        self.decdn.dispatch_per_ip_skipped_no_addr.inc();
     }
 
     /// Read the current value of the `rpc_healthy` gauge. Test-only —

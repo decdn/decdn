@@ -1,9 +1,9 @@
-//! Hot-reload of mutable configuration fields on SIGHUP (#236).
+//! Hot-reload of mutable configuration fields on SIGHUP.
 //!
 //! Reloadable fields (applied in place; no restart required):
 //!   - `payment.rate_per_mb`
 //!   - `observability.log_level`
-//!   - `cache.pinned_hashes` (#276)
+//!   - `cache.pinned_hashes`
 //!   - all of `security.*` — the live `ConnectionLimiter` resizes its
 //!     `Arc<Semaphore>` via `add_permits` / `acquire_many_owned(...)
 //!     .forget()` (identity stable for in-flight permits) and updates
@@ -597,14 +597,22 @@ impl RuntimeReloadState {
         drop(cache_guard);
         drop(limiter_guard);
 
+        // `pinned_added` / `pinned_removed` are emitted only when a cache
+        // is attached. When none is (early startup / unit tests) we
+        // signal that with `pinned_skipped_no_cache_attached = true` so
+        // log scrapers don't see a zero count and conclude "no pins
+        // changed" — they did, the engine just wasn't there to apply
+        // them.
+        let pinned_skipped_no_cache_attached = pin_diff.is_none();
         tracing::info!(
             rate_per_mb = new_payment.rate_per_mb,
             prev_rate_per_mb = prev_rate,
             log_level = %new_level,
             log_level_changed,
             pinned_hashes = pinned_count,
-            pinned_added = pin_diff.map_or(0, |d| d.added),
-            pinned_removed = pin_diff.map_or(0, |d| d.removed),
+            pinned_added = pin_diff.map(|d| d.added),
+            pinned_removed = pin_diff.map(|d| d.removed),
+            pinned_skipped_no_cache_attached,
             cache_attached = pin_diff.is_some(),
             security_attached,
             max_concurrent_handlers = new_security.max_concurrent_handlers,

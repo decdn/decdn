@@ -177,6 +177,13 @@ pub struct SecurityConfig {
     /// More generous than per-NodeID because one IP may host a legitimate
     /// fleet. Default: 100. `0.0` disables the per-IP layer (the paired
     /// `per_ip_burst` is then ignored).
+    ///
+    /// IPv6 addresses are bucketed by their `/64` prefix, not the full
+    /// 128-bit address. A customer-grade IPv6 allocation is typically
+    /// `/64` or larger, so without this prefix grouping an attacker can
+    /// rotate through `2^64` distinct source addresses inside one
+    /// allocation and trivially defeat the per-IP layer. IPv4 addresses
+    /// are used in full.
     pub per_ip_rate_per_sec: Option<f64>,
     /// Token-bucket burst capacity for per-IP limiting. Default: 200
     /// (2× the rate; same headroom rationale as per-NodeID). Required
