@@ -104,6 +104,11 @@ pub async fn run(
         &cfg.security,
         Arc::clone(&node_metrics),
     ));
+    // Attach the limiter to the reload state so SIGHUP / admin reloads
+    // can forward `[security]` changes via `ConnectionLimiter::reload`
+    // (#235). Done immediately after construction so a SIGHUP delivered
+    // during the rest of startup still finds a target.
+    reload_state.attach_limiter(Some(Arc::clone(&limiter)));
 
     let probe_handler = Arc::new(ProbeHandler::new(
         secret_key.public(),

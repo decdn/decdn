@@ -122,34 +122,67 @@ pub struct GossipConfig {
 
 /// Security / rate-limiting section of the config file.
 ///
-/// All fields are optional; defaults produce a safe configuration out of the box.
-/// None of these fields are hot-reloadable: the live `ConnectionLimiter` owns
-/// an `Arc<Semaphore>` whose identity must remain stable across the lifetime
-/// of every in-flight permit, and the in-flight token-bucket state cannot be
-/// reset without losing fairness across the swap. Edits take effect on the
-/// next process restart.
+/// All fields are optional; defaults produce a safe configuration out of
+/// the box.
+///
+/// **All fields are hot-reloadable** on SIGHUP and via `admin_v1_reload`.
+/// The live `ConnectionLimiter` mutates its token-bucket maps in place
+/// under their per-map `Mutex` (preserving `last_refill` and accumulated
+/// `tokens`, clamped to the new `burst`), and resizes its `Arc<Semaphore>`
+/// via `add_permits` / `acquire_many_owned(...).forget()` — the
+/// `Arc<Semaphore>` identity is preserved across the resize so every
+/// in-flight `OwnedSemaphorePermit` keeps draining into the same
+/// semaphore on `Drop`.
+///
+/// **Caveats:** during a shrink the live concurrency cap is `>= new`
+/// until enough handlers drain; under racing reloads (N→N+1→N) the
+/// post-task permit count may briefly land anywhere in `[N, N+1]`
+/// until the next reload reconciles. Acceptable at `PoC` scale.
+///
+/// **`0` means "disable this layer":**
+///   - `max_concurrent_handlers = 0`: no global concurrency cap.
+///   - `per_node_rate_per_sec = 0` (with `per_node_burst = 0`): per-NodeID
+///     rate-limit disabled.
+///   - `per_ip_rate_per_sec = 0` (with `per_ip_burst = 0`): per-IP
+///     rate-limit disabled.
+///   - `max_tracked_sources = 0`: rate-limit bookkeeping map is unbounded.
+///     **Warning:** an attacker churning identities can grow the map
+///     without bound in this mode — operator opt-in only.
+///
+/// `burst > 0` is required only when paired with a positive rate. Setting
+/// `rate > 0` together with `burst = 0` would deny every request after
+/// the first burst-many — the resolver rejects that combination as a
+/// likely-typo.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct SecurityConfig {
-    /// Maximum number of concurrently in-flight QUIC handler tasks across all
-    /// deCDN-authored ALPNs. New connections beyond this limit are closed
-    /// immediately with `APP_ERR_RATE_LIMITED`. Default: 256.
+    /// Maximum number of concurrently in-flight QUIC handler tasks across
+    /// all deCDN-authored ALPNs. New connections beyond this limit are
+    /// closed immediately with `APP_ERR_RATE_LIMITED`. Default: 256.
+    /// `0` disables the global cap (no concurrency limit).
     pub max_concurrent_handlers: Option<u32>,
-    /// Token-bucket refill rate for per-NodeID limiting (tokens per second).
-    /// Matches ADR 001's inbound probe limit. Default: 20.
+    /// Token-bucket refill rate for per-NodeID limiting (tokens per
+    /// second). Matches ADR 001's inbound probe limit. Default: 20.
+    /// `0.0` disables the per-NodeID layer (`per_node_burst` must also
+    /// be `0` to disable).
     pub per_node_rate_per_sec: Option<f64>,
     /// Token-bucket burst capacity for per-NodeID limiting. Default: 40
     /// (2× the rate, providing headroom for jitter so well-behaved peers
-    /// don't trip the limit on naturally-clumped requests).
+    /// don't trip the limit on naturally-clumped requests). `0` valid
+    /// only when `per_node_rate_per_sec = 0`.
     pub per_node_burst: Option<u32>,
     /// Token-bucket refill rate for per-IP limiting (tokens per second).
-    /// More generous than per-NodeID because one IP may host a legitimate fleet.
-    /// Default: 100.
+    /// More generous than per-NodeID because one IP may host a legitimate
+    /// fleet. Default: 100. `0.0` disables the per-IP layer
+    /// (`per_ip_burst` must also be `0` to disable).
     pub per_ip_rate_per_sec: Option<f64>,
     /// Token-bucket burst capacity for per-IP limiting. Default: 200
-    /// (2× the rate; same headroom rationale as per-NodeID).
+    /// (2× the rate; same headroom rationale as per-NodeID). `0` valid
+    /// only when `per_ip_rate_per_sec = 0`.
     pub per_ip_burst: Option<u32>,
-    /// Hard cap on the number of distinct `NodeIDs` (and separately, IPs) tracked
-    /// in the rate-limit state. When full, the oldest entry is evicted. Default: 4096.
+    /// Hard cap on the number of distinct `NodeIDs` (and separately, IPs)
+    /// tracked in the rate-limit state. When full, the oldest entry is
+    /// evicted. Default: 4096. `0` makes the map unbounded — see the
+    /// type-level docs for the operator-opt-in warning.
     pub max_tracked_sources: Option<usize>,
 }
 

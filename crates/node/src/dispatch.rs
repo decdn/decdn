@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -67,8 +67,15 @@ impl RejectReason {
 /// `dispatch_in_flight` gauge; `Drop` decrements it. The pair must remain
 /// symmetric — if you split the construction site, keep the gauge bookkeeping
 /// adjacent so the invariant is locally checkable.
+///
+/// `_sem` is `Option` to support the `max_concurrent_handlers = 0`
+/// disabled-global-cap mode: when the global layer is disabled the
+/// acquire path doesn't take a semaphore permit at all, but it still
+/// returns a `Permit` so the in-flight gauge tracks the handler. The
+/// metric decrement on `Drop` is unconditional — that's the invariant
+/// the comment above is calling out.
 pub struct Permit {
-    _sem: OwnedSemaphorePermit,
+    _sem: Option<OwnedSemaphorePermit>,
     metrics: Arc<Metrics>,
 }
 
@@ -132,25 +139,59 @@ impl TokenBucket {
             false
         }
     }
+
+    /// Replace `rate`/`burst` in place across a hot-reload.
+    ///
+    /// `last_refill` is preserved so a lowered rate doesn't retroactively
+    /// debit phantom tokens and a raised rate doesn't credit them — the
+    /// next `try_consume` computes refill from the elapsed-since-`last_refill`
+    /// window using the new `rate`, which is the natural fairness boundary
+    /// across the swap. Accumulated `tokens` are clamped to the new
+    /// `burst` so a lowered burst can't leave the bucket above its
+    /// ceiling.
+    fn set_rate_burst(&mut self, rate: f64, burst: f64) {
+        debug_assert!(
+            rate.is_finite() && rate > 0.0,
+            "rate must be finite-positive (callers gate on rate > 0 before reaching here)"
+        );
+        debug_assert!(
+            burst.is_finite() && burst >= 1.0,
+            "burst must be finite and at least 1"
+        );
+        self.rate = rate;
+        self.burst = burst;
+        if self.tokens > burst {
+            self.tokens = burst;
+        }
+    }
 }
 
-/// `HashMap<K, TokenBucket>` with a hard cap on the number of tracked entries.
+/// `HashMap<K, TokenBucket>` with an optional cap on the number of tracked
+/// entries.
 ///
 /// When the map is full and a new key arrives, the entry with the oldest
 /// `last_refill` timestamp is evicted (O(n) linear scan over the values —
 /// acceptable at `PoC` scale with `cap ≤ a few thousand`).
 ///
-/// `cap` is `NonZeroUsize` so the type itself rules out the `cap == 0`
-/// degenerate case that would otherwise silently exceed the bound.
+/// `cap == 0` makes the map unbounded — operator opt-in for nodes that want
+/// to disable the source-bookkeeping limit. An attacker churning identities
+/// can grow the map without bound in that mode; `resolve_security` warns
+/// about this at startup.
+///
+/// `rate <= 0.0` disables the layer entirely: `try_consume` short-circuits
+/// to `true` without touching the map. Existing buckets are left in place
+/// so a subsequent enable transition can resume from them.
 struct BoundedRateMap<K> {
     inner: HashMap<K, TokenBucket>,
-    cap: NonZeroUsize,
+    /// `0` = unbounded.
+    cap: usize,
+    /// `0.0` = layer disabled.
     rate: f64,
     burst: f64,
 }
 
 impl<K: std::hash::Hash + Eq + Clone> BoundedRateMap<K> {
-    fn new(cap: NonZeroUsize, rate: f64, burst: f64) -> Self {
+    fn new(cap: usize, rate: f64, burst: f64) -> Self {
         Self {
             inner: HashMap::new(),
             cap,
@@ -160,11 +201,23 @@ impl<K: std::hash::Hash + Eq + Clone> BoundedRateMap<K> {
     }
 
     /// Consume one token for `key`. Returns `true` if the connection is allowed.
+    ///
+    /// Disabled-layer fast path: if `self.rate <= 0.0` the layer is
+    /// administratively disabled and every consume returns `true` without
+    /// touching the map. Without this short-circuit a `rate == 0` config
+    /// would silently deny every request after the first burst — the
+    /// opposite of "disabled."
     fn try_consume(&mut self, key: &K, now: Instant) -> bool {
+        if self.rate <= 0.0 {
+            return true;
+        }
         if let Some(bucket) = self.inner.get_mut(key) {
             return bucket.try_consume(now);
         }
-        if self.inner.len() >= self.cap.get() {
+        // `cap == 0` means "no cap" — skip the eviction path entirely so
+        // an unbounded map doesn't waste a linear scan finding nothing to
+        // evict each insert.
+        if self.cap > 0 && self.inner.len() >= self.cap {
             self.evict_oldest();
         }
         self.inner
@@ -185,6 +238,41 @@ impl<K: std::hash::Hash + Eq + Clone> BoundedRateMap<K> {
         }
     }
 
+    /// Replace `rate`/`burst` and propagate the new parameters to every
+    /// existing bucket. Used by `ConnectionLimiter::reload` (#issue).
+    ///
+    /// Walks `self.inner.values_mut()` — O(n) with n ≤ `cap`. The map's
+    /// surrounding `Mutex` is held for the duration; at the default
+    /// `max_tracked_sources = 4096` this blocks acquires for microseconds.
+    ///
+    /// Transitioning rate `>0 → 0` (disabling the layer) leaves existing
+    /// buckets in place — they're cheap, and a subsequent re-enable just
+    /// resumes from where they left off rather than discarding fairness
+    /// state. A reload that disables and never re-enables will eventually
+    /// drain via the cap-eviction path the next time a new key arrives.
+    fn set_rate_burst(&mut self, rate: f64, burst: f64) {
+        self.rate = rate;
+        self.burst = burst;
+        if rate > 0.0 {
+            for bucket in self.inner.values_mut() {
+                bucket.set_rate_burst(rate, burst);
+            }
+        }
+    }
+
+    /// Replace the cap. `0` switches the map to unbounded mode (no
+    /// eviction). Shrinking evicts oldest entries until `len() <= cap`,
+    /// reusing `evict_oldest` so the eviction policy stays in one place.
+    /// Growing is a no-op for existing entries.
+    fn set_cap(&mut self, cap: usize) {
+        self.cap = cap;
+        if cap > 0 {
+            while self.inner.len() > cap {
+                self.evict_oldest();
+            }
+        }
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.inner.len()
@@ -197,9 +285,38 @@ impl<K: std::hash::Hash + Eq + Clone> BoundedRateMap<K> {
 }
 
 /// Shared rate limiter used by all deCDN-authored `ProtocolHandler` implementations.
+///
+/// `reload(&self, &ResolvedSecurity)` applies a new resolved-security
+/// snapshot in place: token-bucket maps are mutated under their existing
+/// `Mutex` (preserving `last_refill` and accumulated `tokens`, clamped to
+/// the new `burst`), and the `Arc<Semaphore>` identity is preserved across
+/// cap changes via `add_permits` / `acquire_many_owned(...).forget()` —
+/// every outstanding `OwnedSemaphorePermit` continues to drain into the
+/// same semaphore on `Drop`.
+///
+/// `target_max_concurrent` records the operator-asked-for cap; `0` means
+/// "global cap disabled" and the acquire path skips the semaphore
+/// entirely. `live_semaphore_size` tracks the actual live size of the
+/// semaphore so a disable→re-enable transition resizes from the live
+/// value rather than the (stale-while-disabled) target.
+///
+/// Two reloads racing (N→N+1→N) compute their permit deltas from
+/// `live_semaphore_size`, not from the live `available_permits()` —
+/// which would lag behind an in-flight shrink and produce drift. The
+/// `target_lock` `Mutex<()>` serialises the recording-and-resize step so
+/// concurrent reloads see each other's effects.
 #[allow(missing_debug_implementations)]
 pub struct ConnectionLimiter {
     semaphore: Arc<Semaphore>,
+    /// Operator-requested cap. `0` = disabled (acquire path skips the
+    /// semaphore entirely). Source of truth for racing reloads.
+    target_max_concurrent: AtomicU32,
+    /// Actual live size of `semaphore`. Diverges from `target` only
+    /// while disabled (`target == 0` doesn't touch permits). Re-enable
+    /// transitions resize from this value to the new target.
+    live_semaphore_size: AtomicU32,
+    /// Serialises reload-vs-reload for the semaphore resize.
+    target_lock: Mutex<()>,
     by_node: Mutex<BoundedRateMap<[u8; 32]>>,
     by_ip: Mutex<BoundedRateMap<IpAddr>>,
     metrics: Arc<Metrics>,
@@ -208,28 +325,128 @@ pub struct ConnectionLimiter {
 impl ConnectionLimiter {
     /// Construct a limiter from the resolved security configuration.
     pub fn new(cfg: &ResolvedSecurity, metrics: Arc<Metrics>) -> Self {
+        // `cfg.max_concurrent_handlers == 0` → disabled. Build the
+        // semaphore at size 0 (it will never be acquired; the acquire
+        // path branches on `target_max_concurrent`). Sizing it to anything
+        // else would just be wasted work.
+        let initial_size = cfg.max_concurrent_handlers;
         let semaphore = Arc::new(Semaphore::new(
-            usize::try_from(cfg.max_concurrent_handlers).unwrap_or(usize::MAX),
+            usize::try_from(initial_size).unwrap_or(usize::MAX),
         ));
-        // `resolve_security` guarantees `max_tracked_sources > 0`. The
-        // `unwrap_or(MIN)` is defense-in-depth at the type boundary so a
-        // future caller bypassing validation still gets a usable map.
-        let cap = NonZeroUsize::new(cfg.max_tracked_sources).unwrap_or(NonZeroUsize::MIN);
         let by_node = Mutex::new(BoundedRateMap::new(
-            cap,
+            cfg.max_tracked_sources,
             cfg.per_node_rate_per_sec,
             f64::from(cfg.per_node_burst),
         ));
         let by_ip = Mutex::new(BoundedRateMap::new(
-            cap,
+            cfg.max_tracked_sources,
             cfg.per_ip_rate_per_sec,
             f64::from(cfg.per_ip_burst),
         ));
         Self {
             semaphore,
+            target_max_concurrent: AtomicU32::new(initial_size),
+            live_semaphore_size: AtomicU32::new(initial_size),
+            target_lock: Mutex::new(()),
             by_node,
             by_ip,
             metrics,
+        }
+    }
+
+    /// Apply a new `ResolvedSecurity` to the live limiter.
+    ///
+    /// Field-by-field strategy:
+    /// - `per_{node,ip}_rate_per_sec`, `per_{node,ip}_burst`,
+    ///   `max_tracked_sources`: in-place under the existing per-map
+    ///   `Mutex` (see [`BoundedRateMap::set_rate_burst`] /
+    ///   [`BoundedRateMap::set_cap`]). Concurrent acquires briefly
+    ///   serialise behind the reload — bounded by an O(n ≤ cap) walk of
+    ///   the bucket map.
+    /// - `max_concurrent_handlers`: `Arc<Semaphore>` identity is
+    ///   preserved (every in-flight `OwnedSemaphorePermit` holds a
+    ///   clone). Grow via `add_permits(delta)` synchronously; shrink by
+    ///   spawning a detached task that `acquire_many_owned(delta).await
+    ///   .unwrap().forget()`s — live handlers naturally drain the
+    ///   surplus. `0` records the disabled state without touching
+    ///   permits; a later non-zero value resizes from
+    ///   `live_semaphore_size` (the size left over from the last
+    ///   enabled period).
+    ///
+    /// Caveats: during a shrink the live cap is `>= new_target` until
+    /// enough handlers drain. Under racing reloads (N→N+1→N) the
+    /// post-task permit count may briefly land anywhere in `[N, N+1]`
+    /// until the next reload reconciles. A disable→enable→smaller-cap
+    /// sequence spawns a shrink task on the re-enable. All acceptable
+    /// at `PoC` scale.
+    ///
+    /// Infallible: token-bucket mutation can't fail, `add_permits` can't
+    /// fail, and the shrink path is `tokio::spawn` (which only fails by
+    /// panicking — not via this return). Caller (`RuntimeReloadState
+    /// ::reload`) has already validated the values via
+    /// `resolve_security`, so this method takes a `&ResolvedSecurity`
+    /// rather than re-parsing.
+    pub fn reload(&self, cfg: &ResolvedSecurity) {
+        // 1. Token-bucket maps: per-map mutex, in-place mutation.
+        //    rate=0 → layer disabled; cap=0 → unbounded map.
+        {
+            let mut g = lock_recover(&self.by_node, "per-node");
+            g.set_rate_burst(cfg.per_node_rate_per_sec, f64::from(cfg.per_node_burst));
+            g.set_cap(cfg.max_tracked_sources);
+        }
+        {
+            let mut g = lock_recover(&self.by_ip, "per-ip");
+            g.set_rate_burst(cfg.per_ip_rate_per_sec, f64::from(cfg.per_ip_burst));
+            g.set_cap(cfg.max_tracked_sources);
+        }
+
+        // 2. Semaphore: serialise reloads through `target_lock`. Resize
+        //    math operates on `live_semaphore_size`, not `target`, so
+        //    disable→enable→resize transitions stay correct (target was
+        //    0 during disabled period; live retains the last enabled size).
+        let _g = self
+            .target_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let next_target = cfg.max_concurrent_handlers;
+        self.target_max_concurrent
+            .store(next_target, Ordering::Relaxed);
+
+        // No structural change needed when disabling or staying disabled
+        // — `acquire_inner` branches on `target_max_concurrent`, and
+        // leaving `live_semaphore_size` at its last-enabled value lets a
+        // future re-enable resize from a sensible baseline.
+        if next_target == 0 {
+            return;
+        }
+
+        let live = self.live_semaphore_size.load(Ordering::Relaxed);
+        self.live_semaphore_size
+            .store(next_target, Ordering::Relaxed);
+
+        if next_target > live {
+            // Grow: add permits synchronously.
+            let delta = next_target - live;
+            self.semaphore.add_permits(delta as usize);
+        } else if next_target < live {
+            // Shrink: spawn a detached task that waits for `delta`
+            // permits to become free, then forgets them. The acquire
+            // is best-effort — if a third reload arrives growing the
+            // semaphore back up while this task is parked, the task
+            // may forget permits the operator just re-granted. The
+            // next reload will reconcile from the recorded
+            // `live_semaphore_size`.
+            let delta = live - next_target;
+            let sem = Arc::clone(&self.semaphore);
+            tokio::spawn(async move {
+                match sem.acquire_many_owned(delta).await {
+                    Ok(p) => p.forget(),
+                    Err(_) => {
+                        // Semaphore closed only happens on shutdown.
+                        tracing::debug!("semaphore closed during shrink; skipping forget");
+                    }
+                }
+            });
         }
     }
 
@@ -255,6 +472,24 @@ impl ConnectionLimiter {
         self.acquire_inner(*conn.remote_id().as_bytes(), peer_ip(conn))
     }
 
+    /// Cross-module test hook. Same body as [`Self::acquire_inner`];
+    /// exposed `pub` (hidden from rustdoc) so unit tests in other
+    /// modules and integration tests under `tests/` can drive the
+    /// limiter without a real iroh `Connection`. Production code must
+    /// not call this — `Self::acquire` is the only supported entry
+    /// point. Marked `#[doc(hidden)]` so it stays out of the rendered
+    /// public API surface; rustdoc still links it from `acquire`'s
+    /// "see also" if anyone goes looking, which is the right level of
+    /// discoverability for a test helper.
+    #[doc(hidden)]
+    pub fn acquire_for_test(
+        &self,
+        node_key: [u8; 32],
+        peer_ip: Option<IpAddr>,
+    ) -> Result<Permit, RejectReason> {
+        self.acquire_inner(node_key, peer_ip)
+    }
+
     /// Plumbing-free variant exposed for unit tests that don't have a real
     /// iroh `Connection`. Identical to [`Self::acquire`] in behavior.
     fn acquire_inner(
@@ -262,18 +497,28 @@ impl ConnectionLimiter {
         node_key: [u8; 32],
         peer_ip: Option<IpAddr>,
     ) -> Result<Permit, RejectReason> {
-        let sem_permit = Arc::clone(&self.semaphore)
-            .try_acquire_owned()
-            .map_err(|_| {
-                self.metrics.dispatch_rejected_global();
-                tracing::debug!(
-                    reason = RejectReason::GlobalFull.as_str(),
-                    node_id = %hex_short(&node_key),
-                    ip = ?peer_ip,
-                    "dispatch rejected: global semaphore exhausted"
-                );
-                RejectReason::GlobalFull
-            })?;
+        // `target == 0` means the operator disabled the global cap.
+        // Skip the semaphore acquire entirely; the in-flight gauge is
+        // still incremented when the `Permit` is constructed below so
+        // observability is unaffected.
+        let sem_permit = if self.target_max_concurrent.load(Ordering::Relaxed) > 0 {
+            Some(
+                Arc::clone(&self.semaphore)
+                    .try_acquire_owned()
+                    .map_err(|_| {
+                        self.metrics.dispatch_rejected_global();
+                        tracing::debug!(
+                            reason = RejectReason::GlobalFull.as_str(),
+                            node_id = %hex_short(&node_key),
+                            ip = ?peer_ip,
+                            "dispatch rejected: global semaphore exhausted"
+                        );
+                        RejectReason::GlobalFull
+                    })?,
+            )
+        } else {
+            None
+        };
 
         let now = Instant::now();
 
@@ -372,17 +617,12 @@ fn peer_ip(conn: &Connection) -> Option<IpAddr> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
-    use std::num::NonZeroUsize;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use super::{BoundedRateMap, ConnectionLimiter, RejectReason, TokenBucket};
     use crate::config::ResolvedSecurity;
     use crate::metrics::Metrics;
-
-    fn nz(n: usize) -> NonZeroUsize {
-        NonZeroUsize::new(n).unwrap()
-    }
 
     // --- TokenBucket -----------------------------------------------------------
 
@@ -444,7 +684,7 @@ mod tests {
 
     #[test]
     fn bounded_map_allows_under_rate() {
-        let mut map: BoundedRateMap<u32> = BoundedRateMap::new(nz(16), 5.0, 3.0);
+        let mut map: BoundedRateMap<u32> = BoundedRateMap::new(16, 5.0, 3.0);
         let now = Instant::now();
         assert!(map.try_consume(&1, now));
         assert!(map.try_consume(&1, now));
@@ -455,7 +695,7 @@ mod tests {
     #[test]
     fn bounded_map_evicts_oldest_when_full() {
         let cap = 4_usize;
-        let mut map: BoundedRateMap<u32> = BoundedRateMap::new(nz(cap), 100.0, 1.0);
+        let mut map: BoundedRateMap<u32> = BoundedRateMap::new(cap, 100.0, 1.0);
         let now = Instant::now();
         // Insert keys 0..3, each at successively later instants so key 0 is
         // unambiguously the oldest by `last_refill`.
@@ -480,7 +720,7 @@ mod tests {
 
     #[test]
     fn bounded_map_independent_keys() {
-        let mut map: BoundedRateMap<u8> = BoundedRateMap::new(nz(16), 1.0, 1.0);
+        let mut map: BoundedRateMap<u8> = BoundedRateMap::new(16, 1.0, 1.0);
         let now = Instant::now();
         assert!(map.try_consume(&1, now));
         assert!(map.try_consume(&2, now));
@@ -673,5 +913,381 @@ mod tests {
         limiter
             .acquire_inner([1u8; 32], Some(ip(10, 0, 0, 1)))
             .expect("acquire after by_ip poison");
+    }
+
+    // --- BoundedRateMap reload mutators ---------------------------------------
+
+    #[test]
+    fn bounded_map_set_rate_burst_clamps_existing_tokens() {
+        // Drain to 0 tokens, refill to ~3 via elapsed time, then lower the
+        // burst to 1. The clamp must drop the bucket's `tokens` to 1.
+        let mut map: BoundedRateMap<u8> = BoundedRateMap::new(16, 10.0, 5.0);
+        let t0 = Instant::now();
+        for _ in 0..5 {
+            map.try_consume(&1, t0);
+        }
+        assert!(!map.try_consume(&1, t0), "drained");
+        let t1 = t0 + Duration::from_millis(300); // ~3 tokens credited
+        // Lower burst before consuming again. set_rate_burst clamps tokens
+        // to the new burst on the *bucket*, but the bucket's tokens are
+        // recomputed on next consume; clamp must still be observable as
+        // "at most one extra token after lowering burst to 1".
+        map.set_rate_burst(10.0, 1.0);
+        // Existing bucket: tokens were 0 at t0, accrued ~3 at t1, now
+        // clamped to burst=1 at the moment of consume.
+        assert!(map.try_consume(&1, t1), "1 token after clamp");
+        assert!(
+            !map.try_consume(&1, t1),
+            "burst=1 clamp must prevent immediate second consume"
+        );
+    }
+
+    #[test]
+    fn bounded_map_set_rate_burst_preserves_last_refill() {
+        // last_refill stays at the original consume time, so the next
+        // consume credits proportionally to (new rate × elapsed-since-
+        // original-last-refill) — not (new rate × time-since-set-call).
+        let mut map: BoundedRateMap<u8> = BoundedRateMap::new(16, 1.0, 1.0);
+        let t0 = Instant::now();
+        assert!(map.try_consume(&7, t0)); // burst=1 consumed; last_refill=t0
+        // Raise the rate dramatically. last_refill must stay at t0.
+        map.set_rate_burst(100.0, 1.0);
+        // 100ms after t0: at rate=100 tok/s, 10 tokens accrued (capped at
+        // burst=1). One consume should succeed.
+        let t1 = t0 + Duration::from_millis(100);
+        assert!(map.try_consume(&7, t1), "rate=100 credited from t0");
+    }
+
+    #[test]
+    fn bounded_map_set_cap_evicts_when_shrinking() {
+        // Fill cap=4 with successively-later last_refill, then shrink to
+        // cap=2. The two oldest must be evicted, surviving keys = newest 2.
+        let mut map: BoundedRateMap<u32> = BoundedRateMap::new(4, 100.0, 1.0);
+        let t0 = Instant::now();
+        for k in 0..4u32 {
+            map.try_consume(&k, t0 + Duration::from_millis(u64::from(k)));
+        }
+        assert_eq!(map.len(), 4);
+        map.set_cap(2);
+        assert_eq!(map.len(), 2, "shrink to cap evicts oldest");
+        assert!(!map.contains_key(&0), "oldest evicted");
+        assert!(!map.contains_key(&1), "second-oldest evicted");
+        assert!(map.contains_key(&2), "newer survives");
+        assert!(map.contains_key(&3), "newest survives");
+    }
+
+    #[test]
+    fn bounded_map_set_cap_grow_is_noop_for_existing_entries() {
+        let mut map: BoundedRateMap<u32> = BoundedRateMap::new(4, 100.0, 1.0);
+        let t0 = Instant::now();
+        for k in 0..4u32 {
+            map.try_consume(&k, t0);
+        }
+        map.set_cap(16);
+        assert_eq!(map.len(), 4, "grow doesn't touch existing entries");
+        // 5th insert succeeds without eviction (cap > len).
+        let t1 = t0 + Duration::from_millis(1);
+        map.try_consume(&99, t1);
+        assert_eq!(map.len(), 5, "grow allowed a new key without eviction");
+    }
+
+    // --- Disabled-layer (0 = unlimited) ---------------------------------------
+
+    #[test]
+    fn bounded_map_disabled_rate_passes_all_consumes() {
+        // rate=0 short-circuits to true; the map stays empty (no buckets
+        // inserted on the disabled-layer fast path).
+        let mut map: BoundedRateMap<u32> = BoundedRateMap::new(16, 0.0, 1.0);
+        let now = Instant::now();
+        for k in 0..1000u32 {
+            assert!(map.try_consume(&k, now), "rate=0 must accept");
+        }
+        assert_eq!(map.len(), 0, "disabled-layer must not allocate buckets");
+    }
+
+    #[test]
+    fn bounded_map_unbounded_cap_skips_eviction() {
+        // cap=0 means unbounded — keys keep accumulating without eviction.
+        let mut map: BoundedRateMap<u32> = BoundedRateMap::new(0, 100.0, 1.0);
+        let t0 = Instant::now();
+        for k in 0..50u32 {
+            map.try_consume(&k, t0 + Duration::from_micros(u64::from(k)));
+        }
+        assert_eq!(map.len(), 50, "no eviction when cap=0");
+        for k in 0..50u32 {
+            assert!(map.contains_key(&k), "all keys retained");
+        }
+    }
+
+    fn disabled_global_security() -> ResolvedSecurity {
+        ResolvedSecurity {
+            max_concurrent_handlers: 0,
+            per_node_rate_per_sec: 1e9,
+            per_node_burst: u32::MAX,
+            per_ip_rate_per_sec: 1e9,
+            per_ip_burst: u32::MAX,
+            max_tracked_sources: 4096,
+        }
+    }
+
+    #[test]
+    fn connection_limiter_disabled_global_skips_semaphore() {
+        // max_concurrent_handlers=0 disables the global cap. We can hold
+        // far more permits than the per-source layers would normally
+        // allow at startup. Drop-test verifies all permits live until the
+        // explicit drop at the end.
+        let metrics = Arc::new(Metrics::new());
+        let limiter = ConnectionLimiter::new(&disabled_global_security(), Arc::clone(&metrics));
+        let mut held = Vec::with_capacity(256);
+        for i in 0..256 {
+            let mut node = [0u8; 32];
+            node[0] = u8::try_from(i % 251).unwrap_or(0);
+            node[1] = u8::try_from(i / 251).unwrap_or(0);
+            let octet = u8::try_from(i % 200).unwrap_or(0);
+            let p = limiter
+                .acquire_inner(node, Some(ip(10, 0, 0, octet)))
+                .expect("disabled global cap must accept all acquires");
+            held.push(p);
+        }
+        assert_eq!(held.len(), 256);
+        drop(held);
+    }
+
+    // --- ConnectionLimiter::reload --------------------------------------------
+
+    #[tokio::test]
+    async fn connection_limiter_reload_grows_semaphore() {
+        let metrics = Arc::new(Metrics::new());
+        let limiter = ConnectionLimiter::new(&strict_security(2), Arc::clone(&metrics));
+        let _p1 = limiter
+            .acquire_inner([1u8; 32], Some(ip(10, 0, 0, 1)))
+            .unwrap();
+        let _p2 = limiter
+            .acquire_inner([2u8; 32], Some(ip(10, 0, 0, 2)))
+            .unwrap();
+        // Cap exhausted at 2.
+        assert!(
+            limiter
+                .acquire_inner([3u8; 32], Some(ip(10, 0, 0, 3)))
+                .is_err()
+        );
+
+        // Reload to cap=5. Same per-source layers (permissive enough for
+        // these acquires).
+        let mut new_cfg = permissive_security();
+        new_cfg.max_concurrent_handlers = 5;
+        limiter.reload(&new_cfg);
+
+        // Three more acquires from fresh (node, IP) pairs — global cap
+        // grew from 2 to 5, so all three succeed.
+        let _p3 = limiter
+            .acquire_inner([3u8; 32], Some(ip(10, 0, 0, 3)))
+            .expect("after grow");
+        let _p4 = limiter
+            .acquire_inner([4u8; 32], Some(ip(10, 0, 0, 4)))
+            .expect("after grow");
+        let _p5 = limiter
+            .acquire_inner([5u8; 32], Some(ip(10, 0, 0, 5)))
+            .expect("after grow");
+    }
+
+    #[tokio::test]
+    async fn connection_limiter_reload_shrinks_semaphore_eventually() {
+        // Start at cap=4, hold 2 permits, shrink to cap=3 (forget 1
+        // available permit), drop 1 held permit. The shrink task should
+        // forget exactly the available delta; the drop should re-add 1
+        // permit. Net free = 0; a fresh acquire must fail GlobalFull.
+        let metrics = Arc::new(Metrics::new());
+        let limiter = ConnectionLimiter::new(&strict_security(4), Arc::clone(&metrics));
+        let _p1 = limiter
+            .acquire_inner([1u8; 32], Some(ip(10, 0, 0, 1)))
+            .unwrap();
+        let p2 = limiter
+            .acquire_inner([2u8; 32], Some(ip(10, 0, 0, 2)))
+            .unwrap();
+
+        let mut new_cfg = permissive_security();
+        new_cfg.max_concurrent_handlers = 3;
+        limiter.reload(&new_cfg);
+
+        // Yield to let the spawned shrink task forget the available permit.
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        // 4 (live) → 3 (target). Held = 2. Forget = 4 - 3 = 1. Available = 1.
+        // Drop p2: available = 2; held = 1. New acquires can succeed.
+        drop(p2);
+        let _p3 = limiter
+            .acquire_inner([3u8; 32], Some(ip(10, 0, 0, 3)))
+            .expect("after drop, slot freed");
+        let _p4 = limiter
+            .acquire_inner([4u8; 32], Some(ip(10, 0, 0, 4)))
+            .expect("after drop, second slot freed");
+        // Now held = 3 (p1, p3, p4), cap = 3, no more free.
+        assert!(
+            limiter
+                .acquire_inner([5u8; 32], Some(ip(10, 0, 0, 5)))
+                .is_err(),
+            "shrink to 3 must reject the 4th acquire"
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_limiter_reload_updates_per_node_rate_in_place() {
+        // Start with strict per-node burst=1; exhaust it from a single
+        // node; reload with raised burst=10 and confirm the *existing*
+        // bucket sees the new burst (next consume succeeds without
+        // dropping or re-creating the bucket).
+        let metrics = Arc::new(Metrics::new());
+        let limiter = ConnectionLimiter::new(&strict_security(u32::MAX), Arc::clone(&metrics));
+        let attacker = [42u8; 32];
+        let _p1 = limiter
+            .acquire_inner(attacker, Some(ip(10, 0, 0, 1)))
+            .unwrap();
+        // Per-node burst=1 exhausted. (The per-IP burst=1 also blocks
+        // re-use of 10.0.0.1; switch IPs to isolate the per-node check.)
+        assert!(
+            limiter
+                .acquire_inner(attacker, Some(ip(10, 0, 0, 2)))
+                .is_err()
+        );
+        // Reload: raise per-node burst (and rate) so the in-place mutator
+        // refreshes the bucket. Per-IP also raised so it doesn't shadow.
+        let mut new_cfg = permissive_security();
+        new_cfg.max_concurrent_handlers = u32::MAX;
+        limiter.reload(&new_cfg);
+        let _p2 = limiter
+            .acquire_inner(attacker, Some(ip(10, 0, 0, 3)))
+            .expect("raised burst should make this consume succeed");
+    }
+
+    #[tokio::test]
+    async fn connection_limiter_reload_target_tracking_handles_repeated_grow() {
+        // Three reloads N=1, N=5, N=2. Then a fourth to N=3. The grow
+        // step is observable: we should be able to hold exactly 3 permits
+        // after the fourth reload (held grows to 3, 4th is rejected).
+        let metrics = Arc::new(Metrics::new());
+        let limiter = ConnectionLimiter::new(&strict_security(1), Arc::clone(&metrics));
+        let mut c = permissive_security();
+        c.max_concurrent_handlers = 5;
+        limiter.reload(&c);
+        c.max_concurrent_handlers = 2;
+        limiter.reload(&c);
+        // Yield so the shrink (5→2) task forgets 3 permits.
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        c.max_concurrent_handlers = 3;
+        limiter.reload(&c);
+        let _p1 = limiter
+            .acquire_inner([1u8; 32], Some(ip(10, 0, 0, 1)))
+            .unwrap();
+        let _p2 = limiter
+            .acquire_inner([2u8; 32], Some(ip(10, 0, 0, 2)))
+            .unwrap();
+        let _p3 = limiter
+            .acquire_inner([3u8; 32], Some(ip(10, 0, 0, 3)))
+            .unwrap();
+        assert!(
+            limiter
+                .acquire_inner([4u8; 32], Some(ip(10, 0, 0, 4)))
+                .is_err(),
+            "4th must be rejected at cap=3"
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_limiter_reload_disable_then_re_enable_resizes_correctly() {
+        // Start cap=4, disable (target=0), acquire freely (semaphore
+        // skipped), re-enable to cap=3, drop everyone, hold 3 — the 4th
+        // must reject at the new cap=3.
+        let metrics = Arc::new(Metrics::new());
+        let limiter = ConnectionLimiter::new(&strict_security(4), Arc::clone(&metrics));
+
+        // Disable the global cap.
+        let mut c = permissive_security();
+        c.max_concurrent_handlers = 0;
+        limiter.reload(&c);
+
+        // While disabled, hold many permits — the acquire path skips the
+        // semaphore so live_semaphore_size is irrelevant.
+        let bulk: Vec<_> = (0..16u8)
+            .map(|i| {
+                limiter
+                    .acquire_inner([i; 32], Some(ip(10, 0, 0, i)))
+                    .expect("disabled cap accepts all")
+            })
+            .collect();
+        drop(bulk);
+
+        // Re-enable to cap=3. This resizes from live_semaphore_size=4
+        // (last enabled value) to 3 — spawn a shrink task forgetting 1
+        // permit.
+        c.max_concurrent_handlers = 3;
+        limiter.reload(&c);
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        let _p1 = limiter
+            .acquire_inner([1u8; 32], Some(ip(10, 0, 0, 1)))
+            .unwrap();
+        let _p2 = limiter
+            .acquire_inner([2u8; 32], Some(ip(10, 0, 0, 2)))
+            .unwrap();
+        let _p3 = limiter
+            .acquire_inner([3u8; 32], Some(ip(10, 0, 0, 3)))
+            .unwrap();
+        assert!(
+            limiter
+                .acquire_inner([4u8; 32], Some(ip(10, 0, 0, 4)))
+                .is_err(),
+            "after re-enable to 3, 4th must reject"
+        );
+    }
+
+    #[test]
+    fn connection_limiter_reload_per_layer_disable_independent() {
+        // Per-IP disabled, per-NodeID still enforces its burst. Then
+        // disable per-NodeID instead and verify per-IP is the gate.
+        let metrics = Arc::new(Metrics::new());
+        let limiter = ConnectionLimiter::new(&strict_security(u32::MAX), Arc::clone(&metrics));
+
+        // Disable per-IP only.
+        let mut c = strict_security(u32::MAX);
+        c.per_ip_rate_per_sec = 0.0;
+        c.per_ip_burst = 0;
+        limiter.reload(&c);
+
+        let same_node = [9u8; 32];
+        // Same per-node burst is still 1; first acquire from that node
+        // succeeds, second from same node (different IPs to bypass per-IP
+        // — which is anyway disabled) fails on per-NodeID.
+        let _p1 = limiter
+            .acquire_inner(same_node, Some(ip(10, 0, 0, 1)))
+            .expect("first per-node acquire");
+        let err = limiter
+            .acquire_inner(same_node, Some(ip(10, 0, 0, 2)))
+            .expect_err("second from same node must reject on per-NodeID");
+        assert_eq!(err, RejectReason::PerNodeId);
+
+        // Now disable per-NodeID *and* re-enable per-IP. Per-IP burst=1
+        // is now the gate.
+        let mut c = strict_security(u32::MAX);
+        c.per_node_rate_per_sec = 0.0;
+        c.per_node_burst = 0;
+        limiter.reload(&c);
+
+        let same_ip = Some(ip(192, 0, 2, 99));
+        let _q1 = limiter
+            .acquire_inner([1u8; 32], same_ip)
+            .expect("first per-IP acquire");
+        let err = limiter
+            .acquire_inner([2u8; 32], same_ip)
+            .expect_err("second from same IP must reject on per-IP");
+        assert_eq!(err, RejectReason::PerIp);
     }
 }

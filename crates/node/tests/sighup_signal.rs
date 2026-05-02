@@ -30,6 +30,8 @@ use decdn_node::config::{
     ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedGossip, ResolvedIdentity,
     ResolvedNetwork, ResolvedObservability, ResolvedPayment, ResolvedSecurity,
 };
+use decdn_node::dispatch::{ConnectionLimiter, RejectReason};
+use decdn_node::metrics::Metrics;
 use decdn_node::runtime::{LogLevelSetter, RuntimeReloadState};
 use nix::sys::signal::{Signal, raise};
 
@@ -213,4 +215,80 @@ async fn persistent_sighup_observes_both_signals() {
         "both SIGHUPs must produce ordered reloads"
     );
     assert_eq!(shared_rate.load(Ordering::Relaxed), 22);
+}
+
+/// End-to-end SIGHUP→reload→`ConnectionLimiter::reload` chain (#235).
+///
+/// The reload-unit tests cover the in-process commit semantics; this
+/// test proves the SIGHUP path actually wires through to the live
+/// limiter. Without this we'd have no test exercising
+/// `runtime::reload::reload`'s `limiter_guard` arm against a real OS
+/// signal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sighup_applies_security_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.toml");
+
+    let initial = seed_resolved(10, LogLevel::Info);
+    let (setter, _levels) = recording_setter();
+    let state = Arc::new(RuntimeReloadState::new(
+        PaymentArgs { rate_per_mb: None },
+        ObservabilityArgs {
+            log_level: None,
+            log_format: None,
+            metrics_port: None,
+            metrics_bind: None,
+            admin_port: None,
+            otlp_endpoint: None,
+        },
+        &initial,
+        setter,
+    ));
+
+    // Build a real limiter at the seed defaults (per_node_burst = 40).
+    let metrics = Arc::new(Metrics::new());
+    let limiter = Arc::new(ConnectionLimiter::new(&initial.security, metrics));
+    state.attach_limiter(Some(Arc::clone(&limiter)));
+
+    // Tighten per-node burst to 1; raise per-IP so it doesn't shadow.
+    write_config(
+        &path,
+        "[security]\n\
+         per_node_rate_per_sec = 1.0\n\
+         per_node_burst = 1\n\
+         per_ip_rate_per_sec = 1000.0\n\
+         per_ip_burst = 1000\n",
+    );
+
+    let loop_state = Arc::clone(&state);
+    let loop_path = path.clone();
+    let loop_handle = tokio::spawn(async move { run_reload_loop(loop_state, loop_path, 1).await });
+
+    // Same install-race guard as the persistent-SIGHUP test above.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    raise(Signal::SIGHUP).expect("raise SIGHUP");
+
+    tokio::time::timeout(Duration::from_secs(2), loop_handle)
+        .await
+        .expect("reload loop did not finish within 2s of SIGHUP")
+        .expect("reload loop task panicked")
+        .expect("reload loop returned Err");
+
+    // Live limiter now has per-node burst=1: first acquire from a
+    // node-id succeeds, second from the same node-id (different IP to
+    // bypass per-IP) rejects on per-NodeID.
+    let node = [9u8; 32];
+    let _p1 = limiter
+        .acquire_for_test(
+            node,
+            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1))),
+        )
+        .expect("first per-node acquire post-SIGHUP");
+    let err = limiter
+        .acquire_for_test(
+            node,
+            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2))),
+        )
+        .expect_err("second per-node acquire must reject after SIGHUP-applied burst=1");
+    assert_eq!(err, RejectReason::PerNodeId);
 }

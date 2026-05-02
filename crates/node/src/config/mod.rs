@@ -642,50 +642,84 @@ fn resolve_gossip(file: Option<&types::GossipConfig>) -> anyhow::Result<Resolved
 }
 
 /// Resolve security / rate-limiting fields.
+///
+/// Each numeric field accepts `0` as the "disable this layer" sentinel:
+/// `max_concurrent_handlers = 0` skips the global semaphore acquire,
+/// `per_*_rate_per_sec = 0.0` skips the corresponding token bucket, and
+/// `max_tracked_sources = 0` makes the bookkeeping map unbounded (operator
+/// opt-in — an attacker churning identities can grow the map without
+/// bound). The `per_*_burst > 0` rule is paired with the matching rate:
+/// `burst` is irrelevant when `rate == 0` (the layer's `try_consume` short-
+/// circuits before the bucket is touched), but a `rate > 0` with `burst == 0`
+/// is a deny-all corner case operators don't actually want — reject it
+/// outright so a typo turns into a config error rather than a black-hole node.
+// Each field is a linear "default-or-file → validate → log-if-disabled"
+// triple; splitting them out would scatter the field-pair invariants
+// (rate/burst coupling) across helpers that have to take both arguments
+// anyway. Keep it linear.
+#[allow(clippy::cognitive_complexity)]
 pub(crate) fn resolve_security(
     file: Option<&types::SecurityConfig>,
 ) -> anyhow::Result<ResolvedSecurity> {
     let max_concurrent_handlers = file
         .and_then(|s| s.max_concurrent_handlers)
         .unwrap_or(DEFAULT_MAX_CONCURRENT_HANDLERS);
-    anyhow::ensure!(
-        max_concurrent_handlers > 0,
-        "security.max_concurrent_handlers must be > 0"
-    );
 
     let per_node_rate_per_sec = file
         .and_then(|s| s.per_node_rate_per_sec)
         .unwrap_or(DEFAULT_PER_NODE_RATE_PER_SEC);
     anyhow::ensure!(
-        per_node_rate_per_sec.is_finite() && per_node_rate_per_sec > 0.0,
-        "security.per_node_rate_per_sec must be a finite positive number"
+        per_node_rate_per_sec.is_finite() && per_node_rate_per_sec >= 0.0,
+        "security.per_node_rate_per_sec must be a finite non-negative number \
+         (0 disables the per-NodeID layer)"
     );
 
     let per_node_burst = file
         .and_then(|s| s.per_node_burst)
         .unwrap_or(DEFAULT_PER_NODE_BURST);
-    anyhow::ensure!(per_node_burst > 0, "security.per_node_burst must be > 0");
+    anyhow::ensure!(
+        per_node_rate_per_sec == 0.0 || per_node_burst > 0,
+        "security.per_node_burst must be > 0 when per_node_rate_per_sec > 0 \
+         (set both to 0 to disable the per-NodeID layer)"
+    );
 
     let per_ip_rate_per_sec = file
         .and_then(|s| s.per_ip_rate_per_sec)
         .unwrap_or(DEFAULT_PER_IP_RATE_PER_SEC);
     anyhow::ensure!(
-        per_ip_rate_per_sec.is_finite() && per_ip_rate_per_sec > 0.0,
-        "security.per_ip_rate_per_sec must be a finite positive number"
+        per_ip_rate_per_sec.is_finite() && per_ip_rate_per_sec >= 0.0,
+        "security.per_ip_rate_per_sec must be a finite non-negative number \
+         (0 disables the per-IP layer)"
     );
 
     let per_ip_burst = file
         .and_then(|s| s.per_ip_burst)
         .unwrap_or(DEFAULT_PER_IP_BURST);
-    anyhow::ensure!(per_ip_burst > 0, "security.per_ip_burst must be > 0");
+    anyhow::ensure!(
+        per_ip_rate_per_sec == 0.0 || per_ip_burst > 0,
+        "security.per_ip_burst must be > 0 when per_ip_rate_per_sec > 0 \
+         (set both to 0 to disable the per-IP layer)"
+    );
 
     let max_tracked_sources = file
         .and_then(|s| s.max_tracked_sources)
         .unwrap_or(DEFAULT_MAX_TRACKED_SOURCES);
-    anyhow::ensure!(
-        max_tracked_sources > 0,
-        "security.max_tracked_sources must be > 0"
-    );
+
+    if max_concurrent_handlers == 0 {
+        tracing::info!("security.max_concurrent_handlers = 0: global concurrency cap disabled");
+    }
+    if per_node_rate_per_sec == 0.0 {
+        tracing::info!("security.per_node_rate_per_sec = 0: per-NodeID rate-limit disabled");
+    }
+    if per_ip_rate_per_sec == 0.0 {
+        tracing::info!("security.per_ip_rate_per_sec = 0: per-IP rate-limit disabled");
+    }
+    if max_tracked_sources == 0 {
+        tracing::warn!(
+            "security.max_tracked_sources = 0: rate-limit bookkeeping map is unbounded; \
+             an attacker churning identities can grow it without limit"
+        );
+    }
 
     Ok(ResolvedSecurity {
         max_concurrent_handlers,
@@ -3048,15 +3082,16 @@ bind_port = 12345
     }
 
     #[test]
-    fn resolve_security_rejects_zero_max_concurrent_handlers() {
+    fn resolve_security_accepts_zero_max_concurrent_handlers_as_disabled() {
         let s = sec_with(|s| s.max_concurrent_handlers = Some(0));
-        let err = resolve_security(Some(&s)).expect_err("zero must reject");
-        assert!(format!("{err:#}").contains("max_concurrent_handlers"));
+        let resolved = resolve_security(Some(&s)).expect("0 disables the global cap");
+        assert_eq!(resolved.max_concurrent_handlers, 0);
     }
 
     #[test]
-    fn resolve_security_rejects_non_finite_or_non_positive_per_node_rate() {
-        for bad in [0.0_f64, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+    fn resolve_security_rejects_non_finite_or_negative_per_node_rate() {
+        // 0.0 is now valid (disabled); only NaN, ±inf, and strictly-negative are rejected.
+        for bad in [-1.0_f64, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let s = sec_with(|s| s.per_node_rate_per_sec = Some(bad));
             assert!(
                 resolve_security(Some(&s)).is_err(),
@@ -3066,15 +3101,31 @@ bind_port = 12345
     }
 
     #[test]
-    fn resolve_security_rejects_zero_per_node_burst() {
-        let s = sec_with(|s| s.per_node_burst = Some(0));
-        let err = resolve_security(Some(&s)).expect_err("zero burst must reject");
+    fn resolve_security_accepts_zero_per_node_pair_as_disabled() {
+        // rate=0 + burst=0 disables the per-NodeID layer.
+        let s = sec_with(|s| {
+            s.per_node_rate_per_sec = Some(0.0);
+            s.per_node_burst = Some(0);
+        });
+        let resolved = resolve_security(Some(&s)).expect("0/0 disables per-NodeID");
+        assert_eq!(resolved.per_node_burst, 0);
+    }
+
+    #[test]
+    fn resolve_security_rejects_zero_per_node_burst_with_positive_rate() {
+        // rate>0 with burst=0 is the deny-all corner; reject it.
+        let s = sec_with(|s| {
+            s.per_node_rate_per_sec = Some(10.0);
+            s.per_node_burst = Some(0);
+        });
+        let err = resolve_security(Some(&s)).expect_err("rate>0+burst=0 must reject");
         assert!(format!("{err:#}").contains("per_node_burst"));
     }
 
     #[test]
-    fn resolve_security_rejects_non_finite_or_non_positive_per_ip_rate() {
-        for bad in [0.0_f64, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+    fn resolve_security_rejects_non_finite_or_negative_per_ip_rate() {
+        // 0.0 is now valid (disabled); only NaN, ±inf, and strictly-negative are rejected.
+        for bad in [-1.0_f64, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let s = sec_with(|s| s.per_ip_rate_per_sec = Some(bad));
             assert!(
                 resolve_security(Some(&s)).is_err(),
@@ -3084,17 +3135,30 @@ bind_port = 12345
     }
 
     #[test]
-    fn resolve_security_rejects_zero_per_ip_burst() {
-        let s = sec_with(|s| s.per_ip_burst = Some(0));
-        let err = resolve_security(Some(&s)).expect_err("zero burst must reject");
+    fn resolve_security_accepts_zero_per_ip_pair_as_disabled() {
+        let s = sec_with(|s| {
+            s.per_ip_rate_per_sec = Some(0.0);
+            s.per_ip_burst = Some(0);
+        });
+        let resolved = resolve_security(Some(&s)).expect("0/0 disables per-IP");
+        assert_eq!(resolved.per_ip_burst, 0);
+    }
+
+    #[test]
+    fn resolve_security_rejects_zero_per_ip_burst_with_positive_rate() {
+        let s = sec_with(|s| {
+            s.per_ip_rate_per_sec = Some(10.0);
+            s.per_ip_burst = Some(0);
+        });
+        let err = resolve_security(Some(&s)).expect_err("rate>0+burst=0 must reject");
         assert!(format!("{err:#}").contains("per_ip_burst"));
     }
 
     #[test]
-    fn resolve_security_rejects_zero_max_tracked_sources() {
+    fn resolve_security_accepts_zero_max_tracked_sources_as_unbounded() {
         let s = sec_with(|s| s.max_tracked_sources = Some(0));
-        let err = resolve_security(Some(&s)).expect_err("zero cap must reject");
-        assert!(format!("{err:#}").contains("max_tracked_sources"));
+        let resolved = resolve_security(Some(&s)).expect("0 makes the map unbounded");
+        assert_eq!(resolved.max_tracked_sources, 0);
     }
 
     #[test]

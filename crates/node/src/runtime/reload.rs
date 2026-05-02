@@ -1,10 +1,21 @@
 //! Hot-reload of mutable configuration fields on SIGHUP (#236).
 //!
-//! Only `payment.rate_per_mb` and `observability.log_level` are reloadable
-//! today. Every other field that changed in the file is logged and ignored
-//! with a "requires restart" message — the runtime would otherwise need to
-//! tear down the iroh endpoint, the metrics listener, the gossip
-//! subscriptions, etc., which is far beyond the scope of a quick reload.
+//! Reloadable fields (applied in place; no restart required):
+//!   - `payment.rate_per_mb`
+//!   - `observability.log_level`
+//!   - `cache.pinned_hashes` (#276)
+//!   - all of `security.*` — the live `ConnectionLimiter` resizes its
+//!     `Arc<Semaphore>` via `add_permits` / `acquire_many_owned(...)
+//!     .forget()` (identity stable for in-flight permits) and updates
+//!     its token-bucket maps in place under their per-map `Mutex`,
+//!     preserving `last_refill` and accumulated `tokens`. `0` in any
+//!     `security.*` field disables that layer.
+//!
+//! Every other field that changed in the file is logged and ignored
+//! with a "requires restart" message — the runtime would otherwise need
+//! to tear down the iroh endpoint, the metrics listener, the gossip
+//! subscriptions, etc., which is far beyond the scope of a quick
+//! reload.
 //!
 //! The reload entry point ([`RuntimeReloadState::reload`]) is also
 //! called directly by tests, so its only side effects are mutating
@@ -21,9 +32,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::cli::common::LogLevel;
 use crate::cli::run::{ObservabilityArgs, PaymentArgs};
 use crate::config::{
-    FileConfig, ResolvedObservability, ResolvedPayment, load_file_config, parse_pinned_hashes,
-    resolve_observability, resolve_payment, resolve_security,
+    FileConfig, ResolvedObservability, ResolvedPayment, ResolvedSecurity, load_file_config,
+    parse_pinned_hashes, resolve_observability, resolve_payment, resolve_security,
 };
+use crate::dispatch::ConnectionLimiter;
 
 /// Read-only snapshot of the reloadable fields, returned by
 /// [`RuntimeReloadState::current`]. Used by `admin_v1_reload` to report
@@ -78,6 +90,16 @@ pub struct RuntimeReloadState {
     /// in the runtime startup sequence, then attached via
     /// [`Self::attach_cache`].
     cache: std::sync::Mutex<Option<decdn_cache::CacheEngine>>,
+    /// Optional handle to the live connection limiter. When present,
+    /// SIGHUP reloads forward the resolved `ResolvedSecurity` to
+    /// [`ConnectionLimiter::reload`] so the live token-bucket maps and
+    /// semaphore cap reflect the new file. Held as `Option` for the
+    /// same reason as `cache` — the limiter is built after
+    /// `RuntimeReloadState::new` in `runtime::run`, then attached via
+    /// [`Self::attach_limiter`]. Tests exercising reload semantics
+    /// without a real limiter pass `None` and the security commit
+    /// becomes a parse-and-validate-only no-op.
+    limiter: std::sync::Mutex<Option<Arc<ConnectionLimiter>>>,
     /// Cached log level that was last applied. `None` until the first
     /// successful reload — this forces the first SIGHUP to apply the file
     /// value unconditionally, since the live `EnvFilter` at startup may
@@ -96,10 +118,16 @@ pub struct RuntimeReloadState {
     last_file_sections: std::sync::Mutex<FileSectionSnapshot>,
 }
 
-/// JSON-serialised snapshots of every section we don't hot-reload. Stored
-/// as `Option<serde_json::Value>` so "section absent" and "section present
-/// but empty" diff distinctly. `None` everywhere on construction; populated
-/// after the first successful reload.
+/// JSON-serialised snapshots of every section we don't (fully) hot-reload.
+/// Stored as `Option<serde_json::Value>` so "section absent" and "section
+/// present but empty" diff distinctly. `None` everywhere on construction;
+/// populated after the first successful reload.
+///
+/// `cache.*` is captured even though `cache.pinned_hashes` is reloadable —
+/// `cache_changed_only_reloadable_fields` needs the structural baseline to
+/// suppress the "requires restart" warning on a pin/unpin reload. `payment`
+/// and `security` are fully reloadable and have no snapshot field: nothing
+/// to diff against.
 #[derive(Debug, Default, Clone)]
 struct FileSectionSnapshot {
     identity: Option<serde_json::Value>,
@@ -108,7 +136,6 @@ struct FileSectionSnapshot {
     cache: Option<serde_json::Value>,
     gossip: Option<serde_json::Value>,
     observability: Option<serde_json::Value>,
-    security: Option<serde_json::Value>,
 }
 
 impl FileSectionSnapshot {
@@ -125,7 +152,6 @@ impl FileSectionSnapshot {
             cache: snap_section("cache", file.cache.as_ref()),
             gossip: snap_section("gossip", file.gossip.as_ref()),
             observability: snap_section("observability", file.observability.as_ref()),
-            security: snap_section("security", file.security.as_ref()),
         }
     }
 }
@@ -186,6 +212,7 @@ impl RuntimeReloadState {
             rate_per_mb: Arc::new(AtomicU64::new(initial.payment.rate_per_mb)),
             log_level_setter,
             cache: std::sync::Mutex::new(None),
+            limiter: std::sync::Mutex::new(None),
             current_log_level: std::sync::Mutex::new(None),
             last_file_sections: std::sync::Mutex::new(FileSectionSnapshot::default()),
         }
@@ -209,6 +236,23 @@ impl RuntimeReloadState {
                     "runtime reload cache mutex poisoned during attach; recovering inner state"
                 );
                 *poisoned.into_inner() = engine;
+            }
+        }
+    }
+
+    /// Attach the live `ConnectionLimiter` after it's been built. Same
+    /// shape as [`Self::attach_cache`]: must be called before the SIGHUP
+    /// select loop, supports `None` for tests, recovers from a poisoned
+    /// mutex by replacing the inner state. Silent no-op on poison would
+    /// leave subsequent reloads silently dropping security changes.
+    pub fn attach_limiter(&self, limiter: Option<Arc<ConnectionLimiter>>) {
+        match self.limiter.lock() {
+            Ok(mut guard) => *guard = limiter,
+            Err(poisoned) => {
+                tracing::error!(
+                    "runtime reload limiter mutex poisoned during attach; recovering inner state"
+                );
+                *poisoned.into_inner() = limiter;
             }
         }
     }
@@ -381,6 +425,7 @@ impl RuntimeReloadState {
     #[allow(
         clippy::cognitive_complexity, // Diff/log/apply for two fields stays linear.
         clippy::unused_async, // Future-shaped on purpose: see below.
+        clippy::too_many_lines, // Linear "fallible work, then atomic commit" reads better as one unit than split apart.
     )]
     // `async` is preserved even though no body is currently `.await`ed:
     // the runtime select loop awaits this future inside `tokio::select!`
@@ -438,18 +483,31 @@ impl RuntimeReloadState {
                 }
             };
 
-        // Lock the snapshot mutexes *and* the cache attach slot before
-        // any committing side-effect. Holding all three guards across
-        // the rest of the function serialises concurrent reloads (a
-        // second SIGHUP racing the first one waits here) and lets us
+        // Re-resolve `[security]`. All fields are hot-reloadable; an
+        // invalid value rejects the entire reload (all-or-nothing
+        // semantics — operators in incident-response don't want a typo
+        // here to silently leave half their reload applied).
+        let new_security: ResolvedSecurity = match resolve_security(file.security.as_ref()) {
+            Ok(s) => s,
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    "config reload rejected (security); previous values retained"
+                );
+                return Err(err);
+            }
+        };
+
+        // Lock the snapshot mutex *and* the cache and limiter attach
+        // slots before any committing side-effect. Holding all guards
+        // across the rest of the function serialises concurrent reloads
+        // (a second SIGHUP racing the first one waits here) and lets us
         // treat the whole "apply log level + swap rate + swap pinned
-        // set + write back" path as one critical section. Acquiring
-        // the locks here is the *last* fallible step: a `PoisonError`
-        // on any of them must surface before the setter, the atomic
-        // swap, or the pinned-set swap commit anything to live state —
-        // otherwise a poisoned cache mutex would let `rate_per_mb`
-        // update while the pinned set silently drops, violating the
-        // "previous values retained on error" contract.
+        // set + reload limiter + write back" path as one critical
+        // section. Acquiring the locks here is the *last* fallible
+        // step: a `PoisonError` on any of them must surface before the
+        // setter, the atomic swap, the pinned-set swap, or the limiter
+        // reload commit anything to live state.
         let mut current = self
             .current_log_level
             .lock()
@@ -462,6 +520,10 @@ impl RuntimeReloadState {
             .cache
             .lock()
             .map_err(|_| anyhow::anyhow!("cache attach mutex poisoned"))?;
+        let limiter_guard = self
+            .limiter
+            .lock()
+            .map_err(|_| anyhow::anyhow!("limiter attach mutex poisoned"))?;
 
         // Diff non-reloadable sections against the previous snapshot
         // before committing. Emitting "ignored" lines is read-only and
@@ -483,11 +545,15 @@ impl RuntimeReloadState {
         //   1. log-level setter (only fallible commit; tracing filter swap)
         //   2. atomic swap of rate_per_mb (infallible)
         //   3. ArcSwap of cache.pinned set (infallible)
-        //   4. write-back of cached values via the held guards (infallible)
+        //   4. ConnectionLimiter::reload (infallible: lock_recover
+        //      handles poison; add_permits is infallible; the shrink
+        //      path is `tokio::spawn` and surfaces only via panic)
+        //   5. write-back of cached values via the held guards (infallible)
         // If the setter fails we bail before touching the rate atomic,
-        // pinned set, or the snapshot caches, preserving the "previous
-        // values retained on error" contract. AtomicU64::swap, ArcSwap,
-        // and the guard writes themselves cannot fail.
+        // pinned set, the limiter, or the snapshot caches — preserving
+        // the "previous values retained on error" contract. AtomicU64::
+        // swap, ArcSwap, ConnectionLimiter::reload, and the guard writes
+        // themselves cannot fail.
         if log_level_changed && let Err(err) = (self.log_level_setter)(new_level) {
             tracing::warn!(%err, ?new_level, "failed to apply new log level; previous level retained");
             return Err(err);
@@ -509,11 +575,20 @@ impl RuntimeReloadState {
         let pin_diff = cache_guard
             .as_ref()
             .map(|engine| engine.set_pinned(&new_pinned));
+        // Apply the new security snapshot to the live limiter if one
+        // is attached. `None` matches `cache_guard.as_ref()` semantics
+        // — early-startup and unit-test contexts run the parse-and-
+        // validate path without touching a live limiter.
+        let security_attached = limiter_guard.as_ref().is_some();
+        if let Some(lim) = limiter_guard.as_ref() {
+            lim.reload(&new_security);
+        }
         *current = Some(new_level);
         *sections = FileSectionSnapshot::capture(&file);
         drop(current);
         drop(sections);
         drop(cache_guard);
+        drop(limiter_guard);
 
         tracing::info!(
             rate_per_mb = new_payment.rate_per_mb,
@@ -524,6 +599,11 @@ impl RuntimeReloadState {
             pinned_added = pin_diff.map_or(0, |d| d.added),
             pinned_removed = pin_diff.map_or(0, |d| d.removed),
             cache_attached = pin_diff.is_some(),
+            security_attached,
+            max_concurrent_handlers = new_security.max_concurrent_handlers,
+            per_node_rate_per_sec = new_security.per_node_rate_per_sec,
+            per_ip_rate_per_sec = new_security.per_ip_rate_per_sec,
+            max_tracked_sources = new_security.max_tracked_sources,
             "config reload applied"
         );
         Ok(())
@@ -702,20 +782,10 @@ fn log_ignored_other_sections(file: &crate::config::FileConfig, prev: &FileSecti
     if changed("gossip", file.gossip.as_ref(), prev.gossip.as_ref()) && file.gossip.is_some() {
         warn_ignored("gossip.* (announce_interval, peer_ttl, allowlist, subscribe_global)");
     }
-    if changed("security", file.security.as_ref(), prev.security.as_ref())
-        && file.security.is_some()
-    {
-        warn_ignored("security.* (requires restart to take effect)");
-        // Pre-validate so the operator finds out *now* if their next
-        // restart will fail, rather than discovering it the next time
-        // they actually restart (potentially under pressure).
-        if let Err(err) = resolve_security(file.security.as_ref()) {
-            tracing::warn!(
-                %err,
-                "security.* values are invalid; the next restart will fail to start with this error"
-            );
-        }
-    }
+    // `security.*` is now fully reloadable — see `RuntimeReloadState
+    // ::reload`'s commit step. Operators changing security fields no
+    // longer get an "ignored (requires restart)" warning; an invalid
+    // value rejects the entire reload via `resolve_security` upstream.
 }
 
 #[cfg(test)]
@@ -1469,6 +1539,293 @@ mod tests {
             .lock()
             .map_or_else(|p| p.into_inner().is_some(), |g| g.is_some());
         assert!(stored, "attach_cache must store engine despite poison");
+    }
+
+    // ----- security hot-reload (#235) -----
+
+    /// Build a `ConnectionLimiter` with the same defaults `seed_resolved`
+    /// uses for `ResolvedSecurity`. Returned by `Arc` so tests can clone
+    /// it into both `attach_limiter` and assertions about the live state.
+    fn build_test_limiter() -> Arc<crate::dispatch::ConnectionLimiter> {
+        use crate::config::ResolvedSecurity;
+        use crate::dispatch::ConnectionLimiter;
+        use crate::metrics::Metrics;
+        let metrics = Arc::new(Metrics::new());
+        Arc::new(ConnectionLimiter::new(
+            &ResolvedSecurity {
+                max_concurrent_handlers: 256,
+                per_node_rate_per_sec: 20.0,
+                per_node_burst: 40,
+                per_ip_rate_per_sec: 100.0,
+                per_ip_burst: 200,
+                max_tracked_sources: 4096,
+            },
+            metrics,
+        ))
+    }
+
+    #[tokio::test]
+    async fn reload_applies_security_when_limiter_attached() {
+        // Tighten per-node burst from default 40 down to 1; after
+        // reload the live limiter must reject the second per-node
+        // acquire on a fresh node-id pair.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            "[security]\n\
+             per_node_rate_per_sec = 1.0\n\
+             per_node_burst = 1\n\
+             per_ip_rate_per_sec = 1000.0\n\
+             per_ip_burst = 1000\n",
+        );
+
+        let initial = seed_resolved(10, LogLevel::Info);
+        let (setter, _captured) = recording_setter();
+        let state = RuntimeReloadState::new(
+            PaymentArgs { rate_per_mb: None },
+            ObservabilityArgs {
+                log_level: None,
+                log_format: None,
+                metrics_port: None,
+                metrics_bind: None,
+                admin_port: None,
+                otlp_endpoint: None,
+            },
+            &initial,
+            setter,
+        );
+        let limiter = build_test_limiter();
+        state.attach_limiter(Some(Arc::clone(&limiter)));
+
+        state.reload(&path).await.unwrap();
+
+        // Per-node burst is now 1.
+        let node = [7u8; 32];
+        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1));
+        let _p1 = limiter
+            .acquire_for_test(node, Some(ip))
+            .expect("first per-node acquire");
+        let err = limiter
+            .acquire_for_test(
+                node,
+                Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2))),
+            )
+            .expect_err("second per-node acquire must reject after reload");
+        assert_eq!(err, crate::dispatch::RejectReason::PerNodeId);
+    }
+
+    #[tokio::test]
+    async fn reload_without_attached_limiter_is_noop_for_security() {
+        // No limiter attached → reload still parses + validates security
+        // but doesn't blow up. Equivalent of the cache "noop for pinning"
+        // test that already exists.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            "[security]\nper_node_burst = 5\nper_node_rate_per_sec = 1.0\n",
+        );
+        let initial = seed_resolved(10, LogLevel::Info);
+        let (setter, _captured) = recording_setter();
+        let state = RuntimeReloadState::new(
+            PaymentArgs { rate_per_mb: None },
+            ObservabilityArgs {
+                log_level: None,
+                log_format: None,
+                metrics_port: None,
+                metrics_bind: None,
+                admin_port: None,
+                otlp_endpoint: None,
+            },
+            &initial,
+            setter,
+        );
+        // Intentionally NOT calling attach_limiter.
+        state.reload(&path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reload_rejects_invalid_security_and_keeps_previous() {
+        // Negative rate is invalid; reload must reject *and* the rate
+        // atomic and log-level setter must NOT have moved (all-or-
+        // nothing reload — invalid security blocks every other field
+        // too).
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            "[payment]\n\
+             rate_per_mb = 99\n\
+             [observability]\n\
+             log_level = \"debug\"\n\
+             [security]\n\
+             per_node_rate_per_sec = -1.0\n",
+        );
+        let initial = seed_resolved(42, LogLevel::Info);
+        let (setter, captured) = recording_setter();
+        let state = RuntimeReloadState::new(
+            PaymentArgs { rate_per_mb: None },
+            ObservabilityArgs {
+                log_level: None,
+                log_format: None,
+                metrics_port: None,
+                metrics_bind: None,
+                admin_port: None,
+                otlp_endpoint: None,
+            },
+            &initial,
+            setter,
+        );
+        state.attach_limiter(Some(build_test_limiter()));
+
+        let err = state.reload(&path).await.unwrap_err();
+        assert!(format!("{err:#}").contains("per_node_rate_per_sec"));
+        // Payment rate must NOT have moved despite being valid in the
+        // file — "previous values retained on error" applies to the
+        // whole reload.
+        assert_eq!(state.rate_per_mb().load(Ordering::Relaxed), 42);
+        assert!(
+            captured.lock().unwrap().is_none(),
+            "log-level setter must not have run when security rejected"
+        );
+    }
+
+    /// Setter-failure case extended with security: the log-level setter
+    /// returning Err must rollback before the limiter reload runs.
+    #[tokio::test]
+    async fn reload_keeps_security_when_log_level_setter_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            "[observability]\nlog_level = \"debug\"\n\
+             [security]\n\
+             per_node_rate_per_sec = 1.0\n\
+             per_node_burst = 1\n\
+             per_ip_rate_per_sec = 1000.0\n\
+             per_ip_burst = 1000\n",
+        );
+        let failing_setter: LogLevelSetter =
+            Box::new(|_| Err(anyhow::anyhow!("simulated tracing-reload failure")));
+        let initial = seed_resolved(10, LogLevel::Info);
+        let state = RuntimeReloadState::new(
+            PaymentArgs { rate_per_mb: None },
+            ObservabilityArgs {
+                log_level: None,
+                log_format: None,
+                metrics_port: None,
+                metrics_bind: None,
+                admin_port: None,
+                otlp_endpoint: None,
+            },
+            &initial,
+            failing_setter,
+        );
+        let limiter = build_test_limiter();
+        state.attach_limiter(Some(Arc::clone(&limiter)));
+
+        let err = state.reload(&path).await.unwrap_err();
+        assert!(format!("{err:#}").contains("simulated tracing-reload failure"));
+
+        // Limiter must NOT have been mutated — the per-node burst stays
+        // at the seed_resolved default (40), so two acquires from the
+        // same node still succeed.
+        let node = [3u8; 32];
+        let _p1 = limiter
+            .acquire_for_test(
+                node,
+                Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1))),
+            )
+            .expect("setter failure must not have shrunk per-node burst");
+        let _p2 = limiter
+            .acquire_for_test(
+                node,
+                Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2))),
+            )
+            .expect("burst still 40 → second succeeds");
+    }
+
+    /// Mirror of `attach_cache_recovers_from_poisoned_mutex` for the
+    /// new `limiter` slot — silent no-op on a poisoned mutex would turn
+    /// every subsequent reload into a silent no-op for security.
+    #[tokio::test]
+    async fn attach_limiter_recovers_from_poisoned_mutex() {
+        let initial = seed_resolved(10, LogLevel::Info);
+        let (setter, _captured) = recording_setter();
+        let state = Arc::new(RuntimeReloadState::new(
+            PaymentArgs { rate_per_mb: None },
+            ObservabilityArgs {
+                log_level: None,
+                log_format: None,
+                metrics_port: None,
+                metrics_bind: None,
+                admin_port: None,
+                otlp_endpoint: None,
+            },
+            &initial,
+            setter,
+        ));
+
+        let st_for_thread = Arc::clone(&state);
+        let join = std::thread::spawn(move || {
+            let _guard = st_for_thread.limiter.lock().unwrap();
+            panic!("intentional panic to poison limiter mutex");
+        });
+        let _ = join.join();
+        assert!(
+            state.limiter.is_poisoned(),
+            "test setup: limiter mutex should be poisoned"
+        );
+
+        let limiter = build_test_limiter();
+        state.attach_limiter(Some(Arc::clone(&limiter)));
+
+        let stored = state
+            .limiter
+            .lock()
+            .map_or_else(|p| p.into_inner().is_some(), |g| g.is_some());
+        assert!(stored, "attach_limiter must store engine despite poison");
+    }
+
+    /// Mirror of `reload_keeps_log_level_when_sections_mutex_poisoned`
+    /// for the new `limiter` slot. Confirms the limiter-slot lock is
+    /// acquired *before* any commit step.
+    #[tokio::test]
+    async fn reload_keeps_security_when_limiter_mutex_poisoned() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            "[payment]\nrate_per_mb = 99\n\
+             [observability]\nlog_level = \"debug\"\n\
+             [security]\nper_node_burst = 1\n",
+        );
+
+        let initial = seed_resolved(42, LogLevel::Info);
+        let (setter, captured) = recording_setter();
+        let state = Arc::new(RuntimeReloadState::new(
+            PaymentArgs { rate_per_mb: None },
+            ObservabilityArgs {
+                log_level: None,
+                log_format: None,
+                metrics_port: None,
+                metrics_bind: None,
+                admin_port: None,
+                otlp_endpoint: None,
+            },
+            &initial,
+            setter,
+        ));
+
+        let st_for_thread = Arc::clone(&state);
+        let join = std::thread::spawn(move || {
+            let _guard = st_for_thread.limiter.lock().unwrap();
+            panic!("intentional panic to poison limiter mutex");
+        });
+        let _ = join.join();
+        assert!(state.limiter.is_poisoned());
+
+        let err = state.reload(&path).await.unwrap_err();
+        assert!(format!("{err:#}").contains("limiter attach mutex poisoned"));
+        // No commit ran: log-level setter not called, rate atomic intact.
+        assert!(captured.lock().unwrap().is_none());
+        assert_eq!(state.rate_per_mb().load(Ordering::Relaxed), 42);
     }
 
     /// `seed_initial_file_snapshot` primes the diff baseline from the
