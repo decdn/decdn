@@ -261,15 +261,42 @@ impl<K: std::hash::Hash + Eq + Clone> BoundedRateMap<K> {
     }
 
     /// Replace the cap. `0` switches the map to unbounded mode (no
-    /// eviction). Shrinking evicts oldest entries until `len() <= cap`,
-    /// reusing `evict_oldest` so the eviction policy stays in one place.
+    /// eviction). Shrinking evicts oldest entries until `len() <= cap`.
     /// Growing is a no-op for existing entries.
+    ///
+    /// Bulk shrink path: collect the keys with their `last_refill`,
+    /// `select_nth_unstable_by_key` to find the cutoff in O(n), then
+    /// drop everything older. Calling `evict_oldest` in a loop here
+    /// would be O(n²) (each call walks the full map) — at the default
+    /// `max_tracked_sources = 4096`, a shrink down to 10 entries is
+    /// ~16 M comparisons under the per-map `Mutex` held by every live
+    /// acquire. The bulk path keeps it linear in the map size (with a
+    /// log factor for the partial sort), so a worst-case shrink stays
+    /// in microseconds.
     fn set_cap(&mut self, cap: usize) {
         self.cap = cap;
-        if cap > 0 {
-            while self.inner.len() > cap {
-                self.evict_oldest();
-            }
+        if cap == 0 || self.inner.len() <= cap {
+            return;
+        }
+        // Snapshot (key, last_refill). The clone of K is unavoidable
+        // because we need both the keys to remove and the timestamps to
+        // partition by — `HashMap::remove` consumes a `&K` and we don't
+        // hold mutable iterators across removes.
+        let mut entries: Vec<(K, Instant)> = self
+            .inner
+            .iter()
+            .map(|(k, b)| (k.clone(), b.last_refill))
+            .collect();
+        // Partition so the `cap` newest (largest `last_refill`) entries
+        // end up in `entries[entries.len() - cap..]`. The first
+        // `entries.len() - cap` slots are then guaranteed to be the
+        // *oldest* — exactly what we want to evict. `select_nth_unstable_by_key`
+        // is O(n) average; the `_by_key` variant takes a closure
+        // returning the sort key (timestamp here).
+        let drop_count = entries.len() - cap;
+        let _ = entries.select_nth_unstable_by_key(drop_count, |(_, t)| *t);
+        for (k, _) in entries.into_iter().take(drop_count) {
+            self.inner.remove(&k);
         }
     }
 
@@ -359,8 +386,8 @@ impl ConnectionLimiter {
     /// Field-by-field strategy:
     /// - `per_{node,ip}_rate_per_sec`, `per_{node,ip}_burst`,
     ///   `max_tracked_sources`: in-place under the existing per-map
-    ///   `Mutex` (see [`BoundedRateMap::set_rate_burst`] /
-    ///   [`BoundedRateMap::set_cap`]). Concurrent acquires briefly
+    ///   `Mutex` (see the private `BoundedRateMap::set_rate_burst` and
+    ///   `BoundedRateMap::set_cap` mutators). Concurrent acquires briefly
     ///   serialise behind the reload — bounded by an O(n ≤ cap) walk of
     ///   the bucket map.
     /// - `max_concurrent_handlers`: `Arc<Semaphore>` identity is
@@ -974,6 +1001,30 @@ mod tests {
         assert!(!map.contains_key(&1), "second-oldest evicted");
         assert!(map.contains_key(&2), "newer survives");
         assert!(map.contains_key(&3), "newest survives");
+    }
+
+    #[test]
+    fn bounded_map_set_cap_bulk_shrink_drops_oldest_correctly() {
+        // Larger drop than the basic eviction test: 4096 → 10 must
+        // retain the 10 newest entries (by last_refill) and drop the
+        // 4086 oldest. Catches a regression where the bulk-shrink path
+        // selects wrong-side entries (e.g. partitions newest-first and
+        // drops the wrong half).
+        let mut map: BoundedRateMap<u32> = BoundedRateMap::new(4096, 100.0, 1.0);
+        let t0 = Instant::now();
+        for k in 0..4096u32 {
+            map.try_consume(&k, t0 + Duration::from_micros(u64::from(k)));
+        }
+        assert_eq!(map.len(), 4096);
+        map.set_cap(10);
+        assert_eq!(map.len(), 10, "shrink to 10 leaves exactly 10");
+        // Surviving keys are 4086..=4095 (the 10 newest by last_refill).
+        for k in 4086..4096u32 {
+            assert!(map.contains_key(&k), "newest key {k} survives");
+        }
+        for k in [0u32, 1, 100, 1000, 4085] {
+            assert!(!map.contains_key(&k), "old key {k} evicted");
+        }
     }
 
     #[test]

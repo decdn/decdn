@@ -141,10 +141,11 @@ pub struct GossipConfig {
 ///
 /// **`0` means "disable this layer":**
 ///   - `max_concurrent_handlers = 0`: no global concurrency cap.
-///   - `per_node_rate_per_sec = 0` (with `per_node_burst = 0`): per-NodeID
-///     rate-limit disabled.
-///   - `per_ip_rate_per_sec = 0` (with `per_ip_burst = 0`): per-IP
-///     rate-limit disabled.
+///   - `per_node_rate_per_sec = 0`: per-NodeID rate-limit disabled. The
+///     paired `per_node_burst` field is ignored — the limiter's
+///     `try_consume` short-circuits before the bucket is ever touched.
+///   - `per_ip_rate_per_sec = 0`: per-IP rate-limit disabled. Paired
+///     `per_ip_burst` is ignored on the same fast path.
 ///   - `max_tracked_sources = 0`: rate-limit bookkeeping map is unbounded.
 ///     **Warning:** an attacker churning identities can grow the map
 ///     without bound in this mode — operator opt-in only.
@@ -152,7 +153,8 @@ pub struct GossipConfig {
 /// `burst > 0` is required only when paired with a positive rate. Setting
 /// `rate > 0` together with `burst = 0` would deny every request after
 /// the first burst-many — the resolver rejects that combination as a
-/// likely-typo.
+/// likely-typo. Setting `rate = 0` together with any `burst` value is
+/// fine; burst is unused once the layer is disabled.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct SecurityConfig {
     /// Maximum number of concurrently in-flight QUIC handler tasks across
@@ -162,22 +164,24 @@ pub struct SecurityConfig {
     pub max_concurrent_handlers: Option<u32>,
     /// Token-bucket refill rate for per-NodeID limiting (tokens per
     /// second). Matches ADR 001's inbound probe limit. Default: 20.
-    /// `0.0` disables the per-NodeID layer (`per_node_burst` must also
-    /// be `0` to disable).
+    /// `0.0` disables the per-NodeID layer (the paired `per_node_burst`
+    /// is then ignored).
     pub per_node_rate_per_sec: Option<f64>,
     /// Token-bucket burst capacity for per-NodeID limiting. Default: 40
     /// (2× the rate, providing headroom for jitter so well-behaved peers
-    /// don't trip the limit on naturally-clumped requests). `0` valid
-    /// only when `per_node_rate_per_sec = 0`.
+    /// don't trip the limit on naturally-clumped requests). Required `> 0`
+    /// when `per_node_rate_per_sec > 0`; ignored when the layer is
+    /// disabled (`per_node_rate_per_sec = 0`).
     pub per_node_burst: Option<u32>,
     /// Token-bucket refill rate for per-IP limiting (tokens per second).
     /// More generous than per-NodeID because one IP may host a legitimate
-    /// fleet. Default: 100. `0.0` disables the per-IP layer
-    /// (`per_ip_burst` must also be `0` to disable).
+    /// fleet. Default: 100. `0.0` disables the per-IP layer (the paired
+    /// `per_ip_burst` is then ignored).
     pub per_ip_rate_per_sec: Option<f64>,
     /// Token-bucket burst capacity for per-IP limiting. Default: 200
-    /// (2× the rate; same headroom rationale as per-NodeID). `0` valid
-    /// only when `per_ip_rate_per_sec = 0`.
+    /// (2× the rate; same headroom rationale as per-NodeID). Required
+    /// `> 0` when `per_ip_rate_per_sec > 0`; ignored when the layer is
+    /// disabled (`per_ip_rate_per_sec = 0`).
     pub per_ip_burst: Option<u32>,
     /// Hard cap on the number of distinct `NodeIDs` (and separately, IPs)
     /// tracked in the rate-limit state. When full, the oldest entry is
