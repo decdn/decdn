@@ -8,6 +8,12 @@ ignore = [
     "RUSTSEC-2023-0089",
     # paste: unmaintained, transitive via alloy-primitives
     "RUSTSEC-2024-0436",
+    # hickory-proto / hickory-net DNS DoS bugs (O(n²) name compression and
+    # NSEC3 unbounded loop). Fixed in hickory-proto 0.26.1, but iroh 0.98
+    # exact-pins =0.26.0-beta.4 — release a fix once upstream iroh bumps.
+    # Reachable only through iroh's address-lookup path; not a CDN-data path.
+    "RUSTSEC-2026-0119",
+    "RUSTSEC-2026-0120",
 ]
 
 [licenses]

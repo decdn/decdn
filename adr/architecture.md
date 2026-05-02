@@ -141,7 +141,7 @@ Appendices document patterns, reference implementations, and operational guidanc
 
 Numeric per-ADR index. The thematic chapter ordering for top-to-bottom reading lives above in [Reading Order](#reading-order); this section is the canonical per-ADR reference. Each entry is a one-line summary of the ADR's decision; the full Context / Decision / Consequences sections live in the linked file.
 
-- **[ADR 000 — Language and Core Networking Stack](000-language.md)** — Rust + iroh (0.97).
+- **[ADR 000 — Language and Core Networking Stack](000-language.md)** — Rust + iroh (0.98).
 - **[ADR 001 — Network Topology and Peer Mesh](001-network.md)** — Flat peer mesh; gossip for node discovery; `cdn/dht/v1` (Kademlia subset) for content discovery from PoC onward, with broadcast probe fan-out as a bootstrap fallback (see [ADR 022](022-content-discovery.md)).
 - **[ADR 002 — Content Addressing](002-content-addressing.md)** — BLAKE3 content-addressed blobs. Node backends are opaque to the network.
 - **[ADR 003 — Payment Model](003-payments.md)** — Off-chain USDC payment channels. Market-driven rates within governance-set bounds.

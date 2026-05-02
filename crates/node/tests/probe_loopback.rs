@@ -17,22 +17,14 @@ use decdn_protocol::{
     read_frame, write_frame,
 };
 use iroh::endpoint::{
-    ApplicationClose, Connection, ConnectionError, ReadError, ReadToEndError, VarInt,
+    ApplicationClose, Connection, ConnectionError, ReadError, ReadToEndError, VarInt, presets,
 };
 use iroh::protocol::ProtocolHandler;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
-use rand::Rng;
 use tokio::task::JoinHandle;
 
-/// Build a fresh `SecretKey` by drawing 32 random bytes and feeding them
-/// to `SecretKey::from_bytes`. We don't use
-/// `fresh_key()` because iroh 0.97 pins
-/// `rand_core 0.9` while this crate uses rand 0.10, so the two
-/// `CryptoRng` traits don't match.
 fn fresh_key() -> SecretKey {
-    let mut bytes = [0u8; 32];
-    rand::rng().fill_bytes(&mut bytes);
-    SecretKey::from_bytes(&bytes)
+    SecretKey::generate()
 }
 
 /// Build an endpoint bound to 127.0.0.1 with relays disabled and no discovery.
@@ -42,7 +34,7 @@ async fn local_endpoint(
     alpns: Vec<Vec<u8>>,
 ) -> anyhow::Result<(Endpoint, SocketAddr)> {
     let bind = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
-    let ep = Endpoint::empty_builder()
+    let ep = Endpoint::builder(presets::Minimal)
         .secret_key(secret_key)
         .alpns(alpns)
         .relay_mode(RelayMode::Disabled)
