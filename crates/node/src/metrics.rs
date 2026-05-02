@@ -194,7 +194,7 @@ impl Metrics {
         ConnectionGuard::new(self)
     }
 
-    fn encode(&self) -> anyhow::Result<String> {
+    pub(crate) fn encode(&self) -> anyhow::Result<String> {
         let uptime = i64::try_from(self.started_at.elapsed().as_secs()).unwrap_or(i64::MAX);
         self.decdn.uptime_seconds.set(uptime);
 

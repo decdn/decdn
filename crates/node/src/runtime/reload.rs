@@ -223,11 +223,17 @@ impl RuntimeReloadState {
     /// Detaching is permitted (pass `None`) but production code never
     /// needs to: the engine outlives the reload state by construction.
     ///
-    /// A poisoned mutex during attach is recovered (the `PoisonError` is
-    /// owned by `std::sync::Mutex` and lets us still grab the inner
-    /// guard) — silently no-op'ing here would leave reloads as a silent
-    /// no-op forever after a panic on some other thread, which is
-    /// exactly the silent-failure mode this pattern exists to prevent.
+    /// **Poison handling.** A poisoned mutex is recovered by replacing
+    /// the inner value via `PoisonError::into_inner()`, but the poison
+    /// flag is *not* cleared — `Mutex::lock()` will return `Err` again
+    /// the next time anyone tries to take the guard. The first
+    /// subsequent `reload()` will therefore fail-stop with `"cache
+    /// attach mutex poisoned"`, retaining the previous values for
+    /// every section. Recovery here ensures the new engine is at least
+    /// stored for the (non-reload-driven) live path; it does not
+    /// resurrect future reloads. Silently no-op'ing on the poison would
+    /// have been worse — it would leave subsequent reloads applying
+    /// `pinned_hashes` against a stale engine forever.
     pub fn attach_cache(&self, engine: Option<decdn_cache::CacheEngine>) {
         match self.cache.lock() {
             Ok(mut guard) => *guard = engine,
@@ -243,8 +249,9 @@ impl RuntimeReloadState {
     /// Attach the live `ConnectionLimiter` after it's been built. Same
     /// shape as [`Self::attach_cache`]: must be called before the SIGHUP
     /// select loop, supports `None` for tests, recovers from a poisoned
-    /// mutex by replacing the inner state. Silent no-op on poison would
-    /// leave subsequent reloads silently dropping security changes.
+    /// mutex by replacing the inner state. The poison-handling story is
+    /// the same as `attach_cache` — see that doc for the fail-stop
+    /// guarantee on subsequent reloads.
     pub fn attach_limiter(&self, limiter: Option<Arc<ConnectionLimiter>>) {
         match self.limiter.lock() {
             Ok(mut guard) => *guard = limiter,
@@ -436,7 +443,7 @@ impl RuntimeReloadState {
         let file = match load_file_config(Some(path)) {
             Ok(f) => f,
             Err(err) => {
-                tracing::warn!(%err, path = %path.display(), "config reload failed; previous values retained");
+                tracing::warn!(%err, path = %path.display(), "config reload aborted (file load failed); previous values retained for every section");
                 return Err(err);
             }
         };
@@ -449,7 +456,7 @@ impl RuntimeReloadState {
         ) {
             Ok(p) => p,
             Err(err) => {
-                tracing::warn!(%err, "config reload rejected (payment); previous values retained");
+                tracing::warn!(%err, "config reload aborted at [payment]; entire reload rolled back (all-or-nothing): payment, observability, cache.pinned_hashes, and security all retained at their previous values");
                 return Err(err);
             }
         };
@@ -459,7 +466,7 @@ impl RuntimeReloadState {
         ) {
             Ok(o) => o,
             Err(err) => {
-                tracing::warn!(%err, "config reload rejected (observability); previous values retained");
+                tracing::warn!(%err, "config reload aborted at [observability]; entire reload rolled back (all-or-nothing): payment, observability, cache.pinned_hashes, and security all retained at their previous values");
                 return Err(err);
             }
         };
@@ -470,18 +477,18 @@ impl RuntimeReloadState {
         // malformed entry rejects the whole reload before any side
         // effect runs, consistent with the "previous values retained on
         // error" contract.
-        let new_pinned =
-            match parse_pinned_hashes(file.cache.as_ref().and_then(|c| c.pinned_hashes.as_deref()))
-            {
-                Ok(p) => p,
-                Err(err) => {
-                    tracing::warn!(
-                        %err,
-                        "config reload rejected (cache.pinned_hashes); previous values retained"
-                    );
-                    return Err(err);
-                }
-            };
+        let new_pinned = match parse_pinned_hashes(
+            file.cache.as_ref().and_then(|c| c.pinned_hashes.as_deref()),
+        ) {
+            Ok(p) => p,
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    "config reload aborted at [cache.pinned_hashes]; entire reload rolled back (all-or-nothing): payment, observability, cache.pinned_hashes, and security all retained at their previous values"
+                );
+                return Err(err);
+            }
+        };
 
         // Re-resolve `[security]`. All fields are hot-reloadable; an
         // invalid value rejects the entire reload (all-or-nothing
@@ -492,7 +499,7 @@ impl RuntimeReloadState {
             Err(err) => {
                 tracing::warn!(
                     %err,
-                    "config reload rejected (security); previous values retained"
+                    "config reload aborted at [security]; entire reload rolled back (all-or-nothing): payment, observability, cache.pinned_hashes, and security all retained at their previous values"
                 );
                 return Err(err);
             }
@@ -782,10 +789,9 @@ fn log_ignored_other_sections(file: &crate::config::FileConfig, prev: &FileSecti
     if changed("gossip", file.gossip.as_ref(), prev.gossip.as_ref()) && file.gossip.is_some() {
         warn_ignored("gossip.* (announce_interval, peer_ttl, allowlist, subscribe_global)");
     }
-    // `security.*` is now fully reloadable — see `RuntimeReloadState
-    // ::reload`'s commit step. Operators changing security fields no
-    // longer get an "ignored (requires restart)" warning; an invalid
-    // value rejects the entire reload via `resolve_security` upstream.
+    // `security.*` is fully reloadable — see `RuntimeReloadState::reload`'s
+    // commit step. Invalid values reject the entire reload via
+    // `resolve_security` upstream rather than landing here.
 }
 
 #[cfg(test)]

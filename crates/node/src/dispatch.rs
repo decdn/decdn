@@ -63,10 +63,11 @@ impl RejectReason {
 
 /// RAII permit that holds a semaphore slot for the lifetime of a handler task.
 ///
-/// Construction (inside [`ConnectionLimiter::acquire`]) increments the
-/// `dispatch_in_flight` gauge; `Drop` decrements it. The pair must remain
-/// symmetric — if you split the construction site, keep the gauge bookkeeping
-/// adjacent so the invariant is locally checkable.
+/// Construction (on the success path of [`ConnectionLimiter::acquire`],
+/// in `acquire_inner`) increments the `dispatch_in_flight` gauge; `Drop`
+/// decrements it. The pair must remain symmetric — if you split the
+/// construction site, keep the gauge bookkeeping adjacent so the
+/// invariant is locally checkable.
 ///
 /// `_sem` is `Option` to support the `max_concurrent_handlers = 0`
 /// disabled-global-cap mode: when the global layer is disabled the
@@ -239,7 +240,7 @@ impl<K: std::hash::Hash + Eq + Clone> BoundedRateMap<K> {
     }
 
     /// Replace `rate`/`burst` and propagate the new parameters to every
-    /// existing bucket. Used by `ConnectionLimiter::reload` (#issue).
+    /// existing bucket. Used by `ConnectionLimiter::reload`.
     ///
     /// Walks `self.inner.values_mut()` — O(n) with n ≤ `cap`. The map's
     /// surrounding `Mutex` is held for the duration; at the default
@@ -250,6 +251,13 @@ impl<K: std::hash::Hash + Eq + Clone> BoundedRateMap<K> {
     /// resumes from where they left off rather than discarding fairness
     /// state. A reload that disables and never re-enables will eventually
     /// drain via the cap-eviction path the next time a new key arrives.
+    ///
+    /// Safety across dramatic rate drops (e.g. `1e9 → 1.0`) depends on
+    /// `TokenBucket::try_consume` clamping with `.min(self.burst)`:
+    /// preserved `last_refill` would otherwise let `elapsed * new_rate`
+    /// credit phantom tokens during a long idle window. The clamp keeps
+    /// post-reload behavior bounded by the new `burst` regardless of
+    /// how stale `last_refill` is.
     fn set_rate_burst(&mut self, rate: f64, burst: f64) {
         self.rate = rate;
         self.burst = burst;
@@ -265,14 +273,23 @@ impl<K: std::hash::Hash + Eq + Clone> BoundedRateMap<K> {
     /// Growing is a no-op for existing entries.
     ///
     /// Bulk shrink path: collect the keys with their `last_refill`,
-    /// `select_nth_unstable_by_key` to find the cutoff in O(n), then
-    /// drop everything older. Calling `evict_oldest` in a loop here
-    /// would be O(n²) (each call walks the full map) — at the default
-    /// `max_tracked_sources = 4096`, a shrink down to 10 entries is
-    /// ~16 M comparisons under the per-map `Mutex` held by every live
-    /// acquire. The bulk path keeps it linear in the map size (with a
-    /// log factor for the partial sort), so a worst-case shrink stays
-    /// in microseconds.
+    /// `select_nth_unstable_by_key` to partition the oldest cohort, then
+    /// drop them. `select_nth_unstable_by_key` is average O(n) via
+    /// introselect (worst-case O(n²) under adversarial timestamps, still
+    /// bounded by `cap`). Calling `evict_oldest` in a loop here would be
+    /// O(n²) — at the default `max_tracked_sources = 4096`, a shrink to
+    /// 10 entries is ~16 M comparisons under the per-map `Mutex` held by
+    /// every live acquire. The bulk path keeps the worst-case shrink in
+    /// microseconds.
+    ///
+    /// Tie-breaking: `select_nth_unstable_by_key` does not promise stable
+    /// ordering for entries with equal `last_refill`. With `Instant::now()`
+    /// resolution being typically nanosecond-grained on Linux, ties are
+    /// vanishingly rare in production traffic — but tests using tight
+    /// `Instant`-arithmetic loops can produce them, so test assertions
+    /// about *which* tied entry survives a shrink are unstable and should
+    /// not be written. Functionally it's a wash: any of the `cap` newest
+    /// entries are equally valid to retain.
     fn set_cap(&mut self, cap: usize) {
         self.cap = cap;
         if cap == 0 || self.inner.len() <= cap {
@@ -400,12 +417,25 @@ impl ConnectionLimiter {
     ///   `live_semaphore_size` (the size left over from the last
     ///   enabled period).
     ///
+    /// Worked example (cap=4 startup → disable → re-enable smaller → grow):
+    /// ```text
+    /// reload(target=0): target=0, live stays 4; early return (acquire skips semaphore).
+    /// reload(target=3): live=4, store live=3, shrink by 1 (spawn forget task).
+    /// reload(target=5): live=3, store live=5, add_permits(2).
+    /// ```
+    ///
     /// Caveats: during a shrink the live cap is `>= new_target` until
     /// enough handlers drain. Under racing reloads (N→N+1→N) the
-    /// post-task permit count may briefly land anywhere in `[N, N+1]`
-    /// until the next reload reconciles. A disable→enable→smaller-cap
-    /// sequence spawns a shrink task on the re-enable. All acceptable
-    /// at `PoC` scale.
+    /// post-task permit count may briefly land anywhere in `[N, N+1]`,
+    /// and a parked shrink task that fires after a subsequent grow can
+    /// "forget" permits the operator just re-granted — leaving
+    /// `live_semaphore_size` (the recorded value) ahead of the actual
+    /// permit count by however many the parked task ate. Subsequent
+    /// reloads compute deltas from the recorded value, so the
+    /// discrepancy stays bounded by the in-flight shrink count and
+    /// converges as the operator stops reloading. A disable→enable→
+    /// smaller-cap sequence spawns a shrink task on the re-enable.
+    /// All acceptable at `PoC` scale.
     ///
     /// Infallible: token-bucket mutation can't fail, `add_permits` can't
     /// fail, and the shrink path is `tokio::spawn` (which only fails by
@@ -468,9 +498,12 @@ impl ConnectionLimiter {
             tokio::spawn(async move {
                 match sem.acquire_many_owned(delta).await {
                     Ok(p) => p.forget(),
-                    Err(_) => {
-                        // Semaphore closed only happens on shutdown.
-                        tracing::debug!("semaphore closed during shrink; skipping forget");
+                    Err(err) => {
+                        // The only documented `AcquireError` is "semaphore
+                        // closed", which only happens on shutdown today.
+                        // Bind `err` so a future `#[non_exhaustive]` variant
+                        // isn't silently swallowed.
+                        tracing::debug!(%err, "semaphore acquire failed during shrink; skipping forget");
                     }
                 }
             });
@@ -499,15 +532,12 @@ impl ConnectionLimiter {
         self.acquire_inner(*conn.remote_id().as_bytes(), peer_ip(conn))
     }
 
-    /// Cross-module test hook. Same body as [`Self::acquire_inner`];
-    /// exposed `pub` (hidden from rustdoc) so unit tests in other
-    /// modules and integration tests under `tests/` can drive the
-    /// limiter without a real iroh `Connection`. Production code must
-    /// not call this — `Self::acquire` is the only supported entry
-    /// point. Marked `#[doc(hidden)]` so it stays out of the rendered
-    /// public API surface; rustdoc still links it from `acquire`'s
-    /// "see also" if anyone goes looking, which is the right level of
-    /// discoverability for a test helper.
+    /// Cross-module test hook with the same behavior as `acquire`,
+    /// minus the iroh `Connection` argument. Exposed as `pub` so unit
+    /// tests in other modules and integration tests under `tests/` can
+    /// drive the limiter directly. Production code must not call this —
+    /// `Self::acquire` is the only supported entry point.
+    /// `#[doc(hidden)]` keeps it out of the rendered public API surface.
     #[doc(hidden)]
     pub fn acquire_for_test(
         &self,
@@ -517,17 +547,16 @@ impl ConnectionLimiter {
         self.acquire_inner(node_key, peer_ip)
     }
 
-    /// Plumbing-free variant exposed for unit tests that don't have a real
-    /// iroh `Connection`. Identical to [`Self::acquire`] in behavior.
+    /// Shared implementation behind [`Self::acquire`] and
+    /// [`Self::acquire_for_test`].
     fn acquire_inner(
         &self,
         node_key: [u8; 32],
         peer_ip: Option<IpAddr>,
     ) -> Result<Permit, RejectReason> {
-        // `target == 0` means the operator disabled the global cap.
-        // Skip the semaphore acquire entirely; the in-flight gauge is
-        // still incremented when the `Permit` is constructed below so
-        // observability is unaffected.
+        // target == 0 disables the global cap; skip the semaphore.
+        // The in-flight gauge bookkeeping happens inside the `Permit`
+        // constructor regardless — see the `Permit` doc.
         let sem_permit = if self.target_max_concurrent.load(Ordering::Relaxed) > 0 {
             Some(
                 Arc::clone(&self.semaphore)
@@ -1340,5 +1369,186 @@ mod tests {
             .acquire_inner([2u8; 32], same_ip)
             .expect_err("second from same IP must reject on per-IP");
         assert_eq!(err, RejectReason::PerIp);
+    }
+
+    // --- Reload regression tests added per code review ------------------------
+
+    /// `target_lock` exists specifically to serialise concurrent reloads
+    /// so racing N→…→M operations converge. Run 8 concurrent reloads
+    /// against the same limiter and assert the post-race `live_semaphore_size`
+    /// matches the *last* reload to commit (whichever wins the lock race),
+    /// then a follow-up reload to a known cap produces exactly that cap's
+    /// behaviour. A regression that removed `target_lock` would let two
+    /// concurrent reloads' resize math step on each other.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_reloads_converge() {
+        let metrics = Arc::new(Metrics::new());
+        let limiter = Arc::new(ConnectionLimiter::new(&strict_security(8), metrics));
+        let barrier = Arc::new(tokio::sync::Barrier::new(8));
+        let mut handles = Vec::new();
+        for i in 0..8u32 {
+            let l = Arc::clone(&limiter);
+            let b = Arc::clone(&barrier);
+            handles.push(tokio::spawn(async move {
+                b.wait().await;
+                let mut cfg = permissive_security();
+                cfg.max_concurrent_handlers = 4 + i;
+                l.reload(&cfg);
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        // Drain any pending shrink tasks before the final reconcile.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        // Reload to a known cap = 11. From whatever the racing reloads
+        // left `live_semaphore_size` at, this should resize correctly.
+        let mut cfg = permissive_security();
+        cfg.max_concurrent_handlers = 11;
+        limiter.reload(&cfg);
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        // Hold 11 permits; the 12th must reject. This is the operator-
+        // observable convergence proof.
+        let mut held = Vec::with_capacity(11);
+        for i in 0..11u8 {
+            held.push(
+                limiter
+                    .acquire_inner([i; 32], Some(ip(10, 0, 0, i)))
+                    .expect("11 acquires under cap=11"),
+            );
+        }
+        assert!(
+            limiter
+                .acquire_inner([99u8; 32], Some(ip(10, 0, 0, 99)))
+                .is_err(),
+            "12th acquire must reject at cap=11 after concurrent reloads converge"
+        );
+    }
+
+    /// Disable → re-enable on `BoundedRateMap` must preserve existing
+    /// bucket state, not grant fresh burst on re-enable. The docstring
+    /// claims this; the test pins it. Drain a bucket, disable, re-enable
+    /// with same parameters at the *same* `Instant`, and assert the next
+    /// consume still fails — the bucket carried its drained state across.
+    #[test]
+    fn bounded_map_disable_then_reenable_preserves_existing_buckets() {
+        let mut map: BoundedRateMap<u8> = BoundedRateMap::new(16, 1.0, 1.0);
+        let t0 = Instant::now();
+        assert!(map.try_consume(&7, t0), "first consume drains burst=1");
+        assert!(!map.try_consume(&7, t0), "exhausted at the same instant");
+
+        map.set_rate_burst(0.0, 1.0); // disable layer
+        assert!(map.try_consume(&7, t0), "disabled-layer fast path accepts");
+
+        // Re-enable with identical params at the same instant. If the
+        // bucket was preserved (per docstring), tokens are still 0.
+        map.set_rate_burst(1.0, 1.0);
+        assert!(
+            !map.try_consume(&7, t0),
+            "re-enable must resume bucket state, not grant fresh burst"
+        );
+    }
+
+    /// Disabled→still-disabled reload must leave `live_semaphore_size`
+    /// untouched so a future re-enable resizes from the right baseline.
+    /// A regression that flipped the `next_target == 0` early-return to
+    /// also reset `live` would silently break the next re-enable.
+    #[tokio::test]
+    async fn reload_disabled_to_disabled_preserves_live_baseline() {
+        let metrics = Arc::new(Metrics::new());
+        let limiter = ConnectionLimiter::new(&strict_security(4), Arc::clone(&metrics));
+        // First reload: disable.
+        let mut c = permissive_security();
+        c.max_concurrent_handlers = 0;
+        limiter.reload(&c);
+        // Second reload: still disabled. Must not touch live.
+        limiter.reload(&c);
+        // Re-enable to 4. With baseline preserved, this is a no-op resize
+        // (live=4 → 4); without it, the resize would be wrong.
+        c.max_concurrent_handlers = 4;
+        limiter.reload(&c);
+        // Hold 4 permits; the 5th must reject.
+        let _h: Vec<_> = (0..4u8)
+            .map(|i| {
+                limiter
+                    .acquire_inner([i; 32], Some(ip(10, 0, 0, i)))
+                    .expect("acquire under cap=4")
+            })
+            .collect();
+        assert!(
+            limiter
+                .acquire_inner([99u8; 32], Some(ip(10, 0, 0, 99)))
+                .is_err(),
+            "5th must reject; if live baseline drifted, this would have over-allocated"
+        );
+    }
+
+    /// `set_cap(0)` on a populated bounded map transitions the map to
+    /// unbounded mode. It must NOT clear existing entries — that would
+    /// silently lose fairness state across the cap change.
+    #[test]
+    fn bounded_map_set_cap_zero_makes_unbounded_and_retains_entries() {
+        let mut map: BoundedRateMap<u32> = BoundedRateMap::new(4, 100.0, 1.0);
+        let t0 = Instant::now();
+        for k in 0..4u32 {
+            map.try_consume(&k, t0);
+        }
+        assert_eq!(map.len(), 4);
+        map.set_cap(0);
+        assert_eq!(
+            map.len(),
+            4,
+            "transition to unbounded must retain existing entries"
+        );
+        // And a 5th insert must succeed without eviction.
+        map.try_consume(&99, t0 + Duration::from_millis(1));
+        assert_eq!(map.len(), 5, "unbounded mode allows growth past old cap");
+        for k in 0..4u32 {
+            assert!(map.contains_key(&k), "key {k} retained");
+        }
+    }
+
+    /// Metrics counters must continue to flow after a hot reload — the
+    /// `Arc<Metrics>` handle is shared in by the `ConnectionLimiter`
+    /// constructor and reused via in-place mutation. A regression that
+    /// rebuilt the limiter on reload (and lost the `Arc<Metrics>`) would
+    /// leave reject counters frozen at zero post-reload.
+    #[tokio::test]
+    async fn reload_preserves_metrics_handle_for_post_reload_rejects() {
+        let metrics = Arc::new(Metrics::new());
+        let limiter = ConnectionLimiter::new(&permissive_security(), Arc::clone(&metrics));
+
+        // Tighten per-NodeID via reload to burst=1.
+        let mut cfg = strict_security(u32::MAX);
+        cfg.per_node_burst = 1;
+        cfg.per_node_rate_per_sec = 0.001; // effectively no refill
+        cfg.per_ip_rate_per_sec = 1e9;
+        cfg.per_ip_burst = u32::MAX;
+        limiter.reload(&cfg);
+
+        let attacker = [42u8; 32];
+        let _ok = limiter
+            .acquire_inner(attacker, Some(ip(10, 0, 0, 1)))
+            .expect("first acquire under tightened limit");
+        // Second from same node, fresh IP — per-node burst exhausted post-reload.
+        let _err = limiter
+            .acquire_inner(attacker, Some(ip(10, 0, 0, 2)))
+            .expect_err("post-reload reject");
+
+        let text = metrics.encode().unwrap();
+        // OpenMetrics auto-appends `_total` to counter names, so the
+        // metric `decdn_dispatch_rejected_per_node_total` (already with
+        // the conventional `_total` suffix) is rendered as
+        // `decdn_dispatch_rejected_per_node_total_total`.
+        assert!(
+            text.contains("decdn_dispatch_rejected_per_node_total_total 1"),
+            "post-reload reject must increment counter; got:\n{text}"
+        );
     }
 }
