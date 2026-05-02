@@ -130,7 +130,7 @@ When a node caches blob H:
 2. Send a signed `StoreRequest { hash: H, holder: self.node_id, published_at_us, signature }` to each.
 3. Schedule re-publish at T+45 minutes while blob remains cached.
 
-The `StoreRequest` signature (ed25519 over `hash || published_at_us`) lets receiving nodes verify the record was created by the claimed holder. Receiving nodes do **not** verify that the holder actually has the blob — that is the probe step's job. A false publisher fails at probe time, degrading its reputation.
+The `StoreRequest` signature (ed25519 over `hash || published_at_us`) lets receiving nodes verify the record was created by the claimed holder. Receiving nodes do **not** verify that the holder actually has the blob — that is the probe step's job. A false STORE publisher (a node claiming to hold a blob it does not) fails at probe time, degrading its reputation. **Note:** the term "publisher" in this ADR refers to a node publishing a DHT STORE record (an act of advertising). It is distinct from the on-chain *content publisher* identity defined in [ADR 002 § Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces), which is an Ethereum address registered in `PublisherRegistry`. Where confusion is possible this ADR uses "STORE publisher" or "holder" for the DHT-record sender.
 
 #### 1.6 FIND_VALUE Flow (Cache Miss → DHT Lookup)
 
@@ -144,6 +144,8 @@ When a node gets a cache miss for hash H and the probe cache is empty:
 6. Select provider by unified node selection score ([ADR 001](001-network.md#node-selection-algorithm)); deliver via `cdn/client/v1`.
 
 **Fallback:** if DHT returns no providers, fall back to broadcast probe fan-out across all known peers (the existing mechanism). If that also returns nothing, the blob is not available in the network.
+
+**Origin-only discovery.** A requester that needs the canonical origin for a hash in a registered namespace (e.g., a cache-miss pull where only an authorized origin is acceptable) does not need to discover origins through the DHT. The on-chain `OriginAssignment` contract ([ADR 011](011-content-takedown.md#origin-assignment-authority)) is the source of truth for the authorized operator set per namespace; the requester resolves the namespace via `PublisherRegistry.namespaceOf(hash)` and then calls `OriginAssignment.getOrigins(namespaceId)`. The DHT does not discriminate origin vs cache providers — `StoreRequest` is the same wire format regardless of role — and the requester relies on the `is_origin` field in the probe response (see [ADR 005 § cdn/probe/v1](005-protocol.md#cdnprobev1--latency-probe)) to confirm role at probe time. For default-open content (`namespaceId == 0`) every cached provider may also act as origin, so the distinction collapses.
 
 #### 1.7 Bootstrap
 
@@ -235,7 +237,8 @@ The six discovery alternatives evaluated against `cdn/dht/v1` (broadcast probe f
 
 - **ADR 001** Future Work section ("Scaling Content Discovery") is superseded by this ADR. The three strategies listed there are resolved: selective fan-out is subsumed by DHT, content DHT is formalised here, gossip content hints are rejected.
 - **ADR 005** probe protocol is unchanged. DHT provides candidates only.
-- **ADR 008** reputation penalties for delivery failure cover false STORE record publishers.
+- **ADR 008** reputation penalties for delivery failure cover false STORE records (a node publishing a DHT record claiming to hold a blob it does not have).
+- **ADR 011** origin assignment authority is consulted at probe time, not at DHT discovery time. The DHT remains permissionless; per-namespace origin authorization is enforced by the `is_origin` field in `ProbeResponse` and verified against `OriginAssignment` on chain.
 - **ADR 012** client discovery uses DHT FIND_VALUE; probe fan-out bootstrap fallback applies to clients equally.
 - **ADR 013** schema evolution rules apply to `cdn/dht/v1`.
 - **the observability appendix** SHOULD add DHT subsystem metrics: `decdn_dht_store_published_total`, `decdn_dht_findvalue_queries_total`, `decdn_dht_routing_table_size`.

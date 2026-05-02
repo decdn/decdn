@@ -19,6 +19,70 @@ The mapping from hash to the actual backing storage location (e.g., which S3 key
 
 BLAKE3 is iroh's native hash function, so there is no translation layer between blob IDs and the transport layer.
 
+## Publisher Identity and Namespaces
+
+Content addressing answers "what is this blob?". Origin governance answers "who is responsible for serving this blob?". The two questions are independent: a BLAKE3 hash is intrinsic to the bytes, but the network needs a stable identity for the party that publishes the bytes so that the DAO can authorize specific operators to act as origins for their content (see [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority)).
+
+A **publisher** is an Ethereum address that has registered through the `PublisherRegistry` contract ([ADR 016](016-contract-interactions.md)). Registration is permissionless and one-shot per address; transferring publisher ownership is a separate gated action (see ADR 016 for the lifecycle).
+
+A **namespace** is a publisher-owned `uint256` identifier under which blob hashes are claimed. Publishers may register multiple namespaces (subject to the anti-squatting cap in [ADR 009](009-governance.md)) so that distinct content sets can be governed independently — for example, a media company may operate one namespace per product line so that takedowns and origin assignments for one product do not entangle the others.
+
+A **content claim** is an on-chain binding of a `(namespaceId, blake3Hash)` pair, recorded by the namespace's owner via `PublisherRegistry.claimContent`. Claims are append-only and content-immutable: once a hash is claimed under a namespace it cannot be moved, but the underlying bytes are untouched (BLAKE3 makes the hash binding cryptographic). Claims are the authoritative on-chain answer to "is this blob in a registered namespace, and if so which one?".
+
+### Default-open namespace
+
+A reserved namespace ID (`namespaceId == 0`) is the **default-open namespace**. Any blob is implicitly claimed under it; no `claimContent` call is required. Any staked operator may serve as origin for a default-open blob — the DAO has no positive authority over default-open content. This preserves the long-tail content-availability story: small publishers, ad-hoc uploads, and content whose owner has never interacted with the registry remain permissionlessly servable without a registration step. Publishers seeking durability guarantees, takedown accountability, or DAO-supervised origin sets opt in by registering and claiming under a non-zero namespace.
+
+A blob may be claimed under at most one non-zero namespace. If a publisher wants to assert ownership of a blob currently in default-open, the claim succeeds and the blob is thereafter governed under the registered namespace; the default-open implicit claim is overridden. Two publishers attempting to claim the same hash under different namespaces is resolved first-write-wins at the contract layer (see [ADR 016](016-contract-interactions.md) for the dispute resolution rules and the consequences if a second claim is rejected).
+
+### Why this lives in ADR 002
+
+Content identity (the BLAKE3 hash) and publisher identity are paired: every claim is a binding between the two. Defining publisher and namespace here keeps the identity primitives in one place so that ADRs 011 (governance authority), 016 (contract surface), 005 (probe-time enforcement), and 022 (DHT publication semantics) can refer back to a single canonical definition.
+
+### Contract: PublisherRegistry
+
+```solidity
+interface IPublisherRegistry {
+    // Publisher registration — permissionless, one-shot per address
+    function registerPublisher() external returns (uint256 publisherId);
+
+    // Namespace lifecycle — only callable by the namespace owner (or DEFAULT_ADMIN_ROLE)
+    function createNamespace() external returns (uint256 namespaceId);
+
+    // Namespace ownership transfer with a 7-day timelock.
+    // initiateTransfer queues the transfer; finalizeTransfer completes it after
+    // the timelock; cancelTransfer (callable by current owner only) aborts.
+    function initiateNamespaceTransfer(uint256 namespaceId, address newOwner) external;
+    function finalizeNamespaceTransfer(uint256 namespaceId) external;
+    function cancelNamespaceTransfer(uint256 namespaceId) external;
+
+    // Content claim — only callable by the namespace's current owner.
+    // First-write-wins across non-zero namespaces; reverts if the hash is already
+    // claimed under a different non-zero namespace. Claiming a hash currently
+    // implicit in default-open (namespaceId == 0) succeeds and overrides.
+    function claimContent(uint256 namespaceId, bytes32 blake3Hash) external;
+
+    // Views
+    function namespaceOf(bytes32 blake3Hash) external view returns (uint256 namespaceId);
+    function ownerOf(uint256 namespaceId) external view returns (address);
+    function namespaceCount(address publisher) external view returns (uint256);
+    function pendingTransfer(uint256 namespaceId) external view returns (address newOwner, uint256 readyAt);
+
+    // Events
+    event PublisherRegistered(address indexed publisher, uint256 indexed publisherId);
+    event NamespaceCreated(uint256 indexed namespaceId, address indexed owner);
+    event NamespaceTransferInitiated(uint256 indexed namespaceId, address indexed from, address indexed to, uint256 readyAt);
+    event NamespaceTransferred(uint256 indexed namespaceId, address indexed from, address indexed to);
+    event ContentClaimed(uint256 indexed namespaceId, bytes32 indexed blake3Hash, address indexed claimant);
+}
+```
+
+`namespaceOf(hash)` returns `0` for any hash not explicitly claimed; that is the default-open namespace. The view never reverts on unknown hashes — callers cannot distinguish "hash unknown to the protocol" from "hash served as default-open" via this view, which is correct: both states are operationally identical.
+
+Per-publisher namespace cap and ownership-transfer timelock are governable parameters with safety bounds (see [ADR 009](009-governance.md)). The 7-day default transfer timelock is documented for clarity; the contract reads its current value from the governance-controlled parameter store at call time.
+
+> **PoC simplification.** During the PoC, `PublisherRegistry` is admin-key controlled (the deployer EOA can override any publisher action) consistent with the broader admin-key governance model in [ADR 009](009-governance.md). The interface above describes the production semantics; the PoC adds an `onlyOwner` escape hatch that is removed when admin authority transfers to the timelock.
+
 ## Consequences
 
 **Positive:**

@@ -7,7 +7,7 @@
 
 A decentralized CDN with two participant roles:
 
-- **Nodes** (providers) cache and serve content. They stake TOKEN to participate in the peer mesh and compete on price and latency. Some nodes are configured with an origin backend (S3, NFS, local disk) making them the canonical source for specific content — this is a deployment choice, not a protocol distinction. No external origin URL is ever exposed.
+- **Nodes** (providers) cache and serve content. They stake TOKEN to participate in the peer mesh and compete on price and latency. Some nodes are configured with an origin backend (S3, NFS, local disk) making them the canonical source for specific content. The **cache role** is permissionless — any staked operator may pull cached blobs from authorized origins and re-serve them. The **origin role** is permissionless for default-open content and DAO-governed for content claimed in a registered namespace, where only operators in the namespace's `OriginAssignment` set may serve as origin (see [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority) and [ADR 002 § Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces)). No external origin URL is ever exposed.
 - **Clients** consume content. They pay nodes per MB via off-chain payment channels.
 
 ## System Diagram
@@ -202,6 +202,8 @@ The canonical glossary lives in [`README.md` § Glossary](README.md#glossary), g
 ## Origin Integration
 
 Some nodes are configured with an origin backend (S3, R2, Backblaze B2, self-hosted MinIO, NFS, or local disk). They are the source of truth for all blobs but are accessed as infrequently as possible — only when no peer node has the content.
+
+Whether a node may *advertise* itself as origin (responding `is_origin: true` to probes) for content in a registered namespace is governed on-chain via `OriginAssignment` — see [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority). Configuring an origin backend locally is necessary but not sufficient: an unauthorized operator that holds the bytes serves them as cache (`has_blob: true, is_origin: false`) rather than as origin, and the published-content owner controls which operators are authorized to act as canonical sources. Default-open content (`namespaceId == 0`) is exempt — any staked operator with an origin backend may serve as origin without DAO authorization.
 
 ### Supported Origins
 
