@@ -14,14 +14,8 @@
 //! Non-Unix platforms skip these checks — POSIX mode bits do not map
 //! meaningfully to NTFS ACLs.
 //!
-//! New keys are built by drawing 32 random bytes from `rand::rng()`
-//! (rand 0.10's auto-seeded `ThreadRng`, backed by OS entropy via
-//! `getrandom`) and feeding them to [`SecretKey::from_bytes`]. We go
-//! through raw bytes rather than `SecretKey::generate(&mut rand::rng())`
-//! because iroh 0.97 still pins `rand_core 0.9`, so rand 0.10's
-//! `ThreadRng` does not satisfy iroh's `CryptoRng` bound — the
-//! `rand_core` trait lives in two incompatible versions in the dep
-//! graph.
+//! New keys are built via [`SecretKey::generate`], which draws from
+//! the auto-seeded thread-local CSPRNG backed by OS entropy.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -216,13 +210,8 @@ fn load_from(path: &Path) -> anyhow::Result<SecretKey> {
     Ok(SecretKey::from_bytes(&arr))
 }
 
-/// Build a fresh `SecretKey` from 32 random bytes drawn from
-/// [`rand::rng()`]. See module-level docs for why we don't use
-/// `SecretKey::generate` directly.
 pub(crate) fn fresh_secret_key() -> SecretKey {
-    let mut bytes = [0u8; 32];
-    rand::rng().fill_bytes(&mut bytes);
-    SecretKey::from_bytes(&bytes)
+    SecretKey::generate()
 }
 
 /// Write `bytes` to `path` atomically. On Unix the temp file is created with

@@ -173,18 +173,9 @@ mod tests {
         GOSSIP_VERSION, GossipEnvelope, GossipPayload, LoadHint, NodeAnnounce, NodeAnnounceBody,
     };
     use iroh::SecretKey;
-    use rand::Rng;
 
-    /// Build a fresh `SecretKey` by drawing 32 random bytes and feeding
-    /// them to `SecretKey::from_bytes`. We can't call
-    /// `SecretKey::generate(&mut rand::rng())` because iroh 0.97 pins
-    /// `rand_core 0.9` while this crate uses rand 0.10, so the two
-    /// `CryptoRng` traits don't match. Going through raw bytes
-    /// sidesteps the trait-version mismatch entirely.
     fn fresh_key() -> SecretKey {
-        let mut bytes = [0u8; 32];
-        rand::rng().fill_bytes(&mut bytes);
-        SecretKey::from_bytes(&bytes)
+        SecretKey::generate()
     }
 
     /// Freeze the Prometheus label strings: a rename without updating this

@@ -197,6 +197,7 @@ pub async fn probe(args: &cli::ProbeArgs) -> anyhow::Result<()> {
         message::{ProbeRequest, ProbeResponse},
         read_frame, write_frame,
     };
+    use iroh::endpoint::presets;
     use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl};
     use rand::Rng;
 
@@ -223,7 +224,7 @@ pub async fn probe(args: &cli::ProbeArgs) -> anyhow::Result<()> {
     };
 
     let client_sk = fresh_secret_key();
-    let endpoint = Endpoint::empty_builder()
+    let endpoint = Endpoint::builder(presets::Minimal)
         .secret_key(client_sk)
         .relay_mode(relay_mode)
         .bind_addr(bind_addr)

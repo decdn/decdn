@@ -24,9 +24,9 @@ decdn-reputation = { path = "crates/reputation" }
 decdn-gossip = { path = "crates/gossip" }
 
 # Networking (iroh ecosystem, pinned per ADR 000)
-iroh = "0.97"
-iroh-blobs = { version = "0.99", features = ["fs-store"] }
-iroh-gossip = { version = "0.97", features = ["net"] }
+iroh = "0.98"
+iroh-blobs = { version = "0.100", features = ["fs-store"] }
+iroh-gossip = { version = "0.98", features = ["net"] }
 iroh-metrics = "0.38"
 
 # Async runtime
@@ -69,7 +69,7 @@ rand = "0.10"
 url = "2"
 
 # HTTP client (used by cache-origin backend)
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json"] }
 
 # Test-only helpers
 tempfile = "3"
