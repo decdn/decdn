@@ -25,6 +25,31 @@
 //!
 //! On parse error, previous values are retained: the reload is
 //! best-effort and a malformed file must never crash a running node.
+//!
+//! ## Section trait
+//!
+//! Each reloadable knob is a `ReloadableSection` impl. The trait
+//! drives a fixed three-phase iteration in [`RuntimeReloadState::reload`]:
+//!
+//! 1. **Resolve every section.** Any failure → return early, previous
+//!    values retained for *every* section (the all-or-nothing contract).
+//!    Resolved values are stashed in a per-section buffer cell
+//!    (`Mutex<Option<Self::Resolved>>`) so the trait stays `dyn`-safe
+//!    despite each section having its own `Resolved` type.
+//! 2. **Run every `fallible_commit`.** The log-level filter swap is the
+//!    only currently-fallible commit. This phase is the rollback
+//!    boundary: commits already applied stay applied; a later failure
+//!    aborts the rest. (The old monolithic body had the same property,
+//!    documented inline; the trait makes it explicit.)
+//! 3. **Run every `infallible_swap`.** Atomic stores, `ArcSwap` swaps,
+//!    `ConnectionLimiter::reload`, and the per-section "applied"
+//!    tracing event live here. None can fail.
+//!
+//! The buffer cell is emptied at the start of every `reload()`, filled
+//! by `resolve`, read by `fallible_commit`, and drained by
+//! `infallible_swap`. A panic between `resolve` and `infallible_swap`
+//! would leave a buffer populated; the next `reload()`'s clear step
+//! evicts it before anything else runs.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -61,61 +86,373 @@ pub struct ReloadSnapshot {
 /// filter-parse failures from the new directive string.
 pub type LogLevelSetter = Box<dyn Fn(LogLevel) -> anyhow::Result<()> + Send + Sync + 'static>;
 
+// ---------------------------------------------------------------------------
+// Reloadable-section trait + section impls
+// ---------------------------------------------------------------------------
+
+/// One reloadable config section.
+///
+/// The three phases (`resolve` → `fallible_commit` → `infallible_swap`)
+/// are driven in lockstep by [`RuntimeReloadState::reload`]: phase N runs
+/// for *every* section before phase N+1 starts. That ordering is what
+/// gives the all-or-nothing contract — a section that fails to resolve
+/// aborts the reload before any other section's commit runs.
+///
+/// Each impl owns a `Mutex<Option<Resolved>>` buffer cell. `resolve`
+/// fills it; `fallible_commit` reads it; `infallible_swap` drains it.
+/// `clear_buffer` empties the cell at the start of every reload to
+/// recover from a panic-mid-reload that left a stale value behind. The
+/// associated `Resolved` type stays internal to each impl, so the
+/// trait stays `dyn`-safe.
+pub(crate) trait ReloadableSection: Send + Sync {
+    /// Stable identifier for tracing event keys and snapshot-diff
+    /// machinery. Returning `&'static str` keeps it cheap and
+    /// non-allocating in the hot path.
+    fn name(&self) -> &'static str;
+
+    /// Drop any value lingering in the buffer cell.
+    ///
+    /// Called once per `reload()` before phase 1 to keep the cell
+    /// invariant ("populated only between `resolve` and `infallible_swap`")
+    /// robust across previous panic-mid-reload paths. A poisoned mutex
+    /// is recovered in place — losing the previous (now stale) value
+    /// is the desired outcome.
+    fn clear_buffer(&self);
+
+    /// Phase 1: re-resolve from file, store the result in the section's
+    /// buffer cell. May fail; on failure the entire reload is rolled
+    /// back before any commit runs.
+    fn resolve(&self, file: &FileConfig) -> anyhow::Result<()>;
+
+    /// Phase 2: any commit step that can fail (e.g. swapping the live
+    /// tracing filter). Default: no-op. The order of `fallible_commit`
+    /// across sections is the same registration order as `resolve` and
+    /// `infallible_swap`. **Rollback boundary:** once one section's
+    /// `fallible_commit` returns `Ok`, that side-effect stays applied
+    /// even if a later section's `fallible_commit` fails. This matches
+    /// the old monolithic behaviour; the trait just makes it explicit.
+    fn fallible_commit(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Phase 3: drain the buffer and apply the change to live state.
+    /// Must not fail — atomic stores, `Arc` swaps, and `ConnectionLimiter::reload`
+    /// are the only operations allowed here.
+    fn infallible_swap(&self);
+}
+
+/// Helper for the buffer-cell pattern. Each section keeps a
+/// `Mutex<Option<Resolved>>`; this expression captures the "drain or log
+/// and skip" idiom without each `infallible_swap` re-implementing it.
+fn drain_or_log<T>(slot: &std::sync::Mutex<Option<T>>, section: &'static str) -> Option<T> {
+    match slot.lock() {
+        Ok(mut g) => g.take(),
+        Err(poisoned) => {
+            tracing::error!(
+                section,
+                "section buffer mutex poisoned during infallible_swap; \
+                 swap skipped (previous value retained on the live path)"
+            );
+            // Drop the (possibly poisoned) value defensively.
+            let _ = poisoned.into_inner().take();
+            None
+        }
+    }
+}
+
+// ----- payment ------------------------------------------------------------
+
+/// Reloadable `[payment]` section. Owns the shared `Arc<AtomicU64>`
+/// behind `payment.rate_per_mb` so the probe handler reads the current
+/// value without a lock.
+struct PaymentSection {
+    cli: PaymentArgs,
+    rate_per_mb: Arc<AtomicU64>,
+    /// Last applied rate, retained across reloads for the per-section
+    /// `prev_rate_per_mb` field on the success line.
+    buf: std::sync::Mutex<Option<ResolvedPayment>>,
+}
+
+impl ReloadableSection for PaymentSection {
+    fn name(&self) -> &'static str {
+        "payment"
+    }
+    fn clear_buffer(&self) {
+        if let Ok(mut g) = self.buf.lock() {
+            *g = None;
+        }
+    }
+    fn resolve(&self, file: &FileConfig) -> anyhow::Result<()> {
+        let resolved = resolve_payment(&self.cli, file.payment.as_ref())?;
+        if let Ok(mut g) = self.buf.lock() {
+            *g = Some(resolved);
+        }
+        Ok(())
+    }
+    fn infallible_swap(&self) {
+        let Some(resolved) = drain_or_log(&self.buf, self.name()) else {
+            return;
+        };
+        let prev = self
+            .rate_per_mb
+            .swap(resolved.rate_per_mb, Ordering::Relaxed);
+        tracing::info!(
+            section = self.name(),
+            rate_per_mb = resolved.rate_per_mb,
+            prev_rate_per_mb = prev,
+            "config reload section applied"
+        );
+    }
+}
+
+// ----- log_level ----------------------------------------------------------
+
+/// Reloadable observability log level. The full `[observability]`
+/// section isn't reloadable (`metrics_port`, `log_format`, etc. all
+/// need a restart), but the level is. Other sub-fields fall through
+/// to the "ignored field X (requires restart)" diff machinery in
+/// `log_ignored_observability`.
+struct LogLevelSection {
+    cli: ObservabilityArgs,
+    setter: LogLevelSetter,
+    /// Cached log level last applied. `None` until the first successful
+    /// reload — the live `EnvFilter` at startup may be a `RUST_LOG`
+    /// directive we cannot reflect back into a `LogLevel`, so we force
+    /// the first reload to apply unconditionally and only thereafter
+    /// suppress no-op writes.
+    current: std::sync::Mutex<Option<LogLevel>>,
+    buf: std::sync::Mutex<Option<ResolvedObservability>>,
+    /// Set by `fallible_commit` so `infallible_swap` knows whether the
+    /// setter actually ran (we only update the cached `current` on a
+    /// real apply, not on a skip — keeps "first reload always applies"
+    /// honest).
+    swap_applied: std::sync::Mutex<bool>,
+}
+
+impl ReloadableSection for LogLevelSection {
+    fn name(&self) -> &'static str {
+        "log_level"
+    }
+    fn clear_buffer(&self) {
+        if let Ok(mut g) = self.buf.lock() {
+            *g = None;
+        }
+        if let Ok(mut g) = self.swap_applied.lock() {
+            *g = false;
+        }
+    }
+    fn resolve(&self, file: &FileConfig) -> anyhow::Result<()> {
+        let resolved = resolve_observability(&self.cli, file.observability.as_ref())?;
+        if let Ok(mut g) = self.buf.lock() {
+            *g = Some(resolved);
+        }
+        Ok(())
+    }
+    fn fallible_commit(&self) -> anyhow::Result<()> {
+        // Read (don't drain) the buffer — `infallible_swap` still needs
+        // the value to update the cached `current` and emit the
+        // tracing line.
+        let new_level = {
+            let g = self
+                .buf
+                .lock()
+                .map_err(|_| anyhow::anyhow!("log-level buffer mutex poisoned"))?;
+            match g.as_ref() {
+                Some(r) => r.log_level,
+                // `resolve` populates the buffer on success; if it's
+                // empty here something upstream skipped the section,
+                // which is a bug. Fail loud rather than silently no-op.
+                None => return Err(anyhow::anyhow!("log-level buffer empty in fallible_commit")),
+            }
+        };
+        // Lock the cached level for the duration of the change so a
+        // racing reload can't observe a half-updated state.
+        let mut current = self
+            .current
+            .lock()
+            .map_err(|_| anyhow::anyhow!("log-level mutex poisoned"))?;
+        // First reload (current is `None`) always applies — see the
+        // struct's `current` doc.
+        let log_level_changed = match *current {
+            None => true,
+            Some(prev) => prev != new_level,
+        };
+        if log_level_changed && let Err(err) = (self.setter)(new_level) {
+            tracing::warn!(%err, ?new_level, "failed to apply new log level; previous level retained");
+            return Err(err);
+        }
+        if log_level_changed {
+            *current = Some(new_level);
+            if let Ok(mut g) = self.swap_applied.lock() {
+                *g = true;
+            }
+        }
+        Ok(())
+    }
+    fn infallible_swap(&self) {
+        let Some(resolved) = drain_or_log(&self.buf, self.name()) else {
+            return;
+        };
+        let log_level_changed = self.swap_applied.lock().map(|g| *g).unwrap_or(false);
+        tracing::info!(
+            section = self.name(),
+            log_level = %resolved.log_level,
+            log_level_changed,
+            "config reload section applied"
+        );
+    }
+}
+
+// ----- pinned_hashes ------------------------------------------------------
+
+/// Reloadable `cache.pinned_hashes`. The rest of `cache.*`
+/// (`cache_dir`, sizes, origin, `decompress`) is not hot-reloadable.
+struct PinnedHashesSection {
+    /// Optional handle to the live cache engine. `None` in unit tests
+    /// that exercise reload semantics without a real engine; populated
+    /// in production via [`RuntimeReloadState::attach_cache`] before
+    /// the SIGHUP select loop runs.
+    engine: std::sync::Mutex<Option<decdn_cache::CacheEngine>>,
+    buf: std::sync::Mutex<Option<decdn_cache::PinnedHashes>>,
+}
+
+impl ReloadableSection for PinnedHashesSection {
+    fn name(&self) -> &'static str {
+        "pinned_hashes"
+    }
+    fn clear_buffer(&self) {
+        if let Ok(mut g) = self.buf.lock() {
+            *g = None;
+        }
+    }
+    fn resolve(&self, file: &FileConfig) -> anyhow::Result<()> {
+        let resolved =
+            parse_pinned_hashes(file.cache.as_ref().and_then(|c| c.pinned_hashes.as_deref()))?;
+        if let Ok(mut g) = self.buf.lock() {
+            *g = Some(resolved);
+        }
+        Ok(())
+    }
+    fn infallible_swap(&self) {
+        let Some(resolved) = drain_or_log(&self.buf, self.name()) else {
+            return;
+        };
+        let pinned_count = resolved.len();
+        // The engine slot lock can be poisoned (see
+        // `attach_cache`'s recovery path). On poison we forfeit the
+        // swap rather than panic — operationally indistinguishable
+        // from "cache not yet attached" and the same dedicated tracing
+        // line covers it.
+        let pin_diff = if let Ok(g) = self.engine.lock() {
+            g.as_ref().map(|engine| engine.set_pinned(&resolved))
+        } else {
+            tracing::error!(
+                section = self.name(),
+                "cache engine mutex poisoned in infallible_swap; pinning skipped"
+            );
+            None
+        };
+        let pinned_skipped_no_cache_attached = pin_diff.is_none();
+        tracing::info!(
+            section = self.name(),
+            pinned_hashes = pinned_count,
+            pinned_added = pin_diff.map(|d| d.added),
+            pinned_removed = pin_diff.map(|d| d.removed),
+            pinned_skipped_no_cache_attached,
+            cache_attached = pin_diff.is_some(),
+            "config reload section applied"
+        );
+    }
+}
+
+// ----- security -----------------------------------------------------------
+
+/// Reloadable `[security]` section.
+struct SecuritySection {
+    /// Optional handle to the live `ConnectionLimiter`. Same lifecycle
+    /// rules as `PinnedHashesSection::engine` — populated via
+    /// [`RuntimeReloadState::attach_limiter`] before the select loop.
+    limiter: std::sync::Mutex<Option<Arc<ConnectionLimiter>>>,
+    buf: std::sync::Mutex<Option<ResolvedSecurity>>,
+}
+
+impl ReloadableSection for SecuritySection {
+    fn name(&self) -> &'static str {
+        "security"
+    }
+    fn clear_buffer(&self) {
+        if let Ok(mut g) = self.buf.lock() {
+            *g = None;
+        }
+    }
+    fn resolve(&self, file: &FileConfig) -> anyhow::Result<()> {
+        let resolved = resolve_security(file.security.as_ref())?;
+        if let Ok(mut g) = self.buf.lock() {
+            *g = Some(resolved);
+        }
+        Ok(())
+    }
+    fn infallible_swap(&self) {
+        let Some(resolved) = drain_or_log(&self.buf, self.name()) else {
+            return;
+        };
+        let security_attached = if let Ok(g) = self.limiter.lock() {
+            if let Some(lim) = g.as_ref() {
+                lim.reload(&resolved);
+                true
+            } else {
+                false
+            }
+        } else {
+            tracing::error!(
+                section = self.name(),
+                "limiter mutex poisoned in infallible_swap; security swap skipped"
+            );
+            false
+        };
+        tracing::info!(
+            section = self.name(),
+            security_attached,
+            max_concurrent_handlers = resolved.max_concurrent_handlers,
+            per_source_rate_per_sec = resolved.per_source_rate_per_sec,
+            max_tracked_sources = resolved.max_tracked_sources,
+            "config reload section applied"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RuntimeReloadState
+// ---------------------------------------------------------------------------
+
 /// Shared, mutable handles for the fields the runtime can hot-reload.
 ///
 /// Held inside an `Arc` so the SIGHUP handler and the `ProbeHandler` can
-/// both observe updates. Values are updated in place by
-/// [`RuntimeReloadState::reload`]; readers (e.g. the probe handler)
-/// load `rate_per_mb` with `Ordering::Relaxed` because the atomic carries no
-/// happens-before obligation to other state — it's a standalone config
-/// knob (the rate may move up *or* down across a SIGHUP), and readers
-/// tolerate seeing either generation across the swap.
+/// both observe updates. Each section is registered as both a concrete
+/// `Arc<SectionStruct>` (so `attach_*` and accessors can reach into its
+/// state) and as `Arc<dyn ReloadableSection>` (so `reload()` drives the
+/// three-phase iteration without a central match arm per section).
+///
+/// Adding a new reloadable knob: implement `ReloadableSection` for a
+/// new struct, `Arc` it once at construction, and append to the
+/// `sections` vec — no central touch of `RuntimeReloadState::reload`.
 pub struct RuntimeReloadState {
-    /// CLI overrides as parsed at startup. CLI > file > default precedence
-    /// is preserved across reloads — a CLI flag set once at launch keeps
-    /// winning until the process restarts.
-    payment_cli: PaymentArgs,
-    /// CLI overrides for observability fields.
-    observability_cli: ObservabilityArgs,
-    /// Current `payment.rate_per_mb`. Probe handler reads this on every
-    /// request via [`Self::rate_per_mb`].
-    rate_per_mb: Arc<AtomicU64>,
-    /// Closure to apply a new log-level directive to the running tracing
-    /// subscriber.
-    log_level_setter: LogLevelSetter,
-    /// Optional handle to the live cache engine. When present, SIGHUP
-    /// reloads re-parse `cache.pinned_hashes` and atomically swap the
-    /// engine's pinned set (#276). Held as `Option` so unit tests that
-    /// exercise reload semantics without a real cache engine can pass
-    /// `None` — the cache is initialised after `RuntimeReloadState::new`
-    /// in the runtime startup sequence, then attached via
-    /// [`Self::attach_cache`].
-    cache: std::sync::Mutex<Option<decdn_cache::CacheEngine>>,
-    /// Optional handle to the live connection limiter. When present,
-    /// SIGHUP reloads forward the resolved `ResolvedSecurity` to
-    /// [`ConnectionLimiter::reload`] so the live token-bucket maps and
-    /// semaphore cap reflect the new file. Held as `Option` for the
-    /// same reason as `cache` — the limiter is built after
-    /// `RuntimeReloadState::new` in `runtime::run`, then attached via
-    /// [`Self::attach_limiter`]. Tests exercising reload semantics
-    /// without a real limiter pass `None` and the security commit
-    /// becomes a parse-and-validate-only no-op.
-    limiter: std::sync::Mutex<Option<Arc<ConnectionLimiter>>>,
-    /// Cached log level that was last applied. `None` until the first
-    /// successful reload — this forces the first SIGHUP to apply the file
-    /// value unconditionally, since the live `EnvFilter` at startup may
-    /// have been built from `RUST_LOG` rather than the resolved config
-    /// (see `commands::run`). Tracking "what we last applied" rather than
-    /// "what the resolved config said at startup" is what the setter
-    /// actually controls.
-    current_log_level: std::sync::Mutex<Option<LogLevel>>,
+    payment: Arc<PaymentSection>,
+    log_level: Arc<LogLevelSection>,
+    pinned: Arc<PinnedHashesSection>,
+    security: Arc<SecuritySection>,
+    /// Iteration order for the three-phase reload. Matches the order
+    /// the previous monolithic body used (`payment`, `log_level`,
+    /// `pinned_hashes`, `security`) so the user-visible commit ordering
+    /// across sections doesn't shift behind the refactor.
+    sections: Vec<Arc<dyn ReloadableSection>>,
     /// Per-section snapshot of the *previously seen* file contents,
     /// captured as `serde_json::Value` for cheap structural diffing.
-    /// Only sections covered by [`log_ignored_other_sections`] are
-    /// tracked; we use them to suppress the noisy "ignored (requires
-    /// restart)" line when the operator hasn't actually changed anything
-    /// in those sections between reloads. Updated only after a fully
-    /// successful reload so a rejected file doesn't poison future diffs.
+    /// Cross-cutting (not a `ReloadableSection`) — used to suppress
+    /// the noisy "ignored (requires restart)" line when the operator
+    /// hasn't actually changed anything in those sections between
+    /// reloads. Updated only after a fully successful reload so a
+    /// rejected file doesn't poison future diffs.
     last_file_sections: std::sync::Mutex<FileSectionSnapshot>,
 }
 
@@ -184,8 +521,11 @@ fn snap_section<T: serde::Serialize>(
 impl std::fmt::Debug for RuntimeReloadState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RuntimeReloadState")
-            .field("rate_per_mb", &self.rate_per_mb.load(Ordering::Relaxed))
-            .field("current_log_level", &self.current_log_level)
+            .field(
+                "rate_per_mb",
+                &self.payment.rate_per_mb.load(Ordering::Relaxed),
+            )
+            .field("current_log_level", &self.log_level.current)
             .finish_non_exhaustive()
     }
 }
@@ -207,14 +547,45 @@ impl RuntimeReloadState {
         initial: &crate::config::ResolvedConfig,
         log_level_setter: LogLevelSetter,
     ) -> Self {
-        Self {
-            payment_cli,
-            observability_cli,
+        let payment = Arc::new(PaymentSection {
+            cli: payment_cli,
             rate_per_mb: Arc::new(AtomicU64::new(initial.payment.rate_per_mb)),
-            log_level_setter,
-            cache: std::sync::Mutex::new(None),
+            buf: std::sync::Mutex::new(None),
+        });
+        let log_level = Arc::new(LogLevelSection {
+            cli: observability_cli,
+            setter: log_level_setter,
+            current: std::sync::Mutex::new(None),
+            buf: std::sync::Mutex::new(None),
+            swap_applied: std::sync::Mutex::new(false),
+        });
+        let pinned = Arc::new(PinnedHashesSection {
+            engine: std::sync::Mutex::new(None),
+            buf: std::sync::Mutex::new(None),
+        });
+        let security = Arc::new(SecuritySection {
             limiter: std::sync::Mutex::new(None),
-            current_log_level: std::sync::Mutex::new(None),
+            buf: std::sync::Mutex::new(None),
+        });
+        // Registration order is the same as the old monolithic body's
+        // commit order: payment, log_level, pinned_hashes, security.
+        // The order matters for reproducibility (operator-visible
+        // tracing event order) and for the rollback-boundary contract
+        // documented on the trait — moving log_level later or earlier
+        // would change which pre-log_level commits survive a setter
+        // failure.
+        let sections: Vec<Arc<dyn ReloadableSection>> = vec![
+            Arc::clone(&payment) as _,
+            Arc::clone(&log_level) as _,
+            Arc::clone(&pinned) as _,
+            Arc::clone(&security) as _,
+        ];
+        Self {
+            payment,
+            log_level,
+            pinned,
+            security,
+            sections,
             last_file_sections: std::sync::Mutex::new(FileSectionSnapshot::default()),
         }
     }
@@ -228,15 +599,12 @@ impl RuntimeReloadState {
     /// the inner value via `PoisonError::into_inner()`, but the poison
     /// flag is *not* cleared — `Mutex::lock()` will return `Err` again
     /// the next time anyone tries to take the guard. The first
-    /// subsequent `reload()` will therefore fail-stop with `"cache
-    /// attach mutex poisoned"`, retaining the previous values for
-    /// every section. Recovery here ensures the new engine is at least
-    /// stored for the (non-reload-driven) live path; it does not
-    /// resurrect future reloads. Silently no-op'ing on the poison would
-    /// have been worse — it would leave subsequent reloads applying
-    /// `pinned_hashes` against a stale engine forever.
+    /// subsequent `reload()` will therefore skip the pinned-set swap
+    /// for that section (see `PinnedHashesSection::infallible_swap`).
+    /// Recovery here ensures the new engine is at least stored for the
+    /// (non-reload-driven) live path.
     pub fn attach_cache(&self, engine: Option<decdn_cache::CacheEngine>) {
-        match self.cache.lock() {
+        match self.pinned.engine.lock() {
             Ok(mut guard) => *guard = engine,
             Err(poisoned) => {
                 tracing::error!(
@@ -250,11 +618,9 @@ impl RuntimeReloadState {
     /// Attach the live `ConnectionLimiter` after it's been built. Same
     /// shape as [`Self::attach_cache`]: must be called before the SIGHUP
     /// select loop, supports `None` for tests, recovers from a poisoned
-    /// mutex by replacing the inner state. The poison-handling story is
-    /// the same as `attach_cache` — see that doc for the fail-stop
-    /// guarantee on subsequent reloads.
+    /// mutex by replacing the inner state.
     pub fn attach_limiter(&self, limiter: Option<Arc<ConnectionLimiter>>) {
-        match self.limiter.lock() {
+        match self.security.limiter.lock() {
             Ok(mut guard) => *guard = limiter,
             Err(poisoned) => {
                 tracing::error!(
@@ -275,9 +641,7 @@ impl RuntimeReloadState {
     /// the "config reload applied" success line.
     ///
     /// Idempotent. A poisoned mutex is recovered the same way
-    /// [`Self::attach_cache`] handles its slot — silently no-op'ing on
-    /// a poison would re-introduce the very UX bug this method exists
-    /// to fix.
+    /// [`Self::attach_cache`] handles its slot.
     pub fn seed_initial_file_snapshot(&self, file: &crate::config::FileConfig) {
         let snapshot = FileSectionSnapshot::capture(file);
         match self.last_file_sections.lock() {
@@ -295,7 +659,7 @@ impl RuntimeReloadState {
     /// handler at startup; subsequent reloads `store()` into this without
     /// rebuilding the handler.
     pub fn rate_per_mb(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.rate_per_mb)
+        Arc::clone(&self.payment.rate_per_mb)
     }
 
     /// Build a state for tests outside `runtime::reload::tests` that need
@@ -394,9 +758,9 @@ impl RuntimeReloadState {
     /// already received an `Ok(())` from `reload()` (so the rate value
     /// is authoritative); the snapshot is best-effort metadata.
     pub fn current(&self) -> ReloadSnapshot {
-        let log_level = self.current_log_level.lock().ok().and_then(|guard| *guard);
+        let log_level = self.log_level.current.lock().ok().and_then(|guard| *guard);
         ReloadSnapshot {
-            rate_per_mb: self.rate_per_mb.load(Ordering::Relaxed),
+            rate_per_mb: self.payment.rate_per_mb.load(Ordering::Relaxed),
             log_level,
         }
     }
@@ -408,20 +772,22 @@ impl RuntimeReloadState {
     /// returned error so a malformed reload never propagates and stops
     /// the node.
     ///
-    /// Ordering matters: every fallible step (file parse, sub-section
-    /// resolution, both mutex locks) runs *before* any committing
-    /// side-effect (log-level setter, atomic swap, snapshot write-back).
-    /// A partial reload that swapped the live tracing filter and *then*
-    /// hit a poisoned snapshot mutex would leave the running node in a
-    /// state the operator never saw in the file. Lock both mutexes
-    /// first, then commit in a single fall-through block where nothing
-    /// else can fail.
+    /// Three phases, each driven over the registered `sections` in registration
+    /// order:
     ///
-    /// This is a method (not a free function) so the "atomic swap is
-    /// the last committing step" rule lives next to the state it
-    /// guards: callers can't accidentally reorder against external
-    /// helpers, and the borrow checker tracks the `&self` lifetime
-    /// through the whole transactional block.
+    /// 1. **Resolve.** Each section re-derives its `Resolved` value from
+    ///    `file` (and any CLI overrides held on the section struct) and
+    ///    stashes it in its buffer cell. Any failure aborts the reload
+    ///    before any side-effect runs — the all-or-nothing contract.
+    /// 2. **Fallible commit.** The log-level filter swap is the only
+    ///    currently-fallible commit. **Rollback boundary:** commits
+    ///    that already succeeded stay applied even if a later section's
+    ///    `fallible_commit` fails. This matches the old monolithic
+    ///    behaviour; the trait makes it explicit.
+    /// 3. **Infallible swap.** Atomic stores, `Arc` swaps, and
+    ///    `ConnectionLimiter::reload`. Each section also emits a
+    ///    `config reload section applied` tracing event keyed by
+    ///    `section = name()`.
     ///
     /// Fields outside the reloadable set are diffed against the
     /// previously seen file contents (snapshot stored on `self`) and a
@@ -429,9 +795,8 @@ impl RuntimeReloadState {
     /// changed — operators see "you changed X but it needs a restart"
     /// without false positives on every routine SIGHUP.
     #[allow(
-        clippy::cognitive_complexity, // Diff/log/apply for two fields stays linear.
+        clippy::cognitive_complexity, // Three short loops + one read scope; reads better as one unit than split apart.
         clippy::unused_async, // Future-shaped on purpose: see below.
-        clippy::too_many_lines, // Linear "fallible work, then atomic commit" reads better as one unit than split apart.
     )]
     // `async` is preserved even though no body is currently `.await`ed:
     // the runtime select loop awaits this future inside `tokio::select!`
@@ -447,178 +812,101 @@ impl RuntimeReloadState {
             }
         };
 
-        // Re-resolve only the reloadable sections, preserving the same
-        // CLI > file > default precedence used at startup.
-        let new_payment: ResolvedPayment = match resolve_payment(
-            &self.payment_cli,
-            file.payment.as_ref(),
-        ) {
-            Ok(p) => p,
-            Err(err) => {
-                tracing::warn!(%err, "config reload aborted at [payment]; entire reload rolled back (all-or-nothing): payment, observability, cache.pinned_hashes, and security all retained at their previous values");
-                return Err(err);
-            }
-        };
-        let new_observability: ResolvedObservability = match resolve_observability(
-            &self.observability_cli,
-            file.observability.as_ref(),
-        ) {
-            Ok(o) => o,
-            Err(err) => {
-                tracing::warn!(%err, "config reload aborted at [observability]; entire reload rolled back (all-or-nothing): payment, observability, cache.pinned_hashes, and security all retained at their previous values");
-                return Err(err);
-            }
-        };
+        // Clear every section's buffer up-front so a panic-mid-reload
+        // from a previous attempt can't leave stale `Resolved` data
+        // behind. Each `clear_buffer` is infallible (poison-recovering).
+        for section in &self.sections {
+            section.clear_buffer();
+        }
 
-        // Re-parse `cache.pinned_hashes`. The vast majority of fields in
-        // `cache.*` aren't reloadable (cache_dir, sizes, origin), but
-        // pinned_hashes is — see #276. Parse here (fallible) so a
-        // malformed entry rejects the whole reload before any side
-        // effect runs, consistent with the "previous values retained on
-        // error" contract.
-        let new_pinned = match parse_pinned_hashes(
-            file.cache.as_ref().and_then(|c| c.pinned_hashes.as_deref()),
-        ) {
-            Ok(p) => p,
-            Err(err) => {
+        // Phase 1: resolve every section. Any failure → return early,
+        // no side-effects committed. The all-or-nothing contract.
+        for section in &self.sections {
+            if let Err(err) = section.resolve(&file) {
+                let name = section.name();
                 tracing::warn!(
                     %err,
-                    "config reload aborted at [cache.pinned_hashes]; entire reload rolled back (all-or-nothing): payment, observability, cache.pinned_hashes, and security all retained at their previous values"
+                    section = name,
+                    "config reload aborted at [{name}]; entire reload rolled back \
+                     (all-or-nothing): payment, observability, cache.pinned_hashes, \
+                     and security all retained at their previous values",
                 );
                 return Err(err);
             }
-        };
+        }
 
-        // Re-resolve `[security]`. All fields are hot-reloadable; an
-        // invalid value rejects the entire reload (all-or-nothing
-        // semantics — operators in incident-response don't want a typo
-        // here to silently leave half their reload applied).
-        let new_security: ResolvedSecurity = match resolve_security(file.security.as_ref()) {
-            Ok(s) => s,
-            Err(err) => {
-                tracing::warn!(
-                    %err,
-                    "config reload aborted at [security]; entire reload rolled back (all-or-nothing): payment, observability, cache.pinned_hashes, and security all retained at their previous values"
-                );
-                return Err(err);
-            }
-        };
-
-        // Lock the snapshot mutex *and* the cache and limiter attach
-        // slots before any committing side-effect. Holding all guards
-        // across the rest of the function serialises concurrent reloads
-        // (a second SIGHUP racing the first one waits here) and lets us
-        // treat the whole "apply log level + swap rate + swap pinned
-        // set + reload limiter + write back" path as one critical
-        // section. Acquiring the locks here is the *last* fallible
-        // step: a `PoisonError` on any of them must surface before the
-        // setter, the atomic swap, the pinned-set swap, or the limiter
-        // reload commit anything to live state.
-        let mut current = self
-            .current_log_level
-            .lock()
-            .map_err(|_| anyhow::anyhow!("log-level mutex poisoned"))?;
-        let mut sections = self
+        // Lock the snapshot mutex before the fallible-commit phase.
+        // Holding it across the rest of the function serialises
+        // concurrent reloads (a second SIGHUP racing the first one
+        // waits here) and makes the snapshot write-back at the end
+        // part of the same critical section. The lock acquisition is
+        // the *last* fallible step before phase 2; a `PoisonError`
+        // here surfaces before any commit runs, preserving the
+        // "previous values retained on error" contract.
+        let mut sections_snapshot_guard = self
             .last_file_sections
             .lock()
             .map_err(|_| anyhow::anyhow!("file-section snapshot mutex poisoned"))?;
-        let cache_guard = self
-            .cache
-            .lock()
-            .map_err(|_| anyhow::anyhow!("cache attach mutex poisoned"))?;
-        let limiter_guard = self
-            .limiter
-            .lock()
-            .map_err(|_| anyhow::anyhow!("limiter attach mutex poisoned"))?;
 
         // Diff non-reloadable sections against the previous snapshot
         // before committing. Emitting "ignored" lines is read-only and
         // we want them out of the way before the commit step.
-        log_ignored_fields(&file, &new_observability, &sections);
-
-        let new_level = new_observability.log_level;
-        // First reload (current is `None`) always applies, regardless
-        // of whether the file value matches the resolved-at-startup
-        // level — the live `EnvFilter` may be a `RUST_LOG` directive
-        // we can't reflect back into a `LogLevel`, so we defer the
-        // "is this a change?" judgement to the very first apply.
-        let log_level_changed = match *current {
-            None => true,
-            Some(prev) => prev != new_level,
-        };
-
-        // Commit step. Order within the commit:
-        //   1. log-level setter (only fallible commit; tracing filter swap)
-        //   2. atomic swap of rate_per_mb (infallible)
-        //   3. ArcSwap of cache.pinned set (infallible)
-        //   4. ConnectionLimiter::reload (infallible: lock_recover
-        //      handles poison; the global semaphore is replaced via an
-        //      atomic Arc swap with no fallible step)
-        //   5. write-back of cached values via the held guards (infallible)
-        // If the setter fails we bail before touching the rate atomic,
-        // pinned set, the limiter, or the snapshot caches — preserving
-        // the "previous values retained on error" contract. AtomicU64::
-        // swap, ArcSwap, ConnectionLimiter::reload, and the guard writes
-        // themselves cannot fail.
-        if log_level_changed && let Err(err) = (self.log_level_setter)(new_level) {
-            tracing::warn!(%err, ?new_level, "failed to apply new log level; previous level retained");
-            return Err(err);
+        //
+        // The log-level section needs the freshly resolved value to
+        // compare against the file's raw observability fields (the
+        // diff suppresses "ignored field X" lines that match what the
+        // resolver already honoured). Borrow it through the buffer's
+        // mutex guard rather than cloning — `infallible_swap` still
+        // needs the value and `ResolvedObservability` isn't `Clone`.
+        {
+            let buf_guard = self
+                .log_level
+                .buf
+                .lock()
+                .map_err(|_| anyhow::anyhow!("log-level buffer mutex poisoned"))?;
+            let new_observability = buf_guard
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("log-level buffer empty after resolve"))?;
+            log_ignored_fields(&file, new_observability, &sections_snapshot_guard);
         }
-        let prev_rate = self
-            .rate_per_mb
-            .swap(new_payment.rate_per_mb, Ordering::Relaxed);
-        let pinned_count = new_pinned.len();
-        // Swap the cache engine's pinned set if a cache is attached.
-        // `cache_guard` was acquired up top with the rest of the
-        // mutexes, so a poisoned mutex was already returned as an error
-        // before any commit step. `None` here is the no-cache-attached
-        // case (unit tests, very early startup) and a routine no-op.
-        // The `PinDiff` lets the success log line distinguish "applied
-        // (engine swapped)" from "parsed (no engine attached)" — log
-        // scrapers and operators reasoning about pin/unpin events
-        // shouldn't have to reverse-engineer the difference from a
-        // trailing pinned-set count alone.
-        let pin_diff = cache_guard
-            .as_ref()
-            .map(|engine| engine.set_pinned(&new_pinned));
-        // Apply the new security snapshot to the live limiter if one
-        // is attached. `None` matches `cache_guard.as_ref()` semantics
-        // — early-startup and unit-test contexts run the parse-and-
-        // validate path without touching a live limiter.
-        let security_attached = limiter_guard.as_ref().is_some();
-        if let Some(lim) = limiter_guard.as_ref() {
-            lim.reload(&new_security);
-        }
-        *current = Some(new_level);
-        *sections = FileSectionSnapshot::capture(&file);
-        drop(current);
-        drop(sections);
-        drop(cache_guard);
-        drop(limiter_guard);
 
-        // `pinned_added` / `pinned_removed` are emitted only when a cache
-        // is attached. When none is (early startup / unit tests) we
-        // signal that with `pinned_skipped_no_cache_attached = true` so
-        // log scrapers don't see a zero count and conclude "no pins
-        // changed" — they did, the engine just wasn't there to apply
-        // them.
-        let pinned_skipped_no_cache_attached = pin_diff.is_none();
-        tracing::info!(
-            rate_per_mb = new_payment.rate_per_mb,
-            prev_rate_per_mb = prev_rate,
-            log_level = %new_level,
-            log_level_changed,
-            pinned_hashes = pinned_count,
-            pinned_added = pin_diff.map(|d| d.added),
-            pinned_removed = pin_diff.map(|d| d.removed),
-            pinned_skipped_no_cache_attached,
-            cache_attached = pin_diff.is_some(),
-            security_attached,
-            max_concurrent_handlers = new_security.max_concurrent_handlers,
-            per_source_rate_per_sec = new_security.per_source_rate_per_sec,
-            max_tracked_sources = new_security.max_tracked_sources,
-            "config reload applied"
-        );
+        // Phase 2: fallible commits. The log-level section is the only
+        // one that can fail here today; future sections may add more.
+        // Rollback boundary: a section that already returned `Ok`
+        // stays applied even if a later section fails. Surface the
+        // first error and let the caller log/return.
+        for section in &self.sections {
+            if let Err(err) = section.fallible_commit() {
+                // Sections that already committed in this loop stay
+                // applied — that's the rollback boundary. We do *not*
+                // run any infallible_swap to avoid driving sections
+                // partway through a phase. This matches the old
+                // monolithic body's behaviour where a setter failure
+                // returned before the rate atomic swap.
+                tracing::warn!(
+                    %err,
+                    section = section.name(),
+                    "config reload fallible_commit failed; later sections skipped"
+                );
+                return Err(err);
+            }
+        }
+
+        // Phase 3: infallible swaps. None can fail.
+        for section in &self.sections {
+            section.infallible_swap();
+        }
+
+        // Write back the snapshot baseline so the next reload's diff
+        // compares against this file (not the previous one).
+        *sections_snapshot_guard = FileSectionSnapshot::capture(&file);
+        drop(sections_snapshot_guard);
+
+        // Final summary line, retained for backwards compatibility
+        // with any operators / log scrapers that grep for it. The
+        // per-section `config reload section applied` events carry
+        // the structured fields; this one is the "all done" marker.
+        tracing::info!("config reload applied");
         Ok(())
     }
 }
@@ -1062,11 +1350,11 @@ mod tests {
         let st = Arc::new(state);
         let st_for_thread = Arc::clone(&st);
         let join = std::thread::spawn(move || {
-            let _guard = st_for_thread.current_log_level.lock().unwrap();
+            let _guard = st_for_thread.log_level.current.lock().unwrap();
             panic!("intentional panic to poison mutex");
         });
         let _ = join.join(); // discard the panic payload
-        assert!(st.current_log_level.is_poisoned());
+        assert!(st.log_level.current.is_poisoned());
 
         let err = st.reload(&path).await.unwrap_err();
         assert!(format!("{err:#}").contains("log-level mutex poisoned"));
@@ -1121,7 +1409,7 @@ mod tests {
         let err = st.reload(&path).await.unwrap_err();
         assert!(format!("{err:#}").contains("file-section snapshot mutex poisoned"));
         // The setter must NOT have been called — that's the whole point
-        // of locking both mutexes before any committing side-effect.
+        // of locking the snapshot mutex before any committing side-effect.
         assert!(captured.lock().unwrap().is_none());
         // Rate atomic must not have moved either.
         assert_eq!(st.rate_per_mb().load(Ordering::Relaxed), 42);
@@ -1522,30 +1810,23 @@ mod tests {
         // Poison the cache mutex by panicking inside a held guard.
         let st_for_thread = Arc::clone(&state);
         let join = std::thread::spawn(move || {
-            let _guard = st_for_thread.cache.lock().unwrap();
+            let _guard = st_for_thread.pinned.engine.lock().unwrap();
             panic!("intentional panic to poison cache mutex");
         });
         let _ = join.join();
         assert!(
-            state.cache.is_poisoned(),
+            state.pinned.engine.is_poisoned(),
             "test setup: cache mutex should be poisoned"
         );
 
         // Recovery path: `attach_cache` must accept the new engine
-        // despite the poison and a subsequent reload must actually
-        // swap pinned hashes on it (proving recovery wasn't a silent
-        // no-op).
+        // despite the poison.
         let (cache, _tmp_cache) = build_test_cache().await;
         state.attach_cache(Some(cache.clone()));
 
-        // `attach_cache`'s `into_inner` recovery updates the slot but
-        // leaves the mutex's poison flag set (we don't call
-        // `clear_poison`). Subsequent `reload` calls will surface
-        // "cache attach mutex poisoned" — that's the deliberate
-        // fail-stop. The contract we lock in here is the narrower one:
-        // the new engine *was* stored, not silently dropped.
         let stored = state
-            .cache
+            .pinned
+            .engine
             .lock()
             .map_or_else(|p| p.into_inner().is_some(), |g| g.is_some());
         assert!(stored, "attach_cache must store engine despite poison");
@@ -1725,8 +2006,8 @@ mod tests {
         assert!(format!("{err:#}").contains("simulated tracing-reload failure"));
 
         // Limiter must NOT have been mutated — the per-node burst stays
-        // at the seed_resolved default (40), so two acquires from the
-        // same node still succeed.
+        // at the seed_resolved default (200), so two acquires from
+        // different IPs still succeed.
         let _p1 = limiter
             .acquire_for_test(Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
                 10, 0, 0, 1,
@@ -1740,8 +2021,8 @@ mod tests {
     }
 
     /// Mirror of `attach_cache_recovers_from_poisoned_mutex` for the
-    /// new `limiter` slot — silent no-op on a poisoned mutex would turn
-    /// every subsequent reload into a silent no-op for security.
+    /// limiter slot — silent no-op on a poisoned mutex would turn every
+    /// subsequent reload into a silent no-op for security.
     #[tokio::test]
     async fn attach_limiter_recovers_from_poisoned_mutex() {
         let initial = seed_resolved(10, LogLevel::Info);
@@ -1762,12 +2043,12 @@ mod tests {
 
         let st_for_thread = Arc::clone(&state);
         let join = std::thread::spawn(move || {
-            let _guard = st_for_thread.limiter.lock().unwrap();
+            let _guard = st_for_thread.security.limiter.lock().unwrap();
             panic!("intentional panic to poison limiter mutex");
         });
         let _ = join.join();
         assert!(
-            state.limiter.is_poisoned(),
+            state.security.limiter.is_poisoned(),
             "test setup: limiter mutex should be poisoned"
         );
 
@@ -1775,54 +2056,11 @@ mod tests {
         state.attach_limiter(Some(Arc::clone(&limiter)));
 
         let stored = state
+            .security
             .limiter
             .lock()
             .map_or_else(|p| p.into_inner().is_some(), |g| g.is_some());
         assert!(stored, "attach_limiter must store engine despite poison");
-    }
-
-    /// Mirror of `reload_keeps_log_level_when_sections_mutex_poisoned`
-    /// for the new `limiter` slot. Confirms the limiter-slot lock is
-    /// acquired *before* any commit step.
-    #[tokio::test]
-    async fn reload_keeps_security_when_limiter_mutex_poisoned() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_config(
-            dir.path(),
-            "[payment]\nrate_per_mb = 99\n\
-             [observability]\nlog_level = \"debug\"\n\
-             [security]\nper_source_burst = 1\nper_source_rate_per_sec = 0.001\n",
-        );
-
-        let initial = seed_resolved(42, LogLevel::Info);
-        let (setter, captured) = recording_setter();
-        let state = Arc::new(RuntimeReloadState::new(
-            PaymentArgs { rate_per_mb: None },
-            ObservabilityArgs {
-                log_level: None,
-                log_format: None,
-                metrics_port: None,
-                metrics_bind: None,
-                admin_port: None,
-                otlp_endpoint: None,
-            },
-            &initial,
-            setter,
-        ));
-
-        let st_for_thread = Arc::clone(&state);
-        let join = std::thread::spawn(move || {
-            let _guard = st_for_thread.limiter.lock().unwrap();
-            panic!("intentional panic to poison limiter mutex");
-        });
-        let _ = join.join();
-        assert!(state.limiter.is_poisoned());
-
-        let err = state.reload(&path).await.unwrap_err();
-        assert!(format!("{err:#}").contains("limiter attach mutex poisoned"));
-        // No commit ran: log-level setter not called, rate atomic intact.
-        assert!(captured.lock().unwrap().is_none());
-        assert_eq!(state.rate_per_mb().load(Ordering::Relaxed), 42);
     }
 
     /// `seed_initial_file_snapshot` primes the diff baseline from the
