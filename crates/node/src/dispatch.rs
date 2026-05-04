@@ -420,11 +420,15 @@ impl ConnectionLimiter {
         };
         let limiter = limiter?;
         let result = limiter.check_key(&key);
-        // Best-effort cap enforcement: if the keyspace has grown past
-        // the operator-configured cap, prune entries whose state has
-        // refilled to a fresh baseline. Runs after the read guard has
-        // been released so a flood pruning step can't block reload.
-        if cap > 0 && limiter.len() > cap {
+        // Best-effort cap enforcement with a 10 % slack: prune only when
+        // the keyspace has grown past `cap + cap / 10` so a sustained
+        // 1-key-over-cap fluctuation under flood doesn't trigger an
+        // O(n) walk on every accept. The map can briefly exceed `cap`
+        // by up to 10 %; the next prune brings it back via
+        // governor's `retain_recent` (which drops keys whose state is
+        // indistinguishable from fresh). Runs after the read guard
+        // has been released so the walk can't block reload.
+        if cap > 0 && limiter.len() > cap.saturating_add(cap / 10) {
             limiter.retain_recent();
         }
         match result {
