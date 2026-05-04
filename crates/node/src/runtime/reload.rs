@@ -4,13 +4,13 @@
 //!   - `payment.rate_per_mb`
 //!   - `observability.log_level`
 //!   - `cache.pinned_hashes`
-//!   - all of `security.*` — the live `ConnectionLimiter` resizes its
-//!     `Arc<Semaphore>` via `add_permits` / `acquire_many_owned(...)
-//!     .forget()` (identity stable for in-flight permits) and rebuilds
-//!     its keyed [`governor`] rate limiter from the new quota, swapping
-//!     it in under an `RwLock`. Token-bucket state is *not* preserved
-//!     across the rebuild. `0` in any `security.*` field disables that
-//!     layer.
+//!   - all of `security.*` — the live `ConnectionLimiter` swaps its
+//!     `Arc<Semaphore>` wholesale on reload (already-held permits drain
+//!     into the previous semaphore on drop; new acquires hit the new
+//!     one) and rebuilds its keyed [`governor`] rate limiter from the
+//!     new quota, swapping it in under an `RwLock`. Token-bucket state
+//!     is *not* preserved across the rebuild. `0` in any `security.*`
+//!     field disables that layer.
 //!
 //! Every other field that changed in the file is logged and ignored
 //! with a "requires restart" message — the runtime would otherwise need
@@ -552,8 +552,8 @@ impl RuntimeReloadState {
         //   2. atomic swap of rate_per_mb (infallible)
         //   3. ArcSwap of cache.pinned set (infallible)
         //   4. ConnectionLimiter::reload (infallible: lock_recover
-        //      handles poison; add_permits is infallible; the shrink
-        //      path is `tokio::spawn` and surfaces only via panic)
+        //      handles poison; the global semaphore is replaced via an
+        //      atomic Arc swap with no fallible step)
         //   5. write-back of cached values via the held guards (infallible)
         // If the setter fails we bail before touching the rate atomic,
         // pinned set, the limiter, or the snapshot caches — preserving

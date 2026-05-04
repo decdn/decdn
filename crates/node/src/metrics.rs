@@ -63,12 +63,6 @@ pub struct DecdnMetrics {
     pub dispatch_rejected_per_source: Counter,
     /// Currently in-flight QUIC handler tasks holding a dispatch permit.
     pub dispatch_in_flight: Gauge,
-    /// Number of times the limiter's semaphore-shrink task failed to
-    /// acquire (and `forget`) the surplus permits during a hot-reload
-    /// cap reduction. Each increment means `live_semaphore_size` and
-    /// the actual permit count have drifted apart by the corresponding
-    /// `delta`. Operator-visible name: `decdn_dispatch_shrink_skipped_total`.
-    pub dispatch_shrink_skipped: Counter,
     /// Connections accepted on a relay-only path (no resolvable peer
     /// IP) while the per-source layer was enabled. The per-source rate
     /// limit cannot be enforced for these — operators chasing
@@ -184,13 +178,6 @@ impl Metrics {
     /// Decrement the in-flight dispatch permit gauge.
     pub fn dispatch_permit_released(&self) {
         self.decdn.dispatch_in_flight.dec();
-    }
-
-    /// Record a hot-reload semaphore-shrink task that failed to forget
-    /// its surplus permits — `live_semaphore_size` now drifts from the
-    /// real permit count by the spawned task's `delta`.
-    pub fn dispatch_shrink_skipped(&self) {
-        self.decdn.dispatch_shrink_skipped.inc();
     }
 
     /// Record a relay-only connection accepted while the per-source

@@ -33,10 +33,12 @@
 
 use std::net::{IpAddr, Ipv6Addr};
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
+use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use arc_swap::ArcSwapOption;
 use governor::{DefaultKeyedRateLimiter, Quota};
 use iroh::TransportAddr;
 use iroh::Watcher as _;
@@ -187,41 +189,40 @@ fn build_keyed_limiter(
     Some(Arc::new(DefaultKeyedRateLimiter::keyed(quota)))
 }
 
+/// Build an `Arc<Semaphore>` of `cap` permits, or `None` when the global
+/// cap is disabled (`cap == 0`). Used both at construction and on every
+/// reload — the `Arc` is swapped wholesale so already-held permits keep
+/// the previous semaphore alive until they drop.
+fn build_semaphore(cap: u32) -> Option<Arc<Semaphore>> {
+    if cap == 0 {
+        return None;
+    }
+    Some(Arc::new(Semaphore::new(
+        usize::try_from(cap).unwrap_or(usize::MAX),
+    )))
+}
+
 /// Shared rate limiter used by all deCDN-authored `ProtocolHandler` implementations.
 ///
 /// `reload(&self, &ResolvedSecurity)` applies a new resolved-security
 /// snapshot in place. The per-source [`governor`] limiter is rebuilt
-/// from the new quota and swapped in under an internal `RwLock`;
-/// existing in-flight acquires that already passed the per-source
-/// check are unaffected. The `Arc<Semaphore>` identity is
-/// preserved across cap changes via `add_permits` /
-/// `acquire_many_owned(...).forget()` so every outstanding
-/// `OwnedSemaphorePermit` continues to drain into the same semaphore
-/// on `Drop`.
+/// from the new quota and swapped in under an internal `RwLock`. The
+/// global semaphore is replaced wholesale: a fresh `Arc<Semaphore>` of
+/// the new capacity is built and atomically swapped into the
+/// [`ArcSwapOption`] cell, so the next acquire hits the new semaphore.
+/// Already-acquired `OwnedSemaphorePermit`s hold a clone of the old
+/// `Arc<Semaphore>` and continue to drain into it on `Drop` — they're
+/// dropped harmlessly once the last permit goes away.
 ///
-/// `target_max_concurrent` records the operator-asked-for cap; `0` means
-/// "global cap disabled" and the acquire path skips the semaphore
-/// entirely. `live_semaphore_size` tracks the actual live size of the
-/// semaphore so a disable→re-enable transition resizes from the live
-/// value rather than the (stale-while-disabled) target.
-///
-/// Two reloads racing (N→N+1→N) compute their permit deltas from
-/// `live_semaphore_size`, not from the live `available_permits()` —
-/// which would lag behind an in-flight shrink and produce drift. The
-/// `target_lock` `Mutex<()>` serialises the recording-and-resize step so
-/// concurrent reloads see each other's effects.
+/// `semaphore = None` encodes "global cap disabled"
+/// (`max_concurrent_handlers == 0`) and the acquire path skips the
+/// semaphore entirely.
 #[allow(missing_debug_implementations)]
 pub struct ConnectionLimiter {
-    semaphore: Arc<Semaphore>,
-    /// Operator-requested cap. `0` = disabled (acquire path skips the
-    /// semaphore entirely). Source of truth for racing reloads.
-    target_max_concurrent: AtomicU32,
-    /// Actual live size of `semaphore`. Diverges from `target` only
-    /// while disabled (`target == 0` doesn't touch permits). Re-enable
-    /// transitions resize from this value to the new target.
-    live_semaphore_size: AtomicU32,
-    /// Serialises reload-vs-reload for the semaphore resize.
-    target_lock: Mutex<()>,
+    /// `None` when the layer is disabled (`max_concurrent_handlers ==
+    /// 0`), `Some(arc)` otherwise. Reload swaps the whole `Arc` in;
+    /// the acquire path loads it lock-free.
+    semaphore: ArcSwapOption<Semaphore>,
     /// Per-source keyed limiter behind an `RwLock` so reads (the hot
     /// path) take a shared lock and reloads briefly take exclusive.
     /// Held in `Arc` form for cheap cloning into the rare case where
@@ -246,14 +247,7 @@ pub struct ConnectionLimiter {
 impl ConnectionLimiter {
     /// Construct a limiter from the resolved security configuration.
     pub fn new(cfg: &ResolvedSecurity, metrics: Arc<Metrics>) -> Self {
-        // `cfg.max_concurrent_handlers == 0` → disabled. Build the
-        // semaphore at size 0 (it will never be acquired; the acquire
-        // path branches on `target_max_concurrent`). Sizing it to anything
-        // else would just be wasted work.
-        let initial_size = cfg.max_concurrent_handlers;
-        let semaphore = Arc::new(Semaphore::new(
-            usize::try_from(initial_size).unwrap_or(usize::MAX),
-        ));
+        let semaphore = ArcSwapOption::from(build_semaphore(cfg.max_concurrent_handlers));
         let per_source = PerSource::new(
             cfg.per_source_rate_per_sec,
             cfg.per_source_burst,
@@ -262,9 +256,6 @@ impl ConnectionLimiter {
         let per_source_enabled = AtomicBool::new(per_source.limiter.is_some());
         Self {
             semaphore,
-            target_max_concurrent: AtomicU32::new(initial_size),
-            live_semaphore_size: AtomicU32::new(initial_size),
-            target_lock: Mutex::new(()),
             per_source: RwLock::new(per_source),
             per_source_enabled,
             per_source_poison_logged: AtomicBool::new(false),
@@ -274,139 +265,47 @@ impl ConnectionLimiter {
 
     /// Apply a new `ResolvedSecurity` to the live limiter.
     ///
-    /// Field-by-field strategy:
-    /// - `per_source_rate_per_sec`, `per_source_burst`,
-    ///   `max_tracked_sources`: rebuild the keyed [`governor`] limiter
-    ///   from the new quota and atomically swap it in under the
-    ///   per-source write lock. **Token-bucket state is not preserved
-    ///   across the swap** — governor's keyed map is
-    ///   discarded and a fresh one takes its place. Operators tuning a
-    ///   live quota should expect each source's next acquire to start
-    ///   with a fresh burst budget.
-    /// - `max_concurrent_handlers`: `Arc<Semaphore>` identity is
-    ///   preserved (every in-flight `OwnedSemaphorePermit` holds a
-    ///   clone). Grow via `add_permits(delta)` synchronously; shrink by
-    ///   spawning a detached task that `acquire_many_owned(delta).await
-    ///   .unwrap().forget()`s — live handlers naturally drain the
-    ///   surplus. `0` records the disabled state without touching
-    ///   permits; a later non-zero value resizes from
-    ///   `live_semaphore_size` (the size left over from the last
-    ///   enabled period).
+    /// - Per-source: rebuild the keyed [`governor`] limiter from the new
+    ///   quota and atomically swap it in under the per-source write
+    ///   lock. **Token-bucket state is not preserved across the swap.**
+    /// - Global semaphore: build a fresh `Arc<Semaphore>` (or `None`
+    ///   when `max_concurrent_handlers == 0`) and atomically swap it
+    ///   into the [`ArcSwapOption`] cell. Already-acquired permits hold
+    ///   a clone of the previous `Arc<Semaphore>` and drop it harmlessly
+    ///   on permit release; new acquires hit the new cell.
     ///
-    /// Worked example (cap=4 startup → disable → re-enable smaller → grow):
-    /// ```text
-    /// reload(target=0): target=0, live stays 4; early return (acquire skips semaphore).
-    /// reload(target=3): live=4, store live=3, shrink by 1 (spawn forget task).
-    /// reload(target=5): live=3, store live=5, add_permits(2).
-    /// ```
-    ///
-    /// Caveats: during a shrink the live cap is `>= new_target` until
-    /// enough handlers drain. Under racing reloads (N→N+1→N) the
-    /// post-task permit count may briefly land anywhere in `[N, N+1]`,
-    /// and a parked shrink task that fires after a subsequent grow can
-    /// "forget" permits the operator just re-granted — leaving
-    /// `live_semaphore_size` (the recorded value) ahead of the actual
-    /// permit count by however many the parked task ate. Subsequent
-    /// reloads compute deltas from the recorded value, so the
-    /// discrepancy stays bounded by the in-flight shrink count and
-    /// converges as the operator stops reloading. A disable→enable→
-    /// smaller-cap sequence spawns a shrink task on the re-enable.
-    /// All acceptable at `PoC` scale.
-    ///
-    /// Infallible: limiter rebuild can't fail (quota construction is
-    /// gated on validated config), `add_permits` can't fail, and the
-    /// shrink path is `tokio::spawn` (which only fails by panicking —
-    /// not via this return). Caller (`RuntimeReloadState::reload`) has
-    /// already validated the values via `resolve_security`, so this
-    /// method takes a `&ResolvedSecurity` rather than re-parsing.
+    /// Infallible. Caller (`RuntimeReloadState::reload`) has already
+    /// validated the values via `resolve_security`.
     pub fn reload(&self, cfg: &ResolvedSecurity) {
         // 1. Per-source: rebuild limiter from the new quota and swap
         //    under the write lock.
+        let new_per_source = PerSource::new(
+            cfg.per_source_rate_per_sec,
+            cfg.per_source_burst,
+            cfg.max_tracked_sources,
+        );
+        let per_source_enabled = new_per_source.limiter.is_some();
         {
-            let new = PerSource::new(
-                cfg.per_source_rate_per_sec,
-                cfg.per_source_burst,
-                cfg.max_tracked_sources,
-            );
-            let enabled = new.limiter.is_some();
             let mut g = self.per_source.write().unwrap_or_else(|poisoned| {
                 self.log_per_source_poison();
                 poisoned.into_inner()
             });
-            *g = new;
-            // Mirror the enabled state for the relay-only fast path.
-            // Stored under Relaxed because there's no happens-before
-            // relationship to the limiter's own state — the worst case
-            // across a swap is one accept observing the prior generation,
-            // operationally indistinguishable from arriving microseconds
-            // earlier.
-            self.per_source_enabled.store(enabled, Ordering::Relaxed);
+            *g = new_per_source;
         }
+        // Mirror the enabled state for the relay-only fast path.
+        // Stored under Relaxed because there's no happens-before
+        // relationship to the limiter's own state — the worst case
+        // across a swap is one accept observing the prior generation,
+        // operationally indistinguishable from arriving microseconds
+        // earlier.
+        self.per_source_enabled
+            .store(per_source_enabled, Ordering::Relaxed);
 
-        // 2. Semaphore: serialise reloads through `target_lock`. Resize
-        //    math operates on `live_semaphore_size`, not `target`, so
-        //    disable→enable→resize transitions stay correct (target was
-        //    0 during disabled period; live retains the last enabled size).
-        let _g = self
-            .target_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let next_target = cfg.max_concurrent_handlers;
-        self.target_max_concurrent
-            .store(next_target, Ordering::Relaxed);
-
-        // No structural change needed when disabling or staying disabled
-        // — `acquire_inner` branches on `target_max_concurrent`, and
-        // leaving `live_semaphore_size` at its last-enabled value lets a
-        // future re-enable resize from a sensible baseline.
-        if next_target == 0 {
-            return;
-        }
-
-        let live = self.live_semaphore_size.load(Ordering::Relaxed);
-        self.live_semaphore_size
-            .store(next_target, Ordering::Relaxed);
-
-        if next_target > live {
-            // Grow: add permits synchronously.
-            let delta = next_target - live;
-            self.semaphore.add_permits(delta as usize);
-        } else if next_target < live {
-            // Shrink: spawn a detached task that waits for `delta`
-            // permits to become free, then forgets them. The acquire
-            // is best-effort — if a third reload arrives growing the
-            // semaphore back up while this task is parked, the task
-            // may forget permits the operator just re-granted. The
-            // next reload will reconcile from the recorded
-            // `live_semaphore_size`.
-            let delta = live - next_target;
-            let sem = Arc::clone(&self.semaphore);
-            let metrics = Arc::clone(&self.metrics);
-            tokio::spawn(async move {
-                match sem.acquire_many_owned(delta).await {
-                    Ok(p) => p.forget(),
-                    Err(err) => {
-                        // `live_semaphore_size` already moved to the new
-                        // target, but the actual permit count did not —
-                        // accounting drifts permanently for the rest of
-                        // the process lifetime. Surface at `error!` and
-                        // bump a counter so dashboards can fire on it;
-                        // otherwise the discrepancy is invisible until
-                        // the operator notices the cap stopped behaving.
-                        // The only documented `AcquireError` today is
-                        // "semaphore closed" (shutdown only), but bind
-                        // `err` so a future `#[non_exhaustive]` variant
-                        // surfaces.
-                        metrics.dispatch_shrink_skipped();
-                        tracing::error!(
-                            %err,
-                            delta,
-                            "dispatch limiter shrink task failed; live_semaphore_size now drifts from actual permit count by `delta`"
-                        );
-                    }
-                }
-            });
-        }
+        // 2. Global semaphore: swap the whole `Arc<Semaphore>`. Any
+        //    in-flight `OwnedSemaphorePermit` holds a clone of the
+        //    previous `Arc` and drops it harmlessly when released.
+        self.semaphore
+            .store(build_semaphore(cfg.max_concurrent_handlers));
     }
 
     /// Try to acquire a permit for `conn`.
@@ -442,23 +341,19 @@ impl ConnectionLimiter {
     /// Shared implementation behind [`Self::acquire`] and
     /// [`Self::acquire_for_test`].
     fn acquire_inner(&self, peer_ip: Option<IpAddr>) -> Result<Permit, RejectReason> {
-        // target == 0 disables the global cap; skip the semaphore.
-        let sem_permit = if self.target_max_concurrent.load(Ordering::Relaxed) > 0 {
-            Some(
-                Arc::clone(&self.semaphore)
-                    .try_acquire_owned()
-                    .map_err(|_| {
-                        self.metrics.dispatch_rejected_global();
-                        tracing::debug!(
-                            reason = RejectReason::GlobalFull.as_str(),
-                            ip = ?peer_ip,
-                            "dispatch rejected: global semaphore exhausted"
-                        );
-                        RejectReason::GlobalFull
-                    })?,
-            )
-        } else {
-            None
+        // Load the current semaphore. `None` means the global cap is
+        // administratively disabled — skip the layer entirely.
+        let sem_permit = match self.semaphore.load_full() {
+            Some(sem) => Some(sem.try_acquire_owned().map_err(|_| {
+                self.metrics.dispatch_rejected_global();
+                tracing::debug!(
+                    reason = RejectReason::GlobalFull.as_str(),
+                    ip = ?peer_ip,
+                    "dispatch rejected: global semaphore exhausted"
+                );
+                RejectReason::GlobalFull
+            })?),
+            None => None,
         };
 
         // Per-source layer. Relay-only connections (no IP) bypass the
@@ -581,7 +476,6 @@ fn peer_ip(conn: &Connection) -> Option<IpAddr> {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;
-    use std::time::Duration;
 
     use super::{ConnectionLimiter, RejectReason};
     use crate::config::ResolvedSecurity;
@@ -798,64 +692,57 @@ mod tests {
 
     #[tokio::test]
     async fn connection_limiter_reload_grows_semaphore() {
+        // Whole-Arc swap: a reload to cap=5 installs a fresh semaphore
+        // with 5 permits. Already-held permits drain into the *previous*
+        // semaphore on drop and don't count against the new cap. Five
+        // fresh acquires from new IPs must succeed; the sixth rejects.
         let metrics = Arc::new(Metrics::new());
         let limiter = ConnectionLimiter::new(&strict_security(2), Arc::clone(&metrics));
         let _p1 = limiter.acquire_inner(Some(ip(10, 0, 0, 1))).unwrap();
         let _p2 = limiter.acquire_inner(Some(ip(10, 0, 0, 2))).unwrap();
-        // Cap exhausted at 2.
         assert!(limiter.acquire_inner(Some(ip(10, 0, 0, 3))).is_err());
 
-        // Reload to cap=5. Permissive per-source so it doesn't shadow.
         let mut new_cfg = permissive_security();
         new_cfg.max_concurrent_handlers = 5;
         limiter.reload(&new_cfg);
 
-        // Three more acquires from fresh IPs — global cap grew from 2
-        // to 5, so all three succeed.
-        let _p3 = limiter
-            .acquire_inner(Some(ip(10, 0, 0, 3)))
-            .expect("after grow");
-        let _p4 = limiter
-            .acquire_inner(Some(ip(10, 0, 0, 4)))
-            .expect("after grow");
-        let _p5 = limiter
-            .acquire_inner(Some(ip(10, 0, 0, 5)))
-            .expect("after grow");
+        let mut held = Vec::with_capacity(5);
+        for i in 3..8u8 {
+            held.push(
+                limiter
+                    .acquire_inner(Some(ip(10, 0, 0, i)))
+                    .expect("under new cap=5"),
+            );
+        }
+        assert!(
+            limiter.acquire_inner(Some(ip(10, 0, 0, 99))).is_err(),
+            "6th acquire against the new sem must reject at cap=5"
+        );
     }
 
     #[tokio::test]
-    async fn connection_limiter_reload_shrinks_semaphore_eventually() {
-        // Start at cap=4, hold 2 permits, shrink to cap=3 (forget 1
-        // available permit), drop 1 held permit. The shrink task should
-        // forget exactly the available delta; the drop should re-add 1
-        // permit. Net free = 0; a fresh acquire must fail GlobalFull.
+    async fn connection_limiter_reload_shrinks_caps_new_acquires() {
+        // Whole-Arc swap: a reload to a smaller cap installs a fresh
+        // semaphore at that size. New acquires hit the new sem; the
+        // (new+1)th rejects. Already-held permits hold the previous
+        // semaphore alive until they drop — they don't count against
+        // the new cap.
         let metrics = Arc::new(Metrics::new());
         let limiter = ConnectionLimiter::new(&strict_security(4), Arc::clone(&metrics));
         let _p1 = limiter.acquire_inner(Some(ip(10, 0, 0, 1))).unwrap();
-        let p2 = limiter.acquire_inner(Some(ip(10, 0, 0, 2))).unwrap();
+        let _p2 = limiter.acquire_inner(Some(ip(10, 0, 0, 2))).unwrap();
 
         let mut new_cfg = permissive_security();
         new_cfg.max_concurrent_handlers = 3;
         limiter.reload(&new_cfg);
 
-        // Yield to let the spawned shrink task forget the available permit.
-        for _ in 0..32 {
-            tokio::task::yield_now().await;
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-        // 4 (live) → 3 (target). Held = 2. Forget = 4 - 3 = 1. Available = 1.
-        // Drop p2: available = 2; held = 1. New acquires can succeed.
-        drop(p2);
-        let _p3 = limiter
-            .acquire_inner(Some(ip(10, 0, 0, 3)))
-            .expect("after drop, slot freed");
-        let _p4 = limiter
-            .acquire_inner(Some(ip(10, 0, 0, 4)))
-            .expect("after drop, second slot freed");
-        // Now held = 3 (p1, p3, p4), cap = 3, no more free.
+        // Three acquires must succeed against the new (cap=3) sem.
+        let _p3 = limiter.acquire_inner(Some(ip(10, 0, 0, 3))).unwrap();
+        let _p4 = limiter.acquire_inner(Some(ip(10, 0, 0, 4))).unwrap();
+        let _p5 = limiter.acquire_inner(Some(ip(10, 0, 0, 5))).unwrap();
         assert!(
-            limiter.acquire_inner(Some(ip(10, 0, 0, 5))).is_err(),
-            "shrink to 3 must reject the 4th acquire"
+            limiter.acquire_inner(Some(ip(10, 0, 0, 6))).is_err(),
+            "4th acquire against the new cap=3 sem must reject"
         );
     }
 
@@ -883,38 +770,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connection_limiter_reload_target_tracking_handles_repeated_grow() {
-        // Three reloads N=1, N=5, N=2. Then a fourth to N=3. The grow
-        // step is observable: we should be able to hold exactly 3 permits
-        // after the fourth reload (held grows to 3, 4th is rejected).
-        let metrics = Arc::new(Metrics::new());
-        let limiter = ConnectionLimiter::new(&strict_security(1), Arc::clone(&metrics));
-        let mut c = permissive_security();
-        c.max_concurrent_handlers = 5;
-        limiter.reload(&c);
-        c.max_concurrent_handlers = 2;
-        limiter.reload(&c);
-        // Yield so the shrink (5→2) task forgets 3 permits.
-        for _ in 0..32 {
-            tokio::task::yield_now().await;
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-        c.max_concurrent_handlers = 3;
-        limiter.reload(&c);
-        let _p1 = limiter.acquire_inner(Some(ip(10, 0, 0, 1))).unwrap();
-        let _p2 = limiter.acquire_inner(Some(ip(10, 0, 0, 2))).unwrap();
-        let _p3 = limiter.acquire_inner(Some(ip(10, 0, 0, 3))).unwrap();
-        assert!(
-            limiter.acquire_inner(Some(ip(10, 0, 0, 4))).is_err(),
-            "4th must be rejected at cap=3"
-        );
-    }
-
-    #[tokio::test]
-    async fn connection_limiter_reload_disable_then_re_enable_resizes_correctly() {
-        // Start cap=4, disable (target=0), acquire freely (semaphore
-        // skipped), re-enable to cap=3, drop everyone, hold 3 — the 4th
-        // must reject at the new cap=3.
+    async fn connection_limiter_reload_disable_then_re_enable_caps_correctly() {
+        // Start cap=4, disable (max_concurrent_handlers=0), acquire
+        // freely (semaphore skipped), re-enable to cap=3 — fresh
+        // semaphore with 3 permits installed; new acquires up to 3
+        // succeed, 4th rejects.
         let metrics = Arc::new(Metrics::new());
         let limiter = ConnectionLimiter::new(&strict_security(4), Arc::clone(&metrics));
 
@@ -924,7 +784,7 @@ mod tests {
         limiter.reload(&c);
 
         // While disabled, hold many permits — the acquire path skips the
-        // semaphore so live_semaphore_size is irrelevant.
+        // semaphore entirely.
         let bulk: Vec<_> = (0..16u8)
             .map(|i| {
                 limiter
@@ -934,15 +794,9 @@ mod tests {
             .collect();
         drop(bulk);
 
-        // Re-enable to cap=3. This resizes from live_semaphore_size=4
-        // (last enabled value) to 3 — spawn a shrink task forgetting 1
-        // permit.
+        // Re-enable to cap=3.
         c.max_concurrent_handlers = 3;
         limiter.reload(&c);
-        for _ in 0..32 {
-            tokio::task::yield_now().await;
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
 
         let _p1 = limiter.acquire_inner(Some(ip(10, 0, 0, 1))).unwrap();
         let _p2 = limiter.acquire_inner(Some(ip(10, 0, 0, 2))).unwrap();
@@ -980,92 +834,6 @@ mod tests {
                 .acquire_inner(same_ip)
                 .expect("per-source disabled must accept");
         }
-    }
-
-    /// `target_lock` exists specifically to serialise concurrent reloads
-    /// so racing N→…→M operations converge. Run 8 concurrent reloads
-    /// against the same limiter and assert the post-race
-    /// `live_semaphore_size` matches the *last* reload to commit
-    /// (whichever wins the lock race), then a follow-up reload to a
-    /// known cap produces exactly that cap's behaviour.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_reloads_converge() {
-        let metrics = Arc::new(Metrics::new());
-        let limiter = Arc::new(ConnectionLimiter::new(&strict_security(8), metrics));
-        let barrier = Arc::new(tokio::sync::Barrier::new(8));
-        let mut handles = Vec::new();
-        for i in 0..8u32 {
-            let l = Arc::clone(&limiter);
-            let b = Arc::clone(&barrier);
-            handles.push(tokio::spawn(async move {
-                b.wait().await;
-                let mut cfg = permissive_security();
-                cfg.max_concurrent_handlers = 4 + i;
-                l.reload(&cfg);
-            }));
-        }
-        for h in handles {
-            h.await.unwrap();
-        }
-        // Drain any pending shrink tasks before the final reconcile.
-        for _ in 0..64 {
-            tokio::task::yield_now().await;
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-        // Reload to a known cap = 11. From whatever the racing reloads
-        // left `live_semaphore_size` at, this should resize correctly.
-        let mut cfg = permissive_security();
-        cfg.max_concurrent_handlers = 11;
-        limiter.reload(&cfg);
-        for _ in 0..64 {
-            tokio::task::yield_now().await;
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-        // Hold 11 permits; the 12th must reject.
-        let mut held = Vec::with_capacity(11);
-        for i in 0..11u8 {
-            held.push(
-                limiter
-                    .acquire_inner(Some(ip(10, 0, 0, i)))
-                    .expect("11 acquires under cap=11"),
-            );
-        }
-        assert!(
-            limiter.acquire_inner(Some(ip(10, 0, 0, 99))).is_err(),
-            "12th acquire must reject at cap=11 after concurrent reloads converge"
-        );
-    }
-
-    /// Disabled→still-disabled reload must leave `live_semaphore_size`
-    /// untouched so a future re-enable resizes from the right baseline.
-    /// A regression that flipped the `next_target == 0` early-return to
-    /// also reset `live` would silently break the next re-enable.
-    #[tokio::test]
-    async fn reload_disabled_to_disabled_preserves_live_baseline() {
-        let metrics = Arc::new(Metrics::new());
-        let limiter = ConnectionLimiter::new(&strict_security(4), Arc::clone(&metrics));
-        // First reload: disable.
-        let mut c = permissive_security();
-        c.max_concurrent_handlers = 0;
-        limiter.reload(&c);
-        // Second reload: still disabled. Must not touch live.
-        limiter.reload(&c);
-        // Re-enable to 4. With baseline preserved, this is a no-op resize
-        // (live=4 → 4); without it, the resize would be wrong.
-        c.max_concurrent_handlers = 4;
-        limiter.reload(&c);
-        // Hold 4 permits; the 5th must reject.
-        let _h: Vec<_> = (0..4u8)
-            .map(|i| {
-                limiter
-                    .acquire_inner(Some(ip(10, 0, 0, i)))
-                    .expect("acquire under cap=4")
-            })
-            .collect();
-        assert!(
-            limiter.acquire_inner(Some(ip(10, 0, 0, 99))).is_err(),
-            "5th must reject; if live baseline drifted, this would have over-allocated"
-        );
     }
 
     /// Metrics counters must continue to flow after a hot reload — the
@@ -1219,80 +987,5 @@ mod tests {
         let _p2 = limiter
             .acquire_inner(Some(v6_c))
             .expect("acquire from a different /64 must succeed");
-    }
-
-    /// Multi-thread runtime: races N acquire loops against a reload
-    /// storm and asserts no panic + final permit count converges to
-    /// one of the targets the reload storm wrote.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn acquire_storm_during_reload_storm_does_not_panic() {
-        let metrics = Arc::new(Metrics::new());
-        let limiter = Arc::new(ConnectionLimiter::new(
-            &strict_security(8),
-            Arc::clone(&metrics),
-        ));
-
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let mut acquirers = Vec::new();
-        for w in 0..4u8 {
-            let l = Arc::clone(&limiter);
-            let stop = Arc::clone(&stop);
-            acquirers.push(tokio::spawn(async move {
-                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    // Don't care about success/fail — only that we
-                    // never panic and the limiter remains internally
-                    // consistent across the race window.
-                    let _ = l.acquire_inner(Some(ip(10, 0, 0, w)));
-                    tokio::task::yield_now().await;
-                }
-            }));
-        }
-
-        let l = Arc::clone(&limiter);
-        let reloader = tokio::spawn(async move {
-            let targets = [4u32, 12, 6, 16, 2, 10];
-            for _ in 0..6 {
-                for &t in &targets {
-                    let mut cfg = permissive_security();
-                    cfg.max_concurrent_handlers = t;
-                    l.reload(&cfg);
-                    tokio::task::yield_now().await;
-                }
-            }
-        });
-        reloader.await.unwrap();
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        for h in acquirers {
-            h.await.unwrap();
-        }
-
-        // Drain pending shrink tasks before the final convergence
-        // reload — same pattern as `concurrent_reloads_converge`.
-        for _ in 0..64 {
-            tokio::task::yield_now().await;
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-        let mut cfg = permissive_security();
-        cfg.max_concurrent_handlers = 5;
-        limiter.reload(&cfg);
-        for _ in 0..64 {
-            tokio::task::yield_now().await;
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-
-        // Operator-observable convergence proof: hold 5 permits; the
-        // 6th must reject under cap=5.
-        let mut held = Vec::with_capacity(5);
-        for i in 0..5u8 {
-            held.push(
-                limiter
-                    .acquire_inner(Some(ip(192, 168, 1, i)))
-                    .expect("5 acquires under cap=5"),
-            );
-        }
-        assert!(
-            limiter.acquire_inner(Some(ip(192, 168, 1, 99))).is_err(),
-            "6th acquire must reject at cap=5 after acquire+reload storm converges"
-        );
     }
 }

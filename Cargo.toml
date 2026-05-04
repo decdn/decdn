@@ -79,6 +79,9 @@ proptest = "1"
 # Rate limiting (per-source connection rate limits in `node`)
 governor = "0.10"
 
+# Atomic Arc swap (used by `node` to swap the dispatch semaphore on reload)
+arc-swap = "1.7"
+
 # Metrics server
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
