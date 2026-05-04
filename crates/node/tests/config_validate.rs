@@ -220,10 +220,8 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
         },
         security: ResolvedSecurity {
             max_concurrent_handlers: 256,
-            per_node_rate_per_sec: 20.0,
-            per_node_burst: 40,
-            per_ip_rate_per_sec: 100.0,
-            per_ip_burst: 200,
+            per_source_rate_per_sec: 100.0,
+            per_source_burst: 200,
             max_tracked_sources: 4096,
         },
     };

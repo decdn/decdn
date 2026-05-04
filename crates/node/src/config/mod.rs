@@ -49,19 +49,15 @@ const DEFAULT_ANNOUNCE_INTERVAL_SEC: u64 = 60;
 const DEFAULT_PEER_TTL_SEC: u64 = 600;
 /// Default global cap on concurrent in-flight QUIC handler tasks.
 const DEFAULT_MAX_CONCURRENT_HANDLERS: u32 = 256;
-/// Default per-NodeID token-bucket rate (tokens/second). Matches ADR 001's
-/// "20 probe requests per peer per second" inbound limit.
-const DEFAULT_PER_NODE_RATE_PER_SEC: f64 = 20.0;
-/// Default per-NodeID burst — 2× the steady-state rate gives well-behaved
-/// peers headroom for jitter/clumping that would otherwise produce spurious
-/// rejections at burst == rate.
-const DEFAULT_PER_NODE_BURST: u32 = 40;
-/// Default per-IP token-bucket rate. More generous than per-NodeID because a
-/// single IP may legitimately host a fleet of nodes.
-const DEFAULT_PER_IP_RATE_PER_SEC: f64 = 100.0;
-/// Default per-IP burst (2× rate, same headroom rationale as per-NodeID).
-const DEFAULT_PER_IP_BURST: u32 = 200;
-/// Default hard cap on tracked source entries (per-NodeID map and per-IP map).
+/// Default per-source rate-limit refill (cells/second). A single source
+/// may legitimately host a fleet of clients; the value is generous
+/// enough to absorb that without rejecting well-behaved peers.
+const DEFAULT_PER_SOURCE_RATE_PER_SEC: f64 = 100.0;
+/// Default per-source burst — 2× the steady-state rate gives well-behaved
+/// peers headroom for jitter/clumping that would otherwise produce
+/// spurious rejections at burst == rate.
+const DEFAULT_PER_SOURCE_BURST: u32 = 200;
+/// Default hard cap on tracked source entries in the keyed limiter.
 const DEFAULT_MAX_TRACKED_SOURCES: usize = 4096;
 
 /// Load config from file (if present) and merge with CLI args.
@@ -677,40 +673,22 @@ pub(crate) fn resolve_security(
         "security.max_concurrent_handlers={max_concurrent_handlers} exceeds tokio Semaphore::MAX_PERMITS={max_permits} on this target"
     );
 
-    let per_node_rate_per_sec = file
-        .and_then(|s| s.per_node_rate_per_sec)
-        .unwrap_or(DEFAULT_PER_NODE_RATE_PER_SEC);
+    let per_source_rate_per_sec = file
+        .and_then(|s| s.per_source_rate_per_sec)
+        .unwrap_or(DEFAULT_PER_SOURCE_RATE_PER_SEC);
     anyhow::ensure!(
-        per_node_rate_per_sec.is_finite() && per_node_rate_per_sec >= 0.0,
-        "security.per_node_rate_per_sec must be a finite non-negative number \
-         (0 disables the per-NodeID layer)"
+        per_source_rate_per_sec.is_finite() && per_source_rate_per_sec >= 0.0,
+        "security.per_source_rate_per_sec must be a finite non-negative number \
+         (0 disables the per-source layer)"
     );
 
-    let per_node_burst = file
-        .and_then(|s| s.per_node_burst)
-        .unwrap_or(DEFAULT_PER_NODE_BURST);
+    let per_source_burst = file
+        .and_then(|s| s.per_source_burst)
+        .unwrap_or(DEFAULT_PER_SOURCE_BURST);
     anyhow::ensure!(
-        per_node_rate_per_sec == 0.0 || per_node_burst > 0,
-        "security.per_node_burst must be > 0 when per_node_rate_per_sec > 0 \
-         (set both to 0 to disable the per-NodeID layer)"
-    );
-
-    let per_ip_rate_per_sec = file
-        .and_then(|s| s.per_ip_rate_per_sec)
-        .unwrap_or(DEFAULT_PER_IP_RATE_PER_SEC);
-    anyhow::ensure!(
-        per_ip_rate_per_sec.is_finite() && per_ip_rate_per_sec >= 0.0,
-        "security.per_ip_rate_per_sec must be a finite non-negative number \
-         (0 disables the per-IP layer)"
-    );
-
-    let per_ip_burst = file
-        .and_then(|s| s.per_ip_burst)
-        .unwrap_or(DEFAULT_PER_IP_BURST);
-    anyhow::ensure!(
-        per_ip_rate_per_sec == 0.0 || per_ip_burst > 0,
-        "security.per_ip_burst must be > 0 when per_ip_rate_per_sec > 0 \
-         (set both to 0 to disable the per-IP layer)"
+        per_source_rate_per_sec == 0.0 || per_source_burst > 0,
+        "security.per_source_burst must be > 0 when per_source_rate_per_sec > 0 \
+         (set both to 0 to disable the per-source layer)"
     );
 
     let max_tracked_sources = file
@@ -720,25 +698,20 @@ pub(crate) fn resolve_security(
     if max_concurrent_handlers == 0 {
         tracing::info!("security.max_concurrent_handlers = 0: global concurrency cap disabled");
     }
-    if per_node_rate_per_sec == 0.0 {
-        tracing::info!("security.per_node_rate_per_sec = 0: per-NodeID rate-limit disabled");
-    }
-    if per_ip_rate_per_sec == 0.0 {
-        tracing::info!("security.per_ip_rate_per_sec = 0: per-IP rate-limit disabled");
+    if per_source_rate_per_sec == 0.0 {
+        tracing::info!("security.per_source_rate_per_sec = 0: per-source rate-limit disabled");
     }
     if max_tracked_sources == 0 {
         tracing::warn!(
             "security.max_tracked_sources = 0: rate-limit bookkeeping map is unbounded; \
-             an attacker churning identities can grow it without limit"
+             an attacker churning sources can grow it without limit"
         );
     }
 
     Ok(ResolvedSecurity {
         max_concurrent_handlers,
-        per_node_rate_per_sec,
-        per_node_burst,
-        per_ip_rate_per_sec,
-        per_ip_burst,
+        per_source_rate_per_sec,
+        per_source_burst,
         max_tracked_sources,
     })
 }
@@ -3085,11 +3058,10 @@ bind_port = 12345
             DEFAULT_MAX_CONCURRENT_HANDLERS
         );
         assert!(
-            (resolved.per_node_rate_per_sec - DEFAULT_PER_NODE_RATE_PER_SEC).abs() < f64::EPSILON
+            (resolved.per_source_rate_per_sec - DEFAULT_PER_SOURCE_RATE_PER_SEC).abs()
+                < f64::EPSILON
         );
-        assert_eq!(resolved.per_node_burst, DEFAULT_PER_NODE_BURST);
-        assert!((resolved.per_ip_rate_per_sec - DEFAULT_PER_IP_RATE_PER_SEC).abs() < f64::EPSILON);
-        assert_eq!(resolved.per_ip_burst, DEFAULT_PER_IP_BURST);
+        assert_eq!(resolved.per_source_burst, DEFAULT_PER_SOURCE_BURST);
         assert_eq!(resolved.max_tracked_sources, DEFAULT_MAX_TRACKED_SOURCES);
     }
 
@@ -3101,69 +3073,37 @@ bind_port = 12345
     }
 
     #[test]
-    fn resolve_security_rejects_non_finite_or_negative_per_node_rate() {
+    fn resolve_security_rejects_non_finite_or_negative_per_source_rate() {
         // 0.0 is now valid (disabled); only NaN, ±inf, and strictly-negative are rejected.
         for bad in [-1.0_f64, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            let s = sec_with(|s| s.per_node_rate_per_sec = Some(bad));
+            let s = sec_with(|s| s.per_source_rate_per_sec = Some(bad));
             assert!(
                 resolve_security(Some(&s)).is_err(),
-                "per_node_rate_per_sec={bad} should be rejected"
+                "per_source_rate_per_sec={bad} should be rejected"
             );
         }
     }
 
     #[test]
-    fn resolve_security_accepts_zero_per_node_pair_as_disabled() {
-        // rate=0 + burst=0 disables the per-NodeID layer.
+    fn resolve_security_accepts_zero_per_source_pair_as_disabled() {
+        // rate=0 + burst=0 disables the per-source layer.
         let s = sec_with(|s| {
-            s.per_node_rate_per_sec = Some(0.0);
-            s.per_node_burst = Some(0);
+            s.per_source_rate_per_sec = Some(0.0);
+            s.per_source_burst = Some(0);
         });
-        let resolved = resolve_security(Some(&s)).expect("0/0 disables per-NodeID");
-        assert_eq!(resolved.per_node_burst, 0);
+        let resolved = resolve_security(Some(&s)).expect("0/0 disables per-source");
+        assert_eq!(resolved.per_source_burst, 0);
     }
 
     #[test]
-    fn resolve_security_rejects_zero_per_node_burst_with_positive_rate() {
+    fn resolve_security_rejects_zero_per_source_burst_with_positive_rate() {
         // rate>0 with burst=0 is the deny-all corner; reject it.
         let s = sec_with(|s| {
-            s.per_node_rate_per_sec = Some(10.0);
-            s.per_node_burst = Some(0);
+            s.per_source_rate_per_sec = Some(10.0);
+            s.per_source_burst = Some(0);
         });
         let err = resolve_security(Some(&s)).expect_err("rate>0+burst=0 must reject");
-        assert!(format!("{err:#}").contains("per_node_burst"));
-    }
-
-    #[test]
-    fn resolve_security_rejects_non_finite_or_negative_per_ip_rate() {
-        // 0.0 is now valid (disabled); only NaN, ±inf, and strictly-negative are rejected.
-        for bad in [-1.0_f64, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            let s = sec_with(|s| s.per_ip_rate_per_sec = Some(bad));
-            assert!(
-                resolve_security(Some(&s)).is_err(),
-                "per_ip_rate_per_sec={bad} should be rejected"
-            );
-        }
-    }
-
-    #[test]
-    fn resolve_security_accepts_zero_per_ip_pair_as_disabled() {
-        let s = sec_with(|s| {
-            s.per_ip_rate_per_sec = Some(0.0);
-            s.per_ip_burst = Some(0);
-        });
-        let resolved = resolve_security(Some(&s)).expect("0/0 disables per-IP");
-        assert_eq!(resolved.per_ip_burst, 0);
-    }
-
-    #[test]
-    fn resolve_security_rejects_zero_per_ip_burst_with_positive_rate() {
-        let s = sec_with(|s| {
-            s.per_ip_rate_per_sec = Some(10.0);
-            s.per_ip_burst = Some(0);
-        });
-        let err = resolve_security(Some(&s)).expect_err("rate>0+burst=0 must reject");
-        assert!(format!("{err:#}").contains("per_ip_burst"));
+        assert!(format!("{err:#}").contains("per_source_burst"));
     }
 
     #[test]
@@ -3178,6 +3118,6 @@ bind_port = 12345
         let s = sec_with(|s| s.max_concurrent_handlers = Some(512));
         let resolved = resolve_security(Some(&s)).expect("valid override");
         assert_eq!(resolved.max_concurrent_handlers, 512);
-        assert_eq!(resolved.per_node_burst, DEFAULT_PER_NODE_BURST);
+        assert_eq!(resolved.per_source_burst, DEFAULT_PER_SOURCE_BURST);
     }
 }

@@ -6,10 +6,11 @@
 //!   - `cache.pinned_hashes`
 //!   - all of `security.*` — the live `ConnectionLimiter` resizes its
 //!     `Arc<Semaphore>` via `add_permits` / `acquire_many_owned(...)
-//!     .forget()` (identity stable for in-flight permits) and updates
-//!     its token-bucket maps in place under their per-map `Mutex`,
-//!     preserving `last_refill` and accumulated `tokens`. `0` in any
-//!     `security.*` field disables that layer.
+//!     .forget()` (identity stable for in-flight permits) and rebuilds
+//!     its keyed [`governor`] rate limiter from the new quota, swapping
+//!     it in under an `RwLock`. Token-bucket state is *not* preserved
+//!     across the rebuild. `0` in any `security.*` field disables that
+//!     layer.
 //!
 //! Every other field that changed in the file is logged and ignored
 //! with a "requires restart" message — the runtime would otherwise need
@@ -358,10 +359,8 @@ impl RuntimeReloadState {
             },
             security: ResolvedSecurity {
                 max_concurrent_handlers: 256,
-                per_node_rate_per_sec: 20.0,
-                per_node_burst: 40,
-                per_ip_rate_per_sec: 100.0,
-                per_ip_burst: 200,
+                per_source_rate_per_sec: 100.0,
+                per_source_burst: 200,
                 max_tracked_sources: 4096,
             },
         };
@@ -616,8 +615,7 @@ impl RuntimeReloadState {
             cache_attached = pin_diff.is_some(),
             security_attached,
             max_concurrent_handlers = new_security.max_concurrent_handlers,
-            per_node_rate_per_sec = new_security.per_node_rate_per_sec,
-            per_ip_rate_per_sec = new_security.per_ip_rate_per_sec,
+            per_source_rate_per_sec = new_security.per_source_rate_per_sec,
             max_tracked_sources = new_security.max_tracked_sources,
             "config reload applied"
         );
@@ -871,10 +869,8 @@ mod tests {
             },
             security: ResolvedSecurity {
                 max_concurrent_handlers: 256,
-                per_node_rate_per_sec: 20.0,
-                per_node_burst: 40,
-                per_ip_rate_per_sec: 100.0,
-                per_ip_burst: 200,
+                per_source_rate_per_sec: 100.0,
+                per_source_burst: 200,
                 max_tracked_sources: 4096,
             },
         }
@@ -1568,10 +1564,8 @@ mod tests {
         Arc::new(ConnectionLimiter::new(
             &ResolvedSecurity {
                 max_concurrent_handlers: 256,
-                per_node_rate_per_sec: 20.0,
-                per_node_burst: 40,
-                per_ip_rate_per_sec: 100.0,
-                per_ip_burst: 200,
+                per_source_rate_per_sec: 100.0,
+                per_source_burst: 200,
                 max_tracked_sources: 4096,
             },
             metrics,
@@ -1580,17 +1574,15 @@ mod tests {
 
     #[tokio::test]
     async fn reload_applies_security_when_limiter_attached() {
-        // Tighten per-node burst from default 40 down to 1; after
-        // reload the live limiter must reject the second per-node
-        // acquire on a fresh node-id pair.
+        // Tighten per-source burst from default 200 down to 1; after
+        // reload the live limiter must reject the second acquire from
+        // the same source IP.
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(
             dir.path(),
             "[security]\n\
-             per_node_rate_per_sec = 1.0\n\
-             per_node_burst = 1\n\
-             per_ip_rate_per_sec = 1000.0\n\
-             per_ip_burst = 1000\n",
+             per_source_rate_per_sec = 0.001\n\
+             per_source_burst = 1\n",
         );
 
         let initial = seed_resolved(10, LogLevel::Info);
@@ -1613,19 +1605,15 @@ mod tests {
 
         state.reload(&path).await.unwrap();
 
-        // Per-node burst is now 1.
-        let node = [7u8; 32];
+        // Per-source burst is now 1.
         let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1));
         let _p1 = limiter
-            .acquire_for_test(node, Some(ip))
-            .expect("first per-node acquire");
+            .acquire_for_test(Some(ip))
+            .expect("first per-source acquire");
         let err = limiter
-            .acquire_for_test(
-                node,
-                Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2))),
-            )
-            .expect_err("second per-node acquire must reject after reload");
-        assert_eq!(err, crate::dispatch::RejectReason::PerNodeId);
+            .acquire_for_test(Some(ip))
+            .expect_err("second per-source acquire must reject after reload");
+        assert_eq!(err, crate::dispatch::RejectReason::PerSource);
     }
 
     #[tokio::test]
@@ -1636,7 +1624,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(
             dir.path(),
-            "[security]\nper_node_burst = 5\nper_node_rate_per_sec = 1.0\n",
+            "[security]\nper_source_burst = 5\nper_source_rate_per_sec = 1.0\n",
         );
         let initial = seed_resolved(10, LogLevel::Info);
         let (setter, _captured) = recording_setter();
@@ -1671,7 +1659,7 @@ mod tests {
              [observability]\n\
              log_level = \"debug\"\n\
              [security]\n\
-             per_node_rate_per_sec = -1.0\n",
+             per_source_rate_per_sec = -1.0\n",
         );
         let initial = seed_resolved(42, LogLevel::Info);
         let (setter, captured) = recording_setter();
@@ -1691,7 +1679,7 @@ mod tests {
         state.attach_limiter(Some(build_test_limiter()));
 
         let err = state.reload(&path).await.unwrap_err();
-        assert!(format!("{err:#}").contains("per_node_rate_per_sec"));
+        assert!(format!("{err:#}").contains("per_source_rate_per_sec"));
         // Payment rate must NOT have moved despite being valid in the
         // file — "previous values retained on error" applies to the
         // whole reload.
@@ -1711,10 +1699,8 @@ mod tests {
             dir.path(),
             "[observability]\nlog_level = \"debug\"\n\
              [security]\n\
-             per_node_rate_per_sec = 1.0\n\
-             per_node_burst = 1\n\
-             per_ip_rate_per_sec = 1000.0\n\
-             per_ip_burst = 1000\n",
+             per_source_rate_per_sec = 0.001\n\
+             per_source_burst = 1\n",
         );
         let failing_setter: LogLevelSetter =
             Box::new(|_| Err(anyhow::anyhow!("simulated tracing-reload failure")));
@@ -1741,19 +1727,16 @@ mod tests {
         // Limiter must NOT have been mutated — the per-node burst stays
         // at the seed_resolved default (40), so two acquires from the
         // same node still succeed.
-        let node = [3u8; 32];
         let _p1 = limiter
-            .acquire_for_test(
-                node,
-                Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1))),
-            )
-            .expect("setter failure must not have shrunk per-node burst");
+            .acquire_for_test(Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                10, 0, 0, 1,
+            ))))
+            .expect("setter failure must not have shrunk per-source burst");
         let _p2 = limiter
-            .acquire_for_test(
-                node,
-                Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2))),
-            )
-            .expect("burst still 40 → second succeeds");
+            .acquire_for_test(Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                10, 0, 0, 2,
+            ))))
+            .expect("seed burst (200) still in effect → second succeeds");
     }
 
     /// Mirror of `attach_cache_recovers_from_poisoned_mutex` for the
@@ -1808,7 +1791,7 @@ mod tests {
             dir.path(),
             "[payment]\nrate_per_mb = 99\n\
              [observability]\nlog_level = \"debug\"\n\
-             [security]\nper_node_burst = 1\n",
+             [security]\nper_source_burst = 1\nper_source_rate_per_sec = 0.001\n",
         );
 
         let initial = seed_resolved(42, LogLevel::Info);

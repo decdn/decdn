@@ -42,8 +42,8 @@ pub const TOPIC_REPUTATION: &str = "cdn/reputation/v1";
 /// Unlike `0x01`–`0x03`, this code is delivered via `CONNECTION_CLOSE` rather
 /// than `RESET_STREAM` because the rejection happens before any application
 /// stream is opened. The close-frame reason bytes carry a short layer label
-/// (`global-full`, `per-ip`, or `per-node-id`) so the peer can pick an
-/// appropriate backoff. Peers that receive this code SHOULD back off before
+/// (e.g. `global-full`, `per-source`) so the peer can pick an appropriate
+/// backoff. Peers that receive this code SHOULD back off before
 /// reconnecting; they MUST NOT treat it as a protocol error (the server is
 /// functioning normally — the client is overloading it).
 pub const APP_ERR_RATE_LIMITED: u32 = 0x10;

@@ -58,12 +58,9 @@ pub struct DecdnMetrics {
     /// encoder appends it automatically; the operator-visible name is
     /// `decdn_dispatch_rejected_global_total`.
     pub dispatch_rejected_global: Counter,
-    /// Connections rejected by the per-NodeID token bucket. Operator-
-    /// visible name: `decdn_dispatch_rejected_per_node_total`.
-    pub dispatch_rejected_per_node: Counter,
-    /// Connections rejected by the per-IP token bucket. Operator-visible
-    /// name: `decdn_dispatch_rejected_per_ip_total`.
-    pub dispatch_rejected_per_ip: Counter,
+    /// Connections rejected by the per-source rate limiter. Operator-
+    /// visible name: `decdn_dispatch_rejected_per_source_total`.
+    pub dispatch_rejected_per_source: Counter,
     /// Currently in-flight QUIC handler tasks holding a dispatch permit.
     pub dispatch_in_flight: Gauge,
     /// Number of times the limiter's semaphore-shrink task failed to
@@ -73,13 +70,13 @@ pub struct DecdnMetrics {
     /// `delta`. Operator-visible name: `decdn_dispatch_shrink_skipped_total`.
     pub dispatch_shrink_skipped: Counter,
     /// Connections accepted on a relay-only path (no resolvable peer
-    /// IP) while the per-IP layer was enabled. The per-IP rate limit
-    /// cannot be enforced for these — operators chasing
-    /// `dispatch_rejected_per_ip` anomalies need this counter to
+    /// IP) while the per-source layer was enabled. The per-source rate
+    /// limit cannot be enforced for these — operators chasing
+    /// `dispatch_rejected_per_source` anomalies need this counter to
     /// distinguish "the layer didn't fire" from "the layer wasn't
     /// applicable." Operator-visible name:
-    /// `decdn_dispatch_per_ip_skipped_no_addr_total`.
-    pub dispatch_per_ip_skipped_no_addr: Counter,
+    /// `decdn_dispatch_per_source_skipped_no_addr_total`.
+    pub dispatch_per_source_skipped_no_addr: Counter,
 }
 
 /// Aggregated deCDN node metrics.
@@ -174,14 +171,9 @@ impl Metrics {
         self.decdn.dispatch_rejected_global.inc();
     }
 
-    /// Record a connection rejected by the per-NodeID token bucket.
-    pub fn dispatch_rejected_per_node(&self) {
-        self.decdn.dispatch_rejected_per_node.inc();
-    }
-
-    /// Record a connection rejected by the per-IP token bucket.
-    pub fn dispatch_rejected_per_ip(&self) {
-        self.decdn.dispatch_rejected_per_ip.inc();
+    /// Record a connection rejected by the per-source rate limiter.
+    pub fn dispatch_rejected_per_source(&self) {
+        self.decdn.dispatch_rejected_per_source.inc();
     }
 
     /// Increment the in-flight dispatch permit gauge.
@@ -201,10 +193,11 @@ impl Metrics {
         self.decdn.dispatch_shrink_skipped.inc();
     }
 
-    /// Record a relay-only connection accepted while the per-IP layer
-    /// was enabled but no peer IP could be resolved at accept time.
-    pub fn dispatch_per_ip_skipped_no_addr(&self) {
-        self.decdn.dispatch_per_ip_skipped_no_addr.inc();
+    /// Record a relay-only connection accepted while the per-source
+    /// layer was enabled but no peer IP could be resolved at accept
+    /// time.
+    pub fn dispatch_per_source_skipped_no_addr(&self) {
+        self.decdn.dispatch_per_source_skipped_no_addr.inc();
     }
 
     /// Read the current value of the `rpc_healthy` gauge. Test-only —

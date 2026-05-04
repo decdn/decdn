@@ -31,10 +31,8 @@ use tokio::task::JoinHandle;
 fn permissive_limiter(metrics: &Arc<Metrics>) -> Arc<ConnectionLimiter> {
     let cfg = ResolvedSecurity {
         max_concurrent_handlers: u32::MAX,
-        per_node_rate_per_sec: 1_000_000.0,
-        per_node_burst: u32::MAX,
-        per_ip_rate_per_sec: 1_000_000.0,
-        per_ip_burst: u32::MAX,
+        per_source_rate_per_sec: 1_000_000.0,
+        per_source_burst: u32::MAX,
         max_tracked_sources: 4096,
     };
     Arc::new(ConnectionLimiter::new(&cfg, Arc::clone(metrics)))
@@ -400,15 +398,13 @@ async fn probe_rate_limit_returns_rate_limited_close_code() -> anyhow::Result<()
     let server_id = server_sk.public();
     let metrics = Arc::new(Metrics::new());
 
-    // burst=1 per-IP so the second connection from the same client IP
-    // unconditionally rejects. Per-NodeID and global are loose so they
-    // don't interfere.
+    // burst=1 per-source so the second connection from the same client
+    // IP unconditionally rejects. Global is loose so it doesn't
+    // interfere.
     let strict = ResolvedSecurity {
         max_concurrent_handlers: 64,
-        per_node_rate_per_sec: 1_000.0,
-        per_node_burst: 1_000,
-        per_ip_rate_per_sec: 0.001, // negligible refill within the test window
-        per_ip_burst: 1,
+        per_source_rate_per_sec: 0.001, // negligible refill within the test window
+        per_source_burst: 1,
         max_tracked_sources: 32,
     };
     let limiter = Arc::new(ConnectionLimiter::new(&strict, Arc::clone(&metrics)));

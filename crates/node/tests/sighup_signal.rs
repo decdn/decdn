@@ -79,10 +79,8 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
         },
         security: ResolvedSecurity {
             max_concurrent_handlers: 256,
-            per_node_rate_per_sec: 20.0,
-            per_node_burst: 40,
-            per_ip_rate_per_sec: 100.0,
-            per_ip_burst: 200,
+            per_source_rate_per_sec: 100.0,
+            per_source_burst: 200,
             max_tracked_sources: 4096,
         },
     }
@@ -245,19 +243,17 @@ async fn sighup_applies_security_changes() {
         setter,
     ));
 
-    // Build a real limiter at the seed defaults (per_node_burst = 40).
+    // Build a real limiter at the seed defaults (per_source_burst = 200).
     let metrics = Arc::new(Metrics::new());
     let limiter = Arc::new(ConnectionLimiter::new(&initial.security, metrics));
     state.attach_limiter(Some(Arc::clone(&limiter)));
 
-    // Tighten per-node burst to 1; raise per-IP so it doesn't shadow.
+    // Tighten per-source burst to 1.
     write_config(
         &path,
         "[security]\n\
-         per_node_rate_per_sec = 1.0\n\
-         per_node_burst = 1\n\
-         per_ip_rate_per_sec = 1000.0\n\
-         per_ip_burst = 1000\n",
+         per_source_rate_per_sec = 0.001\n\
+         per_source_burst = 1\n",
     );
 
     let loop_state = Arc::clone(&state);
@@ -274,21 +270,14 @@ async fn sighup_applies_security_changes() {
         .expect("reload loop task panicked")
         .expect("reload loop returned Err");
 
-    // Live limiter now has per-node burst=1: first acquire from a
-    // node-id succeeds, second from the same node-id (different IP to
-    // bypass per-IP) rejects on per-NodeID.
-    let node = [9u8; 32];
+    // Live limiter now has per-source burst=1: first acquire from an
+    // IP succeeds, second from the same IP rejects on per-source.
+    let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1));
     let _p1 = limiter
-        .acquire_for_test(
-            node,
-            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1))),
-        )
-        .expect("first per-node acquire post-SIGHUP");
+        .acquire_for_test(Some(ip))
+        .expect("first per-source acquire post-SIGHUP");
     let err = limiter
-        .acquire_for_test(
-            node,
-            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2))),
-        )
-        .expect_err("second per-node acquire must reject after SIGHUP-applied burst=1");
-    assert_eq!(err, RejectReason::PerNodeId);
+        .acquire_for_test(Some(ip))
+        .expect_err("second per-source acquire must reject after SIGHUP-applied burst=1");
+    assert_eq!(err, RejectReason::PerSource);
 }

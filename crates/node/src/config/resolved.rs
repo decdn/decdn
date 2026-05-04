@@ -126,16 +126,13 @@ pub struct ResolvedObservability {
 pub struct ResolvedSecurity {
     /// Global cap on concurrent in-flight QUIC handler tasks.
     pub max_concurrent_handlers: u32,
-    /// Per-NodeID token-bucket refill rate (tokens/second).
-    pub per_node_rate_per_sec: f64,
-    /// Per-NodeID token-bucket burst capacity.
-    pub per_node_burst: u32,
-    /// Per-IP token-bucket refill rate (tokens/second).
-    pub per_ip_rate_per_sec: f64,
-    /// Per-IP token-bucket burst capacity.
-    pub per_ip_burst: u32,
-    /// Hard cap on the number of tracked sources (per-NodeID map and per-IP
-    /// map each respect this limit independently).
+    /// Per-source rate-limit refill (cells/second). `0.0` disables the
+    /// layer.
+    pub per_source_rate_per_sec: f64,
+    /// Per-source rate-limit burst capacity. Ignored when
+    /// `per_source_rate_per_sec == 0.0`.
+    pub per_source_burst: u32,
+    /// Hard cap on the number of tracked sources in the keyed limiter.
     pub max_tracked_sources: usize,
 }
 
