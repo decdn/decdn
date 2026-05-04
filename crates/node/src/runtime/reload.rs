@@ -293,7 +293,7 @@ impl ReloadableSection for LogLevelSection {
         let Some(resolved) = drain_or_log(&self.buf, self.name()) else {
             return;
         };
-        let log_level_changed = self.swap_applied.lock().map(|g| *g).unwrap_or(false);
+        let log_level_changed = self.swap_applied.lock().is_ok_and(|g| *g);
         tracing::info!(
             section = self.name(),
             log_level = %resolved.log_level,
