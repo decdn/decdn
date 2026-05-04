@@ -5,25 +5,28 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use decdn_protocol::{
-    ALPN_PROBE, FrameError, ProbeMessage, decode_message, encode_message, message::ProbeResponse,
-    read_frame, write_frame,
+    ALPN_PROBE, APP_ERR_RATE_LIMITED, FrameError, ProbeMessage, decode_message, encode_message,
+    message::ProbeResponse, read_frame, write_frame,
 };
 use iroh::PublicKey;
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 
+use crate::dispatch::{ConnectionLimiter, RejectReason};
 use crate::metrics::Metrics;
 
-/// Ceiling on how long we wait for the client to open the bi-directional
-/// stream. Without it a peer can sit on an accepted connection without ever
-/// opening a stream.
+// Server-side timeouts. Each ceiling exists so a single peer cannot pin a
+// handler task indefinitely by stalling at one of the protocol's ordered
+// steps.
 const ACCEPT_BI_TIMEOUT: Duration = Duration::from_secs(5);
-/// Ceiling on how long we wait for the client to send the framed request.
-/// Without it a peer can pin a server task indefinitely.
 const PROBE_READ_TIMEOUT: Duration = Duration::from_secs(5);
-/// Ceiling on how long we wait for the client to close the connection after
-/// receiving the response.
 const PROBE_CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
+/// Bound on the post-rejection close-frame flush. The QUIC `CONNECTION_CLOSE`
+/// frame is best-effort; we wait briefly for the peer to acknowledge so the
+/// `0x10 RATE_LIMITED` reason byte (and its layer label) reach them, but cap
+/// the wait so a malicious flooder can't keep the handler alive by refusing
+/// to acknowledge.
+const REJECTION_CLOSE_TIMEOUT: Duration = Duration::from_millis(250);
 
 // QUIC application error codes defined by ADR 013 §Application Error Codes.
 const APP_ERR_UNSUPPORTED_MESSAGE: u32 = 0x01;
@@ -33,32 +36,77 @@ const APP_ERR_MALFORMED_MESSAGE: u32 = 0x03;
 /// Serves `cdn/probe/v1`: reads a framed [`ProbeMessage::Request`], writes a
 /// framed [`ProbeMessage::Response`].
 ///
-/// `rate_per_mb` is held behind a shared `AtomicU64` so SIGHUP-driven
-/// config reload (#236) can swap the value without rebuilding the handler
-/// or touching the iroh `Router`. Reads use `Ordering::Relaxed`: the rate
-/// is a single-word counter with no ordering relationship to other state,
-/// and any in-flight probe simply observes whichever generation of the
-/// rate the load happens to see.
-#[derive(Debug)]
+/// `rate_per_mb` is held behind a shared `AtomicU64` so config reload can
+/// swap the value without rebuilding the handler or touching the iroh
+/// `Router`. Reads use `Ordering::Relaxed`: the rate is a single-word
+/// counter with no ordering relationship to other state, and any in-flight
+/// probe simply observes whichever generation of the rate the load happens
+/// to see.
 pub struct ProbeHandler {
     node_id: PublicKey,
     rate_per_mb: Arc<AtomicU64>,
     metrics: Arc<Metrics>,
+    limiter: Arc<ConnectionLimiter>,
+}
+
+impl std::fmt::Debug for ProbeHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProbeHandler")
+            .field("node_id", &self.node_id)
+            .field("rate_per_mb", &self.rate_per_mb)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ProbeHandler {
     pub const ALPN: &'static [u8] = ALPN_PROBE;
 
     #[allow(clippy::missing_const_for_fn)] // Arc::new isn't const.
-    pub fn new(node_id: PublicKey, rate_per_mb: Arc<AtomicU64>, metrics: Arc<Metrics>) -> Self {
+    pub fn new(
+        node_id: PublicKey,
+        rate_per_mb: Arc<AtomicU64>,
+        metrics: Arc<Metrics>,
+        limiter: Arc<ConnectionLimiter>,
+    ) -> Self {
         Self {
             node_id,
             rate_per_mb,
             metrics,
+            limiter,
         }
     }
 
     async fn serve(&self, conn: Connection) -> anyhow::Result<()> {
+        let _permit = match self.limiter.acquire(&conn) {
+            Ok(p) => p,
+            Err(reason) => {
+                // Rate-limited rejection is normal load-shedding, not a
+                // protocol fault: returning `Err` here would have iroh log
+                // every rejection as an `AcceptError`, amplifying log
+                // volume under flood (exactly what the attacker wants).
+                // The dispatch layer already emits a structured debug log
+                // and a metric counter for the rejection.
+                conn.close(
+                    VarInt::from_u32(APP_ERR_RATE_LIMITED),
+                    reason.as_str().as_bytes(),
+                );
+                // Wait for the close frame to be acknowledged so the peer
+                // reliably observes the 0x10 RATE_LIMITED code and the
+                // layer-label reason byte — except on `GlobalFull`. Under
+                // a global-cap flood every rejection would otherwise
+                // park a task here for up to `REJECTION_CLOSE_TIMEOUT`,
+                // and at thousands of rejections per second that is the
+                // memory-pressure path the limiter exists to prevent.
+                // Layer label is least useful for `GlobalFull` anyway
+                // (operators pivot on the metric counter, not the close
+                // reason byte). Per-source rejections are rate-limited
+                // by the bucket itself, so the bounded wait is safe.
+                if reason != RejectReason::GlobalFull {
+                    let _ = tokio::time::timeout(REJECTION_CLOSE_TIMEOUT, conn.closed()).await;
+                }
+                return Ok(());
+            }
+        };
         let _guard = self.metrics.connection_guard();
 
         let (mut send, mut recv) = tokio::time::timeout(ACCEPT_BI_TIMEOUT, conn.accept_bi())
@@ -119,9 +167,12 @@ impl ProtocolHandler for ProbeHandler {
 }
 
 const fn frame_err_code(e: &FrameError) -> u32 {
+    // Match every variant explicitly so a future `#[non_exhaustive]` /
+    // new variant fails the build instead of being silently collapsed
+    // into `APP_ERR_MALFORMED_MESSAGE`.
     match e {
         FrameError::TooLarge(_) => APP_ERR_MESSAGE_TOO_LARGE,
-        _ => APP_ERR_MALFORMED_MESSAGE,
+        FrameError::Io(_) | FrameError::Varint | FrameError::Decode(_) => APP_ERR_MALFORMED_MESSAGE,
     }
 }
 

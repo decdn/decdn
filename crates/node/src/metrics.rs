@@ -53,6 +53,24 @@ pub struct DecdnMetrics {
     /// `check_rpc_reachability` probe so dashboards/alerts can fire on
     /// a sustained outage rather than relying on a one-shot startup line.
     pub rpc_healthy: Gauge,
+    /// Connections rejected because the global concurrency semaphore was
+    /// exhausted. Field has no `_total` suffix because the `OpenMetrics`
+    /// encoder appends it automatically; the operator-visible name is
+    /// `decdn_dispatch_rejected_global_total`.
+    pub dispatch_rejected_global: Counter,
+    /// Connections rejected by the per-source rate limiter. Operator-
+    /// visible name: `decdn_dispatch_rejected_per_source_total`.
+    pub dispatch_rejected_per_source: Counter,
+    /// Currently in-flight QUIC handler tasks holding a dispatch permit.
+    pub dispatch_in_flight: Gauge,
+    /// Connections accepted on a relay-only path (no resolvable peer
+    /// IP) while the per-source layer was enabled. The per-source rate
+    /// limit cannot be enforced for these — operators chasing
+    /// `dispatch_rejected_per_source` anomalies need this counter to
+    /// distinguish "the layer didn't fire" from "the layer wasn't
+    /// applicable." Operator-visible name:
+    /// `decdn_dispatch_per_source_skipped_no_addr_total`.
+    pub dispatch_per_source_skipped_no_addr: Counter,
 }
 
 /// Aggregated deCDN node metrics.
@@ -142,6 +160,33 @@ impl Metrics {
         self.decdn.rpc_healthy.set(i64::from(ok));
     }
 
+    /// Record a connection rejected by the global concurrency semaphore.
+    pub fn dispatch_rejected_global(&self) {
+        self.decdn.dispatch_rejected_global.inc();
+    }
+
+    /// Record a connection rejected by the per-source rate limiter.
+    pub fn dispatch_rejected_per_source(&self) {
+        self.decdn.dispatch_rejected_per_source.inc();
+    }
+
+    /// Increment the in-flight dispatch permit gauge.
+    pub fn dispatch_permit_acquired(&self) {
+        self.decdn.dispatch_in_flight.inc();
+    }
+
+    /// Decrement the in-flight dispatch permit gauge.
+    pub fn dispatch_permit_released(&self) {
+        self.decdn.dispatch_in_flight.dec();
+    }
+
+    /// Record a relay-only connection accepted while the per-source
+    /// layer was enabled but no peer IP could be resolved at accept
+    /// time.
+    pub fn dispatch_per_source_skipped_no_addr(&self) {
+        self.decdn.dispatch_per_source_skipped_no_addr.inc();
+    }
+
     /// Read the current value of the `rpc_healthy` gauge. Test-only —
     /// production code should rely on the `OpenMetrics` endpoint rather
     /// than reaching into individual gauges.
@@ -157,7 +202,7 @@ impl Metrics {
         ConnectionGuard::new(self)
     }
 
-    fn encode(&self) -> anyhow::Result<String> {
+    pub(crate) fn encode(&self) -> anyhow::Result<String> {
         let uptime = i64::try_from(self.started_at.elapsed().as_secs()).unwrap_or(i64::MAX);
         self.decdn.uptime_seconds.set(uptime);
 

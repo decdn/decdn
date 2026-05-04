@@ -26,6 +26,8 @@ pub struct FileConfig {
     pub observability: Option<ObservabilityConfig>,
     /// Gossip settings.
     pub gossip: Option<GossipConfig>,
+    /// Connection rate-limiting settings.
+    pub security: Option<SecurityConfig>,
 }
 
 /// Identity section of the config file.
@@ -116,6 +118,81 @@ pub struct GossipConfig {
     /// (64 hex chars, either case). Absent/empty = accept any signature-valid
     /// announce. `PoC` replacement for ADR 001 rule 2 (staked-node check).
     pub allowlist: Option<Vec<String>>,
+}
+
+/// Security / rate-limiting section of the config file.
+///
+/// All fields are optional; defaults produce a safe configuration out of
+/// the box.
+///
+/// **All fields are hot-reloadable** on SIGHUP and via `admin_v1_reload`.
+/// The live `ConnectionLimiter` rebuilds its keyed [`governor`] rate
+/// limiter from the new quota and swaps it under an `RwLock`. The
+/// `Arc<Semaphore>` identity is preserved across cap resizes via
+/// `add_permits` / `acquire_many_owned(...).forget()` so every
+/// in-flight `OwnedSemaphorePermit` keeps draining into the same
+/// semaphore on `Drop`.
+///
+/// **Caveats:** during a shrink the live concurrency cap is `>= new`
+/// until enough handlers drain; under racing reloads (N→N+1→N) the
+/// post-task permit count may briefly land anywhere in `[N, N+1]`
+/// until the next reload reconciles. Acceptable at `PoC` scale.
+///
+/// Token-bucket state is *not* preserved across a reload — the keyed
+/// limiter is rebuilt from scratch. Operators tuning the per-source
+/// quota live should expect the next acquire after a reload to start
+/// with a fresh burst budget.
+///
+/// **`0` means "disable this layer":**
+///   - `max_concurrent_handlers = 0`: no global concurrency cap.
+///   - `per_source_rate_per_sec = 0`: per-source rate-limit disabled. The
+///     paired `per_source_burst` field is ignored — the limiter
+///     short-circuits before the keyed map is consulted.
+///   - `max_tracked_sources = 0`: rate-limit bookkeeping map is unbounded.
+///     **Warning:** an attacker churning source addresses can grow the
+///     map without bound in this mode — operator opt-in only.
+///
+/// `burst > 0` is required only when paired with a positive rate. Setting
+/// `rate > 0` together with `burst = 0` would deny every request after
+/// the first burst-many — the resolver rejects that combination as a
+/// likely-typo. Setting `rate = 0` together with any `burst` value is
+/// fine; burst is unused once the layer is disabled.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct SecurityConfig {
+    /// Maximum number of concurrently in-flight QUIC handler tasks across
+    /// all deCDN-authored ALPNs. New connections beyond this limit are
+    /// closed immediately with `APP_ERR_RATE_LIMITED`. Default: 256.
+    /// `0` disables the global cap (no concurrency limit).
+    pub max_concurrent_handlers: Option<u32>,
+    /// Refill rate for per-source rate limiting (cells per second).
+    /// More generous than older per-NodeID-only schemes because a single
+    /// source IP may host a legitimate fleet. Default: 100. `0.0`
+    /// disables the per-source layer (the paired `per_source_burst` is
+    /// then ignored).
+    ///
+    /// The current implementation keys on the remote `IpAddr`. IPv6
+    /// addresses are bucketed by their `/64` prefix, not the full
+    /// 128-bit address. A customer-grade IPv6 allocation is typically
+    /// `/64` or larger, so without this prefix grouping an attacker can
+    /// rotate through `2^64` distinct source addresses inside one
+    /// allocation and trivially defeat the layer. IPv4 addresses are
+    /// used in full.
+    ///
+    /// "Per-source" rather than "per-IP" because the keying axis may
+    /// extend in the future (e.g. `NodeID`) without renaming the field.
+    pub per_source_rate_per_sec: Option<f64>,
+    /// Burst capacity for per-source limiting. Default: 200 (2× the
+    /// rate, providing headroom for jitter so well-behaved peers don't
+    /// trip the limit on naturally-clumped requests). Required `> 0`
+    /// when `per_source_rate_per_sec > 0`; ignored when the layer is
+    /// disabled (`per_source_rate_per_sec = 0`).
+    pub per_source_burst: Option<u32>,
+    /// Hard cap on the number of distinct sources tracked in the
+    /// rate-limit state. When the live keyed map exceeds this size the
+    /// limiter prunes entries whose state has refilled to a fresh
+    /// baseline. Default: 4096. `0` makes the map unbounded — see the
+    /// type-level docs for the operator-opt-in warning.
+    pub max_tracked_sources: Option<usize>,
 }
 
 /// Observability section of the config file.

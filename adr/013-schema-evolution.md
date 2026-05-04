@@ -412,6 +412,7 @@ QUIC application error codes used by this ADR:
 | `0x01` | `UNSUPPORTED_MESSAGE` | Received an unknown protocol enum variant |
 | `0x02` | `MESSAGE_TOO_LARGE` | Received a length prefix exceeding `MAX_MESSAGE_SIZE` |
 | `0x03` | `MALFORMED_MESSAGE` | Frame failed decoding. Covers postcard deserialization failure, varint parse errors, and transport I/O errors during frame read (since the receiver cannot distinguish a truncated frame from a malformed one at the application layer) |
+| `0x10` | `RATE_LIMITED` | Connection rejected by the per-source or global rate limiter. Delivered via `CONNECTION_CLOSE` (not `RESET_STREAM`) because rejection happens before any application stream exists; the close-frame reason bytes carry a short layer label (e.g. `global-full`, `per-source`) so peers can pick an appropriate backoff. Peers that receive this code SHOULD back off before reconnecting; they MUST NOT treat it as a protocol error. |
 
 **Scope.** These codes SHOULD be delivered via `RESET_STREAM` / `STOP_SENDING` so that other streams multiplexed on the same QUIC connection are unaffected. An ALPN that guarantees a 1:1 connection:stream topology (e.g. `cdn/probe/v1`) MAY additionally mirror the same code in the application-level `CONNECTION_CLOSE` frame so the peer observes a deterministic error code even when a stream reset races connection teardown. ALPNs that multiplex multiple streams per connection MUST NOT surface these codes at the connection level, as doing so would tear down unrelated streams.
 

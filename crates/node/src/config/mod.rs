@@ -15,7 +15,7 @@ use crate::cli::run::RunArgs;
 
 pub use resolved::{
     ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedGossip, ResolvedIdentity,
-    ResolvedNetwork, ResolvedObservability, ResolvedPayment,
+    ResolvedNetwork, ResolvedObservability, ResolvedPayment, ResolvedSecurity,
 };
 pub use types::FileConfig;
 
@@ -47,6 +47,18 @@ const DEFAULT_RPC_WATCHDOG_INTERVAL_SEC: u64 = 30;
 const DEFAULT_ANNOUNCE_INTERVAL_SEC: u64 = 60;
 /// Default peer-table entry TTL after which a stale entry is evicted.
 const DEFAULT_PEER_TTL_SEC: u64 = 600;
+/// Default global cap on concurrent in-flight QUIC handler tasks.
+const DEFAULT_MAX_CONCURRENT_HANDLERS: u32 = 256;
+/// Default per-source rate-limit refill (cells/second). A single source
+/// may legitimately host a fleet of clients; the value is generous
+/// enough to absorb that without rejecting well-behaved peers.
+const DEFAULT_PER_SOURCE_RATE_PER_SEC: f64 = 100.0;
+/// Default per-source burst — 2× the steady-state rate gives well-behaved
+/// peers headroom for jitter/clumping that would otherwise produce
+/// spurious rejections at burst == rate.
+const DEFAULT_PER_SOURCE_BURST: u32 = 200;
+/// Default hard cap on tracked source entries in the keyed limiter.
+const DEFAULT_MAX_TRACKED_SOURCES: usize = 4096;
 
 /// Load config from file (if present) and merge with CLI args.
 ///
@@ -73,6 +85,7 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
     let payment = resolve_payment(&cli.payment, file.payment.as_ref())?;
     let observability = resolve_observability(&cli.observability, file.observability.as_ref())?;
     let gossip = resolve_gossip(file.gossip.as_ref())?;
+    let security = resolve_security(file.security.as_ref())?;
 
     ensure_region_when_publishing_global(&identity, &gossip)?;
     validate_port_layout(&network, &observability)?;
@@ -85,6 +98,7 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
         payment,
         observability,
         gossip,
+        security,
     })
 }
 
@@ -620,6 +634,85 @@ fn resolve_gossip(file: Option<&types::GossipConfig>) -> anyhow::Result<Resolved
         peer_ttl_sec,
         subscribe_global,
         allowlist,
+    })
+}
+
+/// Resolve security / rate-limiting fields.
+///
+/// Each numeric field accepts `0` as the "disable this layer" sentinel:
+/// `max_concurrent_handlers = 0` skips the global semaphore acquire,
+/// `per_*_rate_per_sec = 0.0` skips the corresponding token bucket, and
+/// `max_tracked_sources = 0` makes the bookkeeping map unbounded (operator
+/// opt-in — an attacker churning identities can grow the map without
+/// bound). The `per_*_burst > 0` rule is paired with the matching rate:
+/// `burst` is irrelevant when `rate == 0` (the layer's `try_consume` short-
+/// circuits before the bucket is touched), but a `rate > 0` with `burst == 0`
+/// is a deny-all corner case operators don't actually want — reject it
+/// outright so a typo turns into a config error rather than a black-hole node.
+// Each field is a linear "default-or-file → validate → log-if-disabled"
+// triple; splitting them out would scatter the field-pair invariants
+// (rate/burst coupling) across helpers that have to take both arguments
+// anyway. Keep it linear.
+#[allow(clippy::cognitive_complexity)]
+pub(crate) fn resolve_security(
+    file: Option<&types::SecurityConfig>,
+) -> anyhow::Result<ResolvedSecurity> {
+    let max_concurrent_handlers = file
+        .and_then(|s| s.max_concurrent_handlers)
+        .unwrap_or(DEFAULT_MAX_CONCURRENT_HANDLERS);
+    // `tokio::sync::Semaphore` panics if asked to hold more than
+    // `MAX_PERMITS` (= `usize::MAX >> 3`). On 64-bit this is ~2.3×10^18
+    // so any `u32` is safe; on 32-bit it's ~5.4×10^8 and any
+    // `max_concurrent_handlers > MAX_PERMITS` would crash startup *or*
+    // a SIGHUP-driven reload via `add_permits`. Reject at config time
+    // so the failure mode is "node refuses to boot with a clear
+    // error" rather than "node panics on next reload."
+    let max_permits = tokio::sync::Semaphore::MAX_PERMITS;
+    anyhow::ensure!(
+        usize::try_from(max_concurrent_handlers).is_ok_and(|v| v <= max_permits),
+        "security.max_concurrent_handlers={max_concurrent_handlers} exceeds tokio Semaphore::MAX_PERMITS={max_permits} on this target"
+    );
+
+    let per_source_rate_per_sec = file
+        .and_then(|s| s.per_source_rate_per_sec)
+        .unwrap_or(DEFAULT_PER_SOURCE_RATE_PER_SEC);
+    anyhow::ensure!(
+        per_source_rate_per_sec.is_finite() && per_source_rate_per_sec >= 0.0,
+        "security.per_source_rate_per_sec must be a finite non-negative number \
+         (0 disables the per-source layer)"
+    );
+
+    let per_source_burst = file
+        .and_then(|s| s.per_source_burst)
+        .unwrap_or(DEFAULT_PER_SOURCE_BURST);
+    anyhow::ensure!(
+        per_source_rate_per_sec == 0.0 || per_source_burst > 0,
+        "security.per_source_burst must be > 0 when per_source_rate_per_sec > 0 \
+         (set both to 0 to disable the per-source layer)"
+    );
+
+    let max_tracked_sources = file
+        .and_then(|s| s.max_tracked_sources)
+        .unwrap_or(DEFAULT_MAX_TRACKED_SOURCES);
+
+    if max_concurrent_handlers == 0 {
+        tracing::info!("security.max_concurrent_handlers = 0: global concurrency cap disabled");
+    }
+    if per_source_rate_per_sec == 0.0 {
+        tracing::info!("security.per_source_rate_per_sec = 0: per-source rate-limit disabled");
+    }
+    if max_tracked_sources == 0 {
+        tracing::warn!(
+            "security.max_tracked_sources = 0: rate-limit bookkeeping map is unbounded; \
+             an attacker churning sources can grow it without limit"
+        );
+    }
+
+    Ok(ResolvedSecurity {
+        max_concurrent_handlers,
+        per_source_rate_per_sec,
+        per_source_burst,
+        max_tracked_sources,
     })
 }
 
@@ -2947,5 +3040,84 @@ bind_port = 12345
             msg.contains("failed to parse config file"),
             "error should describe the parse failure: {msg}"
         );
+    }
+
+    // --- resolve_security ----------------------------------------------------
+
+    fn sec_with(mutate: impl FnOnce(&mut types::SecurityConfig)) -> types::SecurityConfig {
+        let mut s = types::SecurityConfig::default();
+        mutate(&mut s);
+        s
+    }
+
+    #[test]
+    fn resolve_security_populates_defaults_when_absent() {
+        let resolved = resolve_security(None).expect("defaults must be valid");
+        assert_eq!(
+            resolved.max_concurrent_handlers,
+            DEFAULT_MAX_CONCURRENT_HANDLERS
+        );
+        assert!(
+            (resolved.per_source_rate_per_sec - DEFAULT_PER_SOURCE_RATE_PER_SEC).abs()
+                < f64::EPSILON
+        );
+        assert_eq!(resolved.per_source_burst, DEFAULT_PER_SOURCE_BURST);
+        assert_eq!(resolved.max_tracked_sources, DEFAULT_MAX_TRACKED_SOURCES);
+    }
+
+    #[test]
+    fn resolve_security_accepts_zero_max_concurrent_handlers_as_disabled() {
+        let s = sec_with(|s| s.max_concurrent_handlers = Some(0));
+        let resolved = resolve_security(Some(&s)).expect("0 disables the global cap");
+        assert_eq!(resolved.max_concurrent_handlers, 0);
+    }
+
+    #[test]
+    fn resolve_security_rejects_non_finite_or_negative_per_source_rate() {
+        // 0.0 is now valid (disabled); only NaN, ±inf, and strictly-negative are rejected.
+        for bad in [-1.0_f64, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let s = sec_with(|s| s.per_source_rate_per_sec = Some(bad));
+            assert!(
+                resolve_security(Some(&s)).is_err(),
+                "per_source_rate_per_sec={bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_security_accepts_zero_per_source_pair_as_disabled() {
+        // rate=0 + burst=0 disables the per-source layer.
+        let s = sec_with(|s| {
+            s.per_source_rate_per_sec = Some(0.0);
+            s.per_source_burst = Some(0);
+        });
+        let resolved = resolve_security(Some(&s)).expect("0/0 disables per-source");
+        assert_eq!(resolved.per_source_burst, 0);
+    }
+
+    #[test]
+    fn resolve_security_rejects_zero_per_source_burst_with_positive_rate() {
+        // rate>0 with burst=0 is the deny-all corner; reject it.
+        let s = sec_with(|s| {
+            s.per_source_rate_per_sec = Some(10.0);
+            s.per_source_burst = Some(0);
+        });
+        let err = resolve_security(Some(&s)).expect_err("rate>0+burst=0 must reject");
+        assert!(format!("{err:#}").contains("per_source_burst"));
+    }
+
+    #[test]
+    fn resolve_security_accepts_zero_max_tracked_sources_as_unbounded() {
+        let s = sec_with(|s| s.max_tracked_sources = Some(0));
+        let resolved = resolve_security(Some(&s)).expect("0 makes the map unbounded");
+        assert_eq!(resolved.max_tracked_sources, 0);
+    }
+
+    #[test]
+    fn resolve_security_partial_override_keeps_other_defaults() {
+        let s = sec_with(|s| s.max_concurrent_handlers = Some(512));
+        let resolved = resolve_security(Some(&s)).expect("valid override");
+        assert_eq!(resolved.max_concurrent_handlers, 512);
+        assert_eq!(resolved.per_source_burst, DEFAULT_PER_SOURCE_BURST);
     }
 }
