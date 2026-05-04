@@ -241,6 +241,14 @@ pub struct ConnectionLimiter {
     /// on a poisoned lock the unguarded form would emit megabytes of
     /// identical log lines per second.
     per_source_poison_logged: AtomicBool,
+    /// Single-flight guard for `retain_recent` pruning. Without it, a
+    /// flood of distinct-source connections that all observe an
+    /// over-cap keyspace simultaneously would each spawn an `O(n)`
+    /// walk over the keyed state — one per acquire thread. The flag
+    /// ensures at most one thread is pruning at a time; concurrent
+    /// over-cap observers skip and the next observer after the prune
+    /// completes picks up the work.
+    pruning_in_progress: AtomicBool,
     metrics: Arc<Metrics>,
 }
 
@@ -259,6 +267,7 @@ impl ConnectionLimiter {
             per_source: RwLock::new(per_source),
             per_source_enabled,
             per_source_poison_logged: AtomicBool::new(false),
+            pruning_in_progress: AtomicBool::new(false),
             metrics,
         }
     }
@@ -420,16 +429,32 @@ impl ConnectionLimiter {
         };
         let limiter = limiter?;
         let result = limiter.check_key(&key);
-        // Best-effort cap enforcement with a 10 % slack: prune only when
-        // the keyspace has grown past `cap + cap / 10` so a sustained
-        // 1-key-over-cap fluctuation under flood doesn't trigger an
-        // O(n) walk on every accept. The map can briefly exceed `cap`
-        // by up to 10 %; the next prune brings it back via
-        // governor's `retain_recent` (which drops keys whose state is
-        // indistinguishable from fresh). Runs after the read guard
-        // has been released so the walk can't block reload.
-        if cap > 0 && limiter.len() > cap.saturating_add(cap / 10) {
+        // Best-effort cap enforcement, two layers of throttle:
+        //
+        // 1. 10% slack: prune only when the keyspace has grown past
+        //    cap + cap/10 so a sustained 1-key-over-cap fluctuation
+        //    under flood doesn't trigger an O(n) walk on every accept.
+        // 2. Single-flight: a connection flood from N distinct sources
+        //    that all observe over-cap simultaneously would otherwise
+        //    spawn N concurrent O(n) walks. The pruning_in_progress
+        //    flag bounds it to one walk at a time; concurrent observers
+        //    skip and the next over-cap observer after the prune
+        //    completes picks up any remaining work.
+        //
+        // The map can briefly exceed cap by more than 10% while the
+        // single-flight prune is in progress; on completion governor's
+        // retain_recent brings it back to cap (it drops keys whose
+        // state is indistinguishable from fresh). Runs after the read
+        // guard has been released so the walk can't block reload.
+        if cap > 0
+            && limiter.len() > cap.saturating_add(cap / 10)
+            && self
+                .pruning_in_progress
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+        {
             limiter.retain_recent();
+            self.pruning_in_progress.store(false, Ordering::Release);
         }
         match result {
             Ok(()) => None,
