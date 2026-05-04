@@ -402,21 +402,29 @@ impl ConnectionLimiter {
     /// from a fresh bucket).
     fn check_per_source(&self, ip: IpAddr) -> Option<RejectReason> {
         let key = source_key(ip);
-        let g = self.per_source.read().unwrap_or_else(|poisoned| {
-            self.log_per_source_poison();
-            poisoned.into_inner()
-        });
-        let limiter = g.limiter.as_ref()?;
+        // Snapshot the limiter `Arc` and cap under the read guard, then
+        // drop the guard before doing anything O(n). `retain_recent` walks
+        // the entire keyed state map; holding the read guard across it
+        // would block reload (which needs the write lock) for the
+        // duration of the walk under a flood. The `Arc` clone keeps the
+        // observed `KeyedRateLimiter` alive across a concurrent reload —
+        // a reload swap leaves us operating on the prior generation,
+        // which is operationally indistinguishable from arriving
+        // microseconds earlier.
+        let (limiter, cap) = {
+            let g = self.per_source.read().unwrap_or_else(|poisoned| {
+                self.log_per_source_poison();
+                poisoned.into_inner()
+            });
+            (g.limiter.clone(), g.cap)
+        };
+        let limiter = limiter?;
         let result = limiter.check_key(&key);
         // Best-effort cap enforcement: if the keyspace has grown past
         // the operator-configured cap, prune entries whose state has
-        // refilled to a fresh baseline. `retain_recent` is governor's
-        // O(n) walk over the keyed state and runs without contending
-        // the limiter's per-key state. Pruning here (rather than from
-        // a background task) keeps the bound tight — keys can never
-        // accumulate past the cap by more than the time a single
-        // acquire takes to observe the overflow.
-        if g.cap > 0 && limiter.len() > g.cap {
+        // refilled to a fresh baseline. Runs after the read guard has
+        // been released so a flood pruning step can't block reload.
+        if cap > 0 && limiter.len() > cap {
             limiter.retain_recent();
         }
         match result {

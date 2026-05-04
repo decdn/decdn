@@ -12,7 +12,7 @@ use iroh::PublicKey;
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 
-use crate::dispatch::ConnectionLimiter;
+use crate::dispatch::{ConnectionLimiter, RejectReason};
 use crate::metrics::Metrics;
 
 // Server-side timeouts. Each ceiling exists so a single peer cannot pin a
@@ -90,15 +90,20 @@ impl ProbeHandler {
                     VarInt::from_u32(APP_ERR_RATE_LIMITED),
                     reason.as_str().as_bytes(),
                 );
-                // Briefly wait for the close frame to be acknowledged so
-                // the peer reliably observes the 0x10 RATE_LIMITED code
-                // and its layer-label reason byte. Without this, iroh
-                // may drop the `Connection` before flushing the close
-                // and the peer sees a generic transport reset — losing
-                // the layer label that the rest of the audit chain
-                // depends on. The bound caps the wait so a malicious
-                // peer that refuses to ack can't hold the handler.
-                let _ = tokio::time::timeout(REJECTION_CLOSE_TIMEOUT, conn.closed()).await;
+                // Wait for the close frame to be acknowledged so the peer
+                // reliably observes the 0x10 RATE_LIMITED code and the
+                // layer-label reason byte — except on `GlobalFull`. Under
+                // a global-cap flood every rejection would otherwise
+                // park a task here for up to `REJECTION_CLOSE_TIMEOUT`,
+                // and at thousands of rejections per second that is the
+                // memory-pressure path the limiter exists to prevent.
+                // Layer label is least useful for `GlobalFull` anyway
+                // (operators pivot on the metric counter, not the close
+                // reason byte). Per-source rejections are rate-limited
+                // by the bucket itself, so the bounded wait is safe.
+                if reason != RejectReason::GlobalFull {
+                    let _ = tokio::time::timeout(REJECTION_CLOSE_TIMEOUT, conn.closed()).await;
+                }
                 return Ok(());
             }
         };
