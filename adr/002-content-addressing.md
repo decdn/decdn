@@ -37,7 +37,7 @@ A blob may be claimed under at most one non-zero namespace. If a publisher wants
 
 ### Why this lives in ADR 002
 
-Content identity (the BLAKE3 hash) and publisher identity are paired: every claim is a binding between the two. Defining publisher and namespace here keeps the identity primitives in one place so that ADRs 011 (governance authority), 016 (contract surface), 005 (probe-time enforcement), and 022 (DHT publication semantics) can refer back to a single canonical definition.
+Content identity (the BLAKE3 hash) and publisher identity are paired: every claim is a binding between the two. Defining publisher and namespace here keeps the identity primitives in one place so that ADRs [011](011-content-takedown.md#origin-assignment-authority) (governance authority), [016](016-contract-interactions.md) (contract surface), [005](005-protocol.md#cdnprobev1--latency-probe) (probe-time enforcement), and [022](022-content-discovery.md) (DHT publication semantics) can refer back to a single canonical definition.
 
 ### Contract: PublisherRegistry
 
