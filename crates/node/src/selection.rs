@@ -136,44 +136,46 @@ fn apply_tiebreaker(ranked: &mut Vec<RankedCandidate>, rng: &mut impl rand::Rng)
 
 /// Return the index in `group` of the candidate that wins the tie under the
 /// load → geo (relative to `emitted_regions`) → stake → random tiers.
+///
+/// Filters a single index pool in place across the four tiers, so the function
+/// allocates exactly one Vec per call regardless of group size or tier depth.
 fn pick_best_in_group(
     group: &[RankedCandidate],
     emitted_regions: &HashSet<String>,
     rng: &mut impl rand::Rng,
 ) -> usize {
-    // Find candidates with the lowest load.
-    let load_winner_load = group
-        .iter()
-        .map(|r| &r.candidate.load)
-        .min_by(|a, b| compare_load(**a, **b));
-    let load_winner_load = match load_winner_load {
-        Some(l) => *l,
-        None => return 0,
-    };
-    // Build the set of candidates tied at the lowest load.
-    let load_tied: Vec<usize> = group
-        .iter()
-        .enumerate()
-        .filter(|(_, r)| compare_load(r.candidate.load, load_winner_load).is_eq())
-        .map(|(i, _)| i)
-        .collect();
+    if group.is_empty() {
+        return 0;
+    }
+    let mut pool: Vec<usize> = (0..group.len()).collect();
 
-    // Tier 2: prefer regions not in `emitted_regions`. If any load-tied
-    // candidate is in an unseen region, restrict to those.
-    let geo_pool: Vec<usize> = load_tied
+    // Tier 1: lowest load wins.
+    if let Some(min_load) = pool
         .iter()
-        .copied()
-        .filter(|i| {
+        .filter_map(|i| group.get(*i).map(|r| r.candidate.load))
+        .min_by(|a, b| compare_load(*a, *b))
+    {
+        pool.retain(|i| {
+            group
+                .get(*i)
+                .is_some_and(|r| compare_load(r.candidate.load, min_load).is_eq())
+        });
+    }
+
+    // Tier 2: prefer regions not in `emitted_regions`. If at least one
+    // candidate in the pool is in an unseen region, restrict to those.
+    let any_unseen = pool.iter().any(|i| {
+        group
+            .get(*i)
+            .is_some_and(|r| !emitted_regions.contains(&r.candidate.region))
+    });
+    if any_unseen {
+        pool.retain(|i| {
             group
                 .get(*i)
                 .is_some_and(|r| !emitted_regions.contains(&r.candidate.region))
-        })
-        .collect();
-    let pool = if geo_pool.is_empty() {
-        load_tied.clone()
-    } else {
-        geo_pool
-    };
+        });
+    }
 
     // Tier 3: higher stake wins. `None` is treated as the lowest possible
     // stake (since on-chain integration is deferred — see ADR 023 wiring).
@@ -181,20 +183,9 @@ fn pick_best_in_group(
         .iter()
         .filter_map(|i| group.get(*i).and_then(|r| r.candidate.stake))
         .max();
-    let stake_pool: Vec<usize> = match max_stake {
-        Some(top) => pool
-            .iter()
-            .copied()
-            .filter(|i| group.get(*i).and_then(|r| r.candidate.stake) == Some(top))
-            .collect(),
-        // No candidate in pool has a known stake → all are equal in this tier.
-        None => pool.clone(),
-    };
-    let pool = if stake_pool.is_empty() {
-        pool
-    } else {
-        stake_pool
-    };
+    if let Some(top) = max_stake {
+        pool.retain(|i| group.get(*i).and_then(|r| r.candidate.stake) == Some(top));
+    }
 
     // Tier 4: random tie-break. Uniformly pick from the remaining pool.
     if pool.is_empty() {
