@@ -243,17 +243,79 @@ pub struct EvictRequest {
     /// (mixed case accepted, optional `0x`/`0X` prefix tolerated); rejected
     /// at the server with `INVALID_PARAMS` otherwise.
     pub hash: String,
+    /// If `true`, return only the pre-evict snapshot (size, last access,
+    /// pin status, already-evicted flag) without mutating cache state
+    /// (issue #379). Backs `decdn node evict --dry-run`. Defaulted via
+    /// `serde(default)` so older clients sending `{ "hash": "..." }`
+    /// continue to parse cleanly with no flag, preserving the prior
+    /// "real evict" behaviour.
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 /// Response body for `admin_v1_evict`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Carries both the pre-evict snapshot (always populated, so an operator's
+/// audit log captures size and pin status at the moment of evict) and a
+/// `dry_run` flag indicating whether the cache state was actually mutated.
+/// Older clients that only deserialize `was_present` are unaffected — the
+/// new fields are silently dropped on their side.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EvictResponse {
-    /// Whether the hash was present in the cache *before* the evict ran.
-    /// `false` means the operator's evict was a no-op safety measure (the
-    /// blob was never cached or had already been evicted). The eviction
-    /// is durable in either case — a future `decdn run` against the same
-    /// cache directory will continue to refuse to serve the hash.
+    /// Whether the hash would have been served by the cache before this
+    /// call (i.e. `BlobStatus::Complete` *and* not already evicted).
+    /// `false` means the evict was a no-op safety measure (blob never
+    /// cached, or already in `evicted.log`). For a real evict the
+    /// effect is durable; for a dry-run no effect is committed and the
+    /// `was_present` snapshot describes the current state only.
     pub was_present: bool,
+    /// `true` when this response describes a dry-run preview — the
+    /// cache state was *not* mutated and only [`Self::preview`] is
+    /// meaningful. `false` (the default) means the eviction was
+    /// applied per the existing `admin_v1_evict` behaviour.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Pre-evict snapshot of the blob's local-cache state (#379).
+    /// Populated for both real and dry-run calls so an operator's
+    /// audit log captures size and pin status at the moment of
+    /// evict. The struct is nested (rather than flattened into
+    /// [`Self`]) so the `--dry-run` view doesn't push the bool count
+    /// past the `clippy::struct_excessive_bools` threshold and so a
+    /// future addition to the snapshot doesn't churn the top-level
+    /// response shape.
+    #[serde(default)]
+    pub preview: EvictPreview,
+}
+
+/// Pre-evict snapshot returned inside [`EvictResponse::preview`].
+/// Mirrors [`decdn_cache::EvictionPreview`] minus the engine-internal
+/// `served` field (folded into [`EvictResponse::was_present`]).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EvictPreview {
+    /// Bytes the iroh-blobs store reports for this hash, read straight
+    /// from the underlying store regardless of evicted-log state.
+    /// `None` when the blob isn't in the store. `Partial` blobs (an
+    /// interrupted pull) report whatever size the store has so far —
+    /// operators can spot a half-finished pull while inspecting.
+    #[serde(default)]
+    pub size_bytes: Option<u64>,
+    /// Microseconds elapsed since the last `get()` against this hash.
+    /// `None` when no access has been recorded — typical for a hash
+    /// that was just inserted but never re-served, or one that has
+    /// been logically evicted (eviction clears the access entry).
+    #[serde(default)]
+    pub last_accessed_us_ago: Option<u64>,
+    /// Whether the hash is in the operator-pinned set (#276).
+    /// Pinning protects against LRU eviction but **not** against an
+    /// explicit `admin_v1_evict`; surfaced here so dry-run callers
+    /// can confirm policy state before issuing the real takedown.
+    #[serde(default)]
+    pub pinned: bool,
+    /// Whether the hash is already in `<cache_dir>/evicted.log`.
+    /// `true` means a real `admin_v1_evict` would short-circuit
+    /// (idempotent re-run, no log line appended).
+    #[serde(default)]
+    pub already_evicted: bool,
 }
 
 /// Response body for `admin_v1_announce` (issue #280).
@@ -357,6 +419,15 @@ pub trait AdminRpc {
     /// eviction is logical (the iroh-blobs store still holds the bytes
     /// until #233 lands a public `delete`) but is persisted to
     /// `<cache_dir>/evicted.log` so it survives a restart.
+    ///
+    /// When `req.dry_run` is `true` (issue #379) the cache state is
+    /// *not* mutated: the response carries the pre-evict snapshot
+    /// (size, last-access elapsed time, pin status, already-evicted
+    /// flag) so operators running DMCA takedowns or
+    /// corruption-recovery can confirm what the real evict will touch
+    /// before committing. The same response shape is used for the
+    /// real-evict path with the snapshot reflecting the
+    /// pre-mutation state.
     #[method(name = "evict")]
     async fn evict(&self, req: EvictRequest) -> RpcResult<EvictResponse>;
 
@@ -464,27 +535,45 @@ impl AdminRpcServer for AdminRpcImpl {
     async fn evict(&self, req: EvictRequest) -> RpcResult<EvictResponse> {
         let hash = parse_hash_arg(&req.hash)?;
 
-        // Snapshot presence first so we can report a meaningful
-        // `was_present` to the operator. Any cache I/O failure here is a
-        // genuine problem (the iroh-blobs store is misbehaving), not a
-        // routine "blob is absent" path — surface it.
-        let was_present = self
+        // One `inspect` call snapshots size, pin, evicted, served — the
+        // pre-evict state the response will carry. Any cache I/O
+        // failure here is a genuine problem (the iroh-blobs store is
+        // misbehaving), not a routine "blob is absent" path. Note that
+        // `inspect` reads `BlobStatus` directly so the size we report
+        // is the on-disk byte count, even when `already_evicted` is
+        // already true — operators want to see disk-reclaim potential.
+        let preview = self
             .state
             .cache
-            .has(hash)
+            .inspect(hash)
             .await
             .map_err(|err| cache_error_to_rpc(&err))?;
 
-        // `evict` returns `Err` if it can't durably persist the eviction
-        // (e.g. evicted-log fsync failed). For DMCA takedowns the
-        // operator must learn about that failure rather than getting an
-        // "ok" response that silently degraded to in-memory-only.
-        self.state
-            .cache
-            .evict(hash)
-            .map_err(|err| cache_error_to_rpc(&err))?;
+        // For a real evict we mutate after the inspect. For a dry-run
+        // we skip the `evict()` call entirely — the response is the
+        // snapshot only.
+        if !req.dry_run {
+            // `evict` returns `Err` if it can't durably persist the
+            // eviction (e.g. evicted-log fsync failed). For DMCA
+            // takedowns the operator must learn about that failure
+            // rather than getting an "ok" response that silently
+            // degraded to in-memory-only.
+            self.state
+                .cache
+                .evict(hash)
+                .map_err(|err| cache_error_to_rpc(&err))?;
+        }
 
-        Ok(EvictResponse { was_present })
+        Ok(EvictResponse {
+            was_present: preview.served,
+            dry_run: req.dry_run,
+            preview: EvictPreview {
+                size_bytes: preview.size_bytes,
+                last_accessed_us_ago: preview.last_accessed_us_ago,
+                pinned: preview.pinned,
+                already_evicted: preview.already_evicted,
+            },
+        })
     }
 
     async fn announce(&self) -> RpcResult<AnnounceResponse> {
@@ -857,10 +946,12 @@ mod tests {
         let resp = rpc
             .evict(EvictRequest {
                 hash: alloy::primitives::hex::encode(hash.as_bytes()),
+                dry_run: false,
             })
             .await
             .expect("evict ok");
         assert!(resp.was_present, "expected was_present=true");
+        assert!(!resp.dry_run, "real evict must not set dry_run");
 
         match cache.get(hash).await {
             Err(CacheError::NotFound { .. }) => Ok(()),
@@ -877,6 +968,7 @@ mod tests {
         let err = rpc
             .evict(EvictRequest {
                 hash: "not-hex".into(),
+                dry_run: false,
             })
             .await
             .expect_err("expected invalid-params error");
@@ -907,12 +999,189 @@ mod tests {
             alloy::primitives::hex::encode(hash.as_bytes()).to_uppercase()
         );
         let resp = rpc
-            .evict(EvictRequest { hash: upper })
+            .evict(EvictRequest {
+                hash: upper,
+                dry_run: false,
+            })
             .await
             .expect("0X-prefixed uppercase hex should parse");
         // was_present=false because the test cache has no origin and we
         // never `get`-ed the hash; the parse alone must succeed.
         assert!(!resp.was_present);
+    }
+
+    /// `admin_v1_evict { dry_run: true }` returns the pre-evict
+    /// snapshot but does *not* mutate cache state — a follow-up `has`
+    /// must still report the blob present, and a follow-up `get` must
+    /// still serve. Without this assertion a regression that ignored
+    /// the flag and ran the real `evict()` would silently slip through
+    /// (the response shape is the same; the side-effect is what
+    /// matters).
+    #[tokio::test]
+    async fn admin_evict_dry_run_does_not_mutate() -> anyhow::Result<()> {
+        use bytes::Bytes;
+        use std::future::Future;
+        use std::pin::Pin;
+
+        #[derive(Debug)]
+        struct StubOrigin {
+            data: Bytes,
+            hash: Hash,
+        }
+        impl decdn_cache::Origin for StubOrigin {
+            fn fetch(
+                &self,
+                hash: Hash,
+                _max_bytes: u64,
+            ) -> Pin<Box<dyn Future<Output = anyhow::Result<decdn_cache::OriginFetch>> + Send + '_>>
+            {
+                let result = if hash == self.hash {
+                    Ok(decdn_cache::OriginFetch::Found(self.data.clone()))
+                } else {
+                    Ok(decdn_cache::OriginFetch::NotFound)
+                };
+                Box::pin(async move { result })
+            }
+        }
+
+        let payload = b"dry-run preview";
+        let hash = Hash::new(payload);
+        let tmp = tempfile::tempdir()?;
+        let origin = Arc::new(StubOrigin {
+            data: Bytes::from(payload.to_vec()),
+            hash,
+        }) as Arc<dyn decdn_cache::Origin>;
+        let cache = CacheEngine::open(tmp.path(), Some(origin), 1).await?;
+        let _ = cache.get(hash).await?;
+
+        let state = AdminState::new(
+            Arc::new(RwLock::new(PeerTable::new(0))),
+            [0u8; 32],
+            Instant::now(),
+            cache.clone(),
+            None,
+            None,
+            Arc::new(DrainTrigger::new()),
+        );
+        let rpc = AdminRpcImpl::new(state);
+
+        let resp = rpc
+            .evict(EvictRequest {
+                hash: alloy::primitives::hex::encode(hash.as_bytes()),
+                dry_run: true,
+            })
+            .await
+            .expect("dry-run evict ok");
+
+        // Wire shape — every dry-run-only field is meaningful.
+        assert!(resp.dry_run, "expected dry_run=true on response");
+        assert!(resp.was_present, "blob primed via get(); should be served");
+        assert_eq!(
+            resp.preview.size_bytes,
+            Some(payload.len() as u64),
+            "expected size_bytes={}, got {:?}",
+            payload.len(),
+            resp.preview.size_bytes,
+        );
+        assert!(
+            resp.preview.last_accessed_us_ago.is_some(),
+            "expected Some(last_accessed_us_ago) after get()"
+        );
+        assert!(!resp.preview.pinned);
+        assert!(
+            !resp.preview.already_evicted,
+            "dry-run must not flip evicted flag"
+        );
+
+        // Cache state untouched: the blob is still served, the
+        // evicted-log entry was not created, and no fsync hit disk.
+        assert!(
+            !cache.is_evicted(hash),
+            "dry-run must not commit to evicted set"
+        );
+        assert!(cache.has(hash).await?, "dry-run must not stop serve");
+        assert!(
+            !tmp.path().join("evicted.log").exists(),
+            "dry-run must not create evicted.log"
+        );
+        Ok(())
+    }
+
+    /// A real evict followed by a dry-run on the same hash must report
+    /// `already_evicted: true` and `was_present: false` — the operator
+    /// is using dry-run to confirm an idempotent re-run is in fact a
+    /// no-op. The size field still reports the on-disk bytes since
+    /// the iroh-blobs store hasn't been GC'd yet (#233).
+    #[tokio::test]
+    async fn admin_evict_dry_run_after_real_evict_reports_already_evicted() -> anyhow::Result<()> {
+        use bytes::Bytes;
+        use std::future::Future;
+        use std::pin::Pin;
+
+        #[derive(Debug)]
+        struct StubOrigin {
+            data: Bytes,
+            hash: Hash,
+        }
+        impl decdn_cache::Origin for StubOrigin {
+            fn fetch(
+                &self,
+                hash: Hash,
+                _max_bytes: u64,
+            ) -> Pin<Box<dyn Future<Output = anyhow::Result<decdn_cache::OriginFetch>> + Send + '_>>
+            {
+                let result = if hash == self.hash {
+                    Ok(decdn_cache::OriginFetch::Found(self.data.clone()))
+                } else {
+                    Ok(decdn_cache::OriginFetch::NotFound)
+                };
+                Box::pin(async move { result })
+            }
+        }
+
+        let payload = b"already-evicted preview";
+        let hash = Hash::new(payload);
+        let tmp = tempfile::tempdir()?;
+        let origin = Arc::new(StubOrigin {
+            data: Bytes::from(payload.to_vec()),
+            hash,
+        }) as Arc<dyn decdn_cache::Origin>;
+        let cache = CacheEngine::open(tmp.path(), Some(origin), 1).await?;
+        let _ = cache.get(hash).await?;
+        cache.evict(hash)?;
+
+        let state = AdminState::new(
+            Arc::new(RwLock::new(PeerTable::new(0))),
+            [0u8; 32],
+            Instant::now(),
+            cache,
+            None,
+            None,
+            Arc::new(DrainTrigger::new()),
+        );
+        let rpc = AdminRpcImpl::new(state);
+
+        let resp = rpc
+            .evict(EvictRequest {
+                hash: alloy::primitives::hex::encode(hash.as_bytes()),
+                dry_run: true,
+            })
+            .await
+            .expect("dry-run evict ok");
+
+        assert!(resp.dry_run);
+        assert!(
+            !resp.was_present,
+            "post-evict has() should report absent → was_present=false"
+        );
+        assert!(
+            resp.preview.already_evicted,
+            "expected already_evicted=true on a re-run"
+        );
+        // On-disk size still reported — operators want to see the
+        // disk-reclaim potential even though `served=false`.
+        assert_eq!(resp.preview.size_bytes, Some(payload.len() as u64));
+        Ok(())
     }
 
     #[tokio::test]
