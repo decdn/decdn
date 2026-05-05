@@ -173,6 +173,50 @@ pub struct PinDiff {
     pub removed: usize,
 }
 
+/// Read-only snapshot of a hash's local-cache state, returned by
+/// [`CacheEngine::inspect`]. Backs `decdn node evict --dry-run`
+/// (issue #379): operators running DMCA takedowns or
+/// corruption-recovery want to confirm the blob's size, last-access
+/// time, pin status, and already-evicted flag before mutating state.
+///
+/// All fields reflect the *underlying* cache state — `size_bytes` reads
+/// from the iroh-blobs store directly, so a hash that has already been
+/// logically evicted (and whose bytes are still on disk pending the
+/// follow-up GC sweep in #233) still reports its on-disk size here.
+/// That keeps dry-run honest about disk reclaim potential rather than
+/// hiding it once the operator has flipped the evicted flag.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct EvictionPreview {
+    /// Bytes the iroh-blobs store reports for this hash. `None` when the
+    /// blob isn't in the store; matches `BlobStatus::NotFound`. Partial
+    /// blobs (`BlobStatus::Partial { size }`) report whatever size the
+    /// store has so far — the operator sees how much disk a partial
+    /// pull is occupying.
+    pub size_bytes: Option<u64>,
+    /// Microseconds elapsed since the blob was last served via
+    /// [`CacheEngine::get`]. `None` when no access has been recorded —
+    /// typical for a hash that was just inserted but never re-served,
+    /// or for one that has been logically evicted (eviction clears the
+    /// access entry).
+    pub last_accessed_us_ago: Option<u64>,
+    /// Whether the hash is in the operator-pinned set (#276). Pinning
+    /// protects against LRU eviction but **not** against an explicit
+    /// [`CacheEngine::evict`]; surfaced here so a dry-run operator can
+    /// spot the case before running the takedown.
+    pub pinned: bool,
+    /// Whether the hash already lives in `<cache_dir>/evicted.log`.
+    /// `true` means a real [`CacheEngine::evict`] would short-circuit
+    /// at the idempotency guard at the top of `evict()` — the dry-run
+    /// is reporting on a no-op.
+    pub already_evicted: bool,
+    /// Whether [`CacheEngine::has`] would currently return `true` for
+    /// this hash — equivalently, `BlobStatus::Complete` *and* not
+    /// already evicted. Pre-computed inside `inspect()` so the admin
+    /// RPC doesn't need a second `has()` round-trip to fill the
+    /// `was_present` field on its response.
+    pub served: bool,
+}
+
 /// Snapshot of access times for blobs that are eligible for LRU
 /// eviction — i.e. **pinned hashes are already excluded**. Returned by
 /// [`CacheEngine::eviction_candidates`].
@@ -523,6 +567,69 @@ impl CacheEngine {
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&hash);
         Ok(())
+    }
+
+    /// Read-only inspection of a hash's local cache state, used by
+    /// `admin_v1_evict { dry_run: true }` (issue #379) to preview what
+    /// an [`Self::evict`] call would touch without mutating any state.
+    ///
+    /// Performs a single `BlobStatus` query against the underlying
+    /// store and reuses the cheap in-memory lookups for pin / access /
+    /// already-evicted flags. The returned [`EvictionPreview`] also
+    /// pre-computes a `served` bool so admin can derive `was_present`
+    /// without a follow-up [`Self::has`] call.
+    ///
+    /// Lock structure: the three in-memory probes hit independent
+    /// synchronization primitives — `evicted` (`Mutex<HashSet>`),
+    /// `access_times` (`Mutex<HashMap>`), and `pinned` (`ArcSwap`).
+    /// Each is held for an O(1) lookup; merging them into a single
+    /// lock acquisition would require either combining the underlying
+    /// data structures (a much larger refactor that would couple
+    /// unrelated invariants) or holding a coarser lock across the
+    /// async `BlobStatus` call (which would block the `get()` hot
+    /// path on whichever store backend is slower). Same pattern as
+    /// [`Self::eviction_candidates`].
+    pub async fn inspect(&self, hash: Hash) -> CacheResult<EvictionPreview> {
+        let status = self
+            .inner
+            .store
+            .blobs()
+            .status(hash)
+            .await
+            .map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
+
+        // Decompose `BlobStatus` once: `complete` feeds `served`,
+        // `size_bytes` feeds the wire response. Keeping the `match` here
+        // (rather than splitting into two helpers) makes the mapping
+        // between iroh-blobs states and our preview fields auditable in
+        // one place.
+        let (size_bytes, complete) = match status {
+            iroh_blobs::api::blobs::BlobStatus::NotFound => (None, false),
+            iroh_blobs::api::blobs::BlobStatus::Partial { size } => (size, false),
+            iroh_blobs::api::blobs::BlobStatus::Complete { size } => (Some(size), true),
+        };
+
+        let already_evicted = self.is_evicted(hash);
+        // `served` mirrors the `has()` semantic: complete AND not
+        // evicted. Pre-computed here so admin doesn't issue a second
+        // round-trip to compute `was_present`.
+        let served = complete && !already_evicted;
+
+        let last_accessed_us_ago = self.last_accessed(hash).map(|inst| {
+            // Saturate-on-overflow rather than panic. `Instant::elapsed`
+            // can theoretically exceed u64::MAX microseconds on a
+            // process that's been up for ~580k years; defensive against
+            // a future test that builds an `Instant` from a stub.
+            u64::try_from(inst.elapsed().as_micros()).unwrap_or(u64::MAX)
+        });
+
+        Ok(EvictionPreview {
+            size_bytes,
+            last_accessed_us_ago,
+            pinned: self.is_pinned(hash),
+            already_evicted,
+            served,
+        })
     }
 
     /// Has this hash been logically evicted via [`Self::evict`]?
@@ -1375,6 +1482,123 @@ mod tests {
             !engine.is_evicted(hash),
             "in-memory set must not commit when persistence fails",
         );
+        Ok(())
+    }
+
+    // ----- inspect / dry-run preview (#379) -----
+
+    /// `inspect` on a freshly-opened cache must report all the
+    /// "absent" sentinels: no size, no last access, not pinned, not
+    /// evicted, not served. Locks the wire-shape contract so a
+    /// regression that defaulted `served` to `true` (or that swallowed
+    /// the iroh-blobs `NotFound` arm) is caught on every CI run.
+    #[tokio::test]
+    async fn inspect_unknown_hash_reports_absent() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let engine = CacheEngine::open(tmp.path(), None, 10).await?;
+        let unknown = Hash::new(b"never seen");
+
+        let preview = engine.inspect(unknown).await?;
+        anyhow::ensure!(preview.size_bytes.is_none(), "expected size_bytes=None");
+        anyhow::ensure!(
+            preview.last_accessed_us_ago.is_none(),
+            "expected last_accessed_us_ago=None"
+        );
+        anyhow::ensure!(!preview.pinned, "expected pinned=false");
+        anyhow::ensure!(!preview.already_evicted, "expected already_evicted=false");
+        anyhow::ensure!(!preview.served, "expected served=false");
+        Ok(())
+    }
+
+    /// After a successful pull-through `get`, `inspect` reports the
+    /// concrete blob size, a finite `last_accessed_us_ago`, and
+    /// `served=true`. Asserts the size matches the payload exactly so
+    /// a regression that returned the partial-blob size (or a wrong
+    /// match arm in the `BlobStatus` decode) fails loudly.
+    #[tokio::test]
+    async fn inspect_after_get_reports_size_and_served() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"inspect me";
+        let hash = Hash::new(payload);
+        let origin = StubOrigin::new(payload);
+
+        let engine = CacheEngine::open(tmp.path(), Some(Arc::new(origin)), 10).await?;
+        let _ = engine.get(hash).await?;
+
+        let preview = engine.inspect(hash).await?;
+        anyhow::ensure!(
+            preview.size_bytes == Some(payload.len() as u64),
+            "expected size_bytes={:?}, got {:?}",
+            Some(payload.len() as u64),
+            preview.size_bytes,
+        );
+        anyhow::ensure!(
+            preview.last_accessed_us_ago.is_some(),
+            "expected Some(last_accessed_us_ago) after get()"
+        );
+        anyhow::ensure!(preview.served, "expected served=true");
+        anyhow::ensure!(!preview.already_evicted, "expected already_evicted=false");
+        anyhow::ensure!(!preview.pinned, "expected pinned=false");
+        Ok(())
+    }
+
+    /// `inspect` after `evict` must still report the on-disk
+    /// `size_bytes` (until #233 reclaims) but flip `already_evicted`
+    /// to `true` and `served` to `false`. The size-still-reported part
+    /// is the load-bearing assertion: dry-run callers want to see
+    /// disk-reclaim potential, not a clean `None` that hides the bytes.
+    #[tokio::test]
+    async fn inspect_after_evict_keeps_size_but_flips_served() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"evicted blob";
+        let hash = Hash::new(payload);
+        let origin = StubOrigin::new(payload);
+
+        let engine = CacheEngine::open(tmp.path(), Some(Arc::new(origin)), 10).await?;
+        let _ = engine.get(hash).await?;
+        engine.evict(hash)?;
+
+        let preview = engine.inspect(hash).await?;
+        anyhow::ensure!(
+            preview.size_bytes == Some(payload.len() as u64),
+            "expected size_bytes still reported post-evict, got {:?}",
+            preview.size_bytes,
+        );
+        anyhow::ensure!(preview.already_evicted, "expected already_evicted=true");
+        anyhow::ensure!(!preview.served, "expected served=false post-evict");
+        // Eviction clears the access-time entry, so this should now be None.
+        anyhow::ensure!(
+            preview.last_accessed_us_ago.is_none(),
+            "expected last_accessed cleared by evict, got {:?}",
+            preview.last_accessed_us_ago,
+        );
+        Ok(())
+    }
+
+    /// `inspect` reflects the operator-pinned set without needing a
+    /// blob to be cached. The pinned flag must be observable for
+    /// hashes the operator hasn't fetched yet — that's the whole
+    /// point of pre-flight dry-run: confirm policy state before
+    /// committing to evict.
+    #[tokio::test]
+    async fn inspect_reports_pinned_flag() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pinned_hash = Hash::new(b"pinned");
+        let other_hash = Hash::new(b"other");
+        let mut set = HashSet::new();
+        set.insert(pinned_hash);
+        let engine =
+            CacheEngine::open_with_pinned(tmp.path(), None, 10, PinnedHashes::new(set)).await?;
+
+        let pinned_preview = engine.inspect(pinned_hash).await?;
+        anyhow::ensure!(pinned_preview.pinned, "expected pinned=true");
+        anyhow::ensure!(
+            !pinned_preview.served,
+            "pinned-but-uncached blob should not be served"
+        );
+
+        let other_preview = engine.inspect(other_hash).await?;
+        anyhow::ensure!(!other_preview.pinned, "unrelated hash must not be pinned");
         Ok(())
     }
 }

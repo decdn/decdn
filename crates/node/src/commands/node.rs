@@ -108,7 +108,9 @@ pub async fn health(args: &cli::HealthArgs, global_config: Option<&Path>) -> any
 }
 
 /// `decdn node evict`: call `admin_v1_evict` on the running node to
-/// forcibly remove a single blob from the local cache (issue #279).
+/// forcibly remove a single blob from the local cache (issue #279), or
+/// preview what the evict would touch when `--dry-run` is set (issue
+/// #379).
 pub async fn evict(args: &cli::EvictArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
     anyhow::ensure!(
         args.timeout_ms > 0,
@@ -127,6 +129,7 @@ pub async fn evict(args: &cli::EvictArgs, global_config: Option<&Path>) -> anyho
     let resp: EvictResponse = client
         .evict(EvictRequest {
             hash: args.hash.clone(),
+            dry_run: args.dry_run,
         })
         .await
         .map_err(|err| classify_client_error(&url, args.timeout_ms, err))?;
@@ -135,6 +138,13 @@ pub async fn evict(args: &cli::EvictArgs, global_config: Option<&Path>) -> anyho
         let pretty =
             serde_json::to_string_pretty(&resp).context("failed to encode evict response")?;
         println!("{pretty}");
+    } else if args.dry_run {
+        // Multi-line, grep-friendly so operators can pipe through
+        // `grep size_bytes=` / `grep already_evicted=` in scripts. Each
+        // line stands on its own; the "dry_run=true" tag is the
+        // load-bearing indicator that no state was mutated.
+        write_dry_run_human(&mut io::stdout().lock(), &args.hash, &resp)
+            .context("failed to write dry-run preview")?;
     } else {
         let presence = if resp.was_present {
             "evicted"
@@ -147,6 +157,32 @@ pub async fn evict(args: &cli::EvictArgs, global_config: Option<&Path>) -> anyho
         println!("hash={} status={presence}", args.hash);
     }
 
+    Ok(())
+}
+
+/// Format the dry-run preview as a multi-line plain-text block. Pure
+/// function (takes `&mut impl Write`) so unit tests can assert exact
+/// output without an HTTP round-trip — same pattern as
+/// [`write_peers_table`].
+fn write_dry_run_human(w: &mut impl io::Write, hash: &str, resp: &EvictResponse) -> io::Result<()> {
+    writeln!(w, "hash={hash}")?;
+    writeln!(w, "dry_run=true")?;
+    writeln!(w, "was_present={}", resp.was_present)?;
+    writeln!(w, "pinned={}", resp.preview.pinned)?;
+    writeln!(w, "already_evicted={}", resp.preview.already_evicted)?;
+    match resp.preview.size_bytes {
+        Some(b) => writeln!(w, "size_bytes={b}")?,
+        // Distinct from "0" (a legitimately empty blob); operators
+        // seeing `not_stored` know the iroh-blobs status reported
+        // `NotFound`, not `Complete { size: 0 }`.
+        None => writeln!(w, "size_bytes=not_stored")?,
+    }
+    match resp.preview.last_accessed_us_ago {
+        Some(us) => writeln!(w, "last_accessed={}", format_age(us))?,
+        // Distinct from "<1s ago"; operators want to know the
+        // engine has *no* access record vs a very recent one.
+        None => writeln!(w, "last_accessed=never")?,
+    }
     Ok(())
 }
 
@@ -787,5 +823,74 @@ mod tests {
     fn short_node_id_passthrough_when_already_short() {
         let s = short_node_id("abcd");
         assert_eq!(s, "abcd");
+    }
+
+    /// `--dry-run` plain output is multi-line, key=value, grep-friendly.
+    /// Asserts every load-bearing field appears on its own line so a
+    /// regression that collapsed the table back to one line (or dropped
+    /// e.g. `pinned=`) breaks here rather than silently eating the
+    /// information the operator needs to decide whether to run the real
+    /// evict.
+    #[test]
+    fn write_dry_run_human_emits_all_fields() -> anyhow::Result<()> {
+        use crate::admin::EvictPreview;
+        let resp = EvictResponse {
+            was_present: true,
+            dry_run: true,
+            preview: EvictPreview {
+                size_bytes: Some(1024),
+                last_accessed_us_ago: Some(2_000_000), // 2s ago via format_age
+                pinned: true,
+                already_evicted: false,
+            },
+        };
+        let mut buf = Vec::<u8>::new();
+        write_dry_run_human(&mut buf, "abcd", &resp)?;
+        let s = String::from_utf8(buf)?;
+        assert!(s.contains("hash=abcd"), "missing hash: {s}");
+        assert!(s.contains("dry_run=true"), "missing dry_run tag: {s}");
+        assert!(s.contains("was_present=true"), "missing was_present: {s}");
+        assert!(s.contains("pinned=true"), "missing pinned: {s}");
+        assert!(
+            s.contains("already_evicted=false"),
+            "missing already_evicted: {s}"
+        );
+        assert!(s.contains("size_bytes=1024"), "missing size_bytes: {s}");
+        assert!(
+            s.contains("last_accessed=2s ago"),
+            "expected formatted last_accessed, got: {s}"
+        );
+        Ok(())
+    }
+
+    /// Sentinels for the "no information available" cases:
+    /// `size_bytes=not_stored` and `last_accessed=never`. Distinct from
+    /// "0" / "<1s ago" so an operator can tell "the engine has no
+    /// record" from "the record is at the floor".
+    #[test]
+    fn write_dry_run_human_uses_sentinels_for_absent_fields() -> anyhow::Result<()> {
+        use crate::admin::EvictPreview;
+        let resp = EvictResponse {
+            was_present: false,
+            dry_run: true,
+            preview: EvictPreview {
+                size_bytes: None,
+                last_accessed_us_ago: None,
+                pinned: false,
+                already_evicted: false,
+            },
+        };
+        let mut buf = Vec::<u8>::new();
+        write_dry_run_human(&mut buf, "deadbeef", &resp)?;
+        let s = String::from_utf8(buf)?;
+        assert!(
+            s.contains("size_bytes=not_stored"),
+            "expected not_stored sentinel, got: {s}"
+        );
+        assert!(
+            s.contains("last_accessed=never"),
+            "expected never sentinel, got: {s}"
+        );
+        Ok(())
     }
 }

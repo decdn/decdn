@@ -13,7 +13,9 @@ pub mod engine;
 pub mod error;
 pub mod origin;
 
-pub use engine::{CacheEngine, CacheStats, EvictionCandidates, PinDiff, PinnedHashes};
+pub use engine::{
+    CacheEngine, CacheStats, EvictionCandidates, EvictionPreview, PinDiff, PinnedHashes,
+};
 pub use error::{CacheError, CacheResult, OriginError, SupportedEncoding};
 pub use iroh_blobs::Hash;
 pub use origin::{

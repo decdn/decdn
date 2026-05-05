@@ -104,6 +104,13 @@ pub struct HealthArgs {
 /// is persisted to `<cache_dir>/evicted.log` so it survives restarts.
 /// Operators using this for DMCA takedowns can rely on the takedown
 /// being durable across `decdn run` invocations.
+///
+/// Pass `--dry-run` (issue #379) to preview what the evict would touch
+/// — blob size, last-access elapsed time, pin status, and already-
+/// evicted flag — without mutating any cache state. Useful as a
+/// pre-flight check before a DMCA takedown so operators can confirm
+/// the right blob and notice cases like "this hash is pinned" or
+/// "this is an idempotent re-run".
 #[derive(Args, Debug)]
 pub struct EvictArgs {
     /// BLAKE3 hash of the blob to evict, encoded as 64 hex characters.
@@ -111,6 +118,15 @@ pub struct EvictArgs {
     /// Operators paste this from access logs / takedown notices.
     #[arg(value_name = "HASH")]
     pub hash: String,
+
+    /// Report what *would* be evicted (blob size, last-access elapsed
+    /// time, pin status, already-evicted flag) without mutating cache
+    /// state (issue #379). Use this as a pre-flight check before
+    /// running the real takedown — operators want to confirm the right
+    /// blob and spot cases like "this hash is pinned" or "this is an
+    /// idempotent re-run" before committing to the durable eviction.
+    #[arg(long)]
+    pub dry_run: bool,
 
     /// Base URL of the node's admin HTTP surface. See `health --admin-url`
     /// for resolution precedence (flag → env → config → default).

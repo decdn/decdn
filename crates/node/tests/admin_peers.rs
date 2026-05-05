@@ -336,6 +336,7 @@ async fn cli_evict_surfaces_connection_refused() -> anyhow::Result<()> {
 
     let args = EvictArgs {
         hash: "0".repeat(64),
+        dry_run: false,
         admin_url: Some(format!("http://{addr}")),
         config: None,
         json: false,
@@ -357,6 +358,7 @@ async fn cli_evict_surfaces_connection_refused() -> anyhow::Result<()> {
 async fn cli_evict_rejects_zero_timeout() -> anyhow::Result<()> {
     let args = EvictArgs {
         hash: "0".repeat(64),
+        dry_run: false,
         admin_url: Some("http://127.0.0.1:1".to_string()),
         config: None,
         json: false,
