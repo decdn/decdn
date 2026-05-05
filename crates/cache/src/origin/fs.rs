@@ -158,14 +158,16 @@ impl Origin for FilesystemOrigin {
                 );
             }
 
-            // Pre-size to `len` to skip Vec growth reallocations. The
-            // cap above bounds `max_bytes`, which the operator
-            // configures, so the conversion to `usize` is safe on any
-            // platform we ship to. `read_to_end` will still grow the
-            // buffer if the file gets longer mid-read, which is fine
-            // (the engine's BLAKE3 check will reject the result if the
-            // bytes don't match the requested hash).
-            let cap = usize::try_from(len).unwrap_or(usize::MAX);
+            // Pre-size to `len` to skip Vec growth reallocations. On
+            // 32-bit targets a >4GB file or an operator-configured
+            // `max_bytes` past `usize::MAX` would otherwise blow up the
+            // `Vec::with_capacity` call; surface that as a typed error
+            // instead, in line with the workspace anti-panic policy.
+            // `read_to_end` will still grow the buffer if the file
+            // gets longer mid-read, which is fine — the engine's
+            // BLAKE3 check rejects the result if the bytes don't match
+            // the requested hash.
+            let cap = usize::try_from(len).context("file size exceeds addressable memory")?;
             let mut data = Vec::with_capacity(cap);
             file.read_to_end(&mut data).await.with_context(|| {
                 format!("cache.origin_path read failed for {}", canonical.display())
