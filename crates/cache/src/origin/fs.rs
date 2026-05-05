@@ -122,9 +122,23 @@ impl Origin for FilesystemOrigin {
             // symlink between the two syscalls — the size cap would
             // run on stale metadata. Holding the fd avoids that, and
             // also saves a redundant path traversal.
-            let mut file = tokio::fs::File::open(&canonical).await.with_context(|| {
-                format!("cache.origin_path open failed for {}", canonical.display())
-            })?;
+            //
+            // The file can also disappear between `canonicalize` above
+            // and this open (eviction, gc, operator cleanup); treat
+            // that the same as a missing leaf and surface `NotFound`
+            // rather than a hard error, matching the canonicalize arm.
+            let mut file = match tokio::fs::File::open(&canonical).await {
+                Ok(f) => f,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(OriginFetch::NotFound);
+                }
+                Err(err) => {
+                    return Err(anyhow::Error::from(err).context(format!(
+                        "cache.origin_path open failed for {}",
+                        canonical.display()
+                    )));
+                }
+            };
             let meta = file.metadata().await.with_context(|| {
                 format!("cache.origin_path stat failed for {}", canonical.display())
             })?;
