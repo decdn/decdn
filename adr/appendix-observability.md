@@ -12,15 +12,9 @@ Metrics are referenced throughout the protocol ADRs and listed informally in `ar
 - Alert thresholds for slash-risk metrics
 - The HTTP export format and endpoint contract
 
-Without this, operators cannot build monitoring dashboards, cannot detect slashable
-conditions before they occur, and cannot compare metrics across nodes. Instrumentation
-becomes ad-hoc, making cross-node analysis impossible.
+Without this, operators cannot build monitoring dashboards, cannot detect slashable conditions before they occur, and cannot compare metrics across nodes. Instrumentation becomes ad-hoc, making cross-node analysis impossible.
 
-**Note on existing ADR names.** Several ADRs reference informal metric names
-(e.g., `gossip_messages_rejected_clock_skew`, `probe_hold_violations`,
-`blacklist_sync_lag_seconds` — from ADRs 001, 005, 011). This ADR is the authoritative
-canonical registry; the names below supersede those informal references. The changes are
-purely naming — the semantic intent is unchanged.
+**Note on existing ADR names.** Several ADRs reference informal metric names (e.g., `gossip_messages_rejected_clock_skew`, `probe_hold_violations`, `blacklist_sync_lag_seconds` — from ADRs 001, 005, 011). This ADR is the authoritative canonical registry; the names below supersede those informal references. The changes are purely naming — the semantic intent is unchanged.
 
 ## Decision
 
@@ -36,28 +30,21 @@ All metrics use the `decdn_` prefix, snake_case, and Prometheus-standard unit su
 
 Label names: snake_case, no abbreviations. Label values: lowercase where possible.
 
-All metrics are exported in **Prometheus text format 0.0.4** on a configurable HTTP port
-(default `9090`) at path `/metrics`. The same port exposes `/health` (see [Health
-Endpoint](#3-health-endpoint)). The port MUST be configurable via operator config; it MUST
-NOT be publicly accessible without authentication in production (firewall or auth proxy).
+All metrics are exported in **Prometheus text format 0.0.4** on a configurable HTTP port (default `9090`) at path `/metrics`. The same port exposes `/health` (see [Health Endpoint](#3-health-endpoint)). The port MUST be configurable via operator config; it MUST NOT be publicly accessible without authentication in production (firewall or auth proxy).
 
 ### 2. Metric Registry
 
 Metrics are grouped into **mandatory** (M) and **recommended** (R) tiers.
 
-**Mandatory (M):** The node MUST expose these metrics or refuse to start. They cover
-slash-risk conditions and delivery accountability.
+**Mandatory (M):** The node MUST expose these metrics or refuse to start. They cover slash-risk conditions and delivery accountability.
 
-**Recommended (R):** The node SHOULD expose these metrics. Absence is not a startup
-blocker, but operators lose visibility into specific subsystems.
+**Recommended (R):** The node SHOULD expose these metrics. Absence is not a startup blocker, but operators lose visibility into specific subsystems.
 
 ---
 
 #### 2.1 Slash-Safety Metrics (all Mandatory)
 
-These metrics provide early warning for the five slashable offenses on the slashing
-schedule in [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn). A sustained
-non-zero value for any of these requires immediate operator attention.
+These metrics provide early warning for the five slashable offenses on the slashing schedule in [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn). A sustained non-zero value for any of these requires immediate operator attention.
 
 | Metric | Type | Tier | Description |
 |--------|------|------|-------------|
@@ -161,8 +148,7 @@ Per [ADR 015](015-zero-rtt.md). All labeled by `alpn`.
 | `decdn_quic_0rtt_accepted_total` | Counter | R | 0-RTT connections accepted by server. |
 | `decdn_quic_0rtt_rejected_total` | Counter | R | 0-RTT rejected, fell back to 1-RTT. |
 
-These replace the identical names from ADR 015 — no semantic change, only now under the
-canonical naming regime.
+These replace the identical names from ADR 015 — no semantic change, only now under the canonical naming regime.
 
 ---
 
@@ -176,22 +162,9 @@ canonical naming regime.
 
 #### 2.10 Tokenomics Metrics
 
-Per [ADR 026](026-gauge-boost-tokenomics.md). These metrics expose the `FeeRouter`,
-`VotingEscrow`, and `SafetyReserve` contract surfaces to operator dashboards,
-keeper monitoring, gauge-claim debugging, governance dashboards, and the
-public reporting required by the `SafetyReserve` transparency rules
-([ADR 026 §5](026-gauge-boost-tokenomics.md), [ADR 009](009-governance.md)).
+Per [ADR 026](026-gauge-boost-tokenomics.md). These metrics expose the `FeeRouter`, `VotingEscrow`, and `SafetyReserve` contract surfaces to operator dashboards, keeper monitoring, gauge-claim debugging, governance dashboards, and the public reporting required by the `SafetyReserve` transparency rules ([ADR 026 §5](026-gauge-boost-tokenomics.md), [ADR 009](009-governance.md)).
 
-A subset of these metrics is sourced from on-chain contract state
-(`FeeRouter`, `VotingEscrow`, `SafetyReserve`, `BuybackBurner` /
-`DelegatorBuyer`) via the same RPC client the node already uses for
-blacklist polling and channel-state queries ([ADR 011](011-content-takedown.md),
-[ADR 003](003-payments.md)). They are exported via the **same Prometheus
-text-format `/metrics` endpoint, scrape interval, and retention defaults**
-defined in Section 1 — this ADR does not introduce a separate export
-pipeline. Contract-sourced gauges are sampled at the node's existing
-RPC-poll cadence; counters tracking on-chain events advance only when the
-node observes the corresponding event log.
+A subset of these metrics is sourced from on-chain contract state (`FeeRouter`, `VotingEscrow`, `SafetyReserve`, `BuybackBurner` / `DelegatorBuyer`) via the same RPC client the node already uses for blacklist polling and channel-state queries ([ADR 011](011-content-takedown.md), [ADR 003](003-payments.md)). They are exported via the **same Prometheus text-format `/metrics` endpoint, scrape interval, and retention defaults** defined in Section 1 — this ADR does not introduce a separate export pipeline. Contract-sourced gauges are sampled at the node's existing RPC-poll cadence; counters tracking on-chain events advance only when the node observes the corresponding event log.
 
 ##### 2.10.1 FeeRouter Metrics
 
@@ -274,29 +247,21 @@ node observes the corresponding event log.
 | `degraded` | Node is running but one or more non-critical conditions are impaired (e.g., gossip mesh thin, 0-RTT cache cold). Traffic is still accepted. |
 | `not_ready` | A mandatory startup check has failed or not yet completed (blacklist un-synced, rate bounds not loaded, not registered). Node is not accepting traffic. |
 
-HTTP status codes: `200` for `ready` and `degraded`; `503` for `not_ready`. Monitoring
-systems SHOULD alert on `503` responses.
+HTTP status codes: `200` for `ready` and `degraded`; `503` for `not_ready`. Monitoring systems SHOULD alert on `503` responses.
 
 ---
 
 ### 4. Structured Logging
 
-Metrics cover aggregates. Structured logs cover per-event detail. The two systems are
-complementary — logs are not a substitute for metrics.
+Metrics cover aggregates. Structured logs cover per-event detail. The two systems are complementary — logs are not a substitute for metrics.
 
 - **Library:** `tracing` crate (standard in the iroh ecosystem).
-- **Format:** JSON (`tracing-subscriber` with `json` formatter) for machine consumption
-  in production. Human-readable (`pretty`) format available via config flag for local
-  development.
+- **Format:** JSON (`tracing-subscriber` with `json` formatter) for machine consumption in production. Human-readable (`pretty`) format available via config flag for local development.
 - **Log levels:**
-  - `ERROR` — unrecoverable conditions requiring operator intervention (startup failures,
-    slash-evidence exposure, RPC endpoint unreachable after all retries).
-  - `WARN` — recoverable degraded conditions (blacklist poll lag > 1 interval, clock
-    skew > 10 s detected at startup, probe hold slot saturation > 90%).
-  - `INFO` — significant lifecycle events (node ready, channel opened/settled, peer
-    joined/left, `NodeAnnounce` published).
-  - `DEBUG` — per-stream and per-probe events. Not for production use at high traffic
-    volumes.
+  - `ERROR` — unrecoverable conditions requiring operator intervention (startup failures, slash-evidence exposure, RPC endpoint unreachable after all retries).
+  - `WARN` — recoverable degraded conditions (blacklist poll lag > 1 interval, clock skew > 10 s detected at startup, probe hold slot saturation > 90%).
+  - `INFO` — significant lifecycle events (node ready, channel opened/settled, peer joined/left, `NodeAnnounce` published).
+  - `DEBUG` — per-stream and per-probe events. Not for production use at high traffic volumes.
 
 **Mandatory log fields** on every event:
 
@@ -309,9 +274,7 @@ complementary — logs are not a substitute for metrics.
 
 ### 5. Canonical Metric Name Cross-Reference
 
-Earlier ADRs used informal metric names. This table maps them to their canonical
-replacements. **No wire protocol or on-chain change is required** — these are
-instrumentation names only.
+Earlier ADRs used informal metric names. This table maps them to their canonical replacements. **No wire protocol or on-chain change is required** — these are instrumentation names only.
 
 | Informal name (prior ADR) | Canonical name (this ADR) | Source ADR |
 |---------------------------|---------------------------|------------|
@@ -360,34 +323,18 @@ A reference Grafana dashboard and starter Prometheus alerting rules ship in the 
 
 **Positive:**
 
-- Operators have a single reference for dashboard configuration — no more hunting
-  across 8 ADRs for metric names.
-- Mandatory M-tier slash-risk metrics are enforced at startup, ensuring operators
-  cannot accidentally run without slash-risk visibility.
-- Canonical `decdn_` prefix and `_total` suffix allow automated registry validation
-  (e.g., a CI check that all exported metric names match the registry).
+- Operators have a single reference for dashboard configuration — no more hunting across 8 ADRs for metric names.
+- Mandatory M-tier slash-risk metrics are enforced at startup, ensuring operators cannot accidentally run without slash-risk visibility.
+- Canonical `decdn_` prefix and `_total` suffix allow automated registry validation (e.g., a CI check that all exported metric names match the registry).
 - Alert thresholds provide actionable defaults for new operators.
-- The `/health` endpoint integrates with standard load balancers and container
-  orchestration readiness probes without parsing Prometheus text.
+- The `/health` endpoint integrates with standard load balancers and container orchestration readiness probes without parsing Prometheus text.
 
 **Negative:**
 
-- Existing ADRs reference informal metric names that differ from the canonical names
-  defined here. The cross-reference table (Section 6) documents all renames; no ADR is
-  retroactively edited to avoid churn on draft documents, but implementations must use
-  the canonical names from this ADR.
-- Mandatory metrics add startup complexity — the node must successfully initialize all
-  M-tier metric collectors before accepting connections. This is a small overhead in
-  exchange for guaranteed observability.
+- Existing ADRs reference informal metric names that differ from the canonical names defined here. The cross-reference table (Section 6) documents all renames; no ADR is retroactively edited to avoid churn on draft documents, but implementations must use the canonical names from this ADR.
+- Mandatory metrics add startup complexity — the node must successfully initialize all M-tier metric collectors before accepting connections. This is a small overhead in exchange for guaranteed observability.
 
 ## Future Work
 
-- **OpenMetrics migration.** Prometheus text format 0.0.4 is the current default; the
-  OpenMetrics exposition format (used by `prometheus_client` crate's `MetricsEncoder`)
-  adds exemplars and native histograms — evaluate once tooling support is broader.
-- **Tokenomics + reputation dashboard panels.** The reference dashboard in
-  [`monitoring/grafana-dashboard.json`](../monitoring/grafana-dashboard.json) is
-  deliberately scoped to M-tier core operations. §2.7 reputation and §2.10
-  tokenomics metrics warrant their own dedicated dashboards (governance,
-  delegator-yield, gauge-claim debugging) — these are deployment-specific and
-  belong outside the reference set.
+- **OpenMetrics migration.** Prometheus text format 0.0.4 is the current default; the OpenMetrics exposition format (used by `prometheus_client` crate's `MetricsEncoder`) adds exemplars and native histograms — evaluate once tooling support is broader.
+- **Tokenomics + reputation dashboard panels.** The reference dashboard in [`monitoring/grafana-dashboard.json`](../monitoring/grafana-dashboard.json) is deliberately scoped to M-tier core operations. §2.7 reputation and §2.10 tokenomics metrics warrant their own dedicated dashboards (governance, delegator-yield, gauge-claim debugging) — these are deployment-specific and belong outside the reference set.

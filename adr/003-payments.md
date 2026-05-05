@@ -157,15 +157,13 @@ This means the network self-balances: popular content gets replicated because ca
 
 ### Client-side
 
-**Voucher withholding**
-Client receives bytes but stops signing vouchers, getting content for free up to the last signed interval.
+**Voucher withholding** Client receives bytes but stops signing vouchers, getting content for free up to the last signed interval.
 
 The self-enforcing stop is sufficient. Maximum loss is one voucher interval at the negotiated cadence. At the default cadence (1 MB × market rate ≈ $0.00001), risk is negligible. At a negotiated interval of 100 MB at market rate, loss is ~$0.001. At the governance maximum (1024 MB) at ceiling rate, loss is ~$1.024 — still economically negligible relative to channel deposits. Nodes serving high-value content can unilaterally enforce smaller intervals regardless of what was negotiated. No additional mechanism needed — this is fully addressed by the protocol design.
 
 ---
 
-**Channel griefing**
-Client opens many channels with minimum deposit and never streams, forcing nodes to track and eventually close stale channels.
+**Channel griefing** Client opens many channels with minimum deposit and never streams, forcing nodes to track and eventually close stale channels.
 
 **Resolved: provider-initiated zero-voucher close.** The provider can call `closeChannel` with `amount=0, nonce=0`, and an empty signature (`signature.length == 0`) on any channel where no vouchers have been submitted (`claimedNonce == 0`), immediately entering the close→dispute→settle lifecycle. This bounds the maximum tracking duration to the dispute window (48 hours PoC default) rather than the full 90-day channel expiry. The dispute window protects clients — if a valid voucher exists, the client or a watchtower can submit it via `disputeChannel`. At settlement, the full deposit is refunded to the client. No additional inactivity timer or separate expiry mechanism beyond the existing channel expiry / `reclaimExpired` path is needed; that existing escape hatch remains required for cases where the provider disappears without initiating a close.
 
@@ -176,15 +174,13 @@ The financial cost to the attacker remains bounded: at the recommended 10 USDC p
 
 ---
 
-**Stale close**
-Client submits an old voucher (lower amount) to close the channel, underpaying the node.
+**Stale close** Client submits an old voucher (lower amount) to close the channel, underpaying the node.
 
 The dispute window (default 48 hours for PoC, raised from 24 hours to account for L2 forced-inclusion delay; see [ADR 007](007-watchtower.md#l2-sequencer-censorship)) covers this if the node is online. The liveness gap — node offline during the window — is the entire problem [ADR 007](007-watchtower.md) addresses: non-custodial watchtowers + an in-process dispute monitor + (production) a forced-inclusion deadline extension.
 
 ---
 
-**Probe fishing**
-Client sends probe requests to many nodes at high frequency to map the network or exhaust node resources without ever paying.
+**Probe fishing** Client sends probe requests to many nodes at high frequency to map the network or exhaust node resources without ever paying.
 
 The current mitigation is weak. Clients are not staked — their NodeIds are free to rotate — so per-NodeId rate limiting is bypassable. The iroh connection setup cost is also low. Options:
 
@@ -197,8 +193,7 @@ The current mitigation is weak. Clients are not staked — their NodeIds are fre
 
 ---
 
-**Double-spend across nodes**
-Client opens channels with multiple nodes using the same USDC deposit via a race condition before the on-chain state settles.
+**Double-spend across nodes** Client opens channels with multiple nodes using the same USDC deposit via a race condition before the on-chain state settles.
 
 Fully solved. Each `openChannel` call transfers USDC into the contract immediately; the client's wallet balance is debited on-chain before the transaction finalises. No credit facility exists.
 
@@ -206,29 +201,25 @@ Fully solved. Each `openChannel` call transfers USDC into the contract immediate
 
 ### Node-side
 
-**Data withholding**
-Node accepts a stream request, receives a voucher, then stops delivering bytes.
+**Data withholding** Node accepts a stream request, receives a voucher, then stops delivering bytes.
 
 Fully solved by the self-enforcing protocol. The node cannot extract more payment than the last acknowledged voucher. The client resumes from `byte_offset` on a different node.
 
 ---
 
-**Corrupted delivery**
-Node serves bytes that don't match the advertised BLAKE3 hash.
+**Corrupted delivery** Node serves bytes that don't match the advertised BLAKE3 hash.
 
 Caught at the client by BLAKE3 verification. The on-chain slash-evidence path is in [ADR 014 § 2](014-on-chain-verification.md#2-blake3-content-corruption--optimistic-challenge-response): single-round optimistic challenge-response for PoC (signed `StreamResponse` + 100 TOKEN bond, 24h counter window), upgraded to an interactive keccak256 Merkle proof over 1024-byte chunks for production.
 
 ---
 
-**Rate bait-and-switch**
-Node advertises a low rate in probe responses then returns a higher rate in `StreamResponse`.
+**Rate bait-and-switch** Node advertises a low rate in probe responses then returns a higher rate in `StreamResponse`.
 
 **Resolved: slashable offense.** Both responses are signed over the advertised rate ([ADR 005](005-protocol.md)); a same-NodeId signed pair where `StreamResponse.rate_per_mb > ProbeResponse.rate_per_mb` and the requester-anchored timestamp delta is under 30 seconds is on-chain-verifiable evidence. Clock-skew immune (both timestamps originate from the requester's clock; the node echoes them back in its signed response). The slash schedule lives in [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn); see [ADR 014 § 1](014-on-chain-verification.md#1-ed25519-signature-verification--dual-key-slash-signatures) for the on-chain verifier.
 
 ---
 
-**Phantom blob announcement**
-Node announces a blob as cached (`has_blob: true` in a signed `ProbeResponse`) then fails or redirects on actual request.
+**Phantom blob announcement** Node announces a blob as cached (`has_blob: true` in a signed `ProbeResponse`) then fails or redirects on actual request.
 
 **Resolved: slashable offense.** A same-NodeId signed `ProbeResponse(has_blob: true)` paired with a signed `StreamResponse(ok: false)` or redirect for the same hash within a 30-second requester-anchored timestamp window is on-chain-verifiable evidence. The bare timeout / non-response case is reputation-only (no second signed message → not slashable on-chain). Slash schedule per [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn); on-chain verifier per [ADR 014 § 1](014-on-chain-verification.md#1-ed25519-signature-verification--dual-key-slash-signatures); 24-hour counter-evidence window.
 
@@ -236,15 +227,13 @@ To prevent legitimate cache eviction from producing false slash evidence inside 
 
 ---
 
-**Channel close front-running**
-Node monitors the mempool and front-runs a client's channel close with a higher voucher submission.
+**Channel close front-running** Node monitors the mempool and front-runs a client's channel close with a higher voucher submission.
 
 Not a real attack. The contract always settles the highest valid voucher, and only the client can sign a valid voucher. A node submitting the latest voucher before the client is the intended happy path. Fabricating a higher voucher requires forging the client's ECDSA signature, which is cryptographically infeasible.
 
 ---
 
-**Third-party forced channel close (DoS)**
-A third party holding a valid voucher calls `closeChannel` to force the channel from `Open` to `Closing`, halting delivery.
+**Third-party forced channel close (DoS)** A third party holding a valid voucher calls `closeChannel` to force the channel from `Open` to `Closing`, halting delivery.
 
 **Resolved: access control restriction.** `closeChannel` requires `msg.sender == channel.client || msg.sender == channel.provider`. Third parties cannot initiate a close regardless of whether they hold a valid voucher. Watchtower functionality is unaffected — watchtowers operate via `disputeChannel` during the dispute window. The residual risk is a `disputeChannel` call with an intercepted voucher, which can only *improve* the settlement (higher nonce required). On-path network interception of vouchers is mitigated by QUIC transport (TLS 1.3), though this does not address endpoint compromise or other forms of leakage.
 
@@ -252,22 +241,19 @@ A third party holding a valid voucher calls `closeChannel` to force the channel 
 
 ### Network-level
 
-**Eclipse attack**
-Attacker surrounds a client with malicious nodes so all probe responses come from nodes under attacker control.
+**Eclipse attack** Attacker surrounds a client with malicious nodes so all probe responses come from nodes under attacker control.
 
 BLAKE3 verification catches data corruption regardless of peer-table composition; the remaining DoS variant (attacker-controlled peer set refuses to serve) is resolved in [ADR 012 § Bootstrap and Trust Model](012-client.md): production uses multi-source bootstrap (on-chain registry + hardcoded DNS seeds) so an attacker must compromise both to fully eclipse a client; minimum honest-peer diversity is a supplementary client-side policy. PoC is registry-only.
 
 ---
 
-**Gossip flooding**
-Node sends high-volume `NodeAnnounce` messages to exhaust peer table memory or crowd out legitimate announcements.
+**Gossip flooding** Node sends high-volume `NodeAnnounce` messages to exhaust peer table memory or crowd out legitimate announcements.
 
 Registry check + per-sender rate limiting is solid. The minor gap is that the local registry cache may be up to 10 minutes stale, briefly allowing recently-unstaked nodes to flood. Mostly solved; no strong alternative needed beyond tightening the registry cache refresh on high flood detection.
 
 ---
 
-**Sybil nodes**
-Attacker stakes many cheap nodes to dominate probe responses for popular content, controlling pricing in a region.
+**Sybil nodes** Attacker stakes many cheap nodes to dominate probe responses for popular content, controlling pricing in a region.
 
 The core weakness is token-price dependency: at $0.001/TOKEN, a minimum stake of 1,000 TOKEN costs $1 per sybil node. The unified selection score `rate_per_mb × rtt_ms × (1 / max(reputation, 0.1)²)` (see [ADR 001](001-network.md#node-selection-algorithm)) helps — a sybil fleet must be real hardware in the right geography, competitively priced, and build reputation over time — but does not eliminate the risk when the token is cheap. Options:
 
@@ -277,15 +263,13 @@ The core weakness is token-price dependency: at $0.001/TOKEN, a minimum stake of
 
 ---
 
-**Rate manipulation cartel**
-Colluding nodes in a region hold rates artificially high.
+**Rate manipulation cartel** Colluding nodes in a region hold rates artificially high.
 
 Origin-backed nodes set the effective price ceiling for any blob. Clients can always probe origin-backed nodes directly and pay their rates as a guaranteed fallback. Any node outside the cartel that undercuts wins all local traffic — the incentive to defect is strong. New entrants can join permissionlessly by staking.
 
 ---
 
-**Content withholding**
-A node stakes, responds to probes with `has_blob: true`, but refuses to serve — collecting credibility in the peer table without actually participating.
+**Content withholding** A node stakes, responds to probes with `has_blob: true`, but refuses to serve — collecting credibility in the peer table without actually participating.
 
 **Withholding is not a slashable offense** — operators may legitimately take content offline for maintenance, migration, or business reasons, and slashing for availability creates perverse incentives. Instead, withholding is handled through reputation and redundancy:
 
@@ -296,8 +280,7 @@ Note: the probe-triggered eviction hold ([ADR 005](005-protocol.md#probe-trigger
 
 ---
 
-**Replay attack on vouchers**
-Attacker intercepts a signed voucher and attempts to replay it against a different channel or after close.
+**Replay attack on vouchers** Attacker intercepts a signed voucher and attempts to replay it against a different channel or after close.
 
 Fully solved. EIP-712 typed data over `{channelId, amount, nonce, bytesDelivered, token}` binds the voucher to a specific channel. The EIP-712 domain separator (see [EIP-712 Voucher Signature](#eip-712-voucher-signature)) further binds each voucher to a specific chain and contract deployment, preventing replay across different L2s, contract upgrades, or test vs production environments. The monotonically increasing nonce (starting at 1; see [Voucher Nonce Convention](#voucher-nonce-convention)) prevents resubmission after settlement.
 

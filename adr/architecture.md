@@ -364,18 +364,11 @@ Components referenced by appendices that are operated by content providers, not 
 
 ## Observability
 
-The canonical metric registry, naming convention (`decdn_` prefix, `_total` suffix for
-counters), mandatory vs. recommended tiers, alert thresholds, and `/health` endpoint
-contract are defined in [Appendix: Observability](appendix-observability.md). The summary below is for
-orientation only — the observability appendix is authoritative.
+The canonical metric registry, naming convention (`decdn_` prefix, `_total` suffix for counters), mandatory vs. recommended tiers, alert thresholds, and `/health` endpoint contract are defined in [Appendix: Observability](appendix-observability.md). The summary below is for orientation only — the observability appendix is authoritative.
 
 - **Structured logging** via `tracing` crate (JSON in production).
-- **Metrics** via `prometheus` crate, exposed at `:{port}/metrics` (default port 9090).
-  Key metric groups: delivery (`decdn_streams_*`, `decdn_bytes_*`), cache
-  (`decdn_cache_*`), payment channels (`decdn_channels_*`, `decdn_vouchers_*`), gossip
-  (`decdn_gossip_*`, `decdn_peer_table_size`), and slash-safety (see below).
-- **Health endpoint** at `:{port}/health` — JSON with `ready`/`degraded`/`not_ready`
-  status, peer count, channel balances, and blacklist sync state.
+- **Metrics** via `prometheus` crate, exposed at `:{port}/metrics` (default port 9090). Key metric groups: delivery (`decdn_streams_*`, `decdn_bytes_*`), cache (`decdn_cache_*`), payment channels (`decdn_channels_*`, `decdn_vouchers_*`), gossip (`decdn_gossip_*`, `decdn_peer_table_size`), and slash-safety (see below).
+- **Health endpoint** at `:{port}/health` — JSON with `ready`/`degraded`/`not_ready` status, peer count, channel balances, and blacklist sync state.
 - **Slash-risk metrics** (all mandatory — nodes must expose these at startup):
   - `decdn_probe_hold_violations_total` — phantom announcement risk ([ADR 005](005-protocol.md))
   - `decdn_probe_hold_slots_used` / `decdn_probe_hold_slots_max` — eviction-hold saturation

@@ -230,8 +230,7 @@ interface ISlashJudge {
 
 **Interaction with unbonding period.** `MAX_EVIDENCE_AGE_US` MUST be strictly less than the `StakingRegistry.unbondingPeriod` (converted to microseconds). If evidence can be older than the unbonding period, a node could commit an offense, immediately initiate unstaking, and complete withdrawal before the evidence is submitted — avoiding the slash entirely. With PoC defaults (evidence age: 5 days, unbonding: 7 days), this invariant is satisfied with a 2-day margin. The safety bounds ([1 day, 30 days] for evidence age vs [3 days, 30 days] for unbonding per [ADR 009](009-governance.md)) permit governance to violate this invariant — implementations SHOULD enforce `MAX_EVIDENCE_AGE_US < unbondingPeriod` whenever `MAX_EVIDENCE_AGE_US` is configured or updated, including at initialization and in any governance-controlled reconfiguration path.
 
-**Rate manipulation:**
-1–3. Same `SignatureChecker` verification and identity check as phantom
+**Rate manipulation:** 1–3. Same `SignatureChecker` verification and identity check as phantom
 4. Verify `streamResponse.rate_per_mb > probeResponse.rate_per_mb`
 5. Verify `probeResponse.hash == streamResponse.hash` (same blob)
 6–8. Same timestamp and registration checks as phantom
