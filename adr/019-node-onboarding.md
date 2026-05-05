@@ -47,7 +47,20 @@ Before any on-chain or protocol activity:
 
 5. **Choose region.** Determine the ISO 3166-1 alpha-2 country code that best represents the node's physical location. This value is self-reported and unverified in PoC ([ADR 001](001-network.md), [ADR 011](011-content-takedown.md)). It will be submitted on-chain as `regionHint` and broadcast in `NodeAnnounce` messages — it affects which gossip topics the node publishes to and which regional blacklists it must enforce.
 
-6. **Configure origin backend (optional).** If the node will act as an origin-backed node (serving specific content from S3/R2/B2/NFS/local disk), configure the backend access credentials and content set before proceeding. This is purely a deployment choice — the protocol treats all staked nodes identically.
+6. **Configure origin backend (optional).** If the node will act as an origin-backed node
+   (serving specific content from S3/R2/B2/NFS/local disk), configure the backend access
+   credentials and content set before proceeding. Cache-only serving is permissionless at
+   the protocol layer — any staked node may serve cached blobs and pass them on for
+   payment. To be recognised as an *authorized origin* for a registered namespace, the
+   namespace's publisher must propose the operator via `OriginAssignment.proposeAssignment`
+   and the DAO must ratify after timelock ([ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority));
+   for default-open content (`namespaceId == 0`), the operator must be in the
+   DAO-maintained allow-list (subject to the bootstrap rule — see
+   [ADR 011 § Default-open allow-list](011-content-takedown.md#default-open-allow-list)).
+   These steps happen on the publisher's or governance's timeline and are independent of
+   node onboarding.
+
+---
 
 ### Phase 2 — On-chain Setup
 
