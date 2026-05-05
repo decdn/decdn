@@ -20,6 +20,12 @@ use tokio::io::AsyncReadExt;
 
 use super::{Origin, OriginFetch};
 
+/// Initial capacity hint for the per-fetch read buffer. Caps the
+/// up-front allocation so a multi-GB blob (or an over-generous
+/// `max_bytes` setting) doesn't commit huge memory before the
+/// first byte is read; `read_to_end` grows the buffer as needed.
+const INITIAL_READ_CAP_HINT: usize = 1 << 20;
+
 /// Origin backed by a local filesystem directory. Blobs live at
 /// `{base}/{hex[0..2]}/{hex}`; the engine is responsible for BLAKE3
 /// verification after the bytes come back (same contract as every other
@@ -158,20 +164,33 @@ impl Origin for FilesystemOrigin {
                 );
             }
 
-            // Pre-size to `len` to skip Vec growth reallocations. On
-            // 32-bit targets a >4GB file or an operator-configured
-            // `max_bytes` past `usize::MAX` would otherwise blow up the
-            // `Vec::with_capacity` call; surface that as a typed error
-            // instead, in line with the workspace anti-panic policy.
-            // `read_to_end` will still grow the buffer if the file
-            // gets longer mid-read, which is fine — the engine's
-            // BLAKE3 check rejects the result if the bytes don't match
-            // the requested hash.
-            let cap = usize::try_from(len).context("file size exceeds addressable memory")?;
-            let mut data = Vec::with_capacity(cap);
-            file.read_to_end(&mut data).await.with_context(|| {
+            // Pre-size to `len` so `read_to_end` skips growth reallocs,
+            // but cap the *initial* commit at `INITIAL_READ_CAP_HINT`.
+            // The full-`len` approach hands an over-generous
+            // `max_bytes` setting (or a 32-bit address space) a cheap
+            // OOM up front; capping means a few cheap doublings
+            // instead of one huge allocation. `read_to_end` will
+            // still grow the buffer as the read progresses.
+            let want_cap = usize::try_from(len).context("file size exceeds addressable memory")?;
+            let mut data = Vec::with_capacity(want_cap.min(INITIAL_READ_CAP_HINT));
+
+            // Bound the read at the I/O layer: even with the size
+            // check above, the file could grow between `metadata()`
+            // and the read (append, truncate-then-extend, pwrite past
+            // EOF — all happen on the same inode our fd is pinning).
+            // `take(max_bytes + 1)` reads one byte past the cap so
+            // the post-check can disambiguate "exactly max_bytes"
+            // from "more than max_bytes."
+            let mut reader = (&mut file).take(max_bytes.saturating_add(1));
+            reader.read_to_end(&mut data).await.with_context(|| {
                 format!("cache.origin_path read failed for {}", canonical.display())
             })?;
+            if data.len() as u64 > max_bytes {
+                anyhow::bail!(
+                    "cache.origin_path entry {} grew past max {max_bytes} during read",
+                    canonical.display()
+                );
+            }
             Ok(OriginFetch::Found(Bytes::from(data)))
         })
     }
