@@ -62,7 +62,9 @@ struct LoadHint {
 }
 ```
 
-**Schema evolution note.** The struct above is shown as a flat definition for readability. For implementation, [ADR 013](013-schema-evolution.md) specifies that `NodeAnnounce` uses a `NodeAnnounceBody` (signed portion) + `signature` + optional extensions pattern with two-phase deserialization, enabling unsigned fields to be appended via minor evolution without an ALPN bump. See [ADR 013 — Signed Field Freezing](013-schema-evolution.md#signed-field-freezing) for the canonical struct layout.
+##### Schema evolution note
+
+The struct above is shown as a flat definition for readability. For implementation, [ADR 013](013-schema-evolution.md) specifies that `NodeAnnounce` uses a `NodeAnnounceBody` (signed portion) + `signature` + optional extensions pattern with two-phase deserialization, enabling unsigned fields to be appended via minor evolution without an ALPN bump. See [ADR 013 — Signed Field Freezing](013-schema-evolution.md#signed-field-freezing) for the canonical struct layout.
 
 `LoadHint` is advisory and untrusted. The reputation system ([ADR 008](008-reputation.md)) penalizes nodes whose observed delivery performance contradicts their advertised load.
 
@@ -111,7 +113,9 @@ On probe cache hit, if the selected provider no longer has the blob (evicted —
 
 **Probe cache TTL is 15 seconds** — half the 30-second slashing evidence window from ADR 005.
 
-**Eviction hold interaction.** Probe cache TTL (15s) < `probe_hold_duration` (35s), so any cached probe response used for a stream is within both the slashing window and the eviction hold period.
+##### Eviction hold interaction
+
+Probe cache TTL (15s) < `probe_hold_duration` (35s), so any cached probe response used for a stream is within both the slashing window and the eviction hold period.
 
 **Probe rate limits:**
 
@@ -193,7 +197,9 @@ For new nodes with the initial reputation of 0.5 ([ADR 008](008-reputation.md)),
 
 **Inputs:** `rate_per_mb` and `rtt_ms` come from `ProbeResponse` (see [ADR 005](005-protocol.md)). `reputation` is the node's `final_score` from [ADR 008](008-reputation.md) — local observations (70%) + network gossip (30%).
 
-**Tie-breaking** (scores within 1% of each other): see [ADR 008, Tie-Breaking](008-reputation.md#9-tie-breaking).
+#### Tie-breaking
+
+(scores within 1% of each other): see [ADR 008, Tie-Breaking](008-reputation.md#9-tie-breaking).
 
 This score is used in Content Discovery step 4 above and in all other node selection contexts. The simpler `rate_per_mb × rtt_ms` product is the price×latency component; the full selection algorithm adds reputation weighting as shown above.
 
@@ -375,7 +381,9 @@ Three tiers, from simplest to most scalable:
 
 **Note:** The `bindingSignature` parameter proves the caller's Ethereum key signed the NodeId binding — it does not prove ownership of the ed25519 NodeId itself. These are orthogonal concerns: `bindingSignature` prevents un-slashable registration (required in both PoC and production), while ed25519 ownership verification prevents NodeId squatting.
 
-**Signed message.** The `ed25519Signature` parameter is an ed25519 signature over:
+#### Signed message
+
+The `ed25519Signature` parameter is an ed25519 signature over:
 
 ```
 ed25519_sign(private_key, keccak256(abi.encodePacked(nodeId, msg.sender, block.chainid, registrationNonce[nodeId])))
@@ -383,8 +391,14 @@ ed25519_sign(private_key, keccak256(abi.encodePacked(nodeId, msg.sender, block.c
 
 Where `registrationNonce` is a per-`nodeId` counter (distinct from the per-address `bindingNonce` used for EIP-712 binding), incremented by `deregisterNode` on each deregistration. The nonce prevents replay of old signatures after a node deregisters and a different address attempts to re-register the same `nodeId`. The `block.chainid` binding prevents cross-chain signature replay.
 
-**On-chain verification.** EVM has no native ed25519 precompile, and the RIP-7212 proposal is not yet deployed on the production L2 (see [Appendix: L2 Deployment](appendix-l2-deployment.md) for the chain and rollout status). The implementation uses a well-audited Solidity ed25519 verification library (e.g., `ed25519-sol`). This adds ~500k–1M gas to `registerNode`, but this is a one-time cost per node lifetime — see [gas cost table](#gas-costs) and the rationale in [ADR 014](014-on-chain-verification.md#1-ed25519-signature-verification-dual-key-slash-signatures) for why the dual-key approach used for slash evidence is not needed here.
+#### On-chain verification
 
-**Reclaim flow.** If a NodeId was squatted (e.g., during a transition period or via a contract bug), the legitimate ed25519 key holder can call `reclaimNodeId(nodeId, ed25519Signature)`. This function verifies the ed25519 signature over `keccak256(abi.encodePacked(nodeId, msg.sender, block.chainid, registrationNonce[nodeId]))`, forcibly deregisters the current holder (triggering their unbonding period and incrementing `registrationNonce`), clears the NodeId-to-address mappings, and emits `NodeIdReclaimed`. The caller can then call `registerNode` to register the NodeId under their own address. The reclaim function does not require the caller to have stake — it only proves ed25519 key ownership and clears the squatter's binding.
+EVM has no native ed25519 precompile, and the RIP-7212 proposal is not yet deployed on the production L2 (see [Appendix: L2 Deployment](appendix-l2-deployment.md) for the chain and rollout status). The implementation uses a well-audited Solidity ed25519 verification library (e.g., `ed25519-sol`). This adds ~500k–1M gas to `registerNode`, but this is a one-time cost per node lifetime — see [gas cost table](#gas-costs) and the rationale in [ADR 014](014-on-chain-verification.md#1-ed25519-signature-verification-dual-key-slash-signatures) for why the dual-key approach used for slash evidence is not needed here.
 
-**PoC safety valve.** `adminReclaimNodeId(nodeId)` is an `onlyOwner` function (the PoC admin key per [ADR 009](009-governance.md)) that forcibly deregisters a squatted NodeId without requiring an ed25519 proof. This exists as a fallback in case the ed25519 verification library has bugs or edge cases during early testing. It triggers the squatter's unbonding, clears mappings, increments `registrationNonce`, and emits `NodeIdReclaimed`. This function is removed in production — `reclaimNodeId` is the sole reclaim mechanism.
+#### Reclaim flow
+
+If a NodeId was squatted (e.g., during a transition period or via a contract bug), the legitimate ed25519 key holder can call `reclaimNodeId(nodeId, ed25519Signature)`. This function verifies the ed25519 signature over `keccak256(abi.encodePacked(nodeId, msg.sender, block.chainid, registrationNonce[nodeId]))`, forcibly deregisters the current holder (triggering their unbonding period and incrementing `registrationNonce`), clears the NodeId-to-address mappings, and emits `NodeIdReclaimed`. The caller can then call `registerNode` to register the NodeId under their own address. The reclaim function does not require the caller to have stake — it only proves ed25519 key ownership and clears the squatter's binding.
+
+#### PoC safety valve
+
+`adminReclaimNodeId(nodeId)` is an `onlyOwner` function (the PoC admin key per [ADR 009](009-governance.md)) that forcibly deregisters a squatted NodeId without requiring an ed25519 proof. This exists as a fallback in case the ed25519 verification library has bugs or edge cases during early testing. It triggers the squatter's unbonding, clears mappings, increments `registrationNonce`, and emits `NodeIdReclaimed`. This function is removed in production — `reclaimNodeId` is the sole reclaim mechanism.

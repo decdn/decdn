@@ -13,7 +13,9 @@ ADR 003 identifies this liveness gap explicitly (stale close, Option A) and prop
 
 The threat is asymmetric in unidirectional channels. Vouchers are client-signed cumulative amounts; the node submits the highest voucher to maximise its payout. The stale-close attack is therefore a client submitting an old low-amount voucher to underpay the node. The reverse — a node submitting a lower voucher than it holds — harms only the node itself (the client gets a larger refund). Despite this asymmetry, the mechanism described here is symmetric: either party can delegate dispute protection to a watchtower.
 
-**ADR 026 driver.** [ADR 026](026-gauge-boost-tokenomics.md) introduces a gauge-boost pool whose payout is weighted by per-operator `bytes_delivered`. Raw byte counters are gameable by self-routed traffic (an operator settling against itself or against thinly-funded sybil channels to inflate gauge-pool share — see ADR 026 §Risks "Wash-trading / self-routed traffic"). ADR 026 cites watchtower observation of self-settlement patterns and forward-references [ADR 027 — Distinct-client delivery receipts](027-distinct-client-receipts.md) as the strongest invariant in the gauge-pool security model. This ADR therefore extends the watchtower role beyond stale-close defense to also cover wash-trading detection and validation of ADR 027 delivery receipts. The ADR 027 receipt cryptographic protocol (format, signature scheme, on-chain anchoring) is out of scope here — this ADR only specifies the watchtower-side responsibilities.
+### ADR 026 driver
+
+[ADR 026](026-gauge-boost-tokenomics.md) introduces a gauge-boost pool whose payout is weighted by per-operator `bytes_delivered`. Raw byte counters are gameable by self-routed traffic (an operator settling against itself or against thinly-funded sybil channels to inflate gauge-pool share — see ADR 026 §Risks "Wash-trading / self-routed traffic"). ADR 026 cites watchtower observation of self-settlement patterns and forward-references [ADR 027 — Distinct-client delivery receipts](027-distinct-client-receipts.md) as the strongest invariant in the gauge-pool security model. This ADR therefore extends the watchtower role beyond stale-close defense to also cover wash-trading detection and validation of ADR 027 delivery receipts. The ADR 027 receipt cryptographic protocol (format, signature scheme, on-chain anchoring) is out of scope here — this ADR only specifies the watchtower-side responsibilities.
 
 ## Decision
 
@@ -107,7 +109,9 @@ sequenceDiagram
     T->>W: WatchtowerRevokeAck {channel_id}
 ```
 
-**Registration authentication.** The `WatchtowerRegister` message includes `membership_sig` — a proof of channel membership. The registrant signs `keccak256(abi.encodePacked("WatchtowerRegister", channel_id))` with their Ethereum key. The watchtower verifies via `ecrecover` that the recovered address matches either the `client` or `provider` of the channel (verifiable on-chain via the payment channel contract's `getChannel` view). This prevents state exhaustion attacks from parties not involved in the channel.
+#### Registration authentication
+
+The `WatchtowerRegister` message includes `membership_sig` — a proof of channel membership. The registrant signs `keccak256(abi.encodePacked("WatchtowerRegister", channel_id))` with their Ethereum key. The watchtower verifies via `ecrecover` that the recovered address matches either the `client` or `provider` of the channel (verifiable on-chain via the payment channel contract's `getChannel` view). This prevents state exhaustion attacks from parties not involved in the channel.
 
 `latest_voucher` has the same shape as `VoucherUpdate`: `{channel_id, amount, nonce, token, signature}`. If no vouchers have been exchanged yet, `latest_voucher` is omitted (the watchtower registers the channel with `amount=0, nonce=0`).
 
@@ -333,7 +337,9 @@ interface IWatchtowerEscrow {
 }
 ```
 
-**Heartbeat validation.** `submitHeartbeat` MUST enforce strict timestamp monotonicity: `timestamp > lastHeartbeat[recoveredSigner]` (where `recoveredSigner` is the address recovered from the EIP-712 signature, not `msg.sender`, since gas relayers may submit on behalf of watchtowers). Additionally, the timestamp MUST be within a bounded window of the current block: `block.timestamp - heartbeatInterval <= timestamp <= block.timestamp + 60`. These checks prevent heartbeat replay attacks where a third-party relayer submits old signatures to artificially maintain liveness. Note: all values in this on-chain check are in seconds (`block.timestamp` is the L2 sequencer timestamp in seconds on Arbitrum); the protocol wire format's `timestamp_us` (microseconds) is a separate domain not used in the heartbeat contract.
+#### Heartbeat validation
+
+`submitHeartbeat` MUST enforce strict timestamp monotonicity: `timestamp > lastHeartbeat[recoveredSigner]` (where `recoveredSigner` is the address recovered from the EIP-712 signature, not `msg.sender`, since gas relayers may submit on behalf of watchtowers). Additionally, the timestamp MUST be within a bounded window of the current block: `block.timestamp - heartbeatInterval <= timestamp <= block.timestamp + 60`. These checks prevent heartbeat replay attacks where a third-party relayer submits old signatures to artificially maintain liveness. Note: all values in this on-chain check are in seconds (`block.timestamp` is the L2 sequencer timestamp in seconds on Arbitrum); the protocol wire format's `timestamp_us` (microseconds) is a separate domain not used in the heartbeat contract.
 
 **Events:**
 
@@ -372,7 +378,9 @@ event EscrowReclaimed(
 );
 ```
 
-**EIP-712 heartbeat signature.** The contract uses its own EIP-712 domain separator (same pattern as `SlashJudge` in [ADR 014](014-on-chain-verification.md) — per-contract domain prevents cross-contract replay):
+#### EIP-712 heartbeat signature
+
+The contract uses its own EIP-712 domain separator (same pattern as `SlashJudge` in [ADR 014](014-on-chain-verification.md) — per-contract domain prevents cross-contract replay):
 
 ```solidity
 EIP712Domain({
@@ -407,7 +415,9 @@ bytes32 constant HEARTBEAT_TYPEHASH = keccak256(
 | Monitoring period | 7 days | 90 days | 30 days |
 | Verification miss threshold | 1 | 10 | 3 |
 
-**Per-escrow monitoring verification.** The global `lastHeartbeat` per watchtower creates a cross-escrow dependency: a watchtower that stops monitoring one channel but continues heartbeating for others appears live for all escrows. To give watched parties on-chain recourse:
+#### Per-escrow monitoring verification
+
+The global `lastHeartbeat` per watchtower creates a cross-escrow dependency: a watchtower that stops monitoring one channel but continues heartbeating for others appears live for all escrows. To give watched parties on-chain recourse:
 
 - `WatchtowerEscrow` maintains a `lastVerified` mapping per escrow ID alongside the existing global `lastHeartbeat` mapping.
 - `depositEscrow` initializes `lastVerified[escrowId] = block.timestamp` when the escrow is created, so the verification-miss timer starts from the beginning of the monitoring period rather than from Solidity's default zero value.
@@ -415,11 +425,17 @@ bytes32 constant HEARTBEAT_TYPEHASH = keccak256(
 - `reclaimEscrow` is also allowed when `block.timestamp - lastVerified[escrowId] > verificationMissThreshold * heartbeatInterval` (where `verificationMissThreshold` is a governance parameter, PoC default: 3). Because `lastVerified` is initialized in `depositEscrow`, this path only opens after at least one full verification window has elapsed without confirmation.
 - This mechanism is additive — the existing global heartbeat check remains as a first-pass liveness filter.
 
-**Batched heartbeats.** `submitHeartbeat` is a single O(1) call per heartbeat window, regardless of how many channels the watchtower monitors. The contract stores a single global `lastHeartbeat` timestamp per watchtower address rather than iterating over individual escrows — `reclaimEscrow` and `claimFee` check liveness lazily by comparing the watchtower's global timestamp against each escrow's timing requirements. Per-escrow heartbeats would cost ~$1.20–$2.40/month in gas (120 tx × $0.01–$0.02 at L2 pricing) and would hit the block gas limit as the watchtower's portfolio grows. The `voucherStateHash` already commits to the full set of monitored `(channel_id, latest_nonce)` pairs, so a single heartbeat per 6-hour window suffices.
+#### Batched heartbeats
 
-**Monitoring period renewal.** A monitoring period (default 30 days) may be shorter than the channel's lifetime. The watched party must call `depositEscrow` again before the current period ends to maintain continuous coverage. A gap between periods is not penalised — it simply means no heartbeat accountability during that window.
+`submitHeartbeat` is a single O(1) call per heartbeat window, regardless of how many channels the watchtower monitors. The contract stores a single global `lastHeartbeat` timestamp per watchtower address rather than iterating over individual escrows — `reclaimEscrow` and `claimFee` check liveness lazily by comparing the watchtower's global timestamp against each escrow's timing requirements. Per-escrow heartbeats would cost ~$1.20–$2.40/month in gas (120 tx × $0.01–$0.02 at L2 pricing) and would hit the block gas limit as the watchtower's portfolio grows. The `voucherStateHash` already commits to the full set of monitored `(channel_id, latest_nonce)` pairs, so a single heartbeat per 6-hour window suffices.
 
-**On-chain escrow at channel open time.** An alternative design embeds the watchtower fee in `openChannel`, atomically reserving a portion of the channel deposit for watchtower payment. This is rejected for the PoC because: (1) it couples the payment channel contract to watchtower economics, (2) the watchtower identity is typically not known at channel open time — selection happens after streaming begins, and (3) it changes the `IStablePaymentChannel` interface, which is otherwise frozen for watchtower integration. A hybrid approach — an optional `watchtowerEscrowData` parameter in the production `PaymentChannel` contract that atomically opens the channel and deposits escrow — is viable as a future gas optimisation if watchtower adoption is high.
+#### Monitoring period renewal
+
+A monitoring period (default 30 days) may be shorter than the channel's lifetime. The watched party must call `depositEscrow` again before the current period ends to maintain continuous coverage. A gap between periods is not penalised — it simply means no heartbeat accountability during that window.
+
+#### On-chain escrow at channel open time
+
+An alternative design embeds the watchtower fee in `openChannel`, atomically reserving a portion of the channel deposit for watchtower payment. This is rejected for the PoC because: (1) it couples the payment channel contract to watchtower economics, (2) the watchtower identity is typically not known at channel open time — selection happens after streaming begins, and (3) it changes the `IStablePaymentChannel` interface, which is otherwise frozen for watchtower integration. A hybrid approach — an optional `watchtowerEscrowData` parameter in the production `PaymentChannel` contract that atomically opens the channel and deposits escrow — is viable as a future gas optimisation if watchtower adoption is high.
 
 ## Attack Vectors
 
@@ -451,9 +467,13 @@ The dispute window (48h PoC default, governable 12h–72h) is the primary buffer
 
 The L2 sequencer censors the watchtower's `disputeChannel` transaction during the dispute window.
 
-**Attack scenario.** A malicious closer (or a colluding sequencer) submits `closeChannel` with a stale voucher, then ensures all `disputeChannel` transactions are censored for the full dispute window. The watchtower falls back to L1 forced inclusion, but this takes up to ~24 hours (Arbitrum delayed inbox; OP Stack has a similar path). If the dispute window is also 24 hours, the effective dispute response time is **zero** — by the time the forced-inclusion transaction is processed, the window has expired.
+#### Attack scenario
 
-**Mitigation — layered defense.** The dispute window default is **48 hours** (172800 seconds), which guarantees at least 24 hours of effective dispute response time on any L2 with a forced-inclusion delay ≤ 24 hours. The setting is simple, L2-agnostic, and stays within the governance bounds (12h–72h, [ADR 009](009-governance.md)).
+A malicious closer (or a colluding sequencer) submits `closeChannel` with a stale voucher, then ensures all `disputeChannel` transactions are censored for the full dispute window. The watchtower falls back to L1 forced inclusion, but this takes up to ~24 hours (Arbitrum delayed inbox; OP Stack has a similar path). If the dispute window is also 24 hours, the effective dispute response time is **zero** — by the time the forced-inclusion transaction is processed, the window has expired.
+
+#### Mitigation — layered defense
+
+The dispute window default is **48 hours** (172800 seconds), which guarantees at least 24 hours of effective dispute response time on any L2 with a forced-inclusion delay ≤ 24 hours. The setting is simple, L2-agnostic, and stays within the governance bounds (12h–72h, [ADR 009](009-governance.md)).
 
 On top of that baseline, the payment channel contract implements a **forced-inclusion deadline extension**: if a `disputeChannel` transaction arrives via L1 forced inclusion and the remaining dispute time is less than 24 hours, `disputeDeadline` is set to `block.timestamp + 24 hours` — guaranteeing at least 24 hours of dispute time from the moment the forced-inclusion transaction is processed. This adds safety margin for dispute windows that are above but close to the L2's forced-inclusion delay.
 

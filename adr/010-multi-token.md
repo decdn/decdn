@@ -60,7 +60,9 @@ function removeToken(address token) external onlyGovernance {
 
 Governance (admin key for PoC, OpenZeppelin Governor for production) must call `addToken` before any channel can be opened in that token. `removeToken` prevents new channels from being opened in that token; existing open channels remain valid and can still be closed/disputed normally.
 
-**Force-close channels in removed tokens.** Once a token is removed, any address can force-close open channels in that token via `forceCloseChannel`. This avoids the need for on-chain enumeration of channels per token — callers (watchtowers, governance bots, channel parties) provide the channel ID, and the contract first verifies that the channel exists, then checks `!allowedTokens[channel.token]`:
+#### Force-close channels in removed tokens
+
+Once a token is removed, any address can force-close open channels in that token via `forceCloseChannel`. This avoids the need for on-chain enumeration of channels per token — callers (watchtowers, governance bots, channel parties) provide the channel ID, and the contract first verifies that the channel exists, then checks `!allowedTokens[channel.token]`:
 
 ```solidity
 function forceCloseChannel(bytes32 channelId) external {
@@ -132,7 +134,9 @@ struct Channel {
 }
 ```
 
-**Per-token rate bounds.** The governance-set floor and ceiling are per-token address. This allows sensible bounds in a token's own units regardless of its decimal count or value:
+#### Per-token rate bounds
+
+The governance-set floor and ceiling are per-token address. This allows sensible bounds in a token's own units regardless of its decimal count or value:
 
 ```solidity
 struct RateBounds {

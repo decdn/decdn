@@ -87,11 +87,17 @@ struct BlacklistEntry {
 
 > **Gas optimization (production):** The `region` field uses `string` for PoC readability. Production implementations SHOULD use `bytes2` for ISO 3166-1 alpha-2 codes (always exactly 2 ASCII characters), with `bytes2(0)` as the global sentinel. This reduces storage costs.
 
-**Blacklist version.** `getBlacklistVersion()` returns a monotonically increasing counter incremented on every add/remove operation across all paths. Nodes cache the last-seen version and only re-fetch deltas when the version advances, minimising RPC load.
+### Blacklist version
 
-**Reason field.** Free-form string, stored on-chain for auditability. Operators can reference legal notice identifiers (e.g., DMCA case numbers, DSA notice IDs) or use short category labels.
+`getBlacklistVersion()` returns a monotonically increasing counter incremented on every add/remove operation across all paths. Nodes cache the last-seen version and only re-fetch deltas when the version advances, minimising RPC load.
 
-**`region` field.** Empty string means the entry applies globally. An ISO 3166-1 alpha-2 code scopes the entry to nodes that declare that region. A node is in scope if its declared region matches the entry's region or the entry is global.
+### Reason field
+
+Free-form string, stored on-chain for auditability. Operators can reference legal notice identifiers (e.g., DMCA case numbers, DSA notice IDs) or use short category labels.
+
+### `region` field
+
+Empty string means the entry applies globally. An ISO 3166-1 alpha-2 code scopes the entry to nodes that declare that region. A node is in scope if its declared region matches the entry's region or the entry is global.
 
 ## Regional Governance Bodies
 
@@ -134,7 +140,9 @@ This raises the cost of re-upload evasion from trivial (change a byte) to signif
 
 **Perceptual hashing is out of scope for the protocol.** Perceptual hash algorithms (PhotoDNA/PDQF for images, TMK for video) detect near-duplicate content but are content-type specific — there is no single perceptual hash for arbitrary binary blobs. deCDN is content-agnostic and cannot know whether a blob is an image, video, or other data. Perceptual hash checking for known illegal content categories (CSAM) is an operator obligation handled off-chain via industry databases (NCMEC, StopNCII), not a protocol primitive.
 
-**Fast re-reporting path.** When a re-encoded variant of a known-bad blob is identified, governance can add the new hash via the emergency multisig path (2-hour compliance window). The combination of fast re-reporting and origin blacklisting makes sustained evasion operationally difficult even if no single mechanism closes the gap completely.
+### Fast re-reporting path
+
+When a re-encoded variant of a known-bad blob is identified, governance can add the new hash via the emergency multisig path (2-hour compliance window). The combination of fast re-reporting and origin blacklisting makes sustained evasion operationally difficult even if no single mechanism closes the gap completely.
 
 ## Node Behavior
 
@@ -142,7 +150,9 @@ This raises the cost of re-upload evasion from trivial (change a byte) to signif
 
 Nodes poll `getBlacklistVersion()` on a configurable interval (`blacklist_poll_interval`, default 10 minutes). When the version has advanced, the node fetches new entries since its last-seen version, filtered to its declared region plus global entries. Delta fetching relies on contract event logs: `HashBlacklisted` and `OriginBlacklisted` events include an indexed `version` field, enabling efficient `eth_getLogs` queries filtered by version range. Nodes SHOULD expose `blacklist_sync_lag_seconds` and `blacklist_version_behind` metrics for operational monitoring — see [architecture.md § Observability](architecture.md#observability).
 
-**Version sync recovery.** If a node has been offline or missed multiple version bumps, delta fetching may be insufficient (events may have been pruned from the RPC provider's log retention window). The recovery strategy is:
+#### Version sync recovery
+
+If a node has been offline or missed multiple version bumps, delta fetching may be insufficient (events may have been pruned from the RPC provider's log retention window). The recovery strategy is:
 
 1. If the gap between `last_seen_version` and `current_version` is ≤ 100 versions: fetch deltas normally via contract events.
 2. If the gap exceeds 100 versions (or the delta fetch fails): perform a full re-sync by calling `getBlacklistVersion()` and iterating all events from the contract's deployment block. This is expensive but correct.
@@ -206,7 +216,9 @@ The response does not distinguish between governance and local denylist sources.
 
 Serving a blacklisted hash after the compliance window is a slashable offense, subject to the escalating schedule in [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn). Repeated offenses trigger cumulative stake loss; nodes whose stake drops below 50% of the minimum are auto-ejected. Individual slash percentages are capped at 50% per offense ([ADR 009 § Safety bounds](009-governance.md#governable-parameters-with-safety-bounds)). The standard 100 TOKEN challenge bond from [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn) applies.
 
-**Slash evidence.** The challenger submits:
+### Slash evidence
+
+The challenger submits:
 
 - The `blake3Hash`
 - A node-signed `ProbeResponse` with `has_blob: true` for the blacklisted hash, timestamped after the compliance window. The probe signature (defined in [ADR 005](005-protocol.md)) cryptographically binds the node's identity to the hash claim. On-chain verification uses the dual-key scheme from [ADR 014](014-on-chain-verification.md): the `slash_sig` (EIP-712 secp256k1 signature) is verified via `ecrecover`, and the recovered address is mapped to the node's identity in `StakingRegistry`. This is the primary evidence path. Alternatively, a node-signed `StreamResponse` with `ok: true` for the blacklisted hash (binding `hash` and `channel_id` in the signed data) is also sufficient. Client-signed vouchers alone are NOT sufficient evidence — vouchers do not contain the hash and the `channel_id → hash` binding is not on-chain verifiable.
@@ -216,7 +228,9 @@ The `ContentBlacklist` contract verifies that `effectiveAt` is in the past relat
 
 Regional slash eligibility: a node is only slashable for serving a hash it was in-scope to remove. A node that declared region `US` is not slashable for serving a hash that was only blacklisted by the EU regional body.
 
-**Grace period for offline nodes.** A slash requires an active challenger submitting evidence of a post-window delivery. Nodes that reconnect, sync the blacklist, and evict before serving any content are safe.
+### Grace period for offline nodes
+
+A slash requires an active challenger submitting evidence of a post-window delivery. Nodes that reconnect, sync the blacklist, and evict before serving any content are safe.
 
 ## Consequences
 

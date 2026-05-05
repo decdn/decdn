@@ -14,7 +14,9 @@ Metrics are referenced throughout the protocol ADRs and listed informally in `ar
 
 Without this, operators cannot build monitoring dashboards, cannot detect slashable conditions before they occur, and cannot compare metrics across nodes. Instrumentation becomes ad-hoc, making cross-node analysis impossible.
 
-**Note on existing ADR names.** Several ADRs reference informal metric names (e.g., `gossip_messages_rejected_clock_skew`, `probe_hold_violations`, `blacklist_sync_lag_seconds` — from ADRs 001, 005, 011). This ADR is the authoritative canonical registry; the names below supersede those informal references. The changes are purely naming — the semantic intent is unchanged.
+### Note on existing ADR names
+
+Several ADRs reference informal metric names (e.g., `gossip_messages_rejected_clock_skew`, `probe_hold_violations`, `blacklist_sync_lag_seconds` — from ADRs 001, 005, 011). This ADR is the authoritative canonical registry; the names below supersede those informal references. The changes are purely naming — the semantic intent is unchanged.
 
 ## Decision
 
@@ -311,11 +313,17 @@ A reference Grafana dashboard and starter Prometheus alerting rules ship in the 
 | [`monitoring/prometheus-alerts.yml`](../monitoring/prometheus-alerts.yml) | Three rule groups: `decdn-slash-safety` (thresholds copied verbatim from §2.1), `decdn-liveness`, `decdn-delivery`. |
 | [`monitoring/grafana-dashboard.json`](../monitoring/grafana-dashboard.json) | Single overview dashboard (`uid: decdn-poc-overview`) with rows for health, slash safety, delivery, cache, probes, and payments. Datasource is parameterised via `${DS_PROMETHEUS}`; node selection via the `instance` template variable. |
 
-**Importing the dashboard.** In Grafana, *Dashboards → New → Import* and either upload the JSON file or paste its contents. Select your Prometheus datasource at the import prompt; the `instance` variable auto-populates from `decdn_node_uptime_seconds`.
+#### Importing the dashboard
 
-**Using the alerts.** Add the file to Prometheus via `rule_files:` and reload. Validate locally with `promtool check rules monitoring/prometheus-alerts.yml`. Operators are expected to tune `for:` durations and thresholds for their fleet size before paging on them.
+In Grafana, *Dashboards → New → Import* and either upload the JSON file or paste its contents. Select your Prometheus datasource at the import prompt; the `instance` variable auto-populates from `decdn_node_uptime_seconds`.
 
-**Scope.** The reference set covers M-tier slash-safety metrics and the most common R-tier panels for an operator's first dashboard. It is deliberately not exhaustive: §2.10 tokenomics, reputation, and 0-RTT panels are left to deployment-specific dashboards.
+#### Using the alerts
+
+Add the file to Prometheus via `rule_files:` and reload. Validate locally with `promtool check rules monitoring/prometheus-alerts.yml`. Operators are expected to tune `for:` durations and thresholds for their fleet size before paging on them.
+
+#### Scope
+
+The reference set covers M-tier slash-safety metrics and the most common R-tier panels for an operator's first dashboard. It is deliberately not exhaustive: §2.10 tokenomics, reputation, and 0-RTT panels are left to deployment-specific dashboards.
 
 ---
 

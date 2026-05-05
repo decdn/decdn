@@ -350,7 +350,9 @@ Large files are split into chunks at ingest time. A **manifest blob** describes 
 
 ### Chunk size
 
-**256 MiB** (fixed at ingest). The last chunk is a partial chunk. Chunk size is a convention for origin-produced content — CDN nodes serve any BLAKE3-addressed blob regardless of size.
+#### 256 MiB
+
+(fixed at ingest). The last chunk is a partial chunk. Chunk size is a convention for origin-produced content — CDN nodes serve any BLAKE3-addressed blob regardless of size.
 
 ### Manifest format (postcard-encoded)
 

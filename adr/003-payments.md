@@ -45,7 +45,9 @@ Opening, closing, and settling a channel requires three on-chain transactions to
 
 **Recommended practical minimum: 10 USDC.** Client software should default to a 10 USDC minimum deposit (user-overridable). At 10 USDC, gas overhead is 2.3% — acceptable for a payment channel that covers ~10,000,000 MB at the floor rate or ~1,000,000 MB (~1,000 GB) at the expected market rate ($0.01/GB), sufficient for weeks to months of casual use without top-up. The contract minimum (1 USDC, governable via `setMinDeposit`) remains a safety floor — it prevents dust channels that cost more to settle than they contain and preserves flexibility for testing and governance adjustment. Raising the contract minimum is not recommended because it would reduce governance flexibility and create a hard barrier for development/testing scenarios where small deposits are useful.
 
-**Amortization.** The overhead percentages above represent worst-case single-session economics. Long-lived channels amortize open/settle costs across many sessions: a channel used for 30 sessions costs ~$0.008/session in gas. Channels extended via `topUp` amortize further since only the initial open and final settle incur gas.
+#### Amortization
+
+The overhead percentages above represent worst-case single-session economics. Long-lived channels amortize open/settle costs across many sessions: a channel used for 30 sessions costs ~$0.008/session in gas. Channels extended via `topUp` amortize further since only the initial open and final settle incur gas.
 
 #### Smart Account Support and Gasless Channel Opens
 
@@ -157,13 +159,17 @@ This means the network self-balances: popular content gets replicated because ca
 
 ### Client-side
 
-**Voucher withholding** Client receives bytes but stops signing vouchers, getting content for free up to the last signed interval.
+#### Voucher withholding
+
+Client receives bytes but stops signing vouchers, getting content for free up to the last signed interval.
 
 The self-enforcing stop is sufficient. Maximum loss is one voucher interval at the negotiated cadence. At the default cadence (1 MB × market rate ≈ $0.00001), risk is negligible. At a negotiated interval of 100 MB at market rate, loss is ~$0.001. At the governance maximum (1024 MB) at ceiling rate, loss is ~$1.024 — still economically negligible relative to channel deposits. Nodes serving high-value content can unilaterally enforce smaller intervals regardless of what was negotiated. No additional mechanism needed — this is fully addressed by the protocol design.
 
 ---
 
-**Channel griefing** Client opens many channels with minimum deposit and never streams, forcing nodes to track and eventually close stale channels.
+#### Channel griefing
+
+Client opens many channels with minimum deposit and never streams, forcing nodes to track and eventually close stale channels.
 
 **Resolved: provider-initiated zero-voucher close.** The provider can call `closeChannel` with `amount=0, nonce=0`, and an empty signature (`signature.length == 0`) on any channel where no vouchers have been submitted (`claimedNonce == 0`), immediately entering the close→dispute→settle lifecycle. This bounds the maximum tracking duration to the dispute window (48 hours PoC default) rather than the full 90-day channel expiry. The dispute window protects clients — if a valid voucher exists, the client or a watchtower can submit it via `disputeChannel`. At settlement, the full deposit is refunded to the client. No additional inactivity timer or separate expiry mechanism beyond the existing channel expiry / `reclaimExpired` path is needed; that existing escape hatch remains required for cases where the provider disappears without initiating a close.
 
@@ -174,13 +180,17 @@ The financial cost to the attacker remains bounded: at the recommended 10 USDC p
 
 ---
 
-**Stale close** Client submits an old voucher (lower amount) to close the channel, underpaying the node.
+#### Stale close
+
+Client submits an old voucher (lower amount) to close the channel, underpaying the node.
 
 The dispute window (default 48 hours for PoC, raised from 24 hours to account for L2 forced-inclusion delay; see [ADR 007](007-watchtower.md#l2-sequencer-censorship)) covers this if the node is online. The liveness gap — node offline during the window — is the entire problem [ADR 007](007-watchtower.md) addresses: non-custodial watchtowers + an in-process dispute monitor + (production) a forced-inclusion deadline extension.
 
 ---
 
-**Probe fishing** Client sends probe requests to many nodes at high frequency to map the network or exhaust node resources without ever paying.
+#### Probe fishing
+
+Client sends probe requests to many nodes at high frequency to map the network or exhaust node resources without ever paying.
 
 The current mitigation is weak. Clients are not staked — their NodeIds are free to rotate — so per-NodeId rate limiting is bypassable. The iroh connection setup cost is also low. Options:
 
@@ -193,7 +203,9 @@ The current mitigation is weak. Clients are not staked — their NodeIds are fre
 
 ---
 
-**Double-spend across nodes** Client opens channels with multiple nodes using the same USDC deposit via a race condition before the on-chain state settles.
+#### Double-spend across nodes
+
+Client opens channels with multiple nodes using the same USDC deposit via a race condition before the on-chain state settles.
 
 Fully solved. Each `openChannel` call transfers USDC into the contract immediately; the client's wallet balance is debited on-chain before the transaction finalises. No credit facility exists.
 
@@ -201,25 +213,33 @@ Fully solved. Each `openChannel` call transfers USDC into the contract immediate
 
 ### Node-side
 
-**Data withholding** Node accepts a stream request, receives a voucher, then stops delivering bytes.
+#### Data withholding
+
+Node accepts a stream request, receives a voucher, then stops delivering bytes.
 
 Fully solved by the self-enforcing protocol. The node cannot extract more payment than the last acknowledged voucher. The client resumes from `byte_offset` on a different node.
 
 ---
 
-**Corrupted delivery** Node serves bytes that don't match the advertised BLAKE3 hash.
+#### Corrupted delivery
+
+Node serves bytes that don't match the advertised BLAKE3 hash.
 
 Caught at the client by BLAKE3 verification. The on-chain slash-evidence path is in [ADR 014 § 2](014-on-chain-verification.md#2-blake3-content-corruption--optimistic-challenge-response): single-round optimistic challenge-response for PoC (signed `StreamResponse` + 100 TOKEN bond, 24h counter window), upgraded to an interactive keccak256 Merkle proof over 1024-byte chunks for production.
 
 ---
 
-**Rate bait-and-switch** Node advertises a low rate in probe responses then returns a higher rate in `StreamResponse`.
+#### Rate bait-and-switch
+
+Node advertises a low rate in probe responses then returns a higher rate in `StreamResponse`.
 
 **Resolved: slashable offense.** Both responses are signed over the advertised rate ([ADR 005](005-protocol.md)); a same-NodeId signed pair where `StreamResponse.rate_per_mb > ProbeResponse.rate_per_mb` and the requester-anchored timestamp delta is under 30 seconds is on-chain-verifiable evidence. Clock-skew immune (both timestamps originate from the requester's clock; the node echoes them back in its signed response). The slash schedule lives in [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn); see [ADR 014 § 1](014-on-chain-verification.md#1-ed25519-signature-verification--dual-key-slash-signatures) for the on-chain verifier.
 
 ---
 
-**Phantom blob announcement** Node announces a blob as cached (`has_blob: true` in a signed `ProbeResponse`) then fails or redirects on actual request.
+#### Phantom blob announcement
+
+Node announces a blob as cached (`has_blob: true` in a signed `ProbeResponse`) then fails or redirects on actual request.
 
 **Resolved: slashable offense.** A same-NodeId signed `ProbeResponse(has_blob: true)` paired with a signed `StreamResponse(ok: false)` or redirect for the same hash within a 30-second requester-anchored timestamp window is on-chain-verifiable evidence. The bare timeout / non-response case is reputation-only (no second signed message → not slashable on-chain). Slash schedule per [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn); on-chain verifier per [ADR 014 § 1](014-on-chain-verification.md#1-ed25519-signature-verification--dual-key-slash-signatures); 24-hour counter-evidence window.
 
@@ -227,13 +247,17 @@ To prevent legitimate cache eviction from producing false slash evidence inside 
 
 ---
 
-**Channel close front-running** Node monitors the mempool and front-runs a client's channel close with a higher voucher submission.
+#### Channel close front-running
+
+Node monitors the mempool and front-runs a client's channel close with a higher voucher submission.
 
 Not a real attack. The contract always settles the highest valid voucher, and only the client can sign a valid voucher. A node submitting the latest voucher before the client is the intended happy path. Fabricating a higher voucher requires forging the client's ECDSA signature, which is cryptographically infeasible.
 
 ---
 
-**Third-party forced channel close (DoS)** A third party holding a valid voucher calls `closeChannel` to force the channel from `Open` to `Closing`, halting delivery.
+#### Third-party forced channel close (DoS)
+
+A third party holding a valid voucher calls `closeChannel` to force the channel from `Open` to `Closing`, halting delivery.
 
 **Resolved: access control restriction.** `closeChannel` requires `msg.sender == channel.client || msg.sender == channel.provider`. Third parties cannot initiate a close regardless of whether they hold a valid voucher. Watchtower functionality is unaffected — watchtowers operate via `disputeChannel` during the dispute window. The residual risk is a `disputeChannel` call with an intercepted voucher, which can only *improve* the settlement (higher nonce required). On-path network interception of vouchers is mitigated by QUIC transport (TLS 1.3), though this does not address endpoint compromise or other forms of leakage.
 
@@ -241,19 +265,25 @@ Not a real attack. The contract always settles the highest valid voucher, and on
 
 ### Network-level
 
-**Eclipse attack** Attacker surrounds a client with malicious nodes so all probe responses come from nodes under attacker control.
+#### Eclipse attack
+
+Attacker surrounds a client with malicious nodes so all probe responses come from nodes under attacker control.
 
 BLAKE3 verification catches data corruption regardless of peer-table composition; the remaining DoS variant (attacker-controlled peer set refuses to serve) is resolved in [ADR 012 § Bootstrap and Trust Model](012-client.md): production uses multi-source bootstrap (on-chain registry + hardcoded DNS seeds) so an attacker must compromise both to fully eclipse a client; minimum honest-peer diversity is a supplementary client-side policy. PoC is registry-only.
 
 ---
 
-**Gossip flooding** Node sends high-volume `NodeAnnounce` messages to exhaust peer table memory or crowd out legitimate announcements.
+#### Gossip flooding
+
+Node sends high-volume `NodeAnnounce` messages to exhaust peer table memory or crowd out legitimate announcements.
 
 Registry check + per-sender rate limiting is solid. The minor gap is that the local registry cache may be up to 10 minutes stale, briefly allowing recently-unstaked nodes to flood. Mostly solved; no strong alternative needed beyond tightening the registry cache refresh on high flood detection.
 
 ---
 
-**Sybil nodes** Attacker stakes many cheap nodes to dominate probe responses for popular content, controlling pricing in a region.
+#### Sybil nodes
+
+Attacker stakes many cheap nodes to dominate probe responses for popular content, controlling pricing in a region.
 
 The core weakness is token-price dependency: at $0.001/TOKEN, a minimum stake of 1,000 TOKEN costs $1 per sybil node. The unified selection score `rate_per_mb × rtt_ms × (1 / max(reputation, 0.1)²)` (see [ADR 001](001-network.md#node-selection-algorithm)) helps — a sybil fleet must be real hardware in the right geography, competitively priced, and build reputation over time — but does not eliminate the risk when the token is cheap. Options:
 
@@ -263,13 +293,17 @@ The core weakness is token-price dependency: at $0.001/TOKEN, a minimum stake of
 
 ---
 
-**Rate manipulation cartel** Colluding nodes in a region hold rates artificially high.
+#### Rate manipulation cartel
+
+Colluding nodes in a region hold rates artificially high.
 
 Origin-backed nodes set the effective price ceiling for any blob. Clients can always probe origin-backed nodes directly and pay their rates as a guaranteed fallback. Any node outside the cartel that undercuts wins all local traffic — the incentive to defect is strong. New entrants can join permissionlessly by staking.
 
 ---
 
-**Content withholding** A node stakes, responds to probes with `has_blob: true`, but refuses to serve — collecting credibility in the peer table without actually participating.
+#### Content withholding
+
+A node stakes, responds to probes with `has_blob: true`, but refuses to serve — collecting credibility in the peer table without actually participating.
 
 **Withholding is not a slashable offense** — operators may legitimately take content offline for maintenance, migration, or business reasons, and slashing for availability creates perverse incentives. Instead, withholding is handled through reputation and redundancy:
 
@@ -280,7 +314,9 @@ Note: the probe-triggered eviction hold ([ADR 005](005-protocol.md#probe-trigger
 
 ---
 
-**Replay attack on vouchers** Attacker intercepts a signed voucher and attempts to replay it against a different channel or after close.
+#### Replay attack on vouchers
+
+Attacker intercepts a signed voucher and attempts to replay it against a different channel or after close.
 
 Fully solved. EIP-712 typed data over `{channelId, amount, nonce, bytesDelivered, token}` binds the voucher to a specific channel. The EIP-712 domain separator (see [EIP-712 Voucher Signature](#eip-712-voucher-signature)) further binds each voucher to a specific chain and contract deployment, preventing replay across different L2s, contract upgrades, or test vs production environments. The monotonically increasing nonce (starting at 1; see [Voucher Nonce Convention](#voucher-nonce-convention)) prevents resubmission after settlement.
 
@@ -347,11 +383,15 @@ Under [ADR 026](026-gauge-boost-tokenomics.md) the `setFeePercentage`, `setDisco
 
 **`lifetimeDepositOf` semantics (added per [ADR 027 §3](027-distinct-client-receipts.md#3-identity-diversity-gating)).** Per-client cumulative-deposit counter exposed via `lifetimeDepositOf(client) view returns (uint256)`. Backed by a `mapping(address => uint256) lifetimeDeposit` storage slot. Incremented by the funded amount on every `openChannel` (by `deposit`) and every `topUp` (by `additionalDeposit`) attributable to the client. **Monotonic** — settlement, withdrawal, channel closure, expiry, or slashing MUST NOT decrease it. Returns `0` for an address with no prior channel funding history. Used by ADR 027 distinct-client gating as a cheap on-chain signal of cumulative capital ever bonded by this client (one SSTORE per `openChannel` / `topUp`).
 
-**Initial deployment values.** The constructor takes `(usdc, feeRouter, disputeWindow)` and sets the remaining governable parameters to their PoC defaults: `maxVoucherIntervalMb = 1` (1 MB) and `maxChannelDuration = 7776000` (90 days). All values are within the hardcoded safety bounds table further below (see also [ADR 009](009-governance.md) for governance ranges). The constructor MUST reject `feeRouter == address(0)` and a `feeRouter` whose code size is zero (EOA / undeployed address).
+#### Initial deployment values
+
+The constructor takes `(usdc, feeRouter, disputeWindow)` and sets the remaining governable parameters to their PoC defaults: `maxVoucherIntervalMb = 1` (1 MB) and `maxChannelDuration = 7776000` (90 days). All values are within the hardcoded safety bounds table further below (see also [ADR 009](009-governance.md) for governance ranges). The constructor MUST reject `feeRouter == address(0)` and a `feeRouter` whose code size is zero (EOA / undeployed address).
 
 Default PoC deployment value for `disputeWindow`: **172800 seconds (48 hours)** — raised from 24 hours to guarantee effective dispute response time under L2 sequencer censorship (see [ADR 007](007-watchtower.md#l2-sequencer-censorship)). Safety bounds per [ADR 009](009-governance.md): 43200–259200 seconds (12h–72h). Under ADR 026 the `feePercentage` / `discountedFeePercentage` / treasury-address constructor parameters from earlier drafts are removed; bucket shares are governed on `FeeRouter` instead, and the treasury bucket is one of `FeeRouter`'s six buckets (see [FeeRouter Integration](#feerouter-integration)).
 
-**Events.** All events use indexed `channelId` plus an indexed actor field where applicable.
+#### Events
+
+All events use indexed `channelId` plus an indexed actor field where applicable.
 
 | Event | Emitted by | Non-indexed fields |
 | --- | --- | --- |
@@ -407,13 +447,21 @@ Nodes must keep their local copy of `RateBounds` current so that advertised `rat
 
 **Fallback mechanism: periodic polling.** Nodes MUST poll `getRateBounds()` at a configurable interval (`rate_bounds_poll_interval`, default **1 hour** for PoC). This guards against missed events due to RPC provider issues, WebSocket disconnections, or chain reorganizations. The 1-hour default is deliberately longer than the 10-minute intervals used for the on-chain registry ([ADR 001](001-network.md)) and content blacklist ([ADR 011](011-content-takedown.md)): registry freshness is connectivity-critical, blacklist freshness is slashing-critical, but rate bounds staleness only risks counterparties rejecting the node's advertised rate.
 
-**Startup.** Nodes MUST call `getRateBounds()` before accepting connections, ensuring the node never operates without rate bounds. This follows the same pattern as the content blacklist initial sync ([ADR 011](011-content-takedown.md)). Because `getRateBounds()` returns `uint256` values but the wire protocol represents `rate_per_mb` as `u64` ([ADR 010](010-multi-token.md)), nodes MUST verify that both `deliveryFloor` and `deliveryCeiling` fit within `u64` on every refresh (startup and subsequent polls/events). If either bound exceeds `u64::MAX`, the node MUST refuse to start (or, on a mid-operation refresh, continue with its last valid bounds and log an error). In practice this is unreachable — the PoC ceiling is 1,000 base units — but the check guards against governance misconfiguration.
+#### Startup
 
-**Stale bounds.** If the event subscription is lost and RPC polling fails, the node SHOULD continue operating with its last-known bounds and log a warning. No service interruption is required. The worst-case consequence of stale bounds is that counterparties running compliant software reject the node's `rate_per_mb` as out-of-bounds — a revenue impact, not a safety violation.
+Nodes MUST call `getRateBounds()` before accepting connections, ensuring the node never operates without rate bounds. This follows the same pattern as the content blacklist initial sync ([ADR 011](011-content-takedown.md)). Because `getRateBounds()` returns `uint256` values but the wire protocol represents `rate_per_mb` as `u64` ([ADR 010](010-multi-token.md)), nodes MUST verify that both `deliveryFloor` and `deliveryCeiling` fit within `u64` on every refresh (startup and subsequent polls/events). If either bound exceeds `u64::MAX`, the node MUST refuse to start (or, on a mid-operation refresh, continue with its last valid bounds and log an error). In practice this is unreachable — the PoC ceiling is 1,000 base units — but the check guards against governance misconfiguration.
 
-**No version-based delta pattern.** Unlike the content blacklist (which uses `getBlacklistVersion()` for cheap change detection and incremental delta fetching), rate bounds are a single struct containing two `uint256` values. A version counter adds no value — the full state is readable in a single `eth_call` with negligible overhead. This is an intentional divergence from the ADR 011 pattern.
+#### Stale bounds
 
-**Multi-token extension.** The PoC uses a single `RateBounds` struct. When per-token rate bounds are introduced ([ADR 010](010-multi-token.md)), the `RateBoundsUpdated` event will need a token parameter: `RateBoundsUpdated(address indexed token, uint256 newDeliveryFloor, uint256 newDeliveryCeiling)`. Nodes will subscribe with a token filter or listen for all tokens and update their local cache accordingly.
+If the event subscription is lost and RPC polling fails, the node SHOULD continue operating with its last-known bounds and log a warning. No service interruption is required. The worst-case consequence of stale bounds is that counterparties running compliant software reject the node's `rate_per_mb` as out-of-bounds — a revenue impact, not a safety violation.
+
+#### No version-based delta pattern
+
+Unlike the content blacklist (which uses `getBlacklistVersion()` for cheap change detection and incremental delta fetching), rate bounds are a single struct containing two `uint256` values. A version counter adds no value — the full state is readable in a single `eth_call` with negligible overhead. This is an intentional divergence from the ADR 011 pattern.
+
+#### Multi-token extension
+
+The PoC uses a single `RateBounds` struct. When per-token rate bounds are introduced ([ADR 010](010-multi-token.md)), the `RateBoundsUpdated` event will need a token parameter: `RateBoundsUpdated(address indexed token, uint256 newDeliveryFloor, uint256 newDeliveryCeiling)`. Nodes will subscribe with a token filter or listen for all tokens and update their local cache accordingly.
 
 For how nodes validate `rate_per_mb` against cached bounds before signing protocol messages, see [ADR 005 — Rate Bounds Validation](005-protocol.md#rate-bounds-validation).
 

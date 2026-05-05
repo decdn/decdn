@@ -11,7 +11,9 @@
 
 [ADR 026 §3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula) defines the gauge-pool share as a function of `bytes_i` (verified bytes per operator) and `ve_i / total_ve` (the operator's ve-share). The formula bounds the *output* but says nothing about whether the *input* `bytes_i` is honest. The on-chain `claimedBytes` reaching `FeeRouter.routeSettlement` ([ADR 003](003-payments.md)) is signed by *some* address that opened a payment channel — nothing today prevents the operator from running both sides.
 
-**The wash-trading attack** ([ADR 026 §Risks](026-gauge-boost-tokenomics.md#risks); design-spec §6.3): an operator opens a channel from a sybil client identity to themselves, self-routes traffic, and signs vouchers inflating `bytesDelivered`. Effective cost is the ~60% router skim on the operator's *own* USDC plus a few cents of L2 gas — roughly a 5–8% net loss in USDC terms, more than offset by gauge-share + ve-appreciation gains at TOKEN price 3–5× genesis. Settlement gas does not scale with claimed bytes. **Neither cost is a deterrent at the intended TOKEN price levels.**
+### The wash-trading attack
+
+([ADR 026 §Risks](026-gauge-boost-tokenomics.md#risks); design-spec §6.3): an operator opens a channel from a sybil client identity to themselves, self-routes traffic, and signs vouchers inflating `bytesDelivered`. Effective cost is the ~60% router skim on the operator's *own* USDC plus a few cents of L2 gas — roughly a 5–8% net loss in USDC terms, more than offset by gauge-share + ve-appreciation gains at TOKEN price 3–5× genesis. Settlement gas does not scale with claimed bytes. **Neither cost is a deterrent at the intended TOKEN price levels.**
 
 Defense: byte counters that feed the gauge formula must be attested by **distinct, verifiable client identities** — counterparties the operator does not control. The voucher protocol from [ADR 003](003-payments.md) already proves *bytes were paid for*; this ADR adds a parallel artifact that proves *bytes were paid for by independent counterparties* and gates gauge eligibility on that artifact.
 
@@ -40,19 +42,29 @@ A `DeliveryReceipt` is an EIP-712 typed-data message signed by the **requester's
 | `epochId` | `uint64` | The `FeeRouter` epoch this receipt is intended to credit — set by the requester at signing time. Receipts are grouped/bucketed by this field when constructing per-epoch roots (see §4 Per-epoch bucketing); a receipt is rejected if its `epochId` does not match the specific epoch root/summary under which it is being committed. This does **not** require all receipts in a physical batch to share the same `epochId`. |
 | `timestamp` | `uint64` | Microsecond timestamp from the requester's clock at signing. Skew bounds: `MAX_FUTURE_SKEW_US = 60_000_000` (60 s) prevents future-dated receipts. Staleness is measured against the receipt's `epochId` settlement window, **not** wall-clock at challenge time — a receipt is fresh as long as its `timestamp` falls within the `epochId` epoch (1-week window per [ADR 026 §2](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553)) plus the gauge claim window (26 epochs ≈ 6 months). This decouples receipt validity from the 90-day max channel duration in [ADR 003](003-payments.md): a receipt signed early in a long-lived channel is fresh for the epoch it claims, regardless of when the channel itself eventually settles. The narrower [ADR 014 Evidence Staleness](014-on-chain-verification.md) bounds (5 days) apply only to slash-evidence paths, which are out of scope for routine receipt-eligibility checks. |
 
-**EIP-712 domain.** Dedicated `FeeRouter` domain separator over the §1 field set, preventing cross-contract replay against `StablePaymentChannel` voucher signatures or `SlashJudge` evidence. EIP-712's typed-data envelope inherently carries domain-separator + struct-type-hash bytes that callers must validate before recovering — an attacker-supplied byte-string that doesn't match the typehash fails recovery against `clientPubKey` and is rejected before any further parsing, providing the equivalent of a magic header for the on-chain validation path.
+#### EIP-712 domain
+
+Dedicated `FeeRouter` domain separator over the §1 field set, preventing cross-contract replay against `StablePaymentChannel` voucher signatures or `SlashJudge` evidence. EIP-712's typed-data envelope inherently carries domain-separator + struct-type-hash bytes that callers must validate before recovering — an attacker-supplied byte-string that doesn't match the typehash fails recovery against `clientPubKey` and is rejected before any further parsing, providing the equivalent of a magic header for the on-chain validation path.
 
 **Invariants enforced on challenge (§4, §5):** signature recovers to `clientPubKey == channel.client`; `bytesClaimed` matches the paired voucher's `bytesDelivered` (the receipt and voucher must be two views of the *same* delivery); `operatorAddress == channel.provider`; `timestamp` falls within the receipt's `epochId` epoch ± `MAX_FUTURE_SKEW_US` (each receipt is bucketed by its own `epochId`, so a single batch may span multiple epochs — see §4 Per-epoch bucketing for the long-lived-channel pattern).
 
-**Pairing with vouchers, not replacing them.** [ADR 003](003-payments.md)'s `Voucher` is the on-chain payment instrument and remains the authoritative settlement input for `claimedAmount` and `claimedBytes`. The `DeliveryReceipt` is a separate signature over an overlapping field set (`bytesClaimed` mirrors `bytesDelivered`; `channelId` and `voucherNonce` pin the pairing). A voucher without a matching receipt is fully redeemable for USDC at settlement — only **gauge eligibility for the underlying bytes** depends on the receipt. See §7 for failure semantics.
+#### Pairing with vouchers, not replacing them
+
+[ADR 003](003-payments.md)'s `Voucher` is the on-chain payment instrument and remains the authoritative settlement input for `claimedAmount` and `claimedBytes`. The `DeliveryReceipt` is a separate signature over an overlapping field set (`bytesClaimed` mirrors `bytesDelivered`; `channelId` and `voucherNonce` pin the pairing). A voucher without a matching receipt is fully redeemable for USDC at settlement — only **gauge eligibility for the underlying bytes** depends on the receipt. See §7 for failure semantics.
 
 ### 2. Signature scheme
 
-**secp256k1 / EIP-712.** Identical curve and signing scheme as the rest of the deCDN/EVM stack: voucher signatures ([ADR 003 EIP-712 Voucher Signature](003-payments.md)), `slash_sig` ([ADR 014 §1](014-on-chain-verification.md)), `BindNodeId` ([ADR 003 NodeId Binding](003-payments.md)), and `DeliveryReceipt` for corruption challenges ([ADR 014 §2](014-on-chain-verification.md)) — though the latter is a different typedef from the receipt defined here.
+#### secp256k1 / EIP-712
 
-**Verifier.** OpenZeppelin `SignatureChecker.isValidSignatureNow` so EOAs (`ecrecover`, ~3k gas) and ERC-1271 smart accounts ([ADR 024](024-account-abstraction.md), ~15k gas for Safe) are both supported with no special-casing in `FeeRouter` or `SlashJudge`. Production clients running smart-account wallets sign receipts via the same path as vouchers.
+Identical curve and signing scheme as the rest of the deCDN/EVM stack: voucher signatures ([ADR 003 EIP-712 Voucher Signature](003-payments.md)), `slash_sig` ([ADR 014 §1](014-on-chain-verification.md)), `BindNodeId` ([ADR 003 NodeId Binding](003-payments.md)), and `DeliveryReceipt` for corruption challenges ([ADR 014 §2](014-on-chain-verification.md)) — though the latter is a different typedef from the receipt defined here.
 
-**Why secp256k1.** Receipts are signed by *requester* EVM keys (channel funder, not operator), and identity diversity is computed in the EVM-address space because channel deposits are USDC. Ed25519 is reserved for wire-level operator authentication ([ADR 005](005-protocol.md)); on-chain Ed25519 verification was already rejected as too expensive ([ADR 014 Alternatives](014-on-chain-verification.md#alternatives-considered)).
+#### Verifier
+
+OpenZeppelin `SignatureChecker.isValidSignatureNow` so EOAs (`ecrecover`, ~3k gas) and ERC-1271 smart accounts ([ADR 024](024-account-abstraction.md), ~15k gas for Safe) are both supported with no special-casing in `FeeRouter` or `SlashJudge`. Production clients running smart-account wallets sign receipts via the same path as vouchers.
+
+#### Why secp256k1
+
+Receipts are signed by *requester* EVM keys (channel funder, not operator), and identity diversity is computed in the EVM-address space because channel deposits are USDC. Ed25519 is reserved for wire-level operator authentication ([ADR 005](005-protocol.md)); on-chain Ed25519 verification was already rejected as too expensive ([ADR 014 Alternatives](014-on-chain-verification.md#alternatives-considered)).
 
 ### 3. Identity-diversity gating
 
@@ -66,7 +78,9 @@ A "distinct client identity" for gauge eligibility purposes is a `clientPubKey` 
 | **Funding-source diversity.** The address's USDC balance for the qualifying channel deposit was not received from `operatorAddress`, the operator's known affiliated addresses (registered per [ADR 008](008-reputation.md)), or any other client identity already counted toward this operator's distinct-client set in the current epoch. **Watchtowers compute this signal off-chain** by indexing public USDC `Transfer` events from L2 RPC at the time of channel funding; the diversity attestation enters the watchtower-signed receipt-validation output (§5). On-chain enforcement at challenge time is bounded by the EVM's 256-block `BLOCKHASH` window — a full Merkle proof of the historical funding tx is **not** practical without a dedicated block-hash oracle or storage-proof verifier (`reth`-style execution-state proof against an L1-anchored root, deferred to [ADR 017](017-privacy.md) future work). For now, on-chain challenge resolution accepts the attesting watchtower's signature plus a corroborating attester (per §5 quorum); deeper cryptographic proof is a v2 hardening. | — | — |
 | **Reputation gate (forward to §6).** If the operator's reputation score is below `medium_rep_threshold`, the funded-channel minimum and funding age are tightened (see §6). | — | — |
 
-**Per-epoch eligibility threshold.** An operator is eligible for the gauge pool in epoch `e` only if:
+#### Per-epoch eligibility threshold
+
+An operator is eligible for the gauge pool in epoch `e` only if:
 
 ```
 distinct_clients_e(operator) ≥ MIN_DISTINCT_CLIENTS_PER_EPOCH
@@ -79,11 +93,17 @@ Where `distinct_clients_e(operator)` counts the unique `clientPubKey` values app
 | `MIN_DISTINCT_CLIENTS_PER_EPOCH` | 5 | `[1, 50]` |
 | `medium_rep_threshold` | 0.50 (per [ADR 008 §12.1](008-reputation.md#121-receipt-tiers)) | governable within `[0.30, 0.70]` per ADR 008 |
 
-**Sizing rationale.** A single sybil costs the attacker the funded-channel minimum (10 USDC), the funding-age delay (24 h), and the cooldown (7 d). Five distinct sybils per week is 50 USDC of capital permanently parked in payment-channel deposits per operator per week, plus on-chain Tx fees to fund and rotate. Larger thresholds harden against sybils linearly at the cost of cold-start UX; 5 is a reasoned default at tens-of-nodes-scale. Production data should retune this — the parameter is governable and the safety bounds are wide.
+#### Sizing rationale
 
-**Cold-start exception.** During the first 8 epochs of mainnet (governance-set `gaugeBootstrapEpochs`, default 8, max 26), `MIN_DISTINCT_CLIENTS_PER_EPOCH` is reduced to `1`. The intent is to let the gauge pool distribute meaningfully even when the network has fewer aggregate clients than the steady-state threshold; the wash-trading risk is bounded during this window because externally-funded operator-recruitment programs ([ADR 026 §10](026-gauge-boost-tokenomics.md#10-bootstrap-mechanism-pre-seed-usdc)) dominate early-epoch bytes anyway. Bootstrap-window receipts are still validated; only the *threshold* is lowered.
+A single sybil costs the attacker the funded-channel minimum (10 USDC), the funding-age delay (24 h), and the cooldown (7 d). Five distinct sybils per week is 50 USDC of capital permanently parked in payment-channel deposits per operator per week, plus on-chain Tx fees to fund and rotate. Larger thresholds harden against sybils linearly at the cost of cold-start UX; 5 is a reasoned default at tens-of-nodes-scale. Production data should retune this — the parameter is governable and the safety bounds are wide.
 
-**Optional reputation-attested registry.** The protocol does not require a centralized identity registry. However, a `ClientIdentityRegistry` view contract may be supplied by reputation attesters ([ADR 008](008-reputation.md)) so well-known stable client identities (e.g., operators of large origin-backed services purchasing CDN bandwidth) can be vouched for and bypass the funding-age gate. The registry is opt-in and watchtower-validated; clients without a registry entry use the default funded-channel-and-cooldown rules unchanged.
+#### Cold-start exception
+
+During the first 8 epochs of mainnet (governance-set `gaugeBootstrapEpochs`, default 8, max 26), `MIN_DISTINCT_CLIENTS_PER_EPOCH` is reduced to `1`. The intent is to let the gauge pool distribute meaningfully even when the network has fewer aggregate clients than the steady-state threshold; the wash-trading risk is bounded during this window because externally-funded operator-recruitment programs ([ADR 026 §10](026-gauge-boost-tokenomics.md#10-bootstrap-mechanism-pre-seed-usdc)) dominate early-epoch bytes anyway. Bootstrap-window receipts are still validated; only the *threshold* is lowered.
+
+#### Optional reputation-attested registry
+
+The protocol does not require a centralized identity registry. However, a `ClientIdentityRegistry` view contract may be supplied by reputation attesters ([ADR 008](008-reputation.md)) so well-known stable client identities (e.g., operators of large origin-backed services purchasing CDN bandwidth) can be vouched for and bypass the funding-age gate. The registry is opt-in and watchtower-validated; clients without a registry entry use the default funded-channel-and-cooldown rules unchanged.
 
 ### 4. On-chain anchoring (Merkle-batched)
 
@@ -91,9 +111,13 @@ Per-receipt on-chain storage is uneconomical at scale. A 1 Gbps node produces ~3
 
 The protocol mirrors the **keccak256 Merkle-batch pattern** from [ADR 014 §2 Production Path](014-on-chain-verification.md#production-path-interactive-keccak256-merkle-proof-future-adr): receipts are committed via root, individual receipts surface only on challenge.
 
-**Per-settlement commitment.** Operators commit a `bytes32 receiptBatchRoot` against a channel via `StablePaymentChannel.commitReceiptRoot(channelId, receiptBatchRoot)` — provider-only (`msg.sender == channel.provider`), callable any time before settlement. At settlement, `StablePaymentChannel.settleChannel` reads the stored root (defaulting to `bytes32(0)` if the operator opted out) and forwards it to `FeeRouter.routeSettlement(operator, bytesDelivered, amount, receiptBatchRoot)`. A zero root signals "this settlement contributes nothing to gauge eligibility" — see §7. The commit / settle split is intentional: `settleChannel` itself remains callable by anyone (preserving the [ADR 003](003-payments.md) anyone-can-settle property), but the gauge-eligibility root is fixed at provider-only commit time, preventing third-party settlers from denying gauge credit by submitting a zero root.
+#### Per-settlement commitment
 
-**Per-epoch bucketing (long-lived channels).** A receipt batch may span multiple epochs: each receipt's `epochId` field (signed by the requester at receipt-creation time) buckets that receipt's bytes into the corresponding epoch's `EpochReceiptSummary`. There is no requirement that all receipts in a single batch share the same `epochId`. This decouples channel settlement cadence from gauge-credit cadence:
+Operators commit a `bytes32 receiptBatchRoot` against a channel via `StablePaymentChannel.commitReceiptRoot(channelId, receiptBatchRoot)` — provider-only (`msg.sender == channel.provider`), callable any time before settlement. At settlement, `StablePaymentChannel.settleChannel` reads the stored root (defaulting to `bytes32(0)` if the operator opted out) and forwards it to `FeeRouter.routeSettlement(operator, bytesDelivered, amount, receiptBatchRoot)`. A zero root signals "this settlement contributes nothing to gauge eligibility" — see §7. The commit / settle split is intentional: `settleChannel` itself remains callable by anyone (preserving the [ADR 003](003-payments.md) anyone-can-settle property), but the gauge-eligibility root is fixed at provider-only commit time, preventing third-party settlers from denying gauge credit by submitting a zero root.
+
+#### Per-epoch bucketing (long-lived channels)
+
+A receipt batch may span multiple epochs: each receipt's `epochId` field (signed by the requester at receipt-creation time) buckets that receipt's bytes into the corresponding epoch's `EpochReceiptSummary`. There is no requirement that all receipts in a single batch share the same `epochId`. This decouples channel settlement cadence from gauge-credit cadence:
 
 - A 90-day channel ([ADR 003 maxChannelDuration](003-payments.md)) accumulates receipts across ~13 epochs. The operator can commit per-epoch receipt roots without waiting for channel settlement, and gauge credit accrues to each epoch when its `EpochReceiptSummary` is committed.
 - Per-epoch operator commits use `FeeRouter.commitEpochReceiptRoot(operator, epochId, root)` — directly to the router, independent of any channel's settlement state.
@@ -101,9 +125,13 @@ The protocol mirrors the **keccak256 Merkle-batch pattern** from [ADR 014 §2 Pr
 
 This pattern lets operators settle channels at the cadence that minimizes their gas while still capturing gauge eligibility on the per-epoch cadence the boost mechanism requires.
 
-**Batch shape.** A `ReceiptBatch` is a keccak256 Merkle tree over the §1 field set plus `keccak256(signature)` (which canonicalises EOA vs. arbitrary ERC-1271 signatures into a fixed-width leaf). Tree construction matches the [ADR 014](014-on-chain-verification.md) pattern: `keccak256(left || right)` internal nodes, zero-padded for non-power-of-2 leaf counts, index-prefixed leaves to prevent second-preimage. A 30k-receipt monthly batch produces a 15-deep tree (~480 bytes per challenge proof).
+#### Batch shape
 
-**Per-epoch summary.** At epoch rollover, `FeeRouter` aggregates all `receiptBatchRoot` commitments observed for an operator during the epoch into a single per-epoch `EpochReceiptSummary`:
+A `ReceiptBatch` is a keccak256 Merkle tree over the §1 field set plus `keccak256(signature)` (which canonicalises EOA vs. arbitrary ERC-1271 signatures into a fixed-width leaf). Tree construction matches the [ADR 014](014-on-chain-verification.md) pattern: `keccak256(left || right)` internal nodes, zero-padded for non-power-of-2 leaf counts, index-prefixed leaves to prevent second-preimage. A 30k-receipt monthly batch produces a 15-deep tree (~480 bytes per challenge proof).
+
+#### Per-epoch summary
+
+At epoch rollover, `FeeRouter` aggregates all `receiptBatchRoot` commitments observed for an operator during the epoch into a single per-epoch `EpochReceiptSummary`:
 
 | Field | Type | Description |
 | --- | --- | --- |
@@ -117,7 +145,9 @@ The `EpochReceiptSummary` is committed once per operator per epoch by the operat
 
 > **Aggregator implementation — gas-cost note.** A naive implementation that stores every `receiptBatchRoot` and re-hashes them on `commitEpochSummary` is O(N) per epoch in storage reads + hash steps, where N is the operator's per-epoch settlement count. At the reference scale (~30k receipts/month split across O(1k) settlements per operator) this is gas-prohibitive on L2. The expected production implementation maintains a per-(operator, epoch) **rolling Merkle Mountain Range (MMR)** accumulator: each new `commitReceiptRoot` (or per-epoch commit) appends one leaf and updates O(log N) hashes; `commitEpochSummary` reads only the MMR's current root and depth. The MMR vs. plain-hash tradeoff is implementation-detail (more code, smaller gas footprint); both produce equivalent inclusion proofs. This ADR does not pin the choice, but production deployments SHOULD adopt the MMR pattern at scale.
 
-**Challenge window.** A 7-day window (matches the gauge-claim-window opening) during which any address may submit a `ChallengeReceiptSummary` claim against an operator's summary. Watchtowers (§5) typically initiate. A successful challenge zeros `claimedDistinctClients` for the epoch — gauge eligibility is forfeited in line with §7. An unsuccessful challenge forfeits the challenger's bond per [ADR 014 Bond Handling](014-on-chain-verification.md).
+#### Challenge window
+
+A 7-day window (matches the gauge-claim-window opening) during which any address may submit a `ChallengeReceiptSummary` claim against an operator's summary. Watchtowers (§5) typically initiate. A successful challenge zeros `claimedDistinctClients` for the epoch — gauge eligibility is forfeited in line with §7. An unsuccessful challenge forfeits the challenger's bond per [ADR 014 Bond Handling](014-on-chain-verification.md).
 
 ### 5. Watchtower role (forward to [ADR 007](007-watchtower.md))
 
@@ -129,9 +159,13 @@ A receipt attester subscribed to an operator's epoch performs:
 2. **Identity diversity over recent epochs.** Apply the §3 rules — funded-channel minimum, funding-age, per-operator cooldown, funding-source diversity — and compute the actual distinct-client count. Compare with `claimedDistinctClients` in the operator's `EpochReceiptSummary`.
 3. **Cross-checks against suspicious clustering.** Heuristics flag ancestry / timing / byte-distribution patterns characteristic of self-routed traffic (e.g., contiguous-EOA "address generator" patterns, common-ancestor funding, jitter-free byte counts). Exact catalog is implementation-defined; what is fixed is the **interface** — a heuristic flag is sufficient grounds to open a `ChallengeReceiptSummary`, but the on-chain dispute resolves on cryptographic evidence (signature validity, channel-funding ancestry traces), never on the heuristic itself.
 
-**Bond model.** Receipt-fraud challenges use the existing watchtower bond mechanism in [ADR 007](007-watchtower.md). Successful challenges award the bond plus a configurable receipt-fraud reward to the challenger; unsuccessful challenges forfeit the bond per [ADR 014 Bond Handling](014-on-chain-verification.md). Receipt attesters are not a new on-chain role — they are watchtowers running an additional module against the same `WatchtowerEscrow` contract.
+#### Bond model
 
-**Separation from the operator.** Receipt attesters MUST NOT be operated by the operator they validate. The operator's affiliated-address registry ([ADR 008](008-reputation.md)) is queried; an attester address that overlaps with `operatorAddress`'s known affiliates is ineligible to settle challenges against that operator. This is enforced on-chain in `WatchtowerEscrow` at challenge submission time, mirroring the watchtower-collusion defense already in [ADR 007](007-watchtower.md).
+Receipt-fraud challenges use the existing watchtower bond mechanism in [ADR 007](007-watchtower.md). Successful challenges award the bond plus a configurable receipt-fraud reward to the challenger; unsuccessful challenges forfeit the bond per [ADR 014 Bond Handling](014-on-chain-verification.md). Receipt attesters are not a new on-chain role — they are watchtowers running an additional module against the same `WatchtowerEscrow` contract.
+
+#### Separation from the operator
+
+Receipt attesters MUST NOT be operated by the operator they validate. The operator's affiliated-address registry ([ADR 008](008-reputation.md)) is queried; an attester address that overlaps with `operatorAddress`'s known affiliates is ineligible to settle challenges against that operator. This is enforced on-chain in `WatchtowerEscrow` at challenge submission time, mirroring the watchtower-collusion defense already in [ADR 007](007-watchtower.md).
 
 ### 6. Reputation gating (forward to [ADR 008](008-reputation.md))
 
@@ -150,7 +184,9 @@ The intent: a high-reputation operator with stable historical traffic has a high
 
 **Integration is non-blocking.** The receipt protocol does not require reputation to function — `medium_rep_threshold` may be configured to its lower bound (0.30) in early production so almost all operators clear it and get the relaxed thresholds. The protocol upgrades when reputation is online, not when it ships.
 
-**Forward-compatible.** [ADR 008](008-reputation.md) is updated separately to expose `reputationOf(operator)` as an on-chain view that `FeeRouter.commitEpochSummary` reads at commit time.
+#### Forward-compatible
+
+[ADR 008](008-reputation.md) is updated separately to expose `reputationOf(operator)` as an on-chain view that `FeeRouter.commitEpochSummary` reads at commit time.
 
 ### 7. Failure semantics
 
@@ -164,9 +200,13 @@ The receipt protocol fails open for **payment** and fails closed for **gauge eli
 | Operator delivers bytes but gauge eligibility is forfeited for any reason in this table (zeroed batch, missing summary, sub-threshold distinct clients). | **Paid same-tx** at settlement. | Zero gauge share for the epoch. | None unless triggered separately. |
 | Operator below `MIN_DISTINCT_CLIENTS_PER_EPOCH` after honest validation (low traffic, regional cold-start). | **Paid same-tx** at settlement. | Zero gauge share for the epoch. | None. |
 
-**The cashflow invariant.** Settlement always pays the operator's 40% base ([ADR 026 §2 Same-transaction guarantees](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553); [ADR 026 §3 Properties](026-gauge-boost-tokenomics.md#3-gauge-boost-formula)). Receipt validity gates only the **40% gauge pool share**, never the **40% base share**. An operator running honest delivery with an immature client base receives full base USDC and zero gauge — they are commodity operators in the [ADR 026 §7 Case A](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake) sense. This is the designed incentive pressure, not a punishment.
+#### The cashflow invariant
 
-**The slashing invariant.** Receipt protocol violations are **not by themselves slashable**. A successful Merkle-anchored challenge zeros gauge eligibility for the *current epoch only*. Slashing escalates only via the [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn) schedule and only when watchtower evidence proves a deliberate forgery (e.g., a recovered signer that does not correspond to any channel `client` that ever existed, indicating an outright fabricated signature). Routine receipt invalidation — wrong root committed, late batch commit, signature on a closed channel — is corrected by zeroing the epoch and not by slashing.
+Settlement always pays the operator's 40% base ([ADR 026 §2 Same-transaction guarantees](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553); [ADR 026 §3 Properties](026-gauge-boost-tokenomics.md#3-gauge-boost-formula)). Receipt validity gates only the **40% gauge pool share**, never the **40% base share**. An operator running honest delivery with an immature client base receives full base USDC and zero gauge — they are commodity operators in the [ADR 026 §7 Case A](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake) sense. This is the designed incentive pressure, not a punishment.
+
+#### The slashing invariant
+
+Receipt protocol violations are **not by themselves slashable**. A successful Merkle-anchored challenge zeros gauge eligibility for the *current epoch only*. Slashing escalates only via the [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn) schedule and only when watchtower evidence proves a deliberate forgery (e.g., a recovered signer that does not correspond to any channel `client` that ever existed, indicating an outright fabricated signature). Routine receipt invalidation — wrong root committed, late batch commit, signature on a closed channel — is corrected by zeroing the epoch and not by slashing.
 
 ### 8. Privacy considerations (forward to [ADR 017](017-privacy.md))
 
@@ -188,7 +228,9 @@ This is a real privacy regression from the [ADR 003](003-payments.md) baseline, 
 
 This is consistent with [ADR 026 §Forward references](026-gauge-boost-tokenomics.md#forward-references-follow-up-adrs) — ADR 027 is listed there as "priority-1; not optional for production launch". The wording above pins down what "not optional" means concretely.
 
-**Sequencing.** Format and client/operator libraries → contract paths deployed in parallel-run mode (no enforcement) → watchtower module + heuristic library → reputation integration → cutover (gauge gating on, `MIN_DISTINCT_CLIENTS_PER_EPOCH` active). The cutover is launch readiness.
+#### Sequencing
+
+Format and client/operator libraries → contract paths deployed in parallel-run mode (no enforcement) → watchtower module + heuristic library → reputation integration → cutover (gauge gating on, `MIN_DISTINCT_CLIENTS_PER_EPOCH` active). The cutover is launch readiness.
 
 ---
 
