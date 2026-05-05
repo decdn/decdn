@@ -77,7 +77,7 @@ pub struct ProbeRequest {
 /// Node → client response on `cdn/probe/v1`.
 ///
 /// `rate_per_mb` is bounded by [`MAX_RATE_PER_MB`] at the wire boundary —
-/// the field-level [`deserialize_rate_per_mb`] hook rejects oversize values
+/// the field-level `deserialize_rate_per_mb` hook rejects oversize values
 /// so a malicious node cannot poison the client selection score with an
 /// overflow-inducing rate (issue #378). Server-side construction is
 /// unconstrained at the type level; the node's config layer
@@ -100,7 +100,7 @@ pub struct ProbeResponse {
 
 impl ProbeResponse {
     /// Validate field invariants. The wire-decode path enforces the same
-    /// bound automatically via [`deserialize_rate_per_mb`]; this method is
+    /// bound automatically via `deserialize_rate_per_mb`; this method is
     /// exposed so server-side construction sites can re-check before
     /// sending and so tests can assert validity without going through a
     /// full encode/decode roundtrip.
