@@ -522,6 +522,13 @@ pub(crate) fn parse_pinned_hashes(
 /// make this node trivially win every client selection while earning no
 /// payable revenue — an obvious misconfiguration that should fail startup, not
 /// silently degrade the network.
+///
+/// Rejects `rate_per_mb > MAX_RATE_PER_MB` (issue #378): the wire boundary
+/// enforces the same ceiling on inbound `ProbeResponse`s, so an operator
+/// configuring a rate above this would publish probe responses that every
+/// honest client decoder rejects — fail at startup rather than silently
+/// emit unparseable wire traffic. The bound is also a defense-in-depth
+/// against the selection-score overflow path (issue #322).
 pub(crate) fn resolve_payment(
     cli: &crate::cli::run::PaymentArgs,
     file: Option<&types::PaymentConfig>,
@@ -534,6 +541,12 @@ pub(crate) fn resolve_payment(
         rate_per_mb > 0,
         "payment.rate_per_mb must be > 0 (used in the node selection score, \
          ADR 001); got 0"
+    );
+    anyhow::ensure!(
+        rate_per_mb <= decdn_protocol::MAX_RATE_PER_MB,
+        "payment.rate_per_mb {rate_per_mb} exceeds protocol MAX_RATE_PER_MB ({}); \
+         honest clients reject `ProbeResponse`s above this ceiling (issue #378)",
+        decdn_protocol::MAX_RATE_PER_MB,
     );
     Ok(ResolvedPayment { rate_per_mb })
 }
@@ -1685,6 +1698,40 @@ mod tests {
             resolved.rate_per_mb == DEFAULT_RATE_PER_MB,
             "got: {}",
             resolved.rate_per_mb
+        );
+        Ok(())
+    }
+
+    // Issue #378: configuring a rate above the protocol-level wire ceiling
+    // is a startup error — otherwise the node would publish ProbeResponses
+    // that every honest client decoder rejects, silently dropping itself
+    // out of the candidate pool.
+    #[test]
+    fn resolve_payment_rejects_rate_above_protocol_max() -> anyhow::Result<()> {
+        let cli = crate::cli::run::PaymentArgs {
+            rate_per_mb: Some(decdn_protocol::MAX_RATE_PER_MB + 1),
+        };
+        let err = resolve_payment(&cli, None)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected rejection above MAX_RATE_PER_MB"))?
+            .to_string();
+        anyhow::ensure!(
+            err.contains("MAX_RATE_PER_MB") && err.contains("#378"),
+            "error lacked MAX_RATE_PER_MB / issue #378 context: {err}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_payment_accepts_rate_at_protocol_max() -> anyhow::Result<()> {
+        let cli = crate::cli::run::PaymentArgs {
+            rate_per_mb: Some(decdn_protocol::MAX_RATE_PER_MB),
+        };
+        let resolved = resolve_payment(&cli, None)?;
+        anyhow::ensure!(
+            resolved.rate_per_mb == decdn_protocol::MAX_RATE_PER_MB,
+            "expected MAX_RATE_PER_MB; got {}",
+            resolved.rate_per_mb,
         );
         Ok(())
     }
