@@ -28,6 +28,8 @@ All on-chain contracts inherit from [OpenZeppelin Contracts](https://docs.openze
 | SafetyReserve | [026](026-gauge-boost-tokenomics.md) | Yes | USDC (3% bucket + slashing redirect) | `AccessControl`, `ReentrancyGuard`, `Pausable` | Production only |
 | BuybackBurner | [018](018-liquidity-strategy.md), [026](026-gauge-boost-tokenomics.md) | Yes | USDC, TOKEN (transient) | `AccessControl`, `ReentrancyGuard`, `Pausable` | PoC (accumulate-only) + Production |
 | ContentBlacklist | [011](011-content-takedown.md) | No | — | `AccessControl`, `ReentrancyGuard` | PoC + Production |
+| PublisherRegistry | [002](002-content-addressing.md) | No | — | `AccessControl`, `ReentrancyGuard` | PoC + Production |
+| OriginAssignment | [011](011-content-takedown.md) | No | — | `AccessControl`, `ReentrancyGuard` | PoC + Production |
 | SlashJudge | [014](014-on-chain-verification.md) | Yes | TOKEN (challenge bonds) | `AccessControl`, `ReentrancyGuard`, `Pausable`, `EIP712` | PoC + Production |
 | WatchtowerEscrow | [007](007-watchtower.md) | Yes | USDC | `ReentrancyGuard`, `Pausable`, `EIP712` | Production only |
 
@@ -113,9 +115,11 @@ graph TD
     BB["6. BuybackBurner"]
     FR["7. FeeRouter"]
     SPC["8. StablePaymentChannel (PoC)<br/>PaymentChannel (production)"]
-    CB["9. ContentBlacklist"]
-    SJ["10. SlashJudge"]
-    WE["11. WatchtowerEscrow (production)"]
+    PR["9. PublisherRegistry"]
+    OA["10. OriginAssignment"]
+    CB["11. ContentBlacklist"]
+    SJ["12. SlashJudge"]
+    WE["13. WatchtowerEscrow (production)"]
 
     SR --> TOKEN
     VE --> TOKEN
@@ -129,6 +133,9 @@ graph TD
     SPC --> USDC
     SPC --> SR
     SPC --> FR
+    OA --> SR
+    OA --> PR
+    OA --> CB
     CB --> SR
     SJ --> SR
     SJ --> TOKEN
@@ -148,9 +155,17 @@ graph TD
 | 7 | FeeRouter (production) | USDC address, TOKEN address, VotingEscrow address, BuybackBurner address, SafetyReserve address, treasury wallet address, Balancer V3 Router + pool addresses (for the delegator-pool USDC→TOKEN swap; may share `BuybackBurner`'s configuration), `epochLength` (1 week), `claimWindow` (26 epochs), default split shares (40/40/7/5/5/3 per [ADR 026](026-gauge-boost-tokenomics.md) §2), and `boostFloor` (0.4) per [ADR 026](026-gauge-boost-tokenomics.md) §3. Sum-to-100% across the six router shares is enforced on every governance update. |
 | 8a | StablePaymentChannel (PoC) | Constructor args: USDC address, `treasuryAddress`, `disputeWindow` (48h). Initialized in constructor body: StakingRegistry address, `feePercentage` (300 bps), `discountedFeePercentage` (150 bps), `maxChannelDuration` (90 days), rate bounds ([ADR 003](003-payments.md)) |
 | 8b | PaymentChannel (production) | StakingRegistry address, Governor address, **FeeRouter address** ([ADR 026](026-gauge-boost-tokenomics.md) §2). `settleChannel` no longer skims a protocol fee; it transfers the full operator USDC balance to `FeeRouter.routeSettlement(operator, bytesDelivered, amount, receiptBatchRoot)` in the same transaction. The `feePercentage` / `discountedFeePercentage` constructor arguments from the PoC contract are removed. |
-| 9 | ContentBlacklist | `ContentBlacklist(address stakingRegistry)`. StakingRegistry address is required for `ejectNode()` cross-contract call. [ADR 011](011-content-takedown.md) describes the call but not the constructor interface; this ADR formalizes it. |
-| 10 | SlashJudge | StakingRegistry address, TOKEN address, `challengeBond` (100 TOKEN), `counterEvidenceWindow` (24h) |
-| 11 | WatchtowerEscrow | StablePaymentChannel/PaymentChannel address, `heartbeatInterval`, `missThreshold`, `feeRateBps`, `minFee`, `monitoringPeriod` |
+| 9 | PublisherRegistry | None. Permissionless registration; namespace cap and transfer-timelock parameters are read from the governance-controlled parameter store at call time. See [ADR 002 § Contract: PublisherRegistry](002-content-addressing.md#contract-publisherregistry). |
+| 10 | OriginAssignment | StakingRegistry, PublisherRegistry, ContentBlacklist (latter may be zero at deploy; bound via `setContentBlacklist`). Min-redundancy, timelock, and default-open parameters are governance-controlled. See [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority) and [§ OriginAssignment construction notes](#originassignment-construction-notes) below. |
+| 11 | ContentBlacklist | `ContentBlacklist(address stakingRegistry)`. StakingRegistry address is required for `ejectNode()`. ContentBlacklist no longer cross-calls `OriginAssignment` (security relies on runtime checks; see [ADR 011 § Interaction with ContentBlacklist](011-content-takedown.md#interaction-with-contentblacklist)). After deployment, `OriginAssignment.setContentBlacklist(address)` is called once via the deployer / admin to wire the read direction (`OriginAssignment.pruneBlacklistedAssignment` queries `ContentBlacklist.isOriginBlacklisted`). |
+| 12 | SlashJudge | StakingRegistry address, TOKEN address, `challengeBond` (100 TOKEN), `counterEvidenceWindow` (24h) |
+| 13 | WatchtowerEscrow | StablePaymentChannel/PaymentChannel address, `heartbeatInterval`, `missThreshold`, `feeRateBps`, `minFee`, `monitoringPeriod` |
+
+#### OriginAssignment construction notes
+
+- **Default-open allow-list bootstrap.** Entries keyed by `namespaceId == 0` start empty with `defaultOpenAllowlistActive == false` (permissive bootstrap window — any active staker may serve as origin for default-open content). The first non-empty governance activation flips `defaultOpenAllowlistActive` to `true` permanently; thereafter only allow-listed operators appear in `getOrigins(0)`.
+- **Default-open governance entry points.** `setDefaultOpenAllowlist`, `addDefaultOpenOperator`, `removeDefaultOpenOperator`, `setDefaultOpenMinRedundancy`, `setDefaultOpenMaxOrigins` all carry `GOVERNANCE_ROLE` and run under the Governor's standard 48h timelock.
+- **ContentBlacklist binding.** Until `setContentBlacklist(address)` is called post-deploy (see § Post-Deployment Initialization below), `pruneBlacklistedAssignment` reverts — it cannot read `isOriginBlacklisted` against the zero address. This does not block usage: off-chain consumers of `getOrigins(...)` cross-reference `ContentBlacklist.isOriginBlacklisted` directly via RPC.
 
 #### Post-Deployment Initialization
 
@@ -162,7 +177,15 @@ After all contracts are deployed, the deployer must execute these transactions b
    stakingRegistry.grantRole(BLACKLIST_ROLE, address(contentBlacklist));
    ```
 
-2. **Grant `SLASH_ROLE`** on StakingRegistry to SlashJudge:
+2. **Bind ContentBlacklist into OriginAssignment** (one-shot read wiring):
+
+   ```solidity
+   originAssignment.setContentBlacklist(address(contentBlacklist));
+   ```
+
+   This authorizes `OriginAssignment.pruneBlacklistedAssignment` to query `ContentBlacklist.isOriginBlacklisted` for permissionless storage cleanup. Until this call is made, prune calls revert; runtime authorization checks (probe, peer table) consult both contracts directly via the off-chain RPC path and are unaffected.
+
+3. **Grant `SLASH_ROLE`** on StakingRegistry to SlashJudge:
 
    ```solidity
    stakingRegistry.grantRole(SLASH_ROLE, address(slashJudge));
@@ -170,7 +193,7 @@ After all contracts are deployed, the deployer must execute these transactions b
 
    **Production:** also grant a slashing-redirect role so SlashJudge can route 30% of slashed stake to `SafetyReserve` per [ADR 026](026-gauge-boost-tokenomics.md) §8 (challenger 50% / SafetyReserve 30% / burn 20%). **Slash currency:** stake is denominated in TOKEN, so the 30% share lands in `SafetyReserve` as TOKEN. `SafetyReserve` exposes a keeper-triggered swap into the [ADR 018](018-liquidity-strategy.md) Balancer V3 80/20 pool (same Vault-scoped self-approval, TWAP, `minOut`, private-RPC, and per-epoch liquidity-cap defenses as `BuybackBurner` and the delegator-pool swap path). USDC is the only currency available for `payout`; until swapped, slashed TOKEN is held as part of `SafetyReserve`'s assets-under-management.
 
-3. **Grant `ROUTER_CALLER_ROLE` on FeeRouter to PaymentChannel:**
+4. **Grant `ROUTER_CALLER_ROLE` on FeeRouter to PaymentChannel:**
 
    ```solidity
    feeRouter.grantRole(ROUTER_CALLER_ROLE, address(paymentChannel));
@@ -178,7 +201,7 @@ After all contracts are deployed, the deployer must execute these transactions b
 
    This authorizes `PaymentChannel.settleChannel` to invoke `FeeRouter.routeSettlement(operator, bytesDelivered, amount, receiptBatchRoot)`. Without this grant the production settlement path reverts.
 
-4. **Grant `SETTLEMENT_REPORTER_ROLE` on StakingRegistry to FeeRouter** (and to `PaymentChannel` if the bootstrap-ranking signal is sourced from settlement events):
+5. **Grant `SETTLEMENT_REPORTER_ROLE` on StakingRegistry to FeeRouter** (and to `PaymentChannel` if the bootstrap-ranking signal is sourced from settlement events):
 
    ```solidity
    stakingRegistry.grantRole(SETTLEMENT_REPORTER_ROLE, address(feeRouter));
@@ -186,19 +209,19 @@ After all contracts are deployed, the deployer must execute these transactions b
 
    See §3 below; `lastSettlementAt[operator]` is updated on each `routeSettlement` call.
 
-5. **Add initial token to PaymentChannel** (production only):
+6. **Add initial token to PaymentChannel** (production only):
 
    ```solidity
    paymentChannel.addToken(USDC_ADDRESS, rateFloor, rateCeiling);
    ```
 
-6. **Register regional governance bodies** (production, if applicable):
+7. **Register regional governance bodies** (production, if applicable):
 
    ```solidity
    contentBlacklist.registerRegionalBody(regionCode, bodyAddress);
    ```
 
-7. **Transfer admin roles** to Governor + timelock (production):
+8. **Transfer admin roles** to Governor + timelock (production):
 
    ```solidity
    // For each contract with AccessControl:
@@ -208,7 +231,7 @@ After all contracts are deployed, the deployer must execute these transactions b
 
 > **Production hardening:** Production deployments SHOULD execute `grantRole(DEFAULT_ADMIN_ROLE, timelockController)` and `revokeRole(DEFAULT_ADMIN_ROLE, deployer)` in a single multicall transaction to minimize the dual-admin window between the two operations.
 
-> **Deployment atomicity.** The post-deployment initialization steps (1–7) SHOULD be executed atomically via a multicall contract or a deployment script that reverts on any failure. A partially initialized system (e.g., `SLASH_ROLE` granted but `BLACKLIST_ROLE` not yet, or `ROUTER_CALLER_ROLE` not yet granted to `PaymentChannel`) could create a window where some security mechanisms work but settlements revert or land in the wrong contract. Between deployment and initialization completion, `StakingRegistry` SHOULD reject `registerNode` calls (e.g., via a `paused` initial state or a deployment flag) to prevent nodes from registering before the security infrastructure is fully wired. For the PoC, a Foundry deployment script with sequential `vm.broadcast()` calls provides sufficient atomicity.
+> **Deployment atomicity.** The post-deployment initialization steps (1–8) SHOULD be executed atomically via a multicall contract or a deployment script that reverts on any failure. A partially initialized system (e.g., `SLASH_ROLE` granted but `BLACKLIST_ROLE` not yet, or `ROUTER_CALLER_ROLE` not yet granted to `PaymentChannel`) could create a window where some security mechanisms work but settlements revert or land in the wrong contract. Between deployment and initialization completion, `StakingRegistry` SHOULD reject `registerNode` calls (e.g., via a `paused` initial state or a deployment flag) to prevent nodes from registering before the security infrastructure is fully wired. For the PoC, a Foundry deployment script with sequential `vm.broadcast()` calls provides sufficient atomicity.
 
 ### 3. Cross-Contract Call Graph
 
@@ -217,6 +240,8 @@ graph LR
     SPC["StablePaymentChannel /<br/>PaymentChannel"]
     SR["StakingRegistry"]
     CB["ContentBlacklist"]
+    PR["PublisherRegistry"]
+    OA["OriginAssignment"]
     SJ["SlashJudge"]
     BB["BuybackBurner"]
     FR["FeeRouter"]
@@ -238,6 +263,10 @@ graph LR
     GOV -->|"balanceOfAt / totalSupplyAt"| VE
     GOV -->|"payout(bundle, recipient, amount)"| SAFE
     CB -->|"ejectNode(operatorAddress)"| SR
+    OA -->|"isActive(operator)"| SR
+    OA -->|"ownerOf(namespaceId)"| PR
+    OA -->|"isOriginBlacklisted(operator)"| CB
+    GOV -->|"activateAssignment(...)"| OA
     SJ -->|"slash(node, offenseType)"| SR
     SJ -->|"safeTransferFrom / safeTransfer"| ERC
     SR -->|"safeTransferFrom / safeTransfer"| ERC
@@ -267,6 +296,10 @@ graph LR
 | Governor | VotingEscrow | `balanceOfAt(user, ts)`, `totalSupplyAt(ts)` | Public (read-only) | No |
 | Governor | SafetyReserve | `payout(bundle, recipient, amount)` | `PAYOUT_AUTHORIZER_ROLE` (Governor + emergency-multisig within hard caps; [ADR 026](026-gauge-boost-tokenomics.md) §5) | Yes |
 | ContentBlacklist | StakingRegistry | `ejectNode(operatorAddress)` | `BLACKLIST_ROLE` | Yes |
+| OriginAssignment | StakingRegistry | `isActive(operator)` | Public (read-only) | No |
+| OriginAssignment | PublisherRegistry | `ownerOf(namespaceId)` | Public (read-only) | No |
+| OriginAssignment | ContentBlacklist | `isOriginBlacklisted(operator)` | Public (read-only) | No |
+| Governor | OriginAssignment | `activateAssignment(namespaceId)`, `revokeAssignment(namespaceId, operator)`, `setMinRedundancy(floor)`, `setMaxOriginsPerNamespace(cap)`, `setAssignmentTimelock(seconds)`, `setDefaultOpenAllowlist(operators[])`, `addDefaultOpenOperator(operator)`, `removeDefaultOpenOperator(operator)`, `setDefaultOpenMinRedundancy(floor)`, `setDefaultOpenMaxOrigins(cap)`, `setContentBlacklist(address)` | `GOVERNANCE_ROLE` on OriginAssignment | Yes |
 | SlashJudge | StakingRegistry | `slash(node, offenseType)` | `SLASH_ROLE` | Yes |
 | SlashJudge | IERC20 (TOKEN) | `safeTransferFrom()` / `safeTransfer()` | Caller must have allowance/balance | Yes |
 | StakingRegistry | IERC20 (TOKEN) | `safeTransferFrom()` / `safeTransfer()` | Caller must have allowance/balance | Yes |
@@ -286,6 +319,11 @@ The cross-contract call table above covers contract-to-contract interactions onl
 | Off-chain client/node | StakingRegistry | `getActiveNodeCount() returns (uint256)` | Bootstrap pagination loop | [ADR 001](001-network.md), [ADR 012](012-client.md), [ADR 019](019-node-onboarding.md) |
 | Off-chain client/node | StakingRegistry | `getActiveNodes(uint256 offset, uint256 limit) returns (NodeInfo[])` | Cold-start peer discovery | [ADR 001](001-network.md), [ADR 012](012-client.md), [ADR 019](019-node-onboarding.md) |
 | Off-chain client/node | StakingRegistry | `getFirstRegisteredAt(address ethAddress) returns (uint256)` | Reputation cold-start bonus window (`ethAddress` is the operator address that registered the node) | [ADR 001](001-network.md), [ADR 008](008-reputation.md), [ADR 019](019-node-onboarding.md) |
+| Off-chain client/node | StakingRegistry | `nodeIdOf(address operator) returns (bytes32 nodeId, bool active)` | Per-operator binding + activity lookup; the canonical operator→NodeId step in the on-chain origin-discovery fallback (intersected with `OriginAssignment.getOrigins(...)` and filtered against `ContentBlacklist.isOriginBlacklisted`). Bundles the binding read and active flag to avoid a second RPC. Storage already exists per [ADR 003 § NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding) — this is just the typed view | [ADR 003](003-payments.md#nodeid-to-ethereum-binding), [ADR 022](022-content-discovery.md) |
+| Off-chain client/node | PublisherRegistry | `namespaceOf(bytes32 blake3Hash) returns (uint256[])` | Probe-time and request-time check: set of non-zero namespaces claiming this hash (empty array → default-open semantics); per [ADR 002 § Multi-claim semantics](002-content-addressing.md#multi-claim-semantics) | [ADR 002](002-content-addressing.md), [ADR 005](005-protocol.md) |
+| Off-chain client/node | OriginAssignment | `isAuthorizedOrigin(uint256 namespaceId, address operator) returns (bool)` | Probe-time check: is this operator authorized to act as origin for this namespace | [ADR 005](005-protocol.md), [ADR 011](011-content-takedown.md) |
+| Off-chain client/node | OriginAssignment | `getOrigins(uint256 namespaceId) returns (address[])` | Discovery: list of authorized origin operators for a namespace; `getOrigins(0)` returns the default-open allow-list | [ADR 011](011-content-takedown.md), [ADR 022](022-content-discovery.md) |
+| Off-chain client/node | OriginAssignment | `defaultOpenAllowlistActive() returns (bool)`, `defaultOpenActivatedAt() returns (uint64)` | Detect whether the default-open bootstrap window is still open; pivot probe-time and slashing logic accordingly | [ADR 005](005-protocol.md), [ADR 011](011-content-takedown.md) |
 
 ##### Bootstrap pattern
 
@@ -401,6 +439,8 @@ flowchart TD
 | BuybackBurner | USDC (accumulated), TOKEN (transient) | PoC: treasury transfers. Production: 5% USDC same-tx from `FeeRouter` ([ADR 026](026-gauge-boost-tokenomics.md) §8) | `executeBuyback()` (production; accumulate-only in PoC) |
 | WatchtowerEscrow | USDC | Prepaid watchtower fees | Heartbeat-based payouts, reclaim on liveness failure |
 
+(`PublisherRegistry` and `OriginAssignment` hold no funds — they are pure registry contracts.)
+
 ### 5. Access Control Matrix
 
 All role-based access uses OpenZeppelin `AccessControl`. The `DEFAULT_ADMIN_ROLE` holder can grant and revoke all other roles. Named roles below (`KEEPER_ROLE`, `GOVERNANCE_ROLE`, `EMERGENCY_ROLE`) formalize the implicit access patterns described across source ADRs into concrete `AccessControl` role identifiers for implementation.
@@ -415,6 +455,7 @@ New top-level contracts integrate with the launch-time set via standard `AccessC
 | --- | --- | --- | --- | --- |
 | `DEFAULT_ADMIN_ROLE` | All contracts | Grant/revoke roles, set parameters | Deployer EOA | `TimelockController` (2-day delay) |
 | `BLACKLIST_ROLE` | StakingRegistry | `ejectNode()` | ContentBlacklist contract | ContentBlacklist contract |
+| `GOVERNANCE_ROLE` | OriginAssignment | `activateAssignment()`, `revokeAssignment()`, `setMinRedundancy()`, `setMaxOriginsPerNamespace()`, `setAssignmentTimelock()`, `setDefaultOpenAllowlist()`, `addDefaultOpenOperator()`, `removeDefaultOpenOperator()`, `setDefaultOpenMinRedundancy()`, `setDefaultOpenMaxOrigins()` | Admin | Governor via timelock |
 | `SLASH_ROLE` | StakingRegistry | `slash()` | SlashJudge contract | SlashJudge contract |
 | `SETTLEMENT_REPORTER_ROLE` | StakingRegistry | `recordSettlement(operator)` | StablePaymentChannel | FeeRouter; see §3 |
 | `KEEPER_ROLE` | BuybackBurner, FeeRouter | `executeBuyback()` (BB), `executeDelegatorSwap(epoch, minOut)` (FeeRouter) | Admin / disabled | Keeper bot or governance |
@@ -545,6 +586,34 @@ Every state-mutating function that makes an external call is listed below with i
 | `reclaimOnLivenessFailure()` | `IERC20.safeTransfer()` (USDC to watched party) | `nonReentrant`, checks-effects-interactions |
 | Channel state reads | `StablePaymentChannel`/`PaymentChannel.getChannel()` (read-only) | N/A |
 
+#### PublisherRegistry
+
+| Function | External Calls | Guards |
+| --- | --- | --- |
+| `registerPublisher()` | None (state change only) | Permissionless |
+| `createNamespace()` | None (state change only) | Caller must hold `publisherId`; namespace cap enforced |
+| `initiateNamespaceTransfer()` | None (state change only) | Caller must own the namespace |
+| `finalizeNamespaceTransfer()` | None (state change only) | Pending transfer must exist; current time ≥ `readyAt` |
+| `cancelNamespaceTransfer()` | None (state change only) | Caller must be the current owner |
+| `claimContent()` | None (state change only) | Caller must own the namespace; multi-claim per [ADR 002 § Multi-claim semantics](002-content-addressing.md#multi-claim-semantics) — reverts only if THIS namespace has already claimed THIS hash (idempotency); other namespaces' prior claims do not block |
+
+No external calls; no funds held. `nonReentrant` is not required but is included on state-mutating functions for defense-in-depth.
+
+#### OriginAssignment
+
+| Function | External Calls | Guards |
+| --- | --- | --- |
+| `proposeAssignment(namespaceId, operators[])` | `PublisherRegistry.ownerOf(namespaceId)` (read), `StakingRegistry.isActive(operator)` per operator (read) | Caller must own the namespace; `operators.length` within `[minRedundancy, maxOriginsPerNamespace]`; `operators` array MUST contain unique addresses (duplicates revert) |
+| `activateAssignment(...)` | `StakingRegistry.isActive(operator)` per pending operator (read), `ContentBlacklist.isOriginBlacklisted(operator)` per pending operator (read) | `GOVERNANCE_ROLE`; pending proposal must exist; every pending operator must still be active and not blacklisted at activation time; min-redundancy invariant enforced post-activation |
+| `revokeAssignment(namespaceId, operator)` | None (state change only) | Either `GOVERNANCE_ROLE` or namespace owner; revocation that would drop the active set below `minRedundancy` is allowed (publishers may shrink their assignment set; the constraint is on activation, not on revocation) |
+| `pruneBlacklistedAssignment(namespaceId, operator)` | `ContentBlacklist.isOriginBlacklisted(operator)` (read) | Permissionless; reverts if operator is not currently blacklisted in `ContentBlacklist`; works for `namespaceId == 0` as well |
+| `setMinRedundancy(uint256)`, `setMaxOriginsPerNamespace(uint256)`, `setAssignmentTimelock(uint256)` | None (state change only) | `GOVERNANCE_ROLE`; safety bounds enforced ([ADR 009](009-governance.md)); cross-parameter invariant `1 ≤ minRedundancy ≤ maxOriginsPerNamespace` enforced at the contract layer on every `setMinRedundancy` / `setMaxOriginsPerNamespace` call (revert on violation); all three apply to non-zero namespaces only |
+| `setDefaultOpenAllowlist(operators[])`, `addDefaultOpenOperator(operator)`, `removeDefaultOpenOperator(operator)` | `StakingRegistry.isActive(operator)` per operator (read) | `GOVERNANCE_ROLE`; first non-empty activation flips `defaultOpenAllowlistActive` permanently and emits `DefaultOpenAllowlistActivated`; resulting set size must be within `[defaultOpenMinRedundancy, defaultOpenMaxOrigins]`; duplicates revert; runs under the Governor's standard 48h timelock |
+| `setDefaultOpenMinRedundancy(uint256)`, `setDefaultOpenMaxOrigins(uint256)` | None (state change only) | `GOVERNANCE_ROLE`; safety bounds enforced ([ADR 009](009-governance.md)); cross-parameter invariants `5 ≤ defaultOpenMinRedundancy ≤ defaultOpenMaxOrigins ≤ 500` and `defaultOpenMinRedundancy ≥ minRedundancy` enforced at the contract layer |
+| `isAuthorizedOrigin()`, `getOrigins()`, `getPendingAssignment()`, `defaultOpenAllowlistActive()`, `defaultOpenActivatedAt()` | None (read-only) | N/A |
+
+The contract holds no funds. It maintains an `EnumerableSet` of currently-authorized operators per namespace, plus the bootstrap state for the default-open allow-list (`bool defaultOpenAllowlistActive`, `uint64 defaultOpenActivatedAt`). The first non-empty default-open activation flips `defaultOpenAllowlistActive` to `true` permanently, sets `defaultOpenActivatedAt` to that block's timestamp, and emits `DefaultOpenAllowlistActivated`. Until that moment, `isAuthorizedOrigin(0, op)` returns `true` for any active staker (permissive bootstrap). Off-chain consumers of `getOrigins(namespaceId)` cross-reference each returned operator against `ContentBlacklist.isOriginBlacklisted` and treat blacklisted entries as unauthorized regardless of stale `OriginAssignment` state, so storage cleanup via `pruneBlacklistedAssignment` is a lazy optimisation rather than a security primitive.
+
 #### Multi-Token Reentrancy Considerations
 
 Production `PaymentChannel` accepts arbitrary governance-approved ERC-20s ([ADR 010](010-multi-token.md)). Even with `SafeERC20` and `nonReentrant`, governance must vet tokens before allowlisting:
@@ -562,7 +631,7 @@ Every deCDN contract should inherit from audited OpenZeppelin base contracts rat
 | OZ Contract | Used By | Purpose |
 | --- | --- | --- |
 | `Ownable` | StablePaymentChannel (PoC) | Admin-key governance for PoC-only contract |
-| `AccessControl` | StakingRegistry, PaymentChannel, ContentBlacklist, SlashJudge, BuybackBurner, FeeRouter, SafetyReserve | Role-based function authorization |
+| `AccessControl` | StakingRegistry, PaymentChannel, ContentBlacklist, PublisherRegistry, OriginAssignment, SlashJudge, BuybackBurner, FeeRouter, SafetyReserve | Role-based function authorization |
 | `ReentrancyGuard` | All fund-holding contracts | `nonReentrant` modifier on state-mutating functions with external calls |
 | `Pausable` | All fund-holding contracts | Emergency pause capability |
 | `SafeERC20` | All contracts interacting with ERC-20 tokens | Safe wrappers for `transfer`, `transferFrom`, `approve` |
@@ -593,6 +662,8 @@ Every deCDN contract should inherit from audited OpenZeppelin base contracts rat
 | Minimum stake | 1,000 TOKEN | 50,000 TOKEN ([ADR 026](026-gauge-boost-tokenomics.md) §7); discount-threshold logic removed |
 | Slashing distribution | 50% challenger / 50% burn | 50% challenger / 30% SafetyReserve / 20% burn ([ADR 026](026-gauge-boost-tokenomics.md) §8) |
 | Regional bodies | Not used | Jurisdiction-scoped multisigs |
+| PublisherRegistry | Deployed; admin-key escape hatch active | Deployed; admin-key escape hatch removed; namespace cap and transfer timelock under governance |
+| OriginAssignment | Deployed; admin key activates assignments directly; default-open allow-list inactive (`defaultOpenAllowlistActive == false`, permissive bootstrap window) | Deployed; activations gated by Governor + 24h–14d timelock for registered namespaces; default-open allow-list activated by governance under the standard 48h timelock, flipping the gate to strict |
 | Contract migration | N/A | New `PaymentChannel` + production contracts deployed; PoC `StablePaymentChannel` decommissioned |
 
 **Migration path:** Production deploys a new `PaymentChannel` contract (not an upgrade of `StablePaymentChannel`). Per [ADR 010](010-multi-token.md), no phased migration is required because the PoC `StablePaymentChannel` has no real users or funds in production; the PoC contract is decommissioned rather than operated in a close-only mode alongside `PaymentChannel`.
@@ -618,7 +689,8 @@ Every deCDN contract should inherit from audited OpenZeppelin base contracts rat
 - [ADR 007 — Watchtower Design](007-watchtower.md): WatchtowerEscrow
 - [ADR 009 — Governance Model](009-governance.md): Safety bounds, Governor, emergency multisig
 - [ADR 010 — Multi-Token Payment Support](010-multi-token.md): PaymentChannel, token allowlist
-- [ADR 011 — Content Takedown](011-content-takedown.md): ContentBlacklist, origin ejection
+- [ADR 002 — Content Addressing](002-content-addressing.md): PublisherRegistry, namespaces, content claims
+- [ADR 011 — Content Takedown](011-content-takedown.md): ContentBlacklist, origin ejection, OriginAssignment, DAO origin authority
 - [ADR 014 — On-Chain Verification](014-on-chain-verification.md): SlashJudge, challenge bonds
 - [ADR 018 — Liquidity Strategy](018-liquidity-strategy.md): Balancer V3 80/20 pool, MEV protection, POL custody, BuybackBurner execution
 - [ADR 026 — Gauge-Boost Tokenomics](026-gauge-boost-tokenomics.md): FeeRouter six-bucket split, VotingEscrow, SafetyReserve, gauge-boost formula, the slashing distribution

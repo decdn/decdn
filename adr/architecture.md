@@ -7,7 +7,7 @@
 
 A decentralized CDN with two participant roles:
 
-- **Nodes** (providers) cache and serve content. They stake TOKEN to participate in the peer mesh and compete on price and latency. Some nodes are configured with an origin backend (S3, NFS, local disk) making them the canonical source for specific content — this is a deployment choice, not a protocol distinction. No external origin URL is ever exposed.
+- **Nodes** (providers) cache and serve content. They stake TOKEN to participate in the peer mesh and compete on price and latency. Some nodes are configured with an origin backend (S3, NFS, local disk) making them the canonical source for specific content. The **cache role** is permissionless — any staked operator may pull cached blobs from authorized origins and re-serve them. The **origin role** is DAO-governed for all content — per-namespace `OriginAssignment` set for registered namespaces, and the DAO-maintained default-open allow-list (`OriginAssignment` keyed by `namespaceId == 0`) for unregistered content — with a permissive bootstrap window for default-open serving until the allow-list is first activated (see [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority), [ADR 011 § Default-open allow-list](011-content-takedown.md#default-open-allow-list), and [ADR 002 § Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces)). No external origin URL is ever exposed.
 - **Clients** consume content. They pay nodes per MB via off-chain payment channels.
 
 ## System Diagram
@@ -202,6 +202,8 @@ The canonical glossary lives in [`README.md` § Glossary](README.md#glossary), g
 ## Origin Integration
 
 Some nodes are configured with an origin backend (S3, R2, Backblaze B2, self-hosted MinIO, NFS, or local disk). They are the source of truth for all blobs but are accessed as infrequently as possible — only when no peer node has the content.
+
+Whether a node is *recognized* as origin is governed on-chain via `OriginAssignment` — see [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority). The wire protocol does not distinguish origins from cache nodes at probe time; origin status is a publisher-level commitment surfaced via `OriginAssignment.getOrigins(namespaceId)` for off-chain consumers (clients selecting peers for first-fetch, watchtowers checking publisher availability commitments). Configuring an origin backend locally without DAO authorization simply means the operator's bytes are served as cache and the operator does not appear in `getOrigins(...)`. For registered namespaces, the publisher proposes the operator set and governance ratifies; for default-open content (`namespaceId == 0`), the DAO maintains a single global allow-list (see [ADR 011 § Default-open allow-list](011-content-takedown.md#default-open-allow-list)). Until that allow-list is activated for the first time, the bootstrap rule preserves the prior permissive behaviour so any active staker with an origin backend may serve default-open content as origin; once activated, only allow-listed operators may.
 
 ### Supported Origins
 

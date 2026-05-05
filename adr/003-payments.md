@@ -269,16 +269,17 @@ The core weakness is token-price dependency: at $0.001/TOKEN, a minimum stake of
 
 Colluding nodes in a region hold rates artificially high.
 
-Origin-backed nodes set the effective price ceiling for any blob. Clients can always probe origin-backed nodes directly and pay their rates as a guaranteed fallback. Any node outside the cartel that undercuts wins all local traffic — the incentive to defect is strong. New entrants can join permissionlessly by staking.
+Origin-backed nodes set the effective price ceiling for any blob. Clients can always probe origin-backed nodes directly and pay their rates as a guaranteed fallback. Any node outside the cartel that undercuts wins all local traffic — the incentive to defect is strong. New entrants can join the cache-only role permissionlessly by staking; the origin role for content in registered namespaces requires `OriginAssignment` membership ([ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority)), but cache-only competition is sufficient to discipline the rate cartel because cache delivery is interchangeable with origin delivery from the requester's perspective.
 
 #### Content withholding
 
 A node stakes, responds to probes with `has_blob: true`, but refuses to serve — collecting credibility in the peer table without actually participating.
 
-**Withholding is not a slashable offense** — operators may legitimately take content offline for maintenance, migration, or business reasons, and slashing for availability creates perverse incentives. Instead, withholding is handled through reputation and redundancy:
+**Withholding is not a slashable offense** — operators may legitimately take content offline for maintenance, migration, or business reasons, and slashing for availability creates perverse incentives. Instead, withholding is handled through reputation and DAO-supervised redundancy:
 
-- **Multiple origin-backed nodes per blob.** Content owners configure multiple origin-backed nodes for important content. A single withholding node becomes irrelevant if others serve the same blob.
-- **Reputation fast-path.** Nodes that respond `has_blob: true` to probes but fail to deliver accumulate reputation penalties at a steeper rate. A node with consistently poor availability is deprioritized in provider selection and loses delivery revenue.
+- **Minimum-redundancy invariant on registered namespaces.** Content owners register a publisher identity ([ADR 002 § Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces)) and propose an origin operator set per namespace. Governance ratifies the proposal via the standard timelock path ([ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority)). The `OriginAssignment` contract enforces a minimum-redundancy floor (default 3, governance-bounded — see [ADR 009](009-governance.md)) at activation. A single withholding origin becomes irrelevant when others in the assigned set serve the same blob.
+- **Default-open content** is governed by the DAO-maintained default-open allow-list ([ADR 011 § Default-open allow-list](011-content-takedown.md#default-open-allow-list)) once governance has activated it for the first time; the allow-list enforces its own redundancy floor (default 10), so a single withholding origin is mitigated the same way as registered namespaces. During the bootstrap window before the allow-list is activated, default-open serving falls back to the legacy off-protocol model: any staked operator may serve as origin and content owners that have not registered carry the same withholding risk as before.
+- **Reputation fast-path.** Nodes that respond `has_blob: true` to probes but fail to deliver accumulate reputation penalties at a steeper rate. A node with consistently poor availability is deprioritized in provider selection and loses delivery revenue. Publishers may use the reputation signal as input when proposing or revoking operators in their namespace's assignment.
 
 Note: the probe-triggered eviction hold ([ADR 005](005-protocol.md#probe-triggered-eviction-hold)) addresses a related but distinct problem. Withholding is a node that has the blob but refuses to serve it (behavioral — handled by reputation). The eviction hold addresses a node that signed `has_blob: true` but lost the blob to cache pressure before the stream request (mechanical — prevented by the hold and, if the hold fails, treated as a slashable phantom announcement).
 
@@ -603,6 +604,15 @@ This creates an authoritative, publicly queryable mapping:
 mapping(bytes32 => address) public nodeIdToAddress;
 mapping(address => bytes32) public addressToNodeId;
 mapping(address => uint64) public bindingNonce;
+
+// Convenience view for off-chain origin discovery: combines the operator-to-NodeId
+// binding lookup with the node's activity flag in a single read. Returns
+// (bytes32(0), false) if the operator is unbound, and (nodeId, false) if the
+// operator is bound but currently inactive (deregistered, unbonding, or
+// auto-ejected). Surfaced in ADR 016 § Off-Chain Read API and consumed in
+// ADR 022 § Origin discovery as the per-operator path that replaces paginating
+// getActiveNodes when callers already hold an operator address.
+function nodeIdOf(address operator) external view returns (bytes32 nodeId, bool active);
 
 // Intended for rebinding (key rotation) only — initial binding is performed
 // atomically inside registerNode(). No on-chain guard prevents calling this

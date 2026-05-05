@@ -7,7 +7,9 @@
 
 deCDN is delivery infrastructure optimised for regional performance, not a censorship-resistant storage network. Node operators are businesses with real legal obligations: DMCA safe harbour (US), DSA hosting provider duties (EU), and national laws around illegal content (CSAM, terrorist material) require that operators have a working takedown mechanism. Without one, every operator runs uninsured legal exposure.
 
-No existing ADR addresses content removal. This ADR establishes:
+Origin assignment is the symmetric problem: which operators are authorized to act as origins for which content. Without a positive authority, origin assignment is purely off-protocol — content owners self-coordinate, the network has no Sybil resistance on origin claims, and there is no protocol-enforced redundancy for important content. Both halves of origin governance — negative (blacklisting) and positive (assignment) — naturally share infrastructure (cross-contract integration, governance authority, runtime enforcement) and are specified together in this ADR.
+
+No existing ADR addressed either question. This ADR establishes:
 
 1. A governance-controlled on-chain hash blacklist
 2. Regional governance bodies for jurisdiction-scoped takedowns
@@ -15,12 +17,14 @@ No existing ADR addresses content removal. This ADR establishes:
 4. An emergency fast-path for time-critical removals
 5. The slashing regime for non-compliance
 6. The known limitations of hash-based blacklisting and the mitigations available
+7. A governance-controlled positive authority for origin assignment across all namespaces (`OriginAssignment`) — per-namespace publisher-propose / DAO-ratify for registered namespaces, single global DAO-maintained allow-list for the default-open namespace — built on the publisher/namespace identity primitive defined in [ADR 002](002-content-addressing.md#publisher-identity-and-namespaces)
 
 ## Decision
 
-Content takedown is governed at the network level via an on-chain `ContentBlacklist` contract. Two governance paths exist: a global path (network-wide removal) and a regional path (jurisdiction-scoped removal via a designated regional governance body). Nodes are required to evict blacklisted content and stop announcing it within a defined compliance window. Serving a blacklisted hash after the compliance window is a slashable offense.
+Content governance over origins has two symmetric authorities, both DAO-controlled:
 
-Origin nodes that repeatedly source blacklisted content can themselves be blacklisted by NodeId or operator address, independent of any specific hash — this is the primary mitigation for hash evasion via trivial re-encoding.
+- **Negative authority — `ContentBlacklist`.** Removes hashes and operators. Two governance paths exist: a global path (network-wide removal) and a regional path (jurisdiction-scoped removal via a designated regional governance body). Nodes are required to evict blacklisted content and stop announcing it within a defined compliance window. Serving a blacklisted hash after the compliance window is a slashable offense. Origin nodes that repeatedly source blacklisted content can themselves be blacklisted by NodeId or operator address, independent of any specific hash — this is the primary mitigation for hash evasion via trivial re-encoding.
+- **Positive authority — `OriginAssignment`.** Authorizes specific operators to act as origins for specific namespaces (defined in [ADR 002 § Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces)). For registered namespaces, publishers propose operator sets. Governance ratifies each proposal via the standard timelock path. For default-open content (`namespaceId == 0`), the DAO maintains a single global allow-list (see [§ Default-open allow-list](#default-open-allow-list)). `ContentBlacklist` and `OriginAssignment` integrate via runtime checks with lazy storage cleanup — see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist).
 
 Each node also maintains a local denylist for operator-initiated removal without waiting for governance.
 
@@ -130,6 +134,7 @@ Hash-based blacklisting covers only exact copies of a blob. A one-byte change pr
 **The protocol's primary response is origin blacklisting.** If an origin-backed node repeatedly sources blacklisted content — whether the same blob or trivially re-encoded variants — governance can blacklist the operator's Ethereum address. `ContentBlacklist.addOrigin()` calls `StakingRegistry.ejectNode(operatorAddress)` via a cross-contract call; the `StakingRegistry` grants the `ContentBlacklist` contract address the `BLACKLIST_ROLE`, permitting this call. A blacklisted origin:
 
 - **Ejected from `StakingRegistry`** — sets `active = false`, emits `NodeAutoEjected` ([ADR 001](001-network.md)). This follows the same code path as stake-based auto-ejection ([ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn))
+- **Effectively removed from every namespace's authorized origin set** at runtime; storage cleanup is lazy and permissionless via `pruneBlacklistedAssignment` — see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist)
 - **Remaining stake enters forced unbonding** — the standard unbonding period applies (7 days PoC / governable in production, minimum 3 days). Stake remains slashable during unbonding ([ADR 026 §7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake))
 - **Address banned while blacklisted** — cannot register new nodes under the same Ethereum address unless governance removes the blacklist entry via `removeOrigin(operatorAddress)`. Re-entry otherwise requires a new identity funded with fresh stake (minimum 50,000 TOKEN — [ADR 026 §7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake))
 - **The operator's registered NodeId is excluded from peer tables** — gossip validation rejects messages from that blacklisted node
@@ -143,6 +148,141 @@ This raises the cost of re-upload evasion from trivial (change a byte) to signif
 ### Fast re-reporting path
 
 When a re-encoded variant of a known-bad blob is identified, governance can add the new hash via the emergency multisig path (2-hour compliance window). The combination of fast re-reporting and origin blacklisting makes sustained evasion operationally difficult even if no single mechanism closes the gap completely.
+
+## Origin Assignment Authority
+
+The mechanisms above describe the DAO's *negative* authority over origins: blacklisting bad actors. This section specifies the symmetric *positive* authority: which operators are authorized to act as origin backers for which content.
+
+### Why positive authority is part of governance
+
+Without positive authority, origin assignment is purely off-protocol — content owners independently configure backends and the network has no on-chain notion of "this operator is responsible for serving namespace X". This is workable for content owners who can run their own infrastructure but provides no protocol-level guarantees: no Sybil resistance on origin claims (anyone with stake can claim to be an origin), no enforced redundancy (a single origin operator can be a single point of failure), no accountability path for takedown compliance failures (governance can blacklist after the fact but cannot pre-authorize). Adding positive authority gives the DAO a tool to grant *and* withhold the origin role, mirroring the existing tool to remove it.
+
+The publisher and namespace primitives are defined in [ADR 002 § Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces). Recap:
+
+- A **publisher** is an Ethereum address registered in `PublisherRegistry`.
+- A **namespace** is a publisher-owned `uint256` identifier under which blob hashes are claimed.
+- The **default-open namespace** (`namespaceId == 0`) governs all unclaimed content. Only operators in the DAO-maintained default-open allow-list may serve as origin for default-open content (see [§ Default-open allow-list](#default-open-allow-list)). Origin assignment authority applies to all namespaces; registered namespaces follow the publisher-propose / DAO-ratify flow, while the default-open namespace is governed by a single global allow-list set by the DAO directly.
+
+### Contract: OriginAssignment
+
+```solidity
+interface IOriginAssignment {
+    // Publisher proposes a candidate origin set for one of their namespaces.
+    // Reverts if msg.sender is not the namespace owner, if any operator is not
+    // active in StakingRegistry at proposal time, or if the operator count is
+    // outside [minRedundancy, maxOriginsPerNamespace].
+    function proposeAssignment(uint256 namespaceId, address[] calldata operators) external;
+
+    // Governance ratifies a pending proposal after the assignment timelock.
+    // Reverts if no pending proposal exists, if the timelock has not elapsed,
+    // or if any pending operator is no longer active in StakingRegistry or is
+    // currently blacklisted in ContentBlacklist.
+    function activateAssignment(uint256 namespaceId) external;
+
+    // Revocation paths:
+    //  - Publisher may revoke a single operator from their own namespace at any time.
+    //  - Governance may revoke an operator from any namespace.
+    // Revocation that drops the active set below minRedundancy is allowed; the
+    // namespace simply enters an under-redundant state until a new proposal is
+    // activated. The min-redundancy invariant binds activations, not revocations.
+    function revokeAssignment(uint256 namespaceId, address operator) external;
+
+    // Permissionless storage cleanup for blacklisted operators.
+    // Reverts unless the operator is currently blacklisted in ContentBlacklist
+    // (read via ContentBlacklist.isOriginBlacklisted). Callable by anyone — the
+    // contract performs the lookup itself rather than trusting the caller. This
+    // pattern avoids the unbounded gas cost of removing a blacklisted operator
+    // from every namespace in one transaction; runtime authorization checks
+    // (probe, peer table) consult ContentBlacklist directly so cleanup latency
+    // does not affect security.
+    function pruneBlacklistedAssignment(uint256 namespaceId, address operator) external;
+
+    // Default-open allow-list (namespaceId == 0). GOVERNANCE_ROLE only; see
+    // "Default-open allow-list" below for the lifecycle, bootstrap rule, and
+    // validation invariants.
+    function setDefaultOpenAllowlist(address[] calldata operators) external;
+    function addDefaultOpenOperator(address operator) external;
+    function removeDefaultOpenOperator(address operator) external;
+
+    // Wires the read-direction integration with ContentBlacklist for
+    // pruneBlacklistedAssignment. Called once during post-deploy initialization
+    // (see ADR 016) and not expected to change thereafter; GOVERNANCE_ROLE only.
+    function setContentBlacklist(address contentBlacklist) external;
+
+    // Governable parameters with safety bounds (see ADR 009)
+    function setMinRedundancy(uint256 floor) external;             // non-zero namespaces
+    function setMaxOriginsPerNamespace(uint256 cap) external;      // non-zero namespaces
+    function setAssignmentTimelock(uint256 secondsDelay) external; // non-zero namespaces
+    function setDefaultOpenMinRedundancy(uint256 floor) external;
+    function setDefaultOpenMaxOrigins(uint256 cap) external;
+
+    // Views. For namespaceId == 0 these read the default-open allow-list.
+    function isAuthorizedOrigin(uint256 namespaceId, address operator) external view returns (bool);
+    function getOrigins(uint256 namespaceId) external view returns (address[] memory);
+    function getPendingAssignment(uint256 namespaceId)
+        external view returns (address[] memory operators, uint256 readyAt);
+
+    // Bootstrap state for the default-open allow-list.
+    function defaultOpenAllowlistActive() external view returns (bool);
+    function defaultOpenActivatedAt() external view returns (uint64);
+
+    // Events
+    event AssignmentProposed(uint256 indexed namespaceId, address indexed proposer, address[] operators, uint256 readyAt);
+    event AssignmentActivated(uint256 indexed namespaceId, address[] operators);
+    event AssignmentRevoked(uint256 indexed namespaceId, address indexed operator, address indexed by);
+    event BlacklistedAssignmentPruned(uint256 indexed namespaceId, address indexed operator, address indexed pruner);
+    event DefaultOpenAllowlistUpdated(address[] operators, uint256 indexed updateIndex);
+    event DefaultOpenOperatorAdded(address indexed operator);
+    event DefaultOpenOperatorRemoved(address indexed operator);
+    event DefaultOpenAllowlistActivated();
+}
+```
+
+### Lifecycle
+
+1. **Publisher proposal.** The publisher calls `proposeAssignment(namespaceId, operators)`. The contract validates that the proposer owns the namespace, that every candidate is currently active in `StakingRegistry`, and that the operator count satisfies the `minRedundancy` and `maxOriginsPerNamespace` bounds. The proposal enters a pending state with a `readyAt` timestamp computed as `block.timestamp + assignmentTimelock` (governance-bounded between 24 hours and 14 days; see [ADR 009](009-governance.md)).
+2. **Governance ratification.** During the timelock window, governance reviews the proposal off-chain. After the timelock elapses, a governance proposal calls `activateAssignment(namespaceId)`. Before replacing the active set, activation re-checks every pending operator against `StakingRegistry.isActive` and `ContentBlacklist.isOriginBlacklisted` so a proposal cannot go live with operators that became inactive or were blacklisted during the delay window. If any operator now fails validation, activation reverts and the publisher must submit a fresh proposal. Successful activation replaces the namespace's authorized operator set atomically.
+3. **Operator notification.** Operators in the activated set are now authorized to act as origins for the namespace. They configure their origin store locally and begin serving the namespace's content. The wire protocol does not distinguish origins from cache nodes at probe time — origin status is a publisher-level commitment surfaced via `getOrigins(namespaceId)` for off-chain consumers.
+4. **Revocation.** A publisher may unilaterally remove an operator from their own namespace's set (e.g., the operator is performing poorly). Governance may revoke any operator from any namespace via the standard proposal path (e.g., the operator is misbehaving but has not yet crossed the blacklist threshold). Blacklisting (`ContentBlacklist.addOrigin`) takes effect via runtime checks rather than a cross-call — see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist).
+
+The two-step propose-then-ratify flow is deliberate: it gives publishers agency over which operators they trust (publishers know their content best) while keeping the DAO as the authority that confirms the assignment is consistent with protocol-wide policy (e.g., not concentrating too many namespaces on a small operator set, not assigning to operators with poor reputation). Either party can refuse to advance the flow — publishers by not proposing, governance by not ratifying — and the namespace simply continues with its existing assignment (or remains unassigned).
+
+### Default-open allow-list
+
+The default-open namespace has no publisher, so the per-namespace propose / ratify flow does not apply. Instead, the DAO directly maintains a single global allow-list of operators authorized to serve as origin for *any* default-open hash. The allow-list is held in `OriginAssignment` under the same per-namespace `EnumerableSet` storage used for registered namespaces, keyed by `namespaceId == 0` — `isAuthorizedOrigin(0, op)` is the same view used everywhere else, with no special case downstream.
+
+**Lifecycle.** Allow-list updates are GOVERNANCE_ROLE-only single-step proposals under the Governor's standard timelock — no separate `defaultOpenAssignmentTimelock` parameter. `setDefaultOpenAllowlist(operators)` replaces the active set atomically; `addDefaultOpenOperator` / `removeDefaultOpenOperator` are convenience deltas with the same authority and delay. Each transition appends a checkpoint per affected operator. The contract enforces `operators.length ∈ [defaultOpenMinRedundancy, defaultOpenMaxOrigins]`, that every operator is `StakingRegistry.isActive` at activation time, and rejects duplicate addresses.
+
+**Bootstrap.** `isAuthorizedOrigin(0, op)` is permissive (returns `true` for any active staker) until the first non-empty activation, then strict (returns set membership). The activation atomically flips `defaultOpenAllowlistActive` to `true`, sets `defaultOpenActivatedAt`, and emits `DefaultOpenAllowlistActivated` — a single observable transition so reputation, watchtower, and node tooling can pivot cleanly. Rationale: PoC must be able to serve content on day one without governance, so a hard cutover is unworkable; an implicit genesis-seeded set would be opaque and hard to reason about post-hoc.
+
+**Parameters and bounds.** `defaultOpenMinRedundancy` (default 10) and `defaultOpenMaxOrigins` (default 100) are bounded by [ADR 009](009-governance.md), with the cross-parameter invariants `5 ≤ defaultOpenMinRedundancy ≤ defaultOpenMaxOrigins ≤ 500` and `defaultOpenMinRedundancy ≥ minRedundancy` enforced at the contract layer. Both are higher than the per-registered-namespace bounds because one approved operator may serve any default-open hash — the surface area is the entire long tail.
+
+### Unassigned namespaces
+
+A registered namespace with no activated assignment is **unassigned**. No operator is authorized as origin for unassigned content, but the protocol still permits cache-only serving from any staked operator that happens to hold the blob — see [ADR 005 § cdn/probe/v1](005-protocol.md#cdnprobev1--latency-probe). Publishers who claim content but never propose an assignment effectively prevent any new origin from picking up the content from canonical storage; cached copies eventually expire. This is by design — it lets a publisher delete their content set from the network by claiming the hashes and refusing to assign origins.
+
+### Minimum-redundancy invariant
+
+The contract enforces `operators.length >= minRedundancy` at proposal time and at activation time, and additionally rejects proposals whose `operators` array contains duplicate addresses (without this, a publisher could submit `[A, A, A]` to satisfy `minRedundancy = 3` while still concentrating origin responsibility on a single operator). Activation also re-validates that every pending operator is still active and not blacklisted before the set can go live. `minRedundancy` is a governance-bounded parameter (see [ADR 009](009-governance.md); range `[1, 10]`, default `3`) and is constrained by the cross-parameter invariant `1 ≤ minRedundancy ≤ maxOriginsPerNamespace`. The invariant ensures that no registered namespace can be activated with a single point of failure. The invariant is *not* enforced on revocation — a publisher or governance may revoke operators down to zero, but new activations must satisfy the floor. Under-redundant namespaces are observable via the `getOrigins` view; clients and watchtowers may surface this as a health indicator for the namespace's owner.
+
+### Cross-contract integration
+
+- `OriginAssignment` reads `PublisherRegistry.ownerOf(namespaceId)` to validate proposer ownership.
+- `OriginAssignment` reads `StakingRegistry.isActive(operator)` to validate origin candidates at proposal time. The check is opportunistic, not enforced at probe time — an operator who unbonds mid-assignment is filtered by clients via the standard staking check, not by `OriginAssignment` (avoiding expensive cross-contract checks on every assignment lookup).
+- `OriginAssignment.pruneBlacklistedAssignment` reads `ContentBlacklist.isOriginBlacklisted(operator)` to decide whether to remove an entry. Permissionless callers can clean up storage one (`namespaceId`, operator) pair at a time.
+- `ContentBlacklist.addOrigin(operator)` does not call into `OriginAssignment` — see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist) below for the rationale and the runtime-check pattern.
+
+### Interaction with ContentBlacklist
+
+`ContentBlacklist.addOrigin(operator)` does **not** call `OriginAssignment` to evict the operator from every namespace. The naïve approach — iterate over every namespace the operator is assigned to and remove them in one transaction — is unbounded: an operator in N namespaces costs O(N) storage writes, and a prolific operator could exceed the block gas limit, blocking the blacklist transaction entirely.
+
+Off-chain consumers of `OriginAssignment.getOrigins(namespaceId)` (clients selecting peers for first-fetch, watchtowers checking publisher availability commitments) cross-reference each returned operator against `ContentBlacklist.isOriginBlacklisted` and treat blacklisted entries as unauthorized regardless of stale `OriginAssignment` state. Storage cleanup happens lazily and permissionlessly via `OriginAssignment.pruneBlacklistedAssignment(namespaceId, operator)`: each call removes one entry; anyone may call it (the contract checks `ContentBlacklist.isOriginBlacklisted` itself, so the caller cannot grief by claiming a non-blacklisted operator is blacklisted). Watchtowers and reputation services will likely run pruning jobs as a public good.
+
+This pattern means: blacklisting an operator is an O(1) on-chain action (one ejection call), and storage cleanup is O(1) per call with no transaction-size limit. No design path requires iterating over an operator's full namespace set.
+
+### Permissionless property
+
+This authority extends the DAO's role from negative-only (blacklisting) to positive-and-negative (assignment + blacklisting) for all namespaces, including default-open. Cache-only serving remains permissionless — any staked operator may fetch cached blobs from authorized origins and re-serve them regardless of `OriginAssignment` membership. Only the *origin* role becomes DAO-gated, with publisher-proposed sets for registered namespaces and the global allow-list for default-open content. See [ADR 001](001-network.md) for the updated permissionless-role model.
 
 ## Node Behavior
 
@@ -205,12 +345,16 @@ Local denylist entries take effect immediately and behave identically to governa
 ```rust
 enum StreamError {
     // ... existing errors ...
-    HashBlacklisted,     // hash is on the governance blacklist or local denylist
-    OriginBlacklisted,   // the channel's operator address is blacklisted
+    HashBlacklisted,      // hash is on the governance blacklist or local denylist
+    OriginBlacklisted,    // the channel's operator address is blacklisted
+    UnauthorizedOrigin,   // requester asked the node to act as origin (e.g., over a payment
+                          // channel that flags origin-only delivery) but the node is not in
+                          // the namespace's OriginAssignment set; cache-only delivery from
+                          // this node remains available via a normal StreamRequest
 }
 ```
 
-The response does not distinguish between governance and local denylist sources. Clients should retry on a different node.
+The response does not distinguish between governance and local denylist sources. Clients should retry on a different node. `UnauthorizedOrigin` is distinct: the node is reachable and may have the blob, but cannot act as the canonical origin. Requesters that strictly require an origin source (rather than a cache copy) should retry against the namespace's authorized operator set (`OriginAssignment.getOrigins(namespaceId)`); requesters that accept cache delivery should retry the same node with the origin-only flag cleared.
 
 ## Slashing
 
@@ -242,6 +386,9 @@ A slash requires an active challenger submitting evidence of a post-window deliv
 - Emergency path addresses CSAM and actively-exploited material without a 5-day vote cycle
 - Reason field and on-chain audit trail support legal defensibility for operators
 - Local denylist preserves operator autonomy for direct legal notices
+- Origin assignment authority gives publishers a protocol-level way to commit specific operators to serving their content with an enforced minimum-redundancy invariant — no withholding-by-single-origin failure mode for registered namespaces
+- Symmetric blacklist/assignment infrastructure: a blacklisted operator is treated as unauthorized at every runtime check across every namespace they were authorized to serve, with lazy storage cleanup (see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist))
+- Default-open content is governed by a single DAO-maintained allow-list with its own redundancy floor, closing the prior loophole where any staked operator could claim origin for unregistered content while keeping a uniform `OriginAssignment` storage and view model across all namespaces
 
 **Negative:**
 
@@ -250,6 +397,8 @@ A slash requires an active challenger submitting evidence of a post-window deliv
 - Governance becomes a content moderation body, requiring off-chain processes (abuse intake, legal review) the protocol does not define
 - Multiple regional bodies add governance coordination overhead; regional bodies can disagree on scope
 - Blacklisted content remains content-addressable and verifiable off-network; eviction stops CDN serving but does not prevent redistribution by other means
+- Origin assignment authority extends governance into a new category — positive node-role authorization — that did not previously exist. Capture risk and operator-concentration risk are now governance concerns, not just off-protocol coordination concerns
+- The strict-gating model amends the unconditional permissionless-origin claim from [ADR 001](001-network.md). Cache-only role is preserved as permissionless, but the origin role is governance-gated for all content — per-namespace `OriginAssignment` for registered namespaces and the default-open allow-list for unregistered content. PoC ships in the default-open bootstrap window (see [§ Default-open allow-list](#default-open-allow-list)); production governance closes it
 
 ## Governance Process (Off-Chain)
 
@@ -264,7 +413,11 @@ The minimum viable process for PoC:
 
 ## ADRs Affected
 
-- **ADR 001** (Network Topology) — `NodeAnnounce` must suppress blacklisted hashes from `popular_hashes`; blacklisted origin NodeIds are excluded from peer tables; `StreamError::HashBlacklisted` and `StreamError::OriginBlacklisted` are new error variants
-- **ADR 002** (Content Addressing) — content-addressed blobs can be removed from the network layer even though the hash remains valid; this is explicitly accepted
+- **[ADR 001](001-network.md)** (Network Topology) — `NodeAnnounce` must suppress blacklisted hashes from `popular_hashes`; blacklisted origin NodeIds are excluded from peer tables; `StreamError::HashBlacklisted`, `StreamError::OriginBlacklisted`, and `StreamError::UnauthorizedOrigin` are new error variants; the unconditional permissionless-origin claim in the consequences section is amended to reflect DAO-gated origin role
+- **[ADR 002](002-content-addressing.md)** (Content Addressing) — content-addressed blobs can be removed from the network layer even though the hash remains valid; this is explicitly accepted. The [Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces) section in ADR 002 defines the primitives this ADR's `OriginAssignment` mechanism builds on
+- **[ADR 003](003-payments.md)** (Payments) — multi-origin redundancy is now DAO-supervised via the `OriginAssignment` minimum-redundancy invariant rather than off-protocol content-owner coordination
+- **[ADR 005](005-protocol.md#cdnprobev1--latency-probe)** (Protocol) — origin status is *not* signaled at probe time; the wire response describes only "I have the bytes." Origin authorization is queried off-chain via `OriginAssignment.getOrigins(namespaceId)` for routing/discovery; the protocol does not slash for impersonating origin status because no claim is made on the wire
 - **[ADR 026](026-gauge-boost-tokenomics.md)** (Tokenomics) — serving blacklisted content added to the slashable offense list; origin blacklisting triggers same stake ejection path as repeated slashing
-- **ADR 009** (Governance) — `ContentBlacklist` contract added to governance-controlled contracts; emergency multisig scope documented in ADR 009 as the single source of truth, covering both contract pausing and content/origin blacklisting; regional body registry introduced as a new governance primitive
+- **[ADR 009](009-governance.md)** (Governance) — `ContentBlacklist` and `OriginAssignment` contracts added to governance-controlled contracts; emergency multisig scope documented in ADR 009 as the single source of truth, covering both contract pausing and content/origin blacklisting; regional body registry introduced as a new governance primitive; new governable parameters with safety bounds for assignment timelock, minimum redundancy, per-publisher namespace caps, and default-open allow-list redundancy floor / cap
+- **[ADR 016](016-contract-interactions.md)** (Contract Interactions) — `PublisherRegistry` and `OriginAssignment` added to the contract inventory, deployment order, call graph, role matrix, and reentrancy analysis
+- **[ADR 022](022-content-discovery.md)** (Content Discovery) — DHT STORE remains permissionless; the `OriginAssignment` view layer is consulted at probe / request time rather than at DHT publish time, and the existing "publisher" terminology in ADR 022 is qualified to distinguish DHT STORE publishers from on-chain content publishers

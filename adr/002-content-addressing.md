@@ -19,6 +19,79 @@ The mapping from hash to the actual backing storage location (e.g., which S3 key
 
 BLAKE3 is iroh's native hash function, so there is no translation layer between blob IDs and the transport layer.
 
+## Publisher Identity and Namespaces
+
+Content addressing answers "what is this blob?". Origin governance answers "who is responsible for serving this blob?". The two questions are independent: a BLAKE3 hash is intrinsic to the bytes, but the network needs a stable identity for the party that publishes the bytes so that the DAO can authorize specific operators to act as origins for their content (see [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority)).
+
+A **publisher** is an Ethereum address that has registered through the `PublisherRegistry` contract ([ADR 016](016-contract-interactions.md)). Registration is permissionless and one-shot per address; transferring publisher ownership is a separate gated action (see ADR 016 for the lifecycle).
+
+A **namespace** is a publisher-owned `uint256` identifier under which blob hashes are claimed. Publishers may register multiple namespaces (subject to the anti-squatting cap in [ADR 009](009-governance.md)) so that distinct content sets can be governed independently — for example, a media company may operate one namespace per product line so that takedowns and origin assignments for one product do not entangle the others.
+
+A **content claim** is an on-chain binding of a `(namespaceId, blake3Hash)` pair, recorded by the namespace's owner via `PublisherRegistry.claimContent`. Claims are append-only and content-immutable: a claim, once recorded, cannot be moved or revoked; the underlying bytes are untouched (BLAKE3 makes the hash binding cryptographic). Multiple non-zero namespaces may claim the same hash independently, with no coordination between publishers — see [§ Multi-claim semantics](#multi-claim-semantics) below. Claims are the authoritative on-chain answer to "which registered namespaces, if any, claim this blob?".
+
+### Default-open namespace
+
+A reserved namespace ID (`namespaceId == 0`) is the **default-open namespace**. Any blob is implicitly claimed under it; no `claimContent` call is required. Operators authorized by the DAO via the default-open allow-list (see [ADR 011 § Default-open allow-list](011-content-takedown.md#default-open-allow-list)) may serve as origin for default-open blobs; cache-only serving by any staked operator remains permissionless. The allow-list is the single global authority over default-open origin behaviour; until governance activates a non-empty list at least once, the bootstrap rule preserves the prior permissive semantics so PoC and pre-activation deployments are not stranded. Publishers seeking per-content durability guarantees, takedown accountability, or namespace-scoped origin sets opt in by registering and claiming under a non-zero namespace.
+
+Default-open is the operative regime for any hash with no non-zero claims; once at least one non-zero namespace claims the hash, those namespaces' authorized operator sets become origin authorities for that hash alongside the default-open allow-list (see [§ Multi-claim semantics](#multi-claim-semantics)).
+
+### Multi-claim semantics
+
+Any number of non-zero namespaces may claim the same `blake3Hash`, by independent publishers, with no coordination. Each claim registers a namespace as a responsible origin authority for the hash. The set of operators authorized to serve the hash as origin is the union of the operator sets across all claiming namespaces, plus the default-open allow-list if the hash has no non-zero claims.
+
+This design choice is deliberate. A first-write-wins / one-claim rule would create two failure modes:
+
+- **Stranded hashes.** A namespace owner who loses keys, abandons, or refuses cooperation strands every hash they have claimed: no path exists for another publisher or the DAO to authorize fresh origin operators for that hash. The namespace lifecycle (revocation, transfer) all require the current owner.
+- **Squatting.** Any party could pre-claim popular hashes (e.g., a future release ISO's BLAKE3) and block the legitimate publisher, with no anti-squatting mechanism short of governance overrides.
+
+Multi-claim eliminates both: claims do not block other claims; defunct namespaces do not block alternative origin authorities; squatting gates nothing because the squatter cannot prevent independent claims. The trade-off — that the protocol no longer presents an on-chain claim as "the official publisher of this content" — is accepted because that framing is not load-bearing on any protocol primitive: takedown is hash-keyed, and origin authorization is consumed off-chain by routing/discovery layers that can OR-search the claiming set without protocol-level signaling.
+
+### Why this lives in ADR 002
+
+Content identity (the BLAKE3 hash) and publisher identity are paired: every claim is a binding between the two. Defining publisher and namespace here keeps the identity primitives in one place so that ADRs [011](011-content-takedown.md#origin-assignment-authority) (governance authority), [016](016-contract-interactions.md) (contract surface), and [022](022-content-discovery.md) (DHT publication semantics) can refer back to a single canonical definition.
+
+### Contract: PublisherRegistry
+
+```solidity
+interface IPublisherRegistry {
+    // Publisher registration — permissionless, one-shot per address
+    function registerPublisher() external returns (uint256 publisherId);
+
+    // Namespace lifecycle — only callable by the namespace owner (or DEFAULT_ADMIN_ROLE)
+    function createNamespace() external returns (uint256 namespaceId);
+
+    // Namespace ownership transfer with a 7-day timelock.
+    // initiateTransfer queues the transfer; finalizeTransfer completes it after
+    // the timelock; cancelTransfer (callable by current owner only) aborts.
+    function initiateNamespaceTransfer(uint256 namespaceId, address newOwner) external;
+    function finalizeNamespaceTransfer(uint256 namespaceId) external;
+    function cancelNamespaceTransfer(uint256 namespaceId) external;
+
+    // Content claim — only callable by the namespace's current owner.
+    // Multi-claim: any number of non-zero namespaces may claim the same hash
+    // independently. Reverts only if THIS namespace has already claimed this
+    // hash (idempotency); other namespaces' prior claims do not block.
+    function claimContent(uint256 namespaceId, bytes32 blake3Hash) external;
+
+    // Views
+    function namespaceOf(bytes32 blake3Hash) external view returns (uint256[] memory namespaceIds);
+    function ownerOf(uint256 namespaceId) external view returns (address);
+    function namespaceCount(address publisher) external view returns (uint256);
+    function pendingTransfer(uint256 namespaceId) external view returns (address newOwner, uint256 readyAt);
+
+    // Events
+    event PublisherRegistered(address indexed publisher, uint256 indexed publisherId);
+    event NamespaceCreated(uint256 indexed namespaceId, address indexed owner);
+    event NamespaceTransferInitiated(uint256 indexed namespaceId, address indexed from, address indexed to, uint256 readyAt);
+    event NamespaceTransferred(uint256 indexed namespaceId, address indexed from, address indexed to);
+    event ContentClaimed(uint256 indexed namespaceId, bytes32 indexed blake3Hash, address indexed claimant);
+}
+```
+
+`namespaceOf(hash)` returns an empty array for any hash not explicitly claimed; default-open semantics apply. The view never reverts on unknown hashes — callers cannot distinguish "hash unknown to the protocol" from "hash served as default-open" via this view, which is correct: both states are operationally identical. Storage is a per-hash `uint256[]` set of claiming namespaces — append-only since claims are content-immutable, never moved or revoked.
+
+Per-publisher namespace cap and ownership-transfer timelock are governable parameters with safety bounds (see [ADR 009](009-governance.md)). The 7-day default transfer timelock is documented for clarity; the contract reads its current value from the governance-controlled parameter store at call time.
+
 ## Consequences
 
 **Positive:**

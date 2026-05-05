@@ -130,7 +130,7 @@ When a node caches blob H:
 2. Send a signed `StoreRequest { hash: H, holder: self.node_id, published_at_us, signature }` to each.
 3. Schedule re-publish at T+45 minutes while blob remains cached.
 
-The `StoreRequest` signature (ed25519 over `hash || published_at_us`) lets receiving nodes verify the record was created by the claimed holder. Receiving nodes do **not** verify that the holder actually has the blob — that is the probe step's job. A false publisher fails at probe time, degrading its reputation.
+The `StoreRequest` signature (ed25519 over `hash || published_at_us`) lets receiving nodes verify the record was created by the claimed holder. Receiving nodes do **not** verify that the holder actually has the blob — that is the probe step's job. A false STORE publisher (a node claiming to hold a blob it does not) fails at probe time, degrading its reputation. **Note:** the term "publisher" in this ADR refers to a node publishing a DHT STORE record (an act of advertising). It is distinct from the on-chain *content publisher* identity defined in [ADR 002 § Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces), which is an Ethereum address registered in `PublisherRegistry`. Where confusion is possible this ADR uses "STORE publisher" or "holder" for the DHT-record sender.
 
 #### 1.6 FIND_VALUE Flow (Cache Miss → DHT Lookup)
 
@@ -144,6 +144,10 @@ When a node gets a cache miss for hash H and the probe cache is empty:
 6. Select provider by unified node selection score ([ADR 001](001-network.md#node-selection-algorithm)); deliver via `cdn/client/v1`.
 
 **Fallback:** if DHT returns no providers, fall back to broadcast probe fan-out across all known peers (the existing mechanism). If that also returns nothing, the blob is not available in the network.
+
+**Origin discovery.** A requester that prefers an authorized origin for a hash (e.g., a cache-miss pull where freshness from a publisher-committed source is desirable) discovers candidates through the standard DHT path. The DHT does not discriminate origin vs cache providers — `StoreRequest` is the same wire format regardless of role — so any holder may publish a record. The wire protocol does not surface origin-vs-cache status at probe time either; instead, the requester resolves origin status off-chain by reading `PublisherRegistry.namespaceOf(hash)` and `OriginAssignment.getOrigins(namespaceId)` and intersecting against the probed peer set.
+
+The on-chain origin set is also the directory of last resort if the DHT returns no providers: resolve namespaces via `PublisherRegistry.namespaceOf(hash)` and union the operator-address sets via `OriginAssignment.getOrigins(namespaceId)` for each ([ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority)). Operator addresses map to NodeIds via `StakingRegistry.nodeIdOf(operator)` (a single read per operator, returning `(nodeId, active)` — see [ADR 003 § NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding) and [ADR 016 § Off-Chain Read API](016-contract-interactions.md#off-chain-read-api-client--node-bootstrap)); the requester then probes those NodeIds directly. The chain of reads (namespace lookup → operator union → NodeId binding → blacklist filter) has no inter-call dependencies *within* a tier and is straightforward to batch via the standard `Multicall3` aggregator deployed on Arbitrum, collapsing the fallback to a small number of RPC round-trips; the implementation pattern is left to client libraries since it does not affect protocol semantics. This fallback is uncommon — under normal operation the DHT contains entries for every actively-serving authorized origin — but provides a deterministic recovery path during DHT churn or bootstrap. For default-open content (`namespaceId == 0`) the on-chain directory is `OriginAssignment.getOrigins(0)` — the DAO-maintained default-open allow-list — resolved to NodeIds the same way as for registered namespaces. During the bootstrap window before the allow-list is first activated (`defaultOpenAllowlistActive == false`), `getOrigins(0)` is empty and the DHT path is the only discovery channel; once activated, the allow-list provides the same fallback as registered namespaces.
 
 #### 1.7 Bootstrap
 
@@ -235,7 +239,8 @@ The six discovery alternatives evaluated against `cdn/dht/v1` (broadcast probe f
 
 - **ADR 001** Future Work section ("Scaling Content Discovery") is superseded by this ADR. The three strategies listed there are resolved: selective fan-out is subsumed by DHT, content DHT is formalised here, gossip content hints are rejected.
 - **ADR 005** probe protocol is unchanged. DHT provides candidates only.
-- **ADR 008** reputation penalties for delivery failure cover false STORE record publishers.
+- **ADR 008** reputation penalties for delivery failure cover false STORE records (a node publishing a DHT record claiming to hold a blob it does not have).
+- **ADR 011** origin assignment authority is *not* consulted at probe time — origin status is not signaled on the wire. The DHT remains permissionless; per-namespace origin authorization is queried off-chain via `OriginAssignment.getOrigins(namespaceId)` for routing/discovery preferences.
 - **ADR 012** client discovery uses DHT FIND_VALUE; probe fan-out bootstrap fallback applies to clients equally.
 - **ADR 013** schema evolution rules apply to `cdn/dht/v1`.
 - **the observability appendix** SHOULD add DHT subsystem metrics: `decdn_dht_store_published_total`, `decdn_dht_findvalue_queries_total`, `decdn_dht_routing_table_size`.

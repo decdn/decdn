@@ -144,7 +144,7 @@ Each client release ships with a built-in default seed list compiled into the bi
 
 **Supplementary: Option C — Minimum honest-peer diversity** is adopted as a client-side policy (not protocol-enforced). The client maintains connections to at least `min_peer_diversity` nodes (default: 3) discovered via different sources (registry vs. DNS vs. gossip). If all connected nodes were discovered via the same source, the client logs a warning. This is advisory — not blocking.
 
-**Option A — Origin-backed nodes as fallback** is rejected. Whether a node has an origin backend is an opaque deployment choice (a design invariant: "no external origin URL is ever exposed"). Exposing origin-backed status on-chain to help clients find "trustworthy" nodes would undermine this opacity model. Furthermore, having an origin backend is not a guarantee of honesty.
+**Option A — Origin-backed nodes as fallback** is rejected as a *trust* mechanism. Whether a node has an origin backend remains an opaque deployment choice and origin URLs are never exposed (design invariant preserved by [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority): only operator Ethereum addresses are recorded on-chain via `OriginAssignment`, never backend URLs). Having an origin backend is also not a guarantee of honesty. The DAO-ratified authorized-origin set surfaced via `OriginAssignment.getOrigins(namespaceId)` is an *availability commitment* (publishers commit to serving via specific operators with a min-redundancy floor), not a trust ranking — clients still verify content integrity via BLAKE3 and apply the standard reputation / probe scoring regardless of authorized-origin status.
 
 ### Trust Boundary
 
