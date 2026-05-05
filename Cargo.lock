@@ -1951,6 +1951,7 @@ dependencies = [
  "decdn-protocol",
  "ed25519-dalek 2.2.0",
  "iroh",
+ "proptest",
  "serde",
  "thiserror 2.0.18",
  "tokio",
