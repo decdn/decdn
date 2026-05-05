@@ -20,7 +20,9 @@ Three core protocols negotiated via ALPN, plus the built-in iroh-gossip protocol
 | `cdn/watchtower/v1` | watched party (typically node) ↔ watchtower | Channel-dispute monitoring: voucher registration and updates (see ADR 007) |
 | iroh-gossip (built-in) | all nodes | Node metadata announcements (`NodeAnnounce`), node discovery |
 
-**Gossip topics.** The iroh-gossip protocol carries multiple message types on distinct topics:
+### Gossip topics
+
+The iroh-gossip protocol carries multiple message types on distinct topics:
 
 | Topic | Message Type | Source ADR |
 | --- | --- | --- |
@@ -30,7 +32,9 @@ Three core protocols negotiated via ALPN, plus the built-in iroh-gossip protocol
 
 All gossip topics use the `cdn/` namespace prefix. `NodeAnnounce` and `ReputationReport` are active in production; `WatchtowerAnnounce` is a planned production extension for watchtower discovery at scale (PoC uses static watchtower lists — see [ADR 007](007-watchtower.md)).
 
-**Rate discovery.** Nodes do not gossip rate changes. The current rate is included in every signed `ProbeResponse`; clients query rates by probing. A node's last probe-quoted rate is binding for any stream opened within the 30-second slashing window — see [`cdn/probe/v1` — latency probe](#cdnprobev1--latency-probe) and the rate-manipulation slashing path in [ADR 014](014-on-chain-verification.md).
+### Rate discovery
+
+Nodes do not gossip rate changes. The current rate is included in every signed `ProbeResponse`; clients query rates by probing. A node's last probe-quoted rate is binding for any stream opened within the 30-second slashing window — see [`cdn/probe/v1` — latency probe](#cdnprobev1--latency-probe) and the rate-manipulation slashing path in [ADR 014](014-on-chain-verification.md).
 
 ### `cdn/probe/v1` — latency probe
 
@@ -74,7 +78,9 @@ Before signing a `ProbeResponse` containing `rate_per_mb`, the node MUST verify 
 
 The same validation applies when the node signs a `StreamResponse` containing `rate_per_mb`. The node MUST verify bounds compliance before signing, using the same clamp-and-warn behavior. Each clamping event SHOULD increment the `rate_bounds_clamp_events` metric — see [architecture.md § Observability](architecture.md#observability).
 
-**Requester-side validation (optional).** Requesters (clients and nodes performing cache-miss pulls) MAY reject `ProbeResponse` or `StreamResponse` messages where `rate_per_mb` falls outside their own cached rate bounds. This is a local policy decision, not a protocol requirement. A requester with stale bounds might incorrectly reject a legitimate rate after a governance change; therefore requesters SHOULD refresh their bounds (via `getRateBounds()`) before rejecting a rate as out-of-bounds.
+##### Requester-side validation (optional)
+
+Requesters (clients and nodes performing cache-miss pulls) MAY reject `ProbeResponse` or `StreamResponse` messages where `rate_per_mb` falls outside their own cached rate bounds. This is a local policy decision, not a protocol requirement. A requester with stale bounds might incorrectly reject a legitimate rate after a governance change; therefore requesters SHOULD refresh their bounds (via `getRateBounds()`) before rejecting a rate as out-of-bounds.
 
 Rate bounds are queried from the `StablePaymentChannel` contract via `getRateBounds()` and kept current via `RateBoundsUpdated` event subscription with periodic polling fallback. See [ADR 003 — Rate Bounds Refresh](003-payments.md#rate-bounds-refresh) for the refresh mechanism.
 
@@ -106,7 +112,9 @@ sequenceDiagram
     end
 ```
 
-**Client identity binding.** For clients using ephemeral (off-chain) NodeId-to-Ethereum-address bindings (see [ADR 003 — Off-Chain Ephemeral Binding](003-payments.md#off-chain-ephemeral-binding-for-clients)), the binding is conveyed via optional fields in `StreamRequest`:
+#### Client identity binding
+
+For clients using ephemeral (off-chain) NodeId-to-Ethereum-address bindings (see [ADR 003 — Off-Chain Ephemeral Binding](003-payments.md#off-chain-ephemeral-binding-for-clients)), the binding is conveyed via optional fields in `StreamRequest`:
 
 ```rust
 struct StreamRequest {
@@ -127,7 +135,9 @@ The client includes `ethereum_address` and `binding_signature` in the first `Str
 
 The delivering node advertises its `rate_per_mb` in `StreamResponse`. The payer accepts by sending the first voucher or disconnects and tries another node. No surprise pricing. `timestamp_us` in `StreamResponse` is the requester-generated microsecond timestamp from `StreamRequest`, echoed back unchanged — the same pattern as `ProbeResponse`. The node's iroh key signs all security-relevant fields: `{hash, ok, rate_per_mb, total_bytes, channel_id, timestamp_us, redirect}`, making the response cryptographically binding. A `slash_sig` (EIP-712 secp256k1 signature over the same fields, mandatory in PoC) enables on-chain verification via `ecrecover` — see [ADR 014](014-on-chain-verification.md). Signing the full response prevents a malicious party from altering unsigned fields while reusing a valid signature — in particular, `ok` is needed for phantom announcement evidence (proving a node signed `ok: false` after claiming `has_blob: true` in a probe), and `redirect` ensures a node cannot silently alter routing without accountability. A rate mismatch where `stream_response.rate_per_mb > probe_response.rate_per_mb` is slashable if `stream_response.timestamp_us >= probe_response.timestamp_us` and `stream_response.timestamp_us - probe_response.timestamp_us < 30_000_000` (30 seconds). The ordering check prevents unsigned integer underflow in the on-chain verifier. Because both `timestamp_us` values are requester-generated, the on-chain verifier computes this delta from the signed messages alone — no wall-clock reference or external time oracle is needed, and clock skew between the requester and the node does not affect the check. The `redirect` field in `StreamResponse` is used when a node cannot serve — it contains the NodeId of another node that can, never an external URL. The network is fully opaque.
 
-**Redirect loop prevention.** The requester MUST enforce:
+#### Redirect loop prevention
+
+The requester MUST enforce:
 
 1. **Hop limit:** maximum 3 redirects per original request. After 3 redirects, the requester treats the request as failed (no more redirects followed).
 2. **Cycle detection:** the requester tracks the set of NodeIds visited for each request. A redirect to an already-visited NodeId is rejected immediately.
@@ -135,7 +145,9 @@ The delivering node advertises its `rate_per_mb` in `StreamResponse`. The payer 
 
 `byte_offset` supports seek and resume: on failover, the requester reconnects to a different node and resumes from the last BLAKE3-verified byte.
 
-**Voucher interval negotiation.** The optional `voucher_interval_mb` field in `StreamRequest` proposes a larger-than-default voucher cadence for this stream (see [ADR 003 — Voucher Interval Negotiation](003-payments.md#voucher-interval-negotiation)). If present, the node responds with its accepted interval in `StreamResponse.voucher_interval_mb` — which may be equal to or smaller than the proposed value. If absent from either message, both sides default to 1 MB. The `voucher_interval_mb` field is **not** included in the `StreamResponse` signature because it is a delivery-layer optimization, not a security-relevant field — the node can always enforce a smaller interval unilaterally by pausing delivery.
+#### Voucher interval negotiation
+
+The optional `voucher_interval_mb` field in `StreamRequest` proposes a larger-than-default voucher cadence for this stream (see [ADR 003 — Voucher Interval Negotiation](003-payments.md#voucher-interval-negotiation)). If present, the node responds with its accepted interval in `StreamResponse.voucher_interval_mb` — which may be equal to or smaller than the proposed value. If absent from either message, both sides default to 1 MB. The `voucher_interval_mb` field is **not** included in the `StreamResponse` signature because it is a delivery-layer optimization, not a security-relevant field — the node can always enforce a smaller interval unilaterally by pausing delivery.
 
 The protocol is self-enforcing: payer stops sending vouchers → delivering node stops sending chunks; delivering node stops sending chunks → payer stops sending vouchers.
 
@@ -240,7 +252,9 @@ enum StreamError {
 }
 ```
 
-**`EvictedSinceProbe` semantics.** This error code is informational only (unsigned, like all error codes — see below). It signals to the requester that the node had the blob at probe time but lost it due to cache pressure. The requester MUST NOT retry the same node for this blob — the blob is no longer in cache. The requester falls back to the next-best provider, identical to `NotFound` handling. **Warning:** Returning `EvictedSinceProbe` in a signed `StreamResponse` with `ok: false` within the 30-second slashing window still constitutes valid phantom-announcement slash evidence — the error code is unsigned and invisible to the on-chain verifier. Implementations MUST NOT treat this error code as a "safe" way to refuse a stream after a positive probe. A well-implemented node using probe-triggered eviction holds (see [Probe-Triggered Eviction Hold](#probe-triggered-eviction-hold)) should rarely return this error under normal operation; its presence at significant rates indicates a failure to respect hold commitments (implementation bug or resource exhaustion such as OOM), not a budget configuration issue — an undersized `max_probe_holds` budget causes the node to respond `has_blob: false` at probe time, preventing the stream request entirely.
+#### `EvictedSinceProbe` semantics
+
+This error code is informational only (unsigned, like all error codes — see below). It signals to the requester that the node had the blob at probe time but lost it due to cache pressure. The requester MUST NOT retry the same node for this blob — the blob is no longer in cache. The requester falls back to the next-best provider, identical to `NotFound` handling. **Warning:** Returning `EvictedSinceProbe` in a signed `StreamResponse` with `ok: false` within the 30-second slashing window still constitutes valid phantom-announcement slash evidence — the error code is unsigned and invisible to the on-chain verifier. Implementations MUST NOT treat this error code as a "safe" way to refuse a stream after a positive probe. A well-implemented node using probe-triggered eviction holds (see [Probe-Triggered Eviction Hold](#probe-triggered-eviction-hold)) should rarely return this error under normal operation; its presence at significant rates indicates a failure to respect hold commitments (implementation bug or resource exhaustion such as OOM), not a budget configuration issue — an undersized `max_probe_holds` budget causes the node to respond `has_blob: false` at probe time, preventing the stream request entirely.
 
 **`BlobTooLarge` enforcement:** Nodes may configure a `max_blob_size` limit (PoC recommended default: 10 GB). When deciding whether to serve a blob, a node enforces `max_blob_size` against locally known blob metadata (its cache index or origin catalog). If the locally known size exceeds `max_blob_size`, the node returns `StreamResponse {ok: false, error: BlobTooLarge}`. On a cache-miss pull from an upstream node, the pulling node additionally enforces `max_blob_size` against `StreamResponse.total_bytes`: if the upstream `total_bytes` exceeds the pulling node's `max_blob_size`, the pulling node aborts the upstream stream and returns `BlobTooLarge` to the original requester. The limit applies to individual blobs.
 
@@ -258,7 +272,9 @@ The error code is **not** included in the `StreamResponse` signature — it is i
 
 ### Stream Lifecycle State Machine
 
-**Per-stream states** (one instance per `StreamRequest`):
+#### Per-stream states
+
+(one instance per `StreamRequest`):
 
 ```
 AwaitingResponse ──StreamResponse{ok: true}──► Streaming
@@ -279,7 +295,9 @@ AwaitingResponse ──StreamResponse{ok: true}──► Streaming
 - **Partial final chunk:** The last `ChunkData` before `StreamEnd` MAY be smaller than 1,024 bytes. Receivers MUST accept partial chunks at stream end.
 - **Voucher pacing:** The node pauses delivery when outstanding (unvouchered) bytes exceed `voucher_interval_mb × 1,048,576` bytes (i.e., the MB value converted to bytes). Delivery resumes when the client sends a `Voucher` covering the outstanding balance.
 
-**Per-channel voucher coordinator** (one instance per `channel_id`, shared across streams):
+#### Per-channel voucher coordinator
+
+(one instance per `channel_id`, shared across streams):
 
 ```
 Active ──voucher deficit──► VoucherPending ──Voucher received──► Active

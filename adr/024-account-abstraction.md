@@ -97,7 +97,9 @@ Safe smart wallets are the **recommended** wallet type for both node operators a
 
 **Session keys are out of scope for the PoC.** The PoC uses the direct owner-signature path described in §2 (1-of-1 Safe or EOA, software-held key on the signing host). This matches today's `eth_keystore` trust posture and keeps the PoC from shipping bespoke security-critical contract code.
 
-**Production plan.** High-frequency signing (node `slash_sig`, client vouchers) migrates to a standardized ERC-7579 session-key module:
+#### Production plan
+
+High-frequency signing (node `slash_sig`, client vouchers) migrates to a standardized ERC-7579 session-key module:
 
 - **Account type:** Safe with the [Safe-7579 adapter](https://github.com/rhinestonewtf/safe7579) — turns a Safe into an ERC-7579 modular account while preserving its owner model and deployed address.
 - **Session-key module:** [`erc7579/smartsessions`](https://github.com/erc7579/smartsessions) — a standardized ERC-7579 session-key validator that natively implements ERC-1271 `isValidSignature` for session-key-authorized digests. Because the module is an ERC-7579 *validator*, `isValidSignature` on a Safe-7579 account routes through it without any custom fallback handler on deCDN's side; `SignatureChecker.isValidSignatureNow(safe, digest, sessionKeySig)` returns the ERC-1271 magic value once a session is enabled.

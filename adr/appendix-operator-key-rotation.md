@@ -139,9 +139,13 @@ After migration, the Safe holds TOKEN and executes `stake` / `registerNode` / `o
 
 This is the cheap path — the on-chain Safe address does not change.
 
-**PoC (1-of-1 Safe).** Replace the single owner via `Safe.swapOwner(prevOwner, oldOwner, newOwner)`. The Safe address is unchanged; stake, channels, watchtower escrows, ve-locks, and `firstRegisteredAt` all carry over. No iroh-side action needed.
+#### PoC (1-of-1 Safe)
 
-**Production (2-of-3 + `erc7579/smartsessions`).** Two cases:
+Replace the single owner via `Safe.swapOwner(prevOwner, oldOwner, newOwner)`. The Safe address is unchanged; stake, channels, watchtower escrows, ve-locks, and `firstRegisteredAt` all carry over. No iroh-side action needed.
+
+#### Production (2-of-3 + `erc7579/smartsessions`)
+
+Two cases:
 
 - **Owner rotation:** standard 2-of-3 owner swap via the multisig owners. No protocol-level action needed.
 - **Session-key rotation:** revoke the old session key via the `erc7579/smartsessions` revocation interface; install a new session key with the same policy ([ADR 024 §3](024-account-abstraction.md)). Slash-evidence signing resumes against the new session key with no on-chain identity change.

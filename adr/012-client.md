@@ -243,12 +243,9 @@ The client queries all configured seed domains, cross-checks returned NodeIds ag
 2. ~~**Delegated voucher signer:**~~ Resolved — [ADR 024](024-account-abstraction.md) specifies Safe session keys as the mechanism for high-frequency voucher signing, replacing both the derived hot key and the delegated signer contract approach (PR 196).
 3. **Mobile/web clients:** This ADR assumes a desktop/server client with filesystem access. Mobile and web clients are listed as non-goals in the architecture overview but may need adapted key storage and bootstrap mechanisms.
 
----
-
 ## Multi-Node Parallel Download
 
-A client can split a large blob across N nodes and download each byte range in parallel
-(BitTorrent-style). This is opt-in via a CLI flag:
+A client can split a large blob across N nodes and download each byte range in parallel (BitTorrent-style). This is opt-in via a CLI flag:
 
 ```
 decdn pull <hash> --max-channels <N> -o <output>
@@ -264,30 +261,22 @@ Opening, closing, and settling a payment channel costs ~$0.23 at the production 
 
 1. Probe N candidates; confirm `has_blob: true` and collect latency.
 2. Learn `total_bytes` from the first `StreamResponse` (or from the manifest — see below).
-3. Divide `total_bytes` into N ranges aligned to the 256 MiB chunk boundary; last range absorbs
-   the remainder. Minimum range: 256 MiB — reduce N if necessary.
+3. Divide `total_bytes` into N ranges aligned to the 256 MiB chunk boundary; last range absorbs the remainder. Minimum range: 256 MiB — reduce N if necessary.
 4. Assign lowest-latency node to first range (minimises time-to-first-byte).
 
-One payment channel per node; channel deposit sized for its assigned range plus a 5% buffer.
-A shared multi-provider channel is not supported by the contract.
+One payment channel per node; channel deposit sized for its assigned range plus a 5% buffer. A shared multi-provider channel is not supported by the contract.
 
 ### Streaming incompatibility
 
-`--streaming` (or piped output) forces single-channel sequential delivery. Multi-channel mode
-buffers all range parts to disk before producing output — the output file is only available after
-all ranges complete.
+`--streaming` (or piped output) forces single-channel sequential delivery. Multi-channel mode buffers all range parts to disk before producing output — the output file is only available after all ranges complete.
 
 ### Failure handling
 
-Node failure mid-range: re-probe for a replacement, resume from last BLAKE3-verified byte within
-the range via `byte_offset`, open a new channel for the remaining bytes.
-
----
+Node failure mid-range: re-probe for a replacement, resume from last BLAKE3-verified byte within the range via `byte_offset`, open a new channel for the remaining bytes.
 
 ## Download Resume and Crash Recovery
 
-The client persists download state to disk so that a crash, kill, or network drop never requires
-re-downloading already-verified bytes.
+The client persists download state to disk so that a crash, kill, or network drop never requires re-downloading already-verified bytes.
 
 ### On-disk layout
 
@@ -300,8 +289,7 @@ re-downloading already-verified bytes.
   ...
 ```
 
-`<hash>` is the BLAKE3 hash of the requested blob (or manifest — see below).
-Location overridden by `DECDN_DOWNLOADS_DIR` env var or `--downloads-dir` flag.
+`<hash>` is the BLAKE3 hash of the requested blob (or manifest — see below). Location overridden by `DECDN_DOWNLOADS_DIR` env var or `--downloads-dir` flag.
 
 ### State file (`state.json`)
 
@@ -327,25 +315,18 @@ Location overridden by `DECDN_DOWNLOADS_DIR` env var or `--downloads-dir` flag.
 
 ### Atomic writes
 
-State is written atomically: write to `state.json.tmp`, `fsync`, then `rename` (POSIX atomic).
-A crash during the write never corrupts the previous state.
+State is written atomically: write to `state.json.tmp`, `fsync`, then `rename` (POSIX atomic). A crash during the write never corrupts the previous state.
 
-State is flushed after each 64 MiB of BLAKE3-verified bytes. The voucher nonce is flushed on
-**every voucher send** (nonces must be strictly monotone and must never be reused after resume).
-Worst-case re-download after a crash: 64 MiB per range.
+State is flushed after each 64 MiB of BLAKE3-verified bytes. The voucher nonce is flushed on **every voucher send** (nonces must be strictly monotone and must never be reused after resume). Worst-case re-download after a crash: 64 MiB per range.
 
 ### Resume procedure
 
 On startup, `decdn pull <hash>` checks for an existing download directory:
 
 - **Not found:** start fresh.
-- **Found:** load `state.json`; for each range with `verified_offset > 0`, reconnect to the
-  same node (or re-probe a replacement), open or reuse the channel, send
-  `StreamRequest{byte_offset: verified_offset}`, and continue writing from that offset.
+- **Found:** load `state.json`; for each range with `verified_offset > 0`, reconnect to the same node (or re-probe a replacement), open or reuse the channel, send `StreamRequest{byte_offset: verified_offset}`, and continue writing from that offset.
 
-If the original channel is still open on-chain, the client reuses it (avoids the $0.23
-lifecycle cost). If the channel is already settled, a new channel is opened sized for the
-remaining bytes only.
+If the original channel is still open on-chain, the client reuses it (avoids the $0.23 lifecycle cost). If the channel is already settled, a new channel is opened sized for the remaining bytes only.
 
 ### Cleanup commands
 
@@ -355,20 +336,17 @@ decdn downloads clean             # remove completed and failed downloads
 decdn downloads clean --all       # remove all downloads including in-progress
 ```
 
-State directories older than 30 days with no progress (`verified_offset = -1`) are treated as
-abandoned and purged by `clean`.
-
----
+State directories older than 30 days with no progress (`verified_offset = -1`) are treated as abandoned and purged by `clean`.
 
 ## File Manifests and Reconstruction
 
-Large files are split into chunks at ingest time. A **manifest blob** describes the ordered
-list of chunk hashes; its BLAKE3 hash is the canonical file identifier shared out-of-band.
+Large files are split into chunks at ingest time. A **manifest blob** describes the ordered list of chunk hashes; its BLAKE3 hash is the canonical file identifier shared out-of-band.
 
 ### Chunk size
 
-**256 MiB** (fixed at ingest). The last chunk is a partial chunk. Chunk size is a convention
-for origin-produced content — CDN nodes serve any BLAKE3-addressed blob regardless of size.
+#### 256 MiB
+
+(fixed at ingest). The last chunk is a partial chunk. Chunk size is a convention for origin-produced content — CDN nodes serve any BLAKE3-addressed blob regardless of size.
 
 ### Manifest format (postcard-encoded)
 
@@ -388,28 +366,21 @@ struct ChunkEntry {
 }
 ```
 
-The manifest blob is pushed to the CDN like any other blob. It is typically < 1 MB even for
-10,000-chunk files.
+The manifest blob is pushed to the CDN like any other blob. It is typically < 1 MB even for 10,000-chunk files.
 
 ### Download flow
 
 1. Fetch manifest blob (`StreamRequest{hash: H_manifest}`), verify BLAKE3, deserialise.
-2. For each chunk in order: `StreamRequest{hash: chunk.hash}`, write to
-   `~/.decdn/downloads/<H_manifest>/chunk-<index>.part`, verify BLAKE3.
+2. For each chunk in order: `StreamRequest{hash: chunk.hash}`, write to `~/.decdn/downloads/<H_manifest>/chunk-<index>.part`, verify BLAKE3.
 3. After all chunks verified: concatenate in order → output file; delete part files.
 
 ### Blob retention
 
-Chunk part files are **retained by default** after reconstruction so the client can re-serve
-them via iroh-blobs. Pass `--no-keep-blobs` to delete immediately after reconstruction.
+Chunk part files are **retained by default** after reconstruction so the client can re-serve them via iroh-blobs. Pass `--no-keep-blobs` to delete immediately after reconstruction.
 
 ### Backward compatibility
 
-Raw single-blob downloads are unchanged. The client checks the `DECDNMAN` magic header; on
-failure (wrong or missing magic) it treats the bytes as a raw blob. Content providers signal
-manifest vs. raw out-of-band.
-
----
+Raw single-blob downloads are unchanged. The client checks the `DECDNMAN` magic header; on failure (wrong or missing magic) it treats the bytes as a raw blob. Content providers signal manifest vs. raw out-of-band.
 
 ## ADRs Affected
 

@@ -4,8 +4,6 @@
 **Deciders:** Core team
 **Date:** 2026-04-08
 
----
-
 ## Context
 
 Content discovery answers the question: "which nodes currently hold blob H?" The answer drives both client→node delivery (client picks a node to stream from) and node→node pull-through (a node with a cache miss finds a provider to pull from).
@@ -39,13 +37,9 @@ A **Kademlia-based content DHT** has the right properties for an incentive-drive
 
 iroh's built-in `DhtDiscovery` (mainline BitTorrent DHT via pkarr) is unrelated — it resolves `NodeId → address` on the public internet. A separate content DHT scoped to the registered node set is required.
 
----
-
 ## Decision
 
 `cdn/dht/v1` is the **primary content discovery mechanism from day one**, including PoC. Broadcast probe fan-out is retained as a **bootstrap fallback only** — used when a node's routing table is not yet populated, or when a DHT lookup returns no providers. There is no phased rollout; the DHT is always on.
-
----
 
 ### 1. `cdn/dht/v1` Protocol
 
@@ -161,8 +155,6 @@ On node startup:
 
 At PoC scale (30 nodes) the routing table is fully populated after a single self-lookup round; the fallback window is seconds.
 
----
-
 ### 2. Popularity Signals and Market Dynamics
 
 Content discovery in an incentive-driven network requires nodes to learn what content is in demand *before* being asked to serve it. Two complementary signals provide this.
@@ -203,8 +195,6 @@ All three thresholds are configurable. All three trigger the same action: DHT FI
 
 DHT STORE and FIND_VALUE operations carry no protocol-level fee. The incentive to publish STORE records is indirect: advertising that you hold a blob attracts probe traffic, which converts to paid delivery. Charging for DHT operations would create a new attack surface (collect fee, fail to hold) requiring a new slash condition. All fees remain on delivery.
 
----
-
 ### 3. Interaction with Existing Protocols
 
 | Mechanism | Interaction with DHT |
@@ -216,8 +206,6 @@ DHT STORE and FIND_VALUE operations carry no protocol-level fee. The incentive t
 | Eviction hold ([ADR 005](005-protocol.md)) | Nodes stop re-publishing DHT records when a blob is evicted. TTL ensures stale records expire within 1 hour. |
 | Client discovery ([ADR 012](012-client.md)) | Clients use DHT FIND_VALUE for content discovery the same way nodes do. Probe fan-out bootstrap fallback applies equally. |
 
----
-
 ### 4. Schema Evolution
 
 `cdn/dht/v1` follows the standard evolution model from [ADR 013](013-schema-evolution.md):
@@ -227,8 +215,6 @@ DHT STORE and FIND_VALUE operations carry no protocol-level fee. The incentive t
 - **Major** (incompatible routing changes): new ALPN + migration period.
 
 `DhtMessage` uses a top-level enum consistent with the per-ALPN protocol enum pattern in [ADR 013 — Protocol Enums](013-schema-evolution.md#protocol-enums). Unknown variants are silently dropped.
-
----
 
 ### 5. Acceptance Criteria
 
@@ -241,13 +227,9 @@ DHT STORE and FIND_VALUE operations carry no protocol-level fee. The incentive t
 7. A node observing ≥5 FIND_VALUE queries for hash H within 5 minutes initiates a prefetch for H.
 8. A node suppressing `popular_hashes` entries for a popular blob experiences measurable `LoadHint` increase under sustained demand, verifiable in [Appendix: Observability](appendix-observability.md) metrics.
 
----
-
 ## Alternatives Considered
 
 The six discovery alternatives evaluated against `cdn/dht/v1` (broadcast probe fan-out as primary, gossip content announcements, hash-prefix range hints, iroh mainline DHT, indexer nodes, full libp2p Kademlia) are recorded in [`_history/alternatives-pre-launch.md` § ADR 022 — Content Discovery at Scale](_history/alternatives-pre-launch.md#adr-022--content-discovery-at-scale).
-
----
 
 ## Cross-ADR Consistency
 

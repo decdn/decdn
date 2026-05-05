@@ -33,7 +33,9 @@ This ADR specifies concrete on-chain mechanisms for both: `ecrecover`-based sign
 
 Nodes already register an Ethereum address (secp256k1-derived) alongside their Ed25519 NodeId in `StakingRegistry` ([ADR 003](003-payments.md)). This ADR leverages that existing binding: protocol messages carry a **second signature** using the node's Ethereum key, specifically for on-chain evidence.
 
-**Wire protocol additions.** `ProbeResponse` and `StreamResponse` each carry a `slash_sig` field, mandatory in this protocol version. Any future relaxation allowing `slash_sig` to be omitted from the wire would change field requiredness and therefore requires a Tier 3 / major-version ALPN bump per [ADR 013](013-schema-evolution.md), not a Tier 1 change. Production may instead relax *validation semantics* (e.g., accept zero-length `slash_sig`) while keeping the field always present on the wire:
+##### Wire protocol additions
+
+`ProbeResponse` and `StreamResponse` each carry a `slash_sig` field, mandatory in this protocol version. Any future relaxation allowing `slash_sig` to be omitted from the wire would change field requiredness and therefore requires a Tier 3 / major-version ALPN bump per [ADR 013](013-schema-evolution.md), not a Tier 1 change. Production may instead relax *validation semantics* (e.g., accept zero-length `slash_sig`) while keeping the field always present on the wire:
 
 ```
 ProbeResponse {has_blob, rate_per_mb, timestamp_us, signature, total_bytes?, slash_sig}
@@ -125,7 +127,9 @@ The contract verifies:
 
 The challenged node may call `SlashJudge.counterChallenge(challengeId, evidence)` within 24 hours. Valid counter-evidence is a requester-signed `DeliveryReceipt` from the same requester, proving the node delivered correct bytes for the same blob. `StreamEnd` itself is an unsigned wire message and cannot serve as on-chain evidence.
 
-**DeliveryReceipt.** After a stream completes and the requester's local BLAKE3 verification passes, the requester produces an EIP-712 signed receipt over:
+##### DeliveryReceipt
+
+After a stream completes and the requester's local BLAKE3 verification passes, the requester produces an EIP-712 signed receipt over:
 
 ```solidity
 bytes32 constant DELIVERY_RECEIPT_TYPEHASH = keccak256(
@@ -160,7 +164,9 @@ A unified contract that adjudicates all four slashable offense types. The contra
 
 #### Interface
 
-**Encoding convention.** The `bytes calldata` arguments named `*ResponseData` in the interface below are **ABI-encoded structs** matching the EIP-712 typed data fields (not postcard wire bytes). The contract ABI-decodes these fields, reconstructs the EIP-712 struct hash, and verifies using `SignatureChecker.isValidSignatureNow` ([ADR 024](024-account-abstraction.md)). This ensures a single canonical encoding for both the contract and off-chain signature construction.
+##### Encoding convention
+
+The `bytes calldata` arguments named `*ResponseData` in the interface below are **ABI-encoded structs** matching the EIP-712 typed data fields (not postcard wire bytes). The contract ABI-decodes these fields, reconstructs the EIP-712 struct hash, and verifies using `SignatureChecker.isValidSignatureNow` ([ADR 024](024-account-abstraction.md)). This ensures a single canonical encoding for both the contract and off-chain signature construction.
 
 ```solidity
 interface ISlashJudge {
@@ -211,7 +217,9 @@ interface ISlashJudge {
 }
 ```
 
-**Challenge rate limit.** `SlashJudge` enforces a maximum number of concurrent active (unresolved) challenges per target node address: `maxActiveChallengesPerNode` (PoC: 10, production safety bound: [1, 50]). New `submitPhantomChallenge`, `submitRateChallenge`, `submitBlacklistChallenge`, and `submitCorruptionChallenge` calls targeting a node at the limit MUST revert. This bounds the defender's concurrent counter-evidence response burden and prevents griefing attacks where a well-funded attacker submits many simultaneous spurious challenges to force operational disruption. The parameter is governable per [ADR 009](009-governance.md).
+##### Challenge rate limit
+
+`SlashJudge` enforces a maximum number of concurrent active (unresolved) challenges per target node address: `maxActiveChallengesPerNode` (PoC: 10, production safety bound: [1, 50]). New `submitPhantomChallenge`, `submitRateChallenge`, `submitBlacklistChallenge`, and `submitCorruptionChallenge` calls targeting a node at the limit MUST revert. This bounds the defender's concurrent counter-evidence response burden and prevents griefing attacks where a well-funded attacker submits many simultaneous spurious challenges to force operational disruption. The parameter is governable per [ADR 009](009-governance.md).
 
 #### Evidence Verification Per Offense Type
 
@@ -226,12 +234,15 @@ interface ISlashJudge {
 7. Verify `streamResponse.timestamp_us - probeResponse.timestamp_us < 30_000_000` (30-second window)
 8. Look up `challengedNode` in `StakingRegistry` — must be a registered node
 
-**Evidence staleness.** All challenge types MUST validate evidence age using a skew-safe comparison. Let `nowUs = block.timestamp * 1_000_000` and `evidence.timestamp_us` be the earliest `timestamp_us` from the submitted evidence messages (e.g., `probeResponse.timestamp_us` for phantom/rate challenges, `streamResponse.timestamp_us` for corruption/blacklist challenges that lack a probe). The contract MUST first require `evidence.timestamp_us <= nowUs + MAX_FUTURE_SKEW_US` (rejects far-future timestamps), then compute age without underflow: `ageUs = evidence.timestamp_us >= nowUs ? 0 : nowUs - evidence.timestamp_us`, and finally require `ageUs < MAX_EVIDENCE_AGE_US`. `MAX_EVIDENCE_AGE_US` is a governable parameter on `SlashJudge` (PoC: 5 days = 432,000,000,000 μs; safety bounds: [1 day, 30 days]). `MAX_FUTURE_SKEW_US` is fixed at 60,000,000 μs (60 seconds).
+##### Evidence staleness
 
-**Interaction with unbonding period.** `MAX_EVIDENCE_AGE_US` MUST be strictly less than the `StakingRegistry.unbondingPeriod` (converted to microseconds). If evidence can be older than the unbonding period, a node could commit an offense, immediately initiate unstaking, and complete withdrawal before the evidence is submitted — avoiding the slash entirely. With PoC defaults (evidence age: 5 days, unbonding: 7 days), this invariant is satisfied with a 2-day margin. The safety bounds ([1 day, 30 days] for evidence age vs [3 days, 30 days] for unbonding per [ADR 009](009-governance.md)) permit governance to violate this invariant — implementations SHOULD enforce `MAX_EVIDENCE_AGE_US < unbondingPeriod` whenever `MAX_EVIDENCE_AGE_US` is configured or updated, including at initialization and in any governance-controlled reconfiguration path.
+All challenge types MUST validate evidence age using a skew-safe comparison. Let `nowUs = block.timestamp * 1_000_000` and `evidence.timestamp_us` be the earliest `timestamp_us` from the submitted evidence messages (e.g., `probeResponse.timestamp_us` for phantom/rate challenges, `streamResponse.timestamp_us` for corruption/blacklist challenges that lack a probe). The contract MUST first require `evidence.timestamp_us <= nowUs + MAX_FUTURE_SKEW_US` (rejects far-future timestamps), then compute age without underflow: `ageUs = evidence.timestamp_us >= nowUs ? 0 : nowUs - evidence.timestamp_us`, and finally require `ageUs < MAX_EVIDENCE_AGE_US`. `MAX_EVIDENCE_AGE_US` is a governable parameter on `SlashJudge` (PoC: 5 days = 432,000,000,000 μs; safety bounds: [1 day, 30 days]). `MAX_FUTURE_SKEW_US` is fixed at 60,000,000 μs (60 seconds).
 
-**Rate manipulation:**
-1–3. Same `SignatureChecker` verification and identity check as phantom
+##### Interaction with unbonding period
+
+`MAX_EVIDENCE_AGE_US` MUST be strictly less than the `StakingRegistry.unbondingPeriod` (converted to microseconds). If evidence can be older than the unbonding period, a node could commit an offense, immediately initiate unstaking, and complete withdrawal before the evidence is submitted — avoiding the slash entirely. With PoC defaults (evidence age: 5 days, unbonding: 7 days), this invariant is satisfied with a 2-day margin. The safety bounds ([1 day, 30 days] for evidence age vs [3 days, 30 days] for unbonding per [ADR 009](009-governance.md)) permit governance to violate this invariant — implementations SHOULD enforce `MAX_EVIDENCE_AGE_US < unbondingPeriod` whenever `MAX_EVIDENCE_AGE_US` is configured or updated, including at initialization and in any governance-controlled reconfiguration path.
+
+**Rate manipulation:** 1–3. Same `SignatureChecker` verification and identity check as phantom
 4. Verify `streamResponse.rate_per_mb > probeResponse.rate_per_mb`
 5. Verify `probeResponse.hash == streamResponse.hash` (same blob)
 6–8. Same timestamp and registration checks as phantom

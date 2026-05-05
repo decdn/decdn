@@ -59,35 +59,57 @@ Each row identifies a discrete data exposure. The **ID** column is used for back
 
 A passive observer sees gossip messages, on-chain state, and QUIC connection metadata. The key concern is whether aggregating these signals reveals more than any single signal.
 
-**Content demand patterns (P-01, P-08).** `popular_hashes` in `NodeAnnounce` is the most explicit content-interest signal: it broadcasts the top-20 most-requested hashes per node at the default interval of 60 seconds to all peers. Combined with the deterministic nature of BLAKE3 hashes, a passive observer can build a per-node demand profile over time. This is a deliberate design choice — `popular_hashes` feeds the prefetching system ([ADR 001](001-network.md) §Prefetch Triggers) and cannot be removed without losing that capability.
+##### Content demand patterns (P-01, P-08)
 
-**Payment and identity linkability (P-02, P-03, P-07, P-14).** On-chain data permanently links client Ethereum addresses to provider Ethereum addresses via payment channels. Settlement amounts make node revenue computable. The `StakingRegistry` publishes node identity and network location. Reporter credibility in the reputation system leaks a node's settlement history. These are inherent to the accountability model: staking, slashing, and dispute resolution require on-chain identities and state. For the PoC (testnet with no real economic value), this is acceptable.
+`popular_hashes` in `NodeAnnounce` is the most explicit content-interest signal: it broadcasts the top-20 most-requested hashes per node at the default interval of 60 seconds to all peers. Combined with the deterministic nature of BLAKE3 hashes, a passive observer can build a per-node demand profile over time. This is a deliberate design choice — `popular_hashes` feeds the prefetching system ([ADR 001](001-network.md) §Prefetch Triggers) and cannot be removed without losing that capability.
 
-**Settlement volume leakage (P-22).** When a channel is settled on-chain, the final voucher nonce and cumulative amount are publicly visible. Since vouchers are issued per MB (default cadence), the nonce directly reveals the number of MB-sized increments transferred on that channel. Combined with P-02 (client/provider address linkage) and publicly known rate information, an observer can compute the exact volume of data transferred between a specific client-provider pair. This is inherent to the on-chain dispute model — the settlement amount must be public for dispute resolution to work.
+##### Payment and identity linkability (P-02, P-03, P-07, P-14)
 
-**Protocol fingerprinting (P-04).** ALPN negotiation in the QUIC TLS ClientHello reveals whether a connection is a probe, a paid stream, a watchtower interaction, or a key delivery session. A network-level observer can classify connections by type. This is standard for any QUIC-based multi-protocol system and is not considered a significant privacy concern — the protocols are not secret.
+On-chain data permanently links client Ethereum addresses to provider Ethereum addresses via payment channels. Settlement amounts make node revenue computable. The `StakingRegistry` publishes node identity and network location. Reporter credibility in the reputation system leaks a node's settlement history. These are inherent to the accountability model: staking, slashing, and dispute resolution require on-chain identities and state. For the PoC (testnet with no real economic value), this is acceptable.
 
-**Reputation gossip (P-05).** Signed `ReputationReport` messages on `cdn/reputation/v1` broadcast which nodes interact with which other nodes, with performance metrics and timestamps. This enables an observer to map the interaction graph. The 70/30 local/network weight split ([ADR 008](008-reputation.md) §2) limits the value of manipulating gossip, but does not reduce the observability of the data surface itself.
+##### Settlement volume leakage (P-22)
+
+When a channel is settled on-chain, the final voucher nonce and cumulative amount are publicly visible. Since vouchers are issued per MB (default cadence), the nonce directly reveals the number of MB-sized increments transferred on that channel. Combined with P-02 (client/provider address linkage) and publicly known rate information, an observer can compute the exact volume of data transferred between a specific client-provider pair. This is inherent to the on-chain dispute model — the settlement amount must be public for dispute resolution to work.
+
+##### Protocol fingerprinting (P-04)
+
+ALPN negotiation in the QUIC TLS ClientHello reveals whether a connection is a probe, a paid stream, a watchtower interaction, or a key delivery session. A network-level observer can classify connections by type. This is standard for any QUIC-based multi-protocol system and is not considered a significant privacy concern — the protocols are not secret.
+
+##### Reputation gossip (P-05)
+
+Signed `ReputationReport` messages on `cdn/reputation/v1` broadcast which nodes interact with which other nodes, with performance metrics and timestamps. This enables an observer to map the interaction graph. The 70/30 local/network weight split ([ADR 008](008-reputation.md) §2) limits the value of manipulating gossip, but does not reduce the observability of the data surface itself.
 
 #### T2: Active Protocol Participant
 
 An active participant can probe nodes, join gossip topics, and observe responses to their own protocol interactions. The primary additional concern is content access pattern leakage.
 
-**Probe content leakage (P-09, P-10, P-11).** When a client probes peers for a content hash, all probed nodes learn what is being requested. Probes triggered by cache misses are visible to the entire fan-out set, revealing regionally uncommon or newly requested content. The 15-second probe cache creates a tight timing correlation between probe and subsequent `StreamRequest`. However, probes are explicitly public information ([ADR 005](005-protocol.md)): node identities are in a public registry, content availability is discoverable via probing, and pricing is revealed by design. The protocol fundamentally requires the delivering node to know the requested hash. Mitigating leakage to non-delivering nodes (e.g., via dummy probes) adds bandwidth cost without changing the fundamental property.
+##### Probe content leakage (P-09, P-10, P-11)
 
-**Network enumeration (P-12, P-13).** Regional gossip topics are enumerable, and joining them reveals all participating nodes' identities and self-reported regions. Combined with `multiaddrs` from the on-chain registry, this enables geolocation. This is inherent to any system where nodes must be discoverable to serve content.
+When a client probes peers for a content hash, all probed nodes learn what is being requested. Probes triggered by cache misses are visible to the entire fan-out set, revealing regionally uncommon or newly requested content. The 15-second probe cache creates a tight timing correlation between probe and subsequent `StreamRequest`. However, probes are explicitly public information ([ADR 005](005-protocol.md)): node identities are in a public registry, content availability is discoverable via probing, and pricing is revealed by design. The protocol fundamentally requires the delivering node to know the requested hash. Mitigating leakage to non-delivering nodes (e.g., via dummy probes) adds bandwidth cost without changing the fundamental property.
 
-**`slash_sig` as content inventory proof (P-23).** Every `ProbeResponse` carries a `slash_sig` — an EIP-712 secp256k1 signature binding the node's Ethereum address to specific content hashes and timestamps ([ADR 014](014-on-chain-verification.md)). Any T2 participant that probes a node collects a non-repudiable, cryptographically verifiable proof that the node committed to having (or not having) specific content at a specific time. This is stronger than the unsigned `popular_hashes` signal (P-01) — it is individually attributable and EVM-verifiable. A party systematically probing nodes could build a cryptographic content inventory per node, keyed by Ethereum address. This is an inherent consequence of the on-chain slashing design: the `slash_sig` exists precisely to make node commitments provable. Removing it would eliminate on-chain slashability.
+##### Network enumeration (P-12, P-13)
 
-**Cross-session client tracking (P-21).** A persistent client NodeId allows any node that has served the client to correlate all past and future requests. Payment channels are keyed by Ethereum address ([ADR 012](012-client.md)), not NodeId, so NodeId rotation would not break the payment model. This is the most actionable privacy improvement with the lowest implementation cost.
+Regional gossip topics are enumerable, and joining them reveals all participating nodes' identities and self-reported regions. Combined with `multiaddrs` from the on-chain registry, this enables geolocation. This is inherent to any system where nodes must be discoverable to serve content.
+
+##### `slash_sig` as content inventory proof (P-23)
+
+Every `ProbeResponse` carries a `slash_sig` — an EIP-712 secp256k1 signature binding the node's Ethereum address to specific content hashes and timestamps ([ADR 014](014-on-chain-verification.md)). Any T2 participant that probes a node collects a non-repudiable, cryptographically verifiable proof that the node committed to having (or not having) specific content at a specific time. This is stronger than the unsigned `popular_hashes` signal (P-01) — it is individually attributable and EVM-verifiable. A party systematically probing nodes could build a cryptographic content inventory per node, keyed by Ethereum address. This is an inherent consequence of the on-chain slashing design: the `slash_sig` exists precisely to make node commitments provable. Removing it would eliminate on-chain slashability.
+
+##### Cross-session client tracking (P-21)
+
+A persistent client NodeId allows any node that has served the client to correlate all past and future requests. Payment channels are keyed by Ethereum address ([ADR 012](012-client.md)), not NodeId, so NodeId rotation would not break the payment model. This is the most actionable privacy improvement with the lowest implementation cost.
 
 #### T3: Infrastructure Operator
 
 Infrastructure operators have a privileged view of specific interaction channels.
 
-**RPC provider (P-15).** The RPC provider observes all on-chain queries: registry lookups, blacklist polling, rate-bounds checks. This reveals which nodes a client or node is interested in. The [architecture.md](architecture.md) trust assumptions already document this and plan multi-source bootstrap for production.
+##### RPC provider (P-15)
 
-**Watchtower (P-16).** Voucher updates expose channel activity patterns (amounts, frequency, session duration). [ADR 007](007-watchtower.md) acknowledges this: "the privacy impact is low — vouchers are not secret (the counterparty already has them) — but it is a new data surface." The watchtower sees no more than the channel counterparty already knows.
+The RPC provider observes all on-chain queries: registry lookups, blacklist polling, rate-bounds checks. This reveals which nodes a client or node is interested in. The [architecture.md](architecture.md) trust assumptions already document this and plan multi-source bootstrap for production.
+
+##### Watchtower (P-16)
+
+Voucher updates expose channel activity patterns (amounts, frequency, session duration). [ADR 007](007-watchtower.md) acknowledges this: "the privacy impact is low — vouchers are not secret (the counterparty already has them) — but it is a new data surface." The watchtower sees no more than the channel counterparty already knows.
 
 > **Aggregation risk:** Watchtower operators aggregate voucher update patterns across all monitored channels, providing a qualitatively broader payment activity view than any single bilateral counterparty. Production watchtower selection guidance SHOULD recommend using watchtowers operated by different entities than the node's primary business partners to limit cross-channel correlation.
 
@@ -97,11 +119,17 @@ Infrastructure operators have a privileged view of specific interaction channels
 
 Endpoint compromise yields secrets specific to that endpoint.
 
-**Client key material (P-18).** The PoC stores the iroh secret key unencrypted at `~/.decdn/iroh_key` ([ADR 012](012-client.md)). An attacker with file access gains the client's network identity. Production uses the platform keychain.
+##### Client key material (P-18)
 
-**Offline lease extraction (P-19).** A compromised device yields up to 500 `K_blob` values from the sealed offline lease ([Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md)). Mitigations are operational: device attestation, per-account device limits (3-5), audio watermarking, and behavioral detection. This is the same tradeoff every major streaming service makes.
+The PoC stores the iroh secret key unencrypted at `~/.decdn/iroh_key` ([ADR 012](012-client.md)). An attacker with file access gains the client's network identity. Production uses the platform keychain.
 
-**Epoch key derivation (P-20).** Compromising `server_secret` exposes all past and future epoch keys until rotation ([Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md)). Production mitigations (HSM-backed derivation, periodic rotation, audit log) are already specified in the encrypted-content-publishing appendix. This is the most significant cryptographic limitation but is a server-side concern, not a protocol privacy issue per se.
+##### Offline lease extraction (P-19)
+
+A compromised device yields up to 500 `K_blob` values from the sealed offline lease ([Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md)). Mitigations are operational: device attestation, per-account device limits (3-5), audio watermarking, and behavioral detection. This is the same tradeoff every major streaming service makes.
+
+##### Epoch key derivation (P-20)
+
+Compromising `server_secret` exposes all past and future epoch keys until rotation ([Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md)). Production mitigations (HSM-backed derivation, periodic rotation, audit log) are already specified in the encrypted-content-publishing appendix. This is the most significant cryptographic limitation but is a server-side concern, not a protocol privacy issue per se.
 
 ### 4. Disposition Summary
 

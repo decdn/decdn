@@ -123,7 +123,9 @@ final_score = 0.7 * local_score + 0.3 * network_score
 
 If a client has no local observations for a node (never interacted), it uses 100% network score.
 
-**Minimum reporter threshold.** A node's network reputation score requires reports from at least 3 distinct staked reporters before departing from the default 0.5 neutral score. This defends against gossip-layer eclipse attacks where an attacker controls all of a victim's gossip peers on `cdn/reputation/v1` and injects fabricated reports. Until the threshold is met, the node is treated as unscored rather than positively or negatively rated.
+#### Minimum reporter threshold
+
+A node's network reputation score requires reports from at least 3 distinct staked reporters before departing from the default 0.5 neutral score. This defends against gossip-layer eclipse attacks where an attacker controls all of a victim's gossip peers on `cdn/reputation/v1` and injects fabricated reports. Until the threshold is met, the node is treated as unscored rather than positively or negatively rated.
 
 ```mermaid
 flowchart TD
@@ -262,7 +264,9 @@ An operator's `final_score` (Section 5, after the per-report clamp in Section 8)
 | **Medium** | `[medium_rep_threshold, high_rep_threshold)` (default **[0.50, 0.70)**) | Stricter: `2 × N_std` distinct clients **and** `2 × B_std` minimum balance per contributing channel | Eligible — only receipts meeting the stricter thresholds count toward `bytes_delivered` |
 | **Low** | `< medium_rep_threshold` (default **< 0.50**) | n/a — receipts not accepted into the gauge counter | **Ineligible** — `bytes_delivered = 0` for gauge-share purposes until reputation recovers above `medium_rep_threshold` |
 
-**Concrete thresholds (`N_std`, `B_std`) live in ADR 027.** Treat them as parameters here; the scale factor (`1×` for High, `2×` for Medium, gating off at Low) is the load-bearing decision in this ADR. ADR 027's "below `medium_rep_threshold`" regime references the same parameter defined here (default 0.50, governable within `[0.30, 0.70]`); §12.1 is the canonical home for the value and bounds.
+##### Concrete thresholds (`N_std`, `B_std`) live in ADR 027
+
+Treat them as parameters here; the scale factor (`1×` for High, `2×` for Medium, gating off at Low) is the load-bearing decision in this ADR. ADR 027's "below `medium_rep_threshold`" regime references the same parameter defined here (default 0.50, governable within `[0.30, 0.70]`); §12.1 is the canonical home for the value and bounds.
 
 **Parameter table:**
 
@@ -279,9 +283,13 @@ The receipt protocol (ADR 027) ensures *individual* receipts are signed by disti
 
 The 2× scale factor and the Low-tier exclusion together raise the marginal cost of wash-traded gauge inflation by an operator with degraded service quality without affecting honest operators in good standing. Honest commodity operators stay in the High tier and pay only ADR 027's standard cost; honest small operators may sit in Medium during their cold-start period (Section 10's bootstrap bonus partially offsets) and accept the stricter receipt requirements as a transient cost.
 
-**Interaction with cold-start (Section 10).** The bootstrap bonus (`+0.05` additive) can pull a new operator from `final_score = 0.50` to `0.55`, still in Medium tier. The bonus does *not* alter receipt-tier classification — receipt-tier is computed from the unboosted `final_score`. This is intentional: the bootstrap bonus boosts *selection probability*, not gauge-pool credibility. New operators must build genuine track record (via real interactions and gossip reports from other staked nodes) to reach High tier; the bonus alone is insufficient.
+##### Interaction with cold-start (Section 10)
 
-**Interaction with the selection floor.** [ADR 001](001-network.md#node-selection-algorithm) clamps reputation at `0.1` for selection purposes only. Receipt-tier classification uses the *unclamped* `final_score`, so an operator at 0.05 is unambiguously Low-tier and gauge-ineligible — distinct from the selection-clamp behavior, which still permits (extremely disfavored) selection. The distinction matters because gauge eligibility is binary; selection probability is a continuous penalty.
+The bootstrap bonus (`+0.05` additive) can pull a new operator from `final_score = 0.50` to `0.55`, still in Medium tier. The bonus does *not* alter receipt-tier classification — receipt-tier is computed from the unboosted `final_score`. This is intentional: the bootstrap bonus boosts *selection probability*, not gauge-pool credibility. New operators must build genuine track record (via real interactions and gossip reports from other staked nodes) to reach High tier; the bonus alone is insufficient.
+
+##### Interaction with the selection floor
+
+[ADR 001](001-network.md#node-selection-algorithm) clamps reputation at `0.1` for selection purposes only. Receipt-tier classification uses the *unclamped* `final_score`, so an operator at 0.05 is unambiguously Low-tier and gauge-ineligible — distinct from the selection-clamp behavior, which still permits (extremely disfavored) selection. The distinction matters because gauge eligibility is binary; selection probability is a continuous penalty.
 
 #### 12.3 Reputation-recovery path
 
@@ -301,7 +309,9 @@ The reputation system can expose a per-operator **regional-coverage signal** —
 
 **This signal is not an input to `final_score` or to gauge-pool eligibility (Section 12).** It is an externally-readable per-operator attribute computed from the same gossip reports and local observations that drive Sections 3–4, exposed via the same gossip topic (`cdn/reputation/v1`) for downstream programs to consume.
 
-**Consumer.** Downstream operational programs (e.g., regional deployment grants, hardware-leasing subsidies, staking-loan approvals) may consult this signal as one input to their own decisions. The reputation system commits only to publishing the signal in a form those programs can read; eligibility decisions and thresholds belong to the consuming programs.
+#### Consumer
+
+Downstream operational programs (e.g., regional deployment grants, hardware-leasing subsidies, staking-loan approvals) may consult this signal as one input to their own decisions. The reputation system commits only to publishing the signal in a form those programs can read; eligibility decisions and thresholds belong to the consuming programs.
 
 The signal is intentionally lightweight (e.g., a small set of region-bucketed delivery-volume counters with the same EWMA / decay treatment as `local_score`); the precise aggregation mechanic and region taxonomy are out of scope for this ADR. The reputation system carries no logic that would deny eligibility based on region — that is each consuming program's sole prerogative.
 
