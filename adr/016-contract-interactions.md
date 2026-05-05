@@ -587,7 +587,7 @@ Every state-mutating function that makes an external call is listed below with i
 | `initiateNamespaceTransfer()` | None (state change only) | Caller must own the namespace |
 | `finalizeNamespaceTransfer()` | None (state change only) | Pending transfer must exist; current time ≥ `readyAt` |
 | `cancelNamespaceTransfer()` | None (state change only) | Caller must be the current owner |
-| `claimContent()` | None (state change only) | Caller must own the namespace; first-write-wins across non-zero namespaces |
+| `claimContent()` | None (state change only) | Caller must own the namespace; multi-claim per [ADR 002 § Multi-claim semantics](002-content-addressing.md#multi-claim-semantics) — reverts only if THIS namespace has already claimed THIS hash (idempotency); other namespaces' prior claims do not block |
 
 No external calls; no funds held. `nonReentrant` is not required but is included on state-mutating functions for defense-in-depth.
 

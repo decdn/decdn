@@ -27,13 +27,26 @@ A **publisher** is an Ethereum address that has registered through the `Publishe
 
 A **namespace** is a publisher-owned `uint256` identifier under which blob hashes are claimed. Publishers may register multiple namespaces (subject to the anti-squatting cap in [ADR 009](009-governance.md)) so that distinct content sets can be governed independently — for example, a media company may operate one namespace per product line so that takedowns and origin assignments for one product do not entangle the others.
 
-A **content claim** is an on-chain binding of a `(namespaceId, blake3Hash)` pair, recorded by the namespace's owner via `PublisherRegistry.claimContent`. Claims are append-only and content-immutable: once a hash is claimed under a namespace it cannot be moved, but the underlying bytes are untouched (BLAKE3 makes the hash binding cryptographic). Claims are the authoritative on-chain answer to "is this blob in a registered namespace, and if so which one?".
+A **content claim** is an on-chain binding of a `(namespaceId, blake3Hash)` pair, recorded by the namespace's owner via `PublisherRegistry.claimContent`. Claims are append-only and content-immutable: a claim, once recorded, cannot be moved or revoked; the underlying bytes are untouched (BLAKE3 makes the hash binding cryptographic). Multiple non-zero namespaces may claim the same hash independently, with no coordination between publishers — see [§ Multi-claim semantics](#multi-claim-semantics) below. Claims are the authoritative on-chain answer to "which registered namespaces, if any, claim this blob?".
 
 ### Default-open namespace
 
 A reserved namespace ID (`namespaceId == 0`) is the **default-open namespace**. Any blob is implicitly claimed under it; no `claimContent` call is required. Operators authorized by the DAO via the default-open allow-list (see [ADR 011 § Default-open allow-list](011-content-takedown.md#default-open-allow-list)) may serve as origin for default-open blobs; cache-only serving by any staked operator remains permissionless. The allow-list is the single global authority over default-open origin behaviour; until governance activates a non-empty list at least once, the bootstrap rule preserves the prior permissive semantics so PoC and pre-activation deployments are not stranded. Publishers seeking per-content durability guarantees, takedown accountability, or namespace-scoped origin sets opt in by registering and claiming under a non-zero namespace.
 
-A blob may be claimed under at most one non-zero namespace. If a publisher wants to assert ownership of a blob currently in default-open, the claim succeeds and the blob is thereafter governed under the registered namespace; the default-open implicit claim is overridden. Two publishers attempting to claim the same hash under different namespaces is resolved first-write-wins at the contract layer (see [ADR 016](016-contract-interactions.md) for the dispute resolution rules and the consequences if a second claim is rejected).
+Default-open is the operative regime for any hash with no non-zero claims; once at least one non-zero namespace claims the hash, those namespaces' authorized operator sets become origin authorities for that hash alongside the default-open allow-list (see [§ Multi-claim semantics](#multi-claim-semantics)).
+
+### Multi-claim semantics
+
+Any number of non-zero namespaces may claim the same `blake3Hash`, by independent publishers, with no coordination. Each claim registers a namespace as a responsible origin authority for the hash. The set of operators authorized to serve the hash as origin at time `t` is the union of the operator sets across all namespaces that had claimed the hash by `t`, plus the default-open allow-list if the hash is also unclaimed under any non-zero namespace at `t`.
+
+This design choice is deliberate. A first-write-wins / one-claim rule would create two failure modes:
+
+- **Stranded hashes.** A namespace owner who loses keys, abandons, or refuses cooperation strands every hash they have claimed: no path exists for another publisher or the DAO to authorize fresh origin operators for that hash. The namespace lifecycle (revocation, transfer) all require the current owner.
+- **Squatting.** Any party could pre-claim popular hashes (e.g., a future release ISO's BLAKE3) and block the legitimate publisher, with no anti-squatting mechanism short of governance overrides.
+
+Multi-claim eliminates both: claims do not block other claims; defunct namespaces do not block alternative origin authorities; squatting gates nothing because the squatter cannot prevent independent claims. The trade-off — that the protocol no longer presents an on-chain claim as "the official publisher of this content" — is accepted because that framing is not load-bearing on any protocol primitive: slashing, takedown, and probe verification are hash-keyed and operator-keyed, never publisher-keyed.
+
+`SlashJudge` evaluates phantom-origin evidence by an OR-search over the claiming-namespace set at the response timestamp — see [ADR 011 § Historical state and slashing evidence](011-content-takedown.md#historical-state-and-slashing-evidence). The signed `ProbeResponse` schema is unchanged: the signer asserts authorization as a property of the world (`is_origin: true` for this hash at this time), and the protocol verifies that the property holds against any one of the claiming authorities.
 
 ### Why this lives in ADR 002
 
@@ -57,17 +70,18 @@ interface IPublisherRegistry {
     function cancelNamespaceTransfer(uint256 namespaceId) external;
 
     // Content claim — only callable by the namespace's current owner.
-    // First-write-wins across non-zero namespaces; reverts if the hash is already
-    // claimed under a different non-zero namespace. Claiming a hash currently
-    // implicit in default-open (namespaceId == 0) succeeds and overrides.
+    // Multi-claim: any number of non-zero namespaces may claim the same hash
+    // independently. Reverts only if THIS namespace has already claimed this
+    // hash (idempotency); other namespaces' prior claims do not block.
     function claimContent(uint256 namespaceId, bytes32 blake3Hash) external;
 
     // Views
-    function namespaceOf(bytes32 blake3Hash) external view returns (uint256 namespaceId);
+    function namespaceOf(bytes32 blake3Hash) external view returns (uint256[] memory namespaceIds);
     // Historical view used by SlashJudge for phantom-origin evidence: returns
-    // the namespace this hash was bound to at `timestamp`. Returns 0 if the hash
-    // was unclaimed (default-open) at that time.
-    function namespaceOfAt(bytes32 blake3Hash, uint64 timestamp) external view returns (uint256 namespaceId);
+    // the set of non-zero namespaces this hash was claimed under at `timestamp`,
+    // in the time order they were claimed. An empty array means the hash was
+    // operating under default-open semantics at that time.
+    function namespaceOfAt(bytes32 blake3Hash, uint64 timestamp) external view returns (uint256[] memory namespaceIds);
     function ownerOf(uint256 namespaceId) external view returns (address);
     function namespaceCount(address publisher) external view returns (uint256);
     function pendingTransfer(uint256 namespaceId) external view returns (address newOwner, uint256 readyAt);
@@ -81,9 +95,9 @@ interface IPublisherRegistry {
 }
 ```
 
-`namespaceOf(hash)` returns `0` for any hash not explicitly claimed; that is the default-open namespace. The view never reverts on unknown hashes — callers cannot distinguish "hash unknown to the protocol" from "hash served as default-open" via this view, which is correct: both states are operationally identical.
+`namespaceOf(hash)` returns an empty array for any hash not explicitly claimed; default-open semantics apply. The view never reverts on unknown hashes — callers cannot distinguish "hash unknown to the protocol" from "hash served as default-open" via this view, which is correct: both states are operationally identical.
 
-`namespaceOfAt(hash, timestamp)` is the historical counterpart used by `SlashJudge` to evaluate phantom-origin evidence at the timestamp embedded in a signed `ProbeResponse` (see [ADR 005 § cdn/probe/v1](005-protocol.md#cdnprobev1--latency-probe)). It returns `0` for any timestamp before the hash was claimed, otherwise the namespace it was bound to at that time. Because content claims are append-only — a hash may move from default-open (`0`) to a non-zero namespace exactly once and never moves again — the historical lookup needs to store only a single `(namespaceId, claimedAt)` entry per claimed hash, and the view is `t < claimedAt[hash] ? 0 : namespaceId[hash]`.
+`namespaceOfAt(hash, timestamp)` is the historical counterpart used by `SlashJudge` to evaluate phantom-origin evidence at the timestamp embedded in a signed `ProbeResponse` (see [ADR 005 § cdn/probe/v1](005-protocol.md#cdnprobev1--latency-probe)). Storage is a per-hash append-only array of `(namespaceId, claimedAt)` entries; the view returns the subset whose `claimedAt <= timestamp`. Because claims are content-immutable (append-only, never moved or revoked), the array only grows, and the historical view is monotonic in `timestamp`.
 
 Per-publisher namespace cap and ownership-transfer timelock are governable parameters with safety bounds (see [ADR 009](009-governance.md)). The 7-day default transfer timelock is documented for clarity; the contract reads its current value from the governance-controlled parameter store at call time.
 

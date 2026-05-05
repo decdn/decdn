@@ -268,7 +268,15 @@ The contract enforces `operators.length >= minRedundancy` at proposal time and a
 
 ### Historical state and slashing evidence
 
-Phantom-origin slashing requires `SlashJudge` to verify that an operator was *not* in a namespace's authorized set at the timestamp of a signed `ProbeResponse` (see [ADR 005 § cdn/probe/v1](005-protocol.md#cdnprobev1--latency-probe)). Mutating storage in place would make this impossible to evaluate retroactively — an honest operator that was authorized at probe time could be revoked an hour later and then falsely slashed using the now-stale probe response.
+Phantom-origin slashing requires `SlashJudge` to verify that an operator was *not* in any claiming namespace's authorized set at the timestamp of a signed `ProbeResponse` (see [ADR 005 § cdn/probe/v1](005-protocol.md#cdnprobev1--latency-probe)). Because a hash may be claimed by multiple namespaces independently ([ADR 002 § Multi-claim semantics](002-content-addressing.md#multi-claim-semantics)), the predicate is a disjunction:
+
+```
+authorized(operator, hash, t)  :=
+    (∃ ns ∈ namespaceOfAt(hash, t)  such that  isAuthorizedOriginAt(ns, operator, t))
+    ∨  (namespaceOfAt(hash, t) is empty  AND  defaultOpenAuthorizedAt(operator, t))
+```
+
+`namespaceOfAt` returns the set of non-zero namespaces that had claimed `hash` at `t`. The OR-loop is bounded by the size of that set (typically `0`–`1` for long-tail content; small constant `K` for popular hashes co-claimed by multiple distributors). The signed `ProbeResponse` schema is unchanged — the signer asserts authorization as a property of the world, and `SlashJudge` verifies the property holds against any one claiming authority. Mutating storage in place would make this impossible to evaluate retroactively — an honest operator that was authorized at probe time could be revoked an hour later and then falsely slashed using the now-stale probe response.
 
 `OriginAssignment` therefore stores a per-(namespace, operator) checkpoint history: an append-only array of `{activatedAt, revokedAt}` entries. `revokedAt = type(uint64).max` marks an entry as currently active. `isAuthorizedOriginAt(namespaceId, operator, t)` returns `true` iff some checkpoint satisfies `activatedAt <= t < revokedAt`. The query is O(log N) with binary search over the checkpoint array; in practice `N` per pair is tiny (most operators are activated once, revoked once, never re-activated).
 
