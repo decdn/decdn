@@ -92,8 +92,6 @@ interface IPublisherRegistry {
 
 Per-publisher namespace cap and ownership-transfer timelock are governable parameters with safety bounds (see [ADR 009](009-governance.md)). The 7-day default transfer timelock is documented for clarity; the contract reads its current value from the governance-controlled parameter store at call time.
 
-> **PoC simplification.** During the PoC, `PublisherRegistry` is admin-key controlled (the deployer EOA can override any publisher action) consistent with the broader admin-key governance model in [ADR 009](009-governance.md). The interface above describes the production semantics; the PoC adds an `onlyOwner` escape hatch that is removed when admin authority transfers to the timelock.
-
 ## Consequences
 
 **Positive:**
