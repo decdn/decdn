@@ -167,7 +167,7 @@ pub async fn evict(args: &cli::EvictArgs, global_config: Option<&Path>) -> anyho
 fn write_dry_run_human(w: &mut impl io::Write, hash: &str, resp: &EvictResponse) -> io::Result<()> {
     writeln!(w, "hash={hash}")?;
     writeln!(w, "dry_run=true")?;
-    writeln!(w, "would_serve={}", resp.was_present)?;
+    writeln!(w, "was_present={}", resp.was_present)?;
     writeln!(w, "pinned={}", resp.preview.pinned)?;
     writeln!(w, "already_evicted={}", resp.preview.already_evicted)?;
     match resp.preview.size_bytes {
@@ -849,7 +849,7 @@ mod tests {
         let s = String::from_utf8(buf)?;
         assert!(s.contains("hash=abcd"), "missing hash: {s}");
         assert!(s.contains("dry_run=true"), "missing dry_run tag: {s}");
-        assert!(s.contains("would_serve=true"), "missing would_serve: {s}");
+        assert!(s.contains("was_present=true"), "missing was_present: {s}");
         assert!(s.contains("pinned=true"), "missing pinned: {s}");
         assert!(
             s.contains("already_evicted=false"),
