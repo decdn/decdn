@@ -16,6 +16,7 @@ use std::pin::Pin;
 use anyhow::Context;
 use bytes::Bytes;
 use iroh_blobs::Hash;
+use tokio::io::AsyncReadExt;
 
 use super::{Origin, OriginFetch};
 
@@ -113,13 +114,18 @@ impl Origin for FilesystemOrigin {
                 );
             }
 
-            // Stat the canonical path so a known-oversize file is rejected
-            // without ever reading it into memory — mirrors the HTTP
-            // origin's Content-Length fast-path. Using the canonical
-            // path also means the metadata + read pair operate on the
-            // same already-resolved target, not the symlink we started
-            // from.
-            let meta = tokio::fs::metadata(&canonical).await.with_context(|| {
+            // Open once and stat via the file handle (fstat), so the
+            // metadata we check and the bytes we read come from the
+            // same inode. A pair of `tokio::fs::metadata` + `tokio::fs::read`
+            // on the same path leaves a TOCTOU window where the path
+            // could be swapped for a much larger file or a different
+            // symlink between the two syscalls — the size cap would
+            // run on stale metadata. Holding the fd avoids that, and
+            // also saves a redundant path traversal.
+            let mut file = tokio::fs::File::open(&canonical).await.with_context(|| {
+                format!("cache.origin_path open failed for {}", canonical.display())
+            })?;
+            let meta = file.metadata().await.with_context(|| {
                 format!("cache.origin_path stat failed for {}", canonical.display())
             })?;
 
@@ -138,7 +144,16 @@ impl Origin for FilesystemOrigin {
                 );
             }
 
-            let data = tokio::fs::read(&canonical).await.with_context(|| {
+            // Pre-size to `len` to skip Vec growth reallocations. The
+            // cap above bounds `max_bytes`, which the operator
+            // configures, so the conversion to `usize` is safe on any
+            // platform we ship to. `read_to_end` will still grow the
+            // buffer if the file gets longer mid-read, which is fine
+            // (the engine's BLAKE3 check will reject the result if the
+            // bytes don't match the requested hash).
+            let cap = usize::try_from(len).unwrap_or(usize::MAX);
+            let mut data = Vec::with_capacity(cap);
+            file.read_to_end(&mut data).await.with_context(|| {
                 format!("cache.origin_path read failed for {}", canonical.display())
             })?;
             Ok(OriginFetch::Found(Bytes::from(data)))
