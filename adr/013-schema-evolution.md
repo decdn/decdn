@@ -270,7 +270,6 @@ struct NodeAnnounceBody {
     node_id: NodeId,
     region: String,  // ISO 3166-1 alpha-2
     load: LoadHint,
-    popular_hashes: Vec<Hash>,
     timestamp_us: u64,
 }
 
@@ -343,7 +342,7 @@ Signatures are computed over a specific byte sequence produced by postcard seria
 | --- | --- | --- |
 | `ProbeResponse` | `hash`, `has_blob`, `rate_per_mb`, `timestamp_us` | `total_bytes` |
 | `StreamResponse` | `hash`, `ok`, `rate_per_mb`, `total_bytes`, `channel_id`, `timestamp_us`, `redirect` | `error`, `voucher_interval_mb` |
-| `NodeAnnounce` | `node_id`, `region`, `load`, `popular_hashes`, `timestamp_us` | *(none currently — see implementation note)* |
+| `NodeAnnounce` | `node_id`, `region`, `load`, `timestamp_us` | *(none currently — see implementation note)* |
 | `ReputationReport` | `provider`, `reporter`, `metrics`, `timestamp` | *(none currently)* |
 
 #### Implementation note — separating signed and unsigned fields
@@ -357,7 +356,6 @@ struct NodeAnnounceBody {
     node_id: NodeId,
     region: String,  // ISO 3166-1 alpha-2, e.g. "US"
     load: LoadHint,
-    popular_hashes: Vec<Hash>,
     timestamp_us: u64,
 }
 

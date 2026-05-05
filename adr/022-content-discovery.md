@@ -163,15 +163,7 @@ At PoC scale (30 nodes) the routing table is fully populated after a single self
 
 Content discovery in an incentive-driven network requires nodes to learn what content is in demand *before* being asked to serve it. Two complementary signals provide this.
 
-#### 2.1 Signal 1: `popular_hashes` Gossip (Advisory)
-
-`NodeAnnounce` carries `popular_hashes` (up to 20 hashes, per [ADR 001](001-network.md)) — a self-reported list of the most-requested hashes a node is actively serving. A node observing hash H in multiple peers' `popular_hashes` lists (default: 3+ peers within 10 minutes) treats H as network-popular and prefetches proactively.
-
-**Integrity:** `popular_hashes` is self-reported and unenforceable. A node could suppress entries to maintain pricing advantage by preventing competitors from prefetching the same content.
-
-**Suppression is economically self-limiting.** A node hiding popular hash H concentrates all demand on itself. Concentrated demand raises its `LoadHint`. Higher `LoadHint` depresses its unified selection score, causing clients to route around it. Under sustained load, suppressing `popular_hashes` reduces earnings — the market corrects without protocol enforcement. This is accepted: `popular_hashes` affects selection quality, not safety.
-
-#### 2.2 Signal 2: DHT FIND_VALUE Query Frequency (Non-Suppressible)
+#### 2.1 Signal 1: DHT FIND_VALUE Query Frequency (Non-Suppressible)
 
 In Kademlia, `FindValueRequest` messages for hash H are routed to nodes closest to H in keyspace **regardless of whether those nodes hold H**. A node close to H in keyspace receives all FIND_VALUE queries for H from the entire network without holding H and without receiving any gossip.
 
@@ -183,17 +175,20 @@ This creates a **natural popularity oracle that cannot be suppressed**:
 
 The signal is honest by construction: FIND_VALUE traffic reflects real client demand, not voluntary self-reporting. No node can suppress it — the routing traffic arrives regardless of what anyone gossips.
 
+#### 2.2 Signal 2: Local Cache-Miss Frequency
+
+Each node tracks cache miss timestamps per hash in a bounded map ([ADR 001 § Prefetching from Local Demand](001-network.md)). A hash crossing the local-miss threshold (default: 3 misses in 5 minutes) is prefetched proactively.
+
 #### 2.3 Prefetch Decision
 
-A node prefetches hash H when **any** signal crosses its threshold:
+A node prefetches hash H when **either** signal crosses its threshold:
 
 | Signal | Default threshold | Action |
 |--------|-------------------|--------|
-| `popular_hashes` appearances | ≥3 distinct peers within 10 min | DHT lookup → pull → STORE publish |
 | FIND_VALUE query rate for H | ≥5 queries within 5 min | DHT lookup → pull → STORE publish |
 | Local miss rate for H | ≥3 misses within 5 min | DHT lookup → pull → STORE publish |
 
-All three thresholds are configurable. All three trigger the same action: DHT FIND_VALUE lookup to find a provider, pull via `cdn/client/v1` (paid), cache locally, publish STORE record.
+Both thresholds are configurable. Both trigger the same action: DHT FIND_VALUE lookup to find a provider, pull via `cdn/client/v1` (paid), cache locally, publish STORE record.
 
 #### 2.4 No Discovery Fees
 
@@ -205,7 +200,7 @@ DHT STORE and FIND_VALUE operations carry no protocol-level fee. The incentive t
 |-----------|---------------------|
 | `cdn/probe/v1` | Unchanged. DHT provides candidates; `cdn/probe/v1` confirms live availability and measures latency. Probe cache (15s TTL, [ADR 001](001-network.md)) still prevents redundant probes for recently confirmed providers. |
 | `cdn/client/v1` | Unchanged. All delivery is paid; DHT affects only how providers are discovered. |
-| `NodeAnnounce` gossip | Unchanged. `popular_hashes` field reused as Signal 1. No new gossip message types. |
+| `NodeAnnounce` gossip | Unchanged. Carries node-level metadata only (region, load); demand signals are derived from DHT FIND_VALUE traffic and local cache misses. No new gossip message types. |
 | Reputation system ([ADR 008](008-reputation.md)) | A node publishing a false STORE record fails at probe time → reputation penalty → fewer clients selected. No new slash condition needed. |
 | Eviction hold ([ADR 005](005-protocol.md)) | Nodes stop re-publishing DHT records when a blob is evicted. TTL ensures stale records expire within 1 hour. |
 | Client discovery ([ADR 012](012-client.md)) | Clients use DHT FIND_VALUE for content discovery the same way nodes do. Probe fan-out bootstrap fallback applies equally. |
@@ -229,7 +224,7 @@ DHT STORE and FIND_VALUE operations carry no protocol-level fee. The incentive t
 5. A false STORE record (node claims to hold a blob it doesn't) fails at the probe step; the publishing node incurs a reputation penalty within one gossip cycle.
 6. During bootstrap (routing table < k entries), broadcast probe fan-out is used as fallback; the fallback window completes within 2 self-lookup rounds.
 7. A node observing ≥5 FIND_VALUE queries for hash H within 5 minutes initiates a prefetch for H.
-8. A node suppressing `popular_hashes` entries for a popular blob experiences measurable `LoadHint` increase under sustained demand, verifiable in [Appendix: Observability](appendix-observability.md) metrics.
+8. Demand signals derive from DHT FIND_VALUE traffic and local cache-miss timestamps; both are emitted as observability metrics in [Appendix: Observability](appendix-observability.md).
 
 ## Alternatives Considered
 
