@@ -445,23 +445,17 @@ A malicious closer bribes the watchtower to withhold the counter-voucher during 
 
 Mitigated by redundancy: with 2–3 independent watchtowers, the attacker must bribe all of them. The bribe must exceed the watchtower's monitoring fee income plus reputational cost. For small channels the economics don't justify the coordination cost; for large channels the fee income and reputational stakes are proportionally higher.
 
----
-
 ### Collusion with counterparty
 
 The watchtower and the attacker are the same entity or are colluding.
 
 Mitigated by diverse selection: the watched party should choose watchtowers operated by different entities, ideally in different jurisdictions and on different infrastructure. Node software should warn if all configured watchtowers resolve to the same IP range or Ethereum address. Future on-chain watchtower staking would make collusion costlier (the colluding watchtower's stake is at risk if liveness failure is proven).
 
----
-
 ### Liveness failure (honest)
 
 All watchtowers go offline simultaneously during a dispute window due to infrastructure failure, DDoS, or correlated outage.
 
 The dispute window (48h PoC default, governable 12h–72h) is the primary buffer. For all 3 independent watchtowers to be offline for the full dispute window (48 consecutive hours by default) requires a severe correlated event. The local dispute monitor (defense-in-depth) provides an additional layer — even if all watchtowers fail, the node itself can respond if it comes back online within the dispute window. Additionally, the watched party's software alerts the operator when watchtower connections drop, giving them time to manually submit the latest voucher.
-
----
 
 ### L2 sequencer censorship
 
@@ -485,15 +479,11 @@ Constraints on the extension mechanism:
 - **Only forced-inclusion transactions.** Normal sequencer-included `disputeChannel` calls do not trigger the extension, preventing abuse.
 - **L2-specific detection.** Identifying a forced-inclusion transaction is inherently L2-specific. On Arbitrum, this can be detected via the `ArbSys` precompile or delayed inbox origin; on OP Stack, via L1 message origin. The exact detection logic is a parameter of the L2 chain selection decision (architecture.md, not yet decided) and will be finalized when the L2 is chosen.
 
----
-
 ### Fee extraction without service
 
 A watchtower collects monitoring fees but never actually watches the chain.
 
 Mitigated by periodic liveness testing: the watched party can open a test channel (small deposit), initiate a stale close, and verify the watchtower disputes within a reasonable time (e.g., 1 hour). If the watchtower fails the test, the watched party drops it and selects a replacement. This is off-chain verification — no contract support needed. Future watchtower staking with slashing for proven liveness failures provides stronger guarantees but is deferred.
-
----
 
 ### Voucher state desynchronisation
 
@@ -503,23 +493,17 @@ This is a partial-protection scenario, not a total failure. Mitigation: the watc
 
 With negotiable voucher intervals ([ADR 003](003-payments.md#voucher-interval-negotiation)), larger gaps between voucher updates increase the potential value lost during a desynchronisation event. At a 100 MB interval and market rate, the worst case is the watchtower is one interval behind — a $0.001 discrepancy. At the governance maximum (~1 GB) and ceiling rate ($0.001/MB), the worst-case discrepancy is $1.024. Operators delivering high-value large blobs should weigh the tradeoff between fewer voucher round-trips and larger desynchronisation exposure when choosing an interval.
 
----
-
 ### Sophisticated wash-trading defeats §1a heuristics
 
 A determined attacker funds N distinct addresses through N distinct on-ramps (separate CEX accounts, separate fiat sources, separate KYC identities) and runs a varied traffic-generation profile that avoids the periodicity and byte-pattern signatures the watchtower flags in §1a.
 
 This is the acknowledged ceiling of heuristic detection. Mitigations are layered, per [ADR 026](026-gauge-boost-tokenomics.md) §Risks: (1) per-settlement gas raises the per-fake-byte cost; (2) the FeeRouter skim ensures self-routed traffic is net-negative without significant TOKEN appreciation; (3) [ADR 027](027-distinct-client-receipts.md) distinct-client receipts require *signed* counterparty distinctness from identities that pass [ADR 008](008-reputation.md) reputation gating, raising the cost of obtaining the underlying client identities; (4) multiple independent watchtowers cross-check each other's flag outputs, and a single watchtower's failure to detect does not prevent another from challenging. The watchtower's job is to make the cheap, single-funder, periodic-pattern attacks visible — not to provide a cryptographic proof of honesty.
 
----
-
 ### False-positive wash-trading accusations (griefing operators)
 
 A malicious watchtower, or a watchtower whose §1a heuristics misfire, raises a receipt-fraud challenge against an honest operator with no genuine evidence — purely to disrupt the operator's gauge-pool payout for the contested epoch.
 
 Mitigated by the existing challenge-bond mechanic ([ADR 014](014-on-chain-verification.md#bond-handling)) carried over per §1c: a dismissed challenge forfeits the watchtower's bond (50% burned, 50% to the operator). The operator's counter-evidence path is the standard 24h window with valid distinct-client receipts. The bond cost is the rate limiter; an attacker would need to pay the bond per spurious challenge, and operators' counter-evidence path is well-defined. Repeated dismissed challenges from the same watchtower trigger reputation degradation in [ADR 008](008-reputation.md) and may warrant removal from the operator's configured watchtower set.
-
----
 
 ### Receipt validator collusion with operator
 

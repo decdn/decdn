@@ -5,8 +5,6 @@
 **Required for:** [ADR 026](026-gauge-boost-tokenomics.md) gauge-pool security
 **Touches:** [ADR 003](003-payments.md), [ADR 007](007-watchtower.md), [ADR 008](008-reputation.md), [ADR 014](014-on-chain-verification.md)
 
----
-
 ## Context
 
 [ADR 026 §3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula) defines the gauge-pool share as a function of `bytes_i` (verified bytes per operator) and `ve_i / total_ve` (the operator's ve-share). The formula bounds the *output* but says nothing about whether the *input* `bytes_i` is honest. The on-chain `claimedBytes` reaching `FeeRouter.routeSettlement` ([ADR 003](003-payments.md)) is signed by *some* address that opened a payment channel — nothing today prevents the operator from running both sides.
@@ -18,8 +16,6 @@
 Defense: byte counters that feed the gauge formula must be attested by **distinct, verifiable client identities** — counterparties the operator does not control. The voucher protocol from [ADR 003](003-payments.md) already proves *bytes were paid for*; this ADR adds a parallel artifact that proves *bytes were paid for by independent counterparties* and gates gauge eligibility on that artifact.
 
 This ADR is forward-referenced from [ADR 026 §Risks](026-gauge-boost-tokenomics.md#risks) and [ADR 026 §Forward references](026-gauge-boost-tokenomics.md#forward-references-follow-up-adrs) as priority-1, **not optional for production launch**.
-
----
 
 ## Decision
 
@@ -232,8 +228,6 @@ This is consistent with [ADR 026 §Forward references](026-gauge-boost-tokenomic
 
 Format and client/operator libraries → contract paths deployed in parallel-run mode (no enforcement) → watchtower module + heuristic library → reputation integration → cutover (gauge gating on, `MIN_DISTINCT_CLIENTS_PER_EPOCH` active). The cutover is launch readiness.
 
----
-
 ## Consequences
 
 ### Positive
@@ -263,4 +257,3 @@ Format and client/operator libraries → contract paths deployed in parallel-run
 - **Privacy-vs-defense tension.** Aggressive privacy upgrades (zero-knowledge identity-diversity proofs in [ADR 017](017-privacy.md)) complicate the funding-source diversity heuristic — the watchtower can no longer trace ancestry if identities are private. Tension to resolve in [ADR 017](017-privacy.md) when that path matures; this ADR ships with cleartext receipts.
 - **Non-receipt-aware client wallets.** Clients without receipt-aware wallets produce voucher-only deliveries that are settled and paid normally, but their bytes do not credit gauge eligibility. Operators receiving such traffic carry the cost of pure-base economics for it. Acceptable — receipt-aware client libraries ship in the launch SDK; non-receipt-aware traffic is an asymptote that shrinks as the SDK propagates.
 
----

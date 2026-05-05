@@ -243,8 +243,6 @@ The client queries all configured seed domains, cross-checks returned NodeIds ag
 2. ~~**Delegated voucher signer:**~~ Resolved — [ADR 024](024-account-abstraction.md) specifies Safe session keys as the mechanism for high-frequency voucher signing, replacing both the derived hot key and the delegated signer contract approach (PR 196).
 3. **Mobile/web clients:** This ADR assumes a desktop/server client with filesystem access. Mobile and web clients are listed as non-goals in the architecture overview but may need adapted key storage and bootstrap mechanisms.
 
----
-
 ## Multi-Node Parallel Download
 
 A client can split a large blob across N nodes and download each byte range in parallel (BitTorrent-style). This is opt-in via a CLI flag:
@@ -275,8 +273,6 @@ One payment channel per node; channel deposit sized for its assigned range plus 
 ### Failure handling
 
 Node failure mid-range: re-probe for a replacement, resume from last BLAKE3-verified byte within the range via `byte_offset`, open a new channel for the remaining bytes.
-
----
 
 ## Download Resume and Crash Recovery
 
@@ -342,8 +338,6 @@ decdn downloads clean --all       # remove all downloads including in-progress
 
 State directories older than 30 days with no progress (`verified_offset = -1`) are treated as abandoned and purged by `clean`.
 
----
-
 ## File Manifests and Reconstruction
 
 Large files are split into chunks at ingest time. A **manifest blob** describes the ordered list of chunk hashes; its BLAKE3 hash is the canonical file identifier shared out-of-band.
@@ -387,8 +381,6 @@ Chunk part files are **retained by default** after reconstruction so the client 
 ### Backward compatibility
 
 Raw single-blob downloads are unchanged. The client checks the `DECDNMAN` magic header; on failure (wrong or missing magic) it treats the bytes as a raw blob. Content providers signal manifest vs. raw out-of-band.
-
----
 
 ## ADRs Affected
 

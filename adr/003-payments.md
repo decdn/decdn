@@ -165,8 +165,6 @@ Client receives bytes but stops signing vouchers, getting content for free up to
 
 The self-enforcing stop is sufficient. Maximum loss is one voucher interval at the negotiated cadence. At the default cadence (1 MB × market rate ≈ $0.00001), risk is negligible. At a negotiated interval of 100 MB at market rate, loss is ~$0.001. At the governance maximum (1024 MB) at ceiling rate, loss is ~$1.024 — still economically negligible relative to channel deposits. Nodes serving high-value content can unilaterally enforce smaller intervals regardless of what was negotiated. No additional mechanism needed — this is fully addressed by the protocol design.
 
----
-
 #### Channel griefing
 
 Client opens many channels with minimum deposit and never streams, forcing nodes to track and eventually close stale channels.
@@ -178,15 +176,11 @@ The financial cost to the attacker remains bounded: at the recommended 10 USDC p
 - **Option A — On-chain channel cap per address.** The `StablePaymentChannel` contract enforces a maximum number of open channels per client Ethereum address (e.g., 10). Hard to circumvent without new wallet addresses, each requiring on-chain funding.
 - **Option B — Node-side filtering.** Nodes refuse `StreamRequest` from channels that have been open longer than N days with zero vouchers. Off-chain, no contract change needed, but relies on node operator implementation.
 
----
-
 #### Stale close
 
 Client submits an old voucher (lower amount) to close the channel, underpaying the node.
 
 The dispute window (default 48 hours for PoC, raised from 24 hours to account for L2 forced-inclusion delay; see [ADR 007](007-watchtower.md#l2-sequencer-censorship)) covers this if the node is online. The liveness gap — node offline during the window — is the entire problem [ADR 007](007-watchtower.md) addresses: non-custodial watchtowers + an in-process dispute monitor + (production) a forced-inclusion deadline extension.
-
----
 
 #### Probe fishing
 
@@ -201,15 +195,11 @@ The current mitigation is weak. Clients are not staked — their NodeIds are fre
 
 **Note:** Probe responses are considered public information (see ADR 005). The concern here is resource exhaustion from bulk probing, not information leakage — content availability is discoverable via probing (see ADR 005), and pricing is revealed in probe/stream responses by design.
 
----
-
 #### Double-spend across nodes
 
 Client opens channels with multiple nodes using the same USDC deposit via a race condition before the on-chain state settles.
 
 Fully solved. Each `openChannel` call transfers USDC into the contract immediately; the client's wallet balance is debited on-chain before the transaction finalises. No credit facility exists.
-
----
 
 ### Node-side
 
@@ -219,23 +209,17 @@ Node accepts a stream request, receives a voucher, then stops delivering bytes.
 
 Fully solved by the self-enforcing protocol. The node cannot extract more payment than the last acknowledged voucher. The client resumes from `byte_offset` on a different node.
 
----
-
 #### Corrupted delivery
 
 Node serves bytes that don't match the advertised BLAKE3 hash.
 
 Caught at the client by BLAKE3 verification. The on-chain slash-evidence path is in [ADR 014 § 2](014-on-chain-verification.md#2-blake3-content-corruption--optimistic-challenge-response): single-round optimistic challenge-response for PoC (signed `StreamResponse` + 100 TOKEN bond, 24h counter window), upgraded to an interactive keccak256 Merkle proof over 1024-byte chunks for production.
 
----
-
 #### Rate bait-and-switch
 
 Node advertises a low rate in probe responses then returns a higher rate in `StreamResponse`.
 
 **Resolved: slashable offense.** Both responses are signed over the advertised rate ([ADR 005](005-protocol.md)); a same-NodeId signed pair where `StreamResponse.rate_per_mb > ProbeResponse.rate_per_mb` and the requester-anchored timestamp delta is under 30 seconds is on-chain-verifiable evidence. Clock-skew immune (both timestamps originate from the requester's clock; the node echoes them back in its signed response). The slash schedule lives in [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn); see [ADR 014 § 1](014-on-chain-verification.md#1-ed25519-signature-verification--dual-key-slash-signatures) for the on-chain verifier.
-
----
 
 #### Phantom blob announcement
 
@@ -245,23 +229,17 @@ Node announces a blob as cached (`has_blob: true` in a signed `ProbeResponse`) t
 
 To prevent legitimate cache eviction from producing false slash evidence inside the 30-second window, nodes MUST honor a **probe-triggered eviction hold** (35s, 30s slash window + 5s margin) — see [ADR 005 § Probe-Triggered Eviction Hold](005-protocol.md#probe-triggered-eviction-hold) for the requirement and dependent parameters (probe cache TTL, `probe_hold_duration`). Hold violations under OOM / under-provisioning fall to the same 24-hour counter-window; eviction logs are not on-chain verifiable, so only delivery-receipt counter-evidence rebuts. The protocol does not subsidize under-provisioning.
 
----
-
 #### Channel close front-running
 
 Node monitors the mempool and front-runs a client's channel close with a higher voucher submission.
 
 Not a real attack. The contract always settles the highest valid voucher, and only the client can sign a valid voucher. A node submitting the latest voucher before the client is the intended happy path. Fabricating a higher voucher requires forging the client's ECDSA signature, which is cryptographically infeasible.
 
----
-
 #### Third-party forced channel close (DoS)
 
 A third party holding a valid voucher calls `closeChannel` to force the channel from `Open` to `Closing`, halting delivery.
 
 **Resolved: access control restriction.** `closeChannel` requires `msg.sender == channel.client || msg.sender == channel.provider`. Third parties cannot initiate a close regardless of whether they hold a valid voucher. Watchtower functionality is unaffected — watchtowers operate via `disputeChannel` during the dispute window. The residual risk is a `disputeChannel` call with an intercepted voucher, which can only *improve* the settlement (higher nonce required). On-path network interception of vouchers is mitigated by QUIC transport (TLS 1.3), though this does not address endpoint compromise or other forms of leakage.
-
----
 
 ### Network-level
 
@@ -271,15 +249,11 @@ Attacker surrounds a client with malicious nodes so all probe responses come fro
 
 BLAKE3 verification catches data corruption regardless of peer-table composition; the remaining DoS variant (attacker-controlled peer set refuses to serve) is resolved in [ADR 012 § Bootstrap and Trust Model](012-client.md): production uses multi-source bootstrap (on-chain registry + hardcoded DNS seeds) so an attacker must compromise both to fully eclipse a client; minimum honest-peer diversity is a supplementary client-side policy. PoC is registry-only.
 
----
-
 #### Gossip flooding
 
 Node sends high-volume `NodeAnnounce` messages to exhaust peer table memory or crowd out legitimate announcements.
 
 Registry check + per-sender rate limiting is solid. The minor gap is that the local registry cache may be up to 10 minutes stale, briefly allowing recently-unstaked nodes to flood. Mostly solved; no strong alternative needed beyond tightening the registry cache refresh on high flood detection.
-
----
 
 #### Sybil nodes
 
@@ -291,15 +265,11 @@ The core weakness is token-price dependency: at $0.001/TOKEN, a minimum stake of
 - **Option B — Minimum stake denominated in USD equivalent via oracle.** Requires a price oracle, which introduces oracle dependency, manipulation, and downtime risks (see rate bounds discussion above). The same concerns apply here, but the impact of oracle failure is lower (new stakers temporarily blocked, not payments broken).
 - **Option C — Reputation as a second filter.** New nodes (low reputation, few settled channels) are deprioritised in client selection even if their `rate_per_mb × rtt_ms × (1 / max(reputation, 0.1)²)` score is competitive. A sybil fleet takes time to build reputation, limiting its effectiveness during that window.
 
----
-
 #### Rate manipulation cartel
 
 Colluding nodes in a region hold rates artificially high.
 
 Origin-backed nodes set the effective price ceiling for any blob. Clients can always probe origin-backed nodes directly and pay their rates as a guaranteed fallback. Any node outside the cartel that undercuts wins all local traffic — the incentive to defect is strong. New entrants can join permissionlessly by staking.
-
----
 
 #### Content withholding
 
@@ -311,8 +281,6 @@ A node stakes, responds to probes with `has_blob: true`, but refuses to serve �
 - **Reputation fast-path.** Nodes that respond `has_blob: true` to probes but fail to deliver accumulate reputation penalties at a steeper rate. A node with consistently poor availability is deprioritized in provider selection and loses delivery revenue.
 
 Note: the probe-triggered eviction hold ([ADR 005](005-protocol.md#probe-triggered-eviction-hold)) addresses a related but distinct problem. Withholding is a node that has the blob but refuses to serve it (behavioral — handled by reputation). The eviction hold addresses a node that signed `has_blob: true` but lost the blob to cache pressure before the stream request (mechanical — prevented by the hold and, if the hold fails, treated as a slashable phantom announcement).
-
----
 
 #### Replay attack on vouchers
 

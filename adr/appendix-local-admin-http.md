@@ -13,8 +13,6 @@ Neither is a good fit when an operator on the same host needs to **read live int
 
 A control-plane surface is therefore needed. This ADR pins down the shape of that surface so the first method (`admin_v1_peersList`, added for #247) and future ones (drain, health, config reload, …) share a common transport.
 
----
-
 ## Decision
 
 A running deCDN node exposes a **loopback-only JSON-RPC 2.0 server** on a configurable port (`observability.admin_port`, default `9191`). Methods are dispatched over HTTP `POST /`, framed by JSON-RPC 2.0 per the spec at <https://www.jsonrpc.org/specification>.
@@ -59,8 +57,6 @@ CLI shape:
   2. `observability.admin_port` from the TOML config file — the subcommand-level `--config`, then the top-level `decdn --config`, then the default `~/.decdn/node.toml`. An explicit path that doesn't exist is an error; the default path missing is fine (just falls through). `admin_port = 0` in the file errors rather than silently probing the default port.
   3. Built-in default `http://127.0.0.1:9191`.
 
----
-
 ## Rationale
 
 ### Why HTTP on loopback, not a Unix domain socket?
@@ -88,8 +84,6 @@ CLI shape:
 - On a single-operator host, filesystem permissions on the node's data dir are already the effective trust boundary.
 - Multi-tenant hosts are explicitly **not** a PoC target. If they become one, a follow-up ADR can layer a shared-secret `Authorization: Bearer <token>` header on the same transport — no wire-shape change required.
 
----
-
 ## Consequences
 
 - The node opens one additional TCP socket by default. Operators who want zero extra listeners can set `observability.admin_port = 0`.
@@ -97,16 +91,12 @@ CLI shape:
 - Future operational routes (drain, reload) ship here by default — resisting the "new surface for each new command" drift that produces a half-dozen ops-tooling sockets per node.
 - A careless operator who binds `admin_port` to a non-loopback address by editing the source would expose internal state; the binding is hardcoded to `127.0.0.1` in `crates/node/src/runtime/mod.rs` to make that a code change rather than a config mistake.
 
----
-
 ## Implementation Notes
 
 - `crates/node/src/admin.rs` defines the `AdminRpc` trait with `#[rpc(server, client, namespace = "admin_v1")]` and the concrete server impl backed by the gossip `PeerTable`.
 - `AdminState` carries `Arc<RwLock<PeerTable>>` (and will grow more handles as new methods land).
 - JSON DTOs (`PeerView`, `PeersResponse`) are defined in `admin.rs` rather than derived from internal types so the wire format can stay stable even when internal structs change.
 - `decdn node peers` lives in `crates/node/src/commands/node.rs` and uses `jsonrpsee::http_client::HttpClient` with the generated `AdminRpcClient` trait — no hand-rolled JSON or HTTP logic on the client side.
-
----
 
 ## Alternatives Considered
 

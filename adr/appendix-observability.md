@@ -42,8 +42,6 @@ Metrics are grouped into **mandatory** (M) and **recommended** (R) tiers.
 
 **Recommended (R):** The node SHOULD expose these metrics. Absence is not a startup blocker, but operators lose visibility into specific subsystems.
 
----
-
 #### 2.1 Slash-Safety Metrics (all Mandatory)
 
 These metrics provide early warning for the five slashable offenses on the slashing schedule in [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn). A sustained non-zero value for any of these requires immediate operator attention.
@@ -68,8 +66,6 @@ These metrics provide early warning for the five slashable offenses on the slash
 | `decdn_rate_bounds_clamp_events_total` (rate) | > 0 | — | Update `rate_per_mb` config to within governance bounds. |
 | `decdn_slash_evidence_exposure_total` (rate) | — | > 0 | File a bug; stop node immediately if rate is sustained. |
 
----
-
 #### 2.2 Delivery Metrics (`cdn/client/v1`)
 
 | Metric | Type | Tier | Labels | Description |
@@ -79,8 +75,6 @@ These metrics provide early warning for the five slashable offenses on the slash
 | `decdn_streams_failed_total` | Counter | M | `direction, reason` | Failed streams. `reason` values: `hash_mismatch`, `channel_insufficient`, `rate_mismatch`, `blob_too_large`, `evicted`, `timeout`, `protocol_error`, `other`. |
 | `decdn_bytes_served_total` | Counter | M | — | Bytes delivered to clients and downstream nodes (inbound streams from the perspective of the requester). |
 | `decdn_bytes_received_total` | Counter | M | — | Bytes received as a client in node-to-node cache-miss pulls. |
-
----
 
 #### 2.3 Cache Metrics
 
@@ -92,16 +86,12 @@ These metrics provide early warning for the five slashable offenses on the slash
 | `decdn_cache_evictions_total` | Counter | R | Blobs evicted by LRU/LFU pressure. |
 | `decdn_probe_post_eviction_failures_total` | Counter | R | `EvictedSinceProbe` responses received from remote nodes during cache-hit stream requests. A sustained rate above ~1% of cache-hit attempts suggests remote hold mechanism failures ([ADR 001](001-network.md), [ADR 005](005-protocol.md)). |
 
----
-
 #### 2.4 Probe Metrics (`cdn/probe/v1`)
 
 | Metric | Type | Tier | Labels | Description |
 |--------|------|------|--------|-------------|
 | `decdn_probe_fanout_latency_seconds` | Histogram | M | `outcome={0rtt_warm,1rtt_cold}` | Duration of a complete probe fan-out from send to collection end. The `outcome` label enables measuring 0-RTT impact per [ADR 015](015-zero-rtt.md). Buckets: `[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5]`. |
 | `decdn_probe_responses_total` | Counter | R | `result={has_blob,no_blob,timeout}` | Probe responses received, by result. |
-
----
 
 #### 2.5 Payment Channel Metrics
 
@@ -114,8 +104,6 @@ These metrics provide early warning for the five slashable offenses on the slash
 | `decdn_vouchers_received_total` | Counter | R | Vouchers received by this node as the payer (node-to-node pulls). |
 | `decdn_channel_disputes_total` | Counter | R | Channels that entered the dispute window. |
 
----
-
 #### 2.6 Gossip Metrics
 
 | Metric | Type | Tier | Labels | Description |
@@ -126,8 +114,6 @@ These metrics provide early warning for the five slashable offenses on the slash
 | `decdn_gossip_announces_received_total` | Counter | R | — | `NodeAnnounce` messages accepted (passed validation). |
 | `decdn_gossip_subscriber_reconnections_total` | Counter | R | — | Successful subscriber reconnections after a gossip stream drop. |
 
----
-
 #### 2.7 Reputation Metrics
 
 The metrics below apply once the reputation gossip layer in [ADR 008](008-reputation.md) is implemented; nodes running with reputation simplified to local-only scoring expose only `decdn_reputation_score`.
@@ -137,8 +123,6 @@ The metrics below apply once the reputation gossip layer in [ADR 008](008-reputa
 | `decdn_reputation_reports_sent_total` | Counter | R | `ReputationReport` messages published to `cdn/reputation/v1`. |
 | `decdn_reputation_reports_received_total` | Counter | R | `ReputationReport` messages accepted from peers. |
 | `decdn_reputation_score` | Gauge | R | This node's current `final_score` (0.0–1.0) as computed locally — local observations (70%) + gossip (30%) per [ADR 008](008-reputation.md). |
-
----
 
 #### 2.8 QUIC / 0-RTT Metrics
 
@@ -152,15 +136,11 @@ Per [ADR 015](015-zero-rtt.md). All labeled by `alpn`.
 
 These replace the identical names from ADR 015 — no semantic change, only now under the canonical naming regime.
 
----
-
 #### 2.9 Node / Process Metrics
 
 | Metric | Type | Tier | Description |
 |--------|------|------|-------------|
 | `decdn_node_uptime_seconds` | Gauge | R | Seconds since the node process started (Unix epoch of start subtracted from current time). Used by the `/health` endpoint and operator dashboards to correlate events with restarts. |
-
----
 
 #### 2.10 Tokenomics Metrics
 
@@ -210,8 +190,6 @@ A subset of these metrics is sourced from on-chain contract state (`FeeRouter`, 
 | `decdn_ve_lock_rate` | Gauge | R | — | Derived (`TOKEN.balanceOf(address(VotingEscrow)) / TOKEN.totalSupply()`) | Governance dashboard, adaptive-feedback heuristic input | Fraction of TOKEN supply currently locked in `VotingEscrow`, in `[0, 1]`. The canonical numerator is the underlying TOKEN balance held by the escrow contract — i.e. `TOKEN.balanceOf(address(VotingEscrow))` — **not** the time-weighted ve-supply from `VotingEscrow.totalSupply()` / `totalSupplyAt(...)`. Any consumer of this metric (governance dashboards, automated controllers) MUST key off this same underlying-locked definition; ve-supply has different units. |
 | `decdn_ve_lock_duration_median_seconds` | Gauge | R | — | `VotingEscrow` per-lock checkpoint scan (RPC) | Governance dashboard, ve-economy health view | Median remaining lock duration across all live locks, in seconds. Distribution-shape signal complementing the aggregate `decdn_ve_total_supply` and `decdn_ve_lock_rate`. |
 
----
-
 ### 3. Health Endpoint
 
 `GET /health` (same HTTP port as `/metrics`) returns a JSON object:
@@ -251,8 +229,6 @@ A subset of these metrics is sourced from on-chain contract state (`FeeRouter`, 
 
 HTTP status codes: `200` for `ready` and `degraded`; `503` for `not_ready`. Monitoring systems SHOULD alert on `503` responses.
 
----
-
 ### 4. Structured Logging
 
 Metrics cover aggregates. Structured logs cover per-event detail. The two systems are complementary — logs are not a substitute for metrics.
@@ -271,8 +247,6 @@ Metrics cover aggregates. Structured logs cover per-event detail. The two system
 - `ts` — RFC 3339 timestamp
 - `level` — log level
 - `target` — Rust module path
-
----
 
 ### 5. Canonical Metric Name Cross-Reference
 
@@ -324,8 +298,6 @@ Add the file to Prometheus via `rule_files:` and reload. Validate locally with `
 #### Scope
 
 The reference set covers M-tier slash-safety metrics and the most common R-tier panels for an operator's first dashboard. It is deliberately not exhaustive: §2.10 tokenomics, reputation, and 0-RTT panels are left to deployment-specific dashboards.
-
----
 
 ## Consequences
 

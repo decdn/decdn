@@ -3,16 +3,12 @@
 **Date:** 2026-03-28
 **Status:** Living document — updated as ADRs are added or revised
 
----
-
 ## What This Is
 
 A decentralized CDN with two participant roles:
 
 - **Nodes** (providers) cache and serve content. They stake TOKEN to participate in the peer mesh and compete on price and latency. Some nodes are configured with an origin backend (S3, NFS, local disk) making them the canonical source for specific content — this is a deployment choice, not a protocol distinction. No external origin URL is ever exposed.
 - **Clients** consume content. They pay nodes per MB via off-chain payment channels.
-
----
 
 ## System Diagram
 
@@ -49,8 +45,6 @@ graph TD
 ```
 
 Clients probe candidate nodes, pick the best by the unified selection score (see [ADR 001](001-network.md#node-selection-algorithm) for the full formula), stream over `cdn/client/v1`, and pay via off-chain payment vouchers (USDC in PoC). On a cache miss, a node performs a DHT FIND_VALUE lookup (`cdn/dht/v1`), probes the returned candidates via `cdn/probe/v1`, selects the best, and pulls via `cdn/client/v1` (paid). During bootstrap, broadcast probe fan-out is used as a fallback. Every byte delivered — whether client→node or node→node — is paid.
-
----
 
 ## Reading Order
 
@@ -135,8 +129,6 @@ Appendices document patterns, reference implementations, and operational guidanc
 7. [Operator Protocol-Upgrade Runbook](appendix-operator-upgrade-path.md) — sequenced operator actions for each ADR 013 tier (Tier 1/2 checklists; Tier 3 rolling-upgrade procedure; watchtower, client, and governance coordination)
 8. [Watchtower Operating Economics](appendix-watchtower-economics.md) — operator-facing cost model and break-even analysis previously inlined in ADR 007
 
----
-
 ## Architectural Decisions
 
 Numeric per-ADR index. The thematic chapter ordering for top-to-bottom reading lives above in [Reading Order](#reading-order); this section is the canonical per-ADR reference. Each entry is a one-line summary of the ADR's decision; the full Context / Decision / Consequences sections live in the linked file.
@@ -164,8 +156,6 @@ Numeric per-ADR index. The thematic chapter ordering for top-to-bottom reading l
 - **[ADR 026 — Gauge-Boost Tokenomics](026-gauge-boost-tokenomics.md)** — 1B fixed supply; `FeeRouter` six-bucket split with Curve-style gauge boost, delegator pool, and SafetyReserve.
 - **[ADR 027 — Distinct-Client Delivery Receipts](027-distinct-client-receipts.md)** — Client-signed `DeliveryReceipt` Merkle-batched per epoch; gauge-pool eligibility gated on distinct-client diversity. Required for mainnet launch.
 
----
-
 ## Key Invariants
 
 - No external origin URL exists — content enters the network through origin-backed nodes whose backends are hidden
@@ -178,8 +168,6 @@ Numeric per-ADR index. The thematic chapter ordering for top-to-bottom reading l
 - Payment channels amortize on-chain costs across an entire session; per-MB payments are off-chain
 - Safety bounds on all governable parameters are hardcoded — governance cannot set fees to 100% or stake to zero (see [ADR 009](009-governance.md))
 - A node cannot serve a blacklisted hash after the compliance window — doing so is a slashable offense (see [ADR 011](011-content-takedown.md))
-
----
 
 ## Trust Assumptions
 
@@ -197,8 +185,6 @@ The system relies on several infrastructure-level assumptions beyond the cryptog
 
 - **iroh relay availability.** iroh relays are stateless servers that broker NAT traversal and relay encrypted traffic as a fallback when direct peer-to-peer connections fail (~10% of networking conditions). Relays are not CDN protocol participants — they cannot inspect, cache, or modify content (all traffic is end-to-end encrypted). The deCDN does not incentivize relay operators: paying relays per-byte would create a perverse incentive to prevent direct connections from forming. PoC uses n0.computer's public relays (rate-limited, no SLA). Production deployments should self-host dedicated relays as operational infrastructure, funded from protocol treasury or node staking fees — not as an incentivized network role. If direct-connection success rates drop below ~85%, investigate NAT traversal improvements before considering relay incentivization.
 
----
-
 ## Non-Goals (PoC)
 
 - DRM or content protection
@@ -209,13 +195,9 @@ The system relies on several infrastructure-level assumptions beyond the cryptog
 - Multi-token payment support (USDC only for PoC; see [ADR 010](010-multi-token.md))
 - Erasure coding (full replication only)
 
----
-
 ## Glossary
 
 The canonical glossary lives in [`README.md` § Glossary](README.md#glossary), grouped into four categories: wire protocol & content, payments, tokenomics & incentives, and on-chain enforcement.
-
----
 
 ## Origin Integration
 
@@ -251,8 +233,6 @@ catalog: hash → {s3_bucket, s3_key, size_bytes, content_type}
 
 Nodes query it on cache miss to find the origin pull URL. The catalog is not on-chain — it is an operational concern.
 
----
-
 ## Cache Behavior
 
 The protocol does not dictate cache policy. Nodes are economically motivated to make good caching decisions.
@@ -285,8 +265,6 @@ flowchart TD
     E -->|No| K[Return redirect with origin NodeId]
     K --> L[Client connects to origin-backed node directly]
 ```
-
----
 
 ## Crate Structure
 
@@ -352,15 +330,11 @@ graph TD
 
 `protocol` is the leaf crate with minimal dependencies. Everything depends on it; it depends on almost nothing. The cache and incentive layers are separate crates — the cache layer works without incentives (useful for testing, local dev, private deployments). The incentive layer wraps cache operations with payment logic. The `node` crate wires them together.
 
----
-
 ## External Components
 
 Components referenced by appendices that are operated by content providers, not part of the CDN protocol or workspace.
 
 - **App Server** — companion to the [encrypted-content publishing pattern](appendix-encrypted-content-publishing.md). Operated by the content provider; shares the iroh QUIC transport layer with the CDN but does not participate in gossip, probing, or paid delivery. The CDN crates do not depend on it.
-
----
 
 ## Observability
 
@@ -376,13 +350,9 @@ The canonical metric registry, naming convention (`decdn_` prefix, `_total` suff
   - `decdn_blacklist_sync_lag_seconds` / `decdn_blacklist_version_behind` — compliance lag ([ADR 011](011-content-takedown.md))
   - `decdn_slash_evidence_exposure_total` — self-detected slashing contradiction ([ADR 005](005-protocol.md))
 
----
-
 ## Alternatives Considered
 
 The decentralized-storage model evaluated against this design (replication factor N, pinning deals, challenge games) is recorded in [`_history/alternatives-pre-launch.md` § Architecture Overview — Decentralized Storage vs Decentralized Delivery](_history/alternatives-pre-launch.md#architecture-overview--decentralized-storage-vs-decentralized-delivery).
-
----
 
 ## Future Work: Search & Discovery
 
@@ -391,8 +361,6 @@ Not in PoC scope. The planned approach for the next phase:
 Dedicated **indexer nodes** subscribe to gossip topics and respond to `cdn/probe/v1` queries to build a searchable index of content metadata (via `tantivy` or equivalent), exposing a query API on a custom ALPN (`cdn/search/v1`). Multiple independent indexers can coexist. Clients pay per query via the same payment channel mechanism. Indexers register in the `StakingRegistry` and are slashable for fabricated results.
 
 Content discovery uses `cdn/dht/v1` from PoC onward — at 30 nodes, FIND_VALUE resolves in 1–2 hops and is negligible overhead. Indexers complement DHT by providing metadata search. Broadcast probe fan-out remains the bootstrap/emergency fallback.
-
----
 
 ## Future Work: KV-CRDT Content Catalogs
 
@@ -411,8 +379,6 @@ A KV-CRDT namespace per content provider could replicate a catalog of `hash → 
 **Why not in PoC:** DHT already handles content discovery at PoC scale. CRDT replication adds value at larger scale for smarter prefetching; deferred until the network grows beyond where DHT alone suffices.
 
 **Reference:** [iroh-docs protocol](https://docs.iroh.computer/protocols/kv-crdts)
-
----
 
 ## What Is Not Decided Yet
 

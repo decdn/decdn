@@ -32,8 +32,6 @@ The goal is a clean mechanical answer to: **how does the codebase express the di
 | `cdn/watchtower/v1` ALPN | Not used | Active — nodes register with watchtowers | ADR 007 |
 | Multi-token `token_rates` gossip field | Omitted (single `rate_per_mb`) | Present alongside `rate_per_mb` | ADR 010 |
 
----
-
 ## Decision
 
 **Use trait-based seams, with the single Cargo feature `poc` applied only to the `node` crate (the wiring point).** Leaf crates (`protocol`, `cache`) contain no mode-conditional code. Mode-specific implementations live in sibling modules within each crate; the `node` crate selects which concrete types to wire via `#[cfg(feature = "poc")]` and `#[cfg(not(feature = "poc"))]` attributes on separate function definitions.
@@ -41,8 +39,6 @@ The goal is a clean mechanical answer to: **how does the codebase express the di
 No `if mode == PoC` checks appear in internal crate logic. All branching is resolved at compile time at the top level. PoC code is physically absent from a production binary — it is excluded from compilation, not merely optimized away.
 
 The single-feature design makes PoC removal straightforward: delete all `#[cfg(feature = "poc")]` functions and the `poc` feature declaration. The `#[cfg(not(feature = "poc"))]` production functions become unconditional with no further edits needed.
-
----
 
 ## Seam Definitions
 
@@ -263,8 +259,6 @@ pub trait SafetyReservePayout: Send + Sync {
 | Governance dependency | None | OpenZeppelin Governor + Timelock per [ADR 009](009-governance.md); emergency multisig under hard caps |
 | Registry | Optional in-memory log | Public on-chain registry maintained by `SafetyReserve` |
 
----
-
 ## Cargo Feature: `poc`
 
 The `poc` Cargo feature is declared **only on the `node` crate**. Leaf crates (`protocol`, `cache`, `reputation`, `incentive`) do not declare or use it. Production is the default — no flag is needed for a production build.
@@ -325,8 +319,6 @@ The Solidity `adminReclaimNodeId` function (ADR 001) is removed in production co
 
 No Rust `unsafe-admin` compile flag is needed — the function simply does not exist on the production contract ABI.
 
----
-
 ## Wiring Conventions
 
 ### Where implementations live
@@ -372,8 +364,6 @@ crates/
 5. **PoC removal is mechanical.** To graduate to production-only: delete all `#[cfg(feature = "poc")]` functions, remove the `poc` feature from `Cargo.toml`, and strip the `#[cfg(not(feature = "poc"))]` attributes from the remaining functions. No logic changes required.
 6. **Leaf-crate principle applies to ADR 026 tokenomics.** Domain crates (`cache`, `gossip`, `incentive`, `reputation`, `protocol`) MUST NOT contain mode-branching logic for the [ADR 026](026-gauge-boost-tokenomics.md) contract surface (`FeeRouter`, `VotingEscrow`, `SafetyReserve`, swap helpers). All mode selection between PoC stubs / fixtures / mocks and production contracts lives in the `node` crate's wiring layer behind seams 8–11 above — the same rule that governs seams 1–7. Adding `if production_enabled` checks inside domain crate logic is forbidden.
 
----
-
 ## Consequences
 
 ### Positive
@@ -394,13 +384,9 @@ crates/
 
 - Solidity contract selection is outside Rust's feature system — managed via separate Foundry deploy scripts, which is already the standard Foundry pattern
 
----
-
 ## Alternatives Considered
 
 The six wiring-shape alternatives evaluated against centralised `#[cfg]`-keyed seams (`cfg!()` macro branching, two explicit features, runtime `NetworkMode`, single-impl with `Option` fields, two repositories, scattered `#[cfg]`) are recorded in [`_history/alternatives-pre-launch.md` § PoC/Production Seam Architecture (appendix)](_history/alternatives-pre-launch.md#pocproduction-seam-architecture-appendix).
-
----
 
 ## Cross-ADR Consistency
 

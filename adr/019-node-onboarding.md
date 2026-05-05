@@ -26,8 +26,6 @@ flowchart TD
     P1 --> P2 --> P3 --> P4 --> P5
 ```
 
----
-
 ### Phase 1 — Pre-flight (Operator Environment)
 
 Before any on-chain or protocol activity:
@@ -50,8 +48,6 @@ Before any on-chain or protocol activity:
 5. **Choose region.** Determine the ISO 3166-1 alpha-2 country code that best represents the node's physical location. This value is self-reported and unverified in PoC ([ADR 001](001-network.md), [ADR 011](011-content-takedown.md)). It will be submitted on-chain as `regionHint` and broadcast in `NodeAnnounce` messages — it affects which gossip topics the node publishes to and which regional blacklists it must enforce.
 
 6. **Configure origin backend (optional).** If the node will act as an origin-backed node (serving specific content from S3/R2/B2/NFS/local disk), configure the backend access credentials and content set before proceeding. This is purely a deployment choice — the protocol treats all staked nodes identically.
-
----
 
 ### Phase 2 — On-chain Setup
 
@@ -105,8 +101,6 @@ Both signing operations are supported by the `decdn-node` CLI (`node register` s
 
 **Emitted events:** `NodeRegistered`, `NodeIdBound` — off-chain indexers and other nodes' registry caches will reflect the new node within one sub-second L2 block.
 
----
-
 ### Phase 3 — Node Startup (State Synchronization)
 
 The node process MUST complete all of the following steps before opening any QUIC listener or accepting incoming connections.
@@ -134,8 +128,6 @@ If the RPC endpoint is unavailable, retry with exponential backoff (3 attempts a
 #### Step 3.4 — Configure local rate
 
 Set the node's `rate_per_mb` within the bounds fetched in Step 3.1. This rate is advertised in `ProbeResponse` messages and must satisfy `deliveryFloor ≤ rate_per_mb ≤ deliveryCeiling`. Probes are the canonical rate-discovery channel; rate changes propagate through fresh probe responses ([ADR 005](005-protocol.md)).
-
----
 
 ### Phase 4 — Joining the Mesh (Gossip Subscription)
 
@@ -176,8 +168,6 @@ Process incoming `NodeAnnounce` messages from existing peers, populating the loc
 
 The node is not required to wait for convergence before proceeding to Phase 5 — it can accept connections immediately after Phase 3, even with a sparse peer table.
 
----
-
 ### Phase 5 — Accepting Paid Delivery
 
 After Phases 1–4, the node is fully operational and should be accepting traffic.
@@ -202,8 +192,6 @@ A node that satisfies all seven criteria is ready to:
 
 **Startup readiness log:** The node SHOULD emit a structured log line (e.g., `INFO node_ready registry=true rate_bounds=true blacklist_version=42 peers=12`) once all seven criteria are satisfied, so operators can confirm correct startup without grepping multiple log sources.
 
----
-
 ### NAT and Multiaddr Handling
 
 iroh handles NAT traversal transparently via QUIC hole-punching and relay fallback. Node operators do not need to configure port forwarding.
@@ -226,8 +214,6 @@ iroh handles NAT traversal transparently via QUIC hole-punching and relay fallba
 - **Production:** A governable cooldown prevents rapid address flipping by a compromised key ([ADR 001](001-network.md#multiaddr-update-policy)).
 
 **Multiaddr encoding:** `multiaddrs` is a packed `bytes` field: a sequence of `(uint16 length, bytes data)` entries. Each entry is a QUIC multiaddr string (e.g., `/ip4/203.0.113.10/udp/4433/quic-v1`). Maximum total size: 1,024 bytes (governable).
-
----
 
 ### Re-Onboarding after Deregistration or Auto-Ejection
 

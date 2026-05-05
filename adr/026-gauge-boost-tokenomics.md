@@ -5,8 +5,6 @@
 **Source design spec:** internal `tokenomics-v2-gauge-boost-design` (2026-04-18)
 **Economic source of truth:** internal `decdn-economic-model-40-40-gauge-pool` (2026-04-25)
 
----
-
 ## Context
 
 The economic model — sitting on top of paid byte delivery ([ADR 003](003-payments.md)) and the slashing primitive ([ADR 014](014-on-chain-verification.md)) — has to hold up under four pressures:
@@ -23,8 +21,6 @@ This ADR is the canonical economic model addressing all four. Burn is one of sev
 Pre-launch design with no holder-compensation or contract-migration concerns. ~$1M+ pre-seed USDC capital secured (planning target $3M); program structure is operational and tracked separately. 2026 unmetered-bandwidth provider economics per the design spec's input matrix (1 Gbps VPS, 10 Gbps dedicated, 100 Gbps edge tiers); dedicated-bandwidth nodes are realistic at every scale band the protocol is sized for.
 
 Earlier internal drafts explored alternative shapes — a flat protocol-fee skim, a 200M-TOKEN bootstrap fund, a regressive fee-discount mechanic, auto-ve-lock-on-vest. Those are documented in [Alternatives Considered](#alternatives-considered) below.
-
----
 
 ## Decision
 
@@ -269,8 +265,6 @@ The 20% floor on the node-base share guarantees operators always receive enough 
 
 Parameter setters on `FeeRouter` and `VotingEscrow` are role-gated via `AccessControl` and bound-checked at the contract level — bounds are enforced regardless of caller. A future automated controller granted the parameter-setter role operates within the same bounds; out-of-range writes revert. This makes the bounds above effective for any caller (governance proposals or additive controllers), without trusting the caller to self-clamp.
 
----
-
 ## Consequences
 
 ### Positive
@@ -304,13 +298,9 @@ Parameter setters on `FeeRouter` and `VotingEscrow` are role-gated via `AccessCo
 - **Convex-capture risk.** Third-party liquid-ve wrappers (Convex / Votium / Aura analogs) can concentrate governance power outside the DAO. Mitigation is operational — the DAO may ship a native liquid-ve wrapper as an additive top-level contract (integrating with `VotingEscrow` via the standard lock-creation / increase-amount / snapshot interfaces per §4) without changing the launch contract surface.
 - **20% burn share deterrence.** A higher burn share would weight slashing more toward pure deflation; the chosen 50/30/20 distribution prefers user-harm recourse via `SafetyReserve`. The §11 safety bound on the burn share leaves room for governance recalibration; security review should confirm 20% preserves slashing's deterrent value.
 
----
-
 ## Alternatives Considered
 
 The five tokenomics shapes evaluated against this design (original 3%-flat / stake-multiple-discount / 200M-TOKEN-bootstrap / 50-50-burn shape, auto-ve-lock-on-vest, USDC distribution to a passive ve-pool, pure-deflationary slashing, TOKEN-denominated bootstrap fund) are recorded in [`_history/alternatives-pre-launch.md` § ADR 026 — Gauge-Boost Tokenomics](_history/alternatives-pre-launch.md#adr-026--gauge-boost-tokenomics).
-
----
 
 ## Forward references (follow-up ADRs)
 
