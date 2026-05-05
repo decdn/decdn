@@ -203,11 +203,11 @@ Compromising `server_secret` exposes all past and future epoch keys until rotati
 | Priority | Mitigation | Phase | Effort | Impact |
 |----------|-----------|-------|--------|--------|
 | 1 | Client NodeId rotation (§5.1) | Pre-mainnet | Low | High — breaks cross-session correlation at transport layer |
-| 2 | Client iroh key encryption (§5.4) | Pre-mainnet | Low | Medium — protects identity from T4 on client devices |
+| 2 | Client iroh key encryption (§5.3) | Pre-mainnet | Low | Medium — protects identity from T4 on client devices |
 | 3 | Operational RPC guidance (§5.2) | Pre-mainnet | Minimal | Medium — documents trust boundary as privacy concern |
-| 4 | Epoch key forward secrecy (§5.5) | Pre-mainnet | Medium | High — but already specified in the encrypted-content-publishing appendix; implementation priority |
-| 5 | Dummy probes (§5.6) | Post-mainnet | Medium | Low — probes are public by design |
-| 6 | Payment channel mixing (§5.7) | Post-mainnet | High | Medium — requires regulatory analysis first |
+| 4 | Epoch key forward secrecy (§5.4) | Pre-mainnet | Medium | High — but already specified in the encrypted-content-publishing appendix; implementation priority |
+| 5 | Dummy probes (§5.5) | Post-mainnet | Medium | Low — probes are public by design |
+| 6 | Payment channel mixing (§5.6) | Post-mainnet | High | Medium — requires regulatory analysis first |
 
 ## Consequences
 
