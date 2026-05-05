@@ -578,6 +578,17 @@ impl CacheEngine {
     /// already-evicted flags. The returned [`EvictionPreview`] also
     /// pre-computes a `served` bool so admin can derive `was_present`
     /// without a follow-up [`Self::has`] call.
+    ///
+    /// Lock structure: the three in-memory probes hit independent
+    /// synchronization primitives — `evicted` (`Mutex<HashSet>`),
+    /// `access_times` (`Mutex<HashMap>`), and `pinned` (`ArcSwap`).
+    /// Each is held for an O(1) lookup; merging them into a single
+    /// lock acquisition would require either combining the underlying
+    /// data structures (a much larger refactor that would couple
+    /// unrelated invariants) or holding a coarser lock across the
+    /// async `BlobStatus` call (which would block the `get()` hot
+    /// path on whichever store backend is slower). Same pattern as
+    /// [`Self::eviction_candidates`].
     pub async fn inspect(&self, hash: Hash) -> CacheResult<EvictionPreview> {
         let status = self
             .inner
