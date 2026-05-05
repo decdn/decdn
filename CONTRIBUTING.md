@@ -210,6 +210,27 @@ pub enum FooMessage {
     Request(FooRequest),   // discriminant 0 — locked by test
     Response(FooResponse), // discriminant 1 — locked by test
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn foo_message_request_discriminant_is_zero() -> Result<(), postcard::Error> {
+        let msg = FooMessage::Request(FooRequest { /* ... */ });
+        let bytes = postcard::to_allocvec(&msg)?;
+        assert_eq!(bytes.first().copied(), Some(0u8));
+        Ok(())
+    }
+
+    #[test]
+    fn foo_message_response_discriminant_is_one() -> Result<(), postcard::Error> {
+        let msg = FooMessage::Response(FooResponse { /* ... */ });
+        let bytes = postcard::to_allocvec(&msg)?;
+        assert_eq!(bytes.first().copied(), Some(1u8));
+        Ok(())
+    }
+}
 ```
 
 Re-export the new types from `crates/protocol/src/lib.rs` so node-side code can `use decdn_protocol::FooMessage;`.
