@@ -1026,3 +1026,422 @@ async fn http_origin_strict_mode_accepts_explicit_identity() -> anyhow::Result<(
     anyhow::ensure!(&got[..] == payload);
     Ok(())
 }
+
+// ----- HTTP status mapping (#375) -----
+//
+// `HttpOrigin::fetch` partitions response status into three buckets:
+//   * 404 → `OriginFetch::NotFound` (operator-level "this object never
+//     existed at the origin", surfaced as `CacheError::NotFound`).
+//   * 2xx → success, body is read.
+//   * everything else → `anyhow::bail!`, surfaced as
+//     `CacheError::OriginError` with the status in the message.
+//
+// The 404 case has dedicated coverage above. These tests pin the
+// remaining buckets so a refactor that, say, broadens NotFound to all
+// 4xx (which would corrupt cache semantics by swallowing 410 Gone or
+// 403 Forbidden as "absent") fails loudly.
+
+/// Spin up a wiremock server returning `status` for the canonical hash
+/// path. Returns `(server, hash)`.
+async fn serve_status(status: u16) -> (MockServer, Hash) {
+    let payload: &[u8] = b"status-mapping fixture";
+    let hash = Hash::new(payload);
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(ResponseTemplate::new(status))
+        .mount(&server)
+        .await;
+    (server, hash)
+}
+
+#[tokio::test]
+async fn http_origin_4xx_other_than_404_surfaces_origin_error() -> anyhow::Result<()> {
+    // 410 Gone is the interesting case — semantically "permanently
+    // removed", but the cache can't safely treat it as NotFound: the
+    // engine caches NotFound results in its negative-lookup paths in
+    // some downstream callers, while a Gone response from a
+    // misconfigured CDN frontend should *not* be cached as absent.
+    // Same logic for 401/403 (auth misconfig) and 400/422 (malformed
+    // request).
+    for status in [400u16, 401, 403, 410, 422, 429] {
+        let (server, hash) = serve_status(status).await;
+        let (engine, _tmp) = build_engine(&server.uri()).await?;
+        let err = err_of(engine.get(hash).await)?;
+        let msg = format!("{err:#}");
+        anyhow::ensure!(
+            matches!(err, CacheError::OriginError { .. }),
+            "expected OriginError for status {status}, got: {err:?}"
+        );
+        anyhow::ensure!(
+            msg.contains(&status.to_string()),
+            "error should name status {status}: {msg}"
+        );
+        anyhow::ensure!(
+            !engine.has(hash).await?,
+            "non-404 4xx must not populate the cache for {status}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn http_origin_5xx_surfaces_origin_error() -> anyhow::Result<()> {
+    // 5xx is transient origin trouble, not "object missing". The
+    // operator-facing distinction matters for retry semantics:
+    // `NotFound` short-circuits future client requests for the same
+    // hash via the engine's miss handling, which would be wrong for a
+    // 503 that resolves on retry.
+    for status in [500u16, 502, 503, 504] {
+        let (server, hash) = serve_status(status).await;
+        let (engine, _tmp) = build_engine(&server.uri()).await?;
+        let err = err_of(engine.get(hash).await)?;
+        let msg = format!("{err:#}");
+        anyhow::ensure!(
+            matches!(err, CacheError::OriginError { .. }),
+            "expected OriginError for status {status}, got: {err:?}"
+        );
+        anyhow::ensure!(
+            msg.contains(&status.to_string()),
+            "error should name status {status}: {msg}"
+        );
+        anyhow::ensure!(
+            !engine.has(hash).await?,
+            "5xx must not populate the cache for {status}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn http_origin_2xx_non_200_succeeds() -> anyhow::Result<()> {
+    // `status.is_success()` is the gate, not `== 200`. RFC 9110 §15.3
+    // permits a 2xx range; an origin returning 203 (Non-Authoritative
+    // Information) or 206 should still be accepted. This pins the
+    // wider acceptance so a future tightening to `== 200` is a
+    // deliberate, test-visible decision.
+    let payload: &[u8] = b"two-oh-three is fine";
+    let hash = Hash::new(payload);
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(ResponseTemplate::new(203).set_body_bytes(payload))
+        .mount(&server)
+        .await;
+
+    let (engine, _tmp) = build_engine(&server.uri()).await?;
+    let got = engine.get(hash).await?;
+    anyhow::ensure!(&got[..] == payload, "2xx body must be served");
+    Ok(())
+}
+
+// ----- Content-Length advisory fast-path (#375) -----
+//
+// `HttpOrigin::fetch` short-circuits with an `OriginError` *before*
+// reading any body when `Content-Length > max_bytes`. The existing
+// `blob_too_large_is_rejected_via_http_origin` test trips both the
+// fast-path and the streaming cap (2 MiB body, 1 MiB cap, wiremock
+// sets honest C-L). These tests isolate the fast-path:
+//
+//   * spoof a huge `Content-Length` with no body — proves the check
+//     fires from headers alone, before any chunk read,
+//   * exercise the off-by-one boundary (cap == limit succeeds; cap + 1
+//     fails). A regression flipping `>` to `>=` would slip past the
+//     existing 2x-over test but fail here.
+
+/// Bind an ephemeral TCP port and serve exactly one response with
+/// `Content-Length: <advertised>` followed by `body_bytes`. Used to
+/// spoof a Content-Length that lies about the body size — the
+/// fast-path rejection inside `HttpOrigin::fetch` must fire on
+/// the advertised length alone, never reading the body.
+async fn spawn_spoofed_content_length_server(
+    advertised: u64,
+    body: Vec<u8>,
+) -> anyhow::Result<std::net::SocketAddr> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        let Ok((mut sock, _)) = listener.accept().await else {
+            return;
+        };
+        // Drain request headers — same pattern as the other raw-TCP
+        // helpers in this file.
+        let mut buf = [0u8; 4096];
+        loop {
+            match sock.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    let seen = buf.get(..n).unwrap_or(&[]);
+                    if seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+            }
+        }
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {advertised}\r\nContent-Type: application/octet-stream\r\n\r\n",
+        );
+        if sock.write_all(header.as_bytes()).await.is_err() {
+            return;
+        }
+        let _ = sock.write_all(&body).await;
+        // Hold the socket open so the client doesn't see EOF before it
+        // has time to act on the headers.
+        let _sock = sock;
+        std::future::pending::<()>().await;
+    });
+    Ok(addr)
+}
+
+#[tokio::test]
+async fn http_origin_rejects_advertised_oversize_before_reading_body() -> anyhow::Result<()> {
+    // Spoof Content-Length: 5 GiB but write zero body bytes. If the
+    // fast-path is wired correctly, `fetch` returns immediately with
+    // an error naming the cap. If a regression removes the C-L check,
+    // this would fall through to streaming and hit either the chunk
+    // idle timeout (much slower) or — worse — block forever waiting
+    // on a body that will never arrive.
+    let advertised: u64 = 5 * 1024 * 1024 * 1024;
+    let addr = spawn_spoofed_content_length_server(advertised, Vec::new()).await?;
+    // Tight timeouts: if the fast-path fails, the test should fail
+    // *fast* with a timeout error rather than tying up the suite.
+    let origin = HttpOrigin::parse(&format!("http://{addr}/"))?
+        .with_timeouts(Duration::from_secs(5), Duration::from_millis(500));
+
+    let tmp = tempfile::tempdir()?;
+    let engine = CacheEngine::open(tmp.path(), Some(Arc::new(origin)), 1).await?;
+
+    let err = err_of(engine.get(Hash::new(b"anything")).await)?;
+    let msg = format!("{err:#}");
+    anyhow::ensure!(
+        matches!(err, CacheError::OriginError { .. }),
+        "expected OriginError from Content-Length fast-path, got: {err:?}"
+    );
+    anyhow::ensure!(
+        msg.contains("exceeds max"),
+        "error should name the fast-path message: {msg}"
+    );
+    anyhow::ensure!(
+        msg.contains(&advertised.to_string()),
+        "error should name the advertised length {advertised}: {msg}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn http_origin_accepts_content_length_exactly_at_cap() -> anyhow::Result<()> {
+    // Exactly-at-cap is the right side of the `>` comparison —
+    // `len > max_bytes` must be false when `len == max_bytes`. A
+    // regression flipping to `>=` would reject this legitimate
+    // payload, so the test pins the boundary.
+    let cap_mb: u64 = 1;
+    let cap_bytes = usize::try_from(cap_mb)
+        .map(|m| m * 1024 * 1024)
+        .unwrap_or(0);
+    let payload = vec![0xA5u8; cap_bytes];
+    let hash = Hash::new(&payload);
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload.clone()))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir()?;
+    let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
+    let engine = CacheEngine::open(tmp.path(), Some(origin), cap_mb).await?;
+
+    let got = engine.get(hash).await?;
+    anyhow::ensure!(
+        got.len() == payload.len(),
+        "exact-cap size mismatch: {} vs {}",
+        got.len(),
+        payload.len()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn http_origin_rejects_content_length_one_over_cap() -> anyhow::Result<()> {
+    // Companion to the exact-cap test: `cap + 1` must trip the
+    // fast-path. Together with the exact-cap test these pin the
+    // off-by-one boundary that the existing 2x-over test cannot.
+    let cap_mb: u64 = 1;
+    let cap_bytes = usize::try_from(cap_mb)
+        .map(|m| m * 1024 * 1024)
+        .unwrap_or(0);
+    let payload = vec![0xA6u8; cap_bytes + 1];
+    let hash = Hash::new(&payload);
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir()?;
+    let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
+    let engine = CacheEngine::open(tmp.path(), Some(origin), cap_mb).await?;
+
+    let err = err_of(engine.get(hash).await)?;
+    let msg = format!("{err:#}");
+    anyhow::ensure!(
+        matches!(err, CacheError::OriginError { .. }),
+        "expected OriginError at cap+1, got: {err:?}"
+    );
+    anyhow::ensure!(
+        msg.contains("exceeds max"),
+        "error should name the fast-path message at boundary: {msg}"
+    );
+    Ok(())
+}
+
+// ----- Redirect handling (#375) -----
+//
+// `HttpOrigin` builds its `reqwest::Client` without an explicit
+// `redirect::Policy`, which means reqwest's default applies: follow up
+// to 10 redirects, then error with `TooManyRedirects`. These tests
+// pin that behaviour so a future change (e.g. switching to
+// `Policy::none()` for SSRF protection, or relaxing the limit) is a
+// deliberate, test-visible decision rather than a silent drift.
+//
+// The content-address invariant covers the worst case regardless: a
+// redirect to attacker-controlled bytes still has to satisfy the
+// BLAKE3 verify the engine runs after the body comes back, so the
+// redirect itself can only get an attacker as far as a
+// `HashMismatch`. But "redirects work" is a behaviour operators may
+// rely on (e.g. an S3-fronted origin that 302s to a presigned URL),
+// so we test both directions.
+
+#[tokio::test]
+async fn http_origin_follows_single_redirect_to_canonical_origin() -> anyhow::Result<()> {
+    // 302 → final origin returns the canonical bytes. Models a
+    // common pattern: a frontend that 302s to a CDN edge.
+    let payload: &[u8] = b"behind a 302";
+    let hash = Hash::new(payload);
+
+    let final_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload))
+        .mount(&final_server)
+        .await;
+
+    let redirect_server = MockServer::start().await;
+    let location = format!("{}/{}", final_server.uri(), hash.to_hex());
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(ResponseTemplate::new(302).insert_header("Location", location.as_str()))
+        .mount(&redirect_server)
+        .await;
+
+    let (engine, _tmp) = build_engine(&redirect_server.uri()).await?;
+    let got = engine.get(hash).await?;
+    anyhow::ensure!(
+        &got[..] == payload,
+        "redirected fetch should land on canonical bytes"
+    );
+    anyhow::ensure!(
+        engine.has(hash).await?,
+        "redirected fetch should populate the cache"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn http_origin_follows_301_redirect() -> anyhow::Result<()> {
+    // 301 (permanent) is semantically distinct from 302 (temporary)
+    // for caches and crawlers, but reqwest follows both transparently.
+    // Pin that we don't accidentally treat 301 as terminal.
+    let payload: &[u8] = b"behind a 301";
+    let hash = Hash::new(payload);
+
+    let final_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload))
+        .mount(&final_server)
+        .await;
+
+    let redirect_server = MockServer::start().await;
+    let location = format!("{}/{}", final_server.uri(), hash.to_hex());
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(ResponseTemplate::new(301).insert_header("Location", location.as_str()))
+        .mount(&redirect_server)
+        .await;
+
+    let (engine, _tmp) = build_engine(&redirect_server.uri()).await?;
+    let got = engine.get(hash).await?;
+    anyhow::ensure!(&got[..] == payload, "301 redirect should be followed");
+    Ok(())
+}
+
+#[tokio::test]
+async fn http_origin_redirected_404_surfaces_not_found() -> anyhow::Result<()> {
+    // The status-bucket gate runs on the *final* response, not the
+    // intermediate 302. If the redirect target returns 404, the
+    // engine must see `NotFound` (not `OriginError`) — same as a
+    // direct 404. Without this test, a refactor that started gating
+    // on the original status would silently misclassify a redirected
+    // 404 as a transport error.
+    let hash = Hash::new(b"absent at the redirect target");
+
+    let final_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&final_server)
+        .await;
+
+    let redirect_server = MockServer::start().await;
+    let location = format!("{}/{}", final_server.uri(), hash.to_hex());
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(ResponseTemplate::new(302).insert_header("Location", location.as_str()))
+        .mount(&redirect_server)
+        .await;
+
+    let (engine, _tmp) = build_engine(&redirect_server.uri()).await?;
+    let err = err_of(engine.get(hash).await)?;
+    anyhow::ensure!(
+        matches!(err, CacheError::NotFound { .. }),
+        "expected NotFound from redirect target, got: {err:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn http_origin_rejects_redirect_loop() -> anyhow::Result<()> {
+    // Self-referential redirect. reqwest's default policy caps at 10
+    // hops, after which it errors out — surfacing as `OriginError`.
+    // A regression switching to `Policy::limited(usize::MAX)` (or
+    // disabling the cap somehow) would let this hang or loop, so the
+    // test pins that some upper bound exists.
+    let hash = Hash::new(b"loop me");
+
+    let server = MockServer::start().await;
+    // Self-redirect: every GET to /<hex> 302s back to itself.
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(ResponseTemplate::new(302).insert_header(
+            "Location",
+            format!("{}/{}", server.uri(), hash.to_hex()).as_str(),
+        ))
+        .mount(&server)
+        .await;
+
+    // Tight headers timeout so an unbounded loop fails fast as a
+    // timeout rather than tying up the suite indefinitely.
+    let origin = HttpOrigin::parse(&server.uri())?
+        .with_timeouts(Duration::from_secs(10), Duration::from_secs(5));
+
+    let tmp = tempfile::tempdir()?;
+    let engine = CacheEngine::open(tmp.path(), Some(Arc::new(origin)), 16).await?;
+    let err = err_of(engine.get(hash).await)?;
+    anyhow::ensure!(
+        matches!(err, CacheError::OriginError { .. }),
+        "expected OriginError from redirect loop, got: {err:?}"
+    );
+    Ok(())
+}
