@@ -6,9 +6,10 @@
 //!
 //! Signed-field freezing (ADR 013 §Signed Field Freezing): `ProbeResponse` is
 //! currently unsigned; when it gains a signature, its signed fields will be
-//! split into a frozen `ProbeResponseBody` per ADR 013. The validating
-//! `Deserialize` impl for [`ProbeResponse`] must move with the signed body so
-//! the protocol-boundary bound on [`MAX_RATE_PER_MB`] continues to apply.
+//! split into a frozen `ProbeResponseBody` per ADR 013. The
+//! `#[serde(deserialize_with)]` validation on `rate_per_mb` must move with
+//! the signed body so the protocol-boundary bound on [`MAX_RATE_PER_MB`]
+//! continues to apply.
 
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
@@ -76,12 +77,13 @@ pub struct ProbeRequest {
 /// Node → client response on `cdn/probe/v1`.
 ///
 /// `rate_per_mb` is bounded by [`MAX_RATE_PER_MB`] at the wire boundary —
-/// the [`Deserialize`] impl rejects oversize values so a malicious node
-/// cannot poison the client selection score with an overflow-inducing rate
-/// (issue #378). Server-side construction is unconstrained at the type
-/// level; the node's config layer (`resolve_payment`) enforces the same
-/// ceiling at startup and on hot reload, keeping the bound bilateral.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// the field-level [`deserialize_rate_per_mb`] hook rejects oversize values
+/// so a malicious node cannot poison the client selection score with an
+/// overflow-inducing rate (issue #378). Server-side construction is
+/// unconstrained at the type level; the node's config layer
+/// (`resolve_payment`) enforces the same ceiling at startup and on hot
+/// reload, keeping the bound bilateral.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProbeResponse {
     /// The nonce from the corresponding [`ProbeRequest`].
     pub nonce: u64,
@@ -92,14 +94,16 @@ pub struct ProbeResponse {
     /// The node's current quoted rate in token base units per MB. The specific
     /// token is a deployment concern (see ADR 010) — the protocol itself does
     /// not normalize units across tokens. Bounded by [`MAX_RATE_PER_MB`].
+    #[serde(deserialize_with = "deserialize_rate_per_mb")]
     pub rate_per_mb: u64,
 }
 
 impl ProbeResponse {
-    /// Validate field invariants. Called automatically by [`Deserialize`];
-    /// exposed publicly so server-side construction sites can re-check
-    /// before sending and so tests can assert validity without going
-    /// through a full encode/decode roundtrip.
+    /// Validate field invariants. The wire-decode path enforces the same
+    /// bound automatically via [`deserialize_rate_per_mb`]; this method is
+    /// exposed so server-side construction sites can re-check before
+    /// sending and so tests can assert validity without going through a
+    /// full encode/decode roundtrip.
     pub const fn validate(&self) -> Result<(), MessageValidationError> {
         if self.rate_per_mb > MAX_RATE_PER_MB {
             return Err(MessageValidationError::RateTooLarge {
@@ -110,35 +114,24 @@ impl ProbeResponse {
     }
 }
 
-// Manual `Deserialize` so the protocol boundary rejects oversize
-// `rate_per_mb` (issue #378). Keeping `Serialize` derived means the
-// wire format is byte-identical to what the derived `Deserialize`
-// would have produced — the manual impl only adds validation, not
-// any change to the encoding.
-impl<'de> Deserialize<'de> for ProbeResponse {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        // Mirror struct used solely for the decode pipeline: derives
-        // `Deserialize` so postcard's positional layout matches what
-        // `Serialize for ProbeResponse` emits, then we copy the fields
-        // and validate. Field order MUST stay in lockstep with the
-        // public type or the wire format silently diverges.
-        #[derive(Deserialize)]
-        struct ProbeResponseRaw {
-            nonce: u64,
-            measured_at_unix_ms: u64,
-            node_id: [u8; 32],
-            rate_per_mb: u64,
-        }
-        let raw = ProbeResponseRaw::deserialize(deserializer)?;
-        let resp = Self {
-            nonce: raw.nonce,
-            measured_at_unix_ms: raw.measured_at_unix_ms,
-            node_id: raw.node_id,
-            rate_per_mb: raw.rate_per_mb,
-        };
-        resp.validate().map_err(de::Error::custom)?;
-        Ok(resp)
+// Field-level deserialize hook so the protocol boundary rejects oversize
+// `rate_per_mb` (issue #378). Using `#[serde(deserialize_with)]` rather
+// than a hand-written `impl Deserialize for ProbeResponse` keeps the
+// struct's field order and codec in lockstep with the derive — there is
+// no mirror struct to drift out of sync. The wire bytes are byte-identical
+// to what a fully-derived `Deserialize` would have read, so postcard's
+// positional layout is preserved.
+fn deserialize_rate_per_mb<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let rate = u64::deserialize(deserializer)?;
+    if rate > MAX_RATE_PER_MB {
+        return Err(de::Error::custom(MessageValidationError::RateTooLarge {
+            rate,
+        }));
     }
+    Ok(rate)
 }
 
 #[cfg(test)]
