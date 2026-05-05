@@ -10,12 +10,12 @@ Content discovery answers the question: "which nodes currently hold blob H?" The
 
 ### The scaling problem with probe fan-out
 
-The current design in [ADR 001](001-network.md) uses **broadcast probe fan-out**: on a cache miss, a node sends a `cdn/probe/v1` message to every known peer simultaneously. This works at PoC scale (tens of nodes) but breaks at production scale:
+An earlier design in [ADR 001](001-network.md) used **broadcast probe fan-out**: on a cache miss, a node sends a `cdn/probe/v1` message to every known peer simultaneously. This works at PoC scale (tens of nodes) but breaks at production scale:
 
-- **O(N) probes per cache miss.** At 1,000 nodes each cache miss generates ~1,000 outbound probe messages. Under the existing 10 fan-outs/second rate limit that is 10,000 probe messages/second/node — a self-DoS risk and a meaningful burden on the peers being probed.
-- **O(N) probe overhead for the prober.** Even with rate limiting, the fan-out latency grows with N because the node must wait for the probe collection window on each of those N connections.
+- **O(N) probes per cache miss.** At 1,000 nodes each cache miss generates ~1,000 outbound probe messages. Under a 10 fan-outs/second rate limit that would have been 10,000 probe messages/second/node — a self-DoS risk and a meaningful burden on the peers being probed.
+- **O(N) probe overhead for the prober.** Even with rate limiting, the fan-out latency would have grown with N because the node would need to wait for the probe collection window on each of those N connections.
 
-These problems exist regardless of network scale. Probe fan-out is the wrong primary mechanism even from day one.
+These problems would have existed regardless of network scale. Probe fan-out is the wrong primary mechanism even from day one — the DHT is.
 
 ### Why gossip content announcements don't work
 

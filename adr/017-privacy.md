@@ -37,8 +37,8 @@ Each row identifies a discrete data exposure. The **ID** column is used for back
 | P-05 | `ReputationReport` gossip | Provider, reporter, metrics (delivery speed, correctness, uptime), timestamps — signed and broadcast on `cdn/reputation/v1` | T1 | [008](008-reputation.md) §6 |
 | P-07 | Node earnings inference | Channel closures and settlement amounts are on-chain; node revenue is computable | T1 | [003](003-payments.md) |
 | P-08 | BLAKE3 hash as global identifier | Same content always produces the same hash; repeated requests for a hash are correlatable | T1 | [002](002-content-addressing.md) |
-| P-09 | Probe fan-out content leakage | All probed nodes learn which content hash the requester wants | T2 | [005](005-protocol.md) §Probe |
-| P-10 | Cache miss detection | Probe fan-outs triggered by cache misses are visible to all peers, revealing regionally uncommon content | T2 | [001](001-network.md) §Content Discovery |
+| P-09 | Probe content leakage | All probed nodes (the DHT-returned candidate set) learn which content hash the requester wants | T2 | [005](005-protocol.md) §Probe |
+| P-10 | Cache miss detection | Probes triggered by cache misses are visible to the targeted DHT candidate set, plus DHT FIND_VALUE traffic is visible to nodes close to the hash in keyspace — both reveal regionally uncommon content | T2 | [001](001-network.md) §Content Discovery |
 | P-11 | Probe cache timing correlation | 15-second probe cache ([ADR 001](001-network.md)) means the interval between probe and subsequent `StreamRequest` is trivially observable | T2 | [001](001-network.md), [005](005-protocol.md) |
 | P-12 | Gossip topic enumeration | An attacker joining regional gossip topics (`cdn/region/{cc}/v1`) can enumerate all nodes and their region announcements | T2 | [001](001-network.md), [005](005-protocol.md) |
 | P-13 | GeoIP inference | Self-reported `regionHint` combined with IP addresses from `multiaddrs` enables geolocation | T2 | [001](001-network.md) |
@@ -85,7 +85,7 @@ An active participant can probe nodes, join gossip topics, and observe responses
 
 ##### Probe content leakage (P-09, P-10, P-11)
 
-When a client probes peers for a content hash, all probed nodes learn what is being requested. Probes triggered by cache misses are visible to the entire fan-out set, revealing regionally uncommon or newly requested content. The 15-second probe cache creates a tight timing correlation between probe and subsequent `StreamRequest`. However, probes are explicitly public information ([ADR 005](005-protocol.md)): node identities are in a public registry, content availability is discoverable via probing, and pricing is revealed by design. The protocol fundamentally requires the delivering node to know the requested hash. Mitigating leakage to non-delivering nodes (e.g., via dummy probes) adds bandwidth cost without changing the fundamental property.
+When a client probes peers for a content hash, all probed nodes learn what is being requested. Probes triggered by cache misses are visible to the targeted DHT-candidate set, and DHT FIND_VALUE queries are visible to keyspace-close nodes for the hash — both reveal regionally uncommon or newly requested content. The 15-second probe cache creates a tight timing correlation between probe and subsequent `StreamRequest`. However, probes are explicitly public information ([ADR 005](005-protocol.md)): node identities are in a public registry, content availability is discoverable via probing, and pricing is revealed by design. The protocol fundamentally requires the delivering node to know the requested hash. Mitigating leakage to non-delivering nodes (e.g., via dummy probes) adds bandwidth cost without changing the fundamental property.
 
 ##### Network enumeration (P-12, P-13)
 
@@ -143,7 +143,7 @@ Compromising `server_secret` exposes all past and future epoch keys until rotati
 | P-07 | Node earnings inference | Accept | Inherent to on-chain settlement; no mitigation without breaking dispute model | — |
 | P-08 | BLAKE3 global identifier | Accept | Fundamental to content-addressed delivery; no alternative without breaking the architecture | — |
 | P-09 | Probe content leakage | Accept | Probes are public by design ([ADR 005](005-protocol.md)); delivering node must know the hash | — |
-| P-10 | Cache miss detection | Accept | Inherent to probe fan-out for cache-miss pulls | — |
+| P-10 | Cache miss detection | Accept | Inherent to probing and DHT lookups for cache-miss pulls | — |
 | P-11 | Probe cache timing | Accept | 15-second window is an optimization tradeoff; attacker already sees the probe | — |
 | P-12 | Gossip topic enumeration | Accept | Inherent to any system with discoverable nodes | — |
 | P-13 | GeoIP inference | Accept | Self-reported region is intentionally public for client selection | — |
@@ -245,7 +245,7 @@ Compromising `server_secret` exposes all past and future epoch keys until rotati
 
 ## References
 
-- [ADR 001 — Network Topology and Peer Mesh](001-network.md): `NodeAnnounce`, `popular_hashes`, probe fan-out, gossip topics, prefetch triggers
+- [ADR 001 — Network Topology and Peer Mesh](001-network.md): `NodeAnnounce`, DHT-candidate probing, gossip topics, prefetch triggers
 - [ADR 002 — Content Addressing](002-content-addressing.md): BLAKE3 as global content identifier
 - [ADR 003 — Payment Model](003-payments.md): payment channel on-chain visibility, probe fishing rate limits
 - [ADR 005 — Wire Protocol](005-protocol.md): probe publicity statement, ALPN definitions
