@@ -375,32 +375,71 @@ mod tests {
         Ok(())
     }
 
+    /// Cover every `ChannelError` variant — `apply_voucher` must leave
+    /// state untouched on each rejection path. Bytes for `v1` are `1_000`
+    /// so a `bytes_delivered` decrease can be tested without going below
+    /// the initial zero floor.
     #[test]
     fn rejected_voucher_does_not_advance_state() -> anyhow::Result<()> {
         let (signer, mut state, domain) = fixture();
-        let v1 = build(state.channel_id, 5_000, 1, 1, TOKEN).sign(&signer, &domain)?;
+        let channel_id = state.channel_id;
+        let v1 = build(channel_id, 5_000, 1, 1_000, TOKEN).sign(&signer, &domain)?;
         state.apply_voucher(&v1, &domain)?;
         let snapshot = state.clone();
+        let interloper = PrivateKeySigner::random();
 
-        // Multiple rejection paths — verify each leaves state unchanged.
-        let bad_amount = build(state.channel_id, 1, 2, 2, TOKEN).sign(&signer, &domain)?;
-        let _ = state.apply_voucher(&bad_amount, &domain);
-        anyhow::ensure!(state == snapshot, "amount drop should not advance state");
+        // Build every rejection-path voucher up front so the closure below
+        // borrows `state` exclusively (mutable) without re-borrowing for
+        // each variant.
+        let cases: [(SignedVoucher, &str); 7] = [
+            // WrongChannel
+            (
+                build(B256::ZERO, 6_000, 2, 2_000, TOKEN).sign(&signer, &domain)?,
+                "wrong channel id",
+            ),
+            // WrongToken
+            (
+                build(
+                    channel_id,
+                    6_000,
+                    2,
+                    2_000,
+                    address!("dead000000000000000000000000000000000000"),
+                )
+                .sign(&signer, &domain)?,
+                "wrong token",
+            ),
+            // NonceNotIncreasing
+            (
+                build(channel_id, 6_000, 1, 2_000, TOKEN).sign(&signer, &domain)?,
+                "stale nonce",
+            ),
+            // AmountDecreasing
+            (
+                build(channel_id, 1, 2, 2_000, TOKEN).sign(&signer, &domain)?,
+                "amount drop",
+            ),
+            // BytesDecreasing
+            (
+                build(channel_id, 6_000, 2, 500, TOKEN).sign(&signer, &domain)?,
+                "bytes drop",
+            ),
+            // AmountExceedsDeposit (deposit is 10_000_000)
+            (
+                build(channel_id, 11_000_000, 2, 2_000, TOKEN).sign(&signer, &domain)?,
+                "amount over deposit",
+            ),
+            // Signature (wrong signer)
+            (
+                build(channel_id, 6_000, 2, 2_000, TOKEN).sign(&interloper, &domain)?,
+                "wrong signer",
+            ),
+        ];
 
-        let bad_nonce = build(state.channel_id, 6_000, 1, 2, TOKEN).sign(&signer, &domain)?;
-        let _ = state.apply_voucher(&bad_nonce, &domain);
-        anyhow::ensure!(state == snapshot, "stale nonce should not advance state");
-
-        let bad_token = build(
-            state.channel_id,
-            6_000,
-            2,
-            2,
-            address!("dead000000000000000000000000000000000000"),
-        )
-        .sign(&signer, &domain)?;
-        let _ = state.apply_voucher(&bad_token, &domain);
-        anyhow::ensure!(state == snapshot, "wrong token should not advance state");
+        for (voucher, reason) in &cases {
+            let _ = state.apply_voucher(voucher, &domain);
+            anyhow::ensure!(state == snapshot, "{reason} must not advance state");
+        }
         Ok(())
     }
 }
