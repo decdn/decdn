@@ -605,6 +605,15 @@ mapping(bytes32 => address) public nodeIdToAddress;
 mapping(address => bytes32) public addressToNodeId;
 mapping(address => uint64) public bindingNonce;
 
+// Convenience view for off-chain origin discovery: combines the operator-to-NodeId
+// binding lookup with the node's activity flag in a single read. Returns
+// (bytes32(0), false) if the operator is unbound, and (nodeId, false) if the
+// operator is bound but currently inactive (deregistered, unbonding, or
+// auto-ejected). Surfaced in ADR 016 § Off-Chain Read API and consumed in
+// ADR 022 § Origin discovery as the per-operator path that replaces paginating
+// getActiveNodes when callers already hold an operator address.
+function nodeIdOf(address operator) external view returns (bytes32 nodeId, bool active);
+
 // Intended for rebinding (key rotation) only — initial binding is performed
 // atomically inside registerNode(). No on-chain guard prevents calling this
 // before registerNode, but doing so creates a binding without mesh membership
