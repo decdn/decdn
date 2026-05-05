@@ -390,7 +390,9 @@ fn classify_reqwest_error(e: reqwest::Error) -> OriginPullError {
 /// `OriginFetch::NotFound`; this helper assumes the caller already
 /// excluded it.
 fn is_transient_status(status: StatusCode) -> bool {
-    status.is_server_error() || status == StatusCode::REQUEST_TIMEOUT || status.as_u16() == 429
+    status.is_server_error()
+        || status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_MANY_REQUESTS
 }
 
 impl Origin for HttpOrigin {

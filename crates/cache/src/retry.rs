@@ -53,7 +53,7 @@ pub const MAX_RETRIES_CEILING: u32 = 16;
 /// Sanity ceiling on `initial_backoff_ms` and `max_backoff_ms`. Five
 /// minutes is well above any realistic operator backoff and well within
 /// the f64 mantissa (the value roundtrips through `as f64` losslessly),
-/// so the f64 → u64 cast in [`RetryPolicy::delay_for`] cannot lose
+/// so the f64 → u64 cast inside the backoff calculation cannot lose
 /// precision in practice. Tightening the runtime invariant here means
 /// the `cast_precision_loss`-allow on the cast is a documented choice,
 /// not a "we hope nobody configures something pathological" promise.
@@ -295,9 +295,30 @@ pub enum RetryOutcome {
 /// `observe` is fire-and-forget — implementations must not block (the loop
 /// drives the origin fetch task) and must not panic.
 pub trait RetryObserver: std::fmt::Debug + Send + Sync + 'static {
-    /// Record a single retry-loop event. `attempt` is the 0-indexed retry
-    /// number (so the first retry is `attempt = 0`); `sleep_ms` is the
-    /// backoff that will be slept (0 for non-`TransientRetry` outcomes).
+    /// Record a single retry-loop event.
+    ///
+    /// `attempt` is the 0-indexed iteration counter at the time the
+    /// outcome was decided: `0` for the initial fetch, `1` after one
+    /// retry has run, `N` after `N` retries. Read per variant:
+    ///
+    /// - [`RetryOutcome::Success`] always carries `attempt == 0`
+    ///   (success on the initial fetch).
+    /// - [`RetryOutcome::SuccessAfterRetry`] carries the count of
+    ///   retries that ran before this success (so `attempt == N` means
+    ///   "succeeded on the (N+1)th adapter call after N retries").
+    /// - [`RetryOutcome::TransientRetry`] carries the iteration that
+    ///   just failed; the retry incremented from this value is about
+    ///   to start.
+    /// - [`RetryOutcome::ExhaustedTransient`] carries the final
+    ///   iteration index, which equals `policy.max_retries` (so total
+    ///   adapter calls = `attempt + 1`).
+    /// - [`RetryOutcome::Permanent`] carries the iteration that
+    ///   surfaced the permanent failure (typically `0` for first-call
+    ///   permanent errors; non-zero if a permanent failure surfaces
+    ///   *after* one or more transient retries).
+    ///
+    /// `sleep_ms` is the backoff that will be slept after this event;
+    /// non-zero only for `TransientRetry`.
     fn observe(&self, _outcome: RetryOutcome, _attempt: u32, _sleep_ms: u64) {}
 }
 
@@ -328,10 +349,11 @@ pub async fn retry_fetch(
     policy: RetryPolicy,
     observer: &Arc<dyn RetryObserver>,
 ) -> Result<OriginFetch, OriginPullError> {
-    // `attempt` counts retries (0-indexed). `0..=max_retries` runs at most
-    // `max_retries + 1` adapter calls (the initial try plus `max_retries`
-    // retries). We track the previous error in `last_err` so the final
-    // ExhaustedTransient surfaces the most recent failure, not the first.
+    // `attempt` counts iterations (0-indexed). The loop runs at most
+    // `max_retries + 1` adapter calls (the initial try plus
+    // `max_retries` retries). The most recent failure flows through
+    // pattern-binding `e` directly into the ExhaustedTransient rewrap
+    // — no separate `last_err` slot needed.
     let mut attempt: u32 = 0;
     loop {
         match origin.fetch(hash, max_bytes).await {

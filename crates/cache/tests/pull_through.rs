@@ -1547,8 +1547,7 @@ impl RecordingObserver {
     fn count(&self, want: RetryOutcome) -> usize {
         self.events
             .lock()
-            .map(|g| g.iter().filter(|(o, _, _)| *o == want).count())
-            .unwrap_or(0)
+            .map_or(0, |g| g.iter().filter(|(o, _, _)| *o == want).count())
     }
 }
 
