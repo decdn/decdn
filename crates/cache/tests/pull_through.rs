@@ -1030,44 +1030,52 @@ async fn http_origin_strict_mode_accepts_explicit_identity() -> anyhow::Result<(
 // ----- HTTP status mapping (#375) -----
 //
 // `HttpOrigin::fetch` partitions response status into three buckets:
-//   * 404 → `OriginFetch::NotFound` (operator-level "this object never
-//     existed at the origin", surfaced as `CacheError::NotFound`).
+//   * 404 → `OriginFetch::NotFound` — surfaced as `CacheError::NotFound`,
+//     the dedicated "object missing at origin" signal.
 //   * 2xx → success, body is read.
 //   * everything else → `anyhow::bail!`, surfaced as
 //     `CacheError::OriginError` with the status in the message.
 //
 // The 404 case has dedicated coverage above. These tests pin the
 // remaining buckets so a refactor that, say, broadens NotFound to all
-// 4xx (which would corrupt cache semantics by swallowing 410 Gone or
+// 4xx (which would corrupt operator triage by reporting a 410 Gone or
 // 403 Forbidden as "absent") fails loudly.
 
-/// Spin up a wiremock server returning `status` for the canonical hash
-/// path. Returns `(server, hash)`.
-async fn serve_status(status: u16) -> (MockServer, Hash) {
-    let payload: &[u8] = b"status-mapping fixture";
-    let hash = Hash::new(payload);
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(ResponseTemplate::new(status))
-        .mount(&server)
-        .await;
-    (server, hash)
+/// Mount a wiremock at `/<hash>` for each status. Each status gets a
+/// distinct hash so a single engine + server pair can serve the whole
+/// table — avoids the per-iteration `MockServer::start` + `tempdir`
+/// overhead that adds up across the suite.
+async fn mount_status_mocks(server: &MockServer, statuses: &[u16]) -> Vec<Hash> {
+    let mut hashes = Vec::with_capacity(statuses.len());
+    for &status in statuses {
+        let label = format!("status-mapping-{status}");
+        let hash = Hash::new(label.as_bytes());
+        Mock::given(method("GET"))
+            .and(path(format!("/{}", hash.to_hex())))
+            .respond_with(ResponseTemplate::new(status))
+            .mount(server)
+            .await;
+        hashes.push(hash);
+    }
+    hashes
 }
 
 #[tokio::test]
 async fn http_origin_4xx_other_than_404_surfaces_origin_error() -> anyhow::Result<()> {
-    // 410 Gone is the interesting case — semantically "permanently
-    // removed", but the cache can't safely treat it as NotFound: the
-    // engine caches NotFound results in its negative-lookup paths in
-    // some downstream callers, while a Gone response from a
-    // misconfigured CDN frontend should *not* be cached as absent.
-    // Same logic for 401/403 (auth misconfig) and 400/422 (malformed
-    // request).
-    for status in [400u16, 401, 403, 410, 422, 429] {
-        let (server, hash) = serve_status(status).await;
-        let (engine, _tmp) = build_engine(&server.uri()).await?;
-        let err = err_of(engine.get(hash).await)?;
+    // Picks a representative spread:
+    //   * 410 Gone — the case operators most often expect to be folded
+    //     into NotFound; pinning OriginError keeps a future "broaden
+    //     NotFound to all 4xx" refactor visible.
+    //   * 401/403 — auth misconfiguration.
+    //   * 400/422 — malformed request.
+    //   * 429 — rate-limited, retryable; must not cache as absent.
+    let statuses = [400u16, 401, 403, 410, 422, 429];
+    let server = MockServer::start().await;
+    let hashes = mount_status_mocks(&server, &statuses).await;
+    let (engine, _tmp) = build_engine(&server.uri()).await?;
+
+    for (status, hash) in statuses.iter().zip(hashes.iter()) {
+        let err = err_of(engine.get(*hash).await)?;
         let msg = format!("{err:#}");
         anyhow::ensure!(
             matches!(err, CacheError::OriginError { .. }),
@@ -1078,7 +1086,7 @@ async fn http_origin_4xx_other_than_404_surfaces_origin_error() -> anyhow::Resul
             "error should name status {status}: {msg}"
         );
         anyhow::ensure!(
-            !engine.has(hash).await?,
+            !engine.has(*hash).await?,
             "non-404 4xx must not populate the cache for {status}"
         );
     }
@@ -1087,15 +1095,18 @@ async fn http_origin_4xx_other_than_404_surfaces_origin_error() -> anyhow::Resul
 
 #[tokio::test]
 async fn http_origin_5xx_surfaces_origin_error() -> anyhow::Result<()> {
-    // 5xx is transient origin trouble, not "object missing". The
-    // operator-facing distinction matters for retry semantics:
-    // `NotFound` short-circuits future client requests for the same
-    // hash via the engine's miss handling, which would be wrong for a
-    // 503 that resolves on retry.
-    for status in [500u16, 502, 503, 504] {
-        let (server, hash) = serve_status(status).await;
-        let (engine, _tmp) = build_engine(&server.uri()).await?;
-        let err = err_of(engine.get(hash).await)?;
+    // 5xx is transient origin trouble, not "object missing". Pinning
+    // `OriginError` (rather than `NotFound`) keeps the operator-facing
+    // distinction intact: `NotFound` is the signal a client uses to
+    // give up; misclassifying a 503 as `NotFound` would mask an outage
+    // as missing data.
+    let statuses = [500u16, 502, 503, 504];
+    let server = MockServer::start().await;
+    let hashes = mount_status_mocks(&server, &statuses).await;
+    let (engine, _tmp) = build_engine(&server.uri()).await?;
+
+    for (status, hash) in statuses.iter().zip(hashes.iter()) {
+        let err = err_of(engine.get(*hash).await)?;
         let msg = format!("{err:#}");
         anyhow::ensure!(
             matches!(err, CacheError::OriginError { .. }),
@@ -1106,7 +1117,7 @@ async fn http_origin_5xx_surfaces_origin_error() -> anyhow::Result<()> {
             "error should name status {status}: {msg}"
         );
         anyhow::ensure!(
-            !engine.has(hash).await?,
+            !engine.has(*hash).await?,
             "5xx must not populate the cache for {status}"
         );
     }
@@ -1234,11 +1245,9 @@ async fn http_origin_accepts_content_length_exactly_at_cap() -> anyhow::Result<(
     // `len > max_bytes` must be false when `len == max_bytes`. A
     // regression flipping to `>=` would reject this legitimate
     // payload, so the test pins the boundary.
-    let cap_mb: u64 = 1;
-    let cap_bytes = usize::try_from(cap_mb)
-        .map(|m| m * 1024 * 1024)
-        .unwrap_or(0);
-    let payload = vec![0xA5u8; cap_bytes];
+    const CAP_MB: u64 = 1;
+    const CAP_BYTES: usize = 1024 * 1024;
+    let payload = vec![0xA5u8; CAP_BYTES];
     let hash = Hash::new(&payload);
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -1249,7 +1258,7 @@ async fn http_origin_accepts_content_length_exactly_at_cap() -> anyhow::Result<(
 
     let tmp = tempfile::tempdir()?;
     let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
-    let engine = CacheEngine::open(tmp.path(), Some(origin), cap_mb).await?;
+    let engine = CacheEngine::open(tmp.path(), Some(origin), CAP_MB).await?;
 
     let got = engine.get(hash).await?;
     anyhow::ensure!(
@@ -1266,11 +1275,9 @@ async fn http_origin_rejects_content_length_one_over_cap() -> anyhow::Result<()>
     // Companion to the exact-cap test: `cap + 1` must trip the
     // fast-path. Together with the exact-cap test these pin the
     // off-by-one boundary that the existing 2x-over test cannot.
-    let cap_mb: u64 = 1;
-    let cap_bytes = usize::try_from(cap_mb)
-        .map(|m| m * 1024 * 1024)
-        .unwrap_or(0);
-    let payload = vec![0xA6u8; cap_bytes + 1];
+    const CAP_MB: u64 = 1;
+    const CAP_BYTES: usize = 1024 * 1024;
+    let payload = vec![0xA6u8; CAP_BYTES + 1];
     let hash = Hash::new(&payload);
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -1281,7 +1288,7 @@ async fn http_origin_rejects_content_length_one_over_cap() -> anyhow::Result<()>
 
     let tmp = tempfile::tempdir()?;
     let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
-    let engine = CacheEngine::open(tmp.path(), Some(origin), cap_mb).await?;
+    let engine = CacheEngine::open(tmp.path(), Some(origin), CAP_MB).await?;
 
     let err = err_of(engine.get(hash).await)?;
     let msg = format!("{err:#}");
