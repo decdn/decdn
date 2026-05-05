@@ -25,6 +25,9 @@ use super::{Origin, OriginFetch};
 /// [`Origin`] impl).
 #[derive(Debug, Clone)]
 pub struct FilesystemOrigin {
+    /// Canonicalized at construction so the per-fetch containment check
+    /// compares two resolved paths — see [`Self::new`] and the
+    /// canonicalize step in [`Origin::fetch`].
     base: PathBuf,
 }
 
@@ -32,6 +35,11 @@ impl FilesystemOrigin {
     /// Construct an origin rooted at `base`. Fails fast if `base` doesn't
     /// exist or isn't a directory — a typo in the config shouldn't surface
     /// as a per-request miss.
+    ///
+    /// `base` is canonicalized so the per-request containment check in
+    /// [`Origin::fetch`] can compare a resolved blob path against a
+    /// resolved root. Without this, an operator who configured the origin
+    /// via a symlinked path would have every fetch look "outside" itself.
     pub async fn new(base: impl Into<PathBuf>) -> anyhow::Result<Self> {
         let base = base.into();
         let meta = tokio::fs::metadata(&base)
@@ -40,6 +48,12 @@ impl FilesystemOrigin {
         if !meta.is_dir() {
             anyhow::bail!("cache.origin_path {} is not a directory", base.display());
         }
+        let base = tokio::fs::canonicalize(&base).await.with_context(|| {
+            format!(
+                "cache.origin_path {} could not be canonicalized",
+                base.display()
+            )
+        })?;
         Ok(Self { base })
     }
 
@@ -70,26 +84,49 @@ impl Origin for FilesystemOrigin {
         Box::pin(async move {
             let path = self.path_for(hash);
 
-            // Stat first so a known-oversize file is rejected without
-            // ever reading it into memory — mirrors the HTTP origin's
-            // Content-Length fast-path.
-            let meta = match tokio::fs::metadata(&path).await {
-                Ok(m) => m,
+            // Resolve symlinks before touching the file. A symlink dropped
+            // into the shard tree by an operator mistake or compromised
+            // tooling could otherwise turn a content-addressed read into
+            // an arbitrary-file read of anything the process can see —
+            // and the engine's BLAKE3 check happens *after* the bytes
+            // already left the disk, so it is not a defense for what got
+            // read in the first place. We canonicalize and require the
+            // result to sit under the (already-canonical) base.
+            let canonical = match tokio::fs::canonicalize(&path).await {
+                Ok(p) => p,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                     return Ok(OriginFetch::NotFound);
                 }
                 Err(err) => {
                     return Err(anyhow::Error::from(err).context(format!(
-                        "cache.origin_path stat failed for {}",
+                        "cache.origin_path canonicalize failed for {}",
                         path.display()
                     )));
                 }
             };
+            if !canonical.starts_with(&self.base) {
+                anyhow::bail!(
+                    "cache.origin_path entry {} resolves to {} which is outside base {}",
+                    path.display(),
+                    canonical.display(),
+                    self.base.display()
+                );
+            }
+
+            // Stat the canonical path so a known-oversize file is rejected
+            // without ever reading it into memory — mirrors the HTTP
+            // origin's Content-Length fast-path. Using the canonical
+            // path also means the metadata + read pair operate on the
+            // same already-resolved target, not the symlink we started
+            // from.
+            let meta = tokio::fs::metadata(&canonical).await.with_context(|| {
+                format!("cache.origin_path stat failed for {}", canonical.display())
+            })?;
 
             if !meta.is_file() {
                 anyhow::bail!(
                     "cache.origin_path entry {} is not a regular file",
-                    path.display()
+                    canonical.display()
                 );
             }
 
@@ -97,13 +134,13 @@ impl Origin for FilesystemOrigin {
             if len > max_bytes {
                 anyhow::bail!(
                     "cache.origin_path entry {} is {len} bytes, exceeds max {max_bytes}",
-                    path.display()
+                    canonical.display()
                 );
             }
 
-            let data = tokio::fs::read(&path)
-                .await
-                .with_context(|| format!("cache.origin_path read failed for {}", path.display()))?;
+            let data = tokio::fs::read(&canonical).await.with_context(|| {
+                format!("cache.origin_path read failed for {}", canonical.display())
+            })?;
             Ok(OriginFetch::Found(Bytes::from(data)))
         })
     }
@@ -154,8 +191,95 @@ mod tests {
         let expected_shard = hex
             .get(..2)
             .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
-        let expected = tmp.path().join(expected_shard).join(hex.as_str());
+        // Compare against the canonicalized tmp dir — on macOS the
+        // tempdir lives under /var, which is itself a symlink to
+        // /private/var, so origin.base differs from tmp.path().
+        let canonical_tmp = tokio::fs::canonicalize(tmp.path()).await?;
+        let expected = canonical_tmp.join(expected_shard).join(hex.as_str());
         anyhow::ensure!(path == expected, "got: {}", path.display());
         Ok(())
+    }
+
+    /// A symlink in the shard directory pointing outside the base must
+    /// be rejected — that's the whole point of the per-fetch
+    /// containment check (see issue #374).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fetch_rejects_symlink_pointing_outside_base() -> anyhow::Result<()> {
+        let outside = tempfile::tempdir()?;
+        let secret = outside.path().join("secret");
+        tokio::fs::write(&secret, b"top secret").await?;
+
+        let inside = tempfile::tempdir()?;
+        let origin = FilesystemOrigin::new(inside.path()).await?;
+        let hash = Hash::new(b"marker");
+        let hex = hash.to_hex();
+        let shard = hex
+            .get(..2)
+            .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
+        let shard_dir = inside.path().join(shard);
+        tokio::fs::create_dir_all(&shard_dir).await?;
+        let link = shard_dir.join(hex.as_str());
+        tokio::fs::symlink(&secret, &link).await?;
+
+        let err = origin
+            .fetch(hash, 1024)
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("symlink outside base should have been rejected"))?
+            .to_string();
+        anyhow::ensure!(err.contains("outside base"), "error lacked context: {err}");
+        Ok(())
+    }
+
+    /// A symlink that still resolves to a regular file inside the base
+    /// is fine — we're guarding against escape, not symlinks per se.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fetch_follows_symlink_inside_base() -> anyhow::Result<()> {
+        let inside = tempfile::tempdir()?;
+        let origin = FilesystemOrigin::new(inside.path()).await?;
+
+        // Drop the real file in a sibling directory under base, then
+        // place a symlink at the expected sharded location that points
+        // at it. canonicalize() resolves to the real file, which is
+        // still under base, so the fetch should succeed.
+        let real_dir = inside.path().join("real");
+        tokio::fs::create_dir_all(&real_dir).await?;
+        let real_file = real_dir.join("blob");
+        tokio::fs::write(&real_file, b"hello").await?;
+
+        let hash = Hash::new(b"marker");
+        let hex = hash.to_hex();
+        let shard = hex
+            .get(..2)
+            .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
+        let shard_dir = inside.path().join(shard);
+        tokio::fs::create_dir_all(&shard_dir).await?;
+        let link = shard_dir.join(hex.as_str());
+        tokio::fs::symlink(&real_file, &link).await?;
+
+        let fetched = origin.fetch(hash, 1024).await?;
+        match fetched {
+            OriginFetch::Found(bytes) => {
+                anyhow::ensure!(bytes.as_ref() == b"hello", "got: {bytes:?}");
+            }
+            OriginFetch::NotFound => anyhow::bail!("expected Found, got NotFound"),
+        }
+        Ok(())
+    }
+
+    /// A missing file should still surface as `NotFound`, even though
+    /// `canonicalize` is the first syscall and errors when the leaf
+    /// doesn't exist.
+    #[tokio::test]
+    async fn fetch_missing_file_is_not_found() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let origin = FilesystemOrigin::new(tmp.path()).await?;
+        let hash = Hash::new(b"marker");
+        match origin.fetch(hash, 1024).await? {
+            OriginFetch::NotFound => Ok(()),
+            OriginFetch::Found(_) => anyhow::bail!("expected NotFound"),
+        }
     }
 }
