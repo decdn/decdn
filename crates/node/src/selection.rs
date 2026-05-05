@@ -118,11 +118,13 @@ fn apply_tiebreaker(ranked: &mut Vec<RankedCandidate>, rng: &mut impl rand::Rng)
         while !group.is_empty() {
             let pick_idx = pick_best_in_group(&group, &group_regions, rng);
             // pick_best_in_group always returns a valid index when the slice
-            // is non-empty; defensive default is index 0.
+            // is non-empty; defensive default is index 0. Order in `group`
+            // does not matter — `pick_best_in_group` rescans from scratch
+            // each iteration — so swap_remove is safe and O(1).
             let pick = if pick_idx < group.len() {
-                group.remove(pick_idx)
+                group.swap_remove(pick_idx)
             } else {
-                group.remove(0)
+                group.swap_remove(0)
             };
             group_regions.insert(pick.candidate.region.clone());
             output.push(pick);
