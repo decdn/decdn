@@ -214,7 +214,6 @@ Scores converge to 0.5 asymptotically, reaching within 0.05 of neutral after ~30
 | Decay rate | 10% per week (applied iteratively) |
 | Decay starts after | 1 week with no new reports or interactions |
 | Minimum score (floor) | 0.0 (selection algorithm clamps at 0.1 — see [ADR 001](001-network.md#node-selection-algorithm)) |
-| Scope | Production only — see [Section 14](#14-poc-scope) for PoC scope |
 
 ### 8. Score Clamping
 
@@ -305,31 +304,6 @@ The reputation system can expose a per-operator **regional-coverage signal** —
 
 The signal is intentionally lightweight (e.g., a small set of region-bucketed delivery-volume counters with the same EWMA / decay treatment as `local_score`); the precise aggregation mechanic and region taxonomy are out of scope for this ADR. The reputation system carries no logic that would deny eligibility based on region — that is each consuming program's sole prerogative.
 
-### 14a. PoC Scope
-
-For PoC, reputation is local-only — each client tracks its own observations of node performance (delivery speed, correctness, reachability) via EWMA. There is no gossip propagation, no decay, and no per-report clamping (the selection floor `max(reputation, 0.1)` from [ADR 001](001-network.md#node-selection-algorithm) still applies). The node selection algorithm uses `final_score = local_score` directly. This exercises the core scoring path (interaction → EWMA → selection weight) without the complexity of cross-node reputation aggregation.
-
-Action items:
-
-1. Implement `local_score` EWMA calculation ([§ 3](#3-local-score-calculation)).
-2. Wire `local_score` into the node selection formula as `reputation` ([ADR 001](001-network.md#node-selection-algorithm)).
-3. Store per-node local scores in memory; no persistence required for PoC.
-4. Use the simplified tie-breaker from [§ 9](#9-tie-breaking) (lower load → random).
-
-### 14b. Deferred to Production
-
-Sections above describe the full production design; PoC nodes do not implement any of the following until launch coordination per the implementing ADR:
-
-- **Network score aggregation** ([§ 4](#4-network-score-aggregation)) — `ReputationReport` gossip on the `cdn/reputation/v1` topic, including the distinct-counterparty discount and settlement-time decay anti-wash-trading mechanics ([§§ 4.1–4.2](#41-distinct-counterparty-discount)).
-- **70/30 combined score** ([§ 5](#5-combined-score)) — replaces the PoC's local-only `final_score = local_score`.
-- **Score decay toward 0.5** ([§ 7](#7-score-decay-production-only)) at 10 %/week.
-- **Per-report ±0.05 clamp** ([§ 8](#8-score-clamping)).
-- **Cold-start bootstrap bonus** ([§ 10](#10-cold-start-bootstrap)) — one-time +0.05 additive, linear decay over 7 days / 50 interactions, gated on `firstRegisteredAt`.
-- **Rate limiting on gossip reports** ([§ 11](#11-rate-limiting)).
-- **Gauge-pool eligibility gating** ([§ 12](#12-gauge-pool-eligibility-gating)) — High/Medium/Low receipt-tier gating wired into [ADR 027](027-distinct-client-receipts.md) receipt validation. Out of scope pre-launch (no gauge pool until [ADR 026](026-gauge-boost-tokenomics.md) ships).
-- **Regional-coverage signal** ([§ 13](#13-regional-coverage-reputation-signal)) — per-operator regional bucket counters published on `cdn/reputation/v1` for downstream operational programs.
-- **Full 4-tier tie-breaking** ([§ 9](#9-tie-breaking)) — load → geo → stake → random.
-
 ## Consequences
 
 ### Positive
@@ -353,4 +327,3 @@ Sections above describe the full production design; PoC nodes do not implement a
 - The 70/30 local/network split means a client's view of the network is biased toward its own usage patterns
 - Gauge-pool eligibility gating (Section 12) couples gauge-share security to the inherently subjective reputation system — an operator targeted by coordinated negative gossip reports could be pushed below `medium_rep_threshold` and lose gauge eligibility unfairly. The hysteresis (Section 12.3), per-report clamping (Section 8), and the 3× reporter-weight cap (Section 4) together limit the speed and magnitude of such an attack, but the failure mode is real and shared with the rest of the reputation system. ADR 027's receipt protocol and ADR 007's watchtower validation are the on-chain-anchored layers that complement this off-chain signal
 - Receipt-tier thresholds (`high_rep_threshold`, `medium_rep_threshold`) are governance-tunable, which means a hostile governance majority could in principle gate honest operators out of the gauge pool. The bounds in Section 12.1 (`high_rep_threshold` capped at 0.90) and the 48-hour timelock per [ADR 009](009-governance.md) are the primary defenses; operators can plan ve-lock and stake-management decisions around the bounded worst case
-- PoC uses local-only scores (no gossip, no decay, no per-report clamping) — see [Section 14](#14-poc-scope) for full PoC scope
