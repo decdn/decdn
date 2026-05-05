@@ -26,7 +26,7 @@ The goal is a clean mechanical answer to: **how does the codebase express the di
 | RPC trust | Single RPC endpoint | Multi-source (registry + DNS seed fallback) | ADR 001, 012 |
 | `popular_hashes` cardinality | 20 hashes per `NodeAnnounce` | 5 hashes (reduces content inventory leakage — ADR 017) | ADR 001, 017 |
 | Regional body registration | None — admin key is sole governance for blacklist | Regional bodies registered; global governance override | ADR 011 |
-| Default-open allow-list | Inactive (`defaultOpenAllowlistActive == false`) — permissive bootstrap window: any active staker may serve as origin for `namespaceId == 0` | Activated by governance; `OriginAssignment` rejects unauthorized `is_origin: true` claims for default-open content (slashable phantom-origin) | ADR 011, ADR 016 |
+| Default-open allow-list | Inactive (`defaultOpenAllowlistActive == false`) — permissive bootstrap window: any active staker may serve as origin for `namespaceId == 0` | Activated by governance; only allow-listed operators appear in `OriginAssignment.getOrigins(0)` for default-open content; off-chain consumers (clients, watchtowers) consult that view to filter unauthorized origins | ADR 011, ADR 016 |
 | Treasury disbursement | Manual (admin key holder) | On-chain governance proposal | ADR 009 |
 | `adminReclaimNodeId` | Present — `onlyOwner` fallback for NodeId squatting during early testing | Removed from contract | ADR 001 |
 | Bootstrap peer source | On-chain registry only | Registry + DNS seed list + minimum peer diversity (Option B+C) | ADR 012 |

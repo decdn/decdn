@@ -214,16 +214,8 @@ interface IOriginAssignment {
     function setDefaultOpenMinRedundancy(uint256 floor) external;
     function setDefaultOpenMaxOrigins(uint256 cap) external;
 
-    // Views. For namespaceId == 0 these read the default-open allow-list;
-    // isAuthorizedOriginAt(0, op, t) follows the same checkpoint logic with
-    // one extra rule — see "Historical state and slashing evidence" below.
+    // Views. For namespaceId == 0 these read the default-open allow-list.
     function isAuthorizedOrigin(uint256 namespaceId, address operator) external view returns (bool);
-    // Historical view used by SlashJudge for phantom-origin evidence — true if
-    // the operator was in the namespace's authorized set at `timestamp`. See
-    // "Historical state and slashing evidence" below for the storage model and
-    // the multi-cycle (re-authorization) semantics.
-    function isAuthorizedOriginAt(uint256 namespaceId, address operator, uint64 timestamp)
-        external view returns (bool);
     function getOrigins(uint256 namespaceId) external view returns (address[] memory);
     function getPendingAssignment(uint256 namespaceId)
         external view returns (address[] memory operators, uint256 readyAt);
@@ -248,14 +240,14 @@ interface IOriginAssignment {
 
 1. **Publisher proposal.** The publisher calls `proposeAssignment(namespaceId, operators)`. The contract validates that the proposer owns the namespace, that every candidate is currently active in `StakingRegistry`, and that the operator count satisfies the `minRedundancy` and `maxOriginsPerNamespace` bounds. The proposal enters a pending state with a `readyAt` timestamp computed as `block.timestamp + assignmentTimelock` (governance-bounded between 24 hours and 14 days; see [ADR 009](009-governance.md)).
 2. **Governance ratification.** During the timelock window, governance reviews the proposal off-chain. After the timelock elapses, a governance proposal calls `activateAssignment(namespaceId)`. Activation replaces the namespace's authorized operator set with the pending operators atomically.
-3. **Operator notification.** Operators in the activated set are now authorized to act as origins for the namespace. They configure their origin store locally and respond `is_origin: true` to probes for the namespace's content (see [ADR 005 § cdn/probe/v1](005-protocol.md#cdnprobev1--latency-probe)).
+3. **Operator notification.** Operators in the activated set are now authorized to act as origins for the namespace. They configure their origin store locally and begin serving the namespace's content. The wire protocol does not distinguish origins from cache nodes at probe time — origin status is a publisher-level commitment surfaced via `getOrigins(namespaceId)` for off-chain consumers.
 4. **Revocation.** A publisher may unilaterally remove an operator from their own namespace's set (e.g., the operator is performing poorly). Governance may revoke any operator from any namespace via the standard proposal path (e.g., the operator is misbehaving but has not yet crossed the blacklist threshold). Blacklisting (`ContentBlacklist.addOrigin`) takes effect via runtime checks rather than a cross-call — see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist).
 
 The two-step propose-then-ratify flow is deliberate: it gives publishers agency over which operators they trust (publishers know their content best) while keeping the DAO as the authority that confirms the assignment is consistent with protocol-wide policy (e.g., not concentrating too many namespaces on a small operator set, not assigning to operators with poor reputation). Either party can refuse to advance the flow — publishers by not proposing, governance by not ratifying — and the namespace simply continues with its existing assignment (or remains unassigned).
 
 ### Default-open allow-list
 
-The default-open namespace has no publisher, so the per-namespace propose / ratify flow does not apply. Instead, the DAO directly maintains a single global allow-list of operators authorized to serve as origin for *any* default-open hash. The allow-list is held in `OriginAssignment` under the same per-namespace `EnumerableSet` and `(activatedAt, revokedAt)` checkpoint storage used for registered namespaces, keyed by `namespaceId == 0` — `isAuthorizedOrigin(0, op)` and `isAuthorizedOriginAt(0, op, t)` are the same views used everywhere else, with no special case downstream.
+The default-open namespace has no publisher, so the per-namespace propose / ratify flow does not apply. Instead, the DAO directly maintains a single global allow-list of operators authorized to serve as origin for *any* default-open hash. The allow-list is held in `OriginAssignment` under the same per-namespace `EnumerableSet` storage used for registered namespaces, keyed by `namespaceId == 0` — `isAuthorizedOrigin(0, op)` is the same view used everywhere else, with no special case downstream.
 
 **Lifecycle.** Allow-list updates are GOVERNANCE_ROLE-only single-step proposals under the Governor's standard timelock — no separate `defaultOpenAssignmentTimelock` parameter. `setDefaultOpenAllowlist(operators)` replaces the active set atomically; `addDefaultOpenOperator` / `removeDefaultOpenOperator` are convenience deltas with the same authority and delay. Each transition appends a checkpoint per affected operator. The contract enforces `operators.length ∈ [defaultOpenMinRedundancy, defaultOpenMaxOrigins]`, that every operator is `StakingRegistry.isActive` at activation time, and rejects duplicate addresses.
 
@@ -271,26 +263,6 @@ A registered namespace with no activated assignment is **unassigned**. No operat
 
 The contract enforces `operators.length >= minRedundancy` at proposal time and at activation time, and additionally rejects proposals whose `operators` array contains duplicate addresses (without this, a publisher could submit `[A, A, A]` to satisfy `minRedundancy = 3` while still concentrating origin responsibility on a single operator). `minRedundancy` is a governance-bounded parameter (see [ADR 009](009-governance.md); range `[1, 10]`, default `3`) and is constrained by the cross-parameter invariant `1 ≤ minRedundancy ≤ maxOriginsPerNamespace`. The invariant ensures that no registered namespace can be activated with a single point of failure. The invariant is *not* enforced on revocation — a publisher or governance may revoke operators down to zero, but new activations must satisfy the floor. Under-redundant namespaces are observable via the `getOrigins` view; clients and watchtowers may surface this as a health indicator for the namespace's owner.
 
-### Historical state and slashing evidence
-
-Phantom-origin slashing requires `SlashJudge` to verify that an operator was *not* in any claiming namespace's authorized set at the timestamp of a signed `ProbeResponse` (see [ADR 005 § cdn/probe/v1](005-protocol.md#cdnprobev1--latency-probe)). Because a hash may be claimed by multiple namespaces independently ([ADR 002 § Multi-claim semantics](002-content-addressing.md#multi-claim-semantics)), the predicate is a disjunction:
-
-```
-authorized(operator, hash, t)  :=
-    (∃ ns ∈ namespaceOfAt(hash, t)  such that  isAuthorizedOriginAt(ns, operator, t))
-    ∨  (namespaceOfAt(hash, t) is empty  AND  defaultOpenAuthorizedAt(operator, t))
-```
-
-`namespaceOfAt` returns the set of non-zero namespaces that had claimed `hash` at `t`. The OR-loop is bounded by the size of that set (typically `0`–`1` for long-tail content; small constant `K` for popular hashes co-claimed by multiple distributors). The signed `ProbeResponse` schema is unchanged — the signer asserts authorization as a property of the world, and `SlashJudge` verifies the property holds against any one claiming authority. Mutating storage in place would make this impossible to evaluate retroactively — an honest operator that was authorized at probe time could be revoked an hour later and then falsely slashed using the now-stale probe response.
-
-`OriginAssignment` therefore stores a per-(namespace, operator) checkpoint history: an append-only array of `{activatedAt, revokedAt}` entries. `revokedAt = type(uint64).max` marks an entry as currently active. `isAuthorizedOriginAt(namespaceId, operator, t)` returns `true` iff some checkpoint satisfies `activatedAt <= t < revokedAt`. The query is O(log N) with binary search over the checkpoint array; in practice `N` per pair is tiny (most operators are activated once, revoked once, never re-activated).
-
-The slash-evidence-age bound from [ADR 009](009-governance.md) (default 7 days, range 1–30 days) limits how old a probe response may be when submitted as evidence. Checkpoint arrays older than the maximum evidence age may be pruned by a permissionless garbage-collection call. Two invariants protect ongoing service and lookup correctness: (i) the *currently active* checkpoint (the one with `revokedAt == type(uint64).max`) is never pruned regardless of how old its `activatedAt` is — pruning it would erase the operator's authorization for any new probe; (ii) the contract retains the most recent checkpoint whose `activatedAt` precedes the start of the current evidence window, so binary-search lookups for evidence near the window's lower edge remain valid. Subject to those invariants, the contract retains only the entries needed to evaluate the current evidence window plus a margin for in-flight challenges. This caps storage growth at `O(maxEvidenceAge × authorization_churn)` per pair rather than unbounded history.
-
-Re-authorization of a previously revoked operator appends a new checkpoint; older checkpoints continue to authorize old probe responses correctly. The publisher / governance can revoke and re-activate freely without invalidating in-flight evidence.
-
-`isAuthorizedOriginAt(0, operator, t)` mirrors the bootstrap rule from [§ Default-open allow-list](#default-open-allow-list): for `t < defaultOpenActivatedAt` (or before any activation) it returns `true`, so probes signed during the permissive window are not retroactively slashable; for later `t` it consults the checkpoint history exactly like a registered namespace.
-
 ### Cross-contract integration
 
 - `OriginAssignment` reads `PublisherRegistry.ownerOf(namespaceId)` to validate proposer ownership.
@@ -302,15 +274,9 @@ Re-authorization of a previously revoked operator appends a new checkpoint; olde
 
 `ContentBlacklist.addOrigin(operator)` does **not** call `OriginAssignment` to evict the operator from every namespace. The naïve approach — iterate over every namespace the operator is assigned to and remove them in one transaction — is unbounded: an operator in N namespaces costs O(N) storage writes, and a prolific operator could exceed the block gas limit, blocking the blacklist transaction entirely.
 
-Instead, security is enforced at runtime by checking both contracts:
+Off-chain consumers of `OriginAssignment.getOrigins(namespaceId)` (clients selecting peers for first-fetch, watchtowers checking publisher availability commitments) cross-reference each returned operator against `ContentBlacklist.isOriginBlacklisted` and treat blacklisted entries as unauthorized regardless of stale `OriginAssignment` state. Storage cleanup happens lazily and permissionlessly via `OriginAssignment.pruneBlacklistedAssignment(namespaceId, operator)`: each call removes one entry; anyone may call it (the contract checks `ContentBlacklist.isOriginBlacklisted` itself, so the caller cannot grief by claiming a non-blacklisted operator is blacklisted). Watchtowers and reputation services will likely run pruning jobs as a public good.
 
-- **Probe-time** ([ADR 005 § cdn/probe/v1](005-protocol.md#cdnprobev1--latency-probe)): a node MUST consult `ContentBlacklist.isOriginBlacklisted(self)` before signing `is_origin: true`, in addition to `OriginAssignment.isAuthorizedOrigin`. A blacklisted operator that signs `is_origin: true` is slashable as a phantom-origin offense regardless of the stale `OriginAssignment` entry.
-- **Requester-side** ([ADR 005](005-protocol.md)): probing requesters apply the same combined check before accepting an `is_origin: true` claim from a peer.
-- **Slashing evidence** ([ADR 011 § Slashing](#slashing)): `SlashJudge` evaluates phantom-origin evidence by checking both contracts at the response timestamp; either a missing `OriginAssignment` entry OR a present `ContentBlacklist` blacklist entry constitutes unauthorized origin behaviour.
-
-Storage cleanup happens lazily and permissionlessly via `OriginAssignment.pruneBlacklistedAssignment(namespaceId, operator)`. Each call removes one entry; anyone may call it (the contract checks `ContentBlacklist.isOriginBlacklisted` itself, so the caller cannot grief by claiming a non-blacklisted operator is blacklisted). Watchtowers and reputation services will likely run pruning jobs as a public good. Pruning is a cleanup optimisation, not a security primitive — the security guarantee is the runtime check, not the storage state.
-
-This pattern means: blacklisting an operator is an O(1) on-chain action (one ejection call), runtime checks are O(1) per probe (two views), and storage cleanup is O(1) per call with no transaction-size limit. No design path requires iterating over an operator's full namespace set.
+This pattern means: blacklisting an operator is an O(1) on-chain action (one ejection call), and storage cleanup is O(1) per call with no transaction-size limit. No design path requires iterating over an operator's full namespace set.
 
 ### Permissionless property
 
@@ -448,7 +414,7 @@ The minimum viable process for PoC:
 - **[ADR 001](001-network.md)** (Network Topology) — `NodeAnnounce` must suppress blacklisted hashes from `popular_hashes`; blacklisted origin NodeIds are excluded from peer tables; `StreamError::HashBlacklisted`, `StreamError::OriginBlacklisted`, and `StreamError::UnauthorizedOrigin` are new error variants; the unconditional permissionless-origin claim in the consequences section is amended to reflect DAO-gated origin role
 - **[ADR 002](002-content-addressing.md)** (Content Addressing) — content-addressed blobs can be removed from the network layer even though the hash remains valid; this is explicitly accepted. The [Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces) section in ADR 002 defines the primitives this ADR's `OriginAssignment` mechanism builds on
 - **[ADR 003](003-payments.md)** (Payments) — multi-origin redundancy is now DAO-supervised via the `OriginAssignment` minimum-redundancy invariant rather than off-protocol content-owner coordination
-- **[ADR 005](005-protocol.md#cdnprobev1--latency-probe)** (Protocol) — probe responses include an `is_origin` field; nodes must verify `OriginAssignment` membership before responding `is_origin: true` for any hash, including default-open content (subject to the bootstrap rule until the default-open allow-list is first activated)
+- **[ADR 005](005-protocol.md#cdnprobev1--latency-probe)** (Protocol) — origin status is *not* signaled at probe time; the wire response describes only "I have the bytes." Origin authorization is queried off-chain via `OriginAssignment.getOrigins(namespaceId)` for routing/discovery; the protocol does not slash for impersonating origin status because no claim is made on the wire
 - **[ADR 026](026-gauge-boost-tokenomics.md)** (Tokenomics) — serving blacklisted content added to the slashable offense list; origin blacklisting triggers same stake ejection path as repeated slashing
 - **[ADR 009](009-governance.md)** (Governance) — `ContentBlacklist` and `OriginAssignment` contracts added to governance-controlled contracts; emergency multisig scope documented in ADR 009 as the single source of truth, covering both contract pausing and content/origin blacklisting; regional body registry introduced as a new governance primitive; new governable parameters with safety bounds for assignment timelock, minimum redundancy, per-publisher namespace caps, and default-open allow-list redundancy floor / cap
 - **[ADR 016](016-contract-interactions.md)** (Contract Interactions) — `PublisherRegistry` and `OriginAssignment` added to the contract inventory, deployment order, call graph, role matrix, and reentrancy analysis
