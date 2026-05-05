@@ -28,9 +28,8 @@ The iroh-gossip protocol carries multiple message types on distinct topics:
 | --- | --- | --- |
 | `cdn/global/v1`, `cdn/region/{cc}/v1` | `NodeAnnounce` | [ADR 001](001-network.md) |
 | `cdn/reputation/v1` | `ReputationReport` | [ADR 008](008-reputation.md) |
-| `cdn/global/v1` (production) | `WatchtowerAnnounce` | [ADR 007](007-watchtower.md) |
 
-All gossip topics use the `cdn/` namespace prefix. `NodeAnnounce` and `ReputationReport` are active in production; `WatchtowerAnnounce` is a planned production extension for watchtower discovery at scale (PoC uses static watchtower lists — see [ADR 007](007-watchtower.md)).
+All gossip topics use the `cdn/` namespace prefix. Watchtowers are configured statically in the node config rather than discovered via gossip — see [ADR 007 §4 Discovery](007-watchtower.md).
 
 ### Rate discovery
 

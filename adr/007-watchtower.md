@@ -121,7 +121,7 @@ The `WatchtowerRegister` message includes `membership_sig` — a proof of channe
 
 ### 4. Discovery
 
-**Initial approach (PoC through early production):** Off-chain, config-based. Node operators configure watchtower iroh NodeIds in their node config:
+Off-chain, config-based. Node operators configure watchtower iroh NodeIds in their node config:
 
 ```toml
 [watchtower]
@@ -133,7 +133,7 @@ peers = [
 
 The node software connects to configured watchtowers at startup and registers channels as they are opened.
 
-**Future (production at scale):** Watchtowers announce themselves on the global gossip topic (`cdn/global/v1`) with a `WatchtowerAnnounce` message containing their NodeId, Ethereum address, fee rate, and supported chain IDs. Clients and nodes discover watchtowers through gossip, filtered by fee rate and geographic proximity (RTT). An on-chain watchtower registry (extending the existing `NodeInfo` pattern) can be added if the market grows large enough to need trustless discovery.
+Watchtowers are infrastructure providers, not high-churn entities — operators select them out-of-band based on reputation, jurisdiction, and SLA, then edit the config and restart. Rotation is a manual operation, the same workflow operators already use for RPC providers, origin backends, and other infrastructure dependencies. Trustless on-chain registration is provided by `WatchtowerEscrow.register` (§ 2 above); operators verify a candidate watchtower's stake, fee rate, and chain support against the registry before adding it to their config. There is no gossip-based discovery: a `WatchtowerAnnounce` topic was previously specified as a "production at scale" feature but added a third gossip topic, a new signed message type, and parallel validation logic with no real operator workflow benefit, and was dropped (see [#413](https://github.com/decdn/decdn/issues/413)). If the network grows to a scale where low-friction watchtower discovery is genuinely needed, an additive registry-backed query (`WatchtowerEscrow.getActiveWatchtowers()`) can be added — the same on-chain pattern used for node bootstrap.
 
 ### 5. Fee Model
 
