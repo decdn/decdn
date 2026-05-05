@@ -180,6 +180,133 @@ grep -rn 'TOKEN\|USDC' adr/             # find all token references
 grep -rn 'function\|contract\|modifier' adr/  # find Solidity interface references
 ```
 
+## Adding a New ALPN Protocol Handler
+
+Each ALPN listed in [ADR 005](adr/005-protocol.md) (`cdn/probe/v1`, `cdn/client/v1`, `cdn/watchtower/v1`, `cdn/dht/v1`) is served by a struct that implements `iroh::protocol::ProtocolHandler` and is registered on the iroh `Router` at runtime startup. [`crates/node/src/handlers/probe.rs`](crates/node/src/handlers/probe.rs) is the canonical reference — copy its shape when adding a new handler.
+
+The pieces live in two crates, in this order:
+
+1. **`crates/protocol/`** (leaf crate) — ALPN constant, wire message enum, request/response structs.
+2. **`crates/node/src/handlers/`** — handler struct + `ProtocolHandler` impl. The `node` crate is the wiring layer; per [Appendix: PoC/Production Seams](adr/appendix-poc-production-seams.md), domain crates stay free of mode branching and the runtime in `crates/node/src/runtime/mod.rs` selects the concrete handler.
+
+### Step-by-step recipe
+
+#### 1. Declare the ALPN in `crates/protocol/src/lib.rs`
+
+```rust
+/// ALPN protocol identifier for <one-line purpose>. See ADR 005.
+pub const ALPN_FOO: &[u8] = b"cdn/foo/v1";
+```
+
+The `cdn/<name>/v<n>` shape and the version suffix are mandatory — version bumps are how wire-breaking changes are signalled per [ADR 013](adr/013-schema-evolution.md).
+
+#### 2. Add wire types to `crates/protocol/src/message.rs`
+
+Define a top-level enum (e.g. `FooMessage`) wrapping per-direction structs. Variant order is **frozen** — postcard encodes each variant by its declaration index, so reordering is a wire-breaking change. Add a discriminant-locking test alongside the existing `probe_message_request_discriminant_is_zero` pattern:
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FooMessage {
+    Request(FooRequest),   // discriminant 0 — locked by test
+    Response(FooResponse), // discriminant 1 — locked by test
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn foo_message_request_discriminant_is_zero() -> Result<(), postcard::Error> {
+        let msg = FooMessage::Request(FooRequest { /* ... */ });
+        let bytes = postcard::to_allocvec(&msg)?;
+        assert_eq!(bytes.first().copied(), Some(0u8));
+        Ok(())
+    }
+
+    #[test]
+    fn foo_message_response_discriminant_is_one() -> Result<(), postcard::Error> {
+        let msg = FooMessage::Response(FooResponse { /* ... */ });
+        let bytes = postcard::to_allocvec(&msg)?;
+        assert_eq!(bytes.first().copied(), Some(1u8));
+        Ok(())
+    }
+}
+```
+
+Re-export the new types from `crates/protocol/src/lib.rs` so node-side code can `use decdn_protocol::FooMessage;`.
+
+#### 3. Implement the handler in `crates/node/src/handlers/<name>.rs`
+
+The handler MUST:
+
+- Take an `Arc<ConnectionLimiter>` and call `limiter.acquire(&conn)` first thing inside `serve`. On `Err(reason)`, close the connection with `APP_ERR_RATE_LIMITED` (`0x10`) and return `Ok(())` — rate-limited rejections are normal load-shedding, not protocol faults, and returning `Err` here makes iroh log every rejection (the exact amplification a flooder is trying to cause).
+- Hold a `_guard = self.metrics.connection_guard()` for the lifetime of an accepted connection so `decdn_active_connections` is correct.
+- Wrap each ordered protocol step in a `tokio::time::timeout`. Probe uses `ACCEPT_BI_TIMEOUT = 5s`, `*_READ_TIMEOUT = 5s`, `*_CLOSE_TIMEOUT = 3s`, `REJECTION_CLOSE_TIMEOUT = 250ms`. Without timeouts a single peer can pin a handler task indefinitely by stalling at any step.
+- Map frame/decode errors to ADR 013 [Application Error Codes](adr/013-schema-evolution.md#application-error-codes) — `0x01 UNSUPPORTED_MESSAGE`, `0x02 MESSAGE_TOO_LARGE`, `0x03 MALFORMED_MESSAGE` — and propagate them via `RecvStream::stop` / `SendStream::reset`. For 1:1 connection-stream protocols also call `conn.close(VarInt::from_u32(code), b"...")` so the code reaches the peer deterministically.
+- Match every `FrameError` variant explicitly when mapping to app codes — the explicit match makes a future `#[non_exhaustive]` addition fail the build instead of silently collapsing into `MALFORMED_MESSAGE`.
+- Increment a metric on success (e.g. `self.metrics.foo_request()`) and emit `tracing::warn!(app_code, error = %e, ...)` on each rejected request.
+
+The shape of the handler:
+
+```rust
+use iroh::protocol::{AcceptError, ProtocolHandler};
+use iroh::endpoint::Connection;
+
+pub struct FooHandler { /* fields: node_id, metrics, limiter, ... */ }
+
+impl FooHandler {
+    pub const ALPN: &'static [u8] = decdn_protocol::ALPN_FOO;
+    pub fn new(/* deps */) -> Self { /* ... */ }
+
+    async fn serve(&self, conn: Connection) -> anyhow::Result<()> {
+        // limiter.acquire → metrics guard → accept_bi → read_frame
+        // → decode_message → handle → encode_message → write_frame → finish
+    }
+}
+
+impl ProtocolHandler for FooHandler {
+    async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
+        self.serve(conn)
+            .await
+            .map_err(|e| AcceptError::from_err(std::io::Error::other(e.to_string())))
+    }
+}
+```
+
+#### 4. Re-export the module in `crates/node/src/handlers/mod.rs`
+
+```rust
+pub mod foo;
+```
+
+#### 5. Wire it onto the `Router` in `crates/node/src/runtime/mod.rs`
+
+Construct the handler after `ConnectionLimiter` and `Metrics` exist, then chain it onto the `Router::builder` next to `ProbeHandler`:
+
+```rust
+let foo_handler = Arc::new(FooHandler::new(/* deps */));
+
+let router = Router::builder(ep.clone())
+    .accept(ProbeHandler::ALPN, probe_handler)
+    .accept(FooHandler::ALPN, foo_handler)
+    .accept(GOSSIP_ALPN, gossip.clone())
+    .spawn();
+```
+
+If your handler holds reloadable state (rates, pinned hashes, security limits), follow the existing pattern in `RuntimeReloadState`: store the value behind `Arc<AtomicU64>` / `Arc<RwLock<…>>` and call `reload_state.attach_*` immediately after construction so a SIGHUP delivered during the rest of startup still finds a target.
+
+Bump `SHUTDOWN_DEADLINE` only if your handler's worst-case `accept_bi + read + close` budget exceeds the existing 15-second ceiling.
+
+#### 6. Add a loopback integration test
+
+Mirror [`crates/node/tests/probe_loopback.rs`](crates/node/tests/probe_loopback.rs): build two `iroh::Endpoint`s on `127.0.0.1` with `RelayMode::Disabled`, run your handler on the server endpoint, exercise the full request → response path on the client, and assert metrics increment. Use `permissive_limiter` to bypass rate limits in tests that aren't exercising rate-limit behaviour, and a tightly-configured `ConnectionLimiter` for tests that are.
+
+### Cross-cutting requirements
+
+- **Anti-panic policy** (see [Code Style](#code-style)): no `unwrap`, `expect`, `panic!`, or `arr[i]` indexing. The handler runs on every accepted connection — a panic crashes one task per connection and risks leaking handler state through the `JoinSet`.
+- **ADR cross-references in module docs**: every handler module's doc-comment header should name the ALPN it serves and the ADR section that defines its message format and error codes (see the `probe.rs` header for the pattern).
+- **Variant-order discipline**: when adding fields, follow [ADR 013](adr/013-schema-evolution.md) — append-only for Tier 1, frozen-body split for signed payloads. Don't reorder existing variants.
+
 ## Firewall and Security
 
 On container start, `init-firewall.sh` configures a default-deny iptables firewall.
