@@ -307,9 +307,6 @@ function reclaimNodeId(
     bytes calldata ed25519Signature
 ) external;
 
-// PoC only — admin forcibly deregisters a squatted NodeId (removed in production)
-function adminReclaimNodeId(bytes32 nodeId) external;  // onlyOwner
-
 // Views
 function getNode(bytes32 nodeId) external view returns (NodeInfo memory);
 function getNodeByAddress(address ethAddress) external view returns (NodeInfo memory);
@@ -359,7 +356,6 @@ A governable cooldown (0–86400 seconds, see [ADR 009](009-governance.md)) prev
 | `updateMultiaddrs()` | ~60k gas | ~$0.03 |
 | `deregisterNode()` | ~80k gas | ~$0.05 |
 | `reclaimNodeId()` | ~600k–1.1M gas | ~$0.24–$0.44 |
-| `adminReclaimNodeId()` | ~80k gas | ~$0.05 |
 
 `registerNode` and `reclaimNodeId` include ~500k–1M gas for on-chain ed25519 signature verification (Solidity library). This is a one-time cost per node lifetime; the per-node cost is negligible compared to the minimum stake deposit. These estimates assume typical multiaddr sizes (2–4 addresses, ~200 bytes total). Larger multiaddr payloads increase storage gas proportionally.
 
@@ -395,8 +391,4 @@ EVM has no native ed25519 precompile, and the RIP-7212 proposal is not yet deplo
 
 #### Reclaim flow
 
-If a NodeId was squatted (e.g., during a transition period or via a contract bug), the legitimate ed25519 key holder can call `reclaimNodeId(nodeId, ed25519Signature)`. This function verifies the ed25519 signature over `keccak256(abi.encodePacked(nodeId, msg.sender, block.chainid, registrationNonce[nodeId]))`, forcibly deregisters the current holder (triggering their unbonding period and incrementing `registrationNonce`), clears the NodeId-to-address mappings, and emits `NodeIdReclaimed`. The caller can then call `registerNode` to register the NodeId under their own address. The reclaim function does not require the caller to have stake — it only proves ed25519 key ownership and clears the squatter's binding.
-
-#### PoC safety valve
-
-`adminReclaimNodeId(nodeId)` is an `onlyOwner` function (the PoC admin key per [ADR 009](009-governance.md)) that forcibly deregisters a squatted NodeId without requiring an ed25519 proof. This exists as a fallback in case the ed25519 verification library has bugs or edge cases during early testing. It triggers the squatter's unbonding, clears mappings, increments `registrationNonce`, and emits `NodeIdReclaimed`. This function is removed in production — `reclaimNodeId` is the sole reclaim mechanism.
+If a NodeId was squatted (e.g., during a transition period or via a contract bug), the legitimate ed25519 key holder can call `reclaimNodeId(nodeId, ed25519Signature)`. This function verifies the ed25519 signature over `keccak256(abi.encodePacked(nodeId, msg.sender, block.chainid, registrationNonce[nodeId]))`, forcibly deregisters the current holder (triggering their unbonding period and incrementing `registrationNonce`), clears the NodeId-to-address mappings, and emits `NodeIdReclaimed`. The caller can then call `registerNode` to register the NodeId under their own address. The reclaim function does not require the caller to have stake — it only proves ed25519 key ownership and clears the squatter's binding. `reclaimNodeId` is the sole reclaim mechanism: there is no admin override.
