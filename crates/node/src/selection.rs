@@ -201,7 +201,9 @@ fn pick_best_in_group(
 
 /// Return the exclusive end index of the tie group beginning at `start`.
 /// Two adjacent candidates are in the same group iff their relative score
-/// difference is ≤ [`TIE_THRESHOLD`].
+/// difference is ≤ [`TIE_THRESHOLD`]. Two candidates with score `0.0` are
+/// always grouped together; a zero-score candidate is strictly better than
+/// any positive-score candidate and ends the group.
 fn tie_group_end(ranked: &[RankedCandidate], start: usize) -> usize {
     let pivot = match ranked.get(start) {
         Some(r) => r.score,
@@ -213,8 +215,11 @@ fn tie_group_end(ranked: &[RankedCandidate], start: usize) -> usize {
             Some(r) => r.score,
             None => break,
         };
-        let denom = pivot.min(next);
-        if denom <= 0.0 || (next - pivot).abs() / denom > TIE_THRESHOLD {
+        // Sort is ascending, so next >= pivot. Equal scores stay in the
+        // group; otherwise the relative diff against the (positive) pivot
+        // decides. A pivot of 0.0 with a strictly larger next ends the
+        // group — zero is strictly better than any positive score.
+        if next > pivot && (pivot == 0.0 || (next - pivot) / pivot > TIE_THRESHOLD) {
             break;
         }
         end += 1;
@@ -439,6 +444,29 @@ mod tests {
         let cheap = with_load(make_candidate(1, 100, 10, 1.0), 0, 90); // score 1000
         let dear = with_load(make_candidate(2, 1020, 1, 1.0), 0, 10); // score 1020
         let out = rank_candidates(vec![cheap, dear]);
+        assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(1));
+    }
+
+    #[test]
+    fn zero_score_candidates_group_together_for_tie_break() {
+        // Two zero-score candidates (rate=0, both have score 0.0) must form a
+        // single tie group so the load tier picks between them. Without the
+        // zero-pivot fix, each becomes its own singleton group and load is
+        // skipped entirely.
+        let zero_high_load = with_load(make_candidate(1, 0, 10, 1.0), 0, 90); // score 0, high load
+        let zero_low_load = with_load(make_candidate(2, 0, 10, 1.0), 0, 10); // score 0, low load
+        let out = rank_candidates(vec![zero_high_load, zero_low_load]);
+        // Tied at 0.0 → lower-load (id 2) wins.
+        assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(2));
+    }
+
+    #[test]
+    fn zero_score_beats_positive_score() {
+        // A zero-score candidate is strictly better than any positive-score
+        // candidate and must not be tie-grouped with one.
+        let zero = make_candidate(1, 0, 10, 1.0); // score 0
+        let positive = make_candidate(2, 1, 1, 1.0); // score 1
+        let out = rank_candidates(vec![positive, zero]);
         assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(1));
     }
 
