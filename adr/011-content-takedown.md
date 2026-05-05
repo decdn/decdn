@@ -202,6 +202,11 @@ interface IOriginAssignment {
     function addDefaultOpenOperator(address operator) external;
     function removeDefaultOpenOperator(address operator) external;
 
+    // Wires the read-direction integration with ContentBlacklist for
+    // pruneBlacklistedAssignment. Called once during post-deploy initialization
+    // (see ADR 016) and not expected to change thereafter; GOVERNANCE_ROLE only.
+    function setContentBlacklist(address contentBlacklist) external;
+
     // Governable parameters with safety bounds (see ADR 009)
     function setMinRedundancy(uint256 floor) external;             // non-zero namespaces
     function setMaxOriginsPerNamespace(uint256 cap) external;      // non-zero namespaces
@@ -280,7 +285,7 @@ authorized(operator, hash, t)  :=
 
 `OriginAssignment` therefore stores a per-(namespace, operator) checkpoint history: an append-only array of `{activatedAt, revokedAt}` entries. `revokedAt = type(uint64).max` marks an entry as currently active. `isAuthorizedOriginAt(namespaceId, operator, t)` returns `true` iff some checkpoint satisfies `activatedAt <= t < revokedAt`. The query is O(log N) with binary search over the checkpoint array; in practice `N` per pair is tiny (most operators are activated once, revoked once, never re-activated).
 
-The slash-evidence-age bound from [ADR 009](009-governance.md) (default 7 days, range 1–30 days) limits how old a probe response may be when submitted as evidence. Checkpoint arrays older than the maximum evidence age may be pruned by a permissionless garbage-collection call; the contract retains only the entries needed to evaluate the current evidence window plus a margin for in-flight challenges. This caps storage growth at `O(maxEvidenceAge × authorization_churn)` per pair rather than unbounded history.
+The slash-evidence-age bound from [ADR 009](009-governance.md) (default 7 days, range 1–30 days) limits how old a probe response may be when submitted as evidence. Checkpoint arrays older than the maximum evidence age may be pruned by a permissionless garbage-collection call. Two invariants protect ongoing service and lookup correctness: (i) the *currently active* checkpoint (the one with `revokedAt == type(uint64).max`) is never pruned regardless of how old its `activatedAt` is — pruning it would erase the operator's authorization for any new probe; (ii) the contract retains the most recent checkpoint whose `activatedAt` precedes the start of the current evidence window, so binary-search lookups for evidence near the window's lower edge remain valid. Subject to those invariants, the contract retains only the entries needed to evaluate the current evidence window plus a margin for in-flight challenges. This caps storage growth at `O(maxEvidenceAge × authorization_churn)` per pair rather than unbounded history.
 
 Re-authorization of a previously revoked operator appends a new checkpoint; older checkpoints continue to authorize old probe responses correctly. The publisher / governance can revoke and re-activate freely without invalidating in-flight evidence.
 
