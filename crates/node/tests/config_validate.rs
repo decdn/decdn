@@ -202,6 +202,7 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             origin_path: None,
             decompress: decdn_cache::DecompressMode::Auto,
             pinned_hashes: decdn_cache::PinnedHashes::empty(),
+            origin_retry: decdn_cache::RetryPolicy::default(),
         },
         payment: ResolvedPayment { rate_per_mb: 10 },
         observability: ResolvedObservability {

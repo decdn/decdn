@@ -18,7 +18,7 @@ use reqwest::header::CONTENT_ENCODING;
 use serde::{Deserialize, Serialize};
 
 use super::{Origin, OriginFetch};
-use crate::error::{OriginError, SupportedEncoding};
+use crate::error::{OriginError, OriginPullError, SupportedEncoding};
 
 /// How long to wait for the TCP/TLS handshake to complete. Per-request total
 /// duration is intentionally *not* bounded because `max_blob_size_mb` can be
@@ -350,18 +350,72 @@ fn read_capped<R: Read>(
     Ok(Bytes::from(buf))
 }
 
+/// Classify a `reqwest::Error` raised by `.send()` or `.chunk()`. The
+/// transient bucket spans every realistic transport-layer failure on
+/// this code path:
+///
+/// - `is_connect()` — TCP/TLS handshake failed.
+/// - `is_timeout()` — reqwest's own timeout fired (separate from our
+///   `tokio::time::timeout` wrappers, which produce `Elapsed` and never
+///   reach this helper).
+/// - `is_request()` — request-construction problems that *can* fire on
+///   a parsed URL (e.g. invalid header value injected by reqwest mid-
+///   redirect).
+/// - `is_body()` — body stream ended unexpectedly. Could in principle
+///   be a deterministic origin protocol violation (mid-stream framing
+///   error), but in operational practice this fires on connection
+///   resets and is worth retrying. Tradeoff is bounded by `max_retries`.
+/// - `is_decode()` — character-set / chunked-transfer parse failure.
+///   With reqwest auto-decompression disabled (see `HttpOrigin::new`)
+///   this no longer fires for gzip/zstd; the remaining triggers are
+///   protocol-level and retrying *may* mask a deterministic bug, but
+///   the `max_retries` ceiling bounds the cost.
+///
+/// The `else` arm covers `is_builder()` (unreachable with a parsed
+/// `OriginUrl`), `is_redirect()` (we follow with reqwest's default
+/// limit), `is_status()` (we handle status codes ourselves before
+/// reaching here), and any future reqwest variant. Permanent because
+/// none of those are operationally retriable.
+fn classify_reqwest_error(e: reqwest::Error) -> OriginPullError {
+    if e.is_connect() || e.is_timeout() || e.is_request() || e.is_body() || e.is_decode() {
+        OriginPullError::Transient(e.into())
+    } else {
+        OriginPullError::Permanent(e.into())
+    }
+}
+
+/// Status-code classification per RFC 9110 + operational practice:
+/// 5xx, 408 (Request Timeout), and 429 (Too Many Requests) are retriable;
+/// every other 4xx is permanent. `404` is intercepted earlier as
+/// `OriginFetch::NotFound`; this helper assumes the caller already
+/// excluded it.
+fn is_transient_status(status: StatusCode) -> bool {
+    status.is_server_error() || status == StatusCode::REQUEST_TIMEOUT || status.as_u16() == 429
+}
+
 impl Origin for HttpOrigin {
+    // The body folds together URL parsing, the headers-phase request,
+    // status classification, encoding extraction, the chunked-body
+    // streaming loop, and the decompression branch. Splitting it
+    // further would force passing `resp` and `url_log` across a
+    // boundary that would obscure the linear failure-classification
+    // flow more than the length itself does.
+    #[allow(clippy::too_many_lines)]
     fn fetch(
         &self,
         hash: Hash,
         max_bytes: u64,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<OriginFetch>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>> {
         Box::pin(async move {
+            // URL build can only fail on a malformed hash or a
+            // pathological base URL — both are caller-side bugs, never
+            // transient.
             let url = self
                 .base_url
                 .as_url()
                 .join(&hash.to_hex())
-                .with_context(|| format!("failed to build URL for {hash}"))?;
+                .with_context(|| format!("failed to build URL for {hash}"))
+                .map_err(OriginPullError::Permanent)?;
             // Always log the redacted form — `url` may inherit userinfo
             // from `base_url`, and errors go to logs.
             let url_log = redact_for_log(&url);
@@ -373,19 +427,31 @@ impl Origin for HttpOrigin {
             // TCP/TLS but never writes back.
             let headers_timeout = self.response_headers_timeout;
             let send_fut = self.client.get(url.clone()).send();
-            let mut resp = tokio::time::timeout(headers_timeout, send_fut)
-                .await
-                .with_context(|| {
-                    format!("origin GET {url_log} headers timed out after {headers_timeout:?}")
-                })?
-                .with_context(|| format!("origin GET {url_log} failed"))?;
+            let mut resp = match tokio::time::timeout(headers_timeout, send_fut).await {
+                Err(_elapsed) => {
+                    // Headers-phase timeout: transient.
+                    return Err(OriginPullError::Transient(anyhow::anyhow!(
+                        "origin GET {url_log} headers timed out after {headers_timeout:?}"
+                    )));
+                }
+                Ok(Err(reqwest_err)) => {
+                    return Err(classify_reqwest_error(reqwest_err)
+                        .map_inner(|e| e.context(format!("origin GET {url_log} failed"))));
+                }
+                Ok(Ok(resp)) => resp,
+            };
 
             let status = resp.status();
             if status == StatusCode::NOT_FOUND {
                 return Ok(OriginFetch::NotFound);
             }
             if !status.is_success() {
-                anyhow::bail!("origin GET {url_log} returned {status}");
+                let err = anyhow::anyhow!("origin GET {url_log} returned {status}");
+                return Err(if is_transient_status(status) {
+                    OriginPullError::Transient(err)
+                } else {
+                    OriginPullError::Permanent(err)
+                });
             }
 
             // Capture the encoding before consuming the body. The
@@ -400,7 +466,13 @@ impl Origin for HttpOrigin {
                 None => String::new(),
                 Some(v) => match v.to_str() {
                     Ok(s) => s.to_string(),
-                    Err(_) => return Err(OriginError::MalformedEncoding.into()),
+                    Err(_) => {
+                        // Malformed header is a deterministic origin
+                        // protocol violation — won't be cured by retry.
+                        return Err(OriginPullError::Permanent(
+                            OriginError::MalformedEncoding.into(),
+                        ));
+                    }
                 },
             };
             let trimmed = encoding.trim();
@@ -419,9 +491,12 @@ impl Origin for HttpOrigin {
             if let Some(len) = resp.content_length()
                 && len > max_bytes
             {
-                anyhow::bail!(
+                // Size-cap breach: the origin is sending us more bytes
+                // than the operator allowed. Retrying won't help — this
+                // is permanent.
+                return Err(OriginPullError::Permanent(anyhow::anyhow!(
                     "origin GET {url_log} advertises {len} bytes, exceeds max {max_bytes}"
-                );
+                )));
             }
 
             // Stream the body chunk-by-chunk. Three guards run per chunk:
@@ -445,21 +520,26 @@ impl Origin for HttpOrigin {
             let idle_timeout = self.chunk_idle_timeout;
             let mut buf = BytesMut::with_capacity(hint);
             loop {
-                let chunk_result = tokio::time::timeout(idle_timeout, resp.chunk())
-                    .await
-                    .with_context(|| {
-                        format!(
+                let chunk_result = match tokio::time::timeout(idle_timeout, resp.chunk()).await {
+                    Err(_elapsed) => {
+                        return Err(OriginPullError::Transient(anyhow::anyhow!(
                             "origin GET {url_log} body read stalled for {idle_timeout:?} after {} bytes buffered",
                             buf.len()
-                        )
-                    })?
-                    .with_context(|| format!("origin GET {url_log} body read failed"))?;
+                        )));
+                    }
+                    Ok(Err(reqwest_err)) => {
+                        return Err(classify_reqwest_error(reqwest_err).map_inner(|e| {
+                            e.context(format!("origin GET {url_log} body read failed"))
+                        }));
+                    }
+                    Ok(Ok(chunk)) => chunk,
+                };
                 let Some(chunk) = chunk_result else { break };
                 let next_total = (buf.len() as u64).saturating_add(chunk.len() as u64);
                 if next_total > max_bytes {
-                    anyhow::bail!(
+                    return Err(OriginPullError::Permanent(anyhow::anyhow!(
                         "origin GET {url_log} body exceeds max_bytes={max_bytes} mid-stream"
-                    );
+                    )));
                 }
                 buf.extend_from_slice(&chunk);
             }
@@ -472,10 +552,12 @@ impl Origin for HttpOrigin {
             // debug than a clear `UnsupportedEncoding` error here.
             if matches!(self.decompress, DecompressMode::Strict) {
                 if is_compressed {
-                    return Err(OriginError::UnsupportedEncoding {
-                        encoding: trimmed.into(),
-                    }
-                    .into());
+                    return Err(OriginPullError::Permanent(
+                        OriginError::UnsupportedEncoding {
+                            encoding: trimmed.into(),
+                        }
+                        .into(),
+                    ));
                 }
                 return Ok(OriginFetch::Found(raw));
             }
@@ -487,21 +569,34 @@ impl Origin for HttpOrigin {
             // The `OriginError` is propagated *typed* (no
             // `with_context` wrapping it directly) so
             // [`crate::CacheError::origin_error_kind`] can recover the
-            // variant from the chain without a string match. The outer
-            // `?` converts via `From<OriginError> for anyhow::Error`,
-            // which preserves downcastability.
+            // variant from the chain without a string match.
             let decoded = if raw.len() <= DECOMPRESS_BLOCKING_THRESHOLD {
-                decompress_body(raw, &encoding, max_bytes)?
+                decompress_body(raw, &encoding, max_bytes)
+                    .map_err(|e| OriginPullError::Permanent(e.into()))?
             } else {
                 let raw_for_decode = raw;
                 let encoding_for_decode = encoding.clone();
-                tokio::task::spawn_blocking(move || {
+                let join_result = tokio::task::spawn_blocking(move || {
                     decompress_body(raw_for_decode, &encoding_for_decode, max_bytes)
                 })
-                .await
-                .with_context(|| {
-                    format!("origin GET {url_log} body decompression task failed to join")
-                })??
+                .await;
+                match join_result {
+                    Ok(Ok(bytes)) => bytes,
+                    Ok(Err(decode_err)) => {
+                        return Err(OriginPullError::Permanent(decode_err.into()));
+                    }
+                    Err(join_err) => {
+                        // JoinError is a runtime failure (panic /
+                        // cancellation). Treat as transient — a panic
+                        // *here* probably won't recur on the next try
+                        // and operators see the full chain in logs.
+                        return Err(OriginPullError::Transient(
+                            anyhow::Error::from(join_err).context(format!(
+                                "origin GET {url_log} body decompression task failed to join"
+                            )),
+                        ));
+                    }
+                }
             };
             Ok(OriginFetch::Found(decoded))
         })

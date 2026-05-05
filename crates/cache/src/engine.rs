@@ -15,6 +15,7 @@ use tokio::sync::Notify;
 
 use crate::error::{CacheError, CacheResult};
 use crate::origin::{Origin, OriginFetch};
+use crate::retry::{NoopObserver, RetryObserver, RetryPolicy, retry_fetch};
 
 /// Engine bundling a filesystem-backed iroh-blobs store with an optional
 /// origin backend. Lookups hit the store first; on miss and when an origin is
@@ -73,6 +74,19 @@ struct Inner {
     /// hand-edit it during incident response; duplicate lines are tolerated
     /// (loading deduplicates via the `HashSet`).
     evicted_log_path: PathBuf,
+    /// Origin pull-through retry policy (#285). Held in [`ArcSwap`] so
+    /// SIGHUP can swap in a new policy atomically — see
+    /// [`CacheEngine::set_retry_policy`]. Read once per `pull_through`
+    /// call via `load`; the `Arc<RetryPolicy>` is cheap to clone and
+    /// `RetryPolicy: Copy` so the per-fetch read is a single atomic
+    /// pointer load + a stack copy.
+    retry_policy: ArcSwap<RetryPolicy>,
+    /// Observer plugged into the retry loop so the node crate can record
+    /// retry metrics without the cache crate taking a dependency on
+    /// metrics infrastructure (#285). [`NoopObserver`] when no observer
+    /// is wired up — the trait is fire-and-forget so the no-op cost is
+    /// effectively zero.
+    retry_observer: Arc<dyn RetryObserver>,
 }
 
 /// Coarse-grained cache statistics.
@@ -417,11 +431,39 @@ impl CacheEngine {
     /// Open the cache with an initial pinning set. The set is held in an
     /// [`ArcSwap`] internally so subsequent SIGHUP reloads can call
     /// [`Self::set_pinned`] without rebuilding the engine.
+    ///
+    /// Defaults the retry policy to [`RetryPolicy::default`] and the
+    /// retry observer to [`NoopObserver`]. Use [`Self::open_full`] to
+    /// override either — the node crate plugs in `MetricsRetryObserver`
+    /// and the operator-configured policy through that path.
     pub async fn open_with_pinned(
         cache_dir: &Path,
         origin: Option<Arc<dyn Origin>>,
         max_blob_mb: u64,
         pinned: PinnedHashes,
+    ) -> CacheResult<Self> {
+        Self::open_full(
+            cache_dir,
+            origin,
+            max_blob_mb,
+            pinned,
+            RetryPolicy::default(),
+            Arc::new(NoopObserver),
+        )
+        .await
+    }
+
+    /// Open the cache with full control over every reloadable knob.
+    /// Production callers (the runtime's `build_cache`) use this directly;
+    /// tests usually want [`Self::open`] or [`Self::open_with_pinned`]
+    /// with their defaults.
+    pub async fn open_full(
+        cache_dir: &Path,
+        origin: Option<Arc<dyn Origin>>,
+        max_blob_mb: u64,
+        pinned: PinnedHashes,
+        retry_policy: RetryPolicy,
+        retry_observer: Arc<dyn RetryObserver>,
     ) -> CacheResult<Self> {
         tokio::fs::create_dir_all(cache_dir)
             .await
@@ -449,6 +491,8 @@ impl CacheEngine {
                 pinned: ArcSwap::from(pinned.0),
                 evicted: Mutex::new(evicted),
                 evicted_log_path,
+                retry_policy: ArcSwap::from(Arc::new(retry_policy)),
+                retry_observer,
             }),
         })
     }
@@ -473,6 +517,23 @@ impl CacheEngine {
     /// resolves to an `Arc<HashSet<Hash>>` we then own.
     pub fn pinned_snapshot(&self) -> PinnedHashes {
         PinnedHashes(self.inner.pinned.load_full())
+    }
+
+    /// Atomically swap the origin pull-through retry policy (#285).
+    /// Called by the runtime's SIGHUP handler when `cache.origin_retry`
+    /// changes. Readers (the retry loop) observe either the old or the
+    /// new policy on a per-fetch basis, never a partial mix —
+    /// `RetryPolicy: Copy`, so the read is a single atomic pointer load
+    /// followed by a stack copy of the value.
+    pub fn set_retry_policy(&self, new: RetryPolicy) {
+        self.inner.retry_policy.store(Arc::new(new));
+    }
+
+    /// Snapshot of the current retry policy. Cheap (one atomic load and
+    /// a [`RetryPolicy`] `Copy`). Used by reload tests and by operators
+    /// who want to log the active policy after a SIGHUP.
+    pub fn current_retry_policy(&self) -> RetryPolicy {
+        **self.inner.retry_policy.load()
     }
 
     /// Is `hash` currently pinned? Cheap O(1) lookup against the live set.
@@ -836,10 +897,23 @@ impl CacheEngine {
             .as_ref()
             .ok_or(CacheError::NoOrigin { hash })?;
 
-        let fetch = origin
-            .fetch(hash, self.inner.max_blob_bytes)
-            .await
-            .map_err(|source| CacheError::OriginError { hash, source })?;
+        // Read the policy once per pull-through. SIGHUP can swap the
+        // ArcSwap mid-flight; treating the value as a snapshot keeps the
+        // retry-loop math consistent within a single request, and the
+        // *next* request picks up the new policy immediately.
+        let policy = **self.inner.retry_policy.load();
+        let fetch = retry_fetch(
+            origin,
+            hash,
+            self.inner.max_blob_bytes,
+            policy,
+            &self.inner.retry_observer,
+        )
+        .await
+        .map_err(|e| CacheError::OriginError {
+            hash,
+            source: e.into_inner(),
+        })?;
 
         let bytes = match fetch {
             OriginFetch::NotFound => return Err(CacheError::NotFound { hash }),
@@ -940,7 +1014,8 @@ mod tests {
             &self,
             hash: Hash,
             _max_bytes: u64,
-        ) -> Pin<Box<dyn Future<Output = anyhow::Result<OriginFetch>> + Send + '_>> {
+        ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, crate::OriginPullError>> + Send + '_>>
+        {
             let result = if hash == self.hash {
                 Ok(OriginFetch::Found(self.data.clone()))
             } else {
@@ -1085,7 +1160,8 @@ mod tests {
             &self,
             hash: Hash,
             _max_bytes: u64,
-        ) -> Pin<Box<dyn Future<Output = anyhow::Result<OriginFetch>> + Send + '_>> {
+        ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, crate::OriginPullError>> + Send + '_>>
+        {
             self.fetch_count.fetch_add(1, Ordering::SeqCst);
             let result = if hash == self.hash {
                 Ok(OriginFetch::Found(self.data.clone()))

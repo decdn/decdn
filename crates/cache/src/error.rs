@@ -166,3 +166,62 @@ pub enum OriginError {
 
 /// Convenience result alias.
 pub type CacheResult<T> = std::result::Result<T, CacheError>;
+
+/// Outcome of a single [`crate::origin::Origin::fetch`] call, classified by
+/// whether a retry is appropriate. The cache engine's retry loop drives off
+/// this distinction — `Transient` failures are retried up to
+/// [`crate::RetryPolicy::max_retries`], `Permanent` failures surface to the
+/// caller immediately.
+///
+/// Both variants carry an [`anyhow::Error`] so adapters can keep their
+/// existing `with_context` chains intact; classification is the only new
+/// signal. After the retry loop exhausts (or the failure is permanent), the
+/// engine collapses both variants back into [`CacheError::OriginError`] so
+/// external observers see no change in the error surface.
+#[derive(Debug, Error)]
+pub enum OriginPullError {
+    /// A retry-eligible failure: HTTP 5xx/408/429, connect/headers/chunk
+    /// timeouts, transport-level connection resets, or transient I/O on the
+    /// filesystem origin (`Interrupted`, `TimedOut`, `ResourceBusy`, `WouldBlock`).
+    #[error(transparent)]
+    Transient(anyhow::Error),
+
+    /// A failure that won't be cured by retrying: HTTP 4xx (other than 404,
+    /// which maps to [`crate::origin::OriginFetch::NotFound`]),
+    /// encoding/decompression problems, size-cap breaches, symlink-escape
+    /// or permission-denied on the filesystem origin.
+    #[error(transparent)]
+    Permanent(anyhow::Error),
+}
+
+impl OriginPullError {
+    /// True when the variant is `Transient` — the retry loop tests this in
+    /// the hot path; keep it `const` so it inlines cleanly.
+    pub const fn is_transient(&self) -> bool {
+        matches!(self, Self::Transient(_))
+    }
+
+    /// Unwrap the underlying `anyhow::Error`, discarding the
+    /// transient/permanent classification. Used by the cache engine when
+    /// collapsing into [`CacheError::OriginError`] after retries are
+    /// exhausted (or on the first permanent failure).
+    pub fn into_inner(self) -> anyhow::Error {
+        match self {
+            Self::Transient(e) | Self::Permanent(e) => e,
+        }
+    }
+
+    /// Apply `f` to the inner `anyhow::Error` while preserving the
+    /// transient/permanent classification. Lets adapters stack
+    /// `with_context` (or any other error transform) onto a typed error
+    /// without flipping it to the wrong variant.
+    pub(crate) fn map_inner<F>(self, f: F) -> Self
+    where
+        F: FnOnce(anyhow::Error) -> anyhow::Error,
+    {
+        match self {
+            Self::Transient(e) => Self::Transient(f(e)),
+            Self::Permanent(e) => Self::Permanent(f(e)),
+        }
+    }
+}

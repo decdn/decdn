@@ -12,12 +12,17 @@
 pub mod engine;
 pub mod error;
 pub mod origin;
+pub mod retry;
 
 pub use engine::{
     CacheEngine, CacheStats, EvictionCandidates, EvictionPreview, PinDiff, PinnedHashes,
 };
-pub use error::{CacheError, CacheResult, OriginError, SupportedEncoding};
+pub use error::{CacheError, CacheResult, OriginError, OriginPullError, SupportedEncoding};
 pub use iroh_blobs::Hash;
 pub use origin::{
     DecompressMode, FilesystemOrigin, HttpOrigin, Origin, OriginFetch, OriginUrl, parse_origin_url,
+};
+pub use retry::{
+    MAX_BACKOFF_MS_CEILING, MAX_RETRIES_CEILING, NoopObserver, RetryObserver, RetryOutcome,
+    RetryPolicy, RetryPolicyError,
 };

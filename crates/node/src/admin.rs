@@ -909,8 +909,14 @@ mod tests {
                 &self,
                 hash: Hash,
                 _max_bytes: u64,
-            ) -> Pin<Box<dyn Future<Output = anyhow::Result<decdn_cache::OriginFetch>> + Send + '_>>
-            {
+            ) -> Pin<
+                Box<
+                    dyn Future<
+                            Output = Result<decdn_cache::OriginFetch, decdn_cache::OriginPullError>,
+                        > + Send
+                        + '_,
+                >,
+            > {
                 let result = if hash == self.hash {
                     Ok(decdn_cache::OriginFetch::Found(self.data.clone()))
                 } else {
@@ -1033,8 +1039,14 @@ mod tests {
                 &self,
                 hash: Hash,
                 _max_bytes: u64,
-            ) -> Pin<Box<dyn Future<Output = anyhow::Result<decdn_cache::OriginFetch>> + Send + '_>>
-            {
+            ) -> Pin<
+                Box<
+                    dyn Future<
+                            Output = Result<decdn_cache::OriginFetch, decdn_cache::OriginPullError>,
+                        > + Send
+                        + '_,
+                >,
+            > {
                 let result = if hash == self.hash {
                     Ok(decdn_cache::OriginFetch::Found(self.data.clone()))
                 } else {
@@ -1128,8 +1140,14 @@ mod tests {
                 &self,
                 hash: Hash,
                 _max_bytes: u64,
-            ) -> Pin<Box<dyn Future<Output = anyhow::Result<decdn_cache::OriginFetch>> + Send + '_>>
-            {
+            ) -> Pin<
+                Box<
+                    dyn Future<
+                            Output = Result<decdn_cache::OriginFetch, decdn_cache::OriginPullError>,
+                        > + Send
+                        + '_,
+                >,
+            > {
                 let result = if hash == self.hash {
                     Ok(decdn_cache::OriginFetch::Found(self.data.clone()))
                 } else {

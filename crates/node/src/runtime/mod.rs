@@ -77,16 +77,24 @@ pub async fn run(
     let secret_key = identity::load_or_generate(&cfg.identity.data_dir)?;
     tracing::info!(node_id = %secret_key.public(), "loaded node identity");
 
-    let cache = build_cache(&cfg).await?;
+    let cache = build_cache(&cfg, Arc::clone(&node_metrics)).await?;
     // Attach the cache to the reload state so SIGHUP handlers can swap
     // the pinned-hashes set atomically (#276). Done immediately after
     // `build_cache` succeeds so a SIGHUP delivered during the rest of
     // startup will still find a target.
     reload_state.attach_cache(Some(cache.clone()));
+    let retry = cfg.cache.origin_retry;
     tracing::info!(
         cache_dir = %cfg.cache.cache_dir.display(),
         has_origin = cfg.cache.origin_url.is_some() || cfg.cache.origin_path.is_some(),
         pinned_hashes = cfg.cache.pinned_hashes.len(),
+        // Origin retry policy (#285). Logged at startup so SIGHUP-applied
+        // deltas have a baseline in the same log stream and operators
+        // can audit the active resilience budget without hitting an RPC.
+        retry_max_retries = retry.max_retries,
+        retry_initial_backoff_ms = retry.initial_backoff_ms,
+        retry_max_backoff_ms = retry.max_backoff_ms,
+        retry_jitter_ratio = retry.jitter_ratio,
         "cache engine ready",
     );
 
@@ -488,7 +496,13 @@ fn log_join_result(result: Result<(), tokio::task::JoinError>, phase: &'static s
 /// `config::resolve_cache`); neither-set means the engine serves only
 /// already-cached content and cache misses surface as
 /// `CacheError::NoOrigin`.
-async fn build_cache(cfg: &ResolvedConfig) -> anyhow::Result<CacheEngine> {
+///
+/// `node_metrics` is wired into the engine's retry observer slot (#285)
+/// so origin pull-through retries land on the `OpenMetrics` endpoint.
+async fn build_cache(
+    cfg: &ResolvedConfig,
+    node_metrics: Arc<metrics::Metrics>,
+) -> anyhow::Result<CacheEngine> {
     let origin: Option<Arc<dyn Origin>> =
         match (cfg.cache.origin_url.clone(), cfg.cache.origin_path.clone()) {
             (Some(url), None) => Some(Arc::new(
@@ -508,11 +522,15 @@ async fn build_cache(cfg: &ResolvedConfig) -> anyhow::Result<CacheEngine> {
                 anyhow::bail!("cache.origin_url and cache.origin_path are mutually exclusive")
             }
         };
-    CacheEngine::open_with_pinned(
+    let observer: Arc<dyn decdn_cache::RetryObserver> =
+        Arc::new(metrics::MetricsRetryObserver::new(node_metrics));
+    CacheEngine::open_full(
         &cfg.cache.cache_dir,
         origin,
         cfg.cache.max_blob_size_mb,
         cfg.cache.pinned_hashes.clone(),
+        cfg.cache.origin_retry,
+        observer,
     )
     .await
     .context("failed to open cache engine")

@@ -4,6 +4,11 @@
 //!   - `payment.rate_per_mb`
 //!   - `observability.log_level`
 //!   - `cache.pinned_hashes`
+//!   - `cache.origin_retry.*` (#285) — the engine holds the policy in
+//!     `ArcSwap<RetryPolicy>`, so `set_retry_policy` is a single atomic
+//!     pointer store. New retries in flight read either the old or the
+//!     new policy at the start of each `pull_through`; never a partial
+//!     mix.
 //!   - all of `security.*` — the live `ConnectionLimiter` swaps its
 //!     `Arc<Semaphore>` wholesale on reload (already-held permits drain
 //!     into the previous semaphore on drop; new acquires hit the new
@@ -59,7 +64,8 @@ use crate::cli::common::LogLevel;
 use crate::cli::run::{ObservabilityArgs, PaymentArgs};
 use crate::config::{
     FileConfig, ResolvedObservability, ResolvedPayment, ResolvedSecurity, load_file_config,
-    parse_pinned_hashes, resolve_observability, resolve_payment, resolve_security,
+    parse_pinned_hashes, resolve_observability, resolve_origin_retry, resolve_payment,
+    resolve_security,
 };
 use crate::dispatch::ConnectionLimiter;
 
@@ -139,6 +145,41 @@ pub(crate) trait ReloadableSection: Send + Sync {
     /// Must not fail — atomic stores, `Arc` swaps, and `ConnectionLimiter::reload`
     /// are the only operations allowed here.
     fn infallible_swap(&self);
+}
+
+/// Set a cache-engine slot owned by a `ReloadableSection`, recovering
+/// the inner value on a poisoned mutex. Used by [`RuntimeReloadState::attach_cache`]
+/// to populate both the pinned-hashes and origin-retry sections from a
+/// single attach call.
+///
+/// The poison flag is intentionally *not* cleared. Reachable poison
+/// here implies a panic in some other code path that held the lock —
+/// extremely rare since the lock's only callers are `attach_cache`
+/// (this function) and the section's `infallible_swap`, both of which
+/// are panic-free under workspace lints. The recovery write is
+/// belt-and-braces: it ensures the engine reference is at least stored
+/// (so e.g. the `pinned.engine` slot still receives the new engine if
+/// it had been transiently poisoned), but the next `infallible_swap`
+/// will see `lock()` return `Err` again and emit the section's
+/// `tracing::error!` and skip its swap. This matches the codebase's
+/// established "recover-the-data, log-loudly, do-not-clear-poison"
+/// pattern (see also `attach_limiter` and the trait doc on
+/// `ReloadableSection::infallible_swap`).
+fn attach_engine_to_section(
+    slot: &std::sync::Mutex<Option<decdn_cache::CacheEngine>>,
+    engine: Option<decdn_cache::CacheEngine>,
+    section: &'static str,
+) {
+    match slot.lock() {
+        Ok(mut guard) => *guard = engine,
+        Err(poisoned) => {
+            tracing::error!(
+                section,
+                "runtime reload cache mutex poisoned during attach; recovering inner state"
+            );
+            *poisoned.into_inner() = engine;
+        }
+    }
 }
 
 /// Helper for the buffer-cell pattern. Each section keeps a
@@ -365,6 +406,73 @@ impl ReloadableSection for PinnedHashesSection {
     }
 }
 
+// ----- origin_retry -------------------------------------------------------
+
+/// Reloadable `cache.origin_retry` section (#285). The engine holds the
+/// live policy in [`arc_swap::ArcSwap`], so the swap is atomic and
+/// readers never see a partial mix.
+struct OriginRetrySection {
+    /// Optional handle to the live cache engine. Same lifecycle rules
+    /// as [`PinnedHashesSection::engine`] — set by
+    /// [`RuntimeReloadState::attach_cache`] before the SIGHUP select
+    /// loop starts. Independent slot from `PinnedHashesSection::engine`
+    /// because [`decdn_cache::CacheEngine`] is `Clone`-cheap and a
+    /// poisoned mutex on one section must not poison the other.
+    engine: std::sync::Mutex<Option<decdn_cache::CacheEngine>>,
+    buf: std::sync::Mutex<Option<decdn_cache::RetryPolicy>>,
+}
+
+impl ReloadableSection for OriginRetrySection {
+    fn name(&self) -> &'static str {
+        "origin_retry"
+    }
+    fn clear_buffer(&self) {
+        if let Ok(mut g) = self.buf.lock() {
+            *g = None;
+        }
+    }
+    fn resolve(&self, file: &FileConfig) -> anyhow::Result<()> {
+        // `resolve_origin_retry` validates bounds (max_retries ceiling,
+        // initial<=max, jitter range). A failure here aborts the whole
+        // reload before any commit runs, per the all-or-nothing
+        // contract — bad retry config never escapes resolution.
+        let resolved =
+            resolve_origin_retry(file.cache.as_ref().and_then(|c| c.origin_retry.as_ref()))?;
+        if let Ok(mut g) = self.buf.lock() {
+            *g = Some(resolved);
+        }
+        Ok(())
+    }
+    fn infallible_swap(&self) {
+        let Some(resolved) = drain_or_log(&self.buf, self.name()) else {
+            return;
+        };
+        let attached = if let Ok(g) = self.engine.lock() {
+            if let Some(engine) = g.as_ref() {
+                engine.set_retry_policy(resolved);
+                true
+            } else {
+                false
+            }
+        } else {
+            tracing::error!(
+                section = self.name(),
+                "cache engine mutex poisoned in infallible_swap; retry-policy swap skipped"
+            );
+            false
+        };
+        tracing::info!(
+            section = self.name(),
+            cache_attached = attached,
+            max_retries = resolved.max_retries,
+            initial_backoff_ms = resolved.initial_backoff_ms,
+            max_backoff_ms = resolved.max_backoff_ms,
+            jitter_ratio = resolved.jitter_ratio,
+            "config reload section applied"
+        );
+    }
+}
+
 // ----- security -----------------------------------------------------------
 
 /// Reloadable `[security]` section.
@@ -440,6 +548,7 @@ pub struct RuntimeReloadState {
     payment: Arc<PaymentSection>,
     log_level: Arc<LogLevelSection>,
     pinned: Arc<PinnedHashesSection>,
+    origin_retry: Arc<OriginRetrySection>,
     security: Arc<SecuritySection>,
     /// Iteration order for the three-phase reload. Matches the order
     /// the previous monolithic body used (`payment`, `log_level`,
@@ -563,27 +672,34 @@ impl RuntimeReloadState {
             engine: std::sync::Mutex::new(None),
             buf: std::sync::Mutex::new(None),
         });
+        let origin_retry = Arc::new(OriginRetrySection {
+            engine: std::sync::Mutex::new(None),
+            buf: std::sync::Mutex::new(None),
+        });
         let security = Arc::new(SecuritySection {
             limiter: std::sync::Mutex::new(None),
             buf: std::sync::Mutex::new(None),
         });
         // Registration order is the same as the old monolithic body's
         // commit order: payment, log_level, pinned_hashes, security.
-        // The order matters for reproducibility (operator-visible
-        // tracing event order) and for the rollback-boundary contract
-        // documented on the trait — moving log_level later or earlier
-        // would change which pre-log_level commits survive a setter
-        // failure.
+        // origin_retry slots in next to pinned (both `cache.*`) and
+        // before security (cross-cutting). The order matters for
+        // reproducibility (operator-visible tracing event order) and
+        // for the rollback-boundary contract documented on the trait —
+        // moving log_level later or earlier would change which
+        // pre-log_level commits survive a setter failure.
         let sections: Vec<Arc<dyn ReloadableSection>> = vec![
             Arc::clone(&payment) as _,
             Arc::clone(&log_level) as _,
             Arc::clone(&pinned) as _,
+            Arc::clone(&origin_retry) as _,
             Arc::clone(&security) as _,
         ];
         Self {
             payment,
             log_level,
             pinned,
+            origin_retry,
             security,
             sections,
             last_file_sections: std::sync::Mutex::new(FileSectionSnapshot::default()),
@@ -604,15 +720,12 @@ impl RuntimeReloadState {
     /// Recovery here ensures the new engine is at least stored for the
     /// (non-reload-driven) live path.
     pub fn attach_cache(&self, engine: Option<decdn_cache::CacheEngine>) {
-        match self.pinned.engine.lock() {
-            Ok(mut guard) => *guard = engine,
-            Err(poisoned) => {
-                tracing::error!(
-                    "runtime reload cache mutex poisoned during attach; recovering inner state"
-                );
-                *poisoned.into_inner() = engine;
-            }
-        }
+        // Both `cache.pinned_hashes` and `cache.origin_retry` reload
+        // through the engine, so both sections need a handle. The
+        // engine is `Clone`-cheap (`Arc<Inner>` internally), so cloning
+        // once per slot is essentially free.
+        attach_engine_to_section(&self.pinned.engine, engine.clone(), "pinned_hashes");
+        attach_engine_to_section(&self.origin_retry.engine, engine, "origin_retry");
     }
 
     /// Attach the live `ConnectionLimiter` after it's been built. Same
@@ -705,6 +818,7 @@ impl RuntimeReloadState {
                 origin_path: None,
                 decompress: decdn_cache::DecompressMode::Auto,
                 pinned_hashes: decdn_cache::PinnedHashes::empty(),
+                origin_retry: decdn_cache::RetryPolicy::default(),
             },
             payment: ResolvedPayment { rate_per_mb },
             observability: ResolvedObservability {
@@ -1139,6 +1253,7 @@ mod tests {
                 origin_path: None,
                 decompress: decdn_cache::DecompressMode::Auto,
                 pinned_hashes: decdn_cache::PinnedHashes::empty(),
+                origin_retry: decdn_cache::RetryPolicy::default(),
             },
             payment: ResolvedPayment { rate_per_mb: rate },
             observability: ResolvedObservability {
@@ -1830,6 +1945,187 @@ mod tests {
             .lock()
             .map_or_else(|p| p.into_inner().is_some(), |g| g.is_some());
         assert!(stored, "attach_cache must store engine despite poison");
+    }
+
+    // ----- origin retry hot-reload (#285) -----
+
+    #[tokio::test]
+    async fn reload_swaps_origin_retry_on_attached_cache() {
+        // Operator dials retry up from 3 (default) to 7. After reload
+        // the engine reports the new policy via `current_retry_policy`.
+        let dir = tempfile::tempdir().unwrap();
+        let body = "[cache.origin_retry]\n\
+                    max_retries = 7\n\
+                    initial_backoff_ms = 50\n\
+                    max_backoff_ms = 2000\n\
+                    jitter_ratio = 0.25\n";
+        let path = write_config(dir.path(), body);
+
+        let initial = seed_resolved(10, LogLevel::Info);
+        let (setter, _captured) = recording_setter();
+        let state = RuntimeReloadState::new(
+            PaymentArgs { rate_per_mb: None },
+            ObservabilityArgs {
+                log_level: None,
+                log_format: None,
+                metrics_port: None,
+                metrics_bind: None,
+                admin_port: None,
+                otlp_endpoint: None,
+            },
+            &initial,
+            setter,
+        );
+        let (cache, _tmp_cache) = build_test_cache().await;
+        state.attach_cache(Some(cache.clone()));
+
+        // Pre-reload: defaults.
+        assert_eq!(cache.current_retry_policy().max_retries, 3);
+
+        state.reload(&path).await.unwrap();
+
+        let p = cache.current_retry_policy();
+        assert_eq!(p.max_retries, 7, "max_retries swap");
+        assert_eq!(p.initial_backoff_ms, 50, "initial backoff swap");
+        assert_eq!(p.max_backoff_ms, 2000, "max backoff swap");
+        assert!((p.jitter_ratio - 0.25).abs() < f64::EPSILON, "jitter swap");
+    }
+
+    #[tokio::test]
+    async fn reload_rejects_invalid_origin_retry_and_keeps_previous_policy() {
+        // First reload sets a valid policy; second reload submits an
+        // out-of-range jitter and must be rejected wholesale, leaving
+        // the prior policy in effect (all-or-nothing contract).
+        let dir = tempfile::tempdir().unwrap();
+        let good = "[cache.origin_retry]\n\
+                    max_retries = 5\n\
+                    initial_backoff_ms = 25\n\
+                    max_backoff_ms = 1000\n\
+                    jitter_ratio = 0.0\n";
+        let good_path = write_config(dir.path(), good);
+
+        let initial = seed_resolved(10, LogLevel::Info);
+        let (setter, _captured) = recording_setter();
+        let state = RuntimeReloadState::new(
+            PaymentArgs { rate_per_mb: None },
+            ObservabilityArgs {
+                log_level: None,
+                log_format: None,
+                metrics_port: None,
+                metrics_bind: None,
+                admin_port: None,
+                otlp_endpoint: None,
+            },
+            &initial,
+            setter,
+        );
+        let (cache, _tmp_cache) = build_test_cache().await;
+        state.attach_cache(Some(cache.clone()));
+
+        state.reload(&good_path).await.unwrap();
+        assert_eq!(cache.current_retry_policy().max_retries, 5);
+
+        // Bad config: jitter > 1.0.
+        let bad = "[cache.origin_retry]\n\
+                   max_retries = 4\n\
+                   jitter_ratio = 2.5\n";
+        let bad_path = write_config(dir.path(), bad);
+        let err = state.reload(&bad_path).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("jitter_ratio") || msg.contains("origin_retry"),
+            "error should reference the bad field, got: {msg}"
+        );
+        // Previous policy retained: max_retries still 5, not 4.
+        assert_eq!(
+            cache.current_retry_policy().max_retries,
+            5,
+            "rejected reload must not partially apply",
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_origin_retry_without_attached_cache_is_noop() {
+        // Pre-attach reload: the section's `infallible_swap` must not
+        // panic when the engine slot is empty. Symmetric to
+        // `reload_without_attached_cache_is_noop_for_pinning`.
+        let dir = tempfile::tempdir().unwrap();
+        let body = "[cache.origin_retry]\nmax_retries = 1\n";
+        let path = write_config(dir.path(), body);
+
+        let initial = seed_resolved(10, LogLevel::Info);
+        let (setter, _captured) = recording_setter();
+        let state = RuntimeReloadState::new(
+            PaymentArgs { rate_per_mb: None },
+            ObservabilityArgs {
+                log_level: None,
+                log_format: None,
+                metrics_port: None,
+                metrics_bind: None,
+                admin_port: None,
+                otlp_endpoint: None,
+            },
+            &initial,
+            setter,
+        );
+        // Intentionally not calling attach_cache.
+        state.reload(&path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reload_rejects_invalid_origin_retry_keeps_previous_payment_rate() {
+        // Cross-section all-or-nothing rollback: a TOML file that
+        // bundles a valid `[payment]` change with an invalid
+        // `[cache.origin_retry]` section must roll back *both* — the
+        // payment rate must not advance even though the payment
+        // section's resolution would have succeeded on its own. This
+        // pins the trait-level rollback contract documented at
+        // `ReloadableSection::resolve` (Phase 1: any failure aborts
+        // before any commit runs).
+        let dir = tempfile::tempdir().unwrap();
+        let body = "[payment]\nrate_per_mb = 99\n\
+                    [cache.origin_retry]\njitter_ratio = 2.5\n";
+        let path = write_config(dir.path(), body);
+
+        let initial = seed_resolved(10, LogLevel::Info);
+        let (setter, _captured) = recording_setter();
+        let state = RuntimeReloadState::new(
+            PaymentArgs { rate_per_mb: None },
+            ObservabilityArgs {
+                log_level: None,
+                log_format: None,
+                metrics_port: None,
+                metrics_bind: None,
+                admin_port: None,
+                otlp_endpoint: None,
+            },
+            &initial,
+            setter,
+        );
+        let (cache, _tmp_cache) = build_test_cache().await;
+        state.attach_cache(Some(cache.clone()));
+
+        // Pre-reload baseline: payment rate is the seeded 10.
+        assert_eq!(state.rate_per_mb().load(Ordering::Relaxed), 10);
+
+        let err = state.reload(&path).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("origin_retry") || msg.contains("jitter_ratio"),
+            "rejection should name the bad section, got: {msg}"
+        );
+
+        // Payment rate must NOT have moved despite its own section
+        // resolving successfully — the invalid origin_retry aborts the
+        // whole reload.
+        assert_eq!(
+            state.rate_per_mb().load(Ordering::Relaxed),
+            10,
+            "rejected reload must not commit the payment-rate side either",
+        );
+        // And the retry policy is still the default (fresh cache uses
+        // default).
+        assert_eq!(cache.current_retry_policy().max_retries, 3);
     }
 
     // ----- security hot-reload (#235) -----

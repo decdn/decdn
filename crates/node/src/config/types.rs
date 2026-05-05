@@ -94,6 +94,45 @@ pub struct CacheConfig {
     /// "entry was ignored" surprise hours later when the operator
     /// discovers the blob got evicted anyway.
     pub pinned_hashes: Option<Vec<String>>,
+    /// Origin pull-through retry policy (#285). Controls exponential
+    /// backoff for transient HTTP/filesystem errors. Hot-reloadable on
+    /// SIGHUP. Absent => defaults from [`decdn_cache::RetryPolicy::default`]
+    /// (3 retries, 100ms initial backoff doubling to 10s cap, 10% jitter).
+    /// `max_retries = 0` opts out and reproduces pre-#285 behaviour.
+    pub origin_retry: Option<RetryPolicyConfig>,
+}
+
+/// Origin pull-through retry policy (#285) — TOML form. Each field is
+/// optional so operators only need to override the knobs they care
+/// about; defaults come from [`decdn_cache::RetryPolicy::default`].
+///
+/// Bounds enforced at config-resolution time (out-of-range values fail
+/// config loading rather than silently producing weird behaviour at
+/// runtime):
+///
+/// - `max_retries` — `0..=16`. `0` opts out of retry entirely.
+/// - `initial_backoff_ms` — `<= max_backoff_ms` and `<= 300_000` (five
+///   minutes; an upper bound the f64 jitter cast can roundtrip
+///   losslessly).
+/// - `max_backoff_ms` — `<= 300_000` for the same reason.
+/// - `jitter_ratio` — finite, in `0.0..=1.0`.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct RetryPolicyConfig {
+    /// Number of retries after the initial attempt. Total attempts =
+    /// `max_retries + 1`. `0` disables retry entirely. Capped at `16`
+    /// at resolution time as a sanity bound.
+    pub max_retries: Option<u32>,
+    /// Backoff before the first retry in milliseconds. Subsequent
+    /// retries double up to `max_backoff_ms`.
+    pub initial_backoff_ms: Option<u64>,
+    /// Ceiling on any single backoff sleep, in milliseconds. Must be
+    /// `>= initial_backoff_ms` (otherwise the schedule never grows).
+    pub max_backoff_ms: Option<u64>,
+    /// Equal-jitter ratio in `0.0..=1.0`. The actual sleep is
+    /// `base * (1 - r/2 + rand[0,1) * r)`. `0.0` is fully deterministic;
+    /// `1.0` spreads the sleep uniformly over `[0.5*base, 1.5*base)`
+    /// (AWS "equal jitter"). Values outside the range fail resolution.
+    pub jitter_ratio: Option<f64>,
 }
 
 /// Payment section of the config file.

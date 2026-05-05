@@ -71,6 +71,26 @@ pub struct DecdnMetrics {
     /// applicable." Operator-visible name:
     /// `decdn_dispatch_per_source_skipped_no_addr_total`.
     pub dispatch_per_source_skipped_no_addr: Counter,
+    /// Origin pull-through retries fired (#285). Each transient failure
+    /// that the cache engine retries bumps this once. Operator-visible
+    /// name: `decdn_cache_origin_retry_attempts_total`.
+    pub cache_origin_retry_attempts: Counter,
+    /// Origin fetches that succeeded only after at least one retry
+    /// (#285). The "resilience delivered" counter — operators tuning
+    /// `cache.origin_retry.max_retries` watch this to size the budget.
+    /// Operator-visible name: `decdn_cache_origin_retry_success_after_retry_total`.
+    pub cache_origin_retry_success_after_retry: Counter,
+    /// Origin fetches that gave up after exhausting `max_retries`
+    /// (#285). High values mean the retry budget is too small or the
+    /// origin is genuinely down — distinct from `cache_origin_retry_attempts`
+    /// because operators care about the *terminal* failure rate.
+    /// Operator-visible name: `decdn_cache_origin_retry_exhausted_total`.
+    pub cache_origin_retry_exhausted: Counter,
+    /// Cumulative milliseconds slept across all origin-retry backoffs
+    /// (#285). Combined with `cache_origin_retry_attempts` this gives
+    /// average backoff per retry. Operator-visible name:
+    /// `decdn_cache_origin_retry_sleep_ms_total`.
+    pub cache_origin_retry_sleep_ms: Counter,
 }
 
 /// Aggregated deCDN node metrics.
@@ -187,6 +207,27 @@ impl Metrics {
         self.decdn.dispatch_per_source_skipped_no_addr.inc();
     }
 
+    /// Record one origin-retry attempt (#285). Called when the cache
+    /// engine's retry loop fires a retry after a transient failure;
+    /// `sleep_ms` is the upcoming backoff sleep. Bumps both the attempt
+    /// counter and the cumulative sleep counter so operators can compute
+    /// average backoff per retry.
+    pub fn cache_retry_attempt(&self, sleep_ms: u64) {
+        self.decdn.cache_origin_retry_attempts.inc();
+        self.decdn.cache_origin_retry_sleep_ms.inc_by(sleep_ms);
+    }
+
+    /// Record an origin fetch that succeeded after at least one retry (#285).
+    pub fn cache_retry_success_after_retry(&self) {
+        self.decdn.cache_origin_retry_success_after_retry.inc();
+    }
+
+    /// Record an origin fetch that gave up after exhausting `max_retries`
+    /// (#285).
+    pub fn cache_retry_exhausted(&self) {
+        self.decdn.cache_origin_retry_exhausted.inc();
+    }
+
     /// Read the current value of the `rpc_healthy` gauge. Test-only —
     /// production code should rely on the `OpenMetrics` endpoint rather
     /// than reaching into individual gauges.
@@ -212,6 +253,74 @@ impl Metrics {
             .map_err(|_| anyhow::anyhow!("metrics registry lock poisoned"))?;
         reg.encode_openmetrics_to_string()
             .map_err(|e| anyhow::anyhow!("openmetrics encode failed: {e}"))
+    }
+}
+
+/// Plug the [`Metrics`] handle into [`decdn_cache::CacheEngine`]'s retry
+/// loop (#285). The cache crate stays metrics-free; this adapter sits at
+/// the node-runtime seam and bumps the right counter for each
+/// [`decdn_cache::RetryOutcome`] variant.
+///
+/// Construct via [`Self::new`]; the inner [`Arc<Metrics>`] is private so
+/// callers handed an observer for retry-tracking can't pull the metrics
+/// handle back out.
+#[derive(Debug)]
+pub struct MetricsRetryObserver {
+    metrics: Arc<Metrics>,
+}
+
+impl MetricsRetryObserver {
+    /// Wrap a [`Metrics`] handle so the cache engine can use it as a
+    /// [`decdn_cache::RetryObserver`].
+    pub const fn new(metrics: Arc<Metrics>) -> Self {
+        Self { metrics }
+    }
+}
+
+impl decdn_cache::RetryObserver for MetricsRetryObserver {
+    fn observe(&self, outcome: decdn_cache::RetryOutcome, attempt: u32, sleep_ms: u64) {
+        match outcome {
+            // The retry loop emits TransientRetry *before* sleeping, so
+            // the `sleep_ms` is the upcoming backoff. Bump attempts +
+            // accumulate the sleep here.
+            decdn_cache::RetryOutcome::TransientRetry => {
+                self.metrics.cache_retry_attempt(sleep_ms);
+            }
+            decdn_cache::RetryOutcome::SuccessAfterRetry => {
+                self.metrics.cache_retry_success_after_retry();
+            }
+            // ExhaustedTransient with `attempt == 0` is the
+            // disabled-policy case (`max_retries = 0`): the operator
+            // opted out of retry, so a single transient failure is not
+            // a "retry budget burned through" event — it's just a
+            // failure. Bumping `cache_retry_exhausted` for it would
+            // make the counter mean "transient failure" (already
+            // covered by future origin-error breakdown counters) and
+            // ruin alerts that page on actual exhaustion. Only count
+            // exhaustion when at least one retry actually fired.
+            decdn_cache::RetryOutcome::ExhaustedTransient if attempt > 0 => {
+                self.metrics.cache_retry_exhausted();
+            }
+            // No-op arms collapsed: all three reasons we don't bump a
+            // counter share the same body, so clippy folds them into a
+            // single wildcard. Listed in the comment for reviewers:
+            //
+            // - `ExhaustedTransient` with `attempt == 0`: disabled-policy
+            //   case (`max_retries = 0`). Operator opted out of retry,
+            //   so a single transient failure is not a "retry budget
+            //   burned through" event — it's just a failure. Bumping
+            //   `cache_retry_exhausted` here would make the counter
+            //   mean "transient failure" and ruin alerts that page on
+            //   actual exhaustion.
+            // - `Success` (first-try) and `Permanent`: not operationally
+            //   interesting at the retry-resilience layer. A future
+            //   origin-error breakdown counter will subsume Permanent;
+            //   first-try Success is the dominant path and a counter
+            //   for it would add noise without information.
+            // - `_`: `RetryOutcome` is `#[non_exhaustive]`; future
+            //   variants no-op until this match is updated.
+            _ => {}
+        }
     }
 }
 
@@ -344,5 +453,78 @@ impl<'a> ConnectionGuard<'a> {
 impl Drop for ConnectionGuard<'_> {
     fn drop(&mut self) {
         self.metrics.connection_closed();
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use decdn_cache::RetryObserver as _;
+
+    #[test]
+    fn metrics_retry_observer_records_each_outcome() {
+        // Drive every RetryOutcome variant through the observer once,
+        // then assert each counter ended in the expected state by
+        // scraping the OpenMetrics text. Regression guard against an
+        // accidental rewire (e.g. swapping Success and SuccessAfterRetry).
+        let metrics = Arc::new(Metrics::new());
+        let observer = MetricsRetryObserver::new(Arc::clone(&metrics));
+
+        // 2 transient retries with cumulative sleep 100 + 200 ms
+        observer.observe(decdn_cache::RetryOutcome::TransientRetry, 0, 100);
+        observer.observe(decdn_cache::RetryOutcome::TransientRetry, 1, 200);
+        // 1 success-after-retry
+        observer.observe(decdn_cache::RetryOutcome::SuccessAfterRetry, 2, 0);
+        // 1 exhausted on a separate fetch (attempt > 0 so it counts)
+        observer.observe(decdn_cache::RetryOutcome::ExhaustedTransient, 3, 0);
+        // Disabled-policy "exhaustion" with `attempt == 0` must NOT bump
+        // the counter — the operator opted out of retry, so it isn't a
+        // budget-burn event.
+        observer.observe(decdn_cache::RetryOutcome::ExhaustedTransient, 0, 0);
+        // Success and Permanent should NOT bump anything in the retry
+        // counter family.
+        observer.observe(decdn_cache::RetryOutcome::Success, 0, 0);
+        observer.observe(decdn_cache::RetryOutcome::Permanent, 0, 0);
+
+        let text = metrics.encode().unwrap();
+        // OpenMetrics encoder appends `_total` to counters; the
+        // `decdn_` prefix comes from the MetricsGroup `name` attr.
+        assert!(
+            text.contains("decdn_cache_origin_retry_attempts_total 2"),
+            "missing or wrong attempts counter:\n{text}"
+        );
+        assert!(
+            text.contains("decdn_cache_origin_retry_success_after_retry_total 1"),
+            "missing or wrong success_after_retry counter:\n{text}"
+        );
+        assert!(
+            text.contains("decdn_cache_origin_retry_exhausted_total 1"),
+            "missing or wrong exhausted counter:\n{text}"
+        );
+        assert!(
+            text.contains("decdn_cache_origin_retry_sleep_ms_total 300"),
+            "missing or wrong sleep-ms counter:\n{text}"
+        );
+    }
+
+    #[test]
+    fn metrics_retry_counters_start_at_zero() {
+        // Pinning down the OpenMetrics shape — a fresh registry must
+        // expose the four retry counters at zero so dashboards built
+        // before any retry has fired don't render `(no data)`.
+        let metrics = Metrics::new();
+        let text = metrics.encode().unwrap();
+        for name in [
+            "decdn_cache_origin_retry_attempts_total",
+            "decdn_cache_origin_retry_success_after_retry_total",
+            "decdn_cache_origin_retry_exhausted_total",
+            "decdn_cache_origin_retry_sleep_ms_total",
+        ] {
+            assert!(
+                text.contains(&format!("{name} 0")),
+                "counter {name} should be exposed at zero on a fresh registry:\n{text}"
+            );
+        }
     }
 }
