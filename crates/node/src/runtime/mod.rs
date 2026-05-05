@@ -420,7 +420,16 @@ pub async fn run(
 }
 
 /// Build an iroh `Endpoint` bound to `bind_port`. ALPNs are set by the
-/// `Router` when it spawns.
+/// `Router` when it spawns. The bind address is included in the error
+/// message so a port collision surfaces as a config-level diagnostic
+/// (matching `metrics::bind` and `admin::bind`), rather than an opaque
+/// "endpoint bind failed".
+///
+/// No transient pre-bind probe: it would introduce a TOCTOU window
+/// between the probe and the real bind, and iroh's
+/// `Endpoint::builder().bind_addr(...).bind()` owns its UDP socket
+/// internally — there is nothing to hand off. Single-bind matches the
+/// existing TCP listeners.
 async fn build_endpoint(secret_key: &SecretKey, bind_port: u16) -> anyhow::Result<Endpoint> {
     let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, bind_port);
     Endpoint::builder(presets::N0)
@@ -429,7 +438,7 @@ async fn build_endpoint(secret_key: &SecretKey, bind_port: u16) -> anyhow::Resul
         .map_err(|e| anyhow::anyhow!("invalid bind addr {bind_addr}: {e}"))?
         .bind()
         .await
-        .map_err(|e| anyhow::anyhow!("endpoint bind failed: {e}"))
+        .map_err(|e| anyhow::anyhow!("endpoint bind {bind_addr} failed: {e}"))
 }
 
 /// Adapter: implements `decdn_gossip::GossipMetrics` against the node's
