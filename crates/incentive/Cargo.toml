@@ -17,5 +17,8 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 ed25519-dalek = { workspace = true }
 
+[dev-dependencies]
+anyhow = { workspace = true }
+
 [lints]
 workspace = true
