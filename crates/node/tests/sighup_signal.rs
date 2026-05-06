@@ -49,6 +49,7 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
         blockchain: ResolvedBlockchain {
             rpc_url: "http://localhost:8545".into(),
             eth_keystore: PathBuf::from("/tmp/keystore.json"),
+            keystore_password_file: None,
             payment_channel_address: "0x0000000000000000000000000000000000000001".into(),
             staking_registry_address: "0x0000000000000000000000000000000000000002".into(),
             rpc_watchdog_interval_sec: 30,

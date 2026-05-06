@@ -190,6 +190,7 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
         blockchain: ResolvedBlockchain {
             rpc_url: "https://rpc.example/SECRET_TOKEN_abc123".to_string(),
             eth_keystore: PathBuf::from("/var/lib/decdn/keystore.json"),
+            keystore_password_file: None,
             payment_channel_address: "0x0000000000000000000000000000000000000001".to_string(),
             staking_registry_address: "0x0000000000000000000000000000000000000002".to_string(),
             rpc_watchdog_interval_sec: 30,

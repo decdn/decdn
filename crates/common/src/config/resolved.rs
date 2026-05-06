@@ -34,6 +34,12 @@ pub struct ResolvedBlockchain {
     pub rpc_url: String,
     /// Ethereum keystore file path.
     pub eth_keystore: PathBuf,
+    /// Optional path to a file holding the keystore password. CLI/env-only;
+    /// not surfaced via the TOML schema (passwords don't belong in config
+    /// files even by reference). The runtime first consults the
+    /// `DECDN_KEYSTORE_PASSWORD` env var, then this file, then prompts on
+    /// stdin if connected to a TTY.
+    pub keystore_password_file: Option<PathBuf>,
     /// `StablePaymentChannel` contract address.
     pub payment_channel_address: String,
     /// `StakingRegistry` contract address.

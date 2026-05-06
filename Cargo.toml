@@ -46,7 +46,7 @@ ed25519-dalek = { version = "2", features = ["serde"] }
 chacha20poly1305 = "0.10"
 
 # Blockchain / EVM
-alloy = { version = "2", features = ["providers", "signers", "contract"] }
+alloy = { version = "2", features = ["providers", "signers", "signer-keystore", "contract"] }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
@@ -70,6 +70,7 @@ dirs = "6"
 # Misc
 bytes = "1"
 rand = "0.10"
+rpassword = "7"
 url = "2"
 
 # HTTP client (used by cache-origin backend)

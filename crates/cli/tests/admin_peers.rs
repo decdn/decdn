@@ -64,6 +64,14 @@ async fn test_cache() -> anyhow::Result<(CacheEngine, tempfile::TempDir)> {
     Ok((cache, tmp))
 }
 
+/// Throwaway `PrivateKeySigner` for `AdminState::new` callers that don't
+/// exercise signing logic. Pinned to Arbitrum Sepolia (decdn's `PoC` chain id).
+fn throwaway_signer() -> Arc<alloy::signers::local::PrivateKeySigner> {
+    use alloy::signers::Signer;
+    use alloy::signers::local::PrivateKeySigner;
+    Arc::new(PrivateKeySigner::random().with_chain_id(Some(421_614)))
+}
+
 /// Spawn an admin server with the given state, returning its URL and a
 /// `(stop_tx, join)` pair. The join handle must be awaited after
 /// sending on `stop_tx` so the test doesn't leak a background task.
@@ -90,6 +98,7 @@ async fn peers_list_empty_peer_table() -> anyhow::Result<()> {
         None,
         None,
         Arc::new(DrainTrigger::new()),
+        throwaway_signer(),
     );
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
@@ -127,6 +136,7 @@ async fn peers_list_seeded_entries_sorted_desc() -> anyhow::Result<()> {
         None,
         None,
         Arc::new(DrainTrigger::new()),
+        throwaway_signer(),
     );
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
@@ -170,6 +180,7 @@ async fn health_returns_hex_node_id_and_uptime() -> anyhow::Result<()> {
         None,
         None,
         Arc::new(DrainTrigger::new()),
+        throwaway_signer(),
     );
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
@@ -205,6 +216,7 @@ async fn unknown_method_returns_method_not_found() -> anyhow::Result<()> {
         None,
         None,
         Arc::new(DrainTrigger::new()),
+        throwaway_signer(),
     );
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
@@ -488,6 +500,7 @@ async fn admin_v1_drain_returns_initiated_true() -> anyhow::Result<()> {
         None,
         None,
         Arc::clone(&drain_trigger),
+        throwaway_signer(),
     );
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
@@ -562,6 +575,7 @@ async fn admin_shutdown_closes_listener() -> anyhow::Result<()> {
         None,
         None,
         Arc::new(DrainTrigger::new()),
+        throwaway_signer(),
     );
     let (url, stop_tx, join) = spawn_admin(state).await?;
 

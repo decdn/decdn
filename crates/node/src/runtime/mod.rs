@@ -26,7 +26,9 @@ use crate::admin;
 use crate::dispatch::ConnectionLimiter;
 use crate::handlers::probe::ProbeHandler;
 use crate::metrics;
+use alloy::signers::local::PrivateKeySigner;
 use decdn_common::config::ResolvedConfig;
+use decdn_common::eth_identity::{self, PasswordSource};
 use decdn_common::identity;
 
 /// Ceiling on how long we wait for spawned tasks to drain after the endpoint
@@ -77,6 +79,16 @@ pub async fn run(
 
     let secret_key = identity::load_or_generate(&cfg.identity.data_dir)?;
     tracing::info!(node_id = %secret_key.public(), "loaded node identity");
+
+    // Issue #406: load the Ethereum keystore into a live `PrivateKeySigner`
+    // before the rest of startup so any password-source error (env unset,
+    // missing file, prompt aborted) fails fast with a clear message rather
+    // than after the cache + endpoint have been built. `decrypt_keystore`
+    // runs scrypt/argon2 (hundreds of milliseconds to multi-second under
+    // hardened KDF params), so it must run on a blocking thread to avoid
+    // stalling the tokio runtime.
+    let eth_signer = Arc::new(load_eth_signer(&cfg).await?);
+    tracing::info!(address = %eth_signer.address(), "loaded eth keystore");
 
     let cache = build_cache(&cfg, Arc::clone(&node_metrics)).await?;
     // Attach the cache to the reload state so SIGHUP handlers can swap
@@ -267,6 +279,7 @@ pub async fn run(
             announce_trigger,
             reload_hook,
             Arc::clone(&drain_trigger),
+            Arc::clone(&eth_signer),
         );
         tasks.spawn(async move {
             if let Err(err) = admin::serve(listener, state, rx).await {
@@ -447,6 +460,35 @@ async fn build_endpoint(secret_key: &SecretKey, bind_port: u16) -> anyhow::Resul
         .bind()
         .await
         .map_err(|e| anyhow::anyhow!("endpoint bind {bind_addr} failed: {e}"))
+}
+
+/// Resolve the keystore password from CLI/env/prompt, then decrypt the
+/// keystore JSON via alloy's KDF on a blocking thread. The Arbitrum Sepolia
+/// chain id (`421_614`) is bound on the signer so EIP-712 signers and any
+/// `eth_sendTransaction` paths inherit a deterministic value. When the
+/// production target moves to mainnet, the chain id should follow
+/// `cfg.blockchain.rpc_url` parsing or be promoted to a config field.
+async fn load_eth_signer(cfg: &ResolvedConfig) -> anyhow::Result<PrivateKeySigner> {
+    use alloy::signers::Signer;
+
+    const PASSWORD_ENV: &str = "DECDN_KEYSTORE_PASSWORD";
+    const ARBITRUM_SEPOLIA_CHAIN_ID: u64 = 421_614;
+
+    let mut sources = vec![PasswordSource::Env(PASSWORD_ENV)];
+    if let Some(path) = cfg.blockchain.keystore_password_file.clone() {
+        sources.push(PasswordSource::File(path));
+    }
+    sources.push(PasswordSource::Prompt { confirm: false });
+    let password = eth_identity::read_password(&sources, "eth keystore password")?;
+
+    let path = cfg.blockchain.eth_keystore.clone();
+    // `spawn_blocking` because alloy's `decrypt_keystore` runs scrypt /
+    // argon2 (synchronous, CPU-bound). Calling it on the runtime's worker
+    // thread would stall every other task for the duration of the KDF.
+    let signer = tokio::task::spawn_blocking(move || eth_identity::load_signer(&path, &password))
+        .await
+        .map_err(|e| anyhow::anyhow!("keystore decrypt task panicked: {e}"))??;
+    Ok(signer.with_chain_id(Some(ARBITRUM_SEPOLIA_CHAIN_ID)))
 }
 
 /// Adapter: implements `decdn_gossip::GossipMetrics` against the node's

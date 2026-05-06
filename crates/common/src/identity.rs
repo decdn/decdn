@@ -109,7 +109,7 @@ pub fn load_or_generate(data_dir: &Path) -> anyhow::Result<SecretKey> {
 /// leaves a race where the symlink can be repointed between validation and
 /// use — exercised by `rejects_symlinked_data_dir`.
 #[cfg(unix)]
-fn validate_data_dir(data_dir: &Path) -> anyhow::Result<()> {
+pub(crate) fn validate_data_dir(data_dir: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let meta = fs::symlink_metadata(data_dir)
         .with_context(|| format!("invalid data_dir: cannot access {}", data_dir.display()))?;
@@ -164,7 +164,7 @@ fn validate_key_file(path: &Path) -> anyhow::Result<()> {
 /// call creates — pre-existing parents like `~/.local/share` keep their own
 /// permissions.
 #[cfg(unix)]
-fn create_data_dir_secure(data_dir: &Path) -> anyhow::Result<()> {
+pub(crate) fn create_data_dir_secure(data_dir: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     fs::DirBuilder::new()
         .recursive(true)
@@ -174,7 +174,7 @@ fn create_data_dir_secure(data_dir: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn validate_data_dir(_data_dir: &Path) -> anyhow::Result<()> {
+pub(crate) fn validate_data_dir(_data_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
@@ -184,7 +184,7 @@ fn validate_key_file(_path: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn create_data_dir_secure(data_dir: &Path) -> anyhow::Result<()> {
+pub(crate) fn create_data_dir_secure(data_dir: &Path) -> anyhow::Result<()> {
     fs::create_dir_all(data_dir)
         .with_context(|| format!("failed to create data dir {}", data_dir.display()))
 }

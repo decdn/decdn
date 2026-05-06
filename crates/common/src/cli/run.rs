@@ -77,6 +77,13 @@ pub struct BlockchainArgs {
     #[arg(long, value_name = "PATH", env = "DECDN_ETH_KEYSTORE")]
     pub eth_keystore: Option<PathBuf>,
 
+    /// Path to a file containing the keystore password. When unset, the
+    /// `DECDN_KEYSTORE_PASSWORD` env var is consulted; when that is also
+    /// unset and stdin is a TTY, an interactive prompt is used. A single
+    /// trailing newline is stripped from the file contents.
+    #[arg(long, value_name = "PATH", env = "DECDN_KEYSTORE_PASSWORD_FILE")]
+    pub keystore_password_file: Option<PathBuf>,
+
     /// `StablePaymentChannel` contract address (0x-prefixed hex).
     #[arg(long, value_name = "ADDR", env = "DECDN_PAYMENT_CHANNEL_ADDRESS")]
     pub payment_channel_address: Option<String>,
