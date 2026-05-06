@@ -8,11 +8,18 @@
 //! place; the original `AdminRpc` name is not a linkable rustdoc item,
 //! hence the bare backticks.
 //!
-//! All types here are deliberately wire-only: no engine handles, no
-//! peer-table types, no cache-internal types. The point is that pulling
-//! `decdn-common` into the CLI does not transitively pull the daemon's
-//! runtime. DTOs use simple owned values (`String`, `u64`, primitive
-//! arrays) plus [`decdn_protocol::LoadHint`], a leaf protocol type.
+//! DTO fields are deliberately wire-only: no engine handles, no
+//! peer-table types, no daemon runtime types. They use simple owned
+//! values (`String`, `u64`, primitive arrays) plus
+//! [`decdn_protocol::LoadHint`], a leaf protocol type. Pulling
+//! `decdn-common` into the CLI does not pull the daemon runtime.
+//!
+//! The helper [`parse_hash_arg`] does return [`struct@Hash`] from
+//! `decdn-cache` — `decdn-cache` is already a dep of this crate via
+//! the typed config fields (`DecompressMode`, `RetryPolicy`,
+//! `OriginUrl`, `PinnedHashes`), so re-using the cache's hash type for
+//! the daemon-side handler that consumes it is cheap. The parser is
+//! used only by the daemon's `evict` handler today.
 
 use decdn_cache::Hash;
 use jsonrpsee::core::RpcResult;

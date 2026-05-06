@@ -33,6 +33,13 @@ since project inception and will roll into the first tagged release.
   `decdn-node-${VERSION}-${TARGET}.tar.gz` (operators) and
   `decdn-${VERSION}-${TARGET}.tar.gz` (publishers). See
   [`adr/appendix-binaries.md`](adr/appendix-binaries.md).
+- **CLI** `decdn probe --json` `rtt_ms` field no longer carries
+  trailing zeros. Pre-#421 always emitted three decimal digits via
+  `{:.3}` (`12.500`); post-#421 the field is quantized to ms precision
+  but emitted as a JSON number, so significant trailing zeros are
+  dropped (`12.5`, `12.501`). Numerically identical to any JSON parser;
+  operator scripts that match a `\.\d{3}` regex must update to
+  `\.\d+`.
 
 ### Added
 

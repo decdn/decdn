@@ -112,17 +112,24 @@ pub async fn probe(args: &cli::ProbeArgs) -> anyhow::Result<()> {
         );
     }
 
-    print_probe_response(&resp, rtt_ms, nonce, args.json);
+    let mut stdout = std::io::stdout().lock();
+    write_probe_response(&mut stdout, &resp, rtt_ms, nonce, args.json)
+        .map_err(|e| anyhow::anyhow!("failed to write probe response: {e}"))?;
     Ok(())
 }
 
-/// Render a successful probe response to stdout in pretty or JSON form.
-fn print_probe_response(
+/// Render a successful probe response to `w` in pretty or JSON form.
+///
+/// Public-in-crate so unit tests can capture the output into a buffer
+/// and assert on the wire contract — in particular the `--json` shape
+/// (key set, `rtt_ms` quantization, `nonce` hex padding).
+pub(crate) fn write_probe_response(
+    w: &mut impl std::io::Write,
     resp: &decdn_protocol::message::ProbeResponse,
     rtt_ms: f64,
     nonce: u64,
     json: bool,
-) {
+) -> std::io::Result<()> {
     // Format as the canonical iroh node-id string (z-base-32 via PublicKey's
     // Display impl) — matches what the server logs on startup. Fall back to
     // raw hex if the key fails to parse; the fallback stays alphanumeric so
@@ -140,12 +147,15 @@ fn print_probe_response(
         |pk| pk.to_string(),
     );
     if json {
-        // Quantize `rtt_ms` to 3 decimals before serialization so the
-        // emitted JSON keeps the same precision the manual format
-        // (`{:.3}`) used to produce — preserves the wire contract for
-        // downstream `--json` consumers. `as_secs_f64()` carries
-        // microsecond-resolution noise past 3 decimals anyway, so the
-        // quantization isn't lossy in any meaningful sense.
+        // Quantize `rtt_ms` to ms precision before serialization. The
+        // pre-#421 manual format used `{:.3}` (always 3 decimal digits,
+        // e.g. `12.500`); serde_json drops insignificant trailing zeros,
+        // so a probe at exactly 12.5 ms now emits `"rtt_ms":12.5` (was
+        // `"rtt_ms":12.500`). Numerically identical to any JSON parser;
+        // operator scripts that match a `\.\d{3}` regex will need
+        // `\.\d+`. Called out under the BREAKING note in CHANGELOG.
+        // `as_secs_f64()` carries microsecond noise past 3 decimals, so
+        // the quantization itself isn't lossy in any meaningful sense.
         let rtt_ms_quantized = (rtt_ms * 1000.0).round() / 1000.0;
         let output = serde_json::json!({
             "node_id": node_id,
@@ -154,12 +164,123 @@ fn print_probe_response(
             "rtt_ms": rtt_ms_quantized,
             "nonce": format!("0x{nonce:016x}"),
         });
-        println!("{output}");
+        writeln!(w, "{output}")
     } else {
-        println!("node_id:       {node_id}");
-        println!("rate_per_mb:   {} (base units)", resp.rate_per_mb);
-        println!("measured_at:   {} (unix ms)", resp.measured_at_unix_ms);
-        println!("rtt:           {rtt_ms:.3} ms");
-        println!("nonce:         0x{nonce:016x} (echoed ok)");
+        writeln!(w, "node_id:       {node_id}")?;
+        writeln!(w, "rate_per_mb:   {} (base units)", resp.rate_per_mb)?;
+        writeln!(w, "measured_at:   {} (unix ms)", resp.measured_at_unix_ms)?;
+        writeln!(w, "rtt:           {rtt_ms:.3} ms")?;
+        writeln!(w, "nonce:         0x{nonce:016x} (echoed ok)")
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
+mod tests {
+    use super::*;
+    use decdn_protocol::message::ProbeResponse;
+
+    fn fixture(rate_per_mb: u64, measured_at_unix_ms: u64) -> ProbeResponse {
+        // Iroh PublicKey::from_bytes accepts any 32-byte slice, so the
+        // happy-path branch ("canonical z-base-32") fires for this fixture.
+        ProbeResponse {
+            node_id: [0xAB; 32],
+            rate_per_mb,
+            measured_at_unix_ms,
+            nonce: 0,
+        }
+    }
+
+    /// JSON wire shape: every key the operator-facing `--json` contract
+    /// guarantees. Catches a renamed key, a dropped field, or a type drift
+    /// (e.g. `rate_per_mb` becoming a string).
+    #[test]
+    fn json_output_keys_and_types() {
+        let resp = fixture(10, 1_700_000_000_000);
+        let mut buf: Vec<u8> = Vec::new();
+        write_probe_response(&mut buf, &resp, 12.5, 0xDEAD_BEEF_CAFE_F00D, true).unwrap();
+        let text = std::str::from_utf8(&buf).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+
+        assert!(parsed.is_object(), "top level must be an object");
+        let obj = parsed.as_object().unwrap();
+        assert_eq!(
+            obj.len(),
+            5,
+            "five keys: node_id/rate_per_mb/measured_at_unix_ms/rtt_ms/nonce"
+        );
+        assert!(obj.get("node_id").unwrap().is_string());
+        assert_eq!(obj.get("rate_per_mb").unwrap().as_u64(), Some(10));
+        assert_eq!(
+            obj.get("measured_at_unix_ms").unwrap().as_u64(),
+            Some(1_700_000_000_000)
+        );
+        assert!(obj.get("rtt_ms").unwrap().is_number());
+        assert_eq!(
+            obj.get("nonce").unwrap().as_str(),
+            Some("0xdeadbeefcafef00d"),
+            "nonce is hex-encoded with 0x prefix and 16 padded digits"
+        );
+    }
+
+    /// `rtt_ms` is quantized to ms precision. `12.5009` rounds to `12.501`.
+    /// Pinning the exact rounding so the published behaviour can't drift
+    /// (e.g. someone "improving" precision past ms would silently expand
+    /// the rendered float-tail across operator dashboards).
+    #[test]
+    fn json_rtt_ms_quantized_to_ms_precision() {
+        let resp = fixture(10, 0);
+        let mut buf: Vec<u8> = Vec::new();
+        write_probe_response(&mut buf, &resp, 12.500_9, 0, true).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        // 12.5009 * 1000 = 12500.9, round = 12501.0, / 1000 = 12.501.
+        let rtt = parsed["rtt_ms"].as_f64().unwrap();
+        assert!(
+            (rtt - 12.501).abs() < 1e-9,
+            "expected rtt_ms ≈ 12.501, got {rtt}"
+        );
+    }
+
+    /// `--json` output is single-line — operator scripts pipe through `jq`
+    /// without `-s`/slurp, and grep-friendly per-line tooling stays simple.
+    #[test]
+    fn json_output_is_single_line() {
+        let resp = fixture(10, 0);
+        let mut buf: Vec<u8> = Vec::new();
+        write_probe_response(&mut buf, &resp, 1.0, 0, true).unwrap();
+        let text = std::str::from_utf8(&buf).unwrap();
+        assert_eq!(
+            text.lines().count(),
+            1,
+            "expected one line of JSON, got {text:?}"
+        );
+    }
+
+    /// Pretty output emits five labelled lines in a stable order — operator
+    /// scripts grep for `node_id:` / `rtt:` etc. without `--json`.
+    #[test]
+    fn pretty_output_emits_five_labelled_lines_in_stable_order() {
+        let resp = fixture(7, 1_700_000_000_000);
+        let mut buf: Vec<u8> = Vec::new();
+        write_probe_response(&mut buf, &resp, 1.234, 0xABCD, false).unwrap();
+        let text = std::str::from_utf8(&buf).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 5);
+        assert!(lines[0].starts_with("node_id:"));
+        assert!(lines[1].starts_with("rate_per_mb:"));
+        assert!(lines[2].starts_with("measured_at:"));
+        assert!(lines[3].starts_with("rtt:"));
+        assert!(lines[4].starts_with("nonce:"));
+        // rtt: line keeps the `{:.3}` format on the pretty path.
+        assert!(
+            lines[3].contains("1.234 ms"),
+            "pretty rtt: line should keep 3-decimal format, got {:?}",
+            lines[3],
+        );
     }
 }

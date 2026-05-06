@@ -309,7 +309,10 @@ The container image ships `decdn-node` only. CLI users grab the
 ```mermaid
 graph TD
     node[node]
+    cli[cli]
+    common[common]
     cache[cache]
+    gossip[gossip]
     incentive[incentive]
     reputation[reputation]
     protocol[protocol]
@@ -322,13 +325,26 @@ graph TD
     postcard([postcard])
 
     node --> cache
+    node --> gossip
     node --> incentive
     node --> reputation
     node --> protocol
+    node --> common
+
+    cli --> common
+    cli --> protocol
+
+    common --> cache
+    common --> protocol
+    common --> alloy
+    common --> iroh
 
     cache --> protocol
     cache --> iroh
     cache --> iroh_blobs
+
+    gossip --> protocol
+    gossip --> iroh_gossip
 
     incentive --> protocol
     incentive --> alloy
@@ -341,13 +357,16 @@ graph TD
     protocol --> iroh
 
     style node fill:#4a9eff,color:#fff
+    style cli fill:#60a5fa,color:#fff
+    style common fill:#94a3b8,color:#fff
     style cache fill:#34d399,color:#fff
+    style gossip fill:#22d3ee,color:#fff
     style incentive fill:#f59e0b,color:#fff
     style reputation fill:#a78bfa,color:#fff
     style protocol fill:#f87171,color:#fff
 ```
 
-`protocol` is the leaf crate with minimal dependencies. Everything depends on it; it depends on almost nothing. The cache and incentive layers are separate crates — the cache layer works without incentives (useful for testing, local dev, private deployments). The incentive layer wraps cache operations with payment logic. The `node` crate wires them together.
+`protocol` is the leaf crate with minimal dependencies. Everything depends on it; it depends on almost nothing. `common` carries the wire types and config schema both binaries share (see [appendix-binaries.md](appendix-binaries.md)); it pulls `cache` for the typed config fields (`DecompressMode`, `RetryPolicy`, `OriginUrl`, `PinnedHashes`). The cache and incentive layers are separate crates — the cache layer works without incentives (useful for testing, local dev, private deployments). The incentive layer wraps cache operations with payment logic. The `node` crate wires them together; the `cli` crate stays narrow (no `cache`, no `gossip`).
 
 ## External Components
 

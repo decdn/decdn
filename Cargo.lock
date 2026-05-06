@@ -1945,8 +1945,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -1959,12 +1957,10 @@ dependencies = [
  "decdn-cache",
  "decdn-protocol",
  "dirs",
- "ed25519-dalek 2.2.0",
  "iroh",
  "jsonrpsee",
  "rand 0.10.1",
  "serde",
- "serde_json",
  "tempfile",
  "tokio",
  "toml",

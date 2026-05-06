@@ -36,13 +36,20 @@ Adopt the dockerd shape. Two binaries, one shared support crate:
   `fetch`, `publish`, `channel`, `wallet`.
 - **`decdn-common`** (`crates/common`) — shared types both binaries
   need: the TOML config schema and resolver, identity loading, the
-  `AdminRpc` trait + DTOs, and clap argument structs. No runtime,
-  no peer table, no cache engine.
+  `AdminRpc` trait + DTOs, and clap argument structs. No runtime, no
+  peer table, no engine handles. The crate does pull `decdn-cache` as
+  a build-time dep for typed config fields (`DecompressMode`,
+  `RetryPolicy`, `OriginUrl`, `PinnedHashes`, `Hash`) and for the
+  `Hash` return type of `parse_hash_arg` — see the CLI binary-size
+  note below.
 
 The pre-#421 `decdn run …` binary form does not survive. The cut-over
-is hard: `decdn run` errors with a redirect to `decdn-node run`; there
-is no compatibility shim. Release notes call it out under the
-`BREAKING CHANGE:` footer.
+is hard: `decdn run` errors as an unrecognized subcommand (clap's
+default), with `decdn --help` listing only the user-facing commands.
+There is no compatibility shim and no friendly redirect; operators
+reach for the release notes / CHANGELOG to learn that `decdn-node run`
+is the new daemon entry point. The breaking change is called out
+under the `BREAKING CHANGE:` footer.
 
 ### Why the `node` admin namespace lives on `decdn`, not `decdn-node`
 

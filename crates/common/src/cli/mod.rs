@@ -1,4 +1,10 @@
 //! CLI argument parsing for the `decdn` binary.
+//!
+//! [`RunArgs`] is also re-used (flattened) by [`ConfigValidateArgs`] —
+//! `decdn config validate` runs the same resolver `decdn-node run`
+//! does, against the same `DECDN_*` env vars, without binding ports
+//! or starting any tasks. The daemon's own clap shell lives in
+//! `crates/node/src/main.rs` and is not part of this module.
 
 pub mod common;
 pub mod config_cmd;
@@ -45,8 +51,11 @@ pub struct Cli {
     pub command: Command,
 }
 
-/// Available subcommands. Note: there is intentionally no `run`
-/// subcommand — running the daemon is `decdn-node run` (issue #421).
+/// Available subcommands. There is intentionally no `run` subcommand —
+/// running the daemon is `decdn-node run` (issue #421). For a dry-run
+/// resolution of the daemon's startup config without binding ports,
+/// see [`ConfigValidateArgs`] (`decdn config validate`), which
+/// flattens the same [`RunArgs`] the daemon parses.
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Generate a new Ed25519 node key and Ethereum keystore.
