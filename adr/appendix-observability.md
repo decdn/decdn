@@ -108,8 +108,10 @@ These metrics provide early warning for the five slashable offenses on the slash
 
 | Metric | Type | Tier | Labels | Description |
 |--------|------|------|--------|-------------|
-| `decdn_gossip_messages_rejected_total` | Counter | M | `reason={clock_skew,invalid_signature,not_registered,stale_timestamp,invalid_region,duplicate_hashes}` | Gossip messages rejected during validation ([ADR 001](001-network.md#gossip-validation)). `clock_skew` was previously `gossip_messages_rejected_clock_skew` in ADR 001 — this metric with `reason=clock_skew` is the canonical replacement. |
+| `decdn_gossip_messages_rejected_total` | Counter | M | `reason={clock_skew,invalid_signature,not_registered,stale_timestamp,invalid_region,duplicate_hashes,table_full}` | Gossip messages rejected during validation ([ADR 001](001-network.md#gossip-validation)) or peer-table admission ([ADR 029](029-peer-table-eviction-policy.md)). `clock_skew` was previously `gossip_messages_rejected_clock_skew` in ADR 001 — this metric with `reason=clock_skew` is the canonical replacement. `table_full` fires only when the optional `gossip.max_peer_entries` ceiling is set and exceeded. |
 | `decdn_peer_table_size` | Gauge | M | — | Number of distinct peers in the local peer table. |
+| `decdn_peer_table_evicted_ttl_total` | Counter | R | — | Peer-table entries removed by the TTL sweeper ([ADR 029 §1](029-peer-table-eviction-policy.md)). |
+| `decdn_peer_table_evicted_registry_total` | Counter | R | `reason={deregistered,ejected}` | Peer-table entries removed in response to a `NodeDeregistered` or `NodeAutoEjected` registry event ([ADR 029 §3](029-peer-table-eviction-policy.md)). |
 | `decdn_gossip_announces_sent_total` | Counter | R | — | `NodeAnnounce` messages published. |
 | `decdn_gossip_announces_received_total` | Counter | R | — | `NodeAnnounce` messages accepted (passed validation). |
 | `decdn_gossip_subscriber_reconnections_total` | Counter | R | — | Successful subscriber reconnections after a gossip stream drop. |
