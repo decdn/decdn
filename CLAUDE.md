@@ -8,7 +8,7 @@ Decentralized CDN (deCDN) — nodes cache and serve content-addressed blobs over
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for build commands, ADR conventions, pre-commit hooks, and development environment setup.
 
-**ADR note:** Next ADR number is 028. File naming: `NNN-topic.md` (zero-padded 3-digit prefix). Always verify by checking `adr/` for the highest number before creating a new ADR. (028/029/030/031/032 were reclaimed when their proposals moved to the internal ideas repo — they were never canonical.)
+**ADR note:** Next ADR number is 029. File naming: `NNN-topic.md` (zero-padded 3-digit prefix). Always verify by checking `adr/` for the highest number before creating a new ADR. (029/030/031/032 were reclaimed when their proposals moved to the internal ideas repo — they were never canonical.)
 
 ## Common Commands
 
