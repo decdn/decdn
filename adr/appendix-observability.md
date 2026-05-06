@@ -28,7 +28,7 @@ All metrics use the `decdn_` prefix, snake_case, and Prometheus-standard unit su
 |---------|---------|------|
 | `decdn_{subsystem}_{noun}_{unit}` | `decdn_cache_bytes` | Gauge: descriptive noun + unit |
 | `decdn_{subsystem}_{noun}_total` | `decdn_streams_completed_total` | Counter: always `_total` suffix |
-| `decdn_{subsystem}_{noun}_seconds` | `decdn_probe_fanout_latency_seconds` | Histogram/Summary: `_seconds` for duration |
+| `decdn_{subsystem}_{noun}_seconds` | `decdn_probe_collection_latency_seconds` | Histogram/Summary: `_seconds` for duration |
 
 Label names: snake_case, no abbreviations. Label values: lowercase where possible.
 
@@ -90,7 +90,7 @@ These metrics provide early warning for the five slashable offenses on the slash
 
 | Metric | Type | Tier | Labels | Description |
 |--------|------|------|--------|-------------|
-| `decdn_probe_fanout_latency_seconds` | Histogram | M | `outcome={0rtt_warm,1rtt_cold}` | Duration of a complete probe fan-out from send to collection end. The `outcome` label enables measuring 0-RTT impact per [ADR 015](015-zero-rtt.md). Buckets: `[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5]`. |
+| `decdn_probe_collection_latency_seconds` | Histogram | M | `outcome={0rtt_warm,1rtt_cold}` | Duration of a complete probe collection window from send to collection end. The `outcome` label enables measuring 0-RTT impact per [ADR 015](015-zero-rtt.md). Buckets: `[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5]`. |
 | `decdn_probe_responses_total` | Counter | R | `result={has_blob,no_blob,timeout}` | Probe responses received, by result. |
 
 #### 2.5 Payment Channel Metrics
@@ -264,7 +264,7 @@ Earlier ADRs used informal metric names. This table maps them to their canonical
 | `quic_0rtt_attempts_total` | `decdn_quic_0rtt_attempts_total` | ADR 015 |
 | `quic_0rtt_accepted_total` | `decdn_quic_0rtt_accepted_total` | ADR 015 |
 | `quic_0rtt_rejected_total` | `decdn_quic_0rtt_rejected_total` | ADR 015 |
-| `probe_fanout_latency_seconds` | `decdn_probe_fanout_latency_seconds` | ADR 015 |
+| `probe_collection_latency_seconds` | `decdn_probe_collection_latency_seconds` | ADR 015 |
 | `streams_active` | `decdn_streams_active` | architecture.md |
 | `streams_completed` | `decdn_streams_completed_total` | architecture.md |
 | `streams_failed` | `decdn_streams_failed_total` | architecture.md |
