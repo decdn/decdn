@@ -1914,6 +1914,7 @@ dependencies = [
  "flate2",
  "iroh",
  "iroh-blobs",
+ "iroh-metrics",
  "rand 0.10.1",
  "reqwest 0.13.2",
  "serde",

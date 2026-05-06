@@ -10,6 +10,7 @@ description = "Cache engine wrapping iroh-blobs with origin pull-through for deC
 decdn-protocol = { workspace = true }
 iroh = { workspace = true }
 iroh-blobs = { workspace = true }
+iroh-metrics = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }

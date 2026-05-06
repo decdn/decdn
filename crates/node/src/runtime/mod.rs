@@ -88,8 +88,7 @@ pub async fn run(
         cache_dir = %cfg.cache.cache_dir.display(),
         has_origin = cfg.cache.origin_url.is_some() || cfg.cache.origin_path.is_some(),
         pinned_hashes = cfg.cache.pinned_hashes.len(),
-        // Origin retry policy (#285). Logged at startup so SIGHUP-applied
-        // deltas have a baseline in the same log stream and operators
+        // Origin retry policy (#285). Logged once at startup so operators
         // can audit the active resilience budget without hitting an RPC.
         retry_max_retries = retry.max_retries,
         retry_initial_backoff_ms = retry.initial_backoff_ms,
@@ -497,8 +496,8 @@ fn log_join_result(result: Result<(), tokio::task::JoinError>, phase: &'static s
 /// already-cached content and cache misses surface as
 /// `CacheError::NoOrigin`.
 ///
-/// `node_metrics` is wired into the engine's retry observer slot (#285)
-/// so origin pull-through retries land on the `OpenMetrics` endpoint.
+/// `node_metrics` provides the shared `Arc<CacheMetrics>` that the
+/// engine bumps on origin fetches and retry exhaustions (#285).
 async fn build_cache(
     cfg: &ResolvedConfig,
     node_metrics: Arc<metrics::Metrics>,
@@ -522,15 +521,13 @@ async fn build_cache(
                 anyhow::bail!("cache.origin_url and cache.origin_path are mutually exclusive")
             }
         };
-    let observer: Arc<dyn decdn_cache::RetryObserver> =
-        Arc::new(metrics::MetricsRetryObserver::new(node_metrics));
     CacheEngine::open_full(
         &cfg.cache.cache_dir,
         origin,
         cfg.cache.max_blob_size_mb,
         cfg.cache.pinned_hashes.clone(),
         cfg.cache.origin_retry,
-        observer,
+        Some(node_metrics.cache_metrics()),
     )
     .await
     .context("failed to open cache engine")
