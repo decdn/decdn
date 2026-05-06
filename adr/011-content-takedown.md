@@ -78,12 +78,17 @@ interface IContentBlacklist {
     function ratifyAppealRemoval(uint256 appealId) external;    // ve-Governor only
     function reverseAppeal(uint256 appealId) external;          // ve-Governor only
 
-    // Permissionless cleanup. Anyone may call to finalize an appeal whose
-    // window has elapsed (multisig silent past BLACKLIST_MULTISIG_REVIEW_WINDOW
-    // or governance silent past BLACKLIST_RATIFICATION_WINDOW), to release a
-    // body's interim-relief slot, refund the bond per § Bond and frequency
-    // caps, and emit BlacklistAppealLapsed. Mirrors the lazy-cleanup pattern
-    // used by pruneBlacklistedAssignment in OriginAssignment.
+    // Permissionless cleanup. Reverts unless one of the following admissibility
+    // conditions holds for the appeal:
+    //   (a) multisig silent past BLACKLIST_MULTISIG_REVIEW_WINDOW, or
+    //   (b) governance silent past BLACKLIST_RATIFICATION_WINDOW, or
+    //   (c) synthetic-standing second-checkpoint balance check failed (see
+    //       § Standing — Synthetic-standing clawback), or
+    //   (d) the underlying BlacklistEntry has been removed via removeHash /
+    //       removeHashRegional global override (see § Global Override).
+    // On success, releases the body's interim-relief slot, refunds or burns the
+    // bond per § Bond and frequency caps for the matched condition, and emits
+    // BlacklistAppealLapsed. Mirrors OriginAssignment.pruneBlacklistedAssignment.
     function cleanupExpiredAppeal(uint256 appealId) external;
 
     // Views
@@ -289,7 +294,7 @@ The new entry points are listed in [§ Contract: ContentBlacklist](#contract-con
 
 The slow-path global override is independent of the appeal flow above. ve-Governor proposals may call `removeHash` (global entries) and `removeHashRegional` (regional entries) directly via the standard timelock, regardless of any open appeal. Both functions are restricted to `GOVERNANCE_ROLE`; this is now explicitly documented as their access control. The slow path is always available for cases that do not fit the fast-track — global standard-vote entries, frequency-capped filers, expired filing windows, or coordinated multi-region disputes that warrant a single ve-Governor decision rather than per-region multisig action.
 
-If `removeHash` or `removeHashRegional` fires while an appeal is open against the same `(blake3Hash, region)` pair, the appeal is rendered moot. Bond refund and slot release happen lazily — the next call to `ratifyAppealRemoval`, `reverseAppeal`, or the permissionless `cleanupExpiredAppeal(appealId)` (see [§ Contract surface](#contract-surface)) observes that the underlying entry no longer exists, refunds the bond, releases the body's concurrent-appeal slot under [§ Bond and frequency caps](#bond-and-frequency-caps), and emits `BlacklistAppealLapsed`. After cleanup, subsequent calls against the appeal id revert with `BlacklistAppealAlreadyClosed`. The contract does not auto-execute on `removeHash`/`removeHashRegional` because Solidity has no scheduler — the lazy pattern matches `OriginAssignment.pruneBlacklistedAssignment`'s permissionless-cleanup model.
+If `removeHash` or `removeHashRegional` fires while an appeal is open against the same `(blake3Hash, region)` pair, the appeal is rendered moot. Bond refund and slot release happen lazily — the next call to `ratifyAppealRemoval`, `reverseAppeal`, or the permissionless `cleanupExpiredAppeal(appealId)` (see [§ Contract surface](#contract-surface)) observes that the underlying entry no longer exists, treats the appeal as **lapsed** (not reversed) — so the bond is **refunded** under the lapse-path rule in [§ Bond and frequency caps](#bond-and-frequency-caps), not burned under the reversal-path rule — releases the body's concurrent-appeal slot, and emits `BlacklistAppealLapsed`. After cleanup, subsequent calls against the appeal id revert with `BlacklistAppealAlreadyClosed`. The contract does not auto-execute on `removeHash`/`removeHashRegional` because Solidity has no scheduler — the lazy pattern matches `OriginAssignment.pruneBlacklistedAssignment`'s permissionless-cleanup model.
 
 ## Compliance Window
 
@@ -584,7 +589,7 @@ Slash challenges cannot be opened against operators while the disputed entry is 
 - Blacklisted content remains content-addressable and verifiable off-network; eviction stops CDN serving but does not prevent redistribution by other means
 - Origin assignment authority extends governance into a new category — positive node-role authorization — that did not previously exist. Capture risk and operator-concentration risk are now governance concerns, not just off-protocol coordination concerns
 - The strict-gating model amends the unconditional permissionless-origin claim from [ADR 001](001-network.md). Cache-only role is preserved as permissionless, but the origin role is governance-gated for all content — per-namespace `OriginAssignment` for registered namespaces and the default-open allow-list for unregistered content. PoC ships in the default-open bootstrap window (see [§ Default-open allow-list](#default-open-allow-list)); production governance closes it
-- The appeal flow adds five entry points (`openBlacklistAppeal` / `fastTrackAppeal` / `rejectAppeal` / `ratifyAppealRemoval` / `reverseAppeal`), per-appeal escrow accounting, and a per-address perjury denylist to `ContentBlacklist`, increasing the contract's surface area and audit cost — same trade-off acknowledged in [ADR 028 §6](028-slashing-appeals.md#6-contract-surface)
+- The appeal flow adds six entry points (`openBlacklistAppeal` / `fastTrackAppeal` / `rejectAppeal` / `ratifyAppealRemoval` / `reverseAppeal` / `cleanupExpiredAppeal`), per-appeal escrow accounting, and a per-address perjury denylist to `ContentBlacklist`, increasing the contract's surface area and audit cost — same trade-off acknowledged in [ADR 028 §6](028-slashing-appeals.md#6-contract-surface)
 - Filers must front `BLACKLIST_APPEAL_BOND` (1,000 TOKEN default) at filing time. For cold-start participants and small-balance TOKEN holders this is a real frictional cost. The bond is governance-bounded `[100, 10,000]` so it can be reduced during the PoC window if observed filing volumes warrant
 - The per-body concurrent-appeal cap and per-filer 90-day frequency cap trade off coverage for griefing resistance: a coordinated good-faith dispute against many entries issued by a single body can be queued behind the cap. Mitigations are observable on-chain (cap-reached events should be surfaced in operator tooling) and the slow-path ve-Governor override remains available for cases that overflow the fast-track
 

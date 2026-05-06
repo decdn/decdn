@@ -142,7 +142,7 @@ Numeric per-ADR index. The thematic chapter ordering for top-to-bottom reading l
 - **[ADR 008 — Reputation System](008-reputation.md)** — Interaction-weighted scoring with gossip propagation; gates [ADR 027](027-distinct-client-receipts.md) gauge-pool eligibility.
 - **[ADR 009 — Governance Model](009-governance.md)** — Admin key for PoC; ve-weighted Governor + Timelock with safety bounds for production.
 - **[ADR 010 — Multi-Token Payment Support](010-multi-token.md)** — Token-agnostic payments with governance-managed ERC-20 allowlist. USDC-only for PoC.
-- **[ADR 011 — Content Takedown and Hash Blacklisting](011-content-takedown.md)** — Governance-controlled on-chain hash blacklist with regional bodies and emergency fast-path.
+- **[ADR 011 — Content Takedown and Hash Blacklisting](011-content-takedown.md)** — Governance-controlled on-chain hash blacklist with regional bodies and emergency fast-path; per-entry appeals for regional entries via emergency-multisig fast-track + ve-Governor ratification ([§ Blacklist Entry Appeals](011-content-takedown.md#blacklist-entry-appeals)).
 - **[ADR 012 — Client Architecture, Bootstrap, and Trust Model](012-client.md)** — Client bootstrap, key management, identity lifecycle, trust boundary, multi-node parallel download, crash recovery, and file manifests.
 - **[ADR 013 — Schema Evolution](013-schema-evolution.md)** — Varint-length framing, protocol enums, three-tier evolution model.
 - **[ADR 014 — On-Chain Verification for Slashing Evidence](014-on-chain-verification.md)** — secp256k1 EIP-712 `slash_sig` on `ProbeResponse`/`StreamResponse`, optimistic challenge-response for corruption, unified `SlashJudge` contract.
