@@ -50,7 +50,6 @@ crates/
 |------|---------|
 | `cdn/probe/v1` | Latency + availability probing |
 | `cdn/client/v1` | All paid delivery (client→node and node→node) |
-| `cdn/watchtower/v1` | Channel-dispute monitoring, voucher registration |
 | `cdn/dht/v1` | Content discovery via Kademlia DHT (see ADR 022) |
 | iroh-gossip (built-in) | Node metadata broadcast (`NodeAnnounce`), node discovery |
 | `cdn/reputation/v1` (gossip topic) | Reputation reports over iroh-gossip |

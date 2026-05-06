@@ -21,7 +21,6 @@ This ADR defines which protocols are eligible for 0-RTT, the replay safety ratio
 | --- | --- | --- |
 | `cdn/probe/v1` | **Yes** | `ProbeRequest` is read-only and idempotent. A replayed probe produces a duplicate `ProbeResponse` that the requester deduplicates by `NodeId` in the probe cache. No state change on the responder. |
 | `cdn/client/v1` | **No** | `StreamRequest` initiates a payment relationship. Replay could cause duplicate byte delivery or voucher accounting confusion. Subsequent streams on an established connection already benefit from QUIC stream multiplexing (zero additional handshake cost). |
-| `cdn/watchtower/v1` | **No** | `WatchtowerRegister` has side effects (begins channel monitoring, allocates state). Connections are long-lived — handshake cost is amortized over hours or days. |
 
 > External ALPNs (e.g. companion-protocol ALPNs documented in appendices) make their own 0-RTT decisions; they are out of scope here.
 
@@ -34,8 +33,6 @@ Responders MUST NOT use `ProbeRequest` receipt to trigger any state change (e.g.
 > **Implementation note:** Probe-receipt handling functions MUST be annotated as 0-RTT-safe (no side effects). If future implementations add demand-signal tracking or cache-priority boosting to probe handling, they MUST check the QUIC transport layer's early-data/replayed indicator before applying side effects.
 
 **`StreamRequest` (unsafe):** Initiates paid byte delivery. Replay could cause a node to begin streaming bytes and expect voucher payment for a transfer the client did not request. Even if the node detects the duplicate `channel_id` + `byte_offset` combination, the window between replay receipt and detection creates accounting ambiguity.
-
-**`WatchtowerRegister` (unsafe):** Allocates monitoring state on the watchtower. Replay could cause duplicate channel registration, resource exhaustion, or incorrect `latest_voucher` state if the replayed registration carries a stale voucher.
 
 ### Session Ticket Management
 
@@ -62,7 +59,6 @@ Nodes MUST configure 0-RTT acceptance per ALPN:
 
 - **`cdn/probe/v1`:** Accept 0-RTT. Process early-data `ProbeRequest` immediately.
 - **`cdn/client/v1`:** Reject 0-RTT (do not configure `max_early_data_size`). This is the default — QUIC servers that do not explicitly enable 0-RTT will reject it.
-- **`cdn/watchtower/v1`:** Reject 0-RTT.
 
 ### Impact on Probe Latency
 
@@ -93,7 +89,7 @@ The `probe_collection_latency_seconds` histogram with the `0rtt` label enables o
 ## Consequences
 
 - **Probe latency improves** for warm connections (all connections after the first cycle). The 1-RTT handshake cost is eliminated from the critical path.
-- **No change to payment security.** `cdn/client/v1` and `cdn/watchtower/v1` remain 1-RTT-only. Payment channel setup, voucher exchange, and watchtower registration are never sent as early data.
+- **No change to payment security.** `cdn/client/v1` remains 1-RTT-only. Payment channel setup and voucher exchange are never sent as early data.
 - **Session ticket storage** adds a small memory footprint (~200 bytes per ticket x 1,000 max = ~200 KB).
 - **Complexity cost** is modest: iroh's `connect_with_0rtt()` handles the transport-level details. The implementation burden is the ticket cache, the per-ALPN accept/reject configuration, and the fallback path.
 - **Future protocol versions** that add state-changing behavior to `ProbeRequest` must re-evaluate 0-RTT eligibility. The replay safety analysis in this ADR is tied to the current message semantics.

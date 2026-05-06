@@ -22,13 +22,11 @@ The goal is a clean mechanical answer to: **how does the codebase express the di
 | Key management (node) | File-based (`~/.decdn/node.key`) | Platform keychain + hardware wallet via delegated hot key | ADR 012 |
 | Key management (client) | File-based | Platform keychain; hardware wallet + derived hot key for voucher signing | ADR 012 |
 | Reputation engine | Simplified stand-in (local observations only, no gossip weighting) | Full gossip-weighted scoring (70% local / 30% gossip, decay, cold-start) | ADR 008 |
-| Watchtower | Simplified — client monitors its own channels | Full — dedicated `WatchtowerEscrow` + `cdn/watchtower/v1` | ADR 007 |
 | RPC trust | Single RPC endpoint | Multi-source (registry + DNS seed fallback) | ADR 001, 012 |
 | Regional body registration | None — admin key is sole governance for blacklist | Regional bodies registered; global governance override | ADR 011 |
-| Default-open allow-list | Inactive (`defaultOpenAllowlistActive == false`) — permissive bootstrap window: any active staker may serve as origin for `namespaceId == 0` | Activated by governance; only allow-listed operators appear in `OriginAssignment.getOrigins(0)` for default-open content; off-chain consumers (clients, watchtowers) consult that view to filter unauthorized origins | ADR 011, ADR 016 |
+| Default-open allow-list | Inactive (`defaultOpenAllowlistActive == false`) — permissive bootstrap window: any active staker may serve as origin for `namespaceId == 0` | Activated by governance; only allow-listed operators appear in `OriginAssignment.getOrigins(0)` for default-open content; off-chain consumers (clients) consult that view to filter unauthorized origins | ADR 011, ADR 016 |
 | Treasury disbursement | Manual (admin key holder) | On-chain governance proposal | ADR 009 |
 | Bootstrap peer source | On-chain registry only | Registry + DNS seed list + minimum peer diversity (Option B+C) | ADR 012 |
-| `cdn/watchtower/v1` ALPN | Not used | Active — nodes register with watchtowers | ADR 007 |
 | Multi-token `token_rates` gossip field | Omitted (single `rate_per_mb`) | Present alongside `rate_per_mb` | ADR 010 |
 
 ## Decision
@@ -111,21 +109,6 @@ pub trait GovernanceClient: Send + Sync {
 | Challenge bond | 100 TOKEN | 100 TOKEN |
 | Buyback | `BuybackBurner` receives fees; `executeBuyback` never called | Called by keeper after activation criteria met (ADR 018) |
 
-### 5. `WatchtowerClient` — `crates/incentive`
-
-```rust
-pub trait WatchtowerClient: Send + Sync {
-    /// Register a channel with one or more watchtowers.
-    fn register_channel(&self, channel: ChannelId, watchtower: &NodeId) -> Result<()>;
-    /// Called when a `ChannelCloseInitiated` event is observed.
-    fn on_close_initiated(&self, channel: ChannelId, event: &CloseEvent) -> Result<()>;
-}
-```
-
-| | PoC | Production |
-|---|-----|------------|
-| Implementation | `NoopWatchtowerClient` — client monitors its own channels directly | `cdn/watchtower/v1` ALPN; watchtower nodes use `WatchtowerEscrow` contract |
-
 ### 6. `CorruptionChallenger` — `crates/incentive`
 
 ```rust
@@ -182,8 +165,8 @@ pub trait FeeRouterClient: Send + Sync {
     /// Returns `None` for the no-op PoC variant.
     fn router_address(&self) -> Option<Address>;
     /// Voucher-payload byte counts are forwarded into the router by the
-    /// settlement transaction; this hook lets observers (metrics, watchtower)
-    /// snapshot per-settlement byte deltas without reading chain state.
+    /// settlement transaction; this hook lets observers (metrics) snapshot
+    /// per-settlement byte deltas without reading chain state.
     fn on_settlement(&self, operator: &Address, bytes_delivered: u64, amount_usdc: u64);
 }
 ```
@@ -275,7 +258,6 @@ pub fn build_components(config: &Config) -> Components {
         reputation:    reputation_engine(config),
         payment:       payment_client(config),
         governance:    governance_client(config),
-        watchtower:    watchtower_client(config),
         challenger:    corruption_challenger(config),
         constants:     network_constants(),
     }
@@ -304,7 +286,7 @@ fn key_store(config: &Config) -> Arc<dyn KeyStore> {
 // ... same pattern for remaining seams
 ```
 
-This is a stronger guarantee than `if cfg!(feature = "poc")`: with the attribute form, the PoC branch is **excluded from compilation entirely** in a production build. `FileKeyStore`, `NoopWatchtowerClient`, and other PoC types are not present in the production binary at all — not merely optimized away.
+This is a stronger guarantee than `if cfg!(feature = "poc")`: with the attribute form, the PoC branch is **excluded from compilation entirely** in a production build. `FileKeyStore` and other PoC types are not present in the production binary at all — not merely optimized away.
 
 `#[cfg(feature = "poc")]` and `#[cfg(not(feature = "poc"))]` appear **only** in `crates/node/src/wiring.rs` and `crates/node/src/main.rs`. They are **banned** in all other crates via a `rustflags` lint (see Enforcement below).
 
@@ -324,10 +306,6 @@ crates/
         mod.rs         — PaymentChannelClient trait
         stable.rs      — PoC: StablePaymentChannelClient
         multi_token.rs — Production: MultiTokenPaymentChannelClient
-      watchtower/
-        mod.rs         — WatchtowerClient trait
-        noop.rs        — PoC: NoopWatchtowerClient
-        live.rs        — Production: LiveWatchtowerClient
       ...
   reputation/
     src/
@@ -382,7 +360,6 @@ The six wiring-shape alternatives evaluated against centralised `#[cfg]`-keyed s
 | ADR | Seam used | Notes |
 |-----|-----------|-------|
 | ADR 003 | `PaymentChannelClient` | `StablePaymentChannel` is PoC concrete impl |
-| ADR 007 | `WatchtowerClient` | `NoopWatchtowerClient` for PoC |
 | ADR 008 | `ReputationEngine` | `SimpleReputationEngine` for PoC |
 | ADR 009 | `GovernanceClient` | Admin key vs Governor |
 | ADR 010 | `PaymentChannelClient` | Multi-token client for production |

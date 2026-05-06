@@ -53,7 +53,6 @@ pub enum GossipPayload {
     NodeAnnounce(NodeAnnounce),
     // Reserved for later steps (append only):
     //   ReputationReport(ReputationReport)   // discriminant 1
-    //   WatchtowerAnnounce(WatchtowerAnnounce) // discriminant 2
 }
 
 /// Signed `NodeAnnounce` gossip message (ADR 001).

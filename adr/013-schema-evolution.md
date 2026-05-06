@@ -85,17 +85,6 @@ enum ClientMessage {
     VoucherAck,                       // 4
     StreamEnd,                        // 5
 }
-
-/// cdn/watchtower/v1
-#[derive(Serialize, Deserialize)]
-enum WatchtowerMessage {
-    Register(WatchtowerRegister),     // 0
-    Accept(WatchtowerAccept),         // 1
-    VoucherUpdate(VoucherUpdate),     // 2
-    VoucherAck,                       // 3
-    Revoke(WatchtowerRevoke),         // 4
-    RevokeAck(WatchtowerRevokeAck),   // 5
-}
 ```
 
 #### Variant ordering rule
@@ -421,7 +410,7 @@ A node MUST support at least the current and previous major version simultaneous
 
 Deprecation schedules are announced via governance ([ADR 009](009-governance.md)). A future governance-maintained on-chain `ProtocolVersions` registry could formalize version sunset dates — deferred follow-up.
 
-> **See also:** [`appendix-operator-upgrade-path.md`](appendix-operator-upgrade-path.md) sequences the operator-side actions for each tier — Tier 1/2 checklists, the Tier 3 rolling-upgrade procedure, and the watchtower / client / governance coordination touchpoints.
+> **See also:** [`appendix-operator-upgrade-path.md`](appendix-operator-upgrade-path.md) sequences the operator-side actions for each tier — Tier 1/2 checklists, the Tier 3 rolling-upgrade procedure, and client / governance coordination touchpoints.
 
 ### Application Error Codes
 

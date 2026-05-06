@@ -1,6 +1,6 @@
 # Appendix: Production L2 Deployment Target
 
-> **This is an appendix, not a core protocol ADR.** The protocol depends on Arbitrum-class L2 properties (forced-inclusion delay ≤ 24h per [ADR 007](007-watchtower.md), gas-cost calibration consistent with [ADR 003 § Deposit Economics](003-payments.md#deposit-economics), Balancer V3 Router availability per [ADR 018](018-liquidity-strategy.md)), but the choice of *which* Arbitrum-class L2 is a deployment decision. This appendix records the canonical selection (Arbitrum One) and the comparison against alternatives. A future deployment on Base, OP Mainnet, or another OP-Stack/Nitro chain would require re-validating the property constraints.
+> **This is an appendix, not a core protocol ADR.** The protocol depends on Arbitrum-class L2 properties (forced-inclusion delay ≤ 24h per [ADR 003 § L2 sequencer censorship](003-payments.md#l2-sequencer-censorship), gas-cost calibration consistent with [ADR 003 § Deposit Economics](003-payments.md#deposit-economics), Balancer V3 Router availability per [ADR 018](018-liquidity-strategy.md)), but the choice of *which* Arbitrum-class L2 is a deployment decision. This appendix records the canonical selection (Arbitrum One) and the comparison against alternatives. A future deployment on Base, OP Mainnet, or another OP-Stack/Nitro chain would require re-validating the property constraints.
 
 ## Context
 
@@ -9,7 +9,7 @@ The PoC runs on **Arbitrum Sepolia**. TOKEN is canonical on one L2 — all staki
 The choice affects:
 
 - Gas costs and EIP-4844 data-fee characteristics
-- Sequencer forced-inclusion delay (lower-bounds the dispute window — ADR 003/007)
+- Sequencer forced-inclusion delay (lower-bounds the dispute window — see [ADR 003 § L2 sequencer censorship](003-payments.md#l2-sequencer-censorship))
 - Balancer V3 liquidity venue deployment and router addresses (ADR 018)
 - USDC availability and canonical form (bridged vs native)
 - DeFi ecosystem depth for TOKEN/USDC liquidity (ADR 018)
@@ -18,7 +18,7 @@ The choice affects:
 Several other ADRs depend on the chain selection:
 
 - **ADR 003 / ADR 014** — gas estimates assume Arbitrum-class L2 fee markets
-- **ADR 007** — forced-inclusion delay assumed ≤ 24 hours (Arbitrum value)
+- **ADR 003 § L2 sequencer censorship** — forced-inclusion delay assumed ≤ 24 hours (Arbitrum value)
 - **ADR 018** — Balancer V3 Router address (canonical: see [ADR 018 §"Buyback execution via Balancer V3"](018-liquidity-strategy.md#buyback-execution-via-balancer-v3)) labelled as the Arbitrum mainnet address
 
 ## Candidate Chains
@@ -90,7 +90,7 @@ Rationale:
 2. **Highest DeFi liquidity depth** — thinner competition for TOKEN/USDC pool depth during early production; better buyback execution quality.
 3. **PoC continuity** — Arbitrum Sepolia → Arbitrum One is a straight path with no architecture changes.
 4. **Cross-ADR consistency** — gas estimates (ADR 003), forced-inclusion window (ADR 007), and Balancer V3 contract addresses (ADR 018) are all calibrated against Arbitrum One.
-5. **Mature ecosystem** — Governor + TimelockController deployments, Foundry support, Etherscan explorer, block explorer APIs, and watchtower infrastructure are all well-established on Arbitrum One.
+5. **Mature ecosystem** — Governor + TimelockController deployments, Foundry support, Etherscan explorer, and block-explorer APIs are all well-established on Arbitrum One.
 
 ### Not Selected
 

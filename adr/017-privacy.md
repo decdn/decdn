@@ -5,7 +5,7 @@
 
 ## Context
 
-The protocol makes several deliberate privacy tradeoffs favoring decentralization and accountability over confidentiality. These decisions are scattered across [ADR 001](001-network.md), [ADR 002](002-content-addressing.md), [ADR 003](003-payments.md), [ADR 005](005-protocol.md), [Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md), [ADR 007](007-watchtower.md), [ADR 008](008-reputation.md), [ADR 012](012-client.md), and [architecture.md](architecture.md). No single document maps the full privacy surface, making it difficult to reason about the cumulative exposure or prioritize mitigations.
+The protocol makes several deliberate privacy tradeoffs favoring decentralization and accountability over confidentiality. These decisions are scattered across [ADR 001](001-network.md), [ADR 002](002-content-addressing.md), [ADR 003](003-payments.md), [ADR 005](005-protocol.md), [Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md), [ADR 008](008-reputation.md), [ADR 012](012-client.md), and [architecture.md](architecture.md). No single document maps the full privacy surface, making it difficult to reason about the cumulative exposure or prioritize mitigations.
 
 This ADR consolidates that analysis into a single reference. It does not introduce new functionality — it systematizes privacy properties that other ADRs already specify, assigns an explicit disposition to each, and prioritizes mitigations for PoC versus production.
 
@@ -21,7 +21,7 @@ The analysis is organized by adversary capability. Each tier subsumes the capabi
 |------|-----------|-------------|---------------------|
 | T1 | Passive network observer | Observes QUIC connection metadata (IP pairs, timing, volume), public gossip messages, on-chain transactions and events | ISP, nation-state passive surveillance, blockchain analytics firm |
 | T2 | Active protocol participant | All of T1 plus: operates staked nodes, sends probes, opens payment channels, subscribes to gossip topics, observes probe responses | Competing CDN, curious node operator, researcher |
-| T3 | Infrastructure operator | All of T2 plus: operates an RPC endpoint, iroh relay, or watchtower | RPC provider (Alchemy, Infura), relay operator, watchtower service |
+| T3 | Infrastructure operator | All of T2 plus: operates an RPC endpoint or iroh relay | RPC provider (Alchemy, Infura), relay operator |
 | T4 | Compromised endpoint | Has memory or disk access to a specific client or node | Device theft, malware, law enforcement with warrant |
 
 ### 2. Privacy Surface Inventory
@@ -32,7 +32,7 @@ Each row identifies a discrete data exposure. The **ID** column is used for back
 |----|---------|-------------|-----------|------------|
 | P-02 | On-chain payment channels | Channel IDs, client/provider Ethereum addresses, deposit amounts, settlement events | T1 | [003](003-payments.md) |
 | P-03 | On-chain staking registry | `nodeId`, `ethAddress`, `multiaddrs`, `regionHint`, registration timestamps | T1 | [001](001-network.md), [architecture.md](architecture.md) |
-| P-04 | ALPN protocol identification | QUIC TLS ClientHello reveals which ALPN is negotiated (`cdn/probe/v1`, `cdn/client/v1`, `cdn/watchtower/v1`) | T1 | [005](005-protocol.md) |
+| P-04 | ALPN protocol identification | QUIC TLS ClientHello reveals which ALPN is negotiated (`cdn/probe/v1`, `cdn/client/v1`) | T1 | [005](005-protocol.md) |
 | P-05 | `ReputationReport` gossip | Provider, reporter, metrics (delivery speed, correctness, uptime), timestamps — signed and broadcast on `cdn/reputation/v1` | T1 | [008](008-reputation.md) §6 |
 | P-07 | Node earnings inference | Channel closures and settlement amounts are on-chain; node revenue is computable | T1 | [003](003-payments.md) |
 | P-08 | BLAKE3 hash as global identifier | Same content always produces the same hash; repeated requests for a hash are correlatable | T1 | [002](002-content-addressing.md) |
@@ -43,7 +43,6 @@ Each row identifies a discrete data exposure. The **ID** column is used for back
 | P-13 | GeoIP inference | Self-reported `regionHint` combined with IP addresses from `multiaddrs` enables geolocation | T2 | [001](001-network.md) |
 | P-14 | Reporter credibility leakage | Reporter weight is based on `effective_settled_value` (ADR 008 §4), which depends on on-chain settlement history — reveals a reporter's payment activity | T1 | [008](008-reputation.md) §4 |
 | P-15 | RPC provider query visibility | Registry queries, blacklist polling, and rate-bounds lookups are visible to the RPC provider | T3 | [architecture.md](architecture.md) §Trust Assumptions |
-| P-16 | Watchtower voucher patterns | Voucher updates expose cumulative bytes delivered, update frequency, and session duration | T3 | [007](007-watchtower.md) |
 | P-17 | Relay connection metadata | iroh relays see source/destination IP pairs and connection timing for relayed connections | T3 | [architecture.md](architecture.md) §Trust Assumptions |
 | P-18 | Unencrypted iroh key (PoC) | Client's Ed25519 secret key stored at `~/.decdn/iroh_key` with `0600` permissions, no encryption | T4 | [012](012-client.md) §iroh Identity Key |
 | P-19 | Offline lease blast radius | Up to 500 `K_blob` values extractable from a compromised device's sealed lease | T4 | [Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md) §Offline Leases |
@@ -72,7 +71,7 @@ When a channel is settled on-chain, the final voucher nonce and cumulative amoun
 
 ##### Protocol fingerprinting (P-04)
 
-ALPN negotiation in the QUIC TLS ClientHello reveals whether a connection is a probe, a paid stream, a watchtower interaction, or a key delivery session. A network-level observer can classify connections by type. This is standard for any QUIC-based multi-protocol system and is not considered a significant privacy concern — the protocols are not secret.
+ALPN negotiation in the QUIC TLS ClientHello reveals whether a connection is a probe, a paid stream, or a key delivery session. A network-level observer can classify connections by type. This is standard for any QUIC-based multi-protocol system and is not considered a significant privacy concern — the protocols are not secret.
 
 ##### Reputation gossip (P-05)
 
@@ -106,13 +105,9 @@ Infrastructure operators have a privileged view of specific interaction channels
 
 The RPC provider observes all on-chain queries: registry lookups, blacklist polling, rate-bounds checks. This reveals which nodes a client or node is interested in. The [architecture.md](architecture.md) trust assumptions already document this and plan multi-source bootstrap for production.
 
-##### Watchtower (P-16)
+##### Relay (P-17)
 
-Voucher updates expose channel activity patterns (amounts, frequency, session duration). [ADR 007](007-watchtower.md) acknowledges this: "the privacy impact is low — vouchers are not secret (the counterparty already has them) — but it is a new data surface." The watchtower sees no more than the channel counterparty already knows.
-
-> **Aggregation risk:** Watchtower operators aggregate voucher update patterns across all monitored channels, providing a qualitatively broader payment activity view than any single bilateral counterparty. Production watchtower selection guidance SHOULD recommend using watchtowers operated by different entities than the node's primary business partners to limit cross-channel correlation.
-
-**Relay (P-17).** iroh relays see source/destination IP pairs and connection timing for relayed connections (~10% of conditions). Relays cannot inspect content (all traffic is end-to-end encrypted). This is standard for any relay-based NAT traversal system.
+iroh relays see source/destination IP pairs and connection timing for relayed connections (~10% of conditions). Relays cannot inspect content (all traffic is end-to-end encrypted). This is standard for any relay-based NAT traversal system.
 
 #### T4: Compromised Endpoint
 
@@ -147,7 +142,6 @@ Compromising `server_secret` exposes all past and future epoch keys until rotati
 | P-13 | GeoIP inference | Accept | Self-reported region is intentionally public for client selection | — |
 | P-14 | Reporter credibility leakage | Accept | Settlement history is already on-chain (P-02, P-07) | — |
 | P-15 | RPC provider visibility | Mitigate | Operational guidance reduces single-provider trust | Pre-mainnet |
-| P-16 | Watchtower voucher patterns | Accept | Counterparty already has vouchers; low incremental exposure | — |
 | P-17 | Relay connection metadata | Accept | Standard relay behavior; traffic is E2E encrypted | — |
 | P-18 | Unencrypted iroh key | Mitigate | Already planned: platform keychain in production | Pre-mainnet |
 | P-19 | Offline lease blast radius | Accept | Industry-standard tradeoff; operational mitigations in [Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md) | — |
@@ -233,7 +227,6 @@ Compromising `server_secret` exposes all past and future epoch keys until rotati
 - [ADR 003 — Payment Model](003-payments.md): payment channel on-chain visibility, probe fishing rate limits
 - [ADR 005 — Wire Protocol](005-protocol.md): probe publicity statement, ALPN definitions
 - [Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md): epoch keys, forward secrecy, offline lease blast radius, app server privacy boundary
-- [ADR 007 — Watchtower Design for Channel Disputes](007-watchtower.md): voucher sharing privacy impact
 - [ADR 008 — Reputation System](008-reputation.md): `ReputationReport` gossip, reporter credibility weighting
 - [ADR 012 — Client Architecture, Bootstrap, and Trust Model](012-client.md): client NodeId, key storage, rotation
 - [ADR 014 — On-Chain Verification for Slashing Evidence](014-on-chain-verification.md): on-chain verification data surface
