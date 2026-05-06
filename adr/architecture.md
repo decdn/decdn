@@ -90,9 +90,9 @@ The economic model that ties the protocol together. Three ADRs: [ADR 026](026-ga
 How protocol violations are detected, adjudicated, and punished. The slashing schedule lives in [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn); this chapter is the evidence and adjudication path.
 
 1. [ADR 014 — On-Chain Verification for Slashing Evidence](014-on-chain-verification.md)
-2. [ADR 007 — Watchtower Design for Channel Disputes](007-watchtower.md)
-3. [ADR 008 — Reputation System](008-reputation.md)
-4. [ADR 011 — Content Takedown and Hash Blacklisting](011-content-takedown.md)
+2. [ADR 008 — Reputation System](008-reputation.md)
+3. [ADR 011 — Content Takedown and Hash Blacklisting](011-content-takedown.md)
+4. [Appendix: Permissionless Fraud-Detection Layer](appendix-fraud-detection.md) — operational detection layer over the on-chain primitives
 
 ### Chapter 6 — Governance & contracts
 
@@ -126,8 +126,8 @@ Appendices document patterns, reference implementations, and operational guidanc
 4. [PoC/Production Seam Architecture (Rust)](appendix-poc-production-seams.md) — leaf-crate principle, wiring-layer mode selection, mechanical-deletion graduation path
 5. [Local Admin HTTP Surface](appendix-local-admin-http.md) — loopback-bound admin API for operator runbook automation
 6. [Operator Key Rotation Runbook](appendix-operator-key-rotation.md) — sequenced procedure for rotating the operator's iroh node-key, Ethereum signing key, and (production) session keys via `bindNodeId`, deregister-and-re-stake, or `erc7579/smartsessions`
-7. [Operator Protocol-Upgrade Runbook](appendix-operator-upgrade-path.md) — sequenced operator actions for each ADR 013 tier (Tier 1/2 checklists; Tier 3 rolling-upgrade procedure; watchtower, client, and governance coordination)
-8. [Watchtower Operating Economics](appendix-watchtower-economics.md) — operator-facing cost model and break-even analysis previously inlined in ADR 007
+7. [Operator Protocol-Upgrade Runbook](appendix-operator-upgrade-path.md) — sequenced operator actions for each ADR 013 tier (Tier 1/2 checklists; Tier 3 rolling-upgrade procedure; client and governance coordination)
+8. [Permissionless Fraud-Detection Layer](appendix-fraud-detection.md) — optional, anyone-can-run on-chain monitoring of stale closes and fraudulent epoch summaries via the existing `SlashJudge` bond mechanism
 
 ## Architectural Decisions
 
@@ -137,8 +137,7 @@ Numeric per-ADR index. The thematic chapter ordering for top-to-bottom reading l
 - **[ADR 001 — Network Topology and Peer Mesh](001-network.md)** — Flat peer mesh; gossip for node discovery; `cdn/dht/v1` (Kademlia subset) for content discovery from PoC onward, with the on-chain origin directory ([ADR 022](022-content-discovery.md)) as the deterministic last-resort fallback when DHT returns no providers.
 - **[ADR 002 — Content Addressing](002-content-addressing.md)** — BLAKE3 content-addressed blobs. Node backends are opaque to the network.
 - **[ADR 003 — Payment Model](003-payments.md)** — Off-chain USDC payment channels. Market-driven rates within governance-set bounds.
-- **[ADR 005 — Wire Protocol](005-protocol.md)** — Three core protocols (ALPN-negotiated) plus iroh-gossip. `cdn/client/v1` covers all paid delivery.
-- **[ADR 007 — Watchtower Design for Channel Disputes](007-watchtower.md)** — Non-custodial watchtowers for dispute-window liveness; production `WatchtowerEscrow` provides on-chain fee accountability.
+- **[ADR 005 — Wire Protocol](005-protocol.md)** — Two core protocols (ALPN-negotiated) plus iroh-gossip. `cdn/client/v1` covers all paid delivery.
 - **[ADR 008 — Reputation System](008-reputation.md)** — Interaction-weighted scoring with gossip propagation; gates [ADR 027](027-distinct-client-receipts.md) gauge-pool eligibility.
 - **[ADR 009 — Governance Model](009-governance.md)** — Admin key for PoC; ve-weighted Governor + Timelock with safety bounds for production.
 - **[ADR 010 — Multi-Token Payment Support](010-multi-token.md)** — Token-agnostic payments with governance-managed ERC-20 allowlist. USDC-only for PoC.
@@ -146,7 +145,7 @@ Numeric per-ADR index. The thematic chapter ordering for top-to-bottom reading l
 - **[ADR 012 — Client Architecture, Bootstrap, and Trust Model](012-client.md)** — Client bootstrap, key management, identity lifecycle, trust boundary, multi-node parallel download, crash recovery, and file manifests.
 - **[ADR 013 — Schema Evolution](013-schema-evolution.md)** — Varint-length framing, protocol enums, three-tier evolution model.
 - **[ADR 014 — On-Chain Verification for Slashing Evidence](014-on-chain-verification.md)** — secp256k1 EIP-712 `slash_sig` on `ProbeResponse`/`StreamResponse`, optimistic challenge-response for corruption, unified `SlashJudge` contract.
-- **[ADR 015 — QUIC 0-RTT Connection Establishment](015-zero-rtt.md)** — 0-RTT early data for latency-sensitive protocols (`cdn/probe/v1`, `cdn/dht/v1`); paid delivery (`cdn/client/v1`, `cdn/watchtower/v1`) stays 1-RTT.
+- **[ADR 015 — QUIC 0-RTT Connection Establishment](015-zero-rtt.md)** — 0-RTT early data for latency-sensitive protocols (`cdn/probe/v1`, `cdn/dht/v1`); paid delivery (`cdn/client/v1`) stays 1-RTT.
 - **[ADR 016 — Smart Contract Interaction Model](016-contract-interactions.md)** — Cross-contract call graph, fund custody, access control matrix, and reentrancy analysis.
 - **[ADR 017 — Privacy Analysis](017-privacy.md)** — Unified privacy surface inventory, adversary model, and mitigation roadmap.
 - **[ADR 018 — Liquidity Strategy (Balancer 80/20 POL)](018-liquidity-strategy.md)** — Protocol-Owned Liquidity in a Balancer V3 80/20 TOKEN/USDC weighted pool, seeded from the genesis liquidity allocation.
@@ -175,11 +174,11 @@ The system relies on several infrastructure-level assumptions beyond the cryptog
 
 - **NTP availability and correctness.** Gossip validation depends on loose clock agreement: ±60 s for `NodeAnnounce` freshness ([ADR 001](001-network.md)), and for `ReputationReport`, a maximum age of 1 h with up to +5 min allowed future skew ([ADR 008](008-reputation.md)). A compromised or unavailable NTP source could cause mesh partitions or cause nodes to reject valid gossip. Mitigation: nodes detect relative drift via peer timestamp comparison; the tolerance windows are generous enough to absorb typical NTP jitter.
 
-- **L2 RPC provider honesty.** Nodes and clients trust their RPC provider to return correct event logs for registry queries, blacklist polling, and rate-bounds lookups. A malicious RPC provider could hide `ChannelCloseInitiated` events from watchtowers, defeating dispute protection, or return a fabricated node list to eclipse a client. Mitigation: PoC accepts single-RPC trust; production plans multi-source bootstrap ([ADR 012](012-client.md) Option B) and multiple independent RPC providers.
+- **L2 RPC provider honesty.** Nodes and clients trust their RPC provider to return correct event logs for registry queries, blacklist polling, and rate-bounds lookups. A malicious RPC provider could hide `ChannelCloseInitiated` events from the in-process dispute monitor or third-party fraud detectors, defeating dispute protection, or return a fabricated node list to eclipse a client. Mitigation: PoC accepts single-RPC trust; production plans multi-source bootstrap ([ADR 012](012-client.md) Option B) and multiple independent RPC providers.
 
-- **Encrypted transport integrity for voucher confidentiality.** Vouchers are bearer instruments — a leaked voucher is valid regardless of how it was obtained. The system assumes vouchers only traverse encrypted authenticated channels between the relevant parties: client↔node, node↔watchtower ([ADR 007](007-watchtower.md)), and node↔node cache-miss pulls. Mitigation: QUIC/TLS provides in-transit encryption on all these links; vouchers are never logged or persisted in plaintext. Endpoint compromise or debug output leaking vouchers remains an operational risk.
+- **Encrypted transport integrity for voucher confidentiality.** Vouchers are bearer instruments — a leaked voucher is valid regardless of how it was obtained. The system assumes vouchers only traverse encrypted authenticated channels between the relevant parties: client↔node and node↔node cache-miss pulls. Mitigation: QUIC/TLS provides in-transit encryption on all these links; vouchers are never logged or persisted in plaintext. Endpoint compromise or debug output leaking vouchers remains an operational risk.
 
-- **Arbitrum sequencer liveness.** The dispute mechanism assumes forced-inclusion transactions complete within ~24 h ([ADR 007](007-watchtower.md)). If the sequencer censors dispute transactions beyond this window, a fraudulent close could settle before the honest party responds. Mitigation: PoC dispute window is 48 h (governable 12h–72h), providing at least 24 h of effective response time after worst-case sequencer censorship.
+- **Arbitrum sequencer liveness.** The dispute mechanism assumes forced-inclusion transactions complete within ~24 h ([ADR 003 § L2 sequencer censorship](003-payments.md#l2-sequencer-censorship)). If the sequencer censors dispute transactions beyond this window, a fraudulent close could settle before the honest party responds. Mitigation: PoC dispute window is 48 h (governable 12h–72h), providing at least 24 h of effective response time after worst-case sequencer censorship.
 
 - **ERC-20 token behavior stability.** Governance-approved tokens are assumed not to change behavior post-approval (e.g., a proxy-upgradeable token adding fee-on-transfer). Changed token semantics could break settlement arithmetic or trap funds. Mitigation: PoC is USDC-only, reducing token-surface complexity; production token allowlisting and vetting criteria remain an open question in [ADR 010](010-multi-token.md).
 
@@ -203,7 +202,7 @@ The canonical glossary lives in [`README.md` § Glossary](README.md#glossary), g
 
 Some nodes are configured with an origin backend (S3, R2, Backblaze B2, self-hosted MinIO, NFS, or local disk). They are the source of truth for all blobs but are accessed as infrequently as possible — only when no peer node has the content.
 
-Whether a node is *recognized* as origin is governed on-chain via `OriginAssignment` — see [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority). The wire protocol does not distinguish origins from cache nodes at probe time; origin status is a publisher-level commitment surfaced via `OriginAssignment.getOrigins(namespaceId)` for off-chain consumers (clients selecting peers for first-fetch, watchtowers checking publisher availability commitments). Configuring an origin backend locally without DAO authorization simply means the operator's bytes are served as cache and the operator does not appear in `getOrigins(...)`. For registered namespaces, the publisher proposes the operator set and governance ratifies; for default-open content (`namespaceId == 0`), the DAO maintains a single global allow-list (see [ADR 011 § Default-open allow-list](011-content-takedown.md#default-open-allow-list)). Until that allow-list is activated for the first time, the bootstrap rule preserves the prior permissive behaviour so any active staker with an origin backend may serve default-open content as origin; once activated, only allow-listed operators may.
+Whether a node is *recognized* as origin is governed on-chain via `OriginAssignment` — see [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority). The wire protocol does not distinguish origins from cache nodes at probe time; origin status is a publisher-level commitment surfaced via `OriginAssignment.getOrigins(namespaceId)` for off-chain consumers (clients selecting peers for first-fetch, off-chain monitors checking publisher availability commitments). Configuring an origin backend locally without DAO authorization simply means the operator's bytes are served as cache and the operator does not appear in `getOrigins(...)`. For registered namespaces, the publisher proposes the operator set and governance ratifies; for default-open content (`namespaceId == 0`), the DAO maintains a single global allow-list (see [ADR 011 § Default-open allow-list](011-content-takedown.md#default-open-allow-list)). Until that allow-list is activated for the first time, the bootstrap rule preserves the prior permissive behaviour so any active staker with an origin backend may serve default-open content as origin; once activated, only allow-listed operators may.
 
 ### Supported Origins
 
@@ -376,7 +375,6 @@ A KV-CRDT namespace per content provider could replicate a catalog of `hash → 
 **Secondary use cases to evaluate:**
 
 - **Node metadata.** A shared document keyed by `NodeId` could provide persistent, eventually-consistent node state (rates, capacity, regions) that survives reconnections — supplementing or replacing ephemeral gossip `NodeAnnounce` messages.
-- **Watchtower voucher state.** A KV-CRDT keyed by `(channel_id, nonce)` between a watchtower and its client could keep voucher state consistent, simplifying the bespoke sync and heartbeat commitment described in [ADR 007](007-watchtower.md).
 - **Indexer replication layer.** Indexer nodes (see [Search & Discovery](#future-work-search--discovery) above) could subscribe to content catalog namespaces and build their search index from replicated entries, rather than relying solely on gossip and probe participation.
 
 **Why not in PoC:** DHT already handles content discovery at PoC scale. CRDT replication adds value at larger scale for smarter prefetching; deferred until the network grows beyond where DHT alone suffices.
@@ -385,7 +383,7 @@ A KV-CRDT namespace per content provider could replicate a catalog of `hash → 
 
 ## What Is Not Decided Yet
 
-- ~~Production L2 choice~~: decided — [Appendix: L2 Deployment](appendix-l2-deployment.md) selects Arbitrum One (chain ID 42161). Sequencer censorship mitigation uses Arbitrum's 24h forced-inclusion path; see [ADR 007](007-watchtower.md#l2-sequencer-censorship)
+- ~~Production L2 choice~~: decided — [Appendix: L2 Deployment](appendix-l2-deployment.md) selects Arbitrum One (chain ID 42161). Sequencer censorship mitigation uses Arbitrum's 24h forced-inclusion path; see [ADR 003 § L2 sequencer censorship](003-payments.md#l2-sequencer-censorship)
 - ~~Content discovery scaling strategy (DHT vs gossip hints)~~: decided — [ADR 022](022-content-discovery.md) specifies `cdn/dht/v1` as the primary discovery mechanism from day one, with the on-chain origin directory as the deterministic last-resort fallback; broadcast probe fan-out is not part of the protocol; gossip content hints rejected
 - ~~PoC→production feature-flag / toggle architecture~~: decided — [Appendix: PoC/Production Seams](appendix-poc-production-seams.md) defines trait-based seams with a single `poc` Cargo feature on the `node` crate; `NetworkConstants` as the single source of truth for all numeric differences
 - Parallel streaming from multiple nodes for a single blob (protocol supports it, not prioritised)

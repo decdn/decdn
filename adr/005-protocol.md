@@ -11,13 +11,12 @@ The protocol layer must be distinct from the transport layer (iroh/QUIC) and the
 
 ## Decision
 
-Three core protocols negotiated via ALPN, plus the built-in iroh-gossip protocol:
+Two core protocols negotiated via ALPN, plus the built-in iroh-gossip protocol:
 
 | Protocol | Participants | Purpose |
 | --- | --- | --- |
 | `cdn/probe/v1` | any node ↔ any node | Latency and availability check before committing to a node |
 | `cdn/client/v1` | payer ↔ delivering node | Paid blob delivery with payment vouchers (client→node, node→node on cache miss) |
-| `cdn/watchtower/v1` | watched party (typically node) ↔ watchtower | Channel-dispute monitoring: voucher registration and updates (see ADR 007) |
 | iroh-gossip (built-in) | all nodes | Node metadata announcements (`NodeAnnounce`), node discovery |
 
 ### Gossip topics
@@ -29,7 +28,7 @@ The iroh-gossip protocol carries multiple message types on distinct topics:
 | `cdn/global/v1`, `cdn/region/{cc}/v1` | `NodeAnnounce` | [ADR 001](001-network.md) |
 | `cdn/reputation/v1` | `ReputationReport` | [ADR 008](008-reputation.md) |
 
-All gossip topics use the `cdn/` namespace prefix. Watchtowers are configured statically in the node config rather than discovered via gossip — see [ADR 007 §4 Discovery](007-watchtower.md).
+All gossip topics use the `cdn/` namespace prefix. There is no protocol-level role for fraud monitoring — anyone may run an off-chain detector against the L2 chain ([Appendix: Fraud Detection](appendix-fraud-detection.md)).
 
 ### Rate discovery
 
@@ -128,7 +127,7 @@ struct StreamRequest {
 
 The client includes `ethereum_address` and `binding_signature` in the first `StreamRequest` on a connection. The node verifies the EIP-712 signature via `ecrecover`, caches the verified binding for the connection's lifetime, and uses the recovered address for `clientStakeOf` lookups and voucher attribution. Subsequent requests on the same connection may omit these fields. These are `Option` fields that live in the `StreamRequestExt` extensions struct and default to `None` when absent, via the two-phase deserialization pattern defined in [ADR 013](013-schema-evolution.md#tier-1--minor-no-coordination). Peers that do not send them (e.g., nodes in node-to-node pulls where both sides have on-chain bindings) produce frames without extension bytes, and the receiver fills `StreamRequestExt::default()` — no ALPN version bump is needed since this is defined before the first implementation.
 
-**Voucher wire format:** `Voucher {sig, amt, nonce}` above is shorthand. The EIP-712 signed data covers the full structure from [ADR 003](003-payments.md): `{channelId, amount, nonce, token}`. The fields `signature`, `amount`, and `nonce` are transmitted on the wire; the remaining fields are derived from stream context — `channel_id` is in `StreamRequest` and `token` is fixed at channel open. Including `nonce` explicitly (rather than relying on a monotonically incrementing implicit counter) prevents desynchronization if a `VoucherAck` is dropped. The receiver reconstructs the full typed data to verify the signature. This aligns with the watchtower `VoucherUpdate` below, which also includes `nonce` explicitly — though the watchtower version still requires `channel_id` and `token` because it lacks stream context.
+**Voucher wire format:** `Voucher {sig, amt, nonce}` above is shorthand. The EIP-712 signed data covers the full structure from [ADR 003](003-payments.md): `{channelId, amount, nonce, token}`. The fields `signature`, `amount`, and `nonce` are transmitted on the wire; the remaining fields are derived from stream context — `channel_id` is in `StreamRequest` and `token` is fixed at channel open. Including `nonce` explicitly (rather than relying on a monotonically incrementing implicit counter) prevents desynchronization if a `VoucherAck` is dropped. The receiver reconstructs the full typed data to verify the signature.
 
 The delivering node advertises its `rate_per_mb` in `StreamResponse`. The payer accepts by sending the first voucher or disconnects and tries another node. No surprise pricing. `timestamp_us` in `StreamResponse` is the requester-generated microsecond timestamp from `StreamRequest`, echoed back unchanged — the same pattern as `ProbeResponse`. `slash_sig` is an EIP-712 secp256k1 signature over `{hash, ok, rate_per_mb, total_bytes, channel_id, timestamp_us, redirect}`, signed with the operator's Ethereum key and verifiable via `ecrecover` — see [ADR 014](014-on-chain-verification.md). It is mandatory and non-empty on every `StreamResponse`. Signing the full response prevents a malicious party from altering unsigned fields while reusing a valid signature — in particular, `ok` is needed for phantom announcement evidence (proving a node signed `ok: false` after claiming `has_blob: true` in a probe), and `redirect` ensures a node cannot silently alter routing without accountability. A rate mismatch where `stream_response.rate_per_mb > probe_response.rate_per_mb` is slashable if `stream_response.timestamp_us >= probe_response.timestamp_us` and `stream_response.timestamp_us - probe_response.timestamp_us < 30_000_000` (30 seconds). The ordering check prevents unsigned integer underflow in the on-chain verifier. Because both `timestamp_us` values are requester-generated, the on-chain verifier computes this delta from the signed messages alone — no wall-clock reference or external time oracle is needed, and clock skew between the requester and the node does not affect the check. The `redirect` field in `StreamResponse` is used when a node cannot serve — it contains the NodeId of another node that can, never an external URL. The network is fully opaque.
 
@@ -158,36 +157,13 @@ Region codes (`{cc}` in topic names) are self-declared ISO 3166-1 alpha-2 countr
 
 Gossip messages are lightweight (~800 bytes worst case), well within iroh-gossip message limits. Clients and nodes maintain a peer table (`NodeId → NodeAnnounce`) from received messages. The probe step determines which peers hold specific content, along with their cost and latency.
 
-### `cdn/watchtower/v1` — channel-dispute monitoring
-
-Used by either channel party (typically the node) to register payment channels with a watchtower service that monitors for on-chain disputes. The full protocol design is specified in ADR 007.
-
-```mermaid
-sequenceDiagram
-    participant W as Watched Party (Node)
-    participant T as Watchtower
-
-    W->>T: WatchtowerRegister {channel_id, deposit, client, token, latest_voucher, membership_sig}
-    T->>W: WatchtowerAccept {accepted, fee}
-
-    loop Every voucher (at voucher interval from ADR 003, default 1 MB)
-        W->>T: VoucherUpdate {channel_id, amount, nonce, token, signature}
-        T->>W: VoucherAck
-    end
-
-    W->>T: WatchtowerRevoke {channel_id}
-    T->>W: WatchtowerRevokeAck {channel_id}
-```
-
-The watched party sends its latest voucher on registration and streams updates as new vouchers arrive during delivery. `client` is the voucher signer's Ethereum address (replaces the former `counterparty` field for clarity). `token` is the ERC-20 token address for this channel — required because the watchtower must reconstruct the EIP-712 typed data for off-chain signature verification and needs the token address to do so. Together with the watchtower's configured `contract` address and `chain_id`, these fields enable full off-chain EIP-712 verification. `latest_voucher` has the same shape as `VoucherUpdate`: `{channel_id, amount, nonce, token, signature}`. If no vouchers have been exchanged yet, `latest_voucher` is omitted (the watchtower registers the channel with `amount=0, nonce=0`). If the client initiates an on-chain close with a stale (lower-nonce) voucher, the watchtower submits a `disputeChannel` transaction with the latest voucher it holds. The watchtower is non-custodial — it cannot steal funds, worsen settlement, or grief; the voucher's EIP-712 signature is the only authorization the contract checks.
-
 ### Connection Management
 
 One QUIC connection per `(local_node, remote_node, ALPN)` tuple. Multiple requests to the same node on the same protocol reuse the existing connection via QUIC's native stream multiplexing — each `StreamRequest` opens a new bidirectional QUIC stream. A client fetching 100 blobs from one node opens 1 connection with 100 concurrent streams, not 100 connections.
 
 Different ALPNs require separate connections (TLS ALPN is negotiated at connection establishment). A `cdn/probe/v1` connection and a `cdn/client/v1` connection to the same node are always distinct.
 
-**0-RTT early data** is permitted on `cdn/probe/v1` only (idempotent, read-only probes). All other protocols reject 0-RTT: `cdn/client/v1` and `cdn/watchtower/v1` to prevent replay-based accounting or registration confusion. See [ADR 015](015-zero-rtt.md) for the full replay safety analysis and session ticket management.
+**0-RTT early data** is permitted on `cdn/probe/v1` only (idempotent, read-only probes). `cdn/client/v1` rejects 0-RTT to prevent replay-based accounting confusion. See [ADR 015](015-zero-rtt.md) for the full replay safety analysis and session ticket management.
 
 #### Concurrent stream limits
 
@@ -197,7 +173,6 @@ Maximum concurrent bidirectional streams per connection, set via QUIC transport 
 | --- | --- | --- |
 | `cdn/client/v1` | 100 | Enough parallelism for bulk fetching (e.g., video manifest + segments) without exhausting server resources |
 | `cdn/probe/v1` | 1 | Single request-response; the connection is reused for sequential probes to the same node |
-| `cdn/watchtower/v1` | 10 | Allows concurrent updates for up to 10 registered channels; a node with more channels multiplexes updates over the available streams (sufficient for PoC; production nodes with many concurrent channels should open multiple connections or increase this limit via transport parameter negotiation) |
 
 Stream concurrency is enforced via QUIC's `MAX_STREAMS` transport parameter: a peer MUST NOT open a new bidirectional stream beyond the advertised limit (doing so is a protocol violation resulting in `STREAM_LIMIT_ERROR` and connection close). The receiver grants additional credit by sending `MAX_STREAMS` updates as existing streams close.
 
@@ -233,7 +208,6 @@ Implementation constraint: the payer must have a single voucher-signing task per
 
 - Connections remain open while any stream is active or any sent voucher is awaiting `VoucherAck` (on-chain channel closure does not affect connection lifetime).
 - **Idle timeout:** 30 seconds after the last stream closes and no unacknowledged vouchers remain in flight. Endpoints SHOULD send periodic QUIC PING frames when otherwise idle, with a default interval of 10 seconds (below the idle timeout) to prevent NAT middleboxes from dropping the mapping.
-- **`cdn/watchtower/v1` exception:** watchtower connections are long-lived by design (ADR 007). No idle timeout while any channel is registered.
 
 ### Error Handling and Retry Semantics
 

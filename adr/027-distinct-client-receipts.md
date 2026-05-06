@@ -3,7 +3,7 @@
 **Date:** 2026-04-25
 **Status:** Draft
 **Required for:** [ADR 026](026-gauge-boost-tokenomics.md) gauge-pool security
-**Touches:** [ADR 003](003-payments.md), [ADR 007](007-watchtower.md), [ADR 008](008-reputation.md), [ADR 014](014-on-chain-verification.md)
+**Touches:** [ADR 003](003-payments.md), [ADR 008](008-reputation.md), [ADR 014](014-on-chain-verification.md), [Appendix: Fraud Detection](appendix-fraud-detection.md)
 
 ## Context
 
@@ -21,7 +21,7 @@ This ADR is forward-referenced from [ADR 026 §Risks](026-gauge-boost-tokenomics
 
 The protocol introduces a **DeliveryReceipt** primitive, paired one-to-one with each voucher submitted to `FeeRouter.routeSettlement`. Receipts are EIP-712 typed messages signed by the *requester's* secp256k1 key (the address that funded the payment channel). Gauge-pool eligibility for an operator's epoch is gated on a **distinct-client diversity threshold** verified against the receipts the operator commits to chain.
 
-Receipts are batched into a Merkle tree per operator per epoch; only the root and a small summary are stored on-chain at settlement time, mirroring the keccak256 Merkle pattern in [ADR 014 §2 Production Path](014-on-chain-verification.md). Individual receipts surface only on challenge, processed by watchtowers ([ADR 007](007-watchtower.md)) and gated by reputation ([ADR 008](008-reputation.md)).
+Receipts are batched into a Merkle tree per operator per epoch; only the root and a small summary are stored on-chain at settlement time, mirroring the keccak256 Merkle pattern in [ADR 014 §2 Production Path](014-on-chain-verification.md). Individual receipts surface only on challenge, processed via the permissionless [`SlashJudge` bond mechanism](014-on-chain-verification.md#bond-handling) and gated by reputation ([ADR 008](008-reputation.md)).
 
 ### 1. Receipt format
 
@@ -71,7 +71,7 @@ A "distinct client identity" for gauge eligibility purposes is a `clientPubKey` 
 | **Funded-channel minimum.** Address has at least one channel with the operator (or any operator) where the lifetime aggregate `deposit` ≥ `MIN_CHANNEL_FUNDING_USDC`. Tracked via the per-client cumulative-deposit counter introduced by this ADR and specified in [ADR 003 — StablePaymentChannel](003-payments.md#stablepaymentchannel) (`lifetimeDepositOf` semantics block) — `StablePaymentChannel.lifetimeDepositOf(client) view returns (uint256)`, monotonic, incremented by the funded amount on every `openChannel` and `topUp`. The counter is only ever incremented (decay/withdraw doesn't reduce it) so the metric tracks cumulative capital ever bonded into the protocol by this client. Adds one SSTORE per `openChannel` / `topUp`. | 10 USDC | `[1, 100]` USDC |
 | **Funding age.** First channel deposit by this address occurred at least `MIN_CLIENT_AGE` before the receipt's `timestamp`. | 24 h | `[1 h, 30 d]` |
 | **Per-channel cooldown.** A client identity is counted at most once per `IDENTITY_COOLDOWN` window per operator, regardless of how many channels or how many receipts it produces. | 7 d | `[1 d, 30 d]` |
-| **Funding-source diversity.** The address's USDC balance for the qualifying channel deposit was not received from `operatorAddress`, the operator's known affiliated addresses (registered per [ADR 008](008-reputation.md)), or any other client identity already counted toward this operator's distinct-client set in the current epoch. **Watchtowers compute this signal off-chain** by indexing public USDC `Transfer` events from L2 RPC at the time of channel funding; the diversity attestation enters the watchtower-signed receipt-validation output (§5). On-chain enforcement at challenge time is bounded by the EVM's 256-block `BLOCKHASH` window — a full Merkle proof of the historical funding tx is **not** practical without a dedicated block-hash oracle or storage-proof verifier (`reth`-style execution-state proof against an L1-anchored root, deferred to [ADR 017](017-privacy.md) future work). For now, on-chain challenge resolution accepts the attesting watchtower's signature plus a corroborating attester (per §5 quorum); deeper cryptographic proof is a v2 hardening. | — | — |
+| **Funding-source diversity.** The address's USDC balance for the qualifying channel deposit was not received from `operatorAddress`, the operator's known affiliated addresses (registered per [ADR 008](008-reputation.md)), or any other client identity already counted toward this operator's distinct-client set in the current epoch. **Challengers compute this signal off-chain** by indexing public USDC `Transfer` events from L2 RPC at the time of channel funding; the diversity evidence is supplied alongside the `ChallengeReceiptSummary` submission. On-chain enforcement at challenge time is bounded by the EVM's 256-block `BLOCKHASH` window — a full Merkle proof of the historical funding tx is **not** practical without a dedicated block-hash oracle or storage-proof verifier (`reth`-style execution-state proof against an L1-anchored root, deferred to [ADR 017](017-privacy.md) future work). For now, on-chain challenge resolution accepts the challenger's bonded submission plus the standard counter-evidence window from [ADR 014 Bond Handling](014-on-chain-verification.md); deeper cryptographic proof is a v2 hardening. | — | — |
 | **Reputation gate (forward to §6).** If the operator's reputation score is below `medium_rep_threshold`, the funded-channel minimum and funding age are tightened (see §6). | — | — |
 
 #### Per-epoch eligibility threshold
@@ -99,7 +99,7 @@ During the first 8 epochs of mainnet (governance-set `gaugeBootstrapEpochs`, def
 
 #### Optional reputation-attested registry
 
-The protocol does not require a centralized identity registry. However, a `ClientIdentityRegistry` view contract may be supplied by reputation attesters ([ADR 008](008-reputation.md)) so well-known stable client identities (e.g., operators of large origin-backed services purchasing CDN bandwidth) can be vouched for and bypass the funding-age gate. The registry is opt-in and watchtower-validated; clients without a registry entry use the default funded-channel-and-cooldown rules unchanged.
+The protocol does not require a centralized identity registry. However, a `ClientIdentityRegistry` view contract may be supplied by reputation attesters ([ADR 008](008-reputation.md)) so well-known stable client identities (e.g., operators of large origin-backed services purchasing CDN bandwidth) can be vouched for and bypass the funding-age gate. The registry is opt-in; clients without a registry entry use the default funded-channel-and-cooldown rules unchanged. Registry entries are themselves subject to the `SlashJudge` challenge path if a challenger has evidence the vouched-for identity is operator-affiliated.
 
 ### 4. On-chain anchoring (Merkle-batched)
 
@@ -143,13 +143,13 @@ The `EpochReceiptSummary` is committed once per operator per epoch by the operat
 
 #### Challenge window
 
-A 7-day window (matches the gauge-claim-window opening) during which any address may submit a `ChallengeReceiptSummary` claim against an operator's summary. Watchtowers (§5) typically initiate. A successful challenge zeros `claimedDistinctClients` for the epoch — gauge eligibility is forfeited in line with §7. An unsuccessful challenge forfeits the challenger's bond per [ADR 014 Bond Handling](014-on-chain-verification.md).
+A 7-day window (matches the gauge-claim-window opening) during which any address may submit a `ChallengeReceiptSummary` claim against an operator's summary. A successful challenge zeros `claimedDistinctClients` for the epoch — gauge eligibility is forfeited in line with §7. An unsuccessful challenge forfeits the challenger's bond per [ADR 014 Bond Handling](014-on-chain-verification.md).
 
-### 5. Watchtower role (forward to [ADR 007](007-watchtower.md))
+### 5. Challenger role (see [Appendix: Fraud Detection](appendix-fraud-detection.md))
 
-Receipt validation is added as a new **watchtower-class duty** on top of the channel-dispute monitoring already defined in [ADR 007](007-watchtower.md). Watchtowers serving the receipt-validation role are referred to as **receipt attesters** in this ADR; the term is interchangeable with "receipt-validating watchtower".
+The challenge window is permissionless. Any address with sufficient bond capital and the technical capacity to monitor the chain may submit a `ChallengeReceiptSummary`. There is no protocol-defined "validator" role, no on-chain registration, no per-operator subscription, and no fee paid by monitored parties — the challenger's incentive is the bond + reward on a successful challenge.
 
-A receipt attester subscribed to an operator's epoch performs:
+A challenger investigating an operator's epoch performs:
 
 1. **Signature validity.** For each receipt in the batch, recompute the EIP-712 digest, verify the signature with `SignatureChecker`, and verify all five invariants in §1.
 2. **Identity diversity over recent epochs.** Apply the §3 rules — funded-channel minimum, funding-age, per-operator cooldown, funding-source diversity — and compute the actual distinct-client count. Compare with `claimedDistinctClients` in the operator's `EpochReceiptSummary`.
@@ -157,11 +157,11 @@ A receipt attester subscribed to an operator's epoch performs:
 
 #### Bond model
 
-Receipt-fraud challenges use the existing watchtower bond mechanism in [ADR 007](007-watchtower.md). Successful challenges award the bond plus a configurable receipt-fraud reward to the challenger; unsuccessful challenges forfeit the bond per [ADR 014 Bond Handling](014-on-chain-verification.md). Receipt attesters are not a new on-chain role — they are watchtowers running an additional module against the same `WatchtowerEscrow` contract.
+Receipt-fraud challenges use the existing `SlashJudge` bond mechanism from [ADR 014 Bond Handling](014-on-chain-verification.md). Successful challenges award the bond back plus a configurable receipt-fraud reward sourced from the forfeited gauge payout (size governed per §7); unsuccessful challenges forfeit the bond per the standard 50%-burn / 50%-to-operator rule. No new on-chain role is introduced — the challenge type is added alongside `SlashJudge`'s existing phantom / rate / blacklist / corruption types.
 
 #### Separation from the operator
 
-Receipt attesters MUST NOT be operated by the operator they validate. The operator's affiliated-address registry ([ADR 008](008-reputation.md)) is queried; an attester address that overlaps with `operatorAddress`'s known affiliates is ineligible to settle challenges against that operator. This is enforced on-chain in `WatchtowerEscrow` at challenge submission time, mirroring the watchtower-collusion defense already in [ADR 007](007-watchtower.md).
+A challenger MUST NOT be operated by the operator they challenge. The operator's affiliated-address registry ([ADR 008](008-reputation.md)) is queried; a challenger address that overlaps with `operatorAddress`'s known affiliates is ineligible. This is enforced on-chain in `SlashJudge` at challenge submission time as part of the receipt-fraud challenge handler. The check defends against a self-griefing pattern where an operator burns its own bond to depress visible challenge volume.
 
 ### 6. Reputation gating (forward to [ADR 008](008-reputation.md))
 
@@ -202,7 +202,7 @@ Settlement always pays the operator's 40% base ([ADR 026 §2 Same-transaction gu
 
 #### The slashing invariant
 
-Receipt protocol violations are **not by themselves slashable**. A successful Merkle-anchored challenge zeros gauge eligibility for the *current epoch only*. Slashing escalates only via the [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn) schedule and only when watchtower evidence proves a deliberate forgery (e.g., a recovered signer that does not correspond to any channel `client` that ever existed, indicating an outright fabricated signature). Routine receipt invalidation — wrong root committed, late batch commit, signature on a closed channel — is corrected by zeroing the epoch and not by slashing.
+Receipt protocol violations are **not by themselves slashable**. A successful Merkle-anchored challenge zeros gauge eligibility for the *current epoch only*. Slashing escalates only via the [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn) schedule and only when challenger-submitted evidence proves a deliberate forgery (e.g., a recovered signer that does not correspond to any channel `client` that ever existed, indicating an outright fabricated signature). Routine receipt invalidation — wrong root committed, late batch commit, signature on a closed channel — is corrected by zeroing the epoch and not by slashing.
 
 ### 8. Privacy considerations (forward to [ADR 017](017-privacy.md))
 
@@ -226,14 +226,14 @@ This is consistent with [ADR 026 §Forward references](026-gauge-boost-tokenomic
 
 #### Sequencing
 
-Format and client/operator libraries → contract paths deployed in parallel-run mode (no enforcement) → watchtower module + heuristic library → reputation integration → cutover (gauge gating on, `MIN_DISTINCT_CLIENTS_PER_EPOCH` active). The cutover is launch readiness.
+Format and client/operator libraries → contract paths deployed in parallel-run mode (no enforcement) → challenger tooling + heuristic library (see [Appendix: Fraud Detection](appendix-fraud-detection.md)) → reputation integration → cutover (gauge gating on, `MIN_DISTINCT_CLIENTS_PER_EPOCH` active). The cutover is launch readiness.
 
 ## Consequences
 
 ### Positive
 
 - **Closes the wash-trading attack surface flagged in [ADR 026 §Risks](026-gauge-boost-tokenomics.md#risks).** Self-routed traffic now requires distinct, capital-funded sybil identities, raising the attack's effective cost to `MIN_DISTINCT_CLIENTS_PER_EPOCH × MIN_CHANNEL_FUNDING_USDC` of permanently-parked USDC plus per-sybil setup gas, plus a 7-day rotation cooldown. At default parameters: 50 USDC of permanent capital and a one-week rotation cycle per operator gauge-share inflated.
-- **Reuses existing primitives.** secp256k1 / EIP-712 / `SignatureChecker`, the keccak256 Merkle pattern from [ADR 014](014-on-chain-verification.md), the watchtower bond machinery from [ADR 007](007-watchtower.md), and the reputation surface from [ADR 008](008-reputation.md). No new cryptography, no new role, no new contract beyond a `FeeRouter` extension.
+- **Reuses existing primitives.** secp256k1 / EIP-712 / `SignatureChecker`, the keccak256 Merkle pattern from [ADR 014](014-on-chain-verification.md), the `SlashJudge` bond machinery from [ADR 014 Bond Handling](014-on-chain-verification.md#bond-handling), and the reputation surface from [ADR 008](008-reputation.md). No new cryptography, no new on-chain role, no new contract beyond a `FeeRouter` extension and the `SlashJudge` receipt-fraud challenge handler.
 - **Cleanly separates payment from gauge.** The 40% base USDC continues to flow same-tx for every settlement regardless of receipt validity — the cashflow invariant operators rely on is preserved.
 - **Composable with reputation.** Operators with strong reputation get cheaper gating; new and recently-slashed operators face tighter gating. Receipt validity is a *layer* over reputation, not a replacement.
 - **On-chain footprint is bounded.** One Merkle root per settlement, one summary per operator per epoch. Per-receipt storage is challenge-only.
@@ -242,7 +242,7 @@ Format and client/operator libraries → contract paths deployed in parallel-run
 ### Negative
 
 - **Cold-start UX cost.** Small clients now sign one extra EIP-712 message per voucher. The signing UX is a single popup if the wallet is unlocked and offers `personal_sign`-compatible EIP-712 (Safe, MetaMask, Rainbow, etc.). For headless clients (CLI, automated workflows) the cost is negligible. The cost is real for first-time browser users; client libraries should auto-batch the receipt-signing prompt with the voucher-signing prompt where the wallet permits.
-- **Off-chain validation cost.** Watchtowers / receipt attesters must validate every operator's epoch they cover — at the network mean (1k operators × 30k receipts/month) this is ~30M signature verifications per month per fully-covering attester. `SignatureChecker` at ~3k gas off-chain (no transaction) is a few seconds of CPU per 100k signatures; scales linearly. A small attester running per-region is comfortably within commodity-VPS budgets. The economic cost is recovered through the watchtower fee model in [ADR 007 §5](007-watchtower.md#5-fee-model) plus the receipt-fraud-bounty addition — see [ADR 007](007-watchtower.md) for the updated fee structure.
+- **Off-chain validation cost is on the challenger, not on the protocol.** A would-be challenger must validate the operator's batch before submitting `ChallengeReceiptSummary` — at the network mean (1k operators × 30k receipts/month) full coverage is ~30M signature verifications per month. `SignatureChecker` at ~3k gas off-chain (no transaction) is a few seconds of CPU per 100k signatures; scales linearly. A challenger running per-region is comfortably within commodity-VPS budgets. The economics are MEV-style: bond + reward on a successful challenge fund the work; the protocol does not subsidize unsuccessful or speculative coverage. See [Appendix: Fraud Detection](appendix-fraud-detection.md) for the operational shape.
 - **Privacy regression from baseline.** Per-receipt client identity is on-chain-observable on challenge. Documented above and forward-referenced to [ADR 017](017-privacy.md). Mitigations exist; they are future work.
 - **Per-settlement gas cost grows.** `settleChannel` accepts a new `bytes32 receiptBatchRoot` argument and `FeeRouter.routeSettlement` writes one extra storage slot per settlement. Estimated 5–8k additional gas; on the chosen L2 ([Appendix: L2 Deployment](appendix-l2-deployment.md)) approximately $0.005 per settlement. Validate at L2-cost gate.
 - **`commitEpochSummary` is a new keeper-class job.** Per operator, per epoch, somebody must call `commitEpochSummary` after the epoch closes and before the gauge claim window opens. Operators have the strongest incentive (their gauge share depends on it); third parties may be compensated by an operator-paid commit fee. Not a new failure class — it parallels the existing settlement-bot pattern from [ADR 003](003-payments.md) where any address can call `settleChannel`.
@@ -252,7 +252,7 @@ Format and client/operator libraries → contract paths deployed in parallel-run
 
 - **Threshold tuning is empirical.** `MIN_DISTINCT_CLIENTS_PER_EPOCH = 5`, `MIN_CHANNEL_FUNDING_USDC = 10`, and `IDENTITY_COOLDOWN = 7 d` are reasoned defaults. Production data may show that 5 is too sharp a filter for small regional operators, or too lax against sophisticated sybil farms. The parameters are governable; the safety bounds are wide enough for both directions. Monitor and retune in the first 6 months.
 - **Funding-source diversity heuristic gameability.** A determined attacker can route sybil funding through public mixers, CEX deposit/withdraw cycles, or third-party DEX swaps to disguise common ancestry. The diversity heuristic catches naive ancestor patterns; sophisticated attackers degrade it. The fundamental cost — funded-channel minimum × distinct-clients-per-epoch × cooldown — remains the binding deterrent regardless of heuristic sophistication.
-- **Watchtower coverage must be sufficient.** If no attester is monitoring an operator's epoch, an invalid batch is never challenged, and `claimedDistinctClients` stands. Mitigated by the `WatchtowerEscrow` discovery flow ([ADR 007 §4](007-watchtower.md#4-discovery)) plus the receipt-fraud bounty. Failure mode is more likely "an attacker picks an obscure operator with no watchtower coverage and abuses it" than "the protocol globally fails"; reputation gating (§6) is the secondary defense.
+- **Challenger coverage must be sufficient.** If no challenger investigates an operator's epoch within the 7-day window, an invalid batch is never challenged and `claimedDistinctClients` stands. Mitigated by the bond + reward economics: any obscure operator that pays out gauge inflation is a profitable target for the first challenger that finds them. Failure mode is more likely "an attacker picks an obscure operator with no challenger coverage and abuses it for one epoch" than "the protocol globally fails"; reputation gating (§6) is the secondary defense, and persistent abusers attract escalating attention from challengers chasing the larger reward. See [Appendix: Fraud Detection](appendix-fraud-detection.md).
 - **Reputation-receipt feedback loop.** Operators with high reputation get easier receipt thresholds. If reputation is gameable upstream, a sophisticated attacker first farms reputation, then exploits the relaxed threshold. Reputation gameability is [ADR 008](008-reputation.md)'s problem, not this ADR's, but the loop is worth flagging — the receipt protocol is no stronger than the reputation it depends on for §6 gating.
-- **Privacy-vs-defense tension.** Aggressive privacy upgrades (zero-knowledge identity-diversity proofs in [ADR 017](017-privacy.md)) complicate the funding-source diversity heuristic — the watchtower can no longer trace ancestry if identities are private. Tension to resolve in [ADR 017](017-privacy.md) when that path matures; this ADR ships with cleartext receipts.
+- **Privacy-vs-defense tension.** Aggressive privacy upgrades (zero-knowledge identity-diversity proofs in [ADR 017](017-privacy.md)) complicate the funding-source diversity heuristic — challengers can no longer trace ancestry if identities are private. Tension to resolve in [ADR 017](017-privacy.md) when that path matures; this ADR ships with cleartext receipts.
 - **Non-receipt-aware client wallets.** Clients without receipt-aware wallets produce voucher-only deliveries that are settled and paid normally, but their bytes do not credit gauge eligibility. Operators receiving such traffic carry the cost of pure-base economics for it. Acceptable — receipt-aware client libraries ship in the launch SDK; non-receipt-aware traffic is an asymptote that shrinks as the SDK propagates.

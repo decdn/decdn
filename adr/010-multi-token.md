@@ -62,7 +62,7 @@ Governance (admin key for PoC, OpenZeppelin Governor for production) must call `
 
 #### Force-close channels in removed tokens
 
-Once a token is removed, any address can force-close open channels in that token via `forceCloseChannel`. This avoids the need for on-chain enumeration of channels per token — callers (watchtowers, governance bots, channel parties) provide the channel ID, and the contract first verifies that the channel exists, then checks `!allowedTokens[channel.token]`:
+Once a token is removed, any address can force-close open channels in that token via `forceCloseChannel`. This avoids the need for on-chain enumeration of channels per token — callers (governance bots, channel parties, third-party fraud detectors) provide the channel ID, and the contract first verifies that the channel exists, then checks `!allowedTokens[channel.token]`:
 
 ```solidity
 function forceCloseChannel(bytes32 channelId) external {
@@ -130,7 +130,7 @@ struct Channel {
     uint256 expiresAt;
     uint8   status;           // 0 = Open, 1 = Closing (dispute window active), 2 = Closed (settled)
     uint256 disputeDeadline;  // set when close is initiated
-    address lastDisputor;     // msg.sender of the most recent disputeChannel call (used by WatchtowerEscrow for gas bonus verification — see ADR 007)
+    address lastDisputor;     // msg.sender of the most recent disputeChannel call
 }
 ```
 
@@ -281,5 +281,5 @@ The PoC uses `StablePaymentChannel` (USDC-only, defined in ADR 003). Production 
 - **Decimal validation at runtime.** Should the node fail to start if a configured token's on-chain `decimals()` does not match the configured value, or warn and continue? Failing to start is safer but may cause operational disruption if a proxy token contract is upgraded (rare but possible).
 - ~~**Slash denomination.**~~ **Resolved:** slashing is always in TOKEN stake (see Consequences above). No cross-token conversion needed — nodes must hold TOKEN stake regardless of payment token.
 - **Token metadata trust.** `IERC20Metadata` is not mandatory for ERC-20 tokens. Tokens without `decimals()` will cause a revert at startup. Should the contract use a try/catch and default to 18 decimals, or require the operator to always specify decimals explicitly in config?
-- ~~**Token removal semantics.**~~ **Resolved:** `forceCloseChannel(channelId)` — permissionless, succeeds only when `!allowedTokens[channel.token]`. Enters the standard Closing→dispute→settle flow. No on-chain enumeration; callers (watchtowers, governance bots, channel parties) provide the channel ID. See `forceCloseChannel` interface above.
+- ~~**Token removal semantics.**~~ **Resolved:** `forceCloseChannel(channelId)` — permissionless, succeeds only when `!allowedTokens[channel.token]`. Enters the standard Closing→dispute→settle flow. No on-chain enumeration; callers (governance bots, channel parties, third-party fraud detectors) provide the channel ID. See `forceCloseChannel` interface above.
 - **Token vetting criteria.** What due diligence should governance perform before calling `addToken`? At minimum: verify no fee-on-transfer, no rebase mechanics, no pausable transfers that could lock contract funds, and standard `IERC20` compliance. Should this be codified in a checklist or left to governance discretion?
