@@ -25,6 +25,7 @@ decdn-cache = { workspace = true }
 decdn-incentive = { workspace = true }
 decdn-reputation = { workspace = true }
 decdn-gossip = { workspace = true }
+decdn-common = { workspace = true }
 alloy = { workspace = true }
 iroh = { workspace = true }
 iroh-blobs = { workspace = true }

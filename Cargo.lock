@@ -1927,6 +1927,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "decdn-common"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "anyhow",
+ "clap",
+ "decdn-cache",
+ "decdn-protocol",
+ "dirs",
+ "ed25519-dalek 2.2.0",
+ "iroh",
+ "rand 0.10.1",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "decdn-gossip"
 version = "0.1.0"
 dependencies = [
@@ -1969,6 +1991,7 @@ dependencies = [
  "bytes",
  "clap",
  "decdn-cache",
+ "decdn-common",
  "decdn-gossip",
  "decdn-incentive",
  "decdn-protocol",

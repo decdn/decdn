@@ -201,7 +201,7 @@ pub async fn probe(args: &cli::ProbeArgs) -> anyhow::Result<()> {
     use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl};
     use rand::Rng;
 
-    use crate::identity::fresh_secret_key;
+    use decdn_common::identity::fresh_secret_key;
 
     let node_id = PublicKey::from_str(&args.node_id)
         .map_err(|e| anyhow::anyhow!("invalid --node-id {:?}: {e}", args.node_id))?;

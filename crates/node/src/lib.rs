@@ -5,11 +5,14 @@
 //! should depend on this library rather than reaching into `src/` via `#[path]`.
 
 pub mod admin;
-pub mod cli;
 pub mod commands;
-pub mod config;
 pub mod dispatch;
 pub mod handlers;
-pub mod identity;
 pub mod metrics;
 pub mod runtime;
+
+// Re-exports from `decdn-common`. These keep the existing
+// `decdn_node::{cli,config,identity}::*` paths working for integration tests
+// and downstream tools while the binary split is in flight. Removed in the
+// commit that completes the slim of the node crate.
+pub use decdn_common::{cli, config, identity};

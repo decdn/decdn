@@ -1273,8 +1273,8 @@ mod tests {
     /// dropped one (or stringified the level wrong) fails the unit test.
     #[tokio::test]
     async fn admin_reload_applies_and_returns_post_reload_values() {
-        use crate::cli::common::LogLevel;
         use crate::runtime::RuntimeReloadState;
+        use decdn_common::cli::common::LogLevel;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("node.toml");
@@ -1390,8 +1390,8 @@ mod tests {
     /// in the error mapping).
     #[tokio::test]
     async fn admin_reload_with_missing_config_returns_reload_error() {
-        use crate::cli::common::LogLevel;
         use crate::runtime::RuntimeReloadState;
+        use decdn_common::cli::common::LogLevel;
 
         let dir = tempfile::tempdir().expect("tempdir");
         // Path inside a tempdir that we never write to — guaranteed

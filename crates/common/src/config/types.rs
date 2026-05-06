@@ -137,7 +137,7 @@ pub struct GossipConfig {
 /// the box.
 ///
 /// **All fields are hot-reloadable** on SIGHUP and via `admin_v1_reload`.
-/// The live `ConnectionLimiter` rebuilds its keyed [`governor`] rate
+/// The live `ConnectionLimiter` rebuilds its keyed `governor` rate
 /// limiter from the new quota and swaps it under an `RwLock`. The
 /// `Arc<Semaphore>` identity is preserved across cap resizes via
 /// `add_permits` / `acquire_many_owned(...).forget()` so every

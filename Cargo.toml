@@ -7,6 +7,7 @@ members = [
     "crates/incentive",
     "crates/reputation",
     "crates/gossip",
+    "crates/common",
 ]
 exclude = ["contracts"]
 
@@ -22,6 +23,7 @@ decdn-cache = { path = "crates/cache" }
 decdn-incentive = { path = "crates/incentive" }
 decdn-reputation = { path = "crates/reputation" }
 decdn-gossip = { path = "crates/gossip" }
+decdn-common = { path = "crates/common" }
 
 # Networking (iroh ecosystem, pinned per ADR 000)
 iroh = "0.98"
