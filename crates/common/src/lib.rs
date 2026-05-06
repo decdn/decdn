@@ -7,6 +7,7 @@
 //! holds only what *both* binaries need to parse, validate, or pass between
 //! processes.
 
+pub mod admin;
 pub mod cli;
 pub mod config;
 pub mod identity;
