@@ -14,7 +14,9 @@ use iroh_blobs::store::fs::FsStore;
 use tokio::sync::Notify;
 
 use crate::error::{CacheError, CacheResult};
+use crate::metrics::CacheMetrics;
 use crate::origin::{Origin, OriginFetch};
+use crate::retry::{RetryPolicy, retry_fetch};
 
 /// Engine bundling a filesystem-backed iroh-blobs store with an optional
 /// origin backend. Lookups hit the store first; on miss and when an origin is
@@ -73,6 +75,15 @@ struct Inner {
     /// hand-edit it during incident response; duplicate lines are tolerated
     /// (loading deduplicates via the `HashSet`).
     evicted_log_path: PathBuf,
+    /// Origin pull-through retry policy (#285). Set once at construction;
+    /// changes require a restart. `RetryPolicy: Copy` so the per-fetch
+    /// read is a single struct copy.
+    retry_policy: RetryPolicy,
+    /// Optional handle to the cache-side `OpenMetrics` counters (#285).
+    /// The engine bumps `origin_fetches` once per pull-through and the
+    /// retry loop bumps `origin_retry_exhausted` on terminal exhaustion.
+    /// `None` in tests / non-metrics builds — bumps short-circuit.
+    metrics: Option<Arc<CacheMetrics>>,
 }
 
 /// Coarse-grained cache statistics.
@@ -417,11 +428,39 @@ impl CacheEngine {
     /// Open the cache with an initial pinning set. The set is held in an
     /// [`ArcSwap`] internally so subsequent SIGHUP reloads can call
     /// [`Self::set_pinned`] without rebuilding the engine.
+    ///
+    /// Defaults the retry policy to [`RetryPolicy::default`] and wires no
+    /// metrics handle. Use [`Self::open_full`] to override either — the
+    /// node crate plugs in its `Arc<CacheMetrics>` and the operator-
+    /// configured policy through that path.
     pub async fn open_with_pinned(
         cache_dir: &Path,
         origin: Option<Arc<dyn Origin>>,
         max_blob_mb: u64,
         pinned: PinnedHashes,
+    ) -> CacheResult<Self> {
+        Self::open_full(
+            cache_dir,
+            origin,
+            max_blob_mb,
+            pinned,
+            RetryPolicy::default(),
+            None,
+        )
+        .await
+    }
+
+    /// Open the cache with full control over policy and metrics wiring.
+    /// Production callers (the runtime's `build_cache`) use this directly;
+    /// tests usually want [`Self::open`] or [`Self::open_with_pinned`]
+    /// with their defaults.
+    pub async fn open_full(
+        cache_dir: &Path,
+        origin: Option<Arc<dyn Origin>>,
+        max_blob_mb: u64,
+        pinned: PinnedHashes,
+        retry_policy: RetryPolicy,
+        metrics: Option<Arc<CacheMetrics>>,
     ) -> CacheResult<Self> {
         tokio::fs::create_dir_all(cache_dir)
             .await
@@ -449,6 +488,8 @@ impl CacheEngine {
                 pinned: ArcSwap::from(pinned.0),
                 evicted: Mutex::new(evicted),
                 evicted_log_path,
+                retry_policy,
+                metrics,
             }),
         })
     }
@@ -473,6 +514,13 @@ impl CacheEngine {
     /// resolves to an `Arc<HashSet<Hash>>` we then own.
     pub fn pinned_snapshot(&self) -> PinnedHashes {
         PinnedHashes(self.inner.pinned.load_full())
+    }
+
+    /// Snapshot of the active retry policy. Used by tests and startup
+    /// logging. The policy is fixed at construction; changes require
+    /// a restart.
+    pub fn retry_policy(&self) -> RetryPolicy {
+        self.inner.retry_policy
     }
 
     /// Is `hash` currently pinned? Cheap O(1) lookup against the live set.
@@ -836,10 +884,25 @@ impl CacheEngine {
             .as_ref()
             .ok_or(CacheError::NoOrigin { hash })?;
 
-        let fetch = origin
-            .fetch(hash, self.inner.max_blob_bytes)
-            .await
-            .map_err(|source| CacheError::OriginError { hash, source })?;
+        // Bump the per-fetch denominator before issuing the call so the
+        // counter survives mid-fetch panics — alerts that page on
+        // `origin_retry_exhausted_total / origin_fetches_total` need
+        // every attempt counted, not just successful ones.
+        if let Some(m) = &self.inner.metrics {
+            m.origin_fetches.inc();
+        }
+        let fetch = retry_fetch(
+            origin,
+            hash,
+            self.inner.max_blob_bytes,
+            self.inner.retry_policy,
+            self.inner.metrics.as_ref(),
+        )
+        .await
+        .map_err(|e| CacheError::OriginError {
+            hash,
+            source: e.into_inner(),
+        })?;
 
         let bytes = match fetch {
             OriginFetch::NotFound => return Err(CacheError::NotFound { hash }),
@@ -940,7 +1003,8 @@ mod tests {
             &self,
             hash: Hash,
             _max_bytes: u64,
-        ) -> Pin<Box<dyn Future<Output = anyhow::Result<OriginFetch>> + Send + '_>> {
+        ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, crate::OriginPullError>> + Send + '_>>
+        {
             let result = if hash == self.hash {
                 Ok(OriginFetch::Found(self.data.clone()))
             } else {
@@ -1085,7 +1149,8 @@ mod tests {
             &self,
             hash: Hash,
             _max_bytes: u64,
-        ) -> Pin<Box<dyn Future<Output = anyhow::Result<OriginFetch>> + Send + '_>> {
+        ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, crate::OriginPullError>> + Send + '_>>
+        {
             self.fetch_count.fetch_add(1, Ordering::SeqCst);
             let result = if hash == self.hash {
                 Ok(OriginFetch::Found(self.data.clone()))

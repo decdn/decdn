@@ -141,6 +141,41 @@ pub(crate) trait ReloadableSection: Send + Sync {
     fn infallible_swap(&self);
 }
 
+/// Set a cache-engine slot owned by a `ReloadableSection`, recovering
+/// the inner value on a poisoned mutex. Used by [`RuntimeReloadState::attach_cache`]
+/// to populate both the pinned-hashes and origin-retry sections from a
+/// single attach call.
+///
+/// The poison flag is intentionally *not* cleared. Reachable poison
+/// here implies a panic in some other code path that held the lock —
+/// extremely rare since the lock's only callers are `attach_cache`
+/// (this function) and the section's `infallible_swap`, both of which
+/// are panic-free under workspace lints. The recovery write is
+/// belt-and-braces: it ensures the engine reference is at least stored
+/// (so e.g. the `pinned.engine` slot still receives the new engine if
+/// it had been transiently poisoned), but the next `infallible_swap`
+/// will see `lock()` return `Err` again and emit the section's
+/// `tracing::error!` and skip its swap. This matches the codebase's
+/// established "recover-the-data, log-loudly, do-not-clear-poison"
+/// pattern (see also `attach_limiter` and the trait doc on
+/// `ReloadableSection::infallible_swap`).
+fn attach_engine_to_section(
+    slot: &std::sync::Mutex<Option<decdn_cache::CacheEngine>>,
+    engine: Option<decdn_cache::CacheEngine>,
+    section: &'static str,
+) {
+    match slot.lock() {
+        Ok(mut guard) => *guard = engine,
+        Err(poisoned) => {
+            tracing::error!(
+                section,
+                "runtime reload cache mutex poisoned during attach; recovering inner state"
+            );
+            *poisoned.into_inner() = engine;
+        }
+    }
+}
+
 /// Helper for the buffer-cell pattern. Each section keeps a
 /// `Mutex<Option<Resolved>>`; this expression captures the "drain or log
 /// and skip" idiom without each `infallible_swap` re-implementing it.
@@ -604,15 +639,7 @@ impl RuntimeReloadState {
     /// Recovery here ensures the new engine is at least stored for the
     /// (non-reload-driven) live path.
     pub fn attach_cache(&self, engine: Option<decdn_cache::CacheEngine>) {
-        match self.pinned.engine.lock() {
-            Ok(mut guard) => *guard = engine,
-            Err(poisoned) => {
-                tracing::error!(
-                    "runtime reload cache mutex poisoned during attach; recovering inner state"
-                );
-                *poisoned.into_inner() = engine;
-            }
-        }
+        attach_engine_to_section(&self.pinned.engine, engine, "pinned_hashes");
     }
 
     /// Attach the live `ConnectionLimiter` after it's been built. Same
@@ -705,6 +732,7 @@ impl RuntimeReloadState {
                 origin_path: None,
                 decompress: decdn_cache::DecompressMode::Auto,
                 pinned_hashes: decdn_cache::PinnedHashes::empty(),
+                origin_retry: decdn_cache::RetryPolicy::default(),
             },
             payment: ResolvedPayment { rate_per_mb },
             observability: ResolvedObservability {
@@ -1139,6 +1167,7 @@ mod tests {
                 origin_path: None,
                 decompress: decdn_cache::DecompressMode::Auto,
                 pinned_hashes: decdn_cache::PinnedHashes::empty(),
+                origin_retry: decdn_cache::RetryPolicy::default(),
             },
             payment: ResolvedPayment { rate_per_mb: rate },
             observability: ResolvedObservability {

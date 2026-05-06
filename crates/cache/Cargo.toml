@@ -10,6 +10,7 @@ description = "Cache engine wrapping iroh-blobs with origin pull-through for deC
 decdn-protocol = { workspace = true }
 iroh = { workspace = true }
 iroh-blobs = { workspace = true }
+iroh-metrics = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
@@ -27,6 +28,9 @@ zstd = "0.13"
 # pinned set is non-Copy so AtomicU64 can't carry it; ArcSwap is the
 # standard fix and is MIT/Apache-2.0.
 arc-swap = "1"
+# Jitter for the origin retry/backoff loop (#285). Uses `rand::random::<f64>()`
+# only; no per-call state, so no RNG instance is held.
+rand = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

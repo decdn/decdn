@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use decdn_cache::{
     CacheEngine, CacheError, DecompressMode, FilesystemOrigin, Hash, HttpOrigin, Origin,
-    OriginError, OriginFetch, SupportedEncoding,
+    OriginError, OriginFetch, OriginPullError, PinnedHashes, RetryPolicy, SupportedEncoding,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wiremock::matchers::{method, path};
@@ -31,6 +31,30 @@ async fn build_engine(origin_url: &str) -> anyhow::Result<(CacheEngine, tempfile
     let tmp = tempfile::tempdir()?;
     let origin = Arc::new(HttpOrigin::parse(origin_url)?);
     let engine = CacheEngine::open(tmp.path(), Some(origin), 16).await?;
+    Ok((engine, tmp))
+}
+
+/// Same as [`build_engine`] but with `RetryPolicy::disabled()`. Used by
+/// status-mapping tests where the unit under test is the *first*-attempt
+/// classification — without disabling retry, those tests would burn ~6
+/// seconds of wall time exercising the default retry chain on every
+/// transient-classified status (5xx/408/429), and a flake on the third
+/// retry would surface as a status-mapping failure rather than a
+/// retry-loop failure.
+async fn build_engine_no_retry(
+    origin_url: &str,
+) -> anyhow::Result<(CacheEngine, tempfile::TempDir)> {
+    let tmp = tempfile::tempdir()?;
+    let origin = Arc::new(HttpOrigin::parse(origin_url)?);
+    let engine = CacheEngine::open_full(
+        tmp.path(),
+        Some(origin),
+        16,
+        decdn_cache::PinnedHashes::empty(),
+        RetryPolicy::disabled(),
+        None,
+    )
+    .await?;
     Ok((engine, tmp))
 }
 
@@ -140,7 +164,8 @@ impl Origin for OversizedOrigin {
         &self,
         _hash: Hash,
         _max_bytes: u64,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<OriginFetch>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, decdn_cache::OriginPullError>> + Send + '_>>
+    {
         let payload = self.payload.clone();
         Box::pin(async move { Ok(OriginFetch::Found(payload)) })
     }
@@ -309,12 +334,24 @@ async fn spawn_stall_after_partial_body_server() -> anyhow::Result<std::net::Soc
 
 #[tokio::test]
 async fn response_headers_timeout_fires_on_silent_server() -> anyhow::Result<()> {
+    // Use the disabled retry policy: the silent server only accepts one
+    // TCP connection, so retrying would queue connect attempts that
+    // wait out the 200ms headers timeout each time — irrelevant noise
+    // for a test that only cares about the *first* timeout firing.
     let addr = spawn_silent_server().await?;
     let origin = HttpOrigin::parse(&format!("http://{addr}/"))?
         .with_timeouts(Duration::from_millis(200), Duration::from_secs(30));
 
     let tmp = tempfile::tempdir()?;
-    let engine = CacheEngine::open(tmp.path(), Some(Arc::new(origin)), 16).await?;
+    let engine = CacheEngine::open_full(
+        tmp.path(),
+        Some(Arc::new(origin)),
+        16,
+        PinnedHashes::empty(),
+        RetryPolicy::disabled(),
+        None,
+    )
+    .await?;
 
     let err = err_of(engine.get(Hash::new(b"anything")).await)?;
     let msg = format!("{err:#}");
@@ -331,12 +368,24 @@ async fn response_headers_timeout_fires_on_silent_server() -> anyhow::Result<()>
 
 #[tokio::test]
 async fn chunk_idle_timeout_fires_when_origin_stalls_mid_body() -> anyhow::Result<()> {
+    // Disabled retry policy for the same reason as the headers-timeout
+    // test: the stall server only accepts one connection. A retry
+    // would block on a 30-second headers timeout per attempt, turning
+    // a sub-second test into a multi-minute one.
     let addr = spawn_stall_after_partial_body_server().await?;
     let origin = HttpOrigin::parse(&format!("http://{addr}/"))?
         .with_timeouts(Duration::from_secs(30), Duration::from_millis(200));
 
     let tmp = tempfile::tempdir()?;
-    let engine = CacheEngine::open(tmp.path(), Some(Arc::new(origin)), 16).await?;
+    let engine = CacheEngine::open_full(
+        tmp.path(),
+        Some(Arc::new(origin)),
+        16,
+        PinnedHashes::empty(),
+        RetryPolicy::disabled(),
+        None,
+    )
+    .await?;
 
     let err = err_of(engine.get(Hash::new(b"anything")).await)?;
     let msg = format!("{err:#}");
@@ -1072,7 +1121,11 @@ async fn http_origin_4xx_other_than_404_surfaces_origin_error() -> anyhow::Resul
     let statuses = [400u16, 401, 403, 410, 422, 429];
     let server = MockServer::start().await;
     let hashes = mount_status_mocks(&server, &statuses).await;
-    let (engine, _tmp) = build_engine(&server.uri()).await?;
+    // 429 is transient under the new classifier (#285) and would burn
+    // the default retry budget without changing the assertion. Use a
+    // disabled-retry engine so the test stays fast and asserts the
+    // first-attempt mapping rather than the post-retry collapse.
+    let (engine, _tmp) = build_engine_no_retry(&server.uri()).await?;
 
     for (status, hash) in statuses.iter().zip(hashes.iter()) {
         let err = err_of(engine.get(*hash).await)?;
@@ -1103,7 +1156,10 @@ async fn http_origin_5xx_surfaces_origin_error() -> anyhow::Result<()> {
     let statuses = [500u16, 502, 503, 504];
     let server = MockServer::start().await;
     let hashes = mount_status_mocks(&server, &statuses).await;
-    let (engine, _tmp) = build_engine(&server.uri()).await?;
+    // Disabled retry: this test pins the first-attempt 5xx classification.
+    // The retry-loop's behaviour on 5xx is covered by
+    // `retry_classifies_http_5xx_as_transient_then_succeeds` below.
+    let (engine, _tmp) = build_engine_no_retry(&server.uri()).await?;
 
     for (status, hash) in statuses.iter().zip(hashes.iter()) {
         let err = err_of(engine.get(*hash).await)?;
@@ -1449,6 +1505,481 @@ async fn http_origin_rejects_redirect_loop() -> anyhow::Result<()> {
     anyhow::ensure!(
         matches!(err, CacheError::OriginError { .. }),
         "expected OriginError from redirect loop, got: {err:?}"
+    );
+    Ok(())
+}
+
+// ----- origin retry policy (#285) -----------------------------------------
+
+/// Build a `CacheEngine` with a custom retry policy and no metrics
+/// wiring. Returns the engine and the temp dir whose drop cleans up.
+async fn build_engine_with_retry(
+    origin: Arc<dyn Origin>,
+    policy: RetryPolicy,
+) -> anyhow::Result<(CacheEngine, tempfile::TempDir)> {
+    let tmp = tempfile::tempdir()?;
+    let engine = CacheEngine::open_full(
+        tmp.path(),
+        Some(origin),
+        16,
+        PinnedHashes::empty(),
+        policy,
+        None,
+    )
+    .await?;
+    Ok((engine, tmp))
+}
+
+/// Tiny policy used by tests where the *count* of attempts matters but
+/// we don't want to wait around for real backoffs. 1ms initial / 5ms
+/// cap / no jitter keeps total wall time under 100ms even on a fully
+/// failing origin.
+const fn fast_retry_policy(max_retries: u32) -> RetryPolicy {
+    RetryPolicy {
+        max_retries,
+        initial_backoff_ms: 1,
+        max_backoff_ms: 5,
+        jitter_ratio: 0.0,
+    }
+}
+
+/// Origin that returns N successive `OriginPullError::Transient` failures
+/// before either yielding `Found(payload)` or, if `max_failures` is
+/// `usize::MAX`, failing forever. Counts every fetch via an `AtomicUsize`
+/// so tests can assert exact attempt totals.
+#[derive(Debug)]
+struct FailingThenSucceedingOrigin {
+    payload: bytes::Bytes,
+    target: Hash,
+    fail_count: std::sync::atomic::AtomicUsize,
+    fetch_count: std::sync::atomic::AtomicUsize,
+    max_failures: usize,
+}
+
+impl FailingThenSucceedingOrigin {
+    fn new(payload: &[u8], max_failures: usize) -> Self {
+        Self {
+            target: Hash::new(payload),
+            payload: bytes::Bytes::from(payload.to_vec()),
+            fail_count: std::sync::atomic::AtomicUsize::new(0),
+            fetch_count: std::sync::atomic::AtomicUsize::new(0),
+            max_failures,
+        }
+    }
+    fn fetches(&self) -> usize {
+        self.fetch_count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Origin for FailingThenSucceedingOrigin {
+    fn fetch(
+        &self,
+        hash: Hash,
+        _max_bytes: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>> {
+        self.fetch_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let prior = self
+            .fail_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let max_failures = self.max_failures;
+        let target = self.target;
+        let payload = self.payload.clone();
+        Box::pin(async move {
+            if prior < max_failures {
+                Err(OriginPullError::Transient(anyhow::anyhow!(
+                    "synthetic transient failure {prior}"
+                )))
+            } else if hash == target {
+                Ok(OriginFetch::Found(payload))
+            } else {
+                Ok(OriginFetch::NotFound)
+            }
+        })
+    }
+}
+
+/// Origin that always returns `OriginPullError::Permanent` and counts
+/// attempts. Used to verify the retry loop short-circuits on permanent
+/// errors.
+#[derive(Debug)]
+struct PermanentlyFailingOrigin {
+    fetch_count: std::sync::atomic::AtomicUsize,
+}
+
+impl PermanentlyFailingOrigin {
+    const fn new() -> Self {
+        Self {
+            fetch_count: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+    fn fetches(&self) -> usize {
+        self.fetch_count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Origin for PermanentlyFailingOrigin {
+    fn fetch(
+        &self,
+        _hash: Hash,
+        _max_bytes: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>> {
+        self.fetch_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async move {
+            Err(OriginPullError::Permanent(anyhow::anyhow!(
+                "synthetic permanent failure (e.g. 403)"
+            )))
+        })
+    }
+}
+
+#[tokio::test]
+async fn retry_succeeds_after_transient_failures() -> anyhow::Result<()> {
+    // 2 transient failures, then success on the 3rd attempt. Policy
+    // allows 3 retries, so the loop has headroom.
+    let payload: &[u8] = b"recovered";
+    let origin = Arc::new(FailingThenSucceedingOrigin::new(payload, 2));
+    let (engine, _tmp) =
+        build_engine_with_retry(origin.clone() as Arc<dyn Origin>, fast_retry_policy(3)).await?;
+
+    let hash = Hash::new(payload);
+    let got = engine.get(hash).await?;
+    anyhow::ensure!(&got[..] == payload, "payload survived retry chain");
+    anyhow::ensure!(
+        origin.fetches() == 3,
+        "expected exactly 3 origin attempts (2 fail + 1 success), got {}",
+        origin.fetches()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn retry_exhausts_on_persistent_transient_failures() -> anyhow::Result<()> {
+    // Origin fails forever. Policy allows 3 retries -> 4 total attempts.
+    let payload: &[u8] = b"unreachable";
+    let origin = Arc::new(FailingThenSucceedingOrigin::new(payload, usize::MAX));
+    let (engine, _tmp) =
+        build_engine_with_retry(origin.clone() as Arc<dyn Origin>, fast_retry_policy(3)).await?;
+
+    let hash = Hash::new(payload);
+    let err = err_of(engine.get(hash).await)?;
+    anyhow::ensure!(
+        matches!(err, CacheError::OriginError { .. }),
+        "exhausted retries should surface OriginError, got: {err:?}"
+    );
+    anyhow::ensure!(
+        origin.fetches() == 4,
+        "expected exactly 4 origin attempts (1 + 3 retries), got {}",
+        origin.fetches()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn retry_skips_permanent_failures() -> anyhow::Result<()> {
+    // Permanent failure on the very first attempt — the loop must not
+    // retry, even with a generous policy.
+    let origin = Arc::new(PermanentlyFailingOrigin::new());
+    let (engine, _tmp) =
+        build_engine_with_retry(origin.clone() as Arc<dyn Origin>, fast_retry_policy(5)).await?;
+
+    let hash = Hash::new(b"anything");
+    let err = err_of(engine.get(hash).await)?;
+    anyhow::ensure!(
+        matches!(err, CacheError::OriginError { .. }),
+        "permanent failure should surface OriginError, got: {err:?}"
+    );
+    anyhow::ensure!(
+        origin.fetches() == 1,
+        "expected exactly 1 attempt on permanent failure, got {}",
+        origin.fetches()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn retry_skips_not_found_responses() -> anyhow::Result<()> {
+    // 404-equivalent: the adapter returns OriginFetch::NotFound, which
+    // is *not* an error and must not be retried. `expect(1)` on the
+    // mock panics on drop if more than one request lands.
+    let server = MockServer::start().await;
+    let hash = Hash::new(b"missing");
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
+    let (engine, _tmp) =
+        build_engine_with_retry(origin as Arc<dyn Origin>, fast_retry_policy(3)).await?;
+
+    let err = err_of(engine.get(hash).await)?;
+    anyhow::ensure!(
+        matches!(err, CacheError::NotFound { .. }),
+        "404 should map to CacheError::NotFound, got: {err:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn retry_disabled_policy_makes_a_single_attempt() -> anyhow::Result<()> {
+    // RetryPolicy::disabled() reproduces the pre-#285 behaviour: a
+    // transient failure surfaces immediately without retrying.
+    let payload: &[u8] = b"unreached";
+    let origin = Arc::new(FailingThenSucceedingOrigin::new(payload, usize::MAX));
+    let (engine, _tmp) =
+        build_engine_with_retry(origin.clone() as Arc<dyn Origin>, RetryPolicy::disabled()).await?;
+
+    let hash = Hash::new(payload);
+    let err = err_of(engine.get(hash).await)?;
+    anyhow::ensure!(matches!(err, CacheError::OriginError { .. }));
+    anyhow::ensure!(
+        origin.fetches() == 1,
+        "disabled policy must perform exactly one attempt, got {}",
+        origin.fetches()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn retry_classifies_http_5xx_as_transient_then_succeeds() -> anyhow::Result<()> {
+    // wiremock's `up_to_n_times(N)` makes a mock match at most N times,
+    // after which subsequent requests fall through to the next mock
+    // (matched in registration order). This lets us script "fail twice,
+    // then succeed" without a custom Origin impl.
+    let payload: &[u8] = b"after backoff";
+    let hash = Hash::new(payload);
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload))
+        .mount(&server)
+        .await;
+
+    let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
+    let (engine, _tmp) =
+        build_engine_with_retry(origin as Arc<dyn Origin>, fast_retry_policy(3)).await?;
+    let got = engine.get(hash).await?;
+    anyhow::ensure!(&got[..] == payload);
+    Ok(())
+}
+
+#[tokio::test]
+async fn retry_classifies_http_4xx_non_404_as_permanent() -> anyhow::Result<()> {
+    // 403 is permanent — the retry loop must not paper over what is
+    // probably an auth misconfiguration. `expect(1)` on the mock
+    // double-covers the no-retry assertion at drop time.
+    let payload: &[u8] = b"forbidden";
+    let hash = Hash::new(payload);
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(ResponseTemplate::new(403))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
+    let (engine, _tmp) =
+        build_engine_with_retry(origin as Arc<dyn Origin>, fast_retry_policy(5)).await?;
+    let err = err_of(engine.get(hash).await)?;
+    anyhow::ensure!(matches!(err, CacheError::OriginError { .. }));
+    Ok(())
+}
+
+#[tokio::test]
+async fn coalesced_owner_retry_unblocks_waiters_on_success() -> anyhow::Result<()> {
+    // Multiple concurrent gets for the same hash: the engine coalesces
+    // them through a single owner that runs the retry loop. The owner
+    // retries through 2 transient failures, then succeeds; every waiter
+    // observes the final cached bytes — proof that the retry loop sits
+    // inside the coalescing critical section, not outside.
+    let payload: &[u8] = b"shared via coalescing";
+    let origin = Arc::new(FailingThenSucceedingOrigin::new(payload, 2));
+    let (engine, _tmp) =
+        build_engine_with_retry(origin.clone() as Arc<dyn Origin>, fast_retry_policy(3)).await?;
+    let hash = Hash::new(payload);
+
+    let mut handles = Vec::new();
+    for _ in 0..6 {
+        let e = engine.clone();
+        handles.push(tokio::spawn(async move { e.get(hash).await }));
+    }
+    for h in handles {
+        let bytes = h.await??;
+        anyhow::ensure!(&bytes[..] == payload);
+    }
+    // Coalescing collapses the 6 concurrent requests into one origin
+    // pull. That one pull retries through 2 failures + 1 success = 3
+    // origin fetches total. The exact total is the load-bearing
+    // assertion: a regression that ran retry *outside* coalescing
+    // would multiply this by 6.
+    anyhow::ensure!(
+        origin.fetches() == 3,
+        "coalesced retry should fire exactly 3 origin attempts, got {}",
+        origin.fetches()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn coalesced_owner_exhaustion_bounded_by_serial_owner_count() -> anyhow::Result<()> {
+    // Documents the known coalescing+retry limitation called out in the
+    // retry.rs module doc: under sustained transient failure, after one
+    // owner exhausts its retry budget, a *waiter* may become the next
+    // owner and run a fresh budget. With N concurrent waiters this
+    // produces up to `N` *sequential* retry budgets (no parallel
+    // fan-out — at any instant exactly one owner is running). The
+    // load-bearing invariants this test pins:
+    //
+    //   1. Every concurrent get observes a CacheError::OriginError
+    //      (no spurious successes from a stale cache hit).
+    //   2. Total origin fetches stay within the documented worst case
+    //      `N * (1 + max_retries)` — a regression that re-spread retry
+    //      across waiters in parallel would blow this bound.
+    //   3. Total origin fetches stay above the no-coalescing best case
+    //      `1 + max_retries` — confirming retry actually runs.
+    //
+    // The bound is asserted as <= worst-case, not == exact, because the
+    // race between owner-exhaustion-notify and waiter-loop-reentry is
+    // scheduler-dependent. A stricter bound would be flake-prone.
+    const N_WAITERS: u32 = 5;
+    const MAX_RETRIES: u32 = 2;
+    let payload: &[u8] = b"never available";
+    let origin = Arc::new(FailingThenSucceedingOrigin::new(payload, usize::MAX));
+    let (engine, _tmp) = build_engine_with_retry(
+        origin.clone() as Arc<dyn Origin>,
+        fast_retry_policy(MAX_RETRIES),
+    )
+    .await?;
+    let hash = Hash::new(payload);
+
+    let mut handles = Vec::new();
+    for _ in 0..N_WAITERS {
+        let e = engine.clone();
+        handles.push(tokio::spawn(async move { e.get(hash).await }));
+    }
+    let mut errors: u32 = 0;
+    for h in handles {
+        match h.await? {
+            Err(CacheError::OriginError { .. }) => errors += 1,
+            other => anyhow::bail!("expected OriginError, got: {other:?}"),
+        }
+    }
+    anyhow::ensure!(errors == N_WAITERS);
+
+    let attempts = origin.fetches();
+    let worst_case = (N_WAITERS as usize) * (1 + MAX_RETRIES as usize);
+    let no_coalesce_minimum = 1 + MAX_RETRIES as usize;
+    anyhow::ensure!(
+        attempts <= worst_case,
+        "attempts={attempts} exceeds worst-case {worst_case} (N_WAITERS * (1+MAX_RETRIES))",
+    );
+    anyhow::ensure!(
+        attempts >= no_coalesce_minimum,
+        "attempts={attempts} below the minimum {no_coalesce_minimum} — retry never ran?",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn fs_origin_retries_on_transient_io_kind_then_succeeds() -> anyhow::Result<()> {
+    // Custom Origin that emits one Transient (synthetic Interrupted)
+    // before delegating to a real FilesystemOrigin. Verifies the retry
+    // loop fires for the FS adapter's Transient classification path.
+    #[derive(Debug)]
+    struct InterruptOnceOrigin {
+        inner: FilesystemOrigin,
+        first: std::sync::atomic::AtomicBool,
+    }
+    impl Origin for InterruptOnceOrigin {
+        fn fetch(
+            &self,
+            hash: Hash,
+            max_bytes: u64,
+        ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>>
+        {
+            let already_failed = self.first.swap(true, std::sync::atomic::Ordering::SeqCst);
+            if already_failed {
+                self.inner.fetch(hash, max_bytes)
+            } else {
+                Box::pin(async move {
+                    Err(OriginPullError::Transient(
+                        std::io::Error::from(std::io::ErrorKind::Interrupted).into(),
+                    ))
+                })
+            }
+        }
+    }
+
+    let base = tempfile::tempdir()?;
+    let payload: &[u8] = b"after interrupt";
+    let hash = Hash::new(payload);
+    // hash.to_hex() returns a stack-only ArrayString-style value; clone it
+    // so the borrow ends before we call `.get(..2)` on it via deref.
+    let hex = hash.to_hex().clone();
+    let shard = hex.get(..2).ok_or_else(|| anyhow::anyhow!("hex prefix"))?;
+    let shard_dir = base.path().join(shard);
+    tokio::fs::create_dir_all(&shard_dir).await?;
+    tokio::fs::write(shard_dir.join(&hex), payload).await?;
+
+    let inner = FilesystemOrigin::new(base.path()).await?;
+    let origin = Arc::new(InterruptOnceOrigin {
+        inner,
+        first: std::sync::atomic::AtomicBool::new(false),
+    });
+    let (engine, _tmp) =
+        build_engine_with_retry(origin as Arc<dyn Origin>, fast_retry_policy(2)).await?;
+    let got = engine.get(hash).await?;
+    anyhow::ensure!(&got[..] == payload);
+    Ok(())
+}
+
+#[tokio::test]
+async fn fs_origin_does_not_retry_on_permission_denied() -> anyhow::Result<()> {
+    // PermissionDenied falls in the Permanent arm of classify_io_error.
+    // We synthesise it directly via a custom Origin since making a real
+    // FS path PermissionDenied is platform-specific and would skip on
+    // CI where the test runs as root in a container.
+    #[derive(Debug)]
+    struct DeniedOrigin {
+        count: std::sync::atomic::AtomicUsize,
+    }
+    impl Origin for DeniedOrigin {
+        fn fetch(
+            &self,
+            _hash: Hash,
+            _max_bytes: u64,
+        ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>>
+        {
+            self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                Err(OriginPullError::Permanent(
+                    std::io::Error::from(std::io::ErrorKind::PermissionDenied).into(),
+                ))
+            })
+        }
+    }
+    let origin = Arc::new(DeniedOrigin {
+        count: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let (engine, _tmp) =
+        build_engine_with_retry(origin.clone() as Arc<dyn Origin>, fast_retry_policy(5)).await?;
+    let hash = Hash::new(b"denied");
+    let err = err_of(engine.get(hash).await)?;
+    anyhow::ensure!(matches!(err, CacheError::OriginError { .. }));
+    anyhow::ensure!(
+        origin.count.load(std::sync::atomic::Ordering::SeqCst) == 1,
+        "PermissionDenied must short-circuit after one attempt"
     );
     Ok(())
 }

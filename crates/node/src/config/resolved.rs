@@ -80,6 +80,9 @@ pub struct ResolvedCache {
     /// `HashSet<Hash>`-shaped feature can't be silently swapped into
     /// the pinning slot.
     pub pinned_hashes: decdn_cache::PinnedHashes,
+    /// Origin pull-through retry policy (#285). Set once at startup;
+    /// changes require a process restart.
+    pub origin_retry: decdn_cache::RetryPolicy,
 }
 
 /// Resolved payment fields.

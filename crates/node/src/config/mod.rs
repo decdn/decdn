@@ -462,6 +462,9 @@ fn resolve_cache(
     let pinned_hashes = parse_pinned_hashes(file.and_then(|c| c.pinned_hashes.as_deref()))
         .context("invalid cache.pinned_hashes")?;
 
+    let origin_retry = resolve_origin_retry(file.and_then(|c| c.origin_retry.as_ref()))
+        .context("invalid cache.origin_retry")?;
+
     Ok(ResolvedCache {
         cache_dir,
         cache_size_mb,
@@ -470,7 +473,33 @@ fn resolve_cache(
         origin_path,
         decompress,
         pinned_hashes,
+        origin_retry,
     })
+}
+
+/// Resolve the origin retry policy (#285). Absent => defaults via
+/// `RetryPolicy::default()`. Present partial sections fill missing
+/// fields from the same defaults (handled by `#[serde(default)]` on
+/// `RetryPolicy` itself). This function only enforces the two
+/// cross-field invariants the type can't express: monotone schedule
+/// and finite jitter in `[0, 1]`.
+pub(crate) fn resolve_origin_retry(
+    file: Option<&decdn_cache::RetryPolicy>,
+) -> anyhow::Result<decdn_cache::RetryPolicy> {
+    let p = file.copied().unwrap_or_default();
+    anyhow::ensure!(
+        p.initial_backoff_ms <= p.max_backoff_ms,
+        "cache.origin_retry: initial_backoff_ms ({}) must be <= max_backoff_ms ({}); \
+         otherwise the schedule never grows",
+        p.initial_backoff_ms,
+        p.max_backoff_ms,
+    );
+    anyhow::ensure!(
+        p.jitter_ratio.is_finite() && (0.0..=1.0).contains(&p.jitter_ratio),
+        "cache.origin_retry: jitter_ratio={} must be a finite number in 0.0..=1.0",
+        p.jitter_ratio,
+    );
+    Ok(p)
 }
 
 /// Parse the operator-supplied `cache.pinned_hashes` list (#276) into a
@@ -1947,6 +1976,125 @@ mod tests {
             msg.contains("invalid cache.pinned_hashes"),
             "error should be contextualized: {msg}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_origin_retry_defaults_when_absent() -> anyhow::Result<()> {
+        // Absent `cache.origin_retry` section => defaults from
+        // RetryPolicy::default(). Pin the contract here so a future
+        // default change has to update this test deliberately.
+        let cli = cache_cli(None, None);
+        let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
+        let p = resolved.origin_retry;
+        anyhow::ensure!(p.max_retries == 3, "default max_retries");
+        anyhow::ensure!(p.initial_backoff_ms == 100, "default initial_backoff_ms");
+        anyhow::ensure!(p.max_backoff_ms == 10_000, "default max_backoff_ms");
+        anyhow::ensure!(
+            (p.jitter_ratio - 0.1).abs() < f64::EPSILON,
+            "default jitter_ratio"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_origin_retry_parses_full_section() -> anyhow::Result<()> {
+        let cli = cache_cli(None, None);
+        let file = types::CacheConfig {
+            origin_retry: Some(decdn_cache::RetryPolicy {
+                max_retries: 7,
+                initial_backoff_ms: 50,
+                max_backoff_ms: 2_000,
+                jitter_ratio: 0.25,
+            }),
+            ..types::CacheConfig::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        let p = resolved.origin_retry;
+        anyhow::ensure!(p.max_retries == 7);
+        anyhow::ensure!(p.initial_backoff_ms == 50);
+        anyhow::ensure!(p.max_backoff_ms == 2_000);
+        anyhow::ensure!((p.jitter_ratio - 0.25).abs() < f64::EPSILON);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_origin_retry_partial_section_inherits_defaults() -> anyhow::Result<()> {
+        // `#[serde(default)]` on RetryPolicy fills missing fields from
+        // Default. Pinning the contract here so a future struct-level
+        // attribute change doesn't silently break partial TOML.
+        let toml = "[cache.origin_retry]\nmax_retries = 5\n";
+        let file: crate::config::FileConfig = ::toml::from_str(toml)?;
+        let p = file
+            .cache
+            .as_ref()
+            .and_then(|c| c.origin_retry.as_ref())
+            .ok_or_else(|| anyhow::anyhow!("origin_retry missing"))?;
+        anyhow::ensure!(p.max_retries == 5);
+        anyhow::ensure!(p.initial_backoff_ms == 100, "default carried through");
+        anyhow::ensure!(p.max_backoff_ms == 10_000, "default carried through");
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_origin_retry_max_retries_zero_is_valid() -> anyhow::Result<()> {
+        // `0` opts out and is the documented disable knob; resolution
+        // must not reject it.
+        let cli = cache_cli(None, None);
+        let file = types::CacheConfig {
+            origin_retry: Some(decdn_cache::RetryPolicy {
+                max_retries: 0,
+                ..decdn_cache::RetryPolicy::default()
+            }),
+            ..types::CacheConfig::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        anyhow::ensure!(resolved.origin_retry.max_retries == 0);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_origin_retry_rejects_initial_above_max() -> anyhow::Result<()> {
+        let cli = cache_cli(None, None);
+        let file = types::CacheConfig {
+            origin_retry: Some(decdn_cache::RetryPolicy {
+                initial_backoff_ms: 2_000,
+                max_backoff_ms: 1_000,
+                ..decdn_cache::RetryPolicy::default()
+            }),
+            ..types::CacheConfig::default()
+        };
+        let err = resolve_cache(&cli, Some(&file), Path::new("/tmp"))
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected error"))?;
+        let msg = format!("{err:#}");
+        anyhow::ensure!(
+            msg.contains("schedule never grows"),
+            "error message should explain why initial>max is rejected, got: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_origin_retry_rejects_jitter_out_of_range() -> anyhow::Result<()> {
+        let cli = cache_cli(None, None);
+        for bad in [-0.1, 1.5, f64::NAN, f64::INFINITY] {
+            let file = types::CacheConfig {
+                origin_retry: Some(decdn_cache::RetryPolicy {
+                    jitter_ratio: bad,
+                    ..decdn_cache::RetryPolicy::default()
+                }),
+                ..types::CacheConfig::default()
+            };
+            let err = resolve_cache(&cli, Some(&file), Path::new("/tmp"))
+                .err()
+                .ok_or_else(|| anyhow::anyhow!("expected rejection for jitter={bad}"))?;
+            let msg = format!("{err:#}");
+            anyhow::ensure!(
+                msg.contains("jitter_ratio"),
+                "error message should reference jitter_ratio, got: {msg}"
+            );
+        }
         Ok(())
     }
 

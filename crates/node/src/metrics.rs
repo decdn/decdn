@@ -9,6 +9,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use bytes::Bytes;
+use decdn_cache::CacheMetrics;
 use http_body_util::Full;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
@@ -78,6 +79,7 @@ pub struct DecdnMetrics {
 pub struct Metrics {
     registry: Arc<RwLock<Registry>>,
     decdn: Arc<DecdnMetrics>,
+    cache: Arc<CacheMetrics>,
     started_at: Instant,
 }
 
@@ -88,16 +90,31 @@ impl Default for Metrics {
 }
 
 impl Metrics {
-    /// Create the registry and register deCDN's metric group.
+    /// Create the registry and register deCDN's metric group plus the
+    /// cache crate's `decdn_cache_*` group. The cache handle is shared
+    /// with the engine via [`Self::cache_metrics`] so engine-side bumps
+    /// land in the same encoder output.
     pub fn new() -> Self {
         let decdn = Arc::new(DecdnMetrics::default());
+        let cache = Arc::new(CacheMetrics::default());
         let mut registry = Registry::default();
         registry.register(decdn.clone() as Arc<dyn MetricsGroup>);
+        // Cache metrics live under the `decdn_cache` prefix so they
+        // share the `decdn_*` family the rest of the metrics use.
+        registry
+            .sub_registry_with_prefix("decdn")
+            .register(cache.clone() as Arc<dyn MetricsGroup>);
         Self {
             registry: Arc::new(RwLock::new(registry)),
             decdn,
+            cache,
             started_at: Instant::now(),
         }
+    }
+
+    /// Shared `Arc<CacheMetrics>` for wiring into [`decdn_cache::CacheEngine`].
+    pub fn cache_metrics(&self) -> Arc<CacheMetrics> {
+        Arc::clone(&self.cache)
     }
 
     /// Register iroh's transport metrics under the `decdn_iroh_` prefix so
@@ -344,5 +361,50 @@ impl<'a> ConnectionGuard<'a> {
 impl Drop for ConnectionGuard<'_> {
     fn drop(&mut self) {
         self.metrics.connection_closed();
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_metrics_counters_start_at_zero() {
+        // Pinning down the OpenMetrics shape — a fresh registry must
+        // expose the cache counters at zero so dashboards built before
+        // any fetch has fired don't render `(no data)`.
+        let metrics = Metrics::new();
+        let text = metrics.encode().unwrap();
+        for name in [
+            "decdn_cache_origin_fetches_total",
+            "decdn_cache_origin_retry_exhausted_total",
+        ] {
+            assert!(
+                text.contains(&format!("{name} 0")),
+                "counter {name} should be exposed at zero on a fresh registry:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_metrics_handle_shares_atomic_with_registered_group() {
+        // Sanity: the Arc<CacheMetrics> handed to the engine must be
+        // the same one the registry reads from at scrape time. A bug
+        // that built two Arcs would surface as cache bumps never
+        // appearing in the scrape output.
+        let metrics = Metrics::new();
+        let handle = metrics.cache_metrics();
+        handle.origin_fetches.inc();
+        handle.origin_retry_exhausted.inc();
+        let text = metrics.encode().unwrap();
+        assert!(
+            text.contains("decdn_cache_origin_fetches_total 1"),
+            "fetches counter not visible in scrape:\n{text}"
+        );
+        assert!(
+            text.contains("decdn_cache_origin_retry_exhausted_total 1"),
+            "exhausted counter not visible in scrape:\n{text}"
+        );
     }
 }

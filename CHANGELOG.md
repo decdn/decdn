@@ -36,6 +36,22 @@ since project inception and will roll into the first tagged release.
 - HTTP origin adapter with connect / response-headers / chunk-idle timeouts.
 - Filesystem origin adapter using a git-style sharded layout
   (`{base}/{hex[0..2]}/{hex}`).
+- Origin pull-through retry policy with exponential backoff and jitter
+  (#285). Configurable via `[cache.origin_retry]` (`max_retries`,
+  `initial_backoff_ms`, `max_backoff_ms`, `jitter_ratio`); set once at
+  startup, changes require a restart. **Behaviour change:** *enabled by
+  default* — cache misses now retry transient HTTP (5xx/408/429/timeouts)
+  and filesystem (Interrupted/TimedOut/ResourceBusy/WouldBlock) failures
+  up to 3 times with 100ms…10s exponential backoff. Operators relying
+  on first-attempt failure semantics must set
+  `cache.origin_retry.max_retries = 0`. The active policy is logged at
+  startup on the `cache engine ready` line. Two
+  `decdn_cache_*_total` Prometheus counters track per-fetch volume
+  (`origin_fetches_total`) and terminal exhaustion of the retry budget
+  (`origin_retry_exhausted_total`); operators alert on the rate ratio.
+  The `Origin` trait surface changed to return
+  `Result<OriginFetch, OriginPullError>`; downstream `Origin` impls (if
+  any out-of-tree) must be updated.
 
 #### Gossip
 
