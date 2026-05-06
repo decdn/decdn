@@ -2411,10 +2411,7 @@ mod tests {
             ("relay_url", "DECDN_RELAY_URL"),
             ("rpc_url", "DECDN_RPC_URL"),
             ("eth_keystore", "DECDN_ETH_KEYSTORE"),
-            (
-                "keystore_password_file",
-                "DECDN_KEYSTORE_PASSWORD_FILE",
-            ),
+            ("keystore_password_file", "DECDN_KEYSTORE_PASSWORD_FILE"),
             ("payment_channel_address", "DECDN_PAYMENT_CHANNEL_ADDRESS"),
             ("staking_registry_address", "DECDN_STAKING_REGISTRY_ADDRESS"),
             ("cache_dir", "DECDN_CACHE_DIR"),
