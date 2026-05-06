@@ -2,7 +2,7 @@
 
 **Date:** 2026-05-06
 **Status:** Draft
-**Touches:** [ADR 009](009-governance.md), [ADR 011](011-content-takedown.md), [ADR 014](014-on-chain-verification.md), [ADR 026](026-gauge-boost-tokenomics.md)
+**Touches:** [ADR 008](008-reputation.md), [ADR 009](009-governance.md), [ADR 011](011-content-takedown.md), [ADR 014](014-on-chain-verification.md), [ADR 018](018-liquidity-strategy.md), [ADR 026](026-gauge-boost-tokenomics.md)
 
 ## Context
 
@@ -25,7 +25,7 @@ A node operator may file a **slashing appeal** within 30 days of a `SlashJudge` 
 
 All four `SlashJudge` offense types are appealable: corruption, phantom, rate manipulation, blacklist. The legitimate-outage rationale applies to each — corruption appeals address operators who missed the 24h counter-evidence window; phantom/rate/blacklist appeals address operators who had no counter-evidence opportunity at all because the slash executed immediately ([ADR 014 §3 Bond Handling](014-on-chain-verification.md#bond-handling)).
 
-The eligibility bar (§3) is the gate against frivolous appeals, not the offense type. Blacklist appeals are admissible on the same §3 evidence standard as other offenses; the multisig is expected to apply heightened scrutiny when reviewing them, given that blacklist offenses involve deliberate moderation noncompliance rather than purely operational failure modes. This guidance is not coded into the contract.
+The eligibility bar (§3) is the gate against frivolous appeals, not the offense type. **Scope limitation: ADR 028 covers appeals against the *slash event itself* on operational-failure grounds — the operator was unable to comply because of an outage, NTP drift, or similar.** Appeals against the *underlying [`ContentBlacklist`](011-content-takedown.md#contract-contentblacklist) entry* — i.e., disputing whether the blacklisted hash should be on the list at all — are out of scope here and tracked separately under [ADR 011](011-content-takedown.md) (issue #131). §3's evidence standard explicitly does not admit content-policy arguments (e.g., "the blacklist entry was wrongly issued" or "the takedown notice was overbroad"); only the operational-failure evidence types defined in §3 are admissible. The multisig is expected to apply heightened scrutiny when reviewing blacklist-offense appeals, given that blacklist offenses involve deliberate moderation noncompliance rather than purely operational failure modes. This guidance is not coded into the contract.
 
 ### 2. Appeal flow
 
@@ -44,17 +44,21 @@ sequenceDiagram
         EM->>SR: fastTrackAppeal(appealId) or rejectAppeal(appealId)
         alt fast-track approved
             SR->>SR: provisional restitution moves to per-appeal escrow — not disbursed
-            Note over SR: 48-hour SafetyReserve appeal window (ADR 026 §5)
-            Note over SR: RATIFICATION_WINDOW = 14d (runs in parallel)
-            alt ve-Governor ratifies
-                SR-->>Op: escrow released to operator — APPEAL_BOND refunded
-            else ve-Governor reverses
-                SR->>SR: escrow returns to SafetyReserve — 50% bond burned, 50% to challenger pool
-            else governance silent past RATIFICATION_WINDOW
-                SR->>SR: escrow returns to SafetyReserve — APPEAL_BOND refunded (operator not at fault)
+            Note over SR: gate (3) — 48h SafetyReserve counter-bundle window (ADR 026 §5)
+            alt counter-bundle filed and accepted within 48h
+                SR->>SR: appeal fails — escrow returns to SR; 50% bond burned, 50% to counter-bundle filer
+            else 48h elapses with no successful counter-bundle
+                Note over SR: RATIFICATION_WINDOW = 14d begins (sequential, not parallel)
+                alt ve-Governor ratifies
+                    SR-->>Op: escrow released to operator — APPEAL_BOND refunded
+                else ve-Governor reverses
+                    SR->>SR: escrow returns to SafetyReserve — 50% bond burned, 50% to challenger-incentive pool
+                else governance silent past RATIFICATION_WINDOW
+                    SR->>SR: escrow returns to SafetyReserve — APPEAL_BOND refunded (operator not at fault)
+                end
             end
         else multisig rejects at intake
-            SR->>SR: 50% bond burned, 50% to challenger pool
+            SR->>SR: 100% of bond burned (no counter-bundle filer to credit at intake)
         end
     else multisig silent past MULTISIG_REVIEW_WINDOW
         SR->>SR: appeal expires unless ve-Governor acts directly — APPEAL_BOND refunded
@@ -86,8 +90,9 @@ Evidence type (b) is the on-chain-verifiable path; (a) and (c) are off-chain-roo
 The operator posts `APPEAL_BOND` in TOKEN at the time of filing. Default 1,000 TOKEN; governable with hard bounds `[100, 10,000]` per [ADR 009](009-governance.md) safety-bound pattern. Bond economics mirror [ADR 014 §3 Bond Handling](014-on-chain-verification.md#bond-handling):
 
 - **Successful appeal (ratified by ve-Governor):** bond refunded to operator in full.
-- **Multisig rejects at intake (no fast-track granted):** bond is treated as a failed appeal — 50% burned, 50% to challenger pool.
-- **Failed appeal (reversed by ve-Governor or successfully challenged in the 48h SafetyReserve appeal window):** 50% of bond burned, 50% credited to a challenger-incentive pool managed by `SafetyReserve` (used to compensate parties who file successful counter-bundles in the 48h window).
+- **Multisig rejects at intake (no fast-track granted):** 100% of bond burned. No counter-bundle filer exists to credit at intake; this case has no direct analog in [ADR 014 §3](014-on-chain-verification.md#bond-handling).
+- **Failed appeal — successful counter-bundle in 48h `SafetyReserve` window:** mirrors [ADR 014 §3](014-on-chain-verification.md#bond-handling) bond split — 50% of bond burned, 50% routed *directly to the counter-bundle filer* as the prevailing party.
+- **Failed appeal — ve-Governor reverses (no counter-bundle filer):** 50% of bond burned, 50% credited to a `SafetyReserve` challenger-incentive pool used to compensate parties who file successful counter-bundles in *future* 48h windows. (This case has no specific prevailing party to route to directly.)
 - **Governance silent past `MULTISIG_REVIEW_WINDOW` or `RATIFICATION_WINDOW`:** bond refunded — the operator is not at fault for governance inaction, and the appeal lapses without economic penalty.
 
 The bond is the primary economic deterrent against pro-forma appeals filed in hopes of multisig sympathy. The 365-day frequency cap (§5) and the perjury re-slash (§3) are the secondary deterrents.
@@ -100,13 +105,13 @@ The bond is the primary economic deterrent against pro-forma appeals filed in ho
 | `APPEAL_BOND` | 1,000 TOKEN | `[100, 10,000]` | High enough to deter abuse, low enough that an operator with a genuine outage will pay it. |
 | `MULTISIG_REVIEW_WINDOW` | 14 days | `[3d, 30d]` | Time the emergency multisig has to grant interim relief. After this, the appeal expires unless governance acts directly. |
 | `RATIFICATION_WINDOW` | 14 days | (fixed, mirrors [ADR 011](011-content-takedown.md#regional-governance-bodies)) | ve-Governor must ratify or reverse within this window. Same window as regional-body suspension. |
-| `MAX_APPEAL_RESTITUTION` | 1× minimum stake denominated in USDC at the slash block's TWAP | (fixed) | An appeal cannot net the operator more than the slashable stake floor ([ADR 026 §7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake)). Larger slashes are restituted up to this cap; the operator absorbs the residual. The TOKEN→USDC conversion uses the same Balancer V3 80/20 pool TWAP that [ADR 018](018-liquidity-strategy.md) uses for buyback-and-burn (read at the slash block, not the appeal block, so the cap does not move with TOKEN price during the 30-day filing window). |
+| `MAX_APPEAL_RESTITUTION` | 1× minimum stake denominated in USDC at the slash block's TWAP | (fixed) | An appeal cannot net the operator more than the slashable stake floor ([ADR 026 §7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake)). Larger slashes are restituted up to this cap; the operator absorbs the residual. The TOKEN→USDC conversion uses the same Balancer V3 80/20 pool TWAP that [ADR 018](018-liquidity-strategy.md) uses for buyback-and-burn — specifically the same window length and oracle path as [ADR 018 § Buyback execution via Balancer V3](018-liquidity-strategy.md#buyback-execution-via-balancer-v3) — read at the slash block, not the appeal block, so the cap does not move with TOKEN price during the 30-day filing window. Reusing one oracle parameter set keeps appeal and buyback numerics auditable from a single configuration. |
 | `OPERATOR_APPEAL_FREQUENCY` | 1 accepted appeal per 365 days | (fixed) | Prevents a serially-failing operator from rolling outage appeals indefinitely. Resets on the date the *previous* successful appeal was ratified. |
-| `CORRELATED_ATTACK_WAIVER` | enabled | (fixed) | The emergency multisig may waive `OPERATOR_APPEAL_FREQUENCY` if ≥3 slashes against the same operator land within a 7-day rolling window and pre-date a successful appeal. Closes the coordinated-griefing attack: an adversary triggering many small slashes against a target cannot exhaust the operator's single annual appeal slot. The waiver decision is recorded in the post-incident registry. |
+| `CORRELATED_ATTACK_WAIVER` | enabled | (fixed) | The emergency multisig may waive `OPERATOR_APPEAL_FREQUENCY` if ≥3 slashes against the same operator land within a 7-day rolling window. The waiver becomes available *only after* the first successful ratification within that 7-day cluster (so the operator must first consume their annual appeal slot on a legitimate-outage appeal), permits up to three additional appeals against slashes from the *same* cluster, and lapses when the rolling 7-day window with ≥3 slashes ends. Closes the coordinated-griefing attack: an adversary triggering many small slashes against a target cannot exhaust the operator's single annual appeal slot. The waiver decision and bounded scope are recorded in the post-incident registry. |
 
 `MAX_APPEAL_RESTITUTION` payouts count against `SafetyReserve`'s existing per-incident and per-rolling-window USDC ceilings ([ADR 009 § Emergency Multisig](009-governance.md#emergency-multisig) gate (4)) — appeals share the reserve's overall solvency budget with all other payout categories.
 
-**SafetyReserve insolvency at ratification.** If `SafetyReserve` cannot fund the full restitution at ratification time (rolling-window cap reached, or insufficient general balance after concurrent incidents), the appeal succeeds in principle but the unfunded portion is recorded as a deferred ranked claim against future `SafetyReserve` inflows. The bond is refunded regardless. Operators with deferred claims are paid in FIFO order at each subsequent epoch settlement. This avoids forcing a binary fail/succeed on solvency events outside the operator's control.
+**SafetyReserve insolvency at ratification.** If `SafetyReserve` cannot fund the full restitution at ratification time (rolling-window cap reached, or insufficient general balance after concurrent incidents), the appeal succeeds in principle but the unfunded portion is recorded as a *pending claim*. Disbursement of a pending claim requires a subsequent `SafetyReserve.payout()` authorization once reserve solvency permits — the same four [ADR 026 §5 Spending controls](026-gauge-boost-tokenomics.md#spending-controls) gates apply at that point. The bond is refunded regardless. Cross-category ordering of pending claims (e.g., whether a slash-restitution pending claim is paid before or after a new SLA-breach payout in a later epoch) is intentionally **not** specified in this ADR; if a deterministic queue across payout categories is desired before mainnet, [ADR 026 §5](026-gauge-boost-tokenomics.md#5-safety-and-insurance-reserve-3-bucket) must be amended to define ranking semantics (see [Forward references](#forward-references-follow-up-adrs)). This avoids forcing a binary fail/succeed on solvency events outside the operator's control without silently extending [ADR 026](026-gauge-boost-tokenomics.md)'s payout model.
 
 ### 6. Contract surface
 
@@ -120,7 +125,9 @@ function ratifyAppeal(uint256 appealId) external onlyGovernor;
 function reverseAppeal(uint256 appealId) external onlyGovernor;
 ```
 
-`openSlashAppeal` requires the bond transfer (`TOKEN.transferFrom` of `APPEAL_BOND`) and a non-zero `evidenceBundleHash`; it stores the appeal record and emits `SlashAppealOpened`. The actual restitution disbursement on ratification is routed through the existing `payout(bundleHash, recipient, amount)` entry point so [ADR 026 §5 Interface stability](026-gauge-boost-tokenomics.md#interface-stability)'s contract-stable signature for incident payouts is preserved — appeals are an additional *authorization* path into the same payout machinery, not an additional payout machinery. Subsequent gates are the same four payout gates from [ADR 026 §5 Spending controls](026-gauge-boost-tokenomics.md#spending-controls): attested bundle, authorization (multisig fast-track), 48-hour appeal window, post-incident reporting.
+`openSlashAppeal` requires the bond transfer (`TOKEN.transferFrom` of `APPEAL_BOND`) and a non-zero `evidenceBundleHash`; it stores the appeal record and emits `SlashAppealOpened`. The actual restitution disbursement on ratification is routed through the existing `payout(bundleHash, recipient, amount)` entry point so [ADR 026 §5 Interface stability](026-gauge-boost-tokenomics.md#interface-stability)'s contract-stable signature for incident payouts is preserved — appeals are an additional *authorization* path into the same payout machinery, not an additional payout machinery. Subsequent gates are the same four payout gates from [ADR 026 §5 Spending controls](026-gauge-boost-tokenomics.md#spending-controls): attested bundle, authorization (multisig fast-track), 48-hour appeal window, post-incident reporting — applied **sequentially**, in that order. The §2 mermaid reflects this sequencing: the 48h SafetyReserve counter-bundle window completes before the 14-day ratification window opens, not in parallel.
+
+**Multisig capability scope.** `fastTrackAppeal` and `rejectAppeal` are sub-modes of [ADR 009 § Emergency Multisig](009-governance.md#emergency-multisig)'s existing capability (4) "SafetyReserve fast-track authorization" — they consume appeal-specific arguments and emit appeal-specific events but do **not** create a new multisig power. The 3-of-5 threshold, signing semantics, and post-incident reporting obligations are unchanged from [ADR 009](009-governance.md#emergency-multisig). ADR 009's "Capabilities (exhaustive list)" prose should be editorially expanded to enumerate the appeal-specific entry points as sub-modes of capability (4); see [Forward references](#forward-references-follow-up-adrs).
 
 **Dependency on `SlashJudge` slash identifiers.** The `slashId` argument requires `SlashJudge` ([ADR 014 §3](014-on-chain-verification.md#3-slashjudge-contract)) to emit a stable, unique identifier on every slash resolution — including the immediate-execution offenses (phantom, rate, blacklist) that today resolve synchronously without a challenge-resolution event. The companion implementation ADR must extend `SlashJudge` to emit a `Slashed(uint256 indexed slashId, address indexed operator, uint8 offenseType, uint256 amount, ...)` event for every offense type, with monotonic `slashId` allocation across the four offenses. Operators reference this `slashId` directly in `openSlashAppeal`. Without this dependency the appeal flow cannot pin a particular slash event.
 
@@ -156,7 +163,7 @@ Modeled abuse paths and their counters:
 
 - Closes the issue-403 gap with a bounded, documented mechanism — no ad-hoc multisig discretion needed for legitimate-outage cases.
 - Reuses existing primitives: `SafetyReserve` contract, emergency multisig, ve-Governor, [ADR 014 §3](014-on-chain-verification.md#bond-handling) bond economics, [ADR 011](011-content-takedown.md#regional-governance-bodies) ratification pattern. No new governance body, no new contract.
-- Operator relief is bounded and predictable: the multisig fast-track decision lands within `MULTISIG_REVIEW_WINDOW` (default 14 days) and disbursement follows ratification within at most another 14 days, vs. the ~9-day minimum + indefinite proposal-drafting latency of a Governor-only path.
+- Operator relief is bounded and predictable: the multisig fast-track decision lands within `MULTISIG_REVIEW_WINDOW` (default 14 days) and disbursement follows ratification within at most another ~16 days (48h SafetyReserve counter-bundle window + 14d ratification, applied sequentially), vs. the ~9-day minimum + indefinite proposal-drafting latency of a Governor-only path.
 - Operator trust improves measurably — onboarding pitches can point to a documented appeal path rather than "trust the multisig."
 - Reputation and offense-count are preserved, so the deterrent against repeat behavior is intact.
 
@@ -164,7 +171,7 @@ Modeled abuse paths and their counters:
 
 - Adds five new entry points (`openSlashAppeal`, `fastTrackAppeal`, `rejectAppeal`, `ratifyAppeal`, `reverseAppeal`) plus per-appeal escrow accounting to `SafetyReserve`, increasing the contract's surface area and audit cost.
 - Operators must front `APPEAL_BOND` (1,000 TOKEN default) to file, which is a real frictional cost at PoC TOKEN prices for genuinely-affected smaller operators. Cold-start considerations may motivate a lower default during the PoC window.
-- Escrow-until-ratification (§2) means the operator does not see disbursed restitution until ve-Governor ratification — up to ~14 days after the multisig fast-track. For larger slashes this is real working-capital exposure during the holding period; the trade-off is buying out clawback exposure entirely.
+- Escrow-until-ratification (§2) means the operator does not see disbursed restitution until ve-Governor ratification — up to ~16 days after the multisig fast-track (48h SafetyReserve counter-bundle window + 14d ratification, applied sequentially). For larger slashes this is real working-capital exposure during the holding period; the trade-off is buying out clawback exposure entirely.
 - Evidence standard (≥2 corroborating sources) is documentation-heavy for solo operators without enterprise-grade observability.
 - **TOKEN→USDC market risk.** `MAX_APPEAL_RESTITUTION` is denominated in USDC at the slash-block TWAP (§5). The full appeal lifecycle — 30-day filing window + multisig review + 48-hour SafetyReserve appeal + 14-day ratification — can run up to ~60 days, during which TOKEN may appreciate against USDC. The operator receives a fixed-USDC restitution that may buy back fewer TOKEN than were slashed, leaving them short of pre-slash protocol standing even after a successful appeal. The slash-block TWAP is the deliberate choice (settling at appeal-block TWAP would expose `SafetyReserve` to TOKEN price moves and incentivize timing the appeal); operators bear the residual price risk.
 
@@ -174,6 +181,7 @@ Modeled abuse paths and their counters:
 - **Reserve solvency.** A correlated outage event (regional cloud provider failure) could trigger many simultaneous appeals against the same `SafetyReserve` budget. The per-rolling-window cap from [ADR 009](009-governance.md#emergency-multisig) bounds the worst case at the cost of pro-rata rationing across affected operators.
 - **Sworn-declaration enforcement gap.** The perjury re-slash relies on post-hoc evidence surfacing. If post-hoc evidence is hard to obtain (private RPC logs, ISP records aged off), perjury becomes practically un-prosecutable. The bond forfeit and frequency cap remain as backup deterrents.
 - **Cross-subsidy / depletion ratio.** A 50% slash on a min-stake operator nets `SafetyReserve` ~30% × stake from inflow ([ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn) distribution: 50% challenger / 30% reserve / 20% burn), while a successful appeal can pay out up to 1× minimum stake — a worst-case ~3.3× depletion ratio for the corresponding incident, rising further if the slash tier was 5% or 15% rather than 50%. The reserve is therefore funding a cross-subsidy from non-slash inflows (FeeRouter 3% safety bucket per [ADR 026 §2](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553)) into slash restitution. This cross-subsidy is accepted explicitly for stakes at or near the minimum, where restitution can fully cover the slash; for operators staking well above the minimum, a 50% slash exceeds `MAX_APPEAL_RESTITUTION` and the operator absorbs the residual (§5). The protocol prioritizes reserve solvency over full-restitution-for-whales; restitution caps at the slashable stake floor, not at the operator's actual slash amount. Reserve sizing in [ADR 026 §5](026-gauge-boost-tokenomics.md#5-safety-and-insurance-reserve-3-bucket) — and the underlying economic-model spec — must accommodate this depletion ratio when projecting reserve solvency. The deferred-claim path (§5) bounds the worst case at the cost of operator working-capital exposure during depletion windows.
+- **Gauge-eligibility tier loss persists across appeal.** §7 deliberately preserves reputation, which means a slashed operator's [ADR 008](008-reputation.md) reputation hit — and any tier transition that drops them out of gauge-pool eligibility under [ADR 008](008-reputation.md) — is not reversed on a successful appeal. For high-volume operators this can be a far larger economic loss than the restituted slash, since gauge eligibility gates `bytes_delivered` weighting in the [ADR 026 §3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula) gauge-boost formula. Restoration follows the slower [ADR 008](008-reputation.md) decay/reset paths. The operator absorbs this residual cost; the §7 rationale (reversing peer-aggregated reputation post-hoc weakens its meaning as an ongoing signal) is the explicit trade-off.
 - **Multisig precedent drift on the correlated-attack waiver.** `CORRELATED_ATTACK_WAIVER` (§5) gives the multisig discretion to waive the annual cap. Repeated waivers without ratification could erode the cap's deterrent value. Mitigation: each waiver is recorded in the post-incident registry as an observable metric; ratification of the underlying appeal is still required.
 
 ## Alternatives Considered
@@ -187,5 +195,15 @@ Modeled abuse paths and their counters:
 ## Forward references (follow-up ADRs)
 
 - A future contract-implementation ADR will pin the exact `SafetyReserve` storage layout, the per-appeal escrow accounting from §2, and the Solidity event signatures for `SlashAppealOpened` / `SlashAppealFastTracked` / `SlashAppealRejected` / `SlashAppealRatified` / `SlashAppealReversed` / `SlashAppealLapsed`.
-- **`SafetyReserve` future split.** If the reserve is ever decomposed into separate per-category contracts (e.g. distinct reserves for slash-restitution vs. SLA-breach vs. payment-channel downtime), the appeal-authorization functions added in §6 must migrate alongside the slash-restitution payout category. The migration path should preserve the §2 escrow semantics and the deferred-claim ordering from §5. This is a known coupling cost of the §6 reuse decision and is intentional for PoC; revisiting at the time of any reserve split is sufficient.
+- **`SafetyReserve` future split.** If the reserve is ever decomposed into separate per-category contracts (e.g. distinct reserves for slash-restitution vs. SLA-breach vs. payment-channel downtime), the following state and entry points must migrate alongside the slash-restitution payout category:
+  1. The five §6 entry points (`openSlashAppeal` / `fastTrackAppeal` / `rejectAppeal` / `ratifyAppeal` / `reverseAppeal`).
+  2. Per-appeal escrow accounting from §2.
+  3. The pending-claim register from §5 (and any cross-category ordering decision deferred there).
+  4. The challenger-incentive pool state implied by §4.
+
+  The migration must preserve §2's escrow semantics. This is a known coupling cost of the §6 reuse decision and is intentional for PoC; revisiting at the time of any reserve split is sufficient.
+
+- **[ADR 009 § Emergency Multisig](009-governance.md#emergency-multisig) editorial amendment.** ADR 009's "Capabilities (exhaustive list)" prose enumerates four multisig powers and predates this ADR. ADR 028's `fastTrackAppeal` / `rejectAppeal` are sub-modes of capability (4) "SafetyReserve fast-track authorization" (§6) and do not create a new multisig power, but ADR 009's enumeration should be editorially expanded to reference the appeal-specific entry points so an auditor reading ADR 009 alone can find the appeal flow.
+
+- **[ADR 026 §5](026-gauge-boost-tokenomics.md#5-safety-and-insurance-reserve-3-bucket) cross-category payout ordering.** §5's pending-claim path defers cross-category ordering (slash-restitution vs. SLA-breach vs. other payout categories) to a future amendment of [ADR 026 §5](026-gauge-boost-tokenomics.md#5-safety-and-insurance-reserve-3-bucket). If a deterministic ordering is required before mainnet, that amendment is the gating dependency; this ADR is intentionally silent so it does not extend [ADR 026](026-gauge-boost-tokenomics.md)'s payout model unilaterally.
 - The narrower regional-blacklist appeal mechanism (issue #131) is tracked separately under [ADR 011](011-content-takedown.md). The two appeal paths are deliberately decoupled — content-policy disputes and operator-outage disputes have different evidence standards and different stakeholder pools.
