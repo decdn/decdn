@@ -27,7 +27,6 @@ The goal is a clean mechanical answer to: **how does the codebase express the di
 | Regional body registration | None — admin key is sole governance for blacklist | Regional bodies registered; global governance override | ADR 011 |
 | Default-open allow-list | Inactive (`defaultOpenAllowlistActive == false`) — permissive bootstrap window: any active staker may serve as origin for `namespaceId == 0` | Activated by governance; only allow-listed operators appear in `OriginAssignment.getOrigins(0)` for default-open content; off-chain consumers (clients, watchtowers) consult that view to filter unauthorized origins | ADR 011, ADR 016 |
 | Treasury disbursement | Manual (admin key holder) | On-chain governance proposal | ADR 009 |
-| `adminReclaimNodeId` | Present — `onlyOwner` fallback for NodeId squatting during early testing | Removed from contract | ADR 001 |
 | Bootstrap peer source | On-chain registry only | Registry + DNS seed list + minimum peer diversity (Option B+C) | ADR 012 |
 | `cdn/watchtower/v1` ALPN | Not used | Active — nodes register with watchtowers | ADR 007 |
 | Multi-token `token_rates` gossip field | Omitted (single `rate_per_mb`) | Present alongside `rate_per_mb` | ADR 010 |
@@ -126,7 +125,6 @@ pub trait WatchtowerClient: Send + Sync {
 | | PoC | Production |
 |---|-----|------------|
 | Implementation | `NoopWatchtowerClient` — client monitors its own channels directly | `cdn/watchtower/v1` ALPN; watchtower nodes use `WatchtowerEscrow` contract |
-| `WatchtowerAnnounce` gossip | Not emitted or processed | Emitted by watchtower nodes; subscribed to on `cdn/global/v1` |
 
 ### 6. `CorruptionChallenger` — `crates/incentive`
 
@@ -309,12 +307,6 @@ fn key_store(config: &Config) -> Arc<dyn KeyStore> {
 This is a stronger guarantee than `if cfg!(feature = "poc")`: with the attribute form, the PoC branch is **excluded from compilation entirely** in a production build. `FileKeyStore`, `NoopWatchtowerClient`, and other PoC types are not present in the production binary at all — not merely optimized away.
 
 `#[cfg(feature = "poc")]` and `#[cfg(not(feature = "poc"))]` appear **only** in `crates/node/src/wiring.rs` and `crates/node/src/main.rs`. They are **banned** in all other crates via a `rustflags` lint (see Enforcement below).
-
-### Contracts: `unsafe-admin` feature
-
-The Solidity `adminReclaimNodeId` function (ADR 001) is removed in production contracts. Foundry controls this via a separate deploy script — not a Rust feature flag. The PoC deploy script (`script/DeployPoc.s.sol`) deploys `PocStakingRegistry`, which extends `StakingRegistry` with `adminReclaimNodeId`. The production deploy script (`script/DeployProduction.s.sol`) deploys `StakingRegistry` directly.
-
-No Rust `unsafe-admin` compile flag is needed — the function simply does not exist on the production contract ABI.
 
 ## Wiring Conventions
 

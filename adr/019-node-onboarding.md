@@ -136,7 +136,7 @@ Query `StakingRegistry.getActiveNodes(offset=0, limit=100)` to bootstrap the pee
 
 This registry snapshot is the initial peer table. Gossip updates (Phase 4) will keep it fresh. The node also subscribes to `NodeRegistered`, `NodeMultiaddrUpdated`, `NodeDeregistered`, and `NodeAutoEjected` events to maintain a local registry cache used during gossip validation ([ADR 001](001-network.md#registry-cache)).
 
-If the RPC endpoint is unavailable, retry with exponential backoff (3 attempts at 1s, 5s, 30s). If all retries fail, the node cannot start (no peer table = cannot participate in gossip or probe fan-outs).
+If the RPC endpoint is unavailable, retry with exponential backoff (3 attempts at 1s, 5s, 30s). If all retries fail, the node cannot start (no peer table = cannot participate in gossip, DHT lookups, or probing).
 
 #### Step 3.4 — Configure local rate
 

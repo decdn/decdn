@@ -132,7 +132,7 @@ pre-commit install                # one-time setup (done automatically in devcon
 pre-commit run --all-files        # run all hooks manually
 ```
 
-Hooks: trailing-whitespace, end-of-file-fixer, check-yaml, check-merge-conflict, check-added-large-files, markdownlint, `cargo fmt`, `cargo clippy`, `cargo deny`.
+Hooks: trailing-whitespace, end-of-file-fixer, check-yaml, check-merge-conflict, check-added-large-files, markdownlint, `cargo fmt`, `cargo clippy`, `cargo doc`, `cargo deny`.
 
 ## Build and Test
 

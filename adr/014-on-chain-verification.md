@@ -14,40 +14,33 @@ Four slashable offenses require on-chain evidence verification ([ADR 026 §8](02
 
 A fifth offense, **double settlement** (submitting the same voucher to multiple channels), is production-only and is not covered by on-chain verification in the PoC.
 
-Three of these (phantom, rate, blacklist) require verifying cryptographic signatures from protocol messages. The fourth (corruption) requires adjudicating whether delivered bytes match the claimed BLAKE3 hash. Neither Ed25519 signature verification nor BLAKE3 mismatch adjudication is natively supported on EVM:
-
-- **Ed25519 signatures** (iroh NodeId keys, used for `ProbeResponse` and `StreamResponse` per [ADR 005](005-protocol.md)) have no EVM precompile. Solidity-based verification costs ~500k–1M gas per signature — economically unviable for routine slashing.
-- **BLAKE3 hashes** have no EVM opcode. Submitting full blob data on-chain to prove a mismatch is gas-prohibitive for any non-trivial blob size. The PoC therefore uses an optimistic bond + counter-evidence scheme rather than cryptographic mismatch proof; a production Merkle proof design is specified but deferred.
+Three of these (phantom, rate, blacklist) require verifying cryptographic signatures from protocol messages. The fourth (corruption) requires adjudicating whether delivered bytes match the claimed BLAKE3 hash. EVM's native `ecrecover` handles secp256k1 (ECDSA) cheaply (~3,000 gas), but BLAKE3 mismatch adjudication has no EVM opcode and submitting full blob data on-chain is gas-prohibitive for any non-trivial blob size. The PoC therefore uses an optimistic bond + counter-evidence scheme for corruption rather than cryptographic mismatch proof; a production Merkle proof design is specified but deferred.
 
 This ADR specifies concrete on-chain mechanisms for both: `ecrecover`-based signature verification for the three signature-dependent offenses, and an optimistic challenge-response for corruption — enabling all four slash evidence paths for the PoC.
 
 ## Decision
 
-### 1. Ed25519 Signature Verification — Dual-Key Slash Signatures
+### 1. Slash Signatures — secp256k1 EIP-712
 
-#### Problem
+#### Approach
 
-[ADR 005](005-protocol.md) defines `ProbeResponse` and `StreamResponse` signatures using the node's Ed25519 iroh key. On-chain slash evidence requires verifying these signatures, but EVM's native `ecrecover` only handles secp256k1 (ECDSA). An on-chain Ed25519 library is too expensive for routine use.
+Each protocol message that participates in slashing (`ProbeResponse`, `StreamResponse`) carries a single message-body signature, `slash_sig`, produced with the node's Ethereum key. Connection-level peer identity is authenticated separately by the iroh QUIC handshake against the registered Ed25519 NodeId; the body signature exists to make message contents portable evidence verifiable both off-chain and on-chain.
 
-#### Approach: secp256k1 slash signatures alongside Ed25519 wire signatures
+The Ethereum key is the same secp256k1 key the node already holds for staking and channel operations: `StakingRegistry.registerNode` ([ADR 001](001-network.md)) atomically binds the operator's Ethereum address to the Ed25519 NodeId, so `ecrecover` on a `slash_sig` followed by a `StakingRegistry.nodeIdOf(recovered)` lookup attributes the message to a specific NodeId. EVM-native verification costs ~3,000 gas, making routine slashing economically viable; an Ed25519 wire signature would have cost ~500k–1M gas via Solidity library and was rejected for this reason.
 
-Nodes already register an Ethereum address (secp256k1-derived) alongside their Ed25519 NodeId in `StakingRegistry` ([ADR 003](003-payments.md)). This ADR leverages that existing binding: protocol messages carry a **second signature** using the node's Ethereum key, specifically for on-chain evidence.
+##### Wire protocol
 
-##### Wire protocol additions
-
-`ProbeResponse` and `StreamResponse` each carry a `slash_sig` field, mandatory in this protocol version. Any future relaxation allowing `slash_sig` to be omitted from the wire would change field requiredness and therefore requires a Tier 3 / major-version ALPN bump per [ADR 013](013-schema-evolution.md), not a Tier 1 change. Production may instead relax *validation semantics* (e.g., accept zero-length `slash_sig`) while keeping the field always present on the wire:
+`slash_sig` is mandatory and non-empty on every `ProbeResponse` and `StreamResponse`. Requesters MUST reject responses with missing or zero-length `slash_sig`. There is no opt-out: every interaction in the paid delivery path is on-chain slashable. The fields covered by `slash_sig` are the same fields that drive the slashing mechanisms in [ADR 005](005-protocol.md):
 
 ```
-ProbeResponse {has_blob, rate_per_mb, timestamp_us, signature, total_bytes?, slash_sig}
-StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, signature, redirect?, error?, voucher_interval_mb?, slash_sig}
+ProbeResponse {has_blob, rate_per_mb, timestamp_us, total_bytes?, slash_sig}
+StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, redirect?, error?, voucher_interval_mb?, slash_sig}
 ```
-
-`slash_sig` is an EIP-712 secp256k1 signature over the same security-relevant fields already covered by the Ed25519 `signature`:
 
 - **ProbeResponse slash_sig covers:** `{hash, has_blob, rate_per_mb, timestamp_us}`
 - **StreamResponse slash_sig covers:** `{hash, ok, rate_per_mb, total_bytes, channel_id, timestamp_us, redirect}`
 
-These match the Ed25519-signed field sets defined in [ADR 005](005-protocol.md). Note that `hash` and `channel_id` are request-context fields (from `ProbeRequest` and `StreamRequest` respectively), not transmitted in the response body — implementers must include them when building and verifying the EIP-712 typed data. When `redirect` is absent (the common case), it is encoded as `bytes32(0)`. In the PoC, `slash_sig` is mandatory — all nodes must include it, and requesters MUST reject responses that omit it. Production may relax validation semantics (e.g., accepting zero-length `slash_sig` to indicate opt-out) while keeping the field present on the wire for postcard compatibility. Requesters cannot submit on-chain slash evidence for messages with empty `slash_sig`; those cases fall back to reputation penalties, consistent with the existing timeout/non-response handling in [ADR 003](003-payments.md). Fully removing `slash_sig` from the wire format would require a Tier 3 / ALPN bump per [ADR 013](013-schema-evolution.md).
+`hash` and `channel_id` are request-context fields (from `ProbeRequest` and `StreamRequest` respectively), not transmitted in the response body — implementers must include them when building and verifying the EIP-712 typed data. When `redirect` is absent (the common case), it is encoded as `bytes32(0)`. The signed-field set is the v1 baseline; per [ADR 013 § Signed Field Freezing](013-schema-evolution.md#signed-field-freezing), any subsequent change is a Tier 3 ALPN bump.
 
 #### EIP-712 Type Definitions
 
@@ -81,21 +74,13 @@ EIP712Domain({
 
 #### Node Implementation
 
-When constructing a `ProbeResponse` or `StreamResponse`, the node:
-
-1. Signs the security-relevant fields with its Ed25519 iroh key (existing behavior, used for wire authentication).
-2. Signs the same fields with its Ethereum private key using EIP-712 typed data (new behavior, used for on-chain evidence).
-3. Includes both signatures in the response.
-
-The Ed25519 signature remains the primary authentication mechanism for the QUIC connection. The secp256k1 `slash_sig` is solely an evidence artifact — it is never used for peer authentication or session establishment.
+When constructing a `ProbeResponse` or `StreamResponse`, the node signs the security-relevant fields with its Ethereum private key using EIP-712 typed data and emits the result as `slash_sig`. Peer authentication is handled separately by the iroh QUIC handshake (against the registered Ed25519 NodeId); `slash_sig` is purely a message-body attribution and evidence artifact and is never used for connection establishment.
 
 #### Alternatives Considered
 
 The signature-scheme alternatives table (RIP-7212, Solidity library, ZK, optimistic) is recorded in [`_history/alternatives-pre-launch.md` § ADR 014 — Slash Signature Scheme](_history/alternatives-pre-launch.md#adr-014--slash-signature-scheme).
 
 > **Note:** [ADR 001](001-network.md#nodeid-ownership-verification) uses direct ed25519 verification (Solidity library, ~500k–1M gas) for node registration ownership proof. This is acceptable because registration is a one-time cost per node lifetime, unlike slash evidence which may be submitted frequently.
-
-> **PoC vs production:** The PoC makes `slash_sig` mandatory on all `ProbeResponse` and `StreamResponse` messages ([ADR 005](005-protocol.md)), ensuring universal on-chain accountability. Production may relax validation semantics (accepting zero-length `slash_sig` as an opt-out) while keeping the field on the wire for postcard compatibility — fully removing the field would require a Tier 3 / ALPN bump per [ADR 013](013-schema-evolution.md). Requesters SHOULD be able to require a non-empty `slash_sig` as a precondition for proceeding with a stream — nodes that refuse receive a reputation penalty ([ADR 008](008-reputation.md)), creating economic pressure toward inclusion without a hard protocol requirement.
 
 ### 2. BLAKE3 Content Corruption — Optimistic Challenge-Response
 
@@ -287,7 +272,7 @@ All challenge types MUST validate evidence age using a skew-safe comparison. Let
 | `counterChallenge` (corruption) | ~40k | Evidence verification + storage update |
 | `resolveChallenge` | ~80k | `StakingRegistry.slash()` + bond transfer + state cleanup |
 
-The dual-key approach reduces per-signature verification from ~500k (Ed25519 library) to ~3k (`ecrecover`), making routine slashing economically viable.
+Using secp256k1 EIP-712 for `slash_sig` keeps per-signature verification at ~3k gas via `ecrecover`, against the ~500k–1M gas a Solidity Ed25519 library would require — making routine slashing economically viable.
 
 ### 4. Integration with Existing Contracts
 
@@ -310,15 +295,16 @@ The dual-key approach reduces per-signature verification from ~500k (Ed25519 lib
 
 - All four slashable offenses now have a concrete, gas-efficient on-chain evidence path. Slashing is no longer aspirational.
 - `ecrecover` at 3,000 gas per signature is 100–300× cheaper than a Solidity Ed25519 library, making routine slashing economically viable even for small offenses.
-- The dual-key approach reuses the existing NodeId-to-Ethereum-address binding in `StakingRegistry` — no new on-chain registration step.
-- In the PoC, `slash_sig` is mandatory, ensuring all delivery interactions are on-chain slashable. Production may relax validation semantics (accepting zero-length `slash_sig` as opt-out) while keeping the field on the wire; messages with empty `slash_sig` fall back to reputation penalties. Fully removing the field requires a Tier 3 / ALPN bump.
+- `slash_sig` reuses the existing NodeId-to-Ethereum-address binding in `StakingRegistry` — no new on-chain registration step.
+- `slash_sig` is mandatory and non-empty on every `ProbeResponse` and `StreamResponse`. Universal on-chain accountability is the protocol's single stance — there is no opt-out and no validation-mode difference between PoC and production for this field.
 - The unified `SlashJudge` contract provides a single audit surface for all slashing logic.
 - The PoC corruption path (single-round optimistic) is simple to implement and audit. The production upgrade path (interactive Merkle proof) is designed but deferred.
 
 **Negative:**
 
-- Nodes must perform two signatures per protocol message (Ed25519 + secp256k1). The secp256k1 signature adds ~1ms of computation per message — negligible relative to network RTT, but nonzero.
-- The `slash_sig` field adds ~65 bytes per `ProbeResponse` and `StreamResponse`. For probe messages this is a ~50% size increase; for stream responses preceding multi-MB deliveries, it is negligible.
+- Nodes perform a secp256k1 EIP-712 signature on every `ProbeResponse` and `StreamResponse`, adding ~1ms of computation per message — negligible relative to network RTT, but nonzero.
+- The `slash_sig` field adds ~65 bytes per `ProbeResponse` and `StreamResponse`. For probe messages this is meaningful overhead; for stream responses preceding multi-MB deliveries, it is negligible.
+- Off-chain verifiers (clients, requesting nodes, watchtowers) must `ecrecover` and look up `StakingRegistry.nodeIdOf(recovered)` to attribute a message to a NodeId, rather than verifying directly against the iroh key. The binding cache is already maintained by these parties for `clientStakeOf` and voucher attribution, so the marginal cost is one extra map lookup per verification.
 - The PoC corruption path relies on the bond as the primary deterrent against frivolous challenges, rather than cryptographic proof. A well-funded attacker could submit many spurious challenges (100 TOKEN each) to force nodes into counter-evidence responses. Mitigation: the bond is forfeited on failed challenges, making sustained attacks expensive.
 - The production Merkle proof path requires a future mechanism to bind keccak256 Merkle roots to BLAKE3 hashes — deferred to a follow-up ADR.
 - Cross-contract replay is prevented by per-contract EIP-712 domains, but implementers must ensure domain separators are correctly configured at deployment.
@@ -327,6 +313,6 @@ The dual-key approach reduces per-signature verification from ~500k (Ed25519 lib
 
 - **[ADR 002](002-content-addressing.md):** Open question on on-chain verification mechanism → resolved (this ADR).
 - **[ADR 003](003-payments.md):** Options A/B/C for corruption evidence → resolved as Option A (optimistic challenge-response).
-- **[ADR 005](005-protocol.md):** Signer binding section updated to reference dual signatures; `slash_sig` field added to `ProbeResponse` and `StreamResponse`.
-- **[ADR 011](011-content-takedown.md):** Ed25519-library assumption for slash evidence → updated to dual-key `ecrecover` scheme (this ADR).
+- **[ADR 005](005-protocol.md):** Signer binding section reframed around `slash_sig` only; the prior Ed25519 message-body signature is removed and `slash_sig` becomes the sole `ProbeResponse`/`StreamResponse` body signature.
+- **[ADR 011](011-content-takedown.md):** Ed25519-library assumption for slash evidence → updated to `ecrecover`-based `slash_sig` scheme (this ADR).
 - **[ADR 027](027-distinct-client-receipts.md):** Extends the keccak256 Merkle-batch pattern from §2 to anchor `DeliveryReceipt` batches per operator per epoch; reuses the `Bond Handling` model for receipt-fraud challenges.
