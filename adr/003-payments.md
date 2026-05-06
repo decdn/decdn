@@ -315,8 +315,9 @@ struct Channel {
     uint256 openedAt;
     uint256 expiresAt;
     uint8   status;           // 0 = Open, 1 = Closing (dispute window active), 2 = Closed (settled)
-    uint256 disputeDeadline;  // set when close is initiated
+    uint256 disputeDeadline;  // set when close is initiated; may be extended once via the forced-inclusion path (see § L2 sequencer censorship)
     address lastDisputor;     // msg.sender of the most recent disputeChannel call
+    bool    extended;         // true if disputeDeadline has been extended once via the forced-inclusion path; reset to false on closeChannel
 }
 ```
 
@@ -370,11 +371,11 @@ A malicious closer (or colluding sequencer) submits `closeChannel` with a stale 
 
 **Mitigation — layered defense.** The dispute window default is **48 hours** (172800 seconds), which guarantees at least 24 hours of effective dispute response time on any L2 with a forced-inclusion delay ≤ 24 hours. The setting is L2-agnostic and stays within the [ADR 009](009-governance.md) governance bounds (12h–72h).
 
-On top of that baseline, `disputeChannel` implements a **forced-inclusion deadline extension**: if a `disputeChannel` transaction arrives via L1 forced inclusion and the remaining dispute time is less than 24 hours, `disputeDeadline` is set to `block.timestamp + 24 hours` — guaranteeing 24 hours of dispute time from the moment the forced-inclusion transaction is processed.
+On top of that baseline, `disputeChannel` implements a **forced-inclusion deadline extension**: if a `disputeChannel` transaction arrives via L1 forced inclusion, the remaining dispute time is less than 24 hours, and `channel.extended == false`, `disputeDeadline` is set to `block.timestamp + 24 hours` and `channel.extended` is set to `true` — guaranteeing 24 hours of dispute time from the moment the forced-inclusion transaction is processed. `closeChannel` resets `channel.extended` to `false` so a new close cycle starts fresh.
 
 Constraints on the extension mechanism:
 
-- **One extension per close.** A second forced-inclusion dispute on the same channel does not trigger a further extension. This bounds worst-case settlement delay to `disputeWindow + 24h`.
+- **One extension per close.** Enforced on-chain by the `channel.extended` flag: once set, subsequent forced-inclusion `disputeChannel` calls do not trigger a further extension. This bounds worst-case settlement delay to `disputeWindow + 24h`.
 - **Only forced-inclusion transactions.** Normal sequencer-included `disputeChannel` calls do not trigger the extension, preventing abuse.
 - **L2-specific detection.** Identifying a forced-inclusion transaction is L2-specific. On Arbitrum, this can be detected via `ArbSys` precompile or delayed-inbox origin; on OP Stack, via L1 message origin. Exact detection logic is finalized at L2 selection — see [Appendix: L2 Deployment](appendix-l2-deployment.md).
 - **Governance must not set the dispute window below the L2's maximum forced-inclusion delay.** On an L2 with ~24h forced inclusion the 12h governance floor is not safe — the extension never executes because `settleChannel` becomes callable before the forced-inclusion `disputeChannel` arrives. The 12h floor remains as a hardcoded safety bound for L2s with shorter forced-inclusion paths.

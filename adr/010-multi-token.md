@@ -129,8 +129,9 @@ struct Channel {
     uint256 openedAt;
     uint256 expiresAt;
     uint8   status;           // 0 = Open, 1 = Closing (dispute window active), 2 = Closed (settled)
-    uint256 disputeDeadline;  // set when close is initiated
+    uint256 disputeDeadline;  // set when close is initiated; may be extended once via the forced-inclusion path ([ADR 003 § L2 sequencer censorship](003-payments.md#l2-sequencer-censorship))
     address lastDisputor;     // msg.sender of the most recent disputeChannel call
+    bool    extended;         // true if disputeDeadline has been extended once via the forced-inclusion path; reset to false on closeChannel
 }
 ```
 

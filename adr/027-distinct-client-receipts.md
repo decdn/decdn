@@ -157,7 +157,7 @@ A challenger investigating an operator's epoch performs:
 
 #### Bond model
 
-Receipt-fraud challenges use the existing `SlashJudge` bond mechanism from [ADR 014 Bond Handling](014-on-chain-verification.md). Successful challenges award the bond back plus a configurable receipt-fraud reward sourced from the forfeited gauge payout (size governed per §7); unsuccessful challenges forfeit the bond per the standard 50%-burn / 50%-to-operator rule. No new on-chain role is introduced — the challenge type is added alongside `SlashJudge`'s existing phantom / rate / blacklist / corruption types.
+Receipt-fraud challenges use the existing `SlashJudge` bond mechanism from [ADR 014 Bond Handling](014-on-chain-verification.md). Successful challenges award the bond back plus a receipt-fraud reward; unsuccessful challenges forfeit the bond per the standard 50%-burn / 50%-to-operator rule. The reward is a parameter on the receipt-fraud challenge handler (deployed alongside `SlashJudge`'s existing phantom / rate / blacklist / corruption types) governable per [ADR 009](009-governance.md); a concrete default and bounds are not yet specified in this ADR and will be pinned with the handler. No new on-chain role is introduced.
 
 #### Separation from the operator
 

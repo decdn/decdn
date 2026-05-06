@@ -38,7 +38,7 @@ When an operator commits an `EpochReceiptSummary` via `FeeRouter.commitEpochSumm
 - Identity-diversity rules (funded-channel minimum, funding-age, per-operator cooldown, funding-source diversity).
 - Heuristic flags for self-routed traffic patterns (operator-as-client overlap, funder clustering, settlement-cadence anomalies).
 
-If any check fails, the detector submits `ChallengeReceiptSummary` with the standard bond ([ADR 014 Bond Handling](014-on-chain-verification.md)). On a successful challenge, the operator's `claimedDistinctClients` is zeroed for the epoch and the detector receives back its bond plus a challenger reward sourced from the forfeited gauge payout (size governed per [ADR 027 §7](027-distinct-client-receipts.md)). On a dismissed challenge, the bond is forfeit per the standard 50% burn / 50% to operator rule ([ADR 014](014-on-chain-verification.md)).
+If any check fails, the detector submits `ChallengeReceiptSummary` with the standard bond ([ADR 014 Bond Handling](014-on-chain-verification.md)). On a successful challenge, the operator's `claimedDistinctClients` is zeroed for the epoch and the detector receives back its bond plus a challenger reward (parameter on the receipt-fraud challenge handler, governable per [ADR 009](009-governance.md); see [ADR 027 §5 Bond model](027-distinct-client-receipts.md#bond-model)). On a dismissed challenge, the bond is forfeit per the standard 50% burn / 50% to operator rule ([ADR 014](014-on-chain-verification.md)).
 
 ### Heuristics are a tool, not a protocol input
 
