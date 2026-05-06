@@ -25,7 +25,7 @@ graph TD
         REG_ETC["cdn/region/.../v1"]
     end
 
-    NA["NodeAnnounce<br/>{region, load, popular_hashes}"]
+    NA["NodeAnnounce<br/>{region, load}"]
 
     NA -->|all staked nodes publish| GLOBAL
     NA -->|regional nodes publish| REG_US
@@ -55,7 +55,6 @@ struct NodeAnnounce {
     node_id: NodeId,
     region: String,              // ISO 3166-1 alpha-2 (self-reported)
     load: LoadHint,              // approximate current utilization
-    popular_hashes: Vec<Hash>,   // top-N most-requested hashes (max 20, unique)
     timestamp_us: u64,           // microseconds since epoch
     signature: Signature,        // node's iroh key signs all fields above
 }
@@ -72,7 +71,7 @@ The struct above is shown as a flat definition for readability. For implementati
 
 `LoadHint` is advisory and untrusted. The reputation system ([ADR 008](008-reputation.md)) penalizes nodes whose observed delivery performance contradicts their advertised load.
 
-- **`NodeAnnounce` carries node-level metadata only** — no content inventory. `popular_hashes` (capped at 20) is a popularity signal for prefetching, not a content catalog. Message size is ~800 bytes worst case.
+- **`NodeAnnounce` carries node-level metadata only** — no content inventory and no demand signals. Content discovery and demand are derived from DHT FIND_VALUE traffic and local cache-miss timestamps (see Prefetch Triggers below). Message size is ~150 bytes.
 - **`LoadHint`** makes the "approximate load in gossip announcements" from [ADR 008, Tie-Breaking](008-reputation.md#9-tie-breaking) concrete, feeding tie-breaking logic.
 - **Announce interval** is a per-node configuration parameter (PoC default 60 seconds). This interval directly governs gossip bandwidth — see [Gossip Bandwidth Analysis](#gossip-bandwidth-analysis) below.
 
@@ -84,7 +83,7 @@ Nodes maintain a local cache of the on-chain registry, kept fresh by subscribing
 
 ##### Gossip validation
 
-Gossip messages arrive wrapped in a `GossipEnvelope` ([ADR 013](013-schema-evolution.md)). The receiver deserializes the envelope first; messages with unknown envelope versions or unknown payload variants are silently dropped. Validation rules below apply to the inner payload after envelope unwrapping. Before accepting a `NodeAnnounce` and updating the peer table, a node verifies: (1) the `signature` is valid for the `node_id`'s public key over the signed body fields (serialized via postcard, consistent with [ADR 005](005-protocol.md) and [ADR 013](013-schema-evolution.md)); (2) the `node_id` corresponds to an active staked node in the on-chain registry (checked against a local registry cache); (3) `timestamp_us` is within ±60 seconds of the receiver's local clock (prevents replay of old messages; the 60-second window accommodates clock skew between nodes — see Clock synchronization below); (4) `timestamp_us` is strictly greater than the `timestamp_us` of the existing peer table entry for the same `node_id` (monotonic — prevents replay of older messages within the freshness window). Messages failing any check are silently dropped. Additionally: (5) `region` is exactly 2 ASCII uppercase letters matching a known ISO 3166-1 alpha-2 code set. Messages with invalid region values are dropped. (6) `popular_hashes` contains no duplicate entries. This prevents unregistered, unstaked, or replayed nodes from appearing in or corrupting peer tables.
+Gossip messages arrive wrapped in a `GossipEnvelope` ([ADR 013](013-schema-evolution.md)). The receiver deserializes the envelope first; messages with unknown envelope versions or unknown payload variants are silently dropped. Validation rules below apply to the inner payload after envelope unwrapping. Before accepting a `NodeAnnounce` and updating the peer table, a node verifies: (1) the `signature` is valid for the `node_id`'s public key over the signed body fields (serialized via postcard, consistent with [ADR 005](005-protocol.md) and [ADR 013](013-schema-evolution.md)); (2) the `node_id` corresponds to an active staked node in the on-chain registry (checked against a local registry cache); (3) `timestamp_us` is within ±60 seconds of the receiver's local clock (prevents replay of old messages; the 60-second window accommodates clock skew between nodes — see Clock synchronization below); (4) `timestamp_us` is strictly greater than the `timestamp_us` of the existing peer table entry for the same `node_id` (monotonic — prevents replay of older messages within the freshness window). Messages failing any check are silently dropped. Additionally: (5) `region` is exactly 2 ASCII uppercase letters matching a known ISO 3166-1 alpha-2 code set. Messages with invalid region values are dropped. This prevents unregistered, unstaked, or replayed nodes from appearing in or corrupting peer tables.
 
 **Gossip deduplication:** iroh-gossip uses PlumTree (epidemic broadcast trees) for message dissemination, which performs message-level deduplication internally — each gossip message is assigned a unique identifier and nodes track a bounded in-memory set of seen message IDs, so the same message arriving via multiple epidemic broadcast paths is delivered to the application at most once while its ID remains in that seen-set. This is not a global or persistent exactly-once guarantee: duplicates may be re-delivered after seen-set eviction or process restart. This transport-layer dedup is the primary mechanism that prevents redundant processing of `NodeAnnounce` messages in a multi-path gossip topology. As defense-in-depth, gossip validation rule (4) above (monotonic `timestamp_us` per `node_id`) independently rejects any duplicate or older `NodeAnnounce` — even if transport-level dedup were bypassed (e.g., after a restart), a replayed message would fail the strictly-greater timestamp check against the peer table. The peer table itself (`NodeId → NodeAnnounce`) acts as a natural dedup structure: keyed by `node_id` with only the latest timestamp retained, it is inherently convergent regardless of message delivery order or multiplicity. No application-level seen-message set or content-hash table is required at the gossip layer. See also [ADR 008, Section 6](008-reputation.md#6-gossip-protocol) for deduplication of `ReputationReport` messages on the `cdn/reputation/v1` topic.
 
@@ -206,15 +205,11 @@ For new nodes with the initial reputation of 0.5 ([ADR 008](008-reputation.md)),
 
 This score is used in Content Discovery step 4 above and in all other node selection contexts. The simpler `rate_per_mb × rtt_ms` product is the price×latency component; the full selection algorithm adds reputation weighting as shown above.
 
-#### Prefetching with Dual Signals
+#### Prefetching from Local Demand
 
-Two complementary signals drive proactive caching:
+Each node tracks cache miss timestamps per hash in a bounded map (`HashMap<Hash, VecDeque<u64>>`, max 10,000 entries, LRU eviction). Each miss appends a timestamp; entries older than 5 minutes are pruned on access. Appending a miss timestamp refreshes the entry's LRU position. When a hash crosses a configurable threshold (default: 3 misses in 5 minutes), the node proactively pulls the blob via DHT FIND_VALUE → probe → `cdn/client/v1` path (see [ADR 022](022-content-discovery.md)).
 
-**Local demand signal:** Each node tracks cache miss timestamps per hash in a bounded map (`HashMap<Hash, VecDeque<u64>>`, max 10,000 entries, LRU eviction). Each miss appends a timestamp; entries older than 5 minutes are pruned on access. Appending a miss timestamp refreshes the entry's LRU position. When a hash crosses a configurable threshold (default: 3 misses in 5 minutes), the node proactively pulls the blob via DHT FIND_VALUE → probe → `cdn/client/v1` path (see [ADR 022](022-content-discovery.md)).
-
-**Network popularity signal:** Nodes observe which hashes appear in `popular_hashes` across multiple `NodeAnnounce` messages from different peers. A hash appearing in N peers' top-20 lists suggests cross-region demand. Tracked by storing the announcing peer's NodeId and announcement timestamp for each hash; entries older than the window are pruned on access. Threshold is configurable (default: seen in 3+ peers' popular lists within 10 minutes).
-
-Both signals feed the same action: DHT FIND_VALUE → probe → select provider → pull via `cdn/client/v1` (paid). PoC implements both signals with conservative (high) thresholds.
+The signal feeds the same action as a regular cache miss: DHT FIND_VALUE → probe → select provider → pull via `cdn/client/v1` (paid). PoC uses a conservative (high) threshold.
 
 - **DHT-primary discovery (all scales).** `cdn/dht/v1` is the primary content discovery mechanism from PoC onward. At PoC scale (30 nodes), FIND_VALUE resolves in 1–2 hops. A DHT miss followed by an empty on-chain origin-directory lookup definitively means no registered node holds the blob. See [ADR 022](022-content-discovery.md) for the full discovery flow.
 
@@ -250,7 +245,6 @@ This schedule is tuned for PoC with a single RPC endpoint. Production deployment
 
 - Cold cache miss adds up to 500ms latency (probe maximum wait) compared to a pre-built content index lookup; mitigated by probe cache for repeated lookups within 15 seconds and by adaptive early exit (see Collect step above) which reduces P50 latency to ~50-100ms once the node has sufficient score history
 - Probe cache introduces a brief staleness window (up to 15s) where a node may attempt to pull from a provider that has evicted the blob; mitigated by the probe-triggered eviction hold ([ADR 005](005-protocol.md#probe-triggered-eviction-hold)), with fallback to the next cached provider, then a fresh DHT lookup + probe
-- `popular_hashes` in `NodeAnnounce` explicitly gossips which blobs are in high demand — a new, compactly gossiped signal distinct from content availability (which is now only probe-discoverable)
 - Self-reported region hints (ISO 3166-1 alpha-2) are unverified; a node could misreport its region to appear in more gossip topics. Mitigation: clients apply a reputation penalty when observed latency contradicts the claimed region (e.g., RTT > 150ms to a node in the same claimed region). Cryptographic hardening via an IP-geolocation oracle or third-party attestation is tracked as future work; the latency-based signal is the working mitigation either way.
 - Every transfer is paid, so nodes pulling content on cache miss incur a cost that must be recouped through subsequent client deliveries; this creates a natural economic barrier to speculative caching
 - Origin-backed nodes become the last line of defense for content availability — if all authorized origins for a given blob go offline or are deregistered, the content becomes permanently unavailable (unless cached elsewhere). For content in registered namespaces, the `OriginAssignment` minimum-redundancy invariant ([ADR 009](009-governance.md), [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority)) ensures activated assignments always include at least the configured floor (default 3) of authorized origins, raising the bar for total loss. For default-open content (`namespaceId == 0`), the DAO-maintained default-open allow-list ([ADR 011 § Default-open allow-list](011-content-takedown.md#default-open-allow-list)) enforces its own redundancy floor (default 10) — materially higher than the registered floor because one approved operator may serve any default-open hash. During the bootstrap window before the allow-list is first activated, the prior permissive behaviour applies: any staked operator may serve as origin and the failure mode is total loss of every operator that ever cached the blob.

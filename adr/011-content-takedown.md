@@ -308,11 +308,11 @@ On startup, nodes always fetch the full current blacklist (global + their region
 
 When a node receives a new blacklisted hash, it must, **in order**:
 
-1. **Stop announcing** — omit the hash from `popular_hashes` in all future `NodeAnnounce` gossip messages immediately
+1. **Stop publishing** — withdraw any DHT STORE records for the hash and stop re-publishing immediately ([ADR 022](022-content-discovery.md))
 2. **Stop serving** — reject any new `StreamRequest` for the hash immediately, returning `HashBlacklisted`
 3. **Evict from cache** — delete the blob from local storage within the compliance window
 
-The announce-first ordering is critical: announcing content that is then not delivered triggers the phantom-blob detection path ([ADR 005 — `cdn/probe/v1`](005-protocol.md#cdnprobev1--latency-probe)). Eviction from disk can be async; announcement suppression must be synchronous.
+The publish-first ordering is critical: continuing to publish DHT records and probe-respond `has_blob: true` after the compliance window triggers phantom-blob slashing ([ADR 005 — `cdn/probe/v1`](005-protocol.md#cdnprobev1--latency-probe)). Eviction from disk can be async; DHT-record suppression and probe-response suppression must be synchronous.
 
 When a node receives a blacklisted origin address, it additionally stops accepting any `StreamRequest` that presents a channel funded by that operator address, and removes all of that origin's NodeIds from its local peer table.
 
@@ -413,7 +413,7 @@ The minimum viable process for PoC:
 
 ## ADRs Affected
 
-- **[ADR 001](001-network.md)** (Network Topology) — `NodeAnnounce` must suppress blacklisted hashes from `popular_hashes`; blacklisted origin NodeIds are excluded from peer tables; `StreamError::HashBlacklisted`, `StreamError::OriginBlacklisted`, and `StreamError::UnauthorizedOrigin` are new error variants; the unconditional permissionless-origin claim in the consequences section is amended to reflect DAO-gated origin role
+- **[ADR 001](001-network.md)** (Network Topology) — blacklisted origin NodeIds are excluded from peer tables; `StreamError::HashBlacklisted`, `StreamError::OriginBlacklisted`, and `StreamError::UnauthorizedOrigin` are new error variants; the unconditional permissionless-origin claim in the consequences section is amended to reflect DAO-gated origin role
 - **[ADR 002](002-content-addressing.md)** (Content Addressing) — content-addressed blobs can be removed from the network layer even though the hash remains valid; this is explicitly accepted. The [Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces) section in ADR 002 defines the primitives this ADR's `OriginAssignment` mechanism builds on
 - **[ADR 003](003-payments.md)** (Payments) — multi-origin redundancy is now DAO-supervised via the `OriginAssignment` minimum-redundancy invariant rather than off-protocol content-owner coordination
 - **[ADR 005](005-protocol.md#cdnprobev1--latency-probe)** (Protocol) — origin status is *not* signaled at probe time; the wire response describes only "I have the bytes." Origin authorization is queried off-chain via `OriginAssignment.getOrigins(namespaceId)` for routing/discovery; the protocol does not slash for impersonating origin status because no claim is made on the wire

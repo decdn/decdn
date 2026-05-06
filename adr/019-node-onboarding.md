@@ -165,7 +165,6 @@ NodeAnnounce {
     node_id:        <iroh NodeId>,
     region:         <ISO 3166-1 alpha-2, e.g. "DE">,
     load:           LoadHint { active_streams: 0, bandwidth_utilization: 0 },
-    popular_hashes: vec![],   // empty until content is cached
     timestamp_us:   <current unix microseconds>,
     signature:      <ed25519 over NodeAnnounceBody via postcard>,
 }
