@@ -1927,6 +1927,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "decdn-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "decdn-cache",
+ "decdn-common",
+ "decdn-gossip",
+ "decdn-node",
+ "decdn-protocol",
+ "iroh",
+ "jsonrpsee",
+ "rand 0.10.1",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "decdn-common"
 version = "0.1.0"
 dependencies = [

@@ -10,7 +10,7 @@ use jsonrpsee::core::client::Error as JsonRpcClientError;
 use jsonrpsee::http_client::HttpClientBuilder;
 use serde::Deserialize;
 
-use crate::admin::{
+use decdn_common::admin::{
     AdminRpcClient, AnnounceResponse, DrainResponse, EvictRequest, EvictResponse, HealthResponse,
     PeerView, PeersResponse, ReloadResponse,
 };
@@ -833,7 +833,7 @@ mod tests {
     /// evict.
     #[test]
     fn write_dry_run_human_emits_all_fields() -> anyhow::Result<()> {
-        use crate::admin::EvictPreview;
+        use decdn_common::admin::EvictPreview;
         let resp = EvictResponse {
             was_present: true,
             dry_run: true,
@@ -869,7 +869,7 @@ mod tests {
     /// record" from "the record is at the floor".
     #[test]
     fn write_dry_run_human_uses_sentinels_for_absent_fields() -> anyhow::Result<()> {
-        use crate::admin::EvictPreview;
+        use decdn_common::admin::EvictPreview;
         let resp = EvictResponse {
             was_present: false,
             dry_run: true,

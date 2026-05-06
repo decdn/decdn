@@ -9,9 +9,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use decdn_node::cli::{ConfigValidateArgs, RunArgs};
-use decdn_node::commands;
-use decdn_node::config::{
+use decdn_cli::commands::config as commands;
+use decdn_common::cli::{ConfigValidateArgs, RunArgs};
+use decdn_common::config::{
     ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedGossip, ResolvedIdentity,
     ResolvedNetwork, ResolvedObservability, ResolvedPayment, ResolvedSecurity,
 };
@@ -206,8 +206,8 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
         },
         payment: ResolvedPayment { rate_per_mb: 10 },
         observability: ResolvedObservability {
-            log_level: decdn_node::cli::common::LogLevel::Info,
-            log_format: decdn_node::cli::LogFormat::Pretty,
+            log_level: decdn_common::cli::common::LogLevel::Info,
+            log_format: decdn_common::cli::LogFormat::Pretty,
             metrics_port: 9090,
             metrics_bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             admin_port: Some(9191),

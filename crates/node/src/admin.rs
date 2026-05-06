@@ -14,7 +14,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use decdn_cache::{CacheEngine, CacheError};
-use decdn_common::admin::{AdminRpcServer, parse_hash_arg};
+use decdn_common::admin::{
+    AdminRpcServer, AnnounceResponse, CACHE_ERROR_CODE, CONFIG_PATH_UNSET_CODE, DrainResponse,
+    EvictPreview, EvictRequest, EvictResponse, HealthResponse, PUBLISHER_DISABLED_CODE, PeerView,
+    PeersResponse, RELOAD_ERROR_CODE, ReloadResponse, parse_hash_arg,
+};
 use decdn_gossip::{AnnounceTrigger, PeerEntry, PeerTable};
 use jsonrpsee::core::{RpcResult, async_trait};
 use jsonrpsee::server::{Server, ServerConfig};
@@ -22,18 +26,10 @@ use jsonrpsee::types::ErrorObjectOwned;
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, RwLock, oneshot};
 
-// Re-export wire types so tests and downstream tools that currently
-// reach `decdn_node::admin::{AdminRpcClient, PeerView, ...}` keep
-// compiling. Both the old `decdn_node::admin::*` paths and the new
-// canonical `decdn_common::admin::*` paths resolve to the same types.
-// These re-exports are removed in the commit that completes the slim
-// of the node crate; by then the only client-side caller (the user
-// CLI) imports from `decdn_common::admin` directly.
-pub use decdn_common::admin::{
-    AdminRpcClient, AnnounceResponse, CACHE_ERROR_CODE, CONFIG_PATH_UNSET_CODE, DrainResponse,
-    EvictPreview, EvictRequest, EvictResponse, HealthResponse, INVALID_PARAMS_CODE,
-    PUBLISHER_DISABLED_CODE, PeerView, PeersResponse, RELOAD_ERROR_CODE, ReloadResponse,
-};
+// Wire types live in `decdn_common::admin`. We import the server-side
+// trait, the request DTO, and the few error codes the server impl
+// raises — clients reach the response DTOs through `decdn_common`
+// directly.
 
 use crate::runtime::RuntimeReloadState;
 

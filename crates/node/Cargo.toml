@@ -7,7 +7,7 @@ rust-version.workspace = true
 description = "CLI entry point and runtime wiring for a deCDN node"
 
 [[bin]]
-name = "decdn"
+name = "decdn-node"
 path = "src/main.rs"
 
 [features]
