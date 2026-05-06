@@ -330,7 +330,7 @@ struct Channel {
 | Lifecycle | `topUp(channelId, additionalDeposit)` | Client-only: add funds to an open channel (does not extend `expiresAt`). |
 | Lifecycle | `closeChannel(channelId, amount, nonce, bytesDelivered, signature)` | Client or provider: initiate close with the latest voucher; starts dispute window. |
 | Lifecycle | `disputeChannel(channelId, amount, nonce, bytesDelivered, signature)` | Any address: submit a higher-nonce voucher during the dispute window. |
-| Lifecycle | `settleChannel(channelId)` | Post-dispute-window: forward `claimedAmount` USDC + stored receipt root to `FeeRouter`; refund unused deposit. |
+| Lifecycle | `settleChannel(channelId)` | Post-dispute-window: forward `claimedAmount` USDC to `FeeRouter`; refund unused deposit. |
 | Lifecycle | `reclaimExpired(channelId)` | Client or provider: refund full deposit on an expired channel that was never closed. |
 | View | `getChannel(channelId) → Channel` | Read the on-chain `Channel` struct. |
 | View | `getRateBounds() → (floor, ceiling)` | Current `RateBounds` in token base units. |
