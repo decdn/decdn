@@ -21,6 +21,19 @@ SemVer applies once the first tag (`v0.1.0`) is cut.
 Pre-release development — no versioned tag yet. Entries below track state
 since project inception and will roll into the first tagged release.
 
+### Changed (BREAKING)
+
+- **CLI** Split into two binaries (#421). The daemon is now
+  `decdn-node` (single subcommand: `decdn-node run [--config <path>]`);
+  `decdn run` no longer exists. The user CLI is `decdn` and gains
+  `node {peers,health,announce,drain,evict,reload}`, `key-gen`,
+  `config {init,validate}`, `probe` — all moved from the old fused
+  binary, no behaviour changes. Container image entrypoint becomes
+  `decdn-node`. Release archives ship two tarballs per target:
+  `decdn-node-${VERSION}-${TARGET}.tar.gz` (operators) and
+  `decdn-${VERSION}-${TARGET}.tar.gz` (publishers). See
+  [`adr/appendix-binaries.md`](adr/appendix-binaries.md).
+
 ### Added
 
 #### Node runtime & wire protocol
@@ -73,7 +86,7 @@ since project inception and will roll into the first tagged release.
 
 #### CLI
 
-- `decdn run` — run the node.
+- `decdn-node run` — run the daemon.
 - `decdn config init` / `decdn config validate` (#229).
 - `decdn key-gen` — Ed25519 node key + Ethereum keystore.
 - `decdn probe` — one-shot latency probe over `cdn/probe/v1`.

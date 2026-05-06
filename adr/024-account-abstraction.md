@@ -190,7 +190,7 @@ The following Safe infrastructure is already deployed on the testnet sibling of 
 **Negative:**
 
 - PoC hot-signing parties (nodes, clients) use 1-of-1 Safes (or EOAs). Multisig protection of the high-frequency signing path is deferred to Production; 2-of-3 is only viable on the infrequent stake/withdraw/channel-open paths for parties comfortable with that split.
-- Safe wallet setup is more complex than generating an EOA. Operator tooling (`decdn-node setup`) must guide Safe creation and, in Production, Safe-7579 adapter installation + `enableSession`.
+- Safe wallet setup is more complex than generating an EOA. Operator tooling (`decdn setup`) must guide Safe creation and, in Production, Safe-7579 adapter installation + `enableSession`.
 - Off-chain ERC-1271 verification requires an RPC call to the L2, adding latency at client binding time (~100–200ms). One-time per connection — acceptable.
 - Gas overhead for smart account signature verification is higher than pure `ecrecover` (+10–15k gas per verification). Applies only to on-chain operations (channel close/dispute, slash submission), not the high-frequency off-chain signing path.
 - Production rollout requires coordinated migration to Safe-7579 + smartsessions on every participating wallet; operators running on the PoC path must rotate to the new account type as part of the cutover.

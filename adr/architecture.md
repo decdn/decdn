@@ -275,9 +275,12 @@ flowchart TD
 decdn/
 ├── Cargo.toml                    # workspace root
 ├── crates/
-│   ├── node/                     # Binary — CLI entry, config, wiring
+│   ├── node/                     # Binary `decdn-node` — daemon entry, runtime, handlers
+│   ├── cli/                      # Binary `decdn` — user-facing CLI (probe, node admin, key-gen, config)
+│   ├── common/                   # Shared types: config schema, identity, admin RPC trait + DTOs
 │   ├── protocol/                 # Shared types, wire format, messages
 │   ├── cache/                    # Cache engine wrapping iroh-blobs + origin pull
+│   ├── gossip/                   # NodeAnnounce pub/sub over iroh-gossip
 │   ├── incentive/                # Payment channels, staking, vouchers
 │   ├── reputation/               # Gossip-based reputation system
 │   └── contracts/                # Solidity contracts + Foundry
@@ -287,6 +290,19 @@ decdn/
 # Content providers build it using their own stack. A reference implementation
 # may be provided as a separate repository.
 ```
+
+### Binaries
+
+The workspace produces two binaries that pair like `dockerd` + `docker`:
+
+| Binary | Role | Crate | Listens on |
+|---|---|---|---|
+| `decdn-node` | Daemon — caches, serves, peers, gossips. Single subcommand: `decdn-node run [--config <path>]`. | `crates/node` | QUIC `:4433`, metrics `127.0.0.1:9090`, admin loopback `127.0.0.1:9191` |
+| `decdn` | User CLI — `probe`, `node {peers,health,announce,drain,evict,reload}`, `key-gen`, `config {init,validate}`, plus future `pull`, `bundle …`, `fetch`, `publish`, `channel`, `wallet`. | `crates/cli` | nothing (outbound only; `node` admin commands use the daemon's loopback HTTP per ADR 025 appendix) |
+
+The container image ships `decdn-node` only. CLI users grab the
+`decdn-${VERSION}-${TARGET}.tar.gz` release archive. See
+[appendix-binaries.md](appendix-binaries.md) for the rationale.
 
 ### Dependency Chain
 
