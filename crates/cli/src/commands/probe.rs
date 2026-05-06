@@ -140,10 +140,21 @@ fn print_probe_response(
         |pk| pk.to_string(),
     );
     if json {
-        println!(
-            "{{\"node_id\":\"{node_id}\",\"rate_per_mb\":{},\"measured_at_unix_ms\":{},\"rtt_ms\":{:.3},\"nonce\":\"0x{nonce:016x}\"}}",
-            resp.rate_per_mb, resp.measured_at_unix_ms, rtt_ms,
-        );
+        // Quantize `rtt_ms` to 3 decimals before serialization so the
+        // emitted JSON keeps the same precision the manual format
+        // (`{:.3}`) used to produce — preserves the wire contract for
+        // downstream `--json` consumers. `as_secs_f64()` carries
+        // microsecond-resolution noise past 3 decimals anyway, so the
+        // quantization isn't lossy in any meaningful sense.
+        let rtt_ms_quantized = (rtt_ms * 1000.0).round() / 1000.0;
+        let output = serde_json::json!({
+            "node_id": node_id,
+            "rate_per_mb": resp.rate_per_mb,
+            "measured_at_unix_ms": resp.measured_at_unix_ms,
+            "rtt_ms": rtt_ms_quantized,
+            "nonce": format!("0x{nonce:016x}"),
+        });
+        println!("{output}");
     } else {
         println!("node_id:       {node_id}");
         println!("rate_per_mb:   {} (base units)", resp.rate_per_mb);

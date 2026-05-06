@@ -54,4 +54,11 @@ EXPOSE 4433 9090  # QUIC transport, Prometheus metrics
 # Container ships the daemon only. Operators wanting the user CLI
 # (`decdn pull`, `decdn node …`, `decdn key-gen`) install it from the
 # `decdn-${VERSION}-${TARGET}.tar.gz` release archive.
+#
+# `CMD ["run"]` makes `docker run <image>` start the daemon by default;
+# operators can still override (`docker run <image> --version`,
+# `docker run <image> run --config /etc/decdn/node.toml`, etc.). Without
+# CMD, the daemon-only `decdn-node` binary would print clap usage and
+# exit when invoked with no arguments.
 ENTRYPOINT ["decdn-node"]
+CMD ["run"]
