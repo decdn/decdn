@@ -78,6 +78,14 @@ interface IContentBlacklist {
     function ratifyAppealRemoval(uint256 appealId) external;    // ve-Governor only
     function reverseAppeal(uint256 appealId) external;          // ve-Governor only
 
+    // Permissionless cleanup. Anyone may call to finalize an appeal whose
+    // window has elapsed (multisig silent past BLACKLIST_MULTISIG_REVIEW_WINDOW
+    // or governance silent past BLACKLIST_RATIFICATION_WINDOW), to release a
+    // body's interim-relief slot, refund the bond per § Bond and frequency
+    // caps, and emit BlacklistAppealLapsed. Mirrors the lazy-cleanup pattern
+    // used by pruneBlacklistedAssignment in OriginAssignment.
+    function cleanupExpiredAppeal(uint256 appealId) external;
+
     // Views
     function isBlacklisted(bytes32 blake3Hash) external view returns (bool);
     function isBlacklistedInRegion(bytes32 blake3Hash, string calldata region) external view returns (bool);
@@ -108,9 +116,10 @@ struct BlacklistEntry {
     bool    suspended;        // true while a regional appeal is in interim-relief
                               // or pending ratification; isBlacklisted views return
                               // false during this window. See § Blacklist Entry Appeals.
-    uint256 suspendedAt;      // block timestamp at which suspended last flipped to true;
-                              // used to compute evidence-age windows for slash challenges
-                              // that replay across resumption. 0 if never suspended.
+    uint256 suspendedAtUs;    // microsecond timestamp (block.timestamp * 1_000_000) at which
+                              // suspended last flipped to true. Stored in microseconds to align
+                              // with ADR 014's MAX_EVIDENCE_AGE_US arithmetic so SlashJudge can
+                              // compare without unit conversion. 0 if never suspended.
 }
 ```
 
@@ -142,18 +151,18 @@ Regional bodies operate independently within their scope. A hash blacklisted by 
 
 ## Blacklist Entry Appeals
 
-Regional bodies acting in good faith can still issue entries that are later contested — a wrongly served takedown notice, a regional body that drifts outside its declared jurisdiction, or a notice that misidentifies content. The body-level `suspendRegionalBody` mechanism is the right tool when a body is systemically misbehaving but is the wrong tool for a single disputed entry: it freezes every entry the body has issued, including legitimate ones. This section specifies a per-entry path that mirrors the fast-track + ratification structure used for regional-body suspension and for [ADR 028 § Slashing appeals](028-slashing-appeals.md), narrowed to the content-policy domain.
+Regional bodies acting in good faith can still issue entries that are later contested — a wrongly served takedown notice, a regional body that drifts outside its declared jurisdiction, or a notice that misidentifies content. The body-level `suspendRegionalBody` mechanism is the right tool when a body is systemically misbehaving but is the wrong tool for a single disputed entry: it freezes every entry the body has issued, including legitimate ones. This section specifies a per-entry path that mirrors the fast-track + ratification structure used for regional-body suspension and for [ADR 028](028-slashing-appeals.md), narrowed to the content-policy domain.
 
-The two appeal paths are deliberately decoupled. ADR 028 covers operator-side restitution for slashes incurred during legitimate operational failure. The path defined here covers content-policy challenges to the underlying blacklist entry itself. Operators slashed under an entry that is later removed by this path may seek individual restitution via [ADR 028 § Slashing appeals](028-slashing-appeals.md) — that ADR already lists blacklist offenses as appealable.
+The two appeal paths are deliberately decoupled. ADR 028 covers operator-side restitution for slashes incurred during legitimate operational failure. The path defined here covers content-policy challenges to the underlying blacklist entry itself. Operators slashed under an entry that is later removed by this path may seek individual restitution via [ADR 028](028-slashing-appeals.md) — that ADR already lists blacklist offenses as appealable.
 
 ### Scope
 
-Appellable entries:
+Appellable entries: **regional entries only.** Entries issued via `addHashRegional` carry a non-empty `region` field and are filed against a registered regional body. They are the entries this fast-track was designed to dispute.
 
-- **Regional entries** (primary case). Issued via `addHashRegional`.
-- **Emergency entries** during their live window (secondary). The category-specific auto-expiry from [§ Compliance Window](#compliance-window) is the structural deterrent against indefinite emergency use; the appeal path here addresses disputes during the live window.
+Out of scope for this fast-track:
 
-Global standard-vote entries (`addHash`) are explicitly **not** appellable through this fast-track. They have already passed the full ve-Governor process and re-litigation belongs in a standard governance amendment, not this lighter-weight path. The slow-path override remains available — see [§ Global Override](#global-override) below.
+- **Emergency entries** (`emergencyAdd`, `emergencyAddOrigin`) are global by construction — the interface does not take a `region` parameter — so they cannot be opened via `openBlacklistAppeal`, which reverts on `region == ""`. Emergency entries are bounded by their category-specific auto-expiry from [§ Compliance Window](#compliance-window) (14d for `GENERAL`, 90d for `CSAM` / `TERRORIST`). Disputes against emergency entries route through the slow-path ve-Governor `removeHash` proposal — see [§ Global Override](#global-override). Adding a regional-emergency variant or a separate global-emergency appeal path is left to a future amendment if operational data shows it is needed.
+- **Global standard-vote entries** (`addHash`) are also out of scope. They have already passed the full ve-Governor process and re-litigation belongs in a standard governance amendment, not this lighter-weight path. The slow-path override remains available.
 
 Grounds for appeal:
 
@@ -173,7 +182,7 @@ Any of the following may file an appeal:
 
 Standing is verified at the filing block. An operator who unbonds after filing, or a TOKEN holder who falls below the threshold mid-flow, does not lose standing for an already-open appeal — but cannot file new ones until standing is restored.
 
-**Synthetic-standing clawback.** A TOKEN holder who crosses `APPEAL_FILER_TOKEN_THRESHOLD` only via a flash loan or short-term borrow, files an appeal, and unwinds the position within `STANDING_LOOKBACK_BLOCKS` (default 7,200 blocks ≈ 24 hours on a 12-second L2 block time, fixed) is treated as failing the standing check retroactively. The contract pulls the standing balance check at filing block T and re-checks it at block T + `STANDING_LOOKBACK_BLOCKS`; if the second check shows the filer's balance has dropped below the threshold without a proportional refund of the original loan source, the appeal is closed and the bond is forfeited (100% burned). This guards the filer-standing path without preventing legitimate filers from rebalancing portfolios after filing — the lookback is short and the threshold check is on net balance, not the absence of any outflow. Operator and publisher standing checks are not subject to this clawback (operator stake and namespace ownership are not flash-loanable).
+**Synthetic-standing clawback.** TOKEN-holder standing must be sustained, not just point-in-time. The contract checks the filer's TOKEN balance at the filing block T and again at block `T + STANDING_LOOKBACK_BLOCKS` (default 7,200 blocks ≈ 24 hours on a 12-second L2 block time, fixed). If either check returns a balance below `APPEAL_FILER_TOKEN_THRESHOLD`, the appeal is closed and the bond is forfeited (100% burned). The two-block check is the entire test — the contract does not attempt to identify or trace loan sources, which are not observable on-chain. The trade-off is that legitimate filers must hold the threshold balance unchanged for the 24-hour lookback window before rebalancing; a separate path for filers who need to move TOKEN immediately after filing is not provided. Anyone (including the filer) may invoke `cleanupExpiredAppeal(appealId)` once the second check has failed to finalize the closure and reclaim the body's interim-relief slot. Operator and publisher standing checks are not subject to this clawback — operator stake is unbond-locked under [ADR 026 §7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake), and namespace ownership per [ADR 002](002-content-addressing.md#publisher-identity-and-namespaces) is not flash-loanable.
 
 ### Filing window
 
@@ -181,9 +190,7 @@ Standing is verified at the filing block. An operator who unbonds after filing, 
 | --- | ---: | --- | --- |
 | `BLACKLIST_APPEAL_FILING_WINDOW` | 14 days | `[3d, 30d]` | Shorter than [ADR 028 §5](028-slashing-appeals.md#5-hard-caps-and-frequency-limits)'s 30-day window because content delisting is reversible (the entry can be re-issued) and stakeholder action should be prompt while the disputed content is still relevant. |
 
-For emergency entries, the filing window is `min(remaining auto-expiry, BLACKLIST_APPEAL_FILING_WINDOW)`. Filings past the auto-expiry are moot — the entry has already lapsed by operation of [§ Compliance Window](#compliance-window) — and `openBlacklistAppeal` reverts.
-
-**Auto-expiry during the appeal lifecycle.** Once an appeal is open, the multisig review and ratification windows (each up to 14 days) can in principle outlive the underlying emergency entry's category-specific auto-expiry (14 days for `GENERAL`, 90 days for `CSAM` / `TERRORIST`). When auto-expiry fires while an appeal is open: any active interim-relief is cleared, the bond is refunded to the filer (the entry has lapsed of its own accord — the filer is no worse off than if the appeal had succeeded), and the concurrent-appeal slot is released. Subsequent calls to `ratifyAppealRemoval` or `reverseAppeal` against the terminated appeal revert with `BlacklistAppealAlreadyClosed` (same error as the global-override case in [§ Global Override](#global-override)). The contract emits `BlacklistAppealLapsed`. Implementations check entry liveness inside the ratify / reverse paths rather than scheduling a separate auto-cancel transaction; the lapse is observed lazily on the next governance action against the appeal.
+Regional entries (`addHashRegional`) do not have a category-specific auto-expiry — they persist until removed by governance — so the filing window has a single bound. If the regional body that issued the entry is deregistered or suspended mid-appeal, the appeal continues unaffected: the contested entry remains the on-chain object, and the ve-Governor remains the ratification authority regardless of body status.
 
 ### Authority and flow
 
@@ -223,7 +230,7 @@ sequenceDiagram
     end
 ```
 
-The original `effectiveAt` is preserved across suspension. Resetting `effectiveAt` to `block.timestamp + complianceWindow` on resumption was rejected because it would shield operators who never evicted in the first place — a dishonest operator already past the original compliance window when suspension began would receive a fresh window on resumption, retroactively immunizing pre-suspension delivery. Instead, evidence-age semantics handle the honest-operator case: the `MAX_EVIDENCE_AGE_US` clock from [ADR 014 §2](014-on-chain-verification.md#2-blake3-content-corruption--optimistic-challenge-response) is computed relative to `entry.suspendedAt` rather than the current block while a challenge replays post-resumption, so suspension does not retroactively immunize pre-suspension evidence and does not require challengers to re-witness. Honest operators who continued to serve during suspension (relying on `isBlacklisted == false`) are protected directly: deliveries with timestamps inside the suspension window are not admissible as slash evidence, because the views correctly returned `false` at delivery time. Operators detect resumption via the standard `getBlacklistVersion()` polling cycle (default 10 minutes — see [§ Polling](#polling)).
+The original `effectiveAt` is preserved across suspension. Resetting `effectiveAt` to `block.timestamp + complianceWindow` on resumption was rejected because it would shield operators who never evicted in the first place — a dishonest operator already past the original compliance window when suspension began would receive a fresh window on resumption, retroactively immunizing pre-suspension delivery. Instead, evidence-age semantics handle the honest-operator case: the `MAX_EVIDENCE_AGE_US` clock from [ADR 014 §2](014-on-chain-verification.md#2-blake3-content-corruption--optimistic-challenge-response) is computed relative to `entry.suspendedAtUs` rather than the current block while a challenge replays post-resumption, so suspension does not retroactively immunize pre-suspension evidence and does not require challengers to re-witness. Honest operators who continued to serve during suspension (relying on `isBlacklisted == false`) are protected directly: deliveries with timestamps inside the suspension window are not admissible as slash evidence, because the views correctly returned `false` at delivery time. Operators detect resumption via the standard `getBlacklistVersion()` polling cycle (default 10 minutes — see [§ Polling](#polling)).
 
 ### Bond and frequency caps
 
@@ -264,8 +271,8 @@ While `entry.suspended == true`:
 
 - `isBlacklisted(hash)` and `isBlacklistedInRegion(hash, region)` return `false`. This short-circuits `SlashJudge` per [ADR 014](014-on-chain-verification.md): a blacklist-offense challenge submitted during interim-relief reverts with `BlacklistEntrySuspended`, distinct from `HashNotBlacklisted`, so challengers can distinguish a never-blacklisted hash from a temporarily suspended one.
 - New slash challenges for the disputed hash cannot be opened.
-- Pre-suspension evidence is preserved across resumption. `BlacklistEntry.suspendedAt` records the block timestamp at which fast-track flipped `suspended = true`. On reversal or lapse, `SlashJudge` admits challenges whose `evidence.timestamp_us` falls in the half-open window `[entry.addedAt + complianceWindow, entry.suspendedAt)` for `MAX_EVIDENCE_AGE_US` after resumption — the evidence-age clock is computed relative to `entry.suspendedAt`, not the current block, so a multi-week appeal lifecycle does not retroactively immunize pre-suspension delivery whose evidence would otherwise age past [ADR 014 §2](014-on-chain-verification.md#2-blake3-content-corruption--optimistic-challenge-response)'s 5-day default. Evidence with `timestamp_us ≥ entry.suspendedAt` and `< resumption block` is **not** admissible — the views returned `false` at that delivery time, and operators relying on the suspended view must be protected.
-- Already-resolved slashes against operators for the disputed hash are **not** auto-reversed. Operators in that position seek individual restitution via [ADR 028 § Slashing appeals](028-slashing-appeals.md) using the `slashId` of their original slash. ADR 028 already lists blacklist offenses as appealable; the heightened-scrutiny guidance from [ADR 028 §1](028-slashing-appeals.md#1-scope) for blacklist appeals is somewhat relaxed when the underlying entry has been removed via the path here, since the operational-failure rationale is no longer the only viable defense.
+- Pre-suspension evidence is preserved across resumption. `BlacklistEntry.suspendedAtUs` records the microsecond timestamp (`block.timestamp * 1_000_000`) at which fast-track flipped `suspended = true`. On reversal or lapse, `SlashJudge` admits challenges whose `evidence.timestamp_us` falls in the half-open window `[(entry.addedAt + complianceWindow) * 1_000_000, entry.suspendedAtUs)` for `MAX_EVIDENCE_AGE_US` after resumption — the evidence-age clock is computed as `entry.suspendedAtUs - evidence.timestamp_us`, not `nowUs - evidence.timestamp_us`, so a multi-week appeal lifecycle does not retroactively immunize pre-suspension delivery whose evidence would otherwise age past [ADR 014 §2](014-on-chain-verification.md#2-blake3-content-corruption--optimistic-challenge-response)'s 5-day default. Evidence with `timestamp_us ≥ entry.suspendedAtUs` and predating the resumption block is **not** admissible — the views returned `false` at that delivery time, and operators relying on the suspended view must be protected. All comparisons use the microsecond unit established in [ADR 014 §2](014-on-chain-verification.md#2-blake3-content-corruption--optimistic-challenge-response) (`nowUs = block.timestamp * 1_000_000`).
+- Already-resolved slashes against operators for the disputed hash are **not** auto-reversed. Operators in that position seek individual restitution via [ADR 028](028-slashing-appeals.md) using the `slashId` of their original slash. ADR 028 already lists blacklist offenses as appealable; the heightened-scrutiny guidance from [ADR 028 §1](028-slashing-appeals.md#1-scope) for blacklist appeals is somewhat relaxed when the underlying entry has been removed via the path here, since the operational-failure rationale is no longer the only viable defense.
 
 This decoupling is the explicit boundary between the two ADRs. Removing a wrongful entry going forward (this ADR) does not mechanically refund slashes already taken (ADR 028); the two grievances are filed and bonded separately.
 
@@ -273,16 +280,16 @@ This decoupling is the explicit boundary between the two ADRs. Removing a wrongf
 
 The new entry points are listed in [§ Contract: ContentBlacklist](#contract-contentblacklist) above. Implementation notes:
 
-- `openBlacklistAppeal` reverts if `region == ""` (global entries are out of scope), if the entry is past its `BLACKLIST_APPEAL_FILING_WINDOW`, if the body's concurrent-appeal cap is full, if the filer fails standing checks, or if the filer is on the perjury denylist. Bond is pulled via `TOKEN.transferFrom`; the appeal record is stored and `BlacklistAppealOpened` is emitted.
-- `fastTrackAppeal` / `rejectAppeal` are restricted to the emergency multisig (the same address with the same threshold as the existing `suspendRegionalBody` flow). Sub-mode of [ADR 009 § Emergency Multisig](009-governance.md#emergency-multisig) capability — does not require an additional multisig power.
-- `ratifyAppealRemoval` / `reverseAppeal` are restricted to GOVERNANCE_ROLE (ve-Governor). Ratification calls the contract's internal `_removeHashRegional` and emits both `BlacklistAppealRatified` and the standard `HashRemoved` event. Reversal clears `suspended`, resets `effectiveAt`, and applies the bond split.
+- `openBlacklistAppeal` reverts if `region == ""` (global entries — including emergency entries — are out of scope), if the entry is past its `BLACKLIST_APPEAL_FILING_WINDOW`, if the filer fails standing checks, or if the filer is on the perjury denylist. Filings are not gated by the per-body concurrent-appeal cap — see the next bullet for where the cap applies. Bond is pulled via `TOKEN.transferFrom`; the appeal record is stored and `BlacklistAppealOpened` is emitted.
+- `fastTrackAppeal` / `rejectAppeal` are restricted to the emergency multisig (the same address with the same threshold as the existing `suspendRegionalBody` flow). Sub-mode of [ADR 009 § Emergency Multisig](009-governance.md#emergency-multisig) capability — does not require an additional multisig power. `fastTrackAppeal` reverts if the regional body that issued the contested entry already has `BODY_CONCURRENT_APPEAL_CAP` entries in interim-relief (`entry.suspended == true`); the multisig must wait for one to resolve, or use `rejectAppeal` to triage one of the existing pending appeals first. `rejectAppeal` is not cap-gated.
+- `ratifyAppealRemoval` / `reverseAppeal` are restricted to GOVERNANCE_ROLE (ve-Governor). Ratification calls the contract's internal `_removeHashRegional` and emits both `BlacklistAppealRatified` and the standard `HashRemoved` event. Reversal clears `suspended`, **preserves the original `effectiveAt`** (per [§ Authority and flow](#authority-and-flow) — resetting was rejected to avoid shielding pre-suspension non-compliance), and burns the bond per [§ Bond and frequency caps](#bond-and-frequency-caps).
 - The full ABI (per-appeal storage layout, exact event topics, gas-optimized struct packing) is deferred to a future contract-implementation ADR — same approach as [ADR 028 §6](028-slashing-appeals.md#6-contract-surface).
 
 ### Global Override
 
 The slow-path global override is independent of the appeal flow above. ve-Governor proposals may call `removeHash` (global entries) and `removeHashRegional` (regional entries) directly via the standard timelock, regardless of any open appeal. Both functions are restricted to `GOVERNANCE_ROLE`; this is now explicitly documented as their access control. The slow path is always available for cases that do not fit the fast-track — global standard-vote entries, frequency-capped filers, expired filing windows, or coordinated multi-region disputes that warrant a single ve-Governor decision rather than per-region multisig action.
 
-If `removeHash` or `removeHashRegional` fires while an appeal is open against the same `(blake3Hash, region)` pair, that appeal terminates immediately: any active interim-relief is cleared (`entry.suspended` is moot once the entry is gone), the bond is refunded to the filer (the override achieved the filer's intended outcome), and the body's concurrent-appeal slot under [§ Bond and frequency caps](#bond-and-frequency-caps) is released. Subsequent calls to `ratifyAppealRemoval` or `reverseAppeal` against the terminated appeal revert with `BlacklistAppealAlreadyClosed`. The contract emits `BlacklistAppealLapsed` so off-chain consumers can reconcile.
+If `removeHash` or `removeHashRegional` fires while an appeal is open against the same `(blake3Hash, region)` pair, the appeal is rendered moot. Bond refund and slot release happen lazily — the next call to `ratifyAppealRemoval`, `reverseAppeal`, or the permissionless `cleanupExpiredAppeal(appealId)` (see [§ Contract surface](#contract-surface)) observes that the underlying entry no longer exists, refunds the bond, releases the body's concurrent-appeal slot under [§ Bond and frequency caps](#bond-and-frequency-caps), and emits `BlacklistAppealLapsed`. After cleanup, subsequent calls against the appeal id revert with `BlacklistAppealAlreadyClosed`. The contract does not auto-execute on `removeHash`/`removeHashRegional` because Solidity has no scheduler — the lazy pattern matches `OriginAssignment.pruneBlacklistedAssignment`'s permissionless-cleanup model.
 
 ## Compliance Window
 
@@ -549,7 +556,7 @@ A slash requires an active challenger submitting evidence of a post-window deliv
 
 ### Interaction with appeals
 
-Slash challenges cannot be opened against operators while the disputed entry is in interim-relief (see [§ Blacklist Entry Appeals](#blacklist-entry-appeals)) — `SlashJudge` reads `isBlacklisted == false` from `ContentBlacklist` during the suspension window and rejects the challenge on that basis. Operators slashed under an entry that is *later* removed via the appeals path are not auto-restituted; they may file individually through [ADR 028 § Slashing appeals](028-slashing-appeals.md), which already lists blacklist offenses as appealable. The two paths are filed and bonded separately by design — see [§ Blacklist Entry Appeals — Interaction with active slashes](#interaction-with-active-slashes).
+Slash challenges cannot be opened against operators while the disputed entry is in interim-relief (see [§ Blacklist Entry Appeals](#blacklist-entry-appeals)) — `SlashJudge` reads `isBlacklisted == false` from `ContentBlacklist` during the suspension window and rejects the challenge on that basis. Operators slashed under an entry that is *later* removed via the appeals path are not auto-restituted; they may file individually through [ADR 028](028-slashing-appeals.md), which already lists blacklist offenses as appealable. The two paths are filed and bonded separately by design — see [§ Blacklist Entry Appeals — Interaction with active slashes](#interaction-with-active-slashes).
 
 ## Consequences
 
