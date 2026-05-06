@@ -49,7 +49,7 @@ The peer table is **not size-capped by default**. Growth is bounded externally:
 For defense-in-depth against an unforeseen growth path (registry-validation regression, future schema change), operators MAY set an optional safety ceiling:
 
 - **Config key:** `gossip.max_peer_entries` — `Option<usize>`, default `None` (unlimited).
-- **Behavior when set and exceeded:** new inserts are rejected; the failure surfaces in the existing gossip-rejection counter `decdn_gossip_messages_rejected_total{reason=table_full}` (label registered in [appendix-observability.md § 2.6 Gossip Metrics](appendix-observability.md)). **No existing entry is evicted to make room** — eviction-by-priority would conflate discovery with selection trust (see §4) and is rejected in *Alternatives Considered*.
+- **Behavior when set and exceeded:** new inserts are rejected; the failure surfaces in the existing gossip-rejection counter `decdn_gossip_messages_rejected_total{reason=table_full}` (per [appendix-observability.md § 2.6 Gossip Metrics](appendix-observability.md)). **No existing entry is evicted to make room** — eviction-by-priority would conflate discovery with selection trust (see §4) and is rejected in *Alternatives Considered*.
 - **Operator signal:** sustained `decdn_peer_table_size > registered_node_count × 1.5` indicates registry validation is not constraining inserts as expected and warrants investigation, not silent eviction.
 
 Implementing `gossip.max_peer_entries` is OPTIONAL for the PoC (`peer_table_size` already covers the observable signal); the config key is reserved here so a follow-up implementation does not require an ADR amendment.
@@ -98,7 +98,7 @@ Naming follows [appendix-observability.md § 2.6 Gossip Metrics](appendix-observ
 | Metric | Type | Description |
 |---|---|---|
 | `decdn_peer_table_size` | gauge | Distinct peers in the local peer table — **existing**, see appendix |
-| `decdn_gossip_messages_rejected_total` | counter, labeled by `reason` | **Existing**, see appendix; §2 adds the new label value `reason=table_full` for the optional `gossip.max_peer_entries` rejection path |
+| `decdn_gossip_messages_rejected_total` | counter, labeled by `reason` | **Existing**, see appendix; §2 specifies when the `reason=table_full` label value fires (the optional `gossip.max_peer_entries` rejection path) |
 | `decdn_peer_table_evicted_ttl_total` | counter, unlabeled | New: entries removed by the TTL sweeper |
 | `decdn_peer_table_evicted_registry_total` | counter, labeled by `reason ∈ {deregistered, ejected}` | New: entries removed in response to a registry event (§3) |
 
