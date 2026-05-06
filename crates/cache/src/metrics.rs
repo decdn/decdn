@@ -5,7 +5,7 @@
 //! sustained origin failures the retry budget couldn't save.
 //!
 //! - `origin_fetches_total` — every pull-through call (success or fail).
-//!   Bumped once per [`crate::CacheEngine::pull_through`] entry.
+//!   Bumped once per cache-miss origin pull from [`crate::CacheEngine`].
 //! - `origin_retry_exhausted_total` — per-fetch terminal exhaustion of
 //!   the retry budget. Only bumped when at least one retry actually
 //!   fired; a single failure under `max_retries = 0` is just a failure,
