@@ -126,7 +126,6 @@ pub trait WatchtowerClient: Send + Sync {
 | | PoC | Production |
 |---|-----|------------|
 | Implementation | `NoopWatchtowerClient` — client monitors its own channels directly | `cdn/watchtower/v1` ALPN; watchtower nodes use `WatchtowerEscrow` contract |
-| `WatchtowerAnnounce` gossip | Not emitted or processed | Emitted by watchtower nodes; subscribed to on `cdn/global/v1` |
 
 ### 6. `CorruptionChallenger` — `crates/incentive`
 
