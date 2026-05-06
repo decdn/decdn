@@ -48,7 +48,8 @@ classDiagram
         +settleChannel(op, bytes, amount)
     }
     class FeeRouter {
-        +routeSettlement(op, bytes, amount, root)
+        +routeSettlement(op, bytes, amount)
+        +commitEpochReceiptRoot(epochId, root)
         +claimBoost(epochs)
         +claimDelegator(epochs)
         +workingBytes(op, epoch)
@@ -151,7 +152,7 @@ graph TD
 | 6 | BuybackBurner | TOKEN address, USDC address, Balancer V3 Router address, initial pool contract `address` (may be zero-address at deploy and set later via `setPool(address)` — see [ADR 003](003-payments.md#buybackburner) for the interface and [ADR 018](018-liquidity-strategy.md) for the venue rationale). The pool address remains governance-mutable post-deploy via `setPool(address)`; the constructor value is an initial convenience, not a hard requirement. **Production inflow source:** `FeeRouter` rather than manual treasury transfer ([ADR 026](026-gauge-boost-tokenomics.md) §8); the contract surface is otherwise unchanged. **Router address and naming:** see [ADR 018 §"Buyback execution via Balancer V3"](018-liquidity-strategy.md#buyback-execution-via-balancer-v3) for the canonical Balancer V3 Router address and the `Router v2` label disambiguation. **Approvals note:** `BuybackBurner` MUST self-approve the Balancer V3 **Vault** address (distinct from the Router) during initialization — the Vault pulls input tokens from `msg.sender`, which is `BuybackBurner`. The V3 footgun reference and Vault address live in [ADR 018](018-liquidity-strategy.md#buyback-execution-via-balancer-v3). |
 | 7 | FeeRouter (production) | USDC address, TOKEN address, VotingEscrow address, BuybackBurner address, SafetyReserve address, treasury wallet address, Balancer V3 Router + pool addresses (for the delegator-pool USDC→TOKEN swap; may share `BuybackBurner`'s configuration), `epochLength` (1 week), `claimWindow` (26 epochs), default split shares (40/40/7/5/5/3 per [ADR 026](026-gauge-boost-tokenomics.md) §2), and `boostFloor` (0.4) per [ADR 026](026-gauge-boost-tokenomics.md) §3. Sum-to-100% across the six router shares is enforced on every governance update. |
 | 8a | StablePaymentChannel (PoC) | Constructor args: USDC address, `treasuryAddress`, `disputeWindow` (48h). Initialized in constructor body: StakingRegistry address, `feePercentage` (300 bps), `discountedFeePercentage` (150 bps), `maxChannelDuration` (90 days), rate bounds ([ADR 003](003-payments.md)) |
-| 8b | PaymentChannel (production) | StakingRegistry address, Governor address, **FeeRouter address** ([ADR 026](026-gauge-boost-tokenomics.md) §2). `settleChannel` no longer skims a protocol fee; it transfers the full operator USDC balance to `FeeRouter.routeSettlement(operator, bytesDelivered, amount, receiptBatchRoot)` in the same transaction. The `feePercentage` / `discountedFeePercentage` constructor arguments from the PoC contract are removed. |
+| 8b | PaymentChannel (production) | StakingRegistry address, Governor address, **FeeRouter address** ([ADR 026](026-gauge-boost-tokenomics.md) §2). `settleChannel` no longer skims a protocol fee; it transfers the full operator USDC balance to `FeeRouter.routeSettlement(operator, bytesDelivered, amount)` in the same transaction. The `feePercentage` / `discountedFeePercentage` constructor arguments from the PoC contract are removed. |
 | 9 | PublisherRegistry | None. Permissionless registration; namespace cap and transfer-timelock parameters are read from the governance-controlled parameter store at call time. See [ADR 002 § Contract: PublisherRegistry](002-content-addressing.md#contract-publisherregistry). |
 | 10 | OriginAssignment | StakingRegistry, PublisherRegistry, ContentBlacklist (latter may be zero at deploy; bound via `setContentBlacklist`). Min-redundancy, timelock, and default-open parameters are governance-controlled. See [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority) and [§ OriginAssignment construction notes](#originassignment-construction-notes) below. |
 | 11 | ContentBlacklist | `ContentBlacklist(address stakingRegistry)`. StakingRegistry address is required for `ejectNode()`. ContentBlacklist no longer cross-calls `OriginAssignment` (security relies on runtime checks; see [ADR 011 § Interaction with ContentBlacklist](011-content-takedown.md#interaction-with-contentblacklist)). After deployment, `OriginAssignment.setContentBlacklist(address)` is called once via the deployer / admin to wire the read direction (`OriginAssignment.pruneBlacklistedAssignment` queries `ContentBlacklist.isOriginBlacklisted`). |
@@ -195,7 +196,7 @@ After all contracts are deployed, the deployer must execute these transactions b
    feeRouter.grantRole(ROUTER_CALLER_ROLE, address(paymentChannel));
    ```
 
-   This authorizes `PaymentChannel.settleChannel` to invoke `FeeRouter.routeSettlement(operator, bytesDelivered, amount, receiptBatchRoot)`. Without this grant the production settlement path reverts.
+   This authorizes `PaymentChannel.settleChannel` to invoke `FeeRouter.routeSettlement(operator, bytesDelivered, amount)`. Without this grant the production settlement path reverts.
 
 5. **Grant `SETTLEMENT_REPORTER_ROLE` on StakingRegistry to FeeRouter** (and to `PaymentChannel` if the bootstrap-ranking signal is sourced from settlement events):
 
@@ -249,7 +250,7 @@ graph LR
 
     SPC -->|"getStakeMultiple(provider)"| SR
     SPC -->|"safeTransferFrom / safeTransfer"| ERC
-    SPC -->|"routeSettlement(op, bytes, amount, root)"| FR
+    SPC -->|"routeSettlement(op, bytes, amount)"| FR
     FR -->|"balanceOfAt / totalSupplyAt"| VE
     FR -->|"5% USDC same-tx"| BB
     FR -->|"3% USDC same-tx"| SAFE
@@ -279,7 +280,8 @@ graph LR
 | StablePaymentChannel | IERC20 (USDC) | `safeTransfer()` | Caller holds balance | Yes |
 | PaymentChannel | StakingRegistry | `getStakeMultiple(provider)` | Public (read-only) | No |
 | PaymentChannel | IERC20 (per-token) | `safeTransferFrom()` / `safeTransfer()` | Caller must have allowance/balance | Yes |
-| PaymentChannel | FeeRouter | `routeSettlement(operator, bytesDelivered, amount, receiptBatchRoot)` | `ROUTER_CALLER_ROLE` on FeeRouter ([ADR 026](026-gauge-boost-tokenomics.md) §2) | Yes |
+| PaymentChannel | FeeRouter | `routeSettlement(operator, bytesDelivered, amount)` | `ROUTER_CALLER_ROLE` on FeeRouter ([ADR 026](026-gauge-boost-tokenomics.md) §2) | Yes |
+| Operator (off-chain) | FeeRouter | `commitEpochReceiptRoot(epochId, root)` | None — `msg.sender` is recorded as the credited operator ([ADR 027 §4](027-distinct-client-receipts.md#4-on-chain-anchoring-merkle-batched)) | Yes |
 | FeeRouter | VotingEscrow | `balanceOfAt(user, ts)`, `totalSupplyAt(ts)` | Public (read-only) | No |
 | FeeRouter | StakingRegistry | `recordSettlement(operator)` | `SETTLEMENT_REPORTER_ROLE` (granted to FeeRouter post-deploy; settlement counter moves with the routing call) | Yes |
 | FeeRouter | BuybackBurner | `safeTransfer()` (5% USDC same-tx) | Caller holds balance | Yes |
@@ -451,7 +453,7 @@ New top-level contracts integrate with the launch-time set via standard `AccessC
 | `SLASH_ROLE` | StakingRegistry | `slash()` | SlashJudge contract | SlashJudge contract |
 | `SETTLEMENT_REPORTER_ROLE` | StakingRegistry | `recordSettlement(operator)` | StablePaymentChannel | FeeRouter; see §3 |
 | `KEEPER_ROLE` | BuybackBurner, FeeRouter | `executeBuyback()` (BB), `executeDelegatorSwap(epoch, minOut)` (FeeRouter) | Admin / disabled | Keeper bot or governance |
-| `ROUTER_CALLER_ROLE` | FeeRouter | `routeSettlement(op, bytes, amount, root)` | n/a | PaymentChannel (and any future settlement-emitting contract) |
+| `ROUTER_CALLER_ROLE` | FeeRouter | `routeSettlement(op, bytes, amount)` | n/a | PaymentChannel (and any future settlement-emitting contract) |
 | `PAYOUT_AUTHORIZER_ROLE` | SafetyReserve | `payout(bundle, recipient, amount)` | n/a | Governor via timelock; emergency multisig within hard caps ([ADR 026](026-gauge-boost-tokenomics.md) §5) |
 | `GOVERNANCE_ROLE` | ContentBlacklist, FeeRouter (share parameters / `boostFloor`) | `addHash()`, `removeHash()`, `addOrigin()`, `removeOrigin()`, `registerRegionalBody()` (ContentBlacklist); `setShares(...)`, `setBoostFloor(...)` (FeeRouter) | Admin | Governor via timelock |
 | `EMERGENCY_ROLE` | ContentBlacklist (emergency functions), fund-holding contracts (`pause()`), SafetyReserve (fast-track payout under hard caps) | `emergencyAdd()`, `emergencyAddOrigin()`, `suspendRegionalBody()` (ContentBlacklist); `pause()` (Pausable contracts only); `payout(...)` under hard caps (SafetyReserve) | Admin | 3-of-5 multisig (12-month sunset) |
@@ -495,7 +497,7 @@ Every state-mutating function that makes an external call is listed below with i
 | `openChannel()` | `IERC20.safeTransferFrom()`, `StakingRegistry.getStakeMultiple()` (read) | `nonReentrant`, checks-effects-interactions |
 | `topUp()` | `IERC20.safeTransferFrom()` | `nonReentrant`, checks-effects-interactions |
 | `settleChannel()` (PoC) | `IERC20.safeTransfer()` × 3 (provider, treasury, client) | `nonReentrant`, checks-effects-interactions |
-| `settleChannel()` (production) | `IERC20.safeTransfer()` (unused balance to client), `FeeRouter.routeSettlement(operator, bytesDelivered, amount, receiptBatchRoot)` (full operator balance forwarded; FeeRouter performs the six-way split internally) | `nonReentrant`, checks-effects-interactions; FeeRouter is `nonReentrant`-guarded on `routeSettlement` to defend against re-entry through the operator-base `safeTransfer` |
+| `settleChannel()` (production) | `IERC20.safeTransfer()` (unused balance to client), `FeeRouter.routeSettlement(operator, bytesDelivered, amount)` (full operator balance forwarded; FeeRouter performs the six-way split internally) | `nonReentrant`, checks-effects-interactions; FeeRouter is `nonReentrant`-guarded on `routeSettlement` to defend against re-entry through the operator-base `safeTransfer` |
 | `reclaimExpired()` | `IERC20.safeTransfer()` | `nonReentrant`, checks-effects-interactions |
 | `forceCloseChannel()` | None (state change only) | N/A |
 
@@ -538,7 +540,8 @@ Every state-mutating function that makes an external call is listed below with i
 
 | Function | External Calls | Guards |
 | --- | --- | --- |
-| `routeSettlement(operator, bytesDelivered, amount, receiptBatchRoot)` | `IERC20.safeTransfer()` × 4 (operator base 40%, BuybackBurner 5%, Treasury 5%, SafetyReserve 3%; gauge 40% and delegator 7% retained in epoch buckets, no transfer), `StakingRegistry.recordSettlement(operator)`. State updates: appends one leaf to the per-(operator, epoch) MMR receipt accumulator (per ADR 027 §4), and increments `totalBytesPerEpoch[epoch]` and `totalWorkingBytesPerEpoch[epoch]` global counters that `claimBoost` later reads as the gauge-share denominator (avoids gas-prohibitive iteration at claim time). `receiptBatchRoot` is the gauge-eligibility commitment per [ADR 027 §4](027-distinct-client-receipts.md#4-on-chain-anchoring-merkle-batched); zero root signals operator opt-out of gauge credit for this settlement. | `nonReentrant`, checks-effects-interactions, `ROUTER_CALLER_ROLE` |
+| `routeSettlement(operator, bytesDelivered, amount)` | `IERC20.safeTransfer()` × 4 (operator base 40%, BuybackBurner 5%, Treasury 5%, SafetyReserve 3%; gauge 40% and delegator 7% retained in epoch USDC buckets, no transfer), `StakingRegistry.recordSettlement(operator)`. State updates: increments per-epoch USDC accumulators for the gauge and delegator buckets. Byte counters and receipt-root commitments do **not** flow through this call — gauge eligibility (`bytes_i` and `sum(working_bytes)` in the [ADR 026 §3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula) formula) is sourced from per-(operator, epoch) receipt summaries via the separate `commitEpochReceiptRoot` / `commitEpochSummary` entry points ([ADR 027 §4](027-distinct-client-receipts.md#4-on-chain-anchoring-merkle-batched)). | `nonReentrant`, checks-effects-interactions, `ROUTER_CALLER_ROLE` |
+| `commitEpochReceiptRoot(epochId, root)` | None (state-only). Appends one leaf to the per-(`msg.sender`, `epochId`) MMR receipt accumulator (per [ADR 027 §4](027-distinct-client-receipts.md#4-on-chain-anchoring-merkle-batched)). | None — `msg.sender` is the credited operator; the operator is self-authorising for their own gauge eligibility. |
 | `claimBoost(epochs[])` | `IERC20.safeTransfer()` (USDC to claiming operator), `VotingEscrow.balanceOfAt(...)` × N epochs (read), `VotingEscrow.totalSupplyAt(...)` × N epochs (read) | `nonReentrant`, checks-effects-interactions; epoch must be finalized |
 | `claimDelegator(epochs[])` | `IERC20.safeTransfer()` (TOKEN to claiming ve-locker), `VotingEscrow.balanceOfAt(...)` × N (read), `VotingEscrow.totalSupplyAt(...)` × N (read) | `nonReentrant`, checks-effects-interactions; epoch's delegator-pool USDC→TOKEN swap must be settled |
 | `executeDelegatorSwap(epoch, minOut)` | `BalancerV3Router.swapSingleTokenExactIn()` (Vault-scoped self-approval, same V3 footgun pattern as `BuybackBurner`) | `nonReentrant`, checks-effects-interactions, `KEEPER_ROLE`; per-epoch liquidity caps and TWAP-window guards REQUIRED ([ADR 026](026-gauge-boost-tokenomics.md) §6) |

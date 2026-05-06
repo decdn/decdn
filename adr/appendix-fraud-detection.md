@@ -32,13 +32,13 @@ This is fundamentally a self-protection mechanism, not a paid service. **Nodes t
 
 ### Receipt-summary fraud detection
 
-When an operator commits an `EpochReceiptSummary` via `FeeRouter.commitEpochSummary`, a detector that wishes to challenge ingests the operator's per-epoch settlements (already on-chain via each `routeSettlement`'s `receiptBatchRoot` argument) and pulls the underlying receipt batches from the operator's published surface. It then runs the [ADR 027 §3](027-distinct-client-receipts.md) checks:
+When an operator commits an `EpochReceiptSummary` via `FeeRouter.commitEpochSummary`, a detector that wishes to challenge ingests the operator's per-epoch receipt-root commits (already on-chain via each `FeeRouter.commitEpochReceiptRoot(epochId, root)` call, accumulated in the per-(operator, epoch) MMR) and pulls the underlying receipt batches from the operator's published surface. It then runs the [ADR 027 §3](027-distinct-client-receipts.md) checks:
 
 - Signature recovers to `clientPubKey == channel.client` (cryptographic, definitive).
 - Identity-diversity rules (funded-channel minimum, funding-age, per-operator cooldown, funding-source diversity).
 - Heuristic flags for self-routed traffic patterns (operator-as-client overlap, funder clustering, settlement-cadence anomalies).
 
-If any check fails, the detector submits `ChallengeReceiptSummary` with the standard bond ([ADR 014 Bond Handling](014-on-chain-verification.md)). On a successful challenge, the operator's `claimedDistinctClients` is zeroed for the epoch and the detector receives back its bond plus a challenger reward (parameter on the receipt-fraud challenge handler, governable per [ADR 009](009-governance.md); see [ADR 027 §5 Bond model](027-distinct-client-receipts.md#bond-model)). On a dismissed challenge, the bond is forfeit per the standard 50% burn / 50% to operator rule ([ADR 014](014-on-chain-verification.md)).
+If any check fails, the detector submits `ChallengeReceiptSummary` with the standard bond ([ADR 014 Bond Handling](014-on-chain-verification.md)). On a successful challenge, the disputed field — `claimedBytes` and/or `claimedDistinctClients` — is zeroed for the epoch (per [ADR 027 §Challenge window](027-distinct-client-receipts.md#challenge-window)) and the detector receives back its bond plus a challenger reward (parameter on the receipt-fraud challenge handler, governable per [ADR 009](009-governance.md); see [ADR 027 §5 Bond model](027-distinct-client-receipts.md#bond-model)). On a dismissed challenge, the bond is forfeit per the standard 50% burn / 50% to operator rule ([ADR 014](014-on-chain-verification.md)).
 
 ### Heuristics are a tool, not a protocol input
 
