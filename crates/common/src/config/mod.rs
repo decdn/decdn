@@ -2372,12 +2372,24 @@ mod tests {
     // attribute or a field rename fails this test immediately.
     #[test]
     fn run_subcommand_args_are_wired_to_decdn_env_vars() {
-        use clap::CommandFactory;
+        use clap::{Args, CommandFactory, Parser};
 
-        let cmd = crate::cli::Cli::command();
-        let run = cmd
-            .find_subcommand("run")
-            .expect("Cli has a `run` subcommand");
+        // The user CLI no longer has a `run` subcommand (#421 — the
+        // daemon binary `decdn-node` owns it). `RunArgs` itself
+        // remains in `decdn-common` because `decdn config validate`
+        // flattens it for env-var parity with the daemon. Wrap
+        // `RunArgs` in a local `Parser` and walk *its* args — this
+        // is the same set of env mappings the daemon's
+        // `decdn-node run` exposes and that `decdn config validate`
+        // honours.
+        #[derive(Parser, Debug)]
+        struct RunWrap {
+            #[command(flatten)]
+            run: crate::cli::RunArgs,
+        }
+
+        let _ = RunWrap::command(); // surface a parse error if RunArgs is broken
+        let run = <crate::cli::RunArgs as Args>::augment_args(clap::Command::new("run"));
 
         // One line per DECDN_* env var operators may set. Adding a new
         // `#[arg(env = "DECDN_*")]` field without adding it here is a test

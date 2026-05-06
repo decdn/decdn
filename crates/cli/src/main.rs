@@ -18,16 +18,6 @@ async fn main() -> anyhow::Result<()> {
     let config_path = cli.config.map(|p| cli::common::expand_tilde(&p));
 
     match cli.command {
-        // The daemon-only `Run` subcommand lives on `decdn-node`. On the
-        // user CLI it errors with a redirect rather than silently
-        // unknown-subcommand, so an operator who muscle-memories `decdn
-        // run` (the pre-split shape) gets a useful next step. Hard cut:
-        // there's no compatibility shim — the daemon binary is the only
-        // way to start the node.
-        Command::Run(_) => Err(anyhow::anyhow!(
-            "`decdn run` no longer exists. Run the daemon with `decdn-node run` instead.\n\
-             See ADR appendix-binaries for the dockerd-style split."
-        )),
         Command::KeyGen(args) => commands::key_gen::key_gen(&args),
         Command::Config(args) => match args.command {
             ConfigCommand::Init(init) => commands::config::config_init(&init),

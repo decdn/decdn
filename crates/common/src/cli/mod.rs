@@ -20,9 +20,21 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-/// A deCDN node: cache and serve content-addressed blobs over iroh QUIC.
+/// User-facing deCDN CLI. The daemon lives in the separate `decdn-node`
+/// binary; this CLI is what you type from a terminal — probe, node admin,
+/// key-gen, config.
 #[derive(Parser, Debug)]
-#[command(name = "decdn", version, about, long_about = None)]
+#[command(
+    name = "decdn",
+    version,
+    about = "deCDN user CLI — probe, node admin, key-gen, config",
+    long_about = "User-facing deCDN CLI. Pairs with the `decdn-node` daemon: \
+                  this binary carries every command a human types in a \
+                  terminal (probe, node admin, key-gen, config). The \
+                  `node` subcommand group talks to a running daemon over \
+                  the loopback admin RPC surface (ADR 025) and fails \
+                  cleanly on a host with no daemon running."
+)]
 pub struct Cli {
     /// Path to TOML config file [default: ~/.decdn/node.toml].
     #[arg(long, global = true, value_name = "PATH")]
@@ -33,11 +45,10 @@ pub struct Cli {
     pub command: Command,
 }
 
-/// Available subcommands.
+/// Available subcommands. Note: there is intentionally no `run`
+/// subcommand — running the daemon is `decdn-node run` (issue #421).
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Run the deCDN node.
-    Run(Box<RunArgs>),
     /// Generate a new Ed25519 node key and Ethereum keystore.
     KeyGen(KeyGenArgs),
     /// Manage configuration files (`init`, `validate`).
