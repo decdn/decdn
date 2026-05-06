@@ -5,22 +5,22 @@
 
 ## Context
 
-The pre-#421 single `decdn` binary fused two unrelated jobs:
+A deCDN deployment has two unrelated jobs to do:
 
-- a long-lived cache-node daemon (runs in containers, lives under
+- run a long-lived cache-node daemon (lives in containers, runs under
   systemd, reachable on QUIC `:4433` and metrics `:9090`), and
-- a one-shot human-facing CLI that an operator or publisher types in a
-  terminal (`probe`, `node peers`, `key-gen`, `config validate`, and
-  the future `pull`, `bundle …`, `fetch`, `publish`, `channel`,
-  `wallet` commands).
+- run one-shot human commands an operator or publisher types in a
+  terminal — `probe`, `node peers`, `key-gen`, `config validate`, and
+  the deferred `pull`, `bundle …`, `fetch`, `publish`, `channel`,
+  `wallet`.
 
-Threat surface, dependency footprint, and update cadence are different
-for each. The fused shape forced every operator deployment to ship
-publisher tooling, every publisher install to drag in the daemon's
-runtime, and contaminated upcoming work like `decdn bundle …` (#391)
-and `decdn pull` (ADR 012) with a "which binary owns this?" question
-that doesn't exist in `dockerd` + `docker`, `kubelet` + `kubectl`, or
-`containerd` + `nerdctl`.
+Threat surface, dependency footprint, and update cadence differ
+between the two. A single fused binary would force every operator
+deployment to ship publisher tooling, every publisher install to drag
+in the daemon's runtime, and contaminate features like
+`decdn bundle …` (#391) and `decdn pull` (ADR 012) with a "which
+binary owns this?" question that doesn't exist in `dockerd` +
+`docker`, `kubelet` + `kubectl`, or `containerd` + `nerdctl`.
 
 ## Decision
 
@@ -43,13 +43,10 @@ Adopt the dockerd shape. Two binaries, one shared support crate:
   `Hash` return type of `parse_hash_arg` — see the CLI binary-size
   note below.
 
-The pre-#421 `decdn run …` binary form does not survive. The cut-over
-is hard: `decdn run` errors as an unrecognized subcommand (clap's
-default), with `decdn --help` listing only the user-facing commands.
-There is no compatibility shim and no friendly redirect; operators
-reach for the release notes / CHANGELOG to learn that `decdn-node run`
-is the new daemon entry point. The breaking change is called out
-under the `BREAKING CHANGE:` footer.
+There is no `decdn run` subcommand. `decdn run` errors as an
+unrecognized subcommand (clap's default), with `decdn --help` listing
+only the user-facing commands. There is no compatibility shim and no
+friendly redirect — operators starting the daemon use `decdn-node run`.
 
 ### Why the `node` admin namespace lives on `decdn`, not `decdn-node`
 
@@ -65,28 +62,27 @@ operates on.
 
 ### Why a single shared `decdn-common`, not per-binary common crates
 
-The atomic-PR refactor cost dominates. A two-crate split
-(`decdn-config` + `decdn-admin-types`) would buy a tighter dep graph,
-but everything in `decdn-common` is consumed by both binaries already,
-so the fragmentation has no immediate payoff. The `decdn-cache`
-transitive dep — pulled in for the cache-typed config fields
-(`DecompressMode`, `RetryPolicy`, `OriginUrl`, `PinnedHashes`,
-`Hash`) — is the largest single contributor to CLI binary size; if
-`cargo bloat --release --bin decdn -n 20` shows the CLI exceeding
-~50 MB stripped, the right next move is splitting the cache-typed
-fields out of `decdn-common`'s `config` module rather than splitting
-the crate.
+A two-crate split (`decdn-config` + `decdn-admin-types`) would buy a
+tighter dep graph, but everything in `decdn-common` is consumed by
+both binaries already, so the fragmentation has no immediate payoff.
+The `decdn-cache` transitive dep — pulled in for the cache-typed
+config fields (`DecompressMode`, `RetryPolicy`, `OriginUrl`,
+`PinnedHashes`, `Hash`) — is the largest single contributor to CLI
+binary size; if `cargo bloat --release --bin decdn -n 20` shows the
+CLI exceeding ~50 MB stripped, the right next move is splitting the
+cache-typed fields out of `decdn-common`'s `config` module rather
+than splitting the crate.
 
 ### Why the metric prefix and OTLP `service.name` stay `decdn`
 
 The Prometheus metric prefix in `crates/node/src/metrics.rs` and the
 OTLP `service.name` set in `crates/node/src/commands/mod.rs` both
-remain `decdn` (not `decdn-node`) for dashboard and alert continuity.
+read `decdn` (not `decdn-node`) for dashboard and alert continuity.
 A future reviewer looking at `decdn_*` series and asking "shouldn't
 this be `decdn_node_*`?" should consult this appendix and `monitoring/
 prometheus-alerts.yml` / `monitoring/grafana-dashboard.json` — those
-dashboards and alert rules already match `decdn_*` and would silently
-miss data on a prefix rename.
+dashboards and alert rules match `decdn_*` and would silently miss
+data on a prefix rename.
 
 ## Distribution
 
@@ -104,11 +100,10 @@ miss data on a prefix rename.
 
 - `decdn bundle …` (#391) lands directly on `decdn`; no decision
   about which binary owns it remains.
-- `decdn pull` (ADR 012) lands on `decdn` post-split; it's no longer
-  blocked on a binary-placement question.
+- `decdn pull` (ADR 012) lands on `decdn`; it's not blocked on a
+  binary-placement question.
 - Shell completions and man pages are deferred — both binaries should
-  generate them via `clap_complete`, but adding that to this PR would
-  expand scope. Tracked as follow-up issues.
+  generate them via `clap_complete`. Tracked as follow-up issues.
 - CLI binary-size budget is tracked, not enforced. Run
   `cargo bloat --release --bin decdn -n 20` and
   `ls -lh target/release/decdn target/release/decdn-node` after each
