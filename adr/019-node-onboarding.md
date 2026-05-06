@@ -108,7 +108,7 @@ ed25519Signature = ed25519 sign(nodePrivKey,
                     keccak256(abi.encodePacked(nodeId, ethAddress, chainId, registrationNonce[nodeId])))
 ```
 
-Both signing operations are supported by the `decdn-node` CLI (`node register` subcommand prints the required parameters, signs locally, and submits the transaction).
+Both signing operations are supported by the `decdn` CLI (`decdn node register` subcommand prints the required parameters, signs locally, and submits the transaction).
 
 **Gas:** ~$0.26–$0.46 (includes on-chain ed25519 verification via Solidity library; this is a one-time cost per node lifetime).
 
@@ -136,7 +136,7 @@ Query `StakingRegistry.getActiveNodes(offset=0, limit=100)` to bootstrap the pee
 
 This registry snapshot is the initial peer table. Gossip updates (Phase 4) will keep it fresh. The node also subscribes to `NodeRegistered`, `NodeMultiaddrUpdated`, `NodeDeregistered`, and `NodeAutoEjected` events to maintain a local registry cache used during gossip validation ([ADR 001](001-network.md#registry-cache)).
 
-If the RPC endpoint is unavailable, retry with exponential backoff (3 attempts at 1s, 5s, 30s). If all retries fail, the node cannot start (no peer table = cannot participate in gossip or probe fan-outs).
+If the RPC endpoint is unavailable, retry with exponential backoff (3 attempts at 1s, 5s, 30s). If all retries fail, the node cannot start (no peer table = cannot participate in gossip, DHT lookups, or probing).
 
 #### Step 3.4 — Configure local rate
 
@@ -165,7 +165,6 @@ NodeAnnounce {
     node_id:        <iroh NodeId>,
     region:         <ISO 3166-1 alpha-2, e.g. "DE">,
     load:           LoadHint { active_streams: 0, bandwidth_utilization: 0 },
-    popular_hashes: vec![],   // empty until content is cached
     timestamp_us:   <current unix microseconds>,
     signature:      <ed25519 over NodeAnnounceBody via postcard>,
 }
@@ -255,7 +254,7 @@ If the node's iroh identity has been replaced (key rotation), use `StakingRegist
 
 ## Future Work
 
-- **Node onboarding CLI tool.** A `decdn-node setup` command that walks through Phases 1–2 interactively, generates keys, builds the `registerNode` calldata, and submits the transactions would reduce operator error significantly.
+- **Node onboarding CLI tool.** A `decdn setup` command that walks through Phases 1–2 interactively, generates keys, builds the `registerNode` calldata, and submits the transactions would reduce operator error significantly.
 - **Automated multiaddr refresh.** The node runtime should watch `Endpoint::direct_addresses()` and call `updateMultiaddrs` automatically on change.
 - **Geolocation verification.** Self-reported `regionHint` is an accepted PoC risk. Production should use a decentralized oracle or attestation service — see Issue #190, gap 7.
 - ~~**Delegated voucher signer.**~~ Resolved — [ADR 024](024-account-abstraction.md) specifies Safe session keys for high-frequency signing (vouchers and slash_sig), replacing the delegated signer approach.

@@ -93,10 +93,10 @@ CLI shape:
 
 ## Implementation Notes
 
-- `crates/node/src/admin.rs` defines the `AdminRpc` trait with `#[rpc(server, client, namespace = "admin_v1")]` and the concrete server impl backed by the gossip `PeerTable`.
-- `AdminState` carries `Arc<RwLock<PeerTable>>` (and will grow more handles as new methods land).
-- JSON DTOs (`PeerView`, `PeersResponse`) are defined in `admin.rs` rather than derived from internal types so the wire format can stay stable even when internal structs change.
-- `decdn node peers` lives in `crates/node/src/commands/node.rs` and uses `jsonrpsee::http_client::HttpClient` with the generated `AdminRpcClient` trait — no hand-rolled JSON or HTTP logic on the client side.
+- `crates/common/src/admin.rs` defines the `AdminRpc` trait with `#[rpc(server, client, namespace = "admin_v1")]`, the JSON DTOs, error code constants, and the `parse_hash_arg` helper. Both binaries import from there.
+- `crates/node/src/admin.rs` carries the daemon-side server impl: `AdminState` (`Arc<RwLock<PeerTable>>` plus the cache, announce trigger, reload hook, drain trigger), `AdminRpcImpl`, and the `bind` / `serve` helpers.
+- JSON DTOs (`PeerView`, `PeersResponse`, `HealthResponse`, etc.) live in the shared crate rather than being derived from internal types so the wire format can stay stable even when internal structs change.
+- `decdn node peers` lives in `crates/cli/src/commands/node.rs` and uses `jsonrpsee::http_client::HttpClient` with the generated `AdminRpcClient` trait — no hand-rolled JSON or HTTP logic on the client side.
 
 ## Alternatives Considered
 

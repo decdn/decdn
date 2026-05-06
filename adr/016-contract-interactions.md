@@ -5,7 +5,7 @@
 
 ## Context
 
-The deCDN deploys multiple interacting smart contracts with cross-contract calls, role-based access control, and funds custody. Individual contracts are specified across [ADR 003](003-payments.md), [ADR 007](007-watchtower.md), [ADR 009](009-governance.md), [ADR 010](010-multi-token.md), [ADR 011](011-content-takedown.md), [ADR 014](014-on-chain-verification.md), and [ADR 026](026-gauge-boost-tokenomics.md). However, no single document maps the full interaction surface: who calls whom, which contracts hold funds, who is authorized to do what, and where reentrancy risks exist.
+The deCDN deploys multiple interacting smart contracts with cross-contract calls, role-based access control, and funds custody. Individual contracts are specified across [ADR 003](003-payments.md), [ADR 009](009-governance.md), [ADR 010](010-multi-token.md), [ADR 011](011-content-takedown.md), [ADR 014](014-on-chain-verification.md), and [ADR 026](026-gauge-boost-tokenomics.md). However, no single document maps the full interaction surface: who calls whom, which contracts hold funds, who is authorized to do what, and where reentrancy risks exist.
 
 This ADR consolidates that analysis into a single reference for security audits and implementation. It does not introduce new functionality — it systematizes what other ADRs already specify.
 
@@ -31,7 +31,6 @@ All on-chain contracts inherit from [OpenZeppelin Contracts](https://docs.openze
 | PublisherRegistry | [002](002-content-addressing.md) | No | — | `AccessControl`, `ReentrancyGuard` | PoC + Production |
 | OriginAssignment | [011](011-content-takedown.md) | No | — | `AccessControl`, `ReentrancyGuard` | PoC + Production |
 | SlashJudge | [014](014-on-chain-verification.md) | Yes | TOKEN (challenge bonds) | `AccessControl`, `ReentrancyGuard`, `Pausable`, `EIP712` | PoC + Production |
-| WatchtowerEscrow | [007](007-watchtower.md) | Yes | USDC | `ReentrancyGuard`, `Pausable`, `EIP712` | Production only |
 
 **Deferred / optional contracts (forward-referenced):**
 
@@ -119,7 +118,6 @@ graph TD
     OA["10. OriginAssignment"]
     CB["11. ContentBlacklist"]
     SJ["12. SlashJudge"]
-    WE["13. WatchtowerEscrow (production)"]
 
     SR --> TOKEN
     VE --> TOKEN
@@ -139,7 +137,6 @@ graph TD
     CB --> SR
     SJ --> SR
     SJ --> TOKEN
-    WE --> SPC
 ```
 
 #### Constructor Dependencies
@@ -159,7 +156,6 @@ graph TD
 | 10 | OriginAssignment | StakingRegistry, PublisherRegistry, ContentBlacklist (latter may be zero at deploy; bound via `setContentBlacklist`). Min-redundancy, timelock, and default-open parameters are governance-controlled. See [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority) and [§ OriginAssignment construction notes](#originassignment-construction-notes) below. |
 | 11 | ContentBlacklist | `ContentBlacklist(address stakingRegistry)`. StakingRegistry address is required for `ejectNode()`. ContentBlacklist no longer cross-calls `OriginAssignment` (security relies on runtime checks; see [ADR 011 § Interaction with ContentBlacklist](011-content-takedown.md#interaction-with-contentblacklist)). After deployment, `OriginAssignment.setContentBlacklist(address)` is called once via the deployer / admin to wire the read direction (`OriginAssignment.pruneBlacklistedAssignment` queries `ContentBlacklist.isOriginBlacklisted`). |
 | 12 | SlashJudge | StakingRegistry address, TOKEN address, `challengeBond` (100 TOKEN), `counterEvidenceWindow` (24h) |
-| 13 | WatchtowerEscrow | StablePaymentChannel/PaymentChannel address, `heartbeatInterval`, `missThreshold`, `feeRateBps`, `minFee`, `monitoringPeriod` |
 
 #### OriginAssignment construction notes
 
@@ -248,7 +244,6 @@ graph LR
     VE["VotingEscrow"]
     SAFE["SafetyReserve"]
     GOV["Governor"]
-    WE["WatchtowerEscrow"]
     ERC["ERC-20 Tokens<br/>(USDC, TOKEN)"]
     BAL["Balancer V3 Router"]
 
@@ -273,7 +268,6 @@ graph LR
     SR -->|"30% slashed TOKEN"| SAFE
     BB -->|"Router.swapSingleTokenExactIn()"| BAL
     BB -->|"safeTransferFrom / safeTransfer"| ERC
-    WE -->|"read channel state"| SPC
 ```
 
 #### Complete Call Table
@@ -306,7 +300,6 @@ graph LR
 | StakingRegistry | SafetyReserve | `safeTransfer()` of TOKEN (30% of slashed stake; the remaining 50% goes to the challenger and 20% burns per [ADR 026](026-gauge-boost-tokenomics.md) §8). `SafetyReserve` swaps the accumulated TOKEN balance to USDC via a keeper-triggered call into the [ADR 018](018-liquidity-strategy.md) Balancer V3 80/20 pool. | Caller holds balance | Yes |
 | BuybackBurner | Balancer V3 Router | `swapSingleTokenExactIn(pool, tokenIn, tokenOut, exactAmountIn, minAmountOut, deadline, wethIsEth, userData)` | `BuybackBurner` self-approves the **Balancer V3 Vault** address (NOT the Router) during its initialization — the Vault pulls input tokens from the `msg.sender` of the Router call. This is the V3 footgun; see [ADR 018](018-liquidity-strategy.md#buyback-execution-via-balancer-v3) | Yes |
 | BuybackBurner | IERC20 (USDC, TOKEN) | `safeTransferFrom()` / `safeTransfer()` | Caller must have allowance/balance | Yes |
-| WatchtowerEscrow | StablePaymentChannel / PaymentChannel | Channel state reads | Public (read-only) | No |
 
 **Note:** No contract calls governance functions on another deCDN contract. Cross-contract state mutations are limited to `ejectNode()`, `slash()`, `routeSettlement()`, `recordSettlement()`, and `payout()` — each protected by a dedicated role.
 
@@ -401,7 +394,7 @@ flowchart TD
     ClientStaker["Client (optional staker)"]
     SR["StakingRegistry<br/>(staked TOKEN)"]
     SJ["SlashJudge<br/>(challenge bonds)"]
-    Challenger["Challenger /<br/>Watchtower"]
+    Challenger["Challenger"]
     SAFE["SafetyReserve"]
     BURN["Burn Address<br/>(0x...dEaD)"]
 
@@ -437,7 +430,6 @@ flowchart TD
 | StakingRegistry | TOKEN | Node operator stakes, client priority stakes | `unstake()` after unbonding (operators), `clientUnstake()` anytime (clients) |
 | SlashJudge | TOKEN | Challenger bond deposits | `resolveChallenge()` (slash reward + bond return to challenger) or bond forfeiture |
 | BuybackBurner | USDC (accumulated), TOKEN (transient) | PoC: treasury transfers. Production: 5% USDC same-tx from `FeeRouter` ([ADR 026](026-gauge-boost-tokenomics.md) §8) | `executeBuyback()` (production; accumulate-only in PoC) |
-| WatchtowerEscrow | USDC | Prepaid watchtower fees | Heartbeat-based payouts, reclaim on liveness failure |
 
 (`PublisherRegistry` and `OriginAssignment` hold no funds — they are pure registry contracts.)
 
@@ -447,7 +439,7 @@ All role-based access uses OpenZeppelin `AccessControl`. The `DEFAULT_ADMIN_ROLE
 
 #### Additive contract surface
 
-New top-level contracts integrate with the launch-time set via standard `AccessControl` role grants — governance can grant new roles or revoke existing ones via the standard 7-day vote + 48-hour timelock path, without contract changes, state migration, or redeploy of the existing contracts. The launch-time interface surface (function signatures and events on `StablePaymentChannel` / `PaymentChannel`, `FeeRouter`, `SafetyReserve`, `StakingRegistry`, `BuybackBurner`, `VotingEscrow`, `SlashJudge`, `WatchtowerEscrow`) is treated as stable for cross-contract integration. Concretely: `openChannel` is permissionless, `SafetyReserve.payout(bundleHash, recipient, amount)` accepts arbitrary evidence-bundle hashes (per [ADR 026 §5](026-gauge-boost-tokenomics.md#5-safety-and-insurance-reserve-3-bucket)), TOKEN is `ERC20Burnable` (per [ADR 026 §1](026-gauge-boost-tokenomics.md#1-supply-and-distribution)), and no contract is locked to a specific set of integrators. Future contract surfaces deploy as additive top-level contracts, not as upgrades or migrations of the launch set.
+New top-level contracts integrate with the launch-time set via standard `AccessControl` role grants — governance can grant new roles or revoke existing ones via the standard 7-day vote + 48-hour timelock path, without contract changes, state migration, or redeploy of the existing contracts. The launch-time interface surface (function signatures and events on `StablePaymentChannel` / `PaymentChannel`, `FeeRouter`, `SafetyReserve`, `StakingRegistry`, `BuybackBurner`, `VotingEscrow`, `SlashJudge`) is treated as stable for cross-contract integration. Concretely: `openChannel` is permissionless, `SafetyReserve.payout(bundleHash, recipient, amount)` accepts arbitrary evidence-bundle hashes (per [ADR 026 §5](026-gauge-boost-tokenomics.md#5-safety-and-insurance-reserve-3-bucket)), TOKEN is `ERC20Burnable` (per [ADR 026 §1](026-gauge-boost-tokenomics.md#1-supply-and-distribution)), and no contract is locked to a specific set of integrators. Future contract surfaces deploy as additive top-level contracts, not as upgrades or migrations of the launch set.
 
 #### Role Assignments
 
@@ -576,16 +568,6 @@ Every state-mutating function that makes an external call is listed below with i
 
 > **Spending control invariant.** No path on `SafetyReserve` exists for unattested or non-Governor-authorized payouts. The four-gate check (evidence bundle + Governor or emergency-multisig within hard caps + 48h appeal + post-incident registry write) is enforced atomically inside `payout`; partial paths revert.
 
-#### WatchtowerEscrow
-
-| Function | External Calls | Guards |
-| --- | --- | --- |
-| `depositFee()` | `IERC20.safeTransferFrom()` (USDC fee deposit) | `nonReentrant`, checks-effects-interactions |
-| `submitHeartbeat()` | None (state change only) | N/A |
-| `claimFees()` | `IERC20.safeTransfer()` (USDC to watchtower) | `nonReentrant`, checks-effects-interactions |
-| `reclaimOnLivenessFailure()` | `IERC20.safeTransfer()` (USDC to watched party) | `nonReentrant`, checks-effects-interactions |
-| Channel state reads | `StablePaymentChannel`/`PaymentChannel.getChannel()` (read-only) | N/A |
-
 #### PublisherRegistry
 
 | Function | External Calls | Guards |
@@ -635,7 +617,7 @@ Every deCDN contract should inherit from audited OpenZeppelin base contracts rat
 | `ReentrancyGuard` | All fund-holding contracts | `nonReentrant` modifier on state-mutating functions with external calls |
 | `Pausable` | All fund-holding contracts | Emergency pause capability |
 | `SafeERC20` | All contracts interacting with ERC-20 tokens | Safe wrappers for `transfer`, `transferFrom`, `approve` |
-| `EIP712` | StablePaymentChannel, PaymentChannel, SlashJudge, WatchtowerEscrow, SafetyReserve (production, for attested incident bundles) | Domain separator for voucher/slash/heartbeat/incident-bundle signature verification |
+| `EIP712` | StablePaymentChannel, PaymentChannel, SlashJudge, SafetyReserve (production, for attested incident bundles) | Domain separator for voucher/slash/incident-bundle signature verification |
 | `SignatureChecker` | StablePaymentChannel, PaymentChannel, StakingRegistry, SlashJudge, SafetyReserve | Unified EOA + ERC-1271 smart account signature verification ([ADR 024](024-account-abstraction.md)) |
 | `ERC20` + `ERC20Permit` | TOKEN | Standard fungible token with gasless approvals |
 | `Governor` | Production governance | Token-weighted voting (production: voting weight sourced from `VotingEscrow.balanceOfAt` rather than `TOKEN.getPastVotes`) |
@@ -657,7 +639,6 @@ Every deCDN contract should inherit from audited OpenZeppelin base contracts rat
 | Governance | Admin key (single EOA) | OpenZeppelin Governor + 2-day timelock; voting weight = `VotingEscrow.balanceOfAt` |
 | Emergency multisig | Admin key | 3-of-5 multisig with 12-month sunset (also fast-track SafetyReserve payouts under hard caps) |
 | BuybackBurner | Accumulate-only (execution disabled) | Active (keeper or governance triggered); inflow from `FeeRouter` (5% same-tx) rather than manual treasury transfer |
-| WatchtowerEscrow | Not deployed | Deployed |
 | TOKEN minting | `onlyOwner` mint for testnet flexibility | No mint function; fixed 1B supply |
 | Minimum stake | 1,000 TOKEN | 50,000 TOKEN ([ADR 026](026-gauge-boost-tokenomics.md) §7); discount-threshold logic removed |
 | Slashing distribution | 50% challenger / 50% burn | 50% challenger / 30% SafetyReserve / 20% burn ([ADR 026](026-gauge-boost-tokenomics.md) §8) |
@@ -679,14 +660,13 @@ Every deCDN contract should inherit from audited OpenZeppelin base contracts rat
 
 **Negative:**
 
-- Must be kept in sync as other ADRs evolve — any change to contract interfaces in ADRs 003, 007, 009, 010, 011, 014, or 026 requires updating this document
+- Must be kept in sync as other ADRs evolve — any change to contract interfaces in ADRs 003, 009, 010, 011, 014, or 026 requires updating this document
 - Does not cover off-chain interaction patterns (voucher exchange, gossip, probing) — those remain in their respective ADRs
 - The contract surface includes three fund-holding contracts (`FeeRouter`, `VotingEscrow`, `SafetyReserve`) plus optional `DelegatorBuyer`, materially expanding audit scope
 
 ## References
 
 - [ADR 003 — Payment Model](003-payments.md): StablePaymentChannel specification, production `PaymentChannel.settleChannel` → `FeeRouter` routing
-- [ADR 007 — Watchtower Design](007-watchtower.md): WatchtowerEscrow
 - [ADR 009 — Governance Model](009-governance.md): Safety bounds, Governor, emergency multisig
 - [ADR 010 — Multi-Token Payment Support](010-multi-token.md): PaymentChannel, token allowlist
 - [ADR 002 — Content Addressing](002-content-addressing.md): PublisherRegistry, namespaces, content claims

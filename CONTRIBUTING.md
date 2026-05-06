@@ -182,7 +182,7 @@ grep -rn 'function\|contract\|modifier' adr/  # find Solidity interface referenc
 
 ## Adding a New ALPN Protocol Handler
 
-Each ALPN listed in [ADR 005](adr/005-protocol.md) (`cdn/probe/v1`, `cdn/client/v1`, `cdn/watchtower/v1`, `cdn/dht/v1`) is served by a struct that implements `iroh::protocol::ProtocolHandler` and is registered on the iroh `Router` at runtime startup. [`crates/node/src/handlers/probe.rs`](crates/node/src/handlers/probe.rs) is the canonical reference — copy its shape when adding a new handler.
+Each ALPN listed in [ADR 005](adr/005-protocol.md) (`cdn/probe/v1`, `cdn/client/v1`, `cdn/dht/v1`) is served by a struct that implements `iroh::protocol::ProtocolHandler` and is registered on the iroh `Router` at runtime startup. [`crates/node/src/handlers/probe.rs`](crates/node/src/handlers/probe.rs) is the canonical reference — copy its shape when adding a new handler.
 
 The pieces live in two crates, in this order:
 

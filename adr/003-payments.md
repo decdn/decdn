@@ -33,15 +33,15 @@ Key parameters:
 
 ### Deposit Economics
 
-Opening, closing, and settling a channel requires three on-chain transactions totalling ~$0.23 at the production L2's typical gas prices (`openChannel` ~$0.05, `closeChannel` ~$0.10, `settleChannel` ~$0.08). This estimate assumes an existing ERC-20 approval; first-time users incur an additional one-time `approve` transaction (~$0.03), bringing the true first-channel cost to ~$0.26. The table below uses the $0.23 lifecycle cost (excluding the one-time approval) as a percentage of various deposit sizes, with the optional watchtower minimum fee from [ADR 007](007-watchtower.md) modeled as a single 30-day monitoring period:
+Opening, closing, and settling a channel requires three on-chain transactions totalling ~$0.23 at the production L2's typical gas prices (`openChannel` ~$0.05, `closeChannel` ~$0.10, `settleChannel` ~$0.08). This estimate assumes an existing ERC-20 approval; first-time users incur an additional one-time `approve` transaction (~$0.03), bringing the true first-channel cost to ~$0.26. The table below uses the $0.23 lifecycle cost (excluding the one-time approval) as a percentage of various deposit sizes:
 
-| Deposit | Lifecycle gas ($0.23) | Gas % of deposit | + Watchtower ($0.50 / 30 days, optional) | Total overhead % (1 monitoring period) |
-|---------|----------------------|------------------|------------------------------------------|----------------------------------------|
-| 1 USDC  | $0.23                | 23%              | $0.50                                    | 73%                                    |
-| 5 USDC  | $0.23                | 4.6%             | $0.50                                    | 14.6%                                  |
-| 10 USDC | $0.23                | 2.3%             | $0.50                                    | 7.3%                                   |
-| 25 USDC | $0.23                | 0.92%            | $0.50                                    | 2.9%                                   |
-| 100 USDC| $0.23                | 0.23%            | $0.50                                    | 0.73%                                  |
+| Deposit | Lifecycle gas ($0.23) | Gas % of deposit |
+|---------|----------------------|------------------|
+| 1 USDC  | $0.23                | 23%              |
+| 5 USDC  | $0.23                | 4.6%             |
+| 10 USDC | $0.23                | 2.3%             |
+| 25 USDC | $0.23                | 0.92%            |
+| 100 USDC| $0.23                | 0.23%            |
 
 **Recommended practical minimum: 10 USDC.** Client software should default to a 10 USDC minimum deposit (user-overridable). At 10 USDC, gas overhead is 2.3% — acceptable for a payment channel that covers ~10,000,000 MB at the floor rate or ~1,000,000 MB (~1,000 GB) at the expected market rate ($0.01/GB), sufficient for weeks to months of casual use without top-up. The contract minimum (1 USDC, governable via `setMinDeposit`) remains a safety floor — it prevents dust channels that cost more to settle than they contain and preserves flexibility for testing and governance adjustment. Raising the contract minimum is not recommended because it would reduce governance flexibility and create a hard barrier for development/testing scenarios where small deposits are useful.
 
@@ -169,7 +169,7 @@ The self-enforcing stop is sufficient. Maximum loss is one voucher interval at t
 
 Client opens many channels with minimum deposit and never streams, forcing nodes to track and eventually close stale channels.
 
-**Resolved: provider-initiated zero-voucher close.** The provider can call `closeChannel` with `amount=0, nonce=0`, and an empty signature (`signature.length == 0`) on any channel where no vouchers have been submitted (`claimedNonce == 0`), immediately entering the close→dispute→settle lifecycle. This bounds the maximum tracking duration to the dispute window (48 hours PoC default) rather than the full 90-day channel expiry. The dispute window protects clients — if a valid voucher exists, the client or a watchtower can submit it via `disputeChannel`. At settlement, the full deposit is refunded to the client. No additional inactivity timer or separate expiry mechanism beyond the existing channel expiry / `reclaimExpired` path is needed; that existing escape hatch remains required for cases where the provider disappears without initiating a close.
+**Resolved: provider-initiated zero-voucher close.** The provider can call `closeChannel` with `amount=0, nonce=0`, and an empty signature (`signature.length == 0`) on any channel where no vouchers have been submitted (`claimedNonce == 0`), immediately entering the close→dispute→settle lifecycle. This bounds the maximum tracking duration to the dispute window (48 hours PoC default) rather than the full 90-day channel expiry. The dispute window protects clients — if a valid voucher exists, the client or any third party holding a higher-nonce voucher can submit it via `disputeChannel`. At settlement, the full deposit is refunded to the client. No additional inactivity timer or separate expiry mechanism beyond the existing channel expiry / `reclaimExpired` path is needed; that existing escape hatch remains required for cases where the provider disappears without initiating a close.
 
 The financial cost to the attacker remains bounded: at the recommended 10 USDC practical minimum, an attacker spending $1,000 opens 100 channels; the provider closes them all immediately and each settles after the dispute window with full refund to the attacker (no profit motive) and ~$0.18 gas cost to the provider per channel (close + settle). The provider's total gas exposure is ~$18 for 100 griefing channels — significant enough to warrant additional mitigations for high-volume attacks:
 
@@ -180,7 +180,13 @@ The financial cost to the attacker remains bounded: at the recommended 10 USDC p
 
 Client submits an old voucher (lower amount) to close the channel, underpaying the node.
 
-The dispute window (default 48 hours for PoC, raised from 24 hours to account for L2 forced-inclusion delay; see [ADR 007](007-watchtower.md#l2-sequencer-censorship)) covers this if the node is online. The liveness gap — node offline during the window — is the entire problem [ADR 007](007-watchtower.md) addresses: non-custodial watchtowers + an in-process dispute monitor + (production) a forced-inclusion deadline extension.
+The dispute window (default 48 hours for PoC, raised from 24 hours to account for L2 forced-inclusion delay; see [L2 sequencer censorship](#l2-sequencer-censorship) below) covers this if the node is online. **Defense layers:**
+
+1. **In-process dispute monitor.** A lightweight thread inside the node binary watches the chain for `ChannelCloseInitiated` events on its channels and auto-submits the latest voucher via `disputeChannel`. Zero-latency to the local voucher store; handles the common case where the node is online. Implementation is a SHOULD for production node binaries.
+2. **Operator-arranged redundancy.** Multi-instance deployments, hot-standby relays, peer agreements to relay vouchers. Out of protocol scope; the protocol does not define a wire format for voucher-relay arrangements between operators.
+3. **Permissionless on-chain dispute submission.** `disputeChannel` accepts submissions from any address holding a higher-nonce voucher — operators with their own infrastructure or counterparties can submit directly. See [Appendix: Fraud Detection](appendix-fraud-detection.md).
+
+The node-offline-for-the-full-48h case is a node-operations responsibility, not a protocol gap.
 
 #### Probe fishing
 
@@ -219,13 +225,13 @@ Caught at the client by BLAKE3 verification. The on-chain slash-evidence path is
 
 Node advertises a low rate in probe responses then returns a higher rate in `StreamResponse`.
 
-**Resolved: slashable offense.** Both responses are signed over the advertised rate ([ADR 005](005-protocol.md)); a same-NodeId signed pair where `StreamResponse.rate_per_mb > ProbeResponse.rate_per_mb` and the requester-anchored timestamp delta is under 30 seconds is on-chain-verifiable evidence. Clock-skew immune (both timestamps originate from the requester's clock; the node echoes them back in its signed response). The slash schedule lives in [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn); see [ADR 014 § 1](014-on-chain-verification.md#1-ed25519-signature-verification--dual-key-slash-signatures) for the on-chain verifier.
+**Resolved: slashable offense.** Both responses are signed over the advertised rate ([ADR 005](005-protocol.md)); a same-NodeId signed pair where `StreamResponse.rate_per_mb > ProbeResponse.rate_per_mb` and the requester-anchored timestamp delta is under 30 seconds is on-chain-verifiable evidence. Clock-skew immune (both timestamps originate from the requester's clock; the node echoes them back in its signed response). The slash schedule lives in [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn); see [ADR 014 § 1](014-on-chain-verification.md#1-slash-signatures--secp256k1-eip-712) for the on-chain verifier.
 
 #### Phantom blob announcement
 
 Node announces a blob as cached (`has_blob: true` in a signed `ProbeResponse`) then fails or redirects on actual request.
 
-**Resolved: slashable offense.** A same-NodeId signed `ProbeResponse(has_blob: true)` paired with a signed `StreamResponse(ok: false)` or redirect for the same hash within a 30-second requester-anchored timestamp window is on-chain-verifiable evidence. The bare timeout / non-response case is reputation-only (no second signed message → not slashable on-chain). Slash schedule per [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn); on-chain verifier per [ADR 014 § 1](014-on-chain-verification.md#1-ed25519-signature-verification--dual-key-slash-signatures); 24-hour counter-evidence window.
+**Resolved: slashable offense.** A same-NodeId signed `ProbeResponse(has_blob: true)` paired with a signed `StreamResponse(ok: false)` or redirect for the same hash within a 30-second requester-anchored timestamp window is on-chain-verifiable evidence. The bare timeout / non-response case is reputation-only (no second signed message → not slashable on-chain). Slash schedule per [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn); on-chain verifier per [ADR 014 § 1](014-on-chain-verification.md#1-slash-signatures--secp256k1-eip-712); 24-hour counter-evidence window.
 
 To prevent legitimate cache eviction from producing false slash evidence inside the 30-second window, nodes MUST honor a **probe-triggered eviction hold** (35s, 30s slash window + 5s margin) — see [ADR 005 § Probe-Triggered Eviction Hold](005-protocol.md#probe-triggered-eviction-hold) for the requirement and dependent parameters (probe cache TTL, `probe_hold_duration`). Hold violations under OOM / under-provisioning fall to the same 24-hour counter-window; eviction logs are not on-chain verifiable, so only delivery-receipt counter-evidence rebuts. The protocol does not subsidize under-provisioning.
 
@@ -239,7 +245,7 @@ Not a real attack. The contract always settles the highest valid voucher, and on
 
 A third party holding a valid voucher calls `closeChannel` to force the channel from `Open` to `Closing`, halting delivery.
 
-**Resolved: access control restriction.** `closeChannel` requires `msg.sender == channel.client || msg.sender == channel.provider`. Third parties cannot initiate a close regardless of whether they hold a valid voucher. Watchtower functionality is unaffected — watchtowers operate via `disputeChannel` during the dispute window. The residual risk is a `disputeChannel` call with an intercepted voucher, which can only *improve* the settlement (higher nonce required). On-path network interception of vouchers is mitigated by QUIC transport (TLS 1.3), though this does not address endpoint compromise or other forms of leakage.
+**Resolved: access control restriction.** `closeChannel` requires `msg.sender == channel.client || msg.sender == channel.provider`. Third parties cannot initiate a close regardless of whether they hold a valid voucher. Permissionless fraud detection is unaffected — third parties operate via `disputeChannel` during the dispute window ([Appendix: Fraud Detection](appendix-fraud-detection.md)). The residual risk is a `disputeChannel` call with an intercepted voucher, which can only *improve* the settlement (higher nonce required). On-path network interception of vouchers is mitigated by QUIC transport (TLS 1.3), though this does not address endpoint compromise or other forms of leakage.
 
 ### Network-level
 
@@ -309,8 +315,9 @@ struct Channel {
     uint256 openedAt;
     uint256 expiresAt;
     uint8   status;           // 0 = Open, 1 = Closing (dispute window active), 2 = Closed (settled)
-    uint256 disputeDeadline;  // set when close is initiated
-    address lastDisputor;     // msg.sender of the most recent disputeChannel call (used by WatchtowerEscrow for gas bonus verification — see ADR 007)
+    uint256 disputeDeadline;  // set when close is initiated; may be extended once via the forced-inclusion path (see § L2 sequencer censorship)
+    address lastDisputor;     // msg.sender of the most recent disputeChannel call
+    bool    extended;         // true if disputeDeadline has been extended once via the forced-inclusion path; reset to false on closeChannel
 }
 ```
 
@@ -356,7 +363,22 @@ Under [ADR 026](026-gauge-boost-tokenomics.md) the `setFeePercentage`, `setDisco
 
 The constructor takes `(usdc, feeRouter, disputeWindow)` and sets the remaining governable parameters to their PoC defaults: `maxVoucherIntervalMb = 1` (1 MB) and `maxChannelDuration = 7776000` (90 days). All values are within the hardcoded safety bounds table further below (see also [ADR 009](009-governance.md) for governance ranges). The constructor MUST reject `feeRouter == address(0)` and a `feeRouter` whose code size is zero (EOA / undeployed address).
 
-Default PoC deployment value for `disputeWindow`: **172800 seconds (48 hours)** — raised from 24 hours to guarantee effective dispute response time under L2 sequencer censorship (see [ADR 007](007-watchtower.md#l2-sequencer-censorship)). Safety bounds per [ADR 009](009-governance.md): 43200–259200 seconds (12h–72h). Under ADR 026 the `feePercentage` / `discountedFeePercentage` / treasury-address constructor parameters from earlier drafts are removed; bucket shares are governed on `FeeRouter` instead, and the treasury bucket is one of `FeeRouter`'s six buckets (see [FeeRouter Integration](#feerouter-integration)).
+Default PoC deployment value for `disputeWindow`: **172800 seconds (48 hours)** — raised from 24 hours to guarantee effective dispute response time under L2 sequencer censorship (see [§ L2 sequencer censorship](#l2-sequencer-censorship) below). Safety bounds per [ADR 009](009-governance.md): 43200–259200 seconds (12h–72h). Under ADR 026 the `feePercentage` / `discountedFeePercentage` / treasury-address constructor parameters from earlier drafts are removed; bucket shares are governed on `FeeRouter` instead, and the treasury bucket is one of `FeeRouter`'s six buckets (see [FeeRouter Integration](#feerouter-integration)).
+
+#### L2 sequencer censorship
+
+A malicious closer (or colluding sequencer) submits `closeChannel` with a stale voucher and ensures all `disputeChannel` transactions are censored for the full dispute window. Counterparties fall back to L1 forced inclusion, but this takes up to ~24 hours on Arbitrum (similar paths on other OP-Stack chains). If the dispute window is also 24 hours, effective dispute response time is zero by the time the forced-inclusion transaction is processed.
+
+**Mitigation — layered defense.** The dispute window default is **48 hours** (172800 seconds), which guarantees at least 24 hours of effective dispute response time on any L2 with a forced-inclusion delay ≤ 24 hours. The setting is L2-agnostic and stays within the [ADR 009](009-governance.md) governance bounds (12h–72h).
+
+On top of that baseline, `disputeChannel` implements a **forced-inclusion deadline extension**: if a `disputeChannel` transaction arrives via L1 forced inclusion, the remaining dispute time is less than 24 hours, and `channel.extended == false`, `disputeDeadline` is set to `block.timestamp + 24 hours` and `channel.extended` is set to `true` — guaranteeing 24 hours of dispute time from the moment the forced-inclusion transaction is processed. `closeChannel` resets `channel.extended` to `false` so a new close cycle starts fresh.
+
+Constraints on the extension mechanism:
+
+- **One extension per close.** Enforced on-chain by the `channel.extended` flag: once set, subsequent forced-inclusion `disputeChannel` calls do not trigger a further extension. This bounds worst-case settlement delay to `disputeWindow + 24h`.
+- **Only forced-inclusion transactions.** Normal sequencer-included `disputeChannel` calls do not trigger the extension, preventing abuse.
+- **L2-specific detection.** Identifying a forced-inclusion transaction is L2-specific. On Arbitrum, this can be detected via `ArbSys` precompile or delayed-inbox origin; on OP Stack, via L1 message origin. Exact detection logic is finalized at L2 selection — see [Appendix: L2 Deployment](appendix-l2-deployment.md).
+- **Governance must not set the dispute window below the L2's maximum forced-inclusion delay.** On an L2 with ~24h forced inclusion the 12h governance floor is not safe — the extension never executes because `settleChannel` becomes callable before the forced-inclusion `disputeChannel` arrives. The 12h floor remains as a hardcoded safety bound for L2s with shorter forced-inclusion paths.
 
 #### Events
 
@@ -378,8 +400,8 @@ All events use indexed `channelId` plus an indexed actor field where applicable.
 
 **Channel close lifecycle:**
 
-- `closeChannel` → requires status `Open`. **Callable by `channel.client` or `channel.provider` only** (`require(msg.sender == channel.client || msg.sender == channel.provider)`). Sets status to `Closing`, records `claimedAmount`, `claimedNonce`, and `claimedBytes` from the submitted voucher, emits `ChannelCloseInitiated`. No fund transfers. Third parties (including watchtowers) cannot initiate a close — they act only via `disputeChannel` (during the dispute window) or `settleChannel` (after expiration). **Zero-voucher close:** when the provider calls with `amount == 0`, `nonce == 0`, `bytesDelivered == 0`, an empty signature (`signature.length == 0`), and `channel.claimedNonce == 0`, the voucher signature is not verified — this is the provider's mechanism for releasing channels where no vouchers were ever signed. Since voucher nonces start at 1, any real voucher has a strictly higher nonce than the recorded `claimedNonce=0`, so `disputeChannel` works normally. The dispute window applies; a client or watchtower holding a real voucher can dispute.
-- `disputeChannel` → requires status `Closing` and `block.timestamp < disputeDeadline`. Callable by any address holding a valid voucher with a strictly higher nonce. Updates `claimedAmount`, `claimedNonce`, and `claimedBytes`, emits `ChannelDisputed`. No fund transfers. Unrestricted caller access is intentional: watchtowers and other third parties must be able to submit higher-nonce vouchers on behalf of an offline party during the dispute window.
+- `closeChannel` → requires status `Open`. **Callable by `channel.client` or `channel.provider` only** (`require(msg.sender == channel.client || msg.sender == channel.provider)`). Sets status to `Closing`, records `claimedAmount`, `claimedNonce`, and `claimedBytes` from the submitted voucher, emits `ChannelCloseInitiated`. No fund transfers. Third parties cannot initiate a close — they act only via `disputeChannel` (during the dispute window) or `settleChannel` (after expiration). **Zero-voucher close:** when the provider calls with `amount == 0`, `nonce == 0`, `bytesDelivered == 0`, an empty signature (`signature.length == 0`), and `channel.claimedNonce == 0`, the voucher signature is not verified — this is the provider's mechanism for releasing channels where no vouchers were ever signed. Since voucher nonces start at 1, any real voucher has a strictly higher nonce than the recorded `claimedNonce=0`, so `disputeChannel` works normally. The dispute window applies; the client or any third party holding a real voucher can dispute.
+- `disputeChannel` → requires status `Closing` and `block.timestamp < disputeDeadline`. Callable by any address holding a valid voucher with a strictly higher nonce. Updates `claimedAmount`, `claimedNonce`, and `claimedBytes`, emits `ChannelDisputed`. No fund transfers. Unrestricted caller access is intentional: third-party fraud detectors ([Appendix: Fraud Detection](appendix-fraud-detection.md)) must be able to submit higher-nonce vouchers on behalf of an offline party during the dispute window.
 - `settleChannel` → requires status `Closing` and `block.timestamp >= disputeDeadline`. Callable by any address. Refunds `deposit - claimedAmount` to the client and, if `claimedAmount > 0`, transfers `claimedAmount` USDC to the configured `FeeRouter` and invokes `FeeRouter.routeSettlement(channel.provider, claimedBytes, claimedAmount, receiptBatchRoot)` in the same transaction. Sets status to `Closed`, emits `ChannelSettled`. **No fee is computed or skimmed inside this contract** — the router applies the [ADR 026](026-gauge-boost-tokenomics.md) six-bucket split and pays the operator's 40% base share same-tx (see [FeeRouter Integration](#feerouter-integration)).
 - `reclaimExpired` → requires status `Open` and `block.timestamp >= expiresAt`. Returns the full deposit to the client (no fee deducted — no voucher was submitted). Sets status to `Closed`, emits `ChannelExpiredReclaimed`. Callable by the client or the provider. Regardless of caller, the full deposit is returned to `channel.client` — the provider cannot claim funds via this path. This ensures abandoned channels where the client is absent can be cleaned up by the provider to free on-chain state.
 - `forceCloseChannel` → **production `PaymentChannel` only (not part of the PoC `StablePaymentChannel` interface).** Requires status `Open`, `channel.openedAt != 0` (channel exists), and `!allowedTokens[channel.token]` (token has been removed by governance). Callable by any address. Sets status to `Closing`, `claimedAmount = 0`, `claimedNonce = 0` (no voucher submitted), starts the dispute window. Emits `ChannelForceClosedByTokenRemoval`. The provider (or any address holding a valid voucher) can dispute during the dispute window to claim earned fees; if nobody disputes, `settleChannel` returns the full deposit to the client. See [ADR 010](010-multi-token.md) for the full multi-token context.
@@ -472,7 +494,7 @@ Conservation, same-tx satellite legs (5%/5%/3%), and epoch-consistency invariant
 - Node-to-node settlements use direct peer USDC payment with no router invocation.
 - Implementations distinguish node-to-node from client-to-node settlements via the channel's `client` and `provider` fields cross-referenced against the on-chain registry: if both addresses have a registered NodeId binding (see [NodeId-to-Ethereum Binding](#nodeid-to-ethereum-binding)), the channel is node-to-node; otherwise it is client-to-node.
 - The PoC `StablePaymentChannel` may implement the bypass either by exposing a separate `settleChannelNoRoute(channelId)` entry point usable only when both parties are registered nodes, or by having `settleChannel` detect the case and skip the `FeeRouter` call. Either way the operator-to-operator USDC transfer is direct and the router's `bytesPerEpoch` counter is **not** incremented for the receiving operator (those bytes were already counted at the client-to-node settlement that paid for them downstream).
-- Watchtowers ([ADR 007](007-watchtower.md)) MUST observe node-to-node settlements for self-routed-traffic / wash-trading patterns despite the bypass, since the same operator could otherwise inflate their own revenue figures by routing settlements through controlled nodes.
+- Permissionless fraud detectors ([Appendix: Fraud Detection](appendix-fraud-detection.md)) can observe node-to-node settlements for self-routed-traffic / wash-trading patterns despite the bypass, since the same operator could otherwise inflate their own revenue figures by routing settlements through controlled nodes. The bonded-challenge path on `commitEpochSummary` ([ADR 027](027-distinct-client-receipts.md)) is the on-chain remedy.
 
 #### Settlement sequence
 
@@ -692,7 +714,7 @@ The `token` field (ERC-20 address) is included in the signed EIP-712 typed data 
 - **Carried through `closeChannel` / `disputeChannel` to `settleChannel`.** Recorded in `channel.claimedBytes` and forwarded as the `bytesDelivered` argument to `FeeRouter.routeSettlement` at settlement.
 - **Cross-channel consistency.** A voucher signed for one channel is bound by its EIP-712 typed data; `bytesDelivered` is part of that signed payload and cannot be replayed against a different channel.
 
-The router does not validate `bytesDelivered` against any oracle of physical delivery — the value is whatever the client signed. The gauge-pool wash-trading defense relies on distinct-client delivery receipts (forward-referenced from [ADR 026](026-gauge-boost-tokenomics.md#forward-references-follow-up-adrs) as ADR 027) and watchtower observation of self-routed traffic ([ADR 007](007-watchtower.md)) — not on contract-layer byte verification.
+The router does not validate `bytesDelivered` against any oracle of physical delivery — the value is whatever the client signed. The gauge-pool wash-trading defense relies on distinct-client delivery receipts ([ADR 027](027-distinct-client-receipts.md)) and the permissionless bonded-challenger path documented in [Appendix: Fraud Detection](appendix-fraud-detection.md) — not on contract-layer byte verification.
 
 ## Slashing and Channel Interactions
 

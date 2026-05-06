@@ -10,12 +10,12 @@ Content discovery answers the question: "which nodes currently hold blob H?" The
 
 ### The scaling problem with probe fan-out
 
-The current design in [ADR 001](001-network.md) uses **broadcast probe fan-out**: on a cache miss, a node sends a `cdn/probe/v1` message to every known peer simultaneously. This works at PoC scale (tens of nodes) but breaks at production scale:
+An earlier design in [ADR 001](001-network.md) used **broadcast probe fan-out**: on a cache miss, a node sends a `cdn/probe/v1` message to every known peer simultaneously. This works at PoC scale (tens of nodes) but breaks at production scale:
 
-- **O(N) probes per cache miss.** At 1,000 nodes each cache miss generates ~1,000 outbound probe messages. Under the existing 10 fan-outs/second rate limit that is 10,000 probe messages/second/node — a self-DoS risk and a meaningful burden on the peers being probed.
-- **O(N) probe overhead for the prober.** Even with rate limiting, the fan-out latency grows with N because the node must wait for the probe collection window on each of those N connections.
+- **O(N) probes per cache miss.** At 1,000 nodes each cache miss generates ~1,000 outbound probe messages. Under a 10 fan-outs/second rate limit that would have been 10,000 probe messages/second/node — a self-DoS risk and a meaningful burden on the peers being probed.
+- **O(N) probe overhead for the prober.** Even with rate limiting, the fan-out latency would have grown with N because the node would need to wait for the probe collection window on each of those N connections.
 
-These problems exist regardless of network scale. While probe fan-out is fine as a **bootstrap fallback** (when a node first joins and has no routing table), it is the wrong primary mechanism even from day one.
+These problems would have existed regardless of network scale. Probe fan-out is the wrong primary mechanism even from day one — the DHT is.
 
 ### Why gossip content announcements don't work
 
@@ -39,7 +39,7 @@ iroh's built-in `DhtDiscovery` (mainline BitTorrent DHT via pkarr) is unrelated 
 
 ## Decision
 
-`cdn/dht/v1` is the **primary content discovery mechanism from day one**, including PoC. Broadcast probe fan-out is retained as a **bootstrap fallback only** — used when a node's routing table is not yet populated, or when a DHT lookup returns no providers. There is no phased rollout; the DHT is always on.
+`cdn/dht/v1` is the **primary content discovery mechanism from day one**, including PoC. The DHT bootstraps from `StakingRegistry.getActiveNodes()` — a freshly-started node's first peers come from the on-chain registry and immediately participate in DHT lookups, so there is no separate bootstrap window during which DHT cannot resolve. When a DHT lookup returns no providers, the on-chain origin directory (§ Origin discovery below) is the deterministic last-resort fallback. Broadcast probe fan-out is not part of the protocol. There is no phased rollout; the DHT is always on.
 
 ### 1. `cdn/dht/v1` Protocol
 
@@ -143,7 +143,7 @@ When a node gets a cache miss for hash H and the probe cache is empty:
 5. Probe the returned `NodeId` set via `cdn/probe/v1` to confirm live availability and measure latency.
 6. Select provider by unified node selection score ([ADR 001](001-network.md#node-selection-algorithm)); deliver via `cdn/client/v1`.
 
-**Fallback:** if DHT returns no providers, fall back to broadcast probe fan-out across all known peers (the existing mechanism). If that also returns nothing, the blob is not available in the network.
+**Fallback:** if DHT returns no providers, fall back to the on-chain origin directory (§ Origin discovery below). If that also returns nothing, the blob is not available in the network.
 
 **Origin discovery.** A requester that prefers an authorized origin for a hash (e.g., a cache-miss pull where freshness from a publisher-committed source is desirable) discovers candidates through the standard DHT path. The DHT does not discriminate origin vs cache providers — `StoreRequest` is the same wire format regardless of role — so any holder may publish a record. The wire protocol does not surface origin-vs-cache status at probe time either; instead, the requester resolves origin status off-chain by reading `PublisherRegistry.namespaceOf(hash)` and `OriginAssignment.getOrigins(namespaceId)` and intersecting against the probed peer set.
 
@@ -155,23 +155,14 @@ On node startup:
 
 1. Build initial routing table from the on-chain registry peer list (same source as the peer table bootstrap in [ADR 019](019-node-onboarding.md)).
 2. Issue `FindNode(self.node_id)` to initial peers — standard Kademlia self-lookup that populates k-buckets.
-3. **Until routing table has ≥k entries**, use broadcast probe fan-out as fallback for content discovery.
 
-At PoC scale (30 nodes) the routing table is fully populated after a single self-lookup round; the fallback window is seconds.
+The registry-seeded peer list participates in DHT lookups immediately, so there is no separate bootstrap window during which content discovery is unavailable. If a `FindValue` lookup returns no providers during the first few seconds — before k-buckets are fully populated — the on-chain origin directory (§ Origin discovery above) provides the deterministic fallback. At PoC scale (30 nodes) the routing table is fully populated after a single self-lookup round.
 
 ### 2. Popularity Signals and Market Dynamics
 
 Content discovery in an incentive-driven network requires nodes to learn what content is in demand *before* being asked to serve it. Two complementary signals provide this.
 
-#### 2.1 Signal 1: `popular_hashes` Gossip (Advisory)
-
-`NodeAnnounce` carries `popular_hashes` (up to 20 hashes, per [ADR 001](001-network.md)) — a self-reported list of the most-requested hashes a node is actively serving. A node observing hash H in multiple peers' `popular_hashes` lists (default: 3+ peers within 10 minutes) treats H as network-popular and prefetches proactively.
-
-**Integrity:** `popular_hashes` is self-reported and unenforceable. A node could suppress entries to maintain pricing advantage by preventing competitors from prefetching the same content.
-
-**Suppression is economically self-limiting.** A node hiding popular hash H concentrates all demand on itself. Concentrated demand raises its `LoadHint`. Higher `LoadHint` depresses its unified selection score, causing clients to route around it. Under sustained load, suppressing `popular_hashes` reduces earnings — the market corrects without protocol enforcement. This is accepted: `popular_hashes` affects selection quality, not safety.
-
-#### 2.2 Signal 2: DHT FIND_VALUE Query Frequency (Non-Suppressible)
+#### 2.1 Signal 1: DHT FIND_VALUE Query Frequency (Non-Suppressible)
 
 In Kademlia, `FindValueRequest` messages for hash H are routed to nodes closest to H in keyspace **regardless of whether those nodes hold H**. A node close to H in keyspace receives all FIND_VALUE queries for H from the entire network without holding H and without receiving any gossip.
 
@@ -183,17 +174,20 @@ This creates a **natural popularity oracle that cannot be suppressed**:
 
 The signal is honest by construction: FIND_VALUE traffic reflects real client demand, not voluntary self-reporting. No node can suppress it — the routing traffic arrives regardless of what anyone gossips.
 
+#### 2.2 Signal 2: Local Cache-Miss Frequency
+
+Each node tracks cache miss timestamps per hash in a bounded map ([ADR 001 § Prefetching from Local Demand](001-network.md)). A hash crossing the local-miss threshold (default: 3 misses in 5 minutes) is prefetched proactively.
+
 #### 2.3 Prefetch Decision
 
-A node prefetches hash H when **any** signal crosses its threshold:
+A node prefetches hash H when **either** signal crosses its threshold:
 
 | Signal | Default threshold | Action |
 |--------|-------------------|--------|
-| `popular_hashes` appearances | ≥3 distinct peers within 10 min | DHT lookup → pull → STORE publish |
 | FIND_VALUE query rate for H | ≥5 queries within 5 min | DHT lookup → pull → STORE publish |
 | Local miss rate for H | ≥3 misses within 5 min | DHT lookup → pull → STORE publish |
 
-All three thresholds are configurable. All three trigger the same action: DHT FIND_VALUE lookup to find a provider, pull via `cdn/client/v1` (paid), cache locally, publish STORE record.
+Both thresholds are configurable. Both trigger the same action: DHT FIND_VALUE lookup to find a provider, pull via `cdn/client/v1` (paid), cache locally, publish STORE record.
 
 #### 2.4 No Discovery Fees
 
@@ -205,10 +199,10 @@ DHT STORE and FIND_VALUE operations carry no protocol-level fee. The incentive t
 |-----------|---------------------|
 | `cdn/probe/v1` | Unchanged. DHT provides candidates; `cdn/probe/v1` confirms live availability and measures latency. Probe cache (15s TTL, [ADR 001](001-network.md)) still prevents redundant probes for recently confirmed providers. |
 | `cdn/client/v1` | Unchanged. All delivery is paid; DHT affects only how providers are discovered. |
-| `NodeAnnounce` gossip | Unchanged. `popular_hashes` field reused as Signal 1. No new gossip message types. |
+| `NodeAnnounce` gossip | Unchanged. Carries node-level metadata only (region, load); demand signals are derived from DHT FIND_VALUE traffic and local cache misses. No new gossip message types. |
 | Reputation system ([ADR 008](008-reputation.md)) | A node publishing a false STORE record fails at probe time → reputation penalty → fewer clients selected. No new slash condition needed. |
 | Eviction hold ([ADR 005](005-protocol.md)) | Nodes stop re-publishing DHT records when a blob is evicted. TTL ensures stale records expire within 1 hour. |
-| Client discovery ([ADR 012](012-client.md)) | Clients use DHT FIND_VALUE for content discovery the same way nodes do. Probe fan-out bootstrap fallback applies equally. |
+| Client discovery ([ADR 012](012-client.md)) | Clients use DHT FIND_VALUE for content discovery the same way nodes do. The on-chain origin-directory fallback applies equally. |
 
 ### 4. Schema Evolution
 
@@ -227,9 +221,9 @@ DHT STORE and FIND_VALUE operations carry no protocol-level fee. The incentive t
 3. A cache event (blob added) generates ≤k (=20) outgoing STORE messages, not O(N).
 4. A stale STORE record (node evicted the blob) expires within TTL (1 hour) with no explicit retraction.
 5. A false STORE record (node claims to hold a blob it doesn't) fails at the probe step; the publishing node incurs a reputation penalty within one gossip cycle.
-6. During bootstrap (routing table < k entries), broadcast probe fan-out is used as fallback; the fallback window completes within 2 self-lookup rounds.
+6. During bootstrap (routing table < k entries), the on-chain origin directory provides the fallback; routing table fully populated within 2 self-lookup rounds at PoC scale.
 7. A node observing ≥5 FIND_VALUE queries for hash H within 5 minutes initiates a prefetch for H.
-8. A node suppressing `popular_hashes` entries for a popular blob experiences measurable `LoadHint` increase under sustained demand, verifiable in [Appendix: Observability](appendix-observability.md) metrics.
+8. Demand signals derive from DHT FIND_VALUE traffic and local cache-miss timestamps; both are emitted as observability metrics in [Appendix: Observability](appendix-observability.md).
 
 ## Alternatives Considered
 
@@ -237,10 +231,10 @@ The six discovery alternatives evaluated against `cdn/dht/v1` (broadcast probe f
 
 ## Cross-ADR Consistency
 
-- **ADR 001** Future Work section ("Scaling Content Discovery") is superseded by this ADR. The three strategies listed there are resolved: selective fan-out is subsumed by DHT, content DHT is formalised here, gossip content hints are rejected.
+- **ADR 001** Future Work section ("Scaling Content Discovery") is superseded by this ADR. The three strategies listed there are resolved: selective fan-out is removed entirely (the on-chain origin directory is the deterministic last-resort fallback when the DHT returns no providers), content DHT is formalised here, gossip content hints are rejected.
 - **ADR 005** probe protocol is unchanged. DHT provides candidates only.
 - **ADR 008** reputation penalties for delivery failure cover false STORE records (a node publishing a DHT record claiming to hold a blob it does not have).
 - **ADR 011** origin assignment authority is *not* consulted at probe time — origin status is not signaled on the wire. The DHT remains permissionless; per-namespace origin authorization is queried off-chain via `OriginAssignment.getOrigins(namespaceId)` for routing/discovery preferences.
-- **ADR 012** client discovery uses DHT FIND_VALUE; probe fan-out bootstrap fallback applies to clients equally.
+- **ADR 012** client discovery uses DHT FIND_VALUE; the on-chain origin-directory fallback applies to clients equally.
 - **ADR 013** schema evolution rules apply to `cdn/dht/v1`.
 - **the observability appendix** SHOULD add DHT subsystem metrics: `decdn_dht_store_published_total`, `decdn_dht_findvalue_queries_total`, `decdn_dht_routing_table_size`.

@@ -152,7 +152,7 @@ Each client release ships with a built-in default seed list compiled into the bi
 
 - **Content integrity:** BLAKE3 hash verification on every received blob. A malicious node cannot serve corrupted data.
 - **Voucher binding:** EIP-712 signatures on vouchers are produced by the client's own key. The client controls how much it authorizes.
-- **Rate commitment:** `StreamResponse` is signed by the node's iroh key, binding it to the quoted `rate_per_mb`. A rate mismatch vs. the probe response within 30 seconds is slashable ([ADR 005](005-protocol.md)).
+- **Rate commitment:** `StreamResponse` carries a `slash_sig` (EIP-712 secp256k1) over the response fields, binding the node's registered Ethereum identity to the quoted `rate_per_mb`. A rate mismatch vs. the probe response within 30 seconds is slashable ([ADR 005](005-protocol.md)).
 - **Node identity:** QUIC handshake authenticates the remote NodeId (Ed25519). The client knows it is communicating with the registered node.
 - **Payment channel state:** On-chain, publicly verifiable. The client can always settle or dispute.
 
@@ -160,14 +160,14 @@ Each client release ships with a built-in default seed list compiled into the bi
 
 - **RPC endpoint:** Returns correct registry data. A compromised RPC can return a fabricated node list (eclipse). Mitigated in production by multi-source bootstrap (Option B above).
 - **Registry correctness:** The `StakingRegistry` contract accurately reflects staked nodes. Enforced by EVM execution — trust in the chain, not any specific party.
-- **Gossip integrity:** `NodeAnnounce` messages are signed by the announcing node's registered key and validated against the registry. A node cannot forge another's announcement. However, `LoadHint` and `popular_hashes` are advisory — a node can lie, affecting selection quality but not safety.
+- **Gossip integrity:** `NodeAnnounce` messages are signed by the announcing node's registered key and validated against the registry. A node cannot forge another's announcement. However, `LoadHint` is advisory — a node can lie, affecting selection quality but not safety.
 - **Clock:** NTP-synchronized local clock, used for gossip validation (±60 s freshness). Drift beyond this window causes the client to reject valid gossip.
 
 **Not trusted — the client does not rely on these:**
 
 - Any individual node's self-reported metadata (region, load) beyond what is signed and slashable.
 - Network-level reputation scores (30% gossip weight in [ADR 008](008-reputation.md); local observations dominate at 70%).
-- Node availability promises beyond signed probe responses (unsigned gossip claims like `popular_hashes` are advisory).
+- Node availability promises beyond signed probe responses (unsigned gossip claims like `LoadHint` are advisory).
 
 ### Client Configuration
 

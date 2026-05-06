@@ -19,6 +19,7 @@ use iroh_blobs::Hash;
 use tokio::io::AsyncReadExt;
 
 use super::{Origin, OriginFetch};
+use crate::error::OriginPullError;
 
 /// Initial capacity hint for the per-fetch read buffer. Caps the
 /// up-front allocation so a multi-GB blob (or an over-generous
@@ -82,12 +83,34 @@ impl FilesystemOrigin {
     }
 }
 
+/// Classify a filesystem `io::Error` as transient or permanent. Most FS
+/// failures (`PermissionDenied`, "not a directory", read errors on a
+/// closed file handle) are deterministic — retry won't change the
+/// answer. The handful of error kinds the kernel uses for "the syscall
+/// got interrupted, try again" are retriable.
+///
+/// `NotFound` is intentionally not handled here — the call sites
+/// convert it to [`OriginFetch::NotFound`] before reaching this helper.
+/// Symlink-escape is *also* not an `io::Error` and never reaches this
+/// helper — it's detected by path comparison after `canonicalize` and
+/// emits `OriginPullError::Permanent` directly at the call site.
+fn classify_io_error(err: std::io::Error) -> OriginPullError {
+    use std::io::ErrorKind;
+    match err.kind() {
+        ErrorKind::Interrupted
+        | ErrorKind::TimedOut
+        | ErrorKind::ResourceBusy
+        | ErrorKind::WouldBlock => OriginPullError::Transient(err.into()),
+        _ => OriginPullError::Permanent(err.into()),
+    }
+}
+
 impl Origin for FilesystemOrigin {
     fn fetch(
         &self,
         hash: Hash,
         max_bytes: u64,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<OriginFetch>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>> {
         Box::pin(async move {
             let path = self.path_for(hash);
 
@@ -105,19 +128,21 @@ impl Origin for FilesystemOrigin {
                     return Ok(OriginFetch::NotFound);
                 }
                 Err(err) => {
-                    return Err(anyhow::Error::from(err).context(format!(
+                    let path_msg = format!(
                         "cache.origin_path canonicalize failed for {}",
                         path.display()
-                    )));
+                    );
+                    return Err(classify_io_error(err).map_inner(|e| e.context(path_msg)));
                 }
             };
             if !canonical.starts_with(&self.base) {
-                anyhow::bail!(
+                // Symlink escape: deterministic permanent failure.
+                return Err(OriginPullError::Permanent(anyhow::anyhow!(
                     "cache.origin_path entry {} resolves to {} which is outside base {}",
                     path.display(),
                     canonical.display(),
                     self.base.display()
-                );
+                )));
             }
 
             // Open once and stat via the file handle (fstat), so the
@@ -139,29 +164,29 @@ impl Origin for FilesystemOrigin {
                     return Ok(OriginFetch::NotFound);
                 }
                 Err(err) => {
-                    return Err(anyhow::Error::from(err).context(format!(
-                        "cache.origin_path open failed for {}",
-                        canonical.display()
-                    )));
+                    let path_msg =
+                        format!("cache.origin_path open failed for {}", canonical.display());
+                    return Err(classify_io_error(err).map_inner(|e| e.context(path_msg)));
                 }
             };
-            let meta = file.metadata().await.with_context(|| {
-                format!("cache.origin_path stat failed for {}", canonical.display())
+            let meta = file.metadata().await.map_err(|err| {
+                let path_msg = format!("cache.origin_path stat failed for {}", canonical.display());
+                classify_io_error(err).map_inner(|e| e.context(path_msg))
             })?;
 
             if !meta.is_file() {
-                anyhow::bail!(
+                return Err(OriginPullError::Permanent(anyhow::anyhow!(
                     "cache.origin_path entry {} is not a regular file",
                     canonical.display()
-                );
+                )));
             }
 
             let len = meta.len();
             if len > max_bytes {
-                anyhow::bail!(
+                return Err(OriginPullError::Permanent(anyhow::anyhow!(
                     "cache.origin_path entry {} is {len} bytes, exceeds max {max_bytes}",
                     canonical.display()
-                );
+                )));
             }
 
             // Pre-size to `len` so `read_to_end` skips growth reallocs,
@@ -171,7 +196,9 @@ impl Origin for FilesystemOrigin {
             // OOM up front; capping means a few cheap doublings
             // instead of one huge allocation. `read_to_end` will
             // still grow the buffer as the read progresses.
-            let want_cap = usize::try_from(len).context("file size exceeds addressable memory")?;
+            let want_cap = usize::try_from(len)
+                .context("file size exceeds addressable memory")
+                .map_err(OriginPullError::Permanent)?;
             let mut data = Vec::with_capacity(want_cap.min(INITIAL_READ_CAP_HINT));
 
             // Bound the read at the I/O layer: even with the size
@@ -182,14 +209,15 @@ impl Origin for FilesystemOrigin {
             // the post-check can disambiguate "exactly max_bytes"
             // from "more than max_bytes."
             let mut reader = (&mut file).take(max_bytes.saturating_add(1));
-            reader.read_to_end(&mut data).await.with_context(|| {
-                format!("cache.origin_path read failed for {}", canonical.display())
+            reader.read_to_end(&mut data).await.map_err(|err| {
+                let path_msg = format!("cache.origin_path read failed for {}", canonical.display());
+                classify_io_error(err).map_inner(|e| e.context(path_msg))
             })?;
             if data.len() as u64 > max_bytes {
-                anyhow::bail!(
+                return Err(OriginPullError::Permanent(anyhow::anyhow!(
                     "cache.origin_path entry {} grew past max {max_bytes} during read",
                     canonical.display()
-                );
+                )));
             }
             Ok(OriginFetch::Found(Bytes::from(data)))
         })

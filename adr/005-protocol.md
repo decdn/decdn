@@ -11,13 +11,12 @@ The protocol layer must be distinct from the transport layer (iroh/QUIC) and the
 
 ## Decision
 
-Three core protocols negotiated via ALPN, plus the built-in iroh-gossip protocol:
+Two core protocols negotiated via ALPN, plus the built-in iroh-gossip protocol:
 
 | Protocol | Participants | Purpose |
 | --- | --- | --- |
 | `cdn/probe/v1` | any node ↔ any node | Latency and availability check before committing to a node |
 | `cdn/client/v1` | payer ↔ delivering node | Paid blob delivery with payment vouchers (client→node, node→node on cache miss) |
-| `cdn/watchtower/v1` | watched party (typically node) ↔ watchtower | Channel-dispute monitoring: voucher registration and updates (see ADR 007) |
 | iroh-gossip (built-in) | all nodes | Node metadata announcements (`NodeAnnounce`), node discovery |
 
 ### Gossip topics
@@ -28,9 +27,8 @@ The iroh-gossip protocol carries multiple message types on distinct topics:
 | --- | --- | --- |
 | `cdn/global/v1`, `cdn/region/{cc}/v1` | `NodeAnnounce` | [ADR 001](001-network.md) |
 | `cdn/reputation/v1` | `ReputationReport` | [ADR 008](008-reputation.md) |
-| `cdn/global/v1` (production) | `WatchtowerAnnounce` | [ADR 007](007-watchtower.md) |
 
-All gossip topics use the `cdn/` namespace prefix. `NodeAnnounce` and `ReputationReport` are active in production; `WatchtowerAnnounce` is a planned production extension for watchtower discovery at scale (PoC uses static watchtower lists — see [ADR 007](007-watchtower.md)).
+All gossip topics use the `cdn/` namespace prefix. There is no protocol-level role for fraud monitoring — anyone may run an off-chain detector against the L2 chain ([Appendix: Fraud Detection](appendix-fraud-detection.md)).
 
 ### Rate discovery
 
@@ -46,19 +44,17 @@ sequenceDiagram
     participant C as Candidate Node
 
     R->>C: ProbeRequest {hash, timestamp_us}
-    C->>R: ProbeResponse {has_blob, rate_per_mb, timestamp_us, signature, total_bytes?, slash_sig}
+    C->>R: ProbeResponse {has_blob, rate_per_mb, timestamp_us, total_bytes?, slash_sig}
 
     Note over R: RTT = receive_time - timestamp_us
     Note over R: Score = unified selection score (see ADR 001)
 ```
 
-`timestamp_us` is a requester-generated microsecond timestamp echoed back. RTT is `receive_time - timestamp_us`. `has_blob` confirms the node has the content. The protocol does not distinguish origin from cache at probe time — origin status is a publisher-level commitment recorded in `OriginAssignment` (see [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority)) and discoverable off-chain via `OriginAssignment.getOrigins(namespaceId)`; the wire response describes only "I have the bytes and will serve them at this rate." Cache-only serving is permissionless and indistinguishable from origin serving over the wire, which is correct: clients verify bytes via BLAKE3 regardless of who served them. `rate_per_mb` lets the requester score candidates on both latency and price in a single round-trip. `total_bytes` is an optional unsigned field indicating the blob's total size in bytes. When present, it lets the requester estimate total cost before committing to a node or opening a payment channel. Nodes SHOULD include it when the blob size is known. The field is not covered by the signature — it is not needed for any slashing mechanism and follows the Tier 1 minor evolution pattern from [ADR 013](013-schema-evolution.md#tier-1--minor-no-coordination).
+`timestamp_us` is a requester-generated microsecond timestamp echoed back. RTT is `receive_time - timestamp_us`. `has_blob` confirms the node has the content. The protocol does not distinguish origin from cache at probe time — origin status is a publisher-level commitment recorded in `OriginAssignment` (see [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority)) and discoverable off-chain via `OriginAssignment.getOrigins(namespaceId)`; the wire response describes only "I have the bytes and will serve them at this rate." Cache-only serving is permissionless and indistinguishable from origin serving over the wire, which is correct: clients verify bytes via BLAKE3 regardless of who served them. `rate_per_mb` lets the requester score candidates on both latency and price in a single round-trip. `total_bytes` is an optional unsigned field indicating the blob's total size in bytes. When present, it lets the requester estimate total cost before committing to a node or opening a payment channel. Nodes SHOULD include it when the blob size is known. The field is not covered by `slash_sig` — it is not needed for any slashing mechanism and follows the Tier 1 minor evolution pattern from [ADR 013](013-schema-evolution.md#tier-1--minor-no-coordination).
 
-`signature` is the candidate node's iroh private key signature over `{hash, has_blob, rate_per_mb, timestamp_us}`. The signed-field set is the v1 baseline; per [ADR 013 § Signed Field Freezing](013-schema-evolution.md#signed-field-freezing), any subsequent change to this set is a Tier 3 ALPN bump. The signature makes the probe response cryptographically attributable and enables two slashing mechanisms: (1) **phantom announcement slashing** — if `has_blob: true` in `ProbeResponse` but the node returns a signed `StreamResponse` with `ok: false` or a redirect for the same hash, the two signed messages are on-chain-verifiable evidence of a phantom announcement (the timeout/non-response case is handled separately — see ADR 003); (2) **rate manipulation slashing** — if `stream_response.timestamp_us >= probe_response.timestamp_us` and `stream_response.timestamp_us - probe_response.timestamp_us < 30_000_000` (30 seconds) and `stream_response.rate_per_mb > probe_response.rate_per_mb`, both signed messages constitute on-chain-verifiable evidence of bait-and-switch. Evidence age is bounded by the existing `Max evidence age` parameter ([ADR 009](009-governance.md)) so honest operators are never exposed to indefinite slash risk from old probes. Both `timestamp_us` values are requester-generated (the probe timestamp is echoed in `ProbeResponse`; `StreamResponse` echoes a separate requester timestamp from `StreamRequest`), so the on-chain verifier computes the delta from a single clock with no wall-clock reference needed. **Submitting slash evidence requires a 100 TOKEN challenge bond** — see [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn). The bond is returned if the challenge succeeds and forfeited if the node successfully counters, preventing zero-cost griefing via fabricated slash claims.
+`slash_sig` is the candidate node's EIP-712 secp256k1 signature over `{hash, has_blob, rate_per_mb, timestamp_us}`, signed with the operator's Ethereum key registered in `StakingRegistry` ([ADR 003 § NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)). The signed-field set is the v1 baseline; per [ADR 013 § Signed Field Freezing](013-schema-evolution.md#signed-field-freezing), any subsequent change to this set is a Tier 3 ALPN bump. The signature makes the probe response cryptographically attributable to a registered node and enables two slashing mechanisms: (1) **phantom announcement slashing** — if `has_blob: true` in `ProbeResponse` but the node returns a signed `StreamResponse` with `ok: false` or a redirect for the same hash, the two signed messages are on-chain-verifiable evidence of a phantom announcement (the timeout/non-response case is handled separately — see ADR 003); (2) **rate manipulation slashing** — if `stream_response.timestamp_us >= probe_response.timestamp_us` and `stream_response.timestamp_us - probe_response.timestamp_us < 30_000_000` (30 seconds) and `stream_response.rate_per_mb > probe_response.rate_per_mb`, both signed messages constitute on-chain-verifiable evidence of bait-and-switch. Evidence age is bounded by the existing `Max evidence age` parameter ([ADR 009](009-governance.md)) so honest operators are never exposed to indefinite slash risk from old probes. Both `timestamp_us` values are requester-generated (the probe timestamp is echoed in `ProbeResponse`; `StreamResponse` echoes a separate requester timestamp from `StreamRequest`), so the on-chain verifier computes the delta from a single clock with no wall-clock reference needed. **Submitting slash evidence requires a 100 TOKEN challenge bond** — see [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn). The bond is returned if the challenge succeeds and forfeited if the node successfully counters, preventing zero-cost griefing via fabricated slash claims.
 
-**Signer binding:** Both `ProbeResponse` and `StreamResponse` Ed25519 signatures bind to the signer's identity through the iroh connection's authenticated NodeId. For on-chain slash evidence, each message carries a `slash_sig` — an EIP-712 secp256k1 signature over the same security-relevant fields, verifiable via `ecrecover` at 3,000 gas. In the PoC, `slash_sig` is mandatory on every `ProbeResponse` and `StreamResponse`, ensuring all delivery interactions are on-chain slashable. On-chain slash evidence submissions include the NodeId so the `SlashJudge` contract can confirm the recovered Ethereum address maps to a registered node via `StakingRegistry`. See [ADR 014](014-on-chain-verification.md) for the full dual-key scheme, EIP-712 type definitions, and `SlashJudge` contract interface.
-
-> **PoC constraint:** `slash_sig` is mandatory. PoC nodes MUST reject any `ProbeResponse` or `StreamResponse` that omits `slash_sig`. A future production version may relax validation semantics (accepting zero-length `slash_sig` as opt-out) while keeping the field on the wire for postcard compatibility — fully removing the field would require a Tier 3 / ALPN bump per [ADR 013](013-schema-evolution.md). Requesters may require a non-empty `slash_sig` as a stream precondition; nodes that refuse receive a reputation penalty ([ADR 008](008-reputation.md)).
+**Signer binding:** Connection-level peer identity is authenticated by the iroh QUIC handshake against the registered NodeId (Ed25519). Message-body attribution and on-chain slash evidence both rely on `slash_sig`: verifiers recover the Ethereum address via `ecrecover` (3,000 gas on-chain) and confirm it maps to the expected NodeId via `StakingRegistry.nodeIdOf` ([ADR 003 § NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)). `slash_sig` is mandatory and non-empty on every `ProbeResponse` and `StreamResponse` — there is no opt-out. Requesters MUST reject responses with missing or zero-length `slash_sig`. See [ADR 014](014-on-chain-verification.md) for the EIP-712 type definitions and `SlashJudge` contract interface.
 
 **Dependent parameters:** The probe cache TTL in [ADR 001](001-network.md) is derived as half this 30-second window (15 seconds). Changing the slashing window requires updating the probe cache TTL to maintain the invariant that cached probe responses remain within the slashable window. The `probe_hold_duration` (see below) is derived as this window plus 5-second margin; changing the slashing window requires updating both.
 
@@ -70,7 +66,7 @@ When a node responds `has_blob: true` to a `ProbeRequest`, the node MUST ensure 
 
 #### Hold budget
 
-The total number of concurrently held blobs is bounded by `max_probe_holds` (default: 256, operator-configurable). Holds are per-blob, not per-probe — multiple peers probing the same blob share one hold slot, so the effective throughput is higher than `max_probe_holds / probe_hold_duration` for popular content. When all hold slots are occupied, additional probe requests for unheld blobs receive `has_blob: false` even if the blob is currently in cache. This bounds the effective cache size reduction from holds to at most `max_probe_holds` entries. Operators running small caches should set `max_probe_holds` proportional to their cache size (recommended: no more than 25% of cache capacity). Production nodes serving many peers should increase the default proportionally. The existing inbound probe rate limit (20 probes/peer/second — see [ADR 001](001-network.md)) bounds the rate at which any single peer can consume hold slots, but a coordinated probe flood from many peers (Sybil attack) can still exhaust the global budget — forcing the node to return `has_blob: false` for cached content. This is a degradation of availability, not a safety violation: the node loses revenue but is not falsely slashed. Operators may deploy additional global rate limits or DoS protections as needed.
+The total number of concurrently held blobs is bounded by `max_probe_holds` (default: 256, operator-configurable). Holds are per-blob, not per-probe — multiple peers probing the same blob share one hold slot, so the effective throughput is higher than `max_probe_holds / probe_hold_duration` for popular content. When all hold slots are occupied, additional probe requests for unheld blobs receive `has_blob: false` even if the blob is currently in cache. This bounds the effective cache size reduction from holds to at most `max_probe_holds` entries. Operators running small caches should set `max_probe_holds` proportional to their cache size (recommended: no more than 25% of cache capacity). Production nodes serving many peers should increase the default proportionally. The existing inbound probe rate limit (5 probes/peer/second — see [ADR 001](001-network.md)) bounds the rate at which any single peer can consume hold slots, but a coordinated probe flood from many peers (Sybil attack) can still exhaust the global budget — forcing the node to return `has_blob: false` for cached content. This is a degradation of availability, not a safety violation: the node loses revenue but is not falsely slashed. Operators may deploy additional global rate limits or DoS protections as needed.
 
 #### Rate bounds validation
 
@@ -98,7 +94,7 @@ sequenceDiagram
     participant D as Delivering Node
 
     P->>D: StreamRequest {hash, channel_id, byte_offset, timestamp_us, voucher_interval_mb?}
-    D->>P: StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, signature, redirect?, error?, voucher_interval_mb?, slash_sig}
+    D->>P: StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, redirect?, error?, voucher_interval_mb?, slash_sig}
 
     alt ok = true
         loop Every voucher_interval_mb (default 1 MB)
@@ -131,9 +127,9 @@ struct StreamRequest {
 
 The client includes `ethereum_address` and `binding_signature` in the first `StreamRequest` on a connection. The node verifies the EIP-712 signature via `ecrecover`, caches the verified binding for the connection's lifetime, and uses the recovered address for `clientStakeOf` lookups and voucher attribution. Subsequent requests on the same connection may omit these fields. These are `Option` fields that live in the `StreamRequestExt` extensions struct and default to `None` when absent, via the two-phase deserialization pattern defined in [ADR 013](013-schema-evolution.md#tier-1--minor-no-coordination). Peers that do not send them (e.g., nodes in node-to-node pulls where both sides have on-chain bindings) produce frames without extension bytes, and the receiver fills `StreamRequestExt::default()` — no ALPN version bump is needed since this is defined before the first implementation.
 
-**Voucher wire format:** `Voucher {sig, amt, nonce}` above is shorthand. The EIP-712 signed data covers the full structure from [ADR 003](003-payments.md): `{channelId, amount, nonce, token}`. The fields `signature`, `amount`, and `nonce` are transmitted on the wire; the remaining fields are derived from stream context — `channel_id` is in `StreamRequest` and `token` is fixed at channel open. Including `nonce` explicitly (rather than relying on a monotonically incrementing implicit counter) prevents desynchronization if a `VoucherAck` is dropped. The receiver reconstructs the full typed data to verify the signature. This aligns with the watchtower `VoucherUpdate` below, which also includes `nonce` explicitly — though the watchtower version still requires `channel_id` and `token` because it lacks stream context.
+**Voucher wire format:** `Voucher {sig, amt, nonce}` above is shorthand. The EIP-712 signed data covers the full structure from [ADR 003](003-payments.md): `{channelId, amount, nonce, token}`. The fields `signature`, `amount`, and `nonce` are transmitted on the wire; the remaining fields are derived from stream context — `channel_id` is in `StreamRequest` and `token` is fixed at channel open. Including `nonce` explicitly (rather than relying on a monotonically incrementing implicit counter) prevents desynchronization if a `VoucherAck` is dropped. The receiver reconstructs the full typed data to verify the signature.
 
-The delivering node advertises its `rate_per_mb` in `StreamResponse`. The payer accepts by sending the first voucher or disconnects and tries another node. No surprise pricing. `timestamp_us` in `StreamResponse` is the requester-generated microsecond timestamp from `StreamRequest`, echoed back unchanged — the same pattern as `ProbeResponse`. The node's iroh key signs all security-relevant fields: `{hash, ok, rate_per_mb, total_bytes, channel_id, timestamp_us, redirect}`, making the response cryptographically binding. A `slash_sig` (EIP-712 secp256k1 signature over the same fields, mandatory in PoC) enables on-chain verification via `ecrecover` — see [ADR 014](014-on-chain-verification.md). Signing the full response prevents a malicious party from altering unsigned fields while reusing a valid signature — in particular, `ok` is needed for phantom announcement evidence (proving a node signed `ok: false` after claiming `has_blob: true` in a probe), and `redirect` ensures a node cannot silently alter routing without accountability. A rate mismatch where `stream_response.rate_per_mb > probe_response.rate_per_mb` is slashable if `stream_response.timestamp_us >= probe_response.timestamp_us` and `stream_response.timestamp_us - probe_response.timestamp_us < 30_000_000` (30 seconds). The ordering check prevents unsigned integer underflow in the on-chain verifier. Because both `timestamp_us` values are requester-generated, the on-chain verifier computes this delta from the signed messages alone — no wall-clock reference or external time oracle is needed, and clock skew between the requester and the node does not affect the check. The `redirect` field in `StreamResponse` is used when a node cannot serve — it contains the NodeId of another node that can, never an external URL. The network is fully opaque.
+The delivering node advertises its `rate_per_mb` in `StreamResponse`. The payer accepts by sending the first voucher or disconnects and tries another node. No surprise pricing. `timestamp_us` in `StreamResponse` is the requester-generated microsecond timestamp from `StreamRequest`, echoed back unchanged — the same pattern as `ProbeResponse`. `slash_sig` is an EIP-712 secp256k1 signature over `{hash, ok, rate_per_mb, total_bytes, channel_id, timestamp_us, redirect}`, signed with the operator's Ethereum key and verifiable via `ecrecover` — see [ADR 014](014-on-chain-verification.md). It is mandatory and non-empty on every `StreamResponse`. Signing the full response prevents a malicious party from altering unsigned fields while reusing a valid signature — in particular, `ok` is needed for phantom announcement evidence (proving a node signed `ok: false` after claiming `has_blob: true` in a probe), and `redirect` ensures a node cannot silently alter routing without accountability. A rate mismatch where `stream_response.rate_per_mb > probe_response.rate_per_mb` is slashable if `stream_response.timestamp_us >= probe_response.timestamp_us` and `stream_response.timestamp_us - probe_response.timestamp_us < 30_000_000` (30 seconds). The ordering check prevents unsigned integer underflow in the on-chain verifier. Because both `timestamp_us` values are requester-generated, the on-chain verifier computes this delta from the signed messages alone — no wall-clock reference or external time oracle is needed, and clock skew between the requester and the node does not affect the check. The `redirect` field in `StreamResponse` is used when a node cannot serve — it contains the NodeId of another node that can, never an external URL. The network is fully opaque.
 
 #### Redirect loop prevention
 
@@ -147,7 +143,7 @@ The requester MUST enforce:
 
 #### Voucher interval negotiation
 
-The optional `voucher_interval_mb` field in `StreamRequest` proposes a larger-than-default voucher cadence for this stream (see [ADR 003 — Voucher Interval Negotiation](003-payments.md#voucher-interval-negotiation)). If present, the node responds with its accepted interval in `StreamResponse.voucher_interval_mb` — which may be equal to or smaller than the proposed value. If absent from either message, both sides default to 1 MB. The `voucher_interval_mb` field is **not** included in the `StreamResponse` signature because it is a delivery-layer optimization, not a security-relevant field — the node can always enforce a smaller interval unilaterally by pausing delivery.
+The optional `voucher_interval_mb` field in `StreamRequest` proposes a larger-than-default voucher cadence for this stream (see [ADR 003 — Voucher Interval Negotiation](003-payments.md#voucher-interval-negotiation)). If present, the node responds with its accepted interval in `StreamResponse.voucher_interval_mb` — which may be equal to or smaller than the proposed value. If absent from either message, both sides default to 1 MB. The `voucher_interval_mb` field is **not** covered by `slash_sig` because it is a delivery-layer optimization, not a security-relevant field — the node can always enforce a smaller interval unilaterally by pausing delivery.
 
 The protocol is self-enforcing: payer stops sending vouchers → delivering node stops sending chunks; delivering node stops sending chunks → payer stops sending vouchers.
 
@@ -155,34 +151,11 @@ The protocol is self-enforcing: payer stops sending vouchers → delivering node
 
 ### Gossip — node metadata
 
-Node metadata is broadcast over iroh-gossip on region-scoped topics (`cdn/region/{cc}/v1`) and a global topic (`cdn/global/v1`). All staked nodes publish `NodeAnnounce` messages containing node-level metadata: region, load hint, and a list of popular hashes (max 20). `NodeAnnounce` does not carry content inventories — content discovery uses `cdn/dht/v1` (O(log N) FIND_VALUE) with `cdn/probe/v1` as confirmation and bootstrap fallback. See [ADR 022](022-content-discovery.md) and [ADR 001](001-network.md).
+Node metadata is broadcast over iroh-gossip on region-scoped topics (`cdn/region/{cc}/v1`) and a global topic (`cdn/global/v1`). All staked nodes publish `NodeAnnounce` messages containing node-level metadata: region and load hint. `NodeAnnounce` does not carry content inventories — content discovery uses `cdn/dht/v1` (O(log N) FIND_VALUE) with `cdn/probe/v1` as live-availability confirmation. See [ADR 022](022-content-discovery.md) and [ADR 001](001-network.md).
 
 Region codes (`{cc}` in topic names) are self-declared ISO 3166-1 alpha-2 country codes carried in each node's `NodeAnnounce`. Gossip validation ([ADR 001](001-network.md)) enforces that the `region` field is exactly 2 ASCII uppercase letters matching a known ISO 3166-1 alpha-2 code — messages with invalid region values are dropped. Misreporting a valid but incorrect region is mitigated by latency-based reputation scoring: clients penalize nodes whose observed RTT contradicts the claimed region (e.g., RTT > 150 ms to a node in the same claimed region). See [ADR 001](001-network.md) for the full `NodeAnnounce` struct, gossip validation rules, and region-misreporting mitigation details.
 
 Gossip messages are lightweight (~800 bytes worst case), well within iroh-gossip message limits. Clients and nodes maintain a peer table (`NodeId → NodeAnnounce`) from received messages. The probe step determines which peers hold specific content, along with their cost and latency.
-
-### `cdn/watchtower/v1` — channel-dispute monitoring
-
-Used by either channel party (typically the node) to register payment channels with a watchtower service that monitors for on-chain disputes. The full protocol design is specified in ADR 007.
-
-```mermaid
-sequenceDiagram
-    participant W as Watched Party (Node)
-    participant T as Watchtower
-
-    W->>T: WatchtowerRegister {channel_id, deposit, client, token, latest_voucher, membership_sig}
-    T->>W: WatchtowerAccept {accepted, fee}
-
-    loop Every voucher (at voucher interval from ADR 003, default 1 MB)
-        W->>T: VoucherUpdate {channel_id, amount, nonce, token, signature}
-        T->>W: VoucherAck
-    end
-
-    W->>T: WatchtowerRevoke {channel_id}
-    T->>W: WatchtowerRevokeAck {channel_id}
-```
-
-The watched party sends its latest voucher on registration and streams updates as new vouchers arrive during delivery. `client` is the voucher signer's Ethereum address (replaces the former `counterparty` field for clarity). `token` is the ERC-20 token address for this channel — required because the watchtower must reconstruct the EIP-712 typed data for off-chain signature verification and needs the token address to do so. Together with the watchtower's configured `contract` address and `chain_id`, these fields enable full off-chain EIP-712 verification. `latest_voucher` has the same shape as `VoucherUpdate`: `{channel_id, amount, nonce, token, signature}`. If no vouchers have been exchanged yet, `latest_voucher` is omitted (the watchtower registers the channel with `amount=0, nonce=0`). If the client initiates an on-chain close with a stale (lower-nonce) voucher, the watchtower submits a `disputeChannel` transaction with the latest voucher it holds. The watchtower is non-custodial — it cannot steal funds, worsen settlement, or grief; the voucher's EIP-712 signature is the only authorization the contract checks.
 
 ### Connection Management
 
@@ -190,7 +163,7 @@ One QUIC connection per `(local_node, remote_node, ALPN)` tuple. Multiple reques
 
 Different ALPNs require separate connections (TLS ALPN is negotiated at connection establishment). A `cdn/probe/v1` connection and a `cdn/client/v1` connection to the same node are always distinct.
 
-**0-RTT early data** is permitted on `cdn/probe/v1` only (idempotent, read-only probes). All other protocols reject 0-RTT: `cdn/client/v1` and `cdn/watchtower/v1` to prevent replay-based accounting or registration confusion. See [ADR 015](015-zero-rtt.md) for the full replay safety analysis and session ticket management.
+**0-RTT early data** is permitted on `cdn/probe/v1` only (idempotent, read-only probes). `cdn/client/v1` rejects 0-RTT to prevent replay-based accounting confusion. See [ADR 015](015-zero-rtt.md) for the full replay safety analysis and session ticket management.
 
 #### Concurrent stream limits
 
@@ -200,7 +173,6 @@ Maximum concurrent bidirectional streams per connection, set via QUIC transport 
 | --- | --- | --- |
 | `cdn/client/v1` | 100 | Enough parallelism for bulk fetching (e.g., video manifest + segments) without exhausting server resources |
 | `cdn/probe/v1` | 1 | Single request-response; the connection is reused for sequential probes to the same node |
-| `cdn/watchtower/v1` | 10 | Allows concurrent updates for up to 10 registered channels; a node with more channels multiplexes updates over the available streams (sufficient for PoC; production nodes with many concurrent channels should open multiple connections or increase this limit via transport parameter negotiation) |
 
 Stream concurrency is enforced via QUIC's `MAX_STREAMS` transport parameter: a peer MUST NOT open a new bidirectional stream beyond the advertised limit (doing so is a protocol violation resulting in `STREAM_LIMIT_ERROR` and connection close). The receiver grants additional credit by sending `MAX_STREAMS` updates as existing streams close.
 
@@ -236,7 +208,6 @@ Implementation constraint: the payer must have a single voucher-signing task per
 
 - Connections remain open while any stream is active or any sent voucher is awaiting `VoucherAck` (on-chain channel closure does not affect connection lifetime).
 - **Idle timeout:** 30 seconds after the last stream closes and no unacknowledged vouchers remain in flight. Endpoints SHOULD send periodic QUIC PING frames when otherwise idle, with a default interval of 10 seconds (below the idle timeout) to prevent NAT middleboxes from dropping the mapping.
-- **`cdn/watchtower/v1` exception:** watchtower connections are long-lived by design (ADR 007). No idle timeout while any channel is registered.
 
 ### Error Handling and Retry Semantics
 
@@ -268,7 +239,7 @@ This error code is informational only (unsigned, like all error codes — see be
 4. **Per-attempt timeout:** 10 seconds from `StreamRequest` to first `ChunkData`. If no data arrives within 10 seconds, the requester treats it as a connection failure and moves to the next candidate.
 5. **Mid-stream failure:** if chunks stop arriving mid-delivery, the requester waits 10 seconds, then reconnects to the next candidate with `byte_offset` set to the last BLAKE3-verified byte.
 
-The error code is **not** included in the `StreamResponse` signature — it is informational only and not used for slashing evidence.
+The error code is **not** covered by `slash_sig` — it is informational only and not used for slashing evidence.
 
 ### Stream Lifecycle State Machine
 

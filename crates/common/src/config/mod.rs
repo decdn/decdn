@@ -39,7 +39,7 @@ const DEFAULT_METRICS_BIND: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ip
 /// Default loopback admin HTTP port (ADR 025). Exposed to the rest of
 /// the `node` crate so `decdn node <sub>` clients can fall back to the
 /// same default the server binds on, without duplicating the number.
-pub(crate) const DEFAULT_ADMIN_PORT: u16 = 9191;
+pub const DEFAULT_ADMIN_PORT: u16 = 9191;
 /// Default interval between RPC connectivity watchdog probes. `0`
 /// disables the watchdog; absent in config => this value.
 const DEFAULT_RPC_WATCHDOG_INTERVAL_SEC: u64 = 30;
@@ -462,6 +462,9 @@ fn resolve_cache(
     let pinned_hashes = parse_pinned_hashes(file.and_then(|c| c.pinned_hashes.as_deref()))
         .context("invalid cache.pinned_hashes")?;
 
+    let origin_retry = resolve_origin_retry(file.and_then(|c| c.origin_retry.as_ref()))
+        .context("invalid cache.origin_retry")?;
+
     Ok(ResolvedCache {
         cache_dir,
         cache_size_mb,
@@ -470,7 +473,33 @@ fn resolve_cache(
         origin_path,
         decompress,
         pinned_hashes,
+        origin_retry,
     })
+}
+
+/// Resolve the origin retry policy (#285). Absent => defaults via
+/// `RetryPolicy::default()`. Present partial sections fill missing
+/// fields from the same defaults (handled by `#[serde(default)]` on
+/// `RetryPolicy` itself). This function only enforces the two
+/// cross-field invariants the type can't express: monotone schedule
+/// and finite jitter in `[0, 1]`.
+pub fn resolve_origin_retry(
+    file: Option<&decdn_cache::RetryPolicy>,
+) -> anyhow::Result<decdn_cache::RetryPolicy> {
+    let p = file.copied().unwrap_or_default();
+    anyhow::ensure!(
+        p.initial_backoff_ms <= p.max_backoff_ms,
+        "cache.origin_retry: initial_backoff_ms ({}) must be <= max_backoff_ms ({}); \
+         otherwise the schedule never grows",
+        p.initial_backoff_ms,
+        p.max_backoff_ms,
+    );
+    anyhow::ensure!(
+        p.jitter_ratio.is_finite() && (0.0..=1.0).contains(&p.jitter_ratio),
+        "cache.origin_retry: jitter_ratio={} must be a finite number in 0.0..=1.0",
+        p.jitter_ratio,
+    );
+    Ok(p)
 }
 
 /// Parse the operator-supplied `cache.pinned_hashes` list (#276) into a
@@ -480,9 +509,7 @@ fn resolve_cache(
 ///
 /// `None` and the empty list both resolve to the empty set, so an absent
 /// or empty `pinned_hashes` key just means "no pinning".
-pub(crate) fn parse_pinned_hashes(
-    raw: Option<&[String]>,
-) -> anyhow::Result<decdn_cache::PinnedHashes> {
+pub fn parse_pinned_hashes(raw: Option<&[String]>) -> anyhow::Result<decdn_cache::PinnedHashes> {
     use std::str::FromStr;
 
     let mut out = std::collections::HashSet::new();
@@ -529,7 +556,7 @@ pub(crate) fn parse_pinned_hashes(
 /// honest client decoder rejects — fail at startup rather than silently
 /// emit unparseable wire traffic. The bound is also a defense-in-depth
 /// against the selection-score overflow path (issue #322).
-pub(crate) fn resolve_payment(
+pub fn resolve_payment(
     cli: &crate::cli::run::PaymentArgs,
     file: Option<&types::PaymentConfig>,
 ) -> anyhow::Result<ResolvedPayment> {
@@ -556,9 +583,9 @@ pub(crate) fn resolve_payment(
 /// The admin port is merged with `0` as a first-class "disable" value so
 /// operators can turn the surface off without removing the line from their
 /// config. Cross-port collision checks (bind/metrics/admin) live in
-/// [`validate_port_layout`], which sees all three sections at once — see
+/// `validate_port_layout`, which sees all three sections at once — see
 /// there for the full ruleset.
-pub(crate) fn resolve_observability(
+pub fn resolve_observability(
     cli: &crate::cli::run::ObservabilityArgs,
     file: Option<&types::ObservabilityConfig>,
 ) -> anyhow::Result<ResolvedObservability> {
@@ -667,9 +694,7 @@ fn resolve_gossip(file: Option<&types::GossipConfig>) -> anyhow::Result<Resolved
 // (rate/burst coupling) across helpers that have to take both arguments
 // anyway. Keep it linear.
 #[allow(clippy::cognitive_complexity)]
-pub(crate) fn resolve_security(
-    file: Option<&types::SecurityConfig>,
-) -> anyhow::Result<ResolvedSecurity> {
+pub fn resolve_security(file: Option<&types::SecurityConfig>) -> anyhow::Result<ResolvedSecurity> {
     let max_concurrent_handlers = file
         .and_then(|s| s.max_concurrent_handlers)
         .unwrap_or(DEFAULT_MAX_CONCURRENT_HANDLERS);
@@ -765,7 +790,7 @@ fn hex_val(b: u8) -> anyhow::Result<u8> {
 /// - If `explicit_path` is `Some`, reads that file (errors if missing).
 /// - If `explicit_path` is `None`, tries the default path; returns
 ///   `FileConfig::default()` if the file does not exist.
-pub(crate) fn load_file_config(explicit_path: Option<&Path>) -> anyhow::Result<FileConfig> {
+pub fn load_file_config(explicit_path: Option<&Path>) -> anyhow::Result<FileConfig> {
     let path = match explicit_path {
         Some(p) => p.to_path_buf(),
         None => match common::default_config_path() {
@@ -1951,6 +1976,125 @@ mod tests {
     }
 
     #[test]
+    fn resolve_origin_retry_defaults_when_absent() -> anyhow::Result<()> {
+        // Absent `cache.origin_retry` section => defaults from
+        // RetryPolicy::default(). Pin the contract here so a future
+        // default change has to update this test deliberately.
+        let cli = cache_cli(None, None);
+        let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
+        let p = resolved.origin_retry;
+        anyhow::ensure!(p.max_retries == 3, "default max_retries");
+        anyhow::ensure!(p.initial_backoff_ms == 100, "default initial_backoff_ms");
+        anyhow::ensure!(p.max_backoff_ms == 10_000, "default max_backoff_ms");
+        anyhow::ensure!(
+            (p.jitter_ratio - 0.1).abs() < f64::EPSILON,
+            "default jitter_ratio"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_origin_retry_parses_full_section() -> anyhow::Result<()> {
+        let cli = cache_cli(None, None);
+        let file = types::CacheConfig {
+            origin_retry: Some(decdn_cache::RetryPolicy {
+                max_retries: 7,
+                initial_backoff_ms: 50,
+                max_backoff_ms: 2_000,
+                jitter_ratio: 0.25,
+            }),
+            ..types::CacheConfig::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        let p = resolved.origin_retry;
+        anyhow::ensure!(p.max_retries == 7);
+        anyhow::ensure!(p.initial_backoff_ms == 50);
+        anyhow::ensure!(p.max_backoff_ms == 2_000);
+        anyhow::ensure!((p.jitter_ratio - 0.25).abs() < f64::EPSILON);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_origin_retry_partial_section_inherits_defaults() -> anyhow::Result<()> {
+        // `#[serde(default)]` on RetryPolicy fills missing fields from
+        // Default. Pinning the contract here so a future struct-level
+        // attribute change doesn't silently break partial TOML.
+        let toml = "[cache.origin_retry]\nmax_retries = 5\n";
+        let file: crate::config::FileConfig = ::toml::from_str(toml)?;
+        let p = file
+            .cache
+            .as_ref()
+            .and_then(|c| c.origin_retry.as_ref())
+            .ok_or_else(|| anyhow::anyhow!("origin_retry missing"))?;
+        anyhow::ensure!(p.max_retries == 5);
+        anyhow::ensure!(p.initial_backoff_ms == 100, "default carried through");
+        anyhow::ensure!(p.max_backoff_ms == 10_000, "default carried through");
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_origin_retry_max_retries_zero_is_valid() -> anyhow::Result<()> {
+        // `0` opts out and is the documented disable knob; resolution
+        // must not reject it.
+        let cli = cache_cli(None, None);
+        let file = types::CacheConfig {
+            origin_retry: Some(decdn_cache::RetryPolicy {
+                max_retries: 0,
+                ..decdn_cache::RetryPolicy::default()
+            }),
+            ..types::CacheConfig::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        anyhow::ensure!(resolved.origin_retry.max_retries == 0);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_origin_retry_rejects_initial_above_max() -> anyhow::Result<()> {
+        let cli = cache_cli(None, None);
+        let file = types::CacheConfig {
+            origin_retry: Some(decdn_cache::RetryPolicy {
+                initial_backoff_ms: 2_000,
+                max_backoff_ms: 1_000,
+                ..decdn_cache::RetryPolicy::default()
+            }),
+            ..types::CacheConfig::default()
+        };
+        let err = resolve_cache(&cli, Some(&file), Path::new("/tmp"))
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected error"))?;
+        let msg = format!("{err:#}");
+        anyhow::ensure!(
+            msg.contains("schedule never grows"),
+            "error message should explain why initial>max is rejected, got: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_origin_retry_rejects_jitter_out_of_range() -> anyhow::Result<()> {
+        let cli = cache_cli(None, None);
+        for bad in [-0.1, 1.5, f64::NAN, f64::INFINITY] {
+            let file = types::CacheConfig {
+                origin_retry: Some(decdn_cache::RetryPolicy {
+                    jitter_ratio: bad,
+                    ..decdn_cache::RetryPolicy::default()
+                }),
+                ..types::CacheConfig::default()
+            };
+            let err = resolve_cache(&cli, Some(&file), Path::new("/tmp"))
+                .err()
+                .ok_or_else(|| anyhow::anyhow!("expected rejection for jitter={bad}"))?;
+            let msg = format!("{err:#}");
+            anyhow::ensure!(
+                msg.contains("jitter_ratio"),
+                "error message should reference jitter_ratio, got: {msg}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn resolve_cache_defaults_satisfy_invariant() -> anyhow::Result<()> {
         // Regression guard: if either default changes, the pair must still
         // satisfy `max_blob < cache_size`. Lives here so a future edit to
@@ -2228,12 +2372,24 @@ mod tests {
     // attribute or a field rename fails this test immediately.
     #[test]
     fn run_subcommand_args_are_wired_to_decdn_env_vars() {
-        use clap::CommandFactory;
+        use clap::{Args, CommandFactory, Parser};
 
-        let cmd = crate::cli::Cli::command();
-        let run = cmd
-            .find_subcommand("run")
-            .expect("Cli has a `run` subcommand");
+        // The user CLI no longer has a `run` subcommand (#421 — the
+        // daemon binary `decdn-node` owns it). `RunArgs` itself
+        // remains in `decdn-common` because `decdn config validate`
+        // flattens it for env-var parity with the daemon. Wrap
+        // `RunArgs` in a local `Parser` and walk *its* args — this
+        // is the same set of env mappings the daemon's
+        // `decdn-node run` exposes and that `decdn config validate`
+        // honours.
+        #[derive(Parser, Debug)]
+        struct RunWrap {
+            #[command(flatten)]
+            run: crate::cli::RunArgs,
+        }
+
+        let _ = RunWrap::command(); // surface a parse error if RunArgs is broken
+        let run = <crate::cli::RunArgs as Args>::augment_args(clap::Command::new("run"));
 
         // One line per DECDN_* env var operators may set. Adding a new
         // `#[arg(env = "DECDN_*")]` field without adding it here is a test

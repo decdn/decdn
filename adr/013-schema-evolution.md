@@ -85,17 +85,6 @@ enum ClientMessage {
     VoucherAck,                       // 4
     StreamEnd,                        // 5
 }
-
-/// cdn/watchtower/v1
-#[derive(Serialize, Deserialize)]
-enum WatchtowerMessage {
-    Register(WatchtowerRegister),     // 0
-    Accept(WatchtowerAccept),         // 1
-    VoucherUpdate(VoucherUpdate),     // 2
-    VoucherAck,                       // 3
-    Revoke(WatchtowerRevoke),         // 4
-    RevokeAck(WatchtowerRevokeAck),   // 5
-}
 ```
 
 #### Variant ordering rule
@@ -128,7 +117,6 @@ struct GossipEnvelope {
 enum GossipPayload {
     NodeAnnounce(NodeAnnounce),             // 0
     ReputationReport(ReputationReport),     // 1
-    WatchtowerAnnounce(WatchtowerAnnounce), // 2 (planned — ADR 007)
 }
 ```
 
@@ -270,7 +258,6 @@ struct NodeAnnounceBody {
     node_id: NodeId,
     region: String,  // ISO 3166-1 alpha-2
     load: LoadHint,
-    popular_hashes: Vec<Hash>,
     timestamp_us: u64,
 }
 
@@ -343,7 +330,7 @@ Signatures are computed over a specific byte sequence produced by postcard seria
 | --- | --- | --- |
 | `ProbeResponse` | `hash`, `has_blob`, `rate_per_mb`, `timestamp_us` | `total_bytes` |
 | `StreamResponse` | `hash`, `ok`, `rate_per_mb`, `total_bytes`, `channel_id`, `timestamp_us`, `redirect` | `error`, `voucher_interval_mb` |
-| `NodeAnnounce` | `node_id`, `region`, `load`, `popular_hashes`, `timestamp_us` | *(none currently — see implementation note)* |
+| `NodeAnnounce` | `node_id`, `region`, `load`, `timestamp_us` | *(none currently — see implementation note)* |
 | `ReputationReport` | `provider`, `reporter`, `metrics`, `timestamp` | *(none currently)* |
 
 #### Implementation note — separating signed and unsigned fields
@@ -357,7 +344,6 @@ struct NodeAnnounceBody {
     node_id: NodeId,
     region: String,  // ISO 3166-1 alpha-2, e.g. "US"
     load: LoadHint,
-    popular_hashes: Vec<Hash>,
     timestamp_us: u64,
 }
 
@@ -424,7 +410,7 @@ A node MUST support at least the current and previous major version simultaneous
 
 Deprecation schedules are announced via governance ([ADR 009](009-governance.md)). A future governance-maintained on-chain `ProtocolVersions` registry could formalize version sunset dates — deferred follow-up.
 
-> **See also:** [`appendix-operator-upgrade-path.md`](appendix-operator-upgrade-path.md) sequences the operator-side actions for each tier — Tier 1/2 checklists, the Tier 3 rolling-upgrade procedure, and the watchtower / client / governance coordination touchpoints.
+> **See also:** [`appendix-operator-upgrade-path.md`](appendix-operator-upgrade-path.md) sequences the operator-side actions for each tier — Tier 1/2 checklists, the Tier 3 rolling-upgrade procedure, and client / governance coordination touchpoints.
 
 ### Application Error Codes
 

@@ -8,7 +8,7 @@ A node operator routinely holds three keys:
 
 | Key | Curve / scheme | Purpose | Where it lives |
 |-----|----------------|---------|----------------|
-| **iroh node-key** | Ed25519 | Wire identity (`NodeId`); signs the `signature` field on `ProbeResponse`, `StreamResponse`, and `NodeAnnounce` for connection-level authentication ([ADR 005](005-protocol.md)) | iroh keystore on the signing host |
+| **iroh node-key** | Ed25519 | Wire identity (`NodeId`); authenticates the iroh QUIC handshake for every connection and signs `NodeAnnounce` gossip ([ADR 005](005-protocol.md)). `ProbeResponse` and `StreamResponse` body attribution moved to `slash_sig` — see [ADR 014 §1](014-on-chain-verification.md#1-slash-signatures--secp256k1-eip-712). | iroh keystore on the signing host |
 | **Ethereum signing key** | secp256k1 | On-chain identity for staking, channel ops, voucher receipt. Signs the EIP-712 `BindNodeId` and `bindingSignature` ([ADR 003 §NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)) **and** the `slash_sig` field on every `ProbeResponse` / `StreamResponse` for on-chain accountability ([ADR 014](014-on-chain-verification.md)). The hot-signing burden of the latter motivates the production session-key path below. | EVM keystore (EOA) **or** Safe owner key (PoC 1-of-1) **or** session key delegated by a Safe (production §3 of [ADR 024](024-account-abstraction.md)) |
 | **Slash-sig session key** *(production only)* | secp256k1 | Per-message hot-signing of `slash_sig` digests on `ProbeResponse` / `StreamResponse` at wire speed when the operator runs a 2-of-3 Safe; authorized via `erc7579/smartsessions` ([ADR 024](024-account-abstraction.md) §3). Note: client-side voucher session keys (also production-only, also via smartsessions) are a separate concern owned by clients, not operators. | Signing host, scoped by the session-key policy |
 
@@ -48,7 +48,7 @@ If both the iroh and Ethereum keys must rotate, rotate the **iroh key first** (c
 
 **API used:** `StakingRegistry.bindNodeId(newNodeId, signature)` ([ADR 003 §NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)).
 
-The standalone `bindNodeId` function is intended for rebinding only — it deletes the old `nodeId → ethAddress` mapping atomically and writes the new one. The Ethereum address is unchanged; stake, payment channels keyed by `(client_eth, operator_eth, nonce)`, watchtower escrows, and `firstRegisteredAt` all carry over.
+The standalone `bindNodeId` function is intended for rebinding only — it deletes the old `nodeId → ethAddress` mapping atomically and writes the new one. The Ethereum address is unchanged; stake, payment channels keyed by `(client_eth, operator_eth, nonce)`, and `firstRegisteredAt` all carry over.
 
 ### What carries over
 
@@ -56,7 +56,6 @@ The standalone `bindNodeId` function is intended for rebinding only — it delet
 |-------------------|--------|
 | Stake, ve-locks, gauge-claim history | Keyed by Ethereum address ([ADR 026](026-gauge-boost-tokenomics.md)) |
 | Open payment channels (inbound from clients) | Channel ID is `keccak256(client_eth, operator_eth, nonce[, token])` ([ADR 003](003-payments.md), [ADR 010](010-multi-token.md)) — the Ethereum address is unchanged |
-| Watchtower escrows | Watchtowers track channel state by channel ID, not by NodeId ([ADR 007](007-watchtower.md)) |
 | `firstRegisteredAt` | Cleared only by `deregisterNode`; `bindNodeId` does not touch it ([ADR 019 §Re-Onboarding](019-node-onboarding.md#re-onboarding-after-deregistration-or-auto-ejection)) |
 | Receipt history (ADR 027) | Receipts are signed by *requester* keys, not the operator's |
 
@@ -141,7 +140,7 @@ This is the cheap path — the on-chain Safe address does not change.
 
 #### PoC (1-of-1 Safe)
 
-Replace the single owner via `Safe.swapOwner(prevOwner, oldOwner, newOwner)`. The Safe address is unchanged; stake, channels, watchtower escrows, ve-locks, and `firstRegisteredAt` all carry over. No iroh-side action needed.
+Replace the single owner via `Safe.swapOwner(prevOwner, oldOwner, newOwner)`. The Safe address is unchanged; stake, channels, ve-locks, and `firstRegisteredAt` all carry over. No iroh-side action needed.
 
 #### Production (2-of-3 + `erc7579/smartsessions`)
 
@@ -197,7 +196,6 @@ Exception: **emergency compromise of the Ethereum key.** If the Ethereum key is 
 - [ADR 001 — On-chain registry, `registerNode`, NodeId ownership verification](001-network.md)
 - [ADR 003 — `bindNodeId` rebinding, `nodeIdToAddress`, EIP-712 `BindNodeId` schema](003-payments.md#nodeid-to-ethereum-binding)
 - [ADR 005 — Probe-triggered eviction hold (drain prerequisite)](005-protocol.md#probe-triggered-eviction-hold)
-- [ADR 007 — Watchtower escrow keying (carry-over rationale)](007-watchtower.md)
 - [ADR 008 — Reputation per `(reporter, provider)` NodeId pair](008-reputation.md)
 - [ADR 012 — Client iroh-key rotation analogue](012-client.md)
 - [ADR 019 — `registerNode`, `deregisterNode`, re-onboarding flow](019-node-onboarding.md)

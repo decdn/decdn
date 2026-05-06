@@ -22,15 +22,11 @@ The goal is a clean mechanical answer to: **how does the codebase express the di
 | Key management (node) | File-based (`~/.decdn/node.key`) | Platform keychain + hardware wallet via delegated hot key | ADR 012 |
 | Key management (client) | File-based | Platform keychain; hardware wallet + derived hot key for voucher signing | ADR 012 |
 | Reputation engine | Simplified stand-in (local observations only, no gossip weighting) | Full gossip-weighted scoring (70% local / 30% gossip, decay, cold-start) | ADR 008 |
-| Watchtower | Simplified — client monitors its own channels | Full — dedicated `WatchtowerEscrow` + `cdn/watchtower/v1` | ADR 007 |
 | RPC trust | Single RPC endpoint | Multi-source (registry + DNS seed fallback) | ADR 001, 012 |
-| `popular_hashes` cardinality | 20 hashes per `NodeAnnounce` | 5 hashes (reduces content inventory leakage — ADR 017) | ADR 001, 017 |
 | Regional body registration | None — admin key is sole governance for blacklist | Regional bodies registered; global governance override | ADR 011 |
-| Default-open allow-list | Inactive (`defaultOpenAllowlistActive == false`) — permissive bootstrap window: any active staker may serve as origin for `namespaceId == 0` | Activated by governance; only allow-listed operators appear in `OriginAssignment.getOrigins(0)` for default-open content; off-chain consumers (clients, watchtowers) consult that view to filter unauthorized origins | ADR 011, ADR 016 |
+| Default-open allow-list | Inactive (`defaultOpenAllowlistActive == false`) — permissive bootstrap window: any active staker may serve as origin for `namespaceId == 0` | Activated by governance; only allow-listed operators appear in `OriginAssignment.getOrigins(0)` for default-open content; off-chain consumers (clients) consult that view to filter unauthorized origins | ADR 011, ADR 016 |
 | Treasury disbursement | Manual (admin key holder) | On-chain governance proposal | ADR 009 |
-| `adminReclaimNodeId` | Present — `onlyOwner` fallback for NodeId squatting during early testing | Removed from contract | ADR 001 |
 | Bootstrap peer source | On-chain registry only | Registry + DNS seed list + minimum peer diversity (Option B+C) | ADR 012 |
-| `cdn/watchtower/v1` ALPN | Not used | Active — nodes register with watchtowers | ADR 007 |
 | Multi-token `token_rates` gossip field | Omitted (single `rate_per_mb`) | Present alongside `rate_per_mb` | ADR 010 |
 
 ## Decision
@@ -113,22 +109,6 @@ pub trait GovernanceClient: Send + Sync {
 | Challenge bond | 100 TOKEN | 100 TOKEN |
 | Buyback | `BuybackBurner` receives fees; `executeBuyback` never called | Called by keeper after activation criteria met (ADR 018) |
 
-### 5. `WatchtowerClient` — `crates/incentive`
-
-```rust
-pub trait WatchtowerClient: Send + Sync {
-    /// Register a channel with one or more watchtowers.
-    fn register_channel(&self, channel: ChannelId, watchtower: &NodeId) -> Result<()>;
-    /// Called when a `ChannelCloseInitiated` event is observed.
-    fn on_close_initiated(&self, channel: ChannelId, event: &CloseEvent) -> Result<()>;
-}
-```
-
-| | PoC | Production |
-|---|-----|------------|
-| Implementation | `NoopWatchtowerClient` — client monitors its own channels directly | `cdn/watchtower/v1` ALPN; watchtower nodes use `WatchtowerEscrow` contract |
-| `WatchtowerAnnounce` gossip | Not emitted or processed | Emitted by watchtower nodes; subscribed to on `cdn/global/v1` |
-
 ### 6. `CorruptionChallenger` — `crates/incentive`
 
 ```rust
@@ -147,8 +127,6 @@ Not a trait — a plain struct with a constructor per mode. All mode-dependent n
 
 ```rust
 pub struct NetworkConstants {
-    /// Maximum hashes in a NodeAnnounce popular_hashes field.
-    pub popular_hashes_max: usize,
     /// Challenge bond required to submit a slash claim (TOKEN base units).
     pub challenge_bond_token: u64,
     /// Default NodeAnnounce interval.
@@ -171,7 +149,6 @@ Concrete values:
 
 | Constant | PoC | Production |
 |----------|-----|------------|
-| `popular_hashes_max` | 20 | 5 (ADR 017 — reduces content inventory leakage) |
 | `challenge_bond_token` | 100 TOKEN (1e20 base units) | 100 TOKEN (1e20 base units) |
 | `announce_interval_secs` | 60 | 60 (same; tunable by governance) |
 | `min_stake_token` | Operator-configured | Operator-configured; min enforced by contract |
@@ -188,8 +165,8 @@ pub trait FeeRouterClient: Send + Sync {
     /// Returns `None` for the no-op PoC variant.
     fn router_address(&self) -> Option<Address>;
     /// Voucher-payload byte counts are forwarded into the router by the
-    /// settlement transaction; this hook lets observers (metrics, watchtower)
-    /// snapshot per-settlement byte deltas without reading chain state.
+    /// settlement transaction; this hook lets observers (metrics) snapshot
+    /// per-settlement byte deltas without reading chain state.
     fn on_settlement(&self, operator: &Address, bytes_delivered: u64, amount_usdc: u64);
 }
 ```
@@ -281,7 +258,6 @@ pub fn build_components(config: &Config) -> Components {
         reputation:    reputation_engine(config),
         payment:       payment_client(config),
         governance:    governance_client(config),
-        watchtower:    watchtower_client(config),
         challenger:    corruption_challenger(config),
         constants:     network_constants(),
     }
@@ -310,15 +286,9 @@ fn key_store(config: &Config) -> Arc<dyn KeyStore> {
 // ... same pattern for remaining seams
 ```
 
-This is a stronger guarantee than `if cfg!(feature = "poc")`: with the attribute form, the PoC branch is **excluded from compilation entirely** in a production build. `FileKeyStore`, `NoopWatchtowerClient`, and other PoC types are not present in the production binary at all — not merely optimized away.
+This is a stronger guarantee than `if cfg!(feature = "poc")`: with the attribute form, the PoC branch is **excluded from compilation entirely** in a production build. `FileKeyStore` and other PoC types are not present in the production binary at all — not merely optimized away.
 
 `#[cfg(feature = "poc")]` and `#[cfg(not(feature = "poc"))]` appear **only** in `crates/node/src/wiring.rs` and `crates/node/src/main.rs`. They are **banned** in all other crates via a `rustflags` lint (see Enforcement below).
-
-### Contracts: `unsafe-admin` feature
-
-The Solidity `adminReclaimNodeId` function (ADR 001) is removed in production contracts. Foundry controls this via a separate deploy script — not a Rust feature flag. The PoC deploy script (`script/DeployPoc.s.sol`) deploys `PocStakingRegistry`, which extends `StakingRegistry` with `adminReclaimNodeId`. The production deploy script (`script/DeployProduction.s.sol`) deploys `StakingRegistry` directly.
-
-No Rust `unsafe-admin` compile flag is needed — the function simply does not exist on the production contract ABI.
 
 ## Wiring Conventions
 
@@ -336,10 +306,6 @@ crates/
         mod.rs         — PaymentChannelClient trait
         stable.rs      — PoC: StablePaymentChannelClient
         multi_token.rs — Production: MultiTokenPaymentChannelClient
-      watchtower/
-        mod.rs         — WatchtowerClient trait
-        noop.rs        — PoC: NoopWatchtowerClient
-        live.rs        — Production: LiveWatchtowerClient
       ...
   reputation/
     src/
@@ -360,7 +326,7 @@ crates/
 
 1. **No `#[cfg(feature = "poc")]` or `#[cfg(not(feature = "poc"))]` outside `crates/node/src/wiring.rs` and `crates/node/src/main.rs`.** Enforced via `rustflags = ["-D", "unexpected_cfgs"]` with an explicit `check-cfg` list in `.cargo/config.toml`, or a `#[forbid(unexpected_cfgs)]` crate-level attribute on leaf crates.
 2. **No runtime `NetworkMode` enum.** All mode selection is compile-time. A PoC binary cannot accidentally run in production mode.
-3. **`NetworkConstants` is the single source of truth for all numeric differences.** No magic numbers elsewhere — always reference `constants.popular_hashes_max`, never literal `20`.
+3. **`NetworkConstants` is the single source of truth for all numeric differences.** No magic numbers elsewhere — always reference `constants.challenge_bond_token`, never literal `1e20`.
 4. **Both implementations must compile in CI.** The CI matrix builds with `--features poc` and without (production). This prevents either path from rotting and catches type errors in both concrete implementations.
 5. **PoC removal is mechanical.** To graduate to production-only: delete all `#[cfg(feature = "poc")]` functions, remove the `poc` feature from `Cargo.toml`, and strip the `#[cfg(not(feature = "poc"))]` attributes from the remaining functions. No logic changes required.
 6. **Leaf-crate principle applies to ADR 026 tokenomics.** Domain crates (`cache`, `gossip`, `incentive`, `reputation`, `protocol`) MUST NOT contain mode-branching logic for the [ADR 026](026-gauge-boost-tokenomics.md) contract surface (`FeeRouter`, `VotingEscrow`, `SafetyReserve`, swap helpers). All mode selection between PoC stubs / fixtures / mocks and production contracts lives in the `node` crate's wiring layer behind seams 8–11 above — the same rule that governs seams 1–7. Adding `if production_enabled` checks inside domain crate logic is forbidden.
@@ -394,12 +360,10 @@ The six wiring-shape alternatives evaluated against centralised `#[cfg]`-keyed s
 | ADR | Seam used | Notes |
 |-----|-----------|-------|
 | ADR 003 | `PaymentChannelClient` | `StablePaymentChannel` is PoC concrete impl |
-| ADR 007 | `WatchtowerClient` | `NoopWatchtowerClient` for PoC |
 | ADR 008 | `ReputationEngine` | `SimpleReputationEngine` for PoC |
 | ADR 009 | `GovernanceClient` | Admin key vs Governor |
 | ADR 010 | `PaymentChannelClient` | Multi-token client for production |
 | ADR 012 | `KeyStore` | File-based vs keychain/HW wallet |
 | ADR 014 | `CorruptionChallenger` | Optimistic vs Merkle proof |
-| ADR 017 | `NetworkConstants.popular_hashes_max` | 20 (PoC) vs 5 (production) |
 | ADR 018 | `SwapHelper` | Mock pool (PoC) vs Balancer V3 (production); shared by `BuybackBurner` and delegator-pool path |
 | ADR 026 | `FeeRouterClient`, `VotingEscrowReader`, `SwapHelper`, `SafetyReservePayout` | production contract surface; PoC stubs / fixtures / mocks vs deployed contracts per network |

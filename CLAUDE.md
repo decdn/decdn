@@ -4,7 +4,7 @@
 
 Decentralized CDN (deCDN) — nodes cache and serve content-addressed blobs over iroh QUIC, clients pay per-MB via off-chain USDC payment channels. Rust implementation targeting a PoC of tens of nodes on an Arbitrum Sepolia testnet.
 
-**Status: Early implementation.** Cargo workspace with 6 crates. `node` has CLI, config, runtime bring-up, and a probe handler; `protocol` has varint framing, `ProbeMessage` (ADR 013), and `NodeAnnounce` gossip types; `cache` has the pull-through engine + HTTP/filesystem origin adapters; `gossip` has the `NodeAnnounce` pub/sub service with peer table. `incentive` and `reputation` are still stubs. ADRs in `adr/` remain the primary design artifacts.
+**Status: Early implementation.** Cargo workspace with 8 crates. Two binaries (#421): `node` produces the `decdn-node` daemon with the runtime bring-up, admin RPC server, dispatch limiter, and probe handler; `cli` produces the user-facing `decdn` binary carrying `probe`, `node {peers,…}`, `key-gen`, `config {…}`. `common` holds the shared config schema, identity loading, and AdminRpc trait + DTOs both binaries import. `protocol` has varint framing, `ProbeMessage` (ADR 013), and `NodeAnnounce` gossip types; `cache` has the pull-through engine + HTTP/filesystem origin adapters; `gossip` has the `NodeAnnounce` pub/sub service with peer table. `incentive` and `reputation` are still stubs. ADRs in `adr/` remain the primary design artifacts.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for build commands, ADR conventions, pre-commit hooks, and development environment setup.
 
@@ -33,7 +33,9 @@ pre-commit run --all-files           # run all hooks
 
 ```
 crates/
-  node/         — binary entry point, CLI, config, wiring
+  node/         — daemon binary `decdn-node`: runtime bring-up, handlers, admin RPC server, dispatch limiter
+  cli/          — user CLI binary `decdn`: probe, node admin, key-gen, config
+  common/       — shared types: config schema + resolver, identity loading, AdminRpc trait + DTOs
   protocol/     — shared types, wire format, ALPN message definitions (leaf crate, minimal deps)
   cache/        — cache engine wrapping iroh-blobs + origin pull-through
   gossip/       — NodeAnnounce pub/sub over iroh-gossip, peer table, envelope validation
@@ -42,7 +44,7 @@ crates/
   contracts/    — Solidity contracts + Foundry (excluded from workspace, not yet populated)
 ```
 
-**Dependency flow:** `node → cache, gossip, incentive, reputation, protocol`. Cache and incentive are independent — cache works without payment logic (useful for testing/local dev).
+**Dependency flow:** `node → cache, gossip, incentive, reputation, protocol, common`; `cli → common, protocol`. The two binaries share `common` for config schema, identity, and admin wire types — see [`adr/appendix-binaries.md`](adr/appendix-binaries.md) for the dockerd-style split rationale. Cache and incentive are independent — cache works without payment logic (useful for testing/local dev).
 
 ### Wire Protocols (Core CDN)
 
@@ -50,7 +52,6 @@ crates/
 |------|---------|
 | `cdn/probe/v1` | Latency + availability probing |
 | `cdn/client/v1` | All paid delivery (client→node and node→node) |
-| `cdn/watchtower/v1` | Channel-dispute monitoring, voucher registration |
 | `cdn/dht/v1` | Content discovery via Kademlia DHT (see ADR 022) |
 | iroh-gossip (built-in) | Node metadata broadcast (`NodeAnnounce`), node discovery |
 | `cdn/reputation/v1` (gossip topic) | Reputation reports over iroh-gossip |

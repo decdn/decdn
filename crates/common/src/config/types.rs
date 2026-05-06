@@ -94,6 +94,17 @@ pub struct CacheConfig {
     /// "entry was ignored" surprise hours later when the operator
     /// discovers the blob got evicted anyway.
     pub pinned_hashes: Option<Vec<String>>,
+    /// Origin pull-through retry policy (#285). Controls exponential
+    /// backoff for transient HTTP/filesystem errors. Absent => defaults
+    /// from [`decdn_cache::RetryPolicy::default`] (3 retries, 100ms
+    /// initial backoff doubling to 10s cap, 10% jitter). `max_retries
+    /// = 0` opts out and reproduces pre-#285 behaviour. Set once at
+    /// startup; changes require a restart.
+    ///
+    /// `decdn_cache::RetryPolicy` carries `#[serde(default)]` so
+    /// partial sections (e.g. just `max_retries = 5`) get the rest of
+    /// the fields filled from defaults.
+    pub origin_retry: Option<decdn_cache::RetryPolicy>,
 }
 
 /// Payment section of the config file.
@@ -126,7 +137,7 @@ pub struct GossipConfig {
 /// the box.
 ///
 /// **All fields are hot-reloadable** on SIGHUP and via `admin_v1_reload`.
-/// The live `ConnectionLimiter` rebuilds its keyed [`governor`] rate
+/// The live `ConnectionLimiter` rebuilds its keyed `governor` rate
 /// limiter from the new quota and swaps it under an `RwLock`. The
 /// `Arc<Semaphore>` identity is preserved across cap resizes via
 /// `add_permits` / `acquire_many_owned(...).forget()` so every

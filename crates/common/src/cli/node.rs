@@ -44,7 +44,7 @@ pub enum NodeCommand {
     /// `observability.log_level` are reloadable; other fields are logged
     /// as ignored. Both paths share the same internal mutex, so a
     /// concurrent SIGHUP and `decdn node reload` queue rather than
-    /// race. Requires the node to have been started with `decdn run
+    /// race. Requires the node to have been started with `decdn-node run
     /// --config <path>` — without a path on disk there's nothing to
     /// re-read.
     Reload(ReloadArgs),
@@ -103,7 +103,7 @@ pub struct HealthArgs {
 /// holds the bytes — see issue #233 for the disk-reclaim follow-up) but
 /// is persisted to `<cache_dir>/evicted.log` so it survives restarts.
 /// Operators using this for DMCA takedowns can rely on the takedown
-/// being durable across `decdn run` invocations.
+/// being durable across `decdn-node run` invocations.
 ///
 /// Pass `--dry-run` (issue #379) to preview what the evict would touch
 /// — blob size, last-access elapsed time, pin status, and already-
