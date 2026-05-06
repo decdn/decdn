@@ -3,8 +3,16 @@
 
 use decdn_common::{cli, config};
 
-/// Validate a configuration and print a resolved summary. Performs no I/O
-/// beyond reading the config file — does not open sockets or touch the RPC.
+/// Validate a configuration and print a resolved summary.
+///
+/// Runs the daemon's resolver against the same TOML + CLI + env-var
+/// inputs `decdn-node run` would use, then prints the result. Does not
+/// bind any ports, does not connect to the JSON-RPC endpoint, and does
+/// not open the cache. Does touch the filesystem to verify the config
+/// itself: reads the TOML, and stats / opens the configured
+/// `blockchain.eth_keystore` for readability (the resolver rejects
+/// missing paths, directories, and broken symlinks at this point so
+/// the daemon doesn't fail later in startup).
 pub fn config_validate(
     config_path: Option<&std::path::Path>,
     args: &cli::ConfigValidateArgs,
