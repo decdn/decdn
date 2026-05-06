@@ -143,7 +143,7 @@ pandoc --from=markdown+gfm_auto_identifiers \
   -V date="$(date +%Y-%m-%d)" \
   _build/preface.md \
   architecture.md \
-  000-language.md 001-network.md 002-content-addressing.md 005-protocol.md \
+  000-language.md 001-network.md 029-peer-table-eviction-policy.md 002-content-addressing.md 005-protocol.md \
   022-content-discovery.md 015-zero-rtt.md \
   003-payments.md 010-multi-token.md 012-client.md 024-account-abstraction.md \
   026-gauge-boost-tokenomics.md 027-distinct-client-receipts.md 018-liquidity-strategy.md \

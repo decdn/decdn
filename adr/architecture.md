@@ -58,8 +58,9 @@ The implementation language, the peer mesh's shape, the content-addressing primi
 
 1. [ADR 000 — Language and Core Networking Stack](000-language.md)
 2. [ADR 001 — Network Topology and Peer Mesh](001-network.md)
-3. [ADR 002 — Content Addressing](002-content-addressing.md)
-4. [ADR 005 — Wire Protocol](005-protocol.md)
+3. [ADR 029 — Peer-Table Eviction Policy](029-peer-table-eviction-policy.md)
+4. [ADR 002 — Content Addressing](002-content-addressing.md)
+5. [ADR 005 — Wire Protocol](005-protocol.md)
 
 ### Chapter 2 — Discovery
 
@@ -156,6 +157,7 @@ Numeric per-ADR index. The thematic chapter ordering for top-to-bottom reading l
 - **[ADR 026 — Gauge-Boost Tokenomics](026-gauge-boost-tokenomics.md)** — 1B fixed supply; `FeeRouter` six-bucket split with Curve-style gauge boost, delegator pool, and SafetyReserve.
 - **[ADR 027 — Distinct-Client Delivery Receipts](027-distinct-client-receipts.md)** — Client-signed `DeliveryReceipt` Merkle-batched per epoch; gauge-pool eligibility gated on distinct-client diversity. Required for mainnet launch.
 - **[ADR 028 — Slashing Appeals and Dispute Escalation](028-slashing-appeals.md)** — 30-day post-slash appeal window via `SafetyReserve` restitution; emergency multisig fast-track + 14-day ve-Governor ratification; one accepted appeal per operator per 365 days.
+- **[ADR 029 — Peer-Table Eviction Policy](029-peer-table-eviction-policy.md)** — TTL-based eviction (default 600 s) keyed on `last_seen_us`; active eviction on registry deregistration / origin blacklisting; no hard size cap (staking registry bounds growth); reputation does not factor into eviction.
 
 ## Key Invariants
 
