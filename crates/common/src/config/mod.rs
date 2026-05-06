@@ -39,7 +39,7 @@ const DEFAULT_METRICS_BIND: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ip
 /// Default loopback admin HTTP port (ADR 025). Exposed to the rest of
 /// the `node` crate so `decdn node <sub>` clients can fall back to the
 /// same default the server binds on, without duplicating the number.
-pub(crate) const DEFAULT_ADMIN_PORT: u16 = 9191;
+pub const DEFAULT_ADMIN_PORT: u16 = 9191;
 /// Default interval between RPC connectivity watchdog probes. `0`
 /// disables the watchdog; absent in config => this value.
 const DEFAULT_RPC_WATCHDOG_INTERVAL_SEC: u64 = 30;
@@ -483,7 +483,7 @@ fn resolve_cache(
 /// `RetryPolicy` itself). This function only enforces the two
 /// cross-field invariants the type can't express: monotone schedule
 /// and finite jitter in `[0, 1]`.
-pub(crate) fn resolve_origin_retry(
+pub fn resolve_origin_retry(
     file: Option<&decdn_cache::RetryPolicy>,
 ) -> anyhow::Result<decdn_cache::RetryPolicy> {
     let p = file.copied().unwrap_or_default();
@@ -509,9 +509,7 @@ pub(crate) fn resolve_origin_retry(
 ///
 /// `None` and the empty list both resolve to the empty set, so an absent
 /// or empty `pinned_hashes` key just means "no pinning".
-pub(crate) fn parse_pinned_hashes(
-    raw: Option<&[String]>,
-) -> anyhow::Result<decdn_cache::PinnedHashes> {
+pub fn parse_pinned_hashes(raw: Option<&[String]>) -> anyhow::Result<decdn_cache::PinnedHashes> {
     use std::str::FromStr;
 
     let mut out = std::collections::HashSet::new();
@@ -558,7 +556,7 @@ pub(crate) fn parse_pinned_hashes(
 /// honest client decoder rejects — fail at startup rather than silently
 /// emit unparseable wire traffic. The bound is also a defense-in-depth
 /// against the selection-score overflow path (issue #322).
-pub(crate) fn resolve_payment(
+pub fn resolve_payment(
     cli: &crate::cli::run::PaymentArgs,
     file: Option<&types::PaymentConfig>,
 ) -> anyhow::Result<ResolvedPayment> {
@@ -585,9 +583,9 @@ pub(crate) fn resolve_payment(
 /// The admin port is merged with `0` as a first-class "disable" value so
 /// operators can turn the surface off without removing the line from their
 /// config. Cross-port collision checks (bind/metrics/admin) live in
-/// [`validate_port_layout`], which sees all three sections at once — see
+/// `validate_port_layout`, which sees all three sections at once — see
 /// there for the full ruleset.
-pub(crate) fn resolve_observability(
+pub fn resolve_observability(
     cli: &crate::cli::run::ObservabilityArgs,
     file: Option<&types::ObservabilityConfig>,
 ) -> anyhow::Result<ResolvedObservability> {
@@ -696,9 +694,7 @@ fn resolve_gossip(file: Option<&types::GossipConfig>) -> anyhow::Result<Resolved
 // (rate/burst coupling) across helpers that have to take both arguments
 // anyway. Keep it linear.
 #[allow(clippy::cognitive_complexity)]
-pub(crate) fn resolve_security(
-    file: Option<&types::SecurityConfig>,
-) -> anyhow::Result<ResolvedSecurity> {
+pub fn resolve_security(file: Option<&types::SecurityConfig>) -> anyhow::Result<ResolvedSecurity> {
     let max_concurrent_handlers = file
         .and_then(|s| s.max_concurrent_handlers)
         .unwrap_or(DEFAULT_MAX_CONCURRENT_HANDLERS);
@@ -794,7 +790,7 @@ fn hex_val(b: u8) -> anyhow::Result<u8> {
 /// - If `explicit_path` is `Some`, reads that file (errors if missing).
 /// - If `explicit_path` is `None`, tries the default path; returns
 ///   `FileConfig::default()` if the file does not exist.
-pub(crate) fn load_file_config(explicit_path: Option<&Path>) -> anyhow::Result<FileConfig> {
+pub fn load_file_config(explicit_path: Option<&Path>) -> anyhow::Result<FileConfig> {
     let path = match explicit_path {
         Some(p) => p.to_path_buf(),
         None => match common::default_config_path() {
@@ -2376,12 +2372,24 @@ mod tests {
     // attribute or a field rename fails this test immediately.
     #[test]
     fn run_subcommand_args_are_wired_to_decdn_env_vars() {
-        use clap::CommandFactory;
+        use clap::{Args, CommandFactory, Parser};
 
-        let cmd = crate::cli::Cli::command();
-        let run = cmd
-            .find_subcommand("run")
-            .expect("Cli has a `run` subcommand");
+        // The user CLI no longer has a `run` subcommand (#421 — the
+        // daemon binary `decdn-node` owns it). `RunArgs` itself
+        // remains in `decdn-common` because `decdn config validate`
+        // flattens it for env-var parity with the daemon. Wrap
+        // `RunArgs` in a local `Parser` and walk *its* args — this
+        // is the same set of env mappings the daemon's
+        // `decdn-node run` exposes and that `decdn config validate`
+        // honours.
+        #[derive(Parser, Debug)]
+        struct RunWrap {
+            #[command(flatten)]
+            run: crate::cli::RunArgs,
+        }
+
+        let _ = RunWrap::command(); // surface a parse error if RunArgs is broken
+        let run = <crate::cli::RunArgs as Args>::augment_args(clap::Command::new("run"));
 
         // One line per DECDN_* env var operators may set. Adding a new
         // `#[arg(env = "DECDN_*")]` field without adding it here is a test

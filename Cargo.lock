@@ -1927,6 +1927,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "decdn-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "decdn-cache",
+ "decdn-common",
+ "decdn-gossip",
+ "decdn-node",
+ "decdn-protocol",
+ "iroh",
+ "jsonrpsee",
+ "rand 0.10.1",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+]
+
+[[package]]
+name = "decdn-common"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "anyhow",
+ "clap",
+ "decdn-cache",
+ "decdn-protocol",
+ "dirs",
+ "iroh",
+ "jsonrpsee",
+ "rand 0.10.1",
+ "serde",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "decdn-gossip"
 version = "0.1.0"
 dependencies = [
@@ -1969,6 +2011,7 @@ dependencies = [
  "bytes",
  "clap",
  "decdn-cache",
+ "decdn-common",
  "decdn-gossip",
  "decdn-incentive",
  "decdn-protocol",

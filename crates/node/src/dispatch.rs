@@ -45,8 +45,8 @@ use iroh::Watcher as _;
 use iroh::endpoint::Connection;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::config::ResolvedSecurity;
 use crate::metrics::Metrics;
+use decdn_common::config::ResolvedSecurity;
 
 /// Bucket key for the per-source rate limit. IPv4 addresses are used as-is;
 /// IPv6 addresses are masked to their `/64` prefix.
@@ -515,8 +515,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::{ConnectionLimiter, RejectReason};
-    use crate::config::ResolvedSecurity;
     use crate::metrics::Metrics;
+    use decdn_common::config::ResolvedSecurity;
 
     fn strict_security(max: u32) -> ResolvedSecurity {
         ResolvedSecurity {

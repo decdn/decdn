@@ -1,0 +1,39 @@
+[package]
+name = "decdn-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "User-facing deCDN CLI (decdn binary): probe, node admin, key-gen, config"
+
+[[bin]]
+name = "decdn"
+path = "src/main.rs"
+
+[dependencies]
+decdn-protocol = { workspace = true }
+decdn-common = { workspace = true }
+iroh = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+jsonrpsee = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+# Integration tests in `tests/admin_peers.rs` exercise the loopback admin
+# RPC end-to-end against a real `AdminState` spawned from the daemon
+# crate, so the daemon's surface is a dev-dependency here. `decdn-cache`
+# and `decdn-gossip` are needed to construct the seeded `PeerTable` and
+# `CacheEngine` the admin server runs against. None of this leaks into
+# the `decdn` binary's release dep tree.
+decdn-node = { workspace = true }
+decdn-cache = { workspace = true }
+decdn-gossip = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

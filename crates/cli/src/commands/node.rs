@@ -10,13 +10,13 @@ use jsonrpsee::core::client::Error as JsonRpcClientError;
 use jsonrpsee::http_client::HttpClientBuilder;
 use serde::Deserialize;
 
-use crate::admin::{
+use decdn_common::admin::{
     AdminRpcClient, AnnounceResponse, DrainResponse, EvictRequest, EvictResponse, HealthResponse,
     PeerView, PeersResponse, ReloadResponse,
 };
-use crate::cli;
-use crate::cli::common::expand_tilde;
-use crate::config::DEFAULT_ADMIN_PORT;
+use decdn_common::cli;
+use decdn_common::cli::common::expand_tilde;
+use decdn_common::config::DEFAULT_ADMIN_PORT;
 
 /// Whether the TOML config path we're about to read was chosen by the
 /// operator or defaulted. Drives the "missing file" policy in
@@ -34,7 +34,7 @@ enum ConfigPathSource {
 
 /// Partial deserializer for the TOML config — only the path
 /// `observability.admin_port` is interesting to `decdn node peers`.
-/// Kept private here (rather than reusing `crate::config::FileConfig`)
+/// Kept private here (rather than reusing `decdn_common::config::FileConfig`)
 /// so an operator's typo in an unrelated section can't make peer
 /// listing unusable. `serde(default)` and serde-toml's default
 /// "ignore unknown fields" together guarantee that any other valid
@@ -833,7 +833,7 @@ mod tests {
     /// evict.
     #[test]
     fn write_dry_run_human_emits_all_fields() -> anyhow::Result<()> {
-        use crate::admin::EvictPreview;
+        use decdn_common::admin::EvictPreview;
         let resp = EvictResponse {
             was_present: true,
             dry_run: true,
@@ -869,7 +869,7 @@ mod tests {
     /// record" from "the record is at the floor".
     #[test]
     fn write_dry_run_human_uses_sentinels_for_absent_fields() -> anyhow::Result<()> {
-        use crate::admin::EvictPreview;
+        use decdn_common::admin::EvictPreview;
         let resp = EvictResponse {
             was_present: false,
             dry_run: true,

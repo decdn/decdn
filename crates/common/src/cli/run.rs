@@ -1,4 +1,9 @@
-//! Arguments for the `decdn run` subcommand.
+//! Arguments for `decdn-node run` (the daemon's only subcommand).
+//!
+//! `RunArgs` is also flattened into `decdn config validate` on the user
+//! CLI for env-var parity — operators get one set of `DECDN_*` env
+//! mappings whether they're starting the daemon or dry-running the
+//! resolver.
 
 use std::path::PathBuf;
 

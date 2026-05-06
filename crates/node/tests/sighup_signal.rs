@@ -24,9 +24,9 @@ use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use decdn_node::cli::common::LogLevel;
-use decdn_node::cli::run::{ObservabilityArgs, PaymentArgs};
-use decdn_node::config::{
+use decdn_common::cli::common::LogLevel;
+use decdn_common::cli::run::{ObservabilityArgs, PaymentArgs};
+use decdn_common::config::{
     ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedGossip, ResolvedIdentity,
     ResolvedNetwork, ResolvedObservability, ResolvedPayment, ResolvedSecurity,
 };
@@ -66,7 +66,7 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
         payment: ResolvedPayment { rate_per_mb: rate },
         observability: ResolvedObservability {
             log_level: level,
-            log_format: decdn_node::cli::LogFormat::Pretty,
+            log_format: decdn_common::cli::LogFormat::Pretty,
             metrics_port: 9090,
             metrics_bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             admin_port: Some(9191),

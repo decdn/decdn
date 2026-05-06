@@ -23,10 +23,11 @@ use tokio::task::JoinSet;
 use decdn_gossip::{GossipMetrics, GossipRuntimeConfig, GossipService, PeerTable};
 
 use crate::admin;
-use crate::config::ResolvedConfig;
 use crate::dispatch::ConnectionLimiter;
 use crate::handlers::probe::ProbeHandler;
-use crate::{identity, metrics};
+use crate::metrics;
+use decdn_common::config::ResolvedConfig;
+use decdn_common::identity;
 
 /// Ceiling on how long we wait for spawned tasks to drain after the endpoint
 /// and metrics server have been signalled to stop. Sized comfortably larger

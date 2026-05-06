@@ -32,13 +32,28 @@ Decentralized CDN where nodes cache and serve content-addressed blobs over [iroh
 | `cdn/dht/v1` | Content discovery via Kademlia DHT (see [ADR 022](adr/022-content-discovery.md)) |
 | iroh-gossip (built-in) | Node metadata broadcast (`NodeAnnounce`), node discovery |
 
+### Binaries
+
+| Binary | Role |
+|--------|------|
+| `decdn-node` | Daemon — runs the cache node service. Single subcommand: `decdn-node run [--config <path>]`. |
+| `decdn` | User CLI — `probe`, `node {peers,health,announce,drain,evict,reload}`, `key-gen`, `config {init,validate}`. |
+
+The container image ships `decdn-node` only. Publishers grab the
+`decdn-${VERSION}-${TARGET}.tar.gz` release archive; operators grab
+both. See [`adr/appendix-binaries.md`](adr/appendix-binaries.md) for
+the dockerd-style split rationale.
+
 ### Crate Structure
 
 ```
 crates/
-  node/         — binary entry point, CLI, config, wiring
+  node/         — daemon binary `decdn-node`: runtime, handlers, admin server, dispatch limits
+  cli/          — user CLI binary `decdn`: probe, node admin, key-gen, config
+  common/       — shared types: config schema, identity, AdminRpc trait + DTOs
   protocol/     — shared types, wire format, ALPN message definitions
   cache/        — cache engine wrapping iroh-blobs + origin pull-through
+  gossip/       — NodeAnnounce pub/sub over iroh-gossip
   incentive/    — payment channels, staking, vouchers (alloy for Ethereum)
   reputation/   — gossip-based reputation scoring
   contracts/    — Solidity contracts + Foundry

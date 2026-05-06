@@ -210,7 +210,7 @@ fn load_from(path: &Path) -> anyhow::Result<SecretKey> {
     Ok(SecretKey::from_bytes(&arr))
 }
 
-pub(crate) fn fresh_secret_key() -> SecretKey {
+pub fn fresh_secret_key() -> SecretKey {
     SecretKey::generate()
 }
 

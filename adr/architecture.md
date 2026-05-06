@@ -274,9 +274,12 @@ flowchart TD
 decdn/
 ├── Cargo.toml                    # workspace root
 ├── crates/
-│   ├── node/                     # Binary — CLI entry, config, wiring
+│   ├── node/                     # Binary `decdn-node` — daemon entry, runtime, handlers
+│   ├── cli/                      # Binary `decdn` — user-facing CLI (probe, node admin, key-gen, config)
+│   ├── common/                   # Shared types: config schema, identity, admin RPC trait + DTOs
 │   ├── protocol/                 # Shared types, wire format, messages
 │   ├── cache/                    # Cache engine wrapping iroh-blobs + origin pull
+│   ├── gossip/                   # NodeAnnounce pub/sub over iroh-gossip
 │   ├── incentive/                # Payment channels, staking, vouchers
 │   ├── reputation/               # Gossip-based reputation system
 │   └── contracts/                # Solidity contracts + Foundry
@@ -287,12 +290,28 @@ decdn/
 # may be provided as a separate repository.
 ```
 
+### Binaries
+
+The workspace produces two binaries that pair like `dockerd` + `docker`:
+
+| Binary | Role | Crate | Listens on |
+|---|---|---|---|
+| `decdn-node` | Daemon — caches, serves, peers, gossips. Single subcommand: `decdn-node run [--config <path>]`. | `crates/node` | QUIC `:4433`, metrics `127.0.0.1:9090`, admin loopback `127.0.0.1:9191` |
+| `decdn` | User CLI — `probe`, `node {peers,health,announce,drain,evict,reload}`, `key-gen`, `config {init,validate}`, plus future `pull`, `bundle …`, `fetch`, `publish`, `channel`, `wallet`. | `crates/cli` | nothing (outbound only; `node` admin commands use the daemon's loopback HTTP per ADR 025 appendix) |
+
+The container image ships `decdn-node` only. CLI users grab the
+`decdn-${VERSION}-${TARGET}.tar.gz` release archive. See
+[appendix-binaries.md](appendix-binaries.md) for the rationale.
+
 ### Dependency Chain
 
 ```mermaid
 graph TD
     node[node]
+    cli[cli]
+    common[common]
     cache[cache]
+    gossip[gossip]
     incentive[incentive]
     reputation[reputation]
     protocol[protocol]
@@ -305,13 +324,26 @@ graph TD
     postcard([postcard])
 
     node --> cache
+    node --> gossip
     node --> incentive
     node --> reputation
     node --> protocol
+    node --> common
+
+    cli --> common
+    cli --> protocol
+
+    common --> cache
+    common --> protocol
+    common --> alloy
+    common --> iroh
 
     cache --> protocol
     cache --> iroh
     cache --> iroh_blobs
+
+    gossip --> protocol
+    gossip --> iroh_gossip
 
     incentive --> protocol
     incentive --> alloy
@@ -324,13 +356,16 @@ graph TD
     protocol --> iroh
 
     style node fill:#4a9eff,color:#fff
+    style cli fill:#60a5fa,color:#fff
+    style common fill:#94a3b8,color:#fff
     style cache fill:#34d399,color:#fff
+    style gossip fill:#22d3ee,color:#fff
     style incentive fill:#f59e0b,color:#fff
     style reputation fill:#a78bfa,color:#fff
     style protocol fill:#f87171,color:#fff
 ```
 
-`protocol` is the leaf crate with minimal dependencies. Everything depends on it; it depends on almost nothing. The cache and incentive layers are separate crates — the cache layer works without incentives (useful for testing, local dev, private deployments). The incentive layer wraps cache operations with payment logic. The `node` crate wires them together.
+`protocol` is the leaf crate with minimal dependencies. Everything depends on it; it depends on almost nothing. `common` carries the wire types and config schema both binaries share (see [appendix-binaries.md](appendix-binaries.md)); it pulls `cache` for the typed config fields (`DecompressMode`, `RetryPolicy`, `OriginUrl`, `PinnedHashes`). The cache and incentive layers are separate crates — the cache layer works without incentives (useful for testing, local dev, private deployments). The incentive layer wraps cache operations with payment logic. The `node` crate wires them together; the `cli` crate stays narrow (no `cache`, no `gossip`).
 
 ## External Components
 
