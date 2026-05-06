@@ -48,7 +48,8 @@ classDiagram
         +settleChannel(op, bytes, amount)
     }
     class FeeRouter {
-        +routeSettlement(op, bytes, amount, root)
+        +routeSettlement(op, bytes, amount)
+        +commitEpochReceiptRoot(epochId, root)
         +claimBoost(epochs)
         +claimDelegator(epochs)
         +workingBytes(op, epoch)
@@ -249,7 +250,7 @@ graph LR
 
     SPC -->|"getStakeMultiple(provider)"| SR
     SPC -->|"safeTransferFrom / safeTransfer"| ERC
-    SPC -->|"routeSettlement(op, bytes, amount, root)"| FR
+    SPC -->|"routeSettlement(op, bytes, amount)"| FR
     FR -->|"balanceOfAt / totalSupplyAt"| VE
     FR -->|"5% USDC same-tx"| BB
     FR -->|"3% USDC same-tx"| SAFE
@@ -452,7 +453,7 @@ New top-level contracts integrate with the launch-time set via standard `AccessC
 | `SLASH_ROLE` | StakingRegistry | `slash()` | SlashJudge contract | SlashJudge contract |
 | `SETTLEMENT_REPORTER_ROLE` | StakingRegistry | `recordSettlement(operator)` | StablePaymentChannel | FeeRouter; see §3 |
 | `KEEPER_ROLE` | BuybackBurner, FeeRouter | `executeBuyback()` (BB), `executeDelegatorSwap(epoch, minOut)` (FeeRouter) | Admin / disabled | Keeper bot or governance |
-| `ROUTER_CALLER_ROLE` | FeeRouter | `routeSettlement(op, bytes, amount, root)` | n/a | PaymentChannel (and any future settlement-emitting contract) |
+| `ROUTER_CALLER_ROLE` | FeeRouter | `routeSettlement(op, bytes, amount)` | n/a | PaymentChannel (and any future settlement-emitting contract) |
 | `PAYOUT_AUTHORIZER_ROLE` | SafetyReserve | `payout(bundle, recipient, amount)` | n/a | Governor via timelock; emergency multisig within hard caps ([ADR 026](026-gauge-boost-tokenomics.md) §5) |
 | `GOVERNANCE_ROLE` | ContentBlacklist, FeeRouter (share parameters / `boostFloor`) | `addHash()`, `removeHash()`, `addOrigin()`, `removeOrigin()`, `registerRegionalBody()` (ContentBlacklist); `setShares(...)`, `setBoostFloor(...)` (FeeRouter) | Admin | Governor via timelock |
 | `EMERGENCY_ROLE` | ContentBlacklist (emergency functions), fund-holding contracts (`pause()`), SafetyReserve (fast-track payout under hard caps) | `emergencyAdd()`, `emergencyAddOrigin()`, `suspendRegionalBody()` (ContentBlacklist); `pause()` (Pausable contracts only); `payout(...)` under hard caps (SafetyReserve) | Admin | 3-of-5 multisig (12-month sunset) |
@@ -539,7 +540,7 @@ Every state-mutating function that makes an external call is listed below with i
 
 | Function | External Calls | Guards |
 | --- | --- | --- |
-| `routeSettlement(operator, bytesDelivered, amount)` | `IERC20.safeTransfer()` × 4 (operator base 40%, BuybackBurner 5%, Treasury 5%, SafetyReserve 3%; gauge 40% and delegator 7% retained in epoch buckets, no transfer), `StakingRegistry.recordSettlement(operator)`. State updates: increments `bytesPerEpoch[operator]` (per-operator settled bytes for this epoch), `totalBytesPerEpoch[epoch]`, and `totalWorkingBytesPerEpoch[epoch]` global counters that `claimBoost` later reads as the gauge-share denominator (avoids gas-prohibitive iteration at claim time). Receipt-root commitments do **not** flow through this call — operators commit per-epoch via the separate `commitEpochReceiptRoot` entry point ([ADR 027 §4](027-distinct-client-receipts.md#4-on-chain-anchoring-merkle-batched)). | `nonReentrant`, checks-effects-interactions, `ROUTER_CALLER_ROLE` |
+| `routeSettlement(operator, bytesDelivered, amount)` | `IERC20.safeTransfer()` × 4 (operator base 40%, BuybackBurner 5%, Treasury 5%, SafetyReserve 3%; gauge 40% and delegator 7% retained in epoch USDC buckets, no transfer), `StakingRegistry.recordSettlement(operator)`. State updates: increments per-epoch USDC accumulators for the gauge and delegator buckets. Byte counters and receipt-root commitments do **not** flow through this call — gauge eligibility (`bytes_i` and `sum(working_bytes)` in the [ADR 026 §3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula) formula) is sourced from per-(operator, epoch) receipt summaries via the separate `commitEpochReceiptRoot` / `commitEpochSummary` entry points ([ADR 027 §4](027-distinct-client-receipts.md#4-on-chain-anchoring-merkle-batched)). | `nonReentrant`, checks-effects-interactions, `ROUTER_CALLER_ROLE` |
 | `commitEpochReceiptRoot(epochId, root)` | None (state-only). Appends one leaf to the per-(`msg.sender`, `epochId`) MMR receipt accumulator (per [ADR 027 §4](027-distinct-client-receipts.md#4-on-chain-anchoring-merkle-batched)). | None — `msg.sender` is the credited operator; the operator is self-authorising for their own gauge eligibility. |
 | `claimBoost(epochs[])` | `IERC20.safeTransfer()` (USDC to claiming operator), `VotingEscrow.balanceOfAt(...)` × N epochs (read), `VotingEscrow.totalSupplyAt(...)` × N epochs (read) | `nonReentrant`, checks-effects-interactions; epoch must be finalized |
 | `claimDelegator(epochs[])` | `IERC20.safeTransfer()` (TOKEN to claiming ve-locker), `VotingEscrow.balanceOfAt(...)` × N (read), `VotingEscrow.totalSupplyAt(...)` × N (read) | `nonReentrant`, checks-effects-interactions; epoch's delegator-pool USDC→TOKEN swap must be settled |
