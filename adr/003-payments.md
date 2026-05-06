@@ -373,7 +373,7 @@ All events use indexed `channelId` plus an indexed actor field where applicable.
 | `ChannelForceClosedByTokenRemoval(channelId, token, caller, …)` | `forceCloseChannel` (production `PaymentChannel` only — see [ADR 010](010-multi-token.md)) | `disputeDeadline` |
 | `RateBoundsUpdated` | `setRateBounds` | `newDeliveryFloor, newDeliveryCeiling` |
 
-`ChannelOpened` is the entry point for off-chain channel enumeration: a client lists their channels via `eth_getLogs(topics=[ChannelOpened, *, paddedClientAddress])`; a provider does the same with their address in the third topic; an indexer keys on `channelId`. Without this event, channels that have been opened but not yet acted on (no `topUp`, `closeChannel`, or `disputeChannel`) are invisible to log scans, forcing wallets to walk the client's entire transaction history to enumerate them.
+`ChannelOpened` is the entry point for off-chain channel enumeration: a client lists their channels via `eth_getLogs(topics=[ChannelOpened, *, paddedClientAddress])`; a provider does the same with their address in the third topic; an indexer keys on `channelId`. This ensures channels are discoverable via log scans even if they have not yet had any subsequent on-chain activity (no `topUp`, `closeChannel`, or `disputeChannel`).
 
 `ChannelSettled` carries no `protocolFee` field — `settleChannel` does not skim a fee inline. The bucket distribution emits its own events from `FeeRouter` (see [FeeRouter Integration](#feerouter-integration)).
 
