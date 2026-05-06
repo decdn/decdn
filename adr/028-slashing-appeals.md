@@ -35,29 +35,29 @@ sequenceDiagram
     participant SR as SafetyReserve
     participant EM as Emergency Multisig
     participant Gov as ve-Governor
-    Note over Op,Gov: T+0: SlashJudge resolution executes the slash
-    Op->>SR: T+0..30d: TOKEN.approve(SR, APPEAL_BOND)
-    Op->>SR: openSlashAppeal(slashId, evidenceBundleHash) [transfers bond]
+    Note over Op,Gov: T+0 — SlashJudge resolution executes the slash
+    Op->>SR: T+0..30d — TOKEN.approve(SR, APPEAL_BOND)
+    Op->>SR: openSlashAppeal(slashId, evidenceBundleHash) — bond transferred
     SR-->>Op: appealId, appeal record stored
     Note over SR: MULTISIG_REVIEW_WINDOW = 14d
     alt multisig acts within window
         EM->>SR: fastTrackAppeal(appealId) or rejectAppeal(appealId)
         alt fast-track approved
-            SR->>SR: provisional restitution moves to per-appeal escrow (not disbursed)
+            SR->>SR: provisional restitution moves to per-appeal escrow — not disbursed
             Note over SR: 48-hour SafetyReserve appeal window (ADR 026 §5)
             Note over SR: RATIFICATION_WINDOW = 14d (runs in parallel)
             alt ve-Governor ratifies
-                SR-->>Op: escrow released to operator; APPEAL_BOND refunded
+                SR-->>Op: escrow released to operator — APPEAL_BOND refunded
             else ve-Governor reverses
-                SR->>SR: escrow returns to SafetyReserve; 50% bond burned, 50% to challenger pool
+                SR->>SR: escrow returns to SafetyReserve — 50% bond burned, 50% to challenger pool
             else governance silent past RATIFICATION_WINDOW
-                SR->>SR: escrow returns to SafetyReserve; APPEAL_BOND refunded (operator not at fault for governance inaction)
+                SR->>SR: escrow returns to SafetyReserve — APPEAL_BOND refunded (operator not at fault)
             end
         else multisig rejects at intake
             SR->>SR: 50% bond burned, 50% to challenger pool
         end
     else multisig silent past MULTISIG_REVIEW_WINDOW
-        SR->>SR: appeal expires unless ve-Governor takes direct action; APPEAL_BOND refunded
+        SR->>SR: appeal expires unless ve-Governor acts directly — APPEAL_BOND refunded
     end
 ```
 
