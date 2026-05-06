@@ -130,7 +130,7 @@ When a node caches blob H:
 2. Send a signed `StoreRequest { hash: H, holder: self.node_id, published_at_us, signature }` to each.
 3. Schedule re-publish at T+45 minutes while blob remains cached.
 
-The `StoreRequest` signature (ed25519 over `hash || published_at_us`) lets receiving nodes verify the record was created by the claimed holder. Receiving nodes do **not** verify that the holder actually has the blob — that is the probe step's job. A false STORE publisher (a node claiming to hold a blob it does not) fails at probe time, degrading its reputation. **Note:** the term "publisher" in this ADR refers to a node publishing a DHT STORE record (an act of advertising). It is distinct from the on-chain *content publisher* identity defined in [ADR 002 § Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces), which is an Ethereum address registered in `PublisherRegistry`. Where confusion is possible this ADR uses "STORE publisher" or "holder" for the DHT-record sender.
+The receiving node MUST verify the `StoreRequest` signature (ed25519 over `hash || published_at_us`) against `holder`'s key — NodeIds are 32-byte ed25519 public keys (§1.3), so the signature alone binds the record to its claimed origin. As a fast precheck the receiver MUST also reject any record whose `holder` does not equal the authenticated NodeId of the inbound QUIC connection; the signature check would catch impersonation downstream, but the equality check lets mismatched records fail before the signature work. The receiver MUST additionally verify that `holder` is in the cached active-staker set (populated from `StakingRegistry.getActiveNodes()` per [ADR 019 § Bootstrap](019-node-onboarding.md)) before accepting the record; non-staked publishers are rejected with `StoreAck { accepted: false }`. Receiving nodes do **not** verify that the holder actually has the blob — that is the probe step's job. A false STORE publisher (a node claiming to hold a blob it does not) fails at probe time, degrading its reputation. **Note:** the term "publisher" in this ADR refers to a node publishing a DHT STORE record (an act of advertising). It is distinct from the on-chain *content publisher* identity defined in [ADR 002 § Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces), which is an Ethereum address registered in `PublisherRegistry`. Where confusion is possible this ADR uses "STORE publisher" or "holder" for the DHT-record sender.
 
 #### 1.6 FIND_VALUE Flow (Cache Miss → DHT Lookup)
 
@@ -142,6 +142,8 @@ When a node gets a cache miss for hash H and the probe cache is empty:
 4. Continue until providers are found or lookup converges (no closer nodes returned).
 5. Probe the returned `NodeId` set via `cdn/probe/v1` to confirm live availability and measure latency.
 6. Select provider by unified node selection score ([ADR 001](001-network.md#node-selection-algorithm)); deliver via `cdn/client/v1`.
+
+**Provider ordering.** When a responder returns multiple providers in `FindValueResponse.providers`, the order SHOULD be randomized so probe traffic spreads across the set rather than concentrating on whichever provider was inserted first. The wire protocol does not enforce per-responder ordering — operators can run modified implementations — randomization is the recommended default.
 
 **Fallback:** if DHT returns no providers, fall back to the on-chain origin directory (§ Origin discovery below). If that also returns nothing, the blob is not available in the network.
 
