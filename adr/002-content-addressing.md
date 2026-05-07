@@ -84,7 +84,7 @@ interface IPublisherRegistry {
     // Governable parameter setters (GOVERNANCE_ROLE; standard 48h timelock).
     // Bounds enforced at the contract layer per ADR 009:
     //   - maxNamespacesPerPublisher: [1, 1000]
-    //   - namespaceTransferTimelock:  [24h, 30d] (in seconds)
+    //   - namespaceTransferTimelock: [86400, 2592000] (in seconds; 24 h – 30 days)
     function setMaxNamespacesPerPublisher(uint256 newMax) external;
     function setNamespaceTransferTimelock(uint64 newTimelock) external;
 
@@ -101,7 +101,7 @@ interface IPublisherRegistry {
 
 `namespaceOf(hash)` returns an empty array for any hash not explicitly claimed; default-open semantics apply. The view never reverts on unknown hashes — callers cannot distinguish "hash unknown to the protocol" from "hash served as default-open" via this view, which is correct: both states are operationally identical. Storage is a per-hash `uint256[]` set of claiming namespaces — append-only since claims are content-immutable, never moved or revoked.
 
-Per-publisher namespace cap and ownership-transfer timelock are governable parameters with safety bounds (see [ADR 009](009-governance.md)). Defaults: `maxNamespacesPerPublisher = 100` (anti-squatting; bounded `[1, 1000]`), `namespaceTransferTimelock = 7 days` (key-compromise mitigation; bounded `[24h, 30d]`). Values are stored on `PublisherRegistry` itself and updated via `setMaxNamespacesPerPublisher` / `setNamespaceTransferTimelock` under the standard 48h `TimelockController` delay; the contract enforces the safety bounds at the setter and rejects out-of-range writes regardless of caller.
+Per-publisher namespace cap and ownership-transfer timelock are governable parameters with safety bounds (see [ADR 009](009-governance.md)). Defaults: `maxNamespacesPerPublisher = 100` (anti-squatting; bounded `[1, 1000]`), `namespaceTransferTimelock = 604800` seconds / 7 days (key-compromise mitigation; bounded `[86400, 2592000]` / `[24 h, 30 days]`). Values are stored on `PublisherRegistry` itself and updated via `setMaxNamespacesPerPublisher` / `setNamespaceTransferTimelock` under the standard `TimelockController` delay (`172800` seconds / 48 h); the contract enforces the safety bounds at the setter in seconds and rejects out-of-range writes regardless of caller.
 
 ## Consequences
 
