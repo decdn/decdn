@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use decdn_cache::{CacheEngine, FilesystemOrigin, HttpOrigin, Origin};
+use decdn_common::config::ResolvedOrigin;
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
 use iroh::{Endpoint, SecretKey};
@@ -99,7 +100,8 @@ pub async fn run(
     let retry = cfg.cache.origin_retry;
     tracing::info!(
         cache_dir = %cfg.cache.cache_dir.display(),
-        has_origin = cfg.cache.origin_url.is_some() || cfg.cache.origin_path.is_some(),
+        has_origin = cfg.cache.origin.is_some(),
+        origin_kind = origin_kind_label(cfg.cache.origin.as_ref()),
         pinned_hashes = cfg.cache.pinned_hashes.len(),
         // Origin retry policy (#285). Logged once at startup so operators
         // can audit the active resilience budget without hitting an RPC.
@@ -305,7 +307,8 @@ pub async fn run(
         admin_port = ?cfg.observability.admin_port,
         rate_per_mb = cfg.payment.rate_per_mb,
         cache_dir = %cfg.cache.cache_dir.display(),
-        has_origin = cfg.cache.origin_url.is_some() || cfg.cache.origin_path.is_some(),
+        has_origin = cfg.cache.origin.is_some(),
+        origin_kind = origin_kind_label(cfg.cache.origin.as_ref()),
         subscribe_global = cfg.gossip.subscribe_global,
         "node runtime ready"
     );
@@ -531,10 +534,10 @@ fn log_join_result(result: Result<(), tokio::task::JoinError>, phase: &'static s
     }
 }
 
-/// Construct the cache engine from resolved config. At most one of
-/// `origin_url` and `origin_path` is set (guaranteed by
-/// `config::resolve_cache`); neither-set means the engine serves only
-/// already-cached content and cache misses surface as
+/// Construct the cache engine from resolved config. The `[cache.origin]`
+/// table picks one of three backends — HTTP, filesystem, or S3 (#437).
+/// `None` means no pull-through is configured; the engine then serves
+/// only already-cached content and cache misses surface as
 /// `CacheError::NoOrigin`.
 ///
 /// `node_metrics` provides the shared `Arc<CacheMetrics>` that the
@@ -543,25 +546,33 @@ async fn build_cache(
     cfg: &ResolvedConfig,
     node_metrics: Arc<metrics::Metrics>,
 ) -> anyhow::Result<CacheEngine> {
-    let origin: Option<Arc<dyn Origin>> =
-        match (cfg.cache.origin_url.clone(), cfg.cache.origin_path.clone()) {
-            (Some(url), None) => Some(Arc::new(
-                HttpOrigin::new(url)
-                    .context("failed to build HTTP origin client")?
-                    .with_decompress_mode(cfg.cache.decompress),
-            )),
-            (None, Some(path)) => Some(Arc::new(
-                FilesystemOrigin::new(path)
-                    .await
-                    .context("failed to open filesystem origin")?,
-            )),
-            (None, None) => None,
-            // resolve_cache enforces this mutex; this arm is unreachable in
-            // practice but a typed fallback is safer than unwrap() or unreachable!().
-            (Some(_), Some(_)) => {
-                anyhow::bail!("cache.origin_url and cache.origin_path are mutually exclusive")
-            }
-        };
+    let origin: Option<Arc<dyn Origin>> = match cfg.cache.origin.as_ref() {
+        None => None,
+        Some(ResolvedOrigin::Http { url, decompress }) => Some(Arc::new(
+            HttpOrigin::new(url.clone())
+                .context("failed to build HTTP origin client")?
+                .with_decompress_mode(*decompress),
+        )),
+        Some(ResolvedOrigin::Fs { path }) => Some(Arc::new(
+            FilesystemOrigin::new(path.clone())
+                .await
+                .context("failed to open filesystem origin")?,
+        )),
+        // TODO(#437-PR2): replace this placeholder bail with the
+        // real S3Origin construction once aws-sdk-s3 lands. The
+        // config schema accepts the variant today so operators can
+        // preview the TOML shape and `decdn config validate` lints
+        // it; runtime wiring requires aws-sdk-s3 which adds ~50
+        // transitive crates and a new TLS layer — kept separate so
+        // PR2 is reviewable on its own.
+        Some(ResolvedOrigin::S3(_)) => {
+            anyhow::bail!(
+                "cache.origin kind = \"s3\" is accepted by the schema but the runtime \
+                 backend is not yet wired in this build (lands in the follow-up PR for #437); \
+                 use kind = \"http\" or kind = \"fs\" in the meantime"
+            )
+        }
+    };
     CacheEngine::open_full(
         &cfg.cache.cache_dir,
         origin,
@@ -572,6 +583,20 @@ async fn build_cache(
     )
     .await
     .context("failed to open cache engine")
+}
+
+/// Stable label for the resolved-origin variant, used in startup
+/// logs so operators can grep for `origin_kind=s3` without parsing
+/// the structured fields back out. Returns `"none"` when no origin
+/// is configured (rather than emitting an empty string) so the field
+/// is always present and machine-parseable.
+const fn origin_kind_label(origin: Option<&ResolvedOrigin>) -> &'static str {
+    match origin {
+        None => "none",
+        Some(ResolvedOrigin::Http { .. }) => "http",
+        Some(ResolvedOrigin::Fs { .. }) => "fs",
+        Some(ResolvedOrigin::S3(_)) => "s3",
+    }
 }
 
 /// Which OS signal (or admin RPC call) triggered shutdown. Returned by
@@ -859,6 +884,98 @@ mod tests {
     use super::*;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Build a minimal `ResolvedConfig` with the cache section
+    /// pointed at the given `origin`. Other sections carry sensible
+    /// dummies — only the cache is exercised. Mirrors the fixture
+    /// shape used in `runtime::reload::tests` and
+    /// `crates/node/tests/sighup_signal.rs`.
+    fn cfg_with_origin(origin: Option<ResolvedOrigin>) -> ResolvedConfig {
+        use decdn_common::config::{
+            ResolvedBlockchain, ResolvedGossip, ResolvedIdentity, ResolvedNetwork,
+            ResolvedObservability, ResolvedPayment, ResolvedSecurity,
+        };
+        let cache_dir =
+            std::env::temp_dir().join(format!("decdn-build-cache-test-{}", std::process::id()));
+        ResolvedConfig {
+            identity: ResolvedIdentity {
+                data_dir: cache_dir.clone(),
+                region: None,
+            },
+            network: ResolvedNetwork {
+                bind_port: 4433,
+                relay_url: None,
+            },
+            blockchain: ResolvedBlockchain {
+                rpc_url: "http://localhost:8545".into(),
+                eth_keystore: PathBuf::from("/tmp/keystore.json"),
+                keystore_password_file: None,
+                payment_channel_address: "0x0000000000000000000000000000000000000001".into(),
+                staking_registry_address: "0x0000000000000000000000000000000000000002".into(),
+                rpc_watchdog_interval_sec: 30,
+            },
+            cache: decdn_common::config::ResolvedCache {
+                cache_dir,
+                cache_size_mb: 1024,
+                max_blob_size_mb: 128,
+                origin,
+                pinned_hashes: decdn_cache::PinnedHashes::empty(),
+                origin_retry: decdn_cache::RetryPolicy::default(),
+            },
+            payment: ResolvedPayment { rate_per_mb: 10 },
+            observability: ResolvedObservability {
+                log_level: decdn_common::cli::common::LogLevel::Info,
+                log_format: decdn_common::cli::common::LogFormat::Pretty,
+                metrics_port: 9090,
+                metrics_bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                admin_port: Some(9191),
+                otlp_endpoint: None,
+            },
+            gossip: ResolvedGossip {
+                announce_interval_sec: 60,
+                peer_ttl_sec: 600,
+                subscribe_global: false,
+                allowlist: Vec::new(),
+            },
+            security: ResolvedSecurity {
+                max_concurrent_handlers: 256,
+                per_source_rate_per_sec: 100.0,
+                per_source_burst: 200,
+                max_tracked_sources: 4096,
+            },
+        }
+    }
+
+    /// `build_cache` must reject the S3 variant with a clear,
+    /// operator-greppable error in PR1: the schema accepts
+    /// `kind = "s3"` (so `decdn config validate` passes) but the
+    /// runtime backend lands in PR2. PR2 will replace this test with
+    /// a real-backend smoke test; the message-shape contract here
+    /// guards the operator UX in the meantime.
+    #[tokio::test]
+    async fn build_cache_rejects_s3_with_pr2_pointer_error() {
+        use decdn_common::config::{ResolvedS3Config, ResolvedS3Credentials};
+
+        let s3 = ResolvedS3Config {
+            bucket: "decdn-blobs".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint_url: None,
+            path_style: false,
+            prefix: String::new(),
+            credentials: Some(ResolvedS3Credentials::DefaultChain { profile: None }),
+        };
+        let cfg = cfg_with_origin(Some(ResolvedOrigin::S3(s3)));
+        let metrics_handle = Arc::new(metrics::Metrics::new());
+
+        let err = build_cache(&cfg, metrics_handle)
+            .await
+            .expect_err("S3 placeholder must reject in PR1");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("kind = \"s3\"") && msg.contains("#437"),
+            "operator-facing message must name the variant and the issue: {msg}"
+        );
+    }
 
     // Operators grep `signal=SIGINT` / `signal=SIGTERM` / `signal=admin-drain`
     // in the structured "shutdown signal received" log line; a rename here

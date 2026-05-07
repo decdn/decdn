@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use super::secret::SecretString;
 use crate::cli::common::{LogFormat, LogLevel};
 
 /// Top-level TOML configuration file structure.
@@ -65,7 +66,15 @@ pub struct BlockchainConfig {
 }
 
 /// Cache section of the config file.
+///
+/// `deny_unknown_fields` is set so that operators upgrading from the
+/// pre-#437 schema (flat `origin_url` / `origin_path` / `decompress`
+/// fields) get a clear "unknown field" error at config load instead of
+/// a silent "no origin configured" surprise at the first cache miss.
+/// The new schema lives under the tagged `[cache.origin]` table — see
+/// [`OriginConfig`].
 #[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CacheConfig {
     /// Blob cache directory.
     pub cache_dir: Option<PathBuf>,
@@ -73,20 +82,11 @@ pub struct CacheConfig {
     pub cache_size_mb: Option<u64>,
     /// Maximum single blob size in megabytes.
     pub max_blob_size_mb: Option<u64>,
-    /// Origin base URL (HTTP/HTTPS) served at `{url}/{blake3_hex}`. When
-    /// absent, cache misses fail with `NoOrigin` — useful for nodes that
-    /// only serve already-pinned content.
-    pub origin_url: Option<String>,
-    /// Local filesystem origin root; blobs live at
-    /// `{path}/{hex[0..2]}/{hex}`. Mutually exclusive with `origin_url`.
-    pub origin_path: Option<PathBuf>,
-    /// How to handle `Content-Encoding` on the HTTP origin response
-    /// (#312). `"auto"` (default) decompresses gzip/zstd transparently;
-    /// `"strict"` refuses any non-identity encoding. The BLAKE3
-    /// content-address is computed over the canonical (decompressed)
-    /// form, so `"strict"` is only safe for origins guaranteed to
-    /// serve already-canonical bytes.
-    pub decompress: Option<decdn_cache::DecompressMode>,
+    /// Origin backend for cache pull-through (#437). Absent => no
+    /// pull-through; cache misses fail with `NoOrigin`. The variant
+    /// (`http`, `fs`, or `s3`) is selected by the `kind` field on the
+    /// inner `[cache.origin]` table.
+    pub origin: Option<OriginConfig>,
     /// Hex-encoded BLAKE3 hashes that must stay cached regardless of LRU
     /// pressure (#276). Each entry is 64 lowercase hex chars (BLAKE3
     /// digest size). Invalid hex or wrong-length entries cause config
@@ -105,6 +105,158 @@ pub struct CacheConfig {
     /// partial sections (e.g. just `max_retries = 5`) get the rest of
     /// the fields filled from defaults.
     pub origin_retry: Option<decdn_cache::RetryPolicy>,
+}
+
+/// Origin backend selection (#437). Tagged on the inner `kind` field.
+///
+/// `deny_unknown_fields` is set on the enum and on each variant's
+/// payload so that an operator typo (`decompres = "auto"` on the Http
+/// variant, for instance) fails at config load instead of silently
+/// no-opping.
+///
+/// ```toml
+/// [cache.origin]
+/// kind = "http"
+/// url = "https://origin.example/"
+/// decompress = "auto"          # optional; defaults to "auto"
+///
+/// # — or —
+/// [cache.origin]
+/// kind = "fs"
+/// path = "/var/lib/decdn/origin"
+///
+/// # — or —
+/// [cache.origin]
+/// kind = "s3"
+/// bucket = "decdn-blobs"
+/// region = "us-east-1"
+/// # endpoint_url = "https://<accountid>.r2.cloudflarestorage.com"  # for R2/B2/MinIO
+/// # path_style = true                                               # for MinIO
+/// # prefix = "blobs/"
+/// # [cache.origin.credentials] source = "static" / "default-chain"
+/// ```
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
+pub enum OriginConfig {
+    /// HTTP(S) origin served at `{url}/{blake3_hex}`.
+    Http {
+        /// Base URL; must be `http`/`https` and is path-normalized to
+        /// end with `/` so `{base}.join(&hex)` produces `{base}/{hex}`.
+        url: String,
+        /// How to handle `Content-Encoding` on the HTTP response
+        /// (#312). `"auto"` (default) decompresses gzip/zstd
+        /// transparently; `"strict"` refuses any non-identity
+        /// encoding. The BLAKE3 content-address is computed over the
+        /// canonical (decompressed) form, so `"strict"` is only safe
+        /// for origins guaranteed to serve already-canonical bytes.
+        decompress: Option<decdn_cache::DecompressMode>,
+    },
+    /// Local filesystem origin rooted at `path`; blobs live at
+    /// `{path}/{hex[0..2]}/{hex}`.
+    Fs {
+        /// Filesystem root.
+        path: PathBuf,
+    },
+    /// S3-compatible object storage (#437): AWS S3, Cloudflare R2,
+    /// Backblaze B2, `MinIO`, etc. Object key layout is
+    /// `{prefix?}{hex[0..2]}/{hex}` — sharded the same way as the
+    /// filesystem backend so operators can copy blobs between
+    /// backends without rewriting tooling.
+    S3(S3OriginConfig),
+}
+
+/// S3-compatible origin configuration (#437) — wire form.
+///
+/// Validation runs at config-resolution time via the (private)
+/// `resolve_s3_origin` helper, which produces the runtime form
+/// [`super::resolved::ResolvedS3Config`]. Unvalidated instances of
+/// this type cannot reach the cache wiring layer because
+/// [`super::resolved::ResolvedOrigin::S3`] holds the resolved form,
+/// not this one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct S3OriginConfig {
+    /// Bucket name. Validated DNS-safe at config resolution
+    /// (lowercase `[a-z0-9.-]`, 3–63 chars; see
+    /// `validate_s3_bucket_name`).
+    pub bucket: String,
+    /// AWS region (e.g. `"us-east-1"`). Required because the S3 SDK
+    /// (wired in the follow-up PR for #437) uses it for `SigV4`
+    /// signing even when a custom `endpoint_url` is set. Validated
+    /// non-empty at config resolution.
+    pub region: String,
+    /// Custom endpoint URL for non-AWS S3-compatible providers (R2,
+    /// B2, `MinIO`). Omit for AWS S3. Validated as `http`/`https` at
+    /// config resolution.
+    pub endpoint_url: Option<String>,
+    /// Use path-style addressing (`https://endpoint/bucket/key`)
+    /// instead of virtual-hosted-style (`https://bucket.endpoint/key`).
+    /// Required `true` for `MinIO` and many self-hosted providers;
+    /// AWS S3 and Cloudflare R2 use virtual-hosted-style by default.
+    /// Absent => fall back to the SDK default (virtual-hosted-style).
+    pub path_style: Option<bool>,
+    /// Optional key prefix prepended to every fetched object. Final
+    /// key is `{prefix}{hex[0..2]}/{hex}`. Validation rejects
+    /// `prefix` starting with `/`, containing `..`, containing
+    /// backslash, or containing ASCII control / whitespace
+    /// characters; auto-appends a trailing `/` if the prefix is
+    /// non-empty and missing one (mirrors `parse_origin_url`'s
+    /// trailing-slash normalization).
+    pub prefix: Option<String>,
+    /// Credential source. Absent => use the AWS default credential
+    /// chain (env vars, `~/.aws/credentials`, IAM role / instance
+    /// profile).
+    pub credentials: Option<S3Credentials>,
+}
+
+/// S3 credential source (#437). Tagged on the inner `source` field.
+///
+/// Static credential fields use [`SecretString`] so an incidental
+/// `tracing::debug!(?cfg)` or panic backtrace cannot leak the
+/// material — the wrapper redacts itself in `Debug` output and is
+/// not `Serialize`. The codebase already redacts HTTP-origin URL
+/// credentials (see `decdn_cache::redact_for_log`); this is the
+/// same pattern for TOML-borne secrets.
+///
+/// ```toml
+/// [cache.origin.credentials]
+/// source = "static"
+/// access_key_id = "AKIA..."
+/// secret_access_key = "..."
+/// # session_token = "..."        # optional
+///
+/// # — or —
+/// [cache.origin.credentials]
+/// source = "default-chain"
+/// # profile = "production"       # optional, override default profile
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "source", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum S3Credentials {
+    /// Static IAM credentials embedded in the config file. Common
+    /// for R2/B2/MinIO operator deployments where simple key-pair
+    /// audit is preferred; for AWS S3, prefer the default credential
+    /// chain so credentials live outside the TOML.
+    Static {
+        /// AWS access key ID. Stored in [`SecretString`] so it
+        /// redacts in `Debug` output alongside the secret key.
+        access_key_id: SecretString,
+        /// AWS secret access key. Redacted in `Debug` output.
+        secret_access_key: SecretString,
+        /// Optional STS session token (for assume-role / SSO flows
+        /// where a static key isn't enough on its own). Redacted.
+        session_token: Option<SecretString>,
+    },
+    /// Use the standard AWS credential chain: `AWS_ACCESS_KEY_ID` /
+    /// `AWS_SECRET_ACCESS_KEY` env vars, then `~/.aws/credentials`
+    /// profile, then IAM role / instance profile.
+    DefaultChain {
+        /// Override the default profile name when reading
+        /// `~/.aws/credentials`. Once the S3 backend is wired (PR2
+        /// for #437), this is threaded through as the equivalent of
+        /// `AWS_PROFILE`.
+        profile: Option<String>,
+    },
 }
 
 /// Payment section of the config file.

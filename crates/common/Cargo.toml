@@ -24,6 +24,10 @@ jsonrpsee = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# `secret::SecretString` Serialize tests assert no-leak via JSON. The
+# production-side runtime::reload uses serde_json on the node crate
+# already; here we only need it for tests.
+serde_json = { workspace = true }
 
 [lints]
 workspace = true
