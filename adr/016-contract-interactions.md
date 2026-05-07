@@ -162,6 +162,14 @@ interface IFeeRouter {
     // `DelegatorBuyer` is the single Balancer V3 caller. `KEEPER_ROLE`-gated.
     function executeDelegatorSwap(uint256 epoch, uint256 minOut) external;
 
+    // ─── Delegator-pool swap callback (DelegatorBuyer-only) ───────────
+    // Called by `DelegatorBuyer.swapDelegatorBucket` after the Balancer
+    // V3 swap completes. Deposits `amount` of TOKEN into the delegator
+    // bucket for `epoch` so `claimDelegator(epochs[])` can pay against
+    // it. `msg.sender == delegatorBuyer` is the only authorization
+    // check — single trust boundary; no role grants needed post-deploy.
+    function depositDelegatorTokens(uint256 epoch, uint256 amount) external;
+
     // ─── Permissionless storage cleanup ───────────────────────────────
     // Sweeps the unclaimed remainder of any epoch past the 26-epoch claim
     // window to the treasury, freeing the per-epoch storage slot. Anyone
@@ -261,6 +269,7 @@ interface IFeeRouter {
     event BoostClaimed(address indexed operator, uint256 indexed epoch, uint256 amount);
     event DelegatorClaimed(address indexed account, uint256 indexed epoch, uint256 amount);
     event DelegatorSwapped(uint256 indexed epoch, uint256 amountIn, uint256 amountOut);
+    event DelegatorTokensDeposited(uint256 indexed epoch, uint256 amount);
     event UnclaimedSwept(uint256 indexed epoch, uint256 gaugeAmount, uint256 delegatorAmount);
     event SharesUpdated(uint256[6] newShares);
     event VotingEscrowUpdated(address indexed oldAddr, address indexed newAddr);
