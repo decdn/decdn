@@ -444,17 +444,17 @@ fn resolve_cache(
         .context("invalid cache.origin_retry")?;
 
     // `cache.user_agent` (#435): operator override of the default
-    // `decdn-node/<version>` UA we send on every origin pull. Empty
-    // string is treated as "explicit blank" and rejected — reqwest
-    // would also reject it at client build time, but failing at config
-    // load gives a clearer message. Whitespace is preserved verbatim
-    // so an operator who genuinely wants `MyCdn / 1.0` gets exactly that.
+    // `decdn-node/<version>` UA we send on every origin pull. We
+    // validate the value at config load — both for a clear error
+    // message and to slam the door on header-injection (CRLF, NUL,
+    // other control bytes) before it reaches `reqwest::Client::builder`,
+    // which would otherwise surface a generic "failed to build reqwest
+    // client" at runtime. Whitespace inside the value is preserved
+    // verbatim so an operator who genuinely wants `MyCdn / 1.0` gets
+    // exactly that.
     let user_agent = match file.and_then(|c| c.user_agent.as_ref()) {
         Some(s) => {
-            anyhow::ensure!(
-                !s.is_empty(),
-                "cache.user_agent must be a non-empty string when set"
-            );
+            validate_user_agent(s)?;
             s.clone()
         }
         None => decdn_cache::DEFAULT_USER_AGENT.to_string(),
@@ -687,6 +687,35 @@ fn validate_s3_bucket_name(name: &str) -> anyhow::Result<()> {
     // here.
     if name.parse::<std::net::Ipv4Addr>().is_ok() {
         anyhow::bail!("bucket name must not be formatted as an IPv4 address");
+    }
+    Ok(())
+}
+
+/// Validate `cache.user_agent` as an HTTP header value at config load
+/// time. Rejects empty strings and any byte that would break header
+/// framing (CR, LF, NUL, other C0 controls, DEL). Tab is permitted —
+/// HTTP allows it in field values and operators occasionally use it as
+/// a separator inside the UA. Non-ASCII bytes (≥ 0x80) are rejected
+/// because real-world `User-Agent` strings are pure visible ASCII and
+/// silently passing through obs-text would hide a typo or a botched
+/// env-var expansion. Catching this here, rather than letting reqwest
+/// surface a generic `"failed to build reqwest client"` at startup,
+/// gives the operator a message that actually names the offending
+/// field and position.
+fn validate_user_agent(s: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !s.is_empty(),
+        "cache.user_agent must be a non-empty string when set"
+    );
+    if let Some((idx, byte)) = s
+        .bytes()
+        .enumerate()
+        .find(|(_, b)| !(*b == b'\t' || (0x20..=0x7e).contains(b)))
+    {
+        anyhow::bail!(
+            "cache.user_agent contains an invalid byte 0x{byte:02x} at position {idx}; \
+             only visible ASCII (0x20..=0x7e) and tab (0x09) are allowed in HTTP header values"
+        );
     }
     Ok(())
 }
@@ -1920,6 +1949,12 @@ mod tests {
                     ..Default::default()
                 });
             }),
+            ("cache.user_agent", |c, v| {
+                c.cache = Some(types::CacheConfig {
+                    user_agent: Some(v.to_string()),
+                    ..Default::default()
+                });
+            }),
             ("observability.otlp_endpoint", |c, v| {
                 c.observability = Some(types::ObservabilityConfig {
                     log_level: None,
@@ -1944,6 +1979,31 @@ mod tests {
                 "field `{expected_ctx}` missing from error: {err}"
             );
         }
+        Ok(())
+    }
+
+    // Same guard as `expand_env_substitutes_cache_origin_url`, for the
+    // user_agent field. Operators commonly want to embed `${HOSTNAME}` or
+    // a build-tag env var into the UA, and silently shipping the literal
+    // `${...}` would be a confusing wire-level surprise.
+    #[test]
+    fn expand_env_substitutes_cache_user_agent() -> anyhow::Result<()> {
+        let home = home_str()?;
+        let mut cfg = FileConfig {
+            cache: Some(types::CacheConfig {
+                user_agent: Some("decdn-${HOME}/test".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        expand_env(&mut cfg)?;
+        let ua = cfg
+            .cache
+            .as_ref()
+            .and_then(|c| c.user_agent.as_deref())
+            .ok_or_else(|| anyhow::anyhow!("user_agent missing"))?;
+        let expected = format!("decdn-{home}/test");
+        anyhow::ensure!(ua == expected, "got: {ua}");
         Ok(())
     }
 
@@ -2459,6 +2519,65 @@ mod tests {
             msg.contains("cache.user_agent"),
             "missing field name: {msg}"
         );
+    }
+
+    /// Reject control-byte bytes at config load — most importantly CR/LF, which
+    /// would let an operator-supplied (or env-expanded) value smuggle a second
+    /// header onto every origin request. Also covers NUL, other C0 controls,
+    /// DEL, and non-ASCII obs-text. Without this, the value reaches
+    /// `reqwest::Client::builder` and surfaces as a generic build error from
+    /// inside `HttpOrigin::new_with_user_agent` at startup, which doesn't tell
+    /// the operator which config field is to blame.
+    #[test]
+    fn resolve_cache_rejects_user_agent_with_control_bytes() {
+        let cli = cache_cli(None, None);
+        for bad in [
+            "evil\r\nX-Inject: 1",
+            "has\nlf",
+            "has\rcr",
+            "nul\0byte",
+            "del\x7fbyte",
+            "non-ascii-\u{00e9}",
+        ] {
+            let file = types::CacheConfig {
+                user_agent: Some(bad.to_string()),
+                ..types::CacheConfig::default()
+            };
+            let result = resolve_cache(&cli, Some(&file), Path::new("/tmp"));
+            assert!(result.is_err(), "UA `{bad:?}` must reject but resolved OK");
+        }
+        // Pin the message shape on one representative case so a regression in
+        // error context is caught (e.g. losing the field name or the byte
+        // position).
+        let file = types::CacheConfig {
+            user_agent: Some("crlf\r\ninjection".to_string()),
+            ..types::CacheConfig::default()
+        };
+        let err =
+            resolve_cache(&cli, Some(&file), Path::new("/tmp")).expect_err("CRLF UA must reject");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cache.user_agent") && msg.contains("invalid byte"),
+            "error should name the field and describe the byte, got: {msg}"
+        );
+    }
+
+    /// Tab is part of the legal HTTP header-value byte set and shows up in
+    /// real-world UAs occasionally; make sure the validator doesn't over-reject.
+    #[test]
+    fn resolve_cache_accepts_user_agent_with_tab() -> anyhow::Result<()> {
+        let cli = cache_cli(None, None);
+        let file = types::CacheConfig {
+            user_agent: Some("MyCdn/1.0\t(ops@example.com)".to_string()),
+            ..types::CacheConfig::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        anyhow::ensure!(
+            resolved.user_agent == "MyCdn/1.0\t(ops@example.com)",
+            "got: {}",
+            resolved.user_agent
+        );
+        Ok(())
     }
 
     #[test]
