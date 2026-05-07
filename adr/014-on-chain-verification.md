@@ -155,8 +155,10 @@ The `bytes calldata` arguments named `*ResponseData` in the interface below are 
 
 ```solidity
 interface ISlashJudge {
-    /// Offense identifier emitted on every slash. Order is contract-canonical.
-    enum OffenseType { Corruption, Phantom, RateManipulation, Blacklist }
+    /// Offense identifier emitted on every slash. Order is contract-canonical
+    /// and append-only — new offense types extend the enum at the end so existing
+    /// `slashId` allocations remain stable.
+    enum OffenseType { Corruption, Phantom, RateManipulation, Blacklist, ReceiptFraud }
 
     /// Emitted on every slash resolution that results in a stake reduction.
     /// `slashId` is globally monotonic across all four offense types.
@@ -218,7 +220,21 @@ interface ISlashJudge {
         bytes calldata streamSlashSig
     ) external;
 
-    /// Counter-evidence submission (24h window)
+    /// Receipt-summary fraud: operator's `EpochReceiptSummary` overstates
+    /// `claimedBytes` or `claimedDistinctClients` relative to the on-chain
+    /// MMR. Emits `Slashed` synchronously on successful verification; no
+    /// counter-evidence window because the Merkle proof is cryptographically
+    /// dispositive. Full evidence format and verification spec live in
+    /// [ADR 027 §5](027-distinct-client-receipts.md#5-challenger-role-see-appendix-fraud-detection).
+    function submitReceiptFraudChallenge(
+        address challengedNode,
+        uint64 epochId,
+        bytes calldata fraudEvidence    // serialized Merkle inclusion proofs against the on-chain aggregateRoot
+    ) external;
+
+    /// Counter-evidence submission (24h window). Applies to Corruption only;
+    /// the other four offense types (Phantom, RateManipulation, Blacklist,
+    /// ReceiptFraud) resolve synchronously at submit time.
     function counterChallenge(uint256 challengeId, bytes calldata evidence) external;
 
     /// Resolve after counter-evidence window expires
@@ -228,7 +244,7 @@ interface ISlashJudge {
 
 ##### Challenge rate limit
 
-`SlashJudge` enforces a maximum number of concurrent active (unresolved) challenges per target node address: `maxActiveChallengesPerNode` (PoC: 10, production safety bound: [1, 50]). New `submitPhantomChallenge`, `submitRateChallenge`, `submitBlacklistChallenge`, and `submitCorruptionChallenge` calls targeting a node at the limit MUST revert. This bounds the defender's concurrent counter-evidence response burden and prevents griefing attacks where a well-funded attacker submits many simultaneous spurious challenges to force operational disruption. The parameter is governable per [ADR 009](009-governance.md).
+`SlashJudge` enforces a maximum number of concurrent active (unresolved) challenges per target node address: `maxActiveChallengesPerNode` (PoC: 10, production safety bound: [1, 50]). New `submitPhantomChallenge`, `submitRateChallenge`, `submitBlacklistChallenge`, `submitCorruptionChallenge`, and `submitReceiptFraudChallenge` calls targeting a node at the limit MUST revert. This bounds the defender's concurrent counter-evidence response burden and prevents griefing attacks where a well-funded attacker submits many simultaneous spurious challenges to force operational disruption. The parameter is governable per [ADR 009](009-governance.md).
 
 #### Evidence Verification Per Offense Type
 
@@ -289,12 +305,13 @@ All challenge types MUST validate evidence age using a skew-safe comparison. Let
 Every slash that reduces operator stake emits `Slashed(slashId, operator, offenseType, amount, evidenceHash)` (see the `ISlashJudge` interface block above). The event is the canonical record of the slash and is the appeal-pinning identifier consumed by [ADR 028 §6](028-slashing-appeals.md#6-contract-surface) `openSlashAppeal(slashId, evidenceBundleHash)` — without it, three of the four ADR 028 appeal categories (phantom, rate, blacklist) cannot be filed.
 
 - **`slashId`** is a globally monotonic `uint256` (single counter across all four offense types, not per-operator and not per-offense-type). It is allocated from a `nextSlashId` storage slot incremented inline in the same transaction as the `StakingRegistry.slash(...)` call. `slashId` values are stable, non-reusable, and non-zero — `slashId == 0` is reserved as the "no slash" sentinel.
-- **`offenseType`** is the `OffenseType` enum from the interface above. The order `{Corruption, Phantom, RateManipulation, Blacklist}` is contract-canonical and MUST NOT be reordered without a coordinated migration of consumer contracts (notably `SafetyReserve`).
+- **`offenseType`** is the `OffenseType` enum from the interface above. The order `{Corruption, Phantom, RateManipulation, Blacklist, ReceiptFraud}` is contract-canonical and append-only; existing entries MUST NOT be reordered (consumer contracts — notably `SafetyReserve` — index by ordinal). New offense types extend the enum at the end.
 - **`evidenceHash`** is `keccak256` over a per-offense canonical preimage that uniquely identifies the (offenseType, evidence) pair the slash relied on. The preimage uses `abi.encode(...)` (not `abi.encodePacked`) so the field encoding is unambiguous across implementers. Every preimage is prefixed by `uint8(offenseType)` so two distinct offenses against the same operator on overlapping evidence (e.g., a single `(probe, stream)` pair where `streamResponse.ok == false` AND `streamResponse.rate_per_mb > probeResponse.rate_per_mb` triggers both phantom and rate-manipulation) produce distinct `evidenceHash` values, not just distinct `slashId`s. Signatures are **excluded** from the preimage — the §1 EIP-712 typed-data digests they sign already uniquely identify the message contents, so a successful slash trivially fixes the digest set; including the variable-length signature blobs in the hash would create an ambiguity (`abi.encode` vs `abi.encodePacked` field length) without adding evidentiary content. The `blobHash` parameter passed to the immediate-execution `submit*Challenge` paths is similarly excluded — the §3 evidence-verification flow already binds it via the `responseData.hash == blobHash` check, and the EIP-712 `*Response` struct hash commits to `hash` directly. The per-offense preimages are:
   - **Phantom:** `keccak256(abi.encode(uint8(OffenseType.Phantom), probeStructHash, streamStructHash))`.
   - **Rate manipulation:** `keccak256(abi.encode(uint8(OffenseType.RateManipulation), probeStructHash, streamStructHash))`. The `OffenseType` prefix is what distinguishes this preimage from phantom on overlapping evidence.
   - **Blacklist:** `keccak256(abi.encode(uint8(OffenseType.Blacklist), responseStructHash, isStreamResponse))`. The boolean is required because it is a `submitBlacklistChallenge` parameter, not part of any `*Response` struct.
   - **Corruption:** `keccak256(abi.encode(uint8(OffenseType.Corruption), streamStructHash))`.
+  - **Receipt fraud:** `keccak256(abi.encode(uint8(OffenseType.ReceiptFraud), epochId, aggregateRoot))`. `epochId` and `aggregateRoot` come from the operator's `EpochReceiptSummary` for the challenged epoch; the preimage uniquely identifies (operator, epoch) pair fraud while remaining stable across alternate fraud-evidence formats (different challengers may submit different Merkle proofs against the same `aggregateRoot`, all producing the same `evidenceHash`).
 
   Each `*StructHash` is the EIP-712 struct hash of the corresponding `*Response` per §1 (head-only `bytes32` — `abi.encode` adds no padding to a fixed-width 32-byte value). Appeals reference `evidenceHash` to prove they are challenging the same evidence the slash relied on; ADR 028 §6 `openSlashAppeal(slashId, evidenceBundleHash)` requires `evidenceBundleHash == evidenceHash` of the referenced `Slashed` event.
 - **Emission sites:**
