@@ -105,6 +105,13 @@ pub struct CacheConfig {
     /// partial sections (e.g. just `max_retries = 5`) get the rest of
     /// the fields filled from defaults.
     pub origin_retry: Option<decdn_cache::RetryPolicy>,
+    /// Optional `User-Agent` override sent on every HTTP origin
+    /// pull-through request (#435). Absent => the workspace default
+    /// (`decdn-node/<version>`); set to attribute CDN traffic in origin
+    /// access logs or to apply origin-side rate limits and routing
+    /// policy that distinguish CDN pulls from end-user clients. Empty
+    /// string is rejected at resolution.
+    pub user_agent: Option<String>,
 }
 
 /// Origin backend selection (#437). Tagged on the inner `kind` field.

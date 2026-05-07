@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use decdn_cache::{
     CacheEngine, CacheError, DecompressMode, FilesystemOrigin, Hash, HttpOrigin, Origin,
-    OriginError, OriginFetch, OriginPullError, PinnedHashes, RetryPolicy, SupportedEncoding,
+    OriginError, OriginFetch, OriginKind, OriginPullError, PinnedHashes, RetryPolicy,
+    SupportedEncoding,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wiremock::matchers::{method, path};
@@ -160,6 +161,10 @@ struct OversizedOrigin {
 }
 
 impl Origin for OversizedOrigin {
+    fn kind(&self) -> OriginKind {
+        OriginKind::Http
+    }
+
     fn fetch(
         &self,
         _hash: Hash,
@@ -1572,6 +1577,10 @@ impl FailingThenSucceedingOrigin {
 }
 
 impl Origin for FailingThenSucceedingOrigin {
+    fn kind(&self) -> OriginKind {
+        OriginKind::Http
+    }
+
     fn fetch(
         &self,
         hash: Hash,
@@ -1619,6 +1628,10 @@ impl PermanentlyFailingOrigin {
 }
 
 impl Origin for PermanentlyFailingOrigin {
+    fn kind(&self) -> OriginKind {
+        OriginKind::Http
+    }
+
     fn fetch(
         &self,
         _hash: Hash,
@@ -1902,6 +1915,10 @@ async fn fs_origin_retries_on_transient_io_kind_then_succeeds() -> anyhow::Resul
         first: std::sync::atomic::AtomicBool,
     }
     impl Origin for InterruptOnceOrigin {
+        fn kind(&self) -> OriginKind {
+            OriginKind::Http
+        }
+
         fn fetch(
             &self,
             hash: Hash,
@@ -1955,6 +1972,10 @@ async fn fs_origin_does_not_retry_on_permission_denied() -> anyhow::Result<()> {
         count: std::sync::atomic::AtomicUsize,
     }
     impl Origin for DeniedOrigin {
+        fn kind(&self) -> OriginKind {
+            OriginKind::Filesystem
+        }
+
         fn fetch(
             &self,
             _hash: Hash,

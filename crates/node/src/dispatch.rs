@@ -462,6 +462,54 @@ impl ConnectionLimiter {
         }
     }
 
+    /// Drop per-source buckets whose state has refilled to the fresh
+    /// baseline (#440). The acquire path already prunes opportunistically
+    /// when the keyspace exceeds `cap + cap/10`, but a node whose
+    /// connection rate falls below the over-cap threshold can carry
+    /// millions of stale buckets indefinitely. The runtime spawns a
+    /// periodic task that calls this method to bound steady-state
+    /// memory regardless of acquire-driven activity.
+    ///
+    /// No-op when the per-source layer is disabled. Single-flight with
+    /// the acquire-path prune via the same `pruning_in_progress` flag —
+    /// concurrent observers (the periodic task and a flood-driven
+    /// acquire) coexist without spawning duplicate `O(n)` walks.
+    pub fn gc_per_source(&self) {
+        // Snapshot the limiter `Arc` under the read guard, then release
+        // the lock before the `O(n)` walk. Holding the read guard across
+        // `retain_recent` would block reload (which needs the write
+        // lock) for the whole walk — same reasoning as `check_per_source`.
+        let limiter = {
+            let g = self.per_source.read().unwrap_or_else(|poisoned| {
+                self.log_per_source_poison();
+                poisoned.into_inner()
+            });
+            g.limiter.clone()
+        };
+        let Some(limiter) = limiter else { return };
+        if self
+            .pruning_in_progress
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            limiter.retain_recent();
+            self.pruning_in_progress.store(false, Ordering::Release);
+        }
+    }
+
+    /// Number of per-source buckets currently tracked. Returns `0` when
+    /// the layer is disabled. Used by the periodic GC task in tests and
+    /// by the runtime's debug-log breadcrumb so operators can correlate
+    /// keyspace size with the bookkeeping cap.
+    #[must_use]
+    pub fn per_source_tracked(&self) -> usize {
+        let g = self.per_source.read().unwrap_or_else(|poisoned| {
+            self.log_per_source_poison();
+            poisoned.into_inner()
+        });
+        g.limiter.as_ref().map_or(0, |l| l.len())
+    }
+
     /// One-shot poison log for the `per_source` lock. The first
     /// observation emits `tracing::error!`; every subsequent recovery
     /// is silent. Without the gate, sustained traffic on a poisoned
@@ -991,6 +1039,66 @@ mod tests {
             text.contains("decdn_dispatch_per_source_skipped_no_addr_total 1"),
             "disabled per-source must not bump the skip counter past 1; got:\n{text}"
         );
+    }
+
+    /// `gc_per_source` (#440) drops fully-refilled buckets between
+    /// acquires. Without it, a long-lived node whose connection rate
+    /// stays below the over-cap threshold accumulates stale entries
+    /// indefinitely — the acquire-path prune only fires under flood.
+    #[tokio::test]
+    async fn gc_per_source_drops_refilled_buckets() {
+        // Fast refill: rate=1000/s, burst=1. Each bucket refills to
+        // baseline well within a 100ms wait, so `retain_recent()` will
+        // drop every key it sees.
+        let metrics = Arc::new(Metrics::new());
+        let cfg = ResolvedSecurity {
+            max_concurrent_handlers: u32::MAX,
+            per_source_rate_per_sec: 1000.0,
+            per_source_burst: 1,
+            // cap=0 disables the acquire-path opportunistic prune so
+            // this test isolates the explicit GC method.
+            max_tracked_sources: 0,
+        };
+        let limiter = ConnectionLimiter::new(&cfg, Arc::clone(&metrics));
+
+        // Fill 8 distinct per-source buckets and drop each permit
+        // immediately so the bucket state matches "fresh baseline"
+        // after refill.
+        for i in 0..8u8 {
+            let _p = limiter
+                .acquire_inner(Some(ip(10, 0, 0, i)))
+                .expect("acquire should succeed under generous rate");
+        }
+        assert_eq!(limiter.per_source_tracked(), 8);
+
+        // Wait long enough for every bucket to refill (rate=1000/s
+        // means the single token returns in ~1ms).
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        limiter.gc_per_source();
+        assert_eq!(
+            limiter.per_source_tracked(),
+            0,
+            "refilled buckets should be dropped by gc_per_source"
+        );
+    }
+
+    /// `gc_per_source` is a no-op when the per-source layer is
+    /// disabled — exercises the early-return arm so a future regression
+    /// can't accidentally panic on a `None` limiter.
+    #[test]
+    fn gc_per_source_is_noop_when_layer_disabled() {
+        let metrics = Arc::new(Metrics::new());
+        let cfg = ResolvedSecurity {
+            max_concurrent_handlers: u32::MAX,
+            per_source_rate_per_sec: 0.0,
+            per_source_burst: 0,
+            max_tracked_sources: 0,
+        };
+        let limiter = ConnectionLimiter::new(&cfg, Arc::clone(&metrics));
+        // Must not panic and must leave `per_source_tracked` at 0.
+        limiter.gc_per_source();
+        assert_eq!(limiter.per_source_tracked(), 0);
     }
 
     /// IPv6 addresses in the same /64 share a per-source bucket. Without

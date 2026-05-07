@@ -161,6 +161,20 @@ pub struct EvictPreview {
     /// (idempotent re-run, no log line appended).
     #[serde(default)]
     pub already_evicted: bool,
+    /// Origin backend the node would re-fetch from on a post-eviction
+    /// miss (#439). `None` when the engine has no origin configured
+    /// (cache-only mode). Operators running DMCA takedowns or LRU
+    /// sweeps use this to estimate origin egress cost — re-pulling
+    /// from a `Filesystem` origin is a local read; re-pulling from
+    /// `Http` may consume metered S3/R2/B2 bandwidth.
+    ///
+    /// `skip_serializing_if = "Option::is_none"` keeps the JSON output
+    /// stable for older clients: the field simply doesn't appear when
+    /// the engine has no origin, so deserializers that don't know
+    /// about `origin_kind` (or that pin to a pre-#439 schema) see no
+    /// surface change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_kind: Option<decdn_cache::OriginKind>,
 }
 
 /// Response body for `admin_v1_announce` (issue #280).

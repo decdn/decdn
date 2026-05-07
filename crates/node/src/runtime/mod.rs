@@ -42,6 +42,16 @@ use decdn_incentive::eth_identity::{self, PasswordSource};
 /// `abort_all` branch only fires as a safety net.
 const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(15);
 
+/// Period between dispatch per-source rate-limiter GC sweeps (#440).
+/// The acquire path already prunes opportunistically when the keyspace
+/// exceeds `cap + cap/10`, but a node whose connection rate falls below
+/// the over-cap threshold can carry millions of stale buckets
+/// indefinitely. 60s matches the steady-state cadence of the gossip
+/// peer-table TTL sweeper and is comfortably larger than the longest
+/// realistic bucket refill window, so the sweep is essentially free
+/// when the keyspace is empty.
+const DISPATCH_GC_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Build the endpoint, register handlers on a `Router`, spawn the metrics
 /// server and gossip tasks, and run until a shutdown signal is received.
 ///
@@ -138,7 +148,7 @@ pub async fn run(
         secret_key.public(),
         reload_state.rate_per_mb(),
         Arc::clone(&node_metrics),
-        limiter,
+        Arc::clone(&limiter),
     ));
 
     let router = Router::builder(ep.clone())
@@ -161,6 +171,37 @@ pub async fn run(
     tasks.spawn(async move {
         if let Err(err) = metrics::serve(metrics_listener, metrics_handle, metrics_stop_rx).await {
             tracing::error!(%err, "metrics server exited with error");
+        }
+    });
+
+    // Periodic dispatch-limiter GC (#440). The acquire path only prunes
+    // under flood (when the keyspace exceeds `cap + cap/10`); a node
+    // with bursty short-lived clients can otherwise accumulate stale
+    // per-source buckets between bursts and never reclaim them until
+    // restart. The sweep is `O(n)` over the live keyspace; on an idle
+    // limiter `n = 0` so the steady-state cost is one mutex acquire
+    // per minute. Stops on its own oneshot — same pattern as the
+    // metrics and admin servers.
+    let (dispatch_gc_stop_tx, mut dispatch_gc_stop_rx) = oneshot::channel::<()>();
+    let dispatch_gc_limiter = Arc::clone(&limiter);
+    tasks.spawn(async move {
+        let mut ticker = tokio::time::interval(DISPATCH_GC_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Burn the immediate first tick so the first GC pass lands one
+        // interval after startup rather than on the same tick — there
+        // are no stale buckets to clean up at t=0.
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut dispatch_gc_stop_rx => {
+                    tracing::debug!("dispatch GC shutdown signal received");
+                    return;
+                }
+                _ = ticker.tick() => {
+                    dispatch_gc_limiter.gc_per_source();
+                }
+            }
         }
     });
 
@@ -362,6 +403,11 @@ pub async fn run(
         // been the ones signaling it.
         tracing::warn!("metrics server exited before shutdown signal was sent");
     }
+    // Best-effort: silently ignore the dispatch GC stop send failure.
+    // The task only exits early on a panic, and its panic surfaces
+    // through `JoinSet::join_next` during the drain phase below — no
+    // operator-actionable signal to log at this seam.
+    let _ = dispatch_gc_stop_tx.send(());
     if let Some(tx) = admin_stop_tx
         && tx.send(()).is_err()
     {
@@ -551,7 +597,7 @@ async fn build_cache(
     let origin: Option<Arc<dyn Origin>> = match cfg.cache.origin.as_ref() {
         None => None,
         Some(ResolvedOrigin::Http { url, decompress }) => Some(Arc::new(
-            HttpOrigin::new(url.clone())
+            HttpOrigin::new_with_user_agent(url.clone(), &cfg.cache.user_agent)
                 .context("failed to build HTTP origin client")?
                 .with_decompress_mode(*decompress),
         )),
@@ -960,6 +1006,7 @@ mod tests {
                 origin,
                 pinned_hashes: decdn_cache::PinnedHashes::empty(),
                 origin_retry: decdn_cache::RetryPolicy::default(),
+                user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
             },
             payment: ResolvedPayment { rate_per_mb: 10 },
             observability: ResolvedObservability {

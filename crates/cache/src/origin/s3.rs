@@ -36,7 +36,7 @@ use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use aws_smithy_types::retry::RetryConfig;
 use iroh_blobs::Hash;
 
-use super::{Origin, OriginFetch, OriginUrl};
+use super::{Origin, OriginFetch, OriginKind, OriginUrl};
 use crate::error::OriginPullError;
 
 /// Validated, runtime-ready configuration for an [`S3Origin`].
@@ -448,6 +448,10 @@ fn classify_get_object_error(
 }
 
 impl Origin for S3Origin {
+    fn kind(&self) -> OriginKind {
+        OriginKind::S3
+    }
+
     fn fetch(
         &self,
         hash: Hash,

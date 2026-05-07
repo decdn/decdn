@@ -443,6 +443,23 @@ fn resolve_cache(
     let origin_retry = resolve_origin_retry(file.and_then(|c| c.origin_retry.as_ref()))
         .context("invalid cache.origin_retry")?;
 
+    // `cache.user_agent` (#435): operator override of the default
+    // `decdn-node/<version>` UA we send on every origin pull. Empty
+    // string is treated as "explicit blank" and rejected — reqwest
+    // would also reject it at client build time, but failing at config
+    // load gives a clearer message. Whitespace is preserved verbatim
+    // so an operator who genuinely wants `MyCdn / 1.0` gets exactly that.
+    let user_agent = match file.and_then(|c| c.user_agent.as_ref()) {
+        Some(s) => {
+            anyhow::ensure!(
+                !s.is_empty(),
+                "cache.user_agent must be a non-empty string when set"
+            );
+            s.clone()
+        }
+        None => decdn_cache::DEFAULT_USER_AGENT.to_string(),
+    };
+
     Ok(ResolvedCache {
         cache_dir,
         cache_size_mb,
@@ -450,6 +467,7 @@ fn resolve_cache(
         origin,
         pinned_hashes,
         origin_retry,
+        user_agent,
     })
 }
 
@@ -1047,6 +1065,7 @@ fn expand_env(cfg: &mut FileConfig) -> anyhow::Result<()> {
         if let Some(origin) = c.origin.as_mut() {
             expand_origin(origin)?;
         }
+        expand_str(&mut c.user_agent, "cache.user_agent")?;
     }
     if let Some(o) = cfg.observability.as_mut() {
         expand_str(&mut o.otlp_endpoint, "observability.otlp_endpoint")?;
@@ -1463,6 +1482,144 @@ mod tests {
             err.contains("64 hex chars"),
             "error missing field context: {err}"
         );
+    }
+
+    // Per-field merge coverage for `[gossip]` (#434). The companion to
+    // `resolve_security` per-field tests above. Each field gets a
+    // file-leg "override" test and a "default when absent" test, with
+    // the allowlist hex-validation error path covered alongside.
+
+    #[test]
+    fn resolve_gossip_announce_interval_file_override() -> anyhow::Result<()> {
+        let cfg = types::GossipConfig {
+            announce_interval_sec: Some(123),
+            ..Default::default()
+        };
+        let g = resolve_gossip(Some(&cfg))?;
+        assert_eq!(g.announce_interval_sec, 123);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_gossip_announce_interval_default_when_field_absent() -> anyhow::Result<()> {
+        // Other field populated, this one absent — proves the file
+        // leg's `unwrap_or` arm fires for this field independently.
+        let cfg = types::GossipConfig {
+            peer_ttl_sec: Some(900),
+            ..Default::default()
+        };
+        let g = resolve_gossip(Some(&cfg))?;
+        assert_eq!(g.announce_interval_sec, DEFAULT_ANNOUNCE_INTERVAL_SEC);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_gossip_peer_ttl_file_override() -> anyhow::Result<()> {
+        let cfg = types::GossipConfig {
+            peer_ttl_sec: Some(1234),
+            ..Default::default()
+        };
+        let g = resolve_gossip(Some(&cfg))?;
+        assert_eq!(g.peer_ttl_sec, 1234);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_gossip_peer_ttl_default_when_field_absent() -> anyhow::Result<()> {
+        let cfg = types::GossipConfig {
+            announce_interval_sec: Some(30),
+            ..Default::default()
+        };
+        let g = resolve_gossip(Some(&cfg))?;
+        assert_eq!(g.peer_ttl_sec, DEFAULT_PEER_TTL_SEC);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_gossip_subscribe_global_file_override_to_false() -> anyhow::Result<()> {
+        // Default is `true` (see `resolve_gossip`); the override path
+        // is the operator-actionable case (turning off global pub/sub).
+        let cfg = types::GossipConfig {
+            subscribe_global: Some(false),
+            ..Default::default()
+        };
+        let g = resolve_gossip(Some(&cfg))?;
+        assert!(!g.subscribe_global);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_gossip_subscribe_global_default_when_field_absent_is_true() -> anyhow::Result<()> {
+        // `None` => `true` per `resolve_gossip`. Distinct from "field
+        // explicitly set to true" (also true), but documents the
+        // omitted-field default for an absent TOML key.
+        let cfg = types::GossipConfig::default();
+        let g = resolve_gossip(Some(&cfg))?;
+        assert!(g.subscribe_global);
+        Ok(())
+    }
+
+    /// Allowlist hex validation: non-hex characters in an otherwise
+    /// 64-char entry must be rejected. Sibling to the existing
+    /// `resolve_gossip_rejects_bad_allowlist_entry` (wrong length)
+    /// test — together they cover the two failure modes
+    /// `parse_node_id_hex` raises on the allowlist path so a regression
+    /// in either won't slip past CI silently (#434).
+    #[test]
+    fn resolve_gossip_rejects_non_hex_allowlist_entry() {
+        let cfg = types::GossipConfig {
+            allowlist: Some(vec!["g".repeat(64)]),
+            ..Default::default()
+        };
+        let err = resolve_gossip(Some(&cfg))
+            .expect_err("non-hex entry should be rejected")
+            .to_string();
+        assert!(
+            err.contains("64 hex chars") || err.contains("hex"),
+            "error missing hex-context: {err}"
+        );
+    }
+
+    /// A multi-entry allowlist with one valid and one invalid entry
+    /// must reject the whole resolution — half-applied allowlists are
+    /// a worse failure mode than fail-fast at startup. The invalid
+    /// entry is positioned second so a regression that returns early
+    /// after parsing the first valid entry would silently accept the
+    /// bad list.
+    #[test]
+    fn resolve_gossip_rejects_when_any_allowlist_entry_invalid() {
+        let cfg = types::GossipConfig {
+            allowlist: Some(vec![
+                "0123456789abcdef".repeat(4), // valid
+                "z".repeat(64),               // invalid: non-hex
+            ]),
+            ..Default::default()
+        };
+        let err = resolve_gossip(Some(&cfg))
+            .expect_err("any invalid entry must reject the whole list")
+            .to_string();
+        assert!(
+            err.contains("hex"),
+            "error must surface hex-validation failure: {err}"
+        );
+    }
+
+    /// Independent gossip field overrides: setting one field to a
+    /// non-default value must leave the others at their defaults.
+    /// Catches a regression that copy-pasted the wrong source field
+    /// into a `unwrap_or(DEFAULT_*)` arm.
+    #[test]
+    fn resolve_gossip_field_overrides_are_independent() -> anyhow::Result<()> {
+        let cfg = types::GossipConfig {
+            announce_interval_sec: Some(7),
+            ..Default::default()
+        };
+        let g = resolve_gossip(Some(&cfg))?;
+        assert_eq!(g.announce_interval_sec, 7);
+        assert_eq!(g.peer_ttl_sec, DEFAULT_PEER_TTL_SEC);
+        assert!(g.subscribe_global);
+        assert!(g.allowlist.is_empty());
+        Ok(())
     }
 
     // HOME is guaranteed set in Rust test harness on Linux/macOS and used here
@@ -2257,6 +2414,51 @@ mod tests {
         );
         anyhow::ensure!(resolved.pinned_hashes.is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_user_agent_defaults_to_workspace_constant() -> anyhow::Result<()> {
+        // Absent => DEFAULT_USER_AGENT (#435).
+        let cli = cache_cli(None, None);
+        let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
+        anyhow::ensure!(
+            resolved.user_agent == decdn_cache::DEFAULT_USER_AGENT,
+            "expected default UA, got: {}",
+            resolved.user_agent
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_user_agent_from_file_overrides_default() -> anyhow::Result<()> {
+        let cli = cache_cli(None, None);
+        let file = types::CacheConfig {
+            user_agent: Some("MyCdn/1.0 (+ops@example.com)".to_string()),
+            ..types::CacheConfig::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        anyhow::ensure!(
+            resolved.user_agent == "MyCdn/1.0 (+ops@example.com)",
+            "got: {}",
+            resolved.user_agent
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_rejects_empty_user_agent() {
+        let cli = cache_cli(None, None);
+        let file = types::CacheConfig {
+            user_agent: Some(String::new()),
+            ..types::CacheConfig::default()
+        };
+        let err =
+            resolve_cache(&cli, Some(&file), Path::new("/tmp")).expect_err("empty UA must reject");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cache.user_agent"),
+            "missing field name: {msg}"
+        );
     }
 
     #[test]
@@ -4490,5 +4692,109 @@ bind_port = 12345
         let resolved = resolve_security(Some(&s)).expect("valid override");
         assert_eq!(resolved.max_concurrent_handlers, 512);
         assert_eq!(resolved.per_source_burst, DEFAULT_PER_SOURCE_BURST);
+    }
+
+    // Per-field merge coverage (#438). The four `[security]` fields all
+    // resolve through the same file-vs-default path; one happy-path test
+    // per field plus an "absent => default" companion documents the
+    // contract for each field individually so a regression that
+    // accidentally applies the wrong default doesn't slip past the
+    // existing aggregate `_populates_defaults_when_absent` assertion.
+    //
+    // There is no `[security]` CLI surface — `resolve_security` takes
+    // only the file argument. Operators tune these fields by editing
+    // the config file (with hot reload via SIGHUP). Per-field CLI
+    // overrides could land later without changing the test surface
+    // here.
+
+    #[test]
+    fn resolve_security_max_concurrent_handlers_file_override() {
+        let s = sec_with(|s| s.max_concurrent_handlers = Some(1024));
+        let resolved = resolve_security(Some(&s)).expect("valid override");
+        assert_eq!(resolved.max_concurrent_handlers, 1024);
+    }
+
+    #[test]
+    fn resolve_security_max_concurrent_handlers_default_when_field_absent() {
+        // Other fields populated, this one absent — companion to the
+        // aggregate-defaults test, isolating this single field.
+        let s = sec_with(|s| {
+            s.per_source_rate_per_sec = Some(50.0);
+            s.per_source_burst = Some(100);
+            s.max_tracked_sources = Some(2048);
+        });
+        let resolved = resolve_security(Some(&s)).expect("valid partial config");
+        assert_eq!(
+            resolved.max_concurrent_handlers,
+            DEFAULT_MAX_CONCURRENT_HANDLERS
+        );
+    }
+
+    #[test]
+    fn resolve_security_per_source_rate_file_override() {
+        let s = sec_with(|s| s.per_source_rate_per_sec = Some(42.5));
+        let resolved = resolve_security(Some(&s)).expect("valid override");
+        assert!((resolved.per_source_rate_per_sec - 42.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn resolve_security_per_source_rate_default_when_field_absent() {
+        let s = sec_with(|s| s.max_concurrent_handlers = Some(128));
+        let resolved = resolve_security(Some(&s)).expect("valid partial config");
+        assert!(
+            (resolved.per_source_rate_per_sec - DEFAULT_PER_SOURCE_RATE_PER_SEC).abs()
+                < f64::EPSILON
+        );
+    }
+
+    #[test]
+    fn resolve_security_per_source_burst_file_override() {
+        let s = sec_with(|s| {
+            s.per_source_rate_per_sec = Some(50.0);
+            s.per_source_burst = Some(500);
+        });
+        let resolved = resolve_security(Some(&s)).expect("valid override");
+        assert_eq!(resolved.per_source_burst, 500);
+    }
+
+    #[test]
+    fn resolve_security_per_source_burst_default_when_field_absent() {
+        let s = sec_with(|s| s.per_source_rate_per_sec = Some(50.0));
+        let resolved = resolve_security(Some(&s)).expect("valid partial config");
+        assert_eq!(resolved.per_source_burst, DEFAULT_PER_SOURCE_BURST);
+    }
+
+    #[test]
+    fn resolve_security_max_tracked_sources_file_override() {
+        let s = sec_with(|s| s.max_tracked_sources = Some(8192));
+        let resolved = resolve_security(Some(&s)).expect("valid override");
+        assert_eq!(resolved.max_tracked_sources, 8192);
+    }
+
+    #[test]
+    fn resolve_security_max_tracked_sources_default_when_field_absent() {
+        let s = sec_with(|s| s.max_concurrent_handlers = Some(128));
+        let resolved = resolve_security(Some(&s)).expect("valid partial config");
+        assert_eq!(resolved.max_tracked_sources, DEFAULT_MAX_TRACKED_SOURCES);
+    }
+
+    /// Independent fields don't bleed: setting one to a non-default
+    /// value must leave the others at their defaults. Catches a
+    /// regression that copy-pasted `s.max_concurrent_handlers` into
+    /// the wrong field's `unwrap_or(DEFAULT_*)` arm.
+    #[test]
+    fn resolve_security_field_overrides_are_independent() {
+        let s = sec_with(|s| s.per_source_burst = Some(777));
+        let resolved = resolve_security(Some(&s)).expect("valid partial config");
+        assert_eq!(resolved.per_source_burst, 777);
+        assert_eq!(
+            resolved.max_concurrent_handlers,
+            DEFAULT_MAX_CONCURRENT_HANDLERS
+        );
+        assert!(
+            (resolved.per_source_rate_per_sec - DEFAULT_PER_SOURCE_RATE_PER_SEC).abs()
+                < f64::EPSILON
+        );
+        assert_eq!(resolved.max_tracked_sources, DEFAULT_MAX_TRACKED_SOURCES);
     }
 }

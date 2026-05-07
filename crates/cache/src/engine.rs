@@ -15,7 +15,7 @@ use tokio::sync::Notify;
 
 use crate::error::{CacheError, CacheResult};
 use crate::metrics::CacheMetrics;
-use crate::origin::{Origin, OriginFetch};
+use crate::origin::{Origin, OriginFetch, OriginKind};
 use crate::retry::{RetryPolicy, retry_fetch};
 
 /// Engine bundling a filesystem-backed iroh-blobs store with an optional
@@ -226,6 +226,14 @@ pub struct EvictionPreview {
     /// RPC doesn't need a second `has()` round-trip to fill the
     /// `was_present` field on its response.
     pub served: bool,
+    /// Backend the engine would re-fetch from on a post-eviction miss
+    /// (#439). `None` when no origin is configured (cache-only mode);
+    /// otherwise `Some(OriginKind::Http)` or
+    /// `Some(OriginKind::Filesystem)`. Operators running takedowns or
+    /// LRU sweeps use this to estimate origin egress cost — re-pulling
+    /// from a `Filesystem` origin is a local read; re-pulling from
+    /// `Http` may consume metered S3/R2/B2 bandwidth.
+    pub origin_kind: Option<OriginKind>,
 }
 
 /// Snapshot of access times for blobs that are eligible for LRU
@@ -671,12 +679,19 @@ impl CacheEngine {
             u64::try_from(inst.elapsed().as_micros()).unwrap_or(u64::MAX)
         });
 
+        // The engine holds a single origin handle (`Inner.origin`); a
+        // future per-blob origin association would require touching
+        // `EvictionPreview` again — flagged here so a reader hitting
+        // that refactor doesn't miss this seam.
+        let origin_kind = self.inner.origin.as_ref().map(|o| o.kind());
+
         Ok(EvictionPreview {
             size_bytes,
             last_accessed_us_ago,
             pinned: self.is_pinned(hash),
             already_evicted,
             served,
+            origin_kind,
         })
     }
 
@@ -980,7 +995,7 @@ mod tests {
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use crate::origin::{Origin, OriginFetch};
+    use crate::origin::{Origin, OriginFetch, OriginKind};
 
     /// A trivial in-memory origin for tests. Stores exactly one blob.
     #[derive(Debug)]
@@ -999,6 +1014,14 @@ mod tests {
     }
 
     impl Origin for StubOrigin {
+        fn kind(&self) -> OriginKind {
+            // Stand in for an HTTP origin in tests so callers reasoning
+            // about preview-side `origin_kind` behaviour see a non-None
+            // value. The choice is arbitrary — `Origin::kind` is a
+            // tag, not a behavioural switch.
+            OriginKind::Http
+        }
+
         fn fetch(
             &self,
             hash: Hash,
@@ -1145,6 +1168,10 @@ mod tests {
     }
 
     impl Origin for SlowCountingOrigin {
+        fn kind(&self) -> OriginKind {
+            OriginKind::Http
+        }
+
         fn fetch(
             &self,
             hash: Hash,
@@ -1664,6 +1691,37 @@ mod tests {
 
         let other_preview = engine.inspect(other_hash).await?;
         anyhow::ensure!(!other_preview.pinned, "unrelated hash must not be pinned");
+        Ok(())
+    }
+
+    /// `inspect` (#439) reports the configured origin's backend kind so
+    /// admin dry-run callers can estimate origin egress cost before
+    /// committing to an eviction. Engine constructed with no origin
+    /// reports `None`.
+    #[tokio::test]
+    async fn inspect_reports_origin_kind_when_origin_configured() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let origin = StubOrigin::new(b"egress-cost preview");
+        let engine = CacheEngine::open(tmp.path(), Some(Arc::new(origin)), 10).await?;
+        let preview = engine.inspect(Hash::new(b"never-fetched")).await?;
+        anyhow::ensure!(
+            preview.origin_kind == Some(OriginKind::Http),
+            "expected Some(Http), got {:?}",
+            preview.origin_kind,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn inspect_reports_no_origin_kind_when_cache_only() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let engine = CacheEngine::open(tmp.path(), None, 10).await?;
+        let preview = engine.inspect(Hash::new(b"absent")).await?;
+        anyhow::ensure!(
+            preview.origin_kind.is_none(),
+            "expected None for cache-only mode, got {:?}",
+            preview.origin_kind,
+        );
         Ok(())
     }
 }
