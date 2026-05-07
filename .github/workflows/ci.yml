@@ -125,6 +125,7 @@ jobs:
               - 'rust-toolchain.toml'
               - '.github/workflows/ci.yml'
               - '.github/scripts/coverage-diff.py'
+              - '.github/scripts/tests/**'
 
   coverage:
     name: coverage
@@ -154,6 +155,19 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov,cargo-nextest
+
+      # Run helper unit tests before LCOV generation (the slow step) so a
+      # regression in coverage-diff.py fails fast rather than silently
+      # corrupting the PR comment.
+      - name: Set up Python for coverage helper tests
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Test coverage-diff helper
+        run: |
+          python3 -m pip install 'pytest==8.*'
+          python3 -m pytest .github/scripts/tests -q
+
       - name: Generate LCOV
         continue-on-error: true
         run: cargo llvm-cov nextest --workspace --lcov --output-path lcov.info --no-tests=pass
@@ -177,11 +191,46 @@ jobs:
           path: baseline/
           if_no_artifact_found: warn
 
+      # Read the existing sticky comment (if any) so coverage-diff.py can
+      # extract the prior per-commit history block and append a new row.
+      # Without this step the comment would still update in place but the
+      # history would reset to a single row on every push.
+      # On a transient API failure (5xx, rate limit) the catch falls back to
+      # an empty file so coverage-diff.py treats it as "no prior" rather
+      # than failing the job. The visible degraded mode is "history resets
+      # this push" — same as a deleted comment.
+      - name: Fetch prior coverage comment
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const fs = require('fs');
+            // Must match MARKER in .github/scripts/coverage-diff.py.
+            const marker = '<!-- decdn-coverage-comment -->';
+            try {
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                per_page: 100,
+              });
+              const existing = comments.find(c => c.body && c.body.includes(marker));
+              fs.writeFileSync('prior-comment.md', existing ? existing.body : '');
+            } catch (e) {
+              core.warning(`Failed to fetch prior coverage comment: ${e.message} — history will reset this push.`);
+              fs.writeFileSync('prior-comment.md', '');
+            }
+
       - name: Generate coverage diff
         id: gendiff
         if: github.event_name == 'pull_request'
         # The script writes the truncated comment to stdout (captured here for the
         # PR comment) and the full per-file table directly to $GITHUB_STEP_SUMMARY.
+        # DECDN_HEAD_SHA must be the PR head, not GITHUB_SHA (which is the merge SHA).
+        env:
+          DECDN_COVERAGE_PRIOR_BODY: prior-comment.md
+          DECDN_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           python3 .github/scripts/coverage-diff.py lcov.info baseline/lcov.info \
