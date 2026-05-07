@@ -52,6 +52,46 @@ const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(15);
 /// when the keyspace is empty.
 const DISPATCH_GC_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Body of the periodic dispatch-limiter GC task (#440). Extracted from
+/// the spawn site so the shutdown-promptness contract can be tested
+/// directly: a regression where the loop ignores `stop_rx` would
+/// silently extend `SHUTDOWN_DEADLINE` by up to one tick interval
+/// (60s in production), which the runtime's normal shutdown path
+/// would mask as a "task slow to drain" rather than a bug.
+///
+/// The first tick is burned so the first GC pass lands one interval
+/// after startup rather than on the same tick — there are no stale
+/// buckets to clean up at t=0.
+async fn run_dispatch_gc(
+    limiter: Arc<ConnectionLimiter>,
+    mut stop_rx: oneshot::Receiver<()>,
+    interval: Duration,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut stop_rx => {
+                tracing::debug!("dispatch GC shutdown signal received");
+                return;
+            }
+            _ = ticker.tick() => {
+                if let Some((before, after)) = limiter.gc_per_source() {
+                    let dropped = before.saturating_sub(after);
+                    tracing::debug!(
+                        before,
+                        after,
+                        dropped,
+                        "dispatch GC sweep complete"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Build the endpoint, register handlers on a `Router`, spawn the metrics
 /// server and gossip tasks, and run until a shutdown signal is received.
 ///
@@ -182,28 +222,13 @@ pub async fn run(
     // limiter `n = 0` so the steady-state cost is one mutex acquire
     // per minute. Stops on its own oneshot — same pattern as the
     // metrics and admin servers.
-    let (dispatch_gc_stop_tx, mut dispatch_gc_stop_rx) = oneshot::channel::<()>();
+    let (dispatch_gc_stop_tx, dispatch_gc_stop_rx) = oneshot::channel::<()>();
     let dispatch_gc_limiter = Arc::clone(&limiter);
-    tasks.spawn(async move {
-        let mut ticker = tokio::time::interval(DISPATCH_GC_INTERVAL);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // Burn the immediate first tick so the first GC pass lands one
-        // interval after startup rather than on the same tick — there
-        // are no stale buckets to clean up at t=0.
-        ticker.tick().await;
-        loop {
-            tokio::select! {
-                biased;
-                _ = &mut dispatch_gc_stop_rx => {
-                    tracing::debug!("dispatch GC shutdown signal received");
-                    return;
-                }
-                _ = ticker.tick() => {
-                    dispatch_gc_limiter.gc_per_source();
-                }
-            }
-        }
-    });
+    tasks.spawn(run_dispatch_gc(
+        dispatch_gc_limiter,
+        dispatch_gc_stop_rx,
+        DISPATCH_GC_INTERVAL,
+    ));
 
     // RPC connectivity watchdog (issue #283). Updates `decdn_rpc_healthy`
     // each tick; a sustained transition fires an alert. `interval == 0`
@@ -1193,6 +1218,55 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(ShutdownSignal::Sigterm.to_string(), "SIGTERM");
         assert_eq!(ShutdownSignal::AdminDrain.to_string(), "admin-drain");
+    }
+
+    /// `run_dispatch_gc` exits promptly when the stop oneshot fires,
+    /// even if the next ticker tick is far away. Without the
+    /// shutdown-wins-over-tick `biased` select, a regression that
+    /// dropped the stop arm or polled it after `ticker.tick()` would
+    /// silently extend `SHUTDOWN_DEADLINE` by up to one full
+    /// `DISPATCH_GC_INTERVAL` (60s in production).
+    #[tokio::test]
+    async fn run_dispatch_gc_exits_promptly_on_shutdown() {
+        use crate::dispatch::ConnectionLimiter;
+        use crate::metrics::Metrics;
+        use decdn_common::config::ResolvedSecurity;
+
+        let metrics = Arc::new(Metrics::new());
+        let cfg = ResolvedSecurity {
+            max_concurrent_handlers: u32::MAX,
+            per_source_rate_per_sec: 0.0,
+            per_source_burst: 0,
+            max_tracked_sources: 0,
+        };
+        let limiter = Arc::new(ConnectionLimiter::new(&cfg, metrics));
+
+        let (stop_tx, stop_rx) = oneshot::channel::<()>();
+        // 60s interval to mirror production: the test would hang for
+        // 60s on a regression that polled the ticker before the stop
+        // signal, so the timeout below catches the real bug rather
+        // than an unrelated short-interval race.
+        let task = tokio::spawn(run_dispatch_gc(
+            Arc::clone(&limiter),
+            stop_rx,
+            Duration::from_secs(60),
+        ));
+
+        // Give the task a moment to enter the select loop, then signal
+        // shutdown. The task should exit well within the timeout —
+        // we allow generous headroom for slow CI runners.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        stop_tx.send(()).expect("receiver still alive");
+
+        let result = tokio::time::timeout(Duration::from_millis(500), task).await;
+        assert!(
+            result.is_ok(),
+            "run_dispatch_gc must exit within 500ms of shutdown signal; \
+             a 60s hang here means the stop arm of the select was lost"
+        );
+        result
+            .expect("timeout already asserted")
+            .expect("task should not panic");
     }
 
     /// Mount a JSON-RPC `200 OK` POST handler. The mount lives on
