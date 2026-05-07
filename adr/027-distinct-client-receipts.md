@@ -163,9 +163,9 @@ The receipt-anchoring lifecycle is pinned to four concrete deadlines, all derive
 Default values:
 
 - `epochLength = 1 week` ([ADR 026 §2](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553)) — immutable, not governable
-- `summaryWindow = 7 days` — governable per [ADR 026 §11](026-gauge-boost-tokenomics.md#11-governable-parameters-with-safety-bounds)
-- `challengeWindow = 7 days` — governable
-- `claimWindow = 26 epochs` ([ADR 026 §2](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553)) — governable
+- `summaryWindow = 7 days` — governable through governance proposal under the standard 48 h `TimelockController` delay per [ADR 009](009-governance.md). Concrete bounds are pinned during the ADR 026 / 027 / 028 surface lock-down (#451) and will be added to the [ADR 026 §11](026-gauge-boost-tokenomics.md#11-governable-parameters-with-safety-bounds) safety-bounds table at that time.
+- `challengeWindow = 7 days` — governable on the same path; bounds pinned alongside `summaryWindow`.
+- `claimWindow = 26 epochs` ([ADR 026 §2](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553)) — governable on the same path.
 
 The challenge and claim windows open at the same moment so claimers and challengers see consistent state. A successful challenge during the challenge window zeros the relevant `claimedBytes` or `claimedDistinctClients` field; subsequent `claimBoost` calls within the claim window then read the zeroed value and pay zero. Challenges submitted after the challenge window closes revert.
 
