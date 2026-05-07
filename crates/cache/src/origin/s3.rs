@@ -658,8 +658,9 @@ mod tests {
     /// `endpoint_url: Some(...)` round-trip — the entire R2/B2/MinIO
     /// path. A regression in `OriginUrl::as_url().as_str()` (e.g. a
     /// trailing-slash drift the SDK rejects, or a credential-bearing
-    /// URL slipping past the parser) would surface as a panic from
-    /// the SDK config builder during construction.
+    /// URL slipping past the parser) would surface as an `Err` from
+    /// the SDK config builder during construction, failing this
+    /// test's `.expect(...)`.
     #[tokio::test]
     async fn new_with_endpoint_url_construction_is_pure() {
         let mut cfg = make_cfg();

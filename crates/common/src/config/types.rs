@@ -181,9 +181,8 @@ pub struct S3OriginConfig {
     /// `validate_s3_bucket_name`).
     pub bucket: String,
     /// AWS region (e.g. `"us-east-1"`). Required because the S3 SDK
-    /// (wired in the follow-up PR for #437) uses it for `SigV4`
-    /// signing even when a custom `endpoint_url` is set. Validated
-    /// non-empty at config resolution.
+    /// uses it for `SigV4` signing even when a custom `endpoint_url`
+    /// is set. Validated non-empty at config resolution.
     pub region: String,
     /// Custom endpoint URL for non-AWS S3-compatible providers (R2,
     /// B2, `MinIO`). Omit for AWS S3. Validated as `http`/`https` at
@@ -256,9 +255,8 @@ pub enum S3Credentials {
     /// profile, then IAM role / instance profile.
     DefaultChain {
         /// Override the default profile name when reading
-        /// `~/.aws/credentials`. Once the S3 backend is wired (PR2
-        /// for #437), this is threaded through as the equivalent of
-        /// `AWS_PROFILE`.
+        /// `~/.aws/credentials`. Threaded through to the SDK as the
+        /// equivalent of the `AWS_PROFILE` env var.
         profile: Option<String>,
     },
 }

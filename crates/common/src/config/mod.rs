@@ -501,13 +501,13 @@ fn resolve_origin(cfg: &types::OriginConfig) -> anyhow::Result<crate::config::Re
 ///   Absent prefix becomes `String::new()` on the resolved side.
 /// - `path_style: Option<bool>` is collapsed to `bool` with `None`
 ///   mapped to `false` (the SDK default = virtual-hosted-style).
-/// - `endpoint_url` is parsed into `OriginUrl` so PR2's S3 backend
+/// - `endpoint_url` is parsed into `OriginUrl` so the S3 backend
 ///   can hand it straight to the SDK without re-parsing.
 ///
 /// Validation covers the cases the type can't express:
 /// - DNS-safe bucket name (see [`validate_s3_bucket_name`]);
 /// - non-empty region (the AWS SDK uses it for `SigV4` signing even
-///   when a custom `endpoint_url` is set; required from PR2 onward);
+///   when a custom `endpoint_url` is set);
 /// - `endpoint_url`, when present, parses as `http`/`https`;
 /// - `prefix` is a key prefix, not a path: must not start with `/`,
 ///   must not contain `..`, must not contain backslashes, and must
@@ -541,10 +541,10 @@ fn resolve_s3_origin(
         // `parse_origin_url` rejects query/fragment and forces
         // trailing-slash normalization. That's fine for an S3
         // endpoint base — the SDK appends `/{bucket}/{key}` itself,
-        // and storing the parsed/normalized form here means PR2
-        // hands a single canonical string to the SDK regardless of
-        // whether the operator wrote `http://minio:9000` or
-        // `http://minio:9000/`.
+        // and storing the parsed/normalized form here means the
+        // runtime hands a single canonical string to the SDK
+        // regardless of whether the operator wrote
+        // `http://minio:9000` or `http://minio:9000/`.
         Some(
             decdn_cache::parse_origin_url(&endpoint)
                 .context("invalid cache.origin.endpoint_url")?,
@@ -595,6 +595,12 @@ fn resolve_s3_origin(
             session_token,
         },
         types::S3Credentials::DefaultChain { profile } => {
+            // Collapse `profile = ""` (post env-var expansion) to None
+            // so the runtime's `loader.profile_name(...)` arm only fires
+            // for a real name. The SDK treats `profile_name("")` as
+            // distinct from "no override" and would surface a confusing
+            // "profile '' not found" error at first credential need.
+            let profile = profile.filter(|p| !p.is_empty());
             ResolvedS3Credentials::DefaultChain { profile }
         }
     });
@@ -2293,13 +2299,13 @@ mod tests {
         Ok(())
     }
 
-    // ----- #437: S3 origin schema (PR1) -----
+    // ----- #437: S3 origin schema -----
     //
-    // The S3 backend itself lands in PR2; PR1 only ships the schema
-    // and the resolution-time validators. The tests below pin the
-    // shape of the validators and the resolved-form normalization so
-    // a refactor in PR2 (e.g. adding the SDK call site) cannot
-    // silently regress the validation contract.
+    // The tests below pin the shape of the schema validators and the
+    // resolved-form normalization. The runtime backend (`S3Origin`)
+    // lives in `decdn-cache` and is exercised separately by
+    // `crates/cache/tests/s3_origin.rs`; these tests stay focused on
+    // the resolver contract that feeds it.
 
     /// Build a TOML S3 origin with sane defaults; tests override
     /// individual fields. Avoids 6-line struct literals at every call
@@ -2766,6 +2772,45 @@ mod tests {
         Ok(())
     }
 
+    // `DefaultChain { profile = "" }` (e.g. from a `${PROFILE}` env-var
+    // that resolved to empty, or a literal empty string in TOML) is
+    // collapsed to `profile = None` at the resolver. Without this
+    // normalization the runtime would call `loader.profile_name("")`
+    // and the SDK would surface a confusing "profile '' not found" at
+    // first credential need. Pinned so a future refactor of
+    // `resolve_s3_origin` can't drop the filter.
+    #[test]
+    fn resolve_cache_origin_s3_default_chain_empty_profile_collapses_to_none() -> anyhow::Result<()>
+    {
+        let cli = cache_cli(None, None);
+        let file = cache_with_s3(types::S3OriginConfig {
+            bucket: "decdn-blobs".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint_url: None,
+            path_style: None,
+            prefix: None,
+            credentials: Some(types::S3Credentials::DefaultChain {
+                profile: Some(String::new()),
+            }),
+        });
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        let creds = match resolved.origin {
+            Some(ResolvedOrigin::S3(s3)) => s3
+                .credentials
+                .ok_or_else(|| anyhow::anyhow!("credentials missing"))?,
+            other => anyhow::bail!("expected S3 origin, got: {other:?}"),
+        };
+        match creds {
+            crate::config::ResolvedS3Credentials::DefaultChain { profile } => {
+                anyhow::ensure!(profile.is_none(), "empty profile should collapse to None");
+            }
+            crate::config::ResolvedS3Credentials::Static { .. } => {
+                anyhow::bail!("expected DefaultChain, got Static")
+            }
+        }
+        Ok(())
+    }
+
     // Absent `[cache.origin.credentials]` => resolved credentials
     // are `None` (the runtime then falls back to the AWS default
     // credential chain). Pin this default so a future refactor of
@@ -3011,13 +3056,13 @@ mod tests {
 
     #[test]
     fn resolve_config_accepts_s3_origin_today() -> anyhow::Result<()> {
-        // The schema lands in PR1; the runtime backend lands in
-        // PR2. Until PR2 lands, `decdn config validate` (which goes
-        // through `resolve_config`) must succeed for an S3 TOML —
-        // build_cache rejects at startup. This test pins that
-        // shape so PR2 cannot accidentally invert it (e.g. by
-        // moving the S3 rejection from build_cache into
-        // resolve_origin).
+        // `decdn config validate` (which goes through `resolve_config`)
+        // must succeed for a valid S3 TOML — operator-side validation
+        // is the schema + resolver layer, not the runtime backend.
+        // Pinned so a future refactor that moved the S3 backend's
+        // construction-time validation upstream into `resolve_origin`
+        // can't silently start rejecting configs that `build_cache`
+        // would otherwise accept.
         let toml_body = format!(
             "{}\n\n[cache.origin]\nkind = \"s3\"\n\
              bucket = \"decdn-blobs\"\nregion = \"us-east-1\"\n",

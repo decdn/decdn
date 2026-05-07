@@ -986,14 +986,15 @@ mod tests {
         (tmp, cfg)
     }
 
-    /// PR2 (#437): `build_cache` must construct the S3 backend without
-    /// performing network I/O. The SDK lazily connects on the first
+    /// `build_cache` must construct the S3 backend without performing
+    /// network I/O (#437). The SDK lazily connects on the first
     /// `GetObject` call, so a successful `build_cache` proves the
     /// resolver-to-runtime conversion (`s3_origin_config_from_resolved`)
     /// runs end-to-end and that the SDK's `ClientBuilder::build` doesn't
-    /// fire its `BehaviorVersion` panic for either credential variant.
-    /// The integration suite at `crates/cache/tests/s3_origin.rs` exercises
-    /// the wire path via `aws-smithy-mocks`.
+    /// surface its `BehaviorVersion`-missing runtime error for either
+    /// credential variant. The integration suite at
+    /// `crates/cache/tests/s3_origin.rs` exercises the wire path via
+    /// `aws-smithy-mocks`.
     #[tokio::test]
     async fn build_cache_constructs_s3_origin_for_default_chain() {
         use decdn_common::config::{ResolvedS3Config, ResolvedS3Credentials};
@@ -1052,15 +1053,23 @@ mod tests {
     /// this, a refactor that replaces `.expose()` with a placeholder
     /// would silently break `SigV4` signing at runtime. Direct unit
     /// test on the conversion function avoids the SDK round-trip.
+    ///
+    /// Also pins `region` and `endpoint_url` field-equivalence between
+    /// the resolved form and the runtime form. The conversion uses
+    /// field access (not destructuring), so a new field added to one
+    /// side and forgotten on the other wouldn't be caught at compile
+    /// time — this assertion is the safety net.
     #[test]
     fn s3_origin_config_from_resolved_preserves_static_credentials() {
         use decdn_common::config::secret::SecretString;
         use decdn_common::config::{ResolvedS3Config, ResolvedS3Credentials};
 
+        let endpoint =
+            decdn_cache::parse_origin_url("https://r2.example/").expect("test URL must parse");
         let resolved = ResolvedS3Config {
             bucket: "b".to_string(),
             region: "us-east-1".to_string(),
-            endpoint_url: None,
+            endpoint_url: Some(endpoint),
             path_style: true,
             prefix: "blobs/".to_string(),
             credentials: Some(ResolvedS3Credentials::Static {
@@ -1071,6 +1080,12 @@ mod tests {
         };
         let runtime = s3_origin_config_from_resolved(&resolved);
         assert_eq!(runtime.bucket, "b");
+        assert_eq!(runtime.region, "us-east-1");
+        // OriginUrl doesn't implement PartialEq; compare via Display.
+        assert_eq!(
+            runtime.endpoint_url.as_ref().map(ToString::to_string),
+            Some("https://r2.example/".to_string()),
+        );
         assert!(runtime.path_style);
         assert_eq!(runtime.prefix, "blobs/");
         match runtime.credentials.expect("static creds preserved") {
@@ -1084,6 +1099,41 @@ mod tests {
                 assert_eq!(session_token.as_deref(), Some("tok-1"));
             }
             S3Credentials::DefaultChain { .. } => panic!("expected Static after conversion"),
+        }
+    }
+
+    /// Sibling of the Static-credentials round-trip: pins the
+    /// `DefaultChain` arm of `s3_origin_config_from_resolved` along
+    /// with `endpoint_url: None` and `path_style: false` (the
+    /// virtual-hosted-style AWS / R2 default). Without this test the
+    /// `DefaultChain { profile }` -> `DefaultChain { profile }` arm
+    /// has no direct coverage; the construction tests above call
+    /// `build_cache` but only assert it returns `Ok`, not that
+    /// `profile` survived the conversion.
+    #[test]
+    fn s3_origin_config_from_resolved_preserves_default_chain() {
+        use decdn_common::config::{ResolvedS3Config, ResolvedS3Credentials};
+
+        let resolved = ResolvedS3Config {
+            bucket: "b".to_string(),
+            region: "eu-west-1".to_string(),
+            endpoint_url: None,
+            path_style: false,
+            prefix: String::new(),
+            credentials: Some(ResolvedS3Credentials::DefaultChain {
+                profile: Some("decdn-prod".to_string()),
+            }),
+        };
+        let runtime = s3_origin_config_from_resolved(&resolved);
+        assert_eq!(runtime.region, "eu-west-1");
+        assert!(runtime.endpoint_url.is_none());
+        assert!(!runtime.path_style);
+        assert!(runtime.prefix.is_empty());
+        match runtime.credentials.expect("default-chain creds preserved") {
+            S3Credentials::DefaultChain { profile } => {
+                assert_eq!(profile.as_deref(), Some("decdn-prod"));
+            }
+            S3Credentials::Static { .. } => panic!("expected DefaultChain after conversion"),
         }
     }
 

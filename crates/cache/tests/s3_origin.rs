@@ -529,8 +529,9 @@ async fn cache_engine_miss_pulls_from_s3_and_caches() -> anyhow::Result<()> {
 
     let tmp = tempfile::tempdir()?;
     // Disable our outer retry policy so the test surfaces a deterministic
-    // call count — the SDK still has its own internal retries on transients,
-    // but on a 200-OK happy path that doesn't matter.
+    // call count. The SDK's internal retry layer is also disabled (see
+    // `mock_s3_client`), so the call count reflects neither layer adding
+    // attempts on a 200-OK happy path.
     let engine = CacheEngine::open_full(
         tmp.path(),
         Some(origin),
