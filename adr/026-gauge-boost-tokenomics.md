@@ -326,7 +326,7 @@ interface IDelegatorBuyer {
     // [ADR 016 § Contract: FeeRouter](016-contract-interactions.md#contract-feerouter).
     // Same Vault-scoped self-approval pattern as `BuybackBurner`.
     function swapDelegatorBucket(
-        uint256 epoch,
+        uint64 epochId,
         uint256 amountIn,
         uint256 minOut
     ) external;
@@ -350,7 +350,7 @@ interface IDelegatorBuyer {
     function unpause() external;
 
     // ─── Events ───────────────────────────────────────────────────────
-    event DelegatorSwapped(uint256 indexed epoch, uint256 amountIn, uint256 amountOut);
+    event DelegatorSwapped(uint64 indexed epochId, uint256 amountIn, uint256 amountOut);
     event FeeRouterUpdated(address indexed oldRouter, address indexed newRouter);
     event PoolUpdated(address indexed oldPool, address indexed newPool);
     event SlippageToleranceUpdated(uint256 oldBps, uint256 newBps);
