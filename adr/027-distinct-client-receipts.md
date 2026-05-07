@@ -169,11 +169,13 @@ mapping(bytes32 => uint64)  internal leafCount;
 
 /// Appends keccak256(0x00 || root) as a leaf and merges peaks bottom-up via
 /// keccak256(0x01 || left || right). O(log N) hashes.
-/// Operator is `msg.sender` per §1 / §4 above and ADR 016 §FeeRouter.
+/// Operator is `msg.sender` (see §4 prose above and the ADR 016 §3 cross-contract
+/// call-graph row for `commitEpochReceiptRoot`).
 function commitEpochReceiptRoot(uint64 epochId, bytes32 root) external;
 
-/// Folds remaining peaks (highest height to lowest) into a single root using
-/// keccak256(0x02 || peaks[i] || acc) per the bagging algorithm in the prose below.
+/// Folds remaining peaks shortest-first: acc starts at the shortest peak; taller peaks
+/// accumulate on the LEFT at each step via keccak256(0x02 || peaks[i] || acc), so the
+/// tallest peak ends up as the outermost hash. See the bagging algorithm in the prose below.
 /// Returned as `aggregateRoot` on commitEpochSummary; stable for the (operator, epochId) pair.
 function epochAggregateRoot(address operator, uint64 epochId) public view returns (bytes32);
 ```
@@ -193,7 +195,7 @@ function epochAggregateRoot(address operator, uint64 epochId) public view return
   return acc
   ```
 
-  Returned as `aggregateRoot` in the §Per-epoch-summary table above. The `0x02` tag distinguishes peak-bagging hashes from leaf hashes (`0x00`) and append-time internal-node hashes (`0x01`); a verifier cannot confuse a bagging hash with a tree-internal hash even on otherwise-colliding inputs.
+  Returned as `aggregateRoot` in the §Per-epoch-summary table above. All three domain tags (`0x00`, `0x01`, `0x02`) are single bytes (Solidity `bytes1`) prepended via `abi.encodePacked(bytes1(0xNN), <fields>)` — no length prefix, no padding. The `0x02` tag distinguishes peak-bagging hashes from leaf hashes (`0x00`) and append-time internal-node hashes (`0x01`); a verifier cannot confuse a bagging hash with a tree-internal hash even on otherwise-colliding inputs.
 - **Inclusion proof.** Consumed by §Challenge window. A receipt's proof is a `(leafIndex, siblingPathWithinPeak, peakIndex, peakPath)` tuple where `peakPath` is the array of *other* peaks needed to reproduce the bagging. The verifier (a) replays the leaf-tagged hash up the named peak using `siblingPathWithinPeak`, then (b) reconstructs the bagged root by replaying the `0x02`-tagged folds against `peakPath`. Verification cost is **`peakHeight + (numPeaks − 1)` `keccak256` calls** — bounded above by the within-peak depth plus the bagging-fold depth. At the reference scale (~30k receipts), max peak height is `⌈log₂(30000)⌉ = 15` and `popcount(30000) = 7` peaks ⇒ worst-case ≈ **15 + 6 = 21 hashes** per inclusion proof.
 - **Storage retention.** `peaks` and `leafCount` entries for an `(operator, epochId)` pair are retained for the §Challenge window duration (7 days) plus a `MMR_RETENTION_BUFFER` of **at least 1 day**. The buffer is governance-tunable within bounds `[1 day, 30 days]` defined here on `FeeRouter` (consistent with the §3 governance pattern for receipt parameters); ADR 009's parameter table does not currently enumerate this parameter and would need a paired editorial update to include it. After retention expires, the entries are zeroed for refund eligibility — Solidity does not reclaim storage slots; the SSTORE-to-zero produces a refund (capped at 20 % of the surrounding tx gas post-EIP-3529, with Arbitrum's L2 schedule applying its own clamp), and the slots remain allocated indefinitely with zero values. Post-zeroing, the retained `aggregateRoot` on the `EpochReceiptSummary` record continues to identify the epoch's commitments, but leaf-level inclusion proofs are no longer reconstructable on-chain — challengers MUST cache `peaks` off-chain before submitting a `ChallengeReceiptSummary` if there is any risk the §Challenge window resolution will land after the retention window expires.
 - **Gas validation.** The MMR-append + byte-counter combined per-`commitEpochReceiptRoot` cost on Arbitrum One fee markets is a pre-mainnet validation requirement per [Appendix: L2 Deployment](appendix-l2-deployment.md).
