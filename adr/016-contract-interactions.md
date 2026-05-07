@@ -15,7 +15,7 @@ This ADR consolidates that analysis into a single reference for security audits 
 
 ### 1. Contract Inventory
 
-All on-chain contracts inherit from [OpenZeppelin Contracts](https://docs.openzeppelin.com/contracts/) to minimize custom security-critical code. The full surface ships in a single audit pass; per-bucket economics are governance-tunable from day one (see § Tunable Economics below) so the network can launch with a simplified split (e.g. 80/0/0/10/10/0) and dial up gauge boost / delegator pool / safety reserve as the dependent infrastructure stabilizes.
+All on-chain contracts inherit from [OpenZeppelin Contracts](https://docs.openzeppelin.com/contracts/) to minimize custom security-critical code. The full surface ships in a single audit pass; per-bucket economics are governance-tunable from day one (see [§ Tunable Economics](#tunable-economics) below) so the network can launch with a simplified split (e.g. 80/0/0/10/10/0) and dial up gauge boost / delegator pool / safety reserve as the dependent infrastructure stabilizes.
 
 | Contract | ADR | Holds Funds | Token Types | OZ Base Contracts |
 | --- | --- | --- | --- | --- |
@@ -26,7 +26,7 @@ All on-chain contracts inherit from [OpenZeppelin Contracts](https://docs.openze
 | VotingEscrow | [026](026-gauge-boost-tokenomics.md) | Yes | TOKEN (locked, non-transferable) | `ReentrancyGuard`, `Pausable` |
 | SafetyReserve | [026](026-gauge-boost-tokenomics.md), [028](028-slashing-appeals.md) | Yes | USDC (3% bucket + slashing redirect), TOKEN (transient until keeper swap) | `AccessControl`, `ReentrancyGuard`, `Pausable` (includes [ADR 028](028-slashing-appeals.md) appeal extensions: `openSlashAppeal` / `fastTrackAppeal` / `rejectAppeal` / `ratifyAppeal` / `reverseAppeal`) |
 | BuybackBurner | [018](018-liquidity-strategy.md), [026](026-gauge-boost-tokenomics.md) | Yes | USDC, TOKEN (transient) | `AccessControl`, `ReentrancyGuard`, `Pausable` (Balancer V3 swap-and-burn path) |
-| DelegatorBuyer | [026](026-gauge-boost-tokenomics.md) §6 | Yes | USDC, TOKEN (transient) | `AccessControl`, `ReentrancyGuard`, `Pausable` (USDC→TOKEN swap for the delegator pool; implementation choice between a parallel contract or a `BuybackBurner` multi-output mode is deferred per § Deployment Order below) |
+| DelegatorBuyer | [026](026-gauge-boost-tokenomics.md) §6 | Yes | USDC, TOKEN (transient) | `AccessControl`, `ReentrancyGuard`, `Pausable` (USDC→TOKEN swap for the delegator pool; implementation choice between a parallel contract or a `BuybackBurner` multi-output mode is deferred per [§ Deployment Order](#2-deployment-order-and-initialization-dependencies) below) |
 | ContentBlacklist | [011](011-content-takedown.md) | No | — | `AccessControl`, `ReentrancyGuard` (full surface: hash-level — global + regional — operator-level — `addOrigin` / `removeOrigin` / `isOriginBlacklisted` — and the [ADR 011 § Blacklist Entry Appeals](011-content-takedown.md#blacklist-entry-appeals) API) |
 | PublisherRegistry | [002](002-content-addressing.md) | No | — | `AccessControl`, `ReentrancyGuard` |
 | OriginAssignment | [011](011-content-takedown.md) | No | — | `AccessControl`, `ReentrancyGuard` |
@@ -95,7 +95,7 @@ classDiagram
     Governor ..> SafetyReserve : payout authorization
 ```
 
-The full FeeRouter six-bucket split (40/40/7/5/5/3) is the steady-state target specified in [ADR 026](026-gauge-boost-tokenomics.md) §2; epoch-bucket mechanics and the gauge-boost formula live in [ADR 026](026-gauge-boost-tokenomics.md) §2–§3. This ADR does not duplicate the bucket table; the launch-default share configuration and the tunability mechanism are in § Tunable Economics below.
+The full FeeRouter six-bucket split (40/40/7/5/5/3) is the steady-state target specified in [ADR 026](026-gauge-boost-tokenomics.md) §2; epoch-bucket mechanics and the gauge-boost formula live in [ADR 026](026-gauge-boost-tokenomics.md) §2–§3. This ADR does not duplicate the bucket table; the launch-default share configuration and the tunability mechanism are in [§ Tunable Economics](#tunable-economics) below.
 
 #### Tunable Economics
 
@@ -105,13 +105,13 @@ The pattern has three knobs, all under `GOVERNANCE_ROLE` (i.e. the `TimelockCont
 
 1. **Bucket shares.** `FeeRouter.setShares(operatorBaseBps, gaugeBoostBps, delegatorBps, buybackBps, treasuryBps, safetyBps)` updates the six-bucket split in basis points. Sum-to-10000 invariant enforced; cross-validated against dependency addresses (see knob 2). Steady-state target per [ADR 026](026-gauge-boost-tokenomics.md) §2 is `4000 / 4000 / 700 / 500 / 500 / 300`.
 2. **Dependency addresses.** `FeeRouter.setVotingEscrow(addr)`, `setSafetyReserve(addr)`, `setDelegatorBuyer(addr)`, `setBuybackBurner(addr)`, `setTreasury(addr)` may be called any time. **Cross-validation:** `setShares(...)` reverts if any non-zero share has its destination set to `address(0)` — so a bucket can only become live once its sink contract is wired in. Same applies in reverse: `set*(address(0))` reverts if the corresponding share is non-zero.
-3. **Helper-contract addresses on signing contracts.** `StablePaymentChannel.setFeeRouter(addr)` (per [ADR 003](003-payments.md)) lets governance re-point the router target without redeploying the payment channel. The EIP-712 domain separator is unaffected because it does not include the FeeRouter address; see § No proxy deployment patterns below for the full carve-out.
+3. **Helper-contract addresses on signing contracts.** `StablePaymentChannel.setFeeRouter(addr)` (per [ADR 003](003-payments.md)) lets governance re-point the router target without redeploying the payment channel. The EIP-712 domain separator is unaffected because it does not include the FeeRouter address; see [§ No proxy deployment patterns](#no-proxy-deployment-patterns) below for the full carve-out.
 
 **Inactive buckets accumulate zero with no reverts.** Same-tx legs (operator / buyback / treasury / safety) execute inline against their `safeTransfer` paths. Epoch-bucket legs (gauge / delegator) accumulate to per-epoch storage; at zero share, no storage writes happen and `claimBoost(epochs)` / `claimDelegator(epochs)` return zero for those epochs. No code path reverts when a bucket is off — the contract is uniformly dormant on the disabled legs.
 
 **Activation sequence is governance-driven.** When `VotingEscrow` / `SafetyReserve` / `DelegatorBuyer` are deployed and audited, governance calls the relevant `set*(addr)` then `setShares(...)` to allocate the bucket. Because share updates pass through the standard 48h timelock, bucket activations are externally observable in advance.
 
-**Launch deployment.** `FeeRouter` deploys with zero-address dependencies for `VotingEscrow` / `SafetyReserve` / `DelegatorBuyer` if those aren't co-deployed (see § Deployment Order below). The launch share configuration honors the cross-validation invariant — only buckets whose destinations are wired may be set non-zero.
+**Launch deployment.** `FeeRouter` deploys with zero-address dependencies for `VotingEscrow` / `SafetyReserve` / `DelegatorBuyer` if those aren't co-deployed (see [§ Deployment Order](#2-deployment-order-and-initialization-dependencies) below). The launch share configuration honors the cross-validation invariant — only buckets whose destinations are wired may be set non-zero.
 
 ##### No proxy deployment patterns
 
@@ -123,7 +123,7 @@ No deCDN contract uses proxy (upgradeable) deployment patterns. Production contr
 
 ### 2. Deployment Order and Initialization Dependencies
 
-Contracts must be deployed in dependency order — each contract's constructor requires the addresses of contracts deployed before it. `FeeRouter` accepts `address(0)` for `VotingEscrow` / `SafetyReserve` / `DelegatorBuyer` at construction; the cross-validation invariant in § Tunable Economics ensures any non-zero share has a non-zero destination, so the launch share configuration determines which dependencies must already be wired. `DelegatorBuyer` is deployed after `FeeRouter` so its constructor can pin the router address as immutable; governance then calls `FeeRouter.setDelegatorBuyer(addr)` to complete the bidirectional wiring.
+Contracts must be deployed in dependency order — each contract's constructor requires the addresses of contracts deployed before it. `FeeRouter` accepts `address(0)` for `VotingEscrow` / `SafetyReserve` / `DelegatorBuyer` at construction; the cross-validation invariant in [§ Tunable Economics](#tunable-economics) ensures any non-zero share has a non-zero destination, so the launch share configuration determines which dependencies must already be wired. `DelegatorBuyer` is deployed after `FeeRouter` so its constructor can pin the router address as immutable; governance then calls `FeeRouter.setDelegatorBuyer(addr)` to complete the bidirectional wiring.
 
 ```mermaid
 graph TD
@@ -193,7 +193,7 @@ graph TD
 
 - **Default-open allow-list bootstrap.** Entries keyed by `namespaceId == 0` start empty with `defaultOpenAllowlistActive == false` (permissive bootstrap window — any active staker may serve as origin for default-open content). The first non-empty governance activation flips `defaultOpenAllowlistActive` to `true` permanently; thereafter only allow-listed operators appear in `getOrigins(0)`.
 - **Default-open governance entry points.** `setDefaultOpenAllowlist`, `addDefaultOpenOperator`, `removeDefaultOpenOperator`, `setDefaultOpenMinRedundancy`, `setDefaultOpenMaxOrigins` all carry `GOVERNANCE_ROLE` and run under the Governor's standard 48h timelock.
-- **ContentBlacklist binding.** Until `setContentBlacklist(address)` is called post-deploy (see § Post-Deployment Initialization below), `pruneBlacklistedAssignment` reverts — it cannot read `isOriginBlacklisted` against the zero address. This does not block usage: off-chain consumers of `getOrigins(...)` cross-reference `ContentBlacklist.isOriginBlacklisted` directly via RPC.
+- **ContentBlacklist binding.** Until `setContentBlacklist(address)` is called post-deploy (see [§ Post-Deployment Initialization](#post-deployment-initialization) below), `pruneBlacklistedAssignment` reverts — it cannot read `isOriginBlacklisted` against the zero address. This does not block usage: off-chain consumers of `getOrigins(...)` cross-reference `ContentBlacklist.isOriginBlacklisted` directly via RPC.
 
 #### Post-Deployment Initialization
 
@@ -480,7 +480,7 @@ New top-level contracts integrate with the launch-time set via standard `AccessC
 | `BLACKLIST_ROLE` | StakingRegistry | `ejectNode()` | ContentBlacklist contract | ContentBlacklist contract |
 | `GOVERNANCE_ROLE` | OriginAssignment | `activateAssignment()`, `revokeAssignment()`, `setMinRedundancy()`, `setMaxOriginsPerNamespace()`, `setAssignmentTimelock()`, `setDefaultOpenAllowlist()`, `addDefaultOpenOperator()`, `removeDefaultOpenOperator()`, `setDefaultOpenMinRedundancy()`, `setDefaultOpenMaxOrigins()` | Admin | Governor via timelock |
 | `SLASH_ROLE` | StakingRegistry | `slash()` | SlashJudge contract | SlashJudge contract |
-| `SETTLEMENT_REPORTER_ROLE` | StakingRegistry | `recordSettlement(operator)` | FeeRouter | FeeRouter; see §3 |
+| `SETTLEMENT_REPORTER_ROLE` | StakingRegistry | `recordSettlement(operator)` | FeeRouter | FeeRouter; see [§3](#3-cross-contract-call-graph) |
 | `KEEPER_ROLE` | BuybackBurner, FeeRouter, DelegatorBuyer | `executeBuyback()` (BB), `executeDelegatorSwap(epoch, minOut)` (FeeRouter), `swapDelegatorBucket(...)` (DelegatorBuyer) | Admin / disabled | Keeper bot or governance |
 | `ROUTER_CALLER_ROLE` | FeeRouter | `routeSettlement(op, bytes, amount)` | StablePaymentChannel | StablePaymentChannel (and any future settlement-emitting contract) |
 | `PAYOUT_AUTHORIZER_ROLE` | SafetyReserve | `payout(bundle, recipient, amount)` | n/a | Governor via timelock; emergency multisig within hard caps ([ADR 026](026-gauge-boost-tokenomics.md) §5) |
