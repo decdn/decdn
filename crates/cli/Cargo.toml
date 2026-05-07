@@ -30,9 +30,14 @@ rand = { workspace = true }
 # `decdn bundle create` (issue #391): directory walk + glob exclude +
 # streaming BLAKE3. Using `blake3` directly keeps iroh-blobs out of the
 # publisher CLI's dep tree (see `appendix-binaries.md` § binary-size).
+# `tempfile` is also a runtime dep here because `bundle create` writes
+# the manifest atomically via `NamedTempFile::persist` — a unique
+# O_CREAT|O_EXCL temp avoids the symlink-clobber risk of a predictable
+# `<output>.partial` filename on a shared workspace.
 walkdir = { workspace = true }
 globset = { workspace = true }
 blake3 = { workspace = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
 # Integration tests in `tests/admin_peers.rs` exercise the loopback admin
@@ -49,7 +54,6 @@ decdn-gossip = { workspace = true }
 # `throwaway_signer` helper, with chain id sourced from
 # `decdn_incentive::eth_identity::ARBITRUM_SEPOLIA_CHAIN_ID`.
 alloy = { workspace = true }
-tempfile = { workspace = true }
 
 [lints]
 workspace = true

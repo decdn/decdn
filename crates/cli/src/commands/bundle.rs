@@ -11,7 +11,7 @@
 //! publisher CLI's runtime isn't held up.
 
 use std::fs::File;
-use std::io::{ErrorKind, Read, Write};
+use std::io::Write;
 use std::path::{Component, Path};
 
 use anyhow::{Context as _, anyhow, bail};
@@ -19,8 +19,6 @@ use decdn_common::cli::{BundleArgs, BundleCommand, BundleCreateArgs};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::Serialize;
 use walkdir::WalkDir;
-
-const HASH_BUF_SIZE: usize = 64 * 1024;
 
 /// Top-level dispatcher for `decdn bundle ...`. Single-variant today —
 /// `Pull` is deferred (see `appendix-bundles.md` § Future work).
@@ -212,12 +210,8 @@ fn collect_entries(
             continue;
         }
 
-        let metadata = entry
-            .metadata()
-            .with_context(|| format!("metadata for {}", entry.path().display()))?;
-        let size = metadata.len();
-        let hash = hash_file_streaming(&canonical)
-            .with_context(|| format!("hash {}", canonical.display()))?;
+        let (hash, size) =
+            hash_file_at(&canonical).with_context(|| format!("hash {}", canonical.display()))?;
 
         total_size = total_size.checked_add(size).ok_or_else(|| {
             anyhow!("total_size overflow at {rel_str}: running={total_size} adding={size}")
@@ -262,7 +256,14 @@ fn validate_relpath(rel: &Path) -> anyhow::Result<String> {
                 out.push_str(s);
                 empty = false;
             }
-            Component::CurDir => {}
+            Component::CurDir => {
+                // ADR `appendix-bundles.md` § Path-safety-rules requires
+                // every component to be `Component::Normal`. Rust's
+                // Path::components normalizes most `.` segments away, but
+                // a leading `./` still surfaces here — bail to match the
+                // spec rather than silently collapse to `Normal` order.
+                bail!("rejected current-dir component '.' in {}", rel.display());
+            }
             Component::ParentDir => {
                 bail!("rejected parent-dir component '..' in {}", rel.display());
             }
@@ -280,29 +281,19 @@ fn validate_relpath(rel: &Path) -> anyhow::Result<String> {
     Ok(out)
 }
 
-/// Stream a file through blake3 with a 64 KiB buffer. Avoids loading
-/// the whole file into memory for large blobs. Retries on `Interrupted`
-/// (EINTR) so a stray signal during a multi-GB hash doesn't surface as
-/// a permanent error — same idiom as `std::io::copy`.
-fn hash_file_streaming(path: &Path) -> std::io::Result<blake3::Hash> {
+/// Open a file once and pull both the BLAKE3 hash and the size from the
+/// open handle. The fd-derived `metadata()` (`fstat` on Unix) closes the
+/// TOCTOU window between a separate metadata call and the read —
+/// `entry.metadata()` followed by `File::open(path)` lets the underlying
+/// inode change in between. `blake3::Hasher::update_reader` is the
+/// upstream-recommended streaming primitive; it manages its own buffer
+/// and retries on `Interrupted` internally.
+fn hash_file_at(path: &Path) -> std::io::Result<(blake3::Hash, u64)> {
     let mut file = File::open(path)?;
+    let size = file.metadata()?.len();
     let mut hasher = blake3::Hasher::new();
-    let mut buf = vec![0u8; HASH_BUF_SIZE];
-    loop {
-        let n = match file.read(&mut buf) {
-            Ok(n) => n,
-            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        };
-        if n == 0 {
-            break;
-        }
-        let chunk = buf
-            .get(..n)
-            .ok_or_else(|| std::io::Error::other("read returned out-of-range len"))?;
-        hasher.update(chunk);
-    }
-    Ok(hasher.finalize())
+    hasher.update_reader(&mut file)?;
+    Ok((hasher.finalize(), size))
 }
 
 /// Render the bundle to its canonical byte form: single-line compact JSON,
@@ -315,32 +306,23 @@ fn serialize_canonical(entries: &[BundleEntry]) -> anyhow::Result<Vec<u8>> {
     serde_json::to_vec(&bundle).map_err(|e| anyhow!("serialize bundle: {e}"))
 }
 
-/// Write the bundle bytes atomically: full content lands in a sibling
-/// `<output>.partial`, gets fsync'd, then rename-replaces the target.
-/// On a crash mid-write the half-written file is `.partial`, never the
-/// operator-expected name — downstream tooling that reads `--output`
-/// without re-running create can't be tricked by a torn write.
+/// Write the bundle bytes atomically. `NamedTempFile` creates a uniquely-
+/// named file in the destination directory via `O_CREAT|O_EXCL`, so
+/// there is no predictable `<output>.partial` path an adversary or a
+/// concurrent writer can plant a symlink at to redirect the write.
+/// `persist` does the cross-platform atomic rename-replace; on a crash
+/// mid-write the temp gets dropped (and removed) by the `NamedTempFile`
+/// guard rather than leaving a partial artifact under the operator-
+/// expected name.
 fn write_bundle(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let file_name = target
-        .file_name()
-        .ok_or_else(|| std::io::Error::other("--output has no file-name component"))?;
-    let mut tmp_name = file_name.to_owned();
-    tmp_name.push(".partial");
-    let tmp_path = target.with_file_name(tmp_name);
-    {
-        let mut tmp = File::create(&tmp_path)?;
-        if let Err(e) = tmp.write_all(bytes).and_then(|()| tmp.sync_all()) {
-            // Don't leave the partial behind on a write failure — operator
-            // re-runs should not see two artifacts. Best-effort cleanup;
-            // the original error wins.
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(e);
-        }
-    }
-    if let Err(e) = std::fs::rename(&tmp_path, target) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(e);
-    }
+    let parent = target.parent().filter(|p| !p.as_os_str().is_empty());
+    let mut tmp = match parent {
+        Some(p) => tempfile::NamedTempFile::new_in(p)?,
+        None => tempfile::NamedTempFile::new_in(".")?,
+    };
+    tmp.write_all(bytes)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(target).map_err(|e| e.error)?;
     Ok(())
 }
 
@@ -468,16 +450,17 @@ mod tests {
     }
 
     #[test]
-    fn hash_file_streaming_matches_in_memory_blake3() {
+    fn hash_file_at_matches_in_memory_blake3_and_size() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("hello.txt");
         std::fs::write(&path, b"hello world\n").unwrap();
-        let got = hash_file_streaming(&path).unwrap();
-        assert_eq!(got, blake3::hash(b"hello world\n"));
+        let (hash, size) = hash_file_at(&path).unwrap();
+        assert_eq!(hash, blake3::hash(b"hello world\n"));
+        assert_eq!(size, 12);
     }
 
     #[test]
-    fn write_bundle_is_atomic_no_partial_on_success() {
+    fn write_bundle_persists_target_no_temp_leftover() {
         let dir = tempfile::TempDir::new().unwrap();
         let target = dir.path().join("bundle.json");
         write_bundle(&target, b"{\"version\":1,\"entries\":[]}").unwrap();
@@ -485,9 +468,26 @@ mod tests {
             std::fs::read(&target).unwrap(),
             b"{\"version\":1,\"entries\":[]}"
         );
-        // No `.partial` artifact left behind.
-        let partial = dir.path().join("bundle.json.partial");
-        assert!(!partial.exists(), "partial should not survive success");
+        // After a successful persist, the only file in the dir is the
+        // target — no random temp left behind.
+        let mut entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|r| r.unwrap().file_name())
+            .collect();
+        entries.sort();
+        assert_eq!(entries, vec![std::ffi::OsString::from("bundle.json")]);
+    }
+
+    #[test]
+    fn write_bundle_overwrites_existing_target() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("bundle.json");
+        std::fs::write(&target, b"old").unwrap();
+        write_bundle(&target, b"{\"version\":1,\"entries\":[]}").unwrap();
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"{\"version\":1,\"entries\":[]}"
+        );
     }
 
     #[test]
