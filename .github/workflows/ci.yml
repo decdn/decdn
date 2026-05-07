@@ -168,7 +168,7 @@ jobs:
 
       - name: Download coverage baseline
         if: github.event_name == 'pull_request'
-        uses: dawidd6/action-download-artifact@v6
+        uses: dawidd6/action-download-artifact@v21
         with:
           workflow: ci.yml
           branch: main
