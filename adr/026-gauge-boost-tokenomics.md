@@ -232,9 +232,9 @@ interface ISafetyReserve {
     // ─── Slash-appeal extensions (per ADR 028) ────────────────────────
     // Signature stubs only; full appeal state machine, window timing,
     // and authorization rules are specified in
-    // [ADR 028 §6](028-slashing-appeals.md) and finalized as part of the
-    // surface lock-down in #451. Storage and authorization details are
-    // **not** pinned by this interface.
+    // [ADR 028 §6](028-slashing-appeals.md#6-contract-surface) and
+    // finalized as part of the surface lock-down in #451. Storage and
+    // authorization details are **not** pinned by this interface.
     function openSlashAppeal(uint256 slashId, bytes32 evidenceBundleHash)
         external returns (uint256 appealId);
     function fastTrackAppeal(uint256 appealId) external;
@@ -279,6 +279,8 @@ interface ISafetyReserve {
     event AppealWindowUpdated(uint64 oldValue, uint64 newValue);
     event PoolUpdated(address indexed oldPool, address indexed newPool);
     event SlippageToleranceUpdated(uint256 oldBps, uint256 newBps);
+    event MinBatchAmountUpdated(uint256 oldValue, uint256 newValue);
+    event MaxBatchAmountUpdated(uint256 oldValue, uint256 newValue);
 }
 ```
 
@@ -286,7 +288,7 @@ interface ISafetyReserve {
 
 - **USDC-only payouts.** `usdcAmount` is named explicitly so the constraint is visible in the storage layout and on every `Paid` event. If a future ADR ever motivates multi-currency payouts, the additive shape is a `tokenOut` field plus an allowlist setter — no breaking change to existing `Incident` storage.
 - **Governor and emergency-multisig addresses are governance-mutable.** The `setGovernor` / `setEmergencyMultisig` setters allow the eventual handover from the deployer EOA to `TimelockController` (per [ADR 016 § Post-Deployment Initialization](016-contract-interactions.md#post-deployment-initialization)) and any future re-pointing without contract redeployment. The 48h timelock constraint applies via `GOVERNANCE_ROLE`.
-- **Appeal extensions are signature stubs.** This interface pins the function names and parameter types; the full state machine (`Open` → `FastTracked` / `Rejected` → `Ratified` / `Reversed` / `Lapsed`), window timing (filing, multisig review, ratification), and bond/restitution caps live in [ADR 028 §6](028-slashing-appeals.md) and are surface-locked under #451.
+- **Appeal extensions are signature stubs.** This interface pins the function names and parameter types; the full state machine (`Open` → `FastTracked` / `Rejected` → `Ratified` / `Reversed` / `Lapsed`), window timing (filing, multisig review, ratification), and bond/restitution caps live in [ADR 028 §6](028-slashing-appeals.md#6-contract-surface) and are surface-locked under #451.
 
 ### 6. Delegator pool — USDC → TOKEN conversion
 
