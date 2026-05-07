@@ -11,6 +11,6 @@ coverage:
 comment:
   layout: "header, diff, flags, components, files, footer"
   behavior: default
-  require_changes: false
+  require_changes: true
   require_base: false
   require_head: true
