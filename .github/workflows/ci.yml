@@ -102,12 +102,49 @@ jobs:
           RUSTC_WRAPPER: sccache
           SCCACHE_GHA_ENABLED: "true"
 
+  changes:
+    name: detect changes
+    runs-on: ubuntu-latest
+    # pull-requests: read is needed by dorny/paths-filter to call the
+    # listFiles API on PR events; on push it falls back to git diff.
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            rust:
+              - '**/*.rs'
+              - '**/Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - '.github/workflows/ci.yml'
+              - '.github/scripts/coverage-diff.py'
+
   coverage:
     name: coverage
     runs-on: ubuntu-latest
-    continue-on-error: true
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || github.event_name == 'push'
+    # No job-level continue-on-error: coverage is non-blocking via ci-success
+    # (which omits this job from its needs list). We want red Xs when our own
+    # tooling breaks so we notice — `continue-on-error` is scoped to the only
+    # genuinely-flaky steps below.
+    permissions:
+      contents: read
+      pull-requests: write
+      actions: read
     steps:
+      # fetch-depth: 0 is required: coverage-diff.py runs
+      # `git diff origin/<base>...HEAD` and needs full history.
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
@@ -117,12 +154,78 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov,cargo-nextest
-      - run: cargo llvm-cov nextest --workspace --lcov --output-path lcov.info --no-tests=pass
-      - uses: codecov/codecov-action@v6
+      - name: Generate LCOV
+        continue-on-error: true
+        run: cargo llvm-cov nextest --workspace --lcov --output-path lcov.info --no-tests=pass
+
+      - name: Upload coverage baseline
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v7
         with:
-          files: lcov.info
-          fail_ci_if_error: false
-          token: ${{ secrets.CODECOV_TOKEN }}
+          name: coverage-lcov
+          path: lcov.info
+          retention-days: 90
+
+      - name: Download coverage baseline
+        if: github.event_name == 'pull_request'
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          workflow: ci.yml
+          branch: main
+          workflow_conclusion: success
+          name: coverage-lcov
+          path: baseline/
+          if_no_artifact_found: warn
+
+      - name: Generate coverage diff
+        id: gendiff
+        if: github.event_name == 'pull_request'
+        # The script writes the truncated comment to stdout (captured here for the
+        # PR comment) and the full per-file table directly to $GITHUB_STEP_SUMMARY.
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/coverage-diff.py lcov.info baseline/lcov.info \
+            > coverage-comment.md
+
+      # always(): if Generate coverage diff fails (e.g. cargo llvm-cov produced no LCOV),
+      # post the error message to the PR anyway — coverage-comment.md was written by tee
+      # before the script exited non-zero. Skip on fork PRs: GITHUB_TOKEN is read-only there
+      # and createComment would 403.
+      - name: Post coverage comment
+        if: |
+          always()
+          && github.event_name == 'pull_request'
+          && github.event.pull_request.head.repo.full_name == github.repository
+          && hashFiles('coverage-comment.md') != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('coverage-comment.md', 'utf8');
+            // Must match MARKER in .github/scripts/coverage-diff.py.
+            const marker = '<!-- decdn-coverage-comment -->';
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              per_page: 100,
+            });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
 
   markdownlint:
     name: markdownlint
@@ -136,8 +239,8 @@ jobs:
 
   # Single gate for branch protection. Point required-checks at this one job
   # so adding/renaming jobs above doesn't require updating branch rules.
-  # coverage is excluded intentionally (it's continue-on-error until baseline);
-  # PR comment is configured in codecov.yml at repo root.
+  # coverage is excluded intentionally (informational, non-blocking); the PR
+  # comment is generated in-CI by .github/scripts/coverage-diff.py.
   ci-success:
     name: CI success
     if: always()
