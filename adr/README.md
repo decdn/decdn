@@ -159,6 +159,7 @@ pandoc --from=markdown+gfm_auto_identifiers \
   appendix-operator-key-rotation.md \
   appendix-operator-upgrade-path.md \
   appendix-fraud-detection.md \
+  appendix-admission-policy.md \
   -o adrs-book.pdf
 ```
 

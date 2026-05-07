@@ -130,6 +130,7 @@ Appendices document patterns, reference implementations, and operational guidanc
 6. [Operator Key Rotation Runbook](appendix-operator-key-rotation.md) — sequenced procedure for rotating the operator's iroh node-key, Ethereum signing key, and (production) session keys via `bindNodeId`, deregister-and-re-stake, or `erc7579/smartsessions`
 7. [Operator Protocol-Upgrade Runbook](appendix-operator-upgrade-path.md) — sequenced operator actions for each ADR 013 tier (Tier 1/2 checklists; Tier 3 rolling-upgrade procedure; client and governance coordination)
 8. [Permissionless Fraud-Detection Layer](appendix-fraud-detection.md) — optional, anyone-can-run on-chain monitoring of stale closes and fraudulent epoch summaries via the existing `SlashJudge` bond mechanism
+9. [Node Admission and Priority Policy](appendix-admission-policy.md) — voucher-rate-based ordering, optional staked-peer lane, non-preemptive admission with reject-and-rate-hint
 
 ## Architectural Decisions
 

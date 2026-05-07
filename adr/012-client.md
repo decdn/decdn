@@ -30,7 +30,6 @@ Capabilities:
 - Does **not** publish `ReputationReport` via gossip ([ADR 008](008-reputation.md) — clients contribute local observations only)
 - Maintains a local peer table (`NodeId → NodeAnnounce`) and reputation scores
 - Signs vouchers authorizing off-chain USDC (or governance-approved token) payments
-- Optionally stakes TOKEN for connection priority during congestion ([ADR 003 — Client Priority Staking](003-payments.md#client-priority-staking))
 
 ### Bootstrap Procedure
 
@@ -116,7 +115,7 @@ Client identity bindings are **ephemeral and per-connection**, as specified in [
 1. **Startup:** Load iroh key (→ `NodeId`). Load Ethereum key from keystore (EOA) or configure a 1-of-1 Safe with its owner key loaded from keystore; Production migrates to Safe-7579 + `erc7579/smartsessions` for high-frequency signing ([ADR 024](024-account-abstraction.md)).
 2. **Connect:** Establish QUIC connection to a node via `cdn/client/v1`.
 3. **Bind:** First `StreamRequest` on the connection includes `ethereum_address` and `binding_signature` — an EIP-712 `BindNodeId(nodeId, nonce=0)` signature. The `nonce=0` sentinel indicates an ephemeral (off-chain) binding.
-4. **Session:** The node verifies the signature using `SignatureChecker` semantics (`ecrecover` for EOA clients, ERC-1271 `isValidSignature` RPC call for smart account clients — see [ADR 024](024-account-abstraction.md#4-off-chain-erc-1271-verification)), caches the binding for the connection's lifetime, and uses the verified address for `clientStakeOf` lookups and voucher attribution. Subsequent requests on the same connection omit these fields.
+4. **Session:** The node verifies the signature using `SignatureChecker` semantics (`ecrecover` for EOA clients, ERC-1271 `isValidSignature` RPC call for smart account clients — see [ADR 024](024-account-abstraction.md#4-off-chain-erc-1271-verification)), caches the binding for the connection's lifetime, and uses the verified address for voucher attribution. Subsequent requests on the same connection omit these fields.
 5. **Disconnect:** The node discards the cached binding. No on-chain state to clean up.
 
 **Security properties of `nonce=0`:** The ephemeral binding is not a replay vulnerability because the node only uses it for the authenticated QUIC connection on which it was received. A binding from connection A is never applied to connection B. On-chain `bindNodeId` ([ADR 003](003-payments.md)) also starts at nonce 0 (`bindingNonce[msg.sender]` is initially 0), so the nonce value alone does not distinguish off-chain from on-chain bindings. The protection against on-chain replay is the EIP-712 domain separator: the off-chain binding is verified by the node via `SignatureChecker` semantics (locally, not on-chain), while on-chain `bindNodeId` verifies against `DOMAIN_SEPARATOR` (which includes the `StakingRegistry` contract address and chain ID). A signature produced for off-chain use cannot pass the on-chain domain check unless the client uses the exact same domain parameters — and if it does, the on-chain binding consumes the nonce, preventing reuse.
@@ -233,7 +232,6 @@ The client queries all configured seed domains, cross-checks returned NodeIds ag
 
 - DNS seed list introduces a governance-maintained out-of-band dependency for production
 - File-based key storage in PoC is not suitable for production (acceptable for testnet with test funds)
-- Ephemeral bindings mean a disconnected client loses priority staking benefits until reconnection
 - NTP synchronization is a hard requirement for gossip validation — clients without NTP will reject valid gossip and build stale peer tables
 - Hardware wallet voucher signing is confirmed infeasible — resolved by Safe session keys ([ADR 024](024-account-abstraction.md))
 
