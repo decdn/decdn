@@ -92,6 +92,34 @@ Direct peer USDC payment, no skim. Internal cost-recovery flow, not net protocol
 
 Epoch length is 1 week (7 × 86400 s, block-timestamp-aligned). At epoch rollover the gauge and delegator buckets freeze, new buckets open, and per-operator `bytes_delivered` counters reset. ve-balance snapshots are taken at the epoch-boundary timestamp via `VotingEscrow.balanceOfAt(user, ts)`. Claim window is 26 epochs (~6 months); unclaimed allocations sweep to the treasury.
 
+#### Pre-receipt-launch gauge accumulation
+
+[ADR 027 §9](027-distinct-client-receipts.md#9-implementation-sequencing-and-launch-prerequisite) establishes that the 40% gauge bucket MUST NOT pay out until distinct-client receipts are live and verified at scale — wash-trading at TOKEN price 3–5× genesis is net-profitable without the receipt gate. This sub-section pins the contract-level mechanism for that pause and the cutover.
+
+```solidity
+// FeeRouter pre-launch gauge state.
+bool    public gaugeLaunched;                                       // false until receipts ship and the cutover fires
+mapping(uint64 epochId => uint256) public preLaunchGaugeAccumulator; // epoch-keyed escrow for the 40% gauge share
+uint64  public gaugeLaunchEpoch;                                    // set on enableGauge(); zero pre-launch
+
+/// One-shot governance setter (cannot be re-disabled — pre-launch is a launch-only state).
+/// Sets gaugeLaunched = true and records gaugeLaunchEpoch = currentEpoch.
+function enableGauge() external onlyGovernor;
+
+event GaugeLaunched(uint64 indexed epoch);
+```
+
+**Behavior.**
+
+- While `gaugeLaunched == false`: `routeSettlement` deposits the 40% gauge share into `preLaunchGaugeAccumulator[currentEpoch]` instead of the live gauge bucket. The other five buckets (40% direct, 7% delegator, 5% burn, 5% treasury, 3% safety) flow normally per §2 — the §2 Same-transaction guarantees invariant is preserved end-to-end.
+- `claimGauge(epochs[])` reverts on any epoch where `epoch < gaugeLaunchEpoch` until `gaugeLaunched` flips, then accepts those pre-launch epochs and pays out from `preLaunchGaugeAccumulator[epoch]` weighted by the ve-snapshot taken at each historical epoch boundary (§Epoch mechanics already captures these snapshots for the live gauge formula; pre-launch epochs reuse them).
+- **Cutover** via `enableGauge()`: sets `gaugeLaunched = true`, records `gaugeLaunchEpoch = currentEpoch`, emits `GaugeLaunched(currentEpoch)`. From the cutover epoch onward, `routeSettlement` takes the normal §2 routing path; pre-launch epochs become claimable.
+- **Partial cutover epoch.** Because `enableGauge()` is `onlyGovernor` and inherits the [ADR 009](009-governance.md) ~9-day governance latency (7-day vote + 48-hour timelock), the cutover transaction lands at an arbitrary block within an epoch. Settlements before the cutover block in that epoch deposit into `preLaunchGaugeAccumulator[gaugeLaunchEpoch]`; settlements after the cutover block route via the live gauge bucket for the same epoch. Both halves credit the same `gaugeLaunchEpoch` and use the same ve-snapshot (taken at the epoch boundary before either half executed), so a claimant for `gaugeLaunchEpoch` receives `(preLaunchGaugeAccumulator[gaugeLaunchEpoch] + liveGaugeBucket[gaugeLaunchEpoch]) × ve_share` — the partial-epoch split is invisible at claim time.
+- **Claim window for pre-launch epochs.** The 26-epoch claim window for any epoch `< gaugeLaunchEpoch` starts at `gaugeLaunchEpoch`, not at the original epoch. Unclaimed pre-launch USDC sweeps to treasury after `gaugeLaunchEpoch + 26` per the §Epoch mechanics sweep rule.
+- **Empty-snapshot at a pre-launch epoch.** Operators with zero ve at the historical snapshot get zero retroactive claim — this is the intentional shape (gauge rewards long-term ve-commitment, not retroactive attestation). The §3 `sum(working_bytes) == 0` rollover-to-next-epoch rule does **not** apply to pre-launch epochs because the gauge bucket itself was never live during them; un-distributable pre-launch USDC sweeps to treasury via the standard claim-window expiry path, not via §3 rollover.
+
+This pattern is shape-analogous to §3's empty-epoch rollover (gauge bucket parked in `FeeRouter` and claimable later), but the rollover destination differs (treasury sweep on expiry vs next-epoch bucket); readers should not conflate the two.
+
 ### 3. Gauge-boost formula
 
 Adapted from Curve Finance's veCRV gauge boost (in production since 2020). Replaces the LP-deposit primitive with verified-bytes-delivered.
@@ -263,6 +291,14 @@ Router shares and the boost-floor parameter are governable, gated by 48-hour tim
 
 The 20% floor on the node-base share guarantees operators always receive enough liquid USDC to cover at least a meaningful fraction of infrastructure costs even under extreme governance proposals — preserves the cashflow invariant. The `boostFloor` bounds prevent governance from collapsing the gauge pool to a winner-take-all distribution (lower-bound) or flattening it into uselessness (upper-bound).
 
+**Non-numeric one-shot setters.**
+
+| Setter | Effect | Reversibility |
+| --- | --- | --- |
+| `enableGauge()` | Flips `gaugeLaunched = false → true`, records `gaugeLaunchEpoch`, emits `GaugeLaunched`. Activates the live gauge bucket from `gaugeLaunchEpoch` onward; pre-launch escrow becomes claimable from `gaugeLaunchEpoch` against the historical ve-snapshots already taken at each pre-launch epoch boundary (per §2 Pre-receipt-launch gauge accumulation). | One-shot, irreversible. The pre-launch state is launch-only — there is no `disableGauge()`. |
+
+`enableGauge()` is governable per [ADR 009](009-governance.md), inherits the `AccessControl` role-gating from §11 Setter contract-level bound enforcement, and has no numeric bound (binary state).
+
 #### Setter contract-level bound enforcement
 
 Parameter setters on `FeeRouter` and `VotingEscrow` are role-gated via `AccessControl` and bound-checked at the contract level — bounds are enforced regardless of caller. A future automated controller granted the parameter-setter role operates within the same bounds; out-of-range writes revert. This makes the bounds above effective for any caller (governance proposals or additive controllers), without trusting the caller to self-clamp.
@@ -282,7 +318,7 @@ Parameter setters on `FeeRouter` and `VotingEscrow` are role-gated via `AccessCo
 
 ### Negative
 
-- **Significant contract surface.** `FeeRouter` (with two pool types and the delegator-swap path), `VotingEscrow`, `SafetyReserve`, and the optional `DelegatorBuyer` add meaningful audit burden.
+- **Significant contract surface.** `FeeRouter` (with two pool types and the delegator-swap path), `VotingEscrow`, `SafetyReserve`, and the optional `DelegatorBuyer` add meaningful audit burden. The §2 Pre-receipt-launch gauge accumulation adds three storage slots (`gaugeLaunched`, `gaugeLaunchEpoch`, the `preLaunchGaugeAccumulator` mapping), one one-shot governance setter (`enableGauge()`), and one event (`GaugeLaunched`) on top of the existing `FeeRouter` surface — a small but non-zero increment that audit must include.
 - **Per-epoch byte accounting adds gas.** Every settlement increments an operator's byte counter — 5K–15K gas on top of router forwarding. Minor but non-zero; needs validation on the chosen L2 (see [Appendix: L2 Deployment](appendix-l2-deployment.md)).
 - **Commodity operators face thin margins.** Operators who refuse to ve-lock see lower margins than fair-share-ve operators. This is the designed incentive pressure, but the failure mode is under-supply of operators if the filter is too sharp. Externally-funded operator-onboarding programs partially offset.
 - **Governance bootstrap depends on voluntary locking.** Initial veTOKEN supply tracks self-locking decisions; first 6–12 months may need treasury-funded lock incentives.
@@ -295,7 +331,7 @@ Parameter setters on `FeeRouter` and `VotingEscrow` are role-gated via `AccessCo
 - **Equilibrium fragility.** The Curve-style model converges to a stable equilibrium *if* the boost is valuable enough to lock for but not so valuable that a winner-take-all dynamic emerges. The 40% gauge-pool default is sized in the middle by reasoned default; production tuning may be needed.
 - **Reflexive operator-margin layer.** TOKEN price drop → ve-lock value drops → fair-share-ve margins shrink → operators unwind commitment. Pre-seed USDC insulates the *funding* side; the *operator-recruitment* side still depends on TOKEN price for ve-incentive strength. Mitigated, not eliminated.
 - **Delegator-conversion MEV risk.** TWAP + private-RPC routing mitigates front-running, but the swap is observable on-chain post-fact. Flashbots-style bundles and per-epoch liquidity caps are required on this path, not optional. Keeper-cost economics under L2 gas conditions ([Appendix: L2 Deployment](appendix-l2-deployment.md)) need validation.
-- **Wash-trading / self-routed traffic.** An operator could induce noise settlements to inflate gauge-pool share. Mitigations are per-event settlement gas cost (~$0.08), permissionless bonded-challenger observation of self-settlement patterns ([Appendix: Fraud Detection](appendix-fraud-detection.md)), and most importantly **client-signed delivery receipts from distinct identities** tied to funded payment channels — the latter is the strongest invariant in the gauge-pool security model and is forward-referenced as [ADR 027](027-distinct-client-receipts.md). **The protocol can launch with the gauge pool paused, but enabling and paying the gauge pool requires distinct-client receipts to be live** (see [ADR 027 §9 — Implementation sequencing and launch prerequisite](027-distinct-client-receipts.md#9-implementation-sequencing-and-launch-prerequisite)).
+- **Wash-trading / self-routed traffic.** An operator could induce noise settlements to inflate gauge-pool share. Mitigations are per-event settlement gas cost (~$0.08), permissionless bonded-challenger observation of self-settlement patterns ([Appendix: Fraud Detection](appendix-fraud-detection.md)), and most importantly **client-signed delivery receipts from distinct identities** tied to funded payment channels — the latter is the strongest invariant in the gauge-pool security model and is forward-referenced as [ADR 027](027-distinct-client-receipts.md). The launch prerequisite is now contract-pinned in §2 Pre-receipt-launch gauge accumulation: `gaugeLaunched == false` escrows the 40% gauge bucket per epoch, and the one-shot `enableGauge()` setter is the only path to live gauge payouts. This converts the prior soft governance norm — "the gauge pool MUST NOT pay out until distinct-client receipts are live" — into a mechanical state machine, not a discretionary policy. (See also [ADR 027 §9 — Implementation sequencing and launch prerequisite](027-distinct-client-receipts.md#9-implementation-sequencing-and-launch-prerequisite).)
 - **Governance-weight concentration.** Operators who lock heavily for boost also accumulate disproportionate governance weight. [ADR 009](009-governance.md) safety bounds prevent extreme abuse; team / seed / treasury vesting acts as a counterweight during the first ~3 years.
 - **Convex-capture risk.** Third-party liquid-ve wrappers (Convex / Votium / Aura analogs) can concentrate governance power outside the DAO. Mitigation is operational — the DAO may ship a native liquid-ve wrapper as an additive top-level contract (integrating with `VotingEscrow` via the standard lock-creation / increase-amount / snapshot interfaces per §4) without changing the launch contract surface.
 - **20% burn share deterrence.** A higher burn share would weight slashing more toward pure deflation; the chosen 50/30/20 distribution prefers user-harm recourse via `SafetyReserve`. The §11 safety bound on the burn share leaves room for governance recalibration; security review should confirm 20% preserves slashing's deterrent value.

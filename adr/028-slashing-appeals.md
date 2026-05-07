@@ -120,6 +120,9 @@ The bond is the primary economic deterrent against pro-forma appeals filed in ho
 This ADR specifies the future contract surface; implementation lands in a follow-up issue tracking the slashing/appeals contract work. The `SafetyReserve` contract is extended with:
 
 ```solidity
+// `slashId` is allocated and emitted by SlashJudge.Slashed
+// (ADR 014 §3 — globally monotonic, non-zero, single counter across all four offense types).
+// `evidenceBundleHash` MUST equal the `evidenceHash` field of the referenced `Slashed` event.
 function openSlashAppeal(uint256 slashId, bytes32 evidenceBundleHash) external returns (uint256 appealId);
 function fastTrackAppeal(uint256 appealId) external onlyEmergencyMultisig;
 function rejectAppeal(uint256 appealId) external onlyEmergencyMultisig;
@@ -131,7 +134,7 @@ function reverseAppeal(uint256 appealId) external onlyGovernor;
 
 **Multisig capability scope.** `fastTrackAppeal` and `rejectAppeal` are sub-modes of [ADR 009 § Emergency Multisig](009-governance.md#emergency-multisig)'s existing capability (4) "SafetyReserve fast-track authorization" — they consume appeal-specific arguments and emit appeal-specific events but do **not** create a new multisig power. The 3-of-5 threshold, signing semantics, and post-incident reporting obligations are unchanged from [ADR 009](009-governance.md#emergency-multisig). ADR 009's "Capabilities (exhaustive list)" prose should be editorially expanded to enumerate the appeal-specific entry points as sub-modes of capability (4); see [Forward references](#forward-references-follow-up-adrs).
 
-**Dependency on `SlashJudge` slash identifiers.** The `slashId` argument requires `SlashJudge` ([ADR 014 §3](014-on-chain-verification.md#3-slashjudge-contract)) to emit a stable, unique identifier on every slash resolution — including the immediate-execution offenses (phantom, rate, blacklist) that today resolve synchronously without a challenge-resolution event. The companion implementation ADR must extend `SlashJudge` to emit a `Slashed(uint256 indexed slashId, address indexed operator, uint8 offenseType, uint256 amount, ...)` event for every offense type, with monotonic `slashId` allocation across the four offenses. Operators reference this `slashId` directly in `openSlashAppeal`. Without this dependency the appeal flow cannot pin a particular slash event.
+**Dependency on `SlashJudge` slash identifiers.** The `slashId` argument refers to the `Slashed(uint256 indexed slashId, address indexed operator, OffenseType offenseType, uint256 amount, bytes32 evidenceHash)` event canonicalised in [ADR 014 §3 `Slashed` event and `slashId` allocation](014-on-chain-verification.md#slashed-event-and-slashid-allocation). That ADR pins the event for all four offense types — including the immediate-execution offenses (phantom, rate, blacklist) that previously resolved synchronously without a resolution event — and pins `slashId` as a globally monotonic non-zero counter. Operators reference this `slashId` directly in `openSlashAppeal`, with `evidenceBundleHash` matching the event's `evidenceHash` field. Without ADR 014's emission shipping for all four offenses, three of the four appeal categories cannot be filed.
 
 Extending the existing `SafetyReserve` contract — rather than introducing a new `SlashAppealRegistry` — preserves the deployment budget, reuses the payout machinery, and keeps the public payout registry as the single source of truth for who received protocol restitution and why. The trade-off is acknowledged in [Forward references](#forward-references-follow-up-adrs): if `SafetyReserve` is ever split (e.g., separate reserves per incident category), the appeal-authorization functions must migrate alongside the slash-restitution payout category.
 
