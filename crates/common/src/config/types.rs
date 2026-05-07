@@ -213,10 +213,14 @@ pub struct S3OriginConfig {
 ///
 /// Static credential fields use [`SecretString`] so an incidental
 /// `tracing::debug!(?cfg)` or panic backtrace cannot leak the
-/// material — the wrapper redacts itself in `Debug` output and is
-/// not `Serialize`. The codebase already redacts HTTP-origin URL
-/// credentials (see `decdn_cache::redact_for_log`); this is the
-/// same pattern for TOML-borne secrets.
+/// material — the wrapper redacts itself in `Debug` output, and
+/// its `Serialize` impl emits a non-reversible hashed placeholder
+/// rather than the cleartext (the hash is what
+/// `runtime::reload::FileSectionSnapshot` compares for SIGHUP
+/// diff detection; see [`SecretString`] for the full contract).
+/// The codebase already redacts HTTP-origin URL credentials (see
+/// `decdn_cache::redact_for_log`); this is the same pattern for
+/// TOML-borne secrets.
 ///
 /// ```toml
 /// [cache.origin.credentials]

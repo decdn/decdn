@@ -85,12 +85,13 @@ pub struct ResolvedCache {
 /// [`crate::config::types::OriginConfig`] but carries pre-parsed types
 /// for the variants that need them (HTTP base URL, S3 endpoint URL).
 ///
-/// Construction is restricted to the resolution layer
-/// (`crate::config::resolve_origin`) — runtime callers cannot
-/// fabricate a `ResolvedOrigin::S3` from an unvalidated
-/// `S3OriginConfig` because the `S3` variant holds the
-/// [`ResolvedS3Config`] newtype, whose fields are non-public-default
-/// and whose only constructor goes through the validator.
+/// The resolution layer (`crate::config::resolve_origin`) is the
+/// **intended** construction path — it's the only producer the
+/// runtime relies on, and the only path that runs the validators.
+/// The fields on each variant are `pub` for consistency with the
+/// other `Resolved*` types in this crate (see `ResolvedCache`,
+/// `ResolvedBlockchain`, etc.); Rust visibility doesn't *enforce*
+/// the validator-only contract, but the runtime never bypasses it.
 #[derive(Debug, Clone)]
 pub enum ResolvedOrigin {
     /// HTTP(S) origin. The base URL has already been parsed by
@@ -121,13 +122,16 @@ pub enum ResolvedOrigin {
     S3(ResolvedS3Config),
 }
 
-/// Validated runtime form of an S3 origin (#437). Constructing one
-/// goes through `crate::config::resolve_s3_origin` — there is no
-/// `Default`, no public field-by-field constructor, and the
-/// underlying TOML form ([`crate::config::types::S3OriginConfig`])
-/// cannot be passed directly to the runtime. This mirrors the
-/// `OriginUrl` precedent (`decdn_cache::parse_origin_url` is the only
-/// path to `OriginUrl`).
+/// Validated runtime form of an S3 origin (#437). The intended
+/// construction path is `crate::config::resolve_s3_origin`, which
+/// runs the validators and lifts the wire-form
+/// [`crate::config::types::S3OriginConfig`] into this resolved form
+/// with pre-parsed types (notably `endpoint_url: Option<OriginUrl>`).
+/// `Default` is intentionally not derived. The fields are `pub` for
+/// consistency with the other `Resolved*` types in this crate, so
+/// in-crate construction with field-init is technically possible —
+/// the runtime simply doesn't do that. Pattern of intent rather
+/// than visibility-enforced invariant.
 ///
 /// Resolved-vs-wire-form differences:
 /// - `endpoint_url` is `Option<OriginUrl>` (parsed) instead of

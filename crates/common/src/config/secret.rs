@@ -14,13 +14,18 @@
 //!   [`SecretString::expose`] when you need the raw value, so every
 //!   call site is greppable.
 //! - [`serde::Deserialize`] is implemented (so TOML still works).
-//! - [`serde::Serialize`] is implemented but emits a redacted, hashed
-//!   form (`"sha:{hash}"`) — never the cleartext secret. The hash is
-//!   `DefaultHasher` (per-process keyed, not cryptographic). The
-//!   purpose is to preserve SIGHUP reload diff-detection in
+//! - [`serde::Serialize`] is implemented but emits a redacted,
+//!   hashed form (`"sha:{hash}"`) — never the cleartext secret.
+//!   The hash uses [`std::collections::hash_map::DefaultHasher`]
+//!   (SipHash-1-3 with fixed keys, deterministic across processes;
+//!   non-cryptographic, so collisions are theoretically possible
+//!   but vanishingly rare for the credential-rotation use case).
+//!   The purpose is to preserve SIGHUP reload diff-detection in
 //!   `runtime::reload::FileSectionSnapshot`: two snapshots compare
-//!   equal iff the underlying secrets are equal, without the
-//!   serialized form revealing either secret.
+//!   equal iff the underlying secrets hash to the same value,
+//!   without the serialized form revealing either secret. We don't
+//!   need cryptographic strength here — the snapshot is in-process
+//!   memory only, never logged or written to disk.
 
 use std::hash::{Hash, Hasher};
 
@@ -74,12 +79,18 @@ impl Serialize for SecretString {
         // are non-hot-reloadable. If we skipped the credentials
         // field, an operator rotating the secret would see "no
         // change" instead of "cache.* requires restart". So we emit
-        // a deterministic-per-process hash: distinct secrets map to
-        // distinct hashes (preserving diff detection) without the
-        // serialized form revealing the secret. The serialized
-        // value is only ever held in-memory or compared structurally
-        // in `runtime::reload`; it is never logged or written to a
-        // file by anything in this codebase.
+        // a deterministic hash of the secret bytes: distinct secrets
+        // almost always map to distinct hashes (preserving diff
+        // detection) without the serialized form revealing the
+        // secret. `DefaultHasher` is non-cryptographic with fixed
+        // SipHash-1-3 keys (deterministic across processes, but
+        // dictionary-attackable in principle); we don't need
+        // cryptographic strength because the serialized value is
+        // only ever held in-memory or compared structurally in
+        // `runtime::reload` — it is never logged or written to a
+        // file by anything in this codebase. The 2^-64 birthday-
+        // bound collision risk is negligible for credential-
+        // rotation diffing.
         let mut h = std::collections::hash_map::DefaultHasher::new();
         self.0.hash(&mut h);
         // 16 hex chars covers the full u64 hash output.
