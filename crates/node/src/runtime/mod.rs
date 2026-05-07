@@ -28,8 +28,8 @@ use crate::handlers::probe::ProbeHandler;
 use crate::metrics;
 use alloy::signers::local::PrivateKeySigner;
 use decdn_common::config::ResolvedConfig;
-use decdn_common::eth_identity::{self, PasswordSource};
 use decdn_common::identity;
+use decdn_incentive::eth_identity::{self, PasswordSource};
 
 /// Ceiling on how long we wait for spawned tasks to drain after the endpoint
 /// and metrics server have been signalled to stop. Sized comfortably larger
@@ -464,17 +464,15 @@ async fn build_endpoint(secret_key: &SecretKey, bind_port: u16) -> anyhow::Resul
 
 /// Resolve the keystore password from CLI/env/prompt, then decrypt the
 /// keystore JSON via alloy's KDF on a blocking thread. The Arbitrum Sepolia
-/// chain id (`421_614`) is bound on the signer so EIP-712 signers and any
+/// chain id is bound on the signer so EIP-712 signers and any
 /// `eth_sendTransaction` paths inherit a deterministic value. When the
-/// production target moves to mainnet, the chain id should follow
-/// `cfg.blockchain.rpc_url` parsing or be promoted to a config field.
+/// production target moves to mainnet, this should be threaded through
+/// `ResolvedBlockchain` next to `rpc_url` (chain-id-keyed config is already
+/// a seam pattern; see `appendix-poc-production-seams.md` §Seam 8).
 async fn load_eth_signer(cfg: &ResolvedConfig) -> anyhow::Result<PrivateKeySigner> {
     use alloy::signers::Signer;
 
-    const PASSWORD_ENV: &str = "DECDN_KEYSTORE_PASSWORD";
-    const ARBITRUM_SEPOLIA_CHAIN_ID: u64 = 421_614;
-
-    let mut sources = vec![PasswordSource::Env(PASSWORD_ENV)];
+    let mut sources = vec![PasswordSource::Env(eth_identity::KEYSTORE_PASSWORD_ENV)];
     if let Some(path) = cfg.blockchain.keystore_password_file.clone() {
         sources.push(PasswordSource::File(path));
     }
@@ -488,7 +486,7 @@ async fn load_eth_signer(cfg: &ResolvedConfig) -> anyhow::Result<PrivateKeySigne
     let signer = tokio::task::spawn_blocking(move || eth_identity::load_signer(&path, &password))
         .await
         .map_err(|e| anyhow::anyhow!("keystore decrypt task panicked: {e}"))??;
-    Ok(signer.with_chain_id(Some(ARBITRUM_SEPOLIA_CHAIN_ID)))
+    Ok(signer.with_chain_id(Some(eth_identity::ARBITRUM_SEPOLIA_CHAIN_ID)))
 }
 
 /// Adapter: implements `decdn_gossip::GossipMetrics` against the node's

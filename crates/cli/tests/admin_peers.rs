@@ -65,11 +65,13 @@ async fn test_cache() -> anyhow::Result<(CacheEngine, tempfile::TempDir)> {
 }
 
 /// Throwaway `PrivateKeySigner` for `AdminState::new` callers that don't
-/// exercise signing logic. Pinned to Arbitrum Sepolia (decdn's `PoC` chain id).
+/// exercise signing logic. Chain id sourced from the canonical const so it
+/// stays in lock-step with the runtime loader.
 fn throwaway_signer() -> Arc<alloy::signers::local::PrivateKeySigner> {
     use alloy::signers::Signer;
     use alloy::signers::local::PrivateKeySigner;
-    Arc::new(PrivateKeySigner::random().with_chain_id(Some(421_614)))
+    use decdn_incentive::eth_identity::ARBITRUM_SEPOLIA_CHAIN_ID;
+    Arc::new(PrivateKeySigner::random().with_chain_id(Some(ARBITRUM_SEPOLIA_CHAIN_ID)))
 }
 
 /// Spawn an admin server with the given state, returning its URL and a

@@ -17,7 +17,6 @@ toml = { workspace = true }
 anyhow = { workspace = true }
 dirs = { workspace = true }
 rand = { workspace = true }
-rpassword = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }

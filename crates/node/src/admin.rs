@@ -473,12 +473,13 @@ mod tests {
 
     /// Throwaway `PrivateKeySigner` for tests that need an `AdminState` but
     /// don't exercise any signing logic. The chain id is pinned to Arbitrum
-    /// Sepolia (decdn's `PoC` testnet target) to keep parity with the real
-    /// runtime — tests that *do* exercise signing should construct their
-    /// own signer with the chain id under test.
+    /// Sepolia to keep parity with the real runtime — tests that *do*
+    /// exercise signing should construct their own signer with the chain id
+    /// under test.
     fn throwaway_signer() -> Arc<PrivateKeySigner> {
         use alloy::signers::Signer;
-        Arc::new(PrivateKeySigner::random().with_chain_id(Some(421_614)))
+        use decdn_incentive::eth_identity::ARBITRUM_SEPOLIA_CHAIN_ID;
+        Arc::new(PrivateKeySigner::random().with_chain_id(Some(ARBITRUM_SEPOLIA_CHAIN_ID)))
     }
 
     async fn state_with(peers: Vec<([u8; 32], &str, u64, u64)>) -> (AdminState, tempfile::TempDir) {

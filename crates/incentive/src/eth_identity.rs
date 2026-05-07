@@ -1,11 +1,18 @@
 //! Ethereum keystore: generate, persist, and load a Web3 Secret Storage v3
 //! file into a live `alloy::signers::local::PrivateKeySigner`.
 //!
-//! Companion to [`crate::identity`]. Same security model — the keystore file
-//! is encrypted at rest, but we still enforce `0o600` on the file and `0o700`
+//! Lives in `decdn-incentive` (per `appendix-poc-production-seams.md`
+//! §Seam 1) because the keystore surface is shared between nodes (slash
+//! signing, on-chain settlement) and clients (voucher signing per ADR 003
+//! §EIP-712 Voucher Signature). The eventual `KeyStore` trait covering
+//! `load_node_key` + `load_eth_key` + `sign_voucher` lands with #319 — for
+//! now the surface is free functions.
+//!
+//! Same security model as [`decdn_common::identity`] — the keystore file is
+//! encrypted at rest, but we still enforce `0o600` on the file and `0o700`
 //! on `data_dir` (defense-in-depth: a leaked ciphertext lowers the bar to an
-//! offline KDF attack, so we reuse [`crate::identity`]'s `validate_data_dir`
-//! and `create_data_dir_secure` helpers for permission parity).
+//! offline KDF attack, so we delegate `data_dir` setup to
+//! [`decdn_common::identity::ensure_data_dir`] for permission parity).
 //!
 //! Atomic write: encrypted into a temp filename via alloy's
 //! `LocalSigner::encrypt_keystore`, then chmodded `0o600` and renamed into
@@ -24,10 +31,24 @@ use alloy::signers::local::{LocalSigner, PrivateKeySigner};
 use anyhow::{Context, anyhow};
 use rand::Rng;
 
+/// Process environment variable that supplies the keystore password when
+/// `--password-file` is unset and stdin isn't a TTY. Single source of truth
+/// for both the `decdn key-gen` CLI command and the `decdn run` runtime
+/// loader.
+pub const KEYSTORE_PASSWORD_ENV: &str = "DECDN_KEYSTORE_PASSWORD";
+
+/// Arbitrum Sepolia chain id — decdn's `PoC` testnet target. Bound on every
+/// `PrivateKeySigner` used in the runtime (and the test helpers) so EIP-712
+/// signing and any `eth_sendTransaction` paths inherit a deterministic value.
+/// When the production target moves to mainnet, this should be threaded
+/// through `ResolvedBlockchain` next to `rpc_url` (chain-id-keyed config is
+/// already a seam pattern; see `appendix-poc-production-seams.md` §Seam 8).
+pub const ARBITRUM_SEPOLIA_CHAIN_ID: u64 = 421_614;
+
 const KEYSTORE_FILE_NAME: &str = "keystore.json";
 /// Forbid any group/world bit on the keystore file. Encrypted at rest, but a
 /// readable ciphertext + a leaked or weak password is enough for offline
-/// dictionary attacks. Mirrors [`crate::identity`]'s `0o077` mask.
+/// dictionary attacks. Mirrors [`decdn_common::identity`]'s `0o077` mask.
 #[cfg(unix)]
 const FORBIDDEN_BITS: u32 = 0o077;
 #[cfg(unix)]
@@ -72,21 +93,10 @@ pub fn generate_and_persist(
 ) -> anyhow::Result<Address> {
     let target = keystore_path(data_dir);
 
-    // Same data_dir existence/permissions semantics as
-    // `identity::load_or_generate`: validate if present, create securely if
-    // not. Sharing the helpers (rather than re-implementing them) keeps the
-    // node.secret and keystore.json paths in lock-step.
-    match fs::symlink_metadata(data_dir) {
-        Ok(_) => crate::identity::validate_data_dir(data_dir)?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            crate::identity::create_data_dir_secure(data_dir)?;
-            crate::identity::validate_data_dir(data_dir)?;
-        }
-        Err(e) => {
-            return Err(anyhow::Error::new(e)
-                .context(format!("failed to stat data_dir {}", data_dir.display())));
-        }
-    }
+    // Validate (or create+validate) `data_dir` with the same semantics as
+    // `identity::load_or_generate`: shared via the public helper so the
+    // node.secret and keystore.json paths stay in lock-step.
+    decdn_common::identity::ensure_data_dir(data_dir)?;
 
     if target.exists() {
         if !force {
@@ -564,11 +574,17 @@ mod tests {
         assert!(format!("{err:#}").contains("empty"), "got: {err:#}");
     }
 
+    // Canonical EIP-712 schema from ADR 003 §EIP-712 NodeId-to-Ethereum
+    // Binding (`BindNodeId(bytes32 nodeId,uint64 nonce)`). Inlined rather
+    // than imported from another module: this test asserts the schema we
+    // build against the keystore-loaded signer matches the ADR exactly,
+    // so any drift here surfaces independently of the on-chain contract
+    // wiring (#327).
     sol! {
         #[allow(missing_docs)]
-        struct TinyVoucher {
-            uint256 nonce;
-            uint256 amount;
+        struct BindNodeId {
+            bytes32 nodeId;
+            uint64 nonce;
         }
     }
 
@@ -576,24 +592,21 @@ mod tests {
     fn eip712_loopback_sign_and_recover() {
         let tmp = make_data_dir();
         let written = generate_and_persist(tmp.path(), TEST_PASSWORD, false).unwrap();
-        // Pin to Arbitrum Sepolia chain id (decdn's PoC target). Pure
-        // smoke test: the chain id only matters for the EIP-712 domain
-        // separator, which the recover must use the same.
         let signer = load_signer(&keystore_path(tmp.path()), TEST_PASSWORD)
             .unwrap()
-            .with_chain_id(Some(421_614));
+            .with_chain_id(Some(ARBITRUM_SEPOLIA_CHAIN_ID));
 
         let domain = eip712_domain! {
             name: "decdn-test",
             version: "1",
-            chain_id: 421_614,
+            chain_id: ARBITRUM_SEPOLIA_CHAIN_ID,
             verifying_contract: Address::ZERO,
         };
-        let voucher = TinyVoucher {
-            nonce: alloy::primitives::U256::from(1u64),
-            amount: alloy::primitives::U256::from(123_456u64),
+        let binding = BindNodeId {
+            nodeId: B256::from([0xaau8; 32]),
+            nonce: 1,
         };
-        let signing_hash: B256 = voucher.eip712_signing_hash(&domain);
+        let signing_hash: B256 = binding.eip712_signing_hash(&domain);
 
         let sig = signer.sign_hash_sync(&signing_hash).unwrap();
         let recovered = sig.recover_address_from_prehash(&signing_hash).unwrap();
@@ -602,13 +615,23 @@ mod tests {
             recovered, written,
             "recovered EIP-712 signer must match the keystore-derived address"
         );
+    }
 
-        // A trivial keccak check to ensure we linked the EIP-712 helpers
-        // correctly (not strictly necessary for the round-trip, but
-        // catches a class of "wrong domain hashed" bugs cheaply).
-        assert_ne!(
-            keccak256(TinyVoucher::eip712_root_type().as_bytes()),
-            B256::ZERO
+    /// Lock the EIP-712 type hash to ADR 003's canonical wording. If this
+    /// breaks, either the ADR changed or the `sol!` macro's canonical
+    /// encoding shifted — both warrant a coordinated update with the
+    /// Solidity contract. Mirrors the equivalent test in
+    /// `voucher::voucher_type_hash_matches_adr_003`.
+    #[test]
+    fn bind_node_id_type_hash_matches_adr_003() {
+        // Single space between Solidity type and field name; no other
+        // whitespace; fields in declaration order. Per ADR 003 §606.
+        let canonical: &[u8] = b"BindNodeId(bytes32 nodeId,uint64 nonce)";
+        let expected = keccak256(canonical);
+        let actual = keccak256(BindNodeId::eip712_root_type().as_bytes());
+        assert_eq!(
+            actual, expected,
+            "BindNodeId type hash drifted from ADR 003 §EIP-712 NodeId-to-Ethereum Binding"
         );
     }
 }

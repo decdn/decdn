@@ -1,9 +1,8 @@
 //! `decdn key-gen` — write or refresh the persistent Ed25519 node key and
 //! the Ethereum keystore.
 
-use decdn_common::{cli, eth_identity, identity};
-
-const KEYSTORE_PASSWORD_ENV: &str = "DECDN_KEYSTORE_PASSWORD";
+use decdn_common::{cli, identity};
+use decdn_incentive::eth_identity;
 
 /// Generate (or reuse) the persistent Ed25519 node key, and a fresh
 /// Ethereum keystore alongside it.
@@ -42,7 +41,9 @@ pub fn key_gen(args: &cli::KeyGenArgs) -> anyhow::Result<()> {
     // dynamically so `--password-file` only appears when the operator
     // passed one (an absent `--password-file` should fall through to the
     // env var or the prompt, not error on a missing file).
-    let mut sources = vec![eth_identity::PasswordSource::Env(KEYSTORE_PASSWORD_ENV)];
+    let mut sources = vec![eth_identity::PasswordSource::Env(
+        eth_identity::KEYSTORE_PASSWORD_ENV,
+    )];
     if let Some(path) = args.password_file.as_deref() {
         sources.push(eth_identity::PasswordSource::File(path.to_path_buf()));
     }

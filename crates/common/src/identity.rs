@@ -101,6 +101,27 @@ pub fn load_or_generate(data_dir: &Path) -> anyhow::Result<SecretKey> {
     Ok(key)
 }
 
+/// Validate (or create+validate) `data_dir` with `0o700` semantics: if it
+/// exists, the permission policy is enforced; if it's `NotFound`, it's
+/// created securely and then validated. Other stat errors propagate.
+///
+/// Public surface so `decdn_incentive::eth_identity::generate_and_persist`
+/// (the eth keystore writer, #406) can share the same `data_dir` hardening
+/// path as `node.secret`. The lower-level `validate_data_dir` /
+/// `create_data_dir_secure` helpers stay `pub(crate)` — callers outside
+/// this crate should reach for `ensure_data_dir` instead.
+pub fn ensure_data_dir(data_dir: &Path) -> anyhow::Result<()> {
+    match fs::symlink_metadata(data_dir) {
+        Ok(_) => validate_data_dir(data_dir),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            create_data_dir_secure(data_dir)?;
+            validate_data_dir(data_dir)
+        }
+        Err(e) => Err(anyhow::Error::new(e)
+            .context(format!("failed to stat data_dir {}", data_dir.display()))),
+    }
+}
+
 /// Reject `data_dir` if it isn't a directory or if any group/other permission
 /// bit is set.
 ///
