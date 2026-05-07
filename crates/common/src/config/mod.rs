@@ -486,13 +486,13 @@ fn resolve_origin(cfg: &types::OriginConfig) -> anyhow::Result<crate::config::Re
 
 /// Validate, normalize, and lift an `S3OriginConfig` into the runtime
 /// form `ResolvedS3Config` (#437). This is the **intended** path
-/// from a TOML wire form to a resolved-and-validated runtime form,
+/// from the TOML wire form to a resolved-and-validated runtime form,
 /// and the only producer the rest of the resolution layer
 /// (`resolve_origin`, `resolve_cache`, `resolve_config`) feeds into
 /// the runtime. `ResolvedS3Config` itself has `pub` fields (matching
-/// the `Resolved*` shape used throughout this crate) so the
-/// "validator-only constructor" contract is a code-convention rather
-/// than a visibility-enforced invariant — see the type doc on
+/// the `Resolved*` shape used throughout this crate) — Rust
+/// visibility doesn't *enforce* the validator-only contract, but the
+/// runtime never bypasses it. See the type doc on
 /// [`ResolvedS3Config`].
 ///
 /// Normalization performed here:
