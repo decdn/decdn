@@ -179,10 +179,11 @@ pub enum DecompressMode {
 }
 
 /// Default `User-Agent` header set on every origin request unless overridden
-/// via [`HttpOrigin::with_user_agent`]. Embeds the workspace version so
-/// origin operators can attribute CDN pull-through traffic in their access
-/// logs and apply origin-side rate limits or routing rules separately from
-/// anonymous client traffic (#435).
+/// via [`HttpOrigin::new_with_user_agent`]. Embeds the `decdn-cache` crate's
+/// package version (`CARGO_PKG_VERSION`), which is co-versioned with the
+/// `decdn-node` binary in this workspace, so origin operators can attribute
+/// CDN pull-through traffic in their access logs and apply origin-side rate
+/// limits or routing rules separately from anonymous client traffic (#435).
 pub const DEFAULT_USER_AGENT: &str = concat!("decdn-node/", env!("CARGO_PKG_VERSION"));
 
 /// Origin backed by a plain HTTP(S) endpoint serving content-addressed blobs
@@ -209,7 +210,7 @@ impl HttpOrigin {
     ///
     /// Sets [`DEFAULT_USER_AGENT`] on the inner reqwest client so origin
     /// access logs can attribute CDN pull-through traffic (#435). Override
-    /// via [`Self::with_user_agent`].
+    /// via [`Self::new_with_user_agent`].
     pub fn new(base_url: OriginUrl) -> anyhow::Result<Self> {
         Self::new_with_user_agent(base_url, DEFAULT_USER_AGENT)
     }

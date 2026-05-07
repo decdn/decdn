@@ -1916,7 +1916,7 @@ async fn fs_origin_retries_on_transient_io_kind_then_succeeds() -> anyhow::Resul
     }
     impl Origin for InterruptOnceOrigin {
         fn kind(&self) -> OriginKind {
-            OriginKind::Http
+            self.inner.kind()
         }
 
         fn fetch(

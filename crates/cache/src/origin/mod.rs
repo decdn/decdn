@@ -21,8 +21,8 @@ pub use s3::{S3Credentials, S3Origin, S3OriginConfig};
 
 use crate::error::OriginPullError;
 
-/// Tag identifying which [`crate::CacheEngine`] origin backend is
-/// configured (#439). Surfaced through
+/// Tag identifying which [`Origin`] backend a [`crate::CacheEngine`] is
+/// configured against (#439). Surfaced through
 /// [`crate::EvictionPreview::origin_kind`] so admin dry-run callers can
 /// estimate origin egress cost — re-fetching from a `Filesystem` origin
 /// is a local read; `Http` and `S3` may consume metered bandwidth.
