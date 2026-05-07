@@ -1811,6 +1811,119 @@ mod tests {
         Ok(())
     }
 
+    // Sibling of `expand_env_substitutes_cache_origin_url` — the FS
+    // origin path is a path-shaped field and must get the same
+    // `${VAR}` treatment so an operator can write
+    // `path = "${HOME}/cache-origin"` in their TOML and have it
+    // resolve correctly.
+    #[test]
+    fn expand_env_substitutes_cache_origin_fs_path() -> anyhow::Result<()> {
+        let home = home_str()?;
+        let mut cfg = FileConfig {
+            cache: Some(types::CacheConfig {
+                origin: Some(types::OriginConfig::Fs {
+                    path: PathBuf::from("${HOME}/cache-origin"),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        expand_env(&mut cfg)?;
+        let path = match cfg.cache.as_ref().and_then(|c| c.origin.as_ref()) {
+            Some(types::OriginConfig::Fs { path }) => path.clone(),
+            other => anyhow::bail!("expected Fs origin, got: {other:?}"),
+        };
+        let expected = PathBuf::from(format!("{home}/cache-origin"));
+        anyhow::ensure!(path == expected, "got: {}", path.display());
+        Ok(())
+    }
+
+    // The FS arm of `resolve_origin` calls `expand_tilde` so a TOML
+    // like `path = "~/origin"` resolves to `<home>/origin`. The
+    // expansion happens inside resolution (not in `expand_env`),
+    // because `~` is filesystem-shaped and the `expand_env`
+    // contract only handles `${VAR}` substitution.
+    #[test]
+    fn resolve_cache_origin_fs_expands_tilde_in_path() -> anyhow::Result<()> {
+        let home_dir = TempDir::new()?;
+        let home = home_dir.path().to_path_buf();
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig {
+            origin: Some(types::OriginConfig::Fs {
+                path: PathBuf::from("~/origin"),
+            }),
+            ..Default::default()
+        };
+        let resolved = common::test_support::with_home_override(Some(&home), || {
+            resolve_cache(&cli, Some(&toml), Path::new("/data-dir"))
+        })?;
+        match resolved.origin {
+            Some(ResolvedOrigin::Fs { path }) => {
+                anyhow::ensure!(
+                    path == home.join("origin"),
+                    "tilde should have expanded; got: {}",
+                    path.display()
+                );
+            }
+            other => anyhow::bail!("expected Fs origin, got: {other:?}"),
+        }
+        Ok(())
+    }
+
+    // resolve_cache must reject an HTTP origin variant whose `url`
+    // is the empty string. The error is raised by the explicit
+    // `anyhow::ensure!(!url.is_empty(), ...)` in `resolve_origin`,
+    // separate from `parse_origin_url`'s scheme/format checks. The
+    // existing `resolve_cache_rejects_non_http_origin_url` test
+    // covers the parser path; this one covers the
+    // empty-string-fails-fast path so a future refactor (e.g.
+    // pushing the empty check inside the parser) can't silently
+    // drop the contract.
+    #[test]
+    fn resolve_cache_rejects_empty_http_origin_url() -> anyhow::Result<()> {
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig {
+            origin: Some(types::OriginConfig::Http {
+                url: String::new(),
+                decompress: None,
+            }),
+            ..Default::default()
+        };
+        let err = resolve_cache(&cli, Some(&toml), Path::new("/tmp"))
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected empty-url rejection"))?;
+        let msg = format!("{err:#}");
+        anyhow::ensure!(
+            msg.contains("cache.origin.url") && msg.contains("must not be empty"),
+            "error lacked context: {msg}"
+        );
+        Ok(())
+    }
+
+    // Sibling of the empty-URL test for the FS variant. The
+    // emptiness check runs *after* tilde expansion (the operator
+    // wrote `path = ""`), so an empty PathBuf reaches the
+    // `as_os_str().is_empty()` guard.
+    #[test]
+    fn resolve_cache_rejects_empty_fs_origin_path() -> anyhow::Result<()> {
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig {
+            origin: Some(types::OriginConfig::Fs {
+                path: PathBuf::new(),
+            }),
+            ..Default::default()
+        };
+        let err = resolve_cache(&cli, Some(&toml), Path::new("/tmp"))
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected empty-path rejection"))?;
+        let msg = format!("{err:#}");
+        anyhow::ensure!(
+            msg.contains("cache.origin.path") && msg.contains("must not be empty"),
+            "error lacked context: {msg}"
+        );
+        Ok(())
+    }
+
     // resolve_cache must reject a non-http(s) URL at config resolution
     // instead of deferring the check to engine wiring. This locks in the
     // "single parser" invariant introduced by `parse_origin_url`.
@@ -2482,6 +2595,196 @@ mod tests {
             msg.contains("unknown field") && msg.contains("paht"),
             "got: {msg}"
         );
+        Ok(())
+    }
+
+    /// Helper: assert that a TOML deserialization fails with a
+    /// message containing every required fragment. Used by the
+    /// missing-required-field and unknown-tag-value tests.
+    fn assert_origin_toml_rejects(toml: &str, fragments: &[&str]) -> anyhow::Result<()> {
+        let err = toml::from_str::<types::OriginConfig>(toml)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected rejection for: {toml}"))?;
+        let msg = format!("{err}");
+        for fragment in fragments {
+            anyhow::ensure!(
+                msg.contains(fragment),
+                "error did not contain `{fragment}`: {msg}"
+            );
+        }
+        Ok(())
+    }
+
+    // serde-tagged-enum invariant: the `kind` field is required and
+    // names which variant is being deserialized. Without it,
+    // serde can't disambiguate. Operators who copy-paste the inner
+    // table without the `kind = "..."` line need a clear error.
+    #[test]
+    fn origin_rejects_missing_kind_tag() -> anyhow::Result<()> {
+        assert_origin_toml_rejects(
+            r#"url = "https://origin.example/""#,
+            &["missing field", "kind"],
+        )
+    }
+
+    // An unknown `kind` value (e.g. operator typo `httpx` or a
+    // forward-looking `gcs` someone speculatively wrote) must
+    // surface a clear error instead of being silently dropped.
+    #[test]
+    fn origin_rejects_unknown_kind_value() -> anyhow::Result<()> {
+        assert_origin_toml_rejects(
+            r#"
+                kind = "httpx"
+                url = "https://origin.example/"
+            "#,
+            &["unknown variant", "httpx"],
+        )
+    }
+
+    // HTTP variant requires a `url` field. serde reports a
+    // missing-field error for the inner struct payload of the
+    // tagged enum.
+    #[test]
+    fn http_origin_rejects_missing_url_field() -> anyhow::Result<()> {
+        assert_origin_toml_rejects(
+            r#"
+                kind = "http"
+                decompress = "auto"
+            "#,
+            &["missing field", "url"],
+        )
+    }
+
+    // FS variant requires a `path` field.
+    #[test]
+    fn fs_origin_rejects_missing_path_field() -> anyhow::Result<()> {
+        assert_origin_toml_rejects(r#"kind = "fs""#, &["missing field", "path"])
+    }
+
+    // S3 variant requires `bucket` and `region`. Two siblings —
+    // missing each in turn — so future tag-renames or shape changes
+    // can't silently drop either requirement.
+    #[test]
+    fn s3_origin_rejects_missing_bucket_field() -> anyhow::Result<()> {
+        assert_origin_toml_rejects(
+            r#"
+                kind = "s3"
+                region = "us-east-1"
+            "#,
+            &["missing field", "bucket"],
+        )
+    }
+
+    #[test]
+    fn s3_origin_rejects_missing_region_field() -> anyhow::Result<()> {
+        assert_origin_toml_rejects(
+            r#"
+                kind = "s3"
+                bucket = "decdn-blobs"
+            "#,
+            &["missing field", "region"],
+        )
+    }
+
+    // ----- #437: S3 credentials end-to-end resolution -----
+
+    // Static credentials round-trip through `resolve_cache` into
+    // `ResolvedS3Credentials::Static` with the secret values
+    // preserved (as `SecretString`s, exposing only via `expose()`).
+    // Also exercises the validator path that converts wire-form
+    // `S3Credentials::Static` into resolved form.
+    #[test]
+    fn resolve_cache_origin_s3_static_credentials_round_trip() -> anyhow::Result<()> {
+        let cli = cache_cli(None, None);
+        let file = cache_with_s3(types::S3OriginConfig {
+            bucket: "decdn-blobs".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint_url: None,
+            path_style: None,
+            prefix: None,
+            credentials: Some(types::S3Credentials::Static {
+                access_key_id: secret::SecretString::new("AKIA-test-id"),
+                secret_access_key: secret::SecretString::new("test-secret-value"),
+                session_token: Some(secret::SecretString::new("STS-token")),
+            }),
+        });
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        let creds = match resolved.origin {
+            Some(ResolvedOrigin::S3(s3)) => s3
+                .credentials
+                .ok_or_else(|| anyhow::anyhow!("credentials missing"))?,
+            other => anyhow::bail!("expected S3 origin, got: {other:?}"),
+        };
+        match creds {
+            crate::config::ResolvedS3Credentials::Static {
+                access_key_id,
+                secret_access_key,
+                session_token,
+            } => {
+                anyhow::ensure!(access_key_id.expose() == "AKIA-test-id");
+                anyhow::ensure!(secret_access_key.expose() == "test-secret-value");
+                anyhow::ensure!(
+                    session_token.as_ref().map(secret::SecretString::expose) == Some("STS-token")
+                );
+            }
+            crate::config::ResolvedS3Credentials::DefaultChain { .. } => {
+                anyhow::bail!("expected Static credentials, got DefaultChain")
+            }
+        }
+        Ok(())
+    }
+
+    // DefaultChain with no profile — the most common shape for AWS
+    // operators using IAM roles or AWS_PROFILE. Resolves to
+    // `ResolvedS3Credentials::DefaultChain { profile: None }`.
+    #[test]
+    fn resolve_cache_origin_s3_default_chain_no_profile() -> anyhow::Result<()> {
+        let cli = cache_cli(None, None);
+        let file = cache_with_s3(types::S3OriginConfig {
+            bucket: "decdn-blobs".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint_url: None,
+            path_style: None,
+            prefix: None,
+            credentials: Some(types::S3Credentials::DefaultChain { profile: None }),
+        });
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        let creds = match resolved.origin {
+            Some(ResolvedOrigin::S3(s3)) => s3
+                .credentials
+                .ok_or_else(|| anyhow::anyhow!("credentials missing"))?,
+            other => anyhow::bail!("expected S3 origin, got: {other:?}"),
+        };
+        match creds {
+            crate::config::ResolvedS3Credentials::DefaultChain { profile } => {
+                anyhow::ensure!(profile.is_none(), "profile should be None");
+            }
+            crate::config::ResolvedS3Credentials::Static { .. } => {
+                anyhow::bail!("expected DefaultChain, got Static")
+            }
+        }
+        Ok(())
+    }
+
+    // Absent `[cache.origin.credentials]` => resolved credentials
+    // are `None` (the runtime then falls back to the AWS default
+    // credential chain). Pin this default so a future refactor of
+    // `resolve_s3_origin` can't accidentally synthesize a
+    // `DefaultChain` placeholder where one wasn't requested.
+    #[test]
+    fn resolve_cache_origin_s3_no_credentials_resolves_to_none() -> anyhow::Result<()> {
+        let cli = cache_cli(None, None);
+        let file = cache_with_s3(s3_cfg("decdn-blobs"));
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        match resolved.origin {
+            Some(ResolvedOrigin::S3(s3)) => {
+                anyhow::ensure!(
+                    s3.credentials.is_none(),
+                    "absent credentials must resolve to None, not synthesized DefaultChain"
+                );
+            }
+            other => anyhow::bail!("expected S3 origin, got: {other:?}"),
+        }
         Ok(())
     }
 
