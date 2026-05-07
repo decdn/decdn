@@ -27,6 +27,12 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 jsonrpsee = { workspace = true }
 rand = { workspace = true }
+# `decdn bundle create` (issue #391): directory walk + glob exclude +
+# streaming BLAKE3. Using `blake3` directly keeps iroh-blobs out of the
+# publisher CLI's dep tree (see `appendix-binaries.md` § binary-size).
+walkdir = { workspace = true }
+globset = { workspace = true }
+blake3 = { workspace = true }
 
 [dev-dependencies]
 # Integration tests in `tests/admin_peers.rs` exercise the loopback admin
