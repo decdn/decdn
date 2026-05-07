@@ -1,7 +1,7 @@
-# ADR 029: Peer-Table Eviction Policy
+# Appendix: Peer-Table Eviction Policy
 
-**Date:** 2026-05-06
-**Status:** Draft
+> **This is an appendix, not a core protocol ADR.** Peer-table eviction is a local implementation choice — two nodes running different TTLs or admission policies still interoperate so long as they satisfy the gossip-validation rules in [ADR 001 § Gossip validation](001-network.md#gossip-validation). This appendix codifies the recommended TTL-based approach (default 600 s on `last_seen_us`), the `NodeDeregistered` / `NodeAutoEjected`-driven active-eviction step, the optional `gossip.max_peer_entries` safety ceiling, and the observability metrics. Alternative implementations are acceptable.
+
 **Touches:** [ADR 001](001-network.md), [ADR 008](008-reputation.md), [ADR 011](011-content-takedown.md), [ADR 019](019-node-onboarding.md)
 
 ## Context
@@ -17,7 +17,7 @@ The current implementation in `crates/gossip/src/peer_table.rs` already evicts b
 
 ## Decision
 
-The peer table is **TTL-bounded by `last_seen_us`**, with **active eviction** on registry deregistration / origin blacklisting and **no hard size cap by default**. Reputation does not factor into eviction. The five gossip-validation rules in [ADR 001 § Gossip validation](001-network.md#gossip-validation) are unchanged; this ADR specifies what happens to entries *after* a successful insert.
+The peer table is **TTL-bounded by `last_seen_us`**, with **active eviction** on registry deregistration / origin blacklisting and **no hard size cap by default**. Reputation does not factor into eviction. The five gossip-validation rules in [ADR 001 § Gossip validation](001-network.md#gossip-validation) are unchanged; this appendix specifies what happens to entries *after* a successful insert.
 
 ### 1. Lifecycle and TTL
 
@@ -56,7 +56,7 @@ Implementing `gossip.max_peer_entries` is OPTIONAL for the PoC (`peer_table_size
 
 ### 3. Registry-cache interaction (active eviction)
 
-The local registry cache, when implemented per [ADR 001 § Registry cache](001-network.md#registry-cache) and [ADR 019 § Step 3.3](019-node-onboarding.md#step-33--build-initial-peer-table-from-on-chain-registry), subscribes to `NodeRegistered`, `NodeDeregistered`, and `NodeAutoEjected` events. On `NodeDeregistered` and `NodeAutoEjected` for a `node_id`, the subscriber MUST also **remove the matching peer-table entry** in the same handler, in addition to its registry-cache update. Origin blacklisting ([ADR 011 § Hash Evasion and Origin Blacklisting](011-content-takedown.md#hash-evasion-and-origin-blacklisting)) routes through `StakingRegistry.ejectNode` and emits `NodeAutoEjected`, so the same code path covers it. The subscriber does not yet exist in the codebase as of this ADR; this clause specifies one additional behavior on top of the subscriber introduced by ADR 019.
+The local registry cache, when implemented per [ADR 001 § Registry cache](001-network.md#registry-cache) and [ADR 019 § Step 3.3](019-node-onboarding.md#step-33--build-initial-peer-table-from-on-chain-registry), subscribes to `NodeRegistered`, `NodeDeregistered`, and `NodeAutoEjected` events. On `NodeDeregistered` and `NodeAutoEjected` for a `node_id`, the subscriber MUST also **remove the matching peer-table entry** in the same handler, in addition to its registry-cache update. Origin blacklisting ([ADR 011 § Hash Evasion and Origin Blacklisting](011-content-takedown.md#hash-evasion-and-origin-blacklisting)) routes through `StakingRegistry.ejectNode` and emits `NodeAutoEjected`, so the same code path covers it. The subscriber does not yet exist in the codebase; this clause specifies one additional behavior on top of the subscriber introduced by ADR 019.
 
 **Rationale.**
 
@@ -93,7 +93,7 @@ This ADR therefore explicitly excludes reputation from the eviction decision. Re
 
 ### 6. Observability
 
-Naming follows [appendix-observability.md § 2.6 Gossip Metrics](appendix-observability.md). The existing `decdn_peer_table_size` gauge and `decdn_gossip_messages_rejected_total` counter cover most of the surface; this ADR adds two eviction counters and one new label value:
+Naming follows [appendix-observability.md § 2.6 Gossip Metrics](appendix-observability.md). The existing `decdn_peer_table_size` gauge and `decdn_gossip_messages_rejected_total` counter cover most of the surface; this appendix adds two eviction counters and one new label value:
 
 | Metric | Type | Description |
 |---|---|---|
@@ -110,8 +110,8 @@ A sustained non-zero `decdn_gossip_messages_rejected_total{reason="table_full"}`
 
 - Memory bound is determined by external policy (the staking registry) without per-table bookkeeping. At realistic protocol scales (≤ 10 k nodes) the table is < 5 MB.
 - Active eviction on deregistration / blacklisting keeps admin output and gossip-derived analytics accurate within one event-handler turn instead of within ~10 minutes.
-- Discovery and selection stay separable. Reputation, blacklist, and registry inputs each have a single clear role; this ADR adds no new coupling.
-- The implementation already matches §1 — no code change is required to ship this ADR's TTL behavior. §3 adds a single map-removal step inside the registry-cache subscriber introduced by [ADR 019 § Step 3.3](019-node-onboarding.md#step-33--build-initial-peer-table-from-on-chain-registry) (subscriber not yet implemented). §6 adds two counters and one label value. §2's `max_peer_entries` is opt-in.
+- Discovery and selection stay separable. Reputation, blacklist, and registry inputs each have a single clear role; this appendix adds no new coupling.
+- The implementation already matches §1 — no code change is required to ship this appendix's TTL behavior. §3 adds a single map-removal step inside the registry-cache subscriber introduced by [ADR 019 § Step 3.3](019-node-onboarding.md#step-33--build-initial-peer-table-from-on-chain-registry) (subscriber not yet implemented). §6 adds two counters and one label value. §2's `max_peer_entries` is opt-in.
 
 **Negative.**
 
