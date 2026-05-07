@@ -922,14 +922,21 @@ mod tests {
     /// dummies — only the cache is exercised. Mirrors the fixture
     /// shape used in `runtime::reload::tests` and
     /// `crates/node/tests/sighup_signal.rs`.
-    fn cfg_with_origin(origin: Option<ResolvedOrigin>) -> ResolvedConfig {
+    ///
+    /// Returns the owning `TempDir` alongside the config so the
+    /// caller binds it (`let (_tmp, cfg) = ...`) and the directory
+    /// lives until end-of-test. A pid-keyed directory is not safe
+    /// here: tests in a binary that uses `cargo test` (rather than
+    /// `cargo nextest`) share the process and would race on shared
+    /// `cache_dir` state inside `CacheEngine::open_full`.
+    fn cfg_with_origin(origin: Option<ResolvedOrigin>) -> (tempfile::TempDir, ResolvedConfig) {
         use decdn_common::config::{
             ResolvedBlockchain, ResolvedGossip, ResolvedIdentity, ResolvedNetwork,
             ResolvedObservability, ResolvedPayment, ResolvedSecurity,
         };
-        let cache_dir =
-            std::env::temp_dir().join(format!("decdn-build-cache-test-{}", std::process::id()));
-        ResolvedConfig {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cache_dir = tmp.path().to_path_buf();
+        let cfg = ResolvedConfig {
             identity: ResolvedIdentity {
                 data_dir: cache_dir.clone(),
                 region: None,
@@ -975,7 +982,8 @@ mod tests {
                 per_source_burst: 200,
                 max_tracked_sources: 4096,
             },
-        }
+        };
+        (tmp, cfg)
     }
 
     /// PR2 (#437): `build_cache` must construct the S3 backend without
@@ -998,7 +1006,7 @@ mod tests {
             prefix: String::new(),
             credentials: Some(ResolvedS3Credentials::DefaultChain { profile: None }),
         };
-        let cfg = cfg_with_origin(Some(ResolvedOrigin::S3(s3)));
+        let (_tmp, cfg) = cfg_with_origin(Some(ResolvedOrigin::S3(s3)));
         let metrics_handle = Arc::new(metrics::Metrics::new());
 
         // Construction must succeed end-to-end. A failure here means the
@@ -1031,7 +1039,7 @@ mod tests {
                 session_token: None,
             }),
         };
-        let cfg = cfg_with_origin(Some(ResolvedOrigin::S3(s3)));
+        let (_tmp, cfg) = cfg_with_origin(Some(ResolvedOrigin::S3(s3)));
         let metrics_handle = Arc::new(metrics::Metrics::new());
 
         let _engine = build_cache(&cfg, metrics_handle)

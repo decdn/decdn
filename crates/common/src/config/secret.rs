@@ -15,7 +15,7 @@
 //!   call site is greppable.
 //! - [`serde::Deserialize`] is implemented (so TOML still works).
 //! - [`serde::Serialize`] is implemented but emits a redacted,
-//!   hashed form (`"sha:{hash}"`) — never the cleartext secret.
+//!   hashed form (`"hash:{digest}"`) — never the cleartext secret.
 //!   The hash uses [`std::collections::hash_map::DefaultHasher`],
 //!   which `std` documents as producing the same output for all
 //!   `DefaultHasher` instances in a given build of the standard
@@ -98,8 +98,11 @@ impl Serialize for SecretString {
         // output) is negligible for credential-rotation diffing.
         let mut h = std::collections::hash_map::DefaultHasher::new();
         self.0.hash(&mut h);
-        // 16 hex chars covers the full u64 hash output.
-        serializer.serialize_str(&format!("sha:{:016x}", h.finish()))
+        // 16 hex chars covers the full u64 hash output. Prefix is
+        // `hash:` (not `sha:`): the digest comes from `DefaultHasher`
+        // (SipHash-1-3 in current std), not any SHA family — naming
+        // it after the algorithm we don't use would be misleading.
+        serializer.serialize_str(&format!("hash:{:016x}", h.finish()))
     }
 }
 
@@ -187,7 +190,7 @@ mod tests {
             "raw secret leaked through Serialize: {json}"
         );
         assert!(
-            json.starts_with("\"sha:") && json.ends_with('"'),
+            json.starts_with("\"hash:") && json.ends_with('"'),
             "expected hashed form, got: {json}"
         );
     }
