@@ -149,6 +149,89 @@ The `EpochReceiptSummary` is committed once per operator per epoch by the operat
 
 A 7-day window (matches the gauge-claim-window opening) during which any address may submit a `ChallengeReceiptSummary` claim against an operator's summary. Two failure modes are challengeable: (a) `claimedDistinctClients` overstated relative to the unique `clientPubKey` count under the §3 identity-diversity rules; (b) `claimedBytes` overstated relative to the sum of `bytesClaimed` across the receipt leaves committed under the operator's `epochId` MMR. A successful challenge on either field zeros that field for the epoch — gauge eligibility is forfeited in line with §7 (zeroed `claimedBytes` ⇒ `bytes_i = 0` in the gauge formula; zeroed `claimedDistinctClients` ⇒ sub-threshold ⇒ same outcome). An unsuccessful challenge forfeits the challenger's bond per [ADR 014 Bond Handling](014-on-chain-verification.md). Challenge evidence is supplied as Merkle inclusion proofs against the on-chain MMR root: a `claimedBytes` overstatement is proved by opening enough leaves that the partial sum already exceeds the asserted total, or by full enumeration; a `claimedDistinctClients` overstatement is proved by opening leaves whose `clientPubKey` set is smaller than asserted.
 
+#### Timing windows
+
+The receipt-anchoring lifecycle is pinned to four concrete deadlines, all derived from the epoch's wall-clock end. Let `epochEnd(epochId) = genesisTimestamp + (epochId + 1) * epochLength` (per [ADR 026 §2 Epoch mechanics](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553)). Then:
+
+| Window | Opens | Closes | Effect after close |
+| --- | --- | --- | --- |
+| `commitEpochReceiptRoot` | `epochId * epochLength` (epoch start) | `epochEnd + summaryWindow` | MMR sealed; further root commits revert |
+| `commitEpochSummary` | `epochEnd` (epoch close) | `epochEnd + summaryWindow` | Summary frozen; gauge eligibility input locked |
+| Challenge window | `epochEnd + summaryWindow` | `epochEnd + summaryWindow + challengeWindow` | Summary becomes immutable; no further `ChallengeReceiptSummary` accepted |
+| Claim window | `epochEnd + summaryWindow` | `epochEnd + summaryWindow + claimWindow` | Unclaimed gauge / delegator USDC sweepable to treasury via `FeeRouter.sweepUnclaimed(epochs[])` |
+
+Default values:
+
+- `epochLength = 1 week` ([ADR 026 §2](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553)) — immutable, not governable
+- `summaryWindow = 7 days` — governable per [ADR 026 §11](026-gauge-boost-tokenomics.md#11-governable-parameters-with-safety-bounds)
+- `challengeWindow = 7 days` — governable
+- `claimWindow = 26 epochs` ([ADR 026 §2](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553)) — governable
+
+The challenge and claim windows open at the same moment so claimers and challengers see consistent state. A successful challenge during the challenge window zeros the relevant `claimedBytes` or `claimedDistinctClients` field; subsequent `claimBoost` calls within the claim window then read the zeroed value and pay zero. Challenges submitted after the challenge window closes revert.
+
+#### View surface
+
+`FeeRouter` exposes the following views in support of the receipt-anchoring spec:
+
+```solidity
+// Convert epoch id ↔ wall-clock timestamp.
+function epochEnd(uint64 epochId) external view returns (uint256);
+function currentEpoch() external view returns (uint64);
+
+// Per-(operator, epoch) on-chain state. Returns the consolidated EpochReceiptSummary
+// after `commitEpochSummary`; returns zero-valued struct if no commit has been made.
+function epochSummary(address operator, uint64 epochId) external view returns (EpochReceiptSummary memory);
+
+// MMR introspection during accrual (before `commitEpochSummary`). After
+// finalisation, callers read `epochSummary().aggregateRoot` instead.
+function epochReceiptRoot(address operator, uint64 epochId) external view returns (bytes32);
+function epochReceiptCount(address operator, uint64 epochId) external view returns (uint256);
+
+// Window predicates (handy for off-chain claim simulators and challengers).
+function isCommitWindowOpen(uint64 epochId) external view returns (bool);
+function isChallengeWindowOpen(uint64 epochId) external view returns (bool);
+function isClaimWindowOpen(uint64 epochId) external view returns (bool);
+```
+
+#### Storage shape
+
+The on-chain state per `(operator, epochId)` evolves through three phases:
+
+1. **Accrual** (during the commit window). The contract maintains the per-(operator, epoch) MMR accumulator: at minimum the rolling root and the leaf count. `commitEpochReceiptRoot` appends one leaf and updates O(log N) hashes per call; reads are cheap.
+2. **Finalisation** (`commitEpochSummary` called). The contract verifies that `summary.aggregateRoot` matches the rolling MMR root; on success, writes `EpochReceiptSummary` (operator-asserted `claimedBytes` and `claimedDistinctClients`, plus the verified `aggregateRoot`).
+3. **Settled** (challenge window closed without a successful challenge, or successful challenge applied). `EpochReceiptSummary` is the canonical state and is never further mutated.
+
+Implementation choice — pack `EpochReceiptSummary` into a single struct vs parallel mappings — is left to the implementer. The interface above exposes the consolidated view (`epochSummary`) so off-chain consumers don't need to know the storage shape.
+
+#### Events
+
+```solidity
+event EpochReceiptRootCommitted(
+    address indexed operator,
+    uint64 indexed epochId,
+    bytes32 leafRoot,
+    uint256 leafCount
+);
+
+event EpochSummaryCommitted(
+    address indexed operator,
+    uint64 indexed epochId,
+    uint256 claimedBytes,
+    uint32 claimedDistinctClients,
+    bytes32 aggregateRoot
+);
+
+event EpochSummaryChallenged(
+    address indexed operator,
+    uint64 indexed epochId,
+    address indexed challenger,
+    bool claimedBytesZeroed,
+    bool claimedDistinctClientsZeroed
+);
+```
+
+`EpochReceiptRootCommitted` fires on every `commitEpochReceiptRoot` call (including overwrites before finalisation — the latest event reflects the current MMR state). `EpochSummaryCommitted` fires once at finalisation. `EpochSummaryChallenged` fires once per successful challenge with the two zeroing flags surfaced for indexers.
+
 ### 5. Challenger role (see [Appendix: Fraud Detection](appendix-fraud-detection.md))
 
 The challenge window is permissionless. Any address with sufficient bond capital and the technical capacity to monitor the chain may submit a `ChallengeReceiptSummary`. There is no protocol-defined "validator" role, no on-chain registration, no per-operator subscription, and no fee paid by monitored parties — the challenger's incentive is the bond + reward on a successful challenge.

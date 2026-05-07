@@ -96,7 +96,7 @@ Epoch length is 1 week (7 × 86400 s, block-timestamp-aligned). At epoch rollove
 
 Adapted from Curve Finance's veCRV gauge boost (in production since 2020). Replaces the LP-deposit primitive with verified-bytes-delivered.
 
-Per-operator pool share = `working_bytes_i / sum(working_bytes)`, where `working_bytes_i = min(bytes_i, 0.4·bytes_i + 0.6·(ve_i/total_ve)·total_bytes)` over the epoch's verified bytes (full derivation in design spec §9.4).
+Per-operator pool share = `working_bytes_i / sum(working_bytes)`, where `working_bytes_i = min(bytes_i, 0.4·bytes_i + 0.6·(ve_i/total_ve)·total_bytes)` over the epoch's verified bytes (full derivation in design spec §9.4). `bytes_i` is sourced from the operator's `EpochReceiptSummary.claimedBytes` after the [ADR 027 §4 challenge window](027-distinct-client-receipts.md#challenge-window) closes; a successful challenge zeros that field for the epoch and the operator's gauge share collapses to zero accordingly.
 
 **Properties:**
 
