@@ -136,7 +136,8 @@ jobs:
 
   # Single gate for branch protection. Point required-checks at this one job
   # so adding/renaming jobs above doesn't require updating branch rules.
-  # coverage is excluded intentionally (it's continue-on-error until baseline).
+  # coverage is excluded intentionally (it's continue-on-error until baseline);
+  # PR comment is configured in codecov.yml at repo root.
   ci-success:
     name: CI success
     if: always()
