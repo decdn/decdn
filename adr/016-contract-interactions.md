@@ -194,7 +194,12 @@ interface IFeeRouter {
     function gaugeBucket(uint256 epoch) external view returns (uint256);
     function delegatorBucket(uint256 epoch) external view returns (uint256);
 
-    // Configured shares (basis points) and dependency addresses.
+    // Configured shares (basis points) and dependency addresses. These
+    // are governance-set state (last updated via `setShares` or
+    // `setSharesAndDestinations`), NOT operator-asserted values and NOT
+    // derived from per-epoch settlement state. The returned array
+    // ordering matches `setShares` parameters: [operatorBaseBps,
+    // gaugeBoostBps, delegatorBps, buybackBps, treasuryBps, safetyBps].
     function getShares() external view returns (uint256[6] memory);
     function votingEscrow() external view returns (address);
     function safetyReserve() external view returns (address);
