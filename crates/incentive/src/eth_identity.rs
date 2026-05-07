@@ -30,6 +30,7 @@ use alloy::signers::k256::elliptic_curve::rand_core::OsRng;
 use alloy::signers::local::{LocalSigner, PrivateKeySigner};
 use anyhow::{Context, anyhow};
 use rand::Rng;
+use zeroize::Zeroizing;
 
 /// Process environment variable that supplies the keystore password when
 /// `--password-file` is unset and stdin isn't a TTY. Single source of truth
@@ -105,8 +106,12 @@ pub fn generate_and_persist(
                 target.display()
             );
         }
-        fs::remove_file(&target)
-            .map_err(|e| anyhow!("failed to remove {}: {e}", target.display()))?;
+        // Archive the old keystore rather than destroying it: the operator
+        // key-rotation runbook (`appendix-operator-key-rotation.md` §5) relies
+        // on rollback to the prior key, and the runbook's offline-archive
+        // requirement applies symmetrically to the eth side. The bak path is
+        // returned for caller logging.
+        let _bak = decdn_common::identity::move_aside(&target)?;
     }
 
     // Alloy's `encrypt_keystore` writes the file in-place inside `data_dir`
@@ -136,6 +141,11 @@ pub fn generate_and_persist(
         .with_context(|| format!("failed to encrypt eth keystore at {}", data_dir.display()))?;
 
         let temp_path = data_dir.join(&temp_name);
+        // Atomic-write window: alloy's `encrypt_keystore` writes the temp
+        // file with default umask perms (typically ~0o644). The chmod below
+        // closes that window before the rename. The window is bounded by
+        // `data_dir = 0o700`, so only the owner can traverse the directory
+        // — equivalent to legitimate-user access.
         chmod_keystore_file(&temp_path)?;
 
         fs::rename(&temp_path, &target).with_context(|| {
@@ -186,17 +196,25 @@ pub fn load_signer(path: &Path, password: &str) -> anyhow::Result<PrivateKeySign
 /// Resolve a password from the first matching source. Empty `Env` values and
 /// missing `File` sources fall through to the next entry.
 ///
+/// Returns `Zeroizing<String>` so the password is overwritten in memory on
+/// drop — defense-in-depth against post-mortem heap inspection. The
+/// `String` itself is still subject to allocator reuse, but the wrapper
+/// guarantees the bytes are scrubbed before that reuse becomes possible.
+///
 /// # Errors
 ///
 /// - `Prompt` with mismatched confirmations after 3 attempts.
 /// - `Prompt` when `stdin` is not a TTY.
 /// - All sources exhausted without producing a value.
-pub fn read_password(sources: &[PasswordSource], prompt_label: &str) -> anyhow::Result<String> {
+pub fn read_password(
+    sources: &[PasswordSource],
+    prompt_label: &str,
+) -> anyhow::Result<Zeroizing<String>> {
     let mut last_skip_reason: Option<String> = None;
     for source in sources {
         match source {
             PasswordSource::Env(name) => match std::env::var(name) {
-                Ok(value) if !value.is_empty() => return Ok(value),
+                Ok(value) if !value.is_empty() => return Ok(Zeroizing::new(value)),
                 Ok(_) => last_skip_reason = Some(format!("env {name} is empty")),
                 Err(_) => last_skip_reason = Some(format!("env {name} unset")),
             },
@@ -222,15 +240,17 @@ pub fn read_password(sources: &[PasswordSource], prompt_label: &str) -> anyhow::
     ))
 }
 
-fn read_password_file(path: &Path) -> anyhow::Result<Option<String>> {
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("failed to read password file {}", path.display()))?;
+fn read_password_file(path: &Path) -> anyhow::Result<Option<Zeroizing<String>>> {
+    let raw = Zeroizing::new(
+        fs::read_to_string(path)
+            .with_context(|| format!("failed to read password file {}", path.display()))?,
+    );
     // Strip a single trailing `\n` (or `\r\n`). `String::trim_end` would also
     // eat trailing spaces — passwords legitimately contain whitespace, so we
     // strip exactly the one newline that nearly every editor and `echo`
     // appends.
     let trimmed = raw.strip_suffix("\r\n").or_else(|| raw.strip_suffix('\n'));
-    let value = trimmed.map_or(raw.as_str(), |s| s).to_owned();
+    let value = Zeroizing::new(trimmed.map_or(raw.as_str(), |s| s).to_owned());
     if value.is_empty() {
         Ok(None)
     } else {
@@ -238,19 +258,23 @@ fn read_password_file(path: &Path) -> anyhow::Result<Option<String>> {
     }
 }
 
-fn prompt_password(label: &str, confirm: bool) -> anyhow::Result<String> {
+fn prompt_password(label: &str, confirm: bool) -> anyhow::Result<Zeroizing<String>> {
     const MAX_ATTEMPTS: u8 = 3;
     let mut attempts: u8 = 0;
     loop {
         attempts = attempts.saturating_add(1);
-        let pw = rpassword::prompt_password(format!("{label}: "))
-            .with_context(|| "failed to read password from terminal")?;
+        let pw = Zeroizing::new(
+            rpassword::prompt_password(format!("{label}: "))
+                .with_context(|| "failed to read password from terminal")?,
+        );
         if !confirm {
             return Ok(pw);
         }
-        let again = rpassword::prompt_password(format!("{label} (confirm): "))
-            .with_context(|| "failed to read password confirmation from terminal")?;
-        if pw == again {
+        let again = Zeroizing::new(
+            rpassword::prompt_password(format!("{label} (confirm): "))
+                .with_context(|| "failed to read password confirmation from terminal")?,
+        );
+        if *pw == *again {
             return Ok(pw);
         }
         if attempts >= MAX_ATTEMPTS {
@@ -395,6 +419,34 @@ mod tests {
         );
     }
 
+    /// `--force` must archive (not delete) the prior keystore so the
+    /// operator key-rotation runbook (`appendix-operator-key-rotation.md`
+    /// §1 step 9, §5 rollback) has the previous ciphertext to fall back on.
+    #[test]
+    fn force_archives_old_keystore_to_bak() {
+        let tmp = make_data_dir();
+        generate_and_persist(tmp.path(), TEST_PASSWORD, false).unwrap();
+        let original = fs::read(keystore_path(tmp.path())).unwrap();
+
+        generate_and_persist(tmp.path(), TEST_PASSWORD, true).unwrap();
+
+        let mut bak: Option<PathBuf> = None;
+        for entry in fs::read_dir(tmp.path()).unwrap() {
+            let p = entry.unwrap().path();
+            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if name.starts_with("keystore.json.bak.") {
+                bak = Some(p);
+                break;
+            }
+        }
+        let bak = bak.expect("force should produce a `keystore.json.bak.<ts>` file");
+        let archived = fs::read(&bak).unwrap();
+        assert_eq!(
+            archived, original,
+            "bak file must hold the byte-for-byte prior keystore"
+        );
+    }
+
     #[test]
     fn round_trip_address_recovery() {
         let tmp = make_data_dir();
@@ -502,7 +554,7 @@ mod tests {
             "ignored",
         )
         .unwrap();
-        assert_eq!(pw, "first-wins");
+        assert_eq!(pw.as_str(), "first-wins");
     }
 
     #[test]
@@ -518,7 +570,7 @@ mod tests {
             "ignored",
         )
         .unwrap();
-        assert_eq!(pw, "actual-pw");
+        assert_eq!(pw.as_str(), "actual-pw");
     }
 
     #[test]
@@ -527,7 +579,7 @@ mod tests {
         let pw_file = tmp.path().join("pw.txt");
         fs::write(&pw_file, b"hunter2\n").unwrap();
         let pw = read_password(&[PasswordSource::File(pw_file)], "ignored").unwrap();
-        assert_eq!(pw, "hunter2");
+        assert_eq!(pw.as_str(), "hunter2");
     }
 
     #[test]
@@ -537,7 +589,7 @@ mod tests {
         fs::write(&pw_file, b"line1\nline2").unwrap();
         let pw = read_password(&[PasswordSource::File(pw_file)], "ignored").unwrap();
         // No trailing newline to strip; internal newline preserved.
-        assert_eq!(pw, "line1\nline2");
+        assert_eq!(pw.as_str(), "line1\nline2");
     }
 
     #[test]
@@ -546,7 +598,7 @@ mod tests {
         let pw_file = tmp.path().join("pw.txt");
         fs::write(&pw_file, b"hunter2\r\n").unwrap();
         let pw = read_password(&[PasswordSource::File(pw_file)], "ignored").unwrap();
-        assert_eq!(pw, "hunter2");
+        assert_eq!(pw.as_str(), "hunter2");
     }
 
     #[test]

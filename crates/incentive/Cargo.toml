@@ -19,6 +19,7 @@ serde = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
 rpassword = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }

@@ -74,6 +74,43 @@ fn force_replaces_existing_keystore() {
     );
 }
 
+/// `--force` must archive both prior keys to `<name>.bak.<ts>` so the
+/// runbook's offline-archive and rollback paths
+/// (`appendix-operator-key-rotation.md` §1 step 9, §5) remain available.
+#[test]
+fn force_archives_both_prior_keys() {
+    let tmp = TempDir::new().unwrap();
+    fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let pw_file = write_password_file(&tmp);
+    key_gen(&make_args(&tmp, false, pw_file.clone())).unwrap();
+
+    let original_node = fs::read(tmp.path().join("node.secret")).unwrap();
+    let original_keystore = fs::read(tmp.path().join("keystore.json")).unwrap();
+
+    key_gen(&make_args(&tmp, true, pw_file)).expect("force regenerate");
+
+    let mut node_bak: Option<PathBuf> = None;
+    let mut keystore_bak: Option<PathBuf> = None;
+    for entry in fs::read_dir(tmp.path()).unwrap() {
+        let p = entry.unwrap().path();
+        let name = p
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_owned();
+        if name.starts_with("node.secret.bak.") {
+            node_bak = Some(p);
+        } else if name.starts_with("keystore.json.bak.") {
+            keystore_bak = Some(p);
+        }
+    }
+
+    let node_bak = node_bak.expect("force should archive node.secret");
+    let keystore_bak = keystore_bak.expect("force should archive keystore.json");
+    assert_eq!(fs::read(&node_bak).unwrap(), original_node);
+    assert_eq!(fs::read(&keystore_bak).unwrap(), original_keystore);
+}
+
 #[test]
 fn errors_when_keystore_exists_without_force() {
     let tmp = TempDir::new().unwrap();

@@ -72,6 +72,7 @@ bytes = "1"
 rand = "0.10"
 rpassword = "7"
 url = "2"
+zeroize = "1"
 
 # HTTP client (used by cache-origin backend)
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json"] }

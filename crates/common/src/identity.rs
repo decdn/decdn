@@ -122,6 +122,43 @@ pub fn ensure_data_dir(data_dir: &Path) -> anyhow::Result<()> {
     }
 }
 
+/// Rename `path` to `<filename>.bak.<unix_ts>` so an in-place key rotation
+/// preserves the prior key material rather than destroying it. Required by
+/// `appendix-operator-key-rotation.md` §1 step 9 ("Archive the old iroh
+/// keystore offline. Retain it for at least `MAX_EVIDENCE_AGE_US`") and the
+/// §5 rollback path ("Repoint config at old keystore"). The operator can
+/// later move the `.bak` file offline; deleting it is up to them.
+///
+/// Bails if the bak path already exists (two `key-gen` invocations within
+/// the same second) rather than silently clobbering — operator removes the
+/// stale archive manually and retries.
+///
+/// Returns the new bak path on success.
+pub fn move_aside(path: &Path) -> anyhow::Result<PathBuf> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let unix_ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| anyhow!("invalid path (no UTF-8 filename): {}", path.display()))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("path has no parent directory: {}", path.display()))?;
+    let bak = parent.join(format!("{file_name}.bak.{unix_ts}"));
+    anyhow::ensure!(
+        !bak.exists(),
+        "refusing to overwrite existing archive {}; \
+         move it aside manually and retry",
+        bak.display()
+    );
+    fs::rename(path, &bak)
+        .with_context(|| format!("failed to archive {} -> {}", path.display(), bak.display()))?;
+    Ok(bak)
+}
+
 /// Reject `data_dir` if it isn't a directory or if any group/other permission
 /// bit is set.
 ///

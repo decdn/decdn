@@ -53,9 +53,12 @@ pub fn key_gen(args: &cli::KeyGenArgs) -> anyhow::Result<()> {
     // Force-replace order: the node key write is also non-atomic across the
     // two files, but each file's own write is atomic and the ordering
     // mirrors `decdn run` startup (Ed25519 first, ETH keystore second).
+    // Existing files are archived rather than destroyed so the operator
+    // key-rotation runbook (`appendix-operator-key-rotation.md` §1 step 9
+    // / §5 rollback) has the prior key material to fall back on.
     if args.force && key_path.exists() {
-        std::fs::remove_file(&key_path)
-            .map_err(|e| anyhow::anyhow!("failed to remove {}: {e}", key_path.display()))?;
+        let bak = identity::move_aside(&key_path)?;
+        println!("archived previous node key -> {}", bak.display());
     }
     let key = identity::load_or_generate(&output_dir)?;
     println!("node id: {}", key.public());
