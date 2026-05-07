@@ -113,6 +113,173 @@ The pattern has three knobs, all under `GOVERNANCE_ROLE` (i.e. the `TimelockCont
 
 **Launch deployment.** `FeeRouter` deploys with zero-address dependencies for `VotingEscrow` / `SafetyReserve` / `DelegatorBuyer` if those aren't co-deployed (see [§ Deployment Order](#2-deployment-order-and-initialization-dependencies) below). The launch share configuration honors the cross-validation invariant — only buckets whose destinations are wired may be set non-zero.
 
+#### Contract: FeeRouter
+
+```solidity
+interface IFeeRouter {
+    // ─── Settlement entry point ───────────────────────────────────────
+    // Called by `StablePaymentChannel.settleChannel` (production: future
+    // multi-token `PaymentChannel`). Forwards the operator's full USDC
+    // balance through the six-bucket split per the configured shares;
+    // same-tx legs (operator base, buyback, treasury, safety) execute
+    // inline, epoch-bucket legs (gauge, delegator) accumulate to per-epoch
+    // storage. Updates `lastSettlementAt[operator]` on `StakingRegistry`
+    // via `SETTLEMENT_REPORTER_ROLE`. Reverts if paused.
+    function routeSettlement(
+        address operator,
+        uint256 bytesDelivered,
+        uint256 amount
+    ) external;
+
+    // ─── Receipt-batch anchoring (per ADR 027 §4) ─────────────────────
+    // Operators commit per-epoch receipt summaries gating gauge
+    // eligibility. Permissionless: `msg.sender` is recorded as the
+    // credited operator. Full spec — including the timing window,
+    // overwrite-before-finalization semantics, and the `ReceiptSummary`
+    // field layout — lives in [ADR 027 §4](027-distinct-client-receipts.md).
+    struct ReceiptSummary {
+        uint256 distinctClientCount; // see ADR 027 §3
+        uint256 totalBytes;
+        // ADR 027 §4 may add fields; the canonical layout is finalized there.
+    }
+    function commitEpochReceiptRoot(uint256 epoch, bytes32 root) external;
+    function commitEpochSummary(uint256 epoch, ReceiptSummary calldata summary) external;
+
+    // ─── Claim flows ──────────────────────────────────────────────────
+    // Pull-based claims for the gauge-boost (40% steady-state) and
+    // delegator (7%) epoch buckets. `epochs` MUST all be in the past
+    // 26-epoch claim window; older epochs are swept to treasury via
+    // `sweepUnclaimed` and revert here. Returns the total amount
+    // transferred to the caller for tooling convenience.
+    function claimBoost(uint256[] calldata epochs) external returns (uint256 amount);
+    function claimDelegator(uint256[] calldata epochs) external returns (uint256 amount);
+
+    // ─── Delegator-pool swap (keeper trigger) ─────────────────────────
+    // Initiates the per-epoch USDC→TOKEN swap for the delegator bucket
+    // by forwarding the bucket's accumulated USDC to `DelegatorBuyer` and
+    // calling `swapDelegatorBucket(epoch, amountIn, minOut)`. Consolidated
+    // here so the per-epoch liquidity-cap defenses live in one place;
+    // `DelegatorBuyer` is the single Balancer V3 caller. `KEEPER_ROLE`-gated.
+    function executeDelegatorSwap(uint256 epoch, uint256 minOut) external;
+
+    // ─── Permissionless storage cleanup ───────────────────────────────
+    // Sweeps the unclaimed remainder of any epoch past the 26-epoch claim
+    // window to the treasury, freeing the per-epoch storage slot. Anyone
+    // may call; matches the `pruneBlacklistedAssignment` pattern from
+    // [ADR 011 § Interaction with ContentBlacklist](011-content-takedown.md#interaction-with-contentblacklist).
+    function sweepUnclaimed(uint256[] calldata epochs) external;
+
+    // ─── Read views ───────────────────────────────────────────────────
+    // Per-(operator, epoch) ve-weighted byte count fed into the gauge
+    // formula in [ADR 026 §3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula).
+    // Off-chain claim simulators pair this with `epochTotalWorkingBytes`
+    // via Multicall3.
+    function workingBytes(address operator, uint256 epoch) external view returns (uint256);
+    function epochTotalWorkingBytes(uint256 epoch) external view returns (uint256);
+
+    // Per-epoch USDC accumulators for the gauge and delegator buckets.
+    // `delegatorBucket` is denominated in USDC pre-swap and TOKEN
+    // post-swap (the swap zeros the USDC slot and writes the TOKEN slot —
+    // implementations expose either via this view or a paired
+    // `delegatorBucketToken(epoch)` view at their discretion; the
+    // semantic value reported here is the active bucket currency).
+    function gaugeBucket(uint256 epoch) external view returns (uint256);
+    function delegatorBucket(uint256 epoch) external view returns (uint256);
+
+    // Configured shares (basis points) and dependency addresses.
+    function getShares() external view returns (uint256[6] memory);
+    function votingEscrow() external view returns (address);
+    function safetyReserve() external view returns (address);
+    function delegatorBuyer() external view returns (address);
+    function buybackBurner() external view returns (address);
+    function treasury() external view returns (address);
+    function boostFloor() external view returns (uint256); // 4-decimal fixed-point: 4000 = 0.4
+
+    // ─── Tunability (governance-controlled) ───────────────────────────
+    // Atomic update: shares + dependency-address bundle. One timelock
+    // proposal flips both sides together so the cross-validation
+    // invariant in [§ Tunable Economics](#tunable-economics) — non-zero
+    // share requires non-zero destination — is satisfied at every
+    // observable state. Use this for activation flips (e.g., enabling
+    // the gauge bucket once VotingEscrow is wired); the per-knob setters
+    // below are for routine governance after the initial wiring.
+    struct ShareDestinations {
+        address votingEscrow;
+        address safetyReserve;
+        address delegatorBuyer;
+        address buybackBurner;
+        address treasury;
+    }
+    function setSharesAndDestinations(
+        uint256[6] calldata sharesBps,
+        ShareDestinations calldata dests
+    ) external;
+
+    // Per-knob setters. Each must satisfy the cross-validation invariant:
+    // `setShares` reverts if any non-zero share targets `address(0)`;
+    // each `set*(address(0))` reverts if the corresponding share is
+    // non-zero. Order of operations: zero out the share first, then
+    // re-point the destination.
+    function setShares(uint256[6] calldata sharesBps) external;
+    function setVotingEscrow(address newVotingEscrow) external;
+    function setSafetyReserve(address newSafetyReserve) external;
+    function setDelegatorBuyer(address newDelegatorBuyer) external;
+    function setBuybackBurner(address newBuybackBurner) external;
+    function setTreasury(address newTreasury) external;
+    function setBoostFloor(uint256 newFloor) external; // bounded [2000, 8000] per [ADR 026 §11](026-gauge-boost-tokenomics.md#11-governable-parameters-with-safety-bounds)
+
+    // ─── Pause control ────────────────────────────────────────────────
+    // `pause()` blocks `routeSettlement` and the claim functions
+    // (`claimBoost`, `claimDelegator`); `executeDelegatorSwap` and
+    // `sweepUnclaimed` are also paused. `commitEpochReceiptRoot` and
+    // `commitEpochSummary` continue to work so operators don't lose
+    // gauge eligibility during a pause window.
+    // `StablePaymentChannel.closeChannel` and `disputeChannel` are
+    // independent of `FeeRouter` and remain available — settlement
+    // queues until `unpause`.
+    function pause() external;
+    function unpause() external;
+
+    // ─── Events ───────────────────────────────────────────────────────
+    event Settled(
+        address indexed operator,
+        uint256 bytesDelivered,
+        uint256 amount,
+        uint256 indexed epoch
+    );
+    event EpochReceiptRootCommitted(
+        address indexed operator,
+        uint256 indexed epoch,
+        bytes32 root
+    );
+    event EpochSummaryCommitted(
+        address indexed operator,
+        uint256 indexed epoch,
+        uint256 distinctClientCount,
+        uint256 totalBytes
+    );
+    event BoostClaimed(address indexed operator, uint256 indexed epoch, uint256 amount);
+    event DelegatorClaimed(address indexed account, uint256 indexed epoch, uint256 amount);
+    event DelegatorSwapped(uint256 indexed epoch, uint256 amountIn, uint256 amountOut);
+    event UnclaimedSwept(uint256 indexed epoch, uint256 gaugeAmount, uint256 delegatorAmount);
+    event SharesUpdated(uint256[6] newShares);
+    event VotingEscrowUpdated(address indexed oldAddr, address indexed newAddr);
+    event SafetyReserveUpdated(address indexed oldAddr, address indexed newAddr);
+    event DelegatorBuyerUpdated(address indexed oldAddr, address indexed newAddr);
+    event BuybackBurnerUpdated(address indexed oldAddr, address indexed newAddr);
+    event TreasuryUpdated(address indexed oldAddr, address indexed newAddr);
+    event BoostFloorUpdated(uint256 oldFloor, uint256 newFloor);
+}
+```
+
+**Notes:**
+
+- **Epoch length and claim window** are immutable contract parameters set in the constructor (1 week and 26 epochs respectively per [ADR 026 §2](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553)). Changing them post-deploy would shift the meaning of every `epoch` index in storage; if a future ADR motivates a change, it ships as a fresh `FeeRouter` deployment with state migration, per [§ No proxy deployment patterns](#no-proxy-deployment-patterns).
+- **`workingBytes(operator, epoch)` returns the per-operator value only.** Off-chain claim-amount calculators bundle this with `epochTotalWorkingBytes(epoch)` and `gaugeBucket(epoch)` via Multicall3 — same pattern used elsewhere (ADR 022 § Origin discovery).
+- **`commitEpochReceiptRoot` and `commitEpochSummary` are signature stubs** in this interface; the timing window, overwrite-before-finalization semantics, anti-griefing rules, and the full `ReceiptSummary` field layout are specified canonically in [ADR 027 §4](027-distinct-client-receipts.md).
+- **No `initialize(...)` helper.** [§ No proxy deployment patterns](#no-proxy-deployment-patterns) forbids proxies; constructor + post-deploy `setSharesAndDestinations` from `TimelockController` is sufficient for atomic launch wiring.
+- **Storage shape is implementation-defined.** The `gaugeBucket` and `delegatorBucket` views document the *semantic* per-epoch state; whether the contract uses two parallel mappings or a packed struct is left to the implementation (separate mappings are recommended because the buckets accrue independently — packing would force `SSTORE` of the unchanged half on every accumulation).
+
 ##### No proxy deployment patterns
 
 No deCDN contract uses proxy (upgradeable) deployment patterns. Production contract upgrades deploy new contracts at new addresses with state migration as described in Section 6. This constraint ensures that EIP-712 domain separators computed in constructors (as `immutable`) remain valid for the contract's lifetime — a proxy migration to a different address or chain would invalidate all existing voucher signatures.
