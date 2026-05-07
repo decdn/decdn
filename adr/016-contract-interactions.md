@@ -132,18 +132,26 @@ interface IFeeRouter {
     ) external;
 
     // ─── Receipt-batch anchoring (per ADR 027 §4) ─────────────────────
-    // Operators commit per-epoch receipt summaries gating gauge
-    // eligibility. Permissionless: `msg.sender` is recorded as the
-    // credited operator. Full spec — including the timing window,
-    // overwrite-before-finalization semantics, and the `ReceiptSummary`
-    // field layout — lives in [ADR 027 §4](027-distinct-client-receipts.md).
-    struct ReceiptSummary {
-        uint256 distinctClientCount; // see ADR 027 §3
-        uint256 totalBytes;
-        // ADR 027 §4 may add fields; the canonical layout is finalized there.
+    // Per-epoch summary structure committed by operators (or any third
+    // party on the operator's behalf). Canonical layout pinned in
+    // [ADR 027 §4 § Per-epoch summary](027-distinct-client-receipts.md#per-epoch-summary);
+    // mirrored here so IFeeRouter is self-contained.
+    struct EpochReceiptSummary {
+        address operator;             // matches the function-arg operator
+        uint64 epochId;               // matches the function-arg epochId
+        uint256 claimedBytes;         // operator-asserted; subject to challenge per ADR 027 §4
+        uint32 claimedDistinctClients; // operator-asserted; subject to challenge
+        bytes32 aggregateRoot;        // Merkle root of the per-call commit roots
     }
+
+    // Operator commits one MMR leaf per call. `msg.sender` is recorded
+    // as the credited operator. Full timing-window and overwrite-vs-append
+    // semantics live in [ADR 027 §4 § Timing windows](027-distinct-client-receipts.md#timing-windows).
     function commitEpochReceiptRoot(uint64 epochId, bytes32 root) external;
-    function commitEpochSummary(address operator, uint64 epochId, ReceiptSummary calldata summary) external;
+
+    // Summary commit (any caller — `operator` is explicit, not msg.sender,
+    // so a keeper/relayer can submit on the operator's behalf).
+    function commitEpochSummary(address operator, uint64 epochId, EpochReceiptSummary calldata summary) external;
 
     // ─── Claim flows ──────────────────────────────────────────────────
     // Pull-based claims for the gauge-boost (40% steady-state) and
@@ -263,13 +271,15 @@ interface IFeeRouter {
     event EpochReceiptRootCommitted(
         address indexed operator,
         uint64 indexed epochId,
-        bytes32 root
+        bytes32 leafRoot,
+        uint256 leafCount
     );
     event EpochSummaryCommitted(
         address indexed operator,
         uint64 indexed epochId,
-        uint256 distinctClientCount,
-        uint256 totalBytes
+        uint256 claimedBytes,
+        uint32 claimedDistinctClients,
+        bytes32 aggregateRoot
     );
     event BoostClaimed(address indexed operator, uint64 indexed epochId, uint256 amount);
     event DelegatorClaimed(address indexed account, uint64 indexed epochId, uint256 amount);
