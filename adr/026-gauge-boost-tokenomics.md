@@ -60,9 +60,9 @@ Bootstrap supply-side incentive is funded externally via $1M+ pre-seed USDC capi
 
 ### 2. FeeRouter split (40/40/7/5/5/3)
 
-`FeeRouter` receives the full operator USDC balance from `PaymentChannel.settleChannel` and atomically splits it into six buckets (full mechanic per design spec §2.2). `PaymentChannel` does not skim a protocol fee inline; all bucket distribution happens in `FeeRouter`.
+`FeeRouter` receives the full operator USDC balance from `PaymentChannel.settleChannel` and atomically splits it into six buckets (full mechanic per design spec §2.2). `PaymentChannel` does not skim a protocol fee inline; all bucket distribution happens in `FeeRouter`. The bucket structure (six buckets, the named categories below, sum-to-100% invariant) is fixed at the contract level; **the share percentages themselves are governance-tunable** via `FeeRouter.setShares(...)` per [ADR 016 § Tunable Economics](016-contract-interactions.md#tunable-economics) so the network can launch with a simplified split (e.g. `80/0/0/10/10/0`) and dial up gauge / delegator / safety as their dependency contracts are wired in.
 
-| Destination | Share | Unit | Distribution mechanic |
+| Destination | Steady-state share | Unit | Distribution mechanic |
 | --- | ---: | --- | --- |
 | Node base | 40% | USDC | Direct same-tx, per-byte proportional to verified delivery |
 | Gauge boost pool | 40% | USDC | Weekly epoch pool; pro-rata by ve-weighted `working_bytes` (§3); pull-based claim |
@@ -71,6 +71,8 @@ Bootstrap supply-side incentive is funded externally via $1M+ pre-seed USDC capi
 | Protocol treasury | 5% | USDC | Direct same-tx to Timelock-custodied treasury wallet |
 | Safety & insurance reserve | 3% | USDC | Direct same-tx to `SafetyReserve`; governance-gated incident payouts (§5) |
 | **Total** | **100%** | | |
+
+The 40/40/7/5/5/3 row above is the **steady-state target**, reached once `VotingEscrow`, `SafetyReserve`, and `DelegatorBuyer` are deployed and governance has executed the corresponding `setShares` proposal under the standard 48h timelock. Inactive buckets (share = 0) accumulate zero with no reverts; same-tx legs short-circuit on the share check, epoch-bucket legs (gauge / delegator) skip the storage write. The launch share configuration is documented in [ADR 016 § Tunable Economics](016-contract-interactions.md#tunable-economics).
 
 #### Aggregate operator-aligned compensation = 80%
 
