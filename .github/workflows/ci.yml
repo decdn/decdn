@@ -105,6 +105,11 @@ jobs:
   changes:
     name: detect changes
     runs-on: ubuntu-latest
+    # pull-requests: read is needed by dorny/paths-filter to call the
+    # listFiles API on PR events; on push it falls back to git diff.
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
     steps:
@@ -175,10 +180,12 @@ jobs:
       - name: Generate coverage diff
         id: gendiff
         if: github.event_name == 'pull_request'
+        # The script writes the truncated comment to stdout (captured here for the
+        # PR comment) and the full per-file table directly to $GITHUB_STEP_SUMMARY.
         run: |
           set -euo pipefail
           python3 .github/scripts/coverage-diff.py lcov.info baseline/lcov.info \
-            | tee coverage-comment.md >> "$GITHUB_STEP_SUMMARY"
+            > coverage-comment.md
 
       # always(): if Generate coverage diff fails (e.g. cargo llvm-cov produced no LCOV),
       # post the error message to the PR anyway — coverage-comment.md was written by tee

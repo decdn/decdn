@@ -43,19 +43,23 @@ def parse_lcov(path):
     coverage = {}
     current = None
     lf = lh = 0
-    with open(path, encoding="utf-8") as f:
-        for line_no, raw in enumerate(f, 1):
-            line = raw.rstrip()
-            if line.startswith("SF:"):
-                current = line[3:]
-                lf = lh = 0
-            elif line.startswith("LF:"):
-                lf = _parse_int(line[3:], "LF", line_no, path)
-            elif line.startswith("LH:"):
-                lh = _parse_int(line[3:], "LH", line_no, path)
-            elif line == "end_of_record" and current is not None:
-                coverage[current] = (lf, lh)
-                current = None
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line_no, raw in enumerate(f, 1):
+                line = raw.rstrip()
+                if line.startswith("SF:"):
+                    current = line[3:]
+                    lf = lh = 0
+                elif line.startswith("LF:"):
+                    lf = _parse_int(line[3:], "LF", line_no, path)
+                elif line.startswith("LH:"):
+                    lh = _parse_int(line[3:], "LH", line_no, path)
+                elif line == "end_of_record" and current is not None:
+                    coverage[current] = (lf, lh)
+                    current = None
+    except OSError as e:
+        print(f"warning: could not read {path}: {e}", file=sys.stderr)
+        return None
     return coverage
 
 
@@ -73,8 +77,9 @@ def _parse_int(s, field, line_no, path):
 def changed_rust_files(base_ref):
     """Return set of `.rs` paths changed vs origin/<base_ref>; None on failure.
 
-    Forwards git's stderr to ours so workflow logs show why a diff failed
-    (shallow clone, missing ref, etc.) instead of leaving maintainers to guess.
+    On failure, captures git's stderr and surfaces a single-line summary on our
+    own stderr (workflow log) so maintainers can diagnose shallow-clone or
+    missing-ref problems without having to re-run with verbose flags.
     """
     try:
         result = subprocess.run(
@@ -105,15 +110,27 @@ def fmt_delta(delta):
     if abs(delta) < 0.005:
         return "● 0.00%"
     if delta > 0:
-        return f"▲ +{delta:.2f}%"
-    return f"▼ {delta:.2f}%"
+        return f"▲ +{abs(delta):.2f}%"
+    return f"▼ {abs(delta):.2f}%"
 
 
 def normalize(path):
-    """Strip leading prefixes so absolute and relative LCOV paths match git paths.
+    """Convert an absolute or relative LCOV path to a workspace-relative path.
 
-    cargo-llvm-cov emits absolute paths in some toolchain configs, relative in others.
+    cargo-llvm-cov emits absolute paths under GitHub Actions (e.g.
+    `/home/runner/work/decdn/decdn/crates/cache/src/engine.rs`) and relative
+    ones in other configs. We prefer `os.path.relpath(path, GITHUB_WORKSPACE)`
+    when both are absolute, falling back to a `crates/` substring scan so the
+    script remains usable in local testing where GITHUB_WORKSPACE isn't set.
     """
+    workspace = os.environ.get("GITHUB_WORKSPACE")
+    if workspace and os.path.isabs(path):
+        try:
+            rel = os.path.relpath(path, workspace)
+            if not rel.startswith(".."):
+                return rel
+        except ValueError:
+            pass
     p = path.lstrip("/")
     for root in WORKSPACE_ROOTS:
         idx = p.find(root)
@@ -133,19 +150,18 @@ def main():
 
     head = parse_lcov(head_path)
     if head is None or not head:
-        print(MARKER)
-        print("## Coverage report")
-        print()
         if head is None:
-            print(
+            err = (
                 f"Could not read head coverage file `{head_path}` — "
                 f"the `cargo llvm-cov` step likely failed. See the workflow log."
             )
         else:
-            print(
+            err = (
                 f"Head coverage file `{head_path}` parsed but contained no records — "
                 f"`cargo llvm-cov` likely produced no output. See the workflow log."
             )
+        report = [MARKER, "## Coverage report", "", err]
+        _emit(report, report)
         return 1
 
     base = parse_lcov(base_path) if base_path else None
@@ -154,20 +170,18 @@ def main():
     head_lh = sum(lh for _, lh in head.values())
     head_pct = pct(head_lh, head_lf)
 
-    print(MARKER)
-    print("## Coverage report")
-    print()
+    header = [MARKER, "## Coverage report", ""]
 
     if base is None:
-        print(f"Total: **{fmt_pct(head_pct)}** ({head_lh}/{head_lf} lines)")
-        print()
+        header.append(f"Total: **{fmt_pct(head_pct)}** ({head_lh}/{head_lf} lines)")
+        header.append("")
         if base_path and Path(base_path).parent.is_dir():
-            print(
+            header.append(
                 f"_Baseline `lcov.info` for `origin/{base_ref}` not found "
                 f"(first run on this branch, or the baseline artifact has expired)._"
             )
         else:
-            print(
+            header.append(
                 f"_No baseline coverage available for `origin/{base_ref}` — "
                 f"deltas will appear once the next push to `{base_ref}` completes._"
             )
@@ -175,20 +189,20 @@ def main():
         base_lf = sum(lf for lf, _ in base.values())
         base_lh = sum(lh for _, lh in base.values())
         base_pct = pct(base_lh, base_lf)
-        delta = head_pct - base_pct
-        print(
+        header.append(
             f"Total: **{fmt_pct(head_pct)}** "
-            f"(was {fmt_pct(base_pct)}, {fmt_delta(delta)}) — {head_lh}/{head_lf} lines"
+            f"(was {fmt_pct(base_pct)}, {fmt_delta(head_pct - base_pct)}) — "
+            f"{head_lh}/{head_lf} lines"
         )
 
     changed = changed_rust_files(base_ref)
     if changed is None:
-        print()
-        print(f"_Could not resolve `origin/{base_ref}` — per-file diff unavailable._")
+        report = header + ["", f"_Could not resolve `origin/{base_ref}` — per-file diff unavailable._"]
+        _emit(report, report)
         return 0
     if not changed:
-        print()
-        print("_No Rust files changed in this PR._")
+        report = header + ["", "_No Rust files changed in this PR._"]
+        _emit(report, report)
         return 0
 
     head_norm = {normalize(p): v for p, v in head.items()}
@@ -226,24 +240,43 @@ def main():
         )
 
     if not rows:
-        print()
-        print("_No coverage data for changed Rust files._")
+        report = header + ["", "_No coverage data for changed Rust files._"]
+        _emit(report, report)
         return 0
 
-    print()
-    print("| File | Coverage | Lines | Δ |")
-    print("|---|---:|---:|---:|")
     truncated = len(rows) > MAX_TABLE_ROWS
-    for path, cov, lines, delta in rows[:MAX_TABLE_ROWS]:
-        print(f"| `{path}` | {cov} | {lines} | {delta} |")
+    truncation_note = (
+        f"_Showing top {MAX_TABLE_ROWS} of {len(rows)} changed files — "
+        f"see the workflow Step Summary for the full table._"
+    )
+    stdout_report = header + [""] + list(_table_lines(rows[:MAX_TABLE_ROWS]))
     if truncated:
-        print()
-        print(
-            f"_Showing top {MAX_TABLE_ROWS} of {len(rows)} changed files — "
-            f"see the workflow Step Summary for the full table._"
-        )
-
+        stdout_report += ["", truncation_note]
+    summary_report = header + [""] + list(_table_lines(rows))
+    _emit(stdout_report, summary_report)
     return 0
+
+
+def _emit(stdout_lines, summary_lines):
+    """Write the report to stdout and (when set) to GITHUB_STEP_SUMMARY."""
+    sys.stdout.write("\n".join(stdout_lines) + "\n")
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not summary_path:
+        return
+    try:
+        with open(summary_path, "a", encoding="utf-8") as f:
+            f.write("\n".join(summary_lines) + "\n")
+    except OSError as e:
+        print(f"warning: could not write step summary at {summary_path}: {e}",
+              file=sys.stderr)
+
+
+def _table_lines(rows):
+    """Yield markdown lines for the coverage table (header + body)."""
+    yield "| File | Coverage | Lines | Δ |"
+    yield "|---|---:|---:|---:|"
+    for path, cov, lines, delta in rows:
+        yield f"| `{path}` | {cov} | {lines} | {delta} |"
 
 
 if __name__ == "__main__":
