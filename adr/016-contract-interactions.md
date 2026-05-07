@@ -25,7 +25,7 @@ All on-chain contracts inherit from [OpenZeppelin Contracts](https://docs.openze
 | FeeRouter | [026](026-gauge-boost-tokenomics.md) | Yes | USDC (transient + epoch buckets), TOKEN (delegator-pool epoch buckets) | `AccessControl`, `ReentrancyGuard`, `Pausable` |
 | VotingEscrow | [026](026-gauge-boost-tokenomics.md) | Yes | TOKEN (locked, non-transferable) | `ReentrancyGuard`, `Pausable` |
 | SafetyReserve | [026](026-gauge-boost-tokenomics.md), [028](028-slashing-appeals.md) | Yes | USDC (3% bucket + slashing redirect), TOKEN (transient until keeper swap) | `AccessControl`, `ReentrancyGuard`, `Pausable` (includes [ADR 028](028-slashing-appeals.md) appeal extensions: `openSlashAppeal` / `fastTrackAppeal` / `rejectAppeal` / `ratifyAppeal` / `reverseAppeal`) |
-| BuybackBurner | [018](018-liquidity-strategy.md), [026](026-gauge-boost-tokenomics.md) | Yes | USDC, TOKEN (transient) | `AccessControl`, `ReentrancyGuard`, `Pausable` (full Balancer V3 swap-and-burn path; the prior accumulate-only PoC stub is gone) |
+| BuybackBurner | [018](018-liquidity-strategy.md), [026](026-gauge-boost-tokenomics.md) | Yes | USDC, TOKEN (transient) | `AccessControl`, `ReentrancyGuard`, `Pausable` (Balancer V3 swap-and-burn path) |
 | DelegatorBuyer | [026](026-gauge-boost-tokenomics.md) §6 | Yes | USDC, TOKEN (transient) | `AccessControl`, `ReentrancyGuard`, `Pausable` (USDC→TOKEN swap for the delegator pool; implementation choice between a parallel contract or a `BuybackBurner` multi-output mode is deferred per § Deployment Order below) |
 | ContentBlacklist | [011](011-content-takedown.md) | No | — | `AccessControl`, `ReentrancyGuard` (full surface: hash-level — global + regional — operator-level — `addOrigin` / `removeOrigin` / `isOriginBlacklisted` — and the [ADR 011 § Blacklist Entry Appeals](011-content-takedown.md#blacklist-entry-appeals) API) |
 | PublisherRegistry | [002](002-content-addressing.md) | No | — | `AccessControl`, `ReentrancyGuard` |
@@ -50,6 +50,7 @@ classDiagram
         +claimDelegator(epochs)
         +workingBytes(op, epoch)
         +executeDelegatorSwap(epoch, minOut)
+        +depositDelegatorTokens(epoch, amount)
     }
     class VotingEscrow {
         +createLock(amount, duration)
@@ -88,7 +89,7 @@ classDiagram
     FeeRouter ..> SafetyReserve : 3% USDC
     FeeRouter ..> DelegatorBuyer : 7% USDC (delegator pool)
     DelegatorBuyer ..> BalancerV3Pool : USDC→TOKEN swap
-    DelegatorBuyer ..> FeeRouter : deposit TOKEN to delegator bucket
+    DelegatorBuyer ..> FeeRouter : depositDelegatorTokens
     BuybackBurner ..> BalancerV3Pool : swap USDC→TOKEN
     Governor ..> VotingEscrow : voting weight
     Governor ..> SafetyReserve : payout authorization
@@ -122,24 +123,24 @@ No deCDN contract uses proxy (upgradeable) deployment patterns. Production contr
 
 ### 2. Deployment Order and Initialization Dependencies
 
-Contracts must be deployed in dependency order — each contract's constructor requires the addresses of contracts deployed before it. `FeeRouter` accepts `address(0)` for `VotingEscrow` / `SafetyReserve` / `DelegatorBuyer` if those aren't co-deployed; the cross-validation invariant in § Tunable Economics ensures any non-zero share has a non-zero destination, so the launch share configuration determines which dependencies must already be wired.
+Contracts must be deployed in dependency order — each contract's constructor requires the addresses of contracts deployed before it. `FeeRouter` accepts `address(0)` for `VotingEscrow` / `SafetyReserve` / `DelegatorBuyer` at construction; the cross-validation invariant in § Tunable Economics ensures any non-zero share has a non-zero destination, so the launch share configuration determines which dependencies must already be wired. `DelegatorBuyer` is deployed after `FeeRouter` so its constructor can pin the router address as immutable; governance then calls `FeeRouter.setDelegatorBuyer(addr)` to complete the bidirectional wiring.
 
 ```mermaid
 graph TD
     TOKEN["1. TOKEN (ERC-20, fixed-supply)"]
     USDC["2. USDC (existing or testnet)"]
-    SR["3. StakingRegistry"]
-    VE["4. VotingEscrow"]
-    SAFE["5. SafetyReserve"]
-    BB["6. BuybackBurner"]
-    DB["7. DelegatorBuyer"]
+    TL["3. TimelockController"]
+    SR["4. StakingRegistry"]
+    VE["5. VotingEscrow"]
+    SAFE["6. SafetyReserve"]
+    BB["7. BuybackBurner"]
     FR["8. FeeRouter"]
-    SPC["9. StablePaymentChannel"]
-    PR["10. PublisherRegistry"]
-    OA["11. OriginAssignment"]
-    CB["12. ContentBlacklist"]
-    SJ["13. SlashJudge"]
-    TL["14. TimelockController"]
+    DB["9. DelegatorBuyer"]
+    SPC["10. StablePaymentChannel"]
+    PR["11. PublisherRegistry"]
+    OA["12. OriginAssignment"]
+    CB["13. ContentBlacklist"]
+    SJ["14. SlashJudge"]
     GOV["15. DecdnGovernor"]
 
     SR --> TOKEN
@@ -147,13 +148,14 @@ graph TD
     SAFE --> USDC
     BB --> TOKEN
     BB --> USDC
-    DB --> TOKEN
-    DB --> USDC
     FR --> USDC
+    FR --> TL
     FR -.->|"optional at deploy"| BB
     FR -.->|"optional at deploy"| SAFE
     FR -.->|"optional at deploy"| VE
-    FR -.->|"optional at deploy"| DB
+    DB --> TOKEN
+    DB --> USDC
+    DB --> FR
     SPC --> USDC
     SPC --> SR
     SPC --> FR
@@ -171,20 +173,20 @@ graph TD
 
 | Step | Contract | Constructor Requires |
 | --- | --- | --- |
-| 1 | TOKEN | Initial holder, initial supply (1B fixed per [ADR 026](026-gauge-boost-tokenomics.md) §1), owner. No `mint()` function on the production contract; testnet seeding happens via the constructor `_mint(initialHolder, 1_000_000_000e18)`. |
+| 1 | TOKEN | Initial holder, initial supply (1B fixed per [ADR 026](026-gauge-boost-tokenomics.md) §1), owner. No `mint()` function; testnet seeding happens via the constructor `_mint(initialHolder, 1_000_000_000e18)`. |
 | 2 | USDC | External (testnet faucet or mainnet address) |
-| 3 | StakingRegistry | TOKEN address, `minStake` (**50,000 TOKEN** per [ADR 026](026-gauge-boost-tokenomics.md) §7), `unbondingPeriod` (7 days). No discount-threshold parameters; operator return is differentiated through the gauge-boost flow in `FeeRouter`. |
-| 4 | VotingEscrow | TOKEN address, `minLockDuration` (1 week), `maxLockDuration` (4 years). No `create_lock_for` privileged path; auto-ve-lock not exposed. Implements `balanceOfAt(user, ts)` and `totalSupplyAt(ts)` historical checkpointing ([ADR 026](026-gauge-boost-tokenomics.md) §4). |
-| 5 | SafetyReserve | USDC address, Governor address (payout authorizer; may be `address(0)` at deploy and set via `setGovernor` once `DecdnGovernor` is deployed), emergency-multisig address (fast-track approver under hard caps), `appealWindow` (48h) ([ADR 026](026-gauge-boost-tokenomics.md) §5). [ADR 028](028-slashing-appeals.md) appeal extensions are part of the same contract — no separate deployment. |
-| 6 | BuybackBurner | TOKEN address, USDC address, Balancer V3 Router address, initial pool contract `address` (may be zero-address at deploy and set later via `setPool(address)` — see [ADR 003](003-payments.md#buybackburner) for the interface and [ADR 018](018-liquidity-strategy.md) for the venue rationale). The pool address remains governance-mutable post-deploy via `setPool(address)`; the constructor value is an initial convenience, not a hard requirement. **Inflow source:** `FeeRouter` ([ADR 026](026-gauge-boost-tokenomics.md) §8); the contract surface is otherwise unchanged. **Router address and naming:** see [ADR 018 §"Buyback execution via Balancer V3"](018-liquidity-strategy.md#buyback-execution-via-balancer-v3) for the canonical Balancer V3 Router address and the `Router v2` label disambiguation. **Approvals note:** `BuybackBurner` MUST self-approve the Balancer V3 **Vault** address (distinct from the Router) during initialization — the Vault pulls input tokens from `msg.sender`, which is `BuybackBurner`. The V3 footgun reference and Vault address live in [ADR 018](018-liquidity-strategy.md#buyback-execution-via-balancer-v3). |
-| 7 | DelegatorBuyer | TOKEN address, USDC address, Balancer V3 Router address, initial pool address (same handling as `BuybackBurner`), and the `FeeRouter` address (deposit target). Same Vault-scoped self-approval pattern. May be implemented as a parallel contract or as a `BuybackBurner` multi-output mode (choice deferred to implementation per [§ Contract Inventory](#1-contract-inventory)). |
-| 8 | FeeRouter | USDC address, TOKEN address, treasury wallet address, Balancer V3 Router address, `epochLength` (1 week), `claimWindow` (26 epochs), launch split shares (cross-validated against dependency addresses), and `boostFloor` (0.4) per [ADR 026](026-gauge-boost-tokenomics.md) §3. **Dependency addresses** (`votingEscrow`, `safetyReserve`, `delegatorBuyer`, `buybackBurner`) may all be `address(0)` at deploy and set later via the governance-mutable setters in [§ Tunable Economics](#tunable-economics); the cross-validation invariant ensures any non-zero share has a non-zero destination at construction time. Steady-state target shares per [ADR 026](026-gauge-boost-tokenomics.md) §2 are 40/40/7/5/5/3 in basis points. |
-| 9 | StablePaymentChannel | USDC address, StakingRegistry address, FeeRouter address, `disputeWindow` (48h), `maxChannelDuration` (90 days), rate bounds ([ADR 003](003-payments.md)). `settleChannel` does not skim a protocol fee inline — it transfers the full operator USDC balance to `FeeRouter.routeSettlement(operator, bytesDelivered, amount)` in the same transaction. `setFeeRouter(address)` is governance-mutable per [§ No proxy deployment patterns](#no-proxy-deployment-patterns) carve-out. |
-| 10 | PublisherRegistry | None. Permissionless registration; namespace cap and transfer-timelock parameters are read from the governance-controlled parameter store at call time. See [ADR 002 § Contract: PublisherRegistry](002-content-addressing.md#contract-publisherregistry). |
-| 11 | OriginAssignment | StakingRegistry, PublisherRegistry, ContentBlacklist (latter may be zero at deploy; bound via `setContentBlacklist`). Min-redundancy, timelock, and default-open parameters are governance-controlled. See [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority) and [§ OriginAssignment construction notes](#originassignment-construction-notes) below. |
-| 12 | ContentBlacklist | `ContentBlacklist(address stakingRegistry)`. StakingRegistry address is required for `ejectNode()`. ContentBlacklist no longer cross-calls `OriginAssignment` (security relies on runtime checks; see [ADR 011 § Interaction with ContentBlacklist](011-content-takedown.md#interaction-with-contentblacklist)). After deployment, `OriginAssignment.setContentBlacklist(address)` is called once via the deployer / admin to wire the read direction (`OriginAssignment.pruneBlacklistedAssignment` queries `ContentBlacklist.isOriginBlacklisted`). |
-| 13 | SlashJudge | StakingRegistry address, TOKEN address, `challengeBond` (100 TOKEN), `counterEvidenceWindow` (24h) |
-| 14 | TimelockController | OZ `TimelockController(minDelay, proposers, executors, admin)` — `minDelay` is 48h ([ADR 009](009-governance.md)). `proposers` is `[DecdnGovernor]` (set after step 15), `executors` is `[address(0)]` (anyone may execute after the delay). |
+| 3 | TimelockController | OZ `TimelockController(minDelay, proposers, executors, admin)` — `minDelay` is 48h ([ADR 009](009-governance.md)). Deployed early so its address is available to `FeeRouter` as the treasury bucket destination and to every `AccessControl`-bearing contract as the eventual `DEFAULT_ADMIN_ROLE` holder. `proposers` is initialized empty and `PROPOSER_ROLE` is granted to `DecdnGovernor` post-deploy (step 15); `executors` is `[address(0)]` (anyone may execute after the delay). |
+| 4 | StakingRegistry | TOKEN address, `minStake` (**50,000 TOKEN** per [ADR 026](026-gauge-boost-tokenomics.md) §7), `unbondingPeriod` (7 days). No discount-threshold parameters; operator return is differentiated through the gauge-boost flow in `FeeRouter`. |
+| 5 | VotingEscrow | TOKEN address, `minLockDuration` (1 week), `maxLockDuration` (4 years). No `create_lock_for` privileged path; auto-ve-lock not exposed. Implements `balanceOfAt(user, ts)` and `totalSupplyAt(ts)` historical checkpointing ([ADR 026](026-gauge-boost-tokenomics.md) §4). |
+| 6 | SafetyReserve | USDC address, Governor address (payout authorizer; may be `address(0)` at deploy and set via `setGovernor` once `DecdnGovernor` is deployed), emergency-multisig address (fast-track approver under hard caps), `appealWindow` (48h) ([ADR 026](026-gauge-boost-tokenomics.md) §5). [ADR 028](028-slashing-appeals.md) appeal extensions are part of the same contract — no separate deployment. |
+| 7 | BuybackBurner | TOKEN address, USDC address, Balancer V3 Router address, initial pool contract `address` (may be zero-address at deploy and set later via `setPool(address)` — see [ADR 003](003-payments.md#buybackburner) for the interface and [ADR 018](018-liquidity-strategy.md) for the venue rationale). The pool address remains governance-mutable post-deploy via `setPool(address)`; the constructor value is an initial convenience, not a hard requirement. **Inflow source:** `FeeRouter` ([ADR 026](026-gauge-boost-tokenomics.md) §8). **Router address and naming:** see [ADR 018 §"Buyback execution via Balancer V3"](018-liquidity-strategy.md#buyback-execution-via-balancer-v3) for the canonical Balancer V3 Router address and the `Router v2` label disambiguation. **Approvals note:** `BuybackBurner` MUST self-approve the Balancer V3 **Vault** address (distinct from the Router) during initialization — the Vault pulls input tokens from `msg.sender`, which is `BuybackBurner`. The V3 footgun reference and Vault address live in [ADR 018](018-liquidity-strategy.md#buyback-execution-via-balancer-v3). |
+| 8 | FeeRouter | USDC address, TOKEN address, **`TimelockController` address** (treasury bucket destination), Balancer V3 Router address, `epochLength` (1 week), `claimWindow` (26 epochs), launch split shares (cross-validated against dependency addresses), and `boostFloor` (0.4) per [ADR 026](026-gauge-boost-tokenomics.md) §3. **Dependency addresses** (`votingEscrow`, `safetyReserve`, `delegatorBuyer`, `buybackBurner`) may all be `address(0)` at deploy and set later via the governance-mutable setters in [§ Tunable Economics](#tunable-economics); the cross-validation invariant ensures any non-zero share has a non-zero destination at construction time. Steady-state target shares per [ADR 026](026-gauge-boost-tokenomics.md) §2 are 40/40/7/5/5/3 in basis points. |
+| 9 | DelegatorBuyer | TOKEN address, USDC address, Balancer V3 Router address, initial pool address (same handling as `BuybackBurner`), and the **`FeeRouter` address** (deposit target — `depositDelegatorTokens(epoch, amount)`). Same Vault-scoped self-approval pattern. May be implemented as a parallel contract or as a `BuybackBurner` multi-output mode (choice deferred to implementation per [§ Contract Inventory](#1-contract-inventory)). After deployment, governance calls `FeeRouter.setDelegatorBuyer(address(delegatorBuyer))` to complete the bidirectional wiring. |
+| 10 | StablePaymentChannel | USDC address, StakingRegistry address, FeeRouter address, `disputeWindow` (48h), `maxChannelDuration` (90 days), rate bounds ([ADR 003](003-payments.md)). `settleChannel` does not skim a protocol fee inline — it transfers the full operator USDC balance to `FeeRouter.routeSettlement(operator, bytesDelivered, amount)` in the same transaction. `setFeeRouter(address)` is governance-mutable per [§ No proxy deployment patterns](#no-proxy-deployment-patterns) carve-out. |
+| 11 | PublisherRegistry | None. Permissionless registration; namespace cap and transfer-timelock parameters are read from the governance-controlled parameter store at call time. See [ADR 002 § Contract: PublisherRegistry](002-content-addressing.md#contract-publisherregistry). |
+| 12 | OriginAssignment | StakingRegistry, PublisherRegistry, ContentBlacklist (latter may be zero at deploy; bound via `setContentBlacklist`). Min-redundancy, timelock, and default-open parameters are governance-controlled. See [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority) and [§ OriginAssignment construction notes](#originassignment-construction-notes) below. |
+| 13 | ContentBlacklist | `ContentBlacklist(address stakingRegistry)`. StakingRegistry address is required for `ejectNode()`. `ContentBlacklist` does not cross-call `OriginAssignment`; security relies on runtime checks (see [ADR 011 § Interaction with ContentBlacklist](011-content-takedown.md#interaction-with-contentblacklist)). After deployment, `OriginAssignment.setContentBlacklist(address)` is called once via the deployer / admin to wire the read direction (`OriginAssignment.pruneBlacklistedAssignment` queries `ContentBlacklist.isOriginBlacklisted`). |
+| 14 | SlashJudge | StakingRegistry address, TOKEN address, `challengeBond` (100 TOKEN), `counterEvidenceWindow` (24h) |
 | 15 | DecdnGovernor | OZ Governor wrapper composing `Governor` + `GovernorSettings` + `GovernorVotes` + `GovernorVotesQuorumFraction` + `GovernorTimelockControl`. Constructor wires `VotingEscrow` (vote source) + `TimelockController` (execution target) + the [ADR 009](009-governance.md) defaults (7-day vote, 0.1% proposal threshold, 4% quorum). After deployment, `TimelockController.grantRole(PROPOSER_ROLE, address(decdnGovernor))`. |
 
 #### OriginAssignment construction notes
@@ -281,7 +283,7 @@ graph LR
     FR -->|"7% USDC (delegator pool)"| DB
     FR -->|"safeTransfer (operator base, treasury, claims)"| ERC
     DB -->|"Router.swapSingleTokenExactIn() (delegator pool)"| BAL
-    DB -->|"deposit TOKEN to delegator bucket"| FR
+    DB -->|"depositDelegatorTokens(epoch, amount)"| FR
     GOV -->|"balanceOfAt / totalSupplyAt"| VE
     GOV -->|"payout(bundle, recipient, amount)"| SAFE
     GOV -->|"setShares / setVotingEscrow / setSafetyReserve / setDelegatorBuyer / setBuybackBurner / setTreasury"| FR
@@ -492,7 +494,6 @@ Full parameter table with safety bounds is in [ADR 009](009-governance.md#govern
 
 | Parameter | Min | Max | Contract |
 | --- | --- | --- | --- |
-| Protocol fee (legacy inline skim — not used post-FeeRouter) | 0 bps | 2000 bps (20%) | StablePaymentChannel |
 | Slash % per offense | 5% | 50% | StakingRegistry |
 | Dispute window | 12h | 72h | StablePaymentChannel |
 | **Minimum stake** | **50,000 TOKEN (default)** | **per [ADR 026](026-gauge-boost-tokenomics.md) §7** | **StakingRegistry — discount-threshold logic removed** |

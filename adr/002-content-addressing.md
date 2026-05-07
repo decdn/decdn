@@ -44,7 +44,7 @@ This design choice is deliberate. A first-write-wins / one-claim rule would crea
 - **Stranded hashes.** A namespace owner who loses keys, abandons, or refuses cooperation strands every hash they have claimed: no path exists for another publisher or the DAO to authorize fresh origin operators for that hash. The namespace lifecycle (revocation, transfer) all require the current owner.
 - **Squatting.** Any party could pre-claim popular hashes (e.g., a future release ISO's BLAKE3) and block the legitimate publisher, with no anti-squatting mechanism short of governance overrides.
 
-Multi-claim eliminates both: claims do not block other claims; defunct namespaces do not block alternative origin authorities; squatting gates nothing because the squatter cannot prevent independent claims. The trade-off — that the protocol no longer presents an on-chain claim as "the official publisher of this content" — is accepted because that framing is not load-bearing on any protocol primitive: takedown is hash-keyed, and origin authorization is consumed off-chain by routing/discovery layers that can OR-search the claiming set without protocol-level signaling.
+Multi-claim eliminates both: claims do not block other claims; defunct namespaces do not block alternative origin authorities; squatting gates nothing because the squatter cannot prevent independent claims. The trade-off — that the protocol does not present an on-chain claim as "the official publisher of this content" — is accepted because that framing is not load-bearing on any protocol primitive: takedown is hash-keyed, and origin authorization is consumed off-chain by routing/discovery layers that can OR-search the claiming set without protocol-level signaling.
 
 ### Why this lives in ADR 002
 
