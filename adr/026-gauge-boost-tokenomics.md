@@ -144,6 +144,101 @@ Locks may be held by any address — EOA or contract. Lock creation (`createLock
 
 **Operator stake and ve-positions are separate.** A node's operator stake is held in `StakingRegistry` and is slashable (rates per §8). A ve-position is held in `VotingEscrow` and is not. Neither satisfies the other's requirements; an operator may hold any combination. This separation is a hard invariant — no contract path lets ve-locked TOKEN be slashed.
 
+#### Contract: VotingEscrow
+
+```solidity
+interface IVotingEscrow {
+    // ─── Lock lifecycle ────────────────────────────────────────────────
+    // Lock `amount` of TOKEN until `unlockTime` (absolute, seconds).
+    // `unlockTime` is rounded down to the nearest week boundary internally
+    // (week-aligned slopes — Curve veCRV pattern). Reverts if the caller
+    // already holds a lock, if `unlockTime - block.timestamp` is outside
+    // [minLockDuration, maxLockDuration], or if `amount == 0`.
+    function createLock(uint256 amount, uint256 unlockTime) external;
+
+    // Add `amount` of TOKEN to the caller's existing lock without changing
+    // the unlock time. Reverts if the caller has no active lock or the
+    // lock has already expired.
+    function increaseAmount(uint256 amount) external;
+
+    // Extend the caller's lock to a later `unlockTime` (absolute, seconds,
+    // week-aligned internally). Reverts if `unlockTime` is at or before
+    // the current end, if the new remaining duration would exceed
+    // `maxLockDuration`, or if the lock has already expired.
+    function increaseUnlockTime(uint256 unlockTime) external;
+
+    // Withdraw the full locked TOKEN balance after the lock's unlock time
+    // has passed. Lump-sum only — no partial withdrawals. Reverts if the
+    // lock has not yet expired (no early-exit penalty path; ve-locked
+    // TOKEN never exits early).
+    function withdraw() external;
+
+    // ─── Lock view ─────────────────────────────────────────────────────
+    // Returns the caller's lock state: locked amount and unlock time.
+    // Returns (0, 0) for addresses that have never locked or have already
+    // withdrawn. Single read covers the common "what does this address
+    // hold and when does it unlock" query.
+    function locked(address account)
+        external view returns (uint256 amount, uint256 end);
+
+    // ─── ve-balance ────────────────────────────────────────────────────
+    // Current voting weight: amount × remaining_lock_time / maxLockDuration.
+    // Decays linearly to zero at the lock's unlock time.
+    function balanceOf(address account) external view returns (uint256);
+
+    // Historical voting weight at unix timestamp `ts`. Per-lock checkpoints
+    // make this an O(log n) read on the checkpoint array. Load-bearing for
+    // the epoch-snapshot pattern in §2 (FeeRouter gauge accounting) and
+    // governance vote-weight reads in §9. `ts` may be in the past or
+    // present; future timestamps are rejected.
+    function balanceOfAt(address account, uint256 timestamp)
+        external view returns (uint256);
+
+    // Current total ve-supply (sum of all balanceOf at block.timestamp).
+    function totalSupply() external view returns (uint256);
+
+    // Historical total ve-supply at unix timestamp `ts`. Same checkpoint
+    // pattern as `balanceOfAt`; used by Governor for quorum calculations
+    // calibrated against `VotingEscrow.totalSupplyAt(ts)` per §9.
+    function totalSupplyAt(uint256 timestamp) external view returns (uint256);
+
+    // ─── Vote delegation (Governor Bravo pattern) ──────────────────────
+    // Delegate the caller's ve-balance voting weight to `delegatee`. The
+    // underlying ve-position remains non-transferable; only voting weight
+    // is reassigned. Pass `address(0)` to clear delegation (weight reverts
+    // to self-delegation by default). See ADR 009 §44.
+    function delegate(address delegatee) external;
+
+    // EIP-712 signed delegation, for gasless delegation flows.
+    function delegateBySig(
+        address delegatee,
+        uint256 nonce,
+        uint256 expiry,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external;
+
+    // Returns the address `account` has delegated to, or `account` itself
+    // if no delegation has been set (self-delegation is the default).
+    function delegates(address account) external view returns (address);
+
+    // ─── Events ────────────────────────────────────────────────────────
+    event LockCreated(address indexed account, uint256 amount, uint256 unlockTime);
+    event LockIncreased(address indexed account, uint256 addedAmount, uint256 newAmount);
+    event LockExtended(address indexed account, uint256 oldUnlockTime, uint256 newUnlockTime);
+    event Withdrawn(address indexed account, uint256 amount);
+    event DelegateChanged(address indexed delegator, address indexed fromDelegate, address indexed toDelegate);
+    event DelegateVotesChanged(address indexed delegate, uint256 previousBalance, uint256 newBalance);
+}
+```
+
+**Notes:**
+
+- `createLock` is one-lock-per-address (veCRV pattern). NFT-per-lock (Velodrome / Aerodrome style) is out of scope — if a future ADR introduces it, it ships as an additive top-level contract that holds a single pooled ve-lock here, per [§ Lock ownership](#lock-ownership) above.
+- `getVotes` / `getPastVotes` are deliberately omitted from this interface. Governor (per §9) reads voting weight via `balanceOfAt(user, ts)` / `totalSupplyAt(ts)` rather than the OZ Governor Bravo `getPastVotes(account, blockNumber)` shape, because ve-weight is a function of timestamp (linear decay) not block number. Wallets and indexers that expect Bravo's view surface adapt against `balanceOf` / `balanceOfAt` directly.
+- Delegation reassigns voting weight but not the underlying ve-position — locks remain non-transferable per the §4 invariant. Delegation events follow OZ Governor Bravo so existing Bravo-aware tooling (Tally, Boardroom, etc.) integrates without a custom adapter.
+
 ### 5. Safety and insurance reserve (3% bucket)
 
 The 3% safety bucket is held in `SafetyReserve`, a governance-gated incident reserve. Eligible payout categories per design spec §2.2.5:
