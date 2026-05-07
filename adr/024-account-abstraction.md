@@ -91,7 +91,6 @@ Safe smart wallets are the **recommended** wallet type for both node operators a
 
 - **Channel operations:** The Safe (or EOA) deposits USDC into `StablePaymentChannel.openChannel()`. That address is the `channel.client`. Client software supports both wallet types — `SignatureChecker` makes the choice transparent to every contract.
 - **Voucher signing:** EIP-712 vouchers are signed with the `channel.client` key. `SignatureChecker` on the channel contract validates against `channel.client` (EOA → ECDSA; 1-of-1 Safe → `checkSignatures` via stock handler). The session-key path (signing at delivery speed via `erc7579/smartsessions` without exposing the Safe owner key) lands when § 3 ships.
-- **Priority staking:** If the client stakes TOKEN for priority ([ADR 003](003-payments.md)), the wallet holds the staked TOKEN.
 
 ### 3. Session Keys — Deferred to Production via ERC-7579 smartsessions
 

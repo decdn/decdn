@@ -567,34 +567,18 @@ The full node registry interface (`NodeInfo`, `registerNode` with atomic binding
 
 > **No on-channel fee-discount path.** Operator return is differentiated through ve-locked gauge boost ([ADR 026 §3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula)), not via a stake-multiple fee toggle on the channel contract. `getEffectiveFee`, `getStakeMultiple`, `DISCOUNT_MULTIPLE`, `feePercentage`, and `discountedFeePercentage` are not part of the interface. `StakingRegistry` retains its slashing, registration, and stake-bookkeeping responsibilities; the minimum stake is **50,000 TOKEN** ([ADR 026 §7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake)).
 
-The remaining payment-specific `StakingRegistry` extension is the optional client-priority-staking mechanism below.
+No payment-specific extensions to `StakingRegistry` are required beyond the registry interface defined in [ADR 001](001-network.md).
 
-| Function | Purpose |
-| --- | --- |
-| `clientStake(amount)` | `nonReentrant`: pull `amount` TOKEN via `safeTransferFrom`; bump `clientStakes[msg.sender]`; emit `ClientStaked`. No slashing. |
-| `clientUnstake(amount)` | `nonReentrant`: require sufficient stake; decrement `clientStakes[msg.sender]`; transfer back via `safeTransfer`; emit `ClientUnstaked`. |
-| `clientStakeOf(client) → uint256` | View the address's current stake. |
+## Admission and Priority
 
-Storage: `mapping(address => uint256) public clientStakes`. Events: `ClientStaked(client, amount, newTotal)`, `ClientUnstaked(client, amount, newTotal)`. Uses `SafeERC20` for the `IERC20` token (the protocol's TOKEN, per [ADR 026](026-gauge-boost-tokenomics.md)).
+Node admission and queueing policy — how a node orders incoming `StreamRequest`s under congestion — is implementation-defined and lives outside the protocol. The wire format carries no priority bits, the channel and voucher mechanisms encode no per-stream priority state, and different operators are expected to tune their policy differently. Two signals are available to any admission policy:
 
-## Client Priority Staking
-
-A lightweight, optional mechanism for clients to signal commitment:
-
-- Clients call `StakingRegistry.clientStake(amount)` to deposit TOKEN
-- No minimum, no slashing, no unbonding period — just a deposit
-- Nodes check client stake via `StakingRegistry.clientStakeOf(address)`
-- During congestion, nodes prioritize higher-staking clients in their connection queue
-- Enforcement is off-chain (node-side logic), not on-chain
-- Clients withdraw anytime: `StakingRegistry.clientUnstake(amount)`
-
-**NodeId-to-address mapping:** See [NodeId-to-Ethereum Binding](#nodeid-to-ethereum-binding) for the full specification of how iroh NodeIds are bound to Ethereum addresses.
-
-This is a soft signal, not a hard gate. Non-staking clients still get served, just with lower priority during congestion.
+- **Committed voucher rate.** The advertised `rate_per_mb` in `ProbeResponse` / `StreamResponse` is a **floor**, not equality — nodes verify `amount_delta / bytes_delta >= rate_per_mb`. Clients MAY commit at higher rates; nodes MAY use the committed rate as a per-stream priority key, with the premium paid directly via [`FeeRouter.routeSettlement`](#feerouter-integration).
+- **Registered node-stake.** `StakingRegistry.stakeOf(address)` is readable on-chain for any registered operator. Nodes MAY treat addresses with `stakeOf >= MIN_STAKE` ([ADR 026 §7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake)) as eligible for a higher-priority admission lane.
 
 ## NodeId-to-Ethereum Binding
 
-The protocol requires a verifiable mapping between iroh NodeIds (ed25519 public keys) and Ethereum addresses (secp256k1-derived). This binding is used for client priority staking lookups, payment channel association, and slash evidence attribution. Two orthogonal signature mechanisms protect this mapping: the EIP-712 `bindingSignature` (secp256k1) proves the Ethereum key holder consents to the association — preventing un-slashable registration; the `ed25519Signature` ([ADR 001, NodeId Ownership Verification](001-network.md#nodeid-ownership-verification)) proves the NodeId's private key holder authorized the registration — preventing NodeId squatting.
+The protocol requires a verifiable mapping between iroh NodeIds (ed25519 public keys) and Ethereum addresses (secp256k1-derived). This binding is used for payment channel association and slash evidence attribution. Two orthogonal signature mechanisms protect this mapping: the EIP-712 `bindingSignature` (secp256k1) proves the Ethereum key holder consents to the association — preventing un-slashable registration; the `ed25519Signature` ([ADR 001, NodeId Ownership Verification](001-network.md#nodeid-ownership-verification)) proves the NodeId's private key holder authorized the registration — preventing NodeId squatting.
 
 ### Binding Message Format
 
@@ -677,14 +661,13 @@ function resolveNodeId(bytes32 nodeId) external view returns (address) {
 
 ### Off-Chain (Ephemeral) Binding for Clients
 
-Clients who do not wish to register on-chain (e.g., for priority staking lookups only) include a signed binding in their `StreamRequest`. The node verifies the EIP-712 signature over `BindNodeId(nodeId, nonce=0)` using `SignatureChecker` semantics: `ecrecover` for EOA clients, or an RPC call to `isValidSignature` for smart account clients ([ADR 024](024-account-abstraction.md#4-off-chain-erc-1271-verification)). The verified address is used for `clientStakeOf` lookups. This ephemeral binding is not stored on-chain and is valid only for the session.
+Clients without on-chain registration MAY include a signed binding in their `StreamRequest` to attest a NodeId↔Ethereum-address mapping for the connection's lifetime. The node verifies the EIP-712 signature over `BindNodeId(nodeId, nonce=0)` using `SignatureChecker` semantics: `ecrecover` for EOA clients, or an RPC call to `isValidSignature` for smart account clients ([ADR 024](024-account-abstraction.md#4-off-chain-erc-1271-verification)). The verified address is cached for the connection's lifetime and used for voucher attribution. This ephemeral binding is not stored on-chain and is valid only for the session. Wire-format details are in [ADR 005](005-protocol.md#client-identity-binding).
 
 ### Binding Requirements by Role
 
 | Role | On-chain binding required? | Rationale |
 | --- | --- | --- |
 | Node (staked) | **Yes** — `registerNode` performs binding atomically via `bindingSignature` (EIP-712, proves Ethereum key consent) and `ed25519Signature` (proves NodeId ownership) | Slash evidence references on-chain NodeId→address mapping; atomic binding eliminates gap; ed25519 proof prevents NodeId squatting |
-| Client (priority staking) | No — ephemeral binding in `StreamRequest` is sufficient | Priority staking is a soft signal; no on-chain enforcement needed |
 | Client (opening channels) | No — channel `client` field is the Ethereum address directly | Channel operations use Ethereum addresses, not NodeIds |
 
 ### Rebinding
@@ -722,7 +705,7 @@ The router does not validate `bytesDelivered` against any oracle of physical del
 
 Slashing and payment channels are independent by design. The following interactions apply regardless of which governance-approved tokens are in use (see [ADR 010](010-multi-token.md)).
 
-**Slashing does not affect channel funds.** Slashing operates exclusively on TOKEN stake in the `StakingRegistry` (slashing schedule per [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn) — 5%/15%/50% escalation tiers, 50% challenger / 30% safety / 20% burn distribution). Funds deposited into payment channels are client deposits held in escrow — they are not stake and are never touched by slashing. This follows directly from the functional separation described in [Consequences](#consequences): payment channel contracts never hold or move TOKEN stake, cannot be called by `StakingRegistry` to slash or reassign stake, and any `StakingRegistry` interaction is read-only (e.g., resolving NodeId↔address bindings or checking client priority stake).
+**Slashing does not affect channel funds.** Slashing operates exclusively on TOKEN stake in the `StakingRegistry` (slashing schedule per [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn) — 5%/15%/50% escalation tiers, 50% challenger / 30% safety / 20% burn distribution). Funds deposited into payment channels are client deposits held in escrow — they are not stake and are never touched by slashing. This follows directly from the functional separation described in [Consequences](#consequences): payment channel contracts never hold or move TOKEN stake, cannot be called by `StakingRegistry` to slash or reassign stake, and any `StakingRegistry` interaction is read-only (e.g., resolving NodeId↔address bindings).
 
 **Slashing can drop a node below minimum stake while channels are open.** Because channel deposits are independent of stake, a node can be slashed below the minimum stake requirement (or even to zero) while it has open channels. The channels continue their normal lifecycle — close, dispute window, settle — regardless of the node's staking status. Channel settlement is purely a function of the voucher state, not the node's registry status.
 

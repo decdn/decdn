@@ -393,7 +393,6 @@ The canonical 40/40/7/5/5/3 split is in [ADR 026](026-gauge-boost-tokenomics.md)
 ```mermaid
 flowchart TD
     Operator["Node Operator"]
-    ClientStaker["Client (optional staker)"]
     SR["StakingRegistry<br/>(staked TOKEN)"]
     SJ["SlashJudge<br/>(challenge bonds)"]
     Challenger["Challenger"]
@@ -402,8 +401,6 @@ flowchart TD
 
     Operator -->|"stake(amount)"| SR
     SR -->|"unstake() after unbonding"| Operator
-    ClientStaker -->|"clientStake(amount)"| SR
-    SR -->|"clientUnstake() (no unbonding)"| ClientStaker
     Challenger -->|"submitPhantomChallenge() /<br/>submitRateChallenge() /<br/>submitBlacklistChallenge() /<br/>submitCorruptionChallenge()<br/>bond deposit"| SJ
     SJ -->|"resolveChallenge()<br/>→ slash(node, offenseType)<br/>(amount computed internally)"| SR
     SR -->|"50% of slash to msg.sender"| SJ
@@ -429,7 +426,7 @@ flowchart TD
 | FeeRouter | USDC (gauge + delegator epoch buckets, transient base/treasury/burn/safety legs); TOKEN (delegator-pool epoch buckets after USDC→TOKEN swap) | `PaymentChannel.settleChannel` | `claimBoost(epochs[])` (operators); `claimDelegator(epochs[])` (ve-lockers); same-tx forwards to BuybackBurner / Treasury / SafetyReserve / operator base (40%); 26-epoch claim window then sweep to treasury |
 | VotingEscrow | TOKEN (locked, non-transferable) | User `createLock` deposits | `withdraw()` after lock expiry only; no early exit, no `create_lock_for` privileged path ([ADR 026](026-gauge-boost-tokenomics.md) §4) |
 | SafetyReserve | USDC (3% router bucket; primary holding) + TOKEN (30% slashing redirect; swapped to USDC via keeper) | `FeeRouter`, `StakingRegistry` slashing path | `payout(bundle, recipient, amount)` USDC-only after evidence bundle, Governor (or emergency-multisig within hard caps), and 48h appeal window ([ADR 026](026-gauge-boost-tokenomics.md) §5) |
-| StakingRegistry | TOKEN | Node operator stakes, client priority stakes | `unstake()` after unbonding (operators), `clientUnstake()` anytime (clients) |
+| StakingRegistry | TOKEN | Node operator stakes | `unstake()` after unbonding |
 | SlashJudge | TOKEN | Challenger bond deposits | `resolveChallenge()` (slash reward + bond return to challenger) or bond forfeiture |
 | BuybackBurner | USDC (accumulated), TOKEN (transient) | PoC: treasury transfers. Production: 5% USDC same-tx from `FeeRouter` ([ADR 026](026-gauge-boost-tokenomics.md) §8) | `executeBuyback()` (production; accumulate-only in PoC) |
 
@@ -507,8 +504,6 @@ Every state-mutating function that makes an external call is listed below with i
 | --- | --- | --- |
 | `stake()` | `IERC20.safeTransferFrom()` (TOKEN) | `nonReentrant`, checks-effects-interactions |
 | `unstake()` | `IERC20.safeTransfer()` (TOKEN) | `nonReentrant`, checks-effects-interactions |
-| `clientStake()` | `IERC20.safeTransferFrom()` (TOKEN) | `nonReentrant`, checks-effects-interactions |
-| `clientUnstake()` | `IERC20.safeTransfer()` (TOKEN) | `nonReentrant`, checks-effects-interactions |
 | `slash()` (PoC) | `IERC20.safeTransfer()` (TOKEN, 50% to `msg.sender` i.e. SlashJudge), burn (50%) | `nonReentrant`, checks-effects-interactions, `SLASH_ROLE` |
 | `slash()` | `IERC20.safeTransfer()` (TOKEN: 50% challenger / 30% SafetyReserve / 20% burn per [ADR 026](026-gauge-boost-tokenomics.md) §8) | `nonReentrant`, checks-effects-interactions, `SLASH_ROLE` |
 | `recordSettlement(operator)` | None (single SSTORE) | `SETTLEMENT_REPORTER_ROLE` |
