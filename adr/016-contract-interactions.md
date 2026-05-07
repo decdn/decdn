@@ -410,7 +410,13 @@ After all contracts are deployed, the deployer must execute these transactions b
    stakingRegistry.grantRole(SLASH_ROLE, address(slashJudge));
    ```
 
-   **Production:** also grant a slashing-redirect role so SlashJudge can route 30% of slashed stake to `SafetyReserve` per [ADR 026](026-gauge-boost-tokenomics.md) §8 (challenger 50% / SafetyReserve 30% / burn 20%). **Slash currency:** stake is denominated in TOKEN, so the 30% share lands in `SafetyReserve` as TOKEN. `SafetyReserve` exposes a keeper-triggered swap into the [ADR 018](018-liquidity-strategy.md) Balancer V3 80/20 pool (same Vault-scoped self-approval, TWAP, `minOut`, private-RPC, and per-epoch liquidity-cap defenses as `BuybackBurner` and the delegator-pool swap path). USDC is the only currency available for `payout`; until swapped, slashed TOKEN is held as part of `SafetyReserve`'s assets-under-management.
+   Pair the slash-redirect inflow grant in the same multicall:
+
+   ```solidity
+   safetyReserve.grantRole(SLASH_INFLOW_REPORTER_ROLE, address(stakingRegistry));
+   ```
+
+   This authorizes `StakingRegistry.slash` to call `SafetyReserve.recordSlashInflow(operator, amount)` for the 30% slashed-TOKEN redirect per [ADR 026](026-gauge-boost-tokenomics.md) §8 (challenger 50% / SafetyReserve 30% / burn 20%). **Slash currency:** stake is denominated in TOKEN, so the 30% share lands in `SafetyReserve` as TOKEN. `SafetyReserve` exposes a keeper-triggered swap (`swapAccumulatedTokens`) into the [ADR 018](018-liquidity-strategy.md) Balancer V3 80/20 pool (same Vault-scoped self-approval, TWAP, `minOut`, private-RPC, and per-epoch liquidity-cap defenses as `BuybackBurner` and the delegator-pool swap path). USDC is the only currency available for `payout`; until swapped, slashed TOKEN is held as part of `SafetyReserve`'s assets-under-management.
 
 4. **Grant `ROUTER_CALLER_ROLE` on FeeRouter to StablePaymentChannel:**
 
@@ -673,7 +679,8 @@ New top-level contracts integrate with the launch-time set via standard `AccessC
 | `GOVERNANCE_ROLE` | OriginAssignment | `activateAssignment()`, `revokeAssignment()`, `setMinRedundancy()`, `setMaxOriginsPerNamespace()`, `setAssignmentTimelock()`, `setDefaultOpenAllowlist()`, `addDefaultOpenOperator()`, `removeDefaultOpenOperator()`, `setDefaultOpenMinRedundancy()`, `setDefaultOpenMaxOrigins()` | Admin | Governor via timelock |
 | `SLASH_ROLE` | StakingRegistry | `slash()` | SlashJudge contract | SlashJudge contract |
 | `SETTLEMENT_REPORTER_ROLE` | StakingRegistry | `recordSettlement(operator)` | FeeRouter | FeeRouter; see [§3](#3-cross-contract-call-graph) |
-| `KEEPER_ROLE` | BuybackBurner, FeeRouter, DelegatorBuyer | `executeBuyback()` (BB), `executeDelegatorSwap(epoch, minOut)` (FeeRouter), `swapDelegatorBucket(...)` (DelegatorBuyer) | Admin / disabled | Keeper bot or governance |
+| `SLASH_INFLOW_REPORTER_ROLE` | SafetyReserve | `recordSlashInflow(operator, amount)` | StakingRegistry | StakingRegistry; granted post-deploy. Mirrors `SETTLEMENT_REPORTER_ROLE` — gives auditors a clean event to track slash-redirect provenance |
+| `KEEPER_ROLE` | BuybackBurner, FeeRouter, SafetyReserve | `executeBuyback()` (BuybackBurner), `executeDelegatorSwap(epochId, minOut)` (FeeRouter), `swapAccumulatedTokens(amountIn, minOut)` (SafetyReserve) | Admin / disabled | Keeper bot or governance |
 | `ROUTER_CALLER_ROLE` | FeeRouter | `routeSettlement(op, bytes, amount)` | StablePaymentChannel | StablePaymentChannel (and any future settlement-emitting contract) |
 | `PAYOUT_AUTHORIZER_ROLE` | SafetyReserve | `payout(bundle, recipient, amount)` | n/a | Governor via timelock; emergency multisig within hard caps ([ADR 026](026-gauge-boost-tokenomics.md) §5) |
 | `GOVERNANCE_ROLE` | ContentBlacklist, FeeRouter (share parameters / `boostFloor`) | `addHash()`, `removeHash()`, `addOrigin()`, `removeOrigin()`, `registerRegionalBody()` (ContentBlacklist); `setShares(...)`, `setBoostFloor(...)` (FeeRouter) | Admin | Governor via timelock |

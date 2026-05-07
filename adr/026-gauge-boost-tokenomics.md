@@ -291,6 +291,128 @@ No path exists for unattested payouts; the `payout(bundleHash, recipient, amount
 
 The `payout(bundleHash, recipient, amount)` signature is contract-stable: future incident-response tooling, insurance products, and SLA-style contracts integrate via this entry point without contract changes. Evidence formats live off-chain and are referenced by hash on-chain; the contract enforces the four payout gates uniformly regardless of caller identity (subject to `AccessControl` role grants per [ADR 016 §5](016-contract-interactions.md#5-access-control-matrix)).
 
+#### Contract: SafetyReserve
+
+```solidity
+interface ISafetyReserve {
+    // ─── Payouts ──────────────────────────────────────────────────────
+    // Single entry point for incident disbursements. Payouts are USDC-only
+    // by design — TOKEN inflow from the 30% slashing redirect is swapped
+    // to USDC via `swapAccumulatedTokens` before becoming available here.
+    // The `bundle` hash references an off-chain attested incident bundle;
+    // the contract enforces the four payout gates uniformly:
+    //   1. Attested bundle (cryptographic evidence)
+    //   2. Authorization (Governor or emergency-multisig within hard caps)
+    //   3. 48h appeal window since the bundle was first surfaced
+    //   4. Post-incident registry write (atomic with disbursement)
+    // Reverts if any gate fails. Returns the assigned incident id.
+    function payout(
+        bytes32 bundle,
+        address recipient,
+        uint256 usdcAmount
+    ) external returns (uint256 id);
+
+    // ─── Incident registry ────────────────────────────────────────────
+    enum IncidentReason {
+        OutageRestitution,
+        SlashAppealRatification,
+        ProtocolHack,
+        MisattributionFix,
+        Other
+    }
+
+    struct Incident {
+        bytes32 bundle;          // attested evidence hash
+        address recipient;       // payout target
+        uint256 usdcAmount;      // USDC base units (6 decimals)
+        uint64 paidAt;           // block timestamp
+        address paidBy;          // Governor or emergency-multisig that authorized
+        IncidentReason reason;   // categorical tag for indexers and audit
+    }
+
+    function incidents(uint256 id) external view returns (Incident memory);
+    function incidentCount() external view returns (uint256);
+
+    // ─── Slashing-redirect inflow (callback from StakingRegistry) ─────
+    // Records the 30% slashed-TOKEN redirect against an indexable
+    // operator+amount tuple. `SLASH_INFLOW_REPORTER_ROLE`-gated; granted
+    // to `StakingRegistry` post-deploy per [ADR 016 § Post-Deployment
+    // Initialization](016-contract-interactions.md#post-deployment-initialization).
+    // The TOKEN itself is transferred separately via `safeTransfer`;
+    // this call is the indexable accounting event.
+    function recordSlashInflow(address operator, uint256 amount) external;
+
+    // ─── TOKEN → USDC swap (keeper) ───────────────────────────────────
+    // Swaps `amountIn` of accumulated TOKEN to USDC against the
+    // [ADR 018](018-liquidity-strategy.md) Balancer V3 80/20 pool — same
+    // Vault-scoped self-approval, TWAP, `minOut`, and per-epoch
+    // liquidity-cap defenses as `BuybackBurner`. Per-call batch shape
+    // (rather than full-balance) lets keepers MEV-sequence across
+    // multiple sub-swaps. `KEEPER_ROLE`-gated. `amountIn` is bounded by
+    // contract-level `min/maxBatchAmount` parameters.
+    function swapAccumulatedTokens(uint256 amountIn, uint256 minOut) external;
+
+    // ─── Slash-appeal extensions (per ADR 028) ────────────────────────
+    // Signature stubs only; full appeal state machine, window timing,
+    // and authorization rules are specified in
+    // [ADR 028 §6](028-slashing-appeals.md#6-contract-surface) and
+    // finalized as part of the surface lock-down in #451. Storage and
+    // authorization details are **not** pinned by this interface.
+    function openSlashAppeal(uint256 slashId, bytes32 evidenceBundleHash)
+        external returns (uint256 appealId);
+    function fastTrackAppeal(uint256 appealId) external;
+    function rejectAppeal(uint256 appealId) external;
+    function ratifyAppeal(uint256 appealId) external;
+    function reverseAppeal(uint256 appealId) external;
+
+    // ─── Governance setters ───────────────────────────────────────────
+    function setGovernor(address newGovernor) external;
+    function setEmergencyMultisig(address newMultisig) external;
+    function setAppealWindow(uint64 seconds_) external;
+    function setMinBatchAmount(uint256 amount) external;
+    function setMaxBatchAmount(uint256 amount) external;
+    function setPool(address newPool) external;
+    function setSlippageToleranceBps(uint256 bps) external;
+
+    // ─── Pause control ────────────────────────────────────────────────
+    // `pause()` blocks `payout` and `swapAccumulatedTokens`;
+    // `recordSlashInflow` continues to work so slashing accounting is
+    // never lost during a pause window.
+    function pause() external;
+    function unpause() external;
+
+    // ─── Events ───────────────────────────────────────────────────────
+    event Paid(
+        uint256 indexed id,
+        address indexed recipient,
+        uint256 usdcAmount,
+        bytes32 bundle,
+        address paidBy,
+        IncidentReason reason
+    );
+    event SlashInflowRecorded(address indexed operator, uint256 amount);
+    event SwapExecuted(uint256 amountIn, uint256 amountOut);
+    event SlashAppealOpened(uint256 indexed appealId, uint256 indexed slashId, bytes32 evidenceBundleHash);
+    event SlashAppealFastTracked(uint256 indexed appealId);
+    event SlashAppealRejected(uint256 indexed appealId);
+    event SlashAppealRatified(uint256 indexed appealId);
+    event SlashAppealReversed(uint256 indexed appealId);
+    event GovernorUpdated(address indexed oldAddr, address indexed newAddr);
+    event EmergencyMultisigUpdated(address indexed oldAddr, address indexed newAddr);
+    event AppealWindowUpdated(uint64 oldValue, uint64 newValue);
+    event PoolUpdated(address indexed oldPool, address indexed newPool);
+    event SlippageToleranceUpdated(uint256 oldBps, uint256 newBps);
+    event MinBatchAmountUpdated(uint256 oldValue, uint256 newValue);
+    event MaxBatchAmountUpdated(uint256 oldValue, uint256 newValue);
+}
+```
+
+**Notes:**
+
+- **USDC-only payouts.** `usdcAmount` is named explicitly so the constraint is visible in the storage layout and on every `Paid` event. If a future ADR ever motivates multi-currency payouts, the additive shape is a `tokenOut` field plus an allowlist setter — no breaking change to existing `Incident` storage.
+- **Governor and emergency-multisig addresses are governance-mutable.** The `setGovernor` / `setEmergencyMultisig` setters allow the eventual handover from the deployer EOA to `TimelockController` (per [ADR 016 § Post-Deployment Initialization](016-contract-interactions.md#post-deployment-initialization)) and any future re-pointing without contract redeployment. The 48h timelock constraint applies via `GOVERNANCE_ROLE`.
+- **Appeal extensions are signature stubs.** This interface pins the function names and parameter types; the full state machine (`Open` → `FastTracked` / `Rejected` → `Ratified` / `Reversed` / `Lapsed`), window timing (filing, multisig review, ratification), and bond/restitution caps live in [ADR 028 §6](028-slashing-appeals.md#6-contract-surface) and are surface-locked under #451.
+
 ### 6. Delegator pool — USDC → TOKEN conversion
 
 The 7% delegator bucket flows through a USDC→TOKEN buy-and-distribute pipeline rather than direct USDC distribution.
@@ -311,6 +433,60 @@ Routes acquired TOKEN to the participants with the longest commitment horizon an
 #### MEV / slippage
 
 TWAP windows + per-epoch liquidity caps + private-RPC routing (Flashbots-style bundles) for the swap. Same defenses as the [ADR 018](018-liquidity-strategy.md) buyback flow; per-epoch liquidity caps are a hard requirement on this path, not optional.
+
+#### Contract: DelegatorBuyer
+
+```solidity
+interface IDelegatorBuyer {
+    // ─── Per-epoch USDC → TOKEN swap (FeeRouter-only) ─────────────────
+    // Called by `FeeRouter.executeDelegatorSwap`. `msg.sender == feeRouter`
+    // is the only authorization check — DelegatorBuyer is a single-purpose
+    // helper trusting FeeRouter exclusively, so no role grants are needed
+    // post-deploy. Swaps `amountIn` USDC for at least `minOut` TOKEN
+    // against the configured Balancer V3 pool, then deposits the
+    // resulting TOKEN back to FeeRouter via
+    // `IFeeRouter.depositDelegatorTokens(epoch, amount)` — see
+    // [ADR 016 § Contract: FeeRouter](016-contract-interactions.md#contract-feerouter).
+    // Same Vault-scoped self-approval pattern as `BuybackBurner`.
+    function swapDelegatorBucket(
+        uint64 epochId,
+        uint256 amountIn,
+        uint256 minOut
+    ) external;
+
+    // ─── Read views ───────────────────────────────────────────────────
+    function feeRouter() external view returns (address);
+    function pool() external view returns (address);
+    function slippageToleranceBps() external view returns (uint256);
+    function minSwapAmount() external view returns (uint256);
+    function maxSwapAmount() external view returns (uint256);
+
+    // ─── Governance setters ───────────────────────────────────────────
+    function setFeeRouter(address newFeeRouter) external;
+    function setPool(address newPool) external;
+    function setSlippageToleranceBps(uint256 bps) external;
+    function setMinSwapAmount(uint256 amount) external;
+    function setMaxSwapAmount(uint256 amount) external;
+
+    // ─── Pause control ────────────────────────────────────────────────
+    function pause() external;
+    function unpause() external;
+
+    // ─── Events ───────────────────────────────────────────────────────
+    event DelegatorSwapped(uint64 indexed epochId, uint256 amountIn, uint256 amountOut);
+    event FeeRouterUpdated(address indexed oldRouter, address indexed newRouter);
+    event PoolUpdated(address indexed oldPool, address indexed newPool);
+    event SlippageToleranceUpdated(uint256 oldBps, uint256 newBps);
+    event MinSwapAmountUpdated(uint256 oldValue, uint256 newValue);
+    event MaxSwapAmountUpdated(uint256 oldValue, uint256 newValue);
+}
+```
+
+**Notes:**
+
+- **Implementation choice deferred** per [ADR 016 § Contract Inventory](016-contract-interactions.md#1-contract-inventory): `DelegatorBuyer` may be a parallel contract or a multi-output mode of `BuybackBurner`. Both ship the same `IDelegatorBuyer` surface; the choice is made at implementation time.
+- **`msg.sender == feeRouter` as the sole auth check.** No `KEEPER_ROLE` on `DelegatorBuyer` because there are no other legitimate callers — keepers trigger swaps via `FeeRouter.executeDelegatorSwap(epoch, minOut)` (which holds `KEEPER_ROLE` on `FeeRouter`), and `FeeRouter` then calls `swapDelegatorBucket` here. Single trust boundary; one role grant fewer post-deploy.
+- **`setFeeRouter` carve-out** matches the [ADR 016 § No proxy deployment patterns](016-contract-interactions.md#no-proxy-deployment-patterns) carve-out for non-signing helper addresses: `DelegatorBuyer` has no domain-separator-bound state, so re-pointing the configured `FeeRouter` is safe under the standard 48h timelock.
 
 ### 7. Operator economics and minimum stake
 
