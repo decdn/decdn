@@ -54,6 +54,9 @@ aws-smithy-mocks = { workspace = true }
 # `mock_client!`) for the dev build only. Standard cargo idiom for differing
 # prod/dev feature sets.
 aws-sdk-s3 = { workspace = true, features = ["test-util"] }
+# Wire-form pinning tests for `OriginKind` and any other operator-visible
+# JSON serialised by this crate (#439).
+serde_json = { workspace = true }
 
 [lints]
 workspace = true
