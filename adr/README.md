@@ -154,6 +154,7 @@ pandoc --from=markdown+gfm_auto_identifiers \
   appendix-encrypted-content-publishing.md \
   appendix-observability.md \
   appendix-peer-table-eviction.md \
+  appendix-blob-cache-eviction.md \
   appendix-l2-deployment.md \
   appendix-poc-production-seams.md \
   appendix-local-admin-http.md \

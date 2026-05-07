@@ -124,12 +124,13 @@ Appendices document patterns, reference implementations, and operational guidanc
 1. [Encrypted Content Publishing](appendix-encrypted-content-publishing.md) — pattern for building an encrypted-content publishing system on top of deCDN; companion app server and `cdn/keys/v1` ALPN
 2. [Observability and Metrics](appendix-observability.md) — recommended metric naming, registry, and slash-risk alert thresholds
 3. [Peer-Table Eviction Policy](appendix-peer-table-eviction.md) — TTL-based eviction (default 600 s) keyed on `last_seen_us`; active eviction on registry deregistration / origin blacklisting; no hard size cap (staking registry bounds growth); reputation does not factor into eviction
-4. [Production L2 Deployment Target](appendix-l2-deployment.md) — Arbitrum One selection (deployment decision; protocol depends on Arbitrum-class properties calibrated in core ADRs)
-5. [PoC/Production Seam Architecture (Rust)](appendix-poc-production-seams.md) — leaf-crate principle, wiring-layer mode selection, mechanical-deletion graduation path
-6. [Local Admin HTTP Surface](appendix-local-admin-http.md) — loopback-bound admin API for operator runbook automation
-7. [Operator Key Rotation Runbook](appendix-operator-key-rotation.md) — sequenced procedure for rotating the operator's iroh node-key, Ethereum signing key, and (production) session keys via `bindNodeId`, deregister-and-re-stake, or `erc7579/smartsessions`
-8. [Operator Protocol-Upgrade Runbook](appendix-operator-upgrade-path.md) — sequenced operator actions for each ADR 013 tier (Tier 1/2 checklists; Tier 3 rolling-upgrade procedure; client and governance coordination)
-9. [Permissionless Fraud-Detection Layer](appendix-fraud-detection.md) — optional, anyone-can-run on-chain monitoring of stale closes and fraudulent epoch summaries via the existing `SlashJudge` bond mechanism
+4. [Blob Cache Eviction Policy](appendix-blob-cache-eviction.md) — LRU keyed on last successful `CacheEngine::get` timestamp; operator pinning overrides LRU; operator evict is durable and orthogonal; probe-hold ([ADR 005](005-protocol.md#probe-triggered-eviction-hold)) composes above LRU; reputation does not factor into eviction
+5. [Production L2 Deployment Target](appendix-l2-deployment.md) — Arbitrum One selection (deployment decision; protocol depends on Arbitrum-class properties calibrated in core ADRs)
+6. [PoC/Production Seam Architecture (Rust)](appendix-poc-production-seams.md) — leaf-crate principle, wiring-layer mode selection, mechanical-deletion graduation path
+7. [Local Admin HTTP Surface](appendix-local-admin-http.md) — loopback-bound admin API for operator runbook automation
+8. [Operator Key Rotation Runbook](appendix-operator-key-rotation.md) — sequenced procedure for rotating the operator's iroh node-key, Ethereum signing key, and (production) session keys via `bindNodeId`, deregister-and-re-stake, or `erc7579/smartsessions`
+9. [Operator Protocol-Upgrade Runbook](appendix-operator-upgrade-path.md) — sequenced operator actions for each ADR 013 tier (Tier 1/2 checklists; Tier 3 rolling-upgrade procedure; client and governance coordination)
+10. [Permissionless Fraud-Detection Layer](appendix-fraud-detection.md) — optional, anyone-can-run on-chain monitoring of stale closes and fraudulent epoch summaries via the existing `SlashJudge` bond mechanism
 
 ## Architectural Decisions
 
@@ -248,7 +249,7 @@ The protocol does not dictate cache policy. Nodes are economically motivated to 
 
 **Prefetching:** Nodes can proactively cache popular content using a local demand signal — tracking cache miss frequency per hash and prefetching when a threshold is crossed (default: 3 misses in 5 minutes). Prefetch pulls use the same DHT FIND_VALUE → probe → `cdn/client/v1` path (paid).
 
-**Eviction:** LRU or frequency-weighted eviction (LFU). Operators tune cache size to maximize hit rate within their storage budget. Blobs for which the node has signed `has_blob: true` in a `cdn/probe/v1` response are temporarily exempt from eviction via the **probe-triggered eviction hold** (`probe_hold_duration`, see [ADR 005](005-protocol.md#probe-triggered-eviction-hold)), which prevents false phantom-announcement slashing when cache pressure would otherwise evict a blob between probe and subsequent stream request.
+**Eviction:** LRU keyed on the timestamp of the last successful `CacheEngine::get` ([appendix-blob-cache-eviction.md](appendix-blob-cache-eviction.md)). Operators tune cache size to maximize hit rate within their storage budget. Blobs for which the node has signed `has_blob: true` in a `cdn/probe/v1` response are temporarily exempt from eviction via the **probe-triggered eviction hold** (`probe_hold_duration`, see [ADR 005](005-protocol.md#probe-triggered-eviction-hold)), which prevents false phantom-announcement slashing when cache pressure would otherwise evict a blob between probe and subsequent stream request. Operator pinning and operator-initiated evict compose orthogonally with LRU per [appendix-blob-cache-eviction.md](appendix-blob-cache-eviction.md).
 
 **Maximum blob size:** Nodes may configure a `max_blob_size` (PoC recommended default: 10 GB). Requests for blobs exceeding this limit are rejected with `StreamError::BlobTooLarge` ([ADR 005](005-protocol.md#error-handling-and-retry-semantics)). This prevents a single large blob from exhausting cache capacity or tying up connections for extended periods. The limit is per-node — nodes with larger storage budgets can raise it; cache-only nodes on constrained hardware can lower it.
 

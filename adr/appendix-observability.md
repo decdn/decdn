@@ -80,10 +80,13 @@ These metrics provide early warning for the five slashable offenses on the slash
 
 | Metric | Type | Tier | Description |
 |--------|------|------|-------------|
-| `decdn_cache_bytes` | Gauge | M | Current total cache size in bytes (all blobs). |
+| `decdn_cache_bytes` | Gauge | M | Current total cache size in bytes (all blobs). Paired with `decdn_cache_size_limit_bytes` for a saturation ratio. |
+| `decdn_cache_size_limit_bytes` | Gauge | R | Configured cache capacity in bytes (`cache.cache_size_mb × 1 048 576`). See [appendix-blob-cache-eviction.md](appendix-blob-cache-eviction.md). |
 | `decdn_cache_hits_total` | Counter | M | Probe or stream requests satisfied from local cache. |
 | `decdn_cache_misses_total` | Counter | M | Probe or stream requests requiring origin pull or peer pull. |
-| `decdn_cache_evictions_total` | Counter | R | Blobs evicted by LRU/LFU pressure. |
+| `decdn_cache_evictions_total` | Counter | R | Blobs evicted by LRU pressure (the eviction-driver loop). See [appendix-blob-cache-eviction.md](appendix-blob-cache-eviction.md). |
+| `decdn_cache_evicted_operator_total` | Counter | R | Hashes removed via `decdn node evict` (durable, persisted to `<cache_dir>/evicted.log`). Distinct from `decdn_cache_evictions_total`. See [appendix-blob-cache-eviction.md §3](appendix-blob-cache-eviction.md#3-operator-evict-is-orthogonal-to-lru-279). |
+| `decdn_cache_pinned_count` | Gauge | R | Size of the operator-pinned set (operator-managed exemption from LRU). See [appendix-blob-cache-eviction.md §2](appendix-blob-cache-eviction.md#2-operator-pinning-overrides-lru-276). |
 | `decdn_probe_post_eviction_failures_total` | Counter | R | `EvictedSinceProbe` responses received from remote nodes during cache-hit stream requests. A sustained rate above ~1% of cache-hit attempts suggests remote hold mechanism failures ([ADR 001](001-network.md), [ADR 005](005-protocol.md)). |
 
 #### 2.4 Probe Metrics (`cdn/probe/v1`)
