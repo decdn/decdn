@@ -22,6 +22,7 @@ pub use error::{CacheError, CacheResult, OriginError, OriginPullError, Supported
 pub use iroh_blobs::Hash;
 pub use metrics::CacheMetrics;
 pub use origin::{
-    DecompressMode, FilesystemOrigin, HttpOrigin, Origin, OriginFetch, OriginUrl, parse_origin_url,
+    DecompressMode, FilesystemOrigin, HttpOrigin, Origin, OriginFetch, OriginUrl, S3Credentials,
+    S3Origin, S3OriginConfig, parse_origin_url,
 };
 pub use retry::RetryPolicy;

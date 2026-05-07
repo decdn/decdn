@@ -11,8 +11,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use decdn_cache::{CacheEngine, FilesystemOrigin, HttpOrigin, Origin};
-use decdn_common::config::ResolvedOrigin;
+use decdn_cache::{
+    CacheEngine, FilesystemOrigin, HttpOrigin, Origin, S3Credentials, S3Origin, S3OriginConfig,
+};
+use decdn_common::config::{ResolvedOrigin, ResolvedS3Credentials};
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
 use iroh::{Endpoint, SecretKey};
@@ -558,20 +560,16 @@ async fn build_cache(
                 .await
                 .context("failed to open filesystem origin")?,
         )),
-        // TODO(#437-PR2): replace this placeholder bail with the
-        // real S3Origin construction once aws-sdk-s3 lands. The
-        // config schema accepts the variant today so operators can
-        // preview the TOML shape and `decdn config validate` lints
-        // it; runtime wiring requires aws-sdk-s3 which adds ~50
-        // transitive crates and a new TLS layer — kept separate so
-        // PR2 is reviewable on its own.
-        Some(ResolvedOrigin::S3(_)) => {
-            anyhow::bail!(
-                "cache.origin kind = \"s3\" is accepted by the schema but the runtime \
-                 backend is not yet wired in this build (lands in the follow-up PR for #437); \
-                 use kind = \"http\" or kind = \"fs\" in the meantime"
-            )
-        }
+        // S3-compatible origin (#437 PR2). Conversion from the resolved-
+        // config form to the cache-crate's runtime form happens here
+        // because `decdn-cache` deliberately doesn't depend on
+        // `decdn-common` (the dependency direction is `common -> cache`,
+        // and reversing it would be circular).
+        Some(ResolvedOrigin::S3(cfg)) => Some(Arc::new(
+            S3Origin::new(&s3_origin_config_from_resolved(cfg))
+                .await
+                .context("failed to construct S3 origin client")?,
+        )),
     };
     CacheEngine::open_full(
         &cfg.cache.cache_dir,
@@ -583,6 +581,40 @@ async fn build_cache(
     )
     .await
     .context("failed to open cache engine")
+}
+
+/// Translate the `decdn-common` resolved-config S3 form into the
+/// `decdn-cache` runtime form. The two types carry the same data —
+/// they exist as separate types only because `decdn-cache` deliberately
+/// doesn't pull `decdn-common` (the dep direction is `common -> cache`).
+///
+/// Credential redaction (`SecretString::expose`) happens here, at the
+/// crate boundary: the SDK call site gets plain `String`s, and the
+/// `Debug`-redacted wrapper stays inside the config layer where it
+/// guards against incidental log leaks.
+fn s3_origin_config_from_resolved(cfg: &decdn_common::config::ResolvedS3Config) -> S3OriginConfig {
+    let credentials = cfg.credentials.as_ref().map(|c| match c {
+        ResolvedS3Credentials::Static {
+            access_key_id,
+            secret_access_key,
+            session_token,
+        } => S3Credentials::Static {
+            access_key_id: access_key_id.expose().to_string(),
+            secret_access_key: secret_access_key.expose().to_string(),
+            session_token: session_token.as_ref().map(|t| t.expose().to_string()),
+        },
+        ResolvedS3Credentials::DefaultChain { profile } => S3Credentials::DefaultChain {
+            profile: profile.clone(),
+        },
+    });
+    S3OriginConfig {
+        bucket: cfg.bucket.clone(),
+        region: cfg.region.clone(),
+        endpoint_url: cfg.endpoint_url.clone(),
+        path_style: cfg.path_style,
+        prefix: cfg.prefix.clone(),
+        credentials,
+    }
 }
 
 /// Stable label for the resolved-origin variant, used in startup
@@ -946,14 +978,16 @@ mod tests {
         }
     }
 
-    /// `build_cache` must reject the S3 variant with a clear,
-    /// operator-greppable error in PR1: the schema accepts
-    /// `kind = "s3"` (so `decdn config validate` passes) but the
-    /// runtime backend lands in PR2. PR2 will replace this test with
-    /// a real-backend smoke test; the message-shape contract here
-    /// guards the operator UX in the meantime.
+    /// PR2 (#437): `build_cache` must construct the S3 backend without
+    /// performing network I/O. The SDK lazily connects on the first
+    /// `GetObject` call, so a successful `build_cache` proves the
+    /// resolver-to-runtime conversion (`s3_origin_config_from_resolved`)
+    /// runs end-to-end and that the SDK's `ClientBuilder::build` doesn't
+    /// fire its `BehaviorVersion` panic for either credential variant.
+    /// The integration suite at `crates/cache/tests/s3_origin.rs` exercises
+    /// the wire path via `aws-smithy-mocks`.
     #[tokio::test]
-    async fn build_cache_rejects_s3_with_pr2_pointer_error() {
+    async fn build_cache_constructs_s3_origin_for_default_chain() {
         use decdn_common::config::{ResolvedS3Config, ResolvedS3Credentials};
 
         let s3 = ResolvedS3Config {
@@ -967,14 +1001,82 @@ mod tests {
         let cfg = cfg_with_origin(Some(ResolvedOrigin::S3(s3)));
         let metrics_handle = Arc::new(metrics::Metrics::new());
 
-        let err = build_cache(&cfg, metrics_handle)
+        // Construction must succeed end-to-end. A failure here means the
+        // resolver-to-runtime conversion regressed or the SDK's lazy-
+        // connect contract changed (and we'd be doing I/O at startup).
+        let _engine = build_cache(&cfg, metrics_handle)
             .await
-            .expect_err("S3 placeholder must reject in PR1");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("kind = \"s3\"") && msg.contains("#437"),
-            "operator-facing message must name the variant and the issue: {msg}"
-        );
+            .expect("S3 origin must construct without I/O");
+    }
+
+    /// Same as above but with the `Static` credential path so the
+    /// `SecretString::expose` unwrap arm in `s3_origin_config_from_resolved`
+    /// is exercised. The integration tests use `mock_client!` which doesn't
+    /// route through the resolved-config layer at all, so this is the only
+    /// place the conversion gets covered.
+    #[tokio::test]
+    async fn build_cache_constructs_s3_origin_for_static_credentials() {
+        use decdn_common::config::secret::SecretString;
+        use decdn_common::config::{ResolvedS3Config, ResolvedS3Credentials};
+
+        let s3 = ResolvedS3Config {
+            bucket: "decdn-blobs".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint_url: None,
+            path_style: false,
+            prefix: "blobs/".to_string(),
+            credentials: Some(ResolvedS3Credentials::Static {
+                access_key_id: SecretString::new("AKIA-test-fake"),
+                secret_access_key: SecretString::new("secret-fake"),
+                session_token: None,
+            }),
+        };
+        let cfg = cfg_with_origin(Some(ResolvedOrigin::S3(s3)));
+        let metrics_handle = Arc::new(metrics::Metrics::new());
+
+        let _engine = build_cache(&cfg, metrics_handle)
+            .await
+            .expect("S3 origin with static credentials must construct without I/O");
+    }
+
+    /// The conversion helper unwraps `SecretString` via `.expose()`.
+    /// Verifying the cleartext bytes survive the conversion — without
+    /// this, a refactor that replaces `.expose()` with a placeholder
+    /// would silently break `SigV4` signing at runtime. Direct unit
+    /// test on the conversion function avoids the SDK round-trip.
+    #[test]
+    fn s3_origin_config_from_resolved_preserves_static_credentials() {
+        use decdn_common::config::secret::SecretString;
+        use decdn_common::config::{ResolvedS3Config, ResolvedS3Credentials};
+
+        let resolved = ResolvedS3Config {
+            bucket: "b".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint_url: None,
+            path_style: true,
+            prefix: "blobs/".to_string(),
+            credentials: Some(ResolvedS3Credentials::Static {
+                access_key_id: SecretString::new("ak-1"),
+                secret_access_key: SecretString::new("sk-1"),
+                session_token: Some(SecretString::new("tok-1")),
+            }),
+        };
+        let runtime = s3_origin_config_from_resolved(&resolved);
+        assert_eq!(runtime.bucket, "b");
+        assert!(runtime.path_style);
+        assert_eq!(runtime.prefix, "blobs/");
+        match runtime.credentials.expect("static creds preserved") {
+            S3Credentials::Static {
+                access_key_id,
+                secret_access_key,
+                session_token,
+            } => {
+                assert_eq!(access_key_id, "ak-1");
+                assert_eq!(secret_access_key, "sk-1");
+                assert_eq!(session_token.as_deref(), Some("tok-1"));
+            }
+            S3Credentials::DefaultChain { .. } => panic!("expected Static after conversion"),
+        }
     }
 
     // Operators grep `signal=SIGINT` / `signal=SIGTERM` / `signal=admin-drain`

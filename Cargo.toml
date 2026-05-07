@@ -77,10 +77,60 @@ zeroize = "1"
 # HTTP client (used by cache-origin backend)
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json"] }
 
+# AWS SDK (used by the S3 cache-origin backend, #437 PR2). All four crates carry
+# `default-features = false` so the workspace stays on one TLS implementation
+# (rustls 0.23 + aws-lc-rs); the SDK's stock rustls 0.21 + ring path is
+# fully suppressed by these flags. Cargo.lock confirms only one `rustls` and
+# one `aws-lc-rs` major after the addition.
+#
+# A small hyper-0.14 transitive subtree (`hyper`, `h2`, `http`, `http-body`,
+# `socket2`) does still land in the lockfile because `aws-smithy-runtime`'s
+# default features enable the `connector-hyper-0-14-x` flag on
+# `aws-smithy-http-client` — that connector is for the SDK's legacy code
+# paths the runtime never invokes (we route every request through the
+# explicit hyper-1 client), but cargo unifies features across the dep
+# graph and we can't disable a feature flipped on by a transitive crate.
+# The cost is a handful of extra crate compilations and the
+# `multiple-versions` warning bumps; no parallel TLS stack and no extra
+# crypto provider. Re-evaluate if a future smithy-rs release moves the
+# legacy connector off-default.
+#
+# `aws-config` keeps the standard credential-chain pieces (env / profile /
+# IMDS / SSO / credentials_process) so operators get the AWS-CLI-equivalent
+# discovery for free; the `behavior-version-latest` feature is paired with
+# an explicit `BehaviorVersion::latest()` at the call site so a future
+# feature-flag edit can't silently introduce a panic in
+# `ClientBuilder::build`.
+aws-config = { version = "1.8", default-features = false, features = [
+    "behavior-version-latest",
+    "credentials-process",
+    "sso",
+    "rt-tokio",
+] }
+# Pinned at 1.129 (last release using sha2 ^0.10): aws-sdk-s3 1.130 bumped to
+# sha2 ^0.11 (stable), which conflicts with iroh-base 0.98's `=0.11.0-rc.5`
+# exact pin. Two sha2 majors would otherwise live in the tree, fattening the
+# cargo deny `multiple-versions` warning. Re-evaluate when iroh bumps to a
+# release that no longer pins `sha2 = "=0.11.0-rc.5"`.
+aws-sdk-s3 = { version = "=1.129.0", default-features = false, features = ["http-1x", "rt-tokio"] }
+aws-smithy-http-client = { version = "1.1", default-features = false, features = [
+    "default-client",
+    "rustls-aws-lc",
+] }
+aws-credential-types = "1"
+aws-smithy-runtime-api = "1"
+aws-smithy-types = "1"
+
 # Test-only helpers
 tempfile = "3"
 wiremock = "0.6"
 proptest = "1"
+# Operation-level S3 mocks for the S3 origin tests (#437 PR2). The `mock!`
+# / `mock_client!` macros take the SDK through its full middleware chain
+# (signing, retry, body framing) but stub the network — exactly the
+# granularity we need to validate `OriginPullError` classification without
+# standing up MinIO.
+aws-smithy-mocks = "0.2"
 
 # Rate limiting (per-source connection rate limits in `node`)
 governor = "0.10"

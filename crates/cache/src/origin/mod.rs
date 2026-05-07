@@ -1,10 +1,12 @@
 //! Origin backends — the source of truth a node falls back to on a cache miss.
 //!
-//! [`Origin`] is the seam. One concrete implementation (`HttpOrigin`) lives
-//! alongside it; S3/R2/B2 backends are follow-up work.
+//! [`Origin`] is the seam. Three concrete implementations ship today:
+//! [`HttpOrigin`] (generic HTTP/S), [`FilesystemOrigin`] (local disk), and
+//! [`S3Origin`] (S3-compatible object stores: AWS S3, R2, B2, `MinIO`).
 
 pub mod fs;
 pub mod http;
+pub mod s3;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -14,6 +16,7 @@ use iroh_blobs::Hash;
 
 pub use fs::FilesystemOrigin;
 pub use http::{DecompressMode, HttpOrigin, OriginUrl, parse_origin_url};
+pub use s3::{S3Credentials, S3Origin, S3OriginConfig};
 
 use crate::error::OriginPullError;
 

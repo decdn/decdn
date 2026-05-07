@@ -31,10 +31,29 @@ arc-swap = "1"
 # Jitter for the origin retry/backoff loop (#285). Uses `rand::random::<f64>()`
 # only; no per-call state, so no RNG instance is held.
 rand = { workspace = true }
+# AWS SDK pieces for the S3 origin (#437 PR2). See the workspace
+# `[workspace.dependencies]` block for the rationale on each
+# `default-features = false` choice and the hyper-1 + aws-lc-rs binding.
+aws-config = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+aws-smithy-http-client = { workspace = true }
+aws-credential-types = { workspace = true }
+aws-smithy-runtime-api = { workspace = true }
+aws-smithy-types = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 wiremock = { workspace = true }
+# Operation-level S3 mocks (#437 PR2). The `mock_client!` macro builds an
+# `aws_sdk_s3::Client` whose dispatcher returns canned responses, so
+# `S3Origin` can be exercised end-to-end without standing up MinIO.
+aws-smithy-mocks = { workspace = true }
+# Re-list `aws-sdk-s3` with the `test-util` feature — cargo unifies feature
+# sets between deps and dev-deps, so this turns on the test-only constructors
+# (notably `aws_sdk_s3::config::Builder::new()`-friendly helpers used by
+# `mock_client!`) for the dev build only. Standard cargo idiom for differing
+# prod/dev feature sets.
+aws-sdk-s3 = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
