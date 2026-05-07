@@ -169,7 +169,8 @@ mapping(bytes32 => uint64)  internal leafCount;
 
 /// Appends keccak256(0x00 || root) as a leaf and merges peaks bottom-up via
 /// keccak256(0x01 || left || right). O(log N) hashes.
-function commitEpochReceiptRoot(address operator, uint64 epochId, bytes32 root) external;
+/// Operator is `msg.sender` per §1 / §4 above and ADR 016 §FeeRouter.
+function commitEpochReceiptRoot(uint64 epochId, bytes32 root) external;
 
 /// Folds remaining peaks (highest height to lowest) into a single root using
 /// keccak256(0x02 || peaks[i] || acc) per the bagging algorithm in the prose below.
@@ -181,20 +182,20 @@ function epochAggregateRoot(address operator, uint64 epochId) public view return
   - **Leaf:** `keccak256(0x00 || root)` (1-byte tag + the §Batch-shape root).
   - **Internal node (peak merge during append):** `keccak256(0x01 || left || right)` (1-byte tag + child-pair concatenation, where `left` is the peak being merged into and `right` is the newly-promoted leaf-derived peak — the same orientation as the §Batch-shape internal-node rule).
   - Peaks merge bottom-up: when an append produces a new peak at height `h` and a peak already exists at height `h`, they merge into a single peak at height `h+1`, repeating until no collision remains.
-- **Root extraction.** The MMR's "current root" at `commitEpochSummary` time is the bagged-peaks root, computed by folding the peak array (sorted from highest peak height descending to lowest, i.e., index `0` is the highest) into a single `bytes32` using domain-tag `0x02`:
+- **Root extraction.** The MMR's "current root" at `commitEpochSummary` time is the bagged-peaks root. Let `peaks[]` be the array of MMR peaks ordered by peak height with `peaks[0]` the tallest and `peaks[length-1]` the shortest. The fold initialises the accumulator from the shortest peak and incorporates each remaining peak in order of increasing height (walking the array from index `length-2` down to `0`), hashing each peak with the accumulator using domain-tag `0x02`. The tallest peak ends up as the outermost hash:
 
   ```text
   if peaks.length == 0: return bytes32(0)            // empty MMR
   if peaks.length == 1: return peaks[0]              // single-peak case (one tree, no bagging)
-  acc = peaks[peaks.length - 1]                      // start from the lowest peak
-  for i in (peaks.length - 2) ..= 0:                 // fold higher peaks into the accumulator
-      acc = keccak256(0x02 || peaks[i] || acc)
+  acc = peaks[peaks.length - 1]                      // start from the shortest peak
+  for i = peaks.length - 2 down to 0:                // walk toward the tallest peak
+      acc = keccak256(0x02 || peaks[i] || acc)       // higher peak on the LEFT of the hash
   return acc
   ```
 
   Returned as `aggregateRoot` in the §Per-epoch-summary table above. The `0x02` tag distinguishes peak-bagging hashes from leaf hashes (`0x00`) and append-time internal-node hashes (`0x01`); a verifier cannot confuse a bagging hash with a tree-internal hash even on otherwise-colliding inputs.
 - **Inclusion proof.** Consumed by §Challenge window. A receipt's proof is a `(leafIndex, siblingPathWithinPeak, peakIndex, peakPath)` tuple where `peakPath` is the array of *other* peaks needed to reproduce the bagging. The verifier (a) replays the leaf-tagged hash up the named peak using `siblingPathWithinPeak`, then (b) reconstructs the bagged root by replaying the `0x02`-tagged folds against `peakPath`. Verification cost is **`peakHeight + (numPeaks − 1)` `keccak256` calls** — bounded above by the within-peak depth plus the bagging-fold depth. At the reference scale (~30k receipts), max peak height is `⌈log₂(30000)⌉ = 15` and `popcount(30000) = 7` peaks ⇒ worst-case ≈ **15 + 6 = 21 hashes** per inclusion proof.
-- **Storage retention.** `peaks` and `leafCount` entries for an `(operator, epochId)` pair are retained for the §Challenge window duration (7 days) plus a `MMR_RETENTION_BUFFER` of **at least 1 day** (governable per [ADR 009](009-governance.md), bounds `[1 day, 30 days]`). After retention expires, the entries are zeroed for refund eligibility — Solidity does not reclaim storage slots; the SSTORE-to-zero produces a refund (capped at 20 % of the surrounding tx gas post-EIP-3529, with Arbitrum's L2 schedule applying its own clamp), and the slots remain allocated indefinitely with zero values. Post-zeroing, the retained `aggregateRoot` on the `EpochReceiptSummary` record continues to identify the epoch's commitments, but leaf-level inclusion proofs are no longer reconstructable on-chain — challengers MUST cache `peaks` off-chain before submitting a `ChallengeReceiptSummary` if there is any risk the §Challenge window resolution will land after the retention window expires.
+- **Storage retention.** `peaks` and `leafCount` entries for an `(operator, epochId)` pair are retained for the §Challenge window duration (7 days) plus a `MMR_RETENTION_BUFFER` of **at least 1 day**. The buffer is governance-tunable within bounds `[1 day, 30 days]` defined here on `FeeRouter` (consistent with the §3 governance pattern for receipt parameters); ADR 009's parameter table does not currently enumerate this parameter and would need a paired editorial update to include it. After retention expires, the entries are zeroed for refund eligibility — Solidity does not reclaim storage slots; the SSTORE-to-zero produces a refund (capped at 20 % of the surrounding tx gas post-EIP-3529, with Arbitrum's L2 schedule applying its own clamp), and the slots remain allocated indefinitely with zero values. Post-zeroing, the retained `aggregateRoot` on the `EpochReceiptSummary` record continues to identify the epoch's commitments, but leaf-level inclusion proofs are no longer reconstructable on-chain — challengers MUST cache `peaks` off-chain before submitting a `ChallengeReceiptSummary` if there is any risk the §Challenge window resolution will land after the retention window expires.
 - **Gas validation.** The MMR-append + byte-counter combined per-`commitEpochReceiptRoot` cost on Arbitrum One fee markets is a pre-mainnet validation requirement per [Appendix: L2 Deployment](appendix-l2-deployment.md).
 
 #### Challenge window
