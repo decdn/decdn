@@ -173,7 +173,7 @@ mapping(bytes32 => uint64)  internal leafCount;
 /// call-graph row for `commitEpochReceiptRoot`).
 function commitEpochReceiptRoot(uint64 epochId, bytes32 root) external;
 
-/// Folds remaining peaks shortest-first: acc starts at the shortest peak; taller peaks
+/// Folds remaining peaks shortest-first (acc seeds at the shortest peak); taller peaks
 /// accumulate on the LEFT at each step via keccak256(0x02 || peaks[i] || acc), so the
 /// tallest peak ends up as the outermost hash. See the bagging algorithm in the prose below.
 /// Returned as `aggregateRoot` on commitEpochSummary; stable for the (operator, epochId) pair.
