@@ -142,8 +142,8 @@ interface IFeeRouter {
         uint256 totalBytes;
         // ADR 027 §4 may add fields; the canonical layout is finalized there.
     }
-    function commitEpochReceiptRoot(uint256 epoch, bytes32 root) external;
-    function commitEpochSummary(uint256 epoch, ReceiptSummary calldata summary) external;
+    function commitEpochReceiptRoot(uint64 epochId, bytes32 root) external;
+    function commitEpochSummary(address operator, uint64 epochId, ReceiptSummary calldata summary) external;
 
     // ─── Claim flows ──────────────────────────────────────────────────
     // Pull-based claims for the gauge-boost (40% steady-state) and
@@ -151,8 +151,8 @@ interface IFeeRouter {
     // 26-epoch claim window; older epochs are swept to treasury via
     // `sweepUnclaimed` and revert here. Returns the total amount
     // transferred to the caller for tooling convenience.
-    function claimBoost(uint256[] calldata epochs) external returns (uint256 amount);
-    function claimDelegator(uint256[] calldata epochs) external returns (uint256 amount);
+    function claimBoost(uint64[] calldata epochs) external returns (uint256 amount);
+    function claimDelegator(uint64[] calldata epochs) external returns (uint256 amount);
 
     // ─── Delegator-pool swap (keeper trigger) ─────────────────────────
     // Initiates the per-epoch USDC→TOKEN swap for the delegator bucket
@@ -160,7 +160,7 @@ interface IFeeRouter {
     // calling `swapDelegatorBucket(epoch, amountIn, minOut)`. Consolidated
     // here so the per-epoch liquidity-cap defenses live in one place;
     // `DelegatorBuyer` is the single Balancer V3 caller. `KEEPER_ROLE`-gated.
-    function executeDelegatorSwap(uint256 epoch, uint256 minOut) external;
+    function executeDelegatorSwap(uint64 epochId, uint256 minOut) external;
 
     // ─── Delegator-pool swap callback (DelegatorBuyer-only) ───────────
     // Called by `DelegatorBuyer.swapDelegatorBucket` after the Balancer
@@ -168,22 +168,22 @@ interface IFeeRouter {
     // bucket for `epoch` so `claimDelegator(epochs[])` can pay against
     // it. `msg.sender == delegatorBuyer` is the only authorization
     // check — single trust boundary; no role grants needed post-deploy.
-    function depositDelegatorTokens(uint256 epoch, uint256 amount) external;
+    function depositDelegatorTokens(uint64 epochId, uint256 amount) external;
 
     // ─── Permissionless storage cleanup ───────────────────────────────
     // Sweeps the unclaimed remainder of any epoch past the 26-epoch claim
     // window to the treasury, freeing the per-epoch storage slot. Anyone
     // may call; matches the `pruneBlacklistedAssignment` pattern from
     // [ADR 011 § Interaction with ContentBlacklist](011-content-takedown.md#interaction-with-contentblacklist).
-    function sweepUnclaimed(uint256[] calldata epochs) external;
+    function sweepUnclaimed(uint64[] calldata epochs) external;
 
     // ─── Read views ───────────────────────────────────────────────────
     // Per-(operator, epoch) ve-weighted byte count fed into the gauge
     // formula in [ADR 026 §3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula).
     // Off-chain claim simulators pair this with `epochTotalWorkingBytes`
     // via Multicall3.
-    function workingBytes(address operator, uint256 epoch) external view returns (uint256);
-    function epochTotalWorkingBytes(uint256 epoch) external view returns (uint256);
+    function workingBytes(address operator, uint64 epochId) external view returns (uint256);
+    function epochTotalWorkingBytes(uint64 epochId) external view returns (uint256);
 
     // Per-epoch USDC accumulators for the gauge and delegator buckets.
     // `delegatorBucket` is denominated in USDC pre-swap and TOKEN
@@ -191,8 +191,8 @@ interface IFeeRouter {
     // implementations expose either via this view or a paired
     // `delegatorBucketToken(epoch)` view at their discretion; the
     // semantic value reported here is the active bucket currency).
-    function gaugeBucket(uint256 epoch) external view returns (uint256);
-    function delegatorBucket(uint256 epoch) external view returns (uint256);
+    function gaugeBucket(uint64 epochId) external view returns (uint256);
+    function delegatorBucket(uint64 epochId) external view returns (uint256);
 
     // Configured shares (basis points) and dependency addresses. These
     // are governance-set state (last updated via `setShares` or
@@ -262,20 +262,20 @@ interface IFeeRouter {
     );
     event EpochReceiptRootCommitted(
         address indexed operator,
-        uint256 indexed epoch,
+        uint64 indexed epochId,
         bytes32 root
     );
     event EpochSummaryCommitted(
         address indexed operator,
-        uint256 indexed epoch,
+        uint64 indexed epochId,
         uint256 distinctClientCount,
         uint256 totalBytes
     );
-    event BoostClaimed(address indexed operator, uint256 indexed epoch, uint256 amount);
-    event DelegatorClaimed(address indexed account, uint256 indexed epoch, uint256 amount);
-    event DelegatorSwapped(uint256 indexed epoch, uint256 amountIn, uint256 amountOut);
-    event DelegatorTokensDeposited(uint256 indexed epoch, uint256 amount);
-    event UnclaimedSwept(uint256 indexed epoch, uint256 gaugeAmount, uint256 delegatorAmount);
+    event BoostClaimed(address indexed operator, uint64 indexed epochId, uint256 amount);
+    event DelegatorClaimed(address indexed account, uint64 indexed epochId, uint256 amount);
+    event DelegatorSwapped(uint64 indexed epochId, uint256 amountIn, uint256 amountOut);
+    event DelegatorTokensDeposited(uint64 indexed epochId, uint256 amount);
+    event UnclaimedSwept(uint64 indexed epochId, uint256 gaugeAmount, uint256 delegatorAmount);
     event SharesUpdated(uint256[6] newShares);
     event VotingEscrowUpdated(address indexed oldAddr, address indexed newAddr);
     event SafetyReserveUpdated(address indexed oldAddr, address indexed newAddr);
