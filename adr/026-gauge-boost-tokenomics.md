@@ -174,10 +174,10 @@ interface IVotingEscrow {
     function withdraw() external;
 
     // ─── Lock view ─────────────────────────────────────────────────────
-    // Returns the caller's lock state: locked amount and unlock time.
-    // Returns (0, 0) for addresses that have never locked or have already
-    // withdrawn. Single read covers the common "what does this address
-    // hold and when does it unlock" query.
+    // Returns the specified account's lock state: locked amount and
+    // unlock time. Returns (0, 0) for addresses that have never locked
+    // or have already withdrawn. Single read covers the common "what
+    // does this address hold and when does it unlock" query.
     function locked(address account)
         external view returns (uint256 amount, uint256 end);
 
@@ -235,9 +235,9 @@ interface IVotingEscrow {
 
 **Notes:**
 
-- `createLock` is one-lock-per-address (veCRV pattern). NFT-per-lock (Velodrome / Aerodrome style) is out of scope — if a future ADR introduces it, it ships as an additive top-level contract that holds a single pooled ve-lock here, per [§ Lock ownership](#lock-ownership) above.
-- `getVotes` / `getPastVotes` are deliberately omitted from this interface. Governor (per §9) reads voting weight via `balanceOfAt(user, ts)` / `totalSupplyAt(ts)` rather than the OZ Governor Bravo `getPastVotes(account, blockNumber)` shape, because ve-weight is a function of timestamp (linear decay) not block number. Wallets and indexers that expect Bravo's view surface adapt against `balanceOf` / `balanceOfAt` directly.
-- Delegation reassigns voting weight but not the underlying ve-position — locks remain non-transferable per the §4 invariant. Delegation events follow OZ Governor Bravo so existing Bravo-aware tooling (Tally, Boardroom, etc.) integrates without a custom adapter.
+- `createLock` is one-lock-per-address.
+- `getVotes` and `getPastVotes` are omitted; voting weight is read via `balanceOfAt(user, ts)` and `totalSupplyAt(ts)` because ve-weight is a function of timestamp (linear decay), not block number.
+- Delegation reassigns voting weight but not the underlying ve-position; locks remain non-transferable per the §4 invariant. Delegation events follow OZ Governor Bravo.
 
 ### 5. Safety and insurance reserve (3% bucket)
 
