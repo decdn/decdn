@@ -258,7 +258,7 @@ interface IFeeRouter {
         address indexed operator,
         uint256 bytesDelivered,
         uint256 amount,
-        uint256 indexed epoch
+        uint64 indexed epochId
     );
     event EpochReceiptRootCommitted(
         address indexed operator,
