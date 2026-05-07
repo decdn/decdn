@@ -338,13 +338,31 @@ struct Channel {
 | View | `getRateBounds() → (floor, ceiling)` | Current `RateBounds` in token base units. |
 | View | `feeRouter() → address` | Configured `FeeRouter` target ([ADR 026](026-gauge-boost-tokenomics.md)). |
 | View | `lifetimeDepositOf(client) → uint256` | Monotonic per-client cumulative deposit counter (per [ADR 027 §3](027-distinct-client-receipts.md#3-identity-diversity-gating)). |
-| Governance | `setFeeRouter(addr)` | Replace router target; replaces ADR 003 inline-skim governance per ADR 026. |
+| Governance | `setFeeRouter(addr)` | Replace router target. `GOVERNANCE_ROLE`-gated; routed through the standard 48h `TimelockController` delay; emits `FeeRouterUpdated(address oldRouter, address newRouter)`. See [§ Governance setter: setFeeRouter](#governance-setter-setfeerouter) below. |
 | Governance | `setMinDeposit(amount)` | Minimum channel deposit. |
 | Governance | `setDisputeWindow(seconds)` | Dispute window (bounded 43200–259200 — 12h–72h). |
 | Governance | `setRateBounds(floor, ceiling)` | Rate floor and ceiling in token base units. |
 | Governance | `setMaxVoucherIntervalMb(mb)` | Max negotiable voucher interval (bounded 1–1024 MB). |
 
-Under [ADR 026](026-gauge-boost-tokenomics.md) the `setFeePercentage`, `setDiscountedFeePercentage`, and `setTreasuryAddress` setters from earlier drafts are removed — bucket shares (40/40/7/5/5/3) are governed on `FeeRouter`, not on `StablePaymentChannel`; the treasury share (5%) is configured on `FeeRouter`.
+Bucket shares (40/40/7/5/5/3) are governed on `FeeRouter`, not on `StablePaymentChannel`; the treasury share (5%) is configured on `FeeRouter`.
+
+#### Governance setter: setFeeRouter
+
+```solidity
+function setFeeRouter(address newRouter) external onlyRole(GOVERNANCE_ROLE);
+
+event FeeRouterUpdated(address indexed oldRouter, address indexed newRouter);
+```
+
+`setFeeRouter` re-points the configured `FeeRouter` for future `settleChannel` calls. Required because the audited contract surface is fixed at deploy time but the `FeeRouter` itself may need to be replaced (bug fix, structural upgrade) without redeploying `StablePaymentChannel` and forcing every open channel to re-issue vouchers.
+
+**Authority and timelock.** Only callable by `GOVERNANCE_ROLE` (held by the `TimelockController` post-deploy per [ADR 016 § Post-Deployment Initialization](016-contract-interactions.md#post-deployment-initialization)). `DecdnGovernor` proposals to replace the router execute through the standard 48h timelock per [ADR 009](009-governance.md). Calls outside that path revert.
+
+**Validation.** Reverts on `address(0)` and on the same address as the current `feeRouter`. The new router contract is not interrogated at the setter — the cross-validation invariants in [ADR 016 § Tunable Economics](016-contract-interactions.md#tunable-economics) live on `FeeRouter` itself; replacing the router with a misconfigured deployment surfaces at the next `settleChannel` rather than at the setter.
+
+**Open channels are unaffected.** Vouchers signed against this `StablePaymentChannel` remain valid because the EIP-712 domain separator hashes the contract's own address, not the configured `FeeRouter`. The carve-out is documented in [ADR 016 § No proxy deployment patterns](016-contract-interactions.md#no-proxy-deployment-patterns): helper-contract addresses are not domain-separator inputs and may be re-pointed via governance without invalidating signatures.
+
+**Settlement during the swap.** Settlements that begin before the timelock executes use the previous router; settlements that begin after use the new router. The semantics follow naturally from the on-chain ordering — `settleChannel` reads `feeRouter()` at call time. There is no in-flight settlement that splits across routers because `routeSettlement` is a single transaction.
 
 > **Reentrancy protection:** All state-mutating functions that perform external calls (ERC-20 transfers) — `openChannel`, `topUp`, `settleChannel`, `reclaimExpired` — MUST use `nonReentrant` guards and follow checks-effects-interactions. This is especially critical for the production multi-token contract ([ADR 010](010-multi-token.md)) which accepts arbitrary governance-approved tokens.
 
@@ -613,14 +631,36 @@ mapping(bytes32 => address) public nodeIdToAddress;
 mapping(address => bytes32) public addressToNodeId;
 mapping(address => uint64) public bindingNonce;
 
-// Convenience view for off-chain origin discovery: combines the operator-to-NodeId
-// binding lookup with the node's activity flag in a single read. Returns
-// (bytes32(0), false) if the operator is unbound, and (nodeId, false) if the
-// operator is bound but currently inactive (deregistered, unbonding, or
-// auto-ejected). Surfaced in ADR 016 § Off-Chain Read API and consumed in
-// ADR 022 § Origin discovery as the per-operator path that replaces paginating
-// getActiveNodes when callers already hold an operator address.
+// Bundled per-operator binding + activity view, for off-chain origin
+// discovery. Returns the NodeId currently bound to `operator` and the
+// node's activity flag in a single read. `nodeId` is `bytes32(0)` if the
+// operator has never registered (or has cleared their binding via
+// rebinding); `active` is `false` if the operator is unbound, in
+// unbonding, auto-ejected, or below `minStake`. Surfaced in ADR 016 §
+// Off-Chain Read API and consumed in ADR 022 § Origin discovery as the
+// per-operator path that replaces paginating `getActiveNodes` when
+// callers already hold an operator address.
 function nodeIdOf(address operator) external view returns (bytes32 nodeId, bool active);
+
+// Single-purpose per-operator activity check. Returns `true` iff
+// `operator` is currently registered with active (non-unbonding) stake
+// at or above `minStake`. Returns `false` for unregistered addresses,
+// operators with stake below `minStake`, operators whose stake is fully
+// or partially in unbonding, and auto-ejected operators. Operator-level
+// blacklist status (per ADR 011) is intentionally NOT consulted here —
+// `isActive` is a pure single-contract storage read; callers that need
+// the combined "authorized origin" predicate filter against
+// `ContentBlacklist.isOriginBlacklisted` themselves
+// (per [ADR 011 § Interaction with ContentBlacklist](011-content-takedown.md#interaction-with-contentblacklist)).
+//
+// Equivalent to `(_, active) = nodeIdOf(operator)` but avoids reading
+// the binding slot when only the bit is needed. Consumed by
+// `OriginAssignment.proposeAssignment` / `activateAssignment` /
+// default-open allow-list setters per [ADR 011 § Origin Assignment
+// Authority](011-content-takedown.md#origin-assignment-authority) —
+// those callers work with operator addresses, not NodeIds, and the
+// standalone view keeps their per-operator validation cost flat.
+function isActive(address operator) external view returns (bool);
 
 // Intended for rebinding (key rotation) only — initial binding is performed
 // atomically inside registerNode(). No on-chain guard prevents calling this
