@@ -571,12 +571,10 @@ No payment-specific extensions to `StakingRegistry` are required beyond the regi
 
 ## Admission and Priority
 
-Node admission and queueing policy — including how nodes order incoming `StreamRequest`s under congestion — is implementation-defined and lives outside the protocol. A workable design using two signals already in the protocol (committed voucher rate, plus optional `StakingRegistry.stakeOf` reads for a staked-peer lane) is documented in [appendix-admission-policy.md](appendix-admission-policy.md). Operators MAY adopt that design, vary it, or implement an entirely different policy.
+Node admission and queueing policy — how a node orders incoming `StreamRequest`s under congestion — is implementation-defined and lives outside the protocol. The wire format carries no priority bits, the channel and voucher mechanisms encode no per-stream priority state, and different operators are expected to tune their policy differently. Two signals are available to any admission policy:
 
-Two protocol invariants relevant to any admission policy:
-
-- The advertised `rate_per_mb` in `ProbeResponse` / `StreamResponse` is a **floor**, not equality. Nodes verify `amount_delta / bytes_delta >= rate_per_mb`, so clients are free to commit at higher rates and nodes MAY use the committed rate as a priority signal.
-- The voucher and channel mechanisms in this ADR do not encode priority bits or per-stream priority state. Priority is purely a node-side scheduling concern.
+- **Committed voucher rate.** The advertised `rate_per_mb` in `ProbeResponse` / `StreamResponse` is a **floor**, not equality — nodes verify `amount_delta / bytes_delta >= rate_per_mb`. Clients MAY commit at higher rates; nodes MAY use the committed rate as a per-stream priority key, with the premium paid directly via [`FeeRouter.routeSettlement`](#feerouter-integration).
+- **Registered node-stake.** `StakingRegistry.stakeOf(address)` is readable on-chain for any registered operator. Nodes MAY treat addresses with `stakeOf >= MIN_STAKE` ([ADR 026 §7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake)) as eligible for a higher-priority admission lane.
 
 ## NodeId-to-Ethereum Binding
 
