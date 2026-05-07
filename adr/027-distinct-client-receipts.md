@@ -155,7 +155,7 @@ The receipt-anchoring lifecycle is pinned to four concrete deadlines, all derive
 
 | Window | Opens | Closes | Effect after close |
 | --- | --- | --- | --- |
-| `commitEpochReceiptRoot` | `epochId * epochLength` (epoch start) | `epochEnd + summaryWindow` | MMR sealed; further root commits revert |
+| `commitEpochReceiptRoot` | `genesisTimestamp + epochId * epochLength` (epoch start) | `epochEnd + summaryWindow` | MMR sealed; further root commits revert |
 | `commitEpochSummary` | `epochEnd` (epoch close) | `epochEnd + summaryWindow` | Summary frozen; gauge eligibility input locked |
 | Challenge window | `epochEnd + summaryWindow` | `epochEnd + summaryWindow + challengeWindow` | Summary becomes immutable; no further `ChallengeReceiptSummary` accepted |
 | Claim window | `epochEnd + summaryWindow` | `epochEnd + summaryWindow + claimWindow` | Unclaimed gauge / delegator USDC sweepable to treasury via `FeeRouter.sweepUnclaimed(epochs[])` |
@@ -230,7 +230,7 @@ event EpochSummaryChallenged(
 );
 ```
 
-`EpochReceiptRootCommitted` fires on every `commitEpochReceiptRoot` call (including overwrites before finalisation — the latest event reflects the current MMR state). `EpochSummaryCommitted` fires once at finalisation. `EpochSummaryChallenged` fires once per successful challenge with the two zeroing flags surfaced for indexers.
+`EpochReceiptRootCommitted` fires on every `commitEpochReceiptRoot` call. As each call appends a new leaf to the per-(operator, epoch) MMR, the latest event reflects the current MMR root and leaf count. `EpochSummaryCommitted` fires once at finalisation. `EpochSummaryChallenged` fires once per successful challenge with the two zeroing flags surfaced for indexers.
 
 ### 5. Challenger role (see [Appendix: Fraud Detection](appendix-fraud-detection.md))
 
