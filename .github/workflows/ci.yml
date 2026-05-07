@@ -215,7 +215,14 @@ jobs:
                 issue_number: context.issue.number,
                 per_page: 100,
               });
-              const existing = comments.find(c => c.body && c.body.includes(marker));
+              // Filter by author too: anyone who can comment on the PR could
+              // post a body containing the marker and hijack the sticky-comment
+              // selection. Bot author + marker is the unambiguous identifier.
+              const existing = comments.find(c =>
+                c.user?.login === 'github-actions[bot]'
+                && c.body
+                && c.body.includes(marker)
+              );
               fs.writeFileSync('prior-comment.md', existing ? existing.body : '');
             } catch (e) {
               core.warning(`Failed to fetch prior coverage comment: ${e.message} — history will reset this push.`);
@@ -259,7 +266,15 @@ jobs:
               issue_number: context.issue.number,
               per_page: 100,
             });
-            const existing = comments.find(c => c.body && c.body.includes(marker));
+            // Filter by bot author + marker: a non-bot comment containing
+            // the marker would otherwise get picked as `existing`, and the
+            // updateComment call below would 403 (caller != author), leaving
+            // the bot's actual comment unmaintained.
+            const existing = comments.find(c =>
+              c.user?.login === 'github-actions[bot]'
+              && c.body
+              && c.body.includes(marker)
+            );
             if (existing) {
               await github.rest.issues.updateComment({
                 owner: context.repo.owner,
