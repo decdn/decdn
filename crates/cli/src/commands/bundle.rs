@@ -257,7 +257,7 @@ fn validate_relpath(rel: &Path) -> anyhow::Result<String> {
                 empty = false;
             }
             Component::CurDir => {
-                // ADR `appendix-bundles.md` § Path-safety-rules requires
+                // ADR `appendix-bundles.md` § Path-safety rules requires
                 // every component to be `Component::Normal`. Rust's
                 // Path::components normalizes most `.` segments away, but
                 // a leading `./` still surfaces here — bail to match the
@@ -310,10 +310,14 @@ fn serialize_canonical(entries: &[BundleEntry]) -> anyhow::Result<Vec<u8>> {
 /// named file in the destination directory via `O_CREAT|O_EXCL`, so
 /// there is no predictable `<output>.partial` path an adversary or a
 /// concurrent writer can plant a symlink at to redirect the write.
-/// `persist` does the cross-platform atomic rename-replace; on a crash
-/// mid-write the temp gets dropped (and removed) by the `NamedTempFile`
-/// guard rather than leaving a partial artifact under the operator-
-/// expected name.
+/// `persist` does the cross-platform atomic rename-replace — note that
+/// when `target` already exists as a symlink, `rename(2)` replaces the
+/// symlink itself with the new file, it does not follow it.
+///
+/// On a Rust-side error mid-write the temp is unlinked by the
+/// `NamedTempFile` Drop guard; a hard process kill leaves a random-
+/// named `.tmpXXXXXX` behind, but never a partial artifact under the
+/// operator-expected name.
 fn write_bundle(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let parent = target.parent().filter(|p| !p.as_os_str().is_empty());
     let mut tmp = match parent {
@@ -379,6 +383,18 @@ mod tests {
         let err = validate_relpath(&rel).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("root-dir"), "msg was: {msg}");
+    }
+
+    #[test]
+    fn validate_relpath_rejects_current_dir() {
+        // ADR § Path-safety rules: every component must be `Normal`.
+        // `Path::components` only surfaces `CurDir` for a leading `./`,
+        // but the bail must fire when it does — pin the new behavior so
+        // a future "simplification" can't silently collapse it back.
+        let rel = PathBuf::from("./a/b");
+        let err = validate_relpath(&rel).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("current-dir"), "msg was: {msg}");
     }
 
     #[test]
@@ -488,6 +504,38 @@ mod tests {
             std::fs::read(&target).unwrap(),
             b"{\"version\":1,\"entries\":[]}"
         );
+    }
+
+    // If the operator pre-created `--output` as a symlink, the rename
+    // replaces the symlink with the new regular file rather than
+    // following the link and writing through to its target. The
+    // docstring on `write_bundle` makes this promise; pin it so a
+    // future swap to e.g. `persist_noclobber` can't silently regress.
+    #[cfg(unix)]
+    #[test]
+    fn write_bundle_replaces_symlink_target_does_not_follow() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let decoy = dir.path().join("decoy.txt");
+        std::fs::write(&decoy, b"do not touch").unwrap();
+        let target = dir.path().join("bundle.json");
+        symlink(&decoy, &target).unwrap();
+
+        write_bundle(&target, b"{\"version\":1,\"entries\":[]}").unwrap();
+
+        // `target` is now a regular file with the new bytes…
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"{\"version\":1,\"entries\":[]}"
+        );
+        let meta = std::fs::symlink_metadata(&target).unwrap();
+        assert!(
+            meta.file_type().is_file(),
+            "target should be a regular file"
+        );
+        // …and the decoy file the symlink pointed at is untouched.
+        assert_eq!(std::fs::read(&decoy).unwrap(), b"do not touch");
     }
 
     #[test]
