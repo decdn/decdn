@@ -138,8 +138,7 @@ pub fn move_aside(path: &Path) -> anyhow::Result<PathBuf> {
     use std::time::{SystemTime, UNIX_EPOCH};
     let unix_ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     let file_name = path
         .file_name()
         .and_then(|s| s.to_str())
