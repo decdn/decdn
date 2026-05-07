@@ -2,12 +2,13 @@
 //!
 //! The mocks crate hands us a fully-wired `aws_sdk_s3::Client` whose request
 //! dispatcher returns canned responses while every other layer (signing,
-//! retry, body framing, modeled-error parsing) runs end-to-end. That gives
-//! us the same surface as a real S3 endpoint without standing up `MinIO`,
-//! and crucially routes through the SDK's own retry layer — so a `503` the
-//! mock returns on the first attempt is observed by `S3Origin::fetch` only
-//! after the SDK has exhausted its budget, which is the same observable
-//! behaviour the cache engine sees in production against AWS.
+//! body framing, modeled-error parsing) runs end-to-end. The SDK's
+//! internal retry layer is **disabled** in every test via
+//! [`mock_s3_client`] / [`mock_s3_client_match_any`], matching the
+//! production posture set by `S3Origin::new`'s
+//! `RetryConfig::disabled()`. This keeps the cache engine's
+//! `cache.origin_retry` policy as the single source of retry budget
+//! and makes per-test dispatch counts deterministic.
 //!
 //! See `crates/cache/tests/pull_through.rs` for the equivalent `wiremock`
 //! suite covering [`decdn_cache::HttpOrigin`].
@@ -17,8 +18,9 @@ use std::sync::Arc;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::operation::get_object::{GetObjectError, GetObjectOutput};
 use aws_sdk_s3::types::error::NoSuchKey;
-use aws_smithy_mocks::{RuleMode, mock, mock_client};
+use aws_smithy_mocks::{Rule, RuleMode, mock, mock_client};
 use aws_smithy_types::byte_stream::ByteStream;
+use aws_smithy_types::retry::RetryConfig;
 use decdn_cache::{
     CacheEngine, CacheError, Hash, Origin, OriginFetch, OriginPullError, RetryPolicy, S3Origin,
 };
@@ -26,6 +28,30 @@ use decdn_cache::{
 /// Bucket and prefix used across tests. Matching constants on every rule
 /// keep the test setup terse and the failure messages easy to read.
 const BUCKET: &str = "decdn-blobs";
+
+/// Build a mock-backed S3 client with the SDK's internal retry layer
+/// **disabled**, matching the production posture set by `S3Origin::new`
+/// (which configures `aws_config::ConfigLoader::retry_config(RetryConfig::disabled())`).
+/// Without this, `mock_client!`'s default would re-enable SDK retries and
+/// every `Transient` test would silently observe extra dispatches.
+///
+/// The integration suite uses `S3Origin::from_parts` to inject the mock
+/// client, which skips `S3Origin::new`'s SDK config wiring — so the
+/// retry-disable has to be re-applied here on the mock side.
+fn mock_s3_client(rules: &[&Rule]) -> Client {
+    mock_client!(aws_sdk_s3, RuleMode::Sequential, rules, |conf| {
+        conf.retry_config(RetryConfig::disabled())
+    })
+}
+
+/// Same as [`mock_s3_client`] but with `RuleMode::MatchAny` for tests
+/// that key dispatch on `match_requests` predicates rather than rule
+/// ordering.
+fn mock_s3_client_match_any(rules: &[&Rule]) -> Client {
+    mock_client!(aws_sdk_s3, RuleMode::MatchAny, rules, |conf| {
+        conf.retry_config(RetryConfig::disabled())
+    })
+}
 
 /// Build an `S3Origin` over a mock-backed client. The bucket is fixed to
 /// [`BUCKET`]; the prefix can vary so we can exercise prefix application.
@@ -62,7 +88,7 @@ async fn fetch_returns_origin_bytes_on_success() -> anyhow::Result<()> {
                 .body(ByteStream::from_static(b"hello, decdn from s3"))
                 .build()
         });
-    let client = mock_client!(aws_sdk_s3, [&rule]);
+    let client = mock_s3_client(&[&rule]);
     let origin = s3_origin(client, "");
 
     match origin.fetch(hash, 16 * 1024 * 1024).await? {
@@ -85,7 +111,7 @@ async fn fetch_no_such_key_maps_to_not_found() -> anyhow::Result<()> {
 
     let rule = mock!(Client::get_object)
         .then_error(|| GetObjectError::NoSuchKey(NoSuchKey::builder().build()));
-    let client = mock_client!(aws_sdk_s3, [&rule]);
+    let client = mock_s3_client(&[&rule]);
     let origin = s3_origin(client, "");
 
     match origin.fetch(hash, 16 * 1024 * 1024).await? {
@@ -94,10 +120,13 @@ async fn fetch_no_such_key_maps_to_not_found() -> anyhow::Result<()> {
     }
 }
 
-/// A bare HTTP 404 (no modeled error) also maps to `NotFound`. Some
-/// non-AWS S3 endpoints (notably `MinIO` under certain configurations)
-/// surface the not-found case without the `NoSuchKey` shape, so the
-/// status fallback is load-bearing on those backends.
+/// A bare HTTP 404 with no AWS error code also maps to `NotFound`.
+/// Some non-AWS S3 endpoints have been observed to emit a 404 without
+/// the modeled `NoSuchKey` XML body (no error code field set), so the
+/// status-only fallback is load-bearing on those backends. Critically,
+/// the fallback is **gated on an empty / `NoSuchKey` error code** — a
+/// 404 with `NoSuchBucket` or `AccessDenied` (covered in their own
+/// tests below) bypasses this branch and surfaces as `Permanent`.
 #[tokio::test]
 async fn fetch_bare_http_404_maps_to_not_found() -> anyhow::Result<()> {
     let hash = Hash::new(b"absent");
@@ -106,7 +135,7 @@ async fn fetch_bare_http_404_maps_to_not_found() -> anyhow::Result<()> {
         .sequence()
         .http_status(404, None)
         .build();
-    let client = mock_client!(aws_sdk_s3, [&rule]);
+    let client = mock_s3_client(&[&rule]);
     let origin = s3_origin(client, "");
 
     match origin.fetch(hash, 16 * 1024 * 1024).await? {
@@ -115,14 +144,141 @@ async fn fetch_bare_http_404_maps_to_not_found() -> anyhow::Result<()> {
     }
 }
 
-/// 5xx errors are transient — the SDK's own retry layer cycles through
-/// them, so a sequence that returns 503 twice then succeeds is observed
-/// as a single successful `fetch` from our caller's perspective. The
-/// rule call count proves the retries actually fired (otherwise this
-/// test would pass with a single attempt).
+/// A 404 with `<Code>NoSuchBucket</Code>` in the AWS error body is a
+/// **misconfigured-bucket** failure, not an absent-object failure. The
+/// classifier must surface it as `Permanent` rather than fold it into
+/// `NotFound` — otherwise an operator with a typo'd `bucket = "..."`
+/// in their config would see every cache miss report "blob X is
+/// missing" with no diagnostic, and chase BLAKE3 hashes for hours.
 #[tokio::test]
-async fn fetch_5xx_then_success_drives_sdk_retry_to_success() -> anyhow::Result<()> {
-    let payload: &[u8] = b"recovered after retry";
+async fn fetch_404_with_no_such_bucket_is_permanent_not_not_found() -> anyhow::Result<()> {
+    let hash = Hash::new(b"any");
+    // S3 XML error body. The SDK parses `<Code>NoSuchBucket</Code>`
+    // into `ProvideErrorMetadata::code() == Some("NoSuchBucket")` even
+    // though `NoSuchBucket` is not a modeled variant on `GetObjectError`
+    // — that's exactly the masking case the classifier guards against.
+    let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist</Message>\
+<BucketName>typo-bucket</BucketName></Error>"
+        .to_string();
+    let rule = mock!(Client::get_object)
+        .sequence()
+        .http_status(404, Some(body))
+        .build();
+    let client = mock_s3_client(&[&rule]);
+    let origin = s3_origin(client, "");
+
+    // Match on the result directly — `?` would propagate the Err that
+    // we're trying to inspect.
+    match origin.fetch(hash, 16 * 1024 * 1024).await {
+        Ok(OriginFetch::NotFound) => anyhow::bail!(
+            "NoSuchBucket masked as NotFound — operator would see 'missing blob' \
+             instead of the real config error. fix in classify_get_object_error."
+        ),
+        Ok(OriginFetch::Found(_)) => anyhow::bail!("expected error, got Found"),
+        Err(err) => {
+            anyhow::ensure!(
+                matches!(err, OriginPullError::Permanent(_)),
+                "NoSuchBucket must be Permanent, got: {err:?}"
+            );
+            let msg = format!("{err:#}");
+            anyhow::ensure!(
+                msg.contains("NoSuchBucket"),
+                "error context lost the AWS error code; would make ops debugging harder: {msg}"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// A 404 with `<Code>AccessDenied</Code>` is what AWS S3 returns when
+/// the principal lacks `s3:ListBucket` and the object is missing — the
+/// service hides the existence/permission distinction by returning 404
+/// instead of 403. The classifier must NOT fold this into `NotFound`,
+/// or every cache miss against a misconfigured IAM role would silently
+/// report "missing blob" with no log line surfacing the real cause.
+#[tokio::test]
+async fn fetch_404_with_access_denied_is_permanent_not_not_found() -> anyhow::Result<()> {
+    let hash = Hash::new(b"forbidden");
+    let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>"
+        .to_string();
+    let rule = mock!(Client::get_object)
+        .sequence()
+        .http_status(404, Some(body))
+        .build();
+    let client = mock_s3_client(&[&rule]);
+    let origin = s3_origin(client, "");
+
+    let err = origin
+        .fetch(hash, 16 * 1024 * 1024)
+        .await
+        .err()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "404 + AccessDenied masked as NotFound — IAM misconfig would silently \
+                 report 'missing blob'. fix in classify_get_object_error."
+            )
+        })?;
+    anyhow::ensure!(
+        matches!(err, OriginPullError::Permanent(_)),
+        "AccessDenied must be Permanent, got: {err:?}"
+    );
+    let msg = format!("{err:#}");
+    anyhow::ensure!(
+        msg.contains("AccessDenied"),
+        "error context lost the AWS error code: {msg}"
+    );
+    Ok(())
+}
+
+/// 5xx errors are transient and surface to the cache engine after **a
+/// single dispatch** — `S3Origin::new` configures the SDK with
+/// `RetryConfig::disabled()` so the SDK does not retry internally. The
+/// cache engine's outer `RetryPolicy` (config: `cache.origin_retry`) is
+/// the single source of retry budget, matching the operator-facing
+/// contract from #285. Pinning `num_calls() == 1` catches a regression
+/// where a future SDK upgrade or feature-flag edit re-enables internal
+/// retry — that would silently inflate per-fetch dispatches by up to 3x
+/// (SDK default = 3 attempts) layered under the outer policy.
+#[tokio::test]
+async fn fetch_5xx_classifies_as_transient_with_no_internal_retry() -> anyhow::Result<()> {
+    let hash = Hash::new(b"transient");
+
+    let rule = mock!(Client::get_object)
+        .sequence()
+        .http_status(503, None)
+        .build();
+    let client = mock_s3_client(&[&rule]);
+    let origin = s3_origin(client, "");
+
+    let err = origin
+        .fetch(hash, 16 * 1024 * 1024)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("503 should produce a Transient error"))?;
+    anyhow::ensure!(
+        matches!(err, OriginPullError::Transient(_)),
+        "expected Transient for 5xx, got: {err:?}"
+    );
+    anyhow::ensure!(
+        rule.num_calls() == 1,
+        "SDK internal retry must be disabled; expected 1 dispatch, got {}",
+        rule.num_calls()
+    );
+    Ok(())
+}
+
+/// End-to-end through the cache engine: 5xx then success. This time the
+/// retry happens via `cache.origin_retry` (the outer `RetryPolicy`), not
+/// via the SDK. With the engine's default policy (3 retries), the cache
+/// drives 3 total dispatches against the mock — proving (a) the
+/// `Transient` classification from `S3Origin::fetch` correctly engages
+/// `retry_fetch`, and (b) the SDK's own retry layer is disabled (a 12-
+/// dispatch storm would fail the `num_calls() == 3` assertion).
+#[tokio::test]
+async fn cache_engine_retries_transient_via_origin_retry_policy() -> anyhow::Result<()> {
+    let payload: &[u8] = b"recovered after engine retry";
     let hash = Hash::new(payload);
 
     let rule = mock!(Client::get_object)
@@ -131,26 +287,40 @@ async fn fetch_5xx_then_success_drives_sdk_retry_to_success() -> anyhow::Result<
         .times(2)
         .output(|| {
             GetObjectOutput::builder()
-                .body(ByteStream::from_static(b"recovered after retry"))
+                .body(ByteStream::from_static(b"recovered after engine retry"))
                 .build()
         })
         .build();
-    let client = mock_client!(aws_sdk_s3, [&rule]);
-    let origin = s3_origin(client, "");
+    let client = mock_s3_client(&[&rule]);
+    let origin: Arc<dyn Origin> = Arc::new(s3_origin(client, ""));
 
-    match origin.fetch(hash, 16 * 1024 * 1024).await? {
-        OriginFetch::Found(bytes) => {
-            anyhow::ensure!(&bytes[..] == payload, "got: {bytes:?}");
-        }
-        OriginFetch::NotFound => anyhow::bail!("expected Found after retry"),
-    }
-    // 2 transient + 1 success = 3 calls. If the SDK didn't retry we'd
-    // see 1 call and a Transient error bubbling out instead — so this
-    // assertion is the single line that pins the SDK-level retry budget
-    // we depend on.
+    let tmp = tempfile::tempdir()?;
+    // Use a fast policy so the test doesn't spend wall-time in jittered
+    // backoff sleeps — three retries with 1ms initial / 4ms cap is
+    // milliseconds total even with the jitter envelope.
+    let policy = RetryPolicy {
+        max_retries: 3,
+        initial_backoff_ms: 1,
+        max_backoff_ms: 4,
+        jitter_ratio: 0.0,
+    };
+    let engine = CacheEngine::open_full(
+        tmp.path(),
+        Some(origin),
+        16,
+        decdn_cache::PinnedHashes::empty(),
+        policy,
+        None,
+    )
+    .await?;
+
+    let got = engine.get(hash).await?;
+    anyhow::ensure!(&got[..] == payload, "got: {got:?}");
+    // 2 transients + 1 success = 3 dispatches. If the SDK's internal
+    // retry slipped back on, we'd see 9 (3 × 3) dispatches instead.
     anyhow::ensure!(
         rule.num_calls() == 3,
-        "expected 3 dispatches (2 transient + success), got {}",
+        "expected 3 outer-policy retries (2 transient + success); SDK internal retry may have leaked back on. got {}",
         rule.num_calls()
     );
     Ok(())
@@ -170,7 +340,7 @@ async fn fetch_4xx_classifies_as_permanent_and_does_not_retry() -> anyhow::Resul
         .sequence()
         .http_status(403, None)
         .build();
-    let client = mock_client!(aws_sdk_s3, [&rule]);
+    let client = mock_s3_client(&[&rule]);
     let origin = s3_origin(client, "");
 
     let err = origin
@@ -208,7 +378,7 @@ async fn fetch_with_content_encoding_gzip_is_permanent_with_pointer_message() ->
             .content_encoding("gzip")
             .build()
     });
-    let client = mock_client!(aws_sdk_s3, [&rule]);
+    let client = mock_s3_client(&[&rule]);
     let origin = s3_origin(client, "");
 
     let err = origin
@@ -245,7 +415,7 @@ async fn fetch_with_content_encoding_identity_is_accepted() -> anyhow::Result<()
             .content_encoding("identity")
             .build()
     });
-    let client = mock_client!(aws_sdk_s3, [&rule]);
+    let client = mock_s3_client(&[&rule]);
     let origin = s3_origin(client, "");
 
     match origin.fetch(hash, 16 * 1024 * 1024).await? {
@@ -277,7 +447,7 @@ async fn fetch_oversize_body_is_permanent() -> anyhow::Result<()> {
             .body(ByteStream::from(body.clone()))
             .build()
     });
-    let client = mock_client!(aws_sdk_s3, [&rule]);
+    let client = mock_s3_client(&[&rule]);
     let origin = s3_origin(client, "");
 
     let err = origin
@@ -323,7 +493,7 @@ async fn fetch_applies_prefix_with_sharded_key_layout() -> anyhow::Result<()> {
     // one rule; using `MatchAny` here keeps the failure message clear
     // ("no rule matched the bucket/key" beats "sequence position out of
     // range") if a future regression breaks the key layout.
-    let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, [&rule]);
+    let client = mock_s3_client_match_any(&[&rule]);
     let origin = s3_origin(client, prefix);
 
     match origin.fetch(hash, 16 * 1024 * 1024).await? {
@@ -354,7 +524,7 @@ async fn cache_engine_miss_pulls_from_s3_and_caches() -> anyhow::Result<()> {
             .body(ByteStream::from_static(b"engine-pull through s3"))
             .build()
     });
-    let client = mock_client!(aws_sdk_s3, [&rule]);
+    let client = mock_s3_client(&[&rule]);
     let origin: Arc<dyn Origin> = Arc::new(s3_origin(client, ""));
 
     let tmp = tempfile::tempdir()?;
@@ -398,7 +568,7 @@ async fn cache_engine_surfaces_not_found_for_no_such_key() -> anyhow::Result<()>
 
     let rule = mock!(Client::get_object)
         .then_error(|| GetObjectError::NoSuchKey(NoSuchKey::builder().build()));
-    let client = mock_client!(aws_sdk_s3, [&rule]);
+    let client = mock_s3_client(&[&rule]);
     let origin: Arc<dyn Origin> = Arc::new(s3_origin(client, ""));
 
     let tmp = tempfile::tempdir()?;

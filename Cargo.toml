@@ -83,24 +83,36 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "s
 # fully suppressed by these flags. Cargo.lock confirms only one `rustls` and
 # one `aws-lc-rs` major after the addition.
 #
-# A small hyper-0.14 transitive subtree (`hyper`, `h2`, `http`, `http-body`,
-# `socket2`) does still land in the lockfile because `aws-smithy-runtime`'s
-# default features enable the `connector-hyper-0-14-x` flag on
-# `aws-smithy-http-client` — that connector is for the SDK's legacy code
-# paths the runtime never invokes (we route every request through the
-# explicit hyper-1 client), but cargo unifies features across the dep
-# graph and we can't disable a feature flipped on by a transitive crate.
-# The cost is a handful of extra crate compilations and the
-# `multiple-versions` warning bumps; no parallel TLS stack and no extra
-# crypto provider. Re-evaluate if a future smithy-rs release moves the
-# legacy connector off-default.
+# The production binary `decdn-node` ships hyper-1 only — `cargo tree
+# -p decdn-node --no-dev-dependencies` shows one `hyper` (1.x), one `h2`
+# (0.4), one `socket2` (0.6). Two `http`/`http-body` versions still appear
+# in production because `aws-smithy-types` carries an `http 0.2` shim type
+# alongside its `http 1.x` API; that shim is dead at runtime but cargo
+# can't unify the feature graph across the smithy types crate. No
+# parallel TLS stack and no extra crypto provider in either case.
+#
+# In the **test/dev build** (`crates/cache` dev-deps include `aws-smithy-mocks`
+# and `aws-sdk-s3 = { features = ["test-util"] }`), a hyper-0.14 +
+# h2 0.3 + socket2 0.5 subtree does land — `test-util` enables
+# `aws-smithy-runtime/legacy-test-util` which enables
+# `aws-smithy-http-client/hyper-014`. Cargo unifies features across deps
+# and dev-deps, so the dev-only feature still leaves the lockfile entries
+# even in production builds; they just aren't linked. The fix path is
+# upstream (a leaner mocks crate that doesn't require legacy hyper) or a
+# future smithy-rs release that splits the test-util layer. Re-evaluate
+# both.
 #
 # `aws-config` keeps the standard credential-chain pieces (env / profile /
 # IMDS / SSO / credentials_process) so operators get the AWS-CLI-equivalent
 # discovery for free; the `behavior-version-latest` feature is paired with
 # an explicit `BehaviorVersion::latest()` at the call site so a future
-# feature-flag edit can't silently introduce a panic in
-# `ClientBuilder::build`.
+# feature-flag edit dropping the implicit path cannot regress (older SDK
+# versions panicked here; current versions surface a runtime error).
+# Note: the `sso` feature enables an HTTP-using credential provider; if an
+# operator's `~/.aws/config` profile is configured for SSO with an
+# expired cached token, the *first* fetch through the cache may trigger
+# an HTTP refresh against the SSO endpoint. Construction itself stays
+# I/O-free (verified by `S3Origin::new`'s no-I/O construction tests).
 aws-config = { version = "1.8", default-features = false, features = [
     "behavior-version-latest",
     "credentials-process",

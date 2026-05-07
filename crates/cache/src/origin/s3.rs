@@ -32,6 +32,8 @@ use aws_sdk_s3::config::Region;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_smithy_http_client::{Builder as HttpBuilder, tls};
+use aws_smithy_types::error::metadata::ProvideErrorMetadata;
+use aws_smithy_types::retry::RetryConfig;
 use iroh_blobs::Hash;
 
 use super::{Origin, OriginFetch, OriginUrl};
@@ -50,7 +52,17 @@ use crate::error::OriginPullError;
 /// that the values come from `decdn_common::config::resolve_origin`, the
 /// only producer that runs the bucket-name / region / endpoint-URL
 /// validators.
-#[derive(Debug, Clone)]
+///
+/// The `Debug` impl is **manual** rather than derived: it forwards every
+/// field through the [`S3Credentials`] redaction wrapper so an incidental
+/// `tracing::debug!(?cfg)` or panic-backtrace formatter cannot leak the
+/// access-key / secret-key bytes. The `#[derive(Debug)]` would print them
+/// in cleartext (the wrapped `String`s lost their `SecretString` discipline
+/// at the resolve→runtime boundary in `decdn-node`). Mirrors the pattern
+/// established by `decdn_common::config::secret::SecretString` (same crate
+/// can't be intra-doc-linked because `decdn-cache` deliberately does not
+/// depend on `decdn-common`).
+#[derive(Clone)]
 pub struct S3OriginConfig {
     /// Bucket name. Validated DNS-safe at config-resolve time.
     pub bucket: String,
@@ -78,9 +90,14 @@ pub struct S3OriginConfig {
 /// is responsible for unwrapping `decdn_common::config::secret::SecretString`
 /// before passing them here. By the time credentials reach the SDK they
 /// are plain bytes either way (the SDK's `Credentials::new` takes
-/// `&str`/`String`), so the redaction discipline is enforced at the
-/// config / log boundary, not inside the SDK call site.
-#[derive(Debug, Clone)]
+/// `&str`/`String`).
+///
+/// The `Debug` impl is **manual** to preserve the redaction discipline
+/// across the resolve→runtime boundary: `Static`'s key fields print as
+/// `"***"` so a stray `tracing::debug!(?creds)` or panic-backtrace cannot
+/// leak the credential bytes. `DefaultChain`'s `profile` is operator-set
+/// configuration and prints in cleartext (no secret content).
+#[derive(Clone)]
 pub enum S3Credentials {
     /// Explicit IAM access key + secret + optional STS session token.
     Static {
@@ -99,6 +116,46 @@ pub enum S3Credentials {
         /// Profile name override for `~/.aws/credentials`.
         profile: Option<String>,
     },
+}
+
+impl std::fmt::Debug for S3Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Mirrors `decdn_common::config::secret::SecretString::Debug`: never
+        // print the cleartext key, secret, or session token, regardless of
+        // the surrounding formatter (`{:?}`, `{:#?}`, panic backtrace).
+        // `session_token` discriminates `Some`/`None` so an operator can
+        // tell whether STS temporary creds are in use without seeing the
+        // token bytes.
+        match self {
+            Self::Static { session_token, .. } => f
+                .debug_struct("Static")
+                .field("access_key_id", &"***")
+                .field("secret_access_key", &"***")
+                .field("session_token", &session_token.as_ref().map(|_| "***"))
+                .finish(),
+            Self::DefaultChain { profile } => f
+                .debug_struct("DefaultChain")
+                .field("profile", profile)
+                .finish(),
+        }
+    }
+}
+
+impl std::fmt::Debug for S3OriginConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Manual impl rather than derive so `credentials` flows through
+        // [`S3Credentials`]'s redacting `Debug`. Bucket / region /
+        // endpoint / prefix are operator-set configuration with no
+        // secret content; print in the clear.
+        f.debug_struct("S3OriginConfig")
+            .field("bucket", &self.bucket)
+            .field("region", &self.region)
+            .field("endpoint_url", &self.endpoint_url)
+            .field("path_style", &self.path_style)
+            .field("prefix", &self.prefix)
+            .field("credentials", &self.credentials)
+            .finish()
+    }
 }
 
 /// Compute the S3 object key for `hash`: `{prefix}{hex[0..2]}/{hex}`.
@@ -133,18 +190,46 @@ pub struct S3Origin {
 }
 
 impl S3Origin {
-    /// Build an `S3Origin` from validated config. Performs no network I/O —
-    /// the SDK lazily connects on the first `fetch`. Returns an error only
-    /// if the underlying SDK config builder rejects the inputs (e.g. a
-    /// region string that fails to parse).
+    /// Build an `S3Origin` from validated config. Returns an error if a
+    /// `Static` credential variant carries empty bytes (defense in depth
+    /// against a config-resolver gap or a hand-built `S3OriginConfig`).
     ///
-    /// `BehaviorVersion::latest()` is set explicitly here even though the
-    /// `behavior-version-latest` cargo feature on `aws-config` would
-    /// implicitly do the same. Belt-and-braces against a future feature-
-    /// flag edit causing a silent panic in the SDK's `ClientBuilder::build`
-    /// (the SDK panics if neither path is taken — its only `unwrap` on the
-    /// construction hot path).
+    /// **I/O posture:** construction itself is non-blocking — `aws_config`
+    /// builds lazy provider chains and resolves credentials on the first
+    /// signed request, not at `load()` time. The one operator-visible
+    /// caveat is the AWS SSO provider (enabled via the `sso` feature on
+    /// `aws-config`): if the `~/.aws/config` profile in use is configured
+    /// for SSO and the cached SSO token has expired, the *first* `fetch`
+    /// call may fire an HTTP request to the SSO endpoint to refresh the
+    /// token. That's a property of the AWS credential chain, not this
+    /// constructor; the construction itself stays I/O-free.
+    ///
+    /// `BehaviorVersion::latest()` is set explicitly even though
+    /// `aws-config`'s `behavior-version-latest` feature would imply the
+    /// same. Belt-and-braces against a future feature-flag edit dropping
+    /// the implicit path — older SDK versions panicked when no
+    /// `BehaviorVersion` was set; current versions surface a runtime error.
+    /// Either way, the explicit call site cannot regress.
     pub async fn new(cfg: &S3OriginConfig) -> anyhow::Result<Self> {
+        // Defense in depth against a config-resolver gap or a downstream
+        // caller that bypasses `decdn_common::config::resolve_origin` and
+        // hand-builds an `S3OriginConfig`. Empty static credentials would
+        // otherwise produce a confusing 403 from the service at first
+        // fetch — turn the failure into a clear startup-time error
+        // pointing at the [cache.origin.credentials] block.
+        if let Some(S3Credentials::Static {
+            access_key_id,
+            secret_access_key,
+            ..
+        }) = cfg.credentials.as_ref()
+        {
+            if access_key_id.is_empty() || secret_access_key.is_empty() {
+                anyhow::bail!(
+                    "S3 static credentials have empty access_key_id or secret_access_key; \
+                     check [cache.origin.credentials] in config or the secret-resolution layer"
+                );
+            }
+        }
         // Build the hyper-1 + rustls 0.23 + aws-lc-rs HTTP client.
         // Constructed once per S3Origin and shared across every fetch via
         // `Client::clone` (the SDK Client is cheaply cloneable). A single
@@ -156,8 +241,18 @@ impl S3Origin {
             ))
             .build_https();
 
+        // Disable the SDK's internal retry layer. Without this, transient
+        // failures get retried *twice*: once by the SDK (default 3 attempts)
+        // and again by the cache engine's outer `retry_fetch` (default 4
+        // attempts), producing up to 12 dispatches per logical fetch on
+        // sustained 5xx — not what an operator reading
+        // `cache.origin_retry.max_retries = 3` expects. By disabling the
+        // SDK budget, `cache.origin_retry` becomes the single source of
+        // truth for retry policy across all three origin backends (HTTP,
+        // FS, S3), matching the operator-facing contract from #285.
         let mut loader = aws_config::defaults(BehaviorVersion::latest())
             .http_client(http_client)
+            .retry_config(RetryConfig::disabled())
             .region(Region::new(cfg.region.clone()));
 
         if let Some(endpoint) = cfg.endpoint_url.as_ref() {
@@ -211,8 +306,10 @@ impl S3Origin {
     /// which can't be obtained via `aws_config::defaults`.
     ///
     /// `pub` rather than `pub(crate)` because the integration tests live
-    /// outside the crate; `#[doc(hidden)]` keeps it out of the public
-    /// API surface. Production code uses [`Self::new`].
+    /// outside the crate. `#[doc(hidden)]` excludes the function from
+    /// generated rustdoc only — it is technically callable by downstream
+    /// crates and is part of the semver surface by convention. Production
+    /// code uses [`Self::new`].
     #[doc(hidden)]
     pub fn from_parts(client: Client, bucket: &str, prefix: &str) -> Self {
         Self {
@@ -230,19 +327,30 @@ const fn is_transient_status(status: u16) -> bool {
     status >= 500 || status == 408 || status == 429
 }
 
-/// Classify a `SdkError<GetObjectError>`. Returns
-/// `Ok(OriginFetch::NotFound)` for `NoSuchKey` (and the equivalent
-/// 404 status — some non-AWS endpoints may surface the not-found case
-/// without the modeled `NoSuchKey` variant).
+/// Classify a `SdkError<GetObjectError>` into the cache engine's
+/// `OriginFetch` / `OriginPullError` taxonomy.
+///
+/// Returns `Ok(OriginFetch::NotFound)` only when the response is
+/// genuinely "object does not exist": either the modeled `NoSuchKey`
+/// variant, or an HTTP 404 whose AWS error code is `NoSuchKey`/empty.
+/// A 404 with any other code (`NoSuchBucket`, `AccessDenied`, ...) is
+/// **not** treated as `NotFound` — those are config / permission
+/// failures that AWS sometimes dresses up as 404 (e.g. when the
+/// principal lacks `s3:ListBucket` it returns 404 for missing objects;
+/// a typo'd bucket also surfaces as a non-modeled 404). Misclassifying
+/// those as `NotFound` would silently mask the operator's real problem.
 ///
 /// Errors that may be cured by retry (timeouts, dispatch failures,
-/// 5xx/408/429) become `Transient`; everything else (4xx, construction
-/// failures, response-parse failures, Glacier-cold objects) becomes
-/// `Permanent`.
+/// 5xx/408/429) become `Transient`; everything else (other 4xx,
+/// construction failures, response-parse failures, Glacier-cold objects)
+/// becomes `Permanent`. The cache engine's `retry_fetch` drives the
+/// retry budget off this distinction.
 ///
-/// `SdkError` is `#[non_exhaustive]`, so the catch-all arm conservatively
-/// classifies any unknown future variant as `Permanent` (better to surface
-/// a clear failure than retry indefinitely against a misclassification).
+/// `SdkError` is `#[non_exhaustive]`. The catch-all arm classifies
+/// future variants as `Permanent` (fail fast over retry-storm) and
+/// emits a `tracing::warn!` so an SDK upgrade that adds a transient-
+/// shaped variant we don't yet recognize is operator-visible rather
+/// than silently misclassified.
 fn classify_get_object_error(
     err: SdkError<GetObjectError>,
     log_target: &str,
@@ -255,29 +363,55 @@ fn classify_get_object_error(
             if matches!(inner, GetObjectError::NoSuchKey(_)) {
                 return Ok(OriginFetch::NotFound);
             }
-            // Some non-AWS S3 endpoints emit a bare 404 without the
-            // modeled NoSuchKey error (notably MinIO under certain
-            // configurations). Treat those as NotFound too — this
-            // matches HttpOrigin's status-based 404 path.
+            // Bare HTTP 404 fallback: treat as NotFound when the AWS
+            // error code is empty, explicitly `NoSuchKey`, or the SDK's
+            // synthetic `NotFound` code (assigned when a 404 has no
+            // parseable error body — e.g. some MinIO configurations).
+            // Any *other* code on a 404 is a permission-disguise or
+            // wrong-bucket failure (`NoSuchBucket`, `AccessDenied`) —
+            // those bypass this branch and surface as `Permanent` so
+            // the operator sees the real cause.
             if status == 404 {
-                return Ok(OriginFetch::NotFound);
+                let code = inner.code().unwrap_or("");
+                if code.is_empty()
+                    || code.eq_ignore_ascii_case("NoSuchKey")
+                    || code.eq_ignore_ascii_case("NotFound")
+                {
+                    return Ok(OriginFetch::NotFound);
+                }
             }
-            let msg = format!("{log_target}: S3 GetObject returned {status}: {inner}");
+            let context = format!(
+                "{log_target}: S3 GetObject returned {status} ({})",
+                inner.code().unwrap_or("<no error code>")
+            );
+            // `anyhow::Error::from(inner).context(...)` preserves the
+            // SDK error in the source chain — `anyhow::Error::chain()`
+            // walks through it for structured tracing, and downstream
+            // downcasts (analogous to `CacheError::origin_error_kind`
+            // for HttpOrigin) can recover the typed `GetObjectError`.
+            // Using `anyhow::anyhow!("…{inner}")` would flatten the
+            // chain to a single string and lose that.
             if is_transient_status(status) {
-                Err(OriginPullError::Transient(anyhow::anyhow!(msg)))
+                Err(OriginPullError::Transient(
+                    anyhow::Error::from(inner).context(context),
+                ))
             } else {
-                Err(OriginPullError::Permanent(anyhow::anyhow!(msg)))
+                Err(OriginPullError::Permanent(
+                    anyhow::Error::from(inner).context(context),
+                ))
             }
         }
         // Network-layer transients: TCP/TLS connect failures, idle
-        // timeouts, mid-stream disconnects. The SDK's own retry layer
-        // has already exhausted whatever budget it was given before
-        // surfacing these — wrapping them in `Transient` lets our
-        // outer `RetryPolicy` (config: `cache.origin_retry`) take a
-        // second crack from cold.
+        // timeouts, mid-stream disconnects. With the SDK's internal
+        // retry layer disabled (see `S3Origin::new`), these surface
+        // immediately on the first attempt; the cache engine's
+        // outer `RetryPolicy` (config: `cache.origin_retry`) is the
+        // single source of retry budget.
         SdkError::TimeoutError(_) | SdkError::DispatchFailure(_) => {
-            let msg = format!("{log_target}: S3 GetObject transport failure: {err}");
-            Err(OriginPullError::Transient(anyhow::anyhow!(msg)))
+            Err(OriginPullError::Transient(
+                anyhow::Error::from(err)
+                    .context(format!("{log_target}: S3 GetObject transport failure")),
+            ))
         }
         // ConstructionFailure = the SDK could not even build the
         // request (e.g. impossible URL, bad credentials shape). Not
@@ -285,16 +419,30 @@ fn classify_get_object_error(
         // but failed to parse it; retrying against the same response
         // shape will keep failing.
         SdkError::ConstructionFailure(_) | SdkError::ResponseError(_) => {
-            let msg = format!("{log_target}: S3 GetObject permanent failure: {err}");
-            Err(OriginPullError::Permanent(anyhow::anyhow!(msg)))
+            Err(OriginPullError::Permanent(
+                anyhow::Error::from(err)
+                    .context(format!("{log_target}: S3 GetObject permanent failure")),
+            ))
         }
         // `SdkError` is `#[non_exhaustive]`. Conservatively classify
         // any future variant as Permanent so we don't retry forever
         // against a new failure mode the workspace doesn't yet
-        // understand.
+        // understand. Emit a `warn!` so an SDK upgrade that introduces
+        // a *transient*-shaped variant we should be retrying is
+        // operator-visible (file a ticket → adjust the classifier)
+        // rather than silently treated as fail-fast.
         _ => {
-            let msg = format!("{log_target}: S3 GetObject unrecognized failure: {err}");
-            Err(OriginPullError::Permanent(anyhow::anyhow!(msg)))
+            tracing::warn!(
+                target: "decdn_cache::origin::s3",
+                log_target = %log_target,
+                sdk_error = %err,
+                "S3 GetObject returned an SdkError variant this build does not classify; \
+                 treating as Permanent. File a ticket if this fires after an aws-sdk-s3 bump."
+            );
+            Err(OriginPullError::Permanent(
+                anyhow::Error::from(err)
+                    .context(format!("{log_target}: S3 GetObject unrecognized failure")),
+            ))
         }
     }
 }
@@ -307,11 +455,12 @@ impl Origin for S3Origin {
     ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>> {
         Box::pin(async move {
             let key = key_for(&self.prefix, hash);
-            // `s3://bucket/key` is the conventional log shape and is
-            // safe to print — bucket and key are operator-chosen, not
-            // sourced from a request, so no userinfo / token leakage
-            // path exists here (unlike HttpOrigin's URL-with-userinfo
-            // case).
+            // `s3://bucket/key` is the conventional log shape. Safe to
+            // print: the bucket comes from operator-set config and the
+            // key is `{prefix}{hex[..2]}/{hex}` over a content-addressed
+            // BLAKE3 hash — no caller-controlled bytes, no credentials.
+            // (Contrast with HttpOrigin's URL, which can carry userinfo
+            // and is redacted via `redact_for_log` on every log line.)
             let log_target = format!("s3://{}/{}", self.bucket, key);
 
             let resp = match self
@@ -366,9 +515,11 @@ impl Origin for S3Origin {
             }
 
             // Collect the full body. PR2 buffers the entire payload before
-            // returning — same approach as `HttpOrigin` and acceptable
-            // up to `max_blob_size_mb` (default 128 MB; runtime ceiling
-            // 10 GB but operators rarely touch that). A streaming variant
+            // returning — same approach as `HttpOrigin`. The cap is
+            // `cache.max_blob_size_mb` (default 1 GB per
+            // `decdn_common::config::DEFAULT_MAX_BLOB_SIZE_MB`); the only
+            // upper bound is the runtime invariant
+            // `max_blob_size_mb < cache_size_mb`. A streaming variant
             // is a follow-up if benchmarks show large blobs starve the
             // tokio executor.
             let body = resp
@@ -376,9 +527,19 @@ impl Origin for S3Origin {
                 .collect()
                 .await
                 .map_err(|e| {
-                    OriginPullError::Transient(anyhow::anyhow!(
-                        "{log_target}: body collect failed: {e}"
-                    ))
+                    // `aws_smithy_types::byte_stream::error::Error` doesn't
+                    // expose a clean is-transient API; collect failures are
+                    // typically mid-stream disconnects (genuinely transient)
+                    // but can also be smithy-side deserialization faults
+                    // (would be permanent). With the SDK's internal retry
+                    // layer disabled, classifying conservatively as
+                    // `Transient` lets `cache.origin_retry` take a crack —
+                    // a deterministic deserialize fault will exhaust the
+                    // outer budget and surface as `CacheError::OriginError`.
+                    OriginPullError::Transient(
+                        anyhow::Error::from(e)
+                            .context(format!("{log_target}: body collect failed")),
+                    )
                 })?
                 .into_bytes();
 
@@ -492,5 +653,174 @@ mod tests {
             .await
             .expect("construction with static creds must succeed without I/O");
         assert_eq!(origin.bucket.as_ref(), "decdn-blobs");
+    }
+
+    /// `endpoint_url: Some(...)` round-trip — the entire R2/B2/MinIO
+    /// path. A regression in `OriginUrl::as_url().as_str()` (e.g. a
+    /// trailing-slash drift the SDK rejects, or a credential-bearing
+    /// URL slipping past the parser) would surface as a panic from
+    /// the SDK config builder during construction.
+    #[tokio::test]
+    async fn new_with_endpoint_url_construction_is_pure() {
+        let mut cfg = make_cfg();
+        cfg.endpoint_url = Some(
+            super::super::parse_origin_url("https://example-r2-endpoint.invalid/")
+                .expect("test URL must parse"),
+        );
+        let origin = S3Origin::new(&cfg)
+            .await
+            .expect("construction with custom endpoint must succeed without I/O");
+        assert_eq!(origin.bucket.as_ref(), "decdn-blobs");
+    }
+
+    /// `path_style: true` round-trip — the `MinIO` addressing path. The
+    /// SDK's `force_path_style(true)` call is what makes path-style
+    /// addressing actually take effect; if a future SDK rename or
+    /// removal of `force_path_style` slipped through, `MinIO` deployments
+    /// would break and this construction test would fail at compile
+    /// time (the type signature is the contract under test).
+    #[tokio::test]
+    async fn new_with_path_style_true_construction_is_pure() {
+        let mut cfg = make_cfg();
+        cfg.path_style = true;
+        cfg.endpoint_url = Some(
+            super::super::parse_origin_url("http://minio.invalid:9000/")
+                .expect("test URL must parse"),
+        );
+        cfg.credentials = Some(S3Credentials::Static {
+            access_key_id: "minioadmin".to_string(),
+            secret_access_key: "minioadmin".to_string(),
+            session_token: None,
+        });
+        let origin = S3Origin::new(&cfg)
+            .await
+            .expect("construction with path_style + custom endpoint must succeed");
+        assert_eq!(origin.bucket.as_ref(), "decdn-blobs");
+    }
+
+    /// `DefaultChain { profile: Some(name) }` round-trip — exercises
+    /// the `loader.profile_name(name.clone())` arm. Without this test,
+    /// dropping the `if let Some(name)` branch would silently fall
+    /// back every operator's non-default-profile config to `default`.
+    #[tokio::test]
+    async fn new_with_named_profile_construction_is_pure() {
+        let mut cfg = make_cfg();
+        cfg.credentials = Some(S3Credentials::DefaultChain {
+            profile: Some("decdn-prod".to_string()),
+        });
+        let origin = S3Origin::new(&cfg)
+            .await
+            .expect("construction with named profile must succeed without I/O");
+        assert_eq!(origin.bucket.as_ref(), "decdn-blobs");
+    }
+
+    /// Empty static credentials are rejected at construction time. A
+    /// regression that drops this defense would let a hand-built
+    /// `S3OriginConfig` (or a config-resolver gap) reach the SDK with
+    /// `Credentials::new("", "", None, ...)` — the operator would see
+    /// a confusing 403 from the service at first fetch instead of a
+    /// clear startup error pointing at `[cache.origin.credentials]`.
+    #[tokio::test]
+    async fn new_rejects_empty_static_credentials() {
+        let mut cfg = make_cfg();
+        cfg.credentials = Some(S3Credentials::Static {
+            access_key_id: String::new(),
+            secret_access_key: "secret-fake".to_string(),
+            session_token: None,
+        });
+        let err = S3Origin::new(&cfg)
+            .await
+            .expect_err("empty access_key_id must reject");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("empty access_key_id") || msg.contains("empty"),
+            "rejection message lost actionable wording: {msg}"
+        );
+
+        cfg.credentials = Some(S3Credentials::Static {
+            access_key_id: "AKIA-test-fake".to_string(),
+            secret_access_key: String::new(),
+            session_token: None,
+        });
+        let err = S3Origin::new(&cfg)
+            .await
+            .expect_err("empty secret_access_key must reject");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("empty"), "rejection message: {msg}");
+    }
+
+    /// `S3Credentials::Static` Debug must NEVER print the cleartext
+    /// access key, secret key, or session token. The `derive(Debug)`
+    /// would dump them; the manual impl is the only thing standing
+    /// between a stray `tracing::debug!(?creds)` or panic backtrace
+    /// and a credential leak in operator logs / Sentry. Pin the
+    /// contract.
+    #[test]
+    fn debug_redacts_static_credentials() {
+        let creds = S3Credentials::Static {
+            access_key_id: "AKIA-leaked-12345".to_string(),
+            secret_access_key: "secret-leaked-67890".to_string(),
+            session_token: Some("token-leaked-abcde".to_string()),
+        };
+        let dbg = format!("{creds:?}");
+        assert!(
+            !dbg.contains("AKIA-leaked-12345"),
+            "access_key_id leaked through Debug: {dbg}"
+        );
+        assert!(
+            !dbg.contains("secret-leaked-67890"),
+            "secret_access_key leaked through Debug: {dbg}"
+        );
+        assert!(
+            !dbg.contains("token-leaked-abcde"),
+            "session_token leaked through Debug: {dbg}"
+        );
+        // Redaction marker present
+        assert!(dbg.contains("***"), "redaction marker missing: {dbg}");
+        // Variant tag preserved so operators can tell which branch is in use
+        assert!(dbg.contains("Static"), "variant tag missing: {dbg}");
+    }
+
+    /// The same redaction must apply transitively when `S3Credentials`
+    /// is embedded inside an `S3OriginConfig`. A `?cfg` on the runtime
+    /// wiring path would otherwise leak credentials through the
+    /// containing struct.
+    #[test]
+    fn debug_redacts_credentials_when_nested_in_origin_config() {
+        let cfg = S3OriginConfig {
+            bucket: "b".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint_url: None,
+            path_style: false,
+            prefix: String::new(),
+            credentials: Some(S3Credentials::Static {
+                access_key_id: "AKIA-leaked-fff".to_string(),
+                secret_access_key: "secret-leaked-ggg".to_string(),
+                session_token: None,
+            }),
+        };
+        let dbg = format!("{cfg:?}");
+        assert!(!dbg.contains("AKIA-leaked-fff"), "access key leaked: {dbg}");
+        assert!(!dbg.contains("secret-leaked-ggg"), "secret leaked: {dbg}");
+        // The bucket name is operator config (not secret) and SHOULD
+        // appear — verifies the manual Debug isn't accidentally
+        // suppressing all fields.
+        assert!(dbg.contains("\"b\""), "bucket missing from Debug: {dbg}");
+    }
+
+    /// `DefaultChain`'s `profile` is operator-set config (not secret)
+    /// and SHOULD appear in Debug — operators benefit from seeing
+    /// which profile is in use.
+    #[test]
+    fn debug_default_chain_shows_profile_name() {
+        let creds = S3Credentials::DefaultChain {
+            profile: Some("decdn-prod".to_string()),
+        };
+        let dbg = format!("{creds:?}");
+        assert!(
+            dbg.contains("decdn-prod"),
+            "profile name should appear: {dbg}"
+        );
+        assert!(dbg.contains("DefaultChain"), "variant tag missing: {dbg}");
     }
 }
