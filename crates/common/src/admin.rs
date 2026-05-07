@@ -168,11 +168,12 @@ pub struct EvictPreview {
     /// from a `Filesystem` origin is a local read; re-pulling from
     /// `Http` may consume metered S3/R2/B2 bandwidth.
     ///
-    /// `skip_serializing_if = "Option::is_none"` keeps the JSON output
-    /// stable for older clients: the field simply doesn't appear when
-    /// the engine has no origin, so deserializers that don't know
-    /// about `origin_kind` (or that pin to a pre-#439 schema) see no
-    /// surface change.
+    /// `skip_serializing_if = "Option::is_none"` elides the field
+    /// entirely in cache-only mode (no origin configured), keeping the
+    /// JSON output minimal. Origin-mode responses always carry the
+    /// field, so any deserialiser using `deny_unknown_fields` and
+    /// pinned to a pre-#439 schema will still see a surface change in
+    /// that case — back-compat here only covers the cache-only path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_kind: Option<decdn_cache::OriginKind>,
 }

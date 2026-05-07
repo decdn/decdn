@@ -679,10 +679,6 @@ impl CacheEngine {
             u64::try_from(inst.elapsed().as_micros()).unwrap_or(u64::MAX)
         });
 
-        // The engine holds a single origin handle (`Inner.origin`); a
-        // future per-blob origin association would require touching
-        // `EvictionPreview` again — flagged here so a reader hitting
-        // that refactor doesn't miss this seam.
         let origin_kind = self.inner.origin.as_ref().map(|o| o.kind());
 
         Ok(EvictionPreview {

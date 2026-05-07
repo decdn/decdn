@@ -179,10 +179,11 @@ pub enum DecompressMode {
 }
 
 /// Default `User-Agent` header set on every origin request unless overridden
-/// via [`HttpOrigin::new_with_user_agent`]. Embeds the `decdn-cache` crate's
-/// package version (`CARGO_PKG_VERSION`), which is co-versioned with the
-/// `decdn-node` binary in this workspace, so origin operators can attribute
-/// CDN pull-through traffic in their access logs and apply origin-side rate
+/// via [`HttpOrigin::new_with_user_agent`]. Embeds `CARGO_PKG_VERSION` of
+/// the `decdn-cache` crate (the workspace does not version-link its members,
+/// so this can drift from the running `decdn-node` binary's version if the
+/// two crates are bumped independently). Lets origin operators attribute
+/// CDN pull-through traffic in access logs and apply origin-side rate
 /// limits or routing rules separately from anonymous client traffic (#435).
 pub const DEFAULT_USER_AGENT: &str = concat!("decdn-node/", env!("CARGO_PKG_VERSION"));
 
@@ -782,10 +783,10 @@ mod tests {
         Ok(())
     }
 
-    /// `DEFAULT_USER_AGENT` (#435) embeds the workspace `CARGO_PKG_VERSION`
-    /// so origin operators can attribute pull-through traffic to a
-    /// specific deCDN release. The format is intentionally stable —
-    /// operators may grep `decdn-node/` in access logs.
+    /// `DEFAULT_USER_AGENT` (#435) embeds the `decdn-cache` crate's
+    /// `CARGO_PKG_VERSION` so origin operators can attribute pull-through
+    /// traffic. The `decdn-node/` prefix is intentionally stable —
+    /// operators may grep on it in access logs.
     #[test]
     fn default_user_agent_has_expected_prefix_and_version() -> anyhow::Result<()> {
         anyhow::ensure!(
