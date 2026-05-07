@@ -548,7 +548,7 @@ Bootstrap supply-side incentive is **$1M+ pre-seed USDC capital** (planning targ
 
 ### 11. Governable parameters with safety bounds
 
-Router shares and the boost-floor parameter are governable, gated by 48-hour timelock per [ADR 009](009-governance.md), and bounded as below. Sum-to-100% across the six router shares is enforced on every governance update; updates that violate the sum or exceed any individual bound revert.
+Router shares, the boost-floor parameter, and the receipt-anchoring lifecycle windows are governable, gated by 48-hour timelock per [ADR 009](009-governance.md), and bounded as below. Sum-to-100% across the six router shares is enforced on every governance update; updates that violate the sum or exceed any individual bound revert.
 
 | Parameter | Default | Min | Max |
 | --- | ---: | ---: | ---: |
@@ -559,8 +559,15 @@ Router shares and the boost-floor parameter are governable, gated by 48-hour tim
 | Treasury share | 5% | 0% | 20% |
 | Safety share | 3% | 0% | 15% |
 | `boostFloor` | 0.4 | 0.2 | 0.8 |
+| `summaryWindow` | 604,800 s (7 days) | 259,200 s (3 days) | 1,209,600 s (14 days) |
+| `challengeWindow` | 604,800 s (7 days) | 259,200 s (3 days) | 1,209,600 s (14 days) |
+| `claimWindow` | 26 epochs | 13 epochs | 52 epochs (`uint16` count of epochs; the contract internally multiplies by the immutable `epochLength` to derive a seconds-domain deadline) |
 
 The 20% floor on the node-base share guarantees operators always receive enough liquid USDC to cover at least a meaningful fraction of infrastructure costs even under extreme governance proposals — preserves the cashflow invariant. The `boostFloor` bounds prevent governance from collapsing the gauge pool to a winner-take-all distribution (lower-bound) or flattening it into uselessness (upper-bound).
+
+The `summaryWindow` lower bound (3 days) gives honest operators time to aggregate receipts off-chain, sign the EpochReceiptSummary, and submit the on-chain commit before the deadline; the upper bound (14 days) keeps total time-to-gauge-finality within a month even at the most permissive setting. The `challengeWindow` bounds give bonded challengers time to verify signatures and identity-diversity heuristics (lower bound) without indefinitely delaying gauge payouts (upper bound).
+
+**Cross-parameter invariant:** `claimWindow` MUST be strictly greater than `challengeWindow` (in matching units — the contract converts `challengeWindow` from seconds to epochs as needed). A summary frozen with undetected fraud could otherwise outlive the challenge window before the operator's claim resolves; enforcing `claimWindow > challengeWindow` at the setter layer guarantees there is always time for a successful challenger to surface a `ChallengeReceiptSummary` and zero the over-claimed fields before any payout against that epoch lands. Updates that violate the invariant revert.
 
 **Non-numeric one-shot setters.**
 
