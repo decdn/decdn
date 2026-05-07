@@ -13,6 +13,11 @@ path = "src/main.rs"
 [dependencies]
 decdn-protocol = { workspace = true }
 decdn-common = { workspace = true }
+# `key-gen` (this crate) and the runtime loader in `decdn-node` both load
+# the eth keystore via `decdn_incentive::eth_identity` (#406). Lives in
+# `incentive` per `appendix-poc-production-seams.md` §Seam 1 — clients
+# (voucher signers per ADR 003) and nodes share the keystore surface.
+decdn-incentive = { workspace = true }
 iroh = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
@@ -33,6 +38,11 @@ rand = { workspace = true }
 decdn-node = { workspace = true }
 decdn-cache = { workspace = true }
 decdn-gossip = { workspace = true }
+# `admin_peers.rs` builds an `AdminState`, which (after #406) holds a
+# `PrivateKeySigner`. The signer is constructed in-test via the test-only
+# `throwaway_signer` helper, with chain id sourced from
+# `decdn_incentive::eth_identity::ARBITRUM_SEPOLIA_CHAIN_ID`.
+alloy = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

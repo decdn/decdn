@@ -101,6 +101,63 @@ pub fn load_or_generate(data_dir: &Path) -> anyhow::Result<SecretKey> {
     Ok(key)
 }
 
+/// Validate (or create+validate) `data_dir` with `0o700` semantics: if it
+/// exists, the permission policy is enforced; if it's `NotFound`, it's
+/// created securely and then validated. Other stat errors propagate.
+///
+/// Public surface so `decdn_incentive::eth_identity::generate_and_persist`
+/// (the eth keystore writer, #406) can share the same `data_dir` hardening
+/// path as `node.secret`. The lower-level `validate_data_dir` /
+/// `create_data_dir_secure` helpers stay `pub(crate)` — callers outside
+/// this crate should reach for `ensure_data_dir` instead.
+pub fn ensure_data_dir(data_dir: &Path) -> anyhow::Result<()> {
+    match fs::symlink_metadata(data_dir) {
+        Ok(_) => validate_data_dir(data_dir),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            create_data_dir_secure(data_dir)?;
+            validate_data_dir(data_dir)
+        }
+        Err(e) => Err(anyhow::Error::new(e)
+            .context(format!("failed to stat data_dir {}", data_dir.display()))),
+    }
+}
+
+/// Rename `path` to `<filename>.bak.<unix_ts>` so an in-place key rotation
+/// preserves the prior key material rather than destroying it. Required by
+/// `appendix-operator-key-rotation.md` §1 step 9 ("Archive the old iroh
+/// keystore offline. Retain it for at least `MAX_EVIDENCE_AGE_US`") and the
+/// §5 rollback path ("Repoint config at old keystore"). The operator can
+/// later move the `.bak` file offline; deleting it is up to them.
+///
+/// Bails if the bak path already exists (two `key-gen` invocations within
+/// the same second) rather than silently clobbering — operator removes the
+/// stale archive manually and retries.
+///
+/// Returns the new bak path on success.
+pub fn move_aside(path: &Path) -> anyhow::Result<PathBuf> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let unix_ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| anyhow!("invalid path (no UTF-8 filename): {}", path.display()))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("path has no parent directory: {}", path.display()))?;
+    let bak = parent.join(format!("{file_name}.bak.{unix_ts}"));
+    anyhow::ensure!(
+        !bak.exists(),
+        "refusing to overwrite existing archive {}; \
+         move it aside manually and retry",
+        bak.display()
+    );
+    fs::rename(path, &bak)
+        .with_context(|| format!("failed to archive {} -> {}", path.display(), bak.display()))?;
+    Ok(bak)
+}
+
 /// Reject `data_dir` if it isn't a directory or if any group/other permission
 /// bit is set.
 ///
@@ -109,7 +166,7 @@ pub fn load_or_generate(data_dir: &Path) -> anyhow::Result<SecretKey> {
 /// leaves a race where the symlink can be repointed between validation and
 /// use — exercised by `rejects_symlinked_data_dir`.
 #[cfg(unix)]
-fn validate_data_dir(data_dir: &Path) -> anyhow::Result<()> {
+pub(crate) fn validate_data_dir(data_dir: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let meta = fs::symlink_metadata(data_dir)
         .with_context(|| format!("invalid data_dir: cannot access {}", data_dir.display()))?;
@@ -164,7 +221,7 @@ fn validate_key_file(path: &Path) -> anyhow::Result<()> {
 /// call creates — pre-existing parents like `~/.local/share` keep their own
 /// permissions.
 #[cfg(unix)]
-fn create_data_dir_secure(data_dir: &Path) -> anyhow::Result<()> {
+pub(crate) fn create_data_dir_secure(data_dir: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     fs::DirBuilder::new()
         .recursive(true)
@@ -174,7 +231,7 @@ fn create_data_dir_secure(data_dir: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn validate_data_dir(_data_dir: &Path) -> anyhow::Result<()> {
+pub(crate) fn validate_data_dir(_data_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
@@ -184,7 +241,7 @@ fn validate_key_file(_path: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn create_data_dir_secure(data_dir: &Path) -> anyhow::Result<()> {
+pub(crate) fn create_data_dir_secure(data_dir: &Path) -> anyhow::Result<()> {
     fs::create_dir_all(data_dir)
         .with_context(|| format!("failed to create data dir {}", data_dir.display()))
 }

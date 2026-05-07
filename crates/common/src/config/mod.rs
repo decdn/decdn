@@ -372,9 +372,17 @@ fn resolve_blockchain(
         .and_then(|b| b.rpc_watchdog_interval_sec)
         .unwrap_or(DEFAULT_RPC_WATCHDOG_INTERVAL_SEC);
 
+    // CLI/env only — no TOML field. `expand_tilde` for parity with the
+    // keystore path itself. Existence check is intentionally deferred to
+    // the runtime loader: if the operator passes a stale path the failure
+    // surfaces as "no keystore password source available", which is
+    // clearer than a config-resolution-time stat() error.
+    let keystore_password_file = cli.keystore_password_file.clone().map(|p| expand_tilde(&p));
+
     Ok(ResolvedBlockchain {
         rpc_url,
         eth_keystore,
+        keystore_password_file,
         payment_channel_address,
         staking_registry_address,
         rpc_watchdog_interval_sec,
@@ -2403,6 +2411,7 @@ mod tests {
             ("relay_url", "DECDN_RELAY_URL"),
             ("rpc_url", "DECDN_RPC_URL"),
             ("eth_keystore", "DECDN_ETH_KEYSTORE"),
+            ("keystore_password_file", "DECDN_KEYSTORE_PASSWORD_FILE"),
             ("payment_channel_address", "DECDN_PAYMENT_CHANNEL_ADDRESS"),
             ("staking_registry_address", "DECDN_STAKING_REGISTRY_ADDRESS"),
             ("cache_dir", "DECDN_CACHE_DIR"),
@@ -2462,6 +2471,7 @@ mod tests {
         let cli = BlockchainArgs {
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
+            keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             staking_registry_address: Some("0xNOTHEX".to_string()),
         };
@@ -2486,6 +2496,7 @@ mod tests {
         let cli = BlockchainArgs {
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
+            keystore_password_file: None,
             payment_channel_address: Some("0xNOTHEX".to_string()),
             staking_registry_address: Some(GOOD_ADDR.to_string()),
         };
@@ -2511,6 +2522,7 @@ mod tests {
         let cli = BlockchainArgs {
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
+            keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             staking_registry_address: Some(GOOD_ADDR.to_string()),
         };
@@ -2536,6 +2548,7 @@ mod tests {
         let cli = BlockchainArgs {
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: Some(bogus),
+            keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             staking_registry_address: Some(GOOD_ADDR.to_string()),
         };
@@ -2560,6 +2573,7 @@ mod tests {
         let cli = BlockchainArgs {
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
+            keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             staking_registry_address: Some(GOOD_ADDR.to_string()),
         };
@@ -2595,6 +2609,7 @@ mod tests {
         crate::cli::run::BlockchainArgs {
             rpc_url: None,
             eth_keystore: None,
+            keystore_password_file: None,
             payment_channel_address: None,
             staking_registry_address: None,
         }
@@ -2709,6 +2724,7 @@ mod tests {
         let cli = BlockchainArgs {
             rpc_url: Some("https://cli-wins.example/rpc".to_string()),
             eth_keystore: None,
+            keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             staking_registry_address: Some(GOOD_ADDR.to_string()),
         };
@@ -2759,6 +2775,7 @@ mod tests {
         let cli = BlockchainArgs {
             rpc_url: None,
             eth_keystore: None,
+            keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             staking_registry_address: Some(GOOD_ADDR.to_string()),
         };
@@ -2779,6 +2796,7 @@ mod tests {
         let cli = BlockchainArgs {
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
+            keystore_password_file: None,
             payment_channel_address: None,
             staking_registry_address: Some(GOOD_ADDR.to_string()),
         };
@@ -2799,6 +2817,7 @@ mod tests {
         let cli = BlockchainArgs {
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
+            keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             staking_registry_address: None,
         };
@@ -2822,6 +2841,7 @@ mod tests {
         let cli = BlockchainArgs {
             rpc_url: Some(String::new()),
             eth_keystore: None,
+            keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             staking_registry_address: Some(GOOD_ADDR.to_string()),
         };
