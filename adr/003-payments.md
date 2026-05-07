@@ -651,14 +651,15 @@ function nodeIdOf(address operator) external view returns (bytes32 nodeId, bool 
 // `isActive` is a pure single-contract storage read; callers that need
 // the combined "authorized origin" predicate filter against
 // `ContentBlacklist.isOriginBlacklisted` themselves
-// (per ADR 011 § Interaction with ContentBlacklist).
+// (per [ADR 011 § Interaction with ContentBlacklist](011-content-takedown.md#interaction-with-contentblacklist)).
 //
 // Equivalent to `(_, active) = nodeIdOf(operator)` but avoids reading
 // the binding slot when only the bit is needed. Consumed by
 // `OriginAssignment.proposeAssignment` / `activateAssignment` /
-// default-open allow-list setters per ADR 011 § Origin Assignment
-// Authority — those callers work with operator addresses, not NodeIds,
-// and the standalone view keeps their per-operator validation cost flat.
+// default-open allow-list setters per [ADR 011 § Origin Assignment
+// Authority](011-content-takedown.md#origin-assignment-authority) —
+// those callers work with operator addresses, not NodeIds, and the
+// standalone view keeps their per-operator validation cost flat.
 function isActive(address operator) external view returns (bool);
 
 // Intended for rebinding (key rotation) only — initial binding is performed
