@@ -78,6 +78,15 @@ interface IPublisherRegistry {
     function ownerOf(uint256 namespaceId) external view returns (address);
     function namespaceCount(address publisher) external view returns (uint256);
     function pendingTransfer(uint256 namespaceId) external view returns (address newOwner, uint256 readyAt);
+    function maxNamespacesPerPublisher() external view returns (uint256);
+    function namespaceTransferTimelock() external view returns (uint64);
+
+    // Governable parameter setters (GOVERNANCE_ROLE; standard 48h timelock).
+    // Bounds enforced at the contract layer per ADR 009:
+    //   - maxNamespacesPerPublisher: [1, 1000]
+    //   - namespaceTransferTimelock:  [24h, 30d] (in seconds)
+    function setMaxNamespacesPerPublisher(uint256 newMax) external;
+    function setNamespaceTransferTimelock(uint64 newTimelock) external;
 
     // Events
     event PublisherRegistered(address indexed publisher, uint256 indexed publisherId);
@@ -85,12 +94,14 @@ interface IPublisherRegistry {
     event NamespaceTransferInitiated(uint256 indexed namespaceId, address indexed from, address indexed to, uint256 readyAt);
     event NamespaceTransferred(uint256 indexed namespaceId, address indexed from, address indexed to);
     event ContentClaimed(uint256 indexed namespaceId, bytes32 indexed blake3Hash, address indexed claimant);
+    event MaxNamespacesPerPublisherUpdated(uint256 oldValue, uint256 newValue);
+    event NamespaceTransferTimelockUpdated(uint64 oldValue, uint64 newValue);
 }
 ```
 
 `namespaceOf(hash)` returns an empty array for any hash not explicitly claimed; default-open semantics apply. The view never reverts on unknown hashes — callers cannot distinguish "hash unknown to the protocol" from "hash served as default-open" via this view, which is correct: both states are operationally identical. Storage is a per-hash `uint256[]` set of claiming namespaces — append-only since claims are content-immutable, never moved or revoked.
 
-Per-publisher namespace cap and ownership-transfer timelock are governable parameters with safety bounds (see [ADR 009](009-governance.md)). The 7-day default transfer timelock is documented for clarity; the contract reads its current value from the governance-controlled parameter store at call time.
+Per-publisher namespace cap and ownership-transfer timelock are governable parameters with safety bounds (see [ADR 009](009-governance.md)). Defaults: `maxNamespacesPerPublisher = 100` (anti-squatting; bounded `[1, 1000]`), `namespaceTransferTimelock = 7 days` (key-compromise mitigation; bounded `[24h, 30d]`). Values are stored on `PublisherRegistry` itself and updated via `setMaxNamespacesPerPublisher` / `setNamespaceTransferTimelock` under the standard 48h `TimelockController` delay; the contract enforces the safety bounds at the setter and rejects out-of-range writes regardless of caller.
 
 ## Consequences
 

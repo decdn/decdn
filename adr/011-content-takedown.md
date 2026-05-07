@@ -374,15 +374,29 @@ interface IOriginAssignment {
     // Governance ratifies a pending proposal after the assignment timelock.
     // Reverts if no pending proposal exists, if the timelock has not elapsed,
     // or if any pending operator is no longer active in StakingRegistry or is
-    // currently blacklisted in ContentBlacklist.
+    // currently blacklisted in ContentBlacklist. On revert for either
+    // validation reason, the pending proposal is auto-cleared so the
+    // publisher can immediately submit a fresh `proposeAssignment` without a
+    // separate cancellation step.
     function activateAssignment(uint256 namespaceId) external;
+
+    // Publisher cancels their own pending proposal before activation.
+    // Reverts if msg.sender is not the namespace owner, or if no pending
+    // proposal exists. Equivalent to letting `proposeAssignment` overwrite,
+    // but explicit for the case where the publisher wants to leave the
+    // namespace in its current activated state without queuing a new set.
+    function cancelAssignmentProposal(uint256 namespaceId) external;
 
     // Revocation paths:
     //  - Publisher may revoke a single operator from their own namespace at any time.
     //  - Governance may revoke an operator from any namespace.
-    // Revocation that drops the active set below minRedundancy is allowed; the
-    // namespace simply enters an under-redundant state until a new proposal is
-    // activated. The min-redundancy invariant binds activations, not revocations.
+    // Reverts if `operator` is not a member of the active set for `namespaceId`
+    // — typo protection; revoking a non-member is always a programming error.
+    // Revocation that drops the active set below minRedundancy IS allowed; the
+    // namespace enters an under-redundant state until a new proposal is
+    // activated. The min-redundancy invariant binds activations, not revocations,
+    // because revocation is sometimes urgent (operator misbehaving) and forcing
+    // a replacement-before-removal would block the urgent path.
     function revokeAssignment(uint256 namespaceId, address operator) external;
 
     // Permissionless storage cleanup for blacklisted operators.
@@ -426,6 +440,7 @@ interface IOriginAssignment {
 
     // Events
     event AssignmentProposed(uint256 indexed namespaceId, address indexed proposer, address[] operators, uint256 readyAt);
+    event AssignmentProposalCancelled(uint256 indexed namespaceId, address indexed proposer, bool autoCleared);
     event AssignmentActivated(uint256 indexed namespaceId, address[] operators);
     event AssignmentRevoked(uint256 indexed namespaceId, address indexed operator, address indexed by);
     event BlacklistedAssignmentPruned(uint256 indexed namespaceId, address indexed operator, address indexed pruner);
@@ -435,6 +450,16 @@ interface IOriginAssignment {
     event DefaultOpenAllowlistActivated();
 }
 ```
+
+### Edge cases
+
+- **Empty operator array (`operators.length == 0`)** — `proposeAssignment` reverts. `revokeAssignment` is the explicit removal path; a zero-length proposal would silently masquerade as a removal and obscure intent.
+- **Proposal expiry** — none. Pending proposals sit indefinitely until `activateAssignment` (governance) or `cancelAssignmentProposal` (publisher). If governance is unresponsive, the publisher cancels and re-proposes; no expiry timer.
+- **Re-proposal while a proposal is already pending** — `proposeAssignment` overwrites the existing pending proposal and resets `readyAt` to `block.timestamp + assignmentTimelock`. The old proposal is discarded; only the latest is observable. Emits `AssignmentProposalCancelled` (with `autoCleared = true`) for the discarded proposal followed by `AssignmentProposed` for the new one.
+- **Activation-revert auto-clear** — when `activateAssignment` reverts because pending operators became inactive or blacklisted during the timelock window, the pending proposal is cleared and an `AssignmentProposalCancelled(autoCleared=true)` event fires. The publisher submits a fresh proposal without an explicit cancellation call.
+- **`ContentBlacklist` unbound during the deployment window** — until `setContentBlacklist` is called post-deploy (see [ADR 016 § Post-Deployment Initialization](016-contract-interactions.md#post-deployment-initialization)), `activateAssignment` skips the blacklist check and validates only against `StakingRegistry.isActive`. Once `setContentBlacklist` has been called the check is mandatory thereafter; `setContentBlacklist(address(0))` reverts to prevent regressing into the deployment-window state. `pruneBlacklistedAssignment` continues to revert until the binding is set.
+- **`revokeAssignment` of a non-member operator** — reverts. Typo protection; the explicit error surfaces accidental address mismatches that would otherwise pass silently.
+- **`revokeAssignment` dropping the active set below `minRedundancy`** — allowed by design. Revocation is sometimes urgent (operator misbehaving); blocking it on a redundancy invariant would lock the contract into an unsafe state. The namespace enters under-redundant operation until a new proposal is activated; off-chain consumers (clients, monitors) observe this via `getOrigins(namespaceId).length < minRedundancy` and can route accordingly.
 
 ### Lifecycle
 
