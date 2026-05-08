@@ -722,7 +722,13 @@ impl CacheEngine {
     pub async fn get(&self, hash: Hash) -> CacheResult<Bytes> {
         if self.has(hash).await? {
             self.touch(hash);
-            return self.read_local(hash).await;
+            let bytes = self.read_local(hash).await?;
+            if let Some(m) = &self.inner.metrics {
+                m.hits.inc();
+                m.bytes_returned
+                    .inc_by(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+            }
+            return Ok(bytes);
         }
 
         // Logical-eviction guard (#279): once an operator has run
@@ -1717,6 +1723,45 @@ mod tests {
             preview.origin_kind.is_none(),
             "expected None for cache-only mode, got {:?}",
             preview.origin_kind,
+        );
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------
+    // Cache hit/miss + bytes counters (#418)
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn hit_increments_hits_and_bytes_returned() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"hello hit metrics";
+        let hash = Hash::new(payload);
+        let origin = StubOrigin::new(payload);
+        let cm = Arc::new(CacheMetrics::default());
+        let engine = CacheEngine::open_full(
+            tmp.path(),
+            Some(Arc::new(origin)),
+            10,
+            crate::PinnedHashes::empty(),
+            crate::RetryPolicy::default(),
+            Some(Arc::clone(&cm)),
+        )
+        .await?;
+
+        // First get is a pull-through (miss); prime the cache.
+        let _ = engine.get(hash).await?;
+        let hits_before = cm.hits.get();
+        let bytes_before = cm.bytes_returned.get();
+
+        // Second get must be a local hit.
+        let bytes = engine.get(hash).await?;
+        anyhow::ensure!(
+            cm.hits.get() == hits_before + 1,
+            "hits should increment by 1 on a cache hit"
+        );
+        anyhow::ensure!(
+            cm.bytes_returned.get() == bytes_before + bytes.len() as u64,
+            "bytes_returned should increase by bytes.len() on a cache hit"
         );
         Ok(())
     }
