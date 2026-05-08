@@ -99,12 +99,17 @@ impl Snapshot {
     }
 }
 
-/// Per-second deltas between two consecutive snapshots. The unit is
-/// implicit in the type name — fields name the metric, not the unit.
+/// Per-second deltas between two consecutive snapshots. Unit is
+/// implicit in the type name; the field-level comments make it
+/// re-readable at use sites where `SnapshotDelta` isn't visible
+/// (e.g. `format_rate_bytes(d.bytes)`).
 #[derive(Debug, Clone)]
 pub(crate) struct SnapshotDelta {
+    /// Cache hits per second.
     pub hits: f64,
+    /// Cache misses per second.
     pub misses: f64,
+    /// Cache bytes returned per second.
     pub bytes: f64,
 }
 
@@ -118,11 +123,13 @@ impl SnapshotDelta {
                 bytes: 0.0,
             };
         }
-        // Saturating subtraction in case the underlying counter went
-        // backwards between ticks — daemon restart, --metrics-url
-        // re-pointed at a different node, or any future per-instance
-        // counter reset. Showing 0/s for that one tick is more honest
-        // than a huge spike from the wraparound.
+        // Saturating subtraction in case the underlying counter
+        // went backwards between ticks — typically a daemon
+        // restart (we keep `prev` from before the restart and the
+        // first post-restart scrape returns lower values), but
+        // also any future per-instance counter reset. Showing 0/s
+        // for that one tick is more honest than a huge spike from
+        // the wraparound.
         #[allow(clippy::cast_precision_loss)]
         let d = |a: u64, b: u64| (a.saturating_sub(b)) as f64 / secs;
         Self {
@@ -380,12 +387,14 @@ fn port_from_config_file(
 /// ticks so the table redraws in place rather than scrolling.
 const ANSI_CLEAR_HOME: &str = "\x1b[2J\x1b[H";
 
-/// Cap on consecutive failed scrapes before the loop bails. With the
-/// default `--interval-ms 1000` this is ≈30s of no signal, which is
-/// well past a normal `decdn-node` restart and comfortably catches
-/// the "wrong URL / wrong port" cases where every tick fails the
-/// same way and only the first error matters. Operators chasing a
-/// real flap will see the per-tick `eprintln` in the meantime.
+/// Cap on consecutive failed scrapes before the loop bails. 30
+/// ticks at the default `--interval-ms 1000` is ≈30s on fast-fail
+/// (connection refused), comfortably longer than a normal
+/// `decdn-node` restart. With `--timeout-ms` defaulting to 5000
+/// every consecutive timeout extends the wall-clock cap by up to
+/// 5s, so a sustained timeout takes ≈30 ticks but ≈150s. Operators
+/// chasing a real flap will see the per-tick `eprintln` in the
+/// meantime.
 const MAX_CONSECUTIVE_SCRAPE_FAILURES: u32 = 30;
 
 /// Entry point dispatched from `node_dispatch`. Polls the daemon's
@@ -451,12 +460,12 @@ pub async fn run(args: &cli::TopArgs, global_config: Option<&Path>) -> anyhow::R
             }
             Err(err) => {
                 // Bail immediately on errors that can't possibly
-                // become transient: reqwest's "builder" class fires
-                // for malformed URLs and unsupported schemes —
-                // retrying for 30s achieves nothing.
-                if is_permanent_url_error(&err) {
+                // become transient: reqwest builder class (URL
+                // parse / unsupported scheme) and most 4xx
+                // statuses. Retrying for 30s achieves nothing.
+                if is_permanent_scrape_error(&err) {
                     return Err(err.context(
-                        "permanent error: --metrics-url is malformed or uses an unsupported scheme",
+                        "permanent scrape error (URL malformed, unsupported scheme, or persistent 4xx)",
                     ));
                 }
                 consecutive_failures += 1;
@@ -499,12 +508,28 @@ fn append_metrics_path(base: &str) -> String {
     }
 }
 
-/// Recognise reqwest errors that can't recover by retrying — URL
-/// parse failures, unsupported schemes, etc. (anything where
-/// `reqwest::Error::is_builder()` is true). The `--metrics-url` is
-/// fixed for the lifetime of the process, so retrying these for
-/// 30 ticks is just noise.
-fn is_permanent_url_error(err: &anyhow::Error) -> bool {
+/// Recognise scrape errors that can't recover by retrying:
+/// - reqwest builder errors (URL parse failures, unsupported
+///   schemes, missing host) — the URL is fixed for the lifetime of
+///   the process, so retrying for 30 ticks is just noise.
+/// - 4xx HTTP status (except 408 Request Timeout / 429 Too Many
+///   Requests, which can resolve on their own) — the daemon is
+///   reachable but the path/auth is wrong. Tagged in
+///   `fetch_metrics` via the `PERMANENT_STATUS_TAG` sentinel so we
+///   can match without inspecting the bare `anyhow::Error` shape.
+///
+/// Note that this helper is the only thing standing between a
+/// misconfigured `--metrics-url` and an indefinite retry loop.
+/// The `reqwest::Error` is matched by walking the source chain
+/// because `fetch_metrics` wraps it with `with_context`; if that
+/// wrapping stops being a direct chain element (e.g. via an
+/// indirection that boxes through a different error type), the
+/// `is_builder()` arm silently stops firing — guard with the
+/// `is_permanent_scrape_error_recognises_*` tests.
+fn is_permanent_scrape_error(err: &anyhow::Error) -> bool {
+    if err.chain().any(|e| e.to_string() == PERMANENT_STATUS_TAG) {
+        return true;
+    }
     err.chain().any(|e| {
         e.downcast_ref::<reqwest::Error>()
             .is_some_and(reqwest::Error::is_builder)
@@ -519,12 +544,34 @@ async fn fetch_metrics(client: &reqwest::Client, url: &str) -> anyhow::Result<St
         .with_context(|| format!("GET {url} failed"))?;
     let status = resp.status();
     if !status.is_success() {
-        anyhow::bail!("GET {url} returned HTTP {status}");
+        // Permanent vs. transient: 4xx (except 408 Request Timeout
+        // and 429 Too Many Requests, both of which can resolve on
+        // their own) means the daemon is reachable but the URL
+        // path/auth is wrong. Retrying for 30 ticks won't fix that.
+        // Tagging the error so `is_permanent_scrape_error` picks
+        // it up and bails on the first failure rather than
+        // burning 30s of operator-watching-zeros.
+        let is_permanent_status = status.is_client_error()
+            && status != reqwest::StatusCode::REQUEST_TIMEOUT
+            && status != reqwest::StatusCode::TOO_MANY_REQUESTS;
+        let err = anyhow::anyhow!("GET {url} returned HTTP {status}");
+        return if is_permanent_status {
+            Err(err.context(PERMANENT_STATUS_TAG))
+        } else {
+            Err(err)
+        };
     }
     resp.text()
         .await
         .with_context(|| format!("read body from {url}"))
 }
+
+/// Sentinel context string used by `fetch_metrics` to mark a 4xx
+/// (except 408/429) so `is_permanent_scrape_error` can match it
+/// without re-classifying the bare `anyhow::Error` shape. A typed
+/// scrape-error enum would replace this; until a second permanent
+/// class shows up the sentinel is enough.
+const PERMANENT_STATUS_TAG: &str = "permanent HTTP status (will not retry)";
 
 #[cfg(test)]
 #[allow(
@@ -774,8 +821,8 @@ mod render_tests {
 
     #[test]
     fn format_uptime_crosses_unit_boundaries() {
-        // The four cross-unit boundaries: 60s (s→m), 3600s (m→h),
-        // 86400s (h→d), and the in-band cases. The `write_top_table`
+        // The three cross-unit boundaries: 60s (s→m), 3600s (m→h),
+        // 86400s (h→d), plus in-band cases. `write_top_table`
         // tests exercise the m+s shape via substring; cross-units
         // need direct asserts so a regression at the boundary
         // arithmetic doesn't sneak past unnoticed.
@@ -1064,10 +1111,14 @@ mod e2e_tests {
         let err = fetch_metrics(&client, &url)
             .await
             .expect_err("503 must surface as Err");
-        let msg = err.to_string();
+        let msg = format!("{err:#}");
+        // Assert the status code shows up — `StatusCode`'s Display
+        // emits `503 Service Unavailable`, so checking for "503" is
+        // sufficient and tighter than a `||` over both substrings
+        // (which always co-occur today).
         assert!(
-            msg.contains("503") || msg.contains("Service Unavailable"),
-            "expected 503 in error, got: {msg}"
+            msg.contains("503"),
+            "expected 503 in error chain, got: {msg}"
         );
 
         // Wait for the listener task and propagate JoinError so a
@@ -1191,7 +1242,11 @@ mod resolve_tests {
     #[test]
     fn resolve_metrics_url_zero_port_errors() {
         // metrics_port = 0 is the operator opt-out (no metrics
-        // server). Mirroring resolve_admin_url's behaviour.
+        // server). Mirroring resolve_admin_url's behaviour. Asserts
+        // the exact "disables the metrics server" wording so a
+        // regression that drops the operator-actionable phrasing
+        // (e.g. by collapsing the bail to just `bail!("port = 0")`)
+        // breaks here.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("node.toml");
         std::fs::write(&path, b"[observability]\nmetrics_port = 0\n").unwrap();
@@ -1199,7 +1254,7 @@ mod resolve_tests {
             .expect_err("expected error for zero port")
             .to_string();
         assert!(
-            err.contains("disables") || err.contains('0'),
+            err.contains("disables the metrics server"),
             "missing context: {err}"
         );
     }
