@@ -139,7 +139,9 @@ jobs:
       # mold is a drop-in replacement for ld; on this 8-crate workspace
       # (alloy/iroh/tokio/aws-sdk) it noticeably shortens the link phase of
       # the instrumented test binaries. Scoped to the test job because that's
-      # the only job that actually links binaries (clippy/check/doc don't).
+      # where the link of many large test binaries dominates runtime — other
+      # jobs do link small artifacts (build scripts, proc-macro cdylibs) but
+      # the savings there would be marginal and not pay back the apt-get cost.
       - name: Install mold linker
         run: sudo apt-get update && sudo apt-get install -y mold
       - uses: Swatinem/rust-cache@v2
