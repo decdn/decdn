@@ -20,5 +20,8 @@ updates:
       interval: weekly
     open-pull-requests-limit: 5
     ignore:
-      # MSRV pin — dtolnay/rust-toolchain@1.85.0 is intentional; see ci.yml msrv job
+      # MSRV pin — dtolnay/rust-toolchain@1.85.0 is intentional; see ci.yml msrv job.
+      # Stable pin (currently 1.95.0) IS auto-bumped — only freeze the MSRV version
+      # so dependabot can still open PRs to advance the stable channel pin.
       - dependency-name: "dtolnay/rust-toolchain"
+        versions: ["1.85.0"]
