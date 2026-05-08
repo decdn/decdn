@@ -11,7 +11,7 @@ use anyhow::Context;
 use serde::Deserialize;
 
 use decdn_common::cli;
-use decdn_common::cli::common::{default_config_path, expand_tilde};
+use decdn_common::cli::common::{ConfigPathSource, default_config_path, expand_tilde};
 use decdn_common::config::DEFAULT_METRICS_PORT;
 
 /// Parse an `OpenMetrics` text body into `name -> value`.
@@ -95,13 +95,13 @@ impl Snapshot {
     }
 }
 
-/// Per-second deltas between two consecutive snapshots.
+/// Per-second deltas between two consecutive snapshots. The unit is
+/// implicit in the type name — fields name the metric, not the unit.
 #[derive(Debug, Clone)]
-#[allow(clippy::struct_field_names)]
 pub(crate) struct SnapshotDelta {
-    pub hits_per_sec: f64,
-    pub misses_per_sec: f64,
-    pub bytes_per_sec: f64,
+    pub hits: f64,
+    pub misses: f64,
+    pub bytes: f64,
 }
 
 impl SnapshotDelta {
@@ -109,21 +109,22 @@ impl SnapshotDelta {
         let secs = elapsed.as_secs_f64();
         if secs <= 0.0 {
             return Self {
-                hits_per_sec: 0.0,
-                misses_per_sec: 0.0,
-                bytes_per_sec: 0.0,
+                hits: 0.0,
+                misses: 0.0,
+                bytes: 0.0,
             };
         }
-        // Saturating subtraction in case the daemon was restarted
-        // mid-loop and the new counter is lower than the previous —
-        // showing 0/s for that tick is more honest than a huge spike
-        // back from the wraparound.
+        // Saturating subtraction in case the underlying counter went
+        // backwards between ticks — daemon restart, --metrics-url
+        // re-pointed at a different node, or any future per-instance
+        // counter reset. Showing 0/s for that one tick is more honest
+        // than a huge spike from the wraparound.
         #[allow(clippy::cast_precision_loss)]
         let d = |a: u64, b: u64| (a.saturating_sub(b)) as f64 / secs;
         Self {
-            hits_per_sec: d(now.cache_hits, prev.cache_hits),
-            misses_per_sec: d(now.cache_misses, prev.cache_misses),
-            bytes_per_sec: d(now.cache_bytes_returned, prev.cache_bytes_returned),
+            hits: d(now.cache_hits, prev.cache_hits),
+            misses: d(now.cache_misses, prev.cache_misses),
+            bytes: d(now.cache_bytes_returned, prev.cache_bytes_returned),
         }
     }
 }
@@ -242,13 +243,13 @@ pub(crate) fn write_top_table(
 
     let hits_rate = delta
         .as_ref()
-        .map_or_else(|| "-".to_string(), |d| format!("{:.1}", d.hits_per_sec));
+        .map_or_else(|| "-".to_string(), |d| format!("{:.1}", d.hits));
     let miss_rate = delta
         .as_ref()
-        .map_or_else(|| "-".to_string(), |d| format!("{:.1}", d.misses_per_sec));
+        .map_or_else(|| "-".to_string(), |d| format!("{:.1}", d.misses));
     let bytes_rate = delta
         .as_ref()
-        .map_or_else(|| "-".to_string(), |d| format_rate_bytes(d.bytes_per_sec));
+        .map_or_else(|| "-".to_string(), |d| format_rate_bytes(d.bytes));
 
     writeln!(
         w,
@@ -309,12 +310,6 @@ struct MetricsPortConfig {
 #[derive(Debug, Default, Deserialize)]
 struct MetricsPortObservability {
     metrics_port: Option<u16>,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum ConfigPathSource {
-    Explicit,
-    Default,
 }
 
 /// Resolve the metrics URL. Mirrors `resolve_admin_url` in
@@ -656,9 +651,9 @@ mod snapshot_tests {
         ));
         let dt = Duration::from_secs(2);
         let d = SnapshotDelta::between(&prev, &now, dt);
-        assert!((d.hits_per_sec - 6.0).abs() < 1e-9); // (812-800)/2
-        assert!((d.misses_per_sec - 2.0).abs() < 1e-9); // (94-90)/2
-        assert!((d.bytes_per_sec - 210_000.0).abs() < 1e-9); // (14_420_000-14_000_000)/2
+        assert!((d.hits - 6.0).abs() < 1e-9); // (812-800)/2
+        assert!((d.misses - 2.0).abs() < 1e-9); // (94-90)/2
+        assert!((d.bytes - 210_000.0).abs() < 1e-9); // (14_420_000-14_000_000)/2
     }
 
     #[test]
@@ -669,9 +664,9 @@ mod snapshot_tests {
         let prev = Snapshot::from_metrics(&fake_metrics(0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0));
         let now = Snapshot::from_metrics(&fake_metrics(0.0, 2.0, 2.0, 2.0, 0.0, 0.0, 1.0));
         let d = SnapshotDelta::between(&prev, &now, Duration::ZERO);
-        assert_eq!(d.hits_per_sec, 0.0);
-        assert_eq!(d.misses_per_sec, 0.0);
-        assert_eq!(d.bytes_per_sec, 0.0);
+        assert_eq!(d.hits, 0.0);
+        assert_eq!(d.misses, 0.0);
+        assert_eq!(d.bytes, 0.0);
     }
 }
 
