@@ -18,7 +18,7 @@ use bytes::Bytes;
 use iroh_blobs::Hash;
 use tokio::io::AsyncReadExt;
 
-use super::{Origin, OriginFetch};
+use super::{Origin, OriginFetch, OriginKind};
 use crate::error::OriginPullError;
 
 /// Initial capacity hint for the per-fetch read buffer. Caps the
@@ -52,13 +52,13 @@ impl FilesystemOrigin {
         let base = base.into();
         let meta = tokio::fs::metadata(&base)
             .await
-            .with_context(|| format!("cache.origin_path {} is not accessible", base.display()))?;
+            .with_context(|| format!("cache.origin.path {} is not accessible", base.display()))?;
         if !meta.is_dir() {
-            anyhow::bail!("cache.origin_path {} is not a directory", base.display());
+            anyhow::bail!("cache.origin.path {} is not a directory", base.display());
         }
         let base = tokio::fs::canonicalize(&base).await.with_context(|| {
             format!(
-                "cache.origin_path {} could not be canonicalized",
+                "cache.origin.path {} could not be canonicalized",
                 base.display()
             )
         })?;
@@ -106,6 +106,10 @@ fn classify_io_error(err: std::io::Error) -> OriginPullError {
 }
 
 impl Origin for FilesystemOrigin {
+    fn kind(&self) -> OriginKind {
+        OriginKind::Filesystem
+    }
+
     fn fetch(
         &self,
         hash: Hash,
@@ -129,7 +133,7 @@ impl Origin for FilesystemOrigin {
                 }
                 Err(err) => {
                     let path_msg = format!(
-                        "cache.origin_path canonicalize failed for {}",
+                        "cache.origin.path canonicalize failed for {}",
                         path.display()
                     );
                     return Err(classify_io_error(err).map_inner(|e| e.context(path_msg)));
@@ -138,7 +142,7 @@ impl Origin for FilesystemOrigin {
             if !canonical.starts_with(&self.base) {
                 // Symlink escape: deterministic permanent failure.
                 return Err(OriginPullError::Permanent(anyhow::anyhow!(
-                    "cache.origin_path entry {} resolves to {} which is outside base {}",
+                    "cache.origin.path entry {} resolves to {} which is outside base {}",
                     path.display(),
                     canonical.display(),
                     self.base.display()
@@ -165,18 +169,18 @@ impl Origin for FilesystemOrigin {
                 }
                 Err(err) => {
                     let path_msg =
-                        format!("cache.origin_path open failed for {}", canonical.display());
+                        format!("cache.origin.path open failed for {}", canonical.display());
                     return Err(classify_io_error(err).map_inner(|e| e.context(path_msg)));
                 }
             };
             let meta = file.metadata().await.map_err(|err| {
-                let path_msg = format!("cache.origin_path stat failed for {}", canonical.display());
+                let path_msg = format!("cache.origin.path stat failed for {}", canonical.display());
                 classify_io_error(err).map_inner(|e| e.context(path_msg))
             })?;
 
             if !meta.is_file() {
                 return Err(OriginPullError::Permanent(anyhow::anyhow!(
-                    "cache.origin_path entry {} is not a regular file",
+                    "cache.origin.path entry {} is not a regular file",
                     canonical.display()
                 )));
             }
@@ -184,7 +188,7 @@ impl Origin for FilesystemOrigin {
             let len = meta.len();
             if len > max_bytes {
                 return Err(OriginPullError::Permanent(anyhow::anyhow!(
-                    "cache.origin_path entry {} is {len} bytes, exceeds max {max_bytes}",
+                    "cache.origin.path entry {} is {len} bytes, exceeds max {max_bytes}",
                     canonical.display()
                 )));
             }
@@ -210,12 +214,12 @@ impl Origin for FilesystemOrigin {
             // from "more than max_bytes."
             let mut reader = (&mut file).take(max_bytes.saturating_add(1));
             reader.read_to_end(&mut data).await.map_err(|err| {
-                let path_msg = format!("cache.origin_path read failed for {}", canonical.display());
+                let path_msg = format!("cache.origin.path read failed for {}", canonical.display());
                 classify_io_error(err).map_inner(|e| e.context(path_msg))
             })?;
             if data.len() as u64 > max_bytes {
                 return Err(OriginPullError::Permanent(anyhow::anyhow!(
-                    "cache.origin_path entry {} grew past max {max_bytes} during read",
+                    "cache.origin.path entry {} grew past max {max_bytes} during read",
                     canonical.display()
                 )));
             }

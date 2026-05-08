@@ -22,6 +22,8 @@ jobs:
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -32,6 +34,8 @@ jobs:
   clippy:
     name: clippy
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -47,28 +51,11 @@ jobs:
           RUSTC_WRAPPER: sccache
           SCCACHE_GHA_ENABLED: "true"
 
-  test:
-    name: test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: test
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest
-      - run: cargo nextest run --workspace --no-tests=pass
-        env:
-          RUSTC_WRAPPER: sccache
-          SCCACHE_GHA_ENABLED: "true"
-
   deny:
     name: cargo deny
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v6
       - uses: EmbarkStudios/cargo-deny-action@v2
@@ -76,6 +63,8 @@ jobs:
   doc:
     name: cargo doc
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -89,6 +78,8 @@ jobs:
   msrv:
     name: MSRV check
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.85.0
@@ -102,12 +93,56 @@ jobs:
           RUSTC_WRAPPER: sccache
           SCCACHE_GHA_ENABLED: "true"
 
-  coverage:
-    name: coverage
+  changes:
+    name: detect changes
     runs-on: ubuntu-latest
-    continue-on-error: true
+    # pull-requests: read is needed by dorny/paths-filter to call the
+    # listFiles API on PR events; on push it falls back to git diff.
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
     steps:
       - uses: actions/checkout@v6
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            rust:
+              - '**/*.rs'
+              - '**/Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - 'rustfmt.toml'
+              - 'deny.toml'
+              - '.cargo/**'
+              - '.github/workflows/ci.yml'
+              - '.github/scripts/coverage-diff.py'
+              - '.github/scripts/tests/**'
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
+    # Merged test+coverage job: the `Run tests` step (instrumented nextest) is
+    # the required signal feeding ci-success. Every coverage post-processing
+    # step below it carries `continue-on-error: true` so flaky LCOV/diff/comment
+    # tooling never blocks PRs — preserving the prior `coverage`-job semantics.
+    # Doc-only PRs skip this job via the `changes` gate; alls-green is
+    # configured with `allowed-skips` (see ci-success below) so the skip
+    # is accepted as success.
+    permissions:
+      contents: read
+      pull-requests: write
+      actions: read
+    steps:
+      # fetch-depth: 0 is required: coverage-diff.py runs
+      # `git diff origin/<base>...HEAD` and needs full history.
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
@@ -117,12 +152,185 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov,cargo-nextest
-      - run: cargo llvm-cov nextest --workspace --lcov --output-path lcov.info --no-tests=pass
-      - uses: codecov/codecov-action@v6
+
+      # Python is needed downstream by `Generate coverage diff` to invoke
+      # coverage-diff.py. The helper's own pytest suite lives in the separate
+      # non-blocking `coverage-tooling-tests` job so a regression in the
+      # helper surfaces as a red X without blocking PRs.
+      - name: Set up Python
+        uses: actions/setup-python@v6
         with:
-          files: lcov.info
-          fail_ci_if_error: false
-          token: ${{ secrets.CODECOV_TOKEN }}
+          python-version: '3.12'
+
+      # REQUIRED step. cargo llvm-cov nextest runs the workspace test suite
+      # with LLVM instrumentation; non-zero exit on any test failure fails
+      # this job and (via ci-success.needs) blocks the PR. No continue-on-error.
+      # sccache is not wired here (matching the prior coverage job); Swatinem
+      # /rust-cache with shared-key: coverage covers caching of instrumented
+      # build artifacts on its own.
+      - name: Run tests (with coverage instrumentation)
+        run: cargo llvm-cov nextest --workspace --lcov --output-path lcov.info --no-tests=pass
+
+      # No continue-on-error: this only runs on push to main (post-merge), so
+      # a failure paints main CI red rather than blocking a PR. Silent
+      # degradation is worse than a visible red on main — a persistent upload
+      # failure would silently freeze the coverage baseline that all PR diffs
+      # are computed against.
+      - name: Upload coverage baseline
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          retention-days: 90
+
+      - name: Download coverage baseline
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        uses: dawidd6/action-download-artifact@v21
+        with:
+          workflow: ci.yml
+          branch: main
+          workflow_conclusion: success
+          name: coverage-lcov
+          path: baseline/
+          if_no_artifact_found: warn
+
+      # Read the existing sticky comment (if any) so coverage-diff.py can
+      # extract the prior per-commit history block and append a new row.
+      # Without this step the comment would still update in place but the
+      # history would reset to a single row on every push.
+      # On a transient API failure (5xx, rate limit) the catch falls back to
+      # an empty file so coverage-diff.py treats it as "no prior" rather
+      # than failing the job. The visible degraded mode is "history resets
+      # this push" — same as a deleted comment.
+      - name: Fetch prior coverage comment
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const fs = require('fs');
+            // Must match MARKER in .github/scripts/coverage-diff.py.
+            const marker = '<!-- decdn-coverage-comment -->';
+            try {
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                per_page: 100,
+              });
+              // Filter by author too: anyone who can comment on the PR could
+              // post a body containing the marker and hijack the sticky-comment
+              // selection. Bot author + marker is the unambiguous identifier.
+              const existing = comments.find(c =>
+                c.user?.login === 'github-actions[bot]'
+                && c.body
+                && c.body.includes(marker)
+              );
+              fs.writeFileSync('prior-comment.md', existing ? existing.body : '');
+            } catch (e) {
+              core.warning(`Failed to fetch prior coverage comment: ${e.message} — history will reset this push.`);
+              fs.writeFileSync('prior-comment.md', '');
+            }
+
+      - name: Generate coverage diff
+        id: gendiff
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        # The script writes the truncated comment to stdout (captured here for the
+        # PR comment) and the full per-file table directly to $GITHUB_STEP_SUMMARY.
+        # DECDN_HEAD_SHA must be the PR head, not GITHUB_SHA (which is the merge SHA).
+        # Atomic write on success: stdout to .tmp, then rename. On failure,
+        # write a marker-bearing fallback comment so the Post step updates the
+        # sticky to a "diff failed" indicator rather than leaving stale data
+        # from a prior push. The marker must match MARKER in coverage-diff.py.
+        env:
+          DECDN_COVERAGE_PRIOR_BODY: prior-comment.md
+          DECDN_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if python3 .github/scripts/coverage-diff.py lcov.info baseline/lcov.info \
+               > coverage-comment.md.tmp; then
+            mv coverage-comment.md.tmp coverage-comment.md
+          else
+            rc=$?
+            rm -f coverage-comment.md.tmp
+            run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            printf '%s\n' \
+              '<!-- decdn-coverage-comment -->' \
+              '## Coverage report' \
+              '' \
+              ":warning: Coverage diff generation failed for commit \`${DECDN_HEAD_SHA}\`." \
+              "See the [workflow run logs](${run_url}) for details." \
+              > coverage-comment.md
+            exit $rc
+          fi
+
+      # always(): post the comment even when the required `Run tests` step fails
+      # (without it, success() would be false and this step would skip on red PRs).
+      # On a coverage-diff.py crash, Generate coverage diff writes a marker-
+      # bearing fallback so this step still updates the sticky to a "diff
+      # failed" indicator instead of leaving stale data. The hashFiles guard
+      # only excludes the case where Generate coverage diff was itself skipped
+      # (e.g. Run tests failed and the implicit success() gate skipped the
+      # rest of the chain — in that case the failed-tests signal on the
+      # required job is the unambiguous indicator). Skip on fork PRs:
+      # GITHUB_TOKEN is read-only there and createComment would 403.
+      - name: Post coverage comment
+        if: |
+          always()
+          && github.event_name == 'pull_request'
+          && github.event.pull_request.head.repo.full_name == github.repository
+          && hashFiles('coverage-comment.md') != ''
+        continue-on-error: true
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('coverage-comment.md', 'utf8');
+            // Must match MARKER in .github/scripts/coverage-diff.py.
+            const marker = '<!-- decdn-coverage-comment -->';
+            // try/catch + core.warning: continue-on-error keeps API errors
+            // (5xx, rate limit, permissions drift) from blocking the PR, but
+            // a sustained outage would otherwise be invisible. The warning
+            // adds a searchable entry to the run summary so a stopped-posting
+            // regression is noticeable beyond just a yellow step.
+            try {
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                per_page: 100,
+              });
+              // Filter by bot author + marker: a non-bot comment containing
+              // the marker would otherwise get picked as `existing`, and the
+              // updateComment call below would 403 (caller != author), leaving
+              // the bot's actual comment unmaintained.
+              const existing = comments.find(c =>
+                c.user?.login === 'github-actions[bot]'
+                && c.body
+                && c.body.includes(marker)
+              );
+              if (existing) {
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: existing.id,
+                  body,
+                });
+              } else {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  body,
+                });
+              }
+            } catch (e) {
+              core.warning(`Failed to post coverage comment: ${e.message}`);
+              throw e;
+            }
 
   markdownlint:
     name: markdownlint
@@ -134,16 +342,42 @@ jobs:
           globs: "**/*.md"
           config: ".markdownlint.yaml"
 
+  # Pytest suite for .github/scripts/coverage-diff.py. Non-blocking by design
+  # — excluded from ci-success.needs — so a regression in the helper surfaces
+  # as a red X (visible in the checks list) without blocking PRs. Lives in its
+  # own job so the signal stays distinct from yellow continue-on-error steps
+  # in the required `test` job.
+  coverage-tooling-tests:
+    name: coverage tooling tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Test coverage-diff helper
+        run: |
+          python3 -m pip install 'pytest==8.*'
+          python3 -m pytest .github/scripts/tests -q
+
   # Single gate for branch protection. Point required-checks at this one job
   # so adding/renaming jobs above doesn't require updating branch rules.
-  # coverage is excluded intentionally (it's continue-on-error until baseline);
-  # PR comment is configured in codecov.yml at repo root.
+  # The `test` job carries coverage post-processing (LCOV diff, sticky PR
+  # comment via .github/scripts/coverage-diff.py) as best-effort steps; those
+  # steps' `continue-on-error: true` keeps coverage tooling non-blocking even
+  # though the job itself is required.
   ci-success:
     name: CI success
     if: always()
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, test, deny, doc, msrv, markdownlint]
+    needs: [fmt, clippy, changes, test, deny, doc, msrv, markdownlint]
     steps:
       - uses: re-actors/alls-green@release/v1
         with:
           jobs: ${{ toJSON(needs) }}
+          # Rust jobs are gated on `needs.changes.outputs.rust` and skip
+          # on doc-only PRs. alls-green treats `skipped` as failure unless
+          # listed here. `changes` and `markdownlint` are intentionally
+          # omitted — they always run, so a skip from either signals a
+          # misconfiguration that should fail the gate.
+          allowed-skips: fmt, clippy, test, deny, doc, msrv

@@ -183,6 +183,17 @@ fn write_dry_run_human(w: &mut impl io::Write, hash: &str, resp: &EvictResponse)
         // engine has *no* access record vs a very recent one.
         None => writeln!(w, "last_accessed=never")?,
     }
+    // Origin egress-cost cue (#439). Distinct from omitting the line
+    // when the engine has no origin: operators evaluating disk-reclaim
+    // potential against re-fetch cost want this signal explicitly,
+    // not buried in "the field is missing because there's no origin
+    // at all". `none` matches the JSON serialisation skip-condition
+    // semantically (`Option::is_none` is omitted in JSON, surfaced as
+    // `none` here).
+    match resp.preview.origin_kind {
+        Some(kind) => writeln!(w, "origin_kind={kind}")?,
+        None => writeln!(w, "origin_kind=none")?,
+    }
     Ok(())
 }
 
@@ -842,6 +853,7 @@ mod tests {
                 last_accessed_us_ago: Some(2_000_000), // 2s ago via format_age
                 pinned: true,
                 already_evicted: false,
+                origin_kind: Some(decdn_cache::OriginKind::Http),
             },
         };
         let mut buf = Vec::<u8>::new();
@@ -859,6 +871,10 @@ mod tests {
         assert!(
             s.contains("last_accessed=2s ago"),
             "expected formatted last_accessed, got: {s}"
+        );
+        assert!(
+            s.contains("origin_kind=http"),
+            "missing origin_kind (#439): {s}"
         );
         Ok(())
     }
@@ -878,6 +894,10 @@ mod tests {
                 last_accessed_us_ago: None,
                 pinned: false,
                 already_evicted: false,
+                // Cache-only mode: no origin configured, so the
+                // dry-run reports `none` rather than omitting the
+                // line entirely (#439).
+                origin_kind: None,
             },
         };
         let mut buf = Vec::<u8>::new();
@@ -886,6 +906,10 @@ mod tests {
         assert!(
             s.contains("size_bytes=not_stored"),
             "expected not_stored sentinel, got: {s}"
+        );
+        assert!(
+            s.contains("origin_kind=none"),
+            "expected origin_kind=none sentinel for cache-only mode, got: {s}"
         );
         assert!(
             s.contains("last_accessed=never"),

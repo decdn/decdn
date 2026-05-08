@@ -58,11 +58,10 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
             cache_dir: PathBuf::from("/tmp/cache"),
             cache_size_mb: 1024,
             max_blob_size_mb: 128,
-            origin_url: None,
-            origin_path: None,
-            decompress: decdn_cache::DecompressMode::Auto,
+            origin: None,
             pinned_hashes: decdn_cache::PinnedHashes::empty(),
             origin_retry: decdn_cache::RetryPolicy::default(),
+            user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
         },
         payment: ResolvedPayment { rate_per_mb: rate },
         observability: ResolvedObservability {

@@ -199,11 +199,10 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             cache_dir: PathBuf::from("/var/lib/decdn/cache"),
             cache_size_mb: 10_240,
             max_blob_size_mb: 1_024,
-            origin_url: None::<decdn_cache::OriginUrl>,
-            origin_path: None,
-            decompress: decdn_cache::DecompressMode::Auto,
+            origin: None,
             pinned_hashes: decdn_cache::PinnedHashes::empty(),
             origin_retry: decdn_cache::RetryPolicy::default(),
+            user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
         },
         payment: ResolvedPayment { rate_per_mb: 10 },
         observability: ResolvedObservability {

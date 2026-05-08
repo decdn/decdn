@@ -58,22 +58,12 @@ pub struct ResolvedCache {
     pub cache_size_mb: u64,
     /// Maximum single blob size in megabytes.
     pub max_blob_size_mb: u64,
-    /// Optional HTTP origin base URL for pull-through on cache misses.
-    /// Parsed, scheme-validated, and path-normalized at resolution time via
-    /// [`decdn_cache::parse_origin_url`] so invalid URLs fail config
-    /// loading. Constructing an [`decdn_cache::OriginUrl`] outside the
-    /// parser is impossible — the invariants (http/https scheme,
-    /// trailing-slash path, no query/fragment) are type-enforced.
-    pub origin_url: Option<decdn_cache::OriginUrl>,
-    /// Optional filesystem origin root. Blobs live at
-    /// `{path}/{hex[0..2]}/{hex}`. Directory-existence is validated when
-    /// the runtime constructs the [`decdn_cache::FilesystemOrigin`] —
-    /// config resolution carries the raw path so resolution stays
-    /// filesystem-free and testable without real I/O.
-    pub origin_path: Option<PathBuf>,
-    /// How to handle `Content-Encoding` on the HTTP origin response
-    /// (#312). Defaults to [`decdn_cache::DecompressMode::Auto`].
-    pub decompress: decdn_cache::DecompressMode,
+    /// Resolved origin backend, if any (#437). `None` => no
+    /// pull-through; cache misses return `NoOrigin`. Per-variant
+    /// validation (URL parse, S3 bucket/region/prefix shape) has
+    /// already run at resolution time — the wiring layer can construct
+    /// the concrete `Origin` impl without re-validating.
+    pub origin: Option<ResolvedOrigin>,
     /// Operator-pinned blob hashes (#276). Hashes here are excluded from
     /// LRU eviction candidates by [`decdn_cache::CacheEngine`]. Resolved
     /// from the hex-encoded TOML form at load time, so any wrong-length
@@ -89,6 +79,118 @@ pub struct ResolvedCache {
     /// Origin pull-through retry policy (#285). Set once at startup;
     /// changes require a process restart.
     pub origin_retry: decdn_cache::RetryPolicy,
+    /// `User-Agent` header sent on every HTTP origin pull-through (#435).
+    /// Defaults to [`decdn_cache::DEFAULT_USER_AGENT`] (which embeds the
+    /// `decdn-cache` crate's `CARGO_PKG_VERSION`); operators can override
+    /// via `cache.user_agent` to attribute CDN traffic in origin access
+    /// logs or to drive origin-side rate limits and routing policy.
+    pub user_agent: String,
+}
+
+/// Resolved + validated origin backend selection (#437). Mirrors
+/// [`crate::config::types::OriginConfig`] but carries pre-parsed types
+/// for the variants that need them (HTTP base URL, S3 endpoint URL).
+///
+/// The resolution layer (`crate::config::resolve_origin`) is the
+/// **intended** construction path — it's the only producer the
+/// runtime relies on, and the only path that runs the validators.
+/// The fields on each variant are `pub` for consistency with the
+/// other `Resolved*` types in this crate (see `ResolvedCache`,
+/// `ResolvedBlockchain`, etc.); Rust visibility doesn't *enforce*
+/// the validator-only contract, but the runtime never bypasses it.
+#[derive(Debug, Clone)]
+pub enum ResolvedOrigin {
+    /// HTTP(S) origin. The base URL has already been parsed by
+    /// [`decdn_cache::parse_origin_url`] at resolution time, so
+    /// invariants (http/https scheme, trailing-slash path, no
+    /// query/fragment) are type-enforced — they cannot be reconstructed
+    /// outside the parser.
+    Http {
+        /// Validated base URL.
+        url: decdn_cache::OriginUrl,
+        /// How to handle `Content-Encoding` on the HTTP origin response
+        /// (#312). Defaults to [`decdn_cache::DecompressMode::Auto`].
+        decompress: decdn_cache::DecompressMode,
+    },
+    /// Local filesystem origin root. Directory-existence is validated
+    /// when the runtime constructs the
+    /// [`decdn_cache::FilesystemOrigin`] — config resolution carries
+    /// the raw path so resolution stays filesystem-free and testable
+    /// without real I/O.
+    Fs {
+        /// Filesystem root.
+        path: PathBuf,
+    },
+    /// S3-compatible origin. Field-shape validation (DNS-safe bucket
+    /// name, region non-empty, endpoint URL scheme, prefix shape) has
+    /// already run at resolution time and is encoded in the
+    /// [`ResolvedS3Config`] type.
+    S3(ResolvedS3Config),
+}
+
+/// Validated runtime form of an S3 origin (#437). The intended
+/// construction path is `crate::config::resolve_s3_origin`, which
+/// runs the validators and lifts the wire-form
+/// [`crate::config::types::S3OriginConfig`] into this resolved form
+/// with pre-parsed types (notably `endpoint_url: Option<OriginUrl>`).
+/// `Default` is intentionally not derived. The fields are `pub` for
+/// consistency with the other `Resolved*` types in this crate, so
+/// in-crate construction with field-init is technically possible —
+/// the runtime simply doesn't do that. Pattern of intent rather
+/// than visibility-enforced invariant.
+///
+/// Resolved-vs-wire-form differences:
+/// - `endpoint_url` is `Option<OriginUrl>` (parsed) instead of
+///   `Option<String>`, so PR2's S3 backend cannot accidentally pass
+///   an un-normalized URL to the SDK and produce `SigV4` mismatches
+///   between, say, `http://minio:9000` and `http://minio:9000/`.
+/// - `path_style` is `bool` (collapsed from `Option<bool>`), with
+///   `None` mapped to the SDK default (virtual-hosted-style = false).
+/// - `prefix` is a `String` with the trailing-slash
+///   auto-append already applied — the runtime never sees the raw
+///   pre-normalised form.
+#[derive(Debug, Clone)]
+pub struct ResolvedS3Config {
+    /// Bucket name. Validated DNS-safe at construction time.
+    pub bucket: String,
+    /// AWS region, validated non-empty at construction time.
+    pub region: String,
+    /// Custom endpoint URL for non-AWS S3-compatible providers (R2,
+    /// B2, `MinIO`). Parsed and trailing-slash-normalized.
+    pub endpoint_url: Option<decdn_cache::OriginUrl>,
+    /// Whether to use path-style addressing. `false` (the SDK
+    /// default) selects virtual-hosted-style addressing.
+    pub path_style: bool,
+    /// Optional key prefix prepended to every fetched object.
+    /// Trailing-slash-normalized so the runtime can build keys via
+    /// `format!("{prefix}{shard}/{hex}")` without re-checking the
+    /// trailing slash.
+    pub prefix: String,
+    /// Resolved credential source.
+    pub credentials: Option<ResolvedS3Credentials>,
+}
+
+/// Validated runtime form of S3 credentials (#437). See
+/// [`ResolvedS3Config`] for the constructor invariant.
+#[derive(Debug, Clone)]
+pub enum ResolvedS3Credentials {
+    /// Static IAM credentials.
+    Static {
+        /// AWS access key ID. Held in [`crate::config::secret::SecretString`]
+        /// so an incidental `Debug` print or panic backtrace cannot
+        /// leak it.
+        access_key_id: crate::config::secret::SecretString,
+        /// AWS secret access key. Same redaction discipline.
+        secret_access_key: crate::config::secret::SecretString,
+        /// Optional STS session token, redacted.
+        session_token: Option<crate::config::secret::SecretString>,
+    },
+    /// Use the AWS default credential chain. `profile` overrides the
+    /// default profile name for `~/.aws/credentials`.
+    DefaultChain {
+        /// Optional profile name override.
+        profile: Option<String>,
+    },
 }
 
 /// Resolved payment fields.

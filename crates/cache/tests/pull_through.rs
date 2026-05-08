@@ -8,10 +8,11 @@ use std::time::Duration;
 
 use decdn_cache::{
     CacheEngine, CacheError, DecompressMode, FilesystemOrigin, Hash, HttpOrigin, Origin,
-    OriginError, OriginFetch, OriginPullError, PinnedHashes, RetryPolicy, SupportedEncoding,
+    OriginError, OriginFetch, OriginKind, OriginPullError, PinnedHashes, RetryPolicy,
+    SupportedEncoding,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Spin up a wiremock server that serves a single blob at
@@ -160,6 +161,10 @@ struct OversizedOrigin {
 }
 
 impl Origin for OversizedOrigin {
+    fn kind(&self) -> OriginKind {
+        OriginKind::Http
+    }
+
     fn fetch(
         &self,
         _hash: Hash,
@@ -1572,6 +1577,10 @@ impl FailingThenSucceedingOrigin {
 }
 
 impl Origin for FailingThenSucceedingOrigin {
+    fn kind(&self) -> OriginKind {
+        OriginKind::Http
+    }
+
     fn fetch(
         &self,
         hash: Hash,
@@ -1619,6 +1628,10 @@ impl PermanentlyFailingOrigin {
 }
 
 impl Origin for PermanentlyFailingOrigin {
+    fn kind(&self) -> OriginKind {
+        OriginKind::Http
+    }
+
     fn fetch(
         &self,
         _hash: Hash,
@@ -1902,6 +1915,10 @@ async fn fs_origin_retries_on_transient_io_kind_then_succeeds() -> anyhow::Resul
         first: std::sync::atomic::AtomicBool,
     }
     impl Origin for InterruptOnceOrigin {
+        fn kind(&self) -> OriginKind {
+            self.inner.kind()
+        }
+
         fn fetch(
             &self,
             hash: Hash,
@@ -1955,6 +1972,10 @@ async fn fs_origin_does_not_retry_on_permission_denied() -> anyhow::Result<()> {
         count: std::sync::atomic::AtomicUsize,
     }
     impl Origin for DeniedOrigin {
+        fn kind(&self) -> OriginKind {
+            OriginKind::Filesystem
+        }
+
         fn fetch(
             &self,
             _hash: Hash,
@@ -1980,6 +2001,76 @@ async fn fs_origin_does_not_retry_on_permission_denied() -> anyhow::Result<()> {
     anyhow::ensure!(
         origin.count.load(std::sync::atomic::Ordering::SeqCst) == 1,
         "PermissionDenied must short-circuit after one attempt"
+    );
+    Ok(())
+}
+
+/// Wire-level proof that an operator-configured `cache.user_agent`
+/// actually reaches the origin. The `new_with_user_agent_accepts_custom_value`
+/// unit test in `crate::origin::http` only confirms the constructor doesn't
+/// error, leaving the "is it set on the wire?" question untested. A future
+/// reqwest builder reordering, or a typo passing the UA into the wrong
+/// builder slot, would silently ship the default — exactly the regression
+/// #435 is meant to prevent. Wiremock matches on the `User-Agent` header
+/// here; if the header doesn't match, the mock returns 404 and the engine
+/// errors out, which we assert against by checking the get succeeds.
+#[tokio::test]
+async fn http_origin_sends_configured_user_agent() -> anyhow::Result<()> {
+    use decdn_cache::parse_origin_url;
+
+    let payload: &[u8] = b"hello, decdn";
+    let hash = Hash::new(payload);
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .and(header("user-agent", "MyCdn/1.0 (+ops@example.com)"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload))
+        .mount(&server)
+        .await;
+
+    let url = parse_origin_url(&server.uri())?;
+    let origin = Arc::new(HttpOrigin::new_with_user_agent(
+        url,
+        "MyCdn/1.0 (+ops@example.com)",
+    )?);
+    let tmp = tempfile::tempdir()?;
+    let engine = CacheEngine::open(tmp.path(), Some(origin as Arc<dyn Origin>), 16).await?;
+
+    let got = engine.get(hash).await?;
+    anyhow::ensure!(
+        &got[..] == payload,
+        "fetch should have succeeded — if the configured UA never reached the wire, \
+         the mock's header matcher would have served 404"
+    );
+    Ok(())
+}
+
+/// Default UA is sent on the wire when no override is configured. Pairs
+/// with the test above: together they prove the seam between the config
+/// resolver and the wire is intact in both branches.
+#[tokio::test]
+async fn http_origin_sends_default_user_agent_when_unset() -> anyhow::Result<()> {
+    use decdn_cache::{DEFAULT_USER_AGENT, parse_origin_url};
+
+    let payload: &[u8] = b"hello, decdn";
+    let hash = Hash::new(payload);
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .and(header("user-agent", DEFAULT_USER_AGENT))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload))
+        .mount(&server)
+        .await;
+
+    let url = parse_origin_url(&server.uri())?;
+    let origin = Arc::new(HttpOrigin::new(url)?);
+    let tmp = tempfile::tempdir()?;
+    let engine = CacheEngine::open(tmp.path(), Some(origin as Arc<dyn Origin>), 16).await?;
+
+    let got = engine.get(hash).await?;
+    anyhow::ensure!(
+        &got[..] == payload,
+        "default UA fetch should have succeeded"
     );
     Ok(())
 }

@@ -17,7 +17,7 @@ use reqwest::StatusCode;
 use reqwest::header::CONTENT_ENCODING;
 use serde::{Deserialize, Serialize};
 
-use super::{Origin, OriginFetch};
+use super::{Origin, OriginFetch, OriginKind};
 use crate::error::{OriginError, OriginPullError, SupportedEncoding};
 
 /// How long to wait for the TCP/TLS handshake to complete. Per-request total
@@ -178,6 +178,15 @@ pub enum DecompressMode {
     Strict,
 }
 
+/// Default `User-Agent` header set on every origin request unless overridden
+/// via [`HttpOrigin::new_with_user_agent`]. Embeds `CARGO_PKG_VERSION` of
+/// the `decdn-cache` crate (the workspace does not version-link its members,
+/// so this can drift from the running `decdn-node` binary's version if the
+/// two crates are bumped independently). Lets origin operators attribute
+/// CDN pull-through traffic in access logs and apply origin-side rate
+/// limits or routing rules separately from anonymous client traffic (#435).
+pub const DEFAULT_USER_AGENT: &str = concat!("decdn-node/", env!("CARGO_PKG_VERSION"));
+
 /// Origin backed by a plain HTTP(S) endpoint serving content-addressed blobs
 /// at `{base_url}/{blake3_hex}`.
 #[derive(Debug, Clone)]
@@ -199,7 +208,21 @@ impl HttpOrigin {
     /// to the `RESPONSE_HEADERS_TIMEOUT` and `CHUNK_IDLE_TIMEOUT` constants; override
     /// with [`Self::with_timeouts`] if operator policy or tests require
     /// different values.
+    ///
+    /// Sets [`DEFAULT_USER_AGENT`] on the inner reqwest client so origin
+    /// access logs can attribute CDN pull-through traffic (#435). Override
+    /// via [`Self::new_with_user_agent`].
     pub fn new(base_url: OriginUrl) -> anyhow::Result<Self> {
+        Self::new_with_user_agent(base_url, DEFAULT_USER_AGENT)
+    }
+
+    /// Like [`Self::new`] but with a caller-supplied `User-Agent`. Used by
+    /// the runtime to honour an operator-configured `cache.user_agent`
+    /// without rebuilding the client through a separate code path.
+    /// `user_agent` must be a valid header value (visible-ASCII; `reqwest`
+    /// rejects others at build time and the error is surfaced as a
+    /// startup failure).
+    pub fn new_with_user_agent(base_url: OriginUrl, user_agent: &str) -> anyhow::Result<Self> {
         // We want to inspect `Content-Encoding` and run the body through
         // our own decoders, so disable reqwest's built-in transparent
         // decompression — otherwise reqwest would strip the header and
@@ -207,6 +230,7 @@ impl HttpOrigin {
         // actually sent and bypassing our `UnsupportedEncoding` error path.
         let client = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
+            .user_agent(user_agent)
             .no_gzip()
             .no_deflate()
             .no_brotli()
@@ -396,6 +420,10 @@ fn is_transient_status(status: StatusCode) -> bool {
 }
 
 impl Origin for HttpOrigin {
+    fn kind(&self) -> OriginKind {
+        OriginKind::Http
+    }
+
     // The body folds together URL parsing, the headers-phase request,
     // status classification, encoding extraction, the chunked-body
     // streaming loop, and the decompression branch. Splitting it
@@ -752,6 +780,32 @@ mod tests {
             err.contains("invalid origin base URL"),
             "error lacked context: {err}"
         );
+        Ok(())
+    }
+
+    /// `DEFAULT_USER_AGENT` (#435) embeds the `decdn-cache` crate's
+    /// `CARGO_PKG_VERSION` so origin operators can attribute pull-through
+    /// traffic. The `decdn-node/` prefix is intentionally stable —
+    /// operators may grep on it in access logs.
+    #[test]
+    fn default_user_agent_has_expected_prefix_and_version() -> anyhow::Result<()> {
+        anyhow::ensure!(
+            DEFAULT_USER_AGENT.starts_with("decdn-node/"),
+            "got: {DEFAULT_USER_AGENT}"
+        );
+        anyhow::ensure!(
+            DEFAULT_USER_AGENT.len() > "decdn-node/".len(),
+            "version segment missing: {DEFAULT_USER_AGENT}"
+        );
+        Ok(())
+    }
+
+    /// `HttpOrigin::new_with_user_agent` accepts a non-default UA without
+    /// erroring on a typical operator-supplied value.
+    #[test]
+    fn new_with_user_agent_accepts_custom_value() -> anyhow::Result<()> {
+        let url = parse_origin_url("https://origin.example/")?;
+        let _origin = HttpOrigin::new_with_user_agent(url, "MyCdn/1.0 (+ops@example.com)")?;
         Ok(())
     }
 }
