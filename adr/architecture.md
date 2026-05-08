@@ -90,10 +90,11 @@ The economic model that ties the protocol together. Three ADRs: [ADR 026](026-ga
 How protocol violations are detected, adjudicated, and punished. The slashing schedule lives in [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn); this chapter is the evidence and adjudication path.
 
 1. [ADR 014 — On-Chain Verification for Slashing Evidence](014-on-chain-verification.md)
-2. [ADR 008 — Reputation System](008-reputation.md)
-3. [ADR 011 — Content Takedown and Hash Blacklisting](011-content-takedown.md)
-4. [ADR 028 — Slashing Appeals and Dispute Escalation](028-slashing-appeals.md)
-5. [Appendix: Permissionless Fraud-Detection Layer](appendix-fraud-detection.md) — operational detection layer over the on-chain primitives
+2. [ADR 030 — Production BLAKE3 Corruption Verification (Interactive Merkle Bisection)](030-blake3-merkle-verification.md)
+3. [ADR 008 — Reputation System](008-reputation.md)
+4. [ADR 011 — Content Takedown and Hash Blacklisting](011-content-takedown.md)
+5. [ADR 028 — Slashing Appeals and Dispute Escalation](028-slashing-appeals.md)
+6. [Appendix: Permissionless Fraud-Detection Layer](appendix-fraud-detection.md) — operational detection layer over the on-chain primitives
 
 ### Chapter 6 — Governance & contracts
 
@@ -147,7 +148,7 @@ Numeric per-ADR index. The thematic chapter ordering for top-to-bottom reading l
 - **[ADR 011 — Content Takedown and Hash Blacklisting](011-content-takedown.md)** — Governance-controlled on-chain hash blacklist with regional bodies and emergency fast-path; per-entry appeals for regional entries via emergency-multisig fast-track + ve-Governor ratification ([§ Blacklist Entry Appeals](011-content-takedown.md#blacklist-entry-appeals)).
 - **[ADR 012 — Client Architecture, Bootstrap, and Trust Model](012-client.md)** — Client bootstrap, key management, identity lifecycle, trust boundary, multi-node parallel download, crash recovery, and file manifests.
 - **[ADR 013 — Schema Evolution](013-schema-evolution.md)** — Varint-length framing, protocol enums, three-tier evolution model.
-- **[ADR 014 — On-Chain Verification for Slashing Evidence](014-on-chain-verification.md)** — secp256k1 EIP-712 `slash_sig` on `ProbeResponse`/`StreamResponse`, optimistic challenge-response for corruption, unified `SlashJudge` contract.
+- **[ADR 014 — On-Chain Verification for Slashing Evidence](014-on-chain-verification.md)** — secp256k1 EIP-712 `slash_sig` on `ProbeResponse`/`StreamResponse`, optimistic challenge-response for corruption (v1 / `cdn/client/v1`; production cryptographic path in [ADR 030](030-blake3-merkle-verification.md)), unified `SlashJudge` contract.
 - **[ADR 015 — QUIC 0-RTT Connection Establishment](015-zero-rtt.md)** — 0-RTT early data for latency-sensitive protocols (`cdn/probe/v1`, `cdn/dht/v1`); paid delivery (`cdn/client/v1`) stays 1-RTT.
 - **[ADR 016 — Smart Contract Interaction Model](016-contract-interactions.md)** — Cross-contract call graph, fund custody, access control matrix, and reentrancy analysis.
 - **[ADR 017 — Privacy Analysis](017-privacy.md)** — Unified privacy surface inventory, adversary model, and mitigation roadmap.
@@ -158,6 +159,7 @@ Numeric per-ADR index. The thematic chapter ordering for top-to-bottom reading l
 - **[ADR 026 — Gauge-Boost Tokenomics](026-gauge-boost-tokenomics.md)** — 1B fixed supply; `FeeRouter` six-bucket split with Curve-style gauge boost, delegator pool, and SafetyReserve.
 - **[ADR 027 — Distinct-Client Delivery Receipts](027-distinct-client-receipts.md)** — Client-signed `DeliveryReceipt` Merkle-batched per epoch; gauge-pool eligibility gated on distinct-client diversity. Required for mainnet launch.
 - **[ADR 028 — Slashing Appeals and Dispute Escalation](028-slashing-appeals.md)** — 30-day post-slash appeal window via `SafetyReserve` restitution; emergency multisig fast-track + 14-day ve-Governor ratification; one accepted appeal per operator per 365 days.
+- **[ADR 030 — Production BLAKE3 Corruption Verification](030-blake3-merkle-verification.md)** — `cdn/client/v2` adds signed `merkle_root` (keccak256 MMR) to `StreamResponse`; interactive bisection over the bao tree drives disputes to a single 1024-byte chunk; on-chain BLAKE3 + bao parent path verifies the leaf. Coexists with ADR 014 §2 optimistic path under unified `OffenseType.Corruption`. Raises default `unbondingPeriod` from 7 d to 14 d.
 
 ## Key Invariants
 

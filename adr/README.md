@@ -147,7 +147,7 @@ pandoc --from=markdown+gfm_auto_identifiers \
   022-content-discovery.md 015-zero-rtt.md \
   003-payments.md 010-multi-token.md 012-client.md 024-account-abstraction.md \
   026-gauge-boost-tokenomics.md 027-distinct-client-receipts.md 018-liquidity-strategy.md \
-  014-on-chain-verification.md 008-reputation.md 011-content-takedown.md 028-slashing-appeals.md \
+  014-on-chain-verification.md 030-blake3-merkle-verification.md 008-reputation.md 011-content-takedown.md 028-slashing-appeals.md \
   009-governance.md 016-contract-interactions.md \
   019-node-onboarding.md \
   013-schema-evolution.md 017-privacy.md \

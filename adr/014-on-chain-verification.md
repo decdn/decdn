@@ -141,7 +141,7 @@ The receipt uses the `SlashJudge` EIP-712 domain (same domain separator as slash
 
 #### Future evolution
 
-A cryptographic upgrade path — interactive keccak256 Merkle proofs over 1024-byte chunks — is tracked in [issue #387](https://github.com/decdn/decdn/issues/387). It would replace the bond-economics + counter-evidence-ambiguity dependencies of the optimistic path with on-chain Merkle verification, but requires open design work (chiefly: how to bind a keccak256 Merkle root to a BLAKE3 hash on-chain). Out of scope for this ADR until that future ADR lands.
+The cryptographic upgrade path — interactive keccak256 Merkle proofs over 1024-byte chunks — is specified in [ADR 030](030-blake3-merkle-verification.md). The Merkle path coexists with the optimistic path: v1 deliveries (`cdn/client/v1`) keep using `submitCorruptionChallenge` per this section; v2 deliveries (`cdn/client/v2`) use `submitMerkleCorruptionChallenge` per ADR 030. Both feed the unified `OffenseType.Corruption` and the [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn) lifetime escalation counter — no new offense type is introduced.
 
 ### 3. SlashJudge Contract
 
@@ -209,9 +209,12 @@ interface ISlashJudge {
         bool isStreamResponse          // false = ProbeResponse evidence, true = StreamResponse evidence
     ) external;
 
-    /// Corrupted delivery: node served bytes failing BLAKE3 verification.
-    /// Opens a 24h counter-evidence window; `Slashed` is emitted from `resolveChallenge`
+    /// Corrupted delivery (v1 / optimistic path): node served bytes failing
+    /// BLAKE3 verification on a `cdn/client/v1` delivery. Opens a 24h
+    /// counter-evidence window; `Slashed` is emitted from `resolveChallenge`
     /// only on a slash outcome (countered/dismissed challenges do NOT emit).
+    /// The cryptographic v2 path lives in `submitMerkleCorruptionChallenge`
+    /// per [ADR 030](030-blake3-merkle-verification.md).
     function submitCorruptionChallenge(
         address challengedNode,
         bytes32 nodeId,
@@ -219,6 +222,44 @@ interface ISlashJudge {
         bytes calldata streamResponseData,
         bytes calldata streamSlashSig
     ) external;
+
+    /// Corrupted delivery (v2 / Merkle-bisection path): opens an interactive
+    /// dispute against a `cdn/client/v2` delivery whose signed `StreamResponse`
+    /// includes the keccak256 MMR `merkleRoot` per [ADR 030](030-blake3-merkle-verification.md).
+    /// The dispute progresses via `bisectMove` (cheap rounds) and concludes via
+    /// `terminalReveal` + `resolveMerkleCorruption` (terminal on-chain BLAKE3
+    /// chunk verification). No counter-evidence window — resolution is
+    /// cryptographically dispositive. Feeds the unified `OffenseType.Corruption`;
+    /// the v1 and v2 entry points share `evidenceHash` preimage rules per §3
+    /// (the v2 struct hash differs from v1 by inclusion of `merkleRoot`).
+    function submitMerkleCorruptionChallenge(
+        address challengedNode,
+        bytes32 nodeId,
+        bytes calldata streamResponseV2Data,
+        bytes calldata streamSlashSig
+    ) external returns (uint256 disputeId);
+
+    /// v2 bisection step. See ADR 030 §3 for the state machine.
+    function bisectMove(
+        uint256 disputeId,
+        bytes32 baoRootLeft,    bytes32 keccakRootLeft,
+        bytes32 baoRootRight,   bytes32 keccakRootRight,
+        bool    challengeLeft
+    ) external;
+
+    /// v2 terminal reveal at round N+1.
+    function terminalReveal(
+        uint256 disputeId,
+        bytes  calldata chunkBytes,
+        bytes32[] calldata baoParentPath,
+        bytes  calldata keccakInclusionProof
+    ) external;
+
+    /// v2 resolution after terminal reveal or chess-clock timeout.
+    function resolveMerkleCorruption(uint256 disputeId) external;
+
+    /// v2 voluntary concede.
+    function forfeitDispute(uint256 disputeId) external;
 
     /// Receipt-summary fraud: operator's `EpochReceiptSummary` overstates
     /// `claimedBytes` or `claimedDistinctClients` relative to the on-chain
@@ -244,7 +285,7 @@ interface ISlashJudge {
 
 ##### Challenge rate limit
 
-`SlashJudge` enforces a maximum number of concurrent active (unresolved) challenges per target node address: `maxActiveChallengesPerNode` (PoC: 10, production safety bound: [1, 50]). New `submitPhantomChallenge`, `submitRateChallenge`, `submitBlacklistChallenge`, `submitCorruptionChallenge`, and `submitReceiptFraudChallenge` calls targeting a node at the limit MUST revert. This bounds the defender's concurrent counter-evidence response burden and prevents griefing attacks where a well-funded attacker submits many simultaneous spurious challenges to force operational disruption. The parameter is governable per [ADR 009](009-governance.md).
+`SlashJudge` enforces a maximum number of concurrent active (unresolved) challenges per target node address: `maxActiveChallengesPerNode` (PoC: 10, production safety bound: [1, 50]). New `submitPhantomChallenge`, `submitRateChallenge`, `submitBlacklistChallenge`, `submitCorruptionChallenge`, `submitMerkleCorruptionChallenge` ([ADR 030](030-blake3-merkle-verification.md)), and `submitReceiptFraudChallenge` calls targeting a node at the limit MUST revert. This bounds the defender's concurrent counter-evidence response burden and prevents griefing attacks where a well-funded attacker submits many simultaneous spurious challenges to force operational disruption. The parameter is governable per [ADR 009](009-governance.md).
 
 #### Evidence Verification Per Offense Type
 
@@ -265,7 +306,7 @@ All challenge types MUST validate evidence age using a skew-safe comparison. Let
 
 ##### Interaction with unbonding period
 
-`MAX_EVIDENCE_AGE_US` MUST be strictly less than the `StakingRegistry.unbondingPeriod` (converted to microseconds). If evidence can be older than the unbonding period, a node could commit an offense, immediately initiate unstaking, and complete withdrawal before the evidence is submitted — avoiding the slash entirely. With PoC defaults (evidence age: 5 days, unbonding: 7 days), this invariant is satisfied with a 2-day margin. The safety bounds ([1 day, 30 days] for evidence age vs [3 days, 30 days] for unbonding per [ADR 009](009-governance.md)) permit governance to violate this invariant — implementations SHOULD enforce `MAX_EVIDENCE_AGE_US < unbondingPeriod` whenever `MAX_EVIDENCE_AGE_US` is configured or updated, including at initialization and in any governance-controlled reconfiguration path.
+`MAX_EVIDENCE_AGE_US` MUST be strictly less than the `StakingRegistry.unbondingPeriod` (converted to microseconds). If evidence can be older than the unbonding period, a node could commit an offense, immediately initiate unstaking, and complete withdrawal before the evidence is submitted — avoiding the slash entirely. With current defaults (evidence age: 5 days, unbonding: 14 days per [ADR 030 §7](030-blake3-merkle-verification.md#7-interaction-with-stake-unbonding--unbondingperiod-raised-to-14-d) — raised from the prior 7-day default to cover the worst-case Merkle-bisection lifecycle), this invariant is satisfied with a 9-day margin. The safety bounds ([1 day, 30 days] for evidence age vs [3 days, 30 days] for unbonding per [ADR 009](009-governance.md)) permit governance to violate this invariant — implementations SHOULD enforce `MAX_EVIDENCE_AGE_US < unbondingPeriod` whenever `MAX_EVIDENCE_AGE_US` is configured or updated, including at initialization and in any governance-controlled reconfiguration path. ADR 030 §7 adds a stricter cross-parameter invariant for the Merkle-bisection path that implementations MUST also enforce.
 
 **Rate manipulation:** 1–3. Same `SignatureChecker` verification and identity check as phantom
 4. Verify `streamResponse.rate_per_mb > probeResponse.rate_per_mb`
@@ -310,12 +351,13 @@ Every slash that reduces operator stake emits `Slashed(slashId, operator, offens
   - **Phantom:** `keccak256(abi.encode(uint8(OffenseType.Phantom), probeStructHash, streamStructHash))`.
   - **Rate manipulation:** `keccak256(abi.encode(uint8(OffenseType.RateManipulation), probeStructHash, streamStructHash))`. The `OffenseType` prefix is what distinguishes this preimage from phantom on overlapping evidence.
   - **Blacklist:** `keccak256(abi.encode(uint8(OffenseType.Blacklist), responseStructHash, isStreamResponse))`. The boolean is required because it is a `submitBlacklistChallenge` parameter, not part of any `*Response` struct.
-  - **Corruption:** `keccak256(abi.encode(uint8(OffenseType.Corruption), streamStructHash))`.
+  - **Corruption:** `keccak256(abi.encode(uint8(OffenseType.Corruption), streamStructHash))`. For v1 (`cdn/client/v1`) deliveries `streamStructHash` is computed under `STREAM_RESPONSE_TYPEHASH` (this ADR §1); for v2 (`cdn/client/v2`) deliveries it is computed under `STREAM_RESPONSE_V2_TYPEHASH` per [ADR 030 §1](030-blake3-merkle-verification.md#1-wire-format-merkle_root-in-signed-streamresponse-tier-3--cdnclientv2). The `OffenseType` byte is shared between paths; `evidenceHash` is naturally distinct because the two typed-data definitions differ (v2 includes `merkleRoot`).
   - **Receipt fraud:** `keccak256(abi.encode(uint8(OffenseType.ReceiptFraud), epochId, aggregateRoot))`. `epochId` and `aggregateRoot` come from the operator's `EpochReceiptSummary` for the challenged epoch; the preimage uniquely identifies (operator, epoch) pair fraud while remaining stable across alternate fraud-evidence formats (different challengers may submit different Merkle proofs against the same `aggregateRoot`, all producing the same `evidenceHash`).
 
   Each `*StructHash` is the EIP-712 struct hash of the corresponding `*Response` per §1 (head-only `bytes32` — `abi.encode` adds no padding to a fixed-width 32-byte value). Appeals reference `evidenceHash` to prove they are challenging the same evidence the slash relied on; ADR 028 §6 `openSlashAppeal(slashId, evidenceBundleHash)` requires `evidenceBundleHash == evidenceHash` of the referenced `Slashed` event.
 - **Emission sites:**
-  - **Corruption** — emitted from `resolveChallenge` only when the 24h counter-evidence window resolves to a slash. Countered or dismissed challenges do NOT emit (no stake reduction occurred).
+  - **Corruption (v1 / optimistic — `cdn/client/v1`)** — emitted from `resolveChallenge` only when the 24h counter-evidence window resolves to a slash. Countered or dismissed challenges do NOT emit (no stake reduction occurred).
+  - **Corruption (v2 / Merkle-bisection — `cdn/client/v2`; per [ADR 030](030-blake3-merkle-verification.md))** — emitted from `resolveMerkleCorruption` (or from `forfeitDispute` when the defender concedes) only on the defender-loss branch. Challenger-loss branches (terminal verification proves defender's chunk correct, challenger chess-clock timeout, or challenger forfeit) do NOT emit; the bond is forfeited per the §Bond Handling challenger-loss split with no stake reduction.
   - **Phantom / rate manipulation / blacklist** — emitted from the synchronous `submit*Challenge` paths immediately after the inline `StakingRegistry.slash()` returns. The "`StakingRegistry.slash()` then `emit Slashed`" sequence is contract-enforced atomic (single transaction); a slash without a matching event is impossible.
 
 The companion `SafetyReserve` events (`SlashAppealOpened`, `SlashAppealRatified`, etc.) remain forward-referenced to a future contract-implementation ADR per [ADR 028 §Forward references](028-slashing-appeals.md#forward-references-follow-up-adrs); only the `Slashed` event itself is canonicalised here.
@@ -328,6 +370,7 @@ The companion `SafetyReserve` events (`SlashAppealOpened`, `SlashAppealRatified`
 | `submitRateChallenge` | ~65k–90k | 2× `SignatureChecker` (6k EOA / ~30k Safe) + calldata + storage for pending challenge + bond transfer + `Slashed` emit on success |
 | `submitBlacklistChallenge` | ~55k–70k | 1× `SignatureChecker` (3k EOA / ~15k Safe) + `ContentBlacklist` lookup + bond transfer + `Slashed` emit on success |
 | `submitCorruptionChallenge` | ~50k–65k | 1× `SignatureChecker` (3k EOA / ~15k Safe) + storage for challenge state + bond transfer (no slash yet — emit deferred to `resolveChallenge`) |
+| `submitMerkleCorruptionChallenge` ([ADR 030](030-blake3-merkle-verification.md) v2) | ~80k | 1× `SignatureChecker` (v2 typehash) + dispute state init + initial bond transfer; per-round bisection cost ~50k each (~20 rounds for a 1 GiB blob); terminal-round reveal+resolve ~3–4M (one BLAKE3 chunk hash + N bao parent hashes + keccak MMR inclusion proof). Spread across ~22 transactions over up to ~12.5 days. |
 | `counterChallenge` (rate) | ~40k–55k | 1× `SignatureChecker` (3k EOA / ~15k Safe) + timestamp range check + rate match + storage update |
 | `counterChallenge` (corruption) | ~40k | Evidence verification + storage update |
 | `resolveChallenge` | ~85k | `StakingRegistry.slash()` + bond transfer + state cleanup + `Slashed` emit on slash outcome |
@@ -379,3 +422,4 @@ Using secp256k1 EIP-712 for `slash_sig` keeps per-signature verification at ~3k 
 - **[ADR 011](011-content-takedown.md):** Ed25519-library assumption for slash evidence → updated to `ecrecover`-based `slash_sig` scheme (this ADR). The blacklist-removal restitution path ([ADR 011 § Slashing](011-content-takedown.md#slashing)) also references the `slashId` from the `Slashed` event (this ADR §3) to pin the original blacklist-violation slash being appealed via [ADR 028](028-slashing-appeals.md).
 - **[ADR 027](027-distinct-client-receipts.md):** Extends the keccak256 Merkle-batch pattern from §2 to anchor `DeliveryReceipt` batches per operator per epoch; reuses the `Bond Handling` model for receipt-fraud challenges.
 - **[ADR 028](028-slashing-appeals.md):** Consumes `slashId` from the `Slashed` event (this ADR §3) as the appeal-pinning identifier in `openSlashAppeal(slashId, evidenceBundleHash)`. Without `Slashed` emission for the three immediate-execution offenses, three of the four ADR 028 appeal categories cannot be filed.
+- **[ADR 030](030-blake3-merkle-verification.md):** Replaces this ADR's §2 "Future evolution" stub with the production design. Adds the v2 entry points (`submitMerkleCorruptionChallenge` + bisection-step interface) under the unified `OffenseType.Corruption`. Raises the default `unbondingPeriod` from 7 d to 14 d to cover the worst-case bisection lifecycle; the §3 "Interaction with unbonding period" invariant continues to hold under the new default.

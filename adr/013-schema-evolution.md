@@ -329,9 +329,12 @@ Signatures are computed over a specific byte sequence produced by postcard seria
 | Message | Signed fields | Unsigned fields (evolvable via Tier 1) |
 | --- | --- | --- |
 | `ProbeResponse` | `hash`, `has_blob`, `rate_per_mb`, `timestamp_us` | `total_bytes` |
-| `StreamResponse` | `hash`, `ok`, `rate_per_mb`, `total_bytes`, `channel_id`, `timestamp_us`, `redirect` | `error`, `voucher_interval_mb` |
+| `StreamResponse` (v1, `cdn/client/v1`) | `hash`, `ok`, `rate_per_mb`, `total_bytes`, `channel_id`, `timestamp_us`, `redirect` | `error`, `voucher_interval_mb` |
+| `StreamResponse` (v2, `cdn/client/v2`) | `hash`, `ok`, `rate_per_mb`, `total_bytes`, `channel_id`, `timestamp_us`, `redirect`, **`merkle_root`** | `error`, `voucher_interval_mb` |
 | `NodeAnnounce` | `node_id`, `region`, `load`, `timestamp_us` | *(none currently — see implementation note)* |
 | `ReputationReport` | `provider`, `reporter`, `metrics`, `timestamp` | *(none currently)* |
+
+The v2 row is the Tier 3 ALPN bump triggered by [ADR 030](030-blake3-merkle-verification.md): adding `merkle_root` to the signed-field set required a major version bump (per the freezing rule above), so `cdn/client/v2` is the new ALPN string. v1 and v2 coexist via QUIC ALPN negotiation (see [ALPN Version Negotiation](#alpn-version-negotiation)) — old peers continue using v1 indefinitely.
 
 #### Implementation note — separating signed and unsigned fields
 

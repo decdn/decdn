@@ -151,7 +151,7 @@ This means the network self-balances: popular content gets replicated because ca
 - Clients must hold USDC and native L2 tokens for gas to use the network; this adds an onboarding step compared to a single-token model. At the recommended 10 USDC practical minimum, channel lifecycle gas ($0.23) is 2.3% overhead — acceptable but non-negligible for first-time users. Gasless channel opens via meta-transactions or account abstraction can eliminate the native token requirement post-PoC (see [Deposit Economics](#deposit-economics))
 - Rate volatility: a node can change its advertised rate between a probe and a stream request; the `StreamResponse` rate is the binding one, but a client that probed at one rate and receives a higher rate in `StreamResponse` must disconnect and re-probe rather than having been deceived silently. Rate changes more than 30 seconds after the probe are not slashable; the 30-second window is precisely defined as `stream_response.timestamp_us >= probe_response.timestamp_us && stream_response.timestamp_us - probe_response.timestamp_us < 30_000_000` using requester-anchored timestamps in both signed messages (see ADR 005)
 - USDC is issued by Circle, which can freeze specific addresses or blacklist the contract. For the PoC this risk is accepted; multi-token payment support to mitigate it is deferred to [ADR 010](010-multi-token.md)
-- BLAKE3 verification on EVM requires an intermediate scheme for slash evidence — [ADR 014](014-on-chain-verification.md) specifies the optimistic challenge-response for PoC and keccak256 Merkle proof for production
+- BLAKE3 verification on EVM requires an intermediate scheme for slash evidence — [ADR 014 §2](014-on-chain-verification.md#2-blake3-content-corruption--optimistic-challenge-response) specifies the optimistic challenge-response for `cdn/client/v1` and [ADR 030](030-blake3-merkle-verification.md) specifies the keccak256 Merkle bisection protocol for `cdn/client/v2`
 
 ## Attack Vectors
 
@@ -219,7 +219,7 @@ Fully solved by the self-enforcing protocol. The node cannot extract more paymen
 
 Node serves bytes that don't match the advertised BLAKE3 hash.
 
-Caught at the client by BLAKE3 verification. The on-chain slash-evidence path is in [ADR 014 § 2](014-on-chain-verification.md#2-blake3-content-corruption--optimistic-challenge-response): single-round optimistic challenge-response for PoC (signed `StreamResponse` + 100 TOKEN bond, 24h counter window), upgraded to an interactive keccak256 Merkle proof over 1024-byte chunks for production.
+Caught at the client by BLAKE3 verification. The on-chain slash-evidence path is in [ADR 014 § 2](014-on-chain-verification.md#2-blake3-content-corruption--optimistic-challenge-response) for `cdn/client/v1` deliveries (single-round optimistic challenge-response: signed `StreamResponse` + 100 TOKEN bond, 24h counter window) and [ADR 030](030-blake3-merkle-verification.md) for `cdn/client/v2` deliveries (interactive keccak256 Merkle bisection over 1024-byte chunks; cryptographically dispositive, no counter window).
 
 #### Rate bait-and-switch
 
