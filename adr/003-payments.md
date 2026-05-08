@@ -219,7 +219,9 @@ Fully solved by the self-enforcing protocol. The node cannot extract more paymen
 
 Node serves bytes that don't match the advertised BLAKE3 hash.
 
-Caught at the client by BLAKE3 verification. The on-chain slash-evidence path is in [ADR 014 § 2](014-on-chain-verification.md#2-blake3-content-corruption--optimistic-challenge-response): single-round optimistic challenge-response for PoC (signed `StreamResponse` + 100 TOKEN bond, 24h counter window), upgraded to an interactive keccak256 Merkle proof over 1024-byte chunks for production.
+Fully absorbed at the wire by progressive BLAKE3 verification at the client (mandatory in `cdn/client/v1` per [ADR 002](002-content-addressing.md) and [ADR 005](005-protocol.md)). Vouchers are signed and sent only after the corresponding chunks have been verified — a corrupt window therefore yields no voucher. The client drops the connection, requests the blob from a different node, and recovers any unspent channel funds via channel-close. **Client monetary loss in the corruption case is zero**; the only cost is downstream bandwidth (sunk regardless of outcome).
+
+No on-chain slash machinery is needed for content corruption. The threat is bounded in framing parallel to [§Voucher withholding](#voucher-withholding) above: per-encounter wasted bandwidth is capped at one `voucher_interval` on each side (the client's downstream cost for a corrupt window; the node's upstream cost when a correctly-withheld voucher leaves the window unpaid). Both sides set local acceptance policies — nodes refuse continued service to keys with elevated voucher-withhold rates and may cap total bytes for keys without established history; clients prefer nodes whose probe and delivery history they trust — without protocol-level coordination. Client reputation is a node-local concern; this ADR does not specify a wire format or on-chain surface for it.
 
 #### Rate bait-and-switch
 
