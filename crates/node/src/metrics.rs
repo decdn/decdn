@@ -379,6 +379,10 @@ mod tests {
         for name in [
             "decdn_cache_origin_fetches_total",
             "decdn_cache_origin_retry_exhausted_total",
+            "decdn_cache_hits_total",
+            "decdn_cache_misses_total",
+            "decdn_cache_bytes_returned_total",
+            "decdn_cache_pull_through_bytes_total",
         ] {
             assert!(
                 text.contains(&format!("{name} 0")),
@@ -397,14 +401,23 @@ mod tests {
         let handle = metrics.cache_metrics();
         handle.origin_fetches.inc();
         handle.origin_retry_exhausted.inc();
+        handle.hits.inc();
+        handle.misses.inc();
+        handle.bytes_returned.inc_by(1024);
+        handle.pull_through_bytes.inc_by(2048);
         let text = metrics.encode().unwrap();
-        assert!(
-            text.contains("decdn_cache_origin_fetches_total 1"),
-            "fetches counter not visible in scrape:\n{text}"
-        );
-        assert!(
-            text.contains("decdn_cache_origin_retry_exhausted_total 1"),
-            "exhausted counter not visible in scrape:\n{text}"
-        );
+        for (name, expected) in [
+            ("decdn_cache_origin_fetches_total", 1u64),
+            ("decdn_cache_origin_retry_exhausted_total", 1),
+            ("decdn_cache_hits_total", 1),
+            ("decdn_cache_misses_total", 1),
+            ("decdn_cache_bytes_returned_total", 1024),
+            ("decdn_cache_pull_through_bytes_total", 2048),
+        ] {
+            assert!(
+                text.contains(&format!("{name} {expected}")),
+                "counter {name} should report {expected}:\n{text}"
+            );
+        }
     }
 }
