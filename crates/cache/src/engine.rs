@@ -765,9 +765,9 @@ impl CacheEngine {
                     if self.has(hash).await? {
                         let bytes = self.read_local(hash).await?;
                         // Waiter found the blob after the owner inserted it:
-                        // semantically a hit (the cache served us). The
-                        // post-loop block bumps bytes_returned for both
-                        // hit and miss exits, so only `hits` is bumped here.
+                        // semantically a hit. `bytes_returned` is bumped
+                        // once after the loop for both arms; bump only
+                        // `hits` here.
                         if let Some(m) = &self.inner.metrics {
                             m.hits.inc();
                         }
@@ -910,10 +910,11 @@ impl CacheEngine {
     const BLOCKING_HASH_THRESHOLD: usize = 1 << 20; // 1 MiB
 
     async fn pull_through(&self, hash: Hash) -> CacheResult<Bytes> {
-        // Every pull_through entry is a `get()` cache miss: this fires
-        // for `NoOrigin`, origin `NotFound`, hash-mismatch, and the success
-        // path. Owner waiters that retry and find a fresh hit do not
-        // call `pull_through`, so they never reach this bump.
+        // Every pull_through entry is a `get()` cache miss, regardless
+        // of how the pull resolves. Coalesced waiters that find a hit
+        // on retry never call `pull_through`, so they never reach this
+        // bump (their `hits` increment lives in the waiter branch of
+        // `get`).
         if let Some(m) = &self.inner.metrics {
             m.misses.inc();
         }
@@ -948,10 +949,11 @@ impl CacheEngine {
             OriginFetch::Found(b) => b,
         };
 
-        // Origin egress is paid the moment bytes arrive — count even if
-        // the bytes are about to be rejected by BLAKE3 verification or
-        // the size cap. Operators reasoning about origin spend need
-        // every fetched byte counted, not only the ones that landed.
+        // Origin egress is paid the moment bytes arrive — count before
+        // BLAKE3 verification or the in-engine size-cap re-check, so a
+        // misbehaving origin returning bad bytes still shows up as
+        // egress spend (operators reasoning about origin cost need
+        // every fetched byte counted, not only the ones that landed).
         if let Some(m) = &self.inner.metrics {
             m.pull_through_bytes
                 .inc_by(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
@@ -1235,8 +1237,16 @@ mod tests {
             std::time::Duration::from_millis(50),
         ));
 
-        let engine =
-            CacheEngine::open(tmp.path(), Some(origin.clone() as Arc<dyn Origin>), 10).await?;
+        let cm = Arc::new(CacheMetrics::default());
+        let engine = CacheEngine::open_full(
+            tmp.path(),
+            Some(origin.clone() as Arc<dyn Origin>),
+            10,
+            crate::PinnedHashes::empty(),
+            crate::RetryPolicy::default(),
+            Some(Arc::clone(&cm)),
+        )
+        .await?;
 
         // Spawn several concurrent gets for the same hash.
         let mut handles = Vec::new();
@@ -1256,6 +1266,30 @@ mod tests {
         // The origin should have been called at most once (coalesced).
         let count = origin.fetch_count.load(Ordering::SeqCst);
         anyhow::ensure!(count == 1, "expected exactly 1 origin fetch, got {count}");
+
+        // Counter accounting under coalescing (#418): exactly one task
+        // becomes the owner and counts as a miss; the other four are
+        // waiter-retry hits. A regression that moved the waiter-hit
+        // bump out of `engine.rs::get`'s waiter branch would silently
+        // mis-classify every coalesced workload as a miss-storm.
+        anyhow::ensure!(
+            cm.misses.get() == 1,
+            "owner pulls once → exactly 1 miss, got {}",
+            cm.misses.get()
+        );
+        anyhow::ensure!(
+            cm.hits.get() == 4,
+            "4 waiters retry into a hit, got {} hits",
+            cm.hits.get()
+        );
+        anyhow::ensure!(
+            cm.pull_through_bytes.get() == payload.len() as u64,
+            "single origin fetch → pull_through_bytes == payload.len()"
+        );
+        anyhow::ensure!(
+            cm.bytes_returned.get() == (payload.len() as u64) * 5,
+            "all 5 callers got the bytes back, so bytes_returned == 5 * payload.len()"
+        );
         Ok(())
     }
 
@@ -1792,7 +1826,17 @@ mod tests {
         anyhow::ensure!(cm.misses.get() == 3, "misses = {}", cm.misses.get());
         anyhow::ensure!(
             cm.hits.get() + cm.misses.get() == 5,
-            "every get must bump exactly one of hits/misses"
+            "across cache-domain outcomes (no store-I/O errors), every get bumps exactly one of hits/misses"
+        );
+        // Only the priming Found bumped pull_through_bytes; the unknown
+        // get took the origin-NotFound branch which returns before the
+        // bump. Pin both, so a stray bump in either error path fails
+        // the test.
+        anyhow::ensure!(
+            cm.pull_through_bytes.get() == payload.len() as u64,
+            "pull_through_bytes = {}, expected {}",
+            cm.pull_through_bytes.get(),
+            payload.len()
         );
         Ok(())
     }

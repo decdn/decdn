@@ -1,15 +1,25 @@
-//! Cache-engine `OpenMetrics` counters (#285).
+//! Cache-engine `OpenMetrics` counters.
 //!
-//! Two counters, both monotonic. Operators alert on the *rate* of
-//! `origin_retry_exhausted_total / origin_fetches_total` to catch
-//! sustained origin failures the retry budget couldn't save.
+//! Six counters, all monotonic, exposed under the `decdn_cache_*`
+//! family per ADR `appendix-observability`. Operators reason about
+//! cache health from three ratios:
 //!
-//! - `origin_fetches_total` — every pull-through call (success or fail).
-//!   Bumped once per cache-miss origin pull from [`crate::CacheEngine`].
-//! - `origin_retry_exhausted_total` — per-fetch terminal exhaustion of
-//!   the retry budget. Only bumped when at least one retry actually
-//!   fired; a single failure under `max_retries = 0` is just a failure,
-//!   not an exhausted budget.
+//! - **Hit rate** — `hits / (hits + misses)`.
+//! - **Origin egress amplification** — `pull_through_bytes / bytes_returned`.
+//!   Equal to 1.0 when the cache is acting as pure pass-through; trends
+//!   toward 0 as cached content gets re-served.
+//! - **Origin retry health** — `origin_retry_exhausted / origin_fetches`.
+//!   Sustained nonzero rate = user-visible origin failures the retry
+//!   budget couldn't save (#285).
+//!
+//! Hit/miss accounting (#418): on `Ok` and on the cache-domain error
+//! returns (`NoOrigin`, evicted `NotFound`, origin `NotFound`,
+//! `HashMismatch`, `BlobTooLarge`, `OriginError`), `CacheEngine::get`
+//! bumps exactly one of `hits` or `misses`. Store I/O errors
+//! (`CacheError::Store`) are infrastructure failures distinct from
+//! cache outcomes — they surface via `tracing::error!` and propagate
+//! without bumping either counter, so a degraded local store does not
+//! pollute hit-rate dashboards.
 //!
 //! The cache crate owns this group rather than re-exporting node-side
 //! state so the cache stays self-describing. Node wires `Arc<CacheMetrics>`
@@ -36,23 +46,25 @@ pub struct CacheMetrics {
     pub origin_retry_exhausted: Counter,
     /// `get()` calls served from the local store (#418). Includes both
     /// first-attempt hits and waiter retries that find the blob present
-    /// after a peer pull-through completes.
+    /// after a coalesced peer pull-through completes. Paired with
+    /// `misses`; see the module-level doc for the hits-XOR-misses
+    /// contract and the store-error carve-out.
     pub hits: Counter,
     /// `get()` calls that did not find the blob locally (#418). Bumped
-    /// on every pull-through attempt (success, `NoOrigin`, origin
-    /// `NotFound`, hash mismatch, `BlobTooLarge`, transport failure) and
-    /// once for every operator-evicted (#279) `NotFound` return. Every
-    /// call to `get()` increments exactly one of `hits` or `misses`.
+    /// once on every operator-evicted `NotFound` return and once on
+    /// every pull-through entry — the latter covers all pull-through
+    /// outcomes (`Ok`, no-origin, origin `NotFound`, hash mismatch,
+    /// size cap, transport failure) without enumerating each error
+    /// variant by name. See the module-level doc for the contract with
+    /// `hits`.
     pub misses: Counter,
     /// Total bytes returned to the caller of `get()` on success (#418).
-    /// Counts both cache-hit and pull-through-success paths. Useful as
-    /// the numerator for "cache-served bytes per second" panels.
+    /// Counts both cache-hit and pull-through-success paths.
     pub bytes_returned: Counter,
     /// Bytes fetched from origin during pull-through (#418). Counted
-    /// whenever the origin returns `OriginFetch::Found(b)`, regardless
-    /// of whether the bytes pass BLAKE3 verification or land in the
-    /// store — the egress is paid either way. Distinguishes
-    /// 'serving from cache' vs. 'paying origin egress' when paired
-    /// with `bytes_returned`.
+    /// the moment bytes are received from origin, regardless of whether
+    /// they pass BLAKE3 verification or land in the store — origin
+    /// egress is paid either way. Distinguishes 'serving from cache'
+    /// vs. 'paying origin egress' when paired with `bytes_returned`.
     pub pull_through_bytes: Counter,
 }

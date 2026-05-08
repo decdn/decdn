@@ -369,6 +369,16 @@ impl Drop for ConnectionGuard<'_> {
 mod tests {
     use super::*;
 
+    /// Match an exact `<name> <value>` metric line, anchored against
+    /// surrounding lines so `decdn_cache_hits_total 1` doesn't
+    /// accidentally substring-match into a future
+    /// `decdn_cache_hits_total_foo` series or the `OpenMetrics`
+    /// `_created` companion line.
+    fn has_metric_line(text: &str, name: &str, value: u64) -> bool {
+        let needle = format!("{name} {value}");
+        text.lines().any(|l| l == needle)
+    }
+
     #[test]
     fn cache_metrics_counters_start_at_zero() {
         // Pinning down the OpenMetrics shape — a fresh registry must
@@ -385,7 +395,7 @@ mod tests {
             "decdn_cache_pull_through_bytes_total",
         ] {
             assert!(
-                text.contains(&format!("{name} 0")),
+                has_metric_line(&text, name, 0),
                 "counter {name} should be exposed at zero on a fresh registry:\n{text}"
             );
         }
@@ -469,7 +479,7 @@ mod tests {
             ("decdn_cache_bytes_returned_total", payload_len * 2),
         ] {
             assert!(
-                text.contains(&format!("{name} {expected}")),
+                has_metric_line(&text, name, expected),
                 "counter {name} should report {expected} after 1 miss + 1 hit:\n{text}"
             );
         }
@@ -499,7 +509,7 @@ mod tests {
             ("decdn_cache_pull_through_bytes_total", 2048),
         ] {
             assert!(
-                text.contains(&format!("{name} {expected}")),
+                has_metric_line(&text, name, expected),
                 "counter {name} should report {expected}:\n{text}"
             );
         }
