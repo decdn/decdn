@@ -109,6 +109,9 @@ impl ProbeHandler {
         };
         let _guard = self.metrics.connection_guard();
 
+        // ADR 005 caps probe at 1 bidi stream per connection; the transport-level
+        // cap is the union across ALPNs, so probe's tighter bound is enforced
+        // here by accepting exactly one stream and then closing.
         let (mut send, mut recv) = tokio::time::timeout(ACCEPT_BI_TIMEOUT, conn.accept_bi())
             .await
             .map_err(|_| anyhow::anyhow!("accept_bi timed out after {ACCEPT_BI_TIMEOUT:?}"))?

@@ -20,7 +20,8 @@ use decdn_protocol::{
     read_frame, write_frame,
 };
 use iroh::endpoint::{
-    ApplicationClose, Connection, ConnectionError, ReadError, ReadToEndError, VarInt, presets,
+    ApplicationClose, Connection, ConnectionError, IdleTimeout, QuicTransportConfig, ReadError,
+    ReadToEndError, VarInt, presets,
 };
 use iroh::protocol::ProtocolHandler;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
@@ -481,6 +482,111 @@ async fn probe_rate_limit_returns_rate_limited_close_code() -> anyhow::Result<()
 
     client_ep.close().await;
     let _ = accept_loop.await;
+    server_ep.close().await;
+    Ok(())
+}
+
+/// Verify that `QuicTransportConfig::max_idle_timeout` actually closes a
+/// silent connection (the wiring `production_transport_config` relies on).
+/// The production value is 30s per ADR 005; we shorten it to 300ms here
+/// so the test runs in well under a second. `keep_alive_interval` is
+/// parked at 60s on both ends so the path stays silent across the idle
+/// window — otherwise the keep-alive PINGs the runtime sends in
+/// production would refresh the timer and the test could never observe
+/// the close.
+#[tokio::test(flavor = "multi_thread")]
+async fn idle_timeout_closes_quiet_connection() -> anyhow::Result<()> {
+    let idle = Duration::from_millis(300);
+    let build_cfg = || -> anyhow::Result<QuicTransportConfig> {
+        let it: IdleTimeout = idle
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("idle timeout: {e}"))?;
+        Ok(QuicTransportConfig::builder()
+            .max_idle_timeout(Some(it))
+            .keep_alive_interval(Duration::from_mins(1))
+            .max_concurrent_bidi_streams(VarInt::from_u32(100))
+            .build())
+    };
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_bind = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
+    let server_ep = Endpoint::builder(presets::Minimal)
+        .secret_key(server_sk)
+        .transport_config(build_cfg()?)
+        .alpns(vec![ALPN_PROBE.to_vec()])
+        .relay_mode(RelayMode::Disabled)
+        .bind_addr(server_bind)
+        .map_err(|e| anyhow::anyhow!("server bind_addr: {e}"))?
+        .bind()
+        .await
+        .map_err(|e| anyhow::anyhow!("server bind: {e}"))?;
+    let server_addr = server_ep
+        .bound_sockets()
+        .into_iter()
+        .find(SocketAddr::is_ipv4)
+        .ok_or_else(|| anyhow::anyhow!("no IPv4 bound socket"))?;
+    let server_addr = match server_addr {
+        SocketAddr::V4(v4) if v4.ip().is_unspecified() => {
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, v4.port()))
+        }
+        other => other,
+    };
+
+    // Server task: accept the connection but don't drive any application
+    // handler. We're testing transport-level idle close, not protocol
+    // behaviour — the only thing that should close the connection is the
+    // idle timer.
+    let server_ep_bg = server_ep.clone();
+    let accept_task = tokio::spawn(async move {
+        if let Some(incoming) = server_ep_bg.accept().await {
+            let connecting = incoming
+                .accept()
+                .map_err(|e| anyhow::anyhow!("accept: {e}"))?;
+            let conn = connecting
+                .await
+                .map_err(|e| anyhow::anyhow!("handshake: {e}"))?;
+            let _ = conn.closed().await;
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+
+    let client_bind = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
+    let client_ep = Endpoint::builder(presets::Minimal)
+        .secret_key(fresh_key())
+        .transport_config(build_cfg()?)
+        .relay_mode(RelayMode::Disabled)
+        .bind_addr(client_bind)
+        .map_err(|e| anyhow::anyhow!("client bind_addr: {e}"))?
+        .bind()
+        .await
+        .map_err(|e| anyhow::anyhow!("client bind: {e}"))?;
+
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    let client_conn = client_ep
+        .connect(target, ALPN_PROBE)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+
+    // Wait for the idle timer to fire. The bound is generous compared to
+    // `idle` so a slow CI doesn't flake the test, but tight enough that a
+    // wiring regression (no `transport_config(...)` call, default 30s
+    // timeout) fails fast instead of stalling for the full default.
+    let close_err = tokio::time::timeout(Duration::from_secs(3), client_conn.closed())
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("connection did not idle-close within 3s (idle window: {idle:?})")
+        })?;
+
+    match close_err {
+        ConnectionError::TimedOut => {}
+        other => anyhow::bail!("expected ConnectionError::TimedOut, got {other:?}"),
+    }
+
+    client_ep.close().await;
+    accept_task
+        .await
+        .map_err(|e| anyhow::anyhow!("accept task join: {e}"))??;
     server_ep.close().await;
     Ok(())
 }

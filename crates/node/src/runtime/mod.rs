@@ -15,7 +15,7 @@ use decdn_cache::{
     CacheEngine, FilesystemOrigin, HttpOrigin, Origin, S3Credentials, S3Origin, S3OriginConfig,
 };
 use decdn_common::config::{ResolvedOrigin, ResolvedS3Credentials};
-use iroh::endpoint::presets;
+use iroh::endpoint::{IdleTimeout, QuicTransportConfig, VarInt, presets};
 use iroh::protocol::Router;
 use iroh::{Endpoint, SecretKey};
 use iroh_gossip::ALPN as GOSSIP_ALPN;
@@ -51,6 +51,56 @@ const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(15);
 /// realistic bucket refill window, so the sweep is essentially free
 /// when the keyspace is empty.
 const DISPATCH_GC_INTERVAL: Duration = Duration::from_mins(1);
+
+/// QUIC-level idle timeout: the transport closes a connection if no
+/// packets arrive for this long. Set to match ADR 005's 30s
+/// connection-lifetime ceiling.
+///
+/// Because [`QUIC_KEEP_ALIVE_INTERVAL`] (10s) is shorter than this
+/// timeout, healthy peers keep refreshing it via PING ACKs and the QUIC
+/// idle reaper rarely fires on its own — that is the spec's intent (see
+/// ADR 005: "below the idle timeout to prevent NAT middleboxes from
+/// dropping the mapping"). The QUIC timer is a defense-in-depth floor
+/// for genuinely silent paths (e.g. peer crash / network partition); the
+/// "close 30s after last stream and no unacked vouchers" rule is
+/// application-layer and lives in the cdn/client/v1 handler (not yet
+/// implemented).
+const QUIC_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Interval between QUIC PING keep-alive frames. Per ADR 005 §Connection
+/// lifecycle, endpoints SHOULD send PINGs at 10s intervals — strictly
+/// less than [`QUIC_MAX_IDLE_TIMEOUT`] so a single dropped probe doesn't
+/// trip the idle reaper, and well below the typical NAT mapping timeout
+/// so middleboxes don't drop the path under quiet load. Quinn applies
+/// this on every connection regardless of role, so this endpoint emits
+/// keep-alives on both client- and server-initiated connections.
+const QUIC_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Maximum number of concurrent bidirectional streams a peer may open on
+/// a single connection. Sized for `cdn/client/v1` (the largest cap in
+/// ADR 005 §Concurrent stream limits: client=100, probe=1, dht=1).
+/// `QuicTransportConfig` is per-endpoint, not per-ALPN, so the QUIC
+/// layer can only enforce the union of these caps; tighter per-ALPN
+/// limits are enforced inside each handler. The probe handler already
+/// does this implicitly by calling `accept_bi()` exactly once per
+/// connection and then closing.
+const QUIC_MAX_CONCURRENT_BIDI_STREAMS: u32 = 100;
+
+/// Production [`QuicTransportConfig`]. Tests build their own config via
+/// the same builder when they need to shorten the idle timeout to keep
+/// the test runtime under a second.
+fn production_transport_config() -> anyhow::Result<QuicTransportConfig> {
+    let idle_timeout: IdleTimeout = QUIC_MAX_IDLE_TIMEOUT.try_into().map_err(|e| {
+        anyhow::anyhow!(
+            "BUG: QUIC_MAX_IDLE_TIMEOUT={QUIC_MAX_IDLE_TIMEOUT:?} not representable as IdleTimeout: {e}"
+        )
+    })?;
+    Ok(QuicTransportConfig::builder()
+        .max_idle_timeout(Some(idle_timeout))
+        .keep_alive_interval(QUIC_KEEP_ALIVE_INTERVAL)
+        .max_concurrent_bidi_streams(VarInt::from_u32(QUIC_MAX_CONCURRENT_BIDI_STREAMS))
+        .build())
+}
 
 /// Body of the periodic dispatch-limiter GC task (#440). Extracted from
 /// the spawn site so the shutdown-promptness contract can be tested
@@ -164,7 +214,9 @@ pub async fn run(
         "cache engine ready",
     );
 
-    let ep = build_endpoint(&secret_key, cfg.network.bind_port)
+    let transport_config =
+        production_transport_config().context("failed to build QUIC transport config")?;
+    let ep = build_endpoint(&secret_key, cfg.network.bind_port, transport_config)
         .await
         .context("failed to build iroh endpoint")?;
 
@@ -527,10 +579,15 @@ pub async fn run(
 /// `Endpoint::builder().bind_addr(...).bind()` owns its UDP socket
 /// internally — there is nothing to hand off. Single-bind matches the
 /// existing TCP listeners.
-async fn build_endpoint(secret_key: &SecretKey, bind_port: u16) -> anyhow::Result<Endpoint> {
+async fn build_endpoint(
+    secret_key: &SecretKey,
+    bind_port: u16,
+    transport_config: QuicTransportConfig,
+) -> anyhow::Result<Endpoint> {
     let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, bind_port);
     Endpoint::builder(presets::N0)
         .secret_key(secret_key.clone())
+        .transport_config(transport_config)
         .bind_addr(bind_addr)
         .map_err(|e| anyhow::anyhow!("invalid bind addr {bind_addr}: {e}"))?
         .bind()
@@ -1388,5 +1445,19 @@ mod tests {
             .await
             .expect("ShutdownStreams::recv did not resolve within 500ms of SIGTERM");
         assert!(matches!(signal, ShutdownSignal::Sigterm));
+    }
+
+    /// Guard test for ADR 005 transport defaults. Catches accidental edits to
+    /// the constants and verifies `production_transport_config()` builds
+    /// without error — the integration test in `tests/probe_loopback.rs`
+    /// rebuilds the config on its own to shorten the idle window, so without
+    /// this assertion a regression that changes the production constants (or
+    /// removes the helper's call site) would not be caught.
+    #[test]
+    fn adr_005_transport_defaults() {
+        assert_eq!(QUIC_MAX_IDLE_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(QUIC_KEEP_ALIVE_INTERVAL, Duration::from_secs(10));
+        assert_eq!(QUIC_MAX_CONCURRENT_BIDI_STREAMS, 100);
+        production_transport_config().expect("production_transport_config builds");
     }
 }
