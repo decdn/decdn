@@ -161,7 +161,7 @@ pub trait FeeRouterClient: Send + Sync {
 | | PoC | Production |
 |---|-----|------------|
 | Implementation | `NoopFeeRouterClient` — in-process no-op (or local accounting) router; settlement skips the on-chain split | `OnchainFeeRouterClient` — deployed `FeeRouter` contract address per network (configured) |
-| Settlement path | `PaymentChannel.settleChannel` pays operator the full balance; downstream buckets simulated for tests | `PaymentChannel.settleChannel` calls `FeeRouter.routeSettlement(operator, client, bytesDelivered, amount, epochId)` in the same transaction |
+| Settlement path | `PaymentChannel.settleChannel` pays operator the full balance; downstream buckets simulated for tests | `PaymentChannel.settleChannel` calls `FeeRouter.routeSettlement(operator, bytesDelivered, amount, epochId)` in the same transaction |
 | Per-network config | N/A | Address sourced from chain-id-keyed config; sum-to-100% safety bounds enforced on chain |
 
 ### 7. `VotingEscrowReader` — `crates/incentive`
