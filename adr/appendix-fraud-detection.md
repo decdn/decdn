@@ -10,7 +10,7 @@ The protocol has one on-chain surface where one party can publish a falsified va
 
 `disputeChannel` is permissionless from the protocol's side: any address holding a higher-nonce voucher signed by the same channel funder can submit it. This appendix describes the operational role of running such monitoring as a third party.
 
-Note: distinct-client diversity gating ([ADR 027](027-distinct-client-receipts.md)) is enforced inline in `FeeRouter.routeSettlement` from settled-voucher state. There is no operator-asserted summary, no fraud-challenge mechanism, and therefore no monitoring role for diversity gating — the contract computes the count directly. The wash-trading defense is the [ADR 026 §3 per-operator gauge-share cap](026-gauge-boost-tokenomics.md#per-operator-gauge-share-cap), also enforced by the contract without external attestation.
+Note: the wash-trading defense is the [ADR 026 §3 per-operator gauge-share cap](026-gauge-boost-tokenomics.md#per-operator-gauge-share-cap), enforced by the contract without external attestation. There is no operator-asserted gauge summary, no fraud-challenge mechanism, and therefore no monitoring role for gauge-share — the cap binds in the formula directly. Off-chain reputation observation (ADR 008 §12) and operator-cluster detection are the soft layer that informs governance cap-tuning if persistent wash-trading patterns surface.
 
 ## Role
 
@@ -58,5 +58,5 @@ A protocol decision establishes a participant role with a defined wire interface
 
 - [ADR 003 — Payments](003-payments.md) — `closeChannel` / `disputeChannel` flow, dispute window, local-monitor Option C, forced-inclusion deadline extension
 - [ADR 014 — On-chain Verification](014-on-chain-verification.md) — `SlashJudge` challenge-bond mechanism (Bond Handling) for the three signature-dependent offenses
-- [ADR 027 — Distinct-Client Diversity Gating](027-distinct-client-receipts.md) — diversity gating computed inline by `FeeRouter`; no external attestation surface
+- [ADR 026 §3 Per-operator gauge-share cap](026-gauge-boost-tokenomics.md#per-operator-gauge-share-cap) — wash-trading defense; contract-enforced, no external attestation surface
 - [Appendix: L2 Deployment](appendix-l2-deployment.md) — gas-cost context for detector economics

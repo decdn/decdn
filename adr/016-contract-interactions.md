@@ -45,7 +45,6 @@ classDiagram
     }
     class FeeRouter {
         +routeSettlement(op, bytes, amount, epochId)
-        +distinctClientCount(op, epoch)
         +bytesPerEpoch(op, epoch)
         +claimBoost(epochs)
         +claimDelegator(epochs)
@@ -100,7 +99,7 @@ The full FeeRouter six-bucket split (40/40/7/5/5/3) is the steady-state target s
 
 #### Tunable Economics
 
-The full six-bucket structure ships from day one, but every bucket share and every dependency address is governance-mutable. This lets the network launch with a simplified split — a typical default is `80% operator / 0% gauge / 0% delegator / 10% buyback / 10% treasury / 0% safety` — and dial up the gauge / delegator / safety legs as `VotingEscrow`, `SafetyReserve`, and `DelegatorBuyer` are deployed and as the dependent ADRs ([026](026-gauge-boost-tokenomics.md), [027](027-distinct-client-receipts.md), [028](028-slashing-appeals.md)) settle into operational defaults.
+The full six-bucket structure ships from day one, but every bucket share and every dependency address is governance-mutable. This lets the network launch with a simplified split — a typical default is `80% operator / 0% gauge / 0% delegator / 10% buyback / 10% treasury / 0% safety` — and dial up the gauge / delegator / safety legs as `VotingEscrow`, `SafetyReserve`, and `DelegatorBuyer` are deployed and as the dependent ADRs ([026](026-gauge-boost-tokenomics.md), [028](028-slashing-appeals.md)) settle into operational defaults.
 
 The pattern has three knobs, all under `GOVERNANCE_ROLE` (i.e. the `TimelockController`):
 
@@ -128,17 +127,15 @@ interface IFeeRouter {
     // via `SETTLEMENT_REPORTER_ROLE`. Reverts if paused.
     function routeSettlement(
         address operator,
-        address client,             // channel.client — funder identity for diversity counting
         uint256 bytesDelivered,
         uint256 amount,
-        uint64  epochId             // voucher.epochId per ADR 003 / ADR 027 §2
+        uint64  epochId             // voucher.epochId per ADR 003
     ) external;
 
-    // ─── Distinct-client diversity gating (per ADR 027) ───────────────
-    // Populated inline by routeSettlement. No operator-asserted summary
-    // and no fraud-challenge mechanism — diversity is computed directly
-    // from settled-voucher state.
-    function distinctClientCount(address operator, uint64 epoch) external view returns (uint256);
+    // ─── Per-operator gauge bytes tracking ────────────────────────────
+    // Populated inline by routeSettlement. Read by gauge claim per
+    // ADR 026 §3 to feed bytes_i; the per-operator gauge-share cap
+    // (also in ADR 026 §3) is the binding wash-trading defense.
     function bytesPerEpoch(address operator, uint64 epoch) external view returns (uint256);
 
     // ─── Claim flows ──────────────────────────────────────────────────
@@ -250,11 +247,10 @@ interface IFeeRouter {
     // ─── Events ───────────────────────────────────────────────────────
     event Settled(
         address indexed operator,
-        address indexed client,
+        address indexed client,        // channel.client — for off-chain analytics / reputation
         uint256 bytesDelivered,
         uint256 amount,
-        uint64 indexed epochId,
-        bool firstSeenClient        // true if this client increments distinctClientCount
+        uint64 indexed epochId
     );
     event BoostClaimed(address indexed operator, uint64 indexed epochId, uint256 amount);
     event DelegatorClaimed(address indexed account, uint64 indexed epochId, uint256 amount);
@@ -275,7 +271,7 @@ interface IFeeRouter {
 
 - **Epoch length and claim window** are immutable contract parameters set in the constructor (1 week and 26 epochs respectively per [ADR 026 §2](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553)). Changing them post-deploy would shift the meaning of every `epoch` index in storage; if a future ADR motivates a change, it ships as a fresh `FeeRouter` deployment with state migration, per [§ No proxy deployment patterns](#no-proxy-deployment-patterns).
 - **`workingBytes(operator, epoch)` returns the per-operator value only.** Off-chain claim-amount calculators bundle this with `epochTotalWorkingBytes(epoch)` and `gaugeBucket(epoch)` via Multicall3 — same pattern used elsewhere (ADR 022 § Origin discovery).
-- **Distinct-client diversity gating** is enforced inline in `routeSettlement` per [ADR 027 §1](027-distinct-client-receipts.md). The `distinctClientCount` and `bytesPerEpoch` views are populated as a side effect of settlement; gauge claim verifies the threshold against these views directly. There is no operator-asserted summary, no `commitEpochReceiptRoot`, no `commitEpochSummary`, and no fraud-challenge mechanism.
+- **Per-operator gauge bytes tracking** is enforced inline in `routeSettlement`. The `bytesPerEpoch` view is populated as a side effect of settlement; gauge claim reads `bytes_i` from this view directly per [ADR 026 §3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula). The per-operator gauge-share cap from [ADR 026 §3](026-gauge-boost-tokenomics.md#per-operator-gauge-share-cap) is the binding wash-trading defense. There is no operator-asserted summary, no on-chain identity gate, and no fraud-challenge mechanism.
 - **No `initialize(...)` helper.** [§ No proxy deployment patterns](#no-proxy-deployment-patterns) forbids proxies; constructor + post-deploy `setSharesAndDestinations` from `TimelockController` is sufficient for atomic launch wiring.
 - **Storage shape is implementation-defined.** The `gaugeBucket` and `delegatorBucket` views document the *semantic* per-epoch state; whether the contract uses two parallel mappings or a packed struct is left to the implementation (separate mappings are recommended because the buckets accrue independently — packing would force `SSTORE` of the unchanged half on every accumulation).
 
@@ -733,7 +729,7 @@ Every state-mutating function that makes an external call is listed below with i
 
 | Function | External Calls | Guards |
 | --- | --- | --- |
-| `routeSettlement(operator, client, bytesDelivered, amount, epochId)` | `IERC20.safeTransfer()` × 4 (operator base 40%, BuybackBurner 5%, Treasury 5%, SafetyReserve 3%; gauge 40% and delegator 7% retained in epoch USDC buckets, no transfer), `StakingRegistry.recordSettlement(operator)`. State updates: increments per-epoch USDC accumulators for the gauge and delegator buckets; populates `distinctClientCount[operator][epochId]` and `bytesPerEpoch[operator][epochId]` per [ADR 027 §1](027-distinct-client-receipts.md#1-feerouter-per-epoch-bookkeeping) — gauge eligibility (`bytes_i` and `sum(working_bytes)` in the [ADR 026 §3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula) formula) is sourced directly from these views at gauge-claim time. | `nonReentrant`, checks-effects-interactions, `ROUTER_CALLER_ROLE` |
+| `routeSettlement(operator, bytesDelivered, amount, epochId)` | `IERC20.safeTransfer()` × 4 (operator base 40%, BuybackBurner 5%, Treasury 5%, SafetyReserve 3%; gauge 40% and delegator 7% retained in epoch USDC buckets, no transfer), `StakingRegistry.recordSettlement(operator)`. State updates: increments per-epoch USDC accumulators for the gauge and delegator buckets; increments `bytesPerEpoch[operator][epochId]` for the gauge formula. Gauge eligibility (`bytes_i` in the [ADR 026 §3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula) formula) is sourced from this view at gauge-claim time, with the per-operator share cap binding the output. | `nonReentrant`, checks-effects-interactions, `ROUTER_CALLER_ROLE` |
 | `claimBoost(epochs[])` | `IERC20.safeTransfer()` (USDC to claiming operator), `VotingEscrow.balanceOfAt(...)` × N epochs (read), `VotingEscrow.totalSupplyAt(...)` × N epochs (read) | `nonReentrant`, checks-effects-interactions; epoch must be finalized |
 | `claimDelegator(epochs[])` | `IERC20.safeTransfer()` (TOKEN to claiming ve-locker), `VotingEscrow.balanceOfAt(...)` × N (read), `VotingEscrow.totalSupplyAt(...)` × N (read) | `nonReentrant`, checks-effects-interactions; epoch's delegator-pool USDC→TOKEN swap must be settled |
 | `executeDelegatorSwap(epoch, minOut)` | `BalancerV3Router.swapSingleTokenExactIn()` (Vault-scoped self-approval, same V3 footgun pattern as `BuybackBurner`) | `nonReentrant`, checks-effects-interactions, `KEEPER_ROLE`; per-epoch liquidity caps and TWAP-window guards REQUIRED ([ADR 026](026-gauge-boost-tokenomics.md) §6) |

@@ -5,7 +5,7 @@
 
 ## Context
 
-> **Tokenomics cross-reference.** [ADR 026](026-gauge-boost-tokenomics.md) introduces a gauge-boost reward pool whose payout is weighted by `working_bytes` per operator. The byte counter alone is gameable via self-routed traffic (an operator settles channels with itself or with thinly-funded sybil clients to inflate `bytes_delivered`). ADR 026's §Risks identifies client-signed delivery receipts from distinct identities as the strongest mitigation and forward-references future ADR 027 for the receipt protocol. This ADR adds the reputation-side half of that defense: receipt acceptance into gauge-pool eligibility is gated on operator reputation tiers (Section 12). Reputation governs *which* receipts count, not how byte counts are computed.
+> **Tokenomics cross-reference.** [ADR 026](026-gauge-boost-tokenomics.md) introduces a gauge-boost reward pool whose payout is weighted by `working_bytes` per operator. The byte counter alone is gameable via self-routed traffic; the on-chain defense is the [ADR 026 §3 per-operator gauge-share cap](026-gauge-boost-tokenomics.md#per-operator-gauge-share-cap). Reputation contributes complementary off-chain signal — operator-cluster detection, diversity-of-service signal, governance input for cap-tuning — but is not itself a gauge-eligibility gate. See Section 12.
 
 The network needs a mechanism to rank nodes beyond staking alone. Staking provides Sybil resistance but does not measure service quality. Clients need a way to prefer fast, reliable nodes and avoid slow or unresponsive ones without requiring on-chain proof for every quality metric. A gossip-based reputation system using interaction-weighted scoring fills this gap.
 
@@ -248,59 +248,17 @@ During the first 7 days after staking (or first 50 completed interactions, which
 - Reports exceeding limits are silently dropped by receiving nodes
 - Enforced locally by each node on received gossip messages
 
-### 12. Gauge-Pool Eligibility Gating
+### 12. Gauge-Pool Wash-Trading: Reputation as Off-Chain Signal
 
-[ADR 026](026-gauge-boost-tokenomics.md) §3 distributes 40% of fee revenue via a Curve-style gauge formula whose input is per-operator `bytes_delivered`. Without an integrity layer, an operator can inflate `bytes_delivered` by routing settlements through self-controlled or thinly-funded sybil clients, capturing a disproportionate gauge share at near-zero marginal cost. Future ADR 027 defines the cryptographic protocol for **client-signed delivery receipts** tied to verifiable distinct client identities (funded payment channels, reputation-attested public keys, or a separate receipt-attester role). This section specifies how reputation gates receipt acceptance into the gauge-pool counter.
+[ADR 026 §3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula) distributes 40% of fee revenue via a Curve-style gauge formula whose input is per-operator `bytes_delivered`. Without an integrity layer, an operator can inflate `bytes_delivered` by routing settlements through self-controlled clients. The on-chain defense is the [ADR 026 §3 per-operator gauge-share cap](026-gauge-boost-tokenomics.md#per-operator-gauge-share-cap) (default 5%, governable `[1%, 25%]`), which combined with the closed-pool gauge bucket structure makes wash-trading economically marginal at any reasonable TOKEN price (see `internal/ideas/wash-trading-economics.md`).
 
-> **Scope boundary.** This section does not define receipt format, signature scheme, on-chain anchoring, or the bonded-challenger validation flow — those live in [ADR 027](027-distinct-client-receipts.md) and [Appendix: Fraud Detection](appendix-fraud-detection.md). It defines only the reputation-derived *receipt-tier* an operator falls into and the eligibility consequences of each tier. The reputation score itself (Sections 3–8) is unchanged; this is an additive gating layer applied to receipts before they feed into `working_bytes`.
+Reputation contributes complementary off-chain signal:
 
-#### 12.1 Receipt Tiers
+- **Operator-cluster detection.** An operator running a sybil ring of "real-looking" clients (multiple funded channels, multiple identities) but providing degraded or fraudulent service to its real clients gets reputation-docked via Section 3 (delivery-speed and correctness failures) and Section 4 (gossip propagation). Low reputation reduces selection probability, lowering the operator's natural traffic and forcing them to wash-trade more aggressively to compensate — at which point the per-operator cap binds harder.
+- **Diversity-of-service signal.** Operators with broader real client bases earn more gossip reports (Section 4 distinct-counterparty discount) than operators with concentrated traffic. This is a soft tokenomics preference for diverse-client operators, expressed via reputation-weighted node selection rather than as a hard on-chain gate.
+- **Governance input.** Reputation distributions over time feed governance decisions about whether to tighten `MAX_GAUGE_SHARE_PER_OPERATOR` if persistent wash-trading patterns emerge. Reputation is the canary; the cap is the throttle.
 
-An operator's `final_score` (Section 5, after the per-report clamp in Section 8) maps to one of three receipt tiers. The thresholds use the same `[0.0, 1.0]` reputation scale and apply at the epoch-boundary timestamp used by ADR 026 §2 (`VotingEscrow.balanceOfAt(operator_or_delegate, ts)`).
-
-| Tier | `final_score` range | Receipt requirements (parametric; ADR 027 sets concrete defaults) | Gauge-pool eligibility |
-|------|---------------------|-------------------------------------------------------------------|------------------------|
-| **High** | `>= high_rep_threshold` (default **0.70**) | Standard distinct-client count `N_std`, standard minimum-channel-balance threshold `B_std` | Eligible — `bytes_delivered` enters the gauge formula at the receipt-validated rate |
-| **Medium** | `[medium_rep_threshold, high_rep_threshold)` (default **[0.50, 0.70)**) | Stricter: `2 × N_std` distinct clients **and** `2 × B_std` minimum balance per contributing channel | Eligible — only receipts meeting the stricter thresholds count toward `bytes_delivered` |
-| **Low** | `< medium_rep_threshold` (default **< 0.50**) | n/a — receipts not accepted into the gauge counter | **Ineligible** — `bytes_delivered = 0` for gauge-share purposes until reputation recovers above `medium_rep_threshold` |
-
-##### Concrete thresholds (`N_std`, `B_std`) live in ADR 027
-
-Treat them as parameters here; the scale factor (`1×` for High, `2×` for Medium, gating off at Low) is the load-bearing decision in this ADR. ADR 027's "below `medium_rep_threshold`" regime references the same parameter defined here (default 0.50, governable within `[0.30, 0.70]`); §12.1 is the canonical home for the value and bounds.
-
-**Parameter table:**
-
-| Parameter | Default | Min | Max | Notes |
-|-----------|--------:|----:|----:|-------|
-| `high_rep_threshold` | 0.70 | 0.55 | 0.90 | Governance-tunable per [ADR 009](009-governance.md) timelock |
-| `medium_rep_threshold` | 0.50 | 0.30 | 0.70 | Must remain `<= high_rep_threshold` |
-| Medium-tier scale factor | 2× | 1.5× | 4× | Multiplier applied to ADR 027's `N_std` and `B_std` |
-| Reputation-recovery hysteresis | 0.05 | 0.02 | 0.15 | A Low-tier operator must reach `medium_rep_threshold + hysteresis` (default 0.55) before becoming Medium-eligible — prevents oscillation around the boundary |
-
-#### 12.2 Why reputation-tier gating
-
-The receipt protocol (ADR 027) ensures *individual* receipts are signed by distinct client keys with funded channels. Reputation gating defends against the orthogonal attack where an operator with a small, real client base bootstraps a separate sybil ring of "real-looking" clients (multiple funded channels, multiple identities) but provides degraded or fraudulent service to its real clients. That operator's reputation drops (Section 3 catches delivery-speed and correctness failures; Section 4 propagates these via gossip), which downgrades its receipt-tier and forces the sybil ring to be ~2× larger to maintain the same gauge share — or knocks the operator out of the gauge entirely if reputation falls below `medium_rep_threshold`.
-
-The 2× scale factor and the Low-tier exclusion together raise the marginal cost of wash-traded gauge inflation by an operator with degraded service quality without affecting honest operators in good standing. Honest commodity operators stay in the High tier and pay only ADR 027's standard cost; honest small operators may sit in Medium during their cold-start period (Section 10's bootstrap bonus partially offsets) and accept the stricter receipt requirements as a transient cost.
-
-##### Interaction with cold-start (Section 10)
-
-The bootstrap bonus (`+0.05` additive) can pull a new operator from `final_score = 0.50` to `0.55`, still in Medium tier. The bonus does *not* alter receipt-tier classification — receipt-tier is computed from the unboosted `final_score`. This is intentional: the bootstrap bonus boosts *selection probability*, not gauge-pool credibility. New operators must build genuine track record (via real interactions and gossip reports from other staked nodes) to reach High tier; the bonus alone is insufficient.
-
-##### Interaction with the selection floor
-
-[ADR 001](001-network.md#node-selection-algorithm) clamps reputation at `0.1` for selection purposes only. Receipt-tier classification uses the *unclamped* `final_score`, so an operator at 0.05 is unambiguously Low-tier and gauge-ineligible — distinct from the selection-clamp behavior, which still permits (extremely disfavored) selection. The distinction matters because gauge eligibility is binary; selection probability is a continuous penalty.
-
-#### 12.3 Reputation-recovery path
-
-A Low-tier operator regains gauge eligibility by accumulating positive interactions (Section 3) and gossip reports (Section 4) until `final_score >= medium_rep_threshold + hysteresis` (default 0.55). The hysteresis prevents flicker between Low and Medium across single-report deltas. There is no fast-track recovery mechanism — recovery requires real service-quality improvement, on the same EWMA timescale that produced the downgrade.
-
-Reputation-recovery does *not* retroactively re-include receipts from epochs spent in Low tier. Gauge-share accounting is per-epoch (ADR 026 §2 epoch mechanics) and finalized at epoch rollover. A returning operator gains eligibility for the *next* epoch boundary after recovery.
-
-#### 12.4 Cross-references
-
-- ADR 027 (forward-referenced) defines distinct-client diversity gating, identity-diversity rules, and the concrete `N_std` / `B_std` defaults. Diversity counting runs inline in `FeeRouter.routeSettlement` over settled-voucher state — there is no per-receipt fraud-challenge surface.
-- [ADR 026](026-gauge-boost-tokenomics.md) §3 specifies how `bytes_delivered` (after this ADR's gating) feeds into the gauge formula, with a per-operator gauge-share cap as the binding deterrent against wash-trading.
+There is no on-chain gauge-eligibility gate keyed on reputation. The cap binds equally for high-rep and low-rep operators. Reputation operates in selection probability ([ADR 001](001-network.md#node-selection-algorithm)) and as input to governance-level cap-tuning decisions, not as a per-epoch gate on gauge claims.
 
 ### 13. Regional-Coverage Reputation Signal
 
@@ -335,7 +293,7 @@ Sections above describe the full production design; PoC nodes do not implement a
 - **Per-report ±0.05 clamp** ([§ 8](#8-score-clamping)).
 - **Cold-start bootstrap bonus** ([§ 10](#10-cold-start-bootstrap)) — one-time +0.05 additive, linear decay over 7 days / 50 interactions, gated on `firstRegisteredAt`.
 - **Rate limiting on gossip reports** ([§ 11](#11-rate-limiting)).
-- **Gauge-pool eligibility gating** ([§ 12](#12-gauge-pool-eligibility-gating)) — High/Medium/Low receipt-tier gating wired into [ADR 027](027-distinct-client-receipts.md) receipt validation. Out of scope pre-launch (no gauge pool until [ADR 026](026-gauge-boost-tokenomics.md) ships).
+- **Reputation as off-chain wash-trading signal** ([§ 12](#12-gauge-pool-wash-trading-reputation-as-off-chain-signal)) — operator-cluster detection, diversity-of-service signal, governance input for cap-tuning. The on-chain defense is the [ADR 026 §3 per-operator gauge-share cap](026-gauge-boost-tokenomics.md#per-operator-gauge-share-cap); reputation contributes the soft layer.
 - **Regional-coverage signal** ([§ 13](#13-regional-coverage-reputation-signal)) — per-operator regional bucket counters published on `cdn/reputation/v1` for downstream operational programs.
 - **Full 4-tier tie-breaking** ([§ 9](#9-tie-breaking)) — load → geo → stake → random.
 
@@ -360,6 +318,6 @@ Sections above describe the full production design; PoC nodes do not implement a
 - Reporter weight creates a residual incumbency advantage — established nodes with more settled USDC have more influence over network scores. The weight cap (3×) bounds this advantage tightly — set just above the ~2× clamp-saturation point so the full range is effective for typical score gaps while limiting maximum influence
 - Gossip-based propagation adds bandwidth overhead: at 1,000 nodes with all reporters at max rate (10 reports/hr), each node receives ~10,000 reports/hr (~2 MB/hr ingress), which is modest relative to `NodeAnnounce` traffic (~48 MB/hr at 60-second intervals). The strict rate limits (Section 11) keep reputation gossip well-bounded. See [ADR 001, Gossip Bandwidth Analysis](001-network.md#gossip-bandwidth-analysis) for the combined budget
 - The 70/30 local/network split means a client's view of the network is biased toward its own usage patterns
-- Gauge-pool eligibility gating (Section 12) couples gauge-share security to the inherently subjective reputation system — an operator targeted by coordinated negative gossip reports could be pushed below `medium_rep_threshold` and lose gauge eligibility unfairly. The hysteresis (Section 12.3), per-report clamping (Section 8), and the 3× reporter-weight cap (Section 4) together limit the speed and magnitude of such an attack, but the failure mode is real and shared with the rest of the reputation system. ADR 027's receipt protocol and the permissionless bonded-challenger path ([Appendix: Fraud Detection](appendix-fraud-detection.md)) are the on-chain-anchored layers that complement this off-chain signal
+- Coordinated negative gossip reports could push an operator's reputation down unfairly, reducing their selection probability. Per-report clamping (Section 8) and the 3× reporter-weight cap (Section 4) limit the speed and magnitude of such attacks. Because reputation is not a gauge-eligibility gate (Section 12), an unfairly-docked operator still earns gauge proportional to their actual settled bytes (subject to the per-operator cap) — they only lose selection probability, which is a continuous penalty rather than a hard exclusion
 - Receipt-tier thresholds (`high_rep_threshold`, `medium_rep_threshold`) are governance-tunable, which means a hostile governance majority could in principle gate honest operators out of the gauge pool. The bounds in Section 12.1 (`high_rep_threshold` capped at 0.90) and the 48-hour timelock per [ADR 009](009-governance.md) are the primary defenses; operators can plan ve-lock and stake-management decisions around the bounded worst case
 - PoC uses local-only scores (no gossip, no decay, no per-report clamping) — see [Section 14](#14-poc-scope) for full PoC scope

@@ -57,7 +57,6 @@ The standalone `bindNodeId` function is intended for rebinding only — it delet
 | Stake, ve-locks, gauge-claim history | Keyed by Ethereum address ([ADR 026](026-gauge-boost-tokenomics.md)) |
 | Open payment channels (inbound from clients) | Channel ID is `keccak256(client_eth, operator_eth, nonce[, token])` ([ADR 003](003-payments.md), [ADR 010](010-multi-token.md)) — the Ethereum address is unchanged |
 | `firstRegisteredAt` | Cleared only by `deregisterNode`; `bindNodeId` does not touch it ([ADR 019 §Re-Onboarding](019-node-onboarding.md#re-onboarding-after-deregistration-or-auto-ejection)) |
-| Receipt history (ADR 027) | Receipts are signed by *requester* keys, not the operator's |
 
 ### What does not carry over
 
