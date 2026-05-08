@@ -1763,6 +1763,41 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[tokio::test]
+    async fn hits_plus_misses_equals_total_gets() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"hello invariant";
+        let hash = Hash::new(payload);
+        let unknown = Hash::new(b"never present");
+        let origin = StubOrigin::new(payload);
+        let cm = Arc::new(CacheMetrics::default());
+        let engine = CacheEngine::open_full(
+            tmp.path(),
+            Some(Arc::new(origin)),
+            10,
+            crate::PinnedHashes::empty(),
+            crate::RetryPolicy::default(),
+            Some(Arc::clone(&cm)),
+        )
+        .await?;
+
+        // 1 miss (pull-through), 2 hits, 1 miss (origin NotFound), 1 miss (evicted).
+        let _ = engine.get(hash).await?; // miss
+        let _ = engine.get(hash).await?; // hit
+        let _ = engine.get(hash).await?; // hit
+        let _ = engine.get(unknown).await; // miss (origin NotFound)
+        engine.evict(hash)?;
+        let _ = engine.get(hash).await; // miss (evicted)
+
+        anyhow::ensure!(cm.hits.get() == 2, "hits = {}", cm.hits.get());
+        anyhow::ensure!(cm.misses.get() == 3, "misses = {}", cm.misses.get());
+        anyhow::ensure!(
+            cm.hits.get() + cm.misses.get() == 5,
+            "every get must bump exactly one of hits/misses"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn pull_through_success_bumps_bytes_returned() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let payload = b"hello pull-through bytes returned";
