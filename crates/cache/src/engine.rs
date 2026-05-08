@@ -936,6 +936,15 @@ impl CacheEngine {
             OriginFetch::Found(b) => b,
         };
 
+        // Origin egress is paid the moment bytes arrive — count even if
+        // the bytes are about to be rejected by BLAKE3 verification or
+        // the size cap. Operators reasoning about origin spend need
+        // every fetched byte counted, not only the ones that landed.
+        if let Some(m) = &self.inner.metrics {
+            m.pull_through_bytes
+                .inc_by(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        }
+
         // Enforce the size cap on actual payload — even if the origin
         // omitted `Content-Length`, the blob can't silently exceed the cap.
         let len_u64: u64 = bytes
@@ -1740,6 +1749,33 @@ mod tests {
     // -------------------------------------------------------------------
     // Cache hit/miss + bytes counters (#418)
     // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn pull_through_bumps_pull_through_bytes() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"hello pull-through bytes";
+        let hash = Hash::new(payload);
+        let origin = StubOrigin::new(payload);
+        let cm = Arc::new(CacheMetrics::default());
+        let engine = CacheEngine::open_full(
+            tmp.path(),
+            Some(Arc::new(origin)),
+            10,
+            crate::PinnedHashes::empty(),
+            crate::RetryPolicy::default(),
+            Some(Arc::clone(&cm)),
+        )
+        .await?;
+
+        let bytes = engine.get(hash).await?;
+        anyhow::ensure!(cm.misses.get() == 1, "first get is a miss");
+        anyhow::ensure!(cm.hits.get() == 0, "no hits on first get");
+        anyhow::ensure!(
+            cm.pull_through_bytes.get() == bytes.len() as u64,
+            "pull_through_bytes should equal payload length on a Found origin"
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn no_origin_increments_misses_only() -> anyhow::Result<()> {
