@@ -391,6 +391,90 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn engine_bumps_surface_in_openmetrics_output() {
+        use std::sync::Arc;
+
+        use bytes::Bytes;
+        use decdn_cache::{
+            CacheEngine, Origin, OriginFetch, OriginKind, OriginPullError, PinnedHashes,
+            RetryPolicy,
+        };
+        use iroh_blobs::Hash;
+
+        // Minimal in-memory origin: returns the prearranged payload for
+        // its hash, NotFound otherwise. Mirrors the StubOrigin used in
+        // crates/cache tests but is local to this integration test so
+        // we don't need to expose the cache crate's test fixtures.
+        #[derive(Debug)]
+        struct StubOrigin {
+            data: Bytes,
+            hash: Hash,
+        }
+        impl Origin for StubOrigin {
+            fn kind(&self) -> OriginKind {
+                OriginKind::Http
+            }
+            fn fetch(
+                &self,
+                hash: Hash,
+                _max_bytes: u64,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<OriginFetch, OriginPullError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                let result = if hash == self.hash {
+                    Ok(OriginFetch::Found(self.data.clone()))
+                } else {
+                    Ok(OriginFetch::NotFound)
+                };
+                Box::pin(async move { result })
+            }
+        }
+
+        let payload = b"hello /metrics integration".to_vec();
+        let hash = Hash::new(&payload);
+        let stub = StubOrigin {
+            data: Bytes::from(payload.clone()),
+            hash,
+        };
+
+        let metrics = Arc::new(Metrics::new());
+        let cache_handle = metrics.cache_metrics();
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open_full(
+            tmp.path(),
+            Some(Arc::new(stub)),
+            10,
+            PinnedHashes::empty(),
+            RetryPolicy::default(),
+            Some(Arc::clone(&cache_handle)),
+        )
+        .await
+        .unwrap();
+
+        // 1 miss (pull-through) + 1 hit.
+        let _ = engine.get(hash).await.unwrap();
+        let _ = engine.get(hash).await.unwrap();
+
+        let text = metrics.encode().unwrap();
+        let payload_len = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+        for (name, expected) in [
+            ("decdn_cache_hits_total", 1u64),
+            ("decdn_cache_misses_total", 1),
+            ("decdn_cache_pull_through_bytes_total", payload_len),
+            ("decdn_cache_bytes_returned_total", payload_len * 2),
+        ] {
+            assert!(
+                text.contains(&format!("{name} {expected}")),
+                "counter {name} should report {expected} after 1 miss + 1 hit:\n{text}"
+            );
+        }
+    }
+
     #[test]
     fn cache_metrics_handle_shares_atomic_with_registered_group() {
         // Sanity: the Arc<CacheMetrics> handed to the engine must be
