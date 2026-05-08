@@ -34,4 +34,25 @@ pub struct CacheMetrics {
     /// (#285). Operator-actionable: any nonzero rate = user-visible
     /// origin failures the retry budget couldn't save.
     pub origin_retry_exhausted: Counter,
+    /// `get()` calls served from the local store (#418). Includes both
+    /// first-attempt hits and waiter retries that find the blob present
+    /// after a peer pull-through completes.
+    pub hits: Counter,
+    /// `get()` calls that did not find the blob locally (#418). Bumped
+    /// on every pull-through attempt (success, `NoOrigin`, origin
+    /// `NotFound`, hash mismatch, `BlobTooLarge`, transport failure) and
+    /// once for every operator-evicted (#279) `NotFound` return. Every
+    /// call to `get()` increments exactly one of `hits` or `misses`.
+    pub misses: Counter,
+    /// Total bytes returned to the caller of `get()` on success (#418).
+    /// Counts both cache-hit and pull-through-success paths. Useful as
+    /// the numerator for "cache-served bytes per second" panels.
+    pub bytes_returned: Counter,
+    /// Bytes fetched from origin during pull-through (#418). Counted
+    /// whenever the origin returns `OriginFetch::Found(b)`, regardless
+    /// of whether the bytes pass BLAKE3 verification or land in the
+    /// store — the egress is paid either way. Distinguishes
+    /// 'serving from cache' vs. 'paying origin egress' when paired
+    /// with `bytes_returned`.
+    pub pull_through_bytes: Counter,
 }
