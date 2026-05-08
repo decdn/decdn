@@ -3,8 +3,9 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use serde::Deserialize;
@@ -25,7 +26,6 @@ use decdn_common::config::DEFAULT_METRICS_PORT;
 ///
 /// Counter `_created` timestamp lines parse as floats; callers look
 /// up the names they want and ignore the rest.
-#[allow(dead_code)] // Wired into the fetch loop in a later task.
 pub(crate) fn parse_openmetrics(text: &str) -> HashMap<String, f64> {
     let mut out = HashMap::new();
     for line in text.lines() {
@@ -51,7 +51,6 @@ pub(crate) fn parse_openmetrics(text: &str) -> HashMap<String, f64> {
 /// integer types so the renderer can format them without re-checking
 /// for fractional values from the `OpenMetrics` float wire type.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Wired into the fetch loop in a later task.
 pub struct Snapshot {
     pub uptime_seconds: u64,
     pub active_connections: u64,
@@ -63,7 +62,6 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    #[allow(dead_code)] // Wired into the fetch loop in a later task.
     pub(crate) fn from_metrics(m: &HashMap<String, f64>) -> Self {
         // Saturating cast: gauges/counters are non-negative in
         // practice (the `rpc_healthy` 0/1 gauge included). A negative
@@ -99,7 +97,7 @@ impl Snapshot {
 
 /// Per-second deltas between two consecutive snapshots.
 #[derive(Debug, Clone)]
-#[allow(dead_code, clippy::struct_field_names)] // Wired into the renderer in a later task.
+#[allow(clippy::struct_field_names)]
 pub(crate) struct SnapshotDelta {
     pub hits_per_sec: f64,
     pub misses_per_sec: f64,
@@ -107,7 +105,6 @@ pub(crate) struct SnapshotDelta {
 }
 
 impl SnapshotDelta {
-    #[allow(dead_code)] // Wired into the renderer in a later task.
     pub(crate) fn between(prev: &Snapshot, now: &Snapshot, elapsed: Duration) -> Self {
         let secs = elapsed.as_secs_f64();
         if secs <= 0.0 {
@@ -135,7 +132,7 @@ impl SnapshotDelta {
 /// denominator is 0 — distinct from `Some(0.0)` ("only misses so
 /// far") so the renderer prints a literal `n/a` rather than a
 /// misleading `0.0%`.
-#[allow(dead_code, clippy::cast_precision_loss)] // Wired into the renderer in a later task.
+#[allow(clippy::cast_precision_loss)]
 pub(crate) fn hit_rate(hits: u64, misses: u64) -> Option<f64> {
     let total = hits + misses;
     if total == 0 {
@@ -150,7 +147,7 @@ pub(crate) fn hit_rate(hits: u64, misses: u64) -> Option<f64> {
 /// renders sizes — operators are used to that. Strict binary units
 /// (KiB/MiB/...) so the displayed value matches the raw counter
 /// when divided by the obvious power of two.
-#[allow(dead_code, clippy::cast_precision_loss)] // Wired into the renderer below.
+#[allow(clippy::cast_precision_loss)]
 pub(crate) fn format_bytes(b: u64) -> String {
     const KIB: u64 = 1024;
     const MIB: u64 = KIB * 1024;
@@ -172,7 +169,6 @@ pub(crate) fn format_bytes(b: u64) -> String {
 }
 
 #[allow(
-    dead_code,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::cast_precision_loss
@@ -190,7 +186,6 @@ pub(crate) fn format_rate_bytes(per_sec: f64) -> String {
     format!("{s}/s")
 }
 
-#[allow(dead_code)] // Wired into the renderer below.
 fn format_uptime(secs: u64) -> String {
     if secs < 60 {
         return format!("{secs}s");
@@ -213,7 +208,6 @@ fn format_uptime(secs: u64) -> String {
 /// Render the live-view table to `w`. Writing to `&mut impl Write`
 /// rather than stdout makes the formatter unit-testable and matches
 /// the `write_peers_table` pattern used elsewhere in the CLI.
-#[allow(dead_code)] // Wired into the fetch loop in a later task.
 pub(crate) fn write_top_table(
     w: &mut impl io::Write,
     metrics_url: &str,
@@ -293,9 +287,7 @@ pub(crate) fn write_top_table(
 /// public output shape — field names, `hit_rate` as a fraction in
 /// `[0, 1]` or null, ordering — is decoupled from the internal
 /// struct's field order.
-#[allow(dead_code)] // Wired into the fetch loop in a later task.
 pub(crate) fn render_json_snapshot(s: &Snapshot) -> anyhow::Result<String> {
-    use anyhow::Context;
     let value = serde_json::json!({
         "uptime_seconds": s.uptime_seconds,
         "active_connections": s.active_connections,
@@ -332,7 +324,6 @@ enum ConfigPathSource {
 /// can be `0.0.0.0` / `::`, and a client that dials that goes
 /// nowhere; the operator overrides the host explicitly via
 /// `--metrics-url` if they exposed metrics on a non-loopback address.
-#[allow(dead_code)] // Wired into the fetch loop in a later task.
 pub(crate) fn resolve_metrics_url(
     flag: Option<&str>,
     config_path: Option<&Path>,
@@ -385,13 +376,93 @@ fn port_from_config_file(
     }
 }
 
-/// Entry point dispatched from `node_dispatch`. Currently a stub —
-/// later tasks add the metrics fetch, parse, and render loop. The
-/// signature is `async` because the dispatch arm awaits it; clippy
-/// would otherwise flag the missing await on this scaffolding.
-#[allow(clippy::unused_async)]
-pub async fn run(_args: &cli::TopArgs, _global_config: Option<&Path>) -> anyhow::Result<()> {
-    anyhow::bail!("decdn node top is not yet implemented")
+/// ANSI escape: clear screen + move cursor home. Used between live
+/// ticks so the table redraws in place rather than scrolling.
+const ANSI_CLEAR_HOME: &str = "\x1b[2J\x1b[H";
+
+/// Entry point dispatched from `node_dispatch`. Polls the daemon's
+/// `/metrics` endpoint every `--interval-ms`, parses it, and renders
+/// the table. Single-shot JSON mode bypasses the loop and exits
+/// after one fetch.
+pub async fn run(args: &cli::TopArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
+    anyhow::ensure!(args.timeout_ms > 0, "--timeout-ms must be > 0");
+    anyhow::ensure!(args.interval_ms > 0, "--interval-ms must be > 0");
+
+    let config_path = args.config.as_deref().or(global_config);
+    let url_base = resolve_metrics_url(args.metrics_url.as_deref(), config_path)?;
+    let metrics_url = format!("{url_base}/metrics");
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(args.timeout_ms))
+        .build()
+        .context("failed to build HTTP client")?;
+
+    if args.json {
+        let body = fetch_metrics(&client, &metrics_url).await?;
+        let parsed = parse_openmetrics(&body);
+        let snap = Snapshot::from_metrics(&parsed);
+        println!("{}", render_json_snapshot(&snap)?);
+        return Ok(());
+    }
+
+    let interval = Duration::from_millis(args.interval_ms);
+    let mut ticker = tokio::time::interval(interval);
+    // First tick fires immediately; subsequent ticks every `interval`.
+    // `Skip` means a stalled scrape doesn't cause a burst when
+    // catching back up.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    let mut prev: Option<(Snapshot, Instant)> = None;
+
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {}
+            res = tokio::signal::ctrl_c() => {
+                res.context("failed to install ctrl_c handler")?;
+                return Ok(());
+            }
+        }
+
+        let now_at = Instant::now();
+        match fetch_metrics(&client, &metrics_url).await {
+            Ok(body) => {
+                let parsed = parse_openmetrics(&body);
+                let snap = Snapshot::from_metrics(&parsed);
+                let prev_pair = prev
+                    .as_ref()
+                    .map(|(s, t)| (s, now_at.saturating_duration_since(*t)));
+                let mut stdout = io::stdout().lock();
+                let _ = stdout.write_all(ANSI_CLEAR_HOME.as_bytes());
+                write_top_table(&mut stdout, &metrics_url, &snap, prev_pair, interval)
+                    .context("failed to write top table")?;
+                let _ = stdout.flush();
+                prev = Some((snap, now_at));
+            }
+            Err(err) => {
+                // Don't tear down the loop on a single bad scrape —
+                // print the error inline and let the next tick try
+                // again. Operators want stickiness; transient
+                // ECONNREFUSED during a daemon restart shouldn't
+                // require re-running `decdn node top`.
+                eprintln!("scrape failed: {err}");
+            }
+        }
+    }
+}
+
+async fn fetch_metrics(client: &reqwest::Client, url: &str) -> anyhow::Result<String> {
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("GET {url} failed"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        anyhow::bail!("GET {url} returned HTTP {status}");
+    }
+    resp.text()
+        .await
+        .with_context(|| format!("read body from {url}"))
 }
 
 #[cfg(test)]
