@@ -268,6 +268,7 @@ impl AdminRpcServer for AdminRpcImpl {
                 last_accessed_us_ago: preview.last_accessed_us_ago,
                 pinned: preview.pinned,
                 already_evicted: preview.already_evicted,
+                origin_kind: preview.origin_kind,
             },
         })
     }
@@ -616,6 +617,10 @@ mod tests {
             hash: Hash,
         }
         impl decdn_cache::Origin for StubOrigin {
+            fn kind(&self) -> decdn_cache::OriginKind {
+                decdn_cache::OriginKind::Http
+            }
+
             fn fetch(
                 &self,
                 hash: Hash,
@@ -748,6 +753,10 @@ mod tests {
             hash: Hash,
         }
         impl decdn_cache::Origin for StubOrigin {
+            fn kind(&self) -> decdn_cache::OriginKind {
+                decdn_cache::OriginKind::Http
+            }
+
             fn fetch(
                 &self,
                 hash: Hash,
@@ -818,6 +827,15 @@ mod tests {
             !resp.preview.already_evicted,
             "dry-run must not flip evicted flag"
         );
+        // Origin egress-cost cue (#439). Engine here is configured
+        // with an origin, so the preview must carry a non-None tag —
+        // the StubOrigin reports `Http`.
+        assert_eq!(
+            resp.preview.origin_kind,
+            Some(decdn_cache::OriginKind::Http),
+            "expected Some(Http), got {:?}",
+            resp.preview.origin_kind,
+        );
 
         // Cache state untouched: the blob is still served, the
         // evicted-log entry was not created, and no fsync hit disk.
@@ -850,6 +868,10 @@ mod tests {
             hash: Hash,
         }
         impl decdn_cache::Origin for StubOrigin {
+            fn kind(&self) -> decdn_cache::OriginKind {
+                decdn_cache::OriginKind::Http
+            }
+
             fn fetch(
                 &self,
                 hash: Hash,

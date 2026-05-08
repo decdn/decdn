@@ -18,7 +18,7 @@ use bytes::Bytes;
 use iroh_blobs::Hash;
 use tokio::io::AsyncReadExt;
 
-use super::{Origin, OriginFetch};
+use super::{Origin, OriginFetch, OriginKind};
 use crate::error::OriginPullError;
 
 /// Initial capacity hint for the per-fetch read buffer. Caps the
@@ -106,6 +106,10 @@ fn classify_io_error(err: std::io::Error) -> OriginPullError {
 }
 
 impl Origin for FilesystemOrigin {
+    fn kind(&self) -> OriginKind {
+        OriginKind::Filesystem
+    }
+
     fn fetch(
         &self,
         hash: Hash,

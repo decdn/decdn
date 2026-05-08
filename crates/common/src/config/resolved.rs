@@ -79,6 +79,12 @@ pub struct ResolvedCache {
     /// Origin pull-through retry policy (#285). Set once at startup;
     /// changes require a process restart.
     pub origin_retry: decdn_cache::RetryPolicy,
+    /// `User-Agent` header sent on every HTTP origin pull-through (#435).
+    /// Defaults to [`decdn_cache::DEFAULT_USER_AGENT`] (which embeds the
+    /// `decdn-cache` crate's `CARGO_PKG_VERSION`); operators can override
+    /// via `cache.user_agent` to attribute CDN traffic in origin access
+    /// logs or to drive origin-side rate limits and routing policy.
+    pub user_agent: String,
 }
 
 /// Resolved + validated origin backend selection (#437). Mirrors
