@@ -11,7 +11,8 @@ use anyhow::Context;
 use serde::Deserialize;
 
 use decdn_common::cli;
-use decdn_common::cli::common::{ConfigPathSource, default_config_path, expand_tilde};
+use decdn_common::cli::ConfigPathSource;
+use decdn_common::cli::common::{default_config_path, expand_tilde};
 use decdn_common::config::DEFAULT_METRICS_PORT;
 
 /// Parse an `OpenMetrics` text body into `name -> value`.
