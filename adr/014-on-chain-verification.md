@@ -15,7 +15,7 @@ A fourth offense, **receipt fraud** (operator's `EpochReceiptSummary` overstates
 
 A fifth offense, **double settlement** (submitting the same voucher to multiple channels), is production-only and is not covered by on-chain verification in the PoC.
 
-Content corruption — a node delivering bytes that don't BLAKE3 to the advertised hash — is **not** an on-chain offense. It is fully absorbed at the wire by progressive BLAKE3 verification at the client (already mandatory in `cdn/client/v1` per [ADR 002](002-content-addressing.md) / [ADR 005](005-protocol.md)) plus post-verification voucher signing: a corrupt window never yields a voucher and the client never pays for corrupt bytes. See [ADR 003 §Corrupted delivery](003-payments.md#corrupted-delivery) for the wire-level mechanism. Earlier drafts of this ADR specified an optimistic challenge-response for corruption and forward-referenced an interactive Merkle-proof upgrade ([issue #387](https://github.com/decdn/decdn/issues/387)); both have been removed as solving a non-problem.
+Content corruption — a node delivering bytes that don't BLAKE3 to the advertised hash — is not an on-chain offense; it is absorbed at the wire by client-side BLAKE3 verification + post-verification voucher signing per [ADR 003 §Corrupted delivery](003-payments.md#corrupted-delivery).
 
 Phantom, rate, and blacklist all require verifying cryptographic signatures from protocol messages. EVM's native `ecrecover` handles secp256k1 (ECDSA) cheaply (~3,000 gas). This ADR specifies the concrete on-chain mechanism: `ecrecover`-based signature verification through a unified `SlashJudge` contract.
 
@@ -95,9 +95,6 @@ The `bytes calldata` arguments named `*ResponseData` in the interface below are 
 
 ```solidity
 interface ISlashJudge {
-    /// Offense identifier emitted on every slash. Order is contract-canonical
-    /// and append-only — new offense types extend the enum at the end so existing
-    /// `slashId` allocations remain stable.
     enum OffenseType { Phantom, RateManipulation, Blacklist, ReceiptFraud }
 
     /// Emitted on every slash resolution that results in a stake reduction.
@@ -221,7 +218,7 @@ All challenge types MUST validate evidence age using a skew-safe comparison. Let
 Every slash that reduces operator stake emits `Slashed(slashId, operator, offenseType, amount, evidenceHash)` (see the `ISlashJudge` interface block above). The event is the canonical record of the slash and is the appeal-pinning identifier consumed by [ADR 028 §6](028-slashing-appeals.md#6-contract-surface) `openSlashAppeal(slashId, evidenceBundleHash)` — without it, no ADR 028 appeal can be filed.
 
 - **`slashId`** is a globally monotonic `uint256` (single counter across all offense types, not per-operator and not per-offense-type). It is allocated from a `nextSlashId` storage slot incremented inline in the same transaction as the `StakingRegistry.slash(...)` call. `slashId` values are stable, non-reusable, and non-zero — `slashId == 0` is reserved as the "no slash" sentinel.
-- **`offenseType`** is the `OffenseType` enum from the interface above. The order `{Phantom, RateManipulation, Blacklist, ReceiptFraud}` is contract-canonical and append-only; existing entries MUST NOT be reordered (consumer contracts — notably `SafetyReserve` — index by ordinal). New offense types extend the enum at the end.
+- **`offenseType`** is the `OffenseType` enum from the interface above.
 - **`evidenceHash`** is `keccak256` over a per-offense canonical preimage that uniquely identifies the (offenseType, evidence) pair the slash relied on. The preimage uses `abi.encode(...)` (not `abi.encodePacked`) so the field encoding is unambiguous across implementers. Every preimage is prefixed by `uint8(offenseType)` so two distinct offenses against the same operator on overlapping evidence (e.g., a single `(probe, stream)` pair where `streamResponse.ok == false` AND `streamResponse.rate_per_mb > probeResponse.rate_per_mb` triggers both phantom and rate-manipulation) produce distinct `evidenceHash` values, not just distinct `slashId`s. Signatures are **excluded** from the preimage — the §1 EIP-712 typed-data digests they sign already uniquely identify the message contents, so a successful slash trivially fixes the digest set; including the variable-length signature blobs in the hash would create an ambiguity (`abi.encode` vs `abi.encodePacked` field length) without adding evidentiary content. The `blobHash` parameter passed to the immediate-execution `submit*Challenge` paths is similarly excluded — the §2 evidence-verification flow already binds it via the `responseData.hash == blobHash` check, and the EIP-712 `*Response` struct hash commits to `hash` directly. The per-offense preimages are:
   - **Phantom:** `keccak256(abi.encode(uint8(OffenseType.Phantom), probeStructHash, streamStructHash))`.
   - **Rate manipulation:** `keccak256(abi.encode(uint8(OffenseType.RateManipulation), probeStructHash, streamStructHash))`. The `OffenseType` prefix is what distinguishes this preimage from phantom on overlapping evidence.
