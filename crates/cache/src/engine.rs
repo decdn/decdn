@@ -738,6 +738,9 @@ impl CacheEngine {
         // "unevict" path; an operator who needs to re-cache a previously
         // evicted hash hand-edits the log and restarts.
         if self.is_evicted(hash) {
+            if let Some(m) = &self.inner.metrics {
+                m.misses.inc();
+            }
             return Err(CacheError::NotFound { hash });
         }
 
@@ -1730,6 +1733,42 @@ mod tests {
     // -------------------------------------------------------------------
     // Cache hit/miss + bytes counters (#418)
     // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn evicted_hash_increments_misses() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"hello evicted miss";
+        let hash = Hash::new(payload);
+        let origin = StubOrigin::new(payload);
+        let cm = Arc::new(CacheMetrics::default());
+        let engine = CacheEngine::open_full(
+            tmp.path(),
+            Some(Arc::new(origin)),
+            10,
+            crate::PinnedHashes::empty(),
+            crate::RetryPolicy::default(),
+            Some(Arc::clone(&cm)),
+        )
+        .await?;
+
+        // Prime then evict so the next get hits the evicted branch in get().
+        let _ = engine.get(hash).await?;
+        engine.evict(hash)?;
+        let misses_before = cm.misses.get();
+
+        let Err(err) = engine.get(hash).await else {
+            anyhow::bail!("expected NotFound, got Ok");
+        };
+        anyhow::ensure!(
+            matches!(err, CacheError::NotFound { .. }),
+            "evicted get must surface NotFound"
+        );
+        anyhow::ensure!(
+            cm.misses.get() == misses_before + 1,
+            "misses should bump by exactly 1 on an evicted-hash get"
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn hit_increments_hits_and_bytes_returned() -> anyhow::Result<()> {
