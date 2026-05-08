@@ -136,12 +136,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
-      # mold is a drop-in replacement for ld; on this 8-crate workspace
-      # (alloy/iroh/tokio/aws-sdk) it noticeably shortens the link phase of
-      # the instrumented test binaries. Scoped to the test job because that's
-      # where the link of many large test binaries dominates runtime — other
-      # jobs do link small artifacts (build scripts, proc-macro cdylibs) but
-      # the savings there would be marginal and not pay back the apt-get cost.
+      # mold is a drop-in replacement for ld that noticeably shortens the
+      # link phase of the workspace's instrumented test binaries. Scoped to
+      # the test job because that's where the test binaries get linked —
+      # other jobs do link small artifacts (build scripts, proc-macro
+      # dylibs) but the savings would be marginal and wouldn't pay back the
+      # apt-get cost.
       - name: Install mold linker
         run: sudo apt-get update && sudo apt-get install -y mold
       - uses: Swatinem/rust-cache@v2
@@ -167,25 +167,33 @@ jobs:
       # /rust-cache with shared-key: coverage covers caching of instrumented
       # build artifacts on its own.
       #
-      # RUSTFLAGS is scoped to this step on purpose. Swatinem/rust-cache hashes
-      # the env into its cache key, so setting it here only invalidates the
-      # `coverage` shared-key — clippy/doc/msrv keep their warm caches. Three
+      # RUSTFLAGS is scoped to this step on purpose. The Swatinem/rust-cache
+      # step ran earlier in this job and didn't see this env, so the cache
+      # key isn't invalidated; clippy/doc/msrv steps in their own jobs also
+      # don't see this env and keep their warm caches. Cargo's per-artifact
+      # fingerprint detects the RUSTFLAGS change and recompiles affected
+      # crates in-place inside the restored target/ — that's the actual
+      # cache-correctness mechanism here, not the rust-cache key. Three
       # link/debug knobs:
-      #   - link-arg=-fuse-ld=mold: route final link through mold (faster than ld
-      #     for the workspace's ~8 instrumented test binaries).
-      #   - debuginfo=1: equivalent to debug = "line-tables-only". cargo-llvm-cov
-      #     only needs the .debug_line section to map counters to source lines
-      #     (the SF/DA records in lcov.info). Stripping type/var info shrinks
-      #     compile + link + cached target tree.
+      #   - link-arg=-fuse-ld=mold: route the final link of the test binaries
+      #     through mold instead of the system ld.
+      #   - debuginfo=line-tables-only: emit only the .debug_line DWARF
+      #     section, which is what cargo-llvm-cov reads to map counters to
+      #     source lines (the SF/DA records in lcov.info). Strips subprogram
+      #     DIEs and all type/variable info — smaller compile + link + cache.
+      #     NOT equivalent to `-C debuginfo=1` (= "limited", which keeps
+      #     subprogram DIEs); line-tables-only is strictly tighter.
       #   - split-debuginfo=unpacked: side-file debug info; smaller .o files
-      #     and faster relinking. Coverage-orthogonal.
-      # CARGO_INCREMENTAL=0: incremental files bloat the cache for zero gain in
-      # CI (no second compile in the same run). --no-clean tells cargo-llvm-cov
-      # to trust the cached target tree (modern versions don't clean by default
-      # for the same profile, but explicit beats implicit).
+      #     and faster relinking. Orthogonal to coverage.
+      # CARGO_INCREMENTAL=0: incremental files bloat the cache for zero gain
+      # in CI (no second compile in the same run). --no-clean is the
+      # critical one: cargo-llvm-cov runs `cargo clean --package <each>` per
+      # invocation by default, which would wipe the instrumented artifacts
+      # the rust-cache restore just laid down. --no-clean suppresses that
+      # cleanup so the cache restore is actually useful.
       - name: Run tests (with coverage instrumentation)
         env:
-          RUSTFLAGS: "-C link-arg=-fuse-ld=mold -C debuginfo=1 -C split-debuginfo=unpacked"
+          RUSTFLAGS: "-C link-arg=-fuse-ld=mold -C debuginfo=line-tables-only -C split-debuginfo=unpacked"
           CARGO_INCREMENTAL: "0"
         run: cargo llvm-cov nextest --workspace --lcov --output-path lcov.info --no-tests=pass --no-clean
 
