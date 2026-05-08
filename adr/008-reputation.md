@@ -299,9 +299,8 @@ Reputation-recovery does *not* retroactively re-include receipts from epochs spe
 
 #### 12.4 Cross-references
 
-- ADR 027 (forward-referenced) defines receipt format, signature scheme, identity-diversity heuristics, on-chain anchoring, and the concrete `N_std` / `B_std` defaults.
-- [Appendix: Fraud Detection](appendix-fraud-detection.md) describes the permissionless challenger role for receipt-fraud claims and reuses the `SlashJudge` bond mechanism from [ADR 014 Bond Handling](014-on-chain-verification.md#bond-handling).
-- [ADR 026](026-gauge-boost-tokenomics.md) §3 specifies how `bytes_delivered` (after this ADR's gating) feeds into the gauge formula. ADR 026 §Risks identifies receipt-based gating as the strongest invariant in the gauge-pool security model.
+- ADR 027 (forward-referenced) defines distinct-client diversity gating, identity-diversity rules, and the concrete `N_std` / `B_std` defaults. Diversity counting runs inline in `FeeRouter.routeSettlement` over settled-voucher state — there is no per-receipt fraud-challenge surface.
+- [ADR 026](026-gauge-boost-tokenomics.md) §3 specifies how `bytes_delivered` (after this ADR's gating) feeds into the gauge formula, with a per-operator gauge-share cap as the binding deterrent against wash-trading.
 
 ### 13. Regional-Coverage Reputation Signal
 

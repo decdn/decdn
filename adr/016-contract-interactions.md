@@ -44,8 +44,9 @@ classDiagram
         +settleChannel(op, bytes, amount)
     }
     class FeeRouter {
-        +routeSettlement(op, bytes, amount)
-        +commitEpochReceiptRoot(epochId, root)
+        +routeSettlement(op, bytes, amount, epochId)
+        +distinctClientCount(op, epoch)
+        +bytesPerEpoch(op, epoch)
         +claimBoost(epochs)
         +claimDelegator(epochs)
         +workingBytes(op, epoch)
@@ -127,31 +128,18 @@ interface IFeeRouter {
     // via `SETTLEMENT_REPORTER_ROLE`. Reverts if paused.
     function routeSettlement(
         address operator,
+        address client,             // channel.client — funder identity for diversity counting
         uint256 bytesDelivered,
-        uint256 amount
+        uint256 amount,
+        uint64  epochId             // voucher.epochId per ADR 003 / ADR 027 §2
     ) external;
 
-    // ─── Receipt-batch anchoring (per ADR 027 §4) ─────────────────────
-    // Per-epoch summary structure committed by operators (or any third
-    // party on the operator's behalf). Canonical layout pinned in
-    // [ADR 027 §4 § Per-epoch summary](027-distinct-client-receipts.md#per-epoch-summary);
-    // mirrored here so IFeeRouter is self-contained.
-    struct EpochReceiptSummary {
-        address operator;             // matches the function-arg operator
-        uint64 epochId;               // matches the function-arg epochId
-        uint256 claimedBytes;         // operator-asserted; subject to challenge per ADR 027 §4
-        uint32 claimedDistinctClients; // operator-asserted; subject to challenge
-        bytes32 aggregateRoot;        // Merkle root of the per-call commit roots
-    }
-
-    // Operator commits one MMR leaf per call. `msg.sender` is recorded
-    // as the credited operator. Full timing-window and overwrite-vs-append
-    // semantics live in [ADR 027 §4 § Timing windows](027-distinct-client-receipts.md#timing-windows).
-    function commitEpochReceiptRoot(uint64 epochId, bytes32 root) external;
-
-    // Summary commit (any caller — `operator` is explicit, not msg.sender,
-    // so a keeper/relayer can submit on the operator's behalf).
-    function commitEpochSummary(address operator, uint64 epochId, EpochReceiptSummary calldata summary) external;
+    // ─── Distinct-client diversity gating (per ADR 027) ───────────────
+    // Populated inline by routeSettlement. No operator-asserted summary
+    // and no fraud-challenge mechanism — diversity is computed directly
+    // from settled-voucher state.
+    function distinctClientCount(address operator, uint64 epoch) external view returns (uint256);
+    function bytesPerEpoch(address operator, uint64 epoch) external view returns (uint256);
 
     // ─── Claim flows ──────────────────────────────────────────────────
     // Pull-based claims for the gauge-boost (40% steady-state) and
@@ -252,9 +240,7 @@ interface IFeeRouter {
     // ─── Pause control ────────────────────────────────────────────────
     // `pause()` blocks `routeSettlement` and the claim functions
     // (`claimBoost`, `claimDelegator`); `executeDelegatorSwap` and
-    // `sweepUnclaimed` are also paused. `commitEpochReceiptRoot` and
-    // `commitEpochSummary` continue to work so operators don't lose
-    // gauge eligibility during a pause window.
+    // `sweepUnclaimed` are also paused.
     // `StablePaymentChannel.closeChannel` and `disputeChannel` are
     // independent of `FeeRouter` and remain available — settlement
     // queues until `unpause`.
@@ -264,22 +250,11 @@ interface IFeeRouter {
     // ─── Events ───────────────────────────────────────────────────────
     event Settled(
         address indexed operator,
+        address indexed client,
         uint256 bytesDelivered,
         uint256 amount,
-        uint64 indexed epochId
-    );
-    event EpochReceiptRootCommitted(
-        address indexed operator,
         uint64 indexed epochId,
-        bytes32 leafRoot,
-        uint256 leafCount
-    );
-    event EpochSummaryCommitted(
-        address indexed operator,
-        uint64 indexed epochId,
-        uint256 claimedBytes,
-        uint32 claimedDistinctClients,
-        bytes32 aggregateRoot
+        bool firstSeenClient        // true if this client increments distinctClientCount
     );
     event BoostClaimed(address indexed operator, uint64 indexed epochId, uint256 amount);
     event DelegatorClaimed(address indexed account, uint64 indexed epochId, uint256 amount);
@@ -300,7 +275,7 @@ interface IFeeRouter {
 
 - **Epoch length and claim window** are immutable contract parameters set in the constructor (1 week and 26 epochs respectively per [ADR 026 §2](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553)). Changing them post-deploy would shift the meaning of every `epoch` index in storage; if a future ADR motivates a change, it ships as a fresh `FeeRouter` deployment with state migration, per [§ No proxy deployment patterns](#no-proxy-deployment-patterns).
 - **`workingBytes(operator, epoch)` returns the per-operator value only.** Off-chain claim-amount calculators bundle this with `epochTotalWorkingBytes(epoch)` and `gaugeBucket(epoch)` via Multicall3 — same pattern used elsewhere (ADR 022 § Origin discovery).
-- **`commitEpochReceiptRoot` and `commitEpochSummary` are signature stubs** in this interface; the timing window, overwrite-before-finalization semantics, anti-griefing rules, and the full `ReceiptSummary` field layout are specified canonically in [ADR 027 §4](027-distinct-client-receipts.md).
+- **Distinct-client diversity gating** is enforced inline in `routeSettlement` per [ADR 027 §1](027-distinct-client-receipts.md). The `distinctClientCount` and `bytesPerEpoch` views are populated as a side effect of settlement; gauge claim verifies the threshold against these views directly. There is no operator-asserted summary, no `commitEpochReceiptRoot`, no `commitEpochSummary`, and no fraud-challenge mechanism.
 - **No `initialize(...)` helper.** [§ No proxy deployment patterns](#no-proxy-deployment-patterns) forbids proxies; constructor + post-deploy `setSharesAndDestinations` from `TimelockController` is sufficient for atomic launch wiring.
 - **Storage shape is implementation-defined.** The `gaugeBucket` and `delegatorBucket` views document the *semantic* per-epoch state; whether the contract uses two parallel mappings or a packed struct is left to the implementation (separate mappings are recommended because the buckets accrue independently — packing would force `SSTORE` of the unchanged half on every accumulation).
 
@@ -504,8 +479,7 @@ graph LR
 | StablePaymentChannel | StakingRegistry | `getStakeMultiple(provider)` | Public (read-only) | No |
 | StablePaymentChannel | IERC20 (USDC) | `safeTransferFrom()` | Caller must have allowance | Yes |
 | StablePaymentChannel | IERC20 (USDC) | `safeTransfer()` | Caller holds balance | Yes |
-| StablePaymentChannel | FeeRouter | `routeSettlement(operator, bytesDelivered, amount)` | `ROUTER_CALLER_ROLE` on FeeRouter ([ADR 026](026-gauge-boost-tokenomics.md) §2) | Yes |
-| Operator (off-chain) | FeeRouter | `commitEpochReceiptRoot(epochId, root)` | None — `msg.sender` is recorded as the credited operator ([ADR 027 §4](027-distinct-client-receipts.md#4-on-chain-anchoring-merkle-batched)) | Yes |
+| StablePaymentChannel | FeeRouter | `routeSettlement(operator, client, bytesDelivered, amount, epochId)` | `ROUTER_CALLER_ROLE` on FeeRouter ([ADR 026](026-gauge-boost-tokenomics.md) §2) | Yes |
 | FeeRouter | VotingEscrow | `balanceOfAt(user, ts)`, `totalSupplyAt(ts)` | Public (read-only) | No |
 | FeeRouter | StakingRegistry | `recordSettlement(operator)` | `SETTLEMENT_REPORTER_ROLE` (granted to FeeRouter post-deploy; settlement counter moves with the routing call) | Yes |
 | FeeRouter | BuybackBurner | `safeTransfer()` (5% USDC same-tx) | Caller holds balance | Yes |
@@ -629,7 +603,7 @@ flowchart TD
 
     Operator -->|"stake(amount)"| SR
     SR -->|"unstake() after unbonding"| Operator
-    Challenger -->|"submitPhantomChallenge() /<br/>submitRateChallenge() /<br/>submitBlacklistChallenge() /<br/>submitReceiptFraudChallenge()<br/>bond deposit"| SJ
+    Challenger -->|"submitPhantomChallenge() /<br/>submitRateChallenge() /<br/>submitBlacklistChallenge()<br/>bond deposit"| SJ
     SJ -->|"slash(node, offenseType)<br/>(amount computed internally)"| SR
     SR -->|"50% of slash to msg.sender"| SJ
     SR -->|"30% of slash"| SAFE
@@ -744,7 +718,6 @@ Every state-mutating function that makes an external call is listed below with i
 | `submitPhantomChallenge()` | `IERC20.safeTransferFrom()` (TOKEN bond deposit), `StakingRegistry.slash()`, `IERC20.safeTransfer()` (slash reward + bond return on success) | `nonReentrant`, checks-effects-interactions |
 | `submitRateChallenge()` | `IERC20.safeTransferFrom()` (TOKEN bond deposit), `StakingRegistry.slash()`, `IERC20.safeTransfer()` (slash reward + bond return on success) | `nonReentrant`, checks-effects-interactions |
 | `submitBlacklistChallenge()` | `IERC20.safeTransferFrom()` (TOKEN bond deposit), `ContentBlacklist.getEntry()` (read), `StakingRegistry.slash()`, `IERC20.safeTransfer()` (slash reward + bond return on success) | `nonReentrant`, checks-effects-interactions |
-| `submitReceiptFraudChallenge()` | `IERC20.safeTransferFrom()` (TOKEN bond deposit), `FeeRouter.epochSummary()` (read — `aggregateRoot` for the challenged `(operator, epochId)`), `StakingRegistry.slash()`, `IERC20.safeTransfer()` (slash reward + bond return on success) | `nonReentrant`, checks-effects-interactions |
 
 #### BuybackBurner
 
@@ -760,8 +733,7 @@ Every state-mutating function that makes an external call is listed below with i
 
 | Function | External Calls | Guards |
 | --- | --- | --- |
-| `routeSettlement(operator, bytesDelivered, amount)` | `IERC20.safeTransfer()` × 4 (operator base 40%, BuybackBurner 5%, Treasury 5%, SafetyReserve 3%; gauge 40% and delegator 7% retained in epoch USDC buckets, no transfer), `StakingRegistry.recordSettlement(operator)`. State updates: increments per-epoch USDC accumulators for the gauge and delegator buckets. Byte counters and receipt-root commitments do **not** flow through this call — gauge eligibility (`bytes_i` and `sum(working_bytes)` in the [ADR 026 §3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula) formula) is sourced from per-(operator, epoch) receipt summaries via the separate `commitEpochReceiptRoot` / `commitEpochSummary` entry points ([ADR 027 §4](027-distinct-client-receipts.md#4-on-chain-anchoring-merkle-batched)). | `nonReentrant`, checks-effects-interactions, `ROUTER_CALLER_ROLE` |
-| `commitEpochReceiptRoot(epochId, root)` | None (state-only). Appends one leaf to the per-(`msg.sender`, `epochId`) MMR receipt accumulator (per [ADR 027 §4](027-distinct-client-receipts.md#4-on-chain-anchoring-merkle-batched)). | None — `msg.sender` is the credited operator; the operator is self-authorising for their own gauge eligibility. |
+| `routeSettlement(operator, client, bytesDelivered, amount, epochId)` | `IERC20.safeTransfer()` × 4 (operator base 40%, BuybackBurner 5%, Treasury 5%, SafetyReserve 3%; gauge 40% and delegator 7% retained in epoch USDC buckets, no transfer), `StakingRegistry.recordSettlement(operator)`. State updates: increments per-epoch USDC accumulators for the gauge and delegator buckets; populates `distinctClientCount[operator][epochId]` and `bytesPerEpoch[operator][epochId]` per [ADR 027 §1](027-distinct-client-receipts.md#1-feerouter-per-epoch-bookkeeping) — gauge eligibility (`bytes_i` and `sum(working_bytes)` in the [ADR 026 §3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula) formula) is sourced directly from these views at gauge-claim time. | `nonReentrant`, checks-effects-interactions, `ROUTER_CALLER_ROLE` |
 | `claimBoost(epochs[])` | `IERC20.safeTransfer()` (USDC to claiming operator), `VotingEscrow.balanceOfAt(...)` × N epochs (read), `VotingEscrow.totalSupplyAt(...)` × N epochs (read) | `nonReentrant`, checks-effects-interactions; epoch must be finalized |
 | `claimDelegator(epochs[])` | `IERC20.safeTransfer()` (TOKEN to claiming ve-locker), `VotingEscrow.balanceOfAt(...)` × N (read), `VotingEscrow.totalSupplyAt(...)` × N (read) | `nonReentrant`, checks-effects-interactions; epoch's delegator-pool USDC→TOKEN swap must be settled |
 | `executeDelegatorSwap(epoch, minOut)` | `BalancerV3Router.swapSingleTokenExactIn()` (Vault-scoped self-approval, same V3 footgun pattern as `BuybackBurner`) | `nonReentrant`, checks-effects-interactions, `KEEPER_ROLE`; per-epoch liquidity caps and TWAP-window guards REQUIRED ([ADR 026](026-gauge-boost-tokenomics.md) §6) |

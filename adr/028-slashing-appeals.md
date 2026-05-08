@@ -10,7 +10,7 @@ The protocol slashes operator stake at 5% / 15% / 50% escalation tiers ([ADR 026
 
 - **48-hour appeal window** in `SafetyReserve` ([ADR 009 § SafetyReserve Payout Authorization](009-governance.md#safetyreserve-payout-authorization), [ADR 026 §5](026-gauge-boost-tokenomics.md#5-safety-and-insurance-reserve-3-bucket)). Protects payouts of the reserve, not slashes themselves; an operator cannot directly invoke this gate.
 
-All four `SlashJudge` offenses — phantom delivery, rate manipulation, blacklist violation, and receipt fraud — execute immediately on successful on-chain verification with **no counter-evidence window** ([ADR 014 §Bond Handling](014-on-chain-verification.md#bond-handling)). Operators hit by these offenses while offline have zero in-protocol recourse.
+All three `SlashJudge` offenses — phantom delivery, rate manipulation, and blacklist violation — execute immediately on successful on-chain verification with **no counter-evidence window** ([ADR 014 §Bond Handling](014-on-chain-verification.md#bond-handling)). Operators hit by these offenses while offline have zero in-protocol recourse.
 
 Without a documented escalation path, every legitimate-outage slash becomes either a permanent operator loss (damages onboarding and operator trust) or an ad-hoc emergency-multisig discretion event (sets unbounded multisig precedent). A bounded, documented mechanism is needed before mainnet. This ADR adds a governance-level appeal layered on top of the existing slash machinery — no new governance bodies, no changes to slash execution, no on-chain stake reversal.
 
@@ -22,7 +22,7 @@ A node operator may file a **slashing appeal** within 30 days of a `SlashJudge` 
 
 ### 1. Scope
 
-All four `SlashJudge` offense types are appealable: phantom, rate manipulation, blacklist, receipt fraud. Each executes immediately at submit time with no in-protocol counter-evidence opportunity ([ADR 014 §Bond Handling](014-on-chain-verification.md#bond-handling)); the legitimate-outage rationale applies to all four.
+All three `SlashJudge` offense types are appealable: phantom, rate manipulation, blacklist. Each executes immediately at submit time with no in-protocol counter-evidence opportunity ([ADR 014 §Bond Handling](014-on-chain-verification.md#bond-handling)); the legitimate-outage rationale applies to all three.
 
 The eligibility bar (§3) is the gate against frivolous appeals, not the offense type. **Scope limitation: ADR 028 covers appeals against the *slash event itself* on operational-failure grounds — the operator was unable to comply because of an outage, NTP drift, or similar.** Appeals against the *underlying [`ContentBlacklist`](011-content-takedown.md#contract-contentblacklist) entry* — i.e., disputing whether the blacklisted hash should be on the list at all — are out of scope here and tracked separately under [ADR 011](011-content-takedown.md) (issue #131). §3's evidence standard explicitly does not admit content-policy arguments (e.g., "the blacklist entry was wrongly issued" or "the takedown notice was overbroad"); only the operational-failure evidence types defined in §3 are admissible. The multisig is expected to apply heightened scrutiny when reviewing blacklist-offense appeals, given that blacklist offenses involve deliberate moderation noncompliance rather than purely operational failure modes. This guidance is not coded into the contract.
 
@@ -120,7 +120,7 @@ This ADR specifies the future contract surface; implementation lands in a follow
 
 ```solidity
 // `slashId` is allocated and emitted by SlashJudge.Slashed
-// (ADR 014 §2 — globally monotonic, non-zero, single counter across all offense types).
+// (ADR 014 §2 — globally monotonic, non-zero, single counter across all three offense types).
 // `evidenceBundleHash` MUST equal the `evidenceHash` field of the referenced `Slashed` event.
 function openSlashAppeal(uint256 slashId, bytes32 evidenceBundleHash) external returns (uint256 appealId);
 function fastTrackAppeal(uint256 appealId) external onlyEmergencyMultisig;
@@ -133,7 +133,7 @@ function reverseAppeal(uint256 appealId) external onlyGovernor;
 
 **Multisig capability scope.** `fastTrackAppeal` and `rejectAppeal` are sub-modes of [ADR 009 § Emergency Multisig](009-governance.md#emergency-multisig)'s existing capability (4) "SafetyReserve fast-track authorization" — they consume appeal-specific arguments and emit appeal-specific events but do **not** create a new multisig power. The 3-of-5 threshold, signing semantics, and post-incident reporting obligations are unchanged from [ADR 009](009-governance.md#emergency-multisig). ADR 009's "Capabilities (exhaustive list)" prose should be editorially expanded to enumerate the appeal-specific entry points as sub-modes of capability (4); see [Forward references](#forward-references-follow-up-adrs).
 
-**Dependency on `SlashJudge` slash identifiers.** The `slashId` argument refers to the `Slashed(uint256 indexed slashId, address indexed operator, OffenseType offenseType, uint256 amount, bytes32 evidenceHash)` event canonicalised in [ADR 014 §2 `Slashed` event and `slashId` allocation](014-on-chain-verification.md#slashed-event-and-slashid-allocation). That ADR pins the event for all four offense types (phantom, rate, blacklist, receipt fraud) — each of which resolves synchronously at submit time — and pins `slashId` as a globally monotonic non-zero counter. Operators reference this `slashId` directly in `openSlashAppeal`, with `evidenceBundleHash` matching the event's `evidenceHash` field. Without ADR 014's `Slashed` emission, no appeal can be filed.
+**Dependency on `SlashJudge` slash identifiers.** The `slashId` argument refers to the `Slashed(uint256 indexed slashId, address indexed operator, OffenseType offenseType, uint256 amount, bytes32 evidenceHash)` event canonicalised in [ADR 014 §2 `Slashed` event and `slashId` allocation](014-on-chain-verification.md#slashed-event-and-slashid-allocation). That ADR pins the event for all three offense types (phantom, rate, blacklist) — each of which resolves synchronously at submit time — and pins `slashId` as a globally monotonic non-zero counter. Operators reference this `slashId` directly in `openSlashAppeal`, with `evidenceBundleHash` matching the event's `evidenceHash` field. Without ADR 014's `Slashed` emission, no appeal can be filed.
 
 Extending the existing `SafetyReserve` contract — rather than introducing a new `SlashAppealRegistry` — preserves the deployment budget, reuses the payout machinery, and keeps the public payout registry as the single source of truth for who received protocol restitution and why. The trade-off is acknowledged in [Forward references](#forward-references-follow-up-adrs): if `SafetyReserve` is ever split (e.g., separate reserves per incident category), the appeal-authorization functions must migrate alongside the slash-restitution payout category.
 
@@ -194,7 +194,7 @@ Modeled abuse paths and their counters:
 - **Dedicated arbitration committee.** Rejected: introduces a new on-chain governance body, a new election mechanism, and a new attack surface, none of which is justified by the appeal volume the protocol expects (single-digit appeals per quarter at PoC scale, low-tens at production scale).
 - **On-chain slash reversal.** Rejected: clawback on already-distributed challenger rewards (50% of slashed amount per [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn)) is intractable — the challenger may have already moved the funds. `SafetyReserve` restitution is equivalent in capital terms and avoids the clawback complexity entirely. Reputation/offense-count preservation is a feature, not a bug (§7).
 - **Hybrid stake reversal + reputation reset.** Rejected for the same clawback reason, plus the reputation-preservation rationale in §7.
-- **Narrowing scope to a subset of offenses.** Rejected: phantom, rate, blacklist, and receipt fraud all execute immediately with no in-protocol due process; restricting appeals to a subset would leave a corresponding portion of operator-trust gap unaddressed.
+- **Narrowing scope to a subset of offenses.** Rejected: phantom, rate, and blacklist all execute immediately with no in-protocol due process; restricting appeals to a subset would leave a corresponding portion of operator-trust gap unaddressed.
 
 ## Forward references (follow-up ADRs)
 
