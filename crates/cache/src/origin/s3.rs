@@ -222,13 +222,12 @@ impl S3Origin {
             secret_access_key,
             ..
         }) = cfg.credentials.as_ref()
+            && (access_key_id.is_empty() || secret_access_key.is_empty())
         {
-            if access_key_id.is_empty() || secret_access_key.is_empty() {
-                anyhow::bail!(
-                    "S3 static credentials have empty access_key_id or secret_access_key; \
-                     check [cache.origin.credentials] in config or the secret-resolution layer"
-                );
-            }
+            anyhow::bail!(
+                "S3 static credentials have empty access_key_id or secret_access_key; \
+                 check [cache.origin.credentials] in config or the secret-resolution layer"
+            );
         }
         // Build the hyper-1 + rustls 0.23 + aws-lc-rs HTTP client.
         // Constructed once per S3Origin and shared across every fetch via

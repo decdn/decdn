@@ -142,10 +142,10 @@ pub async fn retry_fetch(
                     // a single transient failure is just a failure, not a
                     // burned-out retry budget — bumping the counter would
                     // ruin alerts that page on actual exhaustion.
-                    if attempt > 0 {
-                        if let Some(m) = metrics {
-                            m.origin_retry_exhausted.inc();
-                        }
+                    if attempt > 0
+                        && let Some(m) = metrics
+                    {
+                        m.origin_retry_exhausted.inc();
                     }
                     tracing::error!(
                         %hash,

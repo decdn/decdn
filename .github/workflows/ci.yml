@@ -77,7 +77,7 @@ jobs:
     if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: msrv

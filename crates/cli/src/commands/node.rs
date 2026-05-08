@@ -400,10 +400,10 @@ fn classify_client_error(url: &str, timeout_ms: u64, err: JsonRpcClientError) ->
 fn is_connection_refused(err: &(dyn std::error::Error + 'static)) -> bool {
     let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
     while let Some(e) = current {
-        if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
-            if io_err.kind() == std::io::ErrorKind::ConnectionRefused {
-                return true;
-            }
+        if let Some(io_err) = e.downcast_ref::<std::io::Error>()
+            && io_err.kind() == std::io::ErrorKind::ConnectionRefused
+        {
+            return true;
         }
         current = e.source();
     }
