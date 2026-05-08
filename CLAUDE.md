@@ -23,7 +23,7 @@ pre-commit run --all-files           # run all hooks
 
 ## Architecture
 
-**Language:** Rust (edition 2024, MSRV 1.85). **Networking:** iroh (QUIC transport, NAT traversal, content-addressed blobs, gossip).
+**Language:** Rust (edition 2024, MSRV 1.95). **Networking:** iroh (QUIC transport, NAT traversal, content-addressed blobs, gossip).
 
 **Code style:** `rustfmt.toml` sets `max_width = 100`.
 

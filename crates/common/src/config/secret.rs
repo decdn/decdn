@@ -60,7 +60,7 @@ impl SecretString {
     /// True if the wrapped string is empty. Useful in validators
     /// without exposing the secret.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 }

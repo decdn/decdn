@@ -144,9 +144,17 @@ cargo fmt -- --check                 # check formatting
 cargo deny check                     # license + advisory audit (deny.toml)
 ```
 
+## Rust Toolchain
+
+`rust-toolchain.toml` pins an exact stable release (currently `1.95.0`); CI uses the same pin via `dtolnay/rust-toolchain@1.95.0` so pre-commit's `cargo clippy` runs the identical lint set as CI. Under a rustup-managed `cargo` (what the devcontainer ships), the pinned toolchain auto-installs and is selected on first `cargo` invocation; other setups need to install `1.95.0` manually.
+
+Dependabot auto-bumps the GitHub Actions refs only — it does **not** touch `rust-toolchain.toml` or `Cargo.toml`'s `rust-version`. When accepting a Dependabot toolchain bump, update those two files in the same PR (and `Cargo.toml`'s `rust-version` if MSRV is moving in lockstep) so developer machines and CI stay aligned.
+
+MSRV (`rust-version.workspace = true` → 1.95) is the lower bound the workspace must compile under; it's checked separately by the `msrv` job in `.github/workflows/ci.yml` and is a distinct knob from the stable lint pin (currently set to the same value).
+
 ## Code Style
 
-**Language:** Rust (edition 2024, MSRV 1.85).
+**Language:** Rust (edition 2024, MSRV 1.95).
 
 `rustfmt.toml` sets `max_width = 100`.
 

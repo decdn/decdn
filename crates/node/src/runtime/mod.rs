@@ -50,7 +50,7 @@ const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(15);
 /// peer-table TTL sweeper and is comfortably larger than the longest
 /// realistic bucket refill window, so the sweep is essentially free
 /// when the keyspace is empty.
-const DISPATCH_GC_INTERVAL: Duration = Duration::from_secs(60);
+const DISPATCH_GC_INTERVAL: Duration = Duration::from_mins(1);
 
 /// Body of the periodic dispatch-limiter GC task (#440). Extracted from
 /// the spawn site so the shutdown-promptness contract can be tested
@@ -1249,7 +1249,7 @@ mod tests {
         let task = tokio::spawn(run_dispatch_gc(
             Arc::clone(&limiter),
             stop_rx,
-            Duration::from_secs(60),
+            Duration::from_mins(1),
         ));
 
         // Give the task a moment to enter the select loop, then signal
