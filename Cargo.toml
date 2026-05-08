@@ -74,6 +74,13 @@ rpassword = "7"
 url = "2"
 zeroize = "1"
 
+# Bundle creation (`decdn bundle create`, issue #391):
+# walkdir for stable directory traversal, globset for `--exclude` patterns,
+# blake3 direct so the publisher CLI doesn't have to pull iroh-blobs.
+walkdir = "2"
+globset = "0.4"
+blake3 = "1"
+
 # HTTP client (used by cache-origin backend)
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json"] }
 

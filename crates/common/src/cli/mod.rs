@@ -6,6 +6,7 @@
 //! or starting any tasks. The daemon's own clap shell lives in
 //! `crates/node/src/main.rs` and is not part of this module.
 
+pub mod bundle;
 pub mod common;
 pub mod config_cmd;
 pub mod key_gen;
@@ -13,6 +14,7 @@ pub mod node;
 pub mod probe;
 pub mod run;
 
+pub use bundle::{BundleArgs, BundleCommand, BundleCreateArgs};
 pub use common::{LogFormat, default_config_path, default_data_dir};
 pub use config_cmd::{ConfigArgs, ConfigCommand, ConfigInitArgs, ConfigValidateArgs};
 pub use key_gen::KeyGenArgs;
@@ -67,4 +69,8 @@ pub enum Command {
     /// Operator-local admin commands that query a running node
     /// over its loopback HTTP surface (ADR 025).
     Node(NodeArgs),
+    /// Build and (eventually) fetch directory bundles — a JSON manifest
+    /// linking BLAKE3-content-addressed blobs by relative path. See
+    /// `appendix-bundles.md` for the format and issue #391 for status.
+    Bundle(BundleArgs),
 }
