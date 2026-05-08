@@ -398,7 +398,7 @@ pub async fn run(args: &cli::TopArgs, global_config: Option<&Path>) -> anyhow::R
 
     let config_path = args.config.as_deref().or(global_config);
     let url_base = resolve_metrics_url(args.metrics_url.as_deref(), config_path)?;
-    let metrics_url = format!("{url_base}/metrics");
+    let metrics_url = append_metrics_path(&url_base);
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(args.timeout_ms))
@@ -469,6 +469,22 @@ pub async fn run(args: &cli::TopArgs, global_config: Option<&Path>) -> anyhow::R
                 }
             }
         }
+    }
+}
+
+/// Build the full `/metrics` URL from an operator-supplied base.
+/// Tolerates the two natural mistakes — a trailing `/` on the base
+/// (`http://h:9090/`) and a base that already ends in `/metrics`
+/// (`http://h:9090/metrics`) — without producing `//metrics` or
+/// `/metrics/metrics`. The resolver in this crate hands us a clean
+/// `http://127.0.0.1:{port}` so the public-facing exposure here is
+/// the `--metrics-url` / `DECDN_METRICS_URL` path.
+fn append_metrics_path(base: &str) -> String {
+    let stripped = base.trim_end_matches('/');
+    if stripped.ends_with("/metrics") {
+        stripped.to_string()
+    } else {
+        format!("{stripped}/metrics")
     }
 }
 
@@ -1043,10 +1059,14 @@ mod e2e_tests {
             "expected 503 in error, got: {msg}"
         );
 
-        // Wait for the listener task; .unwrap()s on the JoinError
-        // so a panic in the spawned write loop surfaces with the
-        // real cause.
-        let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
+        // Wait for the listener task and propagate JoinError so a
+        // panic in the spawned write loop surfaces with the real
+        // cause, rather than the assertion above passing on a
+        // torn-down server. Same shape as the e2e test above.
+        let join = tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .context("listener task did not exit within 1s")?;
+        join.context("listener task panicked")?;
         Ok(())
     }
 }
@@ -1060,6 +1080,37 @@ mod e2e_tests {
 )]
 mod resolve_tests {
     use super::*;
+
+    #[test]
+    fn append_metrics_path_handles_operator_url_shapes() {
+        // Bare base — the canonical default.
+        assert_eq!(
+            append_metrics_path("http://127.0.0.1:9090"),
+            "http://127.0.0.1:9090/metrics"
+        );
+        // Trailing slash — operator habit; must not produce `//metrics`.
+        assert_eq!(
+            append_metrics_path("http://127.0.0.1:9090/"),
+            "http://127.0.0.1:9090/metrics"
+        );
+        // Already-complete URL — operator copy-pasted the full
+        // endpoint; must not produce `/metrics/metrics`.
+        assert_eq!(
+            append_metrics_path("http://127.0.0.1:9090/metrics"),
+            "http://127.0.0.1:9090/metrics"
+        );
+        // Trailing slash *and* `/metrics` — the worst case combo.
+        assert_eq!(
+            append_metrics_path("http://127.0.0.1:9090/metrics/"),
+            "http://127.0.0.1:9090/metrics"
+        );
+        // Path-prefixed bases (reverse proxy etc.) get the suffix
+        // appended cleanly — this is the documented "base URL" use.
+        assert_eq!(
+            append_metrics_path("http://h:9090/proxy"),
+            "http://h:9090/proxy/metrics"
+        );
+    }
 
     #[test]
     fn resolve_metrics_url_prefers_flag() {
