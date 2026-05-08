@@ -26,7 +26,11 @@ use decdn_common::config::DEFAULT_METRICS_PORT;
 ///
 /// Counter `_created` timestamp lines parse as floats; callers look
 /// up the names they want and ignore the rest.
-pub(crate) fn parse_openmetrics(text: &str) -> HashMap<String, f64> {
+///
+/// Visibility is `pub` (not `pub(crate)`) so the integration test in
+/// `crates/cli/tests/node_top.rs` can drive the parser against a
+/// real metrics-server response without a subprocess hop.
+pub fn parse_openmetrics(text: &str) -> HashMap<String, f64> {
     let mut out = HashMap::new();
     for line in text.lines() {
         let trimmed = line.trim();
@@ -62,7 +66,12 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    pub(crate) fn from_metrics(m: &HashMap<String, f64>) -> Self {
+    /// Build a snapshot from a parsed `/metrics` body.
+    ///
+    /// Visibility is `pub` so the integration test in
+    /// `crates/cli/tests/node_top.rs` can verify the snapshot fields
+    /// against a real metrics-server response.
+    pub fn from_metrics(m: &HashMap<String, f64>) -> Self {
         // Saturating cast: gauges/counters are non-negative in
         // practice (the `rpc_healthy` 0/1 gauge included). A negative
         // value here would only arise from a clock-skew gauge we
