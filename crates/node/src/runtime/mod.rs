@@ -54,12 +54,17 @@ const DISPATCH_GC_INTERVAL: Duration = Duration::from_mins(1);
 
 /// QUIC-level idle timeout: the transport closes a connection if no
 /// packets arrive for this long. Set to match ADR 005's 30s
-/// connection-lifetime ceiling. The spec also requires the application
-/// layer to keep the connection open while vouchers are unacknowledged —
-/// that rule is enforced by the cdn/client/v1 handler, not here, so the
-/// flat QUIC timer is a *floor*, not the full closure rule.
-/// [`QUIC_KEEP_ALIVE_INTERVAL`] PINGs refresh this timer on otherwise
-/// silent paths.
+/// connection-lifetime ceiling.
+///
+/// Because [`QUIC_KEEP_ALIVE_INTERVAL`] (10s) is shorter than this
+/// timeout, healthy peers keep refreshing it via PING ACKs and the QUIC
+/// idle reaper rarely fires on its own — that is the spec's intent (see
+/// ADR 005: "below the idle timeout to prevent NAT middleboxes from
+/// dropping the mapping"). The QUIC timer is a defense-in-depth floor
+/// for genuinely silent paths (e.g. peer crash / network partition); the
+/// "close 30s after last stream and no unacked vouchers" rule is
+/// application-layer and lives in the cdn/client/v1 handler (not yet
+/// implemented).
 const QUIC_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Interval between QUIC PING keep-alive frames. Per ADR 005 §Connection

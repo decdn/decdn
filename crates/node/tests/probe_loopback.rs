@@ -584,7 +584,9 @@ async fn idle_timeout_closes_quiet_connection() -> anyhow::Result<()> {
     }
 
     client_ep.close().await;
-    let _ = accept_task.await;
+    accept_task
+        .await
+        .map_err(|e| anyhow::anyhow!("accept task join: {e}"))??;
     server_ep.close().await;
     Ok(())
 }
