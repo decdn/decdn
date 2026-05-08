@@ -763,7 +763,15 @@ impl CacheEngine {
                 Some(Err(notify)) => {
                     notify.notified().await;
                     if self.has(hash).await? {
-                        break self.read_local(hash).await?;
+                        let bytes = self.read_local(hash).await?;
+                        // Waiter found the blob after the owner inserted it:
+                        // semantically a hit (the cache served us). The
+                        // post-loop block bumps bytes_returned for both
+                        // hit and miss exits, so only `hits` is bumped here.
+                        if let Some(m) = &self.inner.metrics {
+                            m.hits.inc();
+                        }
+                        break bytes;
                     }
                     // First attempt failed — loop back and either wait on a
                     // new owner or become the owner ourselves.
@@ -785,6 +793,10 @@ impl CacheEngine {
             }
         };
         self.touch(hash);
+        if let Some(m) = &self.inner.metrics {
+            m.bytes_returned
+                .inc_by(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        }
         Ok(bytes)
     }
 
@@ -1749,6 +1761,31 @@ mod tests {
     // -------------------------------------------------------------------
     // Cache hit/miss + bytes counters (#418)
     // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn pull_through_success_bumps_bytes_returned() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"hello pull-through bytes returned";
+        let hash = Hash::new(payload);
+        let origin = StubOrigin::new(payload);
+        let cm = Arc::new(CacheMetrics::default());
+        let engine = CacheEngine::open_full(
+            tmp.path(),
+            Some(Arc::new(origin)),
+            10,
+            crate::PinnedHashes::empty(),
+            crate::RetryPolicy::default(),
+            Some(Arc::clone(&cm)),
+        )
+        .await?;
+
+        let bytes = engine.get(hash).await?;
+        anyhow::ensure!(
+            cm.bytes_returned.get() == bytes.len() as u64,
+            "bytes_returned should match payload length after a successful pull-through"
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn pull_through_bumps_pull_through_bytes() -> anyhow::Result<()> {
