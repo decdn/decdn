@@ -76,7 +76,7 @@ Call `TOKEN.approve(stakingRegistry, amount)` where `amount ≥ minStake` (**50,
 
 Call `StakingRegistry.stake(amount)` with `amount ≥ 50,000 TOKEN`.
 
-The stake is locked immediately. It is slashable from this point forward, including during the unbonding period if the node later deregisters (14-day unbonding by default per [ADR 030 §7](030-blake3-merkle-verification.md#7-interaction-with-stake-unbonding--unbondingperiod-raised-to-14-d); governable per [ADR 026 §11](026-gauge-boost-tokenomics.md#11-governable-parameters-with-safety-bounds)).
+The stake is locked immediately. It is slashable from this point forward, including during the unbonding period if the node later deregisters (7-day unbonding by default; governable per [ADR 026](026-gauge-boost-tokenomics.md)).
 
 **ve-position is separate.** Operator stake in `StakingRegistry` and any ve-locked TOKEN in `VotingEscrow` are independent positions per [ADR 026 § 4](026-gauge-boost-tokenomics.md#4-voting-escrow-votingescrow). ve-locked TOKEN is non-slashable and does not satisfy the minimum stake requirement; neither does staked TOKEN earn gauge boost. An operator who wants gauge boost must hold both.
 

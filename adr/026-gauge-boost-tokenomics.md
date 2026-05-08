@@ -490,7 +490,7 @@ interface IDelegatorBuyer {
 
 ### 7. Operator economics and minimum stake
 
-**Minimum stake.** **50,000 TOKEN.** Slashable (rates per §8), **14-day unbonding** (raised from 7 days per [ADR 030 §7](030-blake3-merkle-verification.md#7-interaction-with-stake-unbonding--unbondingperiod-raised-to-14-d) so the worst-case Merkle-bisection dispute lifecycle completes before stake withdrawal becomes possible), slashable during unbonding. Sized so operator stake is a meaningful skin-in-the-game floor while keeping the gauge-boost ve-position the differentiating capital channel — the two roles are split cleanly.
+**Minimum stake.** **50,000 TOKEN.** Slashable (rates per §8), 7-day unbonding, slashable during unbonding. Sized so operator stake is a meaningful skin-in-the-game floor while keeping the gauge-boost ve-position the differentiating capital channel — the two roles are split cleanly.
 
 #### No fee-discount mechanic
 
@@ -562,18 +562,12 @@ Router shares, the boost-floor parameter, and the receipt-anchoring lifecycle wi
 | `summaryWindow` | 604,800 s (7 days) | 259,200 s (3 days) | 1,209,600 s (14 days) |
 | `challengeWindow` | 604,800 s (7 days) | 259,200 s (3 days) | 1,209,600 s (14 days) |
 | `claimWindow` | 26 epochs | 13 epochs | 52 epochs (`uint16` count of epochs; the contract internally multiplies by the immutable `epochLength` to derive a seconds-domain deadline) |
-| `unbondingPeriod` (`StakingRegistry`) | 1,209,600 s (14 days) | 259,200 s (3 days) | 2,592,000 s (30 days) |
-| `merkleDispute.perSidePerMoveClock` (`SlashJudge`; per [ADR 030 §3](030-blake3-merkle-verification.md#3-bisection-protocol-state-machine)) | 14,400 s (4 hours) | 3,600 s (1 hour) | 86,400 s (24 hours) |
-| `merkleDispute.maxRounds` (`SlashJudge`; per [ADR 030 §3](030-blake3-merkle-verification.md#3-bisection-protocol-state-machine)) | 20 | 1 | 30 |
-| `merkleDispute.perRoundBond` (`SlashJudge`; per [ADR 030 §6](030-blake3-merkle-verification.md#6-bond-economics-and-griefing-analysis)) | 10 TOKEN | 1 TOKEN | 100 TOKEN |
 
 The 20% floor on the node-base share guarantees operators always receive enough liquid USDC to cover at least a meaningful fraction of infrastructure costs even under extreme governance proposals — preserves the cashflow invariant. The `boostFloor` bounds prevent governance from collapsing the gauge pool to a winner-take-all distribution (lower-bound) or flattening it into uselessness (upper-bound).
 
 The `summaryWindow` lower bound (3 days) gives honest operators time to aggregate receipts off-chain, sign the EpochReceiptSummary, and submit the on-chain commit before the deadline; the upper bound (14 days) keeps total time-to-gauge-finality within a month even at the most permissive setting. The `challengeWindow` bounds give bonded challengers time to verify signatures and identity-diversity heuristics (lower bound) without indefinitely delaying gauge payouts (upper bound).
 
 **Cross-parameter invariant:** `claimWindow` MUST be strictly greater than `challengeWindow` (in matching units — the contract converts `challengeWindow` from seconds to epochs as needed). A summary frozen with undetected fraud could otherwise outlive the challenge window before the operator's claim resolves; enforcing `claimWindow > challengeWindow` at the setter layer guarantees there is always time for a successful challenger to surface a `ChallengeReceiptSummary` and zero the over-claimed fields before any payout against that epoch lands. Updates that violate the invariant revert.
-
-**Merkle-dispute cross-parameter invariant** (per [ADR 030 §7](030-blake3-merkle-verification.md#7-interaction-with-stake-unbonding--unbondingperiod-raised-to-14-d)): the `SlashJudge` Merkle-dispute setters MUST enforce `(merkleDispute.perSidePerMoveClock × 2 × merkleDispute.maxRounds) + MAX_EVIDENCE_AGE_US + 1 d ≤ unbondingPeriod` on every update of any input parameter (per-move clock, `maxRounds`, `MAX_EVIDENCE_AGE_US` on `SlashJudge`, or `unbondingPeriod` on `StakingRegistry`). At default values: `(4 h × 2 × 20) + 5 d + 1 d = 12.7 d ≤ 14 d` (holds). The bounds tabled above are individually permissive but the invariant is the binding constraint — out-of-range *combinations* revert at the setter layer.
 
 **Non-numeric one-shot setters.**
 

@@ -90,7 +90,7 @@ The economic model that ties the protocol together. Three ADRs: [ADR 026](026-ga
 How protocol violations are detected, adjudicated, and punished. The slashing schedule lives in [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn); this chapter is the evidence and adjudication path.
 
 1. [ADR 014 — On-Chain Verification for Slashing Evidence](014-on-chain-verification.md)
-2. [ADR 030 — Production BLAKE3 Corruption Verification (Interactive Merkle Bisection)](030-blake3-merkle-verification.md)
+2. [ADR 030 — Production BLAKE3 Corruption Verification (Single-Shot Merkle Proof)](030-blake3-merkle-verification.md)
 3. [ADR 008 — Reputation System](008-reputation.md)
 4. [ADR 011 — Content Takedown and Hash Blacklisting](011-content-takedown.md)
 5. [ADR 028 — Slashing Appeals and Dispute Escalation](028-slashing-appeals.md)
@@ -159,7 +159,7 @@ Numeric per-ADR index. The thematic chapter ordering for top-to-bottom reading l
 - **[ADR 026 — Gauge-Boost Tokenomics](026-gauge-boost-tokenomics.md)** — 1B fixed supply; `FeeRouter` six-bucket split with Curve-style gauge boost, delegator pool, and SafetyReserve.
 - **[ADR 027 — Distinct-Client Delivery Receipts](027-distinct-client-receipts.md)** — Client-signed `DeliveryReceipt` Merkle-batched per epoch; gauge-pool eligibility gated on distinct-client diversity. Required for mainnet launch.
 - **[ADR 028 — Slashing Appeals and Dispute Escalation](028-slashing-appeals.md)** — 30-day post-slash appeal window via `SafetyReserve` restitution; emergency multisig fast-track + 14-day ve-Governor ratification; one accepted appeal per operator per 365 days.
-- **[ADR 030 — Production BLAKE3 Corruption Verification](030-blake3-merkle-verification.md)** — `cdn/client/v2` adds signed `merkle_root` (plain binary keccak256 Merkle tree over 1024-byte chunks) to `StreamResponse`; interactive bisection over the bao tree drives disputes to a single 1024-byte chunk; on-chain BLAKE3 + bao parent path verifies the leaf. Coexists with ADR 014 §2 optimistic path under unified `OffenseType.Corruption`. Raises default `unbondingPeriod` from 7 d to 14 d.
+- **[ADR 030 — Production BLAKE3 Corruption Verification](030-blake3-merkle-verification.md)** — `cdn/client/v2` adds signed `merkle_root` (plain binary keccak256 Merkle tree over 1024-byte chunks) to `StreamResponse`; a single-transaction inclusion proof — keccak Merkle path of the delivered chunk to `merkle_root` plus bao parent path of the canonical chunk to the BLAKE3 hash — proves corruption when the two chunks differ. Coexists with ADR 014 §2 optimistic path under unified `OffenseType.Corruption`; no `unbondingPeriod` change.
 
 ## Key Invariants
 
