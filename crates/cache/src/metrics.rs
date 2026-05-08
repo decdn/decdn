@@ -15,11 +15,21 @@
 //! Hit/miss accounting (#418): on `Ok` and on the cache-domain error
 //! returns (`NoOrigin`, evicted `NotFound`, origin `NotFound`,
 //! `HashMismatch`, `BlobTooLarge`, `OriginError`), `CacheEngine::get`
-//! bumps exactly one of `hits` or `misses`. Store I/O errors
-//! (`CacheError::Store`) are infrastructure failures distinct from
-//! cache outcomes — they surface via `tracing::error!` and propagate
-//! without bumping either counter, so a degraded local store does not
-//! pollute hit-rate dashboards.
+//! bumps exactly one of `hits` or `misses`.
+//!
+//! Store I/O error carve-out (`CacheError::Store`): these surface via
+//! `tracing::error!` and split by phase.
+//!
+//! - **Local-lookup phase** (`has`, `read_local` before pull-through is
+//!   initiated): a Store error here means the cache can't *determine*
+//!   whether the blob is present, so neither counter is bumped. A
+//!   degraded local store does not silently classify reads as misses.
+//! - **Pull-through phase** (after the miss is already determined —
+//!   e.g., `add_bytes` fails to persist verified origin bytes): the
+//!   `misses` and `pull_through_bytes` bumps that fired earlier in
+//!   `pull_through` stay bumped. The miss genuinely happened, the
+//!   origin egress was genuinely paid, and the failure surfaces both
+//!   via `tracing::error!` and as the get-call's `Err`.
 //!
 //! The cache crate owns this group rather than re-exporting node-side
 //! state so the cache stays self-describing. Node wires `Arc<CacheMetrics>`
@@ -46,17 +56,19 @@ pub struct CacheMetrics {
     pub origin_retry_exhausted: Counter,
     /// `get()` calls served from the local store (#418). Includes both
     /// first-attempt hits and waiter retries that find the blob present
-    /// after a coalesced peer pull-through completes. Paired with
-    /// `misses`; see the module-level doc for the hits-XOR-misses
-    /// contract and the store-error carve-out.
+    /// after a coalesced concurrent pull-through completes (the
+    /// engine's coalescing is between in-process tasks fronting the
+    /// same hash, not between network peers). Paired with `misses`;
+    /// see the module-level doc for the hits-XOR-misses contract and
+    /// the store-error carve-out.
     pub hits: Counter,
     /// `get()` calls that did not find the blob locally (#418). Bumped
-    /// once on every operator-evicted `NotFound` return and once on
-    /// every pull-through entry — the latter covers all pull-through
-    /// outcomes (`Ok`, no-origin, origin `NotFound`, hash mismatch,
-    /// size cap, transport failure) without enumerating each error
-    /// variant by name. See the module-level doc for the contract with
-    /// `hits`.
+    /// once on every operator-evicted `NotFound` return and once at
+    /// the entry of every pull-through — the latter covers all
+    /// pull-through outcomes (`Ok` and any later error, including a
+    /// `Store` error from `add_bytes`) without enumerating each
+    /// variant. See the module-level doc for the contract with `hits`
+    /// and the per-phase store-error carve-out.
     pub misses: Counter,
     /// Total bytes returned to the caller of `get()` on success (#418).
     /// Counts both cache-hit and pull-through-success paths.
