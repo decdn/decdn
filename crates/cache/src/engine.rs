@@ -722,7 +722,13 @@ impl CacheEngine {
     pub async fn get(&self, hash: Hash) -> CacheResult<Bytes> {
         if self.has(hash).await? {
             self.touch(hash);
-            return self.read_local(hash).await;
+            let bytes = self.read_local(hash).await?;
+            if let Some(m) = &self.inner.metrics {
+                m.hits.inc();
+                m.bytes_returned
+                    .inc_by(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+            }
+            return Ok(bytes);
         }
 
         // Logical-eviction guard (#279): once an operator has run
@@ -732,6 +738,9 @@ impl CacheEngine {
         // "unevict" path; an operator who needs to re-cache a previously
         // evicted hash hand-edits the log and restarts.
         if self.is_evicted(hash) {
+            if let Some(m) = &self.inner.metrics {
+                m.misses.inc();
+            }
             return Err(CacheError::NotFound { hash });
         }
 
@@ -754,7 +763,15 @@ impl CacheEngine {
                 Some(Err(notify)) => {
                     notify.notified().await;
                     if self.has(hash).await? {
-                        break self.read_local(hash).await?;
+                        let bytes = self.read_local(hash).await?;
+                        // Waiter found the blob after the owner inserted it:
+                        // semantically a hit. `bytes_returned` is bumped
+                        // once after the loop for both arms; bump only
+                        // `hits` here.
+                        if let Some(m) = &self.inner.metrics {
+                            m.hits.inc();
+                        }
+                        break bytes;
                     }
                     // First attempt failed — loop back and either wait on a
                     // new owner or become the owner ourselves.
@@ -776,6 +793,10 @@ impl CacheEngine {
             }
         };
         self.touch(hash);
+        if let Some(m) = &self.inner.metrics {
+            m.bytes_returned
+                .inc_by(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        }
         Ok(bytes)
     }
 
@@ -889,6 +910,14 @@ impl CacheEngine {
     const BLOCKING_HASH_THRESHOLD: usize = 1 << 20; // 1 MiB
 
     async fn pull_through(&self, hash: Hash) -> CacheResult<Bytes> {
+        // Every pull_through entry is a `get()` cache miss, regardless
+        // of how the pull resolves. Coalesced waiters that find a hit
+        // on retry never call `pull_through`, so they never reach this
+        // bump (their `hits` increment lives in the waiter branch of
+        // `get`).
+        if let Some(m) = &self.inner.metrics {
+            m.misses.inc();
+        }
         let origin = self
             .inner
             .origin
@@ -919,6 +948,16 @@ impl CacheEngine {
             OriginFetch::NotFound => return Err(CacheError::NotFound { hash }),
             OriginFetch::Found(b) => b,
         };
+
+        // Origin egress is paid the moment bytes arrive — count before
+        // BLAKE3 verification or the in-engine size-cap re-check, so a
+        // misbehaving origin returning bad bytes still shows up as
+        // egress spend (operators reasoning about origin cost need
+        // every fetched byte counted, not only the ones that landed).
+        if let Some(m) = &self.inner.metrics {
+            m.pull_through_bytes
+                .inc_by(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        }
 
         // Enforce the size cap on actual payload — even if the origin
         // omitted `Content-Length`, the blob can't silently exceed the cap.
@@ -1198,8 +1237,16 @@ mod tests {
             std::time::Duration::from_millis(50),
         ));
 
-        let engine =
-            CacheEngine::open(tmp.path(), Some(origin.clone() as Arc<dyn Origin>), 10).await?;
+        let cm = Arc::new(CacheMetrics::default());
+        let engine = CacheEngine::open_full(
+            tmp.path(),
+            Some(origin.clone() as Arc<dyn Origin>),
+            10,
+            crate::PinnedHashes::empty(),
+            crate::RetryPolicy::default(),
+            Some(Arc::clone(&cm)),
+        )
+        .await?;
 
         // Spawn several concurrent gets for the same hash.
         let mut handles = Vec::new();
@@ -1219,6 +1266,30 @@ mod tests {
         // The origin should have been called at most once (coalesced).
         let count = origin.fetch_count.load(Ordering::SeqCst);
         anyhow::ensure!(count == 1, "expected exactly 1 origin fetch, got {count}");
+
+        // Counter accounting under coalescing (#418): exactly one task
+        // becomes the owner and counts as a miss; the other four are
+        // waiter-retry hits. A regression that moved the waiter-hit
+        // bump out of `engine.rs::get`'s waiter branch would silently
+        // mis-classify every coalesced workload as a miss-storm.
+        anyhow::ensure!(
+            cm.misses.get() == 1,
+            "owner pulls once → exactly 1 miss, got {}",
+            cm.misses.get()
+        );
+        anyhow::ensure!(
+            cm.hits.get() == 4,
+            "4 waiters retry into a hit, got {} hits",
+            cm.hits.get()
+        );
+        anyhow::ensure!(
+            cm.pull_through_bytes.get() == payload.len() as u64,
+            "single origin fetch → pull_through_bytes == payload.len()"
+        );
+        anyhow::ensure!(
+            cm.bytes_returned.get() == (payload.len() as u64) * 5,
+            "all 5 callers got the bytes back, so bytes_returned == 5 * payload.len()"
+        );
         Ok(())
     }
 
@@ -1717,6 +1788,213 @@ mod tests {
             preview.origin_kind.is_none(),
             "expected None for cache-only mode, got {:?}",
             preview.origin_kind,
+        );
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------
+    // Cache hit/miss + bytes counters (#418)
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn hits_plus_misses_equals_total_gets() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"hello invariant";
+        let hash = Hash::new(payload);
+        let unknown = Hash::new(b"never present");
+        let origin = StubOrigin::new(payload);
+        let cm = Arc::new(CacheMetrics::default());
+        let engine = CacheEngine::open_full(
+            tmp.path(),
+            Some(Arc::new(origin)),
+            10,
+            crate::PinnedHashes::empty(),
+            crate::RetryPolicy::default(),
+            Some(Arc::clone(&cm)),
+        )
+        .await?;
+
+        // 1 miss (pull-through), 2 hits, 1 miss (origin NotFound), 1 miss (evicted).
+        let _ = engine.get(hash).await?; // miss
+        let _ = engine.get(hash).await?; // hit
+        let _ = engine.get(hash).await?; // hit
+        let _ = engine.get(unknown).await; // miss (origin NotFound)
+        engine.evict(hash)?;
+        let _ = engine.get(hash).await; // miss (evicted)
+
+        anyhow::ensure!(cm.hits.get() == 2, "hits = {}", cm.hits.get());
+        anyhow::ensure!(cm.misses.get() == 3, "misses = {}", cm.misses.get());
+        anyhow::ensure!(
+            cm.hits.get() + cm.misses.get() == 5,
+            "across cache-domain outcomes (no store-I/O errors), every get bumps exactly one of hits/misses"
+        );
+        // Only the priming Found bumped pull_through_bytes; the unknown
+        // get took the origin-NotFound branch which returns before the
+        // bump. Pin both, so a stray bump in either error path fails
+        // the test.
+        anyhow::ensure!(
+            cm.pull_through_bytes.get() == payload.len() as u64,
+            "pull_through_bytes = {}, expected {}",
+            cm.pull_through_bytes.get(),
+            payload.len()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pull_through_success_bumps_bytes_returned() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"hello pull-through bytes returned";
+        let hash = Hash::new(payload);
+        let origin = StubOrigin::new(payload);
+        let cm = Arc::new(CacheMetrics::default());
+        let engine = CacheEngine::open_full(
+            tmp.path(),
+            Some(Arc::new(origin)),
+            10,
+            crate::PinnedHashes::empty(),
+            crate::RetryPolicy::default(),
+            Some(Arc::clone(&cm)),
+        )
+        .await?;
+
+        let bytes = engine.get(hash).await?;
+        anyhow::ensure!(
+            cm.bytes_returned.get() == bytes.len() as u64,
+            "bytes_returned should match payload length after a successful pull-through"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pull_through_bumps_pull_through_bytes() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"hello pull-through bytes";
+        let hash = Hash::new(payload);
+        let origin = StubOrigin::new(payload);
+        let cm = Arc::new(CacheMetrics::default());
+        let engine = CacheEngine::open_full(
+            tmp.path(),
+            Some(Arc::new(origin)),
+            10,
+            crate::PinnedHashes::empty(),
+            crate::RetryPolicy::default(),
+            Some(Arc::clone(&cm)),
+        )
+        .await?;
+
+        let bytes = engine.get(hash).await?;
+        anyhow::ensure!(cm.misses.get() == 1, "first get is a miss");
+        anyhow::ensure!(cm.hits.get() == 0, "no hits on first get");
+        anyhow::ensure!(
+            cm.pull_through_bytes.get() == bytes.len() as u64,
+            "pull_through_bytes should equal payload length on a Found origin"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn no_origin_increments_misses_only() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let cm = Arc::new(CacheMetrics::default());
+        let engine = CacheEngine::open_full(
+            tmp.path(),
+            None,
+            10,
+            crate::PinnedHashes::empty(),
+            crate::RetryPolicy::default(),
+            Some(Arc::clone(&cm)),
+        )
+        .await?;
+
+        let hash = Hash::new(b"missing payload");
+        let Err(err) = engine.get(hash).await else {
+            anyhow::bail!("expected NoOrigin, got Ok");
+        };
+        anyhow::ensure!(
+            matches!(err, CacheError::NoOrigin { .. }),
+            "expected NoOrigin"
+        );
+        anyhow::ensure!(cm.misses.get() == 1, "exactly one miss for a NoOrigin get");
+        anyhow::ensure!(cm.hits.get() == 0, "no hits");
+        anyhow::ensure!(
+            cm.pull_through_bytes.get() == 0,
+            "no origin bytes since origin not configured"
+        );
+        anyhow::ensure!(
+            cm.bytes_returned.get() == 0,
+            "no bytes returned on error path"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn evicted_hash_increments_misses() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"hello evicted miss";
+        let hash = Hash::new(payload);
+        let origin = StubOrigin::new(payload);
+        let cm = Arc::new(CacheMetrics::default());
+        let engine = CacheEngine::open_full(
+            tmp.path(),
+            Some(Arc::new(origin)),
+            10,
+            crate::PinnedHashes::empty(),
+            crate::RetryPolicy::default(),
+            Some(Arc::clone(&cm)),
+        )
+        .await?;
+
+        // Prime then evict so the next get hits the evicted branch in get().
+        let _ = engine.get(hash).await?;
+        engine.evict(hash)?;
+        let misses_before = cm.misses.get();
+
+        let Err(err) = engine.get(hash).await else {
+            anyhow::bail!("expected NotFound, got Ok");
+        };
+        anyhow::ensure!(
+            matches!(err, CacheError::NotFound { .. }),
+            "evicted get must surface NotFound"
+        );
+        anyhow::ensure!(
+            cm.misses.get() == misses_before + 1,
+            "misses should bump by exactly 1 on an evicted-hash get"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hit_increments_hits_and_bytes_returned() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"hello hit metrics";
+        let hash = Hash::new(payload);
+        let origin = StubOrigin::new(payload);
+        let cm = Arc::new(CacheMetrics::default());
+        let engine = CacheEngine::open_full(
+            tmp.path(),
+            Some(Arc::new(origin)),
+            10,
+            crate::PinnedHashes::empty(),
+            crate::RetryPolicy::default(),
+            Some(Arc::clone(&cm)),
+        )
+        .await?;
+
+        // First get is a pull-through (miss); prime the cache.
+        let _ = engine.get(hash).await?;
+        let hits_before = cm.hits.get();
+        let bytes_before = cm.bytes_returned.get();
+
+        // Second get must be a local hit.
+        let bytes = engine.get(hash).await?;
+        anyhow::ensure!(
+            cm.hits.get() == hits_before + 1,
+            "hits should increment by 1 on a cache hit"
+        );
+        anyhow::ensure!(
+            cm.bytes_returned.get() == bytes_before + bytes.len() as u64,
+            "bytes_returned should increase by bytes.len() on a cache hit"
         );
         Ok(())
     }

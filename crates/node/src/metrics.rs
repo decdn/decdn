@@ -369,6 +369,16 @@ impl Drop for ConnectionGuard<'_> {
 mod tests {
     use super::*;
 
+    /// Match an exact `<name> <value>` metric line, anchored against
+    /// surrounding lines so `decdn_cache_hits_total 1` doesn't
+    /// accidentally substring-match into a future
+    /// `decdn_cache_hits_total_foo` series or the `OpenMetrics`
+    /// `_created` companion line.
+    fn has_metric_line(text: &str, name: &str, value: u64) -> bool {
+        let needle = format!("{name} {value}");
+        text.lines().any(|l| l == needle)
+    }
+
     #[test]
     fn cache_metrics_counters_start_at_zero() {
         // Pinning down the OpenMetrics shape — a fresh registry must
@@ -379,10 +389,98 @@ mod tests {
         for name in [
             "decdn_cache_origin_fetches_total",
             "decdn_cache_origin_retry_exhausted_total",
+            "decdn_cache_hits_total",
+            "decdn_cache_misses_total",
+            "decdn_cache_bytes_returned_total",
+            "decdn_cache_pull_through_bytes_total",
         ] {
             assert!(
-                text.contains(&format!("{name} 0")),
+                has_metric_line(&text, name, 0),
                 "counter {name} should be exposed at zero on a fresh registry:\n{text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn engine_bumps_surface_in_openmetrics_output() {
+        use std::sync::Arc;
+
+        use bytes::Bytes;
+        use decdn_cache::{
+            CacheEngine, Origin, OriginFetch, OriginKind, OriginPullError, PinnedHashes,
+            RetryPolicy,
+        };
+        use iroh_blobs::Hash;
+
+        // Minimal in-memory origin: returns the prearranged payload for
+        // its hash, NotFound otherwise. Mirrors the StubOrigin used in
+        // crates/cache tests but is local to this integration test so
+        // we don't need to expose the cache crate's test fixtures.
+        #[derive(Debug)]
+        struct StubOrigin {
+            data: Bytes,
+            hash: Hash,
+        }
+        impl Origin for StubOrigin {
+            fn kind(&self) -> OriginKind {
+                OriginKind::Http
+            }
+            fn fetch(
+                &self,
+                hash: Hash,
+                _max_bytes: u64,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<OriginFetch, OriginPullError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                let result = if hash == self.hash {
+                    Ok(OriginFetch::Found(self.data.clone()))
+                } else {
+                    Ok(OriginFetch::NotFound)
+                };
+                Box::pin(async move { result })
+            }
+        }
+
+        let payload = b"hello /metrics integration".to_vec();
+        let hash = Hash::new(&payload);
+        let stub = StubOrigin {
+            data: Bytes::from(payload.clone()),
+            hash,
+        };
+
+        let metrics = Arc::new(Metrics::new());
+        let cache_handle = metrics.cache_metrics();
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open_full(
+            tmp.path(),
+            Some(Arc::new(stub)),
+            10,
+            PinnedHashes::empty(),
+            RetryPolicy::default(),
+            Some(Arc::clone(&cache_handle)),
+        )
+        .await
+        .unwrap();
+
+        // 1 miss (pull-through) + 1 hit.
+        let _ = engine.get(hash).await.unwrap();
+        let _ = engine.get(hash).await.unwrap();
+
+        let text = metrics.encode().unwrap();
+        let payload_len = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+        for (name, expected) in [
+            ("decdn_cache_hits_total", 1u64),
+            ("decdn_cache_misses_total", 1),
+            ("decdn_cache_pull_through_bytes_total", payload_len),
+            ("decdn_cache_bytes_returned_total", payload_len * 2),
+        ] {
+            assert!(
+                has_metric_line(&text, name, expected),
+                "counter {name} should report {expected} after 1 miss + 1 hit:\n{text}"
             );
         }
     }
@@ -397,14 +495,23 @@ mod tests {
         let handle = metrics.cache_metrics();
         handle.origin_fetches.inc();
         handle.origin_retry_exhausted.inc();
+        handle.hits.inc();
+        handle.misses.inc();
+        handle.bytes_returned.inc_by(1024);
+        handle.pull_through_bytes.inc_by(2048);
         let text = metrics.encode().unwrap();
-        assert!(
-            text.contains("decdn_cache_origin_fetches_total 1"),
-            "fetches counter not visible in scrape:\n{text}"
-        );
-        assert!(
-            text.contains("decdn_cache_origin_retry_exhausted_total 1"),
-            "exhausted counter not visible in scrape:\n{text}"
-        );
+        for (name, expected) in [
+            ("decdn_cache_origin_fetches_total", 1u64),
+            ("decdn_cache_origin_retry_exhausted_total", 1),
+            ("decdn_cache_hits_total", 1),
+            ("decdn_cache_misses_total", 1),
+            ("decdn_cache_bytes_returned_total", 1024),
+            ("decdn_cache_pull_through_bytes_total", 2048),
+        ] {
+            assert!(
+                has_metric_line(&text, name, expected),
+                "counter {name} should report {expected}:\n{text}"
+            );
+        }
     }
 }
