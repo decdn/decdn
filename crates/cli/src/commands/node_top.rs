@@ -16,13 +16,15 @@ use decdn_common::config::DEFAULT_METRICS_PORT;
 
 /// Parse an `OpenMetrics` text body into `name -> value`.
 ///
-/// Scope is deliberate: only label-free counters and gauges. Lines
-/// starting with `#` (HELP/TYPE/UNIT/EOF directives) are skipped.
-/// Lines whose name token contains `{` (label-bearing series) are
-/// skipped — `node top` only consumes the bare `decdn_*` series the
-/// daemon registers (`crates/node/src/metrics.rs`), none of which
-/// carry labels today, so silently ignoring labelled lines is the
-/// correct degradation if the metric surface grows them later.
+/// Scope is deliberate: only label-free counters and gauges. Any
+/// line starting with `#` is skipped — this covers the
+/// `OpenMetrics` `HELP`/`TYPE`/`UNIT`/`EOF` directives the encoder
+/// emits, plus any other comments in future revisions. Lines whose name token
+/// contains `{` (label-bearing series) are skipped — `node top`
+/// only consumes the bare `decdn_*` series the daemon registers
+/// (`crates/node/src/metrics.rs`), none of which carry labels today,
+/// so silently ignoring labelled lines is the correct degradation
+/// if the metric surface grows them later.
 ///
 /// Counter `_created` timestamp lines parse as floats; callers look
 /// up the names they want and ignore the rest.
@@ -64,9 +66,11 @@ pub(crate) struct Snapshot {
 impl Snapshot {
     pub(crate) fn from_metrics(m: &HashMap<String, f64>) -> Self {
         // Saturating cast: gauges/counters are non-negative in
-        // practice (the `rpc_healthy` 0/1 gauge included). A negative
-        // value here would only arise from a clock-skew gauge we
-        // don't read, so saturating-to-zero is safe.
+        // practice. Negative or non-finite floats clamp to 0;
+        // values above `u64::MAX` clamp to `u64::MAX`. The negative
+        // branch is mostly defensive (a clock-skew gauge we don't
+        // read could go negative); the high-end clamp matters
+        // because `f64::INFINITY >= u64::MAX as f64` is true.
         #[allow(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
@@ -132,10 +136,12 @@ impl SnapshotDelta {
 /// Cumulative hit ratio over `(hits + misses)`. `None` when the
 /// denominator is 0 — distinct from `Some(0.0)` ("only misses so
 /// far") so the renderer prints a literal `n/a` rather than a
-/// misleading `0.0%`.
+/// misleading `0.0%`. Uses `saturating_add` for symmetry with
+/// `SnapshotDelta::between`'s arithmetic, even though u64 overflow
+/// from these counters is unreachable in practice.
 #[allow(clippy::cast_precision_loss)]
 pub(crate) fn hit_rate(hits: u64, misses: u64) -> Option<f64> {
-    let total = hits + misses;
+    let total = hits.saturating_add(misses);
     if total == 0 {
         None
     } else {
@@ -283,11 +289,10 @@ pub(crate) fn write_top_table(
     Ok(())
 }
 
-/// Render a single snapshot as pretty JSON. Schema is hand-rolled
-/// (rather than `serde_json::to_string_pretty(&Snapshot)`) so the
-/// public output shape — field names, `hit_rate` as a fraction in
-/// `[0, 1]` or null, ordering — is decoupled from the internal
-/// struct's field order.
+/// Render a single snapshot as pretty JSON. The schema is hand-rolled
+/// so the public output shape (field names, ordering, `hit_rate` as
+/// a fraction in `[0, 1]` or null) is stable across internal
+/// `Snapshot` field reorderings.
 pub(crate) fn render_json_snapshot(s: &Snapshot) -> anyhow::Result<String> {
     let value = serde_json::json!({
         "uptime_seconds": s.uptime_seconds,
@@ -410,9 +415,8 @@ pub async fn run(args: &cli::TopArgs, global_config: Option<&Path>) -> anyhow::R
 
     let interval = Duration::from_millis(args.interval_ms);
     let mut ticker = tokio::time::interval(interval);
-    // First tick fires immediately; subsequent ticks every `interval`.
-    // `Skip` means a stalled scrape doesn't cause a burst when
-    // catching back up.
+    // `Skip` so a stalled scrape doesn't cause a burst of catch-up
+    // ticks once the daemon comes back.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut prev: Option<(Snapshot, Instant)> = None;
@@ -657,6 +661,30 @@ mod snapshot_tests {
     }
 
     #[test]
+    fn per_second_delta_saturates_on_counter_regression() {
+        // If the underlying counter went backwards between ticks
+        // (daemon restart, URL re-pointing, instance reset), the
+        // delta must show 0/s for that one tick rather than a huge
+        // wraparound spike. This locks in the `saturating_sub` at
+        // SnapshotDelta::between — a regression to plain `-` would
+        // pass every other test in this file but fail this one.
+        let prev = Snapshot::from_metrics(&fake_metrics(
+            310.0,
+            800.0,
+            90.0,
+            14_000_000.0,
+            2.0,
+            4.0,
+            1.0,
+        ));
+        let now = Snapshot::from_metrics(&fake_metrics(311.0, 5.0, 1.0, 1024.0, 0.0, 0.0, 1.0));
+        let d = SnapshotDelta::between(&prev, &now, Duration::from_secs(1));
+        assert_eq!(d.hits, 0.0);
+        assert_eq!(d.misses, 0.0);
+        assert_eq!(d.bytes, 0.0);
+    }
+
+    #[test]
     fn per_second_delta_zero_elapsed_returns_zero() {
         // If `Instant::now() - prev_at` is somehow zero (or sub-tick),
         // dividing would produce NaN/inf — return 0 instead so the
@@ -715,6 +743,23 @@ mod render_tests {
         assert_eq!(format_rate_bytes(0.0), "0 B/s");
         assert_eq!(format_rate_bytes(1024.0), "1.0 KiB/s");
         assert_eq!(format_rate_bytes(2_500_000.0), "2.4 MiB/s");
+    }
+
+    #[test]
+    fn format_uptime_crosses_unit_boundaries() {
+        // The four cross-unit boundaries: 60s (s→m), 3600s (m→h),
+        // 86400s (h→d), and the in-band cases. The `write_top_table`
+        // tests exercise the m+s shape via substring; cross-units
+        // need direct asserts so a regression at the boundary
+        // arithmetic doesn't sneak past unnoticed.
+        assert_eq!(format_uptime(0), "0s");
+        assert_eq!(format_uptime(59), "59s");
+        assert_eq!(format_uptime(60), "1m 0s");
+        assert_eq!(format_uptime(3_599), "59m 59s");
+        assert_eq!(format_uptime(3_600), "1h 0m");
+        assert_eq!(format_uptime(86_399), "23h 59m");
+        assert_eq!(format_uptime(86_400), "1d 0h");
+        assert_eq!(format_uptime(2 * 86_400 + 3 * 3_600), "2d 3h");
     }
 
     #[test]
@@ -1053,6 +1098,62 @@ mod resolve_tests {
         assert!(
             err.contains("disables") || err.contains('0'),
             "missing context: {err}"
+        );
+    }
+
+    #[test]
+    fn port_from_config_file_missing_default_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent.toml");
+        assert_eq!(
+            port_from_config_file(Some(&path), ConfigPathSource::Default).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn port_from_config_file_missing_explicit_errors() {
+        // Explicit path that doesn't exist is a typo, not a
+        // not-yet-configured operator — must surface as an error
+        // (unlike the default-path branch above).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent.toml");
+        let err = port_from_config_file(Some(&path), ConfigPathSource::Explicit)
+            .expect_err("expected explicit-missing error")
+            .to_string();
+        assert!(
+            err.contains("failed to read config file"),
+            "missing context: {err}"
+        );
+    }
+
+    #[test]
+    fn port_from_config_file_errors_on_invalid_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broken.toml");
+        std::fs::write(&path, b"not = valid = toml").unwrap();
+        let err = port_from_config_file(Some(&path), ConfigPathSource::Default)
+            .expect_err("expected parse error")
+            .to_string();
+        assert!(err.contains("parse"), "missing context: {err}");
+    }
+
+    #[test]
+    fn port_from_config_file_ignores_unrelated_field_errors() {
+        // Locks in the partial-deserializer choice: a wrong type in
+        // some unrelated section (e.g. a malformed `[network]`
+        // field that the full FileConfig would reject) must not stop
+        // `decdn node top` from resolving the metrics port.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node.toml");
+        std::fs::write(
+            &path,
+            b"[observability]\nmetrics_port = 4242\n[network]\nbind_addr = 7\n",
+        )
+        .unwrap();
+        assert_eq!(
+            port_from_config_file(Some(&path), ConfigPathSource::Default).unwrap(),
+            Some(4242)
         );
     }
 }
