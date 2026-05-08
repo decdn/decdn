@@ -157,9 +157,13 @@ jobs:
       - name: Run tests (with coverage instrumentation)
         run: cargo llvm-cov nextest --workspace --lcov --output-path lcov.info --no-tests=pass
 
+      # No continue-on-error: this only runs on push to main (post-merge), so
+      # a failure paints main CI red rather than blocking a PR. Silent
+      # degradation is worse than a visible red on main — a persistent upload
+      # failure would silently freeze the coverage baseline that all PR diffs
+      # are computed against.
       - name: Upload coverage baseline
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
           name: coverage-lcov
@@ -223,24 +227,41 @@ jobs:
         # The script writes the truncated comment to stdout (captured here for the
         # PR comment) and the full per-file table directly to $GITHUB_STEP_SUMMARY.
         # DECDN_HEAD_SHA must be the PR head, not GITHUB_SHA (which is the merge SHA).
-        # Atomic write: stdout goes to a .tmp file; the rename only runs if the
-        # script exited 0 (set -e). A mid-stream crash leaves the .tmp behind
-        # and never produces coverage-comment.md, so the post step's hashFiles
-        # guard correctly skips instead of posting truncated output.
+        # Atomic write on success: stdout to .tmp, then rename. On failure,
+        # write a marker-bearing fallback comment so the Post step updates the
+        # sticky to a "diff failed" indicator rather than leaving stale data
+        # from a prior push. The marker must match MARKER in coverage-diff.py.
         env:
           DECDN_COVERAGE_PRIOR_BODY: prior-comment.md
           DECDN_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          python3 .github/scripts/coverage-diff.py lcov.info baseline/lcov.info \
-            > coverage-comment.md.tmp
-          mv coverage-comment.md.tmp coverage-comment.md
+          if python3 .github/scripts/coverage-diff.py lcov.info baseline/lcov.info \
+               > coverage-comment.md.tmp; then
+            mv coverage-comment.md.tmp coverage-comment.md
+          else
+            rc=$?
+            rm -f coverage-comment.md.tmp
+            run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            printf '%s\n' \
+              '<!-- decdn-coverage-comment -->' \
+              '## Coverage report' \
+              '' \
+              ":warning: Coverage diff generation failed for commit \`${DECDN_HEAD_SHA}\`." \
+              "See the [workflow run logs](${run_url}) for details." \
+              > coverage-comment.md
+            exit $rc
+          fi
 
       # always(): post the comment even when the required `Run tests` step fails
       # (without it, success() would be false and this step would skip on red PRs).
-      # The hashFiles guard handles the no-output case: Generate coverage diff
-      # writes atomically (.tmp + rename), so a script crash leaves no
-      # coverage-comment.md and hashFiles correctly skips. Skip on fork PRs:
+      # On a coverage-diff.py crash, Generate coverage diff writes a marker-
+      # bearing fallback so this step still updates the sticky to a "diff
+      # failed" indicator instead of leaving stale data. The hashFiles guard
+      # only excludes the case where Generate coverage diff was itself skipped
+      # (e.g. Run tests failed and the implicit success() gate skipped the
+      # rest of the chain — in that case the failed-tests signal on the
+      # required job is the unambiguous indicator). Skip on fork PRs:
       # GITHUB_TOKEN is read-only there and createComment would 403.
       - name: Post coverage comment
         if: |
@@ -335,7 +356,7 @@ jobs:
     name: CI success
     if: always()
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, test, deny, doc, msrv, markdownlint]
+    needs: [fmt, clippy, changes, test, deny, doc, msrv, markdownlint]
     steps:
       - uses: re-actors/alls-green@release/v1
         with:
