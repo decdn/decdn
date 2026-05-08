@@ -283,6 +283,27 @@ pub(crate) fn write_top_table(
     Ok(())
 }
 
+/// Render a single snapshot as pretty JSON. Schema is hand-rolled
+/// (rather than `serde_json::to_string_pretty(&Snapshot)`) so the
+/// public output shape — field names, `hit_rate` as a fraction in
+/// `[0, 1]` or null, ordering — is decoupled from the internal
+/// struct's field order.
+#[allow(dead_code)] // Wired into the fetch loop in a later task.
+pub(crate) fn render_json_snapshot(s: &Snapshot) -> anyhow::Result<String> {
+    use anyhow::Context;
+    let value = serde_json::json!({
+        "uptime_seconds": s.uptime_seconds,
+        "active_connections": s.active_connections,
+        "dispatch_in_flight": s.dispatch_in_flight,
+        "cache_hits_total": s.cache_hits,
+        "cache_misses_total": s.cache_misses,
+        "cache_bytes_returned_total": s.cache_bytes_returned,
+        "cache_hit_rate": hit_rate(s.cache_hits, s.cache_misses),
+        "rpc_healthy": s.rpc_healthy,
+    });
+    serde_json::to_string_pretty(&value).context("encode top snapshot as JSON")
+}
+
 /// Entry point dispatched from `node_dispatch`. Currently a stub —
 /// later tasks add the metrics fetch, parse, and render loop. The
 /// signature is `async` because the dispatch arm awaits it; clippy
@@ -611,5 +632,58 @@ mod render_tests {
             out.contains("rpc=unhealthy"),
             "expected rpc=unhealthy: {out}"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
+mod json_tests {
+    use super::*;
+
+    #[test]
+    fn json_includes_all_fields() {
+        let s = Snapshot {
+            uptime_seconds: 312,
+            active_connections: 4,
+            dispatch_in_flight: 2,
+            cache_hits: 812,
+            cache_misses: 94,
+            cache_bytes_returned: 14_900_000,
+            rpc_healthy: true,
+        };
+        let json = render_json_snapshot(&s).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["uptime_seconds"], 312);
+        assert_eq!(v["cache_hits_total"], 812);
+        assert_eq!(v["cache_misses_total"], 94);
+        assert_eq!(v["cache_bytes_returned_total"], 14_900_000);
+        assert_eq!(v["dispatch_in_flight"], 2);
+        assert_eq!(v["active_connections"], 4);
+        assert_eq!(v["rpc_healthy"], true);
+        // Cumulative hit_rate emitted as a fraction in [0,1] so
+        // downstream tooling does its own formatting.
+        let hr = v["cache_hit_rate"].as_f64().unwrap();
+        assert!((hr - 812.0 / (812.0 + 94.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn json_hit_rate_null_on_empty_cache() {
+        let s = Snapshot {
+            uptime_seconds: 0,
+            active_connections: 0,
+            dispatch_in_flight: 0,
+            cache_hits: 0,
+            cache_misses: 0,
+            cache_bytes_returned: 0,
+            rpc_healthy: false,
+        };
+        let json = render_json_snapshot(&s).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v["cache_hit_rate"].is_null());
     }
 }
