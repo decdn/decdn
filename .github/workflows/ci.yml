@@ -136,6 +136,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
+      # mold is a drop-in replacement for ld; on this 8-crate workspace
+      # (alloy/iroh/tokio/aws-sdk) it noticeably shortens the link phase of
+      # the instrumented test binaries. Scoped to the test job because that's
+      # the only job that actually links binaries (clippy/check/doc don't).
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y mold
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: coverage
@@ -158,8 +164,28 @@ jobs:
       # sccache is not wired here (matching the prior coverage job); Swatinem
       # /rust-cache with shared-key: coverage covers caching of instrumented
       # build artifacts on its own.
+      #
+      # RUSTFLAGS is scoped to this step on purpose. Swatinem/rust-cache hashes
+      # the env into its cache key, so setting it here only invalidates the
+      # `coverage` shared-key — clippy/doc/msrv keep their warm caches. Three
+      # link/debug knobs:
+      #   - link-arg=-fuse-ld=mold: route final link through mold (faster than ld
+      #     for the workspace's ~8 instrumented test binaries).
+      #   - debuginfo=1: equivalent to debug = "line-tables-only". cargo-llvm-cov
+      #     only needs the .debug_line section to map counters to source lines
+      #     (the SF/DA records in lcov.info). Stripping type/var info shrinks
+      #     compile + link + cached target tree.
+      #   - split-debuginfo=unpacked: side-file debug info; smaller .o files
+      #     and faster relinking. Coverage-orthogonal.
+      # CARGO_INCREMENTAL=0: incremental files bloat the cache for zero gain in
+      # CI (no second compile in the same run). --no-clean tells cargo-llvm-cov
+      # to trust the cached target tree (modern versions don't clean by default
+      # for the same profile, but explicit beats implicit).
       - name: Run tests (with coverage instrumentation)
-        run: cargo llvm-cov nextest --workspace --lcov --output-path lcov.info --no-tests=pass
+        env:
+          RUSTFLAGS: "-C link-arg=-fuse-ld=mold -C debuginfo=1 -C split-debuginfo=unpacked"
+          CARGO_INCREMENTAL: "0"
+        run: cargo llvm-cov nextest --workspace --lcov --output-path lcov.info --no-tests=pass --no-clean
 
       # No continue-on-error: this only runs on push to main (post-merge), so
       # a failure paints main CI red rather than blocking a PR. Silent
