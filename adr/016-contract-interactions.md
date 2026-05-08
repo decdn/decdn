@@ -629,8 +629,8 @@ flowchart TD
 
     Operator -->|"stake(amount)"| SR
     SR -->|"unstake() after unbonding"| Operator
-    Challenger -->|"submitPhantomChallenge() /<br/>submitRateChallenge() /<br/>submitBlacklistChallenge() /<br/>submitCorruptionChallenge()<br/>bond deposit"| SJ
-    SJ -->|"resolveChallenge()<br/>→ slash(node, offenseType)<br/>(amount computed internally)"| SR
+    Challenger -->|"submitPhantomChallenge() /<br/>submitRateChallenge() /<br/>submitBlacklistChallenge() /<br/>submitReceiptFraudChallenge()<br/>bond deposit"| SJ
+    SJ -->|"slash(node, offenseType)<br/>(amount computed internally)"| SR
     SR -->|"50% of slash to msg.sender"| SJ
     SR -->|"30% of slash"| SAFE
     SR -->|"20% of slash"| BURN
@@ -655,7 +655,7 @@ flowchart TD
 | VotingEscrow | TOKEN (locked, non-transferable) | User `createLock` deposits | `withdraw()` after lock expiry only; no early exit, no `create_lock_for` privileged path ([ADR 026](026-gauge-boost-tokenomics.md) §4) |
 | SafetyReserve | USDC (3% router bucket; primary holding) + TOKEN (30% slashing redirect; swapped to USDC via keeper) | `FeeRouter`, `StakingRegistry` slashing path | `payout(bundle, recipient, amount)` USDC-only after evidence bundle, Governor (or emergency-multisig within hard caps), and 48h appeal window ([ADR 026](026-gauge-boost-tokenomics.md) §5) |
 | StakingRegistry | TOKEN | Node operator stakes | `unstake()` after unbonding |
-| SlashJudge | TOKEN | Challenger bond deposits | `resolveChallenge()` (slash reward + bond return to challenger) or bond forfeiture |
+| SlashJudge | TOKEN | Challenger bond deposits | Synchronous resolution inside each `submit*Challenge` (slash reward + bond return to challenger on success; revert on failed verification) |
 | BuybackBurner | USDC (accumulated), TOKEN (transient) | 5% USDC same-tx from `FeeRouter` ([ADR 026](026-gauge-boost-tokenomics.md) §8) | `executeBuyback()` |
 | DelegatorBuyer | USDC (per-epoch delegator-pool bucket, transient), TOKEN (transient before deposit back to FeeRouter) | 7% USDC same-tx from `FeeRouter` ([ADR 026](026-gauge-boost-tokenomics.md) §6) | `swapDelegatorBucket(epoch, amountIn, minOut)` (KEEPER_ROLE); deposits resulting TOKEN into `FeeRouter`'s delegator bucket for `claimDelegator` |
 | TimelockController | USDC (5% protocol-treasury bucket) | 5% USDC same-tx from `FeeRouter` | Treasury disbursement requires a `DecdnGovernor` proposal under the standard 48h timelock ([ADR 009](009-governance.md)) |
@@ -741,12 +741,10 @@ Every state-mutating function that makes an external call is listed below with i
 
 | Function | External Calls | Guards |
 | --- | --- | --- |
-| `submitPhantomChallenge()` | `IERC20.safeTransferFrom()` (TOKEN bond deposit) | `nonReentrant`, checks-effects-interactions |
-| `submitRateChallenge()` | `IERC20.safeTransferFrom()` (TOKEN bond deposit) | `nonReentrant`, checks-effects-interactions |
-| `submitBlacklistChallenge()` | `IERC20.safeTransferFrom()` (TOKEN bond deposit), `ContentBlacklist.getEntry()` (read) | `nonReentrant`, checks-effects-interactions |
-| `submitCorruptionChallenge()` | `IERC20.safeTransferFrom()` (TOKEN bond deposit) | `nonReentrant`, checks-effects-interactions |
-| `counterChallenge()` | `IERC20.safeTransfer()` (bond forfeit: 50% burn, 50% to node) | `nonReentrant`, checks-effects-interactions |
-| `resolveChallenge()` | `StakingRegistry.slash()`, `IERC20.safeTransfer()` (slash reward + bond return to challenger) | `nonReentrant`, checks-effects-interactions |
+| `submitPhantomChallenge()` | `IERC20.safeTransferFrom()` (TOKEN bond deposit), `StakingRegistry.slash()`, `IERC20.safeTransfer()` (slash reward + bond return on success) | `nonReentrant`, checks-effects-interactions |
+| `submitRateChallenge()` | `IERC20.safeTransferFrom()` (TOKEN bond deposit), `StakingRegistry.slash()`, `IERC20.safeTransfer()` (slash reward + bond return on success) | `nonReentrant`, checks-effects-interactions |
+| `submitBlacklistChallenge()` | `IERC20.safeTransferFrom()` (TOKEN bond deposit), `ContentBlacklist.getEntry()` (read), `StakingRegistry.slash()`, `IERC20.safeTransfer()` (slash reward + bond return on success) | `nonReentrant`, checks-effects-interactions |
+| `submitReceiptFraudChallenge()` | `IERC20.safeTransferFrom()` (TOKEN bond deposit), `StakingRegistry.slash()`, `IERC20.safeTransfer()` (slash reward + bond return on success) | `nonReentrant`, checks-effects-interactions |
 
 #### BuybackBurner
 

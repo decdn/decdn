@@ -17,7 +17,6 @@ The goal is a clean mechanical answer to: **how does the codebase express the di
 | Payment contract | `StablePaymentChannel` (USDC-only) | `PaymentChannel` (multi-token allowlist) | ADR 003, 010 |
 | Governance | Single admin key (`onlyOwner`) | OpenZeppelin Governor + 2-day Timelock | ADR 009 |
 | Challenge bond | 100 TOKEN | 100 TOKEN | ADR 026 |
-| Corruption verification | Optimistic challenge-response (signed `StreamResponse`) | Interactive keccak256 Merkle proof over 1 KiB chunks | ADR 014 |
 | Buyback | Accumulate-only (`executeBuyback` never called) | Active execution via `BuybackBurner` after activation criteria met | ADR 018, 026 |
 | Key management (node) | File-based (`~/.decdn/node.key`) | Platform keychain + hardware wallet via delegated hot key | ADR 012 |
 | Key management (client) | File-based | Platform keychain; hardware wallet + derived hot key for voucher signing | ADR 012 |
@@ -109,19 +108,7 @@ pub trait GovernanceClient: Send + Sync {
 | Challenge bond | 100 TOKEN | 100 TOKEN |
 | Buyback | `BuybackBurner` receives fees; `executeBuyback` never called | Called by keeper after activation criteria met (ADR 018) |
 
-### 6. `CorruptionChallenger` — `crates/incentive`
-
-```rust
-pub trait CorruptionChallenger: Send + Sync {
-    fn submit_challenge(&self, evidence: &CorruptionEvidence) -> Result<TxHash>;
-}
-```
-
-| | PoC | Production |
-|---|-----|------------|
-| Evidence | Signed `StreamResponse` + 100 TOKEN bond; 24h counter-evidence window | Interactive keccak256 Merkle proof over 1 KiB chunks; requires keeper to resolve |
-
-### 7. `NetworkConstants` — `crates/protocol`
+### 5. `NetworkConstants` — `crates/protocol`
 
 Not a trait — a plain struct with a constructor per mode. All mode-dependent numeric constants live here and nowhere else.
 
@@ -155,7 +142,7 @@ Concrete values:
 | `dispute_window_secs` | 48 × 3600 (172800) | Governable 12h–72h; default 48h at genesis |
 | `min_bootstrap_peers` | 3 | 8 |
 
-### 8. `FeeRouterClient` — `crates/incentive`
+### 6. `FeeRouterClient` — `crates/incentive`
 
 Introduced by [ADR 026](026-gauge-boost-tokenomics.md) §2. The `FeeRouter` contract receives the full operator USDC balance from `PaymentChannel.settleChannel` and atomically splits it into the six buckets. The wiring seam selects between an in-process PoC stub (a no-op or local accounting router) and the deployed production contract address per network.
 
@@ -177,7 +164,7 @@ pub trait FeeRouterClient: Send + Sync {
 | Settlement path | `PaymentChannel.settleChannel` pays operator the full balance; downstream buckets simulated for tests | `PaymentChannel.settleChannel` calls `FeeRouter.routeSettlement(operator, bytesDelivered, amount)` in the same transaction |
 | Per-network config | N/A | Address sourced from chain-id-keyed config; sum-to-100% safety bounds enforced on chain |
 
-### 9. `VotingEscrowReader` — `crates/incentive`
+### 7. `VotingEscrowReader` — `crates/incentive`
 
 Introduced by [ADR 026](026-gauge-boost-tokenomics.md) §4. ve-balance lookups are load-bearing for the gauge-boost epoch snapshot (§3 of ADR 026) and ve-weighted governance (§9 of ADR 026). The wiring seam selects between an in-memory fixture (deterministic ve-balances for tests / local dev) and an on-chain `VotingEscrow.balanceOfAt(user, ts)` reader.
 
@@ -196,7 +183,7 @@ pub trait VotingEscrowReader: Send + Sync {
 | Determinism | Fully deterministic; no chain dependency | Reads checkpoint array on the deployed `VotingEscrow` contract |
 | Use sites | Gauge-boost share computation; ve-weighted governance simulations | Same call sites; selection happens in the wiring layer |
 
-### 10. `SwapHelper` — `crates/incentive`
+### 8. `SwapHelper` — `crates/incentive`
 
 Introduced by [ADR 026](026-gauge-boost-tokenomics.md) §6 and consolidated with [ADR 018](018-liquidity-strategy.md). Both `BuybackBurner` (5% burn bucket) and the delegator-pool USDC→TOKEN path (7% bucket) require a swap backend with TWAP windows, `minOut` slippage protection, and per-epoch liquidity caps. Consolidating into a single seam reduces wiring surface.
 
@@ -214,7 +201,7 @@ pub trait SwapHelper: Send + Sync {
 | Used by | `BuybackBurner` (burn) and `DelegatorBuyer` (or `BuybackBurner` multi-output mode) | Same call sites |
 | MEV protection | N/A (deterministic mock) | TWAP windows, `minOut`, private RPC, per-epoch caps (hard requirement, not optional) |
 
-### 11. `SafetyReservePayout` — `crates/incentive`
+### 9. `SafetyReservePayout` — `crates/incentive`
 
 Introduced by [ADR 026](026-gauge-boost-tokenomics.md) §5. The 3% safety bucket is governance-gated; payouts require an attested incident bundle, governance proposal (or fast-track multisig within hard caps), 48-hour appeal window, and post-incident reporting. The wiring seam selects between a local approval mock (single-step approval for tests / local dev) and the Governor-gated production path.
 
@@ -364,6 +351,5 @@ The six wiring-shape alternatives evaluated against centralised `#[cfg]`-keyed s
 | ADR 009 | `GovernanceClient` | Admin key vs Governor |
 | ADR 010 | `PaymentChannelClient` | Multi-token client for production |
 | ADR 012 | `KeyStore` | File-based vs keychain/HW wallet |
-| ADR 014 | `CorruptionChallenger` | Optimistic vs Merkle proof |
 | ADR 018 | `SwapHelper` | Mock pool (PoC) vs Balancer V3 (production); shared by `BuybackBurner` and delegator-pool path |
 | ADR 026 | `FeeRouterClient`, `VotingEscrowReader`, `SwapHelper`, `SafetyReservePayout` | production contract surface; PoC stubs / fixtures / mocks vs deployed contracts per network |
