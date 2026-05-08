@@ -898,6 +898,13 @@ impl CacheEngine {
     const BLOCKING_HASH_THRESHOLD: usize = 1 << 20; // 1 MiB
 
     async fn pull_through(&self, hash: Hash) -> CacheResult<Bytes> {
+        // Every pull_through entry is a `get()` cache miss: this fires
+        // for `NoOrigin`, origin `NotFound`, hash-mismatch, and the success
+        // path. Owner waiters that retry and find a fresh hit do not
+        // call `pull_through`, so they never reach this bump.
+        if let Some(m) = &self.inner.metrics {
+            m.misses.inc();
+        }
         let origin = self
             .inner
             .origin
@@ -1733,6 +1740,41 @@ mod tests {
     // -------------------------------------------------------------------
     // Cache hit/miss + bytes counters (#418)
     // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn no_origin_increments_misses_only() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let cm = Arc::new(CacheMetrics::default());
+        let engine = CacheEngine::open_full(
+            tmp.path(),
+            None,
+            10,
+            crate::PinnedHashes::empty(),
+            crate::RetryPolicy::default(),
+            Some(Arc::clone(&cm)),
+        )
+        .await?;
+
+        let hash = Hash::new(b"missing payload");
+        let Err(err) = engine.get(hash).await else {
+            anyhow::bail!("expected NoOrigin, got Ok");
+        };
+        anyhow::ensure!(
+            matches!(err, CacheError::NoOrigin { .. }),
+            "expected NoOrigin"
+        );
+        anyhow::ensure!(cm.misses.get() == 1, "exactly one miss for a NoOrigin get");
+        anyhow::ensure!(cm.hits.get() == 0, "no hits");
+        anyhow::ensure!(
+            cm.pull_through_bytes.get() == 0,
+            "no origin bytes since origin not configured"
+        );
+        anyhow::ensure!(
+            cm.bytes_returned.get() == 0,
+            "no bytes returned on error path"
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn evicted_hash_increments_misses() -> anyhow::Result<()> {
