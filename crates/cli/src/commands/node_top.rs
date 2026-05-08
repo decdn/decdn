@@ -473,18 +473,29 @@ pub async fn run(args: &cli::TopArgs, global_config: Option<&Path>) -> anyhow::R
 }
 
 /// Build the full `/metrics` URL from an operator-supplied base.
-/// Tolerates the two natural mistakes — a trailing `/` on the base
-/// (`http://h:9090/`) and a base that already ends in `/metrics`
-/// (`http://h:9090/metrics`) — without producing `//metrics` or
-/// `/metrics/metrics`. The resolver in this crate hands us a clean
+/// Tolerates the natural mistakes — a trailing `/` on the base
+/// (`http://h:9090/`), a base already ending in `/metrics`
+/// (`http://h:9090/metrics`), and a query string or fragment on
+/// either (`http://h:9090?token=foo`) — without producing
+/// `//metrics`, `/metrics/metrics`, or splicing the path inside the
+/// query value. The resolver in this crate hands us a clean
 /// `http://127.0.0.1:{port}` so the public-facing exposure here is
 /// the `--metrics-url` / `DECDN_METRICS_URL` path.
 fn append_metrics_path(base: &str) -> String {
-    let stripped = base.trim_end_matches('/');
+    // Split off any query string or fragment first so we can
+    // manipulate the path independently. Without this split, an
+    // operator URL like `http://h:9090?token=foo` would have
+    // `/metrics` appended *inside* the query value.
+    let split_at = base.find(['?', '#']);
+    let (path_part, suffix) = match split_at {
+        Some(i) => (base.get(..i).unwrap_or(base), base.get(i..).unwrap_or("")),
+        None => (base, ""),
+    };
+    let stripped = path_part.trim_end_matches('/');
     if stripped.ends_with("/metrics") {
-        stripped.to_string()
+        format!("{stripped}{suffix}")
     } else {
-        format!("{stripped}/metrics")
+        format!("{stripped}/metrics{suffix}")
     }
 }
 
@@ -1113,18 +1124,59 @@ mod resolve_tests {
     }
 
     #[test]
+    fn append_metrics_path_preserves_query_and_fragment() {
+        // Operator-supplied URL with a query string: the path must
+        // be appended *before* the `?`, not inside the query value.
+        // Without the split, "http://h:9090?token=foo" would become
+        // "http://h:9090?token=foo/metrics", which is a 404 on every
+        // sane server.
+        assert_eq!(
+            append_metrics_path("http://h:9090?token=foo"),
+            "http://h:9090/metrics?token=foo"
+        );
+        assert_eq!(
+            append_metrics_path("http://h:9090/?token=foo"),
+            "http://h:9090/metrics?token=foo"
+        );
+        assert_eq!(
+            append_metrics_path("http://h:9090/metrics?token=foo"),
+            "http://h:9090/metrics?token=foo"
+        );
+        assert_eq!(
+            append_metrics_path("http://h:9090#frag"),
+            "http://h:9090/metrics#frag"
+        );
+        // `?` then `#` — fragment after query, the URL standard
+        // way; the split-on-first-special handles it because we
+        // capture everything from the first delimiter onward.
+        assert_eq!(
+            append_metrics_path("http://h:9090?a=1#frag"),
+            "http://h:9090/metrics?a=1#frag"
+        );
+    }
+
+    #[test]
     fn resolve_metrics_url_prefers_flag() {
         let got = resolve_metrics_url(Some("http://custom:1234"), None).unwrap();
         assert_eq!(got, "http://custom:1234");
     }
 
     #[test]
-    fn resolve_metrics_url_falls_back_to_default_port_when_no_config() {
-        // No explicit config, no override: the resolver must use the
-        // canonical metrics port. Locks against a regression that
-        // hard-coded the wrong number or stopped exporting it.
-        let got = resolve_metrics_url(None, None).unwrap();
-        assert_eq!(got, format!("http://127.0.0.1:{DEFAULT_METRICS_PORT}"));
+    fn port_from_config_file_returns_none_when_path_is_none() {
+        // Locks the helper-layer contract that resolve_metrics_url
+        // relies on for its `unwrap_or(DEFAULT_METRICS_PORT)`
+        // fallback. Tested at the helper rather than the resolver
+        // because resolve_metrics_url(None, None) reads
+        // `~/.decdn/node.toml` if it exists, which is non-hermetic
+        // on developer machines that have a real config file.
+        assert_eq!(
+            port_from_config_file(None, ConfigPathSource::Default).unwrap(),
+            None
+        );
+        assert_eq!(
+            port_from_config_file(None, ConfigPathSource::Explicit).unwrap(),
+            None
+        );
     }
 
     #[test]
