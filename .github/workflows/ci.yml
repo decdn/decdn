@@ -127,6 +127,36 @@ jobs:
       contents: read
       pull-requests: write
       actions: read
+    # RUSTFLAGS lives at the JOB level (not step level) so the
+    # Swatinem/rust-cache step that runs early in this job sees it. That
+    # action hashes CARGO_*/RUST_* env vars into its cache key, so this
+    # placement gives the `coverage` partition a key that uniquely reflects
+    # the build configuration: cache misses cleanly when the flags change,
+    # the post-job step then saves the freshly-built target. Step-level
+    # scoping was the wrong choice — Swatinem didn't see the env, restored
+    # main's old-flag target, cargo invalidated everything via per-artifact
+    # fingerprint and rebuilt from scratch, and the post-step skipped the
+    # save with "Cache up-to-date" because the (unchanged) key already
+    # existed. The new build was thrown away every run; see PR #484 history.
+    # Other jobs (clippy/doc/msrv) are in separate job blocks and do not
+    # inherit this env, so their caches stay warm.
+    env:
+      # Three link/debug knobs:
+      #   - link-arg=-fuse-ld=mold: route the final link of the test
+      #     binaries through mold instead of the system ld.
+      #   - debuginfo=line-tables-only: emit only the .debug_line DWARF
+      #     section, which is what cargo-llvm-cov reads to map counters to
+      #     source lines (SF/DA records in lcov.info). Strips subprogram
+      #     DIEs and type/variable info. NOT equivalent to `-C debuginfo=1`
+      #     (= "limited", which keeps subprogram DIEs); line-tables-only is
+      #     strictly tighter.
+      #   - split-debuginfo=unpacked: side-file debug info; smaller .o
+      #     files, faster relinking. Orthogonal to coverage.
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold -C debuginfo=line-tables-only -C split-debuginfo=unpacked"
+      # Incremental compilation files bloat the cache for zero gain in CI
+      # (no second compile in the same run); rust-cache's README also
+      # recommends disabling it.
+      CARGO_INCREMENTAL: "0"
     steps:
       # fetch-depth: 0 is required: coverage-diff.py runs
       # `git diff origin/<base>...HEAD` and needs full history.
@@ -165,36 +195,15 @@ jobs:
       # this job and (via ci-success.needs) blocks the PR. No continue-on-error.
       # sccache is not wired here (matching the prior coverage job); Swatinem
       # /rust-cache with shared-key: coverage covers caching of instrumented
-      # build artifacts on its own.
+      # build artifacts on its own. Build-flag env (RUSTFLAGS,
+      # CARGO_INCREMENTAL) lives at the job level above so rust-cache's
+      # cache key reflects them.
       #
-      # RUSTFLAGS is scoped to this step on purpose. The Swatinem/rust-cache
-      # step ran earlier in this job and didn't see this env, so the cache
-      # key isn't invalidated; clippy/doc/msrv steps in their own jobs also
-      # don't see this env and keep their warm caches. Cargo's per-artifact
-      # fingerprint detects the RUSTFLAGS change and recompiles affected
-      # crates in-place inside the restored target/ — that's the actual
-      # cache-correctness mechanism here, not the rust-cache key. Three
-      # link/debug knobs:
-      #   - link-arg=-fuse-ld=mold: route the final link of the test binaries
-      #     through mold instead of the system ld.
-      #   - debuginfo=line-tables-only: emit only the .debug_line DWARF
-      #     section, which is what cargo-llvm-cov reads to map counters to
-      #     source lines (the SF/DA records in lcov.info). Strips subprogram
-      #     DIEs and all type/variable info — smaller compile + link + cache.
-      #     NOT equivalent to `-C debuginfo=1` (= "limited", which keeps
-      #     subprogram DIEs); line-tables-only is strictly tighter.
-      #   - split-debuginfo=unpacked: side-file debug info; smaller .o files
-      #     and faster relinking. Orthogonal to coverage.
-      # CARGO_INCREMENTAL=0: incremental files bloat the cache for zero gain
-      # in CI (no second compile in the same run). --no-clean is the
-      # critical one: cargo-llvm-cov runs `cargo clean --package <each>` per
+      # --no-clean: cargo-llvm-cov runs `cargo clean --package <each>` per
       # invocation by default, which would wipe the instrumented artifacts
-      # the rust-cache restore just laid down. --no-clean suppresses that
-      # cleanup so the cache restore is actually useful.
+      # rust-cache just restored. This flag suppresses that cleanup so the
+      # cache restore is actually useful.
       - name: Run tests (with coverage instrumentation)
-        env:
-          RUSTFLAGS: "-C link-arg=-fuse-ld=mold -C debuginfo=line-tables-only -C split-debuginfo=unpacked"
-          CARGO_INCREMENTAL: "0"
         run: cargo llvm-cov nextest --workspace --lcov --output-path lcov.info --no-tests=pass --no-clean
 
       # No continue-on-error: this only runs on push to main (post-merge), so
