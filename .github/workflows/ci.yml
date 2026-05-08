@@ -44,12 +44,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: clippy
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
       - run: cargo clippy --workspace --all-targets -- -D warnings
-        env:
-          RUSTC_WRAPPER: sccache
-          SCCACHE_GHA_ENABLED: "true"
 
   deny:
     name: cargo deny
@@ -86,12 +81,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: msrv
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
       - run: cargo check --workspace --all-targets
-        env:
-          RUSTC_WRAPPER: sccache
-          SCCACHE_GHA_ENABLED: "true"
 
   changes:
     name: detect changes
