@@ -225,7 +225,8 @@ interface ISlashJudge {
 
     /// Corrupted delivery (v2 / Merkle-bisection path): opens an interactive
     /// dispute against a `cdn/client/v2` delivery whose signed `StreamResponse`
-    /// includes the keccak256 MMR `merkleRoot` per [ADR 030](030-blake3-merkle-verification.md).
+    /// includes a plain binary keccak256 Merkle tree root `merkleRoot` over
+    /// the delivered chunks per [ADR 030 §1](030-blake3-merkle-verification.md#1-wire-format-merkle_root-in-signed-streamresponse-tier-3--cdnclientv2).
     /// The dispute progresses via `bisectMove` (cheap rounds) and concludes via
     /// `terminalReveal` + `resolveMerkleCorruption` (terminal on-chain BLAKE3
     /// chunk verification). No counter-evidence window — resolution is
@@ -239,20 +240,20 @@ interface ISlashJudge {
         bytes calldata streamSlashSig
     ) external returns (uint256 disputeId);
 
-    /// v2 bisection step. See ADR 030 §3 for the state machine.
+    /// v2 bisection step. See [ADR 030 §3](030-blake3-merkle-verification.md#3-bisection-protocol-state-machine) for the state machine.
     function bisectMove(
         uint256 disputeId,
-        bytes32 baoRootLeft,    bytes32 keccakRootLeft,
-        bytes32 baoRootRight,   bytes32 keccakRootRight,
-        bool    challengeLeft
+        bytes32 keccakLeft, bytes32 keccakRight,
+        bytes32 baoLeft,    bytes32 baoRight
     ) external;
 
-    /// v2 terminal reveal at round N+1.
+    /// v2 terminal reveal at the leaf level. `chunkBytes` is ≤ 1024 bytes
+    /// (the tail chunk may be shorter; see ADR 030 §1).
     function terminalReveal(
         uint256 disputeId,
         bytes  calldata chunkBytes,
         bytes32[] calldata baoParentPath,
-        bytes  calldata keccakInclusionProof
+        bytes32[] calldata keccakMerklePath
     ) external;
 
     /// v2 resolution after terminal reveal or chess-clock timeout.
@@ -371,11 +372,11 @@ The companion `SafetyReserve` events (`SlashAppealOpened`, `SlashAppealRatified`
 | `submitBlacklistChallenge` | ~55k–70k | 1× `SignatureChecker` (3k EOA / ~15k Safe) + `ContentBlacklist` lookup + bond transfer + `Slashed` emit on success |
 | `submitCorruptionChallenge` | ~50k–65k | 1× `SignatureChecker` (3k EOA / ~15k Safe) + storage for challenge state + bond transfer (no slash yet — emit deferred to `resolveChallenge`) |
 | `submitMerkleCorruptionChallenge` ([ADR 030](030-blake3-merkle-verification.md) v2) | ~80k | 1× `SignatureChecker` (v2 typehash, includes `merkleRoot`) + dispute state init + initial bond transfer (no slash; bisection follows). |
-| `bisectMove` ([ADR 030](030-blake3-merkle-verification.md) v2; called ~20 times per dispute for a 1 GiB blob, alternating sides) | ~60k | One keccak parent-composition check (`keccak256(0x01 \|\| left \|\| right) == parentKeccak`), store new subtree-root pair (4× `bytes32`), advance chess-clock, transfer per-round bond. Bao subtree-root commitments stored lazily without on-chain composition; verified at `resolveMerkleCorruption`. |
+| `bisectMove` ([ADR 030](030-blake3-merkle-verification.md) v2; called ~40 times per dispute for a 1 GiB blob — both sides move at each of ~20 bisection levels) | ~60k | One keccak parent-composition check (`keccak256(0x01 \|\| left \|\| right) == parentKeccak`), store posted subtree-root pair (4× `bytes32`), advance chess-clock, transfer per-round bond. Bao subtree-root commitments stored lazily without on-chain composition; cross-checked at `resolveMerkleCorruption` against the terminal-step bao parent path (see [ADR 030 §Open Questions](030-blake3-merkle-verification.md#open-questions) for the soundness mechanism still being specified). |
 | `terminalReveal` ([ADR 030](030-blake3-merkle-verification.md) v2; called once per side at round N+1) | ~80k | Hash chunk via `keccak256` + verify keccak Merkle path to `R`; store reveal. |
 | `resolveMerkleCorruption` ([ADR 030](030-blake3-merkle-verification.md) v2; called once after both reveals or chess-clock timeout) | ~3–4M | Two BLAKE3 chunk hashes (~150k each) + 2N bao parent-mode hashes (~150k each at depth N) to verify both sides' bao chains compose to `X` + `StakingRegistry.slash()` on defender-loss branch + bond ledger settlement + `Slashed` emit + state cleanup. |
 | `forfeitDispute` ([ADR 030](030-blake3-merkle-verification.md) v2) | ~50k–90k | Defender-forfeit branch: `StakingRegistry.slash()` + slash-reward transfer + `Slashed` emit (~85k, equivalent to a defender chess-clock timeout). Challenger-forfeit branch: bond forfeit per ADR 014 §3 split (~50k, no slash). |
-| **Total per v2 dispute** (1 GiB blob, ~20 bisection rounds, both sides reveal, defender loses) | **~4.5–5.5M** | Spread across ~24 transactions over up to ~12.7 days at the [ADR 030 §3](030-blake3-merkle-verification.md#3-bisection-protocol-state-machine) default chess-clock budget. |
+| **Total per v2 dispute** (1 GiB blob, ~20 bisection levels × 2 moves per level = ~40 bisect calls, both sides reveal, defender loses) | **~5.5–6.5M** | Spread across ~44 transactions over up to ~12.7 days at the [ADR 030 §3](030-blake3-merkle-verification.md#3-bisection-protocol-state-machine) default chess-clock budget. |
 | `counterChallenge` (rate) | ~40k–55k | 1× `SignatureChecker` (3k EOA / ~15k Safe) + timestamp range check + rate match + storage update |
 | `counterChallenge` (corruption) | ~40k | Evidence verification + storage update |
 | `resolveChallenge` | ~85k | `StakingRegistry.slash()` + bond transfer + state cleanup + `Slashed` emit on slash outcome |

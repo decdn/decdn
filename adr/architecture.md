@@ -159,7 +159,7 @@ Numeric per-ADR index. The thematic chapter ordering for top-to-bottom reading l
 - **[ADR 026 — Gauge-Boost Tokenomics](026-gauge-boost-tokenomics.md)** — 1B fixed supply; `FeeRouter` six-bucket split with Curve-style gauge boost, delegator pool, and SafetyReserve.
 - **[ADR 027 — Distinct-Client Delivery Receipts](027-distinct-client-receipts.md)** — Client-signed `DeliveryReceipt` Merkle-batched per epoch; gauge-pool eligibility gated on distinct-client diversity. Required for mainnet launch.
 - **[ADR 028 — Slashing Appeals and Dispute Escalation](028-slashing-appeals.md)** — 30-day post-slash appeal window via `SafetyReserve` restitution; emergency multisig fast-track + 14-day ve-Governor ratification; one accepted appeal per operator per 365 days.
-- **[ADR 030 — Production BLAKE3 Corruption Verification](030-blake3-merkle-verification.md)** — `cdn/client/v2` adds signed `merkle_root` (keccak256 MMR) to `StreamResponse`; interactive bisection over the bao tree drives disputes to a single 1024-byte chunk; on-chain BLAKE3 + bao parent path verifies the leaf. Coexists with ADR 014 §2 optimistic path under unified `OffenseType.Corruption`. Raises default `unbondingPeriod` from 7 d to 14 d.
+- **[ADR 030 — Production BLAKE3 Corruption Verification](030-blake3-merkle-verification.md)** — `cdn/client/v2` adds signed `merkle_root` (plain binary keccak256 Merkle tree over 1024-byte chunks) to `StreamResponse`; interactive bisection over the bao tree drives disputes to a single 1024-byte chunk; on-chain BLAKE3 + bao parent path verifies the leaf. Coexists with ADR 014 §2 optimistic path under unified `OffenseType.Corruption`. Raises default `unbondingPeriod` from 7 d to 14 d.
 
 ## Key Invariants
 

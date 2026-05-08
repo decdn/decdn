@@ -21,7 +21,7 @@ This ADR is forward-referenced from [ADR 026 §Risks](026-gauge-boost-tokenomics
 
 The protocol introduces a **DeliveryReceipt** primitive, paired one-to-one with each voucher submitted to `FeeRouter.routeSettlement`. Receipts are EIP-712 typed messages signed by the *requester's* secp256k1 key (the address that funded the payment channel). Gauge-pool eligibility for an operator's epoch is gated on a **distinct-client diversity threshold** verified against the receipts the operator commits to chain.
 
-Receipts are batched into a Merkle tree per operator per epoch; only the root and a small summary are stored on-chain at settlement time. The canonical keccak256 Merkle MMR construction (domain tags, append rule, peak-bagging fold, inclusion-proof shape) lives in §4 below; [ADR 030 §2](030-blake3-merkle-verification.md#2-root-to-blake3-binding-bisection-over-the-bao-tree) reuses it for production BLAKE3 corruption verification. Individual receipts surface only on challenge, processed via the permissionless [`SlashJudge` bond mechanism](014-on-chain-verification.md#bond-handling) and gated by reputation ([ADR 008](008-reputation.md)).
+Receipts are batched into a Merkle Mountain Range per operator per epoch; only the root and a small summary are stored on-chain at settlement time. The canonical keccak256 MMR construction (domain tags, append rule, peak-bagging fold, inclusion-proof shape) lives in §4 below. [ADR 030](030-blake3-merkle-verification.md) uses a different but tag-domain-compatible primitive — a plain binary keccak Merkle tree, sharing this ADR's `0x00`/`0x01` leaf and internal-node tags but without `0x02` peak-bagging — because ADR 030's `merkle_root` is committed once per blob (no streaming-append concern) so a plain binary tree bisects more cleanly. Individual receipts surface only on challenge, processed via the permissionless [`SlashJudge` bond mechanism](014-on-chain-verification.md#bond-handling) and gated by reputation ([ADR 008](008-reputation.md)).
 
 ### 1. Receipt format
 
@@ -113,7 +113,7 @@ The protocol does not require a centralized identity registry. However, a `Clien
 
 Per-receipt on-chain storage is uneconomical at scale. A 1 Gbps node produces ~30k receipts/month at the default 1 MB voucher cadence ([ADR 003 Voucher Interval Negotiation](003-payments.md)); 1,000 such operators are 30M receipts/month. Storing one log entry per receipt is comparable in cost to settling all the channels themselves.
 
-The protocol uses the **keccak256 Merkle-batch pattern** specified in [§Aggregator implementation — MMR accumulator](#aggregator-implementation--mmr-accumulator) below; receipts are committed via root, individual receipts surface only on challenge. [ADR 030 §2](030-blake3-merkle-verification.md#2-root-to-blake3-binding-bisection-over-the-bao-tree) reuses the same construction for production BLAKE3 corruption verification.
+The protocol uses the **keccak256 Merkle-batch pattern** specified in [§Aggregator implementation — MMR accumulator](#aggregator-implementation--mmr-accumulator) below; receipts are committed via root, individual receipts surface only on challenge. [ADR 030](030-blake3-merkle-verification.md) shares this construction's `0x00`/`0x01` leaf and internal-node domain tags but uses a plain binary Merkle tree (no `0x02` bagging) for its per-blob commitment; the two constructions are deliberately distinct because their use cases differ (streaming receipt append here vs. commit-once-per-blob there).
 
 #### Per-epoch commitment
 

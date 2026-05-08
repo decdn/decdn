@@ -16,7 +16,7 @@ ADR 014's earlier draft sketched a production upgrade — interactive keccak256 
 
 > Binding Merkle root to BLAKE3 hash: The contract cannot independently verify that a keccak256 Merkle root corresponds to a given BLAKE3 hash (BLAKE3 is not available on-chain). … This commitment is the subject of a future ADR.
 
-The half-design was dropped from ADR 014 in PR #386 so that ADR doesn't carry sketches of unbuilt designs. Issue [#387](https://github.com/decdn/decdn/issues/387) tracks the missing follow-up. ADR 027 §1 and §4 had previously dangling forward-references to a "production path" anchor; they are repointed to ADR 027's own canonical MMR construction by this PR (since ADR 027's MMR is the right primitive for receipt batching but a different primitive — a plain binary keccak Merkle tree — is the right primitive for ADR 030's per-blob commitment, see §1). ADR 002 / ADR 003 also forward-reference this ADR as the resolution to the open production-verification question.
+The half-design was dropped from ADR 014 in PR #386 so that ADR doesn't carry sketches of unbuilt designs. Issue [#387](https://github.com/decdn/decdn/issues/387) tracks the missing follow-up. ADR 027's §Decision opening (line ~24), §1 receipt-format table (line ~35), and §4 on-chain-anchoring intro (line ~116) had three previously-dangling forward-references to a "production path" anchor; they are repointed to ADR 027's own canonical MMR construction by this PR (since ADR 027's MMR is the right primitive for receipt batching but a different primitive — a plain binary keccak Merkle tree — is the right primitive for ADR 030's per-blob commitment, see §1). ADR 002 / ADR 003 also forward-reference this ADR as the resolution to the open production-verification question.
 
 Issue #387 lists five questions the new ADR must answer:
 
@@ -49,7 +49,7 @@ cdn/client/v2  StreamResponse signed fields: {hash, ok, rate_per_mb, total_bytes
 - **Leaf:** `keccak256(0x00 || chunk_i)` for chunk index `i ∈ [0, num_chunks)`. Each `chunk_i` is exactly 1024 bytes except the final chunk, which is the tail (≤ 1024 bytes — see §3 `terminalReveal`).
 - **Internal node:** `keccak256(0x01 || left || right)`. Left and right are the 32-byte child subtree roots.
 - **Padding for non-power-of-2 chunk counts:** the leaf array is padded with `bytes32(0)` at the right end up to the next power of two. The padding sentinel is distinguishable from any honest leaf (since `keccak256(0x00 || any_chunk)` is overwhelmingly unlikely to equal `bytes32(0)`).
-- **No bagging.** Unlike [ADR 027 §4](027-distinct-client-receipts.md#aggregator-implementation--mmr-accumulator)'s MMR (which uses `0x02`-tagged peak-bagging because receipts arrive over time and need streaming append), ADR 030's `merkle_root` is computed once per blob at delivery time. The full chunk sequence is known at signing time, so a plain binary tree is the right primitive — and it bisects cleanly under simple `keccak256(0x01 || left || right)` parent composition (see §2). The `0x00`/`0x01` leaf/internal-node domain tags are intentionally shared with ADR 027's MMR for cross-construction tag-domain consistency; the absence of `0x02` makes plain-binary leaves and MMR leaves distinguishable on the wire.
+- **No bagging.** Unlike [ADR 027 §4](027-distinct-client-receipts.md#aggregator-implementation--mmr-accumulator)'s MMR (which uses `0x02`-tagged peak-bagging because receipts arrive over time and need streaming append), ADR 030's `merkle_root` is computed once per blob at delivery time. The full chunk sequence is known at signing time, so a plain binary tree is the right primitive — and it bisects cleanly under simple `keccak256(0x01 || left || right)` parent composition (see §2). The `0x00`/`0x01` leaf/internal-node domain tags are intentionally shared with ADR 027's MMR for cross-construction tag-domain consistency. The two roots are distinguishable on chain because ADR 027's `aggregateRoot` always traces through a `0x02`-tagged bagging fold (see [ADR 027 §4 Root extraction](027-distinct-client-receipts.md#aggregator-implementation--mmr-accumulator)) while ADR 030's `merkle_root` never does — only the *root* shapes differ, not the leaf encoding (both schemes leaf-tag with `0x00`).
 
 #### Computation by the serving node
 
@@ -103,7 +103,7 @@ round 0  — Challenger opens dispute. Posts streamResponseV2 + slash_sig + init
            Challenger asserts: ∃ position i with chunk_i_under_R ≠ chunk_i_under_X.
 
 rounds 1..N where N = ceil(log2(num_chunks)):
-  The MOVING SIDE (alternating per ADR 014 §3 chess-clock semantics; challenger
+  The MOVING SIDE (alternating per §3 chess-clock semantics; challenger
   moves first) posts (left_keccak, right_keccak, left_bao, right_bao) for the
   current range:
     • Contract verifies left_keccak and right_keccak compose to parentKeccak via
@@ -159,15 +159,15 @@ The chess-clock (§3) bounds total dispute lifecycle. Per-round contract-state c
 
 The bisection is deliberately split into **cheap intermediate rounds** (keccak side only — bao composition deferred to terminal) and **one expensive terminal round** (BLAKE3 chunk hash + bao parent path + keccak Merkle path):
 
-| Round | On-chain work | Estimated gas |
+| Call | On-chain work | Estimated gas |
 |---|---|---|
-| Round 0 (`submitMerkleCorruptionChallenge`) | Verify v2 typehash digest, recover signer, record state, transfer initial bond | ~80k |
-| Rounds 1..N (`bisectMove`, ~20 rounds for 1 GiB blob) | One keccak parent-composition check (`keccak256(0x01 \|\| left \|\| right) == parentKeccak`) + store new subtree-root pair + advance chess-clock + per-round bond transfer | ~60k each |
-| Terminal round N+1 reveal (`terminalReveal`) | Hash chunk via keccak256 + verify keccak Merkle path to R (~50k); store reveal | ~80k each side |
-| Terminal round N+1 resolution (`resolveMerkleCorruption`) | Two BLAKE3 chunk hashes (~150k each), 2N bao parent-mode hashes (~150k each at level depth N), state cleanup, `StakingRegistry.slash()` if defender loses, bond ledger settlement, `Slashed` emit | ~3–4M |
-| Total per dispute (1 GiB blob, N=20) | One open + 20 bisect + 2 reveals + 1 resolve | **~4.5–5.5M gas** |
+| Round 0 (`submitMerkleCorruptionChallenge`, once) | Verify v2 typehash digest, recover signer, record state, transfer initial bond | ~80k |
+| Rounds 1..N bisection moves (`bisectMove`, **two calls per level — challenger then defender** at each of N levels; for N=20 levels that's ~40 calls total) | One keccak parent-composition check (`keccak256(0x01 \|\| left \|\| right) == parentKeccak`) + store posted subtree-root pair + advance chess-clock + per-round bond transfer | ~60k each call |
+| Terminal reveal (`terminalReveal`, once per side) | Hash chunk via keccak256 + verify keccak Merkle path to R (~50k); store reveal + bao parent path | ~80k each side |
+| Terminal resolution (`resolveMerkleCorruption`, once) | Two BLAKE3 chunk hashes (~150k each), 2N bao parent-mode hashes (~150k each at level depth N), state cleanup, `StakingRegistry.slash()` if defender loses, bond ledger settlement, `Slashed` emit | ~3–4M |
+| **Total per dispute** (1 GiB blob, N=20 levels: 1 open + 40 bisect + 2 reveals + 1 resolve = ~44 transactions) | | **~5.5–6.5M gas** |
 
-At Arbitrum One ~0.1 gwei effective L2 fee, **~$0.30 per dispute**. Spread across ~24 transactions over up to ~12.7 days at the §3 default chess-clock budget. Cheap relative to the slash recovered (default 5% of 50k TOKEN minimum stake = 2.5k TOKEN; 50% to challenger).
+At Arbitrum One ~0.1 gwei effective L2 fee, **~$0.40 per dispute**. Spread across ~44 transactions over up to ~12.7 days at the §3 default chess-clock budget (each side has a 4 h × 20 = 80 h per-side total clock; chess-clock alternates so wall-clock can be up to 2 × 80 h = 160 h ≈ 6.7 d for the bisection phase). Cheap relative to the slash recovered (default 5% of 50k TOKEN minimum stake = 2.5k TOKEN; 50% to challenger).
 
 The terminal-round BLAKE3 audit surface is non-trivial — see §6 Risks. There is exactly one production-grade Solidity BLAKE3 library in the public ecosystem at the time of writing; library selection and audit are gating prerequisites (see §Forward references).
 
@@ -377,7 +377,7 @@ The slash would arrive after withdrawal — there is nothing left to slash.
 
 The existing invariant from [ADR 014 §3 Interaction with unbonding period](014-on-chain-verification.md#interaction-with-unbonding-period) — `MAX_EVIDENCE_AGE_US < unbondingPeriod` — continues to hold (5 days vs new 14 days; margin: 9 days). The Merkle dispute extends this invariant with a stricter cross-parameter constraint that subsumes it:
 
-> **Cross-parameter invariant.** `(bisection_chess_clock_per_side × 2 × max_rounds) + MAX_EVIDENCE_AGE_US + 1 day_margin ≤ unbondingPeriod`. The `× 2` factor reflects chess-clock semantics (both sides alternate within the round; wall-clock is the sum of both sides' move durations, not just one). At §3 defaults — 4 h per side per move, 20 rounds, 5 d evidence age, 14 d unbonding — this evaluates to `2 × 4 h × 20 + 5 d + 1 d = 6.7 d + 6 d = 12.7 d ≤ 14 d` ✓.
+> **Cross-parameter invariant.** `(bisection_chess_clock_per_side × 2 × max_rounds) + MAX_EVIDENCE_AGE_US + 1 day_margin ≤ unbondingPeriod`. The `× 2` factor reflects chess-clock semantics (both sides alternate within the round; wall-clock is the sum of both sides' move durations, not just one). At §3 defaults — 4 h per side per move, 20 rounds, 5 d evidence age, 14 d unbonding — this evaluates to `2 × 4 h × 20 + 5 d + 1 d = 6.7 d + 6 d = 12.7 d ≤ 14 d` (holds).
 
 Implementations MUST enforce this constraint at every governance update of any input parameter (per-round clock, `max_rounds`, `MAX_EVIDENCE_AGE_US`, or `unbondingPeriod`); a setter call that violates it must revert. The amendment is captured in §11 of ADR 026 (governable-parameters table) and the `unbondingPeriod` row updated to default 14 d / bounds `[3 d, 30 d]`.
 
@@ -411,6 +411,32 @@ The alternative — adding a `stakeLockedWhileDisputed` flag on `StakingRegistry
 - **Double-audit surface for v1 + v2.** The optimistic path stays in service indefinitely. Two corruption code paths means two audit budgets. Sunset deferral is intentional, but the cost is real.
 - **`unbondingPeriod` and operator economics.** Doubling unbonding affects operator P&L modelling in `finance/notebooks/_shared/params.py` (cross-repo dependency per workspace `CLAUDE.md`). The finance subproject must re-derive operator runway tables when this ADR ships.
 
+## Open Questions
+
+These design choices are not finalized in this ADR; they are tracked for resolution in the implementation tracking issues (see §Forward references).
+
+### Lazy-bao verification soundness mechanism
+
+The §2 game has each party post `(left_bao, right_bao)` claims at every bisection level *without* on-chain verification of bao parent-composition during intermediate rounds. The intermediate `parentBaoChallenger_k` and `parentBaoDefender_k` claims are stored as steering inputs (which half to recurse into) rather than as cryptographic commitments verified later.
+
+This is unsound as written: a corrupt defender at chunk position j can post lying intermediate bao roots specifically to steer bisection away from j and into a half that contains no actual disagreement. At the terminal position i ≠ j (uncorrupted), the defender reveals the canonical chunk c_X^i — which BLAKE3-verifies under the bao tree of X (since c_X^i is canonical) and keccak-verifies under R (since R is computed over `(c_X^0, ..., c_X^{j-1}, c'_j, c_X^{j+1}, ..., c_X^{N-1})` where only position j is corrupt). Defender wins the terminal step despite having delivered corrupt bytes. This is a real exploit.
+
+The fix needs to connect the intermediate `parentBao*` storage to the terminal step's bao path verification. Two leading candidates, each with different gas / complexity trade-offs:
+
+1. **Terminal-step cross-check.** At `resolveMerkleCorruption`, the contract walks each side's revealed `baoParentPath` from leaf upward to X. At each ascent step (level k), the contract computes the active-subtree root at that level and compares it to the recorded `parentBao*_k` from the bisection. A mismatch at any level means the party lied at that round → that party loses. This adds N hash comparisons (~3k gas each) on top of the existing `2N` BLAKE3 parent-mode hashes; small marginal cost.
+
+2. **Challenger-driven bisection (Optimism BoLD pattern).** Drop "both sides post midpoints, recurse on disagreement"; use single-sided commitments where the challenger asserts a specific position via subsequent moves and the defender confirms or refutes. This eliminates the steering vector entirely but is a larger structural rewrite (state machine, move count, chess-clock budgets all change).
+
+Resolution: deferred to follow-up issue 2 (`SlashJudge.submitMerkleCorruptionChallenge` Solidity implementation). Implementations MUST adopt one of the two mechanisms before the v2 path goes live; the on-chain BLAKE3 library audit (issue 1) cannot meaningfully complete without a fixed dispute-game spec.
+
+### Pending-storage layout for both-sides-per-level moves
+
+§3 storage struct holds one `pendingLeft*` / `pendingRight*` set, but at each level both parties move (per §2). Open question: does the second mover's call (i) overwrite the first mover's stored pending and trigger immediate recursion (then the contract acts on the comparison inline), (ii) populate a separate "second-mover" pending set (storage extended with `challengerPending*` / `defenderPending*` pairs), or (iii) some hybrid? Implementation-time decision; the spec semantics are unaffected by the choice.
+
+### Padding internal-node propagation
+
+§1 specifies right-padding the leaf array with `bytes32(0)` to the next power of 2. Internal nodes whose subtree contains only padded leaves are computed via the standard rule `keccak256(0x01 || bytes32(0) || bytes32(0))` — the recursion bottoms out at the padding-leaf sentinel. Proofs traversing such positions verify normally; a chunk position ≥ `numChunks` is not a valid leaf for inclusion proofs (the contract rejects revealing such positions in `terminalReveal`). The construction tolerates the (cryptographically unreachable) collision where `keccak256(0x00 || real_chunk) == bytes32(0)`.
+
 ## Alternatives Considered
 
 - **Option B — publisher pre-registers `(blob_hash, merkle_root)` in a `BlobRegistry` contract at ingest.** Rejected: ADR 002's content-claim model has no canonical publisher per blob hash. Multi-claim semantics ([ADR 002 § Multi-claim semantics](002-content-addressing.md#multi-claim-semantics)) explicitly allow any number of independent namespaces to claim the same hash. There is no single party to register R; pre-registration would require coordination that does not exist. Also fails for cache nodes — the cache-miss pull computes R on the fly, decoupled from any publisher registration.
@@ -434,7 +460,7 @@ The alternative — adding a `stakeLockedWhileDisputed` flag on `StakingRegistry
 - **[ADR 014](014-on-chain-verification.md):** §2 "Future evolution" stub is replaced with a one-line cross-reference to this ADR (the optimistic path remains documented in the rest of §2). §3 ISlashJudge interface block extends with `submitMerkleCorruptionChallenge`, `bisectMove`, `terminalReveal`, `resolveMerkleCorruption`, `forfeitDispute`. §3 gas-estimates table gains a row for the v2 dispute flow. ADRs Affected gains an ADR 030 entry.
 - **[ADR 016](016-contract-interactions.md):** §3 SlashJudge function table appends `submitMerkleCorruptionChallenge` (and the bisection-step entry points) with the same `nonReentrant`, checks-effects-interactions, TOKEN bond-deposit guards. §1 Contract Inventory row 14 (SlashJudge constructor parameters) is unchanged — `challengeBond` and `counterEvidenceWindow` cover both paths' bond mechanics.
 - **[ADR 026](026-gauge-boost-tokenomics.md):** §7 Operator economics — `unbondingPeriod` default raised from 7 days to 14 days. §11 governable parameters table gains an `unbondingPeriod` row with default 1,209,600 s (14 days) / bounds `[3 d, 30 d]` (existing bounds unchanged; default within them). Cross-parameter invariant added (per §7 of this ADR).
-- **[ADR 027](027-distinct-client-receipts.md):** Three previously-broken `#production-path-interactive-keccak256-merkle-proof-future-adr` anchor links (lines ~24, ~35, ~116) repointed to ADR 027 §4's own `#aggregator-implementation--mmr-accumulator` anchor — keeping ADR 027 as the canonical home of the MMR construction. ADR 030 uses a different but tag-domain-compatible primitive (plain binary keccak Merkle tree, leaves `keccak256(0x00 || chunk)`, internal nodes `keccak256(0x01 || left || right)`, no bagging — see §1 rationale).
+- **[ADR 027](027-distinct-client-receipts.md):** Three previously-broken `#production-path-interactive-keccak256-merkle-proof-future-adr` anchor links (in §Decision opening line ~24, §1 receipt-format table line ~35, §4 on-chain-anchoring intro line ~116) repointed to ADR 027 §4's own `#aggregator-implementation--mmr-accumulator` anchor — keeping ADR 027 as the canonical home of the MMR construction. ADR 030 uses a different but tag-domain-compatible primitive (plain binary keccak Merkle tree, leaves `keccak256(0x00 || chunk)`, internal nodes `keccak256(0x01 || left || right)`, no bagging — see §1 rationale).
 - **[ADR 028](028-slashing-appeals.md):** §1 confirmation that Merkle-corruption slashes (v2 path) have identical appealability to optimistic-corruption slashes (v1 path), since both feed the unified `OffenseType.Corruption`. No scope change.
 - **[`adr/architecture.md`](architecture.md):** Chapter 5 — Verification & enforcement: insert this ADR after ADR 014 in the chapter listing. Numeric ADR index gains a one-line entry. ADR 014's one-line summary is amended to mention "production path in ADR 030".
 - **[`adr/README.md`](README.md):** Reading-order pandoc command updated to include `030-blake3-merkle-verification.md` between `014-...` and `008-...` in the verification chapter sequence.
