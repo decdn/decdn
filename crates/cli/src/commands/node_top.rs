@@ -389,6 +389,14 @@ fn port_from_config_file(
 /// ticks so the table redraws in place rather than scrolling.
 const ANSI_CLEAR_HOME: &str = "\x1b[2J\x1b[H";
 
+/// Cap on consecutive failed scrapes before the loop bails. With the
+/// default `--interval-ms 1000` this is ≈30s of no signal, which is
+/// well past a normal `decdn-node` restart and comfortably catches
+/// the "wrong URL / wrong port" cases where every tick fails the
+/// same way and only the first error matters. Operators chasing a
+/// real flap will see the per-tick `eprintln` in the meantime.
+const MAX_CONSECUTIVE_SCRAPE_FAILURES: u32 = 30;
+
 /// Entry point dispatched from `node_dispatch`. Polls the daemon's
 /// `/metrics` endpoint every `--interval-ms`, parses it, and renders
 /// the table. Single-shot JSON mode bypasses the loop and exits
@@ -422,6 +430,7 @@ pub async fn run(args: &cli::TopArgs, global_config: Option<&Path>) -> anyhow::R
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut prev: Option<(Snapshot, Instant)> = None;
+    let mut consecutive_failures: u32 = 0;
 
     loop {
         tokio::select! {
@@ -435,28 +444,54 @@ pub async fn run(args: &cli::TopArgs, global_config: Option<&Path>) -> anyhow::R
         let now_at = Instant::now();
         match fetch_metrics(&client, &metrics_url).await {
             Ok(body) => {
+                consecutive_failures = 0;
                 let parsed = parse_openmetrics(&body);
                 let snap = Snapshot::from_metrics(&parsed);
                 let prev_pair = prev
                     .as_ref()
                     .map(|(s, t)| (s, now_at.saturating_duration_since(*t)));
                 let mut stdout = io::stdout().lock();
-                let _ = stdout.write_all(ANSI_CLEAR_HOME.as_bytes());
+                stdout
+                    .write_all(ANSI_CLEAR_HOME.as_bytes())
+                    .context("failed to write clear-screen escape")?;
                 write_top_table(&mut stdout, &metrics_url, &snap, prev_pair, interval)
                     .context("failed to write top table")?;
-                let _ = stdout.flush();
+                stdout.flush().context("failed to flush top table")?;
                 prev = Some((snap, now_at));
             }
             Err(err) => {
-                // Don't tear down the loop on a single bad scrape —
-                // print the error inline and let the next tick try
-                // again. Operators want stickiness; transient
-                // ECONNREFUSED during a daemon restart shouldn't
-                // require re-running `decdn node top`.
+                // Bail immediately on errors that can't possibly
+                // become transient: reqwest's "builder" class fires
+                // for malformed URLs and unsupported schemes —
+                // retrying for 30s achieves nothing.
+                if is_permanent_url_error(&err) {
+                    return Err(err.context(
+                        "permanent error: --metrics-url is malformed or uses an unsupported scheme",
+                    ));
+                }
+                consecutive_failures += 1;
                 eprintln!("scrape failed: {err}");
+                if consecutive_failures >= MAX_CONSECUTIVE_SCRAPE_FAILURES {
+                    return Err(err.context(format!(
+                        "scrape failed {MAX_CONSECUTIVE_SCRAPE_FAILURES} times in a row; \
+                         giving up — check the daemon and --metrics-url"
+                    )));
+                }
             }
         }
     }
+}
+
+/// Recognise reqwest errors that can't recover by retrying — URL
+/// parse failures, unsupported schemes, etc. (anything where
+/// `reqwest::Error::is_builder()` is true). The `--metrics-url` is
+/// fixed for the lifetime of the process, so retrying these for
+/// 30 ticks is just noise.
+fn is_permanent_url_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| {
+        e.downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_builder)
+    })
 }
 
 async fn fetch_metrics(client: &reqwest::Client, url: &str) -> anyhow::Result<String> {
