@@ -55,13 +55,10 @@ This is a mechanical replacement. The EIP-712 domain separators, typed data hash
 | Function | Current | After |
 | --- | --- | --- |
 | `submitPhantomChallenge` | `ecrecover` → address A, `ecrecover` → address B, verify A == B | `SignatureChecker.isValidSignatureNow(challengedNode, probeDigest, probeSig)` + `SignatureChecker.isValidSignatureNow(challengedNode, streamDigest, streamSig)` |
+| `submitRateChallenge` | `ecrecover` → address A, `ecrecover` → address B, verify A == B | `SignatureChecker.isValidSignatureNow(challengedNode, probeDigest, probeSig)` + `SignatureChecker.isValidSignatureNow(challengedNode, streamDigest, streamSig)` |
 | `submitBlacklistChallenge` | `ecrecover` → address, verify registered | `SignatureChecker.isValidSignatureNow(challengedNode, digest, sig)` |
-| `submitCorruptionChallenge` | `ecrecover` → address, verify registered | `SignatureChecker.isValidSignatureNow(challengedNode, digest, sig)` |
-| `counterChallenge` (rate) | `ecrecover` → verify same node | `SignatureChecker.isValidSignatureNow(challengedNode, digest, sig)` |
 
 **Note on SlashJudge pattern change:** The current design recovers an address from `ecrecover` and then looks it up in `StakingRegistry`. With `SignatureChecker`, the pattern becomes: the challenger provides the `challengedNode` address (the node's Ethereum address / Safe address), the contract verifies the signature against that address, then confirms the address is registered. This is equivalent but avoids the "recover then lookup" pattern which does not work for ERC-1271 (there is no "recovery" from a smart account signature — only validation).
-
-**DeliveryReceipt counter-evidence ([ADR 014](014-on-chain-verification.md)):** The `counterChallenge` for corruption challenges verifies a `DeliveryReceipt` signed by the requester. If the requester is a smart account, this verification also uses `SignatureChecker`.
 
 #### Gas Impact
 

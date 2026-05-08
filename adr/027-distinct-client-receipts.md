@@ -21,7 +21,7 @@ This ADR is forward-referenced from [ADR 026 §Risks](026-gauge-boost-tokenomics
 
 The protocol introduces a **DeliveryReceipt** primitive, paired one-to-one with each voucher submitted to `FeeRouter.routeSettlement`. Receipts are EIP-712 typed messages signed by the *requester's* secp256k1 key (the address that funded the payment channel). Gauge-pool eligibility for an operator's epoch is gated on a **distinct-client diversity threshold** verified against the receipts the operator commits to chain.
 
-Receipts are batched into a Merkle tree per operator per epoch; only the root and a small summary are stored on-chain at settlement time, mirroring the keccak256 Merkle pattern in [ADR 014 §2 Production Path](014-on-chain-verification.md). Individual receipts surface only on challenge, processed via the permissionless [`SlashJudge` bond mechanism](014-on-chain-verification.md#bond-handling) and gated by reputation ([ADR 008](008-reputation.md)).
+Receipts are batched into a Merkle Mountain Range (MMR) per operator per epoch; only the root and a small summary are stored on-chain at settlement time. The canonical keccak256 MMR construction (domain tags, append rule, peak-bagging fold, inclusion-proof shape) lives in §4 below. Individual receipts surface only on challenge, processed via the permissionless [`SlashJudge` bond mechanism](014-on-chain-verification.md#bond-handling) and gated by reputation ([ADR 008](008-reputation.md)).
 
 ### 1. Receipt format
 
@@ -32,7 +32,7 @@ A `DeliveryReceipt` is an EIP-712 typed-data message signed by the **requester's
 | `channelId` | `bytes32` | The `StablePaymentChannel` channel ID. Matches the `channelId` field in the paired voucher ([ADR 003](003-payments.md) `Voucher` typedef). |
 | `voucherNonce` | `uint256` | The nonce of the paired voucher (≥1, monotonically increasing within the channel — see [ADR 003 Voucher Nonce Convention](003-payments.md)). Pairs the receipt to a single off-chain voucher. |
 | `bytesClaimed` | `uint256` | Cumulative bytes delivered as of this voucher window. Equals the voucher's `bytesDelivered` field; redundant on purpose, see invariant #2 below. |
-| `contentRoot` | `bytes32` | Merkle root over the per-stream content delivered in this voucher window — a keccak256 Merkle tree over 1024-byte chunks identical to the construction in [ADR 014 §2 Production Path](014-on-chain-verification.md#production-path-interactive-keccak256-merkle-proof-future-adr). For sub-MB streams a single leaf hash; for multi-MB streams the root binds every chunk. **Multi-stream channels** (per [ADR 003 Concurrent Streams](003-payments.md#concurrent-streams), where multiple streams share a single channel and a single cumulative voucher): `contentRoot` is the Merkle root of the per-stream chunk-tree roots, ordered by stream-id ascending. The receipt thus commits to all bytes delivered across the voucher's stream set, not just one stream. |
+| `contentRoot` | `bytes32` | Merkle root over the per-stream content delivered in this voucher window — a keccak256 Merkle tree over 1024-byte chunks (leaves `keccak256(0x00 \|\| chunk_i)`, internal nodes `keccak256(0x01 \|\| left \|\| right)`, right-padded with `bytes32(0)` to the next power of two when chunk count is non-power-of-2). For sub-MB streams a single leaf hash; for multi-MB streams the root binds every chunk. **Multi-stream channels** (per [ADR 003 Concurrent Streams](003-payments.md#concurrent-streams), where multiple streams share a single channel and a single cumulative voucher): `contentRoot` is the Merkle root of the per-stream chunk-tree roots, ordered by stream-id ascending. The receipt thus commits to all bytes delivered across the voucher's stream set, not just one stream. Note: this per-stream chunk tree is informational at the receipt layer — content corruption itself is absorbed at the wire by client-side BLAKE3 verification per [ADR 003 §Corrupted delivery](003-payments.md#corrupted-delivery), and `contentRoot` is not consumed by an on-chain corruption-slash path. |
 | `clientPubKey` | `address` | Requester's Ethereum address. Identity-diversity gating (§3) is computed across this field. Equals the recovered signer; included in plaintext to make on-chain bucketing trivial for batched verification. |
 | `operatorAddress` | `address` | The operator's Ethereum address (`channel.provider`). Receipts are not portable across operators. |
 | `epochId` | `uint64` | The `FeeRouter` epoch this receipt is intended to credit — set by the requester at signing time. Receipts are grouped/bucketed by this field when constructing per-epoch roots (see §4 Per-epoch bucketing); a receipt is rejected if its `epochId` does not match the specific epoch root/summary under which it is being committed. This does **not** require all receipts in a physical batch to share the same `epochId`. |
@@ -52,7 +52,7 @@ Dedicated `FeeRouter` domain separator over the §1 field set, preventing cross-
 
 #### secp256k1 / EIP-712
 
-Identical curve and signing scheme as the rest of the deCDN/EVM stack: voucher signatures ([ADR 003 EIP-712 Voucher Signature](003-payments.md)), `slash_sig` ([ADR 014 §1](014-on-chain-verification.md)), `BindNodeId` ([ADR 003 NodeId Binding](003-payments.md)), and `DeliveryReceipt` for corruption challenges ([ADR 014 §2](014-on-chain-verification.md)) — though the latter is a different typedef from the receipt defined here.
+Identical curve and signing scheme as the rest of the deCDN/EVM stack: voucher signatures ([ADR 003 EIP-712 Voucher Signature](003-payments.md)), `slash_sig` ([ADR 014 §1](014-on-chain-verification.md)), `BindNodeId` ([ADR 003 NodeId Binding](003-payments.md)).
 
 #### Verifier
 
@@ -113,7 +113,7 @@ The protocol does not require a centralized identity registry. However, a `Clien
 
 Per-receipt on-chain storage is uneconomical at scale. A 1 Gbps node produces ~30k receipts/month at the default 1 MB voucher cadence ([ADR 003 Voucher Interval Negotiation](003-payments.md)); 1,000 such operators are 30M receipts/month. Storing one log entry per receipt is comparable in cost to settling all the channels themselves.
 
-The protocol mirrors the **keccak256 Merkle-batch pattern** from [ADR 014 §2 Production Path](014-on-chain-verification.md#production-path-interactive-keccak256-merkle-proof-future-adr): receipts are committed via root, individual receipts surface only on challenge.
+The protocol uses the **keccak256 Merkle-batch pattern** specified in [§Aggregator implementation — MMR accumulator](#aggregator-implementation--mmr-accumulator) below: receipts are committed via root, individual receipts surface only on challenge.
 
 #### Per-epoch commitment
 
@@ -312,12 +312,12 @@ A challenger investigating an operator's epoch performs:
 
 #### Bond model
 
-Receipt-fraud challenges plug into the existing `SlashJudge` bond mechanism from [ADR 014 Bond Handling](014-on-chain-verification.md) under the new `OffenseType.ReceiptFraud` enum value (per [ADR 014 §3 SlashJudge Contract](014-on-chain-verification.md#3-slashjudge-contract)). The `submitReceiptFraudChallenge(challengedNode, epochId, fraudEvidence)` entry point evaluates the proof synchronously — there is **no counter-evidence window** for receipt fraud because a successful Merkle inclusion/exclusion proof against the operator's own on-chain `aggregateRoot` is cryptographically dispositive; there is no symmetric counter-proof the operator can submit. Adding a 24h delay would only postpone the slash without adding adjudication value.
+Receipt-fraud challenges plug into the existing `SlashJudge` bond mechanism from [ADR 014 Bond Handling](014-on-chain-verification.md#bond-handling) under the `OffenseType.ReceiptFraud` enum value (per [ADR 014 §SlashJudge Contract](014-on-chain-verification.md#2-slashjudge-contract)). The `submitReceiptFraudChallenge(challengedNode, epochId, fraudEvidence)` entry point evaluates the proof synchronously — there is **no counter-evidence window** for receipt fraud because a successful Merkle inclusion/exclusion proof against the operator's own on-chain `aggregateRoot` is cryptographically dispositive; there is no symmetric counter-proof the operator can submit. Adding a 24h delay would only postpone the slash without adding adjudication value.
 
 | Parameter | Default | Bounds | Rationale |
 | --- | ---: | --- | --- |
-| Receipt-fraud challenge bond | **100 TOKEN** | `[10, 1000]` TOKEN | Matches `challengeBond` for the existing four offense types per [ADR 014 §2](014-on-chain-verification.md#2-blake3-content-corruption--optimistic-challenge-response); receipt-fraud investigation is in fact cheaper than corruption (deterministic Merkle proofs vs. interactive bond-economics), so no premium. Governable per [ADR 009](009-governance.md). |
-| Slash percentage on success | 5% / 15% / 50% escalating | per [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn) | Same escalation schedule as the other four offense types — the harm class (operator extracting unwarranted gauge yield) fits the existing slash calibration. |
+| Receipt-fraud challenge bond | **100 TOKEN** | `[10, 1000]` TOKEN | Matches `challengeBond` for the existing three signature-dependent offense types per [ADR 014 §Bond Handling](014-on-chain-verification.md#bond-handling). Governable per [ADR 009](009-governance.md). |
+| Slash percentage on success | 5% / 15% / 50% escalating | per [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn) | Same escalation schedule as the other three offense types — the harm class (operator extracting unwarranted gauge yield) fits the existing slash calibration. |
 | Slash distribution on success | 50% challenger / 30% SafetyReserve / 20% burn | per [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn) | Identical to other offenses — challenger reward is the deterrent funding active enforcement; SafetyReserve covers downstream user-harm flows; burn preserves the deflationary signal. |
 | Bond outcome on unsuccessful challenge | 50% burn / 50% to challenged operator | per [ADR 014 § Bond Handling](014-on-chain-verification.md#bond-handling) | Standard unsuccessful-challenge handling. |
 
@@ -401,7 +401,7 @@ Format and client/operator libraries → contract paths deployed in parallel-run
 - **Cleanly separates payment from gauge.** The 40% base USDC continues to flow same-tx for every settlement regardless of receipt validity — the cashflow invariant operators rely on is preserved.
 - **Composable with reputation.** Operators with strong reputation get cheaper gating; new and recently-slashed operators face tighter gating. Receipt validity is a *layer* over reputation, not a replacement.
 - **On-chain footprint is bounded.** One Merkle root per settlement, one summary per operator per epoch. Per-receipt storage is challenge-only.
-- **Aligns with the [ADR 014](014-on-chain-verification.md) production direction.** The Merkle-batched anchoring chosen here is the same construction that production-path corruption proofs will use; toolchain reuse across ADRs is direct.
+- **Self-contained Merkle anchoring.** The MMR construction defined in §4 below is fully specified within this ADR — no external Merkle scheme is required. Receipt-fraud proofs are deterministic Merkle inclusion/exclusion checks against the operator's own on-chain `aggregateRoot`.
 
 ### Negative
 
