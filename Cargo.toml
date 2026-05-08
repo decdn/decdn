@@ -77,10 +77,74 @@ zeroize = "1"
 # HTTP client (used by cache-origin backend)
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json"] }
 
+# AWS SDK (used by the S3 cache-origin backend, #437 PR2). All four crates carry
+# `default-features = false` so the workspace stays on one TLS implementation
+# (rustls 0.23 + aws-lc-rs); the SDK's stock rustls 0.21 + ring path is
+# fully suppressed by these flags. Cargo.lock confirms only one `rustls` and
+# one `aws-lc-rs` major after the addition.
+#
+# The production binary `decdn-node` ships hyper-1 only — `cargo tree
+# -p decdn-node --no-dev-dependencies` shows one `hyper` (1.x), one `h2`
+# (0.4), one `socket2` (0.6). Two `http`/`http-body` versions still appear
+# in production because `aws-smithy-types` carries an `http 0.2` shim type
+# alongside its `http 1.x` API; that shim is dead at runtime but cargo
+# can't unify the feature graph across the smithy types crate. No
+# parallel TLS stack and no extra crypto provider in either case.
+#
+# In the **test/dev build** (`crates/cache` dev-deps include `aws-smithy-mocks`
+# and `aws-sdk-s3 = { features = ["test-util"] }`), a hyper-0.14 +
+# h2 0.3 + socket2 0.5 subtree does land — `test-util` enables
+# `aws-smithy-runtime/legacy-test-util` which enables
+# `aws-smithy-http-client/hyper-014`. Cargo unifies features across deps
+# and dev-deps, so the dev-only feature still leaves the lockfile entries
+# even in production builds; they just aren't linked. The fix path is
+# upstream (a leaner mocks crate that doesn't require legacy hyper) or a
+# future smithy-rs release that splits the test-util layer. Re-evaluate
+# both.
+#
+# `aws-config` keeps the standard credential-chain pieces (env / profile /
+# IMDS / SSO / credentials_process) so operators get the AWS-CLI-equivalent
+# discovery for free; the `behavior-version-latest` feature is paired with
+# an explicit `BehaviorVersion::latest()` at the call site so a future
+# feature-flag edit dropping the implicit path cannot regress (older SDK
+# versions panicked here; current versions surface a runtime error).
+# Note: the `sso` feature enables an HTTP-using credential provider; if an
+# operator's `~/.aws/config` profile is configured for SSO with an
+# expired cached token, the *first* fetch through the cache may trigger
+# an HTTP refresh against the SSO endpoint. Construction itself stays
+# I/O-free (verified by `S3Origin::new`'s no-I/O construction tests).
+aws-config = { version = "1.8", default-features = false, features = [
+    "behavior-version-latest",
+    "credentials-process",
+    "sso",
+    "rt-tokio",
+] }
+# Pinned at 1.129 (last release using sha2 ^0.10): aws-sdk-s3 1.130 bumped to
+# sha2 ^0.11 (stable). The lockfile already carries sha2 0.10.9 alongside
+# iroh-base 0.98's `=0.11.0-rc.5` exact pin (cargo treats stable and
+# pre-release majors as separate); allowing aws-sdk-s3 to pull stable
+# 0.11.x would add a *third* sha2 entry, fattening the cargo deny
+# `multiple-versions` warning. Re-evaluate when iroh bumps to a release
+# that no longer pins `sha2 = "=0.11.0-rc.5"`.
+aws-sdk-s3 = { version = "=1.129.0", default-features = false, features = ["http-1x", "rt-tokio"] }
+aws-smithy-http-client = { version = "1.1", default-features = false, features = [
+    "default-client",
+    "rustls-aws-lc",
+] }
+aws-credential-types = "1"
+aws-smithy-runtime-api = "1"
+aws-smithy-types = "1"
+
 # Test-only helpers
 tempfile = "3"
 wiremock = "0.6"
 proptest = "1"
+# Operation-level S3 mocks for the S3 origin tests (#437 PR2). The `mock!`
+# / `mock_client!` macros take the SDK through its full middleware chain
+# (signing, retry, body framing) but stub the network — exactly the
+# granularity we need to validate `OriginPullError` classification without
+# standing up MinIO.
+aws-smithy-mocks = "0.2"
 
 # Rate limiting (per-source connection rate limits in `node`)
 governor = "0.10"
