@@ -23,6 +23,49 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **Config** Origin backend selection moved into a tagged
+  `[cache.origin]` table (#437). The pre-existing flat
+  `cache.origin_url`, `cache.origin_path`, and `cache.decompress`
+  fields are removed; `CacheConfig` now carries
+  `#[serde(deny_unknown_fields)]` so operators with the old shape get
+  a clear "unknown field" error at config load instead of a silent
+  "no origin configured" surprise. Migration:
+
+  ```toml
+  # before
+  [cache]
+  origin_url = "https://origin.example/"
+  decompress = "auto"
+
+  # after
+  [cache.origin]
+  kind = "http"
+  url = "https://origin.example/"
+  decompress = "auto"          # optional; defaults to "auto"
+  ```
+
+  ```toml
+  # before
+  [cache]
+  origin_path = "/var/lib/decdn/origin"
+
+  # after
+  [cache.origin]
+  kind = "fs"
+  path = "/var/lib/decdn/origin"
+  ```
+
+  The same table also accepts `kind = "s3"` for the new S3 backend —
+  the schema is in place today; the runtime backend lands in the
+  follow-up PR for #437 (the runtime currently rejects this variant
+  at startup with a placeholder error).
+- **CLI** `--origin-url` / `--origin-path` flags (and their
+  `DECDN_ORIGIN_URL` / `DECDN_ORIGIN_PATH` env vars) are removed
+  (#437). Origin selection is now config-only — the S3 backend has
+  too many fields (bucket, region, endpoint, credentials) to fit
+  cleanly on a command line, and keeping all three backends file-only
+  avoids the trap of a CLI-vs-TOML mismatch silently picking the
+  wrong backend.
 - **CLI** Split into two binaries (#421). The daemon is now
   `decdn-node` (single subcommand: `decdn-node run [--config <path>]`);
   `decdn run` no longer exists. The user CLI is `decdn` and gains

@@ -94,6 +94,13 @@ pub struct BlockchainArgs {
 }
 
 /// Cache storage configuration.
+///
+/// As of #437, origin selection (HTTP / filesystem / S3-compatible)
+/// lives only in the config-file `[cache.origin]` table — there are no
+/// CLI flags for it. The S3 backend has many fields (bucket, region,
+/// endpoint, credentials) that don't fit cleanly on a command line, and
+/// keeping all three backends file-only avoids the trap of a
+/// CLI-vs-TOML mismatch silently picking the wrong backend.
 #[derive(Args, Debug)]
 #[command(next_help_heading = "Cache")]
 pub struct CacheArgs {
@@ -109,15 +116,6 @@ pub struct CacheArgs {
     /// strictly less than `cache_size_mb`.
     #[arg(long, value_name = "MB", env = "DECDN_MAX_BLOB_SIZE_MB")]
     pub max_blob_size_mb: Option<u64>,
-
-    /// Origin base URL served at `{url}/{blake3_hex}`. Absent = no pull-through.
-    #[arg(long, value_name = "URL", env = "DECDN_ORIGIN_URL")]
-    pub origin_url: Option<String>,
-
-    /// Filesystem origin root. Blobs live at `{path}/{hex[0..2]}/{hex}`.
-    /// Mutually exclusive with `--origin-url`.
-    #[arg(long, value_name = "DIR", env = "DECDN_ORIGIN_PATH")]
-    pub origin_path: Option<PathBuf>,
 }
 
 /// Payment rate configuration.
