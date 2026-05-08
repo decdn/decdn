@@ -773,7 +773,7 @@ mod render_tests {
             "http://127.0.0.1:9090",
             &s,
             None,
-            Duration::from_millis(1000),
+            Duration::from_secs(1),
         )
         .unwrap();
         let out = String::from_utf8(buf).unwrap();
@@ -810,7 +810,7 @@ mod render_tests {
             "http://127.0.0.1:9090",
             &now,
             Some((&prev, Duration::from_secs(2))),
-            Duration::from_millis(1000),
+            Duration::from_secs(1),
         )
         .unwrap();
         let out = String::from_utf8(buf).unwrap();
@@ -835,7 +835,7 @@ mod render_tests {
             "http://127.0.0.1:9090",
             &s,
             None,
-            Duration::from_millis(1000),
+            Duration::from_secs(1),
         )
         .unwrap();
         let out = String::from_utf8(buf).unwrap();
@@ -851,7 +851,7 @@ mod render_tests {
             "http://127.0.0.1:9090",
             &s,
             None,
-            Duration::from_millis(1000),
+            Duration::from_secs(1),
         )
         .unwrap();
         let out = String::from_utf8(buf).unwrap();
