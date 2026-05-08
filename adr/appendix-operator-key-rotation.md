@@ -57,7 +57,6 @@ The standalone `bindNodeId` function is intended for rebinding only — it delet
 | Stake, ve-locks, gauge-claim history | Keyed by Ethereum address ([ADR 026](026-gauge-boost-tokenomics.md)) |
 | Open payment channels (inbound from clients) | Channel ID is `keccak256(client_eth, operator_eth, nonce[, token])` ([ADR 003](003-payments.md), [ADR 010](010-multi-token.md)) — the Ethereum address is unchanged |
 | `firstRegisteredAt` | Cleared only by `deregisterNode`; `bindNodeId` does not touch it ([ADR 019 §Re-Onboarding](019-node-onboarding.md#re-onboarding-after-deregistration-or-auto-ejection)) |
-| Receipt history (ADR 027) | Receipts are signed by *requester* keys, not the operator's |
 
 ### What does not carry over
 
@@ -84,7 +83,7 @@ The standalone `bindNodeId` function is intended for rebinding only — it delet
    - `decdn_node_uptime_seconds` advancing
    - Outgoing `NodeAnnounce` carries the new NodeId (visible in peers' gossip logs)
 8. **Un-drain** — accept inbound connections again.
-9. **Archive** the old iroh keystore offline. Retain it for at least `MAX_EVIDENCE_AGE_US` (default 5 days, governable [1d, 30d] per [ADR 014](014-on-chain-verification.md) §2 Evidence Verification Per Offense Type) — that is the staleness ceiling beyond which slash evidence containing signatures from the old key cannot be submitted on-chain. The retention is for forensic inspection (which signatures the old key produced); `bindNodeId` does not initiate unbonding, and all `SlashJudge` offenses (phantom, rate, blacklist, receipt fraud) resolve synchronously at submit time per [ADR 014 §Bond Handling](014-on-chain-verification.md#bond-handling) — no key-bound counter-evidence flow exists for the old iroh key to produce. Holding longer is harmless; deleting earlier means losing the ability to forensically reconstruct what the old key signed.
+9. **Archive** the old iroh keystore offline. Retain it for at least `MAX_EVIDENCE_AGE_US` (default 5 days, governable [1d, 30d] per [ADR 014](014-on-chain-verification.md) §2 Evidence Verification Per Offense Type) — that is the staleness ceiling beyond which slash evidence containing signatures from the old key cannot be submitted on-chain. The retention is for forensic inspection (which signatures the old key produced); `bindNodeId` does not initiate unbonding, and all `SlashJudge` offenses (phantom, rate, blacklist) resolve synchronously at submit time per [ADR 014 §Bond Handling](014-on-chain-verification.md#bond-handling) — no key-bound counter-evidence flow exists for the old iroh key to produce. Holding longer is harmless; deleting earlier means losing the ability to forensically reconstruct what the old key signed.
 
 ### Failure modes
 

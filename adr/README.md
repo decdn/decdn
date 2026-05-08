@@ -146,7 +146,7 @@ pandoc --from=markdown+gfm_auto_identifiers \
   000-language.md 001-network.md 002-content-addressing.md 005-protocol.md \
   022-content-discovery.md 015-zero-rtt.md \
   003-payments.md 010-multi-token.md 012-client.md 024-account-abstraction.md \
-  026-gauge-boost-tokenomics.md 027-distinct-client-receipts.md 018-liquidity-strategy.md \
+  026-gauge-boost-tokenomics.md 018-liquidity-strategy.md \
   014-on-chain-verification.md 008-reputation.md 011-content-takedown.md 028-slashing-appeals.md \
   009-governance.md 016-contract-interactions.md \
   019-node-onboarding.md \

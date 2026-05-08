@@ -64,7 +64,6 @@ When a Tier 3 release is announced, you have four weeks of dual-version-supporte
 | **Payment-channel validity.** Tier 3 changes can include the channel-ID formula or the voucher format. A change here invalidates **open channels** for the affected token/protocol. The release notes will state this explicitly. The contract-level worked example is [ADR 010 §Migration from ADR 003](010-multi-token.md#migration-from-adr-003) — the PoC `StablePaymentChannel` is decommissioned and replaced atomically; existing channels are force-closed via `forceCloseChannel`. | Operators must close out open channels in the old protocol before the cutover window or risk losing payments. |
 | **Voucher-signer compatibility.** If the EIP-712 voucher domain or typed-data hash changes (Tier 3 §Signed Field Freezing — modifying the signed field set is a major change), the off-chain voucher signer must be upgraded in lockstep with the node binary. | An old voucher signer producing pre-bump signatures against a new contract will fail `SignatureChecker.isValidSignatureNow` ([ADR 024 §1](024-account-abstraction.md)). |
 | **Local dispute monitor compatibility.** The in-process dispute monitor ([ADR 003](003-payments.md) Option C) reads voucher state from the node's local store and submits `disputeChannel` calls. A Tier 3 voucher-format change means the monitor must be on the new binary before any new-format channels open, otherwise it cannot decode them. The monitor ships with the node binary, so the only operator action is to ensure node and contract upgrades are sequenced correctly. | The local monitor is the primary stale-close defense ([Appendix: Fraud Detection](appendix-fraud-detection.md)); a stale binary leaves a window where new-format closes are unmonitored. |
-| **Reputation / receipt continuity.** Receipts ([ADR 027](027-distinct-client-receipts.md)) are signed by the *requester* key; their verifier lives in the node. A Tier 3 receipt-format change is rare but possible — release notes flag it explicitly. | Operators must coordinate with their downstream receipt-using infrastructure (gauge claim) before the cutover. |
 
 ### 3.2 Cutover — rolling upgrade (per node)
 
@@ -142,6 +141,5 @@ For Tier 3 upgrades that touch governance-controlled parameters (rate bounds in 
 - [ADR 005 — Probe-Triggered Eviction Hold (drain prerequisite)](005-protocol.md#probe-triggered-eviction-hold)
 - [Appendix: Fraud Detection — local dispute monitor and permissionless challengers](appendix-fraud-detection.md)
 - [ADR 024 — Smart-account verification across versions](024-account-abstraction.md)
-- [ADR 027 — Receipt format and gauge-claim continuity](027-distinct-client-receipts.md)
 - [`appendix-local-admin-http.md` — `admin_v1_drain` invocation](appendix-local-admin-http.md)
 - [`appendix-observability.md` — metrics referenced in the smoke-test checklist](appendix-observability.md)

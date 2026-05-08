@@ -79,11 +79,10 @@ Off-chain payment channels for per-MB delivery, with on-chain settlement. Multi-
 
 ### Chapter 4 — Tokenomics & incentives
 
-The economic model that ties the protocol together. Three ADRs: [ADR 026](026-gauge-boost-tokenomics.md) (canonical), [ADR 027](027-distinct-client-receipts.md) (gauge-security prerequisite), [ADR 018](018-liquidity-strategy.md) (Balancer V3 POL). The launch contract surface is forward-compatible (additive integration via standard `AccessControl` role grants per [ADR 016 §5](016-contract-interactions.md#5-access-control-matrix)) so future economic-layer products can land as additive top-level contracts without changing existing contracts.
+The economic model that ties the protocol together. Two ADRs: [ADR 026](026-gauge-boost-tokenomics.md) (canonical, including the per-operator gauge-share cap that defends against wash-trading) and [ADR 018](018-liquidity-strategy.md) (Balancer V3 POL). The launch contract surface is forward-compatible (additive integration via standard `AccessControl` role grants per [ADR 016 §5](016-contract-interactions.md#5-access-control-matrix)) so future economic-layer products can land as additive top-level contracts without changing existing contracts.
 
 1. [ADR 026 — Gauge-Boost Tokenomics](026-gauge-boost-tokenomics.md) (canonical)
-2. [ADR 027 — Distinct-Client Delivery Receipts](027-distinct-client-receipts.md) (gauge security; launch prerequisite)
-3. [ADR 018 — Liquidity Strategy (Balancer 80/20 POL)](018-liquidity-strategy.md)
+2. [ADR 018 — Liquidity Strategy (Balancer 80/20 POL)](018-liquidity-strategy.md)
 
 ### Chapter 5 — Verification & enforcement
 
@@ -141,13 +140,13 @@ Numeric per-ADR index. The thematic chapter ordering for top-to-bottom reading l
 - **[ADR 002 — Content Addressing](002-content-addressing.md)** — BLAKE3 content-addressed blobs. Node backends are opaque to the network.
 - **[ADR 003 — Payment Model](003-payments.md)** — Off-chain USDC payment channels. Market-driven rates within governance-set bounds.
 - **[ADR 005 — Wire Protocol](005-protocol.md)** — Two core protocols (ALPN-negotiated) plus iroh-gossip. `cdn/client/v1` covers all paid delivery.
-- **[ADR 008 — Reputation System](008-reputation.md)** — Interaction-weighted scoring with gossip propagation; gates [ADR 027](027-distinct-client-receipts.md) gauge-pool eligibility.
+- **[ADR 008 — Reputation System](008-reputation.md)** — Interaction-weighted scoring with gossip propagation; complements the [ADR 026 §3 per-operator gauge-share cap](026-gauge-boost-tokenomics.md#per-operator-gauge-share-cap) as off-chain wash-trading signal.
 - **[ADR 009 — Governance Model](009-governance.md)** — Admin key for PoC; ve-weighted Governor + Timelock with safety bounds for production.
 - **[ADR 010 — Multi-Token Payment Support](010-multi-token.md)** — Token-agnostic payments with governance-managed ERC-20 allowlist. USDC-only for PoC.
 - **[ADR 011 — Content Takedown and Hash Blacklisting](011-content-takedown.md)** — Governance-controlled on-chain hash blacklist with regional bodies and emergency fast-path; per-entry appeals for regional entries via emergency-multisig fast-track + ve-Governor ratification ([§ Blacklist Entry Appeals](011-content-takedown.md#blacklist-entry-appeals)).
 - **[ADR 012 — Client Architecture, Bootstrap, and Trust Model](012-client.md)** — Client bootstrap, key management, identity lifecycle, trust boundary, multi-node parallel download, crash recovery, and file manifests.
 - **[ADR 013 — Schema Evolution](013-schema-evolution.md)** — Varint-length framing, protocol enums, three-tier evolution model.
-- **[ADR 014 — On-Chain Verification for Slashing Evidence](014-on-chain-verification.md)** — secp256k1 EIP-712 `slash_sig` on `ProbeResponse`/`StreamResponse`; unified `SlashJudge` contract for the three signature-dependent offenses (phantom, rate, blacklist) plus receipt fraud per ADR 027. Content corruption is absorbed at the wire (no on-chain path) — see [ADR 003 §Corrupted delivery](003-payments.md#corrupted-delivery).
+- **[ADR 014 — On-Chain Verification for Slashing Evidence](014-on-chain-verification.md)** — secp256k1 EIP-712 `slash_sig` on `ProbeResponse`/`StreamResponse`; unified `SlashJudge` contract for the three signature-dependent offenses (phantom, rate, blacklist). Content corruption is absorbed at the wire (no on-chain path) — see [ADR 003 §Corrupted delivery](003-payments.md#corrupted-delivery). Wash-trading defense lives in [ADR 026 §3](026-gauge-boost-tokenomics.md#per-operator-gauge-share-cap) (per-operator gauge-share cap), not in `SlashJudge`.
 - **[ADR 015 — QUIC 0-RTT Connection Establishment](015-zero-rtt.md)** — 0-RTT early data for latency-sensitive protocols (`cdn/probe/v1`, `cdn/dht/v1`); paid delivery (`cdn/client/v1`) stays 1-RTT.
 - **[ADR 016 — Smart Contract Interaction Model](016-contract-interactions.md)** — Cross-contract call graph, fund custody, access control matrix, and reentrancy analysis.
 - **[ADR 017 — Privacy Analysis](017-privacy.md)** — Unified privacy surface inventory, adversary model, and mitigation roadmap.
@@ -155,8 +154,7 @@ Numeric per-ADR index. The thematic chapter ordering for top-to-bottom reading l
 - **[ADR 019 — Node Onboarding and Bootstrapping Flow](019-node-onboarding.md)** — End-to-end procedure from bare server to actively accepting paid delivery; five sequential onboarding phases.
 - **[ADR 022 — Content Discovery at Scale](022-content-discovery.md)** — `cdn/dht/v1` Kademlia subset for content discovery (primary from PoC onward); demand surfaced via DHT FIND_VALUE query frequency and local cache-miss timestamps. No discovery fees.
 - **[ADR 024 — Account Abstraction and Safe Smart Wallet Support](024-account-abstraction.md)** — Universal `SignatureChecker` across all contracts; Safe as the recommended wallet for nodes and clients; session keys via ERC-7579 `smartsessions` deferred to production.
-- **[ADR 026 — Gauge-Boost Tokenomics](026-gauge-boost-tokenomics.md)** — 1B fixed supply; `FeeRouter` six-bucket split with Curve-style gauge boost, delegator pool, and SafetyReserve.
-- **[ADR 027 — Distinct-Client Delivery Receipts](027-distinct-client-receipts.md)** — Client-signed `DeliveryReceipt` Merkle-batched per epoch; gauge-pool eligibility gated on distinct-client diversity. Required for mainnet launch.
+- **[ADR 026 — Gauge-Boost Tokenomics](026-gauge-boost-tokenomics.md)** — 1B fixed supply; `FeeRouter` six-bucket split with Curve-style gauge boost, delegator pool, and SafetyReserve. Per-operator gauge-share cap (5% default) is the wash-trading defense; gauge bucket paused via `gaugeLaunched == false` until cap is enforced (`enableGauge()` cutover).
 - **[ADR 028 — Slashing Appeals and Dispute Escalation](028-slashing-appeals.md)** — 30-day post-slash appeal window via `SafetyReserve` restitution; emergency multisig fast-track + 14-day ve-Governor ratification; one accepted appeal per operator per 365 days.
 
 ## Key Invariants
@@ -428,6 +426,6 @@ A KV-CRDT namespace per content provider could replicate a catalog of `hash → 
 - Parallel streaming from multiple nodes for a single blob (protocol supports it, not prioritised)
 - ~~Maximum blob size~~: decided — nodes may configure a `max_blob_size` limit (PoC recommended default: 10 GB). Requests exceeding a node's limit are rejected with `StreamError::BlobTooLarge` ([ADR 005](005-protocol.md#error-handling-and-retry-semantics)). This is a per-node operational policy, not an on-chain governance parameter, because different nodes have different storage and bandwidth budgets
 - ~~Schema evolution strategy for postcard wire messages~~: decided — [ADR 013](013-schema-evolution.md) defines varint-length framing, protocol enums, a three-tier evolution model, and a gossip envelope
-- ~~On-chain verification for slash evidence~~: decided — [ADR 014](014-on-chain-verification.md) specifies secp256k1 EIP-712 `slash_sig` on `ProbeResponse`/`StreamResponse` (`SignatureChecker` for EOA + ERC-1271 smart-wallet verification) and a unified `SlashJudge` contract for the three signature-dependent offenses (phantom, rate, blacklist) plus receipt fraud per ADR 027. Content corruption is absorbed at the wire by client-side BLAKE3 verification (no on-chain mechanism)
+- ~~On-chain verification for slash evidence~~: decided — [ADR 014](014-on-chain-verification.md) specifies secp256k1 EIP-712 `slash_sig` on `ProbeResponse`/`StreamResponse` (`SignatureChecker` for EOA + ERC-1271 smart-wallet verification) and a unified `SlashJudge` contract for the three signature-dependent offenses (phantom, rate, blacklist). Content corruption is absorbed at the wire by client-side BLAKE3 verification (no on-chain mechanism); wash-trading is defended by the [ADR 026 §3](026-gauge-boost-tokenomics.md#per-operator-gauge-share-cap) per-operator cap (not by `SlashJudge`)
 - ~~NodeId ownership proof for registration~~: decided — [ADR 001](001-network.md#nodeid-ownership-verification) specifies on-chain ed25519 signature verification at registration time, with `reclaimNodeId` as the sole reclaim mechanism in both PoC and production
 - ~~Account abstraction / smart wallet support~~: decided — [ADR 024](024-account-abstraction.md) specifies ERC-1271 (`SignatureChecker`) in all contracts from the PoC, Safe as recommended wallet for nodes and clients, session keys for high-frequency signing (vouchers, slash_sig). Supersedes the delegated voucher signer approach (PR 196)

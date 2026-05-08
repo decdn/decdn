@@ -92,9 +92,9 @@ Direct peer USDC payment, no skim. Internal cost-recovery flow, not net protocol
 
 Epoch length is 1 week (7 × 86400 s, block-timestamp-aligned). At epoch rollover the gauge and delegator buckets freeze, new buckets open, and per-operator `bytes_delivered` counters reset. ve-balance snapshots are taken at the epoch-boundary timestamp via `VotingEscrow.balanceOfAt(user, ts)`. Claim window is 26 epochs (~6 months); unclaimed allocations sweep to the treasury.
 
-#### Pre-receipt-launch gauge accumulation
+#### Pre-launch gauge accumulation
 
-[ADR 027 §9](027-distinct-client-receipts.md#9-implementation-sequencing-and-launch-prerequisite) establishes that the 40% gauge bucket MUST NOT pay out until distinct-client receipts are live and verified at scale — wash-trading at TOKEN price 3–5× genesis is net-profitable without the receipt gate. This sub-section pins the contract-level mechanism for that pause and the cutover.
+The 40% gauge bucket MUST NOT pay out until the per-operator gauge-share cap from §3 above is enforced — wash-trading at TOKEN price 3–5× genesis is net-profitable without that cap (see `internal/ideas/wash-trading-economics.md`). This sub-section pins the contract-level mechanism for that pause and the cutover.
 
 ```solidity
 // FeeRouter pre-launch gauge state.
@@ -124,7 +124,7 @@ This pattern is shape-analogous to §3's empty-epoch rollover (gauge bucket park
 
 Adapted from Curve Finance's veCRV gauge boost (in production since 2020). Replaces the LP-deposit primitive with verified-bytes-delivered.
 
-Per-operator pool share = `working_bytes_i / sum(working_bytes)`, where `working_bytes_i = min(bytes_i, 0.4·bytes_i + 0.6·(ve_i/total_ve)·total_bytes)` over the epoch's verified bytes (full derivation in design spec §9.4). `bytes_i` is sourced from the operator's `EpochReceiptSummary.claimedBytes` after the [ADR 027 §4 challenge window](027-distinct-client-receipts.md#challenge-window) closes; a successful challenge zeros that field for the epoch and the operator's gauge share collapses to zero accordingly.
+Per-operator pool share = `min(working_bytes_i / sum(working_bytes), MAX_GAUGE_SHARE_PER_OPERATOR)`, where `working_bytes_i = min(bytes_i, 0.4·bytes_i + 0.6·(ve_i/total_ve)·total_bytes)` over the epoch's verified bytes (full derivation in design spec §9.4). `bytes_i` is sourced from `FeeRouter.bytesPerEpoch[operator][epoch]` (canonical in [ADR 016 §FeeRouter](016-contract-interactions.md#feerouter)); the per-operator share cap is the binding wash-trading defense.
 
 **Properties:**
 
@@ -144,6 +144,18 @@ Per-operator pool share = `working_bytes_i / sum(working_bytes)`, where `working
 The Curve formula is bounded by `bytes` in both directions (a non-locker still earns 40% of fair-share, a whale-locker cannot exceed fair-share), which prevents both the "starve commodity operators" and "ve-whale captures the pool" failure modes of simpler `boost = 1 + k × ve` mechanics. The fair-share normalization gives the system a stable equilibrium where operators who match their ve-share to their byte-share collectively neither over- nor under-claim — matching Curve's gauge-equilibrium pattern.
 
 The boost-floor parameter (default `boostFloor = 0.4`) is governable within `[0.2, 0.8]`. A lower floor sharpens the penalty for non-lockers and raises the max boost ratio; a higher floor softens differentiation. See §11 for the safety-bound table.
+
+#### Per-operator gauge-share cap
+
+The per-epoch gauge share for any single operator is capped at `MAX_GAUGE_SHARE_PER_OPERATOR` (default **5%**, governable within `[1%, 25%]` per [ADR 009](009-governance.md) safety bounds). Concretely:
+
+```
+share_i = min(working_bytes_i / sum(working_bytes), MAX_GAUGE_SHARE_PER_OPERATOR)
+```
+
+Any residual gauge bucket left after capping (which occurs when one or more operators would have received more than the cap) rolls over to the next epoch's gauge accumulator under the same rule as the `sum(working_bytes) == 0` degenerate case in §Degenerate-input fallbacks above. The 26-epoch claim window in §2 Epoch mechanics caps the total rollover.
+
+**Rationale.** Bounds wash-trading payoff at 5% of the gauge bucket per operator-identity. Combined with the boost formula's `0.4·bytes_i` floor for low-ve operators and the closed-pool gauge structure (every settlement contributes to the same global bucket the operator is then claiming from), this makes wash-trading economically marginal at any reasonable TOKEN price — the attacker pays into the pool they're trying to drain, with 8% leakage to treasury+safety per self-deal, and the cap suppresses any non-proportional share they could extract via ve-boost. Sybil expansion of attack-operator count requires fresh `StakingRegistry` registrations each with the §7 minimum stake, converting wash-trading from a heuristic-bypass attack into a stake-proportional capital-lockup attack. A single honest operator with a dominant byte share is also subject to the cap, which is the intended posture — the gauge pool exists to incentivize a diverse operator set, not to reward concentration. Quantitative analysis: `internal/ideas/wash-trading-economics.md`.
 
 ### 4. Voting escrow (`VotingEscrow`)
 
@@ -548,7 +560,7 @@ Bootstrap supply-side incentive is **$1M+ pre-seed USDC capital** (planning targ
 
 ### 11. Governable parameters with safety bounds
 
-Router shares, the boost-floor parameter, and the receipt-anchoring lifecycle windows are governable, gated by 48-hour timelock per [ADR 009](009-governance.md), and bounded as below. Sum-to-100% across the six router shares is enforced on every governance update; updates that violate the sum or exceed any individual bound revert.
+Router shares, the boost-floor parameter, the per-operator gauge-share cap, and the claim window are governable, gated by 48-hour timelock per [ADR 009](009-governance.md), and bounded as below. Sum-to-100% across the six router shares is enforced on every governance update; updates that violate the sum or exceed any individual bound revert.
 
 | Parameter | Default | Min | Max |
 | --- | ---: | ---: | ---: |
@@ -559,21 +571,16 @@ Router shares, the boost-floor parameter, and the receipt-anchoring lifecycle wi
 | Treasury share | 5% | 0% | 20% |
 | Safety share | 3% | 0% | 15% |
 | `boostFloor` | 0.4 | 0.2 | 0.8 |
-| `summaryWindow` | 604,800 s (7 days) | 259,200 s (3 days) | 1,209,600 s (14 days) |
-| `challengeWindow` | 604,800 s (7 days) | 259,200 s (3 days) | 1,209,600 s (14 days) |
+| `MAX_GAUGE_SHARE_PER_OPERATOR` | 5% | 1% | 25% |
 | `claimWindow` | 26 epochs | 13 epochs | 52 epochs (`uint16` count of epochs; the contract internally multiplies by the immutable `epochLength` to derive a seconds-domain deadline) |
 
-The 20% floor on the node-base share guarantees operators always receive enough liquid USDC to cover at least a meaningful fraction of infrastructure costs even under extreme governance proposals — preserves the cashflow invariant. The `boostFloor` bounds prevent governance from collapsing the gauge pool to a winner-take-all distribution (lower-bound) or flattening it into uselessness (upper-bound).
-
-The `summaryWindow` lower bound (3 days) gives honest operators time to aggregate receipts off-chain, sign the EpochReceiptSummary, and submit the on-chain commit before the deadline; the upper bound (14 days) keeps total time-to-gauge-finality within a month even at the most permissive setting. The `challengeWindow` bounds give bonded challengers time to verify signatures and identity-diversity heuristics (lower bound) without indefinitely delaying gauge payouts (upper bound).
-
-**Cross-parameter invariant:** `claimWindow` MUST be strictly greater than `challengeWindow` (in matching units — the contract converts `challengeWindow` from seconds to epochs as needed). A summary frozen with undetected fraud could otherwise outlive the challenge window before the operator's claim resolves; enforcing `claimWindow > challengeWindow` at the setter layer guarantees there is always time for a successful challenger to surface a `ChallengeReceiptSummary` and zero the over-claimed fields before any payout against that epoch lands. Updates that violate the invariant revert.
+The 20% floor on the node-base share guarantees operators always receive enough liquid USDC to cover at least a meaningful fraction of infrastructure costs even under extreme governance proposals — preserves the cashflow invariant. The `boostFloor` bounds prevent governance from collapsing the gauge pool to a winner-take-all distribution (lower-bound) or flattening it into uselessness (upper-bound). The `MAX_GAUGE_SHARE_PER_OPERATOR` bounds prevent governance from disabling the wash-trading defense (lower bound implicitly enforced by the cap being non-zero) or so over-tightening that legitimate large operators are starved (upper bound).
 
 **Non-numeric one-shot setters.**
 
 | Setter | Effect | Reversibility |
 | --- | --- | --- |
-| `enableGauge()` | Flips `gaugeLaunched = false → true`, records `gaugeLaunchEpoch`, emits `GaugeLaunched`. Activates the live gauge bucket from `gaugeLaunchEpoch` onward; pre-launch escrow becomes claimable from `gaugeLaunchEpoch` against the historical ve-snapshots already taken at each pre-launch epoch boundary (per §2 Pre-receipt-launch gauge accumulation). | One-shot, irreversible. The pre-launch state is launch-only — there is no `disableGauge()`. |
+| `enableGauge()` | Flips `gaugeLaunched = false → true`, records `gaugeLaunchEpoch`, emits `GaugeLaunched`. Activates the live gauge bucket from `gaugeLaunchEpoch` onward; pre-launch escrow becomes claimable from `gaugeLaunchEpoch` against the historical ve-snapshots already taken at each pre-launch epoch boundary (per §2 Pre-launch gauge accumulation). | One-shot, irreversible. The pre-launch state is launch-only — there is no `disableGauge()`. |
 
 `enableGauge()` is governable per [ADR 009](009-governance.md), inherits the `AccessControl` role-gating from §11 Setter contract-level bound enforcement, and has no numeric bound (binary state).
 
@@ -596,7 +603,7 @@ Parameter setters on `FeeRouter` and `VotingEscrow` are role-gated via `AccessCo
 
 ### Negative
 
-- **Significant contract surface.** `FeeRouter` (with two pool types and the delegator-swap path), `VotingEscrow`, `SafetyReserve`, and the optional `DelegatorBuyer` add meaningful audit burden. The §2 Pre-receipt-launch gauge accumulation adds three storage slots (`gaugeLaunched`, `gaugeLaunchEpoch`, the `preLaunchGaugeAccumulator` mapping), one one-shot governance setter (`enableGauge()`), and one event (`GaugeLaunched`) on top of the existing `FeeRouter` surface — a small but non-zero increment that audit must include.
+- **Significant contract surface.** `FeeRouter` (with two pool types and the delegator-swap path), `VotingEscrow`, `SafetyReserve`, and the optional `DelegatorBuyer` add meaningful audit burden. The §2 Pre-launch gauge accumulation adds three storage slots (`gaugeLaunched`, `gaugeLaunchEpoch`, the `preLaunchGaugeAccumulator` mapping), one one-shot governance setter (`enableGauge()`), and one event (`GaugeLaunched`) on top of the existing `FeeRouter` surface — a small but non-zero increment that audit must include.
 - **Per-epoch byte accounting adds gas.** Every settlement increments an operator's byte counter — 5K–15K gas on top of router forwarding. Minor but non-zero; needs validation on the chosen L2 (see [Appendix: L2 Deployment](appendix-l2-deployment.md)).
 - **Commodity operators face thin margins.** Operators who refuse to ve-lock see lower margins than fair-share-ve operators. This is the designed incentive pressure, but the failure mode is under-supply of operators if the filter is too sharp. Externally-funded operator-onboarding programs partially offset.
 - **Governance bootstrap depends on voluntary locking.** Initial veTOKEN supply tracks self-locking decisions; first 6–12 months may need treasury-funded lock incentives.
@@ -609,7 +616,7 @@ Parameter setters on `FeeRouter` and `VotingEscrow` are role-gated via `AccessCo
 - **Equilibrium fragility.** The Curve-style model converges to a stable equilibrium *if* the boost is valuable enough to lock for but not so valuable that a winner-take-all dynamic emerges. The 40% gauge-pool default is sized in the middle by reasoned default; production tuning may be needed.
 - **Reflexive operator-margin layer.** TOKEN price drop → ve-lock value drops → fair-share-ve margins shrink → operators unwind commitment. Pre-seed USDC insulates the *funding* side; the *operator-recruitment* side still depends on TOKEN price for ve-incentive strength. Mitigated, not eliminated.
 - **Delegator-conversion MEV risk.** TWAP + private-RPC routing mitigates front-running, but the swap is observable on-chain post-fact. Flashbots-style bundles and per-epoch liquidity caps are required on this path, not optional. Keeper-cost economics under L2 gas conditions ([Appendix: L2 Deployment](appendix-l2-deployment.md)) need validation.
-- **Wash-trading / self-routed traffic.** An operator could induce noise settlements to inflate gauge-pool share. Mitigations are per-event settlement gas cost (~$0.08), permissionless bonded-challenger observation of self-settlement patterns ([Appendix: Fraud Detection](appendix-fraud-detection.md)), and most importantly **client-signed delivery receipts from distinct identities** tied to funded payment channels — the latter is the strongest invariant in the gauge-pool security model and is forward-referenced as [ADR 027](027-distinct-client-receipts.md). The launch prerequisite is now contract-pinned in §2 Pre-receipt-launch gauge accumulation: `gaugeLaunched == false` escrows the 40% gauge bucket per epoch, and the one-shot `enableGauge()` setter is the only path to live gauge payouts. This converts the prior soft governance norm — "the gauge pool MUST NOT pay out until distinct-client receipts are live" — into a mechanical state machine, not a discretionary policy. (See also [ADR 027 §9 — Implementation sequencing and launch prerequisite](027-distinct-client-receipts.md#9-implementation-sequencing-and-launch-prerequisite).)
+- **Wash-trading / self-routed traffic.** An operator could induce noise settlements to inflate gauge-pool share. The defense is the **per-operator gauge-share cap** from §3 above (`MAX_GAUGE_SHARE_PER_OPERATOR`, default 5%, governable `[1%, 25%]`), bounding the wash-trading payoff per operator-identity. Combined with the closed-pool gauge bucket (every settlement contributes to the same pool the operator is then claiming from) and the 8% treasury+safety leakage per self-deal, this makes wash-trading economically marginal at any reasonable TOKEN price — see `internal/ideas/wash-trading-economics.md` for the quantitative analysis. The launch prerequisite is contract-pinned in §2 Pre-launch gauge accumulation: `gaugeLaunched == false` escrows the 40% gauge bucket per epoch, and the one-shot `enableGauge()` setter is the only path to live gauge payouts.
 - **Governance-weight concentration.** Operators who lock heavily for boost also accumulate disproportionate governance weight. [ADR 009](009-governance.md) safety bounds prevent extreme abuse; team / seed / treasury vesting acts as a counterweight during the first ~3 years.
 - **Convex-capture risk.** Third-party liquid-ve wrappers (Convex / Votium / Aura analogs) can concentrate governance power outside the DAO. Mitigation is operational — the DAO may ship a native liquid-ve wrapper as an additive top-level contract (integrating with `VotingEscrow` via the standard lock-creation / increase-amount / snapshot interfaces per §4) without changing the launch contract surface.
 - **20% burn share deterrence.** A higher burn share would weight slashing more toward pure deflation; the chosen 50/30/20 distribution prefers user-harm recourse via `SafetyReserve`. The §11 safety bound on the burn share leaves room for governance recalibration; security review should confirm 20% preserves slashing's deterrent value.
@@ -620,4 +627,4 @@ The five tokenomics shapes evaluated against this design (original 3%-flat / sta
 
 ## Forward references (follow-up ADRs)
 
-- **[ADR 027 — Distinct-client delivery receipts](027-distinct-client-receipts.md)** — priority-1; required for gauge-pool security at mainnet launch.
+(none currently outstanding — wash-trading defense is the per-operator gauge-share cap from §3, with the cap-enforcement launch prerequisite contract-pinned in §2.)
