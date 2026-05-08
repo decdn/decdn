@@ -70,10 +70,11 @@ on read.
 1. **Canonicalize-and-contain.** The `--input` directory is
    canonicalized once. Every walked path is canonicalized and required
    to sit under that root via `starts_with`. Same shape as
-   `FilesystemOrigin::fetch` in the cache crate. A symlink that
-   resolves outside the root is a hard error regardless of
-   `--follow-symlinks` — the bundle's `path` field is a relative POSIX
-   string and cannot truthfully describe an external target.
+   `FilesystemOrigin::fetch` in the cache crate. With
+   `--follow-symlinks`, a symlink that resolves outside the root is a
+   hard error — the bundle's `path` field is a relative POSIX string
+   and cannot truthfully describe an external target. Without the
+   flag, symlinks are skipped before this check fires (see Rule 5).
 2. **No `..`, root, or current-directory components.** Each component
    of the produced relative path must be `Component::Normal`. The
    canonicalize-and-strip-prefix flow shouldn't produce other variants;

@@ -168,9 +168,13 @@ fn collect_entries(
         }
         // With follow_links=false, symlinks come through as symlink entries
         // we never read — skip silently and surface the count in --json.
+        // The canonicalize-and-contain check below is bypassed in this
+        // branch via `continue`, which matches the appendix Rule 5
+        // "skipped silently" semantics.
         // With follow_links=true, walkdir resolves the link transparently
-        // and the entry presents as a regular file; the path-safety check
-        // below catches escapes regardless of the follow flag.
+        // and the entry presents as a regular file; only then does the
+        // path-safety check below run and catch escapes via in-tree
+        // symlinks.
         if ftype.is_symlink() {
             skipped_symlinks = skipped_symlinks.saturating_add(1);
             continue;
