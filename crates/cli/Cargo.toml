@@ -38,6 +38,10 @@ walkdir = { workspace = true }
 globset = { workspace = true }
 blake3 = { workspace = true }
 tempfile = { workspace = true }
+# `node top` (issue #275) scrapes the daemon's loopback /metrics HTTP
+# endpoint. Workspace-pinned with rustls + no default features — same
+# settings `decdn-node` uses, so the dep tree stays unified.
+reqwest = { workspace = true }
 
 [dev-dependencies]
 # Integration tests in `tests/admin_peers.rs` exercise the loopback admin

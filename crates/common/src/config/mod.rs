@@ -33,8 +33,10 @@ const DEFAULT_CACHE_SIZE_MB: u64 = 10_240;
 const DEFAULT_MAX_BLOB_SIZE_MB: u64 = 1_024;
 /// Default rate per MB in USDC base units ($0.00001/MB).
 const DEFAULT_RATE_PER_MB: u64 = 10;
-/// Default Prometheus metrics port.
-const DEFAULT_METRICS_PORT: u16 = 9090;
+/// Default Prometheus metrics port. Exposed publicly so `decdn node top`
+/// (issue #275) can fall back to the same number the daemon binds on
+/// without duplicating the constant.
+pub const DEFAULT_METRICS_PORT: u16 = 9090;
 /// Default metrics bind address (loopback). Operators in containerised
 /// deployments override to `0.0.0.0` via CLI/env/config.
 const DEFAULT_METRICS_BIND: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
