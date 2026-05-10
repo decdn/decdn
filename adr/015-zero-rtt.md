@@ -21,6 +21,7 @@ This ADR defines which protocols are eligible for 0-RTT, the replay safety ratio
 | --- | --- | --- |
 | `cdn/probe/v1` | **Yes** | `ProbeRequest` is read-only and idempotent. A replayed probe produces a duplicate `ProbeResponse` that the requester deduplicates by `NodeId` in the probe cache. No state change on the responder. |
 | `cdn/client/v1` | **No** | `StreamRequest` initiates a payment relationship. Replay could cause duplicate byte delivery or voucher accounting confusion. Subsequent streams on an established connection already benefit from QUIC stream multiplexing (zero additional handshake cost). |
+| `cdn/dht/v1` | **No** | The ALPN multiplexes `FindValueRequest` / `FindNodeRequest` (read-only, replay-safe) with `StoreRequest` (state-changing — refreshes the receiver's `(hash, holder)` record TTL per [ADR 022 §1.4](022-content-discovery.md#14-content-records-and-ttl)). QUIC's 0-RTT acceptance is negotiated at ALPN granularity, and per-message gating within an accepted ALPN is not idiomatic in iroh/quinn — the multiplexed ALPN therefore takes the safety floor of its least-safe message. The `FindValue` 1-RTT handshake cost is paid once per peer (connection reuse via stream multiplexing per [ADR 005 §Connection Management](005-protocol.md#connection-management)); steady-state cache-miss lookups mostly hit warm connections, especially as routing tables fill (k=20, hourly bucket refresh per [ADR 022 §1.3](022-content-discovery.md#13-routing-table)). If FIND_VALUE 0-RTT later proves load-bearing, the right evolution is a split ALPN (`cdn/dht-find/v1` 0-RTT-yes, `cdn/dht-store/v1` 0-RTT-no), not per-message gating within one ALPN. |
 
 > External ALPNs (e.g. companion-protocol ALPNs documented in appendices) make their own 0-RTT decisions; they are out of scope here.
 
@@ -34,13 +35,15 @@ Responders MUST NOT use `ProbeRequest` receipt to trigger any state change (e.g.
 
 **`StreamRequest` (unsafe):** Initiates paid byte delivery. Replay could cause a node to begin streaming bytes and expect voucher payment for a transfer the client did not request. Even if the node detects the duplicate `channel_id` + `byte_offset` combination, the window between replay receipt and detection creates accounting ambiguity.
 
+**`StoreRequest` (unsafe):** Publishes a `(hash, holder)` content record at the receiver, with TTL up to 1 hour ([ADR 022 §1.4](022-content-discovery.md#14-content-records-and-ttl)). A captured 0-RTT `StoreRequest` packet can be replayed for as long as the server still accepts the resumption ticket — bounded by the server-side acceptance window, which [§Session Ticket Management](#session-ticket-management) below caps at 24 hours. QUIC PSK resumption authenticates the replayed connection as the original holder `H`, so the receiver-side equality check `holder == authenticated NodeId` ([ADR 022 §1.5](022-content-discovery.md#15-store-flow-cache-event--dht-publish)) passes and the record TTL is refreshed. Each replay extends the record by up to one hour; an attacker who re-replays before each TTL expiry can sustain a stale advertisement for as long as the cached session ticket remains valid (up to ~24 hours past the holder's eviction). This is independent of whether `StoreRequest` carries an application-level signature: the captured bytes are constant, so signature replay and bytes replay are equivalent. `FindValueRequest` and `FindNodeRequest` are themselves replay-safe (read-only iterative lookups), but per the table above they share the ALPN with `StoreRequest` and inherit its 1-RTT requirement.
+
 ### Session Ticket Management
 
 After a successful 1-RTT handshake on a 0-RTT-eligible ALPN, the implementation MUST:
 
 1. **Cache the session ticket** keyed by `(remote_node_id, ALPN)` in an in-memory LRU cache.
 2. **Wait for the ticket before closing.** After the application exchange completes, spawn a background task that waits up to 2x the measured RTT (minimum 100ms, maximum 2 seconds) for the server's NewSessionTicket message before closing the connection. This matches the pattern used by iroh-experiments/content-discovery.
-3. **Honor server-advertised expiry.** Discard tickets whose `ticket_lifetime` has elapsed. Additionally, implementations SHOULD discard tickets after 24 hours regardless of the advertised lifetime (which RFC 8446 caps at 7 days) to limit the window of ticket theft impact.
+3. **Honor and bound ticket expiry.** Clients MUST discard tickets whose `ticket_lifetime` has elapsed. Servers SHOULD advertise `ticket_lifetime` ≤ 24 hours (RFC 8446 caps it at 7 days) **and** SHOULD reject 0-RTT resumption attempts whose ticket was issued more than 24 hours ago, regardless of the advertised lifetime — so the server-side accept window, not just client-side cache hygiene, bounds the ticket-theft and 0-RTT replay threat. Clients SHOULD independently discard cached tickets after 24 hours as a defense in depth.
 4. **LRU eviction.** Maximum 1,000 cached tickets. At PoC scale (30 nodes x 1 eligible ALPN = 30 active entries), this provides ample headroom.
 
 ### 0-RTT Rejection Handling
@@ -59,6 +62,7 @@ Nodes MUST configure 0-RTT acceptance per ALPN:
 
 - **`cdn/probe/v1`:** Accept 0-RTT. Process early-data `ProbeRequest` immediately.
 - **`cdn/client/v1`:** Reject 0-RTT (do not configure `max_early_data_size`). This is the default — QUIC servers that do not explicitly enable 0-RTT will reject it.
+- **`cdn/dht/v1`:** Reject 0-RTT (do not configure `max_early_data_size`). Same default as `cdn/client/v1`.
 
 ### Impact on Probe Latency
 
