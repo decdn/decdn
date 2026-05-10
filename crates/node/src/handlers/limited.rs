@@ -86,10 +86,10 @@ impl<H: ProtocolHandler> ProtocolHandler for LimitedHandler<H> {
                 );
                 // No `conn.closed()` wait. Probe waits briefly on `PerSource`
                 // rejections so the peer reliably observes the layer-label
-                // byte; for a generic foreign-handler wrapper we don't own
-                // the protocol semantics, and on `GlobalFull` a wait would
-                // park each rejected task for up to the timeout — at
-                // thousands of rejections per second that is the
+                // reason bytes; for a generic foreign-handler wrapper we
+                // don't own the protocol semantics, and on `GlobalFull` a
+                // wait would park each rejected task for up to the timeout
+                // — at thousands of rejections per second that is the
                 // memory-pressure path the limiter exists to prevent.
                 return Ok(());
             }

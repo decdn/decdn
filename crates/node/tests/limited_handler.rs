@@ -237,19 +237,26 @@ async fn permit_releases_when_inner_returns_err() -> anyhow::Result<()> {
         .spawn();
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
 
-    // Three sequential connects from fresh client endpoints. Each must reach
-    // the inner handler; if the permit leaked on `Err`, only the first would.
+    // Reuse one client endpoint across iterations — endpoint creation is the
+    // expensive part of this loop, the connection itself is cheap.
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+
+    // Three sequential connects. Each must reach the inner handler; if the
+    // permit leaked on `Err`, only the first would. Waiting on
+    // `conn.closed()` between iterations serializes the test against the
+    // server-side permit drop — without it, iteration N+1's connect could
+    // race iteration N's permit release. (This is a 3-iteration sequencing
+    // test, not a flood: the "no `conn.closed()` wait under rejection"
+    // guideline that protects the limiter's memory-pressure path doesn't
+    // apply here.)
     for attempt in 1..=3u32 {
-        let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
         let conn = client_ep
             .connect(target.clone(), TEST_ALPN)
             .await
             .map_err(|e| anyhow::anyhow!("attempt {attempt} connect: {e}"))?;
-        // Wait for the connection to close (server's `accept` returned `Err`,
-        // so iroh drops the connection without sending an app code — the
-        // close arrives as a transport-level event).
-        let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
-        client_ep.close().await;
+        tokio::time::timeout(Duration::from_secs(5), conn.closed())
+            .await
+            .map_err(|_| anyhow::anyhow!("attempt {attempt}: connection never closed within 5s"))?;
     }
 
     assert_eq!(
@@ -263,6 +270,7 @@ async fn permit_releases_when_inner_returns_err() -> anyhow::Result<()> {
         .shutdown()
         .await
         .map_err(|e| anyhow::anyhow!("router.shutdown: {e}"))?;
+    client_ep.close().await;
     server_ep.close().await;
     Ok(())
 }
