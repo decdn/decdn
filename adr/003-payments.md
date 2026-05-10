@@ -135,6 +135,25 @@ This means the network self-balances: popular content gets replicated because ca
 
 **Origin backend economics:** The choice of backing store directly affects an origin-backed node's viable rate. At the expected market rate of $0.01/GB, an S3-backed node paying $0.09/GB egress loses money on every cache miss and must amortize origin pulls across a high cache-hit ratio (or price above market rate). Zero-egress backends — Cloudflare R2 ($0.00/GB), Backblaze B2 ($0.00/GB via Bandwidth Alliance partners), and Wasabi ($0.00/GB) — allow origin-backed nodes to remain profitable at or near market rates. Operators choosing high-egress backends should expect to set higher `rate_per_mb` values to cover their costs, which the market tolerates for content that is not yet cached elsewhere.
 
+### Off-chain Voucher Rejections (Wire Encoding)
+
+When a node rejects a voucher off-chain — before any gas would be spent — the rejection is returned **in-band** mid-stream as a `StreamError` message carrying `VoucherRejected { reason }` (per [ADR 005 § Stream Lifecycle State Machine](005-protocol.md#stream-lifecycle-state-machine), this transitions the stream `Streaming → Failed` cleanly without a QUIC stream reset). Voucher validation can only fire after the client has submitted at least one `Voucher`, which is necessarily after `StreamResponse { ok: true }` — so payment rejections never use the initial-response error path that delivery-side failures (`NotFound`, `Overloaded`, etc.) take. The full reason enum and per-reason retry semantics live in [ADR 005 § VoucherRejected semantics](005-protocol.md#voucherrejected-semantics).
+
+The eight `VoucherRejectReason` values mirror the off-chain validation enums `ChannelError` / `VoucherError` (in `crates/incentive/`) one-to-one, and each maps back to the on-chain invariant it protects:
+
+| `VoucherRejectReason` | Off-chain trigger | On-chain invariant protected |
+|---|---|---|
+| `BadSignature` | Malformed signature bytes | EIP-712 `SignatureChecker` would revert at `closeChannel` (see [EIP-712 Voucher Signature](#eip-712-voucher-signature)) |
+| `WrongSigner` | Signature recovers to the wrong address | `closeChannel` would revert when recovered signer ≠ `channel.client` |
+| `WrongChannel` | `voucher.channel_id` mismatch | EIP-712 domain binds the voucher to a specific `channelId`; off-channel vouchers authorize nothing |
+| `WrongToken` | `voucher.token` mismatch | Cross-token replay defense (see [Replay attack on vouchers](#replay-attack-on-vouchers)) |
+| `StaleNonce` | `voucher.nonce ≤ last accepted nonce` | `disputeChannel` requires strictly higher nonce ([Voucher Nonce Convention](#voucher-nonce-convention)) |
+| `AmountRegression` | `voucher.amount < last accepted amount` | Invariant 2 — `disputeChannel` reverts if `newAmount < claimedAmount` (see [Fee Routing on Disputed Closes](#fee-routing-on-disputed-closes)) |
+| `BytesRegression` | `voucher.bytes_delivered < last accepted bytes_delivered` | Invariant 2 — `disputeChannel` reverts if `newBytes < claimedBytes` |
+| `InsufficientDeposit` | `voucher.amount > channel.deposit` | Invariant 1 — `closeChannel` / `disputeChannel` revert if `voucher.amount > channel.deposit` |
+
+Surfacing these reasons off-chain saves both parties the gas cost of a doomed on-chain submission, and gives the payer enough detail to recover (e.g., refresh state and re-sign for `StaleNonce`, top up for `InsufficientDeposit`) instead of treating every payment failure as an opaque connection drop. Riding in-band — rather than via a QUIC stream reset with no application code — preserves the rejection reason for client retry logic without burning [ADR 013](013-schema-evolution.md) application-error-code numbers for the structured-response case.
+
 ## Consequences
 
 **Positive:**
