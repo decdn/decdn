@@ -429,17 +429,22 @@ async fn fetch_with_content_encoding_identity_is_accepted() -> anyhow::Result<()
     Ok(())
 }
 
-/// Bodies larger than `max_bytes` are rejected with `Permanent`. The
-/// post-collect length check is the load-bearing defense — an origin
-/// can lie in the `Content-Length` header (or omit it for chunked
-/// responses), so the byte-count cap on the actual body is what
-/// guarantees we never hand oversized bytes to the engine.
+/// The S3 adapter's body stream produces every byte the wire
+/// emits — no in-adapter cap, no silent truncation. Post-#271 the
+/// `max_bytes` enforcement moved to the engine's
+/// `count_and_cap_stream`, so this test confirms only the adapter
+/// half of the contract: the bytes flow through verbatim. The
+/// **engine-level** rejection of oversized bodies is covered
+/// end-to-end by `cache_engine_miss_pulls_from_s3_and_caches`.
+/// An origin lying in `Content-Length` (or omitting it for chunked
+/// responses) is caught by the engine's running cap, which is the
+/// load-bearing defense.
 #[tokio::test]
-async fn fetch_oversize_body_is_permanent() -> anyhow::Result<()> {
-    // 256 KiB payload, cap at 64 KiB. The SDK's mock layer doesn't set
-    // Content-Length unless we provide one explicitly, so this exercises
-    // the post-collect byte-count check rather than the fast-path
-    // `content_length()` short-circuit.
+async fn fetch_oversize_body_streams_through_for_engine_cap() -> anyhow::Result<()> {
+    // 256 KiB payload, cap at 64 KiB. The SDK's mock layer doesn't
+    // set Content-Length unless we provide one explicitly, so this
+    // exercises the running cap on the streamed bytes rather than
+    // the fast-path `content_length()` short-circuit.
     let payload = vec![0xABu8; 256 * 1024];
     let hash = Hash::new(&payload);
     let body = payload.clone();
@@ -452,19 +457,18 @@ async fn fetch_oversize_body_is_permanent() -> anyhow::Result<()> {
     let client = mock_s3_client(&[&rule]);
     let origin = s3_origin(client, "");
 
-    let err = origin
+    // Adapter fetch returns the stream (no cap at the adapter).
+    let bytes = origin
         .fetch(hash, 64 * 1024)
-        .await
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("oversize body must be rejected"))?;
+        .await?
+        .collect_to_bytes()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("expected Found"))?;
     anyhow::ensure!(
-        matches!(err, OriginPullError::Permanent(_)),
-        "expected Permanent for size cap breach, got: {err:?}"
-    );
-    let msg = format!("{err:#}");
-    anyhow::ensure!(
-        msg.contains("exceeds max"),
-        "size-cap message lost its actionable wording: {msg}"
+        bytes.len() == payload.len(),
+        "stream truncated: {} bytes vs {} in payload",
+        bytes.len(),
+        payload.len()
     );
     Ok(())
 }
