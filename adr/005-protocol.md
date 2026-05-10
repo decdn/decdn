@@ -212,7 +212,7 @@ Implementation constraint: the payer must have a single voucher-signing task per
 
 ### Error Handling and Retry Semantics
 
-When a `StreamResponse` returns `ok: false`, the response includes an error code indicating the reason:
+A node signals a stream failure by returning a `StreamError` code. Delivery-side codes ride in the initial response (`StreamResponse { ok: false, error: ... }`, transitioning `AwaitingResponse → Failed`); the payment-side code (`VoucherRejected`) rides mid-stream in a `StreamError` message (transitioning `Streaming → Failed`). The lifecycle position is determined by when the rejection becomes diagnosable — see [`VoucherRejected` semantics](#voucherrejected-semantics) below and the [Stream Lifecycle State Machine](#stream-lifecycle-state-machine):
 
 ```rust
 enum StreamError {
@@ -221,18 +221,18 @@ enum StreamError {
     BlobTooLarge,      // Blob exceeds this node's configured max_blob_size; do not retry this node
     InternalError,     // Unexpected failure; do not retry this node
     EvictedSinceProbe, // Blob was evicted between probe and stream request — WARNING: still slashable after a signed has_blob:true probe (see below)
-    VoucherRejected { reason: VoucherRejectReason }, // Node rejected a payment voucher — see VoucherRejected semantics below
+    VoucherRejected { reason: VoucherRejectReason }, // Mid-stream payment-voucher rejection (carried in a StreamError message, not in the initial StreamResponse) — see VoucherRejected semantics below
 }
 
 enum VoucherRejectReason {
-    BadSignature,         // VoucherError::InvalidSignature — malformed signature bytes
-    WrongSigner,          // VoucherError::WrongSigner — signature recovers to the wrong address
+    BadSignature,         // VoucherError::InvalidSignature — signature is malformed: corrupted bytes, non-canonical `s`, or invalid recovery id
+    WrongSigner,          // VoucherError::WrongSigner — signature is well-formed but recovers to an address other than channel.client
     WrongChannel,         // ChannelError::WrongChannel — voucher.channel_id mismatch
     WrongToken,           // ChannelError::WrongToken — cross-token replay defense (ADR 003)
-    StaleNonce,           // ChannelError::NonceNotIncreasing
-    AmountRegression,     // ChannelError::AmountDecreasing
-    BytesRegression,      // ChannelError::BytesDecreasing
-    InsufficientDeposit,  // ChannelError::AmountExceedsDeposit
+    StaleNonce,           // ChannelError::NonceNotIncreasing — voucher nonce not strictly increasing
+    AmountRegression,     // ChannelError::AmountDecreasing — cumulative amount regressed
+    BytesRegression,      // ChannelError::BytesDecreasing — cumulative bytes_delivered regressed
+    InsufficientDeposit,  // ChannelError::AmountExceedsDeposit — voucher amount exceeds channel deposit
 }
 ```
 
@@ -242,7 +242,9 @@ This error code is informational only (unsigned, like all error codes — see be
 
 #### `VoucherRejected` semantics
 
-Issued when a node rejects a payment voucher submitted on the stream. Rejections ride **in-band** in `StreamResponse { ok: false, error: VoucherRejected{reason} }` — the QUIC stream is **not** reset. This preserves the rejection reason for client diagnostics and lets the payer distinguish a payment rejection from a network failure (a bare stream reset with no application code collapses every rejection to "connection error" at the requester).
+`VoucherRejected` is delivered **mid-stream**, not as an initial response. By the time a node can reject a voucher, the stream has already transitioned `AwaitingResponse → Streaming` via `StreamResponse { ok: true }` and the client has sent at least one `Voucher` (the [Stream Lifecycle State Machine](#stream-lifecycle-state-machine) below). The node validates the voucher, and on rejection sends a `StreamError` message carrying `VoucherRejected { reason }`, transitioning the stream `Streaming → Failed`. The QUIC stream is then closed cleanly — **no QUIC stream reset and no application-error close code**. This preserves the rejection reason for client diagnostics and lets the payer distinguish a payment rejection from a network failure (a bare stream reset with no application code collapses every rejection to "connection error" at the requester).
+
+The other `StreamError` variants (`NotFound`, `Overloaded`, `BlobTooLarge`, `InternalError`, `EvictedSinceProbe`) are delivery-side and ride in the initial `StreamResponse { ok: false, error: ... }` (transitioning `AwaitingResponse → Failed`). `VoucherRejected` is the only variant scoped to the mid-stream `StreamError` message; this asymmetry is intentional — the lifecycle position of each rejection determines which carrier message is available.
 
 The `VoucherRejectReason` variants mirror the off-chain validation enums `ChannelError` / `VoucherError` (in `crates/incentive/`) one-to-one. Each rejection reason corresponds to an on-chain `closeChannel` / `disputeChannel` revert that would otherwise cost gas (see [ADR 003 § Fee Routing on Disputed Closes](003-payments.md#fee-routing-on-disputed-closes) for the on-chain invariants and [ADR 003 § Off-chain Voucher Rejections](003-payments.md#off-chain-voucher-rejections-wire-encoding) for the per-reason mapping).
 
@@ -250,7 +252,7 @@ The `VoucherRejectReason` variants mirror the off-chain validation enums `Channe
 
 | Reason | Client action |
 |---|---|
-| `BadSignature` | Client bug (key mismatch / wire corruption). Do not retry; surface to caller. |
+| `BadSignature` | Client signing bug (e.g., signing library produced a non-canonical `s` or invalid recovery id), key mismatch, or wire corruption. Do not retry; surface to caller. |
 | `WrongSigner` | Client bug. Do not retry; surface to caller. |
 | `WrongChannel` | Client bug (channel_id mis-bind). Do not retry; surface to caller. |
 | `WrongToken` | Client bug or cross-token replay attempt (see [ADR 003 § Replay attack on vouchers](003-payments.md#replay-attack-on-vouchers)). Do not retry; surface to caller. |

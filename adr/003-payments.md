@@ -137,7 +137,7 @@ This means the network self-balances: popular content gets replicated because ca
 
 ### Off-chain Voucher Rejections (Wire Encoding)
 
-When a node rejects a voucher off-chain — before any gas would be spent — the rejection is returned **in-band** on the existing stream via `StreamResponse { ok: false, error: VoucherRejected{reason} }`. The full reason enum and per-reason retry semantics live in [ADR 005 § VoucherRejected semantics](005-protocol.md#voucherrejected-semantics).
+When a node rejects a voucher off-chain — before any gas would be spent — the rejection is returned **in-band** mid-stream as a `StreamError` message carrying `VoucherRejected { reason }` (per [ADR 005 § Stream Lifecycle State Machine](005-protocol.md#stream-lifecycle-state-machine), this transitions the stream `Streaming → Failed` cleanly without a QUIC stream reset). Voucher validation can only fire after the client has submitted at least one `Voucher`, which is necessarily after `StreamResponse { ok: true }` — so payment rejections never use the initial-response error path that delivery-side failures (`NotFound`, `Overloaded`, etc.) take. The full reason enum and per-reason retry semantics live in [ADR 005 § VoucherRejected semantics](005-protocol.md#voucherrejected-semantics).
 
 The eight `VoucherRejectReason` values mirror the off-chain validation enums `ChannelError` / `VoucherError` (in `crates/incentive/`) one-to-one, and each maps back to the on-chain invariant it protects:
 
