@@ -902,13 +902,6 @@ impl CacheEngine {
             .map_err(|e| CacheError::Store(anyhow::Error::from(e)))
     }
 
-    /// BLAKE3 of a 10 GB blob takes seconds of 100% CPU; running it on the
-    /// async executor would block one worker and starve other tasks. Small
-    /// blobs don't need the `spawn_blocking` round-trip (≤ 1 MiB hashes in
-    /// sub-millisecond on a modern core), so `pull_through` uses the inline
-    /// path when cheap and `spawn_blocking` above this threshold.
-    const BLOCKING_HASH_THRESHOLD: usize = 1 << 20; // 1 MiB
-
     async fn pull_through(&self, hash: Hash) -> CacheResult<Bytes> {
         // Every pull_through entry is a `get()` cache miss, regardless
         // of how the pull resolves. Coalesced waiters that find a hit
@@ -931,10 +924,11 @@ impl CacheEngine {
         if let Some(m) = &self.inner.metrics {
             m.origin_fetches.inc();
         }
+        let max_blob_bytes = self.inner.max_blob_bytes;
         let fetch = retry_fetch(
             origin,
             hash,
-            self.inner.max_blob_bytes,
+            max_blob_bytes,
             self.inner.retry_policy,
             self.inner.metrics.as_ref(),
         )
@@ -944,96 +938,142 @@ impl CacheEngine {
             source: e.into_inner(),
         })?;
 
-        // PR 1 shim (issue #271): the engine collapses the streaming
-        // `OriginFetch::Found` back to `Bytes` here so the rest of
-        // pull_through can keep using the size-cap → BLAKE3-verify →
-        // `add_bytes` flow unchanged. PR 2 replaces this collect step
-        // with a tee'd `add_stream` and drops the explicit BLAKE3
-        // verification (the AddProgress hash is the verification).
-        let bytes = match fetch.collect_to_bytes().await {
-            Ok(Some(b)) => b,
-            Ok(None) => return Err(CacheError::NotFound { hash }),
-            Err(io_err) => {
+        let (stream, size_hint) = match fetch {
+            crate::origin::OriginFetch::NotFound => {
+                return Err(CacheError::NotFound { hash });
+            }
+            crate::origin::OriginFetch::Found { stream, size_hint } => (stream, size_hint),
+        };
+
+        // Pre-stream cap: if the adapter advertised a length, reject
+        // before reading the first byte. The post-stream cap below is
+        // load-bearing too — origins can lie or omit the hint.
+        if let Some(advertised) = size_hint
+            && advertised > max_blob_bytes
+        {
+            return Err(CacheError::BlobTooLarge {
+                hash,
+                limit_bytes: max_blob_bytes,
+            });
+        }
+
+        // Pipe the origin stream into iroh-blobs' `add_stream`. The
+        // wrapper bumps `pull_through_bytes` per chunk and aborts the
+        // import the moment cumulative bytes exceed `max_blob_bytes`
+        // (origin-egress accounting matches the pre-streaming
+        // intent: every byte the origin sent us is billed even if
+        // the import later fails, so an origin streaming a 5 GB-of-
+        // 10 GB body before erroring still shows as 5 GB egress).
+        let counted = count_and_cap_stream(stream, max_blob_bytes, self.inner.metrics.clone());
+        let progress = self.inner.store.blobs().add_stream(counted).await;
+        let temp_tag = match progress.temp_tag().await {
+            Ok(tt) => tt,
+            Err(err) => {
+                // The origin stream errored mid-flight (size-cap breach,
+                // network mid-stream, file shrunk during read), or the
+                // store rejected the import. iroh-blobs swallows the
+                // source `io::Error` inside `add_stream` (it sends
+                // `Done` only on clean completion), so we cannot
+                // distinguish those cases here without a richer
+                // protocol — surface as a generic origin error and let
+                // the next request trigger a fresh retry budget.
                 return Err(CacheError::OriginError {
                     hash,
-                    source: anyhow::Error::from(io_err)
-                        .context("origin stream collect failed during pull-through"),
+                    source: anyhow::Error::from(err)
+                        .context("origin stream import to iroh-blobs failed during pull-through"),
                 });
             }
         };
 
-        // Origin egress is paid the moment bytes arrive — count before
-        // BLAKE3 verification or the in-engine size-cap re-check, so a
-        // misbehaving origin returning bad bytes still shows up as
-        // egress spend (operators reasoning about origin cost need
-        // every fetched byte counted, not only the ones that landed).
-        if let Some(m) = &self.inner.metrics {
-            m.pull_through_bytes
-                .inc_by(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
-        }
-
-        // Enforce the size cap on actual payload — even if the origin
-        // omitted `Content-Length`, the blob can't silently exceed the cap.
-        let len_u64: u64 = bytes
-            .len()
-            .try_into()
-            .map_err(|_| CacheError::Store(anyhow::anyhow!("payload length overflows u64")))?;
-        if len_u64 > self.inner.max_blob_bytes {
-            return Err(CacheError::BlobTooLarge {
-                hash,
-                limit_bytes: self.inner.max_blob_bytes,
-            });
-        }
-
-        let actual = if bytes.len() <= Self::BLOCKING_HASH_THRESHOLD {
-            Hash::new(&bytes)
-        } else {
-            let bytes_for_hash = bytes.clone();
-            tokio::task::spawn_blocking(move || Hash::new(&bytes_for_hash))
-                .await
-                .map_err(|e| {
-                    // JoinError fires on panic or cancellation — don't
-                    // lie about which one happened.
-                    let note = if e.is_panic() {
-                        "blake3 hash task panicked"
-                    } else if e.is_cancelled() {
-                        "blake3 hash task cancelled"
-                    } else {
-                        "blake3 hash task failed to join"
-                    };
-                    CacheError::Store(anyhow::Error::from(e).context(note))
-                })?
-        };
+        let actual = temp_tag.hash();
         if actual != hash {
+            // Drop the temp tag without promotion → iroh-blobs GC will
+            // reclaim the bytes (they're not protected once the
+            // `TempTag` drops; no public Tags::delete needed because
+            // we never created a named tag for the wrong hash).
+            drop(temp_tag);
             return Err(CacheError::HashMismatch {
                 expected: hash,
                 actual,
             });
         }
 
-        // Hash is verified — now insert. `add_bytes(..).await` runs to
-        // completion and yields the tagged info; we discard the tag because
-        // a lifecycle policy isn't in scope for the MVP.
-        //
-        // TODO(#233): once iroh-blobs exposes a verified-insert API that
-        // accepts an expected hash, drop the explicit `Hash::new(&bytes)`
-        // above and pay BLAKE3 only once instead of twice on the happy path.
-        if let Err(err) = self.inner.store.blobs().add_bytes(bytes.clone()).await {
-            // Verified bytes failed to land in the store: distinct from a
-            // generic store error because the caller just spent origin
-            // egress and a retry will re-pay it. Surface as an error log so
-            // operators can spot this failure mode separately.
-            tracing::error!(
-                %hash,
-                bytes = bytes.len(),
-                %err,
-                "verified blob failed to insert into cache store",
-            );
-            return Err(CacheError::Store(anyhow::Error::from(err)));
-        }
+        // Promote the temp tag to a named tag — same effect as
+        // `add_bytes(...).await`, which goes through `with_tag()` (
+        // iroh-blobs `blobs.rs:624-632`). The name is opaque; the
+        // store auto-assigns it.
+        let haf = temp_tag.hash_and_format();
+        let _named = self
+            .inner
+            .store
+            .tags()
+            .create(haf)
+            .await
+            .map_err(|err| CacheError::Store(anyhow::Error::from(err)))?;
+        drop(temp_tag);
 
-        Ok(bytes)
+        // The engine's existing `get()` callers (admin RPC, metrics
+        // tests) want the full payload as `Bytes`. Re-read it from
+        // the local store: with iroh-blobs' `fs-store` this is one
+        // mmap'd read with no extra origin egress. Stream-shaped
+        // `get()` is in scope for #317 (cdn/client/v1 paid delivery),
+        // not this issue.
+        self.read_local(hash).await
     }
+}
+
+/// Adapter that bumps the `pull_through_bytes` metric per chunk and
+/// aborts mid-stream if cumulative bytes exceed `max_bytes`.
+///
+/// The engine pipes this directly into
+/// [`iroh_blobs::api::blobs::Blobs::add_stream`], so the I/O bound
+/// becomes the chunk size from the origin (typically a few KiB to a
+/// few MiB depending on the backend) — a 10 GB blob no longer pins
+/// 10 GB of process RSS (issue #271).
+///
+/// The `Send + Sync + 'static` bound on the returned stream is fixed
+/// by `add_stream`'s signature.
+fn count_and_cap_stream<S>(
+    stream: S,
+    max_bytes: u64,
+    metrics: Option<Arc<CacheMetrics>>,
+) -> impl futures_util::Stream<Item = std::io::Result<Bytes>> + Send + Sync + 'static
+where
+    S: futures_util::Stream<Item = std::io::Result<Bytes>> + Send + Sync + Unpin + 'static,
+{
+    use futures_util::StreamExt;
+    futures_util::stream::unfold(
+        (stream, 0u64, metrics),
+        move |(mut s, total, metrics)| async move {
+            let next = s.next().await?;
+            match next {
+                Err(e) => Some((Err(e), (s, total, metrics))),
+                Ok(chunk) => {
+                    // Bill the chunk before the cap check: the
+                    // origin already sent us the bytes, so the
+                    // operator-visible egress meter must count them
+                    // (matches the pre-streaming "every byte fetched
+                    // is paid" intent at engine.rs:952-960). A
+                    // chunk that lands the running total past
+                    // `max_bytes` is still counted in
+                    // `pull_through_bytes` even though we then
+                    // abort the import.
+                    if let Some(m) = metrics.as_ref() {
+                        m.pull_through_bytes
+                            .inc_by(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+                    }
+                    let new_total = total.saturating_add(chunk.len() as u64);
+                    if new_total > max_bytes {
+                        let err = std::io::Error::other(format!(
+                            "origin stream exceeded max_blob_bytes={max_bytes} mid-flight"
+                        ));
+                        return Some((Err(err), (s, total, metrics)));
+                    }
+                    Some((Ok(chunk), (s, new_total, metrics)))
+                }
+            }
+        },
+    )
 }
 
 #[cfg(test)]

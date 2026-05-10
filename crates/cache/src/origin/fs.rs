@@ -15,17 +15,13 @@ use std::pin::Pin;
 
 use anyhow::Context;
 use bytes::Bytes;
+use futures_util::{Stream, StreamExt};
 use iroh_blobs::Hash;
 use tokio::io::AsyncReadExt;
+use tokio_util::io::ReaderStream;
 
 use super::{Origin, OriginFetch, OriginKind};
 use crate::error::OriginPullError;
-
-/// Initial capacity hint for the per-fetch read buffer. Caps the
-/// up-front allocation so a multi-GB blob (or an over-generous
-/// `max_bytes` setting) doesn't commit huge memory before the
-/// first byte is read; `read_to_end` grows the buffer as needed.
-const INITIAL_READ_CAP_HINT: usize = 1 << 20;
 
 /// Origin backed by a local filesystem directory. Blobs live at
 /// `{base}/{hex[0..2]}/{hex}`; the engine is responsible for BLAKE3
@@ -162,7 +158,7 @@ impl Origin for FilesystemOrigin {
             // and this open (eviction, gc, operator cleanup); treat
             // that the same as a missing leaf and surface `NotFound`
             // rather than a hard error, matching the canonicalize arm.
-            let mut file = match tokio::fs::File::open(&canonical).await {
+            let file = match tokio::fs::File::open(&canonical).await {
                 Ok(f) => f,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                     return Ok(OriginFetch::NotFound);
@@ -193,44 +189,80 @@ impl Origin for FilesystemOrigin {
                 )));
             }
 
-            // Pre-size to `len` so `read_to_end` skips growth reallocs,
-            // but cap the *initial* commit at `INITIAL_READ_CAP_HINT`.
-            // The full-`len` approach hands an over-generous
-            // `max_bytes` setting (or a 32-bit address space) a cheap
-            // OOM up front; capping means a few cheap doublings
-            // instead of one huge allocation. `read_to_end` will
-            // still grow the buffer as the read progresses.
-            let want_cap = usize::try_from(len)
-                .context("file size exceeds addressable memory")
-                .map_err(OriginPullError::Permanent)?;
-            let mut data = Vec::with_capacity(want_cap.min(INITIAL_READ_CAP_HINT));
-
-            // Bound the read at the I/O layer: even with the size
-            // check above, the file could grow between `metadata()`
-            // and the read (append, truncate-then-extend, pwrite past
-            // EOF — all happen on the same inode our fd is pinning).
-            // `take(max_bytes + 1)` reads one byte past the cap so
-            // the post-check can disambiguate "exactly max_bytes"
-            // from "more than max_bytes."
-            let mut reader = (&mut file).take(max_bytes.saturating_add(1));
-            reader.read_to_end(&mut data).await.map_err(|err| {
-                let path_msg = format!("cache.origin.path read failed for {}", canonical.display());
-                classify_io_error(err).map_inner(|e| e.context(path_msg))
-            })?;
-            if data.len() as u64 > max_bytes {
-                return Err(OriginPullError::Permanent(anyhow::anyhow!(
-                    "cache.origin.path entry {} grew past max {max_bytes} during read",
-                    canonical.display()
-                )));
-            }
-            // PR 1 shim (issue #271): the body still buffers fully here.
-            // PR 2 cuts the read-and-collect step over to a `ReaderStream`
-            // wrapping the same `File::take(max_bytes + 1)` so the running
-            // cap and TOCTOU posture survive without any change in
-            // semantics — only the memory footprint shrinks.
-            Ok(OriginFetch::found_one_shot(Bytes::from(data)))
+            // Stream the file through `ReaderStream` rather than reading
+            // the entire payload into a `Vec` (issue #271). The owned
+            // `File` moves into `Take`, then into `ReaderStream`, so the
+            // fd outlives the stream rather than being borrowed; iroh
+            // -blobs' `add_stream` can drive this directly without any
+            // intermediate buffer.
+            //
+            // `take(max_bytes + 1)` keeps the I/O-layer cap from the
+            // pre-streaming code: a file that grew between `fstat` and
+            // the read (append, pwrite past EOF, truncate-then-extend
+            // — all happen on the same inode our fd is pinning) is
+            // bounded by the kernel's read syscall rather than by a
+            // post-collect length check. The wrapper in
+            // [`cap_at_max_bytes`] catches the one-byte overrun and
+            // surfaces the same "grew past max during read" error the
+            // pre-PR-1 code did.
+            //
+            // The `take(max_bytes + 1)` cast preserves the saturating-
+            // add semantics from the buffered version: `max_bytes ==
+            // u64::MAX` saturates rather than wraps to `0`.
+            let path_for_log = canonical.clone();
+            let reader = file.take(max_bytes.saturating_add(1));
+            let raw = ReaderStream::new(reader);
+            let stream = cap_at_max_bytes(raw, max_bytes, path_for_log);
+            Ok(OriginFetch::Found {
+                stream: Box::pin(stream),
+                size_hint: Some(len),
+            })
         })
     }
+}
+
+/// Defense-in-depth running-cap wrapper around a chunk stream. The
+/// inner `take(max_bytes + 1)` bounds the I/O-layer read at one byte
+/// past the cap, so a file that grew during read produces a stream
+/// whose chunks sum to at most `max_bytes + 1`. This wrapper trips on
+/// the cumulative byte count and converts the overrun into an
+/// `io::Error`, which propagates through iroh-blobs' `add_stream` as
+/// a stream-side failure (the engine collapses it to
+/// `CacheError::OriginError`).
+///
+/// `path_for_log` is captured for the error message so an operator
+/// who hits this in production sees the offending file path. The
+/// path is the canonicalized form (already resolved, so no symlink
+/// trickery in logs).
+fn cap_at_max_bytes<S>(
+    stream: S,
+    max_bytes: u64,
+    path_for_log: PathBuf,
+) -> impl Stream<Item = std::io::Result<Bytes>> + Send + Sync + 'static
+where
+    S: Stream<Item = std::io::Result<Bytes>> + Send + Sync + Unpin + 'static,
+{
+    futures_util::stream::unfold(
+        (stream, 0u64, path_for_log),
+        move |(mut s, total, path)| async move {
+            let next = s.next().await?;
+            match next {
+                Err(e) => Some((Err(e), (s, total, path))),
+                Ok(chunk) => {
+                    let new_total = total.saturating_add(chunk.len() as u64);
+                    if new_total > max_bytes {
+                        let err = std::io::Error::other(format!(
+                            "cache.origin.path entry {} grew past max {max_bytes} during read",
+                            path.display()
+                        ));
+                        Some((Err(err), (s, total, path)))
+                    } else {
+                        Some((Ok(chunk), (s, new_total, path)))
+                    }
+                }
+            }
+        },
+    )
 }
 
 #[cfg(test)]
@@ -367,5 +399,136 @@ mod tests {
             OriginFetch::NotFound => Ok(()),
             OriginFetch::Found { .. } => anyhow::bail!("expected NotFound"),
         }
+    }
+
+    /// `fstat`-time cap rejection: a file whose `metadata().len()`
+    /// already exceeds `max_bytes` is rejected upfront in the prologue,
+    /// before any stream is constructed. This is the cheap path —
+    /// catches the legitimate "operator pre-seeded an oversized
+    /// blob" case without paying for `take(max_bytes + 1)` /
+    /// `ReaderStream` setup.
+    #[tokio::test]
+    async fn fetch_rejects_oversize_file_at_fstat_prologue() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let origin = FilesystemOrigin::new(tmp.path()).await?;
+        let hash = Hash::new(b"oversize-marker");
+        let hex = hash.to_hex();
+        let shard = hex
+            .get(..2)
+            .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
+        let shard_dir = tmp.path().join(shard);
+        tokio::fs::create_dir_all(&shard_dir).await?;
+        let payload = vec![0xAAu8; 8 * 1024];
+        tokio::fs::write(shard_dir.join(hex.as_str()), &payload).await?;
+
+        // 8 KiB on disk, 1 KiB cap → prologue rejects (no stream
+        // is built; this is the expected fast path).
+        let err = origin
+            .fetch(hash, 1024)
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("oversize fstat must be rejected"))?;
+        let msg = format!("{err:#}");
+        anyhow::ensure!(
+            msg.contains("exceeds max"),
+            "fstat-time cap message lost actionable wording: {msg}"
+        );
+        Ok(())
+    }
+
+    /// Mid-stream cap (`cap_at_max_bytes`) is the defense for the
+    /// TOCTOU window: between `fstat` and the actual read, the file
+    /// could grow on the same inode (append, pwrite past EOF,
+    /// truncate-then-extend). The kernel bound is
+    /// `take(max_bytes + 1)`; this test exercises the wrapper that
+    /// catches the one-byte overrun.
+    ///
+    /// We can't deterministically stage a TOCTOU race in a unit
+    /// test without OS-level coordination, so we drive
+    /// `cap_at_max_bytes` directly with a synthetic upstream that
+    /// produces `max_bytes + 1` bytes — same chunk-shape that
+    /// `ReaderStream::new(file.take(max_bytes + 1))` would emit on
+    /// a grew-during-read file.
+    #[tokio::test]
+    async fn cap_at_max_bytes_rejects_one_byte_overrun() -> anyhow::Result<()> {
+        use futures_util::StreamExt;
+        let chunks: Vec<std::io::Result<Bytes>> = vec![
+            Ok(Bytes::from(vec![0xAAu8; 1024])),
+            // 1025th byte — should trip the running-total cap.
+            Ok(Bytes::from(vec![0xBBu8; 1])),
+        ];
+        let upstream = futures_util::stream::iter(chunks);
+        let mut stream = Box::pin(cap_at_max_bytes(
+            upstream,
+            1024,
+            std::path::PathBuf::from("/tmp/test-fixture"),
+        ));
+
+        // First chunk: 1024 bytes, exactly at cap, must pass through.
+        let first = stream
+            .next()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("expected first chunk"))?;
+        let first = first.map_err(|e| anyhow::anyhow!("first chunk errored: {e}"))?;
+        anyhow::ensure!(
+            first.len() == 1024,
+            "first chunk truncated: {}",
+            first.len()
+        );
+
+        // Second chunk: 1 byte, would push total to 1025 > 1024,
+        // wrapper must error.
+        let second = stream
+            .next()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("expected second chunk"))?;
+        let err = second
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("second chunk should have errored"))?;
+        anyhow::ensure!(
+            err.to_string().contains("grew past max"),
+            "wrapper error message lost actionable wording: {err}"
+        );
+        Ok(())
+    }
+
+    /// The streaming path keeps the file descriptor alive across many
+    /// `poll_next` calls — `ReaderStream` owns the `Take<File>` and
+    /// drives one read per poll. A regression that borrowed `&mut
+    /// file` instead of moving ownership would close the fd between
+    /// chunks and either truncate the read or blow up; this test
+    /// catches that by asking for a payload large enough to require
+    /// multiple reads (default `ReaderStream` chunk = 4 KiB) and
+    /// asserting the full bytes come back.
+    #[tokio::test]
+    async fn fetch_streams_multi_chunk_payload() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let origin = FilesystemOrigin::new(tmp.path()).await?;
+        // 32 KiB → 8 chunks at the default 4 KiB ReaderStream size.
+        let payload = (0..32u8)
+            .flat_map(|i| std::iter::repeat_n(i, 1024))
+            .collect::<Vec<_>>();
+        let hash = Hash::new(&payload);
+        let hex = hash.to_hex();
+        let shard = hex
+            .get(..2)
+            .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
+        let shard_dir = tmp.path().join(shard);
+        tokio::fs::create_dir_all(&shard_dir).await?;
+        tokio::fs::write(shard_dir.join(hex.as_str()), &payload).await?;
+
+        let fetched = origin.fetch(hash, 1 << 20).await?;
+        let bytes = fetched
+            .collect_to_bytes()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("expected Found"))?;
+        anyhow::ensure!(
+            bytes.len() == payload.len(),
+            "streamed length mismatch: {} vs {}",
+            bytes.len(),
+            payload.len()
+        );
+        anyhow::ensure!(bytes.as_ref() == payload.as_slice(), "byte mismatch");
+        Ok(())
     }
 }
