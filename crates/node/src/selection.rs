@@ -21,6 +21,7 @@ const TIE_THRESHOLD: f64 = 0.01;
 
 /// A candidate provider produced by content discovery, ready to be ranked.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Candidate {
     /// Iroh `NodeId` (Ed25519 public key) of the candidate.
     pub node_id: [u8; 32],
@@ -45,6 +46,7 @@ pub struct Candidate {
 
 /// A candidate paired with its computed selection score. Lower score is better.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RankedCandidate {
     pub candidate: Candidate,
     pub score: f64,
@@ -110,17 +112,30 @@ fn apply_tiebreaker(ranked: &mut Vec<RankedCandidate>, rng: &mut impl rand::Rng)
         // Geo diversity is scoped to the current tie group: candidates within
         // a single within-1% group are spread across regions, but the tracker
         // is reset between groups so unrelated tie groups don't bias each
-        // other's geo tier (ADR 008 §9 — tie-break is per group).
+        // other's geo tier. ADR 008 §9 lists the four tiers; per-group scoping
+        // is this implementation's interpretation of "within a tie".
         let mut group_regions: HashSet<String> = HashSet::new();
-        let mut group: Vec<RankedCandidate> = ranked
-            .get(start..end)
-            .map_or_else(Vec::new, <[RankedCandidate]>::to_vec);
+        let slice = ranked.get(start..end);
+        debug_assert!(
+            slice.is_some(),
+            "tie_group_end produced out-of-bounds range {start}..{end} for len {}",
+            ranked.len()
+        );
+        let mut group: Vec<RankedCandidate> =
+            slice.map_or_else(Vec::new, <[RankedCandidate]>::to_vec);
         while !group.is_empty() {
             let pick_idx = pick_best_in_group(&group, &group_regions, rng);
             // pick_best_in_group always returns a valid index when the slice
-            // is non-empty; defensive default is index 0. Order in `group`
-            // does not matter — `pick_best_in_group` rescans from scratch
-            // each iteration — so swap_remove is safe and O(1).
+            // is non-empty (loop guard above ensures non-emptiness). The safe
+            // fallback exists only to satisfy clippy::indexing_slicing; the
+            // debug_assert surfaces any future invariant break in tests. Order
+            // in `group` does not matter — pick_best_in_group rescans from
+            // scratch each iteration — so swap_remove is safe and O(1).
+            debug_assert!(
+                pick_idx < group.len(),
+                "pick_best_in_group returned {pick_idx} for group of len {}",
+                group.len()
+            );
             let pick = if pick_idx < group.len() {
                 group.swap_remove(pick_idx)
             } else {
@@ -144,6 +159,10 @@ fn pick_best_in_group(
     emitted_regions: &HashSet<String>,
     rng: &mut impl rand::Rng,
 ) -> usize {
+    debug_assert!(
+        !group.is_empty(),
+        "pick_best_in_group called with empty group"
+    );
     if group.is_empty() {
         return 0;
     }
@@ -178,7 +197,9 @@ fn pick_best_in_group(
     }
 
     // Tier 3: higher stake wins. `None` is treated as the lowest possible
-    // stake (since on-chain integration is deferred — see ADR 023 wiring).
+    // stake (since on-chain integration is deferred — see ADR 001 §Node
+    // Registry / ADR 019 for the staking-registry interface that will populate
+    // `Candidate.stake`).
     let max_stake = pool
         .iter()
         .filter_map(|i| group.get(*i).and_then(|r| r.candidate.stake))
@@ -192,10 +213,16 @@ fn pick_best_in_group(
         0
     } else {
         let idx = rng.random_range(0..pool.len());
-        // pool.get(idx) is always Some — random_range stays within 0..pool.len();
-        // the unwrap_or(0) keeps us off the indexing_slicing-denied path without
-        // using expect/unwrap.
-        pool.get(idx).copied().unwrap_or(0)
+        // pool.get(idx) is always Some — random_range stays within 0..pool.len().
+        // The unwrap_or(0) keeps us off the indexing_slicing-denied path without
+        // using expect/unwrap; debug_assert surfaces any invariant break in tests.
+        let picked = pool.get(idx).copied();
+        debug_assert!(
+            picked.is_some(),
+            "random_range({}) returned out-of-bounds idx {idx}",
+            pool.len()
+        );
+        picked.unwrap_or(0)
     }
 }
 
@@ -229,6 +256,13 @@ fn tie_group_end(ranked: &[RankedCandidate], start: usize) -> usize {
 
 /// Tier 1: lower load wins. Compare `bandwidth_utilization` first, then
 /// `active_streams` to break sub-ties.
+///
+/// Bandwidth utilization is the primary signal because it directly reflects
+/// how saturated a node's outgoing pipe is; `active_streams` is a coarser
+/// proxy (a node serving many small streams may have low utilization, while
+/// one serving a few large ones may be saturated). ADR 001 / ADR 008 §9 list
+/// "lower load" without prescribing the sub-field order — this is this
+/// implementation's interpretation.
 fn compare_load(a: LoadHint, b: LoadHint) -> core::cmp::Ordering {
     a.bandwidth_utilization
         .cmp(&b.bandwidth_utilization)
@@ -365,6 +399,24 @@ mod tests {
             None,
         );
         let out = rank_candidates(vec![unknown, known]);
+        assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(1));
+    }
+
+    #[test]
+    fn some_zero_stake_beats_none_stake() {
+        // Zero-stake operators are still "known" — `Some(0)` should beat `None`
+        // (treated as "not yet looked up") at tier 3. `max_stake` returns
+        // `Some(0)` for the pool, then retain keeps only `stake == Some(0)`,
+        // which drops the `None` entry.
+        let known_zero = with_stake(
+            with_region(with_load(make_candidate(1, 100, 10, 1.0), 0, 50), "US"),
+            Some(0),
+        );
+        let unknown = with_stake(
+            with_region(with_load(make_candidate(2, 100, 10, 1.0), 0, 50), "US"),
+            None,
+        );
+        let out = rank_candidates(vec![unknown, known_zero]);
         assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(1));
     }
 
