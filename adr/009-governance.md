@@ -90,7 +90,6 @@ The 20% floor on the node-base share is the cashflow invariant defined in [ADR 0
 | Default-open max origins | OriginAssignment | 20 | 500 |
 | Max namespaces per publisher | PublisherRegistry | 1 | 1000 |
 | Namespace transfer timelock | PublisherRegistry | 24 hours | 30 days |
-| Max active challenges per node | SlashJudge | 1 | 50 |
 | Max evidence age | SlashJudge | 1 day | 30 days |
 | MMR retention buffer | FeeRouter | 1 day | 30 days |
 

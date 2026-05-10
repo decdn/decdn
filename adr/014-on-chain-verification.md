@@ -151,10 +151,6 @@ interface ISlashJudge {
 }
 ```
 
-##### Challenge rate limit
-
-`SlashJudge` enforces a maximum number of concurrent active challenges per target node address: `maxActiveChallengesPerNode` (PoC: 10, production safety bound: [1, 50]). New `submitPhantomChallenge`, `submitRateChallenge`, and `submitBlacklistChallenge` calls targeting a node at the limit MUST revert. Although all three offenses resolve synchronously and do not accumulate "active" state in the dispute sense, the cap still bounds per-block transaction-level griefing where a well-funded attacker batches many simultaneous spurious challenges to force the defender to monitor and dispute outcomes off-chain. The parameter is governable per [ADR 009](009-governance.md).
-
 #### Evidence Verification Per Offense Type
 
 **Phantom announcement:**
