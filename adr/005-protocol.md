@@ -226,7 +226,7 @@ enum StreamError {
 
 enum VoucherRejectReason {
     BadSignature,         // VoucherError::InvalidSignature — signature is malformed: corrupted bytes, non-canonical `s`, or invalid recovery id
-    WrongSigner,          // VoucherError::WrongSigner — signature is well-formed but recovers to an address other than channel.client
+    WrongSigner,          // VoucherError::WrongSigner — signature is well-formed but recovers to an address other than the expected signer (typically channel.client)
     WrongChannel,         // ChannelError::WrongChannel — voucher.channel_id mismatch
     WrongToken,           // ChannelError::WrongToken — cross-token replay defense (ADR 003)
     StaleNonce,           // ChannelError::NonceNotIncreasing — voucher nonce not strictly increasing
@@ -264,6 +264,10 @@ The `VoucherRejectReason` variants mirror the off-chain validation enums `Channe
 These per-reason rules apply only to `VoucherRejected`. The delivery-side errors (`NotFound`, `Overloaded`, `BlobTooLarge`, `InternalError`, `EvictedSinceProbe`) continue to follow the per-blob retry rules in **Retry behavior** below.
 
 Like all `StreamError` codes, `VoucherRejected` is **unsigned** and is not used as on-chain evidence. A malicious node could falsely return `VoucherRejected` to refuse delivery, which is indistinguishable on-wire from `Overloaded` and is subject to the same reputation/redundancy mitigations as other refusal modes.
+
+**Schema-evolution constraints.** Adding a new `VoucherRejectReason` or new top-level `StreamError` variant is a Tier-2 minor evolution per [ADR 013](013-schema-evolution.md); old peers will close the stream with `0x01 UNSUPPORTED_MESSAGE` on the unknown discriminant rather than receive the new reason, so deployments MUST roll out client-side support before nodes start emitting it. Adding a field to the struct variant `VoucherRejected { … }` is a Tier-3 (major) change requiring an ALPN bump, since the postcard frame ends at the `reason` byte and there is no extension-bytes tail to skip past.
+
+**Mirror obligation with `crates/incentive/`.** `VoucherRejectReason` is structurally mirrored to `ChannelError ∪ VoucherError` minus the `Signature` wrapper. Any new `ChannelError` or `VoucherError` variant therefore requires (a) a corresponding `VoucherRejectReason` variant — Tier-2 per the rule above — and (b) a row in the retry-semantics table. The handler-side conversion `fn voucher_reject_reason(&ChannelError) -> VoucherRejectReason` (when implemented) MUST `match` exhaustively without a wildcard arm, so that adding a `ChannelError` variant fails to compile until the wire enum and this section are updated.
 
 **`BlobTooLarge` enforcement:** Nodes may configure a `max_blob_size` limit (PoC recommended default: 10 GB). When deciding whether to serve a blob, a node enforces `max_blob_size` against locally known blob metadata (its cache index or origin catalog). If the locally known size exceeds `max_blob_size`, the node returns `StreamResponse {ok: false, error: BlobTooLarge}`. On a cache-miss pull from an upstream node, the pulling node additionally enforces `max_blob_size` against `StreamResponse.total_bytes`: if the upstream `total_bytes` exceeds the pulling node's `max_blob_size`, the pulling node aborts the upstream stream and returns `BlobTooLarge` to the original requester. The limit applies to individual blobs.
 
