@@ -577,9 +577,14 @@ fn response_chunk_stream(
             };
             let next_total = total.saturating_add(chunk.len() as u64);
             if next_total > max_bytes {
-                let err = std::io::Error::other(format!(
-                    "origin GET {url_log} body exceeds max_bytes={max_bytes} mid-stream"
-                ));
+                // Pack a typed `BlobTooLargeMarker` so the engine
+                // surfaces `CacheError::BlobTooLarge` rather than
+                // generic `OriginError`. This is the *encoded*-side
+                // cap; for compressed bodies an encoded overrun
+                // implies a decoded overrun (compression ratios <1
+                // in practice), so the same typed shape is the right
+                // operator-visible error.
+                let err = std::io::Error::other(super::BlobTooLargeMarker { max_bytes });
                 return Some((Err(err), (None, total, idle, url_log)));
             }
             Some((Ok(chunk), (Some(resp), next_total, idle, url_log)))

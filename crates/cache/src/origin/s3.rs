@@ -35,6 +35,7 @@ use aws_smithy_http_client::{Builder as HttpBuilder, tls};
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use aws_smithy_types::retry::RetryConfig;
 use iroh_blobs::Hash;
+use tokio_util::io::ReaderStream;
 
 use super::{Origin, OriginFetch, OriginKind, OriginUrl};
 use crate::error::OriginPullError;
@@ -499,72 +500,62 @@ impl Origin for S3Origin {
             // Fast-path size check from the SDK-parsed Content-Length.
             // `content_length()` returns `Option<i64>` — negative is
             // a deterministic protocol violation; `> max_bytes` saves
-            // us streaming bytes we'll throw away. The post-collect
-            // length check below is the load-bearing defense against
-            // an origin that lies in the header.
-            if let Some(len) = resp.content_length() {
-                if len < 0 {
+            // us streaming bytes we'll throw away. The engine still
+            // re-checks the running total via `count_and_cap_stream`
+            // as the body arrives, so an origin that lies in the
+            // header is caught mid-flight.
+            let advertised_size: Option<u64> = match resp.content_length() {
+                Some(len) if len < 0 => {
                     return Err(OriginPullError::Permanent(anyhow::anyhow!(
                         "{log_target}: origin reported negative Content-Length={len}"
                     )));
                 }
-                #[allow(clippy::cast_sign_loss)] // checked >= 0 above.
-                let len_u64 = len as u64;
-                if len_u64 > max_bytes {
-                    return Err(OriginPullError::Permanent(anyhow::anyhow!(
-                        "{log_target}: Content-Length={len} exceeds max {max_bytes}"
-                    )));
+                Some(len) => {
+                    #[allow(clippy::cast_sign_loss)] // checked >= 0 above.
+                    let len_u64 = len as u64;
+                    if len_u64 > max_bytes {
+                        return Err(OriginPullError::Permanent(anyhow::anyhow!(
+                            "{log_target}: Content-Length={len} exceeds max {max_bytes}"
+                        )));
+                    }
+                    Some(len_u64)
                 }
-            }
+                None => None,
+            };
 
-            // Collect the full body. PR2 buffers the entire payload before
-            // returning — same approach as `HttpOrigin`. The cap is
-            // `cache.max_blob_size_mb` (default 1 GB per
-            // `decdn_common::config::DEFAULT_MAX_BLOB_SIZE_MB`); the only
-            // upper bound is the runtime invariant
-            // `max_blob_size_mb < cache_size_mb`. A streaming variant
-            // is a follow-up if benchmarks show large blobs starve the
-            // tokio executor.
-            let body = resp
-                .body
-                .collect()
-                .await
-                .map_err(|e| {
-                    // `aws_smithy_types::byte_stream::error::Error` doesn't
-                    // expose a clean is-transient API; collect failures are
-                    // typically mid-stream disconnects (genuinely transient)
-                    // but can also be smithy-side deserialization faults
-                    // (would be permanent). With the SDK's internal retry
-                    // layer disabled, classifying conservatively as
-                    // `Transient` lets `cache.origin_retry` take a crack —
-                    // a deterministic deserialize fault will exhaust the
-                    // outer budget and surface as `CacheError::OriginError`.
-                    OriginPullError::Transient(
-                        anyhow::Error::from(e)
-                            .context(format!("{log_target}: body collect failed")),
-                    )
-                })?
-                .into_bytes();
-
-            // Defense in depth: an origin can lie in the Content-Length
-            // header (or omit it for `Transfer-Encoding: chunked`
-            // responses), so re-check the actual byte count. This
-            // mirrors `HttpOrigin`'s post-stream cap and `CacheEngine`'s
-            // own re-check.
-            if body.len() as u64 > max_bytes {
-                return Err(OriginPullError::Permanent(anyhow::anyhow!(
-                    "{log_target}: body is {} bytes, exceeds max {max_bytes}",
-                    body.len()
-                )));
-            }
-
-            // PR 1 shim (issue #271): the body is still fully collected
-            // here. PR 4 swaps `body.collect()` for an `unfold`-driven
-            // wrap of the underlying `ByteStream`, which already
-            // implements `futures::Stream<Item = Result<Bytes, _>>`, so
-            // chunks reach the engine without ever sitting in memory in
-            // full.
-            Ok(OriginFetch::found_one_shot(body))
+            // Stream the body chunk-by-chunk into the engine
+            // (issue #271). `ByteStream::into_async_read` yields a
+            // `tokio::io::AsyncBufRead` over the wire body —
+            // `aws_smithy_types`'s `Stream` impl is
+            // crate-private so we go through the AsyncRead seam,
+            // then back to `Stream<io::Result<Bytes>>` via
+            // `ReaderStream`. Chunks reach iroh-blobs'
+            // `add_stream` without the body ever sitting in
+            // process memory in full — a 10 GB S3 object no longer
+            // pins 10 GB of RSS.
+            //
+            // **Operator-visible diagnostics for body errors:**
+            // `aws_smithy_types::byte_stream::error::Error` is
+            // wrapped into the `io::Error` that `ReaderStream`
+            // emits and captured by the engine's
+            // `count_and_cap_stream` side channel. The `s3://`
+            // bucket/key prefix is **not** carried into that
+            // error path — the prefix is in `log_target` here but
+            // we don't have a hook to attach it once the stream
+            // is in flight. Operators should pair the `s3://...`
+            // failures they see at headers phase
+            // (`classify_get_object_error`) with engine logs and
+            // the bucket/key that the request was issued for.
+            // Adding a body-phase context wrapper is a follow-up
+            // (it'd require a bespoke
+            // `Stream::map(io::Error → io::Error::other(format!("{log_target}: …")))`
+            // adapter; out of scope for #271).
+            let async_read = resp.body.into_async_read();
+            let raw_stream = ReaderStream::new(async_read);
+            Ok(OriginFetch::Found {
+                stream: Box::pin(raw_stream),
+                size_hint: advertised_size,
+            })
         })
     }
 }

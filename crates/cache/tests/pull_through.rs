@@ -89,6 +89,7 @@ async fn hash_mismatch_is_rejected_and_not_cached() -> anyhow::Result<()> {
     let server = MockServer::start().await;
     let expected = Hash::new(b"expected");
     let mismatched_payload: &[u8] = b"something else entirely";
+    let actual = Hash::new(mismatched_payload);
     Mock::given(method("GET"))
         .and(path(format!("/{}", expected.to_hex())))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(mismatched_payload))
@@ -101,7 +102,20 @@ async fn hash_mismatch_is_rejected_and_not_cached() -> anyhow::Result<()> {
         matches!(err, CacheError::HashMismatch { .. }),
         "expected HashMismatch, got: {err:?}"
     );
-    anyhow::ensure!(!engine.has(expected).await?, "bad bytes must not be cached");
+    anyhow::ensure!(
+        !engine.has(expected).await?,
+        "expected hash must not be cached"
+    );
+    // Cache-poisoning mitigation: the wrong-hash bytes briefly land
+    // in iroh-blobs under `actual` (their own BLAKE3) when
+    // `add_stream` commits before we hash-check. The engine logically
+    // evicts `actual` on mismatch so neither `has(actual)` nor
+    // `get(actual)` reaches the partial bytes — the fix for the
+    // attack window the streaming refactor introduced.
+    anyhow::ensure!(
+        !engine.has(actual).await?,
+        "actual-hash bytes must be logically evicted (cache-poisoning mitigation)"
+    );
     Ok(())
 }
 
@@ -411,7 +425,7 @@ async fn chunk_idle_timeout_fires_when_origin_stalls_mid_body() -> anyhow::Resul
 }
 
 #[tokio::test]
-async fn pull_through_succeeds_above_blocking_hash_threshold() -> anyhow::Result<()> {
+async fn pull_through_succeeds_above_one_mib_payload() -> anyhow::Result<()> {
     // 2 MiB payload exercises the streaming pull-through across multiple
     // origin chunks — `tokio_util::io::ReaderStream` emits 4 KiB-sized
     // chunks by default, so 2 MiB → ~512 chunks through `add_stream`'s
@@ -450,14 +464,9 @@ async fn mid_stream_overrun_is_rejected_by_http_origin() -> anyhow::Result<()> {
 
     // Any hash works — the raw TCP server doesn't match paths.
     let err = err_of(engine.get(Hash::new(b"doesn't matter")).await)?;
-    let msg = format!("{err:#}");
     anyhow::ensure!(
-        matches!(err, CacheError::OriginError { .. }),
-        "expected OriginError from mid-stream cap, got: {err:?}"
-    );
-    anyhow::ensure!(
-        msg.contains("mid-stream"),
-        "error message missing mid-stream marker: {msg}"
+        matches!(err, CacheError::BlobTooLarge { .. }),
+        "expected BlobTooLarge from mid-stream cap, got: {err:?}"
     );
     Ok(())
 }
@@ -808,13 +817,8 @@ async fn http_origin_rejects_decompression_bomb() -> anyhow::Result<()> {
 
     let err = err_of(engine.get(canonical).await)?;
     anyhow::ensure!(
-        matches!(err, CacheError::OriginError { .. }),
-        "expected OriginError from bomb cap, got: {err:?}"
-    );
-    let msg = format!("{err}");
-    anyhow::ensure!(
-        msg.contains("max_blob_bytes") && msg.contains("mid-flight"),
-        "error message should name the running cap: {msg}"
+        matches!(err, CacheError::BlobTooLarge { .. }),
+        "expected BlobTooLarge from bomb cap, got: {err:?}"
     );
     Ok(())
 }
@@ -935,7 +939,7 @@ async fn http_origin_rejects_multi_encoding_header() -> anyhow::Result<()> {
 /// Above the 1 MiB `DECOMPRESS_BLOCKING_THRESHOLD`, decompression runs
 /// inside `spawn_blocking`. A regression dropping the `.await` or
 /// flipping the comparator would fail this test (the current
-/// `pull_through_succeeds_above_blocking_hash_threshold` only exercises
+/// `pull_through_succeeds_above_one_mib_payload` only exercises
 /// the *hash* threshold via `FilesystemOrigin` and never decompresses).
 #[tokio::test]
 async fn http_origin_decompresses_above_blocking_threshold() -> anyhow::Result<()> {
