@@ -13,7 +13,7 @@ use iroh_blobs::Hash;
 use iroh_blobs::store::fs::FsStore;
 use tokio::sync::Notify;
 
-use crate::error::{CacheError, CacheResult};
+use crate::error::{CacheError, CacheResult, OriginError};
 use crate::metrics::CacheMetrics;
 use crate::origin::{Origin, OriginKind};
 use crate::retry::{RetryPolicy, retry_fetch};
@@ -964,19 +964,53 @@ impl CacheEngine {
         // intent: every byte the origin sent us is billed even if
         // the import later fails, so an origin streaming a 5 GB-of-
         // 10 GB body before erroring still shows as 5 GB egress).
-        let counted = count_and_cap_stream(stream, max_blob_bytes, self.inner.metrics.clone());
+        //
+        // `captured_err` is the side-channel for mid-stream errors:
+        // iroh-blobs' `add_stream` swallows the upstream `io::Error`
+        // (it `?`-propagates inside an async block whose error is
+        // discarded by `let _ = tokio::join!(...)`), so without this
+        // capture the engine sees only "unexpected end of stream"
+        // and operators lose the actionable upstream message
+        // ("body read stalled", "exceeded max_blob_bytes mid-flight",
+        // etc.). The wrapper writes through to `captured_err` on
+        // every `Err` it observes; the engine reads from it after
+        // `temp_tag()` fails and surfaces the typed root cause.
+        let captured_err: Arc<Mutex<Option<std::io::Error>>> = Arc::new(Mutex::new(None));
+        let counted = count_and_cap_stream(
+            stream,
+            max_blob_bytes,
+            self.inner.metrics.clone(),
+            captured_err.clone(),
+        );
         let progress = self.inner.store.blobs().add_stream(counted).await;
-        let temp_tag = match progress.temp_tag().await {
+        let temp_tag_result = progress.temp_tag().await;
+
+        // The upstream stream-error path commits a partial blob to
+        // iroh-blobs (see the long comment in `count_and_cap_stream`):
+        // the side-channel-recorded error wins over both the
+        // iroh-blobs Err arm AND a "successful" partial import,
+        // because the latter's hash is deterministically wrong and
+        // we'd rather surface the real cause ("body read stalled",
+        // "decompression failed") than a confusing `HashMismatch`.
+        if let Some(upstream) = captured_err
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            // Drop the (possibly successful) temp tag so iroh-blobs
+            // GC reclaims the partial bytes.
+            drop(temp_tag_result);
+            return Err(CacheError::OriginError {
+                hash,
+                source: build_origin_anyhow_from_io(upstream),
+            });
+        }
+
+        let temp_tag = match temp_tag_result {
             Ok(tt) => tt,
             Err(err) => {
-                // The origin stream errored mid-flight (size-cap breach,
-                // network mid-stream, file shrunk during read), or the
-                // store rejected the import. iroh-blobs swallows the
-                // source `io::Error` inside `add_stream` (it sends
-                // `Done` only on clean completion), so we cannot
-                // distinguish those cases here without a richer
-                // protocol — surface as a generic origin error and let
-                // the next request trigger a fresh retry budget.
+                // No upstream-captured error: the failure is on
+                // iroh-blobs' side (disk write, actor crash, etc.).
                 return Err(CacheError::OriginError {
                     hash,
                     source: anyhow::Error::from(err)
@@ -1022,14 +1056,83 @@ impl CacheEngine {
     }
 }
 
-/// Adapter that bumps the `pull_through_bytes` metric per chunk and
-/// aborts mid-stream if cumulative bytes exceed `max_bytes`.
+/// Convert a captured `io::Error` (possibly wrapping a typed
+/// [`OriginError`] via `io::Error::new(kind, OriginError::*)`) into an
+/// `anyhow::Error` whose chain still exposes the typed variant for
+/// [`CacheError::origin_error_kind`].
 ///
-/// The engine pipes this directly into
+/// The wrinkle: `io::Error::source()` yields `inner.source()`, **not**
+/// `Some(&inner)`. So if `OriginError::DecompressionFailed` is the
+/// inner of an `io::Error`, walking the chain via `Error::source()`
+/// skips straight from the `io::Error` to whatever the
+/// `OriginError`'s own `source` field has — the typed variant is
+/// invisible to a `downcast_ref::<OriginError>()` walk.
+///
+/// Workaround: pull the typed variant out via `into_inner()` +
+/// `downcast::<OriginError>()` before constructing the anyhow chain.
+/// When successful, `anyhow::Error::from(typed)` makes the typed
+/// variant the deepest (and thus walkable) element — and its
+/// `thiserror`-generated `Display` already includes the inner
+/// `source` (e.g. `"failed to decompress gzip response body: …"`),
+/// so anyhow's natural `Display` surfaces the actionable detail
+/// without manual chain flattening. When the `io::Error` does not
+/// wrap a typed `OriginError`, preserve whatever inner it does
+/// have so the operator-visible source chain isn't lost.
+fn build_origin_anyhow_from_io(upstream: std::io::Error) -> anyhow::Error {
+    // Try to peel off the typed inner. `io::Error::into_inner()`
+    // returns `Option<Box<dyn Error + Send + Sync>>`; the
+    // `Box::downcast` on the trait object recovers the concrete
+    // `OriginError` if the adapter packed one in via
+    // `typed_decoder_error`. We hold on to the kind+message before
+    // consuming so we can rebuild a faithful `io::Error` if the
+    // inner is not a typed `OriginError`.
+    let kind = upstream.kind();
+    let display = upstream.to_string();
+    if let Some(boxed) = upstream.into_inner() {
+        match boxed.downcast::<OriginError>() {
+            Ok(typed) => return anyhow::Error::from(*typed),
+            Err(other_box) => {
+                // Inner wasn't a typed `OriginError`; keep it in the
+                // chain so the operator still sees it via
+                // `anyhow::Error::Display` with `:#` (or by walking
+                // `chain()`).
+                return anyhow::Error::from(std::io::Error::new(kind, other_box));
+            }
+        }
+    }
+    // No inner at all (io::Error from a raw kind, no wrapped
+    // payload). The Display string is all we have.
+    anyhow::Error::msg(display)
+}
+
+/// Adapter that bumps the `pull_through_bytes` metric per chunk,
+/// captures any upstream error into `captured_err`, and *terminates
+/// the stream cleanly* (yields `None`, never `Err`) on cap breach
+/// or upstream error.
+///
+/// The engine pipes the returned stream directly into
 /// [`iroh_blobs::api::blobs::Blobs::add_stream`], so the I/O bound
 /// becomes the chunk size from the origin (typically a few KiB to a
 /// few MiB depending on the backend) — a 10 GB blob no longer pins
 /// 10 GB of process RSS (issue #271).
+///
+/// **Why `None`-on-error rather than `Err`:** iroh-blobs'
+/// `add_stream` send loop propagates a yielded `Err` via `?`,
+/// dropping the bidi-channel sender. Its server-side companion
+/// actor then waits forever for `Done` before yielding any
+/// progress item, hanging the whole import. Yielding `None` lets
+/// `add_stream` send the `Done` marker so the import commits
+/// (under whatever hash the partial bytes produce); the engine
+/// reads `captured_err` to surface the *real* failure instead of
+/// the misleading `HashMismatch` the partial-import would
+/// otherwise produce. The partial blob is left as an unprotected
+/// `TempTag` and reclaimed by iroh-blobs' GC.
+///
+/// **Wrapping the inner stream in `Option`** ensures polling
+/// returns `None` once we've terminated. Polling a stream after
+/// a terminal error is undefined; without the sentinel, a
+/// consumer that resumes polling could re-enter the adapter and
+/// re-poll an already-errored upstream.
 ///
 /// The `Send + Sync + 'static` bound on the returned stream is fixed
 /// by `add_stream`'s signature.
@@ -1037,17 +1140,44 @@ fn count_and_cap_stream<S>(
     stream: S,
     max_bytes: u64,
     metrics: Option<Arc<CacheMetrics>>,
+    captured_err: Arc<Mutex<Option<std::io::Error>>>,
 ) -> impl futures_util::Stream<Item = std::io::Result<Bytes>> + Send + Sync + 'static
 where
     S: futures_util::Stream<Item = std::io::Result<Bytes>> + Send + Sync + Unpin + 'static,
 {
     use futures_util::StreamExt;
     futures_util::stream::unfold(
-        (stream, 0u64, metrics),
-        move |(mut s, total, metrics)| async move {
+        (Some(stream), 0u64, metrics, captured_err),
+        move |(maybe_s, total, metrics, captured)| async move {
+            let mut s = maybe_s?;
             let next = s.next().await?;
             match next {
-                Err(e) => Some((Err(e), (s, total, metrics))),
+                Err(e) => {
+                    // Move the real error into the side channel
+                    // (preserves any typed inner like
+                    // `io::Error::other(OriginError::*)` that
+                    // `HttpOrigin` packs in) and *terminate the
+                    // stream cleanly* by returning `None` on the
+                    // next poll. We deliberately do **not** yield
+                    // the error to iroh-blobs' `add_stream`: when
+                    // we yield `Err` from the source stream,
+                    // `add_stream`'s send loop returns early via
+                    // `?`, dropping the bidi-channel sender — but
+                    // its companion server-side actor then waits
+                    // forever for `Done` before yielding any
+                    // progress item, hanging the whole import.
+                    // Yielding `None` instead lets `add_stream`
+                    // send the `Done` marker, the import commits
+                    // with whatever bytes were already received
+                    // (under a wrong hash), and the engine reads
+                    // `captured_err` to surface the *real* failure
+                    // instead of the misleading `HashMismatch` the
+                    // partial-import would otherwise produce. The
+                    // partial blob is left as an unprotected
+                    // `TempTag` and reclaimed by iroh-blobs' GC.
+                    *captured.lock().unwrap_or_else(PoisonError::into_inner) = Some(e);
+                    None
+                }
                 Ok(chunk) => {
                     // Bill the chunk before the cap check: the
                     // origin already sent us the bytes, so the
@@ -1067,9 +1197,10 @@ where
                         let err = std::io::Error::other(format!(
                             "origin stream exceeded max_blob_bytes={max_bytes} mid-flight"
                         ));
-                        return Some((Err(err), (s, total, metrics)));
+                        *captured.lock().unwrap_or_else(PoisonError::into_inner) = Some(err);
+                        return None;
                     }
-                    Some((Ok(chunk), (s, new_total, metrics)))
+                    Some((Ok(chunk), (Some(s), new_total, metrics, captured)))
                 }
             }
         },
