@@ -376,10 +376,11 @@ async fn gc_reclaims_cap_breach_partial_bytes() -> anyhow::Result<()> {
 /// branch: when `gc_interval = Duration::ZERO`, iroh-blobs must NOT
 /// spawn a GC loop, the partial-import bytes must stay on disk, and
 /// the GC metrics must stay at zero indefinitely. Locks in the
-/// `if !gc_interval.is_zero()` guard at `engine.rs::open_full` —
-/// a regression that swapped the polarity of that condition would
-/// silently re-enable GC for every operator who set `gc_interval_sec
-/// = 0` (or vice versa, silently disabling for everyone else).
+/// `if gc_interval.is_zero() { None } else { Some(...) }` polarity at
+/// `engine.rs::open_full` — a regression that swapped the polarity of
+/// that condition would silently re-enable GC for every operator who
+/// set `gc_interval_sec = 0` (or vice versa, silently disabling for
+/// everyone else).
 #[tokio::test]
 async fn gc_disabled_does_not_reclaim_or_emit_metrics() -> anyhow::Result<()> {
     let server = MockServer::start().await;

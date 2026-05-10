@@ -1,23 +1,35 @@
 //! Cache-engine `OpenMetrics` counters.
 //!
 //! Eight counters, all monotonic, exposed under the `decdn_cache_*`
-//! family per ADR `appendix-observability`. Operators reason about
-//! cache health from four ratios:
+//! family per ADR `appendix-observability`. The exported metric names
+//! all carry the OpenMetrics-encoder-appended `_total` suffix even
+//! though the corresponding Rust struct fields here do not — that's
+//! `iroh-metrics 0.38.3 encoding.rs:490` writing `_total` for every
+//! `Counter`. The `PromQL` fragments below use the exported names so
+//! operators can paste them verbatim into a Prometheus query.
 //!
-//! - **Hit rate** — `hits / (hits + misses)`.
-//! - **Origin egress amplification** — `pull_through_bytes / bytes_returned`.
+//! Operators reason about cache health from four ratios:
+//!
+//! - **Hit rate** — `decdn_cache_hits_total / (decdn_cache_hits_total +
+//!   decdn_cache_misses_total)`.
+//! - **Origin egress amplification** —
+//!   `decdn_cache_pull_through_bytes_total / decdn_cache_bytes_returned_total`.
 //!   Equal to 1.0 when the cache is acting as pure pass-through; trends
 //!   toward 0 as cached content gets re-served.
-//! - **Origin retry health** — `origin_retry_exhausted / origin_fetches`.
+//! - **Origin retry health** —
+//!   `decdn_cache_origin_retry_exhausted_total / decdn_cache_origin_fetches_total`.
 //!   Sustained nonzero rate = user-visible origin failures the retry
 //!   budget couldn't save (#285).
-//! - **GC orphan rate** — `rate(gc_bytes_reclaimed_total) /
-//!   rate(pull_through_bytes)` over a recent observation window.
-//!   Sustained nonzero numerator against zero denominator means bytes
-//!   are being orphaned faster than the pull path promotes named tags
-//!   — typically a hostile-origin signal (#518). Use a window at
-//!   least `2 * cache.gc_interval_sec` wide: byte attribution lags one
-//!   sweep cycle (see `gc_bytes_reclaimed_total`).
+//! - **GC reclaim ratio** —
+//!   `rate(decdn_cache_gc_bytes_reclaimed_total) /
+//!   rate(decdn_cache_pull_through_bytes_total)` over a recent
+//!   observation window. `pull_through_bytes` counts every origin byte
+//!   we receive, success or failure (#418), so this ratio approaches
+//!   `1.0` in the hostile-origin amplification scenario where almost
+//!   everything we pull is later reclaimed by GC. Healthy nodes sit
+//!   near `0.0`. Use a window at least `2 * cache.gc_interval_sec`
+//!   wide: byte attribution lags one sweep cycle (see
+//!   `gc_bytes_reclaimed`).
 //!
 //! Hit/miss accounting (#418): on `Ok` and on the cache-domain error
 //! returns (`NoOrigin`, evicted `NotFound`, origin `NotFound`,

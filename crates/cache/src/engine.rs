@@ -95,15 +95,29 @@ struct Inner {
     ///
     /// **Why this lives here:** iroh-blobs spawns its GC loop on its
     /// internal runtime when `Options.gc` is set. The loop's cb captures
-    /// a [`Weak<OnceLock<FsStore>>`] so it doesn't pin the iroh-blobs
-    /// actor alive forever; when this `Inner` drops, the strong `Arc`
-    /// here drops with it, freeing the inner `FsStore` clone. That
-    /// drops the last sender for the actor's command channel, the
-    /// actor exits, the iroh-blobs runtime drops, and the GC task is
-    /// aborted. Without this field (i.e., if the cb held the strong
-    /// `Arc`), the cb → `OnceLock` → `FsStore` clone → actor → GC task
-    /// → cb cycle would keep the iroh-blobs runtime alive past engine
-    /// drop.
+    /// a [`Weak<OnceLock<FsStore>>`] rather than a strong `Arc`, so the
+    /// cb itself contributes no strong refcount to the iroh-blobs
+    /// `FsStore` handle. When this `Inner` drops, the strong `Arc` here
+    /// drops with it; subsequent cb fires see `Weak::upgrade -> None`
+    /// and silently no-op (no metric writes, no work) — the cb is no
+    /// longer wedged in a cycle that keeps it alive.
+    ///
+    /// **What this does NOT do:** the iroh-blobs GC loop itself
+    /// (`run_gc(store: Store, ...)`) owns its own `Store` clone for the
+    /// lifetime of its `loop`, separate from anything in `Inner`. So
+    /// `Inner.drop()` does not shut iroh-blobs' internal runtime down;
+    /// the runtime sits resident-but-idle until the surrounding process
+    /// exits (or until `gc_run_once` errors and breaks the loop). For
+    /// the current single-engine, process-lifetime model this is
+    /// benign. #520 tracks driving the loop ourselves once iroh-blobs
+    /// exposes `gc_run_once`, at which point engine drop will be able
+    /// to abort the loop directly.
+    ///
+    /// **Invariant:** no `Arc::clone` of this field may escape `Inner`.
+    /// Cloning the strong `Arc` into a longer-lived owner would re-
+    /// introduce a cb-side strong ref via the round-trip and defeat
+    /// the cycle-break, leaving the cb running with a populated
+    /// `Weak` past engine drop.
     ///
     /// `dead_code` is allowed because nothing *reads* this field —
     /// its only purpose is keeping the `Arc` strong-ref alive for the
@@ -456,11 +470,14 @@ const fn hex_digit(c: u8) -> Option<u8> {
 /// **Engine-drop semantics:** `store_handle` is a [`Weak`] of the
 /// `Arc<OnceLock<FsStore>>` that lives in `Inner.gc_store_handle`.
 /// When the engine drops, that strong `Arc` drops with it, the
-/// `Weak::upgrade` here returns `None`, and the cb returns silently.
-/// iroh-blobs' GC task continues to fire for a short window (until the
-/// surrounding `FsStore` clones drop and the actor's runtime aborts the
-/// task) but produces no metric work and holds no resources past the
-/// engine.
+/// `Weak::upgrade` here returns `None`, and the cb returns silently —
+/// no metric writes, no work, no contribution to the cb's surviving
+/// strong-ref graph. iroh-blobs' GC loop itself owns its own `Store`
+/// clone (via `run_gc(store: Store, ...)`) and keeps running for the
+/// rest of the process lifetime; that's an upstream design constraint
+/// tracked under #520. What this `Weak` ensures is that the cb body
+/// no-ops cleanly past engine drop rather than spuriously snapshotting
+/// or bumping metrics on a drained engine.
 async fn gc_protect_callback(
     store_handle: Weak<OnceLock<FsStore>>,
     prev_pre_sweep: Arc<Mutex<HashMap<Hash, u64>>>,
