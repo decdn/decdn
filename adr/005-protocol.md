@@ -221,12 +221,47 @@ enum StreamError {
     BlobTooLarge,      // Blob exceeds this node's configured max_blob_size; do not retry this node
     InternalError,     // Unexpected failure; do not retry this node
     EvictedSinceProbe, // Blob was evicted between probe and stream request — WARNING: still slashable after a signed has_blob:true probe (see below)
+    VoucherRejected { reason: VoucherRejectReason }, // Node rejected a payment voucher — see VoucherRejected semantics below
+}
+
+enum VoucherRejectReason {
+    BadSignature,         // VoucherError::InvalidSignature — malformed signature bytes
+    WrongSigner,          // VoucherError::WrongSigner — signature recovers to the wrong address
+    WrongChannel,         // ChannelError::WrongChannel — voucher.channel_id mismatch
+    WrongToken,           // ChannelError::WrongToken — cross-token replay defense (ADR 003)
+    StaleNonce,           // ChannelError::NonceNotIncreasing
+    AmountRegression,     // ChannelError::AmountDecreasing
+    BytesRegression,      // ChannelError::BytesDecreasing
+    InsufficientDeposit,  // ChannelError::AmountExceedsDeposit
 }
 ```
 
 #### `EvictedSinceProbe` semantics
 
 This error code is informational only (unsigned, like all error codes — see below). It signals to the requester that the node had the blob at probe time but lost it due to cache pressure. The requester MUST NOT retry the same node for this blob — the blob is no longer in cache. The requester falls back to the next-best provider, identical to `NotFound` handling. **Warning:** Returning `EvictedSinceProbe` in a signed `StreamResponse` with `ok: false` within the 30-second slashing window still constitutes valid phantom-announcement slash evidence — the error code is unsigned and invisible to the on-chain verifier. Implementations MUST NOT treat this error code as a "safe" way to refuse a stream after a positive probe. A well-implemented node using probe-triggered eviction holds (see [Probe-Triggered Eviction Hold](#probe-triggered-eviction-hold)) should rarely return this error under normal operation; its presence at significant rates indicates a failure to respect hold commitments (implementation bug or resource exhaustion such as OOM), not a budget configuration issue — an undersized `max_probe_holds` budget causes the node to respond `has_blob: false` at probe time, preventing the stream request entirely.
+
+#### `VoucherRejected` semantics
+
+Issued when a node rejects a payment voucher submitted on the stream. Rejections ride **in-band** in `StreamResponse { ok: false, error: VoucherRejected{reason} }` — the QUIC stream is **not** reset. This preserves the rejection reason for client diagnostics and lets the payer distinguish a payment rejection from a network failure (a bare stream reset with no application code collapses every rejection to "connection error" at the requester).
+
+The `VoucherRejectReason` variants mirror the off-chain validation enums `ChannelError` / `VoucherError` (in `crates/incentive/`) one-to-one. Each rejection reason corresponds to an on-chain `closeChannel` / `disputeChannel` revert that would otherwise cost gas (see [ADR 003 § Fee Routing on Disputed Closes](003-payments.md#fee-routing-on-disputed-closes) for the on-chain invariants and [ADR 003 § Off-chain Voucher Rejections](003-payments.md#off-chain-voucher-rejections-wire-encoding) for the per-reason mapping).
+
+**Retry semantics by reason:**
+
+| Reason | Client action |
+|---|---|
+| `BadSignature` | Client bug (key mismatch / wire corruption). Do not retry; surface to caller. |
+| `WrongSigner` | Client bug. Do not retry; surface to caller. |
+| `WrongChannel` | Client bug (channel_id mis-bind). Do not retry; surface to caller. |
+| `WrongToken` | Client bug or cross-token replay attempt (see [ADR 003 § Replay attack on vouchers](003-payments.md#replay-attack-on-vouchers)). Do not retry; surface to caller. |
+| `StaleNonce` | Likely client-side bookkeeping desync (e.g., reconnect after crash, lost `VoucherAck`). Refresh channel state from the contract or the last received `VoucherAck`; reissue voucher with the correct nonce. **Maximum 1 retry per stream.** |
+| `AmountRegression` | Client bug — cumulative `amount` regressed. Do not retry; surface to caller. |
+| `BytesRegression` | Client bug — cumulative `bytes_delivered` regressed. Do not retry; surface to caller. |
+| `InsufficientDeposit` | Channel funds exhausted ([ADR 003 invariant 1](003-payments.md#fee-routing-on-disputed-closes): `voucher.amount > channel.deposit`). Open a new channel or top up on-chain; do not retry on this channel. |
+
+These per-reason rules apply only to `VoucherRejected`. The delivery-side errors (`NotFound`, `Overloaded`, `BlobTooLarge`, `InternalError`, `EvictedSinceProbe`) continue to follow the per-blob retry rules in **Retry behavior** below.
+
+Like all `StreamError` codes, `VoucherRejected` is **unsigned** and is not used as on-chain evidence. A malicious node could falsely return `VoucherRejected` to refuse delivery, which is indistinguishable on-wire from `Overloaded` and is subject to the same reputation/redundancy mitigations as other refusal modes.
 
 **`BlobTooLarge` enforcement:** Nodes may configure a `max_blob_size` limit (PoC recommended default: 10 GB). When deciding whether to serve a blob, a node enforces `max_blob_size` against locally known blob metadata (its cache index or origin catalog). If the locally known size exceeds `max_blob_size`, the node returns `StreamResponse {ok: false, error: BlobTooLarge}`. On a cache-miss pull from an upstream node, the pulling node additionally enforces `max_blob_size` against `StreamResponse.total_bytes`: if the upstream `total_bytes` exceeds the pulling node's `max_blob_size`, the pulling node aborts the upstream stream and returns `BlobTooLarge` to the original requester. The limit applies to individual blobs.
 
