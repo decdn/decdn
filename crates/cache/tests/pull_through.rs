@@ -770,23 +770,34 @@ async fn serve_encoded(encoding: &'static str, body: Vec<u8>, canonical_hash: Ha
     server
 }
 
-/// Force `read_capped`'s mid-stream cap to fire: gzip a small payload
-/// that decompresses well past `max_blob_mb`. Critical security path —
-/// without this test, a regression flipping `>` to `>=` (or removing
-/// the cap) is a memory-exhaustion `DoS` via a malicious origin.
+/// Reject a decompression bomb mid-stream. Critical security path —
+/// without this test, a regression that removed the running cap on
+/// the decoded byte count would be a memory-exhaustion `DoS` via a
+/// malicious origin.
+///
+/// Pre-#271 this was caught by `read_capped` inside `decompress_body`
+/// (a typed `OriginError::DecompressionFailed`). Post-#271 the
+/// engine's `count_and_cap_stream` is the single cap layer — it
+/// enforces `max_blob_bytes` on the **decoded** stream regardless of
+/// how the encoded bytes arrived (gzip, zstd, identity), so the bomb
+/// surfaces as a generic `CacheError::OriginError` whose message
+/// names the cap. Operator-debug fidelity: still actionable; the
+/// previously-typed `DecompressionFailed` variant now reaches the
+/// chain only when the decoder itself fails (truncated / empty body
+/// — see the dedicated tests below).
 #[tokio::test]
 async fn http_origin_rejects_decompression_bomb() -> anyhow::Result<()> {
-    // 4 MiB of zeros gzips to ~4 KiB. Engine cap = 1 MiB so the
-    // mid-stream check inside `read_capped` is the only thing that
-    // catches this — both the Content-Length fast-path (4 KiB encoded)
-    // and the engine post-receive cap would let it through.
+    // 4 MiB of zeros gzips to ~4 KiB. Engine cap = 1 MiB so neither
+    // the Content-Length fast-path (4 KiB encoded) nor the per-chunk
+    // cap on encoded bytes would catch this — only the
+    // count_and_cap_stream running total over decoded bytes does.
     let payload = vec![0u8; 4 * 1024 * 1024];
     let canonical = Hash::new(&payload);
     let compressed = gzip(&payload)?;
     anyhow::ensure!(
         compressed.len() < 1024 * 1024,
         "test setup: compressed body must be smaller than the cap to \
-         exercise the mid-stream check, was {} bytes",
+         exercise the running-total check, was {} bytes",
         compressed.len()
     );
     let server = serve_encoded("gzip", compressed, canonical).await;
@@ -800,23 +811,10 @@ async fn http_origin_rejects_decompression_bomb() -> anyhow::Result<()> {
         matches!(err, CacheError::OriginError { .. }),
         "expected OriginError from bomb cap, got: {err:?}"
     );
-    let kind = err
-        .origin_error_kind()
-        .ok_or_else(|| anyhow::anyhow!("expected typed OriginError downcast, got: {err:?}"))?;
+    let msg = format!("{err}");
     anyhow::ensure!(
-        matches!(
-            kind,
-            OriginError::DecompressionFailed {
-                encoding: SupportedEncoding::Gzip,
-                ..
-            }
-        ),
-        "expected DecompressionFailed(Gzip), got: {kind:?}"
-    );
-    let msg = format!("{err:#}");
-    anyhow::ensure!(
-        msg.contains("mid-stream"),
-        "error message should name the mid-stream cap: {msg}"
+        msg.contains("max_blob_bytes") && msg.contains("mid-flight"),
+        "error message should name the running cap: {msg}"
     );
     Ok(())
 }

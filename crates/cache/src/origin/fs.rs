@@ -242,12 +242,19 @@ fn cap_at_max_bytes<S>(
 where
     S: Stream<Item = std::io::Result<Bytes>> + Send + Sync + Unpin + 'static,
 {
+    // **Termination after error:** the inner stream is wrapped in
+    // `Option` so that after yielding an `Err`, the next poll returns
+    // `None`. Polling a stream after a terminal error is undefined
+    // (some impls error again, some hang); the sentinel makes the
+    // wrapper deterministic and prevents iroh-blobs' `add_stream` from
+    // hanging when the upstream errors.
     futures_util::stream::unfold(
-        (stream, 0u64, path_for_log),
-        move |(mut s, total, path)| async move {
+        (Some(stream), 0u64, path_for_log),
+        move |(maybe_s, total, path)| async move {
+            let mut s = maybe_s?;
             let next = s.next().await?;
             match next {
-                Err(e) => Some((Err(e), (s, total, path))),
+                Err(e) => Some((Err(e), (None, total, path))),
                 Ok(chunk) => {
                     let new_total = total.saturating_add(chunk.len() as u64);
                     if new_total > max_bytes {
@@ -255,9 +262,9 @@ where
                             "cache.origin.path entry {} grew past max {max_bytes} during read",
                             path.display()
                         ));
-                        Some((Err(err), (s, total, path)))
+                        Some((Err(err), (None, total, path)))
                     } else {
-                        Some((Ok(chunk), (s, new_total, path)))
+                        Some((Ok(chunk), (Some(s), new_total, path)))
                     }
                 }
             }

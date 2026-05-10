@@ -22,13 +22,11 @@ reqwest = { workspace = true }
 # Streaming primitives for origin pull-through (issue #271). `futures-util`
 # brings `Stream` + combinators; `tokio-util` brings `ReaderStream` /
 # `StreamReader` used by FilesystemOrigin and the HTTP decompression
-# pipeline. Both are MIT/Apache-2.0, allowed by deny.toml.
+# pipeline; `async-compression` decompresses gzip/zstd in the stream
+# pipeline. All MIT/Apache-2.0, allowed by deny.toml.
 futures-util = { workspace = true }
 tokio-util = { workspace = true }
-# Decompression for HttpOrigin (#312). flate2 covers gzip; zstd covers zstd.
-# Both are MIT/Apache-2.0, allowed by deny.toml.
-flate2 = "1"
-zstd = "0.13"
+async-compression = { workspace = true }
 # Atomic swap of the pinned-hashes set on SIGHUP (#276). Matches the
 # Arc<AtomicU64> pattern used for payment.rate_per_mb (commit 166ae41) — the
 # pinned set is non-Copy so AtomicU64 can't carry it; ArcSwap is the
@@ -50,6 +48,12 @@ aws-smithy-types = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 wiremock = { workspace = true }
+# Test fixtures construct gzipped / zstd response bodies for the
+# HttpOrigin decompression tests. The runtime decoders moved to
+# `async-compression` in #271 PR3 — these crates remain only on the
+# encoder side for tests.
+flate2 = "1"
+zstd = "0.13"
 # Operation-level S3 mocks (#437 PR2). The `mock_client!` macro builds an
 # `aws_sdk_s3::Client` whose dispatcher returns canned responses, so
 # `S3Origin` can be exercised end-to-end without standing up MinIO.

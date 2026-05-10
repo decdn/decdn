@@ -79,9 +79,12 @@ zeroize = "1"
 # `futures` umbrella crate (already transitively in the tree via reqwest);
 # `tokio-util` provides `ReaderStream` / `StreamReader` for the
 # AsyncRead↔Stream<Bytes> bridges used by FilesystemOrigin and the
-# decompression pipeline.
+# decompression pipeline. `async-compression` decompresses gzip/zstd in
+# the stream pipeline (replacing the synchronous `flate2` / `zstd`
+# round trip from PR-1's HttpOrigin).
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tokio-util = { version = "0.7", features = ["io"] }
+async-compression = { version = "0.4", features = ["tokio", "gzip", "zstd"] }
 
 # Bundle creation (`decdn bundle create`, issue #391):
 # walkdir for stable directory traversal, globset for `--exclude` patterns,
