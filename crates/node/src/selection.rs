@@ -13,7 +13,7 @@ use std::collections::HashSet;
 pub const MAX_PROVIDER_ATTEMPTS: usize = 3;
 
 /// Reputation floor in the score denominator (ADR 001).
-const REPUTATION_FLOOR: f64 = 0.1;
+const REPUTATION_FLOOR: f32 = 0.1;
 
 /// Score-equivalence threshold for tie-break activation (ADR 001 — "scores
 /// within 1% of each other").
@@ -62,7 +62,10 @@ pub struct RankedCandidate {
 fn compute_score(rate_per_mb: u64, rtt_ms: u32, reputation: f32) -> f64 {
     let rate = rate_per_mb as f64;
     let rtt = f64::from(rtt_ms);
-    let rep = f64::from(reputation).max(REPUTATION_FLOOR);
+    // Clamp in f32 (input's domain), then promote once for the f64 score
+    // arithmetic. Promoting first would let `f32(0.1)` slip just above the
+    // floor (it rounds to ~0.10000000149f64), an unintuitive boundary.
+    let rep = f64::from(reputation.max(REPUTATION_FLOOR));
     rate * rtt / (rep * rep)
 }
 
@@ -332,14 +335,9 @@ mod tests {
 
     #[test]
     fn score_reputation_0_0_clamps_to_floor() {
-        // Any sub-floor reputation (0.0, 0.01, etc.) must clamp to
-        // REPUTATION_FLOOR (0.1f64) and produce identical scores. We compare
-        // two sub-floor inputs rather than one sub-floor and 0.1 directly,
-        // because 0.1f32 promotes to ~0.10000000149f64 — slightly above the
-        // f64 floor — and would skip clamping.
         let at_zero = compute_score(100, 10, 0.0);
-        let at_below_floor = compute_score(100, 10, 0.01);
-        assert!((at_zero - at_below_floor).abs() < 1e-9);
+        let at_floor = compute_score(100, 10, 0.1);
+        assert!((at_zero - at_floor).abs() < 1e-9);
     }
 
     #[test]
@@ -347,17 +345,20 @@ mod tests {
         // Defensive: ReputationEngine::score() returns f32 in [0,1], but if a
         // bug produces a negative we must still not panic and must clamp.
         let s = compute_score(100, 10, -0.5);
-        let at_below_floor = compute_score(100, 10, 0.01);
-        assert!((s - at_below_floor).abs() < 1e-9);
+        let at_floor = compute_score(100, 10, 0.1);
+        assert!((s - at_floor).abs() < 1e-9);
     }
 
     #[test]
     fn score_floor_value_is_zero_point_one() {
         // Pin REPUTATION_FLOOR's actual value (not just clamping behavior). At
-        // rate=100, rtt=10, rep clamps to 0.1: score = 1000 / 0.01 = 100_000.
-        // Breaks if the floor drifts off 0.1 (e.g., to 0.05 → 400_000).
+        // rate=100, rtt=10, rep clamps to ~0.1: score ≈ 1000 / 0.01 ≈ 100_000.
+        // The 1e-2 tolerance accounts for the f32→f64 promotion of 0.1
+        // (f32(0.1) ≈ 0.10000000149f64, so the squared denominator is
+        // slightly above 0.01 → score ≈ 99999.997). Test still catches a
+        // drift to e.g. 0.05 (→ 400_000) or 0.2 (→ 25_000).
         let at_floor = compute_score(100, 10, 0.0);
-        assert!((at_floor - 100_000.0).abs() < 1e-3, "got {at_floor}");
+        assert!((at_floor - 100_000.0).abs() < 1e-2, "got {at_floor}");
     }
 
     #[test]
