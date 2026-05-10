@@ -21,7 +21,6 @@ const TIE_THRESHOLD: f64 = 0.01;
 
 /// A candidate provider produced by content discovery, ready to be ranked.
 #[derive(Debug, Clone)]
-#[non_exhaustive]
 pub struct Candidate {
     /// Iroh `NodeId` (Ed25519 public key) of the candidate.
     pub node_id: [u8; 32],
@@ -46,7 +45,6 @@ pub struct Candidate {
 
 /// A candidate paired with its computed selection score. Lower score is better.
 #[derive(Debug, Clone)]
-#[non_exhaustive]
 pub struct RankedCandidate {
     pub candidate: Candidate,
     pub score: f64,
@@ -156,6 +154,11 @@ fn apply_tiebreaker(ranked: &mut Vec<RankedCandidate>, rng: &mut impl rand::Rng)
 ///
 /// Filters a single index pool in place across the four tiers, so the function
 /// allocates exactly one Vec per call regardless of group size or tier depth.
+///
+/// **INVARIANT:** the returned index is independent of element order in
+/// `group`. The caller (`apply_tiebreaker`) relies on this to use `swap_remove`
+/// for O(1) removal, which reorders surviving elements. Any future
+/// optimization that reuses state across calls must preserve this property.
 fn pick_best_in_group(
     group: &[RankedCandidate],
     emitted_regions: &HashSet<String>,
@@ -168,6 +171,10 @@ fn pick_best_in_group(
     if group.is_empty() {
         return 0;
     }
+    // `pool` is constructed as `0..group.len()` and only ever shrunk via
+    // `retain`, so every `usize` it holds is a valid `group` index. This
+    // makes the `group.get(*i)` calls below provably `Some` and the
+    // final `unwrap_or(0)` provably unreachable in release builds.
     let mut pool: Vec<usize> = (0..group.len()).collect();
 
     // Tier 1: lowest load wins.
@@ -199,9 +206,9 @@ fn pick_best_in_group(
     }
 
     // Tier 3: higher stake wins. `None` is treated as the lowest possible
-    // stake (since on-chain integration is deferred — see ADR 001 §Node
-    // Registry / ADR 019 for the staking-registry interface that will populate
-    // `Candidate.stake`).
+    // stake (since on-chain integration is deferred — see ADR 001 "Contract
+    // Interface: Node Registry" / ADR 019 for the staking-registry interface
+    // that will populate `Candidate.stake`).
     let max_stake = pool
         .iter()
         .filter_map(|i| group.get(*i).and_then(|r| r.candidate.stake))
@@ -233,6 +240,10 @@ fn pick_best_in_group(
 /// difference is ≤ [`TIE_THRESHOLD`]. Two candidates with score `0.0` are
 /// always grouped together; a zero-score candidate is strictly better than
 /// any positive-score candidate and ends the group.
+///
+/// **Termination contract:** returns `> start` whenever `start < ranked.len()`,
+/// so the caller's drain-the-front loop in [`apply_tiebreaker`] always makes
+/// progress on a non-empty `ranked`.
 fn tie_group_end(ranked: &[RankedCandidate], start: usize) -> usize {
     let pivot = match ranked.get(start) {
         Some(r) => r.score,
@@ -341,6 +352,15 @@ mod tests {
     }
 
     #[test]
+    fn score_floor_value_is_zero_point_one() {
+        // Pin REPUTATION_FLOOR's actual value (not just clamping behavior). At
+        // rate=100, rtt=10, rep clamps to 0.1: score = 1000 / 0.01 = 100_000.
+        // Breaks if the floor drifts off 0.1 (e.g., to 0.05 → 400_000).
+        let at_floor = compute_score(100, 10, 0.0);
+        assert!((at_floor - 100_000.0).abs() < 1e-3, "got {at_floor}");
+    }
+
+    #[test]
     fn score_handles_max_inputs_without_overflow() {
         // u64::MAX × u32::MAX is well within f64 range (~1.6e28 < 1.8e308).
         let s = compute_score(u64::MAX, u32::MAX, 1.0);
@@ -428,6 +448,52 @@ mod tests {
     }
 
     #[test]
+    fn three_way_zero_stake_falls_through_to_random_tier() {
+        // Two `Some(0)` candidates plus one `None`: tier 3 retains both
+        // `Some(0)` entries (dropping `None`), then tier 4 picks randomly
+        // between the two survivors. Across enough seeds we should see both
+        // survivors win first — confirms tier 3 doesn't accidentally
+        // short-circuit on a single Some(0) winner.
+        let a = with_stake(
+            with_region(with_load(make_candidate(1, 100, 10, 1.0), 0, 50), "US"),
+            Some(0),
+        );
+        let b = with_stake(
+            with_region(with_load(make_candidate(2, 100, 10, 1.0), 0, 50), "US"),
+            Some(0),
+        );
+        let unknown = with_stake(
+            with_region(with_load(make_candidate(3, 100, 10, 1.0), 0, 50), "US"),
+            None,
+        );
+        let mut first_was_a = false;
+        let mut first_was_b = false;
+        for seed in 0u64..32 {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            let out =
+                rank_candidates_with_rng(vec![a.clone(), b.clone(), unknown.clone()], &mut rng);
+            // The unknown (None stake) must never win first — tier 3 drops it.
+            assert_ne!(
+                out.first().map(|r| r.candidate.node_id[0]),
+                Some(3),
+                "seed {seed}: None-stake candidate should never beat Some(0)"
+            );
+            match out.first().map(|r| r.candidate.node_id[0]) {
+                Some(1) => first_was_a = true,
+                Some(2) => first_was_b = true,
+                _ => {}
+            }
+            if first_was_a && first_was_b {
+                break;
+            }
+        }
+        assert!(
+            first_was_a && first_was_b,
+            "expected both Some(0) candidates to win across 32 seeds"
+        );
+    }
+
+    #[test]
     fn stake_tier_only_runs_when_load_and_geo_tied() {
         // Different load → stake doesn't matter, lower load wins.
         let busy_rich = with_stake(
@@ -504,6 +570,17 @@ mod tests {
         let dear = with_load(make_candidate(2, 1020, 1, 1.0), 0, 10); // score 1020
         let out = rank_candidates(vec![cheap, dear]);
         assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(1));
+    }
+
+    #[test]
+    fn at_1_percent_boundary_counts_as_tied() {
+        // 1000 vs 1010 → exactly 1.0% gap. tie_group_end uses `> TIE_THRESHOLD`,
+        // so 1.0% is *inclusive* (still a tie). Pins the boundary against a
+        // future change to `>=` that would silently exclude exact-1% pairs.
+        let high_load = with_load(make_candidate(1, 100, 10, 1.0), 0, 90); // score 1000
+        let low_load = with_load(make_candidate(2, 1010, 1, 1.0), 0, 10); // score 1010
+        let out = rank_candidates(vec![high_load, low_load]);
+        assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(2));
     }
 
     #[test]
@@ -629,6 +706,15 @@ mod tests {
         let out = top_n(vec![dear, cheap, mid], 2);
         let ids: Vec<u8> = out.iter().map(|r| r.candidate.node_id[0]).collect();
         assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn top_n_with_zero_returns_empty() {
+        // Boundary: n = 0 produces an empty result. Locks the contract against
+        // a future change like `truncate(n.max(1))`.
+        let cs: Vec<Candidate> = (0..3).map(|i| make_candidate(i, 100, 10, 1.0)).collect();
+        let out = top_n(cs, 0);
+        assert!(out.is_empty());
     }
 
     #[test]
