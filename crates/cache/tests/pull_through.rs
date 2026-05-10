@@ -412,11 +412,13 @@ async fn chunk_idle_timeout_fires_when_origin_stalls_mid_body() -> anyhow::Resul
 
 #[tokio::test]
 async fn pull_through_succeeds_above_blocking_hash_threshold() -> anyhow::Result<()> {
-    // 2 MiB payload crosses the 1 MiB `BLOCKING_HASH_THRESHOLD`, exercising
-    // the `spawn_blocking` branch of hash verification. A regression
-    // (missing `.await`, wrong comparator, panic in the blocking task) is
-    // caught here — prior tests above the threshold all abort earlier on
-    // size / hash mismatch.
+    // 2 MiB payload exercises the streaming pull-through across multiple
+    // origin chunks — `tokio_util::io::ReaderStream` emits 4 KiB-sized
+    // chunks by default, so 2 MiB → ~512 chunks through `add_stream`'s
+    // bidi protocol. Used to exercise the explicit `spawn_blocking`
+    // BLAKE3 path before #271; that double-hash is now handled inside
+    // iroh-blobs' `add_stream` so this test is now a regression check
+    // that multi-chunk streaming completes through the engine.
     let payload = vec![0x7Fu8; 2 * 1024 * 1024];
     let hash = Hash::new(&payload);
 
