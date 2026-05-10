@@ -33,11 +33,14 @@ use crate::error::OriginPullError;
 /// S3 `ByteStream`) into the stream by `move`-into-async-block; nothing
 /// borrows from `&self` on the origin.
 ///
-/// Errors flow as `io::Error` so the engine can collapse mid-stream
-/// failures into [`OriginPullError::Permanent`] without re-classifying
-/// every adapter's native error type. Headers-phase classification stays
-/// in each adapter (transient vs permanent) and is emitted before the
-/// stream is constructed.
+/// Errors flow as `io::Error`. **They do not feed
+/// [`crate::retry::retry_fetch`]'s transient/permanent classification** —
+/// retry runs around the call to `fetch`, so any error a stream emits
+/// after `fetch` returned `Ok` reaches the engine via
+/// [`crate::CacheError::OriginError`] without going through retry.
+/// Headers-phase failures stay in each adapter's `Origin::fetch` body,
+/// where transient/permanent classification is meaningful and
+/// retry-eligible.
 pub type OriginByteStream =
     Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send + Sync + 'static>>;
 
@@ -86,21 +89,26 @@ impl std::fmt::Display for OriginKind {
 
 /// Result of an [`Origin::fetch`] call.
 ///
-/// `Found` carries a streaming primitive (issue #271) so the engine can
-/// pipe origin bytes straight into [`iroh_blobs::api::blobs::Blobs::add_stream`]
-/// without ever holding the full blob in memory. `size_hint` is the
-/// adapter's best-effort length advertisement (HTTP `Content-Length`,
-/// filesystem `metadata().len()`, S3 `content_length()`); `None` when
-/// the adapter doesn't know.
+/// `Found` carries a streaming primitive (issue #271) so PRs 2-4 can pipe
+/// origin bytes straight into [`iroh_blobs::api::blobs::Blobs::add_stream`].
+/// **In PR 1 the engine still drains the stream via
+/// [`OriginFetch::collect_to_bytes`]** before re-entering the buffered
+/// `add_bytes` path — the adapters wrap their existing buffered payload
+/// via [`OriginFetch::found_one_shot`], so memory savings only land in
+/// PR 2 onward. `size_hint` carries the adapter's best-effort length
+/// advertisement (HTTP `Content-Length`, filesystem `metadata().len()`,
+/// S3 `content_length()`); the PR 2 engine uses it for short-circuit
+/// cap checks before reading the first byte. PR 1 ignores it apart from
+/// pre-sizing the collect-to-bytes buffer (capped to bound `DoS`).
 pub enum OriginFetch {
     /// The origin returned the bytes for this hash as a stream of chunks.
     Found {
         /// Chunked byte stream. See [`OriginByteStream`] for the bounds.
         stream: OriginByteStream,
         /// Best-effort upfront size estimate from the adapter. Used by
-        /// the engine for short-circuit cap checks before reading the
-        /// first byte; the engine still re-checks the running total as
-        /// chunks arrive.
+        /// the PR 2 engine for the short-circuit cap check before
+        /// reading the first byte; the engine still re-checks the
+        /// running total as chunks arrive.
         size_hint: Option<u64>,
     },
     /// The origin reported the object does not exist (e.g. HTTP 404).
@@ -145,6 +153,17 @@ impl OriginFetch {
     /// path; PR 2 removes that call site and gates this helper behind
     /// `cfg(test)`.
     pub async fn collect_to_bytes(self) -> Result<Option<Bytes>, std::io::Error> {
+        // Bound the upfront allocation regardless of `size_hint`. A
+        // hostile origin advertising `Content-Length: 10 TiB` would
+        // otherwise cause `BytesMut::with_capacity` to commit a huge
+        // virtual region before the first byte arrives — the engine's
+        // running cap on the streamed bytes catches the actual
+        // overrun, but the per-fetch initial allocation is the
+        // operator-visible DoS axis we still have to bound here. 1
+        // MiB matches the pre-PR-1 `INITIAL_READ_CAP_HINT` that
+        // `FilesystemOrigin` used for the same reason; the buffer
+        // grows incrementally past it as chunks arrive.
+        const INITIAL_CAP: usize = 1 << 20; // 1 MiB
         use bytes::BytesMut;
         use futures_util::StreamExt;
         match self {
@@ -153,7 +172,10 @@ impl OriginFetch {
                 mut stream,
                 size_hint,
             } => {
-                let cap = size_hint.and_then(|n| usize::try_from(n).ok()).unwrap_or(0);
+                let cap = size_hint
+                    .and_then(|n| usize::try_from(n).ok())
+                    .unwrap_or(0)
+                    .min(INITIAL_CAP);
                 let mut buf = BytesMut::with_capacity(cap);
                 while let Some(chunk) = stream.next().await {
                     buf.extend_from_slice(&chunk?);
