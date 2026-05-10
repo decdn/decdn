@@ -99,9 +99,11 @@ pub struct HealthArgs {
 /// `decdn node evict` — forcibly remove a blob from the local cache via
 /// `admin_v1_evict` (issue #279).
 ///
-/// The eviction is *logical* in this version (the iroh-blobs store still
-/// holds the bytes — see issue #233 for the disk-reclaim follow-up) but
-/// is persisted to `<cache_dir>/evicted.log` so it survives restarts.
+/// The eviction is *logical*: the iroh-blobs store still holds the bytes
+/// until the next periodic GC sweep reclaims them (#518; cadence controlled
+/// by `cache.gc_interval_sec`). The takedown is persisted to
+/// `<cache_dir>/evicted.log` so it survives restarts even if the next sweep
+/// hasn't run yet.
 /// Operators using this for DMCA takedowns can rely on the takedown
 /// being durable across `decdn-node run` invocations.
 ///

@@ -123,6 +123,10 @@ pub fn write_validate_summary<W: std::io::Write>(
         "  max_blob_size_mb:         {}",
         resolved.cache.max_blob_size_mb
     )?;
+    match resolved.cache.gc_interval_sec {
+        0 => writeln!(w, "  gc_interval_sec:          disabled")?,
+        n => writeln!(w, "  gc_interval_sec:          {n}")?,
+    }
     writeln!(
         w,
         "  rate_per_mb:              {}",
@@ -205,6 +209,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # cache_dir = "~/.decdn/cache"
 # cache_size_mb = 10240
 # max_blob_size_mb = 1024
+# gc_interval_sec = 300                    # iroh-blobs GC sweep cadence; 0 disables (#518)
 
 [payment]
 # rate_per_mb = 10

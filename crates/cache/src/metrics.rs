@@ -1,8 +1,8 @@
 //! Cache-engine `OpenMetrics` counters.
 //!
-//! Six counters, all monotonic, exposed under the `decdn_cache_*`
+//! Eight counters, all monotonic, exposed under the `decdn_cache_*`
 //! family per ADR `appendix-observability`. Operators reason about
-//! cache health from three ratios:
+//! cache health from four ratios:
 //!
 //! - **Hit rate** — `hits / (hits + misses)`.
 //! - **Origin egress amplification** — `pull_through_bytes / bytes_returned`.
@@ -11,6 +11,13 @@
 //! - **Origin retry health** — `origin_retry_exhausted / origin_fetches`.
 //!   Sustained nonzero rate = user-visible origin failures the retry
 //!   budget couldn't save (#285).
+//! - **GC orphan rate** — `rate(gc_bytes_reclaimed_total) /
+//!   rate(pull_through_bytes)` over a recent observation window.
+//!   Sustained nonzero numerator against zero denominator means bytes
+//!   are being orphaned faster than the pull path promotes named tags
+//!   — typically a hostile-origin signal (#518). Use a window at
+//!   least `2 * cache.gc_interval_sec` wide: byte attribution lags one
+//!   sweep cycle (see `gc_bytes_reclaimed_total`).
 //!
 //! Hit/miss accounting (#418): on `Ok` and on the cache-domain error
 //! returns (`NoOrigin`, evicted `NotFound`, origin `NotFound`,
@@ -79,4 +86,31 @@ pub struct CacheMetrics {
     /// egress is paid either way. Distinguishes 'serving from cache'
     /// vs. 'paying origin egress' when paired with `bytes_returned`.
     pub pull_through_bytes: Counter,
+    /// iroh-blobs GC sweep cycles observed (#518). Bumped once per
+    /// `add_protected` callback fire, after the pre-sweep snapshot
+    /// succeeds. Iroh-blobs spawns the sweep loop internally when
+    /// `cache.gc_interval_sec > 0`; the cb is our hook into each cycle.
+    /// On-demand reclamation is tracked under #520.
+    ///
+    /// Operator-actionable: a flat-line at zero against a nonzero
+    /// `cache.gc_interval_sec` means the periodic loop never spawned,
+    /// or the snapshot has been failing on every cycle (the engine
+    /// emits a `tracing::warn!` when that happens).
+    pub gc_runs_total: Counter,
+    /// Bytes reclaimed by the iroh-blobs GC, attributed across cycles
+    /// (#518). Computed as the pre-sweep blob-set diff between the
+    /// previous cycle and the current cycle: hashes that vanish across
+    /// that window are exactly what the previous sweep deleted (the
+    /// cache crate has no other public delete path). Sustained nonzero
+    /// rate against zero `rate(pull_through_bytes)` is a red flag —
+    /// either the pull path is failing to promote named tags on
+    /// success, or a hostile origin is amplifying disk usage via
+    /// repeated mid-stream errors.
+    ///
+    /// **Attribution lags one sweep cycle.** The first cycle records a
+    /// baseline and bumps zero bytes; from cycle two onward the bump
+    /// reflects the previous sweep's reclaim. For an alert window
+    /// shorter than `2 * cache.gc_interval_sec` the reading will be
+    /// noisy.
+    pub gc_bytes_reclaimed_total: Counter,
 }

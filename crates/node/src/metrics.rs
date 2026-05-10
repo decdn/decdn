@@ -462,6 +462,7 @@ mod tests {
             PinnedHashes::empty(),
             RetryPolicy::default(),
             Some(Arc::clone(&cache_handle)),
+            std::time::Duration::ZERO,
         )
         .await
         .unwrap();
