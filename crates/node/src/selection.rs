@@ -13,7 +13,7 @@ use std::collections::HashSet;
 pub const MAX_PROVIDER_ATTEMPTS: usize = 3;
 
 /// Reputation floor in the score denominator (ADR 001).
-const REPUTATION_FLOOR: f32 = 0.1;
+const REPUTATION_FLOOR: f64 = 0.1;
 
 /// Score-equivalence threshold for tie-break activation (ADR 001 — "scores
 /// within 1% of each other").
@@ -64,8 +64,7 @@ pub struct RankedCandidate {
 fn compute_score(rate_per_mb: u64, rtt_ms: u32, reputation: f32) -> f64 {
     let rate = rate_per_mb as f64;
     let rtt = f64::from(rtt_ms);
-    let rep_clamped = reputation.max(REPUTATION_FLOOR);
-    let rep = f64::from(rep_clamped);
+    let rep = f64::from(reputation).max(REPUTATION_FLOOR);
     rate * rtt / (rep * rep)
 }
 
@@ -106,23 +105,27 @@ fn rank_candidates_with_rng(
 fn apply_tiebreaker(ranked: &mut Vec<RankedCandidate>, rng: &mut impl rand::Rng) {
     let mut output: Vec<RankedCandidate> = Vec::with_capacity(ranked.len());
 
-    let mut start = 0;
-    while start < ranked.len() {
-        let end = tie_group_end(ranked, start);
+    while !ranked.is_empty() {
         // Geo diversity is scoped to the current tie group: candidates within
         // a single within-1% group are spread across regions, but the tracker
         // is reset between groups so unrelated tie groups don't bias each
         // other's geo tier. ADR 008 §9 lists the four tiers; per-group scoping
         // is this implementation's interpretation of "within a tie".
         let mut group_regions: HashSet<String> = HashSet::new();
-        let slice = ranked.get(start..end);
-        debug_assert!(
-            slice.is_some(),
-            "tie_group_end produced out-of-bounds range {start}..{end} for len {}",
+        let end = tie_group_end(ranked, 0);
+        // tie_group_end's loop guard bounds `end` at `ranked.len()`, so the
+        // min() is belt-and-suspenders to keep `Vec::drain` from panicking
+        // even on a future invariant break.
+        let split_at = end.min(ranked.len());
+        debug_assert_eq!(
+            end,
+            split_at,
+            "tie_group_end exceeded len: {end} > {}",
             ranked.len()
         );
-        let mut group: Vec<RankedCandidate> =
-            slice.map_or_else(Vec::new, <[RankedCandidate]>::to_vec);
+        // Drain (move) the front tie group out of `ranked` into `group` —
+        // avoids the per-element clone of `to_vec()` on the slice.
+        let mut group: Vec<RankedCandidate> = ranked.drain(..split_at).collect();
         while !group.is_empty() {
             let pick_idx = pick_best_in_group(&group, &group_regions, rng);
             // pick_best_in_group always returns a valid index when the slice
@@ -144,7 +147,6 @@ fn apply_tiebreaker(ranked: &mut Vec<RankedCandidate>, rng: &mut impl rand::Rng)
             group_regions.insert(pick.candidate.region.clone());
             output.push(pick);
         }
-        start = end;
     }
     *ranked = output;
 }
@@ -319,9 +321,14 @@ mod tests {
 
     #[test]
     fn score_reputation_0_0_clamps_to_floor() {
+        // Any sub-floor reputation (0.0, 0.01, etc.) must clamp to
+        // REPUTATION_FLOOR (0.1f64) and produce identical scores. We compare
+        // two sub-floor inputs rather than one sub-floor and 0.1 directly,
+        // because 0.1f32 promotes to ~0.10000000149f64 — slightly above the
+        // f64 floor — and would skip clamping.
         let at_zero = compute_score(100, 10, 0.0);
-        let at_floor = compute_score(100, 10, 0.1);
-        assert!((at_zero - at_floor).abs() < 1e-9);
+        let at_below_floor = compute_score(100, 10, 0.01);
+        assert!((at_zero - at_below_floor).abs() < 1e-9);
     }
 
     #[test]
@@ -329,8 +336,8 @@ mod tests {
         // Defensive: ReputationEngine::score() returns f32 in [0,1], but if a
         // bug produces a negative we must still not panic and must clamp.
         let s = compute_score(100, 10, -0.5);
-        let at_floor = compute_score(100, 10, 0.1);
-        assert!((s - at_floor).abs() < 1e-9);
+        let at_below_floor = compute_score(100, 10, 0.01);
+        assert!((s - at_below_floor).abs() < 1e-9);
     }
 
     #[test]
