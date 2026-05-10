@@ -196,19 +196,19 @@ impl Origin for FilesystemOrigin {
             // -blobs' `add_stream` can drive this directly without any
             // intermediate buffer.
             //
-            // `take(max_bytes + 1)` keeps the I/O-layer cap from the
-            // pre-streaming code: a file that grew between `fstat` and
-            // the read (append, pwrite past EOF, truncate-then-extend
-            // — all happen on the same inode our fd is pinning) is
-            // bounded by the kernel's read syscall rather than by a
-            // post-collect length check. The wrapper in
+            // `take(max_bytes + 1)` provides an I/O-layer cap: a
+            // file that grew between `fstat` and the read (append,
+            // pwrite past EOF, truncate-then-extend — all happen on
+            // the same inode our fd is pinning) is bounded by the
+            // kernel's read syscall. The wrapper in
             // [`cap_at_max_bytes`] catches the one-byte overrun and
-            // surfaces the same "grew past max during read" error the
-            // pre-PR-1 code did.
+            // converts it to a typed `io::Error` ("grew past max
+            // during read") that the engine surfaces as
+            // `CacheError::OriginError`.
             //
-            // The `take(max_bytes + 1)` cast preserves the saturating-
-            // add semantics from the buffered version: `max_bytes ==
-            // u64::MAX` saturates rather than wraps to `0`.
+            // `saturating_add(1)` preserves correctness for
+            // `max_bytes == u64::MAX`: saturating rather than
+            // wrapping to `0`.
             let path_for_log = canonical.clone();
             let reader = file.take(max_bytes.saturating_add(1));
             let raw = ReaderStream::new(reader);
@@ -225,10 +225,13 @@ impl Origin for FilesystemOrigin {
 /// inner `take(max_bytes + 1)` bounds the I/O-layer read at one byte
 /// past the cap, so a file that grew during read produces a stream
 /// whose chunks sum to at most `max_bytes + 1`. This wrapper trips on
-/// the cumulative byte count and converts the overrun into an
-/// `io::Error`, which propagates through iroh-blobs' `add_stream` as
-/// a stream-side failure (the engine collapses it to
-/// `CacheError::OriginError`).
+/// the cumulative byte count and yields the overrun as an
+/// `io::Error`. The engine's outer wrapper (`count_and_cap_stream`)
+/// captures the error into its side channel and yields `None` to
+/// `iroh_blobs::Blobs::add_stream`, so this error never reaches
+/// iroh-blobs directly — it surfaces back to the caller as
+/// `CacheError::OriginError` once `temp_tag().await` completes and
+/// the engine inspects the side channel.
 ///
 /// `path_for_log` is captured for the error message so an operator
 /// who hits this in production sees the offending file path. The

@@ -902,6 +902,7 @@ impl CacheEngine {
             .map_err(|e| CacheError::Store(anyhow::Error::from(e)))
     }
 
+    #[allow(clippy::too_many_lines)] // Linear failure-classification flow; splitting would require threading `temp_tag_result`/`captured_err` across a function boundary that obscures the sequence more than the length.
     async fn pull_through(&self, hash: Hash) -> CacheResult<Bytes> {
         // Every pull_through entry is a `get()` cache miss, regardless
         // of how the pull resolves. Coalesced waiters that find a hit
@@ -1000,6 +1001,24 @@ impl CacheEngine {
             // Drop the (possibly successful) temp tag so iroh-blobs
             // GC reclaims the partial bytes.
             drop(temp_tag_result);
+            // Cap-breach errors carry a typed marker via
+            // `BlobTooLargeMarker` so the engine surfaces
+            // `CacheError::BlobTooLarge` rather than the generic
+            // `OriginError`. Operators alerting on the typed
+            // variant continue to see the same shape they did pre-
+            // streaming when the (now-deleted) post-collect length
+            // check fired. Other captured errors (idle timeout,
+            // transport reset, decoder failure) keep the
+            // `OriginError` shape.
+            if upstream
+                .get_ref()
+                .is_some_and(<dyn std::error::Error + Send + Sync>::is::<BlobTooLargeMarker>)
+            {
+                return Err(CacheError::BlobTooLarge {
+                    hash,
+                    limit_bytes: max_blob_bytes,
+                });
+            }
             return Err(CacheError::OriginError {
                 hash,
                 source: build_origin_anyhow_from_io(upstream),
@@ -1010,22 +1029,57 @@ impl CacheEngine {
             Ok(tt) => tt,
             Err(err) => {
                 // No upstream-captured error: the failure is on
-                // iroh-blobs' side (disk write, actor crash, etc.).
-                return Err(CacheError::OriginError {
-                    hash,
-                    source: anyhow::Error::from(err)
-                        .context("origin stream import to iroh-blobs failed during pull-through"),
-                });
+                // iroh-blobs' side (disk write, actor crash,
+                // serialization-task panic, etc.). Surface as
+                // `CacheError::Store` so operators routing on
+                // origin-vs-store don't misclassify a local store
+                // problem as a remote origin one.
+                return Err(CacheError::Store(
+                    anyhow::Error::from(err)
+                        .context("iroh-blobs add_stream failed during pull-through"),
+                ));
             }
         };
 
         let actual = temp_tag.hash();
         if actual != hash {
-            // Drop the temp tag without promotion → iroh-blobs GC will
-            // reclaim the bytes (they're not protected once the
-            // `TempTag` drops; no public Tags::delete needed because
-            // we never created a named tag for the wrong hash).
+            // Drop the temp tag without promotion → bytes become
+            // GC-eligible inside iroh-blobs (they're not protected
+            // once the `TempTag` drops; no public `Tags::delete` is
+            // needed because we never created a named tag for the
+            // wrong hash).
             drop(temp_tag);
+            // Cache-poisoning mitigation: between the drop above
+            // and the next iroh-blobs GC sweep, the wrong-hash
+            // bytes are still resident in the store and
+            // `Blobs::has(actual)` would return `true`. An
+            // adversary who chose the bytes also chose `actual`,
+            // so a follow-up request for `actual` could otherwise
+            // serve content the operator never authorized. Add
+            // `actual` to the engine's logical-evicted set so
+            // `engine::has(actual)` and `engine::get(actual)`
+            // return absent regardless of what iroh-blobs
+            // currently has on disk. Best-effort: a poisoned
+            // mutex or a full evicted-set cap surfaces only as a
+            // log line — the primary error returned to the
+            // caller is still `HashMismatch`.
+            //
+            // **Known limitation:** the wrong-hash bytes still
+            // occupy disk until iroh-blobs GC runs (and the
+            // current `decdn-node` runtime does not yet wire up
+            // iroh-blobs GC). Tracked under #233 follow-up.
+            // Until that lands, a malicious origin can amplify
+            // disk usage by repeatedly streaming
+            // `max_blob_bytes - 1` of garbage and erroring on
+            // the last byte.
+            if let Err(evict_err) = self.evict(actual) {
+                tracing::warn!(
+                    expected = %hash,
+                    %actual,
+                    err = %evict_err,
+                    "hash-mismatch logical-evict failed; engine.has(actual) may surface partial-import bytes until iroh-blobs GC runs",
+                );
+            }
             return Err(CacheError::HashMismatch {
                 expected: hash,
                 actual,
@@ -1055,6 +1109,8 @@ impl CacheEngine {
         self.read_local(hash).await
     }
 }
+
+pub(crate) use crate::origin::BlobTooLargeMarker;
 
 /// Convert a captured `io::Error` (possibly wrapping a typed
 /// [`OriginError`] via `io::Error::new(kind, OriginError::*)`) into an
@@ -1194,9 +1250,11 @@ where
                     }
                     let new_total = total.saturating_add(chunk.len() as u64);
                     if new_total > max_bytes {
-                        let err = std::io::Error::other(format!(
-                            "origin stream exceeded max_blob_bytes={max_bytes} mid-flight"
-                        ));
+                        // Pack a typed `BlobTooLargeMarker` into the
+                        // io::Error so the engine surfaces
+                        // `CacheError::BlobTooLarge` (recovered via
+                        // `io::Error::get_ref` downcast).
+                        let err = std::io::Error::other(BlobTooLargeMarker { max_bytes });
                         *captured.lock().unwrap_or_else(PoisonError::into_inner) = Some(err);
                         return None;
                     }

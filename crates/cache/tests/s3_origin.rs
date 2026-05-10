@@ -566,6 +566,55 @@ async fn cache_engine_miss_pulls_from_s3_and_caches() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// End-to-end `BlobTooLarge` through the S3 backend: the engine's
+/// `count_and_cap_stream` running cap on streamed bytes catches an
+/// origin that delivers more than `max_blob_bytes`. Without this
+/// test the S3 path could regress (e.g., re-buffer in the adapter,
+/// or skip the engine wrapper) and the fix for issue #271 wouldn't
+/// actually constrain S3-fed pulls. HTTP has the equivalent
+/// (`mid_stream_overrun_is_rejected_by_http_origin`); this is the
+/// S3 counterpart.
+#[tokio::test]
+async fn cache_engine_rejects_s3_body_larger_than_max_blob_bytes() -> anyhow::Result<()> {
+    // 4 MiB body, 1 MiB cap. The mock layer doesn't set
+    // Content-Length unless we provide one explicitly, so this
+    // exercises the running cap on streamed bytes (engine's
+    // `count_and_cap_stream`) rather than the adapter's
+    // pre-stream Content-Length short-circuit.
+    let payload = vec![0xCDu8; 4 * 1024 * 1024];
+    let hash = Hash::new(&payload);
+    let body = payload.clone();
+    let rule = mock!(Client::get_object).then_output(move || {
+        GetObjectOutput::builder()
+            .body(ByteStream::from(body.clone()))
+            .build()
+    });
+    let client = mock_s3_client(&[&rule]);
+    let origin: Arc<dyn Origin> = Arc::new(s3_origin(client, ""));
+
+    let tmp = tempfile::tempdir()?;
+    let engine = CacheEngine::open_full(
+        tmp.path(),
+        Some(origin),
+        1, // max_blob_size_mb = 1 MiB
+        decdn_cache::PinnedHashes::empty(),
+        RetryPolicy::disabled(),
+        None,
+    )
+    .await?;
+
+    let err = engine
+        .get(hash)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("oversize body must be rejected at engine cap"))?;
+    anyhow::ensure!(
+        matches!(err, CacheError::BlobTooLarge { .. }),
+        "expected BlobTooLarge from engine cap, got: {err:?}"
+    );
+    Ok(())
+}
+
 /// End-to-end `NotFound`: the engine surfaces `CacheError::NotFound`,
 /// not `CacheError::OriginError`. This is the contract the dispatch
 /// layer (and clients via the cdn/client/v1 ALPN) depend on for
