@@ -307,7 +307,6 @@ Sections above describe the full production design; PoC nodes do not implement a
 - Score clamping limits the damage from individual malicious reports
 - Cold-start bootstrap gives new nodes enough traffic to build a real track record
 - Decay prevents stale high scores from persisting indefinitely
-- Gauge-pool eligibility gating (Section 12) reuses the existing reputation surface to harden ADR 026's gauge formula against wash-traded byte counts, with no new scoring mechanism — the High/Medium/Low tiers are derived from `final_score` and add multiplicative cost (2× receipt requirement at Medium, full exclusion at Low) to operators with degraded service quality
 - Regional-coverage signal (Section 13) is exposed but not coupled to scoring or selection — downstream operational programs own deployment-grant decisions, keeping the reputation system narrowly focused on service-quality measurement
 
 ### Negative
@@ -319,5 +318,4 @@ Sections above describe the full production design; PoC nodes do not implement a
 - Gossip-based propagation adds bandwidth overhead: at 1,000 nodes with all reporters at max rate (10 reports/hr), each node receives ~10,000 reports/hr (~2 MB/hr ingress), which is modest relative to `NodeAnnounce` traffic (~48 MB/hr at 60-second intervals). The strict rate limits (Section 11) keep reputation gossip well-bounded. See [ADR 001, Gossip Bandwidth Analysis](001-network.md#gossip-bandwidth-analysis) for the combined budget
 - The 70/30 local/network split means a client's view of the network is biased toward its own usage patterns
 - Coordinated negative gossip reports could push an operator's reputation down unfairly, reducing their selection probability. Per-report clamping (Section 8) and the 3× reporter-weight cap (Section 4) limit the speed and magnitude of such attacks. Because reputation is not a gauge-eligibility gate (Section 12), an unfairly-docked operator still earns gauge proportional to their actual settled bytes (subject to the per-operator cap) — they only lose selection probability, which is a continuous penalty rather than a hard exclusion
-- Receipt-tier thresholds (`high_rep_threshold`, `medium_rep_threshold`) are governance-tunable, which means a hostile governance majority could in principle gate honest operators out of the gauge pool. The bounds in Section 12.1 (`high_rep_threshold` capped at 0.90) and the 48-hour timelock per [ADR 009](009-governance.md) are the primary defenses; operators can plan ve-lock and stake-management decisions around the bounded worst case
 - PoC uses local-only scores (no gossip, no decay, no per-report clamping) — see [Section 14](#14-poc-scope) for full PoC scope
