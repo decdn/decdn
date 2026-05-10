@@ -45,7 +45,8 @@ pub struct ResolvedBlockchain {
     /// `StakingRegistry` contract address.
     pub staking_registry_address: String,
     /// Seconds between RPC connectivity watchdog probes. `0` disables the
-    /// watchdog entirely.
+    /// watchdog entirely; otherwise the resolver enforces a minimum (see
+    /// `MIN_RPC_WATCHDOG_INTERVAL_SEC`).
     pub rpc_watchdog_interval_sec: u64,
 }
 

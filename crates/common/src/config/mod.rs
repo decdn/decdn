@@ -45,6 +45,10 @@ pub const DEFAULT_ADMIN_PORT: u16 = 9191;
 /// Default interval between RPC connectivity watchdog probes. `0`
 /// disables the watchdog; absent in config => this value.
 const DEFAULT_RPC_WATCHDOG_INTERVAL_SEC: u64 = 30;
+/// Minimum non-zero watchdog interval. Values below this would have
+/// the watchdog probing the RPC endpoint frequently enough to risk
+/// tripping provider rate limits or exhausting paid quotas.
+const MIN_RPC_WATCHDOG_INTERVAL_SEC: u64 = 10;
 /// Default interval between outgoing `NodeAnnounce` messages (ADR 001).
 const DEFAULT_ANNOUNCE_INTERVAL_SEC: u64 = 60;
 /// Default peer-table entry TTL after which a stale entry is evicted.
@@ -373,6 +377,13 @@ fn resolve_blockchain(
     let rpc_watchdog_interval_sec = file
         .and_then(|b| b.rpc_watchdog_interval_sec)
         .unwrap_or(DEFAULT_RPC_WATCHDOG_INTERVAL_SEC);
+    anyhow::ensure!(
+        rpc_watchdog_interval_sec == 0
+            || rpc_watchdog_interval_sec >= MIN_RPC_WATCHDOG_INTERVAL_SEC,
+        "blockchain.rpc_watchdog_interval_sec={rpc_watchdog_interval_sec} \
+         would flood the RPC endpoint (minimum {MIN_RPC_WATCHDOG_INTERVAL_SEC}s, \
+         or 0 to disable)"
+    );
 
     // CLI/env only — no TOML field. `expand_tilde` for parity with the
     // keystore path itself. Existence check is intentionally deferred to
@@ -4302,6 +4313,105 @@ mod tests {
         assert!(
             msg.contains("--rpc-url"),
             "empty rpc_url should surface as missing: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_rejects_small_nonzero_watchdog_interval() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            staking_registry_address: Some(GOOD_ADDR.to_string()),
+        };
+        let file = types::BlockchainConfig {
+            rpc_url: None,
+            eth_keystore: None,
+            payment_channel_address: None,
+            staking_registry_address: None,
+            rpc_watchdog_interval_sec: Some(1),
+        };
+        let Err(err) = resolve_blockchain(&cli, Some(&file), dir.path()) else {
+            anyhow::bail!("expected error when watchdog interval is below the minimum");
+        };
+        let msg = format!("{err:#}");
+        let expected_min = format!("minimum {MIN_RPC_WATCHDOG_INTERVAL_SEC}s");
+        assert!(
+            msg.contains("rpc_watchdog_interval_sec") && msg.contains(&expected_min),
+            "error should mention the field and the {expected_min} floor: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_accepts_zero_watchdog_interval() -> anyhow::Result<()> {
+        // `0` is the documented disable sentinel and must bypass the floor.
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            staking_registry_address: Some(GOOD_ADDR.to_string()),
+        };
+        let file = types::BlockchainConfig {
+            rpc_url: None,
+            eth_keystore: None,
+            payment_channel_address: None,
+            staking_registry_address: None,
+            rpc_watchdog_interval_sec: Some(0),
+        };
+        let resolved = resolve_blockchain(&cli, Some(&file), dir.path())?;
+        assert_eq!(resolved.rpc_watchdog_interval_sec, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_accepts_min_watchdog_interval() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            staking_registry_address: Some(GOOD_ADDR.to_string()),
+        };
+        let file = types::BlockchainConfig {
+            rpc_url: None,
+            eth_keystore: None,
+            payment_channel_address: None,
+            staking_registry_address: None,
+            rpc_watchdog_interval_sec: Some(MIN_RPC_WATCHDOG_INTERVAL_SEC),
+        };
+        let resolved = resolve_blockchain(&cli, Some(&file), dir.path())?;
+        assert_eq!(
+            resolved.rpc_watchdog_interval_sec,
+            MIN_RPC_WATCHDOG_INTERVAL_SEC
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_applies_default_watchdog_interval_when_absent() -> anyhow::Result<()> {
+        // Pins the no-config bootstrap path: if a future change moved
+        // DEFAULT below MIN (or to 0), every operator without an explicit
+        // setting would silently lose the watchdog. Mirrors the gossip
+        // analogue at `resolve_gossip_applies_defaults_when_absent`.
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            staking_registry_address: Some(GOOD_ADDR.to_string()),
+        };
+        let resolved = resolve_blockchain(&cli, None, dir.path())?;
+        assert_eq!(
+            resolved.rpc_watchdog_interval_sec,
+            DEFAULT_RPC_WATCHDOG_INTERVAL_SEC
         );
         Ok(())
     }
