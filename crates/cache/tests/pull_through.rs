@@ -172,7 +172,7 @@ impl Origin for OversizedOrigin {
     ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, decdn_cache::OriginPullError>> + Send + '_>>
     {
         let payload = self.payload.clone();
-        Box::pin(async move { Ok(OriginFetch::Found(payload)) })
+        Box::pin(async move { Ok(OriginFetch::found_one_shot(payload)) })
     }
 }
 
@@ -1600,7 +1600,7 @@ impl Origin for FailingThenSucceedingOrigin {
                     "synthetic transient failure {prior}"
                 )))
             } else if hash == target {
-                Ok(OriginFetch::Found(payload))
+                Ok(OriginFetch::found_one_shot(payload))
             } else {
                 Ok(OriginFetch::NotFound)
             }

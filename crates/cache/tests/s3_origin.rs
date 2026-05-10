@@ -91,12 +91,13 @@ async fn fetch_returns_origin_bytes_on_success() -> anyhow::Result<()> {
     let client = mock_s3_client(&[&rule]);
     let origin = s3_origin(client, "");
 
-    match origin.fetch(hash, 16 * 1024 * 1024).await? {
-        OriginFetch::Found(bytes) => {
-            anyhow::ensure!(&bytes[..] == payload, "got: {bytes:?}");
-        }
-        OriginFetch::NotFound => anyhow::bail!("expected Found, got NotFound"),
-    }
+    let bytes = origin
+        .fetch(hash, 16 * 1024 * 1024)
+        .await?
+        .collect_to_bytes()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("expected Found, got NotFound"))?;
+    anyhow::ensure!(&bytes[..] == payload, "got: {bytes:?}");
     anyhow::ensure!(rule.num_calls() == 1, "single fetch must hit the rule once");
     Ok(())
 }
@@ -116,7 +117,7 @@ async fn fetch_no_such_key_maps_to_not_found() -> anyhow::Result<()> {
 
     match origin.fetch(hash, 16 * 1024 * 1024).await? {
         OriginFetch::NotFound => Ok(()),
-        OriginFetch::Found(_) => anyhow::bail!("expected NotFound on NoSuchKey"),
+        OriginFetch::Found { .. } => anyhow::bail!("expected NotFound on NoSuchKey"),
     }
 }
 
@@ -140,7 +141,7 @@ async fn fetch_bare_http_404_maps_to_not_found() -> anyhow::Result<()> {
 
     match origin.fetch(hash, 16 * 1024 * 1024).await? {
         OriginFetch::NotFound => Ok(()),
-        OriginFetch::Found(_) => anyhow::bail!("expected NotFound on HTTP 404"),
+        OriginFetch::Found { .. } => anyhow::bail!("expected NotFound on HTTP 404"),
     }
 }
 
@@ -175,7 +176,7 @@ async fn fetch_404_with_no_such_bucket_is_permanent_not_not_found() -> anyhow::R
             "NoSuchBucket masked as NotFound — operator would see 'missing blob' \
              instead of the real config error. fix in classify_get_object_error."
         ),
-        Ok(OriginFetch::Found(_)) => anyhow::bail!("expected error, got Found"),
+        Ok(OriginFetch::Found { .. }) => anyhow::bail!("expected error, got Found"),
         Err(err) => {
             anyhow::ensure!(
                 matches!(err, OriginPullError::Permanent(_)),
@@ -418,13 +419,14 @@ async fn fetch_with_content_encoding_identity_is_accepted() -> anyhow::Result<()
     let client = mock_s3_client(&[&rule]);
     let origin = s3_origin(client, "");
 
-    match origin.fetch(hash, 16 * 1024 * 1024).await? {
-        OriginFetch::Found(bytes) => {
-            anyhow::ensure!(&bytes[..] == payload);
-            Ok(())
-        }
-        OriginFetch::NotFound => anyhow::bail!("expected Found"),
-    }
+    let bytes = origin
+        .fetch(hash, 16 * 1024 * 1024)
+        .await?
+        .collect_to_bytes()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("expected Found"))?;
+    anyhow::ensure!(&bytes[..] == payload);
+    Ok(())
 }
 
 /// Bodies larger than `max_bytes` are rejected with `Permanent`. The
@@ -496,12 +498,13 @@ async fn fetch_applies_prefix_with_sharded_key_layout() -> anyhow::Result<()> {
     let client = mock_s3_client_match_any(&[&rule]);
     let origin = s3_origin(client, prefix);
 
-    match origin.fetch(hash, 16 * 1024 * 1024).await? {
-        OriginFetch::Found(bytes) => {
-            anyhow::ensure!(&bytes[..] == payload);
-        }
-        OriginFetch::NotFound => anyhow::bail!("expected Found"),
-    }
+    let bytes = origin
+        .fetch(hash, 16 * 1024 * 1024)
+        .await?
+        .collect_to_bytes()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("expected Found"))?;
+    anyhow::ensure!(&bytes[..] == payload);
     anyhow::ensure!(rule.num_calls() == 1, "rule must match the prefixed key");
     Ok(())
 }

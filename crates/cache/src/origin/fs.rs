@@ -223,7 +223,12 @@ impl Origin for FilesystemOrigin {
                     canonical.display()
                 )));
             }
-            Ok(OriginFetch::Found(Bytes::from(data)))
+            // PR 1 shim (issue #271): the body still buffers fully here.
+            // PR 2 cuts the read-and-collect step over to a `ReaderStream`
+            // wrapping the same `File::take(max_bytes + 1)` so the running
+            // cap and TOCTOU posture survive without any change in
+            // semantics — only the memory footprint shrinks.
+            Ok(OriginFetch::found_one_shot(Bytes::from(data)))
         })
     }
 }
@@ -342,12 +347,11 @@ mod tests {
         tokio::fs::symlink(&real_file, &link).await?;
 
         let fetched = origin.fetch(hash, 1024).await?;
-        match fetched {
-            OriginFetch::Found(bytes) => {
-                anyhow::ensure!(bytes.as_ref() == b"hello", "got: {bytes:?}");
-            }
-            OriginFetch::NotFound => anyhow::bail!("expected Found, got NotFound"),
-        }
+        let bytes = fetched
+            .collect_to_bytes()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("expected Found, got NotFound"))?;
+        anyhow::ensure!(bytes.as_ref() == b"hello", "got: {bytes:?}");
         Ok(())
     }
 
@@ -361,7 +365,7 @@ mod tests {
         let hash = Hash::new(b"marker");
         match origin.fetch(hash, 1024).await? {
             OriginFetch::NotFound => Ok(()),
-            OriginFetch::Found(_) => anyhow::bail!("expected NotFound"),
+            OriginFetch::Found { .. } => anyhow::bail!("expected NotFound"),
         }
     }
 }
