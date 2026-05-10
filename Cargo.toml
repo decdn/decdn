@@ -74,6 +74,15 @@ rpassword = "7"
 url = "2"
 zeroize = "1"
 
+# Streaming primitives for the cache origin pull-through (issue #271). `futures-util`
+# gives us `Stream` / `stream::unfold` / `StreamExt` without the kitchen-sink
+# `futures` umbrella crate (already transitively in the tree via reqwest);
+# `tokio-util` provides `ReaderStream` / `StreamReader` for the
+# AsyncRead↔Stream<Bytes> bridges used by FilesystemOrigin and the
+# decompression pipeline.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+tokio-util = { version = "0.7", features = ["io"] }
+
 # Bundle creation (`decdn bundle create`, issue #391):
 # walkdir for stable directory traversal, globset for `--exclude` patterns,
 # blake3 direct so the publisher CLI doesn't have to pull iroh-blobs.

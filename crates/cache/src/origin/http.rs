@@ -589,7 +589,10 @@ impl Origin for HttpOrigin {
                         .into(),
                     ));
                 }
-                return Ok(OriginFetch::Found(raw));
+                // PR 1 shim (issue #271): still buffered. PR 3 replaces
+                // the chunk-loop with a `stream::unfold` that propagates
+                // chunks straight to the engine.
+                return Ok(OriginFetch::found_one_shot(raw));
             }
             // Sync decompression on big payloads would block a tokio
             // worker the same way BLAKE3 does (engine.rs uses
@@ -628,7 +631,10 @@ impl Origin for HttpOrigin {
                     }
                 }
             };
-            Ok(OriginFetch::Found(decoded))
+            // PR 1 shim (issue #271): full-buffer return. PR 3 collapses
+            // the decompression branch into an in-stream
+            // `async-compression` pipeline.
+            Ok(OriginFetch::found_one_shot(decoded))
         })
     }
 }

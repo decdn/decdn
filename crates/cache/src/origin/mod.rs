@@ -12,6 +12,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use bytes::Bytes;
+use futures_util::Stream;
 use iroh_blobs::Hash;
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +21,28 @@ pub use http::{DEFAULT_USER_AGENT, DecompressMode, HttpOrigin, OriginUrl, parse_
 pub use s3::{S3Credentials, S3Origin, S3OriginConfig};
 
 use crate::error::OriginPullError;
+
+/// Boxed byte stream returned by [`Origin::fetch`]. Each [`Bytes`] item is
+/// one chunk of the blob's payload; the stream completes when the origin
+/// signals end-of-data.
+///
+/// The bound matches [`iroh_blobs::api::blobs::Blobs::add_stream`]: `Send +
+/// Sync + 'static` so the engine can hand the stream straight through to
+/// the store layer without an intermediate buffer. `'static` means impls
+/// move whatever per-fetch state they hold (file handle, HTTP response,
+/// S3 `ByteStream`) into the stream by `move`-into-async-block; nothing
+/// borrows from `&self` on the origin.
+///
+/// Errors flow as `io::Error`. **They do not feed
+/// [`crate::retry::retry_fetch`]'s transient/permanent classification** —
+/// retry runs around the call to `fetch`, so any error a stream emits
+/// after `fetch` returned `Ok` reaches the engine via
+/// [`crate::CacheError::OriginError`] without going through retry.
+/// Headers-phase failures stay in each adapter's `Origin::fetch` body,
+/// where transient/permanent classification is meaningful and
+/// retry-eligible.
+pub type OriginByteStream =
+    Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send + Sync + 'static>>;
 
 /// Tag identifying which [`Origin`] backend a [`crate::CacheEngine`] is
 /// configured against (#439). Surfaced through
@@ -65,12 +88,102 @@ impl std::fmt::Display for OriginKind {
 }
 
 /// Result of an [`Origin::fetch`] call.
-#[derive(Debug)]
+///
+/// `Found` carries a streaming primitive (issue #271) so PRs 2-4 can pipe
+/// origin bytes straight into [`iroh_blobs::api::blobs::Blobs::add_stream`].
+/// **In PR 1 the engine still drains the stream via
+/// [`OriginFetch::collect_to_bytes`]** before re-entering the buffered
+/// `add_bytes` path — the adapters wrap their existing buffered payload
+/// via [`OriginFetch::found_one_shot`], so memory savings only land in
+/// PR 2 onward. `size_hint` carries the adapter's best-effort length
+/// advertisement (HTTP `Content-Length`, filesystem `metadata().len()`,
+/// S3 `content_length()`); the PR 2 engine uses it for short-circuit
+/// cap checks before reading the first byte. PR 1 ignores it apart from
+/// pre-sizing the collect-to-bytes buffer (capped to bound `DoS`).
 pub enum OriginFetch {
-    /// The origin returned the bytes for this hash.
-    Found(Bytes),
+    /// The origin returned the bytes for this hash as a stream of chunks.
+    Found {
+        /// Chunked byte stream. See [`OriginByteStream`] for the bounds.
+        stream: OriginByteStream,
+        /// Best-effort upfront size estimate from the adapter. Used by
+        /// the PR 2 engine for the short-circuit cap check before
+        /// reading the first byte; the engine still re-checks the
+        /// running total as chunks arrive.
+        size_hint: Option<u64>,
+    },
     /// The origin reported the object does not exist (e.g. HTTP 404).
     NotFound,
+}
+
+impl std::fmt::Debug for OriginFetch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Found { size_hint, .. } => f
+                .debug_struct("Found")
+                .field("size_hint", size_hint)
+                .finish_non_exhaustive(),
+            Self::NotFound => f.write_str("NotFound"),
+        }
+    }
+}
+
+impl OriginFetch {
+    /// Wrap a fully-buffered `Bytes` payload as a single-chunk
+    /// [`OriginFetch::Found`]. Used by adapters during the PR-1 trait
+    /// migration (issue #271) and by test mocks that have the whole
+    /// payload in hand. Real streaming adapters land in PR 2-4 and use
+    /// adapter-specific stream constructors directly.
+    #[must_use]
+    pub fn found_one_shot(bytes: Bytes) -> Self {
+        let size_hint = u64::try_from(bytes.len()).ok();
+        let stream = futures_util::stream::once(async move { Ok(bytes) });
+        Self::Found {
+            stream: Box::pin(stream),
+            size_hint,
+        }
+    }
+
+    /// Drain the stream into a single [`Bytes`] for tests and the
+    /// engine's transitional buffered path. Returns `Ok(None)` for
+    /// `NotFound`, `Ok(Some(bytes))` for `Found`.
+    ///
+    /// `cfg(any(test, feature = "test-support"))` would normally gate
+    /// this — it stays `pub` (un-gated) for now because the engine's
+    /// PR-1 transitional `pull_through` calls it on the production
+    /// path; PR 2 removes that call site and gates this helper behind
+    /// `cfg(test)`.
+    pub async fn collect_to_bytes(self) -> Result<Option<Bytes>, std::io::Error> {
+        // Bound the upfront allocation regardless of `size_hint`. A
+        // hostile origin advertising `Content-Length: 10 TiB` would
+        // otherwise cause `BytesMut::with_capacity` to commit a huge
+        // virtual region before the first byte arrives — the engine's
+        // running cap on the streamed bytes catches the actual
+        // overrun, but the per-fetch initial allocation is the
+        // operator-visible DoS axis we still have to bound here. 1
+        // MiB matches the pre-PR-1 `INITIAL_READ_CAP_HINT` that
+        // `FilesystemOrigin` used for the same reason; the buffer
+        // grows incrementally past it as chunks arrive.
+        const INITIAL_CAP: usize = 1 << 20; // 1 MiB
+        use bytes::BytesMut;
+        use futures_util::StreamExt;
+        match self {
+            Self::NotFound => Ok(None),
+            Self::Found {
+                mut stream,
+                size_hint,
+            } => {
+                let cap = size_hint
+                    .and_then(|n| usize::try_from(n).ok())
+                    .unwrap_or(0)
+                    .min(INITIAL_CAP);
+                let mut buf = BytesMut::with_capacity(cap);
+                while let Some(chunk) = stream.next().await {
+                    buf.extend_from_slice(&chunk?);
+                }
+                Ok(Some(buf.freeze()))
+            }
+        }
+    }
 }
 
 /// An origin backend. Implementors fetch a blob identified by its BLAKE3 hash.

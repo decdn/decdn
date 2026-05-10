@@ -19,6 +19,12 @@ chacha20poly1305 = { workspace = true }
 bytes = { workspace = true }
 serde = { workspace = true }
 reqwest = { workspace = true }
+# Streaming primitives for origin pull-through (issue #271). `futures-util`
+# brings `Stream` + combinators; `tokio-util` brings `ReaderStream` /
+# `StreamReader` used by FilesystemOrigin and the HTTP decompression
+# pipeline. Both are MIT/Apache-2.0, allowed by deny.toml.
+futures-util = { workspace = true }
+tokio-util = { workspace = true }
 # Decompression for HttpOrigin (#312). flate2 covers gzip; zstd covers zstd.
 # Both are MIT/Apache-2.0, allowed by deny.toml.
 flate2 = "1"

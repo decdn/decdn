@@ -634,7 +634,7 @@ mod tests {
                 >,
             > {
                 let result = if hash == self.hash {
-                    Ok(decdn_cache::OriginFetch::Found(self.data.clone()))
+                    Ok(decdn_cache::OriginFetch::found_one_shot(self.data.clone()))
                 } else {
                     Ok(decdn_cache::OriginFetch::NotFound)
                 };
@@ -770,7 +770,7 @@ mod tests {
                 >,
             > {
                 let result = if hash == self.hash {
-                    Ok(decdn_cache::OriginFetch::Found(self.data.clone()))
+                    Ok(decdn_cache::OriginFetch::found_one_shot(self.data.clone()))
                 } else {
                     Ok(decdn_cache::OriginFetch::NotFound)
                 };
@@ -885,7 +885,7 @@ mod tests {
                 >,
             > {
                 let result = if hash == self.hash {
-                    Ok(decdn_cache::OriginFetch::Found(self.data.clone()))
+                    Ok(decdn_cache::OriginFetch::found_one_shot(self.data.clone()))
                 } else {
                     Ok(decdn_cache::OriginFetch::NotFound)
                 };

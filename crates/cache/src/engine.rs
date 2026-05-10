@@ -15,7 +15,7 @@ use tokio::sync::Notify;
 
 use crate::error::{CacheError, CacheResult};
 use crate::metrics::CacheMetrics;
-use crate::origin::{Origin, OriginFetch, OriginKind};
+use crate::origin::{Origin, OriginKind};
 use crate::retry::{RetryPolicy, retry_fetch};
 
 /// Engine bundling a filesystem-backed iroh-blobs store with an optional
@@ -944,9 +944,22 @@ impl CacheEngine {
             source: e.into_inner(),
         })?;
 
-        let bytes = match fetch {
-            OriginFetch::NotFound => return Err(CacheError::NotFound { hash }),
-            OriginFetch::Found(b) => b,
+        // PR 1 shim (issue #271): the engine collapses the streaming
+        // `OriginFetch::Found` back to `Bytes` here so the rest of
+        // pull_through can keep using the size-cap → BLAKE3-verify →
+        // `add_bytes` flow unchanged. PR 2 replaces this collect step
+        // with a tee'd `add_stream` and drops the explicit BLAKE3
+        // verification (the AddProgress hash is the verification).
+        let bytes = match fetch.collect_to_bytes().await {
+            Ok(Some(b)) => b,
+            Ok(None) => return Err(CacheError::NotFound { hash }),
+            Err(io_err) => {
+                return Err(CacheError::OriginError {
+                    hash,
+                    source: anyhow::Error::from(io_err)
+                        .context("origin stream collect failed during pull-through"),
+                });
+            }
         };
 
         // Origin egress is paid the moment bytes arrive — count before
@@ -1064,7 +1077,7 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, crate::OriginPullError>> + Send + '_>>
         {
             let result = if hash == self.hash {
-                Ok(OriginFetch::Found(self.data.clone()))
+                Ok(OriginFetch::found_one_shot(self.data.clone()))
             } else {
                 Ok(OriginFetch::NotFound)
             };
@@ -1215,7 +1228,7 @@ mod tests {
         {
             self.fetch_count.fetch_add(1, Ordering::SeqCst);
             let result = if hash == self.hash {
-                Ok(OriginFetch::Found(self.data.clone()))
+                Ok(OriginFetch::found_one_shot(self.data.clone()))
             } else {
                 Ok(OriginFetch::NotFound)
             };

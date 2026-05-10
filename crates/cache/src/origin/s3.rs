@@ -558,9 +558,13 @@ impl Origin for S3Origin {
                 )));
             }
 
-            // `into_bytes()` already returns `bytes::Bytes`; just hand it on
-            // to `OriginFetch::Found` (no extra clone or wrap).
-            Ok(OriginFetch::Found(body))
+            // PR 1 shim (issue #271): the body is still fully collected
+            // here. PR 4 swaps `body.collect()` for an `unfold`-driven
+            // wrap of the underlying `ByteStream`, which already
+            // implements `futures::Stream<Item = Result<Bytes, _>>`, so
+            // chunks reach the engine without ever sitting in memory in
+            // full.
+            Ok(OriginFetch::found_one_shot(body))
         })
     }
 }

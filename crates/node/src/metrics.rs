@@ -437,7 +437,7 @@ mod tests {
                 >,
             > {
                 let result = if hash == self.hash {
-                    Ok(OriginFetch::Found(self.data.clone()))
+                    Ok(OriginFetch::found_one_shot(self.data.clone()))
                 } else {
                     Ok(OriginFetch::NotFound)
                 };
