@@ -61,7 +61,8 @@ pub struct BlockchainConfig {
     /// `StakingRegistry` contract address.
     pub staking_registry_address: Option<String>,
     /// Seconds between RPC connectivity watchdog probes. `0` disables the
-    /// watchdog entirely; absent => default (30s).
+    /// watchdog entirely; absent => default (30s). Non-zero values below
+    /// `MIN_RPC_WATCHDOG_INTERVAL_SEC` are rejected at config resolution.
     pub rpc_watchdog_interval_sec: Option<u64>,
 }
 
