@@ -66,11 +66,14 @@ const DEFAULT_PER_SOURCE_BURST: u32 = 200;
 /// Default hard cap on tracked source entries in the keyed limiter.
 const DEFAULT_MAX_TRACKED_SOURCES: usize = 4096;
 /// Default interval between iroh-blobs GC sweeps in seconds (#518). Five
-/// minutes balances the hostile-origin amplification window (a stuck
-/// upload can leak up to `gc_interval_sec * max_blob_size_mb` of disk
-/// before reclaim) against the per-sweep cost of walking the blob list.
-/// Operators on lean disks can tune lower; setting to `0` disables the
-/// periodic sweep entirely.
+/// minutes balances the hostile-origin amplification window against the
+/// per-sweep cost of walking the blob list. The window matters because
+/// a single failed pull-through orphans up to `max_blob_size_mb`
+/// (one upload-per-request bound, not multiplied by the interval), but
+/// a stream of failed requests inside one interval compounds: total
+/// leak before reclaim is bounded by `requests_in_window * max_blob_size_mb`.
+/// Tuning the interval down shrinks that window. Operators on lean disks
+/// can tune lower; setting to `0` disables the periodic sweep entirely.
 pub const DEFAULT_GC_INTERVAL_SEC: u64 = 300;
 
 /// Load config from file (if present) and merge with CLI args.

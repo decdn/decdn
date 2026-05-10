@@ -535,8 +535,8 @@ async fn gc_protect_inner(
     };
 
     if let Some(m) = metrics.as_ref() {
-        m.gc_runs_total.inc();
-        m.gc_bytes_reclaimed_total.inc_by(reclaimed_bytes);
+        m.gc_runs.inc();
+        m.gc_bytes_reclaimed.inc_by(reclaimed_bytes);
     }
 }
 
@@ -694,8 +694,8 @@ impl CacheEngine {
         // other public delete path: `Blobs::delete` is `pub(crate)` in
         // iroh-blobs 0.100). Bytes for that diff is what the previous
         // sweep reclaimed; we attribute it on the *current* cb fire.
-        // First-cycle fires bump `gc_runs_total` but emit zero
-        // `gc_bytes_reclaimed_total` because there is no prior snapshot.
+        // First-cycle fires bump the runs counter but emit zero on
+        // the reclaim counter because there is no prior snapshot.
         let prev_pre_sweep: Arc<Mutex<HashMap<Hash, u64>>> = Arc::new(Mutex::new(HashMap::new()));
 
         let mut options = FsStoreOptions::new(cache_dir);

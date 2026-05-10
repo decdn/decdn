@@ -96,7 +96,11 @@ pub struct CacheMetrics {
     /// `cache.gc_interval_sec` means the periodic loop never spawned,
     /// or the snapshot has been failing on every cycle (the engine
     /// emits a `tracing::warn!` when that happens).
-    pub gc_runs_total: Counter,
+    ///
+    /// Field name omits `_total`: the `OpenMetrics` encoder appends it
+    /// automatically (`iroh-metrics` 0.38.3 `encoding.rs:490`), so the
+    /// emitted name is `decdn_cache_gc_runs_total`.
+    pub gc_runs: Counter,
     /// Bytes reclaimed by the iroh-blobs GC, attributed across cycles
     /// (#518). Computed as the pre-sweep blob-set diff between the
     /// previous cycle and the current cycle: hashes that vanish across
@@ -112,5 +116,9 @@ pub struct CacheMetrics {
     /// reflects the previous sweep's reclaim. For an alert window
     /// shorter than `2 * cache.gc_interval_sec` the reading will be
     /// noisy.
-    pub gc_bytes_reclaimed_total: Counter,
+    ///
+    /// Field name omits `_total`: the `OpenMetrics` encoder appends it
+    /// automatically, so the emitted name is
+    /// `decdn_cache_gc_bytes_reclaimed_total`.
+    pub gc_bytes_reclaimed: Counter,
 }

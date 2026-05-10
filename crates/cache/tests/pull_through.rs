@@ -191,7 +191,7 @@ async fn gc_reclaims_partial_import_bytes() -> anyhow::Result<()> {
     while std::time::Instant::now() < deadline {
         tokio::time::sleep(gc_interval).await;
         let post = engine.inspect(actual).await?;
-        if post.size_bytes.is_none() && metrics.gc_bytes_reclaimed_total.get() > 0 {
+        if post.size_bytes.is_none() && metrics.gc_bytes_reclaimed.get() > 0 {
             break;
         }
     }
@@ -203,16 +203,16 @@ async fn gc_reclaims_partial_import_bytes() -> anyhow::Result<()> {
         post.size_bytes
     );
     anyhow::ensure!(
-        metrics.gc_runs_total.get() >= 1,
+        metrics.gc_runs.get() >= 1,
         "gc_runs_total should be >=1 after the periodic loop has fired; got {}",
-        metrics.gc_runs_total.get()
+        metrics.gc_runs.get()
     );
     anyhow::ensure!(
-        metrics.gc_bytes_reclaimed_total.get() >= mismatched_payload.len() as u64,
+        metrics.gc_bytes_reclaimed.get() >= mismatched_payload.len() as u64,
         "gc_bytes_reclaimed_total should cover at least the mismatched payload \
          ({} bytes); got {}",
         mismatched_payload.len(),
-        metrics.gc_bytes_reclaimed_total.get()
+        metrics.gc_bytes_reclaimed.get()
     );
 
     Ok(())
@@ -265,7 +265,7 @@ async fn gc_attribution_lags_one_cycle() -> anyhow::Result<()> {
     // Poll for cycle 1 to fire. The cb bumps gc_runs_total once per
     // sweep, so the transition 0 -> 1 marks cycle 1 completion.
     let cycle1_deadline = std::time::Instant::now() + gc_interval * 4;
-    while metrics.gc_runs_total.get() < 1 {
+    while metrics.gc_runs.get() < 1 {
         anyhow::ensure!(
             std::time::Instant::now() < cycle1_deadline,
             "cycle 1 did not fire within {}ms",
@@ -279,14 +279,14 @@ async fn gc_attribution_lags_one_cycle() -> anyhow::Result<()> {
     // has already taken its cycle-1 contribution (which must be 0 —
     // no prior baseline to diff against).
     anyhow::ensure!(
-        metrics.gc_bytes_reclaimed_total.get() == 0,
+        metrics.gc_bytes_reclaimed.get() == 0,
         "after cycle 1, gc_bytes_reclaimed_total must be 0 (no prior baseline to diff against); got {}",
-        metrics.gc_bytes_reclaimed_total.get()
+        metrics.gc_bytes_reclaimed.get()
     );
 
     // Poll for cycle 2.
     let cycle2_deadline = std::time::Instant::now() + gc_interval * 4;
-    while metrics.gc_runs_total.get() < 2 {
+    while metrics.gc_runs.get() < 2 {
         anyhow::ensure!(
             std::time::Instant::now() < cycle2_deadline,
             "cycle 2 did not fire within {}ms after cycle 1",
@@ -295,7 +295,7 @@ async fn gc_attribution_lags_one_cycle() -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     anyhow::ensure!(
-        metrics.gc_bytes_reclaimed_total.get() > 0,
+        metrics.gc_bytes_reclaimed.get() > 0,
         "cycle 2 must attribute cycle-1's reclaim; got 0 bytes after 2 cycles"
     );
 
@@ -347,15 +347,15 @@ async fn gc_reclaims_cap_breach_partial_bytes() -> anyhow::Result<()> {
     let deadline = std::time::Instant::now() + gc_interval * 16;
     while std::time::Instant::now() < deadline {
         tokio::time::sleep(gc_interval).await;
-        if metrics.gc_bytes_reclaimed_total.get() > 0 {
+        if metrics.gc_bytes_reclaimed.get() > 0 {
             break;
         }
     }
 
     anyhow::ensure!(
-        metrics.gc_runs_total.get() >= 1,
+        metrics.gc_runs.get() >= 1,
         "gc_runs_total should be >=1 after the periodic loop has fired; got {}",
-        metrics.gc_runs_total.get()
+        metrics.gc_runs.get()
     );
     // We don't assert an exact byte count — `count_and_cap_stream`
     // can terminate the upstream slightly past `max_blob_bytes`
@@ -364,9 +364,9 @@ async fn gc_reclaims_cap_breach_partial_bytes() -> anyhow::Result<()> {
     // that the metric is *nonzero*: GC is reclaiming partial-import
     // bytes from this code path.
     anyhow::ensure!(
-        metrics.gc_bytes_reclaimed_total.get() > 0,
+        metrics.gc_bytes_reclaimed.get() > 0,
         "gc_bytes_reclaimed_total should be nonzero after cap-breach + GC; got {}",
-        metrics.gc_bytes_reclaimed_total.get()
+        metrics.gc_bytes_reclaimed.get()
     );
 
     Ok(())
@@ -423,14 +423,14 @@ async fn gc_disabled_does_not_reclaim_or_emit_metrics() -> anyhow::Result<()> {
         "actual-hash bytes must remain on disk when GC is disabled; got size_bytes = None"
     );
     anyhow::ensure!(
-        metrics.gc_runs_total.get() == 0,
+        metrics.gc_runs.get() == 0,
         "gc_runs_total must stay at 0 when GC is disabled; got {}",
-        metrics.gc_runs_total.get()
+        metrics.gc_runs.get()
     );
     anyhow::ensure!(
-        metrics.gc_bytes_reclaimed_total.get() == 0,
+        metrics.gc_bytes_reclaimed.get() == 0,
         "gc_bytes_reclaimed_total must stay at 0 when GC is disabled; got {}",
-        metrics.gc_bytes_reclaimed_total.get()
+        metrics.gc_bytes_reclaimed.get()
     );
 
     Ok(())
