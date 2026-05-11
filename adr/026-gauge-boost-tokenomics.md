@@ -299,6 +299,18 @@ Disbursements require all of:
 
 No path exists for unattested payouts; the `payout(bundleHash, recipient, amount)` entry point checks all four gates. Sizing analysis (number of $100K and $1M incidents covered per year per scenario) lives in the economic-model spec §7; this ADR does not duplicate the table.
 
+#### Cross-category payout ordering
+
+When `SafetyReserve` solvency is insufficient to immediately fund every authorized disbursement — most plausibly during a correlated-outage window combining slash-restitution appeals (per [ADR 028 §5](028-slashing-appeals.md#5-hard-caps-and-frequency-limits)) with concurrent SLA-breach payouts — the unfunded portion of each authorization is recorded as a *pending claim* and disbursed once solvency permits. Pending claims are paid **epoch-FIFO across all payout categories**: the queue is ordered by the epoch in which the claim accrued (the epoch of the originating `payout()` authorization that hit insolvency), and ties within an epoch resolve deterministically on `(IncidentReason enum value asc, recipient address asc)`. No payout category has cross-category priority over another, and the multisig's authorization order does not change queue position — once authorized, position is fixed by accrual epoch.
+
+This is contract-enforced via a single queue keyed by `(accrualEpoch, IncidentReason, recipient)`; the exact storage shape lives in the SafetyReserve contract-implementation ADR. Three properties follow:
+
+- **Determinism without per-category priority.** No constituency (slash-appellants, SLA-breach claimants, future incident-response integrations) is privileged over another; queue position depends only on when the claim accrued. This avoids encoding inter-category preferences into the contract that the protocol has no governance mandate to set.
+- **No multisig-as-orderer hazard.** Authorization order (the sequence in which `SafetyReserve.payout()` is called or the multisig fast-tracks an appeal) does not affect queue position once accrual epoch is fixed. This closes the "political ordering by multisig" failure mode that an authorization-order queue would create.
+- **Forward-compatible with new payout categories.** Future incident-response contracts that integrate via the stable `payout(bundleHash, recipient, amount)` interface inherit the same queue semantics without amending this ADR; new `IncidentReason` enum members extend the tiebreaker domain by their enum value.
+
+The four payout gates from [Spending controls](#spending-controls) above continue to apply to each pending claim at disbursement time — epoch-FIFO determines *order*, not authorization. A pending claim whose post-incident-reporting record has not been published, for example, remains unpayable even at the head of the queue until that gate is satisfied.
+
 #### Interface stability
 
 The `payout(bundleHash, recipient, amount)` signature is contract-stable: future incident-response tooling, insurance products, and SLA-style contracts integrate via this entry point without contract changes. Evidence formats live off-chain and are referenced by hash on-chain; the contract enforces the four payout gates uniformly regardless of caller identity (subject to `AccessControl` role grants per [ADR 016 §5](016-contract-interactions.md#5-access-control-matrix)).

@@ -170,7 +170,12 @@ All challenge types MUST validate evidence age using a skew-safe comparison. Let
 
 ##### Interaction with unbonding period
 
-`MAX_EVIDENCE_AGE_US` MUST be strictly less than the `StakingRegistry.unbondingPeriod` (converted to microseconds). If evidence can be older than the unbonding period, a node could commit an offense, immediately initiate unstaking, and complete withdrawal before the evidence is submitted — avoiding the slash entirely. With PoC defaults (evidence age: 5 days, unbonding: 7 days), this invariant is satisfied with a 2-day margin. The safety bounds ([1 day, 30 days] for evidence age vs [3 days, 30 days] for unbonding per [ADR 009](009-governance.md)) permit governance to violate this invariant — implementations SHOULD enforce `MAX_EVIDENCE_AGE_US < unbondingPeriod` whenever `MAX_EVIDENCE_AGE_US` is configured or updated, including at initialization and in any governance-controlled reconfiguration path.
+`MAX_EVIDENCE_AGE_US` MUST be strictly less than the `StakingRegistry.unbondingPeriod` (converted to microseconds). If evidence can be older than the unbonding period, a node could commit an offense, immediately initiate unstaking, and complete withdrawal before the evidence is submitted — avoiding the slash entirely. With PoC defaults (evidence age: 5 days, unbonding: 7 days), this invariant is satisfied with a 2-day margin. The safety bounds ([1 day, 30 days] for evidence age vs [3 days, 30 days] for unbonding per [ADR 009](009-governance.md)) admit configurations that would violate this invariant in isolation, so both setters enforce it as a paired cross-parameter check at the contract layer:
+
+- `SlashJudge.setMaxEvidenceAge(uint256 newValueUs)` MUST revert if `newValueUs >= StakingRegistry.unbondingPeriod * 1_000_000` (or the integer-overflow-safe equivalent), in addition to the [1 day, 30 days] individual bound.
+- `StakingRegistry.setUnbondingPeriod(uint256 newValueSeconds)` MUST revert if `newValueSeconds * 1_000_000 <= SlashJudge.maxEvidenceAgeUs`, in addition to the [3 days, 30 days] individual bound.
+
+The check applies at initialization as well — neither contract may be deployed with an initial pair that violates the invariant. This matches the cross-parameter setter pattern used elsewhere in the protocol (see [ADR 009 § Governable Parameters with Safety Bounds](009-governance.md#governable-parameters-with-safety-bounds): `OriginAssignment.minRedundancy ≤ maxOriginsPerNamespace`; [ADR 026 §11](026-gauge-boost-tokenomics.md#11-governable-parameters-with-safety-bounds): the FeeRouter sum-to-100% invariant) — invariants between parameters with a genuine ordering relationship are contract-enforced, not implementation-enforced.
 
 **Rate manipulation:** 1–3. Same `SignatureChecker` verification and identity check as phantom
 4. Verify `streamResponse.rate_per_mb > probeResponse.rate_per_mb`
@@ -220,6 +225,16 @@ The companion `SafetyReserve` events (`SlashAppealOpened`, `SlashAppealRatified`
 | `Slashed` event emit | ~5k–7k | `nextSlashId++` (cold SLOAD + non-zero→non-zero SSTORE on first emit per tx, ~5k post-EIP-2929) + LOG3 base + 3 stack topics (event signature + 2 indexed) + 96 bytes non-indexed data (~2k); negligible vs the surrounding `StakingRegistry.slash()`. The very first `Slashed` ever emitted on a fresh deployment pays an additional ~17k for the 0→non-zero `nextSlashId` SSTORE. |
 
 Using secp256k1 EIP-712 for `slash_sig` keeps per-signature verification at ~3k gas via `ecrecover`, against the ~500k–1M gas a Solidity Ed25519 library would require — making routine slashing economically viable.
+
+#### Governable Parameters with Safety Bounds
+
+| Parameter | Contract | Default | Min | Max | Cross-parameter invariant |
+| --- | --- | ---: | ---: | ---: | --- |
+| `MAX_EVIDENCE_AGE_US` | `SlashJudge` | 5 days | 1 day | 30 days | `< StakingRegistry.unbondingPeriod` (paired) |
+| `MAX_FUTURE_SKEW_US` | `SlashJudge` | 60 s | (fixed) | (fixed) | — |
+| Challenge bond | `SlashJudge` | (per [ADR 009](009-governance.md#governable-parameters-with-safety-bounds)) | 1 TOKEN | 1,000 TOKEN | — |
+
+The `MAX_EVIDENCE_AGE_US < unbondingPeriod` invariant is paired across two contracts. Setter paths on both `SlashJudge` and `StakingRegistry` enforce the post-update inequality at the contract layer (see [Interaction with unbonding period](#interaction-with-unbonding-period) for the exact revert conditions); updates that would violate it revert atomically with the setter call. `MAX_FUTURE_SKEW_US` is fixed at 60 seconds at deployment and is not governable — it absorbs NTP drift between the challenger and the evidence-signing node and has no economic surface that varies by network conditions. Challenge bond bounds are canonical in [ADR 009](009-governance.md#governable-parameters-with-safety-bounds); they are listed here for completeness.
 
 ### 3. Integration with Existing Contracts
 
