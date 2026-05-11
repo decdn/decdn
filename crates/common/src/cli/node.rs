@@ -63,6 +63,13 @@ pub enum NodeCommand {
     /// via process exit (systemd/K8s will notice) or by polling `decdn
     /// node health` until the connection is refused.
     Drain(DrainArgs),
+    /// Render a live (every `--interval-ms`) view of node activity by
+    /// scraping the running node's `/metrics` HTTP endpoint (issue
+    /// #275). Shows active streams, cache hit rate, and cache bytes
+    /// returned — the operator-visible signal the issue calls "bytes
+    /// served" maps to `decdn_cache_bytes_returned_total` until the
+    /// network-side `cdn/client/v1` egress counter (#317) lands.
+    Top(TopArgs),
 }
 
 /// `decdn node health` — report identity (hex `node_id`) and process
@@ -258,6 +265,52 @@ pub struct PeersArgs {
     pub json: bool,
 
     /// Roundtrip timeout in milliseconds.
+    #[arg(long, value_name = "MS", default_value_t = 5_000)]
+    pub timeout_ms: u64,
+}
+
+/// `decdn node top` — live metrics view (issue #275).
+///
+/// Polls the daemon's loopback `/metrics` HTTP endpoint every
+/// `--interval-ms` and redraws a fixed-column table with current
+/// gauges, per-second counter deltas, and a derived cache hit-rate.
+/// The metrics port is loopback-only by default
+/// (`observability.metrics_bind = 127.0.0.1`); operators who exposed
+/// it elsewhere should pass `--metrics-url`.
+#[derive(Args, Debug)]
+pub struct TopArgs {
+    /// Base URL of the node's metrics HTTP endpoint, e.g.
+    /// `http://127.0.0.1:9090`. Also read from `DECDN_METRICS_URL`
+    /// when unset. If still unset, the port is derived from
+    /// `observability.metrics_port` in the config file (see
+    /// `--config`); the host is always `127.0.0.1` because the
+    /// metrics endpoint is loopback-only by default.
+    #[arg(long, value_name = "URL", env = "DECDN_METRICS_URL")]
+    pub metrics_url: Option<String>,
+
+    /// Path to the TOML config file used to derive the metrics URL
+    /// when `--metrics-url` / `DECDN_METRICS_URL` are unset. Same
+    /// resolution semantics as `decdn node peers --config`.
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+
+    /// Refresh interval in milliseconds. Default 1000 (one Hz, matches
+    /// the issue title). Values below 100ms are accepted but unlikely
+    /// to outpace the operator's terminal redraw budget.
+    #[arg(long, value_name = "MS", default_value_t = 1_000)]
+    pub interval_ms: u64,
+
+    /// Single-shot mode: fetch once, emit the snapshot as pretty JSON,
+    /// and exit. Useful for scripts or one-off captures. Mutually
+    /// exclusive with the live redraw loop (which runs forever in
+    /// plain mode until Ctrl-C).
+    #[arg(long)]
+    pub json: bool,
+
+    /// HTTP roundtrip timeout in milliseconds for each `/metrics`
+    /// scrape. A scrape that times out is logged and the loop
+    /// continues — the displayed counters keep their last value
+    /// rather than the table going blank on a single hiccup.
     #[arg(long, value_name = "MS", default_value_t = 5_000)]
     pub timeout_ms: u64,
 }

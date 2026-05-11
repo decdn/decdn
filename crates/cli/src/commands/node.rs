@@ -15,22 +15,9 @@ use decdn_common::admin::{
     PeerView, PeersResponse, ReloadResponse,
 };
 use decdn_common::cli;
+use decdn_common::cli::ConfigPathSource;
 use decdn_common::cli::common::expand_tilde;
 use decdn_common::config::DEFAULT_ADMIN_PORT;
-
-/// Whether the TOML config path we're about to read was chosen by the
-/// operator or defaulted. Drives the "missing file" policy in
-/// [`port_from_config_file`]: an explicit path that isn't there is
-/// almost certainly a typo and should error, while a default path that
-/// isn't there is normal (operator just hasn't made a config yet).
-#[derive(Debug, Clone, Copy)]
-enum ConfigPathSource {
-    /// Path came from `--config` (subcommand) or the global `decdn
-    /// --config` flag.
-    Explicit,
-    /// Path came from the built-in default (`~/.decdn/node.toml`).
-    Default,
-}
 
 /// Partial deserializer for the TOML config — only the path
 /// `observability.admin_port` is interesting to `decdn node peers`.
@@ -67,6 +54,7 @@ pub async fn node_dispatch(
         cli::NodeCommand::Announce(a) => announce(a, global_config).await,
         cli::NodeCommand::Reload(r) => reload(r, global_config).await,
         cli::NodeCommand::Drain(d) => drain(d, global_config).await,
+        cli::NodeCommand::Top(t) => crate::commands::node_top::run(t, global_config).await,
     }
 }
 

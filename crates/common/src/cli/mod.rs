@@ -15,11 +15,12 @@ pub mod probe;
 pub mod run;
 
 pub use bundle::{BundleArgs, BundleCommand, BundleCreateArgs};
-pub use common::{LogFormat, default_config_path, default_data_dir};
+pub use common::{ConfigPathSource, LogFormat, default_config_path, default_data_dir};
 pub use config_cmd::{ConfigArgs, ConfigCommand, ConfigInitArgs, ConfigValidateArgs};
 pub use key_gen::KeyGenArgs;
 pub use node::{
     AnnounceArgs, DrainArgs, EvictArgs, HealthArgs, NodeArgs, NodeCommand, PeersArgs, ReloadArgs,
+    TopArgs,
 };
 pub use probe::ProbeArgs;
 pub use run::RunArgs;

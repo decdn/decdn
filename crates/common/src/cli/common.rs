@@ -69,6 +69,21 @@ pub fn default_config_path() -> Option<PathBuf> {
     default_data_dir().map(|d| d.join("node.toml"))
 }
 
+/// Whether a TOML config path was chosen by the operator or
+/// defaulted. Drives the "missing file" policy for config-file
+/// lookups in the `decdn node *` subcommands: an explicit path that
+/// isn't there is almost certainly a typo and should error, while a
+/// default path that isn't there is normal (operator just hasn't
+/// made a config yet).
+#[derive(Debug, Clone, Copy)]
+pub enum ConfigPathSource {
+    /// Path came from `--config` (subcommand) or the global
+    /// `decdn --config` flag.
+    Explicit,
+    /// Path came from the built-in default (`~/.decdn/node.toml`).
+    Default,
+}
+
 /// Expands a leading `~/` or bare `~` in a path to the user's home directory.
 ///
 /// Logs a warning and returns the path unchanged if `~` is present but
