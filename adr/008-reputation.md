@@ -216,7 +216,6 @@ Scores converge to 0.5 asymptotically, reaching within 0.05 of neutral after ~30
 | Decay rate | 10% per week (applied iteratively) |
 | Decay starts after | 1 week with no new reports or interactions |
 | Minimum score (floor) | 0.0 (selection algorithm clamps at 0.1 — see [ADR 001](001-network.md#node-selection-algorithm)) |
-| Scope | Production only — see [Section 14](#14-poc-scope) for PoC scope |
 
 ### 8. Score Clamping
 
@@ -272,31 +271,6 @@ Downstream operational programs (e.g., regional deployment grants, hardware-leas
 
 The signal is intentionally lightweight (e.g., a small set of region-bucketed delivery-volume counters with the same EWMA / decay treatment as `local_score`); the precise aggregation mechanic and region taxonomy are out of scope for this ADR. The reputation system carries no logic that would deny eligibility based on region — that is each consuming program's sole prerogative.
 
-### 14a. PoC Scope
-
-For PoC, reputation is local-only — each client tracks its own observations of node performance (delivery speed, correctness, reachability) via EWMA. There is no gossip propagation, no decay, and no per-report clamping (the selection floor `max(reputation, 0.1)` from [ADR 001](001-network.md#node-selection-algorithm) still applies). The node selection algorithm uses `final_score = local_score` directly. This exercises the core scoring path (interaction → EWMA → selection weight) without the complexity of cross-node reputation aggregation.
-
-Action items:
-
-1. Implement `local_score` EWMA calculation ([§ 3](#3-local-score-calculation)).
-2. Wire `local_score` into the node selection formula as `reputation` ([ADR 001](001-network.md#node-selection-algorithm)).
-3. Store per-node local scores in memory; no persistence required for PoC.
-4. Use the simplified tie-breaker from [§ 9](#9-tie-breaking) (lower load → random).
-
-### 14b. Deferred to Production
-
-Sections above describe the full production design; PoC nodes do not implement any of the following until launch coordination per the implementing ADR:
-
-- **Network score aggregation** ([§ 4](#4-network-score-aggregation)) — `ReputationReport` gossip on the `cdn/reputation/v1` topic, including the distinct-counterparty discount and settlement-time decay anti-wash-trading mechanics ([§§ 4.1–4.2](#41-distinct-counterparty-discount)).
-- **70/30 combined score** ([§ 5](#5-combined-score)) — replaces the PoC's local-only `final_score = local_score`.
-- **Score decay toward 0.5** ([§ 7](#7-score-decay-production-only)) at 10 %/week.
-- **Per-report ±0.05 clamp** ([§ 8](#8-score-clamping)).
-- **Cold-start bootstrap bonus** ([§ 10](#10-cold-start-bootstrap)) — one-time +0.05 additive, linear decay over 7 days / 50 interactions, gated on `firstRegisteredAt`.
-- **Rate limiting on gossip reports** ([§ 11](#11-rate-limiting)).
-- **Reputation as off-chain wash-trading signal** ([§ 12](#12-gauge-pool-wash-trading-reputation-as-off-chain-signal)) — operator-cluster detection, diversity-of-service signal, governance input for cap-tuning. The on-chain defense is the [ADR 026 §3 per-operator gauge-share cap](026-gauge-boost-tokenomics.md#per-operator-gauge-share-cap); reputation contributes the soft layer.
-- **Regional-coverage signal** ([§ 13](#13-regional-coverage-reputation-signal)) — per-operator regional bucket counters published on `cdn/reputation/v1` for downstream operational programs.
-- **Full 4-tier tie-breaking** ([§ 9](#9-tie-breaking)) — load → geo → stake → random.
-
 ## Consequences
 
 ### Positive
@@ -318,4 +292,3 @@ Sections above describe the full production design; PoC nodes do not implement a
 - Gossip-based propagation adds bandwidth overhead: at 1,000 nodes with all reporters at max rate (10 reports/hr), each node receives ~10,000 reports/hr (~2 MB/hr ingress), which is modest relative to `NodeAnnounce` traffic (~48 MB/hr at 60-second intervals). The strict rate limits (Section 11) keep reputation gossip well-bounded. See [ADR 001, Gossip Bandwidth Analysis](001-network.md#gossip-bandwidth-analysis) for the combined budget
 - The 70/30 local/network split means a client's view of the network is biased toward its own usage patterns
 - Coordinated negative gossip reports could push an operator's reputation down unfairly, reducing their selection probability. Per-report clamping (Section 8) and the 3× reporter-weight cap (Section 4) limit the speed and magnitude of such attacks. Because reputation is not a gauge-eligibility gate (Section 12), an unfairly-docked operator still earns gauge proportional to their actual settled bytes (subject to the per-operator cap) — they only lose selection probability, which is a continuous penalty rather than a hard exclusion
-- PoC uses local-only scores (no gossip, no decay, no per-report clamping) — see [Section 14](#14-poc-scope) for full PoC scope
