@@ -2547,7 +2547,7 @@ dependencies = [
  "iroh",
  "jsonrpsee",
  "rand 0.10.1",
- "reqwest 0.13.2",
+ "reqwest 0.13.3",
  "serde",
  "serde_json",
  "tempfile",
