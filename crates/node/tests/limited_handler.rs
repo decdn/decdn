@@ -346,3 +346,134 @@ async fn per_source_rejection_routes_through_wrapper() -> anyhow::Result<()> {
     server_ep.close().await;
     Ok(())
 }
+
+/// Inner handler that mimics iroh-gossip's `accept` shape: returns `Ok`
+/// after handing the `Connection` off to an internally-spawned task. Used
+/// to prove the wrapper's permit-holding watcher correctly bounds in-flight
+/// connections even when `inner.accept` itself returns fast.
+///
+/// Without the watcher, the permit would drop right after this `accept`
+/// returned and a second client would not see a `RATE_LIMITED` close — the
+/// exact gap flagged in review #4262648505 on PR #512.
+#[derive(Debug, Clone)]
+struct ReturnFastHandler {
+    accepts: Arc<AtomicUsize>,
+    spawned: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+impl ReturnFastHandler {
+    fn new() -> Self {
+        Self {
+            accepts: Arc::new(AtomicUsize::new(0)),
+            spawned: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        }
+    }
+}
+
+impl ProtocolHandler for ReturnFastHandler {
+    async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
+        self.accepts.fetch_add(1, Ordering::SeqCst);
+        let spawned = self.spawned.clone();
+        let release = self.release.clone();
+        // Hand the connection off to a detached task and return immediately,
+        // mirroring how `Gossip::accept` enqueues into its actor's mpsc and
+        // returns before the connection has been driven.
+        tokio::spawn(async move {
+            spawned.notify_one();
+            release.notified().await;
+            conn.close(0u32.into(), b"test-done");
+        });
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rejects_second_connection_for_return_fast_inner() -> anyhow::Result<()> {
+    // Strict global cap = 1. The inner handler returns `Ok` from `accept`
+    // before its spawned task has closed the connection — so if the wrapper
+    // dropped the permit at `inner.accept`-return (the bug fixed by the
+    // watcher), client 2 would NOT observe a RATE_LIMITED close.
+    let cfg = ResolvedSecurity {
+        max_concurrent_handlers: 1,
+        per_source_rate_per_sec: 1e9,
+        per_source_burst: u32::MAX,
+        max_tracked_sources: 4096,
+    };
+    let metrics = Arc::new(Metrics::new());
+    let limiter = Arc::new(ConnectionLimiter::new(&cfg, Arc::clone(&metrics)));
+
+    let inner = ReturnFastHandler::new();
+    let wrapper = LimitedHandler::new(inner.clone(), Arc::clone(&limiter));
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![TEST_ALPN.to_vec()]).await?;
+    let router = Router::builder(server_ep.clone())
+        .accept(TEST_ALPN, wrapper)
+        .spawn();
+
+    let (client1_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    let conn1 = client1_ep
+        .connect(target.clone(), TEST_ALPN)
+        .await
+        .map_err(|e| anyhow::anyhow!("client1 connect: {e}"))?;
+
+    // Wait for inner's spawned task to be live. By the time `accept`
+    // notifies `spawned`, `inner.accept` has already returned `Ok` and the
+    // wrapper has reached its `tokio::spawn(...)` call: the watcher owns
+    // the permit. (The permit is held continuously between `acquire` and
+    // the watcher task's drop; there is no await between them in the
+    // wrapper's accept body that could release it.)
+    tokio::time::timeout(Duration::from_secs(5), inner.spawned.notified())
+        .await
+        .map_err(|_| anyhow::anyhow!("inner.accept never spawned its task for client1"))?;
+    assert_eq!(
+        inner.accepts.load(Ordering::SeqCst),
+        1,
+        "inner.accept must have fired exactly once for client1"
+    );
+
+    // Client 2 — global cap exhausted. The wrapper must reject before
+    // delegating to the inner handler.
+    let (client2_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let conn2 = client2_ep
+        .connect(target, TEST_ALPN)
+        .await
+        .map_err(|e| anyhow::anyhow!("client2 connect: {e}"))?;
+
+    let expected = VarInt::from_u32(APP_ERR_RATE_LIMITED);
+    let close = tokio::time::timeout(Duration::from_secs(5), conn2.closed())
+        .await
+        .map_err(|_| anyhow::anyhow!("client2 conn never closed"))?;
+    match close {
+        ConnectionError::ApplicationClosed(ApplicationClose { error_code, .. })
+            if error_code == expected => {}
+        other => anyhow::bail!("expected RATE_LIMITED close, got {other:?}"),
+    }
+    assert_eq!(
+        inner.accepts.load(Ordering::SeqCst),
+        1,
+        "inner.accept must not fire for the rejected client2 — \
+         a value of 2 means the permit was dropped at inner.accept-return \
+         (the pre-watcher bug)"
+    );
+
+    // Release inner's spawned task; it closes client1's connection, which
+    // fires the wrapper's watcher `closed()` and drops the permit.
+    inner.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), conn1.closed())
+        .await
+        .map_err(|_| anyhow::anyhow!("client1 failed to close cleanly within 5s"))?;
+
+    router
+        .shutdown()
+        .await
+        .map_err(|e| anyhow::anyhow!("router.shutdown: {e}"))?;
+    client1_ep.close().await;
+    client2_ep.close().await;
+    server_ep.close().await;
+    Ok(())
+}

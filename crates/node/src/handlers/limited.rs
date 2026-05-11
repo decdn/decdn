@@ -9,16 +9,50 @@
 //! that gates `accept` on the shared [`ConnectionLimiter`] and only delegates
 //! to the inner handler if a permit is granted.
 //!
-//! Without this wrapper a connection flood on a foreign ALPN bypasses
-//! `ConnectionLimiter` entirely (issue #433): the global semaphore introduced
-//! in #235 bounds `accept` invocations on probe but not on gossip, so the
-//! per-task resource ceiling does not hold network-wide.
+//! ## What the wrapper actually enforces (issue #433)
 //!
-//! Probe stays on its inline `acquire` call: it has a custom per-rejection-
-//! layer close-frame timeout policy that this generic adapter intentionally
-//! does not replicate (under `GlobalFull` a flood-wide `conn.closed()` wait
-//! re-introduces the memory-pressure path the limiter exists to prevent).
+//! Foreign handlers come in two shapes:
 //!
+//! - **Inline-protocol** (probe-shape): `accept` runs the full protocol
+//!   exchange and only returns once the connection is finished. Permit
+//!   lifetime trivially matches connection lifetime — dropping the permit
+//!   when `inner.accept` returns is sufficient.
+//! - **Return-fast / spawn-internally** (gossip-shape): `iroh-gossip`'s
+//!   `Gossip::accept` clones the [`Connection`] into a 16-deep mpsc and
+//!   returns in microseconds; the gossip actor then spawns the long-lived
+//!   per-connection task that owns the connection (see
+//!   `iroh-gossip-0.98.0/src/net.rs:131-136, 247-253, 526-562`). If we
+//!   dropped the permit at `inner.accept`-return for this shape, the
+//!   global semaphore would only back-pressure once the actor's 16-slot
+//!   mpsc saturates and would not bound the number of in-flight gossip
+//!   handler tasks at all.
+//!
+//! To make the global cap meaningful for both shapes the wrapper spawns
+//! a small detached watcher on the `Ok` path: the watcher owns the
+//! [`Permit`] and awaits [`Connection::closed`], so the in-flight gauge
+//! stays held until the QUIC connection actually terminates. The watcher
+//! is detached intentionally — `Router::shutdown` (from `iroh::protocol`)
+//! calls `endpoint.close()`, which fires every pending
+//! [`Connection::closed`] future, so watchers terminate without any
+//! external coordination and the wrapper does not need a `JoinSet` field
+//! (which would force interior mutability for no real benefit).
+//!
+//! Per-source rate-limiting was already correctly gated even without the
+//! watcher, because [`ConnectionLimiter::acquire`] runs synchronously at
+//! the top of `accept` — the per-source bucket is consumed before
+//! `inner.accept` ever sees the connection.
+//!
+//! ## Why probe stays on its inline `acquire`
+//!
+//! Probe has a custom per-rejection-layer close-frame timeout policy that
+//! this generic adapter intentionally does not replicate (under
+//! `GlobalFull` a flood-wide `conn.closed()` wait re-introduces the
+//! memory-pressure path the limiter exists to prevent). Since probe is
+//! inline-protocol-shape, its inline `acquire` already gives it
+//! permit-lifetime = connection-lifetime; wrapping it would only add the
+//! watcher-spawn overhead without changing the cap's behavior.
+//!
+//! [`Permit`]: crate::dispatch::Permit
 //! [`Gossip`]: iroh_gossip::net::Gossip
 
 use std::sync::Arc;
@@ -71,7 +105,7 @@ impl<H: ProtocolHandler> ProtocolHandler for LimitedHandler<H> {
     }
 
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
-        let _permit = match self.limiter.acquire(&conn) {
+        let permit = match self.limiter.acquire(&conn) {
             Ok(p) => p,
             Err(reason) => {
                 // Rate-limited rejection is normal load-shedding, not a
@@ -94,10 +128,41 @@ impl<H: ProtocolHandler> ProtocolHandler for LimitedHandler<H> {
                 return Ok(());
             }
         };
-        self.inner.accept(conn).await
-        // `_permit` drops at end of scope (after the inner `accept` returns),
-        // keeping the in-flight gauge balanced against the iroh-spawned task
-        // lifetime.
+
+        // Clone for the watcher BEFORE handing the original to inner.accept.
+        // `Connection` clones share QUIC state and all observe the same
+        // `closed()` event; this is a refcount bump, not a deep copy, and
+        // does not extend the connection's lifetime past what the inner
+        // handler keeps alive.
+        let conn_for_watcher = conn.clone();
+
+        // Run the inner handler. For inline-protocol (probe-shape) handlers
+        // this drives the full exchange; for return-fast (iroh-gossip-shape)
+        // handlers it completes once the connection has been handed off to
+        // the inner's internal task.
+        self.inner.accept(conn).await?;
+
+        // Hold the permit until the connection actually closes. Without
+        // this watcher, gossip's 16-slot mpsc fully absorbs any burst and
+        // the global semaphore briefly back-pressures but never bounds the
+        // number of in-flight gossip connection tasks — see the module
+        // docs for the full rationale.
+        //
+        // The spawn is detached intentionally: `Router::shutdown` calls
+        // `endpoint.close()`, which fires every `Connection::closed()`
+        // future, so watchers terminate without external coordination.
+        // The watcher contains no panicking paths: `Permit::drop` is
+        // unconditional (it always decrements the in-flight gauge) and
+        // `closed()` returns `ConnectionError` rather than panicking. The
+        // `Err`-path above returns before reaching here, so a faulty inner
+        // handler that always errors does not leak a permit (see test
+        // `permit_releases_when_inner_returns_err`).
+        tokio::spawn(async move {
+            let _permit_guard = permit; // held until closed() resolves
+            let _ = conn_for_watcher.closed().await;
+        });
+
+        Ok(())
     }
 
     /// Forward shutdown so iroh's drain semantics propagate to the inner
