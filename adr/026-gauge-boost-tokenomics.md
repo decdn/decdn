@@ -94,7 +94,7 @@ Epoch length is 1 week (7 × 86400 s, block-timestamp-aligned). At epoch rollove
 
 #### Pre-launch gauge accumulation
 
-The 40% gauge bucket MUST NOT pay out until the per-operator gauge-share cap from §3 above is enforced — wash-trading at TOKEN price 3–5× genesis is net-profitable without that cap (see [Appendix: Wash-Trading Economics](appendix-wash-trading-economics.md)). This sub-section pins the contract-level mechanism for that pause and the cutover.
+The 40% gauge bucket MUST NOT pay out until the per-operator gauge-share cap from §3 above is enforced — wash-trading is net-profitable without that cap, and the hazard is highest at genesis-low TOKEN prices where the 50,000-TOKEN per-pseudo-operator stake required for sybil expansion is cheapest relative to extractable USDC (see [Appendix: Wash-Trading Economics](appendix-wash-trading-economics.md)). This sub-section pins the contract-level mechanism for that pause and the cutover.
 
 ```solidity
 // FeeRouter pre-launch gauge state.
