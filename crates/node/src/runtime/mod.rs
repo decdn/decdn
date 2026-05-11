@@ -27,6 +27,7 @@ use decdn_gossip::{GossipMetrics, GossipRuntimeConfig, GossipService, PeerTable}
 
 use crate::admin;
 use crate::dispatch::ConnectionLimiter;
+use crate::handlers::limited::LimitedHandler;
 use crate::handlers::probe::ProbeHandler;
 use crate::metrics;
 use alloy::signers::local::PrivateKeySigner;
@@ -243,9 +244,17 @@ pub async fn run(
         Arc::clone(&limiter),
     ));
 
+    // Wrap the foreign `iroh-gossip` handler with `LimitedHandler` so the
+    // gossip ALPN goes through the same `ConnectionLimiter` (#235) that
+    // gates the probe ALPN. Without the wrapper, a connection flood on
+    // `iroh-gossip/0` bypasses the global semaphore entirely (#433): the
+    // per-task resource ceiling holds for probe but not network-wide.
     let router = Router::builder(ep.clone())
         .accept(ProbeHandler::ALPN, probe_handler)
-        .accept(GOSSIP_ALPN, gossip.clone())
+        .accept(
+            GOSSIP_ALPN,
+            LimitedHandler::new(gossip.clone(), Arc::clone(&limiter)),
+        )
         .spawn();
 
     let metrics_addr = std::net::SocketAddr::new(
