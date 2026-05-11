@@ -41,7 +41,7 @@ crates/
   gossip/       — NodeAnnounce pub/sub over iroh-gossip, peer table, envelope validation
   incentive/    — payment channels, staking, vouchers (alloy for Ethereum)
   reputation/   — gossip-based reputation scoring
-  contracts/    — Solidity contracts + Foundry (excluded from workspace, not yet populated)
+contracts/      — Solidity contracts + Foundry (repo root, excluded from workspace, not yet populated)
 ```
 
 **Dependency flow:** `node → cache, gossip, incentive, reputation, protocol, common`; `cli → common, protocol`. The two binaries share `common` for config schema, identity, and admin wire types — see [`adr/appendix-binaries.md`](adr/appendix-binaries.md) for the dockerd-style split rationale. Cache and incentive are independent — cache works without payment logic (useful for testing/local dev).
