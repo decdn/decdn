@@ -65,6 +65,16 @@ const DEFAULT_PER_SOURCE_RATE_PER_SEC: f64 = 100.0;
 const DEFAULT_PER_SOURCE_BURST: u32 = 200;
 /// Default hard cap on tracked source entries in the keyed limiter.
 const DEFAULT_MAX_TRACKED_SOURCES: usize = 4096;
+/// Default interval between iroh-blobs GC sweeps in seconds (#518). Five
+/// minutes balances the hostile-origin amplification window against the
+/// per-sweep cost of walking the blob list. The window matters because
+/// a single failed pull-through orphans up to `max_blob_size_mb`
+/// (one upload-per-request bound, not multiplied by the interval), but
+/// a stream of failed requests inside one interval compounds: total
+/// leak before reclaim is bounded by `requests_in_window * max_blob_size_mb`.
+/// Tuning the interval down shrinks that window. Operators on lean disks
+/// can tune lower; setting to `0` disables the periodic sweep entirely.
+pub const DEFAULT_GC_INTERVAL_SEC: u64 = 300;
 
 /// Load config from file (if present) and merge with CLI args.
 ///
@@ -471,6 +481,10 @@ fn resolve_cache(
         None => decdn_cache::DEFAULT_USER_AGENT.to_string(),
     };
 
+    let gc_interval_sec = file
+        .and_then(|c| c.gc_interval_sec)
+        .unwrap_or(DEFAULT_GC_INTERVAL_SEC);
+
     Ok(ResolvedCache {
         cache_dir,
         cache_size_mb,
@@ -479,6 +493,7 @@ fn resolve_cache(
         pinned_hashes,
         origin_retry,
         user_agent,
+        gc_interval_sec,
     })
 }
 
@@ -2512,6 +2527,56 @@ mod tests {
             resolved.user_agent == "MyCdn/1.0 (+ops@example.com)",
             "got: {}",
             resolved.user_agent
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_gc_interval_defaults_when_absent() -> anyhow::Result<()> {
+        // Absent => DEFAULT_GC_INTERVAL_SEC (#518).
+        let cli = cache_cli(None, None);
+        let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
+        anyhow::ensure!(
+            resolved.gc_interval_sec == DEFAULT_GC_INTERVAL_SEC,
+            "expected default {}, got: {}",
+            DEFAULT_GC_INTERVAL_SEC,
+            resolved.gc_interval_sec
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_gc_interval_from_file_overrides_default() -> anyhow::Result<()> {
+        let cli = cache_cli(None, None);
+        let file = types::CacheConfig {
+            gc_interval_sec: Some(42),
+            ..types::CacheConfig::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        anyhow::ensure!(
+            resolved.gc_interval_sec == 42,
+            "expected 42, got: {}",
+            resolved.gc_interval_sec
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_gc_interval_zero_disables() -> anyhow::Result<()> {
+        // `0` is the documented "disable periodic GC" sentinel — no
+        // clamp/floor should turn it back on. A regression that
+        // saturated to a minimum would silently re-enable GC for
+        // operators who explicitly opted out.
+        let cli = cache_cli(None, None);
+        let file = types::CacheConfig {
+            gc_interval_sec: Some(0),
+            ..types::CacheConfig::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        anyhow::ensure!(
+            resolved.gc_interval_sec == 0,
+            "0 must round-trip as 0 (disabled); got: {}",
+            resolved.gc_interval_sec
         );
         Ok(())
     }

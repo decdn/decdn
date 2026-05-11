@@ -276,9 +276,12 @@ pub trait AdminRpc {
     async fn health(&self) -> RpcResult<HealthResponse>;
 
     /// Evict a single blob from the local cache (issue #279). The
-    /// eviction is logical (the iroh-blobs store still holds the bytes
-    /// until #233 lands a public `delete`) but is persisted to
-    /// `<cache_dir>/evicted.log` so it survives a restart.
+    /// eviction is logical: the iroh-blobs store still holds the bytes
+    /// (`Blobs::delete` is `pub(crate)` in iroh-blobs and reserved for
+    /// the GC task) until the next periodic GC sweep reclaims them
+    /// (#518). The takedown itself is persisted to
+    /// `<cache_dir>/evicted.log` so it survives a restart even when
+    /// the next sweep hasn't run yet.
     ///
     /// When `req.dry_run` is `true` (issue #379) the cache state is
     /// *not* mutated: the response carries the pre-evict snapshot

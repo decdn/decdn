@@ -14,6 +14,7 @@
 //! suite covering [`decdn_cache::HttpOrigin`].
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use aws_sdk_s3::Client;
 use aws_sdk_s3::operation::get_object::{GetObjectError, GetObjectOutput};
@@ -91,12 +92,13 @@ async fn fetch_returns_origin_bytes_on_success() -> anyhow::Result<()> {
     let client = mock_s3_client(&[&rule]);
     let origin = s3_origin(client, "");
 
-    match origin.fetch(hash, 16 * 1024 * 1024).await? {
-        OriginFetch::Found(bytes) => {
-            anyhow::ensure!(&bytes[..] == payload, "got: {bytes:?}");
-        }
-        OriginFetch::NotFound => anyhow::bail!("expected Found, got NotFound"),
-    }
+    let bytes = origin
+        .fetch(hash, 16 * 1024 * 1024)
+        .await?
+        .collect_to_bytes()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("expected Found, got NotFound"))?;
+    anyhow::ensure!(&bytes[..] == payload, "got: {bytes:?}");
     anyhow::ensure!(rule.num_calls() == 1, "single fetch must hit the rule once");
     Ok(())
 }
@@ -116,7 +118,7 @@ async fn fetch_no_such_key_maps_to_not_found() -> anyhow::Result<()> {
 
     match origin.fetch(hash, 16 * 1024 * 1024).await? {
         OriginFetch::NotFound => Ok(()),
-        OriginFetch::Found(_) => anyhow::bail!("expected NotFound on NoSuchKey"),
+        OriginFetch::Found { .. } => anyhow::bail!("expected NotFound on NoSuchKey"),
     }
 }
 
@@ -140,7 +142,7 @@ async fn fetch_bare_http_404_maps_to_not_found() -> anyhow::Result<()> {
 
     match origin.fetch(hash, 16 * 1024 * 1024).await? {
         OriginFetch::NotFound => Ok(()),
-        OriginFetch::Found(_) => anyhow::bail!("expected NotFound on HTTP 404"),
+        OriginFetch::Found { .. } => anyhow::bail!("expected NotFound on HTTP 404"),
     }
 }
 
@@ -175,7 +177,7 @@ async fn fetch_404_with_no_such_bucket_is_permanent_not_not_found() -> anyhow::R
             "NoSuchBucket masked as NotFound — operator would see 'missing blob' \
              instead of the real config error. fix in classify_get_object_error."
         ),
-        Ok(OriginFetch::Found(_)) => anyhow::bail!("expected error, got Found"),
+        Ok(OriginFetch::Found { .. }) => anyhow::bail!("expected error, got Found"),
         Err(err) => {
             anyhow::ensure!(
                 matches!(err, OriginPullError::Permanent(_)),
@@ -311,6 +313,7 @@ async fn cache_engine_retries_transient_via_origin_retry_policy() -> anyhow::Res
         decdn_cache::PinnedHashes::empty(),
         policy,
         None,
+        Duration::ZERO,
     )
     .await?;
 
@@ -418,26 +421,32 @@ async fn fetch_with_content_encoding_identity_is_accepted() -> anyhow::Result<()
     let client = mock_s3_client(&[&rule]);
     let origin = s3_origin(client, "");
 
-    match origin.fetch(hash, 16 * 1024 * 1024).await? {
-        OriginFetch::Found(bytes) => {
-            anyhow::ensure!(&bytes[..] == payload);
-            Ok(())
-        }
-        OriginFetch::NotFound => anyhow::bail!("expected Found"),
-    }
+    let bytes = origin
+        .fetch(hash, 16 * 1024 * 1024)
+        .await?
+        .collect_to_bytes()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("expected Found"))?;
+    anyhow::ensure!(&bytes[..] == payload);
+    Ok(())
 }
 
-/// Bodies larger than `max_bytes` are rejected with `Permanent`. The
-/// post-collect length check is the load-bearing defense — an origin
-/// can lie in the `Content-Length` header (or omit it for chunked
-/// responses), so the byte-count cap on the actual body is what
-/// guarantees we never hand oversized bytes to the engine.
+/// The S3 adapter's body stream produces every byte the wire
+/// emits — no in-adapter cap, no silent truncation. Post-#271 the
+/// `max_bytes` enforcement moved to the engine's
+/// `count_and_cap_stream`, so this test confirms only the adapter
+/// half of the contract: the bytes flow through verbatim. The
+/// **engine-level** rejection of oversized bodies is covered
+/// end-to-end by `cache_engine_miss_pulls_from_s3_and_caches`.
+/// An origin lying in `Content-Length` (or omitting it for chunked
+/// responses) is caught by the engine's running cap, which is the
+/// load-bearing defense.
 #[tokio::test]
-async fn fetch_oversize_body_is_permanent() -> anyhow::Result<()> {
-    // 256 KiB payload, cap at 64 KiB. The SDK's mock layer doesn't set
-    // Content-Length unless we provide one explicitly, so this exercises
-    // the post-collect byte-count check rather than the fast-path
-    // `content_length()` short-circuit.
+async fn fetch_oversize_body_streams_through_for_engine_cap() -> anyhow::Result<()> {
+    // 256 KiB payload, cap at 64 KiB. The SDK's mock layer doesn't
+    // set Content-Length unless we provide one explicitly, so this
+    // exercises the running cap on the streamed bytes rather than
+    // the fast-path `content_length()` short-circuit.
     let payload = vec![0xABu8; 256 * 1024];
     let hash = Hash::new(&payload);
     let body = payload.clone();
@@ -450,19 +459,18 @@ async fn fetch_oversize_body_is_permanent() -> anyhow::Result<()> {
     let client = mock_s3_client(&[&rule]);
     let origin = s3_origin(client, "");
 
-    let err = origin
+    // Adapter fetch returns the stream (no cap at the adapter).
+    let bytes = origin
         .fetch(hash, 64 * 1024)
-        .await
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("oversize body must be rejected"))?;
+        .await?
+        .collect_to_bytes()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("expected Found"))?;
     anyhow::ensure!(
-        matches!(err, OriginPullError::Permanent(_)),
-        "expected Permanent for size cap breach, got: {err:?}"
-    );
-    let msg = format!("{err:#}");
-    anyhow::ensure!(
-        msg.contains("exceeds max"),
-        "size-cap message lost its actionable wording: {msg}"
+        bytes.len() == payload.len(),
+        "stream truncated: {} bytes vs {} in payload",
+        bytes.len(),
+        payload.len()
     );
     Ok(())
 }
@@ -496,12 +504,13 @@ async fn fetch_applies_prefix_with_sharded_key_layout() -> anyhow::Result<()> {
     let client = mock_s3_client_match_any(&[&rule]);
     let origin = s3_origin(client, prefix);
 
-    match origin.fetch(hash, 16 * 1024 * 1024).await? {
-        OriginFetch::Found(bytes) => {
-            anyhow::ensure!(&bytes[..] == payload);
-        }
-        OriginFetch::NotFound => anyhow::bail!("expected Found"),
-    }
+    let bytes = origin
+        .fetch(hash, 16 * 1024 * 1024)
+        .await?
+        .collect_to_bytes()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("expected Found"))?;
+    anyhow::ensure!(&bytes[..] == payload);
     anyhow::ensure!(rule.num_calls() == 1, "rule must match the prefixed key");
     Ok(())
 }
@@ -539,6 +548,7 @@ async fn cache_engine_miss_pulls_from_s3_and_caches() -> anyhow::Result<()> {
         decdn_cache::PinnedHashes::empty(),
         RetryPolicy::disabled(),
         None,
+        Duration::ZERO,
     )
     .await?;
 
@@ -555,6 +565,56 @@ async fn cache_engine_miss_pulls_from_s3_and_caches() -> anyhow::Result<()> {
         rule.num_calls() == 1,
         "second get must not re-hit the origin; got {} dispatches",
         rule.num_calls()
+    );
+    Ok(())
+}
+
+/// End-to-end `BlobTooLarge` through the S3 backend: the engine's
+/// `count_and_cap_stream` running cap on streamed bytes catches an
+/// origin that delivers more than `max_blob_bytes`. Without this
+/// test the S3 path could regress (e.g., re-buffer in the adapter,
+/// or skip the engine wrapper) and the fix for issue #271 wouldn't
+/// actually constrain S3-fed pulls. HTTP has the equivalent
+/// (`mid_stream_overrun_is_rejected_by_http_origin`); this is the
+/// S3 counterpart.
+#[tokio::test]
+async fn cache_engine_rejects_s3_body_larger_than_max_blob_bytes() -> anyhow::Result<()> {
+    // 4 MiB body, 1 MiB cap. The mock layer doesn't set
+    // Content-Length unless we provide one explicitly, so this
+    // exercises the running cap on streamed bytes (engine's
+    // `count_and_cap_stream`) rather than the adapter's
+    // pre-stream Content-Length short-circuit.
+    let payload = vec![0xCDu8; 4 * 1024 * 1024];
+    let hash = Hash::new(&payload);
+    let body = payload.clone();
+    let rule = mock!(Client::get_object).then_output(move || {
+        GetObjectOutput::builder()
+            .body(ByteStream::from(body.clone()))
+            .build()
+    });
+    let client = mock_s3_client(&[&rule]);
+    let origin: Arc<dyn Origin> = Arc::new(s3_origin(client, ""));
+
+    let tmp = tempfile::tempdir()?;
+    let engine = CacheEngine::open_full(
+        tmp.path(),
+        Some(origin),
+        1, // max_blob_size_mb = 1 MiB
+        decdn_cache::PinnedHashes::empty(),
+        RetryPolicy::disabled(),
+        None,
+        Duration::ZERO,
+    )
+    .await?;
+
+    let err = engine
+        .get(hash)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("oversize body must be rejected at engine cap"))?;
+    anyhow::ensure!(
+        matches!(err, CacheError::BlobTooLarge { .. }),
+        "expected BlobTooLarge from engine cap, got: {err:?}"
     );
     Ok(())
 }

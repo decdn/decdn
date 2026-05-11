@@ -634,7 +634,7 @@ mod tests {
                 >,
             > {
                 let result = if hash == self.hash {
-                    Ok(decdn_cache::OriginFetch::Found(self.data.clone()))
+                    Ok(decdn_cache::OriginFetch::found_one_shot(self.data.clone()))
                 } else {
                     Ok(decdn_cache::OriginFetch::NotFound)
                 };
@@ -770,7 +770,7 @@ mod tests {
                 >,
             > {
                 let result = if hash == self.hash {
-                    Ok(decdn_cache::OriginFetch::Found(self.data.clone()))
+                    Ok(decdn_cache::OriginFetch::found_one_shot(self.data.clone()))
                 } else {
                     Ok(decdn_cache::OriginFetch::NotFound)
                 };
@@ -855,7 +855,7 @@ mod tests {
     /// `already_evicted: true` and `was_present: false` — the operator
     /// is using dry-run to confirm an idempotent re-run is in fact a
     /// no-op. The size field still reports the on-disk bytes since
-    /// the iroh-blobs store hasn't been GC'd yet (#233).
+    /// the iroh-blobs store hasn't been GC'd yet (#518).
     #[tokio::test]
     async fn admin_evict_dry_run_after_real_evict_reports_already_evicted() -> anyhow::Result<()> {
         use bytes::Bytes;
@@ -885,7 +885,7 @@ mod tests {
                 >,
             > {
                 let result = if hash == self.hash {
-                    Ok(decdn_cache::OriginFetch::Found(self.data.clone()))
+                    Ok(decdn_cache::OriginFetch::found_one_shot(self.data.clone()))
                 } else {
                     Ok(decdn_cache::OriginFetch::NotFound)
                 };

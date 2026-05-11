@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use decdn_cache::{
-    CacheEngine, CacheError, DecompressMode, FilesystemOrigin, Hash, HttpOrigin, Origin,
-    OriginError, OriginFetch, OriginKind, OriginPullError, PinnedHashes, RetryPolicy,
+    CacheEngine, CacheError, CacheMetrics, DecompressMode, FilesystemOrigin, Hash, HttpOrigin,
+    Origin, OriginError, OriginFetch, OriginKind, OriginPullError, PinnedHashes, RetryPolicy,
     SupportedEncoding,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -54,6 +54,7 @@ async fn build_engine_no_retry(
         decdn_cache::PinnedHashes::empty(),
         RetryPolicy::disabled(),
         None,
+        Duration::ZERO,
     )
     .await?;
     Ok((engine, tmp))
@@ -89,6 +90,7 @@ async fn hash_mismatch_is_rejected_and_not_cached() -> anyhow::Result<()> {
     let server = MockServer::start().await;
     let expected = Hash::new(b"expected");
     let mismatched_payload: &[u8] = b"something else entirely";
+    let actual = Hash::new(mismatched_payload);
     Mock::given(method("GET"))
         .and(path(format!("/{}", expected.to_hex())))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(mismatched_payload))
@@ -101,7 +103,337 @@ async fn hash_mismatch_is_rejected_and_not_cached() -> anyhow::Result<()> {
         matches!(err, CacheError::HashMismatch { .. }),
         "expected HashMismatch, got: {err:?}"
     );
-    anyhow::ensure!(!engine.has(expected).await?, "bad bytes must not be cached");
+    anyhow::ensure!(
+        !engine.has(expected).await?,
+        "expected hash must not be cached"
+    );
+    // Cache-poisoning mitigation: the wrong-hash bytes briefly land
+    // in iroh-blobs under `actual` (their own BLAKE3) when
+    // `add_stream` commits before we hash-check. The engine logically
+    // evicts `actual` on mismatch so neither `has(actual)` nor
+    // `get(actual)` reaches the partial bytes — the fix for the
+    // attack window the streaming refactor introduced.
+    anyhow::ensure!(
+        !engine.has(actual).await?,
+        "actual-hash bytes must be logically evicted (cache-poisoning mitigation)"
+    );
+    Ok(())
+}
+
+/// Periodic iroh-blobs GC must reclaim the partial-import bytes left
+/// behind by a hash-mismatch pull-through (#518). Threat model: a
+/// hostile origin streams `max_blob_size_mb - 1` of garbage and errors
+/// on the last byte; the engine logically evicts the wrong-hash blob
+/// (`actual`) so `engine.has(actual)` returns false, but the bytes
+/// stay on disk under iroh-blobs' tag-less commit until the GC sweep
+/// fires. This test wires a 200ms GC interval and asserts that within
+/// a small handful of cycles the bytes really do leave disk and the
+/// `gc_*` metrics record the reclaim.
+#[tokio::test]
+async fn gc_reclaims_partial_import_bytes() -> anyhow::Result<()> {
+    let server = MockServer::start().await;
+    let expected = Hash::new(b"expected");
+    let mismatched_payload: &[u8] = b"a body the origin pretends matches the requested hash";
+    let actual = Hash::new(mismatched_payload);
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", expected.to_hex())))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(mismatched_payload))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir()?;
+    let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
+    let metrics = Arc::new(CacheMetrics::default());
+    // Tight interval so the test runs in well under a second on a
+    // loaded CI machine. Two cycles are needed to observe a nonzero
+    // `gc_bytes_reclaimed_total`: cycle 1 snapshots the pre-sweep set
+    // (no prior baseline → reclaim = 0), cycle 2 sees the disappeared
+    // hash and attributes its bytes to the previous sweep.
+    let gc_interval = Duration::from_millis(200);
+    let engine = CacheEngine::open_full(
+        tmp.path(),
+        Some(origin),
+        16,
+        PinnedHashes::empty(),
+        RetryPolicy::disabled(),
+        Some(Arc::clone(&metrics)),
+        gc_interval,
+    )
+    .await?;
+
+    let err = err_of(engine.get(expected).await)?;
+    anyhow::ensure!(
+        matches!(err, CacheError::HashMismatch { .. }),
+        "expected HashMismatch, got: {err:?}"
+    );
+
+    // Pre-GC: iroh-blobs still holds the mismatched bytes under
+    // `actual`. `inspect` reads `BlobStatus` directly and ignores the
+    // engine's logical-evict log, so a `Some(_)` size here proves the
+    // disk-leak existed before GC ran.
+    let pre = engine.inspect(actual).await?;
+    anyhow::ensure!(
+        pre.size_bytes.is_some(),
+        "actual-hash bytes must be on disk before GC runs (got size_bytes = None)"
+    );
+    anyhow::ensure!(
+        pre.already_evicted,
+        "engine should have logically-evicted actual on hash mismatch"
+    );
+
+    // Wait for enough sweep cycles to (a) run the sweep that deletes
+    // the bytes and (b) run the next sweep whose pre-sweep snapshot
+    // observes the disappearance and bumps `gc_bytes_reclaimed_total`.
+    // Sixteen cycles' worth of slack (3.2s wallclock total at 200ms
+    // interval) absorbs scheduling jitter on heavily-loaded CI hosts
+    // without making a green path slow.
+    let deadline = std::time::Instant::now() + gc_interval * 16;
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(gc_interval).await;
+        let post = engine.inspect(actual).await?;
+        if post.size_bytes.is_none() && metrics.gc_bytes_reclaimed.get() > 0 {
+            break;
+        }
+    }
+
+    let post = engine.inspect(actual).await?;
+    anyhow::ensure!(
+        post.size_bytes.is_none(),
+        "actual-hash bytes must be reclaimed by iroh-blobs GC; got size_bytes = {:?}",
+        post.size_bytes
+    );
+    anyhow::ensure!(
+        metrics.gc_runs.get() >= 1,
+        "gc_runs_total should be >=1 after the periodic loop has fired; got {}",
+        metrics.gc_runs.get()
+    );
+    anyhow::ensure!(
+        metrics.gc_bytes_reclaimed.get() >= mismatched_payload.len() as u64,
+        "gc_bytes_reclaimed_total should cover at least the mismatched payload \
+         ({} bytes); got {}",
+        mismatched_payload.len(),
+        metrics.gc_bytes_reclaimed.get()
+    );
+
+    Ok(())
+}
+
+/// Locks in the **lagged-by-one-cycle attribution** documented in the
+/// `gc_bytes_reclaimed_total` metric: the first sweep records a baseline
+/// and reports zero reclaim, the second sweep attributes the previous
+/// sweep's deletes. A regression that snapshotted post-sweep instead of
+/// pre-sweep (or double-counted the first cycle) would inflate
+/// `gc_bytes_reclaimed_total` by the entire blob set on every restart —
+/// the exact alert signal `gc_bytes_reclaimed_total` exists for —
+/// and the broader-shaped `gc_reclaims_partial_import_bytes` test would
+/// still pass because it only asserts `>= mismatched_payload.len()`.
+#[tokio::test]
+async fn gc_attribution_lags_one_cycle() -> anyhow::Result<()> {
+    let server = MockServer::start().await;
+    let expected = Hash::new(b"expected-lag");
+    let mismatched_payload: &[u8] = b"a body whose blake3 disagrees with the requested hash";
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", expected.to_hex())))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(mismatched_payload))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir()?;
+    let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
+    let metrics = Arc::new(CacheMetrics::default());
+    // Generous interval so the polling loop has wide margins between
+    // cycle 1 and cycle 2 — we need to read the metric state after
+    // cycle 1 fires but before cycle 2 fires.
+    let gc_interval = Duration::from_millis(500);
+    let engine = CacheEngine::open_full(
+        tmp.path(),
+        Some(origin),
+        16,
+        PinnedHashes::empty(),
+        RetryPolicy::disabled(),
+        Some(Arc::clone(&metrics)),
+        gc_interval,
+    )
+    .await?;
+
+    let err = err_of(engine.get(expected).await)?;
+    anyhow::ensure!(
+        matches!(err, CacheError::HashMismatch { .. }),
+        "expected HashMismatch, got: {err:?}"
+    );
+
+    // Poll for cycle 1 to fire. The cb bumps gc_runs_total once per
+    // sweep, so the transition 0 -> 1 marks cycle 1 completion.
+    let cycle1_deadline = std::time::Instant::now() + gc_interval * 4;
+    while metrics.gc_runs.get() < 1 {
+        anyhow::ensure!(
+            std::time::Instant::now() < cycle1_deadline,
+            "cycle 1 did not fire within {}ms",
+            (gc_interval * 4).as_millis()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Cycle 1 fired. Both counter bumps happen in the same cb body, so
+    // observing `gc_runs_total >= 1` means `gc_bytes_reclaimed_total`
+    // has already taken its cycle-1 contribution (which must be 0 —
+    // no prior baseline to diff against).
+    anyhow::ensure!(
+        metrics.gc_bytes_reclaimed.get() == 0,
+        "after cycle 1, gc_bytes_reclaimed_total must be 0 (no prior baseline to diff against); got {}",
+        metrics.gc_bytes_reclaimed.get()
+    );
+
+    // Poll for cycle 2.
+    let cycle2_deadline = std::time::Instant::now() + gc_interval * 4;
+    while metrics.gc_runs.get() < 2 {
+        anyhow::ensure!(
+            std::time::Instant::now() < cycle2_deadline,
+            "cycle 2 did not fire within {}ms after cycle 1",
+            (gc_interval * 4).as_millis()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    anyhow::ensure!(
+        metrics.gc_bytes_reclaimed.get() > 0,
+        "cycle 2 must attribute cycle-1's reclaim; got 0 bytes after 2 cycles"
+    );
+
+    Ok(())
+}
+
+/// The other limb of #518's threat model: the engine must reclaim
+/// partial-import bytes from a *cap-breach* (mid-stream `BlobTooLarge`),
+/// not just hash mismatch. The cap-breach path drops the (possibly
+/// successful) temp tag in `engine.rs::pull_through` after the
+/// `count_and_cap_stream` adapter writes a `BlobTooLargeMarker` into
+/// the captured-error side-channel. Without GC, those bytes leak.
+/// This locks in the metric path that an operator alert ("hostile
+/// origin amplifying disk via repeated mid-stream errors", per the
+/// `gc_bytes_reclaimed_total` docstring) actually depends on.
+#[tokio::test]
+async fn gc_reclaims_cap_breach_partial_bytes() -> anyhow::Result<()> {
+    // 2 MiB chunked body, 1 MiB cap, no Content-Length → only the
+    // streaming running-total check catches it. Same setup as
+    // `mid_stream_overrun_is_rejected_by_http_origin` plus GC.
+    let payload_bytes = 2 * 1024 * 1024;
+    let addr = spawn_chunked_oversize_server(payload_bytes).await?;
+    let origin_url = format!("http://{addr}/");
+
+    let tmp = tempfile::tempdir()?;
+    let origin = Arc::new(HttpOrigin::parse(&origin_url)?);
+    let metrics = Arc::new(CacheMetrics::default());
+    let gc_interval = Duration::from_millis(200);
+    let engine = CacheEngine::open_full(
+        tmp.path(),
+        Some(origin),
+        1, // max_blob_size_mb = 1 MiB; payload is 2 MiB
+        PinnedHashes::empty(),
+        RetryPolicy::disabled(),
+        Some(Arc::clone(&metrics)),
+        gc_interval,
+    )
+    .await?;
+
+    let err = err_of(engine.get(Hash::new(b"doesn't matter")).await)?;
+    anyhow::ensure!(
+        matches!(err, CacheError::BlobTooLarge { .. }),
+        "expected BlobTooLarge from mid-stream cap, got: {err:?}"
+    );
+
+    // Wait the same way `gc_reclaims_partial_import_bytes` does:
+    // cycle 1 establishes baseline, cycle 2 observes the reclaim and
+    // attributes the bytes. Sixteen cycles' headroom for slow CI.
+    let deadline = std::time::Instant::now() + gc_interval * 16;
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(gc_interval).await;
+        if metrics.gc_bytes_reclaimed.get() > 0 {
+            break;
+        }
+    }
+
+    anyhow::ensure!(
+        metrics.gc_runs.get() >= 1,
+        "gc_runs_total should be >=1 after the periodic loop has fired; got {}",
+        metrics.gc_runs.get()
+    );
+    // We don't assert an exact byte count — `count_and_cap_stream`
+    // can terminate the upstream slightly past `max_blob_bytes`
+    // depending on chunk boundaries, and add_stream may have
+    // committed a different fraction. The load-bearing claim is
+    // that the metric is *nonzero*: GC is reclaiming partial-import
+    // bytes from this code path.
+    anyhow::ensure!(
+        metrics.gc_bytes_reclaimed.get() > 0,
+        "gc_bytes_reclaimed_total should be nonzero after cap-breach + GC; got {}",
+        metrics.gc_bytes_reclaimed.get()
+    );
+
+    Ok(())
+}
+
+/// Sister to `gc_reclaims_partial_import_bytes` for the disabled
+/// branch: when `gc_interval = Duration::ZERO`, iroh-blobs must NOT
+/// spawn a GC loop, the partial-import bytes must stay on disk, and
+/// the GC metrics must stay at zero indefinitely. Locks in the
+/// `if gc_interval.is_zero() { None } else { Some(...) }` polarity at
+/// `engine.rs::open_full` — a regression that swapped the polarity of
+/// that condition would silently re-enable GC for every operator who
+/// set `gc_interval_sec = 0` (or vice versa, silently disabling for
+/// everyone else).
+#[tokio::test]
+async fn gc_disabled_does_not_reclaim_or_emit_metrics() -> anyhow::Result<()> {
+    let server = MockServer::start().await;
+    let expected = Hash::new(b"expected-disabled");
+    let mismatched_payload: &[u8] = b"a body with a different blake3 than the requested hash";
+    let actual = Hash::new(mismatched_payload);
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", expected.to_hex())))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(mismatched_payload))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir()?;
+    let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
+    let metrics = Arc::new(CacheMetrics::default());
+    let engine = CacheEngine::open_full(
+        tmp.path(),
+        Some(origin),
+        16,
+        PinnedHashes::empty(),
+        RetryPolicy::disabled(),
+        Some(Arc::clone(&metrics)),
+        Duration::ZERO, // GC disabled
+    )
+    .await?;
+
+    let err = err_of(engine.get(expected).await)?;
+    anyhow::ensure!(
+        matches!(err, CacheError::HashMismatch { .. }),
+        "expected HashMismatch, got: {err:?}"
+    );
+
+    // Sleep long enough that a 200ms-interval GC loop would have fired
+    // multiple times if it had been spawned. With GC disabled, nothing
+    // should change.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let post = engine.inspect(actual).await?;
+    anyhow::ensure!(
+        post.size_bytes.is_some(),
+        "actual-hash bytes must remain on disk when GC is disabled; got size_bytes = None"
+    );
+    anyhow::ensure!(
+        metrics.gc_runs.get() == 0,
+        "gc_runs_total must stay at 0 when GC is disabled; got {}",
+        metrics.gc_runs.get()
+    );
+    anyhow::ensure!(
+        metrics.gc_bytes_reclaimed.get() == 0,
+        "gc_bytes_reclaimed_total must stay at 0 when GC is disabled; got {}",
+        metrics.gc_bytes_reclaimed.get()
+    );
+
     Ok(())
 }
 
@@ -172,7 +504,7 @@ impl Origin for OversizedOrigin {
     ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, decdn_cache::OriginPullError>> + Send + '_>>
     {
         let payload = self.payload.clone();
-        Box::pin(async move { Ok(OriginFetch::Found(payload)) })
+        Box::pin(async move { Ok(OriginFetch::found_one_shot(payload)) })
     }
 }
 
@@ -355,6 +687,7 @@ async fn response_headers_timeout_fires_on_silent_server() -> anyhow::Result<()>
         PinnedHashes::empty(),
         RetryPolicy::disabled(),
         None,
+        Duration::ZERO,
     )
     .await?;
 
@@ -389,6 +722,7 @@ async fn chunk_idle_timeout_fires_when_origin_stalls_mid_body() -> anyhow::Resul
         PinnedHashes::empty(),
         RetryPolicy::disabled(),
         None,
+        Duration::ZERO,
     )
     .await?;
 
@@ -411,12 +745,14 @@ async fn chunk_idle_timeout_fires_when_origin_stalls_mid_body() -> anyhow::Resul
 }
 
 #[tokio::test]
-async fn pull_through_succeeds_above_blocking_hash_threshold() -> anyhow::Result<()> {
-    // 2 MiB payload crosses the 1 MiB `BLOCKING_HASH_THRESHOLD`, exercising
-    // the `spawn_blocking` branch of hash verification. A regression
-    // (missing `.await`, wrong comparator, panic in the blocking task) is
-    // caught here — prior tests above the threshold all abort earlier on
-    // size / hash mismatch.
+async fn pull_through_succeeds_above_one_mib_payload() -> anyhow::Result<()> {
+    // 2 MiB payload exercises the streaming pull-through across multiple
+    // origin chunks — `tokio_util::io::ReaderStream` emits 4 KiB-sized
+    // chunks by default, so 2 MiB → ~512 chunks through `add_stream`'s
+    // bidi protocol. Used to exercise the explicit `spawn_blocking`
+    // BLAKE3 path before #271; that double-hash is now handled inside
+    // iroh-blobs' `add_stream` so this test is now a regression check
+    // that multi-chunk streaming completes through the engine.
     let payload = vec![0x7Fu8; 2 * 1024 * 1024];
     let hash = Hash::new(&payload);
 
@@ -448,14 +784,9 @@ async fn mid_stream_overrun_is_rejected_by_http_origin() -> anyhow::Result<()> {
 
     // Any hash works — the raw TCP server doesn't match paths.
     let err = err_of(engine.get(Hash::new(b"doesn't matter")).await)?;
-    let msg = format!("{err:#}");
     anyhow::ensure!(
-        matches!(err, CacheError::OriginError { .. }),
-        "expected OriginError from mid-stream cap, got: {err:?}"
-    );
-    anyhow::ensure!(
-        msg.contains("mid-stream"),
-        "error message missing mid-stream marker: {msg}"
+        matches!(err, CacheError::BlobTooLarge { .. }),
+        "expected BlobTooLarge from mid-stream cap, got: {err:?}"
     );
     Ok(())
 }
@@ -768,23 +1099,34 @@ async fn serve_encoded(encoding: &'static str, body: Vec<u8>, canonical_hash: Ha
     server
 }
 
-/// Force `read_capped`'s mid-stream cap to fire: gzip a small payload
-/// that decompresses well past `max_blob_mb`. Critical security path —
-/// without this test, a regression flipping `>` to `>=` (or removing
-/// the cap) is a memory-exhaustion `DoS` via a malicious origin.
+/// Reject a decompression bomb mid-stream. Critical security path —
+/// without this test, a regression that removed the running cap on
+/// the decoded byte count would be a memory-exhaustion `DoS` via a
+/// malicious origin.
+///
+/// Pre-#271 this was caught by `read_capped` inside `decompress_body`
+/// (a typed `OriginError::DecompressionFailed`). Post-#271 the
+/// engine's `count_and_cap_stream` is the single cap layer — it
+/// enforces `max_blob_bytes` on the **decoded** stream regardless of
+/// how the encoded bytes arrived (gzip, zstd, identity), so the bomb
+/// surfaces as a generic `CacheError::OriginError` whose message
+/// names the cap. Operator-debug fidelity: still actionable; the
+/// previously-typed `DecompressionFailed` variant now reaches the
+/// chain only when the decoder itself fails (truncated / empty body
+/// — see the dedicated tests below).
 #[tokio::test]
 async fn http_origin_rejects_decompression_bomb() -> anyhow::Result<()> {
-    // 4 MiB of zeros gzips to ~4 KiB. Engine cap = 1 MiB so the
-    // mid-stream check inside `read_capped` is the only thing that
-    // catches this — both the Content-Length fast-path (4 KiB encoded)
-    // and the engine post-receive cap would let it through.
+    // 4 MiB of zeros gzips to ~4 KiB. Engine cap = 1 MiB so neither
+    // the Content-Length fast-path (4 KiB encoded) nor the per-chunk
+    // cap on encoded bytes would catch this — only the
+    // count_and_cap_stream running total over decoded bytes does.
     let payload = vec![0u8; 4 * 1024 * 1024];
     let canonical = Hash::new(&payload);
     let compressed = gzip(&payload)?;
     anyhow::ensure!(
         compressed.len() < 1024 * 1024,
         "test setup: compressed body must be smaller than the cap to \
-         exercise the mid-stream check, was {} bytes",
+         exercise the running-total check, was {} bytes",
         compressed.len()
     );
     let server = serve_encoded("gzip", compressed, canonical).await;
@@ -795,26 +1137,8 @@ async fn http_origin_rejects_decompression_bomb() -> anyhow::Result<()> {
 
     let err = err_of(engine.get(canonical).await)?;
     anyhow::ensure!(
-        matches!(err, CacheError::OriginError { .. }),
-        "expected OriginError from bomb cap, got: {err:?}"
-    );
-    let kind = err
-        .origin_error_kind()
-        .ok_or_else(|| anyhow::anyhow!("expected typed OriginError downcast, got: {err:?}"))?;
-    anyhow::ensure!(
-        matches!(
-            kind,
-            OriginError::DecompressionFailed {
-                encoding: SupportedEncoding::Gzip,
-                ..
-            }
-        ),
-        "expected DecompressionFailed(Gzip), got: {kind:?}"
-    );
-    let msg = format!("{err:#}");
-    anyhow::ensure!(
-        msg.contains("mid-stream"),
-        "error message should name the mid-stream cap: {msg}"
+        matches!(err, CacheError::BlobTooLarge { .. }),
+        "expected BlobTooLarge from bomb cap, got: {err:?}"
     );
     Ok(())
 }
@@ -935,7 +1259,7 @@ async fn http_origin_rejects_multi_encoding_header() -> anyhow::Result<()> {
 /// Above the 1 MiB `DECOMPRESS_BLOCKING_THRESHOLD`, decompression runs
 /// inside `spawn_blocking`. A regression dropping the `.await` or
 /// flipping the comparator would fail this test (the current
-/// `pull_through_succeeds_above_blocking_hash_threshold` only exercises
+/// `pull_through_succeeds_above_one_mib_payload` only exercises
 /// the *hash* threshold via `FilesystemOrigin` and never decompresses).
 #[tokio::test]
 async fn http_origin_decompresses_above_blocking_threshold() -> anyhow::Result<()> {
@@ -1530,6 +1854,7 @@ async fn build_engine_with_retry(
         PinnedHashes::empty(),
         policy,
         None,
+        Duration::ZERO,
     )
     .await?;
     Ok((engine, tmp))
@@ -1600,7 +1925,7 @@ impl Origin for FailingThenSucceedingOrigin {
                     "synthetic transient failure {prior}"
                 )))
             } else if hash == target {
-                Ok(OriginFetch::Found(payload))
+                Ok(OriginFetch::found_one_shot(payload))
             } else {
                 Ok(OriginFetch::NotFound)
             }

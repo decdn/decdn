@@ -86,6 +86,12 @@ pub struct ResolvedCache {
     /// via `cache.user_agent` to attribute CDN traffic in origin access
     /// logs or to drive origin-side rate limits and routing policy.
     pub user_agent: String,
+    /// Interval between iroh-blobs GC sweeps in seconds (#518). `0`
+    /// disables the periodic sweep; any positive value is forwarded to
+    /// iroh-blobs' built-in GC loop. Default
+    /// [`crate::config::DEFAULT_GC_INTERVAL_SEC`] when the TOML section
+    /// omits the field.
+    pub gc_interval_sec: u64,
 }
 
 /// Resolved + validated origin backend selection (#437). Mirrors

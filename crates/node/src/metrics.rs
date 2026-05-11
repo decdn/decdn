@@ -393,6 +393,15 @@ mod tests {
             "decdn_cache_misses_total",
             "decdn_cache_bytes_returned_total",
             "decdn_cache_pull_through_bytes_total",
+            // GC counters (#518). The Rust struct fields are `gc_runs`
+            // / `gc_bytes_reclaimed`; the OpenMetrics encoder appends
+            // `_total`. Asserting the suffixed forms locks in the
+            // exported names — a regression that re-renamed the
+            // struct fields to include `_total` would emit
+            // `..._total_total`, breaking dashboards/alerts that
+            // reference the names below.
+            "decdn_cache_gc_runs_total",
+            "decdn_cache_gc_bytes_reclaimed_total",
         ] {
             assert!(
                 has_metric_line(&text, name, 0),
@@ -437,7 +446,7 @@ mod tests {
                 >,
             > {
                 let result = if hash == self.hash {
-                    Ok(OriginFetch::Found(self.data.clone()))
+                    Ok(OriginFetch::found_one_shot(self.data.clone()))
                 } else {
                     Ok(OriginFetch::NotFound)
                 };
@@ -462,6 +471,7 @@ mod tests {
             PinnedHashes::empty(),
             RetryPolicy::default(),
             Some(Arc::clone(&cache_handle)),
+            std::time::Duration::ZERO,
         )
         .await
         .unwrap();
@@ -499,6 +509,12 @@ mod tests {
         handle.misses.inc();
         handle.bytes_returned.inc_by(1024);
         handle.pull_through_bytes.inc_by(2048);
+        // GC counters (#518). The struct fields are `gc_runs` /
+        // `gc_bytes_reclaimed`; bumping them here and asserting the
+        // `..._total`-suffixed exported names round-trip locks in the
+        // encoder behavior that motivated the field-name shape.
+        handle.gc_runs.inc();
+        handle.gc_bytes_reclaimed.inc_by(4096);
         let text = metrics.encode().unwrap();
         for (name, expected) in [
             ("decdn_cache_origin_fetches_total", 1u64),
@@ -507,6 +523,8 @@ mod tests {
             ("decdn_cache_misses_total", 1),
             ("decdn_cache_bytes_returned_total", 1024),
             ("decdn_cache_pull_through_bytes_total", 2048),
+            ("decdn_cache_gc_runs_total", 1),
+            ("decdn_cache_gc_bytes_reclaimed_total", 4096),
         ] {
             assert!(
                 has_metric_line(&text, name, expected),
