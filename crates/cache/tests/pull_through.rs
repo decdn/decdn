@@ -2480,7 +2480,7 @@ async fn spawn_mid_body_reset_server(
 /// Small-blob mid-stream reset (`size_hint` <= 4 MiB) — exercises the
 /// buffer-then-commit path. Pre-#519: a single `io::Error` and the engine
 /// surfaces `OriginError` after one dispatch. Post-#519: the drain
-/// path classifies the error as Transient and re-enters `retry_fetch`.
+/// path classifies the error as Transient and re-enters the retry loop.
 #[tokio::test]
 async fn mid_stream_transient_retries_small_blob() -> anyhow::Result<()> {
     let payload = bytes::Bytes::from_static(b"a small blob that fits in the buffered drain path");

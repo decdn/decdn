@@ -243,7 +243,7 @@ impl S3Origin {
 
         // Disable the SDK's internal retry layer. Without this, transient
         // failures get retried *twice*: once by the SDK (default 3 attempts)
-        // and again by the cache engine's outer `retry_fetch` (default 4
+        // and again by the cache engine's outer retry loop (default 4
         // attempts), producing up to 12 dispatches per logical fetch on
         // sustained 5xx — not what an operator reading
         // `cache.origin_retry.max_retries = 3` expects. By disabling the
@@ -343,8 +343,9 @@ const fn is_transient_status(status: u16) -> bool {
 /// Errors that may be cured by retry (timeouts, dispatch failures,
 /// 5xx/408/429) become `Transient`; everything else (other 4xx,
 /// construction failures, response-parse failures, Glacier-cold objects)
-/// becomes `Permanent`. The cache engine's `retry_fetch` drives the
-/// retry budget off this distinction.
+/// becomes `Permanent`. The cache engine's retry loop
+/// (`crate::retry::run_with_retry`) drives the retry budget off
+/// this distinction.
 ///
 /// `SdkError` is `#[non_exhaustive]`. The catch-all arm classifies
 /// future variants as `Permanent` (fail fast over retry-storm) and

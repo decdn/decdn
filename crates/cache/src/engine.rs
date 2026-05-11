@@ -19,7 +19,7 @@ use tokio::sync::Notify;
 use crate::error::{CacheError, CacheResult, OriginPullError};
 use crate::metrics::CacheMetrics;
 use crate::origin::{Origin, OriginKind};
-use crate::retry::{RetryPolicy, classify_io_error, run_with_retry};
+use crate::retry::{RetryPolicy, classify_io_error, drain_to_bytes, run_with_retry, should_buffer};
 
 /// Engine bundling a filesystem-backed iroh-blobs store with an optional
 /// origin backend. Lookups hit the store first; on miss and when an origin is
@@ -1199,15 +1199,10 @@ impl CacheEngine {
         let max_blob_bytes = self.inner.max_blob_bytes;
         let policy = self.inner.retry_policy;
 
-        // Run the per-attempt closure under `run_with_retry`. The
-        // closure does origin.fetch + (drain | stream-and-commit) +
-        // hash verify in one shot. Transient body-phase failures
-        // re-enter the loop (abort+restart for the streaming branch,
-        // buffer-then-commit for the drain branch — both inside
-        // `run_with_retry`). Deterministic non-retryable outcomes
-        // (Store / HashMismatch / BlobTooLarge) short-circuit out via
-        // `PullThroughOutcome` so the loop's `OriginPullError` exit
-        // taxonomy stays focused on retry-class failures.
+        // Deterministic non-retryable outcomes (Store / HashMismatch /
+        // BlobTooLarge) ride out via `PullThroughOutcome` so the
+        // retry loop's `OriginPullError` exit taxonomy stays focused
+        // on retry-class failures.
         let outcome = run_with_retry(policy, self.inner.metrics.as_ref(), hash, || {
             self.pull_through_attempt(hash, max_blob_bytes, policy)
         })
@@ -1252,9 +1247,11 @@ impl CacheEngine {
         max_blob_bytes: u64,
         policy: RetryPolicy,
     ) -> Result<PullThroughOutcome, OriginPullError> {
-        // SAFETY: `pull_through` checked `origin.is_some()` before
+        // Invariant: `pull_through` checked `origin.is_some()` before
         // entering the retry loop; coalesced waiters never re-enter
-        // this method from a path that bypasses that check.
+        // this method from a path that bypasses that check. (`SAFETY:`
+        // is reserved for `unsafe` blocks; this is a logical
+        // invariant in safe code.)
         let Some(origin) = self.inner.origin.as_ref() else {
             // Returning Permanent ensures `run_with_retry` exits
             // without burning the budget on an unreachable case.
@@ -1280,42 +1277,32 @@ impl CacheEngine {
             return Ok(PullThroughOutcome::BlobTooLarge);
         }
 
-        // Buffer-then-commit branch (#519): drain the body into memory
-        // before handing to iroh-blobs. Drain errors are classifiable
-        // and re-enter the retry loop, restoring pre-#271 retry
-        // semantics for sub-threshold blobs.
-        if should_buffer_attempt(size_hint, policy.buffered_max_bytes) {
+        if should_buffer(size_hint, policy.buffered_max_bytes) {
             let drain_cap = policy.buffered_max_bytes.min(max_blob_bytes);
-            let bytes =
-                match drain_origin_stream(stream, drain_cap, self.inner.metrics.as_ref()).await {
-                    Ok(b) => b,
-                    // Cap-breach: surface as `BlobTooLarge` directly (typed
-                    // outcome). Routing through `classify_io_error` would
-                    // collapse it to a generic `OriginError` and operators
-                    // alerting on the typed `BlobTooLarge` metric would
-                    // lose visibility.
-                    Err(e) if is_blob_too_large_marker(&e) => {
-                        return Ok(PullThroughOutcome::BlobTooLarge);
-                    }
-                    Err(e) => return Err(classify_io_error(e)),
-                };
+            let bytes = match drain_to_bytes(stream, drain_cap, self.inner.metrics.as_ref()).await {
+                Ok(b) => b,
+                // Cap-breach: surface as `BlobTooLarge` directly (typed
+                // outcome). Routing through `classify_io_error` would
+                // collapse it to a generic `OriginError` and operators
+                // alerting on the typed `BlobTooLarge` metric would
+                // lose visibility.
+                Err(e) if is_blob_too_large_marker(&e) => {
+                    return Ok(PullThroughOutcome::BlobTooLarge);
+                }
+                Err(e) => return Err(classify_io_error(e)),
+            };
             return self.commit_buffered_bytes(hash, bytes).await;
         }
 
-        // Streaming abort+restart branch (#519): hand the stream to
-        // `iroh-blobs::add_stream`, capture mid-stream errors via the
-        // side channel, classify them after `temp_tag().await`, and
-        // re-enter the retry loop on Transient. Each failed attempt
-        // strands a partial `TempTag` worth of bytes that iroh-blobs
-        // GC reclaims at `cache.gc_interval_sec` cadence (#518).
-        //
-        // `captured_err` is the side-channel for mid-stream errors:
-        // iroh-blobs' `add_stream` swallows the upstream `io::Error`
+        // Streaming path: hand the stream to `iroh-blobs::add_stream`
+        // and capture mid-stream errors via the side channel.
+        // `iroh-blobs::add_stream` swallows the upstream `io::Error`
         // (it `?`-propagates inside an async block whose error is
         // discarded), so without this capture the engine sees only
-        // "unexpected end of stream" and operators lose the actionable
-        // upstream message ("body read stalled", "exceeded max blob
-        // size mid-flight", etc.).
+        // "unexpected end of stream" and operators lose the
+        // actionable upstream message. Failed attempts strand a
+        // partial `TempTag` worth of bytes; iroh-blobs GC reclaims
+        // them at `cache.gc_interval_sec` cadence.
         let captured_err: Arc<Mutex<Option<std::io::Error>>> = Arc::new(Mutex::new(None));
         let counted = count_and_cap_stream(
             stream,
@@ -1347,8 +1334,8 @@ impl CacheEngine {
             if is_blob_too_large_marker(&upstream) {
                 return Ok(PullThroughOutcome::BlobTooLarge);
             }
-            // Otherwise classify via the shared body-phase classifier
-            // (#519): typed `OriginError::*` inners surface as
+            // Otherwise classify via the shared body-phase
+            // classifier: typed `OriginError::*` inners surface as
             // Permanent (decompression failures, etc.);
             // `io::ErrorKind`-Transient kinds (ConnectionReset,
             // TimedOut, …) surface as Transient and re-enter the
@@ -1505,53 +1492,6 @@ enum PullThroughOutcome {
 fn is_blob_too_large_marker(e: &std::io::Error) -> bool {
     e.get_ref()
         .is_some_and(<dyn std::error::Error + Send + Sync>::is::<BlobTooLargeMarker>)
-}
-
-/// Per-attempt buffer-or-stream decision. Mirrors the same predicate in
-/// `retry::should_buffer` (it'd be more DRY to share, but the helper is
-/// `const` and small, and the engine-side copy lets us evolve the
-/// decision over time — e.g. tying it to an in-flight memory budget —
-/// without exporting a wider surface from `retry`).
-const fn should_buffer_attempt(size_hint: Option<u64>, buffered_max_bytes: u64) -> bool {
-    if buffered_max_bytes == 0 {
-        return false;
-    }
-    match size_hint {
-        Some(n) => n <= buffered_max_bytes,
-        None => false,
-    }
-}
-
-/// Drain an origin byte stream into a contiguous [`Bytes`], capping
-/// the buffer at `cap` bytes. Mirrors the `drain_to_bytes` helper in
-/// `crate::retry` but lives engine-side so it can use the engine's
-/// metrics handle directly. Per-chunk `pull_through_bytes` bumps
-/// keep egress accounting symmetric with `count_and_cap_stream` on
-/// the streaming path.
-async fn drain_origin_stream(
-    mut stream: crate::origin::OriginByteStream,
-    cap: u64,
-    metrics: Option<&Arc<CacheMetrics>>,
-) -> std::io::Result<Bytes> {
-    use bytes::BytesMut;
-    use futures_util::StreamExt;
-    const INITIAL_CAP: usize = 1 << 20;
-    let initial = usize::try_from(cap).unwrap_or(INITIAL_CAP).min(INITIAL_CAP);
-    let mut buf = BytesMut::with_capacity(initial);
-    let mut total: u64 = 0;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        if let Some(m) = metrics {
-            m.pull_through_bytes
-                .inc_by(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
-        }
-        total = total.saturating_add(chunk.len() as u64);
-        if total > cap {
-            return Err(std::io::Error::other(BlobTooLargeMarker { max_bytes: cap }));
-        }
-        buf.extend_from_slice(&chunk);
-    }
-    Ok(buf.freeze())
 }
 
 pub(crate) use crate::origin::BlobTooLargeMarker;

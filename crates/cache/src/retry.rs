@@ -13,10 +13,14 @@
 //!
 //! - **Buffer-then-commit (small blobs):** when the adapter advertises a
 //!   `size_hint` at or below [`RetryPolicy::buffered_max_bytes`] (default
-//!   4 MiB), [`retry_fetch`] drains the stream into a bounded `BytesMut`
-//!   before returning. Drain errors are classified via the internal
-//!   `classify_io_error` helper and re-fed to the loop — restoring
-//!   pre-#271 retry semantics for small blobs at a bounded memory cost.
+//!   4 MiB), the engine's per-attempt closure drains the stream into a
+//!   bounded `BytesMut` before handing it to iroh-blobs. Drain errors are
+//!   classified via the internal `classify_io_error` helper (which
+//!   recognises typed `BlobTooLargeMarker` and `OriginError::*` as
+//!   Permanent, treats `io::ErrorKind::{ConnectionReset, TimedOut,
+//!   UnexpectedEof, …}` and the catch-all `Other` as Transient) and
+//!   re-fed to the loop — restoring pre-#271 retry semantics for small
+//!   blobs at a bounded memory cost.
 //! - **Abort + restart (large blobs):** the engine's per-attempt closure
 //!   commits to `iroh-blobs::add_stream` directly. On mid-stream
 //!   `io::Error`, the partial `TempTag` is dropped (iroh-blobs GC
@@ -55,21 +59,21 @@ const DEFAULT_MAX_RETRIES: u32 = 3;
 const DEFAULT_INITIAL_BACKOFF_MS: u64 = 100;
 const DEFAULT_MAX_BACKOFF_MS: u64 = 10_000;
 const DEFAULT_JITTER_RATIO: f64 = 0.1;
-/// Default per-fetch memory budget for the buffer-then-commit path (#519).
-/// At or below this advertised `size_hint`, [`retry_fetch`] drains the
-/// origin body into a `BytesMut` before handing it back, so mid-stream
-/// transient `io::Error`s can be retried (pre-#271 semantics for small
-/// blobs). Above the threshold the engine takes the streaming path and
-/// uses abort + restart instead — no memory amplification, but
-/// disk-amp cost per failed attempt until iroh-blobs GC sweeps. 4 MiB
-/// covers typical web assets while keeping per-fetch RSS predictable.
+/// Default per-fetch memory budget for the buffer-then-commit path.
+/// At or below this advertised `size_hint`, the engine's per-attempt
+/// closure drains the origin body into a `BytesMut` before handing
+/// it to iroh-blobs, so mid-stream transient `io::Error`s can be
+/// retried (pre-#271 semantics for small blobs). Above the threshold
+/// the engine takes the streaming path and uses abort + restart
+/// instead — no memory amplification, but disk-amp cost per failed
+/// attempt until iroh-blobs GC sweeps. 4 MiB covers typical web
+/// assets while keeping per-fetch RSS predictable.
 const DEFAULT_BUFFERED_MAX_BYTES: u64 = 4 << 20;
 
 /// `#[serde(default = ...)]` shim — `Default::default()` on the whole
 /// struct can't be used field-by-field, so missing fields in a partial
-/// `[cache.origin_retry]` section route through these helpers.
-#[allow(clippy::missing_const_for_fn)] // serde requires `fn`, not `const fn`
-pub(crate) fn default_buffered_max_bytes() -> u64 {
+/// `[cache.origin_retry]` section route through this helper.
+pub(crate) const fn default_buffered_max_bytes() -> u64 {
     DEFAULT_BUFFERED_MAX_BYTES
 }
 
@@ -99,15 +103,15 @@ pub struct RetryPolicy {
     /// `[0.5*base, 1.5*base)` — the AWS "equal jitter" recipe.
     pub jitter_ratio: f64,
     /// Per-fetch memory budget for the buffer-then-commit body-phase
-    /// retry path (#519). When the origin advertises a `size_hint` at
-    /// or below this value, [`retry_fetch`] drains the stream into a
-    /// `BytesMut` before returning — drain errors get classified and
-    /// re-feed the retry loop, restoring pre-#271 mid-stream retry
-    /// semantics for small blobs. Above the threshold (or when
-    /// `size_hint` is `None`) the engine uses streaming abort+restart
-    /// instead; memory stays bounded but each failed attempt strands
-    /// up to `max_blob_bytes` of partial-import bytes until
-    /// iroh-blobs GC reclaims them.
+    /// retry path. When the origin advertises a `size_hint` at or
+    /// below this value, the engine drains the stream into a
+    /// `BytesMut` before committing — drain errors get classified
+    /// and re-feed the retry loop, restoring pre-#271 mid-stream
+    /// retry semantics for small blobs. Above the threshold (or
+    /// when `size_hint` is `None`) the engine uses streaming
+    /// abort+restart instead; memory stays bounded but each failed
+    /// attempt strands up to `max_blob_bytes` of partial-import bytes
+    /// until iroh-blobs GC reclaims them.
     ///
     /// `0` disables the buffer path entirely (all body-phase failures
     /// go through the streaming abort+restart path).
@@ -296,7 +300,7 @@ pub async fn retry_fetch(
 /// buffer in memory for body-phase retry classification. Unknown
 /// (`None`) hint falls through to streaming — buffering an unknown-size
 /// body would let a lying origin overrun the operator's memory budget.
-const fn should_buffer(size_hint: Option<u64>, buffered_max_bytes: u64) -> bool {
+pub(crate) const fn should_buffer(size_hint: Option<u64>, buffered_max_bytes: u64) -> bool {
     if buffered_max_bytes == 0 {
         return false;
     }
@@ -316,7 +320,7 @@ const fn should_buffer(size_hint: Option<u64>, buffered_max_bytes: u64) -> bool 
 /// - Per-chunk `pull_through_bytes` metric bumps for egress-accounting
 ///   parity with the streaming path (every byte the origin sent is
 ///   billed, even on a drain that ultimately fails).
-async fn drain_to_bytes(
+pub(crate) async fn drain_to_bytes(
     mut stream: OriginByteStream,
     cap: u64,
     metrics: Option<&Arc<CacheMetrics>>,
@@ -347,9 +351,9 @@ async fn drain_to_bytes(
 
 /// Classify a body-phase `io::Error` into the retry loop's
 /// [`OriginPullError`] taxonomy. Used by both the drain path
-/// ([`drain_to_bytes`] → [`retry_fetch`]) and the streaming path
-/// (engine's side-channel reader) so the classification is consistent
-/// across the two body-phase entry points (#519).
+/// ([`drain_to_bytes`]) and the streaming path (engine's
+/// side-channel reader) so the classification is consistent
+/// across the two body-phase entry points.
 ///
 /// The decision tree:
 ///
@@ -360,15 +364,19 @@ async fn drain_to_bytes(
 ///    These are deterministic protocol or cap violations — retry
 ///    won't help and would just waste budget.
 ///
-/// 2. Otherwise dispatch on `io::ErrorKind`. The Transient set covers
-///    the failure modes that the pre-#271 reqwest path classified as
-///    `is_body()`/`is_connect()`/`is_timeout()`, plus their tokio /
-///    SDK / filesystem equivalents. `ErrorKind::Other` defaults to
-///    Transient because all three origin adapters wrap reqwest / SDK
-///    body errors via `io::Error::other(...)` — pre-#271 those would
-///    have been transient `reqwest::Error`s and retried. Anything not
-///    in the Transient set is classified Permanent (fail-fast over
-///    retry-storm for unrecognised modes).
+/// 2. Otherwise dispatch on `io::ErrorKind`. The Transient set:
+///    `Interrupted`, `TimedOut`, `WouldBlock`, `ResourceBusy`,
+///    `BrokenPipe`, `ConnectionReset`, `ConnectionAborted`,
+///    `ConnectionRefused`, `NotConnected`, `UnexpectedEof`, and the
+///    catch-all `Other`. `UnexpectedEof` is the load-bearing kind
+///    for mid-body resets behind a flaky LB — reqwest surfaces
+///    truncated Content-Length responses through it. `Other`
+///    defaults to Transient because all three origin adapters wrap
+///    reqwest / SDK body errors via `io::Error::other(...)` —
+///    pre-#271 those would have been transient `reqwest::Error`s
+///    and retried. Anything not in the Transient set is classified
+///    Permanent (fail-fast over retry-storm for unrecognised
+///    modes).
 pub(crate) fn classify_io_error(e: io::Error) -> OriginPullError {
     // Consume the error up front so we can chain `downcast` on the
     // inner box without re-checking. `io::Error::into_inner` returns
