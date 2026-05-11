@@ -229,7 +229,7 @@ Using secp256k1 EIP-712 for `slash_sig` keeps per-signature verification at ~3k 
 #### Governable Parameters with Safety Bounds
 
 | Parameter | Contract | Default | Min | Max | Cross-parameter invariant |
-| --- | --- | ---: | ---: | ---: | --- |
+| --- | --- | --- | --- | --- | --- |
 | `MAX_EVIDENCE_AGE_US` | `SlashJudge` | 5 days | 1 day | 30 days | `< StakingRegistry.unbondingPeriod` (paired) |
 | `MAX_FUTURE_SKEW_US` | `SlashJudge` | 60 s | (fixed) | (fixed) | — |
 | Challenge bond | `SlashJudge` | (per [ADR 009](009-governance.md#governable-parameters-with-safety-bounds)) | 1 TOKEN | 1,000 TOKEN | — |
