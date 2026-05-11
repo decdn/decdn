@@ -9,7 +9,7 @@
 //! that gates `accept` on the shared [`ConnectionLimiter`] and only delegates
 //! to the inner handler if a permit is granted.
 //!
-//! ## What the wrapper actually enforces (issue #433)
+//! ## What the wrapper actually enforces
 //!
 //! Foreign handlers come in two shapes:
 //!
@@ -33,9 +33,8 @@
 //! stays held until the QUIC connection actually terminates. The watcher
 //! is detached intentionally — `Router::shutdown` (from `iroh::protocol`)
 //! calls `endpoint.close()`, which fires every pending
-//! [`Connection::closed`] future, so watchers terminate without any
-//! external coordination and the wrapper does not need a `JoinSet` field
-//! (which would force interior mutability for no real benefit).
+//! [`Connection::closed`] future, so watchers self-terminate and the
+//! wrapper does not need a `JoinSet` field.
 //!
 //! Per-source rate-limiting was already correctly gated even without the
 //! watcher, because [`ConnectionLimiter::acquire`] runs synchronously at
@@ -75,8 +74,6 @@ pub struct LimitedHandler<H: ProtocolHandler> {
 }
 
 impl<H: ProtocolHandler> LimitedHandler<H> {
-    /// Wrap `inner` with `limiter`. Construction is cheap: only an `H`
-    /// (typically itself a cheap `Clone`) and an `Arc` clone are stored.
     #[must_use = "constructing a LimitedHandler and dropping it does nothing — \
                   attach it to a Router::builder via .accept(...)"]
     #[allow(clippy::missing_const_for_fn)] // generic field assignment isn't const-stable.
@@ -129,36 +126,18 @@ impl<H: ProtocolHandler> ProtocolHandler for LimitedHandler<H> {
             }
         };
 
-        // Clone for the watcher BEFORE handing the original to inner.accept.
-        // `Connection` clones share QUIC state and all observe the same
-        // `closed()` event; this is a refcount bump, not a deep copy, and
-        // does not extend the connection's lifetime past what the inner
-        // handler keeps alive.
+        // Refcount-bump clone shared with the watcher; does not extend
+        // liveness past what the inner handler keeps alive.
         let conn_for_watcher = conn.clone();
 
-        // Run the inner handler. For inline-protocol (probe-shape) handlers
-        // this drives the full exchange; for return-fast (iroh-gossip-shape)
-        // handlers it completes once the connection has been handed off to
-        // the inner's internal task.
         self.inner.accept(conn).await?;
 
-        // Hold the permit until the connection actually closes. Without
-        // this watcher, gossip's 16-slot mpsc fully absorbs any burst and
-        // the global semaphore briefly back-pressures but never bounds the
-        // number of in-flight gossip connection tasks — see the module
-        // docs for the full rationale.
-        //
-        // The spawn is detached intentionally: `Router::shutdown` calls
-        // `endpoint.close()`, which fires every `Connection::closed()`
-        // future, so watchers terminate without external coordination.
-        // The watcher contains no panicking paths: `Permit::drop` is
-        // unconditional (it always decrements the in-flight gauge) and
-        // `closed()` returns `ConnectionError` rather than panicking. The
-        // `Err`-path above returns before reaching here, so a faulty inner
-        // handler that always errors does not leak a permit (see test
-        // `permit_releases_when_inner_returns_err`).
+        // Hold the permit until the connection actually closes — see the
+        // module-level docs for why this is necessary on the `Ok` path.
+        // `?` above short-circuits the spawn on `Err`, so a faulty inner
+        // handler does not pin a slot (`Permit::drop` is unconditional).
         tokio::spawn(async move {
-            let _permit_guard = permit; // held until closed() resolves
+            let _permit_guard = permit;
             let _ = conn_for_watcher.closed().await;
         });
 

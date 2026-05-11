@@ -351,10 +351,6 @@ async fn per_source_rejection_routes_through_wrapper() -> anyhow::Result<()> {
 /// after handing the `Connection` off to an internally-spawned task. Used
 /// to prove the wrapper's permit-holding watcher correctly bounds in-flight
 /// connections even when `inner.accept` itself returns fast.
-///
-/// Without the watcher, the permit would drop right after this `accept`
-/// returned and a second client would not see a `RATE_LIMITED` close — the
-/// exact gap flagged in review #4262648505 on PR #512.
 #[derive(Debug, Clone)]
 struct ReturnFastHandler {
     accepts: Arc<AtomicUsize>,
@@ -421,12 +417,8 @@ async fn rejects_second_connection_for_return_fast_inner() -> anyhow::Result<()>
         .await
         .map_err(|e| anyhow::anyhow!("client1 connect: {e}"))?;
 
-    // Wait for inner's spawned task to be live. By the time `accept`
-    // notifies `spawned`, `inner.accept` has already returned `Ok` and the
-    // wrapper has reached its `tokio::spawn(...)` call: the watcher owns
-    // the permit. (The permit is held continuously between `acquire` and
-    // the watcher task's drop; there is no await between them in the
-    // wrapper's accept body that could release it.)
+    // `spawned` fires after the wrapper has reached its `tokio::spawn(...)`
+    // call, so the watcher owns the permit by the time we proceed.
     tokio::time::timeout(Duration::from_secs(5), inner.spawned.notified())
         .await
         .map_err(|_| anyhow::anyhow!("inner.accept never spawned its task for client1"))?;
@@ -461,12 +453,45 @@ async fn rejects_second_connection_for_return_fast_inner() -> anyhow::Result<()>
          (the pre-watcher bug)"
     );
 
-    // Release inner's spawned task; it closes client1's connection, which
-    // fires the wrapper's watcher `closed()` and drops the permit.
+    // Release inner's task #1; it closes conn1 on the server side. Both
+    // the server-side watcher's clone and the client's `conn1` observe the
+    // close; the server-side `closed()` resolves before the close frame
+    // reaches the client, so by the time `conn1.closed()` resolves below
+    // the watcher has already dropped its permit.
     inner.release.notify_one();
     tokio::time::timeout(Duration::from_secs(5), conn1.closed())
         .await
         .map_err(|_| anyhow::anyhow!("client1 failed to close cleanly within 5s"))?;
+
+    // Client 3 — must now succeed, because the watcher released its permit
+    // when conn1 closed. A future regression that detaches the permit
+    // (`mem::forget`) or otherwise leaks it would not be caught by the
+    // earlier RATE_LIMITED assertion alone.
+    let (client3_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let target3 = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    let conn3 = client3_ep
+        .connect(target3, TEST_ALPN)
+        .await
+        .map_err(|e| anyhow::anyhow!("client3 connect: {e}"))?;
+    tokio::time::timeout(Duration::from_secs(5), inner.spawned.notified())
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "inner.accept never spawned its task for client3 — \
+                                      watcher likely failed to release the permit"
+            )
+        })?;
+    assert_eq!(
+        inner.accepts.load(Ordering::SeqCst),
+        2,
+        "client3 must reach the inner handler after conn1 closed"
+    );
+
+    // Cleanup task #2 so teardown is deterministic.
+    inner.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), conn3.closed())
+        .await
+        .map_err(|_| anyhow::anyhow!("client3 failed to close cleanly within 5s"))?;
 
     router
         .shutdown()
@@ -474,6 +499,77 @@ async fn rejects_second_connection_for_return_fast_inner() -> anyhow::Result<()>
         .map_err(|e| anyhow::anyhow!("router.shutdown: {e}"))?;
     client1_ep.close().await;
     client2_ep.close().await;
+    client3_ep.close().await;
     server_ep.close().await;
+    Ok(())
+}
+
+/// `Router::shutdown` triggers `endpoint.close()`, which must fire every
+/// pending `Connection::closed()` future — including the wrapper's
+/// detached watcher. If a future iroh release ever changed that contract,
+/// the watcher would hang on `closed().await` and the permit would never
+/// drop, silently leaking the global-cap slot across reload cycles.
+#[tokio::test(flavor = "multi_thread")]
+async fn router_shutdown_releases_parked_watcher_permit() -> anyhow::Result<()> {
+    let cfg = ResolvedSecurity {
+        max_concurrent_handlers: 1,
+        per_source_rate_per_sec: 1e9,
+        per_source_burst: u32::MAX,
+        max_tracked_sources: 4096,
+    };
+    let metrics = Arc::new(Metrics::new());
+    let limiter = Arc::new(ConnectionLimiter::new(&cfg, Arc::clone(&metrics)));
+
+    let inner = ReturnFastHandler::new();
+    let wrapper = LimitedHandler::new(inner.clone(), Arc::clone(&limiter));
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![TEST_ALPN.to_vec()]).await?;
+    let router = Router::builder(server_ep.clone())
+        .accept(TEST_ALPN, wrapper)
+        .spawn();
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    let _conn = client_ep
+        .connect(target, TEST_ALPN)
+        .await
+        .map_err(|e| anyhow::anyhow!("client connect: {e}"))?;
+    tokio::time::timeout(Duration::from_secs(5), inner.spawned.notified())
+        .await
+        .map_err(|_| anyhow::anyhow!("inner.accept never spawned its task for client"))?;
+
+    // Sanity: the permit is currently held by the watcher.
+    assert!(
+        limiter.acquire_for_test(None).is_err(),
+        "global cap should be exhausted while the watcher holds the permit"
+    );
+
+    // Shut down WITHOUT releasing the inner handler. `endpoint.close()`
+    // must fire the watcher's pending `closed().await` so the permit drops.
+    router
+        .shutdown()
+        .await
+        .map_err(|e| anyhow::anyhow!("router.shutdown: {e}"))?;
+    server_ep.close().await;
+
+    // Poll until the permit becomes available. router.shutdown returning is
+    // not synchronous with the watcher's drop (the watcher is detached), so
+    // a brief window of `Err(GlobalFull)` is acceptable. The Permit from a
+    // successful acquire_for_test drops on the boolean eval, so the loop is
+    // self-cleaning.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if limiter.acquire_for_test(None).is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("permit never released after Router::shutdown"))?;
+
+    client_ep.close().await;
     Ok(())
 }
