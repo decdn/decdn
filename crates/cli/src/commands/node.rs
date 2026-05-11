@@ -10,13 +10,13 @@ use jsonrpsee::core::client::Error as JsonRpcClientError;
 use jsonrpsee::http_client::HttpClientBuilder;
 use serde::Deserialize;
 
-use crate::admin::{
+use decdn_common::admin::{
     AdminRpcClient, AnnounceResponse, DrainResponse, EvictRequest, EvictResponse, HealthResponse,
     PeerView, PeersResponse, ReloadResponse,
 };
-use crate::cli;
-use crate::cli::common::expand_tilde;
-use crate::config::DEFAULT_ADMIN_PORT;
+use decdn_common::cli;
+use decdn_common::cli::common::expand_tilde;
+use decdn_common::config::DEFAULT_ADMIN_PORT;
 
 /// Whether the TOML config path we're about to read was chosen by the
 /// operator or defaulted. Drives the "missing file" policy in
@@ -34,7 +34,7 @@ enum ConfigPathSource {
 
 /// Partial deserializer for the TOML config — only the path
 /// `observability.admin_port` is interesting to `decdn node peers`.
-/// Kept private here (rather than reusing `crate::config::FileConfig`)
+/// Kept private here (rather than reusing `decdn_common::config::FileConfig`)
 /// so an operator's typo in an unrelated section can't make peer
 /// listing unusable. `serde(default)` and serde-toml's default
 /// "ignore unknown fields" together guarantee that any other valid
@@ -182,6 +182,17 @@ fn write_dry_run_human(w: &mut impl io::Write, hash: &str, resp: &EvictResponse)
         // Distinct from "<1s ago"; operators want to know the
         // engine has *no* access record vs a very recent one.
         None => writeln!(w, "last_accessed=never")?,
+    }
+    // Origin egress-cost cue (#439). Distinct from omitting the line
+    // when the engine has no origin: operators evaluating disk-reclaim
+    // potential against re-fetch cost want this signal explicitly,
+    // not buried in "the field is missing because there's no origin
+    // at all". `none` matches the JSON serialisation skip-condition
+    // semantically (`Option::is_none` is omitted in JSON, surfaced as
+    // `none` here).
+    match resp.preview.origin_kind {
+        Some(kind) => writeln!(w, "origin_kind={kind}")?,
+        None => writeln!(w, "origin_kind=none")?,
     }
     Ok(())
 }
@@ -389,10 +400,10 @@ fn classify_client_error(url: &str, timeout_ms: u64, err: JsonRpcClientError) ->
 fn is_connection_refused(err: &(dyn std::error::Error + 'static)) -> bool {
     let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
     while let Some(e) = current {
-        if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
-            if io_err.kind() == std::io::ErrorKind::ConnectionRefused {
-                return true;
-            }
+        if let Some(io_err) = e.downcast_ref::<std::io::Error>()
+            && io_err.kind() == std::io::ErrorKind::ConnectionRefused
+        {
+            return true;
         }
         current = e.source();
     }
@@ -833,7 +844,7 @@ mod tests {
     /// evict.
     #[test]
     fn write_dry_run_human_emits_all_fields() -> anyhow::Result<()> {
-        use crate::admin::EvictPreview;
+        use decdn_common::admin::EvictPreview;
         let resp = EvictResponse {
             was_present: true,
             dry_run: true,
@@ -842,6 +853,7 @@ mod tests {
                 last_accessed_us_ago: Some(2_000_000), // 2s ago via format_age
                 pinned: true,
                 already_evicted: false,
+                origin_kind: Some(decdn_cache::OriginKind::Http),
             },
         };
         let mut buf = Vec::<u8>::new();
@@ -860,6 +872,10 @@ mod tests {
             s.contains("last_accessed=2s ago"),
             "expected formatted last_accessed, got: {s}"
         );
+        assert!(
+            s.contains("origin_kind=http"),
+            "missing origin_kind (#439): {s}"
+        );
         Ok(())
     }
 
@@ -869,7 +885,7 @@ mod tests {
     /// record" from "the record is at the floor".
     #[test]
     fn write_dry_run_human_uses_sentinels_for_absent_fields() -> anyhow::Result<()> {
-        use crate::admin::EvictPreview;
+        use decdn_common::admin::EvictPreview;
         let resp = EvictResponse {
             was_present: false,
             dry_run: true,
@@ -878,6 +894,10 @@ mod tests {
                 last_accessed_us_ago: None,
                 pinned: false,
                 already_evicted: false,
+                // Cache-only mode: no origin configured, so the
+                // dry-run reports `none` rather than omitting the
+                // line entirely (#439).
+                origin_kind: None,
             },
         };
         let mut buf = Vec::<u8>::new();
@@ -886,6 +906,10 @@ mod tests {
         assert!(
             s.contains("size_bytes=not_stored"),
             "expected not_stored sentinel, got: {s}"
+        );
+        assert!(
+            s.contains("origin_kind=none"),
+            "expected origin_kind=none sentinel for cache-only mode, got: {s}"
         );
         assert!(
             s.contains("last_accessed=never"),

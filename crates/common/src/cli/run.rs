@@ -1,4 +1,9 @@
-//! Arguments for the `decdn run` subcommand.
+//! Arguments for `decdn-node run` (the daemon's only subcommand).
+//!
+//! `RunArgs` is also flattened into `decdn config validate` on the user
+//! CLI for env-var parity — operators get one set of `DECDN_*` env
+//! mappings whether they're starting the daemon or dry-running the
+//! resolver.
 
 use std::path::PathBuf;
 
@@ -72,6 +77,13 @@ pub struct BlockchainArgs {
     #[arg(long, value_name = "PATH", env = "DECDN_ETH_KEYSTORE")]
     pub eth_keystore: Option<PathBuf>,
 
+    /// Path to a file containing the keystore password. When unset, the
+    /// `DECDN_KEYSTORE_PASSWORD` env var is consulted; when that is also
+    /// unset and stdin is a TTY, an interactive prompt is used. A single
+    /// trailing newline is stripped from the file contents.
+    #[arg(long, value_name = "PATH", env = "DECDN_KEYSTORE_PASSWORD_FILE")]
+    pub keystore_password_file: Option<PathBuf>,
+
     /// `StablePaymentChannel` contract address (0x-prefixed hex).
     #[arg(long, value_name = "ADDR", env = "DECDN_PAYMENT_CHANNEL_ADDRESS")]
     pub payment_channel_address: Option<String>,
@@ -82,6 +94,13 @@ pub struct BlockchainArgs {
 }
 
 /// Cache storage configuration.
+///
+/// As of #437, origin selection (HTTP / filesystem / S3-compatible)
+/// lives only in the config-file `[cache.origin]` table — there are no
+/// CLI flags for it. The S3 backend has many fields (bucket, region,
+/// endpoint, credentials) that don't fit cleanly on a command line, and
+/// keeping all three backends file-only avoids the trap of a
+/// CLI-vs-TOML mismatch silently picking the wrong backend.
 #[derive(Args, Debug)]
 #[command(next_help_heading = "Cache")]
 pub struct CacheArgs {
@@ -97,15 +116,6 @@ pub struct CacheArgs {
     /// strictly less than `cache_size_mb`.
     #[arg(long, value_name = "MB", env = "DECDN_MAX_BLOB_SIZE_MB")]
     pub max_blob_size_mb: Option<u64>,
-
-    /// Origin base URL served at `{url}/{blake3_hex}`. Absent = no pull-through.
-    #[arg(long, value_name = "URL", env = "DECDN_ORIGIN_URL")]
-    pub origin_url: Option<String>,
-
-    /// Filesystem origin root. Blobs live at `{path}/{hex[0..2]}/{hex}`.
-    /// Mutually exclusive with `--origin-url`.
-    #[arg(long, value_name = "DIR", env = "DECDN_ORIGIN_PATH")]
-    pub origin_path: Option<PathBuf>,
 }
 
 /// Payment rate configuration.

@@ -40,9 +40,9 @@ pub struct ConfigInitArgs {
 /// Validate the resolved configuration without binding ports or connecting to
 /// the RPC endpoint.
 ///
-/// Flattens the same argument groups as `run` so that `DECDN_*` environment
-/// variables and optional CLI overrides are honored exactly as they would be
-/// during `decdn run`.
+/// Flattens the same argument groups as `decdn-node run` so that `DECDN_*`
+/// environment variables and optional CLI overrides are honored exactly as
+/// they would be during the daemon's startup.
 #[derive(Args, Debug)]
 pub struct ConfigValidateArgs {
     #[command(flatten)]

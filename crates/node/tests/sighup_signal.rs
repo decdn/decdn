@@ -24,9 +24,9 @@ use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use decdn_node::cli::common::LogLevel;
-use decdn_node::cli::run::{ObservabilityArgs, PaymentArgs};
-use decdn_node::config::{
+use decdn_common::cli::common::LogLevel;
+use decdn_common::cli::run::{ObservabilityArgs, PaymentArgs};
+use decdn_common::config::{
     ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedGossip, ResolvedIdentity,
     ResolvedNetwork, ResolvedObservability, ResolvedPayment, ResolvedSecurity,
 };
@@ -49,6 +49,7 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
         blockchain: ResolvedBlockchain {
             rpc_url: "http://localhost:8545".into(),
             eth_keystore: PathBuf::from("/tmp/keystore.json"),
+            keystore_password_file: None,
             payment_channel_address: "0x0000000000000000000000000000000000000001".into(),
             staking_registry_address: "0x0000000000000000000000000000000000000002".into(),
             rpc_watchdog_interval_sec: 30,
@@ -57,15 +58,16 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
             cache_dir: PathBuf::from("/tmp/cache"),
             cache_size_mb: 1024,
             max_blob_size_mb: 128,
-            origin_url: None,
-            origin_path: None,
-            decompress: decdn_cache::DecompressMode::Auto,
+            origin: None,
             pinned_hashes: decdn_cache::PinnedHashes::empty(),
+            origin_retry: decdn_cache::RetryPolicy::default(),
+            user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
+            gc_interval_sec: 0,
         },
         payment: ResolvedPayment { rate_per_mb: rate },
         observability: ResolvedObservability {
             log_level: level,
-            log_format: decdn_node::cli::LogFormat::Pretty,
+            log_format: decdn_common::cli::LogFormat::Pretty,
             metrics_port: 9090,
             metrics_bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             admin_port: Some(9191),

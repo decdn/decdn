@@ -4,7 +4,7 @@
 
 ## Context
 
-The protocol evolves under the three-tier scheme in ADR 013 (Tier 1 minor, Tier 2 medium, Tier 3 major). The protocol-level mechanics are well-specified, but the operator-facing question — *what do I do when a release ships?* — is not. New operators reading ADR 013 cold cannot tell which kinds of releases require config edits, when payment channels are at risk, when watchtower relationships need re-coordination, or how to roll an upgrade across a multi-node fleet without dropping traffic.
+The protocol evolves under the three-tier scheme in ADR 013 (Tier 1 minor, Tier 2 medium, Tier 3 major). The protocol-level mechanics are well-specified, but the operator-facing question — *what do I do when a release ships?* — is not. New operators reading ADR 013 cold cannot tell which kinds of releases require config edits, when payment channels are at risk, or how to roll an upgrade across a multi-node fleet without dropping traffic.
 
 This runbook fills that gap. It does not redefine any protocol mechanism.
 
@@ -29,7 +29,7 @@ A Tier 1 release adds optional fields to existing structs. By construction:
 - Wire format stays compatible (postcard two-phase deserialization handles missing trailing extensions).
 - ALPN string is unchanged.
 - Signed field set is unchanged ([ADR 013 §Signed Field Freezing](013-schema-evolution.md)) — slash evidence remains verifiable across versions.
-- Payment channels, watchtower escrows, and on-chain bindings are unaffected.
+- Payment channels and on-chain bindings are unaffected.
 
 **Operator action:** Pull the new node release at your normal cadence and restart. No drain required. There is no flag day, no deprecation window, and no client coordination.
 
@@ -46,7 +46,7 @@ A Tier 2 release adds new optional message variants (e.g. a `Ping`/`Pong` keepal
 3. **Monitor `decdn_streams_failed_total{reason="protocol_error"}`** for one rolling window after the restart. A spike indicates a peer is rejecting the new variant — that is expected and benign for legacy peers, but a sustained rate from your own outbound streams to the new variant suggests a config drift.
 4. **Configure new metrics** in your dashboard if the release exposes them (the canonical registry lives in [`appendix-observability.md`](appendix-observability.md)).
 
-Payment channels, watchtower escrows, and stake state are unaffected.
+Payment channels and stake state are unaffected.
 
 ## 3. Tier 3 — major ALPN bump
 
@@ -63,8 +63,7 @@ When a Tier 3 release is announced, you have four weeks of dual-version-supporte
 | **Config-field deltas.** Diff your operator config against the release's example config. New mandatory fields, renamed fields, or removed fields land in this release. | Tier 3 is the only tier where required config can change. |
 | **Payment-channel validity.** Tier 3 changes can include the channel-ID formula or the voucher format. A change here invalidates **open channels** for the affected token/protocol. The release notes will state this explicitly. The contract-level worked example is [ADR 010 §Migration from ADR 003](010-multi-token.md#migration-from-adr-003) — the PoC `StablePaymentChannel` is decommissioned and replaced atomically; existing channels are force-closed via `forceCloseChannel`. | Operators must close out open channels in the old protocol before the cutover window or risk losing payments. |
 | **Voucher-signer compatibility.** If the EIP-712 voucher domain or typed-data hash changes (Tier 3 §Signed Field Freezing — modifying the signed field set is a major change), the off-chain voucher signer must be upgraded in lockstep with the node binary. | An old voucher signer producing pre-bump signatures against a new contract will fail `SignatureChecker.isValidSignatureNow` ([ADR 024 §1](024-account-abstraction.md)). |
-| **Watchtower re-coordination.** Watchtowers ([ADR 007](007-watchtower.md)) maintain `voucherStateHash` commitments per channel; a Tier 3 voucher-format change means existing watchtower escrows cover obsolete state. New escrows must be opened against the new format, and the watchtower itself must be on a compatible binary. | Watchtower disputes during the transition are otherwise unwinnable. |
-| **Reputation / receipt continuity.** Receipts ([ADR 027](027-distinct-client-receipts.md)) are signed by the *requester* key; their verifier lives in the node. A Tier 3 receipt-format change is rare but possible — release notes flag it explicitly. | Operators must coordinate with their downstream receipt-using infrastructure (gauge claim) before the cutover. |
+| **Local dispute monitor compatibility.** The in-process dispute monitor ([ADR 003](003-payments.md) Option C) reads voucher state from the node's local store and submits `disputeChannel` calls. A Tier 3 voucher-format change means the monitor must be on the new binary before any new-format channels open, otherwise it cannot decode them. The monitor ships with the node binary, so the only operator action is to ensure node and contract upgrades are sequenced correctly. | The local monitor is the primary stale-close defense ([Appendix: Fraud Detection](appendix-fraud-detection.md)); a stale binary leaves a window where new-format closes are unmonitored. |
 
 ### 3.2 Cutover — rolling upgrade (per node)
 
@@ -103,24 +102,16 @@ By T+4 weeks the entire fleet should be running the dual-version binary. Clients
 
 ## 4. Coordination touchpoints
 
-A Tier 3 upgrade has three out-of-protocol coordination surfaces. None are automated; all are operator responsibilities.
+A Tier 3 upgrade has two out-of-protocol coordination surfaces. Neither is automated; both are operator responsibilities.
 
-### 4.1 Watchtowers
-
-If you contract with a watchtower ([ADR 007](007-watchtower.md)):
-
-- **Read the watchtower's release notes** alongside the node release. A reputable watchtower publishes its supported protocol versions; do not upgrade your node ahead of your watchtower.
-- **For voucher-format changes:** open new watchtower escrows against the new format **before** opening any new payment channels under the new format. Existing escrows for old-format channels remain valid until those channels settle.
-- **Heartbeat continuity:** the watchtower's `voucherStateHash` ([ADR 007](007-watchtower.md)) cycles per heartbeat; a watchtower mid-upgrade may briefly publish a hash for a no-longer-canonical state. Tolerate up to one heartbeat window of inconsistency before alarming.
-
-### 4.2 Clients
+### 4.1 Clients
 
 For Tier 3, clients control the ALPN proposal order. You do not negotiate with them directly, but:
 
 - **Public-facing operators** should coordinate with major client deployments (CDN consumers, not end-users) ahead of the T+0 release. The list of "major clients" is your own operator concern; the protocol does not enumerate them.
 - **Probe traffic during the dual-version window** will arrive on both ALPNs. Both must be answered correctly.
 
-### 4.3 Governance
+### 4.2 Governance
 
 For Tier 3 upgrades that touch governance-controlled parameters (rate bounds in [ADR 003 §Rate Bounds Refresh](003-payments.md), token allowlist in [ADR 010](010-multi-token.md), slashing schedule in [ADR 026 §8](026-gauge-boost-tokenomics.md)):
 
@@ -135,7 +126,6 @@ For Tier 3 upgrades that touch governance-controlled parameters (rate bounds in 
 | `decdn_streams_failed_total{reason="protocol_error"}` spikes after restart | Old peers receiving the new ALPN version's framing | Expected during the dual-version window. Investigate only if rate is sustained from peers known to have already upgraded. |
 | `closeChannel` reverts with new contract | Voucher format changed; old vouchers no longer valid against the new `PaymentChannel` | Use `forceCloseChannel` per [ADR 010](010-multi-token.md). The dispute window applies. |
 | `decdn_quic_0rtt_rejected_total` spikes after restart | Old session tickets cached by clients are not 0-RTT-replayable on the new ALPN | Self-corrects within one session-ticket lifetime. No action needed. |
-| Watchtower disputes a channel mid-upgrade | Watchtower running an older binary saw a new-format voucher and could not parse it | Resolve via the standard counter-evidence path ([ADR 007](007-watchtower.md)); upgrade the watchtower; do not re-open the channel until both sides are on the new format. |
 | Mass `closeChannel` calls clog the L2 sequencer | Large fleets force-closing all old-format channels at once | Batch the closes across operators; use `forceCloseChannel` only for tokens that were removed from the allowlist; let unforced channels settle naturally over their `maxChannelDuration` (default 90 days per [ADR 010](010-multi-token.md)). |
 
 ## 6. What this runbook does not cover
@@ -149,8 +139,7 @@ For Tier 3 upgrades that touch governance-controlled parameters (rate bounds in 
 - [ADR 013 — Schema Evolution: tier semantics, ALPN negotiation, deprecation timeline](013-schema-evolution.md)
 - [ADR 010 — Migration from ADR 003: contract-level worked example](010-multi-token.md#migration-from-adr-003)
 - [ADR 005 — Probe-Triggered Eviction Hold (drain prerequisite)](005-protocol.md#probe-triggered-eviction-hold)
-- [ADR 007 — Watchtower coordination during transitions](007-watchtower.md)
+- [Appendix: Fraud Detection — local dispute monitor and permissionless challengers](appendix-fraud-detection.md)
 - [ADR 024 — Smart-account verification across versions](024-account-abstraction.md)
-- [ADR 027 — Receipt format and gauge-claim continuity](027-distinct-client-receipts.md)
 - [`appendix-local-admin-http.md` — `admin_v1_drain` invocation](appendix-local-admin-http.md)
 - [`appendix-observability.md` — metrics referenced in the smoke-test checklist](appendix-observability.md)

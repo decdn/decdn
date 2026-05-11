@@ -50,7 +50,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: rustfmt, clippy
 
@@ -110,41 +110,88 @@ jobs:
           TAG: ${{ steps.version.outputs.tag }}
 
   build-binaries:
-    name: Build ${{ matrix.target }}
+    name: Build ${{ matrix.archive_name }} ${{ matrix.target }}
     needs: release
     if: ${{ !inputs.dry_run }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
+      # Two binaries per target post-#421 split: the `decdn-node` daemon
+      # and the `decdn` user CLI. Both ship as separate tarballs so
+      # users grab only what they need; the container image is daemon-
+      # only.
       matrix:
         include:
+          # decdn-node (daemon) — five targets.
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
-            binary: decdn
+            package: decdn-node
+            binary: decdn-node
+            archive_name: decdn-node
             archive: tar.gz
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
-            binary: decdn
+            package: decdn-node
+            binary: decdn-node
+            archive_name: decdn-node
             archive: tar.gz
             cross: true
           - target: x86_64-apple-darwin
             runner: macos-latest
-            binary: decdn
+            package: decdn-node
+            binary: decdn-node
+            archive_name: decdn-node
             archive: tar.gz
           - target: aarch64-apple-darwin
             runner: macos-latest
-            binary: decdn
+            package: decdn-node
+            binary: decdn-node
+            archive_name: decdn-node
             archive: tar.gz
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
+            package: decdn-node
+            binary: decdn-node.exe
+            archive_name: decdn-node
+            archive: zip
+          # decdn (user CLI) — same five targets.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            package: decdn-cli
+            binary: decdn
+            archive_name: decdn
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            package: decdn-cli
+            binary: decdn
+            archive_name: decdn
+            archive: tar.gz
+            cross: true
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            package: decdn-cli
+            binary: decdn
+            archive_name: decdn
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            package: decdn-cli
+            binary: decdn
+            archive_name: decdn
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            package: decdn-cli
             binary: decdn.exe
+            archive_name: decdn
             archive: zip
     steps:
       - uses: actions/checkout@v6
         with:
           ref: ${{ needs.release.outputs.tag }}
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.95.0
         with:
           targets: ${{ matrix.target }}
 
@@ -159,14 +206,16 @@ jobs:
 
       - name: Build (cross)
         if: matrix.cross
-        run: cross build --release --package decdn-node --target "$TARGET"
+        run: cross build --release --package "$PACKAGE" --target "$TARGET"
         env:
+          PACKAGE: ${{ matrix.package }}
           TARGET: ${{ matrix.target }}
 
       - name: Build (native)
         if: ${{ !matrix.cross }}
-        run: cargo build --release --package decdn-node --target "$TARGET"
+        run: cargo build --release --package "$PACKAGE" --target "$TARGET"
         env:
+          PACKAGE: ${{ matrix.package }}
           RUSTC_WRAPPER: sccache
           SCCACHE_GHA_ENABLED: "true"
           TARGET: ${{ matrix.target }}
@@ -175,8 +224,9 @@ jobs:
         if: matrix.archive == 'tar.gz'
         run: |
           cd "target/$TARGET/release"
-          tar czf "../../../decdn-${VERSION}-${TARGET}.tar.gz" "$BINARY"
+          tar czf "../../../${ARCHIVE_NAME}-${VERSION}-${TARGET}.tar.gz" "$BINARY"
         env:
+          ARCHIVE_NAME: ${{ matrix.archive_name }}
           TARGET: ${{ matrix.target }}
           VERSION: ${{ needs.release.outputs.version }}
           BINARY: ${{ matrix.binary }}
@@ -186,8 +236,9 @@ jobs:
         shell: pwsh
         run: |
           Compress-Archive -Path "target/$env:TARGET/release/$env:BINARY" `
-            -DestinationPath "decdn-$env:VERSION-$env:TARGET.zip"
+            -DestinationPath "$env:ARCHIVE_NAME-$env:VERSION-$env:TARGET.zip"
         env:
+          ARCHIVE_NAME: ${{ matrix.archive_name }}
           TARGET: ${{ matrix.target }}
           VERSION: ${{ needs.release.outputs.version }}
           BINARY: ${{ matrix.binary }}
@@ -195,8 +246,8 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: decdn-${{ matrix.target }}
-          path: decdn-${{ needs.release.outputs.version }}-${{ matrix.target }}.*
+          name: ${{ matrix.archive_name }}-${{ matrix.target }}
+          path: ${{ matrix.archive_name }}-${{ needs.release.outputs.version }}-${{ matrix.target }}.*
 
   upload-assets:
     name: Upload release assets

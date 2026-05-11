@@ -19,10 +19,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use decdn_cache::CacheEngine;
+use decdn_cli::commands::node as commands;
+use decdn_common::admin::AdminRpcClient;
+use decdn_common::cli::{AnnounceArgs, DrainArgs, EvictArgs, HealthArgs, PeersArgs, ReloadArgs};
 use decdn_gossip::PeerTable;
-use decdn_node::admin::{self, AdminRpcClient, AdminState, DrainTrigger};
-use decdn_node::cli::{AnnounceArgs, DrainArgs, EvictArgs, HealthArgs, PeersArgs, ReloadArgs};
-use decdn_node::commands;
+use decdn_node::admin::{self, AdminState, DrainTrigger};
 use decdn_protocol::{LoadHint, NodeAnnounce, NodeAnnounceBody};
 use jsonrpsee::core::ClientError;
 use jsonrpsee::core::client::ClientT;
@@ -63,6 +64,16 @@ async fn test_cache() -> anyhow::Result<(CacheEngine, tempfile::TempDir)> {
     Ok((cache, tmp))
 }
 
+/// Throwaway `PrivateKeySigner` for `AdminState::new` callers that don't
+/// exercise signing logic. Chain id sourced from the canonical const so it
+/// stays in lock-step with the runtime loader.
+fn throwaway_signer() -> Arc<alloy::signers::local::PrivateKeySigner> {
+    use alloy::signers::Signer;
+    use alloy::signers::local::PrivateKeySigner;
+    use decdn_incentive::eth_identity::ARBITRUM_SEPOLIA_CHAIN_ID;
+    Arc::new(PrivateKeySigner::random().with_chain_id(Some(ARBITRUM_SEPOLIA_CHAIN_ID)))
+}
+
 /// Spawn an admin server with the given state, returning its URL and a
 /// `(stop_tx, join)` pair. The join handle must be awaited after
 /// sending on `stop_tx` so the test doesn't leak a background task.
@@ -89,6 +100,7 @@ async fn peers_list_empty_peer_table() -> anyhow::Result<()> {
         None,
         None,
         Arc::new(DrainTrigger::new()),
+        throwaway_signer(),
     );
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
@@ -126,6 +138,7 @@ async fn peers_list_seeded_entries_sorted_desc() -> anyhow::Result<()> {
         None,
         None,
         Arc::new(DrainTrigger::new()),
+        throwaway_signer(),
     );
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
@@ -169,6 +182,7 @@ async fn health_returns_hex_node_id_and_uptime() -> anyhow::Result<()> {
         None,
         None,
         Arc::new(DrainTrigger::new()),
+        throwaway_signer(),
     );
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
@@ -204,6 +218,7 @@ async fn unknown_method_returns_method_not_found() -> anyhow::Result<()> {
         None,
         None,
         Arc::new(DrainTrigger::new()),
+        throwaway_signer(),
     );
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
@@ -487,6 +502,7 @@ async fn admin_v1_drain_returns_initiated_true() -> anyhow::Result<()> {
         None,
         None,
         Arc::clone(&drain_trigger),
+        throwaway_signer(),
     );
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
@@ -561,6 +577,7 @@ async fn admin_shutdown_closes_listener() -> anyhow::Result<()> {
         None,
         None,
         Arc::new(DrainTrigger::new()),
+        throwaway_signer(),
     );
     let (url, stop_tx, join) = spawn_admin(state).await?;
 

@@ -45,8 +45,8 @@ use iroh::Watcher as _;
 use iroh::endpoint::Connection;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::config::ResolvedSecurity;
 use crate::metrics::Metrics;
+use decdn_common::config::ResolvedSecurity;
 
 /// Bucket key for the per-source rate limit. IPv4 addresses are used as-is;
 /// IPv6 addresses are masked to their `/64` prefix.
@@ -252,6 +252,23 @@ pub struct ConnectionLimiter {
     metrics: Arc<Metrics>,
 }
 
+/// RAII reset for `ConnectionLimiter::pruning_in_progress`. Holding one
+/// of these means the holder owns the single-flight slot for
+/// `retain_recent`; on drop — including drop during panic unwind — the
+/// flag is released. Without this, a panic inside `retain_recent` (e.g.
+/// from a future regression in the keyed limiter or an allocation
+/// failure during the walk) would leave the flag stuck `true` and
+/// permanently disable both prune codepaths for the lifetime of the
+/// process, which is the exact unbounded-keyspace failure mode #440 is
+/// meant to prevent.
+struct PruneGuard<'a>(&'a AtomicBool);
+
+impl Drop for PruneGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 impl ConnectionLimiter {
     /// Construct a limiter from the resolved security configuration.
     pub fn new(cfg: &ResolvedSecurity, metrics: Arc<Metrics>) -> Self {
@@ -453,13 +470,78 @@ impl ConnectionLimiter {
                 .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
         {
+            // RAII reset on drop: if `retain_recent` ever panics we must
+            // not leave `pruning_in_progress` stuck `true`, or both this
+            // path and the periodic GC task would be permanently disabled
+            // for the lifetime of the process — exactly the
+            // unbounded-keyspace pathology #440 fixes. See `PruneGuard`.
+            let _guard = PruneGuard(&self.pruning_in_progress);
             limiter.retain_recent();
-            self.pruning_in_progress.store(false, Ordering::Release);
         }
         match result {
             Ok(()) => None,
             Err(_) => Some(RejectReason::PerSource),
         }
+    }
+
+    /// Drop per-source buckets whose state has refilled to the fresh
+    /// baseline (#440). The acquire path already prunes opportunistically
+    /// when the keyspace exceeds `cap + cap/10`, but a node whose
+    /// connection rate falls below the over-cap threshold can carry
+    /// millions of stale buckets indefinitely. The runtime spawns a
+    /// periodic task that calls this method to bound steady-state
+    /// memory regardless of acquire-driven activity.
+    ///
+    /// Returns `Some((before, after))` keyspace counts when a prune
+    /// actually ran, or `None` when the per-source layer is disabled or
+    /// the call lost the single-flight CAS to a concurrent prune. The
+    /// runtime's periodic task uses this to emit a debug breadcrumb
+    /// only on real sweeps — silence is meaningful.
+    ///
+    /// Single-flight with the acquire-path prune via the same
+    /// `pruning_in_progress` flag, with `PruneGuard` ensuring the flag
+    /// is released even if `retain_recent` panics — concurrent
+    /// observers (the periodic task and a flood-driven acquire)
+    /// coexist without spawning duplicate `O(n)` walks.
+    pub fn gc_per_source(&self) -> Option<(usize, usize)> {
+        // Snapshot the limiter `Arc` under the read guard, then release
+        // the lock before the `O(n)` walk. Holding the read guard across
+        // `retain_recent` would block reload (which needs the write
+        // lock) for the whole walk — same reasoning as `check_per_source`.
+        let limiter = {
+            let g = self.per_source.read().unwrap_or_else(|poisoned| {
+                self.log_per_source_poison();
+                poisoned.into_inner()
+            });
+            g.limiter.clone()
+        };
+        let limiter = limiter?;
+        if self
+            .pruning_in_progress
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            let _guard = PruneGuard(&self.pruning_in_progress);
+            let before = limiter.len();
+            limiter.retain_recent();
+            let after = limiter.len();
+            Some((before, after))
+        } else {
+            None
+        }
+    }
+
+    /// Number of per-source buckets currently tracked. Returns `0` when
+    /// the layer is disabled. Used by the periodic GC task in tests and
+    /// by the runtime's debug-log breadcrumb so operators can correlate
+    /// keyspace size with the bookkeeping cap.
+    #[must_use]
+    pub fn per_source_tracked(&self) -> usize {
+        let g = self.per_source.read().unwrap_or_else(|poisoned| {
+            self.log_per_source_poison();
+            poisoned.into_inner()
+        });
+        g.limiter.as_ref().map_or(0, |l| l.len())
     }
 
     /// One-shot poison log for the `per_source` lock. The first
@@ -515,8 +597,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::{ConnectionLimiter, RejectReason};
-    use crate::config::ResolvedSecurity;
     use crate::metrics::Metrics;
+    use decdn_common::config::ResolvedSecurity;
 
     fn strict_security(max: u32) -> ResolvedSecurity {
         ResolvedSecurity {
@@ -990,6 +1072,98 @@ mod tests {
         assert!(
             text.contains("decdn_dispatch_per_source_skipped_no_addr_total 1"),
             "disabled per-source must not bump the skip counter past 1; got:\n{text}"
+        );
+    }
+
+    /// `gc_per_source` (#440) drops fully-refilled buckets between
+    /// acquires. Without it, a long-lived node whose connection rate
+    /// stays below the over-cap threshold accumulates stale entries
+    /// indefinitely — the acquire-path prune only fires under flood.
+    #[tokio::test]
+    async fn gc_per_source_drops_refilled_buckets() {
+        // Fast refill: rate=1000/s, burst=1. Each bucket refills to
+        // baseline well within a 100ms wait, so `retain_recent()` will
+        // drop every key it sees.
+        let metrics = Arc::new(Metrics::new());
+        let cfg = ResolvedSecurity {
+            max_concurrent_handlers: u32::MAX,
+            per_source_rate_per_sec: 1000.0,
+            per_source_burst: 1,
+            // cap=0 disables the acquire-path opportunistic prune so
+            // this test isolates the explicit GC method.
+            max_tracked_sources: 0,
+        };
+        let limiter = ConnectionLimiter::new(&cfg, Arc::clone(&metrics));
+
+        // Fill 8 distinct per-source buckets and drop each permit
+        // immediately so the bucket state matches "fresh baseline"
+        // after refill.
+        for i in 0..8u8 {
+            let _p = limiter
+                .acquire_inner(Some(ip(10, 0, 0, i)))
+                .expect("acquire should succeed under generous rate");
+        }
+        assert_eq!(limiter.per_source_tracked(), 8);
+
+        // Wait long enough for every bucket to refill (rate=1000/s
+        // means the single token returns in ~1ms).
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        limiter.gc_per_source();
+        assert_eq!(
+            limiter.per_source_tracked(),
+            0,
+            "refilled buckets should be dropped by gc_per_source"
+        );
+    }
+
+    /// `gc_per_source` is a no-op when the per-source layer is
+    /// disabled — exercises the early-return arm.
+    #[test]
+    fn gc_per_source_is_noop_when_layer_disabled() {
+        let metrics = Arc::new(Metrics::new());
+        let cfg = ResolvedSecurity {
+            max_concurrent_handlers: u32::MAX,
+            per_source_rate_per_sec: 0.0,
+            per_source_burst: 0,
+            max_tracked_sources: 0,
+        };
+        let limiter = ConnectionLimiter::new(&cfg, Arc::clone(&metrics));
+        // Must not panic and must return None (layer disabled).
+        assert!(limiter.gc_per_source().is_none());
+        assert_eq!(limiter.per_source_tracked(), 0);
+    }
+
+    /// `PruneGuard` releases `pruning_in_progress` even when the
+    /// protected operation panics. Without this, a single panic inside
+    /// `retain_recent` (third-party code from `governor`, or a future
+    /// allocation failure during the walk) would leave the flag stuck
+    /// `true` and permanently disable both prune codepaths for the
+    /// lifetime of the process — the unbounded-keyspace failure mode
+    /// #440 is meant to prevent. We can't make `retain_recent` itself
+    /// panic on demand, so test the guard's Drop semantics directly:
+    /// a `catch_unwind` around a guard whose protected scope panics
+    /// must observe the flag reset to `false`.
+    #[test]
+    fn prune_guard_resets_flag_on_panic() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let flag = AtomicBool::new(false);
+        flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .expect("uncontended CAS must succeed");
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = super::PruneGuard(&flag);
+            panic!("simulated retain_recent panic");
+        }));
+        assert!(
+            result.is_err(),
+            "panic should propagate out of catch_unwind"
+        );
+        assert!(
+            !flag.load(Ordering::Acquire),
+            "PruneGuard::drop must reset the flag during panic unwind"
         );
     }
 

@@ -1,16 +1,15 @@
-//! deCDN node library — runtime, handlers, metrics, identity, and CLI types.
+//! deCDN node daemon library — runtime, handlers, dispatch rate limiting,
+//! metrics, and the admin RPC server (ADR 025).
 //!
-//! The binary target (`src/main.rs`) is a thin entry point that parses the CLI
-//! and dispatches into [`commands`]. Integration tests and downstream tools
-//! should depend on this library rather than reaching into `src/` via `#[path]`.
+//! The binary target (`src/main.rs`) is a thin clap shell: parse `--config`
+//! plus a single `run` subcommand and call into [`commands::run`].
+//! Wire types and shared CLI/config schema live in [`decdn_common`]; the
+//! user-facing CLI binary (`decdn`) lives in `crates/cli/`.
 
 pub mod admin;
-pub mod cli;
 pub mod commands;
-pub mod config;
 pub mod dispatch;
 pub mod handlers;
-pub mod identity;
 pub mod metrics;
 pub mod runtime;
 pub mod selection;

@@ -11,8 +11,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use decdn_cache::{CacheEngine, FilesystemOrigin, HttpOrigin, Origin};
-use iroh::endpoint::presets;
+use decdn_cache::{
+    CacheEngine, FilesystemOrigin, HttpOrigin, Origin, S3Credentials, S3Origin, S3OriginConfig,
+};
+use decdn_common::config::{ResolvedOrigin, ResolvedS3Credentials};
+use iroh::endpoint::{IdleTimeout, QuicTransportConfig, VarInt, presets};
 use iroh::protocol::Router;
 use iroh::{Endpoint, SecretKey};
 use iroh_gossip::ALPN as GOSSIP_ALPN;
@@ -23,10 +26,13 @@ use tokio::task::JoinSet;
 use decdn_gossip::{GossipMetrics, GossipRuntimeConfig, GossipService, PeerTable};
 
 use crate::admin;
-use crate::config::ResolvedConfig;
 use crate::dispatch::ConnectionLimiter;
 use crate::handlers::probe::ProbeHandler;
-use crate::{identity, metrics};
+use crate::metrics;
+use alloy::signers::local::PrivateKeySigner;
+use decdn_common::config::ResolvedConfig;
+use decdn_common::identity;
+use decdn_incentive::eth_identity::{self, PasswordSource};
 
 /// Ceiling on how long we wait for spawned tasks to drain after the endpoint
 /// and metrics server have been signalled to stop. Sized comfortably larger
@@ -35,6 +41,106 @@ use crate::{identity, metrics};
 /// `PROBE_CLOSE_TIMEOUT`) so in-flight handlers finish naturally; the
 /// `abort_all` branch only fires as a safety net.
 const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(15);
+
+/// Period between dispatch per-source rate-limiter GC sweeps (#440).
+/// The acquire path already prunes opportunistically when the keyspace
+/// exceeds `cap + cap/10`, but a node whose connection rate falls below
+/// the over-cap threshold can carry millions of stale buckets
+/// indefinitely. 60s matches the steady-state cadence of the gossip
+/// peer-table TTL sweeper and is comfortably larger than the longest
+/// realistic bucket refill window, so the sweep is essentially free
+/// when the keyspace is empty.
+const DISPATCH_GC_INTERVAL: Duration = Duration::from_mins(1);
+
+/// QUIC-level idle timeout: the transport closes a connection if no
+/// packets arrive for this long. Set to match ADR 005's 30s
+/// connection-lifetime ceiling.
+///
+/// Because [`QUIC_KEEP_ALIVE_INTERVAL`] (10s) is shorter than this
+/// timeout, healthy peers keep refreshing it via PING ACKs and the QUIC
+/// idle reaper rarely fires on its own — that is the spec's intent (see
+/// ADR 005: "below the idle timeout to prevent NAT middleboxes from
+/// dropping the mapping"). The QUIC timer is a defense-in-depth floor
+/// for genuinely silent paths (e.g. peer crash / network partition); the
+/// "close 30s after last stream and no unacked vouchers" rule is
+/// application-layer and lives in the cdn/client/v1 handler (not yet
+/// implemented).
+const QUIC_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Interval between QUIC PING keep-alive frames. Per ADR 005 §Connection
+/// lifecycle, endpoints SHOULD send PINGs at 10s intervals — strictly
+/// less than [`QUIC_MAX_IDLE_TIMEOUT`] so a single dropped probe doesn't
+/// trip the idle reaper, and well below the typical NAT mapping timeout
+/// so middleboxes don't drop the path under quiet load. Quinn applies
+/// this on every connection regardless of role, so this endpoint emits
+/// keep-alives on both client- and server-initiated connections.
+const QUIC_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Maximum number of concurrent bidirectional streams a peer may open on
+/// a single connection. Sized for `cdn/client/v1` (the largest cap in
+/// ADR 005 §Concurrent stream limits: client=100, probe=1, dht=1).
+/// `QuicTransportConfig` is per-endpoint, not per-ALPN, so the QUIC
+/// layer can only enforce the union of these caps; tighter per-ALPN
+/// limits are enforced inside each handler. The probe handler already
+/// does this implicitly by calling `accept_bi()` exactly once per
+/// connection and then closing.
+const QUIC_MAX_CONCURRENT_BIDI_STREAMS: u32 = 100;
+
+/// Production [`QuicTransportConfig`]. Tests build their own config via
+/// the same builder when they need to shorten the idle timeout to keep
+/// the test runtime under a second.
+fn production_transport_config() -> anyhow::Result<QuicTransportConfig> {
+    let idle_timeout: IdleTimeout = QUIC_MAX_IDLE_TIMEOUT.try_into().map_err(|e| {
+        anyhow::anyhow!(
+            "BUG: QUIC_MAX_IDLE_TIMEOUT={QUIC_MAX_IDLE_TIMEOUT:?} not representable as IdleTimeout: {e}"
+        )
+    })?;
+    Ok(QuicTransportConfig::builder()
+        .max_idle_timeout(Some(idle_timeout))
+        .keep_alive_interval(QUIC_KEEP_ALIVE_INTERVAL)
+        .max_concurrent_bidi_streams(VarInt::from_u32(QUIC_MAX_CONCURRENT_BIDI_STREAMS))
+        .build())
+}
+
+/// Body of the periodic dispatch-limiter GC task (#440). Extracted from
+/// the spawn site so the shutdown-promptness contract can be tested
+/// directly: a regression where the loop ignores `stop_rx` would
+/// silently extend `SHUTDOWN_DEADLINE` by up to one tick interval
+/// (60s in production), which the runtime's normal shutdown path
+/// would mask as a "task slow to drain" rather than a bug.
+///
+/// The first tick is burned so the first GC pass lands one interval
+/// after startup rather than on the same tick — there are no stale
+/// buckets to clean up at t=0.
+async fn run_dispatch_gc(
+    limiter: Arc<ConnectionLimiter>,
+    mut stop_rx: oneshot::Receiver<()>,
+    interval: Duration,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut stop_rx => {
+                tracing::debug!("dispatch GC shutdown signal received");
+                return;
+            }
+            _ = ticker.tick() => {
+                if let Some((before, after)) = limiter.gc_per_source() {
+                    let dropped = before.saturating_sub(after);
+                    tracing::debug!(
+                        before,
+                        after,
+                        dropped,
+                        "dispatch GC sweep complete"
+                    );
+                }
+            }
+        }
+    }
+}
 
 /// Build the endpoint, register handlers on a `Router`, spawn the metrics
 /// server and gossip tasks, and run until a shutdown signal is received.
@@ -77,20 +183,40 @@ pub async fn run(
     let secret_key = identity::load_or_generate(&cfg.identity.data_dir)?;
     tracing::info!(node_id = %secret_key.public(), "loaded node identity");
 
-    let cache = build_cache(&cfg).await?;
+    // Issue #406: load the Ethereum keystore into a live `PrivateKeySigner`
+    // before the rest of startup so any password-source error (env unset,
+    // missing file, prompt aborted) fails fast with a clear message rather
+    // than after the cache + endpoint have been built. `decrypt_keystore`
+    // runs scrypt/argon2 (hundreds of milliseconds to multi-second under
+    // hardened KDF params), so it must run on a blocking thread to avoid
+    // stalling the tokio runtime.
+    let eth_signer = Arc::new(load_eth_signer(&cfg).await?);
+    tracing::info!(address = %eth_signer.address(), "loaded eth keystore");
+
+    let cache = build_cache(&cfg, Arc::clone(&node_metrics)).await?;
     // Attach the cache to the reload state so SIGHUP handlers can swap
     // the pinned-hashes set atomically (#276). Done immediately after
     // `build_cache` succeeds so a SIGHUP delivered during the rest of
     // startup will still find a target.
     reload_state.attach_cache(Some(cache.clone()));
+    let retry = cfg.cache.origin_retry;
     tracing::info!(
         cache_dir = %cfg.cache.cache_dir.display(),
-        has_origin = cfg.cache.origin_url.is_some() || cfg.cache.origin_path.is_some(),
+        has_origin = cfg.cache.origin.is_some(),
+        origin_kind = origin_kind_label(cfg.cache.origin.as_ref()),
         pinned_hashes = cfg.cache.pinned_hashes.len(),
+        // Origin retry policy (#285). Logged once at startup so operators
+        // can audit the active resilience budget without hitting an RPC.
+        retry_max_retries = retry.max_retries,
+        retry_initial_backoff_ms = retry.initial_backoff_ms,
+        retry_max_backoff_ms = retry.max_backoff_ms,
+        retry_jitter_ratio = retry.jitter_ratio,
         "cache engine ready",
     );
 
-    let ep = build_endpoint(&secret_key, cfg.network.bind_port)
+    let transport_config =
+        production_transport_config().context("failed to build QUIC transport config")?;
+    let ep = build_endpoint(&secret_key, cfg.network.bind_port, transport_config)
         .await
         .context("failed to build iroh endpoint")?;
 
@@ -114,7 +240,7 @@ pub async fn run(
         secret_key.public(),
         reload_state.rate_per_mb(),
         Arc::clone(&node_metrics),
-        limiter,
+        Arc::clone(&limiter),
     ));
 
     let router = Router::builder(ep.clone())
@@ -139,6 +265,22 @@ pub async fn run(
             tracing::error!(%err, "metrics server exited with error");
         }
     });
+
+    // Periodic dispatch-limiter GC (#440). The acquire path only prunes
+    // under flood (when the keyspace exceeds `cap + cap/10`); a node
+    // with bursty short-lived clients can otherwise accumulate stale
+    // per-source buckets between bursts and never reclaim them until
+    // restart. The sweep is `O(n)` over the live keyspace; on an idle
+    // limiter `n = 0` so the steady-state cost is one mutex acquire
+    // per minute. Stops on its own oneshot — same pattern as the
+    // metrics and admin servers.
+    let (dispatch_gc_stop_tx, dispatch_gc_stop_rx) = oneshot::channel::<()>();
+    let dispatch_gc_limiter = Arc::clone(&limiter);
+    tasks.spawn(run_dispatch_gc(
+        dispatch_gc_limiter,
+        dispatch_gc_stop_rx,
+        DISPATCH_GC_INTERVAL,
+    ));
 
     // RPC connectivity watchdog (issue #283). Updates `decdn_rpc_healthy`
     // each tick; a sustained transition fires an alert. `interval == 0`
@@ -259,6 +401,7 @@ pub async fn run(
             announce_trigger,
             reload_hook,
             Arc::clone(&drain_trigger),
+            Arc::clone(&eth_signer),
         );
         tasks.spawn(async move {
             if let Err(err) = admin::serve(listener, state, rx).await {
@@ -284,7 +427,8 @@ pub async fn run(
         admin_port = ?cfg.observability.admin_port,
         rate_per_mb = cfg.payment.rate_per_mb,
         cache_dir = %cfg.cache.cache_dir.display(),
-        has_origin = cfg.cache.origin_url.is_some() || cfg.cache.origin_path.is_some(),
+        has_origin = cfg.cache.origin.is_some(),
+        origin_kind = origin_kind_label(cfg.cache.origin.as_ref()),
         subscribe_global = cfg.gossip.subscribe_global,
         "node runtime ready"
     );
@@ -336,6 +480,11 @@ pub async fn run(
         // been the ones signaling it.
         tracing::warn!("metrics server exited before shutdown signal was sent");
     }
+    // Best-effort: silently ignore the dispatch GC stop send failure.
+    // The task only exits early on a panic, and its panic surfaces
+    // through `JoinSet::join_next` during the drain phase below — no
+    // operator-actionable signal to log at this seam.
+    let _ = dispatch_gc_stop_tx.send(());
     if let Some(tx) = admin_stop_tx
         && tx.send(()).is_err()
     {
@@ -420,16 +569,57 @@ pub async fn run(
 }
 
 /// Build an iroh `Endpoint` bound to `bind_port`. ALPNs are set by the
-/// `Router` when it spawns.
-async fn build_endpoint(secret_key: &SecretKey, bind_port: u16) -> anyhow::Result<Endpoint> {
+/// `Router` when it spawns. The bind address is included in the error
+/// message so a port collision surfaces as a config-level diagnostic
+/// (matching `metrics::bind` and `admin::bind`), rather than an opaque
+/// "endpoint bind failed".
+///
+/// No transient pre-bind probe: it would introduce a TOCTOU window
+/// between the probe and the real bind, and iroh's
+/// `Endpoint::builder().bind_addr(...).bind()` owns its UDP socket
+/// internally — there is nothing to hand off. Single-bind matches the
+/// existing TCP listeners.
+async fn build_endpoint(
+    secret_key: &SecretKey,
+    bind_port: u16,
+    transport_config: QuicTransportConfig,
+) -> anyhow::Result<Endpoint> {
     let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, bind_port);
     Endpoint::builder(presets::N0)
         .secret_key(secret_key.clone())
+        .transport_config(transport_config)
         .bind_addr(bind_addr)
         .map_err(|e| anyhow::anyhow!("invalid bind addr {bind_addr}: {e}"))?
         .bind()
         .await
-        .map_err(|e| anyhow::anyhow!("endpoint bind failed: {e}"))
+        .map_err(|e| anyhow::anyhow!("endpoint bind {bind_addr} failed: {e}"))
+}
+
+/// Resolve the keystore password from CLI/env/prompt, then decrypt the
+/// keystore JSON via alloy's KDF on a blocking thread. The Arbitrum Sepolia
+/// chain id is bound on the signer so EIP-712 signers and any
+/// `eth_sendTransaction` paths inherit a deterministic value. When the
+/// production target moves to mainnet, this should be threaded through
+/// `ResolvedBlockchain` next to `rpc_url` (chain-id-keyed config is already
+/// a seam pattern; see `appendix-poc-production-seams.md` §Seam 8).
+async fn load_eth_signer(cfg: &ResolvedConfig) -> anyhow::Result<PrivateKeySigner> {
+    use alloy::signers::Signer;
+
+    let mut sources = vec![PasswordSource::Env(eth_identity::KEYSTORE_PASSWORD_ENV)];
+    if let Some(path) = cfg.blockchain.keystore_password_file.clone() {
+        sources.push(PasswordSource::File(path));
+    }
+    sources.push(PasswordSource::Prompt { confirm: false });
+    let password = eth_identity::read_password(&sources, "eth keystore password")?;
+
+    let path = cfg.blockchain.eth_keystore.clone();
+    // `spawn_blocking` because alloy's `decrypt_keystore` runs scrypt /
+    // argon2 (synchronous, CPU-bound). Calling it on the runtime's worker
+    // thread would stall every other task for the duration of the KDF.
+    let signer = tokio::task::spawn_blocking(move || eth_identity::load_signer(&path, &password))
+        .await
+        .map_err(|e| anyhow::anyhow!("keystore decrypt task panicked: {e}"))??;
+    Ok(signer.with_chain_id(Some(eth_identity::ARBITRUM_SEPOLIA_CHAIN_ID)))
 }
 
 /// Adapter: implements `decdn_gossip::GossipMetrics` against the node's
@@ -474,39 +664,100 @@ fn log_join_result(result: Result<(), tokio::task::JoinError>, phase: &'static s
     }
 }
 
-/// Construct the cache engine from resolved config. At most one of
-/// `origin_url` and `origin_path` is set (guaranteed by
-/// `config::resolve_cache`); neither-set means the engine serves only
-/// already-cached content and cache misses surface as
+/// Construct the cache engine from resolved config. The `[cache.origin]`
+/// table picks one of three backends — HTTP, filesystem, or S3 (#437).
+/// `None` means no pull-through is configured; the engine then serves
+/// only already-cached content and cache misses surface as
 /// `CacheError::NoOrigin`.
-async fn build_cache(cfg: &ResolvedConfig) -> anyhow::Result<CacheEngine> {
-    let origin: Option<Arc<dyn Origin>> =
-        match (cfg.cache.origin_url.clone(), cfg.cache.origin_path.clone()) {
-            (Some(url), None) => Some(Arc::new(
-                HttpOrigin::new(url)
-                    .context("failed to build HTTP origin client")?
-                    .with_decompress_mode(cfg.cache.decompress),
-            )),
-            (None, Some(path)) => Some(Arc::new(
-                FilesystemOrigin::new(path)
-                    .await
-                    .context("failed to open filesystem origin")?,
-            )),
-            (None, None) => None,
-            // resolve_cache enforces this mutex; this arm is unreachable in
-            // practice but a typed fallback is safer than unwrap() or unreachable!().
-            (Some(_), Some(_)) => {
-                anyhow::bail!("cache.origin_url and cache.origin_path are mutually exclusive")
-            }
-        };
-    CacheEngine::open_with_pinned(
+///
+/// `node_metrics` provides the shared `Arc<CacheMetrics>` that the
+/// engine bumps on origin fetches and retry exhaustions (#285).
+async fn build_cache(
+    cfg: &ResolvedConfig,
+    node_metrics: Arc<metrics::Metrics>,
+) -> anyhow::Result<CacheEngine> {
+    let origin: Option<Arc<dyn Origin>> = match cfg.cache.origin.as_ref() {
+        None => None,
+        Some(ResolvedOrigin::Http { url, decompress }) => Some(Arc::new(
+            HttpOrigin::new_with_user_agent(url.clone(), &cfg.cache.user_agent)
+                .context("failed to build HTTP origin client")?
+                .with_decompress_mode(*decompress),
+        )),
+        Some(ResolvedOrigin::Fs { path }) => Some(Arc::new(
+            FilesystemOrigin::new(path.clone())
+                .await
+                .context("failed to open filesystem origin")?,
+        )),
+        // S3-compatible origin (#437 PR2). Conversion from the resolved-
+        // config form to the cache-crate's runtime form happens here
+        // because `decdn-cache` deliberately doesn't depend on
+        // `decdn-common` (the dependency direction is `common -> cache`,
+        // and reversing it would be circular).
+        Some(ResolvedOrigin::S3(cfg)) => Some(Arc::new(
+            S3Origin::new(&s3_origin_config_from_resolved(cfg))
+                .await
+                .context("failed to construct S3 origin client")?,
+        )),
+    };
+    CacheEngine::open_full(
         &cfg.cache.cache_dir,
         origin,
         cfg.cache.max_blob_size_mb,
         cfg.cache.pinned_hashes.clone(),
+        cfg.cache.origin_retry,
+        Some(node_metrics.cache_metrics()),
+        std::time::Duration::from_secs(cfg.cache.gc_interval_sec),
     )
     .await
     .context("failed to open cache engine")
+}
+
+/// Translate the `decdn-common` resolved-config S3 form into the
+/// `decdn-cache` runtime form. The two types carry the same data —
+/// they exist as separate types only because `decdn-cache` deliberately
+/// doesn't pull `decdn-common` (the dep direction is `common -> cache`).
+///
+/// Credential redaction (`SecretString::expose`) happens here, at the
+/// crate boundary: the SDK call site gets plain `String`s, and the
+/// `Debug`-redacted wrapper stays inside the config layer where it
+/// guards against incidental log leaks.
+fn s3_origin_config_from_resolved(cfg: &decdn_common::config::ResolvedS3Config) -> S3OriginConfig {
+    let credentials = cfg.credentials.as_ref().map(|c| match c {
+        ResolvedS3Credentials::Static {
+            access_key_id,
+            secret_access_key,
+            session_token,
+        } => S3Credentials::Static {
+            access_key_id: access_key_id.expose().to_string(),
+            secret_access_key: secret_access_key.expose().to_string(),
+            session_token: session_token.as_ref().map(|t| t.expose().to_string()),
+        },
+        ResolvedS3Credentials::DefaultChain { profile } => S3Credentials::DefaultChain {
+            profile: profile.clone(),
+        },
+    });
+    S3OriginConfig {
+        bucket: cfg.bucket.clone(),
+        region: cfg.region.clone(),
+        endpoint_url: cfg.endpoint_url.clone(),
+        path_style: cfg.path_style,
+        prefix: cfg.prefix.clone(),
+        credentials,
+    }
+}
+
+/// Stable label for the resolved-origin variant, used in startup
+/// logs so operators can grep for `origin_kind=s3` without parsing
+/// the structured fields back out. Returns `"none"` when no origin
+/// is configured (rather than emitting an empty string) so the field
+/// is always present and machine-parseable.
+const fn origin_kind_label(origin: Option<&ResolvedOrigin>) -> &'static str {
+    match origin {
+        None => "none",
+        Some(ResolvedOrigin::Http { .. }) => "http",
+        Some(ResolvedOrigin::Fs { .. }) => "fs",
+        Some(ResolvedOrigin::S3(_)) => "s3",
+    }
 }
 
 /// Which OS signal (or admin RPC call) triggered shutdown. Returned by
@@ -795,6 +1046,228 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    /// Build a minimal `ResolvedConfig` with the cache section
+    /// pointed at the given `origin`. Other sections carry sensible
+    /// dummies — only the cache is exercised. Mirrors the fixture
+    /// shape used in `runtime::reload::tests` and
+    /// `crates/node/tests/sighup_signal.rs`.
+    ///
+    /// Returns the owning `TempDir` alongside the config so the
+    /// caller binds it (`let (_tmp, cfg) = ...`) and the directory
+    /// lives until end-of-test. A pid-keyed directory is not safe
+    /// here: tests in a binary that uses `cargo test` (rather than
+    /// `cargo nextest`) share the process and would race on shared
+    /// `cache_dir` state inside `CacheEngine::open_full`.
+    fn cfg_with_origin(origin: Option<ResolvedOrigin>) -> (tempfile::TempDir, ResolvedConfig) {
+        use decdn_common::config::{
+            ResolvedBlockchain, ResolvedGossip, ResolvedIdentity, ResolvedNetwork,
+            ResolvedObservability, ResolvedPayment, ResolvedSecurity,
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cache_dir = tmp.path().to_path_buf();
+        let cfg = ResolvedConfig {
+            identity: ResolvedIdentity {
+                data_dir: cache_dir.clone(),
+                region: None,
+            },
+            network: ResolvedNetwork {
+                bind_port: 4433,
+                relay_url: None,
+            },
+            blockchain: ResolvedBlockchain {
+                rpc_url: "http://localhost:8545".into(),
+                eth_keystore: PathBuf::from("/tmp/keystore.json"),
+                keystore_password_file: None,
+                payment_channel_address: "0x0000000000000000000000000000000000000001".into(),
+                staking_registry_address: "0x0000000000000000000000000000000000000002".into(),
+                rpc_watchdog_interval_sec: 30,
+            },
+            cache: decdn_common::config::ResolvedCache {
+                cache_dir,
+                cache_size_mb: 1024,
+                max_blob_size_mb: 128,
+                origin,
+                pinned_hashes: decdn_cache::PinnedHashes::empty(),
+                origin_retry: decdn_cache::RetryPolicy::default(),
+                user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
+                gc_interval_sec: 0,
+            },
+            payment: ResolvedPayment { rate_per_mb: 10 },
+            observability: ResolvedObservability {
+                log_level: decdn_common::cli::common::LogLevel::Info,
+                log_format: decdn_common::cli::common::LogFormat::Pretty,
+                metrics_port: 9090,
+                metrics_bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                admin_port: Some(9191),
+                otlp_endpoint: None,
+            },
+            gossip: ResolvedGossip {
+                announce_interval_sec: 60,
+                peer_ttl_sec: 600,
+                subscribe_global: false,
+                allowlist: Vec::new(),
+            },
+            security: ResolvedSecurity {
+                max_concurrent_handlers: 256,
+                per_source_rate_per_sec: 100.0,
+                per_source_burst: 200,
+                max_tracked_sources: 4096,
+            },
+        };
+        (tmp, cfg)
+    }
+
+    /// `build_cache` must construct the S3 backend without performing
+    /// network I/O (#437). The SDK lazily connects on the first
+    /// `GetObject` call, so a successful `build_cache` proves the
+    /// resolver-to-runtime conversion (`s3_origin_config_from_resolved`)
+    /// runs end-to-end and that the SDK's `ClientBuilder::build` doesn't
+    /// surface its `BehaviorVersion`-missing runtime error for either
+    /// credential variant. The integration suite at
+    /// `crates/cache/tests/s3_origin.rs` exercises the wire path via
+    /// `aws-smithy-mocks`.
+    #[tokio::test]
+    async fn build_cache_constructs_s3_origin_for_default_chain() {
+        use decdn_common::config::{ResolvedS3Config, ResolvedS3Credentials};
+
+        let s3 = ResolvedS3Config {
+            bucket: "decdn-blobs".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint_url: None,
+            path_style: false,
+            prefix: String::new(),
+            credentials: Some(ResolvedS3Credentials::DefaultChain { profile: None }),
+        };
+        let (_tmp, cfg) = cfg_with_origin(Some(ResolvedOrigin::S3(s3)));
+        let metrics_handle = Arc::new(metrics::Metrics::new());
+
+        // Construction must succeed end-to-end. A failure here means the
+        // resolver-to-runtime conversion regressed or the SDK's lazy-
+        // connect contract changed (and we'd be doing I/O at startup).
+        let _engine = build_cache(&cfg, metrics_handle)
+            .await
+            .expect("S3 origin must construct without I/O");
+    }
+
+    /// Same as above but with the `Static` credential path so the
+    /// `SecretString::expose` unwrap arm in `s3_origin_config_from_resolved`
+    /// is exercised. The integration tests use `mock_client!` which doesn't
+    /// route through the resolved-config layer at all, so this is the only
+    /// place the conversion gets covered.
+    #[tokio::test]
+    async fn build_cache_constructs_s3_origin_for_static_credentials() {
+        use decdn_common::config::secret::SecretString;
+        use decdn_common::config::{ResolvedS3Config, ResolvedS3Credentials};
+
+        let s3 = ResolvedS3Config {
+            bucket: "decdn-blobs".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint_url: None,
+            path_style: false,
+            prefix: "blobs/".to_string(),
+            credentials: Some(ResolvedS3Credentials::Static {
+                access_key_id: SecretString::new("AKIA-test-fake"),
+                secret_access_key: SecretString::new("secret-fake"),
+                session_token: None,
+            }),
+        };
+        let (_tmp, cfg) = cfg_with_origin(Some(ResolvedOrigin::S3(s3)));
+        let metrics_handle = Arc::new(metrics::Metrics::new());
+
+        let _engine = build_cache(&cfg, metrics_handle)
+            .await
+            .expect("S3 origin with static credentials must construct without I/O");
+    }
+
+    /// The conversion helper unwraps `SecretString` via `.expose()`.
+    /// Verifying the cleartext bytes survive the conversion — without
+    /// this, a refactor that replaces `.expose()` with a placeholder
+    /// would silently break `SigV4` signing at runtime. Direct unit
+    /// test on the conversion function avoids the SDK round-trip.
+    ///
+    /// Also pins `region` and `endpoint_url` field-equivalence between
+    /// the resolved form and the runtime form. The conversion uses
+    /// field access (not destructuring), so a new field added to one
+    /// side and forgotten on the other wouldn't be caught at compile
+    /// time — this assertion is the safety net.
+    #[test]
+    fn s3_origin_config_from_resolved_preserves_static_credentials() {
+        use decdn_common::config::secret::SecretString;
+        use decdn_common::config::{ResolvedS3Config, ResolvedS3Credentials};
+
+        let endpoint =
+            decdn_cache::parse_origin_url("https://r2.example/").expect("test URL must parse");
+        let resolved = ResolvedS3Config {
+            bucket: "b".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint_url: Some(endpoint),
+            path_style: true,
+            prefix: "blobs/".to_string(),
+            credentials: Some(ResolvedS3Credentials::Static {
+                access_key_id: SecretString::new("ak-1"),
+                secret_access_key: SecretString::new("sk-1"),
+                session_token: Some(SecretString::new("tok-1")),
+            }),
+        };
+        let runtime = s3_origin_config_from_resolved(&resolved);
+        assert_eq!(runtime.bucket, "b");
+        assert_eq!(runtime.region, "us-east-1");
+        // OriginUrl doesn't implement PartialEq; compare via Display.
+        assert_eq!(
+            runtime.endpoint_url.as_ref().map(ToString::to_string),
+            Some("https://r2.example/".to_string()),
+        );
+        assert!(runtime.path_style);
+        assert_eq!(runtime.prefix, "blobs/");
+        match runtime.credentials.expect("static creds preserved") {
+            S3Credentials::Static {
+                access_key_id,
+                secret_access_key,
+                session_token,
+            } => {
+                assert_eq!(access_key_id, "ak-1");
+                assert_eq!(secret_access_key, "sk-1");
+                assert_eq!(session_token.as_deref(), Some("tok-1"));
+            }
+            S3Credentials::DefaultChain { .. } => panic!("expected Static after conversion"),
+        }
+    }
+
+    /// Sibling of the Static-credentials round-trip: pins the
+    /// `DefaultChain` arm of `s3_origin_config_from_resolved` along
+    /// with `endpoint_url: None` and `path_style: false` (the
+    /// virtual-hosted-style AWS / R2 default). Without this test the
+    /// `DefaultChain { profile }` -> `DefaultChain { profile }` arm
+    /// has no direct coverage; the construction tests above call
+    /// `build_cache` but only assert it returns `Ok`, not that
+    /// `profile` survived the conversion.
+    #[test]
+    fn s3_origin_config_from_resolved_preserves_default_chain() {
+        use decdn_common::config::{ResolvedS3Config, ResolvedS3Credentials};
+
+        let resolved = ResolvedS3Config {
+            bucket: "b".to_string(),
+            region: "eu-west-1".to_string(),
+            endpoint_url: None,
+            path_style: false,
+            prefix: String::new(),
+            credentials: Some(ResolvedS3Credentials::DefaultChain {
+                profile: Some("decdn-prod".to_string()),
+            }),
+        };
+        let runtime = s3_origin_config_from_resolved(&resolved);
+        assert_eq!(runtime.region, "eu-west-1");
+        assert!(runtime.endpoint_url.is_none());
+        assert!(!runtime.path_style);
+        assert!(runtime.prefix.is_empty());
+        match runtime.credentials.expect("default-chain creds preserved") {
+            S3Credentials::DefaultChain { profile } => {
+                assert_eq!(profile.as_deref(), Some("decdn-prod"));
+            }
+            S3Credentials::Static { .. } => panic!("expected DefaultChain after conversion"),
+        }
+    }
+
     // Operators grep `signal=SIGINT` / `signal=SIGTERM` / `signal=admin-drain`
     // in the structured "shutdown signal received" log line; a rename here
     // would silently break dashboards and runbooks.
@@ -804,6 +1277,55 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(ShutdownSignal::Sigterm.to_string(), "SIGTERM");
         assert_eq!(ShutdownSignal::AdminDrain.to_string(), "admin-drain");
+    }
+
+    /// `run_dispatch_gc` exits promptly when the stop oneshot fires,
+    /// even if the next ticker tick is far away. Without the
+    /// shutdown-wins-over-tick `biased` select, a regression that
+    /// dropped the stop arm or polled it after `ticker.tick()` would
+    /// silently extend `SHUTDOWN_DEADLINE` by up to one full
+    /// `DISPATCH_GC_INTERVAL` (60s in production).
+    #[tokio::test]
+    async fn run_dispatch_gc_exits_promptly_on_shutdown() {
+        use crate::dispatch::ConnectionLimiter;
+        use crate::metrics::Metrics;
+        use decdn_common::config::ResolvedSecurity;
+
+        let metrics = Arc::new(Metrics::new());
+        let cfg = ResolvedSecurity {
+            max_concurrent_handlers: u32::MAX,
+            per_source_rate_per_sec: 0.0,
+            per_source_burst: 0,
+            max_tracked_sources: 0,
+        };
+        let limiter = Arc::new(ConnectionLimiter::new(&cfg, metrics));
+
+        let (stop_tx, stop_rx) = oneshot::channel::<()>();
+        // 60s interval to mirror production: the test would hang for
+        // 60s on a regression that polled the ticker before the stop
+        // signal, so the timeout below catches the real bug rather
+        // than an unrelated short-interval race.
+        let task = tokio::spawn(run_dispatch_gc(
+            Arc::clone(&limiter),
+            stop_rx,
+            Duration::from_mins(1),
+        ));
+
+        // Give the task a moment to enter the select loop, then signal
+        // shutdown. The task should exit well within the timeout —
+        // we allow generous headroom for slow CI runners.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        stop_tx.send(()).expect("receiver still alive");
+
+        let result = tokio::time::timeout(Duration::from_millis(500), task).await;
+        assert!(
+            result.is_ok(),
+            "run_dispatch_gc must exit within 500ms of shutdown signal; \
+             a 60s hang here means the stop arm of the select was lost"
+        );
+        result
+            .expect("timeout already asserted")
+            .expect("task should not panic");
     }
 
     /// Mount a JSON-RPC `200 OK` POST handler. The mount lives on
@@ -925,5 +1447,19 @@ mod tests {
             .await
             .expect("ShutdownStreams::recv did not resolve within 500ms of SIGTERM");
         assert!(matches!(signal, ShutdownSignal::Sigterm));
+    }
+
+    /// Guard test for ADR 005 transport defaults. Catches accidental edits to
+    /// the constants and verifies `production_transport_config()` builds
+    /// without error — the integration test in `tests/probe_loopback.rs`
+    /// rebuilds the config on its own to shorten the idle window, so without
+    /// this assertion a regression that changes the production constants (or
+    /// removes the helper's call site) would not be caught.
+    #[test]
+    fn adr_005_transport_defaults() {
+        assert_eq!(QUIC_MAX_IDLE_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(QUIC_KEEP_ALIVE_INTERVAL, Duration::from_secs(10));
+        assert_eq!(QUIC_MAX_CONCURRENT_BIDI_STREAMS, 100);
+        production_transport_config().expect("production_transport_config builds");
     }
 }

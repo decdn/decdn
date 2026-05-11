@@ -7,6 +7,7 @@ rust-version.workspace = true
 description = "Payment channels, staking, and voucher management for deCDN"
 
 [dependencies]
+decdn-common = { workspace = true }
 decdn-protocol = { workspace = true }
 iroh = { workspace = true }
 alloy = { workspace = true }
@@ -16,6 +17,13 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+rpassword = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

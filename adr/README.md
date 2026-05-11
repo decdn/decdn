@@ -21,12 +21,12 @@ For first-time readers, follow this thematic order rather than the numeric one. 
 2. **Discovery** — DHT-based content lookup, QUIC 0-RTT.
 3. **Payments** — channels, vouchers, multi-token allowlist, client architecture, smart-wallet support.
 4. **Tokenomics & incentives** — gauge-boost, delivery receipts, liquidity strategy, deferred follow-ups.
-5. **Verification & enforcement** — on-chain slashing evidence, watchtower, reputation, content takedown.
+5. **Verification & enforcement** — on-chain slashing evidence, reputation, content takedown.
 6. **Governance & contracts** — Governor + Timelock model, contract interaction map.
 7. **Operations** — node onboarding.
 8. **Supporting infrastructure** — schema evolution, privacy analysis.
 
-Plus a set of **appendices** documenting reference patterns, operator runbooks, and operational economics built on top of the protocol (encrypted content publishing, observability, L2 deployment selection, PoC/production seam architecture, local admin HTTP surface, operator key rotation, operator protocol-upgrade runbook, watchtower operating economics).
+Plus a set of **appendices** documenting reference patterns, operator runbooks, and operational layers built on top of the protocol (encrypted content publishing, observability, L2 deployment selection, PoC/production seam architecture, local admin HTTP surface, operator key rotation, operator protocol-upgrade runbook, permissionless fraud detection).
 
 The numeric index in [`architecture.md` § Architectural Decisions](architecture.md#architectural-decisions) stays as the canonical per-ADR reference.
 
@@ -75,9 +75,8 @@ Terms used across multiple ADRs without inline definition.
 | --- | --- |
 | **`StakingRegistry`** | The on-chain stake + node registration contract. Holds TOKEN stake, enforces `stake ≥ minStake`, performs slashing, manages the NodeId↔Ethereum-address binding. |
 | **`SlashJudge`** | The on-chain contract that adjudicates all slashable offenses: verifies slash signatures, manages challenge bonds, runs counter-evidence windows, calls `StakingRegistry.slash()` — see [ADR 014](014-on-chain-verification.md). |
-| **`WatchtowerEscrow`** | The on-chain contract managing prepaid watchtower monitoring fees and heartbeat-based liveness accountability. Standalone — reads channel state but does not modify the payment channel — see [ADR 007](007-watchtower.md). |
 | **`BuybackBurner`** | The contract that swaps the 5% burn-bucket USDC into TOKEN via Balancer V3 80/20 weighted pool and burns the proceeds — see [ADR 003 § BuybackBurner](003-payments.md#buybackburner) and [ADR 018](018-liquidity-strategy.md). |
-| **Slash signature** | An EIP-712 secp256k1 signature (`slash_sig`) on protocol messages, used for on-chain slash evidence via `ecrecover`. Distinct from the Ed25519 wire signature — see [ADR 014](014-on-chain-verification.md). |
+| **Slash signature** | An EIP-712 secp256k1 signature (`slash_sig`) on `ProbeResponse` / `StreamResponse`, used for on-chain slash evidence via `ecrecover` and as the message-body attribution signature for the paid-delivery path — see [ADR 014](014-on-chain-verification.md). |
 | **Challenge bond** | The 100 TOKEN amount a challenger must post when submitting slash evidence. Returned on successful slash, forfeited on successful node counter (50% burned, 50% to node) — see [ADR 014 § Bond Handling](014-on-chain-verification.md#bond-handling). |
 
 ## ADRs vs appendices
@@ -85,7 +84,7 @@ Terms used across multiple ADRs without inline definition.
 This directory contains two kinds of documents:
 
 - **Core protocol ADRs** (`NNN-name.md`) — invariants every conforming node, client, or contract must implement the same way for the network to function. These are the canonical specification.
-- **Appendices** (`appendix-name.md`) — patterns, reference implementations, operational guidance, and operator-facing economics built **on top of** the protocol. Alternative implementations are acceptable. Examples: encrypted content publishing (companion app server, `cdn/keys/v1`), the recommended observability metric registry, the Arbitrum One deployment selection, the Rust implementation pattern for PoC/production seams, the local admin HTTP surface, the operator key-rotation runbook, the operator protocol-upgrade runbook, and the watchtower operating-economics analysis.
+- **Appendices** (`appendix-name.md`) — patterns, reference implementations, operational guidance, and optional layers built **on top of** the protocol. Alternative implementations are acceptable. Examples: encrypted content publishing (companion app server, `cdn/keys/v1`), the recommended observability metric registry, the Arbitrum One deployment selection, the Rust implementation pattern for PoC/production seams, the local admin HTTP surface, the operator key-rotation runbook, the operator protocol-upgrade runbook, and the permissionless fraud-detection layer.
 
 Appendices are listed in [`architecture.md` § Appendices — Reference Patterns](architecture.md#appendices-reference-patterns). They are deliberately **not** numbered as ADRs because they document optional patterns rather than core protocol decisions.
 
@@ -147,19 +146,21 @@ pandoc --from=markdown+gfm_auto_identifiers \
   000-language.md 001-network.md 002-content-addressing.md 005-protocol.md \
   022-content-discovery.md 015-zero-rtt.md \
   003-payments.md 010-multi-token.md 012-client.md 024-account-abstraction.md \
-  026-gauge-boost-tokenomics.md 027-distinct-client-receipts.md 018-liquidity-strategy.md \
-  014-on-chain-verification.md 007-watchtower.md 008-reputation.md 011-content-takedown.md \
+  026-gauge-boost-tokenomics.md 018-liquidity-strategy.md \
+  014-on-chain-verification.md 008-reputation.md 011-content-takedown.md 028-slashing-appeals.md \
   009-governance.md 016-contract-interactions.md \
   019-node-onboarding.md \
   013-schema-evolution.md 017-privacy.md \
   appendix-encrypted-content-publishing.md \
   appendix-observability.md \
+  appendix-peer-table-eviction.md \
+  appendix-blob-cache-eviction.md \
   appendix-l2-deployment.md \
   appendix-poc-production-seams.md \
   appendix-local-admin-http.md \
   appendix-operator-key-rotation.md \
   appendix-operator-upgrade-path.md \
-  appendix-watchtower-economics.md \
+  appendix-fraud-detection.md \
   -o adrs-book.pdf
 ```
 

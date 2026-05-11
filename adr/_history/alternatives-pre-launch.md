@@ -10,9 +10,9 @@ Sections below are anchored by source ADR. Cross-references back to each source 
 
 ## ADR 014 — Slash Signature Scheme
 
-Source: [ADR 014 § 1 — Ed25519 Signature Verification — Dual-Key Slash Signatures](../014-on-chain-verification.md#1-ed25519-signature-verification--dual-key-slash-signatures).
+Source: [ADR 014 § 1 — Slash Signatures (secp256k1 EIP-712)](../014-on-chain-verification.md#1-slash-signatures--secp256k1-eip-712).
 
-The alternatives below are scoped to the choice of signature scheme used for on-chain slash evidence (`slash_sig` field on signed wire messages). The chosen design — dual-key slash signatures with secp256k1 `ecrecover` — is documented in ADR 014 § 1.
+The alternatives below are scoped to the choice of signature scheme used for on-chain slash evidence. The chosen design — secp256k1 EIP-712 `slash_sig` verified via `ecrecover` — is documented in ADR 014 § 1. (The original draft also retained an Ed25519 wire signature alongside `slash_sig`; this redundancy was removed pre-launch — see [#408](https://github.com/decdn/decdn/issues/408).)
 
 | Approach | Gas Cost | PoC Suitability | Why Not |
 | --- | --- | --- | --- |
@@ -20,7 +20,7 @@ The alternatives below are scoped to the choice of signature scheme used for on-
 | Solidity Ed25519 library (e.g., `ed25519-sol`) | ~500k–1M | Too expensive | A single slash verification would cost $0.25–$0.50; two-signature offenses double that |
 | ZK proof of Ed25519 signature | ~300k verify | Too complex | Requires a proving circuit, prover infrastructure, and proof generation latency |
 | Optimistic (no signature verification) | ~50k | Insufficient security | A node could deny authorship of any message; counter-evidence alone is not enough |
-| **Dual-key slash signatures (chosen)** | **~3,000** | **Recommended** | Uses proven `ecrecover`; adds one `Option` field per message; no new infrastructure |
+| **secp256k1 EIP-712 `slash_sig` (chosen)** | **~3,000** | **Recommended** | Uses proven `ecrecover`; one signature per message; reuses existing NodeId↔Eth binding from `StakingRegistry` |
 
 ---
 

@@ -260,8 +260,8 @@ fn topic_id(name: &str) -> TopicId {
     TopicId::from_bytes(*hash.as_bytes())
 }
 
-/// Maximum backoff between reconnection attempts (60 seconds).
-const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// Maximum backoff between reconnection attempts (1 minute).
+const RECONNECT_MAX_BACKOFF: Duration = Duration::from_mins(1);
 
 /// Initial backoff after the first stream drop (1 second).
 const RECONNECT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);

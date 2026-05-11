@@ -17,3 +17,8 @@
 /adr/adrs.pdf
 /adr/adrs-book.pdf
 mermaid-filter.err
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class

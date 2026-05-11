@@ -55,13 +55,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::cli::common::LogLevel;
-use crate::cli::run::{ObservabilityArgs, PaymentArgs};
-use crate::config::{
+use crate::dispatch::ConnectionLimiter;
+use decdn_common::cli::common::LogLevel;
+use decdn_common::cli::run::{ObservabilityArgs, PaymentArgs};
+use decdn_common::config::{
     FileConfig, ResolvedObservability, ResolvedPayment, ResolvedSecurity, load_file_config,
     parse_pinned_hashes, resolve_observability, resolve_payment, resolve_security,
 };
-use crate::dispatch::ConnectionLimiter;
 
 /// Read-only snapshot of the reloadable fields, returned by
 /// [`RuntimeReloadState::current`]. Used by `admin_v1_reload` to report
@@ -75,7 +75,7 @@ use crate::dispatch::ConnectionLimiter;
 #[derive(Debug, Clone, Copy)]
 pub struct ReloadSnapshot {
     pub rate_per_mb: u64,
-    pub log_level: Option<crate::cli::common::LogLevel>,
+    pub log_level: Option<decdn_common::cli::common::LogLevel>,
 }
 
 /// Closure that swaps the live `EnvFilter` to one matching `level`.
@@ -139,6 +139,41 @@ pub(crate) trait ReloadableSection: Send + Sync {
     /// Must not fail — atomic stores, `Arc` swaps, and `ConnectionLimiter::reload`
     /// are the only operations allowed here.
     fn infallible_swap(&self);
+}
+
+/// Set a cache-engine slot owned by a `ReloadableSection`, recovering
+/// the inner value on a poisoned mutex. Used by [`RuntimeReloadState::attach_cache`]
+/// to populate both the pinned-hashes and origin-retry sections from a
+/// single attach call.
+///
+/// The poison flag is intentionally *not* cleared. Reachable poison
+/// here implies a panic in some other code path that held the lock —
+/// extremely rare since the lock's only callers are `attach_cache`
+/// (this function) and the section's `infallible_swap`, both of which
+/// are panic-free under workspace lints. The recovery write is
+/// belt-and-braces: it ensures the engine reference is at least stored
+/// (so e.g. the `pinned.engine` slot still receives the new engine if
+/// it had been transiently poisoned), but the next `infallible_swap`
+/// will see `lock()` return `Err` again and emit the section's
+/// `tracing::error!` and skip its swap. This matches the codebase's
+/// established "recover-the-data, log-loudly, do-not-clear-poison"
+/// pattern (see also `attach_limiter` and the trait doc on
+/// `ReloadableSection::infallible_swap`).
+fn attach_engine_to_section(
+    slot: &std::sync::Mutex<Option<decdn_cache::CacheEngine>>,
+    engine: Option<decdn_cache::CacheEngine>,
+    section: &'static str,
+) {
+    match slot.lock() {
+        Ok(mut guard) => *guard = engine,
+        Err(poisoned) => {
+            tracing::error!(
+                section,
+                "runtime reload cache mutex poisoned during attach; recovering inner state"
+            );
+            *poisoned.into_inner() = engine;
+        }
+    }
 }
 
 /// Helper for the buffer-cell pattern. Each section keeps a
@@ -544,7 +579,7 @@ impl RuntimeReloadState {
     pub fn new(
         payment_cli: PaymentArgs,
         observability_cli: ObservabilityArgs,
-        initial: &crate::config::ResolvedConfig,
+        initial: &decdn_common::config::ResolvedConfig,
         log_level_setter: LogLevelSetter,
     ) -> Self {
         let payment = Arc::new(PaymentSection {
@@ -604,15 +639,7 @@ impl RuntimeReloadState {
     /// Recovery here ensures the new engine is at least stored for the
     /// (non-reload-driven) live path.
     pub fn attach_cache(&self, engine: Option<decdn_cache::CacheEngine>) {
-        match self.pinned.engine.lock() {
-            Ok(mut guard) => *guard = engine,
-            Err(poisoned) => {
-                tracing::error!(
-                    "runtime reload cache mutex poisoned during attach; recovering inner state"
-                );
-                *poisoned.into_inner() = engine;
-            }
-        }
+        attach_engine_to_section(&self.pinned.engine, engine, "pinned_hashes");
     }
 
     /// Attach the live `ConnectionLimiter` after it's been built. Same
@@ -642,7 +669,7 @@ impl RuntimeReloadState {
     ///
     /// Idempotent. A poisoned mutex is recovered the same way
     /// [`Self::attach_cache`] handles its slot.
-    pub fn seed_initial_file_snapshot(&self, file: &crate::config::FileConfig) {
+    pub fn seed_initial_file_snapshot(&self, file: &decdn_common::config::FileConfig) {
         let snapshot = FileSectionSnapshot::capture(file);
         match self.last_file_sections.lock() {
             Ok(mut guard) => *guard = snapshot,
@@ -671,12 +698,12 @@ impl RuntimeReloadState {
     #[cfg(test)]
     pub(crate) fn for_test_with_setter(
         rate_per_mb: u64,
-        level: crate::cli::common::LogLevel,
+        level: decdn_common::cli::common::LogLevel,
         log_level_setter: LogLevelSetter,
     ) -> Self {
         use std::path::PathBuf;
 
-        use crate::config::{
+        use decdn_common::config::{
             ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedGossip, ResolvedIdentity,
             ResolvedNetwork, ResolvedObservability, ResolvedPayment, ResolvedSecurity,
         };
@@ -693,6 +720,7 @@ impl RuntimeReloadState {
             blockchain: ResolvedBlockchain {
                 rpc_url: "http://localhost:8545".into(),
                 eth_keystore: PathBuf::from("/tmp/keystore.json"),
+                keystore_password_file: None,
                 payment_channel_address: "0x0000000000000000000000000000000000000001".into(),
                 staking_registry_address: "0x0000000000000000000000000000000000000002".into(),
                 rpc_watchdog_interval_sec: 30,
@@ -701,15 +729,16 @@ impl RuntimeReloadState {
                 cache_dir: PathBuf::from("/tmp/cache"),
                 cache_size_mb: 1024,
                 max_blob_size_mb: 128,
-                origin_url: None,
-                origin_path: None,
-                decompress: decdn_cache::DecompressMode::Auto,
+                origin: None,
                 pinned_hashes: decdn_cache::PinnedHashes::empty(),
+                origin_retry: decdn_cache::RetryPolicy::default(),
+                user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
+                gc_interval_sec: 0,
             },
             payment: ResolvedPayment { rate_per_mb },
             observability: ResolvedObservability {
                 log_level: level,
-                log_format: crate::cli::common::LogFormat::Pretty,
+                log_format: decdn_common::cli::common::LogFormat::Pretty,
                 metrics_port: 9090,
                 metrics_bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
                 admin_port: Some(9191),
@@ -729,8 +758,8 @@ impl RuntimeReloadState {
             },
         };
         Self::new(
-            crate::cli::run::PaymentArgs { rate_per_mb: None },
-            crate::cli::run::ObservabilityArgs {
+            decdn_common::cli::run::PaymentArgs { rate_per_mb: None },
+            decdn_common::cli::run::ObservabilityArgs {
                 log_level: None,
                 log_format: None,
                 metrics_port: None,
@@ -922,7 +951,7 @@ impl RuntimeReloadState {
 /// deliberately conservative — they emit a one-shot warning rather than
 /// silently swallowing a real change.
 fn cache_changed_only_reloadable_fields(
-    file_cache: Option<&crate::config::types::CacheConfig>,
+    file_cache: Option<&decdn_common::config::types::CacheConfig>,
     prev_cache_json: Option<&serde_json::Value>,
 ) -> bool {
     let Some(file_cache) = file_cache else {
@@ -970,7 +999,7 @@ fn warn_ignored(field: &'static str) {
 /// on `state.last_file_sections` so we can diff structurally rather than
 /// emitting a warning every time a section is merely present.
 fn log_ignored_fields(
-    file: &crate::config::FileConfig,
+    file: &decdn_common::config::FileConfig,
     new_obs: &ResolvedObservability,
     prev: &FileSectionSnapshot,
 ) {
@@ -987,7 +1016,7 @@ fn log_ignored_fields(
 /// cares whether the *current file* contains a non-honoured value that
 /// disagrees with what's running, not whether any value is set at all.
 fn log_ignored_observability(
-    obs: Option<&crate::config::types::ObservabilityConfig>,
+    obs: Option<&decdn_common::config::types::ObservabilityConfig>,
     new_obs: &ResolvedObservability,
     prev_obs_json: Option<&serde_json::Value>,
 ) {
@@ -1037,7 +1066,7 @@ fn log_ignored_observability(
 /// reload. The first reload (snapshot empty) treats any present section
 /// as a change so the operator still gets the "ignored" notice once;
 /// thereafter we stay silent unless the section actually moved.
-fn log_ignored_other_sections(file: &crate::config::FileConfig, prev: &FileSectionSnapshot) {
+fn log_ignored_other_sections(file: &decdn_common::config::FileConfig, prev: &FileSectionSnapshot) {
     /// Compare a freshly parsed section to its baseline snapshot. A
     /// serialisation failure is treated as a change ("can't prove it
     /// didn't move, so warn"); the underlying error is logged at
@@ -1095,8 +1124,8 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::cli::common::LogLevel;
-    use crate::config::{
+    use decdn_common::cli::common::LogLevel;
+    use decdn_common::config::{
         ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedGossip, ResolvedIdentity,
         ResolvedNetwork, ResolvedObservability, ResolvedPayment, ResolvedSecurity,
     };
@@ -1127,6 +1156,7 @@ mod tests {
             blockchain: ResolvedBlockchain {
                 rpc_url: "http://localhost:8545".into(),
                 eth_keystore: PathBuf::from("/tmp/keystore.json"),
+                keystore_password_file: None,
                 payment_channel_address: "0x0000000000000000000000000000000000000001".into(),
                 staking_registry_address: "0x0000000000000000000000000000000000000002".into(),
                 rpc_watchdog_interval_sec: 30,
@@ -1135,15 +1165,16 @@ mod tests {
                 cache_dir: PathBuf::from("/tmp/cache"),
                 cache_size_mb: 1024,
                 max_blob_size_mb: 128,
-                origin_url: None,
-                origin_path: None,
-                decompress: decdn_cache::DecompressMode::Auto,
+                origin: None,
                 pinned_hashes: decdn_cache::PinnedHashes::empty(),
+                origin_retry: decdn_cache::RetryPolicy::default(),
+                user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
+                gc_interval_sec: 0,
             },
             payment: ResolvedPayment { rate_per_mb: rate },
             observability: ResolvedObservability {
                 log_level: level,
-                log_format: crate::cli::common::LogFormat::Pretty,
+                log_format: decdn_common::cli::common::LogFormat::Pretty,
                 metrics_port: 9090,
                 metrics_bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
                 admin_port: Some(9191),
@@ -1838,9 +1869,9 @@ mod tests {
     /// uses for `ResolvedSecurity`. Returned by `Arc` so tests can clone
     /// it into both `attach_limiter` and assertions about the live state.
     fn build_test_limiter() -> Arc<crate::dispatch::ConnectionLimiter> {
-        use crate::config::ResolvedSecurity;
         use crate::dispatch::ConnectionLimiter;
         use crate::metrics::Metrics;
+        use decdn_common::config::ResolvedSecurity;
         let metrics = Arc::new(Metrics::new());
         Arc::new(ConnectionLimiter::new(
             &ResolvedSecurity {
@@ -2071,8 +2102,8 @@ mod tests {
     /// the populated cache section instead of `Default::default()`.
     #[test]
     fn seed_initial_file_snapshot_primes_diff_baseline() {
-        use crate::config::FileConfig;
-        use crate::config::types::CacheConfig;
+        use decdn_common::config::FileConfig;
+        use decdn_common::config::types::CacheConfig;
 
         let initial = seed_resolved(10, LogLevel::Info);
         let (setter, _captured) = recording_setter();

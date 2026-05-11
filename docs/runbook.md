@@ -115,7 +115,7 @@ blacklist updates and stop being able to settle channels. Once
 **Remediate:**
 
 1. **If the trigger was a missed challenge response:** investigate the root
-   cause first (RPC outage, watchtower offline, signing host crash, clock
+   cause first (RPC outage, dispute monitor down, signing host crash, clock
    skew). Fix that before submitting evidence — counter-evidence filed while
    the underlying problem persists will not stop the next strike.
 2. **Submit counter-evidence on-chain within the 24-hour challenge window.**

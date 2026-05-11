@@ -55,13 +55,10 @@ This is a mechanical replacement. The EIP-712 domain separators, typed data hash
 | Function | Current | After |
 | --- | --- | --- |
 | `submitPhantomChallenge` | `ecrecover` → address A, `ecrecover` → address B, verify A == B | `SignatureChecker.isValidSignatureNow(challengedNode, probeDigest, probeSig)` + `SignatureChecker.isValidSignatureNow(challengedNode, streamDigest, streamSig)` |
+| `submitRateChallenge` | `ecrecover` → address A, `ecrecover` → address B, verify A == B | `SignatureChecker.isValidSignatureNow(challengedNode, probeDigest, probeSig)` + `SignatureChecker.isValidSignatureNow(challengedNode, streamDigest, streamSig)` |
 | `submitBlacklistChallenge` | `ecrecover` → address, verify registered | `SignatureChecker.isValidSignatureNow(challengedNode, digest, sig)` |
-| `submitCorruptionChallenge` | `ecrecover` → address, verify registered | `SignatureChecker.isValidSignatureNow(challengedNode, digest, sig)` |
-| `counterChallenge` (rate) | `ecrecover` → verify same node | `SignatureChecker.isValidSignatureNow(challengedNode, digest, sig)` |
 
 **Note on SlashJudge pattern change:** The current design recovers an address from `ecrecover` and then looks it up in `StakingRegistry`. With `SignatureChecker`, the pattern becomes: the challenger provides the `challengedNode` address (the node's Ethereum address / Safe address), the contract verifies the signature against that address, then confirms the address is registered. This is equivalent but avoids the "recover then lookup" pattern which does not work for ERC-1271 (there is no "recovery" from a smart account signature — only validation).
-
-**DeliveryReceipt counter-evidence ([ADR 014](014-on-chain-verification.md)):** The `counterChallenge` for corruption challenges verifies a `DeliveryReceipt` signed by the requester. If the requester is a smart account, this verification also uses `SignatureChecker`.
 
 #### Gas Impact
 
@@ -91,13 +88,14 @@ Safe smart wallets are the **recommended** wallet type for both node operators a
 
 - **Channel operations:** The Safe (or EOA) deposits USDC into `StablePaymentChannel.openChannel()`. That address is the `channel.client`. Client software supports both wallet types — `SignatureChecker` makes the choice transparent to every contract.
 - **Voucher signing:** EIP-712 vouchers are signed with the `channel.client` key. `SignatureChecker` on the channel contract validates against `channel.client` (EOA → ECDSA; 1-of-1 Safe → `checkSignatures` via stock handler). The session-key path (signing at delivery speed via `erc7579/smartsessions` without exposing the Safe owner key) lands when § 3 ships.
-- **Priority staking:** If the client stakes TOKEN for priority ([ADR 003](003-payments.md)), the wallet holds the staked TOKEN.
 
 ### 3. Session Keys — Deferred to Production via ERC-7579 smartsessions
 
 **Session keys are out of scope for the PoC.** The PoC uses the direct owner-signature path described in §2 (1-of-1 Safe or EOA, software-held key on the signing host). This matches today's `eth_keystore` trust posture and keeps the PoC from shipping bespoke security-critical contract code.
 
-**Production plan.** High-frequency signing (node `slash_sig`, client vouchers) migrates to a standardized ERC-7579 session-key module:
+#### Production plan
+
+High-frequency signing (node `slash_sig`, client vouchers) migrates to a standardized ERC-7579 session-key module:
 
 - **Account type:** Safe with the [Safe-7579 adapter](https://github.com/rhinestonewtf/safe7579) — turns a Safe into an ERC-7579 modular account while preserving its owner model and deployed address.
 - **Session-key module:** [`erc7579/smartsessions`](https://github.com/erc7579/smartsessions) — a standardized ERC-7579 session-key validator that natively implements ERC-1271 `isValidSignature` for session-key-authorized digests. Because the module is an ERC-7579 *validator*, `isValidSignature` on a Safe-7579 account routes through it without any custom fallback handler on deCDN's side; `SignatureChecker.isValidSignatureNow(safe, digest, sessionKeySig)` returns the ERC-1271 magic value once a session is enabled.
@@ -188,7 +186,7 @@ The following Safe infrastructure is already deployed on the testnet sibling of 
 **Negative:**
 
 - PoC hot-signing parties (nodes, clients) use 1-of-1 Safes (or EOAs). Multisig protection of the high-frequency signing path is deferred to Production; 2-of-3 is only viable on the infrequent stake/withdraw/channel-open paths for parties comfortable with that split.
-- Safe wallet setup is more complex than generating an EOA. Operator tooling (`decdn-node setup`) must guide Safe creation and, in Production, Safe-7579 adapter installation + `enableSession`.
+- Safe wallet setup is more complex than generating an EOA. Operator tooling (`decdn setup`) must guide Safe creation and, in Production, Safe-7579 adapter installation + `enableSession`.
 - Off-chain ERC-1271 verification requires an RPC call to the L2, adding latency at client binding time (~100–200ms). One-time per connection — acceptable.
 - Gas overhead for smart account signature verification is higher than pure `ecrecover` (+10–15k gas per verification). Applies only to on-chain operations (channel close/dispute, slash submission), not the high-frequency off-chain signing path.
 - Production rollout requires coordinated migration to Safe-7579 + smartsessions on every participating wallet; operators running on the PoC path must rotate to the new account type as part of the cutover.

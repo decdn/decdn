@@ -132,7 +132,7 @@ pre-commit install                # one-time setup (done automatically in devcon
 pre-commit run --all-files        # run all hooks manually
 ```
 
-Hooks: trailing-whitespace, end-of-file-fixer, check-yaml, check-merge-conflict, check-added-large-files, markdownlint, `cargo fmt`, `cargo clippy`, `cargo deny`.
+Hooks: trailing-whitespace, end-of-file-fixer, check-yaml, check-merge-conflict, check-added-large-files, markdownlint, `cargo fmt`, `cargo clippy`, `cargo doc`, `cargo deny`.
 
 ## Build and Test
 
@@ -144,9 +144,17 @@ cargo fmt -- --check                 # check formatting
 cargo deny check                     # license + advisory audit (deny.toml)
 ```
 
+## Rust Toolchain
+
+`rust-toolchain.toml` pins an exact stable release (currently `1.95.0`); CI uses the same pin via `dtolnay/rust-toolchain@1.95.0` so pre-commit's `cargo clippy` runs the identical lint set as CI. Under a rustup-managed `cargo` (what the devcontainer ships), the pinned toolchain auto-installs and is selected on first `cargo` invocation; other setups need to install `1.95.0` manually.
+
+Dependabot auto-bumps the GitHub Actions refs only — it does **not** touch `rust-toolchain.toml` or `Cargo.toml`'s `rust-version`. When accepting a Dependabot toolchain bump, update those two files in the same PR (and `Cargo.toml`'s `rust-version` if MSRV is moving in lockstep) so developer machines and CI stay aligned.
+
+MSRV (`rust-version.workspace = true` → 1.95) is the lower bound the workspace must compile under; it's checked separately by the `msrv` job in `.github/workflows/ci.yml` and is a distinct knob from the stable lint pin (currently set to the same value).
+
 ## Code Style
 
-**Language:** Rust (edition 2024, MSRV 1.85).
+**Language:** Rust (edition 2024, MSRV 1.95).
 
 `rustfmt.toml` sets `max_width = 100`.
 
@@ -182,7 +190,7 @@ grep -rn 'function\|contract\|modifier' adr/  # find Solidity interface referenc
 
 ## Adding a New ALPN Protocol Handler
 
-Each ALPN listed in [ADR 005](adr/005-protocol.md) (`cdn/probe/v1`, `cdn/client/v1`, `cdn/watchtower/v1`, `cdn/dht/v1`) is served by a struct that implements `iroh::protocol::ProtocolHandler` and is registered on the iroh `Router` at runtime startup. [`crates/node/src/handlers/probe.rs`](crates/node/src/handlers/probe.rs) is the canonical reference — copy its shape when adding a new handler.
+Each ALPN listed in [ADR 005](adr/005-protocol.md) (`cdn/probe/v1`, `cdn/client/v1`, `cdn/dht/v1`) is served by a struct that implements `iroh::protocol::ProtocolHandler` and is registered on the iroh `Router` at runtime startup. [`crates/node/src/handlers/probe.rs`](crates/node/src/handlers/probe.rs) is the canonical reference — copy its shape when adding a new handler.
 
 The pieces live in two crates, in this order:
 

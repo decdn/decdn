@@ -3,6 +3,7 @@
 //! Three-layer merge: CLI flags > TOML config file > built-in defaults.
 
 pub mod resolved;
+pub mod secret;
 pub mod types;
 
 use std::path::{Path, PathBuf};
@@ -15,7 +16,8 @@ use crate::cli::run::RunArgs;
 
 pub use resolved::{
     ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedGossip, ResolvedIdentity,
-    ResolvedNetwork, ResolvedObservability, ResolvedPayment, ResolvedSecurity,
+    ResolvedNetwork, ResolvedObservability, ResolvedOrigin, ResolvedPayment, ResolvedS3Config,
+    ResolvedS3Credentials, ResolvedSecurity,
 };
 pub use types::FileConfig;
 
@@ -39,10 +41,14 @@ const DEFAULT_METRICS_BIND: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ip
 /// Default loopback admin HTTP port (ADR 025). Exposed to the rest of
 /// the `node` crate so `decdn node <sub>` clients can fall back to the
 /// same default the server binds on, without duplicating the number.
-pub(crate) const DEFAULT_ADMIN_PORT: u16 = 9191;
+pub const DEFAULT_ADMIN_PORT: u16 = 9191;
 /// Default interval between RPC connectivity watchdog probes. `0`
 /// disables the watchdog; absent in config => this value.
 const DEFAULT_RPC_WATCHDOG_INTERVAL_SEC: u64 = 30;
+/// Minimum non-zero watchdog interval. Values below this would have
+/// the watchdog probing the RPC endpoint frequently enough to risk
+/// tripping provider rate limits or exhausting paid quotas.
+const MIN_RPC_WATCHDOG_INTERVAL_SEC: u64 = 10;
 /// Default interval between outgoing `NodeAnnounce` messages (ADR 001).
 const DEFAULT_ANNOUNCE_INTERVAL_SEC: u64 = 60;
 /// Default peer-table entry TTL after which a stale entry is evicted.
@@ -59,6 +65,16 @@ const DEFAULT_PER_SOURCE_RATE_PER_SEC: f64 = 100.0;
 const DEFAULT_PER_SOURCE_BURST: u32 = 200;
 /// Default hard cap on tracked source entries in the keyed limiter.
 const DEFAULT_MAX_TRACKED_SOURCES: usize = 4096;
+/// Default interval between iroh-blobs GC sweeps in seconds (#518). Five
+/// minutes balances the hostile-origin amplification window against the
+/// per-sweep cost of walking the blob list. The window matters because
+/// a single failed pull-through orphans up to `max_blob_size_mb`
+/// (one upload-per-request bound, not multiplied by the interval), but
+/// a stream of failed requests inside one interval compounds: total
+/// leak before reclaim is bounded by `requests_in_window * max_blob_size_mb`.
+/// Tuning the interval down shrinks that window. Operators on lean disks
+/// can tune lower; setting to `0` disables the periodic sweep entirely.
+pub const DEFAULT_GC_INTERVAL_SEC: u64 = 300;
 
 /// Load config from file (if present) and merge with CLI args.
 ///
@@ -371,10 +387,25 @@ fn resolve_blockchain(
     let rpc_watchdog_interval_sec = file
         .and_then(|b| b.rpc_watchdog_interval_sec)
         .unwrap_or(DEFAULT_RPC_WATCHDOG_INTERVAL_SEC);
+    anyhow::ensure!(
+        rpc_watchdog_interval_sec == 0
+            || rpc_watchdog_interval_sec >= MIN_RPC_WATCHDOG_INTERVAL_SEC,
+        "blockchain.rpc_watchdog_interval_sec={rpc_watchdog_interval_sec} \
+         would flood the RPC endpoint (minimum {MIN_RPC_WATCHDOG_INTERVAL_SEC}s, \
+         or 0 to disable)"
+    );
+
+    // CLI/env only — no TOML field. `expand_tilde` for parity with the
+    // keystore path itself. Existence check is intentionally deferred to
+    // the runtime loader: if the operator passes a stale path the failure
+    // surfaces as "no keystore password source available", which is
+    // clearer than a config-resolution-time stat() error.
+    let keystore_password_file = cli.keystore_password_file.clone().map(|p| expand_tilde(&p));
 
     Ok(ResolvedBlockchain {
         rpc_url,
         eth_keystore,
+        keystore_password_file,
         payment_channel_address,
         staking_registry_address,
         rpc_watchdog_interval_sec,
@@ -421,56 +452,323 @@ fn resolve_cache(
          can saturate the cache on one fetch"
     );
 
-    let origin_url_raw = cli
-        .origin_url
-        .clone()
-        .or_else(|| file.and_then(|c| c.origin_url.clone()))
-        .filter(|s| !s.is_empty());
-    let origin_url = origin_url_raw
-        .as_deref()
-        .map(decdn_cache::parse_origin_url)
+    let origin = file
+        .and_then(|c| c.origin.as_ref())
+        .map(resolve_origin)
         .transpose()
-        .context("invalid cache.origin_url")?;
-
-    let origin_path = cli
-        .origin_path
-        .clone()
-        .map(|p| expand_tilde(&p))
-        .or_else(|| {
-            file.and_then(|c| c.origin_path.clone())
-                .map(|p| expand_tilde(&p))
-        })
-        .filter(|p| !p.as_os_str().is_empty());
-
-    // origin_url and origin_path are different backends for the same slot
-    // (pull-through on miss). Accepting both would require choosing one
-    // silently; operators almost never want that, so fail loudly.
-    if origin_url.is_some() && origin_path.is_some() {
-        anyhow::bail!(
-            "cache.origin_url and cache.origin_path are mutually exclusive; set only one"
-        );
-    }
-
-    // Decompression defaults to Auto — most object stores serve
-    // compressed bodies and the BLAKE3 verify in the engine runs over
-    // the canonical (decompressed) form, so silently passing through
-    // compressed bytes would always fail. CLI has no override for
-    // this knob (no operator policy reason to flip it ad-hoc);
-    // file-only is sufficient.
-    let decompress = file.and_then(|c| c.decompress).unwrap_or_default();
+        .context("invalid cache.origin")?;
 
     let pinned_hashes = parse_pinned_hashes(file.and_then(|c| c.pinned_hashes.as_deref()))
         .context("invalid cache.pinned_hashes")?;
+
+    let origin_retry = resolve_origin_retry(file.and_then(|c| c.origin_retry.as_ref()))
+        .context("invalid cache.origin_retry")?;
+
+    // `cache.user_agent` (#435): operator override of the default
+    // `decdn-node/<version>` UA we send on every origin pull. We
+    // validate the value at config load — both for a clear error
+    // message and to slam the door on header-injection (CRLF, NUL,
+    // other control bytes) before it reaches `reqwest::Client::builder`,
+    // which would otherwise surface a generic "failed to build reqwest
+    // client" at runtime. Whitespace inside the value is preserved
+    // verbatim so an operator who genuinely wants `MyCdn / 1.0` gets
+    // exactly that.
+    let user_agent = match file.and_then(|c| c.user_agent.as_ref()) {
+        Some(s) => {
+            validate_user_agent(s)?;
+            s.clone()
+        }
+        None => decdn_cache::DEFAULT_USER_AGENT.to_string(),
+    };
+
+    let gc_interval_sec = file
+        .and_then(|c| c.gc_interval_sec)
+        .unwrap_or(DEFAULT_GC_INTERVAL_SEC);
 
     Ok(ResolvedCache {
         cache_dir,
         cache_size_mb,
         max_blob_size_mb,
-        origin_url,
-        origin_path,
-        decompress,
+        origin,
         pinned_hashes,
+        origin_retry,
+        user_agent,
+        gc_interval_sec,
     })
+}
+
+/// Resolve and validate a `[cache.origin]` table into the typed
+/// runtime form. The match arms run per-variant validation (URL parse
+/// for HTTP, S3 bucket/region/prefix shape) and reject empty paths or
+/// URLs early so a misconfigured backend surfaces at startup rather
+/// than on the first cache miss.
+fn resolve_origin(cfg: &types::OriginConfig) -> anyhow::Result<crate::config::ResolvedOrigin> {
+    use crate::config::ResolvedOrigin;
+    match cfg {
+        types::OriginConfig::Http { url, decompress } => {
+            anyhow::ensure!(!url.is_empty(), "cache.origin.url must not be empty");
+            let parsed = decdn_cache::parse_origin_url(url).context("invalid cache.origin.url")?;
+            Ok(ResolvedOrigin::Http {
+                url: parsed,
+                decompress: decompress.unwrap_or_default(),
+            })
+        }
+        types::OriginConfig::Fs { path } => {
+            let expanded = expand_tilde(path);
+            anyhow::ensure!(
+                !expanded.as_os_str().is_empty(),
+                "cache.origin.path must not be empty"
+            );
+            Ok(ResolvedOrigin::Fs { path: expanded })
+        }
+        types::OriginConfig::S3(s3) => {
+            let resolved = resolve_s3_origin(s3.clone())?;
+            Ok(ResolvedOrigin::S3(resolved))
+        }
+    }
+}
+
+/// Validate, normalize, and lift an `S3OriginConfig` into the runtime
+/// form `ResolvedS3Config` (#437). This is the **intended** path
+/// from the TOML wire form to a resolved-and-validated runtime form,
+/// and the only producer the rest of the resolution layer
+/// (`resolve_origin`, `resolve_cache`, `resolve_config`) feeds into
+/// the runtime. `ResolvedS3Config` itself has `pub` fields (matching
+/// the `Resolved*` shape used throughout this crate) — Rust
+/// visibility doesn't *enforce* the validator-only contract, but the
+/// runtime never bypasses it. See the type doc on
+/// [`ResolvedS3Config`].
+///
+/// Normalization performed here:
+/// - `prefix` gets a trailing `/` auto-appended if non-empty and
+///   missing one (mirrors `parse_origin_url`'s normalization).
+///   Absent prefix becomes `String::new()` on the resolved side.
+/// - `path_style: Option<bool>` is collapsed to `bool` with `None`
+///   mapped to `false` (the SDK default = virtual-hosted-style).
+/// - `endpoint_url` is parsed into `OriginUrl` so the S3 backend
+///   can hand it straight to the SDK without re-parsing.
+///
+/// Validation covers the cases the type can't express:
+/// - DNS-safe bucket name (see [`validate_s3_bucket_name`]);
+/// - non-empty region (the AWS SDK uses it for `SigV4` signing even
+///   when a custom `endpoint_url` is set);
+/// - `endpoint_url`, when present, parses as `http`/`https`;
+/// - `prefix` is a key prefix, not a path: must not start with `/`,
+///   must not contain `..`, must not contain backslashes, and must
+///   not contain ASCII control or whitespace characters.
+fn resolve_s3_origin(
+    cfg: types::S3OriginConfig,
+) -> anyhow::Result<crate::config::ResolvedS3Config> {
+    use crate::config::resolved::{ResolvedS3Config, ResolvedS3Credentials};
+
+    let types::S3OriginConfig {
+        bucket,
+        region,
+        endpoint_url,
+        path_style,
+        prefix,
+        credentials,
+    } = cfg;
+
+    validate_s3_bucket_name(&bucket).context("invalid cache.origin.bucket")?;
+    anyhow::ensure!(
+        !region.trim().is_empty(),
+        "cache.origin.region must not be empty (the AWS SDK uses it for SigV4 signing \
+         even when a custom endpoint_url is set)"
+    );
+
+    let endpoint_url = if let Some(endpoint) = endpoint_url {
+        anyhow::ensure!(
+            !endpoint.is_empty(),
+            "cache.origin.endpoint_url must not be empty when set; omit the key instead"
+        );
+        // `parse_origin_url` rejects query/fragment and forces
+        // trailing-slash normalization. That's fine for an S3
+        // endpoint base — the SDK appends `/{bucket}/{key}` itself,
+        // and storing the parsed/normalized form here means the
+        // runtime hands a single canonical string to the SDK
+        // regardless of whether the operator wrote
+        // `http://minio:9000` or `http://minio:9000/`.
+        Some(
+            decdn_cache::parse_origin_url(&endpoint)
+                .context("invalid cache.origin.endpoint_url")?,
+        )
+    } else {
+        None
+    };
+
+    let prefix = match prefix {
+        None => String::new(),
+        Some(mut prefix) => {
+            anyhow::ensure!(
+                !prefix.starts_with('/'),
+                "cache.origin.prefix is a key prefix, not a filesystem path: \
+                 it must not start with `/` (use `prefix = \"\"` or omit the key for no prefix)"
+            );
+            anyhow::ensure!(
+                !prefix.contains(".."),
+                "cache.origin.prefix must not contain `..` (key-prefix shape)"
+            );
+            anyhow::ensure!(
+                !prefix.contains('\\'),
+                "cache.origin.prefix must not contain `\\` (key-prefix shape)"
+            );
+            anyhow::ensure!(
+                !prefix.bytes().any(|b| b.is_ascii_control()),
+                "cache.origin.prefix must not contain ASCII control characters"
+            );
+            anyhow::ensure!(
+                !prefix.bytes().any(|b| b == b' ' || b == b'\t'),
+                "cache.origin.prefix must not contain whitespace"
+            );
+            if !prefix.is_empty() && !prefix.ends_with('/') {
+                prefix.push('/');
+            }
+            prefix
+        }
+    };
+
+    let credentials = credentials.map(|c| match c {
+        types::S3Credentials::Static {
+            access_key_id,
+            secret_access_key,
+            session_token,
+        } => ResolvedS3Credentials::Static {
+            access_key_id,
+            secret_access_key,
+            session_token,
+        },
+        types::S3Credentials::DefaultChain { profile } => {
+            // Collapse `profile = ""` (post env-var expansion) to None
+            // so the runtime's `loader.profile_name(...)` arm only fires
+            // for a real name. The SDK treats `profile_name("")` as
+            // distinct from "no override" and would surface a confusing
+            // "profile '' not found" error at first credential need.
+            let profile = profile.filter(|p| !p.is_empty());
+            ResolvedS3Credentials::DefaultChain { profile }
+        }
+    });
+
+    Ok(ResolvedS3Config {
+        bucket,
+        region,
+        endpoint_url,
+        path_style: path_style.unwrap_or(false),
+        prefix,
+        credentials,
+    })
+}
+
+/// AWS S3 bucket-name validation (#437). Mirrors the documented
+/// constraints: 3–63 chars; lowercase `[a-z0-9.-]`; no leading or
+/// trailing `.` or `-`; no consecutive dots; must not be formatted
+/// as an IPv4 address. Catches the common operator typo at config
+/// load instead of on the first request.
+///
+/// AWS-permissive choices we deliberately accept (but stricter
+/// frontends like virtual-hosted-style URLs may reject): names
+/// shorter than 3 chars are rejected (per AWS rule), but `xn--`
+/// prefix and `--ol-s3` suffix are not rejected here — they're
+/// reserved by AWS to never be assigned and the operator-typo case
+/// is rare enough not to warrant the extra code.
+fn validate_s3_bucket_name(name: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(!name.is_empty(), "bucket name must not be empty");
+    let len = name.len();
+    anyhow::ensure!(
+        (3..=63).contains(&len),
+        "bucket name must be 3..=63 chars (got {len})"
+    );
+    // AWS: "Bucket names must begin and end with a letter or number"
+    // — i.e. no leading/trailing `.` or `-`. The dot rule used to be
+    // the only one here; the hyphen rule was missed in the first
+    // pass. Names like `-foo` or `foo-` would parse but fail
+    // virtual-hosted-style URLs at request time.
+    let first = name.bytes().next().unwrap_or(0);
+    let last = name.bytes().next_back().unwrap_or(0);
+    anyhow::ensure!(
+        first.is_ascii_lowercase() || first.is_ascii_digit(),
+        "bucket name must begin with a lowercase letter or digit"
+    );
+    anyhow::ensure!(
+        last.is_ascii_lowercase() || last.is_ascii_digit(),
+        "bucket name must end with a lowercase letter or digit"
+    );
+    anyhow::ensure!(
+        !name.contains(".."),
+        "bucket name must not contain consecutive dots"
+    );
+    anyhow::ensure!(
+        name.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.'),
+        "bucket name must contain only lowercase letters, digits, `-`, or `.`"
+    );
+    // Reject IPv4-literal-shaped names (e.g. `192.168.1.1`). AWS
+    // rejects these on the wire; pre-flighting here gives a
+    // friendlier error. The check uses `Ipv4Addr::from_str` which
+    // only accepts the canonical 4-octet decimal form — a
+    // 5-segment all-numeric name like `1.2.3.4.5` is technically
+    // accepted by this validator and rejected by AWS at request
+    // time. That gap is acknowledged; the typo it would catch is
+    // exotic enough that the extra parsing complexity isn't earned
+    // here.
+    if name.parse::<std::net::Ipv4Addr>().is_ok() {
+        anyhow::bail!("bucket name must not be formatted as an IPv4 address");
+    }
+    Ok(())
+}
+
+/// Validate `cache.user_agent` as an HTTP header value at config load
+/// time. Rejects empty strings and any byte that would break header
+/// framing (CR, LF, NUL, other C0 controls, DEL). Tab is permitted —
+/// HTTP allows it in field values and operators occasionally use it as
+/// a separator inside the UA. Non-ASCII bytes (≥ 0x80) are rejected
+/// because real-world `User-Agent` strings are pure visible ASCII and
+/// silently passing through obs-text would hide a typo or a botched
+/// env-var expansion. Catching this here, rather than letting reqwest
+/// surface a generic `"failed to build reqwest client"` at startup,
+/// gives the operator a message that actually names the offending
+/// field and position.
+fn validate_user_agent(s: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !s.is_empty(),
+        "cache.user_agent must be a non-empty string when set"
+    );
+    if let Some((idx, byte)) = s
+        .bytes()
+        .enumerate()
+        .find(|(_, b)| !(*b == b'\t' || (0x20..=0x7e).contains(b)))
+    {
+        anyhow::bail!(
+            "cache.user_agent contains an invalid byte 0x{byte:02x} at position {idx}; \
+             only visible ASCII (0x20..=0x7e) and tab (0x09) are allowed in HTTP header values"
+        );
+    }
+    Ok(())
+}
+
+/// Resolve the origin retry policy (#285). Absent => defaults via
+/// `RetryPolicy::default()`. Present partial sections fill missing
+/// fields from the same defaults (handled by `#[serde(default)]` on
+/// `RetryPolicy` itself). This function only enforces the two
+/// cross-field invariants the type can't express: monotone schedule
+/// and finite jitter in `[0, 1]`.
+pub fn resolve_origin_retry(
+    file: Option<&decdn_cache::RetryPolicy>,
+) -> anyhow::Result<decdn_cache::RetryPolicy> {
+    let p = file.copied().unwrap_or_default();
+    anyhow::ensure!(
+        p.initial_backoff_ms <= p.max_backoff_ms,
+        "cache.origin_retry: initial_backoff_ms ({}) must be <= max_backoff_ms ({}); \
+         otherwise the schedule never grows",
+        p.initial_backoff_ms,
+        p.max_backoff_ms,
+    );
+    anyhow::ensure!(
+        p.jitter_ratio.is_finite() && (0.0..=1.0).contains(&p.jitter_ratio),
+        "cache.origin_retry: jitter_ratio={} must be a finite number in 0.0..=1.0",
+        p.jitter_ratio,
+    );
+    Ok(p)
 }
 
 /// Parse the operator-supplied `cache.pinned_hashes` list (#276) into a
@@ -480,9 +778,7 @@ fn resolve_cache(
 ///
 /// `None` and the empty list both resolve to the empty set, so an absent
 /// or empty `pinned_hashes` key just means "no pinning".
-pub(crate) fn parse_pinned_hashes(
-    raw: Option<&[String]>,
-) -> anyhow::Result<decdn_cache::PinnedHashes> {
+pub fn parse_pinned_hashes(raw: Option<&[String]>) -> anyhow::Result<decdn_cache::PinnedHashes> {
     use std::str::FromStr;
 
     let mut out = std::collections::HashSet::new();
@@ -529,7 +825,7 @@ pub(crate) fn parse_pinned_hashes(
 /// honest client decoder rejects — fail at startup rather than silently
 /// emit unparseable wire traffic. The bound is also a defense-in-depth
 /// against the selection-score overflow path (issue #322).
-pub(crate) fn resolve_payment(
+pub fn resolve_payment(
     cli: &crate::cli::run::PaymentArgs,
     file: Option<&types::PaymentConfig>,
 ) -> anyhow::Result<ResolvedPayment> {
@@ -556,9 +852,9 @@ pub(crate) fn resolve_payment(
 /// The admin port is merged with `0` as a first-class "disable" value so
 /// operators can turn the surface off without removing the line from their
 /// config. Cross-port collision checks (bind/metrics/admin) live in
-/// [`validate_port_layout`], which sees all three sections at once — see
+/// `validate_port_layout`, which sees all three sections at once — see
 /// there for the full ruleset.
-pub(crate) fn resolve_observability(
+pub fn resolve_observability(
     cli: &crate::cli::run::ObservabilityArgs,
     file: Option<&types::ObservabilityConfig>,
 ) -> anyhow::Result<ResolvedObservability> {
@@ -667,9 +963,7 @@ fn resolve_gossip(file: Option<&types::GossipConfig>) -> anyhow::Result<Resolved
 // (rate/burst coupling) across helpers that have to take both arguments
 // anyway. Keep it linear.
 #[allow(clippy::cognitive_complexity)]
-pub(crate) fn resolve_security(
-    file: Option<&types::SecurityConfig>,
-) -> anyhow::Result<ResolvedSecurity> {
+pub fn resolve_security(file: Option<&types::SecurityConfig>) -> anyhow::Result<ResolvedSecurity> {
     let max_concurrent_handlers = file
         .and_then(|s| s.max_concurrent_handlers)
         .unwrap_or(DEFAULT_MAX_CONCURRENT_HANDLERS);
@@ -765,7 +1059,7 @@ fn hex_val(b: u8) -> anyhow::Result<u8> {
 /// - If `explicit_path` is `Some`, reads that file (errors if missing).
 /// - If `explicit_path` is `None`, tries the default path; returns
 ///   `FileConfig::default()` if the file does not exist.
-pub(crate) fn load_file_config(explicit_path: Option<&Path>) -> anyhow::Result<FileConfig> {
+pub fn load_file_config(explicit_path: Option<&Path>) -> anyhow::Result<FileConfig> {
     let path = match explicit_path {
         Some(p) => p.to_path_buf(),
         None => match common::default_config_path() {
@@ -823,8 +1117,10 @@ fn expand_env(cfg: &mut FileConfig) -> anyhow::Result<()> {
     }
     if let Some(c) = cfg.cache.as_mut() {
         expand_path(&mut c.cache_dir, "cache.cache_dir")?;
-        expand_str(&mut c.origin_url, "cache.origin_url")?;
-        expand_path(&mut c.origin_path, "cache.origin_path")?;
+        if let Some(origin) = c.origin.as_mut() {
+            expand_origin(origin)?;
+        }
+        expand_str(&mut c.user_agent, "cache.user_agent")?;
     }
     if let Some(o) = cfg.observability.as_mut() {
         expand_str(&mut o.otlp_endpoint, "observability.otlp_endpoint")?;
@@ -839,12 +1135,74 @@ fn expand_str(field: &mut Option<String>, ctx: &'static str) -> anyhow::Result<(
     Ok(())
 }
 
+/// Walk an [`types::OriginConfig`] and run `${VAR}` / leading-`~`
+/// expansion on every URL and path field. Sibling of the per-section
+/// expansion blocks in [`expand_env`]; lifted out because the cache
+/// origin is a tagged enum with backend-specific shape.
+fn expand_origin(origin: &mut types::OriginConfig) -> anyhow::Result<()> {
+    match origin {
+        types::OriginConfig::Http { url, .. } => {
+            *url = expand_value(url, "cache.origin.url")?;
+        }
+        types::OriginConfig::Fs { path } => {
+            let as_str = path.to_string_lossy();
+            let expanded = expand_value(&as_str, "cache.origin.path")?;
+            *path = PathBuf::from(expanded);
+        }
+        types::OriginConfig::S3(s3) => {
+            s3.bucket = expand_value(&s3.bucket, "cache.origin.bucket")?;
+            s3.region = expand_value(&s3.region, "cache.origin.region")?;
+            expand_str(&mut s3.endpoint_url, "cache.origin.endpoint_url")?;
+            expand_str(&mut s3.prefix, "cache.origin.prefix")?;
+            if let Some(creds) = s3.credentials.as_mut() {
+                match creds {
+                    types::S3Credentials::Static {
+                        access_key_id,
+                        secret_access_key,
+                        session_token,
+                    } => {
+                        expand_secret(access_key_id, "cache.origin.credentials.access_key_id")?;
+                        expand_secret(
+                            secret_access_key,
+                            "cache.origin.credentials.secret_access_key",
+                        )?;
+                        if let Some(token) = session_token.as_mut() {
+                            expand_secret(token, "cache.origin.credentials.session_token")?;
+                        }
+                    }
+                    types::S3Credentials::DefaultChain { profile } => {
+                        expand_str(profile, "cache.origin.credentials.profile")?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn expand_path(field: &mut Option<PathBuf>, ctx: &'static str) -> anyhow::Result<()> {
     if let Some(p) = field.as_mut() {
         let as_str = p.to_string_lossy();
         let expanded = expand_value(&as_str, ctx)?;
         *p = PathBuf::from(expanded);
     }
+    Ok(())
+}
+
+/// `${VAR}` expansion for a [`secret::SecretString`] field. The
+/// expansion runs against the raw secret value via
+/// [`secret::SecretString::expose`], then re-wraps the result so the
+/// redacted-Debug invariant is preserved at every other call site.
+///
+/// `expand_value`'s error chain only mentions the field's dotted path
+/// and the missing env-var name — never the partially-expanded value
+/// — so a missing env-var error here cannot leak any cleartext that
+/// happens to precede the `${VAR}` marker (verified via the existing
+/// `expand_value` contract; see `expand_braces` in
+/// `crates/common/src/cli/common.rs`).
+fn expand_secret(field: &mut secret::SecretString, ctx: &'static str) -> anyhow::Result<()> {
+    let expanded = expand_value(field.expose(), ctx)?;
+    *field = secret::SecretString::new(expanded);
     Ok(())
 }
 
@@ -1181,6 +1539,144 @@ mod tests {
         );
     }
 
+    // Per-field merge coverage for `[gossip]` (#434). The companion to
+    // `resolve_security` per-field tests above. Each field gets a
+    // file-leg "override" test and a "default when absent" test, with
+    // the allowlist hex-validation error path covered alongside.
+
+    #[test]
+    fn resolve_gossip_announce_interval_file_override() -> anyhow::Result<()> {
+        let cfg = types::GossipConfig {
+            announce_interval_sec: Some(123),
+            ..Default::default()
+        };
+        let g = resolve_gossip(Some(&cfg))?;
+        assert_eq!(g.announce_interval_sec, 123);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_gossip_announce_interval_default_when_field_absent() -> anyhow::Result<()> {
+        // Other field populated, this one absent — proves the file
+        // leg's `unwrap_or` arm fires for this field independently.
+        let cfg = types::GossipConfig {
+            peer_ttl_sec: Some(900),
+            ..Default::default()
+        };
+        let g = resolve_gossip(Some(&cfg))?;
+        assert_eq!(g.announce_interval_sec, DEFAULT_ANNOUNCE_INTERVAL_SEC);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_gossip_peer_ttl_file_override() -> anyhow::Result<()> {
+        let cfg = types::GossipConfig {
+            peer_ttl_sec: Some(1234),
+            ..Default::default()
+        };
+        let g = resolve_gossip(Some(&cfg))?;
+        assert_eq!(g.peer_ttl_sec, 1234);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_gossip_peer_ttl_default_when_field_absent() -> anyhow::Result<()> {
+        let cfg = types::GossipConfig {
+            announce_interval_sec: Some(30),
+            ..Default::default()
+        };
+        let g = resolve_gossip(Some(&cfg))?;
+        assert_eq!(g.peer_ttl_sec, DEFAULT_PEER_TTL_SEC);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_gossip_subscribe_global_file_override_to_false() -> anyhow::Result<()> {
+        // Default is `true` (see `resolve_gossip`); the override path
+        // is the operator-actionable case (turning off global pub/sub).
+        let cfg = types::GossipConfig {
+            subscribe_global: Some(false),
+            ..Default::default()
+        };
+        let g = resolve_gossip(Some(&cfg))?;
+        assert!(!g.subscribe_global);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_gossip_subscribe_global_default_when_field_absent_is_true() -> anyhow::Result<()> {
+        // `None` => `true` per `resolve_gossip`. Distinct from "field
+        // explicitly set to true" (also true), but documents the
+        // omitted-field default for an absent TOML key.
+        let cfg = types::GossipConfig::default();
+        let g = resolve_gossip(Some(&cfg))?;
+        assert!(g.subscribe_global);
+        Ok(())
+    }
+
+    /// Allowlist hex validation: non-hex characters in an otherwise
+    /// 64-char entry must be rejected. Sibling to the existing
+    /// `resolve_gossip_rejects_bad_allowlist_entry` (wrong length)
+    /// test — together they cover the two failure modes
+    /// `parse_node_id_hex` raises on the allowlist path so a regression
+    /// in either won't slip past CI silently (#434).
+    #[test]
+    fn resolve_gossip_rejects_non_hex_allowlist_entry() {
+        let cfg = types::GossipConfig {
+            allowlist: Some(vec!["g".repeat(64)]),
+            ..Default::default()
+        };
+        let err = resolve_gossip(Some(&cfg))
+            .expect_err("non-hex entry should be rejected")
+            .to_string();
+        assert!(
+            err.contains("64 hex chars") || err.contains("hex"),
+            "error missing hex-context: {err}"
+        );
+    }
+
+    /// A multi-entry allowlist with one valid and one invalid entry
+    /// must reject the whole resolution — half-applied allowlists are
+    /// a worse failure mode than fail-fast at startup. The invalid
+    /// entry is positioned second so a regression that returns early
+    /// after parsing the first valid entry would silently accept the
+    /// bad list.
+    #[test]
+    fn resolve_gossip_rejects_when_any_allowlist_entry_invalid() {
+        let cfg = types::GossipConfig {
+            allowlist: Some(vec![
+                "0123456789abcdef".repeat(4), // valid
+                "z".repeat(64),               // invalid: non-hex
+            ]),
+            ..Default::default()
+        };
+        let err = resolve_gossip(Some(&cfg))
+            .expect_err("any invalid entry must reject the whole list")
+            .to_string();
+        assert!(
+            err.contains("hex"),
+            "error must surface hex-validation failure: {err}"
+        );
+    }
+
+    /// Independent gossip field overrides: setting one field to a
+    /// non-default value must leave the others at their defaults.
+    /// Catches a regression that copy-pasted the wrong source field
+    /// into a `unwrap_or(DEFAULT_*)` arm.
+    #[test]
+    fn resolve_gossip_field_overrides_are_independent() -> anyhow::Result<()> {
+        let cfg = types::GossipConfig {
+            announce_interval_sec: Some(7),
+            ..Default::default()
+        };
+        let g = resolve_gossip(Some(&cfg))?;
+        assert_eq!(g.announce_interval_sec, 7);
+        assert_eq!(g.peer_ttl_sec, DEFAULT_PEER_TTL_SEC);
+        assert!(g.subscribe_global);
+        assert!(g.allowlist.is_empty());
+        Ok(())
+    }
+
     // HOME is guaranteed set in Rust test harness on Linux/macOS and used here
     // to exercise ${VAR} expansion without mutating the process environment
     // (std::env::set_var is `unsafe` in edition 2024, and workspace lints
@@ -1300,8 +1796,6 @@ mod tests {
                 cache_dir: Some(PathBuf::from(r"C:\data\${HOME}\cache")),
                 cache_size_mb: None,
                 max_blob_size_mb: None,
-                origin_url: None,
-                origin_path: None,
                 ..Default::default()
             }),
             ..Default::default()
@@ -1342,8 +1836,6 @@ mod tests {
                 cache_dir: Some(PathBuf::from("~/decdn-cache")),
                 cache_size_mb: None,
                 max_blob_size_mb: None,
-                origin_url: None,
-                origin_path: None,
                 ..Default::default()
             }),
             ..Default::default()
@@ -1381,8 +1873,6 @@ mod tests {
                 cache_dir: Some(PathBuf::from("~")),
                 cache_size_mb: None,
                 max_blob_size_mb: None,
-                origin_url: None,
-                origin_path: None,
                 ..Default::default()
             }),
             ..Default::default()
@@ -1465,28 +1955,29 @@ mod tests {
                     cache_dir: Some(PathBuf::from(v)),
                     cache_size_mb: None,
                     max_blob_size_mb: None,
-                    origin_url: None,
-                    origin_path: None,
                     ..Default::default()
                 });
             }),
-            ("cache.origin_url", |c, v| {
+            ("cache.origin.url", |c, v| {
                 c.cache = Some(types::CacheConfig {
-                    cache_dir: None,
-                    cache_size_mb: None,
-                    max_blob_size_mb: None,
-                    origin_url: Some(v.to_string()),
-                    origin_path: None,
+                    origin: Some(types::OriginConfig::Http {
+                        url: v.to_string(),
+                        decompress: None,
+                    }),
                     ..Default::default()
                 });
             }),
-            ("cache.origin_path", |c, v| {
+            ("cache.origin.path", |c, v| {
                 c.cache = Some(types::CacheConfig {
-                    cache_dir: None,
-                    cache_size_mb: None,
-                    max_blob_size_mb: None,
-                    origin_url: None,
-                    origin_path: Some(PathBuf::from(v)),
+                    origin: Some(types::OriginConfig::Fs {
+                        path: PathBuf::from(v),
+                    }),
+                    ..Default::default()
+                });
+            }),
+            ("cache.user_agent", |c, v| {
+                c.cache = Some(types::CacheConfig {
+                    user_agent: Some(v.to_string()),
                     ..Default::default()
                 });
             }),
@@ -1517,31 +2008,168 @@ mod tests {
         Ok(())
     }
 
-    // Guards against the classic "added a field, forgot to wire expansion"
-    // regression — cache.origin_url is URL-shaped and must get the same
-    // `${VAR}` treatment as sibling URL fields (rpc_url, relay_url, etc).
+    // Same guard as `expand_env_substitutes_cache_origin_url`, for the
+    // user_agent field. Operators commonly want to embed `${HOSTNAME}` or
+    // a build-tag env var into the UA, and silently shipping the literal
+    // `${...}` would be a confusing wire-level surprise.
     #[test]
-    fn expand_env_substitutes_cache_origin_url() -> anyhow::Result<()> {
+    fn expand_env_substitutes_cache_user_agent() -> anyhow::Result<()> {
         let home = home_str()?;
         let mut cfg = FileConfig {
             cache: Some(types::CacheConfig {
-                cache_dir: None,
-                cache_size_mb: None,
-                max_blob_size_mb: None,
-                origin_url: Some("https://origin.example/${HOME}/bucket".to_string()),
-                origin_path: None,
+                user_agent: Some("decdn-${HOME}/test".to_string()),
                 ..Default::default()
             }),
             ..Default::default()
         };
         expand_env(&mut cfg)?;
-        let url = cfg
+        let ua = cfg
             .cache
             .as_ref()
-            .and_then(|c| c.origin_url.as_deref())
-            .ok_or_else(|| anyhow::anyhow!("origin_url missing"))?;
+            .and_then(|c| c.user_agent.as_deref())
+            .ok_or_else(|| anyhow::anyhow!("user_agent missing"))?;
+        let expected = format!("decdn-{home}/test");
+        anyhow::ensure!(ua == expected, "got: {ua}");
+        Ok(())
+    }
+
+    // Guards against the classic "added a field, forgot to wire expansion"
+    // regression — the HTTP-origin URL is URL-shaped and must get the
+    // same `${VAR}` treatment as sibling URL fields (rpc_url, relay_url,
+    // etc).
+    #[test]
+    fn expand_env_substitutes_cache_origin_url() -> anyhow::Result<()> {
+        let home = home_str()?;
+        let mut cfg = FileConfig {
+            cache: Some(types::CacheConfig {
+                origin: Some(types::OriginConfig::Http {
+                    url: "https://origin.example/${HOME}/bucket".to_string(),
+                    decompress: None,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        expand_env(&mut cfg)?;
+        let url = match cfg.cache.as_ref().and_then(|c| c.origin.as_ref()) {
+            Some(types::OriginConfig::Http { url, .. }) => url.clone(),
+            other => anyhow::bail!("expected Http origin, got: {other:?}"),
+        };
         let expected = format!("https://origin.example/{home}/bucket");
         anyhow::ensure!(url == expected, "got: {url}");
+        Ok(())
+    }
+
+    // Sibling of `expand_env_substitutes_cache_origin_url` — the FS
+    // origin path is a path-shaped field and must get the same
+    // `${VAR}` treatment so an operator can write
+    // `path = "${HOME}/cache-origin"` in their TOML and have it
+    // resolve correctly.
+    #[test]
+    fn expand_env_substitutes_cache_origin_fs_path() -> anyhow::Result<()> {
+        let home = home_str()?;
+        let mut cfg = FileConfig {
+            cache: Some(types::CacheConfig {
+                origin: Some(types::OriginConfig::Fs {
+                    path: PathBuf::from("${HOME}/cache-origin"),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        expand_env(&mut cfg)?;
+        let path = match cfg.cache.as_ref().and_then(|c| c.origin.as_ref()) {
+            Some(types::OriginConfig::Fs { path }) => path.clone(),
+            other => anyhow::bail!("expected Fs origin, got: {other:?}"),
+        };
+        let expected = PathBuf::from(format!("{home}/cache-origin"));
+        anyhow::ensure!(path == expected, "got: {}", path.display());
+        Ok(())
+    }
+
+    // The FS arm of `resolve_origin` calls `expand_tilde` so a TOML
+    // like `path = "~/origin"` resolves to `<home>/origin`. The
+    // expansion happens inside resolution (not in `expand_env`),
+    // because `~` is filesystem-shaped and the `expand_env`
+    // contract only handles `${VAR}` substitution.
+    #[test]
+    fn resolve_cache_origin_fs_expands_tilde_in_path() -> anyhow::Result<()> {
+        let home_dir = TempDir::new()?;
+        let home = home_dir.path().to_path_buf();
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig {
+            origin: Some(types::OriginConfig::Fs {
+                path: PathBuf::from("~/origin"),
+            }),
+            ..Default::default()
+        };
+        let resolved = common::test_support::with_home_override(Some(&home), || {
+            resolve_cache(&cli, Some(&toml), Path::new("/data-dir"))
+        })?;
+        match resolved.origin {
+            Some(ResolvedOrigin::Fs { path }) => {
+                anyhow::ensure!(
+                    path == home.join("origin"),
+                    "tilde should have expanded; got: {}",
+                    path.display()
+                );
+            }
+            other => anyhow::bail!("expected Fs origin, got: {other:?}"),
+        }
+        Ok(())
+    }
+
+    // resolve_cache must reject an HTTP origin variant whose `url`
+    // is the empty string. The error is raised by the explicit
+    // `anyhow::ensure!(!url.is_empty(), ...)` in `resolve_origin`,
+    // separate from `parse_origin_url`'s scheme/format checks. The
+    // existing `resolve_cache_rejects_non_http_origin_url` test
+    // covers the parser path; this one covers the
+    // empty-string-fails-fast path so a future refactor (e.g.
+    // pushing the empty check inside the parser) can't silently
+    // drop the contract.
+    #[test]
+    fn resolve_cache_rejects_empty_http_origin_url() -> anyhow::Result<()> {
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig {
+            origin: Some(types::OriginConfig::Http {
+                url: String::new(),
+                decompress: None,
+            }),
+            ..Default::default()
+        };
+        let err = resolve_cache(&cli, Some(&toml), Path::new("/tmp"))
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected empty-url rejection"))?;
+        let msg = format!("{err:#}");
+        anyhow::ensure!(
+            msg.contains("cache.origin.url") && msg.contains("must not be empty"),
+            "error lacked context: {msg}"
+        );
+        Ok(())
+    }
+
+    // Sibling of the empty-URL test for the FS variant. The
+    // emptiness check runs *after* tilde expansion (the operator
+    // wrote `path = ""`), so an empty PathBuf reaches the
+    // `as_os_str().is_empty()` guard.
+    #[test]
+    fn resolve_cache_rejects_empty_fs_origin_path() -> anyhow::Result<()> {
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig {
+            origin: Some(types::OriginConfig::Fs {
+                path: PathBuf::new(),
+            }),
+            ..Default::default()
+        };
+        let err = resolve_cache(&cli, Some(&toml), Path::new("/tmp"))
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected empty-path rejection"))?;
+        let msg = format!("{err:#}");
+        anyhow::ensure!(
+            msg.contains("cache.origin.path") && msg.contains("must not be empty"),
+            "error lacked context: {msg}"
+        );
         Ok(())
     }
 
@@ -1550,21 +2178,21 @@ mod tests {
     // "single parser" invariant introduced by `parse_origin_url`.
     #[test]
     fn resolve_cache_rejects_non_http_origin_url() -> anyhow::Result<()> {
-        let cli = crate::cli::run::CacheArgs {
-            cache_dir: None,
-            cache_size_mb: None,
-            max_blob_size_mb: None,
-            origin_url: Some("file:///etc/passwd".to_string()),
-            origin_path: None,
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig {
+            origin: Some(types::OriginConfig::Http {
+                url: "file:///etc/passwd".to_string(),
+                decompress: None,
+            }),
+            ..Default::default()
         };
-        let err = resolve_cache(&cli, None, std::path::Path::new("/tmp"))
+        let err = resolve_cache(&cli, Some(&toml), std::path::Path::new("/tmp"))
             .err()
-            .ok_or_else(|| anyhow::anyhow!("expected scheme rejection"))?
-            .to_string();
+            .ok_or_else(|| anyhow::anyhow!("expected scheme rejection"))?;
+        let msg = format!("{err:#}");
         anyhow::ensure!(
-            err.contains("invalid cache.origin_url")
-                || err.contains("unsupported origin URL scheme"),
-            "error lacked context: {err}"
+            msg.contains("invalid cache.origin") || msg.contains("unsupported origin URL scheme"),
+            "error lacked context: {msg}"
         );
         Ok(())
     }
@@ -1585,54 +2213,29 @@ mod tests {
         Ok(())
     }
 
-    // CLI > TOML precedence for origin_url specifically — mirrors the
-    // existing precedence pattern elsewhere in the config layer.
+    // Origin variant from TOML resolves into a typed `ResolvedOrigin::Http`
+    // that round-trips the parsed URL (#437). Replaces the CLI-vs-TOML
+    // precedence test that lived here before — the origin no longer has a
+    // CLI flag, so precedence is moot, but we still want a smoke test that
+    // the TOML form makes it through resolution without dropping anything.
     #[test]
-    fn resolve_cache_cli_origin_url_overrides_toml() -> anyhow::Result<()> {
-        let cli = crate::cli::run::CacheArgs {
-            cache_dir: None,
-            cache_size_mb: None,
-            max_blob_size_mb: None,
-            origin_url: Some("https://cli-wins.example/".to_string()),
-            origin_path: None,
-        };
+    fn resolve_cache_origin_http_from_toml_round_trips() -> anyhow::Result<()> {
+        let cli = empty_cache_args();
         let toml = types::CacheConfig {
-            cache_dir: None,
-            cache_size_mb: None,
-            max_blob_size_mb: None,
-            origin_url: Some("https://toml-loses.example/".to_string()),
-            origin_path: None,
+            origin: Some(types::OriginConfig::Http {
+                url: "https://origin.example/".to_string(),
+                decompress: None,
+            }),
             ..Default::default()
         };
         let resolved = resolve_cache(&cli, Some(&toml), std::path::Path::new("/tmp"))?;
-        let url = resolved
-            .origin_url
-            .ok_or_else(|| anyhow::anyhow!("origin_url missing"))?;
-        anyhow::ensure!(
-            url.as_url().as_str() == "https://cli-wins.example/",
-            "got: {url}"
-        );
-        Ok(())
-    }
-
-    // Both backends for the same miss-pull slot cannot be set at once —
-    // picking one silently would almost certainly violate operator intent.
-    #[test]
-    fn resolve_cache_rejects_both_origin_url_and_path() -> anyhow::Result<()> {
-        let cli = crate::cli::run::CacheArgs {
-            cache_dir: None,
-            cache_size_mb: None,
-            max_blob_size_mb: None,
-            origin_url: Some("https://origin.example/".to_string()),
-            origin_path: Some(PathBuf::from("/var/cache/decdn/origin")),
+        let url = match resolved.origin {
+            Some(ResolvedOrigin::Http { url, .. }) => url,
+            other => anyhow::bail!("expected Http origin, got: {other:?}"),
         };
-        let err = resolve_cache(&cli, None, std::path::Path::new("/tmp"))
-            .err()
-            .ok_or_else(|| anyhow::anyhow!("expected mutual-exclusion error"))?
-            .to_string();
         anyhow::ensure!(
-            err.contains("mutually exclusive"),
-            "error lacked mutual-exclusion context: {err}"
+            url.as_url().as_str() == "https://origin.example/",
+            "got: {url}"
         );
         Ok(())
     }
@@ -1654,24 +2257,25 @@ mod tests {
         Ok(())
     }
 
-    // origin_path alone resolves cleanly and leaves origin_url absent —
-    // pairs with the runtime's (Some, None) / (None, Some) dispatch match.
+    // Filesystem origin variant resolves into the typed
+    // `ResolvedOrigin::Fs` that the runtime's `build_cache` enum match
+    // dispatches on (#437).
     #[test]
-    fn resolve_cache_origin_path_only() -> anyhow::Result<()> {
-        let cli = crate::cli::run::CacheArgs {
-            cache_dir: None,
-            cache_size_mb: None,
-            max_blob_size_mb: None,
-            origin_url: None,
-            origin_path: Some(PathBuf::from("/tmp/origin")),
+    fn resolve_cache_origin_fs_round_trips() -> anyhow::Result<()> {
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig {
+            origin: Some(types::OriginConfig::Fs {
+                path: PathBuf::from("/tmp/origin"),
+            }),
+            ..Default::default()
         };
-        let resolved = resolve_cache(&cli, None, std::path::Path::new("/tmp"))?;
-        anyhow::ensure!(resolved.origin_url.is_none(), "origin_url should be None");
-        anyhow::ensure!(
-            resolved.origin_path == Some(PathBuf::from("/tmp/origin")),
-            "origin_path: {:?}",
-            resolved.origin_path,
-        );
+        let resolved = resolve_cache(&cli, Some(&toml), std::path::Path::new("/tmp"))?;
+        match resolved.origin {
+            Some(ResolvedOrigin::Fs { path }) => {
+                anyhow::ensure!(path == Path::new("/tmp/origin"), "path: {}", path.display());
+            }
+            other => anyhow::bail!("expected Fs origin, got: {other:?}"),
+        }
         Ok(())
     }
 
@@ -1744,8 +2348,6 @@ mod tests {
             cache_dir: None,
             cache_size_mb,
             max_blob_size_mb,
-            origin_url: None,
-            origin_path: None,
         }
     }
 
@@ -1889,29 +2491,990 @@ mod tests {
     }
 
     #[test]
-    fn resolve_cache_defaults_decompress_auto_and_pinned_empty() -> anyhow::Result<()> {
+    fn resolve_cache_no_origin_and_pinned_empty_by_default() -> anyhow::Result<()> {
         let cli = cache_cli(None, None);
         let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
         anyhow::ensure!(
-            matches!(resolved.decompress, decdn_cache::DecompressMode::Auto),
-            "decompress should default to Auto"
+            resolved.origin.is_none(),
+            "no [cache.origin] => no pull-through"
         );
         anyhow::ensure!(resolved.pinned_hashes.is_empty());
         Ok(())
     }
 
     #[test]
-    fn resolve_cache_decompress_strict_via_file() -> anyhow::Result<()> {
+    fn resolve_cache_user_agent_defaults_to_workspace_constant() -> anyhow::Result<()> {
+        // Absent => DEFAULT_USER_AGENT (#435).
+        let cli = cache_cli(None, None);
+        let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
+        anyhow::ensure!(
+            resolved.user_agent == decdn_cache::DEFAULT_USER_AGENT,
+            "expected default UA, got: {}",
+            resolved.user_agent
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_user_agent_from_file_overrides_default() -> anyhow::Result<()> {
         let cli = cache_cli(None, None);
         let file = types::CacheConfig {
-            decompress: Some(decdn_cache::DecompressMode::Strict),
+            user_agent: Some("MyCdn/1.0 (+ops@example.com)".to_string()),
             ..types::CacheConfig::default()
         };
         let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
-        anyhow::ensure!(matches!(
-            resolved.decompress,
-            decdn_cache::DecompressMode::Strict
-        ));
+        anyhow::ensure!(
+            resolved.user_agent == "MyCdn/1.0 (+ops@example.com)",
+            "got: {}",
+            resolved.user_agent
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_gc_interval_defaults_when_absent() -> anyhow::Result<()> {
+        // Absent => DEFAULT_GC_INTERVAL_SEC (#518).
+        let cli = cache_cli(None, None);
+        let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
+        anyhow::ensure!(
+            resolved.gc_interval_sec == DEFAULT_GC_INTERVAL_SEC,
+            "expected default {}, got: {}",
+            DEFAULT_GC_INTERVAL_SEC,
+            resolved.gc_interval_sec
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_gc_interval_from_file_overrides_default() -> anyhow::Result<()> {
+        let cli = cache_cli(None, None);
+        let file = types::CacheConfig {
+            gc_interval_sec: Some(42),
+            ..types::CacheConfig::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        anyhow::ensure!(
+            resolved.gc_interval_sec == 42,
+            "expected 42, got: {}",
+            resolved.gc_interval_sec
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_gc_interval_zero_disables() -> anyhow::Result<()> {
+        // `0` is the documented "disable periodic GC" sentinel — no
+        // clamp/floor should turn it back on. A regression that
+        // saturated to a minimum would silently re-enable GC for
+        // operators who explicitly opted out.
+        let cli = cache_cli(None, None);
+        let file = types::CacheConfig {
+            gc_interval_sec: Some(0),
+            ..types::CacheConfig::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        anyhow::ensure!(
+            resolved.gc_interval_sec == 0,
+            "0 must round-trip as 0 (disabled); got: {}",
+            resolved.gc_interval_sec
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_rejects_empty_user_agent() {
+        let cli = cache_cli(None, None);
+        let file = types::CacheConfig {
+            user_agent: Some(String::new()),
+            ..types::CacheConfig::default()
+        };
+        let err =
+            resolve_cache(&cli, Some(&file), Path::new("/tmp")).expect_err("empty UA must reject");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cache.user_agent"),
+            "missing field name: {msg}"
+        );
+    }
+
+    /// Reject control-byte bytes at config load — most importantly CR/LF, which
+    /// would let an operator-supplied (or env-expanded) value smuggle a second
+    /// header onto every origin request. Also covers NUL, other C0 controls,
+    /// DEL, and non-ASCII obs-text. Without this, the value reaches
+    /// `reqwest::Client::builder` and surfaces as a generic build error from
+    /// inside `HttpOrigin::new_with_user_agent` at startup, which doesn't tell
+    /// the operator which config field is to blame.
+    #[test]
+    fn resolve_cache_rejects_user_agent_with_control_bytes() {
+        let cli = cache_cli(None, None);
+        for bad in [
+            "evil\r\nX-Inject: 1",
+            "has\nlf",
+            "has\rcr",
+            "nul\0byte",
+            "del\x7fbyte",
+            "non-ascii-\u{00e9}",
+        ] {
+            let file = types::CacheConfig {
+                user_agent: Some(bad.to_string()),
+                ..types::CacheConfig::default()
+            };
+            let result = resolve_cache(&cli, Some(&file), Path::new("/tmp"));
+            assert!(result.is_err(), "UA `{bad:?}` must reject but resolved OK");
+        }
+        // Pin the message shape on one representative case so a regression in
+        // error context is caught (e.g. losing the field name or the byte
+        // position).
+        let file = types::CacheConfig {
+            user_agent: Some("crlf\r\ninjection".to_string()),
+            ..types::CacheConfig::default()
+        };
+        let err =
+            resolve_cache(&cli, Some(&file), Path::new("/tmp")).expect_err("CRLF UA must reject");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cache.user_agent") && msg.contains("invalid byte"),
+            "error should name the field and describe the byte, got: {msg}"
+        );
+    }
+
+    /// Tab is part of the legal HTTP header-value byte set and shows up in
+    /// real-world UAs occasionally; make sure the validator doesn't over-reject.
+    #[test]
+    fn resolve_cache_accepts_user_agent_with_tab() -> anyhow::Result<()> {
+        let cli = cache_cli(None, None);
+        let file = types::CacheConfig {
+            user_agent: Some("MyCdn/1.0\t(ops@example.com)".to_string()),
+            ..types::CacheConfig::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        anyhow::ensure!(
+            resolved.user_agent == "MyCdn/1.0\t(ops@example.com)",
+            "got: {}",
+            resolved.user_agent
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_http_decompress_strict_via_file() -> anyhow::Result<()> {
+        let cli = cache_cli(None, None);
+        let file = types::CacheConfig {
+            origin: Some(types::OriginConfig::Http {
+                url: "https://origin.example/".to_string(),
+                decompress: Some(decdn_cache::DecompressMode::Strict),
+            }),
+            ..types::CacheConfig::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        match resolved.origin {
+            Some(ResolvedOrigin::Http { decompress, .. }) => {
+                anyhow::ensure!(matches!(decompress, decdn_cache::DecompressMode::Strict));
+            }
+            other => anyhow::bail!("expected Http origin, got: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_http_decompress_defaults_to_auto() -> anyhow::Result<()> {
+        let cli = cache_cli(None, None);
+        let file = types::CacheConfig {
+            origin: Some(types::OriginConfig::Http {
+                url: "https://origin.example/".to_string(),
+                decompress: None,
+            }),
+            ..types::CacheConfig::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        match resolved.origin {
+            Some(ResolvedOrigin::Http { decompress, .. }) => {
+                anyhow::ensure!(matches!(decompress, decdn_cache::DecompressMode::Auto));
+            }
+            other => anyhow::bail!("expected Http origin, got: {other:?}"),
+        }
+        Ok(())
+    }
+
+    // ----- #437: S3 origin schema -----
+    //
+    // The tests below pin the shape of the schema validators and the
+    // resolved-form normalization. The runtime backend (`S3Origin`)
+    // lives in `decdn-cache` and is exercised separately by
+    // `crates/cache/tests/s3_origin.rs`; these tests stay focused on
+    // the resolver contract that feeds it.
+
+    /// Build a TOML S3 origin with sane defaults; tests override
+    /// individual fields. Avoids 6-line struct literals at every call
+    /// site.
+    fn s3_cfg(bucket: &str) -> types::S3OriginConfig {
+        types::S3OriginConfig {
+            bucket: bucket.to_string(),
+            region: "us-east-1".to_string(),
+            endpoint_url: None,
+            path_style: None,
+            prefix: None,
+            credentials: None,
+        }
+    }
+
+    fn cache_with_s3(s3: types::S3OriginConfig) -> types::CacheConfig {
+        types::CacheConfig {
+            origin: Some(types::OriginConfig::S3(s3)),
+            ..types::CacheConfig::default()
+        }
+    }
+
+    #[test]
+    fn resolve_cache_origin_s3_happy_path() -> anyhow::Result<()> {
+        let cli = cache_cli(None, None);
+        let file = cache_with_s3(types::S3OriginConfig {
+            bucket: "decdn-blobs".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint_url: Some("https://r2.cloudflarestorage.com".to_string()),
+            path_style: Some(true),
+            prefix: Some("blobs".to_string()),
+            credentials: None,
+        });
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        match resolved.origin {
+            Some(ResolvedOrigin::S3(s3)) => {
+                anyhow::ensure!(s3.bucket == "decdn-blobs", "bucket: {}", s3.bucket);
+                anyhow::ensure!(s3.region == "us-east-1", "region: {}", s3.region);
+                anyhow::ensure!(s3.path_style, "path_style should round-trip true");
+                // Trailing-slash auto-append.
+                anyhow::ensure!(s3.prefix == "blobs/", "prefix: {}", s3.prefix);
+                let endpoint = s3
+                    .endpoint_url
+                    .ok_or_else(|| anyhow::anyhow!("endpoint missing"))?;
+                anyhow::ensure!(
+                    endpoint.as_url().as_str() == "https://r2.cloudflarestorage.com/",
+                    "endpoint: {endpoint}"
+                );
+            }
+            other => anyhow::bail!("expected S3 origin, got: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_s3_origin_prefix_trailing_slash_already_present_unchanged() -> anyhow::Result<()> {
+        let cli = cache_cli(None, None);
+        let mut s3 = s3_cfg("decdn-blobs");
+        s3.prefix = Some("foo/bar/".to_string());
+        let resolved = resolve_cache(&cli, Some(&cache_with_s3(s3)), Path::new("/tmp"))?;
+        match resolved.origin {
+            Some(ResolvedOrigin::S3(s3)) => {
+                anyhow::ensure!(s3.prefix == "foo/bar/", "prefix: {}", s3.prefix);
+            }
+            other => anyhow::bail!("expected S3 origin, got: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_s3_origin_empty_prefix_stays_empty() -> anyhow::Result<()> {
+        let cli = cache_cli(None, None);
+        let mut s3 = s3_cfg("decdn-blobs");
+        s3.prefix = Some(String::new());
+        let resolved = resolve_cache(&cli, Some(&cache_with_s3(s3)), Path::new("/tmp"))?;
+        match resolved.origin {
+            Some(ResolvedOrigin::S3(s3)) => {
+                anyhow::ensure!(s3.prefix.is_empty(), "prefix should remain empty");
+            }
+            other => anyhow::bail!("expected S3 origin, got: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_s3_origin_path_style_none_collapses_to_false() -> anyhow::Result<()> {
+        let cli = cache_cli(None, None);
+        let resolved = resolve_cache(
+            &cli,
+            Some(&cache_with_s3(s3_cfg("decdn-blobs"))),
+            Path::new("/tmp"),
+        )?;
+        match resolved.origin {
+            Some(ResolvedOrigin::S3(s3)) => {
+                anyhow::ensure!(
+                    !s3.path_style,
+                    "path_style absent => false (SDK default = virtual-hosted)"
+                );
+            }
+            other => anyhow::bail!("expected S3 origin, got: {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// Helper: assert that a TOML-form S3 config rejects with an
+    /// error whose chained message contains every required fragment.
+    fn assert_s3_rejects(s3: types::S3OriginConfig, fragments: &[&str]) -> anyhow::Result<()> {
+        let cli = cache_cli(None, None);
+        let err = resolve_cache(&cli, Some(&cache_with_s3(s3)), Path::new("/tmp"))
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected rejection"))?;
+        let msg = format!("{err:#}");
+        for fragment in fragments {
+            anyhow::ensure!(
+                msg.contains(fragment),
+                "error did not contain `{fragment}`: {msg}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn validate_bucket_rejects_too_short() -> anyhow::Result<()> {
+        assert_s3_rejects(s3_cfg("ab"), &["cache.origin.bucket", "3..=63"])
+    }
+
+    #[test]
+    fn validate_bucket_accepts_min_length_three() -> anyhow::Result<()> {
+        // Boundary: exactly 3 chars must pass.
+        let cli = cache_cli(None, None);
+        let _ = resolve_cache(&cli, Some(&cache_with_s3(s3_cfg("abc"))), Path::new("/tmp"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn validate_bucket_rejects_too_long() -> anyhow::Result<()> {
+        let name: String = std::iter::repeat_n('a', 64).collect();
+        assert_s3_rejects(s3_cfg(&name), &["cache.origin.bucket", "3..=63"])
+    }
+
+    #[test]
+    fn validate_bucket_accepts_max_length_sixty_three() -> anyhow::Result<()> {
+        let name: String = std::iter::repeat_n('a', 63).collect();
+        let cli = cache_cli(None, None);
+        let _ = resolve_cache(&cli, Some(&cache_with_s3(s3_cfg(&name))), Path::new("/tmp"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn validate_bucket_rejects_uppercase() -> anyhow::Result<()> {
+        assert_s3_rejects(s3_cfg("MyBucket"), &["lowercase"])
+    }
+
+    #[test]
+    fn validate_bucket_rejects_underscore() -> anyhow::Result<()> {
+        assert_s3_rejects(s3_cfg("my_bucket"), &["lowercase"])
+    }
+
+    #[test]
+    fn validate_bucket_rejects_leading_dot() -> anyhow::Result<()> {
+        assert_s3_rejects(s3_cfg(".mybucket"), &["begin"])
+    }
+
+    #[test]
+    fn validate_bucket_rejects_trailing_dot() -> anyhow::Result<()> {
+        assert_s3_rejects(s3_cfg("mybucket."), &["end"])
+    }
+
+    #[test]
+    fn validate_bucket_rejects_leading_hyphen() -> anyhow::Result<()> {
+        // Documented AWS rule: "Bucket names must begin and end with a
+        // letter or number." Pre-#437-PR1-review the validator only
+        // checked dots; the hyphen-edge case slipped through.
+        assert_s3_rejects(s3_cfg("-mybucket"), &["begin"])
+    }
+
+    #[test]
+    fn validate_bucket_rejects_trailing_hyphen() -> anyhow::Result<()> {
+        assert_s3_rejects(s3_cfg("mybucket-"), &["end"])
+    }
+
+    #[test]
+    fn validate_bucket_rejects_consecutive_dots() -> anyhow::Result<()> {
+        assert_s3_rejects(s3_cfg("my..bucket"), &["consecutive dots"])
+    }
+
+    #[test]
+    fn validate_bucket_rejects_ipv4_literal() -> anyhow::Result<()> {
+        assert_s3_rejects(s3_cfg("192.168.1.1"), &["IPv4"])
+    }
+
+    #[test]
+    fn validate_region_rejects_empty_string() -> anyhow::Result<()> {
+        let mut s3 = s3_cfg("decdn-blobs");
+        s3.region = String::new();
+        assert_s3_rejects(s3, &["cache.origin.region", "must not be empty"])
+    }
+
+    #[test]
+    fn validate_region_rejects_whitespace_only() -> anyhow::Result<()> {
+        let mut s3 = s3_cfg("decdn-blobs");
+        s3.region = "   ".to_string();
+        assert_s3_rejects(s3, &["cache.origin.region", "must not be empty"])
+    }
+
+    #[test]
+    fn validate_endpoint_rejects_empty_string() -> anyhow::Result<()> {
+        let mut s3 = s3_cfg("decdn-blobs");
+        s3.endpoint_url = Some(String::new());
+        assert_s3_rejects(s3, &["cache.origin.endpoint_url", "omit the key instead"])
+    }
+
+    #[test]
+    fn validate_endpoint_rejects_non_http_scheme() -> anyhow::Result<()> {
+        let mut s3 = s3_cfg("decdn-blobs");
+        s3.endpoint_url = Some("ftp://endpoint.example/".to_string());
+        assert_s3_rejects(s3, &["cache.origin.endpoint_url"])
+    }
+
+    #[test]
+    fn validate_prefix_rejects_leading_slash() -> anyhow::Result<()> {
+        let mut s3 = s3_cfg("decdn-blobs");
+        s3.prefix = Some("/foo/".to_string());
+        assert_s3_rejects(s3, &["cache.origin.prefix", "must not start with `/`"])
+    }
+
+    #[test]
+    fn validate_prefix_rejects_dotdot() -> anyhow::Result<()> {
+        let mut s3 = s3_cfg("decdn-blobs");
+        s3.prefix = Some("foo/../bar/".to_string());
+        assert_s3_rejects(s3, &["cache.origin.prefix", "must not contain `..`"])
+    }
+
+    #[test]
+    fn validate_prefix_rejects_backslash() -> anyhow::Result<()> {
+        let mut s3 = s3_cfg("decdn-blobs");
+        s3.prefix = Some("foo\\bar/".to_string());
+        assert_s3_rejects(s3, &["cache.origin.prefix", "must not contain `\\`"])
+    }
+
+    #[test]
+    fn validate_prefix_rejects_control_chars() -> anyhow::Result<()> {
+        // \n / \t / \0 inside the prefix would corrupt the eventual
+        // S3 key; reject loud at config load instead of letting the
+        // SDK URL-encode them into a "key not found".
+        let mut s3 = s3_cfg("decdn-blobs");
+        s3.prefix = Some("foo\nbar/".to_string());
+        assert_s3_rejects(s3, &["cache.origin.prefix", "control characters"])
+    }
+
+    #[test]
+    fn validate_prefix_rejects_whitespace() -> anyhow::Result<()> {
+        let mut s3 = s3_cfg("decdn-blobs");
+        s3.prefix = Some("foo bar/".to_string());
+        assert_s3_rejects(s3, &["cache.origin.prefix", "whitespace"])
+    }
+
+    // ----- #437: deny_unknown_fields catches typos on Http variant -----
+    //
+    // The first-pass review caught that the OriginConfig enum lacked
+    // deny_unknown_fields, allowing typos like `decompres = "auto"`
+    // to silently no-op. These two tests lock the contract.
+
+    #[test]
+    fn http_origin_rejects_unknown_field_typo() -> anyhow::Result<()> {
+        let toml = r#"
+            kind = "http"
+            url = "https://origin.example/"
+            decompres = "auto"
+        "#;
+        let err = toml::from_str::<types::OriginConfig>(toml)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected unknown-field error"))?;
+        let msg = format!("{err}");
+        anyhow::ensure!(
+            msg.contains("unknown field") && msg.contains("decompres"),
+            "got: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fs_origin_rejects_unknown_field_typo() -> anyhow::Result<()> {
+        let toml = r#"
+            kind = "fs"
+            paht = "/var/decdn"
+        "#;
+        let err = toml::from_str::<types::OriginConfig>(toml)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected unknown-field error"))?;
+        let msg = format!("{err}");
+        anyhow::ensure!(
+            msg.contains("unknown field") && msg.contains("paht"),
+            "got: {msg}"
+        );
+        Ok(())
+    }
+
+    /// Helper: assert that a TOML deserialization fails with a
+    /// message containing every required fragment. Used by the
+    /// missing-required-field and unknown-tag-value tests.
+    fn assert_origin_toml_rejects(toml: &str, fragments: &[&str]) -> anyhow::Result<()> {
+        let err = toml::from_str::<types::OriginConfig>(toml)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected rejection for: {toml}"))?;
+        let msg = format!("{err}");
+        for fragment in fragments {
+            anyhow::ensure!(
+                msg.contains(fragment),
+                "error did not contain `{fragment}`: {msg}"
+            );
+        }
+        Ok(())
+    }
+
+    // serde-tagged-enum invariant: the `kind` field is required and
+    // names which variant is being deserialized. Without it,
+    // serde can't disambiguate. Operators who copy-paste the inner
+    // table without the `kind = "..."` line need a clear error.
+    #[test]
+    fn origin_rejects_missing_kind_tag() -> anyhow::Result<()> {
+        assert_origin_toml_rejects(
+            r#"url = "https://origin.example/""#,
+            &["missing field", "kind"],
+        )
+    }
+
+    // An unknown `kind` value (e.g. operator typo `httpx` or a
+    // forward-looking `gcs` someone speculatively wrote) must
+    // surface a clear error instead of being silently dropped.
+    #[test]
+    fn origin_rejects_unknown_kind_value() -> anyhow::Result<()> {
+        assert_origin_toml_rejects(
+            r#"
+                kind = "httpx"
+                url = "https://origin.example/"
+            "#,
+            &["unknown variant", "httpx"],
+        )
+    }
+
+    // HTTP variant requires a `url` field. serde reports a
+    // missing-field error for the inner struct payload of the
+    // tagged enum.
+    #[test]
+    fn http_origin_rejects_missing_url_field() -> anyhow::Result<()> {
+        assert_origin_toml_rejects(
+            r#"
+                kind = "http"
+                decompress = "auto"
+            "#,
+            &["missing field", "url"],
+        )
+    }
+
+    // FS variant requires a `path` field.
+    #[test]
+    fn fs_origin_rejects_missing_path_field() -> anyhow::Result<()> {
+        assert_origin_toml_rejects(r#"kind = "fs""#, &["missing field", "path"])
+    }
+
+    // S3 variant requires `bucket` and `region`. Two siblings —
+    // missing each in turn — so future tag-renames or shape changes
+    // can't silently drop either requirement.
+    #[test]
+    fn s3_origin_rejects_missing_bucket_field() -> anyhow::Result<()> {
+        assert_origin_toml_rejects(
+            r#"
+                kind = "s3"
+                region = "us-east-1"
+            "#,
+            &["missing field", "bucket"],
+        )
+    }
+
+    #[test]
+    fn s3_origin_rejects_missing_region_field() -> anyhow::Result<()> {
+        assert_origin_toml_rejects(
+            r#"
+                kind = "s3"
+                bucket = "decdn-blobs"
+            "#,
+            &["missing field", "region"],
+        )
+    }
+
+    // ----- #437: S3 credentials end-to-end resolution -----
+
+    // Static credentials round-trip through `resolve_cache` into
+    // `ResolvedS3Credentials::Static` with the secret values
+    // preserved (as `SecretString`s, exposing only via `expose()`).
+    // Also exercises the validator path that converts wire-form
+    // `S3Credentials::Static` into resolved form.
+    #[test]
+    fn resolve_cache_origin_s3_static_credentials_round_trip() -> anyhow::Result<()> {
+        let cli = cache_cli(None, None);
+        let file = cache_with_s3(types::S3OriginConfig {
+            bucket: "decdn-blobs".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint_url: None,
+            path_style: None,
+            prefix: None,
+            credentials: Some(types::S3Credentials::Static {
+                access_key_id: secret::SecretString::new("AKIA-test-id"),
+                secret_access_key: secret::SecretString::new("test-secret-value"),
+                session_token: Some(secret::SecretString::new("STS-token")),
+            }),
+        });
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        let creds = match resolved.origin {
+            Some(ResolvedOrigin::S3(s3)) => s3
+                .credentials
+                .ok_or_else(|| anyhow::anyhow!("credentials missing"))?,
+            other => anyhow::bail!("expected S3 origin, got: {other:?}"),
+        };
+        match creds {
+            crate::config::ResolvedS3Credentials::Static {
+                access_key_id,
+                secret_access_key,
+                session_token,
+            } => {
+                anyhow::ensure!(access_key_id.expose() == "AKIA-test-id");
+                anyhow::ensure!(secret_access_key.expose() == "test-secret-value");
+                anyhow::ensure!(
+                    session_token.as_ref().map(secret::SecretString::expose) == Some("STS-token")
+                );
+            }
+            crate::config::ResolvedS3Credentials::DefaultChain { .. } => {
+                anyhow::bail!("expected Static credentials, got DefaultChain")
+            }
+        }
+        Ok(())
+    }
+
+    // DefaultChain with no profile — the most common shape for AWS
+    // operators using IAM roles or AWS_PROFILE. Resolves to
+    // `ResolvedS3Credentials::DefaultChain { profile: None }`.
+    #[test]
+    fn resolve_cache_origin_s3_default_chain_no_profile() -> anyhow::Result<()> {
+        let cli = cache_cli(None, None);
+        let file = cache_with_s3(types::S3OriginConfig {
+            bucket: "decdn-blobs".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint_url: None,
+            path_style: None,
+            prefix: None,
+            credentials: Some(types::S3Credentials::DefaultChain { profile: None }),
+        });
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        let creds = match resolved.origin {
+            Some(ResolvedOrigin::S3(s3)) => s3
+                .credentials
+                .ok_or_else(|| anyhow::anyhow!("credentials missing"))?,
+            other => anyhow::bail!("expected S3 origin, got: {other:?}"),
+        };
+        match creds {
+            crate::config::ResolvedS3Credentials::DefaultChain { profile } => {
+                anyhow::ensure!(profile.is_none(), "profile should be None");
+            }
+            crate::config::ResolvedS3Credentials::Static { .. } => {
+                anyhow::bail!("expected DefaultChain, got Static")
+            }
+        }
+        Ok(())
+    }
+
+    // `DefaultChain { profile = "" }` (e.g. from a `${PROFILE}` env-var
+    // that resolved to empty, or a literal empty string in TOML) is
+    // collapsed to `profile = None` at the resolver. Without this
+    // normalization the runtime would call `loader.profile_name("")`
+    // and the SDK would surface a confusing "profile '' not found" at
+    // first credential need. Pinned so a future refactor of
+    // `resolve_s3_origin` can't drop the filter.
+    #[test]
+    fn resolve_cache_origin_s3_default_chain_empty_profile_collapses_to_none() -> anyhow::Result<()>
+    {
+        let cli = cache_cli(None, None);
+        let file = cache_with_s3(types::S3OriginConfig {
+            bucket: "decdn-blobs".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint_url: None,
+            path_style: None,
+            prefix: None,
+            credentials: Some(types::S3Credentials::DefaultChain {
+                profile: Some(String::new()),
+            }),
+        });
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        let creds = match resolved.origin {
+            Some(ResolvedOrigin::S3(s3)) => s3
+                .credentials
+                .ok_or_else(|| anyhow::anyhow!("credentials missing"))?,
+            other => anyhow::bail!("expected S3 origin, got: {other:?}"),
+        };
+        match creds {
+            crate::config::ResolvedS3Credentials::DefaultChain { profile } => {
+                anyhow::ensure!(profile.is_none(), "empty profile should collapse to None");
+            }
+            crate::config::ResolvedS3Credentials::Static { .. } => {
+                anyhow::bail!("expected DefaultChain, got Static")
+            }
+        }
+        Ok(())
+    }
+
+    // Absent `[cache.origin.credentials]` => resolved credentials
+    // are `None` (the runtime then falls back to the AWS default
+    // credential chain). Pin this default so a future refactor of
+    // `resolve_s3_origin` can't accidentally synthesize a
+    // `DefaultChain` placeholder where one wasn't requested.
+    #[test]
+    fn resolve_cache_origin_s3_no_credentials_resolves_to_none() -> anyhow::Result<()> {
+        let cli = cache_cli(None, None);
+        let file = cache_with_s3(s3_cfg("decdn-blobs"));
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        match resolved.origin {
+            Some(ResolvedOrigin::S3(s3)) => {
+                anyhow::ensure!(
+                    s3.credentials.is_none(),
+                    "absent credentials must resolve to None, not synthesized DefaultChain"
+                );
+            }
+            other => anyhow::bail!("expected S3 origin, got: {other:?}"),
+        }
+        Ok(())
+    }
+
+    // ----- #437: expand_origin walks every URL/path/secret field -----
+
+    #[test]
+    fn expand_env_substitutes_s3_bucket_and_region() -> anyhow::Result<()> {
+        // Operators routinely template region by env var across
+        // multi-region deployments.
+        let home = home_str()?;
+        let mut cfg = FileConfig {
+            cache: Some(types::CacheConfig {
+                origin: Some(types::OriginConfig::S3(types::S3OriginConfig {
+                    bucket: "blobs-${HOME}".to_string(),
+                    region: "${HOME}-east-1".to_string(),
+                    endpoint_url: None,
+                    path_style: None,
+                    prefix: None,
+                    credentials: None,
+                })),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        expand_env(&mut cfg)?;
+        let s3 = match cfg.cache.as_ref().and_then(|c| c.origin.as_ref()) {
+            Some(types::OriginConfig::S3(s3)) => s3,
+            other => anyhow::bail!("expected S3 origin, got: {other:?}"),
+        };
+        anyhow::ensure!(s3.bucket == format!("blobs-{home}"));
+        anyhow::ensure!(s3.region == format!("{home}-east-1"));
+        Ok(())
+    }
+
+    #[test]
+    fn expand_env_substitutes_s3_endpoint_and_prefix() -> anyhow::Result<()> {
+        let home = home_str()?;
+        let mut cfg = FileConfig {
+            cache: Some(types::CacheConfig {
+                origin: Some(types::OriginConfig::S3(types::S3OriginConfig {
+                    bucket: "decdn-blobs".to_string(),
+                    region: "us-east-1".to_string(),
+                    endpoint_url: Some("https://${HOME}.example/".to_string()),
+                    path_style: None,
+                    prefix: Some("blobs-${HOME}/".to_string()),
+                    credentials: None,
+                })),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        expand_env(&mut cfg)?;
+        let s3 = match cfg.cache.as_ref().and_then(|c| c.origin.as_ref()) {
+            Some(types::OriginConfig::S3(s3)) => s3,
+            other => anyhow::bail!("expected S3 origin, got: {other:?}"),
+        };
+        anyhow::ensure!(
+            s3.endpoint_url.as_deref() == Some(&format!("https://{home}.example/")[..])
+        );
+        anyhow::ensure!(s3.prefix.as_deref() == Some(&format!("blobs-{home}/")[..]));
+        Ok(())
+    }
+
+    #[test]
+    fn expand_env_substitutes_s3_static_credentials() -> anyhow::Result<()> {
+        // The whole point of supporting `${VAR}` in TOML is to keep
+        // secrets out of the file: operators write
+        // `access_key_id = "${AWS_ACCESS_KEY_ID}"` and the env var
+        // supplies the value. This test locks the wiring so a future
+        // refactor of expand_origin can't silently regress it.
+        let home = home_str()?;
+        let mut cfg = FileConfig {
+            cache: Some(types::CacheConfig {
+                origin: Some(types::OriginConfig::S3(types::S3OriginConfig {
+                    bucket: "decdn-blobs".to_string(),
+                    region: "us-east-1".to_string(),
+                    endpoint_url: None,
+                    path_style: None,
+                    prefix: None,
+                    credentials: Some(types::S3Credentials::Static {
+                        access_key_id: secret::SecretString::new("${HOME}-access"),
+                        secret_access_key: secret::SecretString::new("${HOME}-secret"),
+                        session_token: Some(secret::SecretString::new("${HOME}-token")),
+                    }),
+                })),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        expand_env(&mut cfg)?;
+        let creds = match cfg.cache.as_ref().and_then(|c| c.origin.as_ref()) {
+            Some(types::OriginConfig::S3(s3)) => s3.credentials.as_ref(),
+            other => anyhow::bail!("expected S3 origin, got: {other:?}"),
+        }
+        .ok_or_else(|| anyhow::anyhow!("credentials missing"))?;
+        match creds {
+            types::S3Credentials::Static {
+                access_key_id,
+                secret_access_key,
+                session_token,
+            } => {
+                anyhow::ensure!(access_key_id.expose() == format!("{home}-access"));
+                anyhow::ensure!(secret_access_key.expose() == format!("{home}-secret"));
+                anyhow::ensure!(
+                    session_token
+                        .as_ref()
+                        .map(secret::SecretString::expose)
+                        .map(str::to_string)
+                        == Some(format!("{home}-token"))
+                );
+            }
+            types::S3Credentials::DefaultChain { .. } => {
+                anyhow::bail!("expected Static, got DefaultChain")
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn expand_env_substitutes_s3_default_chain_profile() -> anyhow::Result<()> {
+        let home = home_str()?;
+        let mut cfg = FileConfig {
+            cache: Some(types::CacheConfig {
+                origin: Some(types::OriginConfig::S3(types::S3OriginConfig {
+                    bucket: "decdn-blobs".to_string(),
+                    region: "us-east-1".to_string(),
+                    endpoint_url: None,
+                    path_style: None,
+                    prefix: None,
+                    credentials: Some(types::S3Credentials::DefaultChain {
+                        profile: Some("${HOME}-prof".to_string()),
+                    }),
+                })),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        expand_env(&mut cfg)?;
+        let profile = match cfg.cache.as_ref().and_then(|c| c.origin.as_ref()) {
+            Some(types::OriginConfig::S3(s3)) => match s3.credentials.as_ref() {
+                Some(types::S3Credentials::DefaultChain { profile }) => profile.clone(),
+                other => anyhow::bail!("expected DefaultChain, got: {other:?}"),
+            },
+            other => anyhow::bail!("expected S3 origin, got: {other:?}"),
+        };
+        anyhow::ensure!(profile == Some(format!("{home}-prof")));
+        Ok(())
+    }
+
+    #[test]
+    fn expand_secret_error_on_missing_env_var_does_not_leak_partial_value() -> anyhow::Result<()> {
+        // The safety claim is: an undefined `${VAR}` in a secret
+        // field surfaces only the field's dotted-path context and
+        // the env-var name — never any cleartext that might be
+        // adjacent to the marker in the TOML. This test pins that
+        // contract for the credential path so a refactor of
+        // expand_value cannot silently regress it.
+        let missing = "DECDN_UNSET_SECRET_VAR_XYZ";
+        anyhow::ensure!(
+            std::env::var_os(missing).is_none(),
+            "test prereq: unset env var"
+        );
+        let mut cfg = FileConfig {
+            cache: Some(types::CacheConfig {
+                origin: Some(types::OriginConfig::S3(types::S3OriginConfig {
+                    bucket: "decdn-blobs".to_string(),
+                    region: "us-east-1".to_string(),
+                    endpoint_url: None,
+                    path_style: None,
+                    prefix: None,
+                    credentials: Some(types::S3Credentials::Static {
+                        access_key_id: secret::SecretString::new(format!(
+                            "AKIA-prefix-${{{missing}}}-suffix"
+                        )),
+                        secret_access_key: secret::SecretString::new("does-not-matter"),
+                        session_token: None,
+                    }),
+                })),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = expand_env(&mut cfg)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected env-var error"))?;
+        let msg = format!("{err:#}");
+        anyhow::ensure!(
+            msg.contains("cache.origin.credentials.access_key_id"),
+            "error must name the field: {msg}"
+        );
+        anyhow::ensure!(
+            !msg.contains("AKIA") && !msg.contains("suffix"),
+            "error must not echo any cleartext from the secret value: {msg}"
+        );
+        Ok(())
+    }
+
+    // ----- #437: legacy decompress field rejection -----
+
+    #[test]
+    fn http_origin_legacy_top_level_decompress_field_rejected() -> anyhow::Result<()> {
+        // Pre-#437 schemas put `decompress` at `[cache]` directly.
+        // Sibling of the legacy `origin_url`/`origin_path`
+        // rejection tests below.
+        let toml_body = format!(
+            "{}\n\n[cache]\ndecompress = \"strict\"\n",
+            complete_toml_body()
+        );
+        let dir = data_dir_with_keystore()?;
+        let path = write_minimal_toml(&dir, &toml_body)?;
+        let args = run_args_with_data_dir(dir.path());
+        let err = resolve_config(Some(&path), &args)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected unknown-field error"))?;
+        let msg = format!("{err:#}");
+        anyhow::ensure!(
+            msg.contains("decompress") && msg.contains("unknown field"),
+            "error must call out the legacy `decompress` key: {msg}"
+        );
+        Ok(())
+    }
+
+    // ----- #437: regression lock — `decdn config validate` accepts S3 today -----
+
+    #[test]
+    fn resolve_config_accepts_s3_origin_today() -> anyhow::Result<()> {
+        // `decdn config validate` (which goes through `resolve_config`)
+        // must succeed for a valid S3 TOML — operator-side validation
+        // is the schema + resolver layer, not the runtime backend.
+        // Pinned so a future refactor that moved the S3 backend's
+        // construction-time validation upstream into `resolve_origin`
+        // can't silently start rejecting configs that `build_cache`
+        // would otherwise accept.
+        let toml_body = format!(
+            "{}\n\n[cache.origin]\nkind = \"s3\"\n\
+             bucket = \"decdn-blobs\"\nregion = \"us-east-1\"\n",
+            complete_toml_body()
+        );
+        let dir = data_dir_with_keystore()?;
+        let path = write_minimal_toml(&dir, &toml_body)?;
+        let args = run_args_with_data_dir(dir.path());
+        let resolved = resolve_config(Some(&path), &args)?;
+        match resolved.cache.origin {
+            Some(ResolvedOrigin::S3(s3)) => {
+                anyhow::ensure!(s3.bucket == "decdn-blobs");
+            }
+            other => anyhow::bail!("expected S3 origin, got: {other:?}"),
+        }
         Ok(())
     }
 
@@ -1947,6 +3510,125 @@ mod tests {
             msg.contains("invalid cache.pinned_hashes"),
             "error should be contextualized: {msg}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_origin_retry_defaults_when_absent() -> anyhow::Result<()> {
+        // Absent `cache.origin_retry` section => defaults from
+        // RetryPolicy::default(). Pin the contract here so a future
+        // default change has to update this test deliberately.
+        let cli = cache_cli(None, None);
+        let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
+        let p = resolved.origin_retry;
+        anyhow::ensure!(p.max_retries == 3, "default max_retries");
+        anyhow::ensure!(p.initial_backoff_ms == 100, "default initial_backoff_ms");
+        anyhow::ensure!(p.max_backoff_ms == 10_000, "default max_backoff_ms");
+        anyhow::ensure!(
+            (p.jitter_ratio - 0.1).abs() < f64::EPSILON,
+            "default jitter_ratio"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_origin_retry_parses_full_section() -> anyhow::Result<()> {
+        let cli = cache_cli(None, None);
+        let file = types::CacheConfig {
+            origin_retry: Some(decdn_cache::RetryPolicy {
+                max_retries: 7,
+                initial_backoff_ms: 50,
+                max_backoff_ms: 2_000,
+                jitter_ratio: 0.25,
+            }),
+            ..types::CacheConfig::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        let p = resolved.origin_retry;
+        anyhow::ensure!(p.max_retries == 7);
+        anyhow::ensure!(p.initial_backoff_ms == 50);
+        anyhow::ensure!(p.max_backoff_ms == 2_000);
+        anyhow::ensure!((p.jitter_ratio - 0.25).abs() < f64::EPSILON);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_origin_retry_partial_section_inherits_defaults() -> anyhow::Result<()> {
+        // `#[serde(default)]` on RetryPolicy fills missing fields from
+        // Default. Pinning the contract here so a future struct-level
+        // attribute change doesn't silently break partial TOML.
+        let toml = "[cache.origin_retry]\nmax_retries = 5\n";
+        let file: crate::config::FileConfig = ::toml::from_str(toml)?;
+        let p = file
+            .cache
+            .as_ref()
+            .and_then(|c| c.origin_retry.as_ref())
+            .ok_or_else(|| anyhow::anyhow!("origin_retry missing"))?;
+        anyhow::ensure!(p.max_retries == 5);
+        anyhow::ensure!(p.initial_backoff_ms == 100, "default carried through");
+        anyhow::ensure!(p.max_backoff_ms == 10_000, "default carried through");
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_origin_retry_max_retries_zero_is_valid() -> anyhow::Result<()> {
+        // `0` opts out and is the documented disable knob; resolution
+        // must not reject it.
+        let cli = cache_cli(None, None);
+        let file = types::CacheConfig {
+            origin_retry: Some(decdn_cache::RetryPolicy {
+                max_retries: 0,
+                ..decdn_cache::RetryPolicy::default()
+            }),
+            ..types::CacheConfig::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        anyhow::ensure!(resolved.origin_retry.max_retries == 0);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_origin_retry_rejects_initial_above_max() -> anyhow::Result<()> {
+        let cli = cache_cli(None, None);
+        let file = types::CacheConfig {
+            origin_retry: Some(decdn_cache::RetryPolicy {
+                initial_backoff_ms: 2_000,
+                max_backoff_ms: 1_000,
+                ..decdn_cache::RetryPolicy::default()
+            }),
+            ..types::CacheConfig::default()
+        };
+        let err = resolve_cache(&cli, Some(&file), Path::new("/tmp"))
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected error"))?;
+        let msg = format!("{err:#}");
+        anyhow::ensure!(
+            msg.contains("schedule never grows"),
+            "error message should explain why initial>max is rejected, got: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_origin_retry_rejects_jitter_out_of_range() -> anyhow::Result<()> {
+        let cli = cache_cli(None, None);
+        for bad in [-0.1, 1.5, f64::NAN, f64::INFINITY] {
+            let file = types::CacheConfig {
+                origin_retry: Some(decdn_cache::RetryPolicy {
+                    jitter_ratio: bad,
+                    ..decdn_cache::RetryPolicy::default()
+                }),
+                ..types::CacheConfig::default()
+            };
+            let err = resolve_cache(&cli, Some(&file), Path::new("/tmp"))
+                .err()
+                .ok_or_else(|| anyhow::anyhow!("expected rejection for jitter={bad}"))?;
+            let msg = format!("{err:#}");
+            anyhow::ensure!(
+                msg.contains("jitter_ratio"),
+                "error message should reference jitter_ratio, got: {msg}"
+            );
+        }
         Ok(())
     }
 
@@ -2228,12 +3910,24 @@ mod tests {
     // attribute or a field rename fails this test immediately.
     #[test]
     fn run_subcommand_args_are_wired_to_decdn_env_vars() {
-        use clap::CommandFactory;
+        use clap::{Args, CommandFactory, Parser};
 
-        let cmd = crate::cli::Cli::command();
-        let run = cmd
-            .find_subcommand("run")
-            .expect("Cli has a `run` subcommand");
+        // The user CLI no longer has a `run` subcommand (#421 — the
+        // daemon binary `decdn-node` owns it). `RunArgs` itself
+        // remains in `decdn-common` because `decdn config validate`
+        // flattens it for env-var parity with the daemon. Wrap
+        // `RunArgs` in a local `Parser` and walk *its* args — this
+        // is the same set of env mappings the daemon's
+        // `decdn-node run` exposes and that `decdn config validate`
+        // honours.
+        #[derive(Parser, Debug)]
+        struct RunWrap {
+            #[command(flatten)]
+            run: crate::cli::RunArgs,
+        }
+
+        let _ = RunWrap::command(); // surface a parse error if RunArgs is broken
+        let run = <crate::cli::RunArgs as Args>::augment_args(clap::Command::new("run"));
 
         // One line per DECDN_* env var operators may set. Adding a new
         // `#[arg(env = "DECDN_*")]` field without adding it here is a test
@@ -2247,13 +3941,12 @@ mod tests {
             ("relay_url", "DECDN_RELAY_URL"),
             ("rpc_url", "DECDN_RPC_URL"),
             ("eth_keystore", "DECDN_ETH_KEYSTORE"),
+            ("keystore_password_file", "DECDN_KEYSTORE_PASSWORD_FILE"),
             ("payment_channel_address", "DECDN_PAYMENT_CHANNEL_ADDRESS"),
             ("staking_registry_address", "DECDN_STAKING_REGISTRY_ADDRESS"),
             ("cache_dir", "DECDN_CACHE_DIR"),
             ("cache_size_mb", "DECDN_CACHE_SIZE_MB"),
             ("max_blob_size_mb", "DECDN_MAX_BLOB_SIZE_MB"),
-            ("origin_url", "DECDN_ORIGIN_URL"),
-            ("origin_path", "DECDN_ORIGIN_PATH"),
             ("rate_per_mb", "DECDN_RATE_PER_MB"),
             ("log_level", "DECDN_LOG_LEVEL"),
             ("log_format", "DECDN_LOG_FORMAT"),
@@ -2306,6 +3999,7 @@ mod tests {
         let cli = BlockchainArgs {
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
+            keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             staking_registry_address: Some("0xNOTHEX".to_string()),
         };
@@ -2330,6 +4024,7 @@ mod tests {
         let cli = BlockchainArgs {
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
+            keystore_password_file: None,
             payment_channel_address: Some("0xNOTHEX".to_string()),
             staking_registry_address: Some(GOOD_ADDR.to_string()),
         };
@@ -2355,6 +4050,7 @@ mod tests {
         let cli = BlockchainArgs {
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
+            keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             staking_registry_address: Some(GOOD_ADDR.to_string()),
         };
@@ -2380,6 +4076,7 @@ mod tests {
         let cli = BlockchainArgs {
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: Some(bogus),
+            keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             staking_registry_address: Some(GOOD_ADDR.to_string()),
         };
@@ -2404,6 +4101,7 @@ mod tests {
         let cli = BlockchainArgs {
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
+            keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             staking_registry_address: Some(GOOD_ADDR.to_string()),
         };
@@ -2439,6 +4137,7 @@ mod tests {
         crate::cli::run::BlockchainArgs {
             rpc_url: None,
             eth_keystore: None,
+            keystore_password_file: None,
             payment_channel_address: None,
             staking_registry_address: None,
         }
@@ -2449,8 +4148,6 @@ mod tests {
             cache_dir: None,
             cache_size_mb: None,
             max_blob_size_mb: None,
-            origin_url: None,
-            origin_path: None,
         }
     }
 
@@ -2553,6 +4250,7 @@ mod tests {
         let cli = BlockchainArgs {
             rpc_url: Some("https://cli-wins.example/rpc".to_string()),
             eth_keystore: None,
+            keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             staking_registry_address: Some(GOOD_ADDR.to_string()),
         };
@@ -2603,6 +4301,7 @@ mod tests {
         let cli = BlockchainArgs {
             rpc_url: None,
             eth_keystore: None,
+            keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             staking_registry_address: Some(GOOD_ADDR.to_string()),
         };
@@ -2623,6 +4322,7 @@ mod tests {
         let cli = BlockchainArgs {
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
+            keystore_password_file: None,
             payment_channel_address: None,
             staking_registry_address: Some(GOOD_ADDR.to_string()),
         };
@@ -2643,6 +4343,7 @@ mod tests {
         let cli = BlockchainArgs {
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
+            keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             staking_registry_address: None,
         };
@@ -2666,6 +4367,7 @@ mod tests {
         let cli = BlockchainArgs {
             rpc_url: Some(String::new()),
             eth_keystore: None,
+            keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             staking_registry_address: Some(GOOD_ADDR.to_string()),
         };
@@ -2676,6 +4378,105 @@ mod tests {
         assert!(
             msg.contains("--rpc-url"),
             "empty rpc_url should surface as missing: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_rejects_small_nonzero_watchdog_interval() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            staking_registry_address: Some(GOOD_ADDR.to_string()),
+        };
+        let file = types::BlockchainConfig {
+            rpc_url: None,
+            eth_keystore: None,
+            payment_channel_address: None,
+            staking_registry_address: None,
+            rpc_watchdog_interval_sec: Some(1),
+        };
+        let Err(err) = resolve_blockchain(&cli, Some(&file), dir.path()) else {
+            anyhow::bail!("expected error when watchdog interval is below the minimum");
+        };
+        let msg = format!("{err:#}");
+        let expected_min = format!("minimum {MIN_RPC_WATCHDOG_INTERVAL_SEC}s");
+        assert!(
+            msg.contains("rpc_watchdog_interval_sec") && msg.contains(&expected_min),
+            "error should mention the field and the {expected_min} floor: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_accepts_zero_watchdog_interval() -> anyhow::Result<()> {
+        // `0` is the documented disable sentinel and must bypass the floor.
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            staking_registry_address: Some(GOOD_ADDR.to_string()),
+        };
+        let file = types::BlockchainConfig {
+            rpc_url: None,
+            eth_keystore: None,
+            payment_channel_address: None,
+            staking_registry_address: None,
+            rpc_watchdog_interval_sec: Some(0),
+        };
+        let resolved = resolve_blockchain(&cli, Some(&file), dir.path())?;
+        assert_eq!(resolved.rpc_watchdog_interval_sec, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_accepts_min_watchdog_interval() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            staking_registry_address: Some(GOOD_ADDR.to_string()),
+        };
+        let file = types::BlockchainConfig {
+            rpc_url: None,
+            eth_keystore: None,
+            payment_channel_address: None,
+            staking_registry_address: None,
+            rpc_watchdog_interval_sec: Some(MIN_RPC_WATCHDOG_INTERVAL_SEC),
+        };
+        let resolved = resolve_blockchain(&cli, Some(&file), dir.path())?;
+        assert_eq!(
+            resolved.rpc_watchdog_interval_sec,
+            MIN_RPC_WATCHDOG_INTERVAL_SEC
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_applies_default_watchdog_interval_when_absent() -> anyhow::Result<()> {
+        // Pins the no-config bootstrap path: if a future change moved
+        // DEFAULT below MIN (or to 0), every operator without an explicit
+        // setting would silently lose the watchdog. Mirrors the gossip
+        // analogue at `resolve_gossip_applies_defaults_when_absent`.
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            staking_registry_address: Some(GOOD_ADDR.to_string()),
+        };
+        let resolved = resolve_blockchain(&cli, None, dir.path())?;
+        assert_eq!(
+            resolved.rpc_watchdog_interval_sec,
+            DEFAULT_RPC_WATCHDOG_INTERVAL_SEC
         );
         Ok(())
     }
@@ -2696,8 +4497,6 @@ mod tests {
             cache_dir: Some(PathBuf::from("/from/file")),
             cache_size_mb: None,
             max_blob_size_mb: None,
-            origin_url: None,
-            origin_path: None,
             ..Default::default()
         };
         let resolved = common::test_support::with_home_override(Some(&home), || {
@@ -2728,8 +4527,6 @@ mod tests {
             cache_dir: Some(PathBuf::from("/from/file")),
             cache_size_mb: None,
             max_blob_size_mb: None,
-            origin_url: None,
-            origin_path: None,
             ..Default::default()
         };
         let resolved = resolve_cache(&cli, Some(&file), Path::new("/data-dir"))?;
@@ -2764,8 +4561,6 @@ mod tests {
             cache_dir: None,
             cache_size_mb: Some(99_999),
             max_blob_size_mb: Some(50_000),
-            origin_url: None,
-            origin_path: None,
             ..Default::default()
         };
         let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
@@ -2781,8 +4576,6 @@ mod tests {
             cache_dir: None,
             cache_size_mb: Some(2_048),
             max_blob_size_mb: Some(256),
-            origin_url: None,
-            origin_path: None,
             ..Default::default()
         };
         let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
@@ -2978,22 +4771,49 @@ staking_registry_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
     }
 
     #[test]
-    fn resolve_config_errors_when_origin_url_and_path_both_set() -> anyhow::Result<()> {
-        // resolve_cache enforces mutual exclusion; this end-to-end check
-        // confirms the same diagnostic surfaces from resolve_config so
-        // operators see it at startup.
+    fn resolve_config_errors_on_legacy_origin_url_field() -> anyhow::Result<()> {
+        // Pre-#437 schemas placed `origin_url` directly under `[cache]`.
+        // The new schema lives under the tagged `[cache.origin]` table
+        // and `CacheConfig` has `deny_unknown_fields`, so an operator
+        // who hasn't migrated their TOML must get a clear "unknown
+        // field" error at config load instead of silently dropping the
+        // origin and missing every cache pull.
         let dir = data_dir_with_keystore()?;
-        let path = write_minimal_toml(&dir, complete_toml_body())?;
-        let mut args = run_args_with_data_dir(dir.path());
-        args.cache.origin_url = Some("https://origin.example/".to_string());
-        args.cache.origin_path = Some(PathBuf::from("/var/cache/decdn/origin"));
+        let toml_body = format!(
+            "{}\n\n[cache]\norigin_url = \"https://origin.example/\"\n",
+            complete_toml_body()
+        );
+        let path = write_minimal_toml(&dir, &toml_body)?;
+        let args = run_args_with_data_dir(dir.path());
         let Err(err) = resolve_config(Some(&path), &args) else {
-            anyhow::bail!("expected mutex error");
+            anyhow::bail!("expected unknown-field error for legacy origin_url");
         };
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("mutually exclusive"),
-            "error should call out mutual exclusion: {msg}"
+            msg.contains("origin_url") && msg.contains("unknown field"),
+            "error should call out the legacy `origin_url` key: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_config_errors_on_legacy_origin_path_field() -> anyhow::Result<()> {
+        // Sibling of the above: the second pre-#437 flat field also
+        // gets the loud `deny_unknown_fields` rejection.
+        let dir = data_dir_with_keystore()?;
+        let toml_body = format!(
+            "{}\n\n[cache]\norigin_path = \"/var/cache/decdn/origin\"\n",
+            complete_toml_body()
+        );
+        let path = write_minimal_toml(&dir, &toml_body)?;
+        let args = run_args_with_data_dir(dir.path());
+        let Err(err) = resolve_config(Some(&path), &args) else {
+            anyhow::bail!("expected unknown-field error for legacy origin_path");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("origin_path") && msg.contains("unknown field"),
+            "error should call out the legacy `origin_path` key: {msg}"
         );
         Ok(())
     }
@@ -3166,5 +4986,109 @@ bind_port = 12345
         let resolved = resolve_security(Some(&s)).expect("valid override");
         assert_eq!(resolved.max_concurrent_handlers, 512);
         assert_eq!(resolved.per_source_burst, DEFAULT_PER_SOURCE_BURST);
+    }
+
+    // Per-field merge coverage (#438). The four `[security]` fields all
+    // resolve through the same file-vs-default path; one happy-path test
+    // per field plus an "absent => default" companion documents the
+    // contract for each field individually so a regression that
+    // accidentally applies the wrong default doesn't slip past the
+    // existing aggregate `_populates_defaults_when_absent` assertion.
+    //
+    // There is no `[security]` CLI surface — `resolve_security` takes
+    // only the file argument. Operators tune these fields by editing
+    // the config file (with hot reload via SIGHUP). Per-field CLI
+    // overrides could land later without changing the test surface
+    // here.
+
+    #[test]
+    fn resolve_security_max_concurrent_handlers_file_override() {
+        let s = sec_with(|s| s.max_concurrent_handlers = Some(1024));
+        let resolved = resolve_security(Some(&s)).expect("valid override");
+        assert_eq!(resolved.max_concurrent_handlers, 1024);
+    }
+
+    #[test]
+    fn resolve_security_max_concurrent_handlers_default_when_field_absent() {
+        // Other fields populated, this one absent — companion to the
+        // aggregate-defaults test, isolating this single field.
+        let s = sec_with(|s| {
+            s.per_source_rate_per_sec = Some(50.0);
+            s.per_source_burst = Some(100);
+            s.max_tracked_sources = Some(2048);
+        });
+        let resolved = resolve_security(Some(&s)).expect("valid partial config");
+        assert_eq!(
+            resolved.max_concurrent_handlers,
+            DEFAULT_MAX_CONCURRENT_HANDLERS
+        );
+    }
+
+    #[test]
+    fn resolve_security_per_source_rate_file_override() {
+        let s = sec_with(|s| s.per_source_rate_per_sec = Some(42.5));
+        let resolved = resolve_security(Some(&s)).expect("valid override");
+        assert!((resolved.per_source_rate_per_sec - 42.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn resolve_security_per_source_rate_default_when_field_absent() {
+        let s = sec_with(|s| s.max_concurrent_handlers = Some(128));
+        let resolved = resolve_security(Some(&s)).expect("valid partial config");
+        assert!(
+            (resolved.per_source_rate_per_sec - DEFAULT_PER_SOURCE_RATE_PER_SEC).abs()
+                < f64::EPSILON
+        );
+    }
+
+    #[test]
+    fn resolve_security_per_source_burst_file_override() {
+        let s = sec_with(|s| {
+            s.per_source_rate_per_sec = Some(50.0);
+            s.per_source_burst = Some(500);
+        });
+        let resolved = resolve_security(Some(&s)).expect("valid override");
+        assert_eq!(resolved.per_source_burst, 500);
+    }
+
+    #[test]
+    fn resolve_security_per_source_burst_default_when_field_absent() {
+        let s = sec_with(|s| s.per_source_rate_per_sec = Some(50.0));
+        let resolved = resolve_security(Some(&s)).expect("valid partial config");
+        assert_eq!(resolved.per_source_burst, DEFAULT_PER_SOURCE_BURST);
+    }
+
+    #[test]
+    fn resolve_security_max_tracked_sources_file_override() {
+        let s = sec_with(|s| s.max_tracked_sources = Some(8192));
+        let resolved = resolve_security(Some(&s)).expect("valid override");
+        assert_eq!(resolved.max_tracked_sources, 8192);
+    }
+
+    #[test]
+    fn resolve_security_max_tracked_sources_default_when_field_absent() {
+        let s = sec_with(|s| s.max_concurrent_handlers = Some(128));
+        let resolved = resolve_security(Some(&s)).expect("valid partial config");
+        assert_eq!(resolved.max_tracked_sources, DEFAULT_MAX_TRACKED_SOURCES);
+    }
+
+    /// Independent fields don't bleed: setting one to a non-default
+    /// value must leave the others at their defaults. Catches a
+    /// regression that copy-pasted `s.max_concurrent_handlers` into
+    /// the wrong field's `unwrap_or(DEFAULT_*)` arm.
+    #[test]
+    fn resolve_security_field_overrides_are_independent() {
+        let s = sec_with(|s| s.per_source_burst = Some(777));
+        let resolved = resolve_security(Some(&s)).expect("valid partial config");
+        assert_eq!(resolved.per_source_burst, 777);
+        assert_eq!(
+            resolved.max_concurrent_handlers,
+            DEFAULT_MAX_CONCURRENT_HANDLERS
+        );
+        assert!(
+            (resolved.per_source_rate_per_sec - DEFAULT_PER_SOURCE_RATE_PER_SEC).abs()
+                < f64::EPSILON
+        );
+        assert_eq!(resolved.max_tracked_sources, DEFAULT_MAX_TRACKED_SOURCES);
     }
 }

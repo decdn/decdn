@@ -9,6 +9,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use bytes::Bytes;
+use decdn_cache::CacheMetrics;
 use http_body_util::Full;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
@@ -78,6 +79,7 @@ pub struct DecdnMetrics {
 pub struct Metrics {
     registry: Arc<RwLock<Registry>>,
     decdn: Arc<DecdnMetrics>,
+    cache: Arc<CacheMetrics>,
     started_at: Instant,
 }
 
@@ -88,16 +90,31 @@ impl Default for Metrics {
 }
 
 impl Metrics {
-    /// Create the registry and register deCDN's metric group.
+    /// Create the registry and register deCDN's metric group plus the
+    /// cache crate's `decdn_cache_*` group. The cache handle is shared
+    /// with the engine via [`Self::cache_metrics`] so engine-side bumps
+    /// land in the same encoder output.
     pub fn new() -> Self {
         let decdn = Arc::new(DecdnMetrics::default());
+        let cache = Arc::new(CacheMetrics::default());
         let mut registry = Registry::default();
         registry.register(decdn.clone() as Arc<dyn MetricsGroup>);
+        // Cache metrics live under the `decdn_cache` prefix so they
+        // share the `decdn_*` family the rest of the metrics use.
+        registry
+            .sub_registry_with_prefix("decdn")
+            .register(cache.clone() as Arc<dyn MetricsGroup>);
         Self {
             registry: Arc::new(RwLock::new(registry)),
             decdn,
+            cache,
             started_at: Instant::now(),
         }
+    }
+
+    /// Shared `Arc<CacheMetrics>` for wiring into [`decdn_cache::CacheEngine`].
+    pub fn cache_metrics(&self) -> Arc<CacheMetrics> {
+        Arc::clone(&self.cache)
     }
 
     /// Register iroh's transport metrics under the `decdn_iroh_` prefix so
@@ -344,5 +361,175 @@ impl<'a> ConnectionGuard<'a> {
 impl Drop for ConnectionGuard<'_> {
     fn drop(&mut self) {
         self.metrics.connection_closed();
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// Match an exact `<name> <value>` metric line, anchored against
+    /// surrounding lines so `decdn_cache_hits_total 1` doesn't
+    /// accidentally substring-match into a future
+    /// `decdn_cache_hits_total_foo` series or the `OpenMetrics`
+    /// `_created` companion line.
+    fn has_metric_line(text: &str, name: &str, value: u64) -> bool {
+        let needle = format!("{name} {value}");
+        text.lines().any(|l| l == needle)
+    }
+
+    #[test]
+    fn cache_metrics_counters_start_at_zero() {
+        // Pinning down the OpenMetrics shape — a fresh registry must
+        // expose the cache counters at zero so dashboards built before
+        // any fetch has fired don't render `(no data)`.
+        let metrics = Metrics::new();
+        let text = metrics.encode().unwrap();
+        for name in [
+            "decdn_cache_origin_fetches_total",
+            "decdn_cache_origin_retry_exhausted_total",
+            "decdn_cache_hits_total",
+            "decdn_cache_misses_total",
+            "decdn_cache_bytes_returned_total",
+            "decdn_cache_pull_through_bytes_total",
+            // GC counters (#518). The Rust struct fields are `gc_runs`
+            // / `gc_bytes_reclaimed`; the OpenMetrics encoder appends
+            // `_total`. Asserting the suffixed forms locks in the
+            // exported names — a regression that re-renamed the
+            // struct fields to include `_total` would emit
+            // `..._total_total`, breaking dashboards/alerts that
+            // reference the names below.
+            "decdn_cache_gc_runs_total",
+            "decdn_cache_gc_bytes_reclaimed_total",
+        ] {
+            assert!(
+                has_metric_line(&text, name, 0),
+                "counter {name} should be exposed at zero on a fresh registry:\n{text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn engine_bumps_surface_in_openmetrics_output() {
+        use std::sync::Arc;
+
+        use bytes::Bytes;
+        use decdn_cache::{
+            CacheEngine, Origin, OriginFetch, OriginKind, OriginPullError, PinnedHashes,
+            RetryPolicy,
+        };
+        use iroh_blobs::Hash;
+
+        // Minimal in-memory origin: returns the prearranged payload for
+        // its hash, NotFound otherwise. Mirrors the StubOrigin used in
+        // crates/cache tests but is local to this integration test so
+        // we don't need to expose the cache crate's test fixtures.
+        #[derive(Debug)]
+        struct StubOrigin {
+            data: Bytes,
+            hash: Hash,
+        }
+        impl Origin for StubOrigin {
+            fn kind(&self) -> OriginKind {
+                OriginKind::Http
+            }
+            fn fetch(
+                &self,
+                hash: Hash,
+                _max_bytes: u64,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<OriginFetch, OriginPullError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                let result = if hash == self.hash {
+                    Ok(OriginFetch::found_one_shot(self.data.clone()))
+                } else {
+                    Ok(OriginFetch::NotFound)
+                };
+                Box::pin(async move { result })
+            }
+        }
+
+        let payload = b"hello /metrics integration".to_vec();
+        let hash = Hash::new(&payload);
+        let stub = StubOrigin {
+            data: Bytes::from(payload.clone()),
+            hash,
+        };
+
+        let metrics = Arc::new(Metrics::new());
+        let cache_handle = metrics.cache_metrics();
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open_full(
+            tmp.path(),
+            Some(Arc::new(stub)),
+            10,
+            PinnedHashes::empty(),
+            RetryPolicy::default(),
+            Some(Arc::clone(&cache_handle)),
+            std::time::Duration::ZERO,
+        )
+        .await
+        .unwrap();
+
+        // 1 miss (pull-through) + 1 hit.
+        let _ = engine.get(hash).await.unwrap();
+        let _ = engine.get(hash).await.unwrap();
+
+        let text = metrics.encode().unwrap();
+        let payload_len = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+        for (name, expected) in [
+            ("decdn_cache_hits_total", 1u64),
+            ("decdn_cache_misses_total", 1),
+            ("decdn_cache_pull_through_bytes_total", payload_len),
+            ("decdn_cache_bytes_returned_total", payload_len * 2),
+        ] {
+            assert!(
+                has_metric_line(&text, name, expected),
+                "counter {name} should report {expected} after 1 miss + 1 hit:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_metrics_handle_shares_atomic_with_registered_group() {
+        // Sanity: the Arc<CacheMetrics> handed to the engine must be
+        // the same one the registry reads from at scrape time. A bug
+        // that built two Arcs would surface as cache bumps never
+        // appearing in the scrape output.
+        let metrics = Metrics::new();
+        let handle = metrics.cache_metrics();
+        handle.origin_fetches.inc();
+        handle.origin_retry_exhausted.inc();
+        handle.hits.inc();
+        handle.misses.inc();
+        handle.bytes_returned.inc_by(1024);
+        handle.pull_through_bytes.inc_by(2048);
+        // GC counters (#518). The struct fields are `gc_runs` /
+        // `gc_bytes_reclaimed`; bumping them here and asserting the
+        // `..._total`-suffixed exported names round-trip locks in the
+        // encoder behavior that motivated the field-name shape.
+        handle.gc_runs.inc();
+        handle.gc_bytes_reclaimed.inc_by(4096);
+        let text = metrics.encode().unwrap();
+        for (name, expected) in [
+            ("decdn_cache_origin_fetches_total", 1u64),
+            ("decdn_cache_origin_retry_exhausted_total", 1),
+            ("decdn_cache_hits_total", 1),
+            ("decdn_cache_misses_total", 1),
+            ("decdn_cache_bytes_returned_total", 1024),
+            ("decdn_cache_pull_through_bytes_total", 2048),
+            ("decdn_cache_gc_runs_total", 1),
+            ("decdn_cache_gc_bytes_reclaimed_total", 4096),
+        ] {
+            assert!(
+                has_metric_line(&text, name, expected),
+                "counter {name} should report {expected}:\n{text}"
+            );
+        }
     }
 }

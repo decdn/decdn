@@ -14,4 +14,11 @@ pub struct KeyGenArgs {
     /// Overwrite existing keys if present.
     #[arg(long)]
     pub force: bool,
+
+    /// Read the keystore password from this file. When unset, the
+    /// `DECDN_KEYSTORE_PASSWORD` env var is consulted, then an interactive
+    /// prompt (if stdin is a TTY) is used. A single trailing newline in the
+    /// file is stripped.
+    #[arg(long, value_name = "PATH", env = "DECDN_KEYSTORE_PASSWORD_FILE")]
+    pub password_file: Option<PathBuf>,
 }

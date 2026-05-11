@@ -17,22 +17,16 @@ The goal is a clean mechanical answer to: **how does the codebase express the di
 | Payment contract | `StablePaymentChannel` (USDC-only) | `PaymentChannel` (multi-token allowlist) | ADR 003, 010 |
 | Governance | Single admin key (`onlyOwner`) | OpenZeppelin Governor + 2-day Timelock | ADR 009 |
 | Challenge bond | 100 TOKEN | 100 TOKEN | ADR 026 |
-| Corruption verification | Optimistic challenge-response (signed `StreamResponse`) | Interactive keccak256 Merkle proof over 1 KiB chunks | ADR 014 |
 | Buyback | Accumulate-only (`executeBuyback` never called) | Active execution via `BuybackBurner` after activation criteria met | ADR 018, 026 |
 | Key management (node) | File-based (`~/.decdn/node.key`) | Platform keychain + hardware wallet via delegated hot key | ADR 012 |
 | Key management (client) | File-based | Platform keychain; hardware wallet + derived hot key for voucher signing | ADR 012 |
 | Reputation engine | Simplified stand-in (local observations only, no gossip weighting) | Full gossip-weighted scoring (70% local / 30% gossip, decay, cold-start) | ADR 008 |
-| Watchtower | Simplified — client monitors its own channels | Full — dedicated `WatchtowerEscrow` + `cdn/watchtower/v1` | ADR 007 |
 | RPC trust | Single RPC endpoint | Multi-source (registry + DNS seed fallback) | ADR 001, 012 |
-| `popular_hashes` cardinality | 20 hashes per `NodeAnnounce` | 5 hashes (reduces content inventory leakage — ADR 017) | ADR 001, 017 |
 | Regional body registration | None — admin key is sole governance for blacklist | Regional bodies registered; global governance override | ADR 011 |
+| Default-open allow-list | Inactive (`defaultOpenAllowlistActive == false`) — permissive bootstrap window: any active staker may serve as origin for `namespaceId == 0` | Activated by governance; only allow-listed operators appear in `OriginAssignment.getOrigins(0)` for default-open content; off-chain consumers (clients) consult that view to filter unauthorized origins | ADR 011, ADR 016 |
 | Treasury disbursement | Manual (admin key holder) | On-chain governance proposal | ADR 009 |
-| `adminReclaimNodeId` | Present — `onlyOwner` fallback for NodeId squatting during early testing | Removed from contract | ADR 001 |
 | Bootstrap peer source | On-chain registry only | Registry + DNS seed list + minimum peer diversity (Option B+C) | ADR 012 |
-| `cdn/watchtower/v1` ALPN | Not used | Active — nodes register with watchtowers | ADR 007 |
 | Multi-token `token_rates` gossip field | Omitted (single `rate_per_mb`) | Present alongside `rate_per_mb` | ADR 010 |
-
----
 
 ## Decision
 
@@ -41,8 +35,6 @@ The goal is a clean mechanical answer to: **how does the codebase express the di
 No `if mode == PoC` checks appear in internal crate logic. All branching is resolved at compile time at the top level. PoC code is physically absent from a production binary — it is excluded from compilation, not merely optimized away.
 
 The single-feature design makes PoC removal straightforward: delete all `#[cfg(feature = "poc")]` functions and the `poc` feature declaration. The `#[cfg(not(feature = "poc"))]` production functions become unconditional with no further edits needed.
-
----
 
 ## Seam Definitions
 
@@ -116,42 +108,12 @@ pub trait GovernanceClient: Send + Sync {
 | Challenge bond | 100 TOKEN | 100 TOKEN |
 | Buyback | `BuybackBurner` receives fees; `executeBuyback` never called | Called by keeper after activation criteria met (ADR 018) |
 
-### 5. `WatchtowerClient` — `crates/incentive`
-
-```rust
-pub trait WatchtowerClient: Send + Sync {
-    /// Register a channel with one or more watchtowers.
-    fn register_channel(&self, channel: ChannelId, watchtower: &NodeId) -> Result<()>;
-    /// Called when a `ChannelCloseInitiated` event is observed.
-    fn on_close_initiated(&self, channel: ChannelId, event: &CloseEvent) -> Result<()>;
-}
-```
-
-| | PoC | Production |
-|---|-----|------------|
-| Implementation | `NoopWatchtowerClient` — client monitors its own channels directly | `cdn/watchtower/v1` ALPN; watchtower nodes use `WatchtowerEscrow` contract |
-| `WatchtowerAnnounce` gossip | Not emitted or processed | Emitted by watchtower nodes; subscribed to on `cdn/global/v1` |
-
-### 6. `CorruptionChallenger` — `crates/incentive`
-
-```rust
-pub trait CorruptionChallenger: Send + Sync {
-    fn submit_challenge(&self, evidence: &CorruptionEvidence) -> Result<TxHash>;
-}
-```
-
-| | PoC | Production |
-|---|-----|------------|
-| Evidence | Signed `StreamResponse` + 100 TOKEN bond; 24h counter-evidence window | Interactive keccak256 Merkle proof over 1 KiB chunks; requires keeper to resolve |
-
-### 7. `NetworkConstants` — `crates/protocol`
+### 5. `NetworkConstants` — `crates/protocol`
 
 Not a trait — a plain struct with a constructor per mode. All mode-dependent numeric constants live here and nowhere else.
 
 ```rust
 pub struct NetworkConstants {
-    /// Maximum hashes in a NodeAnnounce popular_hashes field.
-    pub popular_hashes_max: usize,
     /// Challenge bond required to submit a slash claim (TOKEN base units).
     pub challenge_bond_token: u64,
     /// Default NodeAnnounce interval.
@@ -174,14 +136,13 @@ Concrete values:
 
 | Constant | PoC | Production |
 |----------|-----|------------|
-| `popular_hashes_max` | 20 | 5 (ADR 017 — reduces content inventory leakage) |
 | `challenge_bond_token` | 100 TOKEN (1e20 base units) | 100 TOKEN (1e20 base units) |
 | `announce_interval_secs` | 60 | 60 (same; tunable by governance) |
 | `min_stake_token` | Operator-configured | Operator-configured; min enforced by contract |
 | `dispute_window_secs` | 48 × 3600 (172800) | Governable 12h–72h; default 48h at genesis |
 | `min_bootstrap_peers` | 3 | 8 |
 
-### 8. `FeeRouterClient` — `crates/incentive`
+### 6. `FeeRouterClient` — `crates/incentive`
 
 Introduced by [ADR 026](026-gauge-boost-tokenomics.md) §2. The `FeeRouter` contract receives the full operator USDC balance from `PaymentChannel.settleChannel` and atomically splits it into the six buckets. The wiring seam selects between an in-process PoC stub (a no-op or local accounting router) and the deployed production contract address per network.
 
@@ -191,8 +152,8 @@ pub trait FeeRouterClient: Send + Sync {
     /// Returns `None` for the no-op PoC variant.
     fn router_address(&self) -> Option<Address>;
     /// Voucher-payload byte counts are forwarded into the router by the
-    /// settlement transaction; this hook lets observers (metrics, watchtower)
-    /// snapshot per-settlement byte deltas without reading chain state.
+    /// settlement transaction; this hook lets observers (metrics) snapshot
+    /// per-settlement byte deltas without reading chain state.
     fn on_settlement(&self, operator: &Address, bytes_delivered: u64, amount_usdc: u64);
 }
 ```
@@ -200,10 +161,10 @@ pub trait FeeRouterClient: Send + Sync {
 | | PoC | Production |
 |---|-----|------------|
 | Implementation | `NoopFeeRouterClient` — in-process no-op (or local accounting) router; settlement skips the on-chain split | `OnchainFeeRouterClient` — deployed `FeeRouter` contract address per network (configured) |
-| Settlement path | `PaymentChannel.settleChannel` pays operator the full balance; downstream buckets simulated for tests | `PaymentChannel.settleChannel` calls `FeeRouter.routeSettlement(operator, bytesDelivered, amount)` in the same transaction |
+| Settlement path | `PaymentChannel.settleChannel` pays operator the full balance; downstream buckets simulated for tests | `PaymentChannel.settleChannel` calls `FeeRouter.routeSettlement(operator, bytesDelivered, amount, epochId)` in the same transaction |
 | Per-network config | N/A | Address sourced from chain-id-keyed config; sum-to-100% safety bounds enforced on chain |
 
-### 9. `VotingEscrowReader` — `crates/incentive`
+### 7. `VotingEscrowReader` — `crates/incentive`
 
 Introduced by [ADR 026](026-gauge-boost-tokenomics.md) §4. ve-balance lookups are load-bearing for the gauge-boost epoch snapshot (§3 of ADR 026) and ve-weighted governance (§9 of ADR 026). The wiring seam selects between an in-memory fixture (deterministic ve-balances for tests / local dev) and an on-chain `VotingEscrow.balanceOfAt(user, ts)` reader.
 
@@ -222,7 +183,7 @@ pub trait VotingEscrowReader: Send + Sync {
 | Determinism | Fully deterministic; no chain dependency | Reads checkpoint array on the deployed `VotingEscrow` contract |
 | Use sites | Gauge-boost share computation; ve-weighted governance simulations | Same call sites; selection happens in the wiring layer |
 
-### 10. `SwapHelper` — `crates/incentive`
+### 8. `SwapHelper` — `crates/incentive`
 
 Introduced by [ADR 026](026-gauge-boost-tokenomics.md) §6 and consolidated with [ADR 018](018-liquidity-strategy.md). Both `BuybackBurner` (5% burn bucket) and the delegator-pool USDC→TOKEN path (7% bucket) require a swap backend with TWAP windows, `minOut` slippage protection, and per-epoch liquidity caps. Consolidating into a single seam reduces wiring surface.
 
@@ -240,7 +201,7 @@ pub trait SwapHelper: Send + Sync {
 | Used by | `BuybackBurner` (burn) and `DelegatorBuyer` (or `BuybackBurner` multi-output mode) | Same call sites |
 | MEV protection | N/A (deterministic mock) | TWAP windows, `minOut`, private RPC, per-epoch caps (hard requirement, not optional) |
 
-### 11. `SafetyReservePayout` — `crates/incentive`
+### 9. `SafetyReservePayout` — `crates/incentive`
 
 Introduced by [ADR 026](026-gauge-boost-tokenomics.md) §5. The 3% safety bucket is governance-gated; payouts require an attested incident bundle, governance proposal (or fast-track multisig within hard caps), 48-hour appeal window, and post-incident reporting. The wiring seam selects between a local approval mock (single-step approval for tests / local dev) and the Governor-gated production path.
 
@@ -263,8 +224,6 @@ pub trait SafetyReservePayout: Send + Sync {
 | Governance dependency | None | OpenZeppelin Governor + Timelock per [ADR 009](009-governance.md); emergency multisig under hard caps |
 | Registry | Optional in-memory log | Public on-chain registry maintained by `SafetyReserve` |
 
----
-
 ## Cargo Feature: `poc`
 
 The `poc` Cargo feature is declared **only on the `node` crate**. Leaf crates (`protocol`, `cache`, `reputation`, `incentive`) do not declare or use it. Production is the default — no flag is needed for a production build.
@@ -286,7 +245,6 @@ pub fn build_components(config: &Config) -> Components {
         reputation:    reputation_engine(config),
         payment:       payment_client(config),
         governance:    governance_client(config),
-        watchtower:    watchtower_client(config),
         challenger:    corruption_challenger(config),
         constants:     network_constants(),
     }
@@ -315,17 +273,9 @@ fn key_store(config: &Config) -> Arc<dyn KeyStore> {
 // ... same pattern for remaining seams
 ```
 
-This is a stronger guarantee than `if cfg!(feature = "poc")`: with the attribute form, the PoC branch is **excluded from compilation entirely** in a production build. `FileKeyStore`, `NoopWatchtowerClient`, and other PoC types are not present in the production binary at all — not merely optimized away.
+This is a stronger guarantee than `if cfg!(feature = "poc")`: with the attribute form, the PoC branch is **excluded from compilation entirely** in a production build. `FileKeyStore` and other PoC types are not present in the production binary at all — not merely optimized away.
 
 `#[cfg(feature = "poc")]` and `#[cfg(not(feature = "poc"))]` appear **only** in `crates/node/src/wiring.rs` and `crates/node/src/main.rs`. They are **banned** in all other crates via a `rustflags` lint (see Enforcement below).
-
-### Contracts: `unsafe-admin` feature
-
-The Solidity `adminReclaimNodeId` function (ADR 001) is removed in production contracts. Foundry controls this via a separate deploy script — not a Rust feature flag. The PoC deploy script (`script/DeployPoc.s.sol`) deploys `PocStakingRegistry`, which extends `StakingRegistry` with `adminReclaimNodeId`. The production deploy script (`script/DeployProduction.s.sol`) deploys `StakingRegistry` directly.
-
-No Rust `unsafe-admin` compile flag is needed — the function simply does not exist on the production contract ABI.
-
----
 
 ## Wiring Conventions
 
@@ -343,10 +293,6 @@ crates/
         mod.rs         — PaymentChannelClient trait
         stable.rs      — PoC: StablePaymentChannelClient
         multi_token.rs — Production: MultiTokenPaymentChannelClient
-      watchtower/
-        mod.rs         — WatchtowerClient trait
-        noop.rs        — PoC: NoopWatchtowerClient
-        live.rs        — Production: LiveWatchtowerClient
       ...
   reputation/
     src/
@@ -367,12 +313,10 @@ crates/
 
 1. **No `#[cfg(feature = "poc")]` or `#[cfg(not(feature = "poc"))]` outside `crates/node/src/wiring.rs` and `crates/node/src/main.rs`.** Enforced via `rustflags = ["-D", "unexpected_cfgs"]` with an explicit `check-cfg` list in `.cargo/config.toml`, or a `#[forbid(unexpected_cfgs)]` crate-level attribute on leaf crates.
 2. **No runtime `NetworkMode` enum.** All mode selection is compile-time. A PoC binary cannot accidentally run in production mode.
-3. **`NetworkConstants` is the single source of truth for all numeric differences.** No magic numbers elsewhere — always reference `constants.popular_hashes_max`, never literal `20`.
+3. **`NetworkConstants` is the single source of truth for all numeric differences.** No magic numbers elsewhere — always reference `constants.challenge_bond_token`, never literal `1e20`.
 4. **Both implementations must compile in CI.** The CI matrix builds with `--features poc` and without (production). This prevents either path from rotting and catches type errors in both concrete implementations.
 5. **PoC removal is mechanical.** To graduate to production-only: delete all `#[cfg(feature = "poc")]` functions, remove the `poc` feature from `Cargo.toml`, and strip the `#[cfg(not(feature = "poc"))]` attributes from the remaining functions. No logic changes required.
 6. **Leaf-crate principle applies to ADR 026 tokenomics.** Domain crates (`cache`, `gossip`, `incentive`, `reputation`, `protocol`) MUST NOT contain mode-branching logic for the [ADR 026](026-gauge-boost-tokenomics.md) contract surface (`FeeRouter`, `VotingEscrow`, `SafetyReserve`, swap helpers). All mode selection between PoC stubs / fixtures / mocks and production contracts lives in the `node` crate's wiring layer behind seams 8–11 above — the same rule that governs seams 1–7. Adding `if production_enabled` checks inside domain crate logic is forbidden.
-
----
 
 ## Consequences
 
@@ -394,25 +338,18 @@ crates/
 
 - Solidity contract selection is outside Rust's feature system — managed via separate Foundry deploy scripts, which is already the standard Foundry pattern
 
----
-
 ## Alternatives Considered
 
 The six wiring-shape alternatives evaluated against centralised `#[cfg]`-keyed seams (`cfg!()` macro branching, two explicit features, runtime `NetworkMode`, single-impl with `Option` fields, two repositories, scattered `#[cfg]`) are recorded in [`_history/alternatives-pre-launch.md` § PoC/Production Seam Architecture (appendix)](_history/alternatives-pre-launch.md#pocproduction-seam-architecture-appendix).
-
----
 
 ## Cross-ADR Consistency
 
 | ADR | Seam used | Notes |
 |-----|-----------|-------|
 | ADR 003 | `PaymentChannelClient` | `StablePaymentChannel` is PoC concrete impl |
-| ADR 007 | `WatchtowerClient` | `NoopWatchtowerClient` for PoC |
 | ADR 008 | `ReputationEngine` | `SimpleReputationEngine` for PoC |
 | ADR 009 | `GovernanceClient` | Admin key vs Governor |
 | ADR 010 | `PaymentChannelClient` | Multi-token client for production |
 | ADR 012 | `KeyStore` | File-based vs keychain/HW wallet |
-| ADR 014 | `CorruptionChallenger` | Optimistic vs Merkle proof |
-| ADR 017 | `NetworkConstants.popular_hashes_max` | 20 (PoC) vs 5 (production) |
 | ADR 018 | `SwapHelper` | Mock pool (PoC) vs Balancer V3 (production); shared by `BuybackBurner` and delegator-pool path |
 | ADR 026 | `FeeRouterClient`, `VotingEscrowReader`, `SwapHelper`, `SafetyReservePayout` | production contract surface; PoC stubs / fixtures / mocks vs deployed contracts per network |

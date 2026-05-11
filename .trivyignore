@@ -1,0 +1,18 @@
+# Trivy filesystem-scan suppressions. Mirrors the rationale in
+# `deny.toml` so both audit signals stay in sync.
+#
+# hickory-proto / hickory-net DNS DoS bugs (NSEC3 unbounded loop, and
+# the sibling O(n²) name-compression bug if Trivy ever picks it up).
+# Both reachable through iroh's address-lookup path, which the node
+# runtime exercises in normal operation via `presets::N0`. The DoS
+# surface is bounded to DNS lookups (an attacker would need to inject
+# crafted responses), but this is not a dead path.
+#
+# Fixed in hickory-proto 0.26.1, but iroh 0.98 exact-pins
+# =0.26.0-beta.4 — drop this ignore once upstream iroh bumps. Tracked
+# in `deny.toml` as RUSTSEC-2026-0119 / RUSTSEC-2026-0120.
+#
+# When iroh > 0.98 lands and brings hickory >= 0.26.1, remove this
+# entry in the same PR that bumps the iroh dep, alongside the
+# matching `deny.toml` ignores.
+GHSA-3v94-mw7p-v465

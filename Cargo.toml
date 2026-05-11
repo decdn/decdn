@@ -7,13 +7,15 @@ members = [
     "crates/incentive",
     "crates/reputation",
     "crates/gossip",
+    "crates/common",
+    "crates/cli",
 ]
 exclude = ["contracts"]
 
 [workspace.package]
 edition = "2024"
 license = "MIT OR Apache-2.0"
-rust-version = "1.85"
+rust-version = "1.95"
 
 [workspace.dependencies]
 # Internal crates
@@ -22,6 +24,8 @@ decdn-cache = { path = "crates/cache" }
 decdn-incentive = { path = "crates/incentive" }
 decdn-reputation = { path = "crates/reputation" }
 decdn-gossip = { path = "crates/gossip" }
+decdn-common = { path = "crates/common" }
+decdn-node = { path = "crates/node" }
 
 # Networking (iroh ecosystem, pinned per ADR 000)
 iroh = "0.98"
@@ -42,7 +46,7 @@ ed25519-dalek = { version = "2", features = ["serde"] }
 chacha20poly1305 = "0.10"
 
 # Blockchain / EVM
-alloy = { version = "2", features = ["providers", "signers", "contract"] }
+alloy = { version = "2", features = ["providers", "signers", "signer-keystore", "contract"] }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
@@ -66,15 +70,100 @@ dirs = "6"
 # Misc
 bytes = "1"
 rand = "0.10"
+rpassword = "7"
 url = "2"
+zeroize = "1"
+
+# Streaming primitives for the cache origin pull-through (issue #271). `futures-util`
+# gives us `Stream` / `stream::unfold` / `StreamExt` without the kitchen-sink
+# `futures` umbrella crate (already transitively in the tree via reqwest);
+# `tokio-util` provides `ReaderStream` / `StreamReader` for the
+# AsyncRead↔Stream<Bytes> bridges used by FilesystemOrigin and the
+# decompression pipeline. `async-compression` decompresses gzip/zstd in
+# the stream pipeline (replacing the synchronous `flate2` / `zstd`
+# round trip from PR-1's HttpOrigin).
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+tokio-util = { version = "0.7", features = ["io"] }
+async-compression = { version = "0.4", features = ["tokio", "gzip", "zstd"] }
+
+# Bundle creation (`decdn bundle create`, issue #391):
+# walkdir for stable directory traversal, globset for `--exclude` patterns,
+# blake3 direct so the publisher CLI doesn't have to pull iroh-blobs.
+walkdir = "2"
+globset = "0.4"
+blake3 = "1"
 
 # HTTP client (used by cache-origin backend)
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json"] }
+
+# AWS SDK (used by the S3 cache-origin backend, #437 PR2). All four crates carry
+# `default-features = false` so the workspace stays on one TLS implementation
+# (rustls 0.23 + aws-lc-rs); the SDK's stock rustls 0.21 + ring path is
+# fully suppressed by these flags. Cargo.lock confirms only one `rustls` and
+# one `aws-lc-rs` major after the addition.
+#
+# The production binary `decdn-node` ships hyper-1 only — `cargo tree
+# -p decdn-node --no-dev-dependencies` shows one `hyper` (1.x), one `h2`
+# (0.4), one `socket2` (0.6). Two `http`/`http-body` versions still appear
+# in production because `aws-smithy-types` carries an `http 0.2` shim type
+# alongside its `http 1.x` API; that shim is dead at runtime but cargo
+# can't unify the feature graph across the smithy types crate. No
+# parallel TLS stack and no extra crypto provider in either case.
+#
+# In the **test/dev build** (`crates/cache` dev-deps include `aws-smithy-mocks`
+# and `aws-sdk-s3 = { features = ["test-util"] }`), a hyper-0.14 +
+# h2 0.3 + socket2 0.5 subtree does land — `test-util` enables
+# `aws-smithy-runtime/legacy-test-util` which enables
+# `aws-smithy-http-client/hyper-014`. Cargo unifies features across deps
+# and dev-deps, so the dev-only feature still leaves the lockfile entries
+# even in production builds; they just aren't linked. The fix path is
+# upstream (a leaner mocks crate that doesn't require legacy hyper) or a
+# future smithy-rs release that splits the test-util layer. Re-evaluate
+# both.
+#
+# `aws-config` keeps the standard credential-chain pieces (env / profile /
+# IMDS / SSO / credentials_process) so operators get the AWS-CLI-equivalent
+# discovery for free; the `behavior-version-latest` feature is paired with
+# an explicit `BehaviorVersion::latest()` at the call site so a future
+# feature-flag edit dropping the implicit path cannot regress (older SDK
+# versions panicked here; current versions surface a runtime error).
+# Note: the `sso` feature enables an HTTP-using credential provider; if an
+# operator's `~/.aws/config` profile is configured for SSO with an
+# expired cached token, the *first* fetch through the cache may trigger
+# an HTTP refresh against the SSO endpoint. Construction itself stays
+# I/O-free (verified by `S3Origin::new`'s no-I/O construction tests).
+aws-config = { version = "1.8", default-features = false, features = [
+    "behavior-version-latest",
+    "credentials-process",
+    "sso",
+    "rt-tokio",
+] }
+# Pinned at 1.129 (last release using sha2 ^0.10): aws-sdk-s3 1.130 bumped to
+# sha2 ^0.11 (stable). The lockfile already carries sha2 0.10.9 alongside
+# iroh-base 0.98's `=0.11.0-rc.5` exact pin (cargo treats stable and
+# pre-release majors as separate); allowing aws-sdk-s3 to pull stable
+# 0.11.x would add a *third* sha2 entry, fattening the cargo deny
+# `multiple-versions` warning. Re-evaluate when iroh bumps to a release
+# that no longer pins `sha2 = "=0.11.0-rc.5"`.
+aws-sdk-s3 = { version = "=1.129.0", default-features = false, features = ["http-1x", "rt-tokio"] }
+aws-smithy-http-client = { version = "1.1", default-features = false, features = [
+    "default-client",
+    "rustls-aws-lc",
+] }
+aws-credential-types = "1"
+aws-smithy-runtime-api = "1"
+aws-smithy-types = "1"
 
 # Test-only helpers
 tempfile = "3"
 wiremock = "0.6"
 proptest = "1"
+# Operation-level S3 mocks for the S3 origin tests (#437 PR2). The `mock!`
+# / `mock_client!` macros take the SDK through its full middleware chain
+# (signing, retry, body framing) but stub the network — exactly the
+# granularity we need to validate `OriginPullError` classification without
+# standing up MinIO.
+aws-smithy-mocks = "0.2"
 
 # Rate limiting (per-source connection rate limits in `node`)
 governor = "0.10"

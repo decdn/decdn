@@ -9,9 +9,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use decdn_node::cli::{ConfigValidateArgs, RunArgs};
-use decdn_node::commands;
-use decdn_node::config::{
+use decdn_cli::commands::config as commands;
+use decdn_common::cli::{ConfigValidateArgs, RunArgs};
+use decdn_common::config::{
     ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedGossip, ResolvedIdentity,
     ResolvedNetwork, ResolvedObservability, ResolvedPayment, ResolvedSecurity,
 };
@@ -190,6 +190,7 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
         blockchain: ResolvedBlockchain {
             rpc_url: "https://rpc.example/SECRET_TOKEN_abc123".to_string(),
             eth_keystore: PathBuf::from("/var/lib/decdn/keystore.json"),
+            keystore_password_file: None,
             payment_channel_address: "0x0000000000000000000000000000000000000001".to_string(),
             staking_registry_address: "0x0000000000000000000000000000000000000002".to_string(),
             rpc_watchdog_interval_sec: 30,
@@ -198,15 +199,16 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             cache_dir: PathBuf::from("/var/lib/decdn/cache"),
             cache_size_mb: 10_240,
             max_blob_size_mb: 1_024,
-            origin_url: None::<decdn_cache::OriginUrl>,
-            origin_path: None,
-            decompress: decdn_cache::DecompressMode::Auto,
+            origin: None,
             pinned_hashes: decdn_cache::PinnedHashes::empty(),
+            origin_retry: decdn_cache::RetryPolicy::default(),
+            user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
+            gc_interval_sec: 300,
         },
         payment: ResolvedPayment { rate_per_mb: 10 },
         observability: ResolvedObservability {
-            log_level: decdn_node::cli::common::LogLevel::Info,
-            log_format: decdn_node::cli::LogFormat::Pretty,
+            log_level: decdn_common::cli::common::LogLevel::Info,
+            log_format: decdn_common::cli::LogFormat::Pretty,
             metrics_port: 9090,
             metrics_bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             admin_port: Some(9191),
