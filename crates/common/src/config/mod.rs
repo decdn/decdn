@@ -746,12 +746,22 @@ fn validate_user_agent(s: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Resolve the origin retry policy (#285). Absent => defaults via
-/// `RetryPolicy::default()`. Present partial sections fill missing
-/// fields from the same defaults (handled by `#[serde(default)]` on
-/// `RetryPolicy` itself). This function only enforces the two
-/// cross-field invariants the type can't express: monotone schedule
-/// and finite jitter in `[0, 1]`.
+/// Hard ceiling on `cache.origin_retry.buffered_max_bytes` (#519).
+/// 64 MiB is well above the 4 MiB default but small enough that an
+/// accidental "set to 4 GiB" gets caught at config-load time. The
+/// streaming abort+restart path covers blobs of any size without
+/// raising this knob; lifting the ceiling would let an operator
+/// silently amplify per-fetch RSS into territory that doesn't
+/// actually buy them anything.
+pub const MAX_BUFFERED_MAX_BYTES: u64 = 64 << 20;
+
+/// Resolve the origin retry policy (#285, extended in #519). Absent =>
+/// defaults via `RetryPolicy::default()`. Present partial sections
+/// fill missing fields from the same defaults (handled by
+/// `#[serde(default)]` on `RetryPolicy` itself). This function
+/// enforces the cross-field invariants the type can't express:
+/// monotone schedule, finite jitter in `[0, 1]`, and a sane ceiling
+/// on the body-phase buffer budget.
 pub fn resolve_origin_retry(
     file: Option<&decdn_cache::RetryPolicy>,
 ) -> anyhow::Result<decdn_cache::RetryPolicy> {
@@ -767,6 +777,15 @@ pub fn resolve_origin_retry(
         p.jitter_ratio.is_finite() && (0.0..=1.0).contains(&p.jitter_ratio),
         "cache.origin_retry: jitter_ratio={} must be a finite number in 0.0..=1.0",
         p.jitter_ratio,
+    );
+    anyhow::ensure!(
+        p.buffered_max_bytes <= MAX_BUFFERED_MAX_BYTES,
+        "cache.origin_retry: buffered_max_bytes ({}) exceeds the hard ceiling of {} bytes \
+         (#519). The streaming abort+restart path covers blobs of any size without raising \
+         this knob; if mid-stream retries on large blobs is the goal, leave \
+         buffered_max_bytes at the default and rely on the streaming path",
+        p.buffered_max_bytes,
+        MAX_BUFFERED_MAX_BYTES,
     );
     Ok(p)
 }
@@ -3540,6 +3559,7 @@ mod tests {
                 initial_backoff_ms: 50,
                 max_backoff_ms: 2_000,
                 jitter_ratio: 0.25,
+                buffered_max_bytes: 8 << 20, // 8 MiB
             }),
             ..types::CacheConfig::default()
         };
@@ -3549,6 +3569,7 @@ mod tests {
         anyhow::ensure!(p.initial_backoff_ms == 50);
         anyhow::ensure!(p.max_backoff_ms == 2_000);
         anyhow::ensure!((p.jitter_ratio - 0.25).abs() < f64::EPSILON);
+        anyhow::ensure!(p.buffered_max_bytes == 8 << 20);
         Ok(())
     }
 
@@ -3629,6 +3650,72 @@ mod tests {
                 "error message should reference jitter_ratio, got: {msg}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_origin_retry_rejects_buffered_max_bytes_above_ceiling() -> anyhow::Result<()> {
+        // #519 hard ceiling: buffered_max_bytes > 64 MiB is almost
+        // certainly an operator typo. The streaming abort+restart
+        // path covers any blob size without raising this knob.
+        let cli = cache_cli(None, None);
+        let file = types::CacheConfig {
+            origin_retry: Some(decdn_cache::RetryPolicy {
+                buffered_max_bytes: MAX_BUFFERED_MAX_BYTES + 1,
+                ..decdn_cache::RetryPolicy::default()
+            }),
+            ..types::CacheConfig::default()
+        };
+        let err = resolve_cache(&cli, Some(&file), Path::new("/tmp"))
+            .err()
+            .ok_or_else(|| {
+                anyhow::anyhow!("expected rejection for too-large buffered_max_bytes")
+            })?;
+        let msg = format!("{err:#}");
+        anyhow::ensure!(
+            msg.contains("buffered_max_bytes"),
+            "error message should reference buffered_max_bytes, got: {msg}"
+        );
+        anyhow::ensure!(
+            msg.contains("hard ceiling"),
+            "error message should explain the ceiling rationale, got: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_origin_retry_accepts_buffered_max_bytes_at_ceiling() -> anyhow::Result<()> {
+        // Boundary: exactly the ceiling is allowed; only > ceiling is
+        // rejected. Pins the inclusive-bound semantics so a future
+        // edit can't accidentally flip the inequality.
+        let cli = cache_cli(None, None);
+        let file = types::CacheConfig {
+            origin_retry: Some(decdn_cache::RetryPolicy {
+                buffered_max_bytes: MAX_BUFFERED_MAX_BYTES,
+                ..decdn_cache::RetryPolicy::default()
+            }),
+            ..types::CacheConfig::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        anyhow::ensure!(resolved.origin_retry.buffered_max_bytes == MAX_BUFFERED_MAX_BYTES);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_origin_retry_accepts_buffered_max_bytes_zero() -> anyhow::Result<()> {
+        // `0` disables the buffer path entirely (operator opt-out;
+        // documented in `RetryPolicy::buffered_max_bytes`). Must
+        // resolve cleanly.
+        let cli = cache_cli(None, None);
+        let file = types::CacheConfig {
+            origin_retry: Some(decdn_cache::RetryPolicy {
+                buffered_max_bytes: 0,
+                ..decdn_cache::RetryPolicy::default()
+            }),
+            ..types::CacheConfig::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        anyhow::ensure!(resolved.origin_retry.buffered_max_bytes == 0);
         Ok(())
     }
 

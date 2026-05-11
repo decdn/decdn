@@ -1870,6 +1870,11 @@ const fn fast_retry_policy(max_retries: u32) -> RetryPolicy {
         initial_backoff_ms: 1,
         max_backoff_ms: 5,
         jitter_ratio: 0.0,
+        // Default-shaped buffer budget so existing tests exercise
+        // the same buffer-then-commit path that production uses for
+        // sub-4-MiB blobs. Mid-stream-retry tests below override this
+        // explicitly when they need to pin a specific code path.
+        buffered_max_bytes: 4 << 20,
     }
 }
 
@@ -2396,6 +2401,432 @@ async fn http_origin_sends_default_user_agent_when_unset() -> anyhow::Result<()>
     anyhow::ensure!(
         &got[..] == payload,
         "default UA fetch should have succeeded"
+    );
+    Ok(())
+}
+
+// ----- mid-stream retry classification (#519) -----------------------------
+
+/// Connection-counting TCP server that ships a `Content-Length:` header
+/// plus `partial_bytes` of body before closing the socket — exercises
+/// the body-phase retry path (#519). On accept N (1-indexed) it
+/// switches to streaming the full payload and closes cleanly.
+///
+/// Returns the bound address and a shared counter incremented on each
+/// successful accept — tests assert on the counter to pin dispatch
+/// behaviour exactly. A separate counter (vs scraping `HttpOrigin`
+/// internals) is the only thing that pins "did the engine retry?"
+/// without coupling to private state.
+async fn spawn_mid_body_reset_server(
+    payload: bytes::Bytes,
+    partial_bytes: usize,
+    succeed_on_attempt: Option<usize>, // 1-indexed; None = fail every attempt
+) -> anyhow::Result<(std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>)> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cnt = counter.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let attempt = cnt.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            // Drain the request headers — the engine needs the server
+            // to consume `GET /<hex> HTTP/1.1\r\n…\r\n\r\n` before the
+            // response is allowed to flow back. A bounded buffer is
+            // fine: only the header is read; the body is empty on GET.
+            let mut buf = [0u8; 4096];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => {
+                        if buf
+                            .get(..n)
+                            .unwrap_or(&[])
+                            .windows(4)
+                            .any(|w| w == b"\r\n\r\n")
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+            let succeed = matches!(succeed_on_attempt, Some(n) if attempt >= n);
+            let hdr = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                payload.len()
+            );
+            if sock.write_all(hdr.as_bytes()).await.is_err() {
+                continue;
+            }
+            if succeed {
+                let _ = sock.write_all(&payload).await;
+                let _ = sock.shutdown().await;
+            } else {
+                let cut = partial_bytes.min(payload.len());
+                let slice = payload.get(..cut).unwrap_or(&[]);
+                let _ = sock.write_all(slice).await;
+                // Drop the socket without closing the write side
+                // gracefully — peer sees an early EOF mid-body, which
+                // reqwest surfaces as an `is_body()` error.
+                drop(sock);
+            }
+        }
+    });
+    Ok((addr, counter))
+}
+
+/// Small-blob mid-stream reset (`size_hint` <= 4 MiB) — exercises the
+/// buffer-then-commit path. Pre-#519: a single `io::Error` and the engine
+/// surfaces `OriginError` after one dispatch. Post-#519: the drain
+/// path classifies the error as Transient and re-enters `retry_fetch`.
+#[tokio::test]
+async fn mid_stream_transient_retries_small_blob() -> anyhow::Result<()> {
+    let payload = bytes::Bytes::from_static(b"a small blob that fits in the buffered drain path");
+    let hash = Hash::new(&payload);
+    // 2 failures then success on attempt 3 — exercises the partial-
+    // success path with retries.
+    let (addr, counter) = spawn_mid_body_reset_server(payload.clone(), 8, Some(3)).await?;
+    let origin = Arc::new(HttpOrigin::parse(&format!("http://{addr}/"))?);
+    let (engine, _tmp) =
+        build_engine_with_retry(origin as Arc<dyn Origin>, fast_retry_policy(3)).await?;
+
+    let got = engine.get(hash).await?;
+    anyhow::ensure!(
+        got[..] == payload[..],
+        "payload survived mid-stream retry chain"
+    );
+    let dispatched = counter.load(std::sync::atomic::Ordering::SeqCst);
+    anyhow::ensure!(
+        dispatched == 3,
+        "expected exactly 3 dispatches (2 fail + 1 success), got {dispatched}"
+    );
+    Ok(())
+}
+
+/// Large-blob mid-stream reset (`size_hint` > 4 MiB) — exercises the
+/// streaming abort+restart path. Each failed attempt commits a partial
+/// `TempTag` worth of bytes that iroh-blobs GC reclaims; here we just
+/// pin the retry-count behaviour (the GC reclaim assertion is in the
+/// follow-up test).
+#[tokio::test]
+async fn mid_stream_transient_retries_large_blob_via_abort_restart() -> anyhow::Result<()> {
+    // 5 MiB body — above the 4 MiB `buffered_max_bytes` default, so
+    // the engine takes the streaming path. Pattern is intentionally
+    // non-trivial so partial-import bytes don't compress oddly under
+    // store-side optimisations.
+    let payload = bytes::Bytes::from(vec![0xa5_u8; 5 * 1024 * 1024]);
+    let hash = Hash::new(&payload);
+    let (addr, counter) = spawn_mid_body_reset_server(payload.clone(), 64 * 1024, Some(3)).await?;
+    let origin = Arc::new(HttpOrigin::parse(&format!("http://{addr}/"))?);
+    let (engine, _tmp) =
+        build_engine_with_retry(origin as Arc<dyn Origin>, fast_retry_policy(3)).await?;
+
+    let got = engine.get(hash).await?;
+    anyhow::ensure!(
+        got[..] == payload[..],
+        "5 MiB payload survived streaming abort+restart chain"
+    );
+    let dispatched = counter.load(std::sync::atomic::Ordering::SeqCst);
+    anyhow::ensure!(
+        dispatched == 3,
+        "expected exactly 3 dispatches on streaming abort+restart, got {dispatched}"
+    );
+    Ok(())
+}
+
+/// Large-blob mid-stream reset that never recovers — the streaming
+/// abort+restart path must exhaust the retry budget cleanly and not
+/// loop forever.
+#[tokio::test]
+async fn mid_stream_transient_exhausts_budget_large_blob() -> anyhow::Result<()> {
+    let payload = bytes::Bytes::from(vec![0x5a_u8; 5 * 1024 * 1024]);
+    let hash = Hash::new(&payload);
+    // None = fail forever; budget = 3 → 4 total dispatches.
+    let (addr, counter) = spawn_mid_body_reset_server(payload, 64 * 1024, None).await?;
+    let origin = Arc::new(HttpOrigin::parse(&format!("http://{addr}/"))?);
+    let (engine, _tmp) =
+        build_engine_with_retry(origin as Arc<dyn Origin>, fast_retry_policy(3)).await?;
+
+    let err = err_of(engine.get(hash).await)?;
+    anyhow::ensure!(
+        matches!(err, CacheError::OriginError { .. }),
+        "exhausted mid-stream retries should surface OriginError, got: {err:?}"
+    );
+    let dispatched = counter.load(std::sync::atomic::Ordering::SeqCst);
+    anyhow::ensure!(
+        dispatched == 4,
+        "expected exactly 4 dispatches (1 + 3 retries), got {dispatched}"
+    );
+    Ok(())
+}
+
+/// Unknown `size_hint` (Transfer-Encoding: chunked, no Content-Length)
+/// must take the streaming path even for tiny payloads — buffering an
+/// unknown-size body could let a lying origin overrun the operator's
+/// memory budget. Retries still happen via abort+restart.
+///
+/// Mid-stream reset variant of the chunked server: ships a single short
+/// chunk then closes without a terminating `0\r\n\r\n`. Reqwest surfaces
+/// this as an `is_body()` mid-body error.
+#[tokio::test]
+async fn unknown_size_hint_uses_streaming_path_and_retries() -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cnt = counter.clone();
+    let payload: Vec<u8> = b"tiny chunked payload that needs retry".to_vec();
+    let payload_owned = payload.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let attempt = cnt.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let mut buf = [0u8; 4096];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => {
+                        if buf
+                            .get(..n)
+                            .unwrap_or(&[])
+                            .windows(4)
+                            .any(|w| w == b"\r\n\r\n")
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+            if attempt >= 2 {
+                // Complete a proper chunked response on attempt 2+.
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+                    payload_owned.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.write_all(&payload_owned).await;
+                let _ = sock.write_all(b"\r\n0\r\n\r\n").await;
+                let _ = sock.shutdown().await;
+            } else {
+                // First attempt: short chunk then drop, no terminator.
+                let resp = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nABCD\r\n";
+                let _ = sock.write_all(resp).await;
+                drop(sock);
+            }
+        }
+    });
+    let hash = Hash::new(&payload);
+    let origin = Arc::new(HttpOrigin::parse(&format!("http://{addr}/"))?);
+    let (engine, _tmp) =
+        build_engine_with_retry(origin as Arc<dyn Origin>, fast_retry_policy(3)).await?;
+
+    let got = engine.get(hash).await?;
+    anyhow::ensure!(got[..] == payload[..], "chunked payload retried");
+    let dispatched = counter.load(std::sync::atomic::Ordering::SeqCst);
+    anyhow::ensure!(
+        dispatched == 2,
+        "expected 2 dispatches (1 fail + 1 success), got {dispatched}"
+    );
+    Ok(())
+}
+
+/// Truncated gzip body under the 4 MiB threshold takes the drain path.
+/// The decoder's `io::Error` wraps a typed `OriginError::DecompressionFailed`
+/// which `classify_io_error` recognises as Permanent — the retry budget
+/// must not be burned even with retries available.
+#[tokio::test]
+async fn decompression_failure_is_permanent_under_threshold() -> anyhow::Result<()> {
+    let payload: &[u8] = b"a payload that gzip would compress but the response is truncated";
+    let hash = Hash::new(payload);
+    // Build a valid gzip stream then chop the trailing CRC/size words
+    // so the decoder errors after the magic check passes.
+    let mut compressed = Vec::new();
+    {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write as _;
+        let mut enc = GzEncoder::new(&mut compressed, Compression::default());
+        enc.write_all(payload)?;
+        enc.finish()?;
+    }
+    let drop = 8;
+    anyhow::ensure!(compressed.len() > drop, "gzip stream too short to truncate");
+    compressed.truncate(compressed.len() - drop);
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Encoding", "gzip")
+                .set_body_bytes(compressed),
+        )
+        // expect(1): the decoder error is Permanent, so retry must not
+        // dispatch a second request even with budget available.
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
+    let (engine, _tmp) =
+        build_engine_with_retry(origin as Arc<dyn Origin>, fast_retry_policy(3)).await?;
+
+    let err = err_of(engine.get(hash).await)?;
+    anyhow::ensure!(
+        matches!(err, CacheError::OriginError { .. }),
+        "expected OriginError from truncated gzip, got: {err:?}"
+    );
+    // The typed variant must survive the body-phase classification
+    // path — pre-#519 a similar test pinned this through the streaming
+    // side channel; post-#519 the drain branch routes through the
+    // same `classify_io_error` typed-inner downcast.
+    anyhow::ensure!(
+        matches!(
+            err.origin_error_kind(),
+            Some(OriginError::DecompressionFailed {
+                encoding: SupportedEncoding::Gzip,
+                ..
+            })
+        ),
+        "expected typed DecompressionFailed(Gzip) on the error chain, got: {err:?}"
+    );
+    Ok(())
+}
+
+/// `buffered_max_bytes = 0` disables the drain branch (#519 operator
+/// opt-out). Mid-body resets on a tiny payload now route through the
+/// streaming abort+restart path instead — retry still works, but
+/// each failed attempt strands partial bytes (GC reclaim covered by
+/// a separate test).
+#[tokio::test]
+async fn buffered_max_bytes_zero_routes_through_streaming_path() -> anyhow::Result<()> {
+    let payload = bytes::Bytes::from_static(b"tiny payload that the operator chose not to buffer");
+    let hash = Hash::new(&payload);
+    let (addr, counter) = spawn_mid_body_reset_server(payload.clone(), 4, Some(2)).await?;
+    let origin = Arc::new(HttpOrigin::parse(&format!("http://{addr}/"))?);
+
+    let policy = RetryPolicy {
+        buffered_max_bytes: 0, // disable drain branch
+        ..fast_retry_policy(3)
+    };
+    let (engine, _tmp) = build_engine_with_retry(origin as Arc<dyn Origin>, policy).await?;
+
+    let got = engine.get(hash).await?;
+    anyhow::ensure!(got[..] == payload[..]);
+    let dispatched = counter.load(std::sync::atomic::Ordering::SeqCst);
+    anyhow::ensure!(
+        dispatched == 2,
+        "expected 2 dispatches (streaming path with retry), got {dispatched}"
+    );
+    Ok(())
+}
+
+/// Origin advertises `size_hint = K` but its stream ships `>K` bytes —
+/// the drain path's running cap must trip and surface `BlobTooLarge`
+/// via the typed marker, not a generic `OriginError`. Pins the typed-
+/// outcome short-circuit in `pull_through_attempt`'s drain branch.
+///
+/// HTTP-based test setups can't drive this directly: reqwest stops
+/// reading at the declared `Content-Length` regardless of what the
+/// server ships. A custom `Origin` impl that lies about `size_hint`
+/// is the most direct way to exercise the running cap.
+#[tokio::test]
+async fn drain_overrun_surfaces_blob_too_large() -> anyhow::Result<()> {
+    #[derive(Debug)]
+    struct LyingSizeOrigin {
+        chunks: Vec<bytes::Bytes>,
+        advertised: u64,
+    }
+
+    impl Origin for LyingSizeOrigin {
+        fn kind(&self) -> OriginKind {
+            OriginKind::Http
+        }
+        fn fetch(
+            &self,
+            _hash: Hash,
+            _max_bytes: u64,
+        ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>>
+        {
+            let chunks = self.chunks.clone();
+            let advertised = self.advertised;
+            Box::pin(async move {
+                use futures_util::stream;
+                let stream =
+                    stream::iter(chunks.into_iter().map(Ok::<bytes::Bytes, std::io::Error>));
+                Ok(OriginFetch::Found {
+                    stream: Box::pin(stream),
+                    size_hint: Some(advertised),
+                })
+            })
+        }
+    }
+
+    // Origin advertises 1 KiB but actually streams 16 KiB. The drain
+    // cap (set below to 4 KiB via `buffered_max_bytes`) trips after
+    // the second chunk.
+    let chunks: Vec<bytes::Bytes> = (0..4)
+        .map(|_| bytes::Bytes::from(vec![0xAB_u8; 4 * 1024]))
+        .collect();
+    let origin: Arc<dyn Origin> = Arc::new(LyingSizeOrigin {
+        chunks,
+        advertised: 1024,
+    });
+    let policy = RetryPolicy {
+        // 4 KiB drain budget: bigger than the advertised 1 KiB
+        // size_hint (so the drain path is taken) but smaller than
+        // the actual 16 KiB body — overrun fires mid-drain.
+        buffered_max_bytes: 4 * 1024,
+        ..fast_retry_policy(0)
+    };
+    let (engine, _tmp) = build_engine_with_retry(origin, policy).await?;
+
+    let err = err_of(engine.get(Hash::new(b"unreached")).await)?;
+    anyhow::ensure!(
+        matches!(err, CacheError::BlobTooLarge { .. }),
+        "expected BlobTooLarge from drain overrun, got: {err:?}"
+    );
+    Ok(())
+}
+
+/// Hash mismatch after a clean stream is *not* retried — that's an
+/// origin protocol violation, not a transport failure. The boundary
+/// between retry-class `io::Error` and deterministic `HashMismatch`
+/// must stay sharp; a regression that classified `HashMismatch` as
+/// Transient would burn budget on unrecoverable corruption.
+#[tokio::test]
+async fn hash_mismatch_after_streaming_is_not_retried() -> anyhow::Result<()> {
+    // Request a 5 MiB blob (above the buffered threshold to force the
+    // streaming path), but the server ships bytes whose hash doesn't
+    // match. `expect(1)` on the mock fails at drop time if the engine
+    // dispatches a second request.
+    let expected = Hash::new(b"expected payload");
+    // Ship a different payload of size > buffered_max_bytes so the
+    // streaming path is taken.
+    // Deterministic non-trivial pattern; the cast truncates the index
+    // intentionally — we just need bytes that hash to something other
+    // than `expected`.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let wrong: Vec<u8> = (0..6 * 1024 * 1024_i32).map(|i| i as u8).collect();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", expected.to_hex())))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(wrong))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
+    let (engine, _tmp) =
+        build_engine_with_retry(origin as Arc<dyn Origin>, fast_retry_policy(3)).await?;
+
+    let err = err_of(engine.get(expected).await)?;
+    anyhow::ensure!(
+        matches!(err, CacheError::HashMismatch { .. }),
+        "expected HashMismatch, got: {err:?}"
     );
     Ok(())
 }
