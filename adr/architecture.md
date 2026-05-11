@@ -130,6 +130,7 @@ Appendices document patterns, reference implementations, and operational guidanc
 8. [Operator Key Rotation Runbook](appendix-operator-key-rotation.md) — sequenced procedure for rotating the operator's iroh node-key, Ethereum signing key, and (production) session keys via `bindNodeId`, deregister-and-re-stake, or `erc7579/smartsessions`
 9. [Operator Protocol-Upgrade Runbook](appendix-operator-upgrade-path.md) — sequenced operator actions for each ADR 013 tier (Tier 1/2 checklists; Tier 3 rolling-upgrade procedure; client and governance coordination)
 10. [Permissionless Fraud-Detection Layer](appendix-fraud-detection.md) — optional, anyone-can-run on-chain monitoring of stale closes and fraudulent epoch summaries via the existing `SlashJudge` bond mechanism
+11. [Wash-Trading Economics](appendix-wash-trading-economics.md) — closed-pool dilution argument and ve-boost-amplification breakeven backing the [ADR 026 §2](026-gauge-boost-tokenomics.md#pre-launch-gauge-accumulation) launch prerequisite and the [§3](026-gauge-boost-tokenomics.md#per-operator-gauge-share-cap) per-operator gauge-share cap; identifies the cap + per-pseudo-operator capital lockup ([§7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake)) as the load-bearing on-chain defenses
 
 ## Architectural Decisions
 
