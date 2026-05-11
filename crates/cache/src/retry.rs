@@ -378,18 +378,30 @@ pub(crate) async fn drain_to_bytes(
 ///    Permanent (fail-fast over retry-storm for unrecognised
 ///    modes).
 pub(crate) fn classify_io_error(e: io::Error) -> OriginPullError {
-    // Consume the error up front so we can chain `downcast` on the
-    // inner box without re-checking. `io::Error::into_inner` returns
-    // `Option<Box<dyn Error + Send + Sync>>`; if the inner is absent,
-    // there's no typed marker to recover and we go straight to the
-    // `kind()`-based fallback.
+    // Peek the inner *without* consuming so we can preserve the
+    // original `e` (and its `raw_os_error` / Display) when no typed
+    // marker matches. `io::Error::from_raw_os_error` / `last_os_error`
+    // produce errors whose `into_inner()` returns `None` — consuming
+    // up front would silently strip the OS error code.
+    let has_typed_marker = e
+        .get_ref()
+        .is_some_and(|r| r.is::<BlobTooLargeMarker>() || r.is::<OriginError>());
+    if !has_typed_marker {
+        let kind = e.kind();
+        return classify_by_kind(kind, e);
+    }
+    // We confirmed a typed marker via `is::<>`; consume and chain
+    // `Box::downcast` (returns the original box back through `Err`
+    // on a mismatch). Both downcasts can only fail if a third typed
+    // variant slipped in between the `get_ref` peek and the consume
+    // — defensive fall-back rewraps and routes through `classify_by_kind`.
     let kind = e.kind();
     let Some(inner) = e.into_inner() else {
-        return classify_kind_only(kind, None);
+        // Structurally unreachable: `get_ref` returned `Some` so the
+        // Repr is `Custom`, and `Custom`'s `into_inner` always returns
+        // `Some`. If std's invariant ever changes, fall through.
+        return classify_by_kind(kind, io::Error::from(kind));
     };
-    // Try BlobTooLargeMarker first. `Box::downcast` returns the
-    // original boxed value back through `Err` on a type mismatch,
-    // letting us walk through alternatives without losing ownership.
     let inner = match inner.downcast::<BlobTooLargeMarker>() {
         Ok(marker) => {
             return OriginPullError::Permanent(anyhow::anyhow!(
@@ -399,28 +411,18 @@ pub(crate) fn classify_io_error(e: io::Error) -> OriginPullError {
         }
         Err(b) => b,
     };
-    let inner = match inner.downcast::<OriginError>() {
-        Ok(typed) => return OriginPullError::Permanent(anyhow::Error::from(*typed)),
-        Err(b) => b,
-    };
-    // Inner wasn't a typed marker; fall back to `kind()` classification
-    // but preserve the inner so the operator-visible source chain
-    // isn't lost.
-    classify_kind_only(kind, Some(inner))
+    match inner.downcast::<OriginError>() {
+        Ok(typed) => OriginPullError::Permanent(anyhow::Error::from(*typed)),
+        Err(b) => classify_by_kind(kind, io::Error::new(kind, b)),
+    }
 }
 
-/// Classify a body-phase failure by `io::ErrorKind` alone. Used when
-/// no typed marker is recoverable from the inner — the kind is the
-/// best signal we have for whether the failure is transport-class
-/// (retry-eligible) or programmatic (fail-fast).
-fn classify_kind_only(
-    kind: io::ErrorKind,
-    inner: Option<Box<dyn std::error::Error + Send + Sync>>,
-) -> OriginPullError {
-    let rebuilt = match inner {
-        Some(b) => io::Error::new(kind, b),
-        None => io::Error::from(kind),
-    };
+/// Classify a body-phase failure by `io::ErrorKind` alone. Takes the
+/// original `io::Error` so `raw_os_error()` and any Display payload
+/// flow through unchanged into the surfaced `anyhow::Error`. Used
+/// when the typed-marker downcast didn't fire.
+fn classify_by_kind(kind: io::ErrorKind, e: io::Error) -> OriginPullError {
+    let err = anyhow::Error::new(e);
     match kind {
         io::ErrorKind::Interrupted
         | io::ErrorKind::TimedOut
@@ -432,8 +434,8 @@ fn classify_kind_only(
         | io::ErrorKind::ConnectionRefused
         | io::ErrorKind::NotConnected
         | io::ErrorKind::UnexpectedEof
-        | io::ErrorKind::Other => OriginPullError::Transient(anyhow::Error::new(rebuilt)),
-        _ => OriginPullError::Permanent(anyhow::Error::new(rebuilt)),
+        | io::ErrorKind::Other => OriginPullError::Transient(err),
+        _ => OriginPullError::Permanent(err),
     }
 }
 

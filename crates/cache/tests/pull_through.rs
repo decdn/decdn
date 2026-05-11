@@ -2432,25 +2432,12 @@ async fn spawn_mid_body_reset_server(
                 return;
             };
             let attempt = cnt.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-            // Drain the request headers — the engine needs the server
-            // to consume `GET /<hex> HTTP/1.1\r\n…\r\n\r\n` before the
-            // response is allowed to flow back. A bounded buffer is
-            // fine: only the header is read; the body is empty on GET.
-            let mut buf = [0u8; 4096];
-            loop {
-                match sock.read(&mut buf).await {
-                    Ok(0) | Err(_) => return,
-                    Ok(n) => {
-                        if buf
-                            .get(..n)
-                            .unwrap_or(&[])
-                            .windows(4)
-                            .any(|w| w == b"\r\n\r\n")
-                        {
-                            break;
-                        }
-                    }
-                }
+            // Drain headers on this connection only. A per-connection
+            // read error or EOF must NOT kill the spawned task — the
+            // engine will issue follow-up retries that need a live
+            // listener.
+            if drain_http_request_headers(&mut sock).await.is_err() {
+                continue;
             }
             let succeed = matches!(succeed_on_attempt, Some(n) if attempt >= n);
             let hdr = format!(
@@ -2475,6 +2462,40 @@ async fn spawn_mid_body_reset_server(
         }
     });
     Ok((addr, counter))
+}
+
+/// Read from `sock` until `\r\n\r\n` is observed (end of HTTP request
+/// headers). Maintains a 3-byte overlap across reads so a delimiter
+/// split between two `read()` calls is still detected — unlikely on
+/// loopback for a sub-100-byte reqwest GET, but cheap belt-and-
+/// suspenders. Returns the per-connection error rather than
+/// killing the caller's accept loop.
+async fn drain_http_request_headers(sock: &mut tokio::net::TcpStream) -> std::io::Result<()> {
+    let mut buf = [0u8; 4096];
+    // 3-byte tail from the previous read so a `\r\n\r\n` straddling
+    // two reads is still found.
+    let mut tail: [u8; 3] = [0; 3];
+    let mut tail_len: usize = 0;
+    loop {
+        let n = match sock.read(&mut buf).await {
+            Ok(0) => return Err(std::io::Error::other("peer closed before end of headers")),
+            Err(e) => return Err(e),
+            Ok(n) => n,
+        };
+        let mut window: Vec<u8> = Vec::with_capacity(tail_len + n);
+        window.extend_from_slice(tail.get(..tail_len).unwrap_or(&[]));
+        window.extend_from_slice(buf.get(..n).unwrap_or(&[]));
+        if window.windows(4).any(|w| w == b"\r\n\r\n") {
+            return Ok(());
+        }
+        // Carry up to the last 3 bytes for the next iteration's overlap.
+        let carry_from = window.len().saturating_sub(3);
+        let carry = window.get(carry_from..).unwrap_or(&[]);
+        tail_len = carry.len();
+        if let Some(slot) = tail.get_mut(..tail_len) {
+            slot.copy_from_slice(carry);
+        }
+    }
 }
 
 /// Small-blob mid-stream reset (`size_hint` <= 4 MiB) — exercises the
@@ -2584,21 +2605,12 @@ async fn unknown_size_hint_uses_streaming_path_and_retries() -> anyhow::Result<(
                 return;
             };
             let attempt = cnt.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-            let mut buf = [0u8; 4096];
-            loop {
-                match sock.read(&mut buf).await {
-                    Ok(0) | Err(_) => return,
-                    Ok(n) => {
-                        if buf
-                            .get(..n)
-                            .unwrap_or(&[])
-                            .windows(4)
-                            .any(|w| w == b"\r\n\r\n")
-                        {
-                            break;
-                        }
-                    }
-                }
+            // Per-connection header drain — same hygiene as
+            // `spawn_mid_body_reset_server`: don't kill the spawned
+            // task on a single failed read; carry a 3-byte overlap
+            // across reads for delimiter-split safety.
+            if drain_http_request_headers(&mut sock).await.is_err() {
+                continue;
             }
             if attempt >= 2 {
                 // Complete a proper chunked response on attempt 2+.
