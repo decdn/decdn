@@ -250,7 +250,7 @@ During the first 7 days after staking (or first 50 completed interactions, which
 
 ### 12. Gauge-Pool Wash-Trading: Reputation as Off-Chain Signal
 
-[ADR 026 §3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula) distributes 40% of fee revenue via a Curve-style gauge formula whose input is per-operator `bytes_delivered`. Without an integrity layer, an operator can inflate `bytes_delivered` by routing settlements through self-controlled clients. The on-chain defense is the [ADR 026 §3 per-operator gauge-share cap](026-gauge-boost-tokenomics.md#per-operator-gauge-share-cap) (default 5%, governable `[1%, 25%]`), which combined with the closed-pool gauge bucket structure makes wash-trading economically marginal at any reasonable TOKEN price (see `internal/ideas/wash-trading-economics.md`).
+[ADR 026 §3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula) distributes 40% of fee revenue via a Curve-style gauge formula whose input is per-operator `bytes_delivered`. Without an integrity layer, an operator can inflate `bytes_delivered` by routing settlements through self-controlled clients. The on-chain defense is the [ADR 026 §3 per-operator gauge-share cap](026-gauge-boost-tokenomics.md#per-operator-gauge-share-cap) (default 5%, governable `[1%, 25%]`), which combined with the closed-pool gauge bucket structure makes wash-trading economically marginal at any reasonable TOKEN price (see [Appendix: Wash-Trading Economics](appendix-wash-trading-economics.md)).
 
 Reputation contributes complementary off-chain signal:
 
