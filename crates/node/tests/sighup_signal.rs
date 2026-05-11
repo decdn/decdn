@@ -62,6 +62,7 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
             pinned_hashes: decdn_cache::PinnedHashes::empty(),
             origin_retry: decdn_cache::RetryPolicy::default(),
             user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
+            gc_interval_sec: 0,
         },
         payment: ResolvedPayment { rate_per_mb: rate },
         observability: ResolvedObservability {

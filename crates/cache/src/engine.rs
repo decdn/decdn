@@ -4,13 +4,16 @@ use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Instant;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
+use futures_util::StreamExt;
 use iroh_blobs::Hash;
 use iroh_blobs::store::fs::FsStore;
+use iroh_blobs::store::fs::options::Options as FsStoreOptions;
+use iroh_blobs::store::{GcConfig, ProtectOutcome};
 use tokio::sync::Notify;
 
 use crate::error::{CacheError, CacheResult, OriginError};
@@ -56,10 +59,12 @@ struct Inner {
     /// Hashes the operator has explicitly evicted via [`CacheEngine::evict`]
     /// (issue #279). Membership is honored by [`CacheEngine::has`] and
     /// [`CacheEngine::get`] so an evicted blob is not served, even though
-    /// the underlying iroh-blobs store may still hold the bytes — iroh-blobs
-    /// 0.99 does not expose a public delete (`Blobs::delete` is `pub(crate)`,
-    /// reserved for the GC task, see issue #233). Reclaim of disk bytes
-    /// happens on the next GC sweep once that lands.
+    /// the underlying iroh-blobs store may still hold the bytes —
+    /// `Blobs::delete` is `pub(crate)` in iroh-blobs and reserved for the
+    /// GC task. Reclaim of disk bytes happens on the next iroh-blobs GC
+    /// sweep, configured via `cache.gc_interval_sec` (#518). On-demand
+    /// reclamation is tracked under #520, blocked on upstream exposing
+    /// the sweep API.
     ///
     /// Persisted alongside the iroh-blobs store at `<cache_dir>/evicted.log`
     /// on every successful [`CacheEngine::evict`] call so DMCA takedowns and
@@ -84,6 +89,42 @@ struct Inner {
     /// retry loop bumps `origin_retry_exhausted` on terminal exhaustion.
     /// `None` in tests / non-metrics builds — bumps short-circuit.
     metrics: Option<Arc<CacheMetrics>>,
+    /// Strong reference to the GC callback's late-bound `FsStore`
+    /// handle (#518). `Some` when `gc_interval > 0` was passed to
+    /// [`CacheEngine::open_full`], `None` when GC is disabled.
+    ///
+    /// **Why this lives here:** iroh-blobs spawns its GC loop on its
+    /// internal runtime when `Options.gc` is set. The loop's cb captures
+    /// a [`Weak<OnceLock<FsStore>>`] rather than a strong `Arc`, so the
+    /// cb itself contributes no strong refcount to the iroh-blobs
+    /// `FsStore` handle. When this `Inner` drops, the strong `Arc` here
+    /// drops with it; subsequent cb fires see `Weak::upgrade -> None`
+    /// and silently no-op (no metric writes, no work) — the cb is no
+    /// longer wedged in a cycle that keeps it alive.
+    ///
+    /// **What this does NOT do:** the iroh-blobs GC loop itself
+    /// (`run_gc(store: Store, ...)`) owns its own `Store` clone for the
+    /// lifetime of its `loop`, separate from anything in `Inner`. So
+    /// `Inner.drop()` does not shut iroh-blobs' internal runtime down;
+    /// the runtime sits resident-but-idle until the surrounding process
+    /// exits (or until `gc_run_once` errors and breaks the loop). For
+    /// the current single-engine, process-lifetime model this is
+    /// benign. #520 tracks driving the loop ourselves once iroh-blobs
+    /// exposes `gc_run_once`, at which point engine drop will be able
+    /// to abort the loop directly.
+    ///
+    /// **Invariant:** no `Arc::clone` of this field may escape `Inner`.
+    /// Cloning the strong `Arc` into a longer-lived owner would re-
+    /// introduce a cb-side strong ref via the round-trip and defeat
+    /// the cycle-break, leaving the cb running with a populated
+    /// `Weak` past engine drop.
+    ///
+    /// `dead_code` is allowed because nothing *reads* this field —
+    /// its only purpose is keeping the `Arc` strong-ref alive for the
+    /// lifetime of `Inner`. The `Weak` captured into the cb is the
+    /// reading party.
+    #[allow(dead_code)]
+    gc_store_handle: Option<Arc<OnceLock<FsStore>>>,
 }
 
 /// Coarse-grained cache statistics.
@@ -193,7 +234,7 @@ pub struct PinDiff {
 /// All fields reflect the *underlying* cache state — `size_bytes` reads
 /// from the iroh-blobs store directly, so a hash that has already been
 /// logically evicted (and whose bytes are still on disk pending the
-/// follow-up GC sweep in #233) still reports its on-disk size here.
+/// follow-up GC sweep in #518) still reports its on-disk size here.
 /// That keeps dry-run honest about disk reclaim potential rather than
 /// hiding it once the operator has flipped the evicted flag.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -400,6 +441,158 @@ const fn hex_digit(c: u8) -> Option<u8> {
     }
 }
 
+/// `add_protected` body for [`CacheEngine::open_full`]'s GC wiring (#518).
+///
+/// Runs once per iroh-blobs sweep cycle, before `gc_run_once`. Snapshots
+/// the current blob set, attributes "what disappeared since the last
+/// snapshot" to the previous sweep's reclaim, bumps the cache metrics,
+/// and saves the snapshot for the next cycle's diff. Always returns
+/// without adding any hashes to `live` — named-tag promotion in
+/// [`CacheEngine::pull_through`] and `TempTag` lifetimes are what protect
+/// cached / in-progress blobs; this callback is purely instrumentation.
+///
+/// **Why the spawn-and-wait dance:** iroh-blobs requires the
+/// `ProtectCb` future to be `Send + Sync`, but its own RPC layer
+/// (`blobs().list().stream()`, `blobs().status(...)`) returns futures
+/// that are only `Send`. Awaiting those directly here would leak the
+/// non-Sync constraint into our outer future. Spawning the snapshot
+/// work on a separate task and awaiting a [`tokio::sync::oneshot`]
+/// receiver (Send + Sync as long as `T: Send`) gives the outer future
+/// the auto-trait shape iroh-blobs demands.
+///
+/// **Errors are logged and dropped, never propagated as `Abort`.** Any
+/// future refactor that wants to surface them should keep returning
+/// [`ProtectOutcome::Continue`] — `Abort` would skip the sweep itself,
+/// letting the disk-leak threat the GC was added to mitigate keep
+/// growing. The next cycle's snapshot recovers the count attribution as
+/// long as the store eventually services the list/status calls.
+///
+/// **Engine-drop semantics:** `store_handle` is a [`Weak`] of the
+/// `Arc<OnceLock<FsStore>>` that lives in `Inner.gc_store_handle`.
+/// When the engine drops, that strong `Arc` drops with it, the
+/// `Weak::upgrade` here returns `None`, and the cb returns silently —
+/// no metric writes, no work, no contribution to the cb's surviving
+/// strong-ref graph. iroh-blobs' GC loop itself owns its own `Store`
+/// clone (via `run_gc(store: Store, ...)`) and keeps running for the
+/// rest of the process lifetime; that's an upstream design constraint
+/// tracked under #520. What this `Weak` ensures is that the cb body
+/// no-ops cleanly past engine drop rather than spuriously snapshotting
+/// or bumping metrics on a drained engine.
+async fn gc_protect_callback(
+    store_handle: Weak<OnceLock<FsStore>>,
+    prev_pre_sweep: Arc<Mutex<HashMap<Hash, u64>>>,
+    metrics: Option<Arc<CacheMetrics>>,
+) {
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        gc_protect_inner(store_handle, prev_pre_sweep, metrics).await;
+        let _ = tx.send(());
+    });
+    if let Err(err) = rx.await {
+        // The spawned task panicked or was dropped before sending.
+        // Surface it: a panic in `gc_protect_inner` would otherwise be
+        // invisible (this cb just returns `Continue` either way).
+        tracing::warn!(%err, "gc protect spawn dropped without completing; metrics may have skipped a cycle");
+    }
+}
+
+async fn gc_protect_inner(
+    store_handle: Weak<OnceLock<FsStore>>,
+    prev_pre_sweep: Arc<Mutex<HashMap<Hash, u64>>>,
+    metrics: Option<Arc<CacheMetrics>>,
+) {
+    // `Weak::upgrade` returning `None` is the post-engine-drop steady
+    // state: `Inner.gc_store_handle` (the strong `Arc`) has dropped,
+    // the iroh-blobs runtime is in the process of being aborted, and
+    // any further cb fires before the abort lands have nothing to
+    // measure against. Quietly skip — this is not an error.
+    let Some(store_arc) = store_handle.upgrade() else {
+        return;
+    };
+    let Some(store) = store_arc.get() else {
+        // Practically unreachable: iroh-blobs' `run_gc` calls `sleep`
+        // first, and we `set` the OnceLock immediately after
+        // `load_with_opts` returns. A `None` here would mean a future
+        // refactor enabled near-zero intervals or moved the `set`. Log
+        // and skip rather than panic.
+        tracing::warn!("gc protect callback fired before store handle was set");
+        return;
+    };
+
+    let current = match snapshot_blob_sizes(store).await {
+        Ok(snap) => snap,
+        Err(err) => {
+            tracing::warn!(%err, "gc snapshot failed; skipping reclaim attribution this cycle");
+            return;
+        }
+    };
+
+    let reclaimed_bytes: u64 = {
+        // Surface poison: this mutex guards metrics-only state, so a
+        // poisoned lock means a *prior* invocation of this function
+        // panicked while holding the guard (i.e., somewhere in the
+        // diff/fold loop). Different from the operational mutexes
+        // (`evicted`, `access_times`) where silent recovery is correct.
+        // Recover the inner state to keep metrics flowing — the next
+        // cycle re-establishes a baseline — but log once so the panic
+        // doesn't hide.
+        let mut guard = match prev_pre_sweep.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                tracing::warn!("gc prev_pre_sweep mutex poisoned; recovering inner state");
+                poisoned.into_inner()
+            }
+        };
+        let bytes = guard
+            .iter()
+            .filter(|(hash, _)| !current.contains_key(*hash))
+            .fold(0u64, |acc, (_, size)| acc.saturating_add(*size));
+        *guard = current;
+        bytes
+    };
+
+    if let Some(m) = metrics.as_ref() {
+        m.gc_runs.inc();
+        m.gc_bytes_reclaimed.inc_by(reclaimed_bytes);
+    }
+}
+
+/// Snapshot the iroh-blobs blob set keyed by hash, with each entry's
+/// size in bytes. Used by [`gc_protect_callback`] to diff sweep cycles
+/// (#518). Hashes that race the snapshot (deleted between `list` and
+/// `status`) report `BlobStatus::NotFound` and are dropped — they
+/// cannot have contributed bytes either way.
+///
+/// `Partial` blobs report whatever size iroh-blobs has on disk so far
+/// (`None` when the store can't tell us, treated as zero). Including
+/// partials matters: the threat model that motivated #518 is exactly
+/// the partial-import case (`add_stream` errored mid-flight, the
+/// `TempTag` was dropped, but the bytes already on disk are what we
+/// want GC to reclaim).
+async fn snapshot_blob_sizes(store: &FsStore) -> CacheResult<HashMap<Hash, u64>> {
+    let blobs = store.blobs();
+    let mut stream = blobs
+        .list()
+        .stream()
+        .await
+        .map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
+    let mut out = HashMap::new();
+    while let Some(hash) = stream.next().await {
+        let hash = hash.map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
+        let status = blobs
+            .status(hash)
+            .await
+            .map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
+        let size = match status {
+            iroh_blobs::api::blobs::BlobStatus::NotFound => continue,
+            iroh_blobs::api::blobs::BlobStatus::Partial { size } => size.unwrap_or(0),
+            iroh_blobs::api::blobs::BlobStatus::Complete { size } => size,
+        };
+        out.insert(hash, size);
+    }
+    Ok(out)
+}
+
 /// Append `hash` to the evicted log with `fsync` before returning. The
 /// caller relies on the durability guarantee — a return-without-error
 /// means a crash now will replay the eviction on the next `open`.
@@ -437,10 +630,11 @@ impl CacheEngine {
     /// [`ArcSwap`] internally so subsequent SIGHUP reloads can call
     /// [`Self::set_pinned`] without rebuilding the engine.
     ///
-    /// Defaults the retry policy to [`RetryPolicy::default`] and wires no
-    /// metrics handle. Use [`Self::open_full`] to override either — the
-    /// node crate plugs in its `Arc<CacheMetrics>` and the operator-
-    /// configured policy through that path.
+    /// Defaults the retry policy to [`RetryPolicy::default`], wires no
+    /// metrics handle, and disables periodic GC. Use [`Self::open_full`] to
+    /// override any of those — the node crate plugs in its
+    /// `Arc<CacheMetrics>`, the operator-configured retry policy, and the
+    /// `cache.gc_interval_sec` through that path.
     pub async fn open_with_pinned(
         cache_dir: &Path,
         origin: Option<Arc<dyn Origin>>,
@@ -454,14 +648,30 @@ impl CacheEngine {
             pinned,
             RetryPolicy::default(),
             None,
+            Duration::ZERO,
         )
         .await
     }
 
-    /// Open the cache with full control over policy and metrics wiring.
+    /// Open the cache with full control over policy, metrics, and GC wiring.
     /// Production callers (the runtime's `build_cache`) use this directly;
     /// tests usually want [`Self::open`] or [`Self::open_with_pinned`]
     /// with their defaults.
+    ///
+    /// `gc_interval` controls iroh-blobs' built-in GC sweep loop (#518).
+    /// [`Duration::ZERO`] disables periodic GC; any other value is forwarded
+    /// to [`iroh_blobs::store::GcConfig`] and iroh-blobs spawns its own GC
+    /// task on its internal runtime. Reclaimable bytes accumulate between
+    /// sweeps — set the interval based on how much disk you're willing to
+    /// lose to a hostile-origin amplification window.
+    ///
+    /// **Why iroh-blobs drives the loop instead of us:** the sweep
+    /// function (`gc::gc_run_once`) lives in iroh-blobs 0.100's private
+    /// `store::gc` module and is not re-exported, and `Blobs::delete`
+    /// is `pub(crate)`. The only externally-reachable trigger is
+    /// `Options::gc`. #520 tracks switching to a runtime-driven loop
+    /// with manual on-demand GC (`admin_v1_cacheGc` / `decdn node gc`)
+    /// once upstream exposes the sweep API.
     pub async fn open_full(
         cache_dir: &Path,
         origin: Option<Arc<dyn Origin>>,
@@ -469,14 +679,73 @@ impl CacheEngine {
         pinned: PinnedHashes,
         retry_policy: RetryPolicy,
         metrics: Option<Arc<CacheMetrics>>,
+        gc_interval: Duration,
     ) -> CacheResult<Self> {
         tokio::fs::create_dir_all(cache_dir)
             .await
             .map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
 
-        let store = FsStore::load(cache_dir)
+        // Late-bound store handle for the GC `add_protected` callback. The
+        // callback is captured into `Options.gc` *before* `FsStore` exists,
+        // but the cb needs to query `blobs().list()` to compute the
+        // pre-sweep snapshot. Solution: build `Arc<OnceLock<FsStore>>` here,
+        // capture a `Weak` into the cb, and `set` the OnceLock as soon as
+        // the store handle is in hand. The strong `Arc` is moved into
+        // `Inner.gc_store_handle` so its lifetime tracks the engine; on
+        // engine drop the cb's `Weak::upgrade` returns `None`, which is
+        // exactly what breaks the cb → `FsStore` clone → iroh-blobs actor
+        // → GC task → cb cycle.
+        //
+        // `None` when GC is disabled — no cb is registered, so no late-
+        // bind handle is needed.
+        let gc_store_handle: Option<Arc<OnceLock<FsStore>>> = if gc_interval.is_zero() {
+            None
+        } else {
+            Some(Arc::new(OnceLock::new()))
+        };
+
+        // Previous-cycle pre-sweep snapshot. The cb runs once per cycle
+        // *before* `gc_run_once`, so the diff between the snapshot saved
+        // last cycle and the snapshot taken this cycle is exactly the
+        // hash set the previous sweep deleted (the cache crate has no
+        // other public delete path: `Blobs::delete` is `pub(crate)` in
+        // iroh-blobs 0.100). Bytes for that diff is what the previous
+        // sweep reclaimed; we attribute it on the *current* cb fire.
+        // First-cycle fires bump the runs counter but emit zero on
+        // the reclaim counter because there is no prior snapshot.
+        let prev_pre_sweep: Arc<Mutex<HashMap<Hash, u64>>> = Arc::new(Mutex::new(HashMap::new()));
+
+        let mut options = FsStoreOptions::new(cache_dir);
+        if let Some(strong) = gc_store_handle.as_ref() {
+            let store_weak: Weak<OnceLock<FsStore>> = Arc::downgrade(strong);
+            let prev_for_cb = Arc::clone(&prev_pre_sweep);
+            let metrics_for_cb = metrics.clone();
+            options.gc = Some(GcConfig {
+                interval: gc_interval,
+                add_protected: Some(Arc::new(move |_live: &mut HashSet<Hash>| {
+                    let store_weak = store_weak.clone();
+                    let prev_for_cb = Arc::clone(&prev_for_cb);
+                    let metrics_for_cb = metrics_for_cb.clone();
+                    Box::pin(async move {
+                        gc_protect_callback(store_weak, prev_for_cb, metrics_for_cb).await;
+                        ProtectOutcome::Continue
+                    })
+                })),
+            });
+        }
+
+        let db_path = cache_dir.join("blobs.db");
+        let store = FsStore::load_with_opts(db_path, options)
             .await
             .map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
+
+        // Late-bind: the cb's `Weak<OnceLock<FsStore>>` can now upgrade
+        // and `.get()` to reach the store handle. `set` only fails if
+        // the OnceLock was already populated, which can't happen on
+        // this code path (we just constructed it).
+        if let Some(strong) = gc_store_handle.as_ref() {
+            let _ = strong.set(store.clone());
+        }
 
         // Saturate-on-overflow: an operator setting `max_blob_mb = u64::MAX`
         // as a de-facto "unlimited" value should still yield a usable byte cap
@@ -498,6 +767,7 @@ impl CacheEngine {
                 evicted_log_path,
                 retry_policy,
                 metrics,
+                gc_store_handle,
             }),
         })
     }
@@ -559,9 +829,11 @@ impl CacheEngine {
     /// respectively). The corresponding [`Self::access_times_snapshot`] entry
     /// is cleared so future LRU sweeps don't re-surface the hash.
     ///
-    /// This is a *logical* evict: iroh-blobs 0.99 does not expose a public
-    /// `delete` API (see issue #233), so the bytes remain on disk until the
-    /// internal GC sweep reclaims them. The operator-visible behavior — the
+    /// This is a *logical* evict: `Blobs::delete` is `pub(crate)` in
+    /// iroh-blobs and reserved for the GC task, so the bytes remain on
+    /// disk until the next iroh-blobs GC sweep reclaims them (#518; the
+    /// sweep cadence is `cache.gc_interval_sec`, default 5min).
+    /// The operator-visible behavior — the
     /// node stops serving the blob immediately — is what `decdn node evict`
     /// (issue #279) needs for use cases like DMCA takedown and corruption
     /// recovery.
@@ -1064,11 +1336,12 @@ impl CacheEngine {
             // log line — the primary error returned to the
             // caller is still `HashMismatch`.
             //
-            // **Known limitation:** the wrong-hash bytes still
-            // occupy disk until iroh-blobs GC runs (and the
-            // current `decdn-node` runtime does not yet wire up
-            // iroh-blobs GC). Tracked under #233 follow-up.
-            // Until that lands, a malicious origin can amplify
+            // The wrong-hash bytes still occupy disk until
+            // iroh-blobs' periodic GC sweep runs them down;
+            // iroh-blobs spawns the loop internally when
+            // `cache.gc_interval_sec > 0` (#518). On-demand
+            // reclamation is tracked under #520. Until the
+            // next sweep lands, a malicious origin can amplify
             // disk usage by repeatedly streaming
             // `max_blob_bytes - 1` of garbage and erroring on
             // the last byte.
@@ -1487,6 +1760,7 @@ mod tests {
             crate::PinnedHashes::empty(),
             crate::RetryPolicy::default(),
             Some(Arc::clone(&cm)),
+            Duration::ZERO,
         )
         .await?;
 
@@ -1944,8 +2218,9 @@ mod tests {
     }
 
     /// `inspect` after `evict` must still report the on-disk
-    /// `size_bytes` (until #233 reclaims) but flip `already_evicted`
-    /// to `true` and `served` to `false`. The size-still-reported part
+    /// `size_bytes` (until iroh-blobs' periodic GC sweep reclaims, #518)
+    /// but flip `already_evicted` to `true` and `served` to `false`.
+    /// The size-still-reported part
     /// is the load-bearing assertion: dry-run callers want to see
     /// disk-reclaim potential, not a clean `None` that hides the bytes.
     #[tokio::test]
@@ -2053,6 +2328,7 @@ mod tests {
             crate::PinnedHashes::empty(),
             crate::RetryPolicy::default(),
             Some(Arc::clone(&cm)),
+            Duration::ZERO,
         )
         .await?;
 
@@ -2097,6 +2373,7 @@ mod tests {
             crate::PinnedHashes::empty(),
             crate::RetryPolicy::default(),
             Some(Arc::clone(&cm)),
+            Duration::ZERO,
         )
         .await?;
 
@@ -2122,6 +2399,7 @@ mod tests {
             crate::PinnedHashes::empty(),
             crate::RetryPolicy::default(),
             Some(Arc::clone(&cm)),
+            Duration::ZERO,
         )
         .await?;
 
@@ -2146,6 +2424,7 @@ mod tests {
             crate::PinnedHashes::empty(),
             crate::RetryPolicy::default(),
             Some(Arc::clone(&cm)),
+            Duration::ZERO,
         )
         .await?;
 
@@ -2184,6 +2463,7 @@ mod tests {
             crate::PinnedHashes::empty(),
             crate::RetryPolicy::default(),
             Some(Arc::clone(&cm)),
+            Duration::ZERO,
         )
         .await?;
 
@@ -2220,6 +2500,7 @@ mod tests {
             crate::PinnedHashes::empty(),
             crate::RetryPolicy::default(),
             Some(Arc::clone(&cm)),
+            Duration::ZERO,
         )
         .await?;
 

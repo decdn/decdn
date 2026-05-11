@@ -706,6 +706,7 @@ async fn build_cache(
         cfg.cache.pinned_hashes.clone(),
         cfg.cache.origin_retry,
         Some(node_metrics.cache_metrics()),
+        std::time::Duration::from_secs(cfg.cache.gc_interval_sec),
     )
     .await
     .context("failed to open cache engine")
@@ -1089,6 +1090,7 @@ mod tests {
                 pinned_hashes: decdn_cache::PinnedHashes::empty(),
                 origin_retry: decdn_cache::RetryPolicy::default(),
                 user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
+                gc_interval_sec: 0,
             },
             payment: ResolvedPayment { rate_per_mb: 10 },
             observability: ResolvedObservability {

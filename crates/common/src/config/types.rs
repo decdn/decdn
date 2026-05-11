@@ -113,6 +113,15 @@ pub struct CacheConfig {
     /// policy that distinguish CDN pulls from end-user clients. Empty
     /// string is rejected at resolution.
     pub user_agent: Option<String>,
+    /// Interval between iroh-blobs GC sweeps in seconds (#518). Absent =>
+    /// [`crate::config::DEFAULT_GC_INTERVAL_SEC`]. Set to `0` to disable
+    /// the periodic sweep — operators with external disk-reclaim
+    /// scheduling can opt out, accepting that bytes orphaned by
+    /// hash-mismatch / mid-stream-error pull-through paths leak until
+    /// they manually reset state. Tighter intervals shrink the
+    /// hostile-origin amplification window at the cost of more
+    /// list+sweep CPU per minute.
+    pub gc_interval_sec: Option<u64>,
 }
 
 /// Origin backend selection (#437). Tagged on the inner `kind` field.

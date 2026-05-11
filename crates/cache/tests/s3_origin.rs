@@ -14,6 +14,7 @@
 //! suite covering [`decdn_cache::HttpOrigin`].
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use aws_sdk_s3::Client;
 use aws_sdk_s3::operation::get_object::{GetObjectError, GetObjectOutput};
@@ -312,6 +313,7 @@ async fn cache_engine_retries_transient_via_origin_retry_policy() -> anyhow::Res
         decdn_cache::PinnedHashes::empty(),
         policy,
         None,
+        Duration::ZERO,
     )
     .await?;
 
@@ -546,6 +548,7 @@ async fn cache_engine_miss_pulls_from_s3_and_caches() -> anyhow::Result<()> {
         decdn_cache::PinnedHashes::empty(),
         RetryPolicy::disabled(),
         None,
+        Duration::ZERO,
     )
     .await?;
 
@@ -600,6 +603,7 @@ async fn cache_engine_rejects_s3_body_larger_than_max_blob_bytes() -> anyhow::Re
         decdn_cache::PinnedHashes::empty(),
         RetryPolicy::disabled(),
         None,
+        Duration::ZERO,
     )
     .await?;
 
