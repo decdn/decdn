@@ -377,6 +377,7 @@ jobs:
           globs: |
             **/*.md
             !.github/agents/**
+            !.github/workflows/*.md
           config: ".markdownlint.yaml"
 
   # Pytest suite for .github/scripts/coverage-diff.py. Non-blocking by design
