@@ -256,4 +256,70 @@ mod tests {
         let d = p.delay_for(10_000);
         assert_eq!(d.as_millis(), 60_000);
     }
+
+    #[test]
+    fn delay_for_jitter_stays_within_equal_jitter_band() {
+        // Equal jitter (per the doc on `jitter_ratio`) produces delays in
+        // [base*(1 - r/2), base*(1 + r/2)). The existing
+        // `delay_for_clamps_jitter_above_one` only exercises the clamp
+        // boundary (r > 1.0); pin a few non-clamped ratios so a future
+        // tweak to the formula trips here.
+        // base = 1000 ms; bounds precomputed to avoid float→int casts.
+        let cases: &[(f64, u128, u128)] = &[
+            (0.1, 950, 1050),  // ±5%
+            (0.25, 875, 1125), // ±12.5%
+            (0.5, 750, 1250),  // ±25%
+            (1.0, 500, 1500),  // ±50% (full equal-jitter)
+        ];
+        for &(jitter_ratio, lower, upper) in cases {
+            let p = RetryPolicy {
+                max_retries: 1,
+                initial_backoff_ms: 1000,
+                max_backoff_ms: 10_000,
+                jitter_ratio,
+            };
+            for _ in 0..256 {
+                let ms = p.delay_for(0).as_millis();
+                assert!(
+                    (lower..upper).contains(&ms),
+                    "ratio={jitter_ratio}: sample {ms} not in [{lower}, {upper})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn delay_for_zero_jitter_is_deterministic() {
+        // With ratio=0.0 the equal-jitter factor collapses to exactly 1.0,
+        // so every call must return the same value — what tests that pin
+        // an expected sleep schedule rely on.
+        let p = RetryPolicy {
+            max_retries: 5,
+            initial_backoff_ms: 100,
+            max_backoff_ms: 10_000,
+            jitter_ratio: 0.0,
+        };
+        let baseline = p.delay_for(2);
+        assert_eq!(baseline.as_millis(), 400);
+        for _ in 0..16 {
+            assert_eq!(p.delay_for(2), baseline);
+        }
+    }
+
+    #[test]
+    fn delay_for_zero_initial_backoff_is_zero_regardless_of_jitter() {
+        // Edge case: `initial_backoff_ms = 0` collapses the base to 0 at
+        // every attempt, and the jitter factor scales 0 to 0. Pin this so
+        // an operator who disables backoff via initial=0 (rather than
+        // `max_retries = 0`) gets a predictable schedule.
+        let p = RetryPolicy {
+            max_retries: 3,
+            initial_backoff_ms: 0,
+            max_backoff_ms: 10_000,
+            jitter_ratio: 0.5,
+        };
+        for attempt in 0..8 {
+            assert_eq!(p.delay_for(attempt), Duration::ZERO);
+        }
+    }
 }
