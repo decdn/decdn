@@ -57,10 +57,15 @@ const CHANNEL_TABLE: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("c
 /// making manual inspection straightforward.
 ///
 /// `schema_version` lives in the value (not the table name) so a future
-/// additive field on this struct can ship without renaming the table —
-/// postcard's tolerance for trailing unknown bytes lets a reader carrying
-/// an older `SUPPORTED_SCHEMA_VERSION` still decode the prefix it
-/// understands. Breaking shape changes still require bumping the table name.
+/// additive field on this struct can ship without renaming the table.
+/// Forward-compat requires the decode site to use [`postcard::take_from_bytes`]
+/// (which returns `(T, &[u8])` and tolerates trailing unknown bytes) rather
+/// than [`postcard::from_bytes`] (which is strict and errors with
+/// `DeserializeTrailingBytes`). A reader carrying an older
+/// `SUPPORTED_SCHEMA_VERSION` can then decode the prefix it understands and
+/// ignore additive fields a newer writer appended. Breaking shape changes
+/// (field removal, field reorder, type change) still require bumping the
+/// table name to a new `channel_state_vN` and a one-shot migration on open.
 #[derive(Debug, Serialize, Deserialize)]
 struct StoredChannelState {
     schema_version: u32,
@@ -131,11 +136,19 @@ impl PersistentChannelStateStore {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Io`] if the data directory check fails or the
-    /// file cannot be opened, and [`StoreError::Backend`] for any redb
-    /// failure (corrupt magic, truncation, etc.). When this returns `Err`,
-    /// the caller MUST abort node bring-up — starting with a clean store
-    /// silently forfeits the issue #527 guarantee.
+    /// - [`StoreError::Backend`] when the `data_dir` security check fails
+    ///   (wrong mode, not a directory, etc.) or `redb::Database::create`
+    ///   refuses the file (corrupt magic, truncated header, etc.).
+    /// - [`StoreError::Corrupt`] when the file exists but is zero-length —
+    ///   `redb` would otherwise treat that as "create a fresh database"
+    ///   and silently reopen the issue #527 replay window. The variant's
+    ///   `detail` field names the file path and how to recover.
+    /// - [`StoreError::Io`] for any other filesystem error encountered
+    ///   while stat-ing the file or applying the post-create chmod.
+    ///
+    /// When this returns `Err`, the caller MUST abort node bring-up —
+    /// starting with a clean store silently forfeits the issue #527
+    /// guarantee.
     pub fn open(data_dir: &Path) -> Result<Self, StoreError> {
         identity::ensure_data_dir(data_dir).map_err(|err| {
             StoreError::Backend(format!(
@@ -155,7 +168,12 @@ impl PersistentChannelStateStore {
         // successful commit the file is non-zero forever in normal
         // operation, so this check is precise: zero-length on disk means
         // the store has been deliberately or accidentally wiped.
-        match std::fs::metadata(&path) {
+        //
+        // We also record whether the file pre-existed so a subsequent
+        // chmod failure can distinguish "we just created this file" (safe
+        // to remove on cleanup) from "the operator has months of voucher
+        // state here" (MUST NOT remove on a transient permission error).
+        let file_existed_before_open = match std::fs::metadata(&path) {
             Ok(meta) if meta.len() == 0 => {
                 return Err(StoreError::Corrupt {
                     channel_id: None,
@@ -169,12 +187,10 @@ impl PersistentChannelStateStore {
                     ),
                 });
             }
-            Ok(_) => { /* non-empty file — let redb decide if it's valid */ }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                // First start: redb will create the file. Proceed.
-            }
+            Ok(_) => true,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
             Err(err) => return Err(StoreError::Io(err)),
-        }
+        };
 
         let db = Database::create(&path).map_err(|err| {
             StoreError::Backend(format!(
@@ -185,24 +201,31 @@ impl PersistentChannelStateStore {
             ))
         })?;
 
-        // If the permission tighten fails after Database::create has
-        // already touched disk, the file would be left behind with the
-        // umask-default mode (typically 0o644). Defense-in-depth: drop the
-        // open handle and remove the partial file so the next start
-        // observes a clean "not found" state rather than an out-of-spec
-        // file. We deliberately re-surface the original chmod error after
-        // cleanup so the operator sees the root cause, not the secondary
-        // remove status.
+        // If the permission tighten fails, behaviour depends on whether
+        // the file existed before this `open` call. For a fresh file
+        // (first-ever start, file just created by `Database::create`),
+        // remove the partial file so the next start observes a clean
+        // "not found" state rather than an out-of-spec file with
+        // umask-default mode. For a pre-existing file (subsequent start
+        // with real voucher state on disk), do NOT remove: a transient
+        // chmod failure on a read-only mount or NFS would otherwise
+        // delete the live store and silently reopen the issue #527
+        // replay window. In that case the operator gets the chmod error
+        // back and must investigate; the existing file mode is whatever
+        // it was on disk before this start (typically already 0o600
+        // from a prior successful open).
         if let Err(chmod_err) = Self::tighten_permissions(&path) {
             drop(db);
-            // Best-effort cleanup; if remove_file itself fails we log and
-            // still return the original chmod error — re-opening will hit
-            // the empty-file guard above and refuse to start cleanly.
-            if let Err(remove_err) = std::fs::remove_file(&path) {
+            if file_existed_before_open {
+                tracing::warn!(
+                    path = %path.display(),
+                    "chmod failed on pre-existing channel store; refusing to delete it (would reopen issue #527 replay window). Investigate the permission error.",
+                );
+            } else if let Err(remove_err) = std::fs::remove_file(&path) {
                 tracing::warn!(
                     %remove_err,
                     path = %path.display(),
-                    "failed to remove partially-created channel store after chmod failure",
+                    "failed to remove freshly-created channel store after chmod failure",
                 );
             }
             return Err(chmod_err);
@@ -258,8 +281,14 @@ impl ChannelStateStore for PersistentChannelStateStore {
             let key_bytes: [u8; 32] = *key_guard.value();
             let channel_id = B256::from(key_bytes);
             let value_bytes = value_guard.value();
-            let stored: StoredChannelState =
-                postcard::from_bytes(value_bytes).map_err(|err| StoreError::Corrupt {
+            // `take_from_bytes` instead of `from_bytes` so a newer writer's
+            // additive fields (which appear as trailing bytes to an older
+            // reader) decode cleanly — see `StoredChannelState`'s doc and
+            // the schema-version handshake in `into_state`. The remainder
+            // is intentionally discarded: the schema_version field gates
+            // whether to reject the record entirely.
+            let (stored, _remainder): (StoredChannelState, &[u8]) =
+                postcard::take_from_bytes(value_bytes).map_err(|err| StoreError::Corrupt {
                     channel_id: Some(channel_id),
                     detail: format!("postcard decode failed: {err}"),
                 })?;
@@ -481,6 +510,45 @@ mod tests {
                         && supported == SUPPORTED_SCHEMA_VERSION,
             ),
             "expected UnsupportedSchema, got {err:?}",
+        );
+        Ok(())
+    }
+
+    /// **Forward-compat regression.** A newer writer adding an additive
+    /// field appears to an older reader as trailing bytes after the known
+    /// `StoredChannelState` prefix. With `postcard::take_from_bytes` those
+    /// trailing bytes are ignored and the record decodes cleanly; with the
+    /// previous `from_bytes` they would have triggered
+    /// `DeserializeTrailingBytes` and the record would be misclassified
+    /// as `Corrupt`. This test would have failed under the old
+    /// implementation and is the regression guard against re-introducing
+    /// strict decoding.
+    #[test]
+    fn extra_trailing_bytes_are_tolerated() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let store = PersistentChannelStateStore::open(dir.path())?;
+        let s = sample(0x42);
+        let key: [u8; 32] = s.channel_id.into();
+
+        // Encode the real record, then append plausible additive-field
+        // bytes (simulating what a future schema would write).
+        let mut encoded = postcard::to_allocvec(&StoredChannelState::from(&s))?;
+        encoded.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02, 0x03]);
+
+        let mut tx = store.db.begin_write()?;
+        tx.set_durability(Durability::Immediate)?;
+        {
+            let mut t = tx.open_table(CHANNEL_TABLE)?;
+            t.insert(&key, encoded.as_slice())?;
+        }
+        tx.commit()?;
+
+        let all = store.load_all()?;
+        anyhow::ensure!(all.len() == 1, "expected one channel, got {}", all.len());
+        let only = all.first().ok_or_else(|| anyhow::anyhow!("missing"))?;
+        anyhow::ensure!(
+            *only == s,
+            "decoded prefix must equal the original record despite trailing bytes",
         );
         Ok(())
     }
