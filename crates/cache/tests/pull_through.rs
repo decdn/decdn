@@ -1938,6 +1938,60 @@ impl Origin for FailingThenSucceedingOrigin {
     }
 }
 
+/// Origin that sleeps for a fixed `delay` before serving a successful
+/// `OriginFetch::Found(payload)`. The delay forces every concurrent
+/// `CacheEngine::get` caller to reach the coalescing table before the
+/// first owner's fetch completes — without it, an instantaneous fetch
+/// can finish before any waiter is even scheduled, making a coalescing
+/// assertion trivially pass for the wrong reason. Counts every fetch.
+#[derive(Debug)]
+struct SlowOnceOrigin {
+    payload: bytes::Bytes,
+    target: Hash,
+    fetch_count: std::sync::atomic::AtomicUsize,
+    delay: Duration,
+}
+
+impl SlowOnceOrigin {
+    fn new(payload: &[u8], delay: Duration) -> Self {
+        Self {
+            target: Hash::new(payload),
+            payload: bytes::Bytes::from(payload.to_vec()),
+            fetch_count: std::sync::atomic::AtomicUsize::new(0),
+            delay,
+        }
+    }
+    fn fetches(&self) -> usize {
+        self.fetch_count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Origin for SlowOnceOrigin {
+    fn kind(&self) -> OriginKind {
+        OriginKind::Http
+    }
+
+    fn fetch(
+        &self,
+        hash: Hash,
+        _max_bytes: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>> {
+        self.fetch_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let target = self.target;
+        let payload = self.payload.clone();
+        let delay = self.delay;
+        Box::pin(async move {
+            tokio::time::sleep(delay).await;
+            if hash == target {
+                Ok(OriginFetch::found_one_shot(payload))
+            } else {
+                Ok(OriginFetch::NotFound)
+            }
+        })
+    }
+}
+
 /// Origin that always returns `OriginPullError::Permanent` and counts
 /// attempts. Used to verify the retry loop short-circuits on permanent
 /// errors.
@@ -2230,6 +2284,47 @@ async fn coalesced_owner_exhaustion_bounded_by_serial_owner_count() -> anyhow::R
     anyhow::ensure!(
         attempts >= no_coalesce_minimum,
         "attempts={attempts} below the minimum {no_coalesce_minimum} — retry never ran?",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn coalesced_concurrent_misses_fire_origin_exactly_once() -> anyhow::Result<()> {
+    // Minimal happy-path companion to
+    // `coalesced_owner_retry_unblocks_waiters_on_success`: many simultaneous
+    // gets for an uncached hash collapse into a single origin pull when no
+    // retry budget is in play. The existing retry-flavoured tests pin
+    // `origin.fetches() == 3` (1 owner * 3 attempts) and a worst-case
+    // ceiling under sustained failure; neither pins the simpler invariant
+    // — `== 1` on the no-failure path — that #530 asks for. A regression
+    // that broke coalescing (e.g. waiters racing past the registration
+    // slot, or duplicate iroh-blobs inserts) would show up here as
+    // fetches > 1 without retry noise muddying the count.
+    //
+    // The 25ms `SlowOnceOrigin` delay forces all 10 spawned tasks to reach
+    // the coalescing table before the first owner's fetch completes —
+    // without it an instantaneous fetch could finish before any waiter
+    // is even scheduled, making the assertion trivially pass.
+    let payload: &[u8] = b"single shared origin fetch";
+    let origin = Arc::new(SlowOnceOrigin::new(payload, Duration::from_millis(25)));
+    let (engine, _tmp) =
+        build_engine_with_retry(origin.clone() as Arc<dyn Origin>, RetryPolicy::disabled()).await?;
+    let hash = Hash::new(payload);
+
+    let mut handles = Vec::new();
+    for _ in 0..10 {
+        let e = engine.clone();
+        handles.push(tokio::spawn(async move { e.get(hash).await }));
+    }
+    for h in handles {
+        let bytes = h.await??;
+        anyhow::ensure!(&bytes[..] == payload);
+    }
+
+    anyhow::ensure!(
+        origin.fetches() == 1,
+        "coalesced concurrent misses must fire origin exactly once, got {}",
+        origin.fetches()
     );
     Ok(())
 }

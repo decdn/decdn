@@ -553,6 +553,7 @@ mod tests {
                 initial_backoff_ms: 1000,
                 max_backoff_ms: 10_000,
                 jitter_ratio,
+                buffered_max_bytes: DEFAULT_BUFFERED_MAX_BYTES,
             };
             for _ in 0..256 {
                 let ms = p.delay_for(0).as_millis();
@@ -574,6 +575,7 @@ mod tests {
             initial_backoff_ms: 100,
             max_backoff_ms: 10_000,
             jitter_ratio: 0.0,
+            buffered_max_bytes: DEFAULT_BUFFERED_MAX_BYTES,
         };
         let baseline = p.delay_for(2);
         assert_eq!(baseline.as_millis(), 400);
@@ -593,6 +595,7 @@ mod tests {
             initial_backoff_ms: 0,
             max_backoff_ms: 10_000,
             jitter_ratio: 0.5,
+            buffered_max_bytes: DEFAULT_BUFFERED_MAX_BYTES,
         };
         for attempt in 0..8 {
             assert_eq!(p.delay_for(attempt), Duration::ZERO);
