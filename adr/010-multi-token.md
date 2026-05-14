@@ -188,9 +188,9 @@ struct TokenInfo {
 }
 ```
 
-At startup, the node calls `IERC20Metadata.decimals()` on each configured token address and compares the result against the `decimals` field in config. **A mismatch is a fatal startup error** — the node refuses to start. A misconfigured `decimals` value silently misprices deliveries by orders of magnitude (see [Consequences § Decimal heterogeneity](#consequences) below); the cost of a fail-start is bounded operational disruption, the cost of starting with a wrong decimal is unbounded financial loss. The on-chain value is cached for the process lifetime; it never changes for a given token contract.
+At startup, the node calls `IERC20Metadata.decimals()` on each configured token address and compares the result against the `decimals` field in config. **A mismatch is a fatal startup error** — the node refuses to start, because a misconfigured `decimals` value silently misprices deliveries by orders of magnitude (see [Consequences § Decimal heterogeneity](#consequences) below). The on-chain value is cached for the process lifetime; it never changes for a given token contract.
 
-Allowlisted tokens MUST implement `IERC20Metadata.decimals()` per the [Token Vetting Checklist](#token-vetting-checklist) below, so this cross-check always has an authoritative on-chain source — there is no try/catch fallback path that defaults to 18 decimals. A token that does not expose `decimals()` cannot pass vetting and cannot be added to the allowlist; the `decimals` field in node config is mandatory and authoritative.
+Allowlisted tokens MUST implement `IERC20Metadata.decimals()` per the [Token Vetting Checklist](#token-vetting-checklist) below, so this cross-check always has an authoritative on-chain source. A token that does not expose `decimals()` cannot pass vetting and cannot be added to the allowlist; the `decimals` field in node config is mandatory and authoritative.
 
 **Node configuration:**
 
