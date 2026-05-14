@@ -14,7 +14,7 @@
 4. **Probe-hold interaction** — how does the [ADR 005](005-protocol.md#probe-triggered-eviction-hold) hold layer compose with cache-pressure eviction?
 5. **Cache size enforcement** — what triggers eviction, and what is the unit?
 
-The existing implementation in `crates/cache/src/engine.rs` already commits to LRU: `access_times: Mutex<HashMap<Hash, Instant>>` (`crates/cache/src/engine.rs:36`) is refreshed by `CacheEngine::touch` on every successful `get`, and `CacheEngine::eviction_candidates` (`crates/cache/src/engine.rs:839`) returns an LRU snapshot with pinned hashes filtered out. The cache size limit is operator-set via `cache_size_mb: Option<u64>` (default `DEFAULT_CACHE_SIZE_MB = 10_240` at `crates/common/src/config/mod.rs`). The driver loop that consumes `eviction_candidates()` is not yet implemented. The hold-queue / cache-size interaction is already specified in [ADR 005 § Hold Budget](005-protocol.md#hold-budget) (`max_probe_holds = 256`, recommended ≤ 25 % of cache capacity) — this appendix cross-references it.
+The existing implementation in `crates/cache/src/engine.rs` already commits to LRU: `access_times: Mutex<HashMap<Hash, Instant>>` (`crates/cache/src/engine.rs:36`) is refreshed by `CacheEngine::touch` on every successful `get`, and `CacheEngine::eviction_candidates` (`crates/cache/src/engine.rs:839`) returns an LRU snapshot with pinned hashes filtered out. The cache size limit is operator-set via `cache_size_mb: Option<u64>` (default `DEFAULT_CACHE_SIZE_MB = 10_240` at `crates/common/src/config/mod.rs`). The driver loop that consumes `eviction_candidates()` is specified in §7 below; its implementation is pending. The hold-queue / cache-size interaction is already specified in [ADR 005 § Hold Budget](005-protocol.md#hold-budget) (`max_probe_holds = 256`, recommended ≤ 25 % of cache capacity) — this appendix cross-references it.
 
 ## Decision
 
@@ -68,6 +68,45 @@ Naming follows [appendix-observability.md § 2.3 Cache Metrics](appendix-observa
 
 `decdn_probe_hold_*` metrics ([appendix § 2.1](appendix-observability.md#21-slash-safety-metrics-all-mandatory)) are owned by ADR 005 and are not redefined here. A sustained non-zero `decdn_probe_hold_violations_total` rate, paired with `decdn_cache_bytes ≈ decdn_cache_size_limit_bytes`, indicates the eviction driver is racing the hold layer — the operator response is to raise `cache.cache_size_mb` or lower `max_probe_holds`, not to disable the hold.
 
+Driver-loop-specific counters are listed in §7 below alongside the driver mechanism they instrument.
+
+### 7. Eviction driver loop
+
+The driver loop is the runtime that consumes `CacheEngine::eviction_candidates()` and removes hashes until the cache footprint is below target. It runs as a single async task owned by the `node` crate's wiring layer (per [appendix-poc-production-seams.md](appendix-poc-production-seams.md)), independent of the cache write path.
+
+#### Trigger and target
+
+| Parameter | Value | Hard bounds | Rationale |
+|---|---:|---|---|
+| `eviction_high_water_pct` | 90 | `[60, 95]` | Above this fraction of `cache.cache_size_mb`, the driver actively evicts. Sized above the 25% probe-hold capacity recommendation so a fully-loaded hold budget plus typical in-flight writes do not accidentally trip the trigger; below 95% to leave headroom for in-flight writes between sweeps. |
+| `eviction_target_pct` | 80 | `[40, 90]` | The driver evicts down to this fraction before returning to idle. The 10-point gap below `eviction_high_water_pct` is the hysteresis band — preventing driver thrash on writes that hover near the trigger. Lower bound 40 prevents governance error from aggressively starving the cache; upper bound 90 enforces a minimum 5-point gap below high-water. |
+
+The driver MUST refuse to start (or reject a SIGHUP reload) if `eviction_target_pct > eviction_high_water_pct - 5` — the hysteresis gap is structural, not a tunable nicety.
+
+#### Per-sweep budget
+
+`eviction_per_sweep_budget = 16` (governable bounds `[1, 256]`). At each tick, the driver removes at most this many candidates before yielding the cache lock. The budget bounds worst-case driver-induced latency on the cache hot path: at typical filesystem-unlink cost ~1 ms per entry, 16 evictions per sweep produce ~16 ms of locked work before yielding. The driver does NOT hold the `eviction_candidates()` snapshot lock across the sweep — it acquires per-hash removal locks, so concurrent reads on unrelated hashes are not blocked.
+
+The driver continues across consecutive ticks until either (a) `decdn_cache_bytes ≤ eviction_target_pct × cache_size_mb_bytes`, or (b) `eviction_candidates()` returns empty (everything pinned, evicted-durably, or held — see §§2–4). Case (b) emits `decdn_cache_evictions_starved_total` and the driver returns to idle until the next tick. The operator response to sustained starvation is to raise `cache.cache_size_mb`, lower `max_probe_holds` ([ADR 005 § Hold Budget](005-protocol.md#hold-budget)), or trim the pinned set ([#276](https://github.com/decdn/decdn/issues/276)) — never to disable any of the three layers.
+
+#### Tick cadence
+
+`eviction_tick_secs = 1` (governable bounds `[1, 60]`). The driver wakes once per second, checks the high-water condition, and sweeps if needed. When the cache is below high-water the tick is near-zero-cost (one comparison plus one yield), so the 1-second default is the floor of what the OS scheduler resolves cleanly; sub-second polling adds CPU cost without recovery benefit.
+
+A future optimization MAY add an event-driven path where cache-write completions notify the driver directly when they cross the high-water threshold, eliminating the up-to-1-second detection lag under bursty load. Not required for the v1 driver — under sustained pressure the timer-based path converges to high-water-bound within one tick.
+
+#### Backstop behaviour
+
+The `cache.cache_size_mb` ceiling is enforced by the driver, not by the cache write path. Writes remain agnostic: they write to disk via iroh-blobs and bump `decdn_cache_bytes`. If sustained pressure exceeds eviction throughput (adversarial fill, runaway pin set, undersized cache), disk-full errors from iroh-blobs propagate to callers as the hard backstop. Operators should treat sustained `decdn_cache_evictions_starved_total > 0` paired with `decdn_cache_bytes` approaching `disk_capacity` as an operational alarm distinct from the in-bounds `decdn_cache_bytes ≈ decdn_cache_size_limit_bytes` operating regime.
+
+#### Metrics
+
+| Metric | Type | Description |
+|---|---|---|
+| `decdn_cache_evictions_sweeps_total` | counter, label `outcome={evicted, starved, idle}` | New: one increment per driver tick. `evicted` if at least one candidate was removed; `starved` if pressure persisted but `eviction_candidates()` returned empty; `idle` if the high-water condition was not met. |
+| `decdn_cache_evictions_starved_total` | counter, unlabeled | New: convenience counter equivalent to `decdn_cache_evictions_sweeps_total{outcome="starved"}` for alerting (avoids requiring label-filtering at scrape time). Emitted alongside the labeled metric. |
+| `decdn_cache_evictions_bytes_total` | counter, unlabeled | New: cumulative bytes freed by the driver via LRU eviction. Pairs with `decdn_cache_evictions_total` (count-based) so dashboards can show both "how many" and "how much" without computing byte/entry products from cache-size estimates. |
+
 ## Consequences
 
 **Positive.**
@@ -80,7 +119,7 @@ Naming follows [appendix-observability.md § 2.3 Cache Metrics](appendix-observa
 **Negative.**
 
 - LRU does not reflect blob *value* — a 10 GB cold blob and a 1 MB cold blob age out at the same rate. A popularity-weighted policy (LFU or hybrid) would serve hit rate marginally better at the cost of bookkeeping and a counter-griefing surface; rejected in *Alternatives*.
-- Until the eviction-driver loop is implemented, `cache.cache_size_mb` is an aspirational ceiling and the cache grows monotonically. The driver loop MUST land before the network is exposed to adversarial fill.
+- Until the §7 eviction-driver loop is implemented in `crates/cache`, `cache.cache_size_mb` is an aspirational ceiling and the cache grows monotonically. The driver MUST land before the network is exposed to adversarial fill.
 - Coupling `last_accessed` to `get`-only refresh means a blob that is pulled by a peer (cache-miss pull, paid) but never read locally ages by the same rule as a stale local hit. This is correct: the local node's cache is sized for the local workload, not for through-traffic, and through-traffic blobs are re-pullable from peers via DHT.
 
 ## Alternatives Considered
