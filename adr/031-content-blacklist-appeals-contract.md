@@ -31,7 +31,7 @@ enum AppealStatus {
     Ratified,       // 3 — terminal: _removeHashRegional executed; bond refunded
     Reversed,       // 4 — terminal: entry.suspended cleared; bond burned
     Rejected,       // 5 — terminal: rejected at intake or after un-fast-track; bond burned
-    Lapsed,         // 6 — terminal: review/ratification window expired or global override fired; bond refunded
+    Lapsed,         // 6 — terminal: cleanupExpiredAppeal fired; bond refunded except for the synthetic-standing clawback case which burns (see § cleanupExpiredAppeal)
     UnFastTracked   // 7 — non-terminal; fast-track reversed by multisig, awaiting fresh review window
 }
 
@@ -60,7 +60,8 @@ struct BlacklistAppeal {
     uint64  fastTrackedAtUs;        // 8 bytes — non-zero iff entered FastTracked; refreshed on UnFastTracked → FastTracked re-entry
     uint64  reviewWindowEndsUs;     // 8 bytes — running deadline for the active review window (multisig pre-fast-track, ve-Governor post-fast-track)
     bytes2  region;                 // 2 bytes — ISO 3166-1 alpha-2 per ADR 011's bytes2 gas-optimization
-    bytes14 _pad1;                  // 14 bytes — explicit padding for slot completion
+    uint8   alreadyUnFastTracked;   // 1 byte — non-zero iff unFastTrackAppeal has ever fired on this appeal (enforces one-shot per ADR 011)
+    bytes13 _pad1;                  // 13 bytes — explicit padding for slot completion
 }
 
 mapping(uint256 => BlacklistAppeal) public appeals;
@@ -136,7 +137,7 @@ function fastTrackAppeal(uint256 appealId) external onlyEmergencyMultisig;
 | Revert | Trigger |
 | --- | --- |
 | `AppealNotFound()` | `appeals[appealId].status == None` |
-| `AppealNotOpen()` | `appeals[appealId].status != Open` (also rejects `UnFastTracked` — that path uses re-entry via separate call sequence; see § State machine) |
+| `AppealNotEligibleForFastTrack()` | `status != Open && status != UnFastTracked` (the two pre-fast-track states; see § State machine) |
 | `ReviewWindowExpired()` | `nowUs ≥ appeals[appealId].reviewWindowEndsUs` |
 | `BodyConcurrentCapReached()` | `regionActiveReliefCount[appeal.region] ≥ BODY_CONCURRENT_APPEAL_CAP` |
 
@@ -153,11 +154,10 @@ function unFastTrackAppeal(uint256 appealId) external onlyEmergencyMultisig;
 | Revert | Trigger |
 | --- | --- |
 | `AppealNotFound()` | `appeals[appealId].status == None` |
-| `AppealNotFastTracked()` | `status != FastTracked` |
-| `RatificationAlreadyFired()` | The post-fast-track ratification window has been closed by a `ratifyAppealRemoval` / `reverseAppeal` call (i.e., the appeal is already terminal) |
-| `AlreadyUnFastTracked()` | `status` was already `UnFastTracked` once for this `appealId` — one-shot per ADR 011 |
+| `AppealNotFastTracked()` | `status != FastTracked` (also subsumes the "already-terminal" cases — `Ratified`, `Reversed`, `Rejected`, `Lapsed` — none of which have `status == FastTracked`) |
+| `AlreadyUnFastTracked()` | `appeals[appealId].alreadyUnFastTracked != 0` — one-shot per ADR 011, enforced by the Slot 4 flag |
 
-**State transitions:** `status = UnFastTracked`; `entry.suspended = false`; `entry.suspendedAtUs` is **preserved** for the closed window so post-resumption evidence-age arithmetic per [ADR 014 § Evidence Staleness](014-on-chain-verification.md#evidence-staleness) sees the historical suspension boundary; `regionActiveReliefCount[appeal.region]--`; `reviewWindowEndsUs = nowUs + BLACKLIST_MULTISIG_REVIEW_WINDOW` (fresh window opens). Bond stays escrowed; `totalBondsEscrowed` unchanged.
+**State transitions:** `status = UnFastTracked`; `alreadyUnFastTracked = 1`; `entry.suspended = false`; `entry.suspendedAtUs` is **preserved** for the closed window so post-resumption evidence-age arithmetic per [ADR 014 § Evidence Staleness](014-on-chain-verification.md#evidence-staleness) sees the historical suspension boundary; `regionActiveReliefCount[appeal.region]--`; `reviewWindowEndsUs = nowUs + BLACKLIST_MULTISIG_REVIEW_WINDOW` (fresh window opens). Bond stays escrowed; `totalBondsEscrowed` unchanged.
 
 **Emits:** `BlacklistAppealUnFastTracked(appealId)`.
 
@@ -216,9 +216,9 @@ Permissionless. Reverts unless one of the four admissibility conditions from [AD
 | (c) synthetic-standing clawback fired | `status == Open && standingPath == TokenHolder && nowUs ≥ openedAtUs + STANDING_LOOKBACK_SECONDS * 1_000_000 && TOKEN.balanceOf(filer) < APPEAL_FILER_TOKEN_THRESHOLD` | **burn** (100%) |
 | (d) global override fired | `status ∈ {Open, FastTracked} && _entryExists(appeal.blake3Hash, appeal.region) == false` | refund (per ADR 011 § Global Override — treats as lapse, not reversal) |
 
-**State transitions:** `status = Lapsed` (conditions a, b, d) or `status = Rejected` with `perjuryFlagged = 0` (condition c — handled as a forfeiture, not a lapse, but the structural outcome is similar; the contract uses `Lapsed` for c as well to keep the terminal-status set minimal and emits a distinct event for telemetry). If `status` was `FastTracked` when cleanup fires: `regionActiveReliefCount[appeal.region]--`; `entry.suspended = false`; `entry.suspendedAtUs` preserved. Bond handled per the table above. `totalBondsEscrowed -= appeal.bond`.
+**State transitions:** `status = Lapsed` for all four conditions — the terminal-status set is intentionally minimal. The bond outcome (refund for a, b, d; burn for c) is determined by the matched condition per the table above, surfaced through the `LapseReason` indexed sub-field on `BlacklistAppealLapsed` (see § Event topic ordering) so off-chain consumers can distinguish refund-vs-burn cases without parsing follow-on `Transfer` events. If `status` was `FastTracked` when cleanup fires: `regionActiveReliefCount[appeal.region]--`; `entry.suspended = false`; `entry.suspendedAtUs` preserved. `totalBondsEscrowed -= appeal.bond`.
 
-**Emits:** `BlacklistAppealLapsed(appealId)` (all conditions). The `BlacklistAppealLapsed` event carries a `LapseReason` indexed field (`u8` enum: `MultisigTimeout, RatificationTimeout, StandingClawback, GlobalOverride`) so off-chain consumers can distinguish refund-vs-burn cases by reason without parsing follow-on `Transfer` events.
+**Emits:** `BlacklistAppealLapsed(appealId, reason)` where `reason` is a `u8` enum (`MultisigTimeout = 1, RatificationTimeout = 2, StandingClawback = 3, GlobalOverride = 4`) mapping 1:1 to the four conditions above.
 
 After cleanup, subsequent calls against the same `appealId` revert with `BlacklistAppealAlreadyClosed()`.
 
