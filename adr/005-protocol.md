@@ -90,7 +90,7 @@ The requester issues a `cdn/dht/v1` FIND_VALUE lookup for the target hash, then 
 
 | Layer | Default refill | Default burst | Hard bounds | Scope |
 |---|---:|---:|---|---|
-| Per-peer (NodeId) | 5 probes/sec | 5 | (existing — [ADR 001 § Probe rate limits](001-network.md#content-discovery-dht--probe)) | The source iroh `NodeId` on the QUIC connection. |
+| Per-peer (NodeId) | 5 probes/sec | 5 | (existing — [ADR 001, Content Discovery](001-network.md#content-discovery-dht--probe)) | The source iroh `NodeId` on the QUIC connection. |
 | Per-IP | 50 probes/sec | 200 | refill `[10, 1000]`; burst `[refill, 5×refill]` | The QUIC source IP after iroh-relay unwrapping for relay-routed connections. |
 | Global node | 1000 probes/sec | 2000 | refill `[100, 100000]`; burst `[refill, 10×refill]` | Single global bucket across all probes inbound to this node. |
 
@@ -106,7 +106,7 @@ Checks fire cheapest-first (global → per-IP → per-peer) so a probe rejected 
 
 | Metric | Type | Description |
 |---|---|---|
-| `decdn_probe_rate_limited_total` | counter, label `layer={per_peer, per_ip, global}` | New: probes rejected by the rate limiter, broken down by which layer rejected first. |
+| `decdn_probe_rate_limit_rejections_total` | counter, label `layer={per_peer, per_ip, global}` | New: probes rejected by the rate limiter, broken down by which layer rejected first. |
 
 ### `cdn/client/v1` — paid delivery protocol
 
