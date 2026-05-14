@@ -17,6 +17,17 @@ This ADR consolidates all client-specific behavior into a single canonical speci
 
 ## Decision
 
+### Scope
+
+This ADR targets **desktop and server clients** — POSIX or Windows hosts with filesystem access, a long-lived process, and the ability to run a QUIC stack and an Ethereum wallet (EOA or Safe). Specifically:
+
+- A writable home directory for `~/.decdn/` keys, peer cache, and download state.
+- Direct UDP socket access for iroh QUIC and iroh-relay traversal.
+- Local NTP synchronization (required for gossip validation per [ADR 001](001-network.md)).
+- Either an OS keychain (production) or a local encrypted keystore file (PoC) for Ethereum key storage.
+
+**Mobile clients (iOS, Android) and web clients (browser) are out of scope.** They require fundamentally different choices for key custody (platform secure enclave / WalletConnect rather than filesystem keystore), transport (WebTransport rather than raw QUIC; no UDP on browsers), and storage (platform sandbox rather than `~/.decdn/`). The voucher-signing UX (high-frequency session-key signatures per [ADR 024 §3](024-account-abstraction.md#3-session-keys--deferred-to-production-via-erc-7579-smartsessions)) and the bootstrap procedure (registry RPC + DNS seeds) both assume desktop-class capabilities. If mobile or web becomes a target, it warrants a dedicated companion ADR rather than retrofitting this one.
+
 ### Client Roles and Capabilities
 
 A client is a lightweight QUIC endpoint that streams content and pays per MB. It is **not** a staked node and has no on-chain registration requirement.
@@ -68,12 +79,15 @@ For PoC, steps 4–5 are skipped (no DNS seeds configured). The registry is the 
 | --- | --- | --- |
 | Subscribe to gossip topics | Yes | Yes |
 | Publish `NodeAnnounce` | No | Yes |
+| Relay (forward) received gossip messages | No | Yes |
 | Validate incoming gossip (signature, registry, timestamp) | Yes | Yes |
 | Publish `ReputationReport` | No | Yes (staked only) |
 | Maintain peer table | Yes | Yes |
 | Require NTP synchronization | Yes (for gossip validation) | Yes |
 
 The client validates gossip messages using the same rules as nodes: signature verification, registry membership check, and ±60-second timestamp freshness ([ADR 001](001-network.md)). This requires NTP synchronization, as already mandated for "validating clients" in ADR 001.
+
+Clients participate as gossip *leaves*: they subscribe and validate but never forward received messages back into the mesh. iroh-gossip propagation is the responsibility of staked nodes, which carry economic accountability (slashing, reputation) for relay correctness and availability. Clients are unstaked and carry no such accountability; making relay opt-in would add operational complexity without improving propagation at any expected mesh scale. This applies to both PoC and production — the policy is not a deployment-time toggle.
 
 The registry query, retry schedule, and `peers.json` fallback behavior defined here supersede the client-specific portions of [ADR 001 — Registry Unavailability](001-network.md#registry-unavailability). ADR 001 retains the specification for node bootstrap and registry interaction.
 
@@ -234,12 +248,6 @@ The client queries all configured seed domains, cross-checks returned NodeIds ag
 - File-based key storage in PoC is not suitable for production (acceptable for testnet with test funds)
 - NTP synchronization is a hard requirement for gossip validation — clients without NTP will reject valid gossip and build stale peer tables
 - Hardware wallet voucher signing is confirmed infeasible — resolved by Safe session keys ([ADR 024](024-account-abstraction.md))
-
-## Open Questions
-
-1. **Gossip relay:** Should clients forward received gossip messages to other peers, or only consume? Recommendation: consume-only for PoC to minimize client complexity. Evaluate relay participation for production to improve message propagation.
-2. ~~**Delegated voucher signer:**~~ Resolved — [ADR 024](024-account-abstraction.md) specifies Safe session keys as the mechanism for high-frequency voucher signing, replacing both the derived hot key and the delegated signer contract approach (PR 196).
-3. **Mobile/web clients:** This ADR assumes a desktop/server client with filesystem access. Mobile and web clients are listed as non-goals in the architecture overview but may need adapted key storage and bootstrap mechanisms.
 
 ## Multi-Node Parallel Download
 
