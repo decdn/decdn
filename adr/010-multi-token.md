@@ -188,7 +188,9 @@ struct TokenInfo {
 }
 ```
 
-Nodes resolve `decimals` once at startup by calling `IERC20Metadata.decimals()` on each configured token address. The result is cached; it never changes for a given token contract.
+At startup, the node calls `IERC20Metadata.decimals()` on each configured token address and compares the result against the `decimals` field in config. **A mismatch is a fatal startup error** — the node refuses to start. A misconfigured `decimals` value silently misprices deliveries by orders of magnitude (see [Consequences § Decimal heterogeneity](#consequences) below); the cost of a fail-start is bounded operational disruption, the cost of starting with a wrong decimal is unbounded financial loss. The on-chain value is cached for the process lifetime; it never changes for a given token contract.
+
+Allowlisted tokens MUST implement `IERC20Metadata.decimals()` per the [Token Vetting Checklist](#token-vetting-checklist) below, so this cross-check always has an authoritative on-chain source — there is no try/catch fallback path that defaults to 18 decimals. A token that does not expose `decimals()` cannot pass vetting and cannot be added to the allowlist; the `decimals` field in node config is mandatory and authoritative.
 
 **Node configuration:**
 
@@ -268,19 +270,29 @@ struct SignedRate {
 - **Per-token rate bounds governance burden.** Governance must set meaningful bounds for each token at `addToken` time. Bounds can be adjusted later via `setRateBounds`, but the floor can never drop below 1 base unit.
 - **Slashing is always in TOKEN (resolved).** The slashing schedule per [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn) is denominated in TOKEN stake, and this remains unchanged with multi-token payments. Slashing operates on the `StakingRegistry` (TOKEN stake), not on payment channel deposits (which may be in any approved token). A node paid exclusively in DAI is still slashed in TOKEN — the node must hold TOKEN stake to participate in the network regardless of which payment tokens it accepts. No price oracle or cross-token conversion is needed. The slash amount is a percentage of TOKEN stake, not a percentage of delivery revenue.
 
+## Token Vetting Checklist
+
+`addToken` is the sole entry path for a new ERC-20 onto the payment-channel allowlist. The contract enforces only the structural invariants (non-zero address, rate-bounds shape); ERC-20 behavioural safety is a governance responsibility, gated by the checklist below.
+
+Items 1–4 are **functional safety requirements**: a token failing any of these breaks `PaymentChannel` accounting and MUST NOT be approved. Items 5–7 are **trust-model disclosures**: governance retains discretion (a regulated-stablecoin pausable token is acceptable; an anonymous pausable token is not), but the disclosure itself is mandatory.
+
+A governance proposal calling `addToken` MUST include the checklist results in the proposal body, with verification evidence (transaction hashes, block explorer links, or simulation traces) for items 1–4.
+
+1. **Standard `IERC20` + `IERC20Metadata` compliance.** `transfer`, `transferFrom`, `approve`, `balanceOf`, `allowance`, `totalSupply`, and `decimals` are all implemented and behave per [EIP-20](https://eips.ethereum.org/EIPS/eip-20). `decimals()` is mandatory — the node's startup validation (see [Rust: incentive Crate](#rust-incentive-crate) above) treats its absence as a fatal error.
+2. **No fee-on-transfer.** The amount credited to the recipient equals the amount debited from the sender for all transfer values. The `PaymentChannel` contract assumes `deposit` equals the amount actually received (see [`openChannel` discussion](#what-this-adds) above); fee-on-transfer tokens cause silent loss of funds on every channel open. Verified by simulating `openChannel` against the candidate token and confirming `IERC20.balanceOf(channel)` increases by exactly `deposit`.
+3. **No rebase mechanics.** Balances do not change without an explicit `transfer` / `transferFrom` / `burn`. Rebasing tokens (e.g., AMPL) silently change channel balances post-deposit and break voucher accounting against `claimedAmount`.
+4. **No transfer hooks or arbitrary external calls in `transfer`/`transferFrom`.** Only the standard `Transfer` event is emitted; no ERC-777-style callbacks, no `_beforeTokenTransfer` hooks that call external contracts, no reentrancy vectors. `SafeERC20` and `nonReentrant` are defense-in-depth, not a substitute for excluding hook-bearing tokens at the allowlist boundary.
+5. **Pausable transfers are disclosed and bounded.** A pausable token is acceptable only if the pause authority is a known, regulated entity (e.g., Circle for USDC) with publicly disclosed pause criteria. A token whose `pause()` is callable by an anonymous or unaudited EOA MUST NOT be approved.
+6. **Proxy / upgradability is disclosed.** If the token is upgradeable, the upgrade authority (single key, multisig, governance contract) MUST be documented in the proposal. Tokens with anonymous or unaudited upgrade authorities MUST NOT be approved.
+7. **Admin controls are disclosed.** Any admin function that can move user balances, freeze accounts, or change token semantics (e.g., USDC's `blacklist`, USDT's `addBlackList`) MUST be documented. Governance accepts these for regulated stablecoins where the trust model is explicit; opaque admin powers are grounds for rejection.
+
+The checklist is the canonical governance prerequisite for `addToken`. Items 1–4 are not tradeoffs — they protect contract solvency. Items 5–7 are trust judgments delegated to governance; the disclosure requirement is not.
+
 ## Migration from ADR 003
 
 The PoC uses `StablePaymentChannel` (USDC-only, defined in ADR 003). Production deploys `PaymentChannel` (multi-token, defined above) as a direct replacement — not a parallel deployment. Since no real users or funds exist on the PoC contract, no phased migration is needed:
 
 1. Deploy `PaymentChannel` with `addToken(USDC_ADDRESS, 1, 1000)` called at deployment (floor = 1 USDC base unit, ceiling = 1000 USDC base units = $0.001/MB, matching [ADR 003](003-payments.md) defaults)
-2. Governance calls `addToken` with appropriate rate bounds in the token's own base units for any additional tokens (e.g., DAI)
+2. Governance calls `addToken` with appropriate rate bounds in the token's own base units for any additional tokens (e.g., DAI). Each `addToken` call MUST be backed by a completed [Token Vetting Checklist](#token-vetting-checklist).
 3. All nodes update config to point to the new contract
 4. The PoC `StablePaymentChannel` is decommissioned
-
-## Open Questions
-
-- **Decimal validation at runtime.** Should the node fail to start if a configured token's on-chain `decimals()` does not match the configured value, or warn and continue? Failing to start is safer but may cause operational disruption if a proxy token contract is upgraded (rare but possible).
-- ~~**Slash denomination.**~~ **Resolved:** slashing is always in TOKEN stake (see Consequences above). No cross-token conversion needed — nodes must hold TOKEN stake regardless of payment token.
-- **Token metadata trust.** `IERC20Metadata` is not mandatory for ERC-20 tokens. Tokens without `decimals()` will cause a revert at startup. Should the contract use a try/catch and default to 18 decimals, or require the operator to always specify decimals explicitly in config?
-- ~~**Token removal semantics.**~~ **Resolved:** `forceCloseChannel(channelId)` — permissionless, succeeds only when `!allowedTokens[channel.token]`. Enters the standard Closing→dispute→settle flow. No on-chain enumeration; callers (governance bots, channel parties, third-party fraud detectors) provide the channel ID. See `forceCloseChannel` interface above.
-- **Token vetting criteria.** What due diligence should governance perform before calling `addToken`? At minimum: verify no fee-on-transfer, no rebase mechanics, no pausable transfers that could lock contract funds, and standard `IERC20` compliance. Should this be codified in a checklist or left to governance discretion?
