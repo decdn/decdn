@@ -144,12 +144,12 @@ Concrete values:
 
 ### 6. `FeeRouterClient` — `crates/incentive`
 
-Introduced by [ADR 026](026-gauge-boost-tokenomics.md) §2. The `FeeRouter` contract receives the full operator USDC balance from `PaymentChannel.settleChannel` and atomically splits it into the six buckets. The wiring seam selects between an in-process PoC stub (a no-op or local accounting router) and the deployed production contract address per network.
+Introduced by [ADR 026](026-gauge-boost-tokenomics.md) §2. The `FeeRouter` contract receives the full operator USDC balance from `PaymentChannel.settleChannel` and atomically splits it into the six buckets. The wiring seam selects between the deployed `FeeRouter` contract (canonical for every network deployment per [ADR 016 § Tunable Economics](016-contract-interactions.md#tunable-economics), including the Arbitrum Sepolia testnet) and an in-process mock used by unit and integration tests where no contracts are deployed.
 
 ```rust
 pub trait FeeRouterClient: Send + Sync {
     /// Address of the FeeRouter contract for the active chain.
-    /// Returns `None` for the no-op PoC variant.
+    /// Returns `None` for the in-process test mock; never for a network deployment.
     fn router_address(&self) -> Option<Address>;
     /// Voucher-payload byte counts are forwarded into the router by the
     /// settlement transaction; this hook lets observers (metrics) snapshot
@@ -158,10 +158,10 @@ pub trait FeeRouterClient: Send + Sync {
 }
 ```
 
-| | PoC | Production |
+| | Tests / local dev | Network deployment |
 |---|-----|------------|
-| Implementation | `NoopFeeRouterClient` — in-process no-op (or local accounting) router; settlement skips the on-chain split | `OnchainFeeRouterClient` — deployed `FeeRouter` contract address per network (configured) |
-| Settlement path | `PaymentChannel.settleChannel` pays operator the full balance; downstream buckets simulated for tests | `PaymentChannel.settleChannel` calls `FeeRouter.routeSettlement(operator, bytesDelivered, amount, epochId)` in the same transaction |
+| Implementation | `MockFeeRouterClient` — in-process mock for harnesses with no deployed contracts; never a deployment-time backend | `OnchainFeeRouterClient` — deployed `FeeRouter` contract address per network; the full production split applies to every network deployment per [ADR 016 § Tunable Economics](016-contract-interactions.md#tunable-economics) (simplified-launch configurations set bucket shares via `setShares` on the same contract, not via a reduced-surface stub) |
+| Settlement path | `PaymentChannel.settleChannel` interacts with the mock router; downstream buckets simulated for assertion | `PaymentChannel.settleChannel` calls `FeeRouter.routeSettlement(operator, bytesDelivered, amount, epochId)` in the same transaction |
 | Per-network config | N/A | Address sourced from chain-id-keyed config; sum-to-100% safety bounds enforced on chain |
 
 ### 7. `VotingEscrowReader` — `crates/incentive`

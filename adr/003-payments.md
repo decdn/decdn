@@ -535,11 +535,7 @@ Conservation, same-tx satellite legs (5%/5%/3%), and epoch-consistency invariant
 
 #### Settlement sequence
 
-End-to-end USDC flow (client→node settlement, then the parallel cache-miss bypass) is diagrammed in [ADR 016 §"FeeRouter integration"](016-contract-interactions.md). This ADR documents only the `StablePaymentChannel ↔ FeeRouter` interface contract.
-
-#### PoC stub
-
-For the PoC, the wiring layer in the `node` crate (per [Appendix: PoC/Production Seams](appendix-poc-production-seams.md)) selects the `FeeRouter` deployment per network. A PoC stub `FeeRouter` MAY perform only the 40% same-tx base payout to the operator and accumulate the remaining 60% in a single forwarding wallet (treasury), to keep the PoC contract surface bounded while preserving the `StablePaymentChannel` ↔ `FeeRouter` interface contract. Production deployments MUST implement the full six-bucket split with epoch-bucketed gauge and delegator pools.
+End-to-end USDC flow (client→node settlement, then the parallel cache-miss bypass) is diagrammed in [ADR 016 §"FeeRouter integration"](016-contract-interactions.md). This ADR documents only the `StablePaymentChannel ↔ FeeRouter` interface contract. The full six-bucket split applies to every network deployment from launch — simplified launch configurations are expressed by setting non-active bucket shares to zero via `FeeRouter.setShares(...)` per [ADR 016 § Tunable Economics](016-contract-interactions.md#tunable-economics), not by deploying a reduced-surface stub. The cross-validation invariant in [ADR 016 § Tunable Economics](016-contract-interactions.md#tunable-economics) ensures any non-zero share has a wired non-zero destination, so the launch share configuration alone determines which downstream contracts must be ready at deploy time.
 
 ### EIP-712 Voucher Signature
 
