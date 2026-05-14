@@ -283,7 +283,7 @@ For each operator a consuming node maintains a sparse map keyed on region:
 ```rust
 struct CoverageBucket {
     score: f32,                  // [0.0, 1.0] — same scale as final_score
-    last_interaction_us: u64,    // microsecond timestamp of the most recent update
+    last_interaction_at: u64,    // unix timestamp (seconds) of the most recent update
 }
 
 // Per-operator state, computed locally from received ReputationReports.
@@ -297,21 +297,21 @@ Only regions that have produced at least one delivery interaction in the trailin
 On receipt of a `ReputationReport` from reporter `R` about operator `O`:
 
 1. Look up `R.region` from the local peer table (the latest `NodeAnnounce` for `R`'s `NodeId` per [ADR 001 § Node Discovery](001-network.md#node-discovery-gossip)). Reports from reporters with no current `NodeAnnounce` or with an unattested region are dropped from regional aggregation only — they still contribute to the main `network_score` per Section 4.
-2. Compute `interaction_score` from `report.metrics` using the same formula as Section 3 (`0.4 × speed_score + 0.4 × correctness + 0.2 × reachability`).
-3. Update the bucket: `bucket.score = ewma(bucket.score, interaction_score, alpha=0.1)` — same `alpha` as the local-score path in Section 3.
-4. Set `bucket.last_interaction_us = nowUs`.
-
-If no bucket exists for `R.region`, initialize at `bucket.score = interaction_score` (first observation; no prior signal to blend with) and proceed.
+2. If no bucket exists for `R.region`, initialize `bucket.score = 0.5` (neutral) — same convention as the main scores in Section 3 — and proceed to step 3.
+3. Compute `interaction_score` from `report.metrics` using the same formula as Section 3 (`0.4 × speed_score + 0.4 × correctness + 0.2 × reachability`).
+4. Update the bucket: `bucket.score = ewma(bucket.score, interaction_score, alpha=0.1)` — same `alpha` as the local-score path in Section 3.
+5. Set `bucket.last_interaction_at = now` (unix seconds).
 
 #### Decay (mirrors Section 7)
 
-Each `CoverageBucket` decays toward `0.5` (neutral) at the same `0.10 / week` rate applied to component scores in Section 7:
+Each `CoverageBucket` decays toward `0.5` (neutral) at the same per-week rate as the component scores in Section 7. Because lookups are lazy and elapsed time is arbitrary, the closed-form is the canonical specification:
 
 ```
-score_new = score_old + (0.5 - score_old) * 0.10
+weeks_elapsed = (now - bucket.last_interaction_at) / SECONDS_PER_WEEK
+score_decayed = 0.5 + (bucket.score - 0.5) * (0.9 ^ weeks_elapsed)
 ```
 
-Decay is computed per-bucket at lookup time from `last_interaction_us` (lazy evaluation; no background sweep needed). Buckets whose score sits within `0.05` of neutral and whose `last_interaction_us` is older than `26 weeks` MAY be evicted from the sparse map as a storage-cleanup pass; the next lookup against an evicted region returns "no signal" rather than "neutral" so consumers can distinguish "never seen" from "decayed to neutral."
+This is the same `1 - 0.10` per-step factor as Section 7 applied for `weeks_elapsed` steps; `weeks_elapsed` MAY be fractional (no quantization to whole weeks). Decay is computed per-bucket at lookup time from `last_interaction_at` — no background sweep. Buckets whose `score_decayed` sits within `0.05` of neutral and whose `last_interaction_at` is older than `26 weeks` MAY be evicted from the sparse map as a storage-cleanup pass; the next lookup against an evicted region returns "no signal" rather than "neutral" so consumers can distinguish "never seen" from "decayed to neutral."
 
 #### Consumer access
 
