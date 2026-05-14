@@ -314,7 +314,7 @@ async fn cache_engine_retries_transient_via_origin_retry_policy() -> anyhow::Res
     };
     let engine = CacheEngine::open_full(
         tmp.path(),
-        Some(origin),
+        vec![origin as Arc<dyn Origin>],
         16,
         decdn_cache::PinnedHashes::empty(),
         policy,
@@ -549,7 +549,7 @@ async fn cache_engine_miss_pulls_from_s3_and_caches() -> anyhow::Result<()> {
     // attempts on a 200-OK happy path.
     let engine = CacheEngine::open_full(
         tmp.path(),
-        Some(origin),
+        vec![origin as Arc<dyn Origin>],
         16,
         decdn_cache::PinnedHashes::empty(),
         RetryPolicy::disabled(),
@@ -604,7 +604,7 @@ async fn cache_engine_rejects_s3_body_larger_than_max_blob_bytes() -> anyhow::Re
     let tmp = tempfile::tempdir()?;
     let engine = CacheEngine::open_full(
         tmp.path(),
-        Some(origin),
+        vec![origin as Arc<dyn Origin>],
         1, // max_blob_size_mb = 1 MiB
         decdn_cache::PinnedHashes::empty(),
         RetryPolicy::disabled(),
@@ -639,7 +639,7 @@ async fn cache_engine_surfaces_not_found_for_no_such_key() -> anyhow::Result<()>
     let origin: Arc<dyn Origin> = Arc::new(s3_origin(client, ""));
 
     let tmp = tempfile::tempdir()?;
-    let engine = CacheEngine::open(tmp.path(), Some(origin), 16).await?;
+    let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 16).await?;
 
     let err = engine
         .get(hash)

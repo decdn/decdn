@@ -60,7 +60,7 @@ async fn bind_loopback() -> anyhow::Result<(TcpListener, SocketAddr)> {
 /// engine; callers bind it with `_tmp` to keep RAII in scope.
 async fn test_cache() -> anyhow::Result<(CacheEngine, tempfile::TempDir)> {
     let tmp = tempfile::tempdir()?;
-    let cache = CacheEngine::open(tmp.path(), None, 1).await?;
+    let cache = CacheEngine::open(tmp.path(), Vec::new(), 1).await?;
     Ok((cache, tmp))
 }
 

@@ -268,7 +268,7 @@ impl AdminRpcServer for AdminRpcImpl {
                 last_accessed_us_ago: preview.last_accessed_us_ago,
                 pinned: preview.pinned,
                 already_evicted: preview.already_evicted,
-                origin_kind: preview.origin_kind,
+                origin_kinds: preview.origin_kinds,
             },
         })
     }
@@ -440,7 +440,7 @@ pub async fn serve(
 )]
 mod tests {
     use super::*;
-    use decdn_cache::Hash;
+    use decdn_cache::{Hash, Origin};
     use decdn_protocol::{LoadHint, NodeAnnounce, NodeAnnounceBody};
 
     fn mk_announce(node_id: [u8; 32], region: &str, ts_us: u64) -> NodeAnnounce {
@@ -466,7 +466,7 @@ mod tests {
     /// (callers bind it with `_tmp` so RAII handles cleanup at end of test).
     async fn test_cache() -> (CacheEngine, tempfile::TempDir) {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let cache = CacheEngine::open(tmp.path(), None, 1)
+        let cache = CacheEngine::open(tmp.path(), Vec::new(), 1)
             .await
             .expect("cache open");
         (cache, tmp)
@@ -649,7 +649,7 @@ mod tests {
             data: Bytes::from(payload.to_vec()),
             hash,
         }) as Arc<dyn decdn_cache::Origin>;
-        let cache = CacheEngine::open(tmp.path(), Some(origin), 1).await?;
+        let cache = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 1).await?;
 
         // Prime the cache with the blob so the evict has something to remove.
         let _ = cache.get(hash).await?;
@@ -785,7 +785,7 @@ mod tests {
             data: Bytes::from(payload.to_vec()),
             hash,
         }) as Arc<dyn decdn_cache::Origin>;
-        let cache = CacheEngine::open(tmp.path(), Some(origin), 1).await?;
+        let cache = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 1).await?;
         let _ = cache.get(hash).await?;
 
         let state = AdminState::new(
@@ -827,14 +827,14 @@ mod tests {
             !resp.preview.already_evicted,
             "dry-run must not flip evicted flag"
         );
-        // Origin egress-cost cue (#439). Engine here is configured
-        // with an origin, so the preview must carry a non-None tag —
-        // the StubOrigin reports `Http`.
+        // Origin egress-cost cue (#439, #284). Engine here is
+        // configured with a single-origin chain, so the preview must
+        // carry exactly one entry — the StubOrigin reports `Http`.
         assert_eq!(
-            resp.preview.origin_kind,
-            Some(decdn_cache::OriginKind::Http),
-            "expected Some(Http), got {:?}",
-            resp.preview.origin_kind,
+            resp.preview.origin_kinds,
+            vec![decdn_cache::OriginKind::Http],
+            "expected [Http], got {:?}",
+            resp.preview.origin_kinds,
         );
 
         // Cache state untouched: the blob is still served, the
@@ -900,7 +900,7 @@ mod tests {
             data: Bytes::from(payload.to_vec()),
             hash,
         }) as Arc<dyn decdn_cache::Origin>;
-        let cache = CacheEngine::open(tmp.path(), Some(origin), 1).await?;
+        let cache = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 1).await?;
         let _ = cache.get(hash).await?;
         cache.evict(hash)?;
 

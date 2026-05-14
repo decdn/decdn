@@ -83,11 +83,43 @@ pub struct CacheConfig {
     pub cache_size_mb: Option<u64>,
     /// Maximum single blob size in megabytes.
     pub max_blob_size_mb: Option<u64>,
-    /// Origin backend for cache pull-through (#437). Absent => no
-    /// pull-through; cache misses fail with `NoOrigin`. The variant
-    /// (`http`, `fs`, or `s3`) is selected by the `kind` field on the
-    /// inner `[cache.origin]` table.
+    /// Single origin backend for cache pull-through (#437). Absent =>
+    /// no pull-through (unless [`Self::origins`] is set); cache misses
+    /// fail with `NoOrigin`. The variant (`http`, `fs`, or `s3`) is
+    /// selected by the `kind` field on the inner `[cache.origin]`
+    /// table. Mutually exclusive with [`Self::origins`] — operators
+    /// who need an ordered fallback list use the `[[cache.origins]]`
+    /// array-of-tables form instead. Setting both at once is rejected
+    /// at config resolution.
     pub origin: Option<OriginConfig>,
+    /// Ordered list of origin backends with automatic fallback (#284).
+    /// On a cache miss the engine tries each entry in order; the next
+    /// entry is consulted when the current one returns `NotFound`,
+    /// returns a permanent error, or exhausts its per-origin transient
+    /// retry budget. Deterministic per-origin failures (hash mismatch,
+    /// blob-too-large) do **not** trigger fallback — they indicate a
+    /// misbehaving or misconfigured backend that must surface, not be
+    /// masked. Mutually exclusive with [`Self::origin`]; an empty
+    /// array is rejected (omit the key for "no pull-through" rather
+    /// than configuring zero origins). Duplicate entries are
+    /// permitted but logged as a warning at startup — operators may
+    /// legitimately want two entries with the same target for
+    /// connection-pool sharding. Set once at startup; changes require
+    /// a process restart, consistent with [`Self::origin_retry`].
+    ///
+    /// Worst-case *backoff* latency for an all-failing chain is
+    /// `len(origins) × sum_of_backoffs(origin_retry)` plus per-attempt
+    /// origin RTT/timeout. With default [`decdn_cache::RetryPolicy`]
+    /// (3 retries, sleeps `100 + 200 + 400 ms` ± jitter — see
+    /// `RetryPolicy::default`) that's ~700 ms backoff per origin
+    /// (~2.1 s for three origins) — *not* `max_retries × backoff_cap`,
+    /// because the default schedule never saturates the 10 s cap. The
+    /// `max_backoff_ms` cap only dominates if `initial_backoff_ms` is
+    /// raised enough to saturate it; for the worst-case-cap regime use
+    /// `max_retries × max_backoff_ms` and multiply by chain length.
+    /// Plan operator timeouts accordingly — RTT/timeout per attempt
+    /// usually dominates the backoff term.
+    pub origins: Option<Vec<OriginConfig>>,
     /// Hex-encoded BLAKE3 hashes that must stay cached regardless of LRU
     /// pressure (#276). Each entry is 64 lowercase hex chars (BLAKE3
     /// digest size). Invalid hex or wrong-length entries cause config
@@ -170,6 +202,24 @@ pub struct CacheConfig {
 /// # path_style = true                                               # for MinIO
 /// # prefix = "blobs/"
 /// # [cache.origin.credentials] source = "static" / "default-chain"
+/// ```
+///
+/// For multi-origin fallback (#284) use the plural `[[cache.origins]]`
+/// array-of-tables form (mutually exclusive with `[cache.origin]`):
+///
+/// ```toml
+/// [[cache.origins]]
+/// kind = "http"
+/// url = "https://primary.example/"
+///
+/// [[cache.origins]]
+/// kind = "s3"
+/// bucket = "mirror-blobs"
+/// region = "us-east-1"
+///
+/// [[cache.origins]]
+/// kind = "fs"
+/// path = "/var/lib/decdn/archive"
 /// ```
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]

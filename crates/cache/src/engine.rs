@@ -33,7 +33,18 @@ pub struct CacheEngine {
 #[derive(Debug)]
 struct Inner {
     store: FsStore,
-    origin: Option<Arc<dyn Origin>>,
+    /// Ordered list of origin backends consulted on cache misses
+    /// (#284). Empty vec => no pull-through configured; `pull_through`
+    /// short-circuits to `CacheError::NoOrigin`. A single-element vec
+    /// preserves the pre-#284 single-origin semantics. Entries are
+    /// tried in operator-supplied order; the next entry is consulted
+    /// on `NotFound`, permanent error, or retry-budget exhaustion.
+    /// Deterministic per-origin failures (`HashMismatch`,
+    /// `BlobTooLarge`, and local-store errors classified as
+    /// `Store`) deliberately do not fall back — they indicate a
+    /// misbehaving backend or a degraded local store that must
+    /// surface, not be masked by trying a different mirror.
+    origins: Vec<Arc<dyn Origin>>,
     max_blob_bytes: u64,
     /// Per-hash last-access timestamps for LRU eviction ordering.
     access_times: Mutex<HashMap<Hash, Instant>>,
@@ -267,14 +278,16 @@ pub struct EvictionPreview {
     /// RPC doesn't need a second `has()` round-trip to fill the
     /// `was_present` field on its response.
     pub served: bool,
-    /// Backend the engine would re-fetch from on a post-eviction miss
-    /// (#439). `None` when no origin is configured (cache-only mode);
-    /// otherwise `Some(OriginKind::Http)` or
-    /// `Some(OriginKind::Filesystem)`. Operators running takedowns or
-    /// LRU sweeps use this to estimate origin egress cost — re-pulling
-    /// from a `Filesystem` origin is a local read; re-pulling from
-    /// `Http` may consume metered S3/R2/B2 bandwidth.
-    pub origin_kind: Option<OriginKind>,
+    /// Ordered list of backend kinds the engine would consult on a
+    /// post-eviction miss (#439, #284). Empty when no origin is
+    /// configured (cache-only mode); otherwise one [`OriginKind`] per
+    /// entry of the operator-supplied fallback chain, in order.
+    /// Operators running takedowns or LRU sweeps use this to estimate
+    /// the worst-case origin egress cost — re-pulling from a
+    /// `Filesystem` origin is a local read; re-pulling from `Http` or
+    /// `S3` may consume metered bandwidth, and a chain of three S3
+    /// origins multiplies the bill on a deep fallback.
+    pub origin_kinds: Vec<OriginKind>,
 }
 
 /// Snapshot of access times for blobs that are eligible for LRU
@@ -620,10 +633,10 @@ impl CacheEngine {
     /// that exceed the cap without self-enforcement.
     pub async fn open(
         cache_dir: &Path,
-        origin: Option<Arc<dyn Origin>>,
+        origins: Vec<Arc<dyn Origin>>,
         max_blob_mb: u64,
     ) -> CacheResult<Self> {
-        Self::open_with_pinned(cache_dir, origin, max_blob_mb, PinnedHashes::empty()).await
+        Self::open_with_pinned(cache_dir, origins, max_blob_mb, PinnedHashes::empty()).await
     }
 
     /// Open the cache with an initial pinning set. The set is held in an
@@ -637,13 +650,13 @@ impl CacheEngine {
     /// `cache.gc_interval_sec` through that path.
     pub async fn open_with_pinned(
         cache_dir: &Path,
-        origin: Option<Arc<dyn Origin>>,
+        origins: Vec<Arc<dyn Origin>>,
         max_blob_mb: u64,
         pinned: PinnedHashes,
     ) -> CacheResult<Self> {
         Self::open_full(
             cache_dir,
-            origin,
+            origins,
             max_blob_mb,
             pinned,
             RetryPolicy::default(),
@@ -674,7 +687,7 @@ impl CacheEngine {
     /// once upstream exposes the sweep API.
     pub async fn open_full(
         cache_dir: &Path,
-        origin: Option<Arc<dyn Origin>>,
+        origins: Vec<Arc<dyn Origin>>,
         max_blob_mb: u64,
         pinned: PinnedHashes,
         retry_policy: RetryPolicy,
@@ -758,7 +771,7 @@ impl CacheEngine {
         Ok(Self {
             inner: Arc::new(Inner {
                 store,
-                origin,
+                origins,
                 max_blob_bytes,
                 access_times: Mutex::new(HashMap::new()),
                 inflight: Mutex::new(HashMap::new()),
@@ -951,7 +964,7 @@ impl CacheEngine {
             u64::try_from(inst.elapsed().as_micros()).unwrap_or(u64::MAX)
         });
 
-        let origin_kind = self.inner.origin.as_ref().map(|o| o.kind());
+        let origin_kinds = self.inner.origins.iter().map(|o| o.kind()).collect();
 
         Ok(EvictionPreview {
             size_bytes,
@@ -959,7 +972,7 @@ impl CacheEngine {
             pinned: self.is_pinned(hash),
             already_evicted,
             served,
-            origin_kind,
+            origin_kinds,
         })
     }
 
@@ -1185,45 +1198,115 @@ impl CacheEngine {
         }
         // Reject pulls with no origin configured early — keeps the
         // per-attempt closure pure with respect to the origin handle.
-        if self.inner.origin.is_none() {
+        if self.inner.origins.is_empty() {
             return Err(CacheError::NoOrigin { hash });
         }
 
-        // Bump the per-fetch denominator before issuing the call so the
-        // counter survives mid-fetch panics — alerts that page on
-        // `origin_retry_exhausted_total / origin_fetches_total` need
-        // every attempt counted, not just successful ones.
+        // Bump the per-fetch denominator once per `pull_through` —
+        // preserving #285 semantics where the counter is per
+        // cache-miss-call, not per origin attempted. Alerts that
+        // page on `origin_retry_exhausted_total / origin_fetches_total`
+        // continue to be a per-call ratio; the new
+        // `origin_fallback_total` separately counts chain-walk steps.
         if let Some(m) = &self.inner.metrics {
             m.origin_fetches.inc();
         }
         let max_blob_bytes = self.inner.max_blob_bytes;
         let policy = self.inner.retry_policy;
 
-        // Deterministic non-retryable outcomes (Store / HashMismatch /
-        // BlobTooLarge) ride out via `PullThroughOutcome` so the
-        // retry loop's `OriginPullError` exit taxonomy stays focused
-        // on retry-class failures.
-        let outcome = run_with_retry(policy, self.inner.metrics.as_ref(), hash, || {
-            self.pull_through_attempt(hash, max_blob_bytes, policy)
-        })
-        .await;
+        // Fallback chain walk (#284). Each origin gets its own retry
+        // budget; on retry-exhaustion / Permanent / NotFound we advance
+        // to the next entry. Deterministic per-origin failures
+        // (`HashMismatch`, `BlobTooLarge`, `Store`) intentionally do
+        // not fall back — they indicate a misbehaving backend that
+        // must surface, not be masked by trying a different one.
+        let mut last_err: Option<OriginPullError> = None;
+        let mut any_not_found = false;
+        let total = self.inner.origins.len();
+        for (idx, origin) in self.inner.origins.iter().enumerate() {
+            let origin = Arc::clone(origin);
+            let outcome = run_with_retry(policy, self.inner.metrics.as_ref(), hash, || {
+                self.pull_through_attempt(Arc::clone(&origin), hash, max_blob_bytes, policy)
+            })
+            .await;
 
-        match outcome {
-            Ok(PullThroughOutcome::Bytes(bytes)) => Ok(bytes),
-            Ok(PullThroughOutcome::NotFound) => Err(CacheError::NotFound { hash }),
-            Ok(PullThroughOutcome::BlobTooLarge) => Err(CacheError::BlobTooLarge {
-                hash,
-                limit_bytes: max_blob_bytes,
-            }),
-            Ok(PullThroughOutcome::HashMismatch { actual }) => Err(CacheError::HashMismatch {
-                expected: hash,
-                actual,
-            }),
-            Ok(PullThroughOutcome::Store(err)) => Err(CacheError::Store(err)),
-            Err(e) => Err(CacheError::OriginError {
+            // Track *this iteration's* outcome class so the post-match
+            // log records the correct cause. `last_err.is_some()` is
+            // cumulative across iterations and would mislabel a later
+            // NotFound advance as "primary failed" once any earlier
+            // origin had errored.
+            let advance_was_error = match outcome {
+                Ok(PullThroughOutcome::Bytes(bytes)) => return Ok(bytes),
+                Ok(PullThroughOutcome::NotFound) => {
+                    any_not_found = true;
+                    false
+                }
+                Ok(PullThroughOutcome::BlobTooLarge) => {
+                    return Err(CacheError::BlobTooLarge {
+                        hash,
+                        limit_bytes: max_blob_bytes,
+                    });
+                }
+                Ok(PullThroughOutcome::HashMismatch { actual }) => {
+                    return Err(CacheError::HashMismatch {
+                        expected: hash,
+                        actual,
+                    });
+                }
+                Ok(PullThroughOutcome::Store(err)) => return Err(CacheError::Store(err)),
+                Err(e) => {
+                    last_err = Some(e);
+                    true
+                }
+            };
+
+            // Final entry already tried; don't log a "fallback" for a
+            // chain that has nowhere left to advance.
+            if idx + 1 < total {
+                if let Some(m) = &self.inner.metrics {
+                    m.origin_fallback.inc();
+                }
+                // Level reflects *this iteration's* advance cause: a
+                // `NotFound` advance is normal hit-on-fallback (info),
+                // but a Permanent / retry-exhausted advance means the
+                // current backend just failed to deliver and operators
+                // may want to alert on it. Surface as `warn!` so a
+                // misconfigured primary doesn't hide behind a healthy
+                // mirror.
+                if advance_was_error {
+                    tracing::warn!(
+                        hash = %hash,
+                        origin_index = idx,
+                        origin_kind = ?origin.kind(),
+                        "advancing to next origin in fallback chain (origin failed)",
+                    );
+                } else {
+                    tracing::info!(
+                        hash = %hash,
+                        origin_index = idx,
+                        origin_kind = ?origin.kind(),
+                        "advancing to next origin in fallback chain (NotFound)",
+                    );
+                }
+            }
+        }
+
+        // All origins exhausted. Any non-NotFound failure beats a pure
+        // NotFound because "known backend errored" is more diagnostic
+        // than "no backend had it" — operators triaging a 5xx benefit
+        // from the underlying error, and a real NotFound only fires
+        // when every origin agreed the blob is absent.
+        if let Some(e) = last_err {
+            Err(CacheError::OriginError {
                 hash,
                 source: e.into_inner(),
-            }),
+            })
+        } else {
+            debug_assert!(
+                any_not_found,
+                "non-empty origin chain must record an outcome"
+            );
+            Err(CacheError::NotFound { hash })
         }
     }
 
@@ -1243,23 +1326,15 @@ impl CacheEngine {
     #[allow(clippy::too_many_lines)] // Linear per-attempt flow; the failure-classification arms each need their own context comment, and splitting them across functions would obscure the sequence more than the length.
     async fn pull_through_attempt(
         &self,
+        origin: Arc<dyn Origin>,
         hash: Hash,
         max_blob_bytes: u64,
         policy: RetryPolicy,
     ) -> Result<PullThroughOutcome, OriginPullError> {
-        // Invariant: `pull_through` checked `origin.is_some()` before
-        // entering the retry loop; coalesced waiters never re-enter
-        // this method from a path that bypasses that check. (`SAFETY:`
-        // is reserved for `unsafe` blocks; this is a logical
-        // invariant in safe code.)
-        let Some(origin) = self.inner.origin.as_ref() else {
-            // Returning Permanent ensures `run_with_retry` exits
-            // without burning the budget on an unreachable case.
-            return Err(OriginPullError::Permanent(anyhow::anyhow!(
-                "internal invariant: pull_through_attempt called with no origin"
-            )));
-        };
-
+        // The origin handle is now plumbed in by the caller
+        // (`pull_through`'s fallback-chain loop, #284) so this method
+        // is agnostic to chain position and works identically for the
+        // singular-origin (chain length 1) and multi-origin paths.
         let fetch = origin.fetch(hash, max_blob_bytes).await?;
         let (stream, size_hint) = match fetch {
             crate::origin::OriginFetch::NotFound => return Ok(PullThroughOutcome::NotFound),
@@ -1656,7 +1731,8 @@ mod tests {
         let hash = Hash::new(payload);
         let origin = StubOrigin::new(payload);
 
-        let engine = CacheEngine::open(tmp.path(), Some(Arc::new(origin)), 10).await?;
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
 
         // Prime the cache via pull-through.
         let _ = engine.get(hash).await?;
@@ -1683,7 +1759,8 @@ mod tests {
         let hash = Hash::new(payload);
         let origin = StubOrigin::new(payload);
 
-        let engine = CacheEngine::open(tmp.path(), Some(Arc::new(origin)), 10).await?;
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
 
         // First get triggers pull-through.
         let _ = engine.get(hash).await?;
@@ -1702,7 +1779,8 @@ mod tests {
         let hash = Hash::new(payload);
         let origin = StubOrigin::new(payload);
 
-        let engine = CacheEngine::open(tmp.path(), Some(Arc::new(origin)), 10).await?;
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
 
         // First access (pull-through).
         let _ = engine.get(hash).await?;
@@ -1733,7 +1811,8 @@ mod tests {
         let hash = Hash::new(payload);
         let origin = StubOrigin::new(payload);
 
-        let engine = CacheEngine::open(tmp.path(), Some(Arc::new(origin)), 10).await?;
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
 
         let _ = engine.get(hash).await?;
 
@@ -1748,7 +1827,7 @@ mod tests {
     #[tokio::test]
     async fn last_accessed_returns_none_for_unknown_hash() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
-        let engine = CacheEngine::open(tmp.path(), None, 10).await?;
+        let engine = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
         let unknown = Hash::new(b"never accessed");
 
         anyhow::ensure!(
@@ -1817,7 +1896,7 @@ mod tests {
         let cm = Arc::new(CacheMetrics::default());
         let engine = CacheEngine::open_full(
             tmp.path(),
-            Some(origin.clone() as Arc<dyn Origin>),
+            vec![origin.clone() as Arc<dyn Origin> as Arc<dyn Origin>],
             10,
             crate::PinnedHashes::empty(),
             crate::RetryPolicy::default(),
@@ -1878,7 +1957,8 @@ mod tests {
         let hash = Hash::new(payload);
         let origin = StubOrigin::new(payload);
 
-        let engine = CacheEngine::open(tmp.path(), Some(Arc::new(origin)), 10).await?;
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
 
         let _ = engine.get(hash).await?;
 
@@ -1901,7 +1981,8 @@ mod tests {
         let hash = Hash::new(payload);
         let origin = SlowCountingOrigin::new(payload, std::time::Duration::from_secs(10));
 
-        let engine = CacheEngine::open(tmp.path(), Some(Arc::new(origin)), 10).await?;
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
 
         // Spawn the owner with a tiny timeout so it gets cancelled mid-pull.
         let owner_engine = engine.clone();
@@ -1933,9 +2014,13 @@ mod tests {
         // Build the engine with pinned_hash in the pinning set.
         let mut pinned_set = HashSet::new();
         pinned_set.insert(pinned_hash);
-        let engine =
-            CacheEngine::open_with_pinned(tmp.path(), None, 10, PinnedHashes::new(pinned_set))
-                .await?;
+        let engine = CacheEngine::open_with_pinned(
+            tmp.path(),
+            Vec::new(),
+            10,
+            PinnedHashes::new(pinned_set),
+        )
+        .await?;
 
         // Touch both hashes via direct access-time insertion (we don't
         // need actual blob content for this test).
@@ -1972,7 +2057,7 @@ mod tests {
         let h1 = Hash::new(b"one");
         let h2 = Hash::new(b"two");
 
-        let engine = CacheEngine::open(tmp.path(), None, 10).await?;
+        let engine = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
         if let Ok(mut g) = engine.inner.access_times.lock() {
             g.insert(h1, Instant::now());
             g.insert(h2, Instant::now());
@@ -2046,7 +2131,8 @@ mod tests {
         let hash = Hash::new(payload);
         let origin = StubOrigin::new(payload);
 
-        let engine = CacheEngine::open(tmp.path(), Some(Arc::new(origin)), 10).await?;
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
 
         // Prime the cache so we evict a real, served blob — covers the
         // hot path the operator would actually be evicting.
@@ -2086,7 +2172,7 @@ mod tests {
         // First open: prime + evict.
         {
             let origin = Arc::new(StubOrigin::new(payload));
-            let engine = CacheEngine::open(tmp.path(), Some(origin), 10).await?;
+            let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 10).await?;
             let _ = engine.get(hash).await?;
             engine.evict(hash)?;
             engine.shutdown().await?;
@@ -2094,7 +2180,7 @@ mod tests {
 
         // Second open: same cache_dir, no origin so a re-pull would fail
         // loudly. The evicted set must reload from disk.
-        let engine2 = CacheEngine::open(tmp.path(), None, 10).await?;
+        let engine2 = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
         anyhow::ensure!(
             engine2.is_evicted(hash),
             "evict flag should reload from <cache_dir>/evicted.log"
@@ -2119,7 +2205,7 @@ mod tests {
             format!("\n# operator note\n{good}\nnot-a-hash\n{good}\n"),
         )?;
 
-        let engine = CacheEngine::open(tmp.path(), None, 10).await?;
+        let engine = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
         anyhow::ensure!(engine.is_evicted(good), "valid hash line not loaded");
         Ok(())
     }
@@ -2127,7 +2213,7 @@ mod tests {
     #[tokio::test]
     async fn evict_unknown_hash_is_a_no_op() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
-        let engine = CacheEngine::open(tmp.path(), None, 10).await?;
+        let engine = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
         let unknown = Hash::new(b"never seen");
         // Evicting a hash we've never cached is fine — operators may run
         // `decdn node evict` ahead of time as a precaution.
@@ -2146,7 +2232,7 @@ mod tests {
     async fn evict_is_idempotent_and_does_not_grow_log() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let log_path = tmp.path().join("evicted.log");
-        let engine = CacheEngine::open(tmp.path(), None, 10).await?;
+        let engine = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
         let hash = Hash::new(b"dup-evict");
 
         engine.evict(hash)?;
@@ -2179,7 +2265,7 @@ mod tests {
         let upper = hash.to_string().to_uppercase();
         std::fs::write(&log_path, format!("{upper}\n"))?;
 
-        let engine = CacheEngine::open(tmp.path(), None, 10).await?;
+        let engine = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
         anyhow::ensure!(
             engine.is_evicted(hash),
             "uppercase hex line should load as the same hash",
@@ -2197,7 +2283,7 @@ mod tests {
     #[tokio::test]
     async fn evict_returns_err_when_persistence_fails() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
-        let engine = CacheEngine::open(tmp.path(), None, 10).await?;
+        let engine = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
         // Engine opened cleanly with no log file yet. Now plant a
         // directory at the path the engine will try to append to.
         std::fs::create_dir(tmp.path().join("evicted.log"))?;
@@ -2232,7 +2318,7 @@ mod tests {
     #[tokio::test]
     async fn inspect_unknown_hash_reports_absent() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
-        let engine = CacheEngine::open(tmp.path(), None, 10).await?;
+        let engine = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
         let unknown = Hash::new(b"never seen");
 
         let preview = engine.inspect(unknown).await?;
@@ -2259,7 +2345,8 @@ mod tests {
         let hash = Hash::new(payload);
         let origin = StubOrigin::new(payload);
 
-        let engine = CacheEngine::open(tmp.path(), Some(Arc::new(origin)), 10).await?;
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
         let _ = engine.get(hash).await?;
 
         let preview = engine.inspect(hash).await?;
@@ -2292,7 +2379,8 @@ mod tests {
         let hash = Hash::new(payload);
         let origin = StubOrigin::new(payload);
 
-        let engine = CacheEngine::open(tmp.path(), Some(Arc::new(origin)), 10).await?;
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
         let _ = engine.get(hash).await?;
         engine.evict(hash)?;
 
@@ -2326,7 +2414,8 @@ mod tests {
         let mut set = HashSet::new();
         set.insert(pinned_hash);
         let engine =
-            CacheEngine::open_with_pinned(tmp.path(), None, 10, PinnedHashes::new(set)).await?;
+            CacheEngine::open_with_pinned(tmp.path(), Vec::new(), 10, PinnedHashes::new(set))
+                .await?;
 
         let pinned_preview = engine.inspect(pinned_hash).await?;
         anyhow::ensure!(pinned_preview.pinned, "expected pinned=true");
@@ -2343,30 +2432,31 @@ mod tests {
     /// `inspect` (#439) reports the configured origin's backend kind so
     /// admin dry-run callers can estimate origin egress cost before
     /// committing to an eviction. Engine constructed with no origin
-    /// reports `None`.
+    /// reports an empty vec.
     #[tokio::test]
-    async fn inspect_reports_origin_kind_when_origin_configured() -> anyhow::Result<()> {
+    async fn inspect_reports_origin_kinds_when_origin_configured() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let origin = StubOrigin::new(b"egress-cost preview");
-        let engine = CacheEngine::open(tmp.path(), Some(Arc::new(origin)), 10).await?;
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
         let preview = engine.inspect(Hash::new(b"never-fetched")).await?;
         anyhow::ensure!(
-            preview.origin_kind == Some(OriginKind::Http),
-            "expected Some(Http), got {:?}",
-            preview.origin_kind,
+            preview.origin_kinds == vec![OriginKind::Http],
+            "expected [Http], got {:?}",
+            preview.origin_kinds,
         );
         Ok(())
     }
 
     #[tokio::test]
-    async fn inspect_reports_no_origin_kind_when_cache_only() -> anyhow::Result<()> {
+    async fn inspect_reports_no_origin_kinds_when_cache_only() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
-        let engine = CacheEngine::open(tmp.path(), None, 10).await?;
+        let engine = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
         let preview = engine.inspect(Hash::new(b"absent")).await?;
         anyhow::ensure!(
-            preview.origin_kind.is_none(),
-            "expected None for cache-only mode, got {:?}",
-            preview.origin_kind,
+            preview.origin_kinds.is_empty(),
+            "expected empty Vec for cache-only mode, got {:?}",
+            preview.origin_kinds,
         );
         Ok(())
     }
@@ -2385,7 +2475,7 @@ mod tests {
         let cm = Arc::new(CacheMetrics::default());
         let engine = CacheEngine::open_full(
             tmp.path(),
-            Some(Arc::new(origin)),
+            vec![Arc::new(origin) as Arc<dyn Origin>],
             10,
             crate::PinnedHashes::empty(),
             crate::RetryPolicy::default(),
@@ -2430,7 +2520,7 @@ mod tests {
         let cm = Arc::new(CacheMetrics::default());
         let engine = CacheEngine::open_full(
             tmp.path(),
-            Some(Arc::new(origin)),
+            vec![Arc::new(origin) as Arc<dyn Origin>],
             10,
             crate::PinnedHashes::empty(),
             crate::RetryPolicy::default(),
@@ -2456,7 +2546,7 @@ mod tests {
         let cm = Arc::new(CacheMetrics::default());
         let engine = CacheEngine::open_full(
             tmp.path(),
-            Some(Arc::new(origin)),
+            vec![Arc::new(origin) as Arc<dyn Origin>],
             10,
             crate::PinnedHashes::empty(),
             crate::RetryPolicy::default(),
@@ -2481,7 +2571,7 @@ mod tests {
         let cm = Arc::new(CacheMetrics::default());
         let engine = CacheEngine::open_full(
             tmp.path(),
-            None,
+            Vec::new(),
             10,
             crate::PinnedHashes::empty(),
             crate::RetryPolicy::default(),
@@ -2520,7 +2610,7 @@ mod tests {
         let cm = Arc::new(CacheMetrics::default());
         let engine = CacheEngine::open_full(
             tmp.path(),
-            Some(Arc::new(origin)),
+            vec![Arc::new(origin) as Arc<dyn Origin>],
             10,
             crate::PinnedHashes::empty(),
             crate::RetryPolicy::default(),
@@ -2557,7 +2647,7 @@ mod tests {
         let cm = Arc::new(CacheMetrics::default());
         let engine = CacheEngine::open_full(
             tmp.path(),
-            Some(Arc::new(origin)),
+            vec![Arc::new(origin) as Arc<dyn Origin>],
             10,
             crate::PinnedHashes::empty(),
             crate::RetryPolicy::default(),

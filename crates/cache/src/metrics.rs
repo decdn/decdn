@@ -73,6 +73,17 @@ pub struct CacheMetrics {
     /// (#285). Operator-actionable: any nonzero rate = user-visible
     /// origin failures the retry budget couldn't save.
     pub origin_retry_exhausted: Counter,
+    /// Times `pull_through` advanced from one origin to the next in
+    /// the operator-configured fallback chain (#284). One bump per
+    /// chain-walk step, *not* per per-origin retry — the latter is
+    /// covered by `origin_retry_exhausted`. Bumped only when there is
+    /// a next entry to try, so a single-origin chain (the pre-#284
+    /// common case) keeps this counter flat at zero. The denominator
+    /// for a "what fraction of misses needed fallback" alert is
+    /// `decdn_cache_origin_fetches_total`. Sustained nonzero against
+    /// a healthy primary backend suggests the chain is masking an
+    /// outage that should be paged on instead.
+    pub origin_fallback: Counter,
     /// `get()` calls served from the local store (#418). Includes both
     /// first-attempt hits and waiter retries that find the blob present
     /// after a coalesced concurrent pull-through completes (the

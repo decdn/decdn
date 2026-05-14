@@ -31,7 +31,7 @@ async fn serve_blob(payload: &'static [u8]) -> (MockServer, Hash) {
 async fn build_engine(origin_url: &str) -> anyhow::Result<(CacheEngine, tempfile::TempDir)> {
     let tmp = tempfile::tempdir()?;
     let origin = Arc::new(HttpOrigin::parse(origin_url)?);
-    let engine = CacheEngine::open(tmp.path(), Some(origin), 16).await?;
+    let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 16).await?;
     Ok((engine, tmp))
 }
 
@@ -49,7 +49,7 @@ async fn build_engine_no_retry(
     let origin = Arc::new(HttpOrigin::parse(origin_url)?);
     let engine = CacheEngine::open_full(
         tmp.path(),
-        Some(origin),
+        vec![origin as Arc<dyn Origin>],
         16,
         decdn_cache::PinnedHashes::empty(),
         RetryPolicy::disabled(),
@@ -152,7 +152,7 @@ async fn gc_reclaims_partial_import_bytes() -> anyhow::Result<()> {
     let gc_interval = Duration::from_millis(200);
     let engine = CacheEngine::open_full(
         tmp.path(),
-        Some(origin),
+        vec![origin as Arc<dyn Origin>],
         16,
         PinnedHashes::empty(),
         RetryPolicy::disabled(),
@@ -247,7 +247,7 @@ async fn gc_attribution_lags_one_cycle() -> anyhow::Result<()> {
     let gc_interval = Duration::from_millis(500);
     let engine = CacheEngine::open_full(
         tmp.path(),
-        Some(origin),
+        vec![origin as Arc<dyn Origin>],
         16,
         PinnedHashes::empty(),
         RetryPolicy::disabled(),
@@ -326,7 +326,7 @@ async fn gc_reclaims_cap_breach_partial_bytes() -> anyhow::Result<()> {
     let gc_interval = Duration::from_millis(200);
     let engine = CacheEngine::open_full(
         tmp.path(),
-        Some(origin),
+        vec![origin as Arc<dyn Origin>],
         1, // max_blob_size_mb = 1 MiB; payload is 2 MiB
         PinnedHashes::empty(),
         RetryPolicy::disabled(),
@@ -398,7 +398,7 @@ async fn gc_disabled_does_not_reclaim_or_emit_metrics() -> anyhow::Result<()> {
     let metrics = Arc::new(CacheMetrics::default());
     let engine = CacheEngine::open_full(
         tmp.path(),
-        Some(origin),
+        vec![origin as Arc<dyn Origin>],
         16,
         PinnedHashes::empty(),
         RetryPolicy::disabled(),
@@ -473,7 +473,7 @@ async fn blob_too_large_is_rejected_via_http_origin() -> anyhow::Result<()> {
 
     let tmp = tempfile::tempdir()?;
     let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
-    let engine = CacheEngine::open(tmp.path(), Some(origin), 1).await?;
+    let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 1).await?;
 
     let err = err_of(engine.get(hash).await)?;
     anyhow::ensure!(
@@ -519,7 +519,7 @@ async fn engine_rejects_oversize_bytes_from_misbehaving_origin() -> anyhow::Resu
     let origin = Arc::new(OversizedOrigin { payload });
 
     let tmp = tempfile::tempdir()?;
-    let engine = CacheEngine::open(tmp.path(), Some(origin), 1).await?;
+    let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 1).await?;
 
     let err = err_of(engine.get(hash).await)?;
     anyhow::ensure!(
@@ -546,7 +546,7 @@ async fn shutdown_flushes_without_drop() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     {
         let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
-        let engine = CacheEngine::open(tmp.path(), Some(origin), 16).await?;
+        let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 16).await?;
         let _ = engine.get(hash).await?;
         engine.shutdown().await?;
         // Skip Drop so this test fails if shutdown() stopped flushing.
@@ -554,7 +554,7 @@ async fn shutdown_flushes_without_drop() -> anyhow::Result<()> {
     }
     drop(server);
 
-    let engine = CacheEngine::open(tmp.path(), None, 16).await?;
+    let engine = CacheEngine::open(tmp.path(), Vec::new(), 16).await?;
     anyhow::ensure!(
         engine.has(hash).await?,
         "reopened engine should see the blob flushed by shutdown()"
@@ -682,7 +682,7 @@ async fn response_headers_timeout_fires_on_silent_server() -> anyhow::Result<()>
     let tmp = tempfile::tempdir()?;
     let engine = CacheEngine::open_full(
         tmp.path(),
-        Some(Arc::new(origin)),
+        vec![Arc::new(origin) as Arc<dyn Origin>],
         16,
         PinnedHashes::empty(),
         RetryPolicy::disabled(),
@@ -717,7 +717,7 @@ async fn chunk_idle_timeout_fires_when_origin_stalls_mid_body() -> anyhow::Resul
     let tmp = tempfile::tempdir()?;
     let engine = CacheEngine::open_full(
         tmp.path(),
-        Some(Arc::new(origin)),
+        vec![Arc::new(origin) as Arc<dyn Origin>],
         16,
         PinnedHashes::empty(),
         RetryPolicy::disabled(),
@@ -761,7 +761,7 @@ async fn pull_through_succeeds_above_one_mib_payload() -> anyhow::Result<()> {
 
     let cache_dir = tempfile::tempdir()?;
     let origin = Arc::new(FilesystemOrigin::new(origin_dir.path()).await?);
-    let engine = CacheEngine::open(cache_dir.path(), Some(origin), 16).await?;
+    let engine = CacheEngine::open(cache_dir.path(), vec![origin as Arc<dyn Origin>], 16).await?;
 
     let got = engine.get(hash).await?;
     anyhow::ensure!(got.len() == payload.len(), "size mismatch: {}", got.len());
@@ -780,7 +780,7 @@ async fn mid_stream_overrun_is_rejected_by_http_origin() -> anyhow::Result<()> {
 
     let tmp = tempfile::tempdir()?;
     let origin = Arc::new(HttpOrigin::parse(&origin_url)?);
-    let engine = CacheEngine::open(tmp.path(), Some(origin), 1).await?;
+    let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 1).await?;
 
     // Any hash works — the raw TCP server doesn't match paths.
     let err = err_of(engine.get(Hash::new(b"doesn't matter")).await)?;
@@ -797,7 +797,7 @@ async fn open_on_file_path_yields_store_error() -> anyhow::Result<()> {
     // regular file means that fails, which must surface as
     // `CacheError::Store` (the only variant reserved for store I/O issues).
     let tmp = tempfile::NamedTempFile::new()?;
-    let err = CacheEngine::open(tmp.path(), None, 16)
+    let err = CacheEngine::open(tmp.path(), Vec::new(), 16)
         .await
         .err()
         .ok_or_else(|| anyhow::anyhow!("expected open to fail on a file path"))?;
@@ -831,7 +831,7 @@ async fn fs_origin_pulls_and_caches() -> anyhow::Result<()> {
 
     let cache_dir = tempfile::tempdir()?;
     let origin = Arc::new(FilesystemOrigin::new(origin_dir.path()).await?);
-    let engine = CacheEngine::open(cache_dir.path(), Some(origin), 16).await?;
+    let engine = CacheEngine::open(cache_dir.path(), vec![origin as Arc<dyn Origin>], 16).await?;
 
     anyhow::ensure!(!engine.has(hash).await?, "blob should be absent initially");
     let got = engine.get(hash).await?;
@@ -850,7 +850,7 @@ async fn fs_origin_reports_not_found() -> anyhow::Result<()> {
     let origin_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
     let origin = Arc::new(FilesystemOrigin::new(origin_dir.path()).await?);
-    let engine = CacheEngine::open(cache_dir.path(), Some(origin), 16).await?;
+    let engine = CacheEngine::open(cache_dir.path(), vec![origin as Arc<dyn Origin>], 16).await?;
 
     let err = err_of(engine.get(Hash::new(b"absent")).await)?;
     anyhow::ensure!(
@@ -871,7 +871,7 @@ async fn fs_origin_rejects_oversize() -> anyhow::Result<()> {
 
     let cache_dir = tempfile::tempdir()?;
     let origin = Arc::new(FilesystemOrigin::new(origin_dir.path()).await?);
-    let engine = CacheEngine::open(cache_dir.path(), Some(origin), 1).await?;
+    let engine = CacheEngine::open(cache_dir.path(), vec![origin as Arc<dyn Origin>], 1).await?;
 
     let err = err_of(engine.get(hash).await)?;
     anyhow::ensure!(
@@ -884,7 +884,7 @@ async fn fs_origin_rejects_oversize() -> anyhow::Result<()> {
 #[tokio::test]
 async fn miss_without_origin_returns_no_origin() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
-    let engine = CacheEngine::open(tmp.path(), None, 16).await?;
+    let engine = CacheEngine::open(tmp.path(), Vec::new(), 16).await?;
     let err = err_of(engine.get(Hash::new(b"whatever")).await)?;
     anyhow::ensure!(
         matches!(err, CacheError::NoOrigin { .. }),
@@ -1036,7 +1036,7 @@ async fn http_origin_decompress_off_rejects_compressed_response() -> anyhow::Res
     let origin = Arc::new(
         HttpOrigin::parse(&server.uri())?.with_decompress_mode(decdn_cache::DecompressMode::Strict),
     );
-    let engine = CacheEngine::open(tmp.path(), Some(origin), 16).await?;
+    let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 16).await?;
     let err = err_of(engine.get(hash).await)?;
     let formatted = format!("{err:?}");
     anyhow::ensure!(
@@ -1067,7 +1067,7 @@ async fn http_origin_decompress_off_passes_through_identity() -> anyhow::Result<
     let tmp = tempfile::tempdir()?;
     let origin =
         Arc::new(HttpOrigin::parse(&server.uri())?.with_decompress_mode(DecompressMode::Strict));
-    let engine = CacheEngine::open(tmp.path(), Some(origin), 16).await?;
+    let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 16).await?;
     let bytes = engine.get(hash).await?;
     anyhow::ensure!(bytes.as_ref() == payload, "unexpected payload");
     Ok(())
@@ -1133,7 +1133,7 @@ async fn http_origin_rejects_decompression_bomb() -> anyhow::Result<()> {
 
     let tmp = tempfile::tempdir()?;
     let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
-    let engine = CacheEngine::open(tmp.path(), Some(origin), 1).await?;
+    let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 1).await?;
 
     let err = err_of(engine.get(canonical).await)?;
     anyhow::ensure!(
@@ -1271,7 +1271,7 @@ async fn http_origin_decompresses_above_blocking_threshold() -> anyhow::Result<(
 
     let tmp = tempfile::tempdir()?;
     let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
-    let engine = CacheEngine::open(tmp.path(), Some(origin), 16).await?;
+    let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 16).await?;
     let got = engine.get(hash).await?;
     anyhow::ensure!(got.len() == payload.len(), "size mismatch: {}", got.len());
     anyhow::ensure!(got[..] == payload[..], "decompressed content mismatch");
@@ -1305,7 +1305,7 @@ async fn http_origin_rejects_oversized_compressed_content_length() -> anyhow::Re
 
     let tmp = tempfile::tempdir()?;
     let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
-    let engine = CacheEngine::open(tmp.path(), Some(origin), 1).await?;
+    let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 1).await?;
 
     let err = err_of(engine.get(canonical).await)?;
     let msg = format!("{err:#}");
@@ -1399,7 +1399,7 @@ async fn http_origin_strict_mode_accepts_explicit_identity() -> anyhow::Result<(
     let tmp = tempfile::tempdir()?;
     let origin =
         Arc::new(HttpOrigin::parse(&server.uri())?.with_decompress_mode(DecompressMode::Strict));
-    let engine = CacheEngine::open(tmp.path(), Some(origin), 16).await?;
+    let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 16).await?;
     let got = engine.get(hash).await?;
     anyhow::ensure!(&got[..] == payload);
     Ok(())
@@ -1605,7 +1605,8 @@ async fn http_origin_rejects_advertised_oversize_before_reading_body() -> anyhow
         .with_timeouts(Duration::from_secs(5), Duration::from_millis(500));
 
     let tmp = tempfile::tempdir()?;
-    let engine = CacheEngine::open(tmp.path(), Some(Arc::new(origin)), 1).await?;
+    let engine =
+        CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 1).await?;
 
     let err = err_of(engine.get(Hash::new(b"anything")).await)?;
     let msg = format!("{err:#}");
@@ -1643,7 +1644,7 @@ async fn http_origin_accepts_content_length_exactly_at_cap() -> anyhow::Result<(
 
     let tmp = tempfile::tempdir()?;
     let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
-    let engine = CacheEngine::open(tmp.path(), Some(origin), CAP_MB).await?;
+    let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], CAP_MB).await?;
 
     let got = engine.get(hash).await?;
     anyhow::ensure!(
@@ -1673,7 +1674,7 @@ async fn http_origin_rejects_content_length_one_over_cap() -> anyhow::Result<()>
 
     let tmp = tempfile::tempdir()?;
     let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
-    let engine = CacheEngine::open(tmp.path(), Some(origin), CAP_MB).await?;
+    let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], CAP_MB).await?;
 
     let err = err_of(engine.get(hash).await)?;
     let msg = format!("{err:#}");
@@ -1829,7 +1830,8 @@ async fn http_origin_rejects_redirect_loop() -> anyhow::Result<()> {
         .with_timeouts(Duration::from_secs(10), Duration::from_secs(5));
 
     let tmp = tempfile::tempdir()?;
-    let engine = CacheEngine::open(tmp.path(), Some(Arc::new(origin)), 16).await?;
+    let engine =
+        CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 16).await?;
     let err = err_of(engine.get(hash).await)?;
     anyhow::ensure!(
         matches!(err, CacheError::OriginError { .. }),
@@ -1849,7 +1851,7 @@ async fn build_engine_with_retry(
     let tmp = tempfile::tempdir()?;
     let engine = CacheEngine::open_full(
         tmp.path(),
-        Some(origin),
+        vec![origin as Arc<dyn Origin>],
         16,
         PinnedHashes::empty(),
         policy,
@@ -2459,7 +2461,12 @@ async fn http_origin_sends_configured_user_agent() -> anyhow::Result<()> {
         "MyCdn/1.0 (+ops@example.com)",
     )?);
     let tmp = tempfile::tempdir()?;
-    let engine = CacheEngine::open(tmp.path(), Some(origin as Arc<dyn Origin>), 16).await?;
+    let engine = CacheEngine::open(
+        tmp.path(),
+        vec![origin as Arc<dyn Origin> as Arc<dyn Origin>],
+        16,
+    )
+    .await?;
 
     let got = engine.get(hash).await?;
     anyhow::ensure!(
@@ -2490,7 +2497,12 @@ async fn http_origin_sends_default_user_agent_when_unset() -> anyhow::Result<()>
     let url = parse_origin_url(&server.uri())?;
     let origin = Arc::new(HttpOrigin::new(url)?);
     let tmp = tempfile::tempdir()?;
-    let engine = CacheEngine::open(tmp.path(), Some(origin as Arc<dyn Origin>), 16).await?;
+    let engine = CacheEngine::open(
+        tmp.path(),
+        vec![origin as Arc<dyn Origin> as Arc<dyn Origin>],
+        16,
+    )
+    .await?;
 
     let got = engine.get(hash).await?;
     anyhow::ensure!(
@@ -2934,6 +2946,570 @@ async fn hash_mismatch_after_streaming_is_not_retried() -> anyhow::Result<()> {
     anyhow::ensure!(
         matches!(err, CacheError::HashMismatch { .. }),
         "expected HashMismatch, got: {err:?}"
+    );
+    Ok(())
+}
+
+// =====================================================================
+// Multi-origin fallback chain (#284)
+//
+// `pull_through` consults `cache.origins` in declared order. The next
+// entry is tried on `NotFound`, on `Permanent` errors, and on
+// `Transient` errors after the per-origin retry budget is exhausted.
+// Deterministic per-origin failures (`HashMismatch`, `BlobTooLarge`)
+// short-circuit the chain — they indicate a misbehaving backend that
+// must surface, not be masked by trying a different mirror.
+// =====================================================================
+
+/// Origin that always returns `NotFound`. Used to simulate a mirror
+/// that doesn't have the blob — the fallback chain should advance past
+/// it to the next entry.
+#[derive(Debug)]
+struct NotFoundOrigin {
+    fetch_count: std::sync::atomic::AtomicUsize,
+}
+
+impl NotFoundOrigin {
+    const fn new() -> Self {
+        Self {
+            fetch_count: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+    fn fetches(&self) -> usize {
+        self.fetch_count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Origin for NotFoundOrigin {
+    fn kind(&self) -> OriginKind {
+        OriginKind::Http
+    }
+
+    fn fetch(
+        &self,
+        _hash: Hash,
+        _max_bytes: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>> {
+        self.fetch_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async move { Ok(OriginFetch::NotFound) })
+    }
+}
+
+/// Origin that returns bytes whose BLAKE3 hash does not match the
+/// requested hash. Used to verify the engine surfaces `HashMismatch`
+/// without falling back — a hash mismatch is a backend misbehaviour
+/// signal, not an "is this blob present" signal, and trying the next
+/// origin would mask the underlying bug.
+#[derive(Debug)]
+struct LyingHashOrigin {
+    bogus: bytes::Bytes,
+}
+
+impl LyingHashOrigin {
+    fn new(bogus_payload: &[u8]) -> Self {
+        Self {
+            bogus: bytes::Bytes::from(bogus_payload.to_vec()),
+        }
+    }
+}
+
+impl Origin for LyingHashOrigin {
+    fn kind(&self) -> OriginKind {
+        OriginKind::Http
+    }
+
+    fn fetch(
+        &self,
+        _hash: Hash,
+        _max_bytes: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>> {
+        let payload = self.bogus.clone();
+        Box::pin(async move { Ok(OriginFetch::found_one_shot(payload)) })
+    }
+}
+
+/// Origin that wraps another and records how many `fetch` calls it
+/// receives. Used by fallback tests to assert that the chain DID or
+/// DID NOT advance to a given entry.
+#[derive(Debug)]
+struct CountingOrigin {
+    inner: Arc<dyn Origin>,
+    fetch_count: std::sync::atomic::AtomicUsize,
+}
+
+impl CountingOrigin {
+    fn new(inner: Arc<dyn Origin>) -> Self {
+        Self {
+            inner,
+            fetch_count: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+    fn fetches(&self) -> usize {
+        self.fetch_count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Origin for CountingOrigin {
+    fn kind(&self) -> OriginKind {
+        self.inner.kind()
+    }
+
+    fn fetch(
+        &self,
+        hash: Hash,
+        max_bytes: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>> {
+        self.fetch_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.fetch(hash, max_bytes)
+    }
+}
+
+/// Origin that serves a fixed `payload` on every fetch.
+#[derive(Debug)]
+struct PayloadOrigin {
+    payload: bytes::Bytes,
+}
+
+impl PayloadOrigin {
+    fn new(payload: &[u8]) -> Self {
+        Self {
+            payload: bytes::Bytes::from(payload.to_vec()),
+        }
+    }
+}
+
+impl Origin for PayloadOrigin {
+    fn kind(&self) -> OriginKind {
+        OriginKind::Http
+    }
+
+    fn fetch(
+        &self,
+        _hash: Hash,
+        _max_bytes: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>> {
+        let payload = self.payload.clone();
+        Box::pin(async move { Ok(OriginFetch::found_one_shot(payload)) })
+    }
+}
+
+/// Construct a `CacheEngine` over an explicit fallback chain and a
+/// fast retry policy. Sharing this helper across the fallback tests
+/// keeps assertions focused on chain-walk behaviour rather than
+/// engine-construction boilerplate.
+async fn build_engine_with_origins(
+    origins: Vec<Arc<dyn Origin>>,
+    metrics: Arc<CacheMetrics>,
+) -> anyhow::Result<(CacheEngine, tempfile::TempDir)> {
+    let tmp = tempfile::tempdir()?;
+    let engine = CacheEngine::open_full(
+        tmp.path(),
+        origins,
+        16,
+        PinnedHashes::empty(),
+        fast_retry_policy(3),
+        Some(metrics),
+        Duration::ZERO,
+    )
+    .await?;
+    Ok((engine, tmp))
+}
+
+#[tokio::test]
+async fn fallback_advances_on_notfound_to_next_origin() -> anyhow::Result<()> {
+    let payload: &[u8] = b"served by mirror #2";
+    let hash = Hash::new(payload);
+    let first = Arc::new(NotFoundOrigin::new());
+    let second = Arc::new(CountingOrigin::new(Arc::new(PayloadOrigin::new(payload))));
+    let metrics = Arc::new(CacheMetrics::default());
+    let (engine, _tmp) = build_engine_with_origins(
+        vec![
+            Arc::clone(&first) as Arc<dyn Origin>,
+            Arc::clone(&second) as Arc<dyn Origin>,
+        ],
+        Arc::clone(&metrics),
+    )
+    .await?;
+
+    let bytes = engine.get(hash).await?;
+    anyhow::ensure!(&bytes[..] == payload, "second origin must have served");
+    anyhow::ensure!(first.fetches() == 1, "primary must have been tried once");
+    anyhow::ensure!(second.fetches() == 1, "fallback must have been reached");
+    anyhow::ensure!(
+        metrics.origin_fallback.get() == 1,
+        "exactly one fallback advance step (primary -> secondary)"
+    );
+    anyhow::ensure!(
+        metrics.origin_fetches.get() == 1,
+        "origin_fetches must bump exactly once per pull_through call regardless of \
+         chain length (regression guard for #285 alerting ratios)",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn fallback_advances_on_permanent_error_to_next_origin() -> anyhow::Result<()> {
+    let payload: &[u8] = b"served after Permanent failure";
+    let hash = Hash::new(payload);
+    let first = Arc::new(PermanentlyFailingOrigin::new());
+    let second = Arc::new(CountingOrigin::new(Arc::new(PayloadOrigin::new(payload))));
+    let metrics = Arc::new(CacheMetrics::default());
+    let (engine, _tmp) = build_engine_with_origins(
+        vec![
+            Arc::clone(&first) as Arc<dyn Origin>,
+            Arc::clone(&second) as Arc<dyn Origin>,
+        ],
+        Arc::clone(&metrics),
+    )
+    .await?;
+
+    let bytes = engine.get(hash).await?;
+    anyhow::ensure!(&bytes[..] == payload, "second origin must have served");
+    anyhow::ensure!(
+        first.fetches() == 1,
+        "Permanent error must not burn retry budget on origin 0"
+    );
+    anyhow::ensure!(second.fetches() == 1, "fallback must have been reached");
+    anyhow::ensure!(
+        metrics.origin_fallback.get() == 1,
+        "exactly one fallback advance step",
+    );
+    anyhow::ensure!(
+        metrics.origin_fetches.get() == 1,
+        "origin_fetches must bump exactly once per pull_through call",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn fallback_advances_on_transient_after_retry_exhaustion() -> anyhow::Result<()> {
+    let payload: &[u8] = b"served after retry exhaustion";
+    let hash = Hash::new(payload);
+    // `max_failures = usize::MAX` => origin 0 transient-fails forever
+    // and the retry budget runs out. With `fast_retry_policy(3)` that
+    // is 1 + 3 = 4 attempts on origin 0 before the chain advances.
+    let first = Arc::new(FailingThenSucceedingOrigin::new(payload, usize::MAX));
+    let second = Arc::new(CountingOrigin::new(Arc::new(PayloadOrigin::new(payload))));
+    let metrics = Arc::new(CacheMetrics::default());
+    let (engine, _tmp) = build_engine_with_origins(
+        vec![
+            Arc::clone(&first) as Arc<dyn Origin>,
+            Arc::clone(&second) as Arc<dyn Origin>,
+        ],
+        Arc::clone(&metrics),
+    )
+    .await?;
+
+    let bytes = engine.get(hash).await?;
+    anyhow::ensure!(&bytes[..] == payload, "second origin must have served");
+    anyhow::ensure!(
+        first.fetches() == 4,
+        "retry budget should be fully spent on origin 0 (1 + 3 retries), got {}",
+        first.fetches(),
+    );
+    anyhow::ensure!(second.fetches() == 1, "fallback must have been reached");
+    anyhow::ensure!(
+        metrics.origin_retry_exhausted.get() == 1,
+        "retry exhaustion on origin 0 must increment counter",
+    );
+    anyhow::ensure!(
+        metrics.origin_fallback.get() == 1,
+        "exactly one chain-walk step",
+    );
+    anyhow::ensure!(
+        metrics.origin_fetches.get() == 1,
+        "origin_fetches counts pull_through calls, not per-origin attempts",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn fallback_does_not_advance_on_hash_mismatch() -> anyhow::Result<()> {
+    // Operator-actionable error class: a misbehaving backend served
+    // bytes that don't match the requested hash. The engine must
+    // surface that — *not* mask it by trying the next mirror — so a
+    // bad backend gets diagnosed instead of silently fronted by its
+    // peers.
+    let requested: &[u8] = b"requested payload";
+    let bogus: &[u8] = b"bogus payload that hashes differently";
+    let hash = Hash::new(requested);
+    let first = Arc::new(LyingHashOrigin::new(bogus));
+    let second = Arc::new(CountingOrigin::new(Arc::new(PayloadOrigin::new(requested))));
+    let metrics = Arc::new(CacheMetrics::default());
+    let (engine, _tmp) = build_engine_with_origins(
+        vec![
+            Arc::clone(&first) as Arc<dyn Origin>,
+            Arc::clone(&second) as Arc<dyn Origin>,
+        ],
+        Arc::clone(&metrics),
+    )
+    .await?;
+
+    let err = err_of(engine.get(hash).await)?;
+    anyhow::ensure!(
+        matches!(err, CacheError::HashMismatch { .. }),
+        "expected HashMismatch from origin 0; chain must not advance, got: {err:?}",
+    );
+    anyhow::ensure!(
+        second.fetches() == 0,
+        "second origin must not be consulted after a hash mismatch",
+    );
+    anyhow::ensure!(
+        metrics.origin_fallback.get() == 0,
+        "hash mismatch must not bump the fallback counter",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn fallback_does_not_advance_on_blob_too_large() -> anyhow::Result<()> {
+    // Operator-set cap breach: surfacing this lets operators tune
+    // `max_blob_size_mb` or evict the offender, rather than silently
+    // letting a chain mirror serve under the same cap.
+    let payload = bytes::Bytes::from(vec![0xCDu8; 2 * 1024 * 1024]);
+    let hash = Hash::new(&payload);
+    let first = Arc::new(OversizedOrigin { payload });
+    let second = Arc::new(CountingOrigin::new(Arc::new(PayloadOrigin::new(b"x"))));
+    let metrics = Arc::new(CacheMetrics::default());
+
+    // Cap at 1 MiB so the 2 MiB payload trips BlobTooLarge.
+    let tmp = tempfile::tempdir()?;
+    let engine = CacheEngine::open_full(
+        tmp.path(),
+        vec![
+            Arc::clone(&first) as Arc<dyn Origin>,
+            Arc::clone(&second) as Arc<dyn Origin>,
+        ],
+        1,
+        PinnedHashes::empty(),
+        fast_retry_policy(3),
+        Some(Arc::clone(&metrics)),
+        Duration::ZERO,
+    )
+    .await?;
+
+    let err = err_of(engine.get(hash).await)?;
+    anyhow::ensure!(
+        matches!(err, CacheError::BlobTooLarge { .. }),
+        "expected BlobTooLarge from origin 0; chain must not advance, got: {err:?}",
+    );
+    anyhow::ensure!(
+        second.fetches() == 0,
+        "second origin must not be consulted after BlobTooLarge",
+    );
+    anyhow::ensure!(
+        metrics.origin_fallback.get() == 0,
+        "BlobTooLarge must not bump the fallback counter",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn all_origins_notfound_surfaces_notfound() -> anyhow::Result<()> {
+    let hash = Hash::new(b"never-served");
+    let first = Arc::new(NotFoundOrigin::new());
+    let second = Arc::new(NotFoundOrigin::new());
+    let metrics = Arc::new(CacheMetrics::default());
+    let (engine, _tmp) = build_engine_with_origins(
+        vec![
+            Arc::clone(&first) as Arc<dyn Origin>,
+            Arc::clone(&second) as Arc<dyn Origin>,
+        ],
+        Arc::clone(&metrics),
+    )
+    .await?;
+
+    let err = err_of(engine.get(hash).await)?;
+    anyhow::ensure!(
+        matches!(err, CacheError::NotFound { .. }),
+        "all-NotFound chain must surface NotFound (=> 404 at edge), got: {err:?}",
+    );
+    anyhow::ensure!(first.fetches() == 1 && second.fetches() == 1);
+    anyhow::ensure!(
+        metrics.origin_fallback.get() == 1,
+        "exactly one chain advance from origin 0 -> origin 1",
+    );
+    Ok(())
+}
+
+/// Origin that returns a `Permanent` error carrying a caller-supplied
+/// marker string. Used to verify which origin's error survives in the
+/// all-exhausted `OriginError` source chain.
+#[derive(Debug)]
+struct LabeledPermanentlyFailingOrigin {
+    marker: String,
+}
+
+impl LabeledPermanentlyFailingOrigin {
+    fn new(marker: &str) -> Self {
+        Self {
+            marker: marker.to_string(),
+        }
+    }
+}
+
+impl Origin for LabeledPermanentlyFailingOrigin {
+    fn kind(&self) -> OriginKind {
+        OriginKind::Http
+    }
+
+    fn fetch(
+        &self,
+        _hash: Hash,
+        _max_bytes: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>> {
+        let marker = self.marker.clone();
+        Box::pin(async move {
+            Err(OriginPullError::Permanent(anyhow::anyhow!(
+                "synthetic permanent failure with marker={marker}"
+            )))
+        })
+    }
+}
+
+#[tokio::test]
+async fn all_origins_error_surfaces_origin_error_with_last_failure() -> anyhow::Result<()> {
+    // The chain-walk decision is "last error wins" — operators
+    // triaging the surfaced 5xx see the most recently consulted
+    // backend's failure. Use distinguishable markers on origins 0 and
+    // 1 to assert origin 1's error survives into `OriginError.source`,
+    // not origin 0's.
+    let hash = Hash::new(b"never-served");
+    let first = Arc::new(LabeledPermanentlyFailingOrigin::new("primary-marker"));
+    let second = Arc::new(LabeledPermanentlyFailingOrigin::new("mirror-marker"));
+    let metrics = Arc::new(CacheMetrics::default());
+    let (engine, _tmp) = build_engine_with_origins(
+        vec![
+            Arc::clone(&first) as Arc<dyn Origin>,
+            Arc::clone(&second) as Arc<dyn Origin>,
+        ],
+        Arc::clone(&metrics),
+    )
+    .await?;
+
+    let err = err_of(engine.get(hash).await)?;
+    anyhow::ensure!(
+        matches!(err, CacheError::OriginError { .. }),
+        "all-error chain must surface OriginError (=> 5xx at edge), got: {err:?}",
+    );
+    let chain = format!("{err:#}");
+    anyhow::ensure!(
+        chain.contains("mirror-marker"),
+        "OriginError must carry the LAST origin's failure marker; got chain: {chain}",
+    );
+    anyhow::ensure!(
+        !chain.contains("primary-marker"),
+        "OriginError must NOT carry the discarded earlier failure; got chain: {chain}",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn fallback_counter_increments_per_step_in_three_origin_chain() -> anyhow::Result<()> {
+    // Pin the per-step semantics of `origin_fallback`: with 3 origins
+    // and the payload only on origin 2, the chain advances twice
+    // (origin 0 -> 1, origin 1 -> 2), and the counter must reflect
+    // both steps. A regression that bumps the counter once per
+    // pull_through (rather than per advance) would still pass any
+    // 2-origin test.
+    let payload: &[u8] = b"served from third mirror";
+    let hash = Hash::new(payload);
+    let first = Arc::new(NotFoundOrigin::new());
+    let second = Arc::new(NotFoundOrigin::new());
+    let third = Arc::new(CountingOrigin::new(Arc::new(PayloadOrigin::new(payload))));
+    let metrics = Arc::new(CacheMetrics::default());
+    let (engine, _tmp) = build_engine_with_origins(
+        vec![
+            Arc::clone(&first) as Arc<dyn Origin>,
+            Arc::clone(&second) as Arc<dyn Origin>,
+            Arc::clone(&third) as Arc<dyn Origin>,
+        ],
+        Arc::clone(&metrics),
+    )
+    .await?;
+
+    let bytes = engine.get(hash).await?;
+    anyhow::ensure!(&bytes[..] == payload, "third origin must have served");
+    anyhow::ensure!(first.fetches() == 1 && second.fetches() == 1 && third.fetches() == 1);
+    anyhow::ensure!(
+        metrics.origin_fallback.get() == 2,
+        "expected exactly 2 chain-walk steps (0 -> 1 and 1 -> 2), got {}",
+        metrics.origin_fallback.get(),
+    );
+    anyhow::ensure!(
+        metrics.origin_fetches.get() == 1,
+        "origin_fetches must bump once per pull_through regardless of chain length, got {}",
+        metrics.origin_fetches.get(),
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn mixed_notfound_then_error_surfaces_error() -> anyhow::Result<()> {
+    // Decision documented in adr/plan: a known backend errored is more
+    // diagnostic than "no backend had it", so any non-NotFound failure
+    // beats a prior NotFound in the chain.
+    let hash = Hash::new(b"never-served");
+    let first = Arc::new(NotFoundOrigin::new());
+    let second = Arc::new(PermanentlyFailingOrigin::new());
+    let metrics = Arc::new(CacheMetrics::default());
+    let (engine, _tmp) = build_engine_with_origins(
+        vec![
+            Arc::clone(&first) as Arc<dyn Origin>,
+            Arc::clone(&second) as Arc<dyn Origin>,
+        ],
+        Arc::clone(&metrics),
+    )
+    .await?;
+
+    let err = err_of(engine.get(hash).await)?;
+    anyhow::ensure!(
+        matches!(err, CacheError::OriginError { .. }),
+        "mixed NotFound-then-Error chain must surface OriginError, got: {err:?}",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn single_origin_vec_preserves_pre_284_behaviour() -> anyhow::Result<()> {
+    // Regression guard: a one-element origin vec must behave
+    // identically to the old `Some(origin)` single-origin path.
+    let payload: &[u8] = b"single origin success";
+    let hash = Hash::new(payload);
+    let only = Arc::new(CountingOrigin::new(Arc::new(PayloadOrigin::new(payload))));
+    let metrics = Arc::new(CacheMetrics::default());
+    let (engine, _tmp) = build_engine_with_origins(
+        vec![Arc::clone(&only) as Arc<dyn Origin>],
+        Arc::clone(&metrics),
+    )
+    .await?;
+
+    let bytes = engine.get(hash).await?;
+    anyhow::ensure!(&bytes[..] == payload);
+    anyhow::ensure!(only.fetches() == 1);
+    anyhow::ensure!(
+        metrics.origin_fallback.get() == 0,
+        "single-origin chain never advances; counter stays flat at zero",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn empty_origin_vec_returns_no_origin() -> anyhow::Result<()> {
+    let hash = Hash::new(b"impossible");
+    let metrics = Arc::new(CacheMetrics::default());
+    let (engine, _tmp) = build_engine_with_origins(Vec::new(), Arc::clone(&metrics)).await?;
+
+    let err = err_of(engine.get(hash).await)?;
+    anyhow::ensure!(
+        matches!(err, CacheError::NoOrigin { .. }),
+        "empty chain must surface NoOrigin (cache-only mode), got: {err:?}",
+    );
+    anyhow::ensure!(
+        metrics.origin_fetches.get() == 0,
+        "no origin attempted => no origin_fetches bump",
     );
     Ok(())
 }

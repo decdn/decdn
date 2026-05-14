@@ -729,7 +729,7 @@ impl RuntimeReloadState {
                 cache_dir: PathBuf::from("/tmp/cache"),
                 cache_size_mb: 1024,
                 max_blob_size_mb: 128,
-                origin: None,
+                origins: Vec::new(),
                 pinned_hashes: decdn_cache::PinnedHashes::empty(),
                 origin_retry: decdn_cache::RetryPolicy::default(),
                 user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
@@ -1165,7 +1165,7 @@ mod tests {
                 cache_dir: PathBuf::from("/tmp/cache"),
                 cache_size_mb: 1024,
                 max_blob_size_mb: 128,
-                origin: None,
+                origins: Vec::new(),
                 pinned_hashes: decdn_cache::PinnedHashes::empty(),
                 origin_retry: decdn_cache::RetryPolicy::default(),
                 user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
@@ -1649,7 +1649,7 @@ mod tests {
     /// just leave the engine unattached.
     async fn build_test_cache() -> (decdn_cache::CacheEngine, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
-        let engine = decdn_cache::CacheEngine::open(tmp.path(), None, 16)
+        let engine = decdn_cache::CacheEngine::open(tmp.path(), Vec::new(), 16)
             .await
             .unwrap();
         (engine, tmp)

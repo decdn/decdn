@@ -59,12 +59,20 @@ pub struct ResolvedCache {
     pub cache_size_mb: u64,
     /// Maximum single blob size in megabytes.
     pub max_blob_size_mb: u64,
-    /// Resolved origin backend, if any (#437). `None` => no
-    /// pull-through; cache misses return `NoOrigin`. Per-variant
-    /// validation (URL parse, S3 bucket/region/prefix shape) has
-    /// already run at resolution time — the wiring layer can construct
-    /// the concrete `Origin` impl without re-validating.
-    pub origin: Option<ResolvedOrigin>,
+    /// Resolved ordered list of origin backends (#437, #284). Empty
+    /// vec => no pull-through; cache misses return `NoOrigin`. A
+    /// single-element vec preserves the pre-#284 single-origin
+    /// semantics and is also the form produced from a `[cache.origin]`
+    /// (singular) TOML table — both wire forms (singular and plural
+    /// `[[cache.origins]]`) collapse here so downstream wiring sees
+    /// one canonical representation. Per-variant validation (URL
+    /// parse, S3 bucket/region/prefix shape) has already run at
+    /// resolution time — the wiring layer can construct the concrete
+    /// `Origin` impl without re-validating. Order is significant: the
+    /// engine tries entries in this order on a cache miss and falls
+    /// back to the next on `NotFound`, permanent error, or transient
+    /// retry exhaustion.
+    pub origins: Vec<ResolvedOrigin>,
     /// Operator-pinned blob hashes (#276). Hashes here are excluded from
     /// LRU eviction candidates by [`decdn_cache::CacheEngine`]. Resolved
     /// from the hex-encoded TOML form at load time, so any wrong-length
