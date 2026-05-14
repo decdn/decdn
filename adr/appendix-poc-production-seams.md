@@ -160,7 +160,7 @@ pub trait FeeRouterClient: Send + Sync {
 
 | | Tests / local dev | Network deployment |
 |---|-----|------------|
-| Implementation | `MockFeeRouterClient` — in-process mock for harnesses with no deployed contracts; never a deployment-time backend | `OnchainFeeRouterClient` — deployed `FeeRouter` contract address per network; the full production split applies to every network deployment per [ADR 016 § Tunable Economics](016-contract-interactions.md#tunable-economics) (simplified-launch configurations set bucket shares via `setShares` on the same contract, not via a reduced-surface stub) |
+| Implementation | `MockFeeRouterClient` — in-process mock for harnesses with no deployed contracts; never a deployment-time backend | `OnchainFeeRouterClient` — deployed `FeeRouter` contract address per network; the full production split applies to every network deployment per [ADR 016 § Tunable Economics](016-contract-interactions.md#tunable-economics) (simplified-launch configurations set bucket shares via `FeeRouter.setShares(...)` on the same contract, not via a reduced-surface stub) |
 | Settlement path | `PaymentChannel.settleChannel` interacts with the mock router; downstream buckets simulated for assertion | `PaymentChannel.settleChannel` calls `FeeRouter.routeSettlement(operator, bytesDelivered, amount, epochId)` in the same transaction |
 | Per-network config | N/A | Address sourced from chain-id-keyed config; sum-to-100% safety bounds enforced on chain |
 
