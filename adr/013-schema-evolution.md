@@ -26,7 +26,7 @@ Every message on every QUIC stream (all ALPNs) is length-prefixed:
 └─────────────────────┴──────────────────────────────┘
 ```
 
-The varint uses postcard's native varint encoding (a continuation-bit scheme similar to LEB128). Maximum message size: `MAX_MESSAGE_SIZE = 16 MiB` (16,777,216 bytes). Messages exceeding this limit are rejected before allocation. This limit applies uniformly across all ALPNs for PoC simplicity; production deployments MAY tighten this per-ALPN (see [Open Questions](#open-questions)). **DoS note:** Since `read_frame` allocates a buffer of `len` bytes, a malicious peer could send a large length prefix to force allocation. The 16 MiB cap bounds per-stream allocation, and QUIC's `MAX_STREAMS` transport parameter ([ADR 005](005-protocol.md)) bounds concurrent streams per connection — together limiting total memory exposure per peer. Operators running memory-constrained nodes SHOULD set a lower `MAX_MESSAGE_SIZE` as a local policy; `cdn/probe/v1` messages never exceed ~200 bytes, and `cdn/client/v1` messages (excluding `ChunkData`) never exceed ~1 KiB.
+The varint uses postcard's native varint encoding (a continuation-bit scheme similar to LEB128). Maximum message size: `MAX_MESSAGE_SIZE = 16 MiB` (16,777,216 bytes) — a single global protocol-level limit applied uniformly across all ALPNs. Messages exceeding this limit are rejected before allocation. Per-ALPN protocol-level caps are rejected: typical message sizes are orders of magnitude below 16 MiB (see *DoS note* below), and a future ALPN requiring >16 MiB messages would itself be a major-version change. **DoS note:** Since `read_frame` allocates a buffer of `len` bytes, a malicious peer could send a large length prefix to force allocation. The 16 MiB cap bounds per-stream allocation, and QUIC's `MAX_STREAMS` transport parameter ([ADR 005](005-protocol.md)) bounds concurrent streams per connection — together limiting total memory exposure per peer. Operators running memory-constrained nodes SHOULD set a lower `MAX_MESSAGE_SIZE` as a local policy; `cdn/probe/v1` messages never exceed ~200 bytes, and `cdn/client/v1` messages (excluding `ChunkData`) never exceed ~1 KiB.
 
 The receiver reads the varint length, allocates and reads exactly that many bytes, then deserializes with `postcard::take_from_bytes` on the bounded slice. `take_from_bytes` succeeds even if the sender's struct has more fields than the receiver's definition — the unconsumed trailing bytes are returned as a remainder. This is the key mechanism for forward-compatible minor evolution.
 
@@ -127,6 +127,13 @@ On receiving a gossip message, peers deserialize `GossipEnvelope` using `take_fr
 #### Topic names vs. envelope version
 
 Topic names (`cdn/global/v1`, `cdn/reputation/v1`) embed a version that refers to the topic's semantic contract — its purpose, membership rules, and validation semantics. The `GossipEnvelope.version` handles wire format evolution independently. A topic name version bump (e.g., `cdn/global/v2`) is the gossip equivalent of a major ALPN bump and requires dual-subscription during transition.
+
+**Rule for choosing between envelope evolution and topic bump:**
+
+- *Payload-shape changes* — new optional fields, new `GossipPayload` enum variants, additional unsigned outer fields → **envelope evolution**. Bump `GossipEnvelope.version` only if the envelope wire format itself changes; otherwise append to `GossipPayload` (Tier 2) or extend an inner message via the `Body` + outer fields pattern (Tier 1). The topic name does **not** change; no dual-subscription cost is incurred. Old peers safely ignore unknown payload variants per the [Deserialization rule](#deserialization-rule).
+- *Topic-level changes* — who may publish, what registry or membership rule applies, what validation semantics gate acceptance, the topic's purpose → **topic name bump** (`cdn/global/v2`) with dual-subscription during the [Deprecation Timeline](#deprecation-timeline). Envelope-version evolution cannot express these changes because they alter the trust contract of the topic itself; an old subscriber would accept messages under semantics it no longer enforces.
+
+This dichotomy is load-bearing: topic bumps are expensive (every node and validating client dual-subscribes for the full deprecation window) and unnecessary for payload-shape changes that two-phase deserialization already absorbs. The default for any backwards-compatible message change MUST be envelope evolution; topic bumps are reserved for genuine trust-contract changes.
 
 #### Gossip validation interaction
 
@@ -408,7 +415,7 @@ A node MUST support at least the current and previous major version simultaneous
 | Old version removal | T+12 weeks | Old version support MAY be removed. Nodes that have not upgraded become unreachable by new clients |
 | Gossip topic removal | T+12 weeks | Old gossip topic subscriptions MAY be dropped. Peers on old topics become invisible |
 
-Deprecation schedules are announced via governance ([ADR 009](009-governance.md)). A future governance-maintained on-chain `ProtocolVersions` registry could formalize version sunset dates — deferred follow-up.
+Deprecation schedules are announced via governance ([ADR 009](009-governance.md)). An on-chain `ProtocolVersions` registry contract is explicitly out of scope — off-chain governance announcement combined with QUIC ALPN negotiation already covers the runtime path (clients try the newest version first and fall back on `no_application_protocol`), and a dedicated registry contract adds governance and integration complexity without operational payoff at the expected network scale. If a future scale or trust profile changes the calculus, the registry would warrant its own ADR rather than a deferred follow-up here.
 
 > **See also:** [`appendix-operator-upgrade-path.md`](appendix-operator-upgrade-path.md) sequences the operator-side actions for each tier — Tier 1/2 checklists, the Tier 3 rolling-upgrade procedure, and client / governance coordination touchpoints.
 
@@ -429,12 +436,6 @@ QUIC application error codes used by this ADR:
 These codes SHOULD be delivered via `RESET_STREAM` / `STOP_SENDING` so that other streams multiplexed on the same QUIC connection are unaffected. An ALPN that guarantees a 1:1 connection:stream topology (e.g. `cdn/probe/v1`) MAY additionally mirror the same code in the application-level `CONNECTION_CLOSE` frame so the peer observes a deterministic error code even when a stream reset races connection teardown. ALPNs that multiplex multiple streams per connection MUST NOT surface these codes at the connection level, as doing so would tear down unrelated streams.
 
 Additional application error codes defined by other ADRs are unaffected. The codes above occupy the low range `0x00`–`0x0F`; ADRs allocating new codes SHOULD use `0x10` and above to avoid collisions.
-
-## Open Questions
-
-1. **Gossip topic migration.** When a gossip topic requires a major version bump (e.g., `cdn/global/v2`), should nodes subscribe to both old and new topics during transition, or is the `GossipEnvelope` version field sufficient for all foreseeable gossip evolution? Recommendation: envelope-only for payload changes; topic bump reserved for changes to topic membership rules or validation semantics.
-2. **Signed field evolution via extension fields.** Could a future "signature v2" scheme allow appending unsigned extension fields to signed messages — signing a hash of the canonical fields and placing extensions outside the signed region? This would enable minor evolution of currently-frozen messages without an ALPN bump. Deferred — not needed for v1, and the `Body` + unsigned outer fields pattern (see [Signed Field Freezing](#signed-field-freezing)) is sufficient for now.
-3. **Per-ALPN `MAX_MESSAGE_SIZE`.** Should different ALPNs have different maximum message sizes? `cdn/probe/v1` messages are small (<200 bytes) while future `cdn/client/v1` extensions could be larger. A per-ALPN limit would tighten bounds. Recommendation: single global limit for simplicity in v1; per-ALPN limits can be introduced as a configuration change (no wire format impact).
 
 ## ADRs Affected
 
