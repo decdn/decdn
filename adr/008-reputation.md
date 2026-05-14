@@ -292,15 +292,16 @@ type RegionalCoverage = HashMap<[u8; 2], CoverageBucket>;
 
 Only regions that have produced at least one delivery interaction in the trailing decay window appear in the map — operators serving 5 regions carry 5 entries, not 197.
 
-#### Update rule (mirrors Section 3)
+#### Update rule
 
 On receipt of a `ReputationReport` from reporter `R` about operator `O`:
 
 1. Look up `R.region` from the local peer table (the latest `NodeAnnounce` for `R`'s `NodeId` per [ADR 001 § Node Discovery](001-network.md#node-discovery-gossip)). Reports from reporters with no current `NodeAnnounce` or with an unattested region are dropped from regional aggregation only — they still contribute to the main `network_score` per Section 4.
 2. If no bucket exists for `R.region`, initialize `bucket.score = 0.5` (neutral) — same convention as the main scores in Section 3 — and proceed to step 3.
 3. Compute `interaction_score` from `report.metrics` using the same formula as Section 3 (`0.4 × speed_score + 0.4 × correctness + 0.2 × reachability`).
-4. Update the bucket: `bucket.score = ewma(bucket.score, interaction_score, alpha=0.1)` — same `alpha` as the local-score path in Section 3.
-5. Set `bucket.last_interaction_at = now` (unix seconds).
+4. Compute `reporter_weight` for `R` using the existing Section 4 machinery: `effective_settled_value(R)` with the §4.1 distinct-counterparty discount and §4.2 time decay applied, normalized against `max(1, max_effective_settled_value_observed)`, capped at the 3× `weight_cap`. Reporters with `reporter_weight = 0` (fresh-staked, no settled-channel history yet) have no effect on the bucket.
+5. Update the bucket: `bucket.score = ewma(bucket.score, interaction_score, alpha = 0.05 × reporter_weight)` — same weighted-EWMA shape as `network_score` in Section 4. Cap the delta at ±0.05 per the Section 8 per-report clamp.
+6. Set `bucket.last_interaction_at = now` (unix seconds).
 
 #### Decay (mirrors Section 7)
 
@@ -329,13 +330,15 @@ No new gossip topic is introduced. The map is per-consumer (each node computes i
 
 Eligibility thresholds (e.g., "operator must have coverage ≥ 0.7 in at least 3 regions to qualify for the grant") belong to consuming programs, not to this ADR. The reputation system commits only to publishing the signal in a form those programs can read.
 
-#### Trust and region attestation
+#### Adversarial robustness
 
-The signal is only as trusted as the reporter's self-declared region. ADR 001 region attestation is unverified at the protocol level today — IP-geolocation cross-checking is tracked as future work in [#400](https://github.com/decdn/decdn/issues/400). The existing latency-contradiction mitigation in [ADR 001](001-network.md) (a reporter claiming `DE` but observed at >150 ms RTT from another `DE` node triggers a reputation penalty) is the working defence. Consumers requiring stronger attestation than self-declaration should apply their own filtering — e.g., only credit reports from reporters whose latency-contradiction rate is below a threshold.
+**Sybil resistance** is inherited from Section 4. The reporter-weight machinery (`effective_settled_value` with the §4.1 distinct-counterparty discount and §4.2 time decay, capped at 3× via `weight_cap`) applies in full per the Update rule above. A freshly-staked Sybil reporter — one that has met the §6 staking requirement (50,000 TOKEN per [ADR 026 §7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake)) but has no settled-channel history — has `reporter_weight = 0` and produces zero movement in any regional bucket. To influence the signal, a Sybil ring must additionally build sustained settlement activity with distinct counterparties outside the ring. The cost is the same as wash-trading `network_score`: `N × 50,000 TOKEN` stake plus continuous settlement cycling against external counterparties to counteract the §4.2 time decay. The Section 8 per-report ±0.05 clamp applies regardless of weight, so even a max-weight attacker cannot move a bucket by more than 0.05 per admitted report.
+
+**Region-attestation residual.** Even with full §4 weighting, the signal trusts the reporter's self-declared `node.region` from `NodeAnnounce`. A wealthy attacker with deep settlement history (high `reporter_weight`) can rotate their `NodeAnnounce.region` between reports to paint coverage in regions they do not actually serve. ADR 001 region attestation is unverified at the protocol level today — IP-geolocation cross-checking is tracked as future work in [#400](https://github.com/decdn/decdn/issues/400). The existing latency-contradiction mitigation in [ADR 001](001-network.md) (a reporter claiming `DE` but observed at >150 ms RTT from another `DE` node triggers a reputation penalty) catches gross lies but does not catch adjacent-country claims (e.g., a Dutch reporter claiming `DE`) or VPN-routed reporters claiming the VPN-exit region. This residual is bounded by the same §4 wealth gate (rotating regions is cheap, but the reporter still needs §4 weight to matter) but is not eliminated by it. Consumers requiring stronger region attestation should apply their own filtering — e.g., only credit reports from reporters whose latency-contradiction rate is below a threshold.
 
 #### Why no wire change to `ReputationReport`
 
-The reporter's region is already public via `NodeAnnounce`, which every consumer subscribes to per [ADR 001](001-network.md). Embedding `region` in `ReportMetrics` would duplicate state, force receivers to choose between report-stamped vs `NodeAnnounce`-stamped region on disagreement, and break the principle that a single source of truth (`NodeAnnounce`) carries operator metadata. The peer-table lookup adds one hash-map read per report and has no wire cost.
+The reporter's region is already public via `NodeAnnounce`, which every consumer subscribes to per [ADR 001](001-network.md). The `reporter_weight` is computed from on-chain `ChannelSettled` events that Section 4 already indexes — no new on-chain reads beyond what the main `network_score` path requires. Embedding either field in `ReportMetrics` would duplicate state, force receivers to choose between report-stamped vs canonical-source on disagreement, and break the principle that `NodeAnnounce` and on-chain `ChannelSettled` events are the single sources of truth for reporter metadata. The peer-table lookup adds one hash-map read per report; the weight lookup adds one cache read. Both have no wire cost.
 
 ## Consequences
 
