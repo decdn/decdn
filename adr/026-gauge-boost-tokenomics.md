@@ -426,7 +426,7 @@ interface ISafetyReserve {
     event SlashAppealOpened(uint256 indexed appealId, uint256 indexed slashId, address indexed appellant, bytes32 evidenceBundleHash, uint256 bond);
     event SlashAppealFastTracked(uint256 indexed appealId, uint256 escrowAmount);
     event SlashAppealRejected(uint256 indexed appealId, uint256 bondSlashed);
-    event SlashAppealRatified(uint256 indexed appealId, address indexed recipient, uint256 restitutionAmount);
+    event SlashAppealRatified(uint256 indexed appealId, uint256 indexed incidentId, address recipient, uint256 restitutionAmount);
     event SlashAppealReversed(uint256 indexed appealId, uint256 escrowReturned, address bondSplitRecipient, uint256 bondSplitAmount);
     event SlashAppealLapsed(uint256 indexed appealId, uint256 escrowReturned, uint256 bondRefunded);
     event GovernorUpdated(address indexed oldAddr, address indexed newAddr);

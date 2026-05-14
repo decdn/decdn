@@ -43,7 +43,7 @@ struct Appeal {
     // ─── Slot 3 (32 bytes) ─────────────────────────────────────
     uint256 bond;                   // escrowed TOKEN amount (APPEAL_BOND at filing time)
     // ─── Slot 4 (32 bytes) ─────────────────────────────────────
-    uint256 escrowAmount;           // USDC moved from general balance on fastTrackAppeal (0 until fast-track)
+    uint256 escrowAmount;           // USDC lien recorded on fastTrackAppeal (0 until fast-track; participates in the §2 solvency invariant, not a separate balance — see §2 "Escrow is a lien, not a sub-account")
     // ─── Slot 5 (32 bytes, packed) ─────────────────────────────
     uint64  reviewWindowEndsUs;     // 8 bytes — running deadline for the active review window (multisig pre-fast-track, ve-Governor post-fast-track)
     bytes24 _pad1;                  // 24 bytes — explicit padding for slot completion
@@ -61,6 +61,12 @@ mapping(address => uint64) public lastAcceptedAppealUs;
 // Bond escrow accounting — TOKEN held by the contract for active appeals.
 // Public view; auxiliary to the per-appeal `bond` field above for off-chain solvency dashboards.
 uint256 public totalAppealBondsEscrowed;
+
+// USDC lien aggregate — sum of `escrowAmount` across all appeals with `status == FastTracked`.
+// Maintained incrementally (incremented in `fastTrackAppeal`, decremented in `ratifyAppeal` /
+// `reverseAppeal` / `cleanupExpiredAppeal` case (b)). Participates in the §2 solvency invariant
+// so `payout()` and `fastTrackAppeal` can both check liens without iterating `appeals`.
+uint256 public totalEscrowLien;
 ```
 
 The per-category pending-claim queue is **not** declared here. It lives on `SafetyReserve` proper as the canonical disbursement infrastructure for the four [ADR 026 §5 spending controls](026-gauge-boost-tokenomics.md#spending-controls), with the ordering pinned at [ADR 026 §5 Cross-category payout ordering](026-gauge-boost-tokenomics.md#cross-category-payout-ordering) (`(accrualEpoch asc, claimId asc)`). ADR 030 owns only the per-appeal record; integration is at §5 below.
@@ -69,22 +75,22 @@ The per-category pending-claim queue is **not** declared here. It lives on `Safe
 
 ### 2. Per-appeal escrow accounting
 
-[ADR 028 §2 — Escrow-until-ratification](028-slashing-appeals.md#2-appeal-flow) is the canonical disbursement path: on `fastTrackAppeal`, the equivalent USDC payout is moved from the SafetyReserve general balance into a per-appeal escrow account inside `SafetyReserve` and only released to the operator on ratification. The six entry points and their escrow / bond bookkeeping are:
+[ADR 028 §2 — Escrow-until-ratification](028-slashing-appeals.md#2-appeal-flow) is the canonical disbursement path: on `fastTrackAppeal`, the equivalent USDC payout is reserved against the SafetyReserve general balance via a per-appeal lien, and only released to the operator on ratification. **Escrow is a lien, not a sub-account.** The reserved USDC stays in `SafetyReserve`'s general USDC accumulator; `escrowAmount` on the `Appeal` record is a per-appeal earmark that participates in solvency arithmetic (the invariant below) but is not a separate balance the contract tracks two ways. This avoids the double-debit pitfall: there is no second USDC transfer between general balance and escrow at fast-track time, and there is no transfer back at ratification — only the lien comes and goes. The six entry points and their escrow / bond bookkeeping are:
 
-| Entry point | Escrow effect | Bond effect | Caller |
+| Entry point | Escrow effect (`escrowAmount` field + lien) | Bond effect | Caller |
 | --- | --- | --- | --- |
 | `openSlashAppeal(slashId, evidenceBundleHash)` | none yet (`escrowAmount == 0`) | `TOKEN.transferFrom(msg.sender, address(this), APPEAL_BOND)`; `totalAppealBondsEscrowed += APPEAL_BOND` | permissionless (appellant) |
-| `fastTrackAppeal(appealId)` | `escrowAmount = restitutionUsdcAmount`; move from general balance to per-appeal escrow | held | emergency multisig — [ADR 009](009-governance.md#emergency-multisig) capability (4) |
-| `ratifyAppeal(appealId)` | invoke `payout(evidenceBundleHash, appellant, escrowAmount)` — disburses through the [ADR 026 §5 stable interface](026-gauge-boost-tokenomics.md#interface-stability); on solvency-insolvent path, claim is queued per §5 below | refund: `TOKEN.transfer(appellant, bond)`; `totalAppealBondsEscrowed -= bond` | ve-Governor |
-| `reverseAppeal(appealId)` | `escrowAmount` returned to general balance (escrow account zeroed) | split per ADR 028 §4: 50% burn via `TOKEN.burn(bond/2)`, 50% routed per § Bond-routing dispatch below; `totalAppealBondsEscrowed -= bond` | ve-Governor |
+| `fastTrackAppeal(appealId)` | `escrowAmount = restitutionUsdcAmount`; `totalEscrowLien += escrowAmount` (lien recorded; no USDC transfer) | held | emergency multisig — [ADR 009](009-governance.md#emergency-multisig) capability (4) |
+| `ratifyAppeal(appealId)` | `totalEscrowLien -= escrowAmount` (lien released), then invoke `payout(evidenceBundleHash, appellant, escrowAmount)` — disburses through the [ADR 026 §5 stable interface](026-gauge-boost-tokenomics.md#interface-stability), returning `incidentId` (recorded in `SlashAppealRatified`); on solvency-insolvent path the claim is queued per §5 below | refund: `TOKEN.transfer(appellant, bond)`; `totalAppealBondsEscrowed -= bond` | ve-Governor |
+| `reverseAppeal(appealId)` | `totalEscrowLien -= escrowAmount` (lien released; funds remain in general balance) | split per ADR 028 §4: 50% burn via `TOKEN.burn(bond/2)`, 50% routed per § Bond-routing dispatch below; `totalAppealBondsEscrowed -= bond` | ve-Governor |
 | `rejectAppeal(appealId)` | none (`escrowAmount == 0`, not yet fast-tracked) | 100% burn: `TOKEN.burn(bond)`; `totalAppealBondsEscrowed -= bond` | emergency multisig — [ADR 009](009-governance.md#emergency-multisig) capability (4) |
-| `cleanupExpiredAppeal(appealId)` | if previously fast-tracked: `escrowAmount` returned to general balance; otherwise zero | refund: `TOKEN.transfer(appellant, bond)`; `totalAppealBondsEscrowed -= bond` (operator not at fault per ADR 028 §4) | permissionless |
+| `cleanupExpiredAppeal(appealId)` | if previously fast-tracked: `totalEscrowLien -= escrowAmount` (lien released); otherwise zero | refund: `TOKEN.transfer(appellant, bond)`; `totalAppealBondsEscrowed -= bond` (operator not at fault per ADR 028 §4) | permissionless |
 
-**Invariant** (enforced atomically inside `fastTrackAppeal`):
+**Solvency invariant** (enforced atomically inside `fastTrackAppeal` and any other call that increments `totalEscrowLien`):
 
-> `Σ escrowAmount[appealId where status == FastTracked] ≤ generalBalance`
+> `totalEscrowLien + Σ pendingClaim.amount ≤ generalBalance` (USDC, net of bond TOKEN holdings)
 
-where `generalBalance` is the USDC balance held by `SafetyReserve` net of pre-existing per-appeal escrows. The check is inline; `fastTrackAppeal` reverts on insolvency rather than over-committing. Solvency at *ratification* (where the canonical disbursement runs through `payout()`) is handled by the cross-category queue per §5 below — the appeal succeeds in principle and the unfunded portion accrues a pending claim.
+where `totalEscrowLien` is the sum of `escrowAmount` across all appeals with `status == FastTracked`, `generalBalance` is the contract's USDC balance, and `pendingClaim.amount` is canonical in [ADR 026 §5](026-gauge-boost-tokenomics.md#cross-category-payout-ordering). The check is inline at `fastTrackAppeal`; the call reverts on insolvency rather than over-committing. `payout()` reads the same invariant atomically (with `totalEscrowLien` already decremented by the time it executes inside `ratifyAppeal`, so the lien-released funds are visible to its solvency check), and queues an unfunded portion as a pending claim if the reserve is insolvent at disbursement time. The lien-release-then-payout sequence within a single `ratifyAppeal` transaction is atomic — no other call can observe the intermediate state where the lien is released but the payout has not yet debited.
 
 **Bond-routing dispatch (`reverseAppeal`).** ADR 028 §4 distinguishes two reversal cases by where the 50%-non-burn share of the bond goes:
 
@@ -101,7 +107,7 @@ Disbursement of `escrowAmount` on `ratifyAppeal` routes through the same `payout
 event SlashAppealOpened(uint256 indexed appealId, uint256 indexed slashId, address indexed appellant, bytes32 evidenceBundleHash, uint256 bond);
 event SlashAppealFastTracked(uint256 indexed appealId, uint256 escrowAmount);
 event SlashAppealRejected(uint256 indexed appealId, uint256 bondSlashed);
-event SlashAppealRatified(uint256 indexed appealId, address indexed recipient, uint256 restitutionAmount);
+event SlashAppealRatified(uint256 indexed appealId, uint256 indexed incidentId, address recipient, uint256 restitutionAmount);
 event SlashAppealReversed(uint256 indexed appealId, uint256 escrowReturned, address bondSplitRecipient, uint256 bondSplitAmount);
 event SlashAppealLapsed(uint256 indexed appealId, uint256 escrowReturned, uint256 bondRefunded);
 ```
@@ -113,11 +119,11 @@ The event-topic table for indexer convention:
 | `SlashAppealOpened` | `appealId` | `slashId` | `appellant` | `evidenceBundleHash` (bytes32), `bond` (uint256) |
 | `SlashAppealFastTracked` | `appealId` | — | — | `escrowAmount` (uint256) |
 | `SlashAppealRejected` | `appealId` | — | — | `bondSlashed` (uint256) |
-| `SlashAppealRatified` | `appealId` | `recipient` | — | `restitutionAmount` (uint256) |
+| `SlashAppealRatified` | `appealId` | `incidentId` | — | `recipient` (address), `restitutionAmount` (uint256) |
 | `SlashAppealReversed` | `appealId` | — | — | `escrowReturned` (uint256), `bondSplitRecipient` (address), `bondSplitAmount` (uint256) |
 | `SlashAppealLapsed` | `appealId` | — | — | `escrowReturned` (uint256), `bondRefunded` (uint256) |
 
-Indexer convention: clients keying on `(appealId)` use topic 1 across all events; clients reconciling appeals against parent slashes key on `(slashId)` from `SlashAppealOpened` and follow the lifecycle by `appealId`. `appellant` is indexed on `SlashAppealOpened` so operator-facing UIs can subscribe to "my appeals" without scanning every `SlashAppealOpened` payload; subsequent lifecycle events drop the operator topic because the `appealId` index suffices for joins.
+Indexer convention: clients keying on `(appealId)` use topic 1 across all events; clients reconciling appeals against parent slashes key on `(slashId)` from `SlashAppealOpened` and follow the lifecycle by `appealId`. `appellant` is indexed on `SlashAppealOpened` so operator-facing UIs can subscribe to "my appeals" without scanning every `SlashAppealOpened` payload; subsequent lifecycle events drop the operator topic because the `appealId` index suffices for joins. `incidentId` is indexed on `SlashAppealRatified` so off-chain consumers can join directly against `SafetyReserve.Paid(id, recipient, …)` (whose `id` is indexed per [ADR 026 § Contract: SafetyReserve](026-gauge-boost-tokenomics.md#contract-safetyreserve)) — `incidentId == SafetyReserve.Paid.id` for the disbursement triggered by this ratification. No `evidenceBundleHash` / `recipient` join is needed.
 
 `SlashAppealLapsed.escrowReturned` is `0` when lapse fires from `Open` (no fast-track preceded it, the operator-not-at-fault case from ADR 028 §4 "Governance silent past `MULTISIG_REVIEW_WINDOW`"), and equals the previously-escrowed USDC when lapse fires from `FastTracked` (the operator-not-at-fault case from ADR 028 §4 "Governance silent past `RATIFICATION_WINDOW`"). The field is kept on the event in both cases so off-chain consumers do not need to read prior state to determine whether escrow was active at lapse.
 
@@ -151,13 +157,13 @@ Both conditions terminate at `status = Lapsed` and emit `SlashAppealLapsed(appea
 
 **Frequency-cap check on `ratifyAppeal`.** Reverts if `nowUs - lastAcceptedAppealUs[appeal.appellant] < OPERATOR_APPEAL_FREQUENCY` (365 days in microseconds for the default cap). On success, `lastAcceptedAppealUs[appeal.appellant] = nowUs`. The cap is checked **at ratification**, not at filing, so a rejected or lapsed appeal does not consume the operator's annual budget — consistent with ADR 028 §5 ("Resets on the date the *previous* successful appeal was ratified"). Storing the ratification timestamp (rather than the appeal-opened timestamp) is what makes "resets on the date the previous successful appeal was ratified" exact: an appeal that takes 30 days from filing to ratification anchors the next-eligible date 365 days after its ratification, not 365 days after its filing.
 
-**`reviewWindowEndsUs` lifecycle.** Set to `nowUs + MULTISIG_REVIEW_WINDOW` at `openSlashAppeal`; refreshed to `nowUs + RATIFICATION_WINDOW` at `fastTrackAppeal`. Cleared (left as historical) on any terminal transition. The 48-hour gate-3 SafetyReserve counter-bundle window between fast-track and ratification is governed by the existing `SafetyReserve` gate-3 state (not by `reviewWindowEndsUs`); the ratification window per ADR 028 §2 mermaid begins only after the 48h counter-bundle window closes successfully, and `reviewWindowEndsUs` for the post-fast-track phase MUST be set to account for that 48-hour lead-in (i.e., `nowUs + 48h + RATIFICATION_WINDOW`). This is one extra constant addition at `fastTrackAppeal` and avoids a second state transition for "counter-bundle window closed".
+**`reviewWindowEndsUs` lifecycle.** Set to `nowUs + MULTISIG_REVIEW_WINDOW` at `openSlashAppeal`; refreshed at `fastTrackAppeal` to `nowUs + SafetyReserve.appealWindow() + RATIFICATION_WINDOW` — the post-fast-track deadline includes the gate-3 counter-bundle lead-in (the governable `appealWindow` parameter exposed on `SafetyReserve` per [ADR 026 § Contract: SafetyReserve](026-gauge-boost-tokenomics.md#contract-safetyreserve)'s `setAppealWindow` setter, default 48 hours per [ADR 026 §5 Spending controls](026-gauge-boost-tokenomics.md#spending-controls) gate 3) plus the full ratification window. Referencing the parameter name rather than hardcoding "48h" keeps the ADR accurate if governance retunes `appealWindow`. The 48h gate-3 itself is governed by `SafetyReserve`'s gate-3 state and is not duplicated into `reviewWindowEndsUs`; including its duration in the deadline computation is what makes `cleanupExpiredAppeal` condition (b) "governance silent past `RATIFICATION_WINDOW`" fire at the correct time rather than `appealWindow()` early. Cleared (left as historical) on any terminal transition.
 
 ### 5. Cross-category ordering hook
 
 ADR 030 owns only the per-appeal record. The cross-category pending-claim queue is canonical in [ADR 026 §5 Cross-category payout ordering](026-gauge-boost-tokenomics.md#cross-category-payout-ordering): the queue is keyed on `(accrualEpoch asc, claimId asc)`, where `accrualEpoch` is the FeeRouter 1-week epoch in which the original `payout()` authorization first hit insolvency and `claimId` is a `SafetyReserve`-monotonic counter assigned at authorization time.
 
-On `ratifyAppeal`, the contract invokes `payout(evidenceBundleHash, appellant, escrowAmount)` and the return value (the assigned incident `id`) is the handle for any pending-claim entry that may have been created if the reserve was insolvent at the call site. ADR 030 does **not** add a per-appeal field tracking that handle: the `(appealId, slashId)` pair already binds the appeal to its `Slashed` event, the [§3 events](#3-solidity-event-signatures-all-six-pinned) record the disbursement, and the canonical pending-claim queue is observable from `SafetyReserve`'s own pending-claim state. Off-chain consumers reconcile by joining `SlashAppealRatified.recipient` with `SafetyReserve`'s `Paid` event recipients on `evidenceBundleHash`.
+On `ratifyAppeal`, the contract invokes `payout(evidenceBundleHash, appellant, escrowAmount)` and the return value (the assigned incident `id`) is emitted as the indexed `incidentId` topic of `SlashAppealRatified` (§3). ADR 030 does **not** add a per-appeal storage field tracking that handle — the event index is sufficient: indexers join `SlashAppealRatified.incidentId` directly against `SafetyReserve.Paid.id` (both indexed) to reconcile appeal → disbursement → pending-claim flow. If the reserve was insolvent at the call site, the pending-claim entry is observable from `SafetyReserve`'s own pending-claim state under the same `incidentId`.
 
 The disbursement of queued claims is permissionless and follows the head-of-queue path pinned at [ADR 026 §5 Cross-category payout ordering](026-gauge-boost-tokenomics.md#cross-category-payout-ordering) ("any caller may invoke a `disbursePending()` head-of-queue path when reserve solvency permits"). No second-stage authorization is required and no per-payout-category priority signal exists. ADR 030 inherits both properties unchanged.
 
@@ -180,14 +186,14 @@ The disbursement of queued claims is permissionless and follows the head-of-queu
 
 ### Negative
 
-- Six-slot `Appeal` struct + two auxiliary mappings per appeal carry non-trivial storage cost. Expected volume is low per ADR 028 §8 ("single-digit appeals per quarter at PoC scale, low-tens at production scale"), but high-volume correlated-outage events could multiply storage costs linearly within a short window.
-- Adds a sixth external entry point (`cleanupExpiredAppeal`) to `SafetyReserve` that is not enumerated in [ADR 028 §6](028-slashing-appeals.md#6-contract-surface)'s five-function list. The §6 prose still reads "Adds five new entry points" in [ADR 028 § Consequences — Negative](028-slashing-appeals.md#negative); a small editorial update is folded into this PR.
+- Six-slot `Appeal` struct plus one auxiliary mapping (`lastAcceptedAppealUs`) and three contract-level uint256 counters (`appealCounter`, `totalAppealBondsEscrowed`, `totalEscrowLien`) carry non-trivial storage cost. Expected volume is low per ADR 028 §8 ("single-digit appeals per quarter at PoC scale, low-tens at production scale"), but high-volume correlated-outage events could multiply per-appeal storage linearly within a short window.
+- Adds a sixth external entry point (`cleanupExpiredAppeal`) to `SafetyReserve` — widens the public ABI by one permissionless function plus its two-condition admissibility branch. [ADR 028 §6](028-slashing-appeals.md#6-contract-surface)'s function list, Negative consequence, and forward-reference are updated in lockstep within this PR.
 - `SlashAppealReversed`'s `bondSplitRecipient` non-indexed field couples the appeal event schema to `SafetyReserve`'s gate-3 counter-bundle state. If the gate-3 mechanism is ever decoupled from `SafetyReserve` (e.g., moved to a dedicated counter-bundle registry), the event payload changes shape. This coupling is intentional for PoC and is acknowledged in [ADR 028 § Forward references — SafetyReserve future split](028-slashing-appeals.md#forward-references-follow-up-adrs).
 
 ### Risks
 
 - **`_pad0` / `_pad1` field accuracy.** The packed slot calculations assume Solidity's standard packing rules; a compiler version change altering slot semantics could silently relocate fields. The implementation MUST include a Foundry storage-layout test (`forge inspect SafetyReserve storageLayout`) pinned to expected slot offsets, mirroring ADR 031's risk note.
-- **Epoch-vs-second-window mismatch.** `openedEpoch` is a FeeRouter 1-week epoch but `MULTISIG_REVIEW_WINDOW` and `RATIFICATION_WINDOW` are seconds (per ADR 028 §5). Bugs here would surface as off-by-up-to-one-week errors in the frequency-cap check. Mitigation: the cap is "one accepted appeal per 365 days" — coarse-graining the cap arithmetic to FeeRouter epochs (52 epochs ≈ 364 days) is a deliberate ±1-week tolerance, matching how ADR 026 §3 amortizes other operator-level signals to the FeeRouter epoch. Documented in §1.
+- **Mixed time units in storage.** `openedEpoch` is a FeeRouter 1-week epoch index (for queue-reconciliation alignment with `accrualEpoch` per §5); `reviewWindowEndsUs` and `lastAcceptedAppealUs` are microsecond timestamps (for exact deadline / frequency-cap arithmetic per §4). Implementations must not conflate the two — they share a `uint64` width but carry different units. The Foundry storage-layout test recommended above MUST include unit-equivalence assertions where these fields participate in arithmetic, and the implementation MUST NOT add helpers that silently convert epoch indices to microseconds or vice versa.
 
 ## Alternatives Considered
 
