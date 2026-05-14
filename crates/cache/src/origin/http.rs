@@ -484,11 +484,10 @@ impl Origin for HttpOrigin {
             // `io::Error`. We wrap them with a typed
             // `OriginError::DecompressionFailed` so
             // `CacheError::origin_error_kind` can recover the typed
-            // variant later — the engine's
-            // `count_and_cap_stream` side-channel preserves the
-            // `io::Error`, and the engine's `build_origin_anyhow_from_io`
-            // uses `into_inner` + `downcast` to make the typed
-            // variant the deepest error in the anyhow chain.
+            // variant later — `crate::retry::classify_io_error`
+            // downcasts the `io::Error` inner and routes the typed
+            // variant into `OriginPullError::Permanent` (decoder
+            // failures aren't retryable; the body is corrupt).
             let decoded_stream: OriginByteStream = match supported_encoding {
                 None => Box::pin(raw_stream),
                 Some(SupportedEncoding::Gzip) => {
@@ -525,9 +524,10 @@ impl Origin for HttpOrigin {
 /// Wrap a decoder `io::Error` into an `io::Error` whose source is a
 /// typed [`OriginError::DecompressionFailed`]. The engine's
 /// `count_and_cap_stream` side-channel preserves the `io::Error`
-/// verbatim; the engine's `build_origin_anyhow_from_io` then peels
-/// the typed variant out via `into_inner` + `downcast` so
-/// `CacheError::origin_error_kind` finds it on the chain walk.
+/// verbatim; `crate::retry::classify_io_error` then downcasts the
+/// inner to recover the typed variant and surfaces it as
+/// `OriginPullError::Permanent` (`CacheError::origin_error_kind`
+/// finds it on the chain walk).
 fn typed_decoder_error(encoding: SupportedEncoding, source: std::io::Error) -> std::io::Error {
     let kind = source.kind();
     let typed = OriginError::DecompressionFailed { encoding, source };

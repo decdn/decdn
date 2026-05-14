@@ -261,10 +261,19 @@ where
                 Ok(chunk) => {
                     let new_total = total.saturating_add(chunk.len() as u64);
                     if new_total > max_bytes {
-                        let err = std::io::Error::other(format!(
-                            "cache.origin.path entry {} grew past max {max_bytes} during read",
-                            path.display()
-                        ));
+                        // Pack a typed `BlobTooLargeMarker` so the engine
+                        // surfaces `CacheError::BlobTooLarge` rather than
+                        // routing through `classify_io_error`, which
+                        // defaults `ErrorKind::Other` to Transient and
+                        // would burn the retry budget on a cap breach.
+                        // Matches `http.rs::response_chunk_stream`'s
+                        // typed-marker symmetry. The file path is
+                        // intentionally dropped from the error — the
+                        // typed marker is the operator-visible signal;
+                        // adding path context would require a wider
+                        // typed variant that `classify_io_error`
+                        // doesn't recognise.
+                        let err = std::io::Error::other(super::BlobTooLargeMarker { max_bytes });
                         Some((Err(err), (None, total, path)))
                     } else {
                         Some((Ok(chunk), (Some(s), new_total, path)))
@@ -495,9 +504,22 @@ mod tests {
         let err = second
             .err()
             .ok_or_else(|| anyhow::anyhow!("second chunk should have errored"))?;
+        // Cap breach is signalled via a typed `BlobTooLargeMarker`
+        // packed into the `io::Error` inner so the engine can
+        // surface `CacheError::BlobTooLarge` (not a generic
+        // `OriginError`). Operator-visible Display still mentions
+        // the cap; assert on the typed shape because that's what
+        // the engine's downcast walks.
+        let has_marker = err.get_ref().is_some_and(
+            <dyn std::error::Error + Send + Sync>::is::<crate::origin::BlobTooLargeMarker>,
+        );
         anyhow::ensure!(
-            err.to_string().contains("grew past max"),
-            "wrapper error message lost actionable wording: {err}"
+            has_marker,
+            "wrapper error lost typed BlobTooLargeMarker inner: {err}"
+        );
+        anyhow::ensure!(
+            err.to_string().contains("max_blob_bytes=1024"),
+            "wrapper Display lost cap-value wording: {err}"
         );
         Ok(())
     }

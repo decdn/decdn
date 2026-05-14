@@ -60,14 +60,33 @@ impl std::error::Error for BlobTooLargeMarker {}
 /// S3 `ByteStream`) into the stream by `move`-into-async-block; nothing
 /// borrows from `&self` on the origin.
 ///
-/// Errors flow as `io::Error`. **They do not feed
-/// [`crate::retry::retry_fetch`]'s transient/permanent classification** —
-/// retry runs around the call to `fetch`, so any error a stream emits
-/// after `fetch` returned `Ok` reaches the engine via
-/// [`crate::CacheError::OriginError`] without going through retry.
-/// Headers-phase failures stay in each adapter's `Origin::fetch` body,
-/// where transient/permanent classification is meaningful and
-/// retry-eligible.
+/// Errors flow as `io::Error`. They are routed through retry
+/// classification by one of two paths (#519):
+///
+/// - **Buffer-then-commit (small blobs):** when the adapter's
+///   `size_hint` is at or below
+///   `cache.origin_retry.buffered_max_bytes` (default 4 MiB), the
+///   engine drains the stream into a bounded `BytesMut` before
+///   handing to iroh-blobs. Drain errors are classified via
+///   `crate::retry::classify_io_error` and re-feed the retry loop.
+///   No on-disk amplification — the partial bytes never reach the
+///   store.
+/// - **Abort + restart (large blobs / unknown `size_hint`):** the
+///   engine streams directly into `iroh_blobs::Blobs::add_stream`
+///   and captures any mid-stream `io::Error` via the side channel.
+///   After `temp_tag().await` completes, the captured error is
+///   classified; on `Transient` the partial `TempTag` is dropped
+///   (iroh-blobs GC reclaims the bytes at `cache.gc_interval_sec`
+///   cadence, #518) and the retry loop restarts from the headers
+///   phase. Worst-case orphaned bytes per fetch are
+///   `(1 + max_retries) * max_blob_bytes` until GC.
+///
+/// Typed `Permanent` markers short-circuit retry regardless of which
+/// path applies: the internal `BlobTooLargeMarker` surfaces as
+/// [`crate::CacheError::BlobTooLarge`] (size-cap breach is
+/// deterministic — retry won't fit a bigger blob into a smaller cap),
+/// and [`crate::OriginError::DecompressionFailed`] surfaces as
+/// `Permanent` (corrupt body — retry sees the same bytes again).
 pub type OriginByteStream =
     Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send + Sync + 'static>>;
 

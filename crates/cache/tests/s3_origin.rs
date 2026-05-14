@@ -305,6 +305,12 @@ async fn cache_engine_retries_transient_via_origin_retry_policy() -> anyhow::Res
         initial_backoff_ms: 1,
         max_backoff_ms: 4,
         jitter_ratio: 0.0,
+        // Disable the buffered drain path: this test pins the SDK's
+        // first-attempt classification of a 503 service error,
+        // which is a headers-phase concern. Buffering would not
+        // change behaviour but adds noise to the failure mode under
+        // test if the mocked GetObject ever streams a body.
+        buffered_max_bytes: 0,
     };
     let engine = CacheEngine::open_full(
         tmp.path(),

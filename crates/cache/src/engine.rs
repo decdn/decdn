@@ -16,10 +16,10 @@ use iroh_blobs::store::fs::options::Options as FsStoreOptions;
 use iroh_blobs::store::{GcConfig, ProtectOutcome};
 use tokio::sync::Notify;
 
-use crate::error::{CacheError, CacheResult, OriginError};
+use crate::error::{CacheError, CacheResult, OriginPullError};
 use crate::metrics::CacheMetrics;
 use crate::origin::{Origin, OriginKind};
-use crate::retry::{RetryPolicy, retry_fetch};
+use crate::retry::{RetryPolicy, classify_io_error, drain_to_bytes, run_with_retry, should_buffer};
 
 /// Engine bundling a filesystem-backed iroh-blobs store with an optional
 /// origin backend. Lookups hit the store first; on miss and when an origin is
@@ -1174,7 +1174,6 @@ impl CacheEngine {
             .map_err(|e| CacheError::Store(anyhow::Error::from(e)))
     }
 
-    #[allow(clippy::too_many_lines)] // Linear failure-classification flow; splitting would require threading `temp_tag_result`/`captured_err` across a function boundary that obscures the sequence more than the length.
     async fn pull_through(&self, hash: Hash) -> CacheResult<Bytes> {
         // Every pull_through entry is a `get()` cache miss, regardless
         // of how the pull resolves. Coalesced waiters that find a hit
@@ -1184,11 +1183,11 @@ impl CacheEngine {
         if let Some(m) = &self.inner.metrics {
             m.misses.inc();
         }
-        let origin = self
-            .inner
-            .origin
-            .as_ref()
-            .ok_or(CacheError::NoOrigin { hash })?;
+        // Reject pulls with no origin configured early — keeps the
+        // per-attempt closure pure with respect to the origin handle.
+        if self.inner.origin.is_none() {
+            return Err(CacheError::NoOrigin { hash });
+        }
 
         // Bump the per-fetch denominator before issuing the call so the
         // counter survives mid-fetch panics — alerts that page on
@@ -1198,56 +1197,112 @@ impl CacheEngine {
             m.origin_fetches.inc();
         }
         let max_blob_bytes = self.inner.max_blob_bytes;
-        let fetch = retry_fetch(
-            origin,
-            hash,
-            max_blob_bytes,
-            self.inner.retry_policy,
-            self.inner.metrics.as_ref(),
-        )
-        .await
-        .map_err(|e| CacheError::OriginError {
-            hash,
-            source: e.into_inner(),
-        })?;
+        let policy = self.inner.retry_policy;
 
+        // Deterministic non-retryable outcomes (Store / HashMismatch /
+        // BlobTooLarge) ride out via `PullThroughOutcome` so the
+        // retry loop's `OriginPullError` exit taxonomy stays focused
+        // on retry-class failures.
+        let outcome = run_with_retry(policy, self.inner.metrics.as_ref(), hash, || {
+            self.pull_through_attempt(hash, max_blob_bytes, policy)
+        })
+        .await;
+
+        match outcome {
+            Ok(PullThroughOutcome::Bytes(bytes)) => Ok(bytes),
+            Ok(PullThroughOutcome::NotFound) => Err(CacheError::NotFound { hash }),
+            Ok(PullThroughOutcome::BlobTooLarge) => Err(CacheError::BlobTooLarge {
+                hash,
+                limit_bytes: max_blob_bytes,
+            }),
+            Ok(PullThroughOutcome::HashMismatch { actual }) => Err(CacheError::HashMismatch {
+                expected: hash,
+                actual,
+            }),
+            Ok(PullThroughOutcome::Store(err)) => Err(CacheError::Store(err)),
+            Err(e) => Err(CacheError::OriginError {
+                hash,
+                source: e.into_inner(),
+            }),
+        }
+    }
+
+    /// A single end-to-end pull-through attempt: origin.fetch +
+    /// (buffer-then-commit | stream-and-commit) + hash verify + tag
+    /// promote. Body-phase errors classified as
+    /// [`OriginPullError::Transient`] re-enter the retry loop; the
+    /// non-[`OriginPullError`] outcomes (`Store` / `HashMismatch` /
+    /// `BlobTooLarge`) ride out through [`PullThroughOutcome`] because
+    /// they are deterministic and retry would not help.
+    ///
+    /// Why this method instead of inlining into `pull_through`: the
+    /// retry loop ([`run_with_retry`]) needs a callable that produces
+    /// a fresh attempt on each invocation — the side-channel `Arc`s,
+    /// `TempTag`s, and origin futures all have to be re-created per
+    /// attempt and can't be reused across iterations.
+    #[allow(clippy::too_many_lines)] // Linear per-attempt flow; the failure-classification arms each need their own context comment, and splitting them across functions would obscure the sequence more than the length.
+    async fn pull_through_attempt(
+        &self,
+        hash: Hash,
+        max_blob_bytes: u64,
+        policy: RetryPolicy,
+    ) -> Result<PullThroughOutcome, OriginPullError> {
+        // Invariant: `pull_through` checked `origin.is_some()` before
+        // entering the retry loop; coalesced waiters never re-enter
+        // this method from a path that bypasses that check. (`SAFETY:`
+        // is reserved for `unsafe` blocks; this is a logical
+        // invariant in safe code.)
+        let Some(origin) = self.inner.origin.as_ref() else {
+            // Returning Permanent ensures `run_with_retry` exits
+            // without burning the budget on an unreachable case.
+            return Err(OriginPullError::Permanent(anyhow::anyhow!(
+                "internal invariant: pull_through_attempt called with no origin"
+            )));
+        };
+
+        let fetch = origin.fetch(hash, max_blob_bytes).await?;
         let (stream, size_hint) = match fetch {
-            crate::origin::OriginFetch::NotFound => {
-                return Err(CacheError::NotFound { hash });
-            }
+            crate::origin::OriginFetch::NotFound => return Ok(PullThroughOutcome::NotFound),
             crate::origin::OriginFetch::Found { stream, size_hint } => (stream, size_hint),
         };
 
         // Pre-stream cap: if the adapter advertised a length, reject
         // before reading the first byte. The post-stream cap below is
-        // load-bearing too — origins can lie or omit the hint.
+        // load-bearing too — origins can lie or omit the hint. This
+        // is a deterministic operator-visible cap breach; surface as
+        // `BlobTooLarge` directly without burning retry budget.
         if let Some(advertised) = size_hint
             && advertised > max_blob_bytes
         {
-            return Err(CacheError::BlobTooLarge {
-                hash,
-                limit_bytes: max_blob_bytes,
-            });
+            return Ok(PullThroughOutcome::BlobTooLarge);
         }
 
-        // Pipe the origin stream into iroh-blobs' `add_stream`. The
-        // wrapper bumps `pull_through_bytes` per chunk and aborts the
-        // import the moment cumulative bytes exceed `max_blob_bytes`
-        // (origin-egress accounting matches the pre-streaming
-        // intent: every byte the origin sent us is billed even if
-        // the import later fails, so an origin streaming a 5 GB-of-
-        // 10 GB body before erroring still shows as 5 GB egress).
-        //
-        // `captured_err` is the side-channel for mid-stream errors:
-        // iroh-blobs' `add_stream` swallows the upstream `io::Error`
+        if should_buffer(size_hint, policy.buffered_max_bytes) {
+            let drain_cap = policy.buffered_max_bytes.min(max_blob_bytes);
+            let bytes = match drain_to_bytes(stream, drain_cap, self.inner.metrics.as_ref()).await {
+                Ok(b) => b,
+                // Cap-breach: surface as `BlobTooLarge` directly (typed
+                // outcome). Routing through `classify_io_error` would
+                // collapse it to a generic `OriginError` and operators
+                // alerting on the typed `BlobTooLarge` metric would
+                // lose visibility.
+                Err(e) if is_blob_too_large_marker(&e) => {
+                    return Ok(PullThroughOutcome::BlobTooLarge);
+                }
+                Err(e) => return Err(classify_io_error(e)),
+            };
+            return self.commit_buffered_bytes(hash, bytes).await;
+        }
+
+        // Streaming path: hand the stream to `iroh-blobs::add_stream`
+        // and capture mid-stream errors via the side channel.
+        // `iroh-blobs::add_stream` swallows the upstream `io::Error`
         // (it `?`-propagates inside an async block whose error is
-        // discarded by `let _ = tokio::join!(...)`), so without this
-        // capture the engine sees only "unexpected end of stream"
-        // and operators lose the actionable upstream message
-        // ("body read stalled", "exceeded max_blob_bytes mid-flight",
-        // etc.). The wrapper writes through to `captured_err` on
-        // every `Err` it observes; the engine reads from it after
-        // `temp_tag()` fails and surfaces the typed root cause.
+        // discarded), so without this capture the engine sees only
+        // "unexpected end of stream" and operators lose the
+        // actionable upstream message. Failed attempts strand a
+        // partial `TempTag` worth of bytes; iroh-blobs GC reclaims
+        // them at `cache.gc_interval_sec` cadence.
         let captured_err: Arc<Mutex<Option<std::io::Error>>> = Arc::new(Mutex::new(None));
         let counted = count_and_cap_stream(
             stream,
@@ -1258,43 +1313,34 @@ impl CacheEngine {
         let progress = self.inner.store.blobs().add_stream(counted).await;
         let temp_tag_result = progress.temp_tag().await;
 
-        // The upstream stream-error path commits a partial blob to
-        // iroh-blobs (see the long comment in `count_and_cap_stream`):
-        // the side-channel-recorded error wins over both the
-        // iroh-blobs Err arm AND a "successful" partial import,
-        // because the latter's hash is deterministically wrong and
-        // we'd rather surface the real cause ("body read stalled",
-        // "decompression failed") than a confusing `HashMismatch`.
-        if let Some(upstream) = captured_err
+        // Side-channel-recorded error wins over both the iroh-blobs
+        // Err arm AND a "successful" partial import, because the
+        // latter's hash is deterministically wrong and we'd rather
+        // surface the real cause ("body read stalled", "decompression
+        // failed") than a confusing `HashMismatch`. Drop the temp tag
+        // (regardless of inner Ok/Err) so iroh-blobs GC reclaims the
+        // partial bytes.
+        let captured = captured_err
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .take()
-        {
-            // Drop the (possibly successful) temp tag so iroh-blobs
-            // GC reclaims the partial bytes.
+            .take();
+        if let Some(upstream) = captured {
             drop(temp_tag_result);
-            // Cap-breach errors carry a typed marker via
-            // `BlobTooLargeMarker` so the engine surfaces
-            // `CacheError::BlobTooLarge` rather than the generic
-            // `OriginError`. Operators alerting on the typed
-            // variant continue to see the same shape they did pre-
-            // streaming when the (now-deleted) post-collect length
-            // check fired. Other captured errors (idle timeout,
-            // transport reset, decoder failure) keep the
-            // `OriginError` shape.
-            if upstream
-                .get_ref()
-                .is_some_and(<dyn std::error::Error + Send + Sync>::is::<BlobTooLargeMarker>)
-            {
-                return Err(CacheError::BlobTooLarge {
-                    hash,
-                    limit_bytes: max_blob_bytes,
-                });
+            // Cap-breach mid-stream: typed `BlobTooLargeMarker` is the
+            // documented escape hatch — surface as the typed
+            // `BlobTooLarge` outcome rather than routing through
+            // `classify_io_error` which would collapse it to a
+            // generic `OriginError`.
+            if is_blob_too_large_marker(&upstream) {
+                return Ok(PullThroughOutcome::BlobTooLarge);
             }
-            return Err(CacheError::OriginError {
-                hash,
-                source: build_origin_anyhow_from_io(upstream),
-            });
+            // Otherwise classify via the shared body-phase
+            // classifier: typed `OriginError::*` inners surface as
+            // Permanent (decompression failures, etc.);
+            // `io::ErrorKind`-Transient kinds (ConnectionReset,
+            // TimedOut, …) surface as Transient and re-enter the
+            // retry loop for abort+restart.
+            return Err(classify_io_error(upstream));
         }
 
         let temp_tag = match temp_tag_result {
@@ -1303,10 +1349,10 @@ impl CacheEngine {
                 // No upstream-captured error: the failure is on
                 // iroh-blobs' side (disk write, actor crash,
                 // serialization-task panic, etc.). Surface as
-                // `CacheError::Store` so operators routing on
-                // origin-vs-store don't misclassify a local store
-                // problem as a remote origin one.
-                return Err(CacheError::Store(
+                // `Store` so operators routing on origin-vs-store
+                // don't misclassify a local store problem as a
+                // remote origin one. Not retry-class.
+                return Ok(PullThroughOutcome::Store(
                     anyhow::Error::from(err)
                         .context("iroh-blobs add_stream failed during pull-through"),
                 ));
@@ -1317,9 +1363,9 @@ impl CacheEngine {
         if actual != hash {
             // Drop the temp tag without promotion → bytes become
             // GC-eligible inside iroh-blobs (they're not protected
-            // once the `TempTag` drops; no public `Tags::delete` is
-            // needed because we never created a named tag for the
-            // wrong hash).
+            // once the `TempTag` drops). Deterministic protocol
+            // violation: a clean stream that hashed wrong is not a
+            // transport failure — retry won't help.
             drop(temp_tag);
             // Cache-poisoning mitigation: between the drop above
             // and the next iroh-blobs GC sweep, the wrong-hash
@@ -1335,16 +1381,6 @@ impl CacheEngine {
             // mutex or a full evicted-set cap surfaces only as a
             // log line — the primary error returned to the
             // caller is still `HashMismatch`.
-            //
-            // The wrong-hash bytes still occupy disk until
-            // iroh-blobs' periodic GC sweep runs them down;
-            // iroh-blobs spawns the loop internally when
-            // `cache.gc_interval_sec > 0` (#518). On-demand
-            // reclamation is tracked under #520. Until the
-            // next sweep lands, a malicious origin can amplify
-            // disk usage by repeatedly streaming
-            // `max_blob_bytes - 1` of garbage and erroring on
-            // the last byte.
             if let Err(evict_err) = self.evict(actual) {
                 tracing::warn!(
                     expected = %hash,
@@ -1353,24 +1389,19 @@ impl CacheEngine {
                     "hash-mismatch logical-evict failed; engine.has(actual) may surface partial-import bytes until iroh-blobs GC runs",
                 );
             }
-            return Err(CacheError::HashMismatch {
-                expected: hash,
-                actual,
-            });
+            return Ok(PullThroughOutcome::HashMismatch { actual });
         }
 
         // Promote the temp tag to a named tag — same effect as
         // `add_bytes(...).await`, which goes through `with_tag()` (
         // iroh-blobs `blobs.rs:624-632`). The name is opaque; the
-        // store auto-assigns it.
+        // store auto-assigns it. Tag-create failure is store-side, not
+        // origin-side: surface as `Store` so retry-class taxonomy
+        // doesn't pick it up.
         let haf = temp_tag.hash_and_format();
-        let _named = self
-            .inner
-            .store
-            .tags()
-            .create(haf)
-            .await
-            .map_err(|err| CacheError::Store(anyhow::Error::from(err)))?;
+        if let Err(err) = self.inner.store.tags().create(haf).await {
+            return Ok(PullThroughOutcome::Store(anyhow::Error::from(err)));
+        }
         drop(temp_tag);
 
         // The engine's existing `get()` callers (admin RPC, metrics
@@ -1379,60 +1410,91 @@ impl CacheEngine {
         // mmap'd read with no extra origin egress. Stream-shaped
         // `get()` is in scope for #317 (cdn/client/v1 paid delivery),
         // not this issue.
-        self.read_local(hash).await
-    }
-}
-
-pub(crate) use crate::origin::BlobTooLargeMarker;
-
-/// Convert a captured `io::Error` (possibly wrapping a typed
-/// [`OriginError`] via `io::Error::new(kind, OriginError::*)`) into an
-/// `anyhow::Error` whose chain still exposes the typed variant for
-/// [`CacheError::origin_error_kind`].
-///
-/// The wrinkle: `io::Error::source()` yields `inner.source()`, **not**
-/// `Some(&inner)`. So if `OriginError::DecompressionFailed` is the
-/// inner of an `io::Error`, walking the chain via `Error::source()`
-/// skips straight from the `io::Error` to whatever the
-/// `OriginError`'s own `source` field has — the typed variant is
-/// invisible to a `downcast_ref::<OriginError>()` walk.
-///
-/// Workaround: pull the typed variant out via `into_inner()` +
-/// `downcast::<OriginError>()` before constructing the anyhow chain.
-/// When successful, `anyhow::Error::from(typed)` makes the typed
-/// variant the deepest (and thus walkable) element — and its
-/// `thiserror`-generated `Display` already includes the inner
-/// `source` (e.g. `"failed to decompress gzip response body: …"`),
-/// so anyhow's natural `Display` surfaces the actionable detail
-/// without manual chain flattening. When the `io::Error` does not
-/// wrap a typed `OriginError`, preserve whatever inner it does
-/// have so the operator-visible source chain isn't lost.
-fn build_origin_anyhow_from_io(upstream: std::io::Error) -> anyhow::Error {
-    // Try to peel off the typed inner. `io::Error::into_inner()`
-    // returns `Option<Box<dyn Error + Send + Sync>>`; the
-    // `Box::downcast` on the trait object recovers the concrete
-    // `OriginError` if the adapter packed one in via
-    // `typed_decoder_error`. We hold on to the kind+message before
-    // consuming so we can rebuild a faithful `io::Error` if the
-    // inner is not a typed `OriginError`.
-    let kind = upstream.kind();
-    let display = upstream.to_string();
-    if let Some(boxed) = upstream.into_inner() {
-        match boxed.downcast::<OriginError>() {
-            Ok(typed) => return anyhow::Error::from(*typed),
-            Err(other_box) => {
-                // Inner wasn't a typed `OriginError`; keep it in the
-                // chain so the operator still sees it via
-                // `anyhow::Error::Display` with `:#` (or by walking
-                // `chain()`).
-                return anyhow::Error::from(std::io::Error::new(kind, other_box));
+        match self.read_local(hash).await {
+            Ok(bytes) => Ok(PullThroughOutcome::Bytes(bytes)),
+            Err(CacheError::Store(err)) => Ok(PullThroughOutcome::Store(err)),
+            Err(other) => {
+                // `read_local` only surfaces `Store`; any other
+                // variant is a logic regression. Map to `Store` so
+                // the outer `pull_through` still surfaces a coherent
+                // error; the inner anyhow chain preserves the cause.
+                Ok(PullThroughOutcome::Store(anyhow::Error::msg(format!(
+                    "read_local returned unexpected variant after successful commit: {other}"
+                ))))
             }
         }
     }
-    // No inner at all (io::Error from a raw kind, no wrapped
-    // payload). The Display string is all we have.
-    anyhow::Error::msg(display)
+
+    /// Commit a fully-buffered payload from the drain path. Drains do
+    /// not go through `count_and_cap_stream` (their cap was already
+    /// enforced inline), so this just hands the buffered `Bytes` to
+    /// iroh-blobs and verifies the resulting hash. Splitting the
+    /// commit out of `pull_through_attempt` keeps the two body-phase
+    /// paths (drain vs. streaming) symmetric: each is followed by the
+    /// same commit-and-verify sequence.
+    async fn commit_buffered_bytes(
+        &self,
+        hash: Hash,
+        bytes: Bytes,
+    ) -> Result<PullThroughOutcome, OriginPullError> {
+        // iroh-blobs `add_bytes` returns `Ok(NamedTag)` directly,
+        // skipping the `TempTag` intermediary used by `add_stream`.
+        // The named tag protects the blob from GC and is the same
+        // shape the streaming path produces after `tags().create()`.
+        let tag = match self.inner.store.blobs().add_bytes(bytes.clone()).await {
+            Ok(t) => t,
+            Err(err) => {
+                return Ok(PullThroughOutcome::Store(
+                    anyhow::Error::from(err)
+                        .context("iroh-blobs add_bytes failed during pull-through"),
+                ));
+            }
+        };
+        let actual = tag.hash;
+        if actual != hash {
+            // Same cache-poisoning mitigation as the streaming path:
+            // log-evict the wrong hash so `engine.has(actual)` doesn't
+            // surface attacker-chosen bytes between now and the next
+            // GC sweep.
+            if let Err(evict_err) = self.evict(actual) {
+                tracing::warn!(
+                    expected = %hash,
+                    %actual,
+                    err = %evict_err,
+                    "hash-mismatch logical-evict failed (drain path); engine.has(actual) may surface partial-import bytes until iroh-blobs GC runs",
+                );
+            }
+            return Ok(PullThroughOutcome::HashMismatch { actual });
+        }
+        Ok(PullThroughOutcome::Bytes(bytes))
+    }
 }
+
+/// Per-attempt outcomes that ride out of the retry loop without
+/// classification: each is a deterministic, non-retry-class result
+/// the engine maps directly to a `CacheError` variant.
+#[derive(Debug)]
+enum PullThroughOutcome {
+    Bytes(Bytes),
+    NotFound,
+    BlobTooLarge,
+    HashMismatch { actual: Hash },
+    Store(anyhow::Error),
+}
+
+/// True when the body-phase `io::Error` wraps a typed
+/// [`BlobTooLargeMarker`] — meaning the cap (engine-level
+/// `count_and_cap_stream`, adapter-level HTTP chunk cap, or the
+/// drain-path running total) tripped. Lets the engine surface
+/// `CacheError::BlobTooLarge` directly instead of routing through
+/// [`classify_io_error`] which would collapse the typed marker into a
+/// generic `OriginError`.
+fn is_blob_too_large_marker(e: &std::io::Error) -> bool {
+    e.get_ref()
+        .is_some_and(<dyn std::error::Error + Send + Sync>::is::<BlobTooLargeMarker>)
+}
+
+pub(crate) use crate::origin::BlobTooLargeMarker;
 
 /// Adapter that bumps the `pull_through_bytes` metric per chunk,
 /// captures any upstream error into `captured_err`, and *terminates

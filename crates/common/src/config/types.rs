@@ -95,12 +95,31 @@ pub struct CacheConfig {
     /// "entry was ignored" surprise hours later when the operator
     /// discovers the blob got evicted anyway.
     pub pinned_hashes: Option<Vec<String>>,
-    /// Origin pull-through retry policy (#285). Controls exponential
-    /// backoff for transient HTTP/filesystem errors. Absent => defaults
-    /// from [`decdn_cache::RetryPolicy::default`] (3 retries, 100ms
-    /// initial backoff doubling to 10s cap, 10% jitter). `max_retries
-    /// = 0` opts out and reproduces pre-#285 behaviour. Set once at
-    /// startup; changes require a restart.
+    /// Origin pull-through retry policy (#285, extended in #519).
+    /// Controls exponential backoff for transient HTTP / S3 /
+    /// filesystem errors *and* the body-phase retry strategy for
+    /// mid-stream `io::Error`s. Absent => defaults from
+    /// [`decdn_cache::RetryPolicy::default`] (3 retries, 100ms
+    /// initial backoff doubling to 10s cap, 10% jitter,
+    /// `buffered_max_bytes = 4 MiB`). `max_retries = 0` opts out and
+    /// reproduces pre-#285 behaviour; `buffered_max_bytes = 0`
+    /// independently disables the body-phase buffer path so all
+    /// body-phase failures route through the streaming abort+restart
+    /// path. Set once at startup; changes require a restart.
+    ///
+    /// **Body-phase retry trade-offs (#519):**
+    ///
+    /// - **Buffer-then-commit** applies when the origin's advertised
+    ///   `size_hint` is at or below `buffered_max_bytes`. The body
+    ///   drains into memory before the iroh-blobs commit, so failed
+    ///   attempts cost RAM (bounded by `buffered_max_bytes` per
+    ///   in-flight fetch) but leave no on-disk garbage.
+    /// - **Abort + restart** applies above the threshold or when
+    ///   `size_hint` is unknown. Each failed attempt strands up to
+    ///   `max_blob_size_mb` of partial-import bytes until iroh-blobs
+    ///   GC reclaims them at `cache.gc_interval_sec` cadence.
+    ///   Worst-case disk amplification per fetch is
+    ///   `(1 + max_retries) * max_blob_size_mb`.
     ///
     /// `decdn_cache::RetryPolicy` carries `#[serde(default)]` so
     /// partial sections (e.g. just `max_retries = 5`) get the rest of
