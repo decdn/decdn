@@ -42,7 +42,8 @@ This ADR adds a protocol invariant:
 **Appeals-standing eligibility under [ADR 011 § Standing](011-content-takedown.md#standing) path 2** is amended to require:
 
 ```
-block.timestamp - operator.regionLastChanged >= REGION_STABILITY_WINDOW
+effective = operator.regionLastChanged != 0 ? operator.regionLastChanged : operator.firstRegisteredAt
+block.timestamp - effective >= REGION_STABILITY_WINDOW
 ```
 
 with `REGION_STABILITY_WINDOW = 7 days` (governable, hard bounds `[1d, 30d]` per the [ADR 009](009-governance.md) safety-bound pattern). Filings inside the 7-day window do not auto-revert — they remain admissible at multisig discretion only, preserving the existing soft-norm fallback for legitimate post-migration filers (datacenter relocation, ISP change) while making the protocol invariant strict by default. The contract enforces the strict path; the multisig discretion path remains an off-chain governance norm and is unchanged by this ADR.

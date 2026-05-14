@@ -11,7 +11,7 @@
 
 This ADR is that contract-implementation ADR. It pins the per-appeal storage layout, the canonical event topic ordering, the gas-packed struct layout, and the surface-level integration with the rest of `ContentBlacklist` (suspension flag manipulation, internal `_removeHashRegional` call, the `cleanupExpiredAppeal` admissibility checks), so the implementation in `contracts/` has a single canonical reference rather than re-deriving from ADR 011's narrative form.
 
-It is the blacklist-side analogue of [#524](https://github.com/decdn/decdn/issues/524) (ADR 030), which performs the same job for [ADR 028 §6](028-slashing-appeals.md#6-contract-surface)'s slash-appeal entry points on `SafetyReserve`.
+It is the blacklist-side analogue of [#524](https://github.com/decdn/decdn/issues/524) (the slash-appeal SafetyReserve contract-implementation ADR — ADR number still unclaimed; ADR 030 was previously the placeholder slot before being assigned to [ADR 030 — Node Region Self-Attestation](030-node-region-self-attestation.md) in #400), which performs the same job for [ADR 028 §6](028-slashing-appeals.md#6-contract-surface)'s slash-appeal entry points on `SafetyReserve`.
 
 This ADR does **not** re-litigate semantic decisions made in ADR 011 — bond size, filing windows, standing paths, evidence rules, regional-only scope, the synthetic-standing clawback, or the interaction with `SlashJudge`. Where this ADR restates such elements it is for self-containedness of the contract spec; the canonical decision authority remains ADR 011.
 
@@ -288,7 +288,7 @@ stateDiagram-v2
 ### Positive
 
 - Pins the storage layout and event schema so the implementation has a single source of truth, removing the cross-derivation cost between ADR 011's narrative form and the eventual Solidity.
-- Parallel structure to [#524](https://github.com/decdn/decdn/issues/524) (ADR 030) keeps both appeal-contract surfaces — slashing and blacklist — auditable under the same pattern.
+- Parallel structure to [#524](https://github.com/decdn/decdn/issues/524) (the slash-appeal SafetyReserve contract-implementation ADR; ADR number still unclaimed) keeps both appeal-contract surfaces — slashing and blacklist — auditable under the same pattern.
 - Permissionless `cleanupExpiredAppeal` plus the four admissibility conditions removes any contract dependency on a privileged scheduler; bond settlement and slot release are eventually consistent through any caller.
 
 ### Negative
@@ -311,7 +311,7 @@ stateDiagram-v2
 - **[ADR 011](011-content-takedown.md):** § Contract surface "full ABI deferred" clause replaced with a reference to this ADR. § Contract: ContentBlacklist `IContentBlacklist` interface is unchanged — this ADR is purely implementation detail.
 - **[ADR 009](009-governance.md):** § Emergency Multisig capability enumeration should be editorially expanded to list `fastTrackAppeal` / `unFastTrackAppeal` / `rejectAppeal` / `rejectAppealAsPerjury` as sub-modes of capability (1).
 - **[ADR 016](016-contract-interactions.md):** § Contract Inventory `ContentBlacklist` row already references the [ADR 011 § Blacklist Entry Appeals](011-content-takedown.md#blacklist-entry-appeals) API. No edit required by this ADR.
-- **[#524 / ADR 030](https://github.com/decdn/decdn/issues/524):** Parallel contract-implementation ADR for SafetyReserve slash appeals (extends [ADR 028 §6](028-slashing-appeals.md#6-contract-surface)).
+- **[#524](https://github.com/decdn/decdn/issues/524):** Parallel contract-implementation ADR for SafetyReserve slash appeals (extends [ADR 028 §6](028-slashing-appeals.md#6-contract-surface)); ADR number unclaimed — ADR 030 was previously the placeholder before being assigned to [ADR 030 — Node Region Self-Attestation](030-node-region-self-attestation.md) (#400).
 
 ## References
 
