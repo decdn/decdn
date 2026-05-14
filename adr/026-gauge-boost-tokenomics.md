@@ -572,9 +572,10 @@ Router shares, the boost-floor parameter, the per-operator gauge-share cap, and 
 | Safety share | 3% | 0% | 15% |
 | `boostFloor` | 0.4 | 0.2 | 0.8 |
 | `MAX_GAUGE_SHARE_PER_OPERATOR` | 5% | 1% | 25% |
+| `epochLiquidityCapFraction` | 10% | 1% | 30% |
 | `claimWindow` | 26 epochs | 13 epochs | 52 epochs (`uint16` count of epochs; the contract internally multiplies by the immutable `epochLength` to derive a seconds-domain deadline) |
 
-The 20% floor on the node-base share guarantees operators always receive enough liquid USDC to cover at least a meaningful fraction of infrastructure costs even under extreme governance proposals — preserves the cashflow invariant. The `boostFloor` bounds prevent governance from collapsing the gauge pool to a winner-take-all distribution (lower-bound) or flattening it into uselessness (upper-bound). The `MAX_GAUGE_SHARE_PER_OPERATOR` bounds prevent governance from disabling the wash-trading defense (lower bound implicitly enforced by the cap being non-zero) or so over-tightening that legitimate large operators are starved (upper bound).
+The 20% floor on the node-base share guarantees operators always receive enough liquid USDC to cover at least a meaningful fraction of infrastructure costs even under extreme governance proposals — preserves the cashflow invariant. The `boostFloor` bounds prevent governance from collapsing the gauge pool to a winner-take-all distribution (lower-bound) or flattening it into uselessness (upper-bound). The `MAX_GAUGE_SHARE_PER_OPERATOR` bounds prevent governance from disabling the wash-trading defense (lower bound implicitly enforced by the cap being non-zero) or so over-tightening that legitimate large operators are starved (upper bound). `epochLiquidityCapFraction` is the combined per-epoch ceiling on USDC notional swapped through the Balancer V3 80/20 pool across `BuybackBurner` and the delegator-pool swap path. The 1% floor prevents governance from starving the swap paths; the 30% ceiling prevents a single epoch from draining pool depth; the 10% default sizes one epoch's combined pressure conservatively against worst-case sustained execution. The cap is a single pool-wide budget per [ADR 018 § Liquidity-cap interaction](018-liquidity-strategy.md#liquidity-cap-interaction).
 
 **Non-numeric one-shot setters.**
 
