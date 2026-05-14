@@ -17,36 +17,45 @@ The appeal surface lives on the existing `SafetyReserve` contract as an extensio
 
 ### 1. Storage layout
 
-One enum and one struct describe an appeal; two auxiliary mappings carry the per-operator frequency cap from [ADR 028 §5](028-slashing-appeals.md#5-hard-caps-and-frequency-limits).
+One enum, two user-defined value types (UDVTs), and one struct describe an appeal; one auxiliary mapping (per-operator frequency cap) and three contract-level counters (appeal id, bond aggregate, lien aggregate) carry the cross-appeal accounting.
 
 ```solidity
+// User-defined value types for unit-safe time arithmetic.
+// EpochIndex and MicroTimestamp are both uint64 at the storage layer (8 bytes,
+// same as raw uint64) but the Solidity compiler refuses implicit conversion
+// between them, so a future field addition cannot silently mix epoch indices
+// with microsecond timestamps. Zero runtime cost. See §Risks "Mixed time units"
+// for the hazard this retires.
+type EpochIndex is uint64;      // FeeRouter 1-week epoch (ADR 026 §2 Epoch mechanics)
+type MicroTimestamp is uint64;  // microsecond wall-clock (block.timestamp * 1_000_000)
+
 enum AppealStatus {
     None,        // 0 — sentinel; appeals[0] is uninitialized
     Open,        // 1 — bond escrowed; multisig has not yet acted
-    FastTracked, // 2 — escrowAmount moved from general balance; awaiting ve-Governor ratification
-    Ratified,    // 3 — terminal: escrowAmount disbursed via payout(); bond refunded
-    Reversed,    // 4 — terminal: escrowAmount returned to general balance; bond split per ADR 028 §4
+    FastTracked, // 2 — escrowAmount lien recorded against general balance; awaiting ve-Governor ratification
+    Ratified,    // 3 — terminal: lien released and equivalent amount disbursed via payout(); bond refunded
+    Reversed,    // 4 — terminal: lien released (funds remained in general balance); bond split per ADR 028 §4
     Rejected,    // 5 — terminal: rejected at intake; bond burned 100% per ADR 028 §4
-    Lapsed       // 6 — terminal: governance silent; bond refunded (and escrow returned, if previously fast-tracked)
+    Lapsed       // 6 — terminal: governance silent; bond refunded (and lien released, if previously fast-tracked)
 }
 
 struct Appeal {
     // ─── Slot 0 (32 bytes) ─────────────────────────────────────
-    bytes32 evidenceBundleHash;     // MUST equal SlashJudge.Slashed.evidenceHash for the referenced slashId
+    bytes32       evidenceBundleHash;     // MUST equal SlashJudge.Slashed.evidenceHash for the referenced slashId
     // ─── Slot 1 (32 bytes, packed) ─────────────────────────────
-    address appellant;              // 20 bytes — operator who filed; recipient of restitution on ratification
-    uint64  openedEpoch;            // 8 bytes — FeeRouter 1-week epoch at filing (ADR 026 §2 Epoch mechanics)
-    uint8   status;                 // 1 byte — AppealStatus enum
-    bytes3  _pad0;                  // 3 bytes — explicit padding for slot completion
+    address       appellant;              // 20 bytes — operator who filed; recipient of restitution on ratification
+    EpochIndex    openedEpoch;            // 8 bytes — FeeRouter 1-week epoch at filing
+    uint8         status;                 // 1 byte — AppealStatus enum
+    bytes3        _pad0;                  // 3 bytes — explicit padding for slot completion
     // ─── Slot 2 (32 bytes) ─────────────────────────────────────
-    uint256 slashId;                // SlashJudge.Slashed.slashId (ADR 014 §2 — globally monotonic, non-zero)
+    uint256       slashId;                // SlashJudge.Slashed.slashId (ADR 014 §2 — globally monotonic, non-zero)
     // ─── Slot 3 (32 bytes) ─────────────────────────────────────
-    uint256 bond;                   // escrowed TOKEN amount (APPEAL_BOND at filing time)
+    uint256       bond;                   // escrowed TOKEN amount (APPEAL_BOND at filing time)
     // ─── Slot 4 (32 bytes) ─────────────────────────────────────
-    uint256 escrowAmount;           // USDC lien recorded on fastTrackAppeal (0 until fast-track; participates in the §2 solvency invariant, not a separate balance — see §2 "Escrow is a lien, not a sub-account")
+    uint256       escrowAmount;           // USDC lien recorded on fastTrackAppeal (0 until fast-track; participates in the §2 solvency invariant, not a separate balance — see §2 "Escrow is a lien, not a sub-account")
     // ─── Slot 5 (32 bytes, packed) ─────────────────────────────
-    uint64  reviewWindowEndsUs;     // 8 bytes — running deadline for the active review window (multisig pre-fast-track, ve-Governor post-fast-track)
-    bytes24 _pad1;                  // 24 bytes — explicit padding for slot completion
+    MicroTimestamp reviewWindowEndsUs;    // 8 bytes — running deadline for the active review window (multisig pre-fast-track, ve-Governor post-fast-track)
+    bytes24       _pad1;                  // 24 bytes — explicit padding for slot completion
 }
 
 mapping(uint256 => Appeal) public appeals;
@@ -56,7 +65,7 @@ uint256 public appealCounter;   // monotonic; appeals[0] reserved as None sentin
 // Stored as the microsecond timestamp at which the operator's most-recent successful
 // `ratifyAppeal` settled; `ratifyAppeal` reverts if the operator's prior ratification is
 // inside the cap window. Mirrors ADR 031's `lastRatifiedSuccessUs` convention.
-mapping(address => uint64) public lastAcceptedAppealUs;
+mapping(address => MicroTimestamp) public lastAcceptedAppealUs;
 
 // Bond escrow accounting — TOKEN held by the contract for active appeals.
 // Public view; auxiliary to the per-appeal `bond` field above for off-chain solvency dashboards.
@@ -71,7 +80,9 @@ uint256 public totalEscrowLien;
 
 The per-category pending-claim queue is **not** declared here. It lives on `SafetyReserve` proper as the canonical disbursement infrastructure for the four [ADR 026 §5 spending controls](026-gauge-boost-tokenomics.md#spending-controls), with the ordering pinned at [ADR 026 §5 Cross-category payout ordering](026-gauge-boost-tokenomics.md#cross-category-payout-ordering) (`(accrualEpoch asc, claimId asc)`). ADR 030 owns only the per-appeal record; integration is at §5 below.
 
-`openedEpoch` is stored as a `uint64` FeeRouter 1-week epoch index (per [ADR 026 §2 Epoch mechanics](026-gauge-boost-tokenomics.md#epoch-mechanics)), not a raw timestamp — this aligns appeals with the `accrualEpoch` keying of the pending-claim queue (§5) so off-chain consumers reconciling appeal-to-claim flow do not need a separate timestamp-to-epoch conversion. The frequency-cap check, by contrast, uses the microsecond `lastAcceptedAppealUs` so the "365 days" bound is enforced exactly (not coarse-grained to whole FeeRouter epochs). `MULTISIG_REVIEW_WINDOW` and `RATIFICATION_WINDOW` are measured in seconds per ADR 028 §5 hard bounds, so `reviewWindowEndsUs` is a microsecond timestamp matching the convention used in ADR 031's `BlacklistAppeal`.
+`openedEpoch` is typed as `EpochIndex` (FeeRouter 1-week epoch per [ADR 026 §2 Epoch mechanics](026-gauge-boost-tokenomics.md#epoch-mechanics)) — this aligns appeals with the `accrualEpoch` keying of the pending-claim queue (§5) so off-chain consumers reconciling appeal-to-claim flow do not need a separate timestamp-to-epoch conversion. The frequency-cap check, by contrast, uses the `MicroTimestamp`-typed `lastAcceptedAppealUs` so the "365 days" bound is enforced exactly (not coarse-grained to whole FeeRouter epochs). `MULTISIG_REVIEW_WINDOW` and `RATIFICATION_WINDOW` are measured in seconds per ADR 028 §5 hard bounds, so `reviewWindowEndsUs` is a `MicroTimestamp` matching the convention used in ADR 031's `BlacklistAppeal` (with the added UDVT discipline introduced here — ADR 031 stores the equivalent fields as raw `uint64`, and a future editorial pass may retrofit those to UDVTs for cross-ADR consistency).
+
+The UDVT split is what makes mixed-unit fields collision-safe: a careless `appeal.openedEpoch == appeal.reviewWindowEndsUs` comparison fails to compile, and a setter that accidentally writes `nowUs` into `openedEpoch` is rejected by the type system. The §Risks "Mixed time units in storage" entry below documents the residual hazard surface that UDVTs do **not** cover.
 
 ### 2. Per-appeal escrow accounting
 
@@ -90,7 +101,9 @@ The per-category pending-claim queue is **not** declared here. It lives on `Safe
 
 > `totalEscrowLien + Σ pendingClaim.amount ≤ generalBalance` (USDC, net of bond TOKEN holdings)
 
-where `totalEscrowLien` is the sum of `escrowAmount` across all appeals with `status == FastTracked`, `generalBalance` is the contract's USDC balance, and `pendingClaim.amount` is canonical in [ADR 026 §5](026-gauge-boost-tokenomics.md#cross-category-payout-ordering). The check is inline at `fastTrackAppeal`; the call reverts on insolvency rather than over-committing. `payout()` reads the same invariant atomically (with `totalEscrowLien` already decremented by the time it executes inside `ratifyAppeal`, so the lien-released funds are visible to its solvency check), and queues an unfunded portion as a pending claim if the reserve is insolvent at disbursement time. The lien-release-then-payout sequence within a single `ratifyAppeal` transaction is atomic — no other call can observe the intermediate state where the lien is released but the payout has not yet debited.
+where `totalEscrowLien` is the sum of `escrowAmount` across all appeals with `status == FastTracked`, `generalBalance` is the contract's USDC balance, and `pendingClaim.amount` is canonical in [ADR 026 §5](026-gauge-boost-tokenomics.md#cross-category-payout-ordering). The check is inline at `fastTrackAppeal`; the call reverts on insolvency rather than over-committing. `payout()` reads the same invariant atomically (with `totalEscrowLien` already decremented by the time it executes inside `ratifyAppeal`, so the lien-released funds are visible to its solvency check), and queues an unfunded portion as a pending claim if the reserve is insolvent at disbursement time.
+
+**Checks-Effects-Interactions ordering at `ratifyAppeal`.** The lien-release-then-payout sequence MUST follow CEI: (1) check frequency cap and `status == FastTracked`; (2) set `appeals[appealId].status = Ratified`, decrement `totalEscrowLien -= escrowAmount`, update `lastAcceptedAppealUs[appellant] = nowUs`, refund bond via `TOKEN.transfer(appellant, bond)`, decrement `totalAppealBondsEscrowed -= bond`; (3) THEN invoke `payout(evidenceBundleHash, appellant, escrowAmount)` and emit `SlashAppealRatified` with the returned `incidentId`. The interaction (`payout`'s downstream USDC transfer to `appellant`) is last. A re-entrant call from a contract `appellant` finds the appeal already in terminal `Ratified` state with the lien released, so the re-entry cannot double-spend the escrow. The same CEI discipline applies on `reverseAppeal` (effects: status, lien, bond split — before the bond-split `TOKEN.transfer`) and on `cleanupExpiredAppeal` (effects: status, lien, bond refund — before the `TOKEN.transfer`).
 
 **Bond-routing dispatch (`reverseAppeal`).** ADR 028 §4 distinguishes two reversal cases by where the 50%-non-burn share of the bond goes:
 
@@ -151,7 +164,7 @@ stateDiagram-v2
 | Condition | Test | Bond outcome | Escrow outcome |
 | --- | --- | --- | --- |
 | (a) multisig silent past `MULTISIG_REVIEW_WINDOW` | `status == Open && nowUs ≥ reviewWindowEndsUs` | refund | n/a (`escrowAmount == 0`) |
-| (b) governance silent past `RATIFICATION_WINDOW` | `status == FastTracked && nowUs ≥ reviewWindowEndsUs` | refund | return `escrowAmount` to general balance |
+| (b) governance silent past `RATIFICATION_WINDOW` | `status == FastTracked && nowUs ≥ reviewWindowEndsUs` | refund | release lien on `escrowAmount` (funds remain in general balance) |
 
 Both conditions terminate at `status = Lapsed` and emit `SlashAppealLapsed(appealId, escrowReturned, bondRefunded)`. Calls against the same `appealId` after cleanup revert with `AppealAlreadyTerminal`. The reason code is not indexed; the `(escrowReturned == 0)` test distinguishes case (a) from case (b) for off-chain consumers, parallel to ADR 031's `LapseReason` enum but with only two conditions instead of four. ADR 031's conditions (c) `StandingClawback` and (d) `GlobalOverride` have no analogue in slash appeals — there is no standing-path machinery and no global-override path on `SafetyReserve`.
 
@@ -192,8 +205,14 @@ The disbursement of queued claims is permissionless and follows the head-of-queu
 
 ### Risks
 
-- **`_pad0` / `_pad1` field accuracy.** The packed slot calculations assume Solidity's standard packing rules; a compiler version change altering slot semantics could silently relocate fields. The implementation MUST include a Foundry storage-layout test (`forge inspect SafetyReserve storageLayout`) pinned to expected slot offsets, mirroring ADR 031's risk note.
-- **Mixed time units in storage.** `openedEpoch` is a FeeRouter 1-week epoch index (for queue-reconciliation alignment with `accrualEpoch` per §5); `reviewWindowEndsUs` and `lastAcceptedAppealUs` are microsecond timestamps (for exact deadline / frequency-cap arithmetic per §4). Implementations must not conflate the two — they share a `uint64` width but carry different units. The Foundry storage-layout test recommended above MUST include unit-equivalence assertions where these fields participate in arithmetic, and the implementation MUST NOT add helpers that silently convert epoch indices to microseconds or vice versa.
+- **`_pad0` / `_pad1` field accuracy.** The packed slot calculations assume Solidity's standard packing rules; a compiler version change altering slot semantics could silently relocate fields. The implementation MUST include a Foundry storage-layout test (`forge inspect SafetyReserve storageLayout`) pinned to expected slot offsets, mirroring ADR 031's risk note. In addition, the implementation MUST include named Foundry invariant tests covering the lien aggregate and the state-machine constraints:
+  - `invariant_lienEqualsSumOfFastTracked` — `totalEscrowLien == Σ appeals[i].escrowAmount where appeals[i].status == AppealStatus.FastTracked`. Catches a missing decrement on any terminal transition out of `FastTracked`.
+  - `invariant_fastTrackedImpliesEscrow` — `appeals[i].status == AppealStatus.FastTracked` implies `appeals[i].escrowAmount > 0`. Catches a fast-track that opens with zero restitution or a stale-record bug.
+  - `invariant_terminalIsSticky` — once `appeals[i].status ∈ {Ratified, Reversed, Rejected, Lapsed}`, no entry point may transition it out. Catches a missed `AppealAlreadyTerminal` guard.
+  - `invariant_bondAccounting` — `totalAppealBondsEscrowed == Σ appeals[i].bond where appeals[i].status ∈ {Open, FastTracked}`. Catches a missing decrement on any bond-release path.
+
+  These invariants are the contractual enforcement boundary for the field-level constraints that §1's UDVT discipline does **not** cover (UDVTs catch unit confusion at compile time; invariant tests catch aggregate-vs-component drift at runtime).
+- **Mixed time units in storage — residual surface.** §1's `EpochIndex` / `MicroTimestamp` UDVTs prevent the compiler from silently comparing an epoch index against a microsecond timestamp, but they do **not** prevent: (a) explicit `EpochIndex.unwrap` / `MicroTimestamp.unwrap` casts that bypass the type system, (b) external setters that take raw `uint64` and write into a UDVT-typed slot without unit checks, or (c) arithmetic involving constants where the literal's unit is ambiguous (e.g., `OPERATOR_APPEAL_FREQUENCY` in microseconds vs seconds). The implementation MUST keep UDVT `unwrap` usage rare and explicit, MUST type setter parameters with the UDVT (not raw `uint64`), and MUST express all time-constant literals as named constants whose name encodes the unit (e.g., `OPERATOR_APPEAL_FREQUENCY_US`, matching ADR 014's `MAX_EVIDENCE_AGE_US` convention).
 
 ## Alternatives Considered
 
