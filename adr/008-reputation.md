@@ -330,7 +330,7 @@ No new gossip topic is introduced. The map is per-consumer (each node computes i
 
 Eligibility thresholds (e.g., "operator must have coverage ≥ 0.7 in at least 3 regions to qualify for the grant") belong to consuming programs, not to this ADR. The reputation system commits only to publishing the signal in a form those programs can read.
 
-Consumers should be aware that the signal trusts the reporter's self-declared `node.region` from `NodeAnnounce`. ADR 001 region attestation is unverified at the protocol level today ([#400](https://github.com/decdn/decdn/issues/400)); the latency-contradiction mitigation in [ADR 001](001-network.md) catches gross lies but not adjacent-country or VPN-routed claims. Programs requiring stronger attestation should layer their own filter on top — e.g., only credit reports from reporters whose latency-contradiction rate is below a threshold.
+Consumers should be aware that the signal trusts the reporter's self-declared `node.region` from `NodeAnnounce`. Region attestation is self-claimed as the production posture per [ADR 030](030-node-region-self-attestation.md); the latency-contradiction mitigation in [ADR 001](001-network.md) catches gross lies but not adjacent-country or VPN-routed claims. Programs requiring stronger attestation should layer their own filter on top — e.g., only credit reports from reporters whose latency-contradiction rate is below a threshold.
 
 ## Consequences
 

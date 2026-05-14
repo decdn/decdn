@@ -45,7 +45,7 @@ Before any on-chain or protocol activity:
 
    - **Wallet, gas sponsorship, and session keys.** PoC accepts a plain EOA. Production migrates the operator wallet to a Safe (2-of-3 recommended) with ERC-7579 session keys for the high-frequency `slash_sig` signing path and an ERC-4337 paymaster for gas-in-USDC; see [ADR 024](024-account-abstraction.md) for the full design and the [Operator Key-Rotation Runbook](appendix-operator-key-rotation.md) for the EOA → Safe migration.
 
-5. **Choose region.** Determine the ISO 3166-1 alpha-2 country code that best represents the node's physical location. This value is self-reported and unverified in PoC ([ADR 001](001-network.md), [ADR 011](011-content-takedown.md)). It will be submitted on-chain as `regionHint` and broadcast in `NodeAnnounce` messages — it affects which gossip topics the node publishes to and which regional blacklists it must enforce.
+5. **Choose region.** Determine the ISO 3166-1 alpha-2 country code that best represents the node's physical location. This value is self-reported and accepted at face value as the production posture ([ADR 001](001-network.md), [ADR 011](011-content-takedown.md), [ADR 030](030-node-region-self-attestation.md)). It will be submitted on-chain as `regionHint` and broadcast in `NodeAnnounce` messages — it affects which gossip topics the node publishes to and which regional blacklists it must enforce.
 
 6. **Configure origin backend (optional).** If the node will act as an origin-backed node
    (serving specific content from S3/R2/B2/NFS/local disk), configure the backend access
@@ -256,5 +256,5 @@ If the node's iroh identity has been replaced (key rotation), use `StakingRegist
 
 - **Node onboarding CLI tool.** A `decdn setup` command that walks through Phases 1–2 interactively, generates keys, builds the `registerNode` calldata, and submits the transactions would reduce operator error significantly.
 - **Automated multiaddr refresh.** The node runtime should watch `Endpoint::direct_addresses()` and call `updateMultiaddrs` automatically on change.
-- **Geolocation verification.** Self-reported `regionHint` is an accepted PoC risk. Production should use a decentralized oracle or attestation service — see Issue #190, gap 7.
+- ~~**Geolocation verification.**~~ Resolved — [ADR 030](030-node-region-self-attestation.md) accepts self-attested regions as the production posture and rejects the oracle / attestation-service path; appeals-standing flipping is closed by the 7-day `regionLastChanged` stability window on `StakingRegistry` per [ADR 030 § 3](030-node-region-self-attestation.md).
 - ~~**Delegated voucher signer.**~~ Resolved — [ADR 024](024-account-abstraction.md) specifies Safe session keys for high-frequency signing (vouchers and slash_sig), replacing the delegated signer approach.
