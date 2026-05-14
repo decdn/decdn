@@ -1996,16 +1996,22 @@ impl Origin for SlowOnceOrigin {
 
 /// Origin that always returns `OriginPullError::Permanent` and counts
 /// attempts. Used to verify the retry loop short-circuits on permanent
-/// errors.
+/// errors and (with a non-empty `marker`) to verify which origin's
+/// error survives in the all-exhausted `OriginError.source` chain.
 #[derive(Debug)]
 struct PermanentlyFailingOrigin {
     fetch_count: std::sync::atomic::AtomicUsize,
+    marker: String,
 }
 
 impl PermanentlyFailingOrigin {
-    const fn new() -> Self {
+    fn new() -> Self {
+        Self::with_marker(String::new())
+    }
+    fn with_marker(marker: impl Into<String>) -> Self {
         Self {
             fetch_count: std::sync::atomic::AtomicUsize::new(0),
+            marker: marker.into(),
         }
     }
     fn fetches(&self) -> usize {
@@ -2025,10 +2031,17 @@ impl Origin for PermanentlyFailingOrigin {
     ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>> {
         self.fetch_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let marker = self.marker.clone();
         Box::pin(async move {
-            Err(OriginPullError::Permanent(anyhow::anyhow!(
-                "synthetic permanent failure (e.g. 403)"
-            )))
+            if marker.is_empty() {
+                Err(OriginPullError::Permanent(anyhow::anyhow!(
+                    "synthetic permanent failure (e.g. 403)"
+                )))
+            } else {
+                Err(OriginPullError::Permanent(anyhow::anyhow!(
+                    "synthetic permanent failure with marker={marker}"
+                )))
+            }
         })
     }
 }
@@ -3324,41 +3337,6 @@ async fn all_origins_notfound_surfaces_notfound() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Origin that returns a `Permanent` error carrying a caller-supplied
-/// marker string. Used to verify which origin's error survives in the
-/// all-exhausted `OriginError` source chain.
-#[derive(Debug)]
-struct LabeledPermanentlyFailingOrigin {
-    marker: String,
-}
-
-impl LabeledPermanentlyFailingOrigin {
-    fn new(marker: &str) -> Self {
-        Self {
-            marker: marker.to_string(),
-        }
-    }
-}
-
-impl Origin for LabeledPermanentlyFailingOrigin {
-    fn kind(&self) -> OriginKind {
-        OriginKind::Http
-    }
-
-    fn fetch(
-        &self,
-        _hash: Hash,
-        _max_bytes: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>> {
-        let marker = self.marker.clone();
-        Box::pin(async move {
-            Err(OriginPullError::Permanent(anyhow::anyhow!(
-                "synthetic permanent failure with marker={marker}"
-            )))
-        })
-    }
-}
-
 #[tokio::test]
 async fn all_origins_error_surfaces_origin_error_with_last_failure() -> anyhow::Result<()> {
     // The chain-walk decision is "last error wins" — operators
@@ -3367,8 +3345,8 @@ async fn all_origins_error_surfaces_origin_error_with_last_failure() -> anyhow::
     // 1 to assert origin 1's error survives into `OriginError.source`,
     // not origin 0's.
     let hash = Hash::new(b"never-served");
-    let first = Arc::new(LabeledPermanentlyFailingOrigin::new("primary-marker"));
-    let second = Arc::new(LabeledPermanentlyFailingOrigin::new("mirror-marker"));
+    let first = Arc::new(PermanentlyFailingOrigin::with_marker("primary-marker"));
+    let second = Arc::new(PermanentlyFailingOrigin::with_marker("mirror-marker"));
     let metrics = Arc::new(CacheMetrics::default());
     let (engine, _tmp) = build_engine_with_origins(
         vec![

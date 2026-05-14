@@ -1263,31 +1263,13 @@ impl CacheEngine {
             // Final entry already tried; don't log a "fallback" for a
             // chain that has nowhere left to advance.
             if idx + 1 < total {
-                if let Some(m) = &self.inner.metrics {
-                    m.origin_fallback.inc();
-                }
-                // Level reflects *this iteration's* advance cause: a
-                // `NotFound` advance is normal hit-on-fallback (info),
-                // but a Permanent / retry-exhausted advance means the
-                // current backend just failed to deliver and operators
-                // may want to alert on it. Surface as `warn!` so a
-                // misconfigured primary doesn't hide behind a healthy
-                // mirror.
-                if advance_was_error {
-                    tracing::warn!(
-                        hash = %hash,
-                        origin_index = idx,
-                        origin_kind = ?origin.kind(),
-                        "advancing to next origin in fallback chain (origin failed)",
-                    );
-                } else {
-                    tracing::info!(
-                        hash = %hash,
-                        origin_index = idx,
-                        origin_kind = ?origin.kind(),
-                        "advancing to next origin in fallback chain (NotFound)",
-                    );
-                }
+                self.emit_chain_advance(
+                    hash,
+                    idx,
+                    origin.kind(),
+                    advance_was_error,
+                    last_err.as_ref(),
+                );
             }
         }
 
@@ -1301,12 +1283,80 @@ impl CacheEngine {
                 hash,
                 source: e.into_inner(),
             })
+        } else if any_not_found {
+            Err(CacheError::NotFound { hash })
         } else {
-            debug_assert!(
-                any_not_found,
-                "non-empty origin chain must record an outcome"
+            // Structurally unreachable: every iteration of the loop
+            // above takes exactly one match arm. The five non-`Err`
+            // arms all `return`; the `NotFound` arm sets
+            // `any_not_found`; the `Err` arm sets `last_err`. To reach
+            // this branch the chain must be non-empty (`is_empty()`
+            // check at the top of `pull_through`) and have produced
+            // no `last_err` and no `any_not_found` — impossible under
+            // the current `PullThroughOutcome` taxonomy. Reaching it
+            // would mean a future variant was added without wiring
+            // the corresponding flag, and a debug-only assert would
+            // compile out in release builds. Emit an operator-visible
+            // log and fall through to a `NotFound` surface so the
+            // observable behaviour stays bounded (`unreachable!()`
+            // would also be correct but the workspace policy prefers
+            // a logged fallback over a release-panic in a hot path).
+            tracing::error!(
+                hash = %hash,
+                "internal invariant violated: non-empty origin chain produced \
+                 neither a NotFound nor an Err — likely a missing flag on a new \
+                 PullThroughOutcome variant",
             );
             Err(CacheError::NotFound { hash })
+        }
+    }
+
+    /// Bump the `origin_fallback` counter and emit a structured log for
+    /// the chain-advance event (#284). Extracted from `pull_through`
+    /// so the hot-path loop body stays small enough for clippy's
+    /// cognitive-complexity lint, and so the WHY of the
+    /// `warn!`-vs-`info!` branch decision lives in one named place
+    /// rather than inline with retry control flow.
+    ///
+    /// `advance_was_error` is the *current iteration's* outcome class
+    /// (not the cumulative `last_err.is_some()`), so a chain like
+    /// `[Permanent, NotFound, Found]` logs `warn!` at the 0→1 step
+    /// and `info!` at the 1→2 step rather than mislabeling the second
+    /// step as "primary failed" by virtue of an earlier error still
+    /// living in `last_err`. The caller is responsible for the
+    /// `idx + 1 < total` guard that prevents a final-entry log; this
+    /// method assumes a real advance is about to happen.
+    fn emit_chain_advance(
+        &self,
+        hash: Hash,
+        idx: usize,
+        origin_kind: OriginKind,
+        advance_was_error: bool,
+        last_err: Option<&OriginPullError>,
+    ) {
+        if let Some(m) = &self.inner.metrics {
+            m.origin_fallback.inc();
+        }
+        if advance_was_error {
+            // Carry this origin's error in the log so operators
+            // triaging the user-visible 5xx see *this* backend's
+            // failure mode, not just the chain-final one surfaced via
+            // `CacheError::OriginError`. `last_err` was assigned by
+            // the `Err(e)` arm of this iteration and is `Some` here.
+            tracing::warn!(
+                hash = %hash,
+                origin_index = idx,
+                origin_kind = ?origin_kind,
+                error = last_err.map(ToString::to_string).unwrap_or_default(),
+                "advancing to next origin in fallback chain (origin failed)",
+            );
+        } else {
+            tracing::info!(
+                hash = %hash,
+                origin_index = idx,
+                origin_kind = ?origin_kind,
+                "advancing to next origin in fallback chain (NotFound)",
+            );
         }
     }
 
@@ -1703,9 +1753,10 @@ mod tests {
     impl Origin for StubOrigin {
         fn kind(&self) -> OriginKind {
             // Stand in for an HTTP origin in tests so callers reasoning
-            // about preview-side `origin_kind` behaviour see a non-None
-            // value. The choice is arbitrary — `Origin::kind` is a
-            // tag, not a behavioural switch.
+            // about preview-side `origin_kinds` behaviour see a
+            // non-empty `Vec<OriginKind>` entry (post-#284 the field is
+            // a vec, not an `Option`). The choice is arbitrary —
+            // `Origin::kind` is a tag, not a behavioural switch.
             OriginKind::Http
         }
 

@@ -1,6 +1,6 @@
 //! Cache-engine `OpenMetrics` counters.
 //!
-//! Eight counters, all monotonic, exposed under the `decdn_cache_*`
+//! Nine counters, all monotonic, exposed under the `decdn_cache_*`
 //! family per ADR `appendix-observability`. The exported metric names
 //! all carry the OpenMetrics-encoder-appended `_total` suffix even
 //! though the corresponding Rust struct fields here do not — that's

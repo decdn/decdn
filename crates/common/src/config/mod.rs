@@ -1305,7 +1305,7 @@ fn expand_origin(origin: &mut types::OriginConfig, prefix: &str) -> anyhow::Resu
                         }
                     }
                     types::S3Credentials::DefaultChain { profile } => {
-                        expand_str(profile, "cache.origin.credentials.profile")?;
+                        expand_str(profile, &format!("{prefix}.credentials.profile"))?;
                     }
                 }
             }
