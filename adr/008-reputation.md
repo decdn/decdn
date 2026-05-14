@@ -261,15 +261,81 @@ There is no on-chain gauge-eligibility gate keyed on reputation. The cap binds e
 
 ### 13. Regional-Coverage Reputation Signal
 
-The reputation system can expose a per-operator **regional-coverage signal** — a derived metric (not an additional component of `final_score`) summarizing where an operator's verified deliveries originate geographically. Operators serving high-demand low-coverage regions receive a positive regional-coverage signal; operators serving only oversaturated regions receive a neutral signal.
+The reputation system exposes a per-operator **regional-coverage signal** — a derived metric (not an additional component of `final_score`) summarizing where an operator's verified deliveries originate geographically. Operators serving high-demand low-coverage regions receive a positive regional-coverage signal; operators serving only oversaturated regions receive a neutral signal.
 
-**This signal is not an input to `final_score` or to gauge-pool eligibility (Section 12).** It is an externally-readable per-operator attribute computed from the same gossip reports and local observations that drive Sections 3–4, exposed via the same gossip topic (`cdn/reputation/v1`) for downstream programs to consume.
+**This signal is not an input to `final_score` or to gauge-pool eligibility (Section 12).** It is an externally-readable per-operator attribute computed from the same gossip reports that drive Sections 3–4, exposed alongside the main score so downstream programs can consume it without subscribing to anything new.
 
-#### Consumer
+#### Region taxonomy
 
-Downstream operational programs (e.g., regional deployment grants, hardware-leasing subsidies, staking-loan approvals) may consult this signal as one input to their own decisions. The reputation system commits only to publishing the signal in a form those programs can read; eligibility decisions and thresholds belong to the consuming programs.
+Regions are **ISO 3166-1 alpha-2 country codes** (e.g., `DE`, `US`, `JP`), stored as `bytes2` matching the gas-optimization convention in [ADR 011 § Contract: ContentBlacklist](011-content-takedown.md#contract-contentblacklist) and the packing used by [ADR 031 § Storage layout](031-content-blacklist-appeals-contract.md#1-storage-layout). The choice is the same one that already drives `node.region` ([ADR 001](001-network.md)), `BlacklistEntry.region` ([ADR 011](011-content-takedown.md)), and `BlacklistAppeal.region` ([ADR 031](031-content-blacklist-appeals-contract.md)) — keeping all four surfaces at the same grain so the signal can be meaningfully cross-referenced against blacklist scope and operator declaration.
 
-The signal is intentionally lightweight (e.g., a small set of region-bucketed delivery-volume counters with the same EWMA / decay treatment as `local_score`); the precise aggregation mechanic and region taxonomy are out of scope for this ADR. The reputation system carries no logic that would deny eligibility based on region — that is each consuming program's sole prerogative.
+**Sub-national subdivisions are out of scope** for this ADR. ISO 3166-2 (`US-CA`, `DE-BY`, `CA-QC`, etc.) is the standard for finer granularity, and several compliance regimes — CCPA, Quebec Law 25, German Länder-level overlays — operate at that level. They are excluded here for two reasons:
+
+1. **Grain mismatch with blacklist scope.** [ADR 011](011-content-takedown.md) regional blacklists, regional governance bodies, and the [ADR 031](031-content-blacklist-appeals-contract.md) appeal contract are all alpha-2 only. A reputation signal at finer grain than the compliance surface it feeds into would silently overstate what the signal can certify.
+2. **Sub-national regimes are not protocol-addressable.** CCPA, Quebec Law 25, etc. are data-controller obligations on the *publisher*, not the *CDN operator*. The protocol-level compliance surface (content takedowns) is country-level by construction.
+
+If a future ADR needs sub-national reputation, all four surfaces — ADR 001 region attestation, ADR 011 blacklist regions, ADR 031 appeal regions, and the reputation buckets here — must move together. Per-surface upgrades are forbidden because they would introduce grain mismatch between the signal and what it claims to certify.
+
+#### Storage and aggregation
+
+For each operator a consuming node maintains a sparse map keyed on region:
+
+```rust
+struct CoverageBucket {
+    score: f32,                  // [0.0, 1.0] — same scale as final_score
+    last_interaction_us: u64,    // microsecond timestamp of the most recent update
+}
+
+// Per-operator state, computed locally from received ReputationReports.
+type RegionalCoverage = HashMap<[u8; 2], CoverageBucket>;
+```
+
+Only regions that have produced at least one delivery interaction in the trailing decay window appear in the map — operators serving 5 regions carry 5 entries, not 197.
+
+#### Update rule (mirrors Section 3)
+
+On receipt of a `ReputationReport` from reporter `R` about operator `O`:
+
+1. Look up `R.region` from the local peer table (the latest `NodeAnnounce` for `R`'s `NodeId` per [ADR 001 § Node Discovery](001-network.md#node-discovery-gossip)). Reports from reporters with no current `NodeAnnounce` or with an unattested region are dropped from regional aggregation only — they still contribute to the main `network_score` per Section 4.
+2. Compute `interaction_score` from `report.metrics` using the same formula as Section 3 (`0.4 × speed_score + 0.4 × correctness + 0.2 × reachability`).
+3. Update the bucket: `bucket.score = ewma(bucket.score, interaction_score, alpha=0.1)` — same `alpha` as the local-score path in Section 3.
+4. Set `bucket.last_interaction_us = nowUs`.
+
+If no bucket exists for `R.region`, initialize at `bucket.score = interaction_score` (first observation; no prior signal to blend with) and proceed.
+
+#### Decay (mirrors Section 7)
+
+Each `CoverageBucket` decays toward `0.5` (neutral) at the same `0.10 / week` rate applied to component scores in Section 7:
+
+```
+score_new = score_old + (0.5 - score_old) * 0.10
+```
+
+Decay is computed per-bucket at lookup time from `last_interaction_us` (lazy evaluation; no background sweep needed). Buckets whose score sits within `0.05` of neutral and whose `last_interaction_us` is older than `26 weeks` MAY be evicted from the sparse map as a storage-cleanup pass; the next lookup against an evicted region returns "no signal" rather than "neutral" so consumers can distinguish "never seen" from "decayed to neutral."
+
+#### Consumer access
+
+Downstream operational programs (regional deployment grants, hardware-leasing subsidies, staking-loan approvals) read the coverage map via a local read-only API on the reputation subsystem:
+
+```rust
+// "What's this operator's coverage in this region?"
+fn coverage(operator: NodeId, region: [u8; 2]) -> Option<f32>;
+
+// "Which regions does this operator serve?"
+fn covered_regions(operator: NodeId) -> Vec<([u8; 2], f32)>;
+```
+
+No new gossip topic is introduced. The map is per-consumer (each node computes its own view from gossip), matching the subjectivity property already stated in Section 4 — two consumers may compute different regional-coverage maps for the same operator, just as they may compute different `network_score` values.
+
+Eligibility thresholds (e.g., "operator must have coverage ≥ 0.7 in at least 3 regions to qualify for the grant") belong to consuming programs, not to this ADR. The reputation system commits only to publishing the signal in a form those programs can read.
+
+#### Trust and region attestation
+
+The signal is only as trusted as the reporter's self-declared region. ADR 001 region attestation is unverified at the protocol level today — IP-geolocation cross-checking is tracked as future work in [#400](https://github.com/decdn/decdn/issues/400). The existing latency-contradiction mitigation in [ADR 001](001-network.md) (a reporter claiming `DE` but observed at >150 ms RTT from another `DE` node triggers a reputation penalty) is the working defence. Consumers requiring stronger attestation than self-declaration should apply their own filtering — e.g., only credit reports from reporters whose latency-contradiction rate is below a threshold.
+
+#### Why no wire change to `ReputationReport`
+
+The reporter's region is already public via `NodeAnnounce`, which every consumer subscribes to per [ADR 001](001-network.md). Embedding `region` in `ReportMetrics` would duplicate state, force receivers to choose between report-stamped vs `NodeAnnounce`-stamped region on disagreement, and break the principle that a single source of truth (`NodeAnnounce`) carries operator metadata. The peer-table lookup adds one hash-map read per report and has no wire cost.
 
 ## Consequences
 
