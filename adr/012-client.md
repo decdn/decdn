@@ -26,7 +26,7 @@ This ADR targets **desktop and server clients** — POSIX or Windows hosts with 
 - Local NTP synchronization (required for gossip validation per [ADR 001](001-network.md)).
 - Either an OS keychain (production) or a local encrypted keystore file (PoC) for Ethereum key storage.
 
-**Mobile clients (iOS, Android) and web clients (browser) are out of scope.** They require fundamentally different choices for key custody (platform secure enclave / WalletConnect rather than filesystem keystore), transport (WebTransport rather than raw QUIC; no UDP on browsers), and storage (platform sandbox rather than `~/.decdn/`). The voucher-signing UX (high-frequency session-key signatures per [ADR 024 §3](024-account-abstraction.md#3-session-keys--deferred-to-production-via-erc-7579-smartsessions)) and the bootstrap procedure (registry RPC + DNS seeds) both assume desktop-class capabilities. If mobile or web becomes a target, it warrants a dedicated companion ADR rather than retrofitting this one.
+**Mobile clients (iOS, Android) and web clients (browser) are out of scope.** They require fundamentally different choices for key custody (platform secure enclave / WalletConnect rather than filesystem keystore), transport (WebTransport rather than raw QUIC; no UDP on browsers), and storage (platform sandbox rather than `~/.decdn/`). The voucher-signing UX (high-frequency session-key signatures per [ADR 024 §3](024-account-abstraction.md#3-session-keys--deferred-to-production-via-erc-7579-smartsessions)) and the bootstrap procedure (registry RPC + DNS seeds) both assume desktop-class capabilities.
 
 ### Client Roles and Capabilities
 
@@ -87,7 +87,7 @@ For PoC, steps 4–5 are skipped (no DNS seeds configured). The registry is the 
 
 The client validates gossip messages using the same rules as nodes: signature verification, registry membership check, and ±60-second timestamp freshness ([ADR 001](001-network.md)). This requires NTP synchronization, as already mandated for "validating clients" in ADR 001.
 
-Clients participate as gossip *leaves*: they subscribe and validate but never forward received messages back into the mesh. iroh-gossip propagation is the responsibility of staked nodes, which carry economic accountability (slashing, reputation) for relay correctness and availability. Clients are unstaked and carry no such accountability; making relay opt-in would add operational complexity without improving propagation at any expected mesh scale. This applies to both PoC and production — the policy is not a deployment-time toggle.
+Clients participate as gossip *leaves*: they subscribe and validate but never forward received messages back into the mesh. iroh-gossip propagation is the responsibility of staked nodes, which carry economic accountability (slashing, reputation) for relay correctness and availability. Clients are unstaked and carry no such accountability. This applies to both PoC and production — the policy is not a deployment-time toggle.
 
 The registry query, retry schedule, and `peers.json` fallback behavior defined here supersede the client-specific portions of [ADR 001 — Registry Unavailability](001-network.md#registry-unavailability). ADR 001 retains the specification for node bootstrap and registry interaction.
 
