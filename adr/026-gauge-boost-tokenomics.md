@@ -295,13 +295,28 @@ Disbursements require all of:
 1. An attested incident bundle (cryptographic evidence of the failure, identity of the harmed party, proposed payout amount).
 2. A governance proposal, or fast-track multisig approval (within hard caps per [ADR 009](009-governance.md)).
 3. A 48-hour appeal window during which the bundle is challengeable on-chain.
-4. Post-incident reporting published to a public registry maintained by `SafetyReserve`.
+4. **Post-incident reporting.** On payout settlement, `SafetyReserve` writes an immutable record to its public on-chain registry (see [ADR 009 § SafetyReserve Payout Authorization](009-governance.md#safetyreserve-payout-authorization) for the record fields and reporting obligations).
 
 No path exists for unattested payouts; the `payout(bundleHash, recipient, amount)` entry point checks all four gates. Sizing analysis (number of $100K and $1M incidents covered per year per scenario) lives in the economic-model spec §7; this ADR does not duplicate the table.
 
+#### Cross-category payout ordering
+
+When `SafetyReserve` solvency is insufficient to immediately fund every authorized disbursement — most plausibly during a correlated-outage window combining slash-restitution appeals (per [ADR 028 §5](028-slashing-appeals.md#5-hard-caps-and-frequency-limits)) with concurrent SLA-breach payouts — the unfunded portion of each authorization is recorded as a *pending claim* and disbursed once solvency permits. The queue is keyed on `(accrualEpoch asc, claimId asc)`:
+
+- **`accrualEpoch`** is the FeeRouter 1-week epoch ([§2 Epoch mechanics](#epoch-mechanics)) in which the original `payout()` authorization first hit insolvency. SafetyReserve does not maintain a separate epoch clock; using the FeeRouter epoch keeps `accrualEpoch` derivable from any block timestamp without an additional canonical clock.
+- **`claimId`** is a monotonic `uint256` counter assigned by `SafetyReserve` at authorization time, incremented atomically as each pending claim is recorded. It is the within-epoch tiebreaker — not a payout-category priority signal, just a deterministic disambiguator for the rare case of multiple claims accruing in the same epoch.
+
+The queue ordering is therefore **epoch-FIFO across all payout categories with a per-claim monotonic tiebreaker within an epoch**. Three properties follow:
+
+- **No payout category has cross-category priority.** Slash-appellants, SLA-breach claimants, and future incident-response integrations all enter the same queue keyed by accrual epoch and `claimId`; no constituency is privileged. The `claimId` tiebreaker is protocol-monotonic, not category-coded — it does not assert that any payout category is preferred over another.
+- **No multisig-as-orderer hazard.** Authorization order (the sequence in which `SafetyReserve.payout()` is called or the multisig fast-tracks an appeal) determines `claimId` only in the rare same-epoch tie, and even then only deterministically; once authorized, queue position is fixed.
+- **Forward-compatible with new payout categories.** Future incident-response contracts integrating via the stable `payout(bundleHash, recipient, amount)` interface inherit the same queue semantics without amending this ADR.
+
+**Disbursement of queued claims is permissionless.** Once the original `payout()` authorization completes — gates 1–3 of the four [Spending controls](#spending-controls) (attested bundle, authorization, 48-hour appeal window) were checked at authorization; gate 4 (post-incident reporting) writes atomically on each disbursement — the claim is in the queue and any caller may invoke a `disbursePending()` head-of-queue path when reserve solvency permits. No second-stage authorization is required, which is what makes the queue-ordering guarantee meaningful: the multisig cannot selectively re-authorize favored queued claims because no re-authorization step exists. This mirrors the permissionless-detection pattern in [Appendix: Fraud Detection](appendix-fraud-detection.md). The exact storage shape and the `disbursePending` entry-point signature are pinned in a future SafetyReserve contract-implementation ADR (tracked at [#524](https://github.com/decdn/decdn/issues/524)); this section pins only the ordering semantics and the permissionless-disbursement property.
+
 #### Interface stability
 
-The `payout(bundleHash, recipient, amount)` signature is contract-stable: future incident-response tooling, insurance products, and SLA-style contracts integrate via this entry point without contract changes. Evidence formats live off-chain and are referenced by hash on-chain; the contract enforces the four payout gates uniformly regardless of caller identity (subject to `AccessControl` role grants per [ADR 016 §5](016-contract-interactions.md#5-access-control-matrix)).
+The `payout(bundleHash, recipient, amount)` signature is contract-stable: future incident-response tooling, insurance products, and SLA-style contracts integrate via this entry point without contract changes. Evidence formats live off-chain and are referenced by hash on-chain; the contract enforces the four payout gates uniformly regardless of caller identity (subject to `AccessControl` role grants per [ADR 016 §5](016-contract-interactions.md#5-access-control-matrix)). `payout()` is the AccessControl-gated authorization path; `disbursePending()` is permissionless by design (see [Cross-category payout ordering](#cross-category-payout-ordering)) and inherits its evidence-and-gates guarantees from the original `payout()` authorization that placed the claim on the queue.
 
 #### Contract: SafetyReserve
 
