@@ -2461,12 +2461,7 @@ async fn http_origin_sends_configured_user_agent() -> anyhow::Result<()> {
         "MyCdn/1.0 (+ops@example.com)",
     )?);
     let tmp = tempfile::tempdir()?;
-    let engine = CacheEngine::open(
-        tmp.path(),
-        vec![origin as Arc<dyn Origin> as Arc<dyn Origin>],
-        16,
-    )
-    .await?;
+    let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 16).await?;
 
     let got = engine.get(hash).await?;
     anyhow::ensure!(
@@ -2497,12 +2492,7 @@ async fn http_origin_sends_default_user_agent_when_unset() -> anyhow::Result<()>
     let url = parse_origin_url(&server.uri())?;
     let origin = Arc::new(HttpOrigin::new(url)?);
     let tmp = tempfile::tempdir()?;
-    let engine = CacheEngine::open(
-        tmp.path(),
-        vec![origin as Arc<dyn Origin> as Arc<dyn Origin>],
-        16,
-    )
-    .await?;
+    let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 16).await?;
 
     let got = engine.get(hash).await?;
     anyhow::ensure!(

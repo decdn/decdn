@@ -1896,7 +1896,7 @@ mod tests {
         let cm = Arc::new(CacheMetrics::default());
         let engine = CacheEngine::open_full(
             tmp.path(),
-            vec![origin.clone() as Arc<dyn Origin> as Arc<dyn Origin>],
+            vec![origin.clone() as Arc<dyn Origin>],
             10,
             crate::PinnedHashes::empty(),
             crate::RetryPolicy::default(),
