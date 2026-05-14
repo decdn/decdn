@@ -14,10 +14,12 @@
 pub mod channel;
 pub mod eth_identity;
 pub mod rate;
+pub mod store;
 pub mod voucher;
 
 pub use channel::{ChannelError, ChannelId, ChannelState};
 pub use rate::{BYTES_PER_MB, DEFAULT_TOLERANCE_BPS, RateError, verify_rate};
+pub use store::{ChannelStateStore, MemoryChannelStateStore, StoreError};
 pub use voucher::{
     DOMAIN_NAME, DOMAIN_VERSION, SignedVoucher, Voucher, VoucherError, voucher_domain,
 };
