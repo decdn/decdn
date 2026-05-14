@@ -81,13 +81,13 @@ The driver loop is the runtime that consumes `CacheEngine::eviction_candidates()
 | `eviction_high_water_pct` | 90 | `[60, 95]` | Above this fraction of `cache.cache_size_mb`, the driver actively evicts. Sized above the 25% probe-hold capacity recommendation so a fully-loaded hold budget plus typical in-flight writes do not accidentally trip the trigger; below 95% to leave headroom for in-flight writes between sweeps. |
 | `eviction_target_pct` | 80 | `[40, 90]` | The driver evicts down to this fraction before returning to idle. The 10-point gap below `eviction_high_water_pct` is the hysteresis band — preventing driver thrash on writes that hover near the trigger. Lower bound 40 prevents governance error from aggressively starving the cache; upper bound 90 enforces a minimum 5-point gap below high-water. |
 
-The driver MUST refuse to start (or reject a SIGHUP reload) if `eviction_target_pct ≥ eviction_high_water_pct − 5` — the hysteresis gap is structural, not a tunable nicety.
+The driver MUST refuse to start (or reject a SIGHUP reload) if `eviction_target_pct > eviction_high_water_pct - 5` — the hysteresis gap is structural, not a tunable nicety.
 
 #### Per-sweep budget
 
 `eviction_per_sweep_budget = 16` (governable bounds `[1, 256]`). At each tick, the driver removes at most this many candidates before yielding the cache lock. The budget bounds worst-case driver-induced latency on the cache hot path: at typical filesystem-unlink cost ~1 ms per entry, 16 evictions per sweep produce ~16 ms of locked work before yielding. The driver does NOT hold the `eviction_candidates()` snapshot lock across the sweep — it acquires per-hash removal locks, so concurrent reads on unrelated hashes are not blocked.
 
-The driver continues across consecutive ticks until either (a) `decdn_cache_bytes ≤ eviction_target_pct × cache_size_mb_bytes`, or (b) `eviction_candidates()` returns empty (everything pinned, evicted-durably, or held — see §§2–4). Case (b) emits `decdn_cache_eviction_starved_total` and the driver returns to idle until the next tick. The operator response to sustained starvation is to raise `cache.cache_size_mb`, lower `max_probe_holds` ([ADR 005 § Hold Budget](005-protocol.md#hold-budget)), or trim the pinned set ([#276](https://github.com/decdn/decdn/issues/276)) — never to disable any of the three layers.
+The driver continues across consecutive ticks until either (a) `decdn_cache_bytes ≤ eviction_target_pct × cache_size_mb_bytes`, or (b) `eviction_candidates()` returns empty (everything pinned, evicted-durably, or held — see §§2–4). Case (b) emits `decdn_cache_evictions_starved_total` and the driver returns to idle until the next tick. The operator response to sustained starvation is to raise `cache.cache_size_mb`, lower `max_probe_holds` ([ADR 005 § Hold Budget](005-protocol.md#hold-budget)), or trim the pinned set ([#276](https://github.com/decdn/decdn/issues/276)) — never to disable any of the three layers.
 
 #### Tick cadence
 
@@ -97,15 +97,15 @@ A future optimization MAY add an event-driven path where cache-write completions
 
 #### Backstop behaviour
 
-The `cache.cache_size_mb` ceiling is enforced by the driver, not by the cache write path. Writes remain agnostic: they write to disk via iroh-blobs and bump `decdn_cache_bytes`. If sustained pressure exceeds eviction throughput (adversarial fill, runaway pin set, undersized cache), disk-full errors from iroh-blobs propagate to callers as the hard backstop. Operators should treat sustained `decdn_cache_eviction_starved_total > 0` paired with `decdn_cache_bytes` approaching `disk_capacity` as an operational alarm distinct from the in-bounds `decdn_cache_bytes ≈ decdn_cache_size_limit_bytes` operating regime.
+The `cache.cache_size_mb` ceiling is enforced by the driver, not by the cache write path. Writes remain agnostic: they write to disk via iroh-blobs and bump `decdn_cache_bytes`. If sustained pressure exceeds eviction throughput (adversarial fill, runaway pin set, undersized cache), disk-full errors from iroh-blobs propagate to callers as the hard backstop. Operators should treat sustained `decdn_cache_evictions_starved_total > 0` paired with `decdn_cache_bytes` approaching `disk_capacity` as an operational alarm distinct from the in-bounds `decdn_cache_bytes ≈ decdn_cache_size_limit_bytes` operating regime.
 
 #### Metrics
 
 | Metric | Type | Description |
 |---|---|---|
-| `decdn_cache_eviction_sweeps_total` | counter, label `outcome={evicted, starved, idle}` | New: one increment per driver tick. `evicted` if at least one candidate was removed; `starved` if pressure persisted but `eviction_candidates()` returned empty; `idle` if the high-water condition was not met. |
-| `decdn_cache_eviction_starved_total` | counter, unlabeled | New: convenience counter equivalent to `decdn_cache_eviction_sweeps_total{outcome="starved"}` for alerting (avoids requiring label-filtering at scrape time). Emitted alongside the labeled metric. |
-| `decdn_cache_eviction_bytes_total` | counter, unlabeled | New: cumulative bytes freed by the driver via LRU eviction. Pairs with `decdn_cache_evictions_total` (count-based) so dashboards can show both "how many" and "how much" without computing byte/entry products from cache-size estimates. |
+| `decdn_cache_evictions_sweeps_total` | counter, label `outcome={evicted, starved, idle}` | New: one increment per driver tick. `evicted` if at least one candidate was removed; `starved` if pressure persisted but `eviction_candidates()` returned empty; `idle` if the high-water condition was not met. |
+| `decdn_cache_evictions_starved_total` | counter, unlabeled | New: convenience counter equivalent to `decdn_cache_evictions_sweeps_total{outcome="starved"}` for alerting (avoids requiring label-filtering at scrape time). Emitted alongside the labeled metric. |
+| `decdn_cache_evictions_bytes_total` | counter, unlabeled | New: cumulative bytes freed by the driver via LRU eviction. Pairs with `decdn_cache_evictions_total` (count-based) so dashboards can show both "how many" and "how much" without computing byte/entry products from cache-size estimates. |
 
 ## Consequences
 
