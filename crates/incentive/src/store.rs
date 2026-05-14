@@ -119,6 +119,20 @@ pub enum StoreError {
         /// Human-readable detail for the operator log.
         detail: String,
     },
+    /// Post-create permission tightening (chmod) failed. Distinct from
+    /// [`StoreError::Io`] because the operator remediation differs: a
+    /// `PermissionTighten` typically means "the file mode is not `0o600`
+    /// and the OS refused to fix it" (read-only mount, missing capability,
+    /// EPERM on a foreign-owned inode) — recovery requires manual
+    /// intervention on the filesystem, not just retrying the open. Log
+    /// triage should escalate this above transient I/O.
+    #[error("failed to tighten permissions on {path}: {source}")]
+    PermissionTighten {
+        /// Filesystem path of the affected file.
+        path: std::path::PathBuf,
+        /// Underlying I/O error returned by the chmod syscall.
+        source: std::io::Error,
+    },
 }
 
 /// In-memory [`ChannelStateStore`] for tests and the trait's reference

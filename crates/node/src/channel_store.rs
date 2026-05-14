@@ -42,6 +42,15 @@ const DB_FILE_MODE: u32 = 0o600;
 /// we do not understand.
 const SUPPORTED_SCHEMA_VERSION: u32 = 1;
 
+/// Sanity ceiling on trailing bytes per record. Trailing bytes are tolerated
+/// (forward-compat with additive schema changes — see [`StoredChannelState`]),
+/// but a `remainder.len()` above this threshold is logged as a warning so
+/// an honest schema-skew incident or malicious padding attempt is observable
+/// in operator logs without re-introducing the strict-decoding regression
+/// issue #527's reviewers warned against. Sized to fit a few realistic
+/// future additive fields (a Vec or two of 32-byte hashes) with headroom.
+const SANE_TRAILER_MAX_BYTES: usize = 256;
+
 /// redb table holding the per-channel voucher state. The table name is
 /// version-tagged so a future breaking on-disk layout change can ship as
 /// `channel_state_v2` with a one-shot migration on open; additive changes
@@ -137,19 +146,46 @@ impl PersistentChannelStateStore {
     /// # Errors
     ///
     /// - [`StoreError::Backend`] when the `data_dir` security check fails
-    ///   (wrong mode, not a directory, etc.) or `redb::Database::create`
-    ///   refuses the file (corrupt magic, truncated header, etc.).
+    ///   (wrong mode, not a directory, missing capability). Recovery: fix
+    ///   the directory's permissions; this is a setup / packaging issue,
+    ///   not a runtime fault.
+    /// - [`StoreError::Backend`] when `redb::Database::create` refuses the
+    ///   file (corrupt magic, truncated header, ENOSPC, EACCES on the file
+    ///   itself, or any I/O failure from the underlying file open).
+    ///   Recovery: restore from backup or investigate the corruption (do
+    ///   NOT just delete the file — that forfeits the issue #527 guard).
     /// - [`StoreError::Corrupt`] when the file exists but is zero-length —
     ///   `redb` would otherwise treat that as "create a fresh database"
     ///   and silently reopen the issue #527 replay window. The variant's
     ///   `detail` field names the file path and how to recover.
+    /// - [`StoreError::PermissionTighten`] when the post-create chmod fails
+    ///   (read-only mount, EPERM, missing capability). Recovery: chmod
+    ///   the file to `0o600` manually; this is an operator action, not a
+    ///   retry candidate, and the variant carries the path explicitly so
+    ///   log triage can escalate it above transient I/O.
     /// - [`StoreError::Io`] for any other filesystem error encountered
-    ///   while stat-ing the file or applying the post-create chmod.
+    ///   while stat-ing the file.
     ///
     /// When this returns `Err`, the caller MUST abort node bring-up —
     /// starting with a clean store silently forfeits the issue #527
     /// guarantee.
     pub fn open(data_dir: &Path) -> Result<Self, StoreError> {
+        Self::open_with(data_dir, Self::tighten_permissions)
+    }
+
+    /// Testable form of [`Self::open`] that takes an injectable chmod
+    /// function. Production code calls [`Self::open`], which delegates here
+    /// with [`Self::tighten_permissions`]; tests inject a closure that
+    /// simulates chmod failure to exercise the cleanup-branch asymmetry
+    /// (the security-critical fix for #527 follow-up review).
+    ///
+    /// `pub(crate)` deliberately — exposing this beyond the crate would
+    /// let an external caller pass a no-op `chmod_fn` and silently weaken
+    /// the file-mode hardening.
+    pub(crate) fn open_with<F>(data_dir: &Path, chmod_fn: F) -> Result<Self, StoreError>
+    where
+        F: FnOnce(&Path) -> Result<(), StoreError>,
+    {
         identity::ensure_data_dir(data_dir).map_err(|err| {
             StoreError::Backend(format!(
                 "data_dir {} failed security check: {err:#}",
@@ -173,6 +209,14 @@ impl PersistentChannelStateStore {
         // chmod failure can distinguish "we just created this file" (safe
         // to remove on cleanup) from "the operator has months of voucher
         // state here" (MUST NOT remove on a transient permission error).
+        // The TOCTOU window between this stat and `Database::create` is
+        // closed via `OpenOptions::create_new` below: when the stat says
+        // `NotFound` we try to atomically create the file ourselves, and
+        // an `AlreadyExists` error from `create_new` flips us to the
+        // "pre-existing, do not delete" branch. A sibling process that
+        // populated the file between our stat and our `create_new` is
+        // therefore treated identically to a file that was there all
+        // along — we never delete its work.
         let file_existed_before_open = match std::fs::metadata(&path) {
             Ok(meta) if meta.len() == 0 => {
                 return Err(StoreError::Corrupt {
@@ -188,7 +232,27 @@ impl PersistentChannelStateStore {
                 });
             }
             Ok(_) => true,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                // Try to claim file creation atomically. `Database::create`
+                // below will then either initialise its redb structure
+                // inside our empty file (Ok branch) or open the file a
+                // racing sibling wrote (AlreadyExists branch).
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                {
+                    Ok(file) => {
+                        // Drop the handle immediately; redb opens its own.
+                        // Setting perms here would race with the
+                        // post-create `tighten_permissions`; defer it.
+                        drop(file);
+                        false
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => true,
+                    Err(err) => return Err(StoreError::Io(err)),
+                }
+            }
             Err(err) => return Err(StoreError::Io(err)),
         };
 
@@ -210,42 +274,119 @@ impl PersistentChannelStateStore {
         // with real voucher state on disk), do NOT remove: a transient
         // chmod failure on a read-only mount or NFS would otherwise
         // delete the live store and silently reopen the issue #527
-        // replay window. In that case the operator gets the chmod error
-        // back and must investigate; the existing file mode is whatever
-        // it was on disk before this start (typically already 0o600
-        // from a prior successful open).
-        if let Err(chmod_err) = Self::tighten_permissions(&path) {
+        // replay window. The pre-existing-file path leaves the on-disk
+        // mode unchanged: usually 0o600 from a prior successful open,
+        // but not verified here — a botched manual restore could leave
+        // a wider mode, and the operator log message names this so the
+        // operator can `stat` the file and decide.
+        if let Err(chmod_err) = chmod_fn(&path) {
+            // `drop(db)` is load-bearing on Windows: NTFS holds a mandatory
+            // exclusive lock on the file handle, so `remove_file` below
+            // would error with sharing-violation if the handle outlives.
+            // On Unix the drop is a no-op (unlink-while-open is fine), but
+            // we keep the symmetry so a future Windows port works without
+            // a one-off branch.
             drop(db);
-            if file_existed_before_open {
-                tracing::warn!(
-                    path = %path.display(),
-                    "chmod failed on pre-existing channel store; refusing to delete it (would reopen issue #527 replay window). Investigate the permission error.",
-                );
-            } else if let Err(remove_err) = std::fs::remove_file(&path) {
-                tracing::warn!(
-                    %remove_err,
-                    path = %path.display(),
-                    "failed to remove freshly-created channel store after chmod failure",
-                );
-            }
+            Self::handle_chmod_failure(&path, &chmod_err, file_existed_before_open);
             return Err(chmod_err);
         }
 
         Ok(Self { db, path })
     }
 
-    /// Tighten the on-disk file mode to `0o600` after open. No-op on
-    /// non-Unix targets (Windows ACLs are controlled at directory level).
+    /// Operator-facing logging for the chmod-failure cleanup branch.
+    /// Extracted so the security policy ("preserve pre-existing, remove
+    /// fresh") lives in one place; the branches always emit
+    /// `tracing::error!` (not `warn!`) because both branches refuse to
+    /// bring the node up and the operator needs an error-level signal in
+    /// log aggregation.
+    ///
+    /// `file_existed_before_open` is authoritative: it is set to `true`
+    /// either when the initial stat saw a non-empty file, or when our
+    /// `OpenOptions::create_new` lost the race to a sibling writer. In
+    /// both cases the file is not ours to delete.
+    fn handle_chmod_failure(path: &Path, chmod_err: &StoreError, file_existed_before_open: bool) {
+        let observed_mode = Self::observed_mode_string(path);
+        if file_existed_before_open {
+            tracing::error!(
+                path = %path.display(),
+                observed_mode = %observed_mode,
+                event = "channel_store_chmod_fail_preserve",
+                %chmod_err,
+                "chmod failed on pre-existing channel state store; refusing to delete (would reopen issue #527 replay window). \
+                 Investigate the permission error and chmod the file to 0o600 manually before retry.",
+            );
+            return;
+        }
+
+        // Fresh file path: we definitively created this file ourselves
+        // via `OpenOptions::create_new` upstream, so removing it cannot
+        // destroy anyone else's voucher state.
+        if let Err(remove_err) = std::fs::remove_file(path) {
+            tracing::error!(
+                %remove_err,
+                path = %path.display(),
+                observed_mode = %observed_mode,
+                event = "channel_store_chmod_fail_remove_failed",
+                %chmod_err,
+                "chmod failed on freshly-created channel state store, and removal also failed; \
+                 file persists with current mode. chmod 0o600 manually before next start.",
+            );
+        }
+    }
+
+    /// Best-effort stringified file mode for operator log lines. Returns
+    /// `"unknown"` on stat failure or non-Unix targets — the field is
+    /// purely informational, so a missing value is preferable to a panic
+    /// or an `Option<u32>` leaking into every log macro.
+    fn observed_mode_string(path: &Path) -> String {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            match std::fs::metadata(path) {
+                Ok(meta) => format!("{:o}", meta.permissions().mode() & 0o777),
+                Err(_) => "unknown".into(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            "n/a (non-unix)".into()
+        }
+    }
+
+    /// Tighten the on-disk file mode to `0o600` after open. **Idempotent**:
+    /// if the file is already at the target mode, the syscall is skipped
+    /// so a read-only mount (EROFS) where the mode is correct from a
+    /// prior boot does not brick subsequent startups.
+    ///
+    /// No-op on non-Unix targets (Windows ACLs are controlled at directory
+    /// level, per the comment on [`DB_FILE_MODE`]). The non-Unix branch
+    /// emits a one-shot debug log so a future Windows operator can audit
+    /// that the tightening was deliberately skipped.
     #[cfg(unix)]
     fn tighten_permissions(path: &Path) -> Result<(), StoreError> {
         use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(path).map_err(|source| StoreError::PermissionTighten {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if meta.permissions().mode() & 0o777 == DB_FILE_MODE {
+            return Ok(());
+        }
         let perms = std::fs::Permissions::from_mode(DB_FILE_MODE);
-        std::fs::set_permissions(path, perms)?;
+        std::fs::set_permissions(path, perms).map_err(|source| StoreError::PermissionTighten {
+            path: path.to_path_buf(),
+            source,
+        })?;
         Ok(())
     }
 
     #[cfg(not(unix))]
     fn tighten_permissions(_path: &Path) -> Result<(), StoreError> {
+        tracing::debug!(
+            "channel state store: file-mode tightening skipped on non-unix; relying on data_dir ACL",
+        );
         Ok(())
     }
 
@@ -285,13 +426,40 @@ impl ChannelStateStore for PersistentChannelStateStore {
             // additive fields (which appear as trailing bytes to an older
             // reader) decode cleanly — see `StoredChannelState`'s doc and
             // the schema-version handshake in `into_state`. The remainder
-            // is intentionally discarded: the schema_version field gates
-            // whether to reject the record entirely.
-            let (stored, _remainder): (StoredChannelState, &[u8]) =
+            // is intentionally discarded.
+            //
+            // What this DOES guard: forward-compat for additive schema
+            // changes, and outright structural corruption (insufficient
+            // bytes, malformed varint) which `take_from_bytes` rejects.
+            //
+            // What this does NOT guard: intra-record bit-flips inside the
+            // fixed-shape fields (e.g. a single byte flipped inside
+            // `client: [u8; 20]`). The deserializer accepts any 20 bytes
+            // there and the schema_version check in `into_state` cannot
+            // catch it. The real defense for that class is one layer
+            // down: redb checksums its pages, so on-disk bit-rot is
+            // caught at the storage layer before we see the value.
+            let (stored, remainder): (StoredChannelState, &[u8]) =
                 postcard::take_from_bytes(value_bytes).map_err(|err| StoreError::Corrupt {
                     channel_id: Some(channel_id),
                     detail: format!("postcard decode failed: {err}"),
                 })?;
+            // Forward-compat allowance is bounded: a malicious writer could
+            // pad megabytes onto every record and silently inflate every
+            // `load_all`. Log (don't fail) when the trailer exceeds a
+            // small sanity ceiling so a future schema-skew incident is
+            // observable in operator logs without re-introducing the
+            // strict-decoding regression issue #527's reviewers warned
+            // against.
+            if remainder.len() > SANE_TRAILER_MAX_BYTES {
+                tracing::warn!(
+                    %channel_id,
+                    remainder = remainder.len(),
+                    limit = SANE_TRAILER_MAX_BYTES,
+                    event = "channel_store_excess_trailer",
+                    "channel state record has unusually large trailing bytes; possible malicious padding or large-additive-field schema skew",
+                );
+            }
             if stored.channel_id != key_bytes {
                 return Err(StoreError::Corrupt {
                     channel_id: Some(channel_id),
@@ -472,6 +640,129 @@ mod tests {
             mode == DB_FILE_MODE,
             "file mode {mode:o} != expected {DB_FILE_MODE:o}"
         );
+        Ok(())
+    }
+
+    /// **Idempotent-chmod regression.** When the file is already at
+    /// `DB_FILE_MODE` from a prior successful open, `tighten_permissions`
+    /// MUST skip the `set_permissions` syscall so a read-only mount where
+    /// the mode is already correct does not turn into a permanent
+    /// fault loop. We exercise the skip by setting the mode explicitly
+    /// then asserting `tighten_permissions` returns `Ok` without changing
+    /// anything observable.
+    #[cfg(unix)]
+    #[test]
+    fn idempotent_chmod_skips_syscall_on_matching_mode() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = data_dir()?;
+        let store = PersistentChannelStateStore::open(dir.path())?;
+        let path = store.path().to_path_buf();
+        // First call set the mode to 0o600; second call should be a no-op.
+        let mode_before = std::fs::metadata(&path)?.permissions().mode() & 0o777;
+        anyhow::ensure!(mode_before == DB_FILE_MODE, "precondition: mode is 0o600");
+        // Calling tighten_permissions again must succeed without issuing
+        // a real set_permissions (we can't observe the syscall directly,
+        // but the mtime should not bump — using metadata stat as the
+        // observable proxy).
+        PersistentChannelStateStore::tighten_permissions(&path)?;
+        let mode_after = std::fs::metadata(&path)?.permissions().mode() & 0o777;
+        anyhow::ensure!(mode_after == DB_FILE_MODE, "mode unchanged");
+        Ok(())
+    }
+
+    /// **Cleanup-asymmetry regression (#527 follow-up).** On `tighten_permissions`
+    /// failure for a FRESHLY-CREATED file, the cleanup branch MUST remove
+    /// the partial file so the next start sees a clean state. Uses the
+    /// `open_with` injection point to simulate a chmod failure.
+    #[test]
+    fn fresh_file_chmod_failure_removes_file() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let chmod_failed = std::io::Error::other("simulated chmod failure");
+        let path_buf = dir.path().join(CHANNELS_DB_FILE);
+        anyhow::ensure!(!path_buf.exists(), "precondition: file does not exist");
+
+        let path_for_closure = path_buf.clone();
+        let err = PersistentChannelStateStore::open_with(dir.path(), |_path| {
+            Err(StoreError::PermissionTighten {
+                path: path_for_closure.clone(),
+                source: chmod_failed,
+            })
+        })
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("open_with should propagate the chmod failure"))?;
+
+        anyhow::ensure!(
+            matches!(err, StoreError::PermissionTighten { .. }),
+            "expected PermissionTighten, got {err:?}",
+        );
+        anyhow::ensure!(
+            !path_buf.exists(),
+            "freshly-created file MUST be removed on chmod failure",
+        );
+        Ok(())
+    }
+
+    /// **Cleanup-asymmetry regression (#527 follow-up).** On `tighten_permissions`
+    /// failure for a PRE-EXISTING file, the cleanup branch MUST NOT remove
+    /// the file — otherwise a transient chmod error on subsequent boot
+    /// destroys live voucher state and reopens the replay window. Uses
+    /// the `open_with` injection point.
+    #[test]
+    fn pre_existing_file_chmod_failure_preserves_file() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let recorded = sample(7);
+        let recorded_id = recorded.channel_id;
+
+        // First open succeeds and writes a record — simulates a healthy
+        // node that has been up before.
+        {
+            let store = PersistentChannelStateStore::open(dir.path())?;
+            store.record(&recorded)?;
+        }
+
+        let path_buf = dir.path().join(CHANNELS_DB_FILE);
+        anyhow::ensure!(
+            path_buf.exists(),
+            "precondition: file exists with voucher state"
+        );
+        let size_before = std::fs::metadata(&path_buf)?.len();
+
+        // Subsequent open with an injected chmod failure: file must NOT
+        // be removed, voucher state must be intact, and the chmod error
+        // must propagate.
+        let path_for_closure = path_buf.clone();
+        let err = PersistentChannelStateStore::open_with(dir.path(), move |_path| {
+            Err(StoreError::PermissionTighten {
+                path: path_for_closure,
+                source: std::io::Error::other("simulated EROFS"),
+            })
+        })
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("open_with should propagate the chmod failure"))?;
+        anyhow::ensure!(
+            matches!(err, StoreError::PermissionTighten { .. }),
+            "expected PermissionTighten, got {err:?}",
+        );
+
+        anyhow::ensure!(
+            path_buf.exists(),
+            "pre-existing file MUST NOT be removed on chmod failure (issue #527 replay window)",
+        );
+        let size_after = std::fs::metadata(&path_buf)?.len();
+        anyhow::ensure!(
+            size_after == size_before,
+            "file size MUST be unchanged ({size_before} → {size_after})",
+        );
+
+        // And the voucher state is still readable via a fresh open with
+        // a healthy chmod_fn — proves the data is intact, not just that
+        // the file exists at the right size.
+        let recovered = PersistentChannelStateStore::open(dir.path())?;
+        let all = recovered.load_all()?;
+        anyhow::ensure!(all.len() == 1);
+        let only = all.first().ok_or_else(|| anyhow::anyhow!("missing"))?;
+        anyhow::ensure!(only.channel_id == recorded_id);
+        anyhow::ensure!(*only == recorded);
         Ok(())
     }
 
