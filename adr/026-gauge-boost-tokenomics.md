@@ -645,7 +645,3 @@ Parameter setters on `FeeRouter` and `VotingEscrow` are role-gated via `AccessCo
 ## Alternatives Considered
 
 The five tokenomics shapes evaluated against this design (original 3%-flat / stake-multiple-discount / 200M-TOKEN-bootstrap / 50-50-burn shape, auto-ve-lock-on-vest, USDC distribution to a passive ve-pool, pure-deflationary slashing, TOKEN-denominated bootstrap fund) are recorded in [`_history/alternatives-pre-launch.md` § ADR 026 — Gauge-Boost Tokenomics](_history/alternatives-pre-launch.md#adr-026--gauge-boost-tokenomics).
-
-## Cross-ADR Impact
-
-(none currently outstanding — wash-trading defense is the per-operator gauge-share cap from §3, with the cap-enforcement launch prerequisite contract-pinned in §2.)

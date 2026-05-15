@@ -102,6 +102,6 @@ The backstops for the pre-positioned case are deliberately off-protocol: (a) the
 
 ## Cross-ADR Impact
 
-- Any tightening of the [ADR 001 § Consequences](001-network.md#consequences) latency-vs.-claim reputation penalty (threshold, sample size, aggregation window, decay) is in scope for the [ADR 008](008-reputation.md) reputation domain and not blocked by this ADR.
-- `crates/gossip/src/validation.rs` enforces only the shape check (two ASCII-uppercase bytes), not the [ADR 001 § Gossip validation](001-network.md#gossip-validation) known-ISO-3166-1-alpha-2-code-set check. Closing that spec/implementation divergence is in scope for the [ADR 001](001-network.md) gossip-validation domain and not blocked by this ADR; it is logged here so the gap is tracked rather than silent.
-- The contract-level implementation of `regionLastChanged`, `regionPrev`, `regionGateActivatedAt`, and `updateRegion` (including the stability-window cooldown) lands when the `StakingRegistry` contract is implemented; the interface spec in § 3 above is the canonical reference for that work.
+- Tightening the [ADR 001 § Consequences](001-network.md#consequences) latency-vs-claim reputation penalty (threshold, sample size, window, decay) is in scope for the [ADR 008](008-reputation.md) reputation domain, not blocked by this ADR.
+- Tracked spec/impl divergence: `crates/gossip/src/validation.rs` enforces only the shape check (two ASCII-uppercase bytes), not the [ADR 001 § Gossip validation](001-network.md#gossip-validation) known-ISO-3166-1-alpha-2 set check. Closing it is in scope for the [ADR 001](001-network.md) gossip-validation domain — logged here so the gap is not silent.
+- Contract-level `regionLastChanged` / `regionPrev` / `regionGateActivatedAt` / `updateRegion` (incl. the stability-window cooldown) land with the `StakingRegistry` implementation; the § 3 interface spec is the canonical reference for that work.
