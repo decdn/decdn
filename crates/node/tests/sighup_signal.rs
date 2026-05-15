@@ -53,6 +53,8 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
             payment_channel_address: "0x0000000000000000000000000000000000000001".into(),
             staking_registry_address: "0x0000000000000000000000000000000000000002".into(),
             rpc_watchdog_interval_sec: 30,
+            slash_judge_address: "0x0000000000000000000000000000000000000003".to_string(),
+            chain_id: decdn_common::config::DEFAULT_CHAIN_ID,
         },
         cache: ResolvedCache {
             cache_dir: PathBuf::from("/tmp/cache"),
@@ -63,8 +65,13 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
             origin_retry: decdn_cache::RetryPolicy::default(),
             user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
             gc_interval_sec: 0,
+            max_probe_holds: decdn_common::config::DEFAULT_MAX_PROBE_HOLDS,
         },
-        payment: ResolvedPayment { rate_per_mb: rate },
+        payment: ResolvedPayment {
+            rate_per_mb: rate,
+            delivery_floor: 0,
+            delivery_ceiling: decdn_protocol::MAX_RATE_PER_MB,
+        },
         observability: ResolvedObservability {
             log_level: level,
             log_format: decdn_common::cli::LogFormat::Pretty,
@@ -146,7 +153,11 @@ async fn persistent_sighup_observes_both_signals() {
     let initial = seed_resolved(10, LogLevel::Info);
     let (setter, levels) = recording_setter();
     let state = Arc::new(RuntimeReloadState::new(
-        PaymentArgs { rate_per_mb: None },
+        PaymentArgs {
+            rate_per_mb: None,
+            delivery_floor: None,
+            delivery_ceiling: None,
+        },
         ObservabilityArgs {
             log_level: None,
             log_format: None,
@@ -232,7 +243,11 @@ async fn sighup_applies_security_changes() {
     let initial = seed_resolved(10, LogLevel::Info);
     let (setter, _levels) = recording_setter();
     let state = Arc::new(RuntimeReloadState::new(
-        PaymentArgs { rate_per_mb: None },
+        PaymentArgs {
+            rate_per_mb: None,
+            delivery_floor: None,
+            delivery_ceiling: None,
+        },
         ObservabilityArgs {
             log_level: None,
             log_format: None,

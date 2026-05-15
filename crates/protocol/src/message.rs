@@ -4,17 +4,38 @@
 //! wrap the per-message structs. The enum is serialized as the outermost
 //! postcard value inside a length-prefixed frame (see [`crate::framing`]).
 //!
-//! Signed-field freezing (ADR 013 §Signed Field Freezing): `ProbeResponse` is
-//! currently unsigned; when it gains a signature, its signed fields will be
-//! split into a frozen `ProbeResponseBody` per ADR 013. The
-//! `#[serde(deserialize_with)]` validation on `rate_per_mb` must move with
-//! the signed body so the protocol-boundary bound on [`MAX_RATE_PER_MB`]
-//! continues to apply.
+//! # Signed-field freezing (ADR 013 §Signed Field Freezing)
+//!
+//! [`ProbeResponse`] is split into a signed [`ProbeResponseBody`] plus the
+//! outer unsigned fields `total_bytes` and `slash_sig`. Unlike
+//! [`crate::gossip::NodeAnnounce`] (Ed25519 over postcard bytes), `slash_sig`
+//! is **not** computed over a postcard serialization: it is an EIP-712
+//! secp256k1 signature over the *typed-data hash of the body fields*
+//! `{hash, has_blob, rate_per_mb, timestamp_us}`, exactly as defined in ADR
+//! 014 §EIP-712 Type Definitions and implemented in
+//! `decdn_incentive::ProbeSlashData`. There is intentionally no
+//! `signing_bytes()` helper here — postcard bytes are *not* the signing
+//! input, and exposing one would invite incompatible verifier
+//! implementations. The `#[serde(deserialize_with)]` validation on
+//! `rate_per_mb` lives on the body field so the protocol-boundary bound on
+//! [`MAX_RATE_PER_MB`] continues to apply (issue #378).
+//!
+//! This establishes the `cdn/probe/v1` signed baseline — it is **not** an
+//! ALPN bump. ADR 013 freezes a signed field set at the protocol version that
+//! introduces it; `cdn/probe/v1` had no prior signed `ProbeResponse`, so the
+//! set `{hash, has_blob, rate_per_mb, timestamp_us}` is the v1 baseline (ADR
+//! 005 §`cdn/probe/v1`, ADR 014 §1). `total_bytes` is the ADR 013 Tier-1
+//! unsigned-evolution exemplar (ADR 005 §`cdn/probe/v1`) and is deliberately
+//! NOT covered by `slash_sig`. The `ProbeMessage` variant order is unchanged.
+//!
+//! This crate deliberately does not depend on any crypto library. The caller
+//! (`decdn_incentive::ProbeSlashData` and the probe handler/CLI) computes and
+//! verifies the EIP-712 `slash_sig`.
 
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 
-/// Maximum permitted value for [`ProbeResponse::rate_per_mb`] (issue #378).
+/// Maximum permitted value for [`ProbeResponseBody::rate_per_mb`] (issue #378).
 ///
 /// 1 trillion (10^12) base units. The value participates in the client
 /// selection score `rate_per_mb × rtt_ms × scale / reputation²` (issue #322,
@@ -30,11 +51,30 @@ use serde::{Deserialize, Serialize};
 /// bound is the protocol-boundary check, not a substitute for safe math.
 pub const MAX_RATE_PER_MB: u64 = 1_000_000_000_000;
 
+/// Length in bytes of an EOA secp256k1 EIP-712 signature (`r‖s‖v`, 32+32+1).
+///
+/// ADR 014 §1 mandates `slash_sig` is **non-empty** and that requesters MUST
+/// reject missing/zero-length signatures — it does not itself fix a byte
+/// length. In the `PoC` every node signs its own `slash_sig` with a
+/// software-held EOA key (ADR 024 §18: "a software-held signing key … used
+/// as a plain EOA" or wrapped by a 1-of-1 Safe), which is always exactly
+/// this 65-byte form. Variable-length **ERC-1271** smart-account signatures
+/// (ADR 024 production) are verified on-chain by `SlashJudge` via
+/// `SignatureChecker.isValidSignatureNow` (ADR 014 §On-Chain Verification) —
+/// off-chain producers/requesters in the `PoC` are EOA-only, so enforcing
+/// exactly this length is the correct, intentionally-strict `PoC` bound.
+/// When ERC-1271 off-chain handling lands this constant becomes a lower
+/// bound.
+pub const SLASH_SIG_LEN: usize = 65;
+
 /// Errors produced when validating wire-decoded protocol messages.
 ///
-/// These surface from the [`Deserialize`] impl on validated message types
-/// (see [`ProbeResponse`]); postcard wraps them as [`postcard::Error`] which
-/// the framing layer in turn maps to [`crate::FrameError::Decode`].
+/// `RateTooLarge` surfaces from the [`Deserialize`] impl on
+/// [`ProbeResponseBody`] (postcard wraps it as [`postcard::Error`] which the
+/// framing layer maps to [`crate::FrameError::Decode`]).
+/// `InvalidSlashSigLen` is a requester-side obligation enforced via
+/// [`ProbeResponse::validate`] — it is intentionally NOT enforced at decode
+/// time so the handler can build the response before signing it.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum MessageValidationError {
     /// `rate_per_mb` exceeds [`MAX_RATE_PER_MB`].
@@ -43,6 +83,16 @@ pub enum MessageValidationError {
         max = MAX_RATE_PER_MB
     )]
     RateTooLarge { rate: u64 },
+    /// `slash_sig` is missing or not [`SLASH_SIG_LEN`] bytes. ADR 014 §1
+    /// mandates a non-empty signature on every `ProbeResponse`; the `PoC`'s
+    /// EOA-only signing path (ADR 024 §18) makes that exactly
+    /// [`SLASH_SIG_LEN`], which requesters MUST reject deviations from.
+    #[error(
+        "ProbeResponse.slash_sig has invalid length {len} \
+         (ADR 014 §1: mandatory non-empty; PoC EOA form is {expected} bytes)",
+        expected = SLASH_SIG_LEN
+    )]
+    InvalidSlashSigLen { len: usize },
 }
 
 /// Top-level protocol enum for `cdn/probe/v1`. Variant order is frozen per
@@ -63,51 +113,93 @@ pub enum ProbeMessage {
     Response(ProbeResponse),
 }
 
-/// Client → node request on `cdn/probe/v1`.
+/// Client → node request on `cdn/probe/v1` (ADR 005 §`cdn/probe/v1`).
 ///
-/// A probe is unauthenticated and unpaid: it asks a candidate node to identify
-/// itself and report its current per-MB rate so the client can rank it.
+/// A probe is unauthenticated and unpaid: it asks a candidate node whether it
+/// holds `hash` and at what rate it will serve it, so the client can rank
+/// candidates on both availability and price in a single round-trip.
+/// `timestamp_us` is a requester-generated microsecond timestamp echoed back
+/// in [`ProbeResponseBody::timestamp_us`]; it serves both response
+/// correlation and RTT measurement (RTT = `receive_time` − `timestamp_us`)
+/// and is
+/// part of the EIP-712 signed set so the slashing window can be computed
+/// on-chain from a single requester clock (ADR 014 §1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProbeRequest {
-    /// Client-chosen nonce echoed back in the response. Lets clients correlate
-    /// concurrent probes and match responses to the originating request.
-    pub nonce: u64,
+    /// BLAKE3 hash of the blob being queried (iroh `Hash`, 32 bytes).
+    pub hash: [u8; 32],
+    /// Requester-generated microseconds since Unix epoch, echoed back.
+    pub timestamp_us: u64,
 }
 
-/// Node → client response on `cdn/probe/v1`.
+/// Node → client response on `cdn/probe/v1` (ADR 005 §`cdn/probe/v1`).
 ///
-/// `rate_per_mb` is bounded by [`MAX_RATE_PER_MB`] at the wire boundary —
-/// the field-level `deserialize_rate_per_mb` hook rejects oversize values
-/// so a malicious node cannot poison the client selection score with an
+/// The signed [`ProbeResponseBody`] is covered by `slash_sig` (EIP-712
+/// secp256k1, ADR 014 §1). `total_bytes` is an optional unsigned field added
+/// per the ADR 013 Tier-1 minor-evolution pattern and is deliberately NOT
+/// covered by `slash_sig`. `slash_sig` is mandatory and non-empty on the
+/// wire; requesters MUST reject missing/zero-length signatures (enforced via
+/// [`ProbeResponse::validate`] and the requester's [`SLASH_SIG_LEN`] check).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProbeResponse {
+    /// Signed body. Its wire layout is frozen per ADR 013.
+    pub body: ProbeResponseBody,
+    /// Blob size in bytes when known. Optional, unsigned, NOT covered by
+    /// `slash_sig` (ADR 005 §`cdn/probe/v1`, ADR 013 Tier-1). Nodes SHOULD
+    /// include it when the size is known so requesters can estimate cost.
+    pub total_bytes: Option<u64>,
+    /// EIP-712 secp256k1 signature over the typed-data hash of `body`'s
+    /// fields `{hash, has_blob, rate_per_mb, timestamp_us}` (ADR 014 §1; see
+    /// `decdn_incentive::ProbeSlashData`). Always exactly [`SLASH_SIG_LEN`]
+    /// bytes — *not* a signature over postcard bytes. The verify path
+    /// rejects any other length.
+    pub slash_sig: Vec<u8>,
+}
+
+/// Signed fields of a [`ProbeResponse`]. Layout is frozen per ADR 013 — future
+/// additions go on [`ProbeResponse`] as optional unsigned fields, not here.
+///
+/// `rate_per_mb` is bounded by [`MAX_RATE_PER_MB`] at the wire boundary — the
+/// field-level `deserialize_rate_per_mb` hook rejects oversize values so a
+/// malicious node cannot poison the client selection score with an
 /// overflow-inducing rate (issue #378). Server-side construction is
 /// unconstrained at the type level; the node's config layer
 /// (`resolve_payment`) enforces the same ceiling at startup and on hot
 /// reload, keeping the bound bilateral.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProbeResponse {
-    /// The nonce from the corresponding [`ProbeRequest`].
-    pub nonce: u64,
-    /// Node-side timestamp when the response was generated, as Unix epoch ms.
-    pub measured_at_unix_ms: u64,
-    /// The responding node's ed25519 public key (iroh `NodeId`), 32 bytes.
-    pub node_id: [u8; 32],
+pub struct ProbeResponseBody {
+    /// BLAKE3 hash this response answers for, echoed from the request.
+    pub hash: [u8; 32],
+    /// Whether the node currently holds the blob and will serve it. A node
+    /// MUST NOT sign `true` unless it can guarantee delivery within the
+    /// slashing window (ADR 005 §Probe-triggered eviction hold).
+    pub has_blob: bool,
     /// The node's current quoted rate in token base units per MB. The specific
     /// token is a deployment concern (see ADR 010) — the protocol itself does
     /// not normalize units across tokens. Bounded by [`MAX_RATE_PER_MB`].
     #[serde(deserialize_with = "deserialize_rate_per_mb")]
     pub rate_per_mb: u64,
+    /// The requester-generated microsecond timestamp from the corresponding
+    /// [`ProbeRequest`], echoed back unchanged.
+    pub timestamp_us: u64,
 }
 
 impl ProbeResponse {
-    /// Validate field invariants. The wire-decode path enforces the same
-    /// bound automatically via `deserialize_rate_per_mb`; this method is
-    /// exposed so server-side construction sites can re-check before
-    /// sending and so tests can assert validity without going through a
-    /// full encode/decode roundtrip.
+    /// Validate field invariants. The wire-decode path enforces the
+    /// `rate_per_mb` bound automatically via `deserialize_rate_per_mb`; this
+    /// method additionally enforces the requester-side mandatory-`slash_sig`
+    /// rule (ADR 014 §1) and is exposed so construction sites can re-check
+    /// before sending and tests can assert validity without a full
+    /// encode/decode roundtrip.
     pub const fn validate(&self) -> Result<(), MessageValidationError> {
-        if self.rate_per_mb > MAX_RATE_PER_MB {
+        if self.body.rate_per_mb > MAX_RATE_PER_MB {
             return Err(MessageValidationError::RateTooLarge {
-                rate: self.rate_per_mb,
+                rate: self.body.rate_per_mb,
+            });
+        }
+        if self.slash_sig.len() != SLASH_SIG_LEN {
+            return Err(MessageValidationError::InvalidSlashSigLen {
+                len: self.slash_sig.len(),
             });
         }
         Ok(())
@@ -116,7 +208,7 @@ impl ProbeResponse {
 
 // Field-level deserialize hook so the protocol boundary rejects oversize
 // `rate_per_mb` (issue #378). Using `#[serde(deserialize_with)]` rather
-// than a hand-written `impl Deserialize for ProbeResponse` keeps the
+// than a hand-written `impl Deserialize for ProbeResponseBody` keeps the
 // struct's field order and codec in lockstep with the derive — there is
 // no mirror struct to drift out of sync. The wire bytes are byte-identical
 // to what a fully-derived `Deserialize` would have read, so postcard's
@@ -138,9 +230,29 @@ where
 mod tests {
     use super::*;
 
+    fn sample_body() -> ProbeResponseBody {
+        ProbeResponseBody {
+            hash: [7u8; 32],
+            has_blob: true,
+            rate_per_mb: 10,
+            timestamp_us: 1_700_000_000_000_000,
+        }
+    }
+
+    fn sample_response() -> ProbeResponse {
+        ProbeResponse {
+            body: sample_body(),
+            total_bytes: Some(4096),
+            slash_sig: vec![0xABu8; SLASH_SIG_LEN],
+        }
+    }
+
     #[test]
     fn probe_request_roundtrip() -> Result<(), postcard::Error> {
-        let req = ProbeRequest { nonce: 0xdead_beef };
+        let req = ProbeRequest {
+            hash: [9u8; 32],
+            timestamp_us: 0xdead_beef,
+        };
         let bytes = postcard::to_allocvec(&req)?;
         let decoded: ProbeRequest = postcard::from_bytes(&bytes)?;
         assert_eq!(req, decoded);
@@ -149,12 +261,7 @@ mod tests {
 
     #[test]
     fn probe_response_roundtrip() -> Result<(), postcard::Error> {
-        let resp = ProbeResponse {
-            nonce: 42,
-            measured_at_unix_ms: 1_700_000_000_000,
-            node_id: [7u8; 32],
-            rate_per_mb: 10,
-        };
+        let resp = sample_response();
         let bytes = postcard::to_allocvec(&resp)?;
         let decoded: ProbeResponse = postcard::from_bytes(&bytes)?;
         assert_eq!(resp, decoded);
@@ -162,8 +269,24 @@ mod tests {
     }
 
     #[test]
+    fn probe_response_total_bytes_none_roundtrip() -> Result<(), postcard::Error> {
+        let resp = ProbeResponse {
+            total_bytes: None,
+            ..sample_response()
+        };
+        let bytes = postcard::to_allocvec(&resp)?;
+        let decoded: ProbeResponse = postcard::from_bytes(&bytes)?;
+        assert_eq!(resp, decoded);
+        assert_eq!(decoded.total_bytes, None);
+        Ok(())
+    }
+
+    #[test]
     fn probe_message_request_discriminant_is_zero() -> Result<(), postcard::Error> {
-        let msg = ProbeMessage::Request(ProbeRequest { nonce: 1 });
+        let msg = ProbeMessage::Request(ProbeRequest {
+            hash: [0u8; 32],
+            timestamp_us: 1,
+        });
         let bytes = postcard::to_allocvec(&msg)?;
         assert_eq!(bytes.first().copied(), Some(0u8));
         let decoded: ProbeMessage = postcard::from_bytes(&bytes)?;
@@ -173,13 +296,7 @@ mod tests {
 
     #[test]
     fn probe_message_response_discriminant_is_one() -> Result<(), postcard::Error> {
-        let resp = ProbeResponse {
-            nonce: 9,
-            measured_at_unix_ms: 1,
-            node_id: [0u8; 32],
-            rate_per_mb: 2,
-        };
-        let msg = ProbeMessage::Response(resp);
+        let msg = ProbeMessage::Response(sample_response());
         let bytes = postcard::to_allocvec(&msg)?;
         assert_eq!(bytes.first().copied(), Some(1u8));
         let decoded: ProbeMessage = postcard::from_bytes(&bytes)?;
@@ -196,17 +313,16 @@ mod tests {
 
     // Issue #378: the wire boundary MUST reject `rate_per_mb` above
     // MAX_RATE_PER_MB so a malicious peer cannot feed an overflow-inducing
-    // value into the client selection score.
+    // value into the client selection score. The hook now lives on the
+    // signed body field.
     #[test]
-    fn probe_response_decode_rejects_rate_above_max() -> Result<(), postcard::Error> {
-        let resp = ProbeResponse {
-            nonce: 1,
-            measured_at_unix_ms: 0,
-            node_id: [0u8; 32],
+    fn probe_response_body_decode_rejects_rate_above_max() -> Result<(), postcard::Error> {
+        let body = ProbeResponseBody {
             rate_per_mb: MAX_RATE_PER_MB + 1,
+            ..sample_body()
         };
-        let bytes = postcard::to_allocvec(&resp)?;
-        let decoded: Result<ProbeResponse, _> = postcard::from_bytes(&bytes);
+        let bytes = postcard::to_allocvec(&body)?;
+        let decoded: Result<ProbeResponseBody, _> = postcard::from_bytes(&bytes);
         assert!(decoded.is_err(), "expected decode rejection");
         Ok(())
     }
@@ -214,10 +330,11 @@ mod tests {
     #[test]
     fn probe_response_decode_rejects_u64_max_rate() -> Result<(), postcard::Error> {
         let resp = ProbeResponse {
-            nonce: 1,
-            measured_at_unix_ms: 0,
-            node_id: [0u8; 32],
-            rate_per_mb: u64::MAX,
+            body: ProbeResponseBody {
+                rate_per_mb: u64::MAX,
+                ..sample_body()
+            },
+            ..sample_response()
         };
         let bytes = postcard::to_allocvec(&resp)?;
         let decoded: Result<ProbeResponse, _> = postcard::from_bytes(&bytes);
@@ -230,31 +347,33 @@ mod tests {
     #[test]
     fn probe_response_decode_accepts_rate_at_max() -> Result<(), postcard::Error> {
         let resp = ProbeResponse {
-            nonce: 1,
-            measured_at_unix_ms: 0,
-            node_id: [0u8; 32],
-            rate_per_mb: MAX_RATE_PER_MB,
+            body: ProbeResponseBody {
+                rate_per_mb: MAX_RATE_PER_MB,
+                ..sample_body()
+            },
+            ..sample_response()
         };
         let bytes = postcard::to_allocvec(&resp)?;
         let decoded: ProbeResponse = postcard::from_bytes(&bytes)?;
-        assert_eq!(decoded.rate_per_mb, MAX_RATE_PER_MB);
+        assert_eq!(decoded.body.rate_per_mb, MAX_RATE_PER_MB);
         Ok(())
     }
 
     #[test]
     fn probe_message_response_decode_rejects_oversize_rate() -> Result<(), postcard::Error> {
         let resp = ProbeResponse {
-            nonce: 1,
-            measured_at_unix_ms: 0,
-            node_id: [0u8; 32],
-            rate_per_mb: MAX_RATE_PER_MB + 1,
+            body: ProbeResponseBody {
+                rate_per_mb: MAX_RATE_PER_MB + 1,
+                ..sample_body()
+            },
+            ..sample_response()
         };
         let msg = ProbeMessage::Response(resp);
         let bytes = postcard::to_allocvec(&msg)?;
         let decoded: Result<ProbeMessage, _> = postcard::from_bytes(&bytes);
         assert!(
             decoded.is_err(),
-            "ProbeMessage decode must propagate ProbeResponse validation"
+            "ProbeMessage decode must propagate ProbeResponseBody validation"
         );
         Ok(())
     }
@@ -262,10 +381,11 @@ mod tests {
     #[test]
     fn probe_response_validate_is_consistent_with_decode() {
         let bad = ProbeResponse {
-            nonce: 1,
-            measured_at_unix_ms: 0,
-            node_id: [0u8; 32],
-            rate_per_mb: MAX_RATE_PER_MB + 1,
+            body: ProbeResponseBody {
+                rate_per_mb: MAX_RATE_PER_MB + 1,
+                ..sample_body()
+            },
+            ..sample_response()
         };
         assert_eq!(
             bad.validate(),
@@ -274,33 +394,83 @@ mod tests {
             })
         );
 
-        let good = ProbeResponse {
-            rate_per_mb: MAX_RATE_PER_MB,
-            ..bad
-        };
+        let good = sample_response();
         assert_eq!(good.validate(), Ok(()));
     }
 
-    // Wire-format guard: switching to manual `Deserialize` for
-    // `ProbeResponse` must not change the on-wire layout. If postcard's
-    // bytes for a ProbeResponse change, this fixed-byte assertion catches
-    // it before the change ships.
+    #[test]
+    fn probe_response_validate_rejects_empty_slash_sig() {
+        let resp = ProbeResponse {
+            slash_sig: Vec::new(),
+            ..sample_response()
+        };
+        assert_eq!(
+            resp.validate(),
+            Err(MessageValidationError::InvalidSlashSigLen { len: 0 })
+        );
+    }
+
+    #[test]
+    fn probe_response_validate_rejects_wrong_length_slash_sig() {
+        // A non-empty but too-short signature must also be rejected — the
+        // public helper has to be as strict as the wire invariant
+        // (SLASH_SIG_LEN), not merely "non-empty".
+        let resp = ProbeResponse {
+            slash_sig: vec![0xAB; SLASH_SIG_LEN - 1],
+            ..sample_response()
+        };
+        assert_eq!(
+            resp.validate(),
+            Err(MessageValidationError::InvalidSlashSigLen {
+                len: SLASH_SIG_LEN - 1
+            })
+        );
+    }
+
+    #[test]
+    fn probe_response_trailing_bytes_tolerated() -> Result<(), postcard::Error> {
+        // ADR 013: `take_from_bytes` silently ignores trailing bytes so future
+        // unknown unsigned fields don't break old decoders.
+        let resp = sample_response();
+        let mut bytes = postcard::to_allocvec(&resp)?;
+        bytes.extend_from_slice(&[0xAAu8, 0xBB, 0xCC]);
+        let (decoded, tail) = postcard::take_from_bytes::<ProbeResponse>(&bytes)?;
+        assert_eq!(decoded, resp);
+        assert_eq!(tail, &[0xAAu8, 0xBB, 0xCC]);
+        Ok(())
+    }
+
+    // Wire-format guard: the signed-body split must not silently change the
+    // on-wire layout. If postcard's bytes for a ProbeResponse change, this
+    // fixed-byte assertion catches it before the change ships.
+    // SLASH_SIG_LEN (65) fits a u8 and a single postcard varint byte; the
+    // cast is exact and asserted by this very test.
+    #[allow(clippy::cast_possible_truncation)]
     #[test]
     fn probe_response_wire_format_is_stable() -> Result<(), postcard::Error> {
         let resp = ProbeResponse {
-            nonce: 1,
-            measured_at_unix_ms: 2,
-            node_id: [3u8; 32],
-            rate_per_mb: 4,
+            body: ProbeResponseBody {
+                hash: [3u8; 32],
+                has_blob: true,
+                rate_per_mb: 4,
+                timestamp_us: 5,
+            },
+            total_bytes: None,
+            slash_sig: vec![0xABu8; SLASH_SIG_LEN],
         };
         let bytes = postcard::to_allocvec(&resp)?;
-        // postcard varint encoding: nonce=1 (1 byte), measured_at=2 (1 byte),
-        // node_id=32 raw bytes, rate_per_mb=4 (1 byte) → 35 bytes.
-        let mut expected = Vec::with_capacity(35);
-        expected.push(1u8); // nonce varint
-        expected.push(2u8); // measured_at_unix_ms varint
-        expected.extend_from_slice(&[3u8; 32]); // node_id
-        expected.push(4u8); // rate_per_mb varint
+        // postcard layout: body{ hash=32 raw, has_blob=1 byte (0x01),
+        // rate_per_mb=4 (1-byte varint), timestamp_us=5 (1-byte varint) },
+        // total_bytes=None (1-byte Option tag 0x00), slash_sig Vec
+        // (len varint 65=0x41, then 65 bytes).
+        let mut expected = Vec::with_capacity(32 + 1 + 1 + 1 + 1 + 1 + SLASH_SIG_LEN);
+        expected.extend_from_slice(&[3u8; 32]); // body.hash
+        expected.push(1u8); // body.has_blob = true
+        expected.push(4u8); // body.rate_per_mb varint
+        expected.push(5u8); // body.timestamp_us varint
+        expected.push(0u8); // total_bytes = None
+        expected.push(SLASH_SIG_LEN as u8); // slash_sig length prefix (65)
+        expected.extend_from_slice(&[0xABu8; SLASH_SIG_LEN]); // slash_sig bytes
         assert_eq!(bytes, expected);
         Ok(())
     }

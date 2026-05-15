@@ -23,6 +23,33 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **`cdn/probe/v1` content-availability + slashing evidence (#318).**
+  `cdn/probe/v1` is now a content-availability query, not just a
+  latency/rate probe (ADR 005, ADR 014). Wire changes (same ALPN —
+  this establishes the v1 signed baseline, not a version bump):
+  `ProbeRequest` is now `{ hash, timestamp_us }` (was `{ nonce }`);
+  `ProbeResponse` is now a signed `{ body: { hash, has_blob,
+  rate_per_mb, timestamp_us }, total_bytes: Option<u64>, slash_sig }`
+  (was `{ nonce, measured_at_unix_ms, node_id, rate_per_mb }`).
+  `slash_sig` is a mandatory, non-empty EIP-712 secp256k1 signature
+  (65-byte EOA `r‖s‖v` form in the PoC, ADR 024 §18); requesters reject
+  missing/zero-length or wrong-length signatures.
+  - **CLI** `decdn probe` now requires `--hash <BLAKE3>` (64 hex
+    chars, the `cache.pinned_hashes` form). `--json` keys changed:
+    removed `node_id`, `measured_at_unix_ms`, `nonce`; added `hash`,
+    `has_blob`, `total_bytes` (nullable), `timestamp_us`, `slash_sig`
+    (hex). `rate_per_mb`/`rtt_ms` unchanged.
+  - **Config** new required `blockchain.slash_judge_address`
+    (EIP-712 `verifyingContract` for `slash_sig`; no default — a
+    wrong/zero address silently breaks every signature); new optional
+    `blockchain.chain_id` (default 421614, Arbitrum Sepolia),
+    `cache.max_probe_holds` (default 256; `0` disables `has_blob:
+    true`), and `payment.delivery_floor`/`delivery_ceiling`
+    (PoC-local rate-bounds clamp; defaults `0`..`MAX_RATE_PER_MB` =
+    no-op). Env vars: `DECDN_SLASH_JUDGE_ADDRESS`, `DECDN_CHAIN_ID`,
+    `DECDN_MAX_PROBE_HOLDS`, `DECDN_DELIVERY_FLOOR`,
+    `DECDN_DELIVERY_CEILING`.
+
 - **Config** Origin backend selection moved into a tagged
   `[cache.origin]` table (#437). The pre-existing flat
   `cache.origin_url`, `cache.origin_path`, and `cache.decompress`

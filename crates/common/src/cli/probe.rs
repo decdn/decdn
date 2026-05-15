@@ -21,6 +21,13 @@ pub struct ProbeArgs {
     #[arg(long, value_name = "ID")]
     pub node_id: String,
 
+    /// BLAKE3 hash of the blob to query availability for: 64 hex chars
+    /// (optional `0x` prefix), the same form `cache.pinned_hashes` accepts.
+    /// `cdn/probe/v1` is a content-availability query — the node answers
+    /// whether it holds this blob (ADR 005).
+    #[arg(long, value_name = "HASH")]
+    pub hash: String,
+
     /// Direct socket address of the target node (e.g. `127.0.0.1:4433`).
     #[arg(long, value_name = "HOST:PORT")]
     pub addr: Option<SocketAddr>,

@@ -2,11 +2,16 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
+use alloy::dyn_abi::Eip712Domain;
+use alloy::primitives::B256;
+use alloy::signers::local::PrivateKeySigner;
+use decdn_cache::{CacheEngine, Hash, ProbeHoldOutcome};
+use decdn_incentive::ProbeSlashData;
 use decdn_protocol::{
-    ALPN_PROBE, APP_ERR_RATE_LIMITED, FrameError, ProbeMessage, decode_message, encode_message,
-    message::ProbeResponse, read_frame, write_frame,
+    ALPN_PROBE, APP_ERR_RATE_LIMITED, FrameError, ProbeMessage, ProbeResponseBody, decode_message,
+    encode_message, message::ProbeResponse, read_frame, write_frame,
 };
 use iroh::PublicKey;
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
@@ -47,6 +52,20 @@ pub struct ProbeHandler {
     rate_per_mb: Arc<AtomicU64>,
     metrics: Arc<Metrics>,
     limiter: Arc<ConnectionLimiter>,
+    /// Cache engine — queried for blob presence and the probe-triggered
+    /// eviction hold (ADR 005 §Probe-triggered eviction hold).
+    cache: CacheEngine,
+    /// Operator Ethereum key used to produce the EIP-712 `slash_sig`
+    /// (#406 loads it; ADR 014 §1 mandates it on every response).
+    eth_signer: Arc<PrivateKeySigner>,
+    /// `SlashJudge` EIP-712 domain, built once from
+    /// `blockchain.{slash_judge_address,chain_id}`.
+    slash_domain: Eip712Domain,
+    /// Lower/upper clamp bounds for `rate_per_mb` before signing (ADR 005
+    /// §Rate bounds validation). PoC-local stand-in for on-chain
+    /// `getRateBounds()`.
+    delivery_floor: u64,
+    delivery_ceiling: u64,
 }
 
 impl std::fmt::Debug for ProbeHandler {
@@ -54,6 +73,8 @@ impl std::fmt::Debug for ProbeHandler {
         f.debug_struct("ProbeHandler")
             .field("node_id", &self.node_id)
             .field("rate_per_mb", &self.rate_per_mb)
+            .field("delivery_floor", &self.delivery_floor)
+            .field("delivery_ceiling", &self.delivery_ceiling)
             .finish_non_exhaustive()
     }
 }
@@ -62,20 +83,37 @@ impl ProbeHandler {
     pub const ALPN: &'static [u8] = ALPN_PROBE;
 
     #[allow(clippy::missing_const_for_fn)] // Arc::new isn't const.
+    #[allow(clippy::too_many_arguments)] // wiring struct; each arg is distinct runtime state.
     pub fn new(
         node_id: PublicKey,
         rate_per_mb: Arc<AtomicU64>,
         metrics: Arc<Metrics>,
         limiter: Arc<ConnectionLimiter>,
+        cache: CacheEngine,
+        eth_signer: Arc<PrivateKeySigner>,
+        slash_domain: Eip712Domain,
+        delivery_floor: u64,
+        delivery_ceiling: u64,
     ) -> Self {
         Self {
             node_id,
             rate_per_mb,
             metrics,
             limiter,
+            cache,
+            eth_signer,
+            slash_domain,
+            delivery_floor,
+            delivery_ceiling,
         }
     }
 
+    // Linear, ordered protocol sequence (limit → accept → read → hold →
+    // clamp → sign → write → close). Splitting it would scatter the ADR-013
+    // app-error-code mapping and the ADR-005 ordering invariants across
+    // helpers and make them harder to audit against the spec — same
+    // rationale as the `read_probe_request` cognitive-complexity allow.
+    #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
     async fn serve(&self, conn: Connection) -> anyhow::Result<()> {
         let _permit = match self.limiter.acquire(&conn) {
             Ok(p) => p,
@@ -129,18 +167,104 @@ impl ProbeHandler {
             }
         };
 
-        let measured_at_unix_ms = u64::try_from(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.as_millis()),
-        )
-        .unwrap_or(u64::MAX);
+        let hash = Hash::from_bytes(req.hash);
+
+        // Probe-triggered eviction hold (ADR 005 §Probe-triggered eviction
+        // hold). Only `Held` permits signing `has_blob: true` — the blob is
+        // present, not operator-evicted, and a 35s hold is guaranteed. The
+        // outcome enum already classifies the miss (absent vs budget
+        // exhausted) so no second cache lookup is needed. The hold is taken
+        // *after* the rate limiter (ADR 005 §Probe rate limiting: hold
+        // admission occurs only after the limiter passes — do not reorder).
+        let (has_blob, total_bytes) = match self.cache.try_probe_hold(hash).await {
+            Ok(ProbeHoldOutcome::Held) => {
+                let size = self
+                    .cache
+                    .inspect(hash)
+                    .await
+                    .ok()
+                    .and_then(|p| p.size_bytes);
+                (true, size)
+            }
+            Ok(ProbeHoldOutcome::BudgetExhausted) => {
+                // Present but un-holdable: an availability degradation, never
+                // a safety fault (ADR 005 §Hold budget). Answer false.
+                self.metrics.probe_hold_violation();
+                (false, None)
+            }
+            // Blob genuinely absent or operator-evicted — a true negative,
+            // no signal needed.
+            Ok(ProbeHoldOutcome::Unavailable) => (false, None),
+            // A transient cache fault is *not* the same as "absent": the
+            // node may actually hold the blob. We still conservatively
+            // answer `has_blob: false` (never risk a phantom slash, ADR
+            // 005), but a degrading backend must be operator-visible rather
+            // than indistinguishable from a normal miss. The registry has
+            // no metric for this; a warn log is the actionable signal.
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "cache error during probe hold check; answering has_blob:false"
+                );
+                (false, None)
+            }
+        };
+        self.metrics
+            .probe_hold_slots(self.cache.probe_hold_slots_used());
+
+        // Clamp the quoted rate to the configured delivery bounds before
+        // signing (ADR 005 §Rate bounds validation): clamp-and-warn keeps
+        // the node operational across governance transitions.
+        let raw_rate = self.rate_per_mb.load(Ordering::Relaxed);
+        let rate_per_mb = raw_rate.clamp(self.delivery_floor, self.delivery_ceiling);
+        if rate_per_mb != raw_rate {
+            self.metrics.rate_bounds_clamped();
+            tracing::warn!(
+                raw_rate,
+                clamped = rate_per_mb,
+                floor = self.delivery_floor,
+                ceiling = self.delivery_ceiling,
+                "rate_per_mb clamped to delivery bounds before signing ProbeResponse"
+            );
+        }
+
+        let body = ProbeResponseBody {
+            hash: req.hash,
+            has_blob,
+            rate_per_mb,
+            timestamp_us: req.timestamp_us,
+        };
+        // EIP-712 secp256k1 slash_sig over the frozen signed set
+        // {hash, has_blob, rate_per_mb, timestamp_us} (ADR 014 §1). Mandatory
+        // and non-empty on every response — a signing failure fails the
+        // handler rather than emitting an unsigned response a requester MUST
+        // reject anyway.
+        let slash_data = ProbeSlashData {
+            hash: B256::from(req.hash),
+            has_blob,
+            rate_per_mb,
+            timestamp_us: req.timestamp_us,
+        };
+        let slash_sig = match slash_data.sign(self.eth_signer.as_ref(), &self.slash_domain) {
+            Ok(sig) => sig.as_bytes().to_vec(),
+            Err(e) => {
+                // Operator-actionable infra fault (key locked, remote/HSM
+                // signer offline). The bare iroh `AcceptError` carries no
+                // context, so log it explicitly before failing the handler
+                // (we must NOT emit an unsigned response — ADR 014 §1).
+                tracing::error!(
+                    error = %e,
+                    "probe slash_sig signing failed (eth signer unavailable?); \
+                     failing probe"
+                );
+                return Err(anyhow::anyhow!("probe slash_sig signing failed: {e}"));
+            }
+        };
 
         let resp = ProbeResponse {
-            nonce: req.nonce,
-            measured_at_unix_ms,
-            node_id: *self.node_id.as_bytes(),
-            rate_per_mb: self.rate_per_mb.load(Ordering::Relaxed),
+            body,
+            total_bytes,
+            slash_sig,
         };
 
         let payload = encode_message(&ProbeMessage::Response(resp))
