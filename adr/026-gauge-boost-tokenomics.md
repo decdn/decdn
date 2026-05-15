@@ -94,7 +94,7 @@ Epoch length is 1 week (7 × 86400 s, block-timestamp-aligned). At epoch rollove
 
 #### Pre-launch gauge accumulation
 
-The 40% gauge bucket MUST NOT pay out until the per-operator gauge-share cap from §3 above is enforced — without the cap, the ve-boost factor in §3's `working_bytes` formula admits an effective gauge slice exceeding fee-contribution share, which opens a wash-trading route on self-routed settlements (see §3 [Per-operator gauge-share cap](#per-operator-gauge-share-cap) for the structural defense and trade-offs). This sub-section pins the contract-level mechanism for that pause and the cutover.
+The 40% gauge bucket MUST NOT pay out until the §3 [Per-operator gauge-share cap](#per-operator-gauge-share-cap) is enforced (that section gives the wash-trading rationale and trade-offs). This sub-section pins the contract-level pause-and-cutover mechanism.
 
 ```solidity
 // FeeRouter pre-launch gauge state.
@@ -111,14 +111,11 @@ event GaugeLaunched(uint64 indexed epoch);
 
 **Behavior.**
 
-- While `gaugeLaunched == false`: `routeSettlement` deposits the 40% gauge share into `preLaunchGaugeAccumulator[currentEpoch]` instead of the live gauge bucket. The other five buckets (40% direct, 7% delegator, 5% burn, 5% treasury, 3% safety) flow normally per §2 — the §2 Same-transaction guarantees invariant is preserved end-to-end.
-- `claimBoost(epochs[])` reverts on every requested epoch while `gaugeLaunched == false` (no live distribution has occurred). Once `gaugeLaunched == true`, requested epochs in `[0, gaugeLaunchEpoch)` are paid from `preLaunchGaugeAccumulator[epoch]`, and epochs `≥ gaugeLaunchEpoch` are paid from the live gauge bucket — both weighted by the ve-snapshot already taken at each epoch boundary (§Epoch mechanics captures these snapshots regardless of `gaugeLaunched` state; pre-launch epochs reuse them).
-- **Cutover** via `enableGauge()`: sets `gaugeLaunched = true`, records `gaugeLaunchEpoch = currentEpoch`, emits `GaugeLaunched(currentEpoch)`. After `enableGauge()` returns, `claimBoost(epochs[])` no longer reverts for any epoch ≥ 0 — pre-launch epochs become claimable from `preLaunchGaugeAccumulator[epoch]`, and the cutover epoch onward routes through the live gauge bucket via the normal §2 path.
-- **Partial cutover epoch.** Because `enableGauge()` is `onlyGovernor` and inherits the [ADR 009](009-governance.md) ~9-day governance latency (7-day vote + 48-hour timelock), the cutover transaction lands at an arbitrary block within an epoch. Settlements before the cutover block in that epoch deposit into `preLaunchGaugeAccumulator[gaugeLaunchEpoch]`; settlements after the cutover block route via the live gauge bucket for the same epoch. Both halves credit the same `gaugeLaunchEpoch` and use the same ve-snapshot (taken at the epoch boundary before either half executed), so a claimant for `gaugeLaunchEpoch` receives `(preLaunchGaugeAccumulator[gaugeLaunchEpoch] + liveGaugeBucket[gaugeLaunchEpoch]) × ve_share` — the partial-epoch split is invisible at claim time.
-- **Claim window for pre-launch epochs.** The 26-epoch claim window for any epoch `< gaugeLaunchEpoch` starts at `gaugeLaunchEpoch`, not at the original epoch. Unclaimed pre-launch USDC sweeps to treasury after `gaugeLaunchEpoch + 26` per the §Epoch mechanics sweep rule.
-- **Empty-snapshot at a pre-launch epoch.** Operators with zero ve at the historical snapshot get zero retroactive claim — this is the intentional shape (gauge rewards long-term ve-commitment, not retroactive attestation). The §3 `sum(working_bytes) == 0` rollover-to-next-epoch rule does **not** apply to pre-launch epochs because the gauge bucket itself was never live during them; un-distributable pre-launch USDC sweeps to treasury via the standard claim-window expiry path, not via §3 rollover.
-
-This pattern is shape-analogous to §3's empty-epoch rollover (gauge bucket parked in `FeeRouter` and claimable later), but the rollover destination differs (treasury sweep on expiry vs next-epoch bucket); readers should not conflate the two.
+- While `gaugeLaunched == false`: `routeSettlement` deposits the 40% gauge share into `preLaunchGaugeAccumulator[currentEpoch]` instead of the live gauge bucket. The other five buckets (40% direct, 7% delegator, 5% burn, 5% treasury, 3% safety) flow normally — the §2 Same-transaction guarantees invariant holds end-to-end.
+- `claimBoost(epochs[])` reverts on every requested epoch while `gaugeLaunched == false`. Once `true`, epochs in `[0, gaugeLaunchEpoch)` pay from `preLaunchGaugeAccumulator[epoch]` and epochs `≥ gaugeLaunchEpoch` pay from the live gauge bucket — both weighted by the ve-snapshot taken at each epoch boundary (§Epoch mechanics captures these regardless of `gaugeLaunched` state; pre-launch epochs reuse them).
+- **Partial cutover epoch.** Because `enableGauge()` is `onlyGovernor` and inherits the [ADR 009](009-governance.md) ~9-day latency (7-day vote + 48-hour timelock), the cutover lands at an arbitrary block within an epoch. Settlements before the cutover block credit `preLaunchGaugeAccumulator[gaugeLaunchEpoch]`; settlements after route via the live gauge bucket — both halves credit the same `gaugeLaunchEpoch` under the same epoch-boundary ve-snapshot, so a claimant receives `(preLaunchGaugeAccumulator[gaugeLaunchEpoch] + liveGaugeBucket[gaugeLaunchEpoch]) × ve_share`; the split is invisible at claim time.
+- **Claim window for pre-launch epochs.** For any epoch `< gaugeLaunchEpoch` the 26-epoch window starts at `gaugeLaunchEpoch`, not the original epoch; unclaimed USDC sweeps to treasury after `gaugeLaunchEpoch + 26` per the §Epoch mechanics sweep rule.
+- **Empty-snapshot at a pre-launch epoch.** Operators with zero ve at the historical snapshot get zero retroactive claim — intentional (gauge rewards ve-commitment, not retroactive attestation). The §3 `sum(working_bytes) == 0` next-epoch rollover does **not** apply (the gauge bucket was never live during pre-launch epochs); un-distributable pre-launch USDC sweeps to treasury via claim-window expiry, not §3 rollover. This differs from §3's rollover only in destination (treasury sweep vs next-epoch bucket); do not conflate the two.
 
 ### 3. Gauge-boost formula
 
@@ -189,64 +186,56 @@ Locks may be held by any address — EOA or contract. Lock creation (`createLock
 ```solidity
 interface IVotingEscrow {
     // ─── Lock lifecycle ────────────────────────────────────────────────
-    // Lock `amount` of TOKEN until `unlockTime` (absolute, seconds).
-    // `unlockTime` is rounded down to the nearest week boundary internally
-    // (week-aligned slopes — Curve veCRV pattern). Reverts if the caller
-    // already holds a lock, if `unlockTime - block.timestamp` is outside
+    // Lock `amount` TOKEN until `unlockTime` (absolute seconds), rounded
+    // down to the nearest week boundary (week-aligned slopes — veCRV
+    // pattern). Reverts if the caller already holds a lock, if
+    // `unlockTime - block.timestamp` is outside
     // [minLockDuration, maxLockDuration], or if `amount == 0`.
     function createLock(uint256 amount, uint256 unlockTime) external;
 
-    // Add `amount` of TOKEN to the caller's existing lock without changing
-    // the unlock time. Reverts if the caller has no active lock or the
-    // lock has already expired.
+    // Add `amount` to the caller's existing lock; unlock time unchanged.
+    // Reverts if the caller has no active lock or it has expired.
     function increaseAmount(uint256 amount) external;
 
-    // Extend the caller's lock to a later `unlockTime` (absolute, seconds,
-    // week-aligned internally). Reverts if `unlockTime` is at or before
-    // the current end, if the new remaining duration would exceed
-    // `maxLockDuration`, or if the lock has already expired.
+    // Extend the caller's lock to a later `unlockTime` (week-aligned).
+    // Reverts if `unlockTime` is at or before the current end, if the new
+    // remaining duration exceeds `maxLockDuration`, or if expired.
     function increaseUnlockTime(uint256 unlockTime) external;
 
-    // Withdraw the full locked TOKEN balance after the lock's unlock time
-    // has passed. Lump-sum only — no partial withdrawals. Reverts if the
-    // lock has not yet expired (no early-exit penalty path; ve-locked
-    // TOKEN never exits early).
+    // Withdraw the full locked balance after unlock time. Lump-sum only.
+    // Reverts if not yet expired (no early-exit path; ve-locked TOKEN
+    // never exits early).
     function withdraw() external;
 
     // ─── Lock view ─────────────────────────────────────────────────────
-    // Returns the specified account's lock state: locked amount and
-    // unlock time. Returns (0, 0) for addresses that have never locked
-    // or have already withdrawn. Single read covers the common "what
-    // does this address hold and when does it unlock" query.
+    // Account's locked amount and unlock time. Returns (0, 0) for
+    // never-locked or already-withdrawn addresses.
     function locked(address account)
         external view returns (uint256 amount, uint256 end);
 
     // ─── ve-balance ────────────────────────────────────────────────────
     // Current voting weight: amount × remaining_lock_time / maxLockDuration.
-    // Decays linearly to zero at the lock's unlock time.
+    // Decays linearly to zero at unlock time.
     function balanceOf(address account) external view returns (uint256);
 
-    // Historical voting weight at unix timestamp `ts`. Per-lock checkpoints
-    // make this an O(log n) read on the checkpoint array. Load-bearing for
-    // the epoch-snapshot pattern in §2 (FeeRouter gauge accounting) and
-    // governance vote-weight reads in §9. `ts` may be in the past or
-    // present; future timestamps are rejected.
+    // Historical voting weight at unix timestamp `ts`. Per-lock
+    // checkpoints make this O(log n). Load-bearing for the §2
+    // epoch-snapshot pattern (FeeRouter gauge accounting) and §9
+    // governance vote-weight reads. Future timestamps are rejected.
     function balanceOfAt(address account, uint256 timestamp)
         external view returns (uint256);
 
     // Current total ve-supply (sum of all balanceOf at block.timestamp).
     function totalSupply() external view returns (uint256);
 
-    // Historical total ve-supply at unix timestamp `ts`. Same checkpoint
-    // pattern as `balanceOfAt`; used by Governor for quorum calculations
-    // calibrated against `VotingEscrow.totalSupplyAt(ts)` per §9.
+    // Historical total ve-supply at `ts`. Same checkpoint pattern as
+    // `balanceOfAt`; used for Governor quorum per §9.
     function totalSupplyAt(uint256 timestamp) external view returns (uint256);
 
     // ─── Vote delegation (Governor Bravo pattern) ──────────────────────
-    // Delegate the caller's ve-balance voting weight to `delegatee`. The
-    // underlying ve-position remains non-transferable; only voting weight
-    // is reassigned. Pass `address(0)` to clear delegation (weight reverts
-    // to self-delegation by default). See ADR 009 §44.
+    // Delegate the caller's ve voting weight to `delegatee`. The
+    // ve-position stays non-transferable; only voting weight moves.
+    // `address(0)` clears delegation (defaults to self). See ADR 009 §44.
     function delegate(address delegatee) external;
 
     // EIP-712 signed delegation, for gasless delegation flows.
@@ -259,8 +248,8 @@ interface IVotingEscrow {
         bytes32 s
     ) external;
 
-    // Returns the address `account` has delegated to, or `account` itself
-    // if no delegation has been set (self-delegation is the default).
+    // Address `account` delegates to, or `account` itself if unset
+    // (self-delegation is the default).
     function delegates(address account) external view returns (address);
 
     // ─── Events ────────────────────────────────────────────────────────
@@ -308,11 +297,11 @@ When `SafetyReserve` solvency is insufficient to immediately fund every authoriz
 
 The queue ordering is therefore **epoch-FIFO across all payout categories with a per-claim monotonic tiebreaker within an epoch**. Three properties follow:
 
-- **No payout category has cross-category priority.** Slash-appellants, SLA-breach claimants, and future incident-response integrations all enter the same queue keyed by accrual epoch and `claimId`; no constituency is privileged. The `claimId` tiebreaker is protocol-monotonic, not category-coded — it does not assert that any payout category is preferred over another.
-- **No multisig-as-orderer hazard.** Authorization order (the sequence in which `SafetyReserve.payout()` is called or the multisig fast-tracks an appeal) determines `claimId` only in the rare same-epoch tie, and even then only deterministically; once authorized, queue position is fixed.
-- **Forward-compatible with new payout categories.** Future incident-response contracts integrating via the stable `payout(bundleHash, recipient, amount)` interface inherit the same queue semantics without amending this ADR.
+- **No payout category has cross-category priority.** All claimants — slash-appellants, SLA-breach, future integrations — enter one queue keyed by `(accrualEpoch, claimId)`; `claimId` is protocol-monotonic, not category-coded.
+- **No multisig-as-orderer hazard.** Authorization order sets `claimId` only in the rare same-epoch tie, and deterministically; once authorized, queue position is fixed.
+- **Forward-compatible with new payout categories.** Contracts integrating via the stable `payout(bundleHash, recipient, amount)` interface inherit these semantics without amending this ADR.
 
-**Disbursement of queued claims is permissionless.** Once the original `payout()` authorization completes — gates 1–3 of the four [Spending controls](#spending-controls) (attested bundle, authorization, 48-hour appeal window) were checked at authorization; gate 4 (post-incident reporting) writes atomically on each disbursement — the claim is in the queue and any caller may invoke a `disbursePending()` head-of-queue path when reserve solvency permits. No second-stage authorization is required, which is what makes the queue-ordering guarantee meaningful: the multisig cannot selectively re-authorize favored queued claims because no re-authorization step exists. This mirrors the permissionless-detection pattern in [Appendix: Fraud Detection](appendix-fraud-detection.md). The exact storage shape and the `disbursePending` entry-point signature are pinned in a future SafetyReserve contract-implementation ADR (tracked at [#524](https://github.com/decdn/decdn/issues/524)); this section pins only the ordering semantics and the permissionless-disbursement property.
+**Disbursement of queued claims is permissionless.** Gates 1–3 of the four [Spending controls](#spending-controls) (attested bundle, authorization, 48-hour appeal window) were checked at `payout()` authorization; gate 4 (post-incident reporting) writes atomically per disbursement. Thereafter any caller may invoke a `disbursePending()` head-of-queue path when solvency permits — no second-stage authorization exists, so the multisig cannot selectively re-authorize favored queued claims. This is what makes the ordering guarantee meaningful, and mirrors the permissionless-detection pattern in [Appendix: Fraud Detection](appendix-fraud-detection.md). Storage shape and the `disbursePending` signature are pinned in a future SafetyReserve contract-implementation ADR ([#524](https://github.com/decdn/decdn/issues/524)); this section pins only ordering and the permissionless-disbursement property.
 
 #### Interface stability
 
@@ -323,11 +312,11 @@ The `payout(bundleHash, recipient, amount)` signature is contract-stable: future
 ```solidity
 interface ISafetyReserve {
     // ─── Payouts ──────────────────────────────────────────────────────
-    // Single entry point for incident disbursements. Payouts are USDC-only
-    // by design — TOKEN inflow from the 30% slashing redirect is swapped
-    // to USDC via `swapAccumulatedTokens` before becoming available here.
-    // The `bundle` hash references an off-chain attested incident bundle;
-    // the contract enforces the four payout gates uniformly:
+    // Single entry point for incident disbursements. USDC-only by design —
+    // TOKEN from the 30% slashing redirect is swapped to USDC via
+    // `swapAccumulatedTokens` before becoming available here. `bundle`
+    // references an off-chain attested incident bundle. Enforces the four
+    // payout gates uniformly:
     //   1. Attested bundle (cryptographic evidence)
     //   2. Authorization (Governor or emergency-multisig within hard caps)
     //   3. 48h appeal window since the bundle was first surfaced
@@ -365,24 +354,23 @@ interface ISafetyReserve {
     // operator+amount tuple. `SLASH_INFLOW_REPORTER_ROLE`-gated; granted
     // to `StakingRegistry` post-deploy per [ADR 016 § Post-Deployment
     // Initialization](016-contract-interactions.md#post-deployment-initialization).
-    // The TOKEN itself is transferred separately via `safeTransfer`;
-    // this call is the indexable accounting event.
+    // TOKEN is transferred separately via `safeTransfer`; this is the
+    // indexable accounting event.
     function recordSlashInflow(address operator, uint256 amount) external;
 
     // ─── TOKEN → USDC swap (keeper) ───────────────────────────────────
-    // Swaps `amountIn` of accumulated TOKEN to USDC against the
+    // Swaps `amountIn` accumulated TOKEN to USDC against the
     // [ADR 018](018-liquidity-strategy.md) Balancer V3 80/20 pool — same
     // Vault-scoped self-approval, TWAP, `minOut`, and per-epoch
-    // liquidity-cap defenses as `BuybackBurner`. Per-call batch shape
-    // (rather than full-balance) lets keepers MEV-sequence across
-    // multiple sub-swaps. `KEEPER_ROLE`-gated. `amountIn` is bounded by
-    // contract-level `min/maxBatchAmount` parameters.
+    // liquidity-cap defenses as `BuybackBurner`. Per-call batch shape lets
+    // keepers MEV-sequence sub-swaps. `KEEPER_ROLE`-gated; `amountIn`
+    // bounded by `min/maxBatchAmount`.
     function swapAccumulatedTokens(uint256 amountIn, uint256 minOut) external;
 
     // ─── Slash-appeal extensions (per ADR 028) ────────────────────────
     // Signature stubs only; full appeal state machine, window timing,
     // storage layout, per-appeal escrow accounting, and event-parameter
-    // semantics are specified in
+    // semantics live in
     // [ADR 032](032-safety-reserve-appeals-contract.md) and
     // [ADR 028 §6](028-slashing-appeals.md#6-contract-surface);
     // parameter values lock down in #451.
@@ -405,8 +393,8 @@ interface ISafetyReserve {
 
     // ─── Pause control ────────────────────────────────────────────────
     // `pause()` blocks `payout` and `swapAccumulatedTokens`;
-    // `recordSlashInflow` continues to work so slashing accounting is
-    // never lost during a pause window.
+    // `recordSlashInflow` keeps working so slashing accounting is never
+    // lost during a pause window.
     function pause() external;
     function unpause() external;
 
@@ -472,11 +460,10 @@ TWAP windows + per-epoch liquidity caps + private-RPC routing (Flashbots-style b
 interface IDelegatorBuyer {
     // ─── Per-epoch USDC → TOKEN swap (FeeRouter-only) ─────────────────
     // Called by `FeeRouter.executeDelegatorSwap`. `msg.sender == feeRouter`
-    // is the only authorization check — DelegatorBuyer is a single-purpose
-    // helper trusting FeeRouter exclusively, so no role grants are needed
-    // post-deploy. Swaps `amountIn` USDC for at least `minOut` TOKEN
-    // against the configured Balancer V3 pool, then deposits the
-    // resulting TOKEN back to FeeRouter via
+    // is the only auth check (single-purpose helper trusting FeeRouter
+    // exclusively; no post-deploy role grants). Swaps `amountIn` USDC for
+    // at least `minOut` TOKEN against the configured Balancer V3 pool,
+    // then deposits the TOKEN back via
     // `IFeeRouter.depositDelegatorTokens(epoch, amount)` — see
     // [ADR 016 § Contract: FeeRouter](016-contract-interactions.md#contract-feerouter).
     // Same Vault-scoped self-approval pattern as `BuybackBurner`.
@@ -595,7 +582,7 @@ Router shares, the boost-floor parameter, the per-operator gauge-share cap, and 
 | `epochLiquidityCapFraction` | 10% | 1% | 30% |
 | `claimWindow` | 26 epochs | 13 epochs | 52 epochs (`uint16` count of epochs; the contract internally multiplies by the immutable `epochLength` to derive a seconds-domain deadline) |
 
-The 20% floor on the node-base share guarantees operators always receive enough liquid USDC to cover at least a meaningful fraction of infrastructure costs even under extreme governance proposals — preserves the cashflow invariant. The `boostFloor` bounds prevent governance from collapsing the gauge pool to a winner-take-all distribution (lower-bound) or flattening it into uselessness (upper-bound). The `MAX_GAUGE_SHARE_PER_OPERATOR` bounds prevent governance from disabling the wash-trading defense (lower bound implicitly enforced by the cap being non-zero) or so over-tightening that legitimate large operators are starved (upper bound). `epochLiquidityCapFraction` is the combined per-epoch ceiling on USDC notional swapped through the Balancer V3 80/20 pool across `BuybackBurner` and the delegator-pool swap path. The 1% floor prevents governance from starving the swap paths; the 30% ceiling prevents a single epoch from draining pool depth; the 10% default sizes one epoch's combined pressure conservatively against worst-case sustained execution. The cap is a single pool-wide budget per [ADR 018 § Liquidity-cap interaction](018-liquidity-strategy.md#liquidity-cap-interaction).
+The 20% floor on the node-base share guarantees operators always receive enough liquid USDC to cover at least a meaningful fraction of infrastructure costs even under extreme governance proposals — preserves the cashflow invariant. The `boostFloor` and `MAX_GAUGE_SHARE_PER_OPERATOR` bounds keep governance from breaking the gauge mechanics they parameterize (winner-take-all vs flat distribution; disabled vs over-tight wash-trading defense) — rationale in §3 [Gauge-boost formula](#3-gauge-boost-formula) and [Per-operator gauge-share cap](#per-operator-gauge-share-cap). `epochLiquidityCapFraction` is the combined per-epoch ceiling on USDC notional swapped through the Balancer V3 80/20 pool across `BuybackBurner` and the delegator-pool swap path. The 1% floor prevents governance from starving the swap paths; the 30% ceiling prevents a single epoch from draining pool depth; the 10% default sizes one epoch's combined pressure conservatively against worst-case sustained execution. The cap is a single pool-wide budget per [ADR 018 § Liquidity-cap interaction](018-liquidity-strategy.md#liquidity-cap-interaction).
 
 **Non-numeric one-shot setters.**
 
@@ -637,7 +624,7 @@ Parameter setters on `FeeRouter` and `VotingEscrow` are role-gated via `AccessCo
 - **Equilibrium fragility.** The Curve-style model converges to a stable equilibrium *if* the boost is valuable enough to lock for but not so valuable that a winner-take-all dynamic emerges. The 40% gauge-pool default is sized in the middle by reasoned default; production tuning may be needed.
 - **Reflexive operator-margin layer.** TOKEN price drop → ve-lock value drops → fair-share-ve margins shrink → operators unwind commitment. Pre-seed USDC insulates the *funding* side; the *operator-recruitment* side still depends on TOKEN price for ve-incentive strength. Mitigated, not eliminated.
 - **Delegator-conversion MEV risk.** TWAP + private-RPC routing mitigates front-running, but the swap is observable on-chain post-fact. Flashbots-style bundles and per-epoch liquidity caps are required on this path, not optional. Keeper-cost economics under L2 gas conditions ([Appendix: L2 Deployment](appendix-l2-deployment.md)) need validation.
-- **Wash-trading / self-routed traffic.** An operator could induce noise settlements to inflate gauge-pool share. The defense is the **per-operator gauge-share cap** from §3 above (`MAX_GAUGE_SHARE_PER_OPERATOR`, default 5%, governable `[1%, 25%]`), bounding the wash-trading payoff per operator-identity. Combined with the closed-pool gauge bucket (every settlement contributes to the same pool the operator is then claiming from) and the 8% treasury+safety leakage per self-deal, this makes wash-trading economically marginal at any reasonable TOKEN price. The launch prerequisite is contract-pinned in §2 Pre-launch gauge accumulation: `gaugeLaunched == false` escrows the 40% gauge bucket per epoch, and the one-shot `enableGauge()` setter is the only path to live gauge payouts.
+- **Wash-trading / self-routed traffic.** An operator could induce noise settlements to inflate gauge-pool share. The structural defense and economic argument are in §3 [Per-operator gauge-share cap](#per-operator-gauge-share-cap). The launch prerequisite is contract-pinned in §2 [Pre-launch gauge accumulation](#pre-launch-gauge-accumulation): `gaugeLaunched == false` escrows the 40% gauge bucket per epoch, and the one-shot `enableGauge()` setter is the only path to live gauge payouts.
 - **Governance-weight concentration.** Operators who lock heavily for boost also accumulate disproportionate governance weight. [ADR 009](009-governance.md) safety bounds prevent extreme abuse; team / seed / treasury vesting acts as a counterweight during the first ~3 years.
 - **Convex-capture risk.** Third-party liquid-ve wrappers (Convex / Votium / Aura analogs) can concentrate governance power outside the DAO. Mitigation is operational — the DAO may ship a native liquid-ve wrapper as an additive top-level contract (integrating with `VotingEscrow` via the standard lock-creation / increase-amount / snapshot interfaces per §4) without changing the launch contract surface.
 - **20% burn share deterrence.** A higher burn share would weight slashing more toward pure deflation; the chosen 50/30/20 distribution prefers user-harm recourse via `SafetyReserve`. The §11 safety bound on the burn share leaves room for governance recalibration; security review should confirm 20% preserves slashing's deterrent value.
