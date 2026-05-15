@@ -248,10 +248,6 @@ Components referenced by appendices that are operated by content providers, not 
 
 - **App Server** — companion to the [encrypted-content publishing pattern](appendix-encrypted-content-publishing.md). Operated by the content provider; shares the iroh QUIC transport layer with the CDN but does not participate in gossip, probing, or paid delivery. The CDN crates do not depend on it.
 
-## Alternatives Considered
-
-The decentralized-storage model evaluated against this design (replication factor N, pinning deals, challenge games) is recorded in [`_history/alternatives-pre-launch.md` § Architecture Overview — Decentralized Storage vs Decentralized Delivery](_history/alternatives-pre-launch.md#architecture-overview--decentralized-storage-vs-decentralized-delivery).
-
 ## Deferred & Open
 
 ### Search & Discovery (deferred)

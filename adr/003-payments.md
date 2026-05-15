@@ -212,8 +212,6 @@ Client sends probe requests to many nodes at high frequency to map the network o
 
 Per-NodeId rate limiting alone is bypassable: clients are not staked, NodeIds are free to rotate, and iroh connection setup is cheap. The mitigation is the layered token-bucket rate limit in [ADR 005 § Probe rate limiting](005-protocol.md#probe-rate-limiting): per-peer (NodeId) plus per-IP plus a global node cap, applied before any signature or hold-slot allocation. The per-IP layer raises the cost of bulk probing because IP rotation requires money (proxies, IPv6 delegation, cloud bills) while NodeId rotation does not; the global cap is defence in depth.
 
-The rejected alternatives (require-channel-to-probe, proof-of-work on probes, monitor-only) are recorded in [`_history/alternatives-pre-launch.md` § ADR 003 — Probe-Fishing Rate-Limit Alternatives](_history/alternatives-pre-launch.md#adr-003--probe-fishing-rate-limit-alternatives).
-
 **Note:** Probe responses are considered public information (see ADR 005). The concern here is resource exhaustion from bulk probing, not information leakage — content availability is discoverable via probing (see ADR 005), and pricing is revealed in probe/stream responses by design.
 
 #### Double-spend across nodes

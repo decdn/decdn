@@ -283,10 +283,6 @@ The offline lease intentionally weakens two properties of the online scheme: K_b
 - Per-account audio watermarking — pirated tracks trace back to the source account
 - Behavioral detection — flag accounts that download max tracks, never stream online, and churn subscriptions
 
-## Alternatives Considered
-
-The four publishing-shape alternatives evaluated against the chosen design (client-enforced expiry, decryption proxy, proxy re-encryption, per-client ECIES) are recorded in [`_history/alternatives-pre-launch.md` § Encrypted Content Publishing (appendix)](_history/alternatives-pre-launch.md#encrypted-content-publishing-appendix).
-
 ## Consequences
 
 **Positive:**

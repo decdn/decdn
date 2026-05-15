@@ -11,7 +11,7 @@ This directory is the protocol's canonical specification. Each numbered file is 
 - **Stake to participate, slash on misbehavior.** Nodes must stake TOKEN before joining the mesh. Misbehavior (phantom announcements, rate manipulation, corruption, blacklist violation) is detectable on-chain and slashable. Challenge bonds prevent zero-cost griefing.
 - **Origin storage is opaque.** Origin-backed nodes hold canonical content in S3/R2/B2/NFS/local-disk backends, but no external origin URL is ever exposed. Bypassing the payment layer requires bypassing the network entirely.
 - **Operator return is differentiated by long-term commitment, not raw stake.** Curve-style gauge-boost via opt-in `VotingEscrow` rewards operators who lock TOKEN for longer periods, instead of a regressive stake-multiple fee discount.
-- **Pre-launch the protocol has one design.** ADRs read as the canonical specification, not as an iteration log. Rejected alternatives appear in each ADR's `## Alternatives Considered` section (see *Decision-record context* below).
+- **Pre-launch the protocol has one design.** ADRs read as the canonical specification, not as an iteration log. Rejected pre-launch alternatives are kept out of the ADR bodies entirely — archived in [`adr/_history/`](_history/alternatives-pre-launch.md), which is part of neither built PDF (see *Decision-record context* below).
 
 ## Reading order
 
@@ -90,9 +90,9 @@ Appendices are listed in [`architecture.md` § Appendices — Reference Patterns
 
 ## Decision-record context
 
-ADRs are **decision records**: they capture both the canonical design and the alternatives that were considered and rejected, so future contributors can see what was on the table without inferring it from the current design. Each ADR with rejected alternatives carries a `## Alternatives Considered` section covering the alternatives, the rationale for rejection, and the design that replaced them.
+ADRs are **decision records** — but the *rendered* spec carries only the canonical design. The pre-launch alternatives that were weighed and rejected (and the rationale) are collected in [`adr/_history/alternatives-pre-launch.md`](_history/alternatives-pre-launch.md), kept out of every ADR body and out of both built PDFs, so future contributors can see what was on the table without the spec reading as a debate transcript.
 
-> **Note:** moving the rejected-alternatives content out of ADR bodies into a dedicated `adr/_history/` audit trail is tracked in #346 (Tier 3 of the book-readiness program). Until that lands, alternatives live inline.
+> **Note:** the rejected-alternatives relocation (#346, Tier 3 of the book-readiness program) is complete — ADR bodies carry no `## Alternatives Considered` section and no breadcrumb link; the `_history/` archive is reached directly.
 
 ## Contributing
 
@@ -127,7 +127,7 @@ The Makefile applies a purely-presentational page-density config — [`_build/bo
 
 The numeric build above is the canonical per-ADR reference. For a top-to-bottom read, build the same set in the thematic chapter order from [`architecture.md` § Reading Order](architecture.md#reading-order) — Foundations → Discovery → Payments → Tokenomics → Verification → Governance → Operations → Supporting → Appendices. Output goes to `adrs-book.pdf` so both PDFs can coexist.
 
-This build also strips *Deferred & Open* (and its legacy aliases *Open Questions* / *Future Work*) and *Alternatives Considered* / *Considered Alternatives* / *"Why not …"* sections at render time via [`_build/strip-meta-sections.lua`](_build/strip-meta-sections.lua), so the document reads as a single canonical design rather than a debate transcript. *Cross-ADR Impact* is **not** stripped — it carries substantive cross-cutting design content, not scaffolding. The source `.md` files keep every section untouched, and the numeric `adrs.pdf` build above includes them all for readers who want the full decision-record context. A short notice on the first page ([`_build/preface.md`](_build/preface.md)) tells readers what was omitted and where to find it.
+This build also strips *Deferred & Open* (and its legacy aliases *Open Questions* / *Future Work*) and *Alternatives Considered* / *Considered Alternatives* / *"Why not …"* sections at render time via [`_build/strip-meta-sections.lua`](_build/strip-meta-sections.lua), so the document reads as a single canonical design rather than a debate transcript. *Cross-ADR Impact* is **not** stripped — it carries substantive cross-cutting design content, not scaffolding. *Deferred & Open* is retained verbatim in the source `.md` files and the numeric `adrs.pdf` build — only the reading-order book strips it. Rejected alternatives are in no ADR; they live solely in [`adr/_history/`](_history/alternatives-pre-launch.md), which neither PDF includes. A short notice on the first page ([`_build/preface.md`](_build/preface.md)) states what is omitted.
 
 `make book` produces this. The thematic file order (with the `_build/part-*.md` dividers) and the `--lua-filter` wiring live in the `BOOK_SRCS` variable and the `adrs-book.pdf` recipe of [`adr/Makefile`](Makefile).
 
@@ -143,6 +143,6 @@ Recurring non-`Context`/`Decision`/`Consequences` sections use one canonical nam
 | **Deferred & Open** | Deferred work, open questions, forward-looking items | No — stripped | *Open Questions*, *Future Work*, *Future work and non-goals* (split: non-goals → Non-Goals) |
 | **Non-Goals** | Substantive scope exclusions | Yes — substantive | (was sometimes merged into *Future work and non-goals*) |
 | **References** | Bibliography / external links | Yes | (already consistent) |
-| **Alternatives Considered** | Rejected-alternative record | No — stripped | (already consistent; bulk lives in `_history/`) |
+| **Alternatives Considered** | Rejected-alternative record | No — not in ADRs | Removed from ADR bodies; archived only in `_history/` (in neither PDF) |
 
 The numeric `adrs.pdf` build keeps every section regardless of name; only the reading-order `adrs-book.pdf` applies the strip.

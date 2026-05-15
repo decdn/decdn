@@ -20,7 +20,7 @@ This ADR is the canonical economic model addressing all four. Burn is one of sev
 
 Pre-launch design with no holder-compensation or contract-migration concerns. ~$1M+ pre-seed USDC capital secured (planning target $3M); program structure is operational and tracked separately. 2026 unmetered-bandwidth provider economics per the design spec's input matrix (1 Gbps VPS, 10 Gbps dedicated, 100 Gbps edge tiers); dedicated-bandwidth nodes are realistic at every scale band the protocol is sized for.
 
-Earlier internal drafts explored alternative shapes — a flat protocol-fee skim, a 200M-TOKEN bootstrap fund, a regressive fee-discount mechanic, auto-ve-lock-on-vest. Those are documented in [Alternatives Considered](#alternatives-considered) below.
+Earlier internal drafts explored and rejected alternative shapes — a flat protocol-fee skim, a 200M-TOKEN bootstrap fund, a regressive fee-discount mechanic, auto-ve-lock-on-vest.
 
 ## Decision
 
@@ -448,7 +448,7 @@ Both are buy-side market pressure on USDC→TOKEN. Burn removes TOKEN from circu
 
 #### Why TOKEN-denominated, not USDC?
 
-Routes acquired TOKEN to the participants with the longest commitment horizon and couples ve-locker yield to TOKEN value rather than to network revenue alone — when network revenue grows, TOKEN buy pressure grows, ve-locker positions appreciate. This is the model's primary "real yield in TOKEN" lever; an alternative pattern (USDC distribution to a passive ve-pool) is documented in [Alternatives Considered](#alternatives-considered).
+Routes acquired TOKEN to the participants with the longest commitment horizon and couples ve-locker yield to TOKEN value rather than to network revenue alone — when network revenue grows, TOKEN buy pressure grows, ve-locker positions appreciate. This is the model's primary "real yield in TOKEN" lever; an alternative pattern — USDC distribution to a passive ve-pool — was considered and rejected.
 
 #### MEV / slippage
 
@@ -513,7 +513,7 @@ interface IDelegatorBuyer {
 
 #### No fee-discount mechanic
 
-Operator yield differentiates by long-term ve-commitment via the gauge boost (§3), not by stake-multiple-keyed fee discounts. A discount-on-stake pattern is documented in [Alternatives Considered](#alternatives-considered).
+Operator yield differentiates by long-term ve-commitment via the gauge boost (§3), not by stake-multiple-keyed fee discounts. A discount-on-stake pattern was considered and rejected.
 
 #### Revenue streams
 
@@ -531,7 +531,7 @@ Operator yield differentiates by long-term ve-commitment via the gauge boost (§
 
 **Slashing rates.** 5% / 15% / 50% escalation tiers, lifetime offense counter (`uint32`, monotonically increasing), increasing reset periods, auto-ejection at 50% of minimum stake, challenge-bond mechanics.
 
-**Slashing distribution.** **50% challenger / 30% SafetyReserve / 20% burn.** The challenger share is the deterrent that pays for active enforcement; the SafetyReserve share funds user-harm incident recourse beyond pure deflation; the burn share preserves the deflationary deterrent at a level governance can recalibrate within §11 bounds. Pure-burn variants are documented in [Alternatives Considered](#alternatives-considered).
+**Slashing distribution.** **50% challenger / 30% SafetyReserve / 20% burn.** The challenger share is the deterrent that pays for active enforcement; the SafetyReserve share funds user-harm incident recourse beyond pure deflation; the burn share preserves the deflationary deterrent at a level governance can recalibrate within §11 bounds. Pure-burn variants were considered and rejected.
 
 **Buyback-and-burn inflow.** 5% of routed USDC flows to `BuybackBurner` from `FeeRouter`. [ADR 018](018-liquidity-strategy.md) mechanics (Balancer V3 80/20 swap, TWAP, `minTokenOut`, POL custody) are inherited.
 
@@ -628,7 +628,3 @@ Parameter setters on `FeeRouter` and `VotingEscrow` are role-gated via `AccessCo
 - **Governance-weight concentration.** Operators who lock heavily for boost also accumulate disproportionate governance weight. [ADR 009](009-governance.md) safety bounds prevent extreme abuse; team / seed / treasury vesting acts as a counterweight during the first ~3 years.
 - **Convex-capture risk.** Third-party liquid-ve wrappers (Convex / Votium / Aura analogs) can concentrate governance power outside the DAO. Mitigation is operational — the DAO may ship a native liquid-ve wrapper as an additive top-level contract (integrating with `VotingEscrow` via the standard lock-creation / increase-amount / snapshot interfaces per §4) without changing the launch contract surface.
 - **20% burn share deterrence.** A higher burn share would weight slashing more toward pure deflation; the chosen 50/30/20 distribution prefers user-harm recourse via `SafetyReserve`. The §11 safety bound on the burn share leaves room for governance recalibration; security review should confirm 20% preserves slashing's deterrent value.
-
-## Alternatives Considered
-
-The five tokenomics shapes evaluated against this design (original 3%-flat / stake-multiple-discount / 200M-TOKEN-bootstrap / 50-50-burn shape, auto-ve-lock-on-vest, USDC distribution to a passive ve-pool, pure-deflationary slashing, TOKEN-denominated bootstrap fund) are recorded in [`_history/alternatives-pre-launch.md` § ADR 026 — Gauge-Boost Tokenomics](_history/alternatives-pre-launch.md#adr-026--gauge-boost-tokenomics).

@@ -115,7 +115,3 @@ A sustained non-zero `decdn_gossip_messages_rejected_total{reason="table_full"}`
 - Without `max_peer_entries` set, a registry-validation regression admitting unstaked `node_id`s could allow unbounded growth. `decdn_peer_table_size` is the early-warning signal; operators tracking it can set the ceiling reactively.
 - Up to one sweep period (≤ 30 s) elapses between TTL expiry and physical removal. Callers iterating the table MUST tolerate brief over-counting. No iterator currently relies on real-time accuracy.
 - Active registry-driven eviction adds one `HashMap::remove` per `NodeDeregistered` / `NodeAutoEjected` event. These events are infrequent (operator-initiated or auto-ejection at 50 % stake floor); cost is negligible.
-
-## Alternatives Considered
-
-The rejected peer-eviction alternatives (reputation-priority eviction, lazy deregistration, LRU under a hard size cap, persisting the table across restarts, eviction by `announce.timestamp_us`, shorter TTL aligned to one announce interval) are recorded in [`_history/alternatives-pre-launch.md` § Peer Table Eviction Policy (appendix)](_history/alternatives-pre-launch.md#peer-table-eviction-policy-appendix).

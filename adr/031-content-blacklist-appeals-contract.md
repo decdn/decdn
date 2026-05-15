@@ -301,10 +301,6 @@ stateDiagram-v2
 - **`_pad0` / `_pad1` field accuracy.** Packed slot calculations assume Solidity's standard packing rules; a compiler version change altering slot semantics could silently relocate fields. The implementation MUST include a Foundry storage-layout test (`forge inspect ContentBlacklist storageLayout`) pinned to expected slot offsets.
 - **`region` canonicalization at the function boundary.** `openBlacklistAppeal` taking `string calldata region` and canonicalizing to `bytes2` diverges from the rest of `ContentBlacklist`'s internal API. A reviewer should confirm every internal write site uses the `bytes2` form to avoid silent format mismatch between the appeal record and the parent entry.
 
-## Alternatives Considered
-
-The rejected contract-shape alternatives (separate `BlacklistAppealRegistry` contract, per-appeal escrow contract) are recorded in [`_history/alternatives-pre-launch.md` § ADR 031 — ContentBlacklist Appeal-Contract Surface](_history/alternatives-pre-launch.md#adr-031--contentblacklist-appeal-contract-surface).
-
 ## References
 
 - [ADR 011 § Blacklist Entry Appeals](011-content-takedown.md#blacklist-entry-appeals) — semantic spec.

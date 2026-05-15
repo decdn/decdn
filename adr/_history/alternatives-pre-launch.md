@@ -2,7 +2,7 @@
 
 > **Audit trail.** This file collects the `## Alternatives Considered` sections that previously lived inline across the ADR set. It is **not** part of the canonical protocol specification — it is a record of design alternatives evaluated and rejected before launch, retained so future contributors can see what was on the table without inferring it from the current design. Tracked in [#346](https://github.com/decdn/decdn/issues/346); see [`adr/README.md` § Decision-record context](../README.md#decision-record-context) for the project-level framing.
 >
-> Neither the numeric `adrs.pdf` nor the reading-order `adrs-book.pdf` build includes this file. Readers approaching the protocol top-to-bottom get the canonical spec; readers researching a specific decision can follow the breadcrumb at the bottom of each source ADR's stub `## Alternatives Considered` section back here.
+> Neither the numeric `adrs.pdf` nor the reading-order `adrs-book.pdf` build includes this file, and the ADR bodies intentionally do **not** link to it — there is no `## Alternatives Considered` stub or breadcrumb in any ADR. Readers approaching the protocol get the canonical spec; this archive is browsed directly, by the per-ADR sections below.
 
 Sections below are anchored by source ADR. Cross-references back to each source use relative paths (`../NNN-name.md`).
 

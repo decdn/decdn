@@ -121,7 +121,3 @@ The `cache.cache_size_mb` ceiling is enforced by the driver, not the cache write
 - LRU does not reflect blob *value* — a 10 GB cold blob and a 1 MB cold blob age out at the same rate. A popularity-weighted policy (LFU or hybrid) would serve hit rate marginally better at the cost of bookkeeping and a counter-griefing surface; rejected in *Alternatives*.
 - Until the §7 eviction-driver loop is implemented in `crates/cache`, `cache.cache_size_mb` is an aspirational ceiling and the cache grows monotonically. The driver MUST land before the network is exposed to adversarial fill.
 - Coupling `last_accessed` to `get`-only refresh means a blob pulled by a peer (cache-miss pull, paid) but never read locally ages by the same rule as a stale local hit. This is correct: the local node's cache is sized for the local workload, not through-traffic, and through-traffic blobs are re-pullable from peers via DHT.
-
-## Alternatives Considered
-
-The rejected eviction-policy alternatives (LFU, size-weighted, hybrid LRU+LFU, no-eviction, reputation-priority, refresh-on-every-probe) are recorded in [`_history/alternatives-pre-launch.md` § Blob Cache Eviction Policy (appendix)](_history/alternatives-pre-launch.md#blob-cache-eviction-policy-appendix).

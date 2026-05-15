@@ -24,7 +24,7 @@ The treasury holds the 100M TOKEN POL allocation per [ADR 026 §1](026-gauge-boo
 
 This reverses the implicit Uniswap V3 choice in prior ADRs.
 
-> deCDN uses Balancer **V3** for its new Vault architecture; the affirmative security justification is in [§ Consequences](#consequences). The rejected Balancer V2 alternative and the 2025-11-03 V2 exploit that motivated rejecting it are recorded in [`_history/alternatives-pre-launch.md` § ADR 018 — Balancer V2 vs V3](_history/alternatives-pre-launch.md#adr-018--balancer-v2-vs-v3-pre-merge-migration). The 80/20 weighted-POL decision is a property of weighted pools generally and is not version-specific.
+> deCDN uses Balancer **V3** for its new Vault architecture; the affirmative security justification is in [§ Consequences](#consequences). The 80/20 weighted-POL decision is a property of weighted pools generally and is not version-specific.
 
 ### Venue: Balancer V3 weighted pool vs Uniswap V3 concentrated
 
@@ -145,10 +145,6 @@ Buyback execution should be enabled by governance vote only when all of the foll
 8. **(If CoW routing is used as an add-on)** The operator has verified via CoW's `/api/v1/quote` endpoint that CoW solvers route through the deployed Balancer V3 pool and that quoted prices are within `slippageBps` of the Router-direct path. If this fails, disable CoW routing and fall back to direct Router + TWAP + private-RPC; this does not block activation. CoW does not substitute for the criterion-6 private-RPC requirement on the non-CoW path.
 
 Criteria 1–4 are quantitative; governance voters verify them off-chain before enabling execution. Criterion 2 is a one-time deployment check. Criteria 6 and 7 are hard structural requirements (non-negotiable); criterion 8 is venue-integration health, not a gating requirement.
-
-## Alternatives Considered
-
-The Uniswap V3 alternative — including the *if and when to revisit* triggers governance can act on — is recorded in [`_history/alternatives-pre-launch.md` § ADR 018 — Liquidity Strategy](_history/alternatives-pre-launch.md#adr-018--liquidity-strategy).
 
 ## Consequences
 

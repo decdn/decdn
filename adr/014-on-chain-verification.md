@@ -75,10 +75,6 @@ EIP712Domain({
 
 When constructing a `ProbeResponse` or `StreamResponse`, the node signs the security-relevant fields with its Ethereum private key using EIP-712 typed data and emits the result as `slash_sig`. Peer authentication is handled separately by the iroh QUIC handshake (against the registered Ed25519 NodeId); `slash_sig` is purely message-body attribution/evidence, never used for connection establishment.
 
-#### Alternatives Considered
-
-The signature-scheme alternatives table (RIP-7212, Solidity library, ZK, optimistic) is recorded in [`_history/alternatives-pre-launch.md` § ADR 014 — Slash Signature Scheme](_history/alternatives-pre-launch.md#adr-014--slash-signature-scheme).
-
 > **Note:** [ADR 001](001-network.md#nodeid-ownership-verification) uses direct ed25519 verification (Solidity library, ~500k–1M gas) for node registration ownership proof. This is acceptable because registration is a one-time cost per node lifetime, unlike slash evidence which may be submitted frequently.
 
 ### 2. SlashJudge Contract

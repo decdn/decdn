@@ -89,7 +89,3 @@ CLI shape:
 - `crates/node/src/admin.rs` carries the daemon-side server impl: `AdminState` (`Arc<RwLock<PeerTable>>` plus the cache, announce trigger, reload hook, drain trigger), `AdminRpcImpl`, and the `bind` / `serve` helpers.
 - JSON DTOs (`PeerView`, `PeersResponse`, `HealthResponse`, etc.) live in the shared crate rather than derived from internal types, so the wire format stays stable when internal structs change.
 - `decdn node peers` lives in `crates/cli/src/commands/node.rs` and uses `jsonrpsee::http_client::HttpClient` with the generated `AdminRpcClient` trait — no hand-rolled JSON or HTTP on the client side.
-
-## Alternatives Considered
-
-The five admin-surface alternatives evaluated against jsonrpsee-on-loopback (hand-rolled hyper REST, jsonrpsee + OpenRPC, Unix domain socket, new iroh ALPN, extending `/metrics`) are recorded in [`_history/alternatives-pre-launch.md` § Local Admin HTTP Surface (appendix)](_history/alternatives-pre-launch.md#local-admin-http-surface-appendix).

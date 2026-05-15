@@ -227,7 +227,3 @@ DHT STORE and FIND_VALUE operations carry no protocol-level fee. The incentive t
 7. A node observing ≥5 FIND_VALUE queries for hash H within 5 minutes initiates a prefetch for H.
 8. Demand signals derive from DHT FIND_VALUE traffic and local cache-miss timestamps; both are emitted as observability metrics in [Appendix: Observability](appendix-observability.md).
 9. An accepted `StoreRequest`'s record TTL is anchored on the receiver's wall-clock at acceptance time (`expiry_us = receive_us + record_ttl_us`), independent of any holder-supplied timestamp.
-
-## Alternatives Considered
-
-The six discovery alternatives evaluated against `cdn/dht/v1` (broadcast probe fan-out as primary, gossip content announcements, hash-prefix range hints, iroh mainline DHT, indexer nodes, full libp2p Kademlia) are recorded in [`_history/alternatives-pre-launch.md` § ADR 022 — Content Discovery at Scale](_history/alternatives-pre-launch.md#adr-022--content-discovery-at-scale).

@@ -93,10 +93,6 @@ Backstops for the pre-positioned case are deliberately off-protocol: (a) declare
 - **Governance-set `REGION_STABILITY_WINDOW` drift.** Lowering the window toward the 3-day floor weakens both the appeals-standing and the blacklist-scope protections. The hard bounds `[3d, 30d]` per [ADR 009](009-governance.md) safety-bound pattern make this an above-the-line governance question rather than a silent regression; the floor was raised from 1d to 3d specifically so the worst legal setting still keeps a region flip uneconomic (see § 3 Threshold rationale).
 - **Migration-cohort window.** Pre-upgrade operator records have no `regionLastChanged`; the `max(firstRegisteredAt, regionGateActivatedAt)` fallback (§ 3) treats every pre-upgrade operator as having changed region at gate activation, so each must wait one `REGION_STABILITY_WINDOW` past activation before regaining path-2 appeals standing and before a region change ripens for blacklist scope. (A pre-upgrade record's *first* post-activation `updateRegion` is itself cooldown-exempt — `regionLastChanged == 0` — but neither ripens nor grants path-2 standing until the window passes, so the exemption changes timing of the call, not of the protection.) This is a one-time, bounded cost accepted in exchange for not running a per-record storage migration; it is the conservative direction (no record passes the window instantly on a stale timestamp).
 
-## Alternatives Considered
-
-The rejected region-attestation alternatives (IP-geolocation oracle, required announce-time attestation, peer-witnessed on-chain dispute, scoping-only ADR) are recorded in [`_history/alternatives-pre-launch.md` § ADR 030 — Node Region Self-Attestation](_history/alternatives-pre-launch.md#adr-030--node-region-self-attestation).
-
 ## Cross-ADR Impact
 
 - Tightening the [ADR 001 § Consequences](001-network.md#consequences) latency-vs-claim reputation penalty (threshold, sample size, window, decay) is in scope for the [ADR 008](008-reputation.md) reputation domain, not blocked by this ADR.

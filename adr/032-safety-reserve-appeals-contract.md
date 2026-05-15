@@ -211,10 +211,6 @@ Disbursement of queued claims is permissionless via the head-of-queue path pinne
   These invariants are the contractual enforcement boundary for field-level constraints §1's UDVT discipline does **not** cover (UDVTs catch unit confusion at compile time; invariant tests catch aggregate-vs-component drift at runtime).
 - **Mixed time units in storage — residual surface.** §1's `EpochIndex` / `MicroTimestamp` UDVTs prevent the compiler from silently comparing an epoch index against a microsecond timestamp, but do **not** prevent: (a) explicit `EpochIndex.unwrap` / `MicroTimestamp.unwrap` casts bypassing the type system, (b) external setters taking raw `uint64` and writing a UDVT-typed slot without unit checks, or (c) arithmetic with constants whose literal unit is ambiguous (e.g., `OPERATOR_APPEAL_FREQUENCY` microseconds vs seconds). The implementation MUST keep UDVT `unwrap` usage rare and explicit, MUST type setter parameters with the UDVT (not raw `uint64`), and MUST express all time-constant literals as named constants encoding the unit (e.g., `OPERATOR_APPEAL_FREQUENCY_US`, matching ADR 014's `MAX_EVIDENCE_AGE_US`).
 
-## Alternatives Considered
-
-The rejected contract-shape alternatives (dedicated `SlashAppealRegistry`, per-appeal `counterBundleFiler` storage field, five-condition `LapseReason` enum) are recorded in [`_history/alternatives-pre-launch.md` § ADR 032 — SafetyReserve Appeal-Surface](_history/alternatives-pre-launch.md#adr-032--safetyreserve-appeal-surface).
-
 ## References
 
 - [ADR 028 — Slashing Appeals and Dispute Escalation](028-slashing-appeals.md) — semantic spec.
