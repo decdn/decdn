@@ -387,10 +387,3 @@ Chunk part files are **retained by default** after reconstruction so the client 
 ### Backward compatibility
 
 Raw single-blob downloads are unchanged. The client checks the `DECDNMAN` magic header; on failure (wrong or missing magic) it treats the bytes as a raw blob. Content providers signal manifest vs. raw out-of-band.
-
-## Cross-ADR Impact
-
-- **[ADR 001](001-network.md):** Client bootstrap and registry unavailability sections are superseded by this ADR for client-specific behavior. ADR 001 retains the specification for node bootstrap.
-- **[ADR 003](003-payments.md):** Eclipse attack options (A/B/C) are resolved — Option B for production, registry-only for PoC, Option C as supplementary policy.
-- **[ADR 005](005-protocol.md):** `StreamRequest` ephemeral binding fields are specified in full lifecycle context here.
-- **[ADR 008](008-reputation.md):** Client reputation contribution is clarified — local observations only, no gossip submissions.
