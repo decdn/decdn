@@ -116,6 +116,9 @@ pandoc --from=markdown+gfm_auto_identifiers \
   --toc --toc-depth=2 \
   --pdf-engine=typst \
   -F mermaid-filter \
+  --metadata-file=_build/book-margins.yaml \
+  -V fontsize=10pt -V linestretch=1.0 \
+  --include-in-header=_build/book-density.typ \
   -V title="deCDN — Architecture Decision Records" \
   -V date="$(date +%Y-%m-%d)" \
   architecture.md $(ls [0-9]*.md | sort) $(ls appendix-*.md | sort) \
@@ -123,6 +126,8 @@ pandoc --from=markdown+gfm_auto_identifiers \
 ```
 
 Build takes ~1 minute (most of it spent rendering Mermaid diagrams). Without `-F mermaid-filter` the diagrams ship as raw source text.
+
+The `--metadata-file` / `-V fontsize` / `-V linestretch` / `--include-in-header` flags apply the purely-presentational page-density tuning in [`_build/book-density.typ`](_build/book-density.typ) and [`_build/book-margins.yaml`](_build/book-margins.yaml). They change **no content and no decision** — they only replace the very loose pandoc/typst defaults (≈2.5 cm margins, 11 pt, slack leading) with a standard technical-book geometry, taking the reading-order book from ≈430 to ≈260 pages (no mermaid) without dropping a single section or cross-reference. Drop the four flags to render byte-identical content at the loose default density.
 
 ### Reading-order build (book layout)
 
@@ -137,6 +142,9 @@ pandoc --from=markdown+gfm_auto_identifiers \
   --pdf-engine=typst \
   -F mermaid-filter \
   --lua-filter=_build/strip-meta-sections.lua \
+  --metadata-file=_build/book-margins.yaml \
+  -V fontsize=10pt -V linestretch=1.0 \
+  --include-in-header=_build/book-density.typ \
   -V title="deCDN — Architecture Decision Records (Reading Order)" \
   -V date="$(date +%Y-%m-%d)" \
   _build/preface.md \

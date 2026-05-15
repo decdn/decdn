@@ -1,0 +1,10 @@
+# adr/_build/book-margins.yaml
+#
+# Page margin for the ADR PDF builds, supplied via `pandoc --metadata-file`.
+# Purely presentational (see `_build/book-density.typ` for the rationale and
+# the reversibility note). The pandoc typst template reads `margin` as a
+# key/value map; 1.6cm x / 1.8cm y is a standard technical-book geometry,
+# down from the ~2.5cm typst default that inflated the page count.
+margin:
+  x: 1.6cm
+  y: 1.8cm
