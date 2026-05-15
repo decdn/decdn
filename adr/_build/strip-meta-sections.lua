@@ -4,10 +4,11 @@
 -- source `.md` files untouched. Canonical ADR section taxonomy (see
 -- adr/README.md § Canonical section taxonomy):
 --
---   * "Deferred & Open"  — STRIPPED. The canonical home for deferred work,
---     open questions, and forward references. Legacy names ("Open Questions",
---     "Future Work", "Forward references …") are kept in the patterns below
---     defensively so any un-migrated or future drift is still caught.
+--   * "Deferred & Open"  — STRIPPED. The canonical home for deferred work
+--     and open questions. Legacy names ("Open Questions", "Future Work")
+--     are kept in the patterns below defensively so any un-migrated or
+--     future drift is still caught. ("Forward references" is NOT here — it
+--     is a Cross-ADR Impact alias, retained; see below.)
 --   * "Alternatives Considered" / "Considered Alternatives" / "Why not …"
 --     — STRIPPED. Rejected-alternative records (a distinct concept; most live
 --     in _history/, these patterns catch the inline remainder).
