@@ -437,12 +437,6 @@ These codes SHOULD be delivered via `RESET_STREAM` / `STOP_SENDING` so that othe
 
 Additional application error codes defined by other ADRs are unaffected. The codes above occupy the low range `0x00`–`0x0F`; ADRs allocating new codes SHOULD use `0x10` and above to avoid collisions.
 
-## Cross-ADR Impact
-
-- **[ADR 005](005-protocol.md):** Serialization section updated to reference this ADR. Schema evolution negative consequence resolved. The `voucher_interval_mb` "one-time workaround" language replaced with reference to the standard minor evolution mechanism.
-- **[ADR 001](001-network.md):** Gossip validation now operates on payloads unwrapped from `GossipEnvelope`.
-- **[architecture.md](architecture.md):** New ADR 013 entry added to the Architectural Decisions section.
-
 ## Consequences
 
 **Positive:**
