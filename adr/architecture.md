@@ -176,6 +176,7 @@ Numeric per-ADR index. The thematic chapter ordering for top-to-bottom reading l
 - Payment channels amortize on-chain costs across an entire session; per-MB payments are off-chain
 - Safety bounds on all governable parameters are hardcoded — governance cannot set fees to 100% or stake to zero (see [ADR 009](009-governance.md))
 - A node cannot serve a blacklisted hash after the compliance window — doing so is a slashable offense (see [ADR 011](011-content-takedown.md))
+- The cache and incentive layers are independent crates — the cache layer works without payment logic (leaf-crate principle, [appendix-poc-production-seams.md](appendix-poc-production-seams.md)); the binary split and crate dependency flow are specified in [appendix-binaries.md](appendix-binaries.md)
 
 ## Trust Assumptions
 
@@ -197,7 +198,7 @@ The system relies on several infrastructure-level assumptions beyond the cryptog
 
 - DRM or content protection
 - Content transcoding or adaptive format conversion
-- Search, discovery, or recommendation (see Future Work below)
+- Search, discovery, or recommendation (deferred; see [Deferred & Open](#deferred--open) below)
 - Mobile or web clients
 - Multi-chain support (single L2 only)
 - Multi-token payment support (USDC only for PoC; see [ADR 010](010-multi-token.md))
@@ -207,11 +208,9 @@ The system relies on several infrastructure-level assumptions beyond the cryptog
 
 The canonical glossary lives in [`README.md` § Glossary](README.md#glossary), grouped into four categories: wire protocol & content, payments, tokenomics & incentives, and on-chain enforcement.
 
-## Origin Integration
+## Origin Backends
 
-Some nodes are configured with an origin backend (S3, R2, Backblaze B2, self-hosted MinIO, NFS, or local disk). They are the source of truth for all blobs but are accessed as infrequently as possible — only when no peer node has the content.
-
-Whether a node is *recognized* as origin is governed on-chain via `OriginAssignment` — see [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority). The wire protocol does not distinguish origins from cache nodes at probe time; origin status is a publisher-level commitment surfaced via `OriginAssignment.getOrigins(namespaceId)` for off-chain consumers (clients selecting peers for first-fetch, off-chain monitors checking publisher availability commitments). Configuring an origin backend locally without DAO authorization simply means the operator's bytes are served as cache and the operator does not appear in `getOrigins(...)`. For registered namespaces, the publisher proposes the operator set and governance ratifies; for default-open content (`namespaceId == 0`), the DAO maintains a single global allow-list (see [ADR 011 § Default-open allow-list](011-content-takedown.md#default-open-allow-list)). Until that allow-list is activated for the first time, the bootstrap rule preserves the prior permissive behaviour so any active staker with an origin backend may serve default-open content as origin; once activated, only allow-listed operators may.
+Origin-backed nodes hold the canonical bytes and are pulled only on cache miss; whether an operator is *recognized* as origin is governed on-chain via `OriginAssignment` (see [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority) and [ADR 002 § Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces)). Configuring an origin backend locally without DAO authorization simply means the operator's bytes are served as cache. The supported backends and the operator-side hash→object-key mapping below are operational reference, not protocol surface.
 
 ### Supported Origins
 
@@ -243,164 +242,19 @@ catalog: hash → {s3_bucket, s3_key, size_bytes, content_type}
 
 Nodes query it on cache miss to find the origin pull URL. The catalog is not on-chain — it is an operational concern.
 
-## Cache Behavior
-
-The protocol does not dictate cache policy. Nodes are economically motivated to make good caching decisions.
-
-**Cache miss resolution** follows a priority order:
-
-1. **Paid pull-through (preferred):** Node checks its probe cache or performs a DHT FIND_VALUE lookup + probe (`cdn/dht/v1` → `cdn/probe/v1`), selects the best provider by the unified selection score ([ADR 001](001-network.md#node-selection-algorithm)), pulls via `cdn/client/v1` (paid), caches locally, and streams to the client while the pull is in progress.
-2. **Redirect (last resort):** If pull-through is disabled (`pull_through: false` in config), the node returns a redirect to an origin-backed node's NodeId. The client opens a channel with that node directly.
-
-**Prefetching:** Nodes can proactively cache popular content using a local demand signal — tracking cache miss frequency per hash and prefetching when a threshold is crossed (default: 3 misses in 5 minutes). Prefetch pulls use the same DHT FIND_VALUE → probe → `cdn/client/v1` path (paid).
-
-**Eviction:** LRU keyed on the timestamp of the last successful `CacheEngine::get` ([appendix-blob-cache-eviction.md](appendix-blob-cache-eviction.md)). Operators tune cache size to maximize hit rate within their storage budget. Blobs for which the node has signed `has_blob: true` in a `cdn/probe/v1` response are temporarily exempt from eviction via the **probe-triggered eviction hold** (`probe_hold_duration`, see [ADR 005](005-protocol.md#probe-triggered-eviction-hold)), which prevents false phantom-announcement slashing when cache pressure would otherwise evict a blob between probe and subsequent stream request. Operator pinning and operator-initiated evict compose orthogonally with LRU per [appendix-blob-cache-eviction.md](appendix-blob-cache-eviction.md).
-
-**Maximum blob size:** Nodes may configure a `max_blob_size` (PoC recommended default: 10 GB). Requests for blobs exceeding this limit are rejected with `StreamError::BlobTooLarge` ([ADR 005](005-protocol.md#error-handling-and-retry-semantics)). This prevents a single large blob from exhausting cache capacity or tying up connections for extended periods. The limit is per-node — nodes with larger storage budgets can raise it; cache-only nodes on constrained hardware can lower it.
-
-```mermaid
-flowchart TD
-    A[Client requests blob via StreamRequest] --> B{Node has blob in cache?}
-    B -->|Hit| C[Stream from local cache]
-    C --> D[Client pays per MB via vouchers]
-
-    B -->|Miss| E{pull_through enabled?}
-    E -->|Yes| F["DHT FIND_VALUE (cdn/dht/v1) → 3-5 candidate NodeIds"]
-    F --> M["Targeted probe of candidates (cdn/probe/v1)"]
-    M --> G["Collect has_blob:true responses (50ms min, 500ms max; early exit on good score)"]
-    G --> H["Select best: unified selection score"]
-    H --> I["Pull via cdn/client/v1 (node pays peer)"]
-    I --> J[Cache locally + stream to client simultaneously]
-    J --> D
-
-    E -->|No| K[Return redirect with origin NodeId]
-    K --> L[Client connects to origin-backed node directly]
-```
-
-## Crate Structure
-
-```
-decdn/
-├── Cargo.toml                    # workspace root
-├── crates/
-│   ├── node/                     # Binary `decdn-node` — daemon entry, runtime, handlers
-│   ├── cli/                      # Binary `decdn` — user-facing CLI (probe, node admin, key-gen, config)
-│   ├── common/                   # Shared types: config schema, identity, admin RPC trait + DTOs
-│   ├── protocol/                 # Shared types, wire format, messages
-│   ├── cache/                    # Cache engine wrapping iroh-blobs + origin pull
-│   ├── gossip/                   # NodeAnnounce pub/sub over iroh-gossip
-│   ├── incentive/                # Payment channels, staking, vouchers
-│   ├── reputation/               # Gossip-based reputation system
-│   └── contracts/                # Solidity contracts + Foundry
-├── tests/                        # Integration tests
-└── adr/                          # Architecture decision records
-# The app server (encrypted-content-publishing appendix) is an external component, not part of this workspace.
-# Content providers build it using their own stack. A reference implementation
-# may be provided as a separate repository.
-```
-
-### Binaries
-
-The workspace produces two binaries that pair like `dockerd` + `docker`:
-
-| Binary | Role | Crate | Listens on |
-|---|---|---|---|
-| `decdn-node` | Daemon — caches, serves, peers, gossips. Single subcommand: `decdn-node run [--config <path>]`. | `crates/node` | QUIC `:4433`, metrics `127.0.0.1:9090`, admin loopback `127.0.0.1:9191` |
-| `decdn` | User CLI — `probe`, `node {peers,health,announce,drain,evict,reload}`, `key-gen`, `config {init,validate}`, plus future `pull`, `bundle …`, `fetch`, `publish`, `channel`, `wallet`. | `crates/cli` | nothing (outbound only; `node` admin commands use the daemon's loopback HTTP per ADR 025 appendix) |
-
-The container image ships `decdn-node` only. CLI users grab the
-`decdn-${VERSION}-${TARGET}.tar.gz` release archive. See
-[appendix-binaries.md](appendix-binaries.md) for the rationale.
-
-### Dependency Chain
-
-```mermaid
-graph TD
-    node[node]
-    cli[cli]
-    common[common]
-    cache[cache]
-    gossip[gossip]
-    incentive[incentive]
-    reputation[reputation]
-    protocol[protocol]
-
-    iroh([iroh])
-    iroh_blobs([iroh-blobs])
-    iroh_gossip([iroh-gossip])
-    alloy([alloy])
-    serde([serde])
-    postcard([postcard])
-
-    node --> cache
-    node --> gossip
-    node --> incentive
-    node --> reputation
-    node --> protocol
-    node --> common
-
-    cli --> common
-    cli --> protocol
-
-    common --> cache
-    common --> protocol
-    common --> alloy
-    common --> iroh
-
-    cache --> protocol
-    cache --> iroh
-    cache --> iroh_blobs
-
-    gossip --> protocol
-    gossip --> iroh_gossip
-
-    incentive --> protocol
-    incentive --> alloy
-
-    reputation --> protocol
-    reputation --> iroh_gossip
-
-    protocol --> serde
-    protocol --> postcard
-    protocol --> iroh
-
-    style node fill:#4a9eff,color:#fff
-    style cli fill:#60a5fa,color:#fff
-    style common fill:#94a3b8,color:#fff
-    style cache fill:#34d399,color:#fff
-    style gossip fill:#22d3ee,color:#fff
-    style incentive fill:#f59e0b,color:#fff
-    style reputation fill:#a78bfa,color:#fff
-    style protocol fill:#f87171,color:#fff
-```
-
-`protocol` is the leaf crate with minimal dependencies. Everything depends on it; it depends on almost nothing. `common` carries the wire types and config schema both binaries share (see [appendix-binaries.md](appendix-binaries.md)); it pulls `cache` for the typed config fields (`DecompressMode`, `RetryPolicy`, `OriginUrl`, `PinnedHashes`). The cache and incentive layers are separate crates — the cache layer works without incentives (useful for testing, local dev, private deployments). The incentive layer wraps cache operations with payment logic. The `node` crate wires them together; the `cli` crate stays narrow (no `cache`, no `gossip`).
-
 ## External Components
 
 Components referenced by appendices that are operated by content providers, not part of the CDN protocol or workspace.
 
 - **App Server** — companion to the [encrypted-content publishing pattern](appendix-encrypted-content-publishing.md). Operated by the content provider; shares the iroh QUIC transport layer with the CDN but does not participate in gossip, probing, or paid delivery. The CDN crates do not depend on it.
 
-## Observability
-
-The canonical metric registry, naming convention (`decdn_` prefix, `_total` suffix for counters), mandatory vs. recommended tiers, alert thresholds, and `/health` endpoint contract are defined in [Appendix: Observability](appendix-observability.md). The summary below is for orientation only — the observability appendix is authoritative.
-
-- **Structured logging** via `tracing` crate (JSON in production).
-- **Metrics** via `prometheus` crate, exposed at `:{port}/metrics` (default port 9090). Key metric groups: delivery (`decdn_streams_*`, `decdn_bytes_*`), cache (`decdn_cache_*`), payment channels (`decdn_channels_*`, `decdn_vouchers_*`), gossip (`decdn_gossip_*`, `decdn_peer_table_size`), and slash-safety (see below).
-- **Health endpoint** at `:{port}/health` — JSON with `ready`/`degraded`/`not_ready` status, peer count, channel balances, and blacklist sync state.
-- **Slash-risk metrics** (all mandatory — nodes must expose these at startup):
-  - `decdn_probe_hold_violations_total` — phantom announcement risk ([ADR 005](005-protocol.md))
-  - `decdn_probe_hold_slots_used` / `decdn_probe_hold_slots_max` — eviction-hold saturation
-  - `decdn_rate_bounds_clamp_events_total` — rate outside governance bounds ([ADR 003](003-payments.md))
-  - `decdn_blacklist_sync_lag_seconds` / `decdn_blacklist_version_behind` — compliance lag ([ADR 011](011-content-takedown.md))
-  - `decdn_slash_evidence_exposure_total` — self-detected slashing contradiction ([ADR 005](005-protocol.md))
-
 ## Alternatives Considered
 
 The decentralized-storage model evaluated against this design (replication factor N, pinning deals, challenge games) is recorded in [`_history/alternatives-pre-launch.md` § Architecture Overview — Decentralized Storage vs Decentralized Delivery](_history/alternatives-pre-launch.md#architecture-overview--decentralized-storage-vs-decentralized-delivery).
 
-## Future Work: Search & Discovery
+## Deferred & Open
+
+### Search & Discovery (deferred)
 
 Not in PoC scope. The planned approach for the next phase:
 
@@ -408,24 +262,20 @@ Dedicated **indexer nodes** subscribe to gossip topics and respond to `cdn/probe
 
 Content discovery uses `cdn/dht/v1` from PoC onward — at 30 nodes, FIND_VALUE resolves in 1–2 hops and is negligible overhead. Indexers complement DHT by providing metadata search. The on-chain origin directory ([ADR 022](022-content-discovery.md)) remains the deterministic last-resort fallback when DHT returns no providers.
 
-## Future Work: KV-CRDT Content Catalogs
+### KV-CRDT Content Catalogs (deferred)
 
 Not in PoC scope. iroh's KV-CRDT protocol (`iroh-docs`) provides a replicated key-value store with eventual consistency via range-based set reconciliation. Entries are `(namespace, author, key) → (BLAKE3 hash, size, timestamp)` — metadata only; actual content travels via iroh-blobs separately. This maps naturally to deCDN's content-addressing model.
 
-### Primary use case — content catalog replication
-
-A KV-CRDT namespace per content provider could replicate a catalog of `hash → content metadata` entries across nodes. Nodes would learn what content exists before needing it, enabling smarter prefetching. This complements (not replaces) `cdn/dht/v1` — CRDT replication propagates metadata; DHT locates holders.
+**Primary use case — content catalog replication.** A KV-CRDT namespace per content provider could replicate a catalog of `hash → content metadata` entries across nodes. Nodes would learn what content exists before needing it, enabling smarter prefetching. This complements (not replaces) `cdn/dht/v1` — CRDT replication propagates metadata; DHT locates holders.
 
 **Secondary use cases to evaluate:**
 
 - **Node metadata.** A shared document keyed by `NodeId` could provide persistent, eventually-consistent node state (rates, capacity, regions) that survives reconnections — supplementing or replacing ephemeral gossip `NodeAnnounce` messages.
-- **Indexer replication layer.** Indexer nodes (see [Search & Discovery](#future-work-search--discovery) above) could subscribe to content catalog namespaces and build their search index from replicated entries, rather than relying solely on gossip and probe participation.
+- **Indexer replication layer.** Indexer nodes (the search layer described above) could subscribe to content catalog namespaces and build their search index from replicated entries, rather than relying solely on gossip and probe participation.
 
-**Why not in PoC:** DHT already handles content discovery at PoC scale. CRDT replication adds value at larger scale for smarter prefetching; deferred until the network grows beyond where DHT alone suffices.
+**Why not in PoC:** DHT already handles content discovery at PoC scale. CRDT replication adds value at larger scale for smarter prefetching; deferred until the network grows beyond where DHT alone suffices. **Reference:** [iroh-docs protocol](https://docs.iroh.computer/protocols/kv-crdts)
 
-**Reference:** [iroh-docs protocol](https://docs.iroh.computer/protocols/kv-crdts)
-
-## What Is Not Decided Yet
+### Open / undecided
 
 - ~~Production L2 choice~~: decided — [Appendix: L2 Deployment](appendix-l2-deployment.md) selects Arbitrum One (chain ID 42161). Sequencer censorship mitigation uses Arbitrum's 24h forced-inclusion path; see [ADR 003 § L2 sequencer censorship](003-payments.md#l2-sequencer-censorship)
 - ~~Content discovery scaling strategy (DHT vs gossip hints)~~: decided — [ADR 022](022-content-discovery.md) specifies `cdn/dht/v1` as the primary discovery mechanism from day one, with the on-chain origin directory as the deterministic last-resort fallback; broadcast probe fan-out is not part of the protocol; gossip content hints rejected

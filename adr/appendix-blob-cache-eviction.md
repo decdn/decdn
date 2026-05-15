@@ -6,7 +6,7 @@
 
 ## Context
 
-[architecture.md § Cache Behavior](architecture.md#cache-behavior) describes the local blob cache and the conditions under which entries must be exempt from eviction (the probe-triggered hold introduced by [ADR 005 § Probe-Triggered Eviction Hold](005-protocol.md#probe-triggered-eviction-hold)). It does **not** specify the eviction order itself — the canonical wording is *"LRU or frequency-weighted eviction (LFU)"*, which leaves the choice open. Issue [#220](https://github.com/decdn/decdn/issues/220) tracks the gap. This appendix resolves five questions:
+The local blob cache holds pulled content; certain entries must be exempt from eviction — the probe-triggered hold introduced by [ADR 005 § Probe-Triggered Eviction Hold](005-protocol.md#probe-triggered-eviction-hold). The protocol does **not** specify the eviction order itself — the canonical wording is *"LRU or frequency-weighted eviction (LFU)"*, which leaves the choice open. Issue [#220](https://github.com/decdn/decdn/issues/220) tracks the gap. This appendix resolves five questions:
 
 1. **Eviction key** — should the cache evict by recency (LRU), frequency (LFU), size (largest-first), or a hybrid? The non-committal wording in `architecture.md` is the gap this appendix closes.
 2. **Pinning interaction** — how does an operator-pinned hash ([#276](https://github.com/decdn/decdn/issues/276)) compose with eviction?
