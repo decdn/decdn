@@ -199,6 +199,12 @@ For new nodes with the initial reputation of 0.5 ([ADR 008](008-reputation.md)),
 
 **Inputs:** `rate_per_mb` and `rtt_ms` come from `ProbeResponse` (see [ADR 005](005-protocol.md)). `reputation` is the node's `final_score` from [ADR 008](008-reputation.md) — local observations (70%) + network gossip (30%).
 
+#### Minimum-reputation rejection floor
+
+The `max(reputation, 0.1)` clamp above only bounds the *score denominator* — it caps the worst-case multiplier at 100×, but a sufficiently cheap and close node can still produce the lowest score and win selection despite a poor reputation. Independently of that clamp, a client MAY configure a hard **minimum-reputation floor**: candidates whose `reputation` is below the floor are removed from the candidate pool *before* scoring, so price and RTT can never override a sub-floor reputation. The boundary is inclusive (a node exactly at the floor is retained); a `NaN` reputation is rejected whenever the floor is active (any comparison with `NaN` is false).
+
+The floor defaults to `0.0`, which disables filtering and preserves the pre-floor ranking behavior exactly (including the defensive negative-reputation clamp). Per-client configuration wiring is deferred until the client fetch path that consumes the selection algorithm exists; the floor is currently exposed as a selection-API parameter (issue [#441](https://github.com/decdn/decdn/issues/441)).
+
 #### Tie-breaking
 
 (scores within 1% of each other): see [ADR 008, Tie-Breaking](008-reputation.md#9-tie-breaking).
