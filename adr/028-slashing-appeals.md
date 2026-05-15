@@ -199,13 +199,6 @@ Modeled abuse paths and their counters:
 
 ## Cross-ADR Impact
 
-- Storage layout, per-appeal escrow accounting from §2, and the six Solidity event signatures (`SlashAppealOpened` / `SlashAppealFastTracked` / `SlashAppealRejected` / `SlashAppealRatified` / `SlashAppealReversed` / `SlashAppealLapsed`) are pinned in [ADR 032 — SafetyReserve appeal-surface contract surface](032-safety-reserve-appeals-contract.md). ADR 032 also introduces a sixth external entry point `cleanupExpiredAppeal(appealId)` (permissionless) for the two lapse cases defined in its state machine; see [ADR 032 §4](032-safety-reserve-appeals-contract.md#4-state-machine).
-- **`SafetyReserve` future split.** If the reserve is ever decomposed into separate per-category contracts (e.g. distinct reserves for slash-restitution vs. SLA-breach vs. payment-channel downtime), the following state and entry points must migrate alongside the slash-restitution payout category:
-  1. The six §6 entry points (`openSlashAppeal` / `fastTrackAppeal` / `rejectAppeal` / `ratifyAppeal` / `reverseAppeal` / `cleanupExpiredAppeal` per [ADR 032 §6](032-safety-reserve-appeals-contract.md#6-multisig-capability-scope)).
-  2. Per-appeal escrow accounting from §2.
-  3. The pending-claim register from §5 (including the cross-category epoch-FIFO queue pinned in [ADR 026 §5 Cross-category payout ordering](026-gauge-boost-tokenomics.md#cross-category-payout-ordering)).
-  4. The challenger-incentive pool state implied by §4.
-
-  The migration must preserve §2's escrow semantics. This is a known coupling cost of the §6 reuse decision and is intentional for PoC; revisiting at the time of any reserve split is sufficient.
-
-- The narrower regional-blacklist appeal mechanism (issue #131) is tracked separately under [ADR 011](011-content-takedown.md). The two appeal paths are deliberately decoupled — content-policy disputes and operator-outage disputes have different evidence standards and different stakeholder pools.
+- Storage layout, per-appeal escrow accounting (§2), and the six event signatures are pinned in [ADR 032](032-safety-reserve-appeals-contract.md), which also adds the permissionless `cleanupExpiredAppeal(appealId)` lapse handler (see [ADR 032 §4](032-safety-reserve-appeals-contract.md#4-state-machine)).
+- **`SafetyReserve` future split.** If the reserve is ever decomposed into per-category contracts (slash-restitution vs. SLA-breach vs. payment-channel downtime), the slash-restitution category must migrate together with: (1) the six §6 entry points (`openSlashAppeal` / `fastTrackAppeal` / `rejectAppeal` / `ratifyAppeal` / `reverseAppeal` / `cleanupExpiredAppeal`, per [ADR 032 §6](032-safety-reserve-appeals-contract.md#6-multisig-capability-scope)); (2) per-appeal escrow accounting (§2); (3) the pending-claim register (§5, including the cross-category epoch-FIFO queue pinned in [ADR 026 §5](026-gauge-boost-tokenomics.md#cross-category-payout-ordering)); (4) the challenger-incentive pool state (§4). Migration MUST preserve §2's escrow semantics — a known, intentional coupling cost of the §6-reuse decision, revisited only at split time.
+- Regional-blacklist appeals (#131) are tracked separately under [ADR 011](011-content-takedown.md); the two appeal paths are deliberately decoupled (different evidence standards and stakeholder pools).
