@@ -45,7 +45,7 @@ sequenceDiagram
             SR->>SR: provisional restitution moves to per-appeal escrow — not disbursed
             Note over SR: gate (3) — 48h SafetyReserve counter-bundle window (ADR 026 §5)
             alt counter-bundle filed and accepted within 48h
-                SR->>SR: appeal fails — escrow returns to SR; 50% bond burned, 50% to counter-bundle filer
+                SR->>SR: appeal fails, escrow returns to SR — 50% bond burned, 50% to counter-bundle filer
             else 48h elapses with no successful counter-bundle
                 Note over SR: RATIFICATION_WINDOW = 14d begins (sequential, not parallel)
                 alt ve-Governor ratifies

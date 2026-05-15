@@ -222,7 +222,7 @@ sequenceDiagram
     Note over F,Gov: T+0 — disputed entry added by regional body
     F->>CB: TOKEN.approve(CB, BLACKLIST_APPEAL_BOND)
     F->>CB: openBlacklistAppeal(hash, region, evidenceBundleHash, standingPath)
-    CB-->>F: appealId; bond escrowed; entry.suspended = false (still enforced)
+    CB-->>F: appealId — bond escrowed — entry.suspended = false (still enforced)
     Note over CB: BLACKLIST_MULTISIG_REVIEW_WINDOW = 14d
     alt multisig acts within window
         EM->>CB: fastTrackAppeal(appealId) or rejectAppeal(appealId)
@@ -231,19 +231,19 @@ sequenceDiagram
             Note over CB: BLACKLIST_RATIFICATION_WINDOW = 14d
             alt ve-Governor ratifies
                 Gov->>CB: ratifyAppealRemoval(appealId)
-                CB->>CB: _removeHashRegional(hash, region); bond refunded
+                CB->>CB: _removeHashRegional(hash, region) — bond refunded
             else ve-Governor reverses
                 Gov->>CB: reverseAppeal(appealId)
-                CB->>CB: entry.suspended = false; original effectiveAt preserved
+                CB->>CB: entry.suspended = false — original effectiveAt preserved
                 CB->>CB: 100% of bond burned
             else governance silent past BLACKLIST_RATIFICATION_WINDOW
-                CB->>CB: entry.suspended = false; original effectiveAt preserved; bond refunded
+                CB->>CB: entry.suspended = false — original effectiveAt preserved — bond refunded
             end
         else rejected at intake
             CB->>CB: 100% of bond burned
         end
     else multisig silent past BLACKLIST_MULTISIG_REVIEW_WINDOW
-        CB->>CB: appeal lapses; bond refunded
+        CB->>CB: appeal lapses — bond refunded
     end
 ```
 
