@@ -220,14 +220,6 @@ The disbursement of queued claims is permissionless and follows the head-of-queu
 - **Per-appeal `counterBundleFiler` storage field.** Considered for §2's bond-routing dispatch (counter-bundle filer recorded at gate-3 acceptance, read at `reverseAppeal`). Rejected: the gate-3 state already exists on `SafetyReserve` proper; duplicating it into the `Appeal` struct would cost another slot per appeal and require two writes (gate-3 + appeal) on every counter-bundle acceptance. The current design reads gate-3 state directly and surfaces the recipient via the `bondSplitRecipient` event field.
 - **Five-condition `LapseReason` enum (ADR 031 style).** Rejected: slash appeals have only two lapse triggers (multisig timeout, ratification timeout), with no standing-path or global-override analogue. A two-enum mapping would over-engineer the case set; the `(escrowReturned == 0)` test suffices for off-chain disambiguation.
 
-## Cross-ADR Impact
-
-- **[ADR 026 § Contract: SafetyReserve](026-gauge-boost-tokenomics.md#contract-safetyreserve):** the `ISafetyReserve` interface stub for slash-appeal extensions is updated in this PR to (a) add the missing `SlashAppealLapsed` event and (b) pin all six event signatures' parameter lists consistently with §3 above. The comment block immediately preceding the stub points at this ADR as the authority on storage and event semantics.
-- **[ADR 028 § Cross-ADR Impact](028-slashing-appeals.md#cross-adr-impact):** the "future contract-implementation ADR will pin…" bullet is replaced with a back-reference to this ADR.
-- **[ADR 028 § Consequences — Negative](028-slashing-appeals.md#negative):** the "Adds five new entry points" sentence is updated to "Adds six new entry points" reflecting the `cleanupExpiredAppeal` introduced here.
-- **[architecture.md § Chapter 5 — Verification & enforcement](architecture.md#chapter-5--verification--enforcement)** and **[§ Architectural Decisions](architecture.md#architectural-decisions):** ADR 032 added to the Chapter 5 reading order and the numeric per-ADR index.
-- **`decdn/CLAUDE.md`:** the "Next ADR number is 030" line is bumped to "Next ADR number is 033", and the ADR-number provenance note records ADR 032 (`032-safety-reserve-appeals-contract.md`, this ADR) and ADR 031 (`031-content-blacklist-appeals-contract.md`) as canonical, with ADR 030 assigned by in-flight PR #565.
-
 ## References
 
 - [ADR 028 — Slashing Appeals and Dispute Escalation](028-slashing-appeals.md) — semantic spec.
