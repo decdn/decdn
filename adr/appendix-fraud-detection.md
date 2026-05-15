@@ -54,7 +54,7 @@ The detector role consumes only public on-chain data — channel close events. N
 
 A protocol decision establishes a participant role with a defined wire interface, on-chain registration, fee/payment economics, or off-chain coordination protocol. The fraud-detection layer has none of these — it is a permissionless side-effect of `disputeChannel` access from [ADR 003](003-payments.md). Documenting it as an appendix matches the role of [Encrypted Content Publishing](appendix-encrypted-content-publishing.md) or [Observability](appendix-observability.md): operationally relevant, but not a protocol primitive.
 
-## Cross-references
+## Cross-ADR Impact
 
 - [ADR 003 — Payments](003-payments.md) — `closeChannel` / `disputeChannel` flow, dispute window, local-monitor Option C, forced-inclusion deadline extension
 - [ADR 014 — On-chain Verification](014-on-chain-verification.md) — `SlashJudge` challenge-bond mechanism (Bond Handling) for the three signature-dependent offenses

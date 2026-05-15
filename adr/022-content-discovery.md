@@ -232,7 +232,7 @@ DHT STORE and FIND_VALUE operations carry no protocol-level fee. The incentive t
 
 The six discovery alternatives evaluated against `cdn/dht/v1` (broadcast probe fan-out as primary, gossip content announcements, hash-prefix range hints, iroh mainline DHT, indexer nodes, full libp2p Kademlia) are recorded in [`_history/alternatives-pre-launch.md` § ADR 022 — Content Discovery at Scale](_history/alternatives-pre-launch.md#adr-022--content-discovery-at-scale).
 
-## Cross-ADR Consistency
+## Cross-ADR Impact
 
 - **ADR 001** Future Work section ("Scaling Content Discovery") is superseded by this ADR. The three strategies listed there are resolved: selective fan-out is removed entirely (the on-chain origin directory is the deterministic last-resort fallback when the DHT returns no providers), content DHT is formalised here, gossip content hints are rejected.
 - **ADR 005** probe protocol is unchanged. DHT provides candidates only.

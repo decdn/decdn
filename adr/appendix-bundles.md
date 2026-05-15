@@ -148,15 +148,18 @@ blob hash for a chunked single file inside a bundled directory.
   those rules do not apply. Future versions bump `version` directly;
   parsers dispatch on the literal integer.
 
-## Future work and non-goals
+## Non-Goals
 
-- `decdn bundle pull -i <file>` and `decdn bundle pull --hash <b3>`
-  are blocked on a client-side fetch primitive that does not exist
-  yet. Both checked items in issue #391's pull section will land in
-  a follow-up once the fetch primitive is implemented.
 - `bundle inspect`, signing/attestation, encryption, compression,
   nested bundles, network publishing of the produced file — all v2+
   concerns, none of which the bundle BLAKE3 invariant depends on.
 - This appendix does not add a wire format. Bundles never ride an
   ALPN; they exist only as on-disk JSON or as opaque blob bytes when
   published through the regular content path.
+
+## Deferred & Open
+
+- `decdn bundle pull -i <file>` and `decdn bundle pull --hash <b3>`
+  are blocked on a client-side fetch primitive that does not exist
+  yet. Both checked items in issue #391's pull section will land in
+  a follow-up once the fetch primitive is implemented.

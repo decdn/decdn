@@ -96,7 +96,7 @@ data on a prefix rename.
 - **`cargo install --path crates/cli`** and
   **`cargo install --path crates/node`** both work standalone.
 
-## Implications & follow-ups
+## Cross-ADR Impact
 
 - `decdn bundle …` (#391) lands directly on `decdn`; no decision
   about which binary owns it remains.

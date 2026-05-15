@@ -1,23 +1,37 @@
 -- adr/_build/strip-meta-sections.lua
 --
--- Drops Alternatives Considered / Considered Alternatives / Open Questions /
--- Future Work / "Why not …" sections from the rendered PDF while leaving the
--- source `.md` files untouched. Also drops the per-ADR `**Date:** … /
--- **Status:** …` preamble paragraphs (book-formatting noise that ages
--- poorly) and rewrites internal cross-references pointing at the
--- stripped sections (same-file and cross-file) to plain text so typst
--- doesn't choke on dangling labels.
+-- Drops debate/deferral scaffolding from the rendered PDF while leaving the
+-- source `.md` files untouched. Canonical ADR section taxonomy (see
+-- adr/README.md § Canonical section taxonomy):
+--
+--   * "Deferred & Open"  — STRIPPED. The canonical home for deferred work,
+--     open questions, and forward references. Legacy names ("Open Questions",
+--     "Future Work", "Forward references …") are kept in the patterns below
+--     defensively so any un-migrated or future drift is still caught.
+--   * "Alternatives Considered" / "Considered Alternatives" / "Why not …"
+--     — STRIPPED. Rejected-alternative records (a distinct concept; most live
+--     in _history/, these patterns catch the inline remainder).
+--   * "Cross-ADR Impact" — NOT stripped. It carries substantive cross-cutting
+--     design content (amendments to other ADRs, coupling notes), not
+--     scaffolding. Do not add it to strip_patterns.
+--   * "Non-Goals" / "References" — NOT stripped. Substantive.
+--
+-- Also drops the per-ADR `**Date:** … / **Status:** …` preamble paragraphs
+-- (book-formatting noise that ages poorly) and rewrites internal
+-- cross-references pointing at the stripped sections (same-file and
+-- cross-file) to plain text so typst doesn't choke on dangling labels.
 --
 -- Wired into the reading-order book build only (see adr/README.md
 -- § Building a single PDF). The numeric build keeps everything so it stays
 -- usable as the complete-spec reference.
 
 local strip_patterns = {
+  "^deferred & open",            -- canonical: deferred work / open questions
   "^alternatives considered$",
   "^considered alternatives$",
   "alternatives considered$",   -- "§6 — Alternatives Considered"
-  "^open questions$",
-  "^future work",                -- "Future Work" and "Future Work: …"
+  "^open questions$",            -- legacy alias, retained defensively
+  "^future work",                -- legacy: "Future Work" / "Future Work: …"
   "^why not ",                   -- "Why not Uniswap V3, …"
 }
 

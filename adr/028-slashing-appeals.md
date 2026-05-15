@@ -138,7 +138,7 @@ function cleanupExpiredAppeal(uint256 appealId) external;
 
 **Dependency on `SlashJudge` slash identifiers.** The `slashId` argument refers to the `Slashed(uint256 indexed slashId, address indexed operator, OffenseType offenseType, uint256 amount, bytes32 evidenceHash)` event canonicalised in [ADR 014 §2 `Slashed` event and `slashId` allocation](014-on-chain-verification.md#slashed-event-and-slashid-allocation). That ADR pins the event for all three offense types (phantom, rate, blacklist) — each of which resolves synchronously at submit time — and pins `slashId` as a globally monotonic non-zero counter. Operators reference this `slashId` directly in `openSlashAppeal`, with `evidenceBundleHash` matching the event's `evidenceHash` field. Without ADR 014's `Slashed` emission, no appeal can be filed.
 
-Extending the existing `SafetyReserve` contract — rather than introducing a new `SlashAppealRegistry` — preserves the deployment budget, reuses the payout machinery, and keeps the public payout registry as the single source of truth for who received protocol restitution and why. The trade-off is acknowledged in [Forward references](#forward-references-follow-up-adrs): if `SafetyReserve` is ever split (e.g., separate reserves per incident category), the appeal-authorization functions must migrate alongside the slash-restitution payout category.
+Extending the existing `SafetyReserve` contract — rather than introducing a new `SlashAppealRegistry` — preserves the deployment budget, reuses the payout machinery, and keeps the public payout registry as the single source of truth for who received protocol restitution and why. The trade-off is acknowledged in [Cross-ADR Impact](#cross-adr-impact): if `SafetyReserve` is ever split (e.g., separate reserves per incident category), the appeal-authorization functions must migrate alongside the slash-restitution payout category.
 
 ### 7. Reputation handling
 
@@ -197,7 +197,7 @@ Modeled abuse paths and their counters:
 - **Hybrid stake reversal + reputation reset.** Rejected for the same clawback reason, plus the reputation-preservation rationale in §7.
 - **Narrowing scope to a subset of offenses.** Rejected: phantom, rate, and blacklist all execute immediately with no in-protocol due process; restricting appeals to a subset would leave a corresponding portion of operator-trust gap unaddressed.
 
-## Forward references (follow-up ADRs)
+## Cross-ADR Impact
 
 - Storage layout, per-appeal escrow accounting from §2, and the six Solidity event signatures (`SlashAppealOpened` / `SlashAppealFastTracked` / `SlashAppealRejected` / `SlashAppealRatified` / `SlashAppealReversed` / `SlashAppealLapsed`) are pinned in [ADR 032 — SafetyReserve appeal-surface contract surface](032-safety-reserve-appeals-contract.md). ADR 032 also introduces a sixth external entry point `cleanupExpiredAppeal(appealId)` (permissionless) for the two lapse cases defined in its state machine; see [ADR 032 §4](032-safety-reserve-appeals-contract.md#4-state-machine).
 - **`SafetyReserve` future split.** If the reserve is ever decomposed into separate per-category contracts (e.g. distinct reserves for slash-restitution vs. SLA-breach vs. payment-channel downtime), the following state and entry points must migrate alongside the slash-restitution payout category:
