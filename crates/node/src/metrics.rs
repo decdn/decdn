@@ -389,6 +389,7 @@ mod tests {
         for name in [
             "decdn_cache_origin_fetches_total",
             "decdn_cache_origin_retry_exhausted_total",
+            "decdn_cache_origin_fallback_total",
             "decdn_cache_hits_total",
             "decdn_cache_misses_total",
             "decdn_cache_bytes_returned_total",
@@ -466,7 +467,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let engine = CacheEngine::open_full(
             tmp.path(),
-            Some(Arc::new(stub)),
+            vec![Arc::new(stub) as Arc<dyn decdn_cache::Origin>],
             10,
             PinnedHashes::empty(),
             RetryPolicy::default(),
@@ -505,6 +506,7 @@ mod tests {
         let handle = metrics.cache_metrics();
         handle.origin_fetches.inc();
         handle.origin_retry_exhausted.inc();
+        handle.origin_fallback.inc();
         handle.hits.inc();
         handle.misses.inc();
         handle.bytes_returned.inc_by(1024);

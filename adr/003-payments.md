@@ -316,6 +316,16 @@ Attacker intercepts a signed voucher and attempts to replay it against a differe
 
 Fully solved. EIP-712 typed data over `{channelId, amount, nonce, bytesDelivered, token}` binds the voucher to a specific channel. The EIP-712 domain separator (see [EIP-712 Voucher Signature](#eip-712-voucher-signature)) further binds each voucher to a specific chain and contract deployment, preventing replay across different L2s, contract upgrades, or test vs production environments. The monotonically increasing nonce (starting at 1; see [Voucher Nonce Convention](#voucher-nonce-convention)) prevents resubmission after settlement.
 
+#### Off-chain voucher state persistence
+
+The on-chain protections in [Replay attack on vouchers](#replay-attack-on-vouchers) constrain only what the contract will accept at settlement. They do not prevent the **delivering node** from re-delivering bytes off-chain for a voucher it has already honoured — a node that holds voucher state only in memory and restarts will re-accept any earlier-nonce voucher the client (or anyone observing the wire) resubmits, and serve the bytes a second time. Issue #527 is the canonical filing.
+
+Required invariant: a node MUST persist `(last_nonce, last_amount, last_bytes_delivered)` per channel and durably commit (fsync, on disk-backed implementations) **before** sending `VoucherAck` or delivering any further bytes for that voucher. After a restart, voucher acceptance MUST resume from the persisted state — never from `last_nonce = 0`. An absent entry is semantically identical to a never-seen channel (`last_nonce == 0`, per [Voucher Nonce Convention](#voucher-nonce-convention)); a record exists iff the node ever advanced past the initial sentinel. Entries are dropped only when the node observes `ChannelSettled` on-chain.
+
+A failed persist write MUST surface as a voucher-acceptance failure — the node returns a transient-failure rejection through the [Off-chain Voucher Rejections (Wire Encoding)](#off-chain-voucher-rejections-wire-encoding) channel, and MUST NOT send `VoucherAck`. The specific wire code for transient persistence failures is left to the `cdn/client/v1` handler implementation (issue #317); the existing `StaleNonce` / `InsufficientDeposit` codes are NOT appropriate substitutes because they would tell the client to refresh state or top up the deposit when in fact the same voucher should be retried unchanged. Persisting after acknowledgement re-opens the same replay window for the crash interval between the two writes.
+
+Storage backend and trait shape are implementation concerns; the Rust implementation exposes a `ChannelStateStore` seam in `crates/incentive` with a `redb`-backed persistent implementation in `crates/node` (per the leaf-crate convention in [appendix-poc-production-seams.md §1](appendix-poc-production-seams.md#1-keystore--cratesincentive)). The protocol fixes only the ordering above.
+
 ## Contract Interfaces
 
 ### StablePaymentChannel

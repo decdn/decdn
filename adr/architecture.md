@@ -94,7 +94,8 @@ How protocol violations are detected, adjudicated, and punished. The slashing sc
 4. [ADR 028 — Slashing Appeals and Dispute Escalation](028-slashing-appeals.md)
 5. [ADR 032 — SafetyReserve Appeal-Surface Contract Surface](032-safety-reserve-appeals-contract.md) — contract-implementation pin for ADR 028's appeal flow
 6. [ADR 031 — ContentBlacklist Appeal-Contract Surface](031-content-blacklist-appeals-contract.md) — contract-implementation pin for ADR 011's blacklist-entry appeals
-7. [Appendix: Permissionless Fraud-Detection Layer](appendix-fraud-detection.md) — operational detection layer over the on-chain primitives
+7. [ADR 030 — Node Region Self-Attestation](030-node-region-self-attestation.md)
+8. [Appendix: Permissionless Fraud-Detection Layer](appendix-fraud-detection.md) — operational detection layer over the on-chain primitives
 
 ### Chapter 6 — Governance & contracts
 
@@ -158,6 +159,7 @@ Numeric per-ADR index. The thematic chapter ordering for top-to-bottom reading l
 - **[ADR 024 — Account Abstraction and Safe Smart Wallet Support](024-account-abstraction.md)** — Universal `SignatureChecker` across all contracts; Safe as the recommended wallet for nodes and clients; session keys via ERC-7579 `smartsessions` deferred to production.
 - **[ADR 026 — Gauge-Boost Tokenomics](026-gauge-boost-tokenomics.md)** — 1B fixed supply; `FeeRouter` six-bucket split with Curve-style gauge boost, delegator pool, and SafetyReserve. Per-operator gauge-share cap (5% default) is the wash-trading defense; gauge bucket paused via `gaugeLaunched == false` until cap is enforced (`enableGauge()` cutover).
 - **[ADR 028 — Slashing Appeals and Dispute Escalation](028-slashing-appeals.md)** — 30-day post-slash appeal window via `SafetyReserve` restitution; emergency multisig fast-track + 14-day ve-Governor ratification; one accepted appeal per operator per 365 days.
+- **[ADR 030 — Node Region Self-Attestation](030-node-region-self-attestation.md)** — Region claims in `NodeAnnounce` and `StakingRegistry` are accepted at face value; the IP-geolocation oracle / third-party attestation path is explicitly rejected. Appeals-standing flipping and reactive blacklist-scope flipping are closed by a 7-day `regionLastChanged` stability window on `StakingRegistry` (governable `[3d, 30d]`; [ADR 011 § Standing](011-content-takedown.md#standing) path 2 and [§ Regional Scope](011-content-takedown.md#regional-scope)). Latency-vs.-claim reputation penalty from [ADR 001 § Consequences](001-network.md#consequences) is the canonical soft mitigation for residual pre-positioned misdeclaration.
 - **[ADR 031 — ContentBlacklist Appeal-Contract Surface](031-content-blacklist-appeals-contract.md)** — Pins the contract surface for ADR 011 § Blacklist Entry Appeals: per-appeal storage layout, event-topic ordering, state machine, and integration with `ContentBlacklist` core (suspension flag, `_removeHashRegional`, permissionless cleanup).
 - **[ADR 032 — SafetyReserve Appeal-Surface Contract Surface](032-safety-reserve-appeals-contract.md)** — Pins the contract surface for ADR 028: per-appeal storage layout, escrow accounting, all six Solidity event signatures (`SlashAppealOpened` / `FastTracked` / `Rejected` / `Ratified` / `Reversed` / `Lapsed`), and a permissionless `cleanupExpiredAppeal` entry point.
 

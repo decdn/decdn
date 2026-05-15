@@ -199,7 +199,7 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             cache_dir: PathBuf::from("/var/lib/decdn/cache"),
             cache_size_mb: 10_240,
             max_blob_size_mb: 1_024,
-            origin: None,
+            origins: Vec::new(),
             pinned_hashes: decdn_cache::PinnedHashes::empty(),
             origin_retry: decdn_cache::RetryPolicy::default(),
             user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),

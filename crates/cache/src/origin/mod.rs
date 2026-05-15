@@ -92,7 +92,7 @@ pub type OriginByteStream =
 
 /// Tag identifying which [`Origin`] backend a [`crate::CacheEngine`] is
 /// configured against (#439). Surfaced through
-/// [`crate::EvictionPreview::origin_kind`] so admin dry-run callers can
+/// [`crate::EvictionPreview::origin_kinds`] so admin dry-run callers can
 /// estimate origin egress cost — re-fetching from a `Filesystem` origin
 /// is a local read; `Http` and `S3` may consume metered bandwidth.
 ///
@@ -264,7 +264,7 @@ pub trait Origin: std::fmt::Debug + Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>>;
 
     /// Tag identifying the backend type. Surfaced through
-    /// [`crate::EvictionPreview::origin_kind`] so admin dry-run callers
+    /// [`crate::EvictionPreview::origin_kinds`] so admin dry-run callers
     /// can estimate origin egress cost (#439) — `Filesystem` is a local
     /// read; `Http` may bill metered bandwidth.
     fn kind(&self) -> OriginKind;

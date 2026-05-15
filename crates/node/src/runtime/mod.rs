@@ -26,6 +26,7 @@ use tokio::task::JoinSet;
 use decdn_gossip::{GossipMetrics, GossipRuntimeConfig, GossipService, PeerTable};
 
 use crate::admin;
+use crate::channel_store::PersistentChannelStateStore;
 use crate::dispatch::ConnectionLimiter;
 use crate::handlers::limited::LimitedHandler;
 use crate::handlers::probe::ProbeHandler;
@@ -33,6 +34,7 @@ use crate::metrics;
 use alloy::signers::local::PrivateKeySigner;
 use decdn_common::config::ResolvedConfig;
 use decdn_common::identity;
+use decdn_incentive::ChannelStateStore;
 use decdn_incentive::eth_identity::{self, PasswordSource};
 
 /// Ceiling on how long we wait for spawned tasks to drain after the endpoint
@@ -194,6 +196,43 @@ pub async fn run(
     let eth_signer = Arc::new(load_eth_signer(&cfg).await?);
     tracing::info!(address = %eth_signer.address(), "loaded eth keystore");
 
+    // Open the off-chain voucher-state store (issue #527, ADR 003
+    // §Off-chain voucher state persistence) before any handler that could
+    // accept a voucher comes online. `PersistentChannelStateStore::open`
+    // performs disk I/O (file create + mode tighten + redb header read), so
+    // run it on a blocking thread to avoid stalling the tokio runtime.
+    // Failure here MUST abort startup: continuing with a fresh in-memory
+    // map silently reopens the replay window the store exists to close.
+    let channel_store_data_dir = cfg.identity.data_dir.clone();
+    let channel_state_store: Arc<dyn ChannelStateStore> = Arc::new(
+        tokio::task::spawn_blocking(move || {
+            PersistentChannelStateStore::open(&channel_store_data_dir)
+        })
+        .await
+        .context("channel state store open task panicked")?
+        .context("failed to open channel state store (issue #527 voucher replay guard)")?,
+    );
+    // Boot-time smoke test: read every persisted record so startup fails
+    // fast on corruption / forward-incompatible schema even before the
+    // future cdn/client/v1 handler (#317) is constructed. The handler will
+    // call `load_all` again to bootstrap its in-memory channel map — that
+    // duplicate read is by design; the runtime cannot keep the snapshot
+    // because no consumer exists yet, and threading a pre-built map
+    // through `Router::builder` would couple the runtime to the (still
+    // unwritten) handler signature. Cost: one extra `load_all` on startup.
+    let persisted_count = tokio::task::spawn_blocking({
+        let store = Arc::clone(&channel_state_store);
+        move || store.load_all()
+    })
+    .await
+    .context("channel state store load task panicked")?
+    .context("failed to hydrate persisted channel state")?
+    .len();
+    tracing::info!(
+        channels = persisted_count,
+        "channel state store ready (issue #527 replay guard active)",
+    );
+
     let cache = build_cache(&cfg, Arc::clone(&node_metrics)).await?;
     // Attach the cache to the reload state so SIGHUP handlers can swap
     // the pinned-hashes set atomically (#276). Done immediately after
@@ -203,8 +242,9 @@ pub async fn run(
     let retry = cfg.cache.origin_retry;
     tracing::info!(
         cache_dir = %cfg.cache.cache_dir.display(),
-        has_origin = cfg.cache.origin.is_some(),
-        origin_kind = origin_kind_label(cfg.cache.origin.as_ref()),
+        has_origin = !cfg.cache.origins.is_empty(),
+        origin_count = cfg.cache.origins.len(),
+        origin_kinds = %origin_kinds_label(&cfg.cache.origins),
         pinned_hashes = cfg.cache.pinned_hashes.len(),
         // Origin retry policy (#285). Logged once at startup so operators
         // can audit the active resilience budget without hitting an RPC.
@@ -249,6 +289,29 @@ pub async fn run(
     // gates the probe ALPN. Without the wrapper, a connection flood on
     // `iroh-gossip/0` bypasses the global semaphore entirely (#433): the
     // per-task resource ceiling holds for probe but not network-wide.
+    //
+    // TODO(#317): when the `cdn/client/v1` paid delivery handler is
+    // implemented, wire it up here. Required steps:
+    //
+    //   1. Construct it with `Arc::clone(&channel_state_store)`.
+    //   2. In the handler's constructor, call
+    //      `channel_state_store.load_all()` to bootstrap an in-memory
+    //      `HashMap<ChannelId, ChannelState>` (or per-channel mutex map).
+    //      An absent entry == never-seen channel (ADR 003 §Off-chain
+    //      voucher state persistence).
+    //   3. Every voucher-acceptance path MUST call
+    //      `ChannelState::apply_voucher(..., &*channel_state_store)`. Do
+    //      NOT build a fresh `ChannelState::new` on the request path
+    //      without consulting the in-memory map first — that's the
+    //      issue #527 replay window.
+    //   4. Treat `ChannelError::Store(_)` as transient (client SHOULD
+    //      retry the same voucher); treat every other `ChannelError`
+    //      variant as a permanent rejection.
+    //
+    // The runtime intentionally does NOT pre-build the in-memory map: the
+    // handler's data structures aren't fixed yet, and coupling the
+    // runtime to a not-yet-written handler signature would block #317
+    // unnecessarily.
     let router = Router::builder(ep.clone())
         .accept(ProbeHandler::ALPN, probe_handler)
         .accept(
@@ -436,8 +499,9 @@ pub async fn run(
         admin_port = ?cfg.observability.admin_port,
         rate_per_mb = cfg.payment.rate_per_mb,
         cache_dir = %cfg.cache.cache_dir.display(),
-        has_origin = cfg.cache.origin.is_some(),
-        origin_kind = origin_kind_label(cfg.cache.origin.as_ref()),
+        has_origin = !cfg.cache.origins.is_empty(),
+        origin_count = cfg.cache.origins.len(),
+        origin_kinds = %origin_kinds_label(&cfg.cache.origins),
         subscribe_global = cfg.gossip.subscribe_global,
         "node runtime ready"
     );
@@ -673,44 +737,61 @@ fn log_join_result(result: Result<(), tokio::task::JoinError>, phase: &'static s
     }
 }
 
-/// Construct the cache engine from resolved config. The `[cache.origin]`
-/// table picks one of three backends — HTTP, filesystem, or S3 (#437).
-/// `None` means no pull-through is configured; the engine then serves
-/// only already-cached content and cache misses surface as
+/// Construct the cache engine from resolved config. The
+/// `[cache.origins]` array picks an ordered list of backends — HTTP,
+/// filesystem, or S3 (#437, #284). The singular `[cache.origin]` TOML
+/// form is collapsed by the resolver into a single-element vec, so
+/// this function sees one canonical representation. An empty vec means
+/// no pull-through is configured; the engine then serves only
+/// already-cached content and cache misses surface as
 /// `CacheError::NoOrigin`.
 ///
+/// Init failure is fail-fast: if origin #i can't be constructed (bad
+/// path, S3 auth failure, etc.) the node refuses to start and the
+/// context chain identifies which entry. Skip-and-warn would let a
+/// misconfigured fallback rot silently until the primary fails — the
+/// opposite of operator intent.
+///
 /// `node_metrics` provides the shared `Arc<CacheMetrics>` that the
-/// engine bumps on origin fetches and retry exhaustions (#285).
+/// engine bumps on origin fetches, retry exhaustions (#285), and
+/// chain-walk fallback advances (#284).
 async fn build_cache(
     cfg: &ResolvedConfig,
     node_metrics: Arc<metrics::Metrics>,
 ) -> anyhow::Result<CacheEngine> {
-    let origin: Option<Arc<dyn Origin>> = match cfg.cache.origin.as_ref() {
-        None => None,
-        Some(ResolvedOrigin::Http { url, decompress }) => Some(Arc::new(
-            HttpOrigin::new_with_user_agent(url.clone(), &cfg.cache.user_agent)
-                .context("failed to build HTTP origin client")?
-                .with_decompress_mode(*decompress),
-        )),
-        Some(ResolvedOrigin::Fs { path }) => Some(Arc::new(
-            FilesystemOrigin::new(path.clone())
-                .await
-                .context("failed to open filesystem origin")?,
-        )),
-        // S3-compatible origin (#437 PR2). Conversion from the resolved-
-        // config form to the cache-crate's runtime form happens here
-        // because `decdn-cache` deliberately doesn't depend on
-        // `decdn-common` (the dependency direction is `common -> cache`,
-        // and reversing it would be circular).
-        Some(ResolvedOrigin::S3(cfg)) => Some(Arc::new(
-            S3Origin::new(&s3_origin_config_from_resolved(cfg))
-                .await
-                .context("failed to construct S3 origin client")?,
-        )),
-    };
+    let mut origins: Vec<Arc<dyn Origin>> = Vec::with_capacity(cfg.cache.origins.len());
+    for (idx, resolved) in cfg.cache.origins.iter().enumerate() {
+        let backend: Arc<dyn Origin> = match resolved {
+            ResolvedOrigin::Http { url, decompress } => Arc::new(
+                HttpOrigin::new_with_user_agent(url.clone(), &cfg.cache.user_agent)
+                    .with_context(|| {
+                        format!("failed to build HTTP origin client for cache.origins[{idx}]")
+                    })?
+                    .with_decompress_mode(*decompress),
+            ),
+            ResolvedOrigin::Fs { path } => {
+                Arc::new(FilesystemOrigin::new(path.clone()).await.with_context(|| {
+                    format!("failed to open filesystem origin for cache.origins[{idx}]")
+                })?)
+            }
+            // S3-compatible origin (#437 PR2). Conversion from the resolved-
+            // config form to the cache-crate's runtime form happens here
+            // because `decdn-cache` deliberately doesn't depend on
+            // `decdn-common` (the dependency direction is `common -> cache`,
+            // and reversing it would be circular).
+            ResolvedOrigin::S3(s3_cfg) => Arc::new(
+                S3Origin::new(&s3_origin_config_from_resolved(s3_cfg))
+                    .await
+                    .with_context(|| {
+                        format!("failed to construct S3 origin client for cache.origins[{idx}]")
+                    })?,
+            ),
+        };
+        origins.push(backend);
+    }
     CacheEngine::open_full(
         &cfg.cache.cache_dir,
-        origin,
+        origins,
         cfg.cache.max_blob_size_mb,
         cfg.cache.pinned_hashes.clone(),
         cfg.cache.origin_retry,
@@ -755,18 +836,24 @@ fn s3_origin_config_from_resolved(cfg: &decdn_common::config::ResolvedS3Config) 
     }
 }
 
-/// Stable label for the resolved-origin variant, used in startup
-/// logs so operators can grep for `origin_kind=s3` without parsing
-/// the structured fields back out. Returns `"none"` when no origin
-/// is configured (rather than emitting an empty string) so the field
-/// is always present and machine-parseable.
-const fn origin_kind_label(origin: Option<&ResolvedOrigin>) -> &'static str {
-    match origin {
-        None => "none",
-        Some(ResolvedOrigin::Http { .. }) => "http",
-        Some(ResolvedOrigin::Fs { .. }) => "fs",
-        Some(ResolvedOrigin::S3(_)) => "s3",
+/// Stable comma-separated label for the resolved-origin chain, used
+/// in startup logs so operators can grep for `origin_kinds=http,s3`
+/// without parsing the structured fields back out. Returns `"none"`
+/// when the chain is empty (rather than emitting an empty string) so
+/// the field is always present and machine-parseable.
+fn origin_kinds_label(origins: &[ResolvedOrigin]) -> String {
+    if origins.is_empty() {
+        return "none".to_string();
     }
+    origins
+        .iter()
+        .map(|o| match o {
+            ResolvedOrigin::Http { .. } => "http",
+            ResolvedOrigin::Fs { .. } => "fs",
+            ResolvedOrigin::S3(_) => "s3",
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Which OS signal (or admin RPC call) triggered shutdown. Returned by
@@ -1068,6 +1155,10 @@ mod tests {
     /// `cargo nextest`) share the process and would race on shared
     /// `cache_dir` state inside `CacheEngine::open_full`.
     fn cfg_with_origin(origin: Option<ResolvedOrigin>) -> (tempfile::TempDir, ResolvedConfig) {
+        cfg_with_origins(origin.map(|o| vec![o]).unwrap_or_default())
+    }
+
+    fn cfg_with_origins(origins: Vec<ResolvedOrigin>) -> (tempfile::TempDir, ResolvedConfig) {
         use decdn_common::config::{
             ResolvedBlockchain, ResolvedGossip, ResolvedIdentity, ResolvedNetwork,
             ResolvedObservability, ResolvedPayment, ResolvedSecurity,
@@ -1095,7 +1186,7 @@ mod tests {
                 cache_dir,
                 cache_size_mb: 1024,
                 max_blob_size_mb: 128,
-                origin,
+                origins,
                 pinned_hashes: decdn_cache::PinnedHashes::empty(),
                 origin_retry: decdn_cache::RetryPolicy::default(),
                 user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),

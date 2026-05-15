@@ -6,13 +6,19 @@
 //! ADR 003 §Fee Routing on Disputed Closes apply equally off-chain (a node
 //! that retains a stale voucher just under-claims at settlement).
 //!
-//! State is kept in memory; persistence is wiring-layer concern (issue #406
-//! covers the keystore + persistence path). The contract-level open / close /
-//! dispute / settle calls are issue #327.
+//! In-memory state alone is insufficient: without persistence a node restart
+//! resets `last_nonce` to zero and a client can resubmit a previously-accepted
+//! voucher (issue #527). [`ChannelState::apply_voucher`] therefore requires a
+//! [`ChannelStateStore`] and writes the post-acceptance state durably before
+//! advancing in-memory fields or returning `Ok` — see
+//! [ADR 003 §Off-chain voucher state persistence](../../../adr/003-payments.md)
+//! and [`crate::store`]. The contract-level open / close / dispute / settle
+//! calls remain out of scope here and are tracked in #327.
 
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, U256};
 
+use crate::store::{ChannelStateStore, StoreError};
 use crate::voucher::{SignedVoucher, VoucherError};
 
 /// Identifier for a payment channel — the on-chain `channelId`, computed by
@@ -25,6 +31,15 @@ pub type ChannelId = B256;
 /// [`ChannelState::apply_voucher`] calls can enforce monotonicity. `deposit`
 /// is the on-chain escrowed amount — vouchers exceeding it are invalid
 /// because `closeChannel` would itself revert (ADR 003 invariant 1).
+///
+/// **Field invariant (#527):** the `last_*` fields MUST only be advanced
+/// through [`ChannelState::apply_voucher`] (the validated, persisted-commit
+/// path) or hydrated from a [`crate::ChannelStateStore`] (the trusted
+/// on-disk path). Direct field assignment from outside this crate bypasses
+/// the voucher-replay guard from ADR 003 §Off-chain voucher state
+/// persistence. The fields stay `pub` because the cross-crate hydration
+/// path (`decdn-node` reading `channels.redb`) legitimately needs
+/// struct-literal construction — but no other writer should exist.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelState {
     /// Channel identifier (matches the on-chain `channelId`).
@@ -69,7 +84,8 @@ impl ChannelState {
     }
 
     /// Validate `signed` against this channel's invariants and, on success,
-    /// advance the `last_*` fields.
+    /// durably persist the post-acceptance state via `store` before advancing
+    /// the in-memory `last_*` fields.
     ///
     /// Mirrors the on-chain `closeChannel` + `disputeChannel` checks:
     /// - signature recovers to `self.client`
@@ -80,15 +96,23 @@ impl ChannelState {
     /// - `voucher.bytes_delivered >= self.last_bytes_delivered`
     /// - `voucher.amount <= self.deposit`
     ///
-    /// On any check failure, state is left unchanged.
+    /// Ordering of side effects: every check above runs first; if all pass,
+    /// the candidate `last_*` tuple is sent to `store.record` and only on
+    /// `Ok` is in-memory state advanced. On any check failure — including
+    /// store failure — `self` is left unchanged. This makes `Ok(())` the
+    /// protocol-level commit point: `VoucherAck` MUST be sent (and further
+    /// bytes delivered) **only after, never before**, this method returns
+    /// `Ok` (ADR 003 §Off-chain voucher state persistence, issue #527).
     ///
     /// # Errors
     ///
-    /// See [`ChannelError`] for the full taxonomy.
+    /// See [`ChannelError`] for the full taxonomy. A persistent-store
+    /// failure surfaces as [`ChannelError::Store`].
     pub fn apply_voucher(
         &mut self,
         signed: &SignedVoucher,
         domain: &Eip712Domain,
+        store: &dyn ChannelStateStore,
     ) -> Result<(), ChannelError> {
         if signed.voucher.channel_id != self.channel_id {
             return Err(ChannelError::WrongChannel {
@@ -126,24 +150,39 @@ impl ChannelState {
                 got: signed.voucher.amount,
             });
         }
-        // Signature check is last — it's the most expensive (ecrecover).
+        // Signature check is last among the cheap-fail checks — it's the most
+        // expensive in-memory step (ecrecover).
         signed
             .verify_signer(self.client, domain)
             .map_err(ChannelError::Signature)?;
 
-        self.last_amount = signed.voucher.amount;
-        self.last_nonce = signed.voucher.nonce;
-        self.last_bytes_delivered = signed.voucher.bytes_delivered;
+        // INVARIANT (#527): clone after validation, record on the clone, swap
+        // on `Ok` only. Do NOT move the clone earlier — a `record` failure
+        // between a pre-validation clone and the swap below would persist a
+        // state we never accepted. Do NOT advance `*self = next` before the
+        // `?` either: that's the literal #527 replay window in code form.
+        let mut next = self.clone();
+        next.last_amount = signed.voucher.amount;
+        next.last_nonce = signed.voucher.nonce;
+        next.last_bytes_delivered = signed.voucher.bytes_delivered;
+        store.record(&next)?;
+        *self = next;
         Ok(())
     }
 }
 
 /// Failure modes for [`ChannelState::apply_voucher`].
 ///
-/// Each variant maps to an on-chain `closeChannel` / `disputeChannel` revert
-/// from ADR 003 §Fee Routing on Disputed Closes; off-chain we surface them
-/// before they cost gas.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+/// Each in-memory variant maps to an on-chain `closeChannel` /
+/// `disputeChannel` revert from ADR 003 §Fee Routing on Disputed Closes;
+/// off-chain we surface them before they cost gas. [`ChannelError::Store`]
+/// is the additional off-chain-only variant for persistent-store failures
+/// (issue #527).
+///
+/// `PartialEq`/`Eq` are intentionally not derived: [`StoreError::Io`] wraps
+/// `std::io::Error`, which is not `PartialEq`. Tests pattern-match on
+/// variants via the `matches!` macro instead of comparing for equality.
+#[derive(Debug, thiserror::Error)]
 pub enum ChannelError {
     /// `voucher.channel_id` does not match the channel this state tracks.
     /// Equivalent to attempting to apply a voucher signed for a different
@@ -172,21 +211,85 @@ pub enum ChannelError {
     /// Signature is malformed or signed by the wrong address.
     #[error(transparent)]
     Signature(#[from] VoucherError),
+    /// Persistent-store write (or fsync) failed; in-memory state is
+    /// unchanged. See [`StoreError`] for the underlying cause. This is
+    /// surfaced to the caller so the client retries instead of receiving a
+    /// `VoucherAck` for state that was never durably committed (#527,
+    /// ADR 003 §Off-chain voucher state persistence).
+    ///
+    /// PROTOCOL NOTE: this is the only `ChannelError` variant for which the
+    /// client SHOULD retry the same voucher unchanged. The validation
+    /// variants (`WrongChannel`, `NonceNotIncreasing`, `AmountDecreasing`,
+    /// `BytesDecreasing`, `AmountExceedsDeposit`, `WrongToken`, `Signature`)
+    /// mean the voucher is permanently invalid for this channel state and
+    /// retrying is a client bug. The cdn/client/v1 wire encoding (#317)
+    /// MUST distinguish the two cases — folding them together either causes
+    /// silent ack of unpersisted state (retry-on-validation-failure) or
+    /// hangs the channel (no-retry-on-`Store`).
+    #[error("channel state store failed: {0}")]
+    Store(#[from] StoreError),
 }
 
 #[cfg(test)]
 #[allow(clippy::similar_names)] // signer/signed pair up clearly here
 mod tests {
     use super::*;
+    use crate::store::{ChannelStateStore, MemoryChannelStateStore, StoreError};
     use crate::voucher::{Voucher, voucher_domain};
     use alloy::primitives::{address, b256};
     use alloy::signers::local::PrivateKeySigner;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// `ChannelStateStore` whose `record` always errors. Used to prove the
+    /// strict-durability invariant: `apply_voucher` MUST surface the store
+    /// failure as `ChannelError::Store(..)` and MUST NOT advance the
+    /// in-memory `last_*` fields. The record-call count is exposed so the
+    /// test can assert the failure-path is actually reached (and isn't
+    /// short-circuited by an earlier validation error).
+    struct FailingStore {
+        record_calls: AtomicUsize,
+    }
+
+    impl FailingStore {
+        fn new() -> Self {
+            Self {
+                record_calls: AtomicUsize::new(0),
+            }
+        }
+        fn record_calls(&self) -> usize {
+            self.record_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ChannelStateStore for FailingStore {
+        fn load_all(&self) -> Result<Vec<ChannelState>, StoreError> {
+            Ok(Vec::new())
+        }
+        fn record(&self, _state: &ChannelState) -> Result<(), StoreError> {
+            self.record_calls.fetch_add(1, Ordering::SeqCst);
+            Err(StoreError::Io(std::io::Error::other(
+                "simulated fsync failure",
+            )))
+        }
+        fn forget(&self, _channel_id: ChannelId) -> Result<(), StoreError> {
+            Ok(())
+        }
+    }
 
     const CHAIN_ID: u64 = 421_614;
     const VERIFYING: Address = address!("0000000000000000000000000000000000001234");
     const TOKEN: Address = address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
 
-    fn fixture() -> (PrivateKeySigner, ChannelState, Eip712Domain) {
+    /// Shared test fixture: a fresh keypair, an empty `ChannelState`, the
+    /// voucher EIP-712 domain, and an in-memory `ChannelStateStore`. Each
+    /// `apply_voucher` call site threads the store through; cross-test state
+    /// isolation comes from each test calling `fixture()` independently.
+    fn fixture() -> (
+        PrivateKeySigner,
+        ChannelState,
+        Eip712Domain,
+        MemoryChannelStateStore,
+    ) {
         let signer = PrivateKeySigner::random();
         let state = ChannelState::new(
             b256!("11223344556677889900aabbccddeeff00112233445566778899aabbccddeeff"),
@@ -195,7 +298,8 @@ mod tests {
             U256::from(10_000_000u64), // 10 USDC deposit
         );
         let domain = voucher_domain(CHAIN_ID, VERIFYING);
-        (signer, state, domain)
+        let store = MemoryChannelStateStore::new();
+        (signer, state, domain, store)
     }
 
     fn build(
@@ -221,10 +325,10 @@ mod tests {
 
     #[test]
     fn first_voucher_advances_state() -> anyhow::Result<()> {
-        let (signer, mut state, domain) = fixture();
+        let (signer, mut state, domain, store) = fixture();
         let signed = build(state.channel_id, 1_000, 1, 1_048_576, TOKEN).sign(&signer, &domain)?;
 
-        state.apply_voucher(&signed, &domain)?;
+        state.apply_voucher(&signed, &domain, &store)?;
         anyhow::ensure!(state.last_amount == U256::from(1_000u64));
         anyhow::ensure!(state.last_nonce == U256::from(1u64));
         anyhow::ensure!(state.last_bytes_delivered == U256::from(1_048_576u64));
@@ -233,11 +337,11 @@ mod tests {
 
     #[test]
     fn monotonic_progression_accepted() -> anyhow::Result<()> {
-        let (signer, mut state, domain) = fixture();
+        let (signer, mut state, domain, store) = fixture();
         for (amount, nonce, bytes) in [(1_000u64, 1u64, 1_048_576u64), (2_500, 2, 2_621_440)] {
             let signed =
                 build(state.channel_id, amount, nonce, bytes, TOKEN).sign(&signer, &domain)?;
-            state.apply_voucher(&signed, &domain)?;
+            state.apply_voucher(&signed, &domain, &store)?;
         }
         anyhow::ensure!(state.last_nonce == U256::from(2u64));
         Ok(())
@@ -245,9 +349,9 @@ mod tests {
 
     #[test]
     fn wrong_channel_id_rejected() -> anyhow::Result<()> {
-        let (signer, mut state, domain) = fixture();
+        let (signer, mut state, domain, store) = fixture();
         let signed = build(B256::ZERO, 1_000, 1, 1, TOKEN).sign(&signer, &domain)?;
-        let err = err_of(state.apply_voucher(&signed, &domain))?;
+        let err = err_of(state.apply_voucher(&signed, &domain, &store))?;
         anyhow::ensure!(matches!(err, ChannelError::WrongChannel { .. }), "{err:?}");
         anyhow::ensure!(state.last_nonce == U256::ZERO, "state must be unchanged");
         Ok(())
@@ -255,7 +359,7 @@ mod tests {
 
     #[test]
     fn wrong_token_rejected() -> anyhow::Result<()> {
-        let (signer, mut state, domain) = fixture();
+        let (signer, mut state, domain, store) = fixture();
         let signed = build(
             state.channel_id,
             1_000,
@@ -264,19 +368,19 @@ mod tests {
             address!("0000000000000000000000000000000000000000"),
         )
         .sign(&signer, &domain)?;
-        let err = err_of(state.apply_voucher(&signed, &domain))?;
+        let err = err_of(state.apply_voucher(&signed, &domain, &store))?;
         anyhow::ensure!(matches!(err, ChannelError::WrongToken { .. }), "{err:?}");
         Ok(())
     }
 
     #[test]
     fn equal_nonce_rejected() -> anyhow::Result<()> {
-        let (signer, mut state, domain) = fixture();
+        let (signer, mut state, domain, store) = fixture();
         let v1 = build(state.channel_id, 1_000, 1, 1, TOKEN).sign(&signer, &domain)?;
-        state.apply_voucher(&v1, &domain)?;
+        state.apply_voucher(&v1, &domain, &store)?;
 
         let v2 = build(state.channel_id, 2_000, 1, 2, TOKEN).sign(&signer, &domain)?;
-        let err = err_of(state.apply_voucher(&v2, &domain))?;
+        let err = err_of(state.apply_voucher(&v2, &domain, &store))?;
         anyhow::ensure!(
             matches!(err, ChannelError::NonceNotIncreasing { .. }),
             "{err:?}"
@@ -286,12 +390,12 @@ mod tests {
 
     #[test]
     fn lower_nonce_rejected() -> anyhow::Result<()> {
-        let (signer, mut state, domain) = fixture();
+        let (signer, mut state, domain, store) = fixture();
         let v1 = build(state.channel_id, 1_000, 5, 1, TOKEN).sign(&signer, &domain)?;
-        state.apply_voucher(&v1, &domain)?;
+        state.apply_voucher(&v1, &domain, &store)?;
 
         let v2 = build(state.channel_id, 2_000, 4, 2, TOKEN).sign(&signer, &domain)?;
-        let err = err_of(state.apply_voucher(&v2, &domain))?;
+        let err = err_of(state.apply_voucher(&v2, &domain, &store))?;
         anyhow::ensure!(
             matches!(err, ChannelError::NonceNotIncreasing { .. }),
             "{err:?}"
@@ -301,12 +405,12 @@ mod tests {
 
     #[test]
     fn amount_decrease_rejected() -> anyhow::Result<()> {
-        let (signer, mut state, domain) = fixture();
+        let (signer, mut state, domain, store) = fixture();
         let v1 = build(state.channel_id, 5_000, 1, 1, TOKEN).sign(&signer, &domain)?;
-        state.apply_voucher(&v1, &domain)?;
+        state.apply_voucher(&v1, &domain, &store)?;
 
         let v2 = build(state.channel_id, 4_000, 2, 2, TOKEN).sign(&signer, &domain)?;
-        let err = err_of(state.apply_voucher(&v2, &domain))?;
+        let err = err_of(state.apply_voucher(&v2, &domain, &store))?;
         anyhow::ensure!(
             matches!(err, ChannelError::AmountDecreasing { .. }),
             "{err:?}"
@@ -320,24 +424,24 @@ mod tests {
         // re-acks an earlier amount with a fresh nonce after a `VoucherAck`
         // got dropped (ADR 003 voucher format). The contract treats `amount`
         // as non-decreasing, not strictly increasing.
-        let (signer, mut state, domain) = fixture();
+        let (signer, mut state, domain, store) = fixture();
         let v1 = build(state.channel_id, 5_000, 1, 1, TOKEN).sign(&signer, &domain)?;
-        state.apply_voucher(&v1, &domain)?;
+        state.apply_voucher(&v1, &domain, &store)?;
 
         let v2 = build(state.channel_id, 5_000, 2, 2, TOKEN).sign(&signer, &domain)?;
-        state.apply_voucher(&v2, &domain)?;
+        state.apply_voucher(&v2, &domain, &store)?;
         anyhow::ensure!(state.last_nonce == U256::from(2u64));
         Ok(())
     }
 
     #[test]
     fn bytes_decrease_rejected() -> anyhow::Result<()> {
-        let (signer, mut state, domain) = fixture();
+        let (signer, mut state, domain, store) = fixture();
         let v1 = build(state.channel_id, 1_000, 1, 1_048_576, TOKEN).sign(&signer, &domain)?;
-        state.apply_voucher(&v1, &domain)?;
+        state.apply_voucher(&v1, &domain, &store)?;
 
         let v2 = build(state.channel_id, 2_000, 2, 524_288, TOKEN).sign(&signer, &domain)?;
-        let err = err_of(state.apply_voucher(&v2, &domain))?;
+        let err = err_of(state.apply_voucher(&v2, &domain, &store))?;
         anyhow::ensure!(
             matches!(err, ChannelError::BytesDecreasing { .. }),
             "{err:?}"
@@ -347,10 +451,10 @@ mod tests {
 
     #[test]
     fn amount_exceeds_deposit_rejected() -> anyhow::Result<()> {
-        let (signer, mut state, domain) = fixture();
+        let (signer, mut state, domain, store) = fixture();
         // deposit is 10_000_000 (10 USDC); attempt 11 USDC.
         let signed = build(state.channel_id, 11_000_000, 1, 1, TOKEN).sign(&signer, &domain)?;
-        let err = err_of(state.apply_voucher(&signed, &domain))?;
+        let err = err_of(state.apply_voucher(&signed, &domain, &store))?;
         anyhow::ensure!(
             matches!(err, ChannelError::AmountExceedsDeposit { .. }),
             "{err:?}"
@@ -360,11 +464,11 @@ mod tests {
 
     #[test]
     fn wrong_signer_rejected() -> anyhow::Result<()> {
-        let (_signer, mut state, domain) = fixture();
+        let (_signer, mut state, domain, store) = fixture();
         // Sign with an unrelated key.
         let interloper = PrivateKeySigner::random();
         let signed = build(state.channel_id, 1_000, 1, 1, TOKEN).sign(&interloper, &domain)?;
-        let err = err_of(state.apply_voucher(&signed, &domain))?;
+        let err = err_of(state.apply_voucher(&signed, &domain, &store))?;
         anyhow::ensure!(
             matches!(
                 err,
@@ -381,10 +485,10 @@ mod tests {
     /// the initial zero floor.
     #[test]
     fn rejected_voucher_does_not_advance_state() -> anyhow::Result<()> {
-        let (signer, mut state, domain) = fixture();
+        let (signer, mut state, domain, store) = fixture();
         let channel_id = state.channel_id;
         let v1 = build(channel_id, 5_000, 1, 1_000, TOKEN).sign(&signer, &domain)?;
-        state.apply_voucher(&v1, &domain)?;
+        state.apply_voucher(&v1, &domain, &store)?;
         let snapshot = state.clone();
         let interloper = PrivateKeySigner::random();
 
@@ -437,9 +541,88 @@ mod tests {
         ];
 
         for (voucher, reason) in &cases {
-            let _ = state.apply_voucher(voucher, &domain);
+            let _ = state.apply_voucher(voucher, &domain, &store);
             anyhow::ensure!(state == snapshot, "{reason} must not advance state");
         }
+        // And: the store row for this channel must still match the v1
+        // snapshot — validation checks short-circuit with `return Err(..)`
+        // before any `store.record` call (see channel.rs ordering at the
+        // top of `apply_voucher`), so a rejected voucher must never have
+        // written through. This is the issue #527 regression guard at the
+        // in-memory layer: any future rejection path that mistakenly
+        // persists state lands here.
+        let persisted = store.load_all()?;
+        anyhow::ensure!(persisted.len() == 1, "exactly one channel persisted");
+        let only = persisted
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("expected one persisted entry"))?;
+        anyhow::ensure!(
+            *only == snapshot,
+            "rejected voucher path must not overwrite stored channel state",
+        );
+        Ok(())
+    }
+
+    /// **Strict-durability regression (#527).** The protocol-level commit
+    /// point is `apply_voucher`'s `Ok(())` return. If `store.record` fails,
+    /// the in-memory `ChannelState` MUST NOT advance — otherwise a future
+    /// `VoucherAck` would acknowledge a voucher that was never durably
+    /// persisted. This test breaks if anyone reorders the
+    /// `store.record(&next)?` and `*self = next` lines, or moves the clone
+    /// earlier in a way that creates a window between validation and
+    /// commit.
+    #[test]
+    fn store_failure_leaves_in_memory_state_unchanged() -> anyhow::Result<()> {
+        let (signer, mut state, domain, _mem_store) = fixture();
+        let snapshot = state.clone();
+        let failing = FailingStore::new();
+
+        let signed = build(state.channel_id, 1_000, 1, 1_048_576, TOKEN).sign(&signer, &domain)?;
+        let err = state
+            .apply_voucher(&signed, &domain, &failing)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("store failure must surface to caller"))?;
+        anyhow::ensure!(
+            matches!(err, ChannelError::Store(_)),
+            "expected ChannelError::Store, got {err:?}",
+        );
+        anyhow::ensure!(
+            state == snapshot,
+            "in-memory state must NOT advance when store.record fails",
+        );
+        // The failure path must actually have been reached — a future
+        // refactor that, say, skipped `record` on some optimisation path
+        // would pass the equality check above for the wrong reason.
+        anyhow::ensure!(
+            failing.record_calls() == 1,
+            "expected exactly one `record` call, got {}",
+            failing.record_calls(),
+        );
+        Ok(())
+    }
+
+    /// Companion to the above: after a `record` failure, a subsequent
+    /// successful apply (against a real store) MUST still work — i.e. the
+    /// failure didn't poison the in-memory state for retries. This guards
+    /// against a refactor that, e.g., set a "dirty" flag on `self` before
+    /// the commit succeeded.
+    #[test]
+    fn store_failure_does_not_poison_subsequent_retries() -> anyhow::Result<()> {
+        let (signer, mut state, domain, store) = fixture();
+        let failing = FailingStore::new();
+        let signed = build(state.channel_id, 1_000, 1, 1_048_576, TOKEN).sign(&signer, &domain)?;
+
+        // First attempt: store fails, state unchanged.
+        let _err = state
+            .apply_voucher(&signed, &domain, &failing)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected store failure"))?;
+        anyhow::ensure!(state.last_nonce == U256::ZERO);
+
+        // Retry against a healthy store with the same voucher — must
+        // succeed and advance state normally.
+        state.apply_voucher(&signed, &domain, &store)?;
+        anyhow::ensure!(state.last_nonce == U256::from(1u64));
         Ok(())
     }
 }

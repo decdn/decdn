@@ -172,15 +172,24 @@ fn write_dry_run_human(w: &mut impl io::Write, hash: &str, resp: &EvictResponse)
         None => writeln!(w, "last_accessed=never")?,
     }
     // Origin egress-cost cue (#439). Distinct from omitting the line
-    // when the engine has no origin: operators evaluating disk-reclaim
+    // when the engine has no origins: operators evaluating disk-reclaim
     // potential against re-fetch cost want this signal explicitly,
     // not buried in "the field is missing because there's no origin
     // at all". `none` matches the JSON serialisation skip-condition
-    // semantically (`Option::is_none` is omitted in JSON, surfaced as
-    // `none` here).
-    match resp.preview.origin_kind {
-        Some(kind) => writeln!(w, "origin_kind={kind}")?,
-        None => writeln!(w, "origin_kind=none")?,
+    // semantically (`Vec::is_empty` is omitted in JSON, surfaced as
+    // `none` here). Multi-origin chains (#284) render as a
+    // comma-separated list in declared order.
+    if resp.preview.origin_kinds.is_empty() {
+        writeln!(w, "origin_kinds=none")?;
+    } else {
+        let joined = resp
+            .preview
+            .origin_kinds
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        writeln!(w, "origin_kinds={joined}")?;
     }
     Ok(())
 }
@@ -841,7 +850,7 @@ mod tests {
                 last_accessed_us_ago: Some(2_000_000), // 2s ago via format_age
                 pinned: true,
                 already_evicted: false,
-                origin_kind: Some(decdn_cache::OriginKind::Http),
+                origin_kinds: vec![decdn_cache::OriginKind::Http],
             },
         };
         let mut buf = Vec::<u8>::new();
@@ -861,8 +870,8 @@ mod tests {
             "expected formatted last_accessed, got: {s}"
         );
         assert!(
-            s.contains("origin_kind=http"),
-            "missing origin_kind (#439): {s}"
+            s.contains("origin_kinds=http"),
+            "missing origin_kinds (#439, #284): {s}"
         );
         Ok(())
     }
@@ -885,7 +894,7 @@ mod tests {
                 // Cache-only mode: no origin configured, so the
                 // dry-run reports `none` rather than omitting the
                 // line entirely (#439).
-                origin_kind: None,
+                origin_kinds: Vec::new(),
             },
         };
         let mut buf = Vec::<u8>::new();
@@ -896,12 +905,49 @@ mod tests {
             "expected not_stored sentinel, got: {s}"
         );
         assert!(
-            s.contains("origin_kind=none"),
-            "expected origin_kind=none sentinel for cache-only mode, got: {s}"
+            s.contains("origin_kinds=none"),
+            "expected origin_kinds=none sentinel for cache-only mode, got: {s}"
         );
         assert!(
             s.contains("last_accessed=never"),
             "expected never sentinel, got: {s}"
+        );
+        Ok(())
+    }
+
+    /// Multi-origin chain (#284): the dry-run preview surfaces every
+    /// configured backend kind, comma-separated in declared order, so
+    /// operators evaluating worst-case egress cost across a fallback
+    /// chain see the full chain length and composition rather than
+    /// only the primary's kind.
+    #[test]
+    fn write_dry_run_human_renders_multi_origin_kinds_in_declared_order() -> anyhow::Result<()> {
+        use decdn_common::admin::EvictPreview;
+        let resp = EvictResponse {
+            was_present: true,
+            dry_run: true,
+            preview: EvictPreview {
+                size_bytes: Some(512),
+                last_accessed_us_ago: Some(1_500_000),
+                pinned: false,
+                already_evicted: false,
+                origin_kinds: vec![
+                    decdn_cache::OriginKind::Http,
+                    decdn_cache::OriginKind::S3,
+                    decdn_cache::OriginKind::Filesystem,
+                ],
+            },
+        };
+        let mut buf = Vec::<u8>::new();
+        write_dry_run_human(&mut buf, "cafebabe", &resp)?;
+        let s = String::from_utf8(buf)?;
+        // Order is operator-controlled and load-bearing — assert the
+        // exact comma-separated sequence rather than just substring
+        // matches, so a regression that sorts or dedupes the list is
+        // caught here.
+        assert!(
+            s.contains("origin_kinds=http,s3,filesystem"),
+            "expected ordered comma-separated chain, got: {s}"
         );
         Ok(())
     }

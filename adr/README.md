@@ -148,7 +148,7 @@ pandoc --from=markdown+gfm_auto_identifiers \
   003-payments.md 010-multi-token.md 012-client.md 024-account-abstraction.md \
   026-gauge-boost-tokenomics.md 018-liquidity-strategy.md \
   014-on-chain-verification.md 008-reputation.md 011-content-takedown.md 028-slashing-appeals.md \
-  032-safety-reserve-appeals-contract.md 031-content-blacklist-appeals-contract.md \
+  032-safety-reserve-appeals-contract.md 031-content-blacklist-appeals-contract.md 030-node-region-self-attestation.md \
   009-governance.md 016-contract-interactions.md \
   019-node-onboarding.md \
   013-schema-evolution.md 017-privacy.md \
