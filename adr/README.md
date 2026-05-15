@@ -111,7 +111,6 @@ Dependencies:
 The `PATH` prefix below makes the build work even when your shell hasn't picked up npm's global bin directory:
 
 ```bash
-cd adr
 PATH="$(npm config get prefix)/bin:$PATH" \
 pandoc --from=markdown+gfm_auto_identifiers \
   --toc --toc-depth=2 \
@@ -132,7 +131,6 @@ The numeric build above is the canonical per-ADR reference. For a top-to-bottom 
 This build also strips *Alternatives Considered*, *Considered Alternatives*, *Open Questions*, *Future Work*, and *"Why not …"* sections at render time via [`_build/strip-meta-sections.lua`](_build/strip-meta-sections.lua), so the document reads as a single canonical design rather than a debate transcript. The source `.md` files keep those sections untouched, and the numeric `adrs.pdf` build above includes them for readers who want the full decision-record context. A short notice on the first page ([`_build/preface.md`](_build/preface.md)) tells readers what was omitted and where to find it.
 
 ```bash
-cd adr
 PATH="$(npm config get prefix)/bin:$PATH" \
 pandoc --from=markdown+gfm_auto_identifiers \
   --toc --toc-depth=2 \
@@ -143,21 +141,32 @@ pandoc --from=markdown+gfm_auto_identifiers \
   -V date="$(date +%Y-%m-%d)" \
   _build/preface.md \
   architecture.md \
+  _build/part-1-foundations.md \
   000-language.md 001-network.md 002-content-addressing.md 005-protocol.md \
+  _build/part-2-discovery.md \
   022-content-discovery.md 015-zero-rtt.md \
+  _build/part-3-payments.md \
   003-payments.md 010-multi-token.md 012-client.md 024-account-abstraction.md \
+  _build/part-4-tokenomics.md \
   026-gauge-boost-tokenomics.md 018-liquidity-strategy.md \
+  _build/part-5-verification.md \
   014-on-chain-verification.md 008-reputation.md 011-content-takedown.md 028-slashing-appeals.md \
   032-safety-reserve-appeals-contract.md 031-content-blacklist-appeals-contract.md 030-node-region-self-attestation.md \
+  _build/part-6-governance.md \
   009-governance.md 016-contract-interactions.md \
+  _build/part-7-operations.md \
   019-node-onboarding.md \
+  _build/part-8-supporting.md \
   013-schema-evolution.md 017-privacy.md \
+  _build/part-9-appendices.md \
   appendix-encrypted-content-publishing.md \
+  appendix-bundles.md \
   appendix-observability.md \
   appendix-peer-table-eviction.md \
   appendix-blob-cache-eviction.md \
   appendix-l2-deployment.md \
   appendix-poc-production-seams.md \
+  appendix-binaries.md \
   appendix-local-admin-http.md \
   appendix-operator-key-rotation.md \
   appendix-operator-upgrade-path.md \
