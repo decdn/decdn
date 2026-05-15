@@ -161,21 +161,24 @@ pub struct EvictPreview {
     /// (idempotent re-run, no log line appended).
     #[serde(default)]
     pub already_evicted: bool,
-    /// Origin backend the node would re-fetch from on a post-eviction
-    /// miss (#439). `None` when the engine has no origin configured
-    /// (cache-only mode). Operators running DMCA takedowns or LRU
-    /// sweeps use this to estimate origin egress cost — re-pulling
-    /// from a `Filesystem` origin is a local read; re-pulling from
-    /// `Http` may consume metered S3/R2/B2 bandwidth.
+    /// Ordered list of origin backends the node would consult on a
+    /// post-eviction miss (#439, #284). Empty when the engine has no
+    /// origin configured (cache-only mode); a single-element vec is
+    /// the pre-#284 common case. Operators running DMCA takedowns or
+    /// LRU sweeps use this to estimate worst-case origin egress cost
+    /// — re-pulling from a `Filesystem` origin is a local read;
+    /// re-pulling through a chain of `Http`/`S3` mirrors multiplies
+    /// the metered-bandwidth bill on a deep fallback.
     ///
-    /// `skip_serializing_if = "Option::is_none"` elides the field
-    /// entirely in cache-only mode (no origin configured), keeping the
-    /// JSON output minimal. Origin-mode responses always carry the
-    /// field, so any deserialiser using `deny_unknown_fields` and
-    /// pinned to a pre-#439 schema will still see a surface change in
-    /// that case — back-compat here only covers the cache-only path.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub origin_kind: Option<decdn_cache::OriginKind>,
+    /// `skip_serializing_if = "Vec::is_empty"` elides the field
+    /// entirely in cache-only mode, keeping the JSON output minimal.
+    /// Origin-mode responses always carry the field, so any
+    /// deserialiser using `deny_unknown_fields` pinned to a pre-#284
+    /// schema (which expected `origin_kind: Option<…>`) will see a
+    /// surface change — back-compat here only covers the cache-only
+    /// path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub origin_kinds: Vec<decdn_cache::OriginKind>,
 }
 
 /// Response body for `admin_v1_announce` (issue #280).

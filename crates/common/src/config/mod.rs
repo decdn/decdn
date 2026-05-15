@@ -454,11 +454,7 @@ fn resolve_cache(
          can saturate the cache on one fetch"
     );
 
-    let origin = file
-        .and_then(|c| c.origin.as_ref())
-        .map(resolve_origin)
-        .transpose()
-        .context("invalid cache.origin")?;
+    let origins = resolve_origins(file)?;
 
     let pinned_hashes = parse_pinned_hashes(file.and_then(|c| c.pinned_hashes.as_deref()))
         .context("invalid cache.pinned_hashes")?;
@@ -491,12 +487,117 @@ fn resolve_cache(
         cache_dir,
         cache_size_mb,
         max_blob_size_mb,
-        origin,
+        origins,
         pinned_hashes,
         origin_retry,
         user_agent,
         gc_interval_sec,
     })
+}
+
+/// Resolve and validate the cache origin section (#437, #284). Collapses
+/// the singular `[cache.origin]` table and the plural `[[cache.origins]]`
+/// array-of-tables into a single canonical [`Vec<ResolvedOrigin>`]:
+/// absent => `vec![]`, singular => one-element vec, plural => the
+/// resolved vec in operator-supplied order. The two wire forms are
+/// mutually exclusive — setting both at once is an operator mistake
+/// (each form names a distinct fallback policy) and the error message
+/// names both keys so the fix is unambiguous.
+///
+/// Empty `origins = []` is rejected rather than treated as "no
+/// pull-through" — an operator who wrote `origins = []` almost
+/// certainly meant to populate it later and forgot. Failing at config
+/// load surfaces the mistake before the first cache miss instead of
+/// silently degrading to `NoOrigin`.
+///
+/// Duplicate entries (same kind + identity key) are permitted with a
+/// `tracing::warn!` log. Two HTTP origins pointing at the same URL is
+/// legitimate for connection-pool sharding, but is more often a
+/// copy-paste mistake worth flagging in the startup log.
+fn resolve_origins(
+    file: Option<&types::CacheConfig>,
+) -> anyhow::Result<Vec<crate::config::ResolvedOrigin>> {
+    let Some(cache) = file else {
+        return Ok(Vec::new());
+    };
+
+    match (&cache.origin, &cache.origins) {
+        (Some(_), Some(_)) => Err(anyhow::anyhow!(
+            "cache.origin and cache.origins are mutually exclusive — \
+             use [cache.origin] for a single backend or [[cache.origins]] \
+             for an ordered fallback list, not both"
+        )),
+        (Some(single), None) => Ok(vec![
+            resolve_origin(single).context("invalid cache.origin")?,
+        ]),
+        (None, Some(list)) => {
+            anyhow::ensure!(
+                !list.is_empty(),
+                "cache.origins must contain at least one entry; \
+                 omit the key entirely for no pull-through"
+            );
+            let mut resolved = Vec::with_capacity(list.len());
+            for (idx, entry) in list.iter().enumerate() {
+                resolved.push(
+                    resolve_origin(entry)
+                        .with_context(|| format!("invalid cache.origins[{idx}]"))?,
+                );
+            }
+            warn_on_duplicate_origins(&resolved);
+            Ok(resolved)
+        }
+        (None, None) => Ok(Vec::new()),
+    }
+}
+
+/// Operator-visible identity key for a resolved origin — used solely to
+/// detect duplicates within a `[[cache.origins]]` array. Carries the
+/// fields that distinguish two backends at the operator level (URL for
+/// HTTP, filesystem path for fs, bucket+region+endpoint+prefix for S3).
+/// Credentials are deliberately excluded: rotating an access key on an
+/// otherwise-identical S3 backend should still count as a duplicate.
+fn origin_identity_key(origin: &crate::config::ResolvedOrigin) -> String {
+    use crate::config::ResolvedOrigin;
+    match origin {
+        ResolvedOrigin::Http { url, .. } => format!("http|{url}"),
+        ResolvedOrigin::Fs { path } => format!("fs|{}", path.display()),
+        ResolvedOrigin::S3(s3) => format!(
+            "s3|{}|{}|{}|{}",
+            s3.bucket,
+            s3.region,
+            s3.endpoint_url
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            s3.prefix,
+        ),
+    }
+}
+
+/// Emit a `tracing::warn!` for any `[[cache.origins]]` entry whose
+/// identity key matches an earlier entry. Two origins pointing at the
+/// same backend can be intentional (connection-pool sharding) but is
+/// usually a copy-paste mistake; warning at startup gives the operator
+/// a chance to notice before debugging a production "why is one origin
+/// being hit twice as often" puzzle. Not an error: ordering still
+/// determines fallback behaviour, and the engine handles duplicate
+/// backends without misbehaviour.
+fn warn_on_duplicate_origins(origins: &[crate::config::ResolvedOrigin]) {
+    let mut seen: std::collections::HashSet<String> =
+        std::collections::HashSet::with_capacity(origins.len());
+    for (idx, origin) in origins.iter().enumerate() {
+        let key = origin_identity_key(origin);
+        if !seen.insert(key.clone()) {
+            tracing::warn!(
+                origin_index = idx,
+                identity = %key,
+                "cache.origins[{idx}] duplicates an earlier entry — \
+                 the cache engine will dispatch the same backend twice \
+                 in the fallback chain (intentional for connection-pool \
+                 sharding, otherwise a likely copy-paste mistake)",
+            );
+        }
+    }
 }
 
 /// Resolve and validate a `[cache.origin]` table into the typed
@@ -1139,7 +1240,13 @@ fn expand_env(cfg: &mut FileConfig) -> anyhow::Result<()> {
     if let Some(c) = cfg.cache.as_mut() {
         expand_path(&mut c.cache_dir, "cache.cache_dir")?;
         if let Some(origin) = c.origin.as_mut() {
-            expand_origin(origin)?;
+            expand_origin(origin, "cache.origin")?;
+        }
+        if let Some(list) = c.origins.as_mut() {
+            for (idx, entry) in list.iter_mut().enumerate() {
+                let path_ctx = format!("cache.origins[{idx}]");
+                expand_origin(entry, &path_ctx)?;
+            }
         }
         expand_str(&mut c.user_agent, "cache.user_agent")?;
     }
@@ -1149,7 +1256,7 @@ fn expand_env(cfg: &mut FileConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn expand_str(field: &mut Option<String>, ctx: &'static str) -> anyhow::Result<()> {
+fn expand_str(field: &mut Option<String>, ctx: &str) -> anyhow::Result<()> {
     if let Some(s) = field.as_mut() {
         *s = expand_value(s, ctx)?;
     }
@@ -1159,22 +1266,25 @@ fn expand_str(field: &mut Option<String>, ctx: &'static str) -> anyhow::Result<(
 /// Walk an [`types::OriginConfig`] and run `${VAR}` / leading-`~`
 /// expansion on every URL and path field. Sibling of the per-section
 /// expansion blocks in [`expand_env`]; lifted out because the cache
-/// origin is a tagged enum with backend-specific shape.
-fn expand_origin(origin: &mut types::OriginConfig) -> anyhow::Result<()> {
+/// origin is a tagged enum with backend-specific shape. `prefix` names
+/// the TOML path of the containing table (`"cache.origin"` for the
+/// singular form, `"cache.origins[i]"` for the array form) so error
+/// messages carry the operator-visible field path.
+fn expand_origin(origin: &mut types::OriginConfig, prefix: &str) -> anyhow::Result<()> {
     match origin {
         types::OriginConfig::Http { url, .. } => {
-            *url = expand_value(url, "cache.origin.url")?;
+            *url = expand_value(url, &format!("{prefix}.url"))?;
         }
         types::OriginConfig::Fs { path } => {
             let as_str = path.to_string_lossy();
-            let expanded = expand_value(&as_str, "cache.origin.path")?;
+            let expanded = expand_value(&as_str, &format!("{prefix}.path"))?;
             *path = PathBuf::from(expanded);
         }
         types::OriginConfig::S3(s3) => {
-            s3.bucket = expand_value(&s3.bucket, "cache.origin.bucket")?;
-            s3.region = expand_value(&s3.region, "cache.origin.region")?;
-            expand_str(&mut s3.endpoint_url, "cache.origin.endpoint_url")?;
-            expand_str(&mut s3.prefix, "cache.origin.prefix")?;
+            s3.bucket = expand_value(&s3.bucket, &format!("{prefix}.bucket"))?;
+            s3.region = expand_value(&s3.region, &format!("{prefix}.region"))?;
+            expand_str(&mut s3.endpoint_url, &format!("{prefix}.endpoint_url"))?;
+            expand_str(&mut s3.prefix, &format!("{prefix}.prefix"))?;
             if let Some(creds) = s3.credentials.as_mut() {
                 match creds {
                     types::S3Credentials::Static {
@@ -1182,17 +1292,20 @@ fn expand_origin(origin: &mut types::OriginConfig) -> anyhow::Result<()> {
                         secret_access_key,
                         session_token,
                     } => {
-                        expand_secret(access_key_id, "cache.origin.credentials.access_key_id")?;
+                        expand_secret(
+                            access_key_id,
+                            &format!("{prefix}.credentials.access_key_id"),
+                        )?;
                         expand_secret(
                             secret_access_key,
-                            "cache.origin.credentials.secret_access_key",
+                            &format!("{prefix}.credentials.secret_access_key"),
                         )?;
                         if let Some(token) = session_token.as_mut() {
-                            expand_secret(token, "cache.origin.credentials.session_token")?;
+                            expand_secret(token, &format!("{prefix}.credentials.session_token"))?;
                         }
                     }
                     types::S3Credentials::DefaultChain { profile } => {
-                        expand_str(profile, "cache.origin.credentials.profile")?;
+                        expand_str(profile, &format!("{prefix}.credentials.profile"))?;
                     }
                 }
             }
@@ -1201,7 +1314,7 @@ fn expand_origin(origin: &mut types::OriginConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn expand_path(field: &mut Option<PathBuf>, ctx: &'static str) -> anyhow::Result<()> {
+fn expand_path(field: &mut Option<PathBuf>, ctx: &str) -> anyhow::Result<()> {
     if let Some(p) = field.as_mut() {
         let as_str = p.to_string_lossy();
         let expanded = expand_value(&as_str, ctx)?;
@@ -1221,13 +1334,13 @@ fn expand_path(field: &mut Option<PathBuf>, ctx: &'static str) -> anyhow::Result
 /// happens to precede the `${VAR}` marker (verified via the existing
 /// `expand_value` contract; see `expand_braces` in
 /// `crates/common/src/cli/common.rs`).
-fn expand_secret(field: &mut secret::SecretString, ctx: &'static str) -> anyhow::Result<()> {
+fn expand_secret(field: &mut secret::SecretString, ctx: &str) -> anyhow::Result<()> {
     let expanded = expand_value(field.expose(), ctx)?;
     *field = secret::SecretString::new(expanded);
     Ok(())
 }
 
-fn expand_value(raw: &str, ctx: &'static str) -> anyhow::Result<String> {
+fn expand_value(raw: &str, ctx: &str) -> anyhow::Result<String> {
     if !needs_expansion(raw) {
         return Ok(raw.to_string());
     }
@@ -1247,7 +1360,7 @@ fn needs_expansion(raw: &str) -> bool {
 /// left alone. Errors contextually if the home directory is not resolvable,
 /// rather than silently returning a literal `~` that downstream file I/O
 /// would later fail on with an unrelated error.
-fn expand_tilde_prefix(raw: &str, ctx: &'static str) -> anyhow::Result<String> {
+fn expand_tilde_prefix(raw: &str, ctx: &str) -> anyhow::Result<String> {
     if raw == "~" {
         let home = dirs::home_dir().ok_or_else(|| missing_home_err(ctx))?;
         return Ok(home.to_string_lossy().into_owned());
@@ -1266,7 +1379,7 @@ fn expand_tilde_prefix(raw: &str, ctx: &'static str) -> anyhow::Result<String> {
     Ok(raw.to_string())
 }
 
-fn missing_home_err(ctx: &'static str) -> anyhow::Error {
+fn missing_home_err(ctx: &str) -> anyhow::Error {
     anyhow::anyhow!("config field `{ctx}` uses `~` but home directory is not available")
 }
 
@@ -1275,7 +1388,7 @@ fn missing_home_err(ctx: &'static str) -> anyhow::Error {
 /// through verbatim. This is important for Windows paths like
 /// `C:\Users\${USER}\data`, where a shell-style escape interpreter would
 /// swallow the `\` before `$` and disable the substitution.
-fn expand_braces(raw: &str, ctx: &'static str) -> anyhow::Result<String> {
+fn expand_braces(raw: &str, ctx: &str) -> anyhow::Result<String> {
     let mut out = String::with_capacity(raw.len());
     let mut rest = raw;
     while let Some((before, after)) = rest.split_once("${") {
@@ -2127,7 +2240,7 @@ mod tests {
         let resolved = common::test_support::with_home_override(Some(&home), || {
             resolve_cache(&cli, Some(&toml), Path::new("/data-dir"))
         })?;
-        match resolved.origin {
+        match resolved.origins.into_iter().next() {
             Some(ResolvedOrigin::Fs { path }) => {
                 anyhow::ensure!(
                     path == home.join("origin"),
@@ -2194,6 +2307,223 @@ mod tests {
         Ok(())
     }
 
+    // -------------------------------------------------------------------
+    // Multi-origin fallback config validation (#284)
+    //
+    // The resolver collapses both wire forms — singular `[cache.origin]`
+    // and plural `[[cache.origins]]` — into a single canonical
+    // `Vec<ResolvedOrigin>` in `ResolvedCache`. These tests pin the
+    // invariants the chain-walk engine relies on: declared order is
+    // preserved, both forms cannot be set simultaneously, and an
+    // empty plural array fails fast rather than silently degrading
+    // to "no pull-through".
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn resolve_cache_accepts_array_of_origins_preserving_order() -> anyhow::Result<()> {
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig {
+            origins: Some(vec![
+                types::OriginConfig::Http {
+                    url: "https://primary.example/".to_string(),
+                    decompress: None,
+                },
+                types::OriginConfig::Fs {
+                    path: PathBuf::from("/var/lib/decdn/mirror"),
+                },
+            ]),
+            ..Default::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&toml), Path::new("/tmp"))?;
+        anyhow::ensure!(
+            resolved.origins.len() == 2,
+            "expected 2 origins, got {}",
+            resolved.origins.len()
+        );
+        // Order is operator-controlled and load-bearing — assert the
+        // first slot is the HTTP entry and the second is the Fs one,
+        // matching the TOML declaration order.
+        anyhow::ensure!(
+            matches!(
+                resolved.origins[0],
+                crate::config::ResolvedOrigin::Http { .. }
+            ),
+            "expected origins[0] to be Http, got {:?}",
+            resolved.origins[0]
+        );
+        anyhow::ensure!(
+            matches!(
+                resolved.origins[1],
+                crate::config::ResolvedOrigin::Fs { .. }
+            ),
+            "expected origins[1] to be Fs, got {:?}",
+            resolved.origins[1]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_rejects_both_origin_and_origins() -> anyhow::Result<()> {
+        // Each wire form names a different fallback policy. Setting
+        // both is an operator mistake the resolver must surface, not
+        // silently pick a winner.
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig {
+            origin: Some(types::OriginConfig::Http {
+                url: "https://one.example/".to_string(),
+                decompress: None,
+            }),
+            origins: Some(vec![types::OriginConfig::Http {
+                url: "https://two.example/".to_string(),
+                decompress: None,
+            }]),
+            ..Default::default()
+        };
+        let err = resolve_cache(&cli, Some(&toml), Path::new("/tmp"))
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected mutual-exclusion rejection"))?;
+        let msg = format!("{err:#}");
+        anyhow::ensure!(
+            msg.contains("cache.origin")
+                && msg.contains("cache.origins")
+                && msg.contains("mutually exclusive"),
+            "error lacked both keys and exclusivity marker: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_rejects_empty_origins_array() -> anyhow::Result<()> {
+        // `origins = []` is almost certainly a half-finished config
+        // edit (operator meant to populate it later). Reject at load
+        // so the surprise lands at startup, not at the first cache
+        // miss hours later.
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig {
+            origins: Some(Vec::new()),
+            ..Default::default()
+        };
+        let err = resolve_cache(&cli, Some(&toml), Path::new("/tmp"))
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected empty-array rejection"))?;
+        let msg = format!("{err:#}");
+        anyhow::ensure!(
+            msg.contains("cache.origins") && msg.contains("at least one entry"),
+            "error lacked the at-least-one-entry guidance: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_origin_singular_resolves_to_one_element_vec() -> anyhow::Result<()> {
+        // Back-compat: pre-#284 operators with a single `[cache.origin]`
+        // table must observe identical behaviour after the resolver
+        // collapses both wire forms into a vec. A length-1 vec is the
+        // canonical representation of the singular form.
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig {
+            origin: Some(types::OriginConfig::Http {
+                url: "https://only.example/".to_string(),
+                decompress: None,
+            }),
+            ..Default::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&toml), Path::new("/tmp"))?;
+        anyhow::ensure!(
+            resolved.origins.len() == 1,
+            "singular [cache.origin] must produce a 1-element vec, got len {}",
+            resolved.origins.len(),
+        );
+        anyhow::ensure!(
+            matches!(
+                resolved.origins[0],
+                crate::config::ResolvedOrigin::Http { .. }
+            ),
+            "expected the single origin to be Http"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_no_origin_resolves_to_empty_vec() -> anyhow::Result<()> {
+        // Back-compat: absent both `[cache.origin]` and `[[cache.origins]]`
+        // means "no pull-through configured". The resolver returns an
+        // empty vec; engine's `pull_through` short-circuits to NoOrigin.
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig::default();
+        let resolved = resolve_cache(&cli, Some(&toml), Path::new("/tmp"))?;
+        anyhow::ensure!(
+            resolved.origins.is_empty(),
+            "absent origin section must yield empty vec, got len {}",
+            resolved.origins.len(),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_accepts_duplicate_origins_without_erroring() -> anyhow::Result<()> {
+        // Duplicate entries are logged as `tracing::warn!` but must
+        // not fail config resolution — operators legitimately use
+        // duplicates for connection-pool sharding. Pinning the
+        // non-erroring contract here protects against a future PR
+        // promoting the warning to a hard error. (Tracing-event
+        // capture isn't asserted; that would require a new dev-dep
+        // for a single assertion. Code review of
+        // `warn_on_duplicate_origins` covers the log emission.)
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig {
+            origins: Some(vec![
+                types::OriginConfig::Http {
+                    url: "https://shared.example/".to_string(),
+                    decompress: None,
+                },
+                types::OriginConfig::Http {
+                    url: "https://shared.example/".to_string(),
+                    decompress: None,
+                },
+            ]),
+            ..Default::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&toml), Path::new("/tmp"))?;
+        anyhow::ensure!(
+            resolved.origins.len() == 2,
+            "duplicate origins must both survive into the resolved vec"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_origins_propagates_per_entry_error_with_index() -> anyhow::Result<()> {
+        // The second entry has an empty URL — the existing
+        // `resolve_origin` validator should reject it, and the wrapper
+        // must thread the `cache.origins[1]` index into the error
+        // context so an operator with three entries can identify which
+        // one is broken.
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig {
+            origins: Some(vec![
+                types::OriginConfig::Http {
+                    url: "https://good.example/".to_string(),
+                    decompress: None,
+                },
+                types::OriginConfig::Http {
+                    url: String::new(),
+                    decompress: None,
+                },
+            ]),
+            ..Default::default()
+        };
+        let err = resolve_cache(&cli, Some(&toml), Path::new("/tmp"))
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected per-entry validation rejection"))?;
+        let msg = format!("{err:#}");
+        anyhow::ensure!(
+            msg.contains("cache.origins[1]") && msg.contains("must not be empty"),
+            "error lacked the indexed context: {msg}"
+        );
+        Ok(())
+    }
+
     // resolve_cache must reject a non-http(s) URL at config resolution
     // instead of deferring the check to engine wiring. This locks in the
     // "single parser" invariant introduced by `parse_origin_url`.
@@ -2250,7 +2580,7 @@ mod tests {
             ..Default::default()
         };
         let resolved = resolve_cache(&cli, Some(&toml), std::path::Path::new("/tmp"))?;
-        let url = match resolved.origin {
+        let url = match resolved.origins.into_iter().next() {
             Some(ResolvedOrigin::Http { url, .. }) => url,
             other => anyhow::bail!("expected Http origin, got: {other:?}"),
         };
@@ -2291,7 +2621,7 @@ mod tests {
             ..Default::default()
         };
         let resolved = resolve_cache(&cli, Some(&toml), std::path::Path::new("/tmp"))?;
-        match resolved.origin {
+        match resolved.origins.into_iter().next() {
             Some(ResolvedOrigin::Fs { path }) => {
                 anyhow::ensure!(path == Path::new("/tmp/origin"), "path: {}", path.display());
             }
@@ -2516,8 +2846,8 @@ mod tests {
         let cli = cache_cli(None, None);
         let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
         anyhow::ensure!(
-            resolved.origin.is_none(),
-            "no [cache.origin] => no pull-through"
+            resolved.origins.is_empty(),
+            "no [cache.origin]/[[cache.origins]] => no pull-through"
         );
         anyhow::ensure!(resolved.pinned_hashes.is_empty());
         Ok(())
@@ -2688,7 +3018,7 @@ mod tests {
             ..types::CacheConfig::default()
         };
         let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
-        match resolved.origin {
+        match resolved.origins.into_iter().next() {
             Some(ResolvedOrigin::Http { decompress, .. }) => {
                 anyhow::ensure!(matches!(decompress, decdn_cache::DecompressMode::Strict));
             }
@@ -2708,7 +3038,7 @@ mod tests {
             ..types::CacheConfig::default()
         };
         let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
-        match resolved.origin {
+        match resolved.origins.into_iter().next() {
             Some(ResolvedOrigin::Http { decompress, .. }) => {
                 anyhow::ensure!(matches!(decompress, decdn_cache::DecompressMode::Auto));
             }
@@ -2758,7 +3088,7 @@ mod tests {
             credentials: None,
         });
         let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
-        match resolved.origin {
+        match resolved.origins.into_iter().next() {
             Some(ResolvedOrigin::S3(s3)) => {
                 anyhow::ensure!(s3.bucket == "decdn-blobs", "bucket: {}", s3.bucket);
                 anyhow::ensure!(s3.region == "us-east-1", "region: {}", s3.region);
@@ -2784,7 +3114,7 @@ mod tests {
         let mut s3 = s3_cfg("decdn-blobs");
         s3.prefix = Some("foo/bar/".to_string());
         let resolved = resolve_cache(&cli, Some(&cache_with_s3(s3)), Path::new("/tmp"))?;
-        match resolved.origin {
+        match resolved.origins.into_iter().next() {
             Some(ResolvedOrigin::S3(s3)) => {
                 anyhow::ensure!(s3.prefix == "foo/bar/", "prefix: {}", s3.prefix);
             }
@@ -2799,7 +3129,7 @@ mod tests {
         let mut s3 = s3_cfg("decdn-blobs");
         s3.prefix = Some(String::new());
         let resolved = resolve_cache(&cli, Some(&cache_with_s3(s3)), Path::new("/tmp"))?;
-        match resolved.origin {
+        match resolved.origins.into_iter().next() {
             Some(ResolvedOrigin::S3(s3)) => {
                 anyhow::ensure!(s3.prefix.is_empty(), "prefix should remain empty");
             }
@@ -2816,7 +3146,7 @@ mod tests {
             Some(&cache_with_s3(s3_cfg("decdn-blobs"))),
             Path::new("/tmp"),
         )?;
-        match resolved.origin {
+        match resolved.origins.into_iter().next() {
             Some(ResolvedOrigin::S3(s3)) => {
                 anyhow::ensure!(
                     !s3.path_style,
@@ -3133,7 +3463,7 @@ mod tests {
             }),
         });
         let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
-        let creds = match resolved.origin {
+        let creds = match resolved.origins.into_iter().next() {
             Some(ResolvedOrigin::S3(s3)) => s3
                 .credentials
                 .ok_or_else(|| anyhow::anyhow!("credentials missing"))?,
@@ -3173,7 +3503,7 @@ mod tests {
             credentials: Some(types::S3Credentials::DefaultChain { profile: None }),
         });
         let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
-        let creds = match resolved.origin {
+        let creds = match resolved.origins.into_iter().next() {
             Some(ResolvedOrigin::S3(s3)) => s3
                 .credentials
                 .ok_or_else(|| anyhow::anyhow!("credentials missing"))?,
@@ -3212,7 +3542,7 @@ mod tests {
             }),
         });
         let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
-        let creds = match resolved.origin {
+        let creds = match resolved.origins.into_iter().next() {
             Some(ResolvedOrigin::S3(s3)) => s3
                 .credentials
                 .ok_or_else(|| anyhow::anyhow!("credentials missing"))?,
@@ -3239,7 +3569,7 @@ mod tests {
         let cli = cache_cli(None, None);
         let file = cache_with_s3(s3_cfg("decdn-blobs"));
         let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
-        match resolved.origin {
+        match resolved.origins.into_iter().next() {
             Some(ResolvedOrigin::S3(s3)) => {
                 anyhow::ensure!(
                     s3.credentials.is_none(),
@@ -3490,7 +3820,7 @@ mod tests {
         let path = write_minimal_toml(&dir, &toml_body)?;
         let args = run_args_with_data_dir(dir.path());
         let resolved = resolve_config(Some(&path), &args)?;
-        match resolved.cache.origin {
+        match resolved.cache.origins.into_iter().next() {
             Some(ResolvedOrigin::S3(s3)) => {
                 anyhow::ensure!(s3.bucket == "decdn-blobs");
             }
