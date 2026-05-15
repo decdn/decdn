@@ -15,6 +15,19 @@ pub const MAX_PROVIDER_ATTEMPTS: usize = 3;
 /// Reputation floor in the score denominator (ADR 001).
 const REPUTATION_FLOOR: f32 = 0.1;
 
+/// Default minimum-reputation rejection floor (issue #441). At this value —
+/// and at any non-positive value, since reputation is domain `[0.0, 1.0]` —
+/// filtering is disabled: every candidate is ranked, preserving pre-#441
+/// semantics including the defensive negative-reputation clamp in
+/// `compute_score`.
+///
+/// This is distinct from `REPUTATION_FLOOR`: that only clamps the score
+/// *denominator* (capping the worst-case multiplier at 100×), whereas this is
+/// a hard pre-filter that removes sub-floor candidates outright so price and
+/// RTT can never override a poor reputation (ADR 001 §Node Selection
+/// Algorithm).
+pub const DEFAULT_MIN_REPUTATION: f32 = 0.0;
+
 /// Score-equivalence threshold for tie-break activation (ADR 001 — "scores
 /// within 1% of each other").
 const TIE_THRESHOLD: f64 = 0.01;
@@ -76,8 +89,53 @@ fn compute_score(rate_per_mb: u64, rtt_ms: u32, reputation: f32) -> f64 {
 /// fresh thread-local RNG; tests inside this module use the private
 /// `rank_candidates_with_rng` variant for determinism.
 pub fn rank_candidates(candidates: Vec<Candidate>) -> Vec<RankedCandidate> {
+    rank_candidates_with_floor(candidates, DEFAULT_MIN_REPUTATION)
+}
+
+/// Drop candidates whose reputation is below `min_reputation` (issue #441).
+///
+/// Applied *before* scoring so a cheap, low-latency node can never win on
+/// price when its reputation is below the client's floor. Any non-positive
+/// `min_reputation` (the default `0.0` ([`DEFAULT_MIN_REPUTATION`]), or an
+/// out-of-domain negative) disables filtering entirely — no candidate is
+/// removed, preserving pre-#441 ranking semantics including the defensive
+/// negative-reputation clamp in [`compute_score`]. The boundary is inclusive
+/// (`reputation >= min_reputation`): a node exactly at the floor is kept. With
+/// an active floor the comparison alone decides membership, so a `NaN`
+/// reputation is rejected (any `NaN` comparison is false) while `+∞` would be
+/// kept; symmetrically a `NaN` *floor* is fail-closed (drops every
+/// candidate). Non-finite values cannot reach this from config today —
+/// per-client wiring is deferred (issue #441).
+fn apply_reputation_floor(candidates: Vec<Candidate>, min_reputation: f32) -> Vec<Candidate> {
+    if min_reputation <= 0.0 {
+        return candidates;
+    }
+    candidates
+        .into_iter()
+        .filter(|c| c.reputation >= min_reputation)
+        .collect()
+}
+
+/// [`rank_candidates`] with a configurable minimum-reputation rejection floor
+/// (issue #441). Candidates below `min_reputation` are removed before ranking;
+/// `0.0` disables the floor. See `apply_reputation_floor` for the exact
+/// boundary semantics.
+pub fn rank_candidates_with_floor(
+    candidates: Vec<Candidate>,
+    min_reputation: f32,
+) -> Vec<RankedCandidate> {
     let mut rng = rand::rng();
-    rank_candidates_with_rng(candidates, &mut rng)
+    rank_candidates_with_floor_and_rng(candidates, min_reputation, &mut rng)
+}
+
+/// Floor-filtering variant taking an explicit RNG. Internal — used by tests
+/// for deterministic random tie-breaking on the surviving candidates.
+fn rank_candidates_with_floor_and_rng(
+    candidates: Vec<Candidate>,
+    min_reputation: f32,
+    rng: &mut impl rand::Rng,
+) -> Vec<RankedCandidate> {
+    rank_candidates_with_rng(apply_reputation_floor(candidates, min_reputation), rng)
 }
 
 /// Variant of [`rank_candidates`] taking an explicit RNG. Internal — used by
@@ -292,7 +350,19 @@ fn compare_load(a: LoadHint, b: LoadHint) -> core::cmp::Ordering {
 /// For the standard fetch path use `n = MAX_PROVIDER_ATTEMPTS`. The function
 /// returns fewer than `n` results when the candidate pool is smaller.
 pub fn top_n(candidates: Vec<Candidate>, n: usize) -> Vec<RankedCandidate> {
-    let mut ranked = rank_candidates(candidates);
+    top_n_with_floor(candidates, n, DEFAULT_MIN_REPUTATION)
+}
+
+/// [`top_n`] with a configurable minimum-reputation rejection floor (issue
+/// #441). The floor is applied first, then the survivors are ranked and
+/// truncated to `n` — so `n` bounds the *reputable* result set, not the raw
+/// candidate pool.
+pub fn top_n_with_floor(
+    candidates: Vec<Candidate>,
+    n: usize,
+    min_reputation: f32,
+) -> Vec<RankedCandidate> {
+    let mut ranked = rank_candidates_with_floor(candidates, min_reputation);
     ranked.truncate(n);
     ranked
 }
@@ -764,5 +834,158 @@ mod tests {
             saw_g2_us_after_g1_us,
             "geo tier should reset between tie groups; without reset, group 2 would never pick US first after group 1 picked US"
         );
+    }
+
+    // --- Minimum-reputation rejection floor (issue #441) ---
+
+    #[test]
+    fn floor_drops_cheapest_subfloor_node() {
+        // `bad` has the lowest raw score by far (rate 1, rtt 1) but a poor
+        // reputation; `good` is expensive/slow but reputable. Without a floor
+        // `bad` wins on price; with a 0.5 floor it must be rejected outright.
+        let bad = make_candidate(1, 1, 1, 0.1);
+        let good = make_candidate(2, 100, 10, 0.9);
+
+        let unfiltered = rank_candidates(vec![bad.clone(), good.clone()]);
+        assert_eq!(
+            unfiltered.first().map(|r| r.candidate.node_id[0]),
+            Some(1),
+            "without a floor the cheap low-rep node wins"
+        );
+
+        let filtered = rank_candidates_with_floor(vec![bad, good], 0.5);
+        let ids: Vec<u8> = filtered.iter().map(|r| r.candidate.node_id[0]).collect();
+        assert_eq!(ids, vec![2], "sub-floor node must be dropped entirely");
+    }
+
+    #[test]
+    fn default_rank_candidates_preserves_negative_reputation() {
+        // Default path (DEFAULT_MIN_REPUTATION == 0.0) disables filtering, so
+        // the pre-#441 defensive negative-reputation clamp behavior is intact:
+        // the candidate is still ranked, not dropped.
+        assert_eq!(DEFAULT_MIN_REPUTATION, 0.0);
+        let neg = make_candidate(1, 100, 10, -0.5);
+        let out = rank_candidates(vec![neg]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(1));
+    }
+
+    #[test]
+    fn floor_boundary_is_inclusive() {
+        // reputation exactly at the floor is kept (>=).
+        let at = make_candidate(1, 100, 10, 0.5);
+        let out = rank_candidates_with_floor(vec![at], 0.5);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(1));
+    }
+
+    #[test]
+    fn floor_drops_just_below() {
+        let below = make_candidate(1, 100, 10, 0.49);
+        let out = rank_candidates_with_floor(vec![below], 0.5);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn floor_all_below_returns_empty() {
+        let a = make_candidate(1, 100, 10, 0.1);
+        let b = make_candidate(2, 100, 10, 0.2);
+        assert!(rank_candidates_with_floor(vec![a.clone(), b.clone()], 0.5).is_empty());
+        assert!(top_n_with_floor(vec![a, b], MAX_PROVIDER_ATTEMPTS, 0.5).is_empty());
+    }
+
+    #[test]
+    fn floor_rejects_nan_reputation() {
+        // A NaN reputation is unusable; an active floor must reject it
+        // (NaN >= x is false).
+        let nan_rep = make_candidate(1, 100, 10, f32::NAN);
+        let out = rank_candidates_with_floor(vec![nan_rep], 0.5);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn top_n_with_floor_truncates_after_filtering() {
+        // Five reputable candidates plus two sub-floor ones; n = 3 must yield
+        // exactly the three lowest-score reputable candidates. Rates double
+        // each step so scores are >1% apart — no within-tie random reordering,
+        // making the survivor order deterministic.
+        let mut cs: Vec<Candidate> = (0..5)
+            .map(|i| make_candidate(i, 100u64 << i, 10, 0.9))
+            .collect();
+        cs.push(make_candidate(10, 1, 1, 0.1));
+        cs.push(make_candidate(11, 2, 1, 0.2));
+        let out = top_n_with_floor(cs, 3, 0.5);
+        let ids: Vec<u8> = out.iter().map(|r| r.candidate.node_id[0]).collect();
+        assert_eq!(ids, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn floor_preserves_survivor_ordering() {
+        // Among survivors the usual ascending-score order still holds.
+        let cheap = make_candidate(1, 1, 10, 0.9); // score ~12.3
+        let mid = make_candidate(2, 10, 10, 0.9); // score ~123
+        let subfloor = make_candidate(3, 1, 1, 0.1); // cheapest raw, dropped
+        let out = rank_candidates_with_floor(vec![mid, subfloor, cheap], 0.5);
+        let ids: Vec<u8> = out.iter().map(|r| r.candidate.node_id[0]).collect();
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn negative_floor_disables_filtering_like_zero() {
+        // Pins the `min_reputation <= 0.0` disable branch for the negative
+        // case: an out-of-domain negative floor must behave exactly like the
+        // `0.0` default (no filtering), so even a sub-zero-reputation
+        // candidate is retained — identical to the active-floor case dropping
+        // it. Guards against a future `== 0.0` / `< 0.0` guard regression.
+        let poor = make_candidate(1, 100, 10, -0.5);
+        let good = make_candidate(2, 100, 10, 0.9);
+
+        let disabled = rank_candidates_with_floor(vec![poor.clone(), good.clone()], -0.5);
+        let mut ids: Vec<u8> = disabled.iter().map(|r| r.candidate.node_id[0]).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2], "negative floor must keep every candidate");
+
+        let active = rank_candidates_with_floor(vec![poor, good], 0.5);
+        let ids: Vec<u8> = active.iter().map(|r| r.candidate.node_id[0]).collect();
+        assert_eq!(
+            ids,
+            vec![2],
+            "an active floor still drops the sub-floor node"
+        );
+    }
+
+    #[test]
+    fn floor_then_tiebreak_runs_deterministically() {
+        // Covers `rank_candidates_with_floor_and_rng` directly and the
+        // floor↔tie-break interaction: after the sub-floor node is removed,
+        // two fully score-tied survivors must still flow through the four-tier
+        // breaker. They differ only by load, so the load tier decides
+        // deterministically (independent of the RNG seed) — the lower-load
+        // node ranks first and the sub-floor node is absent, for every seed.
+        let busy = with_load(make_candidate(1, 100, 10, 0.9), 0, 90);
+        let idle = with_load(make_candidate(2, 100, 10, 0.9), 0, 10);
+        let subfloor = make_candidate(3, 1, 1, 0.1); // cheapest raw, below floor
+        for seed in 0u64..8 {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            let out = rank_candidates_with_floor_and_rng(
+                vec![busy.clone(), subfloor.clone(), idle.clone()],
+                0.5,
+                &mut rng,
+            );
+            let ids: Vec<u8> = out.iter().map(|r| r.candidate.node_id[0]).collect();
+            assert_eq!(
+                ids,
+                vec![2, 1],
+                "seed {seed}: floor drops #3, load tier orders #2<#1"
+            );
+        }
+    }
+
+    #[test]
+    fn floor_above_domain_rejects_all() {
+        // Documented contract: a floor above the [0.0, 1.0] reputation domain
+        // rejects every candidate, including a perfectly-reputable one.
+        let perfect = make_candidate(1, 100, 10, 1.0);
+        assert!(rank_candidates_with_floor(vec![perfect], 1.5).is_empty());
     }
 }

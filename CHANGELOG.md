@@ -91,6 +91,10 @@ since project inception and will roll into the first tagged release.
 - `cdn/probe/v1` ALPN with ADR-013 varint framing and `ProbeMessage`
   request/response (#225).
 - Compile-time guardrail on `MAX_MESSAGE_SIZE = 16 MiB` per ADR 013 (#287).
+- Configurable minimum-reputation rejection floor for node selection:
+  `rank_candidates_with_floor` / `top_n_with_floor` drop sub-floor
+  candidates before scoring so price/RTT cannot override a poor
+  reputation (#441, ADR 001). Default `0.0` keeps prior behavior.
 
 #### Cache
 
