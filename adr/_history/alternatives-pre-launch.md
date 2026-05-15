@@ -253,3 +253,21 @@ Source: [Appendix: Peer Table Eviction Policy](../appendix-peer-table-eviction.m
 - **Persisting the peer table across restarts.** Rejected. Restart cost is < one announce interval (~60 s) of cold gossip; durability machinery is not justified.
 - **Eviction by `announce.timestamp_us` rather than `last_seen_us`.** Rejected. Couples eviction to peer wall-clock instead of receiver wall-clock; creates surprises when peer clocks drift within the ±60 s skew window. The existing implementation correctly uses `last_seen_us`.
 - **Shorter TTL aligned to a single announce interval (60 s).** Rejected. Below 2× announce interval a single dropped announce evicts a healthy peer; PlumTree gossip is best-effort, so single drops occur.
+
+---
+
+## ADR 003 — Probe-Fishing Rate-Limit Alternatives
+
+Source: [ADR 003 § Attack Vectors → Probe fishing](../003-payments.md#probe-fishing). The chosen mitigation — the layered per-peer / per-IP / global token-bucket rate limit applied before any signature or hold-slot allocation ([ADR 005 § Probe rate limiting](../005-protocol.md#probe-rate-limiting)) — is documented inline in ADR 003. The rejected alternatives:
+
+- **Option B — Require an open channel to probe.** Rejected. Creates a bootstrap catch-22: clients need probe results (rate, latency) to choose a node before opening a channel, but this requires a channel before probing. Since probes happen before channel opens (see [ADR 005](../005-protocol.md) probe flow), requiring a channel is architecturally incompatible with the protocol sequence. Probes are unauthenticated and free — ADR 005 states "`ProbeRequest` requires no authentication."
+- **Option C — Proof-of-work on probe requests.** Rejected for two reasons: (a) probe latency is part of the unified node-selection score ([ADR 001 § Node Selection Algorithm](../001-network.md#node-selection-algorithm)), so mandatory hashing on every probe degrades the selection signal the probe was meant to provide; (b) PoW is bypassable by an attacker with cheaper compute than the honest client (cloud GPU vs mobile CPU), inverting the intended cost asymmetry.
+- **Option D — Accept the risk and monitor only.** Rejected. A probe response is a 200-byte signed message; per-probe cost is dominated by the EIP-712 signature (~1 ms CPU on a typical node). At scale a Sybil attacker can saturate the signing path and exhaust the hold budget. Monitoring without enforcement is insufficient — the locked mechanism is enforced rate limiting per [ADR 005 § Probe rate limiting](../005-protocol.md#probe-rate-limiting).
+
+---
+
+## ADR 018 — Balancer V2 vs V3 (pre-merge migration)
+
+Source: [ADR 018 — Liquidity Strategy](../018-liquidity-strategy.md). The canonical decision (Balancer **V3** 80/20 weighted POL, with the affirmative V3 security justification in ADR 018 § Consequences) is documented inline. The rejected alternative:
+
+- **Balancer V2.** An earlier draft targeted Balancer V2. Rejected before merge after the 2025-11-03 V2 Composable Stable Pool exploit (~$125M, per Certora / Trail of Bits / OpenZeppelin post-mortems) demonstrated a latent V2 codebase risk not present in V3's new Vault architecture. The core 80/20 weighted-POL decision (USDC efficiency, IL alignment, zero-keeper posture) is a property of weighted pools in general and is not version-specific.

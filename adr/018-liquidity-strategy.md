@@ -24,7 +24,7 @@ The treasury holds the 100M TOKEN POL allocation per [ADR 026 §1](026-gauge-boo
 
 This reverses the implicit Uniswap V3 choice in prior ADRs.
 
-> **V2 vs V3 note.** An earlier draft of this ADR targeted Balancer V2. It was migrated to V3 before merge after the 2025-11-03 V2 Composable Stable Pool exploit (~$125M, per Certora / Trail of Bits / OpenZeppelin post-mortems) demonstrated a latent V2 codebase risk not present in V3's new Vault architecture. See the security section in Consequences for the affirmative justification. The core 80/20 weighted POL decision (USDC efficiency, IL alignment, zero-keeper posture) is a property of weighted pools in general and is not version-specific.
+> deCDN uses Balancer **V3** for its new Vault architecture; the affirmative security justification is in [§ Consequences](#consequences). The rejected Balancer V2 alternative and the 2025-11-03 V2 exploit that motivated rejecting it are recorded in [`_history/alternatives-pre-launch.md` § ADR 018 — Balancer V2 vs V3](_history/alternatives-pre-launch.md#adr-018--balancer-v2-vs-v3-pre-merge-migration). The 80/20 weighted-POL decision is a property of weighted pools generally and is not version-specific.
 
 ### Venue: Balancer V3 weighted pool vs Uniswap V3 concentrated
 

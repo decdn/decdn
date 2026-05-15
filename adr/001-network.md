@@ -173,7 +173,7 @@ The strict rate limits (Section 11 of [ADR 008](008-reputation.md)) keep reputat
 | ≤200 nodes | <10 MB/node/hr (~22 Kbps) | No action needed |
 | 200–500 nodes | ~25 MB/node/hr (~56 Kbps) | Monitor bandwidth metrics; consider increasing interval to 120s if constrained |
 | 500–1,000 nodes | ~50 MB/node/hr (~111 Kbps) | Evaluate selective gossip (regional-only subscription for non-global nodes) |
-| >1,000 nodes | Scales linearly (~50 KB/node/hr per additional node) | Structured overlay (DHT) or gossip partitioning required — see [Future Work](#future-work-scaling-content-discovery-resolved-by-adr-022) |
+| >1,000 nodes | Scales linearly (~50 KB/node/hr per additional node) | Structured overlay (DHT) or gossip partitioning required — see [ADR 022](022-content-discovery.md) |
 
 **PoC (tens of nodes) is well within safe bounds.** At 30 nodes with a 60-second interval, gossip consumes ~3 Kbps per node — negligible. This analysis is a production planning exercise; the PoC validates the bandwidth model empirically.
 
