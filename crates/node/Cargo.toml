@@ -65,6 +65,12 @@ tempfile = { workspace = true }
 # otherwise force us to use `libc::raise` directly.
 nix = { version = "0.31", default-features = false, features = ["signal"] }
 wiremock = { workspace = true }
+# The SIGHUP integration tests assert on the "ignoring change to X
+# (requires restart)" diff lines, which are only observable as `tracing`
+# events. `tracing-subscriber` is a normal dependency of the crate but
+# integration tests link only the public API + dev-dependencies, so it
+# must be repeated here to install a buffer-capturing subscriber.
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true
