@@ -26,6 +26,7 @@ use tokio::task::JoinSet;
 use decdn_gossip::{GossipMetrics, GossipRuntimeConfig, GossipService, PeerTable};
 
 use crate::admin;
+use crate::channel_store::PersistentChannelStateStore;
 use crate::dispatch::ConnectionLimiter;
 use crate::handlers::limited::LimitedHandler;
 use crate::handlers::probe::ProbeHandler;
@@ -33,6 +34,7 @@ use crate::metrics;
 use alloy::signers::local::PrivateKeySigner;
 use decdn_common::config::ResolvedConfig;
 use decdn_common::identity;
+use decdn_incentive::ChannelStateStore;
 use decdn_incentive::eth_identity::{self, PasswordSource};
 
 /// Ceiling on how long we wait for spawned tasks to drain after the endpoint
@@ -194,6 +196,43 @@ pub async fn run(
     let eth_signer = Arc::new(load_eth_signer(&cfg).await?);
     tracing::info!(address = %eth_signer.address(), "loaded eth keystore");
 
+    // Open the off-chain voucher-state store (issue #527, ADR 003
+    // §Off-chain voucher state persistence) before any handler that could
+    // accept a voucher comes online. `PersistentChannelStateStore::open`
+    // performs disk I/O (file create + mode tighten + redb header read), so
+    // run it on a blocking thread to avoid stalling the tokio runtime.
+    // Failure here MUST abort startup: continuing with a fresh in-memory
+    // map silently reopens the replay window the store exists to close.
+    let channel_store_data_dir = cfg.identity.data_dir.clone();
+    let channel_state_store: Arc<dyn ChannelStateStore> = Arc::new(
+        tokio::task::spawn_blocking(move || {
+            PersistentChannelStateStore::open(&channel_store_data_dir)
+        })
+        .await
+        .context("channel state store open task panicked")?
+        .context("failed to open channel state store (issue #527 voucher replay guard)")?,
+    );
+    // Boot-time smoke test: read every persisted record so startup fails
+    // fast on corruption / forward-incompatible schema even before the
+    // future cdn/client/v1 handler (#317) is constructed. The handler will
+    // call `load_all` again to bootstrap its in-memory channel map — that
+    // duplicate read is by design; the runtime cannot keep the snapshot
+    // because no consumer exists yet, and threading a pre-built map
+    // through `Router::builder` would couple the runtime to the (still
+    // unwritten) handler signature. Cost: one extra `load_all` on startup.
+    let persisted_count = tokio::task::spawn_blocking({
+        let store = Arc::clone(&channel_state_store);
+        move || store.load_all()
+    })
+    .await
+    .context("channel state store load task panicked")?
+    .context("failed to hydrate persisted channel state")?
+    .len();
+    tracing::info!(
+        channels = persisted_count,
+        "channel state store ready (issue #527 replay guard active)",
+    );
+
     let cache = build_cache(&cfg, Arc::clone(&node_metrics)).await?;
     // Attach the cache to the reload state so SIGHUP handlers can swap
     // the pinned-hashes set atomically (#276). Done immediately after
@@ -250,6 +289,29 @@ pub async fn run(
     // gates the probe ALPN. Without the wrapper, a connection flood on
     // `iroh-gossip/0` bypasses the global semaphore entirely (#433): the
     // per-task resource ceiling holds for probe but not network-wide.
+    //
+    // TODO(#317): when the `cdn/client/v1` paid delivery handler is
+    // implemented, wire it up here. Required steps:
+    //
+    //   1. Construct it with `Arc::clone(&channel_state_store)`.
+    //   2. In the handler's constructor, call
+    //      `channel_state_store.load_all()` to bootstrap an in-memory
+    //      `HashMap<ChannelId, ChannelState>` (or per-channel mutex map).
+    //      An absent entry == never-seen channel (ADR 003 §Off-chain
+    //      voucher state persistence).
+    //   3. Every voucher-acceptance path MUST call
+    //      `ChannelState::apply_voucher(..., &*channel_state_store)`. Do
+    //      NOT build a fresh `ChannelState::new` on the request path
+    //      without consulting the in-memory map first — that's the
+    //      issue #527 replay window.
+    //   4. Treat `ChannelError::Store(_)` as transient (client SHOULD
+    //      retry the same voucher); treat every other `ChannelError`
+    //      variant as a permanent rejection.
+    //
+    // The runtime intentionally does NOT pre-build the in-memory map: the
+    // handler's data structures aren't fixed yet, and coupling the
+    // runtime to a not-yet-written handler signature would block #317
+    // unnecessarily.
     let router = Router::builder(ep.clone())
         .accept(ProbeHandler::ALPN, probe_handler)
         .accept(

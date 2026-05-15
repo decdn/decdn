@@ -179,6 +179,11 @@ http-body-util = "0.1"
 # Admin JSON-RPC surface (ADR 025)
 jsonrpsee = { version = "0.26", features = ["server", "http-client", "macros"] }
 
+# Embedded persistent KV (used by `node` to fence voucher replay across
+# restarts — issue #527 / ADR 003 §Off-chain voucher state persistence).
+# Pure-Rust, ACID, single-file, fsync on commit via `Durability::Immediate`.
+redb = "4"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_debug_implementations = "warn"

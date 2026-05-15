@@ -51,6 +51,7 @@ reqwest = { workspace = true }
 url = { workspace = true }
 governor = { workspace = true }
 arc-swap = { workspace = true }
+redb = { workspace = true }
 opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
