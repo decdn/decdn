@@ -197,6 +197,16 @@ A subset of these metrics is sourced from on-chain contract state (`FeeRouter`, 
 | `decdn_ve_lock_rate` | Gauge | R | — | Derived (`TOKEN.balanceOf(address(VotingEscrow)) / TOKEN.totalSupply()`) | Governance dashboard, adaptive-feedback heuristic input | Fraction of TOKEN supply currently locked in `VotingEscrow`, in `[0, 1]`. The canonical numerator is the underlying TOKEN balance held by the escrow contract — i.e. `TOKEN.balanceOf(address(VotingEscrow))` — **not** the time-weighted ve-supply from `VotingEscrow.totalSupply()` / `totalSupplyAt(...)`. Any consumer of this metric (governance dashboards, automated controllers) MUST key off this same underlying-locked definition; ve-supply has different units. |
 | `decdn_ve_lock_duration_median_seconds` | Gauge | R | — | `VotingEscrow` per-lock checkpoint scan (RPC) | Governance dashboard, ve-economy health view | Median remaining lock duration across all live locks, in seconds. Distribution-shape signal complementing the aggregate `decdn_ve_total_supply` and `decdn_ve_lock_rate`. |
 
+#### 2.11 DHT / Content-Discovery Metrics
+
+Per [ADR 022](022-content-discovery.md) (`cdn/dht/v1`). DHT STORE and FIND_VALUE carry no protocol-level fee; these metrics expose discovery health only.
+
+| Metric | Type | Tier | Labels | Description |
+|--------|------|------|--------|-------------|
+| `decdn_dht_store_published_total` | Counter | R | — | DHT STORE records this node published to the K-closest peers ([ADR 022](022-content-discovery.md)). |
+| `decdn_dht_findvalue_queries_total` | Counter | R | — | DHT FIND_VALUE lookups this node issued to discover providers. |
+| `decdn_dht_routing_table_size` | Gauge | R | — | Distinct entries in the local Kademlia routing table. |
+
 ### 3. Health Endpoint
 
 `GET /health` (same HTTP port as `/metrics`) returns a JSON object:

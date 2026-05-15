@@ -231,13 +231,3 @@ DHT STORE and FIND_VALUE operations carry no protocol-level fee. The incentive t
 ## Alternatives Considered
 
 The six discovery alternatives evaluated against `cdn/dht/v1` (broadcast probe fan-out as primary, gossip content announcements, hash-prefix range hints, iroh mainline DHT, indexer nodes, full libp2p Kademlia) are recorded in [`_history/alternatives-pre-launch.md` § ADR 022 — Content Discovery at Scale](_history/alternatives-pre-launch.md#adr-022--content-discovery-at-scale).
-
-## Cross-ADR Impact
-
-- **ADR 001** Future Work section ("Scaling Content Discovery") is superseded by this ADR. The three strategies listed there are resolved: selective fan-out is removed entirely (the on-chain origin directory is the deterministic last-resort fallback when the DHT returns no providers), content DHT is formalised here, gossip content hints are rejected.
-- **ADR 005** probe protocol is unchanged. DHT provides candidates only.
-- **ADR 008** reputation penalties for delivery failure cover false STORE records (a node publishing a DHT record claiming to hold a blob it does not have).
-- **ADR 011** origin assignment authority is *not* consulted at probe time — origin status is not signaled on the wire. The DHT remains permissionless; per-namespace origin authorization is queried off-chain via `OriginAssignment.getOrigins(namespaceId)` for routing/discovery preferences.
-- **ADR 012** client discovery uses DHT FIND_VALUE; the on-chain origin-directory fallback applies to clients equally.
-- **ADR 013** schema evolution rules apply to `cdn/dht/v1`.
-- **the observability appendix** SHOULD add DHT subsystem metrics: `decdn_dht_store_published_total`, `decdn_dht_findvalue_queries_total`, `decdn_dht_routing_table_size`.
