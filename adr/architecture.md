@@ -95,7 +95,6 @@ How protocol violations are detected, adjudicated, and punished. The slashing sc
 5. [ADR 032 — SafetyReserve Appeal-Surface Contract Surface](032-safety-reserve-appeals-contract.md) — contract-implementation pin for ADR 028's appeal flow
 6. [ADR 031 — ContentBlacklist Appeal-Contract Surface](031-content-blacklist-appeals-contract.md) — contract-implementation pin for ADR 011's blacklist-entry appeals
 7. [ADR 030 — Node Region Self-Attestation](030-node-region-self-attestation.md)
-8. [Appendix: Permissionless Fraud-Detection Layer](appendix-fraud-detection.md) — operational detection layer over the on-chain primitives
 
 ### Chapter 6 — Governance & contracts
 
