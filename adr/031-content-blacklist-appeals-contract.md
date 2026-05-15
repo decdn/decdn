@@ -5,23 +5,23 @@
 
 ## Context
 
-[ADR 011 § Blacklist Entry Appeals](011-content-takedown.md#blacklist-entry-appeals) specifies the semantics of the per-entry blacklist-appeal flow: regional-only scope, standing paths and synthetic-standing clawback, evidence requirements, bond and frequency caps, the multisig fast-track + ve-Governor ratification authority, the per-body concurrent-appeal cap, and the lifecycle across `openBlacklistAppeal` → (`fastTrackAppeal` | `rejectAppeal`) → (`ratifyAppealRemoval` | `reverseAppeal` | lapse). The high-level signatures appear in the [`IContentBlacklist` interface](011-content-takedown.md#contract-contentblacklist) at the top of ADR 011. ADR 011 § Contract surface explicitly defers the implementation details:
+[ADR 011 § Blacklist Entry Appeals](011-content-takedown.md#blacklist-entry-appeals) specifies the semantics of the per-entry blacklist-appeal flow (regional-only scope, standing paths and synthetic-standing clawback, evidence requirements, bond and frequency caps, the multisig fast-track + ve-Governor ratification authority, the per-body concurrent-appeal cap, and the lifecycle across `openBlacklistAppeal` → (`fastTrackAppeal` | `rejectAppeal`) → (`ratifyAppealRemoval` | `reverseAppeal` | lapse)). High-level signatures appear in the [`IContentBlacklist` interface](011-content-takedown.md#contract-contentblacklist). ADR 011 § Contract surface defers the implementation details:
 
 > The full ABI (per-appeal storage layout, exact event topics, gas-optimized struct packing) is deferred to a future contract-implementation ADR — same approach as [ADR 028 §6](028-slashing-appeals.md#6-contract-surface).
 
-This ADR is that contract-implementation ADR. It pins the per-appeal storage layout, the canonical event topic ordering, the gas-packed struct layout, and the surface-level integration with the rest of `ContentBlacklist` (suspension flag manipulation, internal `_removeHashRegional` call, the `cleanupExpiredAppeal` admissibility checks), so the implementation in `contracts/` has a single canonical reference rather than re-deriving from ADR 011's narrative form.
+This ADR is that contract-implementation ADR. It pins the per-appeal storage layout, canonical event topic ordering, gas-packed struct layout, and surface-level integration with the rest of `ContentBlacklist` (suspension flag manipulation, internal `_removeHashRegional` call, `cleanupExpiredAppeal` admissibility checks), giving the implementation in `contracts/` a single canonical reference.
 
-It is the blacklist-side analogue of [#524](https://github.com/decdn/decdn/issues/524) (ADR 032), which performs the same job for [ADR 028 §6](028-slashing-appeals.md#6-contract-surface)'s slash-appeal entry points on `SafetyReserve`.
+It is the blacklist-side analogue of [#524](https://github.com/decdn/decdn/issues/524) (ADR 032), which does the same for [ADR 028 §6](028-slashing-appeals.md#6-contract-surface)'s slash-appeal entry points on `SafetyReserve`.
 
-This ADR does **not** re-litigate semantic decisions made in ADR 011 — bond size, filing windows, standing paths, evidence rules, regional-only scope, the synthetic-standing clawback, or the interaction with `SlashJudge`. Where this ADR restates such elements it is for self-containedness of the contract spec; the canonical decision authority remains ADR 011.
+This ADR does **not** re-litigate ADR 011 semantic decisions — bond size, filing windows, standing paths, evidence rules, regional-only scope, the synthetic-standing clawback, or the interaction with `SlashJudge`. Restatements here are for self-containedness; the canonical decision authority remains ADR 011.
 
 ## Decision
 
-The appeal surface lives on the existing `ContentBlacklist` contract as an extension of [ADR 011 § Contract: ContentBlacklist](011-content-takedown.md#contract-contentblacklist), not as a separate appeal-registry contract. Rationale parallel to [ADR 028 §6](028-slashing-appeals.md#6-contract-surface): the appeal records reference entries that already live on `ContentBlacklist`, the ratification path mutates `ContentBlacklist` state (`entry.suspended`, `entry.suspendedAtUs`, `_removeHashRegional`), and the cleanup admissibility tests depend on `ContentBlacklist` views — splitting them across two contracts would force every appeal lifecycle transition through cross-call hops without any audit-surface savings.
+The appeal surface lives on the existing `ContentBlacklist` contract as an extension of [ADR 011 § Contract: ContentBlacklist](011-content-takedown.md#contract-contentblacklist), not as a separate appeal-registry contract. Rationale parallel to [ADR 028 §6](028-slashing-appeals.md#6-contract-surface): appeal records reference entries already on `ContentBlacklist`, the ratification path mutates `ContentBlacklist` state (`entry.suspended`, `entry.suspendedAtUs`, `_removeHashRegional`), and cleanup admissibility tests depend on `ContentBlacklist` views — splitting across two contracts would force every lifecycle transition through cross-call hops with no audit-surface savings.
 
 ### 1. Storage layout
 
-Two enums and one struct describe an appeal; four auxiliary mappings carry the per-filer and per-region caps from [ADR 011 § Bond and frequency caps](011-content-takedown.md#bond-and-frequency-caps).
+Two enums and one struct describe an appeal; auxiliary mappings carry the per-filer and per-region caps from [ADR 011 § Bond and frequency caps](011-content-takedown.md#bond-and-frequency-caps).
 
 ```solidity
 enum AppealStatus {
@@ -100,7 +100,7 @@ uint256 public totalBondsEscrowed;
 
 ### 2. Function signatures and revert table
 
-The five entry points from `IContentBlacklist` are pinned below with their full revert conditions, state transitions, side effects, and emitted events. Permissionless `cleanupExpiredAppeal` is included.
+The five entry points from `IContentBlacklist`, plus permissionless `cleanupExpiredAppeal`, are pinned below with full revert conditions, state transitions, side effects, and emitted events.
 
 ```solidity
 function openBlacklistAppeal(
@@ -168,7 +168,7 @@ function rejectAppeal(uint256 appealId) external onlyEmergencyMultisig;
 function rejectAppealAsPerjury(uint256 appealId) external onlyEmergencyMultisig;
 ```
 
-`rejectAppealAsPerjury` is a sibling entry point for the case in ADR 011 § Evidence where post-hoc evidence shows the sworn declaration was false. It performs everything `rejectAppeal` does, plus sets `appeals[appealId].perjuryFlagged = 1` and `perjuryDenylistUntilUs[appeal.filer] = nowUs + 365 days * 1_000_000`. Multisig may call either against an `Open`, `UnFastTracked`, or `FastTracked` appeal; on a `FastTracked` appeal the suspension is released as a side effect (mirrors `unFastTrackAppeal` slot accounting before terminating).
+`rejectAppealAsPerjury` is a sibling entry point for the ADR 011 § Evidence case where post-hoc evidence shows the sworn declaration was false. It does everything `rejectAppeal` does, plus sets `appeals[appealId].perjuryFlagged = 1` and `perjuryDenylistUntilUs[appeal.filer] = nowUs + 365 days * 1_000_000`. Multisig may call either against an `Open`, `UnFastTracked`, or `FastTracked` appeal; on a `FastTracked` appeal the suspension is released as a side effect (mirrors `unFastTrackAppeal` slot accounting before terminating).
 
 | Revert | Trigger |
 | --- | --- |
@@ -287,31 +287,19 @@ stateDiagram-v2
 
 ### Positive
 
-- Pins the storage layout and event schema so the implementation has a single source of truth, removing the cross-derivation cost between ADR 011's narrative form and the eventual Solidity.
-- Parallel structure to [#524](https://github.com/decdn/decdn/issues/524) (ADR 032) keeps both appeal-contract surfaces — slashing and blacklist — auditable under the same pattern.
+- Pins storage layout and event schema as a single source of truth, removing the cross-derivation cost between ADR 011's narrative form and the eventual Solidity.
+- Parallel structure to [#524](https://github.com/decdn/decdn/issues/524) (ADR 032) keeps both appeal-contract surfaces — slashing and blacklist — auditable under one pattern.
 - Permissionless `cleanupExpiredAppeal` plus the four admissibility conditions removes any contract dependency on a privileged scheduler; bond settlement and slot release are eventually consistent through any caller.
 
 ### Negative
 
-- Five-slot struct + four auxiliary mappings per appeal carry non-trivial storage cost. The expected volume is low — most regional entries are never appealed; the bond + frequency caps + per-body cap keep the active set bounded — but high-volume regional adversarial activity would multiply storage costs linearly.
-- Multisig capability scope is implicit: `ADR 009` enumerates four capabilities, and the blacklist-appeal entry points are sub-modes of capability (1) (regional-body suspension) but not yet listed. An ADR 009 editorial pass is owed.
+- Five-slot struct + four auxiliary mappings per appeal carry non-trivial storage cost. Expected volume is low (most regional entries are never appealed; bond + frequency caps + per-body cap bound the active set), but high-volume regional adversarial activity multiplies storage cost linearly.
+- Multisig capability scope is implicit: `ADR 009` enumerates four capabilities; the blacklist-appeal entry points are sub-modes of capability (1) (regional-body suspension) but not yet listed. An ADR 009 editorial pass is owed.
 
 ### Risks
 
-- **`_pad0` / `_pad1` field accuracy.** The packed slot calculations assume Solidity's standard packing rules; a compiler version change altering slot semantics could silently relocate fields. The implementation MUST include a Foundry storage-layout test (`forge inspect ContentBlacklist storageLayout`) pinned to expected slot offsets.
-- **`region` canonicalization at the function boundary.** `openBlacklistAppeal` taking `string calldata region` and canonicalizing to `bytes2` is a divergence point from the rest of `ContentBlacklist`'s internal API. A reviewer should confirm every internal write site uses the `bytes2` form to avoid silent format mismatch between the appeal record and the parent entry.
-
-## Alternatives Considered
-
-- **Separate `BlacklistAppealRegistry` contract.** Rejected for the reason stated under [§ Decision](#decision): cross-contract hops on every transition, no audit-surface savings, and the cleanup admissibility tests depend on `ContentBlacklist` state anyway.
-- **Per-appeal escrow contract** (one contract per active appeal, holding its own bond). Rejected as massive deployment overhead for no benefit; `ContentBlacklist` itself custodies bonds and burns / refunds them inline.
-
-## Cross-ADR Impact
-
-- **[ADR 011](011-content-takedown.md):** § Contract surface "full ABI deferred" clause replaced with a reference to this ADR. § Contract: ContentBlacklist `IContentBlacklist` interface is unchanged — this ADR is purely implementation detail.
-- **[ADR 009](009-governance.md):** § Emergency Multisig capability enumeration should be editorially expanded to list `fastTrackAppeal` / `unFastTrackAppeal` / `rejectAppeal` / `rejectAppealAsPerjury` as sub-modes of capability (1).
-- **[ADR 016](016-contract-interactions.md):** § Contract Inventory `ContentBlacklist` row already references the [ADR 011 § Blacklist Entry Appeals](011-content-takedown.md#blacklist-entry-appeals) API. No edit required by this ADR.
-- **[#524 / ADR 032](https://github.com/decdn/decdn/issues/524):** Parallel contract-implementation ADR for SafetyReserve slash appeals (extends [ADR 028 §6](028-slashing-appeals.md#6-contract-surface)).
+- **`_pad0` / `_pad1` field accuracy.** Packed slot calculations assume Solidity's standard packing rules; a compiler version change altering slot semantics could silently relocate fields. The implementation MUST include a Foundry storage-layout test (`forge inspect ContentBlacklist storageLayout`) pinned to expected slot offsets.
+- **`region` canonicalization at the function boundary.** `openBlacklistAppeal` taking `string calldata region` and canonicalizing to `bytes2` diverges from the rest of `ContentBlacklist`'s internal API. A reviewer should confirm every internal write site uses the `bytes2` form to avoid silent format mismatch between the appeal record and the parent entry.
 
 ## References
 

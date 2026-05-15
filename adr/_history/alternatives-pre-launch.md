@@ -2,7 +2,7 @@
 
 > **Audit trail.** This file collects the `## Alternatives Considered` sections that previously lived inline across the ADR set. It is **not** part of the canonical protocol specification — it is a record of design alternatives evaluated and rejected before launch, retained so future contributors can see what was on the table without inferring it from the current design. Tracked in [#346](https://github.com/decdn/decdn/issues/346); see [`adr/README.md` § Decision-record context](../README.md#decision-record-context) for the project-level framing.
 >
-> Neither the numeric `adrs.pdf` nor the reading-order `adrs-book.pdf` build includes this file. Readers approaching the protocol top-to-bottom get the canonical spec; readers researching a specific decision can follow the breadcrumb at the bottom of each source ADR's stub `## Alternatives Considered` section back here.
+> Neither the numeric `adrs.pdf` nor the reading-order `adrs-book.pdf` build includes this file, and the ADR bodies intentionally do **not** link to it — there is no `## Alternatives Considered` stub or breadcrumb in any ADR. Readers approaching the protocol get the canonical spec; this archive is browsed directly, by the per-ADR sections below.
 
 Sections below are anchored by source ADR. Cross-references back to each source use relative paths (`../NNN-name.md`).
 
@@ -185,3 +185,89 @@ Rejected. Shared protocol types, cache logic, and contract interaction code is l
 ### Compile-time `#[cfg(feature = "poc")]` throughout all crates
 
 Rejected. Scatters the PoC/production boundary into every crate, making it hard to track all the differences and audit the production surface. Centralizing in `wiring.rs` gives a single readable inventory.
+
+---
+
+## ADR 028 — Slashing Appeals
+
+Source: [ADR 028 — Slashing Appeals and Dispute Escalation](../028-slashing-appeals.md).
+
+- **ve-Governor-only path (no multisig fast-track).** Rejected: ~9-day minimum governance latency (7d voting + 48h timelock per [ADR 009](../009-governance.md#production-ve-weighted-governance)) is too slow for an operator who needs working-capital relief during an active business. The multisig fast-track + ratification structure is borrowed exactly from [ADR 011 § Regional Governance Bodies](../011-content-takedown.md#regional-governance-bodies) for the same reason.
+- **Dedicated arbitration committee.** Rejected: introduces a new on-chain governance body, a new election mechanism, and a new attack surface, none of which is justified by the appeal volume the protocol expects (single-digit appeals per quarter at PoC scale, low-tens at production scale).
+- **On-chain slash reversal.** Rejected: clawback on already-distributed challenger rewards (50% of slashed amount per [ADR 026 §8](../026-gauge-boost-tokenomics.md#8-slashing-and-burn)) is intractable — the challenger may have already moved the funds. `SafetyReserve` restitution is equivalent in capital terms and avoids the clawback complexity entirely. Reputation/offense-count preservation is a feature, not a bug (§7).
+- **Hybrid stake reversal + reputation reset.** Rejected for the same clawback reason, plus the reputation-preservation rationale in §7.
+- **Narrowing scope to a subset of offenses.** Rejected: phantom, rate, and blacklist all execute immediately with no in-protocol due process; restricting appeals to a subset would leave a corresponding portion of operator-trust gap unaddressed.
+
+---
+
+## ADR 030 — Node Region Self-Attestation
+
+Source: [ADR 030 — Node Region Self-Attestation](../030-node-region-self-attestation.md).
+
+- **IP-geolocation oracle (Chainlink Functions, governance-approved oracle set, or similar).** Rejected. (a) Introduces a centralized trust root — the oracle operator(s) become a choke point that can blackhole or misclassify a node's region; (b) systematically misclassifies legitimate deployments behind VPN, anycast, IXP relays, or mobile/cellular allocations; (c) creates a net-new external dependency for the codebase (no oracle infrastructure exists in `crates/incentive/` or the contracts directory today); (d) does not produce a strictly better signal than the latency/reputation loop already in place — IP-geolocation databases are themselves imperfect heuristics over BGP allocations.
+- **Required attestation at announce time (every `NodeAnnounce` carries a fresh oracle-signed attestation; gossip drops announces without one).** Rejected for the same reasons plus a harder operational floor — a brief oracle outage now causes every node's announces to age out, partitioning the gossip mesh until the oracle recovers.
+- **Peer-witnessed latency challenge with on-chain dispute (mirror [ADR 028 § 3](../028-slashing-appeals.md#3-eligibility-and-evidence-standard) evidence-bundle pattern for region claims).** Rejected as overengineered. The same latency signal is already used at lower cost by the [ADR 001 § Consequences](../001-network.md#consequences) reputation penalty; promoting it to an on-chain adjudication path adds bond economics, multisig load, and a new ratification window without changing the operational outcome (a misdeclaring node already loses payouts under the soft path).
+- **Scoping-only ADR (document the requirements/interface, defer mechanism).** Rejected — this is the posture issue #400 already objects to, and re-issuing it under a new ADR number does not close the gap.
+
+---
+
+## ADR 031 — ContentBlacklist Appeal-Contract Surface
+
+Source: [ADR 031 — ContentBlacklist appeal-contract surface](../031-content-blacklist-appeals-contract.md).
+
+- **Separate `BlacklistAppealRegistry` contract.** Rejected for the reason stated under § Decision: cross-contract hops on every transition, no audit-surface savings, and the cleanup admissibility tests depend on `ContentBlacklist` state anyway.
+- **Per-appeal escrow contract** (one contract per active appeal, holding its own bond). Rejected as massive deployment overhead for no benefit; `ContentBlacklist` itself custodies bonds and burns / refunds them inline.
+
+---
+
+## ADR 032 — SafetyReserve Appeal-Surface
+
+Source: [ADR 032 — SafetyReserve appeal-surface contract surface](../032-safety-reserve-appeals-contract.md).
+
+- **Dedicated `SlashAppealRegistry` contract.** Rejected for the reason stated under § Decision: cross-contract hops on every transition, no audit-surface savings, and the `payout()` integration would need to be re-exposed. Mirrors ADR 031's rejection of `BlacklistAppealRegistry`.
+- **Per-appeal `counterBundleFiler` storage field.** Considered for §2's bond-routing dispatch (counter-bundle filer recorded at gate-3 acceptance, read at `reverseAppeal`). Rejected: the gate-3 state already exists on `SafetyReserve` proper; duplicating it into the `Appeal` struct would cost another slot per appeal and require two writes (gate-3 + appeal) on every counter-bundle acceptance. The current design reads gate-3 state directly and surfaces the recipient via the `bondSplitRecipient` event field.
+- **Five-condition `LapseReason` enum (ADR 031 style).** Rejected: slash appeals have only two lapse triggers (multisig timeout, ratification timeout), with no standing-path or global-override analogue. A two-enum mapping would over-engineer the case set; the `(escrowReturned == 0)` test suffices for off-chain disambiguation.
+
+---
+
+## Blob Cache Eviction Policy (appendix)
+
+Source: [Appendix: Blob Cache Eviction Policy](../appendix-blob-cache-eviction.md).
+
+- **LFU.** Rejected. Per-hash hit-counter bookkeeping grows without decay heuristics; counters are gameable by an attacker who repeatedly probes a low-value blob to keep it resident, wasting cache capacity on adversarial-popular content. LRU's "recently useful" proxy is robust enough for PoC scale and resists the same attack (the attacker must keep accessing the blob, paying per access — the cost defends the policy).
+- **Size-weighted (largest-first).** Rejected. Penalizes the legitimate large-blob use case (video, datasets) the network is designed for. A 1 GB blob would always evict before a 1 MB blob even when both are equally hot, defeating the purpose of a CDN cache for large content.
+- **Hybrid LRU + LFU (e.g. SLRU, ARC, W-TinyLFU).** Rejected for PoC. The bookkeeping overhead and parameter-tuning burden ("how do we set the segment ratio?") buy a marginal hit-rate gain at scales orders of magnitude larger than the PoC. Revisit at production hardening if cache-hit telemetry shows a clear miss-rate floor LRU is responsible for.
+- **No eviction (rely on `cache_size_mb` as a soft hint).** Rejected. The cache is bounded storage; unbounded growth either wedges the disk or relies on the operator manually evicting via `decdn node evict` — neither acceptable. The driver loop is deferred (see *Negative consequences*) but the policy is mandatory.
+- **Reputation-priority eviction.** Rejected, mirrors [appendix-peer-table-eviction.md §4](../appendix-peer-table-eviction.md#4-reputation-does-not-factor-into-eviction). Conflates retention with selection; creates a collusive-reporting vector against ADR 008's hard floor; the cache layer should not consult reputation at all.
+- **Refresh `last_accessed` on every probe / `has` check.** Rejected. A coordinated probe flood from many peers would refresh every cached hash to "recent" and turn the LRU policy into approximate FIFO. Refresh on `get` only — the paid-delivery path — ties recency to the operator's revenue signal, which is the right alignment.
+
+---
+
+## Peer Table Eviction Policy (appendix)
+
+Source: [Appendix: Peer Table Eviction Policy](../appendix-peer-table-eviction.md).
+
+- **Reputation-priority eviction.** Rejected. Conflates discovery with selection (§4); creates a collusive-reporting vector against ADR 008's hard reputation floor; punishes transient noise. Reputation already governs selection via the score formula, the right place for it.
+- **Lazy deregistration (TTL-only, no active evict).** Rejected. The registry-cache subscriber already runs on every event; marginal cost is one `HashMap::remove`. Lazy handling would leave a deregistered node visible to operators and analytics for up to TTL with no benefit.
+- **LRU under a hard size cap.** Rejected. Adds eviction-priority bookkeeping for a problem the staking registry already bounds. If observed `peer_table_size` exceeds `registered_node_count × 1.5` in production, revisit — but the right next step is a registry-validation audit, not an LRU layer.
+- **Persisting the peer table across restarts.** Rejected. Restart cost is < one announce interval (~60 s) of cold gossip; durability machinery is not justified.
+- **Eviction by `announce.timestamp_us` rather than `last_seen_us`.** Rejected. Couples eviction to peer wall-clock instead of receiver wall-clock; creates surprises when peer clocks drift within the ±60 s skew window. The existing implementation correctly uses `last_seen_us`.
+- **Shorter TTL aligned to a single announce interval (60 s).** Rejected. Below 2× announce interval a single dropped announce evicts a healthy peer; PlumTree gossip is best-effort, so single drops occur.
+
+---
+
+## ADR 003 — Probe-Fishing Rate-Limit Alternatives
+
+Source: [ADR 003 § Attack Vectors → Probe fishing](../003-payments.md#probe-fishing). The chosen mitigation — the layered per-peer / per-IP / global token-bucket rate limit applied before any signature or hold-slot allocation ([ADR 005 § Probe rate limiting](../005-protocol.md#probe-rate-limiting)) — is documented inline in ADR 003. The rejected alternatives:
+
+- **Option B — Require an open channel to probe.** Rejected. Creates a bootstrap catch-22: clients need probe results (rate, latency) to choose a node before opening a channel, but this requires a channel before probing. Since probes happen before channel opens (see [ADR 005](../005-protocol.md) probe flow), requiring a channel is architecturally incompatible with the protocol sequence. Probes are unauthenticated and free — ADR 005 states "`ProbeRequest` requires no authentication."
+- **Option C — Proof-of-work on probe requests.** Rejected for two reasons: (a) probe latency is part of the unified node-selection score ([ADR 001 § Node Selection Algorithm](../001-network.md#node-selection-algorithm)), so mandatory hashing on every probe degrades the selection signal the probe was meant to provide; (b) PoW is bypassable by an attacker with cheaper compute than the honest client (cloud GPU vs mobile CPU), inverting the intended cost asymmetry.
+- **Option D — Accept the risk and monitor only.** Rejected. A probe response is a 200-byte signed message; per-probe cost is dominated by the EIP-712 signature (~1 ms CPU on a typical node). At scale a Sybil attacker can saturate the signing path and exhaust the hold budget. Monitoring without enforcement is insufficient — the locked mechanism is enforced rate limiting per [ADR 005 § Probe rate limiting](../005-protocol.md#probe-rate-limiting).
+
+---
+
+## ADR 018 — Balancer V2 vs V3 (pre-merge migration)
+
+Source: [ADR 018 — Liquidity Strategy](../018-liquidity-strategy.md). The canonical decision (Balancer **V3** 80/20 weighted POL, with the affirmative V3 security justification in ADR 018 § Consequences) is documented inline. The rejected alternative:
+
+- **Balancer V2.** An earlier draft targeted Balancer V2. Rejected before merge after the 2025-11-03 V2 Composable Stable Pool exploit (~$125M, per Certora / Trail of Bits / OpenZeppelin post-mortems) demonstrated a latent V2 codebase risk not present in V3's new Vault architecture. The core 80/20 weighted-POL decision (USDC efficiency, IL alignment, zero-keeper posture) is a property of weighted pools in general and is not version-specific.
