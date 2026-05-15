@@ -933,10 +933,13 @@ mod tests {
     #[test]
     fn negative_floor_disables_filtering_like_zero() {
         // Pins the `min_reputation <= 0.0` disable branch for the negative
-        // case: an out-of-domain negative floor must behave exactly like the
-        // `0.0` default (no filtering), so even a sub-zero-reputation
-        // candidate is retained — identical to the active-floor case dropping
-        // it. Guards against a future `== 0.0` / `< 0.0` guard regression.
+        // case. Two assertions, two distinct paths:
+        //   - disabled path (floor -0.5): out-of-domain negative behaves like
+        //     the `0.0` default — no filtering, so even the sub-zero-reputation
+        //     candidate is retained.
+        //   - active path (floor 0.5): the same sub-floor candidate IS dropped.
+        // Together they guard against a future `== 0.0` / `< 0.0` guard
+        // regression that would conflate the two.
         let poor = make_candidate(1, 100, 10, -0.5);
         let good = make_candidate(2, 100, 10, 0.9);
 
@@ -987,5 +990,19 @@ mod tests {
         // rejects every candidate, including a perfectly-reputable one.
         let perfect = make_candidate(1, 100, 10, 1.0);
         assert!(rank_candidates_with_floor(vec![perfect], 1.5).is_empty());
+    }
+
+    #[test]
+    fn nan_floor_is_fail_closed() {
+        // A `NaN` floor must drop every candidate, not silently disable
+        // filtering. This relies on two subtle facts: `NaN <= 0.0` is false
+        // (so the disable early-return is skipped) and `reputation >= NaN` is
+        // false for all reputations (so the filter retains nothing). Pins the
+        // documented fail-closed contract against a future guard change (e.g.
+        // `min_reputation <= 0.0 || min_reputation.is_nan()`) that would flip
+        // a malformed floor into disabled filtering.
+        let perfect = make_candidate(1, 100, 10, 1.0);
+        let neutral = make_candidate(2, 100, 10, 0.5);
+        assert!(rank_candidates_with_floor(vec![perfect, neutral], f32::NAN).is_empty());
     }
 }
