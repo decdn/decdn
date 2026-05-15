@@ -1,14 +1,14 @@
 # Appendix: PoC/Production Seam Architecture (Rust implementation)
 
-> **This is an appendix, not a core protocol ADR.** The principle "PoC and production must be visibly distinct, with mode selection happening at composition boundaries rather than threaded through domain logic" is a protocol design rule. The specific implementation pattern documented here — Rust crate structure with leaf domain crates and a `node`-crate wiring layer, `#[cfg(feature = "poc")]` placement rules, and the mechanical-deletion graduation path — applies to this codebase. Other implementations are free to express the same principle differently (e.g., Go build tags, Python factories, runtime configuration).
+> **This is an appendix, not a core protocol ADR.** The principle "PoC and production must be visibly distinct, with mode selection happening at composition boundaries rather than threaded through domain logic" is a protocol design rule. The specific implementation pattern here — Rust leaf domain crates plus a `node`-crate wiring layer, `#[cfg(feature = "poc")]` placement rules, and the mechanical-deletion graduation path — applies to this codebase. Other implementations may express the same principle differently (Go build tags, Python factories, runtime configuration).
 
 ## Context
 
-Every ADR from 001–022 contains a PoC vs production split: different contracts, different constants, simplified stand-in components, admin-key shortcuts, and deferred features. Without a canonical architectural pattern for managing these differences, implementation will produce scattered `if mode == PoC` checks throughout every crate, making both the PoC and the production path harder to reason about, test, and eventually remove.
+Every ADR from 001–022 contains a PoC vs production split: different contracts, constants, simplified stand-in components, admin-key shortcuts, and deferred features. Without a canonical pattern for these differences, implementation produces scattered `if mode == PoC` checks across every crate, making both paths harder to reason about, test, and eventually remove.
 
 The goal is a clean mechanical answer to: **how does the codebase express the difference between PoC and production?**
 
-> **Cross-reference:** [ADR 026 — Gauge-Boost Tokenomics](026-gauge-boost-tokenomics.md) introduces a new contract surface (`FeeRouter`, `VotingEscrow`, `SafetyReserve`, swap helpers shared by `BuybackBurner` and the delegator-pool path). Seams 8–11 below cover the wiring-layer selectors for those contracts. The leaf-crate principle restated in §"Wiring Conventions" applies to ADR 026's tokenomics with the same force as to ADRs 001–022: domain crates remain free of ADR-026-mode-branching logic.
+> **Cross-reference:** [ADR 026 — Gauge-Boost Tokenomics](026-gauge-boost-tokenomics.md) introduces a new contract surface (`FeeRouter`, `VotingEscrow`, `SafetyReserve`, swap helpers shared by `BuybackBurner` and the delegator-pool path). Seams 8–11 below cover the wiring-layer selectors for those contracts. The leaf-crate principle in §"Wiring Conventions" applies to ADR 026's tokenomics with the same force as to ADRs 001–022: domain crates remain free of ADR-026-mode-branching logic.
 
 ### Inventory of PoC/Production differences (from prior ADRs)
 
@@ -32,13 +32,13 @@ The goal is a clean mechanical answer to: **how does the codebase express the di
 
 **Use trait-based seams, with the single Cargo feature `poc` applied only to the `node` crate (the wiring point).** Leaf crates (`protocol`, `cache`) contain no mode-conditional code. Mode-specific implementations live in sibling modules within each crate; the `node` crate selects which concrete types to wire via `#[cfg(feature = "poc")]` and `#[cfg(not(feature = "poc"))]` attributes on separate function definitions.
 
-No `if mode == PoC` checks appear in internal crate logic. All branching is resolved at compile time at the top level. PoC code is physically absent from a production binary — it is excluded from compilation, not merely optimized away.
+No `if mode == PoC` checks appear in internal crate logic — all branching resolves at compile time at the top level. PoC code is physically absent from a production binary: excluded from compilation, not merely optimized away.
 
-The single-feature design makes PoC removal straightforward: delete all `#[cfg(feature = "poc")]` functions and the `poc` feature declaration. The `#[cfg(not(feature = "poc"))]` production functions become unconditional with no further edits needed.
+The single-feature design makes PoC removal straightforward: delete all `#[cfg(feature = "poc")]` functions and the `poc` feature declaration; the `#[cfg(not(feature = "poc"))]` production functions become unconditional with no further edits.
 
 ## Seam Definitions
 
-Each seam is a Rust trait in the crate that owns the abstraction. The PoC and production implementations are concrete structs in `poc/` and `prod/` submodules of that crate.
+Each seam is a Rust trait in the crate that owns the abstraction. PoC and production implementations are concrete structs in `poc/` and `prod/` submodules of that crate.
 
 ### 1. `KeyStore` — `crates/incentive`
 
@@ -144,7 +144,7 @@ Concrete values:
 
 ### 6. `FeeRouterClient` — `crates/incentive`
 
-Introduced by [ADR 026](026-gauge-boost-tokenomics.md) §2. The `FeeRouter` contract receives the full operator USDC balance from `PaymentChannel.settleChannel` and atomically splits it into the six buckets. The wiring seam selects between the deployed `FeeRouter` contract (canonical for every network deployment per [ADR 016 § Tunable Economics](016-contract-interactions.md#tunable-economics), including the Arbitrum Sepolia testnet) and an in-process mock used by unit and integration tests where no contracts are deployed.
+Introduced by [ADR 026](026-gauge-boost-tokenomics.md) §2. `FeeRouter` receives the full operator USDC balance from `PaymentChannel.settleChannel` and atomically splits it into the six buckets. The seam selects between the deployed `FeeRouter` contract (canonical for every network deployment per [ADR 016 § Tunable Economics](016-contract-interactions.md#tunable-economics), including Arbitrum Sepolia testnet) and an in-process mock for unit/integration tests with no contracts deployed.
 
 ```rust
 pub trait FeeRouterClient: Send + Sync {
@@ -160,13 +160,13 @@ pub trait FeeRouterClient: Send + Sync {
 
 | | Tests / local dev | Network deployment |
 |---|-----|------------|
-| Implementation | `MockFeeRouterClient` — in-process mock for harnesses with no deployed contracts; never a deployment-time backend | `OnchainFeeRouterClient` — deployed `FeeRouter` contract address per network; the full production split applies to every network deployment per [ADR 016 § Tunable Economics](016-contract-interactions.md#tunable-economics) (simplified-launch configurations set bucket shares via `FeeRouter.setShares(...)` on the same contract, not via a reduced-surface stub) |
+| Implementation | `MockFeeRouterClient` — in-process mock for harnesses with no deployed contracts; never a deployment-time backend | `OnchainFeeRouterClient` — deployed `FeeRouter` address per network; full production split per [ADR 016 § Tunable Economics](016-contract-interactions.md#tunable-economics) (simplified-launch configs set bucket shares via `FeeRouter.setShares(...)` on the same contract, not a reduced-surface stub) |
 | Settlement path | `PaymentChannel.settleChannel` interacts with the mock router; downstream buckets simulated for assertion | `PaymentChannel.settleChannel` calls `FeeRouter.routeSettlement(operator, bytesDelivered, amount, epochId)` in the same transaction |
 | Per-network config | N/A | Address sourced from chain-id-keyed config; sum-to-100% safety bounds enforced on chain |
 
 ### 7. `VotingEscrowReader` — `crates/incentive`
 
-Introduced by [ADR 026](026-gauge-boost-tokenomics.md) §4. ve-balance lookups are load-bearing for the gauge-boost epoch snapshot (§3 of ADR 026) and ve-weighted governance (§9 of ADR 026). The wiring seam selects between an in-memory fixture (deterministic ve-balances for tests / local dev) and an on-chain `VotingEscrow.balanceOfAt(user, ts)` reader.
+Introduced by [ADR 026](026-gauge-boost-tokenomics.md) §4. ve-balance lookups are load-bearing for the gauge-boost epoch snapshot (ADR 026 §3) and ve-weighted governance (ADR 026 §9). The seam selects between an in-memory fixture (deterministic ve-balances for tests / local dev) and an on-chain `VotingEscrow.balanceOfAt(user, ts)` reader.
 
 ```rust
 pub trait VotingEscrowReader: Send + Sync {
@@ -185,7 +185,7 @@ pub trait VotingEscrowReader: Send + Sync {
 
 ### 8. `SwapHelper` — `crates/incentive`
 
-Introduced by [ADR 026](026-gauge-boost-tokenomics.md) §6 and consolidated with [ADR 018](018-liquidity-strategy.md). Both `BuybackBurner` (5% burn bucket) and the delegator-pool USDC→TOKEN path (7% bucket) require a swap backend with TWAP windows, `minOut` slippage protection, and per-epoch liquidity caps. Consolidating into a single seam reduces wiring surface.
+Introduced by [ADR 026](026-gauge-boost-tokenomics.md) §6, consolidated with [ADR 018](018-liquidity-strategy.md). Both `BuybackBurner` (5% burn bucket) and the delegator-pool USDC→TOKEN path (7% bucket) require a swap backend with TWAP windows, `minOut` slippage protection, and per-epoch liquidity caps; a single seam reduces wiring surface.
 
 ```rust
 pub trait SwapHelper: Send + Sync {
@@ -203,7 +203,7 @@ pub trait SwapHelper: Send + Sync {
 
 ### 9. `SafetyReservePayout` — `crates/incentive`
 
-Introduced by [ADR 026](026-gauge-boost-tokenomics.md) §5. The 3% safety bucket is governance-gated; payouts require an attested incident bundle, governance proposal (or fast-track multisig within hard caps), 48-hour appeal window, and post-incident reporting. The wiring seam selects between a local approval mock (single-step approval for tests / local dev) and the Governor-gated production path.
+Introduced by [ADR 026](026-gauge-boost-tokenomics.md) §5. The 3% safety bucket is governance-gated; payouts require an attested incident bundle, governance proposal (or fast-track multisig within hard caps), 48-hour appeal window, and post-incident reporting. The seam selects between a local single-step approval mock (tests / local dev) and the Governor-gated production path.
 
 ```rust
 pub trait SafetyReservePayout: Send + Sync {
@@ -273,9 +273,9 @@ fn key_store(config: &Config) -> Arc<dyn KeyStore> {
 // ... same pattern for remaining seams
 ```
 
-This is a stronger guarantee than `if cfg!(feature = "poc")`: with the attribute form, the PoC branch is **excluded from compilation entirely** in a production build. `FileKeyStore` and other PoC types are not present in the production binary at all — not merely optimized away.
+This is a stronger guarantee than `if cfg!(feature = "poc")`: with the attribute form the PoC branch is **excluded from compilation entirely** in a production build. `FileKeyStore` and other PoC types are not present in the production binary at all — not merely optimized away.
 
-`#[cfg(feature = "poc")]` and `#[cfg(not(feature = "poc"))]` appear **only** in `crates/node/src/wiring.rs` and `crates/node/src/main.rs`. They are **banned** in all other crates via a `rustflags` lint (see Enforcement below).
+`#[cfg(feature = "poc")]` and `#[cfg(not(feature = "poc"))]` appear **only** in `crates/node/src/wiring.rs` and `crates/node/src/main.rs`; they are **banned** in all other crates via a `rustflags` lint (see Rules below).
 
 ## Wiring Conventions
 
@@ -312,9 +312,9 @@ crates/
 ### Rules
 
 1. **No `#[cfg(feature = "poc")]` or `#[cfg(not(feature = "poc"))]` outside `crates/node/src/wiring.rs` and `crates/node/src/main.rs`.** Enforced via `rustflags = ["-D", "unexpected_cfgs"]` with an explicit `check-cfg` list in `.cargo/config.toml`, or a `#[forbid(unexpected_cfgs)]` crate-level attribute on leaf crates.
-2. **No runtime `NetworkMode` enum.** All mode selection is compile-time. A PoC binary cannot accidentally run in production mode.
+2. **No runtime `NetworkMode` enum.** All mode selection is compile-time; a PoC binary cannot accidentally run in production mode.
 3. **`NetworkConstants` is the single source of truth for all numeric differences.** No magic numbers elsewhere — always reference `constants.challenge_bond_token`, never literal `1e20`.
-4. **Both implementations must compile in CI.** The CI matrix builds with `--features poc` and without (production). This prevents either path from rotting and catches type errors in both concrete implementations.
+4. **Both implementations must compile in CI.** The CI matrix builds with `--features poc` and without (production), preventing either path from rotting and catching type errors in both concrete implementations.
 5. **PoC removal is mechanical.** To graduate to production-only: delete all `#[cfg(feature = "poc")]` functions, remove the `poc` feature from `Cargo.toml`, and strip the `#[cfg(not(feature = "poc"))]` attributes from the remaining functions. No logic changes required.
 6. **Leaf-crate principle applies to ADR 026 tokenomics.** Domain crates (`cache`, `gossip`, `incentive`, `reputation`, `protocol`) MUST NOT contain mode-branching logic for the [ADR 026](026-gauge-boost-tokenomics.md) contract surface (`FeeRouter`, `VotingEscrow`, `SafetyReserve`, swap helpers). All mode selection between PoC stubs / fixtures / mocks and production contracts lives in the `node` crate's wiring layer behind seams 8–11 above — the same rule that governs seams 1–7. Adding `if production_enabled` checks inside domain crate logic is forbidden.
 
@@ -323,10 +323,10 @@ crates/
 ### Positive
 
 - Zero mode-conditional branches in internal crate logic
-- Both modes are tested in CI continuously — no surprise at production migration time
-- PoC code is **physically absent** from a production binary (excluded at compile time, not just optimized away) — provides a hard security boundary
+- Both modes tested in CI continuously — no surprise at production migration time
+- PoC code is **physically absent** from a production binary (excluded at compile time, not just optimized away) — a hard security boundary
 - Production is the default compile target — no flag needed, no accidental PoC deployment
-- Removing PoC support later is mechanical: delete `#[cfg(feature = "poc")]` functions, drop the feature, strip `#[cfg(not(feature = "poc"))]` attributes — no logic changes
+- Removing PoC later is mechanical: delete `#[cfg(feature = "poc")]` functions, drop the feature, strip `#[cfg(not(feature = "poc"))]` attributes — no logic changes
 - `NetworkConstants` gives operators a single reference for all tunable differences
 
 ### Negative
