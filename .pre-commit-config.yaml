@@ -42,3 +42,14 @@ repos:
         entry: cargo deny check
         language: system
         pass_filenames: false
+
+      # Fails if a numbered ADR or appendix on disk is missing from the
+      # hand-maintained reading-order list in adr/Makefile (which would
+      # silently drop it from adrs-book.pdf). `files:` scopes the hook to
+      # ADR-book changes only, so it never runs on unrelated commits.
+      - id: adr-book-list
+        name: adr book list in sync
+        entry: make -C adr check-book-list
+        language: system
+        files: ^adr/(.*\.md|Makefile)$
+        pass_filenames: false
