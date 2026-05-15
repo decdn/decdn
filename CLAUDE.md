@@ -8,7 +8,7 @@ Decentralized CDN (deCDN) — nodes cache and serve content-addressed blobs over
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for build commands, ADR conventions, pre-commit hooks, and development environment setup.
 
-**ADR note:** Next ADR number is 030. File naming: `NNN-topic.md` (zero-padded 3-digit prefix). Always verify by checking `adr/` for the highest number before creating a new ADR. (030/031/032 were reclaimed when their proposals moved to the internal ideas repo — they were never canonical. 029 was canonical but reclassified as `appendix-peer-table-eviction.md`; do not reuse 029. 027 was canonical (Distinct-Client Diversity Gating / Delivery Receipts) but deleted when its content collapsed into ADR 026 §3 per-operator gauge-share cap; do not reuse 027.)
+**ADR note:** Next ADR number is 032. File naming: `NNN-topic.md` (zero-padded 3-digit prefix). Always verify by checking `adr/` for the highest number before creating a new ADR. (030 is canonical as `030-node-region-self-attestation.md` (closes #400). 031 is canonical as `031-content-blacklist-appeals-contract.md`. 032 was reclaimed when its proposal moved to the internal ideas repo — it was never canonical; free to claim. 029 was canonical but reclassified as `appendix-peer-table-eviction.md`; do not reuse 029. 027 was canonical (Distinct-Client Diversity Gating / Delivery Receipts) but deleted when its content collapsed into ADR 026 §3 per-operator gauge-share cap; do not reuse 027.)
 
 ## Common Commands
 
