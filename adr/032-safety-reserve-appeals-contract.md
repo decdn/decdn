@@ -1,4 +1,4 @@
-# ADR 030: SafetyReserve appeal-surface contract surface
+# ADR 032: SafetyReserve appeal-surface contract surface
 
 **Date:** 2026-05-14
 **Status:** Draft
@@ -78,7 +78,7 @@ uint256 public totalAppealBondsEscrowed;
 uint256 public totalEscrowLien;
 ```
 
-The per-category pending-claim queue is **not** declared here. It lives on `SafetyReserve` proper as the canonical disbursement infrastructure for the four [ADR 026 §5 spending controls](026-gauge-boost-tokenomics.md#spending-controls), with the ordering pinned at [ADR 026 §5 Cross-category payout ordering](026-gauge-boost-tokenomics.md#cross-category-payout-ordering) (`(accrualEpoch asc, claimId asc)`). ADR 030 owns only the per-appeal record; integration is at §5 below.
+The per-category pending-claim queue is **not** declared here. It lives on `SafetyReserve` proper as the canonical disbursement infrastructure for the four [ADR 026 §5 spending controls](026-gauge-boost-tokenomics.md#spending-controls), with the ordering pinned at [ADR 026 §5 Cross-category payout ordering](026-gauge-boost-tokenomics.md#cross-category-payout-ordering) (`(accrualEpoch asc, claimId asc)`). ADR 032 owns only the per-appeal record; integration is at §5 below.
 
 `openedEpoch` is typed as `EpochIndex` (FeeRouter 1-week epoch per [ADR 026 §2 Epoch mechanics](026-gauge-boost-tokenomics.md#epoch-mechanics)) — this aligns appeals with the `accrualEpoch` keying of the pending-claim queue (§5) so off-chain consumers reconciling appeal-to-claim flow do not need a separate timestamp-to-epoch conversion. The frequency-cap check, by contrast, uses the `MicroTimestamp`-typed `lastAcceptedAppealUs` so the "365 days" bound is enforced exactly (not coarse-grained to whole FeeRouter epochs). `MULTISIG_REVIEW_WINDOW` and `RATIFICATION_WINDOW` are measured in seconds per ADR 028 §5 hard bounds, so `reviewWindowEndsUs` is a `MicroTimestamp` matching the convention used in ADR 031's `BlacklistAppeal` (with the added UDVT discipline introduced here — ADR 031 stores the equivalent fields as raw `uint64`, and a future editorial pass may retrofit those to UDVTs for cross-ADR consistency).
 
@@ -174,11 +174,11 @@ Both conditions terminate at `status = Lapsed` and emit `SlashAppealLapsed(appea
 
 ### 5. Cross-category ordering hook
 
-ADR 030 owns only the per-appeal record. The cross-category pending-claim queue is canonical in [ADR 026 §5 Cross-category payout ordering](026-gauge-boost-tokenomics.md#cross-category-payout-ordering): the queue is keyed on `(accrualEpoch asc, claimId asc)`, where `accrualEpoch` is the FeeRouter 1-week epoch in which the original `payout()` authorization first hit insolvency and `claimId` is a `SafetyReserve`-monotonic counter assigned at authorization time.
+ADR 032 owns only the per-appeal record. The cross-category pending-claim queue is canonical in [ADR 026 §5 Cross-category payout ordering](026-gauge-boost-tokenomics.md#cross-category-payout-ordering): the queue is keyed on `(accrualEpoch asc, claimId asc)`, where `accrualEpoch` is the FeeRouter 1-week epoch in which the original `payout()` authorization first hit insolvency and `claimId` is a `SafetyReserve`-monotonic counter assigned at authorization time.
 
-On `ratifyAppeal`, the contract invokes `payout(evidenceBundleHash, appellant, escrowAmount)` and the return value (the assigned incident `id`) is emitted as the indexed `incidentId` topic of `SlashAppealRatified` (§3). ADR 030 does **not** add a per-appeal storage field tracking that handle — the event index is sufficient: indexers join `SlashAppealRatified.incidentId` directly against `SafetyReserve.Paid.id` (both indexed) to reconcile appeal → disbursement → pending-claim flow. If the reserve was insolvent at the call site, the pending-claim entry is observable from `SafetyReserve`'s own pending-claim state under the same `incidentId`.
+On `ratifyAppeal`, the contract invokes `payout(evidenceBundleHash, appellant, escrowAmount)` and the return value (the assigned incident `id`) is emitted as the indexed `incidentId` topic of `SlashAppealRatified` (§3). ADR 032 does **not** add a per-appeal storage field tracking that handle — the event index is sufficient: indexers join `SlashAppealRatified.incidentId` directly against `SafetyReserve.Paid.id` (both indexed) to reconcile appeal → disbursement → pending-claim flow. If the reserve was insolvent at the call site, the pending-claim entry is observable from `SafetyReserve`'s own pending-claim state under the same `incidentId`.
 
-The disbursement of queued claims is permissionless and follows the head-of-queue path pinned at [ADR 026 §5 Cross-category payout ordering](026-gauge-boost-tokenomics.md#cross-category-payout-ordering) ("any caller may invoke a `disbursePending()` head-of-queue path when reserve solvency permits"). No second-stage authorization is required and no per-payout-category priority signal exists. ADR 030 inherits both properties unchanged.
+The disbursement of queued claims is permissionless and follows the head-of-queue path pinned at [ADR 026 §5 Cross-category payout ordering](026-gauge-boost-tokenomics.md#cross-category-payout-ordering) ("any caller may invoke a `disbursePending()` head-of-queue path when reserve solvency permits"). No second-stage authorization is required and no per-payout-category priority signal exists. ADR 032 inherits both properties unchanged.
 
 ### 6. Multisig capability scope
 
@@ -195,7 +195,7 @@ The disbursement of queued claims is permissionless and follows the head-of-queu
 - Pins the storage layout and event schema so the [#452](https://github.com/decdn/decdn/issues/452) implementation has a single source of truth, removing the cross-derivation cost between ADR 028's narrative form and the eventual Solidity.
 - Parallel structure to [ADR 031](031-content-blacklist-appeals-contract.md) keeps both appeal-contract surfaces — slashing and blacklist — auditable under the same pattern: slot-aligned struct, event-topic table, Mermaid state machine, permissionless cleanup.
 - Permissionless `cleanupExpiredAppeal` plus the two admissibility conditions removes any contract dependency on a privileged scheduler; escrow return, bond refund, and slot release are eventually consistent through any caller.
-- Adding `SlashAppealLapsed` to [ADR 026 §5](026-gauge-boost-tokenomics.md#contract-safetyreserve)'s interface stub closes the gap between ADR 026 and ADR 028's Forward references — the six-event set is now canonical in three places (ADR 030 §3, ADR 026 §5, the eventual Solidity).
+- Adding `SlashAppealLapsed` to [ADR 026 §5](026-gauge-boost-tokenomics.md#contract-safetyreserve)'s interface stub closes the gap between ADR 026 and ADR 028's Forward references — the six-event set is now canonical in three places (ADR 032 §3, ADR 026 §5, the eventual Solidity).
 
 ### Negative
 
@@ -225,8 +225,8 @@ The disbursement of queued claims is permissionless and follows the head-of-queu
 - **[ADR 026 § Contract: SafetyReserve](026-gauge-boost-tokenomics.md#contract-safetyreserve):** the `ISafetyReserve` interface stub for slash-appeal extensions is updated in this PR to (a) add the missing `SlashAppealLapsed` event and (b) pin all six event signatures' parameter lists consistently with §3 above. The comment block immediately preceding the stub points at this ADR as the authority on storage and event semantics.
 - **[ADR 028 § Forward references](028-slashing-appeals.md#forward-references-follow-up-adrs):** the "future contract-implementation ADR will pin…" bullet is replaced with a back-reference to this ADR.
 - **[ADR 028 § Consequences — Negative](028-slashing-appeals.md#negative):** the "Adds five new entry points" sentence is updated to "Adds six new entry points" reflecting the `cleanupExpiredAppeal` introduced here.
-- **[architecture.md § Chapter 5 — Verification & enforcement](architecture.md#chapter-5--verification--enforcement)** and **[§ Architectural Decisions](architecture.md#architectural-decisions):** ADR 030 added to the Chapter 5 reading order and the numeric per-ADR index.
-- **`decdn/CLAUDE.md`:** the "Next ADR number is 030" line is bumped to "Next ADR number is 032" (031 is `031-content-blacklist-appeals-contract.md`, canonical; 030 is now this ADR).
+- **[architecture.md § Chapter 5 — Verification & enforcement](architecture.md#chapter-5--verification--enforcement)** and **[§ Architectural Decisions](architecture.md#architectural-decisions):** ADR 032 added to the Chapter 5 reading order and the numeric per-ADR index.
+- **`decdn/CLAUDE.md`:** the "Next ADR number is 030" line is bumped to "Next ADR number is 033", and the ADR-number provenance note records ADR 032 (`032-safety-reserve-appeals-contract.md`, this ADR) and ADR 031 (`031-content-blacklist-appeals-contract.md`) as canonical, with ADR 030 assigned by in-flight PR #565.
 
 ## References
 

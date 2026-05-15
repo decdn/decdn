@@ -383,7 +383,7 @@ interface ISafetyReserve {
     // Signature stubs only; full appeal state machine, window timing,
     // storage layout, per-appeal escrow accounting, and event-parameter
     // semantics are specified in
-    // [ADR 030](030-safety-reserve-appeals-contract.md) and
+    // [ADR 032](032-safety-reserve-appeals-contract.md) and
     // [ADR 028 §6](028-slashing-appeals.md#6-contract-surface);
     // parameter values lock down in #451.
     function openSlashAppeal(uint256 slashId, bytes32 evidenceBundleHash)
@@ -422,7 +422,7 @@ interface ISafetyReserve {
     event SlashInflowRecorded(address indexed operator, uint256 amount);
     event SwapExecuted(uint256 amountIn, uint256 amountOut);
     // Parameter lists pinned in
-    // [ADR 030 §3](030-safety-reserve-appeals-contract.md#3-solidity-event-signatures-all-six-pinned).
+    // [ADR 032 §3](032-safety-reserve-appeals-contract.md#3-solidity-event-signatures-all-six-pinned).
     event SlashAppealOpened(uint256 indexed appealId, uint256 indexed slashId, address indexed appellant, bytes32 evidenceBundleHash, uint256 bond);
     event SlashAppealFastTracked(uint256 indexed appealId, uint256 escrowAmount);
     event SlashAppealRejected(uint256 indexed appealId, uint256 bondSlashed);

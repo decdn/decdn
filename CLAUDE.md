@@ -8,7 +8,7 @@ Decentralized CDN (deCDN) — nodes cache and serve content-addressed blobs over
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for build commands, ADR conventions, pre-commit hooks, and development environment setup.
 
-**ADR note:** Next ADR number is 032. File naming: `NNN-topic.md` (zero-padded 3-digit prefix). Always verify by checking `adr/` for the highest number before creating a new ADR. (030 is canonical (`030-safety-reserve-appeals-contract.md`, #524); 031 is canonical (`031-content-blacklist-appeals-contract.md`). 032 was previously reclaimed when an earlier proposal moved to the internal ideas repo — that proposal was never canonical, so 032 is free. 029 was canonical but reclassified as `appendix-peer-table-eviction.md`; do not reuse 029. 027 was canonical (Distinct-Client Diversity Gating / Delivery Receipts) but deleted when its content collapsed into ADR 026 §3 per-operator gauge-share cap; do not reuse 027.)
+**ADR note:** Next ADR number is 033. File naming: `NNN-topic.md` (zero-padded 3-digit prefix). Always verify by checking `adr/` for the highest number before creating a new ADR. (032 is canonical (`032-safety-reserve-appeals-contract.md`, #524); 031 is canonical (`031-content-blacklist-appeals-contract.md`). 030 is being assigned by in-flight ADR work in PR #565 (`030-node-region-self-attestation.md`) and is not yet on `main`; do not reuse 030. 029 was canonical but reclassified as `appendix-peer-table-eviction.md`; do not reuse 029. 027 was canonical (Distinct-Client Diversity Gating / Delivery Receipts) but deleted when its content collapsed into ADR 026 §3 per-operator gauge-share cap; do not reuse 027.)
 
 ## Common Commands
 
