@@ -117,14 +117,11 @@ The pattern has three knobs, all under `GOVERNANCE_ROLE` (i.e. the `TimelockCont
 
 ```solidity
 interface IFeeRouter {
-    // ─── Settlement entry point ───────────────────────────────────────
-    // Called by `StablePaymentChannel.settleChannel` (production: future
-    // multi-token `PaymentChannel`). Forwards the operator's full USDC
-    // balance through the six-bucket split per the configured shares;
-    // same-tx legs (operator base, buyback, treasury, safety) execute
-    // inline, epoch-bucket legs (gauge, delegator) accumulate to per-epoch
-    // storage. Updates `lastSettlementAt[operator]` on `StakingRegistry`
-    // via `SETTLEMENT_REPORTER_ROLE`. Reverts if paused.
+    // Called by `StablePaymentChannel.settleChannel`. Forwards the operator's
+    // full USDC balance through the configured six-bucket split (per ADR 026
+    // §2); same-tx legs execute inline, epoch-bucket legs accumulate to
+    // per-epoch storage. Updates `lastSettlementAt[operator]` on
+    // `StakingRegistry` via `SETTLEMENT_REPORTER_ROLE`. Reverts if paused.
     function routeSettlement(
         address operator,
         uint256 bytesDelivered,
@@ -132,67 +129,52 @@ interface IFeeRouter {
         uint64  epochId             // voucher.epochId per ADR 003
     ) external;
 
-    // ─── Per-operator gauge bytes tracking ────────────────────────────
-    // Populated inline by routeSettlement. Read by gauge claim per
-    // ADR 026 §3 to feed bytes_i; the per-operator gauge-share cap
-    // (also in ADR 026 §3) is the binding wash-trading defense.
+    // Populated inline by routeSettlement; read by gauge claim per ADR 026
+    // §3 to feed bytes_i. The per-operator gauge-share cap (ADR 026 §3) is
+    // the binding wash-trading defense.
     function bytesPerEpoch(address operator, uint64 epoch) external view returns (uint256);
 
-    // ─── Claim flows ──────────────────────────────────────────────────
-    // Pull-based claims for the gauge-boost (40% steady-state) and
-    // delegator (7%) epoch buckets. `epochs` MUST all be in the past
-    // 26-epoch claim window; older epochs are swept to treasury via
-    // `sweepUnclaimed` and revert here. Returns the total amount
-    // transferred to the caller for tooling convenience.
+    // Pull-based claims for the gauge-boost and delegator epoch buckets.
+    // INVARIANT: `epochs` MUST all be in the past 26-epoch claim window;
+    // older epochs are swept to treasury via `sweepUnclaimed` and revert
+    // here. Returns the total amount transferred, for tooling.
     function claimBoost(uint64[] calldata epochs) external returns (uint256 amount);
     function claimDelegator(uint64[] calldata epochs) external returns (uint256 amount);
 
-    // ─── Delegator-pool swap (keeper trigger) ─────────────────────────
-    // Initiates the per-epoch USDC→TOKEN swap for the delegator bucket
-    // by forwarding the bucket's accumulated USDC to `DelegatorBuyer` and
-    // calling `swapDelegatorBucket(epoch, amountIn, minOut)`. Consolidated
-    // here so the per-epoch liquidity-cap defenses live in one place;
-    // `DelegatorBuyer` is the single Balancer V3 caller. `KEEPER_ROLE`-gated.
+    // Per-epoch USDC→TOKEN delegator-bucket swap: forwards accumulated USDC
+    // to `DelegatorBuyer.swapDelegatorBucket`. `DelegatorBuyer` is the
+    // single Balancer V3 caller (liquidity-cap defenses in one place).
+    // `KEEPER_ROLE`-gated.
     function executeDelegatorSwap(uint64 epochId, uint256 minOut) external;
 
-    // ─── Delegator-pool swap callback (DelegatorBuyer-only) ───────────
-    // Called by `DelegatorBuyer.swapDelegatorBucket` after the Balancer
-    // V3 swap completes. Deposits `amount` of TOKEN into the delegator
-    // bucket for `epoch` so `claimDelegator(epochs[])` can pay against
-    // it. `msg.sender == delegatorBuyer` is the only authorization
-    // check — single trust boundary; no role grants needed post-deploy.
+    // Callback from `DelegatorBuyer.swapDelegatorBucket` after the swap;
+    // deposits TOKEN into the delegator bucket for `epoch`. INVARIANT:
+    // `msg.sender == delegatorBuyer` is the only authorization — single
+    // trust boundary, no post-deploy role grants.
     function depositDelegatorTokens(uint64 epochId, uint256 amount) external;
 
-    // ─── Permissionless storage cleanup ───────────────────────────────
-    // Sweeps the unclaimed remainder of any epoch past the 26-epoch claim
-    // window to the treasury, freeing the per-epoch storage slot. Anyone
-    // may call; matches the `pruneBlacklistedAssignment` pattern from
-    // [ADR 011 § Interaction with ContentBlacklist](011-content-takedown.md#interaction-with-contentblacklist).
+    // Permissionless: sweeps the unclaimed remainder of any epoch past the
+    // 26-epoch claim window to the treasury, freeing the storage slot
+    // (same pattern as `OriginAssignment.pruneBlacklistedAssignment`,
+    // [ADR 011](011-content-takedown.md#interaction-with-contentblacklist)).
     function sweepUnclaimed(uint64[] calldata epochs) external;
 
-    // ─── Read views ───────────────────────────────────────────────────
     // Per-(operator, epoch) ve-weighted byte count fed into the gauge
-    // formula in [ADR 026 §3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula).
-    // Off-chain claim simulators pair this with `epochTotalWorkingBytes`
-    // via Multicall3.
+    // formula ([ADR 026 §3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula)).
     function workingBytes(address operator, uint64 epochId) external view returns (uint256);
     function epochTotalWorkingBytes(uint64 epochId) external view returns (uint256);
 
-    // Per-epoch USDC accumulators for the gauge and delegator buckets.
-    // `delegatorBucket` is denominated in USDC pre-swap and TOKEN
-    // post-swap (the swap zeros the USDC slot and writes the TOKEN slot —
-    // implementations expose either via this view or a paired
-    // `delegatorBucketToken(epoch)` view at their discretion; the
-    // semantic value reported here is the active bucket currency).
+    // Per-epoch USDC accumulators. `delegatorBucket` is USDC pre-swap and
+    // TOKEN post-swap (swap zeros the USDC slot, writes the TOKEN slot);
+    // the value reported is the active bucket currency.
     function gaugeBucket(uint64 epochId) external view returns (uint256);
     function delegatorBucket(uint64 epochId) external view returns (uint256);
 
-    // Configured shares (basis points) and dependency addresses. These
-    // are governance-set state (last updated via `setShares` or
-    // `setSharesAndDestinations`), NOT operator-asserted values and NOT
-    // derived from per-epoch settlement state. The returned array
-    // ordering matches `setShares` parameters: [operatorBaseBps,
-    // gaugeBoostBps, delegatorBps, buybackBps, treasuryBps, safetyBps].
+    // Configured shares (bps) and dependency addresses. INVARIANT: these
+    // are governance-set state (via `setShares` / `setSharesAndDestinations`),
+    // NOT operator-asserted and NOT derived from settlement state. Array
+    // order matches `setShares`: [operatorBase, gaugeBoost, delegator,
+    // buyback, treasury, safety].
     function getShares() external view returns (uint256[6] memory);
     function votingEscrow() external view returns (address);
     function safetyReserve() external view returns (address);
@@ -201,14 +183,11 @@ interface IFeeRouter {
     function treasury() external view returns (address);
     function boostFloor() external view returns (uint256); // 4-decimal fixed-point: 4000 = 0.4
 
-    // ─── Tunability (governance-controlled) ───────────────────────────
-    // Atomic update: shares + dependency-address bundle. One timelock
-    // proposal flips both sides together so the cross-validation
-    // invariant in [§ Tunable Economics](#tunable-economics) — non-zero
-    // share requires non-zero destination — is satisfied at every
-    // observable state. Use this for activation flips (e.g., enabling
-    // the gauge bucket once VotingEscrow is wired); the per-knob setters
-    // below are for routine governance after the initial wiring.
+    // Atomic shares + dependency-address update in one timelock proposal,
+    // so the cross-validation invariant ([§ Tunable Economics](#tunable-economics)
+    // — non-zero share requires non-zero destination) holds at every
+    // observable state. Use for activation flips; per-knob setters below
+    // are for routine post-wiring governance.
     struct ShareDestinations {
         address votingEscrow;
         address safetyReserve;
@@ -234,12 +213,9 @@ interface IFeeRouter {
     function setTreasury(address newTreasury) external;
     function setBoostFloor(uint256 newFloor) external; // bounded [2000, 8000] per [ADR 026 §11](026-gauge-boost-tokenomics.md#11-governable-parameters-with-safety-bounds)
 
-    // ─── Pause control ────────────────────────────────────────────────
-    // `pause()` blocks `routeSettlement` and the claim functions
-    // (`claimBoost`, `claimDelegator`); `executeDelegatorSwap` and
-    // `sweepUnclaimed` are also paused.
-    // `StablePaymentChannel.closeChannel` and `disputeChannel` are
-    // independent of `FeeRouter` and remain available — settlement
+    // `pause()` blocks `routeSettlement`, `claimBoost`, `claimDelegator`,
+    // `executeDelegatorSwap`, `sweepUnclaimed`. `StablePaymentChannel`
+    // close/dispute are independent and remain available — settlement
     // queues until `unpause`.
     function pause() external;
     function unpause() external;
@@ -268,11 +244,11 @@ interface IFeeRouter {
 
 **Notes:**
 
-- **Epoch length and claim window** are immutable contract parameters set in the constructor (1 week and 26 epochs respectively per [ADR 026 §2](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553)). Changing them post-deploy would shift the meaning of every `epoch` index in storage; if a future ADR motivates a change, it ships as a fresh `FeeRouter` deployment with state migration, per [§ No proxy deployment patterns](#no-proxy-deployment-patterns).
-- **`workingBytes(operator, epoch)` returns the per-operator value only.** Off-chain claim-amount calculators bundle this with `epochTotalWorkingBytes(epoch)` and `gaugeBucket(epoch)` via Multicall3 — same pattern used elsewhere (ADR 022 § Origin discovery).
-- **Per-operator gauge bytes tracking** is enforced inline in `routeSettlement`. The `bytesPerEpoch` view is populated as a side effect of settlement; gauge claim reads `bytes_i` from this view directly per [ADR 026 §3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula). The per-operator gauge-share cap from [ADR 026 §3](026-gauge-boost-tokenomics.md#per-operator-gauge-share-cap) is the binding wash-trading defense. There is no operator-asserted summary, no on-chain identity gate, and no fraud-challenge mechanism.
-- **No `initialize(...)` helper.** [§ No proxy deployment patterns](#no-proxy-deployment-patterns) forbids proxies; constructor + post-deploy `setSharesAndDestinations` from `TimelockController` is sufficient for atomic launch wiring.
-- **Storage shape is implementation-defined.** The `gaugeBucket` and `delegatorBucket` views document the *semantic* per-epoch state; whether the contract uses two parallel mappings or a packed struct is left to the implementation (separate mappings are recommended because the buckets accrue independently — packing would force `SSTORE` of the unchanged half on every accumulation).
+- **Epoch length / claim window are immutable** (1 week / 26 epochs, constructor-set, [ADR 026 §2](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553)). Changing them post-deploy shifts every stored `epoch` index; a change ships as a fresh `FeeRouter` with state migration ([§ No proxy deployment patterns](#no-proxy-deployment-patterns)).
+- **`workingBytes` is per-operator only.** Off-chain calculators bundle it with `epochTotalWorkingBytes` and `gaugeBucket` via Multicall3.
+- **Gauge-bytes tracking is inline in `routeSettlement`.** INVARIANT: there is no operator-asserted summary, no on-chain identity gate, and no fraud-challenge mechanism — the [ADR 026 §3](026-gauge-boost-tokenomics.md#per-operator-gauge-share-cap) per-operator gauge-share cap is the binding wash-trading defense.
+- **No `initialize(...)` helper** — proxies are forbidden ([§ No proxy deployment patterns](#no-proxy-deployment-patterns)); constructor + post-deploy `setSharesAndDestinations` from `TimelockController` suffices.
+- **Storage shape is implementation-defined** — the `gaugeBucket`/`delegatorBucket` views document semantic per-epoch state; separate mappings are recommended (buckets accrue independently; packing forces an `SSTORE` of the unchanged half each accumulation).
 
 ##### No proxy deployment patterns
 
