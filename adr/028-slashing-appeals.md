@@ -117,7 +117,7 @@ The bond is the primary economic deterrent against pro-forma appeals filed in ho
 
 ### 6. Contract surface
 
-This ADR specifies the future contract surface; implementation lands in a follow-up issue tracking the slashing/appeals contract work. The `SafetyReserve` contract is extended with:
+This ADR specifies the contract surface at the semantic level — function signatures, modifiers, and authorization gates. Storage layout, per-appeal escrow accounting, event-parameter shapes, and the permissionless `cleanupExpiredAppeal` lapse handler are pinned in [ADR 032 — SafetyReserve appeal-surface contract surface](032-safety-reserve-appeals-contract.md). Implementation lands in [#452](https://github.com/decdn/decdn/issues/452). The `SafetyReserve` contract is extended with:
 
 ```solidity
 // `slashId` is allocated and emitted by SlashJudge.Slashed
@@ -128,6 +128,8 @@ function fastTrackAppeal(uint256 appealId) external onlyEmergencyMultisig;
 function rejectAppeal(uint256 appealId) external onlyEmergencyMultisig;
 function ratifyAppeal(uint256 appealId) external onlyGovernor;
 function reverseAppeal(uint256 appealId) external onlyGovernor;
+// Permissionless lapse handler — see [ADR 032 §4](032-safety-reserve-appeals-contract.md#4-state-machine).
+function cleanupExpiredAppeal(uint256 appealId) external;
 ```
 
 `openSlashAppeal` requires the bond transfer (`TOKEN.transferFrom` of `APPEAL_BOND`) and a non-zero `evidenceBundleHash`; it stores the appeal record and emits `SlashAppealOpened`. The actual restitution disbursement on ratification is routed through the existing `payout(bundleHash, recipient, amount)` entry point so [ADR 026 §5 Interface stability](026-gauge-boost-tokenomics.md#interface-stability)'s contract-stable signature for incident payouts is preserved — appeals are an additional *authorization* path into the same payout machinery, not an additional payout machinery. Subsequent gates are the same four payout gates from [ADR 026 §5 Spending controls](026-gauge-boost-tokenomics.md#spending-controls): attested bundle, authorization (multisig fast-track), 48-hour appeal window, post-incident reporting — applied **sequentially**, in that order. The §2 mermaid reflects this sequencing: the 48h SafetyReserve counter-bundle window completes before the 14-day ratification window opens, not in parallel.
@@ -173,7 +175,7 @@ Modeled abuse paths and their counters:
 
 ### Negative
 
-- Adds five new entry points (`openSlashAppeal`, `fastTrackAppeal`, `rejectAppeal`, `ratifyAppeal`, `reverseAppeal`) plus per-appeal escrow accounting to `SafetyReserve`, increasing the contract's surface area and audit cost.
+- Adds six new entry points (`openSlashAppeal`, `fastTrackAppeal`, `rejectAppeal`, `ratifyAppeal`, `reverseAppeal`, plus the permissionless `cleanupExpiredAppeal` introduced in [ADR 032 §6](032-safety-reserve-appeals-contract.md#6-multisig-capability-scope)) plus per-appeal escrow accounting to `SafetyReserve`, increasing the contract's surface area and audit cost.
 - Operators must front `APPEAL_BOND` (1,000 TOKEN default) to file, which is a real frictional cost at PoC TOKEN prices for genuinely-affected smaller operators. Cold-start considerations may motivate a lower default during the PoC window.
 - Escrow-until-ratification (§2) means the operator does not see disbursed restitution until ve-Governor ratification — up to ~16 days after the multisig fast-track (48h SafetyReserve counter-bundle window + 14d ratification, applied sequentially). For larger slashes this is real working-capital exposure during the holding period; the trade-off is buying out clawback exposure entirely.
 - Evidence standard (≥2 corroborating sources) is documentation-heavy for solo operators without enterprise-grade observability.
@@ -197,9 +199,9 @@ Modeled abuse paths and their counters:
 
 ## Forward references (follow-up ADRs)
 
-- A future contract-implementation ADR will pin the exact `SafetyReserve` storage layout, the per-appeal escrow accounting from §2, and the Solidity event signatures for `SlashAppealOpened` / `SlashAppealFastTracked` / `SlashAppealRejected` / `SlashAppealRatified` / `SlashAppealReversed` / `SlashAppealLapsed`.
+- Storage layout, per-appeal escrow accounting from §2, and the six Solidity event signatures (`SlashAppealOpened` / `SlashAppealFastTracked` / `SlashAppealRejected` / `SlashAppealRatified` / `SlashAppealReversed` / `SlashAppealLapsed`) are pinned in [ADR 032 — SafetyReserve appeal-surface contract surface](032-safety-reserve-appeals-contract.md). ADR 032 also introduces a sixth external entry point `cleanupExpiredAppeal(appealId)` (permissionless) for the two lapse cases defined in its state machine; see [ADR 032 §4](032-safety-reserve-appeals-contract.md#4-state-machine).
 - **`SafetyReserve` future split.** If the reserve is ever decomposed into separate per-category contracts (e.g. distinct reserves for slash-restitution vs. SLA-breach vs. payment-channel downtime), the following state and entry points must migrate alongside the slash-restitution payout category:
-  1. The five §6 entry points (`openSlashAppeal` / `fastTrackAppeal` / `rejectAppeal` / `ratifyAppeal` / `reverseAppeal`).
+  1. The six §6 entry points (`openSlashAppeal` / `fastTrackAppeal` / `rejectAppeal` / `ratifyAppeal` / `reverseAppeal` / `cleanupExpiredAppeal` per [ADR 032 §6](032-safety-reserve-appeals-contract.md#6-multisig-capability-scope)).
   2. Per-appeal escrow accounting from §2.
   3. The pending-claim register from §5 (including the cross-category epoch-FIFO queue pinned in [ADR 026 §5 Cross-category payout ordering](026-gauge-boost-tokenomics.md#cross-category-payout-ordering)).
   4. The challenger-incentive pool state implied by §4.

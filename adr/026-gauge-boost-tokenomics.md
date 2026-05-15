@@ -381,16 +381,18 @@ interface ISafetyReserve {
 
     // ─── Slash-appeal extensions (per ADR 028) ────────────────────────
     // Signature stubs only; full appeal state machine, window timing,
-    // and authorization rules are specified in
-    // [ADR 028 §6](028-slashing-appeals.md#6-contract-surface) and
-    // finalized as part of the surface lock-down in #451. Storage and
-    // authorization details are **not** pinned by this interface.
+    // storage layout, per-appeal escrow accounting, and event-parameter
+    // semantics are specified in
+    // [ADR 032](032-safety-reserve-appeals-contract.md) and
+    // [ADR 028 §6](028-slashing-appeals.md#6-contract-surface);
+    // parameter values lock down in #451.
     function openSlashAppeal(uint256 slashId, bytes32 evidenceBundleHash)
         external returns (uint256 appealId);
     function fastTrackAppeal(uint256 appealId) external;
     function rejectAppeal(uint256 appealId) external;
     function ratifyAppeal(uint256 appealId) external;
     function reverseAppeal(uint256 appealId) external;
+    function cleanupExpiredAppeal(uint256 appealId) external;
 
     // ─── Governance setters ───────────────────────────────────────────
     function setGovernor(address newGovernor) external;
@@ -419,11 +421,14 @@ interface ISafetyReserve {
     );
     event SlashInflowRecorded(address indexed operator, uint256 amount);
     event SwapExecuted(uint256 amountIn, uint256 amountOut);
-    event SlashAppealOpened(uint256 indexed appealId, uint256 indexed slashId, bytes32 evidenceBundleHash);
-    event SlashAppealFastTracked(uint256 indexed appealId);
-    event SlashAppealRejected(uint256 indexed appealId);
-    event SlashAppealRatified(uint256 indexed appealId);
-    event SlashAppealReversed(uint256 indexed appealId);
+    // Parameter lists pinned in
+    // [ADR 032 §3](032-safety-reserve-appeals-contract.md#3-solidity-event-signatures-all-six-pinned).
+    event SlashAppealOpened(uint256 indexed appealId, uint256 indexed slashId, address indexed appellant, bytes32 evidenceBundleHash, uint256 bond);
+    event SlashAppealFastTracked(uint256 indexed appealId, uint256 escrowAmount);
+    event SlashAppealRejected(uint256 indexed appealId, uint256 bondSlashed);
+    event SlashAppealRatified(uint256 indexed appealId, uint256 indexed incidentId, address recipient, uint256 restitutionAmount);
+    event SlashAppealReversed(uint256 indexed appealId, uint256 escrowReturned, address bondSplitRecipient, uint256 bondSplitAmount);
+    event SlashAppealLapsed(uint256 indexed appealId, uint256 escrowReturned, uint256 bondRefunded);
     event GovernorUpdated(address indexed oldAddr, address indexed newAddr);
     event EmergencyMultisigUpdated(address indexed oldAddr, address indexed newAddr);
     event AppealWindowUpdated(uint64 oldValue, uint64 newValue);
