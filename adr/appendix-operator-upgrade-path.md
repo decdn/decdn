@@ -134,7 +134,7 @@ For Tier 3 upgrades that touch governance-controlled parameters (rate bounds in 
 - **Cross-chain protocol coordination.** This runbook assumes a single L2 deployment ([`appendix-l2-deployment.md`](appendix-l2-deployment.md)). Future multi-L2 deployments will require a separate per-deployment-coordinator pattern.
 - **Client-side migration.** Client behavior during a Tier 3 upgrade is governed by client deployment policy, not by this runbook. Client smart-wallet upgrades follow [ADR 024](024-account-abstraction.md).
 
-## Cross-references
+## Cross-ADR Impact
 
 - [ADR 013 — Schema Evolution: tier semantics, ALPN negotiation, deprecation timeline](013-schema-evolution.md)
 - [ADR 010 — Migration from ADR 003: contract-level worked example](010-multi-token.md#migration-from-adr-003)

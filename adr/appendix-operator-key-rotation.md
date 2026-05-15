@@ -188,7 +188,7 @@ Exception: **emergency compromise of the Ethereum key.** If the Ethereum key is 
 - **Out-of-scope production hot-signing alternatives.** Hardware-wallet and HSM-backed voucher signing are confirmed infeasible per [ADR 012 § Consequences](012-client.md#consequences) — physical confirmation latencies of 2–5 seconds per signature cannot keep up with the per-MB voucher cadence. A separate delegated-voucher-signer contract path (previously tracked as the unresolved item in [#190](https://github.com/decdn/decdn/issues/190)) is similarly superseded. The production hot-signing path is [ADR 024 §3 `erc7579/smartsessions`](024-account-abstraction.md#3-session-keys--deferred-to-production-via-erc-7579-smartsessions) exclusively; no other production hot-signing pattern is supported.
 - **Compromised-key incident response.** This runbook describes mechanics. If a key is *believed compromised*, the operator should also: file an incident report with the SafetyReserve registry ([ADR 026 §5](026-gauge-boost-tokenomics.md)) if losses occurred, alert peer operators via reputation gossip, and rotate before any further wire-level signature is produced under the compromised key.
 
-## Cross-references
+## Cross-ADR Impact
 
 - [ADR 001 — On-chain registry, `registerNode`, NodeId ownership verification](001-network.md)
 - [ADR 003 — `bindNodeId` rebinding, `nodeIdToAddress`, EIP-712 `BindNodeId` schema](003-payments.md#nodeid-to-ethereum-binding)

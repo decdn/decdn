@@ -128,7 +128,7 @@ Build takes ~1 minute (most of it spent rendering Mermaid diagrams). Without `-F
 
 The numeric build above is the canonical per-ADR reference. For a top-to-bottom read, build the same set in the thematic chapter order from [`architecture.md` § Reading Order](architecture.md#reading-order) — Foundations → Discovery → Payments → Tokenomics → Verification → Governance → Operations → Supporting → Appendices. Output goes to `adrs-book.pdf` so both PDFs can coexist.
 
-This build also strips *Alternatives Considered*, *Considered Alternatives*, *Open Questions*, *Future Work*, and *"Why not …"* sections at render time via [`_build/strip-meta-sections.lua`](_build/strip-meta-sections.lua), so the document reads as a single canonical design rather than a debate transcript. The source `.md` files keep those sections untouched, and the numeric `adrs.pdf` build above includes them for readers who want the full decision-record context. A short notice on the first page ([`_build/preface.md`](_build/preface.md)) tells readers what was omitted and where to find it.
+This build also strips *Deferred & Open* (and its legacy aliases *Open Questions* / *Future Work*) and *Alternatives Considered* / *Considered Alternatives* / *"Why not …"* sections at render time via [`_build/strip-meta-sections.lua`](_build/strip-meta-sections.lua), so the document reads as a single canonical design rather than a debate transcript. *Cross-ADR Impact* is **not** stripped — it carries substantive cross-cutting design content, not scaffolding. The source `.md` files keep every section untouched, and the numeric `adrs.pdf` build above includes them all for readers who want the full decision-record context. A short notice on the first page ([`_build/preface.md`](_build/preface.md)) tells readers what was omitted and where to find it.
 
 ```bash
 PATH="$(npm config get prefix)/bin:$PATH" \
@@ -175,3 +175,17 @@ pandoc --from=markdown+gfm_auto_identifiers \
 ```
 
 If `architecture.md`'s Reading Order changes, this file list needs to be updated by hand — there's no auto-generation. The build itself takes the same ~1 minute.
+
+### Canonical section taxonomy
+
+Recurring non-`Context`/`Decision`/`Consequences` sections use one canonical name so the book filter keys off a stable set instead of an ever-growing list of synonyms. When authoring an ADR, use these names — do not coin new ones:
+
+| Canonical `## H2` | Purpose | In the book? | Replaces (do not reuse) |
+| --- | --- | --- | --- |
+| **Cross-ADR Impact** | How this ADR amends / relates to / couples with other ADRs | Yes — substantive | *ADRs Affected*, *Amendments to Existing ADRs*, *Cross-ADR Consistency*, *Cross-references*, *Forward references*, *Implications & follow-ups* |
+| **Deferred & Open** | Deferred work, open questions, forward-looking items | No — stripped | *Open Questions*, *Future Work*, *Future work and non-goals* (split: non-goals → Non-Goals) |
+| **Non-Goals** | Substantive scope exclusions | Yes — substantive | (was sometimes merged into *Future work and non-goals*) |
+| **References** | Bibliography / external links | Yes | (already consistent) |
+| **Alternatives Considered** | Rejected-alternative record | No — stripped | (already consistent; bulk lives in `_history/`) |
+
+The numeric `adrs.pdf` build keeps every section regardless of name; only the reading-order `adrs-book.pdf` applies the strip.

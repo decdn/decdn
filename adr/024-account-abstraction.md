@@ -191,7 +191,7 @@ The following Safe infrastructure is already deployed on the testnet sibling of 
 - Gas overhead for smart account signature verification is higher than pure `ecrecover` (+10–15k gas per verification). Applies only to on-chain operations (channel close/dispute, slash submission), not the high-frequency off-chain signing path.
 - Production rollout requires coordinated migration to Safe-7579 + smartsessions on every participating wallet; operators running on the PoC path must rotate to the new account type as part of the cutover.
 
-## Amendments to Existing ADRs
+## Cross-ADR Impact
 
 This ADR amends the following:
 
@@ -200,11 +200,3 @@ This ADR amends the following:
 - **[ADR 014](014-on-chain-verification.md):** All `ecrecover` sites in `SlashJudge` updated to `SignatureChecker`. Challenger provides target node address; contract verifies signature against it.
 - **[ADR 016](016-contract-interactions.md):** `SignatureChecker` added to OpenZeppelin framework usage table.
 - **[ADR 019](019-node-onboarding.md):** "ETH gas sponsor" PoC simplification updated. "Delegated voucher signer" future work item resolved by the Production smartsessions plan.
-
-## ADRs Affected
-
-- [ADR 003 — Payment Model](003-payments.md): Signature verification, gasless channel opens
-- [ADR 012 — Client Architecture](012-client.md): Key management, identity lifecycle
-- [ADR 014 — On-Chain Verification](014-on-chain-verification.md): SlashJudge signature verification
-- [ADR 016 — Smart Contract Interactions](016-contract-interactions.md): OZ framework table
-- [ADR 019 — Node Onboarding](019-node-onboarding.md): Wallet setup, delegated signer resolution

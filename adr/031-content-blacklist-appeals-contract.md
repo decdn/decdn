@@ -306,7 +306,7 @@ stateDiagram-v2
 - **Separate `BlacklistAppealRegistry` contract.** Rejected for the reason stated under [§ Decision](#decision): cross-contract hops on every transition, no audit-surface savings, and the cleanup admissibility tests depend on `ContentBlacklist` state anyway.
 - **Per-appeal escrow contract** (one contract per active appeal, holding its own bond). Rejected as massive deployment overhead for no benefit; `ContentBlacklist` itself custodies bonds and burns / refunds them inline.
 
-## ADRs Affected
+## Cross-ADR Impact
 
 - **[ADR 011](011-content-takedown.md):** § Contract surface "full ABI deferred" clause replaced with a reference to this ADR. § Contract: ContentBlacklist `IContentBlacklist` interface is unchanged — this ADR is purely implementation detail.
 - **[ADR 009](009-governance.md):** § Emergency Multisig capability enumeration should be editorially expanded to list `fastTrackAppeal` / `unFastTrackAppeal` / `rejectAppeal` / `rejectAppealAsPerjury` as sub-modes of capability (1).

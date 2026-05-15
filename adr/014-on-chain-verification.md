@@ -213,7 +213,7 @@ Every slash that reduces operator stake emits `Slashed(slashId, operator, offens
   Each `*StructHash` is the EIP-712 struct hash of the corresponding `*Response` per §1 (head-only `bytes32` — `abi.encode` adds no padding to a fixed-width 32-byte value). Appeals reference `evidenceHash` to prove they are challenging the same evidence the slash relied on; ADR 028 §6 `openSlashAppeal(slashId, evidenceBundleHash)` requires `evidenceBundleHash == evidenceHash` of the referenced `Slashed` event.
 - **Emission sites.** All four offenses are immediate: `Slashed` is emitted from the synchronous `submit*Challenge` paths immediately after the inline `StakingRegistry.slash()` returns. The "`StakingRegistry.slash()` then `emit Slashed`" sequence is contract-enforced atomic (single transaction); a slash without a matching event is impossible.
 
-The companion `SafetyReserve` events (`SlashAppealOpened`, `SlashAppealRatified`, etc.) remain forward-referenced to a future contract-implementation ADR per [ADR 028 §Forward references](028-slashing-appeals.md#forward-references-follow-up-adrs); only the `Slashed` event itself is canonicalised here.
+The companion `SafetyReserve` events (`SlashAppealOpened`, `SlashAppealRatified`, etc.) remain forward-referenced to a future contract-implementation ADR per [ADR 028 § Cross-ADR Impact](028-slashing-appeals.md#cross-adr-impact); only the `Slashed` event itself is canonicalised here.
 
 #### Gas Estimates
 
@@ -269,7 +269,7 @@ The `MAX_EVIDENCE_AGE_US < unbondingPeriod` invariant is paired across two contr
 - Cross-contract replay is prevented by per-contract EIP-712 domains, but implementers must ensure domain separators are correctly configured at deployment.
 - The §2 `Slashed` event adds an `OffenseType` enum, a `nextSlashId` storage slot, and the per-offense `evidenceHash` preimage encoding to `SlashJudge`'s audit surface. The increment is small but real: every slash path emits the event atomically with `StakingRegistry.slash()`, and the `OffenseType` ordering is contract-canonical (any reordering requires coordinated migration of `SafetyReserve` per ADR 028 §6).
 
-## ADRs Affected
+## Cross-ADR Impact
 
 - **[ADR 002](002-content-addressing.md):** Open question on on-chain verification mechanism → resolved (this ADR for `slash_sig` paths; content corruption is fully absorbed at the wire by client-side BLAKE3 verification per [ADR 003 §Corrupted delivery](003-payments.md#corrupted-delivery), no on-chain mechanism needed).
 - **[ADR 003](003-payments.md):** Corruption is resolved at the wire; ADR 003 §Corrupted delivery documents the wire-level mechanism.

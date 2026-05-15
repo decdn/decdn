@@ -342,7 +342,7 @@ crates/
 
 The six wiring-shape alternatives evaluated against centralised `#[cfg]`-keyed seams (`cfg!()` macro branching, two explicit features, runtime `NetworkMode`, single-impl with `Option` fields, two repositories, scattered `#[cfg]`) are recorded in [`_history/alternatives-pre-launch.md` § PoC/Production Seam Architecture (appendix)](_history/alternatives-pre-launch.md#pocproduction-seam-architecture-appendix).
 
-## Cross-ADR Consistency
+## Cross-ADR Impact
 
 | ADR | Seam used | Notes |
 |-----|-----------|-------|

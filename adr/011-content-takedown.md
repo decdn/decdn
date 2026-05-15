@@ -644,7 +644,7 @@ The minimum viable process at launch:
 5. Repeat-offender origin nodes → global governance vote for origin blacklisting
 6. Disputed regional entries → see [§ Blacklist Entry Appeals](#blacklist-entry-appeals) for the per-entry path. The slow-path global override (ve-Governor `removeHash` / `removeHashRegional` proposal) remains available for entries that fall outside the fast-track scope
 
-## ADRs Affected
+## Cross-ADR Impact
 
 - **[ADR 001](001-network.md)** (Network Topology) — blacklisted origin NodeIds are excluded from peer tables; `StreamError::HashBlacklisted`, `StreamError::OriginBlacklisted`, and `StreamError::UnauthorizedOrigin` are new error variants; the unconditional permissionless-origin claim in the consequences section is amended to reflect DAO-gated origin role
 - **[ADR 002](002-content-addressing.md)** (Content Addressing) — content-addressed blobs can be removed from the network layer even though the hash remains valid; this is explicitly accepted. The [Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces) section in ADR 002 defines the primitives this ADR's `OriginAssignment` mechanism builds on

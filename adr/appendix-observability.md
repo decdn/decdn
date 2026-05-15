@@ -321,7 +321,7 @@ The reference set covers M-tier slash-safety metrics and the most common R-tier 
 - Existing ADRs reference informal metric names that differ from the canonical names defined here. The cross-reference table (Section 6) documents all renames; no ADR is retroactively edited to avoid churn on draft documents, but implementations must use the canonical names from this ADR.
 - Mandatory metrics add startup complexity — the node must successfully initialize all M-tier metric collectors before accepting connections. This is a small overhead in exchange for guaranteed observability.
 
-## Future Work
+## Deferred & Open
 
 - **OpenMetrics migration.** Prometheus text format 0.0.4 is the current default; the OpenMetrics exposition format (used by `prometheus_client` crate's `MetricsEncoder`) adds exemplars and native histograms — evaluate once tooling support is broader.
 - **Tokenomics + reputation dashboard panels.** The reference dashboard in [`monitoring/grafana-dashboard.json`](../monitoring/grafana-dashboard.json) is deliberately scoped to M-tier core operations. §2.7 reputation and §2.10 tokenomics metrics warrant their own dedicated dashboards (governance, delegator-yield, gauge-claim debugging) — these are deployment-specific and belong outside the reference set.
