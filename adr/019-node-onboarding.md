@@ -254,5 +254,3 @@ If the node's iroh identity was replaced (key rotation), use `StakingRegistry.bi
 
 - **Node onboarding CLI tool.** A `decdn setup` command that walks through Phases 1–2 interactively, generates keys, builds the `registerNode` calldata, and submits the transactions would reduce operator error significantly.
 - **Automated multiaddr refresh.** The node runtime should watch `Endpoint::direct_addresses()` and call `updateMultiaddrs` automatically on change.
-- ~~**Geolocation verification.**~~ Resolved — [ADR 030](030-node-region-self-attestation.md) accepts self-attested regions as the production posture and rejects the oracle / attestation-service path; appeals-standing and reactive blacklist-scope flipping are closed by the 7-day `regionLastChanged` stability window on `StakingRegistry` per [ADR 030 § 3](030-node-region-self-attestation.md#3-region-stability-window).
-- ~~**Delegated voucher signer.**~~ Resolved — [ADR 024](024-account-abstraction.md) specifies Safe session keys for high-frequency signing (vouchers and slash_sig), replacing the delegated signer approach.

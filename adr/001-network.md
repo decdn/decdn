@@ -250,14 +250,6 @@ This schedule is tuned for PoC with a single RPC endpoint. Production deployment
 - Origin-backed nodes are the last line of defense for availability — if all authorized origins for a blob go offline or are deregistered, the content becomes permanently unavailable (unless cached elsewhere). For registered namespaces, the `OriginAssignment` minimum-redundancy invariant ([ADR 009](009-governance.md), [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority)) ensures activated assignments always include at least the configured floor (default 3) of authorized origins. For default-open content (`namespaceId == 0`), the DAO-maintained default-open allow-list ([ADR 011 § Default-open allow-list](011-content-takedown.md#default-open-allow-list)) enforces its own redundancy floor (default 10) — materially higher than the registered floor because one approved operator may serve any default-open hash. During the bootstrap window before the allow-list is first activated, the prior permissive behaviour applies: any staked operator may serve as origin and the failure mode is total loss of every operator that ever cached the blob.
 - `registerNode` gas cost increases ~4–7× due to on-chain ed25519 signature verification (~650k–1.15M gas vs. ~150k without); acceptable as a one-time cost per node lifetime
 
-### ~~Future Work: Scaling Content Discovery~~ (Resolved by ADR 022)
-
-The three strategies considered here are resolved in [ADR 022](022-content-discovery.md):
-
-1. **Selective fan-out** — subsumed by DHT and removed entirely; the on-chain origin directory ([ADR 022](022-content-discovery.md)) is the deterministic last-resort fallback.
-2. **Content-addressed DHT** — adopted as the primary mechanism from PoC onward via `cdn/dht/v1`. iroh's native discovery services (DNS/pkarr) resolve `NodeId → address` and should be evaluated for production address resolution, complementing the on-chain registry which remains authoritative for enumerating active staked nodes.
-3. **Gossip-based content hints** — rejected (hash-prefix ranges are economically irrational in an incentive-driven network; see [ADR 022 §Context](022-content-discovery.md)).
-
 ## Contract Interface: Node Registry
 
 The node registry is part of the `StakingRegistry` contract, not a separate contract. Staking is a prerequisite for registration ([ADR 026 §7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake)), so co-locating them avoids cross-contract calls and simplifies the atomic stake-then-register flow.

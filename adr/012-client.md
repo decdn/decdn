@@ -144,8 +144,6 @@ Client identity bindings are **ephemeral and per-connection**, per [ADR 003 — 
 
 ### Eclipse Attack Mitigation
 
-Resolves the open question in [ADR 003](003-payments.md) regarding eclipse attack options.
-
 At small mesh scale, eclipse attacks require both Sybil-scale capital (staking enough nodes to dominate the registry) and RPC endpoint compromise (returning a fabricated node list); the on-chain registry alone suffices as the discovery source. As the mesh grows and operator-set diversity increases, clients adopt **multi-source bootstrap (Option B)** — discovering initial peers from at least two independent sources:
 
 1. **On-chain registry** — `StakingRegistry.getActiveNodes()` via the configured RPC endpoint.
@@ -235,7 +233,7 @@ The client queries all configured seed domains, cross-checks returned NodeIds ag
 **Positive:**
 
 - Consolidates client behavior scattered across ADRs 001, 003, 005, and 008 into a single canonical specification
-- Resolves the eclipse attack open question from ADR 003 with a concrete decision (Option B for production)
+- Specifies multi-source bootstrap (Option B) as the production eclipse-attack defense
 - Establishes an explicit trust boundary, making security assumptions auditable
 - PoC key management is simple (file-based EOA or Safe wallet) with a clear production upgrade path (Safe multisig with session keys — see [ADR 024](024-account-abstraction.md))
 - Bootstrap procedure is fully specified end-to-end, unblocking PoC implementation
