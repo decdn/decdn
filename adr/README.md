@@ -108,26 +108,20 @@ Dependencies:
 - [`typst`](https://typst.app/) — `brew install typst` (PDF engine)
 - [`mermaid-filter`](https://github.com/raghur/mermaid-filter) — `npm install -g mermaid-filter` (renders ` ```mermaid ` blocks via headless Chromium pulled in by puppeteer; first install is ~150 MB)
 
-The `PATH` prefix below makes the build work even when your shell hasn't picked up npm's global bin directory:
+Both PDFs build from [`adr/Makefile`](Makefile) — the single source of truth for the pandoc invocation. Run from the `adr/` directory:
 
 ```bash
-PATH="$(npm config get prefix)/bin:$PATH" \
-pandoc --from=markdown+gfm_auto_identifiers \
-  --toc --toc-depth=2 \
-  --pdf-engine=typst \
-  -F mermaid-filter \
-  --metadata-file=_build/book-margins.yaml \
-  -V fontsize=10pt -V linestretch=1.0 \
-  --include-in-header=_build/book-density.typ \
-  -V title="deCDN — Architecture Decision Records" \
-  -V date="$(date +%Y-%m-%d)" \
-  architecture.md $(ls [0-9]*.md | sort) $(ls appendix-*.md | sort) \
-  -o adrs.pdf
+make            # both PDFs: adrs.pdf (numeric) + adrs-book.pdf (reading order)
+make book       # adrs-book.pdf only
+make numeric    # adrs.pdf only
+make MERMAID=0  # build without mermaid-filter (no mmdc/puppeteer needed)
+make clean      # remove generated PDFs
+make help       # list targets
 ```
 
-Build takes ~1 minute (most of it spent rendering Mermaid diagrams). Without `-F mermaid-filter` the diagrams ship as raw source text.
+The canonical build (`make`) renders Mermaid diagrams and takes ~1 minute (most of it rendering diagrams); it adds the npm global-bin `PATH` prefix automatically so it works even when your shell hasn't picked it up. `make MERMAID=0` omits `-F mermaid-filter` — diagrams ship as raw source text — for environments without `mmdc`/puppeteer and for the no-mermaid content-soundness check.
 
-The `--metadata-file` / `-V fontsize` / `-V linestretch` / `--include-in-header` flags apply the purely-presentational page-density tuning in [`_build/book-density.typ`](_build/book-density.typ) and [`_build/book-margins.yaml`](_build/book-margins.yaml). They change **no content and no decision** — they only replace the very loose pandoc/typst defaults (≈2.5 cm margins, 11 pt, slack leading) with a standard technical-book geometry, taking the reading-order book from ≈430 to ≈260 pages (no mermaid) without dropping a single section or cross-reference. Drop the four flags to render byte-identical content at the loose default density.
+The Makefile applies a purely-presentational page-density config — [`_build/book-margins.yaml`](_build/book-margins.yaml) (1.6 cm/1.8 cm margins) plus [`_build/book-density.typ`](_build/book-density.typ) (10 pt, `linestretch 1.0`, tighter leading/code/tables/headings) — that replaces the very loose pandoc/typst defaults (≈2.5 cm margins, 11 pt, slack leading). It changes **no content and no decision**, only whitespace: it takes the reading-order book from ≈430 to ≈260 pages (no mermaid) with the section-level TOC and every cross-reference intact. Delete the `DENSITY` flags from the Makefile to render byte-identical content at the loose default density.
 
 ### Reading-order build (book layout)
 
@@ -135,54 +129,9 @@ The numeric build above is the canonical per-ADR reference. For a top-to-bottom 
 
 This build also strips *Deferred & Open* (and its legacy aliases *Open Questions* / *Future Work*) and *Alternatives Considered* / *Considered Alternatives* / *"Why not …"* sections at render time via [`_build/strip-meta-sections.lua`](_build/strip-meta-sections.lua), so the document reads as a single canonical design rather than a debate transcript. *Cross-ADR Impact* is **not** stripped — it carries substantive cross-cutting design content, not scaffolding. The source `.md` files keep every section untouched, and the numeric `adrs.pdf` build above includes them all for readers who want the full decision-record context. A short notice on the first page ([`_build/preface.md`](_build/preface.md)) tells readers what was omitted and where to find it.
 
-```bash
-PATH="$(npm config get prefix)/bin:$PATH" \
-pandoc --from=markdown+gfm_auto_identifiers \
-  --toc --toc-depth=2 \
-  --pdf-engine=typst \
-  -F mermaid-filter \
-  --lua-filter=_build/strip-meta-sections.lua \
-  --metadata-file=_build/book-margins.yaml \
-  -V fontsize=10pt -V linestretch=1.0 \
-  --include-in-header=_build/book-density.typ \
-  -V title="deCDN — Architecture Decision Records (Reading Order)" \
-  -V date="$(date +%Y-%m-%d)" \
-  _build/preface.md \
-  architecture.md \
-  _build/part-1-foundations.md \
-  000-language.md 001-network.md 002-content-addressing.md 005-protocol.md \
-  _build/part-2-discovery.md \
-  022-content-discovery.md 015-zero-rtt.md \
-  _build/part-3-payments.md \
-  003-payments.md 010-multi-token.md 012-client.md 024-account-abstraction.md \
-  _build/part-4-tokenomics.md \
-  026-gauge-boost-tokenomics.md 018-liquidity-strategy.md \
-  _build/part-5-verification.md \
-  014-on-chain-verification.md 008-reputation.md 011-content-takedown.md 028-slashing-appeals.md \
-  032-safety-reserve-appeals-contract.md 031-content-blacklist-appeals-contract.md 030-node-region-self-attestation.md \
-  _build/part-6-governance.md \
-  009-governance.md 016-contract-interactions.md \
-  _build/part-7-operations.md \
-  019-node-onboarding.md \
-  _build/part-8-supporting.md \
-  013-schema-evolution.md 017-privacy.md \
-  _build/part-9-appendices.md \
-  appendix-encrypted-content-publishing.md \
-  appendix-bundles.md \
-  appendix-observability.md \
-  appendix-peer-table-eviction.md \
-  appendix-blob-cache-eviction.md \
-  appendix-l2-deployment.md \
-  appendix-poc-production-seams.md \
-  appendix-binaries.md \
-  appendix-local-admin-http.md \
-  appendix-operator-key-rotation.md \
-  appendix-operator-upgrade-path.md \
-  appendix-fraud-detection.md \
-  -o adrs-book.pdf
-```
+`make book` produces this. The thematic file order (with the `_build/part-*.md` dividers) and the `--lua-filter` wiring live in the `BOOK_SRCS` variable and the `adrs-book.pdf` recipe of [`adr/Makefile`](Makefile).
 
-If `architecture.md`'s Reading Order changes, this file list needs to be updated by hand — there's no auto-generation. The build itself takes the same ~1 minute.
+If `architecture.md`'s Reading Order changes, the `BOOK_SRCS` list in the Makefile must be updated by hand to match — there's no auto-generation. `make check-book-list` guards against the common drift (a numbered ADR or appendix on disk that was never added to `BOOK_SRCS`, which would silently omit it from the book) and is a cheap pre-commit / CI check. The build itself takes the same ~1 minute.
 
 ### Canonical section taxonomy
 
