@@ -185,11 +185,7 @@ Modeled abuse paths and counters:
 
 ## Alternatives Considered
 
-- **ve-Governor-only path (no multisig fast-track).** Rejected: ~9-day minimum governance latency (7d voting + 48h timelock per [ADR 009](009-governance.md#production-ve-weighted-governance)) is too slow for an operator who needs working-capital relief during an active business. The multisig fast-track + ratification structure is borrowed exactly from [ADR 011 § Regional Governance Bodies](011-content-takedown.md#regional-governance-bodies) for the same reason.
-- **Dedicated arbitration committee.** Rejected: introduces a new on-chain governance body, a new election mechanism, and a new attack surface, none of which is justified by the appeal volume the protocol expects (single-digit appeals per quarter at PoC scale, low-tens at production scale).
-- **On-chain slash reversal.** Rejected: clawback on already-distributed challenger rewards (50% of slashed amount per [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn)) is intractable — the challenger may have already moved the funds. `SafetyReserve` restitution is equivalent in capital terms and avoids the clawback complexity entirely. Reputation/offense-count preservation is a feature, not a bug (§7).
-- **Hybrid stake reversal + reputation reset.** Rejected for the same clawback reason, plus the reputation-preservation rationale in §7.
-- **Narrowing scope to a subset of offenses.** Rejected: phantom, rate, and blacklist all execute immediately with no in-protocol due process; restricting appeals to a subset would leave a corresponding portion of operator-trust gap unaddressed.
+The rejected escalation-path alternatives (ve-Governor-only, dedicated arbitration committee, on-chain slash reversal, hybrid stake-reversal + reputation-reset, narrowing scope to a subset of offenses) are recorded in [`_history/alternatives-pre-launch.md` § ADR 028 — Slashing Appeals](_history/alternatives-pre-launch.md#adr-028--slashing-appeals).
 
 ## Cross-ADR Impact
 

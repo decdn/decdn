@@ -118,9 +118,4 @@ A sustained non-zero `decdn_gossip_messages_rejected_total{reason="table_full"}`
 
 ## Alternatives Considered
 
-- **Reputation-priority eviction.** Rejected. Conflates discovery with selection (§4); creates a collusive-reporting vector against ADR 008's hard reputation floor; punishes transient noise. Reputation already governs selection via the score formula, the right place for it.
-- **Lazy deregistration (TTL-only, no active evict).** Rejected. The registry-cache subscriber already runs on every event; marginal cost is one `HashMap::remove`. Lazy handling would leave a deregistered node visible to operators and analytics for up to TTL with no benefit.
-- **LRU under a hard size cap.** Rejected. Adds eviction-priority bookkeeping for a problem the staking registry already bounds. If observed `peer_table_size` exceeds `registered_node_count × 1.5` in production, revisit — but the right next step is a registry-validation audit, not an LRU layer.
-- **Persisting the peer table across restarts.** Rejected. Restart cost is < one announce interval (~60 s) of cold gossip; durability machinery is not justified.
-- **Eviction by `announce.timestamp_us` rather than `last_seen_us`.** Rejected. Couples eviction to peer wall-clock instead of receiver wall-clock; creates surprises when peer clocks drift within the ±60 s skew window. The existing implementation correctly uses `last_seen_us`.
-- **Shorter TTL aligned to a single announce interval (60 s).** Rejected. Below 2× announce interval a single dropped announce evicts a healthy peer; PlumTree gossip is best-effort, so single drops occur.
+The rejected peer-eviction alternatives (reputation-priority eviction, lazy deregistration, LRU under a hard size cap, persisting the table across restarts, eviction by `announce.timestamp_us`, shorter TTL aligned to one announce interval) are recorded in [`_history/alternatives-pre-launch.md` § Peer Table Eviction Policy (appendix)](_history/alternatives-pre-launch.md#peer-table-eviction-policy-appendix).

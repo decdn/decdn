@@ -303,8 +303,7 @@ stateDiagram-v2
 
 ## Alternatives Considered
 
-- **Separate `BlacklistAppealRegistry` contract.** Rejected for the reason stated under [§ Decision](#decision): cross-contract hops on every transition, no audit-surface savings, and the cleanup admissibility tests depend on `ContentBlacklist` state anyway.
-- **Per-appeal escrow contract** (one contract per active appeal, holding its own bond). Rejected as massive deployment overhead for no benefit; `ContentBlacklist` itself custodies bonds and burns / refunds them inline.
+The rejected contract-shape alternatives (separate `BlacklistAppealRegistry` contract, per-appeal escrow contract) are recorded in [`_history/alternatives-pre-launch.md` § ADR 031 — ContentBlacklist Appeal-Contract Surface](_history/alternatives-pre-launch.md#adr-031--contentblacklist-appeal-contract-surface).
 
 ## References
 

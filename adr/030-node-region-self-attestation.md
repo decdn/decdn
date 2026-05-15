@@ -95,10 +95,7 @@ Backstops for the pre-positioned case are deliberately off-protocol: (a) declare
 
 ## Alternatives Considered
 
-- **IP-geolocation oracle (Chainlink Functions, governance-approved oracle set, or similar).** Rejected. (a) Introduces a centralized trust root — the oracle operator(s) become a choke point that can blackhole or misclassify a node's region; (b) systematically misclassifies legitimate deployments behind VPN, anycast, IXP relays, or mobile/cellular allocations; (c) creates a net-new external dependency for the codebase (no oracle infrastructure exists in `crates/incentive/` or the contracts directory today); (d) does not produce a strictly better signal than the latency/reputation loop already in place — IP-geolocation databases are themselves imperfect heuristics over BGP allocations.
-- **Required attestation at announce time (every `NodeAnnounce` carries a fresh oracle-signed attestation; gossip drops announces without one).** Rejected for the same reasons plus a harder operational floor — a brief oracle outage now causes every node's announces to age out, partitioning the gossip mesh until the oracle recovers.
-- **Peer-witnessed latency challenge with on-chain dispute (mirror [ADR 028 § 3](028-slashing-appeals.md#3-eligibility-and-evidence-standard) evidence-bundle pattern for region claims).** Rejected as overengineered. The same latency signal is already used at lower cost by the [ADR 001 § Consequences](001-network.md#consequences) reputation penalty; promoting it to an on-chain adjudication path adds bond economics, multisig load, and a new ratification window without changing the operational outcome (a misdeclaring node already loses payouts under the soft path).
-- **Scoping-only ADR (document the requirements/interface, defer mechanism).** Rejected — this is the posture issue #400 already objects to, and re-issuing it under a new ADR number does not close the gap.
+The rejected region-attestation alternatives (IP-geolocation oracle, required announce-time attestation, peer-witnessed on-chain dispute, scoping-only ADR) are recorded in [`_history/alternatives-pre-launch.md` § ADR 030 — Node Region Self-Attestation](_history/alternatives-pre-launch.md#adr-030--node-region-self-attestation).
 
 ## Cross-ADR Impact
 

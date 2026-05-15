@@ -213,9 +213,7 @@ Disbursement of queued claims is permissionless via the head-of-queue path pinne
 
 ## Alternatives Considered
 
-- **Dedicated `SlashAppealRegistry` contract.** Rejected for the reason stated under [§ Decision](#decision): cross-contract hops on every transition, no audit-surface savings, and the `payout()` integration would need to be re-exposed. Mirrors ADR 031's rejection of `BlacklistAppealRegistry`.
-- **Per-appeal `counterBundleFiler` storage field.** Considered for §2's bond-routing dispatch (counter-bundle filer recorded at gate-3 acceptance, read at `reverseAppeal`). Rejected: the gate-3 state already exists on `SafetyReserve` proper; duplicating it into the `Appeal` struct would cost another slot per appeal and require two writes (gate-3 + appeal) on every counter-bundle acceptance. The current design reads gate-3 state directly and surfaces the recipient via the `bondSplitRecipient` event field.
-- **Five-condition `LapseReason` enum (ADR 031 style).** Rejected: slash appeals have only two lapse triggers (multisig timeout, ratification timeout), with no standing-path or global-override analogue. A two-enum mapping would over-engineer the case set; the `(escrowReturned == 0)` test suffices for off-chain disambiguation.
+The rejected contract-shape alternatives (dedicated `SlashAppealRegistry`, per-appeal `counterBundleFiler` storage field, five-condition `LapseReason` enum) are recorded in [`_history/alternatives-pre-launch.md` § ADR 032 — SafetyReserve Appeal-Surface](_history/alternatives-pre-launch.md#adr-032--safetyreserve-appeal-surface).
 
 ## References
 
