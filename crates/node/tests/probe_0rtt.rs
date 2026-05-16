@@ -327,3 +327,83 @@ async fn rejected_0rtt_falls_back_after_server_restart() -> anyhow::Result<()> {
     shutdown_server(router2, server_ep2).await?;
     Ok(())
 }
+
+/// CHARACTERIZATION TEST — pins iroh 0.98.2's actual 0-RTT behavior so
+/// the safety model documented in ADR 015 cannot silently drift from
+/// reality (an earlier draft of this PR wrongly claimed per-ALPN 0-RTT
+/// gating was "structural via `on_accepting`"; this test exists because
+/// that claim was false).
+///
+/// iroh sets `crypto.max_early_data_size = u32::MAX` on *every* server
+/// TLS config (`iroh::tls::make_server_config`), so the QUIC/TLS layer
+/// accepts 0-RTT early data for **any** ALPN regardless of whether the
+/// handler overrides `on_accepting`. A handler that keeps the default
+/// (`accepting.await`, what `enable_0rtt = false` and every non-probe
+/// handler use) therefore STILL has the client's 0-RTT *accepted* — it
+/// only reads the early-data streams post-handshake instead of pre-.
+///
+/// Hence 0-RTT replay safety is **client-side only**: the sole code that
+/// calls `into_0rtt()` / sends early data is `probe_once`, hard-wired to
+/// `ALPN_PROBE` (an idempotent, replay-safe request per ADR 015 §Replay
+/// Safety). No `cdn/client/v1` / `cdn/dht/v1` client sends early data, so
+/// none can be replayed — server-side `on_accepting` is not the barrier.
+///
+/// This test asserts the real behavior (`accepted == 1` on a default
+/// handler). If a future iroh bump changes it (drops early data on the
+/// default path) OR someone makes a non-probe client attempt 0-RTT, the
+/// assertions break and force re-evaluation of ADR 015's safety model.
+#[tokio::test(flavor = "multi_thread")]
+async fn default_on_accepting_still_accepts_0rtt_safety_is_client_side() -> anyhow::Result<()> {
+    let metrics = Arc::new(Metrics::new());
+    // Server handler 0-RTT OFF => on_accepting == the default
+    // full-handshake path every non-probe ALPN inherits.
+    let (router, server_ep, server_id, server_addr) =
+        spawn_server(&metrics, false, SecretKey::generate()).await?;
+    // Client 0-RTT ON => it WILL attempt early data once it has a ticket.
+    let client = client_endpoint().await?;
+    let sink = MetricsSink(Arc::clone(&metrics));
+    let timeout = Duration::from_secs(5);
+    let target = || EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    // Probe 1 — cold: 1-RTT; the default-path server still issues a
+    // NewSessionTicket (rustls `send_tls13_tickets > 0`) so the client
+    // caches one.
+    let (r1, _) = probe_once(&client, target(), 0xE1, true, Some(&sink), timeout).await?;
+    assert_eq!(r1.nonce, 0xE1);
+
+    // Probe 2 — client has a ticket, attempts 0-RTT. Characterization:
+    // the default `on_accepting` does NOT prevent acceptance (global
+    // max_early_data_size), so the server accepts and the probe rides
+    // 0-RTT. Safety here is solely that the request is an idempotent
+    // probe — not that the server refused it.
+    let (r2, _) = probe_once(&client, target(), 0xE2, true, Some(&sink), timeout).await?;
+    assert_eq!(r2.nonce, 0xE2);
+
+    let text = metrics.encode()?;
+    assert!(
+        has_metric_line(&text, "decdn_quic_0rtt_attempts_total", 1),
+        "client must have attempted 0-RTT on the warm probe:\n{text}"
+    );
+    assert!(
+        has_metric_line(&text, "decdn_quic_0rtt_accepted_total", 1),
+        "CHARACTERIZATION: iroh accepts 0-RTT even with the default \
+         on_accepting (global max_early_data_size); if this flips, ADR \
+         015's client-side-only safety model must be re-derived:\n{text}"
+    );
+    assert!(
+        has_metric_line(&text, "decdn_quic_0rtt_rejected_total", 0),
+        "no rejection: the default path still accepts the 0-RTT:\n{text}"
+    );
+    // The `enable_0rtt = false` handler returns before
+    // `note_session_ticket_peer`, so the gauge stays untouched even
+    // though the TLS layer accepted 0-RTT — the switch's only real
+    // server-side effect.
+    assert!(
+        has_metric_line(&text, "decdn_quic_session_ticket_cache_size", 0),
+        "disabled handler must not feed the session-ticket gauge:\n{text}"
+    );
+
+    client.close().await;
+    shutdown_server(router, server_ep).await?;
+    Ok(())
+}

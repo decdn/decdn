@@ -48,11 +48,11 @@ pub struct ProbeHandler {
     metrics: Arc<Metrics>,
     limiter: Arc<ConnectionLimiter>,
     /// ADR 015 master switch (`network.enable_0rtt`). When `true`, this
-    /// handler overrides `on_accepting` to accept QUIC 0-RTT for
-    /// `cdn/probe/v1` (the per-ALPN gate is structural: only handlers
-    /// that override `on_accepting` ever surface early data). When
-    /// `false`, the default full-handshake `on_accepting` is used and the
-    /// connection is served 1-RTT, exactly as before ADR 015.
+    /// handler overrides `on_accepting` to read the probe as pre-handshake
+    /// 0-RTT. When `false`, the default `on_accepting` is used. The 1-RTT
+    /// downgrade is effected client-side (`probe_once` emits no early data
+    /// when off) — not by this handler refusing 0-RTT; see the
+    /// `on_accepting` doc and ADR 015 §"Replay Safety Is Client-Side".
     enable_0rtt: bool,
 }
 
@@ -172,30 +172,35 @@ impl ProbeHandler {
 }
 
 impl ProtocolHandler for ProbeHandler {
-    /// ADR 015 §Server-Side Controls. Overriding `on_accepting` is what
-    /// makes `cdn/probe/v1` 0-RTT-eligible — handlers that keep the
-    /// default (gossip, future client/dht) await the full handshake and
-    /// the QUIC stack drops any early data, so the per-ALPN guarantee is
-    /// structural, not a TLS knob.
+    /// ADR 015. This override is a *latency/structuring* choice, **not**
+    /// the replay-safety boundary. iroh sets `max_early_data_size =
+    /// u32::MAX` on every server TLS config, so a handler that keeps the
+    /// default `accepting.await` STILL has the client's 0-RTT accepted and
+    /// still processes the early data (just post-handshake). Per-ALPN
+    /// safety is enforced client-side: `probe_once` is the only code that
+    /// emits early data and it is hard-wired to `ALPN_PROBE` (idempotent,
+    /// replay-safe). See ADR 015 §"Replay Safety Is Client-Side" and the
+    /// `default_on_accepting_still_accepts_0rtt_safety_is_client_side`
+    /// characterization test.
     ///
-    /// `Accepting::into_0rtt()` accepts the client's early data when a
-    /// resumption ticket is present (0-RTT) and enables 0.5-RTT
-    /// otherwise. When the client did send early data (it had a cached
-    /// ticket), its request rode with the `ClientHello` and the handshake
-    /// round trip is saved; a cold client is an ordinary 1-RTT connection.
-    /// We resolve the connection via `handshake_completed()` and then
-    /// serve it through the unchanged 1-RTT `serve()` path: any latency
-    /// win is already banked client-side, and serving post-handshake
-    /// keeps the limiter, metrics, and ADR 013 error mapping operating on
-    /// a connection with a known, authenticated peer. A completed
-    /// handshake also means the server has emitted its `NewSessionTicket`
-    /// (rustls default `send_tls13_tickets > 0` — a dependency default,
+    /// What the override buys: the probe is read as true 0-RTT *before*
+    /// handshake completion instead of post-handshake. `into_0rtt()`
+    /// accepts the client's early data when a resumption ticket is present
+    /// and enables 0.5-RTT otherwise; a cold client is an ordinary 1-RTT
+    /// connection. We resolve via `handshake_completed()` and serve
+    /// through the unchanged `serve()` path so the limiter, metrics, and
+    /// ADR 013 error mapping operate on a connection with a known,
+    /// authenticated peer. A completed handshake also means the server
+    /// has emitted its `NewSessionTicket` (rustls defaults
+    /// `send_tls13_tickets` to a non-zero value — a dependency default,
     /// not a protocol guarantee), so the peer is counted toward the
     /// approximate session-ticket gauge.
     ///
-    /// When the master switch is off, fall back to the default behavior
-    /// (await the full handshake) so the node is byte-for-byte the
-    /// pre-ADR-015 1-RTT server.
+    /// With the master switch off we keep the default `on_accepting`: the
+    /// server no longer reads probes pre-handshake or feeds the gauge.
+    /// That alone does not refuse 0-RTT (the TLS layer still would) — the
+    /// genuine 1-RTT downgrade comes from `probe_once` not emitting early
+    /// data when the switch is off.
     async fn on_accepting(&self, accepting: Accepting) -> Result<Connection, AcceptError> {
         if !self.enable_0rtt {
             // `ConnectingError` implements `std::error::Error`; pass it to

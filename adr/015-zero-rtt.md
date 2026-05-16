@@ -51,10 +51,15 @@ resuming connection's ALPN matches the ticket's, so early data sent under one AL
 ticket is rejected if replayed against a different ALPN — but the 1-RTT session
 resumption itself is not ALPN-scoped. The implementation therefore MUST:
 
-1. **Size the ticket cache to 1,000 entries** via `Endpoint::builder().max_tls_tickets(1000)`
-   on every endpoint that probes or serves probes (iroh's default is 256). At PoC
-   scale (~30 nodes x 1 eligible ALPN) this is ample headroom; LRU eviction beyond
-   1,000 is handled by rustls.
+1. **Size the client ticket cache to 1,000 entries** via
+   `Endpoint::builder().max_tls_tickets(1000)` (iroh's default is 256). Note this
+   knob sizes only the *client-side* `ClientSessionMemoryCache` — the tickets a node
+   caches for servers it probes. The *serving* side's resumption store is
+   rustls-internal at rustls's own default and is **not** sized by this knob; that is
+   acceptable because the serving side only needs enough state to honor recent
+   resumptions and is not the latency-critical path. At PoC scale (~30 nodes x 1
+   eligible ALPN) the client cache never approaches 1,000; LRU eviction beyond it is
+   handled by rustls.
 2. **Linger briefly before closing** so the server's NewSessionTicket frame arrives
    and rustls can store it. After the application exchange completes, wait (bounded:
    minimum 100ms, target 2x the measured RTT, maximum 2 seconds) on the connection's
@@ -78,26 +83,50 @@ Servers MAY reject 0-RTT at any time (e.g., after key rotation, ticket expiry, o
 
 Implementations SHOULD NOT treat 0-RTT rejection as an error — it is a normal part of the protocol. The rejection path is functionally equivalent to a cold connection; the only cost is one wasted round trip of early data.
 
-### Server-Side Controls
+### Replay Safety Is Client-Side, Not Server-Gated
 
-0-RTT acceptance is gated **per handler**, not per TLS config. iroh enables
-`max_early_data_size` globally on the server crypto config, but early data only
-reaches the application if a handler overrides `ProtocolHandler::on_accepting` to call
-`Accepting::into_0rtt()`. The default `on_accepting` awaits the full handshake and
-the QUIC stack drops any 0-RTT packets. This gives exactly the required per-ALPN
-behavior:
+> **Implementation reality (iroh 0.98.x).** An earlier draft asserted that 0-RTT was
+> gated *server-side per handler* — that only an `on_accepting` override exposes early
+> data and the default handler makes the QUIC stack drop it. **That is false** and is
+> recorded here so the safety model is not misunderstood. iroh sets
+> `crypto.max_early_data_size = u32::MAX` on *every* server TLS config
+> (`iroh::tls::make_server_config`), so the TLS/QUIC layer accepts 0-RTT early data
+> for **any** ALPN regardless of the handler. `Accepting::into_0rtt()` only changes
+> *when* the application reads the early-data streams (before vs. after handshake
+> completion); it does **not** decide whether 0-RTT is accepted. A handler that keeps
+> the default `accepting.await` still has the client's 0-RTT accepted and still
+> processes the early data (post-handshake). This is pinned by the characterization
+> test `default_on_accepting_still_accepts_0rtt_safety_is_client_side`.
 
-- **`cdn/probe/v1`:** The probe handler overrides `on_accepting` to accept 0-RTT and
-  process the early-data `ProbeRequest`.
-- **`cdn/client/v1`:** No override — keeps the default full-handshake `on_accepting`.
-  Early data is never surfaced to the payment handler.
-- **`cdn/dht/v1`:** No override — same default as `cdn/client/v1`.
+The replay-safety guarantee is therefore **enforced on the client side**: the only
+code path that calls `Connecting::into_0rtt()` / transmits early data is the probe
+client (`probe_once`), and it is hard-wired to `cdn/probe/v1`. No `cdn/client/v1` or
+`cdn/dht/v1` client ever sends early data, so a state-changing `StreamRequest` /
+`StoreRequest` is never transmitted as replayable 0-RTT in the first place — which is
+exactly the property [§Replay Safety Analysis](#replay-safety-analysis) requires. The
+load-bearing invariant is "exactly one 0-RTT-emitting client path, hard-wired to the
+idempotent probe ALPN", not any server-side per-handler gate.
 
-A node-wide master switch, `network.enable_0rtt` (default `true`), is provided as an
-operational kill switch: when `false`, the probe handler falls back to the default
-full-handshake `on_accepting` and probe clients fall back to plain 1-RTT
-`connect`. It does not weaken the per-ALPN guarantee — it only disables 0-RTT for the
-one ALPN that opts in.
+Server-side, the probe handler still overrides `on_accepting` (to read the probe as
+true 0-RTT pre-handshake rather than post-handshake) and other handlers keep the
+default — but this is a latency/structuring choice, **not** the safety boundary:
+
+- **`cdn/probe/v1`:** `on_accepting` override → early-data `ProbeRequest` read
+  pre-handshake. Replay-safe because the request is idempotent and read-only.
+- **`cdn/client/v1` / `cdn/dht/v1`:** default `on_accepting`. The TLS layer would
+  still accept 0-RTT, but no client sends any, so none is processed.
+
+If a future non-probe client is ever made to attempt 0-RTT, this client-side
+invariant breaks and a real server-side barrier (or removing the global
+`max_early_data_size`) would be required first — see Consequences.
+
+A node-wide master switch, `network.enable_0rtt` (default `true`), is the operational
+kill switch. Its effective mechanism is **client-side**: when `false`, `probe_once`
+takes the plain `connect().await` path and transmits no early data, so the connection
+is genuinely 1-RTT. Setting it `false` also makes the probe handler keep the default
+`on_accepting` (so it stops reading early data pre-handshake and stops feeding the
+session-ticket gauge), but on its own that server-side change does not reject 0-RTT —
+the client not sending early data is what does.
 
 ### Impact on Probe Latency
 
@@ -124,13 +153,19 @@ is label-free:
 | `decdn_quic_0rtt_attempts_total` | Counter | 0-RTT connection attempts (a cached ticket existed and early data was sent) |
 | `decdn_quic_0rtt_accepted_total` | Counter | 0-RTT accepted by server |
 | `decdn_quic_0rtt_rejected_total` | Counter | 0-RTT rejected, fell back to 1-RTT |
-| `decdn_quic_session_ticket_cache_size` | Gauge | Approximate cached-ticket count (see note) |
+| `decdn_quic_session_ticket_cache_size` | Gauge | Approximate 0-RTT working-set proxy (see note) |
+| `decdn_quic_session_ticket_peers_dropped_total` | Counter | Distinct new peers dropped because the tracking set hit its memory-safety ceiling (Sybil-saturation signal) |
 
-`decdn_quic_session_ticket_cache_size` is an **approximation**: rustls owns the
-session store and exposes no API to read its size, so the node tracks the number of
-distinct remote endpoints with which it completed a 0-RTT-eligible handshake,
-saturating at the 1,000-entry ceiling. It is a close upper bound on the real cache
-occupancy at PoC scale, where the working set is far below the ceiling.
+`decdn_quic_session_ticket_cache_size` is an **approximation / proxy**, not a read of
+any rustls cache: rustls owns the session stores and exposes no size API, and the
+server-side store these handshakes populate is rustls-internal at rustls's own
+default (iroh's `max_tls_tickets` sizes only the client store). The node instead
+tracks the number of distinct remote endpoints with which it completed a
+0-RTT-eligible *server* handshake, in a set bounded for memory safety at the same
+1,000-entry ceiling the client cache uses. At PoC scale the working set is far below
+that ceiling, so the proxy tracks the real working set closely; once the bound
+engages, `decdn_quic_session_ticket_peers_dropped_total` rises so saturation is
+distinguishable from organic growth.
 
 `probe_collection_latency_seconds` (a histogram labeled `0rtt=warm|cold`) is
 **deferred**: it measures the node's cache-miss probe-collection loop, which does not
@@ -140,7 +175,8 @@ under Consequences and SHOULD be added when that loop lands.
 ## Consequences
 
 - **Probe latency improves** for warm connections (all connections after the first cycle). The 1-RTT handshake cost is eliminated from the critical path.
-- **No change to payment security.** `cdn/client/v1` remains 1-RTT-only. Payment channel setup and voucher exchange are never sent as early data.
+- **No change to payment security** — but the mechanism is client-side. `cdn/client/v1` / `cdn/dht/v1` are never sent as 0-RTT because no client emits early data for them, **not** because the server rejects it (iroh's global `max_early_data_size` means the server-side TLS would accept 0-RTT for any ALPN). Safety rests on there being exactly one 0-RTT-emitting client path, hard-wired to the idempotent probe ALPN.
+- **Defense-in-depth gap (accepted at PoC scale):** there is no server-side barrier. A future `cdn/client/v1` / `cdn/dht/v1` client that mistakenly called `into_0rtt()` would have its state-changing request accepted and replayably processed by the server. Mitigation if that risk materializes: drop the unconditional global `max_early_data_size` (needs an iroh change or fork), or have non-probe handlers detect and reset 0-RTT-opened streams (`RecvStream::is_0rtt`). Tracked as a follow-up; not required while the single hard-wired probe client is the only 0-RTT emitter.
 - **Session ticket storage** adds a small memory footprint (~200 bytes per ticket x 1,000 max = ~200 KB), owned by rustls inside iroh.
 - **Complexity cost** is modest: iroh's `Connecting::into_0rtt()` / `Accepting::into_0rtt()` handle the transport-level details and the ticket store. The implementation burden is the per-handler `on_accepting` override, the client attempt/fallback path, the `max_tls_tickets` sizing, and the metrics.
 - **Future protocol versions** that add state-changing behavior to `ProbeRequest` must re-evaluate 0-RTT eligibility. The replay safety analysis in this ADR is tied to the current message semantics.

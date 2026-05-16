@@ -86,21 +86,37 @@ pub struct DecdnMetrics {
     /// 1-RTT handshake and re-sent the request. Operator-visible name:
     /// `decdn_quic_0rtt_rejected_total`.
     pub quic_0rtt_rejected: Counter,
-    /// Approximate count of cached TLS session tickets (ADR 015
-    /// §Observability). rustls owns the real session store and exposes no
-    /// size API, so this tracks the number of distinct remote endpoints
-    /// that completed a probe handshake on the 0-RTT-enabled server path —
-    /// cold clients (no ticket presented) included, since the server still
-    /// issues a `NewSessionTicket` to each. It is therefore an *upper
-    /// bound* on live cached tickets, not a count of resumed connections,
-    /// saturating at the 1,000-entry ceiling — close at `PoC` scale.
+    /// Approximate 0-RTT working-set size (ADR 015 §Observability).
+    /// rustls owns the real session stores and exposes no size API, so
+    /// this is a *proxy*: the number of distinct remote endpoints that
+    /// completed a probe handshake on the 0-RTT-enabled server path —
+    /// cold clients included, since the server still issues a
+    /// `NewSessionTicket` to each. It is **not** a mirror of any specific
+    /// rustls cache: server-side resumption state lives in rustls's
+    /// internal, default-sized server store (iroh's `max_tls_tickets`
+    /// knob sizes only the *client* `ClientSessionMemoryCache`). The
+    /// value saturates at `SESSION_TICKET_CACHE_CEILING` because the
+    /// backing set is bounded there for memory safety, not because it
+    /// tracks a cache of that size — close at `PoC` scale either way.
     pub quic_session_ticket_cache_size: Gauge,
+    /// Distinct *new* peers dropped from the tracking set because it hit
+    /// `SESSION_TICKET_CACHE_CEILING`. Zero under organic load at `PoC`
+    /// scale; a rising value means the unauthenticated probe handler is
+    /// being fed many distinct node ids — i.e. it distinguishes a
+    /// Sybil-style saturation from the gauge legitimately reaching the
+    /// ceiling. Operator-visible name:
+    /// `decdn_quic_session_ticket_peers_dropped_total`.
+    pub quic_session_ticket_peers_dropped: Counter,
 }
 
-/// ADR 015 §Session Ticket Management: the iroh/rustls session cache is
-/// sized to [`decdn_protocol::SESSION_TICKET_CACHE_SIZE`] entries. The
-/// gauge saturates at that same value rather than reporting
-/// a distinct-peer count that could exceed the real (LRU-bounded) cache.
+/// Self-imposed cap on the distinct-peer tracking set (and hence the
+/// `quic_session_ticket_cache_size` gauge). It is **not** a rustls cache
+/// size — the server-side ticket store is rustls-internal and untouched
+/// by iroh's `max_tls_tickets`. We reuse
+/// [`decdn_protocol::SESSION_TICKET_CACHE_SIZE`] (the value that *does*
+/// size the client-side `ClientSessionMemoryCache`) purely so the node's
+/// 0-RTT memory budget is described by one number across client and
+/// server roles.
 const SESSION_TICKET_CACHE_CEILING: usize = decdn_protocol::SESSION_TICKET_CACHE_SIZE;
 
 /// Aggregated deCDN node metrics.
@@ -270,15 +286,24 @@ impl Metrics {
     /// to generate) would otherwise grow the set without limit — a slow
     /// memory-exhaustion vector on untrusted input. Once the set is full
     /// new peers are no longer tracked (re-noting an already-tracked peer
-    /// stays a no-op); the gauge then sits at the ceiling, still a valid
-    /// upper bound on the real rustls LRU, which is itself capped at
-    /// `SESSION_TICKET_CACHE_CEILING`.
+    /// stays a no-op) and `quic_session_ticket_peers_dropped` is bumped so
+    /// the saturation is distinguishable from organic growth; the gauge
+    /// then sits at the ceiling. The ceiling is the node's own memory
+    /// bound, not a rustls cache size (see `SESSION_TICKET_CACHE_CEILING`).
     pub fn note_session_ticket_peer(&self, remote_id: [u8; 32]) {
         let Ok(mut peers) = self.session_ticket_peers.lock() else {
             return;
         };
         if peers.len() < SESSION_TICKET_CACHE_CEILING {
             peers.insert(remote_id);
+        } else if !peers.contains(&remote_id) {
+            // Set is full AND this is a genuinely new peer: the memory
+            // bound is engaging on (untrusted) input. Surface it so a
+            // Sybil-style flood is distinguishable from organic
+            // saturation. Re-noting an already-tracked peer is a
+            // legitimate no-op and must NOT count as a drop, or the
+            // counter becomes noise.
+            self.decdn.quic_session_ticket_peers_dropped.inc();
         }
         let size = peers.len();
         self.decdn
@@ -509,6 +534,7 @@ mod tests {
             "decdn_quic_0rtt_attempts_total",
             "decdn_quic_0rtt_accepted_total",
             "decdn_quic_0rtt_rejected_total",
+            "decdn_quic_session_ticket_peers_dropped_total",
         ] {
             assert!(
                 has_metric_line(&text, name, 0),
@@ -571,6 +597,12 @@ mod tests {
         // not merely the reported gauge.
         let len = metrics.session_ticket_peers.lock().unwrap().len();
         assert_eq!(len, SESSION_TICKET_CACHE_CEILING);
+        // The 50 distinct peers beyond the ceiling were each counted as a
+        // drop, so the saturation is observable (not silent).
+        assert!(
+            has_metric_line(&text, "decdn_quic_session_ticket_peers_dropped_total", 50),
+            "expected 50 dropped peers, got:\n{text}"
+        );
     }
 
     #[tokio::test]

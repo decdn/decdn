@@ -665,12 +665,14 @@ async fn build_endpoint(
     Endpoint::builder(presets::N0)
         .secret_key(secret_key.clone())
         .transport_config(transport_config)
-        // ADR 015 §Session Ticket Management: size the iroh/rustls
-        // session-ticket LRU to 1,000 entries (default is 256). This is
-        // the cache ADR 015 specifies; rustls keys it by remote endpoint
-        // id and bounds it LRU. Set unconditionally — it only matters
-        // when a peer resumes, and `network.enable_0rtt` gates whether
-        // the probe handler accepts that resumption.
+        // ADR 015 §Session Ticket Management. In iroh this knob sizes
+        // only the *client-side* `ClientSessionMemoryCache` — i.e. the
+        // tickets THIS node caches when it probes others (default 256;
+        // we raise it). The inbound/serving side's ticket store is
+        // rustls-internal and unaffected by this. Set unconditionally:
+        // it only matters when this node resumes outbound, and
+        // `network.enable_0rtt` gates whether the probe handler accepts
+        // inbound resumption.
         .max_tls_tickets(decdn_protocol::SESSION_TICKET_CACHE_SIZE)
         .bind_addr(bind_addr)
         .map_err(|e| anyhow::anyhow!("invalid bind addr {bind_addr}: {e}"))?
