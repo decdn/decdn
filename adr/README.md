@@ -20,7 +20,7 @@ For first-time readers, follow this thematic order rather than the numeric one. 
 1. **Foundations** — language stack, network topology, content addressing, wire protocol.
 2. **Discovery** — DHT-based content lookup, QUIC 0-RTT.
 3. **Payments** — channels, vouchers, multi-token allowlist, client architecture, smart-wallet support.
-4. **Tokenomics & incentives** — gauge-boost, delivery receipts, liquidity strategy, deferred follow-ups.
+4. **Tokenomics & incentives** — gauge-boost tokenomics, liquidity strategy, deferred follow-ups.
 5. **Verification & enforcement** — on-chain slashing evidence, reputation, content takedown.
 6. **Governance & contracts** — Governor + Timelock model, contract interaction map.
 7. **Operations** — node onboarding.
