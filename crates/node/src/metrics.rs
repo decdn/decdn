@@ -112,9 +112,10 @@ pub struct Metrics {
     started_at: Instant,
     /// Distinct remote endpoint ids with a completed 0-RTT-eligible
     /// handshake. Backs the approximate `quic_session_ticket_cache_size`
-    /// gauge (rustls exposes no session-store size API). At `PoC` scale the
-    /// working set is tens of peers, far below the cache ceiling, so the
-    /// set's own memory is negligible and it is never pruned.
+    /// gauge (rustls exposes no session-store size API). Bounded at
+    /// `SESSION_TICKET_CACHE_CEILING` entries by `note_session_ticket_peer`
+    /// — the insert path is fed by the unauthenticated probe handler, so
+    /// the cap is what stops an unbounded-distinct-peer memory leak.
     session_ticket_peers: Mutex<HashSet<[u8; 32]>>,
 }
 
@@ -259,16 +260,27 @@ impl Metrics {
 
     /// Note a remote endpoint with which a 0-RTT-eligible handshake
     /// completed, refreshing the approximate
-    /// `quic_session_ticket_cache_size` gauge. Idempotent per peer. The
-    /// gauge saturates at `SESSION_TICKET_CACHE_CEILING` because the
-    /// real rustls cache is LRU-bounded there; a poisoned lock is treated
-    /// as "skip the update" rather than panicking (anti-panic policy).
+    /// `quic_session_ticket_cache_size` gauge. Idempotent per peer; a
+    /// poisoned lock is treated as "skip the update" rather than
+    /// panicking (anti-panic policy).
+    ///
+    /// The tracking set is itself bounded at `SESSION_TICKET_CACHE_CEILING`,
+    /// not just the gauge value: this is called from the *unauthenticated*
+    /// probe handler, so a peer presenting many distinct node ids (cheap
+    /// to generate) would otherwise grow the set without limit — a slow
+    /// memory-exhaustion vector on untrusted input. Once the set is full
+    /// new peers are no longer tracked (re-noting an already-tracked peer
+    /// stays a no-op); the gauge then sits at the ceiling, still a valid
+    /// upper bound on the real rustls LRU, which is itself capped at
+    /// `SESSION_TICKET_CACHE_CEILING`.
     pub fn note_session_ticket_peer(&self, remote_id: [u8; 32]) {
         let Ok(mut peers) = self.session_ticket_peers.lock() else {
             return;
         };
-        peers.insert(remote_id);
-        let size = peers.len().min(SESSION_TICKET_CACHE_CEILING);
+        if peers.len() < SESSION_TICKET_CACHE_CEILING {
+            peers.insert(remote_id);
+        }
+        let size = peers.len();
         self.decdn
             .quic_session_ticket_cache_size
             .set(i64::try_from(size).unwrap_or(i64::MAX));
@@ -534,6 +546,31 @@ mod tests {
             has_metric_line(&text, "decdn_quic_session_ticket_cache_size", 2),
             "expected 2 distinct peers, got:\n{text}"
         );
+    }
+
+    #[test]
+    fn session_ticket_set_is_bounded_against_unbounded_distinct_peers() {
+        // Regression: the insert path is fed by the unauthenticated probe
+        // handler, so the tracking set MUST stay bounded under a flood of
+        // distinct node ids — not just the gauge value.
+        let metrics = Metrics::new();
+        for i in 0..(SESSION_TICKET_CACHE_CEILING + 50) {
+            let mut id = [0u8; 32];
+            let tag = u64::try_from(i).unwrap().to_le_bytes();
+            id.iter_mut().zip(tag).for_each(|(dst, src)| *dst = src);
+            metrics.note_session_ticket_peer(id);
+        }
+
+        let ceiling = u64::try_from(SESSION_TICKET_CACHE_CEILING).unwrap();
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(&text, "decdn_quic_session_ticket_cache_size", ceiling),
+            "gauge must saturate at the ceiling, got:\n{text}"
+        );
+        // The set itself stopped growing at the ceiling (the leak fix),
+        // not merely the reported gauge.
+        let len = metrics.session_ticket_peers.lock().unwrap().len();
+        assert_eq!(len, SESSION_TICKET_CACHE_CEILING);
     }
 
     #[tokio::test]
