@@ -9,7 +9,7 @@ use decdn_protocol::{
     message::ProbeResponse, read_frame, write_frame,
 };
 use iroh::PublicKey;
-use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
+use iroh::endpoint::{Accepting, Connection, RecvStream, SendStream, VarInt};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 
 use crate::dispatch::{ConnectionLimiter, RejectReason};
@@ -47,6 +47,13 @@ pub struct ProbeHandler {
     rate_per_mb: Arc<AtomicU64>,
     metrics: Arc<Metrics>,
     limiter: Arc<ConnectionLimiter>,
+    /// ADR 015 master switch (`network.enable_0rtt`). When `true`, this
+    /// handler overrides `on_accepting` to accept QUIC 0-RTT for
+    /// `cdn/probe/v1` (the per-ALPN gate is structural: only handlers
+    /// that override `on_accepting` ever surface early data). When
+    /// `false`, the default full-handshake `on_accepting` is used and the
+    /// connection is served 1-RTT, exactly as before ADR 015.
+    enable_0rtt: bool,
 }
 
 impl std::fmt::Debug for ProbeHandler {
@@ -54,6 +61,7 @@ impl std::fmt::Debug for ProbeHandler {
         f.debug_struct("ProbeHandler")
             .field("node_id", &self.node_id)
             .field("rate_per_mb", &self.rate_per_mb)
+            .field("enable_0rtt", &self.enable_0rtt)
             .finish_non_exhaustive()
     }
 }
@@ -67,12 +75,14 @@ impl ProbeHandler {
         rate_per_mb: Arc<AtomicU64>,
         metrics: Arc<Metrics>,
         limiter: Arc<ConnectionLimiter>,
+        enable_0rtt: bool,
     ) -> Self {
         Self {
             node_id,
             rate_per_mb,
             metrics,
             limiter,
+            enable_0rtt,
         }
     }
 
@@ -162,6 +172,58 @@ impl ProbeHandler {
 }
 
 impl ProtocolHandler for ProbeHandler {
+    /// ADR 015 §Server-Side Controls. Overriding `on_accepting` is what
+    /// makes `cdn/probe/v1` 0-RTT-eligible — handlers that keep the
+    /// default (gossip, future client/dht) await the full handshake and
+    /// the QUIC stack drops any early data, so the per-ALPN guarantee is
+    /// structural, not a TLS knob.
+    ///
+    /// `Accepting::into_0rtt()` accepts the client's early data when a
+    /// resumption ticket is present (0-RTT) and enables 0.5-RTT
+    /// otherwise. When the client did send early data (it had a cached
+    /// ticket), its request rode with the `ClientHello` and the handshake
+    /// round trip is saved; a cold client is an ordinary 1-RTT connection.
+    /// We resolve the connection via `handshake_completed()` and then
+    /// serve it through the unchanged 1-RTT `serve()` path: any latency
+    /// win is already banked client-side, and serving post-handshake
+    /// keeps the limiter, metrics, and ADR 013 error mapping operating on
+    /// a connection with a known, authenticated peer. A completed
+    /// handshake also means the server has emitted its `NewSessionTicket`
+    /// (rustls default `send_tls13_tickets > 0` — a dependency default,
+    /// not a protocol guarantee), so the peer is counted toward the
+    /// approximate session-ticket gauge.
+    ///
+    /// When the master switch is off, fall back to the default behavior
+    /// (await the full handshake) so the node is byte-for-byte the
+    /// pre-ADR-015 1-RTT server.
+    async fn on_accepting(&self, accepting: Accepting) -> Result<Connection, AcceptError> {
+        if !self.enable_0rtt {
+            // `ConnectingError` implements `std::error::Error`; pass it to
+            // `AcceptError::from_err` directly (no `to_string()` flatten)
+            // so iroh's warn-on-drop log keeps the typed cause chain — the
+            // same fidelity the default `on_accepting` (`accepting.await?`)
+            // would have produced.
+            return accepting.await.map_err(AcceptError::from_err);
+        }
+        let zrtt = accepting.into_0rtt();
+        let conn = zrtt
+            .handshake_completed()
+            .await
+            .map_err(AcceptError::from_err)?;
+        // Approximate `quic_session_ticket_cache_size` (ADR 015
+        // §Observability). This counts every distinct peer that completed
+        // a probe handshake on the 0-RTT-enabled path — cold (no ticket
+        // presented) included — not only peers that actually resumed: the
+        // server issues a `NewSessionTicket` on each handshake (rustls
+        // default `send_tls13_tickets > 0`), so the peer becomes
+        // resumption-capable regardless. It is therefore an upper bound on
+        // live cached tickets, as the gauge's docs state. Idempotent per
+        // peer.
+        self.metrics
+            .note_session_ticket_peer(*conn.remote_id().as_bytes());
+        Ok(conn)
+    }
+
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         self.serve(connection)
             .await

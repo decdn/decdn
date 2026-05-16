@@ -282,6 +282,10 @@ pub async fn run(
         reload_state.rate_per_mb(),
         Arc::clone(&node_metrics),
         Arc::clone(&limiter),
+        // ADR 015 master switch. Restart-required (it changes the
+        // `on_accepting` wiring): the SIGHUP path reports any
+        // `[network]` change as "requires restart".
+        cfg.network.enable_0rtt,
     ));
 
     // Wrap the foreign `iroh-gossip` handler with `LimitedHandler` so the
@@ -661,6 +665,13 @@ async fn build_endpoint(
     Endpoint::builder(presets::N0)
         .secret_key(secret_key.clone())
         .transport_config(transport_config)
+        // ADR 015 §Session Ticket Management: size the iroh/rustls
+        // session-ticket LRU to 1,000 entries (default is 256). This is
+        // the cache ADR 015 specifies; rustls keys it by remote endpoint
+        // id and bounds it LRU. Set unconditionally — it only matters
+        // when a peer resumes, and `network.enable_0rtt` gates whether
+        // the probe handler accepts that resumption.
+        .max_tls_tickets(decdn_protocol::SESSION_TICKET_CACHE_SIZE)
         .bind_addr(bind_addr)
         .map_err(|e| anyhow::anyhow!("invalid bind addr {bind_addr}: {e}"))?
         .bind()
@@ -1173,6 +1184,7 @@ mod tests {
             network: ResolvedNetwork {
                 bind_port: 4433,
                 relay_url: None,
+                enable_0rtt: true,
             },
             blockchain: ResolvedBlockchain {
                 rpc_url: "http://localhost:8545".into(),

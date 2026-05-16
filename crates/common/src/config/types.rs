@@ -47,6 +47,12 @@ pub struct NetworkConfig {
     pub bind_port: Option<u16>,
     /// iroh relay URL.
     pub relay_url: Option<String>,
+    /// Master switch for QUIC 0-RTT on `cdn/probe/v1` (ADR 015). Absent =>
+    /// default (`true`). When `false`, the probe handler keeps the default
+    /// full-handshake `on_accepting` and probe clients fall back to plain
+    /// 1-RTT `connect` — an operational kill switch, not a per-ALPN knob
+    /// (0-RTT is structurally probe-only via the handler override).
+    pub enable_0rtt: Option<bool>,
 }
 
 /// Blockchain section of the config file.

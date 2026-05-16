@@ -65,6 +65,12 @@ tempfile = { workspace = true }
 # otherwise force us to use `libc::raise` directly.
 nix = { version = "0.31", default-features = false, features = ["signal"] }
 wiremock = { workspace = true }
+# `tests/probe_0rtt.rs` drives the server through the reusable
+# `probe_client::probe_once` 0-RTT helper (ADR 015) so the integration
+# test exercises the exact production client path. Dev-dep only — never
+# in the `decdn-node` binary dep tree (the dev-dep cycle with
+# `decdn-cli`'s own `decdn-node` dev-dep is permitted by Cargo).
+decdn-cli = { workspace = true }
 
 [lints]
 workspace = true

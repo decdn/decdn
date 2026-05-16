@@ -2626,6 +2626,7 @@ dependencies = [
  "bytes",
  "clap",
  "decdn-cache",
+ "decdn-cli",
  "decdn-common",
  "decdn-gossip",
  "decdn-incentive",

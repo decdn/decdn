@@ -3,16 +3,22 @@
 
 use decdn_common::cli;
 
+use super::probe_client::probe_once;
+
 /// Send a `cdn/probe/v1` request to a running node and print the response.
+///
+/// The transport path (0-RTT attempt + 1-RTT fallback, ADR 015) lives in
+/// [`probe_once`]. 0-RTT is always
+/// attempted here (`enable_0rtt = true`): a probe is read-only and
+/// idempotent, so early data is safe, and there is no per-invocation
+/// reason to disable it. A one-shot `decdn probe` starts cold — iroh's
+/// session cache is per-endpoint and this process builds a fresh
+/// endpoint — so the first (and only) attempt resolves 1-RTT; the
+/// machinery exists for the node's long-lived reuse, not the CLI's.
 pub async fn probe(args: &cli::ProbeArgs) -> anyhow::Result<()> {
     use std::str::FromStr;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
-    use decdn_protocol::{
-        ALPN_PROBE, ProbeMessage, decode_message, encode_message,
-        message::{ProbeRequest, ProbeResponse},
-        read_frame, write_frame,
-    };
     use iroh::endpoint::presets;
     use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl};
     use rand::Rng;
@@ -43,6 +49,10 @@ pub async fn probe(args: &cli::ProbeArgs) -> anyhow::Result<()> {
     let endpoint = Endpoint::builder(presets::Minimal)
         .secret_key(client_sk)
         .relay_mode(relay_mode)
+        // ADR 015 §Session Ticket Management: shared ticket-cache size
+        // (iroh's default is 256). Harmless for the one-shot CLI; matches
+        // the node's endpoint so the mechanism is identical.
+        .max_tls_tickets(decdn_protocol::SESSION_TICKET_CACHE_SIZE)
         .bind_addr(bind_addr)
         .map_err(|e| anyhow::anyhow!("invalid bind addr {bind_addr}: {e}"))?
         .bind()
@@ -60,57 +70,9 @@ pub async fn probe(args: &cli::ProbeArgs) -> anyhow::Result<()> {
     let timeout = Duration::from_millis(args.timeout_ms);
     let nonce: u64 = rand::rng().next_u64();
 
-    let started = Instant::now();
-    let result = tokio::time::timeout(timeout, async {
-        let conn = endpoint
-            .connect(target, ALPN_PROBE)
-            .await
-            .map_err(|e| anyhow::anyhow!("connect failed: {e}"))?;
-
-        let (mut send, mut recv) = conn
-            .open_bi()
-            .await
-            .map_err(|e| anyhow::anyhow!("open_bi failed: {e}"))?;
-
-        let payload = encode_message(&ProbeMessage::Request(ProbeRequest { nonce }))
-            .map_err(|e| anyhow::anyhow!("encode request: {e}"))?;
-        write_frame(&mut send, &payload)
-            .await
-            .map_err(|e| anyhow::anyhow!("write request: {e}"))?;
-        send.finish()
-            .map_err(|e| anyhow::anyhow!("finish stream: {e}"))?;
-
-        let frame = read_frame(&mut recv)
-            .await
-            .map_err(|e| anyhow::anyhow!("read response: {e}"))?;
-        let (msg, _rest) = decode_message::<ProbeMessage>(&frame)
-            .map_err(|e| anyhow::anyhow!("decode response: {e}"))?;
-        let resp: ProbeResponse = match msg {
-            ProbeMessage::Response(r) => r,
-            ProbeMessage::Request(_) => {
-                anyhow::bail!("unexpected ProbeMessage::Request from server");
-            }
-        };
-
-        conn.close(0u32.into(), b"probe-done");
-        Ok::<_, anyhow::Error>(resp)
-    })
-    .await;
-
-    let rtt_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let result = probe_once(&endpoint, target, nonce, true, None, timeout).await;
     endpoint.close().await;
-
-    let resp = match result {
-        Ok(inner) => inner?,
-        Err(_) => anyhow::bail!("probe timed out after {} ms", args.timeout_ms),
-    };
-
-    if resp.nonce != nonce {
-        anyhow::bail!(
-            "nonce mismatch: sent 0x{nonce:016x}, received 0x{:016x}",
-            resp.nonce
-        );
-    }
+    let (resp, rtt_ms) = result?;
 
     let mut stdout = std::io::stdout().lock();
     write_probe_response(&mut stdout, &resp, rtt_ms, nonce, args.json)

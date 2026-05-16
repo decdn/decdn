@@ -25,6 +25,14 @@ pub const ALPN_CLIENT: &[u8] = b"cdn/client/v1";
 /// ALPN protocol identifier for Kademlia-based content discovery (ADR 022).
 pub const ALPN_DHT: &[u8] = b"cdn/dht/v1";
 
+/// QUIC 0-RTT TLS session-ticket cache size (ADR 015 §Session Ticket
+/// Management). Passed to `Endpoint::builder().max_tls_tickets(..)` on
+/// every endpoint that probes or serves probes, and used as the
+/// saturation ceiling for the approximate `decdn_quic_session_ticket_cache_size`
+/// gauge. Single source of truth so the gauge's "upper bound on live
+/// cached tickets" invariant provably matches the real rustls LRU bound.
+pub const SESSION_TICKET_CACHE_SIZE: usize = 1000;
+
 /// Gossip topic for global node announcements and rate changes.
 pub const TOPIC_GLOBAL: &str = "cdn/global/v1";
 

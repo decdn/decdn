@@ -52,6 +52,7 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
         network: ResolvedNetwork {
             bind_port: 4433,
             relay_url: None,
+            enable_0rtt: true,
         },
         blockchain: ResolvedBlockchain {
             rpc_url: "http://localhost:8545".into(),

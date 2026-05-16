@@ -26,6 +26,11 @@ decdn-reputation = { path = "crates/reputation" }
 decdn-gossip = { path = "crates/gossip" }
 decdn-common = { path = "crates/common" }
 decdn-node = { path = "crates/node" }
+# Bin crate; only ever a dev-dependency (node integration tests reuse the
+# `probe_client` 0-RTT helper, ADR 015). Dev-dep cycle with `decdn-cli`'s
+# own `decdn-node` dev-dep is permitted by Cargo (dev-deps are outside the
+# library build graph).
+decdn-cli = { path = "crates/cli" }
 
 # Networking (iroh ecosystem, pinned per ADR 000)
 iroh = "0.98"

@@ -86,6 +86,9 @@ async fn probe_roundtrip() -> anyhow::Result<()> {
         Arc::new(AtomicU64::new(rate_per_mb)),
         Arc::clone(&metrics),
         limiter,
+        // 1-RTT path: this suite is the pre-ADR-015 loopback coverage.
+        // 0-RTT acceptance has its own dedicated test (probe_0rtt.rs).
+        false,
     ));
 
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_PROBE.to_vec()]).await?;
@@ -174,6 +177,9 @@ async fn spin_up_probe_harness() -> anyhow::Result<Harness> {
         Arc::new(AtomicU64::new(1)),
         Arc::clone(&metrics),
         limiter,
+        // 1-RTT path: this suite is the pre-ADR-015 loopback coverage.
+        // 0-RTT acceptance has its own dedicated test (probe_0rtt.rs).
+        false,
     ));
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_PROBE.to_vec()]).await?;
 
@@ -414,6 +420,9 @@ async fn probe_rate_limit_returns_rate_limited_close_code() -> anyhow::Result<()
         Arc::new(AtomicU64::new(1)),
         Arc::clone(&metrics),
         limiter,
+        // 1-RTT path: this suite is the pre-ADR-015 loopback coverage.
+        // 0-RTT acceptance has its own dedicated test (probe_0rtt.rs).
+        false,
     ));
 
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_PROBE.to_vec()]).await?;

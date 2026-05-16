@@ -186,6 +186,7 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
         network: ResolvedNetwork {
             bind_port: 4433,
             relay_url: None,
+            enable_0rtt: true,
         },
         blockchain: ResolvedBlockchain {
             rpc_url: "https://rpc.example/SECRET_TOKEN_abc123".to_string(),
