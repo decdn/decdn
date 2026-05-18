@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
@@ -19,6 +20,7 @@ use tokio::sync::Notify;
 use crate::error::{CacheError, CacheResult, OriginPullError};
 use crate::metrics::CacheMetrics;
 use crate::origin::{Origin, OriginKind};
+use crate::probe_hold::ProbeHoldOutcome;
 use crate::retry::{RetryPolicy, classify_io_error, drain_to_bytes, run_with_retry, should_buffer};
 
 /// Engine bundling a filesystem-backed iroh-blobs store with an optional
@@ -84,6 +86,29 @@ struct Inner {
     /// after `decdn run` is restarted, which is exactly the failure mode
     /// #279 needs to prevent.
     evicted: Mutex<HashSet<Hash>>,
+    /// Probe-triggered eviction holds (#318, ADR 005 §Probe-triggered
+    /// eviction hold). Maps a held hash to its hold *expiry* instant; a
+    /// held hash is invisible to [`CacheEngine::eviction_candidates`] until
+    /// expiry, composing *above* the LRU layer. Holds are per-blob, not
+    /// per-probe: many peers probing the same hash share (and refresh) one
+    /// entry, so the slot count is bounded by distinct held blobs, not
+    /// probe volume. Expired entries are swept lazily on every hold
+    /// admission and every `eviction_candidates` call (no background task).
+    ///
+    /// Like [`Self::pinned`] this only blocks *LRU* eviction — an explicit
+    /// operator [`CacheEngine::evict`] still wins (ADR
+    /// appendix-blob-cache-eviction.md §4: DMCA always wins), enforced
+    /// because [`CacheEngine::try_probe_hold`] gates on [`CacheEngine::has`]
+    /// which already
+    /// honors the evicted set.
+    probe_holds: Mutex<HashMap<Hash, Instant>>,
+    /// Hold-budget cap (ADR 005 §Hold budget). `0` disables `has_blob: true`
+    /// entirely. Set once from `cache.max_probe_holds` via
+    /// [`CacheEngine::set_max_probe_holds`] at runtime bring-up — `cache.*`
+    /// is restart-required (not hot-reloaded), so an atomic written once is
+    /// sufficient and avoids threading the value through every `open_*`
+    /// constructor and its many test call sites.
+    max_probe_holds: AtomicUsize,
     /// Append-only file holding lowercase-hex evicted hashes, one per line.
     /// Loaded on [`CacheEngine::open`]; appended to (with `fsync`) on every
     /// successful [`CacheEngine::evict`]. Lives at `<cache_dir>/evicted.log`.
@@ -777,6 +802,8 @@ impl CacheEngine {
                 inflight: Mutex::new(HashMap::new()),
                 pinned: ArcSwap::from(pinned.0),
                 evicted: Mutex::new(evicted),
+                probe_holds: Mutex::new(HashMap::new()),
+                max_probe_holds: AtomicUsize::new(crate::probe_hold::DEFAULT_MAX_PROBE_HOLDS),
                 evicted_log_path,
                 retry_policy,
                 metrics,
@@ -991,6 +1018,98 @@ impl CacheEngine {
             .contains(&hash)
     }
 
+    /// Set the probe-hold budget cap from `cache.max_probe_holds` (ADR 005
+    /// §Hold budget, #318). Called once by the runtime at bring-up. `0`
+    /// disables the hold path so [`Self::try_probe_hold`] always returns
+    /// `false` (the node then answers `has_blob: false` to every probe).
+    pub fn set_max_probe_holds(&self, max: usize) {
+        self.inner.max_probe_holds.store(max, Ordering::Relaxed);
+    }
+
+    /// Attempt to take (or refresh) a probe-triggered eviction hold on
+    /// `hash` for [`crate::probe_hold::PROBE_HOLD_DURATION`] (ADR 005
+    /// §Probe-triggered eviction hold).
+    ///
+    /// Returns [`ProbeHoldOutcome::Held`] only when the node may safely sign
+    /// `has_blob: true`: the blob is present, not operator-evicted, **and** a
+    /// hold is guaranteed for the full slashing window. Otherwise returns
+    /// [`ProbeHoldOutcome::Unavailable`] (absent/evicted) or
+    /// [`ProbeHoldOutcome::BudgetExhausted`] (present but `max == 0` or all
+    /// slots in use) so the caller signs `has_blob: false` without a second
+    /// cache lookup to classify the miss.
+    ///
+    /// Per-blob semantics: a hash already held has its expiry refreshed and
+    /// consumes no additional slot, so many peers probing one popular blob
+    /// share a single hold (ADR 005 §Hold budget). The common
+    /// already-held case is an O(1) lookup that skips the O(N) expiry
+    /// sweep; the sweep runs only when no live hold exists, bounding map
+    /// growth without a background task.
+    ///
+    /// The operator-evicted set is re-checked **while holding the
+    /// `probe_holds` lock**, closing the TOCTOU window where a concurrent
+    /// [`Self::evict`] (DMCA takedown) could land between the initial
+    /// [`Self::has`] check and granting the hold — a takedown always wins
+    /// (ADR appendix-blob-cache-eviction.md §4).
+    pub async fn try_probe_hold(&self, hash: Hash) -> CacheResult<ProbeHoldOutcome> {
+        // `has` returns false for operator-evicted hashes too.
+        if !self.has(hash).await? {
+            return Ok(ProbeHoldOutcome::Unavailable);
+        }
+        let max = self.inner.max_probe_holds.load(Ordering::Relaxed);
+        let now = Instant::now();
+        // `Instant + Duration` panics on overflow; saturate instead to keep
+        // the workspace anti-panic policy (clippy `unwrap_used`/`panic`).
+        let expiry = now
+            .checked_add(crate::probe_hold::PROBE_HOLD_DURATION)
+            .unwrap_or(now);
+        let mut guard = self
+            .inner
+            .probe_holds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+
+        // Fast path for popular re-probed blobs: a live hold already exists.
+        // O(1), no sweep. Still re-check the takedown set under the lock so a
+        // refresh can't resurrect just-evicted content.
+        if guard.get(&hash).is_some_and(|exp| *exp > now) {
+            if self.is_evicted(hash) {
+                return Ok(ProbeHoldOutcome::Unavailable);
+            }
+            guard.insert(hash, expiry);
+            return Ok(ProbeHoldOutcome::Held);
+        }
+
+        // No live hold — sweep expired entries before consulting the budget.
+        guard.retain(|_, exp| *exp > now);
+        // TOCTOU re-check: a concurrent `evict()` may have completed after
+        // the `has()` above. Under the lock, an evicted hash is never held.
+        if self.is_evicted(hash) {
+            return Ok(ProbeHoldOutcome::Unavailable);
+        }
+        if guard.len() >= max {
+            // Covers both budget exhaustion and the `max == 0` (holds
+            // disabled) case (ADR 005 §Hold budget).
+            return Ok(ProbeHoldOutcome::BudgetExhausted);
+        }
+        guard.insert(hash, expiry);
+        Ok(ProbeHoldOutcome::Held)
+    }
+
+    /// Number of currently-active (non-expired) probe holds, for the
+    /// `probe_hold_slots_used` metric (ADR 005). Sweeps expired entries as
+    /// a side effect so the gauge reflects live holds even with no probe
+    /// traffic.
+    pub fn probe_hold_slots_used(&self) -> usize {
+        let now = Instant::now();
+        let mut guard = self
+            .inner
+            .probe_holds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        guard.retain(|_, exp| *exp > now);
+        guard.len()
+    }
+
     /// Fetch the blob by hash. Hits the local store on a cache hit; on a miss
     /// pulls from the configured origin, BLAKE3-verifies, and inserts before
     /// returning.
@@ -1153,15 +1272,32 @@ impl CacheEngine {
     /// concurrent `set_pinned` swap doesn't change which hashes get
     /// filtered mid-iteration — the snapshot is consistent against
     /// *some* pinned generation, just not necessarily the very latest.
+    ///
+    /// A third filter layer (after pinned, before the LRU sort) drops any
+    /// hash under an active probe-triggered eviction hold (#318, ADR 005
+    /// §Probe-triggered eviction hold; appendix-blob-cache-eviction.md §4:
+    /// "a held hash is invisible to the LRU driver until the hold
+    /// expires"). The held set is swept of expired entries here too, so a
+    /// node with no probe traffic still releases stale holds.
     pub fn eviction_candidates(&self) -> EvictionCandidates {
         let pinned = self.inner.pinned.load();
+        let now = Instant::now();
+        let held: HashSet<Hash> = {
+            let mut g = self
+                .inner
+                .probe_holds
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            g.retain(|_, exp| *exp > now);
+            g.keys().copied().collect()
+        };
         let Ok(guard) = self.inner.access_times.lock() else {
             return EvictionCandidates(HashMap::new());
         };
         let map = guard
             .iter()
             .filter_map(|(h, t)| {
-                if pinned.contains(h) {
+                if pinned.contains(h) || held.contains(h) {
                     None
                 } else {
                     Some((*h, *t))
@@ -1771,6 +1907,45 @@ mod tests {
             } else {
                 Ok(OriginFetch::NotFound)
             };
+            Box::pin(async move { result })
+        }
+    }
+
+    /// Serves several blobs from one origin so a single engine can hold
+    /// multiple distinct hashes (a second `CacheEngine::open` on the same
+    /// dir would deadlock on iroh-blobs' single-writer file lock).
+    #[derive(Debug)]
+    struct MultiStubOrigin {
+        blobs: std::collections::HashMap<Hash, Bytes>,
+    }
+
+    impl MultiStubOrigin {
+        fn new(payloads: &[&[u8]]) -> Self {
+            let blobs = payloads
+                .iter()
+                .map(|p| (Hash::new(p), Bytes::from(p.to_vec())))
+                .collect();
+            Self { blobs }
+        }
+    }
+
+    impl Origin for MultiStubOrigin {
+        fn kind(&self) -> OriginKind {
+            OriginKind::Http
+        }
+
+        fn fetch(
+            &self,
+            hash: Hash,
+            _max_bytes: u64,
+        ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, crate::OriginPullError>> + Send + '_>>
+        {
+            let result = self
+                .blobs
+                .get(&hash)
+                .map_or(Ok(OriginFetch::NotFound), |b| {
+                    Ok(OriginFetch::found_one_shot(b.clone()))
+                });
             Box::pin(async move { result })
         }
     }
@@ -2685,6 +2860,185 @@ mod tests {
         anyhow::ensure!(
             cm.misses.get() == misses_before + 1,
             "misses should bump by exactly 1 on an evicted-hash get"
+        );
+        Ok(())
+    }
+
+    // ---- Probe-triggered eviction hold (#318, ADR 005) ----
+
+    #[tokio::test]
+    async fn try_probe_hold_unavailable_when_blob_absent() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let engine = CacheEngine::open(tmp.path(), vec![], 10).await?;
+        let absent = Hash::new(b"never fetched");
+        anyhow::ensure!(
+            engine.try_probe_hold(absent).await? == ProbeHoldOutcome::Unavailable,
+            "absent blob must not be holdable (would risk a phantom slash)"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn try_probe_hold_true_when_cached_and_excluded_from_eviction() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"holdable blob";
+        let hash = Hash::new(payload);
+        let engine = CacheEngine::open(
+            tmp.path(),
+            vec![Arc::new(StubOrigin::new(payload)) as Arc<dyn Origin>],
+            10,
+        )
+        .await?;
+        let _ = engine.get(hash).await?;
+
+        anyhow::ensure!(
+            engine.try_probe_hold(hash).await? == ProbeHoldOutcome::Held,
+            "cached blob should hold"
+        );
+        anyhow::ensure!(engine.probe_hold_slots_used() == 1, "one slot used");
+        anyhow::ensure!(
+            !engine
+                .eviction_candidates()
+                .into_inner()
+                .contains_key(&hash),
+            "held hash must be invisible to the LRU driver"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn probe_hold_is_shared_per_blob_not_per_probe() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"popular blob";
+        let hash = Hash::new(payload);
+        let engine = CacheEngine::open(
+            tmp.path(),
+            vec![Arc::new(StubOrigin::new(payload)) as Arc<dyn Origin>],
+            10,
+        )
+        .await?;
+        let _ = engine.get(hash).await?;
+        engine.set_max_probe_holds(1);
+
+        // Many "peers" probing the same hash share one slot.
+        for _ in 0..3 {
+            anyhow::ensure!(engine.try_probe_hold(hash).await? == ProbeHoldOutcome::Held);
+        }
+        anyhow::ensure!(
+            engine.probe_hold_slots_used() == 1,
+            "shared per-blob slot must not grow with probe volume"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn probe_hold_budget_exhaustion_reports_exhausted() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let a: &[u8] = b"blob a";
+        let b: &[u8] = b"blob bee";
+        let (ha, hb) = (Hash::new(a), Hash::new(b));
+        // One engine, one multi-blob origin: opening a second engine on the
+        // same dir would deadlock on iroh-blobs' single-writer lock.
+        let origin = Arc::new(MultiStubOrigin::new(&[a, b]));
+        let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 10).await?;
+        let _ = engine.get(ha).await?;
+        let _ = engine.get(hb).await?;
+        engine.set_max_probe_holds(1);
+
+        anyhow::ensure!(
+            engine.try_probe_hold(ha).await? == ProbeHoldOutcome::Held,
+            "first hold fits budget"
+        );
+        anyhow::ensure!(
+            engine.try_probe_hold(hb).await? == ProbeHoldOutcome::BudgetExhausted,
+            "second distinct hold must be refused when budget is exhausted"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn probe_hold_disabled_when_budget_zero() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"unhold me";
+        let hash = Hash::new(payload);
+        let engine = CacheEngine::open(
+            tmp.path(),
+            vec![Arc::new(StubOrigin::new(payload)) as Arc<dyn Origin>],
+            10,
+        )
+        .await?;
+        let _ = engine.get(hash).await?;
+        engine.set_max_probe_holds(0);
+        anyhow::ensure!(
+            engine.try_probe_hold(hash).await? == ProbeHoldOutcome::BudgetExhausted,
+            "max_probe_holds=0 must disable has_blob:true entirely"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn operator_evict_overrides_probe_hold() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"dmca target";
+        let hash = Hash::new(payload);
+        let engine = CacheEngine::open(
+            tmp.path(),
+            vec![Arc::new(StubOrigin::new(payload)) as Arc<dyn Origin>],
+            10,
+        )
+        .await?;
+        let _ = engine.get(hash).await?;
+        anyhow::ensure!(
+            engine.try_probe_hold(hash).await? == ProbeHoldOutcome::Held,
+            "held before evict"
+        );
+
+        engine.evict(hash)?;
+        anyhow::ensure!(
+            engine.try_probe_hold(hash).await? == ProbeHoldOutcome::Unavailable,
+            "operator evict (DMCA) must win over a probe hold"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_probe_hold_is_swept_and_re_evictable() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"expiring blob";
+        let hash = Hash::new(payload);
+        let engine = CacheEngine::open(
+            tmp.path(),
+            vec![Arc::new(StubOrigin::new(payload)) as Arc<dyn Origin>],
+            10,
+        )
+        .await?;
+        let _ = engine.get(hash).await?;
+        engine.touch(hash); // make it an LRU candidate
+
+        // Inject an already-expired hold directly (the real 35s duration is
+        // impractical to sleep, and std `Instant` ignores tokio time pause).
+        {
+            let mut g = engine
+                .inner
+                .probe_holds
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let past = Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or_else(Instant::now);
+            g.insert(hash, past);
+        }
+
+        anyhow::ensure!(
+            engine.probe_hold_slots_used() == 0,
+            "expired hold must be swept from the slot count"
+        );
+        anyhow::ensure!(
+            engine
+                .eviction_candidates()
+                .into_inner()
+                .contains_key(&hash),
+            "an expired hold must no longer shield the hash from LRU"
         );
         Ok(())
     }

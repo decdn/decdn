@@ -78,6 +78,20 @@ const DEFAULT_MAX_TRACKED_SOURCES: usize = 4096;
 /// can tune lower; setting to `0` disables the periodic sweep entirely.
 pub const DEFAULT_GC_INTERVAL_SEC: u64 = 300;
 
+/// Default EIP-712 `chainId` for the `slash_sig` domain separator (ADR 014).
+/// Arbitrum Sepolia — the `PoC` testnet target; matches the chain id bound on
+/// the runtime `PrivateKeySigner` (`decdn_incentive::eth_identity`). When the
+/// production target moves to mainnet this is overridden via
+/// `blockchain.chain_id` (see `appendix-poc-production-seams.md` §Seam 8).
+pub const DEFAULT_CHAIN_ID: u64 = 421_614;
+
+/// Default maximum concurrently held (eviction-exempt) blobs for the
+/// probe-triggered hold (ADR 005 §Hold budget, #318). Per-blob holds: many
+/// peers probing one hash share a single slot. Re-exported from
+/// `decdn_cache` so the config default and the cache engine's own default
+/// (used by direct `CacheEngine::open` callers) cannot drift apart.
+pub const DEFAULT_MAX_PROBE_HOLDS: usize = decdn_cache::DEFAULT_MAX_PROBE_HOLDS;
+
 /// Load config from file (if present) and merge with CLI args.
 ///
 /// CLI args take precedence over file values; defaults fill gaps.
@@ -299,6 +313,10 @@ fn parse_contract_address(flag_name: &str, raw: &str) -> anyhow::Result<String> 
 }
 
 /// Resolve blockchain fields.
+// Linear field-by-field resolution (rpc_url, keystore, three contract
+// addresses, chain_id, watchdog) — splitting it would scatter the
+// "missing required option" error wording that tests assert on.
+#[allow(clippy::too_many_lines)]
 fn resolve_blockchain(
     cli: &crate::cli::run::BlockchainArgs,
     file: Option<&types::BlockchainConfig>,
@@ -386,6 +404,49 @@ fn resolve_blockchain(
     let staking_registry_address =
         parse_contract_address("staking_registry_address", &staking_registry_address)?;
 
+    // Required like the other contract addresses: a wrong/zero
+    // `verifyingContract` silently produces `slash_sig`s no verifier accepts
+    // (ADR 014 §1), so fail fast rather than default to a placeholder.
+    let slash_judge_address = cli
+        .slash_judge_address
+        .clone()
+        .or_else(|| file.and_then(|b| b.slash_judge_address.clone()))
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "missing required option: --slash-judge-address \
+                 (or blockchain.slash_judge_address in config file)"
+            )
+        })?;
+    let slash_judge_address = parse_contract_address("slash_judge_address", &slash_judge_address)?;
+    // The all-zero address is syntactically valid but is never a real
+    // `SlashJudge` deployment; signing against it produces `slash_sig`s no
+    // verifier can attribute (ADR 014 §1). Reject it explicitly rather than
+    // letting the node start in a silently-broken state.
+    anyhow::ensure!(
+        slash_judge_address
+            .trim_start_matches("0x")
+            .bytes()
+            .any(|b| b != b'0'),
+        "blockchain.slash_judge_address must not be the zero address — \
+         set it to the deployed SlashJudge contract (ADR 014 §1)"
+    );
+
+    let chain_id = cli
+        .chain_id
+        .or_else(|| file.and_then(|b| b.chain_id))
+        .unwrap_or(DEFAULT_CHAIN_ID);
+    // `chain_id` is bound into every `slash_sig` EIP-712 domain separator
+    // (and the runtime signer). Chain id 0 is not a real network; signing
+    // against it produces `slash_sig`s no `SlashJudge` can verify — the same
+    // silently-broken-but-running failure mode the zero-`slash_judge_address`
+    // check below prevents. Fail fast (ADR 014 §1).
+    anyhow::ensure!(
+        chain_id != 0,
+        "blockchain.chain_id must not be 0 — set it to the deployed L2 \
+         chain id (default {DEFAULT_CHAIN_ID}, Arbitrum Sepolia)"
+    );
+
     let rpc_watchdog_interval_sec = file
         .and_then(|b| b.rpc_watchdog_interval_sec)
         .unwrap_or(DEFAULT_RPC_WATCHDOG_INTERVAL_SEC);
@@ -410,6 +471,8 @@ fn resolve_blockchain(
         keystore_password_file,
         payment_channel_address,
         staking_registry_address,
+        slash_judge_address,
+        chain_id,
         rpc_watchdog_interval_sec,
     })
 }
@@ -483,6 +546,13 @@ fn resolve_cache(
         .and_then(|c| c.gc_interval_sec)
         .unwrap_or(DEFAULT_GC_INTERVAL_SEC);
 
+    let max_probe_holds = cli
+        .max_probe_holds
+        .or_else(|| file.and_then(|c| c.max_probe_holds))
+        .map_or(DEFAULT_MAX_PROBE_HOLDS, |v| {
+            usize::try_from(v).unwrap_or(usize::MAX)
+        });
+
     Ok(ResolvedCache {
         cache_dir,
         cache_size_mb,
@@ -492,6 +562,7 @@ fn resolve_cache(
         origin_retry,
         user_agent,
         gc_interval_sec,
+        max_probe_holds,
     })
 }
 
@@ -966,7 +1037,44 @@ pub fn resolve_payment(
          honest clients reject `ProbeResponse`s above this ceiling (issue #378)",
         decdn_protocol::MAX_RATE_PER_MB,
     );
-    Ok(ResolvedPayment { rate_per_mb })
+    // PoC-local stand-in for the on-chain `getRateBounds()` (ADR 005 §Rate
+    // bounds validation). Defaults (`0` .. `MAX_RATE_PER_MB`) make the clamp
+    // a no-op so existing deployments see no behavior change.
+    let delivery_floor = cli
+        .delivery_floor
+        .or_else(|| file.and_then(|p| p.delivery_floor))
+        .unwrap_or(0);
+    let delivery_ceiling = cli
+        .delivery_ceiling
+        .or_else(|| file.and_then(|p| p.delivery_ceiling))
+        .unwrap_or(decdn_protocol::MAX_RATE_PER_MB);
+    anyhow::ensure!(
+        delivery_floor <= delivery_ceiling,
+        "payment.delivery_floor ({delivery_floor}) must be <= \
+         payment.delivery_ceiling ({delivery_ceiling})"
+    );
+    // A ceiling of 0 would clamp every quoted rate to 0, bypassing the
+    // `rate_per_mb > 0` guard above and making the node advertise a
+    // free/selection-winning rate (ADR 001). With ceiling >= 1 and the
+    // validated `rate_per_mb >= 1`, `clamp(rate, floor, ceiling)` is always
+    // >= 1, so the signed rate can never collapse to 0.
+    anyhow::ensure!(
+        delivery_ceiling >= 1,
+        "payment.delivery_ceiling must be >= 1 (clamping to 0 would sign a \
+         free rate and bypass the rate_per_mb > 0 guard, ADR 001)"
+    );
+    anyhow::ensure!(
+        delivery_ceiling <= decdn_protocol::MAX_RATE_PER_MB,
+        "payment.delivery_ceiling {delivery_ceiling} exceeds protocol \
+         MAX_RATE_PER_MB ({}); clamping to it could still emit a rate honest \
+         clients reject",
+        decdn_protocol::MAX_RATE_PER_MB,
+    );
+    Ok(ResolvedPayment {
+        rate_per_mb,
+        delivery_floor,
+        delivery_ceiling,
+    })
 }
 
 /// Resolve observability fields.
@@ -1236,6 +1344,7 @@ fn expand_env(cfg: &mut FileConfig) -> anyhow::Result<()> {
             &mut b.staking_registry_address,
             "blockchain.staking_registry_address",
         )?;
+        expand_str(&mut b.slash_judge_address, "blockchain.slash_judge_address")?;
     }
     if let Some(c) = cfg.cache.as_mut() {
         expand_path(&mut c.cache_dir, "cache.cache_dir")?;
@@ -1843,6 +1952,29 @@ mod tests {
             .and_then(|b| b.rpc_url.as_deref())
             .ok_or_else(|| anyhow::anyhow!("rpc_url missing"))?;
         anyhow::ensure!(url == format!("{home}/rpc"), "got: {url}");
+        Ok(())
+    }
+
+    #[test]
+    fn expand_env_substitutes_slash_judge_address() -> anyhow::Result<()> {
+        // Regression for the wiring line in `expand_env`: a `${VAR}` in
+        // blockchain.slash_judge_address must be expanded before
+        // `parse_contract_address`, like the other contract-address fields.
+        let home = home_str()?;
+        let mut cfg = FileConfig {
+            blockchain: Some(types::BlockchainConfig {
+                slash_judge_address: Some("${HOME}/judge".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        expand_env(&mut cfg)?;
+        let got = cfg
+            .blockchain
+            .as_ref()
+            .and_then(|b| b.slash_judge_address.as_deref())
+            .ok_or_else(|| anyhow::anyhow!("slash_judge_address missing"))?;
+        anyhow::ensure!(got == format!("{home}/judge"), "got: {got}");
         Ok(())
     }
 
@@ -2552,6 +2684,8 @@ mod tests {
     fn resolve_payment_rejects_zero_from_cli() -> anyhow::Result<()> {
         let cli = crate::cli::run::PaymentArgs {
             rate_per_mb: Some(0),
+            delivery_floor: None,
+            delivery_ceiling: None,
         };
         let err = resolve_payment(&cli, None)
             .err()
@@ -2560,6 +2694,79 @@ mod tests {
         anyhow::ensure!(
             err.contains("rate_per_mb") && err.contains("> 0"),
             "error lacked context: {err}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_payment_rejects_zero_delivery_ceiling() -> anyhow::Result<()> {
+        // ceiling=0 would clamp every quoted rate to 0, signing a free
+        // selection-winning rate and bypassing the rate_per_mb > 0 guard.
+        let cli = crate::cli::run::PaymentArgs {
+            rate_per_mb: Some(10),
+            delivery_floor: Some(0),
+            delivery_ceiling: Some(0),
+        };
+        let err = resolve_payment(&cli, None)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected rejection for delivery_ceiling=0"))?
+            .to_string();
+        anyhow::ensure!(
+            err.contains("delivery_ceiling") && err.contains(">= 1"),
+            "error lacked context: {err}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_payment_rejects_floor_above_ceiling() -> anyhow::Result<()> {
+        let cli = crate::cli::run::PaymentArgs {
+            rate_per_mb: Some(10),
+            delivery_floor: Some(100),
+            delivery_ceiling: Some(50),
+        };
+        let err = resolve_payment(&cli, None)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected rejection for floor>ceiling"))?
+            .to_string();
+        anyhow::ensure!(
+            err.contains("delivery_floor") && err.contains("delivery_ceiling"),
+            "error lacked context: {err}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_payment_rejects_ceiling_above_protocol_max() -> anyhow::Result<()> {
+        let cli = crate::cli::run::PaymentArgs {
+            rate_per_mb: Some(10),
+            delivery_floor: None,
+            delivery_ceiling: Some(decdn_protocol::MAX_RATE_PER_MB + 1),
+        };
+        let err = resolve_payment(&cli, None)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected rejection for ceiling>MAX"))?
+            .to_string();
+        anyhow::ensure!(
+            err.contains("delivery_ceiling") && err.contains("MAX_RATE_PER_MB"),
+            "error lacked context: {err}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_payment_accepts_and_threads_explicit_bounds() -> anyhow::Result<()> {
+        let cli = crate::cli::run::PaymentArgs {
+            rate_per_mb: Some(10),
+            delivery_floor: Some(5),
+            delivery_ceiling: Some(100),
+        };
+        let resolved = resolve_payment(&cli, None)?;
+        anyhow::ensure!(
+            resolved.delivery_floor == 5 && resolved.delivery_ceiling == 100,
+            "bounds not threaded: floor={} ceiling={}",
+            resolved.delivery_floor,
+            resolved.delivery_ceiling
         );
         Ok(())
     }
@@ -2593,9 +2800,15 @@ mod tests {
 
     #[test]
     fn resolve_payment_rejects_zero_from_file() -> anyhow::Result<()> {
-        let cli = crate::cli::run::PaymentArgs { rate_per_mb: None };
+        let cli = crate::cli::run::PaymentArgs {
+            rate_per_mb: None,
+            delivery_floor: None,
+            delivery_ceiling: None,
+        };
         let file = types::PaymentConfig {
             rate_per_mb: Some(0),
+            delivery_floor: None,
+            delivery_ceiling: None,
         };
         let err = resolve_payment(&cli, Some(&file))
             .err()
@@ -2636,9 +2849,13 @@ mod tests {
         // short-circuit the CLI override that would otherwise be valid.
         let cli = crate::cli::run::PaymentArgs {
             rate_per_mb: Some(42),
+            delivery_floor: None,
+            delivery_ceiling: None,
         };
         let file = types::PaymentConfig {
             rate_per_mb: Some(0),
+            delivery_floor: None,
+            delivery_ceiling: None,
         };
         let resolved = resolve_payment(&cli, Some(&file))?;
         anyhow::ensure!(resolved.rate_per_mb == 42, "got: {}", resolved.rate_per_mb);
@@ -2647,7 +2864,11 @@ mod tests {
 
     #[test]
     fn resolve_payment_defaults_when_unset() -> anyhow::Result<()> {
-        let cli = crate::cli::run::PaymentArgs { rate_per_mb: None };
+        let cli = crate::cli::run::PaymentArgs {
+            rate_per_mb: None,
+            delivery_floor: None,
+            delivery_ceiling: None,
+        };
         let resolved = resolve_payment(&cli, None)?;
         anyhow::ensure!(
             resolved.rate_per_mb == DEFAULT_RATE_PER_MB,
@@ -2665,6 +2886,8 @@ mod tests {
     fn resolve_payment_rejects_rate_above_protocol_max() -> anyhow::Result<()> {
         let cli = crate::cli::run::PaymentArgs {
             rate_per_mb: Some(decdn_protocol::MAX_RATE_PER_MB + 1),
+            delivery_floor: None,
+            delivery_ceiling: None,
         };
         let err = resolve_payment(&cli, None)
             .err()
@@ -2681,6 +2904,8 @@ mod tests {
     fn resolve_payment_accepts_rate_at_protocol_max() -> anyhow::Result<()> {
         let cli = crate::cli::run::PaymentArgs {
             rate_per_mb: Some(decdn_protocol::MAX_RATE_PER_MB),
+            delivery_floor: None,
+            delivery_ceiling: None,
         };
         let resolved = resolve_payment(&cli, None)?;
         anyhow::ensure!(
@@ -2699,6 +2924,7 @@ mod tests {
             cache_dir: None,
             cache_size_mb,
             max_blob_size_mb,
+            max_probe_holds: None,
         }
     }
 
@@ -4363,10 +4589,15 @@ mod tests {
             ("keystore_password_file", "DECDN_KEYSTORE_PASSWORD_FILE"),
             ("payment_channel_address", "DECDN_PAYMENT_CHANNEL_ADDRESS"),
             ("staking_registry_address", "DECDN_STAKING_REGISTRY_ADDRESS"),
+            ("slash_judge_address", "DECDN_SLASH_JUDGE_ADDRESS"),
+            ("chain_id", "DECDN_CHAIN_ID"),
             ("cache_dir", "DECDN_CACHE_DIR"),
             ("cache_size_mb", "DECDN_CACHE_SIZE_MB"),
             ("max_blob_size_mb", "DECDN_MAX_BLOB_SIZE_MB"),
+            ("max_probe_holds", "DECDN_MAX_PROBE_HOLDS"),
             ("rate_per_mb", "DECDN_RATE_PER_MB"),
+            ("delivery_floor", "DECDN_DELIVERY_FLOOR"),
+            ("delivery_ceiling", "DECDN_DELIVERY_CEILING"),
             ("log_level", "DECDN_LOG_LEVEL"),
             ("log_format", "DECDN_LOG_FORMAT"),
             ("metrics_port", "DECDN_METRICS_PORT"),
@@ -4421,6 +4652,8 @@ mod tests {
             keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             staking_registry_address: Some("0xNOTHEX".to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
         };
         let dir = data_dir_with_keystore()?;
         let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
@@ -4446,6 +4679,8 @@ mod tests {
             keystore_password_file: None,
             payment_channel_address: Some("0xNOTHEX".to_string()),
             staking_registry_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
         };
         let dir = data_dir_with_keystore()?;
         let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
@@ -4472,6 +4707,8 @@ mod tests {
             keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             staking_registry_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
         };
         let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
             anyhow::bail!("expected resolve_blockchain to fail on missing keystore");
@@ -4498,6 +4735,8 @@ mod tests {
             keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             staking_registry_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
         };
         let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
             anyhow::bail!("expected resolve_blockchain to fail on bogus --eth-keystore");
@@ -4523,6 +4762,8 @@ mod tests {
             keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             staking_registry_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
         };
         let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
             anyhow::bail!("expected resolve_blockchain to fail on directory keystore");
@@ -4559,6 +4800,8 @@ mod tests {
             keystore_password_file: None,
             payment_channel_address: None,
             staking_registry_address: None,
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
         }
     }
 
@@ -4567,11 +4810,16 @@ mod tests {
             cache_dir: None,
             cache_size_mb: None,
             max_blob_size_mb: None,
+            max_probe_holds: None,
         }
     }
 
     fn empty_payment_args() -> crate::cli::run::PaymentArgs {
-        crate::cli::run::PaymentArgs { rate_per_mb: None }
+        crate::cli::run::PaymentArgs {
+            rate_per_mb: None,
+            delivery_floor: None,
+            delivery_ceiling: None,
+        }
     }
 
     fn empty_observability_args() -> crate::cli::run::ObservabilityArgs {
@@ -4672,6 +4920,8 @@ mod tests {
             keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             staking_registry_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
         };
         let file = types::BlockchainConfig {
             rpc_url: Some("https://file-loses.example/rpc".to_string()),
@@ -4679,6 +4929,8 @@ mod tests {
             payment_channel_address: None,
             staking_registry_address: None,
             rpc_watchdog_interval_sec: None,
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
         };
         let resolved = resolve_blockchain(&cli, Some(&file), dir.path())?;
         // url::Url normalisation appends a trailing path on bare-host URLs;
@@ -4702,6 +4954,8 @@ mod tests {
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             staking_registry_address: Some(GOOD_ADDR.to_string()),
             rpc_watchdog_interval_sec: None,
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
         };
         let resolved = resolve_blockchain(&cli, Some(&file), dir.path())?;
         assert!(
@@ -4723,6 +4977,8 @@ mod tests {
             keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             staking_registry_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
         };
         let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
             anyhow::bail!("expected error when rpc_url missing");
@@ -4744,6 +5000,8 @@ mod tests {
             keystore_password_file: None,
             payment_channel_address: None,
             staking_registry_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
         };
         let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
             anyhow::bail!("expected error when payment_channel_address missing");
@@ -4765,6 +5023,8 @@ mod tests {
             keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             staking_registry_address: None,
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
         };
         let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
             anyhow::bail!("expected error when staking_registry_address missing");
@@ -4773,6 +5033,75 @@ mod tests {
         assert!(
             msg.contains("staking_registry_address"),
             "error should mention staking_registry_address: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_errors_when_slash_judge_address_missing() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            staking_registry_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: None,
+            chain_id: None,
+        };
+        let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
+            anyhow::bail!("expected error when slash_judge_address missing");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("slash_judge_address"),
+            "error should mention slash_judge_address: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_rejects_zero_slash_judge_address() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            staking_registry_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some("0x0000000000000000000000000000000000000000".to_string()),
+            chain_id: None,
+        };
+        let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
+            anyhow::bail!("expected error for zero slash_judge_address");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("slash_judge_address") && msg.contains("zero address"),
+            "error should reject the zero address: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_rejects_zero_chain_id() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            staking_registry_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            chain_id: Some(0),
+        };
+        let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
+            anyhow::bail!("expected error for chain_id=0");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("chain_id") && msg.contains("must not be 0"),
+            "error should reject chain_id=0: {msg}"
         );
         Ok(())
     }
@@ -4789,6 +5118,8 @@ mod tests {
             keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             staking_registry_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
         };
         let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
             anyhow::bail!("expected error when rpc_url is empty string");
@@ -4810,6 +5141,8 @@ mod tests {
             keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             staking_registry_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
         };
         let file = types::BlockchainConfig {
             rpc_url: None,
@@ -4817,6 +5150,8 @@ mod tests {
             payment_channel_address: None,
             staking_registry_address: None,
             rpc_watchdog_interval_sec: Some(1),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
         };
         let Err(err) = resolve_blockchain(&cli, Some(&file), dir.path()) else {
             anyhow::bail!("expected error when watchdog interval is below the minimum");
@@ -4840,6 +5175,8 @@ mod tests {
             keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             staking_registry_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
         };
         let file = types::BlockchainConfig {
             rpc_url: None,
@@ -4847,6 +5184,8 @@ mod tests {
             payment_channel_address: None,
             staking_registry_address: None,
             rpc_watchdog_interval_sec: Some(0),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
         };
         let resolved = resolve_blockchain(&cli, Some(&file), dir.path())?;
         assert_eq!(resolved.rpc_watchdog_interval_sec, 0);
@@ -4862,6 +5201,8 @@ mod tests {
             keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             staking_registry_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
         };
         let file = types::BlockchainConfig {
             rpc_url: None,
@@ -4869,6 +5210,8 @@ mod tests {
             payment_channel_address: None,
             staking_registry_address: None,
             rpc_watchdog_interval_sec: Some(MIN_RPC_WATCHDOG_INTERVAL_SEC),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
         };
         let resolved = resolve_blockchain(&cli, Some(&file), dir.path())?;
         assert_eq!(
@@ -4891,6 +5234,8 @@ mod tests {
             keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             staking_registry_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
         };
         let resolved = resolve_blockchain(&cli, None, dir.path())?;
         assert_eq!(
@@ -5009,9 +5354,13 @@ mod tests {
     fn resolve_payment_cli_rate_overrides_file_rate() -> anyhow::Result<()> {
         let cli = crate::cli::run::PaymentArgs {
             rate_per_mb: Some(99),
+            delivery_floor: None,
+            delivery_ceiling: None,
         };
         let file = types::PaymentConfig {
             rate_per_mb: Some(1),
+            delivery_floor: None,
+            delivery_ceiling: None,
         };
         let resolved = resolve_payment(&cli, Some(&file))?;
         assert_eq!(resolved.rate_per_mb, 99);
@@ -5023,6 +5372,8 @@ mod tests {
         let cli = empty_payment_args();
         let file = types::PaymentConfig {
             rate_per_mb: Some(50),
+            delivery_floor: None,
+            delivery_ceiling: None,
         };
         let resolved = resolve_payment(&cli, Some(&file))?;
         assert_eq!(resolved.rate_per_mb, 50);

@@ -206,6 +206,13 @@ struct PaymentSection {
     /// Last applied rate, retained across reloads for the per-section
     /// `prev_rate_per_mb` field on the success line.
     buf: std::sync::Mutex<Option<ResolvedPayment>>,
+    /// `(delivery_floor, delivery_ceiling)` as wired into the live probe
+    /// handler at startup. Only `rate_per_mb` is hot-reloadable; the
+    /// delivery bounds are copied into the handler by value, so a reload
+    /// that changes them is accepted by `resolve_payment` but cannot take
+    /// effect until restart. Retained here so the swap can emit a
+    /// restart-required warning instead of silently diverging.
+    applied_bounds: (u64, u64),
 }
 
 impl ReloadableSection for PaymentSection {
@@ -231,6 +238,22 @@ impl ReloadableSection for PaymentSection {
         let prev = self
             .rate_per_mb
             .swap(resolved.rate_per_mb, Ordering::Relaxed);
+        // The probe handler holds `delivery_floor`/`delivery_ceiling` by
+        // value (ADR 005 §Rate bounds validation is a PoC-local seam); a
+        // changed bound is accepted by `resolve_payment` but cannot take
+        // effect until restart. Surface that rather than silently diverging.
+        if (resolved.delivery_floor, resolved.delivery_ceiling) != self.applied_bounds {
+            tracing::warn!(
+                section = self.name(),
+                applied_delivery_floor = self.applied_bounds.0,
+                applied_delivery_ceiling = self.applied_bounds.1,
+                new_delivery_floor = resolved.delivery_floor,
+                new_delivery_ceiling = resolved.delivery_ceiling,
+                "payment.delivery_floor/delivery_ceiling change ignored \
+                 (requires restart); the live probe handler keeps the \
+                 startup bounds"
+            );
+        }
         tracing::info!(
             section = self.name(),
             rate_per_mb = resolved.rate_per_mb,
@@ -586,6 +609,10 @@ impl RuntimeReloadState {
             cli: payment_cli,
             rate_per_mb: Arc::new(AtomicU64::new(initial.payment.rate_per_mb)),
             buf: std::sync::Mutex::new(None),
+            applied_bounds: (
+                initial.payment.delivery_floor,
+                initial.payment.delivery_ceiling,
+            ),
         });
         let log_level = Arc::new(LogLevelSection {
             cli: observability_cli,
@@ -724,6 +751,8 @@ impl RuntimeReloadState {
                 payment_channel_address: "0x0000000000000000000000000000000000000001".into(),
                 staking_registry_address: "0x0000000000000000000000000000000000000002".into(),
                 rpc_watchdog_interval_sec: 30,
+                slash_judge_address: "0x0000000000000000000000000000000000000003".to_string(),
+                chain_id: decdn_common::config::DEFAULT_CHAIN_ID,
             },
             cache: ResolvedCache {
                 cache_dir: PathBuf::from("/tmp/cache"),
@@ -734,8 +763,13 @@ impl RuntimeReloadState {
                 origin_retry: decdn_cache::RetryPolicy::default(),
                 user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
                 gc_interval_sec: 0,
+                max_probe_holds: decdn_common::config::DEFAULT_MAX_PROBE_HOLDS,
             },
-            payment: ResolvedPayment { rate_per_mb },
+            payment: ResolvedPayment {
+                rate_per_mb,
+                delivery_floor: 0,
+                delivery_ceiling: decdn_protocol::MAX_RATE_PER_MB,
+            },
             observability: ResolvedObservability {
                 log_level: level,
                 log_format: decdn_common::cli::common::LogFormat::Pretty,
@@ -758,7 +792,11 @@ impl RuntimeReloadState {
             },
         };
         Self::new(
-            decdn_common::cli::run::PaymentArgs { rate_per_mb: None },
+            decdn_common::cli::run::PaymentArgs {
+                rate_per_mb: None,
+                delivery_floor: None,
+                delivery_ceiling: None,
+            },
             decdn_common::cli::run::ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -1160,6 +1198,8 @@ mod tests {
                 payment_channel_address: "0x0000000000000000000000000000000000000001".into(),
                 staking_registry_address: "0x0000000000000000000000000000000000000002".into(),
                 rpc_watchdog_interval_sec: 30,
+                slash_judge_address: "0x0000000000000000000000000000000000000003".to_string(),
+                chain_id: decdn_common::config::DEFAULT_CHAIN_ID,
             },
             cache: ResolvedCache {
                 cache_dir: PathBuf::from("/tmp/cache"),
@@ -1170,8 +1210,13 @@ mod tests {
                 origin_retry: decdn_cache::RetryPolicy::default(),
                 user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
                 gc_interval_sec: 0,
+                max_probe_holds: decdn_common::config::DEFAULT_MAX_PROBE_HOLDS,
             },
-            payment: ResolvedPayment { rate_per_mb: rate },
+            payment: ResolvedPayment {
+                rate_per_mb: rate,
+                delivery_floor: 0,
+                delivery_ceiling: decdn_protocol::MAX_RATE_PER_MB,
+            },
             observability: ResolvedObservability {
                 log_level: level,
                 log_format: decdn_common::cli::common::LogFormat::Pretty,
@@ -1212,7 +1257,11 @@ mod tests {
         let initial = seed_resolved(10, LogLevel::Info);
         let (setter, captured) = recording_setter();
         let state = RuntimeReloadState::new(
-            PaymentArgs { rate_per_mb: None },
+            PaymentArgs {
+                rate_per_mb: None,
+                delivery_floor: None,
+                delivery_ceiling: None,
+            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -1247,7 +1296,11 @@ mod tests {
         let initial = seed_resolved(10, LogLevel::Info);
         let (setter, captured) = recording_setter();
         let state = RuntimeReloadState::new(
-            PaymentArgs { rate_per_mb: None },
+            PaymentArgs {
+                rate_per_mb: None,
+                delivery_floor: None,
+                delivery_ceiling: None,
+            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -1291,7 +1344,11 @@ mod tests {
         let initial = seed_resolved(1, LogLevel::Info);
         let (setter, captured) = recording_setter();
         let state = RuntimeReloadState::new(
-            PaymentArgs { rate_per_mb: None },
+            PaymentArgs {
+                rate_per_mb: None,
+                delivery_floor: None,
+                delivery_ceiling: None,
+            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -1329,7 +1386,11 @@ mod tests {
 
         let initial = seed_resolved(42, LogLevel::Info);
         let state = RuntimeReloadState::new(
-            PaymentArgs { rate_per_mb: None },
+            PaymentArgs {
+                rate_per_mb: None,
+                delivery_floor: None,
+                delivery_ceiling: None,
+            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -1361,7 +1422,11 @@ mod tests {
         let initial = seed_resolved(33, LogLevel::Info);
         let (setter, _captured) = recording_setter();
         let state = RuntimeReloadState::new(
-            PaymentArgs { rate_per_mb: None },
+            PaymentArgs {
+                rate_per_mb: None,
+                delivery_floor: None,
+                delivery_ceiling: None,
+            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -1412,7 +1477,11 @@ mod tests {
         let initial = seed_resolved(42, LogLevel::Info);
         let (setter, captured) = recording_setter();
         let state = RuntimeReloadState::new(
-            PaymentArgs { rate_per_mb: None },
+            PaymentArgs {
+                rate_per_mb: None,
+                delivery_floor: None,
+                delivery_ceiling: None,
+            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -1468,7 +1537,11 @@ mod tests {
         let initial = seed_resolved(11, LogLevel::Info);
         let (setter, captured) = recording_setter();
         let state = RuntimeReloadState::new(
-            PaymentArgs { rate_per_mb: None },
+            PaymentArgs {
+                rate_per_mb: None,
+                delivery_floor: None,
+                delivery_ceiling: None,
+            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -1499,7 +1572,11 @@ mod tests {
         let initial = seed_resolved(42, LogLevel::Info);
         let (setter, _captured) = recording_setter();
         let state = RuntimeReloadState::new(
-            PaymentArgs { rate_per_mb: None },
+            PaymentArgs {
+                rate_per_mb: None,
+                delivery_floor: None,
+                delivery_ceiling: None,
+            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -1526,7 +1603,11 @@ mod tests {
         let initial = seed_resolved(7, LogLevel::Info);
         let (setter, _captured) = recording_setter();
         let state = RuntimeReloadState::new(
-            PaymentArgs { rate_per_mb: None },
+            PaymentArgs {
+                rate_per_mb: None,
+                delivery_floor: None,
+                delivery_ceiling: None,
+            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -1555,6 +1636,8 @@ mod tests {
         let state = RuntimeReloadState::new(
             PaymentArgs {
                 rate_per_mb: Some(50),
+                delivery_floor: None,
+                delivery_ceiling: None,
             },
             ObservabilityArgs {
                 log_level: None,
@@ -1589,7 +1672,11 @@ mod tests {
         let initial = seed_resolved(42, LogLevel::Info);
         let (setter, captured) = recording_setter();
         let state = RuntimeReloadState::new(
-            PaymentArgs { rate_per_mb: None },
+            PaymentArgs {
+                rate_per_mb: None,
+                delivery_floor: None,
+                delivery_ceiling: None,
+            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -1666,7 +1753,11 @@ mod tests {
         let initial = seed_resolved(10, LogLevel::Info);
         let (setter, _captured) = recording_setter();
         let state = RuntimeReloadState::new(
-            PaymentArgs { rate_per_mb: None },
+            PaymentArgs {
+                rate_per_mb: None,
+                delivery_floor: None,
+                delivery_ceiling: None,
+            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -1704,7 +1795,11 @@ mod tests {
         let initial = seed_resolved(10, LogLevel::Info);
         let (setter, _captured) = recording_setter();
         let state = RuntimeReloadState::new(
-            PaymentArgs { rate_per_mb: None },
+            PaymentArgs {
+                rate_per_mb: None,
+                delivery_floor: None,
+                delivery_ceiling: None,
+            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -1749,7 +1844,11 @@ mod tests {
         let initial = seed_resolved(10, LogLevel::Info);
         let (setter, _captured) = recording_setter();
         let state = RuntimeReloadState::new(
-            PaymentArgs { rate_per_mb: None },
+            PaymentArgs {
+                rate_per_mb: None,
+                delivery_floor: None,
+                delivery_ceiling: None,
+            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -1783,7 +1882,11 @@ mod tests {
         let initial = seed_resolved(10, LogLevel::Info);
         let (setter, _captured) = recording_setter();
         let state = RuntimeReloadState::new(
-            PaymentArgs { rate_per_mb: None },
+            PaymentArgs {
+                rate_per_mb: None,
+                delivery_floor: None,
+                delivery_ceiling: None,
+            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -1825,7 +1928,11 @@ mod tests {
         let initial = seed_resolved(10, LogLevel::Info);
         let (setter, _captured) = recording_setter();
         let state = Arc::new(RuntimeReloadState::new(
-            PaymentArgs { rate_per_mb: None },
+            PaymentArgs {
+                rate_per_mb: None,
+                delivery_floor: None,
+                delivery_ceiling: None,
+            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -1900,7 +2007,11 @@ mod tests {
         let initial = seed_resolved(10, LogLevel::Info);
         let (setter, _captured) = recording_setter();
         let state = RuntimeReloadState::new(
-            PaymentArgs { rate_per_mb: None },
+            PaymentArgs {
+                rate_per_mb: None,
+                delivery_floor: None,
+                delivery_ceiling: None,
+            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -1941,7 +2052,11 @@ mod tests {
         let initial = seed_resolved(10, LogLevel::Info);
         let (setter, _captured) = recording_setter();
         let state = RuntimeReloadState::new(
-            PaymentArgs { rate_per_mb: None },
+            PaymentArgs {
+                rate_per_mb: None,
+                delivery_floor: None,
+                delivery_ceiling: None,
+            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -1976,7 +2091,11 @@ mod tests {
         let initial = seed_resolved(42, LogLevel::Info);
         let (setter, captured) = recording_setter();
         let state = RuntimeReloadState::new(
-            PaymentArgs { rate_per_mb: None },
+            PaymentArgs {
+                rate_per_mb: None,
+                delivery_floor: None,
+                delivery_ceiling: None,
+            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -2018,7 +2137,11 @@ mod tests {
             Box::new(|_| Err(anyhow::anyhow!("simulated tracing-reload failure")));
         let initial = seed_resolved(10, LogLevel::Info);
         let state = RuntimeReloadState::new(
-            PaymentArgs { rate_per_mb: None },
+            PaymentArgs {
+                rate_per_mb: None,
+                delivery_floor: None,
+                delivery_ceiling: None,
+            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -2059,7 +2182,11 @@ mod tests {
         let initial = seed_resolved(10, LogLevel::Info);
         let (setter, _captured) = recording_setter();
         let state = Arc::new(RuntimeReloadState::new(
-            PaymentArgs { rate_per_mb: None },
+            PaymentArgs {
+                rate_per_mb: None,
+                delivery_floor: None,
+                delivery_ceiling: None,
+            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -2108,7 +2235,11 @@ mod tests {
         let initial = seed_resolved(10, LogLevel::Info);
         let (setter, _captured) = recording_setter();
         let state = RuntimeReloadState::new(
-            PaymentArgs { rate_per_mb: None },
+            PaymentArgs {
+                rate_per_mb: None,
+                delivery_floor: None,
+                delivery_ceiling: None,
+            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,

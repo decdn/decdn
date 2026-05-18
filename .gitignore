@@ -6,6 +6,9 @@
 /.worktrees/
 .claude/worktrees
 
+# Claude Code harness runtime artifacts
+.claude/scheduled_tasks.lock
+
 # Rust / Cargo
 /target/
 

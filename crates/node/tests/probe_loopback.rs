@@ -2,21 +2,27 @@
 //!
 //! Spawns a server endpoint running the probe handler, connects a client
 //! endpoint over iroh on localhost, sends a `ProbeRequest`, and verifies the
-//! response echoes the nonce and reports the server's node id and rate.
+//! response echoes the request, reports content availability, and carries a
+//! valid EIP-712 `slash_sig` (ADR 005 / ADR 014, #318).
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
+use alloy::dyn_abi::Eip712Domain;
+use alloy::primitives::{Address, B256, Signature};
+use alloy::signers::local::PrivateKeySigner;
+use decdn_cache::{CacheEngine, FilesystemOrigin, Hash};
 use decdn_common::config::ResolvedSecurity;
+use decdn_incentive::ProbeSlashData;
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::probe::ProbeHandler;
 use decdn_node::metrics::Metrics;
 use decdn_protocol::{
-    ALPN_PROBE, APP_ERR_RATE_LIMITED, MAX_MESSAGE_SIZE, ProbeMessage, decode_message,
-    encode_message,
-    message::{ProbeRequest, ProbeResponse},
+    ALPN_PROBE, APP_ERR_RATE_LIMITED, MAX_MESSAGE_SIZE, MAX_RATE_PER_MB, ProbeMessage,
+    SLASH_SIG_LEN, decode_message, encode_message,
+    message::{ProbeRequest, ProbeResponse, ProbeResponseBody},
     read_frame, write_frame,
 };
 use iroh::endpoint::{
@@ -26,6 +32,86 @@ use iroh::endpoint::{
 use iroh::protocol::ProtocolHandler;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
 use tokio::task::JoinHandle;
+
+/// Deterministic test `SlashJudge` EIP-712 domain (Arbitrum Sepolia chain id,
+/// fixture verifying-contract address).
+fn test_slash_domain() -> Eip712Domain {
+    decdn_incentive::slash_judge_domain(421_614, Address::repeat_byte(0x11))
+}
+
+/// Open an empty cache (no origin) in a fresh temp dir. The returned
+/// `TempDir` must be kept alive for the cache's lifetime.
+async fn empty_cache() -> anyhow::Result<(CacheEngine, tempfile::TempDir)> {
+    let tmp = tempfile::tempdir()?;
+    let cache = CacheEngine::open(tmp.path(), vec![], 16).await?;
+    Ok((cache, tmp))
+}
+
+/// Open a cache pre-seeded with `payload` (pulled+verified into the store via
+/// a filesystem origin, then the origin dir is dropped). Returns the cache,
+/// the blob hash, and the temp dirs to keep alive.
+async fn cache_with_blob(payload: &[u8]) -> anyhow::Result<(CacheEngine, Hash, tempfile::TempDir)> {
+    let hash = Hash::new(payload);
+    let origin_dir = tempfile::tempdir()?;
+    let hex = hash.to_hex();
+    let shard = hex
+        .get(..2)
+        .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
+    let dir = origin_dir.path().join(shard);
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join(hex.as_str()), payload)?;
+
+    let cache_dir = tempfile::tempdir()?;
+    let origin = Arc::new(FilesystemOrigin::new(origin_dir.path()).await?);
+    let cache = CacheEngine::open(
+        cache_dir.path(),
+        vec![origin as Arc<dyn decdn_cache::Origin>],
+        16,
+    )
+    .await?;
+    let _ = cache.get(hash).await?; // populate the local store
+    drop(origin_dir); // prove subsequent reads are local
+    Ok((cache, hash, cache_dir))
+}
+
+/// Build a `ProbeHandler` with the given delivery bounds, returning the
+/// handler plus the random signer and domain so tests can verify `slash_sig`.
+#[allow(clippy::too_many_arguments)]
+fn build_handler_bounds(
+    server_id: iroh::PublicKey,
+    rate: u64,
+    metrics: &Arc<Metrics>,
+    limiter: Arc<ConnectionLimiter>,
+    cache: CacheEngine,
+    floor: u64,
+    ceiling: u64,
+) -> (Arc<ProbeHandler>, Arc<PrivateKeySigner>, Eip712Domain) {
+    let signer = Arc::new(PrivateKeySigner::random());
+    let domain = test_slash_domain();
+    let handler = Arc::new(ProbeHandler::new(
+        server_id,
+        Arc::new(AtomicU64::new(rate)),
+        Arc::clone(metrics),
+        limiter,
+        cache,
+        Arc::clone(&signer),
+        domain.clone(),
+        floor,
+        ceiling,
+    ));
+    (handler, signer, domain)
+}
+
+/// Default-bounds handler (no effective rate clamp).
+fn build_handler(
+    server_id: iroh::PublicKey,
+    rate: u64,
+    metrics: &Arc<Metrics>,
+    limiter: Arc<ConnectionLimiter>,
+    cache: CacheEngine,
+) -> (Arc<ProbeHandler>, Arc<PrivateKeySigner>, Eip712Domain) {
+    build_handler_bounds(server_id, rate, metrics, limiter, cache, 0, MAX_RATE_PER_MB)
+}
 
 /// Build a permissive `ConnectionLimiter` suitable for tests that don't
 /// exercise rate-limiting behaviour.
@@ -73,6 +159,31 @@ async fn local_endpoint(
     Ok((ep, addr))
 }
 
+/// Verify a 65-byte `slash_sig` recovers to `signer`'s Ethereum address over
+/// the body's frozen signed set (ADR 014 §1).
+fn assert_slash_sig_valid(
+    resp: &ProbeResponse,
+    signer: &PrivateKeySigner,
+    domain: &Eip712Domain,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        resp.slash_sig.len() == SLASH_SIG_LEN,
+        "slash_sig must be exactly {SLASH_SIG_LEN} bytes, got {}",
+        resp.slash_sig.len()
+    );
+    let sig = Signature::try_from(resp.slash_sig.as_slice())
+        .map_err(|e| anyhow::anyhow!("slash_sig parse: {e}"))?;
+    ProbeSlashData {
+        hash: B256::from(resp.body.hash),
+        has_blob: resp.body.has_blob,
+        rate_per_mb: resp.body.rate_per_mb,
+        timestamp_us: resp.body.timestamp_us,
+    }
+    .verify_signer(&sig, signer.address(), domain)
+    .map_err(|e| anyhow::anyhow!("slash_sig verify: {e}"))?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn probe_roundtrip() -> anyhow::Result<()> {
     let rate_per_mb: u64 = 42;
@@ -81,12 +192,8 @@ async fn probe_roundtrip() -> anyhow::Result<()> {
     let server_id = server_sk.public();
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
-    let handler = Arc::new(ProbeHandler::new(
-        server_id,
-        Arc::new(AtomicU64::new(rate_per_mb)),
-        Arc::clone(&metrics),
-        limiter,
-    ));
+    let (cache, _cache_tmp) = empty_cache().await?;
+    let (handler, signer, domain) = build_handler(server_id, rate_per_mb, &metrics, limiter, cache);
 
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_PROBE.to_vec()]).await?;
 
@@ -121,7 +228,10 @@ async fn probe_roundtrip() -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
 
-    let req = ProbeRequest { nonce: 0x00c0_ffee };
+    let req = ProbeRequest {
+        hash: [0x5au8; 32],
+        timestamp_us: 0x00c0_ffee,
+    };
     let payload = encode_message(&ProbeMessage::Request(req))?;
     write_frame(&mut send, &payload)
         .await
@@ -137,10 +247,15 @@ async fn probe_roundtrip() -> anyhow::Result<()> {
         ProbeMessage::Request(_) => anyhow::bail!("unexpected request variant on client"),
     };
 
-    assert_eq!(resp.nonce, req.nonce);
-    assert_eq!(resp.rate_per_mb, rate_per_mb);
-    assert_eq!(resp.node_id, *server_id.as_bytes());
-    assert!(resp.measured_at_unix_ms > 0);
+    assert_eq!(resp.body.timestamp_us, req.timestamp_us, "timestamp echoed");
+    assert_eq!(resp.body.hash, req.hash, "hash echoed");
+    assert_eq!(resp.body.rate_per_mb, rate_per_mb, "rate (unclamped)");
+    assert!(
+        !resp.body.has_blob,
+        "empty cache must report has_blob=false"
+    );
+    assert_eq!(resp.total_bytes, None, "no size when blob absent");
+    assert_slash_sig_valid(&resp, &signer, &domain)?;
 
     conn.close(0u32.into(), b"bye");
     client_ep.close().await;
@@ -162,6 +277,8 @@ struct Harness {
     accept_task: JoinHandle<anyhow::Result<()>>,
     client_ep: Endpoint,
     server_ep: Endpoint,
+    /// Kept alive so the cache dir outlives the connection.
+    _cache_tmp: tempfile::TempDir,
 }
 
 async fn spin_up_probe_harness() -> anyhow::Result<Harness> {
@@ -169,12 +286,8 @@ async fn spin_up_probe_harness() -> anyhow::Result<Harness> {
     let server_id = server_sk.public();
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
-    let handler = Arc::new(ProbeHandler::new(
-        server_id,
-        Arc::new(AtomicU64::new(1)),
-        Arc::clone(&metrics),
-        limiter,
-    ));
+    let (cache, cache_tmp) = empty_cache().await?;
+    let (handler, _signer, _domain) = build_handler(server_id, 1, &metrics, limiter, cache);
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_PROBE.to_vec()]).await?;
 
     let server_ep_bg = server_ep.clone();
@@ -207,6 +320,7 @@ async fn spin_up_probe_harness() -> anyhow::Result<Harness> {
         accept_task,
         client_ep,
         server_ep,
+        _cache_tmp: cache_tmp,
     })
 }
 
@@ -302,10 +416,14 @@ async fn probe_response_on_server_stream_returns_unsupported_code() -> anyhow::R
 
     // Well-formed frame, but the wrong variant (server expects Request).
     let payload = encode_message(&ProbeMessage::Response(ProbeResponse {
-        nonce: 0,
-        measured_at_unix_ms: 0,
-        node_id: [0u8; 32],
-        rate_per_mb: 0,
+        body: ProbeResponseBody {
+            hash: [0u8; 32],
+            has_blob: false,
+            rate_per_mb: 0,
+            timestamp_us: 0,
+        },
+        total_bytes: None,
+        slash_sig: vec![0u8; SLASH_SIG_LEN],
     }))?;
     write_frame(&mut send, &payload)
         .await
@@ -409,12 +527,8 @@ async fn probe_rate_limit_returns_rate_limited_close_code() -> anyhow::Result<()
         max_tracked_sources: 32,
     };
     let limiter = Arc::new(ConnectionLimiter::new(&strict, Arc::clone(&metrics)));
-    let handler = Arc::new(ProbeHandler::new(
-        server_id,
-        Arc::new(AtomicU64::new(1)),
-        Arc::clone(&metrics),
-        limiter,
-    ));
+    let (cache, _cache_tmp) = empty_cache().await?;
+    let (handler, _signer, _domain) = build_handler(server_id, 1, &metrics, limiter, cache);
 
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_PROBE.to_vec()]).await?;
     let server_ep_bg = server_ep.clone();
@@ -452,7 +566,10 @@ async fn probe_rate_limit_returns_rate_limited_close_code() -> anyhow::Result<()
         .open_bi()
         .await
         .map_err(|e| anyhow::anyhow!("open_bi 1: {e}"))?;
-    let req = ProbeRequest { nonce: 1 };
+    let req = ProbeRequest {
+        hash: [1u8; 32],
+        timestamp_us: 1,
+    };
     write_frame(&mut s, &encode_message(&ProbeMessage::Request(req))?)
         .await
         .map_err(|e| anyhow::anyhow!("write 1: {e}"))?;
@@ -483,6 +600,159 @@ async fn probe_rate_limit_returns_rate_limited_close_code() -> anyhow::Result<()
     client_ep.close().await;
     let _ = accept_loop.await;
     server_ep.close().await;
+    Ok(())
+}
+
+/// Drive one full probe exchange against `handler` on a loopback pair and
+/// return the decoded response. Handles endpoint setup/teardown.
+async fn run_one_probe(
+    server_sk: SecretKey,
+    handler: Arc<ProbeHandler>,
+    req: ProbeRequest,
+) -> anyhow::Result<ProbeResponse> {
+    let server_id = server_sk.public();
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_PROBE.to_vec()]).await?;
+    let server_ep_bg = server_ep.clone();
+    let accept_task = tokio::spawn(async move {
+        if let Some(incoming) = server_ep_bg.accept().await {
+            let connecting = incoming
+                .accept()
+                .map_err(|e| anyhow::anyhow!("accept: {e}"))?;
+            let conn = connecting
+                .await
+                .map_err(|e| anyhow::anyhow!("handshake: {e}"))?;
+            handler
+                .accept(conn)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    let conn = client_ep
+        .connect(target, ALPN_PROBE)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+    write_frame(&mut send, &encode_message(&ProbeMessage::Request(req))?)
+        .await
+        .map_err(|e| anyhow::anyhow!("write: {e}"))?;
+    send.finish().map_err(|e| anyhow::anyhow!("finish: {e}"))?;
+    let frame = read_frame(&mut recv)
+        .await
+        .map_err(|e| anyhow::anyhow!("read: {e}"))?;
+    let (msg, _rest) = decode_message::<ProbeMessage>(&frame)?;
+    let resp = match msg {
+        ProbeMessage::Response(r) => r,
+        ProbeMessage::Request(_) => anyhow::bail!("unexpected request variant on client"),
+    };
+    conn.close(0u32.into(), b"bye");
+    client_ep.close().await;
+    accept_task
+        .await
+        .map_err(|e| anyhow::anyhow!("accept task join: {e}"))??;
+    server_ep.close().await;
+    Ok(resp)
+}
+
+/// A node holding the blob signs `has_blob: true`, reports `total_bytes`,
+/// and the `slash_sig` verifies (ADR 005 §`cdn/probe/v1`, #318).
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_has_blob_true_for_cached_blob() -> anyhow::Result<()> {
+    let payload = b"probe-served content-addressed bytes";
+    let (cache, hash, _cache_tmp) = cache_with_blob(payload).await?;
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let (handler, signer, domain) = build_handler(server_id, 7, &metrics, limiter, cache);
+
+    let req = ProbeRequest {
+        hash: *hash.as_bytes(),
+        timestamp_us: 0xabc_def,
+    };
+    let resp = run_one_probe(server_sk, handler, req).await?;
+
+    anyhow::ensure!(resp.body.has_blob, "cached blob must report has_blob=true");
+    anyhow::ensure!(
+        resp.total_bytes == Some(payload.len() as u64),
+        "total_bytes should report the blob size, got {:?}",
+        resp.total_bytes
+    );
+    anyhow::ensure!(resp.body.hash == *hash.as_bytes(), "hash echoed");
+    assert_slash_sig_valid(&resp, &signer, &domain)?;
+    Ok(())
+}
+
+/// A node that holds the blob but cannot guarantee a hold (budget
+/// exhausted / disabled) must still answer `has_blob: false` with a valid
+/// `slash_sig` over `has_blob=false` — never risk a phantom slash (ADR 005
+/// §Hold budget). Exercises the handler's `BudgetExhausted` arm end-to-end.
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_budget_exhausted_signs_has_blob_false() -> anyhow::Result<()> {
+    let payload = b"present but un-holdable";
+    let (cache, hash, _cache_tmp) = cache_with_blob(payload).await?;
+    cache.set_max_probe_holds(0); // disable holds -> BudgetExhausted
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let (handler, signer, domain) = build_handler(server_id, 7, &metrics, limiter, cache);
+
+    let req = ProbeRequest {
+        hash: *hash.as_bytes(),
+        timestamp_us: 0x1234,
+    };
+    let resp = run_one_probe(server_sk, handler, req).await?;
+
+    anyhow::ensure!(
+        !resp.body.has_blob,
+        "budget-exhausted hold must yield has_blob=false even though the blob is cached"
+    );
+    anyhow::ensure!(
+        resp.total_bytes.is_none(),
+        "no size advertised when has_blob=false, got {:?}",
+        resp.total_bytes
+    );
+    // The signature must cover has_blob=false (not a stale true).
+    assert_slash_sig_valid(&resp, &signer, &domain)?;
+    Ok(())
+}
+
+/// `rate_per_mb` is clamped to the configured delivery ceiling before
+/// signing, and the `slash_sig` covers the clamped value (ADR 005 §Rate
+/// bounds validation, #318).
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_rate_clamped_to_ceiling_before_signing() -> anyhow::Result<()> {
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let (cache, _cache_tmp) = empty_cache().await?;
+    // Configured rate 42 but a ceiling of 5 → response must quote 5.
+    let (handler, signer, domain) =
+        build_handler_bounds(server_id, 42, &metrics, limiter, cache, 0, 5);
+
+    let req = ProbeRequest {
+        hash: [9u8; 32],
+        timestamp_us: 99,
+    };
+    let resp = run_one_probe(server_sk, handler, req).await?;
+
+    anyhow::ensure!(
+        resp.body.rate_per_mb == 5,
+        "rate must be clamped to ceiling 5, got {}",
+        resp.body.rate_per_mb
+    );
+    // slash_sig must verify over the clamped rate, not the raw 42.
+    assert_slash_sig_valid(&resp, &signer, &domain)?;
     Ok(())
 }
 

@@ -1,12 +1,26 @@
-//! `decdn probe` — send a `cdn/probe/v1` request to a running node and
-//! print the response.
+//! `decdn probe` — send a `cdn/probe/v1` content-availability query to a
+//! running node and print the signed response.
 
 use decdn_common::cli;
 
+/// Parse a user-supplied BLAKE3 hash (64 hex chars, optional `0x` prefix —
+/// the same form `cache.pinned_hashes` accepts) into raw bytes.
+fn parse_hash(s: &str) -> anyhow::Result<[u8; 32]> {
+    let hex = s.strip_prefix("0x").unwrap_or(s);
+    let h = blake3::Hash::from_hex(hex).map_err(|e| {
+        anyhow::anyhow!("invalid --hash {s:?}: expected 64 hex chars (BLAKE3 digest): {e}")
+    })?;
+    Ok(*h.as_bytes())
+}
+
 /// Send a `cdn/probe/v1` request to a running node and print the response.
+// Linear client flow (endpoint setup → request → response correlation →
+// mandatory slash_sig check → render); splitting it would only scatter the
+// single round-trip across helpers with no readability gain.
+#[allow(clippy::too_many_lines)]
 pub async fn probe(args: &cli::ProbeArgs) -> anyhow::Result<()> {
     use std::str::FromStr;
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use decdn_protocol::{
         ALPN_PROBE, ProbeMessage, decode_message, encode_message,
@@ -15,12 +29,12 @@ pub async fn probe(args: &cli::ProbeArgs) -> anyhow::Result<()> {
     };
     use iroh::endpoint::presets;
     use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl};
-    use rand::Rng;
 
     use decdn_common::identity::fresh_secret_key;
 
     let node_id = PublicKey::from_str(&args.node_id)
         .map_err(|e| anyhow::anyhow!("invalid --node-id {:?}: {e}", args.node_id))?;
+    let hash = parse_hash(&args.hash)?;
 
     let relay_url = match args.relay_url.as_deref() {
         Some(s) => Some(
@@ -58,7 +72,17 @@ pub async fn probe(args: &cli::ProbeArgs) -> anyhow::Result<()> {
     }
 
     let timeout = Duration::from_millis(args.timeout_ms);
-    let nonce: u64 = rand::rng().next_u64();
+    // ADR 005: `timestamp_us` is the requester-generated microsecond
+    // timestamp echoed back; it serves response correlation. RTT is measured
+    // from the local monotonic clock (`Instant`), which is strictly better
+    // than `receive_time - timestamp_us` for a single-host CLI and avoids
+    // cross-host clock-skew artefacts.
+    let timestamp_us = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_micros()),
+    )
+    .unwrap_or(u64::MAX);
 
     let started = Instant::now();
     let result = tokio::time::timeout(timeout, async {
@@ -72,7 +96,7 @@ pub async fn probe(args: &cli::ProbeArgs) -> anyhow::Result<()> {
             .await
             .map_err(|e| anyhow::anyhow!("open_bi failed: {e}"))?;
 
-        let payload = encode_message(&ProbeMessage::Request(ProbeRequest { nonce }))
+        let payload = encode_message(&ProbeMessage::Request(ProbeRequest { hash, timestamp_us }))
             .map_err(|e| anyhow::anyhow!("encode request: {e}"))?;
         write_frame(&mut send, &payload)
             .await
@@ -105,72 +129,90 @@ pub async fn probe(args: &cli::ProbeArgs) -> anyhow::Result<()> {
         Err(_) => anyhow::bail!("probe timed out after {} ms", args.timeout_ms),
     };
 
-    if resp.nonce != nonce {
+    // Correlation: the node echoes both the queried hash and the
+    // requester timestamp (ADR 005). A mismatch means a stale/confused
+    // response — reject it.
+    if resp.body.timestamp_us != timestamp_us {
         anyhow::bail!(
-            "nonce mismatch: sent 0x{nonce:016x}, received 0x{:016x}",
-            resp.nonce
+            "timestamp mismatch: sent {timestamp_us}, received {}",
+            resp.body.timestamp_us
         );
     }
+    if resp.body.hash != hash {
+        anyhow::bail!("hash mismatch: response is for a different blob");
+    }
+
+    // ADR 014 §1: `slash_sig` is mandatory and non-empty; requesters MUST
+    // reject missing/wrong-length signatures (and an over-`MAX_RATE_PER_MB`
+    // rate). Route through `ProbeResponse::validate()` so this requester
+    // obligation has a single definition shared with the protocol layer
+    // rather than an open-coded length check that can drift. Full
+    // attribution (recover signer, confirm NodeId↔address via
+    // `StakingRegistry`) is the on-chain `SlashJudge`'s job — the CLI has no
+    // registry client, so it enforces presence/shape only.
+    resp.validate()
+        .map_err(|e| anyhow::anyhow!("rejecting probe response: {e}"))?;
 
     let mut stdout = std::io::stdout().lock();
-    write_probe_response(&mut stdout, &resp, rtt_ms, nonce, args.json)
+    write_probe_response(&mut stdout, &resp, rtt_ms, args.json)
         .map_err(|e| anyhow::anyhow!("failed to write probe response: {e}"))?;
     Ok(())
 }
 
 /// Render a successful probe response to `w` in pretty or JSON form.
 ///
-/// Public-in-crate so unit tests can capture the output into a buffer
-/// and assert on the wire contract — in particular the `--json` shape
-/// (key set, `rtt_ms` quantization, `nonce` hex padding).
+/// Public-in-crate so unit tests can capture the output into a buffer and
+/// assert on the wire contract — in particular the `--json` shape (key set,
+/// `rtt_ms` quantization, `slash_sig` hex encoding).
 pub(crate) fn write_probe_response(
     w: &mut impl std::io::Write,
     resp: &decdn_protocol::message::ProbeResponse,
     rtt_ms: f64,
-    nonce: u64,
     json: bool,
 ) -> std::io::Result<()> {
-    // Format as the canonical iroh node-id string (z-base-32 via PublicKey's
-    // Display impl) — matches what the server logs on startup. Fall back to
-    // raw hex if the key fails to parse; the fallback stays alphanumeric so
-    // downstream `--json` consumers never see non-conforming output.
-    let node_id = iroh::PublicKey::from_bytes(&resp.node_id).map_or_else(
-        |_| {
-            use std::fmt::Write as _;
-            let mut s = String::with_capacity(2 + 64);
-            s.push_str("0x");
-            for b in resp.node_id {
-                let _ = write!(s, "{b:02x}");
-            }
-            s
-        },
-        |pk| pk.to_string(),
-    );
+    use std::fmt::Write as _;
+
+    let hash_hex = {
+        let mut s = String::with_capacity(64);
+        for b in resp.body.hash {
+            let _ = write!(s, "{b:02x}");
+        }
+        s
+    };
+    let slash_sig_hex = {
+        let mut s = String::with_capacity(resp.slash_sig.len() * 2);
+        for b in &resp.slash_sig {
+            let _ = write!(s, "{b:02x}");
+        }
+        s
+    };
+
     if json {
-        // Quantize `rtt_ms` to ms precision before serialization. The
-        // pre-#421 manual format used `{:.3}` (always 3 decimal digits,
-        // e.g. `12.500`); serde_json drops insignificant trailing zeros,
-        // so a probe at exactly 12.5 ms now emits `"rtt_ms":12.5` (was
-        // `"rtt_ms":12.500`). Numerically identical to any JSON parser;
-        // operator scripts that match a `\.\d{3}` regex will need
-        // `\.\d+`. Called out under the BREAKING note in CHANGELOG.
-        // `as_secs_f64()` carries microsecond noise past 3 decimals, so
-        // the quantization itself isn't lossy in any meaningful sense.
+        // Quantize `rtt_ms` to ms precision before serialization (see the
+        // CHANGELOG BREAKING note — the #421 manual `{:.3}` format is gone;
+        // serde_json drops insignificant trailing zeros).
         let rtt_ms_quantized = (rtt_ms * 1000.0).round() / 1000.0;
         let output = serde_json::json!({
-            "node_id": node_id,
-            "rate_per_mb": resp.rate_per_mb,
-            "measured_at_unix_ms": resp.measured_at_unix_ms,
+            "hash": hash_hex,
+            "has_blob": resp.body.has_blob,
+            "rate_per_mb": resp.body.rate_per_mb,
+            "total_bytes": resp.total_bytes,
+            "timestamp_us": resp.body.timestamp_us,
             "rtt_ms": rtt_ms_quantized,
-            "nonce": format!("0x{nonce:016x}"),
+            "slash_sig": slash_sig_hex,
         });
         writeln!(w, "{output}")
     } else {
-        writeln!(w, "node_id:       {node_id}")?;
-        writeln!(w, "rate_per_mb:   {} (base units)", resp.rate_per_mb)?;
-        writeln!(w, "measured_at:   {} (unix ms)", resp.measured_at_unix_ms)?;
+        writeln!(w, "hash:          {hash_hex}")?;
+        writeln!(w, "has_blob:      {}", resp.body.has_blob)?;
+        writeln!(w, "rate_per_mb:   {} (base units)", resp.body.rate_per_mb)?;
+        match resp.total_bytes {
+            Some(n) => writeln!(w, "total_bytes:   {n}")?,
+            None => writeln!(w, "total_bytes:   (unknown)")?,
+        }
+        writeln!(w, "timestamp_us:  {} (echoed ok)", resp.body.timestamp_us)?;
         writeln!(w, "rtt:           {rtt_ms:.3} ms")?;
-        writeln!(w, "nonce:         0x{nonce:016x} (echoed ok)")
+        writeln!(w, "slash_sig:     {slash_sig_hex}")
     }
 }
 
@@ -183,27 +225,29 @@ pub(crate) fn write_probe_response(
 )]
 mod tests {
     use super::*;
-    use decdn_protocol::message::ProbeResponse;
+    use decdn_protocol::SLASH_SIG_LEN;
+    use decdn_protocol::message::{ProbeResponse, ProbeResponseBody};
 
-    fn fixture(rate_per_mb: u64, measured_at_unix_ms: u64) -> ProbeResponse {
-        // Iroh PublicKey::from_bytes accepts any 32-byte slice, so the
-        // happy-path branch ("canonical z-base-32") fires for this fixture.
+    fn fixture(rate_per_mb: u64, has_blob: bool, total_bytes: Option<u64>) -> ProbeResponse {
         ProbeResponse {
-            node_id: [0xAB; 32],
-            rate_per_mb,
-            measured_at_unix_ms,
-            nonce: 0,
+            body: ProbeResponseBody {
+                hash: [0xAB; 32],
+                has_blob,
+                rate_per_mb,
+                timestamp_us: 1_700_000_000_000_000,
+            },
+            total_bytes,
+            slash_sig: vec![0xCD; SLASH_SIG_LEN],
         }
     }
 
     /// JSON wire shape: every key the operator-facing `--json` contract
-    /// guarantees. Catches a renamed key, a dropped field, or a type drift
-    /// (e.g. `rate_per_mb` becoming a string).
+    /// guarantees. Catches a renamed key, a dropped field, or a type drift.
     #[test]
     fn json_output_keys_and_types() {
-        let resp = fixture(10, 1_700_000_000_000);
+        let resp = fixture(10, true, Some(4096));
         let mut buf: Vec<u8> = Vec::new();
-        write_probe_response(&mut buf, &resp, 12.5, 0xDEAD_BEEF_CAFE_F00D, true).unwrap();
+        write_probe_response(&mut buf, &resp, 12.5, true).unwrap();
         let text = std::str::from_utf8(&buf).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
 
@@ -211,34 +255,44 @@ mod tests {
         let obj = parsed.as_object().unwrap();
         assert_eq!(
             obj.len(),
-            5,
-            "five keys: node_id/rate_per_mb/measured_at_unix_ms/rtt_ms/nonce"
+            7,
+            "seven keys: hash/has_blob/rate_per_mb/total_bytes/timestamp_us/rtt_ms/slash_sig"
         );
-        assert!(obj.get("node_id").unwrap().is_string());
+        assert_eq!(obj.get("hash").unwrap().as_str().map(str::len), Some(64));
+        assert_eq!(obj.get("has_blob").unwrap().as_bool(), Some(true));
         assert_eq!(obj.get("rate_per_mb").unwrap().as_u64(), Some(10));
+        assert_eq!(obj.get("total_bytes").unwrap().as_u64(), Some(4096));
         assert_eq!(
-            obj.get("measured_at_unix_ms").unwrap().as_u64(),
-            Some(1_700_000_000_000)
+            obj.get("timestamp_us").unwrap().as_u64(),
+            Some(1_700_000_000_000_000)
         );
         assert!(obj.get("rtt_ms").unwrap().is_number());
         assert_eq!(
-            obj.get("nonce").unwrap().as_str(),
-            Some("0xdeadbeefcafef00d"),
-            "nonce is hex-encoded with 0x prefix and 16 padded digits"
+            obj.get("slash_sig").unwrap().as_str().map(str::len),
+            Some(SLASH_SIG_LEN * 2),
+            "slash_sig is hex-encoded (2 chars/byte)"
         );
     }
 
+    /// `total_bytes` serializes as JSON `null` when the node didn't include
+    /// a size (ADR 005: optional field).
+    #[test]
+    fn json_total_bytes_null_when_absent() {
+        let resp = fixture(10, false, None);
+        let mut buf: Vec<u8> = Vec::new();
+        write_probe_response(&mut buf, &resp, 1.0, true).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert!(parsed["total_bytes"].is_null());
+        assert_eq!(parsed["has_blob"].as_bool(), Some(false));
+    }
+
     /// `rtt_ms` is quantized to ms precision. `12.5009` rounds to `12.501`.
-    /// Pinning the exact rounding so the published behaviour can't drift
-    /// (e.g. someone "improving" precision past ms would silently expand
-    /// the rendered float-tail across operator dashboards).
     #[test]
     fn json_rtt_ms_quantized_to_ms_precision() {
-        let resp = fixture(10, 0);
+        let resp = fixture(10, true, None);
         let mut buf: Vec<u8> = Vec::new();
-        write_probe_response(&mut buf, &resp, 12.500_9, 0, true).unwrap();
+        write_probe_response(&mut buf, &resp, 12.500_9, true).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&buf).unwrap();
-        // 12.5009 * 1000 = 12500.9, round = 12501.0, / 1000 = 12.501.
         let rtt = parsed["rtt_ms"].as_f64().unwrap();
         assert!(
             (rtt - 12.501).abs() < 1e-9,
@@ -247,12 +301,12 @@ mod tests {
     }
 
     /// `--json` output is single-line — operator scripts pipe through `jq`
-    /// without `-s`/slurp, and grep-friendly per-line tooling stays simple.
+    /// without `-s`/slurp.
     #[test]
     fn json_output_is_single_line() {
-        let resp = fixture(10, 0);
+        let resp = fixture(10, true, Some(1));
         let mut buf: Vec<u8> = Vec::new();
-        write_probe_response(&mut buf, &resp, 1.0, 0, true).unwrap();
+        write_probe_response(&mut buf, &resp, 1.0, true).unwrap();
         let text = std::str::from_utf8(&buf).unwrap();
         assert_eq!(
             text.lines().count(),
@@ -261,26 +315,42 @@ mod tests {
         );
     }
 
-    /// Pretty output emits five labelled lines in a stable order — operator
-    /// scripts grep for `node_id:` / `rtt:` etc. without `--json`.
+    /// Pretty output emits seven labelled lines in a stable order — operator
+    /// scripts grep for `has_blob:` / `rtt:` etc. without `--json`.
     #[test]
-    fn pretty_output_emits_five_labelled_lines_in_stable_order() {
-        let resp = fixture(7, 1_700_000_000_000);
+    fn pretty_output_emits_labelled_lines_in_stable_order() {
+        let resp = fixture(7, true, Some(2048));
         let mut buf: Vec<u8> = Vec::new();
-        write_probe_response(&mut buf, &resp, 1.234, 0xABCD, false).unwrap();
+        write_probe_response(&mut buf, &resp, 1.234, false).unwrap();
         let text = std::str::from_utf8(&buf).unwrap();
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 5);
-        assert!(lines[0].starts_with("node_id:"));
-        assert!(lines[1].starts_with("rate_per_mb:"));
-        assert!(lines[2].starts_with("measured_at:"));
-        assert!(lines[3].starts_with("rtt:"));
-        assert!(lines[4].starts_with("nonce:"));
-        // rtt: line keeps the `{:.3}` format on the pretty path.
+        assert_eq!(lines.len(), 7);
+        assert!(lines[0].starts_with("hash:"));
+        assert!(lines[1].starts_with("has_blob:"));
+        assert!(lines[2].starts_with("rate_per_mb:"));
+        assert!(lines[3].starts_with("total_bytes:"));
+        assert!(lines[4].starts_with("timestamp_us:"));
+        assert!(lines[5].starts_with("rtt:"));
+        assert!(lines[6].starts_with("slash_sig:"));
         assert!(
-            lines[3].contains("1.234 ms"),
-            "pretty rtt: line should keep 3-decimal format, got {:?}",
-            lines[3],
+            lines[5].contains("1.234 ms"),
+            "pretty rtt: line keeps 3-decimal format, got {:?}",
+            lines[5],
         );
+    }
+
+    #[test]
+    fn parse_hash_accepts_hex_with_and_without_prefix() {
+        let hex = "ab".repeat(32);
+        let a = parse_hash(&hex).unwrap();
+        let b = parse_hash(&format!("0x{hex}")).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a, [0xABu8; 32]);
+    }
+
+    #[test]
+    fn parse_hash_rejects_wrong_length() {
+        assert!(parse_hash("abc").is_err());
+        assert!(parse_hash(&"ab".repeat(33)).is_err());
     }
 }

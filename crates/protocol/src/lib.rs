@@ -14,7 +14,10 @@ pub use gossip::{
     GOSSIP_VERSION, GossipEnvelope, GossipPayload, LoadHint, NodeAnnounce, NodeAnnounceBody,
     POPULAR_HASHES_MAX, SIGNATURE_LEN,
 };
-pub use message::{MAX_RATE_PER_MB, MessageValidationError, ProbeMessage};
+pub use message::{
+    MAX_RATE_PER_MB, MessageValidationError, ProbeMessage, ProbeRequest, ProbeResponse,
+    ProbeResponseBody, SLASH_SIG_LEN,
+};
 
 /// ALPN protocol identifier for latency and availability probing.
 pub const ALPN_PROBE: &[u8] = b"cdn/probe/v1";

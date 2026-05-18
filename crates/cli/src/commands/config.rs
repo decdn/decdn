@@ -203,6 +203,8 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # eth_keystore = "~/.decdn/keystore.json"
 # payment_channel_address = ""       # REQUIRED: 0x-prefixed hex
 # staking_registry_address = ""      # REQUIRED: 0x-prefixed hex
+# slash_judge_address = ""           # REQUIRED: 0x-prefixed hex (EIP-712 verifyingContract, ADR 014)
+# chain_id = 421614                  # EIP-712 chain id; default Arbitrum Sepolia
 # rpc_watchdog_interval_sec = 30     # 0 disables the connectivity watchdog
 
 [cache]
@@ -210,9 +212,12 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # cache_size_mb = 10240
 # max_blob_size_mb = 1024
 # gc_interval_sec = 300                    # iroh-blobs GC sweep cadence; 0 disables (#518)
+# max_probe_holds = 256                    # probe eviction-hold budget (ADR 005 §Hold budget); 0 disables has_blob:true
 
 [payment]
 # rate_per_mb = 10
+# delivery_floor = 0                       # PoC rate-bounds clamp lower bound (ADR 005)
+# delivery_ceiling = 1000000000000         # PoC rate-bounds clamp upper bound; must be >= 1
 
 [observability]
 # log_level = "info"
