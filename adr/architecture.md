@@ -204,10 +204,6 @@ The system relies on several infrastructure-level assumptions beyond the cryptog
 - Multi-token payment support (USDC only for PoC; see [ADR 010](010-multi-token.md))
 - Erasure coding (full replication only)
 
-## Glossary
-
-The canonical glossary lives in [`README.md` § Glossary](README.md#glossary), grouped into four categories: wire protocol & content, payments, tokenomics & incentives, and on-chain enforcement.
-
 ## Origin Backends
 
 Origin-backed nodes hold the canonical bytes and are pulled only on cache miss; whether an operator is *recognized* as origin is governed on-chain via `OriginAssignment` (see [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority) and [ADR 002 § Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces)). Configuring an origin backend locally without DAO authorization simply means the operator's bytes are served as cache. The supported backends and the operator-side hash→object-key mapping below are operational reference, not protocol surface.
