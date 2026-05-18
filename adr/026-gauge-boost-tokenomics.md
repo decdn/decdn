@@ -361,10 +361,11 @@ interface ISafetyReserve {
     // the head when reserve solvency permits.
     struct PendingClaim {
         uint256 claimId;        // protocol-monotonic, set at authorization
-        uint64  accrualEpoch;   // FeeRouter epoch payout() first hit insolvency
-        bytes32 bundle;         // attested evidence hash (from payout())
-        address recipient;      // payout target
         uint256 usdcAmount;     // unfunded USDC base units (6 decimals)
+        bytes32 bundle;         // attested evidence hash (from payout())
+        // packed into one slot: address(20) + uint64(8) + enum(1) = 29 B
+        address recipient;      // payout target
+        uint64  accrualEpoch;   // FeeRouter epoch payout() first hit insolvency
         IncidentReason reason;  // categorical tag, not a priority signal
     }
 
@@ -437,8 +438,8 @@ interface ISafetyReserve {
     );
     event SlashInflowRecorded(address indexed operator, uint256 amount);
     event SwapExecuted(uint256 amountIn, uint256 amountOut);
-    event PendingClaimQueued(uint256 indexed claimId, uint64 indexed accrualEpoch, address recipient, uint256 usdcAmount, IncidentReason reason);
-    event PendingClaimDisbursed(uint256 indexed claimId, uint256 indexed incidentId, address recipient, uint256 usdcAmount);
+    event PendingClaimQueued(uint256 indexed claimId, uint64 indexed accrualEpoch, address indexed recipient, uint256 usdcAmount, IncidentReason reason);
+    event PendingClaimDisbursed(uint256 indexed claimId, uint256 indexed incidentId, address indexed recipient, uint256 usdcAmount);
     // Parameter lists pinned in
     // [ADR 032 §3](032-safety-reserve-appeals-contract.md#3-solidity-event-signatures-all-six-pinned).
     event SlashAppealOpened(uint256 indexed appealId, uint256 indexed slashId, address indexed appellant, bytes32 evidenceBundleHash, uint256 bond);
