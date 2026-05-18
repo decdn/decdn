@@ -113,10 +113,13 @@ pub async fn probe(args: &cli::ProbeArgs) -> anyhow::Result<()> {
     }
 
     // ADR 014 §1: `slash_sig` is mandatory and non-empty; requesters MUST
-    // reject missing/wrong-length signatures (and an over-`MAX_RATE_PER_MB`
-    // rate). Route through `ProbeResponse::validate()` so this requester
-    // obligation has a single definition shared with the protocol layer
-    // rather than an open-coded length check that can drift. Full
+    // reject missing/wrong-length signatures. Route through
+    // `ProbeResponse::validate()` so this requester obligation has a single
+    // definition shared with the protocol layer rather than an open-coded
+    // length check that can drift. (`validate()` also re-checks the
+    // `MAX_RATE_PER_MB` bound, but for a wire-decoded response that is
+    // already enforced at decode time by `deserialize_rate_per_mb`, so the
+    // `slash_sig` length is the only live obligation on this path.) Full
     // attribution (recover signer, confirm NodeId↔address via
     // `StakingRegistry`) is the on-chain `SlashJudge`'s job — the CLI has no
     // registry client, so it enforces presence/shape only.

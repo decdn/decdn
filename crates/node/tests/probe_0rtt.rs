@@ -20,24 +20,27 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, B256, Signature};
 use alloy::signers::local::PrivateKeySigner;
-use decdn_cache::CacheEngine;
+use decdn_cache::{CacheEngine, FilesystemOrigin, Hash};
 use decdn_cli::commands::probe_client::{ProbeMetrics, probe_once};
 use decdn_common::config::ResolvedSecurity;
+use decdn_incentive::ProbeSlashData;
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::probe::ProbeHandler;
 use decdn_node::metrics::Metrics;
-use decdn_protocol::{ALPN_PROBE, MAX_RATE_PER_MB, SESSION_TICKET_CACHE_SIZE};
+use decdn_protocol::{ALPN_PROBE, MAX_RATE_PER_MB, SESSION_TICKET_CACHE_SIZE, SLASH_SIG_LEN};
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
 
-/// Fixed BLAKE3 digest every probe in this suite queries. The transport
-/// path (0-RTT vs 1-RTT, RTT, ticket linger) is hash-independent; the
-/// server runs an empty cache so every response is `has_blob: false`.
-/// Distinct `timestamp_us` values (passed per probe) carry the echoed-back
-/// correlation these tests assert on, exactly as the pre-#569 `nonce` did.
+/// Fixed BLAKE3 digest the empty-cache transport tests query (the
+/// blob-backed `warm_0rtt_serves_signed_has_blob_true` queries its real
+/// blob hash instead). The transport path (0-RTT vs 1-RTT, RTT, ticket
+/// linger) is hash-independent; those servers run an empty cache so every
+/// response is `has_blob: false`. Distinct `timestamp_us` values (passed
+/// per probe) carry the echoed-back correlation these tests assert on,
+/// exactly as the pre-#569 `nonce` did.
 const PROBE_HASH: [u8; 32] = [0x5au8; 32];
 
 /// Forwards the client-side 0-RTT transitions into the node metrics
@@ -72,8 +75,10 @@ fn permissive_limiter(metrics: &Arc<Metrics>) -> Arc<ConnectionLimiter> {
 /// restart the server under the *same* endpoint identity (the technique
 /// iroh's own `test_0rtt_after_server_restart` uses to force a
 /// deterministic 0-RTT rejection). Returns the router, the endpoint (so
-/// callers can fully `close()` it before a restart), its endpoint id, and
-/// its dialable address.
+/// callers can fully `close()` it before a restart), its endpoint id, its
+/// dialable address, and the cache directory's `TempDir` guard — callers
+/// MUST keep the guard alive for the server's lifetime (dropping it deletes
+/// the cache dir out from under the running handler).
 async fn spawn_server(
     metrics: &Arc<Metrics>,
     enable_0rtt: bool,
@@ -85,6 +90,46 @@ async fn spawn_server(
     SocketAddr,
     tempfile::TempDir,
 )> {
+    // Empty cache (no origin): every probe answers `has_blob: false`. Most
+    // tests here exercise the 0-RTT transport, not content availability — a
+    // random EOA signer + deterministic test domain satisfy the post-#569
+    // mandatory `slash_sig` (ADR 014 §1) without the suite verifying it.
+    // `warm_0rtt_serves_signed_has_blob_true` is the exception and builds
+    // its own blob-backed cache + known signer via `spawn_core`.
+    let cache_tmp = tempfile::tempdir()?;
+    let cache = CacheEngine::open(cache_tmp.path(), vec![], 16).await?;
+    let eth_signer = Arc::new(PrivateKeySigner::random());
+    let (router, ep, id, addr) = spawn_core(
+        metrics,
+        enable_0rtt,
+        sk,
+        cache,
+        eth_signer,
+        test_slash_domain(),
+    )
+    .await?;
+    Ok((router, ep, id, addr, cache_tmp))
+}
+
+/// Deterministic test `SlashJudge` EIP-712 domain (Arbitrum Sepolia chain
+/// id, fixture verifying-contract address) — mirrors `probe_loopback.rs` so
+/// a known signer's `slash_sig` recovers under the same domain.
+fn test_slash_domain() -> alloy::dyn_abi::Eip712Domain {
+    decdn_incentive::slash_judge_domain(421_614, Address::repeat_byte(0x11))
+}
+
+/// Core server bring-up shared by `spawn_server` (empty cache, throwaway
+/// signer) and the signed-content test (blob-backed cache, known signer).
+/// Returns the router, endpoint, endpoint id, and dialable address; the
+/// caller owns the cache's `TempDir` and must keep it alive.
+async fn spawn_core(
+    metrics: &Arc<Metrics>,
+    enable_0rtt: bool,
+    sk: SecretKey,
+    cache: CacheEngine,
+    eth_signer: Arc<PrivateKeySigner>,
+    slash_domain: alloy::dyn_abi::Eip712Domain,
+) -> anyhow::Result<(Router, Endpoint, iroh::PublicKey, SocketAddr)> {
     let id = sk.public();
     let bind = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
     let ep = Endpoint::builder(presets::Minimal)
@@ -109,14 +154,6 @@ async fn spawn_server(
         other => other,
     };
 
-    // Empty cache (no origin): every probe answers `has_blob: false`. These
-    // tests exercise the 0-RTT transport, not content availability — a
-    // random EOA signer + deterministic test domain satisfy the post-#569
-    // mandatory `slash_sig` (ADR 014 §1) without the suite verifying it.
-    let cache_tmp = tempfile::tempdir()?;
-    let cache = CacheEngine::open(cache_tmp.path(), vec![], 16).await?;
-    let eth_signer = Arc::new(PrivateKeySigner::random());
-    let slash_domain = decdn_incentive::slash_judge_domain(421_614, Address::repeat_byte(0x11));
     let handler = Arc::new(ProbeHandler::new(
         id,
         Arc::new(AtomicU64::new(42)),
@@ -132,7 +169,7 @@ async fn spawn_server(
     let router = Router::builder(ep.clone())
         .accept(ALPN_PROBE, handler)
         .spawn();
-    Ok((router, ep, id, addr, cache_tmp))
+    Ok((router, ep, id, addr))
 }
 
 /// Fully tear down a server: stop the router, then close the endpoint so
@@ -166,6 +203,60 @@ async fn client_endpoint() -> anyhow::Result<Endpoint> {
 fn has_metric_line(text: &str, name: &str, value: u64) -> bool {
     let needle = format!("{name} {value}");
     text.lines().any(|l| l == needle)
+}
+
+/// Open a cache pre-seeded with `payload` (pulled+verified into the store
+/// via a filesystem origin, then the origin dir is dropped so subsequent
+/// reads are proven local). Mirrors `probe_loopback.rs::cache_with_blob`.
+/// The returned `TempDir` must be kept alive for the cache's lifetime.
+async fn cache_with_blob(payload: &[u8]) -> anyhow::Result<(CacheEngine, Hash, tempfile::TempDir)> {
+    let hash = Hash::new(payload);
+    let origin_dir = tempfile::tempdir()?;
+    let hex = hash.to_hex();
+    let shard = hex
+        .get(..2)
+        .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
+    let dir = origin_dir.path().join(shard);
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join(hex.as_str()), payload)?;
+
+    let cache_dir = tempfile::tempdir()?;
+    let origin = Arc::new(FilesystemOrigin::new(origin_dir.path()).await?);
+    let cache = CacheEngine::open(
+        cache_dir.path(),
+        vec![origin as Arc<dyn decdn_cache::Origin>],
+        16,
+    )
+    .await?;
+    let _ = cache.get(hash).await?; // populate the local store
+    drop(origin_dir); // prove subsequent reads are local
+    Ok((cache, hash, cache_dir))
+}
+
+/// Verify a 65-byte `slash_sig` recovers to `signer`'s Ethereum address
+/// over the body's frozen signed set (ADR 014 §1). Mirrors
+/// `probe_loopback.rs::assert_slash_sig_valid`.
+fn assert_slash_sig_valid(
+    resp: &decdn_protocol::message::ProbeResponse,
+    signer: &PrivateKeySigner,
+    domain: &alloy::dyn_abi::Eip712Domain,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        resp.slash_sig.len() == SLASH_SIG_LEN,
+        "slash_sig must be exactly {SLASH_SIG_LEN} bytes, got {}",
+        resp.slash_sig.len()
+    );
+    let sig = Signature::try_from(resp.slash_sig.as_slice())
+        .map_err(|e| anyhow::anyhow!("slash_sig parse: {e}"))?;
+    ProbeSlashData {
+        hash: B256::from(resp.body.hash),
+        has_blob: resp.body.has_blob,
+        rate_per_mb: resp.body.rate_per_mb,
+        timestamp_us: resp.body.timestamp_us,
+    }
+    .verify_signer(&sig, signer.address(), domain)
+    .map_err(|e| anyhow::anyhow!("slash_sig verify: {e}"))?;
+    Ok(())
 }
 
 /// Cold probe caches a ticket; the second probe over the same client
@@ -482,6 +573,69 @@ async fn default_on_accepting_still_accepts_0rtt_safety_is_client_side() -> anyh
     assert!(
         has_metric_line(&text, "decdn_quic_session_ticket_cache_size", 0),
         "disabled handler must not feed the session-ticket gauge:\n{text}"
+    );
+
+    client.close().await;
+    shutdown_server(router, server_ep).await?;
+    Ok(())
+}
+
+/// Closes the merge seam #569 ↔ #576 left open: the 0-RTT *early-data*
+/// response path (`ZeroRttStatus::Accepted` → `read_response`) is a
+/// distinct code path from the 1-RTT `exchange()`, yet no test exercised it
+/// carrying a *verified* `slash_sig` and `has_blob: true`. Every other test
+/// here uses an empty cache + throwaway signer. Here the server holds the
+/// queried blob and signs with a *known* key under the shared test domain,
+/// so the warm (0-RTT-accepted) probe asserts the full post-#569 contract —
+/// `has_blob: true`, `total_bytes`, and an EIP-712 `slash_sig` that
+/// recovers to the operator address — rode the early-data stream intact.
+#[tokio::test(flavor = "multi_thread")]
+async fn warm_0rtt_serves_signed_has_blob_true() -> anyhow::Result<()> {
+    let metrics = Arc::new(Metrics::new());
+    let payload = b"deCDN 0-RTT signed-response coverage payload";
+    let (cache, blob_hash, _cache_tmp) = cache_with_blob(payload).await?;
+    let signer = Arc::new(PrivateKeySigner::random());
+    let domain = test_slash_domain();
+    let (router, server_ep, server_id, server_addr) = spawn_core(
+        &metrics,
+        true,
+        SecretKey::generate(),
+        cache,
+        Arc::clone(&signer),
+        domain.clone(),
+    )
+    .await?;
+    let client = client_endpoint().await?;
+    let sink = MetricsSink(Arc::clone(&metrics));
+    let timeout = Duration::from_secs(5);
+    let hash = *blob_hash.as_bytes();
+    let target = || EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    // Probe 1 — cold: 1-RTT, caches a ticket. Already proves the blob is
+    // served signed over the plain path.
+    let (r1, _) = probe_once(&client, target(), hash, 0xF1, true, Some(&sink), timeout).await?;
+    assert_eq!(r1.body.timestamp_us, 0xF1);
+    assert!(r1.body.has_blob, "server holds the blob");
+    assert_eq!(
+        r1.total_bytes,
+        Some(payload.len() as u64),
+        "size reported when blob present"
+    );
+    assert_slash_sig_valid(&r1, &signer, &domain)?;
+
+    // Probe 2 — warm: same client endpoint → cached ticket → 0-RTT
+    // attempt, accepted. The signed content-availability body must survive
+    // the early-data path byte-for-byte.
+    let (r2, _) = probe_once(&client, target(), hash, 0xF2, true, Some(&sink), timeout).await?;
+    assert_eq!(r2.body.timestamp_us, 0xF2);
+    assert!(r2.body.has_blob, "0-RTT path must still report has_blob");
+    assert_eq!(r2.total_bytes, Some(payload.len() as u64));
+    assert_slash_sig_valid(&r2, &signer, &domain)?;
+
+    let text = metrics.encode()?;
+    assert!(
+        has_metric_line(&text, "decdn_quic_0rtt_accepted_total", 1),
+        "second probe must have been served as accepted 0-RTT:\n{text}"
     );
 
     client.close().await;

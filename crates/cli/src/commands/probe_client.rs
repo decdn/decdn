@@ -8,7 +8,10 @@
 //! loop (DHT `FIND_VALUE` → parallel probes, [ADR 001]) can reuse the exact
 //! mechanism — attempt, accept/reject classification, fallback re-send,
 //! and the post-exchange linger that lets the server's `NewSessionTicket`
-//! reach the client's (iroh/rustls-owned) session cache.
+//! reach the client's (iroh/rustls-owned) session cache. The reused
+//! mechanism is **transport-only**: echoed-field correlation (ADR 005) and
+//! `slash_sig` validation (ADR 014 §1) are the caller's responsibility, not
+//! performed here — see [`probe_once`].
 //!
 //! Session-ticket storage is **not** managed here: iroh wires an LRU
 //! `rustls::client::ClientSessionMemoryCache` into every endpoint, sized
@@ -67,12 +70,14 @@ const LINGER_MAX: Duration = Duration::from_secs(2);
 /// (≤ `LINGER_MAX`) so capturing the ticket can't starve, nor inflate,
 /// the caller's deadline.
 ///
-/// The decoded [`ProbeResponse`] is returned uncorrelated and unvalidated:
-/// the requester-side obligations — echoed `hash`/`timestamp_us`
-/// correlation (ADR 005) and the mandatory `slash_sig` shape check
-/// (`ProbeResponse::validate`, ADR 014 §1) — are the caller's, so a future
-/// node-side probe-collection loop can apply its own policy on the same
-/// transport.
+/// The decoded [`ProbeResponse`] is returned without echoed-field
+/// correlation or `slash_sig` validation: the requester-side obligations —
+/// echoed `hash`/`timestamp_us` correlation (ADR 005) and the mandatory
+/// `slash_sig` shape check (`ProbeResponse::validate`, ADR 014 §1) — are the
+/// caller's, so a future node-side probe-collection loop can apply its own
+/// policy on the same transport. The only check performed internally is the
+/// protocol-level one that the server sent a `Response` (not a `Request`)
+/// variant.
 #[allow(clippy::too_many_arguments)] // transport knobs; each arg is distinct.
 pub async fn probe_once(
     endpoint: &Endpoint,
