@@ -297,7 +297,7 @@ The offline lease intentionally weakens two properties of the online scheme: K_b
 
 ### Negative
 
-- Adds an app server component that shares the iroh QUIC transport layer but is not a CDN protocol participant (documented in [architecture.md](architecture.md#external-components) under External Components). Content providers must run an `iroh::Endpoint` accepting `cdn/keys/v1` connections alongside their auth/billing infrastructure. A minimal reference implementation may be provided in a separate repository.
+- Adds an app server component that shares the iroh QUIC transport layer but is not a CDN protocol participant — operated by the content provider, it does not participate in gossip, probing, or paid delivery, and the CDN crates do not depend on it. Content providers must run an `iroh::Endpoint` accepting `cdn/keys/v1` connections alongside their auth/billing infrastructure. A minimal reference implementation may be provided in a separate repository.
 - The app server's key store (holding all `K_blob` values) is a high-value target. It must be protected with a KMS or HSM in production. Key-store compromise exposes all content.
 - A hacked client can still extract `K_blob` for tracks it plays in real-time. This is inherent to any scheme where the client produces plaintext output — equivalent to the "analog hole" in DRM systems.
 - Epoch key rotation creates a hard dependency on the `cdn/keys/v1` connection. If it drops, the client cannot decrypt new tracks until it reconnects and receives the current epoch key. The client should cache the current and previous epoch keys in memory (not disk) to survive brief disconnects and to unwrap envelopes for content buffered just before an epoch boundary.

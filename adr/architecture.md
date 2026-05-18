@@ -194,79 +194,15 @@ The system relies on several infrastructure-level assumptions beyond the cryptog
 
 - **iroh relay availability.** iroh relays are stateless servers that broker NAT traversal and relay encrypted traffic as a fallback when direct peer-to-peer connections fail (~10% of networking conditions). Relays are not CDN protocol participants — they cannot inspect, cache, or modify content (all traffic is end-to-end encrypted). The deCDN does not incentivize relay operators: paying relays per-byte would create a perverse incentive to prevent direct connections from forming. PoC uses n0.computer's public relays (rate-limited, no SLA). Production deployments should self-host dedicated relays as operational infrastructure, funded from protocol treasury or node staking fees — not as an incentivized network role. If direct-connection success rates drop below ~85%, investigate NAT traversal improvements before considering relay incentivization.
 
-## Non-Goals (PoC)
+## Non-Goals
 
 - DRM or content protection
 - Content transcoding or adaptive format conversion
-- Search, discovery, or recommendation (deferred; see [Deferred & Open](#deferred--open) below)
+- Search, discovery, or recommendation (an external/additive layer, not the core protocol)
 - Mobile or web clients
 - Multi-chain support (single L2 only)
-- Multi-token payment support (USDC only for PoC; see [ADR 010](010-multi-token.md))
 - Erasure coding (full replication only)
 
 ## Origin Backends
 
-Origin-backed nodes hold the canonical bytes and are pulled only on cache miss; whether an operator is *recognized* as origin is governed on-chain via `OriginAssignment` (see [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority) and [ADR 002 § Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces)). Configuring an origin backend locally without DAO authorization simply means the operator's bytes are served as cache. The supported backends and the operator-side hash→object-key mapping below are operational reference, not protocol surface.
-
-### Supported Origins
-
-| Origin | Auth Method | Notes |
-| --- | --- | --- |
-| AWS S3 | IAM credentials or pre-signed URLs | Most common |
-| Cloudflare R2 | S3-compatible API | No egress fees between R2 and Workers |
-| Backblaze B2 | S3-compatible API | Cheapest egress ($0.01/GB) |
-| MinIO (self-hosted) | S3-compatible API | Full operator control |
-| NFS (local mount) | Filesystem access | No egress fees; requires local/network mount |
-| Local disk | Filesystem access | Simplest setup; single-machine only |
-
-All origin access goes through a single trait:
-
-```rust
-trait OriginStore: Send + Sync {
-    async fn fetch(&self, hash: &Hash) -> Result<Bytes>;
-    async fn head(&self, hash: &Hash) -> Result<ObjectMeta>;
-}
-```
-
-### Hash-to-Object-Key Mapping
-
-S3 objects are addressed by key (a path string). Blobs are addressed by BLAKE3 hash. The mapping is stored in a content catalog — a small database (PostgreSQL or SQLite) maintained by the operator:
-
-```
-catalog: hash → {s3_bucket, s3_key, size_bytes, content_type}
-```
-
-Nodes query it on cache miss to find the origin pull URL. The catalog is not on-chain — it is an operational concern.
-
-## External Components
-
-Components referenced by appendices that are operated by content providers, not part of the CDN protocol or workspace.
-
-- **App Server** — companion to the [encrypted-content publishing pattern](appendix-encrypted-content-publishing.md). Operated by the content provider; shares the iroh QUIC transport layer with the CDN but does not participate in gossip, probing, or paid delivery. The CDN crates do not depend on it.
-
-## Deferred & Open
-
-### Search & Discovery (deferred)
-
-Not in PoC scope. The planned approach for the next phase:
-
-Dedicated **indexer nodes** subscribe to gossip topics and respond to `cdn/probe/v1` queries to build a searchable index of content metadata (via `tantivy` or equivalent), exposing a query API on a custom ALPN (`cdn/search/v1`). Multiple independent indexers can coexist. Clients pay per query via the same payment channel mechanism. Indexers register in the `StakingRegistry` and are slashable for fabricated results.
-
-Content discovery uses `cdn/dht/v1` from PoC onward — at 30 nodes, FIND_VALUE resolves in 1–2 hops and is negligible overhead. Indexers complement DHT by providing metadata search. The on-chain origin directory ([ADR 022](022-content-discovery.md)) remains the deterministic last-resort fallback when DHT returns no providers.
-
-### KV-CRDT Content Catalogs (deferred)
-
-Not in PoC scope. iroh's KV-CRDT protocol (`iroh-docs`) provides a replicated key-value store with eventual consistency via range-based set reconciliation. Entries are `(namespace, author, key) → (BLAKE3 hash, size, timestamp)` — metadata only; actual content travels via iroh-blobs separately. This maps naturally to deCDN's content-addressing model.
-
-**Primary use case — content catalog replication.** A KV-CRDT namespace per content provider could replicate a catalog of `hash → content metadata` entries across nodes. Nodes would learn what content exists before needing it, enabling smarter prefetching. This complements (not replaces) `cdn/dht/v1` — CRDT replication propagates metadata; DHT locates holders.
-
-**Secondary use cases to evaluate:**
-
-- **Node metadata.** A shared document keyed by `NodeId` could provide persistent, eventually-consistent node state (rates, capacity, regions) that survives reconnections — supplementing or replacing ephemeral gossip `NodeAnnounce` messages.
-- **Indexer replication layer.** Indexer nodes (the search layer described above) could subscribe to content catalog namespaces and build their search index from replicated entries, rather than relying solely on gossip and probe participation.
-
-**Why not in PoC:** DHT already handles content discovery at PoC scale. CRDT replication adds value at larger scale for smarter prefetching; deferred until the network grows beyond where DHT alone suffices. **Reference:** [iroh-docs protocol](https://docs.iroh.computer/protocols/kv-crdts)
-
-### Open / undecided
-
-- Parallel streaming from multiple nodes for a single blob (protocol supports it, not prioritised).
+Origin-backed nodes hold the canonical bytes and are pulled only on cache miss; whether an operator is *recognized* as origin is governed on-chain via `OriginAssignment` (see [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority) and [ADR 002 § Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces)). Configuring an origin backend locally without DAO authorization simply means the operator's bytes are served as cache. Supported backends — any S3-compatible object store (AWS S3, Cloudflare R2, Backblaze B2, self-hosted MinIO), an NFS mount, or local disk — and how a node maps a hash to its stored object are purely operational: the protocol only requires that a node deliver the correct bytes for a given hash.
