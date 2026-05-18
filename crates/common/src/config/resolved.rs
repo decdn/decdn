@@ -25,6 +25,8 @@ pub struct ResolvedNetwork {
     pub bind_port: u16,
     /// iroh relay URL.
     pub relay_url: Option<String>,
+    /// QUIC 0-RTT master switch for `cdn/probe/v1` (ADR 015). Default `true`.
+    pub enable_0rtt: bool,
 }
 
 /// Resolved blockchain fields.

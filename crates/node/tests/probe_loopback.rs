@@ -98,6 +98,9 @@ fn build_handler_bounds(
         domain.clone(),
         floor,
         ceiling,
+        // This suite is the pre-ADR-015 1-RTT loopback coverage; 0-RTT
+        // acceptance has its own dedicated test (probe_0rtt.rs).
+        false,
     ));
     (handler, signer, domain)
 }

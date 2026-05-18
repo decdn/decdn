@@ -4,8 +4,9 @@
 //! `decdn_*` counters and iroh's own transport metrics through a single
 //! endpoint. Output is `OpenMetrics` text, which Prometheus scrapers accept.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -72,6 +73,40 @@ pub struct DecdnMetrics {
     /// applicable." Operator-visible name:
     /// `decdn_dispatch_per_source_skipped_no_addr_total`.
     pub dispatch_per_source_skipped_no_addr: Counter,
+    /// QUIC 0-RTT connection attempts on `cdn/probe/v1` — a cached
+    /// session ticket existed and early data was sent (ADR 015
+    /// §Observability). Operator-visible name:
+    /// `decdn_quic_0rtt_attempts_total`.
+    pub quic_0rtt_attempts: Counter,
+    /// 0-RTT attempts the server accepted (early data processed without a
+    /// full handshake). Operator-visible name:
+    /// `decdn_quic_0rtt_accepted_total`.
+    pub quic_0rtt_accepted: Counter,
+    /// 0-RTT attempts the server rejected; the client fell back to a
+    /// 1-RTT handshake and re-sent the request. Operator-visible name:
+    /// `decdn_quic_0rtt_rejected_total`.
+    pub quic_0rtt_rejected: Counter,
+    /// Approximate 0-RTT working-set size (ADR 015 §Observability).
+    /// rustls owns the real session stores and exposes no size API, so
+    /// this is a *proxy*: the number of distinct remote endpoints that
+    /// completed a probe handshake on the 0-RTT-enabled server path —
+    /// cold clients included, since the server still issues a
+    /// `NewSessionTicket` to each. It is **not** a mirror of any specific
+    /// rustls cache: server-side resumption state lives in rustls's
+    /// internal, default-sized server store (iroh's `max_tls_tickets`
+    /// knob sizes only the *client* `ClientSessionMemoryCache`). The
+    /// value saturates at `SESSION_TICKET_CACHE_CEILING` because the
+    /// backing set is bounded there for memory safety, not because it
+    /// tracks a cache of that size — close at `PoC` scale either way.
+    pub quic_session_ticket_cache_size: Gauge,
+    /// Distinct *new* peers dropped from the tracking set because it hit
+    /// `SESSION_TICKET_CACHE_CEILING`. Zero under organic load at `PoC`
+    /// scale; a rising value means the unauthenticated probe handler is
+    /// being fed many distinct node ids — i.e. it distinguishes a
+    /// Sybil-style saturation from the gauge legitimately reaching the
+    /// ceiling. Operator-visible name:
+    /// `decdn_quic_session_ticket_peers_dropped_total`.
+    pub quic_session_ticket_peers_dropped: Counter,
     /// `decdn_probe_hold_violations_total` per the canonical metric registry
     /// (`adr/appendix-observability.md` — the authoritative naming source,
     /// superseding informal ADR-005 references). The registry's alert
@@ -103,6 +138,16 @@ pub struct DecdnMetrics {
     pub rate_bounds_clamp_events: Counter,
 }
 
+/// Self-imposed cap on the distinct-peer tracking set (and hence the
+/// `quic_session_ticket_cache_size` gauge). It is **not** a rustls cache
+/// size — the server-side ticket store is rustls-internal and untouched
+/// by iroh's `max_tls_tickets`. We reuse
+/// [`decdn_protocol::SESSION_TICKET_CACHE_SIZE`] (the value that *does*
+/// size the client-side `ClientSessionMemoryCache`) purely so the node's
+/// 0-RTT memory budget is described by one number across client and
+/// server roles.
+const SESSION_TICKET_CACHE_CEILING: usize = decdn_protocol::SESSION_TICKET_CACHE_SIZE;
+
 /// Aggregated deCDN node metrics.
 #[derive(Debug)]
 pub struct Metrics {
@@ -110,6 +155,13 @@ pub struct Metrics {
     decdn: Arc<DecdnMetrics>,
     cache: Arc<CacheMetrics>,
     started_at: Instant,
+    /// Distinct remote endpoint ids with a completed 0-RTT-eligible
+    /// handshake. Backs the approximate `quic_session_ticket_cache_size`
+    /// gauge (rustls exposes no session-store size API). Bounded at
+    /// `SESSION_TICKET_CACHE_CEILING` entries by `note_session_ticket_peer`
+    /// — the insert path is fed by the unauthenticated probe handler, so
+    /// the cap is what stops an unbounded-distinct-peer memory leak.
+    session_ticket_peers: Mutex<HashSet<[u8; 32]>>,
 }
 
 impl Default for Metrics {
@@ -138,6 +190,7 @@ impl Metrics {
             decdn,
             cache,
             started_at: Instant::now(),
+            session_ticket_peers: Mutex::new(HashSet::new()),
         }
     }
 
@@ -261,6 +314,60 @@ impl Metrics {
         self.decdn.dispatch_per_source_skipped_no_addr.inc();
     }
 
+    /// Record a 0-RTT connection attempt (ADR 015): a cached session
+    /// ticket existed and early data was sent.
+    pub fn record_0rtt_attempt(&self) {
+        self.decdn.quic_0rtt_attempts.inc();
+    }
+
+    /// Record that the server accepted a 0-RTT attempt.
+    pub fn record_0rtt_accepted(&self) {
+        self.decdn.quic_0rtt_accepted.inc();
+    }
+
+    /// Record that the server rejected a 0-RTT attempt and the client
+    /// fell back to a 1-RTT handshake.
+    pub fn record_0rtt_rejected(&self) {
+        self.decdn.quic_0rtt_rejected.inc();
+    }
+
+    /// Note a remote endpoint with which a 0-RTT-eligible handshake
+    /// completed, refreshing the approximate
+    /// `quic_session_ticket_cache_size` gauge. Idempotent per peer; a
+    /// poisoned lock is treated as "skip the update" rather than
+    /// panicking (anti-panic policy).
+    ///
+    /// The tracking set is itself bounded at `SESSION_TICKET_CACHE_CEILING`,
+    /// not just the gauge value: this is called from the *unauthenticated*
+    /// probe handler, so a peer presenting many distinct node ids (cheap
+    /// to generate) would otherwise grow the set without limit — a slow
+    /// memory-exhaustion vector on untrusted input. Once the set is full
+    /// new peers are no longer tracked (re-noting an already-tracked peer
+    /// stays a no-op) and `quic_session_ticket_peers_dropped` is bumped so
+    /// the saturation is distinguishable from organic growth; the gauge
+    /// then sits at the ceiling. The ceiling is the node's own memory
+    /// bound, not a rustls cache size (see `SESSION_TICKET_CACHE_CEILING`).
+    pub fn note_session_ticket_peer(&self, remote_id: [u8; 32]) {
+        let Ok(mut peers) = self.session_ticket_peers.lock() else {
+            return;
+        };
+        if peers.len() < SESSION_TICKET_CACHE_CEILING {
+            peers.insert(remote_id);
+        } else if !peers.contains(&remote_id) {
+            // Set is full AND this is a genuinely new peer: the memory
+            // bound is engaging on (untrusted) input. Surface it so a
+            // Sybil-style flood is distinguishable from organic
+            // saturation. Re-noting an already-tracked peer is a
+            // legitimate no-op and must NOT count as a drop, or the
+            // counter becomes noise.
+            self.decdn.quic_session_ticket_peers_dropped.inc();
+        }
+        let size = peers.len();
+        self.decdn
+            .quic_session_ticket_cache_size
+            .set(i64::try_from(size).unwrap_or(i64::MAX));
+    }
+
     /// Read the current value of the `rpc_healthy` gauge. Test-only —
     /// production code should rely on the `OpenMetrics` endpoint rather
     /// than reaching into individual gauges.
@@ -276,7 +383,12 @@ impl Metrics {
         ConnectionGuard::new(self)
     }
 
-    pub(crate) fn encode(&self) -> anyhow::Result<String> {
+    /// Render the registry as `OpenMetrics` text — exactly the body the
+    /// public `/metrics` HTTP endpoint serves. `pub` (not `pub(crate)`)
+    /// so integration tests in sibling crates can assert on the exported
+    /// series without scraping over TCP; it exposes no data the
+    /// unauthenticated `/metrics` endpoint doesn't already.
+    pub fn encode(&self) -> anyhow::Result<String> {
         let uptime = i64::try_from(self.started_at.elapsed().as_secs()).unwrap_or(i64::MAX);
         self.decdn.uptime_seconds.set(uptime);
 
@@ -466,6 +578,88 @@ mod tests {
                 "counter {name} should be exposed at zero on a fresh registry:\n{text}"
             );
         }
+    }
+
+    #[test]
+    fn quic_0rtt_metrics_start_at_zero_and_increment() {
+        let metrics = Metrics::new();
+
+        // Fresh registry: ADR 015 §Observability metrics exposed at zero
+        // so dashboards don't render `(no data)` before the first probe.
+        let text = metrics.encode().unwrap();
+        for name in [
+            "decdn_quic_0rtt_attempts_total",
+            "decdn_quic_0rtt_accepted_total",
+            "decdn_quic_0rtt_rejected_total",
+            "decdn_quic_session_ticket_peers_dropped_total",
+        ] {
+            assert!(
+                has_metric_line(&text, name, 0),
+                "0-RTT counter {name} should start at zero:\n{text}"
+            );
+        }
+        assert!(
+            has_metric_line(&text, "decdn_quic_session_ticket_cache_size", 0),
+            "session-ticket gauge should start at zero:\n{text}"
+        );
+
+        metrics.record_0rtt_attempt();
+        metrics.record_0rtt_attempt();
+        metrics.record_0rtt_accepted();
+        metrics.record_0rtt_rejected();
+
+        let text = metrics.encode().unwrap();
+        assert!(has_metric_line(&text, "decdn_quic_0rtt_attempts_total", 2));
+        assert!(has_metric_line(&text, "decdn_quic_0rtt_accepted_total", 1));
+        assert!(has_metric_line(&text, "decdn_quic_0rtt_rejected_total", 1));
+    }
+
+    #[test]
+    fn session_ticket_gauge_counts_distinct_peers_and_is_idempotent() {
+        let metrics = Metrics::new();
+
+        metrics.note_session_ticket_peer([1u8; 32]);
+        metrics.note_session_ticket_peer([2u8; 32]);
+        // Re-noting the same peer must not double-count (the real rustls
+        // cache holds one ticket entry per peer).
+        metrics.note_session_ticket_peer([1u8; 32]);
+
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(&text, "decdn_quic_session_ticket_cache_size", 2),
+            "expected 2 distinct peers, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn session_ticket_set_is_bounded_against_unbounded_distinct_peers() {
+        // Regression: the insert path is fed by the unauthenticated probe
+        // handler, so the tracking set MUST stay bounded under a flood of
+        // distinct node ids — not just the gauge value.
+        let metrics = Metrics::new();
+        for i in 0..(SESSION_TICKET_CACHE_CEILING + 50) {
+            let mut id = [0u8; 32];
+            let tag = u64::try_from(i).unwrap().to_le_bytes();
+            id.iter_mut().zip(tag).for_each(|(dst, src)| *dst = src);
+            metrics.note_session_ticket_peer(id);
+        }
+
+        let ceiling = u64::try_from(SESSION_TICKET_CACHE_CEILING).unwrap();
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(&text, "decdn_quic_session_ticket_cache_size", ceiling),
+            "gauge must saturate at the ceiling, got:\n{text}"
+        );
+        // The set itself stopped growing at the ceiling (the leak fix),
+        // not merely the reported gauge.
+        let len = metrics.session_ticket_peers.lock().unwrap().len();
+        assert_eq!(len, SESSION_TICKET_CACHE_CEILING);
+        // The 50 distinct peers beyond the ceiling were each counted as a
+        // drop, so the saturation is observable (not silent).
+        assert!(
+            has_metric_line(&text, "decdn_quic_session_ticket_peers_dropped_total", 50),
+            "expected 50 dropped peers, got:\n{text}"
+        );
     }
 
     #[tokio::test]

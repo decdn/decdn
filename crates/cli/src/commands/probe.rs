@@ -3,6 +3,8 @@
 
 use decdn_common::cli;
 
+use super::probe_client::probe_once;
+
 /// Parse a user-supplied BLAKE3 hash (64 hex chars, optional `0x` prefix —
 /// the same form `cache.pinned_hashes` accepts) into raw bytes.
 fn parse_hash(s: &str) -> anyhow::Result<[u8; 32]> {
@@ -13,20 +15,22 @@ fn parse_hash(s: &str) -> anyhow::Result<[u8; 32]> {
     Ok(*h.as_bytes())
 }
 
-/// Send a `cdn/probe/v1` request to a running node and print the response.
-// Linear client flow (endpoint setup → request → response correlation →
-// mandatory slash_sig check → render); splitting it would only scatter the
-// single round-trip across helpers with no readability gain.
-#[allow(clippy::too_many_lines)]
+/// Send a `cdn/probe/v1` content-availability request to a running node and
+/// print the signed response.
+///
+/// The transport path (0-RTT attempt + 1-RTT fallback, ADR 015) lives in
+/// [`probe_once`]; response correlation and the mandatory `slash_sig` check
+/// (ADR 014 §1) are applied here on the returned response. 0-RTT is always
+/// attempted (`enable_0rtt = true`): a probe is read-only and idempotent, so
+/// early data is safe, and there is no per-invocation reason to disable it. A
+/// one-shot `decdn probe` starts cold — iroh's session cache is per-endpoint
+/// and this process builds a fresh endpoint — so the first (and only)
+/// attempt resolves 1-RTT; the machinery exists for the node's long-lived
+/// reuse, not the CLI's.
 pub async fn probe(args: &cli::ProbeArgs) -> anyhow::Result<()> {
     use std::str::FromStr;
-    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use decdn_protocol::{
-        ALPN_PROBE, ProbeMessage, decode_message, encode_message,
-        message::{ProbeRequest, ProbeResponse},
-        read_frame, write_frame,
-    };
     use iroh::endpoint::presets;
     use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl};
 
@@ -57,6 +61,10 @@ pub async fn probe(args: &cli::ProbeArgs) -> anyhow::Result<()> {
     let endpoint = Endpoint::builder(presets::Minimal)
         .secret_key(client_sk)
         .relay_mode(relay_mode)
+        // ADR 015 §Session Ticket Management: shared ticket-cache size
+        // (iroh's default is 256). Harmless for the one-shot CLI; matches
+        // the node's endpoint so the mechanism is identical.
+        .max_tls_tickets(decdn_protocol::SESSION_TICKET_CACHE_SIZE)
         .bind_addr(bind_addr)
         .map_err(|e| anyhow::anyhow!("invalid bind addr {bind_addr}: {e}"))?
         .bind()
@@ -84,50 +92,12 @@ pub async fn probe(args: &cli::ProbeArgs) -> anyhow::Result<()> {
     )
     .unwrap_or(u64::MAX);
 
-    let started = Instant::now();
-    let result = tokio::time::timeout(timeout, async {
-        let conn = endpoint
-            .connect(target, ALPN_PROBE)
-            .await
-            .map_err(|e| anyhow::anyhow!("connect failed: {e}"))?;
-
-        let (mut send, mut recv) = conn
-            .open_bi()
-            .await
-            .map_err(|e| anyhow::anyhow!("open_bi failed: {e}"))?;
-
-        let payload = encode_message(&ProbeMessage::Request(ProbeRequest { hash, timestamp_us }))
-            .map_err(|e| anyhow::anyhow!("encode request: {e}"))?;
-        write_frame(&mut send, &payload)
-            .await
-            .map_err(|e| anyhow::anyhow!("write request: {e}"))?;
-        send.finish()
-            .map_err(|e| anyhow::anyhow!("finish stream: {e}"))?;
-
-        let frame = read_frame(&mut recv)
-            .await
-            .map_err(|e| anyhow::anyhow!("read response: {e}"))?;
-        let (msg, _rest) = decode_message::<ProbeMessage>(&frame)
-            .map_err(|e| anyhow::anyhow!("decode response: {e}"))?;
-        let resp: ProbeResponse = match msg {
-            ProbeMessage::Response(r) => r,
-            ProbeMessage::Request(_) => {
-                anyhow::bail!("unexpected ProbeMessage::Request from server");
-            }
-        };
-
-        conn.close(0u32.into(), b"probe-done");
-        Ok::<_, anyhow::Error>(resp)
-    })
-    .await;
-
-    let rtt_ms = started.elapsed().as_secs_f64() * 1000.0;
+    // Transport (0-RTT attempt + 1-RTT fallback, ADR 015) and RTT
+    // measurement live in `probe_once`. The CLI passes no `ProbeMetrics`
+    // sink — the one-shot `decdn` binary has no metrics registry.
+    let result = probe_once(&endpoint, target, hash, timestamp_us, true, None, timeout).await;
     endpoint.close().await;
-
-    let resp = match result {
-        Ok(inner) => inner?,
-        Err(_) => anyhow::bail!("probe timed out after {} ms", args.timeout_ms),
-    };
+    let (resp, rtt_ms) = result?;
 
     // Correlation: the node echoes both the queried hash and the
     // requester timestamp (ADR 005). A mismatch means a stale/confused
@@ -143,10 +113,13 @@ pub async fn probe(args: &cli::ProbeArgs) -> anyhow::Result<()> {
     }
 
     // ADR 014 §1: `slash_sig` is mandatory and non-empty; requesters MUST
-    // reject missing/wrong-length signatures (and an over-`MAX_RATE_PER_MB`
-    // rate). Route through `ProbeResponse::validate()` so this requester
-    // obligation has a single definition shared with the protocol layer
-    // rather than an open-coded length check that can drift. Full
+    // reject missing/wrong-length signatures. Route through
+    // `ProbeResponse::validate()` so this requester obligation has a single
+    // definition shared with the protocol layer rather than an open-coded
+    // length check that can drift. (`validate()` also re-checks the
+    // `MAX_RATE_PER_MB` bound, but for a wire-decoded response that is
+    // already enforced at decode time by `deserialize_rate_per_mb`, so the
+    // `slash_sig` length is the only live obligation on this path.) Full
     // attribution (recover signer, confirm NodeId↔address via
     // `StakingRegistry`) is the on-chain `SlashJudge`'s job — the CLI has no
     // registry client, so it enforces presence/shape only.

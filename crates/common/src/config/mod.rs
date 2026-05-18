@@ -23,6 +23,10 @@ pub use types::FileConfig;
 
 /// Default QUIC bind port.
 const DEFAULT_BIND_PORT: u16 = 4433;
+/// Default for the QUIC 0-RTT master switch (ADR 015). 0-RTT for
+/// `cdn/probe/v1` is on by default; operators kill it via
+/// `network.enable_0rtt = false`.
+const DEFAULT_ENABLE_0RTT: bool = true;
 /// Default maximum cache size in megabytes (10 GB).
 const DEFAULT_CACHE_SIZE_MB: u64 = 10_240;
 /// Default maximum single blob size in megabytes (1 GB).
@@ -291,9 +295,16 @@ fn resolve_network(
         .clone()
         .or_else(|| file.and_then(|n| n.relay_url.clone()));
 
+    // No CLI flag: 0-RTT is an operational kill switch, not a per-invocation
+    // tuning knob. File `network.enable_0rtt` > built-in default (`true`).
+    let enable_0rtt = file
+        .and_then(|n| n.enable_0rtt)
+        .unwrap_or(DEFAULT_ENABLE_0RTT);
+
     ResolvedNetwork {
         bind_port,
         relay_url,
+        enable_0rtt,
     }
 }
 
@@ -2190,6 +2201,7 @@ mod tests {
                 c.network = Some(types::NetworkConfig {
                     bind_port: None,
                     relay_url: Some(v.to_string()),
+                    enable_0rtt: None,
                 });
             }),
             ("blockchain.rpc_url", |c, v| {
@@ -4311,6 +4323,7 @@ mod tests {
         ResolvedNetwork {
             bind_port: port,
             relay_url: None,
+            enable_0rtt: true,
         }
     }
 
@@ -4884,6 +4897,7 @@ mod tests {
         let file = types::NetworkConfig {
             bind_port: Some(6666),
             relay_url: None,
+            enable_0rtt: None,
         };
         let resolved = resolve_network(&cli, Some(&file));
         assert_eq!(resolved.bind_port, 5555);
@@ -4895,10 +4909,33 @@ mod tests {
         let file = types::NetworkConfig {
             bind_port: Some(6666),
             relay_url: Some("https://relay.example".to_string()),
+            enable_0rtt: None,
         };
         let resolved = resolve_network(&cli, Some(&file));
         assert_eq!(resolved.bind_port, 6666);
         assert_eq!(resolved.relay_url.as_deref(), Some("https://relay.example"));
+    }
+
+    #[test]
+    fn resolve_network_enable_0rtt_defaults_true_and_file_overrides() {
+        let cli = empty_network_args();
+
+        // Absent in file => built-in default (0-RTT on).
+        let none = types::NetworkConfig {
+            bind_port: None,
+            relay_url: None,
+            enable_0rtt: None,
+        };
+        assert!(resolve_network(&cli, Some(&none)).enable_0rtt);
+        assert!(resolve_network(&cli, None).enable_0rtt);
+
+        // Explicit `false` in file is the operational kill switch.
+        let off = types::NetworkConfig {
+            bind_port: None,
+            relay_url: None,
+            enable_0rtt: Some(false),
+        };
+        assert!(!resolve_network(&cli, Some(&off)).enable_0rtt);
     }
 
     #[test]

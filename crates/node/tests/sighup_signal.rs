@@ -52,6 +52,7 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
         network: ResolvedNetwork {
             bind_port: 4433,
             relay_url: None,
+            enable_0rtt: true,
         },
         blockchain: ResolvedBlockchain {
             rpc_url: "http://localhost:8545".into(),
@@ -403,7 +404,11 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
     let initial = seed_resolved(10, LogLevel::Info);
     let (setter, levels) = recording_setter();
     let state = Arc::new(RuntimeReloadState::new(
-        PaymentArgs { rate_per_mb: None },
+        PaymentArgs {
+            rate_per_mb: None,
+            delivery_floor: None,
+            delivery_ceiling: None,
+        },
         ObservabilityArgs {
             log_level: None,
             log_format: None,
