@@ -1,7 +1,7 @@
 # ADR 032: SafetyReserve appeal-surface contract surface
 
 **Date:** 2026-05-14
-**Status:** Draft
+**Status:** Locked-for-implementation
 
 ## Context
 

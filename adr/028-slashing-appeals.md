@@ -1,7 +1,7 @@
 # ADR 028: Slashing Appeals and Dispute Escalation
 
 **Date:** 2026-05-06
-**Status:** Draft
+**Status:** Locked-for-implementation
 **Touches:** [ADR 008](008-reputation.md), [ADR 009](009-governance.md), [ADR 011](011-content-takedown.md), [ADR 014](014-on-chain-verification.md), [ADR 018](018-liquidity-strategy.md), [ADR 026](026-gauge-boost-tokenomics.md)
 
 ## Context
