@@ -65,7 +65,7 @@ If both keys must rotate, rotate the **iroh key first** (cheap, atomic on-chain,
 ### Procedure
 
 1. **Generate** a new iroh ed25519 key offline on the signing host. Keep the old keystore until rotation completes.
-2. **Drain** the node — refuse new inbound connections, let existing streams complete (`decdn node drain`, surfaced via `admin_v1_drain` in [`appendix-local-admin-http.md`](appendix-local-admin-http.md); subcommand tracked in [#244](https://github.com/decdn/decdn/issues/244)). Confirm:
+2. **Drain** the node — refuse new inbound connections, let existing streams complete (`decdn node drain`, surfaced via `admin_v1_drain` in [`appendix-local-admin-http.md`](appendix-local-admin-http.md)). Confirm:
    - `decdn_streams_active{direction="inbound"} == 0`
    - `decdn_probe_hold_slots_used == 0`
 
@@ -177,7 +177,7 @@ Exception: **emergency compromise of the Ethereum key.** Run §2 immediately, sk
 ## 6. What this runbook does not cover
 
 - **Client-side iroh-key rotation.** See [ADR 012](012-client.md), inline "Key rotation": open client→node channels survive client iroh-key rotation (keyed by the client's Ethereum address), mirroring the operator-side carry-over in §1.
-- **Out-of-scope production hot-signing alternatives.** Hardware-wallet and HSM-backed voucher signing are infeasible per [ADR 012 § Consequences](012-client.md#consequences) — 2–5s confirmation latencies cannot keep the per-MB voucher cadence. A separate delegated-voucher-signer contract path (previously tracked in [#190](https://github.com/decdn/decdn/issues/190)) is similarly superseded. The sole production hot-signing path is [ADR 024 §3 `erc7579/smartsessions`](024-account-abstraction.md#3-session-keys--deferred-to-production-via-erc-7579-smartsessions).
+- **Out-of-scope production hot-signing alternatives.** Hardware-wallet and HSM-backed voucher signing are infeasible per [ADR 012 § Consequences](012-client.md#consequences) — 2–5s confirmation latencies cannot keep the per-MB voucher cadence. A separate delegated-voucher-signer contract path is similarly superseded. The sole production hot-signing path is [ADR 024 §3 `erc7579/smartsessions`](024-account-abstraction.md#3-session-keys--deferred-to-production-via-erc-7579-smartsessions).
 - **Compromised-key incident response.** This runbook describes mechanics. If a key is *believed compromised*, the operator should also: file an incident report with the SafetyReserve registry ([ADR 026 §5](026-gauge-boost-tokenomics.md)) if losses occurred, alert peer operators via reputation gossip, and rotate before any further wire-level signature under the compromised key.
 
 ## Cross-ADR Impact

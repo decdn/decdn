@@ -20,7 +20,7 @@ The treasury holds the 100M TOKEN POL allocation per [ADR 026 §1](026-gauge-boo
 
 ## Decision
 
-**Use a Balancer V3 weighted pool (80% TOKEN / 20% USDC, 1% swap fee) as the canonical TOKEN/USDC venue. Seed it as Protocol-Owned Liquidity (POL) from the 10% genesis liquidity allocation. The DAO treasury holds the BPT (Balancer pool token) directly; no LP rewards, no liquidity mining, no dedicated `LiquidityManager` contract.**
+Use a Balancer V3 weighted pool (80% TOKEN / 20% USDC, 1% swap fee) as the canonical TOKEN/USDC venue. Seed it as Protocol-Owned Liquidity (POL) from the 10% genesis liquidity allocation. The DAO treasury holds the BPT (Balancer pool token) directly; no LP rewards, no liquidity mining, no dedicated `LiquidityManager` contract.
 
 This reverses the implicit Uniswap V3 choice in prior ADRs.
 
@@ -148,7 +148,7 @@ Criteria 1–4 are quantitative; governance voters verify them off-chain before 
 
 ## Consequences
 
-**Positive:**
+### Positive
 
 - Seeds pool with ~1/4 the USDC of an equivalent 50/50 V3 position — critical for a USDC-poor treasury.
 - Zero keeper / range-management operational burden. No `LiquidityManager` contract, no `KEEPER_ROLE` for liquidity operations, no off-chain monitoring beyond what already exists for `executeBuyback()`.
@@ -158,7 +158,7 @@ Criteria 1–4 are quantitative; governance voters verify them off-chain before 
 - `IBuybackBurner` remains venue-agnostic — switching or adding venues later is a deployment-time configuration change, not an interface change.
 - POL is non-extractable by LPs because there are no external LPs. The DAO cannot be rugged by mercenary liquidity leaving at the worst moment.
 
-**Negative:**
+### Negative
 
 - Fee capture per dollar of TVL is lower than a well-managed V3 concentrated position. The DAO earns less from LP fees than it theoretically could.
 - Aggregator routing density for Balancer V3 pools on Arbitrum is lower than for Uniswap V3, *and* materially lower than for Balancer V2 (V3 is newer; aggregator coverage and solver integrations are still maturing as of this ADR's date). Third-party traders using their preferred aggregator may not find the pool. A transient concern that should improve as V3 ages, but real friction today.

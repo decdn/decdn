@@ -97,7 +97,7 @@ deployment pipeline against a different architecture.
 
 ## Decision
 
-**Deploy deCDN production contracts on Arbitrum One (chain ID 42161).**
+Deploy deCDN production contracts on Arbitrum One (chain ID 42161).
 
 Rationale:
 
@@ -191,8 +191,7 @@ Arbitrum One fee markets at deployment. Three MUST gates:
    delegator-pool flow per [ADR 026 §6](026-gauge-boost-tokenomics.md)) — at a
    1-week epoch, **52+ swaps/year minimum**, both via the Balancer V3 80/20
    TOKEN/USDC pool with TWAP windows, `minOut`, and per-epoch liquidity caps (which
-   bind at S2/S3 scale per [ADR 026 §8](026-gauge-boost-tokenomics.md) and the
-   economic-model spec). Per-epoch keeper costs MUST be not cost-prohibitive at
+   bind at S2/S3 scale per [ADR 026 §8](026-gauge-boost-tokenomics.md)). Per-epoch keeper costs MUST be not cost-prohibitive at
    S2/S3 scale and a small fraction of the inflow each call routes.
 
 3. **Private-RPC gate.** The L2 MUST support private-RPC routing (Flashbots-style

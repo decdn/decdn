@@ -36,8 +36,8 @@ else
 endif
 
 # Numeric build: architecture.md, then every numbered ADR, then every
-# appendix — same set the README `ls | sort` produced; new files are
-# picked up automatically.
+# appendix, then glossary.md (back matter). Numbered/appendix files are
+# picked up automatically; glossary.md is wired in explicitly below.
 NUMERIC_SRCS  := $(sort $(wildcard [0-9]*.md))
 APPENDIX_SRCS := $(sort $(wildcard appendix-*.md))
 
@@ -71,7 +71,8 @@ BOOK_SRCS := \
   appendix-blob-cache-eviction.md appendix-l2-deployment.md \
   appendix-poc-production-seams.md appendix-binaries.md \
   appendix-local-admin-http.md appendix-operator-key-rotation.md \
-  appendix-operator-upgrade-path.md appendix-fraud-detection.md
+  appendix-operator-upgrade-path.md appendix-fraud-detection.md \
+  glossary.md
 
 DENSITY_CFG := _build/book-density.typ _build/book-margins.yaml
 
@@ -83,11 +84,11 @@ all: adrs.pdf adrs-book.pdf
 numeric: adrs.pdf
 book: adrs-book.pdf
 
-adrs.pdf: architecture.md $(NUMERIC_SRCS) $(APPENDIX_SRCS) $(DENSITY_CFG)
+adrs.pdf: architecture.md $(NUMERIC_SRCS) $(APPENDIX_SRCS) glossary.md $(DENSITY_CFG)
 	$(NPMPATH) $(PANDOC) $(MERMAID_FLAG) $(DENSITY) \
 	  -V title="deCDN — Architecture Decision Records" \
 	  -V date="$(DATE)" \
-	  architecture.md $(NUMERIC_SRCS) $(APPENDIX_SRCS) \
+	  architecture.md $(NUMERIC_SRCS) $(APPENDIX_SRCS) glossary.md \
 	  -o $@
 
 adrs-book.pdf: $(BOOK_SRCS) _build/strip-meta-sections.lua $(DENSITY_CFG)

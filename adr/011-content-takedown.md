@@ -301,7 +301,7 @@ The new entry points are listed in [§ Contract: ContentBlacklist](#contract-con
 - `openBlacklistAppeal` reverts if `region == ""` (global entries — including emergency entries — are out of scope), if the entry is past its `BLACKLIST_APPEAL_FILING_WINDOW`, if the filer fails standing checks under the declared `standingPath`, if the filer is on the perjury denylist, or if the filer is in a rejection-cooldown window (see [§ Bond and frequency caps](#bond-and-frequency-caps) — `APPEAL_FILER_REJECTION_COOLDOWN`). Filings are not gated by the per-body concurrent-appeal cap — see the next bullet for where the cap applies. Bond is pulled via `TOKEN.transferFrom`; the appeal record is stored with the declared `standingPath` and `BlacklistAppealOpened` is emitted.
 - `fastTrackAppeal` / `unFastTrackAppeal` / `rejectAppeal` are restricted to the emergency multisig (the same address with the same threshold as the existing `suspendRegionalBody` flow), under the sub-mode authority described in [§ Authority and flow](#authority-and-flow). `fastTrackAppeal` reverts if the regional body that issued the contested entry already has `BODY_CONCURRENT_APPEAL_CAP` entries in interim-relief (`entry.suspended == true`); the multisig must wait for one to resolve, or use `rejectAppeal` to triage one of the existing pending appeals first. `rejectAppeal` is not cap-gated. `unFastTrackAppeal` is the multisig's escape hatch when post-fast-track evidence (perjury, late counter-evidence) shows the suspension was misjudged: it requires `entry.suspended == true` and that the appeal is still pre-ratification, clears `suspended` (releasing the body's slot), preserves the original `effectiveAt`, leaves the bond escrowed, opens a fresh `BLACKLIST_MULTISIG_REVIEW_WINDOW` from the un-fast-track timestamp during which the multisig may call `rejectAppeal` (burn) or do nothing (lapse → refund), and emits `BlacklistAppealUnFastTracked`. It is a one-shot per appeal — the contract reverts on a second invocation against the same `appealId` to prevent the multisig from indefinitely cycling fast-track ↔ un-fast-track to re-arm review windows. `unFastTrackAppeal` does not by itself trigger the perjury denylist; that requires a subsequent `rejectAppeal` on the same appeal with the perjury flag set.
 - `ratifyAppealRemoval` / `reverseAppeal` are restricted to GOVERNANCE_ROLE (ve-Governor). Ratification calls the contract's internal `_removeHashRegional` and emits both `BlacklistAppealRatified` and the standard `HashRemoved` event. Reversal clears `suspended`, **preserves the original `effectiveAt`** (per [§ Authority and flow](#authority-and-flow) — resetting was rejected to avoid shielding pre-suspension non-compliance), and burns the bond per [§ Bond and frequency caps](#bond-and-frequency-caps).
-- The full ABI (per-appeal storage layout, exact event topics, gas-optimized struct packing) is specified in [ADR 031](031-content-blacklist-appeals-contract.md) — same approach as [ADR 028 §6](028-slashing-appeals.md#6-contract-surface), whose contract-implementation ADR is tracked at [#524](https://github.com/decdn/decdn/issues/524).
+- The full ABI (per-appeal storage layout, exact event topics, gas-optimized struct packing) is specified in [ADR 031](031-content-blacklist-appeals-contract.md) — same approach as [ADR 028 §6](028-slashing-appeals.md#6-contract-surface), whose contract-implementation ADR is [ADR 032](032-safety-reserve-appeals-contract.md).
 
 ### Global Override
 
@@ -603,7 +603,7 @@ Slash challenges cannot be opened against operators while the disputed entry is 
 
 ## Consequences
 
-**Positive:**
+### Positive
 
 - Global and regional blacklisting coexist in one contract — no separate deployment for jurisdictions
 - Regional bodies can act without a global governance vote, matching the speed of real-world legal processes (DSA requires expeditious removal)
@@ -618,7 +618,7 @@ Slash challenges cannot be opened against operators while the disputed entry is 
 - Appeal standing extends to publishers, affected operators, and TOKEN holders above a threshold — content advocates and end-user proxies can file without on-chain content ownership, while the bond and frequency caps deter pro-forma filings
 - Disjoint evidence sets across the two appeal paths (see [§ Blacklist Entry Appeals](#blacklist-entry-appeals)) map a single grievance cleanly to a single path
 
-**Negative:**
+### Negative
 
 - Hash-based blacklisting covers exact copies only; trivial re-encoding evades it. This is a fundamental limitation with no protocol-level solution for content-agnostic blobs
 - Node region is self-reported and unverified; regional compliance relies on operator legal incentive, not cryptographic enforcement

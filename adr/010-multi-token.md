@@ -252,7 +252,7 @@ struct SignedRate {
 
 ## Consequences
 
-**Positive:**
+### Positive
 
 - Works identically on any EVM chain with any governance-approved token. A private operator can run the entire CDN stack with their own token by adding it to the allowlist — zero core codebase changes.
 - No issuer dependency. Governance can approve tokens with different trust profiles: Circle (USDC), MakerDAO (DAI), or operator-issued tokens on a private chain.
@@ -261,7 +261,7 @@ struct SignedRate {
 - **Malicious token exposure reduction.** The allowlist lets governance reject known-problematic ERC-20 contracts before they touch `PaymentChannel` funds. First line of defense; on-chain mitigations (`nonReentrant`, `SafeERC20`, checks-effects-interactions) remain required.
 - **Garbage token prevention.** Only governance-approved tokens can be used in channels, eliminating the attack surface of worthless self-issued tokens polluting the network.
 
-**Negative:**
+### Negative
 
 - **Decimal heterogeneity.** Tokens use 0–18 decimals; a node misconfiguring decimals silently misprices deliveries. The `TokenInfo.decimals` field must be validated against the on-chain `IERC20Metadata.decimals()` return value at startup.
 - **No protocol-level price normalization.** A node advertising 1 base-unit/MB in USDC (= $0.000001/MB) and 1 base-unit/MB in a low-value token are indistinguishable at the wire level. Clients bear responsibility for evaluating whether a node's accepted token has value.

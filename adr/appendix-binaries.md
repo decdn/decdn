@@ -1,7 +1,7 @@
 # Appendix: deCDN Binaries — `decdn-node` + `decdn` split
 
 **Date:** 2026-05-06
-**Status:** Accepted (issue #421)
+**Status:** Accepted
 
 ## Context
 
@@ -18,7 +18,7 @@ Threat surface, dependency footprint, and update cadence differ
 between the two. A single fused binary would force every operator
 deployment to ship publisher tooling, every publisher install to drag
 in the daemon's runtime, and contaminate features like
-`decdn bundle …` (#391) and `decdn pull` (ADR 012) with a "which
+`decdn bundle …` and `decdn pull` (ADR 012) with a "which
 binary owns this?" question absent from `dockerd` + `docker`,
 `kubelet` + `kubectl`, or `containerd` + `nerdctl`.
 
@@ -93,7 +93,7 @@ and would silently miss data on a prefix rename.
 
 ## Cross-ADR Impact
 
-- `decdn bundle …` (#391) and `decdn pull` (ADR 012) land directly
+- `decdn bundle …` and `decdn pull` (ADR 012) land directly
   on `decdn`; no binary-placement question remains for either.
 - Shell completions and man pages are deferred — both binaries should
   generate them via `clap_complete`. Tracked as follow-up issues.
