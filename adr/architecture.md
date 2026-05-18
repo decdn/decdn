@@ -194,15 +194,17 @@ The system relies on several infrastructure-level assumptions beyond the cryptog
 
 - **iroh relay availability.** iroh relays are stateless servers that broker NAT traversal and relay encrypted traffic as a fallback when direct peer-to-peer connections fail (~10% of networking conditions). Relays are not CDN protocol participants — they cannot inspect, cache, or modify content (all traffic is end-to-end encrypted). The deCDN does not incentivize relay operators: paying relays per-byte would create a perverse incentive to prevent direct connections from forming. PoC uses n0.computer's public relays (rate-limited, no SLA). Production deployments should self-host dedicated relays as operational infrastructure, funded from protocol treasury or node staking fees — not as an incentivized network role. If direct-connection success rates drop below ~85%, investigate NAT traversal improvements before considering relay incentivization.
 
-## Non-Goals
-
-- DRM or content protection
-- Content transcoding or adaptive format conversion
-- Search, discovery, or recommendation (an external/additive layer, not the core protocol)
-- Mobile or web clients
-- Multi-chain support (single L2 only)
-- Erasure coding (full replication only)
-
 ## Origin Backends
 
 Origin-backed nodes hold the canonical bytes and are pulled only on cache miss; whether an operator is *recognized* as origin is governed on-chain via `OriginAssignment` (see [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority) and [ADR 002 § Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces)). Configuring an origin backend locally without DAO authorization simply means the operator's bytes are served as cache. Supported backends — any S3-compatible object store (AWS S3, Cloudflare R2, Backblaze B2, self-hosted MinIO), an NFS mount, or local disk — and how a node maps a hash to its stored object are purely operational: the protocol only requires that a node deliver the correct bytes for a given hash.
+
+## Non-Goals
+
+Permanent scope boundaries — not deferred work.
+
+- **DRM / content protection** — blobs are served public-by-default; confidentiality is an app-layer concern.
+- **Transcoding / adaptive formats** — content-addressed bytes are delivered verbatim; transforming them would break the hash.
+- **Search, discovery, recommendation** — an external/additive layer, not the core protocol.
+- **Mobile or web clients** — the reference client is a native binary; other surfaces are downstream.
+- **Multi-chain support** — settlement runs on a single L2; cross-chain is out of scope.
+- **Erasure coding** — blobs are fully replicated across nodes, not erasure-coded.
