@@ -36,7 +36,7 @@ All on-chain contracts inherit from [OpenZeppelin Contracts](https://docs.openze
 
 #### Contract Architecture (classDiagram)
 
-The diagram below shows the full contract surface and its primary call relationships. Reproduced from [ADR 026](026-gauge-boost-tokenomics.md)'s source design spec §9.5 with `StakingRegistry`, `Governor`, etc. included for orientation. `StakingRegistry` is unconnected on the fee-router path because it is independent of settlement — it governs slashable stake and is read by gossip / peer-validation logic ([ADR 001](001-network.md), [ADR 003](003-payments.md)) rather than by `FeeRouter`.
+The diagram below shows the full contract surface and its primary call relationships, with `StakingRegistry`, `Governor`, etc. included for orientation. `StakingRegistry` is unconnected on the fee-router path because it is independent of settlement — it governs slashable stake and is read by gossip / peer-validation logic ([ADR 001](001-network.md), [ADR 003](003-payments.md)) rather than by `FeeRouter`.
 
 ```mermaid
 classDiagram
@@ -821,14 +821,14 @@ The contract surface is identical at launch and at steady state — every contra
 
 ## Consequences
 
-**Positive:**
+### Positive
 
 - Single reference document for all contract interactions, reducing audit scope ambiguity
 - Explicit deployment order prevents initialization-order bugs
 - Access control matrix makes privilege escalation paths visible and auditable
 - OZ base contract prescriptions eliminate classes of implementation bugs before code is written
 
-**Negative:**
+### Negative
 
 - Must be kept in sync as other ADRs evolve — any change to contract interfaces in ADRs 003, 009, 010, 011, 014, or 026 requires updating this document
 - Does not cover off-chain interaction patterns (voucher exchange, gossip, probing) — those remain in their respective ADRs

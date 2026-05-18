@@ -149,7 +149,7 @@ interface ISlashJudge {
 
 #### Evidence Verification Per Offense Type
 
-**Phantom announcement:**
+##### Phantom announcement
 
 1. Challenger provides `challengedNode` address (the node's Ethereum address or Safe address)
 2. `SignatureChecker.isValidSignatureNow(challengedNode, probeDigest, probeSlashSig)` — must pass
@@ -179,7 +179,7 @@ The check applies at initialization too — neither contract may be deployed wit
 6–8. Same timestamp and registration checks as phantom
 9. Slash immediately via `StakingRegistry.slash()` — no counter-evidence window. Two signed messages from the same NodeId disagreeing about that node's own rate within 30 seconds are non-repudiable; the node's last probe-quoted rate is binding for the slashing window. Legitimate rate changes wait out the 30-second window before serving a stream at the new rate.
 
-**Blacklist violation:**
+##### Blacklist violation
 
 1. Challenger provides `challengedNode` address
 2. `SignatureChecker.isValidSignatureNow(challengedNode, responseDigest, slashSig)` — must pass
@@ -249,7 +249,7 @@ The `MAX_EVIDENCE_AGE_US < unbondingPeriod` invariant is paired across two contr
 
 ## Consequences
 
-**Positive:**
+### Positive
 
 - All four slashable offenses now have a concrete, gas-efficient on-chain evidence path. Slashing is no longer aspirational.
 - `ecrecover` at 3,000 gas per signature is 100–300× cheaper than a Solidity Ed25519 library, making routine slashing economically viable even for small offenses.
@@ -257,7 +257,7 @@ The `MAX_EVIDENCE_AGE_US < unbondingPeriod` invariant is paired across two contr
 - `slash_sig` is mandatory and non-empty on every `ProbeResponse` and `StreamResponse`. Universal on-chain accountability is the protocol's single stance — there is no opt-out and no validation-mode difference between PoC and production for this field.
 - The unified `SlashJudge` contract provides a single audit surface for all slashing logic.
 
-**Negative:**
+### Negative
 
 - Nodes perform a secp256k1 EIP-712 signature on every `ProbeResponse` and `StreamResponse`, adding ~1ms of computation per message — negligible relative to network RTT, but nonzero.
 - The `slash_sig` field adds ~65 bytes per `ProbeResponse` and `StreamResponse`. For probe messages this is meaningful overhead; for stream responses preceding multi-MB deliveries, it is negligible.

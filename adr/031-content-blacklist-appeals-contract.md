@@ -11,7 +11,7 @@
 
 This ADR is that contract-implementation ADR. It pins the per-appeal storage layout, canonical event topic ordering, gas-packed struct layout, and surface-level integration with the rest of `ContentBlacklist` (suspension flag manipulation, internal `_removeHashRegional` call, `cleanupExpiredAppeal` admissibility checks), giving the implementation in `contracts/` a single canonical reference.
 
-It is the blacklist-side analogue of [#524](https://github.com/decdn/decdn/issues/524) (ADR 032), which does the same for [ADR 028 §6](028-slashing-appeals.md#6-contract-surface)'s slash-appeal entry points on `SafetyReserve`.
+It is the blacklist-side analogue of [ADR 032](032-safety-reserve-appeals-contract.md), which does the same for [ADR 028 §6](028-slashing-appeals.md#6-contract-surface)'s slash-appeal entry points on `SafetyReserve`.
 
 This ADR does **not** re-litigate ADR 011 semantic decisions — bond size, filing windows, standing paths, evidence rules, regional-only scope, the synthetic-standing clawback, or the interaction with `SlashJudge`. Restatements here are for self-containedness; the canonical decision authority remains ADR 011.
 
@@ -288,7 +288,7 @@ stateDiagram-v2
 ### Positive
 
 - Pins storage layout and event schema as a single source of truth, removing the cross-derivation cost between ADR 011's narrative form and the eventual Solidity.
-- Parallel structure to [#524](https://github.com/decdn/decdn/issues/524) (ADR 032) keeps both appeal-contract surfaces — slashing and blacklist — auditable under one pattern.
+- Parallel structure to [ADR 032](032-safety-reserve-appeals-contract.md) keeps both appeal-contract surfaces — slashing and blacklist — auditable under one pattern.
 - Permissionless `cleanupExpiredAppeal` plus the four admissibility conditions removes any contract dependency on a privileged scheduler; bond settlement and slot release are eventually consistent through any caller.
 
 ### Negative

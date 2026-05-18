@@ -101,7 +101,7 @@ High-frequency signing (node `slash_sig`, client vouchers) migrates to a standar
 - **Session-key module:** [`erc7579/smartsessions`](https://github.com/erc7579/smartsessions) — a standardized ERC-7579 session-key validator that natively implements ERC-1271 `isValidSignature` for session-key-authorized digests. Because the module is an ERC-7579 *validator*, `isValidSignature` on a Safe-7579 account routes through it without any custom fallback handler on deCDN's side; `SignatureChecker.isValidSignatureNow(safe, digest, sessionKeySig)` returns the ERC-1271 magic value once a session is enabled.
 - **Policies:** smartsessions' existing policy system covers what this ADR would otherwise have had to invent — time windows, action policies scoped to selectors / EIP-712 domains, per-session spending caps, and first-class revocation via `removeSession`. A follow-up ADR will pin down the specific policy encodings deCDN uses for node and client sessions.
 
-**Production authorization flow (sketch):**
+##### Production authorization flow (sketch)
 
 ```
 Safe (2-of-3) owners →
@@ -116,7 +116,7 @@ No bespoke Safe module, no custom fallback handler, no new security-critical con
 
 [ADR 012](012-client.md) specifies that nodes verify client ephemeral binding signatures (`BindNodeId` with `nonce=0`) via `ecrecover`. When the client's Ethereum address is a smart account, this verification must use ERC-1271 instead.
 
-**Node-side verification logic (Rust, using alloy):**
+#### Node-side verification logic (Rust, using alloy)
 
 ```rust
 async fn verify_binding_signature(
@@ -158,14 +158,14 @@ The following Safe infrastructure is already deployed on the testnet sibling of 
 | Compatibility Fallback Handler | Deployed | Stock ERC-1271 routing — used as-is in the PoC |
 | Multi Send | Deployed | Batch transactions |
 
-**Not required for PoC:**
+#### Not required for PoC
 
 - ERC-4337 Entry Point interaction — operators submit transactions directly via Safe SDK
 - Paymaster contracts — operators hold ETH for gas (same as current [ADR 003](003-payments.md) assumption)
 - Bundler infrastructure
 - Safe-7579 adapter and any session-key module (deferred to Production per §3)
 
-**Production additions (documented, deferred):**
+#### Production additions (documented, deferred)
 
 - [Safe-7579 adapter](https://github.com/rhinestonewtf/safe7579) on each participating Safe, unlocking ERC-7579 modules
 - [`erc7579/smartsessions`](https://github.com/erc7579/smartsessions) session-key module (ERC-1271 validator)
@@ -174,7 +174,7 @@ The following Safe infrastructure is already deployed on the testnet sibling of 
 
 ## Consequences
 
-**Positive:**
+### Positive
 
 - All deCDN contracts support smart account wallets from day one, eliminating a future retrofit across every verification site.
 - PoC ships no bespoke Safe modules or custom fallback handlers — stock `CompatibilityFallbackHandler` + `SignatureChecker` are sufficient for 1-of-1 Safes and EOAs.
@@ -183,7 +183,7 @@ The following Safe infrastructure is already deployed on the testnet sibling of 
 - EOA users are unaffected — `SignatureChecker` is a transparent superset of `ECDSA.recover`.
 - The approach is wallet-agnostic at the contract level. Safe is recommended; any ERC-1271-compliant smart account works without contract changes.
 
-**Negative:**
+### Negative
 
 - PoC hot-signing parties (nodes, clients) use 1-of-1 Safes (or EOAs). Multisig protection of the high-frequency signing path is deferred to Production; 2-of-3 is only viable on the infrequent stake/withdraw/channel-open paths for parties comfortable with that split.
 - Safe wallet setup is more complex than generating an EOA. Operator tooling (`decdn setup`) must guide Safe creation and, in Production, Safe-7579 adapter installation + `enableSession`.

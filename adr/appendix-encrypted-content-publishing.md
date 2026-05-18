@@ -18,7 +18,7 @@ The encryption scheme must satisfy these constraints:
 
 ## Decision
 
-**Envelope encryption with epoch-rotated key distribution.**
+Envelope encryption with epoch-rotated key distribution.
 
 Two independent layers: a permanent content layer and an ephemeral key delivery layer.
 
@@ -285,7 +285,7 @@ The offline lease intentionally weakens two properties of the online scheme: K_b
 
 ## Consequences
 
-**Positive:**
+### Positive
 
 - Global content-addressing is preserved: one ciphertext, one hash, one cached copy for all clients. CDN nodes, protocol, payments, and gossip are unchanged.
 - CDN nodes never see plaintext or any key material. Compromising a node yields only ciphertext.
@@ -295,7 +295,7 @@ The offline lease intentionally weakens two properties of the online scheme: K_b
 - Single transport stack: both CDN delivery and key delivery use iroh QUIC, eliminating a separate WebSocket/SSE stack on the client.
 - The key delivery layer uses only primitives already in the stack: BLAKE3 for KDF, XChaCha20-Poly1305 for symmetric encryption. No asymmetric encryption (X25519/`crypto_box_seal`) is needed — QUIC TLS 1.3 handles confidentiality and authentication.
 
-**Negative:**
+### Negative
 
 - Adds an app server component that shares the iroh QUIC transport layer but is not a CDN protocol participant (documented in [architecture.md](architecture.md#external-components) under External Components). Content providers must run an `iroh::Endpoint` accepting `cdn/keys/v1` connections alongside their auth/billing infrastructure. A minimal reference implementation may be provided in a separate repository.
 - The app server's key store (holding all `K_blob` values) is a high-value target. It must be protected with a KMS or HSM in production. Key-store compromise exposes all content.

@@ -237,14 +237,14 @@ If the node's iroh identity was replaced (key rotation), use `StakingRegistry.bi
 
 ## Consequences
 
-**Positive:**
+### Positive
 
 - Operators have a single, ordered reference for joining the PoC testnet.
-- All startup prerequisites (rate bounds, blacklist, registry) are explicitly ordered, eliminating the silent-failure class identified in Issue #190.
+- All startup prerequisites (rate bounds, blacklist, registry) are explicitly ordered, eliminating the previously identified silent-failure class.
 - The acceptance criteria table (Phase 5) provides a machine-checkable health signal for readiness probes and operational monitoring.
 - Re-onboarding (post-ejection) is explicitly covered, preventing nonce confusion.
 
-**Negative:**
+### Negative
 
 - Phase 2 requires three ordered on-chain transactions (`approve`, `stake`, `registerNode`), each confirmed before the node can start. Sub-second L2 block times keep this fast, but operator tooling must handle nonce management across them.
 - Multiaddr registration before iroh starts requires either a static IP/port (suitable for most VPS deployments) or a two-step workflow (start node, observe addresses, then register or update).

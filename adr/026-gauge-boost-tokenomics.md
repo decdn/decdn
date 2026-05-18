@@ -2,8 +2,6 @@
 
 **Date:** 2026-04-25
 **Status:** Locked-for-implementation
-**Source design spec:** internal `tokenomics-v2-gauge-boost-design` (2026-04-18)
-**Economic source of truth:** internal `decdn-economic-model-40-40-gauge-pool` (2026-04-25)
 
 ## Context
 
@@ -14,17 +12,15 @@ The economic model — sitting on top of paid byte delivery ([ADR 003](003-payme
 3. **A progressive operator incentive.** Per-operator return must scale with long-term commitment, not with stake size alone. A flat-rate or regressive mechanic (e.g., a fee discount that grows with raw stake) attracts capital without aligning it.
 4. **A TOKEN-price-insulated bootstrap.** Subsidies denominated in the token they're meant to bootstrap collapse in purchasing power exactly when most needed. Bootstrap capital must be denominated in a unit independent of the protocol's own TOKEN price.
 
-This ADR is the canonical economic model addressing all four. Burn is one of several deflationary levers; real yield in TOKEN flows to delegators and ve-lockers; operator compensation differentiates by long-term ve-commitment via a Curve-style gauge boost rather than by a discounted skim percentage; bootstrap is USDC-denominated. Full design reasoning, MEV-defense analysis, equilibrium-stability argument, and reference-implementation pointers live in the source design spec; this ADR is the decision layer.
+This ADR is the canonical economic model addressing all four. Burn is one of several deflationary levers; real yield in TOKEN flows to delegators and ve-lockers; operator compensation differentiates by long-term ve-commitment via a Curve-style gauge boost rather than by a discounted skim percentage; bootstrap is USDC-denominated. Full design reasoning, MEV-defense analysis, and equilibrium-stability argument are out of scope here; this ADR is the decision layer.
 
 ### Inputs assumed by this ADR
 
-Pre-launch design with no holder-compensation or contract-migration concerns. ~$1M+ pre-seed USDC capital secured (planning target $3M); program structure is operational and tracked separately. 2026 unmetered-bandwidth provider economics per the design spec's input matrix (1 Gbps VPS, 10 Gbps dedicated, 100 Gbps edge tiers); dedicated-bandwidth nodes are realistic at every scale band the protocol is sized for.
-
-Earlier internal drafts explored and rejected alternative shapes — a flat protocol-fee skim, a 200M-TOKEN bootstrap fund, a regressive fee-discount mechanic, auto-ve-lock-on-vest.
+Pre-launch design with no holder-compensation or contract-migration concerns. ~$1M+ pre-seed USDC capital secured (planning target $3M); program structure is operational and tracked separately. 2026 unmetered-bandwidth provider economics (1 Gbps VPS, 10 Gbps dedicated, 100 Gbps edge tiers); dedicated-bandwidth nodes are realistic at every scale band the protocol is sized for.
 
 ## Decision
 
-The protocol's economic model is defined by the following sections. Where a table fully duplicates one in the source design spec, this ADR shows the canonical defaults and points to the spec for the surrounding analysis.
+The protocol's economic model is defined by the following sections.
 
 ### 1. Supply and distribution
 
@@ -36,7 +32,7 @@ TOKEN is `ERC20Burnable`; any contract may burn TOKEN it holds via `burn` / `bur
 
 #### Allocation (1B total)
 
-Six buckets summing to 100%. Vesting profile per the design spec §2.1; effective release rate is ~24%/yr during the active vesting window (Y1–Y3), 16%/yr in Y4, then zero.
+Six buckets summing to 100%. Vesting profile: effective release rate is ~24%/yr during the active vesting window (Y1–Y3), 16%/yr in Y4, then zero.
 
 | Allocation | Share | TOKEN | Vesting |
 | --- | ---: | ---: | --- |
@@ -60,7 +56,7 @@ Bootstrap supply-side incentive is funded externally via $1M+ pre-seed USDC capi
 
 ### 2. FeeRouter split (40/40/7/5/5/3)
 
-`FeeRouter` receives the full operator USDC balance from `PaymentChannel.settleChannel` and atomically splits it into six buckets (full mechanic per design spec §2.2). `PaymentChannel` does not skim a protocol fee inline; all bucket distribution happens in `FeeRouter`. The bucket structure (six buckets, the named categories below, sum-to-100% invariant) is fixed at the contract level; **the share percentages themselves are governance-tunable** via `FeeRouter.setShares(...)` per [ADR 016 § Tunable Economics](016-contract-interactions.md#tunable-economics) so the network can launch with a simplified split (e.g. `80/0/0/10/10/0`) and dial up gauge / delegator / safety as their dependency contracts are wired in.
+`FeeRouter` receives the full operator USDC balance from `PaymentChannel.settleChannel` and atomically splits it into six buckets. `PaymentChannel` does not skim a protocol fee inline; all bucket distribution happens in `FeeRouter`. The bucket structure (six buckets, the named categories below, sum-to-100% invariant) is fixed at the contract level; **the share percentages themselves are governance-tunable** via `FeeRouter.setShares(...)` per [ADR 016 § Tunable Economics](016-contract-interactions.md#tunable-economics) so the network can launch with a simplified split (e.g. `80/0/0/10/10/0`) and dial up gauge / delegator / safety as their dependency contracts are wired in.
 
 | Destination | Steady-state share | Unit | Distribution mechanic |
 | --- | ---: | --- | --- |
@@ -127,7 +123,7 @@ event GaugeLaunched(uint64 indexed epoch);
 
 Adapted from Curve Finance's veCRV gauge boost (in production since 2020). Replaces the LP-deposit primitive with verified-bytes-delivered.
 
-Per-operator pool share = `min(working_bytes_i / sum(working_bytes), MAX_GAUGE_SHARE_PER_OPERATOR)`, where `working_bytes_i = min(bytes_i, 0.4·bytes_i + 0.6·(ve_i/total_ve)·total_bytes)` over the epoch's verified bytes (full derivation in design spec §9.4). `bytes_i` is sourced from `FeeRouter.bytesPerEpoch[operator][epoch]` (canonical in [ADR 016 §FeeRouter](016-contract-interactions.md#feerouter)); the per-operator share cap is the binding wash-trading defense.
+Per-operator pool share = `min(working_bytes_i / sum(working_bytes), MAX_GAUGE_SHARE_PER_OPERATOR)`, where `working_bytes_i = min(bytes_i, 0.4·bytes_i + 0.6·(ve_i/total_ve)·total_bytes)` over the epoch's verified bytes. `bytes_i` is sourced from `FeeRouter.bytesPerEpoch[operator][epoch]` (canonical in [ADR 016 §FeeRouter](016-contract-interactions.md#feerouter)); the per-operator share cap is the binding wash-trading defense.
 
 **Properties:**
 
@@ -276,7 +272,7 @@ interface IVotingEscrow {
 
 ### 5. Safety and insurance reserve (3% bucket)
 
-The 3% safety bucket is held in `SafetyReserve`, a governance-gated incident reserve. Eligible payout categories per design spec §2.2.5:
+The 3% safety bucket is held in `SafetyReserve`, a governance-gated incident reserve. Eligible payout categories:
 
 - Incorrect slashing / appeal reversals.
 - Relay, sequencer, or payment-channel downtime.
@@ -292,7 +288,7 @@ Disbursements require all of:
 3. A 48-hour appeal window during which the bundle is challengeable on-chain.
 4. **Post-incident reporting.** On payout settlement, `SafetyReserve` writes an immutable record to its public on-chain registry (see [ADR 009 § SafetyReserve Payout Authorization](009-governance.md#safetyreserve-payout-authorization) for the record fields and reporting obligations).
 
-No path exists for unattested payouts; the `payout(bundleHash, recipient, amount)` entry point checks all four gates. Sizing analysis (number of $100K and $1M incidents covered per year per scenario) lives in the economic-model spec §7; this ADR does not duplicate the table.
+No path exists for unattested payouts; the `payout(bundleHash, recipient, amount)` entry point checks all four gates.
 
 #### Cross-category payout ordering
 
@@ -307,7 +303,7 @@ The queue ordering is therefore **epoch-FIFO across all payout categories with a
 - **No multisig-as-orderer hazard.** Authorization order sets `claimId` only in the rare same-epoch tie, and deterministically; once authorized, queue position is fixed.
 - **Forward-compatible with new payout categories.** Contracts integrating via the stable `payout(bundleHash, recipient, amount)` interface inherit these semantics without amending this ADR.
 
-**Disbursement of queued claims is permissionless.** Gates 1–3 of the four [Spending controls](#spending-controls) (attested bundle, authorization, 48-hour appeal window) were checked at `payout()` authorization; gate 4 (post-incident reporting) writes atomically per disbursement. Thereafter any caller may invoke a `disbursePending()` head-of-queue path when solvency permits — no second-stage authorization exists, so the multisig cannot selectively re-authorize favored queued claims. This is what makes the ordering guarantee meaningful, and mirrors the permissionless-detection pattern in [Appendix: Fraud Detection](appendix-fraud-detection.md). Storage shape and the `disbursePending` signature are pinned in a future SafetyReserve contract-implementation ADR ([#524](https://github.com/decdn/decdn/issues/524)); this section pins only ordering and the permissionless-disbursement property.
+**Disbursement of queued claims is permissionless.** Gates 1–3 of the four [Spending controls](#spending-controls) (attested bundle, authorization, 48-hour appeal window) were checked at `payout()` authorization; gate 4 (post-incident reporting) writes atomically per disbursement. Thereafter any caller may invoke a `disbursePending()` head-of-queue path when solvency permits — no second-stage authorization exists, so the multisig cannot selectively re-authorize favored queued claims. This is what makes the ordering guarantee meaningful, and mirrors the permissionless-detection pattern in [Appendix: Fraud Detection](appendix-fraud-detection.md). The `disbursePending()` signature and the pending-claim storage shape are pinned in the [`ISafetyReserve` interface](#contract-safetyreserve) below; this section pins the ordering and permissionless-disbursement semantics.
 
 #### Interface stability
 
@@ -355,6 +351,32 @@ interface ISafetyReserve {
     function incidents(uint256 id) external view returns (Incident memory);
     function incidentCount() external view returns (uint256);
 
+    // ─── Pending-claim queue (insolvency overflow of payout) ──────────
+    // When payout() cannot be fully funded, the unfunded portion is
+    // recorded as a PendingClaim. The queue is epoch-FIFO across all
+    // payout categories, ordered (accrualEpoch asc, claimId asc) — see
+    // § Cross-category payout ordering. Gates 1–4 were already enforced
+    // by the originating payout(); disbursePending() adds no second-
+    // stage authorization and is permissionless — any caller may drain
+    // the head when reserve solvency permits.
+    struct PendingClaim {
+        uint256 claimId;        // protocol-monotonic, set at authorization
+        uint64  accrualEpoch;   // FeeRouter epoch payout() first hit insolvency
+        bytes32 bundle;         // attested evidence hash (from payout())
+        address recipient;      // payout target
+        uint256 usdcAmount;     // unfunded USDC base units (6 decimals)
+        IncidentReason reason;  // categorical tag, not a priority signal
+    }
+
+    // Disburses the frontmost claim (lowest (accrualEpoch, claimId))
+    // and performs the gate-4 post-incident registry write atomically,
+    // mirroring payout(). Reverts if the queue is empty or the head is
+    // still unfunded. Returns the incident id assigned to the claim.
+    function disbursePending() external returns (uint256 id);
+
+    function pendingClaimHead() external view returns (PendingClaim memory);
+    function pendingClaimCount() external view returns (uint256);
+
     // ─── Slashing-redirect inflow (callback from StakingRegistry) ─────
     // Records the 30% slashed-TOKEN redirect against an indexable
     // operator+amount tuple. `SLASH_INFLOW_REPORTER_ROLE`-gated; granted
@@ -379,7 +401,7 @@ interface ISafetyReserve {
     // semantics live in
     // [ADR 032](032-safety-reserve-appeals-contract.md) and
     // [ADR 028 §6](028-slashing-appeals.md#6-contract-surface);
-    // parameter values lock down in #451.
+    // parameter values remain ADR 028 §5's responsibility.
     function openSlashAppeal(uint256 slashId, bytes32 evidenceBundleHash)
         external returns (uint256 appealId);
     function fastTrackAppeal(uint256 appealId) external;
@@ -415,6 +437,8 @@ interface ISafetyReserve {
     );
     event SlashInflowRecorded(address indexed operator, uint256 amount);
     event SwapExecuted(uint256 amountIn, uint256 amountOut);
+    event PendingClaimQueued(uint256 indexed claimId, uint64 indexed accrualEpoch, address recipient, uint256 usdcAmount, IncidentReason reason);
+    event PendingClaimDisbursed(uint256 indexed claimId, uint256 indexed incidentId, address recipient, uint256 usdcAmount);
     // Parameter lists pinned in
     // [ADR 032 §3](032-safety-reserve-appeals-contract.md#3-solidity-event-signatures-all-six-pinned).
     event SlashAppealOpened(uint256 indexed appealId, uint256 indexed slashId, address indexed appellant, bytes32 evidenceBundleHash, uint256 bond);
@@ -437,7 +461,7 @@ interface ISafetyReserve {
 
 - **USDC-only payouts.** `usdcAmount` is named explicitly so the constraint is visible in the storage layout and on every `Paid` event. If a future ADR ever motivates multi-currency payouts, the additive shape is a `tokenOut` field plus an allowlist setter — no breaking change to existing `Incident` storage.
 - **Governor and emergency-multisig addresses are governance-mutable.** The `setGovernor` / `setEmergencyMultisig` setters allow the eventual handover from the deployer EOA to `TimelockController` (per [ADR 016 § Post-Deployment Initialization](016-contract-interactions.md#post-deployment-initialization)) and any future re-pointing without contract redeployment. The 48h timelock constraint applies via `GOVERNANCE_ROLE`.
-- **Appeal extensions are signature stubs.** This interface pins the function names and parameter types; the full state machine (`Open` → `FastTracked` / `Rejected` → `Ratified` / `Reversed` / `Lapsed`), window timing (filing, multisig review, ratification), and bond/restitution caps live in [ADR 028 §6](028-slashing-appeals.md#6-contract-surface) and are surface-locked under #451.
+- **Appeal extensions are signature stubs.** This interface pins the function names and parameter types; the full state machine (`Open` → `FastTracked` / `Rejected` → `Ratified` / `Reversed` / `Lapsed`), window timing (filing, multisig review, ratification), and bond/restitution caps live in [ADR 028 §6](028-slashing-appeals.md#6-contract-surface).
 
 ### 6. Delegator pool — USDC → TOKEN conversion
 
@@ -523,15 +547,13 @@ Operator yield differentiates by long-term ve-commitment via the gauge boost (§
 
 #### Revenue streams
 
-(per design spec §2.4):
-
 1. **40% of every channel settlement** — direct USDC, same-tx, per-byte.
 2. **Share of the 40% gauge-boost pool** — USDC, weekly distribution, weighted by `working_bytes`. Non-ve-lockers receive ~40% of fair-share; max-ve-lockers receive 100% of fair-share (2.5× more per byte than non-lockers).
 3. **Optional delegator-pool yield** (TOKEN-denominated) on any TOKEN they ve-lock. Disjoint from the gauge pool; uncapped relative to byte share.
 
 #### Sample 1 Gbps node P&L
 
-(full multi-scenario model, including absolute figures and the S0–S3 × node-type-A–E unmetered-infra cost matrix, lives in design spec §2.4 / §3). Qualitative shape: fair-share ve materially out-earns no-ve at the reference 30K GB/mo node (the commodity operator is positive but thin and is the design's intended filter); over-ve is gauge-flat and earns its marginal yield via the delegator pool. Externally-funded operator-onboarding programs soften the filter for new operators.
+Qualitative shape: fair-share ve materially out-earns no-ve at the reference 30K GB/mo node (the commodity operator is positive but thin and is the design's intended filter); over-ve is gauge-flat and earns its marginal yield via the delegator pool. Externally-funded operator-onboarding programs soften the filter for new operators.
 
 ### 8. Slashing and burn
 
@@ -541,11 +563,11 @@ Operator yield differentiates by long-term ve-commitment via the gauge boost (§
 
 **Buyback-and-burn inflow.** 5% of routed USDC flows to `BuybackBurner` from `FeeRouter`. [ADR 018](018-liquidity-strategy.md) mechanics (Balancer V3 80/20 swap, TWAP, `minTokenOut`, POL custody) are inherited.
 
-**Mature-scale burn estimate.** ~0.3–0.4%/yr of 1B supply at S2 reference scale (full burn-vs-vesting and burn-sensitivity tables across S0–S3 × $0.001–$1.00 TOKEN price live in economic-model spec §§4–5).
+**Mature-scale burn estimate.** ~0.3–0.4%/yr of 1B supply at S2 reference scale.
 
 #### Operational constraint
 
-Burn must be TWAP-limited and liquidity-aware. Mature burn budgets can exceed available market depth, especially at low TOKEN prices (per economic-model spec §4, S2/S3 are the regimes where liquidity caps bind).
+Burn must be TWAP-limited and liquidity-aware. Mature burn budgets can exceed available market depth, especially at low TOKEN prices (S2/S3 are the regimes where liquidity caps bind).
 
 ### 9. Governance
 
@@ -563,7 +585,7 @@ Burn must be TWAP-limited and liquidity-aware. Mature burn budgets can exceed av
 | Total governance latency | ≈9 days (7-day vote + 48-hour timelock) |
 | Delegation | ve-balance delegatable, Governor Bravo pattern |
 
-Traders with no ve-position cannot vote. The early veTOKEN base is concentrated in self-locked seed/team/treasury positions and POL/airdrop recipients who choose to lock; **governance bootstrapping may require a treasury-funded ve-lock-on-claim airdrop in the first 6–12 months** (sourced from the community / ecosystem allocation or pre-seed). Sizing is open and tracked in the design spec's open-question list. Rest of [ADR 009](009-governance.md) (emergency multisig, hard-cap pause powers, etc.) unchanged.
+Traders with no ve-position cannot vote. The early veTOKEN base is concentrated in self-locked seed/team/treasury positions and POL/airdrop recipients who choose to lock; **governance bootstrapping may require a treasury-funded ve-lock-on-claim airdrop in the first 6–12 months** (sourced from the community / ecosystem allocation or pre-seed). Rest of [ADR 009](009-governance.md) (emergency multisig, hard-cap pause powers, etc.) unchanged.
 
 ### 10. Bootstrap mechanism — pre-seed USDC
 
@@ -611,7 +633,7 @@ Parameter setters on `FeeRouter` and `VotingEscrow` are role-gated via `AccessCo
 - **Proven mechanism.** Curve's gauge + veCRV system has operated for 4+ years with billions in TVL. Reference implementations are open-source and auditable.
 - **No cashflow crisis at the operator layer.** 40% liquid USDC per settlement covers infrastructure costs at the reference 1 Gbps / 30K GB/mo node — operators are never starved of USDC by the design.
 - **USDC pre-seed eliminates TOKEN-price reflexivity in bootstrap.** Subsidy purchasing power does not collapse with TOKEN price.
-- **Self-funding treasury at S1+.** Per economic-model spec §2, treasury net of $33K/mo team burn is positive from S1 (Early) onward.
+- **Self-funding treasury at S1+.** Treasury net of $33K/mo team burn is positive from S1 (Early) onward.
 - **Safety reserve creates enterprise-tier credibility.** Funded SLA-failure compensation makes the Enterprise tier sellable rather than purely best-effort decentralized.
 - **Slashing funds user recourse.** 30% of slashed stake funds incident payouts via `SafetyReserve` — user-harm incidents have a structural recourse path.
 
@@ -623,7 +645,7 @@ Parameter setters on `FeeRouter` and `VotingEscrow` are role-gated via `AccessCo
 - **Governance bootstrap depends on voluntary locking.** Initial veTOKEN supply tracks self-locking decisions; first 6–12 months may need treasury-funded lock incentives.
 - **Delegator-pool swap adds keeper dependency.** USDC→TOKEN conversion needs a keeper trigger (or fold into `BuybackBurner`'s existing keeper). Not a new failure mode — [ADR 018](018-liquidity-strategy.md) already has keeper dependency — but it expands the keeper's responsibilities.
 - **Load-bearing math is harder to explain.** The Curve formula and the delegator-conversion mechanic are not intuitive to casual readers. UI, documentation, and operator dashboards need to expose "your boost factor," "your delegator-pool TOKEN earnings," and "delegator-pool slippage" clearly.
-- **Effective supply growth ~24%/yr during vesting window.** With ve-locking opt-in, the model relies on burn flow plus scenario-driven revenue growth to outweigh release pressure. Per economic-model spec §4, burn dominates monthly vesting only at S2+ at $0.05/TOKEN.
+- **Effective supply growth ~24%/yr during vesting window.** With ve-locking opt-in, the model relies on burn flow plus scenario-driven revenue growth to outweigh release pressure. Burn dominates monthly vesting only at S2+ at $0.05/TOKEN.
 
 ### Risks
 

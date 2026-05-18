@@ -105,7 +105,7 @@ Per-publisher namespace cap and ownership-transfer timelock are governable param
 
 ## Consequences
 
-**Positive:**
+### Positive
 
 - Delivery verification is inherent: hash mismatch on receipt is both detection and proof. No separate proof-of-delivery oracle is needed.
 - Content is location-independent: a blob from any node is interchangeable as long as the hash matches. This makes the entire delivery layer transparent to clients.
@@ -113,7 +113,7 @@ Per-publisher namespace cap and ownership-transfer timelock are governable param
 - The hash serves as the slash evidence primitive: a client detecting a BLAKE3 mismatch on received bytes can trigger an on-chain slash via a challenge process. **Resolved:** [ADR 014](014-on-chain-verification.md) specifies a single-round optimistic challenge-response for the PoC (challenger posts a signed `StreamResponse` + 100 TOKEN bond; node has 24 hours to counter) with a production upgrade path using interactive keccak256 Merkle proofs over 1024-byte chunks for cryptographic on-chain verification. See [ADR 014 § Bond Handling](014-on-chain-verification.md#bond-handling) for challenge bond requirements (amount, transfer, forfeit rules) and [ADR 005](005-protocol.md#cdnprobev1--latency-probe) for slashing evidence mechanisms.
 - The origin-backed node's backing storage is completely opaque to the network — nobody can discover the origin URL or bypass the payment layer.
 
-**Negative:**
+### Negative
 
 - BLAKE3 is not a native EVM precompile, so on-chain verification requires an intermediate scheme. [ADR 014](014-on-chain-verification.md) specifies an optimistic challenge-response for PoC and a keccak256 Merkle proof protocol for production.
 - Content is immutable: updating a blob produces a new hash and a new identity. Applications that need mutable references (e.g., "latest version of X") must manage their own indirection layer above the protocol.

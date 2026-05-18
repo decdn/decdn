@@ -92,7 +92,7 @@ Appendices are listed in [`architecture.md` § Appendices — Reference Patterns
 
 ADRs are **decision records** — but the *rendered* spec carries only the canonical design. The pre-launch alternatives that were weighed and rejected (and the rationale) are collected in [`adr/_history/alternatives-pre-launch.md`](_history/alternatives-pre-launch.md), kept out of every ADR body and out of both built PDFs, so future contributors can see what was on the table without the spec reading as a debate transcript.
 
-> **Note:** the rejected-alternatives relocation (#346, Tier 3 of the book-readiness program) is complete — ADR bodies carry no `## Alternatives Considered` section and no breadcrumb link; the `_history/` archive is reached directly.
+> **Note:** the rejected-alternatives relocation is complete — ADR bodies carry no `## Alternatives Considered` section and no breadcrumb link; the `_history/` archive is reached directly.
 
 ## Contributing
 
