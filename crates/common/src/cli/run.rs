@@ -91,6 +91,15 @@ pub struct BlockchainArgs {
     /// `StakingRegistry` contract address (0x-prefixed hex).
     #[arg(long, value_name = "ADDR", env = "DECDN_STAKING_REGISTRY_ADDRESS")]
     pub staking_registry_address: Option<String>,
+
+    /// `SlashJudge` contract address (0x-prefixed hex) — EIP-712
+    /// `verifyingContract` for probe `slash_sig` (ADR 014).
+    #[arg(long, value_name = "ADDR", env = "DECDN_SLASH_JUDGE_ADDRESS")]
+    pub slash_judge_address: Option<String>,
+
+    /// EIP-712 chain id for the `slash_sig` domain [default: 421614].
+    #[arg(long, value_name = "ID", env = "DECDN_CHAIN_ID")]
+    pub chain_id: Option<u64>,
 }
 
 /// Cache storage configuration.
@@ -116,6 +125,11 @@ pub struct CacheArgs {
     /// strictly less than `cache_size_mb`.
     #[arg(long, value_name = "MB", env = "DECDN_MAX_BLOB_SIZE_MB")]
     pub max_blob_size_mb: Option<u64>,
+
+    /// Max concurrently held (eviction-exempt) blobs for the probe hold
+    /// (ADR 005 §Hold budget) [default: 256]. `0` disables `has_blob: true`.
+    #[arg(long, value_name = "N", env = "DECDN_MAX_PROBE_HOLDS")]
+    pub max_probe_holds: Option<u64>,
 }
 
 /// Payment rate configuration.
@@ -125,6 +139,16 @@ pub struct PaymentArgs {
     /// Rate per MB in USDC base units (6 decimals; 10 = $0.00001/MB) [default: 10].
     #[arg(long, value_name = "UNITS", env = "DECDN_RATE_PER_MB")]
     pub rate_per_mb: Option<u64>,
+
+    /// Lower bound `rate_per_mb` is clamped to before signing a
+    /// `ProbeResponse` (ADR 005 §Rate bounds validation) [default: 0].
+    #[arg(long, value_name = "UNITS", env = "DECDN_DELIVERY_FLOOR")]
+    pub delivery_floor: Option<u64>,
+
+    /// Upper bound `rate_per_mb` is clamped to before signing a
+    /// `ProbeResponse` [default: protocol `MAX_RATE_PER_MB`].
+    #[arg(long, value_name = "UNITS", env = "DECDN_DELIVERY_CEILING")]
+    pub delivery_ceiling: Option<u64>,
 }
 
 /// Observability settings (logging, metrics).

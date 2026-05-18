@@ -9,7 +9,7 @@ A deCDN node has two observation points today:
 - A loopback-only `/metrics` HTTP endpoint (hyper on `observability.metrics_port`, default `9090`) emitting OpenMetrics text — text-only, aggregate, read-only by design.
 - The `cdn/probe/v1` ALPN, hittable by any remote iroh peer for latency/availability checks — not a local control channel, no auth beyond "anyone with an iroh connection".
 
-Neither fits when a same-host operator must **read live internal state** (gossip peer table — #247) or **trigger a local control action** (graceful drain — #244). A control-plane surface is therefore needed; this ADR pins its shape so the first method (`admin_v1_peersList`, #247) and future ones (drain, health, config reload, …) share a common transport.
+Neither fits when a same-host operator must **read live internal state** (gossip peer table) or **trigger a local control action** (graceful drain). A control-plane surface is therefore needed; this ADR pins its shape so the first method (`admin_v1_peersList`) and future ones (drain, health, config reload, …) share a common transport.
 
 ## Decision
 
@@ -25,7 +25,7 @@ Initial method set:
 
 Future methods **expected** to use this surface (not designed here):
 
-- `admin_v1_drain` — graceful drain (#244).
+- `admin_v1_drain` — graceful drain.
 - `admin_v1_health` — readiness/liveness probe.
 - `admin_v1_configReload` — reload mutable config sections.
 
@@ -46,7 +46,7 @@ Config shape:
 
 CLI shape:
 
-- New subcommand group `decdn node` whose children talk to the admin server: initially `decdn node peers`, with `decdn node drain` to follow under #244.
+- New subcommand group `decdn node` whose children talk to the admin server: initially `decdn node peers`, with `decdn node drain` to follow.
 - Admin URL resolution (`decdn node ...`) precedence:
   1. `--admin-url` flag, or `DECDN_ADMIN_URL` env (folded into the flag by clap's `env =`).
   2. `observability.admin_port` from the TOML config file — subcommand-level `--config`, then top-level `decdn --config`, then default `~/.decdn/node.toml`. An explicit path that doesn't exist errors; the default path missing falls through. `admin_port = 0` in the file errors rather than silently probing the default port.

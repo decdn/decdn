@@ -1,7 +1,7 @@
 # ADR 000: Language and Core Networking Stack
 
 **Date:** 2026-03-28
-**Status:** Draft
+**Status:** Accepted
 
 ## Context
 
@@ -11,7 +11,7 @@ We are building a decentralized CDN with two participant roles: **nodes** (provi
 - Concurrent handling of many inbound connections per node
 - Safe memory management without a garbage collector introducing latency spikes under load
 - A QUIC-based transport with content-addressed verified transfer
-- A single binary deployable as a node or client depending on configuration
+- Two statically linked binaries — a `decdn-node` daemon and a `decdn` CLI — sharing a common config schema and identity model (see [Appendix: deCDN Binaries](appendix-binaries.md))
 
 ## Decision
 
@@ -27,15 +27,15 @@ Specifically:
 
 ## Consequences
 
-**Positive:**
+### Positive
 
 - Memory safety without GC pauses — predictable tail latency under concurrent delivery load
 - Rust's async runtime (tokio) handles thousands of concurrent connections per node efficiently
 - iroh bundles QUIC, NAT traversal, content-addressed transfer, and verified streaming — fewer moving parts than assembling these from separate libraries
 - BLAKE3 is native to iroh's content model; blob IDs and transport layer use the same hash with no translation layer
-- A single statically linked binary simplifies deployment with no runtime dependency management
+- Statically linked binaries simplify deployment with no runtime dependency management
 
-**Negative:**
+### Negative
 
 - Rust's compile times slow the development feedback loop compared to interpreted or JVM languages
 - The team needs Rust proficiency; onboarding contributors takes longer

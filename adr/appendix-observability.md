@@ -36,7 +36,7 @@ Metrics are grouped into **mandatory** (M) and **recommended** (R) tiers.
 
 #### 2.1 Slash-Safety Metrics (all Mandatory)
 
-Early warning for the five slashable offenses in [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn). A sustained non-zero value for any of these requires immediate operator attention.
+Early warning for the three slashable offenses in [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn). A sustained non-zero value for any of these requires immediate operator attention.
 
 | Metric | Type | Tier | Description |
 |--------|------|------|-------------|
@@ -79,8 +79,8 @@ Early warning for the five slashable offenses in [ADR 026 §8](026-gauge-boost-t
 | `decdn_cache_bytes_returned_total` | Counter | R | Bytes returned from `CacheEngine::get` to the caller on success. Counts both cache-hit and pull-through-success paths. |
 | `decdn_cache_pull_through_bytes_total` | Counter | R | Bytes received from origin during a cache miss, counted regardless of BLAKE3 verification or store landing — origin egress is paid either way. Independent of `decdn_cache_bytes_returned_total`: equal values mean pure pass-through; `bytes_returned_total >> pull_through_bytes_total` indicates effective caching. |
 | `decdn_cache_evictions_total` | Counter | R | Blobs evicted by LRU pressure (eviction-driver loop). See [appendix-blob-cache-eviction.md](appendix-blob-cache-eviction.md). |
-| `decdn_cache_evicted_operator_total` | Counter | R | Hashes removed via `decdn node evict` (durable, persisted to `<cache_dir>/evicted.log`). Distinct from `decdn_cache_evictions_total`. See [appendix-blob-cache-eviction.md §3](appendix-blob-cache-eviction.md#3-operator-evict-is-orthogonal-to-lru-279). |
-| `decdn_cache_pinned_count` | Gauge | R | Size of the operator-pinned set (LRU-exempt). See [appendix-blob-cache-eviction.md §2](appendix-blob-cache-eviction.md#2-operator-pinning-overrides-lru-276). |
+| `decdn_cache_evicted_operator_total` | Counter | R | Hashes removed via `decdn node evict` (durable, persisted to `<cache_dir>/evicted.log`). Distinct from `decdn_cache_evictions_total`. See [appendix-blob-cache-eviction.md §3](appendix-blob-cache-eviction.md#3-operator-evict-is-orthogonal-to-lru). |
+| `decdn_cache_pinned_count` | Gauge | R | Size of the operator-pinned set (LRU-exempt). See [appendix-blob-cache-eviction.md §2](appendix-blob-cache-eviction.md#2-operator-pinning-overrides-lru). |
 | `decdn_probe_post_eviction_failures_total` | Counter | R | `EvictedSinceProbe` responses from remote nodes during cache-hit stream requests. A sustained rate above ~1% of cache-hit attempts suggests remote hold mechanism failures ([ADR 001](001-network.md), [ADR 005](005-protocol.md)). |
 
 #### 2.4 Probe Metrics (`cdn/probe/v1`)
@@ -310,7 +310,7 @@ Covers M-tier slash-safety metrics and the most common R-tier panels for a first
 
 ## Consequences
 
-**Positive:**
+### Positive
 
 - Single reference for dashboard configuration — no hunting across 8 ADRs for metric names.
 - Mandatory M-tier slash-risk metrics enforced at startup, so operators cannot accidentally run without slash-risk visibility.
@@ -318,7 +318,7 @@ Covers M-tier slash-safety metrics and the most common R-tier panels for a first
 - Alert thresholds provide actionable defaults for new operators.
 - The `/health` endpoint integrates with standard load balancers and container readiness probes without parsing Prometheus text.
 
-**Negative:**
+### Negative
 
 - Existing ADRs reference informal names differing from the canonical ones here. The cross-reference table (Section 6) documents all renames; no ADR is retroactively edited (avoids draft-document churn), but implementations must use this ADR's canonical names.
 - Mandatory metrics add startup complexity — all M-tier collectors must initialize before accepting connections. Small overhead for guaranteed observability.

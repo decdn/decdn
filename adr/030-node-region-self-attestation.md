@@ -13,7 +13,7 @@ Each node declares a region — an ISO 3166-1 alpha-2 country code — at regist
 - **Peer-selection geo-diversity.** Clients prefer geographically diverse providers when other ranking factors tie ([ADR 001 § Selection](001-network.md), implemented in `crates/node/src/selection.rs`).
 - **Appeals standing.** Operator standing under [ADR 011 § Blacklist Entry Appeals — Standing](011-content-takedown.md#standing) path 2 is gated on `node.region` matching the disputed entry's region.
 
-Three ADRs ([001 § Consequences](001-network.md#consequences), [011 § Regional Scope](011-content-takedown.md#regional-scope), [019 § Deferred & Open](019-node-onboarding.md#deferred--open)) name "a decentralized oracle or third-party attestation service" as the production mitigation against region misreporting but provide no design — choice of oracle, IP→region resolution, mismatch handling, slashing implications, and operator UX are all unspecified. Issue #400 tracks the gap as `prod-blocking` / `missing-decision`. Without a decision, regional compliance under [ADR 011](011-content-takedown.md) is structurally fragile and two region-flip gaming vectors — the appeals-standing flip ([ADR 011 § Standing](011-content-takedown.md#standing)) and the reactive blacklist-scope flip ([ADR 011 § Regional Scope](011-content-takedown.md#regional-scope)) — remain open.
+Three ADRs ([001 § Consequences](001-network.md#consequences), [011 § Regional Scope](011-content-takedown.md#regional-scope), [019 § Deferred & Open](019-node-onboarding.md#deferred--open)) name "a decentralized oracle or third-party attestation service" as the production mitigation against region misreporting but provide no design — choice of oracle, IP→region resolution, mismatch handling, slashing implications, and operator UX are all unspecified. This gap is production-blocking and represents a missing design decision. Without a decision, regional compliance under [ADR 011](011-content-takedown.md) is structurally fragile and two region-flip gaming vectors — the appeals-standing flip ([ADR 011 § Standing](011-content-takedown.md#standing)) and the reactive blacklist-scope flip ([ADR 011 § Regional Scope](011-content-takedown.md#regional-scope)) — remain open.
 
 This ADR closes the gap by **rejecting** the oracle/attestation-service path and committing to self-attested regions as the production posture, with one protocol-level hardening — a region-change stability window — that removes the two region-flip surfaces (appeals-standing and reactive blacklist-scope) that do not self-correct under the existing latency/reputation loop.
 
@@ -25,7 +25,7 @@ A node's region is whatever the operator declares — at `StakingRegistry.regist
 
 ### 2. Soft mitigation: latency-vs.-claim reputation penalty (canonical)
 
-The reputation penalty described in [ADR 001 § Consequences](001-network.md#consequences) — clients apply a reputation penalty when observed latency contradicts the claimed region (default heuristic: RTT > 150ms to a node in the same claimed region) — is the canonical continuous mitigation. This ADR does not respecify the threshold, sample size, or decay curve; tightening those parameters is a follow-up in the [ADR 008](008-reputation.md) reputation domain, not a precondition for closing #400 — the residual control is consciously accepted in its current unparameterized form, tracked in Cross-ADR Impact. The penalty is self-correcting (a misdeclaring node loses payouts proportional to how badly its declared region contradicts measured RTT) and requires no new protocol surface.
+The reputation penalty described in [ADR 001 § Consequences](001-network.md#consequences) — clients apply a reputation penalty when observed latency contradicts the claimed region (default heuristic: RTT > 150ms to a node in the same claimed region) — is the canonical continuous mitigation. This ADR does not respecify the threshold, sample size, or decay curve; tightening those parameters is a follow-up in the [ADR 008](008-reputation.md) reputation domain, not a precondition for the decision recorded here — the residual control is consciously accepted in its current unparameterized form, tracked in Cross-ADR Impact. The penalty is self-correcting (a misdeclaring node loses payouts proportional to how badly its declared region contradicts measured RTT) and requires no new protocol surface.
 
 ### 3. Region-stability window
 
@@ -73,21 +73,21 @@ Backstops for the pre-positioned case are deliberately off-protocol: (a) declare
 
 ## Consequences
 
-**Positive:**
+### Positive
 
-- Closes #400 with a concrete decision; supersedes the three "future work / production mitigation: oracle" passages in [ADR 001](001-network.md), [ADR 011](011-content-takedown.md), and [ADR 019](019-node-onboarding.md).
+- Closes the region-attestation gap with a concrete decision; supersedes the three "future work / production mitigation: oracle" passages in [ADR 001](001-network.md), [ADR 011](011-content-takedown.md), and [ADR 019](019-node-onboarding.md).
 - No new external trust root and no new external dependency.
 - Appeals-standing flipping *and* reactive blacklist-scope flipping become protocol invariants rather than, respectively, a multisig norm and an unmitigated gap.
 - Operator UX unchanged for honest deployments — VPN, anycast, mobile, and multi-region operators are not penalized by an IP-geolocation gate that would systematically misclassify them.
 - Compatible with the existing on-chain surface: `updateRegion` follows the operator-callable, no-bond shape of `updateMultiaddrs` ([ADR 019 § NAT and Multiaddr Handling](019-node-onboarding.md#nat-and-multiaddr-handling)), and `regionLastChanged` adopts the timestamp-field shape already used by `firstRegisteredAt` ([ADR 019 § Re-Onboarding after Deregistration or Auto-Ejection](019-node-onboarding.md#re-onboarding-after-deregistration-or-auto-ejection)) — with opposite mutability (updated on every successful `updateRegion`, vs. `firstRegisteredAt`'s write-once-on-first-registration).
 
-**Negative:**
+### Negative
 
 - The protocol cannot prevent a **pre-positioned** misdeclaring node (false region since registration, before any entry exists) from staying out of scope for the real region's entries. Reactive flipping is foreclosed by § 3, but a persistently false declaration is accepted at face value; this is the residual risk this ADR consciously accepts. Backstops are off-protocol — declared-jurisdiction legal exposure plus the continuous latency-vs.-claim reputation penalty (§ 2) — not protocol-level slashing: [ADR 011 § Slashing](011-content-takedown.md#slashing) routes slash eligibility under the *declared* region, which by construction does not reach a region the operator never declared.
 - The multisig-discretion fallback for sub-7d appeal filings remains an off-chain norm. Operators with legitimate post-relocation filings still depend on multisig judgement during that window.
 - The 7-day stability window slightly raises the cost of legitimate relocation when it overlaps a regional appeal — an operator who relocates and *then* wants to file in the new region must wait out the window or accept multisig-discretion intake.
 
-**Risks:**
+### Risks
 
 - **Coordinated region-spoofing attack on a region's reputation.** A fleet of misdeclaring nodes could pollute regional gossip topics and depress the region's measured reputation. Bounded by (a) the latency penalty (attacker reputation collapses as fast as RTTs are sampled), (b) the cost of staking each node ([ADR 026 § 7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake) minimum stake), and (c) gossip-bandwidth cost. Not free; self-correcting.
 - **Governance-set `REGION_STABILITY_WINDOW` drift.** Lowering the window toward the 3-day floor weakens both the appeals-standing and the blacklist-scope protections. The hard bounds `[3d, 30d]` per [ADR 009](009-governance.md) safety-bound pattern make this an above-the-line governance question rather than a silent regression; the floor was raised from 1d to 3d specifically so the worst legal setting still keeps a region flip uneconomic (see § 3 Threshold rationale).

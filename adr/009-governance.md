@@ -7,7 +7,7 @@
 
 [ADR 026](026-gauge-boost-tokenomics.md) introduces three tokenomics primitives that this ADR depends on: a `VotingEscrow` contract (vote-escrowed TOKEN with linear decay), a six-bucket `FeeRouter` whose share parameters are governable within hard-coded bounds, and a `SafetyReserve` contract whose payouts are gated by governance-authorized rules. These are the economic primitives the production governance model assumes.
 
-Governance — how protocol parameters are changed, who can change them, and what safety mechanisms exist — is a separate concern. During the PoC, governance is a single admin key. Production governance (ve-weighted voting, emergency multisig, parameter safety bounds, and SafetyReserve payout authorization) is complex enough to warrant its own ADR and will be implemented post-PoC.
+Governance — how protocol parameters are changed, who can change them, and what safety mechanisms exist — is a separate concern. The governance contracts (`DecdnGovernor`, `TimelockController`) ship in the day-one single-audit-pass surface ([ADR 016 § Contract Inventory](016-contract-interactions.md#1-contract-inventory)); what differs by phase is the governance *process*, not the contract surface. In the PoC, parameters are changed through a single admin key; the production process (ve-weighted voting, emergency multisig, parameter safety bounds, and SafetyReserve payout authorization) is what this ADR specifies.
 
 This ADR covers:
 
@@ -45,7 +45,7 @@ Traders, passive holders, and any TOKEN that has not been locked into `VotingEsc
 
 #### Bootstrap consideration
 
-Under [ADR 026](026-gauge-boost-tokenomics.md), vesting contracts release TOKEN unlocked and locking into `VotingEscrow` is opt-in (no auto-ve-lock-on-vest). Consequently the early ve-supply is concentrated in self-locked seed/team/treasury positions plus POL/airdrop recipients who choose to lock, and is materially smaller than it would be under an auto-lock model. Quorum measured against `totalSupplyAt` is robust to this — a small ve-supply means a small absolute quorum bar — but the population of distinct lockers may be too thin to resist concentration. **Recommendation:** the protocol treasury should fund a ve-lock-on-claim airdrop (sourced from the community / ecosystem allocation or pre-seed) during the first 6–12 months post-launch, structured so participants receive TOKEN only by locking it in `VotingEscrow`. Sizing is open and tracked in the [ADR 026](026-gauge-boost-tokenomics.md) source design spec's open-question list.
+Under [ADR 026](026-gauge-boost-tokenomics.md), vesting contracts release TOKEN unlocked and locking into `VotingEscrow` is opt-in (no auto-ve-lock-on-vest). Consequently the early ve-supply is concentrated in self-locked seed/team/treasury positions plus POL/airdrop recipients who choose to lock, and is materially smaller than it would be under an auto-lock model. Quorum measured against `totalSupplyAt` is robust to this — a small ve-supply means a small absolute quorum bar — but the population of distinct lockers may be too thin to resist concentration. **Recommendation:** the protocol treasury should fund a ve-lock-on-claim airdrop (sourced from the community / ecosystem allocation or pre-seed) during the first 6–12 months post-launch, structured so participants receive TOKEN only by locking it in `VotingEscrow`. Sizing is an open question.
 
 ### Governable Parameters with Safety Bounds
 
@@ -122,7 +122,7 @@ The 3% `SafetyReserve` bucket introduced by [ADR 026](026-gauge-boost-tokenomics
 
 `SafetyReserve.payout(bundle, recipient, amount)` checks all four of the following gates; absence of any of them causes the call to revert. There is no path for unattested or unreviewed payouts.
 
-1. **Attested incident bundle.** The caller must supply a cryptographic evidence bundle identifying the failure mode, the harmed party, and the proposed payout amount. Bundle attestation rules and accepted evidence types are tracked in the [ADR 026](026-gauge-boost-tokenomics.md) source design spec.
+1. **Attested incident bundle.** The caller must supply a cryptographic evidence bundle identifying the failure mode, the harmed party, and the proposed payout amount.
 2. **Authorization.** Either (a) a successful governance proposal that authorizes the specific bundle, or (b) emergency-multisig fast-track approval — the multisig may execute payouts under hard caps (per-incident and per-rolling-window USDC ceilings configured at deploy time and immutable thereafter; see [Emergency Multisig](#emergency-multisig)). Multisig fast-track is intended for time-critical incidents (active SLA breaches, ongoing outages) and does not bypass the other three gates.
 3. **48-hour appeal window.** After authorization, the bundle enters a 48-hour on-chain appeal window during which any party may submit a counter-bundle challenging the original. Successful challenges revert the authorization. The appeal window cannot be shortened (including by emergency multisig); only the gate-2 authorization step has a fast path.
 4. **Post-incident reporting.** On payout settlement, `SafetyReserve` writes an immutable record to its public on-chain registry (incident hash, payout amount, recipient, authorization path used, links to the evidence bundle and any successful appeals). Operators of the registry MUST publish a human-readable post-incident report referencing the on-chain record; the registry tracks completion of these reports and exposes outstanding-report counts as a public metric.
@@ -144,14 +144,14 @@ The emergency multisig's fast-track authority over gate 2 is constrained by the 
 
 ## Consequences
 
-**Positive:**
+### Positive
 
 - Hardcoded safety bounds on all governable parameters limit the damage a governance attack can cause
 - Emergency multisig provides rapid exploit response without giving any party unilateral control over funds or parameters
 - Sunset clause on the multisig prevents permanent centralization
-- PoC can operate with a simple admin key; governance contracts are additive post-PoC
+- PoC can operate with a simple admin key; the governance contracts ship day-one in the single-audit-pass surface ([ADR 016](016-contract-interactions.md)) — only the ve-weighted voting process is activated later, not the contract surface
 
-**Negative:**
+### Negative
 
 - ve-weighted governance shifts capture risk from large TOKEN holders to large ve-lockers; safety bounds limit damage but cannot prevent rent-seeking within allowed parameter ranges (e.g., setting the gauge-boost share to the 60% maximum). Operators who lock heavily for gauge boost (per [ADR 026](026-gauge-boost-tokenomics.md) §3) also accumulate disproportionate governance weight; this concentration is partially offset by team / seed / treasury vesting acting as a counterweight during the first ~3 years.
 - 7-day voting period + 48-hour timelock means 9 days minimum to respond to non-emergency issues via governance

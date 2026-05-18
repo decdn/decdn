@@ -20,15 +20,25 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
+use alloy::primitives::Address;
+use alloy::signers::local::PrivateKeySigner;
+use decdn_cache::CacheEngine;
 use decdn_cli::commands::probe_client::{ProbeMetrics, probe_once};
 use decdn_common::config::ResolvedSecurity;
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::probe::ProbeHandler;
 use decdn_node::metrics::Metrics;
-use decdn_protocol::{ALPN_PROBE, SESSION_TICKET_CACHE_SIZE};
+use decdn_protocol::{ALPN_PROBE, MAX_RATE_PER_MB, SESSION_TICKET_CACHE_SIZE};
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
+
+/// Fixed BLAKE3 digest every probe in this suite queries. The transport
+/// path (0-RTT vs 1-RTT, RTT, ticket linger) is hash-independent; the
+/// server runs an empty cache so every response is `has_blob: false`.
+/// Distinct `timestamp_us` values (passed per probe) carry the echoed-back
+/// correlation these tests assert on, exactly as the pre-#569 `nonce` did.
+const PROBE_HASH: [u8; 32] = [0x5au8; 32];
 
 /// Forwards the client-side 0-RTT transitions into the node metrics
 /// registry. Local type + foreign trait → orphan rule satisfied; lets
@@ -68,7 +78,13 @@ async fn spawn_server(
     metrics: &Arc<Metrics>,
     enable_0rtt: bool,
     sk: SecretKey,
-) -> anyhow::Result<(Router, Endpoint, iroh::PublicKey, SocketAddr)> {
+) -> anyhow::Result<(
+    Router,
+    Endpoint,
+    iroh::PublicKey,
+    SocketAddr,
+    tempfile::TempDir,
+)> {
     let id = sk.public();
     let bind = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
     let ep = Endpoint::builder(presets::Minimal)
@@ -93,17 +109,30 @@ async fn spawn_server(
         other => other,
     };
 
+    // Empty cache (no origin): every probe answers `has_blob: false`. These
+    // tests exercise the 0-RTT transport, not content availability — a
+    // random EOA signer + deterministic test domain satisfy the post-#569
+    // mandatory `slash_sig` (ADR 014 §1) without the suite verifying it.
+    let cache_tmp = tempfile::tempdir()?;
+    let cache = CacheEngine::open(cache_tmp.path(), vec![], 16).await?;
+    let eth_signer = Arc::new(PrivateKeySigner::random());
+    let slash_domain = decdn_incentive::slash_judge_domain(421_614, Address::repeat_byte(0x11));
     let handler = Arc::new(ProbeHandler::new(
         id,
         Arc::new(AtomicU64::new(42)),
         Arc::clone(metrics),
         permissive_limiter(metrics),
+        cache,
+        eth_signer,
+        slash_domain,
+        0,
+        MAX_RATE_PER_MB,
         enable_0rtt,
     ));
     let router = Router::builder(ep.clone())
         .accept(ALPN_PROBE, handler)
         .spawn();
-    Ok((router, ep, id, addr))
+    Ok((router, ep, id, addr, cache_tmp))
 }
 
 /// Fully tear down a server: stop the router, then close the endpoint so
@@ -145,7 +174,7 @@ fn has_metric_line(text: &str, name: &str, value: u64) -> bool {
 #[tokio::test(flavor = "multi_thread")]
 async fn warm_probe_uses_0rtt_and_records_metrics() -> anyhow::Result<()> {
     let metrics = Arc::new(Metrics::new());
-    let (router, server_ep, server_id, server_addr) =
+    let (router, server_ep, server_id, server_addr, _cache_tmp) =
         spawn_server(&metrics, true, SecretKey::generate()).await?;
     let client = client_endpoint().await?;
     let sink = MetricsSink(Arc::clone(&metrics));
@@ -156,9 +185,18 @@ async fn warm_probe_uses_0rtt_and_records_metrics() -> anyhow::Result<()> {
     // Probe 1 — cold. No cached ticket: 0-RTT not attempted, resolves
     // 1-RTT. The post-exchange linger lets the server's NewSessionTicket
     // reach the client's rustls cache.
-    let (resp1, _rtt) = probe_once(&client, target(), 0xA1, true, Some(&sink), timeout).await?;
-    assert_eq!(resp1.nonce, 0xA1);
-    assert_eq!(resp1.rate_per_mb, 42);
+    let (resp1, _rtt) = probe_once(
+        &client,
+        target(),
+        PROBE_HASH,
+        0xA1,
+        true,
+        Some(&sink),
+        timeout,
+    )
+    .await?;
+    assert_eq!(resp1.body.timestamp_us, 0xA1);
+    assert_eq!(resp1.body.rate_per_mb, 42);
 
     let text = metrics.encode()?;
     assert!(
@@ -168,8 +206,17 @@ async fn warm_probe_uses_0rtt_and_records_metrics() -> anyhow::Result<()> {
 
     // Probe 2 — warm. Same client endpoint => cached ticket => 0-RTT
     // attempt, accepted by the server.
-    let (resp2, _rtt) = probe_once(&client, target(), 0xB2, true, Some(&sink), timeout).await?;
-    assert_eq!(resp2.nonce, 0xB2);
+    let (resp2, _rtt) = probe_once(
+        &client,
+        target(),
+        PROBE_HASH,
+        0xB2,
+        true,
+        Some(&sink),
+        timeout,
+    )
+    .await?;
+    assert_eq!(resp2.body.timestamp_us, 0xB2);
 
     let text = metrics.encode()?;
     assert!(
@@ -202,17 +249,25 @@ async fn warm_probe_uses_0rtt_and_records_metrics() -> anyhow::Result<()> {
 async fn disabled_0rtt_never_attempts_early_data() -> anyhow::Result<()> {
     let metrics = Arc::new(Metrics::new());
     // Server handler also has 0-RTT off → default full-handshake path.
-    let (router, server_ep, server_id, server_addr) =
+    let (router, server_ep, server_id, server_addr, _cache_tmp) =
         spawn_server(&metrics, false, SecretKey::generate()).await?;
     let client = client_endpoint().await?;
     let sink = MetricsSink(Arc::clone(&metrics));
     let timeout = Duration::from_secs(5);
     let target = || EndpointAddr::new(server_id).with_ip_addr(server_addr);
 
-    for nonce in [0xC3u64, 0xD4u64] {
-        let (resp, _rtt) =
-            probe_once(&client, target(), nonce, false, Some(&sink), timeout).await?;
-        assert_eq!(resp.nonce, nonce);
+    for ts in [0xC3u64, 0xD4u64] {
+        let (resp, _rtt) = probe_once(
+            &client,
+            target(),
+            PROBE_HASH,
+            ts,
+            false,
+            Some(&sink),
+            timeout,
+        )
+        .await?;
+        assert_eq!(resp.body.timestamp_us, ts);
     }
 
     let text = metrics.encode()?;
@@ -255,7 +310,8 @@ async fn rejected_0rtt_falls_back_after_server_restart() -> anyhow::Result<()> {
     let server_key = SecretKey::generate();
     let server_id = server_key.public();
 
-    let (router, server_ep, _id, addr1) = spawn_server(&metrics, true, server_key.clone()).await?;
+    let (router, server_ep, _id, addr1, _cache_tmp1) =
+        spawn_server(&metrics, true, server_key.clone()).await?;
     let client = client_endpoint().await?;
     let sink = MetricsSink(Arc::clone(&metrics));
     let timeout = Duration::from_secs(5);
@@ -264,25 +320,27 @@ async fn rejected_0rtt_falls_back_after_server_restart() -> anyhow::Result<()> {
     let (r1, _) = probe_once(
         &client,
         EndpointAddr::new(server_id).with_ip_addr(addr1),
+        PROBE_HASH,
         0x01,
         true,
         Some(&sink),
         timeout,
     )
     .await?;
-    assert_eq!(r1.nonce, 0x01);
+    assert_eq!(r1.body.timestamp_us, 0x01);
 
     // Probe 2 — warm, accepted (sanity: resumption works pre-restart).
     let (r2, _) = probe_once(
         &client,
         EndpointAddr::new(server_id).with_ip_addr(addr1),
+        PROBE_HASH,
         0x02,
         true,
         Some(&sink),
         timeout,
     )
     .await?;
-    assert_eq!(r2.nonce, 0x02);
+    assert_eq!(r2.body.timestamp_us, 0x02);
     let text = metrics.encode()?;
     assert!(
         has_metric_line(&text, "decdn_quic_0rtt_accepted_total", 1),
@@ -292,22 +350,27 @@ async fn rejected_0rtt_falls_back_after_server_restart() -> anyhow::Result<()> {
     // Restart the server under the SAME key on a fresh endpoint — new
     // TLS state, so it can no longer decrypt the client's old ticket.
     shutdown_server(router, server_ep).await?;
-    let (router2, server_ep2, _id2, addr2) = spawn_server(&metrics, true, server_key).await?;
+    let (router2, server_ep2, _id2, addr2, _cache_tmp2) =
+        spawn_server(&metrics, true, server_key).await?;
 
     // Probe 3 — client still has a cached ticket for `server_id`, so it
     // ATTEMPTS 0-RTT (attempts goes 1 → 2), the restarted server REJECTS
     // it, and `probe_once` re-sends on the confirmed stream. The probe
-    // still succeeds with the correct echoed nonce.
+    // still succeeds with the correct echoed timestamp.
     let (r3, _) = probe_once(
         &client,
         EndpointAddr::new(server_id).with_ip_addr(addr2),
+        PROBE_HASH,
         0x03,
         true,
         Some(&sink),
         timeout,
     )
     .await?;
-    assert_eq!(r3.nonce, 0x03, "re-sent request must round-trip");
+    assert_eq!(
+        r3.body.timestamp_us, 0x03,
+        "re-sent request must round-trip"
+    );
 
     let text = metrics.encode()?;
     assert!(
@@ -357,7 +420,7 @@ async fn default_on_accepting_still_accepts_0rtt_safety_is_client_side() -> anyh
     let metrics = Arc::new(Metrics::new());
     // Server handler 0-RTT OFF => on_accepting == the default
     // full-handshake path every non-probe ALPN inherits.
-    let (router, server_ep, server_id, server_addr) =
+    let (router, server_ep, server_id, server_addr, _cache_tmp) =
         spawn_server(&metrics, false, SecretKey::generate()).await?;
     // Client 0-RTT ON => it WILL attempt early data once it has a ticket.
     let client = client_endpoint().await?;
@@ -368,16 +431,34 @@ async fn default_on_accepting_still_accepts_0rtt_safety_is_client_side() -> anyh
     // Probe 1 — cold: 1-RTT; the default-path server still issues a
     // NewSessionTicket (rustls `send_tls13_tickets > 0`) so the client
     // caches one.
-    let (r1, _) = probe_once(&client, target(), 0xE1, true, Some(&sink), timeout).await?;
-    assert_eq!(r1.nonce, 0xE1);
+    let (r1, _) = probe_once(
+        &client,
+        target(),
+        PROBE_HASH,
+        0xE1,
+        true,
+        Some(&sink),
+        timeout,
+    )
+    .await?;
+    assert_eq!(r1.body.timestamp_us, 0xE1);
 
     // Probe 2 — client has a ticket, attempts 0-RTT. Characterization:
     // the default `on_accepting` does NOT prevent acceptance (global
     // max_early_data_size), so the server accepts and the probe rides
     // 0-RTT. Safety here is solely that the request is an idempotent
     // probe — not that the server refused it.
-    let (r2, _) = probe_once(&client, target(), 0xE2, true, Some(&sink), timeout).await?;
-    assert_eq!(r2.nonce, 0xE2);
+    let (r2, _) = probe_once(
+        &client,
+        target(),
+        PROBE_HASH,
+        0xE2,
+        true,
+        Some(&sink),
+        timeout,
+    )
+    .await?;
+    assert_eq!(r2.body.timestamp_us, 0xE2);
 
     let text = metrics.encode()?;
     assert!(

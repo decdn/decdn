@@ -157,7 +157,7 @@ Each client release ships with a built-in default seed list compiled into the bi
 
 ### Trust Boundary
 
-**Verified (trustless) — the client cryptographically validates these:**
+#### Verified (trustless) — the client cryptographically validates these
 
 - **Content integrity:** BLAKE3 hash verification on every received blob. A malicious node cannot serve corrupted data.
 - **Voucher binding:** EIP-712 signatures on vouchers are produced by the client's own key. The client controls how much it authorizes.
@@ -165,14 +165,14 @@ Each client release ships with a built-in default seed list compiled into the bi
 - **Node identity:** QUIC handshake authenticates the remote NodeId (Ed25519). The client knows it is communicating with the registered node.
 - **Payment channel state:** On-chain, publicly verifiable. The client can always settle or dispute.
 
-**Trusted — the client relies on external guarantees:**
+#### Trusted — the client relies on external guarantees
 
 - **RPC endpoint:** Returns correct registry data. A compromised RPC can return a fabricated node list (eclipse). Mitigated in production by multi-source bootstrap (Option B above).
 - **Registry correctness:** The `StakingRegistry` contract accurately reflects staked nodes. Enforced by EVM execution — trust in the chain, not any specific party.
 - **Gossip integrity:** `NodeAnnounce` messages are signed by the announcing node's registered key and validated against the registry. A node cannot forge another's announcement. However, `LoadHint` is advisory — a node can lie, affecting selection quality but not safety.
 - **Clock:** NTP-synchronized local clock, used for gossip validation (±60 s freshness). Drift beyond this window causes the client to reject valid gossip.
 
-**Not trusted — the client does not rely on these:**
+#### Not trusted — the client does not rely on these
 
 - Any individual node's self-reported metadata (region, load) beyond what is signed and slashable.
 - Network-level reputation scores (30% gossip weight in [ADR 008](008-reputation.md); local observations dominate at 70%).
@@ -230,7 +230,7 @@ The client queries all configured seed domains, cross-checks returned NodeIds ag
 
 ## Consequences
 
-**Positive:**
+### Positive
 
 - Consolidates client behavior scattered across ADRs 001, 003, 005, and 008 into a single canonical specification
 - Specifies multi-source bootstrap (Option B) as the production eclipse-attack defense
@@ -238,7 +238,7 @@ The client queries all configured seed domains, cross-checks returned NodeIds ag
 - PoC key management is simple (file-based EOA or Safe wallet) with a clear production upgrade path (Safe multisig with session keys — see [ADR 024](024-account-abstraction.md))
 - Bootstrap procedure is fully specified end-to-end, unblocking PoC implementation
 
-**Negative:**
+### Negative
 
 - DNS seed list introduces a governance-maintained out-of-band dependency for production
 - File-based key storage in PoC is not suitable for production (acceptable for testnet with test funds)

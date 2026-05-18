@@ -13,11 +13,16 @@
 
 pub mod channel;
 pub mod eth_identity;
+pub mod probe_sig;
 pub mod rate;
 pub mod store;
 pub mod voucher;
 
 pub use channel::{ChannelError, ChannelId, ChannelState};
+pub use probe_sig::{
+    ProbeSlashData, ProbeSlashError, SLASH_JUDGE_DOMAIN_NAME, SLASH_JUDGE_DOMAIN_VERSION,
+    slash_judge_domain,
+};
 pub use rate::{BYTES_PER_MB, DEFAULT_TOLERANCE_BPS, RateError, verify_rate};
 pub use store::{ChannelStateStore, MemoryChannelStateStore, StoreError};
 pub use voucher::{

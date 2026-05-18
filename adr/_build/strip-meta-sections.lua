@@ -12,6 +12,10 @@
 --   * "Alternatives Considered" / "Considered Alternatives" / "Why not …"
 --     — STRIPPED. Rejected-alternative records (a distinct concept; most live
 --     in _history/, these patterns catch the inline remainder).
+--   * "Reading Order" — STRIPPED (book only). The architecture overview's
+--     chapter-by-chapter reading guide; in the book the part dividers and
+--     generated ToC *are* the reading order, so the prose list is
+--     redundant. Kept verbatim in the source and the numeric build.
 --   * "Cross-ADR Impact" — NOT stripped. It carries substantive cross-cutting
 --     design content (amendments to other ADRs, coupling notes), not
 --     scaffolding. Do not add it to strip_patterns.
@@ -34,6 +38,8 @@ local strip_patterns = {
   "^open questions$",            -- legacy alias, retained defensively
   "^future work",                -- legacy: "Future Work" / "Future Work: …"
   "^why not ",                   -- "Why not Uniswap V3, …"
+  "^reading order$",             -- architecture overview's chapter list;
+                                 -- book ToC + part dividers supersede it
 }
 
 local function should_strip(text)

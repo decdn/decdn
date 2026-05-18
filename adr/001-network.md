@@ -46,7 +46,7 @@ graph TD
     DIR -->|no provider found| MISS["No Known Provider<br/>(serve from local origin if configured,<br/>otherwise reject)"]
 ```
 
-#### Node Discovery (Gossip)
+### Node Discovery (Gossip)
 
 Nodes broadcast lightweight metadata over iroh-gossip on regional topics (`cdn/region/{cc}/v1`) and a global topic (`cdn/global/v1`). Each node publishes `NodeAnnounce` messages:
 
@@ -65,7 +65,7 @@ struct LoadHint {
 }
 ```
 
-##### Schema evolution note
+#### Schema evolution note
 
 The struct above is a flat definition for readability. [ADR 013](013-schema-evolution.md) specifies that `NodeAnnounce` uses a `NodeAnnounceBody` (signed portion) + `signature` + optional extensions pattern with two-phase deserialization, enabling unsigned fields to be appended via minor evolution without an ALPN bump. See [ADR 013 — Signed Field Freezing](013-schema-evolution.md#signed-field-freezing) for the canonical struct layout.
 
@@ -77,23 +77,23 @@ The struct above is a flat definition for readability. [ADR 013](013-schema-evol
 
 Both clients and nodes maintain a **peer table** (`NodeId → NodeAnnounce`) built from received gossip messages. This table tracks which nodes exist and their metadata — it does not track content. Peer-table lifecycle (TTL, registry-driven eviction, reputation independence) is documented in [appendix-peer-table-eviction.md](appendix-peer-table-eviction.md).
 
-##### Registry cache
+#### Registry cache
 
 Nodes maintain a local cache of the on-chain registry, kept fresh by subscribing to `NodeRegistered`, `NodeDeregistered`, and `NodeAutoEjected` events; sub-second L2 block times keep the staleness window small. The cache is checked during gossip validation (below) and before initiating paid pulls (see Content Discovery step 5). On `NodeDeregistered` and `NodeAutoEjected`, the cache also removes the corresponding peer-table entry — see [appendix-peer-table-eviction.md](appendix-peer-table-eviction.md).
 
-##### Gossip validation
+#### Gossip validation
 
 Gossip messages arrive wrapped in a `GossipEnvelope` ([ADR 013](013-schema-evolution.md)). The receiver deserializes the envelope first; messages with unknown envelope versions or unknown payload variants are silently dropped. The rules below apply to the inner payload after unwrapping. Before accepting a `NodeAnnounce` and updating the peer table, a node verifies: (1) the `signature` is valid for the `node_id`'s public key over the signed body fields (serialized via postcard, consistent with [ADR 005](005-protocol.md) and [ADR 013](013-schema-evolution.md)); (2) the `node_id` corresponds to an active staked node in the on-chain registry (checked against a local registry cache); (3) `timestamp_us` is within ±60 seconds of the receiver's local clock (prevents replay of old messages; the 60-second window accommodates clock skew between nodes — see Clock synchronization below); (4) `timestamp_us` is strictly greater than the `timestamp_us` of the existing peer table entry for the same `node_id` (monotonic — prevents replay of older messages within the freshness window). Messages failing any check are silently dropped. Additionally: (5) `region` is exactly 2 ASCII uppercase letters matching a known ISO 3166-1 alpha-2 code set. Messages with invalid region values are dropped. This prevents unregistered, unstaked, or replayed nodes from appearing in or corrupting peer tables.
 
 **Gossip deduplication:** iroh-gossip uses PlumTree (epidemic broadcast trees), which performs message-level deduplication internally — each message is assigned a unique identifier and nodes track a bounded in-memory set of seen message IDs, so the same message arriving via multiple paths is delivered to the application at most once while its ID remains in that seen-set. This is not a global or persistent exactly-once guarantee: duplicates may be re-delivered after seen-set eviction or process restart. This transport-layer dedup is the primary mechanism preventing redundant processing of `NodeAnnounce` in a multi-path topology. As defense-in-depth, gossip validation rule (4) (monotonic `timestamp_us` per `node_id`) independently rejects any duplicate or older `NodeAnnounce` — even if transport-level dedup were bypassed (e.g., after a restart), a replayed message fails the strictly-greater timestamp check against the peer table. The peer table itself (`NodeId → NodeAnnounce`), keyed by `node_id` with only the latest timestamp retained, is inherently convergent regardless of delivery order or multiplicity. No application-level seen-message set or content-hash table is required at the gossip layer. See also [ADR 008, Section 6](008-reputation.md#6-gossip-protocol) for deduplication of `ReputationReport` messages on the `cdn/reputation/v1` topic.
 
-##### Clock synchronization
+#### Clock synchronization
 
 The ±60-second freshness check in gossip validation (3) is evaluated against the receiver's local clock. A process whose wall-clock offset exceeds 60 seconds relative to well-synchronized peers will both (a) have its own `NodeAnnounce` messages silently rejected by those peers and (b) silently reject otherwise-valid `NodeAnnounce` from correctly synchronized peers — in either case making peers invisible in the local mesh view, with no error feedback. All processes that perform gossip validation and maintain a peer table (staked nodes and any validating clients) MUST run NTP (or an equivalent time-synchronization service) to maintain wall-clock accuracy well within this 60-second window. At startup, such a process SHOULD query an NTP server and log a warning if the measured offset exceeds 10 seconds.
 
 **Observability:** Nodes SHOULD expose a `gossip_messages_rejected_clock_skew` counter (Prometheus metric). Additionally, a node SHOULD periodically compare its own `NodeAnnounce` timestamp against timestamps in received `NodeAnnounce` messages from peers to detect relative drift. If median peer timestamps diverge from the local clock by more than 30 seconds, the node logs a warning.
 
-#### Content Discovery (DHT + Probe)
+### Content Discovery (DHT + Probe)
 
 Content discovery uses `cdn/dht/v1` as the primary mechanism (see [ADR 022](022-content-discovery.md)). `cdn/probe/v1` is used **after** the DHT lookup to confirm live availability and measure latency. When a node or client needs blob H:
 
@@ -115,11 +115,11 @@ On probe cache hit, if the selected provider no longer has the blob (evicted —
 
 **Probe cache TTL is 15 seconds** — half the 30-second slashing evidence window from ADR 005.
 
-##### Eviction hold interaction
+#### Eviction hold interaction
 
 Probe cache TTL (15s) < `probe_hold_duration` (35s), so any cached probe response used for a stream is within both the slashing window and the eviction hold period.
 
-**Probe rate limits:**
+#### Probe rate limits
 
 - **Outbound:** 3 probe batches per second per node (each batch targets the DHT-returned candidate set, typically 3–5 NodeIds). Excess cache misses queue.
 - **Inbound:** 5 probe requests per peer per second (token bucket). Excess probes silently dropped.
@@ -203,7 +203,7 @@ For new nodes with the initial reputation of 0.5 ([ADR 008](008-reputation.md)),
 
 The `max(reputation, 0.1)` clamp above only bounds the *score denominator* — it caps the worst-case multiplier at 100×, but a sufficiently cheap and close node can still produce the lowest score and win selection despite a poor reputation. Independently of that clamp, a client MAY configure a hard **minimum-reputation floor**: candidates whose `reputation` is below the floor are removed from the candidate pool *before* scoring, so price and RTT can never override a sub-floor reputation. The boundary is inclusive (a node exactly at the floor is retained); a `NaN` reputation is rejected whenever the floor is active (any comparison with `NaN` is false).
 
-The floor defaults to `0.0`, which disables filtering and preserves the pre-floor ranking behavior exactly (including the defensive negative-reputation clamp). Per-client configuration wiring is deferred until the client fetch path that consumes the selection algorithm exists; the floor is currently exposed as a selection-API parameter (issue [#441](https://github.com/decdn/decdn/issues/441)).
+The floor defaults to `0.0`, which disables filtering and preserves the pre-floor ranking behavior exactly (including the defensive negative-reputation clamp). Per-client configuration wiring is deferred until the client fetch path that consumes the selection algorithm exists; the floor is currently exposed as a selection-API parameter.
 
 #### Tie-breaking
 
@@ -236,7 +236,7 @@ This schedule is tuned for PoC with a single RPC endpoint. Production deployment
 
 ## Consequences
 
-**Positive:**
+### Positive
 
 - No external infrastructure is reachable — origin-backed nodes completely hide their backends, so no client or node can bypass the payment layer via a direct storage URL
 - All nodes share the same discovery and transport protocols. The cache-only role remains permissionless — any staked operator may pull cached blobs from authorized origins and re-serve them. The origin role is DAO-governed for all content. Registered namespaces use a per-namespace `OriginAssignment` set; unregistered content uses the DAO-maintained default-open allow-list (`OriginAssignment` keyed by `namespaceId == 0`). A permissive bootstrap window applies to default-open serving until the allow-list is first activated. See [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority), [ADR 011 § Default-open allow-list](011-content-takedown.md#default-open-allow-list), and [ADR 002 § Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces)
@@ -247,7 +247,7 @@ This schedule is tuned for PoC with a single RPC endpoint. Production deployment
 - The flat mesh is simple to reason about and easy to test at small scale (PoC is tens of nodes)
 - NodeId squatting is prevented by on-chain ed25519 ownership proof — an attacker cannot register a NodeId they do not control, and a legitimate owner can reclaim a squatted NodeId
 
-**Negative:**
+### Negative
 
 - Cold cache miss adds up to 500ms latency (probe maximum wait) vs. a pre-built content index lookup; mitigated by probe cache for repeated lookups within 15 seconds and by adaptive early exit (see Collect step above), which reduces P50 latency to ~50-100ms once the node has sufficient score history
 - Probe cache introduces a brief staleness window (up to 15s) where a node may pull from a provider that has evicted the blob; mitigated by the probe-triggered eviction hold ([ADR 005](005-protocol.md#probe-triggered-eviction-hold)), with fallback to the next cached provider, then a fresh DHT lookup + probe

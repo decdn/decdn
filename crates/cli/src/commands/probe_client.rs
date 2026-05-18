@@ -66,10 +66,19 @@ const LINGER_MAX: Duration = Duration::from_secs(2);
 /// best-effort ticket linger that follows is bounded independently
 /// (≤ `LINGER_MAX`) so capturing the ticket can't starve, nor inflate,
 /// the caller's deadline.
+///
+/// The decoded [`ProbeResponse`] is returned uncorrelated and unvalidated:
+/// the requester-side obligations — echoed `hash`/`timestamp_us`
+/// correlation (ADR 005) and the mandatory `slash_sig` shape check
+/// (`ProbeResponse::validate`, ADR 014 §1) — are the caller's, so a future
+/// node-side probe-collection loop can apply its own policy on the same
+/// transport.
+#[allow(clippy::too_many_arguments)] // transport knobs; each arg is distinct.
 pub async fn probe_once(
     endpoint: &Endpoint,
     target: EndpointAddr,
-    nonce: u64,
+    hash: [u8; 32],
+    timestamp_us: u64,
     enable_0rtt: bool,
     metrics: Option<&dyn ProbeMetrics>,
     timeout: Duration,
@@ -89,7 +98,7 @@ pub async fn probe_once(
             let conn = connecting
                 .await
                 .map_err(|e| anyhow::anyhow!("handshake failed: {e}"))?;
-            let resp = exchange(&conn, nonce).await?;
+            let resp = exchange(&conn, hash, timestamp_us).await?;
             return Ok::<_, anyhow::Error>((conn, resp));
         }
 
@@ -101,7 +110,7 @@ pub async fn probe_once(
                 let conn = connecting
                     .await
                     .map_err(|e| anyhow::anyhow!("handshake failed: {e}"))?;
-                let resp = exchange(&conn, nonce).await?;
+                let resp = exchange(&conn, hash, timestamp_us).await?;
                 Ok((conn, resp))
             }
             // Warm: a ticket exists. Send the request as early data, then
@@ -114,7 +123,7 @@ pub async fn probe_once(
                     .open_bi()
                     .await
                     .map_err(|e| anyhow::anyhow!("0-RTT open_bi failed: {e}"))?;
-                write_request(&mut send, nonce).await?;
+                write_request(&mut send, hash, timestamp_us).await?;
 
                 match zrtt
                     .handshake_completed()
@@ -125,7 +134,7 @@ pub async fn probe_once(
                         if let Some(m) = metrics {
                             m.record_0rtt_accepted();
                         }
-                        let resp = read_response(recv, nonce).await?;
+                        let resp = read_response(recv).await?;
                         Ok((conn, resp))
                     }
                     ZeroRttStatus::Rejected(conn) => {
@@ -135,7 +144,7 @@ pub async fn probe_once(
                         if let Some(m) = metrics {
                             m.record_0rtt_rejected();
                         }
-                        let resp = exchange(&conn, nonce).await?;
+                        let resp = exchange(&conn, hash, timestamp_us).await?;
                         Ok((conn, resp))
                     }
                 }
@@ -162,18 +171,26 @@ pub async fn probe_once(
 
 /// Open a fresh bidirectional stream, send the request, read the
 /// response. Used for the 1-RTT path and the 0-RTT-rejected fallback.
-async fn exchange(conn: &Connection, nonce: u64) -> anyhow::Result<ProbeResponse> {
+async fn exchange(
+    conn: &Connection,
+    hash: [u8; 32],
+    timestamp_us: u64,
+) -> anyhow::Result<ProbeResponse> {
     let (mut send, recv) = conn
         .open_bi()
         .await
         .map_err(|e| anyhow::anyhow!("open_bi failed: {e}"))?;
-    write_request(&mut send, nonce).await?;
-    read_response(recv, nonce).await
+    write_request(&mut send, hash, timestamp_us).await?;
+    read_response(recv).await
 }
 
 /// Frame and write a `ProbeMessage::Request`, then finish the send half.
-async fn write_request(send: &mut SendStream, nonce: u64) -> anyhow::Result<()> {
-    let payload = encode_message(&ProbeMessage::Request(ProbeRequest { nonce }))
+async fn write_request(
+    send: &mut SendStream,
+    hash: [u8; 32],
+    timestamp_us: u64,
+) -> anyhow::Result<()> {
+    let payload = encode_message(&ProbeMessage::Request(ProbeRequest { hash, timestamp_us }))
         .map_err(|e| anyhow::anyhow!("encode request: {e}"))?;
     write_frame(send, &payload)
         .await
@@ -183,24 +200,20 @@ async fn write_request(send: &mut SendStream, nonce: u64) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// Read one framed `ProbeMessage::Response` and verify the echoed nonce.
-async fn read_response(mut recv: RecvStream, nonce: u64) -> anyhow::Result<ProbeResponse> {
+/// Read and decode one framed `ProbeMessage::Response`. Echoed-field
+/// correlation (`hash`/`timestamp_us`) and the mandatory `slash_sig` shape
+/// check are the caller's obligation (ADR 005 / ADR 014 §1), not enforced
+/// here — see [`probe_once`].
+async fn read_response(mut recv: RecvStream) -> anyhow::Result<ProbeResponse> {
     let frame = read_frame(&mut recv)
         .await
         .map_err(|e| anyhow::anyhow!("read response: {e}"))?;
     let (msg, _rest) = decode_message::<ProbeMessage>(&frame)
         .map_err(|e| anyhow::anyhow!("decode response: {e}"))?;
-    let resp = match msg {
-        ProbeMessage::Response(r) => r,
+    match msg {
+        ProbeMessage::Response(r) => Ok(r),
         ProbeMessage::Request(_) => {
             anyhow::bail!("unexpected ProbeMessage::Request from server");
         }
-    };
-    if resp.nonce != nonce {
-        anyhow::bail!(
-            "nonce mismatch: sent 0x{nonce:016x}, received 0x{:016x}",
-            resp.nonce
-        );
     }
-    Ok(resp)
 }

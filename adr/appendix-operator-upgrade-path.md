@@ -69,7 +69,7 @@ The release ships a binary registering **both** ALPN handlers (`v1` and `v2`) on
 
 For each node in the fleet, in any order:
 
-1. **Drain** new inbound connections. The intended surface, `admin_v1_drain`, is listed in [`appendix-local-admin-http.md`](appendix-local-admin-http.md) but not yet implemented (tracked as [#244](https://github.com/decdn/decdn/issues/244)); until it ships, drain via your external load balancer (stop forwarding new connections) or block the node's QUIC port at the firewall. Either way, confirm:
+1. **Drain** new inbound connections. The intended surface, `admin_v1_drain`, is listed in [`appendix-local-admin-http.md`](appendix-local-admin-http.md) but not yet implemented; until it ships, drain via your external load balancer (stop forwarding new connections) or block the node's QUIC port at the firewall. Either way, confirm:
    - `decdn_streams_active{direction="inbound"} == 0`
    - `decdn_probe_hold_slots_used == 0` (avoids the phantom-slash window per [ADR 005 §Probe-Triggered Eviction Hold](005-protocol.md#probe-triggered-eviction-hold))
 2. **Stop** the node.

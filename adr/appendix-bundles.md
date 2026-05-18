@@ -8,7 +8,7 @@
 > [ADR 012 § File Manifests and Reconstruction](012-client.md#file-manifests-and-reconstruction))
 > remain valid for their own use cases.
 
-**Date:** 2026-05-07 — **Status:** Accepted (issue #391, `bundle create`
+**Date:** 2026-05-07 — **Status:** Accepted (`bundle create`
 ships; `bundle pull` deferred). **Touches:** `decdn` CLI, content
 publishing workflow.
 
@@ -158,5 +158,5 @@ chunked single file inside a bundled directory.
 
 - `decdn bundle pull -i <file>` and `decdn bundle pull --hash <b3>`
   are blocked on a client-side fetch primitive that does not exist
-  yet. Both checked items in issue #391's pull section will land in
+  yet. Both `bundle pull` variants will land in
   a follow-up once the fetch primitive is implemented.

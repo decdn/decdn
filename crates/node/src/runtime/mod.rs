@@ -182,6 +182,9 @@ pub async fn run(
 
     let node_metrics = Arc::new(metrics::Metrics::new());
     node_metrics.started();
+    // Registry-mandatory `decdn_probe_hold_slots_max` (ADR
+    // appendix-observability.md) — static, set once from config.
+    node_metrics.probe_hold_slots_max(cfg.cache.max_probe_holds);
 
     let secret_key = identity::load_or_generate(&cfg.identity.data_dir)?;
     tracing::info!(node_id = %secret_key.public(), "loaded node identity");
@@ -277,11 +280,33 @@ pub async fn run(
     // during the rest of startup still finds a target.
     reload_state.attach_limiter(Some(Arc::clone(&limiter)));
 
+    // SlashJudge EIP-712 domain for probe `slash_sig` (ADR 014 §1–2). The
+    // address was validated checksummed at config resolution
+    // (`parse_contract_address`), so the parse here cannot fail in practice;
+    // map the error rather than unwrap to satisfy the anti-panic policy.
+    let slash_judge_addr: alloy::primitives::Address = cfg
+        .blockchain
+        .slash_judge_address
+        .parse()
+        .with_context(|| {
+        format!(
+            "blockchain.slash_judge_address is not a valid address: {}",
+            cfg.blockchain.slash_judge_address
+        )
+    })?;
+    let slash_domain =
+        decdn_incentive::slash_judge_domain(cfg.blockchain.chain_id, slash_judge_addr);
+
     let probe_handler = Arc::new(ProbeHandler::new(
         secret_key.public(),
         reload_state.rate_per_mb(),
         Arc::clone(&node_metrics),
         Arc::clone(&limiter),
+        cache.clone(),
+        Arc::clone(&eth_signer),
+        slash_domain,
+        cfg.payment.delivery_floor,
+        cfg.payment.delivery_ceiling,
         // ADR 015 master switch. Restart-required (it changes the
         // `on_accepting` wiring): the SIGHUP path reports any
         // `[network]` change as "requires restart".
@@ -705,7 +730,15 @@ async fn load_eth_signer(cfg: &ResolvedConfig) -> anyhow::Result<PrivateKeySigne
     let signer = tokio::task::spawn_blocking(move || eth_identity::load_signer(&path, &password))
         .await
         .map_err(|e| anyhow::anyhow!("keystore decrypt task panicked: {e}"))??;
-    Ok(signer.with_chain_id(Some(eth_identity::ARBITRUM_SEPOLIA_CHAIN_ID)))
+    // Bind the signer to the *configured* chain id, not a hardcoded
+    // constant, so the signer's chain id and the `slash_sig` EIP-712 domain
+    // chain id (also `cfg.blockchain.chain_id`, see the slash domain build)
+    // can never silently diverge — e.g. on the documented mainnet move
+    // (appendix-poc-production-seams.md §Seam 8). Note: raw EIP-712
+    // `sign_hash_sync` does not consult the signer's bound chain id, so this
+    // binding only matters for any future `eth_sendTransaction` path; keeping
+    // it single-sourced is defensive against that future code.
+    Ok(signer.with_chain_id(Some(cfg.blockchain.chain_id)))
 }
 
 /// Adapter: implements `decdn_gossip::GossipMetrics` against the node's
@@ -802,7 +835,7 @@ async fn build_cache(
         };
         origins.push(backend);
     }
-    CacheEngine::open_full(
+    let engine = CacheEngine::open_full(
         &cfg.cache.cache_dir,
         origins,
         cfg.cache.max_blob_size_mb,
@@ -812,7 +845,11 @@ async fn build_cache(
         std::time::Duration::from_secs(cfg.cache.gc_interval_sec),
     )
     .await
-    .context("failed to open cache engine")
+    .context("failed to open cache engine")?;
+    // `cache.*` is restart-required (not hot-reloaded), so applying the
+    // probe-hold budget once here is sufficient (ADR 005 §Hold budget, #318).
+    engine.set_max_probe_holds(cfg.cache.max_probe_holds);
+    Ok(engine)
 }
 
 /// Translate the `decdn-common` resolved-config S3 form into the
@@ -1195,6 +1232,8 @@ mod tests {
                 payment_channel_address: "0x0000000000000000000000000000000000000001".into(),
                 staking_registry_address: "0x0000000000000000000000000000000000000002".into(),
                 rpc_watchdog_interval_sec: 30,
+                slash_judge_address: "0x0000000000000000000000000000000000000003".to_string(),
+                chain_id: decdn_common::config::DEFAULT_CHAIN_ID,
             },
             cache: decdn_common::config::ResolvedCache {
                 cache_dir,
@@ -1205,8 +1244,13 @@ mod tests {
                 origin_retry: decdn_cache::RetryPolicy::default(),
                 user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
                 gc_interval_sec: 0,
+                max_probe_holds: decdn_common::config::DEFAULT_MAX_PROBE_HOLDS,
             },
-            payment: ResolvedPayment { rate_per_mb: 10 },
+            payment: ResolvedPayment {
+                rate_per_mb: 10,
+                delivery_floor: 0,
+                delivery_ceiling: decdn_protocol::MAX_RATE_PER_MB,
+            },
             observability: ResolvedObservability {
                 log_level: decdn_common::cli::common::LogLevel::Info,
                 log_format: decdn_common::cli::common::LogFormat::Pretty,

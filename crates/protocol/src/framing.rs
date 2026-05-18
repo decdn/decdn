@@ -363,14 +363,21 @@ mod tests {
     #[tokio::test]
     async fn probe_message_full_stack_roundtrip() -> Result<(), FrameError> {
         use crate::ProbeMessage;
-        use crate::message::{ProbeRequest, ProbeResponse};
+        use crate::message::{ProbeRequest, ProbeResponse, ProbeResponseBody};
 
-        let req = ProbeMessage::Request(ProbeRequest { nonce: 0xfeed_face });
+        let req = ProbeMessage::Request(ProbeRequest {
+            hash: [5u8; 32],
+            timestamp_us: 0xfeed_face,
+        });
         let resp = ProbeMessage::Response(ProbeResponse {
-            nonce: 0xfeed_face,
-            measured_at_unix_ms: 1_700_000_000_000,
-            node_id: [3u8; 32],
-            rate_per_mb: 7,
+            body: ProbeResponseBody {
+                hash: [5u8; 32],
+                has_blob: true,
+                rate_per_mb: 7,
+                timestamp_us: 0xfeed_face,
+            },
+            total_bytes: Some(1_700_000),
+            slash_sig: vec![0x3u8; crate::SLASH_SIG_LEN],
         });
 
         for msg in [req, resp] {

@@ -350,7 +350,7 @@ All protocol messages use [postcard](https://docs.rs/postcard) — compact, no-s
 
 ## Consequences
 
-**Positive:**
+### Positive
 
 - ALPN separation means a single iroh `Endpoint` dispatches all connection types without ambiguity
 - Probing in parallel before committing means no payment channel is opened with a slow or unresponsive node
@@ -361,7 +361,7 @@ All protocol messages use [postcard](https://docs.rs/postcard) — compact, no-s
 - QUIC stream multiplexing allows concurrent blob requests to the same node without additional connection overhead — one handshake cost regardless of how many blobs are fetched
 - A shared `channel_id` across concurrent streams amortizes on-chain channel costs: one channel per (client, node) pair regardless of request volume
 
-**Negative:**
+### Negative
 
 - Probe RTT includes iroh's NAT traversal overhead on first connection, inflating the latency estimate. Reusing existing connections for probes gives a cleaner signal.
 - A node under load can respond to probes quickly but deliver slowly — probe RTT is necessary but not sufficient. Reputation (a separate system) provides the longer-term signal.

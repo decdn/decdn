@@ -33,6 +33,7 @@ region = "us"
 rpc_url = "https://sepolia-rollup.arbitrum.io/rpc"
 payment_channel_address = "0x0000000000000000000000000000000000000001"
 staking_registry_address = "0x0000000000000000000000000000000000000002"
+slash_judge_address = "0x0000000000000000000000000000000000000003"
 "#;
 
 const MISSING_RPC: &str = r#"
@@ -195,6 +196,8 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             payment_channel_address: "0x0000000000000000000000000000000000000001".to_string(),
             staking_registry_address: "0x0000000000000000000000000000000000000002".to_string(),
             rpc_watchdog_interval_sec: 30,
+            slash_judge_address: "0x0000000000000000000000000000000000000003".to_string(),
+            chain_id: decdn_common::config::DEFAULT_CHAIN_ID,
         },
         cache: ResolvedCache {
             cache_dir: PathBuf::from("/var/lib/decdn/cache"),
@@ -205,8 +208,13 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             origin_retry: decdn_cache::RetryPolicy::default(),
             user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
             gc_interval_sec: 300,
+            max_probe_holds: decdn_common::config::DEFAULT_MAX_PROBE_HOLDS,
         },
-        payment: ResolvedPayment { rate_per_mb: 10 },
+        payment: ResolvedPayment {
+            rate_per_mb: 10,
+            delivery_floor: 0,
+            delivery_ceiling: decdn_protocol::MAX_RATE_PER_MB,
+        },
         observability: ResolvedObservability {
             log_level: decdn_common::cli::common::LogLevel::Info,
             log_format: decdn_common::cli::LogFormat::Pretty,

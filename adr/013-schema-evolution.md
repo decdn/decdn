@@ -128,7 +128,7 @@ Peers deserialize `GossipEnvelope` using `take_from_bytes`. If `version != 1` (u
 
 Topic names (`cdn/global/v1`, `cdn/reputation/v1`) embed a version referring to the topic's semantic contract — its purpose, membership rules, validation semantics. `GossipEnvelope.version` handles wire format evolution independently. A topic name version bump (e.g., `cdn/global/v2`) is the gossip equivalent of a major ALPN bump and requires dual-subscription during transition.
 
-**Rule for choosing between envelope evolution and topic bump:**
+##### Rule for choosing between envelope evolution and topic bump
 
 - *Payload-shape changes* — new optional fields, new `GossipPayload` enum variants, additional unsigned outer fields → **envelope evolution**. Bump `GossipEnvelope.version` only if the envelope wire format itself changes; otherwise append to `GossipPayload` (Tier 2) or extend an inner message via the `Body` + outer fields pattern (Tier 1). The topic name does **not** change; no dual-subscription cost. Old peers safely ignore unknown payload variants per the [Deserialization rule](#deserialization-rule).
 - *Topic-level changes* — who may publish, what registry/membership rule applies, what validation semantics gate acceptance, the topic's purpose → **topic name bump** (`cdn/global/v2`) with dual-subscription during the [Deprecation Timeline](#deprecation-timeline). Envelope-version evolution cannot express these because they alter the topic's trust contract; an old subscriber would accept messages under semantics it no longer enforces.
@@ -257,7 +257,7 @@ This formalizes the pattern already used for `ethereum_address`, `binding_signat
 
 > ADR 010 (multi-token, post-PoC) specifies `payment_token: Address` as a required field. Because postcard encodes structs positionally, appending a field to an already-in-use `StreamRequestExt` breaks compatibility for senders that already include extension bytes. Multi-token support therefore requires either a Tier 3 / major `cdn/client` version bump or a new trailing extension container (e.g., `StreamRequestExt2`), not extending `StreamRequestExt` in place.
 
-**Example — adding `supported_versions` to `NodeAnnounce`:**
+##### Example — adding `supported_versions` to `NodeAnnounce`
 
 ```rust
 #[derive(Serialize, Deserialize)]
@@ -294,7 +294,7 @@ Append a new variant to the protocol enum. Old peers encountering an unknown var
 - The new message type MUST be non-critical for peers that do not understand it. If the message is required for protocol correctness, it is a major change.
 - For QUIC protocols, the sender SHOULD be prepared for the receiver to close the stream with `UNSUPPORTED_MESSAGE` and fall back to behavior that does not require the new message type.
 
-**Example — adding a `Ping`/`Pong` keepalive to the delivery protocol:**
+##### Example — adding a `Ping`/`Pong` keepalive to the delivery protocol
 
 ```rust
 enum ClientMessage {
@@ -439,7 +439,7 @@ Additional application error codes defined by other ADRs are unaffected. The cod
 
 ## Consequences
 
-**Positive:**
+### Positive
 
 - Formalizes the optional-trailing-fields pattern from [ADR 005](005-protocol.md) as a standard, repeatable mechanism — no longer a one-time workaround
 - Length-prefixed framing enables forward-compatible deserialization: receivers skip unknown trailing bytes without connection failure
@@ -451,7 +451,7 @@ Additional application error codes defined by other ADRs are unaffected. The cod
 - The signed body / unsigned outer fields pattern enables minor evolution of messages that currently sign all fields, without an ALPN bump
 - All conventions are defined before v1 implementation — no migration cost
 
-**Negative:**
+### Negative
 
 - Varint length prefix adds 1–5 bytes per message. For `ChunkData` (1024-byte payload), ~0.2% including the enum discriminant; for `ProbeRequest` (~40 bytes), ~5%. Both negligible
 - `take_from_bytes` is marginally slower than `from_bytes` (tracks consumed position); negligible for this protocol's message sizes (sub-microsecond)

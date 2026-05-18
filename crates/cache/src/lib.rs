@@ -13,6 +13,7 @@ pub mod engine;
 pub mod error;
 pub mod metrics;
 pub mod origin;
+pub mod probe_hold;
 pub mod retry;
 
 pub use engine::{
@@ -24,5 +25,9 @@ pub use metrics::CacheMetrics;
 pub use origin::{
     DEFAULT_USER_AGENT, DecompressMode, FilesystemOrigin, HttpOrigin, Origin, OriginFetch,
     OriginKind, OriginUrl, S3Credentials, S3Origin, S3OriginConfig, parse_origin_url,
+};
+pub use probe_hold::{
+    DEFAULT_MAX_PROBE_HOLDS, PROBE_HOLD_DURATION, PROBE_HOLD_MARGIN, PROBE_SLASH_WINDOW,
+    ProbeHoldOutcome,
 };
 pub use retry::RetryPolicy;

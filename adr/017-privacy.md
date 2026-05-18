@@ -205,7 +205,7 @@ Compromising `server_secret` exposes all past and future epoch keys until rotati
 
 ## Consequences
 
-**Positive:**
+### Positive
 
 - Single reference for the protocol's privacy posture, enabling informed tradeoffs before implementation
 - Explicit disposition for every privacy surface prevents implicit acceptance of unanalyzed risks
@@ -213,7 +213,7 @@ Compromising `server_secret` exposes all past and future epoch keys until rotati
 - Adversary-tier framing maps threats to real-world actors, avoiding over- or under-engineering
 - Documents fundamental protocol limitations (delivering node must know the hash) versus implementation choices (NodeId rotation cadence, RPC provider trust)
 
-**Negative:**
+### Negative
 
 - Must be kept in sync as other ADRs evolve — any new protocol feature or gossip message must be evaluated against §2
 - Some "accept" dispositions may need revisiting as the threat landscape or regulatory requirements change, or the network scales beyond PoC

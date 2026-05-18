@@ -6,7 +6,7 @@
 
 ## Context
 
-[ADR 001 § Node Discovery (Gossip)](001-network.md#node-discovery-gossip) defines the peer table (`NodeId → NodeAnnounce`) and the five gossip-validation rules that gate insertion (signature, on-chain stake, ±60 s clock skew, monotonic `timestamp_us`, region format). It does **not** specify when entries leave the table. Issue [#401](https://github.com/decdn/decdn/issues/401) (split from the broader [#190](https://github.com/decdn/decdn/issues/190) gap-10 audit) tracks the missing decisions:
+[ADR 001 § Node Discovery (Gossip)](001-network.md#node-discovery-gossip) defines the peer table (`NodeId → NodeAnnounce`) and the five gossip-validation rules that gate insertion (signature, on-chain stake, ±60 s clock skew, monotonic `timestamp_us`, region format). It does **not** specify when entries leave the table. This appendix resolves the missing decisions:
 
 1. **Size cap and eviction order** — should a long-running node bound the table, and if so how is the victim chosen (LRU? oldest-timestamp? lowest-reputation?)
 2. **Age-based expiry** — independent of size pressure, when does a quiet entry get removed
@@ -102,14 +102,14 @@ A sustained non-zero `decdn_gossip_messages_rejected_total{reason="table_full"}`
 
 ## Consequences
 
-**Positive.**
+### Positive
 
 - Memory bound is set by external policy (the staking registry) without per-table bookkeeping. At realistic scales (≤ 10 k nodes) the table is < 5 MB.
 - Active eviction on deregistration / blacklisting keeps admin output and gossip-derived analytics accurate within one event-handler turn instead of ~10 minutes.
 - Discovery and selection stay separable. Reputation, blacklist, and registry inputs each have a single clear role; no new coupling.
 - The implementation already matches §1 — no code change ships this appendix's TTL behavior. §3 adds a single map-removal step inside the registry-cache subscriber introduced by [ADR 019 § Step 3.3](019-node-onboarding.md#step-33--build-initial-peer-table-from-on-chain-registry) (subscriber not yet implemented). §6 adds two counters and one label value. §2's `max_peer_entries` is opt-in.
 
-**Negative.**
+### Negative
 
 - TTL 600 s on a 60 s announce interval means an offline peer stays discoverable but unreachable for up to ~10 minutes. Probe + DHT route around it (the peer table is not consulted during selection); the `EvictedSinceProbe` handling in [ADR 001 § Content Discovery](001-network.md#content-discovery-dht--probe) covers the corresponding blob-eviction case. Operators concerned about stale visibility can lower `peer_ttl_sec` toward the §1 minimum.
 - Without `max_peer_entries` set, a registry-validation regression admitting unstaked `node_id`s could allow unbounded growth. `decdn_peer_table_size` is the early-warning signal; operators tracking it can set the ceiling reactively.

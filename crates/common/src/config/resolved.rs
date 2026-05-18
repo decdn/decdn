@@ -46,6 +46,12 @@ pub struct ResolvedBlockchain {
     pub payment_channel_address: String,
     /// `StakingRegistry` contract address.
     pub staking_registry_address: String,
+    /// `SlashJudge` contract address — the EIP-712 `verifyingContract` for
+    /// `slash_sig` signatures (ADR 014). Required (no default).
+    pub slash_judge_address: String,
+    /// EIP-712 `chainId` for the `slash_sig` domain separator. Defaults to
+    /// [`super::DEFAULT_CHAIN_ID`] (Arbitrum Sepolia) when unset.
+    pub chain_id: u64,
     /// Seconds between RPC connectivity watchdog probes. `0` disables the
     /// watchdog entirely; otherwise the resolver enforces a minimum (see
     /// `MIN_RPC_WATCHDOG_INTERVAL_SEC`).
@@ -102,6 +108,11 @@ pub struct ResolvedCache {
     /// [`crate::config::DEFAULT_GC_INTERVAL_SEC`] when the TOML section
     /// omits the field.
     pub gc_interval_sec: u64,
+    /// Maximum number of concurrently held (eviction-exempt) blobs for the
+    /// probe-triggered hold (ADR 005 §Hold budget, #318). Default
+    /// [`crate::config::DEFAULT_MAX_PROBE_HOLDS`]; `0` disables
+    /// `has_blob: true`.
+    pub max_probe_holds: usize,
 }
 
 /// Resolved + validated origin backend selection (#437). Mirrors
@@ -215,6 +226,15 @@ pub enum ResolvedS3Credentials {
 pub struct ResolvedPayment {
     /// Rate per MB in USDC base units (6 decimals).
     pub rate_per_mb: u64,
+    /// Lower clamp bound applied to `rate_per_mb` before signing a
+    /// `ProbeResponse` (ADR 005 §Rate bounds validation). PoC-local
+    /// stand-in for on-chain `getRateBounds().deliveryFloor`; default `0`.
+    pub delivery_floor: u64,
+    /// Upper clamp bound applied to `rate_per_mb` before signing a
+    /// `ProbeResponse`. PoC-local stand-in for
+    /// `getRateBounds().deliveryCeiling`; default
+    /// [`decdn_protocol::MAX_RATE_PER_MB`].
+    pub delivery_ceiling: u64,
 }
 
 /// Resolved gossip fields (ADR 001).

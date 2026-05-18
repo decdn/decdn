@@ -107,6 +107,35 @@ pub struct DecdnMetrics {
     /// ceiling. Operator-visible name:
     /// `decdn_quic_session_ticket_peers_dropped_total`.
     pub quic_session_ticket_peers_dropped: Counter,
+    /// `decdn_probe_hold_violations_total` per the canonical metric registry
+    /// (`adr/appendix-observability.md` — the authoritative naming source,
+    /// superseding informal ADR-005 references). The registry's alert
+    /// remediation for this counter is "reduce load or increase
+    /// `max_probe_holds`", i.e. it is the budget-pressure signal: this code
+    /// increments it when the blob is present but the
+    /// [`crate::handlers::probe`] hold could not be guaranteed (budget
+    /// exhausted), so the node answers `has_blob: false`. That is an
+    /// availability degradation, never a safety fault — the node loses
+    /// revenue but never signs a phantom announcement (the hold mechanism
+    /// makes the registry's literal "evicted after signing `has_blob:true`"
+    /// case unreachable by construction, so this counter surfaces the
+    /// budget-pressure cause the operator can actually act on).
+    pub probe_hold_violations: Counter,
+    /// `decdn_probe_hold_slots_used` (registry): current active
+    /// probe-triggered eviction holds (distinct held blobs), ADR 005
+    /// §Probe-triggered eviction hold. Sampled from the cache engine on
+    /// each probe; pair with `probe_hold_slots_max` for a saturation ratio.
+    pub probe_hold_slots_used: Gauge,
+    /// `decdn_probe_hold_slots_max` (registry, mandatory): the configured
+    /// `max_probe_holds` budget. Set once at startup. Pairs with
+    /// `probe_hold_slots_used` so dashboards can alert on a saturation
+    /// ratio rather than an absolute count.
+    pub probe_hold_slots_max: Gauge,
+    /// Times the node clamped `rate_per_mb` to the configured delivery
+    /// bounds before signing a `ProbeResponse` (ADR 005 §Rate bounds
+    /// validation). Operator-visible name:
+    /// `decdn_rate_bounds_clamp_events_total`.
+    pub rate_bounds_clamp_events: Counter,
 }
 
 /// Self-imposed cap on the distinct-peer tracking set (and hence the
@@ -193,6 +222,34 @@ impl Metrics {
 
     pub fn probe_request(&self) {
         self.decdn.probe_requests.inc();
+    }
+
+    /// A probe answered `has_blob: false` despite the bytes being present,
+    /// because the eviction hold could not be guaranteed (ADR 005 §Hold
+    /// budget).
+    pub fn probe_hold_violation(&self) {
+        self.decdn.probe_hold_violations.inc();
+    }
+
+    /// Publish the current count of active probe holds (ADR 005).
+    pub fn probe_hold_slots(&self, used: usize) {
+        self.decdn
+            .probe_hold_slots_used
+            .set(i64::try_from(used).unwrap_or(i64::MAX));
+    }
+
+    /// Publish the configured `max_probe_holds` budget (registry-mandatory
+    /// `decdn_probe_hold_slots_max`). Called once at runtime bring-up.
+    pub fn probe_hold_slots_max(&self, max: usize) {
+        self.decdn
+            .probe_hold_slots_max
+            .set(i64::try_from(max).unwrap_or(i64::MAX));
+    }
+
+    /// The node clamped `rate_per_mb` to the configured delivery bounds
+    /// before signing (ADR 005 §Rate bounds validation).
+    pub fn rate_bounds_clamped(&self) {
+        self.decdn.rate_bounds_clamp_events.inc();
     }
 
     pub fn connection_opened(&self) {

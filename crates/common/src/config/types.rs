@@ -67,6 +67,16 @@ pub struct BlockchainConfig {
     pub payment_channel_address: Option<String>,
     /// `StakingRegistry` contract address.
     pub staking_registry_address: Option<String>,
+    /// `SlashJudge` contract address — the EIP-712 `verifyingContract` for
+    /// `ProbeResponse` / `StreamResponse` `slash_sig` signatures (ADR 014
+    /// §1–2). Required: a wrong/zero address silently produces signatures no
+    /// verifier accepts, so resolution fails fast when it is missing rather
+    /// than defaulting.
+    pub slash_judge_address: Option<String>,
+    /// EIP-712 `chainId` bound into every `slash_sig` domain separator.
+    /// Absent => [`super::DEFAULT_CHAIN_ID`] (Arbitrum Sepolia, the `PoC`
+    /// testnet target — matches the chain id bound on the runtime signer).
+    pub chain_id: Option<u64>,
     /// Seconds between RPC connectivity watchdog probes. `0` disables the
     /// watchdog entirely; absent => default (30s). Non-zero values below
     /// `MIN_RPC_WATCHDOG_INTERVAL_SEC` are rejected at config resolution.
@@ -180,6 +190,16 @@ pub struct CacheConfig {
     /// hostile-origin amplification window at the cost of more
     /// list+sweep CPU per minute.
     pub gc_interval_sec: Option<u64>,
+    /// Maximum number of concurrently held (eviction-exempt) blobs for the
+    /// probe-triggered hold (ADR 005 §Hold budget, #318). Holds are
+    /// per-blob: multiple peers probing the same hash share one slot. When
+    /// the budget is exhausted, additional probes for unheld blobs receive
+    /// `has_blob: false` rather than risk a phantom-announcement slash.
+    /// Absent => [`crate::config::DEFAULT_MAX_PROBE_HOLDS`] (256). `0`
+    /// disables `has_blob: true` entirely (every probe answers false).
+    /// Operators with small caches SHOULD set this to ≤25% of cache
+    /// capacity.
+    pub max_probe_holds: Option<u64>,
 }
 
 /// Origin backend selection (#437). Tagged on the inner `kind` field.
@@ -359,6 +379,17 @@ pub enum S3Credentials {
 pub struct PaymentConfig {
     /// Rate per MB in USDC base units.
     pub rate_per_mb: Option<u64>,
+    /// Lower bound the node clamps `rate_per_mb` to before signing a
+    /// `ProbeResponse` (ADR 005 §Rate bounds validation). PoC-local
+    /// stand-in for the on-chain `getRateBounds().deliveryFloor`. Absent =>
+    /// `0` (no floor; current behavior unchanged).
+    pub delivery_floor: Option<u64>,
+    /// Upper bound the node clamps `rate_per_mb` to before signing a
+    /// `ProbeResponse` (ADR 005 §Rate bounds validation). PoC-local
+    /// stand-in for the on-chain `getRateBounds().deliveryCeiling`. Absent
+    /// => [`decdn_protocol::MAX_RATE_PER_MB`] (no effective ceiling;
+    /// current behavior unchanged).
+    pub delivery_ceiling: Option<u64>,
 }
 
 /// Gossip section of the config file (ADR 001).
