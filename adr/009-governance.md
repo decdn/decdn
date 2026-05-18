@@ -7,7 +7,7 @@
 
 [ADR 026](026-gauge-boost-tokenomics.md) introduces three tokenomics primitives that this ADR depends on: a `VotingEscrow` contract (vote-escrowed TOKEN with linear decay), a six-bucket `FeeRouter` whose share parameters are governable within hard-coded bounds, and a `SafetyReserve` contract whose payouts are gated by governance-authorized rules. These are the economic primitives the production governance model assumes.
 
-Governance — how protocol parameters are changed, who can change them, and what safety mechanisms exist — is a separate concern. The governance contracts (`DecdnGovernor`, `TimelockController`) ship in the day-one single-audit-pass surface ([ADR 016 § Contract Inventory](016-contract-interactions.md)); what differs by phase is the governance *process*, not the contract surface. In the PoC, parameters are changed through a single admin key; the production process (ve-weighted voting, emergency multisig, parameter safety bounds, and SafetyReserve payout authorization) is what this ADR specifies.
+Governance — how protocol parameters are changed, who can change them, and what safety mechanisms exist — is a separate concern. The governance contracts (`DecdnGovernor`, `TimelockController`) ship in the day-one single-audit-pass surface ([ADR 016 § Contract Inventory](016-contract-interactions.md#1-contract-inventory)); what differs by phase is the governance *process*, not the contract surface. In the PoC, parameters are changed through a single admin key; the production process (ve-weighted voting, emergency multisig, parameter safety bounds, and SafetyReserve payout authorization) is what this ADR specifies.
 
 This ADR covers:
 
