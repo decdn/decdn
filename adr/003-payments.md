@@ -318,7 +318,7 @@ Required invariant: a node MUST persist `(last_nonce, last_amount, last_bytes_de
 
 A failed persist write MUST surface as a voucher-acceptance failure — the node returns a transient-failure rejection through the [Off-chain Voucher Rejections (Wire Encoding)](#off-chain-voucher-rejections-wire-encoding) channel, and MUST NOT send `VoucherAck`. The specific wire code for transient persistence failures is left to the `cdn/client/v1` handler implementation; the existing `StaleNonce` / `InsufficientDeposit` codes are NOT appropriate substitutes because they would tell the client to refresh state or top up the deposit when in fact the same voucher should be retried unchanged. Persisting after acknowledgement re-opens the same replay window for the crash interval between the two writes.
 
-Storage backend and trait shape are implementation concerns; the Rust implementation exposes a `ChannelStateStore` seam in `crates/incentive` with a `redb`-backed persistent implementation in `crates/node` (per the leaf-crate convention in [appendix-poc-production-seams.md §1](appendix-poc-production-seams.md#1-keystore--cratesincentive)). The protocol fixes only the ordering above.
+Storage backend and trait shape are implementation concerns; the Rust implementation exposes a `ChannelStateStore` seam in `crates/incentive` with a `redb`-backed persistent implementation in `crates/node` (per the leaf-crate convention in [appendix-poc-production-seams.md](appendix-poc-production-seams.md)). The protocol fixes only the ordering above.
 
 ## Contract Interfaces
 
@@ -470,7 +470,7 @@ All events use indexed `channelId` plus an indexed actor field where applicable.
 | `deliveryFloor` | $0.000001/MB | 1 | Anti-abuse minimum; 10× below expected market rate. Prevents zero-rate free-riding while imposing no practical constraint on legitimate pricing. Nodes are expected to set rates well above this floor; the floor is purely an anti-zero safeguard, not a recommended price. |
 | `deliveryCeiling` | $0.001/MB | 1,000 | 100× expected market rate. Accommodates origin-backed nodes with high-egress backends (e.g., S3 at $0.09/GB) while remaining well above any legitimate pricing scenario ($1.00/GB vs Akamai's ~$0.12–0.20/GB). |
 
-The expected market rate is $0.00001/MB (10 USDC base units per MB, or $0.01/GB). This positions deCDN ~4–9× cheaper than major traditional CDNs (CloudFront at $0.085/GB, KeyCDN at $0.04/GB) and at parity with budget providers (Bunny.net at $0.01/GB). Both bounds are governable post-PoC within the hardcoded safety constraints above.
+The expected market rate is $0.00001/MB (10 USDC base units per MB, or $0.01/GB). This positions deCDN ~4–9× cheaper than major traditional CDNs (CloudFront at $0.085/GB, KeyCDN at $0.04/GB) and at parity with budget providers (Bunny.net at $0.01/GB). Both bounds are governance-tunable from day one within the hardcoded safety constraints above — admin-key-gated in the PoC, ve-Governor in production (see [ADR 009](009-governance.md)).
 
 ### Rate Bounds Refresh
 
