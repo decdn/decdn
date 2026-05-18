@@ -51,7 +51,7 @@ If both keys must rotate, rotate the **iroh key first** (cheap, atomic on-chain,
 | Survives rotation | Reason |
 |-------------------|--------|
 | Stake, ve-locks, gauge-claim history | Keyed by Ethereum address ([ADR 026](026-gauge-boost-tokenomics.md)) |
-| Open payment channels (inbound from clients) | Channel ID `keccak256(client_eth, operator_eth, nonce[, token])` ([ADR 003](003-payments.md), [ADR 010](010-multi-token.md)); Ethereum address unchanged |
+| Open payment channels (inbound from clients) | Channel ID `keccak256(client_eth, operator_eth, token, nonce)` ([ADR 003](003-payments.md)); Ethereum address unchanged |
 | `firstRegisteredAt` | Cleared only by `deregisterNode`; `bindNodeId` does not touch it ([ADR 019 §Re-Onboarding](019-node-onboarding.md#re-onboarding-after-deregistration-or-auto-ejection)) |
 
 ### What does not carry over
@@ -110,7 +110,7 @@ Procedure:
 4. **Wait** the full unbonding period (default 7d, minimum 3d governable). Stake remains slashable here — do not relax monitoring.
 5. **`StakingRegistry.withdraw()`** to the old address.
 6. **Generate** the new EOA. Fund it with TOKEN (transfer from old, or from treasury) and a small ETH float for gas.
-7. **Keep the old EVM keystore reachable until your last open outbound channel settles or expires.** Vouchers are *client*-signed ([ADR 003](003-payments.md)); as node-operator-as-client (cache-miss pulls upstream) you hold signed vouchers under the old address, and the upstream counterparty may submit your latest voucher via `closeChannel`, triggering the 48h dispute window. Channels live up to `maxChannelDuration` (default 90 days per [ADR 010](010-multi-token.md)). As provider you do not sign vouchers, so inbound channels carry no key-side liability post-deregistration.
+7. **Keep the old EVM keystore reachable until your last open outbound channel settles or expires.** Vouchers are *client*-signed ([ADR 003](003-payments.md)); as node-operator-as-client (cache-miss pulls upstream) you hold signed vouchers under the old address, and the upstream counterparty may submit your latest voucher via `closeChannel`, triggering the 48h dispute window. Channels live up to `maxChannelDuration` (default 90 days per [ADR 003](003-payments.md)). As provider you do not sign vouchers, so inbound channels carry no key-side liability post-deregistration.
 8. **Re-stake from the new address with a fresh NodeId.** `TOKEN.approve` → `StakingRegistry.stake` → atomic `registerNode(newNodeId, multiaddrs, regionHint, bindingSignature, ed25519Signature)` (see [ADR 019](019-node-onboarding.md) §Phase 2 — On-chain Setup). **Reusing the original NodeId is not possible** without a separate `bindNodeId` on the *old* address before deregister: `deregisterNode` only sets `active = false` and increments `registrationNonce`, and does **not** clear `nodeIdToAddress[originalNodeId]` ([ADR 001](001-network.md) §340–342, [ADR 003](003-payments.md#nodeid-to-ethereum-binding)), so a fresh address calling `registerNode(originalNodeId, …)` reverts `"NodeId bound to another address"`. To reuse it (e.g., reputation continuity), chain §1 → §2.1: §1's `bindNodeId` to a temporary NodeId clears the original mapping, then §2.1 re-registers it from the new address.
 9. **Restart** the node with config pointing at the new EVM keystore. Confirm `/health` reports `ready` and `decdn_channel_deposit_usdc` is zero (no channels yet).
 10. **Re-open outbound channels** as needed for cache-miss pulls — no carry-over.

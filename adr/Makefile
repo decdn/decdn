@@ -52,7 +52,7 @@ BOOK_SRCS := \
   _build/part-2-discovery.md \
   022-content-discovery.md 015-zero-rtt.md \
   _build/part-3-payments.md \
-  003-payments.md 010-multi-token.md 012-client.md 024-account-abstraction.md \
+  003-payments.md 012-client.md 024-account-abstraction.md \
   _build/part-4-tokenomics.md \
   026-gauge-boost-tokenomics.md 018-liquidity-strategy.md \
   _build/part-5-verification.md \

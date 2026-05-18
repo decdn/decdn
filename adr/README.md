@@ -1,13 +1,13 @@
 # deCDN — Protocol Specification
 
-A decentralized CDN. Nodes cache and serve content-addressed blobs over iroh QUIC; clients pay per-MB via off-chain USDC payment channels with on-chain settlement; staked operators compete on price and latency, with reputation, slashing, and gauge-weighted incentives keeping the mesh honest.
+A decentralized CDN. Nodes cache and serve content-addressed blobs over iroh QUIC; clients pay per-MB via off-chain stablecoin payment channels (USDC at launch) with on-chain settlement; staked operators compete on price and latency, with reputation, slashing, and gauge-weighted incentives keeping the mesh honest.
 
 This directory is the protocol's canonical specification. Each numbered file is an Architecture Decision Record (ADR) covering one component or invariant of the design. [`architecture.md`](architecture.md) is the living overview — system diagram, ADR-by-ADR summaries, key invariants, trust assumptions, and the canonical reading order.
 
 ## Design principles
 
 - **Content-addressed, location-independent.** Every blob is identified by its BLAKE3 hash. Delivery verification is inherent: the receiver hashes received bytes and rejects mismatches. Nodes are interchangeable as long as the hash matches.
-- **Paid byte delivery, end to end.** Every byte transferred — client→node *and* node→node — is paid. There is no free-rider tier and no unpaid relay layer. Off-chain payment channels (USDC, with multi-token allowlist post-PoC) settle on-chain.
+- **Paid byte delivery, end to end.** Every byte transferred — client→node *and* node→node — is paid. There is no free-rider tier and no unpaid relay layer. Off-chain payment channels (governance-allowlisted stablecoins, USDC at launch) settle on-chain.
 - **Stake to participate, slash on misbehavior.** Nodes must stake TOKEN before joining the mesh. Misbehavior (phantom announcements, rate manipulation, corruption, blacklist violation) is detectable on-chain and slashable. Challenge bonds prevent zero-cost griefing.
 - **Origin storage is opaque.** Origin-backed nodes hold canonical content in S3/R2/B2/NFS/local-disk backends, but no external origin URL is ever exposed. Bypassing the payment layer requires bypassing the network entirely.
 - **Operator return is differentiated by long-term commitment, not raw stake.** Curve-style gauge-boost via opt-in `VotingEscrow` rewards operators who lock TOKEN for longer periods, instead of a regressive stake-multiple fee discount.
@@ -19,7 +19,7 @@ For first-time readers, follow this thematic order rather than the numeric one. 
 
 1. **Foundations** — language stack, network topology, content addressing, wire protocol.
 2. **Discovery** — DHT-based content lookup, QUIC 0-RTT.
-3. **Payments** — channels, vouchers, multi-token allowlist, client architecture, smart-wallet support.
+3. **Payments** — channels, vouchers, stablecoin allowlist, client architecture, smart-wallet support.
 4. **Tokenomics & incentives** — gauge-boost tokenomics, liquidity strategy, deferred follow-ups.
 5. **Verification & enforcement** — on-chain slashing evidence, reputation, content takedown.
 6. **Governance & contracts** — Governor + Timelock model, contract interaction map.

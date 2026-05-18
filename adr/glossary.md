@@ -19,7 +19,7 @@ Terms used across multiple ADRs without inline definition.
 
 | Term | Definition |
 | --- | --- |
-| **Channel** | An off-chain payment channel between a client and a node. Funded with USDC (or a governance-approved ERC-20 in production), settled on-chain after the dispute window — see [ADR 003](003-payments.md). |
+| **Channel** | An off-chain payment channel between a client and a node. Funded with a governance-allowlisted stablecoin (USDC at launch), settled on-chain after the dispute window — see [ADR 003](003-payments.md). |
 | **Voucher** | A signed off-chain payment message: `{channelId, amount, nonce, token, signature}`. The bearer instrument for per-MB payments. |
 | **TOKEN** | The protocol's native fixed-supply (1B) ERC-20. Used for staking, governance, gauge-boost, and slashing — see [ADR 026](026-gauge-boost-tokenomics.md). |
 | **USDC** | The payment-and-settlement currency. All channel deposits, fee distribution, and the externally-raised pre-seed pool are USDC-denominated — see [ADR 003](003-payments.md), [ADR 026](026-gauge-boost-tokenomics.md). |

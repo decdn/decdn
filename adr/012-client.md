@@ -214,7 +214,7 @@ probe_cache_max_entries = 1024               # per ADR 001
 probe_cache_ttl_secs = 15                    # per ADR 001
 
 [payment]
-default_token = "USDC"                       # per ADR 010
+default_token = "USDC"                       # per ADR 003 (allowlisted stablecoin; USDC at launch)
 voucher_interval_mb = 1                      # per ADR 003
 ```
 

@@ -8,7 +8,7 @@ Decentralized CDN (deCDN) — nodes cache and serve content-addressed blobs over
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for build commands, ADR conventions, pre-commit hooks, and development environment setup.
 
-**ADR note:** Next ADR number is 033. File naming: `NNN-topic.md` (zero-padded 3-digit prefix). Always verify by checking `adr/` for the highest number before creating a new ADR. (032 is canonical (`032-safety-reserve-appeals-contract.md`, #524); 031 is canonical (`031-content-blacklist-appeals-contract.md`); 030 is canonical (`030-node-region-self-attestation.md`, #400). 029 was canonical but reclassified as `appendix-peer-table-eviction.md`; do not reuse 029. 027 was canonical (Distinct-Client Diversity Gating / Delivery Receipts) but deleted when its content collapsed into ADR 026 §3 per-operator gauge-share cap; do not reuse 027.)
+**ADR note:** Next ADR number is 033. File naming: `NNN-topic.md` (zero-padded 3-digit prefix). Always verify by checking `adr/` for the highest number before creating a new ADR. (032 is canonical (`032-safety-reserve-appeals-contract.md`, #524); 031 is canonical (`031-content-blacklist-appeals-contract.md`); 030 is canonical (`030-node-region-self-attestation.md`, #400). 029 was canonical but reclassified as `appendix-peer-table-eviction.md`; do not reuse 029. 027 was canonical (Distinct-Client Diversity Gating / Delivery Receipts) but deleted when its content collapsed into ADR 026 §3 per-operator gauge-share cap; do not reuse 027. 010 was canonical (Multi-Token Payment Support) but deleted when its surviving surface folded into ADR 003 (governance stablecoin allowlist, multi-stablecoin from day 1) and the separate multi-token `PaymentChannel` was dropped; do not reuse 010.)
 
 ## Common Commands
 
