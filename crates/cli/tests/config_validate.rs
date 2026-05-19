@@ -129,6 +129,14 @@ fn validate_fails_when_config_flag_points_at_missing_file() -> anyhow::Result<()
         msg.contains("does-not-exist.toml"),
         "error should name the missing file: {msg}"
     );
+    // `load_file_config` stays fail-fast: a file that never parsed has
+    // nothing to accumulate, so the error must NOT be wrapped in the
+    // aggregate `configuration has N problem(s):` header (issue #222
+    // boundary). Locks the fail-fast/accumulate split.
+    anyhow::ensure!(
+        !msg.contains("problem(s):"),
+        "file-load failure must not be wrapped in the aggregate header: {msg}"
+    );
     Ok(())
 }
 

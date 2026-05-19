@@ -5,9 +5,24 @@
 //! [`ConfigErrorBag`] collects every problem found in a single resolution
 //! pass so the whole list is reported at once.
 //!
-//! The bag preserves each fail-fast resolver's original message text
-//! verbatim (as a bullet under a dotted field label), so existing
-//! `.contains("substring")` assertions keep matching.
+//! The bag preserves each fail-fast resolver's original message text under
+//! a dotted field label: single-line messages verbatim, multi-line messages
+//! with their continuation lines indented (see [`ConfigErrorBag::into_result`]).
+//! All current messages are single-line — anyhow's `{e:#}` joins context with
+//! `": "`, not newlines — so existing `.contains("substring")` assertions keep
+//! matching.
+
+/// Field labels that participate in a `has_field` cascade-suppression guard.
+///
+/// These are the only labels whose exact string is load-bearing for
+/// *correctness* (a producing-site `push`/`try_with` and a guarding-site
+/// `has_field` must agree byte-for-byte, ~200 lines apart, or the misleading
+/// cascade error issue #222 was meant to kill silently reappears). Naming
+/// them as constants makes that coupling refactor-safe. The other ~60
+/// non-guarded labels stay inline literals — they only appear in operator
+/// output, never in a guard.
+pub(crate) const IDENTITY_REGION: &str = "identity.region";
+pub(crate) const IDENTITY_DATA_DIR: &str = "identity.data_dir";
 
 /// One resolved-config problem: a dotted field label (`blockchain.rpc_url`)
 /// plus the verbatim message the fail-fast resolver used to return.
@@ -106,8 +121,10 @@ impl ConfigErrorBag {
 
     /// Collapse the bag into a single `anyhow::Error` listing every problem
     /// as a `  - <field>: <message>` bullet, or `Ok(())` when empty. Each
-    /// original message appears verbatim so existing substring assertions
-    /// keep matching.
+    /// message is reproduced unchanged except that continuation lines of a
+    /// multi-line message are indented to stay under their bullet; single-line
+    /// messages (all current ones) are verbatim, so existing substring
+    /// assertions keep matching.
     pub(crate) fn into_result(self) -> anyhow::Result<()> {
         if self.problems.is_empty() {
             return Ok(());

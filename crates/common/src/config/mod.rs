@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use alloy::primitives::Address;
 use anyhow::Context;
 
-use errors::{ConfigErrorBag, one_section};
+use errors::{ConfigErrorBag, IDENTITY_DATA_DIR, IDENTITY_REGION, one_section};
 
 use crate::cli::common::{self, expand_tilde};
 use crate::cli::run::RunArgs;
@@ -126,7 +126,7 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
     // must not also fire (see `ensure_region_when_publishing_global_into`).
     // A data_dir we could not determine becomes a placeholder — skip the
     // keystore existence check that would otherwise spuriously fail on it.
-    let data_dir_valid = !bag.has_field("identity.data_dir");
+    let data_dir_valid = !bag.has_field(IDENTITY_DATA_DIR);
     let network = resolve_network(&cli.network, file.network.as_ref());
     let blockchain = resolve_blockchain_into(
         &cli.blockchain,
@@ -191,12 +191,12 @@ fn ensure_region_when_publishing_global_into(
     // `identity.region`. Reporting "region must be set when subscribe_global
     // is true" on top of it would be misleading double-counting — they set
     // it, it was just malformed. Suppress the cascade.
-    if bag.has_field("identity.region") {
+    if bag.has_field(IDENTITY_REGION) {
         return;
     }
     bag.check(
         identity.region.is_some() || !gossip.subscribe_global,
-        "identity.region",
+        IDENTITY_REGION,
         "identity.region must be set when gossip.subscribe_global is true \
          (it signs every NodeAnnounce); set identity.region or disable the \
          global topic by setting gossip.subscribe_global = false",
@@ -332,7 +332,7 @@ fn resolve_identity_into(
             // from `bag.has_field("identity.data_dir")` in `resolve_config`,
             // and the keystore existence check is skipped for a placeholder.
             bag.push(
-                "identity.data_dir",
+                IDENTITY_DATA_DIR,
                 "cannot determine data directory: home dir not found",
             );
             PathBuf::from("/nonexistent")
@@ -343,7 +343,7 @@ fn resolve_identity_into(
         .clone()
         .or_else(|| file.and_then(|i| i.region.clone()))
     {
-        Some(raw) => bag.try_with("identity.region", normalize_region(&raw)),
+        Some(raw) => bag.try_with(IDENTITY_REGION, normalize_region(&raw)),
         None => None,
     };
 
@@ -528,10 +528,12 @@ fn resolve_blockchain_into(
         })
         .unwrap_or_else(|| data_dir.join("keystore.json"));
 
-    // Validate the keystore path unless it derives from a placeholder
-    // data_dir: a `/nonexistent/keystore.json` "cannot access" error is
-    // pure cascade noise on top of the real `identity.data_dir` problem.
-    // An explicitly-set keystore path is always checked.
+    // An explicitly-set keystore path (CLI/file) is always validated. A
+    // *defaulted* keystore is validated only when data_dir resolved: when
+    // data_dir itself failed, the keystore path is `/nonexistent/keystore.json`
+    // and a "cannot access" error here is pure cascade noise on top of the
+    // real `identity.data_dir` problem (which already fails resolution), so
+    // the skip is deliberate cascade-suppression, not an unchecked hole.
     if keystore_from_cli_or_file || data_dir_valid {
         bag.try_with(
             "blockchain.eth_keystore",
@@ -1398,9 +1400,12 @@ fn resolve_observability_into(
     }
 }
 
-/// Resolve gossip fields. Allowlist entries are parsed as 64-character hex
-/// node IDs (either case accepted); bad entries fail loudly at startup
-/// rather than silently degrading to accept-all mode later.
+/// Resolve gossip fields. Every allowlist entry is parsed as a 64-character
+/// hex node ID (either case accepted); each malformed entry is dropped from
+/// the returned list and recorded under `gossip.allowlist[<idx>]` (so an
+/// operator sees every bad ID at once), and resolution still fails at startup
+/// before the partial allowlist is used — never silently degrading to
+/// accept-all mode later.
 #[cfg(test)]
 fn resolve_gossip(file: Option<&types::GossipConfig>) -> anyhow::Result<ResolvedGossip> {
     one_section(|bag| resolve_gossip_into(file, bag))
@@ -2166,24 +2171,35 @@ mod tests {
         );
     }
 
-    /// A multi-entry allowlist with one valid and one invalid entry
-    /// must reject the whole resolution — half-applied allowlists are
-    /// a worse failure mode than fail-fast at startup. The invalid
-    /// entry is positioned second so a regression that returns early
-    /// after parsing the first valid entry would silently accept the
-    /// bad list.
+    /// Post-#222 the allowlist resolves with `filter_map` over
+    /// `enumerate()`: every malformed entry is dropped *and* recorded
+    /// under its own `gossip.allowlist[<idx>]` label, and resolution
+    /// still fails at startup before the partial list is used (never
+    /// silently degrading to accept-all). Two invalid entries at
+    /// indices 0 and 2 (valid hex at 1) must *both* surface — a
+    /// regression that reverted to fail-fast on the first bad entry
+    /// would only report one.
     #[test]
-    fn resolve_gossip_rejects_when_any_allowlist_entry_invalid() {
+    fn resolve_gossip_accumulates_every_invalid_allowlist_entry() {
         let cfg = types::GossipConfig {
             allowlist: Some(vec![
-                "0123456789abcdef".repeat(4), // valid
-                "z".repeat(64),               // invalid: non-hex
+                "z".repeat(64),               // idx 0: invalid (non-hex)
+                "0123456789abcdef".repeat(4), // idx 1: valid
+                "q".repeat(64),               // idx 2: invalid (non-hex)
             ]),
             ..Default::default()
         };
         let err = resolve_gossip(Some(&cfg))
-            .expect_err("any invalid entry must reject the whole list")
+            .expect_err("every invalid allowlist entry must be reported")
             .to_string();
+        assert!(
+            err.contains("gossip.allowlist[0]") && err.contains("gossip.allowlist[2]"),
+            "both bad entries must be named by index: {err}"
+        );
+        assert!(
+            !err.contains("gossip.allowlist[1]"),
+            "the valid entry must not be reported: {err}"
+        );
         assert!(
             err.contains("hex"),
             "error must surface hex-validation failure: {err}"
@@ -2941,6 +2957,44 @@ mod tests {
         anyhow::ensure!(
             msg.contains("cache.origins[1]") && msg.contains("must not be empty"),
             "error lacked the indexed context: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_origins_accumulates_every_bad_entry() -> anyhow::Result<()> {
+        // Intra-section accumulation (issue #222): two malformed origins
+        // at indices 0 and 2 (valid at 1) must BOTH be reported, by
+        // index. A regression that reverted the per-entry loop to
+        // fail-fast on the first bad entry would only report `[0]`.
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig {
+            origins: Some(vec![
+                types::OriginConfig::Http {
+                    url: String::new(), // idx 0: empty URL
+                    decompress: None,
+                },
+                types::OriginConfig::Http {
+                    url: "https://good.example/".to_string(), // idx 1: valid
+                    decompress: None,
+                },
+                types::OriginConfig::Fs {
+                    path: std::path::PathBuf::new(), // idx 2: empty path
+                },
+            ]),
+            ..Default::default()
+        };
+        let err = resolve_cache(&cli, Some(&toml), Path::new("/tmp"))
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected per-entry validation rejection"))?;
+        let msg = format!("{err:#}");
+        anyhow::ensure!(
+            msg.contains("cache.origins[0]") && msg.contains("cache.origins[2]"),
+            "both bad entries must be named by index: {msg}"
+        );
+        anyhow::ensure!(
+            !msg.contains("cache.origins[1]"),
+            "the valid entry must not be reported: {msg}"
         );
         Ok(())
     }
@@ -5907,6 +5961,148 @@ rate_per_mb = 0
         // A present-but-invalid region must not also trigger the
         // subscribe_global cross-section cascade (only the 4 real
         // problems, no double-count).
+        assert!(
+            !msg.contains("must be set when gossip.subscribe_global"),
+            "region cascade should be suppressed: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_config_missing_rpc_url_emits_no_parse_cascade() -> anyhow::Result<()> {
+        // Cascade guard: a missing `rpc_url` records exactly the
+        // "missing required option" problem and skips the URL-parse +
+        // scheme checks (a synthesized placeholder must not also emit
+        // "is not a valid URL"). subscribe_global=false keeps region
+        // out of it so this is a single, clean problem.
+        let body = r#"
+[blockchain]
+payment_channel_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+staking_registry_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+slash_judge_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+
+[gossip]
+subscribe_global = false
+"#;
+        let dir = data_dir_with_keystore()?;
+        let path = write_minimal_toml(&dir, body)?;
+        let args = run_args_with_data_dir(dir.path());
+        let Err(err) = resolve_config(Some(&path), &args) else {
+            anyhow::bail!("expected resolve_config to fail on missing rpc_url");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("configuration has 1 problem(s):"),
+            "missing rpc_url must be the only problem (no parse cascade): {msg}"
+        );
+        assert!(
+            msg.contains("missing required option: --rpc-url"),
+            "expected the missing-option message: {msg}"
+        );
+        assert!(
+            !msg.contains("is not a valid URL"),
+            "URL-parse cascade must be suppressed: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_config_malformed_slash_judge_emits_no_zero_address_cascade() -> anyhow::Result<()> {
+        // Cascade guard: a slash_judge_address that fails to parse
+        // records the parse/checksum problem and skips the zero-address
+        // check (the empty placeholder must not also emit "must not be
+        // the zero address"). The address is set via CLI args because
+        // `empty_blockchain_args` defaults `slash_judge_address` to a
+        // valid one (CLI > file), so a TOML value would be ignored.
+        let body = r#"
+[blockchain]
+rpc_url = "https://example/rpc"
+payment_channel_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+staking_registry_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+
+[gossip]
+subscribe_global = false
+"#;
+        let dir = data_dir_with_keystore()?;
+        let path = write_minimal_toml(&dir, body)?;
+        let mut args = run_args_with_data_dir(dir.path());
+        args.blockchain.slash_judge_address = Some("0xnothex".to_string());
+        let Err(err) = resolve_config(Some(&path), &args) else {
+            anyhow::bail!("expected resolve_config to fail on bad slash_judge_address");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("configuration has 1 problem(s):"),
+            "bad slash_judge must be the only problem (no zero-addr cascade): {msg}"
+        );
+        assert!(
+            msg.contains("slash_judge_address"),
+            "error should name slash_judge_address: {msg}"
+        );
+        assert!(
+            !msg.contains("must not be the zero address"),
+            "zero-address cascade must be suppressed: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_config_aggregates_cross_and_intra_section_problems() -> anyhow::Result<()> {
+        // Cross-section + intra-section accumulation compose with a
+        // correct count: bad region (1) + two malformed cache.origins
+        // (2) + rate_per_mb=0 (1) = 4. The present-but-invalid region
+        // also suppresses the subscribe_global cascade.
+        let body = r#"
+[identity]
+region = "USA"
+
+[blockchain]
+rpc_url = "https://example/rpc"
+payment_channel_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+staking_registry_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+slash_judge_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+
+[[cache.origins]]
+kind = "http"
+url = ""
+
+[[cache.origins]]
+kind = "http"
+url = "https://good.example/"
+
+[[cache.origins]]
+kind = "fs"
+path = ""
+
+[payment]
+rate_per_mb = 0
+"#;
+        let dir = data_dir_with_keystore()?;
+        let path = write_minimal_toml(&dir, body)?;
+        let args = run_args_with_data_dir(dir.path());
+        let Err(err) = resolve_config(Some(&path), &args) else {
+            anyhow::bail!("expected resolve_config to fail with 4 problems");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("configuration has 4 problem(s):"),
+            "expected exactly 4 problems: {msg}"
+        );
+        for needle in [
+            "identity.region",
+            "cache.origins[0]",
+            "cache.origins[2]",
+            "rate_per_mb",
+        ] {
+            assert!(
+                msg.contains(needle),
+                "aggregated error missing {needle:?}: {msg}"
+            );
+        }
+        assert!(
+            !msg.contains("cache.origins[1]"),
+            "the valid origin must not be reported: {msg}"
+        );
         assert!(
             !msg.contains("must be set when gossip.subscribe_global"),
             "region cascade should be suppressed: {msg}"
