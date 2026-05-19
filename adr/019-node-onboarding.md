@@ -28,16 +28,16 @@ flowchart TD
 
 Before any on-chain or protocol activity:
 
-1. **Provision server.** Minimum recommended spec: 4 vCPU, 8 GB RAM, 1 TB SSD, 5 TB/month egress. See [ADR 026 § Operator economics and minimum stake](026-tokenomics.md#7-operator-economics-and-minimum-stake) for operator economics.
+1. **Provision server.** Minimum recommended spec: 4 vCPU, 8 GB RAM, 1 TB SSD, 5 TB/month egress. See [ADR 026 § Operator economics and minimum stake](026-tokenomics.md#operator-economics-and-minimum-stake) for operator economics.
 
-2. **Synchronize clock.** The node MUST run NTP (or equivalent) and MUST verify the local clock offset is within 10 seconds of UTC before proceeding. Clock skew ≥ 60 s causes gossip messages to be silently rejected by all peers ([ADR 001](001-network.md#clock-synchronization)). Nodes SHOULD expose a `decdn_gossip_messages_rejected_total` Prometheus counter with the `reason="clock_skew"` label ([Appendix: Observability](appendix-observability.md#26-gossip-metrics)).
+2. **Synchronize clock.** The node MUST run NTP (or equivalent) and MUST verify the local clock offset is within 10 seconds of UTC before proceeding. Clock skew ≥ 60 s causes gossip messages to be silently rejected by all peers ([ADR 001](001-network.md#clock-synchronization)). Nodes SHOULD expose a `decdn_gossip_messages_rejected_total` Prometheus counter with the `reason="clock_skew"` label ([Appendix: Observability](appendix-observability.md#gossip-metrics)).
 
 3. **Generate iroh identity.** Run the node binary's `keys generate` (or equivalent) subcommand. This produces an **ed25519 key pair** whose public key is the iroh `NodeId`. The private key MUST be stored securely:
    - **PoC:** encrypted file on disk (passphrase-protected or operator-managed).
    - **Production:** platform keychain or HSM. See [ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model) for key management guidance (the same tiers apply to node keys).
 
 4. **Prepare Ethereum key.** The operator needs an Ethereum address (`ethAddress`) with sufficient funds:
-   - **TOKEN:** at minimum **50,000 TOKEN** for the minimum stake deposit ([ADR 026 § Operator economics and minimum stake](026-tokenomics.md#7-operator-economics-and-minimum-stake)). There is no discount-stake threshold; operators wanting amplified return on capital ve-lock TOKEN in `VotingEscrow` for gauge boost ([ADR 034 § Gauge-boost formula](034-gauge-boost-voting-escrow.md#gauge-boost-formula)) rather than staking above a threshold for fee discount. Operators lacking the 50K minimum may qualify for externally-funded operator-onboarding programs (see [ADR 026 §10](026-tokenomics.md#10-bootstrap-mechanism-pre-seed-usdc)).
+   - **TOKEN:** at minimum **50,000 TOKEN** for the minimum stake deposit ([ADR 026 § Operator economics and minimum stake](026-tokenomics.md#operator-economics-and-minimum-stake)). There is no discount-stake threshold; operators wanting amplified return on capital ve-lock TOKEN in `VotingEscrow` for gauge boost ([ADR 034 § Gauge-boost formula](034-gauge-boost-voting-escrow.md#gauge-boost-formula)) rather than staking above a threshold for fee discount. Operators lacking the 50K minimum may qualify for externally-funded operator-onboarding programs (see [ADR 026 § Bootstrap mechanism — pre-seed USDC](026-tokenomics.md#bootstrap-mechanism--pre-seed-usdc)).
    - **Native gas token:** ~$0.50–$1.00 for the Phase 2 transactions at typical L2 gas prices.
    - **Optional USDC:** only required if the operator intends to open outbound payment channels immediately (e.g., to pay origin-backed nodes for cache-miss pulls). Clients open inbound channels to the node without any USDC on the node side.
 
@@ -66,7 +66,7 @@ All transactions must be confirmed on-chain before proceeding to Phase 3.
 
 #### Step 2.1 — Approve TOKEN transfer
 
-Call `TOKEN.approve(stakingRegistry, amount)` where `amount ≥ minStake` (**50,000 TOKEN** under [ADR 026 § Operator economics and minimum stake](026-tokenomics.md#7-operator-economics-and-minimum-stake)). This ERC-20 approval authorizes `StakingRegistry` to pull the stake deposit.
+Call `TOKEN.approve(stakingRegistry, amount)` where `amount ≥ minStake` (**50,000 TOKEN** under [ADR 026 § Operator economics and minimum stake](026-tokenomics.md#operator-economics-and-minimum-stake)). This ERC-20 approval authorizes `StakingRegistry` to pull the stake deposit.
 
 **Gas:** ~$0.03 (one-time; re-stakes reuse the allowance if set above `minStake`).
 
@@ -88,7 +88,7 @@ This single transaction atomically:
 
 - Verifies the EIP-712 `bindingSignature` over `BindNodeId(nodeId, bindingNonce[ethAddress])`, establishing the `nodeId → ethAddress` mapping for slash evidence and payment attribution.
 - Verifies the `ed25519Signature` over `keccak256(abi.encodePacked(nodeId, ethAddress, chainId, registrationNonce[nodeId]))`, proving the operator controls the iroh private key (prevents NodeId squatting). (`ethAddress` is `msg.sender` and `chainId` is `block.chainid` on-chain; this ADR uses operator-perspective names for consistency with the signing pseudo-code below.)
-- Records `NodeInfo` (including `firstRegisteredAt` if this is the node's first-ever registration — used for cold-start bootstrap eligibility in [ADR 008](008-reputation.md#10-cold-start-bootstrap)).
+- Records `NodeInfo` (including `firstRegisteredAt` if this is the node's first-ever registration — used for cold-start bootstrap eligibility in [ADR 008](008-reputation.md#cold-start-bootstrap)).
 - Sets `active = true` in the registry.
 
 **Constructing `multiaddrs`:** The iroh `Endpoint` is not yet bound in Phase 2, so hole-punched addresses are unavailable at registration time:
@@ -227,7 +227,7 @@ iroh handles NAT traversal transparently via QUIC hole-punching and relay fallba
 
 ### Re-Onboarding after Deregistration or Auto-Ejection
 
-A node that voluntarily deregistered or was auto-ejected (stake dropped below 50% of `minStake` due to slashing — see [ADR 026 § Slashing and burn](026-tokenomics.md#8-slashing-and-burn)) must re-onboard. The flow is identical to initial onboarding with two differences:
+A node that voluntarily deregistered or was auto-ejected (stake dropped below 50% of `minStake` due to slashing — see [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn)) must re-onboard. The flow is identical to initial onboarding with two differences:
 
 1. **`firstRegisteredAt` is preserved.** The cold-start bootstrap bonus ([ADR 008](008-reputation.md#adr-008-reputation-system)) is not re-granted — the `firstRegisteredAt` field in `StakingRegistry` is immutable once set, and the bonus is one-time per operator address.
 

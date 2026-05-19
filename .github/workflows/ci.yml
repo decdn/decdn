@@ -402,7 +402,7 @@ jobs:
       - run: make -C adr check-book-list
       - run: make -C adr check-bare-refs
       - run: make -C adr check-md-anchors
-      - run: make -C adr check-section-spacing
+      - run: make -C adr check-no-section-numbers
 
   # Pytest suite for .github/scripts/coverage-diff.py. Non-blocking by design
   # — excluded from ci-success.needs — so a regression in the helper surfaces

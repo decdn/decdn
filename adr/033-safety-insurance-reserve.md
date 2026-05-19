@@ -5,7 +5,7 @@
 
 ## Context
 
-The 3% safety/insurance bucket of the `FeeRouter` six-bucket split ([ADR 026 § FeeRouter split (40/40/7/5/5/3)](026-tokenomics.md#2-feerouter-split-40407553)) is held in a governance-gated `SafetyReserve` contract. This ADR specifies that reserve: eligible payout categories, spending controls, cross-category payout ordering, interface stability, and the `ISafetyReserve` contract surface. The economic model that sizes the bucket is [ADR 026](026-tokenomics.md#adr-026-tokenomics); the appeal-surface that feeds slash-restitution claims into it is [ADR 032](032-safety-reserve-appeals-contract.md#adr-032-safetyreserve-appeal-surface-contract-surface).
+The 3% safety/insurance bucket of the `FeeRouter` six-bucket split ([ADR 026 § FeeRouter split (40/40/7/5/5/3)](026-tokenomics.md#feerouter-split-40407553)) is held in a governance-gated `SafetyReserve` contract. This ADR specifies that reserve: eligible payout categories, spending controls, cross-category payout ordering, interface stability, and the `ISafetyReserve` contract surface. The economic model that sizes the bucket is [ADR 026](026-tokenomics.md#adr-026-tokenomics); the appeal-surface that feeds slash-restitution claims into it is [ADR 032](032-safety-reserve-appeals-contract.md#adr-032-safetyreserve-appeal-surface-contract-surface).
 
 ## Decision
 
@@ -29,9 +29,9 @@ No path exists for unattested payouts; the `payout(bundleHash, recipient, amount
 
 ### Cross-category payout ordering
 
-When `SafetyReserve` solvency is insufficient to immediately fund every authorized disbursement — most plausibly during a correlated-outage window combining slash-restitution appeals (per [ADR 028 § Hard caps and frequency limits](028-slashing-appeals.md#5-hard-caps-and-frequency-limits)) with concurrent SLA-breach payouts — the unfunded portion of each authorization is recorded as a *pending claim* and disbursed once solvency permits. The queue is keyed on `(accrualEpoch asc, claimId asc)`:
+When `SafetyReserve` solvency is insufficient to immediately fund every authorized disbursement — most plausibly during a correlated-outage window combining slash-restitution appeals (per [ADR 028 § Hard caps and frequency limits](028-slashing-appeals.md#hard-caps-and-frequency-limits)) with concurrent SLA-breach payouts — the unfunded portion of each authorization is recorded as a *pending claim* and disbursed once solvency permits. The queue is keyed on `(accrualEpoch asc, claimId asc)`:
 
-- **`accrualEpoch`** is the FeeRouter 1-week epoch ([ADR 026 §2 Epoch mechanics](026-tokenomics.md#epoch-mechanics)) in which the original `payout()` authorization first hit insolvency. SafetyReserve does not maintain a separate epoch clock; using the FeeRouter epoch keeps `accrualEpoch` derivable from any block timestamp without an additional canonical clock.
+- **`accrualEpoch`** is the FeeRouter 1-week epoch ([ADR 026 § Epoch mechanics](026-tokenomics.md#epoch-mechanics)) in which the original `payout()` authorization first hit insolvency. SafetyReserve does not maintain a separate epoch clock; using the FeeRouter epoch keeps `accrualEpoch` derivable from any block timestamp without an additional canonical clock.
 - **`claimId`** is a monotonic `uint256` counter assigned by `SafetyReserve` at authorization time, incremented atomically as each pending claim is recorded. It is the within-epoch tiebreaker — not a payout-category priority signal, just a deterministic disambiguator for the rare case of multiple claims accruing in the same epoch.
 
 The queue ordering is therefore **epoch-FIFO across all payout categories with a per-claim monotonic tiebreaker within an epoch**. Three properties follow:
@@ -44,7 +44,7 @@ The queue ordering is therefore **epoch-FIFO across all payout categories with a
 
 ### Interface stability
 
-The `payout(bundleHash, recipient, amount)` signature is contract-stable: future incident-response tooling, insurance products, and SLA-style contracts integrate via this entry point without contract changes. Evidence formats live off-chain and are referenced by hash on-chain; the contract enforces the four payout gates uniformly regardless of caller identity (subject to `AccessControl` role grants per [ADR 016 § Access Control Matrix](016-contract-interactions.md#5-access-control-matrix)). `payout()` is the AccessControl-gated authorization path; `disbursePending()` is permissionless by design (see [Cross-category payout ordering](#cross-category-payout-ordering)) and inherits its evidence-and-gates guarantees from the original `payout()` authorization that placed the claim on the queue.
+The `payout(bundleHash, recipient, amount)` signature is contract-stable: future incident-response tooling, insurance products, and SLA-style contracts integrate via this entry point without contract changes. Evidence formats live off-chain and are referenced by hash on-chain; the contract enforces the four payout gates uniformly regardless of caller identity (subject to `AccessControl` role grants per [ADR 016 § Access Control Matrix](016-contract-interactions.md#access-control-matrix)). `payout()` is the AccessControl-gated authorization path; `disbursePending()` is permissionless by design (see [Cross-category payout ordering](#cross-category-payout-ordering)) and inherits its evidence-and-gates guarantees from the original `payout()` authorization that placed the claim on the queue.
 
 ### Contract: SafetyReserve
 
@@ -141,8 +141,8 @@ interface ISafetyReserve {
     // storage layout, per-appeal escrow accounting, and event-parameter
     // semantics live in
     // [ADR 032](032-safety-reserve-appeals-contract.md) and
-    // [ADR 028 §6](028-slashing-appeals.md#6-contract-surface);
-    // parameter values remain ADR 028 §5's responsibility.
+    // [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface);
+    // parameter values remain ADR 028 § Hard caps and frequency limits's responsibility.
     function openSlashAppeal(uint256 slashId, bytes32 evidenceBundleHash)
         external returns (uint256 appealId);
     function fastTrackAppeal(uint256 appealId) external;
@@ -181,7 +181,7 @@ interface ISafetyReserve {
     event PendingClaimQueued(uint256 indexed claimId, uint64 indexed accrualEpoch, address indexed recipient, uint256 usdcAmount, IncidentReason reason);
     event PendingClaimDisbursed(uint256 indexed claimId, uint256 indexed incidentId, address indexed recipient, uint256 usdcAmount);
     // Parameter lists pinned in
-    // [ADR 032 §3](032-safety-reserve-appeals-contract.md#3-solidity-event-signatures-all-six-pinned).
+    // [ADR 032 § Solidity event signatures (all six, pinned)](032-safety-reserve-appeals-contract.md#solidity-event-signatures-all-six-pinned).
     event SlashAppealOpened(uint256 indexed appealId, uint256 indexed slashId, address indexed appellant, bytes32 evidenceBundleHash, uint256 bond);
     event SlashAppealFastTracked(uint256 indexed appealId, uint256 escrowAmount);
     event SlashAppealRejected(uint256 indexed appealId, uint256 bondSlashed);
@@ -202,4 +202,4 @@ interface ISafetyReserve {
 
 - **USDC-only payouts.** `usdcAmount` is named explicitly so the constraint is visible in the storage layout and on every `Paid` event.
 - **Governor and emergency-multisig addresses are governance-mutable.** The `setGovernor` / `setEmergencyMultisig` setters allow the eventual handover from the deployer EOA to `TimelockController` (per [ADR 016 § Post-Deployment Initialization](016-contract-interactions.md#post-deployment-initialization)) and any future re-pointing without contract redeployment. The 48h timelock constraint applies via `GOVERNANCE_ROLE`.
-- **Appeal extensions are signature stubs.** This interface pins the function names and parameter types; the full state machine (`Open` → `FastTracked` / `Rejected` → `Ratified` / `Reversed` / `Lapsed`), window timing (filing, multisig review, ratification), and bond/restitution caps live in [ADR 028 § Contract surface](028-slashing-appeals.md#6-contract-surface).
+- **Appeal extensions are signature stubs.** This interface pins the function names and parameter types; the full state machine (`Open` → `FastTracked` / `Rejected` → `Ratified` / `Reversed` / `Lapsed`), window timing (filing, multisig review, ratification), and bond/restitution caps live in [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface).

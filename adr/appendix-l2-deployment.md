@@ -138,7 +138,7 @@ Canonical reference for Arbitrum-specific assumptions elsewhere in the ADR set:
 | [ADR 003 § Deposit Economics](003-payments.md#deposit-economics) | Gas table calibrated against Arbitrum One fee market |
 | [ADR 003 § L2 Sequencer Censorship](003-payments.md#l2-sequencer-censorship) | Forced-inclusion delay ≤ 24 h (Arbitrum value) |
 | [ADR 018 § Buyback execution via Balancer V3](018-liquidity-strategy.md#buyback-execution-via-balancer-v3) | Balancer V3 Router address is the Arbitrum One deployment |
-| [ADR 016 § Deployment Order](016-contract-interactions.md#2-deployment-order-and-initialization-dependencies) | "Arbitrum mainnet" in the BuybackBurner row |
+| [ADR 016 § Deployment Order](016-contract-interactions.md#deployment-order-and-initialization-dependencies) | "Arbitrum mainnet" in the BuybackBurner row |
 
 ### Chain-Specific Constants
 
@@ -182,15 +182,15 @@ Arbitrum One fee markets at deployment. Three MUST gates:
    100K settlements/year (medium operator) a small fraction of total cost. Aggregate
    per-settlement gas (USDC-equivalent, incl. this overhead) MUST stay within the
    operator P&L affordability bounds of
-   [ADR 026 §7](026-tokenomics.md#adr-026-tokenomics).
+   [ADR 026 § Operator economics and minimum stake](026-tokenomics.md#operator-economics-and-minimum-stake).
 
 2. **Per-epoch keeper-call gas economics.** Two TWAP-protected USDC→TOKEN swap
    keeper calls per epoch: `BuybackBurner` (5% buyback-and-burn flow per
    [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol)) and delegator-pool conversion (7%
-   delegator-pool flow per [ADR 026 §6](026-tokenomics.md#adr-026-tokenomics)) — at a
+   delegator-pool flow per [ADR 026 § Delegator pool — USDC → TOKEN conversion](026-tokenomics.md#delegator-pool--usdc--token-conversion)) — at a
    1-week epoch, **52+ swaps/year minimum**, both via the Balancer V3 80/20
    TOKEN/USDC pool with TWAP windows, `minOut`, and per-epoch liquidity caps (which
-   bind at S2/S3 scale per [ADR 026 §8](026-tokenomics.md#adr-026-tokenomics)). Per-epoch keeper costs MUST be not cost-prohibitive at
+   bind at S2/S3 scale per [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn)). Per-epoch keeper costs MUST be not cost-prohibitive at
    S2/S3 scale and a small fraction of the inflow each call routes.
 
 3. **Private-RPC gate.** The L2 MUST support private-RPC routing (Flashbots-style

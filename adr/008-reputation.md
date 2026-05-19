@@ -11,7 +11,7 @@ The network needs to rank nodes beyond staking alone. Staking provides Sybil res
 
 ## Decision
 
-### 1. Three-Tier Architecture
+### Three-Tier Architecture
 
 | Tier | Mechanism |
 |------|-----------|
@@ -19,13 +19,13 @@ The network needs to rank nodes beyond staking alone. Staking provides Sybil res
 | Network | Gossip-propagated signed reports via iroh-gossip |
 | On-chain | Stake weight for sybil resistance, slashing for provable faults |
 
-### 2. Score Model
+### Score Model
 
 - Score range: 0.0 to 1.0 (stored internally as u32, 0 to 1,000,000, for 6-decimal precision)
 - Initial score for new nodes: 0.5
 - Weight: local observations 70%, network gossip 30%
 
-### 3. Local Score Calculation
+### Local Score Calculation
 
 After each interaction with a node, the client updates its local score using EWMA:
 
@@ -49,7 +49,7 @@ Normalization: `speed_score = min(1.0, actual_bps / expected_bps)` where `expect
 
 EWMA with alpha=0.1 means recent interactions matter more but old interactions still contribute.
 
-### 4. Network Score Aggregation
+### Network Score Aggregation
 
 Reports received via iroh-gossip are aggregated using EWMA weighted by reporter credibility:
 
@@ -67,7 +67,7 @@ network_score = ewma(network_score, report.score, alpha=0.05 * reporter_weight)
 - `weight_cap`: caps reporter influence at 3× to prevent established high-earning nodes from disproportionately controlling network reputation. The 3× value sits just above the ~2× clamp-saturation threshold, so the full weight range is effective for typical score gaps while the per-report clamp governs extreme divergences. Preserves the anti-Sybil property (influence still scales with capital) while tightening maximum incumbency advantage.
 - Alpha is scaled by reporter weight: high-credibility reporters (more settled value) move the score faster
 
-#### 4.1 Distinct-Counterparty Discount
+#### Distinct-Counterparty Discount
 
 The `effective_settled_value` computation applies a distinct-counterparty discount to prevent wash trading via self-dealing channels. For each reporter, the indexer tracks two quantities from `ChannelSettled` events:
 
@@ -82,13 +82,13 @@ diversity_factor = min(distinct_counterparties / min_counterparties, 1.0)
 
 Where `min_counterparties = 5` (governance-tunable; hardcoded floor: 2).
 
-**Effect on wash trading:** An attacker cycling funds between two self-owned addresses has `distinct_counterparties = 1`, yielding `diversity_factor = 0.2` — an 80% reduction in effective weight. Full credit needs settlements with 5+ distinct counterparties, each requiring a separate staking deposit (minimum 50,000 TOKEN per [ADR 026 § Operator economics and minimum stake](026-tokenomics.md#7-operator-economics-and-minimum-stake)) and its own capital cycling fees.
+**Effect on wash trading:** An attacker cycling funds between two self-owned addresses has `distinct_counterparties = 1`, yielding `diversity_factor = 0.2` — an 80% reduction in effective weight. Full credit needs settlements with 5+ distinct counterparties, each requiring a separate staking deposit (minimum 50,000 TOKEN per [ADR 026 § Operator economics and minimum stake](026-tokenomics.md#operator-economics-and-minimum-stake)) and its own capital cycling fees.
 
 **Counterparty validation:** Only counterparty addresses that had a `StakingRegistry` NodeId binding at the time of channel settlement count toward `distinct_counterparties`. Unregistered addresses (pure clients without stake) do not count, since only staked nodes submit gossip reports (Section 6) and counterparty diversity matters only for reporter weight in the network score.
 
-#### 4.2 Settled-Value Time Decay
+#### Settled-Value Time Decay
 
-Individual settlement contributions decay exponentially with age, forcing an attacker to continuously cycle capital (incurring the `FeeRouter` non-base skim of 60% per [ADR 026 § FeeRouter split (40/40/7/5/5/3)](026-tokenomics.md#2-feerouter-split-40407553) plus per-cycle L2 gas, on their own USDC) to maintain reporter weight:
+Individual settlement contributions decay exponentially with age, forcing an attacker to continuously cycle capital (incurring the `FeeRouter` non-base skim of 60% per [ADR 026 § FeeRouter split (40/40/7/5/5/3)](026-tokenomics.md#feerouter-split-40407553) plus per-cycle L2 gas, on their own USDC) to maintain reporter weight:
 
 ```
 settlement_weight_i = exp(-lambda * age_weeks_i)
@@ -115,7 +115,7 @@ Where `lambda = 0.1` per week (half-life ≈ 6.9 weeks) and `age_weeks_i` is the
 | `settlement_max_age` | 52 weeks (older settlements contribute 0) |
 | `weight_cap` | 3.0 (max `reporter_weight` value; bounds the EWMA alpha multiplier) |
 
-### 5. Combined Score
+### Combined Score
 
 ```
 final_score = 0.7 * local_score + 0.3 * network_score
@@ -155,7 +155,7 @@ flowchart TD
     FINAL --> DECAY["Decay toward 0.5<br/>10%/week without data"]
 ```
 
-### 6. Gossip Protocol
+### Gossip Protocol
 
 Dedicated gossip topic (`cdn/reputation/v1`) — all nodes subscribe. After interacting with a node, a node broadcasts a signed reputation report:
 
@@ -196,7 +196,7 @@ classDiagram
     ReputationReport *-- ReportMetrics
 ```
 
-### 7. Score Decay (Production Only)
+### Score Decay (Production Only)
 
 Scores decay toward neutral (0.5) over time without new data. Applied iteratively each week:
 
@@ -217,7 +217,7 @@ Scores converge to 0.5 asymptotically, reaching within 0.05 of neutral after ~30
 | Decay starts after | 1 week with no new reports or interactions |
 | Minimum score (floor) | 0.0 (selection algorithm clamps at 0.1 — see [ADR 001](001-network.md#node-selection-algorithm)) |
 
-### 8. Score Clamping
+### Score Clamping
 
 A single reputation report (local or network) can move a node's `local_score` or `network_score` by at most 0.05 in either direction. The derived weighted `final_score` (70% local, 30% network) is not separately clamped. This per-report cap prevents one bad interaction from destroying a good node or one fake report from inflating a sybil.
 
@@ -225,7 +225,7 @@ A single reputation report (local or network) can move a node's `local_score` or
 
 **Selection clamp:** Independently of per-report clamping, the node selection formula in [ADR 001](001-network.md#node-selection-algorithm) clamps reputation to `max(reputation, 0.1)` to avoid division by zero. Nodes with reputation below 0.1 are scored identically (100× penalty vs. a perfect node) — effectively unselectable but not blacklisted.
 
-### 9. Tie-Breaking
+### Tie-Breaking
 
 When multiple nodes have the same unified selection score (within 1% — see [ADR 001, Node Selection Algorithm](001-network.md#node-selection-algorithm)), select by:
 
@@ -234,20 +234,20 @@ When multiple nodes have the same unified selection score (within 1% — see [AD
 3. Higher stake (more skin in the game)
 4. Random (final tiebreaker)
 
-### 10. Cold-Start Bootstrap
+### Cold-Start Bootstrap
 
 During the first 7 days after staking (or first 50 completed interactions, whichever comes first), new nodes receive a 10% selection bonus — scores temporarily boosted by 0.05 (additive), clamped to 1.0: `boosted_score = min(final_score + 0.05, 1.0)`. Local to each client, decays linearly over the bootstrap period.
 
 **Anti-gaming: one-time bonus per operator.** Granted only once per operator Ethereum address. Clients check `StakingRegistry.getFirstRegisteredAt(operator)` against the chain's latest block timestamp. If `firstRegisteredAt > 0` and the first registration is older than 7 days, no bonus is applied, regardless of the current `registeredAt`. The 7-day bootstrap timer derives from `firstRegisteredAt`, not `registeredAt`. This prevents the unstake → re-stake cycle in the threat model. `firstRegisteredAt` is immutable once set and survives deregistration, auto-ejection, and re-registration (see [ADR 001](001-network.md#data-structure)).
 
-### 11. Rate Limiting
+### Rate Limiting
 
 - Max 1 report per (reporter, node) pair per hour
 - Max 10 reports per reporter per hour
 - Reports exceeding limits are silently dropped by receiving nodes
 - Enforced locally by each node on received gossip messages
 
-### 12. Gauge-Pool Wash-Trading: Reputation as Off-Chain Signal
+### Gauge-Pool Wash-Trading: Reputation as Off-Chain Signal
 
 [ADR 034 § Gauge-boost formula](034-gauge-boost-voting-escrow.md#gauge-boost-formula) distributes 40% of fee revenue via a Curve-style gauge formula whose input is per-operator `bytes_delivered`. Without an integrity layer, an operator can inflate `bytes_delivered` by routing settlements through self-controlled clients. The on-chain defense is the [ADR 034 § per-operator gauge-share cap](034-gauge-boost-voting-escrow.md#per-operator-gauge-share-cap) (default 5%, governable `[1%, 25%]`), which with the closed-pool gauge bucket structure makes wash-trading economically marginal at any reasonable TOKEN price.
 
@@ -259,7 +259,7 @@ Reputation contributes complementary off-chain signal:
 
 There is no on-chain gauge-eligibility gate keyed on reputation. The cap binds equally for high-rep and low-rep operators. Reputation operates in selection probability ([ADR 001](001-network.md#node-selection-algorithm)) and as input to governance-level cap-tuning decisions, not as a per-epoch gate on gauge claims.
 
-### 13. Regional-Coverage Reputation Signal
+### Regional-Coverage Reputation Signal
 
 The reputation system exposes a per-operator **regional-coverage signal** — a derived metric (not a component of `final_score`) summarizing where an operator's verified deliveries originate geographically. Operators serving high-demand low-coverage regions receive a positive signal; operators serving only oversaturated regions receive a neutral signal.
 
@@ -267,7 +267,7 @@ The reputation system exposes a per-operator **regional-coverage signal** — a 
 
 #### Region taxonomy
 
-Regions are **ISO 3166-1 alpha-2 country codes** (e.g., `DE`, `US`, `JP`), stored as `bytes2` matching the gas-optimization convention in [ADR 011 § Contract: ContentBlacklist](011-content-takedown.md#contract-contentblacklist) and the packing used by [ADR 031 § Storage layout](031-content-blacklist-appeals-contract.md#1-storage-layout). This is the same choice that already drives `node.region` ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)), `BlacklistEntry.region` ([ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)), and `BlacklistAppeal.region` ([ADR 031](031-content-blacklist-appeals-contract.md#adr-031-contentblacklist-appeal-contract-surface)) — keeping all four surfaces at the same grain so the signal can be meaningfully cross-referenced against blacklist scope and operator declaration.
+Regions are **ISO 3166-1 alpha-2 country codes** (e.g., `DE`, `US`, `JP`), stored as `bytes2` matching the gas-optimization convention in [ADR 011 § Contract: ContentBlacklist](011-content-takedown.md#contract-contentblacklist) and the packing used by [ADR 031 § Storage layout](031-content-blacklist-appeals-contract.md#storage-layout). This is the same choice that already drives `node.region` ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)), `BlacklistEntry.region` ([ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)), and `BlacklistAppeal.region` ([ADR 031](031-content-blacklist-appeals-contract.md#adr-031-contentblacklist-appeal-contract-surface)) — keeping all four surfaces at the same grain so the signal can be meaningfully cross-referenced against blacklist scope and operator declaration.
 
 **Sub-national subdivisions are out of scope** for this ADR. ISO 3166-2 (`US-CA`, `DE-BY`, `CA-QC`, etc.) is the standard for finer granularity, and several compliance regimes — CCPA, Quebec Law 25, German Länder-level overlays — operate at that level. They are excluded here for two reasons:
 
@@ -299,7 +299,7 @@ On receipt of a `ReputationReport` from reporter `R` about operator `O`:
 1. Look up `R.region` from the local peer table (the latest `NodeAnnounce` for `R`'s `NodeId` per [ADR 001 § Node Discovery](001-network.md#node-discovery-gossip)). Reports from reporters with no current `NodeAnnounce` or an unattested region are dropped from regional aggregation only — they still contribute to the main `network_score` per Section 4.
 2. If no bucket exists for `R.region`, initialize `bucket.score = 0.5` (neutral) — same convention as the main scores in Section 3 — and proceed to step 3.
 3. Compute `interaction_score` from `report.metrics` using the same formula as Section 3 (`0.4 × speed_score + 0.4 × correctness + 0.2 × reachability`).
-4. Compute `reporter_weight` for `R` using the existing Section 4 machinery: `effective_settled_value(R)` with the §4.1 distinct-counterparty discount and §4.2 time decay applied, normalized against `max(1, max_effective_settled_value_observed)`, capped at the 3× `weight_cap`. Reporters with `reporter_weight = 0` (fresh-staked, no settled-channel history) have no effect on the bucket.
+4. Compute `reporter_weight` for `R` using the existing Section 4 machinery: `effective_settled_value(R)` with the [§ Distinct-Counterparty Discount](#distinct-counterparty-discount) distinct-counterparty discount and [§ Settled-Value Time Decay](#settled-value-time-decay) time decay applied, normalized against `max(1, max_effective_settled_value_observed)`, capped at the 3× `weight_cap`. Reporters with `reporter_weight = 0` (fresh-staked, no settled-channel history) have no effect on the bucket.
 5. Update the bucket: `bucket.score = ewma(bucket.score, interaction_score, alpha = 0.05 × reporter_weight)` — same weighted-EWMA shape as `network_score` in Section 4. Cap the delta at ±0.05 per the Section 8 per-report clamp.
 6. Set `bucket.last_interaction_at = now` (unix seconds).
 
@@ -337,7 +337,7 @@ Consumers should note the signal trusts the reporter's self-declared `node.regio
 ### Positive
 
 - Interaction-weighted scoring makes reputation manipulation expensive — you need real economic activity (settled payment channels), not just stake
-- Distinct-counterparty discount and settlement time decay raise the cost of wash trading from a single self-dealing pair to requiring 5+ staking deposits (50,000 TOKEN each per [ADR 026 § Operator economics and minimum stake](026-tokenomics.md#7-operator-economics-and-minimum-stake)) plus the per-cycle `FeeRouter` non-base skim (60% per [ADR 026 § FeeRouter split (40/40/7/5/5/3)](026-tokenomics.md#2-feerouter-split-40407553)) across 5+ counterparties — an order-of-magnitude increase in capital requirements
+- Distinct-counterparty discount and settlement time decay raise the cost of wash trading from a single self-dealing pair to requiring 5+ staking deposits (50,000 TOKEN each per [ADR 026 § Operator economics and minimum stake](026-tokenomics.md#operator-economics-and-minimum-stake)) plus the per-cycle `FeeRouter` non-base skim (60% per [ADR 026 § FeeRouter split (40/40/7/5/5/3)](026-tokenomics.md#feerouter-split-40407553)) across 5+ counterparties — an order-of-magnitude increase in capital requirements
 - Local observations dominate (70%), so a node's own experience always outweighs the crowd
 - Score clamping limits the damage from individual malicious reports
 - Cold-start bootstrap gives new nodes enough traffic to build a real track record

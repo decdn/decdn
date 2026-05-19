@@ -22,7 +22,7 @@ Deferring session keys to Production keeps the PoC PR small and avoids shipping 
 
 ## Decision
 
-### 1. Universal `SignatureChecker` in All Contracts
+### Universal `SignatureChecker` in All Contracts
 
 Every signature verification site across all deCDN contracts MUST use OpenZeppelin's [`SignatureChecker`](https://docs.openzeppelin.com/contracts/5.x/api/utils#SignatureChecker) library instead of direct `ECDSA.recover` or `ecrecover`.
 
@@ -68,30 +68,30 @@ This is a mechanical replacement. The EIP-712 domain separators, typed data hash
 | Safe (1-of-1) | +~12,000 (external call + `checkSignatures`) | Yes — on-chain verification happens only at channel close/dispute/slash, not per-voucher |
 | Safe (2-of-3) | +~15,000 | Yes — same rationale |
 
-### 2. Safe as Recommended Wallet
+### Safe as Recommended Wallet
 
 Safe smart wallets are the **recommended** wallet type for both node operators and clients. EOAs remain fully functional — `SignatureChecker` makes this transparent at the contract level.
 
 #### Node Operators
 
-**Recommended PoC configuration: 1-of-1 Safe.** **Production: 2-of-3 + session keys (see §3).**
+**Recommended PoC configuration: 1-of-1 Safe.** **Production: 2-of-3 + session keys (see [§ Session Keys — Deferred to Production via ERC-7579 smartsessions](#session-keys--deferred-to-production-via-erc-7579-smartsessions)).**
 
 - **Owners (PoC):** 1-of-1. The single owner is a software-held key on the signing host — same trust posture as today's `eth_keystore`. 2-of-3 is not recommended for the PoC because `SignatureChecker` → Safe's `checkSignatures` cannot reach a multi-owner threshold at wire speed: every `slash_sig` would need signatures from multiple owners, and pre-approving every digest via `signMessage` is infeasible.
 - **Stake management:** The Safe holds TOKEN and executes `StakingRegistry.stake()`, `registerNode()`, `deregister()`.
 - **Channel operations:** The Safe executes `openChannel()`, `closeChannel()`, `topUp()` for outbound node-to-node payment channels (cache-miss pulls). Infrequent — not on the hot path.
 - **Hot signing (slash_sig) — PoC:** The 1-of-1 owner signs the EIP-712 digest directly. `SignatureChecker.isValidSignatureNow(safeAddress, digest, sig)` routes through Safe's stock `CompatibilityFallbackHandler` → `checkSignatures`, which passes at threshold 1.
-- **Hot signing (slash_sig) — Production:** 2-of-3 Safe with a session key authorized via `erc7579/smartsessions` (see §3). Multisig protects stake/withdraw/channel-open; the session key signs `slash_sig` at wire speed without quorum per message.
+- **Hot signing (slash_sig) — Production:** 2-of-3 Safe with a session key authorized via `erc7579/smartsessions` (see [§ Session Keys — Deferred to Production via ERC-7579 smartsessions](#session-keys--deferred-to-production-via-erc-7579-smartsessions)). Multisig protects stake/withdraw/channel-open; the session key signs `slash_sig` at wire speed without quorum per message.
 
 #### Clients
 
-**Recommended PoC configuration: 1-of-1 Safe or plain EOA.** High-value client accounts migrate to 2-of-3 + session keys in Production (§3); the same threshold constraint that applies to node operators applies here.
+**Recommended PoC configuration: 1-of-1 Safe or plain EOA.** High-value client accounts migrate to 2-of-3 + session keys in Production ([§ Session Keys — Deferred to Production via ERC-7579 smartsessions](#session-keys--deferred-to-production-via-erc-7579-smartsessions)); the same threshold constraint that applies to node operators applies here.
 
 - **Channel operations:** The Safe (or EOA) deposits USDC into `PaymentChannel.openChannel()`. That address is the `channel.client`. Client software supports both wallet types — `SignatureChecker` makes the choice transparent to every contract.
-- **Voucher signing:** EIP-712 vouchers are signed with the `channel.client` key. `SignatureChecker` on the channel contract validates against `channel.client` (EOA → ECDSA; 1-of-1 Safe → `checkSignatures` via stock handler). The session-key path (signing at delivery speed via `erc7579/smartsessions` without exposing the Safe owner key) lands when §3 ships.
+- **Voucher signing:** EIP-712 vouchers are signed with the `channel.client` key. `SignatureChecker` on the channel contract validates against `channel.client` (EOA → ECDSA; 1-of-1 Safe → `checkSignatures` via stock handler). The session-key path (signing at delivery speed via `erc7579/smartsessions` without exposing the Safe owner key) lands when [§ Session Keys — Deferred to Production via ERC-7579 smartsessions](#session-keys--deferred-to-production-via-erc-7579-smartsessions) ships.
 
-### 3. Session Keys — Deferred to Production via ERC-7579 smartsessions
+### Session Keys — Deferred to Production via ERC-7579 smartsessions
 
-**Session keys are out of scope for the PoC.** The PoC uses the direct owner-signature path described in §2 (1-of-1 Safe or EOA, software-held key on the signing host). This matches today's `eth_keystore` trust posture and keeps the PoC from shipping bespoke security-critical contract code.
+**Session keys are out of scope for the PoC.** The PoC uses the direct owner-signature path described in [§ Safe as Recommended Wallet](#safe-as-recommended-wallet) (1-of-1 Safe or EOA, software-held key on the signing host). This matches today's `eth_keystore` trust posture and keeps the PoC from shipping bespoke security-critical contract code.
 
 #### Production plan
 
@@ -112,7 +112,7 @@ Safe (2-of-3) owners →
 
 No bespoke Safe module, no custom fallback handler, no new security-critical contract code owned by deCDN.
 
-### 4. Off-Chain ERC-1271 Verification
+### Off-Chain ERC-1271 Verification
 
 [ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model) specifies that nodes verify client ephemeral binding signatures (`BindNodeId` with `nonce=0`) via `ecrecover`. When the client's Ethereum address is a smart account, this verification must use ERC-1271 instead.
 
@@ -146,7 +146,7 @@ async fn verify_binding_signature(
 
 **Caching:** Nodes SHOULD cache the result of `get_code_at` for known client addresses to avoid repeated RPC calls. The code at an address does not change after deployment (ignoring `SELFDESTRUCT`, which is deprecated and irrelevant for Safe wallets).
 
-### 5. Safe Infrastructure on the Canonical Testnet
+### Safe Infrastructure on the Canonical Testnet
 
 The following Safe infrastructure is already deployed on the testnet sibling of the canonical L2 (Arbitrum Sepolia, per [Appendix: L2 Deployment](appendix-l2-deployment.md#appendix-production-l2-deployment-target)):
 
@@ -163,7 +163,7 @@ The following Safe infrastructure is already deployed on the testnet sibling of 
 - ERC-4337 Entry Point interaction — operators submit transactions directly via Safe SDK
 - Paymaster contracts — operators hold ETH for gas (same as current [ADR 003](003-payments.md#adr-003-payment-model) assumption)
 - Bundler infrastructure
-- Safe-7579 adapter and any session-key module (deferred to Production per §3)
+- Safe-7579 adapter and any session-key module (deferred to Production per [§ Session Keys — Deferred to Production via ERC-7579 smartsessions](#session-keys--deferred-to-production-via-erc-7579-smartsessions))
 
 #### Production additions (documented, deferred)
 
