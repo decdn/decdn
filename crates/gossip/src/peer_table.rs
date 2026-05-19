@@ -141,7 +141,6 @@ mod tests {
                     active_streams: 0,
                     bandwidth_utilization: 0,
                 },
-                popular_hashes: vec![],
                 timestamp_us: ts_us,
             },
             signature: vec![0u8; 64],

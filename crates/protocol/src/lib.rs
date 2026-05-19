@@ -12,7 +12,7 @@ pub use framing::{
 };
 pub use gossip::{
     GOSSIP_VERSION, GossipEnvelope, GossipPayload, LoadHint, NodeAnnounce, NodeAnnounceBody,
-    POPULAR_HASHES_MAX, SIGNATURE_LEN,
+    SIGNATURE_LEN,
 };
 pub use message::{
     MAX_RATE_PER_MB, MessageValidationError, ProbeMessage, ProbeRequest, ProbeResponse,

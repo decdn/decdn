@@ -7,9 +7,7 @@
 
 use std::collections::HashSet;
 
-use decdn_protocol::{
-    GOSSIP_VERSION, GossipEnvelope, GossipPayload, NodeAnnounce, POPULAR_HASHES_MAX, SIGNATURE_LEN,
-};
+use decdn_protocol::{GOSSIP_VERSION, GossipEnvelope, GossipPayload, NodeAnnounce, SIGNATURE_LEN};
 use thiserror::Error;
 
 /// Every reason an incoming envelope can be rejected. Each variant's
@@ -42,10 +40,6 @@ pub enum AnnounceReject {
     StaleTimestamp,
     #[error("region must be 2 ASCII uppercase letters")]
     BadRegion,
-    #[error("popular_hashes contains duplicates")]
-    DuplicateHashes,
-    #[error("popular_hashes exceeds {POPULAR_HASHES_MAX} entries")]
-    TooManyHashes,
     #[error("announcer not in allowlist")]
     NotAllowlisted,
 }
@@ -64,8 +58,6 @@ impl AnnounceReject {
             Self::ClockSkew => "clock_skew",
             Self::StaleTimestamp => "stale_timestamp",
             Self::BadRegion => "bad_region",
-            Self::DuplicateHashes => "duplicate_hashes",
-            Self::TooManyHashes => "too_many_hashes",
             Self::NotAllowlisted => "not_allowlisted",
         }
     }
@@ -129,14 +121,6 @@ fn validate_announce_fields(a: &NodeAnnounce, now_us: u64) -> Result<(), Announc
         return Err(AnnounceReject::BadRegion);
     }
 
-    if b.popular_hashes.len() > POPULAR_HASHES_MAX {
-        return Err(AnnounceReject::TooManyHashes);
-    }
-    let unique: HashSet<&[u8; 32]> = b.popular_hashes.iter().collect();
-    if unique.len() != b.popular_hashes.len() {
-        return Err(AnnounceReject::DuplicateHashes);
-    }
-
     // Clock skew: |now - ts| <= 60s. Use signed subtraction in i128 to dodge
     // wrap-around when ts is far in the future or the past.
     let diff = i128::from(now_us) - i128::from(b.timestamp_us);
@@ -197,8 +181,6 @@ mod tests {
                 AnnounceReject::ClockSkew => "clock_skew",
                 AnnounceReject::StaleTimestamp => "stale_timestamp",
                 AnnounceReject::BadRegion => "bad_region",
-                AnnounceReject::DuplicateHashes => "duplicate_hashes",
-                AnnounceReject::TooManyHashes => "too_many_hashes",
                 AnnounceReject::NotAllowlisted => "not_allowlisted",
             }
         }
@@ -215,8 +197,6 @@ mod tests {
             AnnounceReject::ClockSkew,
             AnnounceReject::StaleTimestamp,
             AnnounceReject::BadRegion,
-            AnnounceReject::DuplicateHashes,
-            AnnounceReject::TooManyHashes,
             AnnounceReject::NotAllowlisted,
         ] {
             assert_eq!(r.label(), expected_label(&r), "label drift for {r:?}");
@@ -235,7 +215,6 @@ mod tests {
                 active_streams: 0,
                 bandwidth_utilization: 0,
             },
-            popular_hashes: vec![],
             timestamp_us: ts_us,
         }
     }
@@ -361,34 +340,6 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_hashes_rejected() {
-        let sk = fresh_key();
-        let bytes = mk_envelope(&sk, |b| b.popular_hashes = vec![[1u8; 32], [1u8; 32]]);
-        assert_eq!(
-            validate_envelope(&bytes, 1_700_000_000_000_000, &no_list()),
-            Err(AnnounceReject::DuplicateHashes)
-        );
-    }
-
-    #[test]
-    fn too_many_hashes_rejected() {
-        let sk = fresh_key();
-        let bytes = mk_envelope(&sk, |b| {
-            b.popular_hashes = (0..=POPULAR_HASHES_MAX)
-                .map(|i| {
-                    let mut h = [0u8; 32];
-                    h[0] = u8::try_from(i & 0xff).unwrap_or(0);
-                    h
-                })
-                .collect();
-        });
-        assert_eq!(
-            validate_envelope(&bytes, 1_700_000_000_000_000, &no_list()),
-            Err(AnnounceReject::TooManyHashes)
-        );
-    }
-
-    #[test]
     fn allowlist_enforced_when_non_empty() {
         let sk = fresh_key();
         let bytes = mk_envelope(&sk, |_| {});
@@ -452,8 +403,8 @@ mod tests {
     fn signature_does_not_verify_after_body_mutation() {
         // A relay / on-path attacker alters a field after a legitimate
         // signature was produced. ADR 001 requires per-field signing: any
-        // edit to `region`, `load`, `popular_hashes`, `timestamp_us`, or
-        // `node_id` must invalidate the signature. Mutating `region`
+        // edit to `region`, `load`, `timestamp_us`, or `node_id` must
+        // invalidate the signature. Mutating `region`
         // stands in for the whole class — postcard's canonical encoding
         // means any body-byte difference changes the signed bytes.
         let sk = fresh_key();
