@@ -5,7 +5,7 @@
 
 ## Context
 
-The 7% delegator bucket of the `FeeRouter` six-bucket split ([ADR 026 §2](026-tokenomics.md#2-feerouter-split-40407553)) flows through a USDC→TOKEN buy-and-distribute pipeline (the `DelegatorBuyer` contract) rather than direct USDC distribution. This ADR specifies that pipeline: its distinction from buyback-and-burn, why it is TOKEN-denominated, MEV/slippage handling, and the `DelegatorBuyer` interface. The economic-model umbrella is [ADR 026](026-tokenomics.md#adr-026-tokenomics).
+The 7% delegator bucket of the `FeeRouter` six-bucket split ([ADR 026 § FeeRouter split (40/40/7/5/5/3)](026-tokenomics.md#2-feerouter-split-40407553)) flows through a USDC→TOKEN buy-and-distribute pipeline (the `DelegatorBuyer` contract) rather than direct USDC distribution. This ADR specifies that pipeline: its distinction from buyback-and-burn, why it is TOKEN-denominated, MEV/slippage handling, and the `DelegatorBuyer` interface. The economic-model umbrella is [ADR 026](026-tokenomics.md#adr-026-tokenomics).
 
 ## Decision
 

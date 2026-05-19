@@ -5,7 +5,7 @@
 
 ## Context
 
-The gauge-boost mechanism and the `VotingEscrow` contract are the operator-incentive core of the 40% gauge bucket in the `FeeRouter` six-bucket split ([ADR 026 §2](026-tokenomics.md#2-feerouter-split-40407553)). This ADR specifies the gauge-boost formula (including degenerate-input fallbacks and the per-operator gauge-share cap that is the canonical wash-trading defense) and the vote-escrow contract (historical checkpointing, lock ownership, the `VotingEscrow` interface). The economic-model umbrella that sizes and ties the buckets together is [ADR 026](026-tokenomics.md#adr-026-tokenomics).
+The gauge-boost mechanism and the `VotingEscrow` contract are the operator-incentive core of the 40% gauge bucket in the `FeeRouter` six-bucket split ([ADR 026 § FeeRouter split (40/40/7/5/5/3)](026-tokenomics.md#2-feerouter-split-40407553)). This ADR specifies the gauge-boost formula (including degenerate-input fallbacks and the per-operator gauge-share cap that is the canonical wash-trading defense) and the vote-escrow contract (historical checkpointing, lock ownership, the `VotingEscrow` interface). The economic-model umbrella that sizes and ties the buckets together is [ADR 026](026-tokenomics.md#adr-026-tokenomics).
 
 ## Decision
 
@@ -32,7 +32,7 @@ Per-operator pool share = `min(working_bytes_i / sum(working_bytes), MAX_GAUGE_S
 
 The Curve formula is bounded by `bytes` in both directions (a non-locker still earns 40% of fair-share, a whale-locker cannot exceed fair-share), which prevents both the "starve commodity operators" and "ve-whale captures the pool" failure modes of simpler `boost = 1 + k × ve` mechanics. The fair-share normalization gives the system a stable equilibrium where operators who match their ve-share to their byte-share collectively neither over- nor under-claim — matching Curve's gauge-equilibrium pattern.
 
-The boost-floor parameter (default `boostFloor = 0.4`) is governable within `[0.2, 0.8]`. A lower floor sharpens the penalty for non-lockers and raises the max boost ratio; a higher floor softens differentiation. See [ADR 026 §11](026-tokenomics.md#11-governable-parameters-with-safety-bounds) for the safety-bound table.
+The boost-floor parameter (default `boostFloor = 0.4`) is governable within `[0.2, 0.8]`. A lower floor sharpens the penalty for non-lockers and raises the max boost ratio; a higher floor softens differentiation. See [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#11-governable-parameters-with-safety-bounds) for the safety-bound table.
 
 #### Per-operator gauge-share cap
 
@@ -44,7 +44,7 @@ share_i = min(working_bytes_i / sum(working_bytes), MAX_GAUGE_SHARE_PER_OPERATOR
 
 Any residual gauge bucket left after capping (which occurs when one or more operators would have received more than the cap) rolls over to the next epoch's gauge accumulator under the same rule as the `sum(working_bytes) == 0` degenerate case in [Degenerate-input fallbacks](#degenerate-input-fallbacks) above. The 26-epoch claim window in [ADR 026 §2 Epoch mechanics](026-tokenomics.md#epoch-mechanics) caps the total rollover.
 
-**Rationale.** Bounds wash-trading payoff at 5% of the gauge bucket per operator-identity. Combined with the boost formula's `0.4·bytes_i` floor for low-ve operators and the closed-pool gauge structure (every settlement contributes to the same global bucket the operator is then claiming from), this makes wash-trading economically marginal at any reasonable TOKEN price — the attacker pays into the pool they're trying to drain, with 8% leakage to treasury+safety per self-deal, and the cap suppresses any non-proportional share they could extract via ve-boost. Sybil expansion of attack-operator count requires fresh `StakingRegistry` registrations each with the [ADR 026 §7](026-tokenomics.md#7-operator-economics-and-minimum-stake) minimum stake, converting wash-trading from a heuristic-bypass attack into a stake-proportional capital-lockup attack. A single honest operator with a dominant byte share is also subject to the cap, which is the intended posture — the gauge pool exists to incentivize a diverse operator set, not to reward concentration.
+**Rationale.** Bounds wash-trading payoff at 5% of the gauge bucket per operator-identity. Combined with the boost formula's `0.4·bytes_i` floor for low-ve operators and the closed-pool gauge structure (every settlement contributes to the same global bucket the operator is then claiming from), this makes wash-trading economically marginal at any reasonable TOKEN price — the attacker pays into the pool they're trying to drain, with 8% leakage to treasury+safety per self-deal, and the cap suppresses any non-proportional share they could extract via ve-boost. Sybil expansion of attack-operator count requires fresh `StakingRegistry` registrations each with the [ADR 026 § Operator economics and minimum stake](026-tokenomics.md#7-operator-economics-and-minimum-stake) minimum stake, converting wash-trading from a heuristic-bypass attack into a stake-proportional capital-lockup attack. A single honest operator with a dominant byte share is also subject to the cap, which is the intended posture — the gauge pool exists to incentivize a diverse operator set, not to reward concentration.
 
 ### Voting escrow (`VotingEscrow`)
 
@@ -65,13 +65,13 @@ Vote-escrowed TOKEN. Modeled on veCRV with deliberate deviations.
 
 #### Historical checkpointing
 
-`VotingEscrow.balanceOfAt(user, ts)` and `totalSupplyAt(ts)` are load-bearing for the epoch-snapshot pattern in [ADR 026 §2](026-tokenomics.md#2-feerouter-split-40407553) and the governance pattern in [ADR 026 §9](026-tokenomics.md#9-governance). Per-lock checkpoints; reads O(log n) on the checkpoint array; writes O(1) amortized.
+`VotingEscrow.balanceOfAt(user, ts)` and `totalSupplyAt(ts)` are load-bearing for the epoch-snapshot pattern in [ADR 026 § FeeRouter split (40/40/7/5/5/3)](026-tokenomics.md#2-feerouter-split-40407553) and the governance pattern in [ADR 026 § Governance](026-tokenomics.md#9-governance). Per-lock checkpoints; reads O(log n) on the checkpoint array; writes O(1) amortized.
 
 #### Lock ownership
 
 Locks may be held by any address — EOA or contract. Lock creation (`createLock`), amount increase (`increaseAmount`), and time extension (`increaseUnlockTime`) are stable for cross-contract integration. A future contract that holds a pooled lock on behalf of multiple beneficiaries (e.g., a liquid-ve wrapper) integrates as an additive top-level contract via these interfaces without changing `VotingEscrow`.
 
-**Operator stake and ve-positions are separate.** A node's operator stake is held in `StakingRegistry` and is slashable (rates per [ADR 026 §8](026-tokenomics.md#8-slashing-and-burn)). A ve-position is held in `VotingEscrow` and is not. Neither satisfies the other's requirements; an operator may hold any combination. This separation is a hard invariant — no contract path lets ve-locked TOKEN be slashed.
+**Operator stake and ve-positions are separate.** A node's operator stake is held in `StakingRegistry` and is slashable (rates per [ADR 026 § Slashing and burn](026-tokenomics.md#8-slashing-and-burn)). A ve-position is held in `VotingEscrow` and is not. Neither satisfies the other's requirements; an operator may hold any combination. This separation is a hard invariant — no contract path lets ve-locked TOKEN be slashed.
 
 #### Contract: VotingEscrow
 

@@ -36,7 +36,7 @@ Metrics are grouped into **mandatory** (M) and **recommended** (R) tiers.
 
 #### 2.1 Slash-Safety Metrics (all Mandatory)
 
-Early warning for the three slashable offenses in [ADR 026 §8](026-tokenomics.md#8-slashing-and-burn). A sustained non-zero value for any of these requires immediate operator attention.
+Early warning for the three slashable offenses in [ADR 026 § Slashing and burn](026-tokenomics.md#8-slashing-and-burn). A sustained non-zero value for any of these requires immediate operator attention.
 
 | Metric | Type | Tier | Description |
 |--------|------|------|-------------|
