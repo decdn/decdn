@@ -14,11 +14,18 @@ use std::pin::Pin;
 use bytes::Bytes;
 use futures_util::Stream;
 use iroh_blobs::Hash;
-use serde::{Deserialize, Serialize};
 
 pub use fs::FilesystemOrigin;
-pub use http::{DEFAULT_USER_AGENT, DecompressMode, HttpOrigin, OriginUrl, parse_origin_url};
+pub use http::HttpOrigin;
 pub use s3::{S3Credentials, S3Origin, S3OriginConfig};
+// `OriginKind`, `OriginUrl`, `DecompressMode`, `parse_origin_url`, and
+// `DEFAULT_USER_AGENT` moved to the `decdn-config-types` leaf crate
+// (#578); re-export from there so `decdn_cache::origin::*` paths and the
+// `Origin` trait's `kind()` return type stay identical to the
+// top-level `decdn_cache::*` re-exports.
+pub use decdn_config_types::{
+    DEFAULT_USER_AGENT, DecompressMode, OriginKind, OriginUrl, parse_origin_url, redact_for_log,
+};
 
 use crate::error::OriginPullError;
 
@@ -90,48 +97,10 @@ impl std::error::Error for BlobTooLargeMarker {}
 pub type OriginByteStream =
     Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send + Sync + 'static>>;
 
-/// Tag identifying which [`Origin`] backend a [`crate::CacheEngine`] is
-/// configured against (#439). Surfaced through
-/// [`crate::EvictionPreview::origin_kinds`] so admin dry-run callers can
-/// estimate origin egress cost — re-fetching from a `Filesystem` origin
-/// is a local read; `Http` and `S3` may consume metered bandwidth.
-///
-/// The serde representation uses lowercase tag names (`http`,
-/// `filesystem`, `s3`) so admin RPC JSON output is operator-friendly
-/// and stable for log scrapers. (`OriginKind` itself is output-only —
-/// it is never deserialised from operator TOML; the `[cache.origin]`
-/// table uses `OriginConfig`.)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-#[non_exhaustive]
-pub enum OriginKind {
-    /// Pull-through over HTTP/HTTPS via [`HttpOrigin`].
-    Http,
-    /// Pull-through from a local filesystem directory via
-    /// [`FilesystemOrigin`].
-    Filesystem,
-    /// Pull-through from an S3-compatible object store via [`S3Origin`].
-    S3,
-}
-
-impl OriginKind {
-    /// Stable lowercase string label suitable for log fields and
-    /// metrics. Operators may grep on this — keep the variants stable.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Http => "http",
-            Self::Filesystem => "filesystem",
-            Self::S3 => "s3",
-        }
-    }
-}
-
-impl std::fmt::Display for OriginKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+// `OriginKind` (the backend tag surfaced through the admin
+// eviction-preview, #439) moved to the `decdn-config-types` leaf crate
+// (#578) and is re-exported above. Its serde/`as_str`/`Display`
+// wire-form contract and the `origin_kind_*` tests live there.
 
 /// Result of an [`Origin::fetch`] call.
 ///
@@ -268,70 +237,4 @@ pub trait Origin: std::fmt::Debug + Send + Sync + 'static {
     /// can estimate origin egress cost (#439) — `Filesystem` is a local
     /// read; `Http` may bill metered bandwidth.
     fn kind(&self) -> OriginKind;
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-mod tests {
-    use super::*;
-
-    /// `OriginKind`'s JSON serialisation is part of the operator-visible
-    /// contract — admin RPC responses, log scrapers, and runbook regex
-    /// patterns all depend on the literal lowercase strings `"http"`,
-    /// `"filesystem"`, and `"s3"`. A future refactor that swapped
-    /// `#[serde(rename_all = "lowercase")]` for `snake_case`, dropped the
-    /// attribute, or accidentally derived a different shape would break
-    /// every consumer silently. Pin the wire form here so any such
-    /// regression fails this test.
-    #[test]
-    fn origin_kind_serialises_to_stable_lowercase_strings() {
-        assert_eq!(
-            serde_json::to_string(&OriginKind::Http).expect("serialise"),
-            "\"http\""
-        );
-        assert_eq!(
-            serde_json::to_string(&OriginKind::Filesystem).expect("serialise"),
-            "\"filesystem\""
-        );
-        assert_eq!(
-            serde_json::to_string(&OriginKind::S3).expect("serialise"),
-            "\"s3\""
-        );
-    }
-
-    /// Round-trip via JSON to lock both the serialise *and* deserialise
-    /// directions: a regression that only changed one direction (e.g.
-    /// renamed a variant but added a `#[serde(alias = ...)]`) would
-    /// still drift the operator-visible string.
-    #[test]
-    fn origin_kind_round_trips_through_json() {
-        for variant in [OriginKind::Http, OriginKind::Filesystem, OriginKind::S3] {
-            let s = serde_json::to_string(&variant).expect("serialise");
-            let back: OriginKind = serde_json::from_str(&s).expect("deserialise");
-            assert_eq!(variant, back, "round-trip for {variant:?}");
-        }
-    }
-
-    /// `as_str` and `Display` must agree with the serde tag — operators
-    /// who grep on `decdn_origin_kind="http"` in tracing log lines see
-    /// the `Display` form, while admin RPC consumers see the JSON form.
-    /// The two paths must not drift.
-    #[test]
-    fn origin_kind_as_str_and_display_match_serde_tag() {
-        for variant in [OriginKind::Http, OriginKind::Filesystem, OriginKind::S3] {
-            let json = serde_json::to_string(&variant).expect("serialise");
-            // JSON wraps the tag in quotes; strip them.
-            let unquoted = json.trim_matches('"');
-            assert_eq!(
-                variant.as_str(),
-                unquoted,
-                "as_str disagrees with serde tag for {variant:?}"
-            );
-            assert_eq!(
-                variant.to_string(),
-                unquoted,
-                "Display disagrees with serde tag for {variant:?}"
-            );
-        }
-    }
 }

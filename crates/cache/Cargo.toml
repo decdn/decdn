@@ -8,6 +8,7 @@ description = "Cache engine wrapping iroh-blobs with origin pull-through for deC
 
 [dependencies]
 decdn-protocol = { workspace = true }
+decdn-config-types = { workspace = true }
 iroh = { workspace = true }
 iroh-blobs = { workspace = true }
 iroh-metrics = { workspace = true }

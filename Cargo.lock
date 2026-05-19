@@ -2510,6 +2510,7 @@ dependencies = [
  "aws-smithy-types",
  "bytes",
  "chacha20poly1305",
+ "decdn-config-types",
  "decdn-protocol",
  "flate2",
  "futures-util",
@@ -2563,7 +2564,7 @@ dependencies = [
  "alloy",
  "anyhow",
  "clap",
- "decdn-cache",
+ "decdn-config-types",
  "decdn-protocol",
  "dirs",
  "iroh",
@@ -2575,6 +2576,16 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "url",
+]
+
+[[package]]
+name = "decdn-config-types"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
  "url",
 ]
 

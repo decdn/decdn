@@ -28,8 +28,13 @@ toml = { workspace = true }
 jsonrpsee = { workspace = true }
 rand = { workspace = true }
 # `decdn bundle create` (issue #391): directory walk + glob exclude +
-# streaming BLAKE3. Using `blake3` directly keeps iroh-blobs out of the
-# publisher CLI's dep tree (see `appendix-binaries.md` § binary-size).
+# streaming BLAKE3. `blake3` is used directly for the bundle digest.
+# Post-#578 the *entire* CLI is free of iroh-blobs / the AWS SDK: the
+# config-vocabulary types `decdn-common` needs were extracted into the
+# `decdn-config-types` leaf crate, so `cli → common → config-types` no
+# longer drags in `decdn-cache` (see `appendix-binaries.md` §
+# binary-size). Verify with
+# `cargo tree -p decdn-cli -e normal -i iroh-blobs` (must be empty).
 # `tempfile` is also a runtime dep here because `bundle create` writes
 # the manifest atomically via `NamedTempFile::persist` — a unique
 # O_CREAT|O_EXCL temp avoids the symlink-clobber risk of a predictable

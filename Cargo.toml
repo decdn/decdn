@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/node",
     "crates/protocol",
+    "crates/config-types",
     "crates/cache",
     "crates/incentive",
     "crates/reputation",
@@ -20,6 +21,7 @@ rust-version = "1.95"
 [workspace.dependencies]
 # Internal crates
 decdn-protocol = { path = "crates/protocol" }
+decdn-config-types = { path = "crates/config-types" }
 decdn-cache = { path = "crates/cache" }
 decdn-incentive = { path = "crates/incentive" }
 decdn-reputation = { path = "crates/reputation" }
