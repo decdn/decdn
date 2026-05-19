@@ -387,17 +387,22 @@ jobs:
           config: ".markdownlint.yaml"
 
   adr-book-list:
-    name: ADR book list
+    name: ADR book check
     runs-on: ubuntu-latest
     needs: changes
     # Runs only when the ADR book changes (adr/**/*.md or adr/Makefile);
     # skips otherwise (accepted via ci-success allowed-skips below).
+    # Job id stays `adr-book-list` — referenced by ci-success needs/allowed-skips.
     if: needs.changes.outputs.adr == 'true'
     steps:
       - uses: actions/checkout@v6
-      # `make` is preinstalled on ubuntu-latest; the target is pure shell
-      # (no pandoc/typst/mermaid) and runs sub-second.
+      # `make` is preinstalled on ubuntu-latest; every target is pure shell
+      # (awk/sed/grep, no pandoc/typst/mermaid) and runs sub-second. Separate
+      # steps so a failure points at the specific guard in the checks UI.
       - run: make -C adr check-book-list
+      - run: make -C adr check-bare-refs
+      - run: make -C adr check-md-anchors
+      - run: make -C adr check-section-spacing
 
   # Pytest suite for .github/scripts/coverage-diff.py. Non-blocking by design
   # — excluded from ci-success.needs — so a regression in the helper surfaces
