@@ -347,8 +347,7 @@ impl AdminRpcServer for AdminRpcImpl {
         // owned data needed to build a PeerView (raw node_id bytes,
         // region clone, scalar fields). Hex encoding of node_id and
         // final DTO assembly run *after* the lock is released, along
-        // with sorting and (later, in the framework) JSON encoding of
-        // `popular_hashes`. Lock hold time stays proportional to peer
+        // with sorting. Lock hold time stays proportional to peer
         // count and to the per-entry data extraction, no further.
         let raw: Vec<RawPeer> = {
             let guard = self.state.peer_table.read().await;
@@ -455,7 +454,6 @@ mod tests {
                     active_streams: 0,
                     bandwidth_utilization: 0,
                 },
-                popular_hashes: vec![],
                 timestamp_us: ts_us,
             },
             signature: vec![0u8; 64],

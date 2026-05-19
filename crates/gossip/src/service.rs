@@ -369,9 +369,9 @@ fn publisher_task(
             // Both arms drive the same publish; the trigger arm exists so
             // operators running `decdn node announce` (issue #280) can push
             // a fresh announce immediately rather than waiting up to
-            // `interval` seconds for peers to see a refreshed `LoadHint` /
-            // `popular_hashes` (the fields in `NodeAnnounceBody` that vary
-            // between iterations). `region_code` is captured by-value
+            // `interval` seconds for peers to see a refreshed `LoadHint`
+            // (the field in `NodeAnnounceBody` that varies between
+            // iterations). `region_code` is captured by-value
             // above and does not re-read from config inside this loop —
             // changing region requires a restart, which respawns the
             // publisher and obviates the trigger anyway.
@@ -387,7 +387,6 @@ fn publisher_task(
                     active_streams: 0,
                     bandwidth_utilization: 0,
                 },
-                popular_hashes: Vec::new(),
                 timestamp_us: ts,
             };
             let signing_bytes = match body.signing_bytes() {

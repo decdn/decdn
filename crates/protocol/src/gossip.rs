@@ -23,9 +23,6 @@ use serde::{Deserialize, Serialize};
 /// Current `GossipEnvelope::version` emitted by this protocol version.
 pub const GOSSIP_VERSION: u8 = 1;
 
-/// Maximum entries permitted in [`NodeAnnounceBody::popular_hashes`] (ADR 001).
-pub const POPULAR_HASHES_MAX: usize = 20;
-
 /// Length in bytes of an Ed25519 signature.
 pub const SIGNATURE_LEN: usize = 64;
 
@@ -78,8 +75,6 @@ pub struct NodeAnnounceBody {
     pub region: String,
     /// Approximate current utilization.
     pub load: LoadHint,
-    /// Top-N most-requested hashes, at most [`POPULAR_HASHES_MAX`], unique.
-    pub popular_hashes: Vec<[u8; 32]>,
     /// Microseconds since Unix epoch.
     pub timestamp_us: u64,
 }
@@ -112,7 +107,6 @@ mod tests {
                 active_streams: 3,
                 bandwidth_utilization: 42,
             },
-            popular_hashes: vec![[9u8; 32], [10u8; 32]],
             timestamp_us: 1_700_000_000_000_000,
         }
     }

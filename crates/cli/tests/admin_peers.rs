@@ -41,7 +41,6 @@ fn mk_announce(node_id: [u8; 32], region: &str, ts_us: u64) -> NodeAnnounce {
                 active_streams: 0,
                 bandwidth_utilization: 0,
             },
-            popular_hashes: vec![],
             timestamp_us: ts_us,
         },
         signature: vec![0u8; 64],
