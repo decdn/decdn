@@ -2,7 +2,7 @@
 
 > **This is an appendix, not a core protocol ADR.** Blob cache eviction is a local implementation choice — two nodes running different eviction strategies (LRU, LFU, hybrid) still interoperate so long as they honour the probe-triggered hold in [ADR 005 § Probe-Triggered Eviction Hold](005-protocol.md#probe-triggered-eviction-hold). This appendix codifies the recommended LRU approach (refreshed on every successful `CacheEngine::get`), the operator-pinning override, the durable operator-evict orthogonality, the probe-hold composition, and the observability metrics. Alternative implementations are acceptable.
 
-**Touches:** [ADR 005](005-protocol.md), [ADR 011](011-content-takedown.md), [ADR 022](022-content-discovery.md), [architecture.md](architecture.md), [appendix-observability.md](appendix-observability.md)
+**Touches:** [ADR 005](005-protocol.md#adr-005-wire-protocol), [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting), [ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale), [architecture.md](architecture.md#architecture-overview), [appendix-observability.md](appendix-observability.md#appendix-observability-and-metrics)
 
 ## Context
 
@@ -18,7 +18,7 @@ The existing implementation in `crates/cache/src/engine.rs` already commits to L
 
 ## Decision
 
-The blob cache uses **least-recently-used (LRU) eviction** keyed on the `Instant` of the last successful `CacheEngine::get` (refreshed on both the cache-hit path and the post-pull-through path). Pinned hashes are exempt from LRU; operator-evicted hashes are durably hidden orthogonally to LRU; probe-hold-marked hashes defer to [ADR 005](005-protocol.md). Reputation does not factor into eviction.
+The blob cache uses **least-recently-used (LRU) eviction** keyed on the `Instant` of the last successful `CacheEngine::get` (refreshed on both the cache-hit path and the post-pull-through path). Pinned hashes are exempt from LRU; operator-evicted hashes are durably hidden orthogonally to LRU; probe-hold-marked hashes defer to [ADR 005](005-protocol.md#adr-005-wire-protocol). Reputation does not factor into eviction.
 
 ### 1. Eviction key
 
@@ -52,7 +52,7 @@ This appendix adds nothing to the hold mechanism itself — a separate layer wit
 
 ### 5. Reputation does not factor into eviction
 
-Reputation governs *selection* (the unified score in [ADR 001 § Node Selection Algorithm](001-network.md#node-selection-algorithm) and [ADR 008](008-reputation.md)), not local-cache retention. A blob's reputation-derived "value" is irrelevant to the cache; only access recency is. This mirrors [appendix-peer-table-eviction.md §4](appendix-peer-table-eviction.md#4-reputation-does-not-factor-into-eviction) for the same reasons: coupling reputation to eviction would create a collusive-reporting vector and conflate two concerns whose designs live in separate ADRs.
+Reputation governs *selection* (the unified score in [ADR 001 § Node Selection Algorithm](001-network.md#node-selection-algorithm) and [ADR 008](008-reputation.md#adr-008-reputation-system)), not local-cache retention. A blob's reputation-derived "value" is irrelevant to the cache; only access recency is. This mirrors [appendix-peer-table-eviction.md §4](appendix-peer-table-eviction.md#4-reputation-does-not-factor-into-eviction) for the same reasons: coupling reputation to eviction would create a collusive-reporting vector and conflate two concerns whose designs live in separate ADRs.
 
 ### 6. Observability
 
@@ -66,13 +66,13 @@ Naming follows [appendix-observability.md §2.3 Cache Metrics](appendix-observab
 | `decdn_cache_evicted_operator_total` | counter, unlabeled | New: hashes removed via `decdn node evict`. Distinct from `decdn_cache_evictions_total`. |
 | `decdn_cache_pinned_count` | gauge | New: size of the operator-pinned set. |
 
-`decdn_probe_hold_*` metrics ([appendix §2.1](appendix-observability.md#21-slash-safety-metrics-all-mandatory)) are owned by [ADR 005](005-protocol.md) and not redefined here. A sustained non-zero `decdn_probe_hold_violations_total` rate, paired with `decdn_cache_bytes ≈ decdn_cache_size_limit_bytes`, indicates the eviction driver is racing the hold layer — the operator response is to raise `cache.cache_size_mb` or lower `max_probe_holds`, not to disable the hold.
+`decdn_probe_hold_*` metrics ([appendix §2.1](appendix-observability.md#21-slash-safety-metrics-all-mandatory)) are owned by [ADR 005](005-protocol.md#adr-005-wire-protocol) and not redefined here. A sustained non-zero `decdn_probe_hold_violations_total` rate, paired with `decdn_cache_bytes ≈ decdn_cache_size_limit_bytes`, indicates the eviction driver is racing the hold layer — the operator response is to raise `cache.cache_size_mb` or lower `max_probe_holds`, not to disable the hold.
 
 Driver-loop-specific counters are listed in §7 below alongside the driver mechanism they instrument.
 
 ### 7. Eviction driver loop
 
-The driver loop is the runtime that consumes `CacheEngine::eviction_candidates()` and removes hashes until the cache footprint is below target. It runs as a single async task owned by the `node` crate's wiring layer (per [appendix-poc-production-seams.md](appendix-poc-production-seams.md)), independent of the cache write path.
+The driver loop is the runtime that consumes `CacheEngine::eviction_candidates()` and removes hashes until the cache footprint is below target. It runs as a single async task owned by the `node` crate's wiring layer (per [appendix-poc-production-seams.md](appendix-poc-production-seams.md#appendix-pocproduction-seam-architecture-rust-implementation)), independent of the cache write path.
 
 #### Trigger and target
 
@@ -112,7 +112,7 @@ The `cache.cache_size_mb` ceiling is enforced by the driver, not the cache write
 ### Positive
 
 - Codifies what the implementation already does. No code change is required to ship the policy contract; the new §6 metrics (`decdn_cache_size_limit_bytes`, `decdn_cache_evicted_operator_total`, `decdn_cache_pinned_count`) land alongside the eviction-driver loop when it is wired.
-- Three layers (pinning, operator-evict, probe-hold) compose without entanglement. Each has a single owner (§2 / §3 / [ADR 005](005-protocol.md)) and a single rule.
+- Three layers (pinning, operator-evict, probe-hold) compose without entanglement. Each has a single owner (§2 / §3 / [ADR 005](005-protocol.md#adr-005-wire-protocol)) and a single rule.
 - DMCA compliance is preserved exactly: operator-evict beats pinning, beats LRU, and is durable across restart. No policy gap lets a pinned-and-evicted hash resurface.
 - LRU's bookkeeping is one timestamp per cached hash. At PoC scale (10 GB / typical blob ~ 10 MB → ~1 000 entries), the `HashMap<Hash, Instant>` overhead is < 100 KB.
 

@@ -143,7 +143,7 @@ After the first probe cycles to a given peer, that connection has a cached ticke
 ### Observability
 
 Implementations SHOULD expose the following metrics. They live in the `decdn_*`
-metric family (per [Appendix: Observability](appendix-observability.md) / the node metrics registry); the
+metric family (per [Appendix: Observability](appendix-observability.md#appendix-observability-and-metrics) / the node metrics registry); the
 OpenMetrics encoder appends `_total` to counters. No ALPN label is applied — only one
 ALPN is 0-RTT-eligible, so the label would be constant, and the metrics house style
 is label-free:
@@ -189,4 +189,4 @@ under Consequences and SHOULD be added when that loop lands.
 - [RFC 8446 Section 8](https://www.rfc-editor.org/rfc/rfc8446#section-8) — TLS 1.3 0-RTT and anti-replay
 - [ADR 001 — Content Discovery](001-network.md#content-discovery-dht--probe)
 - [ADR 005 — Connection Management](005-protocol.md#connection-management)
-- [ADR 013 — Schema Evolution](013-schema-evolution.md) — protocol-enum framing rules
+- [ADR 013 — Schema Evolution](013-schema-evolution.md#adr-013-schema-evolution) — protocol-enum framing rules

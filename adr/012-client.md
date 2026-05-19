@@ -7,10 +7,10 @@
 
 Clients are referenced throughout ADRs 001–011 — they pay for content, hold Ethereum keys that authorize fund movement, maintain peer tables, validate gossip, and decrypt content envelopes — but no ADR defines the client as a coherent entity. Five gaps block PoC functionality:
 
-1. **Bootstrap** — how does a client discover initial peers? [ADR 001](001-network.md) specifies registry query and retry but interleaves it with node-specific concerns and is incomplete for clients (no gossip subscription policy, no identity loading).
+1. **Bootstrap** — how does a client discover initial peers? [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) specifies registry query and retry but interleaves it with node-specific concerns and is incomplete for clients (no gossip subscription policy, no identity loading).
 2. **Key management** — clients hold an iroh Ed25519 key (NodeId) and an Ethereum secp256k1 key (voucher signing, channel operations). Generation, storage, and rotation are unspecified.
-3. **Identity lifecycle** — [ADR 005](005-protocol.md) defines ephemeral NodeId-to-Ethereum bindings in `StreamRequest` but does not specify creation, rotation, or expiry.
-4. **Eclipse attack resolution** — [ADR 003](003-payments.md) lists Options A/B/C with no decision.
+3. **Identity lifecycle** — [ADR 005](005-protocol.md#adr-005-wire-protocol) defines ephemeral NodeId-to-Ethereum bindings in `StreamRequest` but does not specify creation, rotation, or expiry.
+4. **Eclipse attack resolution** — [ADR 003](003-payments.md#adr-003-payment-model) lists Options A/B/C with no decision.
 5. **Trust boundary** — what does the client verify vs. trust? Implied across multiple ADRs but never stated explicitly.
 
 This ADR consolidates all client-specific behavior into a single canonical specification.
@@ -23,7 +23,7 @@ This ADR targets **desktop and server clients** — POSIX or Windows hosts with 
 
 - A writable home directory for `~/.decdn/` keys, peer cache, and download state.
 - Direct UDP socket access for iroh QUIC and iroh-relay traversal.
-- Local NTP synchronization (required for gossip validation per [ADR 001](001-network.md)).
+- Local NTP synchronization (required for gossip validation per [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)).
 - Either an OS keychain (production) or a local encrypted keystore file (PoC) for Ethereum key storage.
 
 **Mobile clients (iOS, Android) and web clients (browser) are out of scope.** They require fundamentally different choices for key custody (platform secure enclave / WalletConnect rather than filesystem keystore), transport (WebTransport rather than raw QUIC; no UDP on browsers), and storage (platform sandbox rather than `~/.decdn/`). The voucher-signing UX (high-frequency session-key signatures per [ADR 024 §3](024-account-abstraction.md#3-session-keys--deferred-to-production-via-erc-7579-smartsessions)) and the bootstrap procedure (registry RPC + DNS seeds) both assume desktop-class capabilities.
@@ -33,10 +33,10 @@ This ADR targets **desktop and server clients** — POSIX or Windows hosts with 
 A client is a lightweight QUIC endpoint that streams content and pays per MB. It is **not** a staked node and has no on-chain registration requirement. Capabilities:
 
 - Opens `cdn/client/v1` connections to nodes for paid content delivery
-- Uses `cdn/dht/v1` FIND_VALUE for content discovery; falls back to `cdn/probe/v1` broadcast during bootstrap (see [ADR 022](022-content-discovery.md))
+- Uses `cdn/dht/v1` FIND_VALUE for content discovery; falls back to `cdn/probe/v1` broadcast during bootstrap (see [ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale))
 - **Subscribes** to gossip topics to receive `NodeAnnounce` messages
 - Does **not** publish `NodeAnnounce` (not a staked node)
-- Does **not** publish `ReputationReport` via gossip ([ADR 008](008-reputation.md) — clients contribute local observations only)
+- Does **not** publish `ReputationReport` via gossip ([ADR 008](008-reputation.md#adr-008-reputation-system) — clients contribute local observations only)
 - Maintains a local peer table (`NodeId → NodeAnnounce`) and reputation scores
 - Signs vouchers authorizing off-chain USDC payments
 
@@ -83,11 +83,11 @@ For PoC, steps 4–5 are skipped (no DNS seeds configured). The registry is the 
 | Maintain peer table | Yes | Yes |
 | Require NTP synchronization | Yes (for gossip validation) | Yes |
 
-The client validates gossip using the same rules as nodes: signature verification, registry membership check, and ±60-second timestamp freshness ([ADR 001](001-network.md)). This requires NTP synchronization, as already mandated for "validating clients" in [ADR 001](001-network.md).
+The client validates gossip using the same rules as nodes: signature verification, registry membership check, and ±60-second timestamp freshness ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)). This requires NTP synchronization, as already mandated for "validating clients" in [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh).
 
 Clients participate as gossip *leaves*: they subscribe and validate but never forward received messages back into the mesh. iroh-gossip propagation is the responsibility of staked nodes, which carry economic accountability (slashing, reputation) for relay correctness and availability; unstaked clients carry none. This applies to both PoC and production — not a deployment-time toggle.
 
-The registry query, retry schedule, and `peers.json` fallback defined here supersede the client-specific portions of [ADR 001 — Registry Unavailability](001-network.md#registry-unavailability). [ADR 001](001-network.md) retains the specification for node bootstrap and registry interaction.
+The registry query, retry schedule, and `peers.json` fallback defined here supersede the client-specific portions of [ADR 001 — Registry Unavailability](001-network.md#registry-unavailability). [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) retains the specification for node bootstrap and registry interaction.
 
 ### Key Management
 
@@ -109,28 +109,28 @@ Clients manage two independent cryptographic keys.
 - **PoC:** Either an encrypted keystore file at `~/.decdn/eth_keystore` (Web3 Secret Storage format, EOA) or a Safe smart wallet address. The client supports both — all contracts use `SignatureChecker`, which transparently handles EOA and smart account signatures.
 - **Production:** Safe smart wallet (recommended). 1-of-1 for simplicity, 2-of-3 for high-value accounts. A **session key** authorized via the Safe's Session Key Module handles high-frequency voucher signing — see [ADR 024 §3](024-account-abstraction.md#3-session-keys--deferred-to-production-via-erc-7579-smartsessions).
 
-**Voucher signing with session keys:** At the default 1 MB voucher cadence, a 100 MB download requires 100 EIP-712 voucher signatures. Hardware wallets require physical confirmation per signature (2–5 seconds each), making them infeasible. Session keys solve this: a lightweight secp256k1 key generated at session start, authorized by the Safe owners (one approval), held in memory for the session, signing vouchers at wire speed. It is time-bounded, scope-limited to voucher signatures, and revocable by the Safe owners. See [ADR 024](024-account-abstraction.md) for the full design.
+**Voucher signing with session keys:** At the default 1 MB voucher cadence, a 100 MB download requires 100 EIP-712 voucher signatures. Hardware wallets require physical confirmation per signature (2–5 seconds each), making them infeasible. Session keys solve this: a lightweight secp256k1 key generated at session start, authorized by the Safe owners (one approval), held in memory for the session, signing vouchers at wire speed. It is time-bounded, scope-limited to voucher signatures, and revocable by the Safe owners. See [ADR 024](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support) for the full design.
 
 #### Key Summary
 
 | Key | Algorithm | PoC Storage | Production Storage | Rotation |
 | --- | --- | --- | --- | --- |
 | iroh identity | Ed25519 | `~/.decdn/iroh_key` (0600) | Platform keychain | New key + reconnect |
-| Ethereum | secp256k1 | `~/.decdn/eth_keystore` (encrypted) or Safe address | Safe wallet + session key ([ADR 024](024-account-abstraction.md)) | Wallet-level |
+| Ethereum | secp256k1 | `~/.decdn/eth_keystore` (encrypted) or Safe address | Safe wallet + session key ([ADR 024](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support)) | Wallet-level |
 
 ### Identity Lifecycle
 
-Client identity bindings are **ephemeral and per-connection**, per [ADR 003 — Off-Chain Ephemeral Binding](003-payments.md#off-chain-ephemeral-binding-for-clients) and [ADR 005](005-protocol.md).
+Client identity bindings are **ephemeral and per-connection**, per [ADR 003 — Off-Chain Ephemeral Binding](003-payments.md#off-chain-ephemeral-binding-for-clients) and [ADR 005](005-protocol.md#adr-005-wire-protocol).
 
 **Lifecycle:**
 
-1. **Startup:** Load iroh key (→ `NodeId`). Load Ethereum key from keystore (EOA) or configure a 1-of-1 Safe with its owner key loaded from keystore; Production migrates to Safe-7579 + `erc7579/smartsessions` for high-frequency signing ([ADR 024](024-account-abstraction.md)).
+1. **Startup:** Load iroh key (→ `NodeId`). Load Ethereum key from keystore (EOA) or configure a 1-of-1 Safe with its owner key loaded from keystore; Production migrates to Safe-7579 + `erc7579/smartsessions` for high-frequency signing ([ADR 024](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support)).
 2. **Connect:** Establish QUIC connection to a node via `cdn/client/v1`.
 3. **Bind:** First `StreamRequest` on the connection includes `ethereum_address` and `binding_signature` — an EIP-712 `BindNodeId(nodeId, nonce=0)` signature. The `nonce=0` sentinel indicates an ephemeral (off-chain) binding.
 4. **Session:** The node verifies the signature via `SignatureChecker` semantics (`ecrecover` for EOA clients, ERC-1271 `isValidSignature` RPC call for smart account clients — see [ADR 024](024-account-abstraction.md#4-off-chain-erc-1271-verification)), caches the binding for the connection's lifetime, and uses the verified address for voucher attribution. Subsequent requests on the same connection omit these fields.
 5. **Disconnect:** The node discards the cached binding. No on-chain state to clean up.
 
-**Security properties of `nonce=0`:** The ephemeral binding is not a replay vulnerability because the node only uses it for the authenticated QUIC connection on which it was received — a binding from connection A is never applied to connection B. On-chain `bindNodeId` ([ADR 003](003-payments.md)) also starts at nonce 0 (`bindingNonce[msg.sender]` is initially 0), so the nonce value alone does not distinguish off-chain from on-chain bindings. Protection against on-chain replay is the EIP-712 domain separator: the node verifies the off-chain binding via `SignatureChecker` semantics (locally, not on-chain), while on-chain `bindNodeId` verifies against `DOMAIN_SEPARATOR` (which includes the `StakingRegistry` contract address and chain ID). A signature produced for off-chain use cannot pass the on-chain domain check unless the client uses the exact same domain parameters — and if it does, the on-chain binding consumes the nonce, preventing reuse.
+**Security properties of `nonce=0`:** The ephemeral binding is not a replay vulnerability because the node only uses it for the authenticated QUIC connection on which it was received — a binding from connection A is never applied to connection B. On-chain `bindNodeId` ([ADR 003](003-payments.md#adr-003-payment-model)) also starts at nonce 0 (`bindingNonce[msg.sender]` is initially 0), so the nonce value alone does not distinguish off-chain from on-chain bindings. Protection against on-chain replay is the EIP-712 domain separator: the node verifies the off-chain binding via `SignatureChecker` semantics (locally, not on-chain), while on-chain `bindNodeId` verifies against `DOMAIN_SEPARATOR` (which includes the `StakingRegistry` contract address and chain ID). A signature produced for off-chain use cannot pass the on-chain domain check unless the client uses the exact same domain parameters — and if it does, the on-chain binding consumes the nonce, preventing reuse.
 
 **Key rotation:** Generating a new iroh key and reconnecting produces a new NodeId. The client signs a fresh `BindNodeId` with the same Ethereum key and the new NodeId. Open payment channels remain valid — channels are keyed by `(client_ethereum_address, provider_ethereum_address, nonce)`, not by NodeId.
 
@@ -139,7 +139,7 @@ Client identity bindings are **ephemeral and per-connection**, per [ADR 003 — 
 | Compromised key | Impact | Response |
 | --- | --- | --- |
 | iroh Ed25519 | Attacker can impersonate client NodeId (connect to nodes, receive gossip) but cannot sign vouchers or move funds. | Generate new iroh key, reconnect |
-| Ethereum secp256k1 | Attacker can sign vouchers draining the payment channel balance | Race to close channels: call `closeChannel` with the latest voucher nonce. If attacker has already submitted a close with a higher-nonce voucher, dispute within the challenge window ([ADR 003](003-payments.md)). No revocation mechanism exists beyond racing to close. |
+| Ethereum secp256k1 | Attacker can sign vouchers draining the payment channel balance | Race to close channels: call `closeChannel` with the latest voucher nonce. If attacker has already submitted a close with a higher-nonce voucher, dispute within the challenge window ([ADR 003](003-payments.md#adr-003-payment-model)). No revocation mechanism exists beyond racing to close. |
 | Both | Full impersonation | Close all channels immediately. Generate new iroh key. Use a new Ethereum address for future sessions. |
 
 ### Eclipse Attack Mitigation
@@ -149,7 +149,7 @@ At small mesh scale, eclipse attacks require both Sybil-scale capital (staking e
 1. **On-chain registry** — `StakingRegistry.getActiveNodes()` via the configured RPC endpoint.
 2. **DNS seed list** — TXT records at `_decdn-seeds.{domain}` for each domain in a governance-maintained seed list. Record format: `nodeId=<hex>; addrs=<multiaddr>,<multiaddr>`.
 
-Each client release ships with a built-in default seed list compiled into the binary; the `dns_seeds` configuration key (see [Client Configuration](#client-configuration)) provides a runtime override. Seed domains are maintained by governance ([ADR 009](009-governance.md)) and updated via new client releases or local config. An attacker must compromise both the RPC endpoint and all effective DNS seed domains to fully eclipse a client.
+Each client release ships with a built-in default seed list compiled into the binary; the `dns_seeds` configuration key (see [Client Configuration](#client-configuration)) provides a runtime override. Seed domains are maintained by governance ([ADR 009](009-governance.md#adr-009-governance-model)) and updated via new client releases or local config. An attacker must compromise both the RPC endpoint and all effective DNS seed domains to fully eclipse a client.
 
 **Supplementary: Option C — Minimum honest-peer diversity** is adopted as a client-side policy (not protocol-enforced). The client maintains connections to at least `min_peer_diversity` nodes (default: 3) discovered via different sources (registry vs. DNS vs. gossip). If all connected nodes share one discovery source, the client logs a warning. Advisory — not blocking.
 
@@ -161,7 +161,7 @@ Each client release ships with a built-in default seed list compiled into the bi
 
 - **Content integrity:** BLAKE3 hash verification on every received blob. A malicious node cannot serve corrupted data.
 - **Voucher binding:** EIP-712 signatures on vouchers are produced by the client's own key. The client controls how much it authorizes.
-- **Rate commitment:** `StreamResponse` carries a `slash_sig` (EIP-712 secp256k1) over the response fields, binding the node's registered Ethereum identity to the quoted `rate_per_mb`. A rate mismatch vs. the probe response within 30 seconds is slashable ([ADR 005](005-protocol.md)).
+- **Rate commitment:** `StreamResponse` carries a `slash_sig` (EIP-712 secp256k1) over the response fields, binding the node's registered Ethereum identity to the quoted `rate_per_mb`. A rate mismatch vs. the probe response within 30 seconds is slashable ([ADR 005](005-protocol.md#adr-005-wire-protocol)).
 - **Node identity:** QUIC handshake authenticates the remote NodeId (Ed25519). The client knows it is communicating with the registered node.
 - **Payment channel state:** On-chain, publicly verifiable. The client can always settle or dispute.
 
@@ -175,7 +175,7 @@ Each client release ships with a built-in default seed list compiled into the bi
 #### Not trusted — the client does not rely on these
 
 - Any individual node's self-reported metadata (region, load) beyond what is signed and slashable.
-- Network-level reputation scores (30% gossip weight in [ADR 008](008-reputation.md); local observations dominate at 70%).
+- Network-level reputation scores (30% gossip weight in [ADR 008](008-reputation.md#adr-008-reputation-system); local observations dominate at 70%).
 - Node availability promises beyond signed probe responses (unsigned gossip claims like `LoadHint` are advisory).
 
 ### Client Configuration
@@ -234,7 +234,7 @@ The client queries all configured seed domains, cross-checks returned NodeIds ag
 - Consolidates client behavior scattered across ADRs 001, 003, 005, and 008 into a single canonical specification
 - Specifies multi-source bootstrap (Option B) as the production eclipse-attack defense
 - Establishes an explicit trust boundary, making security assumptions auditable
-- PoC key management is simple (file-based EOA or Safe wallet) with a clear production upgrade path (Safe multisig with session keys — see [ADR 024](024-account-abstraction.md))
+- PoC key management is simple (file-based EOA or Safe wallet) with a clear production upgrade path (Safe multisig with session keys — see [ADR 024](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support))
 - Bootstrap procedure is fully specified end-to-end, unblocking PoC implementation
 
 ### Negative
@@ -242,7 +242,7 @@ The client queries all configured seed domains, cross-checks returned NodeIds ag
 - DNS seed list introduces a governance-maintained out-of-band dependency for production
 - File-based key storage in PoC is not suitable for production (acceptable for testnet with test funds)
 - NTP synchronization is a hard requirement for gossip validation — clients without NTP will reject valid gossip and build stale peer tables
-- Hardware wallet voucher signing is confirmed infeasible — resolved by Safe session keys ([ADR 024](024-account-abstraction.md))
+- Hardware wallet voucher signing is confirmed infeasible — resolved by Safe session keys ([ADR 024](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support))
 
 ## Multi-Node Parallel Download
 
@@ -256,7 +256,7 @@ decdn pull <hash> --max-channels <N> -o <output>
 
 ### Economic threshold
 
-Opening, closing, and settling a payment channel costs ~$0.23 at the production L2's typical gas prices ([ADR 003](003-payments.md)). For N nodes that is N × $0.23 in fixed overhead before a byte is delivered. At $0.01/GB this overhead is significant, so parallelism is recommended only for large blobs (e.g., > 10 GiB) to amortize the per-channel cost. The `--min-blob-size` flag (default: 10 GiB) disables parallelism for smaller blobs.
+Opening, closing, and settling a payment channel costs ~$0.23 at the production L2's typical gas prices ([ADR 003](003-payments.md#adr-003-payment-model)). For N nodes that is N × $0.23 in fixed overhead before a byte is delivered. At $0.01/GB this overhead is significant, so parallelism is recommended only for large blobs (e.g., > 10 GiB) to amortize the per-channel cost. The `--min-blob-size` flag (default: 10 GiB) disables parallelism for smaller blobs.
 
 ### Range assignment
 

@@ -11,7 +11,7 @@ We are building a decentralized CDN with two participant roles: **nodes** (provi
 - Concurrent handling of many inbound connections per node
 - Safe memory management without a garbage collector introducing latency spikes under load
 - A QUIC-based transport with content-addressed verified transfer
-- Two statically linked binaries — a `decdn-node` daemon and a `decdn` CLI — sharing a common config schema and identity model (see [Appendix: deCDN Binaries](appendix-binaries.md))
+- Two statically linked binaries — a `decdn-node` daemon and a `decdn` CLI — sharing a common config schema and identity model (see [Appendix: deCDN Binaries](appendix-binaries.md#appendix-decdn-binaries--decdn-node--decdn-split))
 
 ## Decision
 

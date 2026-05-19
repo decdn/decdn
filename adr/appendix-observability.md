@@ -43,10 +43,10 @@ Early warning for the three slashable offenses in [ADR 026 §8](026-gauge-boost-
 | `decdn_probe_hold_violations_total` | Counter | M | Blob evicted within `probe_hold_duration` after signing `has_blob: true`. Each increment is a signed phantom-announcement slash risk ([ADR 005](005-protocol.md#probe-triggered-eviction-hold)). |
 | `decdn_probe_hold_slots_used` | Gauge | M | Eviction-hold slots in use out of `max_probe_holds`. Saturation forces `has_blob: false` at probe time. |
 | `decdn_probe_hold_slots_max` | Gauge | M | Configured `max_probe_holds`. Paired with `decdn_probe_hold_slots_used` for a saturation ratio. |
-| `decdn_blacklist_sync_lag_seconds` | Gauge | M | Seconds since the last successful `getBlacklistVersion()` poll. Exceeding the compliance window makes serving any recently-blacklisted hash slashable ([ADR 011](011-content-takedown.md)). |
+| `decdn_blacklist_sync_lag_seconds` | Gauge | M | Seconds since the last successful `getBlacklistVersion()` poll. Exceeding the compliance window makes serving any recently-blacklisted hash slashable ([ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)). |
 | `decdn_blacklist_version_behind` | Gauge | M | `on_chain_version − local_version`. Positive means new blacklist entries not yet fetched. |
-| `decdn_rate_bounds_clamp_events_total` | Counter | M | Times `rate_per_mb` was clamped to governance bounds before signing a `ProbeResponse` — configured rate is outside the current governance window ([ADR 003](003-payments.md), [ADR 005](005-protocol.md)). |
-| `decdn_slash_evidence_exposure_total` | Counter | M | Self-detected `has_blob: true` probe followed by a stream response within the 30-second slashing window — valid phantom slash evidence ([ADR 005](005-protocol.md)). Non-zero is a critical bug signal. |
+| `decdn_rate_bounds_clamp_events_total` | Counter | M | Times `rate_per_mb` was clamped to governance bounds before signing a `ProbeResponse` — configured rate is outside the current governance window ([ADR 003](003-payments.md#adr-003-payment-model), [ADR 005](005-protocol.md#adr-005-wire-protocol)). |
+| `decdn_slash_evidence_exposure_total` | Counter | M | Self-detected `has_blob: true` probe followed by a stream response within the 30-second slashing window — valid phantom slash evidence ([ADR 005](005-protocol.md#adr-005-wire-protocol)). Non-zero is a critical bug signal. |
 
 **Recommended alert thresholds:**
 
@@ -73,21 +73,21 @@ Early warning for the three slashable offenses in [ADR 026 §8](026-gauge-boost-
 | Metric | Type | Tier | Description |
 |--------|------|------|-------------|
 | `decdn_cache_bytes` | Gauge | M | Total cache size in bytes (all blobs). Paired with `decdn_cache_size_limit_bytes` for a saturation ratio. |
-| `decdn_cache_size_limit_bytes` | Gauge | R | Configured cache capacity in bytes (`cache.cache_size_mb × 1 048 576`). See [appendix-blob-cache-eviction.md](appendix-blob-cache-eviction.md). |
+| `decdn_cache_size_limit_bytes` | Gauge | R | Configured cache capacity in bytes (`cache.cache_size_mb × 1 048 576`). See [appendix-blob-cache-eviction.md](appendix-blob-cache-eviction.md#appendix-blob-cache-eviction-policy). |
 | `decdn_cache_hits_total` | Counter | M | Probe or stream requests satisfied from local cache. |
 | `decdn_cache_misses_total` | Counter | M | Probe or stream requests requiring origin pull or peer pull. |
 | `decdn_cache_bytes_returned_total` | Counter | R | Bytes returned from `CacheEngine::get` to the caller on success. Counts both cache-hit and pull-through-success paths. |
 | `decdn_cache_pull_through_bytes_total` | Counter | R | Bytes received from origin during a cache miss, counted regardless of BLAKE3 verification or store landing — origin egress is paid either way. Independent of `decdn_cache_bytes_returned_total`: equal values mean pure pass-through; `bytes_returned_total >> pull_through_bytes_total` indicates effective caching. |
-| `decdn_cache_evictions_total` | Counter | R | Blobs evicted by LRU pressure (eviction-driver loop). See [appendix-blob-cache-eviction.md](appendix-blob-cache-eviction.md). |
+| `decdn_cache_evictions_total` | Counter | R | Blobs evicted by LRU pressure (eviction-driver loop). See [appendix-blob-cache-eviction.md](appendix-blob-cache-eviction.md#appendix-blob-cache-eviction-policy). |
 | `decdn_cache_evicted_operator_total` | Counter | R | Hashes removed via `decdn node evict` (durable, persisted to `<cache_dir>/evicted.log`). Distinct from `decdn_cache_evictions_total`. See [appendix-blob-cache-eviction.md §3](appendix-blob-cache-eviction.md#3-operator-evict-is-orthogonal-to-lru). |
 | `decdn_cache_pinned_count` | Gauge | R | Size of the operator-pinned set (LRU-exempt). See [appendix-blob-cache-eviction.md §2](appendix-blob-cache-eviction.md#2-operator-pinning-overrides-lru). |
-| `decdn_probe_post_eviction_failures_total` | Counter | R | `EvictedSinceProbe` responses from remote nodes during cache-hit stream requests. A sustained rate above ~1% of cache-hit attempts suggests remote hold mechanism failures ([ADR 001](001-network.md), [ADR 005](005-protocol.md)). |
+| `decdn_probe_post_eviction_failures_total` | Counter | R | `EvictedSinceProbe` responses from remote nodes during cache-hit stream requests. A sustained rate above ~1% of cache-hit attempts suggests remote hold mechanism failures ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh), [ADR 005](005-protocol.md#adr-005-wire-protocol)). |
 
 #### 2.4 Probe Metrics (`cdn/probe/v1`)
 
 | Metric | Type | Tier | Labels | Description |
 |--------|------|------|--------|-------------|
-| `decdn_probe_collection_latency_seconds` | Histogram | M | `outcome={0rtt_warm,1rtt_cold}` | Duration of a complete probe collection window, send to collection end. The `outcome` label measures 0-RTT impact per [ADR 015](015-zero-rtt.md). Buckets: `[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5]`. |
+| `decdn_probe_collection_latency_seconds` | Histogram | M | `outcome={0rtt_warm,1rtt_cold}` | Duration of a complete probe collection window, send to collection end. The `outcome` label measures 0-RTT impact per [ADR 015](015-zero-rtt.md#adr-015-quic-0-rtt-connection-establishment). Buckets: `[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5]`. |
 | `decdn_probe_responses_total` | Counter | R | `result={has_blob,no_blob,timeout}` | Probe responses received, by result. |
 
 #### 2.5 Payment Channel Metrics
@@ -105,7 +105,7 @@ Early warning for the three slashable offenses in [ADR 026 §8](026-gauge-boost-
 
 | Metric | Type | Tier | Labels | Description |
 |--------|------|------|--------|-------------|
-| `decdn_gossip_messages_rejected_total` | Counter | M | `reason={clock_skew,invalid_signature,not_registered,stale_timestamp,invalid_region,duplicate_hashes,table_full}` | Gossip messages rejected during validation ([ADR 001](001-network.md#gossip-validation)) or peer-table admission ([appendix-peer-table-eviction.md](appendix-peer-table-eviction.md)). `reason=clock_skew` is the canonical replacement for [ADR 001](001-network.md)'s `gossip_messages_rejected_clock_skew`. `table_full` fires only when the optional `gossip.max_peer_entries` ceiling is set and exceeded. |
+| `decdn_gossip_messages_rejected_total` | Counter | M | `reason={clock_skew,invalid_signature,not_registered,stale_timestamp,invalid_region,duplicate_hashes,table_full}` | Gossip messages rejected during validation ([ADR 001](001-network.md#gossip-validation)) or peer-table admission ([appendix-peer-table-eviction.md](appendix-peer-table-eviction.md#appendix-peer-table-eviction-policy)). `reason=clock_skew` is the canonical replacement for [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)'s `gossip_messages_rejected_clock_skew`. `table_full` fires only when the optional `gossip.max_peer_entries` ceiling is set and exceeded. |
 | `decdn_peer_table_size` | Gauge | M | — | Number of distinct peers in the local peer table. |
 | `decdn_peer_table_evicted_ttl_total` | Counter | R | — | Peer-table entries removed by the TTL sweeper ([appendix-peer-table-eviction.md §1](appendix-peer-table-eviction.md#1-lifecycle-and-ttl)). |
 | `decdn_peer_table_evicted_registry_total` | Counter | R | `reason={deregistered,ejected}` | Peer-table entries removed in response to a `NodeDeregistered` or `NodeAutoEjected` registry event ([appendix-peer-table-eviction.md §3](appendix-peer-table-eviction.md#3-registry-cache-interaction-active-eviction)). |
@@ -115,17 +115,17 @@ Early warning for the three slashable offenses in [ADR 026 §8](026-gauge-boost-
 
 #### 2.7 Reputation Metrics
 
-The metrics below apply once the reputation gossip layer in [ADR 008](008-reputation.md) is implemented; local-only-scoring nodes expose only `decdn_reputation_score`.
+The metrics below apply once the reputation gossip layer in [ADR 008](008-reputation.md#adr-008-reputation-system) is implemented; local-only-scoring nodes expose only `decdn_reputation_score`.
 
 | Metric | Type | Tier | Description |
 |--------|------|------|-------------|
 | `decdn_reputation_reports_sent_total` | Counter | R | `ReputationReport` messages published to `cdn/reputation/v1`. |
 | `decdn_reputation_reports_received_total` | Counter | R | `ReputationReport` messages accepted from peers. |
-| `decdn_reputation_score` | Gauge | R | This node's current `final_score` (0.0–1.0) as computed locally — local observations (70%) + gossip (30%) per [ADR 008](008-reputation.md). |
+| `decdn_reputation_score` | Gauge | R | This node's current `final_score` (0.0–1.0) as computed locally — local observations (70%) + gossip (30%) per [ADR 008](008-reputation.md#adr-008-reputation-system). |
 
 #### 2.8 QUIC / 0-RTT Metrics
 
-Per [ADR 015](015-zero-rtt.md). All labeled by `alpn`.
+Per [ADR 015](015-zero-rtt.md#adr-015-quic-0-rtt-connection-establishment). All labeled by `alpn`.
 
 | Metric | Type | Tier | Description |
 |--------|------|------|-------------|
@@ -133,7 +133,7 @@ Per [ADR 015](015-zero-rtt.md). All labeled by `alpn`.
 | `decdn_quic_0rtt_accepted_total` | Counter | R | 0-RTT connections accepted by server. |
 | `decdn_quic_0rtt_rejected_total` | Counter | R | 0-RTT rejected, fell back to 1-RTT. |
 
-These replace the identical names from [ADR 015](015-zero-rtt.md) — no semantic change, now under the canonical naming regime.
+These replace the identical names from [ADR 015](015-zero-rtt.md#adr-015-quic-0-rtt-connection-establishment) — no semantic change, now under the canonical naming regime.
 
 #### 2.9 Node / Process Metrics
 
@@ -143,24 +143,24 @@ These replace the identical names from [ADR 015](015-zero-rtt.md) — no semanti
 
 #### 2.10 Tokenomics Metrics
 
-Per [ADR 026](026-gauge-boost-tokenomics.md). These metrics expose the `FeeRouter`, `VotingEscrow`, and `SafetyReserve` contract surfaces to operator dashboards, keeper monitoring, gauge-claim debugging, governance dashboards, and the public reporting required by the `SafetyReserve` transparency rules ([ADR 026 §5](026-gauge-boost-tokenomics.md), [ADR 009](009-governance.md)).
+Per [ADR 026](026-gauge-boost-tokenomics.md#adr-026-gauge-boost-tokenomics). These metrics expose the `FeeRouter`, `VotingEscrow`, and `SafetyReserve` contract surfaces to operator dashboards, keeper monitoring, gauge-claim debugging, governance dashboards, and the public reporting required by the `SafetyReserve` transparency rules ([ADR 026 §5](026-gauge-boost-tokenomics.md#adr-026-gauge-boost-tokenomics), [ADR 009](009-governance.md#adr-009-governance-model)).
 
-A subset is sourced from on-chain contract state (`FeeRouter`, `VotingEscrow`, `SafetyReserve`, `BuybackBurner` / `DelegatorBuyer`) via the same RPC client used for blacklist polling and channel-state queries ([ADR 011](011-content-takedown.md), [ADR 003](003-payments.md)). They use the **same Prometheus text-format `/metrics` endpoint, scrape interval, and retention defaults** defined in Section 1 — no separate export pipeline. Contract-sourced gauges sample at the existing RPC-poll cadence; counters tracking on-chain events advance only when the node observes the corresponding event log.
+A subset is sourced from on-chain contract state (`FeeRouter`, `VotingEscrow`, `SafetyReserve`, `BuybackBurner` / `DelegatorBuyer`) via the same RPC client used for blacklist polling and channel-state queries ([ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting), [ADR 003](003-payments.md#adr-003-payment-model)). They use the **same Prometheus text-format `/metrics` endpoint, scrape interval, and retention defaults** defined in Section 1 — no separate export pipeline. Contract-sourced gauges sample at the existing RPC-poll cadence; counters tracking on-chain events advance only when the node observes the corresponding event log.
 
 ##### 2.10.1 FeeRouter Metrics
 
 | Metric | Type | Tier | Labels | Source | Consumer | Description |
 |--------|------|------|--------|--------|----------|-------------|
-| `decdn_fee_router_inflow_usdc_total` | Counter | R | `bucket={node_base,gauge,delegator,burn,treasury,safety}` | `FeeRouter` settlement events (RPC) | Operator + governance dashboards | Cumulative per-bucket USDC inflow at `FeeRouter.routeSettlement`. Rate of change gives the per-bucket inflow rate ([ADR 026 §2](026-gauge-boost-tokenomics.md)). |
+| `decdn_fee_router_inflow_usdc_total` | Counter | R | `bucket={node_base,gauge,delegator,burn,treasury,safety}` | `FeeRouter` settlement events (RPC) | Operator + governance dashboards | Cumulative per-bucket USDC inflow at `FeeRouter.routeSettlement`. Rate of change gives the per-bucket inflow rate ([ADR 026 §2](026-gauge-boost-tokenomics.md#adr-026-gauge-boost-tokenomics)). |
 | `decdn_fee_router_inflow_usdc_rate` | Gauge | R | `bucket={node_base,gauge,delegator,burn,treasury,safety}` | Derived (rolling 7-epoch avg over `..._inflow_usdc_total`) | Governance + capacity-planning dashboards | Rolling-average per-bucket USDC inflow per epoch. Computed locally from the counter. |
-| `decdn_gauge_pool_distribution_usdc_total` | Counter | R | `phase={inflow,claimed,swept_to_treasury}` | `FeeRouter` events: bucket inflow, `claimBoost`, sweep-on-26-epoch-timeout | Gauge-claim debugging + treasury reporting | Per-epoch gauge-pool USDC lifecycle: inflow, disbursed via `claimBoost`, swept to treasury on the 26-epoch unclaimed timeout ([ADR 026 §2](026-gauge-boost-tokenomics.md)). |
+| `decdn_gauge_pool_distribution_usdc_total` | Counter | R | `phase={inflow,claimed,swept_to_treasury}` | `FeeRouter` events: bucket inflow, `claimBoost`, sweep-on-26-epoch-timeout | Gauge-claim debugging + treasury reporting | Per-epoch gauge-pool USDC lifecycle: inflow, disbursed via `claimBoost`, swept to treasury on the 26-epoch unclaimed timeout ([ADR 026 §2](026-gauge-boost-tokenomics.md#adr-026-gauge-boost-tokenomics)). |
 | `decdn_pool_swept_to_treasury_usdc_total` | Counter | R | `pool={gauge,delegator}` | `FeeRouter` sweep events | Treasury + governance dashboards | Cumulative unclaimed-after-26-epochs sweep volume per pool. Differs from `..._gauge_pool_distribution_..._{phase=swept_to_treasury}` only in covering both pools; the gauge-pool label remains the canonical gauge-specific view. |
 
 ##### 2.10.2 Operator Gauge-Boost Metrics
 
 | Metric | Type | Tier | Labels | Source | Consumer | Description |
 |--------|------|------|--------|--------|----------|-------------|
-| `decdn_operator_working_bytes` | Gauge | R | `epoch` | `FeeRouter.workingBytes(operator, epoch)` (RPC) | Operator dashboard, gauge-claim debugging | This node's `working_bytes_i` for the labeled epoch, per the gauge formula ([ADR 026 §3](026-gauge-boost-tokenomics.md)). Explains why a claim payout is what it is. |
+| `decdn_operator_working_bytes` | Gauge | R | `epoch` | `FeeRouter.workingBytes(operator, epoch)` (RPC) | Operator dashboard, gauge-claim debugging | This node's `working_bytes_i` for the labeled epoch, per the gauge formula ([ADR 026 §3](026-gauge-boost-tokenomics.md#adr-026-gauge-boost-tokenomics)). Explains why a claim payout is what it is. |
 | `decdn_operator_bytes_delivered` | Gauge | R | `epoch` | `FeeRouter.bytesDelivered(operator, epoch)` (RPC) | Operator dashboard | Raw `bytes_i` for the labeled epoch — paired with `decdn_operator_working_bytes` to derive the boost factor. |
 | `decdn_operator_boost_factor` | Gauge | R | `epoch` | Derived (`working_bytes / bytes_delivered`) | Operator dashboard, UI "your current boost" surface | Effective boost factor for the labeled epoch, in `[boostFloor, 1.0]` (default `[0.4, 1.0]`). At `boostFloor` for a zero-ve operator; `1.0` for a fair-share-or-higher ve operator. |
 
@@ -168,7 +168,7 @@ A subset is sourced from on-chain contract state (`FeeRouter`, `VotingEscrow`, `
 
 | Metric | Type | Tier | Labels | Source | Consumer | Description |
 |--------|------|------|--------|--------|----------|-------------|
-| `decdn_delegator_swap_slippage_bps` | Histogram | R | — | `DelegatorBuyer` (or `BuybackBurner` multi-output mode) swap events | Keeper monitoring, MEV-defense review | Realized TWAP slippage on the per-epoch USDC→TOKEN swap, in basis points below the swap's `minOut` reference. Buckets: `[1, 5, 10, 25, 50, 100, 250, 500]`. Sustained tail = MEV / liquidity-cap pressure ([ADR 026 §6](026-gauge-boost-tokenomics.md), [ADR 018](018-liquidity-strategy.md)). |
+| `decdn_delegator_swap_slippage_bps` | Histogram | R | — | `DelegatorBuyer` (or `BuybackBurner` multi-output mode) swap events | Keeper monitoring, MEV-defense review | Realized TWAP slippage on the per-epoch USDC→TOKEN swap, in basis points below the swap's `minOut` reference. Buckets: `[1, 5, 10, 25, 50, 100, 250, 500]`. Sustained tail = MEV / liquidity-cap pressure ([ADR 026 §6](026-gauge-boost-tokenomics.md#adr-026-gauge-boost-tokenomics), [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol)). |
 | `decdn_delegator_liquidity_cap_utilization` | Gauge | R | — | Derived (`swap_size_usdc / per_epoch_cap_usdc`) | Keeper monitoring, governance dashboard | Per-epoch liquidity-cap utilization in `[0, 1]`. Sustained `≥ 1.0` means the cap is binding and excess delegator-pool USDC rolls forward — feeds the cap-resize discussion. |
 | `decdn_delegator_usdc_to_token_ratio` | Gauge | R | `epoch` | Derived (`token_acquired / usdc_spent`) | Governance + delegator-yield dashboards | Per-epoch ratio of TOKEN distributed to delegators against USDC acquired into the bucket. Tracks market-price drift and aggregate swap quality across the epoch. |
 
@@ -176,7 +176,7 @@ A subset is sourced from on-chain contract state (`FeeRouter`, `VotingEscrow`, `
 
 | Metric | Type | Tier | Labels | Source | Consumer | Description |
 |--------|------|------|--------|--------|----------|-------------|
-| `decdn_safety_reserve_balance_usdc` | Gauge | R | — | `SafetyReserve.balance()` (RPC) | Public dashboard, governance, enterprise-tier credibility | Current USDC balance of the `SafetyReserve` contract. Public-transparency requirement per [ADR 026 §5](026-gauge-boost-tokenomics.md). |
+| `decdn_safety_reserve_balance_usdc` | Gauge | R | — | `SafetyReserve.balance()` (RPC) | Public dashboard, governance, enterprise-tier credibility | Current USDC balance of the `SafetyReserve` contract. Public-transparency requirement per [ADR 026 §5](026-gauge-boost-tokenomics.md#adr-026-gauge-boost-tokenomics). |
 | `decdn_safety_reserve_incidents` | Gauge | R | `state={pending,approved,disputed}` | `SafetyReserve` incident-registry (RPC) | Public incident registry, governance dashboard | Incident count per registry state. `pending` = bundle filed, awaiting governance/multisig action; `approved` = approved for payout (within or after 48h appeal window); `disputed` = under on-chain challenge. |
 | `decdn_safety_reserve_payouts_total` | Counter | R | — | `SafetyReserve.payout` events | Public registry, governance reporting | Cumulative executed payouts across the reserve's lifetime. |
 | `decdn_safety_reserve_outflow_usdc_total` | Counter | R | — | `SafetyReserve.payout` events | Public registry, governance reporting | Cumulative USDC paid out across all approved incidents. |
@@ -191,11 +191,11 @@ A subset is sourced from on-chain contract state (`FeeRouter`, `VotingEscrow`, `
 
 #### 2.11 DHT / Content-Discovery Metrics
 
-Per [ADR 022](022-content-discovery.md) (`cdn/dht/v1`). DHT STORE and FIND_VALUE carry no protocol-level fee; these metrics expose discovery health only.
+Per [ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale) (`cdn/dht/v1`). DHT STORE and FIND_VALUE carry no protocol-level fee; these metrics expose discovery health only.
 
 | Metric | Type | Tier | Labels | Description |
 |--------|------|------|--------|-------------|
-| `decdn_dht_store_published_total` | Counter | R | — | DHT STORE records this node published to the K-closest peers ([ADR 022](022-content-discovery.md)). |
+| `decdn_dht_store_published_total` | Counter | R | — | DHT STORE records this node published to the K-closest peers ([ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale)). |
 | `decdn_dht_findvalue_queries_total` | Counter | R | — | DHT FIND_VALUE lookups this node issued to discover providers. |
 | `decdn_dht_routing_table_size` | Gauge | R | — | Distinct entries in the local Kademlia routing table. |
 
@@ -263,17 +263,17 @@ Earlier ADRs used informal metric names; this table maps them to canonical repla
 
 | Informal name (prior ADR) | Canonical name (this ADR) | Source ADR |
 |---------------------------|---------------------------|------------|
-| `gossip_messages_rejected_clock_skew` | `decdn_gossip_messages_rejected_total{reason="clock_skew"}` | [ADR 001](001-network.md) |
-| `probe_hold_violations` | `decdn_probe_hold_violations_total` | [ADR 005](005-protocol.md), architecture.md |
-| `probe_hold_slots_used` | `decdn_probe_hold_slots_used` | [ADR 005](005-protocol.md), architecture.md |
+| `gossip_messages_rejected_clock_skew` | `decdn_gossip_messages_rejected_total{reason="clock_skew"}` | [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) |
+| `probe_hold_violations` | `decdn_probe_hold_violations_total` | [ADR 005](005-protocol.md#adr-005-wire-protocol), architecture.md |
+| `probe_hold_slots_used` | `decdn_probe_hold_slots_used` | [ADR 005](005-protocol.md#adr-005-wire-protocol), architecture.md |
 | `rate_bounds_clamp_events` | `decdn_rate_bounds_clamp_events_total` | architecture.md |
-| `blacklist_sync_lag_seconds` | `decdn_blacklist_sync_lag_seconds` | [ADR 011](011-content-takedown.md) |
-| `blacklist_version_behind` | `decdn_blacklist_version_behind` | [ADR 011](011-content-takedown.md) |
+| `blacklist_sync_lag_seconds` | `decdn_blacklist_sync_lag_seconds` | [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) |
+| `blacklist_version_behind` | `decdn_blacklist_version_behind` | [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) |
 | `slash_evidence_exposure` | `decdn_slash_evidence_exposure_total` | architecture.md |
-| `quic_0rtt_attempts_total` | `decdn_quic_0rtt_attempts_total` | [ADR 015](015-zero-rtt.md) |
-| `quic_0rtt_accepted_total` | `decdn_quic_0rtt_accepted_total` | [ADR 015](015-zero-rtt.md) |
-| `quic_0rtt_rejected_total` | `decdn_quic_0rtt_rejected_total` | [ADR 015](015-zero-rtt.md) |
-| `probe_collection_latency_seconds` | `decdn_probe_collection_latency_seconds` | [ADR 015](015-zero-rtt.md) |
+| `quic_0rtt_attempts_total` | `decdn_quic_0rtt_attempts_total` | [ADR 015](015-zero-rtt.md#adr-015-quic-0-rtt-connection-establishment) |
+| `quic_0rtt_accepted_total` | `decdn_quic_0rtt_accepted_total` | [ADR 015](015-zero-rtt.md#adr-015-quic-0-rtt-connection-establishment) |
+| `quic_0rtt_rejected_total` | `decdn_quic_0rtt_rejected_total` | [ADR 015](015-zero-rtt.md#adr-015-quic-0-rtt-connection-establishment) |
+| `probe_collection_latency_seconds` | `decdn_probe_collection_latency_seconds` | [ADR 015](015-zero-rtt.md#adr-015-quic-0-rtt-connection-establishment) |
 | `streams_active` | `decdn_streams_active` | architecture.md |
 | `streams_completed` | `decdn_streams_completed_total` | architecture.md |
 | `streams_failed` | `decdn_streams_failed_total` | architecture.md |

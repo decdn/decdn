@@ -5,7 +5,7 @@
 
 ## Context
 
-Existing ADRs specify individual node-lifecycle components in isolation — staking in [ADR 026](026-gauge-boost-tokenomics.md), on-chain registration in [ADR 001](001-network.md), payment channel bindings in [ADR 003](003-payments.md), gossip validation in [ADR 001](001-network.md), blacklist sync in [ADR 011](011-content-takedown.md), contract deployment order in [ADR 016](016-contract-interactions.md). No single document describes the complete ordered procedure from "operator has a server" to "actively accepting paid delivery requests."
+Existing ADRs specify individual node-lifecycle components in isolation — staking in [ADR 026](026-gauge-boost-tokenomics.md#adr-026-gauge-boost-tokenomics), on-chain registration in [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh), payment channel bindings in [ADR 003](003-payments.md#adr-003-payment-model), gossip validation in [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh), blacklist sync in [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting), contract deployment order in [ADR 016](016-contract-interactions.md#adr-016-smart-contract-interaction-model). No single document describes the complete ordered procedure from "operator has a server" to "actively accepting paid delivery requests."
 
 This blocks PoC testnet participation: operators have no canonical reference, and missing or mis-ordered steps produce silent protocol failures (gossip messages rejected without error because the clock is unsynchronized; connections refused because the blacklist was not fetched). This ADR defines the authoritative onboarding flow.
 
@@ -34,16 +34,16 @@ Before any on-chain or protocol activity:
 
 3. **Generate iroh identity.** Run the node binary's `keys generate` (or equivalent) subcommand. This produces an **ed25519 key pair** whose public key is the iroh `NodeId`. The private key MUST be stored securely:
    - **PoC:** encrypted file on disk (passphrase-protected or operator-managed).
-   - **Production:** platform keychain or HSM. See [ADR 012](012-client.md) for key management guidance (the same tiers apply to node keys).
+   - **Production:** platform keychain or HSM. See [ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model) for key management guidance (the same tiers apply to node keys).
 
 4. **Prepare Ethereum key.** The operator needs an Ethereum address (`ethAddress`) with sufficient funds:
    - **TOKEN:** at minimum **50,000 TOKEN** for the minimum stake deposit ([ADR 026 §7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake)). There is no discount-stake threshold; operators wanting amplified return on capital ve-lock TOKEN in `VotingEscrow` for gauge boost ([ADR 026 §3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula)) rather than staking above a threshold for fee discount. Operators lacking the 50K minimum may qualify for externally-funded operator-onboarding programs (see [ADR 026 §10](026-gauge-boost-tokenomics.md#10-bootstrap-mechanism-pre-seed-usdc)).
    - **Native gas token:** ~$0.50–$1.00 for the Phase 2 transactions at typical L2 gas prices.
    - **Optional USDC:** only required if the operator intends to open outbound payment channels immediately (e.g., to pay origin-backed nodes for cache-miss pulls). Clients open inbound channels to the node without any USDC on the node side.
 
-   - **Wallet, gas sponsorship, and session keys.** PoC accepts a plain EOA. Production migrates the operator wallet to a Safe (2-of-3 recommended) with ERC-7579 session keys for the high-frequency `slash_sig` signing path and an ERC-4337 paymaster for gas-in-USDC; see [ADR 024](024-account-abstraction.md) for the full design and the [Operator Key-Rotation Runbook](appendix-operator-key-rotation.md) for the EOA → Safe migration.
+   - **Wallet, gas sponsorship, and session keys.** PoC accepts a plain EOA. Production migrates the operator wallet to a Safe (2-of-3 recommended) with ERC-7579 session keys for the high-frequency `slash_sig` signing path and an ERC-4337 paymaster for gas-in-USDC; see [ADR 024](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support) for the full design and the [Operator Key-Rotation Runbook](appendix-operator-key-rotation.md#appendix-operator-key-rotation-runbook) for the EOA → Safe migration.
 
-5. **Choose region.** Determine the ISO 3166-1 alpha-2 country code best representing the node's physical location. Self-reported, accepted at face value as the production posture ([ADR 001](001-network.md), [ADR 011](011-content-takedown.md), [ADR 030](030-node-region-self-attestation.md)). Submitted on-chain as `regionHint` and broadcast in `NodeAnnounce` — it affects which gossip topics the node publishes to and which regional blacklists it must enforce.
+5. **Choose region.** Determine the ISO 3166-1 alpha-2 country code best representing the node's physical location. Self-reported, accepted at face value as the production posture ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh), [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting), [ADR 030](030-node-region-self-attestation.md#adr-030-node-region-self-attestation)). Submitted on-chain as `regionHint` and broadcast in `NodeAnnounce` — it affects which gossip topics the node publishes to and which regional blacklists it must enforce.
 
 6. **Configure origin backend (optional).** If the node will act as an origin-backed
    node (serving specific content from S3/R2/B2/NFS/local disk), configure backend
@@ -74,7 +74,7 @@ Call `TOKEN.approve(stakingRegistry, amount)` where `amount ≥ minStake` (**50,
 
 Call `StakingRegistry.stake(amount)` with `amount ≥ 50,000 TOKEN`.
 
-The stake locks immediately and is slashable from this point forward, including during the unbonding period if the node later deregisters (7-day unbonding by default; governable per [ADR 026](026-gauge-boost-tokenomics.md)).
+The stake locks immediately and is slashable from this point forward, including during the unbonding period if the node later deregisters (7-day unbonding by default; governable per [ADR 026](026-gauge-boost-tokenomics.md#adr-026-gauge-boost-tokenomics)).
 
 **ve-position is separate.** Operator stake in `StakingRegistry` and any ve-locked TOKEN in `VotingEscrow` are independent positions per [ADR 026 §4](026-gauge-boost-tokenomics.md#4-voting-escrow-votingescrow). ve-locked TOKEN is non-slashable and does not satisfy the minimum stake; staked TOKEN does not earn gauge boost. An operator wanting gauge boost must hold both.
 
@@ -120,7 +120,7 @@ The node process MUST complete all of the following steps before opening any QUI
 
 Call `PaymentChannel.getRateBounds()`. Verify that both `deliveryFloor` and `deliveryCeiling` fit in `u64` (see [ADR 003 § Startup](003-payments.md#rate-bounds-refresh)). If either value exceeds `u64::MAX`, the node MUST refuse to start and log an error.
 
-The node SHOULD subscribe to on-chain `RateBoundsUpdated` events for real-time updates. Periodic polling (`rate_bounds_poll_interval`, default 1 hour) is the fallback ([ADR 003](003-payments.md)).
+The node SHOULD subscribe to on-chain `RateBoundsUpdated` events for real-time updates. Periodic polling (`rate_bounds_poll_interval`, default 1 hour) is the fallback ([ADR 003](003-payments.md#adr-003-payment-model)).
 
 #### Step 3.2 — Sync content blacklist
 
@@ -138,7 +138,7 @@ If the RPC endpoint is unavailable, retry with exponential backoff (3 attempts a
 
 #### Step 3.4 — Configure local rate
 
-Set the node's `rate_per_mb` within the bounds fetched in Step 3.1, satisfying `deliveryFloor ≤ rate_per_mb ≤ deliveryCeiling`. This rate is advertised in `ProbeResponse` messages. Probes are the canonical rate-discovery channel; rate changes propagate through fresh probe responses ([ADR 005](005-protocol.md)).
+Set the node's `rate_per_mb` within the bounds fetched in Step 3.1, satisfying `deliveryFloor ≤ rate_per_mb ≤ deliveryCeiling`. This rate is advertised in `ProbeResponse` messages. Probes are the canonical rate-discovery channel; rate changes propagate through fresh probe responses ([ADR 005](005-protocol.md#adr-005-wire-protocol)).
 
 ### Phase 4 — Joining the Mesh (Gossip Subscription)
 
@@ -150,7 +150,7 @@ Subscribe to:
 
 - `cdn/global/v1` — all staked nodes publish and subscribe.
 - `cdn/region/{cc}/v1` — subscribe to the node's own declared region topic.
-- `cdn/reputation/v1` — reputation reports (production only; see [ADR 008](008-reputation.md)).
+- `cdn/reputation/v1` — reputation reports (production only; see [ADR 008](008-reputation.md#adr-008-reputation-system)).
 
 Topic names are string literals used as iroh-gossip topic IDs.
 
@@ -229,7 +229,7 @@ iroh handles NAT traversal transparently via QUIC hole-punching and relay fallba
 
 A node that voluntarily deregistered or was auto-ejected (stake dropped below 50% of `minStake` due to slashing — see [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn)) must re-onboard. The flow is identical to initial onboarding with two differences:
 
-1. **`firstRegisteredAt` is preserved.** The cold-start bootstrap bonus ([ADR 008](008-reputation.md)) is not re-granted — the `firstRegisteredAt` field in `StakingRegistry` is immutable once set, and the bonus is one-time per operator address.
+1. **`firstRegisteredAt` is preserved.** The cold-start bootstrap bonus ([ADR 008](008-reputation.md#adr-008-reputation-system)) is not re-granted — the `firstRegisteredAt` field in `StakingRegistry` is immutable once set, and the bonus is one-time per operator address.
 
 2. **`registrationNonce` is incremented.** On deregistration, `registrationNonce[nodeId]` is incremented. The operator must sign fresh `ed25519Signature` and `bindingSignature` parameters with the new nonce before calling `registerNode` again.
 
@@ -248,7 +248,7 @@ If the node's iroh identity was replaced (key rotation), use `StakingRegistry.bi
 
 - Phase 2 requires three ordered on-chain transactions (`approve`, `stake`, `registerNode`), each confirmed before the node can start. Sub-second L2 block times keep this fast, but operator tooling must handle nonce management across them.
 - Multiaddr registration before iroh starts requires either a static IP/port (suitable for most VPS deployments) or a two-step workflow (start node, observe addresses, then register or update).
-- Cold-start reputation (0.5, a 4× score penalty vs. a reputable node) means new nodes must price aggressively or wait out the 7-day bootstrap period to compete for traffic. This is a known and accepted property of [ADR 008](008-reputation.md).
+- Cold-start reputation (0.5, a 4× score penalty vs. a reputable node) means new nodes must price aggressively or wait out the 7-day bootstrap period to compete for traffic. This is a known and accepted property of [ADR 008](008-reputation.md#adr-008-reputation-system).
 
 ## Deferred & Open
 

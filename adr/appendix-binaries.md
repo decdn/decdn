@@ -18,7 +18,7 @@ Threat surface, dependency footprint, and update cadence differ
 between the two. A single fused binary would force every operator
 deployment to ship publisher tooling, every publisher install to drag
 in the daemon's runtime, and contaminate features like
-`decdn bundle …` and `decdn pull` ([ADR 012](012-client.md)) with a "which
+`decdn bundle …` and `decdn pull` ([ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model)) with a "which
 binary owns this?" question absent from `dockerd` + `docker`,
 `kubelet` + `kubectl`, or `containerd` + `nerdctl`.
 
@@ -55,7 +55,7 @@ friendly redirect — operators starting the daemon use `decdn-node run`.
 ### Why the `node` admin namespace lives on `decdn`, not `decdn-node`
 
 Operator-local admin (`peers`, `health`, `announce`, `drain`, `evict`,
-`reload`) is loopback-HTTP-only per the [ADR 025 admin appendix](appendix-local-admin-http.md):
+`reload`) is loopback-HTTP-only per the [ADR 025 admin appendix](appendix-local-admin-http.md#appendix-local-admin-http-surface):
 the binary running the commands need not be the daemon, just on the
 daemon's host. So the `node` namespace fits the user CLI naturally —
 operators don't track which binary owns it, the daemon stays focused
@@ -98,7 +98,7 @@ and would silently miss data on a prefix rename.
 
 ## Cross-ADR Impact
 
-- `decdn bundle …` and `decdn pull` ([ADR 012](012-client.md)) land directly
+- `decdn bundle …` and `decdn pull` ([ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model)) land directly
   on `decdn`; no binary-placement question remains for either.
 - Shell completions and man pages are deferred — both binaries should
   generate them via `clap_complete`. Tracked as follow-up issues.

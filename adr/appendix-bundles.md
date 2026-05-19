@@ -14,7 +14,7 @@ publishing workflow.
 
 ## Context
 
-[ADR 002](002-content-addressing.md) makes the network single-blob
+[ADR 002](002-content-addressing.md#adr-002-content-addressing) makes the network single-blob
 content-addressed: every byte stream is identified by its BLAKE3 hash,
 and the protocol is "content-agnostic … applications may define their
 own metadata or manifest layers on top". Multi-file publishing is one
@@ -135,11 +135,11 @@ chunked single file inside a bundled directory.
 
 ## Relationship to ADR 002 / ADR 013
 
-- [ADR 002](002-content-addressing.md) declares multi-file an
+- [ADR 002](002-content-addressing.md#adr-002-content-addressing) declares multi-file an
   application concern. This appendix is that concern, layered above the
   protocol — the network sees only the bundle blob and (later) each
   entry blob, never the bundle's structure.
-- [ADR 013](013-schema-evolution.md) bounds *wire-format* evolution
+- [ADR 013](013-schema-evolution.md#adr-013-schema-evolution) bounds *wire-format* evolution
   (varint framing, ALPN tiers, `#[serde(default)]` rules for signed
   payloads). Bundles are a **file format**, never on the wire, so those
   rules do not apply. Future versions bump `version` directly; parsers

@@ -10,7 +10,7 @@ Content discovery answers: "which nodes currently hold blob H?" The answer drive
 
 ### The scaling problem with probe fan-out
 
-An earlier design in [ADR 001](001-network.md) used **broadcast probe fan-out**: on a cache miss, a node sends a `cdn/probe/v1` message to every known peer simultaneously. This works at PoC scale (tens of nodes) but breaks at production scale:
+An earlier design in [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) used **broadcast probe fan-out**: on a cache miss, a node sends a `cdn/probe/v1` message to every known peer simultaneously. This works at PoC scale (tens of nodes) but breaks at production scale:
 
 - **O(N) probes per cache miss.** At 1,000 nodes each cache miss generates ~1,000 outbound probe messages. Under a 10 fan-outs/second rate limit that is 10,000 probe messages/second/node — a self-DoS risk and a meaningful burden on the probed peers.
 - **O(N) probe overhead for the prober.** Even rate-limited, fan-out latency grows with N: the node waits for the probe collection window on each of those N connections.
@@ -118,7 +118,7 @@ Content records are stored in-memory at the K nodes closest to the hash in keysp
 | Max providers per hash | 50 | Well above useful redundancy; bounds record size |
 | Max records per node | 100,000 | ~50 MB memory at max record size |
 
-A node **stops re-publishing** when it evicts the blob. Stale records self-expire within TTL — no explicit retraction messages needed. **TTL is anchored on the receiver's wall-clock at acceptance time:** the receiver computes `expiry_us = receive_us + record_ttl_us`, where `receive_us` is the receiver's wall-clock microsecond timestamp at acceptance and `record_ttl_us` is the Record TTL parameter above in microseconds (1 hour = 3,600,000,000 μs). `StoreRequest` carries no sender-asserted timestamp, so record lifetime is independent of any clock the holder controls. A re-publish at 45 min refreshes the receiver's record by replacing stored `expiry_us` with one derived from the new `receive_us`, extending effective lifetime ahead of the previous expiry while the holder still has the blob. Rationale matches the receiver-anchored TTL pattern in [Appendix: Peer Table Eviction](appendix-peer-table-eviction.md).
+A node **stops re-publishing** when it evicts the blob. Stale records self-expire within TTL — no explicit retraction messages needed. **TTL is anchored on the receiver's wall-clock at acceptance time:** the receiver computes `expiry_us = receive_us + record_ttl_us`, where `receive_us` is the receiver's wall-clock microsecond timestamp at acceptance and `record_ttl_us` is the Record TTL parameter above in microseconds (1 hour = 3,600,000,000 μs). `StoreRequest` carries no sender-asserted timestamp, so record lifetime is independent of any clock the holder controls. A re-publish at 45 min refreshes the receiver's record by replacing stored `expiry_us` with one derived from the new `receive_us`, extending effective lifetime ahead of the previous expiry while the holder still has the blob. Rationale matches the receiver-anchored TTL pattern in [Appendix: Peer Table Eviction](appendix-peer-table-eviction.md#appendix-peer-table-eviction-policy).
 
 #### 1.5 STORE Flow (Cache Event → DHT Publish)
 
@@ -155,7 +155,7 @@ The on-chain origin set is also the directory of last resort if the DHT returns 
 
 On node startup:
 
-1. Build initial routing table from the on-chain registry peer list (same source as the peer table bootstrap in [ADR 019](019-node-onboarding.md)).
+1. Build initial routing table from the on-chain registry peer list (same source as the peer table bootstrap in [ADR 019](019-node-onboarding.md#adr-019-node-onboarding-and-bootstrapping-flow)).
 2. Issue `FindNode(self.node_id)` to initial peers — standard Kademlia self-lookup that populates k-buckets.
 
 The registry-seeded peer list participates in DHT lookups immediately, so there is no separate bootstrap window during which content discovery is unavailable. If a `FindValue` lookup returns no providers during the first few seconds — before k-buckets are populated — the on-chain origin directory (§ Origin discovery above) provides the deterministic fallback. At PoC scale (30 nodes) the routing table is fully populated after a single self-lookup round.
@@ -178,7 +178,7 @@ The signal is honest by construction: FIND_VALUE traffic reflects real client de
 
 #### 2.2 Signal 2: Local Cache-Miss Frequency
 
-Each node tracks cache miss timestamps per hash in a bounded map ([ADR 001 § Prefetching from Local Demand](001-network.md)). A hash crossing the local-miss threshold (default: 3 misses in 5 minutes) is prefetched proactively.
+Each node tracks cache miss timestamps per hash in a bounded map ([ADR 001 § Prefetching from Local Demand](001-network.md#adr-001-network-topology-and-peer-mesh)). A hash crossing the local-miss threshold (default: 3 misses in 5 minutes) is prefetched proactively.
 
 #### 2.3 Prefetch Decision
 
@@ -199,16 +199,16 @@ DHT STORE and FIND_VALUE operations carry no protocol-level fee. The incentive t
 
 | Mechanism | Interaction with DHT |
 |-----------|---------------------|
-| `cdn/probe/v1` | Unchanged. DHT provides candidates; `cdn/probe/v1` confirms live availability and measures latency. Probe cache (15s TTL, [ADR 001](001-network.md)) still prevents redundant probes for recently confirmed providers. |
+| `cdn/probe/v1` | Unchanged. DHT provides candidates; `cdn/probe/v1` confirms live availability and measures latency. Probe cache (15s TTL, [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)) still prevents redundant probes for recently confirmed providers. |
 | `cdn/client/v1` | Unchanged. All delivery is paid; DHT affects only how providers are discovered. |
 | `NodeAnnounce` gossip | Unchanged. Carries node-level metadata only (region, load); demand signals are derived from DHT FIND_VALUE traffic and local cache misses. No new gossip message types. |
-| Reputation system ([ADR 008](008-reputation.md)) | A node publishing a false STORE record fails at probe time → reputation penalty → fewer clients selected. No new slash condition needed. |
-| Eviction hold ([ADR 005](005-protocol.md)) | Nodes stop re-publishing DHT records when a blob is evicted. TTL ensures stale records expire within 1 hour. |
-| Client discovery ([ADR 012](012-client.md)) | Clients use DHT FIND_VALUE for content discovery the same way nodes do. The on-chain origin-directory fallback applies equally. |
+| Reputation system ([ADR 008](008-reputation.md#adr-008-reputation-system)) | A node publishing a false STORE record fails at probe time → reputation penalty → fewer clients selected. No new slash condition needed. |
+| Eviction hold ([ADR 005](005-protocol.md#adr-005-wire-protocol)) | Nodes stop re-publishing DHT records when a blob is evicted. TTL ensures stale records expire within 1 hour. |
+| Client discovery ([ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model)) | Clients use DHT FIND_VALUE for content discovery the same way nodes do. The on-chain origin-directory fallback applies equally. |
 
 ### 4. Schema Evolution
 
-`cdn/dht/v1` follows the standard evolution model from [ADR 013](013-schema-evolution.md):
+`cdn/dht/v1` follows the standard evolution model from [ADR 013](013-schema-evolution.md#adr-013-schema-evolution):
 
 - **Minor** (new optional fields on existing message types): no ALPN bump.
 - **Medium** (new mandatory fields): `cdn/dht/v2` ALPN.
@@ -225,5 +225,5 @@ DHT STORE and FIND_VALUE operations carry no protocol-level fee. The incentive t
 5. A false STORE record (node claims to hold a blob it doesn't) fails at the probe step; the publishing node incurs a reputation penalty within one gossip cycle.
 6. During bootstrap (routing table < k entries), the on-chain origin directory provides the fallback; routing table fully populated within 2 self-lookup rounds at PoC scale.
 7. A node observing ≥5 FIND_VALUE queries for hash H within 5 minutes initiates a prefetch for H.
-8. Demand signals derive from DHT FIND_VALUE traffic and local cache-miss timestamps; both are emitted as observability metrics in [Appendix: Observability](appendix-observability.md).
+8. Demand signals derive from DHT FIND_VALUE traffic and local cache-miss timestamps; both are emitted as observability metrics in [Appendix: Observability](appendix-observability.md#appendix-observability-and-metrics).
 9. An accepted `StoreRequest`'s record TTL is anchored on the receiver's wall-clock at acceptance time (`expiry_us = receive_us + record_ttl_us`), independent of any holder-supplied timestamp.

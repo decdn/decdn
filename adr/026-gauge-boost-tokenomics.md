@@ -5,7 +5,7 @@
 
 ## Context
 
-The economic model — sitting on top of paid byte delivery ([ADR 003](003-payments.md)) and the slashing primitive ([ADR 014](014-on-chain-verification.md)) — has to hold up under four pressures:
+The economic model — sitting on top of paid byte delivery ([ADR 003](003-payments.md#adr-003-payment-model)) and the slashing primitive ([ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)) — has to hold up under four pressures:
 
 1. **A deflationary lever that scales with network usage.** A nominally "deflationary" token model whose burn rate sits well below circulating-supply growth from vesting unlocks is structurally inflationary in practice. Burn must be sized to compete with vesting flows at mature scale.
 2. **A real-yield path to token holders.** Passive holders need compensation tied to network usage; long-term lockers need a compensation lever distinct from short-term holders. Without one, governance weight, liquidity provision, and long-term capital formation all weaken.
@@ -40,7 +40,7 @@ Six buckets summing to 100%. Vesting profile: effective release rate is ~24%/yr 
 | Seed backers | 24% | 240,000,000 | 3-year linear, 6-month cliff |
 | Team & core contributors | 19% | 190,000,000 | 4-year linear, 12-month cliff |
 | Community & ecosystem | 15% | 150,000,000 | 4-year linear |
-| Genesis liquidity (POL) | 10% | 100,000,000 | Fully unlocked at genesis (Balancer V3 80/20 per [ADR 018](018-liquidity-strategy.md)) |
+| Genesis liquidity (POL) | 10% | 100,000,000 | Fully unlocked at genesis (Balancer V3 80/20 per [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol)) |
 | Public sale / airdrop | 2% | 20,000,000 | Fully unlocked at genesis |
 | **Total** | **100%** | **1,000,000,000** | |
 
@@ -63,7 +63,7 @@ Bootstrap supply-side incentive is funded externally via $1M+ pre-seed USDC capi
 | Node base | 40% | USDC | Direct same-tx, per-byte proportional to verified delivery |
 | Gauge boost pool | 40% | USDC | Weekly epoch pool; pro-rata by ve-weighted `working_bytes` (§3); pull-based claim |
 | Delegator pool | 7% | USDC → TOKEN | TWAP USDC→TOKEN swap; distributed pro-rata by ve-balance to delegators / ve-lockers (§6) |
-| Buyback-and-burn | 5% | USDC → TOKEN | Direct same-tx to `BuybackBurner`; mechanics unchanged from [ADR 018](018-liquidity-strategy.md); TOKEN burned |
+| Buyback-and-burn | 5% | USDC → TOKEN | Direct same-tx to `BuybackBurner`; mechanics unchanged from [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol); TOKEN burned |
 | Protocol treasury | 5% | USDC | Direct same-tx to Timelock-custodied treasury wallet |
 | Safety & insurance reserve | 3% | USDC | Direct same-tx to `SafetyReserve`; governance-gated incident payouts (§5) |
 | **Total** | **100%** | | |
@@ -115,7 +115,7 @@ event GaugeLaunched(uint64 indexed epoch);
 
 - While `gaugeLaunched == false`: `routeSettlement` deposits the 40% gauge share into `preLaunchGaugeAccumulator[currentEpoch]` instead of the live gauge bucket. The other five buckets (40% direct, 7% delegator, 5% burn, 5% treasury, 3% safety) flow normally — the §2 Same-transaction guarantees invariant holds end-to-end.
 - `claimBoost(epochs[])` reverts on every requested epoch while `gaugeLaunched == false`. Once `true`, epochs in `[0, gaugeLaunchEpoch)` pay from `preLaunchGaugeAccumulator[epoch]` and epochs `≥ gaugeLaunchEpoch` pay from the live gauge bucket — both weighted by the ve-snapshot taken at each epoch boundary (§ Epoch mechanics captures these regardless of `gaugeLaunched` state; pre-launch epochs reuse them).
-- **Partial cutover epoch.** Because `enableGauge()` is `onlyGovernor` and inherits the [ADR 009](009-governance.md) ~9-day latency (7-day vote + 48-hour timelock), the cutover lands at an arbitrary block within an epoch. Settlements before the cutover block credit `preLaunchGaugeAccumulator[gaugeLaunchEpoch]`; settlements after route via the live gauge bucket — both halves credit the same `gaugeLaunchEpoch` under the same epoch-boundary ve-snapshot, so a claimant receives `(preLaunchGaugeAccumulator[gaugeLaunchEpoch] + liveGaugeBucket[gaugeLaunchEpoch]) × ve_share`; the split is invisible at claim time.
+- **Partial cutover epoch.** Because `enableGauge()` is `onlyGovernor` and inherits the [ADR 009](009-governance.md#adr-009-governance-model) ~9-day latency (7-day vote + 48-hour timelock), the cutover lands at an arbitrary block within an epoch. Settlements before the cutover block credit `preLaunchGaugeAccumulator[gaugeLaunchEpoch]`; settlements after route via the live gauge bucket — both halves credit the same `gaugeLaunchEpoch` under the same epoch-boundary ve-snapshot, so a claimant receives `(preLaunchGaugeAccumulator[gaugeLaunchEpoch] + liveGaugeBucket[gaugeLaunchEpoch]) × ve_share`; the split is invisible at claim time.
 - **Claim window for pre-launch epochs.** For any epoch `< gaugeLaunchEpoch` the 26-epoch window starts at `gaugeLaunchEpoch`, not the original epoch; unclaimed USDC sweeps to treasury after `gaugeLaunchEpoch + 26` per the § Epoch mechanics sweep rule.
 - **Empty-snapshot at a pre-launch epoch.** Operators with zero ve at the historical snapshot get zero retroactive claim — intentional (gauge rewards ve-commitment, not retroactive attestation). The §3 `sum(working_bytes) == 0` next-epoch rollover does **not** apply (the gauge bucket was never live during pre-launch epochs); un-distributable pre-launch USDC sweeps to treasury via claim-window expiry, not §3 rollover. This differs from §3's rollover only in destination (treasury sweep vs next-epoch bucket); do not conflate the two.
 
@@ -146,7 +146,7 @@ The boost-floor parameter (default `boostFloor = 0.4`) is governable within `[0.
 
 #### Per-operator gauge-share cap
 
-The per-epoch gauge share for any single operator is capped at `MAX_GAUGE_SHARE_PER_OPERATOR` (default **5%**, governable within `[1%, 25%]` per [ADR 009](009-governance.md) safety bounds). Concretely:
+The per-epoch gauge share for any single operator is capped at `MAX_GAUGE_SHARE_PER_OPERATOR` (default **5%**, governable within `[1%, 25%]` per [ADR 009](009-governance.md#adr-009-governance-model) safety bounds). Concretely:
 
 ```
 share_i = min(working_bytes_i / sum(working_bytes), MAX_GAUGE_SHARE_PER_OPERATOR)
@@ -272,14 +272,14 @@ interface IVotingEscrow {
 
 ### 5. Safety and insurance reserve (3% bucket)
 
-The 3% safety bucket is held in `SafetyReserve`, a governance-gated incident reserve covering incorrect-slashing / appeal reversals, relay / sequencer / payment-channel downtime, and bad-data incidents. Disbursements require an attested incident bundle, governance (or capped fast-track multisig) authorization, a 48-hour on-chain appeal window, and immutable post-incident reporting; queued claims disburse permissionlessly in epoch-FIFO order. Full specification — payout categories, spending controls, cross-category payout ordering, interface stability, and the `ISafetyReserve` contract surface — is in [ADR 033](033-safety-insurance-reserve.md).
+The 3% safety bucket is held in `SafetyReserve`, a governance-gated incident reserve covering incorrect-slashing / appeal reversals, relay / sequencer / payment-channel downtime, and bad-data incidents. Disbursements require an attested incident bundle, governance (or capped fast-track multisig) authorization, a 48-hour on-chain appeal window, and immutable post-incident reporting; queued claims disburse permissionlessly in epoch-FIFO order. Full specification — payout categories, spending controls, cross-category payout ordering, interface stability, and the `ISafetyReserve` contract surface — is in [ADR 033](033-safety-insurance-reserve.md#adr-033-safety-and-insurance-reserve).
 
 ### 6. Delegator pool — USDC → TOKEN conversion
 
 The 7% delegator bucket flows through a USDC→TOKEN buy-and-distribute pipeline rather than direct USDC distribution.
 
 1. `FeeRouter` accumulates 7% of routed USDC into the delegator-pool epoch bucket per epoch.
-2. At epoch rollover (or via keeper trigger within the epoch), the bucket's USDC is swapped for TOKEN against the Balancer V3 80/20 pool ([ADR 018](018-liquidity-strategy.md)) under the same TWAP + minOut + per-epoch liquidity-cap protections as `BuybackBurner`. Implementation is a parallel `DelegatorBuyer` contract per [ADR 016 § Shared swap helper](016-contract-interactions.md#shared-swap-helper-buybackburner--delegatorbuyer); the two contracts share the swap execution path through an internal `BalancerV3SwapHelper` abstract contract while preserving distinct downstream destinations and governance setters.
+2. At epoch rollover (or via keeper trigger within the epoch), the bucket's USDC is swapped for TOKEN against the Balancer V3 80/20 pool ([ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol)) under the same TWAP + minOut + per-epoch liquidity-cap protections as `BuybackBurner`. Implementation is a parallel `DelegatorBuyer` contract per [ADR 016 § Shared swap helper](016-contract-interactions.md#shared-swap-helper-buybackburner--delegatorbuyer); the two contracts share the swap execution path through an internal `BalancerV3SwapHelper` abstract contract while preserving distinct downstream destinations and governance setters.
 3. The acquired TOKEN is held in the delegator-pool epoch bucket as TOKEN.
 4. Delegators / ve-lockers call `FeeRouter.claimDelegator(epochs[])`. Payout per locker = `ve_i / total_ve_at_epoch_boundary × token_in_delegator_bucket[epoch]`.
 
@@ -293,7 +293,7 @@ Routes acquired TOKEN to the participants with the longest commitment horizon an
 
 #### MEV / slippage
 
-TWAP windows + per-epoch liquidity caps + private-RPC routing (Flashbots-style bundles) for the swap. Same defenses as the [ADR 018](018-liquidity-strategy.md) buyback flow; per-epoch liquidity caps are a hard requirement on this path, not optional.
+TWAP windows + per-epoch liquidity caps + private-RPC routing (Flashbots-style bundles) for the swap. Same defenses as the [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol) buyback flow; per-epoch liquidity caps are a hard requirement on this path, not optional.
 
 #### Contract: DelegatorBuyer
 
@@ -372,7 +372,7 @@ Qualitative shape: fair-share ve materially out-earns no-ve at the reference 30K
 
 **Slashing distribution.** **50% challenger / 30% SafetyReserve / 20% burn.** The challenger share is the deterrent that pays for active enforcement; the SafetyReserve share funds user-harm incident recourse beyond pure deflation; the burn share preserves the deflationary deterrent at a level governance can recalibrate within §11 bounds. Pure-burn variants were considered and rejected.
 
-**Buyback-and-burn inflow.** 5% of routed USDC flows to `BuybackBurner` from `FeeRouter`. [ADR 018](018-liquidity-strategy.md) mechanics (Balancer V3 80/20 swap, TWAP, `minTokenOut`, POL custody) are inherited.
+**Buyback-and-burn inflow.** 5% of routed USDC flows to `BuybackBurner` from `FeeRouter`. [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol) mechanics (Balancer V3 80/20 swap, TWAP, `minTokenOut`, POL custody) are inherited.
 
 **Mature-scale burn estimate.** ~0.3–0.4%/yr of 1B supply at S2 reference scale.
 
@@ -391,22 +391,22 @@ Burn must be TWAP-limited and liquidity-aware. Mature burn budgets can exceed av
 | Voting source | `VotingEscrow.balanceOfAt` (was `TOKEN.getPastVotes`) |
 | Proposal threshold | 0.1% of total ve-supply |
 | Quorum | 4% of total ve-supply |
-| Voting period | 7 days (matches [ADR 009](009-governance.md)) |
-| Timelock | 48 hours (matches [ADR 009](009-governance.md)) |
+| Voting period | 7 days (matches [ADR 009](009-governance.md#adr-009-governance-model)) |
+| Timelock | 48 hours (matches [ADR 009](009-governance.md#adr-009-governance-model)) |
 | Total governance latency | ≈9 days (7-day vote + 48-hour timelock) |
 | Delegation | ve-balance delegatable, Governor Bravo pattern |
 
-Traders with no ve-position cannot vote. The early veTOKEN base is concentrated in self-locked seed/team/treasury positions and POL/airdrop recipients who choose to lock; **governance bootstrapping may require a treasury-funded ve-lock-on-claim airdrop in the first 6–12 months** (sourced from the community / ecosystem allocation or pre-seed). Rest of [ADR 009](009-governance.md) (emergency multisig, hard-cap pause powers, etc.) unchanged.
+Traders with no ve-position cannot vote. The early veTOKEN base is concentrated in self-locked seed/team/treasury positions and POL/airdrop recipients who choose to lock; **governance bootstrapping may require a treasury-funded ve-lock-on-claim airdrop in the first 6–12 months** (sourced from the community / ecosystem allocation or pre-seed). Rest of [ADR 009](009-governance.md#adr-009-governance-model) (emergency multisig, hard-cap pause powers, etc.) unchanged.
 
 ### 10. Bootstrap mechanism — pre-seed USDC
 
 Bootstrap supply-side incentive is **$1M+ pre-seed USDC capital** (planning target: $3M), externally raised. USDC denomination insulates subsidy purchasing power from TOKEN price. The protocol commits to the funding mechanism (USDC, externally raised) and the size floor ($1M); the operational program structure (allocation across operator-recruitment programs, eligibility, success metrics, governance flow) is tracked separately as a foundation/team operational concern, not as a protocol decision.
 
-[ADR 019](019-node-onboarding.md) is the canonical onboarding flow.
+[ADR 019](019-node-onboarding.md#adr-019-node-onboarding-and-bootstrapping-flow) is the canonical onboarding flow.
 
 ### 11. Governable parameters with safety bounds
 
-Router shares, the boost-floor parameter, the per-operator gauge-share cap, and the claim window are governable, gated by 48-hour timelock per [ADR 009](009-governance.md), and bounded as below. Sum-to-100% across the six router shares is enforced on every governance update; updates that violate the sum or exceed any individual bound revert.
+Router shares, the boost-floor parameter, the per-operator gauge-share cap, and the claim window are governable, gated by 48-hour timelock per [ADR 009](009-governance.md#adr-009-governance-model), and bounded as below. Sum-to-100% across the six router shares is enforced on every governance update; updates that violate the sum or exceed any individual bound revert.
 
 | Parameter | Default | Min | Max |
 | --- | ---: | ---: | ---: |
@@ -429,7 +429,7 @@ The 20% floor on the node-base share guarantees operators always receive enough 
 | --- | --- | --- |
 | `enableGauge()` | Flips `gaugeLaunched = false → true`, records `gaugeLaunchEpoch`, emits `GaugeLaunched`. Activates the live gauge bucket from `gaugeLaunchEpoch` onward; pre-launch escrow becomes claimable from `gaugeLaunchEpoch` against the historical ve-snapshots already taken at each pre-launch epoch boundary (per §2 Pre-launch gauge accumulation). | One-shot, irreversible. The pre-launch state is launch-only — there is no `disableGauge()`. |
 
-`enableGauge()` is governable per [ADR 009](009-governance.md), inherits the `AccessControl` role-gating from §11 Setter contract-level bound enforcement, and has no numeric bound (binary state).
+`enableGauge()` is governable per [ADR 009](009-governance.md#adr-009-governance-model), inherits the `AccessControl` role-gating from §11 Setter contract-level bound enforcement, and has no numeric bound (binary state).
 
 #### Setter contract-level bound enforcement
 
@@ -451,10 +451,10 @@ Parameter setters on `FeeRouter` and `VotingEscrow` are role-gated via `AccessCo
 ### Negative
 
 - **Significant contract surface.** `FeeRouter` (with two pool types and the delegator-swap path), `VotingEscrow`, `SafetyReserve`, and the optional `DelegatorBuyer` add meaningful audit burden. The §2 Pre-launch gauge accumulation adds three storage slots (`gaugeLaunched`, `gaugeLaunchEpoch`, the `preLaunchGaugeAccumulator` mapping), one one-shot governance setter (`enableGauge()`), and one event (`GaugeLaunched`) on top of the existing `FeeRouter` surface — a small but non-zero increment that audit must include.
-- **Per-epoch byte accounting adds gas.** Every settlement increments an operator's byte counter — 5K–15K gas on top of router forwarding. Minor but non-zero; needs validation on the chosen L2 (see [Appendix: L2 Deployment](appendix-l2-deployment.md)).
+- **Per-epoch byte accounting adds gas.** Every settlement increments an operator's byte counter — 5K–15K gas on top of router forwarding. Minor but non-zero; needs validation on the chosen L2 (see [Appendix: L2 Deployment](appendix-l2-deployment.md#appendix-production-l2-deployment-target)).
 - **Commodity operators face thin margins.** Operators who refuse to ve-lock see lower margins than fair-share-ve operators. This is the designed incentive pressure, but the failure mode is under-supply of operators if the filter is too sharp. Externally-funded operator-onboarding programs partially offset.
 - **Governance bootstrap depends on voluntary locking.** Initial veTOKEN supply tracks self-locking decisions; first 6–12 months may need treasury-funded lock incentives.
-- **Delegator-pool swap adds keeper dependency.** USDC→TOKEN conversion needs a keeper trigger (or fold into `BuybackBurner`'s existing keeper). Not a new failure mode — [ADR 018](018-liquidity-strategy.md) already has keeper dependency — but it expands the keeper's responsibilities.
+- **Delegator-pool swap adds keeper dependency.** USDC→TOKEN conversion needs a keeper trigger (or fold into `BuybackBurner`'s existing keeper). Not a new failure mode — [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol) already has keeper dependency — but it expands the keeper's responsibilities.
 - **Load-bearing math is harder to explain.** The Curve formula and the delegator-conversion mechanic are not intuitive to casual readers. UI, documentation, and operator dashboards need to expose "your boost factor," "your delegator-pool TOKEN earnings," and "delegator-pool slippage" clearly.
 - **Effective supply growth ~24%/yr during vesting window.** With ve-locking opt-in, the model relies on burn flow plus scenario-driven revenue growth to outweigh release pressure. Burn dominates monthly vesting only at S2+ at $0.05/TOKEN.
 
@@ -462,8 +462,8 @@ Parameter setters on `FeeRouter` and `VotingEscrow` are role-gated via `AccessCo
 
 - **Equilibrium fragility.** The Curve-style model converges to a stable equilibrium *if* the boost is valuable enough to lock for but not so valuable that a winner-take-all dynamic emerges. The 40% gauge-pool default is sized in the middle by reasoned default; production tuning may be needed.
 - **Reflexive operator-margin layer.** TOKEN price drop → ve-lock value drops → fair-share-ve margins shrink → operators unwind commitment. Pre-seed USDC insulates the *funding* side; the *operator-recruitment* side still depends on TOKEN price for ve-incentive strength. Mitigated, not eliminated.
-- **Delegator-conversion MEV risk.** TWAP + private-RPC routing mitigates front-running, but the swap is observable on-chain post-fact. Flashbots-style bundles and per-epoch liquidity caps are required on this path, not optional. Keeper-cost economics under L2 gas conditions ([Appendix: L2 Deployment](appendix-l2-deployment.md)) need validation.
+- **Delegator-conversion MEV risk.** TWAP + private-RPC routing mitigates front-running, but the swap is observable on-chain post-fact. Flashbots-style bundles and per-epoch liquidity caps are required on this path, not optional. Keeper-cost economics under L2 gas conditions ([Appendix: L2 Deployment](appendix-l2-deployment.md#appendix-production-l2-deployment-target)) need validation.
 - **Wash-trading / self-routed traffic.** An operator could induce noise settlements to inflate gauge-pool share. The structural defense and economic argument are in §3 [Per-operator gauge-share cap](#per-operator-gauge-share-cap). The launch prerequisite is contract-pinned in §2 [Pre-launch gauge accumulation](#pre-launch-gauge-accumulation): `gaugeLaunched == false` escrows the 40% gauge bucket per epoch, and the one-shot `enableGauge()` setter is the only path to live gauge payouts.
-- **Governance-weight concentration.** Operators who lock heavily for boost also accumulate disproportionate governance weight. [ADR 009](009-governance.md) safety bounds prevent extreme abuse; team / seed / treasury vesting acts as a counterweight during the first ~3 years.
+- **Governance-weight concentration.** Operators who lock heavily for boost also accumulate disproportionate governance weight. [ADR 009](009-governance.md#adr-009-governance-model) safety bounds prevent extreme abuse; team / seed / treasury vesting acts as a counterweight during the first ~3 years.
 - **Convex-capture risk.** Third-party liquid-ve wrappers (Convex / Votium / Aura analogs) can concentrate governance power outside the DAO. Mitigation is operational — the DAO may ship a native liquid-ve wrapper as an additive top-level contract (integrating with `VotingEscrow` via the standard lock-creation / increase-amount / snapshot interfaces per §4) without changing the launch contract surface.
 - **20% burn share deterrence.** A higher burn share would weight slashing more toward pure deflation; the chosen 50/30/20 distribution prefers user-harm recourse via `SafetyReserve`. The §11 safety bound on the burn share leaves room for governance recalibration; security review should confirm 20% preserves slashing's deterrent value.

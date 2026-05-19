@@ -1,16 +1,16 @@
 # Appendix: Operator Protocol-Upgrade Runbook
 
-> **Appendix, not a core protocol ADR.** Operator-facing companion to [ADR 013 — Schema Evolution](013-schema-evolution.md). Tier semantics, two-phase deserialization, ALPN negotiation, and the deprecation timeline are defined in [ADR 013](013-schema-evolution.md); this appendix only sequences the operator actions each tier implies.
+> **Appendix, not a core protocol ADR.** Operator-facing companion to [ADR 013 — Schema Evolution](013-schema-evolution.md#adr-013-schema-evolution). Tier semantics, two-phase deserialization, ALPN negotiation, and the deprecation timeline are defined in [ADR 013](013-schema-evolution.md#adr-013-schema-evolution); this appendix only sequences the operator actions each tier implies.
 
 ## Context
 
-The protocol evolves under the [ADR 013](013-schema-evolution.md) three-tier scheme (Tier 1 minor, Tier 2 medium, Tier 3 major). The mechanics are well-specified; the operator question — *what do I do when a release ships?* — is not (which releases need config edits, when payment channels are at risk, how to roll a fleet upgrade without dropping traffic).
+The protocol evolves under the [ADR 013](013-schema-evolution.md#adr-013-schema-evolution) three-tier scheme (Tier 1 minor, Tier 2 medium, Tier 3 major). The mechanics are well-specified; the operator question — *what do I do when a release ships?* — is not (which releases need config edits, when payment channels are at risk, how to roll a fleet upgrade without dropping traffic).
 
 This runbook fills that gap. It does not redefine any protocol mechanism.
 
 ## 1. Tier overview
 
-Per [ADR 013 § Decision](013-schema-evolution.md), each schema change is exactly one tier:
+Per [ADR 013 § Decision](013-schema-evolution.md#adr-013-schema-evolution), each schema change is exactly one tier:
 
 | Tier | Trigger | ALPN | Operator action |
 |------|---------|------|-----------------|
@@ -28,21 +28,21 @@ A Tier 1 release adds optional fields to existing structs. By construction:
 
 - Wire format stays compatible (postcard two-phase deserialization handles missing trailing extensions).
 - ALPN string unchanged.
-- Signed field set unchanged ([ADR 013 § Signed Field Freezing](013-schema-evolution.md)) — slash evidence stays verifiable across versions.
+- Signed field set unchanged ([ADR 013 § Signed Field Freezing](013-schema-evolution.md#adr-013-schema-evolution)) — slash evidence stays verifiable across versions.
 - Payment channels and on-chain bindings unaffected.
 
 **Operator action:** Pull and restart at your normal cadence. No drain, flag day, deprecation window, or client coordination. Skipping a Tier 1 release entirely keeps you interoperable indefinitely — peers on the new version just won't see the optional fields you don't emit.
 
 ### 2.2 Tier 2 — medium evolution
 
-A Tier 2 release adds new optional message variants (e.g. a `Ping`/`Pong` keepalive on `cdn/client/v1`) or a new gossip envelope version. The ALPN string is unchanged; legacy peers that don't understand the new variant close the stream with `UNSUPPORTED_MESSAGE` and the sender falls back ([ADR 013 § Tier 2](013-schema-evolution.md)).
+A Tier 2 release adds new optional message variants (e.g. a `Ping`/`Pong` keepalive on `cdn/client/v1`) or a new gossip envelope version. The ALPN string is unchanged; legacy peers that don't understand the new variant close the stream with `UNSUPPORTED_MESSAGE` and the sender falls back ([ADR 013 § Tier 2](013-schema-evolution.md#adr-013-schema-evolution)).
 
 **Operator checklist:**
 
 1. **Read the release notes** for new operator-config flags introduced with the variant. Typically opt-in (e.g. `enable_keepalive = true`); defaults are conservative.
 2. **Pull and restart at your normal cadence.** Drain only if the release notes say so — most Tier 2 releases need none.
 3. **Monitor `decdn_streams_failed_total{reason="protocol_error"}`** for one rolling window after restart. A spike means a peer is rejecting the new variant — expected and benign for legacy peers, but a sustained rate from your own outbound streams suggests config drift.
-4. **Configure new metrics** in your dashboard if the release exposes them (canonical registry: [`appendix-observability.md`](appendix-observability.md)).
+4. **Configure new metrics** in your dashboard if the release exposes them (canonical registry: [`appendix-observability.md`](appendix-observability.md#appendix-observability-and-metrics)).
 
 Payment channels and stake state are unaffected.
 
@@ -60,16 +60,16 @@ A Tier 3 release ships a node binary supporting both versions, giving you four w
 |-------|-----|
 | **Config-field deltas.** Diff your operator config against the release's example config for new mandatory, renamed, or removed fields. | Tier 3 is the only tier where required config can change. |
 | **Payment-channel validity.** Tier 3 may change the channel-ID formula or voucher format, invalidating **open channels** (release notes state this). Affected channels settle via the normal close/dispute/settle path, or `reclaimExpired` after expiry. | Close open old-protocol channels before the cutover window or risk losing payments. |
-| **Voucher-signer compatibility.** If the EIP-712 voucher domain or typed-data hash changes (Tier 3 § Signed Field Freezing — changing the signed field set is major), upgrade the off-chain voucher signer in lockstep with the node binary. | An old signer's pre-bump signatures fail `SignatureChecker.isValidSignatureNow` against the new contract ([ADR 024 §1](024-account-abstraction.md)). |
-| **Local dispute monitor compatibility.** The in-process dispute monitor ([ADR 003](003-payments.md) Option C) reads local-store voucher state and submits `disputeChannel` calls. After a Tier 3 voucher-format change it must be on the new binary before any new-format channels open, else it cannot decode them. It ships with the node binary, so the only operator action is sequencing node and contract upgrades correctly. | Primary stale-close defense ([Appendix: Fraud Detection](appendix-fraud-detection.md)); a stale binary leaves new-format closes unmonitored. |
+| **Voucher-signer compatibility.** If the EIP-712 voucher domain or typed-data hash changes (Tier 3 § Signed Field Freezing — changing the signed field set is major), upgrade the off-chain voucher signer in lockstep with the node binary. | An old signer's pre-bump signatures fail `SignatureChecker.isValidSignatureNow` against the new contract ([ADR 024 §1](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support)). |
+| **Local dispute monitor compatibility.** The in-process dispute monitor ([ADR 003](003-payments.md#adr-003-payment-model) Option C) reads local-store voucher state and submits `disputeChannel` calls. After a Tier 3 voucher-format change it must be on the new binary before any new-format channels open, else it cannot decode them. It ships with the node binary, so the only operator action is sequencing node and contract upgrades correctly. | Primary stale-close defense ([Appendix: Fraud Detection](appendix-fraud-detection.md#appendix-permissionless-stale-close-detection)); a stale binary leaves new-format closes unmonitored. |
 
 ### 3.2 Cutover — rolling upgrade (per node)
 
-The release ships a binary registering **both** ALPN handlers (`v1` and `v2`) on one `iroh::Endpoint`, per [ADR 013 § Multi-version support](013-schema-evolution.md), making the rolling upgrade per-node and zero-downtime in aggregate.
+The release ships a binary registering **both** ALPN handlers (`v1` and `v2`) on one `iroh::Endpoint`, per [ADR 013 § Multi-version support](013-schema-evolution.md#adr-013-schema-evolution), making the rolling upgrade per-node and zero-downtime in aggregate.
 
 For each node in the fleet, in any order:
 
-1. **Drain** new inbound connections. The intended surface, `admin_v1_drain`, is listed in [`appendix-local-admin-http.md`](appendix-local-admin-http.md) but not yet implemented; until it ships, drain via your external load balancer (stop forwarding new connections) or block the node's QUIC port at the firewall. Either way, confirm:
+1. **Drain** new inbound connections. The intended surface, `admin_v1_drain`, is listed in [`appendix-local-admin-http.md`](appendix-local-admin-http.md#appendix-local-admin-http-surface) but not yet implemented; until it ships, drain via your external load balancer (stop forwarding new connections) or block the node's QUIC port at the firewall. Either way, confirm:
    - `decdn_streams_active{direction="inbound"} == 0`
    - `decdn_probe_hold_slots_used == 0` (avoids the phantom-slash window per [ADR 005 § Probe-Triggered Eviction Hold](005-protocol.md#probe-triggered-eviction-hold))
 2. **Stop** the node.
@@ -111,32 +111,32 @@ For Tier 3, clients control the ALPN proposal order. You don't negotiate with th
 
 ### 4.2 Governance
 
-For Tier 3 upgrades touching governance-controlled parameters (rate bounds in [ADR 003 § Rate Bounds Refresh](003-payments.md), slashing schedule in [ADR 026 §8](026-gauge-boost-tokenomics.md)):
+For Tier 3 upgrades touching governance-controlled parameters (rate bounds in [ADR 003 § Rate Bounds Refresh](003-payments.md#adr-003-payment-model), slashing schedule in [ADR 026 §8](026-gauge-boost-tokenomics.md#adr-026-gauge-boost-tokenomics)):
 
-- The authorizing governance proposal is on its own timeline ([ADR 009](009-governance.md): 7-day vote + 48-hour timelock). The protocol release usually ships **before** the vote concludes, with the new behavior gated on an on-chain flag.
+- The authorizing governance proposal is on its own timeline ([ADR 009](009-governance.md#adr-009-governance-model): 7-day vote + 48-hour timelock). The protocol release usually ships **before** the vote concludes, with the new behavior gated on an on-chain flag.
 - Operators MUST verify the relevant on-chain governance state before activating the new behavior locally — consult the release notes for the specific contract call (e.g. `Governance.upgradeActivated(uint256 versionId)` returns true).
 
 ## 5. Failure modes and rollback
 
 | Symptom during Tier 3 rollout | Likely cause | Rollback |
 |-------------------------------|--------------|----------|
-| Restarted node reports `not_ready` for `rate_bounds_loaded` | Tier 3 changed the rate-bounds RPC response format; node parsed an old-format response | Roll back to the last-green binary (previous stable or dual-version). The governance flag may take up to 48h to flip per [ADR 009](009-governance.md) timelock; don't block availability waiting for it. After it flips, redo the §3.2 cutover for that node. |
+| Restarted node reports `not_ready` for `rate_bounds_loaded` | Tier 3 changed the rate-bounds RPC response format; node parsed an old-format response | Roll back to the last-green binary (previous stable or dual-version). The governance flag may take up to 48h to flip per [ADR 009](009-governance.md#adr-009-governance-model) timelock; don't block availability waiting for it. After it flips, redo the §3.2 cutover for that node. |
 | `decdn_streams_failed_total{reason="protocol_error"}` spikes after restart | Old peers receiving the new ALPN version's framing | Expected during the dual-version window. Investigate only if sustained from peers known to have already upgraded. |
 | `closeChannel` reverts with new contract | Voucher format changed; old vouchers invalid against the new contract | Affected channels settle via the normal close/dispute/settle path; `reclaimExpired` returns the deposit after expiry. The dispute window applies. |
 | `decdn_quic_0rtt_rejected_total` spikes after restart | Old client-cached session tickets are not 0-RTT-replayable on the new ALPN | Self-corrects within one session-ticket lifetime. No action needed. |
-| Mass `closeChannel` calls clog the L2 sequencer | Large fleets closing all old-format channels at once | Batch closes across operators; let channels settle naturally over their `maxChannelDuration` (default 90 days per [ADR 003](003-payments.md)). |
+| Mass `closeChannel` calls clog the L2 sequencer | Large fleets closing all old-format channels at once | Batch closes across operators; let channels settle naturally over their `maxChannelDuration` (default 90 days per [ADR 003](003-payments.md#adr-003-payment-model)). |
 
 ## 6. What this runbook does not cover
 
 - **In-place protocol downgrades.** The Tier 3 deprecation timeline is one-directional. Operator software may roll back to the dual-version binary in an emergency, but reverting a `v2`-only binary to `v1`-only after `v1` removal is unsupported.
-- **Cross-chain protocol coordination.** Assumes a single L2 deployment ([`appendix-l2-deployment.md`](appendix-l2-deployment.md)). Multi-L2 deployments will need a separate per-deployment-coordinator pattern.
-- **Client-side migration.** Governed by client deployment policy, not this runbook. Client smart-wallet upgrades follow [ADR 024](024-account-abstraction.md).
+- **Cross-chain protocol coordination.** Assumes a single L2 deployment ([`appendix-l2-deployment.md`](appendix-l2-deployment.md#appendix-production-l2-deployment-target)). Multi-L2 deployments will need a separate per-deployment-coordinator pattern.
+- **Client-side migration.** Governed by client deployment policy, not this runbook. Client smart-wallet upgrades follow [ADR 024](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support).
 
 ## Cross-ADR Impact
 
-- [ADR 013 — Schema Evolution: tier semantics, ALPN negotiation, deprecation timeline](013-schema-evolution.md)
+- [ADR 013 — Schema Evolution: tier semantics, ALPN negotiation, deprecation timeline](013-schema-evolution.md#adr-013-schema-evolution)
 - [ADR 005 — Probe-Triggered Eviction Hold (drain prerequisite)](005-protocol.md#probe-triggered-eviction-hold)
-- [Appendix: Fraud Detection — local dispute monitor and permissionless challengers](appendix-fraud-detection.md)
-- [ADR 024 — Smart-account verification across versions](024-account-abstraction.md)
-- [`appendix-local-admin-http.md` — `admin_v1_drain` invocation](appendix-local-admin-http.md)
-- [`appendix-observability.md` — metrics referenced in the smoke-test checklist](appendix-observability.md)
+- [Appendix: Fraud Detection — local dispute monitor and permissionless challengers](appendix-fraud-detection.md#appendix-permissionless-stale-close-detection)
+- [ADR 024 — Smart-account verification across versions](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support)
+- [`appendix-local-admin-http.md` — `admin_v1_drain` invocation](appendix-local-admin-http.md#appendix-local-admin-http-surface)
+- [`appendix-observability.md` — metrics referenced in the smoke-test checklist](appendix-observability.md#appendix-observability-and-metrics)
