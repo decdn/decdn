@@ -50,7 +50,7 @@ If both keys must rotate, rotate the **iroh key first** (cheap, atomic on-chain,
 
 | Survives rotation | Reason |
 |-------------------|--------|
-| Stake, ve-locks, gauge-claim history | Keyed by Ethereum address ([ADR 026](026-gauge-boost-tokenomics.md)) |
+| Stake, ve-locks, gauge-claim history | Keyed by Ethereum address ([ADR 026](026-tokenomics.md)) |
 | Open payment channels (inbound from clients) | Channel ID `keccak256(client_eth, operator_eth, nonce)` ([ADR 003](003-payments.md)); Ethereum address unchanged |
 | `firstRegisteredAt` | Cleared only by `deregisterNode`; `bindNodeId` does not touch it ([ADR 019 § Re-Onboarding](019-node-onboarding.md#re-onboarding-after-deregistration-or-auto-ejection)) |
 
@@ -178,7 +178,7 @@ Exception: **emergency compromise of the Ethereum key.** Run §2 immediately, sk
 
 - **Client-side iroh-key rotation.** See [ADR 012](012-client.md), inline "Key rotation": open client→node channels survive client iroh-key rotation (keyed by the client's Ethereum address), mirroring the operator-side carry-over in §1.
 - **Out-of-scope production hot-signing alternatives.** Hardware-wallet and HSM-backed voucher signing are infeasible per [ADR 012 § Consequences](012-client.md#consequences) — 2–5s confirmation latencies cannot keep the per-MB voucher cadence. A separate delegated-voucher-signer contract path is similarly superseded. The sole production hot-signing path is [ADR 024 §3 `erc7579/smartsessions`](024-account-abstraction.md#3-session-keys--deferred-to-production-via-erc-7579-smartsessions).
-- **Compromised-key incident response.** This runbook describes mechanics. If a key is *believed compromised*, the operator should also: file an incident report with the SafetyReserve registry ([ADR 026 §5](026-gauge-boost-tokenomics.md)) if losses occurred, alert peer operators via reputation gossip, and rotate before any further wire-level signature under the compromised key.
+- **Compromised-key incident response.** This runbook describes mechanics. If a key is *believed compromised*, the operator should also: file an incident report with the SafetyReserve registry ([ADR 026 §5](026-tokenomics.md)) if losses occurred, alert peer operators via reputation gossip, and rotate before any further wire-level signature under the compromised key.
 
 ## Cross-ADR Impact
 

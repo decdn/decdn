@@ -168,7 +168,7 @@ for Arbitrum One mainnet equivalents at each step. No contract logic changes.
 
 ### Tokenomics Validation Requirements
 
-[ADR 026](026-gauge-boost-tokenomics.md) adds two gas-cost surfaces to re-validate
+[ADR 026](026-tokenomics.md) adds two gas-cost surfaces to re-validate
 before mainnet — economic, not architectural: they do not invalidate the Arbitrum
 One choice but must be quantified on the chosen L2 with measured (not estimated)
 numbers, additive to this ADR's selection criteria. Gas tables are intentionally
@@ -177,20 +177,20 @@ Arbitrum One fee markets at deployment. Three MUST gates:
 
 1. **`FeeRouter` per-settlement overhead.** Every `settleChannel` routes through
    `FeeRouter.routeSettlement(operator, bytesDelivered, amount, epochId)`, feeding
-   the [ADR 026 §3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula) gauge
+   the [ADR 034 § Gauge-boost formula](034-gauge-boost-voting-escrow.md#gauge-boost-formula) gauge
    formula. Overhead **~5–10K gas** atop the settlement tx (1 SLOAD + 1 SSTORE); at
    100K settlements/year (medium operator) a small fraction of total cost. Aggregate
    per-settlement gas (USDC-equivalent, incl. this overhead) MUST stay within the
    operator P&L affordability bounds of
-   [ADR 026 §7](026-gauge-boost-tokenomics.md).
+   [ADR 026 §7](026-tokenomics.md).
 
 2. **Per-epoch keeper-call gas economics.** Two TWAP-protected USDC→TOKEN swap
    keeper calls per epoch: `BuybackBurner` (5% buyback-and-burn flow per
    [ADR 018](018-liquidity-strategy.md)) and delegator-pool conversion (7%
-   delegator-pool flow per [ADR 026 §6](026-gauge-boost-tokenomics.md)) — at a
+   delegator-pool flow per [ADR 026 §6](026-tokenomics.md)) — at a
    1-week epoch, **52+ swaps/year minimum**, both via the Balancer V3 80/20
    TOKEN/USDC pool with TWAP windows, `minOut`, and per-epoch liquidity caps (which
-   bind at S2/S3 scale per [ADR 026 §8](026-gauge-boost-tokenomics.md)). Per-epoch keeper costs MUST be not cost-prohibitive at
+   bind at S2/S3 scale per [ADR 026 §8](026-tokenomics.md)). Per-epoch keeper costs MUST be not cost-prohibitive at
    S2/S3 scale and a small fraction of the inflow each call routes.
 
 3. **Private-RPC gate.** The L2 MUST support private-RPC routing (Flashbots-style
