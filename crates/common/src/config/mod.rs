@@ -246,10 +246,10 @@ fn validate_port_layout_into(
     // checks are independent: accumulate every collision so an operator who
     // set all three equal sees all of them, not just the first.
     if bind != 0 && metrics != 0 {
-        bag.check(
+        bag.check_with(
             bind != metrics,
             "network.bind_port",
-            format!(
+            || format!(
                 "network.bind_port ({bind}) must differ from observability.metrics_port ({metrics}); \
                  QUIC (UDP) and metrics (TCP) would not collide at bind time, but sharing \
                  the same port number is almost certainly an operator typo"
@@ -262,15 +262,13 @@ fn validate_port_layout_into(
         && bind != 0
         && admin != 0
     {
-        bag.check(
-            bind != admin,
-            "network.bind_port",
+        bag.check_with(bind != admin, "network.bind_port", || {
             format!(
                 "network.bind_port ({bind}) must differ from observability.admin_port ({admin}); \
                  QUIC (UDP) and admin (TCP) would not collide at bind time, but sharing \
                  the same port number is almost certainly an operator typo"
-            ),
-        );
+            )
+        });
     }
 
     // metrics vs admin — both TCP, second bind would fail silently.
@@ -278,10 +276,10 @@ fn validate_port_layout_into(
         && metrics != 0
         && admin != 0
     {
-        bag.check(
+        bag.check_with(
             admin != metrics,
             "observability.admin_port",
-            format!(
+            || format!(
                 "observability.admin_port ({admin}) must differ from observability.metrics_port ({metrics}); \
                  the two servers cannot share a TCP port"
             ),
@@ -495,13 +493,15 @@ fn resolve_blockchain_into(
             ) {
                 None => String::new(),
                 Some(parsed) => {
-                    if bag.check(
+                    if bag.check_with(
                         parsed.scheme() == "http" || parsed.scheme() == "https",
                         "blockchain.rpc_url",
-                        format!(
-                            "blockchain.rpc_url must use http or https scheme (got {:?})",
-                            parsed.scheme()
-                        ),
+                        || {
+                            format!(
+                                "blockchain.rpc_url must use http or https scheme (got {:?})",
+                                parsed.scheme()
+                            )
+                        },
                     ) {
                         // Store the normalized form (lowercase scheme,
                         // trailing slash, etc.). Userinfo (basic auth) is
@@ -600,27 +600,27 @@ fn resolve_blockchain_into(
     // against it produces `slash_sig`s no `SlashJudge` can verify — the same
     // silently-broken-but-running failure mode the zero-`slash_judge_address`
     // check above prevents.
-    bag.check(
-        chain_id != 0,
-        "blockchain.chain_id",
+    bag.check_with(chain_id != 0, "blockchain.chain_id", || {
         format!(
             "blockchain.chain_id must not be 0 — set it to the deployed L2 \
              chain id (default {DEFAULT_CHAIN_ID}, Arbitrum Sepolia)"
-        ),
-    );
+        )
+    });
 
     let rpc_watchdog_interval_sec = file
         .and_then(|b| b.rpc_watchdog_interval_sec)
         .unwrap_or(DEFAULT_RPC_WATCHDOG_INTERVAL_SEC);
-    bag.check(
+    bag.check_with(
         rpc_watchdog_interval_sec == 0
             || rpc_watchdog_interval_sec >= MIN_RPC_WATCHDOG_INTERVAL_SEC,
         "blockchain.rpc_watchdog_interval_sec",
-        format!(
-            "blockchain.rpc_watchdog_interval_sec={rpc_watchdog_interval_sec} \
+        || {
+            format!(
+                "blockchain.rpc_watchdog_interval_sec={rpc_watchdog_interval_sec} \
              would flood the RPC endpoint (minimum {MIN_RPC_WATCHDOG_INTERVAL_SEC}s, \
              or 0 to disable)"
-        ),
+            )
+        },
     );
 
     // CLI/env only — no TOML field. `expand_tilde` for parity with the
@@ -685,14 +685,16 @@ fn resolve_cache_into(
         .or_else(|| file.and_then(|c| c.max_blob_size_mb))
         .unwrap_or(DEFAULT_MAX_BLOB_SIZE_MB);
 
-    bag.check(
+    bag.check_with(
         max_blob_size_mb < cache_size_mb,
         "cache.max_blob_size_mb",
-        format!(
-            "cache.max_blob_size_mb ({max_blob_size_mb}) must be strictly less than \
+        || {
+            format!(
+                "cache.max_blob_size_mb ({max_blob_size_mb}) must be strictly less than \
              cache.cache_size_mb ({cache_size_mb}); otherwise a single oversized blob \
              can saturate the cache on one fetch"
-        ),
+            )
+        },
     );
 
     let origins = resolve_origins_into(file, bag);
@@ -1255,14 +1257,16 @@ fn resolve_payment_into(
         "payment.rate_per_mb must be > 0 (used in the node selection score, \
          ADR 001); got 0",
     );
-    bag.check(
+    bag.check_with(
         rate_per_mb <= decdn_protocol::MAX_RATE_PER_MB,
         "payment.rate_per_mb",
-        format!(
-            "payment.rate_per_mb {rate_per_mb} exceeds protocol MAX_RATE_PER_MB ({}); \
+        || {
+            format!(
+                "payment.rate_per_mb {rate_per_mb} exceeds protocol MAX_RATE_PER_MB ({}); \
              honest clients reject `ProbeResponse`s above this ceiling (issue #378)",
-            decdn_protocol::MAX_RATE_PER_MB,
-        ),
+                decdn_protocol::MAX_RATE_PER_MB,
+            )
+        },
     );
     // PoC-local stand-in for the on-chain `getRateBounds()` (ADR 005 §Rate
     // bounds validation). Defaults (`0` .. `MAX_RATE_PER_MB`) make the clamp
@@ -1275,13 +1279,15 @@ fn resolve_payment_into(
         .delivery_ceiling
         .or_else(|| file.and_then(|p| p.delivery_ceiling))
         .unwrap_or(decdn_protocol::MAX_RATE_PER_MB);
-    bag.check(
+    bag.check_with(
         delivery_floor <= delivery_ceiling,
         "payment.delivery_floor",
-        format!(
-            "payment.delivery_floor ({delivery_floor}) must be <= \
+        || {
+            format!(
+                "payment.delivery_floor ({delivery_floor}) must be <= \
              payment.delivery_ceiling ({delivery_ceiling})"
-        ),
+            )
+        },
     );
     // A ceiling of 0 would clamp every quoted rate to 0, bypassing the
     // `rate_per_mb > 0` guard above and making the node advertise a
@@ -1294,15 +1300,17 @@ fn resolve_payment_into(
         "payment.delivery_ceiling must be >= 1 (clamping to 0 would sign a \
          free rate and bypass the rate_per_mb > 0 guard, ADR 001)",
     );
-    bag.check(
+    bag.check_with(
         delivery_ceiling <= decdn_protocol::MAX_RATE_PER_MB,
         "payment.delivery_ceiling",
-        format!(
-            "payment.delivery_ceiling {delivery_ceiling} exceeds protocol \
+        || {
+            format!(
+                "payment.delivery_ceiling {delivery_ceiling} exceeds protocol \
              MAX_RATE_PER_MB ({}); clamping to it could still emit a rate honest \
              clients reject",
-            decdn_protocol::MAX_RATE_PER_MB,
-        ),
+                decdn_protocol::MAX_RATE_PER_MB,
+            )
+        },
     );
     ResolvedPayment {
         rate_per_mb,
@@ -1368,13 +1376,15 @@ fn resolve_observability_into(
 
     if let Some(ref ep) = otlp_endpoint {
         let lower = ep.to_ascii_lowercase();
-        bag.check(
+        bag.check_with(
             lower.starts_with("http://") || lower.starts_with("https://"),
             "observability.otlp_endpoint",
-            format!(
-                "observability.otlp_endpoint must start with http:// or https:// \
+            || {
+                format!(
+                    "observability.otlp_endpoint must start with http:// or https:// \
                  (got {ep:?}); gRPC/OTLP collectors require an HTTP-scheme URL"
-            ),
+                )
+            },
         );
     }
 
@@ -1426,7 +1436,10 @@ fn resolve_gossip_into(
         .and_then(|g| g.allowlist.as_ref())
         .map(|v| {
             v.iter()
-                .filter_map(|s| bag.try_with("gossip.allowlist", parse_node_id_hex(s)))
+                .enumerate()
+                .filter_map(|(idx, s)| {
+                    bag.try_with(format!("gossip.allowlist[{idx}]"), parse_node_id_hex(s))
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -1475,10 +1488,10 @@ fn resolve_security_into(
     // so the failure mode is "node refuses to boot with a clear
     // error" rather than "node panics on next reload."
     let max_permits = tokio::sync::Semaphore::MAX_PERMITS;
-    bag.check(
+    bag.check_with(
         usize::try_from(max_concurrent_handlers).is_ok_and(|v| v <= max_permits),
         "security.max_concurrent_handlers",
-        format!(
+        || format!(
             "security.max_concurrent_handlers={max_concurrent_handlers} exceeds tokio Semaphore::MAX_PERMITS={max_permits} on this target"
         ),
     );

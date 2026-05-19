@@ -42,9 +42,9 @@ impl ConfigErrorBag {
         });
     }
 
-    /// `anyhow::ensure!` replacement: record `message` under `field` when
-    /// `cond` is false. Returns `cond` so callers can branch and skip a
-    /// dependent check or substitute a placeholder.
+    /// `anyhow::ensure!` replacement for a static message: record `message`
+    /// under `field` when `cond` is false. Returns `cond` so callers can
+    /// branch and skip a dependent check or substitute a placeholder.
     pub(crate) fn check(
         &mut self,
         cond: bool,
@@ -53,6 +53,22 @@ impl ConfigErrorBag {
     ) -> bool {
         if !cond {
             self.push(field, message);
+        }
+        cond
+    }
+
+    /// Lazy variant of [`check`](Self::check): the message closure runs only
+    /// when `cond` is false, matching `anyhow::ensure!`'s format-on-failure
+    /// behaviour so the happy path allocates nothing for `format!(...)`
+    /// messages.
+    pub(crate) fn check_with(
+        &mut self,
+        cond: bool,
+        field: impl Into<String>,
+        message: impl FnOnce() -> String,
+    ) -> bool {
+        if !cond {
+            self.push(field, message());
         }
         cond
     }
@@ -100,7 +116,13 @@ impl ConfigErrorBag {
         let bullets = self
             .problems
             .iter()
-            .map(|p| format!("  - {}: {}", p.field, p.message))
+            .map(|p| {
+                // Indent any continuation lines so a multi-line message
+                // (e.g. a future `{e:#}` chain that wraps) still reads as
+                // one bullet rather than dedenting to the margin.
+                let message = p.message.replace('\n', "\n    ");
+                format!("  - {}: {}", p.field, message)
+            })
             .collect::<Vec<_>>()
             .join("\n");
         Err(anyhow::anyhow!(
@@ -170,6 +192,35 @@ mod tests {
         assert!(msg.contains("configuration has 2 problem(s):"), "{msg}");
         assert!(msg.contains("  - one.a: first problem"), "{msg}");
         assert!(msg.contains("  - two.b: second problem"), "{msg}");
+    }
+
+    #[test]
+    fn check_with_runs_closure_only_on_failure() {
+        let mut bag = ConfigErrorBag::new();
+        let mut calls = 0;
+        // cond == true: closure must not run, nothing recorded.
+        assert!(bag.check_with(true, "a.b", || {
+            calls += 1;
+            "unreachable".to_string()
+        }));
+        assert_eq!(calls, 0);
+        assert!(bag.is_empty());
+        // cond == false: closure runs once, message recorded.
+        assert!(!bag.check_with(false, "a.b", || {
+            calls += 1;
+            format!("boom {}", 42)
+        }));
+        assert_eq!(calls, 1);
+        let msg = format!("{:#}", bag.into_result().unwrap_err());
+        assert!(msg.contains("a.b: boom 42"), "{msg}");
+    }
+
+    #[test]
+    fn into_result_indents_multiline_message_continuations() {
+        let mut bag = ConfigErrorBag::new();
+        bag.push("x.y", "line one\nline two");
+        let msg = format!("{:#}", bag.into_result().unwrap_err());
+        assert!(msg.contains("  - x.y: line one\n    line two"), "{msg}");
     }
 
     #[test]
