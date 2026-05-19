@@ -32,7 +32,7 @@ Three OP-Stack / Nitro L2s evaluated: **Arbitrum One**, **Base**, **OP Mainnet**
 | Factor | Relevance to deCDN |
 |--------|--------------------|
 | Gas costs at current fee market | Directly affects channel open/close/settle economics (ADR 003 §Deposit Economics) |
-| Sequencer forced-inclusion delay | Hard lower-bound on dispute window; must exceed this value (ADR 003/007) |
+| Sequencer forced-inclusion delay | Hard lower-bound on dispute window; must exceed this value (ADR 003 §L2 sequencer censorship) |
 | Native USDC availability | Eliminates Circle bridge counterparty risk for payment channels |
 | Balancer V3 deployment | ADR 018 requires a Balancer V3 Weighted Pool for TOKEN/USDC POL |
 | Aggregator routing density | Affects buyback execution quality and CoW Swap solver availability (ADR 018) |
@@ -71,12 +71,12 @@ magnitude.
 
 ### Sequencer Censorship and Dispute Window
 
-ADR 003 / ADR 007 set the default dispute window at **48 hours** for a 24-hour
-effective response window under worst-case censorship (forced-inclusion ≤ 24 h);
-with all three at ~24 h, 48 h is adequate and no ADR 003/007 parameter change is
-required. ADR 009 governance bounds (12 h–72 h) apply identically; the 12-hour floor
-is unsafe wherever forced-inclusion exceeds 12 hours — a governance guardrail issue
-independent of the chain chosen here.
+[ADR 003 § L2 sequencer censorship](003-payments.md#l2-sequencer-censorship) sets
+the default dispute window at **48 hours** for a 24-hour effective response window
+under worst-case censorship (forced-inclusion ≤ 24 h); with all three at ~24 h, 48 h
+is adequate and no ADR 003 parameter change is required. ADR 009 governance bounds
+(12 h–72 h) apply identically; the 12-hour floor is unsafe wherever forced-inclusion
+exceeds 12 hours — a governance guardrail issue independent of the chain chosen here.
 
 ### Balancer V3 and Liquidity
 
@@ -103,8 +103,8 @@ Rationale:
 
 1. **Cross-ADR calibration** — Balancer V3 Router address, CoW Swap routing
    assumptions, and aggregator density (ADR 018), gas estimates (ADR 003), and the
-   forced-inclusion window (ADR 007) are all calibrated for Arbitrum One; changing
-   chains would require re-validating all of them.
+   forced-inclusion window (ADR 003 § L2 sequencer censorship) are all calibrated
+   for Arbitrum One; changing chains would require re-validating all of them.
 2. **Highest DeFi liquidity depth** — thinner competition for TOKEN/USDC pool depth
    in early production; better buyback execution quality.
 3. **PoC continuity** — Arbitrum Sepolia → Arbitrum One, no architecture changes.
@@ -137,7 +137,7 @@ Canonical reference for Arbitrum-specific assumptions elsewhere in the ADR set:
 | ADR | Assumption |
 |-----|------------|
 | ADR 003 § Deposit Economics | Gas table calibrated against Arbitrum One fee market |
-| ADR 007 § L2 Sequencer Censorship | Forced-inclusion delay ≤ 24 h (Arbitrum value) |
+| ADR 003 § L2 Sequencer Censorship | Forced-inclusion delay ≤ 24 h (Arbitrum value) |
 | ADR 018 § Buyback execution | Balancer V3 Router address is the Arbitrum One deployment |
 | ADR 016 § Deployment | "Arbitrum mainnet" in the BuybackBurner row |
 

@@ -143,7 +143,7 @@ After the first probe cycles to a given peer, that connection has a cached ticke
 ### Observability
 
 Implementations SHOULD expose the following metrics. They live in the `decdn_*`
-metric family (per [ADR 020](020-observability.md) / the node metrics registry); the
+metric family (per [Appendix: Observability](appendix-observability.md) / the node metrics registry); the
 OpenMetrics encoder appends `_total` to counters. No ALPN label is applied — only one
 ALPN is 0-RTT-eligible, so the label would be constant, and the metrics house style
 is label-free:
