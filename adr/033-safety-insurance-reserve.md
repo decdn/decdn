@@ -76,6 +76,9 @@ interface ISafetyReserve {
         Other
     }
 
+    // Field order is illustrative; storage-slot packing is an
+    // implementation/audit concern (gas micro-tuning is out of scope
+    // here — see ADR 032). Logical order: what / who / how-much / when.
     struct Incident {
         bytes32 bundle;          // attested evidence hash
         address recipient;       // payout target
