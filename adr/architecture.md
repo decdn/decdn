@@ -78,10 +78,11 @@ Off-chain payment channels for per-MB delivery, with on-chain settlement. Client
 
 ### Chapter 4 — Tokenomics & incentives
 
-The economic model that ties the protocol together. Two ADRs: [ADR 026](026-gauge-boost-tokenomics.md) (canonical, including the per-operator gauge-share cap that defends against wash-trading) and [ADR 018](018-liquidity-strategy.md) (Balancer V3 POL). The launch contract surface is forward-compatible (additive integration via standard `AccessControl` role grants per [ADR 016 §5](016-contract-interactions.md#5-access-control-matrix)) so future economic-layer products can land as additive top-level contracts without changing existing contracts.
+The economic model that ties the protocol together. [ADR 026](026-gauge-boost-tokenomics.md) is the canonical umbrella (supply, the `FeeRouter` six-bucket split, gauge boost incl. the per-operator gauge-share cap that defends against wash-trading, operator economics, slashing-burn, bootstrap, governable parameters); [ADR 033](033-safety-insurance-reserve.md) specifies the `SafetyReserve` (3% safety/insurance bucket); [ADR 018](018-liquidity-strategy.md) the Balancer V3 POL. The launch contract surface is forward-compatible (additive integration via standard `AccessControl` role grants per [ADR 016 §5](016-contract-interactions.md#5-access-control-matrix)) so future economic-layer products can land as additive top-level contracts without changing existing contracts.
 
 1. [ADR 026 — Gauge-Boost Tokenomics](026-gauge-boost-tokenomics.md) (canonical)
-2. [ADR 018 — Liquidity Strategy (Balancer 80/20 POL)](018-liquidity-strategy.md)
+2. [ADR 033 — Safety and Insurance Reserve](033-safety-insurance-reserve.md)
+3. [ADR 018 — Liquidity Strategy (Balancer 80/20 POL)](018-liquidity-strategy.md)
 
 ### Chapter 5 — Verification & enforcement
 
@@ -161,6 +162,7 @@ Numeric per-ADR index. The thematic chapter ordering for top-to-bottom reading l
 - **[ADR 030 — Node Region Self-Attestation](030-node-region-self-attestation.md)** — Region claims in `NodeAnnounce` and `StakingRegistry` are accepted at face value; the IP-geolocation oracle / third-party attestation path is explicitly rejected. Appeals-standing flipping and reactive blacklist-scope flipping are closed by a 7-day `regionLastChanged` stability window on `StakingRegistry` (governable `[3d, 30d]`; [ADR 011 § Standing](011-content-takedown.md#standing) path 2 and [§ Regional Scope](011-content-takedown.md#regional-scope)). Latency-vs.-claim reputation penalty from [ADR 001 § Consequences](001-network.md#consequences) is the canonical soft mitigation for residual pre-positioned misdeclaration.
 - **[ADR 031 — ContentBlacklist Appeal-Contract Surface](031-content-blacklist-appeals-contract.md)** — Pins the contract surface for ADR 011 § Blacklist Entry Appeals: per-appeal storage layout, event-topic ordering, state machine, and integration with `ContentBlacklist` core (suspension flag, `_removeHashRegional`, permissionless cleanup).
 - **[ADR 032 — SafetyReserve Appeal-Surface Contract Surface](032-safety-reserve-appeals-contract.md)** — Pins the contract surface for ADR 028: per-appeal storage layout, escrow accounting, all six Solidity event signatures (`SlashAppealOpened` / `FastTracked` / `Rejected` / `Ratified` / `Reversed` / `Lapsed`), and a permissionless `cleanupExpiredAppeal` entry point.
+- **[ADR 033 — Safety and Insurance Reserve](033-safety-insurance-reserve.md)** — The 3% `FeeRouter` safety/insurance bucket: `SafetyReserve` payout categories, the four-gate spending controls, epoch-FIFO cross-category payout ordering with permissionless queued disbursement, interface stability, and the `ISafetyReserve` contract surface. Split out of [ADR 026 §5](026-gauge-boost-tokenomics.md#5-safety-and-insurance-reserve-3-bucket); the appeal-surface that feeds it is [ADR 032](032-safety-reserve-appeals-contract.md).
 
 ## Key Invariants
 
