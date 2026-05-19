@@ -111,7 +111,7 @@ For Tier 3, clients control the ALPN proposal order. You don't negotiate with th
 
 ### 4.2 Governance
 
-For Tier 3 upgrades touching governance-controlled parameters (rate bounds in [ADR 003 § Rate Bounds Refresh](003-payments.md#adr-003-payment-model), slashing schedule in [ADR 026 §8](026-gauge-boost-tokenomics.md#adr-026-gauge-boost-tokenomics)):
+For Tier 3 upgrades touching governance-controlled parameters (rate bounds in [ADR 003 § Rate Bounds Refresh](003-payments.md#adr-003-payment-model), slashing schedule in [ADR 026 §8](026-tokenomics.md#adr-026-tokenomics)):
 
 - The authorizing governance proposal is on its own timeline ([ADR 009](009-governance.md#adr-009-governance-model): 7-day vote + 48-hour timelock). The protocol release usually ships **before** the vote concludes, with the new behavior gated on an on-chain flag.
 - Operators MUST verify the relevant on-chain governance state before activating the new behavior locally — consult the release notes for the specific contract call (e.g. `Governance.upgradeActivated(uint256 versionId)` returns true).

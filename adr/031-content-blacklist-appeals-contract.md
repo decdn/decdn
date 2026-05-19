@@ -175,7 +175,7 @@ function rejectAppealAsPerjury(uint256 appealId) external onlyEmergencyMultisig;
 | `AppealNotFound()` | `appeals[appealId].status == None` |
 | `AppealAlreadyTerminal()` | `status ∈ {Ratified, Reversed, Rejected, Lapsed}` |
 
-**State transitions (both functions):** `status = Rejected`; bond is burned via `TOKEN.burn(appeal.bond)` (`ContentBlacklist` holds and burns directly — TOKEN is `ERC20Burnable` per [ADR 026 §1 Burnability](026-gauge-boost-tokenomics.md#burnability)); `totalBondsEscrowed -= appeal.bond`; record a new entry in `filerRejections[appeal.filer]` (rolling window); if the rolling window contains three rejections within the lookback, set `cooldownUntilUs`. If `status` was `FastTracked` at the moment of rejection: also clear `entry.suspended = false` and `regionActiveReliefCount[appeal.region]--` (preserving `entry.suspendedAtUs` per `unFastTrackAppeal` semantics).
+**State transitions (both functions):** `status = Rejected`; bond is burned via `TOKEN.burn(appeal.bond)` (`ContentBlacklist` holds and burns directly — TOKEN is `ERC20Burnable` per [ADR 026 §1 Burnability](026-tokenomics.md#burnability)); `totalBondsEscrowed -= appeal.bond`; record a new entry in `filerRejections[appeal.filer]` (rolling window); if the rolling window contains three rejections within the lookback, set `cooldownUntilUs`. If `status` was `FastTracked` at the moment of rejection: also clear `entry.suspended = false` and `regionActiveReliefCount[appeal.region]--` (preserving `entry.suspendedAtUs` per `unFastTrackAppeal` semantics).
 
 **Emits:** `BlacklistAppealRejected(appealId)`. Perjury-flagged rejections additionally emit `BlacklistAppealPerjuryRecorded(appealId, filer, perjuryDenylistUntilUs)`.
 
@@ -305,5 +305,5 @@ stateDiagram-v2
 
 - [ADR 011 § Blacklist Entry Appeals](011-content-takedown.md#blacklist-entry-appeals) — semantic spec.
 - [ADR 028 §6](028-slashing-appeals.md#6-contract-surface) — companion contract surface (slash appeals).
-- [ADR 026 §1 Burnability](026-gauge-boost-tokenomics.md#burnability) — `ERC20Burnable` interface used for bond burns.
+- [ADR 026 §1 Burnability](026-tokenomics.md#burnability) — `ERC20Burnable` interface used for bond burns.
 - [ADR 014 § Evidence Staleness](014-on-chain-verification.md#evidence-staleness) — consumer of `entry.suspendedAtUs`.

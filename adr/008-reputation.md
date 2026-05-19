@@ -5,7 +5,7 @@
 
 ## Context
 
-> **Tokenomics cross-reference.** [ADR 026](026-gauge-boost-tokenomics.md#adr-026-gauge-boost-tokenomics) introduces a gauge-boost reward pool whose payout is weighted by `working_bytes` per operator. The byte counter alone is gameable via self-routed traffic; the on-chain defense is the [ADR 026 §3 per-operator gauge-share cap](026-gauge-boost-tokenomics.md#per-operator-gauge-share-cap). Reputation contributes complementary off-chain signal — operator-cluster detection, diversity-of-service signal, governance input for cap-tuning — but is not itself a gauge-eligibility gate. See Section 12.
+> **Tokenomics cross-reference.** [ADR 026](026-tokenomics.md#adr-026-tokenomics) introduces a gauge-boost reward pool whose payout is weighted by `working_bytes` per operator. The byte counter alone is gameable via self-routed traffic; the on-chain defense is the [ADR 034 § per-operator gauge-share cap](034-gauge-boost-voting-escrow.md#per-operator-gauge-share-cap). Reputation contributes complementary off-chain signal — operator-cluster detection, diversity-of-service signal, governance input for cap-tuning — but is not itself a gauge-eligibility gate. See Section 12.
 
 The network needs to rank nodes beyond staking alone. Staking provides Sybil resistance but does not measure service quality. Clients need to prefer fast, reliable nodes and avoid slow or unresponsive ones without on-chain proof for every quality metric. A gossip-based reputation system using interaction-weighted scoring fills this gap.
 
@@ -82,13 +82,13 @@ diversity_factor = min(distinct_counterparties / min_counterparties, 1.0)
 
 Where `min_counterparties = 5` (governance-tunable; hardcoded floor: 2).
 
-**Effect on wash trading:** An attacker cycling funds between two self-owned addresses has `distinct_counterparties = 1`, yielding `diversity_factor = 0.2` — an 80% reduction in effective weight. Full credit needs settlements with 5+ distinct counterparties, each requiring a separate staking deposit (minimum 50,000 TOKEN per [ADR 026 §7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake)) and its own capital cycling fees.
+**Effect on wash trading:** An attacker cycling funds between two self-owned addresses has `distinct_counterparties = 1`, yielding `diversity_factor = 0.2` — an 80% reduction in effective weight. Full credit needs settlements with 5+ distinct counterparties, each requiring a separate staking deposit (minimum 50,000 TOKEN per [ADR 026 §7](026-tokenomics.md#7-operator-economics-and-minimum-stake)) and its own capital cycling fees.
 
 **Counterparty validation:** Only counterparty addresses that had a `StakingRegistry` NodeId binding at the time of channel settlement count toward `distinct_counterparties`. Unregistered addresses (pure clients without stake) do not count, since only staked nodes submit gossip reports (Section 6) and counterparty diversity matters only for reporter weight in the network score.
 
 #### 4.2 Settled-Value Time Decay
 
-Individual settlement contributions decay exponentially with age, forcing an attacker to continuously cycle capital (incurring the `FeeRouter` non-base skim of 60% per [ADR 026 §2](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553) plus per-cycle L2 gas, on their own USDC) to maintain reporter weight:
+Individual settlement contributions decay exponentially with age, forcing an attacker to continuously cycle capital (incurring the `FeeRouter` non-base skim of 60% per [ADR 026 §2](026-tokenomics.md#2-feerouter-split-40407553) plus per-cycle L2 gas, on their own USDC) to maintain reporter weight:
 
 ```
 settlement_weight_i = exp(-lambda * age_weeks_i)
@@ -249,7 +249,7 @@ During the first 7 days after staking (or first 50 completed interactions, which
 
 ### 12. Gauge-Pool Wash-Trading: Reputation as Off-Chain Signal
 
-[ADR 026 §3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula) distributes 40% of fee revenue via a Curve-style gauge formula whose input is per-operator `bytes_delivered`. Without an integrity layer, an operator can inflate `bytes_delivered` by routing settlements through self-controlled clients. The on-chain defense is the [ADR 026 §3 per-operator gauge-share cap](026-gauge-boost-tokenomics.md#per-operator-gauge-share-cap) (default 5%, governable `[1%, 25%]`), which with the closed-pool gauge bucket structure makes wash-trading economically marginal at any reasonable TOKEN price.
+[ADR 034 § Gauge-boost formula](034-gauge-boost-voting-escrow.md#gauge-boost-formula) distributes 40% of fee revenue via a Curve-style gauge formula whose input is per-operator `bytes_delivered`. Without an integrity layer, an operator can inflate `bytes_delivered` by routing settlements through self-controlled clients. The on-chain defense is the [ADR 034 § per-operator gauge-share cap](034-gauge-boost-voting-escrow.md#per-operator-gauge-share-cap) (default 5%, governable `[1%, 25%]`), which with the closed-pool gauge bucket structure makes wash-trading economically marginal at any reasonable TOKEN price.
 
 Reputation contributes complementary off-chain signal:
 
@@ -337,7 +337,7 @@ Consumers should note the signal trusts the reporter's self-declared `node.regio
 ### Positive
 
 - Interaction-weighted scoring makes reputation manipulation expensive — you need real economic activity (settled payment channels), not just stake
-- Distinct-counterparty discount and settlement time decay raise the cost of wash trading from a single self-dealing pair to requiring 5+ staking deposits (50,000 TOKEN each per [ADR 026 §7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake)) plus the per-cycle `FeeRouter` non-base skim (60% per [ADR 026 §2](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553)) across 5+ counterparties — an order-of-magnitude increase in capital requirements
+- Distinct-counterparty discount and settlement time decay raise the cost of wash trading from a single self-dealing pair to requiring 5+ staking deposits (50,000 TOKEN each per [ADR 026 §7](026-tokenomics.md#7-operator-economics-and-minimum-stake)) plus the per-cycle `FeeRouter` non-base skim (60% per [ADR 026 §2](026-tokenomics.md#2-feerouter-split-40407553)) across 5+ counterparties — an order-of-magnitude increase in capital requirements
 - Local observations dominate (70%), so a node's own experience always outweighs the crowd
 - Score clamping limits the damage from individual malicious reports
 - Cold-start bootstrap gives new nodes enough traffic to build a real track record

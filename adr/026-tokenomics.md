@@ -1,4 +1,4 @@
-# ADR 026: Gauge-Boost Tokenomics
+# ADR 026: Tokenomics
 
 **Date:** 2026-04-25
 **Status:** Draft
@@ -96,7 +96,7 @@ The truncation remainder — at most one base unit (USDC or TOKEN wei) per claim
 
 #### Pre-launch gauge accumulation
 
-The 40% gauge bucket MUST NOT pay out until the §3 [Per-operator gauge-share cap](#per-operator-gauge-share-cap) is enforced (that section gives the wash-trading rationale and trade-offs). This sub-section pins the contract-level pause-and-cutover mechanism.
+The 40% gauge bucket MUST NOT pay out until the [ADR 034 § Per-operator gauge-share cap](034-gauge-boost-voting-escrow.md#per-operator-gauge-share-cap) is enforced (that section gives the wash-trading rationale and trade-offs). This sub-section pins the contract-level pause-and-cutover mechanism.
 
 ```solidity
 // FeeRouter pre-launch gauge state.
@@ -121,154 +121,11 @@ event GaugeLaunched(uint64 indexed epoch);
 
 ### 3. Gauge-boost formula
 
-Adapted from Curve Finance's veCRV gauge boost (in production since 2020). Replaces the LP-deposit primitive with verified-bytes-delivered.
-
-Per-operator pool share = `min(working_bytes_i / sum(working_bytes), MAX_GAUGE_SHARE_PER_OPERATOR)`, where `working_bytes_i = min(bytes_i, 0.4·bytes_i + 0.6·(ve_i/total_ve)·total_bytes)` over the epoch's verified bytes. `bytes_i` is sourced from `FeeRouter.bytesPerEpoch[operator][epoch]` (canonical in [ADR 016 § FeeRouter](016-contract-interactions.md#feerouter)); the per-operator share cap is the binding wash-trading defense.
-
-**Properties:**
-
-- **No ve-lock:** `working = 0.4 × bytes` — the commodity floor. Receives 40% of what a fair-share-ve operator with the same byte count would.
-- **Fair-share ve** (`ve_i / total_ve ≥ bytes_i / total_bytes`): `working = bytes_i` — the cap binds. Full proportional share of the pool.
-- **Over-ve:** `working` capped at `bytes_i` — no over-boost in the gauge pool. Excess ve still earns from the 7% delegator pool linearly.
-- **Maximum boost ratio = 1 / 0.4 = 2.5×** between a max-ve-locker and a zero-ve-locker delivering the same byte count.
-
-#### Degenerate-input fallbacks
-
-(required to prevent division-by-zero at launch and on quiet epochs):
-
-- `total_ve == 0` (no ve-locks exist anywhere — bootstrap window): the `ve_i / total_ve` term is undefined. The contract MUST treat `working_bytes_i = boostFloor × bytes_i = 0.4 × bytes_i` for every operator — every operator receives the commodity floor, share is purely byte-proportional. This is the natural limit of the Curve formula as ve-supply approaches zero.
-- `sum(working_bytes) == 0` (no operator delivered any verified bytes in the epoch): the per-operator share is undefined. The epoch's gauge bucket is **not** distributed; it remains in `FeeRouter`'s gauge accumulator and is included in the next epoch's bucket. This is preferred over sweeping to treasury immediately because the empty-epoch case is most likely an outage, not a permanent state — the next active epoch should benefit from the rolled-over USDC. The 26-epoch claim window (§2 Epoch mechanics) caps the total rollover; unclaimed-after-26-epochs USDC sweeps to treasury per the existing rule.
-- `bytes_i == 0` (operator delivered nothing this epoch): trivially `working_bytes_i = 0` and that operator's share is `0`. No special-case required — the formula handles this directly.
-
-The Curve formula is bounded by `bytes` in both directions (a non-locker still earns 40% of fair-share, a whale-locker cannot exceed fair-share), which prevents both the "starve commodity operators" and "ve-whale captures the pool" failure modes of simpler `boost = 1 + k × ve` mechanics. The fair-share normalization gives the system a stable equilibrium where operators who match their ve-share to their byte-share collectively neither over- nor under-claim — matching Curve's gauge-equilibrium pattern.
-
-The boost-floor parameter (default `boostFloor = 0.4`) is governable within `[0.2, 0.8]`. A lower floor sharpens the penalty for non-lockers and raises the max boost ratio; a higher floor softens differentiation. See §11 for the safety-bound table.
-
-#### Per-operator gauge-share cap
-
-The per-epoch gauge share for any single operator is capped at `MAX_GAUGE_SHARE_PER_OPERATOR` (default **5%**, governable within `[1%, 25%]` per [ADR 009](009-governance.md#adr-009-governance-model) safety bounds). Concretely:
-
-```
-share_i = min(working_bytes_i / sum(working_bytes), MAX_GAUGE_SHARE_PER_OPERATOR)
-```
-
-Any residual gauge bucket left after capping (which occurs when one or more operators would have received more than the cap) rolls over to the next epoch's gauge accumulator under the same rule as the `sum(working_bytes) == 0` degenerate case in § Degenerate-input fallbacks above. The 26-epoch claim window in §2 Epoch mechanics caps the total rollover.
-
-**Rationale.** Bounds wash-trading payoff at 5% of the gauge bucket per operator-identity. Combined with the boost formula's `0.4·bytes_i` floor for low-ve operators and the closed-pool gauge structure (every settlement contributes to the same global bucket the operator is then claiming from), this makes wash-trading economically marginal at any reasonable TOKEN price — the attacker pays into the pool they're trying to drain, with 8% leakage to treasury+safety per self-deal, and the cap suppresses any non-proportional share they could extract via ve-boost. Sybil expansion of attack-operator count requires fresh `StakingRegistry` registrations each with the §7 minimum stake, converting wash-trading from a heuristic-bypass attack into a stake-proportional capital-lockup attack. A single honest operator with a dominant byte share is also subject to the cap, which is the intended posture — the gauge pool exists to incentivize a diverse operator set, not to reward concentration.
+The 40% gauge bucket is distributed by a Curve-style ve-weighted gauge-boost formula with degenerate-input fallbacks and a per-operator gauge-share cap (the canonical wash-trading defense). Full specification is in [ADR 034](034-gauge-boost-voting-escrow.md#adr-034-gauge-boost-and-voting-escrow).
 
 ### 4. Voting escrow (`VotingEscrow`)
 
-Vote-escrowed TOKEN. Modeled on veCRV with deliberate deviations.
-
-| Parameter | Value |
-| --- | --- |
-| Lockable token | TOKEN (ERC-20) |
-| Min lock duration | 1 week |
-| Max lock duration | 4 years |
-| ve-balance formula | `amount × remaining_lock_time / 4y` (linear decay to zero at expiry) |
-| Lock extension | Allowed (up to 4y from current time) |
-| Lock shortening | Not allowed |
-| Early exit | **None** — no penalty-exit option (stricter than Convex; matches veCRV) |
-| Transferability | **Non-transferable** — no `transfer` / `approve` for ve-positions |
-| Slashing on ve-position | **No** — ve-locked TOKEN is never slashable, even if the locker is also a node operator |
-| `create_lock_for` privileged path | **None** — no auto-ve-lock path |
-
-#### Historical checkpointing
-
-`VotingEscrow.balanceOfAt(user, ts)` and `totalSupplyAt(ts)` are load-bearing for the epoch-snapshot pattern in §2 and the governance pattern in §8. Per-lock checkpoints; reads O(log n) on the checkpoint array; writes O(1) amortized.
-
-#### Lock ownership
-
-Locks may be held by any address — EOA or contract. Lock creation (`createLock`), amount increase (`increaseAmount`), and time extension (`increaseUnlockTime`) are stable for cross-contract integration. A future contract that holds a pooled lock on behalf of multiple beneficiaries (e.g., a liquid-ve wrapper) integrates as an additive top-level contract via these interfaces without changing `VotingEscrow`.
-
-**Operator stake and ve-positions are separate.** A node's operator stake is held in `StakingRegistry` and is slashable (rates per §8). A ve-position is held in `VotingEscrow` and is not. Neither satisfies the other's requirements; an operator may hold any combination. This separation is a hard invariant — no contract path lets ve-locked TOKEN be slashed.
-
-#### Contract: VotingEscrow
-
-```solidity
-interface IVotingEscrow {
-    // ─── Lock lifecycle ────────────────────────────────────────────────
-    // Lock `amount` TOKEN until `unlockTime` (absolute seconds), rounded
-    // down to the nearest week boundary (week-aligned slopes — veCRV
-    // pattern). Reverts if the caller already holds a lock, if
-    // `unlockTime - block.timestamp` is outside
-    // [minLockDuration, maxLockDuration], or if `amount == 0`.
-    function createLock(uint256 amount, uint256 unlockTime) external;
-
-    // Add `amount` to the caller's existing lock; unlock time unchanged.
-    // Reverts if the caller has no active lock or it has expired.
-    function increaseAmount(uint256 amount) external;
-
-    // Extend the caller's lock to a later `unlockTime` (week-aligned).
-    // Reverts if `unlockTime` is at or before the current end, if the new
-    // remaining duration exceeds `maxLockDuration`, or if expired.
-    function increaseUnlockTime(uint256 unlockTime) external;
-
-    // Withdraw the full locked balance after unlock time. Lump-sum only.
-    // Reverts if not yet expired (no early-exit path; ve-locked TOKEN
-    // never exits early).
-    function withdraw() external;
-
-    // ─── Lock view ─────────────────────────────────────────────────────
-    // Account's locked amount and unlock time. Returns (0, 0) for
-    // never-locked or already-withdrawn addresses.
-    function locked(address account)
-        external view returns (uint256 amount, uint256 end);
-
-    // ─── ve-balance ────────────────────────────────────────────────────
-    // Current voting weight: amount × remaining_lock_time / maxLockDuration.
-    // Decays linearly to zero at unlock time.
-    function balanceOf(address account) external view returns (uint256);
-
-    // Historical voting weight at unix timestamp `ts`. Per-lock
-    // checkpoints make this O(log n). Load-bearing for the §2
-    // epoch-snapshot pattern (FeeRouter gauge accounting) and §9
-    // governance vote-weight reads. Future timestamps are rejected.
-    function balanceOfAt(address account, uint256 timestamp)
-        external view returns (uint256);
-
-    // Current total ve-supply (sum of all balanceOf at block.timestamp).
-    function totalSupply() external view returns (uint256);
-
-    // Historical total ve-supply at `ts`. Same checkpoint pattern as
-    // `balanceOfAt`; used for Governor quorum per §9.
-    function totalSupplyAt(uint256 timestamp) external view returns (uint256);
-
-    // ─── Vote delegation (Governor Bravo pattern) ──────────────────────
-    // Delegate the caller's ve voting weight to `delegatee`. The
-    // ve-position stays non-transferable; only voting weight moves.
-    // `address(0)` clears delegation (defaults to self). See ADR 009 §44.
-    function delegate(address delegatee) external;
-
-    // EIP-712 signed delegation, for gasless delegation flows.
-    function delegateBySig(
-        address delegatee,
-        uint256 nonce,
-        uint256 expiry,
-        uint8 v,
-        bytes32 r,
-        bytes32 s
-    ) external;
-
-    // Address `account` delegates to, or `account` itself if unset
-    // (self-delegation is the default).
-    function delegates(address account) external view returns (address);
-
-    // ─── Events ────────────────────────────────────────────────────────
-    event LockCreated(address indexed account, uint256 amount, uint256 unlockTime);
-    event LockIncreased(address indexed account, uint256 addedAmount, uint256 newAmount);
-    event LockExtended(address indexed account, uint256 oldUnlockTime, uint256 newUnlockTime);
-    event Withdrawn(address indexed account, uint256 amount);
-    event DelegateChanged(address indexed delegator, address indexed fromDelegate, address indexed toDelegate);
-    event DelegateVotesChanged(address indexed delegate, uint256 previousBalance, uint256 newBalance);
-}
-```
-
-**Notes:**
-
-- `createLock` is one-lock-per-address.
-- `getVotes` and `getPastVotes` are omitted; voting weight is read via `balanceOfAt(user, ts)` and `totalSupplyAt(ts)` because ve-weight is a function of timestamp (linear decay), not block number.
-- Delegation reassigns voting weight but not the underlying ve-position; locks remain non-transferable per the §4 invariant. Delegation events follow OZ Governor Bravo.
+Operators opt into gauge boost by time-locking TOKEN in the non-transferable `VotingEscrow` contract (historical checkpointing, lock ownership, the contract interface). Full specification is in [ADR 034](034-gauge-boost-voting-escrow.md#adr-034-gauge-boost-and-voting-escrow).
 
 ### 5. Safety and insurance reserve (3% bucket)
 
@@ -276,77 +133,7 @@ The 3% safety bucket is held in `SafetyReserve`, a governance-gated incident res
 
 ### 6. Delegator pool — USDC → TOKEN conversion
 
-The 7% delegator bucket flows through a USDC→TOKEN buy-and-distribute pipeline rather than direct USDC distribution.
-
-1. `FeeRouter` accumulates 7% of routed USDC into the delegator-pool epoch bucket per epoch.
-2. At epoch rollover (or via keeper trigger within the epoch), the bucket's USDC is swapped for TOKEN against the Balancer V3 80/20 pool ([ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol)) under the same TWAP + minOut + per-epoch liquidity-cap protections as `BuybackBurner`. Implementation is a parallel `DelegatorBuyer` contract per [ADR 016 § Shared swap helper](016-contract-interactions.md#shared-swap-helper-buybackburner--delegatorbuyer); the two contracts share the swap execution path through an internal `BalancerV3SwapHelper` abstract contract while preserving distinct downstream destinations and governance setters.
-3. The acquired TOKEN is held in the delegator-pool epoch bucket as TOKEN.
-4. Delegators / ve-lockers call `FeeRouter.claimDelegator(epochs[])`. Payout per locker = `ve_i / total_ve_at_epoch_boundary × token_in_delegator_bucket[epoch]`.
-
-#### Distinction from buyback-and-burn
-
-Both are buy-side market pressure on USDC→TOKEN. Burn removes TOKEN from circulation; the delegator pool routes TOKEN to long-term ve-locked holders. Both are required.
-
-#### Why TOKEN-denominated, not USDC?
-
-Routes acquired TOKEN to the participants with the longest commitment horizon and couples ve-locker yield to TOKEN value rather than to network revenue alone — when network revenue grows, TOKEN buy pressure grows, ve-locker positions appreciate. This is the model's primary "real yield in TOKEN" lever; an alternative pattern — USDC distribution to a passive ve-pool — was considered and rejected.
-
-#### MEV / slippage
-
-TWAP windows + per-epoch liquidity caps + private-RPC routing (Flashbots-style bundles) for the swap. Same defenses as the [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol) buyback flow; per-epoch liquidity caps are a hard requirement on this path, not optional.
-
-#### Contract: DelegatorBuyer
-
-```solidity
-interface IDelegatorBuyer {
-    // ─── Per-epoch USDC → TOKEN swap (FeeRouter-only) ─────────────────
-    // Called by `FeeRouter.executeDelegatorSwap`. `msg.sender == feeRouter`
-    // is the only auth check (single-purpose helper trusting FeeRouter
-    // exclusively; no post-deploy role grants). Swaps `amountIn` USDC for
-    // at least `minOut` TOKEN against the configured Balancer V3 pool,
-    // then deposits the TOKEN back via
-    // `IFeeRouter.depositDelegatorTokens(epoch, amount)` — see
-    // [ADR 016 § Contract: FeeRouter](016-contract-interactions.md#contract-feerouter).
-    // Same Vault-scoped self-approval pattern as `BuybackBurner`.
-    function swapDelegatorBucket(
-        uint64 epochId,
-        uint256 amountIn,
-        uint256 minOut
-    ) external;
-
-    // ─── Read views ───────────────────────────────────────────────────
-    function feeRouter() external view returns (address);
-    function pool() external view returns (address);
-    function slippageToleranceBps() external view returns (uint256);
-    function minSwapAmount() external view returns (uint256);
-    function maxSwapAmount() external view returns (uint256);
-
-    // ─── Governance setters ───────────────────────────────────────────
-    function setFeeRouter(address newFeeRouter) external;
-    function setPool(address newPool) external;
-    function setSlippageToleranceBps(uint256 bps) external;
-    function setMinSwapAmount(uint256 amount) external;
-    function setMaxSwapAmount(uint256 amount) external;
-
-    // ─── Pause control ────────────────────────────────────────────────
-    function pause() external;
-    function unpause() external;
-
-    // ─── Events ───────────────────────────────────────────────────────
-    event DelegatorSwapped(uint64 indexed epochId, uint256 amountIn, uint256 amountOut);
-    event FeeRouterUpdated(address indexed oldRouter, address indexed newRouter);
-    event PoolUpdated(address indexed oldPool, address indexed newPool);
-    event SlippageToleranceUpdated(uint256 oldBps, uint256 newBps);
-    event MinSwapAmountUpdated(uint256 oldValue, uint256 newValue);
-    event MaxSwapAmountUpdated(uint256 oldValue, uint256 newValue);
-}
-```
-
-**Notes:**
-
-- **Parallel contract to `BuybackBurner`** per [ADR 016 § Shared swap helper](016-contract-interactions.md#shared-swap-helper-buybackburner--delegatorbuyer). The two contracts share the Balancer V3 swap execution path through an internal `BalancerV3SwapHelper` abstract contract while keeping separate addresses, separate governance setters on `FeeRouter`, and divergent downstream value flows (burn vs deposit-back).
-- **`msg.sender == feeRouter` as the sole auth check.** No `KEEPER_ROLE` on `DelegatorBuyer` because there are no other legitimate callers — keepers trigger swaps via `FeeRouter.executeDelegatorSwap(epoch, minOut)` (which holds `KEEPER_ROLE` on `FeeRouter`), and `FeeRouter` then calls `swapDelegatorBucket` here. Single trust boundary; one role grant fewer post-deploy.
-- **`setFeeRouter` carve-out** matches the [ADR 016 § No proxy deployment patterns](016-contract-interactions.md#no-proxy-deployment-patterns) carve-out for non-signing helper addresses: `DelegatorBuyer` has no domain-separator-bound state, so re-pointing the configured `FeeRouter` is safe under the standard 48h timelock.
+The 7% delegator bucket flows through a USDC→TOKEN buy-and-distribute pipeline (the `DelegatorBuyer` contract) rather than direct USDC distribution. Full specification is in [ADR 035](035-delegator-pool.md#adr-035-delegator-pool).
 
 ### 7. Operator economics and minimum stake
 
@@ -421,7 +208,7 @@ Router shares, the boost-floor parameter, the per-operator gauge-share cap, and 
 | `epochLiquidityCapFraction` | 10% | 1% | 30% |
 | `claimWindow` | 26 epochs | 13 epochs | 52 epochs (`uint16` count of epochs; the contract internally multiplies by the immutable `epochLength` to derive a seconds-domain deadline) |
 
-The 20% floor on the node-base share guarantees operators always receive enough liquid USDC to cover at least a meaningful fraction of infrastructure costs even under extreme governance proposals — preserves the cashflow invariant. The `boostFloor` and `MAX_GAUGE_SHARE_PER_OPERATOR` bounds keep governance from breaking the gauge mechanics they parameterize (winner-take-all vs flat distribution; disabled vs over-tight wash-trading defense) — rationale in §3 [Gauge-boost formula](#3-gauge-boost-formula) and [Per-operator gauge-share cap](#per-operator-gauge-share-cap). `epochLiquidityCapFraction` is the combined per-epoch ceiling on USDC notional swapped through the Balancer V3 80/20 pool across `BuybackBurner` and the delegator-pool swap path. The 1% floor prevents governance from starving the swap paths; the 30% ceiling prevents a single epoch from draining pool depth; the 10% default sizes one epoch's combined pressure conservatively against worst-case sustained execution. The cap is a single pool-wide budget per [ADR 018 § Liquidity-cap interaction](018-liquidity-strategy.md#liquidity-cap-interaction).
+The 20% floor on the node-base share guarantees operators always receive enough liquid USDC to cover at least a meaningful fraction of infrastructure costs even under extreme governance proposals — preserves the cashflow invariant. The `boostFloor` and `MAX_GAUGE_SHARE_PER_OPERATOR` bounds keep governance from breaking the gauge mechanics they parameterize (winner-take-all vs flat distribution; disabled vs over-tight wash-trading defense) — rationale in [ADR 034 § Gauge-boost formula](034-gauge-boost-voting-escrow.md#gauge-boost-formula) and [ADR 034 § Per-operator gauge-share cap](034-gauge-boost-voting-escrow.md#per-operator-gauge-share-cap). `epochLiquidityCapFraction` is the combined per-epoch ceiling on USDC notional swapped through the Balancer V3 80/20 pool across `BuybackBurner` and the delegator-pool swap path. The 1% floor prevents governance from starving the swap paths; the 30% ceiling prevents a single epoch from draining pool depth; the 10% default sizes one epoch's combined pressure conservatively against worst-case sustained execution. The cap is a single pool-wide budget per [ADR 018 § Liquidity-cap interaction](018-liquidity-strategy.md#liquidity-cap-interaction).
 
 **Non-numeric one-shot setters.**
 
@@ -463,7 +250,7 @@ Parameter setters on `FeeRouter` and `VotingEscrow` are role-gated via `AccessCo
 - **Equilibrium fragility.** The Curve-style model converges to a stable equilibrium *if* the boost is valuable enough to lock for but not so valuable that a winner-take-all dynamic emerges. The 40% gauge-pool default is sized in the middle by reasoned default; production tuning may be needed.
 - **Reflexive operator-margin layer.** TOKEN price drop → ve-lock value drops → fair-share-ve margins shrink → operators unwind commitment. Pre-seed USDC insulates the *funding* side; the *operator-recruitment* side still depends on TOKEN price for ve-incentive strength. Mitigated, not eliminated.
 - **Delegator-conversion MEV risk.** TWAP + private-RPC routing mitigates front-running, but the swap is observable on-chain post-fact. Flashbots-style bundles and per-epoch liquidity caps are required on this path, not optional. Keeper-cost economics under L2 gas conditions ([Appendix: L2 Deployment](appendix-l2-deployment.md#appendix-production-l2-deployment-target)) need validation.
-- **Wash-trading / self-routed traffic.** An operator could induce noise settlements to inflate gauge-pool share. The structural defense and economic argument are in §3 [Per-operator gauge-share cap](#per-operator-gauge-share-cap). The launch prerequisite is contract-pinned in §2 [Pre-launch gauge accumulation](#pre-launch-gauge-accumulation): `gaugeLaunched == false` escrows the 40% gauge bucket per epoch, and the one-shot `enableGauge()` setter is the only path to live gauge payouts.
+- **Wash-trading / self-routed traffic.** An operator could induce noise settlements to inflate gauge-pool share. The structural defense and economic argument are in [ADR 034 § Per-operator gauge-share cap](034-gauge-boost-voting-escrow.md#per-operator-gauge-share-cap). The launch prerequisite is contract-pinned in §2 [Pre-launch gauge accumulation](#pre-launch-gauge-accumulation): `gaugeLaunched == false` escrows the 40% gauge bucket per epoch, and the one-shot `enableGauge()` setter is the only path to live gauge payouts.
 - **Governance-weight concentration.** Operators who lock heavily for boost also accumulate disproportionate governance weight. [ADR 009](009-governance.md#adr-009-governance-model) safety bounds prevent extreme abuse; team / seed / treasury vesting acts as a counterweight during the first ~3 years.
 - **Convex-capture risk.** Third-party liquid-ve wrappers (Convex / Votium / Aura analogs) can concentrate governance power outside the DAO. Mitigation is operational — the DAO may ship a native liquid-ve wrapper as an additive top-level contract (integrating with `VotingEscrow` via the standard lock-creation / increase-amount / snapshot interfaces per §4) without changing the launch contract surface.
 - **20% burn share deterrence.** A higher burn share would weight slashing more toward pure deflation; the chosen 50/30/20 distribution prefers user-harm recourse via `SafetyReserve`. The §11 safety bound on the burn share leaves room for governance recalibration; security review should confirm 20% preserves slashing's deterrent value.

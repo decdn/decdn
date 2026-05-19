@@ -176,7 +176,7 @@ Operator runbook entries go in [docs/runbook.md](docs/runbook.md); cross-referen
 
 - Grep for renamed terms/parameters across all `adr/*.md` files
 - Verify ALPN strings, message type names, and protocol version identifiers match `005-protocol.md`
-- Verify token names (TOKEN/USDC), contract references, and fee parameters match `003-payments.md` and `026-gauge-boost-tokenomics.md`
+- Verify token names (TOKEN/USDC), contract references, and fee parameters match `003-payments.md` and `026-tokenomics.md`
 - Verify contract interaction flows and function signatures match `016-contract-interactions.md`
 - Verify privacy claims and data-flow assertions match `017-privacy.md`
 - Confirm `architecture.md` summary still reflects any changed ADR
