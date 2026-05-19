@@ -78,6 +78,8 @@ The canonical build (`make`) renders Mermaid diagrams and takes ~1 minute (most 
 
 The Makefile applies a purely-presentational page-density config — [`_build/book-margins.yaml`](_build/book-margins.yaml) (1.6 cm/1.8 cm margins) plus [`_build/book-density.typ`](_build/book-density.typ) (10 pt, `linestretch 1.0`, tighter leading/code/tables/headings) — that replaces the very loose pandoc/typst defaults (≈2.5 cm margins, 11 pt, slack leading). It changes **no content and no decision**, only whitespace: it takes the reading-order book from ≈430 to ≈260 pages (no mermaid) with the section-level TOC and every cross-reference intact. Delete the `DENSITY` flags from the Makefile to render byte-identical content at the loose default density.
 
+A second purely-presentational filter, [`_build/table-autofit.lua`](_build/table-autofit.lua), also changes **no content and no decision**: it hands table column sizing to the typst engine (content-aware `auto` columns) instead of the uniform equal widths pandoc derives from the GFM `| --- | --- |` delimiters, which otherwise squish a prose-heavy column (e.g. ADR 016 § Contract Inventory) into a tall ribbon beside near-empty short columns. Delete the `TABLEFIT` flag from the Makefile to restore pandoc's default equal-width tables.
+
 ### Reading-order build (book layout)
 
 The numeric build above is the canonical per-ADR reference. For a top-to-bottom read, build the same set in the thematic chapter order from [`architecture.md` § Reading Order](architecture.md#reading-order) — Foundations → Discovery → Payments → Tokenomics → Verification → Governance → Operations → Supporting → Appendices. Output goes to `adrs-book.pdf` so both PDFs can coexist.

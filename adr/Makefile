@@ -23,6 +23,12 @@ PANDOC  := pandoc --from=markdown+gfm_auto_identifiers --toc --toc-depth=2 --pdf
 DENSITY := --metadata-file=_build/book-margins.yaml -V fontsize=10pt \
            -V linestretch=1.0 --include-in-header=_build/book-density.typ
 
+# Purely-presentational table-width fix (see _build/table-autofit.lua).
+# Hands column sizing to typst (content-aware auto columns) instead of
+# pandoc's uniform GFM-derived equal widths, which squish prose-heavy
+# columns. Drop this flag for byte-identical content at pandoc's defaults.
+TABLEFIT := --lua-filter=_build/table-autofit.lua
+
 # Mermaid rendering is the canonical build (CI). MERMAID=0 omits it for
 # environments without mmdc/puppeteer and for the no-mermaid soundness check.
 MERMAID ?= 1
@@ -74,7 +80,7 @@ BOOK_SRCS := \
   appendix-operator-upgrade-path.md appendix-fraud-detection.md \
   glossary.md
 
-DENSITY_CFG := _build/book-density.typ _build/book-margins.yaml
+DENSITY_CFG := _build/book-density.typ _build/book-margins.yaml _build/table-autofit.lua
 
 .DEFAULT_GOAL := all
 .PHONY: all numeric book clean help check-book-list
@@ -85,7 +91,7 @@ numeric: adrs.pdf
 book: adrs-book.pdf
 
 adrs.pdf: architecture.md $(NUMERIC_SRCS) $(APPENDIX_SRCS) glossary.md $(DENSITY_CFG)
-	$(NPMPATH) $(PANDOC) $(MERMAID_FLAG) $(DENSITY) \
+	$(NPMPATH) $(PANDOC) $(MERMAID_FLAG) $(DENSITY) $(TABLEFIT) \
 	  -V title="deCDN — Architecture Decision Records" \
 	  -V date="$(DATE)" \
 	  architecture.md $(NUMERIC_SRCS) $(APPENDIX_SRCS) glossary.md \
@@ -93,7 +99,7 @@ adrs.pdf: architecture.md $(NUMERIC_SRCS) $(APPENDIX_SRCS) glossary.md $(DENSITY
 
 adrs-book.pdf: $(BOOK_SRCS) _build/strip-meta-sections.lua $(DENSITY_CFG)
 	$(NPMPATH) $(PANDOC) $(MERMAID_FLAG) \
-	  --lua-filter=_build/strip-meta-sections.lua $(DENSITY) \
+	  --lua-filter=_build/strip-meta-sections.lua $(DENSITY) $(TABLEFIT) \
 	  -V title="deCDN — Architecture Decision Records (Reading Order)" \
 	  -V date="$(DATE)" \
 	  $(BOOK_SRCS) \
