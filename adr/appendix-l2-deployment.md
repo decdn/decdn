@@ -137,8 +137,8 @@ Canonical reference for Arbitrum-specific assumptions elsewhere in the ADR set:
 |-----|------------|
 | [ADR 003 § Deposit Economics](003-payments.md#deposit-economics) | Gas table calibrated against Arbitrum One fee market |
 | [ADR 003 § L2 Sequencer Censorship](003-payments.md#l2-sequencer-censorship) | Forced-inclusion delay ≤ 24 h (Arbitrum value) |
-| ADR 018 § Buyback execution | Balancer V3 Router address is the Arbitrum One deployment |
-| ADR 016 § Deployment | "Arbitrum mainnet" in the BuybackBurner row |
+| [ADR 018 § Buyback execution via Balancer V3](018-liquidity-strategy.md#buyback-execution-via-balancer-v3) | Balancer V3 Router address is the Arbitrum One deployment |
+| [ADR 016 § Deployment Order](016-contract-interactions.md#2-deployment-order-and-initialization-dependencies) | "Arbitrum mainnet" in the BuybackBurner row |
 
 ### Chain-Specific Constants
 
