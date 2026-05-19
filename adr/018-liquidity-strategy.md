@@ -56,7 +56,7 @@ The first three rows dominate the decision for a TOKEN-rich, USDC-poor treasury 
 - **No `LiquidityManager` contract.** A weighted pool's curve handles rebalancing implicitly via arbitrage. There is no range to manage, no `rebalance()` keeper, no `KEEPER_ROLE` for liquidity operations. The only privileged operation on the BPT position is emergency withdrawal by governance, via the standard timelock path — no bespoke contract required.
 - **No liquidity mining in v1.** Mercenary LPs exit when rewards stop and consume TOKEN supply for a benefit POL provides more reliably. A future ADR may introduce liquidity mining if organic pool depth proves insufficient despite POL seeding.
 
-### Buyback inflow source and rate (router-driven per ADR 026)
+### Buyback inflow source and rate (router-driven per [ADR 026](026-tokenomics.md#adr-026-tokenomics))
 
 Under [ADR 026](026-tokenomics.md#adr-026-tokenomics), `BuybackBurner` no longer relies on manual treasury transfers. The `FeeRouter` contract receives the full operator USDC balance from `PaymentChannel.settleChannel` at every settlement and atomically forwards **5% of routed USDC directly to `BuybackBurner` in the same transaction**, alongside the other fee buckets. The full router split lives in [ADR 026 §2](026-tokenomics.md#2-feerouter-split-40407553) (six buckets summing to 100%); this ADR cross-references rather than duplicating it.
 

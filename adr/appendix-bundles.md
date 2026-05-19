@@ -116,7 +116,7 @@ the bundle hash; clients (eventually) fetch the bundle hash, parse the
 JSON, then fetch every `entries[].hash` separately. The bundle is leaf
 data, not a manifest in the protocol sense.
 
-## Non-relationship to ADR 012's `DECDNMAN` chunk manifest
+## Non-relationship to [ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model)'s `DECDNMAN` chunk manifest
 
 [ADR 012 § File Manifests and Reconstruction](012-client.md#file-manifests-and-reconstruction)
 defines a binary chunk manifest with the magic prefix `DECDNMAN` for
@@ -133,7 +133,7 @@ Different layer, different audience, different magic. The two compose:
 an entry's `hash` may itself be a `DECDNMAN` manifest blob hash for a
 chunked single file inside a bundled directory.
 
-## Relationship to ADR 002 / ADR 013
+## Relationship to [ADR 002](002-content-addressing.md#adr-002-content-addressing) / [ADR 013](013-schema-evolution.md#adr-013-schema-evolution)
 
 - [ADR 002](002-content-addressing.md#adr-002-content-addressing) declares multi-file an
   application concern. This appendix is that concern, layered above the

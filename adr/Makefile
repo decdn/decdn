@@ -118,8 +118,9 @@ check-book-list:
 	else echo "book list in sync ($(words $(NUMERIC_SRCS)) ADRs + $(words $(APPENDIX_SRCS)) appendices)"; fi
 
 # Reference-hygiene guards. Basic tools only (awk/sed/grep), no perl/python.
-# Fenced ```code```, ATX headings, inline `code`, and existing markdown links
-# are excluded — references there either can't be links or already are one.
+# Fenced ```code```, the H1 title line, inline `code`, and existing markdown
+# links are excluded — they can't be links or already are one. H2-H6 headings
+# ARE checked: an ADR named in a section title must be linked too.
 #   check-bare-refs      : every `ADR NNN` mention (with or without § Section)
 #                          must be a markdown link, not bare prose/table text.
 #   check-md-anchors     : every cross-ADR *.md link must carry a #heading
@@ -131,7 +132,7 @@ SRCS_REF := architecture.md $(NUMERIC_SRCS) $(APPENDIX_SRCS) glossary.md
 
 check-bare-refs:
 	@bad=""; for f in $(SRCS_REF); do \
-	  hits=$$(awk -v F="$$f" '/^```/{c=!c;next} c{next} /^#{1,6} /{next} {print F":"FNR": "$$0}' "$$f" \
+	  hits=$$(awk -v F="$$f" '/^```/{c=!c;next} c{next} /^# /{next} {print F":"FNR": "$$0}' "$$f" \
 	    | sed -e 's/`[^`]*`//g' -e 's/\[[^]]*\]([^)]*)//g' \
 	    | grep -E '(^|[^[*])ADR ?[0-9]{1,3}' || true); \
 	  if [ -n "$$hits" ]; then printf '%s\n' "$$hits"; bad=1; fi; \
@@ -139,7 +140,7 @@ check-bare-refs:
 	if [ -n "$$bad" ]; then \
 	  echo "ERROR: bare ADR reference(s) above — every ADR mention must be a markdown link, e.g. [ADR 016 § Deployment](016-contract-interactions.md#smart-contract-interaction-model)"; \
 	  exit 1; \
-	else echo "no bare ADR references ($(words $(SRCS_REF)) files; code/headings excluded)"; fi
+	else echo "no bare ADR references ($(words $(SRCS_REF)) files; code + H1 titles excluded, H2-H6 checked)"; fi
 
 check-md-anchors:
 	@bad=""; for f in $(SRCS_REF); do \

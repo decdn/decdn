@@ -46,7 +46,7 @@ This design choice is deliberate. A first-write-wins / one-claim rule would crea
 
 Multi-claim eliminates both: claims do not block other claims; defunct namespaces do not block alternative origin authorities; squatting gates nothing because the squatter cannot prevent independent claims. The trade-off — that the protocol does not present an on-chain claim as "the official publisher of this content" — is accepted because that framing is not load-bearing on any protocol primitive: takedown is hash-keyed, and origin authorization is consumed off-chain by routing/discovery layers that can OR-search the claiming set without protocol-level signaling.
 
-### Why this lives in ADR 002
+### Why this lives in [ADR 002](002-content-addressing.md#adr-002-content-addressing)
 
 Content identity (the BLAKE3 hash) and publisher identity are paired: every claim is a binding between the two. Defining publisher and namespace here keeps the identity primitives in one place so that ADRs [011](011-content-takedown.md#origin-assignment-authority) (governance authority), [016](016-contract-interactions.md#adr-016-smart-contract-interaction-model) (contract surface), and [022](022-content-discovery.md#adr-022--content-discovery-at-scale) (DHT publication semantics) can refer back to a single canonical definition.
 

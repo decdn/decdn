@@ -44,7 +44,7 @@ Hashes in the operator-pinned set (`pinned: ArcSwap<HashSet<Hash>>` at `crates/c
 
 The two layers compose cleanly: LRU eviction is *ephemeral cache pressure* (a victim selected by the driver loop); operator eviction is a *durable operator directive* (a hash hidden permanently). LRU eviction does not append to `evicted.log`; operator eviction does not consult `last_accessed`. Pinning protects against LRU but loses to operator evict — DMCA always wins.
 
-### 4. Probe-hold integration defers to ADR 005
+### 4. Probe-hold integration defers to [ADR 005](005-protocol.md#adr-005-wire-protocol)
 
 Hashes for which the node has signed `has_blob: true` within the last `probe_hold_duration` (35 s) are eviction-exempt for that window, per [ADR 005 § Probe-Triggered Eviction Hold](005-protocol.md#probe-triggered-eviction-hold). The hold layer composes above LRU: a held hash is invisible to the LRU driver until the hold expires. Concurrent holds are bounded by `max_probe_holds` (default 256) per [ADR 005 § Hold Budget](005-protocol.md#hold-budget); when the budget is exhausted the node responds `has_blob: false` rather than evict-and-slash. Operators sizing small caches SHOULD keep `max_probe_holds ≤ 25 %` of cache capacity (the § Hold Budget recommendation).
 
