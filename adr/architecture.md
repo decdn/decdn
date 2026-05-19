@@ -44,7 +44,7 @@ graph TD
     N2 <-.->|"iroh-gossip<br/>NodeAnnounce"| N3
 ```
 
-Clients probe candidate nodes, pick the best by the unified selection score (see [ADR 001](001-network.md#node-selection-algorithm) for the full formula), stream over `cdn/client/v1`, and pay via off-chain payment vouchers (USDC in PoC). On a cache miss, a node performs a DHT FIND_VALUE lookup (`cdn/dht/v1`), probes the returned candidates via `cdn/probe/v1`, selects the best, and pulls via `cdn/client/v1` (paid). When DHT returns no providers, the on-chain origin directory ([ADR 022](022-content-discovery.md)) is the deterministic last-resort fallback. Every byte delivered — whether client→node or node→node — is paid.
+Clients probe candidate nodes, pick the best by the unified selection score (see [ADR 001](001-network.md#node-selection-algorithm) for the full formula), stream over `cdn/client/v1`, and pay via off-chain payment vouchers (denominated in the payment token). On a cache miss, a node performs a DHT FIND_VALUE lookup (`cdn/dht/v1`), probes the returned candidates via `cdn/probe/v1`, selects the best, and pulls via `cdn/client/v1` (paid). When DHT returns no providers, the on-chain origin directory ([ADR 022](022-content-discovery.md)) is the deterministic last-resort fallback. Every byte delivered — whether client→node or node→node — is paid.
 
 ## Reading Order
 
@@ -141,7 +141,7 @@ Numeric per-ADR index. The thematic chapter ordering for top-to-bottom reading l
 - **[ADR 000 — Language and Core Networking Stack](000-language.md)** — Rust + iroh (0.98).
 - **[ADR 001 — Network Topology and Peer Mesh](001-network.md)** — Flat peer mesh; gossip for node discovery; `cdn/dht/v1` (Kademlia subset) for content discovery from PoC onward, with the on-chain origin directory ([ADR 022](022-content-discovery.md)) as the deterministic last-resort fallback when DHT returns no providers.
 - **[ADR 002 — Content Addressing](002-content-addressing.md)** — BLAKE3 content-addressed blobs. Node backends are opaque to the network.
-- **[ADR 003 — Payment Model](003-payments.md)** — Off-chain USDC payment channels. Market-driven rates within governance-set bounds.
+- **[ADR 003 — Payment Model](003-payments.md)** — Off-chain payment-token channels (USDC, fixed at deployment). Market-driven rates within governance-set bounds.
 - **[ADR 005 — Wire Protocol](005-protocol.md)** — Two core protocols (ALPN-negotiated) plus iroh-gossip. `cdn/client/v1` covers all paid delivery.
 - **[ADR 008 — Reputation System](008-reputation.md)** — Interaction-weighted scoring with gossip propagation; complements the [ADR 026 §3 per-operator gauge-share cap](026-gauge-boost-tokenomics.md#per-operator-gauge-share-cap) as off-chain wash-trading signal.
 - **[ADR 009 — Governance Model](009-governance.md)** — Admin key for PoC; ve-weighted Governor + Timelock with safety bounds for production.
