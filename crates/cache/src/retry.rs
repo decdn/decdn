@@ -45,139 +45,42 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
+use decdn_config_types::RetryPolicy;
 use futures_util::StreamExt;
 use iroh_blobs::Hash;
-use serde::{Deserialize, Serialize};
 
 use crate::error::{OriginError, OriginPullError};
 use crate::metrics::CacheMetrics;
 use crate::origin::{BlobTooLargeMarker, Origin, OriginByteStream, OriginFetch};
 
-/// Default values applied when the operator omits a `cache.origin_retry`
-/// field.
-const DEFAULT_MAX_RETRIES: u32 = 3;
-const DEFAULT_INITIAL_BACKOFF_MS: u64 = 100;
-const DEFAULT_MAX_BACKOFF_MS: u64 = 10_000;
-const DEFAULT_JITTER_RATIO: f64 = 0.1;
-/// Default per-fetch memory budget for the buffer-then-commit path.
-/// At or below this advertised `size_hint`, the engine's per-attempt
-/// closure drains the origin body into a `BytesMut` before handing
-/// it to iroh-blobs, so mid-stream transient `io::Error`s can be
-/// retried (pre-#271 semantics for small blobs). Above the threshold
-/// the engine takes the streaming path and uses abort + restart
-/// instead — no memory amplification, but disk-amp cost per failed
-/// attempt until iroh-blobs GC sweeps. 4 MiB covers typical web
-/// assets while keeping per-fetch RSS predictable.
-const DEFAULT_BUFFERED_MAX_BYTES: u64 = 4 << 20;
-
-/// `#[serde(default = ...)]` shim — `Default::default()` on the whole
-/// struct can't be used field-by-field, so missing fields in a partial
-/// `[cache.origin_retry]` section route through this helper.
-pub(crate) const fn default_buffered_max_bytes() -> u64 {
-    DEFAULT_BUFFERED_MAX_BYTES
-}
-
-/// Origin retry policy. Field-level validation lives at config-resolve time
-/// (`crates/node/src/config/mod.rs::resolve_origin_retry`); this struct
-/// just carries the values.
+/// Compute the backoff delay before the `attempt`-th retry (0-indexed:
+/// `attempt = 0` is the first retry, immediately after the initial
+/// failure). The schedule is `min(initial * 2^attempt, max)` with
+/// equal-jitter applied.
 ///
-/// `max_retries == 0` disables retry entirely and reproduces the
-/// pre-issue-#285 behaviour exactly. `buffered_max_bytes == 0` separately
-/// disables the buffer-then-commit body-phase path (#519), forcing all
-/// body-phase failures through the abort+restart streaming path.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct RetryPolicy {
-    /// Number of *retries* after the initial attempt. Total attempts =
-    /// `max_retries + 1`. `0` disables retry.
-    pub max_retries: u32,
-    /// Backoff before the first retry, in milliseconds. Subsequent
-    /// retries double up to `max_backoff_ms`.
-    pub initial_backoff_ms: u64,
-    /// Ceiling on any single backoff sleep, in milliseconds. The
-    /// exponential schedule saturates here.
-    pub max_backoff_ms: u64,
-    /// Equal-jitter ratio in `0.0..=1.0`. The actual sleep is
-    /// `base * (1 - ratio/2 + rand[0,1) * ratio)` so a ratio of `0.0` is
-    /// fully deterministic and `1.0` spreads the sleep uniformly over
-    /// `[0.5*base, 1.5*base)` — the AWS "equal jitter" recipe.
-    pub jitter_ratio: f64,
-    /// Per-fetch memory budget for the buffer-then-commit body-phase
-    /// retry path. When the origin advertises a `size_hint` at or
-    /// below this value, the engine drains the stream into a
-    /// `BytesMut` before committing — drain errors get classified
-    /// and re-feed the retry loop, restoring pre-#271 mid-stream
-    /// retry semantics for small blobs. Above the threshold (or
-    /// when `size_hint` is `None`) the engine uses streaming
-    /// abort+restart instead; memory stays bounded but each failed
-    /// attempt strands up to `max_blob_bytes` of partial-import bytes
-    /// until iroh-blobs GC reclaims them.
-    ///
-    /// `0` disables the buffer path entirely (all body-phase failures
-    /// go through the streaming abort+restart path).
-    #[serde(default = "default_buffered_max_bytes")]
-    pub buffered_max_bytes: u64,
-}
+/// Lives here (not on [`RetryPolicy`], which moved to the
+/// `decdn-config-types` leaf crate) because it needs `rand` for the
+/// jitter sample — keeping `rand` out of the leaf is the point of #578.
+///
+/// Saturating math throughout: `checked_shl` handles huge `attempt`
+/// values without panicking on `1u64 << 64`, and the eventual
+/// `min(_, max_backoff_ms)` collapses everything to the cap.
+fn delay_for(policy: RetryPolicy, attempt: u32) -> Duration {
+    let multiplier = 1u64.checked_shl(attempt).unwrap_or(u64::MAX);
+    let exp = policy.initial_backoff_ms.saturating_mul(multiplier);
+    let base = exp.min(policy.max_backoff_ms);
 
-impl Default for RetryPolicy {
-    /// Defaults: `3` retries, `100ms` initial backoff doubling to a cap of
-    /// `10s`, with `10%` equal-jitter. Worst-case extra latency on a
-    /// fully-failing origin is ~700ms — three sleeps `100 + 200 + 400 ms`
-    /// (± up to 5% jitter each) between the four total attempts.
-    /// `buffered_max_bytes` defaults to 4 MiB (the internal
-    /// `DEFAULT_BUFFERED_MAX_BYTES` constant).
-    fn default() -> Self {
-        Self {
-            max_retries: DEFAULT_MAX_RETRIES,
-            initial_backoff_ms: DEFAULT_INITIAL_BACKOFF_MS,
-            max_backoff_ms: DEFAULT_MAX_BACKOFF_MS,
-            jitter_ratio: DEFAULT_JITTER_RATIO,
-            buffered_max_bytes: DEFAULT_BUFFERED_MAX_BYTES,
-        }
-    }
-}
-
-impl RetryPolicy {
-    /// A policy that performs no retries — equivalent to the pre-#285
-    /// behaviour. Useful in tests and for operators who want to opt out.
-    /// Also sets `buffered_max_bytes = 0` so the body-phase buffer path
-    /// is disabled in lock-step (a `disabled()` policy that still
-    /// buffered would surprise operators reading the field name).
-    pub const fn disabled() -> Self {
-        Self {
-            max_retries: 0,
-            initial_backoff_ms: 0,
-            max_backoff_ms: 0,
-            jitter_ratio: 0.0,
-            buffered_max_bytes: 0,
-        }
-    }
-
-    /// Compute the backoff delay before the `attempt`-th retry (0-indexed:
-    /// `attempt = 0` is the first retry, immediately after the initial
-    /// failure). The schedule is `min(initial * 2^attempt, max)` with
-    /// equal-jitter applied.
-    ///
-    /// Saturating math throughout: `checked_shl` handles huge `attempt`
-    /// values without panicking on `1u64 << 64`, and the eventual
-    /// `min(_, max_backoff_ms)` collapses everything to the cap.
-    fn delay_for(self, attempt: u32) -> Duration {
-        let multiplier = 1u64.checked_shl(attempt).unwrap_or(u64::MAX);
-        let exp = self.initial_backoff_ms.saturating_mul(multiplier);
-        let base = exp.min(self.max_backoff_ms);
-
-        // Equal jitter: factor lies in [1 - r/2, 1 + r/2).
-        let r = self.jitter_ratio.clamp(0.0, 1.0);
-        let factor = 1.0_f64 - (r / 2.0) + rand::random::<f64>() * r;
-        #[allow(clippy::cast_precision_loss)]
-        let base_f = base as f64;
-        #[allow(clippy::cast_precision_loss)]
-        let upper = u64::MAX as f64;
-        let scaled = (base_f * factor).clamp(0.0, upper);
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let ms = scaled as u64;
-        Duration::from_millis(ms)
-    }
+    // Equal jitter: factor lies in [1 - r/2, 1 + r/2).
+    let r = policy.jitter_ratio.clamp(0.0, 1.0);
+    let factor = 1.0_f64 - (r / 2.0) + rand::random::<f64>() * r;
+    #[allow(clippy::cast_precision_loss)]
+    let base_f = base as f64;
+    #[allow(clippy::cast_precision_loss)]
+    let upper = u64::MAX as f64;
+    let scaled = (base_f * factor).clamp(0.0, upper);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let ms = scaled as u64;
+    Duration::from_millis(ms)
 }
 
 /// Drive a per-attempt closure through the retry policy.
@@ -235,7 +138,7 @@ where
                     );
                     return Err(OriginPullError::Permanent(e));
                 }
-                let sleep = policy.delay_for(attempt);
+                let sleep = delay_for(policy, attempt);
                 let sleep_ms = u64::try_from(sleep.as_millis()).unwrap_or(u64::MAX);
                 tracing::warn!(
                     %hash,
@@ -444,39 +347,10 @@ fn classify_by_kind(kind: io::ErrorKind, e: io::Error) -> OriginPullError {
 mod tests {
     use super::*;
 
-    #[test]
-    fn default_values_match_documented_constants() {
-        let p = RetryPolicy::default();
-        assert_eq!(p.max_retries, 3);
-        assert_eq!(p.initial_backoff_ms, 100);
-        assert_eq!(p.max_backoff_ms, 10_000);
-        assert!((p.jitter_ratio - 0.1).abs() < f64::EPSILON);
-        assert_eq!(p.buffered_max_bytes, DEFAULT_BUFFERED_MAX_BYTES);
-        assert_eq!(p.buffered_max_bytes, 4 << 20);
-    }
-
-    #[test]
-    fn disabled_has_zero_retries() {
-        let p = RetryPolicy::disabled();
-        assert_eq!(p.max_retries, 0);
-        // `disabled()` must also disable the buffer path (#519) — the
-        // field name promises "no retry"; an operator setting the
-        // policy to disabled and still seeing buffered drains would
-        // be surprised.
-        assert_eq!(p.buffered_max_bytes, 0);
-    }
-
-    #[test]
-    fn default_and_disabled_are_distinct() {
-        // Footgun guard: `default()` is *not* `disabled()` — defaults
-        // are opt-out (3 retries on by default per #285). A test
-        // author writing `RetryPolicy::default()` to "get a no-op"
-        // would actually retry 3 times with real sleeps. Pin the
-        // distinction so a future "make default = disabled" change
-        // is a deliberate, test-visible decision.
-        assert_ne!(RetryPolicy::default(), RetryPolicy::disabled());
-        assert!(RetryPolicy::default().max_retries > 0);
-    }
+    // `RetryPolicy` value-type tests (defaults / disabled) moved to the
+    // `decdn-config-types` leaf crate alongside the struct (#578). What
+    // stays here is the `delay_for` backoff math, which lives in this
+    // crate because it needs `rand`.
 
     #[test]
     fn delay_for_doubles_until_max_cap() {
@@ -487,11 +361,11 @@ mod tests {
             jitter_ratio: 0.0,     // deterministic
             buffered_max_bytes: 0, // not exercised by delay_for
         };
-        let d0 = p.delay_for(0);
-        let d1 = p.delay_for(1);
-        let d2 = p.delay_for(2);
-        let d3 = p.delay_for(3); // saturates at cap
-        let d4 = p.delay_for(4); // still saturated
+        let d0 = delay_for(p, 0);
+        let d1 = delay_for(p, 1);
+        let d2 = delay_for(p, 2);
+        let d3 = delay_for(p, 3); // saturates at cap
+        let d4 = delay_for(p, 4); // still saturated
         assert_eq!(d0.as_millis(), 100);
         assert_eq!(d1.as_millis(), 200);
         assert_eq!(d2.as_millis(), 400);
@@ -510,7 +384,7 @@ mod tests {
             buffered_max_bytes: 0,
         };
         for _ in 0..32 {
-            let d = p.delay_for(0);
+            let d = delay_for(p, 0);
             let ms = d.as_millis();
             assert!((50..150).contains(&ms), "jitter sample out of range: {ms}");
         }
@@ -529,7 +403,7 @@ mod tests {
         };
         // 10_000 is well above 64; `checked_shl` returns None and the
         // saturating multiply collapses to `max_backoff_ms`.
-        let d = p.delay_for(10_000);
+        let d = delay_for(p, 10_000);
         assert_eq!(d.as_millis(), 60_000);
     }
 
@@ -553,10 +427,10 @@ mod tests {
                 initial_backoff_ms: 1000,
                 max_backoff_ms: 10_000,
                 jitter_ratio,
-                buffered_max_bytes: DEFAULT_BUFFERED_MAX_BYTES,
+                buffered_max_bytes: 4 << 20,
             };
             for _ in 0..256 {
-                let ms = p.delay_for(0).as_millis();
+                let ms = delay_for(p, 0).as_millis();
                 assert!(
                     (lower..upper).contains(&ms),
                     "ratio={jitter_ratio}: sample {ms} not in [{lower}, {upper})"
@@ -575,12 +449,12 @@ mod tests {
             initial_backoff_ms: 100,
             max_backoff_ms: 10_000,
             jitter_ratio: 0.0,
-            buffered_max_bytes: DEFAULT_BUFFERED_MAX_BYTES,
+            buffered_max_bytes: 4 << 20,
         };
-        let baseline = p.delay_for(2);
+        let baseline = delay_for(p, 2);
         assert_eq!(baseline.as_millis(), 400);
         for _ in 0..16 {
-            assert_eq!(p.delay_for(2), baseline);
+            assert_eq!(delay_for(p, 2), baseline);
         }
     }
 
@@ -595,10 +469,10 @@ mod tests {
             initial_backoff_ms: 0,
             max_backoff_ms: 10_000,
             jitter_ratio: 0.5,
-            buffered_max_bytes: DEFAULT_BUFFERED_MAX_BYTES,
+            buffered_max_bytes: 4 << 20,
         };
         for attempt in 0..8 {
-            assert_eq!(p.delay_for(attempt), Duration::ZERO);
+            assert_eq!(delay_for(p, attempt), Duration::ZERO);
         }
     }
 }

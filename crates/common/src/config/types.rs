@@ -126,7 +126,7 @@ pub struct CacheConfig {
     ///
     /// Worst-case *backoff* latency for an all-failing chain is
     /// `len(origins) × sum_of_backoffs(origin_retry)` plus per-attempt
-    /// origin RTT/timeout. With default [`decdn_cache::RetryPolicy`]
+    /// origin RTT/timeout. With default [`decdn_config_types::RetryPolicy`]
     /// (3 retries, sleeps `100 + 200 + 400 ms` ± jitter — see
     /// `RetryPolicy::default`) that's ~700 ms backoff per origin
     /// (~2.1 s for three origins) — *not* `max_retries × backoff_cap`,
@@ -148,7 +148,7 @@ pub struct CacheConfig {
     /// Controls exponential backoff for transient HTTP / S3 /
     /// filesystem errors *and* the body-phase retry strategy for
     /// mid-stream `io::Error`s. Absent => defaults from
-    /// [`decdn_cache::RetryPolicy::default`] (3 retries, 100ms
+    /// [`decdn_config_types::RetryPolicy::default`] (3 retries, 100ms
     /// initial backoff doubling to 10s cap, 10% jitter,
     /// `buffered_max_bytes = 4 MiB`). `max_retries = 0` opts out and
     /// reproduces pre-#285 behaviour; `buffered_max_bytes = 0`
@@ -170,10 +170,10 @@ pub struct CacheConfig {
     ///   Worst-case disk amplification per fetch is
     ///   `(1 + max_retries) * max_blob_size_mb`.
     ///
-    /// `decdn_cache::RetryPolicy` carries `#[serde(default)]` so
+    /// `decdn_config_types::RetryPolicy` carries `#[serde(default)]` so
     /// partial sections (e.g. just `max_retries = 5`) get the rest of
     /// the fields filled from defaults.
-    pub origin_retry: Option<decdn_cache::RetryPolicy>,
+    pub origin_retry: Option<decdn_config_types::RetryPolicy>,
     /// Optional `User-Agent` override sent on every HTTP origin
     /// pull-through request (#435). Absent => the workspace default
     /// (`decdn-node/<version>`); set to attribute CDN traffic in origin
@@ -262,7 +262,7 @@ pub enum OriginConfig {
         /// encoding. The BLAKE3 content-address is computed over the
         /// canonical (decompressed) form, so `"strict"` is only safe
         /// for origins guaranteed to serve already-canonical bytes.
-        decompress: Option<decdn_cache::DecompressMode>,
+        decompress: Option<decdn_config_types::DecompressMode>,
     },
     /// Local filesystem origin rooted at `path`; blobs live at
     /// `{path}/{hex[0..2]}/{hex}`.
@@ -331,7 +331,7 @@ pub struct S3OriginConfig {
 /// `runtime::reload::FileSectionSnapshot` compares for SIGHUP
 /// diff detection; see [`SecretString`] for the full contract).
 /// The codebase already redacts HTTP-origin URL credentials (see
-/// `decdn_cache::redact_for_log`); this is the same pattern for
+/// `decdn_config_types::redact_for_log`); this is the same pattern for
 /// TOML-borne secrets.
 ///
 /// ```toml

@@ -82,23 +82,25 @@ pub struct ResolvedCache {
     /// retry exhaustion.
     pub origins: Vec<ResolvedOrigin>,
     /// Operator-pinned blob hashes (#276). Hashes here are excluded from
-    /// LRU eviction candidates by [`decdn_cache::CacheEngine`]. Resolved
+    /// LRU eviction candidates by the cache engine. Resolved
     /// from the hex-encoded TOML form at load time, so any wrong-length
     /// or non-hex entry fails config loading rather than turning into a
     /// silent "this hash will be ignored" surprise.
     ///
-    /// Held as [`decdn_cache::PinnedHashes`] (a typed wrapper around
+    /// Held as [`decdn_config_types::PinnedHashes`] (a typed wrapper around
     /// `Arc<HashSet<Hash>>`) so the engine, runtime, and resolver
     /// share one nominal type — a future "blocklist" or similar
     /// `HashSet<Hash>`-shaped feature can't be silently swapped into
     /// the pinning slot.
-    pub pinned_hashes: decdn_cache::PinnedHashes,
+    pub pinned_hashes: decdn_config_types::PinnedHashes,
     /// Origin pull-through retry policy (#285). Set once at startup;
     /// changes require a process restart.
-    pub origin_retry: decdn_cache::RetryPolicy,
+    pub origin_retry: decdn_config_types::RetryPolicy,
     /// `User-Agent` header sent on every HTTP origin pull-through (#435).
-    /// Defaults to [`decdn_cache::DEFAULT_USER_AGENT`] (which embeds the
-    /// `decdn-cache` crate's `CARGO_PKG_VERSION`); operators can override
+    /// Defaults to [`decdn_config_types::DEFAULT_USER_AGENT`] (which embeds
+    /// the `decdn-config-types` crate's `CARGO_PKG_VERSION`; the
+    /// `decdn-node/` prefix — not the version — is the stable contract,
+    /// #578); operators can override
     /// via `cache.user_agent` to attribute CDN traffic in origin access
     /// logs or to drive origin-side rate limits and routing policy.
     pub user_agent: String,
@@ -129,20 +131,20 @@ pub struct ResolvedCache {
 #[derive(Debug, Clone)]
 pub enum ResolvedOrigin {
     /// HTTP(S) origin. The base URL has already been parsed by
-    /// [`decdn_cache::parse_origin_url`] at resolution time, so
+    /// [`decdn_config_types::parse_origin_url`] at resolution time, so
     /// invariants (http/https scheme, trailing-slash path, no
     /// query/fragment) are type-enforced — they cannot be reconstructed
     /// outside the parser.
     Http {
         /// Validated base URL.
-        url: decdn_cache::OriginUrl,
+        url: decdn_config_types::OriginUrl,
         /// How to handle `Content-Encoding` on the HTTP origin response
-        /// (#312). Defaults to [`decdn_cache::DecompressMode::Auto`].
-        decompress: decdn_cache::DecompressMode,
+        /// (#312). Defaults to [`decdn_config_types::DecompressMode::Auto`].
+        decompress: decdn_config_types::DecompressMode,
     },
     /// Local filesystem origin root. Directory-existence is validated
     /// when the runtime constructs the
-    /// [`decdn_cache::FilesystemOrigin`] — config resolution carries
+    /// cache engine's filesystem origin — config resolution carries
     /// the raw path so resolution stays filesystem-free and testable
     /// without real I/O.
     Fs {
@@ -185,7 +187,7 @@ pub struct ResolvedS3Config {
     pub region: String,
     /// Custom endpoint URL for non-AWS S3-compatible providers (R2,
     /// B2, `MinIO`). Parsed and trailing-slash-normalized.
-    pub endpoint_url: Option<decdn_cache::OriginUrl>,
+    pub endpoint_url: Option<decdn_config_types::OriginUrl>,
     /// Whether to use path-style addressing. `false` (the SDK
     /// default) selects virtual-hosted-style addressing.
     pub path_style: bool,

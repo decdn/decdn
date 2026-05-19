@@ -229,7 +229,10 @@ impl AdminRpcServer for AdminRpcImpl {
     }
 
     async fn evict(&self, req: EvictRequest) -> RpcResult<EvictResponse> {
-        let hash = parse_hash_arg(&req.hash)?;
+        // `parse_hash_arg` yields the config-vocabulary leaf hash (keeps
+        // iroh-blobs out of the publisher CLI, #578); the blob store
+        // keys on `decdn_cache::Hash`, so convert at this boundary.
+        let hash = decdn_cache::to_store_hash(parse_hash_arg(&req.hash)?);
 
         // One `inspect` call snapshots size, pin, evicted, served — the
         // pre-evict state the response will carry. Any cache I/O

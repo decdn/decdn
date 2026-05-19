@@ -4,7 +4,7 @@
 
 Decentralized CDN (deCDN) — nodes cache and serve content-addressed blobs over iroh QUIC, clients pay per-MB via off-chain USDC payment channels. Rust implementation; the initial network deployment targets tens of nodes on an Arbitrum Sepolia testnet. "PoC" in code and ADR comments refers to that network-scale milestone, not contract-surface scope — the on-chain surface ships at full production shape with governance-tunable economics from day one (see [ADR 016 § Contract Inventory](adr/016-contract-interactions.md) and [§ Tunable Economics](adr/016-contract-interactions.md#tunable-economics)).
 
-**Status: Early implementation.** Cargo workspace with 8 crates. Two binaries (#421): `node` produces the `decdn-node` daemon with the runtime bring-up, admin RPC server, dispatch limiter, and probe handler; `cli` produces the user-facing `decdn` binary carrying `probe`, `node {peers,…}`, `key-gen`, `config {…}`. `common` holds the shared config schema, identity loading, and AdminRpc trait + DTOs both binaries import. `protocol` has varint framing, `ProbeMessage` (ADR 013), and `NodeAnnounce` gossip types; `cache` has the pull-through engine + HTTP/filesystem origin adapters; `gossip` has the `NodeAnnounce` pub/sub service with peer table. `incentive` and `reputation` are still stubs. ADRs in `adr/` remain the primary design artifacts.
+**Status: Early implementation.** Cargo workspace with 9 crates. Two binaries (#421): `node` produces the `decdn-node` daemon with the runtime bring-up, admin RPC server, dispatch limiter, and probe handler; `cli` produces the user-facing `decdn` binary carrying `probe`, `node {peers,…}`, `key-gen`, `config {…}`. `common` holds the shared config schema, identity loading, and AdminRpc trait + DTOs both binaries import. `protocol` has varint framing, `ProbeMessage` (ADR 013), and `NodeAnnounce` gossip types; `cache` has the pull-through engine + HTTP/filesystem origin adapters; `gossip` has the `NodeAnnounce` pub/sub service with peer table. `incentive` and `reputation` are still stubs. ADRs in `adr/` remain the primary design artifacts.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for build commands, ADR conventions, pre-commit hooks, and development environment setup.
 
@@ -37,6 +37,7 @@ crates/
   cli/          — user CLI binary `decdn`: probe, node admin, key-gen, config
   common/       — shared types: config schema + resolver, identity loading, AdminRpc trait + DTOs
   protocol/     — shared types, wire format, ALPN message definitions (leaf crate, minimal deps)
+  config-types/ — config-vocabulary value types (RetryPolicy, DecompressMode, OriginUrl, OriginKind, Hash, PinnedHashes) shared by cache + common (leaf crate: serde + url only, no iroh-blobs / no AWS — #578)
   cache/        — cache engine wrapping iroh-blobs + origin pull-through
   gossip/       — NodeAnnounce pub/sub over iroh-gossip, peer table, envelope validation
   incentive/    — payment channels, staking, vouchers (alloy for Ethereum)
@@ -44,7 +45,7 @@ crates/
 contracts/      — Solidity contracts + Foundry (repo root, excluded from workspace, not yet populated)
 ```
 
-**Dependency flow:** `node → cache, gossip, incentive, reputation, protocol, common`; `cli → common, protocol`. The two binaries share `common` for config schema, identity, and admin wire types — see [`adr/appendix-binaries.md`](adr/appendix-binaries.md) for the dockerd-style split rationale. Cache and incentive are independent — cache works without payment logic (useful for testing/local dev).
+**Dependency flow:** `node → cache, gossip, incentive, reputation, protocol, common`; `cli → common, protocol, incentive`; `common → config-types, protocol` (no longer `→ cache`, #578); `cache → config-types, protocol`. `config-types` is a leaf (alongside `protocol`), so the publisher CLI links no blob store / AWS SDK. The two binaries share `common` for config schema, identity, and admin wire types — see [`adr/appendix-binaries.md`](adr/appendix-binaries.md) for the dockerd-style split rationale. Cache and incentive are independent — cache works without payment logic (useful for testing/local dev).
 
 ### Wire Protocols (Core CDN)
 

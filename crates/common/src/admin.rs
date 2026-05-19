@@ -14,14 +14,16 @@
 //! [`decdn_protocol::LoadHint`], a leaf protocol type. Pulling
 //! `decdn-common` into the CLI does not pull the daemon runtime.
 //!
-//! The helper [`parse_hash_arg`] does return [`struct@Hash`] from
-//! `decdn-cache` — `decdn-cache` is already a dep of this crate via
-//! the typed config fields (`DecompressMode`, `RetryPolicy`,
-//! `OriginUrl`, `PinnedHashes`), so re-using the cache's hash type for
-//! the daemon-side handler that consumes it is cheap. The parser is
-//! used only by the daemon's `evict` handler today.
+//! The helper [`parse_hash_arg`] returns [`struct@Hash`] from the
+//! `decdn-config-types` leaf crate (the same leaf the typed config
+//! fields `DecompressMode`, `RetryPolicy`, `OriginUrl`, `PinnedHashes`
+//! come from). That keeps `decdn-cache`/iroh-blobs out of the publisher
+//! CLI's dependency tree (#578); the daemon's `evict` handler converts
+//! the leaf hash to the blob-store hash at its boundary via
+//! `decdn_cache::to_store_hash`. The parser is used only by that
+//! handler today.
 
-use decdn_cache::Hash;
+use decdn_config_types::Hash;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::types::ErrorObjectOwned;
@@ -133,8 +135,9 @@ pub struct EvictResponse {
 }
 
 /// Pre-evict snapshot returned inside [`EvictResponse::preview`].
-/// Mirrors `decdn_cache::EvictionPreview` minus the engine-internal
-/// `served` field (folded into [`EvictResponse::was_present`]).
+/// Mirrors the cache engine's `EvictionPreview` minus the
+/// engine-internal `served` field (folded into
+/// [`EvictResponse::was_present`]).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EvictPreview {
     /// Bytes the iroh-blobs store reports for this hash, read straight
@@ -178,7 +181,7 @@ pub struct EvictPreview {
     /// surface change — back-compat here only covers the cache-only
     /// path.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub origin_kinds: Vec<decdn_cache::OriginKind>,
+    pub origin_kinds: Vec<decdn_config_types::OriginKind>,
 }
 
 /// Response body for `admin_v1_announce` (issue #280).
@@ -337,13 +340,13 @@ pub trait AdminRpc {
 /// Decode a 64-character hex BLAKE3 hash into a [`struct@Hash`].
 ///
 /// Goes through `alloy::primitives::hex::decode` (case-insensitive,
-/// `0x`/`0X`-prefix-tolerant) rather than `Hash::from_str` because the
-/// iroh-blobs implementation falls through to `data_encoding`'s base32
-/// decoder for short inputs and **panics** when the decoder's output
-/// buffer is the wrong size for the requested decoding. Operator-driven
-/// inputs reach this path; a panic on malformed hex would tear down the
-/// admin RPC handler thread instead of returning an `INVALID_PARAMS`
-/// error to the caller.
+/// `0x`/`0X`-prefix-tolerant) rather than `Hash::from_str` so operators
+/// may paste a `0x`-prefixed hash and get a uniform `INVALID_PARAMS`
+/// error on malformed input. (The leaf [`struct@Hash`]'s own `FromStr`
+/// is panic-free since #578 — unlike the old iroh-blobs `Hash::from_str`
+/// which fell through to a base32 decoder that panicked on a
+/// wrong-size output buffer — but it does not accept a `0x` prefix, so
+/// the alloy path is kept for the operator ergonomics.)
 ///
 /// # Errors
 /// Returns an [`ErrorObjectOwned`] with [`INVALID_PARAMS_CODE`] when the

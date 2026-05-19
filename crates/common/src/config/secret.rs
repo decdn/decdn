@@ -5,7 +5,7 @@
 //! incidental `tracing::debug!(?cfg)`, panic backtrace formatter, or
 //! stray `dbg!()` cannot leak the credential into logs. The codebase
 //! already has redaction discipline for HTTP-origin URL credentials
-//! (see `decdn_cache::redact_for_log`) — this is the same pattern for
+//! (see `decdn_config_types::redact_for_log`) — this is the same pattern for
 //! TOML-borne secrets.
 //!
 //! - [`std::fmt::Debug`] always prints `"***"` regardless of the

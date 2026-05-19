@@ -91,10 +91,11 @@ pub const DEFAULT_CHAIN_ID: u64 = 421_614;
 
 /// Default maximum concurrently held (eviction-exempt) blobs for the
 /// probe-triggered hold (ADR 005 §Hold budget, #318). Per-blob holds: many
-/// peers probing one hash share a single slot. Re-exported from
-/// `decdn_cache` so the config default and the cache engine's own default
-/// (used by direct `CacheEngine::open` callers) cannot drift apart.
-pub const DEFAULT_MAX_PROBE_HOLDS: usize = decdn_cache::DEFAULT_MAX_PROBE_HOLDS;
+/// peers probing one hash share a single slot. Re-exported from the
+/// `decdn_config_types` leaf crate (the canonical home since #578) so
+/// the config default and the cache engine's own default (used by
+/// direct `CacheEngine::open` callers) cannot drift apart.
+pub const DEFAULT_MAX_PROBE_HOLDS: usize = decdn_config_types::DEFAULT_MAX_PROBE_HOLDS;
 
 /// Load config from file (if present) and merge with CLI args.
 ///
@@ -550,7 +551,7 @@ fn resolve_cache(
             validate_user_agent(s)?;
             s.clone()
         }
-        None => decdn_cache::DEFAULT_USER_AGENT.to_string(),
+        None => decdn_config_types::DEFAULT_USER_AGENT.to_string(),
     };
 
     let gc_interval_sec = file
@@ -692,7 +693,8 @@ fn resolve_origin(cfg: &types::OriginConfig) -> anyhow::Result<crate::config::Re
     match cfg {
         types::OriginConfig::Http { url, decompress } => {
             anyhow::ensure!(!url.is_empty(), "cache.origin.url must not be empty");
-            let parsed = decdn_cache::parse_origin_url(url).context("invalid cache.origin.url")?;
+            let parsed =
+                decdn_config_types::parse_origin_url(url).context("invalid cache.origin.url")?;
             Ok(ResolvedOrigin::Http {
                 url: parsed,
                 decompress: decompress.unwrap_or_default(),
@@ -775,7 +777,7 @@ fn resolve_s3_origin(
         // regardless of whether the operator wrote
         // `http://minio:9000` or `http://minio:9000/`.
         Some(
-            decdn_cache::parse_origin_url(&endpoint)
+            decdn_config_types::parse_origin_url(&endpoint)
                 .context("invalid cache.origin.endpoint_url")?,
         )
     } else {
@@ -948,8 +950,8 @@ pub const MAX_BUFFERED_MAX_BYTES: u64 = 64 << 20;
 /// monotone schedule, finite jitter in `[0, 1]`, and a sane ceiling
 /// on the body-phase buffer budget.
 pub fn resolve_origin_retry(
-    file: Option<&decdn_cache::RetryPolicy>,
-) -> anyhow::Result<decdn_cache::RetryPolicy> {
+    file: Option<&decdn_config_types::RetryPolicy>,
+) -> anyhow::Result<decdn_config_types::RetryPolicy> {
     let p = file.copied().unwrap_or_default();
     anyhow::ensure!(
         p.initial_backoff_ms <= p.max_backoff_ms,
@@ -976,18 +978,20 @@ pub fn resolve_origin_retry(
 }
 
 /// Parse the operator-supplied `cache.pinned_hashes` list (#276) into a
-/// [`decdn_cache::PinnedHashes`]. Each entry must be 64 lowercase hex
+/// [`decdn_config_types::PinnedHashes`]. Each entry must be 64 lowercase hex
 /// chars (BLAKE3 digest size); anything else fails resolution. Duplicates
 /// are silently de-duplicated — they're harmless.
 ///
 /// `None` and the empty list both resolve to the empty set, so an absent
 /// or empty `pinned_hashes` key just means "no pinning".
-pub fn parse_pinned_hashes(raw: Option<&[String]>) -> anyhow::Result<decdn_cache::PinnedHashes> {
+pub fn parse_pinned_hashes(
+    raw: Option<&[String]>,
+) -> anyhow::Result<decdn_config_types::PinnedHashes> {
     use std::str::FromStr;
 
     let mut out = std::collections::HashSet::new();
     let Some(entries) = raw else {
-        return Ok(decdn_cache::PinnedHashes::empty());
+        return Ok(decdn_config_types::PinnedHashes::empty());
     };
     for (idx, entry) in entries.iter().enumerate() {
         let trimmed = entry.trim();
@@ -1006,12 +1010,12 @@ pub fn parse_pinned_hashes(raw: Option<&[String]>) -> anyhow::Result<decdn_cache
                 && !trimmed.chars().any(|c| c.is_ascii_uppercase()),
             "cache.pinned_hashes[{idx}] must be lowercase hex (0-9, a-f)"
         );
-        let parsed = decdn_cache::Hash::from_str(trimmed).with_context(|| {
+        let parsed = decdn_config_types::Hash::from_str(trimmed).with_context(|| {
             format!("cache.pinned_hashes[{idx}] failed to parse as a BLAKE3 hash")
         })?;
         out.insert(parsed);
     }
-    Ok(decdn_cache::PinnedHashes::new(out))
+    Ok(decdn_config_types::PinnedHashes::new(out))
 }
 
 /// Resolve payment fields.
@@ -3097,7 +3101,7 @@ mod tests {
         let cli = cache_cli(None, None);
         let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
         anyhow::ensure!(
-            resolved.user_agent == decdn_cache::DEFAULT_USER_AGENT,
+            resolved.user_agent == decdn_config_types::DEFAULT_USER_AGENT,
             "expected default UA, got: {}",
             resolved.user_agent
         );
@@ -3251,14 +3255,17 @@ mod tests {
         let file = types::CacheConfig {
             origin: Some(types::OriginConfig::Http {
                 url: "https://origin.example/".to_string(),
-                decompress: Some(decdn_cache::DecompressMode::Strict),
+                decompress: Some(decdn_config_types::DecompressMode::Strict),
             }),
             ..types::CacheConfig::default()
         };
         let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
         match resolved.origins.into_iter().next() {
             Some(ResolvedOrigin::Http { decompress, .. }) => {
-                anyhow::ensure!(matches!(decompress, decdn_cache::DecompressMode::Strict));
+                anyhow::ensure!(matches!(
+                    decompress,
+                    decdn_config_types::DecompressMode::Strict
+                ));
             }
             other => anyhow::bail!("expected Http origin, got: {other:?}"),
         }
@@ -3278,7 +3285,10 @@ mod tests {
         let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
         match resolved.origins.into_iter().next() {
             Some(ResolvedOrigin::Http { decompress, .. }) => {
-                anyhow::ensure!(matches!(decompress, decdn_cache::DecompressMode::Auto));
+                anyhow::ensure!(matches!(
+                    decompress,
+                    decdn_config_types::DecompressMode::Auto
+                ));
             }
             other => anyhow::bail!("expected Http origin, got: {other:?}"),
         }
@@ -4124,7 +4134,7 @@ mod tests {
     fn resolve_origin_retry_parses_full_section() -> anyhow::Result<()> {
         let cli = cache_cli(None, None);
         let file = types::CacheConfig {
-            origin_retry: Some(decdn_cache::RetryPolicy {
+            origin_retry: Some(decdn_config_types::RetryPolicy {
                 max_retries: 7,
                 initial_backoff_ms: 50,
                 max_backoff_ms: 2_000,
@@ -4167,9 +4177,9 @@ mod tests {
         // must not reject it.
         let cli = cache_cli(None, None);
         let file = types::CacheConfig {
-            origin_retry: Some(decdn_cache::RetryPolicy {
+            origin_retry: Some(decdn_config_types::RetryPolicy {
                 max_retries: 0,
-                ..decdn_cache::RetryPolicy::default()
+                ..decdn_config_types::RetryPolicy::default()
             }),
             ..types::CacheConfig::default()
         };
@@ -4182,10 +4192,10 @@ mod tests {
     fn resolve_origin_retry_rejects_initial_above_max() -> anyhow::Result<()> {
         let cli = cache_cli(None, None);
         let file = types::CacheConfig {
-            origin_retry: Some(decdn_cache::RetryPolicy {
+            origin_retry: Some(decdn_config_types::RetryPolicy {
                 initial_backoff_ms: 2_000,
                 max_backoff_ms: 1_000,
-                ..decdn_cache::RetryPolicy::default()
+                ..decdn_config_types::RetryPolicy::default()
             }),
             ..types::CacheConfig::default()
         };
@@ -4205,9 +4215,9 @@ mod tests {
         let cli = cache_cli(None, None);
         for bad in [-0.1, 1.5, f64::NAN, f64::INFINITY] {
             let file = types::CacheConfig {
-                origin_retry: Some(decdn_cache::RetryPolicy {
+                origin_retry: Some(decdn_config_types::RetryPolicy {
                     jitter_ratio: bad,
-                    ..decdn_cache::RetryPolicy::default()
+                    ..decdn_config_types::RetryPolicy::default()
                 }),
                 ..types::CacheConfig::default()
             };
@@ -4230,9 +4240,9 @@ mod tests {
         // path covers any blob size without raising this knob.
         let cli = cache_cli(None, None);
         let file = types::CacheConfig {
-            origin_retry: Some(decdn_cache::RetryPolicy {
+            origin_retry: Some(decdn_config_types::RetryPolicy {
                 buffered_max_bytes: MAX_BUFFERED_MAX_BYTES + 1,
-                ..decdn_cache::RetryPolicy::default()
+                ..decdn_config_types::RetryPolicy::default()
             }),
             ..types::CacheConfig::default()
         };
@@ -4260,9 +4270,9 @@ mod tests {
         // edit can't accidentally flip the inequality.
         let cli = cache_cli(None, None);
         let file = types::CacheConfig {
-            origin_retry: Some(decdn_cache::RetryPolicy {
+            origin_retry: Some(decdn_config_types::RetryPolicy {
                 buffered_max_bytes: MAX_BUFFERED_MAX_BYTES,
-                ..decdn_cache::RetryPolicy::default()
+                ..decdn_config_types::RetryPolicy::default()
             }),
             ..types::CacheConfig::default()
         };
@@ -4278,9 +4288,9 @@ mod tests {
         // resolve cleanly.
         let cli = cache_cli(None, None);
         let file = types::CacheConfig {
-            origin_retry: Some(decdn_cache::RetryPolicy {
+            origin_retry: Some(decdn_config_types::RetryPolicy {
                 buffered_max_bytes: 0,
-                ..decdn_cache::RetryPolicy::default()
+                ..decdn_config_types::RetryPolicy::default()
             }),
             ..types::CacheConfig::default()
         };

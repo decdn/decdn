@@ -24,10 +24,12 @@ pub const PROBE_HOLD_DURATION: Duration = PROBE_SLASH_WINDOW.saturating_add(PROB
 
 /// Default maximum number of concurrently held (eviction-exempt) blobs (ADR
 /// 005 §Hold budget). Holds are per-blob: many peers probing one hash share a
-/// single slot. `decdn_common::config::DEFAULT_MAX_PROBE_HOLDS` re-exports
-/// this constant, so the config default and the cache engine default cannot
-/// drift apart.
-pub const DEFAULT_MAX_PROBE_HOLDS: usize = 256;
+/// single slot. The canonical definition now lives in the
+/// `decdn-config-types` leaf crate (#578) so the config default
+/// (`decdn_common::config`) and the cache engine default cannot drift apart;
+/// re-exported here for the existing `crate::probe_hold::DEFAULT_MAX_PROBE_HOLDS`
+/// path.
+pub use decdn_config_types::DEFAULT_MAX_PROBE_HOLDS;
 
 /// Outcome of [`crate::CacheEngine::try_probe_hold`]. The caller maps this to
 /// the `has_blob` it signs (ADR 005 §Probe-triggered eviction hold) — only

@@ -7,7 +7,7 @@ rust-version.workspace = true
 description = "Shared types for deCDN binaries: config schema, identity, CLI args"
 
 [dependencies]
-decdn-cache = { workspace = true }
+decdn-config-types = { workspace = true }
 decdn-protocol = { workspace = true }
 alloy = { workspace = true }
 iroh = { workspace = true }

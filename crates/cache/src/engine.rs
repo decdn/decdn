@@ -17,11 +17,14 @@ use iroh_blobs::store::fs::options::Options as FsStoreOptions;
 use iroh_blobs::store::{GcConfig, ProtectOutcome};
 use tokio::sync::Notify;
 
+use decdn_config_types::{PinDiff, PinnedHashes, RetryPolicy};
+
 use crate::error::{CacheError, CacheResult, OriginPullError};
 use crate::metrics::CacheMetrics;
 use crate::origin::{Origin, OriginKind};
 use crate::probe_hold::ProbeHoldOutcome;
-use crate::retry::{RetryPolicy, classify_io_error, drain_to_bytes, run_with_retry, should_buffer};
+use crate::retry::{classify_io_error, drain_to_bytes, run_with_retry, should_buffer};
+use crate::{from_store_hash, to_store_hash};
 
 /// Engine bundling a filesystem-backed iroh-blobs store with an optional
 /// origin backend. Lookups hit the store first; on miss and when an origin is
@@ -176,90 +179,10 @@ pub struct CacheStats {
     pub blob_count: u64,
 }
 
-/// Operator-pinned blob hashes (#276). Hashes here are excluded from the
-/// LRU eviction-candidate snapshot. Constructing this type is the only
-/// way to feed pinned hashes into [`CacheEngine::open_with_pinned`] or
-/// [`CacheEngine::set_pinned`], so a future "blocklist" or similar
-/// `HashSet<Hash>`-shaped feature can't be silently passed into the
-/// pinning slot.
-///
-/// Held as `Arc<HashSet<Hash>>` internally so reload paths that swap the
-/// active set don't need to clone the underlying map.
-#[derive(Debug, Clone)]
-pub struct PinnedHashes(Arc<HashSet<Hash>>);
-
-impl PinnedHashes {
-    /// Build a [`PinnedHashes`] from a freshly parsed set.
-    #[must_use]
-    pub fn new(set: HashSet<Hash>) -> Self {
-        Self(Arc::new(set))
-    }
-
-    /// The empty pinned set.
-    #[must_use]
-    pub fn empty() -> Self {
-        Self(Arc::new(HashSet::new()))
-    }
-
-    /// Number of pinned hashes.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    /// Is the pinned set empty?
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    /// Is `hash` pinned?
-    #[must_use]
-    pub fn contains(&self, hash: &Hash) -> bool {
-        self.0.contains(hash)
-    }
-
-    /// Iterate over the pinned hashes.
-    pub fn iter(&self) -> std::collections::hash_set::Iter<'_, Hash> {
-        self.0.iter()
-    }
-
-    /// Compute counts of additions / removals / unchanged hashes between
-    /// `prev` (older snapshot) and `self` (newer). Used by the SIGHUP
-    /// reload path to log a diff line — operators pin/unpin individual
-    /// hashes and want to see the delta in the success log without
-    /// scraping the full set.
-    #[must_use]
-    pub fn diff(&self, prev: &Self) -> PinDiff {
-        let added = self.0.iter().filter(|h| !prev.0.contains(*h)).count();
-        let removed = prev.0.iter().filter(|h| !self.0.contains(*h)).count();
-        PinDiff { added, removed }
-    }
-}
-
-impl<'a> IntoIterator for &'a PinnedHashes {
-    type Item = &'a Hash;
-    type IntoIter = std::collections::hash_set::Iter<'a, Hash>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.iter()
-    }
-}
-
-impl Default for PinnedHashes {
-    fn default() -> Self {
-        Self::empty()
-    }
-}
-
-/// Cheap diff of two [`PinnedHashes`] snapshots, for the reload log line.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PinDiff {
-    /// Number of hashes present in the new set but not the old.
-    pub added: usize,
-    /// Number of hashes present in the old set but not the new.
-    pub removed: usize,
-}
+// `PinnedHashes` and `PinDiff` moved to the `decdn-config-types` leaf
+// crate (#578) and are imported above. The engine holds its pinned set
+// internally as `HashSet<Hash>` (the iroh-blobs store hash) and converts
+// at the public boundary via `to_store_hash` / `from_store_hash`.
 
 /// Read-only snapshot of a hash's local-cache state, returned by
 /// [`CacheEngine::inspect`]. Backs `decdn node evict --dry-run`
@@ -800,7 +723,12 @@ impl CacheEngine {
                 max_blob_bytes,
                 access_times: Mutex::new(HashMap::new()),
                 inflight: Mutex::new(HashMap::new()),
-                pinned: ArcSwap::from(pinned.0),
+                pinned: ArcSwap::from(Arc::new(
+                    pinned
+                        .iter()
+                        .map(|h| to_store_hash(*h))
+                        .collect::<HashSet<Hash>>(),
+                )),
                 evicted: Mutex::new(evicted),
                 probe_holds: Mutex::new(HashMap::new()),
                 max_probe_holds: AtomicUsize::new(crate::probe_hold::DEFAULT_MAX_PROBE_HOLDS),
@@ -818,20 +746,48 @@ impl CacheEngine {
     /// never a partial mix. Returns a [`PinDiff`] so callers can log
     /// "added X, removed Y" without re-walking either set.
     ///
-    /// Takes `&PinnedHashes` rather than ownership: the inner `Arc`
-    /// is cheap to clone for the swap, and callers commonly want to
-    /// compute the diff without giving up their own copy.
+    /// Takes `&PinnedHashes` rather than ownership: callers commonly
+    /// want to compute the diff without giving up their own copy. The
+    /// leaf [`PinnedHashes`] is converted to the engine-internal
+    /// `HashSet<Hash>` (iroh-blobs store hash) here — the cold SIGHUP
+    /// path, so the O(n) conversion is acceptable; the hot
+    /// `is_pinned`/`eviction_candidates` lookups stay on the store hash.
     pub fn set_pinned(&self, new: &PinnedHashes) -> PinDiff {
-        let prev_arc = self.inner.pinned.swap(Arc::clone(&new.0));
-        let prev = PinnedHashes(prev_arc);
-        new.diff(&prev)
+        let new_arc = Arc::new(
+            new.iter()
+                .map(|h| to_store_hash(*h))
+                .collect::<HashSet<Hash>>(),
+        );
+        let prev_arc = self.inner.pinned.swap(Arc::clone(&new_arc));
+        // Same set-difference arithmetic as `PinnedHashes::diff` (in
+        // `decdn-config-types`), recomputed here over the store-hash
+        // sets instead of round-tripping back to leaf hashes. The two
+        // must stay behaviorally identical — `to_store_hash` is a
+        // bijection on the 32 bytes, so cardinalities and membership are
+        // preserved; if `PinnedHashes::diff` ever reports more than
+        // counts (e.g. a sample of changed hashes), update both.
+        let added = new_arc.iter().filter(|h| !prev_arc.contains(*h)).count();
+        let removed = prev_arc.iter().filter(|h| !new_arc.contains(*h)).count();
+        PinDiff { added, removed }
     }
 
-    /// Borrow a snapshot of the current pinned set. Cheap (one
-    /// `Arc::clone`); the underlying [`ArcSwap`] returns a `Guard` that
-    /// resolves to an `Arc<HashSet<Hash>>` we then own.
+    /// Borrow a snapshot of the current pinned set, rebuilt as the leaf
+    /// [`PinnedHashes`] (config-vocabulary hash) from the engine-internal
+    /// store-hash set.
+    ///
+    /// **Cost:** O(n) — unlike the pre-#578 single `Arc::clone`, this
+    /// allocates a fresh `HashSet` and converts every hash across the
+    /// store↔leaf boundary. Call it off the hot path (it backs SIGHUP
+    /// reload logging and admin snapshots, not per-request lookups).
     pub fn pinned_snapshot(&self) -> PinnedHashes {
-        PinnedHashes(self.inner.pinned.load_full())
+        let set = self
+            .inner
+            .pinned
+            .load()
+            .iter()
+            .map(|h| from_store_hash(*h))
+            .collect::<HashSet<decdn_config_types::Hash>>();
+        PinnedHashes::new(set)
     }
 
     /// Snapshot of the active retry policy. Used by tests and startup
@@ -2237,9 +2193,11 @@ mod tests {
         let pinned_hash = Hash::new(pinned_payload);
         let evictable_hash = Hash::new(evictable_payload);
 
-        // Build the engine with pinned_hash in the pinning set.
-        let mut pinned_set = HashSet::new();
-        pinned_set.insert(pinned_hash);
+        // Build the engine with pinned_hash in the pinning set. The
+        // leaf `PinnedHashes` is keyed on the config-vocabulary hash, so
+        // convert the store hash at the boundary (#578) — this also
+        // regression-covers the leaf↔store conversion in `open_full`.
+        let pinned_set = [from_store_hash(pinned_hash)].into_iter().collect();
         let engine = CacheEngine::open_with_pinned(
             tmp.path(),
             Vec::new(),
@@ -2292,9 +2250,9 @@ mod tests {
         // No pinning yet — both candidates.
         anyhow::ensure!(engine.eviction_candidates().len() == 2);
 
-        // Pin h1.
-        let mut s = HashSet::new();
-        s.insert(h1);
+        // Pin h1 (convert the store hash to the leaf config-vocabulary
+        // hash at the boundary, #578).
+        let s = [from_store_hash(h1)].into_iter().collect();
         let diff = engine.set_pinned(&PinnedHashes::new(s));
         anyhow::ensure!(
             diff.added == 1 && diff.removed == 0,
@@ -2312,35 +2270,6 @@ mod tests {
             "expected diff (added=0, removed=1), got {diff2:?}"
         );
         anyhow::ensure!(engine.eviction_candidates().len() == 2);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn pinned_hashes_diff_counts_added_and_removed() -> anyhow::Result<()> {
-        // Direct unit test of the diff helper, independent of the
-        // engine swap path. Locks the API: a future caller stitching
-        // log messages from `PinDiff` shouldn't break silently if the
-        // counting changes shape.
-        let h1 = Hash::new(b"one");
-        let h2 = Hash::new(b"two");
-        let h3 = Hash::new(b"three");
-
-        let mut prev_set = HashSet::new();
-        prev_set.insert(h1);
-        prev_set.insert(h2);
-        let prev = PinnedHashes::new(prev_set);
-
-        let mut new_set = HashSet::new();
-        new_set.insert(h2);
-        new_set.insert(h3);
-        let new = PinnedHashes::new(new_set);
-
-        let diff = new.diff(&prev);
-        anyhow::ensure!(diff.added == 1 && diff.removed == 1, "got {diff:?}");
-
-        // Same set on both sides: zero diff.
-        let no_change = new.diff(&new);
-        anyhow::ensure!(no_change.added == 0 && no_change.removed == 0);
         Ok(())
     }
 
@@ -2637,8 +2566,9 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let pinned_hash = Hash::new(b"pinned");
         let other_hash = Hash::new(b"other");
-        let mut set = HashSet::new();
-        set.insert(pinned_hash);
+        // Convert the store hash to the leaf config-vocabulary hash at
+        // the `PinnedHashes` boundary (#578).
+        let set = [from_store_hash(pinned_hash)].into_iter().collect();
         let engine =
             CacheEngine::open_with_pinned(tmp.path(), Vec::new(), 10, PinnedHashes::new(set))
                 .await?;

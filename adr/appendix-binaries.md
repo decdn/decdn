@@ -37,12 +37,15 @@ Adopt the dockerd shape. Two binaries, one shared support crate:
 - **`decdn-common`** (`crates/common`) — shared types both binaries
   need: the TOML config schema and resolver, identity loading, the
   `AdminRpc` trait + DTOs, and clap argument structs. No runtime, no
-  peer table, no engine handles. It does pull `decdn-cache` as a
-  build-time dep — for the cache-typed config fields
-  (`DecompressMode`, `RetryPolicy`, `OriginUrl`, `PinnedHashes`,
-  `Hash`) and the `Hash` return of `parse_hash_arg` — which is the
-  largest single contributor to CLI binary size (see Cross-ADR
-  Impact for the budget and remedy).
+  peer table, no engine handles. The config-vocabulary value types it
+  is built from (`DecompressMode`, `RetryPolicy`, `OriginUrl`,
+  `OriginKind`, `PinnedHashes`, `Hash`) and the `Hash` returned by
+  `parse_hash_arg` live in the `decdn-config-types` leaf crate
+  (serde + `url` only — no iroh-blobs, no AWS SDK). `decdn-common`
+  therefore does **not** depend on `decdn-cache`, so `decdn` links
+  none of the blob-store/AWS weight (#578). The daemon's `evict`
+  handler converts the leaf `Hash` to the blob-store hash via
+  `decdn_cache::to_store_hash` at its boundary.
 
 There is no `decdn run` subcommand. `decdn run` errors as an
 unrecognized subcommand (clap's default), with `decdn --help` listing
@@ -64,10 +67,12 @@ noun the command operates on.
 
 A two-crate split (`decdn-config` + `decdn-admin-types`) would buy a
 tighter dep graph, but everything in `decdn-common` is consumed by
-both binaries already, so the fragmentation has no immediate payoff.
-If the CLI binary-size budget (Cross-ADR Impact) is exceeded, the
-right move is splitting the cache-typed `config` fields out of
-`decdn-common` — not splitting the crate.
+both binaries already, so fragmenting `decdn-common` itself has no
+payoff. The cache-typed `config` fields *were* split out — into the
+`decdn-config-types` leaf crate (#578) — which is the realized form of
+the remedy this section anticipated: extract the shared value types,
+not the crate. `decdn-common` keeps its single-crate shape; the leaf
+just owns the vocabulary types so the CLI links no blob store.
 
 ### Why the metric prefix and OTLP `service.name` stay `decdn`
 
@@ -101,6 +106,11 @@ and would silently miss data on a prefix rename.
   `cargo bloat --release --bin decdn -n 20` and
   `ls -lh target/release/decdn target/release/decdn-node` after each
   significant CLI change. Soft target ≤ 50 MB stripped (the dockerd
-  CLI is ≈ 50 MB; `iroh` + `iroh-blobs` via `decdn-cache` pull in
-  most of the weight). If exceeded, split the cache-typed config
-  fields out of `decdn-common`'s `config` module.
+  CLI is ≈ 50 MB). The single largest contributor — `iroh-blobs` and
+  the AWS SDK reaching `decdn` via `cli → common → cache` — was
+  removed in #578 by extracting `decdn-config-types`; `decdn` no
+  longer links the blob store or AWS SDK at all (`reqwest`/`iroh`
+  remain, via `alloy` and the direct `iroh` dep — not the cache).
+  Regression guard: `cargo tree -p decdn-cli -e normal -i iroh-blobs`
+  and `-i aws-sdk-s3` must be empty (dev-deps still pull them for the
+  integration tests; that does not affect the release binary).
