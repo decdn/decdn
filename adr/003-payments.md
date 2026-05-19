@@ -22,7 +22,7 @@ The same channel mechanism operates at two tiers:
 - **Client → node**: a client opens a USDC channel with a node, signs cumulative vouchers as MB are delivered, and the node initiates channel close on-chain and settles to claim payment after the dispute window.
 - **Node → node**: when a node pulls content from another node (typically an origin-backed node) for the first time, it pays via the same channel mechanism. The origin-backed node is paid wholesale; the pulling node recoups this by serving multiple clients from its cache at a markup.
 
-A channel is opened by depositing USDC into the `StablePaymentChannel` contract. As content is delivered, the payer signs cumulative vouchers off-chain — one voucher per MB received (default cadence; negotiable for large transfers). The delivering node holds the latest voucher and submits it on-chain to initiate channel close. A dispute window (default 48 hours for PoC, governable within 12h–72h — see [ADR 009](009-governance.md)) allows either party to counter a stale or fraudulent close attempt. After the dispute window expires, the channel is settled and funds are distributed.
+A channel is opened by depositing USDC into the `PaymentChannel` contract. As content is delivered, the payer signs cumulative vouchers off-chain — one voucher per MB received (default cadence; negotiable for large transfers). The delivering node holds the latest voucher and submits it on-chain to initiate channel close. A dispute window (default 48 hours for PoC, governable within 12h–72h — see [ADR 009](009-governance.md)) allows either party to counter a stale or fraudulent close attempt. After the dispute window expires, the channel is settled and funds are distributed.
 
 Key parameters:
 
@@ -56,7 +56,7 @@ All deCDN contracts use OpenZeppelin `SignatureChecker` for signature verificati
 Two standards can further eliminate the requirement for clients to hold the L2's native gas token:
 
 - **ERC-2771 meta-transactions.** A relayer submits the `openChannel` transaction on behalf of the client, paying gas. The client signs an ERC-2771 forwarding request; the relayer recoups gas from the deposit or a separate sponsorship fund. Requires adding a trusted-forwarder check to the contract.
-- **ERC-4337 account abstraction.** Smart contract wallets batch USDC approval + channel open into a single user operation. A paymaster can sponsor gas in USDC rather than ETH. Works with unmodified contracts — no changes to `StablePaymentChannel` needed.
+- **ERC-4337 account abstraction.** Smart contract wallets batch USDC approval + channel open into a single user operation. A paymaster can sponsor gas in USDC rather than ETH. Works with unmodified contracts — no changes to `PaymentChannel` needed.
 
 Gas abstraction via ERC-2771 or ERC-4337 paymasters is deferred to production. For the PoC, clients must hold both USDC and a small amount of ETH for gas.
 
@@ -64,7 +64,7 @@ Gas abstraction via ERC-2771 or ERC-4337 paymasters is deferred to production. F
 
 At the default 1 MB cadence, a 10 GB blob requires 10,000 vouchers — each involving a sign, transmit, verify, and ack cycle. This overhead is unnecessary when the unacknowledged exposure per interval is negligible at typical rates.
 
-**Parameter:** `maxVoucherIntervalMb` is a governable parameter on `StablePaymentChannel` defining the maximum allowed voucher interval in MB. Default: 1 MB. Hardcoded safety bounds: minimum 1 MB, maximum 1024 MB (~1 GB).
+**Parameter:** `maxVoucherIntervalMb` is a governable parameter on `PaymentChannel` defining the maximum allowed voucher interval in MB. Default: 1 MB. Hardcoded safety bounds: minimum 1 MB, maximum 1024 MB (~1 GB).
 
 **Negotiation semantics:**
 
@@ -113,7 +113,7 @@ The settled amount is still calculated **at final settlement**, after the disput
 
 1. **`closeChannel`** — callable by client or provider only. Records the submitted voucher's `amount` in `claimedAmount`, `nonce` in `claimedNonce`, and `bytesDelivered` in `claimedBytes`, sets status to `Closing`, starts the dispute window. **No fee deduction, no router call.** **Zero-voucher close:** when **either party** calls `closeChannel` with `amount=0`, `nonce=0`, `bytesDelivered=0`, and an empty signature (`signature.length == 0`) on a channel with `claimedNonce == 0`, the signature verification is skipped — no client-signed voucher is needed. All other `closeChannel` calls — any call with `signature.length > 0`, or any call where `amount != 0`, `nonce != 0`, or `bytesDelivered != 0` — require normal EIP-712/ECDSA voucher verification. This is safe because voucher nonces start at 1 (nonce 0 is the sentinel for "no voucher submitted"; see [Voucher Nonce Convention](#voucher-nonce-convention)), so any real voucher has nonce ≥ 1 and can always be submitted via `disputeChannel` (which requires strictly higher nonce than `claimedNonce`). The dispute window still applies: if a valid voucher exists, any party can submit it via `disputeChannel`. At settlement, `claimedAmount=0` means the full deposit is refunded to the client and the provider receives nothing — no router call is made for a zero-amount settlement.
 2. **`disputeChannel`** (during dispute window) — callable by any address. If the submitted voucher has a strictly higher nonce, updates both `claimedAmount`, `claimedNonce`, and `claimedBytes` (see [Voucher Bytes-Delivered Field](#voucher-bytes-delivered-field)) to the new values. Still **no fee deduction, no router call**. Submissions with an equal or lower nonce revert with no state change.
-3. **`settleChannel`** (after dispute window expires) — callable by anyone. If `claimedAmount > 0`, computes `bytesDelivered` from the final voucher, transfers the full `claimedAmount` of USDC to the `FeeRouter`, and invokes `FeeRouter.routeSettlement(channel.provider, bytesDelivered, claimedAmount, voucher.epochId)` in the same transaction. Refunds `deposit - claimedAmount` to the client. Sets status to `Closed`. The router (not `StablePaymentChannel`) applies the six-bucket split and increments `bytesPerEpoch[operator][epochId]` for the gauge formula in [ADR 026 §3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula) — split legs and bounds in [FeeRouter Integration](#feerouter-integration). The per-operator gauge-share cap from [ADR 026 §3](026-gauge-boost-tokenomics.md#per-operator-gauge-share-cap) is the binding wash-trading defense; gauge bytes flow through `settleChannel` directly with no separate commit step.
+3. **`settleChannel`** (after dispute window expires) — callable by anyone. If `claimedAmount > 0`, computes `bytesDelivered` from the final voucher, transfers the full `claimedAmount` of USDC to the `FeeRouter`, and invokes `FeeRouter.routeSettlement(channel.provider, bytesDelivered, claimedAmount, voucher.epochId)` in the same transaction. Refunds `deposit - claimedAmount` to the client. Sets status to `Closed`. The router (not `PaymentChannel`) applies the six-bucket split and increments `bytesPerEpoch[operator][epochId]` for the gauge formula in [ADR 026 §3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula) — split legs and bounds in [FeeRouter Integration](#feerouter-integration). The per-operator gauge-share cap from [ADR 026 §3](026-gauge-boost-tokenomics.md#per-operator-gauge-share-cap) is the binding wash-trading defense; gauge bytes flow through `settleChannel` directly with no separate commit step.
 
    > **Invariants:**
    > 1. `closeChannel` and `disputeChannel` MUST revert if the submitted voucher's `amount > channel.deposit`. This prevents client bugs or malicious over-deposit vouchers from causing an underflow revert in `settleChannel` that would lock the channel.
@@ -163,7 +163,7 @@ Surfacing these reasons off-chain saves both parties the gas of a doomed on-chai
 - The voucher is the payment receipt; the BLAKE3 hash is the delivery receipt. Together they provide mutual protection: the client doesn't sign a voucher for bytes that fail hash verification; the node stops delivering if vouchers stop arriving
 - Maximum risk per voucher interval at default cadence (1 MB) is $0.00001 at market rate — negligible. At the governance maximum interval (1024 MB) and ceiling rate ($0.001/MB), worst-case risk is $1.024 per interval — still small relative to the recommended 10 USDC minimum deposit (see [Voucher Interval Negotiation](#voucher-interval-negotiation))
 - Market-driven rate setting means replication happens organically: profitable content gets cached by more nodes, driving prices down without any coordination protocol
-- The `StablePaymentChannel` contract is functionally separated from the `StakingRegistry`, keeping the audit surface for each contract's core logic bounded
+- The `PaymentChannel` contract is functionally separated from the `StakingRegistry`, keeping the audit surface for each contract's core logic bounded
 
 ### Negative
 
@@ -191,7 +191,7 @@ Client opens many channels with minimum deposit and never streams, forcing nodes
 
 The griefing attacker's financial cost stays bounded: at the recommended 10 USDC minimum, $1,000 opens 100 channels; the counterparty (or the attacker, to recover the deposit) closes them all and each settles after the dispute window with full client refund (no profit motive) and ~$0.18 gas per close+settle pair. Total gas exposure for 100 channels is ~$18 — enough to warrant additional mitigations for high-volume attacks:
 
-- **Option A — On-chain channel cap per address.** The `StablePaymentChannel` contract enforces a maximum number of open channels per client Ethereum address (e.g., 10). Hard to circumvent without new wallet addresses, each requiring on-chain funding.
+- **Option A — On-chain channel cap per address.** The `PaymentChannel` contract enforces a maximum number of open channels per client Ethereum address (e.g., 10). Hard to circumvent without new wallet addresses, each requiring on-chain funding.
 - **Option B — Node-side filtering.** Nodes refuse `StreamRequest` from channels that have been open longer than N days with zero vouchers. Off-chain, no contract change needed, but relies on node operator implementation.
 
 #### Stale close
@@ -322,9 +322,9 @@ Storage backend and trait shape are implementation concerns; the Rust implementa
 
 ## Contract Interfaces
 
-### StablePaymentChannel
+### PaymentChannel
 
-The `StablePaymentChannel` is the payment-channel contract, handling USDC payment channels. The USDC token address is fixed at deployment as an immutable constructor argument.
+The `PaymentChannel` is the payment-channel contract, handling USDC payment channels. The USDC token address is fixed at deployment as an immutable constructor argument.
 
 **Channel state:**
 
@@ -368,7 +368,7 @@ struct Channel {
 | Governance | `setRateBounds(floor, ceiling)` | Rate floor and ceiling in token base units. |
 | Governance | `setMaxVoucherIntervalMb(mb)` | Max negotiable voucher interval (bounded 1–1024 MB). |
 
-Bucket shares (40/40/7/5/5/3) are governed on `FeeRouter`, not on `StablePaymentChannel`; the treasury share (5%) is configured on `FeeRouter`.
+Bucket shares (40/40/7/5/5/3) are governed on `FeeRouter`, not on `PaymentChannel`; the treasury share (5%) is configured on `FeeRouter`.
 
 #### Governance setter: setFeeRouter
 
@@ -378,13 +378,13 @@ function setFeeRouter(address newRouter) external onlyRole(GOVERNANCE_ROLE);
 event FeeRouterUpdated(address indexed oldRouter, address indexed newRouter);
 ```
 
-`setFeeRouter` re-points the configured `FeeRouter` for future `settleChannel` calls. Required because the audited contract surface is fixed at deploy time, yet the `FeeRouter` may need replacing (bug fix, structural upgrade) without redeploying `StablePaymentChannel` and forcing every open channel to re-issue vouchers.
+`setFeeRouter` re-points the configured `FeeRouter` for future `settleChannel` calls. Required because the audited contract surface is fixed at deploy time, yet the `FeeRouter` may need replacing (bug fix, structural upgrade) without redeploying `PaymentChannel` and forcing every open channel to re-issue vouchers.
 
 **Authority and timelock.** Only callable by `GOVERNANCE_ROLE` (held by the `TimelockController` post-deploy per [ADR 016 § Post-Deployment Initialization](016-contract-interactions.md#post-deployment-initialization)). `DecdnGovernor` proposals to replace the router execute through the standard 48h timelock per [ADR 009](009-governance.md). Calls outside that path revert.
 
 **Validation.** Reverts on `address(0)` and on the same address as the current `feeRouter`. The new router contract is not interrogated at the setter — the cross-validation invariants in [ADR 016 § Tunable Economics](016-contract-interactions.md#tunable-economics) live on `FeeRouter` itself; replacing the router with a misconfigured deployment surfaces at the next `settleChannel` rather than at the setter.
 
-**Open channels are unaffected.** Vouchers signed against this `StablePaymentChannel` remain valid because the EIP-712 domain separator hashes the contract's own address, not the configured `FeeRouter`. Carve-out documented in [ADR 016 § No proxy deployment patterns](016-contract-interactions.md#no-proxy-deployment-patterns): helper-contract addresses are not domain-separator inputs and may be re-pointed via governance without invalidating signatures.
+**Open channels are unaffected.** Vouchers signed against this `PaymentChannel` remain valid because the EIP-712 domain separator hashes the contract's own address, not the configured `FeeRouter`. Carve-out documented in [ADR 016 § No proxy deployment patterns](016-contract-interactions.md#no-proxy-deployment-patterns): helper-contract addresses are not domain-separator inputs and may be re-pointed via governance without invalidating signatures.
 
 **Settlement during the swap.** Settlements beginning before the timelock executes use the previous router; those beginning after use the new one. `settleChannel` reads `feeRouter()` at call time, and `routeSettlement` is a single transaction, so no in-flight settlement splits across routers.
 
@@ -457,7 +457,7 @@ All events use indexed `channelId` plus an indexed actor field where applicable.
 | Max voucher interval | 1 MB | 1024 MB (~1 GB) |
 | Max channel duration | 604800 seconds (7 days) | 31536000 seconds (365 days) |
 
-`StablePaymentChannel` does not hold a fee-percentage parameter. Bucket-share bounds (40/40/7/5/5/3 + `boostFloor`) are owned by `FeeRouter` per [ADR 026 §11](026-gauge-boost-tokenomics.md#11-governable-parameters-with-safety-bounds).
+`PaymentChannel` does not hold a fee-percentage parameter. Bucket-share bounds (40/40/7/5/5/3 + `boostFloor`) are owned by `FeeRouter` per [ADR 026 §11](026-gauge-boost-tokenomics.md#11-governable-parameters-with-safety-bounds).
 
 **Rate bounds are in USDC base units (6 decimals).** The contract stores a single `RateBounds` struct with `deliveryFloor` and `deliveryCeiling`.
 
@@ -474,7 +474,7 @@ The expected market rate is $0.00001/MB (10 USDC base units per MB, or $0.01/GB)
 
 Nodes must keep their local `RateBounds` copy current so advertised `rate_per_mb` stays within governance-set bounds. Because rate bounds are advisory coordination parameters — the contract does not verify rate compliance during settlement or slashing — the refresh strategy is lighter-touch than the content blacklist ([ADR 011](011-content-takedown.md)), where serving blacklisted content is a slashable offense.
 
-**Primary mechanism: event listening.** Nodes SHOULD subscribe to `RateBoundsUpdated` events on the `StablePaymentChannel` contract and update the local cache immediately. Governance actions are infrequent (days to weeks), so high-frequency polling would be wasteful.
+**Primary mechanism: event listening.** Nodes SHOULD subscribe to `RateBoundsUpdated` events on the `PaymentChannel` contract and update the local cache immediately. Governance actions are infrequent (days to weeks), so high-frequency polling would be wasteful.
 
 **Fallback mechanism: periodic polling.** Nodes MUST poll `getRateBounds()` at a configurable interval (`rate_bounds_poll_interval`, default **1 hour** for PoC), guarding against missed events from RPC provider issues, WebSocket disconnections, or chain reorganizations. The 1-hour default is deliberately longer than the 10-minute registry ([ADR 001](001-network.md)) / blacklist ([ADR 011](011-content-takedown.md)) intervals: registry freshness is connectivity-critical and blacklist freshness slashing-critical, but rate-bounds staleness only risks counterparties rejecting the node's advertised rate.
 
@@ -509,11 +509,11 @@ All `set*` functions are governance-only behind a timelock.
 
 ### FeeRouter Integration
 
-Under [ADR 026](026-gauge-boost-tokenomics.md), `StablePaymentChannel.settleChannel` does not split fees inline. The full operator-bound USDC balance is forwarded to a `FeeRouter` contract, which applies the canonical six-bucket split (40% node base / 40% gauge boost / 7% delegator pool / 5% buyback-and-burn / 5% treasury / 3% safety reserve — full table and bounds in [ADR 026 §2](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553) and [§11](026-gauge-boost-tokenomics.md#11-governable-parameters-with-safety-bounds)). This ADR specifies the `FeeRouter` interface only as it relates to the settlement path; the gauge formula, ve-escrow mechanics, and bucket disbursement schedule live in [ADR 026](026-gauge-boost-tokenomics.md).
+Under [ADR 026](026-gauge-boost-tokenomics.md), `PaymentChannel.settleChannel` does not split fees inline. The full operator-bound USDC balance is forwarded to a `FeeRouter` contract, which applies the canonical six-bucket split (40% node base / 40% gauge boost / 7% delegator pool / 5% buyback-and-burn / 5% treasury / 3% safety reserve — full table and bounds in [ADR 026 §2](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553) and [§11](026-gauge-boost-tokenomics.md#11-governable-parameters-with-safety-bounds)). This ADR specifies the `FeeRouter` interface only as it relates to the settlement path; the gauge formula, ve-escrow mechanics, and bucket disbursement schedule live in [ADR 026](026-gauge-boost-tokenomics.md).
 
 #### Settlement-path interface
 
-`StablePaymentChannel.settleChannel` MUST invoke `FeeRouter.routeSettlement(address operator, uint256 bytesDelivered, uint256 amount, uint64 epochId)` in the same transaction as the USDC `safeTransferFrom` to the router. The router pays the operator's 40% base share in that transaction, dispatches the 5% / 5% / 3% same-tx legs, and increments `bytesPerEpoch[operator][epochId]` for the gauge formula per [ADR 026 §3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula). The full `IFeeRouter` interface is canonical in [ADR 016](016-contract-interactions.md).
+`PaymentChannel.settleChannel` MUST invoke `FeeRouter.routeSettlement(address operator, uint256 bytesDelivered, uint256 amount, uint64 epochId)` in the same transaction as the USDC `safeTransferFrom` to the router. The router pays the operator's 40% base share in that transaction, dispatches the 5% / 5% / 3% same-tx legs, and increments `bytesPerEpoch[operator][epochId]` for the gauge formula per [ADR 026 §3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula). The full `IFeeRouter` interface is canonical in [ADR 016](016-contract-interactions.md).
 
 #### Settlement-path invariants
 
@@ -529,12 +529,12 @@ Conservation, same-tx satellite legs (5%/5%/3%), and epoch-consistency invariant
 
 - Node-to-node settlements use direct peer USDC payment with no router invocation.
 - Implementations distinguish node-to-node from client-to-node settlements via the channel's `client` and `provider` fields cross-referenced against the on-chain registry: if both addresses have a registered NodeId binding (see [NodeId-to-Ethereum Binding](#nodeid-to-ethereum-binding)), the channel is node-to-node; otherwise it is client-to-node.
-- The PoC `StablePaymentChannel` may implement the bypass either by exposing a separate `settleChannelNoRoute(channelId)` entry point usable only when both parties are registered nodes, or by having `settleChannel` detect the case and skip the `FeeRouter` call. Either way the operator-to-operator USDC transfer is direct and bypasses the router's per-epoch USDC accumulators (those bytes were already counted at the client-to-node settlement that paid for them downstream). Gauge eligibility for these bytes is naturally bounded by the [ADR 026 §3 per-operator gauge-share cap](026-gauge-boost-tokenomics.md#per-operator-gauge-share-cap) — even if a colluding operator pair routed bypassed bytes through the gauge counter, each operator-identity's share is capped at 5%.
+- The PoC `PaymentChannel` may implement the bypass either by exposing a separate `settleChannelNoRoute(channelId)` entry point usable only when both parties are registered nodes, or by having `settleChannel` detect the case and skip the `FeeRouter` call. Either way the operator-to-operator USDC transfer is direct and bypasses the router's per-epoch USDC accumulators (those bytes were already counted at the client-to-node settlement that paid for them downstream). Gauge eligibility for these bytes is naturally bounded by the [ADR 026 §3 per-operator gauge-share cap](026-gauge-boost-tokenomics.md#per-operator-gauge-share-cap) — even if a colluding operator pair routed bypassed bytes through the gauge counter, each operator-identity's share is capped at 5%.
 - Permissionless fraud detectors ([Appendix: Fraud Detection](appendix-fraud-detection.md)) can observe node-to-node settlements for self-routed-traffic / wash-trading patterns despite the bypass. The on-chain remedy is the per-operator gauge-share cap; off-chain reputation gauges (ADR 008 §12) consume the observation as a soft signal.
 
 #### Settlement sequence
 
-End-to-end USDC flow (client→node settlement, then the parallel cache-miss bypass) is diagrammed in [ADR 016 §"FeeRouter integration"](016-contract-interactions.md). This ADR documents only the `StablePaymentChannel ↔ FeeRouter` interface contract.
+End-to-end USDC flow (client→node settlement, then the parallel cache-miss bypass) is diagrammed in [ADR 016 §"FeeRouter integration"](016-contract-interactions.md). This ADR documents only the `PaymentChannel ↔ FeeRouter` interface contract.
 
 The full six-bucket split applies to every network deployment from launch. Simplified launch configurations are expressed by setting non-active bucket shares to zero via `FeeRouter.setShares(...)` per [ADR 016 § Tunable Economics](016-contract-interactions.md#tunable-economics), not by deploying a reduced-surface stub. The cross-validation invariant in that section ensures any non-zero share has a wired non-zero destination, so the launch share configuration alone determines which downstream contracts must be ready at deploy time.
 
@@ -554,7 +554,7 @@ bytes32 public immutable DOMAIN_SEPARATOR;
 constructor() {
     DOMAIN_SEPARATOR = keccak256(abi.encode(
         DOMAIN_TYPEHASH,
-        keccak256(bytes("StablePaymentChannel")),   // name
+        keccak256(bytes("PaymentChannel")),   // name
         keccak256(bytes("1")),                      // version
         block.chainid,                              // chainId (L2)
         address(this)                               // verifyingContract
@@ -562,7 +562,7 @@ constructor() {
 }
 ```
 
-The domain separator binds every voucher to a specific contract deployment on a specific chain. A voucher signed for one chain cannot be replayed on another, and a voucher signed for one `StablePaymentChannel` deployment cannot be replayed against an upgraded or redeployed contract at a different address.
+The domain separator binds every voucher to a specific contract deployment on a specific chain. A voucher signed for one chain cannot be replayed on another, and a voucher signed for one `PaymentChannel` deployment cannot be replayed against an upgraded or redeployed contract at a different address.
 
 **Voucher type:**
 
@@ -592,7 +592,7 @@ The `DOMAIN_SEPARATOR` is computed once in the constructor and stored as an immu
 
 Voucher nonces within a channel start at **1**. Nonce 0 is reserved as the sentinel value meaning "no voucher has been submitted" — it is the Solidity default for `claimedNonce` in a newly opened `Channel` struct. The first client-signed voucher in a channel uses `nonce=1`, the second uses `nonce=2`, and so on. This convention ensures:
 
-- `claimedNonce == 0` reliably identifies channels where no voucher has ever been submitted, which is the guard condition for the zero-voucher close path callable by either party (see [Channel griefing](#channel-griefing) and the channel close lifecycle in [StablePaymentChannel](#stablepaymentchannel)).
+- `claimedNonce == 0` reliably identifies channels where no voucher has ever been submitted, which is the guard condition for the zero-voucher close path callable by either party (see [Channel griefing](#channel-griefing) and the channel close lifecycle in [PaymentChannel](#paymentchannel)).
 - Any real voucher (nonce ≥ 1) can always be used to dispute a zero-voucher close (which records `claimedNonce=0`), since `disputeChannel` requires strictly higher nonce.
 
 ### StakingRegistry Modifications

@@ -43,7 +43,7 @@ Adopt the dockerd shape. Two binaries, one shared support crate:
   `parse_hash_arg` live in the `decdn-config-types` leaf crate
   (serde + `url` only — no iroh-blobs, no AWS SDK). `decdn-common`
   therefore does **not** depend on `decdn-cache`, so `decdn` links
-  none of the blob-store/AWS weight (#578). The daemon's `evict`
+  none of the blob-store/AWS weight. The daemon's `evict`
   handler converts the leaf `Hash` to the blob-store hash via
   `decdn_cache::to_store_hash` at its boundary.
 
@@ -69,7 +69,7 @@ A two-crate split (`decdn-config` + `decdn-admin-types`) would buy a
 tighter dep graph, but everything in `decdn-common` is consumed by
 both binaries already, so fragmenting `decdn-common` itself has no
 payoff. The cache-typed `config` fields *were* split out — into the
-`decdn-config-types` leaf crate (#578) — which is the realized form of
+`decdn-config-types` leaf crate — which is the realized form of
 the remedy this section anticipated: extract the shared value types,
 not the crate. `decdn-common` keeps its single-crate shape; the leaf
 just owns the vocabulary types so the CLI links no blob store.
@@ -108,7 +108,7 @@ and would silently miss data on a prefix rename.
   significant CLI change. Soft target ≤ 50 MB stripped (the dockerd
   CLI is ≈ 50 MB). The single largest contributor — `iroh-blobs` and
   the AWS SDK reaching `decdn` via `cli → common → cache` — was
-  removed in #578 by extracting `decdn-config-types`; `decdn` no
+  removed by extracting `decdn-config-types`; `decdn` no
   longer links the blob store or AWS SDK at all (`reqwest`/`iroh`
   remain, via `alloy` and the direct `iroh` dep — not the cache).
   Regression guard: `cargo tree -p decdn-cli -e normal -i iroh-blobs`

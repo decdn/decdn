@@ -58,7 +58,7 @@ The first three rows dominate the decision for a TOKEN-rich, USDC-poor treasury 
 
 ### Buyback inflow source and rate (router-driven per ADR 026)
 
-Under [ADR 026](026-gauge-boost-tokenomics.md), `BuybackBurner` no longer relies on manual treasury transfers. The `FeeRouter` contract receives the full operator USDC balance from `StablePaymentChannel.settleChannel` at every settlement and atomically forwards **5% of routed USDC directly to `BuybackBurner` in the same transaction**, alongside the other fee buckets. The full router split lives in [ADR 026 §2](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553) (six buckets summing to 100%); this ADR cross-references rather than duplicating it.
+Under [ADR 026](026-gauge-boost-tokenomics.md), `BuybackBurner` no longer relies on manual treasury transfers. The `FeeRouter` contract receives the full operator USDC balance from `PaymentChannel.settleChannel` at every settlement and atomically forwards **5% of routed USDC directly to `BuybackBurner` in the same transaction**, alongside the other fee buckets. The full router split lives in [ADR 026 §2](026-gauge-boost-tokenomics.md#2-feerouter-split-40407553) (six buckets summing to 100%); this ADR cross-references rather than duplicating it.
 
 **Implications for this ADR:**
 

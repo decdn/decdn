@@ -76,10 +76,10 @@ The 20% floor on the node-base share is the cashflow invariant defined in [ADR 0
 | Unbonding period | StakingRegistry | 3 days | 30 days |
 | Multiaddr update cooldown | StakingRegistry | 0 (disabled) | 86400 seconds (1 day) |
 | Max multiaddr size | StakingRegistry | 64 bytes | 1024 bytes |
-| Dispute window (default: 48h) | StablePaymentChannel | 12 hours | 72 hours (3 days) |
-| Rate floor/ceiling | StablePaymentChannel | Floor ≥ 1 base unit | Ceiling > floor |
-| Max voucher interval | StablePaymentChannel | 1 MB | 1024 MB (~1 GB) |
-| Min deposit | StablePaymentChannel | 1 base unit | No max |
+| Dispute window (default: 48h) | PaymentChannel | 12 hours | 72 hours (3 days) |
+| Rate floor/ceiling | PaymentChannel | Floor ≥ 1 base unit | Ceiling > floor |
+| Max voucher interval | PaymentChannel | 1 MB | 1024 MB (~1 GB) |
+| Min deposit | PaymentChannel | 1 base unit | No max |
 | Challenge bond | SlashJudge | 1 TOKEN | 1,000 TOKEN |
 | Base slash reset period | StakingRegistry | 30 days | 365 days |
 | Compliance window | ContentBlacklist | 1 hour | 7 days |
