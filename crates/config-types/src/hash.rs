@@ -126,8 +126,11 @@ impl std::fmt::Display for Hash {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Write hex straight to the formatter — no per-call `String`
         // allocation. `{:02x}` is lowercase zero-padded, byte-identical
-        // to `to_hex()`/the serde form (and to `iroh_blobs::Hash`),
-        // which the `hash_bridge_tests` wire-compat test still pins.
+        // to `to_hex()` (the serde path). This is a *second*, independent
+        // hex impl, so the equivalence is pinned explicitly by
+        // `display_and_debug_match_to_hex`; `to_hex()`'s own
+        // byte-identity to `iroh_blobs::Hash` is pinned separately by
+        // `hash_bridge_tests` in `decdn-cache`.
         for byte in &self.0 {
             write!(f, "{byte:02x}")?;
         }
@@ -251,6 +254,27 @@ mod tests {
         assert!(hex.chars().all(|c| c == 'a' || c == 'b'));
         let back: Hash = hex.parse().expect("round-trip");
         assert_eq!(h, back);
+    }
+
+    #[test]
+    fn display_and_debug_match_to_hex() {
+        // `Display`/`Debug` format hex independently of `to_hex()` (the
+        // serde path) — pin their equivalence so the two impls cannot
+        // silently drift. A divergence would split the operator-facing
+        // wire form: admin JSON-RPC (serde → `to_hex`) vs tracing
+        // `%hash` (`Display`). Cover a leading-zero byte and `0xff`.
+        let mut bytes = [0xffu8; 32];
+        if let Some(first) = bytes.first_mut() {
+            *first = 0x00;
+        }
+        for h in [
+            Hash::from_bytes([0u8; 32]),
+            Hash::from_bytes([0xab; 32]),
+            Hash::from_bytes(bytes),
+        ] {
+            assert_eq!(h.to_string(), h.to_hex(), "Display must equal to_hex()");
+            assert_eq!(format!("{h:?}"), h.to_hex(), "Debug must equal to_hex()");
+        }
     }
 
     #[test]
