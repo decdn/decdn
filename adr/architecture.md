@@ -70,12 +70,11 @@ How a client or node finds the right peer for a given hash. The DHT is the prima
 
 ### Chapter 3 — Payments
 
-Off-chain payment channels for per-MB delivery, with on-chain settlement. Multi-token allowlist follows. Client-side architecture and smart-wallet support are included here because client trust boundaries and key management hang off the payment path.
+Off-chain payment channels for per-MB delivery, with on-chain settlement. Client-side architecture and smart-wallet support are included here because client trust boundaries and key management hang off the payment path.
 
 1. [ADR 003 — Payment Model](003-payments.md)
-2. [ADR 010 — Multi-Token Payment Support](010-multi-token.md)
-3. [ADR 012 — Client Architecture, Bootstrap, and Trust Model](012-client.md)
-4. [ADR 024 — Account Abstraction and Safe Smart Wallet Support](024-account-abstraction.md)
+2. [ADR 012 — Client Architecture, Bootstrap, and Trust Model](012-client.md)
+3. [ADR 024 — Account Abstraction and Safe Smart Wallet Support](024-account-abstraction.md)
 
 ### Chapter 4 — Tokenomics & incentives
 
@@ -146,7 +145,6 @@ Numeric per-ADR index. The thematic chapter ordering for top-to-bottom reading l
 - **[ADR 005 — Wire Protocol](005-protocol.md)** — Two core protocols (ALPN-negotiated) plus iroh-gossip. `cdn/client/v1` covers all paid delivery.
 - **[ADR 008 — Reputation System](008-reputation.md)** — Interaction-weighted scoring with gossip propagation; complements the [ADR 026 §3 per-operator gauge-share cap](026-gauge-boost-tokenomics.md#per-operator-gauge-share-cap) as off-chain wash-trading signal.
 - **[ADR 009 — Governance Model](009-governance.md)** — Admin key for PoC; ve-weighted Governor + Timelock with safety bounds for production.
-- **[ADR 010 — Multi-Token Payment Support](010-multi-token.md)** — Token-agnostic payments with governance-managed ERC-20 allowlist. USDC-only for PoC.
 - **[ADR 011 — Content Takedown and Hash Blacklisting](011-content-takedown.md)** — Governance-controlled on-chain hash blacklist with regional bodies and emergency fast-path; per-entry appeals for regional entries via emergency-multisig fast-track + ve-Governor ratification ([§ Blacklist Entry Appeals](011-content-takedown.md#blacklist-entry-appeals)).
 - **[ADR 012 — Client Architecture, Bootstrap, and Trust Model](012-client.md)** — Client bootstrap, key management, identity lifecycle, trust boundary, multi-node parallel download, crash recovery, and file manifests.
 - **[ADR 013 — Schema Evolution](013-schema-evolution.md)** — Varint-length framing, protocol enums, three-tier evolution model.
@@ -190,7 +188,7 @@ The system relies on several infrastructure-level assumptions beyond the cryptog
 
 - **Arbitrum sequencer liveness.** The dispute mechanism assumes forced-inclusion transactions complete within ~24 h ([ADR 003 § L2 sequencer censorship](003-payments.md#l2-sequencer-censorship)). If the sequencer censors dispute transactions beyond this window, a fraudulent close could settle before the honest party responds. Mitigation: PoC dispute window is 48 h (governable 12h–72h), providing at least 24 h of effective response time after worst-case sequencer censorship.
 
-- **ERC-20 token behavior stability.** Governance-approved tokens are assumed not to change behavior post-approval (e.g., a proxy-upgradeable token adding fee-on-transfer). Changed token semantics could break settlement arithmetic or trap funds. Mitigation: PoC is USDC-only, reducing token-surface complexity; production token allowlisting and vetting are governed by ADR 010's [Token Vetting Checklist](010-multi-token.md#token-vetting-checklist).
+- **Payment-token behavior stability.** The payment token is USDC, fixed at deployment as an immutable constructor argument. USDC is a standard ERC-20 (no fee-on-transfer, rebase, or transfer hooks). A Circle-side change to USDC semantics or an address/contract freeze is outside protocol control and is the accepted counterparty risk noted in [ADR 003](003-payments.md).
 
 - **iroh relay availability.** iroh relays are stateless servers that broker NAT traversal and relay encrypted traffic as a fallback when direct peer-to-peer connections fail (~10% of networking conditions). Relays are not CDN protocol participants — they cannot inspect, cache, or modify content (all traffic is end-to-end encrypted). The deCDN does not incentivize relay operators: paying relays per-byte would create a perverse incentive to prevent direct connections from forming. PoC uses n0.computer's public relays (rate-limited, no SLA). Production deployments should self-host dedicated relays as operational infrastructure, funded from protocol treasury or node staking fees — not as an incentivized network role. If direct-connection success rates drop below ~85%, investigate NAT traversal improvements before considering relay incentivization.
 

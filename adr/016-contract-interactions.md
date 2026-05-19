@@ -5,7 +5,7 @@
 
 ## Context
 
-The deCDN deploys multiple interacting smart contracts with cross-contract calls, role-based access control, and funds custody. Individual contracts are specified across [ADR 003](003-payments.md), [ADR 009](009-governance.md), [ADR 010](010-multi-token.md), [ADR 011](011-content-takedown.md), [ADR 014](014-on-chain-verification.md), and [ADR 026](026-gauge-boost-tokenomics.md). However, no single document maps the full interaction surface: who calls whom, which contracts hold funds, who is authorized to do what, and where reentrancy risks exist.
+The deCDN deploys multiple interacting smart contracts with cross-contract calls, role-based access control, and funds custody. Individual contracts are specified across [ADR 003](003-payments.md), [ADR 009](009-governance.md), [ADR 011](011-content-takedown.md), [ADR 014](014-on-chain-verification.md), and [ADR 026](026-gauge-boost-tokenomics.md). However, no single document maps the full interaction surface: who calls whom, which contracts hold funds, who is authorized to do what, and where reentrancy risks exist.
 
 This ADR consolidates that analysis into a single reference for security audits and implementation. It does not introduce new functionality — it systematizes what other ADRs already specify.
 
@@ -21,7 +21,7 @@ All on-chain contracts inherit from [OpenZeppelin Contracts](https://docs.openze
 | --- | --- | --- | --- | --- |
 | TOKEN (ERC-20) | [026](026-gauge-boost-tokenomics.md) | No (fungible token) | — | `ERC20`, `ERC20Permit`, `ERC20Votes` (fixed-supply per [ADR 026](026-gauge-boost-tokenomics.md) §1; no post-genesis mint function) |
 | StakingRegistry | [003](003-payments.md), [026](026-gauge-boost-tokenomics.md) | Yes | TOKEN | `AccessControl`, `ReentrancyGuard`, `Pausable`, `EIP712` (includes `isActive(operator)` per [ADR 003](003-payments.md) `IStakingRegistry`) |
-| StablePaymentChannel | [003](003-payments.md) | Yes | USDC | `Ownable`, `ReentrancyGuard`, `Pausable`, `EIP712` (USDC-only; `settleChannel` forwards full balance to `FeeRouter.routeSettlement` rather than skimming inline; multi-token `PaymentChannel` per [ADR 010](010-multi-token.md) is deferred) |
+| StablePaymentChannel | [003](003-payments.md) | Yes | USDC | `Ownable`, `ReentrancyGuard`, `Pausable`, `EIP712` (USDC-only; the USDC address is fixed at deployment; `settleChannel` forwards full balance to `FeeRouter.routeSettlement` rather than skimming inline) |
 | FeeRouter | [026](026-gauge-boost-tokenomics.md) | Yes | USDC (transient + epoch buckets), TOKEN (delegator-pool epoch buckets) | `AccessControl`, `ReentrancyGuard`, `Pausable` |
 | VotingEscrow | [026](026-gauge-boost-tokenomics.md) | Yes | TOKEN (locked, non-transferable) | `ReentrancyGuard`, `Pausable` |
 | SafetyReserve | [026](026-gauge-boost-tokenomics.md), [028](028-slashing-appeals.md) | Yes | USDC (3% bucket + slashing redirect), TOKEN (transient until keeper swap) | `AccessControl`, `ReentrancyGuard`, `Pausable` (includes [ADR 028](028-slashing-appeals.md) appeal extensions: `openSlashAppeal` / `fastTrackAppeal` / `rejectAppeal` / `ratifyAppeal` / `reverseAppeal`) |
@@ -603,7 +603,7 @@ flowchart TD
 
 | Contract | Token | Source | Release Condition |
 | --- | --- | --- | --- |
-| StablePaymentChannel | USDC | Client deposits | `settleChannel()`, `reclaimExpired()`, `forceCloseChannel()` |
+| StablePaymentChannel | USDC | Client deposits | `settleChannel()`, `reclaimExpired()` |
 | FeeRouter | USDC (gauge + delegator epoch buckets, transient base/treasury/burn/safety legs); TOKEN (delegator-pool epoch buckets after USDC→TOKEN swap) | `StablePaymentChannel.settleChannel` | `claimBoost(epochs[])` (operators); `claimDelegator(epochs[])` (ve-lockers); same-tx forwards to BuybackBurner / Treasury / SafetyReserve / operator base; 26-epoch claim window then sweep to treasury |
 | VotingEscrow | TOKEN (locked, non-transferable) | User `createLock` deposits | `withdraw()` after lock expiry only; no early exit, no `create_lock_for` privileged path ([ADR 026](026-gauge-boost-tokenomics.md) §4) |
 | SafetyReserve | USDC (3% router bucket; primary holding) + TOKEN (30% slashing redirect; swapped to USDC via keeper) | `FeeRouter`, `StakingRegistry` slashing path | `payout(bundle, recipient, amount)` USDC-only after evidence bundle, Governor (or emergency-multisig within hard caps), and 48h appeal window ([ADR 026](026-gauge-boost-tokenomics.md) §5) |
@@ -621,7 +621,7 @@ All role-based access uses OpenZeppelin `AccessControl`. The `DEFAULT_ADMIN_ROLE
 
 #### Additive contract surface
 
-New top-level contracts integrate with the launch-time set via standard `AccessControl` role grants — governance can grant new roles or revoke existing ones via the standard 7-day vote + 48-hour timelock path, without contract changes, state migration, or redeploy of the existing contracts. The launch-time interface surface (function signatures and events on `StablePaymentChannel` / `PaymentChannel`, `FeeRouter`, `SafetyReserve`, `StakingRegistry`, `BuybackBurner`, `VotingEscrow`, `SlashJudge`) is treated as stable for cross-contract integration. Concretely: `openChannel` is permissionless, `SafetyReserve.payout(bundleHash, recipient, amount)` accepts arbitrary evidence-bundle hashes (per [ADR 026 §5](026-gauge-boost-tokenomics.md#5-safety-and-insurance-reserve-3-bucket)), TOKEN is `ERC20Burnable` (per [ADR 026 §1](026-gauge-boost-tokenomics.md#1-supply-and-distribution)), and no contract is locked to a specific set of integrators. Future contract surfaces deploy as additive top-level contracts, not as upgrades or migrations of the launch set.
+New top-level contracts integrate with the launch-time set via standard `AccessControl` role grants — governance can grant new roles or revoke existing ones via the standard 7-day vote + 48-hour timelock path, without contract changes, state migration, or redeploy of the existing contracts. The launch-time interface surface (function signatures and events on `StablePaymentChannel`, `FeeRouter`, `SafetyReserve`, `StakingRegistry`, `BuybackBurner`, `VotingEscrow`, `SlashJudge`) is treated as stable for cross-contract integration. Concretely: `openChannel` is permissionless, `SafetyReserve.payout(bundleHash, recipient, amount)` accepts arbitrary evidence-bundle hashes (per [ADR 026 §5](026-gauge-boost-tokenomics.md#5-safety-and-insurance-reserve-3-bucket)), TOKEN is `ERC20Burnable` (per [ADR 026 §1](026-gauge-boost-tokenomics.md#1-supply-and-distribution)), and no contract is locked to a specific set of integrators. Future contract surfaces deploy as additive top-level contracts, not as upgrades or migrations of the launch set.
 
 #### Role Assignments
 
@@ -677,7 +677,6 @@ Every state-mutating function that makes an external call is listed below with i
 | `topUp()` | `IERC20.safeTransferFrom()` | `nonReentrant`, checks-effects-interactions |
 | `settleChannel()` | `IERC20.safeTransfer()` (unused balance to client), `FeeRouter.routeSettlement(operator, bytesDelivered, amount, epochId)` (full operator balance forwarded; FeeRouter performs the six-way split internally) | `nonReentrant`, checks-effects-interactions; FeeRouter is `nonReentrant`-guarded on `routeSettlement` to defend against re-entry through the operator-base `safeTransfer` |
 | `reclaimExpired()` | `IERC20.safeTransfer()` | `nonReentrant`, checks-effects-interactions |
-| `forceCloseChannel()` | None (state change only) | N/A |
 
 #### StakingRegistry
 
@@ -770,15 +769,9 @@ No external calls; no funds held. `nonReentrant` is not required but is included
 
 The contract holds no funds. It maintains an `EnumerableSet` of currently-authorized operators per namespace, plus the bootstrap state for the default-open allow-list (`bool defaultOpenAllowlistActive`, `uint64 defaultOpenActivatedAt`). The first non-empty default-open activation flips `defaultOpenAllowlistActive` to `true` permanently, sets `defaultOpenActivatedAt` to that block's timestamp, and emits `DefaultOpenAllowlistActivated`. Until that moment, `isAuthorizedOrigin(0, op)` returns `true` for any active staker (permissive bootstrap). Off-chain consumers of `getOrigins(namespaceId)` cross-reference each returned operator against `ContentBlacklist.isOriginBlacklisted` and treat blacklisted entries as unauthorized regardless of stale `OriginAssignment` state, so storage cleanup via `pruneBlacklistedAssignment` is a lazy optimisation rather than a security primitive.
 
-#### Multi-Token Reentrancy Considerations (deferred per [ADR 010](010-multi-token.md))
+#### Payment-Channel Reentrancy
 
-The future multi-token `PaymentChannel` rewrite per [ADR 010](010-multi-token.md) will accept arbitrary governance-approved ERC-20s. The current `StablePaymentChannel` is USDC-only, so this section applies only to the eventual multi-token deployment. Even with `SafeERC20` and `nonReentrant`, governance must vet tokens before allowlisting:
-
-- **Reject:** Fee-on-transfer tokens, rebase tokens, pausable tokens, tokens with transfer hooks (ERC-777) that could re-enter
-- **Accept:** Standard IERC20 tokens with no callback mechanisms
-- **Mitigations in contract code:** `nonReentrant` blocks all re-entry regardless of token behavior; `SafeERC20` handles non-reverting transfers and missing return values
-
-All ERC-20 interactions use OpenZeppelin `SafeERC20` to handle non-standard token implementations ([ADR 003](003-payments.md), [ADR 010](010-multi-token.md)).
+`StablePaymentChannel` moves USDC on `openChannel`, `topUp`, `settleChannel`, and `reclaimExpired`. All such functions use `nonReentrant` guards and follow checks-effects-interactions, and all ERC-20 interactions use OpenZeppelin `SafeERC20` ([ADR 003](003-payments.md)). The payment token is USDC, fixed at deployment — a standard ERC-20 with no fee-on-transfer, rebase, default-pausable, or transfer-hook behavior.
 
 ### 7. OpenZeppelin Framework Usage
 
@@ -817,7 +810,7 @@ The contract surface is identical at launch and at steady state — every contra
 | `TOKEN` supply | 1B fixed at genesis; no mint function | Same |
 | Minimum stake | 50,000 TOKEN per [ADR 026](026-gauge-boost-tokenomics.md) §7 | Same |
 
-**No contract migration is planned.** Tunable parameters and governance-mutable dependency addresses (per [§ Tunable Economics](#tunable-economics)) carry the system from launch to steady state without redeployment. The future multi-token `PaymentChannel` rewrite per [ADR 010](010-multi-token.md) is the one acknowledged exception, and is independently deferred.
+**No contract migration is planned.** Tunable parameters and governance-mutable dependency addresses (per [§ Tunable Economics](#tunable-economics)) carry the system from launch to steady state without redeployment.
 
 ## Consequences
 
@@ -830,15 +823,14 @@ The contract surface is identical at launch and at steady state — every contra
 
 ### Negative
 
-- Must be kept in sync as other ADRs evolve — any change to contract interfaces in ADRs 003, 009, 010, 011, 014, or 026 requires updating this document
+- Must be kept in sync as other ADRs evolve — any change to contract interfaces in ADRs 003, 009, 011, 014, or 026 requires updating this document
 - Does not cover off-chain interaction patterns (voucher exchange, gossip, probing) — those remain in their respective ADRs
 - The contract surface includes three fund-holding contracts (`FeeRouter`, `VotingEscrow`, `SafetyReserve`) plus optional `DelegatorBuyer`, materially expanding audit scope
 
 ## References
 
-- [ADR 003 — Payment Model](003-payments.md): StablePaymentChannel specification, production `PaymentChannel.settleChannel` → `FeeRouter` routing
+- [ADR 003 — Payment Model](003-payments.md): StablePaymentChannel specification, `StablePaymentChannel.settleChannel` → `FeeRouter` routing
 - [ADR 009 — Governance Model](009-governance.md): Safety bounds, Governor, emergency multisig
-- [ADR 010 — Multi-Token Payment Support](010-multi-token.md): PaymentChannel, token allowlist
 - [ADR 002 — Content Addressing](002-content-addressing.md): PublisherRegistry, namespaces, content claims
 - [ADR 011 — Content Takedown](011-content-takedown.md): ContentBlacklist, origin ejection, OriginAssignment, DAO origin authority
 - [ADR 014 — On-Chain Verification](014-on-chain-verification.md): SlashJudge, challenge bonds

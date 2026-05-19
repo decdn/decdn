@@ -118,7 +118,7 @@ The node process MUST complete all of the following steps before opening any QUI
 
 #### Step 3.1 — Fetch rate bounds
 
-Call `StablePaymentChannel.getRateBounds()` (PoC) or `PaymentChannel.getRateBounds(token)` (production). Verify that both `deliveryFloor` and `deliveryCeiling` fit in `u64` (see [ADR 003 § Startup](003-payments.md#rate-bounds-refresh)). If either value exceeds `u64::MAX`, the node MUST refuse to start and log an error.
+Call `StablePaymentChannel.getRateBounds()`. Verify that both `deliveryFloor` and `deliveryCeiling` fit in `u64` (see [ADR 003 § Startup](003-payments.md#rate-bounds-refresh)). If either value exceeds `u64::MAX`, the node MUST refuse to start and log an error.
 
 The node SHOULD subscribe to on-chain `RateBoundsUpdated` events for real-time updates. Periodic polling (`rate_bounds_poll_interval`, default 1 hour) is the fallback ([ADR 003](003-payments.md)).
 

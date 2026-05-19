@@ -1,7 +1,7 @@
 # ADR 026: Gauge-Boost Tokenomics
 
 **Date:** 2026-04-25
-**Status:** Locked-for-implementation
+**Status:** Draft
 
 ## Context
 
@@ -56,7 +56,7 @@ Bootstrap supply-side incentive is funded externally via $1M+ pre-seed USDC capi
 
 ### 2. FeeRouter split (40/40/7/5/5/3)
 
-`FeeRouter` receives the full operator USDC balance from `PaymentChannel.settleChannel` and atomically splits it into six buckets. `PaymentChannel` does not skim a protocol fee inline; all bucket distribution happens in `FeeRouter`. The bucket structure (six buckets, the named categories below, sum-to-100% invariant) is fixed at the contract level; **the share percentages themselves are governance-tunable** via `FeeRouter.setShares(...)` per [ADR 016 § Tunable Economics](016-contract-interactions.md#tunable-economics) so the network can launch with a simplified split (e.g. `80/0/0/10/10/0`) and dial up gauge / delegator / safety as their dependency contracts are wired in.
+`FeeRouter` receives the full operator USDC balance from `StablePaymentChannel.settleChannel` and atomically splits it into six buckets. `StablePaymentChannel` does not skim a protocol fee inline; all bucket distribution happens in `FeeRouter`. The bucket structure (six buckets, the named categories below, sum-to-100% invariant) is fixed at the contract level; **the share percentages themselves are governance-tunable** via `FeeRouter.setShares(...)` per [ADR 016 § Tunable Economics](016-contract-interactions.md#tunable-economics) so the network can launch with a simplified split (e.g. `80/0/0/10/10/0`) and dial up gauge / delegator / safety as their dependency contracts are wired in.
 
 | Destination | Steady-state share | Unit | Distribution mechanic |
 | --- | ---: | --- | --- |
@@ -460,7 +460,7 @@ interface ISafetyReserve {
 
 **Notes:**
 
-- **USDC-only payouts.** `usdcAmount` is named explicitly so the constraint is visible in the storage layout and on every `Paid` event. If a future ADR ever motivates multi-currency payouts, the additive shape is a `tokenOut` field plus an allowlist setter — no breaking change to existing `Incident` storage.
+- **USDC-only payouts.** `usdcAmount` is named explicitly so the constraint is visible in the storage layout and on every `Paid` event.
 - **Governor and emergency-multisig addresses are governance-mutable.** The `setGovernor` / `setEmergencyMultisig` setters allow the eventual handover from the deployer EOA to `TimelockController` (per [ADR 016 § Post-Deployment Initialization](016-contract-interactions.md#post-deployment-initialization)) and any future re-pointing without contract redeployment. The 48h timelock constraint applies via `GOVERNANCE_ROLE`.
 - **Appeal extensions are signature stubs.** This interface pins the function names and parameter types; the full state machine (`Open` → `FastTracked` / `Rejected` → `Ratified` / `Reversed` / `Lapsed`), window timing (filing, multisig review, ratification), and bond/restitution caps live in [ADR 028 §6](028-slashing-appeals.md#6-contract-surface).
 
