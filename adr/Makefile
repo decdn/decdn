@@ -164,7 +164,7 @@ check-no-section-numbers:
 	@bad=""; for f in $(SRCS_REF); do \
 	  hits=$$( { grep -nE '§ ?[0-9]' "$$f" \
 	      | grep -vE '(RFC|EIP|BIP)[ -]?[0-9]+,? *§' | sed "s|^|$$f:|"; \
-	    awk -v F="$$f" '/^```/{c=!c;next} c{next} /^#+ [0-9]+\.?[0-9.]* /{print F":"FNR": "$$0}' "$$f"; \
+	    awk -v F="$$f" '/^```/{c=!c;next} c{next} /^#+ [0-9]+\. |^#+ [0-9]+\.[0-9]/{print F":"FNR": "$$0}' "$$f"; \
 	  } || true); \
 	  if [ -n "$$hits" ]; then printf '%s\n' "$$hits"; bad=1; fi; \
 	done; \
