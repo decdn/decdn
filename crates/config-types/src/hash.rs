@@ -124,13 +124,20 @@ impl FromStr for Hash {
 
 impl std::fmt::Display for Hash {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.to_hex())
+        // Write hex straight to the formatter — no per-call `String`
+        // allocation. `{:02x}` is lowercase zero-padded, byte-identical
+        // to `to_hex()`/the serde form (and to `iroh_blobs::Hash`),
+        // which the `hash_bridge_tests` wire-compat test still pins.
+        for byte in &self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
     }
 }
 
 impl std::fmt::Debug for Hash {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.to_hex())
+        std::fmt::Display::fmt(self, f)
     }
 }
 
