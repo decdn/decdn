@@ -8,7 +8,7 @@ A node operator routinely holds three keys:
 
 | Key | Curve / scheme | Purpose | Where it lives |
 |-----|----------------|---------|----------------|
-| **iroh node-key** | Ed25519 | Wire identity (`NodeId`); authenticates the iroh QUIC handshake and signs `NodeAnnounce` gossip ([ADR 005](005-protocol.md#adr-005-wire-protocol)). `ProbeResponse`/`StreamResponse` body attribution moved to `slash_sig` — see [ADR 014 §1](014-on-chain-verification.md#1-slash-signatures--secp256k1-eip-712). | iroh keystore on the signing host |
+| **iroh node-key** | Ed25519 | Wire identity (`NodeId`); authenticates the iroh QUIC handshake and signs `NodeAnnounce` gossip ([ADR 005](005-protocol.md#adr-005-wire-protocol)). `ProbeResponse`/`StreamResponse` body attribution moved to `slash_sig` — see [ADR 014 § Slash Signatures — secp256k1 EIP-712](014-on-chain-verification.md#1-slash-signatures--secp256k1-eip-712). | iroh keystore on the signing host |
 | **Ethereum signing key** | secp256k1 | On-chain identity for staking, channel ops, voucher receipt. Signs EIP-712 `BindNodeId`/`bindingSignature` ([ADR 003 § NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)) **and** `slash_sig` on every `ProbeResponse`/`StreamResponse` ([ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)); the latter's hot-signing burden motivates the production session-key path. | EVM keystore (EOA) **or** Safe owner key (PoC 1-of-1) **or** session key delegated by a Safe (production §3 of [ADR 024](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support)) |
 | **Slash-sig session key** *(production only)* | secp256k1 | Per-message hot-signing of `slash_sig` digests on `ProbeResponse`/`StreamResponse` at wire speed under a 2-of-3 Safe; authorized via `erc7579/smartsessions` ([ADR 024](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support) §3). Client-side voucher session keys (also production, also smartsessions) are a separate client-owned concern. | Signing host, scoped by the session-key policy |
 
@@ -100,7 +100,7 @@ cast code <addr>      # EOA → returns 0x ; Safe → returns deployed proxy cod
 
 ### 2.1 EOA → EOA migration (PoC default)
 
-**No rebinding API exists for the on-chain Ethereum address.** The address is the stake owner — to rotate, move the entire identity. Expect downtime and loss of `firstRegisteredAt` (cold-start bootstrap signal in [ADR 008 §10](008-reputation.md#10-cold-start-bootstrap)).
+**No rebinding API exists for the on-chain Ethereum address.** The address is the stake owner — to rotate, move the entire identity. Expect downtime and loss of `firstRegisteredAt` (cold-start bootstrap signal in [ADR 008 § Cold-Start Bootstrap](008-reputation.md#10-cold-start-bootstrap)).
 
 Procedure:
 
