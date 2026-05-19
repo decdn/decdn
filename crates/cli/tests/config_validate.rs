@@ -132,6 +132,47 @@ fn validate_fails_when_config_flag_points_at_missing_file() -> anyhow::Result<()
     Ok(())
 }
 
+// Three independent problems across three sections: missing rpc_url,
+// max_blob_size_mb >= cache_size_mb, and rate_per_mb = 0.
+const MULTI_ERROR: &str = r#"
+[blockchain]
+payment_channel_address = "0x0000000000000000000000000000000000000001"
+staking_registry_address = "0x0000000000000000000000000000000000000002"
+slash_judge_address = "0x0000000000000000000000000000000000000003"
+
+[cache]
+cache_size_mb = 100
+max_blob_size_mb = 500
+
+[payment]
+rate_per_mb = 0
+
+[gossip]
+subscribe_global = false
+"#;
+
+#[test]
+fn validate_emits_all_problems_at_once() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let path = write_config(&dir, MULTI_ERROR)?;
+    fs::write(dir.path().join("keystore.json"), "")?;
+    let err = commands::config_validate(Some(&path), &args(dir.path())?)
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("expected validation to fail"))?;
+    let msg = format!("{err:#}");
+    anyhow::ensure!(
+        msg.contains("configuration has 3 problem(s):"),
+        "expected aggregated header: {msg}"
+    );
+    for needle in ["rpc_url", "max_blob_size_mb", "rate_per_mb"] {
+        anyhow::ensure!(
+            msg.contains(needle),
+            "aggregated error should name {needle}: {msg}"
+        );
+    }
+    Ok(())
+}
+
 // -- tests for the `effective_source` helper ------------------------------
 
 #[test]
