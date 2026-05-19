@@ -19,10 +19,12 @@ Terms used across multiple ADRs without inline definition.
 
 | Term | Definition |
 | --- | --- |
-| **Channel** | An off-chain payment channel between a client and a node. Funded with USDC, settled on-chain after the dispute window — see [ADR 003](003-payments.md). |
-| **Voucher** | A signed off-chain payment message: `{channelId, amount, nonce, token, signature}`. The bearer instrument for per-MB payments. |
-| **TOKEN** | The protocol's native fixed-supply (1B) ERC-20. Used for staking, governance, gauge-boost, and slashing — see [ADR 026](026-gauge-boost-tokenomics.md). |
-| **USDC** | The payment-and-settlement currency. All channel deposits, fee distribution, and the externally-raised pre-seed pool are USDC-denominated — see [ADR 003](003-payments.md), [ADR 026](026-gauge-boost-tokenomics.md). |
+| **Payment token** | The dual-currency model's settlement asset: the currency clients pay in and operators are paid in. The concrete asset is **USDC**, fixed at contract deployment (immutable, 6 decimals) — see [ADR 003](003-payments.md). This is the canonical term used throughout the spec for the channel-deposit, voucher, and fee-distribution currency; "USDC" appears only where a USDC-specific property is load-bearing (decimals, Circle counterparty risk, on-chain identifiers, swap pairs, dollar-denominated constants). |
+| **Governance token** | The dual-currency model's staking/governance/gauge asset. The concrete asset is **TOKEN**, the protocol's native fixed-supply (1B) `ERC20Burnable` — see [ADR 026](026-gauge-boost-tokenomics.md). "TOKEN" is used as the asset symbol/unit; "governance token" is the role term. Distinct from the payment token; never interchangeable. |
+| **Channel** | An off-chain payment channel between a client and a node. Funded with the payment token, settled on-chain after the dispute window — see [ADR 003](003-payments.md). |
+| **Voucher** | A signed off-chain payment message: `{channelId, amount, nonce, token, signature}` (the `token` field is the payment-token contract address, bound for cross-contract replay protection). The bearer instrument for per-MB payments. |
+| **TOKEN** | The concrete governance token: the protocol's native fixed-supply (1B) ERC-20. Used for staking, governance, gauge-boost, and slashing — see [ADR 026](026-gauge-boost-tokenomics.md). |
+| **USDC** | The concrete payment token. Fixed at deployment; all channel deposits, fee distribution, and the externally-raised pre-seed pool are USDC-denominated — see [ADR 003](003-payments.md), [ADR 026](026-gauge-boost-tokenomics.md). |
 
 ## Tokenomics & incentives
 
