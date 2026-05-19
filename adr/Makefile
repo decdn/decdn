@@ -11,7 +11,7 @@
 #                          # the hand-maintained reading-order list below
 #   make check-bare-refs        # fail on any bare (un-linked) ADR reference
 #   make check-md-anchors       # fail on ADR cross-links missing a #anchor
-#   make check-section-spacing  # fail on bad § spacing (§3 / § Word)
+#   make check-no-section-numbers # fail on numeric §N refs or numbered headings
 #   make check-refs             # all three reference-hygiene guards above
 #
 # This Makefile is the single source of truth for the build invocation;
@@ -87,7 +87,7 @@ BOOK_SRCS := \
 DENSITY_CFG := _build/book-density.typ _build/book-margins.yaml _build/table-autofit.lua
 
 .DEFAULT_GOAL := all
-.PHONY: all numeric book clean help check-book-list check-bare-refs check-md-anchors check-section-spacing check-refs
+.PHONY: all numeric book clean help check-book-list check-bare-refs check-md-anchors check-no-section-numbers check-refs
 
 all: adrs.pdf adrs-book.pdf
 
@@ -132,8 +132,9 @@ check-book-list:
 #   check-md-anchors     : every cross-ADR *.md link must carry a #heading
 #                          anchor, so a retitled/renamed ADR breaks the link
 #                          (drift caught) vs silently pointing at the wrong file.
-#   check-section-spacing: §3 for numbered sections, § Word for named ones
-#                          (locks in the #599 § normalization).
+#   check-no-section-numbers: no numeric §N refs and no numbered headings
+#                          (### N. Title) anywhere — sections are referenced
+#                          by NAME only. Scans code too; RFC/EIP/BIP § exempt.
 SRCS_REF := architecture.md $(NUMERIC_SRCS) $(APPENDIX_SRCS) glossary.md
 
 check-bare-refs:
@@ -159,18 +160,20 @@ check-md-anchors:
 	  exit 1; \
 	else echo "all ADR cross-links carry a #anchor"; fi
 
-check-section-spacing:
+check-no-section-numbers:
 	@bad=""; for f in $(SRCS_REF); do \
-	  hits=$$(awk -v F="$$f" '/^```/{c=!c;next} c{next} {print F":"FNR": "$$0}' "$$f" \
-	    | grep -E '§ +[0-9]|§[A-Za-z]' || true); \
+	  hits=$$( { grep -nE '§ ?[0-9]' "$$f" \
+	      | grep -vE '(RFC|EIP|BIP)[ -]?[0-9]+,? *§' | sed "s|^|$$f:|"; \
+	    awk -v F="$$f" '/^```/{c=!c;next} c{next} /^#+ [0-9]+\.?[0-9.]* /{print F":"FNR": "$$0}' "$$f"; \
+	  } || true); \
 	  if [ -n "$$hits" ]; then printf '%s\n' "$$hits"; bad=1; fi; \
 	done; \
 	if [ -n "$$bad" ]; then \
-	  echo "ERROR: bad § spacing above — numbered sections use §3 (no space), named sections use § Word (one space)"; \
+	  echo "ERROR: numeric §N reference(s) or numbered heading(s) above — reference sections by NAME ([... § Section Name](file.md#anchor)) and drop heading numbers (RFC/EIP/BIP § exempt)"; \
 	  exit 1; \
-	else echo "§ spacing normalized (§N for numbers, § Word for names)"; fi
+	else echo "no numeric §N refs or numbered headings (RFC/EIP/BIP § exempt)"; fi
 
-check-refs: check-bare-refs check-md-anchors check-section-spacing
+check-refs: check-bare-refs check-md-anchors check-no-section-numbers
 
 help:
 	@echo "make            build both PDFs (mermaid-rendered)"
@@ -181,5 +184,5 @@ help:
 	@echo "make check-book-list   verify the reading-order list is complete"
 	@echo "make check-bare-refs        fail on any bare (un-linked) ADR reference"
 	@echo "make check-md-anchors       fail on ADR links missing a #anchor"
-	@echo "make check-section-spacing  fail on bad § spacing (§3 / § Word)"
+	@echo "make check-no-section-numbers  fail on numeric §N refs / numbered headings"
 	@echo "make check-refs             run all reference-hygiene guards"

@@ -14,13 +14,13 @@ The local blob cache holds pulled content; certain entries must be exempt from e
 4. **Probe-hold interaction** — how does the [ADR 005](005-protocol.md#probe-triggered-eviction-hold) hold layer compose with cache-pressure eviction?
 5. **Cache size enforcement** — what triggers eviction, and what is the unit?
 
-The existing implementation in `crates/cache/src/engine.rs` already commits to LRU (the concrete symbols and config keys are catalogued in §1); the driver loop that consumes `CacheEngine::eviction_candidates()` is specified in §7, its implementation pending. The hold-queue / cache-size interaction is already specified in [ADR 005 § Hold Budget](005-protocol.md#hold-budget) (`max_probe_holds = 256`, recommended ≤ 25 % of cache capacity) — this appendix cross-references it.
+The existing implementation in `crates/cache/src/engine.rs` already commits to LRU (the concrete symbols and config keys are catalogued in [§ Eviction key](#eviction-key)); the driver loop that consumes `CacheEngine::eviction_candidates()` is specified in [§ Eviction driver loop](#eviction-driver-loop), its implementation pending. The hold-queue / cache-size interaction is already specified in [ADR 005 § Hold Budget](005-protocol.md#hold-budget) (`max_probe_holds = 256`, recommended ≤ 25 % of cache capacity) — this appendix cross-references it.
 
 ## Decision
 
 The blob cache uses **least-recently-used (LRU) eviction** keyed on the `Instant` of the last successful `CacheEngine::get` (refreshed on both the cache-hit path and the post-pull-through path). Pinned hashes are exempt from LRU; operator-evicted hashes are durably hidden orthogonally to LRU; probe-hold-marked hashes defer to [ADR 005](005-protocol.md#adr-005-wire-protocol). Reputation does not factor into eviction.
 
-### 1. Eviction key
+### Eviction key
 
 Each in-cache hash carries a `last_accessed: Instant` (`access_times: Mutex<HashMap<Hash, Instant>>`, `crates/cache/src/engine.rs:36`) updated on every successful `CacheEngine::get` — both the cache-hit path and the post-pull-through path call `touch`. `has`, `probe`, and `is_pinned` lookups do NOT refresh. When the local cache footprint exceeds `cache_size_mb`, the eviction driver picks the smallest-`last_accessed` candidate from `CacheEngine::eviction_candidates()` (`crates/cache/src/engine.rs:839`, an LRU snapshot with pinned hashes filtered out) and removes it via the cache engine's removal path. This matches the existing `crates/cache/src/engine.rs` implementation.
 
@@ -34,29 +34,29 @@ Once the eviction-driver loop is wired, it MUST honour the candidate-snapshot se
 
 **Why `last_accessed` and not insertion time.** Insertion-time eviction (FIFO) discards hot blobs the moment they age past their freshness threshold — exactly wrong for a CDN cache. Refreshing on every hit makes "recently useful" the survival signal: standard LRU any operator already understands.
 
-### 2. Operator pinning overrides LRU
+### Operator pinning overrides LRU
 
-Hashes in the operator-pinned set (`pinned: ArcSwap<HashSet<Hash>>` at `crates/cache/src/engine.rs`) are filtered out of `CacheEngine::eviction_candidates()` and therefore never appear as LRU victims. The pin set is reloaded atomically on SIGHUP. Pinning does NOT refresh `last_accessed`; if a pin is later removed the hash re-enters the LRU pool with whatever timestamp it last saw on a `get` — the right behaviour: recently-served pins survive briefly, long-stale pins go to the front of the eviction queue. The interaction is **one-way**: pinning protects against LRU but NOT against operator `evict()` — see §3.
+Hashes in the operator-pinned set (`pinned: ArcSwap<HashSet<Hash>>` at `crates/cache/src/engine.rs`) are filtered out of `CacheEngine::eviction_candidates()` and therefore never appear as LRU victims. The pin set is reloaded atomically on SIGHUP. Pinning does NOT refresh `last_accessed`; if a pin is later removed the hash re-enters the LRU pool with whatever timestamp it last saw on a `get` — the right behaviour: recently-served pins survive briefly, long-stale pins go to the front of the eviction queue. The interaction is **one-way**: pinning protects against LRU but NOT against operator `evict()` — see [§ Operator-evict is orthogonal to LRU](#operator-evict-is-orthogonal-to-lru).
 
-### 3. Operator-evict is orthogonal to LRU
+### Operator-evict is orthogonal to LRU
 
 `CacheEngine::evict(hash)` (`crates/cache/src/engine.rs:568`) is the DMCA / corruption-recovery path. It writes the hash into the in-memory `evicted: Mutex<HashSet<Hash>>` and appends to `<cache_dir>/evicted.log` with `fsync`, so the eviction survives a process restart. `CacheEngine::has` and `CacheEngine::get` short-circuit to "not present" for any evicted hash, regardless of whether the bytes still live in the iroh-blobs store (iroh-blobs 0.99 exposes no public delete; disk-byte reclaim happens on the next GC sweep once it ships one).
 
 The two layers compose cleanly: LRU eviction is *ephemeral cache pressure* (a victim selected by the driver loop); operator eviction is a *durable operator directive* (a hash hidden permanently). LRU eviction does not append to `evicted.log`; operator eviction does not consult `last_accessed`. Pinning protects against LRU but loses to operator evict — DMCA always wins.
 
-### 4. Probe-hold integration defers to [ADR 005](005-protocol.md#adr-005-wire-protocol)
+### Probe-hold integration defers to [ADR 005](005-protocol.md#adr-005-wire-protocol)
 
 Hashes for which the node has signed `has_blob: true` within the last `probe_hold_duration` (35 s) are eviction-exempt for that window, per [ADR 005 § Probe-Triggered Eviction Hold](005-protocol.md#probe-triggered-eviction-hold). The hold layer composes above LRU: a held hash is invisible to the LRU driver until the hold expires. Concurrent holds are bounded by `max_probe_holds` (default 256) per [ADR 005 § Hold Budget](005-protocol.md#hold-budget); when the budget is exhausted the node responds `has_blob: false` rather than evict-and-slash. Operators sizing small caches SHOULD keep `max_probe_holds ≤ 25 %` of cache capacity (the § Hold Budget recommendation).
 
-This appendix adds nothing to the hold mechanism itself — a separate layer with its own ADR and metrics. DHT-record retraction ([ADR 022 §1.4 Content Records and TTL](022-content-discovery.md#14-content-records-and-ttl)) is similarly downstream: a node stops re-publishing on eviction; stale records self-expire within TTL with no explicit retraction.
+This appendix adds nothing to the hold mechanism itself — a separate layer with its own ADR and metrics. DHT-record retraction ([ADR 022 § Content Records and TTL](022-content-discovery.md#content-records-and-ttl)) is similarly downstream: a node stops re-publishing on eviction; stale records self-expire within TTL with no explicit retraction.
 
-### 5. Reputation does not factor into eviction
+### Reputation does not factor into eviction
 
-Reputation governs *selection* (the unified score in [ADR 001 § Node Selection Algorithm](001-network.md#node-selection-algorithm) and [ADR 008](008-reputation.md#adr-008-reputation-system)), not local-cache retention. A blob's reputation-derived "value" is irrelevant to the cache; only access recency is. This mirrors [appendix-peer-table-eviction.md §4](appendix-peer-table-eviction.md#4-reputation-does-not-factor-into-eviction) for the same reasons: coupling reputation to eviction would create a collusive-reporting vector and conflate two concerns whose designs live in separate ADRs.
+Reputation governs *selection* (the unified score in [ADR 001 § Node Selection Algorithm](001-network.md#node-selection-algorithm) and [ADR 008](008-reputation.md#adr-008-reputation-system)), not local-cache retention. A blob's reputation-derived "value" is irrelevant to the cache; only access recency is. This mirrors [appendix-peer-table-eviction.md § Reputation does not factor into eviction](appendix-peer-table-eviction.md#reputation-does-not-factor-into-eviction) for the same reasons: coupling reputation to eviction would create a collusive-reporting vector and conflate two concerns whose designs live in separate ADRs.
 
-### 6. Observability
+### Observability
 
-Naming follows [appendix-observability.md §2.3 Cache Metrics](appendix-observability.md#23-cache-metrics). The existing `decdn_cache_evictions_total` counter is retained but its description is tightened to "LRU pressure only" (was "LRU/LFU pressure"); operator-evict and pinning counts are surfaced separately:
+Naming follows [appendix-observability.md § Cache Metrics](appendix-observability.md#cache-metrics). The existing `decdn_cache_evictions_total` counter is retained but its description is tightened to "LRU pressure only" (was "LRU/LFU pressure"); operator-evict and pinning counts are surfaced separately:
 
 | Metric | Type | Description |
 |---|---|---|
@@ -66,11 +66,11 @@ Naming follows [appendix-observability.md §2.3 Cache Metrics](appendix-observab
 | `decdn_cache_evicted_operator_total` | counter, unlabeled | New: hashes removed via `decdn node evict`. Distinct from `decdn_cache_evictions_total`. |
 | `decdn_cache_pinned_count` | gauge | New: size of the operator-pinned set. |
 
-`decdn_probe_hold_*` metrics ([appendix §2.1](appendix-observability.md#21-slash-safety-metrics-all-mandatory)) are owned by [ADR 005](005-protocol.md#adr-005-wire-protocol) and not redefined here. A sustained non-zero `decdn_probe_hold_violations_total` rate, paired with `decdn_cache_bytes ≈ decdn_cache_size_limit_bytes`, indicates the eviction driver is racing the hold layer — the operator response is to raise `cache.cache_size_mb` or lower `max_probe_holds`, not to disable the hold.
+`decdn_probe_hold_*` metrics ([appendix § Slash-Safety Metrics (all Mandatory)](appendix-observability.md#slash-safety-metrics-all-mandatory)) are owned by [ADR 005](005-protocol.md#adr-005-wire-protocol) and not redefined here. A sustained non-zero `decdn_probe_hold_violations_total` rate, paired with `decdn_cache_bytes ≈ decdn_cache_size_limit_bytes`, indicates the eviction driver is racing the hold layer — the operator response is to raise `cache.cache_size_mb` or lower `max_probe_holds`, not to disable the hold.
 
-Driver-loop-specific counters are listed in §7 below alongside the driver mechanism they instrument.
+Driver-loop-specific counters are listed in [§ Eviction driver loop](#eviction-driver-loop) below alongside the driver mechanism they instrument.
 
-### 7. Eviction driver loop
+### Eviction driver loop
 
 The driver loop is the runtime that consumes `CacheEngine::eviction_candidates()` and removes hashes until the cache footprint is below target. It runs as a single async task owned by the `node` crate's wiring layer (per [appendix-poc-production-seams.md](appendix-poc-production-seams.md#appendix-pocproduction-seam-architecture-rust-implementation)), independent of the cache write path.
 
@@ -87,7 +87,7 @@ The driver MUST refuse to start (or reject a SIGHUP reload) if `eviction_target_
 
 `eviction_per_sweep_budget = 16` (governable bounds `[1, 256]`). At each tick the driver removes at most this many candidates before yielding the cache lock, bounding worst-case driver-induced latency on the cache hot path: at typical filesystem-unlink cost ~1 ms per entry, 16 evictions produce ~16 ms of locked work before yielding. The driver does NOT hold the `eviction_candidates()` snapshot lock across the sweep — it acquires per-hash removal locks, so concurrent reads on unrelated hashes are not blocked.
 
-The driver continues across consecutive ticks until either (a) `decdn_cache_bytes ≤ eviction_target_pct × cache_size_mb_bytes`, or (b) `eviction_candidates()` returns empty (everything pinned, evicted-durably, or held — see §§2–4). Case (b) emits `decdn_cache_evictions_starved_total` and the driver returns to idle until the next tick. The operator response to sustained starvation is to raise `cache.cache_size_mb`, lower `max_probe_holds` ([ADR 005 § Hold Budget](005-protocol.md#hold-budget)), or trim the pinned set — never to disable any of the three layers.
+The driver continues across consecutive ticks until either (a) `decdn_cache_bytes ≤ eviction_target_pct × cache_size_mb_bytes`, or (b) `eviction_candidates()` returns empty (everything pinned, evicted-durably, or held — see §[§ Operator pinning overrides LRU](#operator-pinning-overrides-lru)–4). Case (b) emits `decdn_cache_evictions_starved_total` and the driver returns to idle until the next tick. The operator response to sustained starvation is to raise `cache.cache_size_mb`, lower `max_probe_holds` ([ADR 005 § Hold Budget](005-protocol.md#hold-budget)), or trim the pinned set — never to disable any of the three layers.
 
 #### Tick cadence
 
@@ -111,13 +111,13 @@ The `cache.cache_size_mb` ceiling is enforced by the driver, not the cache write
 
 ### Positive
 
-- Codifies what the implementation already does. No code change is required to ship the policy contract; the new §6 metrics (`decdn_cache_size_limit_bytes`, `decdn_cache_evicted_operator_total`, `decdn_cache_pinned_count`) land alongside the eviction-driver loop when it is wired.
-- Three layers (pinning, operator-evict, probe-hold) compose without entanglement. Each has a single owner (§2 / §3 / [ADR 005](005-protocol.md#adr-005-wire-protocol)) and a single rule.
+- Codifies what the implementation already does. No code change is required to ship the policy contract; the new [§ Observability](#observability) metrics (`decdn_cache_size_limit_bytes`, `decdn_cache_evicted_operator_total`, `decdn_cache_pinned_count`) land alongside the eviction-driver loop when it is wired.
+- Three layers (pinning, operator-evict, probe-hold) compose without entanglement. Each has a single owner ([§ Operator pinning overrides LRU](#operator-pinning-overrides-lru) / [§ Operator-evict is orthogonal to LRU](#operator-evict-is-orthogonal-to-lru) / [ADR 005](005-protocol.md#adr-005-wire-protocol)) and a single rule.
 - DMCA compliance is preserved exactly: operator-evict beats pinning, beats LRU, and is durable across restart. No policy gap lets a pinned-and-evicted hash resurface.
 - LRU's bookkeeping is one timestamp per cached hash. At PoC scale (10 GB / typical blob ~ 10 MB → ~1 000 entries), the `HashMap<Hash, Instant>` overhead is < 100 KB.
 
 ### Negative
 
 - LRU does not reflect blob *value* — a 10 GB cold blob and a 1 MB cold blob age out at the same rate. A popularity-weighted policy (LFU or hybrid) would serve hit rate marginally better at the cost of bookkeeping and a counter-griefing surface; rejected in *Alternatives*.
-- Until the §7 eviction-driver loop is implemented in `crates/cache`, `cache.cache_size_mb` is an aspirational ceiling and the cache grows monotonically. The driver MUST land before the network is exposed to adversarial fill.
+- Until the [§ Eviction driver loop](#eviction-driver-loop) eviction-driver loop is implemented in `crates/cache`, `cache.cache_size_mb` is an aspirational ceiling and the cache grows monotonically. The driver MUST land before the network is exposed to adversarial fill.
 - Coupling `last_accessed` to `get`-only refresh means a blob pulled by a peer (cache-miss pull, paid) but never read locally ages by the same rule as a stale local hit. This is correct: the local node's cache is sized for the local workload, not through-traffic, and through-traffic blobs are re-pullable from peers via DHT.

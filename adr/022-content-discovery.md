@@ -41,13 +41,13 @@ iroh's built-in `DhtDiscovery` (mainline BitTorrent DHT via pkarr) is unrelated 
 
 `cdn/dht/v1` is the **primary content discovery mechanism from day one**, including PoC. The DHT bootstraps from `StakingRegistry.getActiveNodes()` — a freshly-started node's first peers come from the on-chain registry and immediately participate in DHT lookups, so there is no separate bootstrap window during which DHT cannot resolve. When a DHT lookup returns no providers, the on-chain origin directory (§ Origin discovery below) is the deterministic last-resort fallback. Broadcast probe fan-out is not part of the protocol. There is no phased rollout — the DHT is always on.
 
-### 1. `cdn/dht/v1` Protocol
+### `cdn/dht/v1` Protocol
 
-#### 1.1 ALPN and Transport
+#### ALPN and Transport
 
 All DHT messages use the ALPN `cdn/dht/v1` over iroh QUIC. Connections are short-lived and request/response oriented — no persistent streams. The same iroh endpoint serving `cdn/probe/v1` and `cdn/client/v1` handles DHT connections.
 
-#### 1.2 Message Types
+#### Message Types
 
 ```rust
 /// Top-level DHT protocol enum (one variant per request/response pair)
@@ -96,7 +96,7 @@ struct FindNodeResponse {
 }
 ```
 
-#### 1.3 Routing Table
+#### Routing Table
 
 Each node maintains a Kademlia routing table: **k-buckets** partitioned by XOR distance from the node's own `NodeId` in 256-bit keyspace. NodeIds are already 32-byte ed25519 public keys — no separate DHT key needed.
 
@@ -107,7 +107,7 @@ Each node maintains a Kademlia routing table: **k-buckets** partitioned by XOR d
 | Bucket refresh interval | 1 hour | Keeps routing table fresh |
 | Routing table storage | In-memory | Rebuilt via bootstrap on restart |
 
-#### 1.4 Content Records and TTL
+#### Content Records and TTL
 
 Content records are stored in-memory at the K nodes closest to the hash in keyspace.
 
@@ -120,7 +120,7 @@ Content records are stored in-memory at the K nodes closest to the hash in keysp
 
 A node **stops re-publishing** when it evicts the blob. Stale records self-expire within TTL — no explicit retraction messages needed. **TTL is anchored on the receiver's wall-clock at acceptance time:** the receiver computes `expiry_us = receive_us + record_ttl_us`, where `receive_us` is the receiver's wall-clock microsecond timestamp at acceptance and `record_ttl_us` is the Record TTL parameter above in microseconds (1 hour = 3,600,000,000 μs). `StoreRequest` carries no sender-asserted timestamp, so record lifetime is independent of any clock the holder controls. A re-publish at 45 min refreshes the receiver's record by replacing stored `expiry_us` with one derived from the new `receive_us`, extending effective lifetime ahead of the previous expiry while the holder still has the blob. Rationale matches the receiver-anchored TTL pattern in [Appendix: Peer Table Eviction](appendix-peer-table-eviction.md#appendix-peer-table-eviction-policy).
 
-#### 1.5 STORE Flow (Cache Event → DHT Publish)
+#### STORE Flow (Cache Event → DHT Publish)
 
 When a node caches blob H:
 
@@ -130,9 +130,9 @@ When a node caches blob H:
 
 **Re-publish.** Re-publish reuses the same step 1–2 sequence; missed slots (e.g., local downtime) re-fire at the next scheduler tick rather than back-filling.
 
-The receiving node MUST reject any record whose `holder` does not equal the authenticated NodeId of the inbound QUIC connection. NodeIds are 32-byte ed25519 public keys (§1.3) and iroh's QUIC handshake authenticates the connection against that key, so the equality check binds the record to its claimed origin without a per-record signature. This depends on the publisher-only re-publish model (§1.4 and §1.5 step 2): records are pushed directly by the holder to the K-closest nodes and never propagated peer-to-peer. If a future scheme introduces peer relay of records (e.g., Kademlia replication-on-churn), receivers no longer have a direct authenticated connection to `holder` and a per-record signature MUST be reintroduced. In that case an in-scope sender timestamp MUST also be reintroduced inside the signed body — otherwise the captured signed bytes are constant and trivially replayable, defeating the signature ([ADR 015 § Replay Safety Analysis](015-zero-rtt.md#replay-safety-analysis) makes the same point at the transport layer). The receiver MUST additionally verify that `holder` is in the cached active-staker set (populated from `StakingRegistry.getActiveNodes()` per [ADR 019 § Step 3.3](019-node-onboarding.md#step-33--build-initial-peer-table-from-on-chain-registry)) before accepting the record; non-staked publishers are rejected with `StoreAck { accepted: false }`. Receiving nodes do **not** verify that the holder actually has the blob — that is the probe step's job. A false STORE publisher (a node claiming to hold a blob it does not) fails at probe time, degrading its reputation. **Note:** "publisher" in this ADR refers to a node publishing a DHT STORE record (an act of advertising). It is distinct from the on-chain *content publisher* identity defined in [ADR 002 § Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces), which is an Ethereum address registered in `PublisherRegistry`. Where confusion is possible this ADR uses "STORE publisher" or "holder" for the DHT-record sender.
+The receiving node MUST reject any record whose `holder` does not equal the authenticated NodeId of the inbound QUIC connection. NodeIds are 32-byte ed25519 public keys ([§ Routing Table](#routing-table)) and iroh's QUIC handshake authenticates the connection against that key, so the equality check binds the record to its claimed origin without a per-record signature. This depends on the publisher-only re-publish model ([§ Content Records and TTL](#content-records-and-ttl) and [§ STORE Flow (Cache Event → DHT Publish)](#store-flow-cache-event--dht-publish) step 2): records are pushed directly by the holder to the K-closest nodes and never propagated peer-to-peer. If a future scheme introduces peer relay of records (e.g., Kademlia replication-on-churn), receivers no longer have a direct authenticated connection to `holder` and a per-record signature MUST be reintroduced. In that case an in-scope sender timestamp MUST also be reintroduced inside the signed body — otherwise the captured signed bytes are constant and trivially replayable, defeating the signature ([ADR 015 § Replay Safety Analysis](015-zero-rtt.md#replay-safety-analysis) makes the same point at the transport layer). The receiver MUST additionally verify that `holder` is in the cached active-staker set (populated from `StakingRegistry.getActiveNodes()` per [ADR 019 § Step 3.3](019-node-onboarding.md#step-33--build-initial-peer-table-from-on-chain-registry)) before accepting the record; non-staked publishers are rejected with `StoreAck { accepted: false }`. Receiving nodes do **not** verify that the holder actually has the blob — that is the probe step's job. A false STORE publisher (a node claiming to hold a blob it does not) fails at probe time, degrading its reputation. **Note:** "publisher" in this ADR refers to a node publishing a DHT STORE record (an act of advertising). It is distinct from the on-chain *content publisher* identity defined in [ADR 002 § Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces), which is an Ethereum address registered in `PublisherRegistry`. Where confusion is possible this ADR uses "STORE publisher" or "holder" for the DHT-record sender.
 
-#### 1.6 FIND_VALUE Flow (Cache Miss → DHT Lookup)
+#### FIND_VALUE Flow (Cache Miss → DHT Lookup)
 
 When a node gets a cache miss for hash H and the probe cache is empty:
 
@@ -151,7 +151,7 @@ When a node gets a cache miss for hash H and the probe cache is empty:
 
 The on-chain origin set is also the directory of last resort if the DHT returns no providers: resolve namespaces via `PublisherRegistry.namespaceOf(hash)` and union the operator-address sets via `OriginAssignment.getOrigins(namespaceId)` for each ([ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority)). Operator addresses map to NodeIds via `StakingRegistry.nodeIdOf(operator)` (a single read per operator, returning `(nodeId, active)` — see [ADR 003 § NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding) and [ADR 016 § Off-Chain Read API](016-contract-interactions.md#off-chain-read-api-client--node-bootstrap)); the requester filters by `active == true` and probes those NodeIds directly. The read chain (namespace lookup → operator union → NodeId binding → blacklist filter) has no inter-call dependencies *within* a tier and batches via the standard `Multicall3` aggregator deployed on Arbitrum, collapsing the fallback to a few RPC round-trips; the batching pattern is left to client libraries since it does not affect protocol semantics. This fallback is uncommon — under normal operation the DHT contains entries for every actively-serving authorized origin — but provides a deterministic recovery path during DHT churn or bootstrap. For default-open content (`namespaceId == 0`) the on-chain directory is `OriginAssignment.getOrigins(0)` — the DAO-maintained default-open allow-list — resolved to NodeIds the same way as registered namespaces. The on-chain fallback is always queryable; it returns an empty set during the bootstrap window before the allow-list is first activated (`defaultOpenAllowlistActive == false`), in which case clients fall through to the DHT path. Once activated, the allow-list populates the fallback the same way registered namespaces do.
 
-#### 1.7 Bootstrap
+#### Bootstrap
 
 On node startup:
 
@@ -160,11 +160,11 @@ On node startup:
 
 The registry-seeded peer list participates in DHT lookups immediately, so there is no separate bootstrap window during which content discovery is unavailable. If a `FindValue` lookup returns no providers during the first few seconds — before k-buckets are populated — the on-chain origin directory (§ Origin discovery above) provides the deterministic fallback. At PoC scale (30 nodes) the routing table is fully populated after a single self-lookup round.
 
-### 2. Popularity Signals and Market Dynamics
+### Popularity Signals and Market Dynamics
 
 Content discovery in an incentive-driven network requires nodes to learn what content is in demand *before* being asked to serve it. Two complementary signals provide this.
 
-#### 2.1 Signal 1: DHT FIND_VALUE Query Frequency (Non-Suppressible)
+#### Signal 1: DHT FIND_VALUE Query Frequency (Non-Suppressible)
 
 In Kademlia, `FindValueRequest` messages for hash H are routed to nodes closest to H in keyspace **regardless of whether those nodes hold H**. A node close to H receives all FIND_VALUE queries for H from the entire network without holding H and without receiving any gossip.
 
@@ -176,11 +176,11 @@ This creates a **natural popularity oracle that cannot be suppressed**:
 
 The signal is honest by construction: FIND_VALUE traffic reflects real client demand, not voluntary self-reporting, and arrives regardless of what anyone gossips.
 
-#### 2.2 Signal 2: Local Cache-Miss Frequency
+#### Signal 2: Local Cache-Miss Frequency
 
 Each node tracks cache miss timestamps per hash in a bounded map ([ADR 001 § Prefetching from Local Demand](001-network.md#adr-001-network-topology-and-peer-mesh)). A hash crossing the local-miss threshold (default: 3 misses in 5 minutes) is prefetched proactively.
 
-#### 2.3 Prefetch Decision
+#### Prefetch Decision
 
 A node prefetches hash H when **either** signal crosses its threshold:
 
@@ -191,11 +191,11 @@ A node prefetches hash H when **either** signal crosses its threshold:
 
 Both thresholds are configurable. Both trigger the same action: DHT FIND_VALUE lookup to find a provider, pull via `cdn/client/v1` (paid), cache locally, publish STORE record.
 
-#### 2.4 No Discovery Fees
+#### No Discovery Fees
 
 DHT STORE and FIND_VALUE operations carry no protocol-level fee. The incentive to publish STORE records is indirect: advertising that you hold a blob attracts probe traffic, which converts to paid delivery. Charging for DHT operations would create a new attack surface (collect fee, fail to hold) requiring a new slash condition. All fees remain on delivery.
 
-### 3. Interaction with Existing Protocols
+### Interaction with Existing Protocols
 
 | Mechanism | Interaction with DHT |
 |-----------|---------------------|
@@ -206,7 +206,7 @@ DHT STORE and FIND_VALUE operations carry no protocol-level fee. The incentive t
 | Eviction hold ([ADR 005](005-protocol.md#adr-005-wire-protocol)) | Nodes stop re-publishing DHT records when a blob is evicted. TTL ensures stale records expire within 1 hour. |
 | Client discovery ([ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model)) | Clients use DHT FIND_VALUE for content discovery the same way nodes do. The on-chain origin-directory fallback applies equally. |
 
-### 4. Schema Evolution
+### Schema Evolution
 
 `cdn/dht/v1` follows the standard evolution model from [ADR 013](013-schema-evolution.md#adr-013-schema-evolution):
 
@@ -216,7 +216,7 @@ DHT STORE and FIND_VALUE operations carry no protocol-level fee. The incentive t
 
 `DhtMessage` uses a top-level enum consistent with the per-ALPN protocol enum pattern in [ADR 013 — Protocol Enums](013-schema-evolution.md#protocol-enums). Unknown variants are silently dropped.
 
-### 5. Acceptance Criteria
+### Acceptance Criteria
 
 1. A node in a 30-node PoC network can discover providers for a cached blob in ≤3 FIND_VALUE hops.
 2. A node in a 500-node network can discover providers in ≤5 FIND_VALUE hops.

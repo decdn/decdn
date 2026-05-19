@@ -6,7 +6,7 @@
 
 Several ADRs describe PoC-vs-production differences, and they fall into three kinds: **network-scale operational choices** (single RPC endpoint, clients holding ETH for gas, simplified peer bootstrap), **component implementations** (file-based vs platform-keychain key storage, local-only vs gossip-weighted reputation), and **governance process** (admin key vs ve-weighted Governor).
 
-Crucially, none of these is a *contract-surface* difference. Per [ADR 016 § Contract Inventory](016-contract-interactions.md#1-contract-inventory), the full on-chain surface ships in a single audit pass with governance-tunable economics from day one; "PoC" is a network-scale milestone (tens of nodes on a testnet), not a reduced contract surface — there are no contract-surface scope reductions, only the non-contract differences this appendix addresses.
+Crucially, none of these is a *contract-surface* difference. Per [ADR 016 § Contract Inventory](016-contract-interactions.md#contract-inventory), the full on-chain surface ships in a single audit pass with governance-tunable economics from day one; "PoC" is a network-scale milestone (tens of nodes on a testnet), not a reduced contract surface — there are no contract-surface scope reductions, only the non-contract differences this appendix addresses.
 
 The question this appendix answers: **how does the codebase express the non-contract differences without scattering `if mode == PoC` checks through every crate?**
 

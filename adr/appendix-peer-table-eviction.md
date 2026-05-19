@@ -19,7 +19,7 @@ The current implementation in `crates/gossip/src/peer_table.rs` already evicts b
 
 The peer table is **TTL-bounded by `last_seen_us`**, with **active eviction** on registry deregistration / origin blacklisting and **no hard size cap by default**. Reputation does not factor into eviction. The five gossip-validation rules in [ADR 001 § Gossip validation](001-network.md#gossip-validation) are unchanged; this appendix specifies what happens *after* a successful insert.
 
-### 1. Lifecycle and TTL
+### Lifecycle and TTL
 
 Each `PeerEntry` carries `first_seen_us` (insertion time) and `last_seen_us` (last refresh). A periodic sweeper removes entries whose `last_seen_us < now_us - peer_ttl_us`.
 
@@ -38,7 +38,7 @@ The 10× ratio (not the absolute 600 s) is the stable invariant: if the announce
 
 **Sweep is not real-time.** Up to one sweep period (≤ 30 s) elapses between TTL expiry and physical removal. Callers iterating the table MUST tolerate brief over-counting. Selection (probe + DHT) is unaffected — it never consults the peer table.
 
-### 2. No hard size cap (optional safety ceiling)
+### No hard size cap (optional safety ceiling)
 
 The peer table is **not size-capped by default**. Growth is bounded externally:
 
@@ -49,12 +49,12 @@ The peer table is **not size-capped by default**. Growth is bounded externally:
 For defense-in-depth against an unforeseen growth path (registry-validation regression, future schema change), operators MAY set an optional ceiling:
 
 - **Config key:** `gossip.max_peer_entries` — `Option<usize>`, default `None` (unlimited).
-- **When set and exceeded:** new inserts are rejected; the failure surfaces in the existing gossip-rejection counter `decdn_gossip_messages_rejected_total{reason=table_full}` (per [appendix-observability.md §2.6 Gossip Metrics](appendix-observability.md#26-gossip-metrics)). **No existing entry is evicted to make room** — eviction-by-priority would conflate discovery with selection trust (see §4) and is rejected in *Alternatives Considered*.
+- **When set and exceeded:** new inserts are rejected; the failure surfaces in the existing gossip-rejection counter `decdn_gossip_messages_rejected_total{reason=table_full}` (per [appendix-observability.md § Gossip Metrics](appendix-observability.md#gossip-metrics)). **No existing entry is evicted to make room** — eviction-by-priority would conflate discovery with selection trust (see [§ Reputation does not factor into eviction](#reputation-does-not-factor-into-eviction)) and is rejected in *Alternatives Considered*.
 - **Operator signal:** sustained `decdn_peer_table_size > registered_node_count × 1.5` indicates registry validation is not constraining inserts as expected and warrants investigation, not silent eviction.
 
 Implementing `gossip.max_peer_entries` is OPTIONAL for the PoC (`peer_table_size` already covers the observable signal); the config key is reserved here so a follow-up implementation needs no ADR amendment.
 
-### 3. Registry-cache interaction (active eviction)
+### Registry-cache interaction (active eviction)
 
 The local registry cache, when implemented per [ADR 001 § Registry cache](001-network.md#registry-cache) and [ADR 019 § Step 3.3](019-node-onboarding.md#step-33--build-initial-peer-table-from-on-chain-registry), subscribes to `NodeRegistered`, `NodeDeregistered`, and `NodeAutoEjected` events. On `NodeDeregistered` and `NodeAutoEjected` for a `node_id`, the subscriber MUST also **remove the matching peer-table entry** in the same handler, alongside its registry-cache update. Origin blacklisting ([ADR 011 § Hash Evasion and Origin Blacklisting](011-content-takedown.md#hash-evasion-and-origin-blacklisting)) routes through `StakingRegistry.ejectNode` and emits `NodeAutoEjected`, so the same code path covers it. The subscriber does not yet exist; this clause adds one behavior on top of the subscriber introduced by [ADR 019](019-node-onboarding.md#adr-019-node-onboarding-and-bootstrapping-flow).
 
@@ -67,7 +67,7 @@ The local registry cache, when implemented per [ADR 001 § Registry cache](001-n
 
 `NodeRegistered` does NOT trigger any peer-table action — the entry will arrive (if ever) via gossip, validated normally.
 
-### 4. Reputation does not factor into eviction
+### Reputation does not factor into eviction
 
 Reputation governs *selection* (the `selection_score` formula in [ADR 001 § Node Selection Algorithm](001-network.md#node-selection-algorithm) and the local/network blend in [ADR 008](008-reputation.md#adr-008-reputation-system)), not retention. A peer whose reputation falls to the 0.1 floor stays in the peer table until TTL or deregistration removes it. The selection-score formula already makes such a node ~100× less likely to be selected (see [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) reputation table), the appropriate response.
 
@@ -79,7 +79,7 @@ Reputation governs *selection* (the `selection_score` formula in [ADR 001 § Nod
 
 This ADR therefore excludes reputation from the eviction decision. Reputation-system changes ([ADR 008](008-reputation.md#adr-008-reputation-system)) need not consider peer-table side effects.
 
-### 5. Offline handling
+### Offline handling
 
 **Peer is offline (this node is online).** Receiver stops getting valid `NodeAnnounce` messages for the peer. After ≥ TTL of silence, `evict_expired` removes the entry; a later valid `NodeAnnounce` re-inserts a fresh entry with new `first_seen_us` / `last_seen_us`. There is no "stale" intermediate state — eviction is binary and the receiver does not surface or act on partial freshness.
 
@@ -87,16 +87,16 @@ This ADR therefore excludes reputation from the eviction decision. Reputation-sy
 
 **Process restart.** The peer table is in-memory only; restarts start empty. This is intentional — persistence would save < one announce interval (~60 s) of cold gossip and add durability machinery the protocol does not need.
 
-### 6. Observability
+### Observability
 
-Naming follows [appendix-observability.md §2.6 Gossip Metrics](appendix-observability.md#26-gossip-metrics). The existing `decdn_peer_table_size` gauge and `decdn_gossip_messages_rejected_total` counter cover most of the surface; this appendix adds two eviction counters and one label value:
+Naming follows [appendix-observability.md § Gossip Metrics](appendix-observability.md#gossip-metrics). The existing `decdn_peer_table_size` gauge and `decdn_gossip_messages_rejected_total` counter cover most of the surface; this appendix adds two eviction counters and one label value:
 
 | Metric | Type | Description |
 |---|---|---|
 | `decdn_peer_table_size` | gauge | Distinct peers in the local peer table — **existing**, see appendix |
-| `decdn_gossip_messages_rejected_total` | counter, labeled by `reason` | **Existing**, see appendix; §2 specifies when the `reason=table_full` label value fires (the optional `gossip.max_peer_entries` rejection path) |
+| `decdn_gossip_messages_rejected_total` | counter, labeled by `reason` | **Existing**, see appendix; [§ No hard size cap (optional safety ceiling)](#no-hard-size-cap-optional-safety-ceiling) specifies when the `reason=table_full` label value fires (the optional `gossip.max_peer_entries` rejection path) |
 | `decdn_peer_table_evicted_ttl_total` | counter, unlabeled | New: entries removed by the TTL sweeper |
-| `decdn_peer_table_evicted_registry_total` | counter, labeled by `reason ∈ {deregistered, ejected}` | New: entries removed in response to a registry event (§3) |
+| `decdn_peer_table_evicted_registry_total` | counter, labeled by `reason ∈ {deregistered, ejected}` | New: entries removed in response to a registry event ([§ Registry-cache interaction (active eviction)](#registry-cache-interaction-active-eviction)) |
 
 A sustained non-zero `decdn_gossip_messages_rejected_total{reason="table_full"}` rate signals that `gossip.max_peer_entries` is misconfigured or that registry validation is letting through an unexpected number of `node_id`s.
 
@@ -107,11 +107,11 @@ A sustained non-zero `decdn_gossip_messages_rejected_total{reason="table_full"}`
 - Memory bound is set by external policy (the staking registry) without per-table bookkeeping. At realistic scales (≤ 10 k nodes) the table is < 5 MB.
 - Active eviction on deregistration / blacklisting keeps admin output and gossip-derived analytics accurate within one event-handler turn instead of ~10 minutes.
 - Discovery and selection stay separable. Reputation, blacklist, and registry inputs each have a single clear role; no new coupling.
-- The implementation already matches §1 — no code change ships this appendix's TTL behavior. §3 adds a single map-removal step inside the registry-cache subscriber introduced by [ADR 019 § Step 3.3](019-node-onboarding.md#step-33--build-initial-peer-table-from-on-chain-registry) (subscriber not yet implemented). §6 adds two counters and one label value. §2's `max_peer_entries` is opt-in.
+- The implementation already matches [§ Lifecycle and TTL](#lifecycle-and-ttl) — no code change ships this appendix's TTL behavior. [§ Registry-cache interaction (active eviction)](#registry-cache-interaction-active-eviction) adds a single map-removal step inside the registry-cache subscriber introduced by [ADR 019 § Step 3.3](019-node-onboarding.md#step-33--build-initial-peer-table-from-on-chain-registry) (subscriber not yet implemented). [§ Observability](#observability) adds two counters and one label value. [§ No hard size cap (optional safety ceiling)](#no-hard-size-cap-optional-safety-ceiling)'s `max_peer_entries` is opt-in.
 
 ### Negative
 
-- TTL 600 s on a 60 s announce interval means an offline peer stays discoverable but unreachable for up to ~10 minutes. Probe + DHT route around it (the peer table is not consulted during selection); the `EvictedSinceProbe` handling in [ADR 001 § Content Discovery](001-network.md#content-discovery-dht--probe) covers the corresponding blob-eviction case. Operators concerned about stale visibility can lower `peer_ttl_sec` toward the §1 minimum.
+- TTL 600 s on a 60 s announce interval means an offline peer stays discoverable but unreachable for up to ~10 minutes. Probe + DHT route around it (the peer table is not consulted during selection); the `EvictedSinceProbe` handling in [ADR 001 § Content Discovery](001-network.md#content-discovery-dht--probe) covers the corresponding blob-eviction case. Operators concerned about stale visibility can lower `peer_ttl_sec` toward the [§ Lifecycle and TTL](#lifecycle-and-ttl) minimum.
 - Without `max_peer_entries` set, a registry-validation regression admitting unstaked `node_id`s could allow unbounded growth. `decdn_peer_table_size` is the early-warning signal; operators tracking it can set the ceiling reactively.
 - Up to one sweep period (≤ 30 s) elapses between TTL expiry and physical removal. Callers iterating the table MUST tolerate brief over-counting. No iterator currently relies on real-time accuracy.
 - Active registry-driven eviction adds one `HashMap::remove` per `NodeDeregistered` / `NodeAutoEjected` event. These events are infrequent (operator-initiated or auto-ejection at 50 % stake floor); cost is negligible.

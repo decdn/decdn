@@ -13,20 +13,20 @@ This ADR consolidates that analysis into a single reference for security audits 
 
 ## Decision
 
-### 1. Contract Inventory
+### Contract Inventory
 
 All on-chain contracts inherit from [OpenZeppelin Contracts](https://docs.openzeppelin.com/contracts/) to minimize custom security-critical code. The full surface ships in a single audit pass; per-bucket economics are governance-tunable from day one (see [§ Tunable Economics](#tunable-economics) below) so the network can launch with a simplified split (e.g. 80/0/0/10/10/0) and dial up gauge boost / delegator pool / safety reserve as the dependent infrastructure stabilizes.
 
 | Contract | ADR | Holds Funds | Token Types | OZ Base Contracts |
 | --- | --- | --- | --- | --- |
-| TOKEN (ERC-20) | [026](026-tokenomics.md#adr-026-tokenomics) | No (fungible token) | — | `ERC20`, `ERC20Permit`, `ERC20Votes` (fixed-supply per [ADR 026](026-tokenomics.md#adr-026-tokenomics) §1; no post-genesis mint function) |
+| TOKEN (ERC-20) | [026](026-tokenomics.md#adr-026-tokenomics) | No (fungible token) | — | `ERC20`, `ERC20Permit`, `ERC20Votes` (fixed-supply per [ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ Supply and distribution](026-tokenomics.md#supply-and-distribution); no post-genesis mint function) |
 | StakingRegistry | [003](003-payments.md#adr-003-payment-model), [026](026-tokenomics.md#adr-026-tokenomics) | Yes | TOKEN | `AccessControl`, `ReentrancyGuard`, `Pausable`, `EIP712` (includes `isActive(operator)` per [ADR 003](003-payments.md#adr-003-payment-model) `IStakingRegistry`) |
 | PaymentChannel | [003](003-payments.md#adr-003-payment-model) | Yes | USDC | `Ownable`, `ReentrancyGuard`, `Pausable`, `EIP712` (USDC-only; the USDC address is fixed at deployment; `settleChannel` forwards full balance to `FeeRouter.routeSettlement` rather than skimming inline) |
 | FeeRouter | [026](026-tokenomics.md#adr-026-tokenomics) | Yes | USDC (transient + epoch buckets), TOKEN (delegator-pool epoch buckets) | `AccessControl`, `ReentrancyGuard`, `Pausable` |
 | VotingEscrow | [026](026-tokenomics.md#adr-026-tokenomics) | Yes | TOKEN (locked, non-transferable) | `ReentrancyGuard`, `Pausable` |
 | SafetyReserve | [026](026-tokenomics.md#adr-026-tokenomics), [028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation) | Yes | USDC (3% bucket + slashing redirect), TOKEN (transient until keeper swap) | `AccessControl`, `ReentrancyGuard`, `Pausable` (includes [ADR 028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation) appeal extensions: `openSlashAppeal` / `fastTrackAppeal` / `rejectAppeal` / `ratifyAppeal` / `reverseAppeal`) |
 | BuybackBurner | [018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol), [026](026-tokenomics.md#adr-026-tokenomics) | Yes | USDC, TOKEN (transient) | `AccessControl`, `ReentrancyGuard`, `Pausable` (Balancer V3 swap-and-burn path) |
-| DelegatorBuyer | [026](026-tokenomics.md#adr-026-tokenomics) §6 | Yes | USDC, TOKEN (transient) | `AccessControl`, `ReentrancyGuard`, `Pausable` (USDC→TOKEN swap for the delegator pool; parallel contract to `BuybackBurner` — the two share the Balancer V3 swap execution path via an internal swap-helper library but settle to different downstream destinations and have independent governance setters on `FeeRouter` — see [§ Shared swap helper](#shared-swap-helper-buybackburner--delegatorbuyer) below) |
+| DelegatorBuyer | [026](026-tokenomics.md#adr-026-tokenomics) [§ Delegator pool — USDC → TOKEN conversion](026-tokenomics.md#delegator-pool--usdc--token-conversion) | Yes | USDC, TOKEN (transient) | `AccessControl`, `ReentrancyGuard`, `Pausable` (USDC→TOKEN swap for the delegator pool; parallel contract to `BuybackBurner` — the two share the Balancer V3 swap execution path via an internal swap-helper library but settle to different downstream destinations and have independent governance setters on `FeeRouter` — see [§ Shared swap helper](#shared-swap-helper-buybackburner--delegatorbuyer) below) |
 | ContentBlacklist | [011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) | No | — | `AccessControl`, `ReentrancyGuard` (full surface: hash-level — global + regional — operator-level — `addOrigin` / `removeOrigin` / `isOriginBlacklisted` — and the [ADR 011 § Blacklist Entry Appeals](011-content-takedown.md#blacklist-entry-appeals) API) |
 | PublisherRegistry | [002](002-content-addressing.md#adr-002-content-addressing) | No | — | `AccessControl`, `ReentrancyGuard` |
 | OriginAssignment | [011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) | No | — | `AccessControl`, `ReentrancyGuard` |
@@ -95,7 +95,7 @@ classDiagram
     Governor ..> SafetyReserve : payout authorization
 ```
 
-The full FeeRouter six-bucket split (40/40/7/5/5/3) is the steady-state target specified in [ADR 026](026-tokenomics.md#adr-026-tokenomics) §2; epoch-bucket mechanics and the gauge-boost formula live in [ADR 026](026-tokenomics.md#adr-026-tokenomics) §2–§3. This ADR does not duplicate the bucket table; the launch-default share configuration and the tunability mechanism are in [§ Tunable Economics](#tunable-economics) below.
+The full FeeRouter six-bucket split (40/40/7/5/5/3) is the steady-state target specified in [ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ FeeRouter split (40/40/7/5/5/3)](026-tokenomics.md#feerouter-split-40407553); epoch-bucket mechanics and the gauge-boost formula live in [ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ FeeRouter split (40/40/7/5/5/3)](026-tokenomics.md#feerouter-split-40407553)–[§ Cross-Contract Call Graph](#cross-contract-call-graph). This ADR does not duplicate the bucket table; the launch-default share configuration and the tunability mechanism are in [§ Tunable Economics](#tunable-economics) below.
 
 #### Tunable Economics
 
@@ -103,7 +103,7 @@ The full six-bucket structure ships from day one, but every bucket share and eve
 
 The pattern has three knobs, all under `GOVERNANCE_ROLE` (i.e. the `TimelockController`):
 
-1. **Bucket shares.** `FeeRouter.setShares(operatorBaseBps, gaugeBoostBps, delegatorBps, buybackBps, treasuryBps, safetyBps)` updates the six-bucket split in basis points. Sum-to-10000 invariant enforced; cross-validated against dependency addresses (see knob 2). Steady-state target per [ADR 026](026-tokenomics.md#adr-026-tokenomics) §2 is `4000 / 4000 / 700 / 500 / 500 / 300`.
+1. **Bucket shares.** `FeeRouter.setShares(operatorBaseBps, gaugeBoostBps, delegatorBps, buybackBps, treasuryBps, safetyBps)` updates the six-bucket split in basis points. Sum-to-10000 invariant enforced; cross-validated against dependency addresses (see knob 2). Steady-state target per [ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ FeeRouter split (40/40/7/5/5/3)](026-tokenomics.md#feerouter-split-40407553) is `4000 / 4000 / 700 / 500 / 500 / 300`.
 2. **Dependency addresses.** `FeeRouter.setVotingEscrow(addr)`, `setSafetyReserve(addr)`, `setDelegatorBuyer(addr)`, `setBuybackBurner(addr)`, `setTreasury(addr)` may be called any time. **Cross-validation:** `setShares(...)` reverts if any non-zero share has its destination set to `address(0)` — so a bucket can only become live once its sink contract is wired in. Same applies in reverse: `set*(address(0))` reverts if the corresponding share is non-zero.
 3. **Helper-contract addresses on signing contracts.** `PaymentChannel.setFeeRouter(addr)` (per [ADR 003](003-payments.md#adr-003-payment-model)) lets governance re-point the router target without redeploying the payment channel. The EIP-712 domain separator is unaffected because it does not include the FeeRouter address; see [§ No proxy deployment patterns](#no-proxy-deployment-patterns) below for the full carve-out.
 
@@ -111,7 +111,7 @@ The pattern has three knobs, all under `GOVERNANCE_ROLE` (i.e. the `TimelockCont
 
 **Activation sequence is governance-driven.** When `VotingEscrow` / `SafetyReserve` / `DelegatorBuyer` are deployed and audited, governance calls the relevant `set*(addr)` then `setShares(...)` to allocate the bucket. Because share updates pass through the standard 48h timelock, bucket activations are externally observable in advance.
 
-**Launch deployment.** `FeeRouter` deploys with zero-address dependencies for `VotingEscrow` / `SafetyReserve` / `DelegatorBuyer` if those aren't co-deployed (see [§ Deployment Order](#2-deployment-order-and-initialization-dependencies) below). The launch share configuration honors the cross-validation invariant — only buckets whose destinations are wired may be set non-zero.
+**Launch deployment.** `FeeRouter` deploys with zero-address dependencies for `VotingEscrow` / `SafetyReserve` / `DelegatorBuyer` if those aren't co-deployed (see [§ Deployment Order](#deployment-order-and-initialization-dependencies) below). The launch share configuration honors the cross-validation invariant — only buckets whose destinations are wired may be set non-zero.
 
 #### Contract: FeeRouter
 
@@ -119,7 +119,7 @@ The pattern has three knobs, all under `GOVERNANCE_ROLE` (i.e. the `TimelockCont
 interface IFeeRouter {
     // Called by `PaymentChannel.settleChannel`. Forwards the operator's
     // full USDC balance through the configured six-bucket split (per ADR 026
-    // §2); same-tx legs execute inline, epoch-bucket legs accumulate to
+    // § Deployment Order and Initialization Dependencies); same-tx legs execute inline, epoch-bucket legs accumulate to
     // per-epoch storage. Updates `lastSettlementAt[operator]` on
     // `StakingRegistry` via `SETTLEMENT_REPORTER_ROLE`. Reverts if paused.
     function routeSettlement(
@@ -130,7 +130,7 @@ interface IFeeRouter {
     ) external;
 
     // Populated inline by routeSettlement; read by gauge claim per ADR 026
-    // §3 to feed bytes_i. The per-operator gauge-share cap (ADR 026 §3) is
+    // § Cross-Contract Call Graph to feed bytes_i. The per-operator gauge-share cap (ADR 026 § Gauge-boost formula) is
     // the binding wash-trading defense.
     function bytesPerEpoch(address operator, uint64 epoch) external view returns (uint256);
 
@@ -211,7 +211,7 @@ interface IFeeRouter {
     function setDelegatorBuyer(address newDelegatorBuyer) external;
     function setBuybackBurner(address newBuybackBurner) external;
     function setTreasury(address newTreasury) external;
-    function setBoostFloor(uint256 newFloor) external; // bounded [2000, 8000] per [ADR 026 §11](026-tokenomics.md#11-governable-parameters-with-safety-bounds)
+    function setBoostFloor(uint256 newFloor) external; // bounded [2000, 8000] per [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds)
 
     // `pause()` blocks `routeSettlement`, `claimBoost`, `claimDelegator`,
     // `executeDelegatorSwap`, `sweepUnclaimed`. `PaymentChannel`
@@ -244,7 +244,7 @@ interface IFeeRouter {
 
 **Notes:**
 
-- **Epoch length / claim window are immutable** (1 week / 26 epochs, constructor-set, [ADR 026 § FeeRouter split (40/40/7/5/5/3)](026-tokenomics.md#2-feerouter-split-40407553)). Changing them post-deploy shifts every stored `epoch` index; a change ships as a fresh `FeeRouter` with state migration ([§ No proxy deployment patterns](#no-proxy-deployment-patterns)).
+- **Epoch length / claim window are immutable** (1 week / 26 epochs, constructor-set, [ADR 026 § FeeRouter split (40/40/7/5/5/3)](026-tokenomics.md#feerouter-split-40407553)). Changing them post-deploy shifts every stored `epoch` index; a change ships as a fresh `FeeRouter` with state migration ([§ No proxy deployment patterns](#no-proxy-deployment-patterns)).
 - **`workingBytes` is per-operator only.** Off-chain calculators bundle it with `epochTotalWorkingBytes` and `gaugeBucket` via Multicall3.
 - **Gauge-bytes tracking is inline in `routeSettlement`.** INVARIANT: there is no operator-asserted summary, no on-chain identity gate, and no fraud-challenge mechanism — the [ADR 034 § Per-operator gauge-share cap](034-gauge-boost-voting-escrow.md#per-operator-gauge-share-cap) is the binding wash-trading defense.
 - **No `initialize(...)` helper** — proxies are forbidden ([§ No proxy deployment patterns](#no-proxy-deployment-patterns)); constructor + post-deploy `setSharesAndDestinations` from `TimelockController` suffices.
@@ -260,13 +260,13 @@ No deCDN contract uses proxy (upgradeable) deployment patterns. Production contr
 
 #### Shared swap helper (BuybackBurner ↔ DelegatorBuyer)
 
-`BuybackBurner` and `DelegatorBuyer` are separate contracts with separate addresses and separate audit boundaries. Both consume USDC and produce TOKEN via the same Balancer V3 80/20 pool but settle to different downstream destinations — `BuybackBurner` burns its TOKEN output ([ADR 026 § Slashing and burn](026-tokenomics.md#8-slashing-and-burn)); `DelegatorBuyer` deposits its TOKEN output back into the `FeeRouter` per-epoch delegator bucket via `IFeeRouter.depositDelegatorTokens(epochId, amount)` ([ADR 035](035-delegator-pool.md#delegator-pool--usdc--token-conversion)). The two are wired through distinct `FeeRouter` setters (`setBuybackBurner` / `setDelegatorBuyer`) and expose divergent governance and event surfaces ([`IDelegatorBuyer`](035-delegator-pool.md#contract-delegatorbuyer) is single-purpose with `msg.sender == feeRouter` as its sole auth check; `BuybackBurner` is `KEEPER_ROLE`-gated and burn-typed).
+`BuybackBurner` and `DelegatorBuyer` are separate contracts with separate addresses and separate audit boundaries. Both consume USDC and produce TOKEN via the same Balancer V3 80/20 pool but settle to different downstream destinations — `BuybackBurner` burns its TOKEN output ([ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn)); `DelegatorBuyer` deposits its TOKEN output back into the `FeeRouter` per-epoch delegator bucket via `IFeeRouter.depositDelegatorTokens(epochId, amount)` ([ADR 035](035-delegator-pool.md#delegator-pool--usdc--token-conversion)). The two are wired through distinct `FeeRouter` setters (`setBuybackBurner` / `setDelegatorBuyer`) and expose divergent governance and event surfaces ([`IDelegatorBuyer`](035-delegator-pool.md#contract-delegatorbuyer) is single-purpose with `msg.sender == feeRouter` as its sole auth check; `BuybackBurner` is `KEEPER_ROLE`-gated and burn-typed).
 
-They share the Balancer V3 swap execution path — TWAP splitting, `minTokenOut` aggregate guard, `subSwapMinBlockGap` spacing, mandatory private-RPC routing, the [`epochLiquidityCapFraction` per-epoch combined cap](026-tokenomics.md#11-governable-parameters-with-safety-bounds), and Vault-scoped self-approval — via an internal abstract contract (e.g., `BalancerV3SwapHelper`) inherited by both. The combined-path per-epoch liquidity-cap accounting per [ADR 018 § Liquidity-cap interaction](018-liquidity-strategy.md#liquidity-cap-interaction) is implemented as shared state in that base contract so both children see the same epoch-to-date notional.
+They share the Balancer V3 swap execution path — TWAP splitting, `minTokenOut` aggregate guard, `subSwapMinBlockGap` spacing, mandatory private-RPC routing, the [`epochLiquidityCapFraction` per-epoch combined cap](026-tokenomics.md#governable-parameters-with-safety-bounds), and Vault-scoped self-approval — via an internal abstract contract (e.g., `BalancerV3SwapHelper`) inherited by both. The combined-path per-epoch liquidity-cap accounting per [ADR 018 § Liquidity-cap interaction](018-liquidity-strategy.md#liquidity-cap-interaction) is implemented as shared state in that base contract so both children see the same epoch-to-date notional.
 
 A unified `BuybackBurner` multi-output mode (the rejected alternative) was considered for its smaller surface count. It is rejected because (a) the audit savings are captured by the shared base contract without entangling the two children's downstream value flows, (b) collapsing the surfaces would force the two paths to share governance setters and events despite serving semantically distinct purposes (deflation vs ve-locker redistribution), and (c) the [`IDelegatorBuyer` interface](035-delegator-pool.md#contract-delegatorbuyer) already specifies a distinct, single-purpose contract.
 
-### 2. Deployment Order and Initialization Dependencies
+### Deployment Order and Initialization Dependencies
 
 Contracts must be deployed in dependency order — each contract's constructor requires the addresses of contracts deployed before it. `FeeRouter` accepts `address(0)` for `VotingEscrow` / `SafetyReserve` / `DelegatorBuyer` at construction; the cross-validation invariant in [§ Tunable Economics](#tunable-economics) ensures any non-zero share has a non-zero destination, so the launch share configuration determines which dependencies must already be wired. `DelegatorBuyer` is deployed after `FeeRouter` so its constructor can pin the router address as immutable; governance then calls `FeeRouter.setDelegatorBuyer(addr)` to complete the bidirectional wiring.
 
@@ -318,14 +318,14 @@ graph TD
 
 | Step | Contract | Constructor Requires |
 | --- | --- | --- |
-| 1 | TOKEN | Initial holder, initial supply (1B fixed per [ADR 026](026-tokenomics.md#adr-026-tokenomics) §1), owner. No `mint()` function; testnet seeding happens via the constructor `_mint(initialHolder, 1_000_000_000e18)`. |
+| 1 | TOKEN | Initial holder, initial supply (1B fixed per [ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ Supply and distribution](026-tokenomics.md#supply-and-distribution)), owner. No `mint()` function; testnet seeding happens via the constructor `_mint(initialHolder, 1_000_000_000e18)`. |
 | 2 | USDC | External (testnet faucet or mainnet address) |
 | 3 | TimelockController | OZ `TimelockController(minDelay, proposers, executors, admin)` — `minDelay` is 48h ([ADR 009](009-governance.md#adr-009-governance-model)). Deployed early so its address is available to `FeeRouter` as the treasury bucket destination and to every `AccessControl`-bearing contract as the eventual `DEFAULT_ADMIN_ROLE` holder. `proposers` is initialized empty and `PROPOSER_ROLE` is granted to `DecdnGovernor` post-deploy (step 15); `executors` is `[address(0)]` (anyone may execute after the delay). |
-| 4 | StakingRegistry | TOKEN address, `minStake` (**50,000 TOKEN** per [ADR 026](026-tokenomics.md#adr-026-tokenomics) §7), `unbondingPeriod` (7 days). No discount-threshold parameters; operator return is differentiated through the gauge-boost flow in `FeeRouter`. |
-| 5 | VotingEscrow | TOKEN address, `minLockDuration` (1 week), `maxLockDuration` (4 years). No `create_lock_for` privileged path; auto-ve-lock not exposed. Implements `balanceOfAt(user, ts)` and `totalSupplyAt(ts)` historical checkpointing ([ADR 026](026-tokenomics.md#adr-026-tokenomics) §4). |
-| 6 | SafetyReserve | USDC address, Governor address (payout authorizer; may be `address(0)` at deploy and set via `setGovernor` once `DecdnGovernor` is deployed), emergency-multisig address (fast-track approver under hard caps), `appealWindow` (48h) ([ADR 026](026-tokenomics.md#adr-026-tokenomics) §5). [ADR 028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation) appeal extensions are part of the same contract — no separate deployment. |
-| 7 | BuybackBurner | TOKEN address, USDC address, Balancer V3 Router address, initial pool contract `address` (may be zero-address at deploy and set later via `setPool(address)` — see [ADR 003](003-payments.md#buybackburner) for the interface and [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol) for the venue rationale). The pool address remains governance-mutable post-deploy via `setPool(address)`; the constructor value is an initial convenience, not a hard requirement. **Inflow source:** `FeeRouter` ([ADR 026](026-tokenomics.md#adr-026-tokenomics) §8). **Router address and naming:** see [ADR 018 §"Buyback execution via Balancer V3"](018-liquidity-strategy.md#buyback-execution-via-balancer-v3) for the canonical Balancer V3 Router address and the `Router v2` label disambiguation. **Approvals note:** `BuybackBurner` MUST self-approve the Balancer V3 **Vault** address (distinct from the Router) during initialization — the Vault pulls input tokens from `msg.sender`, which is `BuybackBurner`. The V3 footgun reference and Vault address live in [ADR 018](018-liquidity-strategy.md#buyback-execution-via-balancer-v3). |
-| 8 | FeeRouter | USDC address, TOKEN address, **`TimelockController` address** (treasury bucket destination), Balancer V3 Router address, `epochLength` (1 week), `claimWindow` (26 epochs), launch split shares (cross-validated against dependency addresses), and `boostFloor` (0.4) per [ADR 026](026-tokenomics.md#adr-026-tokenomics) §3. **Dependency addresses** (`votingEscrow`, `safetyReserve`, `delegatorBuyer`, `buybackBurner`) may all be `address(0)` at deploy and set later via the governance-mutable setters in [§ Tunable Economics](#tunable-economics); the cross-validation invariant ensures any non-zero share has a non-zero destination at construction time. Steady-state target shares per [ADR 026](026-tokenomics.md#adr-026-tokenomics) §2 are 40/40/7/5/5/3 in basis points. |
+| 4 | StakingRegistry | TOKEN address, `minStake` (**50,000 TOKEN** per [ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ Operator economics and minimum stake](026-tokenomics.md#operator-economics-and-minimum-stake)), `unbondingPeriod` (7 days). No discount-threshold parameters; operator return is differentiated through the gauge-boost flow in `FeeRouter`. |
+| 5 | VotingEscrow | TOKEN address, `minLockDuration` (1 week), `maxLockDuration` (4 years). No `create_lock_for` privileged path; auto-ve-lock not exposed. Implements `balanceOfAt(user, ts)` and `totalSupplyAt(ts)` historical checkpointing ([ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ Voting escrow (`VotingEscrow`)](026-tokenomics.md#voting-escrow-votingescrow)). |
+| 6 | SafetyReserve | USDC address, Governor address (payout authorizer; may be `address(0)` at deploy and set via `setGovernor` once `DecdnGovernor` is deployed), emergency-multisig address (fast-track approver under hard caps), `appealWindow` (48h) ([ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ Safety and insurance reserve (3% bucket)](026-tokenomics.md#safety-and-insurance-reserve-3-bucket)). [ADR 028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation) appeal extensions are part of the same contract — no separate deployment. |
+| 7 | BuybackBurner | TOKEN address, USDC address, Balancer V3 Router address, initial pool contract `address` (may be zero-address at deploy and set later via `setPool(address)` — see [ADR 003](003-payments.md#buybackburner) for the interface and [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol) for the venue rationale). The pool address remains governance-mutable post-deploy via `setPool(address)`; the constructor value is an initial convenience, not a hard requirement. **Inflow source:** `FeeRouter` ([ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ Slashing and burn](026-tokenomics.md#slashing-and-burn)). **Router address and naming:** see [ADR 018 §"Buyback execution via Balancer V3"](018-liquidity-strategy.md#buyback-execution-via-balancer-v3) for the canonical Balancer V3 Router address and the `Router v2` label disambiguation. **Approvals note:** `BuybackBurner` MUST self-approve the Balancer V3 **Vault** address (distinct from the Router) during initialization — the Vault pulls input tokens from `msg.sender`, which is `BuybackBurner`. The V3 footgun reference and Vault address live in [ADR 018](018-liquidity-strategy.md#buyback-execution-via-balancer-v3). |
+| 8 | FeeRouter | USDC address, TOKEN address, **`TimelockController` address** (treasury bucket destination), Balancer V3 Router address, `epochLength` (1 week), `claimWindow` (26 epochs), launch split shares (cross-validated against dependency addresses), and `boostFloor` (0.4) per [ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ Gauge-boost formula](026-tokenomics.md#gauge-boost-formula). **Dependency addresses** (`votingEscrow`, `safetyReserve`, `delegatorBuyer`, `buybackBurner`) may all be `address(0)` at deploy and set later via the governance-mutable setters in [§ Tunable Economics](#tunable-economics); the cross-validation invariant ensures any non-zero share has a non-zero destination at construction time. Steady-state target shares per [ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ FeeRouter split (40/40/7/5/5/3)](026-tokenomics.md#feerouter-split-40407553) are 40/40/7/5/5/3 in basis points. |
 | 9 | DelegatorBuyer | TOKEN address, USDC address, Balancer V3 Router address, initial pool address (same handling as `BuybackBurner`), and the **`FeeRouter` address** (deposit target — `depositDelegatorTokens(epoch, amount)`). Same Vault-scoped self-approval pattern. Parallel contract to `BuybackBurner` per [§ Shared swap helper](#shared-swap-helper-buybackburner--delegatorbuyer). After deployment, governance calls `FeeRouter.setDelegatorBuyer(address(delegatorBuyer))` to complete the bidirectional wiring. |
 | 10 | PaymentChannel | USDC address, StakingRegistry address, FeeRouter address, `disputeWindow` (48h), `maxChannelDuration` (90 days), rate bounds ([ADR 003](003-payments.md#adr-003-payment-model)). `settleChannel` does not skim a protocol fee inline — it transfers the full operator USDC balance to `FeeRouter.routeSettlement(operator, bytesDelivered, amount, epochId)` in the same transaction. `setFeeRouter(address)` is governance-mutable per [§ No proxy deployment patterns](#no-proxy-deployment-patterns) carve-out. |
 | 11 | PublisherRegistry | None. Permissionless registration; namespace cap and transfer-timelock parameters are read from the governance-controlled parameter store at call time. See [ADR 002 § Contract: PublisherRegistry](002-content-addressing.md#contract-publisherregistry). |
@@ -370,7 +370,7 @@ After all contracts are deployed, the deployer must execute these transactions b
    safetyReserve.grantRole(SLASH_INFLOW_REPORTER_ROLE, address(stakingRegistry));
    ```
 
-   This authorizes `StakingRegistry.slash` to call `SafetyReserve.recordSlashInflow(operator, amount)` for the 30% slashed-TOKEN redirect per [ADR 026](026-tokenomics.md#adr-026-tokenomics) §8 (challenger 50% / SafetyReserve 30% / burn 20%). **Slash currency:** stake is denominated in TOKEN, so the 30% share lands in `SafetyReserve` as TOKEN. `SafetyReserve` exposes a keeper-triggered swap (`swapAccumulatedTokens`) into the [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol) Balancer V3 80/20 pool (same Vault-scoped self-approval, TWAP, `minOut`, private-RPC, and per-epoch liquidity-cap defenses as `BuybackBurner` and the delegator-pool swap path). USDC is the only currency available for `payout`; until swapped, slashed TOKEN is held as part of `SafetyReserve`'s assets-under-management.
+   This authorizes `StakingRegistry.slash` to call `SafetyReserve.recordSlashInflow(operator, amount)` for the 30% slashed-TOKEN redirect per [ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ Slashing and burn](026-tokenomics.md#slashing-and-burn) (challenger 50% / SafetyReserve 30% / burn 20%). **Slash currency:** stake is denominated in TOKEN, so the 30% share lands in `SafetyReserve` as TOKEN. `SafetyReserve` exposes a keeper-triggered swap (`swapAccumulatedTokens`) into the [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol) Balancer V3 80/20 pool (same Vault-scoped self-approval, TWAP, `minOut`, private-RPC, and per-epoch liquidity-cap defenses as `BuybackBurner` and the delegator-pool swap path). USDC is the only currency available for `payout`; until swapped, slashed TOKEN is held as part of `SafetyReserve`'s assets-under-management.
 
 4. **Grant `ROUTER_CALLER_ROLE` on FeeRouter to PaymentChannel:**
 
@@ -386,7 +386,7 @@ After all contracts are deployed, the deployer must execute these transactions b
    stakingRegistry.grantRole(SETTLEMENT_REPORTER_ROLE, address(feeRouter));
    ```
 
-   See §3 below; `lastSettlementAt[operator]` is updated on each `routeSettlement` call.
+   See [§ Cross-Contract Call Graph](#cross-contract-call-graph) below; `lastSettlementAt[operator]` is updated on each `routeSettlement` call.
 
 6. **Register regional governance bodies** (when jurisdictional bodies are constituted):
 
@@ -406,7 +406,7 @@ After all contracts are deployed, the deployer must execute these transactions b
 
 > **Deployment atomicity.** The post-deployment initialization steps (1–7) SHOULD be executed atomically via a multicall contract or a deployment script that reverts on any failure. A partially initialized system (e.g., `SLASH_ROLE` granted but `BLACKLIST_ROLE` not yet, or `ROUTER_CALLER_ROLE` not yet granted to `PaymentChannel`) could create a window where some security mechanisms work but settlements revert or land in the wrong contract. Between deployment and initialization completion, `StakingRegistry` SHOULD reject `registerNode` calls (e.g., via a `paused` initial state or a deployment flag) to prevent nodes from registering before the security infrastructure is fully wired. A Foundry deployment script with sequential `vm.broadcast()` calls provides sufficient atomicity at launch scale.
 
-### 3. Cross-Contract Call Graph
+### Cross-Contract Call Graph
 
 ```mermaid
 graph LR
@@ -458,7 +458,7 @@ graph LR
 | PaymentChannel | StakingRegistry | `getStakeMultiple(provider)` | Public (read-only) | No |
 | PaymentChannel | IERC20 (USDC) | `safeTransferFrom()` | Caller must have allowance | Yes |
 | PaymentChannel | IERC20 (USDC) | `safeTransfer()` | Caller holds balance | Yes |
-| PaymentChannel | FeeRouter | `routeSettlement(operator, bytesDelivered, amount, epochId)` | `ROUTER_CALLER_ROLE` on FeeRouter ([ADR 026](026-tokenomics.md#adr-026-tokenomics) §2) | Yes |
+| PaymentChannel | FeeRouter | `routeSettlement(operator, bytesDelivered, amount, epochId)` | `ROUTER_CALLER_ROLE` on FeeRouter ([ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ FeeRouter split (40/40/7/5/5/3)](026-tokenomics.md#feerouter-split-40407553)) | Yes |
 | FeeRouter | VotingEscrow | `balanceOfAt(user, ts)`, `totalSupplyAt(ts)` | Public (read-only) | No |
 | FeeRouter | StakingRegistry | `recordSettlement(operator)` | `SETTLEMENT_REPORTER_ROLE` (granted to FeeRouter post-deploy; settlement counter moves with the routing call) | Yes |
 | FeeRouter | BuybackBurner | `safeTransfer()` (5% USDC same-tx) | Caller holds balance | Yes |
@@ -470,7 +470,7 @@ graph LR
 | DelegatorBuyer | FeeRouter | `depositDelegatorTokens(epoch, amount)` (deposits swapped TOKEN into `FeeRouter`'s delegator bucket so `claimDelegator` can pay against it) | Caller is the configured `DelegatorBuyer` address | Yes |
 | Governor | FeeRouter | `setShares(operatorBaseBps, gaugeBoostBps, delegatorBps, buybackBps, treasuryBps, safetyBps)`, `setVotingEscrow(addr)`, `setSafetyReserve(addr)`, `setDelegatorBuyer(addr)`, `setBuybackBurner(addr)`, `setTreasury(addr)` | `GOVERNANCE_ROLE` on FeeRouter; sum-to-10000 invariant; cross-validated against dependency addresses (see [§ Tunable Economics](#tunable-economics)) | Yes |
 | Governor | VotingEscrow | `balanceOfAt(user, ts)`, `totalSupplyAt(ts)` | Public (read-only) | No |
-| Governor | SafetyReserve | `payout(bundle, recipient, amount)` | `PAYOUT_AUTHORIZER_ROLE` (Governor + emergency-multisig within hard caps; [ADR 026](026-tokenomics.md#adr-026-tokenomics) §5) | Yes |
+| Governor | SafetyReserve | `payout(bundle, recipient, amount)` | `PAYOUT_AUTHORIZER_ROLE` (Governor + emergency-multisig within hard caps; [ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ Safety and insurance reserve (3% bucket)](026-tokenomics.md#safety-and-insurance-reserve-3-bucket)) | Yes |
 | ContentBlacklist | StakingRegistry | `ejectNode(operatorAddress)` | `BLACKLIST_ROLE` | Yes |
 | OriginAssignment | StakingRegistry | `isActive(operator)` | Public (read-only) | No |
 | OriginAssignment | PublisherRegistry | `ownerOf(namespaceId)` | Public (read-only) | No |
@@ -479,7 +479,7 @@ graph LR
 | SlashJudge | StakingRegistry | `slash(node, offenseType)` | `SLASH_ROLE` | Yes |
 | SlashJudge | IERC20 (TOKEN) | `safeTransferFrom()` / `safeTransfer()` | Caller must have allowance/balance | Yes |
 | StakingRegistry | IERC20 (TOKEN) | `safeTransferFrom()` / `safeTransfer()` | Caller must have allowance/balance | Yes |
-| StakingRegistry | SafetyReserve | `safeTransfer()` of TOKEN (30% of slashed stake; the remaining 50% goes to the challenger and 20% burns per [ADR 026](026-tokenomics.md#adr-026-tokenomics) §8). `SafetyReserve` swaps the accumulated TOKEN balance to USDC via a keeper-triggered call into the [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol) Balancer V3 80/20 pool. | Caller holds balance | Yes |
+| StakingRegistry | SafetyReserve | `safeTransfer()` of TOKEN (30% of slashed stake; the remaining 50% goes to the challenger and 20% burns per [ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ Slashing and burn](026-tokenomics.md#slashing-and-burn)). `SafetyReserve` swaps the accumulated TOKEN balance to USDC via a keeper-triggered call into the [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol) Balancer V3 80/20 pool. | Caller holds balance | Yes |
 | BuybackBurner | Balancer V3 Router | `swapSingleTokenExactIn(pool, tokenIn, tokenOut, exactAmountIn, minAmountOut, deadline, wethIsEth, userData)` | `BuybackBurner` self-approves the **Balancer V3 Vault** address (NOT the Router) during its initialization — the Vault pulls input tokens from the `msg.sender` of the Router call. This is the V3 footgun; see [ADR 018](018-liquidity-strategy.md#buyback-execution-via-balancer-v3) | Yes |
 | BuybackBurner | IERC20 (USDC, TOKEN) | `safeTransferFrom()` / `safeTransfer()` | Caller must have allowance/balance | Yes |
 
@@ -527,7 +527,7 @@ Design principles for forward compatibility:
 
 Cold-start operators (`lastSettlementAt == 0`) sink to the bottom by recency but are not excluded — they get probed once early settlers are exhausted, settle their first channel, and rise. A short on-boarding grace window can be added in a follow-up if needed.
 
-### 4. Fund Flow Diagrams
+### Fund Flow Diagrams
 
 #### USDC Flow (Payments)
 
@@ -567,7 +567,7 @@ flowchart TD
     DELE -->|"claimDelegator(epochs[])"| LockerClaim
 ```
 
-The canonical 40/40/7/5/5/3 split is in [ADR 026](026-tokenomics.md#adr-026-tokenomics) §2; this ADR does not duplicate the bucket table. Treasury disbursement requires a governance proposal ([ADR 009](009-governance.md#adr-009-governance-model)).
+The canonical 40/40/7/5/5/3 split is in [ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ FeeRouter split (40/40/7/5/5/3)](026-tokenomics.md#feerouter-split-40407553); this ADR does not duplicate the bucket table. Treasury disbursement requires a governance proposal ([ADR 009](009-governance.md#adr-009-governance-model)).
 
 #### TOKEN Flow (Staking & Slashing)
 
@@ -591,7 +591,7 @@ flowchart TD
     SJ -->|"bond forfeit: 50% burn, 50% to node"| BURN
 ```
 
-**Slashing distribution** ([ADR 026](026-tokenomics.md#adr-026-tokenomics) §8):
+**Slashing distribution** ([ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ Slashing and burn](026-tokenomics.md#slashing-and-burn)):
 
 | Destination | Share |
 | --- | ---: |
@@ -605,23 +605,23 @@ flowchart TD
 | --- | --- | --- | --- |
 | PaymentChannel | USDC | Client deposits | `settleChannel()`, `reclaimExpired()` |
 | FeeRouter | USDC (gauge + delegator epoch buckets, transient base/treasury/burn/safety legs); TOKEN (delegator-pool epoch buckets after USDC→TOKEN swap) | `PaymentChannel.settleChannel` | `claimBoost(epochs[])` (operators); `claimDelegator(epochs[])` (ve-lockers); same-tx forwards to BuybackBurner / Treasury / SafetyReserve / operator base; 26-epoch claim window then sweep to treasury |
-| VotingEscrow | TOKEN (locked, non-transferable) | User `createLock` deposits | `withdraw()` after lock expiry only; no early exit, no `create_lock_for` privileged path ([ADR 026](026-tokenomics.md#adr-026-tokenomics) §4) |
-| SafetyReserve | USDC (3% router bucket; primary holding) + TOKEN (30% slashing redirect; swapped to USDC via keeper) | `FeeRouter`, `StakingRegistry` slashing path | `payout(bundle, recipient, amount)` USDC-only after evidence bundle, Governor (or emergency-multisig within hard caps), and 48h appeal window ([ADR 026](026-tokenomics.md#adr-026-tokenomics) §5) |
+| VotingEscrow | TOKEN (locked, non-transferable) | User `createLock` deposits | `withdraw()` after lock expiry only; no early exit, no `create_lock_for` privileged path ([ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ Voting escrow (`VotingEscrow`)](026-tokenomics.md#voting-escrow-votingescrow)) |
+| SafetyReserve | USDC (3% router bucket; primary holding) + TOKEN (30% slashing redirect; swapped to USDC via keeper) | `FeeRouter`, `StakingRegistry` slashing path | `payout(bundle, recipient, amount)` USDC-only after evidence bundle, Governor (or emergency-multisig within hard caps), and 48h appeal window ([ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ Safety and insurance reserve (3% bucket)](026-tokenomics.md#safety-and-insurance-reserve-3-bucket)) |
 | StakingRegistry | TOKEN | Node operator stakes | `unstake()` after unbonding |
 | SlashJudge | TOKEN | Challenger bond deposits | Synchronous resolution inside each `submit*Challenge` (slash reward + bond return to challenger on success; revert on failed verification) |
-| BuybackBurner | USDC (accumulated), TOKEN (transient) | 5% USDC same-tx from `FeeRouter` ([ADR 026](026-tokenomics.md#adr-026-tokenomics) §8) | `executeBuyback()` |
-| DelegatorBuyer | USDC (per-epoch delegator-pool bucket, transient), TOKEN (transient before deposit back to FeeRouter) | 7% USDC same-tx from `FeeRouter` ([ADR 026](026-tokenomics.md#adr-026-tokenomics) §6) | `swapDelegatorBucket(epoch, amountIn, minOut)` (KEEPER_ROLE); deposits resulting TOKEN into `FeeRouter`'s delegator bucket for `claimDelegator` |
+| BuybackBurner | USDC (accumulated), TOKEN (transient) | 5% USDC same-tx from `FeeRouter` ([ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ Slashing and burn](026-tokenomics.md#slashing-and-burn)) | `executeBuyback()` |
+| DelegatorBuyer | USDC (per-epoch delegator-pool bucket, transient), TOKEN (transient before deposit back to FeeRouter) | 7% USDC same-tx from `FeeRouter` ([ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ Delegator pool — USDC → TOKEN conversion](026-tokenomics.md#delegator-pool--usdc--token-conversion)) | `swapDelegatorBucket(epoch, amountIn, minOut)` (KEEPER_ROLE); deposits resulting TOKEN into `FeeRouter`'s delegator bucket for `claimDelegator` |
 | TimelockController | USDC (5% protocol-treasury bucket) | 5% USDC same-tx from `FeeRouter` | Treasury disbursement requires a `DecdnGovernor` proposal under the standard 48h timelock ([ADR 009](009-governance.md#adr-009-governance-model)) |
 
 (`PublisherRegistry` and `OriginAssignment` hold no funds — they are pure registry contracts.)
 
-### 5. Access Control Matrix
+### Access Control Matrix
 
 All role-based access uses OpenZeppelin `AccessControl`. The `DEFAULT_ADMIN_ROLE` holder can grant and revoke all other roles. Named roles below (`KEEPER_ROLE`, `GOVERNANCE_ROLE`, `EMERGENCY_ROLE`) formalize the implicit access patterns described across source ADRs into concrete `AccessControl` role identifiers for implementation.
 
 #### Additive contract surface
 
-New top-level contracts integrate with the launch-time set via standard `AccessControl` role grants — governance can grant new roles or revoke existing ones via the standard 7-day vote + 48-hour timelock path, without contract changes, state migration, or redeploy of the existing contracts. The launch-time interface surface (function signatures and events on `PaymentChannel`, `FeeRouter`, `SafetyReserve`, `StakingRegistry`, `BuybackBurner`, `VotingEscrow`, `SlashJudge`) is treated as stable for cross-contract integration. Concretely: `openChannel` is permissionless, `SafetyReserve.payout(bundleHash, recipient, amount)` accepts arbitrary evidence-bundle hashes (per [ADR 026 § Safety and insurance reserve (3% bucket)](026-tokenomics.md#5-safety-and-insurance-reserve-3-bucket)), TOKEN is `ERC20Burnable` (per [ADR 026 § Supply and distribution](026-tokenomics.md#1-supply-and-distribution)), and no contract is locked to a specific set of integrators. Future contract surfaces deploy as additive top-level contracts, not as upgrades or migrations of the launch set.
+New top-level contracts integrate with the launch-time set via standard `AccessControl` role grants — governance can grant new roles or revoke existing ones via the standard 7-day vote + 48-hour timelock path, without contract changes, state migration, or redeploy of the existing contracts. The launch-time interface surface (function signatures and events on `PaymentChannel`, `FeeRouter`, `SafetyReserve`, `StakingRegistry`, `BuybackBurner`, `VotingEscrow`, `SlashJudge`) is treated as stable for cross-contract integration. Concretely: `openChannel` is permissionless, `SafetyReserve.payout(bundleHash, recipient, amount)` accepts arbitrary evidence-bundle hashes (per [ADR 026 § Safety and insurance reserve (3% bucket)](026-tokenomics.md#safety-and-insurance-reserve-3-bucket)), TOKEN is `ERC20Burnable` (per [ADR 026 § Supply and distribution](026-tokenomics.md#supply-and-distribution)), and no contract is locked to a specific set of integrators. Future contract surfaces deploy as additive top-level contracts, not as upgrades or migrations of the launch set.
 
 #### Role Assignments
 
@@ -631,11 +631,11 @@ New top-level contracts integrate with the launch-time set via standard `AccessC
 | `BLACKLIST_ROLE` | StakingRegistry | `ejectNode()` | ContentBlacklist contract | ContentBlacklist contract |
 | `GOVERNANCE_ROLE` | OriginAssignment | `activateAssignment()`, `revokeAssignment()`, `setMinRedundancy()`, `setMaxOriginsPerNamespace()`, `setAssignmentTimelock()`, `setDefaultOpenAllowlist()`, `addDefaultOpenOperator()`, `removeDefaultOpenOperator()`, `setDefaultOpenMinRedundancy()`, `setDefaultOpenMaxOrigins()` | Admin | Governor via timelock |
 | `SLASH_ROLE` | StakingRegistry | `slash()` | SlashJudge contract | SlashJudge contract |
-| `SETTLEMENT_REPORTER_ROLE` | StakingRegistry | `recordSettlement(operator)` | FeeRouter | FeeRouter; see [§ Cross-Contract Call Graph](#3-cross-contract-call-graph) |
+| `SETTLEMENT_REPORTER_ROLE` | StakingRegistry | `recordSettlement(operator)` | FeeRouter | FeeRouter; see [§ Cross-Contract Call Graph](#cross-contract-call-graph) |
 | `SLASH_INFLOW_REPORTER_ROLE` | SafetyReserve | `recordSlashInflow(operator, amount)` | StakingRegistry | StakingRegistry; granted post-deploy. Mirrors `SETTLEMENT_REPORTER_ROLE` — gives auditors a clean event to track slash-redirect provenance |
 | `KEEPER_ROLE` | BuybackBurner, FeeRouter, SafetyReserve | `executeBuyback()` (BuybackBurner), `executeDelegatorSwap(epochId, minOut)` (FeeRouter), `swapAccumulatedTokens(amountIn, minOut)` (SafetyReserve) | Admin / disabled | Keeper bot or governance |
 | `ROUTER_CALLER_ROLE` | FeeRouter | `routeSettlement(op, bytes, amount)` | PaymentChannel | PaymentChannel (and any future settlement-emitting contract) |
-| `PAYOUT_AUTHORIZER_ROLE` | SafetyReserve | `payout(bundle, recipient, amount)` | n/a | Governor via timelock; emergency multisig within hard caps ([ADR 026](026-tokenomics.md#adr-026-tokenomics) §5) |
+| `PAYOUT_AUTHORIZER_ROLE` | SafetyReserve | `payout(bundle, recipient, amount)` | n/a | Governor via timelock; emergency multisig within hard caps ([ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ Safety and insurance reserve (3% bucket)](026-tokenomics.md#safety-and-insurance-reserve-3-bucket)) |
 | `GOVERNANCE_ROLE` | ContentBlacklist, FeeRouter (share parameters / `boostFloor`) | `addHash()`, `removeHash()`, `addOrigin()`, `removeOrigin()`, `registerRegionalBody()` (ContentBlacklist); `setShares(...)`, `setBoostFloor(...)` (FeeRouter) | Admin | Governor via timelock |
 | `EMERGENCY_ROLE` | ContentBlacklist (emergency functions), fund-holding contracts (`pause()`), SafetyReserve (fast-track payout under hard caps) | `emergencyAdd()`, `emergencyAddOrigin()`, `suspendRegionalBody()` (ContentBlacklist); `pause()` (Pausable contracts only); `payout(...)` under hard caps (SafetyReserve) | Admin | 3-of-5 multisig (12-month sunset) |
 | Regional body | ContentBlacklist | `addHashRegional(region)` | Not registered at launch | Per-jurisdiction multisig |
@@ -648,12 +648,12 @@ Full parameter table with safety bounds is in [ADR 009](009-governance.md#govern
 | --- | --- | --- | --- |
 | Slash % per offense | 5% | 50% | StakingRegistry |
 | Dispute window | 12h | 72h | PaymentChannel |
-| **Minimum stake** | **50,000 TOKEN (default)** | **per [ADR 026](026-tokenomics.md#adr-026-tokenomics) §7** | **StakingRegistry — discount-threshold logic removed** |
+| **Minimum stake** | **50,000 TOKEN (default)** | **per [ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ Operator economics and minimum stake](026-tokenomics.md#operator-economics-and-minimum-stake)** | **StakingRegistry — discount-threshold logic removed** |
 | Challenge bond | 1 TOKEN | 1,000 TOKEN | SlashJudge (note: [ADR 009](009-governance.md#adr-009-governance-model) lists this under StakingRegistry; SlashJudge is correct per [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)) |
 | Unbonding period | 3 days | 30 days | StakingRegistry |
 | **VotingEscrow lock duration** | **1 week (min)** | **4 years (max)** | **VotingEscrow** (`immutable`) |
 
-The six FeeRouter shares (with their bounds and defaults) and `boostFloor` are governed in `FeeRouter` per [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#11-governable-parameters-with-safety-bounds); sum-to-100% across the six shares is enforced on every governance update. Other safety bounds are `immutable` — hardcoded in constructors, not overridable by governance or admin.
+The six FeeRouter shares (with their bounds and defaults) and `boostFloor` are governed in `FeeRouter` per [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds); sum-to-100% across the six shares is enforced on every governance update. Other safety bounds are `immutable` — hardcoded in constructors, not overridable by governance or admin.
 
 #### Emergency Multisig (Production)
 
@@ -665,7 +665,7 @@ The six FeeRouter shares (with their bounds and defaults) and `boostFloor` are g
 - **12-month sunset:** All emergency functions revert after `block.timestamp > deployTimestamp + 365 days` ([ADR 009](009-governance.md#emergency-multisig))
 - Emergency blacklist entries expire after 14 days unless ratified by governance
 
-### 6. Reentrancy Analysis
+### Reentrancy Analysis
 
 Every state-mutating function that makes an external call is listed below with its guards and call pattern.
 
@@ -684,7 +684,7 @@ Every state-mutating function that makes an external call is listed below with i
 | --- | --- | --- |
 | `stake()` | `IERC20.safeTransferFrom()` (TOKEN) | `nonReentrant`, checks-effects-interactions |
 | `unstake()` | `IERC20.safeTransfer()` (TOKEN) | `nonReentrant`, checks-effects-interactions |
-| `slash()` | `IERC20.safeTransfer()` (TOKEN: 50% challenger / 30% SafetyReserve / 20% burn per [ADR 026](026-tokenomics.md#adr-026-tokenomics) §8) | `nonReentrant`, checks-effects-interactions, `SLASH_ROLE` |
+| `slash()` | `IERC20.safeTransfer()` (TOKEN: 50% challenger / 30% SafetyReserve / 20% burn per [ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ Slashing and burn](026-tokenomics.md#slashing-and-burn)) | `nonReentrant`, checks-effects-interactions, `SLASH_ROLE` |
 | `recordSettlement(operator)` | None (single SSTORE) | `SETTLEMENT_REPORTER_ROLE` |
 | `ejectNode()` | None (state change only) | `BLACKLIST_ROLE` |
 | `getStakeMultiple()` | None (read-only) | N/A |
@@ -705,7 +705,7 @@ Every state-mutating function that makes an external call is listed below with i
 
 > **MEV protection (production).** See [ADR 018 — Buyback execution via Balancer V3](018-liquidity-strategy.md#buyback-execution-via-balancer-v3) for the authoritative policy. In summary: Balancer's weighted-pool curve reduces (but does not eliminate) price-impact concerns compared to concentrated liquidity, and `executeBuyback` MAY split large buybacks into `subSwapCount` sub-swaps spaced by `subSwapMinBlockGap` blocks. **Direct Router execution with TWAP + `minTokenOut` guards is the primary production path and the required fallback.** Routing through CoW Swap is a conditional add-on that requires operator verification of CoW solver routing against the deployed Balancer V3 pool (per [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol)'s activation criteria); if CoW routing is unavailable or regresses, direct Router + TWAP remains correct. The `maxBuybackAmount` parameter MUST be enforced to limit per-transaction MEV exposure regardless of venue.
 
-> **Inflow source.** Under [ADR 026](026-tokenomics.md#adr-026-tokenomics) §8, `BuybackBurner` receives the buyback share (5% of every settlement at steady state) same-tx from `FeeRouter`; share is governance-tunable per [§ Tunable Economics](#tunable-economics). The `executeBuyback` mechanics, `KEEPER_ROLE`-gating, and Vault-scoped self-approval pattern are independent of the share value.
+> **Inflow source.** Under [ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ Slashing and burn](026-tokenomics.md#slashing-and-burn), `BuybackBurner` receives the buyback share (5% of every settlement at steady state) same-tx from `FeeRouter`; share is governance-tunable per [§ Tunable Economics](#tunable-economics). The `executeBuyback` mechanics, `KEEPER_ROLE`-gating, and Vault-scoped self-approval pattern are independent of the share value.
 
 #### FeeRouter
 
@@ -714,11 +714,11 @@ Every state-mutating function that makes an external call is listed below with i
 | `routeSettlement(operator, bytesDelivered, amount, epochId)` | `IERC20.safeTransfer()` × 4 (operator base 40%, BuybackBurner 5%, Treasury 5%, SafetyReserve 3%; gauge 40% and delegator 7% retained in epoch USDC buckets, no transfer), `StakingRegistry.recordSettlement(operator)`. State updates: increments per-epoch USDC accumulators for the gauge and delegator buckets; increments `bytesPerEpoch[operator][epochId]` for the gauge formula; emits `Settled`. Off-chain reputation indexers correlate this `Settled` event with `PaymentChannel.ChannelSettled(channelId, ...)` from the same transaction to recover the channel context (channel.client lookup via the historical `ChannelOpened` event). Gauge eligibility (`bytes_i` in the [ADR 034 § Gauge-boost formula](034-gauge-boost-voting-escrow.md#gauge-boost-formula) formula) is sourced from this view at gauge-claim time, with the per-operator share cap binding the output. | `nonReentrant`, checks-effects-interactions, `ROUTER_CALLER_ROLE` |
 | `claimBoost(epochs[])` | `IERC20.safeTransfer()` (USDC to claiming operator), `VotingEscrow.balanceOfAt(...)` × N epochs (read), `VotingEscrow.totalSupplyAt(...)` × N epochs (read) | `nonReentrant`, checks-effects-interactions; epoch must be finalized |
 | `claimDelegator(epochs[])` | `IERC20.safeTransfer()` (TOKEN to claiming ve-locker), `VotingEscrow.balanceOfAt(...)` × N (read), `VotingEscrow.totalSupplyAt(...)` × N (read) | `nonReentrant`, checks-effects-interactions; epoch's delegator-pool USDC→TOKEN swap must be settled |
-| `executeDelegatorSwap(epoch, minOut)` | `BalancerV3Router.swapSingleTokenExactIn()` (Vault-scoped self-approval, same V3 footgun pattern as `BuybackBurner`) | `nonReentrant`, checks-effects-interactions, `KEEPER_ROLE`; per-epoch liquidity caps and TWAP-window guards REQUIRED ([ADR 026](026-tokenomics.md#adr-026-tokenomics) §6) |
-| `setShares(...)`, `setBoostFloor(...)` | None (state change only) | `GOVERNANCE_ROLE` (Governor via timelock); sum-to-100% across the six router shares enforced; per-share bounds enforced ([ADR 026](026-tokenomics.md#adr-026-tokenomics) §11) |
+| `executeDelegatorSwap(epoch, minOut)` | `BalancerV3Router.swapSingleTokenExactIn()` (Vault-scoped self-approval, same V3 footgun pattern as `BuybackBurner`) | `nonReentrant`, checks-effects-interactions, `KEEPER_ROLE`; per-epoch liquidity caps and TWAP-window guards REQUIRED ([ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ Delegator pool — USDC → TOKEN conversion](026-tokenomics.md#delegator-pool--usdc--token-conversion)) |
+| `setShares(...)`, `setBoostFloor(...)` | None (state change only) | `GOVERNANCE_ROLE` (Governor via timelock); sum-to-100% across the six router shares enforced; per-share bounds enforced ([ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds)) |
 | `sweepUnclaimed(epoch)` | `IERC20.safeTransfer()` (USDC/TOKEN to treasury) | `nonReentrant`, checks-effects-interactions; only callable after the 26-epoch claim window expires |
 
-> **Cashflow invariant.** The 20% lower bound on the node-base share is `immutable` and guarantees operators always receive enough liquid USDC to cover at least a meaningful fraction of infrastructure costs even under extreme governance proposals. See [ADR 026](026-tokenomics.md#adr-026-tokenomics) §11.
+> **Cashflow invariant.** The 20% lower bound on the node-base share is `immutable` and guarantees operators always receive enough liquid USDC to cover at least a meaningful fraction of infrastructure costs even under extreme governance proposals. See [ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds).
 
 #### VotingEscrow
 
@@ -729,13 +729,13 @@ Every state-mutating function that makes an external call is listed below with i
 | `withdraw()` | `IERC20.safeTransfer()` (TOKEN) | `nonReentrant`, checks-effects-interactions; only callable after lock expiry; **no early-exit penalty path** |
 | `balanceOfAt(user, ts)`, `totalSupplyAt(ts)` | None (read-only; per-lock checkpoint binary search) | N/A |
 
-> **No `create_lock_for` privileged path.** Auto-ve-lock-on-vest is removed ([ADR 026](026-tokenomics.md#adr-026-tokenomics) §1, §4). All ve-positions are voluntarily created by the locker. **No slashing path on ve-locked TOKEN** — the slashing-immunity invariant is enforced by the absence of any `slash` / `burn` / `sweep` entry point on `VotingEscrow`. Operator stake (slashable) lives in `StakingRegistry`; ve-positions (non-slashable) live here. An operator may hold any combination but the contracts never share state.
+> **No `create_lock_for` privileged path.** Auto-ve-lock-on-vest is removed ([ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ Supply and distribution](026-tokenomics.md#supply-and-distribution), [§ Fund Flow Diagrams](#fund-flow-diagrams)). All ve-positions are voluntarily created by the locker. **No slashing path on ve-locked TOKEN** — the slashing-immunity invariant is enforced by the absence of any `slash` / `burn` / `sweep` entry point on `VotingEscrow`. Operator stake (slashable) lives in `StakingRegistry`; ve-positions (non-slashable) live here. An operator may hold any combination but the contracts never share state.
 
 #### SafetyReserve
 
 | Function | External Calls | Guards |
 | --- | --- | --- |
-| `payout(bundle, recipient, amount)` | `IERC20.safeTransfer()` (USDC to recipient) | `nonReentrant`, checks-effects-interactions, `PAYOUT_AUTHORIZER_ROLE` (Governor via timelock; emergency multisig under hard caps); attested incident bundle REQUIRED; 48h appeal window REQUIRED before disbursement; post-incident registry write atomic with disbursement ([ADR 026](026-tokenomics.md#adr-026-tokenomics) §5) |
+| `payout(bundle, recipient, amount)` | `IERC20.safeTransfer()` (USDC to recipient) | `nonReentrant`, checks-effects-interactions, `PAYOUT_AUTHORIZER_ROLE` (Governor via timelock; emergency multisig under hard caps); attested incident bundle REQUIRED; 48h appeal window REQUIRED before disbursement; post-incident registry write atomic with disbursement ([ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ Safety and insurance reserve (3% bucket)](026-tokenomics.md#safety-and-insurance-reserve-3-bucket)) |
 | `recordIncident(bundle)` | None (event + storage write) | Public; bundle signature verified against attestor allowlist |
 | `challengeIncident(id, evidence)` | None (storage write) | Public during 48h appeal window; valid challenge pauses disbursement pending Governor resolution |
 
@@ -773,7 +773,7 @@ The contract holds no funds. It maintains an `EnumerableSet` of currently-author
 
 `PaymentChannel` moves USDC on `openChannel`, `topUp`, `settleChannel`, and `reclaimExpired`. All such functions use `nonReentrant` guards and follow checks-effects-interactions, and all ERC-20 interactions use OpenZeppelin `SafeERC20` ([ADR 003](003-payments.md#adr-003-payment-model)). The payment token is USDC, fixed at deployment — a standard ERC-20 with no fee-on-transfer, rebase, default-pausable, or transfer-hook behavior.
 
-### 7. OpenZeppelin Framework Usage
+### OpenZeppelin Framework Usage
 
 Every deCDN contract should inherit from audited OpenZeppelin base contracts rather than implementing security primitives from scratch.
 
@@ -787,18 +787,18 @@ Every deCDN contract should inherit from audited OpenZeppelin base contracts rat
 | `EIP712` | PaymentChannel, SlashJudge, StakingRegistry (`bindNode`), SafetyReserve (attested incident bundles) | Domain separator for voucher/slash/incident-bundle signature verification |
 | `SignatureChecker` | PaymentChannel, StakingRegistry, SlashJudge, SafetyReserve | Unified EOA + ERC-1271 smart account signature verification ([ADR 024](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support)) |
 | `ERC20` + `ERC20Permit` + `ERC20Votes` | TOKEN | Fixed-supply fungible token with gasless approvals and historical voting weight |
-| `Governor` + `GovernorSettings` + `GovernorVotes` + `GovernorVotesQuorumFraction` + `GovernorTimelockControl` | DecdnGovernor | Token-weighted voting; voting weight sourced from `VotingEscrow.balanceOfAt` per [ADR 026](026-tokenomics.md#adr-026-tokenomics) §9 |
+| `Governor` + `GovernorSettings` + `GovernorVotes` + `GovernorVotesQuorumFraction` + `GovernorTimelockControl` | DecdnGovernor | Token-weighted voting; voting weight sourced from `VotingEscrow.balanceOfAt` per [ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ Governance](026-tokenomics.md#governance) |
 | `TimelockController` | TimelockController | Queued execution of governance proposals (48h delay); custodian of the protocol-treasury 5% bucket |
 
 **Rationale:** OpenZeppelin Contracts are the most widely audited Solidity library, used by the majority of production DeFi protocols. Using audited primitives for access control, reentrancy protection, token handling, and governance eliminates entire classes of implementation bugs and reduces the surface area that a security audit must cover to deCDN-specific business logic.
 
-### 8. Launch vs Steady-State Configuration
+### Launch vs Steady-State Configuration
 
-The contract surface is identical at launch and at steady state — every contract in [§1 Contract Inventory](#1-contract-inventory) ships in a single audit pass. Behavioral differences across the network's lifecycle are governance-tunable parameters, not contract redeployments.
+The contract surface is identical at launch and at steady state — every contract in [§ Contract Inventory](#contract-inventory) ships in a single audit pass. Behavioral differences across the network's lifecycle are governance-tunable parameters, not contract redeployments.
 
 | Aspect | At launch (typical) | At steady state |
 | --- | --- | --- |
-| `FeeRouter.setShares` | `8000 / 0 / 0 / 1000 / 1000 / 0` (operator / gauge / delegator / buyback / treasury / safety) — only same-tx legs active until `VotingEscrow` / `SafetyReserve` / `DelegatorBuyer` are wired | `4000 / 4000 / 700 / 500 / 500 / 300` per [ADR 026](026-tokenomics.md#adr-026-tokenomics) §2 |
+| `FeeRouter.setShares` | `8000 / 0 / 0 / 1000 / 1000 / 0` (operator / gauge / delegator / buyback / treasury / safety) — only same-tx legs active until `VotingEscrow` / `SafetyReserve` / `DelegatorBuyer` are wired | `4000 / 4000 / 700 / 500 / 500 / 300` per [ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ FeeRouter split (40/40/7/5/5/3)](026-tokenomics.md#feerouter-split-40407553) |
 | `FeeRouter` dependency addresses | `votingEscrow / safetyReserve / delegatorBuyer = address(0)` permitted at deploy; `setVotingEscrow(addr)` etc. activate them | All wired |
 | `DEFAULT_ADMIN_ROLE` holder | Deployer EOA (handed off to `TimelockController` immediately post-deploy per [§ Post-Deployment Initialization](#post-deployment-initialization) step 7) | `TimelockController` |
 | `DecdnGovernor` activity | Deployed but no proposals pending | Active proposal stream |
@@ -806,9 +806,9 @@ The contract surface is identical at launch and at steady state — every contra
 | Default-open allow-list | `defaultOpenAllowlistActive == false`; `isAuthorizedOrigin(0, op)` permissive (any active staker) | Activated; strict membership |
 | Regional governance bodies | Not registered | Per-jurisdiction multisigs registered as needed |
 | `BuybackBurner.executeBuyback` | Callable from day one; share = 0 means no USDC to swap until `setShares` raises the buyback bucket | Routinely keeper-triggered |
-| Slashing distribution | 50% challenger / 30% SafetyReserve / 20% burn ([ADR 026](026-tokenomics.md#adr-026-tokenomics) §8) — applies as soon as `SafetyReserve` is wired into `StakingRegistry`'s slash-redirect path | Same |
+| Slashing distribution | 50% challenger / 30% SafetyReserve / 20% burn ([ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ Slashing and burn](026-tokenomics.md#slashing-and-burn)) — applies as soon as `SafetyReserve` is wired into `StakingRegistry`'s slash-redirect path | Same |
 | `TOKEN` supply | 1B fixed at genesis; no mint function | Same |
-| Minimum stake | 50,000 TOKEN per [ADR 026](026-tokenomics.md#adr-026-tokenomics) §7 | Same |
+| Minimum stake | 50,000 TOKEN per [ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ Operator economics and minimum stake](026-tokenomics.md#operator-economics-and-minimum-stake) | Same |
 
 **No contract migration is planned.** Tunable parameters and governance-mutable dependency addresses (per [§ Tunable Economics](#tunable-economics)) carry the system from launch to steady state without redeployment.
 
