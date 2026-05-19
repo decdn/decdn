@@ -15,11 +15,10 @@
 
 The PoC runs on **Arbitrum Sepolia**. TOKEN is canonical on one L2 — all staking, channel settlements, and governance happen on this chain. This ADR selects the production L2.
 
-The choice affects the criteria enumerated below. Dependent ADRs: **ADR 003 / ADR
-014** gas estimates assume Arbitrum-class L2 fee markets; [ADR 003 § L2 sequencer
+The choice affects the criteria enumerated below. Dependent ADRs: **[ADR 003](003-payments.md) / [ADR 014](014-on-chain-verification.md)** gas estimates assume Arbitrum-class L2 fee markets; [ADR 003 § L2 sequencer
 censorship](003-payments.md#l2-sequencer-censorship) assumes
 forced-inclusion delay ≤ 24 hours (Arbitrum value), which lower-bounds the dispute
-window; **ADR 018**'s Balancer V3 Router address (canonical: see
+window; **[ADR 018](018-liquidity-strategy.md)**'s Balancer V3 Router address (canonical: see
 [ADR 018 §"Buyback execution via Balancer V3"](018-liquidity-strategy.md#buyback-execution-via-balancer-v3))
 is labelled the Arbitrum mainnet address.
 
@@ -31,11 +30,11 @@ Three OP-Stack / Nitro L2s evaluated: **Arbitrum One**, **Base**, **OP Mainnet**
 
 | Factor | Relevance to deCDN |
 |--------|--------------------|
-| Gas costs at current fee market | Directly affects channel open/close/settle economics (ADR 003 §Deposit Economics) |
-| Sequencer forced-inclusion delay | Hard lower-bound on dispute window; must exceed this value (ADR 003 §L2 sequencer censorship) |
+| Gas costs at current fee market | Directly affects channel open/close/settle economics ([ADR 003 § Deposit Economics](003-payments.md#deposit-economics)) |
+| Sequencer forced-inclusion delay | Hard lower-bound on dispute window; must exceed this value ([ADR 003 § L2 sequencer censorship](003-payments.md#l2-sequencer-censorship)) |
 | Native USDC availability | Eliminates Circle bridge counterparty risk for payment channels |
-| Balancer V3 deployment | ADR 018 requires a Balancer V3 Weighted Pool for TOKEN/USDC POL |
-| Aggregator routing density | Affects buyback execution quality and CoW Swap solver availability (ADR 018) |
+| Balancer V3 deployment | [ADR 018](018-liquidity-strategy.md) requires a Balancer V3 Weighted Pool for TOKEN/USDC POL |
+| Aggregator routing density | Affects buyback execution quality and CoW Swap solver availability ([ADR 018](018-liquidity-strategy.md)) |
 | DeFi ecosystem depth | Thin overall liquidity amplifies TOKEN/USDC pool slippage |
 | Arbitrum Sepolia continuity | Sepolia → mainnet same-family migration avoids contract redesign |
 | OpenZeppelin Governor compatibility | Governor + TimelockController deployment must be straightforward |
@@ -64,7 +63,7 @@ values — prose covers only the non-table rationale and cross-ADR consequences)
 ### Gas and Fee Characteristics
 
 Post-EIP-4844 all three use blob data (Nitro adds calldata compression). The
-[ADR 003 §Deposit Economics](003-payments.md#deposit-economics) gas estimates
+[ADR 003 § Deposit Economics](003-payments.md#deposit-economics) gas estimates
 (`openChannel` ~$0.05, `closeChannel` ~$0.10, `settleChannel` ~$0.08) are calibrated
 for Arbitrum and stay accurate for 2026 fee markets on all three within an order of
 magnitude.
@@ -74,16 +73,16 @@ magnitude.
 [ADR 003 § L2 sequencer censorship](003-payments.md#l2-sequencer-censorship) sets
 the default dispute window at **48 hours** for a 24-hour effective response window
 under worst-case censorship (forced-inclusion ≤ 24 h); with all three at ~24 h, 48 h
-is adequate and no ADR 003 parameter change is required. ADR 009 governance bounds
+is adequate and no [ADR 003](003-payments.md) parameter change is required. [ADR 009](009-governance.md) governance bounds
 (12 h–72 h) apply identically; the 12-hour floor is unsafe wherever forced-inclusion
 exceeds 12 hours — a governance guardrail issue independent of the chain chosen here.
 
 ### Balancer V3 and Liquidity
 
-Balancer V3 is deployed on all three; Arbitrum is preferred because ADR 018 already
+Balancer V3 is deployed on all three; Arbitrum is preferred because [ADR 018](018-liquidity-strategy.md) already
 embedded the Arbitrum mainnet Balancer V3 Router address (canonical:
 [ADR 018](018-liquidity-strategy.md#buyback-execution-via-balancer-v3)), CoW Swap
-solver coverage of Balancer V3 pools is most mature on Arbitrum One (ADR 018
+solver coverage of Balancer V3 pools is most mature on Arbitrum One ([ADR 018](018-liquidity-strategy.md)
 requires operator CoW-routing verification pre-production, most likely to succeed on
 Arbitrum), and Arbitrum's largest-of-three DeFi TVL reduces TOKEN/USDC pool slippage
 for buybacks on thin early-production liquidity.
@@ -102,8 +101,8 @@ Deploy deCDN production contracts on Arbitrum One (chain ID 42161).
 Rationale:
 
 1. **Cross-ADR calibration** — Balancer V3 Router address, CoW Swap routing
-   assumptions, and aggregator density (ADR 018), gas estimates (ADR 003), and the
-   forced-inclusion window (ADR 003 § L2 sequencer censorship) are all calibrated
+   assumptions, and aggregator density ([ADR 018](018-liquidity-strategy.md)), gas estimates ([ADR 003](003-payments.md)), and the
+   forced-inclusion window ([ADR 003 § L2 sequencer censorship](003-payments.md#l2-sequencer-censorship)) are all calibrated
    for Arbitrum One; changing chains would require re-validating all of them.
 2. **Highest DeFi liquidity depth** — thinner competition for TOKEN/USDC pool depth
    in early production; better buyback execution quality.
@@ -136,10 +135,10 @@ Canonical reference for Arbitrum-specific assumptions elsewhere in the ADR set:
 
 | ADR | Assumption |
 |-----|------------|
-| ADR 003 § Deposit Economics | Gas table calibrated against Arbitrum One fee market |
-| ADR 003 § L2 Sequencer Censorship | Forced-inclusion delay ≤ 24 h (Arbitrum value) |
-| ADR 018 § Buyback execution | Balancer V3 Router address is the Arbitrum One deployment |
-| ADR 016 § Deployment | "Arbitrum mainnet" in the BuybackBurner row |
+| [ADR 003 § Deposit Economics](003-payments.md#deposit-economics) | Gas table calibrated against Arbitrum One fee market |
+| [ADR 003 § L2 Sequencer Censorship](003-payments.md#l2-sequencer-censorship) | Forced-inclusion delay ≤ 24 h (Arbitrum value) |
+| [ADR 018 § Buyback execution via Balancer V3](018-liquidity-strategy.md#buyback-execution-via-balancer-v3) | Balancer V3 Router address is the Arbitrum One deployment |
+| [ADR 016 § Deployment Order](016-contract-interactions.md#2-deployment-order-and-initialization-dependencies) | "Arbitrum mainnet" in the BuybackBurner row |
 
 ### Chain-Specific Constants
 
@@ -155,7 +154,7 @@ Canonical reference for Arbitrum-specific assumptions elsewhere in the ADR set:
 | Block time | ~250 ms | Arbitrum Nitro |
 | RIP-7212 Ed25519 precompile | Not deployed | Verified 2026-04 against both Arbitrum One and Sepolia |
 | Testnet sibling | Arbitrum Sepolia | Used for PoC; same Nitro architecture and tooling |
-| Reference gas price (early 2026) | ~$0.50 per 1M gas | Underlying rate behind the per-operation costs cited in ADR 003 and ADR 014 |
+| Reference gas price (early 2026) | ~$0.50 per 1M gas | Underlying rate behind the per-operation costs cited in [ADR 003](003-payments.md) and [ADR 014](014-on-chain-verification.md) |
 
 > **Address verification.** Addresses MUST be re-confirmed against the Arbitrum One
 > deployment registry and Arbiscan at deployment time. Balancer V3 addresses correct
@@ -164,7 +163,7 @@ Canonical reference for Arbitrum-specific assumptions elsewhere in the ADR set:
 
 ### Deployment Runbook Impact
 
-The production deployment runbook (ADR 016) substitutes Arbitrum Sepolia addresses
+The production deployment runbook ([ADR 016](016-contract-interactions.md)) substitutes Arbitrum Sepolia addresses
 for Arbitrum One mainnet equivalents at each step. No contract logic changes.
 
 ### Tokenomics Validation Requirements

@@ -168,7 +168,7 @@ Surfacing these reasons off-chain saves both parties the gas of a doomed on-chai
 ### Negative
 
 - Clients must hold the payment token and the L2's native gas currency to use the network; this adds an onboarding step compared to a single-currency model. Gas-overhead percentages and the gasless-open deferral are quantified in [Deposit Economics](#deposit-economics)
-- Rate volatility: a node can change its advertised rate between a probe and a stream request; the `StreamResponse` rate is the binding one, but a client that probed at one rate and receives a higher rate in `StreamResponse` must disconnect and re-probe rather than having been deceived silently. Rate changes more than 30 seconds after the probe are not slashable; the 30-second window is precisely defined as `stream_response.timestamp_us >= probe_response.timestamp_us && stream_response.timestamp_us - probe_response.timestamp_us < 30_000_000` using requester-anchored timestamps in both signed messages (see ADR 005)
+- Rate volatility: a node can change its advertised rate between a probe and a stream request; the `StreamResponse` rate is the binding one, but a client that probed at one rate and receives a higher rate in `StreamResponse` must disconnect and re-probe rather than having been deceived silently. Rate changes more than 30 seconds after the probe are not slashable; the 30-second window is precisely defined as `stream_response.timestamp_us >= probe_response.timestamp_us && stream_response.timestamp_us - probe_response.timestamp_us < 30_000_000` using requester-anchored timestamps in both signed messages (see [ADR 005](005-protocol.md))
 - USDC is issued by Circle, which can freeze specific addresses or blacklist the contract. This counterparty risk is accepted: the payment token is fixed to USDC at deployment and the protocol does not implement payment-token substitution
 
 ## Attack Vectors
@@ -212,7 +212,7 @@ Client sends probe requests to many nodes at high frequency to map the network o
 
 Per-NodeId rate limiting alone is bypassable: clients are not staked, NodeIds are free to rotate, and iroh connection setup is cheap. The mitigation is the layered token-bucket rate limit in [ADR 005 § Probe rate limiting](005-protocol.md#probe-rate-limiting): per-peer (NodeId) plus per-IP plus a global node cap, applied before any signature or hold-slot allocation. The per-IP layer raises the cost of bulk probing because IP rotation requires money (proxies, IPv6 delegation, cloud bills) while NodeId rotation does not; the global cap is defence in depth.
 
-**Note:** Probe responses are considered public information (see ADR 005). The concern here is resource exhaustion from bulk probing, not information leakage — content availability is discoverable via probing (see ADR 005), and pricing is revealed in probe/stream responses by design.
+**Note:** Probe responses are considered public information (see [ADR 005](005-protocol.md)). The concern here is resource exhaustion from bulk probing, not information leakage — content availability is discoverable via probing (see [ADR 005](005-protocol.md)), and pricing is revealed in probe/stream responses by design.
 
 #### Double-spend across nodes
 
@@ -234,19 +234,19 @@ Node serves bytes that don't match the advertised BLAKE3 hash.
 
 Absorbed at the wire by progressive BLAKE3 verification at the client (mandatory in `cdn/client/v1` per [ADR 002](002-content-addressing.md) and [ADR 005](005-protocol.md)). Vouchers are signed and sent only after the corresponding chunks have been verified — a corrupt window therefore yields no voucher. The client drops the connection, requests the blob from a different node, and recovers any unspent channel funds via channel-close. **Client monetary loss in the corruption case is zero**; the only cost is downstream bandwidth (sunk regardless of outcome).
 
-No on-chain slash machinery is needed for content corruption. The threat is bounded in framing parallel to [§Voucher withholding](#voucher-withholding) above: per-encounter wasted bandwidth is capped at one `voucher_interval` on each side (the client's downstream cost for a corrupt window; the node's upstream cost when a correctly-withheld voucher leaves the window unpaid). Both sides set local acceptance policies — nodes refuse continued service to keys with elevated voucher-withhold rates and may cap total bytes for keys without established history; clients prefer nodes whose probe and delivery history they trust — without protocol-level coordination. Client reputation is a node-local concern; this ADR does not specify a wire format or on-chain surface for it.
+No on-chain slash machinery is needed for content corruption. The threat is bounded in framing parallel to [§ Voucher withholding](#voucher-withholding) above: per-encounter wasted bandwidth is capped at one `voucher_interval` on each side (the client's downstream cost for a corrupt window; the node's upstream cost when a correctly-withheld voucher leaves the window unpaid). Both sides set local acceptance policies — nodes refuse continued service to keys with elevated voucher-withhold rates and may cap total bytes for keys without established history; clients prefer nodes whose probe and delivery history they trust — without protocol-level coordination. Client reputation is a node-local concern; this ADR does not specify a wire format or on-chain surface for it.
 
 #### Rate bait-and-switch
 
 Node advertises a low rate in probe responses then returns a higher rate in `StreamResponse`.
 
-**Resolved: slashable offense.** Both responses are signed over the advertised rate ([ADR 005](005-protocol.md)); a same-NodeId signed pair where `StreamResponse.rate_per_mb > ProbeResponse.rate_per_mb` and the requester-anchored timestamp delta is under 30 seconds is on-chain-verifiable evidence. Clock-skew immune (both timestamps originate from the requester's clock; the node echoes them back in its signed response). The slash schedule lives in [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn); see [ADR 014 § 1](014-on-chain-verification.md#1-slash-signatures--secp256k1-eip-712) for the on-chain verifier.
+**Resolved: slashable offense.** Both responses are signed over the advertised rate ([ADR 005](005-protocol.md)); a same-NodeId signed pair where `StreamResponse.rate_per_mb > ProbeResponse.rate_per_mb` and the requester-anchored timestamp delta is under 30 seconds is on-chain-verifiable evidence. Clock-skew immune (both timestamps originate from the requester's clock; the node echoes them back in its signed response). The slash schedule lives in [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn); see [ADR 014 §1](014-on-chain-verification.md#1-slash-signatures--secp256k1-eip-712) for the on-chain verifier.
 
 #### Phantom blob announcement
 
 Node announces a blob as cached (`has_blob: true` in a signed `ProbeResponse`) then fails or redirects on actual request.
 
-**Resolved: slashable offense.** A same-NodeId signed `ProbeResponse(has_blob: true)` paired with a signed `StreamResponse(ok: false)` or redirect for the same hash within a 30-second requester-anchored timestamp window is on-chain-verifiable evidence. The bare timeout / non-response case is reputation-only (no second signed message → not slashable on-chain). Slash schedule per [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn); on-chain verifier per [ADR 014 § 1](014-on-chain-verification.md#1-slash-signatures--secp256k1-eip-712); slash executes synchronously at submit time per [ADR 014 §Bond Handling](014-on-chain-verification.md#bond-handling).
+**Resolved: slashable offense.** A same-NodeId signed `ProbeResponse(has_blob: true)` paired with a signed `StreamResponse(ok: false)` or redirect for the same hash within a 30-second requester-anchored timestamp window is on-chain-verifiable evidence. The bare timeout / non-response case is reputation-only (no second signed message → not slashable on-chain). Slash schedule per [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn); on-chain verifier per [ADR 014 §1](014-on-chain-verification.md#1-slash-signatures--secp256k1-eip-712); slash executes synchronously at submit time per [ADR 014 § Bond Handling](014-on-chain-verification.md#bond-handling).
 
 To prevent legitimate cache eviction from producing false slash evidence inside the 30-second window, nodes MUST honor a **probe-triggered eviction hold** (35s, 30s slash window + 5s margin) — see [ADR 005 § Probe-Triggered Eviction Hold](005-protocol.md#probe-triggered-eviction-hold) for the requirement and dependent parameters (probe cache TTL, `probe_hold_duration`). Hold violations under OOM / under-provisioning fall to the same 24-hour counter-window; eviction logs are not on-chain verifiable, so only delivery-receipt counter-evidence rebuts. The protocol does not subsidize under-provisioning.
 
@@ -402,7 +402,7 @@ event FeeRouterUpdated(address indexed oldRouter, address indexed newRouter);
 
 The constructor takes `(usdc, feeRouter, disputeWindow)` and sets the remaining governable parameters to their PoC defaults: `maxVoucherIntervalMb = 1` (1 MB) and `maxChannelDuration = 7776000` (90 days). All values are within the hardcoded safety bounds table further below (see also [ADR 009](009-governance.md) for governance ranges). The constructor MUST reject `feeRouter == address(0)` and a `feeRouter` whose code size is zero (EOA / undeployed address).
 
-Default PoC deployment value for `disputeWindow`: **172800 seconds (48 hours)** — raised from 24 hours to guarantee effective dispute response time under L2 sequencer censorship (see [§ L2 sequencer censorship](#l2-sequencer-censorship) below). Safety bounds per [ADR 009](009-governance.md): 43200–259200 seconds (12h–72h). Under ADR 026 the `feePercentage` / `discountedFeePercentage` / treasury-address constructor parameters from earlier drafts are removed; bucket shares are governed on `FeeRouter` instead, and the treasury bucket is one of `FeeRouter`'s six buckets (see [FeeRouter Integration](#feerouter-integration)).
+Default PoC deployment value for `disputeWindow`: **172800 seconds (48 hours)** — raised from 24 hours to guarantee effective dispute response time under L2 sequencer censorship (see [§ L2 sequencer censorship](#l2-sequencer-censorship) below). Safety bounds per [ADR 009](009-governance.md): 43200–259200 seconds (12h–72h). Under [ADR 026](026-gauge-boost-tokenomics.md) the `feePercentage` / `discountedFeePercentage` / treasury-address constructor parameters from earlier drafts are removed; bucket shares are governed on `FeeRouter` instead, and the treasury bucket is one of `FeeRouter`'s six buckets (see [FeeRouter Integration](#feerouter-integration)).
 
 #### L2 sequencer censorship
 
@@ -488,7 +488,7 @@ If the event subscription is lost and RPC polling fails, the node SHOULD continu
 
 #### No version-based delta pattern
 
-Unlike the content blacklist (which uses `getBlacklistVersion()` for cheap change detection and incremental delta fetching), rate bounds are a single struct containing two `uint256` values. A version counter adds no value — the full state is readable in a single `eth_call` with negligible overhead. This is an intentional divergence from the ADR 011 pattern.
+Unlike the content blacklist (which uses `getBlacklistVersion()` for cheap change detection and incremental delta fetching), rate bounds are a single struct containing two `uint256` values. A version counter adds no value — the full state is readable in a single `eth_call` with negligible overhead. This is an intentional divergence from the [ADR 011](011-content-takedown.md) pattern.
 
 For how nodes validate `rate_per_mb` against cached bounds before signing protocol messages, see [ADR 005 — Rate Bounds Validation](005-protocol.md#rate-bounds-validation).
 
@@ -530,7 +530,7 @@ Conservation, same-tx satellite legs (5%/5%/3%), and epoch-consistency invariant
 - Node-to-node settlements use direct peer payment-token transfer with no router invocation.
 - Implementations distinguish node-to-node from client-to-node settlements via the channel's `client` and `provider` fields cross-referenced against the on-chain registry: if both addresses have a registered NodeId binding (see [NodeId-to-Ethereum Binding](#nodeid-to-ethereum-binding)), the channel is node-to-node; otherwise it is client-to-node.
 - The PoC `PaymentChannel` may implement the bypass either by exposing a separate `settleChannelNoRoute(channelId)` entry point usable only when both parties are registered nodes, or by having `settleChannel` detect the case and skip the `FeeRouter` call. Either way the operator-to-operator USDC transfer is direct and bypasses the router's per-epoch USDC accumulators (those bytes were already counted at the client-to-node settlement that paid for them downstream). Gauge eligibility for these bytes is naturally bounded by the [ADR 026 §3 per-operator gauge-share cap](026-gauge-boost-tokenomics.md#per-operator-gauge-share-cap) — even if a colluding operator pair routed bypassed bytes through the gauge counter, each operator-identity's share is capped at 5%.
-- Permissionless fraud detectors ([Appendix: Fraud Detection](appendix-fraud-detection.md)) can observe node-to-node settlements for self-routed-traffic / wash-trading patterns despite the bypass. The on-chain remedy is the per-operator gauge-share cap; off-chain reputation gauges (ADR 008 §12) consume the observation as a soft signal.
+- Permissionless fraud detectors ([Appendix: Fraud Detection](appendix-fraud-detection.md)) can observe node-to-node settlements for self-routed-traffic / wash-trading patterns despite the bypass. The on-chain remedy is the per-operator gauge-share cap; off-chain reputation gauges ([ADR 008 §12](008-reputation.md#12-gauge-pool-wash-trading-reputation-as-off-chain-signal)) consume the observation as a soft signal.
 
 #### Settlement sequence
 
@@ -597,7 +597,7 @@ Voucher nonces within a channel start at **1**. Nonce 0 is reserved as the senti
 
 ### StakingRegistry Modifications
 
-The full node registry interface (`NodeInfo`, `registerNode` with atomic binding, `getActiveNodes`, etc.) is defined in ADR 001. The additions below are payment-specific extensions.
+The full node registry interface (`NodeInfo`, `registerNode` with atomic binding, `getActiveNodes`, etc.) is defined in [ADR 001](001-network.md). The additions below are payment-specific extensions.
 
 > **No on-channel fee-discount path.** Operator return is differentiated through ve-locked gauge boost ([ADR 026 §3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula)), not via a stake-multiple fee toggle on the channel contract. `getEffectiveFee`, `getStakeMultiple`, `DISCOUNT_MULTIPLE`, `feePercentage`, and `discountedFeePercentage` are not part of the interface. `StakingRegistry` retains its slashing, registration, and stake-bookkeeping responsibilities; the minimum stake is **50,000 TOKEN** ([ADR 026 §7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake)).
 
@@ -637,7 +637,7 @@ Node registration and NodeId binding are atomic. `StakingRegistry.registerNode()
 
 The standalone `StakingRegistry.bindNodeId()` function below remains available for **rebinding only** (key rotation after initial registration). It is no longer needed at initial registration time.
 
-**Canonical source of truth:** The `nodeIdToAddress` / `addressToNodeId` mappings — written atomically by `registerNode` at initial registration and by `bindNodeId` on rebinding — are the authoritative source for payment attribution and slashing. `NodeInfo.ethAddress` in ADR 001 is always `msg.sender`, so the two are consistent by construction under the one-to-one constraint. If the implementation stores both, `NodeInfo.ethAddress` MUST equal `nodeIdToAddress[nodeId]` at all times.
+**Canonical source of truth:** The `nodeIdToAddress` / `addressToNodeId` mappings — written atomically by `registerNode` at initial registration and by `bindNodeId` on rebinding — are the authoritative source for payment attribution and slashing. `NodeInfo.ethAddress` in [ADR 001](001-network.md) is always `msg.sender`, so the two are consistent by construction under the one-to-one constraint. If the implementation stores both, `NodeInfo.ethAddress` MUST equal `nodeIdToAddress[nodeId]` at all times.
 
 This creates an authoritative, publicly queryable mapping:
 

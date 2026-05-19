@@ -36,20 +36,20 @@ Each row is a discrete data exposure. **ID** back-references the analysis and di
 | P-05 | `ReputationReport` gossip | Provider, reporter, metrics (delivery speed, correctness, uptime), timestamps — signed and broadcast on `cdn/reputation/v1` | T1 | [008](008-reputation.md) §6 |
 | P-07 | Node earnings inference | Channel closures and settlement amounts are on-chain; node revenue is computable | T1 | [003](003-payments.md) |
 | P-08 | BLAKE3 hash as global identifier | Same content always produces the same hash; repeated requests for a hash are correlatable | T1 | [002](002-content-addressing.md) |
-| P-09 | Probe content leakage | All probed nodes (the DHT-returned candidate set) learn which content hash the requester wants | T2 | [005](005-protocol.md) §Probe |
-| P-10 | Cache miss detection | Probes triggered by cache misses are visible to the targeted DHT candidate set, plus DHT FIND_VALUE traffic is visible to nodes close to the hash in keyspace — both reveal regionally uncommon content | T2 | [001](001-network.md) §Content Discovery |
+| P-09 | Probe content leakage | All probed nodes (the DHT-returned candidate set) learn which content hash the requester wants | T2 | [005](005-protocol.md) § Probe |
+| P-10 | Cache miss detection | Probes triggered by cache misses are visible to the targeted DHT candidate set, plus DHT FIND_VALUE traffic is visible to nodes close to the hash in keyspace — both reveal regionally uncommon content | T2 | [001](001-network.md) § Content Discovery |
 | P-11 | Probe cache timing correlation | 15-second probe cache ([ADR 001](001-network.md)) means the interval between probe and subsequent `StreamRequest` is trivially observable | T2 | [001](001-network.md), [005](005-protocol.md) |
 | P-12 | Gossip topic enumeration | An attacker joining regional gossip topics (`cdn/region/{cc}/v1`) can enumerate all nodes and their region announcements | T2 | [001](001-network.md), [005](005-protocol.md) |
 | P-13 | GeoIP inference | Self-reported `regionHint` combined with IP addresses from `multiaddrs` enables geolocation | T2 | [001](001-network.md) |
-| P-14 | Reporter credibility leakage | Reporter weight is based on `effective_settled_value` (ADR 008 §4), which depends on on-chain settlement history — reveals a reporter's payment activity | T1 | [008](008-reputation.md) §4 |
-| P-15 | RPC provider query visibility | Registry queries, blacklist polling, and rate-bounds lookups are visible to the RPC provider | T3 | [architecture.md](architecture.md) §Trust Assumptions |
-| P-17 | Relay connection metadata | iroh relays see source/destination IP pairs and connection timing for relayed connections | T3 | [architecture.md](architecture.md) §Trust Assumptions |
-| P-18 | Unencrypted iroh key (PoC) | Client's Ed25519 secret key stored at `~/.decdn/iroh_key` with `0600` permissions, no encryption | T4 | [012](012-client.md) §iroh Identity Key |
-| P-19 | Offline lease blast radius | Up to 500 `K_blob` values extractable from a compromised device's sealed lease | T4 | [Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md) §Offline Leases |
-| P-20 | No forward secrecy for epoch keys | Compromising `server_secret` retroactively exposes all past and future epoch keys until rotation | T4 | [Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md) §Consequences |
-| P-21 | Permanent client NodeId | Ed25519 identity is persistent across sessions; all content requests are correlatable under one identity | T2 | [012](012-client.md) §iroh Identity Key |
-| P-22 | On-chain settlement volume leakage | Voucher nonce and cumulative amount at `settleChannel` reveal per-channel delivery volume; nonce spacing reveals session granularity | T1 | [003](003-payments.md) §settleChannel |
-| P-23 | `slash_sig` as content inventory proof | A node's `slash_sig` on `ProbeResponse` with `has_blob: true` constitutes non-repudiable cryptographic proof that the node held specific content at a specific time; accumulated signatures build a verifiable content inventory | T2 | [014](014-on-chain-verification.md) §slash_sig |
+| P-14 | Reporter credibility leakage | Reporter weight is based on `effective_settled_value` ([ADR 008 §4](008-reputation.md#4-network-score-aggregation)), which depends on on-chain settlement history — reveals a reporter's payment activity | T1 | [008](008-reputation.md) §4 |
+| P-15 | RPC provider query visibility | Registry queries, blacklist polling, and rate-bounds lookups are visible to the RPC provider | T3 | [architecture.md](architecture.md) § Trust Assumptions |
+| P-17 | Relay connection metadata | iroh relays see source/destination IP pairs and connection timing for relayed connections | T3 | [architecture.md](architecture.md) § Trust Assumptions |
+| P-18 | Unencrypted iroh key (PoC) | Client's Ed25519 secret key stored at `~/.decdn/iroh_key` with `0600` permissions, no encryption | T4 | [012](012-client.md) § iroh Identity Key |
+| P-19 | Offline lease blast radius | Up to 500 `K_blob` values extractable from a compromised device's sealed lease | T4 | [Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md) § Offline Leases |
+| P-20 | No forward secrecy for epoch keys | Compromising `server_secret` retroactively exposes all past and future epoch keys until rotation | T4 | [Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md) § Consequences |
+| P-21 | Permanent client NodeId | Ed25519 identity is persistent across sessions; all content requests are correlatable under one identity | T2 | [012](012-client.md) § iroh Identity Key |
+| P-22 | On-chain settlement volume leakage | Voucher nonce and cumulative amount at `settleChannel` reveal per-channel delivery volume; nonce spacing reveals session granularity | T1 | [003](003-payments.md) § settleChannel |
+| P-23 | `slash_sig` as content inventory proof | A node's `slash_sig` on `ProbeResponse` with `has_blob: true` constitutes non-repudiable cryptographic proof that the node held specific content at a specific time; accumulated signatures build a verifiable content inventory | T2 | [014](014-on-chain-verification.md) § slash_sig |
 
 ### 3. Analysis by Adversary Tier
 
@@ -164,7 +164,7 @@ Compromising `server_secret` exposes all past and future epoch keys until rotati
 
 #### 5.2 Operational RPC Guidance (P-15)
 
-**Proposal:** Document a production recommendation to use multiple independent RPC providers or a self-hosted node for on-chain queries. Already implied by [architecture.md](architecture.md) §Trust Assumptions (multi-source bootstrap) but should be explicit as a privacy recommendation, not just reliability.
+**Proposal:** Document a production recommendation to use multiple independent RPC providers or a self-hosted node for on-chain queries. Already implied by [architecture.md](architecture.md) § Trust Assumptions (multi-source bootstrap) but should be explicit as a privacy recommendation, not just reliability.
 
 **Effort:** Minimal. Documentation change in [ADR 012](012-client.md) and [architecture.md](architecture.md).
 

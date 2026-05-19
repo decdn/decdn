@@ -105,7 +105,7 @@ Early warning for the three slashable offenses in [ADR 026 §8](026-gauge-boost-
 
 | Metric | Type | Tier | Labels | Description |
 |--------|------|------|--------|-------------|
-| `decdn_gossip_messages_rejected_total` | Counter | M | `reason={clock_skew,invalid_signature,not_registered,stale_timestamp,invalid_region,duplicate_hashes,table_full}` | Gossip messages rejected during validation ([ADR 001](001-network.md#gossip-validation)) or peer-table admission ([appendix-peer-table-eviction.md](appendix-peer-table-eviction.md)). `reason=clock_skew` is the canonical replacement for ADR 001's `gossip_messages_rejected_clock_skew`. `table_full` fires only when the optional `gossip.max_peer_entries` ceiling is set and exceeded. |
+| `decdn_gossip_messages_rejected_total` | Counter | M | `reason={clock_skew,invalid_signature,not_registered,stale_timestamp,invalid_region,duplicate_hashes,table_full}` | Gossip messages rejected during validation ([ADR 001](001-network.md#gossip-validation)) or peer-table admission ([appendix-peer-table-eviction.md](appendix-peer-table-eviction.md)). `reason=clock_skew` is the canonical replacement for [ADR 001](001-network.md)'s `gossip_messages_rejected_clock_skew`. `table_full` fires only when the optional `gossip.max_peer_entries` ceiling is set and exceeded. |
 | `decdn_peer_table_size` | Gauge | M | — | Number of distinct peers in the local peer table. |
 | `decdn_peer_table_evicted_ttl_total` | Counter | R | — | Peer-table entries removed by the TTL sweeper ([appendix-peer-table-eviction.md §1](appendix-peer-table-eviction.md#1-lifecycle-and-ttl)). |
 | `decdn_peer_table_evicted_registry_total` | Counter | R | `reason={deregistered,ejected}` | Peer-table entries removed in response to a `NodeDeregistered` or `NodeAutoEjected` registry event ([appendix-peer-table-eviction.md §3](appendix-peer-table-eviction.md#3-registry-cache-interaction-active-eviction)). |
@@ -133,7 +133,7 @@ Per [ADR 015](015-zero-rtt.md). All labeled by `alpn`.
 | `decdn_quic_0rtt_accepted_total` | Counter | R | 0-RTT connections accepted by server. |
 | `decdn_quic_0rtt_rejected_total` | Counter | R | 0-RTT rejected, fell back to 1-RTT. |
 
-These replace the identical names from ADR 015 — no semantic change, now under the canonical naming regime.
+These replace the identical names from [ADR 015](015-zero-rtt.md) — no semantic change, now under the canonical naming regime.
 
 #### 2.9 Node / Process Metrics
 
@@ -263,17 +263,17 @@ Earlier ADRs used informal metric names; this table maps them to canonical repla
 
 | Informal name (prior ADR) | Canonical name (this ADR) | Source ADR |
 |---------------------------|---------------------------|------------|
-| `gossip_messages_rejected_clock_skew` | `decdn_gossip_messages_rejected_total{reason="clock_skew"}` | ADR 001 |
-| `probe_hold_violations` | `decdn_probe_hold_violations_total` | ADR 005, architecture.md |
-| `probe_hold_slots_used` | `decdn_probe_hold_slots_used` | ADR 005, architecture.md |
+| `gossip_messages_rejected_clock_skew` | `decdn_gossip_messages_rejected_total{reason="clock_skew"}` | [ADR 001](001-network.md) |
+| `probe_hold_violations` | `decdn_probe_hold_violations_total` | [ADR 005](005-protocol.md), architecture.md |
+| `probe_hold_slots_used` | `decdn_probe_hold_slots_used` | [ADR 005](005-protocol.md), architecture.md |
 | `rate_bounds_clamp_events` | `decdn_rate_bounds_clamp_events_total` | architecture.md |
-| `blacklist_sync_lag_seconds` | `decdn_blacklist_sync_lag_seconds` | ADR 011 |
-| `blacklist_version_behind` | `decdn_blacklist_version_behind` | ADR 011 |
+| `blacklist_sync_lag_seconds` | `decdn_blacklist_sync_lag_seconds` | [ADR 011](011-content-takedown.md) |
+| `blacklist_version_behind` | `decdn_blacklist_version_behind` | [ADR 011](011-content-takedown.md) |
 | `slash_evidence_exposure` | `decdn_slash_evidence_exposure_total` | architecture.md |
-| `quic_0rtt_attempts_total` | `decdn_quic_0rtt_attempts_total` | ADR 015 |
-| `quic_0rtt_accepted_total` | `decdn_quic_0rtt_accepted_total` | ADR 015 |
-| `quic_0rtt_rejected_total` | `decdn_quic_0rtt_rejected_total` | ADR 015 |
-| `probe_collection_latency_seconds` | `decdn_probe_collection_latency_seconds` | ADR 015 |
+| `quic_0rtt_attempts_total` | `decdn_quic_0rtt_attempts_total` | [ADR 015](015-zero-rtt.md) |
+| `quic_0rtt_accepted_total` | `decdn_quic_0rtt_accepted_total` | [ADR 015](015-zero-rtt.md) |
+| `quic_0rtt_rejected_total` | `decdn_quic_0rtt_rejected_total` | [ADR 015](015-zero-rtt.md) |
+| `probe_collection_latency_seconds` | `decdn_probe_collection_latency_seconds` | [ADR 015](015-zero-rtt.md) |
 | `streams_active` | `decdn_streams_active` | architecture.md |
 | `streams_completed` | `decdn_streams_completed_total` | architecture.md |
 | `streams_failed` | `decdn_streams_failed_total` | architecture.md |

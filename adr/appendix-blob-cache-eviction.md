@@ -18,7 +18,7 @@ The existing implementation in `crates/cache/src/engine.rs` already commits to L
 
 ## Decision
 
-The blob cache uses **least-recently-used (LRU) eviction** keyed on the `Instant` of the last successful `CacheEngine::get` (refreshed on both the cache-hit path and the post-pull-through path). Pinned hashes are exempt from LRU; operator-evicted hashes are durably hidden orthogonally to LRU; probe-hold-marked hashes defer to ADR 005. Reputation does not factor into eviction.
+The blob cache uses **least-recently-used (LRU) eviction** keyed on the `Instant` of the last successful `CacheEngine::get` (refreshed on both the cache-hit path and the post-pull-through path). Pinned hashes are exempt from LRU; operator-evicted hashes are durably hidden orthogonally to LRU; probe-hold-marked hashes defer to [ADR 005](005-protocol.md). Reputation does not factor into eviction.
 
 ### 1. Eviction key
 
@@ -46,9 +46,9 @@ The two layers compose cleanly: LRU eviction is *ephemeral cache pressure* (a vi
 
 ### 4. Probe-hold integration defers to ADR 005
 
-Hashes for which the node has signed `has_blob: true` within the last `probe_hold_duration` (35 s) are eviction-exempt for that window, per [ADR 005 § Probe-Triggered Eviction Hold](005-protocol.md#probe-triggered-eviction-hold). The hold layer composes above LRU: a held hash is invisible to the LRU driver until the hold expires. Concurrent holds are bounded by `max_probe_holds` (default 256) per [ADR 005 § Hold Budget](005-protocol.md#hold-budget); when the budget is exhausted the node responds `has_blob: false` rather than evict-and-slash. Operators sizing small caches SHOULD keep `max_probe_holds ≤ 25 %` of cache capacity (the §Hold Budget recommendation).
+Hashes for which the node has signed `has_blob: true` within the last `probe_hold_duration` (35 s) are eviction-exempt for that window, per [ADR 005 § Probe-Triggered Eviction Hold](005-protocol.md#probe-triggered-eviction-hold). The hold layer composes above LRU: a held hash is invisible to the LRU driver until the hold expires. Concurrent holds are bounded by `max_probe_holds` (default 256) per [ADR 005 § Hold Budget](005-protocol.md#hold-budget); when the budget is exhausted the node responds `has_blob: false` rather than evict-and-slash. Operators sizing small caches SHOULD keep `max_probe_holds ≤ 25 %` of cache capacity (the § Hold Budget recommendation).
 
-This appendix adds nothing to the hold mechanism itself — a separate layer with its own ADR and metrics. DHT-record retraction ([ADR 022 § 1.4 Content Records and TTL](022-content-discovery.md#14-content-records-and-ttl)) is similarly downstream: a node stops re-publishing on eviction; stale records self-expire within TTL with no explicit retraction.
+This appendix adds nothing to the hold mechanism itself — a separate layer with its own ADR and metrics. DHT-record retraction ([ADR 022 §1.4 Content Records and TTL](022-content-discovery.md#14-content-records-and-ttl)) is similarly downstream: a node stops re-publishing on eviction; stale records self-expire within TTL with no explicit retraction.
 
 ### 5. Reputation does not factor into eviction
 
@@ -56,7 +56,7 @@ Reputation governs *selection* (the unified score in [ADR 001 § Node Selection 
 
 ### 6. Observability
 
-Naming follows [appendix-observability.md § 2.3 Cache Metrics](appendix-observability.md#23-cache-metrics). The existing `decdn_cache_evictions_total` counter is retained but its description is tightened to "LRU pressure only" (was "LRU/LFU pressure"); operator-evict and pinning counts are surfaced separately:
+Naming follows [appendix-observability.md §2.3 Cache Metrics](appendix-observability.md#23-cache-metrics). The existing `decdn_cache_evictions_total` counter is retained but its description is tightened to "LRU pressure only" (was "LRU/LFU pressure"); operator-evict and pinning counts are surfaced separately:
 
 | Metric | Type | Description |
 |---|---|---|
@@ -66,7 +66,7 @@ Naming follows [appendix-observability.md § 2.3 Cache Metrics](appendix-observa
 | `decdn_cache_evicted_operator_total` | counter, unlabeled | New: hashes removed via `decdn node evict`. Distinct from `decdn_cache_evictions_total`. |
 | `decdn_cache_pinned_count` | gauge | New: size of the operator-pinned set. |
 
-`decdn_probe_hold_*` metrics ([appendix § 2.1](appendix-observability.md#21-slash-safety-metrics-all-mandatory)) are owned by ADR 005 and not redefined here. A sustained non-zero `decdn_probe_hold_violations_total` rate, paired with `decdn_cache_bytes ≈ decdn_cache_size_limit_bytes`, indicates the eviction driver is racing the hold layer — the operator response is to raise `cache.cache_size_mb` or lower `max_probe_holds`, not to disable the hold.
+`decdn_probe_hold_*` metrics ([appendix §2.1](appendix-observability.md#21-slash-safety-metrics-all-mandatory)) are owned by [ADR 005](005-protocol.md) and not redefined here. A sustained non-zero `decdn_probe_hold_violations_total` rate, paired with `decdn_cache_bytes ≈ decdn_cache_size_limit_bytes`, indicates the eviction driver is racing the hold layer — the operator response is to raise `cache.cache_size_mb` or lower `max_probe_holds`, not to disable the hold.
 
 Driver-loop-specific counters are listed in §7 below alongside the driver mechanism they instrument.
 
@@ -112,7 +112,7 @@ The `cache.cache_size_mb` ceiling is enforced by the driver, not the cache write
 ### Positive
 
 - Codifies what the implementation already does. No code change is required to ship the policy contract; the new §6 metrics (`decdn_cache_size_limit_bytes`, `decdn_cache_evicted_operator_total`, `decdn_cache_pinned_count`) land alongside the eviction-driver loop when it is wired.
-- Three layers (pinning, operator-evict, probe-hold) compose without entanglement. Each has a single owner (§2 / §3 / ADR 005) and a single rule.
+- Three layers (pinning, operator-evict, probe-hold) compose without entanglement. Each has a single owner (§2 / §3 / [ADR 005](005-protocol.md)) and a single rule.
 - DMCA compliance is preserved exactly: operator-evict beats pinning, beats LRU, and is durable across restart. No policy gap lets a pinned-and-evicted hash resurface.
 - LRU's bookkeeping is one timestamp per cached hash. At PoC scale (10 GB / typical blob ~ 10 MB → ~1 000 entries), the `HashMap<Hash, Instant>` overhead is < 100 KB.
 

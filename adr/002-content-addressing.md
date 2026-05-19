@@ -23,7 +23,7 @@ BLAKE3 is iroh's native hash function, so there is no translation layer between 
 
 Content addressing answers "what is this blob?". Origin governance answers "who is responsible for serving this blob?". The two questions are independent: a BLAKE3 hash is intrinsic to the bytes, but the network needs a stable identity for the party that publishes the bytes so that the DAO can authorize specific operators to act as origins for their content (see [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority)).
 
-A **publisher** is an Ethereum address that has registered through the `PublisherRegistry` contract ([ADR 016](016-contract-interactions.md)). Registration is permissionless and one-shot per address; transferring publisher ownership is a separate gated action (see ADR 016 for the lifecycle).
+A **publisher** is an Ethereum address that has registered through the `PublisherRegistry` contract ([ADR 016](016-contract-interactions.md)). Registration is permissionless and one-shot per address; transferring publisher ownership is a separate gated action (see [ADR 016](016-contract-interactions.md) for the lifecycle).
 
 A **namespace** is a publisher-owned `uint256` identifier under which blob hashes are claimed. Publishers may register multiple namespaces (subject to the anti-squatting cap in [ADR 009](009-governance.md)) so that distinct content sets can be governed independently — for example, a media company may operate one namespace per product line so that takedowns and origin assignments for one product do not entangle the others.
 

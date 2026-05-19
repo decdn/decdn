@@ -83,11 +83,11 @@ For PoC, steps 4–5 are skipped (no DNS seeds configured). The registry is the 
 | Maintain peer table | Yes | Yes |
 | Require NTP synchronization | Yes (for gossip validation) | Yes |
 
-The client validates gossip using the same rules as nodes: signature verification, registry membership check, and ±60-second timestamp freshness ([ADR 001](001-network.md)). This requires NTP synchronization, as already mandated for "validating clients" in ADR 001.
+The client validates gossip using the same rules as nodes: signature verification, registry membership check, and ±60-second timestamp freshness ([ADR 001](001-network.md)). This requires NTP synchronization, as already mandated for "validating clients" in [ADR 001](001-network.md).
 
 Clients participate as gossip *leaves*: they subscribe and validate but never forward received messages back into the mesh. iroh-gossip propagation is the responsibility of staked nodes, which carry economic accountability (slashing, reputation) for relay correctness and availability; unstaked clients carry none. This applies to both PoC and production — not a deployment-time toggle.
 
-The registry query, retry schedule, and `peers.json` fallback defined here supersede the client-specific portions of [ADR 001 — Registry Unavailability](001-network.md#registry-unavailability). ADR 001 retains the specification for node bootstrap and registry interaction.
+The registry query, retry schedule, and `peers.json` fallback defined here supersede the client-specific portions of [ADR 001 — Registry Unavailability](001-network.md#registry-unavailability). [ADR 001](001-network.md) retains the specification for node bootstrap and registry interaction.
 
 ### Key Management
 

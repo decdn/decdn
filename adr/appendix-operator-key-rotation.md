@@ -9,7 +9,7 @@ A node operator routinely holds three keys:
 | Key | Curve / scheme | Purpose | Where it lives |
 |-----|----------------|---------|----------------|
 | **iroh node-key** | Ed25519 | Wire identity (`NodeId`); authenticates the iroh QUIC handshake and signs `NodeAnnounce` gossip ([ADR 005](005-protocol.md)). `ProbeResponse`/`StreamResponse` body attribution moved to `slash_sig` — see [ADR 014 §1](014-on-chain-verification.md#1-slash-signatures--secp256k1-eip-712). | iroh keystore on the signing host |
-| **Ethereum signing key** | secp256k1 | On-chain identity for staking, channel ops, voucher receipt. Signs EIP-712 `BindNodeId`/`bindingSignature` ([ADR 003 §NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)) **and** `slash_sig` on every `ProbeResponse`/`StreamResponse` ([ADR 014](014-on-chain-verification.md)); the latter's hot-signing burden motivates the production session-key path. | EVM keystore (EOA) **or** Safe owner key (PoC 1-of-1) **or** session key delegated by a Safe (production §3 of [ADR 024](024-account-abstraction.md)) |
+| **Ethereum signing key** | secp256k1 | On-chain identity for staking, channel ops, voucher receipt. Signs EIP-712 `BindNodeId`/`bindingSignature` ([ADR 003 § NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)) **and** `slash_sig` on every `ProbeResponse`/`StreamResponse` ([ADR 014](014-on-chain-verification.md)); the latter's hot-signing burden motivates the production session-key path. | EVM keystore (EOA) **or** Safe owner key (PoC 1-of-1) **or** session key delegated by a Safe (production §3 of [ADR 024](024-account-abstraction.md)) |
 | **Slash-sig session key** *(production only)* | secp256k1 | Per-message hot-signing of `slash_sig` digests on `ProbeResponse`/`StreamResponse` at wire speed under a 2-of-3 Safe; authorized via `erc7579/smartsessions` ([ADR 024](024-account-abstraction.md) §3). Client-side voucher session keys (also production, also smartsessions) are a separate client-owned concern. | Signing host, scoped by the session-key policy |
 
 Rotation reasons: (1) **compromise** — suspected leak, revoke **today**; (2) **scheduled hygiene** — routine annual, no time pressure; (3) **hardware migration** — host replacement, HSM enrolment, or PoC EOA → production Safe.
@@ -42,7 +42,7 @@ If both keys must rotate, rotate the **iroh key first** (cheap, atomic on-chain,
 
 ## 1. iroh node-key rotation only
 
-**API used:** `StakingRegistry.bindNodeId(newNodeId, signature)` ([ADR 003 §NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)).
+**API used:** `StakingRegistry.bindNodeId(newNodeId, signature)` ([ADR 003 § NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)).
 
 `bindNodeId` is rebind-only — atomically deletes the old `nodeId → ethAddress` mapping and writes the new one. Ethereum address unchanged.
 
@@ -52,7 +52,7 @@ If both keys must rotate, rotate the **iroh key first** (cheap, atomic on-chain,
 |-------------------|--------|
 | Stake, ve-locks, gauge-claim history | Keyed by Ethereum address ([ADR 026](026-gauge-boost-tokenomics.md)) |
 | Open payment channels (inbound from clients) | Channel ID `keccak256(client_eth, operator_eth, nonce)` ([ADR 003](003-payments.md)); Ethereum address unchanged |
-| `firstRegisteredAt` | Cleared only by `deregisterNode`; `bindNodeId` does not touch it ([ADR 019 §Re-Onboarding](019-node-onboarding.md#re-onboarding-after-deregistration-or-auto-ejection)) |
+| `firstRegisteredAt` | Cleared only by `deregisterNode`; `bindNodeId` does not touch it ([ADR 019 § Re-Onboarding](019-node-onboarding.md#re-onboarding-after-deregistration-or-auto-ejection)) |
 
 ### What does not carry over
 
@@ -69,7 +69,7 @@ If both keys must rotate, rotate the **iroh key first** (cheap, atomic on-chain,
    - `decdn_streams_active{direction="inbound"} == 0`
    - `decdn_probe_hold_slots_used == 0`
 
-   Probe-hold drain is critical: rotating before holds clear opens a phantom-slash window — outstanding holds were signed by the *old* NodeId but the *new* one would not honor them. See [ADR 005 §Probe-Triggered Eviction Hold](005-protocol.md#probe-triggered-eviction-hold).
+   Probe-hold drain is critical: rotating before holds clear opens a phantom-slash window — outstanding holds were signed by the *old* NodeId but the *new* one would not honor them. See [ADR 005 § Probe-Triggered Eviction Hold](005-protocol.md#probe-triggered-eviction-hold).
 3. **Stop** the node process.
 4. **Build the EIP-712 `BindNodeId` binding signature** with the operator's Ethereum key at the current `bindingNonce[ethAddress]` — `bindingSignature = EIP-712 sign(ethKey, BindNodeId { nodeId: newNodeId, nonce: bindingNonce[ethAddress] })`.
 5. **Submit** `StakingRegistry.bindNodeId(newNodeId, bindingSignature)`. The transaction must originate from the same Ethereum address that owns the existing binding. Wait one block confirmation and verify the `NodeIdBound` event.
@@ -79,7 +79,7 @@ If both keys must rotate, rotate the **iroh key first** (cheap, atomic on-chain,
    - `decdn_node_uptime_seconds` advancing
    - Outgoing `NodeAnnounce` carries the new NodeId (visible in peers' gossip logs)
 8. **Un-drain** — accept inbound connections again.
-9. **Archive** the old iroh keystore offline; retain at least `MAX_EVIDENCE_AGE_US` (default 5 days, governable [1d, 30d] per [ADR 014](014-on-chain-verification.md) §2 Evidence Verification Per Offense Type) — the staleness ceiling beyond which old-key slash evidence cannot be submitted. Retention is forensic-only: `bindNodeId` does not initiate unbonding, all `SlashJudge` offenses (phantom, rate, blacklist) resolve synchronously at submit time per [ADR 014 §Bond Handling](014-on-chain-verification.md#bond-handling), and no key-bound counter-evidence flow exists for the old iroh key. Holding longer is harmless.
+9. **Archive** the old iroh keystore offline; retain at least `MAX_EVIDENCE_AGE_US` (default 5 days, governable [1d, 30d] per [ADR 014](014-on-chain-verification.md) §2 Evidence Verification Per Offense Type) — the staleness ceiling beyond which old-key slash evidence cannot be submitted. Retention is forensic-only: `bindNodeId` does not initiate unbonding, all `SlashJudge` offenses (phantom, rate, blacklist) resolve synchronously at submit time per [ADR 014 § Bond Handling](014-on-chain-verification.md#bond-handling), and no key-bound counter-evidence flow exists for the old iroh key. Holding longer is harmless.
 
 ### Failure modes
 
@@ -106,16 +106,16 @@ Procedure:
 
 1. **Drain** and **stop** the node (same as §1 steps 2–3).
 2. **Wait** for all open inbound channels to settle. Watch `decdn_channels_open`. If any channel is in the dispute window, do **not** rotate — settling a stale state in step 7 requires the old keystore. PoC dispute window 48h ([ADR 003](003-payments.md)); production governable 12h–72h ([ADR 009](009-governance.md)).
-3. **`StakingRegistry.deregisterNode()`** from the old address. Sets `active = false`, starts the unbonding period, increments `registrationNonce[nodeId]`. Stake remains slashable during unbonding ([ADR 019 §Re-Onboarding](019-node-onboarding.md#re-onboarding-after-deregistration-or-auto-ejection)).
+3. **`StakingRegistry.deregisterNode()`** from the old address. Sets `active = false`, starts the unbonding period, increments `registrationNonce[nodeId]`. Stake remains slashable during unbonding ([ADR 019 § Re-Onboarding](019-node-onboarding.md#re-onboarding-after-deregistration-or-auto-ejection)).
 4. **Wait** the full unbonding period (default 7d, minimum 3d governable). Stake remains slashable here — do not relax monitoring.
 5. **`StakingRegistry.withdraw()`** to the old address.
 6. **Generate** the new EOA. Fund it with TOKEN (transfer from old, or from treasury) and a small ETH float for gas.
 7. **Keep the old EVM keystore reachable until your last open outbound channel settles or expires.** Vouchers are *client*-signed ([ADR 003](003-payments.md)); as node-operator-as-client (cache-miss pulls upstream) you hold signed vouchers under the old address, and the upstream counterparty may submit your latest voucher via `closeChannel`, triggering the 48h dispute window. Channels live up to `maxChannelDuration` (default 90 days per [ADR 003](003-payments.md)). As provider you do not sign vouchers, so inbound channels carry no key-side liability post-deregistration.
-8. **Re-stake from the new address with a fresh NodeId.** `TOKEN.approve` → `StakingRegistry.stake` → atomic `registerNode(newNodeId, multiaddrs, regionHint, bindingSignature, ed25519Signature)` (see [ADR 019](019-node-onboarding.md) §Phase 2 — On-chain Setup). **Reusing the original NodeId is not possible** without a separate `bindNodeId` on the *old* address before deregister: `deregisterNode` only sets `active = false` and increments `registrationNonce`, and does **not** clear `nodeIdToAddress[originalNodeId]` ([ADR 001](001-network.md) §340–342, [ADR 003](003-payments.md#nodeid-to-ethereum-binding)), so a fresh address calling `registerNode(originalNodeId, …)` reverts `"NodeId bound to another address"`. To reuse it (e.g., reputation continuity), chain §1 → §2.1: §1's `bindNodeId` to a temporary NodeId clears the original mapping, then §2.1 re-registers it from the new address.
+8. **Re-stake from the new address with a fresh NodeId.** `TOKEN.approve` → `StakingRegistry.stake` → atomic `registerNode(newNodeId, multiaddrs, regionHint, bindingSignature, ed25519Signature)` (see [ADR 019](019-node-onboarding.md) § Phase 2 — On-chain Setup). **Reusing the original NodeId is not possible** without a separate `bindNodeId` on the *old* address before deregister: `deregisterNode` only sets `active = false` and increments `registrationNonce`, and does **not** clear `nodeIdToAddress[originalNodeId]` ([ADR 001](001-network.md) §340–342, [ADR 003](003-payments.md#nodeid-to-ethereum-binding)), so a fresh address calling `registerNode(originalNodeId, …)` reverts `"NodeId bound to another address"`. To reuse it (e.g., reputation continuity), chain §1 → §2.1: §1's `bindNodeId` to a temporary NodeId clears the original mapping, then §2.1 re-registers it from the new address.
 9. **Restart** the node with config pointing at the new EVM keystore. Confirm `/health` reports `ready` and `decdn_channel_deposit_usdc` is zero (no channels yet).
 10. **Re-open outbound channels** as needed for cache-miss pulls — no carry-over.
 
-**Real cost:** `firstRegisteredAt` resets to the new registration timestamp (cold-start bootstrap window restarts); reputation observations on the old NodeId↔Ethereum-address pair are stranded — peers' caches time out per [ADR 008 §Score decay](008-reputation.md); stake-time-weighted gauge-boost (where the gauge formula consumes `firstRegisteredAt`) is lost.
+**Real cost:** `firstRegisteredAt` resets to the new registration timestamp (cold-start bootstrap window restarts); reputation observations on the old NodeId↔Ethereum-address pair are stranded — peers' caches time out per [ADR 008 § Score decay](008-reputation.md); stake-time-weighted gauge-boost (where the gauge formula consumes `firstRegisteredAt`) is lost.
 
 > **Recommendation.** Treat EOA rotation as a last resort. Prefer the **one-time migration to a Safe** (§2.2) — once on a Safe, all future "rotations" are owner/session-key swaps with no on-chain identity change.
 
@@ -159,7 +159,7 @@ Same as [§2.3 — production](#23-safe-owner--session-key-rotation-production-p
 Rotate **iroh first**, then Ethereum:
 
 1. Run §1 to completion. `bindNodeId` finality is one block confirmation plus the `NodeIdBound` event — no unbonding period (only `deregisterNode` triggers unbonding per [ADR 001](001-network.md#contract-interface-node-registry)).
-2. Run §2.1, §2.2, or §2.3 per the account-type goal. Replay protection between the steps is the per-address `bindingNonce`, incremented when §1 ran ([ADR 003 §NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)) — no extra cooling-off window required.
+2. Run §2.1, §2.2, or §2.3 per the account-type goal. Replay protection between the steps is the per-address `bindingNonce`, incremented when §1 ran ([ADR 003 § NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)) — no extra cooling-off window required.
 
 Reverse order works but is wasteful: §2 takes the node offline for the unbonding window anyway, so §1 work after §2 is a no-op against an already-deregistered node.
 

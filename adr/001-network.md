@@ -113,7 +113,7 @@ Content discovery uses `cdn/dht/v1` as the primary mechanism (see [ADR 022](022-
 
 On probe cache hit, if the selected provider no longer has the blob (evicted — rare with eviction holds), try the next-best cached provider. If all fail, run a fresh DHT lookup + probe. **Observability:** Track `EvictedSinceProbe` response rate; sustained >1% may indicate eviction hold failures ([ADR 005](005-protocol.md#probe-triggered-eviction-hold)).
 
-**Probe cache TTL is 15 seconds** — half the 30-second slashing evidence window from ADR 005.
+**Probe cache TTL is 15 seconds** — half the 30-second slashing evidence window from [ADR 005](005-protocol.md).
 
 #### Eviction hold interaction
 
@@ -145,7 +145,7 @@ Regional topics (`cdn/region/{cc}/v1`) add per-region bandwidth but do not reduc
 
 #### ReputationReport (`cdn/reputation/v1`, production only)
 
-Per ADR 008 rate limits: max 10 reports per reporter per hour, max 1 per (reporter, target) pair per hour. Worst case: all N nodes send 10 reports/hr, each delivered to N−1 subscribers.
+Per [ADR 008](008-reputation.md) rate limits: max 10 reports per reporter per hour, max 1 per (reporter, target) pair per hour. Worst case: all N nodes send 10 reports/hr, each delivered to N−1 subscribers.
 
 | Nodes | Reports received/node/hr | Ingress/node/hr |
 | --- | --- | --- |
@@ -185,7 +185,7 @@ The unified selection score combines price, latency, and reputation into a singl
 selection_score = rate_per_mb × rtt_ms × (1 / max(reputation, 0.1)²)
 ```
 
-Lower is better. Reputation is clamped to a minimum of 0.1 to prevent division by zero (ADR 008 allows a floor of 0.0, but a node at 0.0 reputation is effectively unusable). The `reputation²` term amplifies reputation: a node at 0.5 (neutral) is 4× more expensive in score terms than a node at 1.0 (perfect):
+Lower is better. Reputation is clamped to a minimum of 0.1 to prevent division by zero ([ADR 008](008-reputation.md) allows a floor of 0.0, but a node at 0.0 reputation is effectively unusable). The `reputation²` term amplifies reputation: a node at 0.5 (neutral) is 4× more expensive in score terms than a node at 1.0 (perfect):
 
 | Reputation | Score multiplier (vs. rep=1.0) |
 | --- | --- |
@@ -195,7 +195,7 @@ Lower is better. Reputation is clamped to a minimum of 0.1 to prevent division b
 | 0.3 | 11.1× |
 | 0.1 | 100× |
 
-For new nodes with the initial reputation of 0.5 ([ADR 008](008-reputation.md)), the 4× multiplier means they must be ~4× cheaper or faster to compete with established nodes — a bootstrap barrier softened by the cold-start bonus in ADR 008.
+For new nodes with the initial reputation of 0.5 ([ADR 008](008-reputation.md)), the 4× multiplier means they must be ~4× cheaper or faster to compete with established nodes — a bootstrap barrier softened by the cold-start bonus in [ADR 008](008-reputation.md).
 
 **Inputs:** `rate_per_mb` and `rtt_ms` come from `ProbeResponse` (see [ADR 005](005-protocol.md)). `reputation` is the node's `final_score` from [ADR 008](008-reputation.md) — local observations (70%) + network gossip (30%).
 
@@ -333,7 +333,7 @@ event NodeIdReclaimed(bytes32 indexed nodeId, address indexed previousOwner);
 ### Constraints
 
 - **One-to-one mapping.** Each `nodeId` maps to exactly one `ethAddress` and vice versa. Enforced with `require(nodeByAddress[msg.sender].nodeId == bytes32(0))` and `require(nodes[nodeId].ethAddress == address(0))`, where `bytes32(0)` is the sentinel for "unregistered". This enforces a one-stake-position-per-node invariant.
-- **`registerNode` rejects `nodeId == bytes32(0)`** (reserved as the unregistered sentinel). It binds `msg.sender` to `nodeId` — the caller's Ethereum address becomes `ethAddress`. This binding is on-chain and permanent until deregistration, distinct from the ephemeral per-session `NodeId`-to-address binding in ADR 003 for clients. The function performs two signature verifications: (1) the `bindingSignature` parameter is an EIP-712 signature over `BindNodeId(nodeId, bindingNonce[msg.sender])` (see [ADR 003](003-payments.md)); `registerNode` verifies this against the caller's current `bindingNonce`, then atomically writes the `nodeIdToAddress`/`addressToNodeId` mappings and increments `bindingNonce[msg.sender]`. (2) The `ed25519Signature` parameter proves ownership of the NodeId's ed25519 private key — see [NodeId Ownership Verification](#nodeid-ownership-verification) below. The shared per-address `bindingNonce` counter with `bindNodeId` ensures replay protection across both registration and rebinding. Every registered node is immediately slashable — there is no window in which a node is active in the mesh without a verifiable binding. The separate `StakingRegistry.bindNodeId()` function in [ADR 003](003-payments.md) remains available for rebinding (key rotation) after initial registration.
+- **`registerNode` rejects `nodeId == bytes32(0)`** (reserved as the unregistered sentinel). It binds `msg.sender` to `nodeId` — the caller's Ethereum address becomes `ethAddress`. This binding is on-chain and permanent until deregistration, distinct from the ephemeral per-session `NodeId`-to-address binding in [ADR 003](003-payments.md) for clients. The function performs two signature verifications: (1) the `bindingSignature` parameter is an EIP-712 signature over `BindNodeId(nodeId, bindingNonce[msg.sender])` (see [ADR 003](003-payments.md)); `registerNode` verifies this against the caller's current `bindingNonce`, then atomically writes the `nodeIdToAddress`/`addressToNodeId` mappings and increments `bindingNonce[msg.sender]`. (2) The `ed25519Signature` parameter proves ownership of the NodeId's ed25519 private key — see [NodeId Ownership Verification](#nodeid-ownership-verification) below. The shared per-address `bindingNonce` counter with `bindNodeId` ensures replay protection across both registration and rebinding. Every registered node is immediately slashable — there is no window in which a node is active in the mesh without a verifiable binding. The separate `StakingRegistry.bindNodeId()` function in [ADR 003](003-payments.md) remains available for rebinding (key rotation) after initial registration.
 - **`deregisterNode` triggers unbonding.** Sets `active = false`, starts the current unbonding period (default 7 days, minimum 3 days per [ADR 009](009-governance.md)), and increments `registrationNonce[nodeId]` to invalidate any previously issued ed25519 registration signatures for this NodeId. Stake remains slashable during unbonding to prevent slash-then-run.
 - **Auto-ejection.** When slashing drops a node's stake below 50% of the minimum stake requirement ([ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn)), the contract sets `active = false` and emits `NodeAutoEjected`. The node must re-stake at full minimum to rejoin.
 - **`firstRegisteredAt` is write-once.** `registerNode` sets `firstRegisteredAt = block.timestamp` only if the stored value is 0 (first-ever registration for this address). On re-registration after deregistration or auto-ejection it retains its original value; it is never cleared by `deregisterNode` or auto-ejection. Used by clients to determine cold-start bootstrap eligibility ([ADR 008](008-reputation.md#10-cold-start-bootstrap)).
