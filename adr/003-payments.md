@@ -22,14 +22,14 @@ The same channel mechanism operates at two tiers:
 - **Client → node**: a client opens a payment-token channel with a node, signs cumulative vouchers as MB are delivered, and the node initiates channel close on-chain and settles to claim payment after the dispute window.
 - **Node → node**: when a node pulls content from another node (typically an origin-backed node) for the first time, it pays via the same channel mechanism. The origin-backed node is paid wholesale; the pulling node recoups this by serving multiple clients from its cache at a markup.
 
-A channel is opened by depositing the payment token into the `PaymentChannel` contract. As content is delivered, the payer signs cumulative vouchers off-chain — one voucher per MB received (default cadence; negotiable for large transfers). The delivering node holds the latest voucher and submits it on-chain to initiate channel close. A dispute window (default 48 hours for PoC, governable within 12h–72h — see [ADR 009](009-governance.md)) allows either party to counter a stale or fraudulent close attempt. After the dispute window expires, the channel is settled and funds are distributed.
+A channel is opened by depositing the payment token into the `PaymentChannel` contract. As content is delivered, the payer signs cumulative vouchers off-chain — one voucher per MB received (default cadence; negotiable for large transfers). The delivering node holds the latest voucher and submits it on-chain to initiate channel close. A dispute window (default 48 hours for PoC, governable within 12h–72h — see [ADR 009](009-governance.md#adr-009-governance-model)) allows either party to counter a stale or fraudulent close attempt. After the dispute window expires, the channel is settled and funds are distributed.
 
 Key parameters:
 
 - Voucher cadence: 1 MB delivered per voucher (default; negotiable up to `maxVoucherIntervalMb` for large transfers — see [Voucher Interval Negotiation](#voucher-interval-negotiation))
 - Minimum deposit: 1 USDC (contract floor, governable); recommended practical minimum: 10 USDC (see [Deposit Economics](#deposit-economics))
-- Fee routing: at settlement, the full operator payment-token balance is forwarded to `FeeRouter.routeSettlement(operator, bytesDelivered, amount, epochId)` in a single transaction; the operator's 40% base share is paid out same-tx and the remaining buckets (gauge boost, delegator pool, buyback-and-burn, treasury, safety) are distributed per [ADR 026](026-tokenomics.md). See [FeeRouter Integration](#feerouter-integration).
-- Operator return is differentiated through ve-locked gauge boost per [ADR 026](026-tokenomics.md), not via a fee-discount mechanic on the channel contract.
+- Fee routing: at settlement, the full operator payment-token balance is forwarded to `FeeRouter.routeSettlement(operator, bytesDelivered, amount, epochId)` in a single transaction; the operator's 40% base share is paid out same-tx and the remaining buckets (gauge boost, delegator pool, buyback-and-burn, treasury, safety) are distributed per [ADR 026](026-tokenomics.md#adr-026-tokenomics). See [FeeRouter Integration](#feerouter-integration).
+- Operator return is differentiated through ve-locked gauge boost per [ADR 026](026-tokenomics.md#adr-026-tokenomics), not via a fee-discount mechanic on the channel contract.
 
 ### Deposit Economics
 
@@ -51,7 +51,7 @@ The overhead percentages above represent worst-case single-session economics. Lo
 
 #### Smart Account Support and Gasless Channel Opens
 
-All deCDN contracts use OpenZeppelin `SignatureChecker` for signature verification, supporting both EOA (via `ecrecover`) and smart account wallets (via ERC-1271 `isValidSignature`) from the PoC. Safe smart wallets are the recommended wallet type for both node operators and clients — see [ADR 024](024-account-abstraction.md).
+All deCDN contracts use OpenZeppelin `SignatureChecker` for signature verification, supporting both EOA (via `ecrecover`) and smart account wallets (via ERC-1271 `isValidSignature`) from the PoC. Safe smart wallets are the recommended wallet type for both node operators and clients — see [ADR 024](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support).
 
 Two standards can further eliminate the requirement for clients to hold the L2's native gas currency:
 
@@ -68,7 +68,7 @@ At the default 1 MB cadence, a 10 GB blob requires 10,000 vouchers — each invo
 
 **Negotiation semantics:**
 
-1. The client proposes a `voucher_interval_mb` in `StreamRequest` (see [ADR 005](005-protocol.md)).
+1. The client proposes a `voucher_interval_mb` in `StreamRequest` (see [ADR 005](005-protocol.md#adr-005-wire-protocol)).
 2. The node responds with its accepted `voucher_interval_mb` in `StreamResponse`. The node may accept the client's proposal, reduce it, or omit the field to fall back to 1 MB.
 3. The effective interval for the stream is `min(client_proposed, node_accepted, on-chain maxVoucherIntervalMb)`.
 
@@ -122,7 +122,7 @@ The settled amount is still calculated **at final settlement**, after the disput
 
 A dispute that raises the settlement amount (e.g., 50 → 80 payment-token units) raises every router-bucket allocation proportionally, and a higher `claimedBytes` raises the operator's gauge-pool weighting for the epoch. The router computes its split once, on the final settled amount and byte count — never on intermediate values, never more than once per channel.
 
-The governance token (TOKEN) is not used for delivery payments. It is reserved for staking, gauge-boost ve-locking (see [ADR 034 § Gauge-boost formula](034-gauge-boost-voting-escrow.md#gauge-boost-formula) and [§4](034-gauge-boost-voting-escrow.md#voting-escrow-votingescrow)), and governance (see [ADR 009](009-governance.md)).
+The governance token (TOKEN) is not used for delivery payments. It is reserved for staking, gauge-boost ve-locking (see [ADR 034 § Gauge-boost formula](034-gauge-boost-voting-escrow.md#gauge-boost-formula) and [§4](034-gauge-boost-voting-escrow.md#voting-escrow-votingescrow)), and governance (see [ADR 009](009-governance.md#adr-009-governance-model)).
 
 **Rate setting is entirely up to each node.** Nodes advertise their `rate_per_mb` in probe responses and stream responses; the requester sees the rate before committing a voucher. There is no protocol-enforced rate beyond a governance-set floor and ceiling. This creates a market with natural arbitrage dynamics:
 
@@ -152,7 +152,7 @@ The eight `VoucherRejectReason` values mirror the off-chain validation enums `Ch
 | `BytesRegression` | `voucher.bytes_delivered < last accepted bytes_delivered` | Invariant 2 — `disputeChannel` reverts if `newBytes < claimedBytes` |
 | `InsufficientDeposit` | `voucher.amount > channel.deposit` | Invariant 1 — `closeChannel` / `disputeChannel` revert if `voucher.amount > channel.deposit` |
 
-Surfacing these reasons off-chain saves both parties the gas of a doomed on-chain submission and gives the payer enough detail to recover (e.g., refresh state and re-sign for `StaleNonce`, top up for `InsufficientDeposit`) instead of an opaque connection drop. Riding in-band rather than via a QUIC stream reset preserves the reason for client retry logic without burning [ADR 013](013-schema-evolution.md) application-error-code numbers for the structured-response case.
+Surfacing these reasons off-chain saves both parties the gas of a doomed on-chain submission and gives the payer enough detail to recover (e.g., refresh state and re-sign for `StaleNonce`, top up for `InsufficientDeposit`) instead of an opaque connection drop. Riding in-band rather than via a QUIC stream reset preserves the reason for client retry logic without burning [ADR 013](013-schema-evolution.md#adr-013-schema-evolution) application-error-code numbers for the structured-response case.
 
 ## Consequences
 
@@ -168,7 +168,7 @@ Surfacing these reasons off-chain saves both parties the gas of a doomed on-chai
 ### Negative
 
 - Clients must hold the payment token and the L2's native gas currency to use the network; this adds an onboarding step compared to a single-currency model. Gas-overhead percentages and the gasless-open deferral are quantified in [Deposit Economics](#deposit-economics)
-- Rate volatility: a node can change its advertised rate between a probe and a stream request; the `StreamResponse` rate is the binding one, but a client that probed at one rate and receives a higher rate in `StreamResponse` must disconnect and re-probe rather than having been deceived silently. Rate changes more than 30 seconds after the probe are not slashable; the 30-second window is precisely defined as `stream_response.timestamp_us >= probe_response.timestamp_us && stream_response.timestamp_us - probe_response.timestamp_us < 30_000_000` using requester-anchored timestamps in both signed messages (see [ADR 005](005-protocol.md))
+- Rate volatility: a node can change its advertised rate between a probe and a stream request; the `StreamResponse` rate is the binding one, but a client that probed at one rate and receives a higher rate in `StreamResponse` must disconnect and re-probe rather than having been deceived silently. Rate changes more than 30 seconds after the probe are not slashable; the 30-second window is precisely defined as `stream_response.timestamp_us >= probe_response.timestamp_us && stream_response.timestamp_us - probe_response.timestamp_us < 30_000_000` using requester-anchored timestamps in both signed messages (see [ADR 005](005-protocol.md#adr-005-wire-protocol))
 - USDC is issued by Circle, which can freeze specific addresses or blacklist the contract. This counterparty risk is accepted: the payment token is fixed to USDC at deployment and the protocol does not implement payment-token substitution
 
 ## Attack Vectors
@@ -202,7 +202,7 @@ The dispute window (default 48 hours for PoC, raised from 24 hours to account fo
 
 1. **In-process dispute monitor.** A lightweight thread inside the node binary watches the chain for `ChannelCloseInitiated` events on its channels and auto-submits the latest voucher via `disputeChannel`. Zero-latency to the local voucher store; handles the common case where the node is online. Implementation is a SHOULD for production node binaries.
 2. **Operator-arranged redundancy.** Multi-instance deployments, hot-standby relays, peer agreements to relay vouchers. Out of protocol scope; the protocol does not define a wire format for voucher-relay arrangements between operators.
-3. **Permissionless on-chain dispute submission.** `disputeChannel` accepts submissions from any address holding a higher-nonce voucher — operators with their own infrastructure or counterparties can submit directly. See [Appendix: Fraud Detection](appendix-fraud-detection.md).
+3. **Permissionless on-chain dispute submission.** `disputeChannel` accepts submissions from any address holding a higher-nonce voucher — operators with their own infrastructure or counterparties can submit directly. See [Appendix: Fraud Detection](appendix-fraud-detection.md#appendix-permissionless-stale-close-detection).
 
 The node-offline-for-the-full-48h case is a node-operations responsibility, not a protocol gap.
 
@@ -212,7 +212,7 @@ Client sends probe requests to many nodes at high frequency to map the network o
 
 Per-NodeId rate limiting alone is bypassable: clients are not staked, NodeIds are free to rotate, and iroh connection setup is cheap. The mitigation is the layered token-bucket rate limit in [ADR 005 § Probe rate limiting](005-protocol.md#probe-rate-limiting): per-peer (NodeId) plus per-IP plus a global node cap, applied before any signature or hold-slot allocation. The per-IP layer raises the cost of bulk probing because IP rotation requires money (proxies, IPv6 delegation, cloud bills) while NodeId rotation does not; the global cap is defence in depth.
 
-**Note:** Probe responses are considered public information (see [ADR 005](005-protocol.md)). The concern here is resource exhaustion from bulk probing, not information leakage — content availability is discoverable via probing (see [ADR 005](005-protocol.md)), and pricing is revealed in probe/stream responses by design.
+**Note:** Probe responses are considered public information (see [ADR 005](005-protocol.md#adr-005-wire-protocol)). The concern here is resource exhaustion from bulk probing, not information leakage — content availability is discoverable via probing (see [ADR 005](005-protocol.md#adr-005-wire-protocol)), and pricing is revealed in probe/stream responses by design.
 
 #### Double-spend across nodes
 
@@ -232,7 +232,7 @@ Self-enforcing: the node cannot extract more payment than the last acknowledged 
 
 Node serves bytes that don't match the advertised BLAKE3 hash.
 
-Absorbed at the wire by progressive BLAKE3 verification at the client (mandatory in `cdn/client/v1` per [ADR 002](002-content-addressing.md) and [ADR 005](005-protocol.md)). Vouchers are signed and sent only after the corresponding chunks have been verified — a corrupt window therefore yields no voucher. The client drops the connection, requests the blob from a different node, and recovers any unspent channel funds via channel-close. **Client monetary loss in the corruption case is zero**; the only cost is downstream bandwidth (sunk regardless of outcome).
+Absorbed at the wire by progressive BLAKE3 verification at the client (mandatory in `cdn/client/v1` per [ADR 002](002-content-addressing.md#adr-002-content-addressing) and [ADR 005](005-protocol.md#adr-005-wire-protocol)). Vouchers are signed and sent only after the corresponding chunks have been verified — a corrupt window therefore yields no voucher. The client drops the connection, requests the blob from a different node, and recovers any unspent channel funds via channel-close. **Client monetary loss in the corruption case is zero**; the only cost is downstream bandwidth (sunk regardless of outcome).
 
 No on-chain slash machinery is needed for content corruption. The threat is bounded in framing parallel to [§ Voucher withholding](#voucher-withholding) above: per-encounter wasted bandwidth is capped at one `voucher_interval` on each side (the client's downstream cost for a corrupt window; the node's upstream cost when a correctly-withheld voucher leaves the window unpaid). Both sides set local acceptance policies — nodes refuse continued service to keys with elevated voucher-withhold rates and may cap total bytes for keys without established history; clients prefer nodes whose probe and delivery history they trust — without protocol-level coordination. Client reputation is a node-local concern; this ADR does not specify a wire format or on-chain surface for it.
 
@@ -240,7 +240,7 @@ No on-chain slash machinery is needed for content corruption. The threat is boun
 
 Node advertises a low rate in probe responses then returns a higher rate in `StreamResponse`.
 
-**Resolved: slashable offense.** Both responses are signed over the advertised rate ([ADR 005](005-protocol.md)); a same-NodeId signed pair where `StreamResponse.rate_per_mb > ProbeResponse.rate_per_mb` and the requester-anchored timestamp delta is under 30 seconds is on-chain-verifiable evidence. Clock-skew immune (both timestamps originate from the requester's clock; the node echoes them back in its signed response). The slash schedule lives in [ADR 026 §8](026-tokenomics.md#8-slashing-and-burn); see [ADR 014 §1](014-on-chain-verification.md#1-slash-signatures--secp256k1-eip-712) for the on-chain verifier.
+**Resolved: slashable offense.** Both responses are signed over the advertised rate ([ADR 005](005-protocol.md#adr-005-wire-protocol)); a same-NodeId signed pair where `StreamResponse.rate_per_mb > ProbeResponse.rate_per_mb` and the requester-anchored timestamp delta is under 30 seconds is on-chain-verifiable evidence. Clock-skew immune (both timestamps originate from the requester's clock; the node echoes them back in its signed response). The slash schedule lives in [ADR 026 §8](026-tokenomics.md#8-slashing-and-burn); see [ADR 014 §1](014-on-chain-verification.md#1-slash-signatures--secp256k1-eip-712) for the on-chain verifier.
 
 #### Phantom blob announcement
 
@@ -260,7 +260,7 @@ Not an attack. The contract always settles the highest valid voucher, and only t
 
 A third party holding a valid voucher calls `closeChannel` to force the channel from `Open` to `Closing`, halting delivery.
 
-**Resolved: access control restriction.** `closeChannel` requires `msg.sender == channel.client || msg.sender == channel.provider`. Third parties cannot initiate a close regardless of whether they hold a valid voucher. Permissionless fraud detection is unaffected — third parties operate via `disputeChannel` during the dispute window ([Appendix: Fraud Detection](appendix-fraud-detection.md)). The residual risk is a `disputeChannel` call with an intercepted voucher, which can only *improve* the settlement (higher nonce required). On-path network interception of vouchers is mitigated by QUIC transport (TLS 1.3), though this does not address endpoint compromise or other forms of leakage.
+**Resolved: access control restriction.** `closeChannel` requires `msg.sender == channel.client || msg.sender == channel.provider`. Third parties cannot initiate a close regardless of whether they hold a valid voucher. Permissionless fraud detection is unaffected — third parties operate via `disputeChannel` during the dispute window ([Appendix: Fraud Detection](appendix-fraud-detection.md#appendix-permissionless-stale-close-detection)). The residual risk is a `disputeChannel` call with an intercepted voucher, which can only *improve* the settlement (higher nonce required). On-path network interception of vouchers is mitigated by QUIC transport (TLS 1.3), though this does not address endpoint compromise or other forms of leakage.
 
 ### Network-level
 
@@ -268,7 +268,7 @@ A third party holding a valid voucher calls `closeChannel` to force the channel 
 
 Attacker surrounds a client with malicious nodes so all probe responses come from nodes under attacker control.
 
-BLAKE3 verification catches data corruption regardless of peer-table composition; the remaining DoS variant (attacker-controlled peer set refuses to serve) is resolved in [ADR 012 § Bootstrap and Trust Model](012-client.md): production uses multi-source bootstrap (on-chain registry + hardcoded DNS seeds) so an attacker must compromise both to fully eclipse a client; minimum honest-peer diversity is a supplementary client-side policy. PoC is registry-only.
+BLAKE3 verification catches data corruption regardless of peer-table composition; the remaining DoS variant (attacker-controlled peer set refuses to serve) is resolved in [ADR 012 § Bootstrap and Trust Model](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model): production uses multi-source bootstrap (on-chain registry + hardcoded DNS seeds) so an attacker must compromise both to fully eclipse a client; minimum honest-peer diversity is a supplementary client-side policy. PoC is registry-only.
 
 #### Gossip flooding
 
@@ -298,7 +298,7 @@ A node stakes, responds to probes with `has_blob: true`, but refuses to serve �
 
 **Withholding is not a slashable offense** — operators may legitimately take content offline for maintenance, migration, or business reasons, and slashing for availability creates perverse incentives. Instead, withholding is handled through reputation and DAO-supervised redundancy:
 
-- **Minimum-redundancy invariant on registered namespaces.** Content owners register a publisher identity ([ADR 002 § Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces)) and propose an origin operator set per namespace. Governance ratifies the proposal via the standard timelock path ([ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority)). The `OriginAssignment` contract enforces a minimum-redundancy floor (default 3, governance-bounded — see [ADR 009](009-governance.md)) at activation. A single withholding origin becomes irrelevant when others in the assigned set serve the same blob.
+- **Minimum-redundancy invariant on registered namespaces.** Content owners register a publisher identity ([ADR 002 § Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces)) and propose an origin operator set per namespace. Governance ratifies the proposal via the standard timelock path ([ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority)). The `OriginAssignment` contract enforces a minimum-redundancy floor (default 3, governance-bounded — see [ADR 009](009-governance.md#adr-009-governance-model)) at activation. A single withholding origin becomes irrelevant when others in the assigned set serve the same blob.
 - **Default-open content** is governed by the DAO-maintained default-open allow-list ([ADR 011 § Default-open allow-list](011-content-takedown.md#default-open-allow-list)) once governance has activated it for the first time; the allow-list enforces its own redundancy floor (default 10), so a single withholding origin is mitigated the same way as registered namespaces. During the bootstrap window before the allow-list is activated, default-open serving falls back to the legacy off-protocol model: any staked operator may serve as origin and content owners that have not registered carry the same withholding risk as before.
 - **Reputation fast-path.** Nodes that respond `has_blob: true` to probes but fail to deliver accumulate reputation penalties at a steeper rate. A node with consistently poor availability is deprioritized in provider selection and loses delivery revenue. Publishers may use the reputation signal as input when proposing or revoking operators in their namespace's assignment.
 
@@ -318,7 +318,7 @@ Required invariant: a node MUST persist `(last_nonce, last_amount, last_bytes_de
 
 A failed persist write MUST surface as a voucher-acceptance failure — the node returns a transient-failure rejection through the [Off-chain Voucher Rejections (Wire Encoding)](#off-chain-voucher-rejections-wire-encoding) channel, and MUST NOT send `VoucherAck`. The specific wire code for transient persistence failures is left to the `cdn/client/v1` handler implementation; the existing `StaleNonce` / `InsufficientDeposit` codes are NOT appropriate substitutes because they would tell the client to refresh state or top up the deposit when in fact the same voucher should be retried unchanged. Persisting after acknowledgement re-opens the same replay window for the crash interval between the two writes.
 
-Storage backend and trait shape are implementation concerns; the Rust implementation exposes a `ChannelStateStore` seam in `crates/incentive` with a `redb`-backed persistent implementation in `crates/node` (per the leaf-crate convention in [appendix-poc-production-seams.md](appendix-poc-production-seams.md)). The protocol fixes only the ordering above.
+Storage backend and trait shape are implementation concerns; the Rust implementation exposes a `ChannelStateStore` seam in `crates/incentive` with a `redb`-backed persistent implementation in `crates/node` (per the leaf-crate convention in [appendix-poc-production-seams.md](appendix-poc-production-seams.md#appendix-pocproduction-seam-architecture-rust-implementation)). The protocol fixes only the ordering above.
 
 ## Contract Interfaces
 
@@ -361,7 +361,7 @@ struct Channel {
 | Lifecycle | `reclaimExpired(channelId)` | Client or provider: refund full deposit on an expired channel that was never closed. |
 | View | `getChannel(channelId) → Channel` | Read the on-chain `Channel` struct. |
 | View | `getRateBounds() → (floor, ceiling)` | Current `RateBounds` in payment-token base units. |
-| View | `feeRouter() → address` | Configured `FeeRouter` target ([ADR 026](026-tokenomics.md)). |
+| View | `feeRouter() → address` | Configured `FeeRouter` target ([ADR 026](026-tokenomics.md#adr-026-tokenomics)). |
 | Governance | `setFeeRouter(addr)` | Replace router target. `GOVERNANCE_ROLE`-gated; routed through the standard 48h `TimelockController` delay; emits `FeeRouterUpdated(address oldRouter, address newRouter)`. See [§ Governance setter: setFeeRouter](#governance-setter-setfeerouter) below. |
 | Governance | `setMinDeposit(amount)` | Minimum channel deposit. |
 | Governance | `setDisputeWindow(seconds)` | Dispute window (bounded 43200–259200 — 12h–72h). |
@@ -380,7 +380,7 @@ event FeeRouterUpdated(address indexed oldRouter, address indexed newRouter);
 
 `setFeeRouter` re-points the configured `FeeRouter` for future `settleChannel` calls. Required because the audited contract surface is fixed at deploy time, yet the `FeeRouter` may need replacing (bug fix, structural upgrade) without redeploying `PaymentChannel` and forcing every open channel to re-issue vouchers.
 
-**Authority and timelock.** Only callable by `GOVERNANCE_ROLE` (held by the `TimelockController` post-deploy per [ADR 016 § Post-Deployment Initialization](016-contract-interactions.md#post-deployment-initialization)). `DecdnGovernor` proposals to replace the router execute through the standard 48h timelock per [ADR 009](009-governance.md). Calls outside that path revert.
+**Authority and timelock.** Only callable by `GOVERNANCE_ROLE` (held by the `TimelockController` post-deploy per [ADR 016 § Post-Deployment Initialization](016-contract-interactions.md#post-deployment-initialization)). `DecdnGovernor` proposals to replace the router execute through the standard 48h timelock per [ADR 009](009-governance.md#adr-009-governance-model). Calls outside that path revert.
 
 **Validation.** Reverts on `address(0)` and on the same address as the current `feeRouter`. The new router contract is not interrogated at the setter — the cross-validation invariants in [ADR 016 § Tunable Economics](016-contract-interactions.md#tunable-economics) live on `FeeRouter` itself; replacing the router with a misconfigured deployment surfaces at the next `settleChannel` rather than at the setter.
 
@@ -400,15 +400,15 @@ event FeeRouterUpdated(address indexed oldRouter, address indexed newRouter);
 
 #### Initial deployment values
 
-The constructor takes `(usdc, feeRouter, disputeWindow)` and sets the remaining governable parameters to their PoC defaults: `maxVoucherIntervalMb = 1` (1 MB) and `maxChannelDuration = 7776000` (90 days). All values are within the hardcoded safety bounds table further below (see also [ADR 009](009-governance.md) for governance ranges). The constructor MUST reject `feeRouter == address(0)` and a `feeRouter` whose code size is zero (EOA / undeployed address).
+The constructor takes `(usdc, feeRouter, disputeWindow)` and sets the remaining governable parameters to their PoC defaults: `maxVoucherIntervalMb = 1` (1 MB) and `maxChannelDuration = 7776000` (90 days). All values are within the hardcoded safety bounds table further below (see also [ADR 009](009-governance.md#adr-009-governance-model) for governance ranges). The constructor MUST reject `feeRouter == address(0)` and a `feeRouter` whose code size is zero (EOA / undeployed address).
 
-Default PoC deployment value for `disputeWindow`: **172800 seconds (48 hours)** — raised from 24 hours to guarantee effective dispute response time under L2 sequencer censorship (see [§ L2 sequencer censorship](#l2-sequencer-censorship) below). Safety bounds per [ADR 009](009-governance.md): 43200–259200 seconds (12h–72h). Under [ADR 026](026-tokenomics.md) the `feePercentage` / `discountedFeePercentage` / treasury-address constructor parameters from earlier drafts are removed; bucket shares are governed on `FeeRouter` instead, and the treasury bucket is one of `FeeRouter`'s six buckets (see [FeeRouter Integration](#feerouter-integration)).
+Default PoC deployment value for `disputeWindow`: **172800 seconds (48 hours)** — raised from 24 hours to guarantee effective dispute response time under L2 sequencer censorship (see [§ L2 sequencer censorship](#l2-sequencer-censorship) below). Safety bounds per [ADR 009](009-governance.md#adr-009-governance-model): 43200–259200 seconds (12h–72h). Under [ADR 026](026-tokenomics.md#adr-026-tokenomics) the `feePercentage` / `discountedFeePercentage` / treasury-address constructor parameters from earlier drafts are removed; bucket shares are governed on `FeeRouter` instead, and the treasury bucket is one of `FeeRouter`'s six buckets (see [FeeRouter Integration](#feerouter-integration)).
 
 #### L2 sequencer censorship
 
 A malicious closer (or colluding sequencer) submits `closeChannel` with a stale voucher and ensures all `disputeChannel` transactions are censored for the full dispute window. Counterparties fall back to L1 forced inclusion, but this takes up to ~24 hours on Arbitrum (similar paths on other OP-Stack chains). If the dispute window is also 24 hours, effective dispute response time is zero by the time the forced-inclusion transaction is processed.
 
-**Mitigation — layered defense.** The dispute window default is **48 hours** (172800 seconds), which guarantees at least 24 hours of effective dispute response time on any L2 with a forced-inclusion delay ≤ 24 hours. The setting is L2-agnostic and stays within the [ADR 009](009-governance.md) governance bounds (12h–72h).
+**Mitigation — layered defense.** The dispute window default is **48 hours** (172800 seconds), which guarantees at least 24 hours of effective dispute response time on any L2 with a forced-inclusion delay ≤ 24 hours. The setting is L2-agnostic and stays within the [ADR 009](009-governance.md#adr-009-governance-model) governance bounds (12h–72h).
 
 On top of that baseline, `disputeChannel` implements a **forced-inclusion deadline extension**: if a `disputeChannel` transaction arrives via L1 forced inclusion, the remaining dispute time is less than 24 hours, and `channel.extended == false`, `disputeDeadline` is set to `block.timestamp + 24 hours` and `channel.extended` is set to `true` — guaranteeing 24 hours of dispute time from the moment the forced-inclusion transaction is processed. `closeChannel` resets `channel.extended` to `false` so a new close cycle starts fresh.
 
@@ -416,7 +416,7 @@ Constraints on the extension mechanism:
 
 - **One extension per close.** Enforced on-chain by the `channel.extended` flag: once set, subsequent forced-inclusion `disputeChannel` calls do not trigger a further extension. This bounds worst-case settlement delay to `disputeWindow + 24h`.
 - **Only forced-inclusion transactions.** Normal sequencer-included `disputeChannel` calls do not trigger the extension, preventing abuse.
-- **L2-specific detection.** Identifying a forced-inclusion transaction is L2-specific. On Arbitrum, this can be detected via `ArbSys` precompile or delayed-inbox origin; on OP Stack, via L1 message origin. Exact detection logic is finalized at L2 selection — see [Appendix: L2 Deployment](appendix-l2-deployment.md).
+- **L2-specific detection.** Identifying a forced-inclusion transaction is L2-specific. On Arbitrum, this can be detected via `ArbSys` precompile or delayed-inbox origin; on OP Stack, via L1 message origin. Exact detection logic is finalized at L2 selection — see [Appendix: L2 Deployment](appendix-l2-deployment.md#appendix-production-l2-deployment-target).
 - **Governance must not set the dispute window below the L2's maximum forced-inclusion delay.** On an L2 with ~24h forced inclusion the 12h governance floor is not safe — the extension never executes because `settleChannel` becomes callable before the forced-inclusion `disputeChannel` arrives. The 12h floor remains as a hardcoded safety bound for L2s with shorter forced-inclusion paths.
 
 #### Events
@@ -442,7 +442,7 @@ All events use indexed `channelId` plus an indexed actor field where applicable.
 **Channel close lifecycle:**
 
 - `closeChannel` → requires status `Open`. **Callable by `channel.client` or `channel.provider` only** (`require(msg.sender == channel.client || msg.sender == channel.provider)`). Sets status to `Closing`, records `claimedAmount`, `claimedNonce`, and `claimedBytes` from the submitted voucher, emits `ChannelCloseInitiated`. No fund transfers. Third parties cannot initiate a close — they act only via `disputeChannel` (during the dispute window) or `settleChannel` (after expiration). **Zero-voucher close:** when **either party** calls with `amount == 0`, `nonce == 0`, `bytesDelivered == 0`, an empty signature (`signature.length == 0`), and `channel.claimedNonce == 0`, the voucher signature is not verified. Full mechanic, safety argument, and dispute symmetry: [Fee Routing on Disputed Closes](#fee-routing-on-disputed-closes) §1.
-- `disputeChannel` → requires status `Closing` and `block.timestamp < disputeDeadline`. Callable by any address holding a valid voucher with a strictly higher nonce. Updates `claimedAmount`, `claimedNonce`, and `claimedBytes`, emits `ChannelDisputed`. No fund transfers. Unrestricted caller access is intentional: third-party fraud detectors ([Appendix: Fraud Detection](appendix-fraud-detection.md)) must be able to submit higher-nonce vouchers on behalf of an offline party during the dispute window.
+- `disputeChannel` → requires status `Closing` and `block.timestamp < disputeDeadline`. Callable by any address holding a valid voucher with a strictly higher nonce. Updates `claimedAmount`, `claimedNonce`, and `claimedBytes`, emits `ChannelDisputed`. No fund transfers. Unrestricted caller access is intentional: third-party fraud detectors ([Appendix: Fraud Detection](appendix-fraud-detection.md#appendix-permissionless-stale-close-detection)) must be able to submit higher-nonce vouchers on behalf of an offline party during the dispute window.
 - `settleChannel` → requires status `Closing` and `block.timestamp >= disputeDeadline`. Callable by any address. Refunds `deposit - claimedAmount` to the client and, if `claimedAmount > 0`, transfers `claimedAmount` of the payment token to the configured `FeeRouter` and invokes `FeeRouter.routeSettlement(channel.provider, claimedBytes, claimedAmount, voucher.epochId)` in the same transaction. Sets status to `Closed`, emits `ChannelSettled`. **No fee is computed or skimmed inside this contract** — the router applies the split, pays the operator's 40% base share same-tx, and increments `bytesPerEpoch[operator][epochId]` for the [ADR 034 § Gauge-boost formula](034-gauge-boost-voting-escrow.md#gauge-boost-formula) gauge formula; see [FeeRouter Integration](#feerouter-integration). The per-operator gauge-share cap from [ADR 034 § Per-operator gauge-share cap](034-gauge-boost-voting-escrow.md#per-operator-gauge-share-cap) is the binding wash-trading defense.
 - `reclaimExpired` → requires status `Open` and `block.timestamp >= expiresAt`. Returns the full deposit to the client (no fee deducted — no voucher was submitted). Sets status to `Closed`, emits `ChannelExpiredReclaimed`. Callable by the client or the provider. Regardless of caller, the full deposit is returned to `channel.client` — the provider cannot claim funds via this path. This ensures abandoned channels where the client is absent can be cleaned up by the provider to free on-chain state.
 
@@ -468,19 +468,19 @@ All events use indexed `channelId` plus an indexed actor field where applicable.
 | `deliveryFloor` | $0.000001/MB | 1 | Anti-abuse minimum; 10× below expected market rate. Prevents zero-rate free-riding while imposing no practical constraint on legitimate pricing. Nodes are expected to set rates well above this floor; the floor is purely an anti-zero safeguard, not a recommended price. |
 | `deliveryCeiling` | $0.001/MB | 1,000 | 100× expected market rate. Accommodates origin-backed nodes with high-egress backends (e.g., S3 at $0.09/GB) while remaining well above any legitimate pricing scenario ($1.00/GB vs Akamai's ~$0.12–0.20/GB). |
 
-The expected market rate is $0.00001/MB (10 USDC base units per MB, or $0.01/GB). This positions deCDN ~4–9× cheaper than major traditional CDNs (CloudFront at $0.085/GB, KeyCDN at $0.04/GB) and at parity with budget providers (Bunny.net at $0.01/GB). Both bounds are governance-tunable from day one within the hardcoded safety constraints above — admin-key-gated in the PoC, ve-Governor in production (see [ADR 009](009-governance.md)).
+The expected market rate is $0.00001/MB (10 USDC base units per MB, or $0.01/GB). This positions deCDN ~4–9× cheaper than major traditional CDNs (CloudFront at $0.085/GB, KeyCDN at $0.04/GB) and at parity with budget providers (Bunny.net at $0.01/GB). Both bounds are governance-tunable from day one within the hardcoded safety constraints above — admin-key-gated in the PoC, ve-Governor in production (see [ADR 009](009-governance.md#adr-009-governance-model)).
 
 ### Rate Bounds Refresh
 
-Nodes must keep their local `RateBounds` copy current so advertised `rate_per_mb` stays within governance-set bounds. Because rate bounds are advisory coordination parameters — the contract does not verify rate compliance during settlement or slashing — the refresh strategy is lighter-touch than the content blacklist ([ADR 011](011-content-takedown.md)), where serving blacklisted content is a slashable offense.
+Nodes must keep their local `RateBounds` copy current so advertised `rate_per_mb` stays within governance-set bounds. Because rate bounds are advisory coordination parameters — the contract does not verify rate compliance during settlement or slashing — the refresh strategy is lighter-touch than the content blacklist ([ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)), where serving blacklisted content is a slashable offense.
 
 **Primary mechanism: event listening.** Nodes SHOULD subscribe to `RateBoundsUpdated` events on the `PaymentChannel` contract and update the local cache immediately. Governance actions are infrequent (days to weeks), so high-frequency polling would be wasteful.
 
-**Fallback mechanism: periodic polling.** Nodes MUST poll `getRateBounds()` at a configurable interval (`rate_bounds_poll_interval`, default **1 hour** for PoC), guarding against missed events from RPC provider issues, WebSocket disconnections, or chain reorganizations. The 1-hour default is deliberately longer than the 10-minute registry ([ADR 001](001-network.md)) / blacklist ([ADR 011](011-content-takedown.md)) intervals: registry freshness is connectivity-critical and blacklist freshness slashing-critical, but rate-bounds staleness only risks counterparties rejecting the node's advertised rate.
+**Fallback mechanism: periodic polling.** Nodes MUST poll `getRateBounds()` at a configurable interval (`rate_bounds_poll_interval`, default **1 hour** for PoC), guarding against missed events from RPC provider issues, WebSocket disconnections, or chain reorganizations. The 1-hour default is deliberately longer than the 10-minute registry ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)) / blacklist ([ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)) intervals: registry freshness is connectivity-critical and blacklist freshness slashing-critical, but rate-bounds staleness only risks counterparties rejecting the node's advertised rate.
 
 #### Startup
 
-Nodes MUST call `getRateBounds()` before accepting connections, never operating without rate bounds (same pattern as the content blacklist initial sync, [ADR 011](011-content-takedown.md)). Because `getRateBounds()` returns `uint256` but the wire protocol represents `rate_per_mb` as `u64` ([ADR 005](005-protocol.md)), nodes MUST verify both `deliveryFloor` and `deliveryCeiling` fit within `u64` on every refresh (startup and subsequent polls/events). If either bound exceeds `u64::MAX`, the node MUST refuse to start (or, on a mid-operation refresh, continue with its last valid bounds and log an error). Unreachable in practice — the PoC ceiling is 1,000 base units — but the check guards against governance misconfiguration.
+Nodes MUST call `getRateBounds()` before accepting connections, never operating without rate bounds (same pattern as the content blacklist initial sync, [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)). Because `getRateBounds()` returns `uint256` but the wire protocol represents `rate_per_mb` as `u64` ([ADR 005](005-protocol.md#adr-005-wire-protocol)), nodes MUST verify both `deliveryFloor` and `deliveryCeiling` fit within `u64` on every refresh (startup and subsequent polls/events). If either bound exceeds `u64::MAX`, the node MUST refuse to start (or, on a mid-operation refresh, continue with its last valid bounds and log an error). Unreachable in practice — the PoC ceiling is 1,000 base units — but the check guards against governance misconfiguration.
 
 #### Stale bounds
 
@@ -488,7 +488,7 @@ If the event subscription is lost and RPC polling fails, the node SHOULD continu
 
 #### No version-based delta pattern
 
-Unlike the content blacklist (which uses `getBlacklistVersion()` for cheap change detection and incremental delta fetching), rate bounds are a single struct containing two `uint256` values. A version counter adds no value — the full state is readable in a single `eth_call` with negligible overhead. This is an intentional divergence from the [ADR 011](011-content-takedown.md) pattern.
+Unlike the content blacklist (which uses `getBlacklistVersion()` for cheap change detection and incremental delta fetching), rate bounds are a single struct containing two `uint256` values. A version counter adds no value — the full state is readable in a single `eth_call` with negligible overhead. This is an intentional divergence from the [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) pattern.
 
 For how nodes validate `rate_per_mb` against cached bounds before signing protocol messages, see [ADR 005 — Rate Bounds Validation](005-protocol.md#rate-bounds-validation).
 
@@ -501,7 +501,7 @@ For how nodes validate `rate_per_mb` against cached bounds before signing protoc
 | `setSlippageTolerance(bps)` / `setMinBuybackAmount(n)` / `setMaxBuybackAmount(n)` | Governance: per-call execution guards. |
 | `keeper() → address` / `getAccumulatedFees() → uint256` | Views: current keeper and accumulated buyback inflow (USDC). |
 
-This is the canonical `BuybackBurner` interface. [ADR 026 §2](026-tokenomics.md#2-feerouter-split-40407553) defines the economic parameters and the inflow source (5% router-fed). [ADR 018](018-liquidity-strategy.md) specifies the venue (Balancer V3 Router + 80/20 weighted pool) and how `setSwapRouter` / `setPool` are configured at deployment. **V3 integration note:** `setSwapRouter` holds the Balancer V3 **Router** address, but `BuybackBurner` MUST self-approve the Balancer V3 **Vault** address (a separate contract) during initialization — the Vault pulls input tokens from the `msg.sender` of the Router call. See [ADR 018 — Buyback execution via Balancer V3](018-liquidity-strategy.md#buyback-execution-via-balancer-v3).
+This is the canonical `BuybackBurner` interface. [ADR 026 §2](026-tokenomics.md#2-feerouter-split-40407553) defines the economic parameters and the inflow source (5% router-fed). [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol) specifies the venue (Balancer V3 Router + 80/20 weighted pool) and how `setSwapRouter` / `setPool` are configured at deployment. **V3 integration note:** `setSwapRouter` holds the Balancer V3 **Router** address, but `BuybackBurner` MUST self-approve the Balancer V3 **Vault** address (a separate contract) during initialization — the Vault pulls input tokens from the `msg.sender` of the Router call. See [ADR 018 — Buyback execution via Balancer V3](018-liquidity-strategy.md#buyback-execution-via-balancer-v3).
 
 All `set*` functions are governance-only behind a timelock.
 
@@ -509,19 +509,19 @@ All `set*` functions are governance-only behind a timelock.
 
 ### FeeRouter Integration
 
-Under [ADR 026](026-tokenomics.md), `PaymentChannel.settleChannel` does not split fees inline. The full operator-bound payment-token balance is forwarded to a `FeeRouter` contract, which applies the canonical six-bucket split (40% node base / 40% gauge boost / 7% delegator pool / 5% buyback-and-burn / 5% treasury / 3% safety reserve — full table and bounds in [ADR 026 §2](026-tokenomics.md#2-feerouter-split-40407553) and [§11](026-tokenomics.md#11-governable-parameters-with-safety-bounds)). This ADR specifies the `FeeRouter` interface only as it relates to the settlement path; the gauge formula, ve-escrow mechanics, and bucket disbursement schedule live in [ADR 026](026-tokenomics.md).
+Under [ADR 026](026-tokenomics.md#adr-026-tokenomics), `PaymentChannel.settleChannel` does not split fees inline. The full operator-bound payment-token balance is forwarded to a `FeeRouter` contract, which applies the canonical six-bucket split (40% node base / 40% gauge boost / 7% delegator pool / 5% buyback-and-burn / 5% treasury / 3% safety reserve — full table and bounds in [ADR 026 §2](026-tokenomics.md#2-feerouter-split-40407553) and [§11](026-tokenomics.md#11-governable-parameters-with-safety-bounds)). This ADR specifies the `FeeRouter` interface only as it relates to the settlement path; the gauge formula, ve-escrow mechanics, and bucket disbursement schedule live in [ADR 026](026-tokenomics.md#adr-026-tokenomics).
 
 #### Settlement-path interface
 
-`PaymentChannel.settleChannel` MUST invoke `FeeRouter.routeSettlement(address operator, uint256 bytesDelivered, uint256 amount, uint64 epochId)` in the same transaction as the payment-token `safeTransferFrom` to the router. The router pays the operator's 40% base share in that transaction, dispatches the 5% / 5% / 3% same-tx legs, and increments `bytesPerEpoch[operator][epochId]` for the gauge formula per [ADR 034 § Gauge-boost formula](034-gauge-boost-voting-escrow.md#gauge-boost-formula). The full `IFeeRouter` interface is canonical in [ADR 016](016-contract-interactions.md).
+`PaymentChannel.settleChannel` MUST invoke `FeeRouter.routeSettlement(address operator, uint256 bytesDelivered, uint256 amount, uint64 epochId)` in the same transaction as the payment-token `safeTransferFrom` to the router. The router pays the operator's 40% base share in that transaction, dispatches the 5% / 5% / 3% same-tx legs, and increments `bytesPerEpoch[operator][epochId]` for the gauge formula per [ADR 034 § Gauge-boost formula](034-gauge-boost-voting-escrow.md#gauge-boost-formula). The full `IFeeRouter` interface is canonical in [ADR 016](016-contract-interactions.md#adr-016-smart-contract-interaction-model).
 
 #### Settlement-path invariants
 
 1. **Atomic base-share payout.** The 40% base share MUST land in the operator's wallet in the same transaction as `settleChannel` — no claim step, no keeper, no off-chain queue. This is the Case A cashflow guarantee from [ADR 026 §7](026-tokenomics.md#7-operator-economics-and-minimum-stake).
 2. **No reentry.** `settleChannel` holds a `nonReentrant` guard for the duration of the router call.
-3. **One settlement per channel.** Enforced by the existing `Closed` status; the router need only tolerate duplicate calls (idempotency or revert — pinned in [ADR 016](016-contract-interactions.md)).
+3. **One settlement per channel.** Enforced by the existing `Closed` status; the router need only tolerate duplicate calls (idempotency or revert — pinned in [ADR 016](016-contract-interactions.md#adr-016-smart-contract-interaction-model)).
 
-Conservation, same-tx satellite legs (5%/5%/3%), and epoch-consistency invariants live with the router itself in [ADR 026 §2](026-tokenomics.md#2-feerouter-split-40407553) / [ADR 016](016-contract-interactions.md). The `SettlementRouted` event (operator + epoch + per-bucket deltas) is emitted by the router; full event set is in [ADR 016](016-contract-interactions.md).
+Conservation, same-tx satellite legs (5%/5%/3%), and epoch-consistency invariants live with the router itself in [ADR 026 §2](026-tokenomics.md#2-feerouter-split-40407553) / [ADR 016](016-contract-interactions.md#adr-016-smart-contract-interaction-model). The `SettlementRouted` event (operator + epoch + per-bucket deltas) is emitted by the router; full event set is in [ADR 016](016-contract-interactions.md#adr-016-smart-contract-interaction-model).
 
 #### Cache-miss bypass (node-to-node paid pulls)
 
@@ -530,11 +530,11 @@ Conservation, same-tx satellite legs (5%/5%/3%), and epoch-consistency invariant
 - Node-to-node settlements use direct peer payment-token transfer with no router invocation.
 - Implementations distinguish node-to-node from client-to-node settlements via the channel's `client` and `provider` fields cross-referenced against the on-chain registry: if both addresses have a registered NodeId binding (see [NodeId-to-Ethereum Binding](#nodeid-to-ethereum-binding)), the channel is node-to-node; otherwise it is client-to-node.
 - The `PaymentChannel` may implement the bypass either by exposing a separate `settleChannelNoRoute(channelId)` entry point usable only when both parties are registered nodes, or by having `settleChannel` detect the case and skip the `FeeRouter` call. Either way the operator-to-operator USDC transfer is direct and bypasses the router's per-epoch USDC accumulators (those bytes were already counted at the client-to-node settlement that paid for them downstream). Gauge eligibility for these bytes is naturally bounded by the [ADR 034 § per-operator gauge-share cap](034-gauge-boost-voting-escrow.md#per-operator-gauge-share-cap) — even if a colluding operator pair routed bypassed bytes through the gauge counter, each operator-identity's share is capped at 5%.
-- Permissionless fraud detectors ([Appendix: Fraud Detection](appendix-fraud-detection.md)) can observe node-to-node settlements for self-routed-traffic / wash-trading patterns despite the bypass. The on-chain remedy is the per-operator gauge-share cap; off-chain reputation gauges ([ADR 008 §12](008-reputation.md#12-gauge-pool-wash-trading-reputation-as-off-chain-signal)) consume the observation as a soft signal.
+- Permissionless fraud detectors ([Appendix: Fraud Detection](appendix-fraud-detection.md#appendix-permissionless-stale-close-detection)) can observe node-to-node settlements for self-routed-traffic / wash-trading patterns despite the bypass. The on-chain remedy is the per-operator gauge-share cap; off-chain reputation gauges ([ADR 008 §12](008-reputation.md#12-gauge-pool-wash-trading-reputation-as-off-chain-signal)) consume the observation as a soft signal.
 
 #### Settlement sequence
 
-End-to-end payment-token flow (client→node settlement, then the parallel cache-miss bypass) is diagrammed in [ADR 016 §"FeeRouter integration"](016-contract-interactions.md). This ADR documents only the `PaymentChannel ↔ FeeRouter` interface contract.
+End-to-end payment-token flow (client→node settlement, then the parallel cache-miss bypass) is diagrammed in [ADR 016 §"FeeRouter integration"](016-contract-interactions.md#adr-016-smart-contract-interaction-model). This ADR documents only the `PaymentChannel ↔ FeeRouter` interface contract.
 
 The full six-bucket split applies to every network deployment from launch. Simplified launch configurations are expressed by setting non-active bucket shares to zero via `FeeRouter.setShares(...)` per [ADR 016 § Tunable Economics](016-contract-interactions.md#tunable-economics), not by deploying a reduced-surface stub. The cross-validation invariant in that section ensures any non-zero share has a wired non-zero destination, so the launch share configuration alone determines which downstream contracts must be ready at deploy time.
 
@@ -584,7 +584,7 @@ bytes32 digest = keccak256(abi.encodePacked(
 ));
 ```
 
-**Verification:** Implementations must use OpenZeppelin's `SignatureChecker.isValidSignatureNow(channel.client, digest, signature)`, which transparently supports both EOA signers (via hardened `ECDSA.recover` that rejects non-canonical `s` values and restricts `v` to `27`/`28`) and smart account signers (via ERC-1271 `isValidSignature`). The signature is encoded as 65 bytes (`r || s || v`) for EOA signers; smart account signers may use longer signatures per their wallet implementation. See [ADR 024](024-account-abstraction.md) for the full account abstraction design.
+**Verification:** Implementations must use OpenZeppelin's `SignatureChecker.isValidSignatureNow(channel.client, digest, signature)`, which transparently supports both EOA signers (via hardened `ECDSA.recover` that rejects non-canonical `s` values and restricts `v` to `27`/`28`) and smart account signers (via ERC-1271 `isValidSignature`). The signature is encoded as 65 bytes (`r || s || v`) for EOA signers; smart account signers may use longer signatures per their wallet implementation. See [ADR 024](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support) for the full account abstraction design.
 
 The `DOMAIN_SEPARATOR` is computed once in the constructor and stored as an immutable. If the contract is deployed behind a proxy and may be migrated to a different chain, it should be cached in a state variable and recomputed only when `block.chainid` changes (the pattern used by OpenZeppelin's `EIP712` base contract), rather than on every call.
 
@@ -597,11 +597,11 @@ Voucher nonces within a channel start at **1**. Nonce 0 is reserved as the senti
 
 ### StakingRegistry Modifications
 
-The full node registry interface (`NodeInfo`, `registerNode` with atomic binding, `getActiveNodes`, etc.) is defined in [ADR 001](001-network.md). The additions below are payment-specific extensions.
+The full node registry interface (`NodeInfo`, `registerNode` with atomic binding, `getActiveNodes`, etc.) is defined in [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh). The additions below are payment-specific extensions.
 
 > **No on-channel fee-discount path.** Operator return is differentiated through ve-locked gauge boost ([ADR 034 § Gauge-boost formula](034-gauge-boost-voting-escrow.md#gauge-boost-formula)), not via a stake-multiple fee toggle on the channel contract. `getEffectiveFee`, `getStakeMultiple`, `DISCOUNT_MULTIPLE`, `feePercentage`, and `discountedFeePercentage` are not part of the interface. `StakingRegistry` retains its slashing, registration, and stake-bookkeeping responsibilities; the minimum stake is **50,000 TOKEN** ([ADR 026 §7](026-tokenomics.md#7-operator-economics-and-minimum-stake)).
 
-No payment-specific extensions to `StakingRegistry` are required beyond the registry interface defined in [ADR 001](001-network.md).
+No payment-specific extensions to `StakingRegistry` are required beyond the registry interface defined in [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh).
 
 ## Admission and Priority
 
@@ -633,11 +633,11 @@ The EIP-712 domain separator is the same as the `StakingRegistry` contract deplo
 
 ### On-Chain Registration
 
-Node registration and NodeId binding are atomic. `StakingRegistry.registerNode()` ([ADR 001](001-network.md)) accepts a `bindingSignature` parameter — an EIP-712 signature over `BindNodeId(nodeId, bindingNonce[msg.sender])` — and an `ed25519Signature` parameter proving ownership of the NodeId's ed25519 private key (see [ADR 001, NodeId Ownership Verification](001-network.md#nodeid-ownership-verification)). It verifies both signatures, writes the `nodeIdToAddress`/`addressToNodeId` mappings, and increments `bindingNonce[msg.sender]` in the same transaction that adds the node to the mesh. The per-address nonce counter is shared with `bindNodeId`, giving replay protection across both paths. This eliminates the window in which a node could be active but not slashable.
+Node registration and NodeId binding are atomic. `StakingRegistry.registerNode()` ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)) accepts a `bindingSignature` parameter — an EIP-712 signature over `BindNodeId(nodeId, bindingNonce[msg.sender])` — and an `ed25519Signature` parameter proving ownership of the NodeId's ed25519 private key (see [ADR 001, NodeId Ownership Verification](001-network.md#nodeid-ownership-verification)). It verifies both signatures, writes the `nodeIdToAddress`/`addressToNodeId` mappings, and increments `bindingNonce[msg.sender]` in the same transaction that adds the node to the mesh. The per-address nonce counter is shared with `bindNodeId`, giving replay protection across both paths. This eliminates the window in which a node could be active but not slashable.
 
 The standalone `StakingRegistry.bindNodeId()` function below remains available for **rebinding only** (key rotation after initial registration). It is no longer needed at initial registration time.
 
-**Canonical source of truth:** The `nodeIdToAddress` / `addressToNodeId` mappings — written atomically by `registerNode` at initial registration and by `bindNodeId` on rebinding — are the authoritative source for payment attribution and slashing. `NodeInfo.ethAddress` in [ADR 001](001-network.md) is always `msg.sender`, so the two are consistent by construction under the one-to-one constraint. If the implementation stores both, `NodeInfo.ethAddress` MUST equal `nodeIdToAddress[nodeId]` at all times.
+**Canonical source of truth:** The `nodeIdToAddress` / `addressToNodeId` mappings — written atomically by `registerNode` at initial registration and by `bindNodeId` on rebinding — are the authoritative source for payment attribution and slashing. `NodeInfo.ethAddress` in [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) is always `msg.sender`, so the two are consistent by construction under the one-to-one constraint. If the implementation stores both, `NodeInfo.ethAddress` MUST equal `nodeIdToAddress[nodeId]` at all times.
 
 This creates an authoritative, publicly queryable mapping:
 
@@ -731,7 +731,7 @@ USDC uses 6 decimals; TOKEN uses 18 decimals. All payment amounts in the `incent
 {channelId, amount, nonce, bytesDelivered, token, signature}
 ```
 
-During delivery over `cdn/client/v1`, `{signature, amount, nonce, bytesDelivered}` are transmitted on the wire; the remaining fields (`channelId`, `token`) are derived from stream context. The `nonce` is explicit to prevent desynchronization if a `VoucherAck` is dropped (it starts at 1 for the first voucher in a channel; 0 is reserved as a sentinel). See [ADR 005](005-protocol.md) for wire protocol details.
+During delivery over `cdn/client/v1`, `{signature, amount, nonce, bytesDelivered}` are transmitted on the wire; the remaining fields (`channelId`, `token`) are derived from stream context. The `nonce` is explicit to prevent desynchronization if a `VoucherAck` is dropped (it starts at 1 for the first voucher in a channel; 0 is reserved as a sentinel). See [ADR 005](005-protocol.md#adr-005-wire-protocol) for wire protocol details.
 
 The `token` field (ERC-20 address) is in the signed EIP-712 typed data to prevent cross-token replay; it is the USDC contract address, fixed at deployment. Full EIP-712 type definition and domain separator: [EIP-712 Voucher Signature](#eip-712-voucher-signature).
 
@@ -740,7 +740,7 @@ The `token` field (ERC-20 address) is in the signed EIP-712 typed data to preven
 `bytesDelivered` is a cumulative byte count signed alongside `amount` and `nonce`. It is the canonical settlement-record byte count carried in the `Voucher`, forwarded to `FeeRouter.routeSettlement`, and aggregated into `bytesPerEpoch[operator][epochId]` for the gauge formula in [ADR 034 § Gauge-boost formula](034-gauge-boost-voting-escrow.md#gauge-boost-formula). Properties:
 
 - **Cumulative, monotonic.** Like `amount` and `nonce`, `bytesDelivered` is strictly non-decreasing across vouchers within a channel. `disputeChannel` MUST revert if the new voucher's `bytesDelivered < claimedBytes`.
-- **Derivable from MB-denominated voucher cadence.** Voucher cadence is MB-denominated (default 1 MB; see [Voucher Interval Negotiation](#voucher-interval-negotiation)) and `rate_per_mb` is MB-denominated. Clients computing `amount` from `bytesDelivered` use `amount = ⌈bytesDelivered / 1_048_576⌉ × rate_per_mb` (1 MB = 1,048,576 bytes per [ADR 005](005-protocol.md)); equivalently, `bytesDelivered = mb_delivered × 1_048_576` when delivery boundaries align with MB intervals. The unit conversion is purely an off-chain arithmetic concern; the voucher carries the byte count directly so the contract does not need to re-derive it.
+- **Derivable from MB-denominated voucher cadence.** Voucher cadence is MB-denominated (default 1 MB; see [Voucher Interval Negotiation](#voucher-interval-negotiation)) and `rate_per_mb` is MB-denominated. Clients computing `amount` from `bytesDelivered` use `amount = ⌈bytesDelivered / 1_048_576⌉ × rate_per_mb` (1 MB = 1,048,576 bytes per [ADR 005](005-protocol.md#adr-005-wire-protocol)); equivalently, `bytesDelivered = mb_delivered × 1_048_576` when delivery boundaries align with MB intervals. The unit conversion is purely an off-chain arithmetic concern; the voucher carries the byte count directly so the contract does not need to re-derive it.
 - **Carried through `closeChannel` / `disputeChannel` to `settleChannel`.** Recorded in `channel.claimedBytes` and forwarded as the `bytesDelivered` argument to `FeeRouter.routeSettlement` at settlement.
 - **Cross-channel consistency.** A voucher signed for one channel is bound by its EIP-712 typed data; `bytesDelivered` is part of that signed payload and cannot be replayed against a different channel.
 

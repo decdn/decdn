@@ -14,7 +14,7 @@ Two questions are in scope:
 
 ## Decision
 
-All staked nodes form a flat peer mesh with no fixed routing hierarchy. Node discovery is gossip-based; content discovery uses `cdn/dht/v1` (a lightweight Kademlia subset — see [ADR 022](022-content-discovery.md)), with the on-chain origin directory as the deterministic fallback when the DHT returns no providers:
+All staked nodes form a flat peer mesh with no fixed routing hierarchy. Node discovery is gossip-based; content discovery uses `cdn/dht/v1` (a lightweight Kademlia subset — see [ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale)), with the on-chain origin directory as the deterministic fallback when the DHT returns no providers:
 
 ```mermaid
 graph TD
@@ -67,23 +67,23 @@ struct LoadHint {
 
 #### Schema evolution note
 
-The struct above is a flat definition for readability. [ADR 013](013-schema-evolution.md) specifies that `NodeAnnounce` uses a `NodeAnnounceBody` (signed portion) + `signature` + optional extensions pattern with two-phase deserialization, enabling unsigned fields to be appended via minor evolution without an ALPN bump. See [ADR 013 — Signed Field Freezing](013-schema-evolution.md#signed-field-freezing) for the canonical struct layout.
+The struct above is a flat definition for readability. [ADR 013](013-schema-evolution.md#adr-013-schema-evolution) specifies that `NodeAnnounce` uses a `NodeAnnounceBody` (signed portion) + `signature` + optional extensions pattern with two-phase deserialization, enabling unsigned fields to be appended via minor evolution without an ALPN bump. See [ADR 013 — Signed Field Freezing](013-schema-evolution.md#signed-field-freezing) for the canonical struct layout.
 
-`LoadHint` is advisory and untrusted. The reputation system ([ADR 008](008-reputation.md)) penalizes nodes whose observed delivery performance contradicts their advertised load.
+`LoadHint` is advisory and untrusted. The reputation system ([ADR 008](008-reputation.md#adr-008-reputation-system)) penalizes nodes whose observed delivery performance contradicts their advertised load.
 
 - **`NodeAnnounce` carries node-level metadata only** — no content inventory and no demand signals. Content discovery and demand are derived from DHT FIND_VALUE traffic and local cache-miss timestamps (see Prefetch Triggers below). Message size is ~150 bytes.
 - **`LoadHint`** makes the "approximate load in gossip announcements" from [ADR 008, Tie-Breaking](008-reputation.md#9-tie-breaking) concrete, feeding tie-breaking logic.
 - **Announce interval** is a per-node configuration parameter (PoC default 60 seconds). This interval directly governs gossip bandwidth — see [Gossip Bandwidth Analysis](#gossip-bandwidth-analysis) below.
 
-Both clients and nodes maintain a **peer table** (`NodeId → NodeAnnounce`) built from received gossip messages. This table tracks which nodes exist and their metadata — it does not track content. Peer-table lifecycle (TTL, registry-driven eviction, reputation independence) is documented in [appendix-peer-table-eviction.md](appendix-peer-table-eviction.md).
+Both clients and nodes maintain a **peer table** (`NodeId → NodeAnnounce`) built from received gossip messages. This table tracks which nodes exist and their metadata — it does not track content. Peer-table lifecycle (TTL, registry-driven eviction, reputation independence) is documented in [appendix-peer-table-eviction.md](appendix-peer-table-eviction.md#appendix-peer-table-eviction-policy).
 
 #### Registry cache
 
-Nodes maintain a local cache of the on-chain registry, kept fresh by subscribing to `NodeRegistered`, `NodeDeregistered`, and `NodeAutoEjected` events; sub-second L2 block times keep the staleness window small. The cache is checked during gossip validation (below) and before initiating paid pulls (see Content Discovery step 5). On `NodeDeregistered` and `NodeAutoEjected`, the cache also removes the corresponding peer-table entry — see [appendix-peer-table-eviction.md](appendix-peer-table-eviction.md).
+Nodes maintain a local cache of the on-chain registry, kept fresh by subscribing to `NodeRegistered`, `NodeDeregistered`, and `NodeAutoEjected` events; sub-second L2 block times keep the staleness window small. The cache is checked during gossip validation (below) and before initiating paid pulls (see Content Discovery step 5). On `NodeDeregistered` and `NodeAutoEjected`, the cache also removes the corresponding peer-table entry — see [appendix-peer-table-eviction.md](appendix-peer-table-eviction.md#appendix-peer-table-eviction-policy).
 
 #### Gossip validation
 
-Gossip messages arrive wrapped in a `GossipEnvelope` ([ADR 013](013-schema-evolution.md)). The receiver deserializes the envelope first; messages with unknown envelope versions or unknown payload variants are silently dropped. The rules below apply to the inner payload after unwrapping. Before accepting a `NodeAnnounce` and updating the peer table, a node verifies: (1) the `signature` is valid for the `node_id`'s public key over the signed body fields (serialized via postcard, consistent with [ADR 005](005-protocol.md) and [ADR 013](013-schema-evolution.md)); (2) the `node_id` corresponds to an active staked node in the on-chain registry (checked against a local registry cache); (3) `timestamp_us` is within ±60 seconds of the receiver's local clock (prevents replay of old messages; the 60-second window accommodates clock skew between nodes — see Clock synchronization below); (4) `timestamp_us` is strictly greater than the `timestamp_us` of the existing peer table entry for the same `node_id` (monotonic — prevents replay of older messages within the freshness window). Messages failing any check are silently dropped. Additionally: (5) `region` is exactly 2 ASCII uppercase letters matching a known ISO 3166-1 alpha-2 code set. Messages with invalid region values are dropped. This prevents unregistered, unstaked, or replayed nodes from appearing in or corrupting peer tables.
+Gossip messages arrive wrapped in a `GossipEnvelope` ([ADR 013](013-schema-evolution.md#adr-013-schema-evolution)). The receiver deserializes the envelope first; messages with unknown envelope versions or unknown payload variants are silently dropped. The rules below apply to the inner payload after unwrapping. Before accepting a `NodeAnnounce` and updating the peer table, a node verifies: (1) the `signature` is valid for the `node_id`'s public key over the signed body fields (serialized via postcard, consistent with [ADR 005](005-protocol.md#adr-005-wire-protocol) and [ADR 013](013-schema-evolution.md#adr-013-schema-evolution)); (2) the `node_id` corresponds to an active staked node in the on-chain registry (checked against a local registry cache); (3) `timestamp_us` is within ±60 seconds of the receiver's local clock (prevents replay of old messages; the 60-second window accommodates clock skew between nodes — see Clock synchronization below); (4) `timestamp_us` is strictly greater than the `timestamp_us` of the existing peer table entry for the same `node_id` (monotonic — prevents replay of older messages within the freshness window). Messages failing any check are silently dropped. Additionally: (5) `region` is exactly 2 ASCII uppercase letters matching a known ISO 3166-1 alpha-2 code set. Messages with invalid region values are dropped. This prevents unregistered, unstaked, or replayed nodes from appearing in or corrupting peer tables.
 
 **Gossip deduplication:** iroh-gossip uses PlumTree (epidemic broadcast trees), which performs message-level deduplication internally — each message is assigned a unique identifier and nodes track a bounded in-memory set of seen message IDs, so the same message arriving via multiple paths is delivered to the application at most once while its ID remains in that seen-set. This is not a global or persistent exactly-once guarantee: duplicates may be re-delivered after seen-set eviction or process restart. This transport-layer dedup is the primary mechanism preventing redundant processing of `NodeAnnounce` in a multi-path topology. As defense-in-depth, gossip validation rule (4) (monotonic `timestamp_us` per `node_id`) independently rejects any duplicate or older `NodeAnnounce` — even if transport-level dedup were bypassed (e.g., after a restart), a replayed message fails the strictly-greater timestamp check against the peer table. The peer table itself (`NodeId → NodeAnnounce`), keyed by `node_id` with only the latest timestamp retained, is inherently convergent regardless of delivery order or multiplicity. No application-level seen-message set or content-hash table is required at the gossip layer. See also [ADR 008, Section 6](008-reputation.md#6-gossip-protocol) for deduplication of `ReputationReport` messages on the `cdn/reputation/v1` topic.
 
@@ -95,11 +95,11 @@ The ±60-second freshness check in gossip validation (3) is evaluated against th
 
 ### Content Discovery (DHT + Probe)
 
-Content discovery uses `cdn/dht/v1` as the primary mechanism (see [ADR 022](022-content-discovery.md)). `cdn/probe/v1` is used **after** the DHT lookup to confirm live availability and measure latency. When a node or client needs blob H:
+Content discovery uses `cdn/dht/v1` as the primary mechanism (see [ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale)). `cdn/probe/v1` is used **after** the DHT lookup to confirm live availability and measure latency. When a node or client needs blob H:
 
 1. **Probe cache check.** Look up `hash` in a short-lived LRU cache (`hash → Vec<(NodeId, rate_per_mb, rtt, ProbeResponse)>`, TTL 15 seconds, max 1024 entries). Each hash entry retains at most 10 responses (top 10 by selection score); each entry retains the full signed `ProbeResponse` for slashing evidence. Approximate memory: 1,024 entries × 10 responses × ~200 bytes ≈ 2 MB. If a valid entry exists, skip to step 5.
-2. **DHT FIND_VALUE.** Issue an iterative O(log N) `FindValueRequest` for H via `cdn/dht/v1` (see [ADR 022 §1.6](022-content-discovery.md)). Returns a `Vec<NodeId>` of known holders. The DHT bootstraps from `StakingRegistry.getActiveNodes()` — a node's first peers come from the on-chain registry and immediately participate in DHT lookups, so there is no separate bootstrap window.
-3. **Probe the DHT candidate set.** Send `ProbeRequest {hash, timestamp_us}` in parallel to the NodeIds returned by the DHT. ALPN: `cdn/probe/v1` — `ProbeResponse {has_blob, rate_per_mb, timestamp_us, total_bytes?, slash_sig}`. If DHT returned no providers, fall back to the on-chain origin directory ([ADR 022 § Origin discovery](022-content-discovery.md)): resolve namespaces via `PublisherRegistry.namespaceOf(hash)` and union the operator-address sets via `OriginAssignment.getOrigins(namespaceId)` for each, then probe those NodeIds.
+2. **DHT FIND_VALUE.** Issue an iterative O(log N) `FindValueRequest` for H via `cdn/dht/v1` (see [ADR 022 §1.6](022-content-discovery.md#adr-022--content-discovery-at-scale)). Returns a `Vec<NodeId>` of known holders. The DHT bootstraps from `StakingRegistry.getActiveNodes()` — a node's first peers come from the on-chain registry and immediately participate in DHT lookups, so there is no separate bootstrap window.
+3. **Probe the DHT candidate set.** Send `ProbeRequest {hash, timestamp_us}` in parallel to the NodeIds returned by the DHT. ALPN: `cdn/probe/v1` — `ProbeResponse {has_blob, rate_per_mb, timestamp_us, total_bytes?, slash_sig}`. If DHT returned no providers, fall back to the on-chain origin directory ([ADR 022 § Origin discovery](022-content-discovery.md#adr-022--content-discovery-at-scale)): resolve namespaces via `PublisherRegistry.namespaceOf(hash)` and union the operator-address sets via `OriginAssignment.getOrigins(namespaceId)` for each, then probe those NodeIds.
 4. **Collect.** Wait for probe responses in two phases:
    - **Phase 1 — Minimum wait** (`probe_min_wait`, default 50ms): Always wait this long to let multiple candidates respond.
    - **Phase 2 — Extended wait with optional early exit** (`probe_max_wait`, default 500ms): Exit early when **both** conditions are met: (a) at least `min_probe_responses` (default: 3) `has_blob: true` responses, and (b) best selection score is below `early_exit_score_threshold` (default: `1.5 × rolling_median_score`). Rolling median from last 100 successful pull scores, seeded with `0` (early exit disabled until history exists). If not met, wait up to 500ms. The 500ms ceiling accommodates inter-continental RTTs (e.g., London↔Sydney ~250–300ms).
@@ -113,7 +113,7 @@ Content discovery uses `cdn/dht/v1` as the primary mechanism (see [ADR 022](022-
 
 On probe cache hit, if the selected provider no longer has the blob (evicted — rare with eviction holds), try the next-best cached provider. If all fail, run a fresh DHT lookup + probe. **Observability:** Track `EvictedSinceProbe` response rate; sustained >1% may indicate eviction hold failures ([ADR 005](005-protocol.md#probe-triggered-eviction-hold)).
 
-**Probe cache TTL is 15 seconds** — half the 30-second slashing evidence window from [ADR 005](005-protocol.md).
+**Probe cache TTL is 15 seconds** — half the 30-second slashing evidence window from [ADR 005](005-protocol.md#adr-005-wire-protocol).
 
 #### Eviction hold interaction
 
@@ -145,7 +145,7 @@ Regional topics (`cdn/region/{cc}/v1`) add per-region bandwidth but do not reduc
 
 #### ReputationReport (`cdn/reputation/v1`, production only)
 
-Per [ADR 008](008-reputation.md) rate limits: max 10 reports per reporter per hour, max 1 per (reporter, target) pair per hour. Worst case: all N nodes send 10 reports/hr, each delivered to N−1 subscribers.
+Per [ADR 008](008-reputation.md#adr-008-reputation-system) rate limits: max 10 reports per reporter per hour, max 1 per (reporter, target) pair per hour. Worst case: all N nodes send 10 reports/hr, each delivered to N−1 subscribers.
 
 | Nodes | Reports received/node/hr | Ingress/node/hr |
 | --- | --- | --- |
@@ -153,7 +153,7 @@ Per [ADR 008](008-reputation.md) rate limits: max 10 reports per reporter per ho
 | 500 | ~5,000 | ~1.0 MB |
 | 1,000 | ~10,000 | ~2.0 MB |
 
-The strict rate limits (Section 11 of [ADR 008](008-reputation.md)) keep reputation gossip modest vs. `NodeAnnounce`.
+The strict rate limits (Section 11 of [ADR 008](008-reputation.md#adr-008-reputation-system)) keep reputation gossip modest vs. `NodeAnnounce`.
 
 #### Combined per-node budget (60-second announce interval)
 
@@ -173,7 +173,7 @@ The strict rate limits (Section 11 of [ADR 008](008-reputation.md)) keep reputat
 | ≤200 nodes | <10 MB/node/hr (~22 Kbps) | No action needed |
 | 200–500 nodes | ~25 MB/node/hr (~56 Kbps) | Monitor bandwidth metrics; consider increasing interval to 120s if constrained |
 | 500–1,000 nodes | ~50 MB/node/hr (~111 Kbps) | Evaluate selective gossip (regional-only subscription for non-global nodes) |
-| >1,000 nodes | Scales linearly (~50 KB/node/hr per additional node) | Structured overlay (DHT) or gossip partitioning required — see [ADR 022](022-content-discovery.md) |
+| >1,000 nodes | Scales linearly (~50 KB/node/hr per additional node) | Structured overlay (DHT) or gossip partitioning required — see [ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale) |
 
 **PoC (tens of nodes) is well within safe bounds.** At 30 nodes with a 60-second interval, gossip consumes ~3 Kbps per node — negligible. This analysis is a production planning exercise; the PoC validates the bandwidth model empirically.
 
@@ -185,7 +185,7 @@ The unified selection score combines price, latency, and reputation into a singl
 selection_score = rate_per_mb × rtt_ms × (1 / max(reputation, 0.1)²)
 ```
 
-Lower is better. Reputation is clamped to a minimum of 0.1 to prevent division by zero ([ADR 008](008-reputation.md) allows a floor of 0.0, but a node at 0.0 reputation is effectively unusable). The `reputation²` term amplifies reputation: a node at 0.5 (neutral) is 4× more expensive in score terms than a node at 1.0 (perfect):
+Lower is better. Reputation is clamped to a minimum of 0.1 to prevent division by zero ([ADR 008](008-reputation.md#adr-008-reputation-system) allows a floor of 0.0, but a node at 0.0 reputation is effectively unusable). The `reputation²` term amplifies reputation: a node at 0.5 (neutral) is 4× more expensive in score terms than a node at 1.0 (perfect):
 
 | Reputation | Score multiplier (vs. rep=1.0) |
 | --- | --- |
@@ -195,9 +195,9 @@ Lower is better. Reputation is clamped to a minimum of 0.1 to prevent division b
 | 0.3 | 11.1× |
 | 0.1 | 100× |
 
-For new nodes with the initial reputation of 0.5 ([ADR 008](008-reputation.md)), the 4× multiplier means they must be ~4× cheaper or faster to compete with established nodes — a bootstrap barrier softened by the cold-start bonus in [ADR 008](008-reputation.md).
+For new nodes with the initial reputation of 0.5 ([ADR 008](008-reputation.md#adr-008-reputation-system)), the 4× multiplier means they must be ~4× cheaper or faster to compete with established nodes — a bootstrap barrier softened by the cold-start bonus in [ADR 008](008-reputation.md#adr-008-reputation-system).
 
-**Inputs:** `rate_per_mb` and `rtt_ms` come from `ProbeResponse` (see [ADR 005](005-protocol.md)). `reputation` is the node's `final_score` from [ADR 008](008-reputation.md) — local observations (70%) + network gossip (30%).
+**Inputs:** `rate_per_mb` and `rtt_ms` come from `ProbeResponse` (see [ADR 005](005-protocol.md#adr-005-wire-protocol)). `reputation` is the node's `final_score` from [ADR 008](008-reputation.md#adr-008-reputation-system) — local observations (70%) + network gossip (30%).
 
 #### Minimum-reputation rejection floor
 
@@ -213,11 +213,11 @@ This score is used in Content Discovery step 4 above and in all other node selec
 
 #### Prefetching from Local Demand
 
-Each node tracks cache miss timestamps per hash in a bounded map (`HashMap<Hash, VecDeque<u64>>`, max 10,000 entries, LRU eviction). Each miss appends a timestamp (refreshing the entry's LRU position); entries older than 5 minutes are pruned on access. When a hash crosses a configurable threshold (default: 3 misses in 5 minutes), the node proactively pulls the blob via DHT FIND_VALUE → probe → `cdn/client/v1` path (see [ADR 022](022-content-discovery.md)).
+Each node tracks cache miss timestamps per hash in a bounded map (`HashMap<Hash, VecDeque<u64>>`, max 10,000 entries, LRU eviction). Each miss appends a timestamp (refreshing the entry's LRU position); entries older than 5 minutes are pruned on access. When a hash crosses a configurable threshold (default: 3 misses in 5 minutes), the node proactively pulls the blob via DHT FIND_VALUE → probe → `cdn/client/v1` path (see [ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale)).
 
 The signal feeds the same action as a regular cache miss: DHT FIND_VALUE → probe → select provider → pull via `cdn/client/v1` (paid). PoC uses a conservative (high) threshold.
 
-- **DHT-primary discovery (all scales).** `cdn/dht/v1` is the primary content discovery mechanism from PoC onward. At PoC scale (30 nodes), FIND_VALUE resolves in 1–2 hops. A DHT miss followed by an empty on-chain origin-directory lookup definitively means no registered node holds the blob. See [ADR 022](022-content-discovery.md) for the full discovery flow.
+- **DHT-primary discovery (all scales).** `cdn/dht/v1` is the primary content discovery mechanism from PoC onward. At PoC scale (30 nodes), FIND_VALUE resolves in 1–2 hops. A DHT miss followed by an empty on-chain origin-directory lookup definitively means no registered node holds the blob. See [ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale) for the full discovery flow.
 
 On a cache miss, a node checks its probe cache or performs a DHT FIND_VALUE lookup + probe (see Content Discovery above), selects the best provider by the unified node selection score, and pulls via `cdn/client/v1` (paid) — the same protocol used for client→node delivery, since every byte transferred is paid. Origin-backed nodes typically charge more (reflecting backend egress costs) and set the effective price ceiling; cache-only nodes that have the blob compete at lower rates.
 
@@ -251,9 +251,9 @@ This schedule is tuned for PoC with a single RPC endpoint. Production deployment
 
 - Cold cache miss adds up to 500ms latency (probe maximum wait) vs. a pre-built content index lookup; mitigated by probe cache for repeated lookups within 15 seconds and by adaptive early exit (see Collect step above), which reduces P50 latency to ~50-100ms once the node has sufficient score history
 - Probe cache introduces a brief staleness window (up to 15s) where a node may pull from a provider that has evicted the blob; mitigated by the probe-triggered eviction hold ([ADR 005](005-protocol.md#probe-triggered-eviction-hold)), with fallback to the next cached provider, then a fresh DHT lookup + probe
-- Self-reported region hints (ISO 3166-1 alpha-2) are unverified; a node could misreport its region to appear in more gossip topics. Mitigation: clients apply a reputation penalty when observed latency contradicts the claimed region (e.g., RTT > 150ms to a node in the same claimed region). Cryptographic hardening via an IP-geolocation oracle or third-party attestation was considered and rejected — see [ADR 030](030-node-region-self-attestation.md); the latency-based signal is the canonical mitigation.
+- Self-reported region hints (ISO 3166-1 alpha-2) are unverified; a node could misreport its region to appear in more gossip topics. Mitigation: clients apply a reputation penalty when observed latency contradicts the claimed region (e.g., RTT > 150ms to a node in the same claimed region). Cryptographic hardening via an IP-geolocation oracle or third-party attestation was considered and rejected — see [ADR 030](030-node-region-self-attestation.md#adr-030-node-region-self-attestation); the latency-based signal is the canonical mitigation.
 - Every transfer is paid, so nodes pulling on cache miss incur a cost recouped through subsequent client deliveries — a natural economic barrier to speculative caching
-- Origin-backed nodes are the last line of defense for availability — if all authorized origins for a blob go offline or are deregistered, the content becomes permanently unavailable (unless cached elsewhere). For registered namespaces, the `OriginAssignment` minimum-redundancy invariant ([ADR 009](009-governance.md), [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority)) ensures activated assignments always include at least the configured floor (default 3) of authorized origins. For default-open content (`namespaceId == 0`), the DAO-maintained default-open allow-list ([ADR 011 § Default-open allow-list](011-content-takedown.md#default-open-allow-list)) enforces its own redundancy floor (default 10) — materially higher than the registered floor because one approved operator may serve any default-open hash. During the bootstrap window before the allow-list is first activated, the prior permissive behaviour applies: any staked operator may serve as origin and the failure mode is total loss of every operator that ever cached the blob.
+- Origin-backed nodes are the last line of defense for availability — if all authorized origins for a blob go offline or are deregistered, the content becomes permanently unavailable (unless cached elsewhere). For registered namespaces, the `OriginAssignment` minimum-redundancy invariant ([ADR 009](009-governance.md#adr-009-governance-model), [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority)) ensures activated assignments always include at least the configured floor (default 3) of authorized origins. For default-open content (`namespaceId == 0`), the DAO-maintained default-open allow-list ([ADR 011 § Default-open allow-list](011-content-takedown.md#default-open-allow-list)) enforces its own redundancy floor (default 10) — materially higher than the registered floor because one approved operator may serve any default-open hash. During the bootstrap window before the allow-list is first activated, the prior permissive behaviour applies: any staked operator may serve as origin and the failure mode is total loss of every operator that ever cached the blob.
 - `registerNode` gas cost increases ~4–7× due to on-chain ed25519 signature verification (~650k–1.15M gas vs. ~150k without); acceptable as a one-time cost per node lifetime
 
 ## Contract Interface: Node Registry
@@ -275,7 +275,7 @@ struct NodeInfo {
 }
 ```
 
-`multiaddrs` uses `bytes` rather than `string[]` for gas efficiency: a packed array of `(uint16 length, bytes data)` entries, parsed off-chain by clients. Maximum encoded size is bounded by the governable `maxMultiaddrSize` parameter (initial value 1024 bytes; safety bounds 64–1024 bytes per [ADR 009](009-governance.md)).
+`multiaddrs` uses `bytes` rather than `string[]` for gas efficiency: a packed array of `(uint16 length, bytes data)` entries, parsed off-chain by clients. Maximum encoded size is bounded by the governable `maxMultiaddrSize` parameter (initial value 1024 bytes; safety bounds 64–1024 bytes per [ADR 009](009-governance.md#adr-009-governance-model)).
 
 ### Interface (additions to StakingRegistry)
 
@@ -328,19 +328,19 @@ event NodeAutoEjected(bytes32 indexed nodeId, uint256 remainingStake);
 event NodeIdReclaimed(bytes32 indexed nodeId, address indexed previousOwner);
 ```
 
-`registerNode` emits both `NodeRegistered` and `NodeIdBound` ([ADR 003](003-payments.md)) — the latter ensures off-chain indexers tracking the authoritative `nodeIdToAddress` mapping see initial registrations alongside rebindings.
+`registerNode` emits both `NodeRegistered` and `NodeIdBound` ([ADR 003](003-payments.md#adr-003-payment-model)) — the latter ensures off-chain indexers tracking the authoritative `nodeIdToAddress` mapping see initial registrations alongside rebindings.
 
 ### Constraints
 
 - **One-to-one mapping.** Each `nodeId` maps to exactly one `ethAddress` and vice versa. Enforced with `require(nodeByAddress[msg.sender].nodeId == bytes32(0))` and `require(nodes[nodeId].ethAddress == address(0))`, where `bytes32(0)` is the sentinel for "unregistered". This enforces a one-stake-position-per-node invariant.
-- **`registerNode` rejects `nodeId == bytes32(0)`** (reserved as the unregistered sentinel). It binds `msg.sender` to `nodeId` — the caller's Ethereum address becomes `ethAddress`. This binding is on-chain and permanent until deregistration, distinct from the ephemeral per-session `NodeId`-to-address binding in [ADR 003](003-payments.md) for clients. The function performs two signature verifications: (1) the `bindingSignature` parameter is an EIP-712 signature over `BindNodeId(nodeId, bindingNonce[msg.sender])` (see [ADR 003](003-payments.md)); `registerNode` verifies this against the caller's current `bindingNonce`, then atomically writes the `nodeIdToAddress`/`addressToNodeId` mappings and increments `bindingNonce[msg.sender]`. (2) The `ed25519Signature` parameter proves ownership of the NodeId's ed25519 private key — see [NodeId Ownership Verification](#nodeid-ownership-verification) below. The shared per-address `bindingNonce` counter with `bindNodeId` ensures replay protection across both registration and rebinding. Every registered node is immediately slashable — there is no window in which a node is active in the mesh without a verifiable binding. The separate `StakingRegistry.bindNodeId()` function in [ADR 003](003-payments.md) remains available for rebinding (key rotation) after initial registration.
-- **`deregisterNode` triggers unbonding.** Sets `active = false`, starts the current unbonding period (default 7 days, minimum 3 days per [ADR 009](009-governance.md)), and increments `registrationNonce[nodeId]` to invalidate any previously issued ed25519 registration signatures for this NodeId. Stake remains slashable during unbonding to prevent slash-then-run.
+- **`registerNode` rejects `nodeId == bytes32(0)`** (reserved as the unregistered sentinel). It binds `msg.sender` to `nodeId` — the caller's Ethereum address becomes `ethAddress`. This binding is on-chain and permanent until deregistration, distinct from the ephemeral per-session `NodeId`-to-address binding in [ADR 003](003-payments.md#adr-003-payment-model) for clients. The function performs two signature verifications: (1) the `bindingSignature` parameter is an EIP-712 signature over `BindNodeId(nodeId, bindingNonce[msg.sender])` (see [ADR 003](003-payments.md#adr-003-payment-model)); `registerNode` verifies this against the caller's current `bindingNonce`, then atomically writes the `nodeIdToAddress`/`addressToNodeId` mappings and increments `bindingNonce[msg.sender]`. (2) The `ed25519Signature` parameter proves ownership of the NodeId's ed25519 private key — see [NodeId Ownership Verification](#nodeid-ownership-verification) below. The shared per-address `bindingNonce` counter with `bindNodeId` ensures replay protection across both registration and rebinding. Every registered node is immediately slashable — there is no window in which a node is active in the mesh without a verifiable binding. The separate `StakingRegistry.bindNodeId()` function in [ADR 003](003-payments.md#adr-003-payment-model) remains available for rebinding (key rotation) after initial registration.
+- **`deregisterNode` triggers unbonding.** Sets `active = false`, starts the current unbonding period (default 7 days, minimum 3 days per [ADR 009](009-governance.md#adr-009-governance-model)), and increments `registrationNonce[nodeId]` to invalidate any previously issued ed25519 registration signatures for this NodeId. Stake remains slashable during unbonding to prevent slash-then-run.
 - **Auto-ejection.** When slashing drops a node's stake below 50% of the minimum stake requirement ([ADR 026 §8](026-tokenomics.md#8-slashing-and-burn)), the contract sets `active = false` and emits `NodeAutoEjected`. The node must re-stake at full minimum to rejoin.
 - **`firstRegisteredAt` is write-once.** `registerNode` sets `firstRegisteredAt = block.timestamp` only if the stored value is 0 (first-ever registration for this address). On re-registration after deregistration or auto-ejection it retains its original value; it is never cleared by `deregisterNode` or auto-ejection. Used by clients to determine cold-start bootstrap eligibility ([ADR 008](008-reputation.md#10-cold-start-bootstrap)).
 
 ### Multiaddr Update Policy
 
-A governable cooldown (0–86400 seconds, see [ADR 009](009-governance.md)) prevents a compromised node key from rapidly flipping multiaddrs to redirect traffic. The default is 0 (disabled) — `updateMultiaddrs` costs ~$0.03 per call at typical L2 gas prices, so a small mesh updating occasionally (IP change, port rotation) needs no rate limiting. Governance tightens the cooldown if abuse is seen.
+A governable cooldown (0–86400 seconds, see [ADR 009](009-governance.md#adr-009-governance-model)) prevents a compromised node key from rapidly flipping multiaddrs to redirect traffic. The default is 0 (disabled) — `updateMultiaddrs` costs ~$0.03 per call at typical L2 gas prices, so a small mesh updating occasionally (IP change, port rotation) needs no rate limiting. Governance tightens the cooldown if abuse is seen.
 
 ### Gas Costs
 
@@ -381,8 +381,8 @@ Where `registrationNonce` is a per-`nodeId` counter (distinct from the per-addre
 
 #### On-chain verification
 
-EVM has no native ed25519 precompile, and the RIP-7212 proposal is not yet deployed on the production L2 (see [Appendix: L2 Deployment](appendix-l2-deployment.md) for chain and rollout status). The implementation uses a well-audited Solidity ed25519 verification library (e.g., `ed25519-sol`). This adds ~500k–1M gas to `registerNode`, a one-time cost per node lifetime — see [gas cost table](#gas-costs) and the rationale in [ADR 014 §1](014-on-chain-verification.md#1-slash-signatures--secp256k1-eip-712) for why the secp256k1 `slash_sig` scheme used for routine slash evidence is not needed here.
+EVM has no native ed25519 precompile, and the RIP-7212 proposal is not yet deployed on the production L2 (see [Appendix: L2 Deployment](appendix-l2-deployment.md#appendix-production-l2-deployment-target) for chain and rollout status). The implementation uses a well-audited Solidity ed25519 verification library (e.g., `ed25519-sol`). This adds ~500k–1M gas to `registerNode`, a one-time cost per node lifetime — see [gas cost table](#gas-costs) and the rationale in [ADR 014 §1](014-on-chain-verification.md#1-slash-signatures--secp256k1-eip-712) for why the secp256k1 `slash_sig` scheme used for routine slash evidence is not needed here.
 
 #### Reclaim flow
 
-If a NodeId was squatted (e.g., during a transition period or via a contract bug), the legitimate ed25519 key holder calls `reclaimNodeId(nodeId, ed25519Signature)`. This verifies the ed25519 signature over `keccak256(abi.encodePacked(nodeId, msg.sender, block.chainid, registrationNonce[nodeId]))`, forcibly deregisters the current holder (triggering their unbonding period and incrementing `registrationNonce`), clears the NodeId-to-address mappings, and emits `NodeIdReclaimed`. The caller can then call `registerNode` under their own address. Reclaim does not require the caller to have stake — it only proves ed25519 key ownership and clears the squatter's binding. `reclaimNodeId` is the sole reclaim mechanism in both PoC and production: there is no admin override. Reclaim authority is gated entirely by ed25519 wire-key ownership (the iroh NodeId private key), distinct from the secp256k1 on-chain signatures used for slash evidence ([ADR 014](014-on-chain-verification.md)) and EIP-712 NodeId↔Ethereum binding ([ADR 003](003-payments.md)).
+If a NodeId was squatted (e.g., during a transition period or via a contract bug), the legitimate ed25519 key holder calls `reclaimNodeId(nodeId, ed25519Signature)`. This verifies the ed25519 signature over `keccak256(abi.encodePacked(nodeId, msg.sender, block.chainid, registrationNonce[nodeId]))`, forcibly deregisters the current holder (triggering their unbonding period and incrementing `registrationNonce`), clears the NodeId-to-address mappings, and emits `NodeIdReclaimed`. The caller can then call `registerNode` under their own address. Reclaim does not require the caller to have stake — it only proves ed25519 key ownership and clears the squatter's binding. `reclaimNodeId` is the sole reclaim mechanism in both PoC and production: there is no admin override. Reclaim authority is gated entirely by ed25519 wire-key ownership (the iroh NodeId private key), distinct from the secp256k1 on-chain signatures used for slash evidence ([ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)) and EIP-712 NodeId↔Ethereum binding ([ADR 003](003-payments.md#adr-003-payment-model)).

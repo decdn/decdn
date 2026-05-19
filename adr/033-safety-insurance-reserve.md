@@ -5,7 +5,7 @@
 
 ## Context
 
-The 3% safety/insurance bucket of the `FeeRouter` six-bucket split ([ADR 026 §2](026-tokenomics.md#2-feerouter-split-40407553)) is held in a governance-gated `SafetyReserve` contract. This ADR specifies that reserve: eligible payout categories, spending controls, cross-category payout ordering, interface stability, and the `ISafetyReserve` contract surface. The economic model that sizes the bucket is [ADR 026](026-tokenomics.md); the appeal-surface that feeds slash-restitution claims into it is [ADR 032](032-safety-reserve-appeals-contract.md).
+The 3% safety/insurance bucket of the `FeeRouter` six-bucket split ([ADR 026 §2](026-tokenomics.md#2-feerouter-split-40407553)) is held in a governance-gated `SafetyReserve` contract. This ADR specifies that reserve: eligible payout categories, spending controls, cross-category payout ordering, interface stability, and the `ISafetyReserve` contract surface. The economic model that sizes the bucket is [ADR 026](026-tokenomics.md#adr-026-tokenomics); the appeal-surface that feeds slash-restitution claims into it is [ADR 032](032-safety-reserve-appeals-contract.md#adr-032-safetyreserve-appeal-surface-contract-surface).
 
 ## Decision
 
@@ -21,7 +21,7 @@ The 3% safety bucket is held in `SafetyReserve`, a governance-gated incident res
 Disbursements require all of:
 
 1. An attested incident bundle (cryptographic evidence of the failure, identity of the harmed party, proposed payout amount).
-2. A governance proposal, or fast-track multisig approval (within hard caps per [ADR 009](009-governance.md)).
+2. A governance proposal, or fast-track multisig approval (within hard caps per [ADR 009](009-governance.md#adr-009-governance-model)).
 3. A 48-hour appeal window during which the bundle is challengeable on-chain.
 4. **Post-incident reporting.** On payout settlement, `SafetyReserve` writes an immutable record to its public on-chain registry (see [ADR 009 § SafetyReserve Payout Authorization](009-governance.md#safetyreserve-payout-authorization) for the record fields and reporting obligations).
 
@@ -40,7 +40,7 @@ The queue ordering is therefore **epoch-FIFO across all payout categories with a
 - **No multisig-as-orderer hazard.** Authorization order sets `claimId` only in the rare same-epoch tie, and deterministically; once authorized, queue position is fixed.
 - **Forward-compatible with new payout categories.** Contracts integrating via the stable `payout(bundleHash, recipient, amount)` interface inherit these semantics without amending this ADR.
 
-**Disbursement of queued claims is permissionless.** Gates 1–3 of the four [Spending controls](#spending-controls) (attested bundle, authorization, 48-hour appeal window) were checked at `payout()` authorization; gate 4 (post-incident reporting) writes atomically per disbursement. Thereafter any caller may invoke a `disbursePending()` head-of-queue path when solvency permits — no second-stage authorization exists, so the multisig cannot selectively re-authorize favored queued claims. This is what makes the ordering guarantee meaningful, and mirrors the permissionless-detection pattern in [Appendix: Fraud Detection](appendix-fraud-detection.md). The `disbursePending()` signature and the pending-claim storage shape are pinned in the [`ISafetyReserve` interface](#contract-safetyreserve) below; this section pins the ordering and permissionless-disbursement semantics.
+**Disbursement of queued claims is permissionless.** Gates 1–3 of the four [Spending controls](#spending-controls) (attested bundle, authorization, 48-hour appeal window) were checked at `payout()` authorization; gate 4 (post-incident reporting) writes atomically per disbursement. Thereafter any caller may invoke a `disbursePending()` head-of-queue path when solvency permits — no second-stage authorization exists, so the multisig cannot selectively re-authorize favored queued claims. This is what makes the ordering guarantee meaningful, and mirrors the permissionless-detection pattern in [Appendix: Fraud Detection](appendix-fraud-detection.md#appendix-permissionless-stale-close-detection). The `disbursePending()` signature and the pending-claim storage shape are pinned in the [`ISafetyReserve` interface](#contract-safetyreserve) below; this section pins the ordering and permissionless-disbursement semantics.
 
 ### Interface stability
 

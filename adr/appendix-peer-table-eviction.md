@@ -2,7 +2,7 @@
 
 > **This is an appendix, not a core protocol ADR.** Peer-table eviction is a local implementation choice — two nodes running different TTLs or admission policies still interoperate so long as they satisfy the gossip-validation rules in [ADR 001 § Gossip validation](001-network.md#gossip-validation). This appendix codifies the recommended approach (default 600 s TTL on `last_seen_us`, `NodeDeregistered` / `NodeAutoEjected`-driven active eviction, optional `gossip.max_peer_entries` ceiling, observability metrics). Alternative implementations are acceptable.
 
-**Touches:** [ADR 001](001-network.md), [ADR 008](008-reputation.md), [ADR 011](011-content-takedown.md), [ADR 019](019-node-onboarding.md)
+**Touches:** [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh), [ADR 008](008-reputation.md#adr-008-reputation-system), [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting), [ADR 019](019-node-onboarding.md#adr-019-node-onboarding-and-bootstrapping-flow)
 
 ## Context
 
@@ -56,7 +56,7 @@ Implementing `gossip.max_peer_entries` is OPTIONAL for the PoC (`peer_table_size
 
 ### 3. Registry-cache interaction (active eviction)
 
-The local registry cache, when implemented per [ADR 001 § Registry cache](001-network.md#registry-cache) and [ADR 019 § Step 3.3](019-node-onboarding.md#step-33--build-initial-peer-table-from-on-chain-registry), subscribes to `NodeRegistered`, `NodeDeregistered`, and `NodeAutoEjected` events. On `NodeDeregistered` and `NodeAutoEjected` for a `node_id`, the subscriber MUST also **remove the matching peer-table entry** in the same handler, alongside its registry-cache update. Origin blacklisting ([ADR 011 § Hash Evasion and Origin Blacklisting](011-content-takedown.md#hash-evasion-and-origin-blacklisting)) routes through `StakingRegistry.ejectNode` and emits `NodeAutoEjected`, so the same code path covers it. The subscriber does not yet exist; this clause adds one behavior on top of the subscriber introduced by [ADR 019](019-node-onboarding.md).
+The local registry cache, when implemented per [ADR 001 § Registry cache](001-network.md#registry-cache) and [ADR 019 § Step 3.3](019-node-onboarding.md#step-33--build-initial-peer-table-from-on-chain-registry), subscribes to `NodeRegistered`, `NodeDeregistered`, and `NodeAutoEjected` events. On `NodeDeregistered` and `NodeAutoEjected` for a `node_id`, the subscriber MUST also **remove the matching peer-table entry** in the same handler, alongside its registry-cache update. Origin blacklisting ([ADR 011 § Hash Evasion and Origin Blacklisting](011-content-takedown.md#hash-evasion-and-origin-blacklisting)) routes through `StakingRegistry.ejectNode` and emits `NodeAutoEjected`, so the same code path covers it. The subscriber does not yet exist; this clause adds one behavior on top of the subscriber introduced by [ADR 019](019-node-onboarding.md#adr-019-node-onboarding-and-bootstrapping-flow).
 
 **Rationale.**
 
@@ -69,15 +69,15 @@ The local registry cache, when implemented per [ADR 001 § Registry cache](001-n
 
 ### 4. Reputation does not factor into eviction
 
-Reputation governs *selection* (the `selection_score` formula in [ADR 001 § Node Selection Algorithm](001-network.md#node-selection-algorithm) and the local/network blend in [ADR 008](008-reputation.md)), not retention. A peer whose reputation falls to the 0.1 floor stays in the peer table until TTL or deregistration removes it. The selection-score formula already makes such a node ~100× less likely to be selected (see [ADR 001](001-network.md) reputation table), the appropriate response.
+Reputation governs *selection* (the `selection_score` formula in [ADR 001 § Node Selection Algorithm](001-network.md#node-selection-algorithm) and the local/network blend in [ADR 008](008-reputation.md#adr-008-reputation-system)), not retention. A peer whose reputation falls to the 0.1 floor stays in the peer table until TTL or deregistration removes it. The selection-score formula already makes such a node ~100× less likely to be selected (see [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) reputation table), the appropriate response.
 
 **Why not reputation-priority eviction.**
 
 - It conflates discovery and selection. The peer table is a discovery surface; selection is the trust-weighted decision built on top of it.
-- It creates a collusive-eviction vector: a coalition sending negative `ReputationReport` messages could push a competitor below an "eviction threshold" and remove them from peer tables network-wide, bypassing the hard floor in [ADR 008](008-reputation.md).
+- It creates a collusive-eviction vector: a coalition sending negative `ReputationReport` messages could push a competitor below an "eviction threshold" and remove them from peer tables network-wide, bypassing the hard floor in [ADR 008](008-reputation.md#adr-008-reputation-system).
 - Reputation is noisy in the tail; a transient bad-luck dip should not erase a peer from discovery.
 
-This ADR therefore excludes reputation from the eviction decision. Reputation-system changes ([ADR 008](008-reputation.md)) need not consider peer-table side effects.
+This ADR therefore excludes reputation from the eviction decision. Reputation-system changes ([ADR 008](008-reputation.md#adr-008-reputation-system)) need not consider peer-table side effects.
 
 ### 5. Offline handling
 

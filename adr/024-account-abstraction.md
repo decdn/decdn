@@ -7,7 +7,7 @@
 
 Three independent design pressures converge on the need for smart-account support from the PoC:
 
-1. **High-frequency signing needs a hot key.** At the default 1 MB voucher cadence, a 100 MB download requires 100 EIP-712 signatures, each requiring physical confirmation on a hardware wallet (2–5 seconds); nodes sign a `slash_sig` on every `ProbeResponse` / `StreamResponse`. Hardware-wallet-only operation is infeasible at that cadence regardless of wallet model. [ADR 012](012-client.md) identified this and explored a derived hot key (HKDF from hardware wallet signature) as a narrow workaround.
+1. **High-frequency signing needs a hot key.** At the default 1 MB voucher cadence, a 100 MB download requires 100 EIP-712 signatures, each requiring physical confirmation on a hardware wallet (2–5 seconds); nodes sign a `slash_sig` on every `ProbeResponse` / `StreamResponse`. Hardware-wallet-only operation is infeasible at that cadence regardless of wallet model. [ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model) identified this and explored a derived hot key (HKDF from hardware wallet signature) as a narrow workaround.
 
 2. **Node operators need multisig security.** Nodes stake significant TOKEN and accumulate USDC earnings. A single EOA controlling staked funds is a single point of compromise. Safe multisig wallets are the industry standard for securing protocol-managed funds — most DeFi operators use them. Deferring this to production means the PoC cannot demonstrate the intended security model.
 
@@ -35,7 +35,7 @@ This is a mechanical replacement. The EIP-712 domain separators, typed data hash
 
 #### Verification Sites Affected
 
-**PaymentChannel ([ADR 003](003-payments.md)):**
+**PaymentChannel ([ADR 003](003-payments.md#adr-003-payment-model)):**
 
 | Function | Current | After |
 | --- | --- | --- |
@@ -43,14 +43,14 @@ This is a mechanical replacement. The EIP-712 domain separators, typed data hash
 
 `disputeChannel` validates the voucher signature using the same scheme as `closeChannel` and migrates the same way.
 
-**StakingRegistry ([ADR 003](003-payments.md)):**
+**StakingRegistry ([ADR 003](003-payments.md#adr-003-payment-model)):**
 
 | Function | Current | After |
 | --- | --- | --- |
 | `registerNode` — `bindingSignature` | `ECDSA.recover(digest, sig) == msg.sender` | `SignatureChecker.isValidSignatureNow(msg.sender, digest, sig)` |
 | `bindNodeId` — `signature` | `ECDSA.recover(digest, sig) == msg.sender` | `SignatureChecker.isValidSignatureNow(msg.sender, digest, sig)` |
 
-**SlashJudge ([ADR 014](014-on-chain-verification.md)):**
+**SlashJudge ([ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)):**
 
 | Function | Current | After |
 | --- | --- | --- |
@@ -114,7 +114,7 @@ No bespoke Safe module, no custom fallback handler, no new security-critical con
 
 ### 4. Off-Chain ERC-1271 Verification
 
-[ADR 012](012-client.md) specifies that nodes verify client ephemeral binding signatures (`BindNodeId` with `nonce=0`) via `ecrecover`. When the client's Ethereum address is a smart account, this verification must use ERC-1271 instead.
+[ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model) specifies that nodes verify client ephemeral binding signatures (`BindNodeId` with `nonce=0`) via `ecrecover`. When the client's Ethereum address is a smart account, this verification must use ERC-1271 instead.
 
 #### Node-side verification logic (Rust, using alloy)
 
@@ -148,7 +148,7 @@ async fn verify_binding_signature(
 
 ### 5. Safe Infrastructure on the Canonical Testnet
 
-The following Safe infrastructure is already deployed on the testnet sibling of the canonical L2 (Arbitrum Sepolia, per [Appendix: L2 Deployment](appendix-l2-deployment.md)):
+The following Safe infrastructure is already deployed on the testnet sibling of the canonical L2 (Arbitrum Sepolia, per [Appendix: L2 Deployment](appendix-l2-deployment.md#appendix-production-l2-deployment-target)):
 
 | Contract | Status | Notes |
 | --- | --- | --- |
@@ -161,7 +161,7 @@ The following Safe infrastructure is already deployed on the testnet sibling of 
 #### Not required for PoC
 
 - ERC-4337 Entry Point interaction — operators submit transactions directly via Safe SDK
-- Paymaster contracts — operators hold ETH for gas (same as current [ADR 003](003-payments.md) assumption)
+- Paymaster contracts — operators hold ETH for gas (same as current [ADR 003](003-payments.md#adr-003-payment-model) assumption)
 - Bundler infrastructure
 - Safe-7579 adapter and any session-key module (deferred to Production per §3)
 

@@ -1,6 +1,6 @@
 # Appendix: Operator Key Rotation Runbook
 
-> **Appendix, not a core protocol ADR.** It sequences operator actions against the API surface defined elsewhere; it does not redefine any mechanism. Protocol semantics: [ADR 001](001-network.md), [ADR 003](003-payments.md), [ADR 019](019-node-onboarding.md), [ADR 024](024-account-abstraction.md).
+> **Appendix, not a core protocol ADR.** It sequences operator actions against the API surface defined elsewhere; it does not redefine any mechanism. Protocol semantics: [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh), [ADR 003](003-payments.md#adr-003-payment-model), [ADR 019](019-node-onboarding.md#adr-019-node-onboarding-and-bootstrapping-flow), [ADR 024](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support).
 
 ## Context
 
@@ -8,9 +8,9 @@ A node operator routinely holds three keys:
 
 | Key | Curve / scheme | Purpose | Where it lives |
 |-----|----------------|---------|----------------|
-| **iroh node-key** | Ed25519 | Wire identity (`NodeId`); authenticates the iroh QUIC handshake and signs `NodeAnnounce` gossip ([ADR 005](005-protocol.md)). `ProbeResponse`/`StreamResponse` body attribution moved to `slash_sig` — see [ADR 014 §1](014-on-chain-verification.md#1-slash-signatures--secp256k1-eip-712). | iroh keystore on the signing host |
-| **Ethereum signing key** | secp256k1 | On-chain identity for staking, channel ops, voucher receipt. Signs EIP-712 `BindNodeId`/`bindingSignature` ([ADR 003 § NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)) **and** `slash_sig` on every `ProbeResponse`/`StreamResponse` ([ADR 014](014-on-chain-verification.md)); the latter's hot-signing burden motivates the production session-key path. | EVM keystore (EOA) **or** Safe owner key (PoC 1-of-1) **or** session key delegated by a Safe (production §3 of [ADR 024](024-account-abstraction.md)) |
-| **Slash-sig session key** *(production only)* | secp256k1 | Per-message hot-signing of `slash_sig` digests on `ProbeResponse`/`StreamResponse` at wire speed under a 2-of-3 Safe; authorized via `erc7579/smartsessions` ([ADR 024](024-account-abstraction.md) §3). Client-side voucher session keys (also production, also smartsessions) are a separate client-owned concern. | Signing host, scoped by the session-key policy |
+| **iroh node-key** | Ed25519 | Wire identity (`NodeId`); authenticates the iroh QUIC handshake and signs `NodeAnnounce` gossip ([ADR 005](005-protocol.md#adr-005-wire-protocol)). `ProbeResponse`/`StreamResponse` body attribution moved to `slash_sig` — see [ADR 014 §1](014-on-chain-verification.md#1-slash-signatures--secp256k1-eip-712). | iroh keystore on the signing host |
+| **Ethereum signing key** | secp256k1 | On-chain identity for staking, channel ops, voucher receipt. Signs EIP-712 `BindNodeId`/`bindingSignature` ([ADR 003 § NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)) **and** `slash_sig` on every `ProbeResponse`/`StreamResponse` ([ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)); the latter's hot-signing burden motivates the production session-key path. | EVM keystore (EOA) **or** Safe owner key (PoC 1-of-1) **or** session key delegated by a Safe (production §3 of [ADR 024](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support)) |
+| **Slash-sig session key** *(production only)* | secp256k1 | Per-message hot-signing of `slash_sig` digests on `ProbeResponse`/`StreamResponse` at wire speed under a 2-of-3 Safe; authorized via `erc7579/smartsessions` ([ADR 024](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support) §3). Client-side voucher session keys (also production, also smartsessions) are a separate client-owned concern. | Signing host, scoped by the session-key policy |
 
 Rotation reasons: (1) **compromise** — suspected leak, revoke **today**; (2) **scheduled hygiene** — routine annual, no time pressure; (3) **hardware migration** — host replacement, HSM enrolment, or PoC EOA → production Safe.
 
@@ -50,22 +50,22 @@ If both keys must rotate, rotate the **iroh key first** (cheap, atomic on-chain,
 
 | Survives rotation | Reason |
 |-------------------|--------|
-| Stake, ve-locks, gauge-claim history | Keyed by Ethereum address ([ADR 026](026-tokenomics.md)) |
-| Open payment channels (inbound from clients) | Channel ID `keccak256(client_eth, operator_eth, nonce)` ([ADR 003](003-payments.md)); Ethereum address unchanged |
+| Stake, ve-locks, gauge-claim history | Keyed by Ethereum address ([ADR 026](026-tokenomics.md#adr-026-tokenomics)) |
+| Open payment channels (inbound from clients) | Channel ID `keccak256(client_eth, operator_eth, nonce)` ([ADR 003](003-payments.md#adr-003-payment-model)); Ethereum address unchanged |
 | `firstRegisteredAt` | Cleared only by `deregisterNode`; `bindNodeId` does not touch it ([ADR 019 § Re-Onboarding](019-node-onboarding.md#re-onboarding-after-deregistration-or-auto-ejection)) |
 
 ### What does not carry over
 
 | Resets on rotation | Impact |
 |--------------------|--------|
-| Reputation observations from peers | Reports indexed by `(reporter, provider)` NodeId pair ([ADR 008](008-reputation.md)); new NodeId starts at cold-start bootstrap score |
-| Local DHT routing-table position | New NodeId reseeds the Kademlia bucket structure ([ADR 022](022-content-discovery.md)) |
-| 0-RTT session tickets cached by clients | Clients fall back to 1-RTT until they re-cache ([ADR 015](015-zero-rtt.md)); brief P95 bump |
+| Reputation observations from peers | Reports indexed by `(reporter, provider)` NodeId pair ([ADR 008](008-reputation.md#adr-008-reputation-system)); new NodeId starts at cold-start bootstrap score |
+| Local DHT routing-table position | New NodeId reseeds the Kademlia bucket structure ([ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale)) |
+| 0-RTT session tickets cached by clients | Clients fall back to 1-RTT until they re-cache ([ADR 015](015-zero-rtt.md#adr-015-quic-0-rtt-connection-establishment)); brief P95 bump |
 
 ### Procedure
 
 1. **Generate** a new iroh ed25519 key offline on the signing host. Keep the old keystore until rotation completes.
-2. **Drain** the node — refuse new inbound connections, let existing streams complete (`decdn node drain`, surfaced via `admin_v1_drain` in [`appendix-local-admin-http.md`](appendix-local-admin-http.md)). Confirm:
+2. **Drain** the node — refuse new inbound connections, let existing streams complete (`decdn node drain`, surfaced via `admin_v1_drain` in [`appendix-local-admin-http.md`](appendix-local-admin-http.md#appendix-local-admin-http-surface)). Confirm:
    - `decdn_streams_active{direction="inbound"} == 0`
    - `decdn_probe_hold_slots_used == 0`
 
@@ -79,7 +79,7 @@ If both keys must rotate, rotate the **iroh key first** (cheap, atomic on-chain,
    - `decdn_node_uptime_seconds` advancing
    - Outgoing `NodeAnnounce` carries the new NodeId (visible in peers' gossip logs)
 8. **Un-drain** — accept inbound connections again.
-9. **Archive** the old iroh keystore offline; retain at least `MAX_EVIDENCE_AGE_US` (default 5 days, governable [1d, 30d] per [ADR 014](014-on-chain-verification.md) §2 Evidence Verification Per Offense Type) — the staleness ceiling beyond which old-key slash evidence cannot be submitted. Retention is forensic-only: `bindNodeId` does not initiate unbonding, all `SlashJudge` offenses (phantom, rate, blacklist) resolve synchronously at submit time per [ADR 014 § Bond Handling](014-on-chain-verification.md#bond-handling), and no key-bound counter-evidence flow exists for the old iroh key. Holding longer is harmless.
+9. **Archive** the old iroh keystore offline; retain at least `MAX_EVIDENCE_AGE_US` (default 5 days, governable [1d, 30d] per [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence) §2 Evidence Verification Per Offense Type) — the staleness ceiling beyond which old-key slash evidence cannot be submitted. Retention is forensic-only: `bindNodeId` does not initiate unbonding, all `SlashJudge` offenses (phantom, rate, blacklist) resolve synchronously at submit time per [ADR 014 § Bond Handling](014-on-chain-verification.md#bond-handling), and no key-bound counter-evidence flow exists for the old iroh key. Holding longer is harmless.
 
 ### Failure modes
 
@@ -87,7 +87,7 @@ If both keys must rotate, rotate the **iroh key first** (cheap, atomic on-chain,
 |---------|--------------|----------|
 | `bindNodeId` reverts `"NodeId bound to another address"` | A separate operator already registered `newNodeId` | Generate a different keypair and retry. The ed25519 ownership proof prevents squatting, but a pre-existing binding by a different *legitimate* owner is a hard collision. |
 | `bindNodeId` reverts `"invalid signature"` | `bindingNonce[ethAddress]` advanced or EIP-712 digest mis-built | Re-read the on-chain nonce, re-sign, resubmit |
-| Restarted node throws phantom-announcement self-detection | Probe holds not drained before stop | Stop immediately, file a bug, **do not restart** until the slash-evidence-exposure window (30s per [ADR 005](005-protocol.md)) has elapsed |
+| Restarted node throws phantom-announcement self-detection | Probe holds not drained before stop | Stop immediately, file a bug, **do not restart** until the slash-evidence-exposure window (30s per [ADR 005](005-protocol.md#adr-005-wire-protocol)) has elapsed |
 | Peers continue to address the old NodeId | Gossip re-propagation lag | Up to one `node_announce_interval`; if it persists past two intervals, restart gossip subscription |
 
 ## 2. Ethereum signing-key rotation only
@@ -105,23 +105,23 @@ cast code <addr>      # EOA → returns 0x ; Safe → returns deployed proxy cod
 Procedure:
 
 1. **Drain** and **stop** the node (same as §1 steps 2–3).
-2. **Wait** for all open inbound channels to settle. Watch `decdn_channels_open`. If any channel is in the dispute window, do **not** rotate — settling a stale state in step 7 requires the old keystore. PoC dispute window 48h ([ADR 003](003-payments.md)); production governable 12h–72h ([ADR 009](009-governance.md)).
+2. **Wait** for all open inbound channels to settle. Watch `decdn_channels_open`. If any channel is in the dispute window, do **not** rotate — settling a stale state in step 7 requires the old keystore. PoC dispute window 48h ([ADR 003](003-payments.md#adr-003-payment-model)); production governable 12h–72h ([ADR 009](009-governance.md#adr-009-governance-model)).
 3. **`StakingRegistry.deregisterNode()`** from the old address. Sets `active = false`, starts the unbonding period, increments `registrationNonce[nodeId]`. Stake remains slashable during unbonding ([ADR 019 § Re-Onboarding](019-node-onboarding.md#re-onboarding-after-deregistration-or-auto-ejection)).
 4. **Wait** the full unbonding period (default 7d, minimum 3d governable). Stake remains slashable here — do not relax monitoring.
 5. **`StakingRegistry.withdraw()`** to the old address.
 6. **Generate** the new EOA. Fund it with TOKEN (transfer from old, or from treasury) and a small ETH float for gas.
-7. **Keep the old EVM keystore reachable until your last open outbound channel settles or expires.** Vouchers are *client*-signed ([ADR 003](003-payments.md)); as node-operator-as-client (cache-miss pulls upstream) you hold signed vouchers under the old address, and the upstream counterparty may submit your latest voucher via `closeChannel`, triggering the 48h dispute window. Channels live up to `maxChannelDuration` (default 90 days per [ADR 003](003-payments.md)). As provider you do not sign vouchers, so inbound channels carry no key-side liability post-deregistration.
-8. **Re-stake from the new address with a fresh NodeId.** `TOKEN.approve` → `StakingRegistry.stake` → atomic `registerNode(newNodeId, multiaddrs, regionHint, bindingSignature, ed25519Signature)` (see [ADR 019](019-node-onboarding.md) § Phase 2 — On-chain Setup). **Reusing the original NodeId is not possible** without a separate `bindNodeId` on the *old* address before deregister: `deregisterNode` only sets `active = false` and increments `registrationNonce`, and does **not** clear `nodeIdToAddress[originalNodeId]` ([ADR 001](001-network.md) §340–342, [ADR 003](003-payments.md#nodeid-to-ethereum-binding)), so a fresh address calling `registerNode(originalNodeId, …)` reverts `"NodeId bound to another address"`. To reuse it (e.g., reputation continuity), chain §1 → §2.1: §1's `bindNodeId` to a temporary NodeId clears the original mapping, then §2.1 re-registers it from the new address.
+7. **Keep the old EVM keystore reachable until your last open outbound channel settles or expires.** Vouchers are *client*-signed ([ADR 003](003-payments.md#adr-003-payment-model)); as node-operator-as-client (cache-miss pulls upstream) you hold signed vouchers under the old address, and the upstream counterparty may submit your latest voucher via `closeChannel`, triggering the 48h dispute window. Channels live up to `maxChannelDuration` (default 90 days per [ADR 003](003-payments.md#adr-003-payment-model)). As provider you do not sign vouchers, so inbound channels carry no key-side liability post-deregistration.
+8. **Re-stake from the new address with a fresh NodeId.** `TOKEN.approve` → `StakingRegistry.stake` → atomic `registerNode(newNodeId, multiaddrs, regionHint, bindingSignature, ed25519Signature)` (see [ADR 019](019-node-onboarding.md#adr-019-node-onboarding-and-bootstrapping-flow) § Phase 2 — On-chain Setup). **Reusing the original NodeId is not possible** without a separate `bindNodeId` on the *old* address before deregister: `deregisterNode` only sets `active = false` and increments `registrationNonce`, and does **not** clear `nodeIdToAddress[originalNodeId]` ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) §340–342, [ADR 003](003-payments.md#nodeid-to-ethereum-binding)), so a fresh address calling `registerNode(originalNodeId, …)` reverts `"NodeId bound to another address"`. To reuse it (e.g., reputation continuity), chain §1 → §2.1: §1's `bindNodeId` to a temporary NodeId clears the original mapping, then §2.1 re-registers it from the new address.
 9. **Restart** the node with config pointing at the new EVM keystore. Confirm `/health` reports `ready` and `decdn_channel_deposit_usdc` is zero (no channels yet).
 10. **Re-open outbound channels** as needed for cache-miss pulls — no carry-over.
 
-**Real cost:** `firstRegisteredAt` resets to the new registration timestamp (cold-start bootstrap window restarts); reputation observations on the old NodeId↔Ethereum-address pair are stranded — peers' caches time out per [ADR 008 § Score decay](008-reputation.md); stake-time-weighted gauge-boost (where the gauge formula consumes `firstRegisteredAt`) is lost.
+**Real cost:** `firstRegisteredAt` resets to the new registration timestamp (cold-start bootstrap window restarts); reputation observations on the old NodeId↔Ethereum-address pair are stranded — peers' caches time out per [ADR 008 § Score decay](008-reputation.md#adr-008-reputation-system); stake-time-weighted gauge-boost (where the gauge formula consumes `firstRegisteredAt`) is lost.
 
 > **Recommendation.** Treat EOA rotation as a last resort. Prefer the **one-time migration to a Safe** (§2.2) — once on a Safe, all future "rotations" are owner/session-key swaps with no on-chain identity change.
 
 ### 2.2 EOA → Safe migration (one-time, recommended)
 
-`SignatureChecker` is wired across every contract per [ADR 024 §1](024-account-abstraction.md), so a Safe is a drop-in EOA replacement. The migration follows §2.1 (deregister → unbond → withdraw → re-stake from the Safe), performed once, yielding a stable on-chain identity for all subsequent rotations.
+`SignatureChecker` is wired across every contract per [ADR 024 §1](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support), so a Safe is a drop-in EOA replacement. The migration follows §2.1 (deregister → unbond → withdraw → re-stake from the Safe), performed once, yielding a stable on-chain identity for all subsequent rotations.
 
 After migration, the Safe holds TOKEN and executes `stake` / `registerNode` / `openChannel` / `closeChannel` / `topUp`. The Safe's owner key rotates thereafter (§2.3).
 
@@ -138,7 +138,7 @@ Replace the single owner via `Safe.swapOwner(prevOwner, oldOwner, newOwner)`. Th
 Two cases:
 
 - **Owner rotation:** standard 2-of-3 owner swap via the multisig owners. No protocol-level action needed.
-- **Session-key rotation:** revoke the old session key via the `erc7579/smartsessions` revocation interface; install a new one with the same policy ([ADR 024 §3](024-account-abstraction.md)). Slash-evidence signing resumes against the new key with no on-chain identity change.
+- **Session-key rotation:** revoke the old session key via the `erc7579/smartsessions` revocation interface; install a new one with the same policy ([ADR 024 §3](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support)). Slash-evidence signing resumes against the new key with no on-chain identity change.
 
 Procedure (session-key rotation):
 
@@ -176,17 +176,17 @@ Exception: **emergency compromise of the Ethereum key.** Run §2 immediately, sk
 
 ## 6. What this runbook does not cover
 
-- **Client-side iroh-key rotation.** See [ADR 012](012-client.md), inline "Key rotation": open client→node channels survive client iroh-key rotation (keyed by the client's Ethereum address), mirroring the operator-side carry-over in §1.
+- **Client-side iroh-key rotation.** See [ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model), inline "Key rotation": open client→node channels survive client iroh-key rotation (keyed by the client's Ethereum address), mirroring the operator-side carry-over in §1.
 - **Out-of-scope production hot-signing alternatives.** Hardware-wallet and HSM-backed voucher signing are infeasible per [ADR 012 § Consequences](012-client.md#consequences) — 2–5s confirmation latencies cannot keep the per-MB voucher cadence. A separate delegated-voucher-signer contract path is similarly superseded. The sole production hot-signing path is [ADR 024 §3 `erc7579/smartsessions`](024-account-abstraction.md#3-session-keys--deferred-to-production-via-erc-7579-smartsessions).
-- **Compromised-key incident response.** This runbook describes mechanics. If a key is *believed compromised*, the operator should also: file an incident report with the SafetyReserve registry ([ADR 026 §5](026-tokenomics.md)) if losses occurred, alert peer operators via reputation gossip, and rotate before any further wire-level signature under the compromised key.
+- **Compromised-key incident response.** This runbook describes mechanics. If a key is *believed compromised*, the operator should also: file an incident report with the SafetyReserve registry ([ADR 026 §5](026-tokenomics.md#adr-026-tokenomics)) if losses occurred, alert peer operators via reputation gossip, and rotate before any further wire-level signature under the compromised key.
 
 ## Cross-ADR Impact
 
-- [ADR 001 — On-chain registry, `registerNode`, NodeId ownership verification](001-network.md)
+- [ADR 001 — On-chain registry, `registerNode`, NodeId ownership verification](001-network.md#adr-001-network-topology-and-peer-mesh)
 - [ADR 003 — `bindNodeId` rebinding, `nodeIdToAddress`, EIP-712 `BindNodeId` schema](003-payments.md#nodeid-to-ethereum-binding)
 - [ADR 005 — Probe-triggered eviction hold (drain prerequisite)](005-protocol.md#probe-triggered-eviction-hold)
-- [ADR 008 — Reputation per `(reporter, provider)` NodeId pair](008-reputation.md)
-- [ADR 012 — Client iroh-key rotation analogue](012-client.md)
-- [ADR 019 — `registerNode`, `deregisterNode`, re-onboarding flow](019-node-onboarding.md)
-- [ADR 024 — Smart-account session keys via `erc7579/smartsessions`](024-account-abstraction.md)
-- [`appendix-local-admin-http.md` — `admin_v1_drain` invocation](appendix-local-admin-http.md)
+- [ADR 008 — Reputation per `(reporter, provider)` NodeId pair](008-reputation.md#adr-008-reputation-system)
+- [ADR 012 — Client iroh-key rotation analogue](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model)
+- [ADR 019 — `registerNode`, `deregisterNode`, re-onboarding flow](019-node-onboarding.md#adr-019-node-onboarding-and-bootstrapping-flow)
+- [ADR 024 — Smart-account session keys via `erc7579/smartsessions`](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support)
+- [`appendix-local-admin-http.md` — `admin_v1_drain` invocation](appendix-local-admin-http.md#appendix-local-admin-http-surface)

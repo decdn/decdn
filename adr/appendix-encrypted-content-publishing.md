@@ -43,9 +43,9 @@ XChaCha20-Poly1305 is chosen over AES-256-GCM: its 24-byte nonce eliminates nonc
 
 #### App Server (External Component)
 
-An app server gates access and delivers `K_blob` to authorized clients. It is operated by the content provider and is **not** a CDN protocol participant (no gossip, probing, or staking), but shares the iroh QUIC transport layer with the network, communicating with clients over iroh QUIC on the `cdn/keys/v1` ALPN ([ADR 005](005-protocol.md)). It handles subscription auth, billing integration, and key management — content-provider concerns — while reusing the same transport stack the client already has for CDN delivery.
+An app server gates access and delivers `K_blob` to authorized clients. It is operated by the content provider and is **not** a CDN protocol participant (no gossip, probing, or staking), but shares the iroh QUIC transport layer with the network, communicating with clients over iroh QUIC on the `cdn/keys/v1` ALPN ([ADR 005](005-protocol.md#adr-005-wire-protocol)). It handles subscription auth, billing integration, and key management — content-provider concerns — while reusing the same transport stack the client already has for CDN delivery.
 
-The app server accepts `cdn/keys/v1` connections from clients. A single connection carries three stream types, discriminated by the `KeysMessage` protocol enum ([ADR 013](013-schema-evolution.md)) — each message is varint-length-prefixed and the enum discriminant identifies the message type, consistent with all other ALPNs:
+The app server accepts `cdn/keys/v1` connections from clients. A single connection carries three stream types, discriminated by the `KeysMessage` protocol enum ([ADR 013](013-schema-evolution.md#adr-013-schema-evolution)) — each message is varint-length-prefixed and the enum discriminant identifies the message type, consistent with all other ALPNs:
 
 - **Epoch key stream** (`EpochKeyAuth`/`EpochKey`/`EpochKeyRevoked` variants, long-lived, bidirectional) — client sends `{session_token}`, server pushes `epoch_key` and `epoch_key_revoked` events. Server closes the stream on subscription expiry. Doubles as a presence signal for concurrent stream limiting.
 - **Play request** (`PlayRequest`/`PlayResponse` variants, short-lived, request-response) — client sends `{blob_hash}`, server responds with `{wrapped, epoch_id, blob_hash}`. The client's subscription is already authenticated on the epoch key stream.
@@ -78,11 +78,11 @@ wrapped    = nonce_wrap || XChaCha20-Poly1305(epoch_key, nonce_wrap, K_blob)
 envelope   = {wrapped, epoch_id, blob_hash}
 ```
 
-The envelope is sent directly over the authenticated `cdn/keys/v1` QUIC stream. QUIC TLS 1.3 provides confidentiality and mutual authentication — no additional asymmetric encryption layer (such as `crypto_box_seal`) is needed. This eliminates the X25519 key from the client's key set: the client needs only its iroh Ed25519 key (QUIC authentication) and its Ethereum secp256k1 key (payments). See [ADR 012](012-client.md) for the full client key management specification.
+The envelope is sent directly over the authenticated `cdn/keys/v1` QUIC stream. QUIC TLS 1.3 provides confidentiality and mutual authentication — no additional asymmetric encryption layer (such as `crypto_box_seal`) is needed. This eliminates the X25519 key from the client's key set: the client needs only its iroh Ed25519 key (QUIC authentication) and its Ethereum secp256k1 key (payments). See [ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model) for the full client key management specification.
 
 To decrypt the blob, the client needs both the envelope and the current epoch key.
 
-**Epoch key delivery:** Epoch keys are pushed to clients over the epoch key stream on the `cdn/keys/v1` connection. The client opens a long-lived bidirectional QUIC stream (`EpochKeyAuth` — see [ADR 013](013-schema-evolution.md)) and sends its session token. The app server validates the token, then pushes epoch keys as they rotate. When the subscription expires or is canceled, the server closes the stream and the client receives no further epoch keys.
+**Epoch key delivery:** Epoch keys are pushed to clients over the epoch key stream on the `cdn/keys/v1` connection. The client opens a long-lived bidirectional QUIC stream (`EpochKeyAuth` — see [ADR 013](013-schema-evolution.md#adr-013-schema-evolution)) and sends its session token. The app server validates the token, then pushes epoch keys as they rotate. When the subscription expires or is canceled, the server closes the stream and the client receives no further epoch keys.
 
 ```mermaid
 sequenceDiagram

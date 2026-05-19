@@ -5,11 +5,11 @@
 
 ## Context
 
-All wire messages are serialized with [postcard](https://docs.rs/postcard) — a compact, no-std, serde-based binary format standard in the iroh ecosystem ([ADR 005](005-protocol.md)). Postcard is positional: fields are encoded in declaration order with no field tags, no per-field length delimiters, no schema versioning. `postcard::from_bytes` silently ignores trailing bytes; `postcard::take_from_bytes` returns the unconsumed remainder. Neither fails on trailing bytes — but on a QUIC byte stream with no message boundaries, the receiver cannot find where one message ends without explicit framing. [ADR 005](005-protocol.md) noted the limitation: "Postcard has no schema evolution story — adding fields requires a new ALPN version (`cdn/client/v2`); version negotiation must be planned before the first breaking change."
+All wire messages are serialized with [postcard](https://docs.rs/postcard) — a compact, no-std, serde-based binary format standard in the iroh ecosystem ([ADR 005](005-protocol.md#adr-005-wire-protocol)). Postcard is positional: fields are encoded in declaration order with no field tags, no per-field length delimiters, no schema versioning. `postcard::from_bytes` silently ignores trailing bytes; `postcard::take_from_bytes` returns the unconsumed remainder. Neither fails on trailing bytes — but on a QUIC byte stream with no message boundaries, the receiver cannot find where one message ends without explicit framing. [ADR 005](005-protocol.md#adr-005-wire-protocol) noted the limitation: "Postcard has no schema evolution story — adding fields requires a new ALPN version (`cdn/client/v2`); version negotiation must be planned before the first breaking change."
 
-The codebase already has an ad-hoc pattern: `StreamRequest` appends `ethereum_address: Option<Address>` and `binding_signature: Option<Bytes>` with `#[serde(default)]` ([ADR 005](005-protocol.md)). [ADR 005](005-protocol.md) called this a "one-time workaround" and stated "any future mandatory field addition still requires `cdn/client/v2`." It is unscalable. Gossip messages (`NodeAnnounce`, `ReputationReport`) have no ALPN negotiation — published to iroh-gossip topics whose names embed a version (`cdn/global/v1`), and changing a topic name partitions the gossip network.
+The codebase already has an ad-hoc pattern: `StreamRequest` appends `ethereum_address: Option<Address>` and `binding_signature: Option<Bytes>` with `#[serde(default)]` ([ADR 005](005-protocol.md#adr-005-wire-protocol)). [ADR 005](005-protocol.md#adr-005-wire-protocol) called this a "one-time workaround" and stated "any future mandatory field addition still requires `cdn/client/v2`." It is unscalable. Gossip messages (`NodeAnnounce`, `ReputationReport`) have no ALPN negotiation — published to iroh-gossip topics whose names embed a version (`cdn/global/v1`), and changing a topic name partitions the gossip network.
 
-Several messages contain cryptographically signed fields ([ADR 005](005-protocol.md)). Signatures are a byte-level commitment: appending a field to a signed struct makes old verifiers compute the signature over fewer bytes than the signer intended, causing verification failure. Signed field sets must be explicitly frozen per protocol version.
+Several messages contain cryptographically signed fields ([ADR 005](005-protocol.md#adr-005-wire-protocol)). Signatures are a byte-level commitment: appending a field to a signed struct makes old verifiers compute the signature over fewer bytes than the signer intended, causing verification failure. Signed field sets must be explicitly frozen per protocol version.
 
 The project is pre-implementation. Defining framing and evolution conventions now avoids retrofitting after v1 — itself a breaking change.
 
@@ -26,7 +26,7 @@ Every message on every QUIC stream (all ALPNs) is length-prefixed:
 └─────────────────────┴──────────────────────────────┘
 ```
 
-The varint uses postcard's native varint encoding (continuation-bit scheme similar to LEB128). `MAX_MESSAGE_SIZE = 16 MiB` (16,777,216 bytes) — a single global protocol-level limit applied uniformly across all ALPNs; messages exceeding it are rejected before allocation. Per-ALPN protocol-level caps are rejected: typical messages are orders of magnitude below 16 MiB (see *DoS note*), and a future ALPN requiring >16 MiB would itself be a major-version change. **DoS note:** `read_frame` allocates `len` bytes, so a malicious peer could send a large length prefix to force allocation. The 16 MiB cap bounds per-stream allocation; QUIC's `MAX_STREAMS` transport parameter ([ADR 005](005-protocol.md)) bounds concurrent streams per connection — together limiting per-peer memory exposure. Operators on memory-constrained nodes SHOULD set a lower `MAX_MESSAGE_SIZE` as local policy; `cdn/probe/v1` messages never exceed ~200 bytes, and `cdn/client/v1` messages (excluding `ChunkData`) never exceed ~1 KiB.
+The varint uses postcard's native varint encoding (continuation-bit scheme similar to LEB128). `MAX_MESSAGE_SIZE = 16 MiB` (16,777,216 bytes) — a single global protocol-level limit applied uniformly across all ALPNs; messages exceeding it are rejected before allocation. Per-ALPN protocol-level caps are rejected: typical messages are orders of magnitude below 16 MiB (see *DoS note*), and a future ALPN requiring >16 MiB would itself be a major-version change. **DoS note:** `read_frame` allocates `len` bytes, so a malicious peer could send a large length prefix to force allocation. The 16 MiB cap bounds per-stream allocation; QUIC's `MAX_STREAMS` transport parameter ([ADR 005](005-protocol.md#adr-005-wire-protocol)) bounds concurrent streams per connection — together limiting per-peer memory exposure. Operators on memory-constrained nodes SHOULD set a lower `MAX_MESSAGE_SIZE` as local policy; `cdn/probe/v1` messages never exceed ~200 bytes, and `cdn/client/v1` messages (excluding `ChunkData`) never exceed ~1 KiB.
 
 The receiver reads the varint length, allocates and reads exactly that many bytes, then deserializes with `postcard::take_from_bytes` on the bounded slice. `take_from_bytes` succeeds even if the sender's struct has more fields than the receiver's definition — unconsumed trailing bytes are returned as a remainder. This is the key mechanism for forward-compatible minor evolution.
 
@@ -137,7 +137,7 @@ This dichotomy is load-bearing: topic bumps are expensive (every node and valida
 
 #### Gossip validation interaction
 
-Existing gossip validation rules ([ADR 001](001-network.md)) — signature verification, registry membership check, timestamp freshness, monotonic timestamp — operate on the inner `GossipPayload` after envelope unwrapping. The envelope is not signed; the inner message's signature covers the same fields as before.
+Existing gossip validation rules ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)) — signature verification, registry membership check, timestamp freshness, monotonic timestamp — operate on the inner `GossipPayload` after envelope unwrapping. The envelope is not signed; the inner message's signature covers the same fields as before.
 
 ### Three Tiers of Evolution
 
@@ -253,7 +253,7 @@ Messages without extensions (e.g., `VoucherAck`, `StreamEnd`, `ChunkData`) have 
 - New fields MUST NOT be included in any existing signature computation (see [Signed Field Freezing](#signed-field-freezing)).
 - The base struct is frozen at the protocol version that introduced it. Moving fields between base and extensions is a major change.
 
-This formalizes the pattern already used for `ethereum_address`, `binding_signature`, and `voucher_interval_mb` in `StreamRequest` ([ADR 005](005-protocol.md)) — no longer a one-time workaround but the standard minor evolution mechanism. The existing `Option<T>` fields with default semantics (`ethereum_address`/`binding_signature` with `#[serde(default)]`, `voucher_interval_mb` defaulting to 1 MB when absent) go in the extensions struct from the start, since the project is pre-implementation.
+This formalizes the pattern already used for `ethereum_address`, `binding_signature`, and `voucher_interval_mb` in `StreamRequest` ([ADR 005](005-protocol.md#adr-005-wire-protocol)) — no longer a one-time workaround but the standard minor evolution mechanism. The existing `Option<T>` fields with default semantics (`ethereum_address`/`binding_signature` with `#[serde(default)]`, `voucher_interval_mb` defaulting to 1 MB when absent) go in the extensions struct from the start, since the project is pre-implementation.
 
 ##### Example — adding `supported_versions` to `NodeAnnounce`
 
@@ -370,7 +370,7 @@ This separates the frozen signed region from the evolvable unsigned region via t
 
 #### Cross-ADR struct alignment
 
-The `Body` + extensions pattern and type definitions here are the canonical reference for implementation. Struct definitions in [ADR 001](001-network.md), [ADR 005](005-protocol.md), and [ADR 008](008-reputation.md) retain their flat-struct representations for readability; implementations MUST follow the body/extensions split defined here. Those flat-struct definitions will be updated when implementation begins.
+The `Body` + extensions pattern and type definitions here are the canonical reference for implementation. Struct definitions in [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh), [ADR 005](005-protocol.md#adr-005-wire-protocol), and [ADR 008](008-reputation.md#adr-008-reputation-system) retain their flat-struct representations for readability; implementations MUST follow the body/extensions split defined here. Those flat-struct definitions will be updated when implementation begins.
 
 ### ALPN Version Negotiation
 
@@ -413,9 +413,9 @@ A node MUST support at least the current and previous major version simultaneous
 | Old version removal | T+12 weeks | Old version support MAY be removed. Nodes that have not upgraded become unreachable by new clients |
 | Gossip topic removal | T+12 weeks | Old gossip topic subscriptions MAY be dropped. Peers on old topics become invisible |
 
-Deprecation schedules are announced via governance ([ADR 009](009-governance.md)). An on-chain `ProtocolVersions` registry contract is explicitly out of scope — off-chain governance announcement plus QUIC ALPN negotiation already covers the runtime path (clients try the newest version first, fall back on `no_application_protocol`), and a registry contract adds governance and integration complexity without operational payoff at the expected network scale. If a future scale or trust profile changes the calculus, the registry warrants its own ADR rather than a deferred follow-up here.
+Deprecation schedules are announced via governance ([ADR 009](009-governance.md#adr-009-governance-model)). An on-chain `ProtocolVersions` registry contract is explicitly out of scope — off-chain governance announcement plus QUIC ALPN negotiation already covers the runtime path (clients try the newest version first, fall back on `no_application_protocol`), and a registry contract adds governance and integration complexity without operational payoff at the expected network scale. If a future scale or trust profile changes the calculus, the registry warrants its own ADR rather than a deferred follow-up here.
 
-> **See also:** [`appendix-operator-upgrade-path.md`](appendix-operator-upgrade-path.md) sequences the operator-side actions for each tier — Tier 1/2 checklists, the Tier 3 rolling-upgrade procedure, and client / governance coordination touchpoints.
+> **See also:** [`appendix-operator-upgrade-path.md`](appendix-operator-upgrade-path.md#appendix-operator-protocol-upgrade-runbook) sequences the operator-side actions for each tier — Tier 1/2 checklists, the Tier 3 rolling-upgrade procedure, and client / governance coordination touchpoints.
 
 ### Application Error Codes
 
@@ -439,11 +439,11 @@ Additional application error codes defined by other ADRs are unaffected. The cod
 
 ### Positive
 
-- Formalizes the optional-trailing-fields pattern from [ADR 005](005-protocol.md) as a standard, repeatable mechanism — no longer a one-time workaround
+- Formalizes the optional-trailing-fields pattern from [ADR 005](005-protocol.md#adr-005-wire-protocol) as a standard, repeatable mechanism — no longer a one-time workaround
 - Length-prefixed framing enables forward-compatible deserialization: receivers skip unknown trailing bytes without connection failure
-- Protocol enums give explicit, type-safe message discrimination on every ALPN, replacing [Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md)'s ad-hoc 1-byte prefix with a uniform pattern
+- Protocol enums give explicit, type-safe message discrimination on every ALPN, replacing [Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md#appendix-encrypted-content-publishing-on-decdn)'s ad-hoc 1-byte prefix with a uniform pattern
 - The three-tier model provides a clear decision framework for every future protocol change
-- Gossip envelope provides schema evolution for messages lacking ALPN negotiation, filling the gap identified in [ADR 005](005-protocol.md)
+- Gossip envelope provides schema evolution for messages lacking ALPN negotiation, filling the gap identified in [ADR 005](005-protocol.md#adr-005-wire-protocol)
 - ALPN negotiation is already supported by QUIC/TLS 1.3 and iroh — no custom handshake needed for major version transitions
 - Signed field freezing makes implicit constraints explicit, preventing accidental signature-breaking changes
 - The signed body / unsigned outer fields pattern enables minor evolution of messages that currently sign all fields, without an ALPN bump
@@ -457,4 +457,4 @@ Additional application error codes defined by other ADRs are unaffected. The cod
 - Signed field freezing means even minor improvements to signed structs (e.g., adding a field to `ProbeResponse`'s signed set) require a full ALPN version bump. Conservative by design — the unsigned outer fields pattern mitigates this for fields that need not be signed
 - The `GossipEnvelope` wrapper adds 2–3 bytes (version byte + enum discriminant) per gossip message. For `NodeAnnounce` (~800 bytes), <0.4%
 - Multi-version support during deprecation requires nodes to maintain two protocol handler codepaths simultaneously, increasing code complexity during transitions. The 12-week deprecation window bounds this cost
-- Refactoring signed messages to the `Body` + outer fields pattern changes the struct layout relative to [ADR 005](005-protocol.md)'s current definitions. Pre-implementation, so a design change not a migration — but it MUST be reflected in the `protocol` crate's type definitions from day one
+- Refactoring signed messages to the `Body` + outer fields pattern changes the struct layout relative to [ADR 005](005-protocol.md#adr-005-wire-protocol)'s current definitions. Pre-implementation, so a design change not a migration — but it MUST be reflected in the `protocol` crate's type definitions from day one

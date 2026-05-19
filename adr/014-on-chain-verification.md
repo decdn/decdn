@@ -9,7 +9,7 @@ Three slashable offenses require on-chain evidence verification ([ADR 026 §8](0
 
 1. **Phantom announcement** — node signs `has_blob: true` then cannot deliver
 2. **Rate manipulation** — node advertises one rate in probe, charges higher in stream
-3. **Blacklist violation** — node serves a blacklisted hash after the compliance window ([ADR 011](011-content-takedown.md))
+3. **Blacklist violation** — node serves a blacklisted hash after the compliance window ([ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting))
 
 Content corruption — a node delivering bytes that don't BLAKE3 to the advertised hash — is not an on-chain offense; it is absorbed at the wire by client-side BLAKE3 verification + post-verification voucher signing per [ADR 003 § Corrupted delivery](003-payments.md#corrupted-delivery).
 
@@ -23,11 +23,11 @@ Phantom, rate, and blacklist all require verifying cryptographic signatures from
 
 Each slashing-participating message (`ProbeResponse`, `StreamResponse`) carries a single message-body signature, `slash_sig`, produced with the node's Ethereum key. Connection-level peer identity is authenticated separately by the iroh QUIC handshake against the registered Ed25519 NodeId; the body signature makes message contents portable evidence verifiable both off-chain and on-chain.
 
-The Ethereum key is the same secp256k1 key the node already holds for staking and channels: `StakingRegistry.registerNode` ([ADR 001](001-network.md)) atomically binds the operator's Ethereum address to the Ed25519 NodeId, so `ecrecover` on a `slash_sig` followed by a `StakingRegistry.nodeIdOf(recovered)` lookup attributes the message to a NodeId. EVM-native verification costs ~3,000 gas, making routine slashing economically viable; an Ed25519 wire signature would have cost ~500k–1M gas via Solidity library and was rejected for this reason.
+The Ethereum key is the same secp256k1 key the node already holds for staking and channels: `StakingRegistry.registerNode` ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)) atomically binds the operator's Ethereum address to the Ed25519 NodeId, so `ecrecover` on a `slash_sig` followed by a `StakingRegistry.nodeIdOf(recovered)` lookup attributes the message to a NodeId. EVM-native verification costs ~3,000 gas, making routine slashing economically viable; an Ed25519 wire signature would have cost ~500k–1M gas via Solidity library and was rejected for this reason.
 
 ##### Wire protocol
 
-`slash_sig` is mandatory and non-empty on every `ProbeResponse` and `StreamResponse`. Requesters MUST reject responses with missing or zero-length `slash_sig`. There is no opt-out: every interaction in the paid delivery path is on-chain slashable. The fields covered by `slash_sig` are the same fields that drive the slashing mechanisms in [ADR 005](005-protocol.md):
+`slash_sig` is mandatory and non-empty on every `ProbeResponse` and `StreamResponse`. Requesters MUST reject responses with missing or zero-length `slash_sig`. There is no opt-out: every interaction in the paid delivery path is on-chain slashable. The fields covered by `slash_sig` are the same fields that drive the slashing mechanisms in [ADR 005](005-protocol.md#adr-005-wire-protocol):
 
 ```
 ProbeResponse {has_blob, rate_per_mb, timestamp_us, total_bytes?, slash_sig}
@@ -65,7 +65,7 @@ EIP712Domain({
 #### On-Chain Verification Flow
 
 1. Challenger submits the serialized message fields and `slash_sig` to `SlashJudge`.
-2. The contract reconstructs the EIP-712 typed data hash and calls `SignatureChecker.isValidSignatureNow(challengedNode, hash, slash_sig)` — **~3,000 gas** for EOA nodes, **~15,000 gas** for Safe-based nodes ([ADR 024](024-account-abstraction.md)).
+2. The contract reconstructs the EIP-712 typed data hash and calls `SignatureChecker.isValidSignatureNow(challengedNode, hash, slash_sig)` — **~3,000 gas** for EOA nodes, **~15,000 gas** for Safe-based nodes ([ADR 024](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support)).
 3. The challenger-provided address is looked up in `StakingRegistry` to confirm it maps to a registered node.
 4. For offenses requiring two messages (phantom, rate manipulation), the signatures must both validate against the **same** node address.
 
@@ -83,7 +83,7 @@ A unified contract that adjudicates the three signature-dependent offenses (phan
 
 ##### Encoding convention
 
-The `bytes calldata` arguments named `*ResponseData` in the interface below are **ABI-encoded structs** matching the EIP-712 typed data fields (not postcard wire bytes). The contract ABI-decodes these fields, reconstructs the EIP-712 struct hash, and verifies using `SignatureChecker.isValidSignatureNow` ([ADR 024](024-account-abstraction.md)). This ensures a single canonical encoding for both the contract and off-chain signature construction.
+The `bytes calldata` arguments named `*ResponseData` in the interface below are **ABI-encoded structs** matching the EIP-712 typed data fields (not postcard wire bytes). The contract ABI-decodes these fields, reconstructs the EIP-712 struct hash, and verifies using `SignatureChecker.isValidSignatureNow` ([ADR 024](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support)). This ensures a single canonical encoding for both the contract and off-chain signature construction.
 
 ```solidity
 interface ISlashJudge {
@@ -164,7 +164,7 @@ All challenge types MUST validate evidence age using a skew-safe comparison. Let
 
 ##### Interaction with unbonding period
 
-`MAX_EVIDENCE_AGE_US` MUST be strictly less than `StakingRegistry.unbondingPeriod` (converted to microseconds). Otherwise a node could commit an offense, immediately initiate unstaking, and complete withdrawal before the evidence is submitted — avoiding the slash entirely. PoC defaults (evidence age 5 days, unbonding 7 days) satisfy the invariant with a 2-day margin. The safety bounds ([1 day, 30 days] for evidence age vs [3 days, 30 days] for unbonding per [ADR 009](009-governance.md)) admit configurations that violate this invariant in isolation, so both setters enforce it as a paired cross-parameter check at the contract layer:
+`MAX_EVIDENCE_AGE_US` MUST be strictly less than `StakingRegistry.unbondingPeriod` (converted to microseconds). Otherwise a node could commit an offense, immediately initiate unstaking, and complete withdrawal before the evidence is submitted — avoiding the slash entirely. PoC defaults (evidence age 5 days, unbonding 7 days) satisfy the invariant with a 2-day margin. The safety bounds ([1 day, 30 days] for evidence age vs [3 days, 30 days] for unbonding per [ADR 009](009-governance.md#adr-009-governance-model)) admit configurations that violate this invariant in isolation, so both setters enforce it as a paired cross-parameter check at the contract layer:
 
 - `SlashJudge.setMaxEvidenceAge(uint256 newValueUs)` MUST revert if `newValueUs >= StakingRegistry.unbondingPeriod * 1_000_000` (or the integer-overflow-safe equivalent), in addition to the [1 day, 30 days] individual bound.
 - `StakingRegistry.setUnbondingPeriod(uint256 newValueSeconds)` MUST revert if `newValueSeconds * 1_000_000 <= SlashJudge.maxEvidenceAgeUs`, in addition to the [3 days, 30 days] individual bound.
@@ -196,7 +196,7 @@ The check applies at initialization too — neither contract may be deployed wit
 
 #### `Slashed` event and `slashId` allocation
 
-Every slash that reduces operator stake emits `Slashed(slashId, operator, offenseType, amount, evidenceHash)` (see the `ISlashJudge` interface block above). The event is the canonical slash record and the appeal-pinning identifier consumed by [ADR 028 §6](028-slashing-appeals.md#6-contract-surface) `openSlashAppeal(slashId, evidenceBundleHash)` — without it, no [ADR 028](028-slashing-appeals.md) appeal can be filed.
+Every slash that reduces operator stake emits `Slashed(slashId, operator, offenseType, amount, evidenceHash)` (see the `ISlashJudge` interface block above). The event is the canonical slash record and the appeal-pinning identifier consumed by [ADR 028 §6](028-slashing-appeals.md#6-contract-surface) `openSlashAppeal(slashId, evidenceBundleHash)` — without it, no [ADR 028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation) appeal can be filed.
 
 - **`slashId`** is a globally monotonic `uint256` (single counter across all offense types, not per-operator and not per-offense-type), allocated from a `nextSlashId` storage slot incremented inline in the same transaction as the `StakingRegistry.slash(...)` call. `slashId` values are stable, non-reusable, and non-zero — `slashId == 0` is reserved as the "no slash" sentinel.
 - **`offenseType`** is the `OffenseType` enum from the interface above.
@@ -232,16 +232,16 @@ The `MAX_EVIDENCE_AGE_US < unbondingPeriod` invariant is paired across two contr
 
 ### 3. Integration with Existing Contracts
 
-**StakingRegistry ([ADR 001](001-network.md), [ADR 003](003-payments.md), [ADR 026 §7](026-tokenomics.md#7-operator-economics-and-minimum-stake)):**
+**StakingRegistry ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh), [ADR 003](003-payments.md#adr-003-payment-model), [ADR 026 §7](026-tokenomics.md#7-operator-economics-and-minimum-stake)):**
 
 - Adds `slash(address node, uint8 offenseType) external` callable only by the `SlashJudge` contract address. Implements the escalating schedule from [ADR 026 §8](026-tokenomics.md#8-slashing-and-burn) (10% flat for PoC; 5/15/50% with lifetime counter for production). Checks auto-ejection threshold (50% of `minStake`).
 - No new fields in `NodeInfo` for PoC — the existing `msg.sender` Ethereum address serves as the slash key.
 
-**PaymentChannel ([ADR 003](003-payments.md)):**
+**PaymentChannel ([ADR 003](003-payments.md#adr-003-payment-model)):**
 
 - No changes. Slashing and payment channels are independent by design.
 
-**ContentBlacklist ([ADR 011](011-content-takedown.md)):**
+**ContentBlacklist ([ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)):**
 
 - `SlashJudge` calls `ContentBlacklist.isBlacklisted(hash)` and `ContentBlacklist.getEntry(hash)` to verify blacklist status and compliance window timing. No changes to the `ContentBlacklist` interface.
 

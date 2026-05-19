@@ -9,6 +9,10 @@
 #   make clean        # remove the generated PDFs
 #   make check-book-list   # fail if a numbered/appendix .md is missing from
 #                          # the hand-maintained reading-order list below
+#   make check-bare-refs        # fail on any bare (un-linked) ADR reference
+#   make check-md-anchors       # fail on ADR cross-links missing a #anchor
+#   make check-section-spacing  # fail on bad § spacing (§3 / § Word)
+#   make check-refs             # all three reference-hygiene guards above
 #
 # This Makefile is the single source of truth for the build invocation;
 # README.md documents *what* the builds are and points here for *how*.
@@ -83,7 +87,7 @@ BOOK_SRCS := \
 DENSITY_CFG := _build/book-density.typ _build/book-margins.yaml _build/table-autofit.lua
 
 .DEFAULT_GOAL := all
-.PHONY: all numeric book clean help check-book-list
+.PHONY: all numeric book clean help check-book-list check-bare-refs check-md-anchors check-section-spacing check-refs
 
 all: adrs.pdf adrs-book.pdf
 
@@ -119,6 +123,55 @@ check-book-list:
 	  exit 1; \
 	else echo "book list in sync ($(words $(NUMERIC_SRCS)) ADRs + $(words $(APPENDIX_SRCS)) appendices)"; fi
 
+# Reference-hygiene guards. Basic tools only (awk/sed/grep), no perl/python.
+# Fenced ```code```, the H1 title line, inline `code`, and existing markdown
+# links are excluded — they can't be links or already are one. H2-H6 headings
+# ARE checked: an ADR named in a section title must be linked too.
+#   check-bare-refs      : every `ADR NNN` mention (with or without § Section)
+#                          must be a markdown link, not bare prose/table text.
+#   check-md-anchors     : every cross-ADR *.md link must carry a #heading
+#                          anchor, so a retitled/renamed ADR breaks the link
+#                          (drift caught) vs silently pointing at the wrong file.
+#   check-section-spacing: §3 for numbered sections, § Word for named ones
+#                          (locks in the #599 § normalization).
+SRCS_REF := architecture.md $(NUMERIC_SRCS) $(APPENDIX_SRCS) glossary.md
+
+check-bare-refs:
+	@bad=""; for f in $(SRCS_REF); do \
+	  hits=$$(awk -v F="$$f" '/^```/{c=!c;next} c{next} /^# /{next} {print F":"FNR": "$$0}' "$$f" \
+	    | sed -e 's/`[^`]*`//g' -e 's/\[[^]]*\]([^)]*)//g' \
+	    | grep -E '(^|[^[*])ADR ?[0-9]{1,3}' || true); \
+	  if [ -n "$$hits" ]; then printf '%s\n' "$$hits"; bad=1; fi; \
+	done; \
+	if [ -n "$$bad" ]; then \
+	  echo "ERROR: bare ADR reference(s) above — every ADR mention must be a markdown link, e.g. [ADR 016 § Deployment](016-contract-interactions.md#smart-contract-interaction-model)"; \
+	  exit 1; \
+	else echo "no bare ADR references ($(words $(SRCS_REF)) files; code + H1 titles excluded, H2-H6 checked)"; fi
+
+check-md-anchors:
+	@bad=""; for f in $(SRCS_REF); do \
+	  hits=$$(awk -v F="$$f" '/^```/{c=!c;next} !c{print F":"FNR": "$$0}' "$$f" \
+	    | grep -E '\]\((\./)?([0-9]{3}-[a-z0-9-]+|appendix-[a-z0-9-]+|architecture|glossary)\.md\)' || true); \
+	  if [ -n "$$hits" ]; then printf '%s\n' "$$hits"; bad=1; fi; \
+	done; \
+	if [ -n "$$bad" ]; then \
+	  echo "ERROR: ADR cross-link(s) above point to a bare *.md with no #anchor — add a heading anchor, e.g. 016-contract-interactions.md#smart-contract-interaction-model"; \
+	  exit 1; \
+	else echo "all ADR cross-links carry a #anchor"; fi
+
+check-section-spacing:
+	@bad=""; for f in $(SRCS_REF); do \
+	  hits=$$(awk -v F="$$f" '/^```/{c=!c;next} c{next} {print F":"FNR": "$$0}' "$$f" \
+	    | grep -E '§ +[0-9]|§[A-Za-z]' || true); \
+	  if [ -n "$$hits" ]; then printf '%s\n' "$$hits"; bad=1; fi; \
+	done; \
+	if [ -n "$$bad" ]; then \
+	  echo "ERROR: bad § spacing above — numbered sections use §3 (no space), named sections use § Word (one space)"; \
+	  exit 1; \
+	else echo "§ spacing normalized (§N for numbers, § Word for names)"; fi
+
+check-refs: check-bare-refs check-md-anchors check-section-spacing
+
 help:
 	@echo "make            build both PDFs (mermaid-rendered)"
 	@echo "make book       reading-order adrs-book.pdf"
@@ -126,3 +179,7 @@ help:
 	@echo "make MERMAID=0  build without mermaid-filter (no mmdc needed)"
 	@echo "make clean      remove generated PDFs"
 	@echo "make check-book-list   verify the reading-order list is complete"
+	@echo "make check-bare-refs        fail on any bare (un-linked) ADR reference"
+	@echo "make check-md-anchors       fail on ADR links missing a #anchor"
+	@echo "make check-section-spacing  fail on bad § spacing (§3 / § Word)"
+	@echo "make check-refs             run all reference-hygiene guards"

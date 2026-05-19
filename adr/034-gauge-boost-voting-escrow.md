@@ -5,7 +5,7 @@
 
 ## Context
 
-The gauge-boost mechanism and the `VotingEscrow` contract are the operator-incentive core of the 40% gauge bucket in the `FeeRouter` six-bucket split ([ADR 026 §2](026-tokenomics.md#2-feerouter-split-40407553)). This ADR specifies the gauge-boost formula (including degenerate-input fallbacks and the per-operator gauge-share cap that is the canonical wash-trading defense) and the vote-escrow contract (historical checkpointing, lock ownership, the `VotingEscrow` interface). The economic-model umbrella that sizes and ties the buckets together is [ADR 026](026-tokenomics.md).
+The gauge-boost mechanism and the `VotingEscrow` contract are the operator-incentive core of the 40% gauge bucket in the `FeeRouter` six-bucket split ([ADR 026 §2](026-tokenomics.md#2-feerouter-split-40407553)). This ADR specifies the gauge-boost formula (including degenerate-input fallbacks and the per-operator gauge-share cap that is the canonical wash-trading defense) and the vote-escrow contract (historical checkpointing, lock ownership, the `VotingEscrow` interface). The economic-model umbrella that sizes and ties the buckets together is [ADR 026](026-tokenomics.md#adr-026-tokenomics).
 
 ## Decision
 
@@ -36,7 +36,7 @@ The boost-floor parameter (default `boostFloor = 0.4`) is governable within `[0.
 
 #### Per-operator gauge-share cap
 
-The per-epoch gauge share for any single operator is capped at `MAX_GAUGE_SHARE_PER_OPERATOR` (default **5%**, governable within `[1%, 25%]` per [ADR 009](009-governance.md) safety bounds). Concretely:
+The per-epoch gauge share for any single operator is capped at `MAX_GAUGE_SHARE_PER_OPERATOR` (default **5%**, governable within `[1%, 25%]` per [ADR 009](009-governance.md#adr-009-governance-model) safety bounds). Concretely:
 
 ```
 share_i = min(working_bytes_i / sum(working_bytes), MAX_GAUGE_SHARE_PER_OPERATOR)
