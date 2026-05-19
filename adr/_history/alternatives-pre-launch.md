@@ -8,6 +8,21 @@ Sections below are anchored by source ADR. Cross-references back to each source 
 
 ---
 
+## ADR 010 — Multi-Token Payment Support (dropped)
+
+Source: ADR 010 was removed entirely. The payment-token decision now lives in [ADR 003 — Payment Model](../003-payments.md): the payment token is **USDC, with its address fixed at contract deployment** (immutable constructor argument). There is no governance token allowlist, no `addToken`/`removeToken`, no per-token rate bounds, no token-keyed channel IDs, and no on-protocol price oracle or swap. Decision recorded in [#591](https://github.com/decdn/decdn/issues/591); supersedes the multi-stablecoin variant [#583](https://github.com/decdn/decdn/issues/583) / PR [#585](https://github.com/decdn/decdn/pull/585).
+
+ADR 010 had proposed a token-agnostic `PaymentChannel` with a governance-managed ERC-20 allowlist (motivated by network heterogeneity and Circle-freeze censorship resistance). A later revision narrowed it to a multi-*stablecoin* allowlist to avoid a price oracle. Both were rejected pre-launch.
+
+| Approach | Why Not |
+| --- | --- |
+| Arbitrary-ERC-20 allowlist (`PaymentChannel`, original ADR 010) | Largest attack surface: fee-on-transfer / rebase / pausable / hook-bearing tokens each break channel accounting; cross-token value comparison for reputation weighting needs a price oracle; per-token rate bounds, `forceCloseChannel`-on-removal, and a Token Vetting Checklist add standing governance burden and audit scope. |
+| Multi-stablecoin allowlist (revised ADR 010 / [#583](https://github.com/decdn/decdn/issues/583)) | Removes the oracle but keeps the allowlist machinery (`addToken`/`removeToken`, per-token rate bounds, vetting checklist, token-removal force-close, per-token decimals) and the multi-token contract/reentrancy surface — still materially more complex than launch requires. |
+| Per-node arbitrary token (no governance gate) | Lets adversarial ERC-20s touch channel funds with no vetting; rejected even within ADR 010's own framing. |
+| **Single immutable USDC address, set at deployment (chosen)** | One token, no allowlist, no oracle, no swap, no per-token machinery. Smallest contract and audit surface. Holders of other assets swap into USDC off-protocol before opening a channel. Circle-freeze counterparty risk is accepted (stated in ADR 003 Consequences). |
+
+---
+
 ## ADR 014 — Slash Signature Scheme
 
 Source: [ADR 014 § 1 — Slash Signatures (secp256k1 EIP-712)](../014-on-chain-verification.md#1-slash-signatures--secp256k1-eip-712).

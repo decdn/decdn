@@ -38,7 +38,7 @@ A client is a lightweight QUIC endpoint that streams content and pays per MB. It
 - Does **not** publish `NodeAnnounce` (not a staked node)
 - Does **not** publish `ReputationReport` via gossip ([ADR 008](008-reputation.md) — clients contribute local observations only)
 - Maintains a local peer table (`NodeId → NodeAnnounce`) and reputation scores
-- Signs vouchers authorizing off-chain USDC (or governance-approved token) payments
+- Signs vouchers authorizing off-chain USDC payments
 
 ### Bootstrap Procedure
 
@@ -214,7 +214,6 @@ probe_cache_max_entries = 1024               # per ADR 001
 probe_cache_ttl_secs = 15                    # per ADR 001
 
 [payment]
-default_token = "USDC"                       # per ADR 010
 voucher_interval_mb = 1                      # per ADR 003
 ```
 

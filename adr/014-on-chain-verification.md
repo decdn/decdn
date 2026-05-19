@@ -51,7 +51,7 @@ bytes32 constant STREAM_RESPONSE_TYPEHASH = keccak256(
 );
 ```
 
-The `SlashJudge` contract uses its own EIP-712 domain separator, not shared with `StakingRegistry` or `StablePaymentChannel`. This prevents cross-contract signature replay.
+The `SlashJudge` contract uses its own EIP-712 domain separator, not shared with `StakingRegistry` or `PaymentChannel`. This prevents cross-contract signature replay.
 
 ```solidity
 EIP712Domain({
@@ -237,7 +237,7 @@ The `MAX_EVIDENCE_AGE_US < unbondingPeriod` invariant is paired across two contr
 - Adds `slash(address node, uint8 offenseType) external` callable only by the `SlashJudge` contract address. Implements the escalating schedule from [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn) (10% flat for PoC; 5/15/50% with lifetime counter for production). Checks auto-ejection threshold (50% of `minStake`).
 - No new fields in `NodeInfo` for PoC — the existing `msg.sender` Ethereum address serves as the slash key.
 
-**StablePaymentChannel ([ADR 003](003-payments.md)):**
+**PaymentChannel ([ADR 003](003-payments.md)):**
 
 - No changes. Slashing and payment channels are independent by design.
 

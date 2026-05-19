@@ -59,7 +59,7 @@ A Tier 3 release ships a node binary supporting both versions, giving you four w
 | Check | Why |
 |-------|-----|
 | **Config-field deltas.** Diff your operator config against the release's example config for new mandatory, renamed, or removed fields. | Tier 3 is the only tier where required config can change. |
-| **Payment-channel validity.** Tier 3 may change the channel-ID formula or voucher format, invalidating **open channels** for the affected token/protocol (release notes state this). Worked example: [ADR 010 §Migration from ADR 003](010-multi-token.md#migration-from-adr-003) — PoC `StablePaymentChannel` decommissioned and replaced atomically; existing channels force-closed via `forceCloseChannel`. | Close open old-protocol channels before the cutover window or risk losing payments. |
+| **Payment-channel validity.** Tier 3 may change the channel-ID formula or voucher format, invalidating **open channels** (release notes state this). Affected channels settle via the normal close/dispute/settle path, or `reclaimExpired` after expiry. | Close open old-protocol channels before the cutover window or risk losing payments. |
 | **Voucher-signer compatibility.** If the EIP-712 voucher domain or typed-data hash changes (Tier 3 §Signed Field Freezing — changing the signed field set is major), upgrade the off-chain voucher signer in lockstep with the node binary. | An old signer's pre-bump signatures fail `SignatureChecker.isValidSignatureNow` against the new contract ([ADR 024 §1](024-account-abstraction.md)). |
 | **Local dispute monitor compatibility.** The in-process dispute monitor ([ADR 003](003-payments.md) Option C) reads local-store voucher state and submits `disputeChannel` calls. After a Tier 3 voucher-format change it must be on the new binary before any new-format channels open, else it cannot decode them. It ships with the node binary, so the only operator action is sequencing node and contract upgrades correctly. | Primary stale-close defense ([Appendix: Fraud Detection](appendix-fraud-detection.md)); a stale binary leaves new-format closes unmonitored. |
 
@@ -111,7 +111,7 @@ For Tier 3, clients control the ALPN proposal order. You don't negotiate with th
 
 ### 4.2 Governance
 
-For Tier 3 upgrades touching governance-controlled parameters (rate bounds in [ADR 003 §Rate Bounds Refresh](003-payments.md), token allowlist in [ADR 010](010-multi-token.md), slashing schedule in [ADR 026 §8](026-gauge-boost-tokenomics.md)):
+For Tier 3 upgrades touching governance-controlled parameters (rate bounds in [ADR 003 §Rate Bounds Refresh](003-payments.md), slashing schedule in [ADR 026 §8](026-gauge-boost-tokenomics.md)):
 
 - The authorizing governance proposal is on its own timeline ([ADR 009](009-governance.md): 7-day vote + 48-hour timelock). The protocol release usually ships **before** the vote concludes, with the new behavior gated on an on-chain flag.
 - Operators MUST verify the relevant on-chain governance state before activating the new behavior locally — consult the release notes for the specific contract call (e.g. `Governance.upgradeActivated(uint256 versionId)` returns true).
@@ -122,9 +122,9 @@ For Tier 3 upgrades touching governance-controlled parameters (rate bounds in [A
 |-------------------------------|--------------|----------|
 | Restarted node reports `not_ready` for `rate_bounds_loaded` | Tier 3 changed the rate-bounds RPC response format; node parsed an old-format response | Roll back to the last-green binary (previous stable or dual-version). The governance flag may take up to 48h to flip per [ADR 009](009-governance.md) timelock; don't block availability waiting for it. After it flips, redo the §3.2 cutover for that node. |
 | `decdn_streams_failed_total{reason="protocol_error"}` spikes after restart | Old peers receiving the new ALPN version's framing | Expected during the dual-version window. Investigate only if sustained from peers known to have already upgraded. |
-| `closeChannel` reverts with new contract | Voucher format changed; old vouchers invalid against the new `PaymentChannel` | Use `forceCloseChannel` per [ADR 010](010-multi-token.md). The dispute window applies. |
+| `closeChannel` reverts with new contract | Voucher format changed; old vouchers invalid against the new contract | Affected channels settle via the normal close/dispute/settle path; `reclaimExpired` returns the deposit after expiry. The dispute window applies. |
 | `decdn_quic_0rtt_rejected_total` spikes after restart | Old client-cached session tickets are not 0-RTT-replayable on the new ALPN | Self-corrects within one session-ticket lifetime. No action needed. |
-| Mass `closeChannel` calls clog the L2 sequencer | Large fleets force-closing all old-format channels at once | Batch closes across operators; use `forceCloseChannel` only for tokens removed from the allowlist; let unforced channels settle naturally over their `maxChannelDuration` (default 90 days per [ADR 010](010-multi-token.md)). |
+| Mass `closeChannel` calls clog the L2 sequencer | Large fleets closing all old-format channels at once | Batch closes across operators; let channels settle naturally over their `maxChannelDuration` (default 90 days per [ADR 003](003-payments.md)). |
 
 ## 6. What this runbook does not cover
 
@@ -135,7 +135,6 @@ For Tier 3 upgrades touching governance-controlled parameters (rate bounds in [A
 ## Cross-ADR Impact
 
 - [ADR 013 — Schema Evolution: tier semantics, ALPN negotiation, deprecation timeline](013-schema-evolution.md)
-- [ADR 010 — Migration from ADR 003: contract-level worked example](010-multi-token.md#migration-from-adr-003)
 - [ADR 005 — Probe-Triggered Eviction Hold (drain prerequisite)](005-protocol.md#probe-triggered-eviction-hold)
 - [Appendix: Fraud Detection — local dispute monitor and permissionless challengers](appendix-fraud-detection.md)
 - [ADR 024 — Smart-account verification across versions](024-account-abstraction.md)
