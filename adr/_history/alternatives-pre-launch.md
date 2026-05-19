@@ -96,7 +96,7 @@ Deferred. `libp2p-kad` is battle-tested but built on libp2p's transport stack. B
 
 ## ADR 026 — Gauge-Boost Tokenomics
 
-Source: [ADR 026 — Gauge-Boost Tokenomics](../026-gauge-boost-tokenomics.md).
+Source: [ADR 026 — Gauge-Boost Tokenomics](../026-tokenomics.md).
 
 - **Original tokenomics shape** — 3% flat protocol fee, regressive stake-multiple fee discount, 200M-TOKEN bootstrap fund, 50/50 challenger/burn slashing. **Rejected:** burn was structurally noise (~0.014%/yr supply vs. ~24%/yr vesting per §1); no yield path for passive holders or long-term lockers; the stake-multiple discount weakened the deflationary sink as operators qualified; TOKEN-denominated bootstrap was reflexive against price drops.
 - **Auto-ve-lock-on-vest** — vesting contracts auto-lock released TOKEN into `VotingEscrow` for a fixed term before delivery. **Rejected:** the §3 gauge boost is a stronger voluntary incentive than a forced lock; auto-lock complicates seed/team term sheets and adds audit surface; the thinner-initial-veTOKEN cost is absorbed by §9's optional ve-lock-on-claim airdrop.
@@ -209,7 +209,7 @@ Source: [ADR 028 — Slashing Appeals and Dispute Escalation](../028-slashing-ap
 
 - **ve-Governor-only path (no multisig fast-track).** Rejected: ~9-day minimum governance latency (7d voting + 48h timelock per [ADR 009](../009-governance.md#production-ve-weighted-governance)) is too slow for an operator who needs working-capital relief during an active business. The multisig fast-track + ratification structure is borrowed exactly from [ADR 011 § Regional Governance Bodies](../011-content-takedown.md#regional-governance-bodies) for the same reason.
 - **Dedicated arbitration committee.** Rejected: introduces a new on-chain governance body, a new election mechanism, and a new attack surface, none of which is justified by the appeal volume the protocol expects (single-digit appeals per quarter at PoC scale, low-tens at production scale).
-- **On-chain slash reversal.** Rejected: clawback on already-distributed challenger rewards (50% of slashed amount per [ADR 026 §8](../026-gauge-boost-tokenomics.md#8-slashing-and-burn)) is intractable — the challenger may have already moved the funds. `SafetyReserve` restitution is equivalent in capital terms and avoids the clawback complexity entirely. Reputation/offense-count preservation is a feature, not a bug (§7).
+- **On-chain slash reversal.** Rejected: clawback on already-distributed challenger rewards (50% of slashed amount per [ADR 026 §8](../026-tokenomics.md#8-slashing-and-burn)) is intractable — the challenger may have already moved the funds. `SafetyReserve` restitution is equivalent in capital terms and avoids the clawback complexity entirely. Reputation/offense-count preservation is a feature, not a bug (§7).
 - **Hybrid stake reversal + reputation reset.** Rejected for the same clawback reason, plus the reputation-preservation rationale in §7.
 - **Narrowing scope to a subset of offenses.** Rejected: phantom, rate, and blacklist all execute immediately with no in-protocol due process; restricting appeals to a subset would leave a corresponding portion of operator-trust gap unaddressed.
 

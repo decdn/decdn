@@ -6,7 +6,7 @@
 
 The protocol has one on-chain surface where a party can publish a falsified value and benefit if no third party objects within a bounded window — **`closeChannel` / `disputeChannel`** ([ADR 003](003-payments.md)): a client may close a channel with a stale (low-nonce) voucher; the 48-hour dispute window settles at the stale value unless a higher-nonce voucher (signed by the same channel funder) is submitted in time. Submitting is permissionless from the protocol's side — see Contract integration below.
 
-The wash-trading defense is separately the [ADR 026 §3 per-operator gauge-share cap](026-gauge-boost-tokenomics.md#per-operator-gauge-share-cap), contract-enforced without external attestation — no operator-asserted gauge summary, no fraud-challenge mechanism, no monitoring role for gauge-share; the cap binds in the formula directly. Off-chain reputation observation ([ADR 008 §12](008-reputation.md#12-gauge-pool-wash-trading-reputation-as-off-chain-signal)) and operator-cluster detection are the soft layer informing governance cap-tuning if persistent wash-trading patterns surface.
+The wash-trading defense is separately the [ADR 034 § per-operator gauge-share cap](034-gauge-boost-voting-escrow.md#per-operator-gauge-share-cap), contract-enforced without external attestation — no operator-asserted gauge summary, no fraud-challenge mechanism, no monitoring role for gauge-share; the cap binds in the formula directly. Off-chain reputation observation ([ADR 008 §12](008-reputation.md#12-gauge-pool-wash-trading-reputation-as-off-chain-signal)) and operator-cluster detection are the soft layer informing governance cap-tuning if persistent wash-trading patterns surface.
 
 ## Role
 
@@ -53,5 +53,5 @@ A protocol decision establishes a participant role with a defined wire interface
 
 - [ADR 003 — Payments](003-payments.md) — `closeChannel` / `disputeChannel` flow, dispute window, local-monitor Option C, forced-inclusion deadline extension
 - [ADR 014 — On-chain Verification](014-on-chain-verification.md) — `SlashJudge` challenge-bond mechanism (Bond Handling) for the three signature-dependent offenses
-- [ADR 026 §3 Per-operator gauge-share cap](026-gauge-boost-tokenomics.md#per-operator-gauge-share-cap) — wash-trading defense; contract-enforced, no external attestation surface
+- [ADR 034 § Per-operator gauge-share cap](034-gauge-boost-voting-escrow.md#per-operator-gauge-share-cap) — wash-trading defense; contract-enforced, no external attestation surface
 - [Appendix: L2 Deployment](appendix-l2-deployment.md) — gas-cost context for detector economics
