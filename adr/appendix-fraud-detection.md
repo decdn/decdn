@@ -6,7 +6,7 @@
 
 The protocol has one on-chain surface where a party can publish a falsified value and benefit if no third party objects within a bounded window — **`closeChannel` / `disputeChannel`** ([ADR 003](003-payments.md)): a client may close a channel with a stale (low-nonce) voucher; the 48-hour dispute window settles at the stale value unless a higher-nonce voucher (signed by the same channel funder) is submitted in time. Submitting is permissionless from the protocol's side — see Contract integration below.
 
-The wash-trading defense is separately the [ADR 026 §3 per-operator gauge-share cap](026-gauge-boost-tokenomics.md#per-operator-gauge-share-cap), contract-enforced without external attestation — no operator-asserted gauge summary, no fraud-challenge mechanism, no monitoring role for gauge-share; the cap binds in the formula directly. Off-chain reputation observation (ADR 008 §12) and operator-cluster detection are the soft layer informing governance cap-tuning if persistent wash-trading patterns surface.
+The wash-trading defense is separately the [ADR 026 §3 per-operator gauge-share cap](026-gauge-boost-tokenomics.md#per-operator-gauge-share-cap), contract-enforced without external attestation — no operator-asserted gauge summary, no fraud-challenge mechanism, no monitoring role for gauge-share; the cap binds in the formula directly. Off-chain reputation observation ([ADR 008 §12](008-reputation.md#12-gauge-pool-wash-trading-reputation-as-off-chain-signal)) and operator-cluster detection are the soft layer informing governance cap-tuning if persistent wash-trading patterns surface.
 
 ## Role
 
@@ -28,7 +28,7 @@ This is fundamentally a self-protection mechanism, not a paid service: the offli
 
 Two contract-level requirements, already specified in their owning ADRs:
 
-1. **`disputeChannel` accepts submissions from any address** — the voucher's EIP-712 signature is the sole authorization (`ecrecover(signature) == channel.client`), no `msg.sender` access check ([ADR 003 §closeChannel/disputeChannel](003-payments.md)).
+1. **`disputeChannel` accepts submissions from any address** — the voucher's EIP-712 signature is the sole authorization (`ecrecover(signature) == channel.client`), no `msg.sender` access check ([ADR 003 § closeChannel/disputeChannel](003-payments.md)).
 2. **`ChannelCloseInitiated`, `ChannelDisputed`, `ChannelSettled` events are emitted** ([ADR 003](003-payments.md)).
 
 No `WatchtowerEscrow` contract, heartbeat protocol, per-channel registration, or `cdn/watchtower/v1` ALPN.

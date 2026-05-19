@@ -87,7 +87,7 @@ Safe smart wallets are the **recommended** wallet type for both node operators a
 **Recommended PoC configuration: 1-of-1 Safe or plain EOA.** High-value client accounts migrate to 2-of-3 + session keys in Production (§3); the same threshold constraint that applies to node operators applies here.
 
 - **Channel operations:** The Safe (or EOA) deposits USDC into `PaymentChannel.openChannel()`. That address is the `channel.client`. Client software supports both wallet types — `SignatureChecker` makes the choice transparent to every contract.
-- **Voucher signing:** EIP-712 vouchers are signed with the `channel.client` key. `SignatureChecker` on the channel contract validates against `channel.client` (EOA → ECDSA; 1-of-1 Safe → `checkSignatures` via stock handler). The session-key path (signing at delivery speed via `erc7579/smartsessions` without exposing the Safe owner key) lands when § 3 ships.
+- **Voucher signing:** EIP-712 vouchers are signed with the `channel.client` key. `SignatureChecker` on the channel contract validates against `channel.client` (EOA → ECDSA; 1-of-1 Safe → `checkSignatures` via stock handler). The session-key path (signing at delivery speed via `erc7579/smartsessions` without exposing the Safe owner key) lands when §3 ships.
 
 ### 3. Session Keys — Deferred to Production via ERC-7579 smartsessions
 

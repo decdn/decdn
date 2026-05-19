@@ -37,7 +37,7 @@ Before any on-chain or protocol activity:
    - **Production:** platform keychain or HSM. See [ADR 012](012-client.md) for key management guidance (the same tiers apply to node keys).
 
 4. **Prepare Ethereum key.** The operator needs an Ethereum address (`ethAddress`) with sufficient funds:
-   - **TOKEN:** at minimum **50,000 TOKEN** for the minimum stake deposit ([ADR 026 § 7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake)). There is no discount-stake threshold; operators wanting amplified return on capital ve-lock TOKEN in `VotingEscrow` for gauge boost ([ADR 026 § 3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula)) rather than staking above a threshold for fee discount. Operators lacking the 50K minimum may qualify for externally-funded operator-onboarding programs (see [ADR 026 §10](026-gauge-boost-tokenomics.md#10-bootstrap-mechanism-pre-seed-usdc)).
+   - **TOKEN:** at minimum **50,000 TOKEN** for the minimum stake deposit ([ADR 026 §7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake)). There is no discount-stake threshold; operators wanting amplified return on capital ve-lock TOKEN in `VotingEscrow` for gauge boost ([ADR 026 §3](026-gauge-boost-tokenomics.md#3-gauge-boost-formula)) rather than staking above a threshold for fee discount. Operators lacking the 50K minimum may qualify for externally-funded operator-onboarding programs (see [ADR 026 §10](026-gauge-boost-tokenomics.md#10-bootstrap-mechanism-pre-seed-usdc)).
    - **Native gas token:** ~$0.50–$1.00 for the Phase 2 transactions at typical L2 gas prices.
    - **Optional USDC:** only required if the operator intends to open outbound payment channels immediately (e.g., to pay origin-backed nodes for cache-miss pulls). Clients open inbound channels to the node without any USDC on the node side.
 
@@ -66,7 +66,7 @@ All transactions must be confirmed on-chain before proceeding to Phase 3.
 
 #### Step 2.1 — Approve TOKEN transfer
 
-Call `TOKEN.approve(stakingRegistry, amount)` where `amount ≥ minStake` (**50,000 TOKEN** under [ADR 026 § 7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake)). This ERC-20 approval authorizes `StakingRegistry` to pull the stake deposit.
+Call `TOKEN.approve(stakingRegistry, amount)` where `amount ≥ minStake` (**50,000 TOKEN** under [ADR 026 §7](026-gauge-boost-tokenomics.md#7-operator-economics-and-minimum-stake)). This ERC-20 approval authorizes `StakingRegistry` to pull the stake deposit.
 
 **Gas:** ~$0.03 (one-time; re-stakes reuse the allowance if set above `minStake`).
 
@@ -76,7 +76,7 @@ Call `StakingRegistry.stake(amount)` with `amount ≥ 50,000 TOKEN`.
 
 The stake locks immediately and is slashable from this point forward, including during the unbonding period if the node later deregisters (7-day unbonding by default; governable per [ADR 026](026-gauge-boost-tokenomics.md)).
 
-**ve-position is separate.** Operator stake in `StakingRegistry` and any ve-locked TOKEN in `VotingEscrow` are independent positions per [ADR 026 § 4](026-gauge-boost-tokenomics.md#4-voting-escrow-votingescrow). ve-locked TOKEN is non-slashable and does not satisfy the minimum stake; staked TOKEN does not earn gauge boost. An operator wanting gauge boost must hold both.
+**ve-position is separate.** Operator stake in `StakingRegistry` and any ve-locked TOKEN in `VotingEscrow` are independent positions per [ADR 026 §4](026-gauge-boost-tokenomics.md#4-voting-escrow-votingescrow). ve-locked TOKEN is non-slashable and does not satisfy the minimum stake; staked TOKEN does not earn gauge boost. An operator wanting gauge boost must hold both.
 
 **Gas:** ~$0.05.
 
@@ -227,9 +227,9 @@ iroh handles NAT traversal transparently via QUIC hole-punching and relay fallba
 
 ### Re-Onboarding after Deregistration or Auto-Ejection
 
-A node that voluntarily deregistered or was auto-ejected (stake dropped below 50% of `minStake` due to slashing — see [ADR 026 § 8](026-gauge-boost-tokenomics.md#8-slashing-and-burn)) must re-onboard. The flow is identical to initial onboarding with two differences:
+A node that voluntarily deregistered or was auto-ejected (stake dropped below 50% of `minStake` due to slashing — see [ADR 026 §8](026-gauge-boost-tokenomics.md#8-slashing-and-burn)) must re-onboard. The flow is identical to initial onboarding with two differences:
 
-1. **`firstRegisteredAt` is preserved.** The cold-start bootstrap bonus (ADR 008) is not re-granted — the `firstRegisteredAt` field in `StakingRegistry` is immutable once set, and the bonus is one-time per operator address.
+1. **`firstRegisteredAt` is preserved.** The cold-start bootstrap bonus ([ADR 008](008-reputation.md)) is not re-granted — the `firstRegisteredAt` field in `StakingRegistry` is immutable once set, and the bonus is one-time per operator address.
 
 2. **`registrationNonce` is incremented.** On deregistration, `registrationNonce[nodeId]` is incremented. The operator must sign fresh `ed25519Signature` and `bindingSignature` parameters with the new nonce before calling `registerNode` again.
 

@@ -5,7 +5,7 @@
 
 ## Context
 
-[ADR 011 § Blacklist Entry Appeals](011-content-takedown.md#blacklist-entry-appeals) specifies the semantics of the per-entry blacklist-appeal flow (regional-only scope, standing paths and synthetic-standing clawback, evidence requirements, bond and frequency caps, the multisig fast-track + ve-Governor ratification authority, the per-body concurrent-appeal cap, and the lifecycle across `openBlacklistAppeal` → (`fastTrackAppeal` | `rejectAppeal`) → (`ratifyAppealRemoval` | `reverseAppeal` | lapse)). High-level signatures appear in the [`IContentBlacklist` interface](011-content-takedown.md#contract-contentblacklist). ADR 011 § Contract surface defers the implementation details:
+[ADR 011 § Blacklist Entry Appeals](011-content-takedown.md#blacklist-entry-appeals) specifies the semantics of the per-entry blacklist-appeal flow (regional-only scope, standing paths and synthetic-standing clawback, evidence requirements, bond and frequency caps, the multisig fast-track + ve-Governor ratification authority, the per-body concurrent-appeal cap, and the lifecycle across `openBlacklistAppeal` → (`fastTrackAppeal` | `rejectAppeal`) → (`ratifyAppealRemoval` | `reverseAppeal` | lapse)). High-level signatures appear in the [`IContentBlacklist` interface](011-content-takedown.md#contract-contentblacklist). [ADR 011 § Contract surface](011-content-takedown.md#contract-surface):
 
 > The full ABI (per-appeal storage layout, exact event topics, gas-optimized struct packing) is deferred to a future contract-implementation ADR — same approach as [ADR 028 §6](028-slashing-appeals.md#6-contract-surface).
 
@@ -13,7 +13,7 @@ This ADR is that contract-implementation ADR. It pins the per-appeal storage lay
 
 It is the blacklist-side analogue of [ADR 032](032-safety-reserve-appeals-contract.md), which does the same for [ADR 028 §6](028-slashing-appeals.md#6-contract-surface)'s slash-appeal entry points on `SafetyReserve`.
 
-This ADR does **not** re-litigate ADR 011 semantic decisions — bond size, filing windows, standing paths, evidence rules, regional-only scope, the synthetic-standing clawback, or the interaction with `SlashJudge`. Restatements here are for self-containedness; the canonical decision authority remains ADR 011.
+This ADR does **not** re-litigate [ADR 011](011-content-takedown.md) semantic decisions — bond size, filing windows, standing paths, evidence rules, regional-only scope, the synthetic-standing clawback, or the interaction with `SlashJudge`. Restatements here are for self-containedness; the canonical decision authority remains [ADR 011](011-content-takedown.md).
 
 ## Decision
 
@@ -113,7 +113,7 @@ function openBlacklistAppeal(
 
 | Revert | Trigger |
 | --- | --- |
-| `EmptyRegion()` | `region` canonicalizes to `bytes2(0)` (global entries are out of scope per ADR 011) |
+| `EmptyRegion()` | `region` canonicalizes to `bytes2(0)` (global entries are out of scope per [ADR 011](011-content-takedown.md)) |
 | `EntryNotFound()` | No `BlacklistEntry` exists for `(blake3Hash, region)` |
 | `FilingWindowClosed()` | `block.timestamp ≥ entry.addedAt + BLACKLIST_APPEAL_FILING_WINDOW` |
 | `InvalidStandingPath()` | `standingPath` is not in `{Publisher, Operator, TokenHolder}` |
@@ -122,7 +122,7 @@ function openBlacklistAppeal(
 | `FilerInRejectionCooldown()` | `filerRejections[msg.sender].cooldownUntilUs > nowUs` |
 | `EmptyEvidenceBundleHash()` | `evidenceBundleHash == bytes32(0)` |
 | `BondTransferFailed()` | `TOKEN.transferFrom(msg.sender, address(this), BLACKLIST_APPEAL_BOND)` reverts or returns false |
-| `AppealPathNotYetActive()` | Optional: first regional body not yet registered per ADR 011 bootstrap-window degradation note |
+| `AppealPathNotYetActive()` | Optional: first regional body not yet registered per [ADR 011](011-content-takedown.md) bootstrap-window degradation note |
 
 **State transitions:** `appealCounter` increments; `appeals[appealCounter] = BlacklistAppeal{status: Open, openedAtUs: nowUs, reviewWindowEndsUs: nowUs + BLACKLIST_MULTISIG_REVIEW_WINDOW, ...}`; `totalBondsEscrowed += BLACKLIST_APPEAL_BOND`. The synthetic-standing clawback check for `standingPath == TokenHolder` schedules a second checkpoint at `openedAtUs + STANDING_LOOKBACK_SECONDS * 1_000_000` — the on-chain second-check fires through `cleanupExpiredAppeal` admissibility condition (c) once the lookback elapses; the contract does not auto-schedule.
 
@@ -141,7 +141,7 @@ function fastTrackAppeal(uint256 appealId) external onlyEmergencyMultisig;
 | `ReviewWindowExpired()` | `nowUs ≥ appeals[appealId].reviewWindowEndsUs` |
 | `BodyConcurrentCapReached()` | `regionActiveReliefCount[appeal.region] ≥ BODY_CONCURRENT_APPEAL_CAP` |
 
-**State transitions:** `status = FastTracked`; `fastTrackedAtUs = nowUs`; `reviewWindowEndsUs = nowUs + BLACKLIST_RATIFICATION_WINDOW`; `regionActiveReliefCount[appeal.region]++`; on the parent entry, `entry.suspended = true`, `entry.suspendedAtUs = nowUs`. The `ContentBlacklist` views `isBlacklisted` / `isBlacklistedInRegion` immediately return false for the parent entry per ADR 011 § Interaction with active slashes.
+**State transitions:** `status = FastTracked`; `fastTrackedAtUs = nowUs`; `reviewWindowEndsUs = nowUs + BLACKLIST_RATIFICATION_WINDOW`; `regionActiveReliefCount[appeal.region]++`; on the parent entry, `entry.suspended = true`, `entry.suspendedAtUs = nowUs`. The `ContentBlacklist` views `isBlacklisted` / `isBlacklistedInRegion` immediately return false for the parent entry per [ADR 011 § Interaction with active slashes](011-content-takedown.md#interaction-with-active-slashes).
 
 **Emits:** `BlacklistAppealFastTracked(appealId)`.
 
@@ -155,7 +155,7 @@ function unFastTrackAppeal(uint256 appealId) external onlyEmergencyMultisig;
 | --- | --- |
 | `AppealNotFound()` | `appeals[appealId].status == None` |
 | `AppealNotFastTracked()` | `status != FastTracked` (also subsumes the "already-terminal" cases — `Ratified`, `Reversed`, `Rejected`, `Lapsed` — none of which have `status == FastTracked`) |
-| `AlreadyUnFastTracked()` | `appeals[appealId].alreadyUnFastTracked != 0` — one-shot per ADR 011, enforced by the Slot 4 flag |
+| `AlreadyUnFastTracked()` | `appeals[appealId].alreadyUnFastTracked != 0` — one-shot per [ADR 011](011-content-takedown.md), enforced by the Slot 4 flag |
 
 **State transitions:** `status = UnFastTracked`; `alreadyUnFastTracked = 1`; `entry.suspended = false`; `entry.suspendedAtUs` is **preserved** for the closed window so post-resumption evidence-age arithmetic per [ADR 014 § Evidence Staleness](014-on-chain-verification.md#evidence-staleness) sees the historical suspension boundary; `regionActiveReliefCount[appeal.region]--`; `reviewWindowEndsUs = nowUs + BLACKLIST_MULTISIG_REVIEW_WINDOW` (fresh window opens). Bond stays escrowed; `totalBondsEscrowed` unchanged.
 
@@ -168,7 +168,7 @@ function rejectAppeal(uint256 appealId) external onlyEmergencyMultisig;
 function rejectAppealAsPerjury(uint256 appealId) external onlyEmergencyMultisig;
 ```
 
-`rejectAppealAsPerjury` is a sibling entry point for the ADR 011 § Evidence case where post-hoc evidence shows the sworn declaration was false. It does everything `rejectAppeal` does, plus sets `appeals[appealId].perjuryFlagged = 1` and `perjuryDenylistUntilUs[appeal.filer] = nowUs + 365 days * 1_000_000`. Multisig may call either against an `Open`, `UnFastTracked`, or `FastTracked` appeal; on a `FastTracked` appeal the suspension is released as a side effect (mirrors `unFastTrackAppeal` slot accounting before terminating).
+`rejectAppealAsPerjury` is a sibling entry point for the [ADR 011 § Evidence](011-content-takedown.md#evidence)claration was false. It does everything `rejectAppeal` does, plus sets `appeals[appealId].perjuryFlagged = 1` and `perjuryDenylistUntilUs[appeal.filer] = nowUs + 365 days * 1_000_000`. Multisig may call either against an `Open`, `UnFastTracked`, or `FastTracked` appeal; on a `FastTracked` appeal the suspension is released as a side effect (mirrors `unFastTrackAppeal` slot accounting before terminating).
 
 | Revert | Trigger |
 | --- | --- |
@@ -197,7 +197,7 @@ Both require `status == FastTracked` and `nowUs < reviewWindowEndsUs`. Both term
 
 `reverseAppeal`:
 
-- `status = Reversed`; `regionActiveReliefCount[appeal.region]--`; `entry.suspended = false`. `entry.effectiveAt` is **preserved** per ADR 011 § Authority and flow — resetting was rejected to avoid retroactively shielding pre-suspension non-compliance.
+- `status = Reversed`; `regionActiveReliefCount[appeal.region]--`; `entry.suspended = false`. `entry.effectiveAt` is **preserved** per [ADR 011 § Authority and flow](011-content-takedown.md#authority-and-flow)roactively shielding pre-suspension non-compliance.
 - Bond burn: `TOKEN.burn(appeal.bond)`; `totalBondsEscrowed -= appeal.bond`.
 - **Emits:** `BlacklistAppealReversed(appealId)`.
 
@@ -214,7 +214,7 @@ Permissionless. Reverts unless one of the four admissibility conditions from [AD
 | (a) multisig silent past `BLACKLIST_MULTISIG_REVIEW_WINDOW` | `status == Open && nowUs ≥ reviewWindowEndsUs` | refund |
 | (b) governance silent past `BLACKLIST_RATIFICATION_WINDOW` | `status == FastTracked && nowUs ≥ reviewWindowEndsUs` | refund |
 | (c) synthetic-standing clawback fired | `status == Open && standingPath == TokenHolder && nowUs ≥ openedAtUs + STANDING_LOOKBACK_SECONDS * 1_000_000 && TOKEN.balanceOf(filer) < APPEAL_FILER_TOKEN_THRESHOLD` | **burn** (100%) |
-| (d) global override fired | `status ∈ {Open, FastTracked} && _entryExists(appeal.blake3Hash, appeal.region) == false` | refund (per ADR 011 § Global Override — treats as lapse, not reversal) |
+| (d) global override fired | `status ∈ {Open, FastTracked} && _entryExists(appeal.blake3Hash, appeal.region) == false` | refund (per [ADR 011 § Global Override](011-content-takedown.md#global-override)) |
 
 **State transitions:** `status = Lapsed` for all four conditions — the terminal-status set is intentionally minimal. The bond outcome (refund for a, b, d; burn for c) is determined by the matched condition per the table above, surfaced through the `LapseReason` indexed sub-field on `BlacklistAppealLapsed` (see § Event topic ordering) so off-chain consumers can distinguish refund-vs-burn cases without parsing follow-on `Transfer` events. If `status` was `FastTracked` when cleanup fires: `regionActiveReliefCount[appeal.region]--`; `entry.suspended = false`; `entry.suspendedAtUs` preserved. `totalBondsEscrowed -= appeal.bond`.
 
@@ -263,13 +263,13 @@ stateDiagram-v2
     Lapsed --> [*]
 ```
 
-`UnFastTracked → FastTracked` is one-shot per ADR 011 § Contract surface — a second `unFastTrackAppeal` against the same `appealId` reverts with `AlreadyUnFastTracked`.
+`UnFastTracked → FastTracked` is one-shot per [ADR 011 § Contract surface](011-content-takedown.md#contract-surface) the same `appealId` reverts with `AlreadyUnFastTracked`.
 
 ### 5. Integration with ContentBlacklist core
 
 - **`entry.suspended` writes** happen only from `fastTrackAppeal` (true), `unFastTrackAppeal` (false, preserving `suspendedAtUs`), `reverseAppeal` (false, preserving `suspendedAtUs`), `rejectAppeal` / `rejectAppealAsPerjury` on a `FastTracked` appeal (false, preserving `suspendedAtUs`), and `cleanupExpiredAppeal` cases (b) and (d) (false, preserving `suspendedAtUs`). No other path mutates `suspended`.
 - **`entry.suspendedAtUs` is monotonic per entry.** Once written by a fast-track, it is preserved across `unFastTrackAppeal`, `reverseAppeal`, and `cleanupExpiredAppeal` so [ADR 014 § Evidence Staleness](014-on-chain-verification.md#evidence-staleness) can compute evidence age against the historical suspension boundary. A subsequent fresh `fastTrackAppeal` on the same entry overwrites with the new boundary; this is acceptable because each fast-track defines its own suspension epoch.
-- **`_removeHashRegional` internal call** from `ratifyAppealRemoval` reuses the same body as the public `removeHashRegional` (which is `onlyGovernor` per ADR 011). The internal variant skips the role check (caller is already `onlyGovernor` on `ratifyAppealRemoval`) and emits `HashRemoved` exactly once.
+- **`_removeHashRegional` internal call** from `ratifyAppealRemoval` reuses the same body as the public `removeHashRegional` (which is `onlyGovernor` per [ADR 011](011-content-takedown.md)). The internal variant skips the role check (caller is already `onlyGovernor` on `ratifyAppealRemoval`) and emits `HashRemoved` exactly once.
 - **`regionActiveReliefCount` decrement points** are: `unFastTrackAppeal`, `rejectAppeal` / `rejectAppealAsPerjury` on a `FastTracked` appeal, `ratifyAppealRemoval`, `reverseAppeal`, and `cleanupExpiredAppeal` cases (b) and (d) — every transition out of `FastTracked`. Increment is exclusive to `fastTrackAppeal`.
 
 ### 6. Multisig capability scope
@@ -278,7 +278,7 @@ stateDiagram-v2
 
 ### 7. Gas-optimization notes
 
-- **`region` as `bytes2`.** Per ADR 011's gas-optimization note on `BlacklistEntry`, the production region representation is `bytes2`. The `openBlacklistAppeal` external entry takes `string calldata region` for ADR-conformant interface stability but canonicalizes internally to `bytes2` for storage. Helpers (`_toBytes2(string)`) revert on length ≠ 2 or non-ASCII-alpha characters per ISO 3166-1 alpha-2.
+- **`region` as `bytes2`.** Per [ADR 011](011-content-takedown.md)'s gas-optimization note on `BlacklistEntry`, the production region representation is `bytes2`. The `openBlacklistAppeal` external entry takes `string calldata region` for ADR-conformant interface stability but canonicalizes internally to `bytes2` for storage. Helpers (`_toBytes2(string)`) revert on length ≠ 2 or non-ASCII-alpha characters per ISO 3166-1 alpha-2.
 - **Struct packing.** The `BlacklistAppeal` struct is laid out across 5 slots (160 bytes total) with explicit padding fields marking unused slot space. Future field additions append to slot 4 (which has 14 bytes of free padding) or open a slot 5.
 - **`RejectionWindow` packing.** The fixed-length `uint64[3]` plus `uint64 cooldownUntilUs` fit in a single 32-byte slot, so `filerRejections` is one SLOAD per cap check.
 - **`appeals[0]` reserved.** Reading uninitialized appeal records (`appealId == 0` or unallocated) returns `status == None`; functions revert with `AppealNotFound()` on `status == None`. The contract does not store `0`-indexed entries.
@@ -287,14 +287,14 @@ stateDiagram-v2
 
 ### Positive
 
-- Pins storage layout and event schema as a single source of truth, removing the cross-derivation cost between ADR 011's narrative form and the eventual Solidity.
+- Pins storage layout and event schema as a single source of truth, removing the cross-derivation cost between [ADR 011](011-content-takedown.md)'s narrative form and the eventual Solidity.
 - Parallel structure to [ADR 032](032-safety-reserve-appeals-contract.md) keeps both appeal-contract surfaces — slashing and blacklist — auditable under one pattern.
 - Permissionless `cleanupExpiredAppeal` plus the four admissibility conditions removes any contract dependency on a privileged scheduler; bond settlement and slot release are eventually consistent through any caller.
 
 ### Negative
 
 - Five-slot struct + four auxiliary mappings per appeal carry non-trivial storage cost. Expected volume is low (most regional entries are never appealed; bond + frequency caps + per-body cap bound the active set), but high-volume regional adversarial activity multiplies storage cost linearly.
-- Multisig capability scope is implicit: `ADR 009` enumerates four capabilities; the blacklist-appeal entry points are sub-modes of capability (1) (regional-body suspension) but not yet listed. An ADR 009 editorial pass is owed.
+- Multisig capability scope is implicit: `ADR 009` enumerates four capabilities; the blacklist-appeal entry points are sub-modes of capability (1) (regional-body suspension) but not yet listed. An [ADR 009](009-governance.md) editorial pass is owed.
 
 ### Risks
 

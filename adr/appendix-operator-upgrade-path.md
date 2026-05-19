@@ -1,16 +1,16 @@
 # Appendix: Operator Protocol-Upgrade Runbook
 
-> **Appendix, not a core protocol ADR.** Operator-facing companion to [ADR 013 — Schema Evolution](013-schema-evolution.md). Tier semantics, two-phase deserialization, ALPN negotiation, and the deprecation timeline are defined in ADR 013; this appendix only sequences the operator actions each tier implies.
+> **Appendix, not a core protocol ADR.** Operator-facing companion to [ADR 013 — Schema Evolution](013-schema-evolution.md). Tier semantics, two-phase deserialization, ALPN negotiation, and the deprecation timeline are defined in [ADR 013](013-schema-evolution.md); this appendix only sequences the operator actions each tier implies.
 
 ## Context
 
-The protocol evolves under the ADR 013 three-tier scheme (Tier 1 minor, Tier 2 medium, Tier 3 major). The mechanics are well-specified; the operator question — *what do I do when a release ships?* — is not (which releases need config edits, when payment channels are at risk, how to roll a fleet upgrade without dropping traffic).
+The protocol evolves under the [ADR 013](013-schema-evolution.md) three-tier scheme (Tier 1 minor, Tier 2 medium, Tier 3 major). The mechanics are well-specified; the operator question — *what do I do when a release ships?* — is not (which releases need config edits, when payment channels are at risk, how to roll a fleet upgrade without dropping traffic).
 
 This runbook fills that gap. It does not redefine any protocol mechanism.
 
 ## 1. Tier overview
 
-Per [ADR 013 §Decision](013-schema-evolution.md), each schema change is exactly one tier:
+Per [ADR 013 § Decision](013-schema-evolution.md), each schema change is exactly one tier:
 
 | Tier | Trigger | ALPN | Operator action |
 |------|---------|------|-----------------|
@@ -18,7 +18,7 @@ Per [ADR 013 §Decision](013-schema-evolution.md), each schema change is exactly
 | **2 — Medium** | Add new optional message types or gossip envelope versions, no ALPN bump | Same | Config-only (opt-in flags), see §2.2 |
 | **3 — Major** | Remove a field; change a type; reorder enum variants; add a mandatory field; change signed-field set; change framing | Bumped (`cdn/client/v1` → `cdn/client/v2`) | Coordinated rolling upgrade, see §3 |
 
-The [ADR 013 §Deprecation Timeline](013-schema-evolution.md#deprecation-timeline) gives the schedule (T+0 release, T+4 weeks adoption target, T+12 weeks old-version removal). Operators MUST plan fleet upgrades against that schedule.
+The [ADR 013 § Deprecation Timeline](013-schema-evolution.md#deprecation-timeline) gives the schedule (T+0 release, T+4 weeks adoption target, T+12 weeks old-version removal). Operators MUST plan fleet upgrades against that schedule.
 
 ## 2. Tier 1 and Tier 2 operator checklists
 
@@ -28,14 +28,14 @@ A Tier 1 release adds optional fields to existing structs. By construction:
 
 - Wire format stays compatible (postcard two-phase deserialization handles missing trailing extensions).
 - ALPN string unchanged.
-- Signed field set unchanged ([ADR 013 §Signed Field Freezing](013-schema-evolution.md)) — slash evidence stays verifiable across versions.
+- Signed field set unchanged ([ADR 013 § Signed Field Freezing](013-schema-evolution.md)) — slash evidence stays verifiable across versions.
 - Payment channels and on-chain bindings unaffected.
 
 **Operator action:** Pull and restart at your normal cadence. No drain, flag day, deprecation window, or client coordination. Skipping a Tier 1 release entirely keeps you interoperable indefinitely — peers on the new version just won't see the optional fields you don't emit.
 
 ### 2.2 Tier 2 — medium evolution
 
-A Tier 2 release adds new optional message variants (e.g. a `Ping`/`Pong` keepalive on `cdn/client/v1`) or a new gossip envelope version. The ALPN string is unchanged; legacy peers that don't understand the new variant close the stream with `UNSUPPORTED_MESSAGE` and the sender falls back ([ADR 013 §Tier 2](013-schema-evolution.md)).
+A Tier 2 release adds new optional message variants (e.g. a `Ping`/`Pong` keepalive on `cdn/client/v1`) or a new gossip envelope version. The ALPN string is unchanged; legacy peers that don't understand the new variant close the stream with `UNSUPPORTED_MESSAGE` and the sender falls back ([ADR 013 § Tier 2](013-schema-evolution.md)).
 
 **Operator checklist:**
 
@@ -50,7 +50,7 @@ Payment channels and stake state are unaffected.
 
 This is the only tier with cross-fleet coordination cost. The ALPN string changes (`cdn/client/v1` → `cdn/client/v2`); a node running only `v1` becomes invisible to clients that have rotated to `v2`-only after the deprecation window.
 
-**Read [ADR 013 §ALPN Version Negotiation](013-schema-evolution.md#alpn-version-negotiation) before starting** — it explains why both versions can run on a single `iroh::Endpoint` simultaneously, the entire basis of the rolling upgrade below.
+**Read [ADR 013 § ALPN Version Negotiation](013-schema-evolution.md#alpn-version-negotiation) before starting** — it explains why both versions can run on a single `iroh::Endpoint` simultaneously, the entire basis of the rolling upgrade below.
 
 ### 3.1 Pre-cutover (T+0 to T+4 weeks)
 
@@ -60,18 +60,18 @@ A Tier 3 release ships a node binary supporting both versions, giving you four w
 |-------|-----|
 | **Config-field deltas.** Diff your operator config against the release's example config for new mandatory, renamed, or removed fields. | Tier 3 is the only tier where required config can change. |
 | **Payment-channel validity.** Tier 3 may change the channel-ID formula or voucher format, invalidating **open channels** (release notes state this). Affected channels settle via the normal close/dispute/settle path, or `reclaimExpired` after expiry. | Close open old-protocol channels before the cutover window or risk losing payments. |
-| **Voucher-signer compatibility.** If the EIP-712 voucher domain or typed-data hash changes (Tier 3 §Signed Field Freezing — changing the signed field set is major), upgrade the off-chain voucher signer in lockstep with the node binary. | An old signer's pre-bump signatures fail `SignatureChecker.isValidSignatureNow` against the new contract ([ADR 024 §1](024-account-abstraction.md)). |
+| **Voucher-signer compatibility.** If the EIP-712 voucher domain or typed-data hash changes (Tier 3 § Signed Field Freezing — changing the signed field set is major), upgrade the off-chain voucher signer in lockstep with the node binary. | An old signer's pre-bump signatures fail `SignatureChecker.isValidSignatureNow` against the new contract ([ADR 024 §1](024-account-abstraction.md)). |
 | **Local dispute monitor compatibility.** The in-process dispute monitor ([ADR 003](003-payments.md) Option C) reads local-store voucher state and submits `disputeChannel` calls. After a Tier 3 voucher-format change it must be on the new binary before any new-format channels open, else it cannot decode them. It ships with the node binary, so the only operator action is sequencing node and contract upgrades correctly. | Primary stale-close defense ([Appendix: Fraud Detection](appendix-fraud-detection.md)); a stale binary leaves new-format closes unmonitored. |
 
 ### 3.2 Cutover — rolling upgrade (per node)
 
-The release ships a binary registering **both** ALPN handlers (`v1` and `v2`) on one `iroh::Endpoint`, per [ADR 013 §Multi-version support](013-schema-evolution.md), making the rolling upgrade per-node and zero-downtime in aggregate.
+The release ships a binary registering **both** ALPN handlers (`v1` and `v2`) on one `iroh::Endpoint`, per [ADR 013 § Multi-version support](013-schema-evolution.md), making the rolling upgrade per-node and zero-downtime in aggregate.
 
 For each node in the fleet, in any order:
 
 1. **Drain** new inbound connections. The intended surface, `admin_v1_drain`, is listed in [`appendix-local-admin-http.md`](appendix-local-admin-http.md) but not yet implemented; until it ships, drain via your external load balancer (stop forwarding new connections) or block the node's QUIC port at the firewall. Either way, confirm:
    - `decdn_streams_active{direction="inbound"} == 0`
-   - `decdn_probe_hold_slots_used == 0` (avoids the phantom-slash window per [ADR 005 §Probe-Triggered Eviction Hold](005-protocol.md#probe-triggered-eviction-hold))
+   - `decdn_probe_hold_slots_used == 0` (avoids the phantom-slash window per [ADR 005 § Probe-Triggered Eviction Hold](005-protocol.md#probe-triggered-eviction-hold))
 2. **Stop** the node.
 3. **Upgrade config** with any new mandatory fields from §3.1.
 4. **Replace the binary** with the new release.
@@ -87,14 +87,14 @@ If the smoke test fails on the first node, **stop the rollout**, roll the binary
 
 ### 3.3 Post-cutover (T+4 to T+12 weeks)
 
-By T+4 weeks the whole fleet should run the dual-version binary. Clients begin preferring the new version per [ADR 013 §Deprecation Timeline](013-schema-evolution.md#deprecation-timeline); traffic mix shifts toward `v2`.
+By T+4 weeks the whole fleet should run the dual-version binary. Clients begin preferring the new version per [ADR 013 § Deprecation Timeline](013-schema-evolution.md#deprecation-timeline); traffic mix shifts toward `v2`.
 
 | Phase | Operator action |
 |-------|-----------------|
 | **T+4 to T+8 weeks** | Monitor the `decdn_streams_completed_total` `v1`/`v2` mix. When `v1` drops below ~5% of total, plan removal. |
 | **T+12 weeks** | The release schedule **may** ship a `v1`-removal binary. Upgrade per §3.2 again. After this rollout, peers still running `v1`-only become unreachable. |
 
-**You MUST keep `v1` support until T+12 weeks.** [ADR 013 §Multi-version support](013-schema-evolution.md#alpn-version-negotiation) makes this a protocol guarantee: "a node MUST support at least the current and previous major version simultaneously during a transition period." T+12 weeks is the earliest the deprecation timeline permits old-version removal. Dropping `v1` earlier breaks the guarantee — legacy clients on the old ALPN see `no_application_protocol` TLS alerts and fall through to the next probe candidate, indistinguishable from a node outage.
+**You MUST keep `v1` support until T+12 weeks.** [ADR 013 § Multi-version support](013-schema-evolution.md#alpn-version-negotiation) makes this a protocol guarantee: "a node MUST support at least the current and previous major version simultaneously during a transition period." T+12 weeks is the earliest the deprecation timeline permits old-version removal. Dropping `v1` earlier breaks the guarantee — legacy clients on the old ALPN see `no_application_protocol` TLS alerts and fall through to the next probe candidate, indistinguishable from a node outage.
 
 **At T+12 weeks** old-version support MAY be removed, depending on the operator-visible traffic mix. Permitted, not required.
 
@@ -111,7 +111,7 @@ For Tier 3, clients control the ALPN proposal order. You don't negotiate with th
 
 ### 4.2 Governance
 
-For Tier 3 upgrades touching governance-controlled parameters (rate bounds in [ADR 003 §Rate Bounds Refresh](003-payments.md), slashing schedule in [ADR 026 §8](026-gauge-boost-tokenomics.md)):
+For Tier 3 upgrades touching governance-controlled parameters (rate bounds in [ADR 003 § Rate Bounds Refresh](003-payments.md), slashing schedule in [ADR 026 §8](026-gauge-boost-tokenomics.md)):
 
 - The authorizing governance proposal is on its own timeline ([ADR 009](009-governance.md): 7-day vote + 48-hour timelock). The protocol release usually ships **before** the vote concludes, with the new behavior gated on an on-chain flag.
 - Operators MUST verify the relevant on-chain governance state before activating the new behavior locally — consult the release notes for the specific contract call (e.g. `Governance.upgradeActivated(uint256 versionId)` returns true).

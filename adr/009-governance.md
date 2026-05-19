@@ -65,7 +65,7 @@ The six `FeeRouter` shares and the `boostFloor` parameter are governable within 
 | Safety share | 3% | 0% | 15% |
 | `boostFloor` | 0.4 | 0.2 | 0.8 |
 
-The 20% floor on the node-base share is the cashflow invariant defined in [ADR 016 §FeeRouter (production)](016-contract-interactions.md#feerouter-production); the rationale is load-bearing for governance and is not re-derived here. The `boostFloor` bounds prevent governance from collapsing the gauge pool to a winner-take-all distribution (lower bound) or flattening it into uselessness (upper bound). See [ADR 026](026-gauge-boost-tokenomics.md) §3 for the full gauge-boost formula.
+The 20% floor on the node-base share is the cashflow invariant defined in [ADR 016 § FeeRouter (production)](016-contract-interactions.md#feerouter-production); the rationale is load-bearing for governance and is not re-derived here. The `boostFloor` bounds prevent governance from collapsing the gauge pool to a winner-take-all distribution (lower bound) or flattening it into uselessness (upper bound). See [ADR 026](026-gauge-boost-tokenomics.md) §3 for the full gauge-boost formula.
 
 #### Other protocol parameters
 

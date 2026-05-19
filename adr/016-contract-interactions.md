@@ -9,7 +9,7 @@ The deCDN deploys multiple interacting smart contracts with cross-contract calls
 
 This ADR consolidates that analysis into a single reference for security audits and implementation. It does not introduce new functionality — it systematizes what other ADRs already specify.
 
-> **ADR 026 driver.** The contract surface in this ADR is materially expanded by [ADR 026](026-gauge-boost-tokenomics.md), which adds `FeeRouter`, `VotingEscrow`, `SafetyReserve`, and `DelegatorBuyer`, and rewires `PaymentChannel`, `StakingRegistry`, and `BuybackBurner`. Read ADR 026 first for the economic model; this ADR is the integration view.
+> **[ADR 026](026-gauge-boost-tokenomics.md) driver.** The contract surface in this ADR is materially expanded by [ADR 026](026-gauge-boost-tokenomics.md), which adds `FeeRouter`, `VotingEscrow`, `SafetyReserve`, and `DelegatorBuyer`, and rewires `PaymentChannel`, `StakingRegistry`, and `BuybackBurner`. Read [ADR 026](026-gauge-boost-tokenomics.md) first for the economic model; this ADR is the integration view.
 
 ## Decision
 
@@ -503,7 +503,7 @@ The cross-contract call table above covers contract-to-contract interactions onl
 
 ##### Bootstrap pattern
 
-(per [ADR 012 §Bootstrap](012-client.md#bootstrap-procedure)): paginated `getActiveNodes(offset, 100)` calls until a page returns fewer than `limit` results. For PoC scale (tens of nodes) a single call suffices; the pagination pattern is preserved so the same code works at production scale.
+(per [ADR 012 § Bootstrap](012-client.md#bootstrap-procedure)): paginated `getActiveNodes(offset, 100)` calls until a page returns fewer than `limit` results. For PoC scale (tens of nodes) a single call suffices; the pagination pattern is preserved so the same code works at production scale.
 
 **Liveness caveat:** the registry is a cold-start *seed list*, not a liveness oracle. The chain has no liveness signal, so returned operators include staked-but-offline nodes. Clients filter to live peers via gossip (`NodeAnnounce` TTL) and probe RTT after bootstrap.
 
@@ -703,7 +703,7 @@ Every state-mutating function that makes an external call is listed below with i
 | --- | --- | --- |
 | `executeBuyback()` | `BalancerV3Router.swapSingleTokenExactIn()` (swaps contract-held USDC; Router forwards to Vault which pulls input tokens via Vault-scoped allowance), `IERC20.safeTransfer()` (TOKEN to burn) | `nonReentrant`, checks-effects-interactions, `KEEPER_ROLE` |
 
-> **MEV protection (production).** See [ADR 018 — Buyback execution via Balancer V3](018-liquidity-strategy.md#buyback-execution-via-balancer-v3) for the authoritative policy. In summary: Balancer's weighted-pool curve reduces (but does not eliminate) price-impact concerns compared to concentrated liquidity, and `executeBuyback` MAY split large buybacks into `subSwapCount` sub-swaps spaced by `subSwapMinBlockGap` blocks. **Direct Router execution with TWAP + `minTokenOut` guards is the primary production path and the required fallback.** Routing through CoW Swap is a conditional add-on that requires operator verification of CoW solver routing against the deployed Balancer V3 pool (per ADR 018's activation criteria); if CoW routing is unavailable or regresses, direct Router + TWAP remains correct. The `maxBuybackAmount` parameter MUST be enforced to limit per-transaction MEV exposure regardless of venue.
+> **MEV protection (production).** See [ADR 018 — Buyback execution via Balancer V3](018-liquidity-strategy.md#buyback-execution-via-balancer-v3) for the authoritative policy. In summary: Balancer's weighted-pool curve reduces (but does not eliminate) price-impact concerns compared to concentrated liquidity, and `executeBuyback` MAY split large buybacks into `subSwapCount` sub-swaps spaced by `subSwapMinBlockGap` blocks. **Direct Router execution with TWAP + `minTokenOut` guards is the primary production path and the required fallback.** Routing through CoW Swap is a conditional add-on that requires operator verification of CoW solver routing against the deployed Balancer V3 pool (per [ADR 018](018-liquidity-strategy.md)'s activation criteria); if CoW routing is unavailable or regresses, direct Router + TWAP remains correct. The `maxBuybackAmount` parameter MUST be enforced to limit per-transaction MEV exposure regardless of venue.
 
 > **Inflow source.** Under [ADR 026](026-gauge-boost-tokenomics.md) §8, `BuybackBurner` receives the buyback share (5% of every settlement at steady state) same-tx from `FeeRouter`; share is governance-tunable per [§ Tunable Economics](#tunable-economics). The `executeBuyback` mechanics, `KEEPER_ROLE`-gating, and Vault-scoped self-approval pattern are independent of the share value.
 
@@ -794,7 +794,7 @@ Every deCDN contract should inherit from audited OpenZeppelin base contracts rat
 
 ### 8. Launch vs Steady-State Configuration
 
-The contract surface is identical at launch and at steady state — every contract in [§ 1 Contract Inventory](#1-contract-inventory) ships in a single audit pass. Behavioral differences across the network's lifecycle are governance-tunable parameters, not contract redeployments.
+The contract surface is identical at launch and at steady state — every contract in [§1 Contract Inventory](#1-contract-inventory) ships in a single audit pass. Behavioral differences across the network's lifecycle are governance-tunable parameters, not contract redeployments.
 
 | Aspect | At launch (typical) | At steady state |
 | --- | --- | --- |

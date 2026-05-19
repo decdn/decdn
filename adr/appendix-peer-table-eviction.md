@@ -49,14 +49,14 @@ The peer table is **not size-capped by default**. Growth is bounded externally:
 For defense-in-depth against an unforeseen growth path (registry-validation regression, future schema change), operators MAY set an optional ceiling:
 
 - **Config key:** `gossip.max_peer_entries` — `Option<usize>`, default `None` (unlimited).
-- **When set and exceeded:** new inserts are rejected; the failure surfaces in the existing gossip-rejection counter `decdn_gossip_messages_rejected_total{reason=table_full}` (per [appendix-observability.md § 2.6 Gossip Metrics](appendix-observability.md#26-gossip-metrics)). **No existing entry is evicted to make room** — eviction-by-priority would conflate discovery with selection trust (see §4) and is rejected in *Alternatives Considered*.
+- **When set and exceeded:** new inserts are rejected; the failure surfaces in the existing gossip-rejection counter `decdn_gossip_messages_rejected_total{reason=table_full}` (per [appendix-observability.md §2.6 Gossip Metrics](appendix-observability.md#26-gossip-metrics)). **No existing entry is evicted to make room** — eviction-by-priority would conflate discovery with selection trust (see §4) and is rejected in *Alternatives Considered*.
 - **Operator signal:** sustained `decdn_peer_table_size > registered_node_count × 1.5` indicates registry validation is not constraining inserts as expected and warrants investigation, not silent eviction.
 
 Implementing `gossip.max_peer_entries` is OPTIONAL for the PoC (`peer_table_size` already covers the observable signal); the config key is reserved here so a follow-up implementation needs no ADR amendment.
 
 ### 3. Registry-cache interaction (active eviction)
 
-The local registry cache, when implemented per [ADR 001 § Registry cache](001-network.md#registry-cache) and [ADR 019 § Step 3.3](019-node-onboarding.md#step-33--build-initial-peer-table-from-on-chain-registry), subscribes to `NodeRegistered`, `NodeDeregistered`, and `NodeAutoEjected` events. On `NodeDeregistered` and `NodeAutoEjected` for a `node_id`, the subscriber MUST also **remove the matching peer-table entry** in the same handler, alongside its registry-cache update. Origin blacklisting ([ADR 011 § Hash Evasion and Origin Blacklisting](011-content-takedown.md#hash-evasion-and-origin-blacklisting)) routes through `StakingRegistry.ejectNode` and emits `NodeAutoEjected`, so the same code path covers it. The subscriber does not yet exist; this clause adds one behavior on top of the subscriber introduced by ADR 019.
+The local registry cache, when implemented per [ADR 001 § Registry cache](001-network.md#registry-cache) and [ADR 019 § Step 3.3](019-node-onboarding.md#step-33--build-initial-peer-table-from-on-chain-registry), subscribes to `NodeRegistered`, `NodeDeregistered`, and `NodeAutoEjected` events. On `NodeDeregistered` and `NodeAutoEjected` for a `node_id`, the subscriber MUST also **remove the matching peer-table entry** in the same handler, alongside its registry-cache update. Origin blacklisting ([ADR 011 § Hash Evasion and Origin Blacklisting](011-content-takedown.md#hash-evasion-and-origin-blacklisting)) routes through `StakingRegistry.ejectNode` and emits `NodeAutoEjected`, so the same code path covers it. The subscriber does not yet exist; this clause adds one behavior on top of the subscriber introduced by [ADR 019](019-node-onboarding.md).
 
 **Rationale.**
 
@@ -69,15 +69,15 @@ The local registry cache, when implemented per [ADR 001 § Registry cache](001-n
 
 ### 4. Reputation does not factor into eviction
 
-Reputation governs *selection* (the `selection_score` formula in [ADR 001 § Node Selection Algorithm](001-network.md#node-selection-algorithm) and the local/network blend in [ADR 008](008-reputation.md)), not retention. A peer whose reputation falls to the 0.1 floor stays in the peer table until TTL or deregistration removes it. The selection-score formula already makes such a node ~100× less likely to be selected (see ADR 001 reputation table), the appropriate response.
+Reputation governs *selection* (the `selection_score` formula in [ADR 001 § Node Selection Algorithm](001-network.md#node-selection-algorithm) and the local/network blend in [ADR 008](008-reputation.md)), not retention. A peer whose reputation falls to the 0.1 floor stays in the peer table until TTL or deregistration removes it. The selection-score formula already makes such a node ~100× less likely to be selected (see [ADR 001](001-network.md) reputation table), the appropriate response.
 
 **Why not reputation-priority eviction.**
 
 - It conflates discovery and selection. The peer table is a discovery surface; selection is the trust-weighted decision built on top of it.
-- It creates a collusive-eviction vector: a coalition sending negative `ReputationReport` messages could push a competitor below an "eviction threshold" and remove them from peer tables network-wide, bypassing the hard floor in ADR 008.
+- It creates a collusive-eviction vector: a coalition sending negative `ReputationReport` messages could push a competitor below an "eviction threshold" and remove them from peer tables network-wide, bypassing the hard floor in [ADR 008](008-reputation.md).
 - Reputation is noisy in the tail; a transient bad-luck dip should not erase a peer from discovery.
 
-This ADR therefore excludes reputation from the eviction decision. Reputation-system changes (ADR 008) need not consider peer-table side effects.
+This ADR therefore excludes reputation from the eviction decision. Reputation-system changes ([ADR 008](008-reputation.md)) need not consider peer-table side effects.
 
 ### 5. Offline handling
 
@@ -89,7 +89,7 @@ This ADR therefore excludes reputation from the eviction decision. Reputation-sy
 
 ### 6. Observability
 
-Naming follows [appendix-observability.md § 2.6 Gossip Metrics](appendix-observability.md#26-gossip-metrics). The existing `decdn_peer_table_size` gauge and `decdn_gossip_messages_rejected_total` counter cover most of the surface; this appendix adds two eviction counters and one label value:
+Naming follows [appendix-observability.md §2.6 Gossip Metrics](appendix-observability.md#26-gossip-metrics). The existing `decdn_peer_table_size` gauge and `decdn_gossip_messages_rejected_total` counter cover most of the surface; this appendix adds two eviction counters and one label value:
 
 | Metric | Type | Description |
 |---|---|---|
