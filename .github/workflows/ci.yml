@@ -116,51 +116,93 @@ jobs:
               - 'adr/Makefile'
               - '.github/workflows/ci.yml'
 
+  # REQUIRED signal feeding ci-success. Runs the workspace test suite
+  # *uninstrumented* — this is the fast blocking path. Coverage (LLVM
+  # instrumentation + LCOV diff + sticky PR comment) was split out into the
+  # separate, non-blocking `coverage` job below so the required path no
+  # longer pays the cargo-llvm-cov instrumentation tax (≈ the bulk of the
+  # old merged job's runtime; see PR #484 / split rationale).
+  #
+  # Behaviour note: the blocking test-failure signal is now the
+  # uninstrumented run. A failure that *only* manifests under coverage
+  # instrumentation (rare — instrumentation changes timing/codegen, not
+  # logic) will surface as a red X on the non-blocking `coverage` job
+  # rather than blocking the PR. This is the intended trade-off for the
+  # faster required path.
+  #
+  # Doc/ADR-only PRs skip this job via the `changes` gate; alls-green is
+  # configured with `allowed-skips` (see ci-success below) so the skip is
+  # accepted as success.
   test:
     name: test
     runs-on: ubuntu-latest
     needs: changes
     if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
-    # Merged test+coverage job: the `Run tests` step (instrumented nextest) is
-    # the required signal feeding ci-success. Every coverage post-processing
-    # step below it carries `continue-on-error: true` so flaky LCOV/diff/comment
-    # tooling never blocks PRs — preserving the prior `coverage`-job semantics.
-    # Doc-only PRs skip this job via the `changes` gate; alls-green is
-    # configured with `allowed-skips` (see ci-success below) so the skip
-    # is accepted as success.
+    permissions:
+      contents: read
+    # Build-flag env lives at the JOB level (not step level) so the
+    # Swatinem/rust-cache step sees it: the action hashes CARGO_*/RUST_*
+    # env into its cache key. shared-key MUST differ from the `coverage`
+    # job's: both jobs set the same RUSTFLAGS env, but cargo-llvm-cov
+    # additionally injects instrumentation, so the produced artifacts
+    # differ while the env-derived key would not. Distinct shared-keys
+    # ('test' vs 'coverage') keep the two partitions from clobbering each
+    # other and silently restoring the wrong-flavoured target (the exact
+    # fingerprint trap from PR #484's history).
+    env:
+      # mold for the final link of the test binaries; line-tables-only +
+      # unpacked split-debuginfo keep .o files small and relinking fast.
+      # No coverage instrumentation here — that is the whole point of this
+      # job.
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold -C debuginfo=line-tables-only -C split-debuginfo=unpacked"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      # Default (shallow) checkout: this job does no git-diff coverage
+      # work, so fetch-depth: 0 is unnecessary here (kept only in
+      # `coverage`, where coverage-diff.py needs full history).
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y mold
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      # REQUIRED step. Non-zero exit on any test failure fails this job
+      # and (via ci-success.needs) blocks the PR. No continue-on-error.
+      # --no-tests=pass: stub crates (incentive/reputation) currently have
+      # no tests; without this nextest would exit non-zero on them.
+      - name: Run tests
+        run: cargo nextest run --workspace --no-tests=pass
+
+  # NON-BLOCKING coverage job — intentionally excluded from
+  # ci-success.needs (same pattern as coverage-tooling-tests). Carries the
+  # instrumented run plus all coverage post-processing (LCOV baseline
+  # upload/download, diff, sticky PR comment). A failure here paints a
+  # red X in the checks list (visible) without blocking PRs; on push to
+  # main it paints main CI red (visible) but blocks nothing — preserving
+  # the prior "visible degradation beats silent" semantics. Every
+  # post-processing step keeps its original continue-on-error so flaky
+  # LCOV/diff/comment tooling never even reds this job.
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
     permissions:
       contents: read
       pull-requests: write
       actions: read
-    # RUSTFLAGS lives at the JOB level (not step level) so the
-    # Swatinem/rust-cache step that runs early in this job sees it. That
-    # action hashes CARGO_*/RUST_* env vars into its cache key, so this
-    # placement gives the `coverage` partition a key that uniquely reflects
-    # the build configuration: cache misses cleanly when the flags change,
-    # the post-job step then saves the freshly-built target. Step-level
-    # scoping was the wrong choice — Swatinem didn't see the env, restored
-    # main's old-flag target, cargo invalidated everything via per-artifact
-    # fingerprint and rebuilt from scratch, and the post-step skipped the
-    # save with "Cache up-to-date" because the (unchanged) key already
-    # existed. The new build was thrown away every run; see PR #484 history.
-    # Other jobs (clippy/doc/msrv) are in separate job blocks and do not
-    # inherit this env, so their caches stay warm.
+    # Distinct shared-key from `test` (see that job's note). RUSTFLAGS at
+    # job level so rust-cache's key reflects the build config; the
+    # `coverage` partition's key uniquely covers the instrumented build
+    # because cargo-llvm-cov's injected instrumentation differentiates the
+    # artifacts even though this env matches `test`'s.
     env:
-      # Three link/debug knobs:
-      #   - link-arg=-fuse-ld=mold: route the final link of the test
-      #     binaries through mold instead of the system ld.
-      #   - debuginfo=line-tables-only: emit only the .debug_line DWARF
-      #     section, which is what cargo-llvm-cov reads to map counters to
-      #     source lines (SF/DA records in lcov.info). Strips subprogram
-      #     DIEs and type/variable info. NOT equivalent to `-C debuginfo=1`
-      #     (= "limited", which keeps subprogram DIEs); line-tables-only is
-      #     strictly tighter.
-      #   - split-debuginfo=unpacked: side-file debug info; smaller .o
-      #     files, faster relinking. Orthogonal to coverage.
       RUSTFLAGS: "-C link-arg=-fuse-ld=mold -C debuginfo=line-tables-only -C split-debuginfo=unpacked"
-      # Incremental compilation files bloat the cache for zero gain in CI
-      # (no second compile in the same run); rust-cache's README also
-      # recommends disabling it.
       CARGO_INCREMENTAL: "0"
     steps:
       # fetch-depth: 0 is required: coverage-diff.py runs
@@ -171,12 +213,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: llvm-tools-preview
-      # mold is a drop-in replacement for ld that noticeably shortens the
-      # link phase of the workspace's instrumented test binaries. Scoped to
-      # the test job because that's where the test binaries get linked —
-      # other jobs do link small artifacts (build scripts, proc-macro
-      # dylibs) but the savings would be marginal and wouldn't pay back the
-      # apt-get cost.
       - name: Install mold linker
         run: sudo apt-get update && sudo apt-get install -y mold
       - uses: Swatinem/rust-cache@v2
@@ -195,14 +231,10 @@ jobs:
         with:
           python-version: '3.12'
 
-      # REQUIRED step. cargo llvm-cov nextest runs the workspace test suite
-      # with LLVM instrumentation; non-zero exit on any test failure fails
-      # this job and (via ci-success.needs) blocks the PR. No continue-on-error.
-      # sccache is not wired here (matching the prior coverage job); Swatinem
-      # /rust-cache with shared-key: coverage covers caching of instrumented
-      # build artifacts on its own. Build-flag env (RUSTFLAGS,
-      # CARGO_INCREMENTAL) lives at the job level above so rust-cache's
-      # cache key reflects them.
+      # cargo llvm-cov nextest runs the workspace suite with LLVM
+      # instrumentation. This job is non-blocking, so a failure here is a
+      # visible red X (and red main on push) but does not block PRs — the
+      # blocking test signal is the uninstrumented `test` job above.
       #
       # --no-clean: cargo-llvm-cov runs `cargo clean --package <each>` per
       # invocation by default, which would wipe the instrumented artifacts
@@ -211,11 +243,11 @@ jobs:
       - name: Run tests (with coverage instrumentation)
         run: cargo llvm-cov nextest --workspace --lcov --output-path lcov.info --no-tests=pass --no-clean
 
-      # No continue-on-error: this only runs on push to main (post-merge), so
-      # a failure paints main CI red rather than blocking a PR. Silent
-      # degradation is worse than a visible red on main — a persistent upload
-      # failure would silently freeze the coverage baseline that all PR diffs
-      # are computed against.
+      # No continue-on-error: on push to main (post-merge) a failure paints
+      # main CI red rather than blocking a PR. Silent degradation is worse
+      # than a visible red on main — a persistent upload failure would
+      # silently freeze the coverage baseline that all PR diffs are
+      # computed against.
       - name: Upload coverage baseline
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@v7
@@ -307,16 +339,15 @@ jobs:
             exit $rc
           fi
 
-      # always(): post the comment even when the required `Run tests` step fails
-      # (without it, success() would be false and this step would skip on red PRs).
+      # always(): post the comment even when the `Run tests` step fails
+      # (without it, success() would be false and this step would skip).
       # On a coverage-diff.py crash, Generate coverage diff writes a marker-
       # bearing fallback so this step still updates the sticky to a "diff
       # failed" indicator instead of leaving stale data. The hashFiles guard
       # only excludes the case where Generate coverage diff was itself skipped
       # (e.g. Run tests failed and the implicit success() gate skipped the
-      # rest of the chain — in that case the failed-tests signal on the
-      # required job is the unambiguous indicator). Skip on fork PRs:
-      # GITHUB_TOKEN is read-only there and createComment would 403.
+      # rest of the chain). Skip on fork PRs: GITHUB_TOKEN is read-only
+      # there and createComment would 403.
       - name: Post coverage comment
         if: |
           always()
@@ -402,8 +433,7 @@ jobs:
   # Pytest suite for .github/scripts/coverage-diff.py. Non-blocking by design
   # — excluded from ci-success.needs — so a regression in the helper surfaces
   # as a red X (visible in the checks list) without blocking PRs. Lives in its
-  # own job so the signal stays distinct from yellow continue-on-error steps
-  # in the required `test` job.
+  # own job so the signal stays distinct from yellow continue-on-error steps.
   coverage-tooling-tests:
     name: coverage tooling tests
     runs-on: ubuntu-latest
@@ -419,10 +449,10 @@ jobs:
 
   # Single gate for branch protection. Point required-checks at this one job
   # so adding/renaming jobs above doesn't require updating branch rules.
-  # The `test` job carries coverage post-processing (LCOV diff, sticky PR
-  # comment via .github/scripts/coverage-diff.py) as best-effort steps; those
-  # steps' `continue-on-error: true` keeps coverage tooling non-blocking even
-  # though the job itself is required.
+  # The non-blocking `coverage` and `coverage-tooling-tests` jobs are
+  # intentionally omitted from `needs`: coverage post-processing (LCOV diff,
+  # sticky PR comment) is best-effort and must never block PRs. The required
+  # test signal is the uninstrumented `test` job.
   ci-success:
     name: CI success
     if: always()
