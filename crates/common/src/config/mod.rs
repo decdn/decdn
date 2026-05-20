@@ -363,15 +363,20 @@ fn resolve_identity_into(
     ResolvedIdentity { data_dir, region }
 }
 
-/// Normalize an operator-supplied region code: uppercase it and require
-/// exactly two ASCII letters (ISO 3166-1 alpha-2 per ADR 001). A bad value
-/// here would otherwise cause the node to publish announces that it and
-/// its peers all reject at validation time — fail loudly at startup.
+/// Normalize an operator-supplied region code: uppercase it and check it
+/// against the ISO 3166-1 alpha-2 allowlist in
+/// [`decdn_protocol::is_valid_region`] (assigned codes + the user-reserved
+/// ranges `AA`, `QM`–`QZ`, `XA`–`XZ`, `ZZ`). A bad value here would
+/// otherwise cause the node to publish announces that it and its peers
+/// all reject at validation time, or — worse for unassigned codes that
+/// slipped the bare ASCII check — partition the regional gossip topology.
+/// Fail loudly at startup.
 fn normalize_region(raw: &str) -> anyhow::Result<String> {
     let upper = raw.to_ascii_uppercase();
     anyhow::ensure!(
-        upper.len() == 2 && upper.bytes().all(|b| b.is_ascii_uppercase()),
-        "identity.region must be 2 ASCII letters (ISO 3166-1 alpha-2), got {raw:?}"
+        decdn_protocol::is_valid_region(&upper),
+        "identity.region must be an ISO 3166-1 alpha-2 code \
+         (assigned or user-reserved AA/QM-QZ/XA-XZ/ZZ), got {raw:?}"
     );
     Ok(upper)
 }
@@ -1847,10 +1852,31 @@ mod tests {
 
     #[test]
     fn normalize_region_rejects_wrong_length_or_charset() {
-        for bad in ["usa", "u1", "", "U", "U S", "Ü1", "12", "U-"] {
+        // Length / charset failures and unassigned codes. Adversarial
+        // inputs that the wire layer also rejects are pinned here too so
+        // a config-resolver regression can't shift the only effective
+        // check onto the receive path.
+        let bad_inputs = [
+            "usa", "u1", "", "U", "U S", "Ü1", "12", "U-", "OO", "JJ", "BX", "U/", "U\0",
+        ];
+        for bad in bad_inputs {
             assert!(
                 normalize_region(bad).is_err(),
                 "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_region_accepts_reserved_codes() {
+        // Reserved-for-user-assignment codes (ISO 3166-1 §8.1.3) must
+        // round-trip unchanged so air-gapped / testnet operators can use
+        // them. Spot-check each range.
+        for code in ["AA", "QM", "QZ", "XA", "XK", "XZ", "ZZ"] {
+            assert_eq!(
+                normalize_region(code).expect("accepted"),
+                code,
+                "{code} should round-trip"
             );
         }
     }
