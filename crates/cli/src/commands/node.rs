@@ -519,21 +519,14 @@ fn write_peers_table(w: &mut impl io::Write, peers: &[PeerView], now_us: u64) ->
     if peers.is_empty() {
         return writeln!(w, "(no peers known)");
     }
-    // Fixed-column layout: 14 (node_id preview) | 8 (region) | 18 (load) | rest (last_seen).
-    let (node_hdr, region_hdr, load_hdr, last_hdr) = ("NODE_ID", "REGION", "LOAD", "LAST_SEEN");
-    writeln!(
-        w,
-        "{node_hdr:<14} {region_hdr:<8} {load_hdr:<18} {last_hdr}"
-    )?;
+    // Fixed-column layout: 14 (node_id preview) | 8 (region) | rest (last_seen).
+    let (node_hdr, region_hdr, last_hdr) = ("NODE_ID", "REGION", "LAST_SEEN");
+    writeln!(w, "{node_hdr:<14} {region_hdr:<8} {last_hdr}")?;
     for p in peers {
         let preview = short_node_id(&p.node_id);
-        let load = format!(
-            "{}s/{}%",
-            p.load.active_streams, p.load.bandwidth_utilization
-        );
         let age = relative_age(now_us, p.last_seen_us);
         let region = truncate(&p.region, 8);
-        writeln!(w, "{preview:<14} {region:<8} {load:<18} {age}")?;
+        writeln!(w, "{preview:<14} {region:<8} {age}")?;
     }
     Ok(())
 }
@@ -610,7 +603,6 @@ fn format_age(delta_us: u64) -> String {
 )]
 mod tests {
     use super::*;
-    use decdn_protocol::LoadHint;
 
     fn mk_peer(node_id: &str, region: &str, last_seen_us: u64) -> PeerView {
         PeerView {
@@ -618,10 +610,6 @@ mod tests {
             region: region.to_string(),
             first_seen_us: last_seen_us,
             last_seen_us,
-            load: LoadHint {
-                active_streams: 0,
-                bandwidth_utilization: 0,
-            },
             announced_at_us: last_seen_us,
         }
     }

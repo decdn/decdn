@@ -7,8 +7,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use decdn_protocol::{
-    GOSSIP_VERSION, GossipEnvelope, GossipPayload, LoadHint, NodeAnnounce, NodeAnnounceBody,
-    TOPIC_GLOBAL, TOPIC_REGION_PREFIX,
+    GOSSIP_VERSION, GossipEnvelope, GossipPayload, NodeAnnounce, NodeAnnounceBody, TOPIC_GLOBAL,
+    TOPIC_REGION_PREFIX,
 };
 use iroh::{Endpoint, SecretKey};
 use iroh_gossip::api::{GossipReceiver, GossipSender};
@@ -369,12 +369,15 @@ fn publisher_task(
             // Both arms drive the same publish; the trigger arm exists so
             // operators running `decdn node announce` (issue #280) can push
             // a fresh announce immediately rather than waiting up to
-            // `interval` seconds for peers to see a refreshed `LoadHint`
-            // (the field in `NodeAnnounceBody` that varies between
-            // iterations). `region_code` is captured by-value
-            // above and does not re-read from config inside this loop —
-            // changing region requires a restart, which respawns the
-            // publisher and obviates the trigger anyway.
+            // `interval` seconds for the next periodic broadcast. Only
+            // `timestamp_us` varies between iterations, but a forced
+            // re-announce still matters — it refreshes peers' TTL on this
+            // node's entry and lets a freshly-started operator surface in
+            // peer tables without waiting a full interval. `region_code`
+            // is captured by-value above and does not re-read from config
+            // inside this loop — changing region requires a restart,
+            // which respawns the publisher and obviates the trigger
+            // anyway.
             tokio::select! {
                 _ = ticker.tick() => {}
                 () = announce_now.notified() => {}
@@ -383,10 +386,6 @@ fn publisher_task(
             let body = NodeAnnounceBody {
                 node_id,
                 region: region_code.clone(),
-                load: LoadHint {
-                    active_streams: 0,
-                    bandwidth_utilization: 0,
-                },
                 timestamp_us: ts,
             };
             let signing_bytes = match body.signing_bytes() {

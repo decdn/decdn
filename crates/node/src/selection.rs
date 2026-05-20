@@ -1,10 +1,10 @@
-//! Provider selection algorithm (ADR 001 §Node Selection Algorithm + ADR 008 §9).
+//! Provider selection algorithm (ADR 001 § Node Selection Algorithm + ADR 008
+//! § Tie-Breaking).
 //!
 //! `rank_candidates` returns the input list ordered best-first (lowest score
-//! first) with the four-tier tie-breaker applied. The caller iterates the
+//! first) with the three-tier tie-breaker applied. The caller iterates the
 //! result in order and stops after `MAX_PROVIDER_ATTEMPTS` failed providers.
 
-use decdn_protocol::gossip::LoadHint;
 use rand::RngExt;
 use std::collections::HashSet;
 
@@ -44,9 +44,6 @@ pub struct Candidate {
     pub rtt_ms: u32,
     /// Local reputation in `[0.0, 1.0]` from the reputation engine.
     pub reputation: f32,
-    /// Most recent advertised load from `NodeAnnounce`. Used by the
-    /// load tie-break tier.
-    pub load: LoadHint,
     /// ISO 3166-1 alpha-2 region from `NodeAnnounce`. Used by the
     /// geo-diversity tie-break tier.
     pub region: String,
@@ -84,9 +81,9 @@ fn compute_score(rate_per_mb: u64, rtt_ms: u32, reputation: f32) -> f64 {
 
 /// Rank candidates by selection score, lowest (best) first.
 ///
-/// Within-1%-score tie groups are reordered by the four-tier ADR 008
-/// tie-breaker (load → geo → stake → random). The random tier uses a
-/// fresh thread-local RNG; tests inside this module use the private
+/// Within-1%-score tie groups are reordered by the three-tier ADR 008
+/// tie-breaker (geo → stake → random). The random tier uses a fresh
+/// thread-local RNG; tests inside this module use the private
 /// `rank_candidates_with_rng` variant for determinism.
 pub fn rank_candidates(candidates: Vec<Candidate>) -> Vec<RankedCandidate> {
     rank_candidates_with_floor(candidates, DEFAULT_MIN_REPUTATION)
@@ -157,7 +154,7 @@ fn rank_candidates_with_rng(
 }
 
 /// Walk the score-sorted slice and emit each within-1% tie group using the
-/// ADR 008 §9 tie-break tiers. Geo diversity is scoped to the current tie
+/// ADR 008 § Tie-Breaking tiers. Geo diversity is scoped to the current tie
 /// group: candidates within a single within-1% group are spread across
 /// regions, but the tracker is reset between groups so unrelated tie groups
 /// don't bias each other's geo tier.
@@ -168,8 +165,9 @@ fn apply_tiebreaker(ranked: &mut Vec<RankedCandidate>, rng: &mut impl rand::Rng)
         // Geo diversity is scoped to the current tie group: candidates within
         // a single within-1% group are spread across regions, but the tracker
         // is reset between groups so unrelated tie groups don't bias each
-        // other's geo tier. ADR 008 §9 lists the four tiers; per-group scoping
-        // is this implementation's interpretation of "within a tie".
+        // other's geo tier. ADR 008 § Tie-Breaking lists the three tiers;
+        // per-group scoping is this implementation's interpretation of
+        // "within a tie".
         let mut group_regions: HashSet<String> = HashSet::new();
         let end = tie_group_end(ranked, 0);
         // tie_group_end's loop guard bounds `end` at `ranked.len()`, so the
@@ -211,10 +209,11 @@ fn apply_tiebreaker(ranked: &mut Vec<RankedCandidate>, rng: &mut impl rand::Rng)
 }
 
 /// Return the index in `group` of the candidate that wins the tie under the
-/// load → geo (relative to `emitted_regions`) → stake → random tiers.
+/// geo (relative to `emitted_regions`) → stake → random tiers.
 ///
-/// Filters a single index pool in place across the four tiers, so the function
-/// allocates exactly one Vec per call regardless of group size or tier depth.
+/// Filters a single index pool in place across the three tiers, so the
+/// function allocates exactly one Vec per call regardless of group size or
+/// tier depth.
 ///
 /// **INVARIANT:** the returned index is independent of element order in
 /// `group`. The caller (`apply_tiebreaker`) relies on this to use `swap_remove`
@@ -238,20 +237,7 @@ fn pick_best_in_group(
     // final `unwrap_or(0)` provably unreachable in release builds.
     let mut pool: Vec<usize> = (0..group.len()).collect();
 
-    // Tier 1: lowest load wins.
-    if let Some(min_load) = pool
-        .iter()
-        .filter_map(|i| group.get(*i).map(|r| r.candidate.load))
-        .min_by(|a, b| compare_load(*a, *b))
-    {
-        pool.retain(|i| {
-            group
-                .get(*i)
-                .is_some_and(|r| compare_load(r.candidate.load, min_load).is_eq())
-        });
-    }
-
-    // Tier 2: prefer regions not in `emitted_regions`. If at least one
+    // Tier 1: prefer regions not in `emitted_regions`. If at least one
     // candidate in the pool is in an unseen region, restrict to those.
     let any_unseen = pool.iter().any(|i| {
         group
@@ -266,7 +252,7 @@ fn pick_best_in_group(
         });
     }
 
-    // Tier 3: higher stake wins. `None` is treated as the lowest possible
+    // Tier 2: higher stake wins. `None` is treated as the lowest possible
     // stake (since on-chain integration is deferred — see ADR 001 "Contract
     // Interface: Node Registry" / ADR 019 for the staking-registry interface
     // that will populate `Candidate.stake`).
@@ -278,7 +264,7 @@ fn pick_best_in_group(
         pool.retain(|i| group.get(*i).and_then(|r| r.candidate.stake) == Some(top));
     }
 
-    // Tier 4: random tie-break. Uniformly pick from the remaining pool.
+    // Tier 3: random tie-break. Uniformly pick from the remaining pool.
     if pool.is_empty() {
         0
     } else {
@@ -326,21 +312,6 @@ fn tie_group_end(ranked: &[RankedCandidate], start: usize) -> usize {
         end += 1;
     }
     end
-}
-
-/// Tier 1: lower load wins. Compare `bandwidth_utilization` first, then
-/// `active_streams` to break sub-ties.
-///
-/// Bandwidth utilization is the primary signal because it directly reflects
-/// how saturated a node's outgoing pipe is; `active_streams` is a coarser
-/// proxy (a node serving many small streams may have low utilization, while
-/// one serving a few large ones may be saturated). ADR 001 / ADR 008 §9 list
-/// "lower load" without prescribing the sub-field order — this is this
-/// implementation's interpretation.
-fn compare_load(a: LoadHint, b: LoadHint) -> core::cmp::Ordering {
-    a.bandwidth_utilization
-        .cmp(&b.bandwidth_utilization)
-        .then(a.active_streams.cmp(&b.active_streams))
 }
 
 /// Convenience wrapper around [`rank_candidates`]: returns the top `n`
@@ -444,21 +415,9 @@ mod tests {
             rate_per_mb: rate,
             rtt_ms: rtt,
             reputation: rep,
-            load: LoadHint {
-                active_streams: 0,
-                bandwidth_utilization: 0,
-            },
             region: "US".to_string(),
             stake: None,
         }
-    }
-
-    fn with_load(mut c: Candidate, active_streams: u32, util: u8) -> Candidate {
-        c.load = LoadHint {
-            active_streams,
-            bandwidth_utilization: util,
-        };
-        c
     }
 
     fn with_region(mut c: Candidate, region: &str) -> Candidate {
@@ -472,14 +431,14 @@ mod tests {
     }
 
     #[test]
-    fn higher_stake_wins_when_load_and_geo_tied() {
-        // Same score, same load, same region. Higher stake wins.
+    fn higher_stake_wins_when_geo_tied() {
+        // Same score, same region. Higher stake wins at tier 2.
         let small_stake = with_stake(
-            with_region(with_load(make_candidate(1, 100, 10, 1.0), 0, 50), "US"),
+            with_region(make_candidate(1, 100, 10, 1.0), "US"),
             Some(1_000),
         );
         let big_stake = with_stake(
-            with_region(with_load(make_candidate(2, 100, 10, 1.0), 0, 50), "US"),
+            with_region(make_candidate(2, 100, 10, 1.0), "US"),
             Some(10_000),
         );
         let out = rank_candidates(vec![small_stake, big_stake]);
@@ -489,13 +448,10 @@ mod tests {
     #[test]
     fn some_stake_beats_none_stake() {
         let known = with_stake(
-            with_region(with_load(make_candidate(1, 100, 10, 1.0), 0, 50), "US"),
+            with_region(make_candidate(1, 100, 10, 1.0), "US"),
             Some(1_000),
         );
-        let unknown = with_stake(
-            with_region(with_load(make_candidate(2, 100, 10, 1.0), 0, 50), "US"),
-            None,
-        );
+        let unknown = with_stake(with_region(make_candidate(2, 100, 10, 1.0), "US"), None);
         let out = rank_candidates(vec![unknown, known]);
         assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(1));
     }
@@ -503,47 +459,32 @@ mod tests {
     #[test]
     fn some_zero_stake_beats_none_stake() {
         // Zero-stake operators are still "known" — `Some(0)` should beat `None`
-        // (treated as "not yet looked up") at tier 3. `max_stake` returns
+        // (treated as "not yet looked up") at tier 2. `max_stake` returns
         // `Some(0)` for the pool, then retain keeps only `stake == Some(0)`,
         // which drops the `None` entry.
-        let known_zero = with_stake(
-            with_region(with_load(make_candidate(1, 100, 10, 1.0), 0, 50), "US"),
-            Some(0),
-        );
-        let unknown = with_stake(
-            with_region(with_load(make_candidate(2, 100, 10, 1.0), 0, 50), "US"),
-            None,
-        );
+        let known_zero = with_stake(with_region(make_candidate(1, 100, 10, 1.0), "US"), Some(0));
+        let unknown = with_stake(with_region(make_candidate(2, 100, 10, 1.0), "US"), None);
         let out = rank_candidates(vec![unknown, known_zero]);
         assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(1));
     }
 
     #[test]
     fn three_way_zero_stake_falls_through_to_random_tier() {
-        // Two `Some(0)` candidates plus one `None`: tier 3 retains both
-        // `Some(0)` entries (dropping `None`), then tier 4 picks randomly
+        // Two `Some(0)` candidates plus one `None`: tier 2 retains both
+        // `Some(0)` entries (dropping `None`), then tier 3 picks randomly
         // between the two survivors. Across enough seeds we should see both
-        // survivors win first — confirms tier 3 doesn't accidentally
+        // survivors win first — confirms tier 2 doesn't accidentally
         // short-circuit on a single Some(0) winner.
-        let a = with_stake(
-            with_region(with_load(make_candidate(1, 100, 10, 1.0), 0, 50), "US"),
-            Some(0),
-        );
-        let b = with_stake(
-            with_region(with_load(make_candidate(2, 100, 10, 1.0), 0, 50), "US"),
-            Some(0),
-        );
-        let unknown = with_stake(
-            with_region(with_load(make_candidate(3, 100, 10, 1.0), 0, 50), "US"),
-            None,
-        );
+        let a = with_stake(with_region(make_candidate(1, 100, 10, 1.0), "US"), Some(0));
+        let b = with_stake(with_region(make_candidate(2, 100, 10, 1.0), "US"), Some(0));
+        let unknown = with_stake(with_region(make_candidate(3, 100, 10, 1.0), "US"), None);
         let mut first_was_a = false;
         let mut first_was_b = false;
         for seed in 0u64..32 {
             let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
             let out =
                 rank_candidates_with_rng(vec![a.clone(), b.clone(), unknown.clone()], &mut rng);
-            // The unknown (None stake) must never win first — tier 3 drops it.
+            // The unknown (None stake) must never win first — tier 2 drops it.
             assert_ne!(
                 out.first().map(|r| r.candidate.node_id[0]),
                 Some(3),
@@ -565,18 +506,29 @@ mod tests {
     }
 
     #[test]
-    fn stake_tier_only_runs_when_load_and_geo_tied() {
-        // Different load → stake doesn't matter, lower load wins.
-        let busy_rich = with_stake(
-            with_region(with_load(make_candidate(1, 100, 10, 1.0), 0, 90), "US"),
+    fn higher_stake_wins_when_all_regions_unseen() {
+        // Two candidates fully tied on score; one US, one DE. At the start
+        // of a fresh tie group `emitted_regions` is empty, so the geo tier
+        // (tier 1) finds every region "unseen" — `any_unseen` is true but
+        // the retain predicate keeps every candidate (nothing is in
+        // `emitted_regions` yet). The geo tier is effectively a no-op for
+        // the first pick from a fresh group, and stake (tier 2) decides —
+        // US (10k) outranks DE (1k).
+        //
+        // This pins geo tier 1 as "prefer regions not yet emitted in this
+        // group", not "prefer any specific region per se" — a future tweak
+        // that biased the first pick toward, say, the alphabetically-first
+        // region would change this outcome.
+        let us_rich = with_stake(
+            with_region(make_candidate(1, 100, 10, 1.0), "US"),
             Some(10_000),
         );
-        let idle_poor = with_stake(
-            with_region(with_load(make_candidate(2, 100, 10, 1.0), 0, 10), "US"),
+        let de_poor = with_stake(
+            with_region(make_candidate(2, 100, 10, 1.0), "DE"),
             Some(1_000),
         );
-        let out = rank_candidates(vec![busy_rich, idle_poor]);
-        assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(2));
+        let out = rank_candidates(vec![us_rich, de_poor]);
+        assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(1));
     }
 
     #[test]
@@ -607,38 +559,34 @@ mod tests {
     }
 
     #[test]
-    fn tied_scores_lower_utilization_wins() {
-        // Both score exactly the same. busy has higher bandwidth_utilization.
-        let busy = with_load(make_candidate(1, 100, 10, 1.0), 5, 90);
-        let idle = with_load(make_candidate(2, 100, 10, 1.0), 5, 10);
-        let out = rank_candidates(vec![busy, idle]);
-        assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(2));
-    }
-
-    #[test]
-    fn tied_scores_break_streams_when_util_equal() {
-        // Equal bandwidth_utilization → fall back to active_streams.
-        let many = with_load(make_candidate(1, 100, 10, 1.0), 50, 50);
-        let few = with_load(make_candidate(2, 100, 10, 1.0), 1, 50);
-        let out = rank_candidates(vec![many, few]);
-        assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(2));
-    }
-
-    #[test]
     fn within_1_percent_counts_as_tied() {
-        // score_a = 1000, score_b = 1005 → within 0.5%, should tie-break by load.
-        let high_load = with_load(make_candidate(1, 100, 10, 1.0), 0, 90); // score 1000
-        let low_load = with_load(make_candidate(2, 1005, 1, 1.0), 0, 10); // score 1005
-        let out = rank_candidates(vec![high_load, low_load]);
-        // Tied → lower-load (id 2) wins despite higher raw score.
+        // score_a = 1000, score_b = 1005 → within 0.5%, should tie-break.
+        // Tier 1 (geo) is neutral (same region); tier 2 (stake) decides.
+        let high_score = with_stake(
+            with_region(make_candidate(1, 100, 10, 1.0), "US"),
+            Some(1_000),
+        ); // score 1000
+        let low_score = with_stake(
+            with_region(make_candidate(2, 1005, 1, 1.0), "US"),
+            Some(10_000),
+        ); // score 1005
+        let out = rank_candidates(vec![high_score, low_score]);
+        // Tied → higher-stake (id 2) wins despite higher raw score.
         assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(2));
     }
 
     #[test]
     fn outside_1_percent_does_not_tie_break() {
-        // 1000 vs 1020 → 2% gap, no tie-break.
-        let cheap = with_load(make_candidate(1, 100, 10, 1.0), 0, 90); // score 1000
-        let dear = with_load(make_candidate(2, 1020, 1, 1.0), 0, 10); // score 1020
+        // 1000 vs 1020 → 2% gap, no tie-break. Higher stake on the dearer
+        // candidate can't pull it ahead.
+        let cheap = with_stake(
+            with_region(make_candidate(1, 100, 10, 1.0), "US"),
+            Some(1_000),
+        ); // score 1000
+        let dear = with_stake(
+            with_region(make_candidate(2, 1020, 1, 1.0), "US"),
+            Some(10_000),
+        ); // score 1020
         let out = rank_candidates(vec![cheap, dear]);
         assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(1));
     }
@@ -648,22 +596,35 @@ mod tests {
         // 1000 vs 1010 → exactly 1.0% gap. tie_group_end uses `> TIE_THRESHOLD`,
         // so 1.0% is *inclusive* (still a tie). Pins the boundary against a
         // future change to `>=` that would silently exclude exact-1% pairs.
-        let high_load = with_load(make_candidate(1, 100, 10, 1.0), 0, 90); // score 1000
-        let low_load = with_load(make_candidate(2, 1010, 1, 1.0), 0, 10); // score 1010
-        let out = rank_candidates(vec![high_load, low_load]);
+        // Stake on the dearer candidate proves the tie-break ran.
+        let high_score = with_stake(
+            with_region(make_candidate(1, 100, 10, 1.0), "US"),
+            Some(1_000),
+        ); // score 1000
+        let low_score = with_stake(
+            with_region(make_candidate(2, 1010, 1, 1.0), "US"),
+            Some(10_000),
+        ); // score 1010
+        let out = rank_candidates(vec![high_score, low_score]);
         assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(2));
     }
 
     #[test]
     fn zero_score_candidates_group_together_for_tie_break() {
         // Two zero-score candidates (rate=0, both have score 0.0) must form a
-        // single tie group so the load tier picks between them. Without the
-        // zero-pivot fix, each becomes its own singleton group and load is
+        // single tie group so the stake tier picks between them. Without the
+        // zero-pivot fix, each becomes its own singleton group and stake is
         // skipped entirely.
-        let zero_high_load = with_load(make_candidate(1, 0, 10, 1.0), 0, 90); // score 0, high load
-        let zero_low_load = with_load(make_candidate(2, 0, 10, 1.0), 0, 10); // score 0, low load
-        let out = rank_candidates(vec![zero_high_load, zero_low_load]);
-        // Tied at 0.0 → lower-load (id 2) wins.
+        let zero_low_stake = with_stake(
+            with_region(make_candidate(1, 0, 10, 1.0), "US"),
+            Some(1_000),
+        ); // score 0, low stake
+        let zero_high_stake = with_stake(
+            with_region(make_candidate(2, 0, 10, 1.0), "US"),
+            Some(10_000),
+        ); // score 0, high stake
+        let out = rank_candidates(vec![zero_low_stake, zero_high_stake]);
+        // Tied at 0.0 → higher-stake (id 2) wins.
         assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(2));
     }
 
@@ -679,15 +640,15 @@ mod tests {
 
     #[test]
     fn geo_diversity_prefers_unseen_region() {
-        // Three candidates fully tied by score AND load; two in US, one in DE.
-        // With tier-4 randomness the first pick may be any of the three, so the
+        // Three candidates fully tied by score; two in US, one in DE.
+        // With tier-3 randomness the first pick may be any of the three, so the
         // test verifies the geo invariant directly: WHEN a US candidate is picked
         // first (the path where the geo tier matters), the second pick MUST be DE
         // — the only unseen region left in the tie group. Iterating seeds keeps
         // the test robust to RNG implementation changes.
-        let us1 = with_region(with_load(make_candidate(1, 100, 10, 1.0), 0, 50), "US");
-        let us2 = with_region(with_load(make_candidate(2, 100, 10, 1.0), 0, 50), "US");
-        let de = with_region(with_load(make_candidate(3, 100, 10, 1.0), 0, 50), "DE");
+        let us1 = with_region(make_candidate(1, 100, 10, 1.0), "US");
+        let us2 = with_region(make_candidate(2, 100, 10, 1.0), "US");
+        let de = with_region(make_candidate(3, 100, 10, 1.0), "DE");
         let mut tested_first_us = false;
         for seed in 0u64..32 {
             let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
@@ -803,10 +764,10 @@ mod tests {
         // moment). Then verify the SECOND group's first pick can be either US
         // or non-US (i.e., across many seeds we observe both — proving group 2
         // wasn't biased by group 1's US).
-        let g1_us = with_region(with_load(make_candidate(1, 1, 10, 1.0), 0, 50), "US");
-        let g1_de = with_region(with_load(make_candidate(2, 1, 10, 1.0), 0, 50), "DE");
-        let g2_us = with_region(with_load(make_candidate(3, 100, 10, 1.0), 0, 50), "US");
-        let g2_jp = with_region(with_load(make_candidate(4, 100, 10, 1.0), 0, 50), "JP");
+        let g1_us = with_region(make_candidate(1, 1, 10, 1.0), "US");
+        let g1_de = with_region(make_candidate(2, 1, 10, 1.0), "DE");
+        let g2_us = with_region(make_candidate(3, 100, 10, 1.0), "US");
+        let g2_jp = with_region(make_candidate(4, 100, 10, 1.0), "JP");
 
         // Run with many seeds. We want to find at least one seed where group 1
         // emits US first AND group 2 emits US first. With per-group reset that's
@@ -961,17 +922,18 @@ mod tests {
     fn floor_then_tiebreak_runs_deterministically() {
         // Covers `rank_candidates_with_floor_and_rng` directly and the
         // floor↔tie-break interaction: after the sub-floor node is removed,
-        // two fully score-tied survivors must still flow through the four-tier
-        // breaker. They differ only by load, so the load tier decides
-        // deterministically (independent of the RNG seed) — the lower-load
-        // node ranks first and the sub-floor node is absent, for every seed.
-        let busy = with_load(make_candidate(1, 100, 10, 0.9), 0, 90);
-        let idle = with_load(make_candidate(2, 100, 10, 0.9), 0, 10);
+        // two fully score-tied survivors must still flow through the
+        // three-tier breaker. They differ only by stake, so the stake tier
+        // decides deterministically (independent of the RNG seed) — the
+        // higher-stake node ranks first and the sub-floor node is absent,
+        // for every seed.
+        let poor = with_stake(make_candidate(1, 100, 10, 0.9), Some(1_000));
+        let rich = with_stake(make_candidate(2, 100, 10, 0.9), Some(10_000));
         let subfloor = make_candidate(3, 1, 1, 0.1); // cheapest raw, below floor
         for seed in 0u64..8 {
             let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
             let out = rank_candidates_with_floor_and_rng(
-                vec![busy.clone(), subfloor.clone(), idle.clone()],
+                vec![poor.clone(), subfloor.clone(), rich.clone()],
                 0.5,
                 &mut rng,
             );
@@ -979,7 +941,7 @@ mod tests {
             assert_eq!(
                 ids,
                 vec![2, 1],
-                "seed {seed}: floor drops #3, load tier orders #2<#1"
+                "seed {seed}: floor drops #3, stake tier orders #2<#1"
             );
         }
     }

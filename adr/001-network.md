@@ -25,7 +25,7 @@ graph TD
         REG_ETC["cdn/region/.../v1"]
     end
 
-    NA["NodeAnnounce<br/>{region, load}"]
+    NA["NodeAnnounce<br/>{region}"]
 
     NA -->|all staked nodes publish| GLOBAL
     NA -->|regional nodes publish| REG_US
@@ -54,14 +54,8 @@ Nodes broadcast lightweight metadata over iroh-gossip on regional topics (`cdn/r
 struct NodeAnnounce {
     node_id: NodeId,
     region: String,              // ISO 3166-1 alpha-2 (self-reported)
-    load: LoadHint,              // approximate current utilization
     timestamp_us: u64,           // microseconds since epoch
     signature: Signature,        // node's iroh key signs all fields above
-}
-
-struct LoadHint {
-    active_streams: u32,         // current concurrent delivery streams
-    bandwidth_utilization: u8,   // 0-100 percentage of self-reported capacity
 }
 ```
 
@@ -69,10 +63,7 @@ struct LoadHint {
 
 The struct above is a flat definition for readability. [ADR 013](013-schema-evolution.md#adr-013-schema-evolution) specifies that `NodeAnnounce` uses a `NodeAnnounceBody` (signed portion) + `signature` + optional extensions pattern with two-phase deserialization, enabling unsigned fields to be appended via minor evolution without an ALPN bump. See [ADR 013 — Signed Field Freezing](013-schema-evolution.md#signed-field-freezing) for the canonical struct layout.
 
-`LoadHint` is advisory and untrusted. The reputation system ([ADR 008](008-reputation.md#adr-008-reputation-system)) penalizes nodes whose observed delivery performance contradicts their advertised load.
-
 - **`NodeAnnounce` carries node-level metadata only** — no content inventory and no demand signals. Content discovery and demand are derived from DHT FIND_VALUE traffic and local cache-miss timestamps (see [ADR 022 § Popularity Signals and Market Dynamics](022-content-discovery.md#popularity-signals-and-market-dynamics)). Message size is ~150 bytes.
-- **`LoadHint`** makes the "approximate load in gossip announcements" from [ADR 008, Tie-Breaking](008-reputation.md#tie-breaking) concrete, feeding tie-breaking logic.
 - **Announce interval** is a per-node configuration parameter (default 60 seconds). This interval directly governs gossip bandwidth — see [Gossip Bandwidth Analysis](#gossip-bandwidth-analysis) below.
 
 Both clients and nodes maintain a **peer table** (`NodeId → NodeAnnounce`) built from received gossip messages. This table tracks which nodes exist and their metadata — it does not track content. Peer-table lifecycle (TTL, registry-driven eviction, reputation independence) is documented in [appendix-peer-table-eviction.md](appendix-peer-table-eviction.md#appendix-peer-table-eviction-policy).

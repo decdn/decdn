@@ -10,9 +10,8 @@
 //!
 //! DTO fields are deliberately wire-only: no engine handles, no
 //! peer-table types, no daemon runtime types. They use simple owned
-//! values (`String`, `u64`, primitive arrays) plus
-//! [`decdn_protocol::LoadHint`], a leaf protocol type. Pulling
-//! `decdn-common` into the CLI does not pull the daemon runtime.
+//! values (`String`, `u64`, primitive arrays). Pulling `decdn-common`
+//! into the CLI does not pull the daemon runtime.
 //!
 //! The helper [`parse_hash_arg`] returns [`struct@Hash`] from the
 //! `decdn-config-types` leaf crate (the same leaf the typed config
@@ -34,9 +33,6 @@ use serde::{Deserialize, Serialize};
 /// Defined separately from any peer-table internal type so that
 /// table-internal fields (per-peer counters, debug flags, etc.) that may
 /// accrete in the future can't silently leak into the wire format.
-/// Transitively-included protocol types (e.g. [`decdn_protocol::LoadHint`])
-/// do remain on the wire, so changes to those still need to be treated
-/// as wire-format changes.
 ///
 /// Also used by `decdn node peers` and the integration tests to
 /// deserialize the server response — sharing the type here prevents the
@@ -51,8 +47,6 @@ pub struct PeerView {
     pub first_seen_us: u64,
     /// Microseconds-since-epoch the peer's most recent announce was accepted.
     pub last_seen_us: u64,
-    /// `LoadHint` from the most recent announce.
-    pub load: decdn_protocol::LoadHint,
     /// `timestamp_us` carried inside the signed announce body.
     pub announced_at_us: u64,
 }

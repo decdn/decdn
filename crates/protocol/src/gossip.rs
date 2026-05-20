@@ -73,8 +73,6 @@ pub struct NodeAnnounceBody {
     pub node_id: [u8; 32],
     /// ISO 3166-1 alpha-2 region code, 2 ASCII uppercase letters.
     pub region: String,
-    /// Approximate current utilization.
-    pub load: LoadHint,
     /// Microseconds since Unix epoch.
     pub timestamp_us: u64,
 }
@@ -86,15 +84,6 @@ impl NodeAnnounceBody {
     }
 }
 
-/// Coarse load hint carried in every [`NodeAnnounce`] (ADR 001).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LoadHint {
-    /// Current concurrent delivery streams.
-    pub active_streams: u32,
-    /// 0..=100 percentage of self-reported capacity.
-    pub bandwidth_utilization: u8,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,10 +92,6 @@ mod tests {
         NodeAnnounceBody {
             node_id: [1u8; 32],
             region: "US".to_string(),
-            load: LoadHint {
-                active_streams: 3,
-                bandwidth_utilization: 42,
-            },
             timestamp_us: 1_700_000_000_000_000,
         }
     }
@@ -145,7 +130,7 @@ mod tests {
             }),
         };
         let bytes = postcard::to_allocvec(&env)?;
-        // First byte is the version (1), second byte is the payload discriminant.
+        // First byte is the version, second byte is the payload discriminant.
         assert_eq!(bytes.first().copied(), Some(GOSSIP_VERSION));
         assert_eq!(bytes.get(1).copied(), Some(0u8));
         Ok(())

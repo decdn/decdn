@@ -154,7 +154,7 @@ fn verify_signature(a: &NodeAnnounce) -> Result<(), AnnounceReject> {
 mod tests {
     use super::*;
     use decdn_protocol::{
-        GOSSIP_VERSION, GossipEnvelope, GossipPayload, LoadHint, NodeAnnounce, NodeAnnounceBody,
+        GOSSIP_VERSION, GossipEnvelope, GossipPayload, NodeAnnounce, NodeAnnounceBody,
     };
     use iroh::SecretKey;
 
@@ -211,10 +211,6 @@ mod tests {
         NodeAnnounceBody {
             node_id: *sk.public().as_bytes(),
             region: "US".to_string(),
-            load: LoadHint {
-                active_streams: 0,
-                bandwidth_utilization: 0,
-            },
             timestamp_us: ts_us,
         }
     }

@@ -130,17 +130,13 @@ impl PeerTable {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use decdn_protocol::{LoadHint, NodeAnnounceBody};
+    use decdn_protocol::NodeAnnounceBody;
 
     fn mk_announce(node_id: [u8; 32], ts_us: u64) -> NodeAnnounce {
         NodeAnnounce {
             body: NodeAnnounceBody {
                 node_id,
                 region: "US".to_string(),
-                load: LoadHint {
-                    active_streams: 0,
-                    bandwidth_utilization: 0,
-                },
                 timestamp_us: ts_us,
             },
             signature: vec![0u8; 64],
