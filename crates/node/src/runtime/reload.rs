@@ -31,11 +31,18 @@
 //! Each reloadable knob is a `ReloadableSection` impl. The trait
 //! drives a fixed three-phase iteration in [`RuntimeReloadState::reload`]:
 //!
-//! 1. **Resolve every section.** Any failure → return early, previous
-//!    values retained for *every* section (the all-or-nothing contract).
-//!    Resolved values are stashed in a per-section buffer cell
+//! 1. **Resolve every section.** A single [`ConfigErrorBag`] is threaded
+//!    through every section's `resolve`, so an operator who broke
+//!    multiple fields sees them all in one error rather than fixing them
+//!    one SIGHUP at a time, and collapsed once at the end; any problem
+//!    → return early with previous values retained for *every* section
+//!    (the all-or-nothing contract). Resolved values
+//!    are stashed in a per-section buffer cell
 //!    (`Mutex<Option<Self::Resolved>>`) so the trait stays `dyn`-safe
-//!    despite each section having its own `Resolved` type.
+//!    despite each section having its own `Resolved` type; every section
+//!    populates its buffer on every resolve (a sentinel placeholder if
+//!    it pushed to the bag). The early return skips the swap phase, and
+//!    the next reload's `clear_buffer` evicts any leftover sentinel.
 //! 2. **Run every `fallible_commit`.** The log-level filter swap is the
 //!    only currently-fallible commit. This phase is the rollback
 //!    boundary: commits already applied stay applied; a later failure
@@ -56,11 +63,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::dispatch::ConnectionLimiter;
+use anyhow::Context;
 use decdn_common::cli::common::LogLevel;
 use decdn_common::cli::run::{ObservabilityArgs, PaymentArgs};
 use decdn_common::config::{
-    FileConfig, ResolvedObservability, ResolvedPayment, ResolvedSecurity, load_file_config,
-    parse_pinned_hashes, resolve_observability, resolve_payment, resolve_security,
+    ConfigErrorBag, FileConfig, ResolvedObservability, ResolvedPayment, ResolvedSecurity,
+    load_file_config, parse_pinned_hashes, resolve_observability_into, resolve_payment_into,
+    resolve_security_into,
 };
 
 /// Read-only snapshot of the reloadable fields, returned by
@@ -120,9 +129,14 @@ pub(crate) trait ReloadableSection: Send + Sync {
     fn clear_buffer(&self);
 
     /// Phase 1: re-resolve from file, store the result in the section's
-    /// buffer cell. May fail; on failure the entire reload is rolled
-    /// back before any commit runs.
-    fn resolve(&self, file: &FileConfig) -> anyhow::Result<()>;
+    /// buffer cell. Problems are pushed to the shared `bag` rather than
+    /// returned as a `Result`, so every section's resolve runs before the
+    /// aggregated bag is collapsed in `reload()`. Implementations must
+    /// always populate the buffer (with a sentinel/default value if
+    /// validation failed) — the buffer is only read downstream when the
+    /// bag is empty, so a placeholder there is never observed by the
+    /// commit/swap phases on the failure path.
+    fn resolve(&self, file: &FileConfig, bag: &mut ConfigErrorBag);
 
     /// Phase 2: any commit step that can fail (e.g. swapping the live
     /// tracing filter). Default: no-op. The order of `fallible_commit`
@@ -224,12 +238,11 @@ impl ReloadableSection for PaymentSection {
             *g = None;
         }
     }
-    fn resolve(&self, file: &FileConfig) -> anyhow::Result<()> {
-        let resolved = resolve_payment(&self.cli, file.payment.as_ref())?;
+    fn resolve(&self, file: &FileConfig, bag: &mut ConfigErrorBag) {
+        let resolved = resolve_payment_into(&self.cli, file.payment.as_ref(), bag);
         if let Ok(mut g) = self.buf.lock() {
             *g = Some(resolved);
         }
-        Ok(())
     }
     fn infallible_swap(&self) {
         let Some(resolved) = drain_or_log(&self.buf, self.name()) else {
@@ -299,12 +312,11 @@ impl ReloadableSection for LogLevelSection {
             *g = false;
         }
     }
-    fn resolve(&self, file: &FileConfig) -> anyhow::Result<()> {
-        let resolved = resolve_observability(&self.cli, file.observability.as_ref())?;
+    fn resolve(&self, file: &FileConfig, bag: &mut ConfigErrorBag) {
+        let resolved = resolve_observability_into(&self.cli, file.observability.as_ref(), bag);
         if let Ok(mut g) = self.buf.lock() {
             *g = Some(resolved);
         }
-        Ok(())
     }
     fn fallible_commit(&self) -> anyhow::Result<()> {
         // Read (don't drain) the buffer — `infallible_swap` still needs
@@ -383,13 +395,20 @@ impl ReloadableSection for PinnedHashesSection {
             *g = None;
         }
     }
-    fn resolve(&self, file: &FileConfig) -> anyhow::Result<()> {
-        let resolved =
-            parse_pinned_hashes(file.cache.as_ref().and_then(|c| c.pinned_hashes.as_deref()))?;
+    fn resolve(&self, file: &FileConfig, bag: &mut ConfigErrorBag) {
+        // Same shape as `resolve_cache_into`: bag-push on parse failure,
+        // empty placeholder so later sections still run. `reload()`'s
+        // early return guarantees the placeholder never reaches swap.
+        let resolved = bag
+            .try_with(
+                "cache.pinned_hashes",
+                parse_pinned_hashes(file.cache.as_ref().and_then(|c| c.pinned_hashes.as_deref()))
+                    .context("invalid cache.pinned_hashes"),
+            )
+            .unwrap_or_else(decdn_cache::PinnedHashes::empty);
         if let Ok(mut g) = self.buf.lock() {
             *g = Some(resolved);
         }
-        Ok(())
     }
     fn infallible_swap(&self) {
         let Some(resolved) = drain_or_log(&self.buf, self.name()) else {
@@ -443,12 +462,11 @@ impl ReloadableSection for SecuritySection {
             *g = None;
         }
     }
-    fn resolve(&self, file: &FileConfig) -> anyhow::Result<()> {
-        let resolved = resolve_security(file.security.as_ref())?;
+    fn resolve(&self, file: &FileConfig, bag: &mut ConfigErrorBag) {
+        let resolved = resolve_security_into(file.security.as_ref(), bag);
         if let Ok(mut g) = self.buf.lock() {
             *g = Some(resolved);
         }
-        Ok(())
     }
     fn infallible_swap(&self) {
         let Some(resolved) = drain_or_log(&self.buf, self.name()) else {
@@ -887,20 +905,23 @@ impl RuntimeReloadState {
             section.clear_buffer();
         }
 
-        // Phase 1: resolve every section. Any failure → return early,
-        // no side-effects committed. The all-or-nothing contract.
+        // Phase 1: resolve every section into one shared bag, then
+        // collapse it once. Non-empty bag → return early, no side-effects
+        // committed (the all-or-nothing contract).
+        let mut bag = ConfigErrorBag::new();
         for section in &self.sections {
-            if let Err(err) = section.resolve(&file) {
-                let name = section.name();
-                tracing::warn!(
-                    %err,
-                    section = name,
-                    "config reload aborted at [{name}]; entire reload rolled back \
-                     (all-or-nothing): payment, observability, cache.pinned_hashes, \
-                     and security all retained at their previous values",
-                );
-                return Err(err);
-            }
+            section.resolve(&file, &mut bag);
+        }
+        let problem_count = bag.problem_count();
+        if let Err(err) = bag.into_result() {
+            tracing::warn!(
+                %err,
+                problem_count,
+                "config reload aborted; entire reload rolled back \
+                 (all-or-nothing) — all reloadable sections retained at \
+                 their previous values",
+            );
+            return Err(err);
         }
 
         // Lock the snapshot mutex before the fallible-commit phase.
@@ -2121,6 +2142,120 @@ mod tests {
             captured.lock().unwrap().is_none(),
             "log-level setter must not have run when security rejected"
         );
+    }
+
+    /// SIGHUP aggregates problems across sections into one error;
+    /// all-or-nothing — no section's previous value moves and the
+    /// log-level setter is never called.
+    #[tokio::test]
+    async fn reload_aggregates_problems_across_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            "[payment]\n\
+             rate_per_mb = 0\n\
+             [cache]\n\
+             pinned_hashes = [\"notahash\"]\n\
+             [security]\n\
+             per_source_rate_per_sec = -1.0\n",
+        );
+
+        let initial = seed_resolved(42, LogLevel::Info);
+        let (setter, captured) = recording_setter();
+        let state = RuntimeReloadState::new(
+            PaymentArgs {
+                rate_per_mb: None,
+                delivery_floor: None,
+                delivery_ceiling: None,
+            },
+            ObservabilityArgs {
+                log_level: None,
+                log_format: None,
+                metrics_port: None,
+                metrics_bind: None,
+                admin_port: None,
+                otlp_endpoint: None,
+            },
+            &initial,
+            setter,
+        );
+
+        let err = state.reload(&path).await.unwrap_err();
+        let msg = format!("{err:#}");
+        // Aggregated envelope from `ConfigErrorBag::into_result`.
+        assert!(
+            msg.contains("configuration has 3 problem(s)"),
+            "expected 3-problem envelope, got: {msg}"
+        );
+        // Every offending field is named in the same error.
+        assert!(
+            msg.contains("payment.rate_per_mb"),
+            "missing payment field: {msg}"
+        );
+        assert!(
+            msg.contains("cache.pinned_hashes"),
+            "missing pinned-hashes field: {msg}"
+        );
+        assert!(
+            msg.contains("security.per_source_rate_per_sec"),
+            "missing security field: {msg}"
+        );
+
+        // All-or-nothing: every section's previous value is retained.
+        assert_eq!(state.rate_per_mb().load(Ordering::Relaxed), 42);
+        assert!(
+            captured.lock().unwrap().is_none(),
+            "log-level setter must not have run when any section rejected"
+        );
+    }
+
+    /// Two problems inside one section must both surface — guards
+    /// against `*_into` workers short-circuiting on the first push.
+    #[tokio::test]
+    async fn reload_aggregates_two_problems_in_one_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            "[payment]\n\
+             rate_per_mb = 0\n\
+             delivery_ceiling = 0\n",
+        );
+
+        let initial = seed_resolved(42, LogLevel::Info);
+        let (setter, _captured) = recording_setter();
+        let state = RuntimeReloadState::new(
+            PaymentArgs {
+                rate_per_mb: None,
+                delivery_floor: None,
+                delivery_ceiling: None,
+            },
+            ObservabilityArgs {
+                log_level: None,
+                log_format: None,
+                metrics_port: None,
+                metrics_bind: None,
+                admin_port: None,
+                otlp_endpoint: None,
+            },
+            &initial,
+            setter,
+        );
+
+        let err = state.reload(&path).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("configuration has 2 problem(s)"),
+            "expected 2-problem envelope, got: {msg}"
+        );
+        assert!(
+            msg.contains("payment.rate_per_mb"),
+            "missing rate_per_mb: {msg}"
+        );
+        assert!(
+            msg.contains("payment.delivery_ceiling"),
+            "missing delivery_ceiling: {msg}"
+        );
+        assert_eq!(state.rate_per_mb().load(Ordering::Relaxed), 42);
     }
 
     /// Setter-failure case extended with security: the log-level setter

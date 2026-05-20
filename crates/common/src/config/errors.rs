@@ -1,8 +1,9 @@
 //! Structured config-validation error accumulator.
 //!
 //! [`ConfigErrorBag`] is threaded through every section resolver during a
-//! `resolve_config` pass so every problem an operator made surfaces in one
-//! bulleted `anyhow::Error`, not one per re-run.
+//! `resolve_config` pass — and through every reloadable section during a
+//! SIGHUP reload (`runtime::reload`) — so every problem an operator made
+//! surfaces in one bulleted `anyhow::Error`, not one per re-run.
 //!
 //! Each problem is recorded under a dotted field label (`blockchain.rpc_url`,
 //! `cache.origins[2]`, ...) with the resolver's message text. Single-line
@@ -29,6 +30,7 @@ pub(crate) const IDENTITY_DATA_DIR: &str = "identity.data_dir";
 
 /// One resolved-config problem: a dotted field label (`blockchain.rpc_url`)
 /// plus the resolver's message text.
+#[derive(Debug)]
 struct ConfigProblem {
     field: String,
     message: String,
@@ -37,22 +39,29 @@ struct ConfigProblem {
 /// Accumulates every problem found during a single `resolve_config` pass.
 ///
 /// Threaded by `&mut` through the `*_into` section workers. Callers record
-/// problems via [`check`](Self::check) (the `anyhow::ensure!` replacement)
-/// and [`try_with`](Self::try_with) (the `?`/`.context()` replacement),
+/// problems via `check` (the `anyhow::ensure!` replacement) and
+/// [`try_with`](Self::try_with) (the `?`/`.context()` replacement),
 /// substituting a placeholder for any value they could not resolve so
 /// later independent checks still run.
 ///
 /// Insertion order is preserved end-to-end: [`into_result`](Self::into_result)
-/// renders bullets in the same order they were [`push`](Self::push)ed, so
+/// renders bullets in the same order they were `push`ed, so
 /// resolver authors can rely on operator-facing problem order matching the
 /// order of validation logic, and tests that pin specific output order keep
 /// working through future refactors.
-pub(crate) struct ConfigErrorBag {
+#[derive(Debug)]
+pub struct ConfigErrorBag {
     problems: Vec<ConfigProblem>,
 }
 
+impl Default for ConfigErrorBag {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ConfigErrorBag {
-    pub(crate) const fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             problems: Vec::new(),
         }
@@ -100,7 +109,7 @@ impl ConfigErrorBag {
     /// `?` / `.context()` replacement: on `Err`, record the full `{e:#}`
     /// alternate-form context chain under `field` and return `None`; on
     /// `Ok`, return `Some(value)`.
-    pub(crate) fn try_with<T>(
+    pub fn try_with<T>(
         &mut self,
         field: impl Into<String>,
         result: anyhow::Result<T>,
@@ -125,6 +134,14 @@ impl ConfigErrorBag {
         self.problems.iter().any(|p| p.field == field)
     }
 
+    /// Number of problems recorded. Read before
+    /// [`into_result`](Self::into_result) when the count is needed
+    /// alongside the consumed error (e.g. as a structured
+    /// `problem_count` log field).
+    pub const fn problem_count(&self) -> usize {
+        self.problems.len()
+    }
+
     /// Collapse the bag into a single `anyhow::Error` listing every problem
     /// as a `  - <field>: <message>` bullet, or `Ok(())` when empty.
     /// Single-line messages are reproduced verbatim; continuation lines of
@@ -135,7 +152,7 @@ impl ConfigErrorBag {
     /// `  - <field>: `, and a trailing `\n` becomes a dangling-indent blank
     /// line; neither shape is produced by the current resolvers but a future
     /// `{e:#}` source whose `Display` ends in a newline would surface it.
-    pub(crate) fn into_result(self) -> anyhow::Result<()> {
+    pub fn into_result(self) -> anyhow::Result<()> {
         if self.problems.is_empty() {
             return Ok(());
         }
