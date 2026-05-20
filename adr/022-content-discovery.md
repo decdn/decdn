@@ -182,14 +182,41 @@ Each node tracks cache miss timestamps per hash in a bounded map (`HashMap<Hash,
 
 #### Prefetch Decision
 
-A node prefetches hash H when **either** signal crosses its threshold:
+A node MAY prefetch hash H when either signal crosses its threshold, subject to operator-local policy. Prefetch is operator policy, not protocol behavior: the wire protocol carries no prefetch state, and the receiving end of any pull cannot distinguish a prefetch-driven pull from a regular cache-miss pull-through.
 
-| Signal | Default threshold | Action |
-|--------|-------------------|--------|
-| FIND_VALUE query rate for H | ≥5 queries within 5 min | DHT lookup → pull → STORE publish |
-| Local miss rate for H | ≥3 misses within 5 min | DHT lookup → pull → STORE publish |
+##### Threat model
 
-Both thresholds are configurable. Both trigger the same action: DHT FIND_VALUE lookup to find a provider, pull via `cdn/client/v1` (paid), cache locally, publish STORE record.
+Both demand signals are cheap to manufacture, since neither the FIND_VALUE wire path nor the `cdn/probe/v1` wire path requires payment or any signature beyond a QUIC NodeId. Two compositional Sybil attacks follow:
+
+1. **Demand-only Sybil.** Attacker fans out FIND_VALUE queries or `cdn/probe/v1` requests from rotating NodeIds and IPs to drive a victim's prefetch toward content the attacker chooses. Bounded above by the DHT and probe rate limits ([ADR 005 § Probe rate limiting](005-protocol.md#probe-rate-limiting)), but those bounds throttle the rate, not the existence, of the attack.
+2. **Demand-supply Sybil.** Attacker also stakes a node, publishes a synthetic blob to the DHT pointing at their own node, and Sybil-triggers the victim's prefetch for that blob. The victim's DHT FIND_VALUE for the hash returns only the attacker; the attacker is paid USDC for delivering bytes no real customer demanded. Stake is recoverable on deregister, so attacker cost is the unbond opportunity cost; revenue is `delivery_rate × blob_size` per extracted blob, bounded above by `deliveryCeiling`.
+
+Acceptance Criterion 5's reputation penalty only fires on *false* STORE records — the attacker's STORE is honest at the wire level (they really do hold the bytes they generated). The demand they manufactured is what's synthetic, and the wire protocol has no way to detect that from the publisher side.
+
+##### Recommended configuration
+
+A node MAY prefetch from popularity signals subject to a configuration block whose recommended defaults close both attacks:
+
+| Key | Recommended default | Purpose |
+|---|---|---|
+| `prefetch.enabled` | `false` | Opt-in. Operators must affirmatively choose to take on the prefetch surface — disables both signals when false. |
+| `prefetch.require_authorized_origin` | `true` | Prefetch fires for a hash only if the DHT FIND_VALUE candidate set contains at least one operator currently authorized as origin for the hash's namespace via `OriginAssignment.getOrigins(namespaceId)`, with `namespaceId == 0` resolving to the default-open allow-list (see [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority) and the read chain in [§ Origin discovery](#origin-discovery) above). Closes the demand-supply Sybil attack: an attacker has to obtain DAO-ratified origin status to bait a prefetch, which is governance-gated by timelock. The cache-tier serving role is unaffected — once any authorized origin holds the hash, cache-tier candidates compete on the unified selection score as usual. |
+| `prefetch.budget_usdc_per_hour` | operator-set, finite | Hard circuit breaker on aggregate prefetch spend over a rolling 1-hour window. Independent of the origin gate; defends the loss function even if the gate is disabled or partially defeated. The default value is operator-policy, but *some* finite cap is the load-bearing recommendation. |
+| `prefetch.find_value_threshold` | `5` queries | Signal 1 trigger: FIND_VALUE queries for hash H received within `prefetch.threshold_window_secs`. |
+| `prefetch.miss_threshold` | `3` misses | Signal 2 trigger: local cache misses for hash H within `prefetch.threshold_window_secs`. |
+| `prefetch.threshold_window_secs` | `300` | Shared rolling-window length for both trigger signals (matches the existing 5-minute LRU pruning window for the miss tracker). |
+| `prefetch.demand_quality_min_ratio` | `0.1` | Auto-throttle predicate: `served_bytes / acquired_bytes` over the rolling demand-quality window. When the ratio falls below the floor, prefetch pauses until it recovers. Detects sustained signal poisoning past the origin gate. |
+| `prefetch.demand_quality_window_secs` | `3600` | Rolling-window length for the demand-quality predicate. |
+
+`OriginAssignment` state for the gate is kept current via subscription to `AssignmentActivated`, `AssignmentRevoked`, and `DefaultOpenAllowlistUpdated` events against the local registry cache (same pattern used elsewhere for blacklist polling and channel-state queries); on RPC unavailability the gate fails closed (no prefetch) until the cache recovers.
+
+##### Scope and limits
+
+The gate governs the protocol-driven *speculative acquisition decision* only. The cache role remains permissionless: any staked operator may serve any hash they have, and the cache-miss pull-through path used to fulfill an in-flight `cdn/client/v1` `StreamRequest` from a paying customer is unaffected by these knobs (it has its own selection logic and is driven by an active paid request, not by speculative popularity inference).
+
+A publisher whose `OriginAssignment` has not yet been ratified (timelock per [ADR 009](009-governance.md#adr-009-governance-model)) does not get cache-tier propagation via prefetch during the wait — content is served from their own configured origin until ratification. Truly-unclaimed hashes (no namespace, not default-open) get no prefetch ever; operators wanting to cache them MUST explicitly pin (see [appendix-blob-cache-eviction.md § Operator pinning overrides LRU](appendix-blob-cache-eviction.md#operator-pinning-overrides-lru)).
+
+Observability for the prefetch surface is in [appendix-observability.md § Prefetch Metrics](appendix-observability.md#prefetch-metrics).
 
 #### No Discovery Fees
 
@@ -224,6 +251,6 @@ DHT STORE and FIND_VALUE operations carry no protocol-level fee. The incentive t
 4. A stale STORE record (node evicted the blob) expires within TTL (1 hour) with no explicit retraction.
 5. A false STORE record (node claims to hold a blob it doesn't) fails at the probe step; the publishing node incurs a reputation penalty within one gossip cycle.
 6. During bootstrap (routing table < k entries), the on-chain origin directory provides the fallback; routing table fully populated within 2 self-lookup rounds at PoC scale.
-7. A node observing ≥5 FIND_VALUE queries for hash H within 5 minutes initiates a prefetch for H.
+7. A node with `prefetch.enabled = true` observing a prefetch trigger for hash H (either ≥`prefetch.find_value_threshold` FIND_VALUE queries or ≥`prefetch.miss_threshold` local cache misses within `prefetch.threshold_window_secs`) initiates a prefetch for H, subject to the `prefetch.require_authorized_origin` gate (default `true`), the `prefetch.budget_usdc_per_hour` ceiling, and the demand-quality auto-throttle (see [§ Prefetch Decision](#prefetch-decision)).
 8. Demand signals derive from DHT FIND_VALUE traffic and local cache-miss timestamps; both are emitted as observability metrics in [Appendix: Observability](appendix-observability.md#appendix-observability-and-metrics).
 9. An accepted `StoreRequest`'s record TTL is anchored on the receiver's wall-clock at acceptance time (`expiry_us = receive_us + record_ttl_us`), independent of any holder-supplied timestamp.

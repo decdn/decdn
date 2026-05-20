@@ -83,6 +83,20 @@ Early warning for the three slashable offenses in [ADR 026 § Slashing and burn]
 | `decdn_cache_pinned_count` | Gauge | R | Size of the operator-pinned set (LRU-exempt). See [appendix-blob-cache-eviction.md § Operator pinning overrides LRU](appendix-blob-cache-eviction.md#operator-pinning-overrides-lru). |
 | `decdn_probe_post_eviction_failures_total` | Counter | R | `EvictedSinceProbe` responses from remote nodes during cache-hit stream requests. A sustained rate above ~1% of cache-hit attempts suggests remote hold mechanism failures ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh), [ADR 005](005-protocol.md#adr-005-wire-protocol)). |
 
+#### Prefetch Metrics
+
+Operator-policy prefetch from popularity signals per [ADR 022 § Prefetch Decision](022-content-discovery.md#prefetch-decision). All metrics are exposed regardless of whether `prefetch.enabled` is true — a node with prefetch disabled reports zero counters and `decdn_prefetch_enabled` as `0`, giving operators a uniform schema to scrape against and the DAO an off-chain signal for outlier behavior.
+
+| Metric | Type | Tier | Labels | Description |
+|--------|------|------|--------|-------------|
+| `decdn_prefetch_enabled` | Gauge | M | — | `1` if `prefetch.enabled` is true, `0` otherwise. Provides a stable schema across enabled/disabled nodes. |
+| `decdn_prefetch_acquisitions_total` | Counter | M | `signal={find_value,local_miss}`, `gate_result={authorized,unauthorized,bypassed}` | Prefetch acquisitions attempted, broken down by triggering signal and `prefetch.require_authorized_origin` gate outcome. `authorized` and `bypassed` (gate disabled) proceed to pull; `unauthorized` is a rejected attempt. |
+| `decdn_prefetch_spend_usdc_total` | Counter | M | — | Cumulative USDC paid out for prefetch acquisitions. Pairs with `decdn_prefetch_acquisitions_total{gate_result≠unauthorized}` to derive average spend per acquisition. |
+| `decdn_prefetch_budget_exhaustion_events_total` | Counter | M | — | Times `prefetch.budget_usdc_per_hour` was hit, preventing further acquisitions until the rolling window advanced. Non-zero values indicate the operator should raise the budget or investigate elevated demand-signal volume. |
+| `decdn_prefetch_origin_gate_rejections_total` | Counter | R | — | Acquisitions skipped because no candidate in the DHT FIND_VALUE result set was authorized as origin under the relevant `OriginAssignment` lookup. Identical-by-construction to `decdn_prefetch_acquisitions_total{gate_result=unauthorized}`; surfaced as a standalone counter for alerting convenience. |
+| `decdn_prefetch_demand_quality_ratio` | Gauge | R | — | Current rolling-window `served_bytes / acquired_bytes` for prefetched content. Below `prefetch.demand_quality_min_ratio` triggers the auto-throttle described in [ADR 022 § Prefetch Decision](022-content-discovery.md#prefetch-decision). |
+| `decdn_prefetch_throttle_active` | Gauge | R | — | `1` while the demand-quality auto-throttle is suppressing prefetch; `0` otherwise. |
+
 #### Probe Metrics (`cdn/probe/v1`)
 
 | Metric | Type | Tier | Labels | Description |

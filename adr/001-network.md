@@ -71,7 +71,7 @@ The struct above is a flat definition for readability. [ADR 013](013-schema-evol
 
 `LoadHint` is advisory and untrusted. The reputation system ([ADR 008](008-reputation.md#adr-008-reputation-system)) penalizes nodes whose observed delivery performance contradicts their advertised load.
 
-- **`NodeAnnounce` carries node-level metadata only** — no content inventory and no demand signals. Content discovery and demand are derived from DHT FIND_VALUE traffic and local cache-miss timestamps (see Prefetch Triggers below). Message size is ~150 bytes.
+- **`NodeAnnounce` carries node-level metadata only** — no content inventory and no demand signals. Content discovery and demand are derived from DHT FIND_VALUE traffic and local cache-miss timestamps (see [ADR 022 § Popularity Signals and Market Dynamics](022-content-discovery.md#popularity-signals-and-market-dynamics)). Message size is ~150 bytes.
 - **`LoadHint`** makes the "approximate load in gossip announcements" from [ADR 008, Tie-Breaking](008-reputation.md#tie-breaking) concrete, feeding tie-breaking logic.
 - **Announce interval** is a per-node configuration parameter (default 60 seconds). This interval directly governs gossip bandwidth — see [Gossip Bandwidth Analysis](#gossip-bandwidth-analysis) below.
 
