@@ -39,7 +39,7 @@ iroh's built-in `DhtDiscovery` (mainline BitTorrent DHT via pkarr) is unrelated 
 
 ## Decision
 
-`cdn/dht/v1` is the **primary content discovery mechanism from day one**, including PoC. The DHT bootstraps from `StakingRegistry.getActiveNodes()` — a freshly-started node's first peers come from the on-chain registry and immediately participate in DHT lookups, so there is no separate bootstrap window during which DHT cannot resolve. When a DHT lookup returns no providers, the on-chain origin directory (§ Origin discovery below) is the deterministic last-resort fallback. Broadcast probe fan-out is not part of the protocol. There is no phased rollout — the DHT is always on.
+`cdn/dht/v1` is the **primary content discovery mechanism from day one**, including PoC. The DHT bootstraps from `StakingRegistry.getActiveNodes()` — a freshly-started node's first peers come from the on-chain registry and immediately participate in DHT lookups, so there is no separate bootstrap window during which DHT cannot resolve. When a DHT lookup returns no providers, the on-chain origin directory is the deterministic last-resort fallback. Broadcast probe fan-out is not part of the protocol. There is no phased rollout — the DHT is always on.
 
 ### `cdn/dht/v1` Protocol
 
@@ -145,7 +145,7 @@ When a node gets a cache miss for hash H and the probe cache is empty:
 
 **Provider ordering.** When a responder returns multiple providers in `FindValueResponse.providers`, the order SHOULD be randomized so probe traffic spreads across the set rather than concentrating on whichever provider was inserted first. The wire protocol does not enforce per-responder ordering (operators can run modified implementations); randomization is the recommended default.
 
-**Fallback:** if DHT returns no providers, fall back to the on-chain origin directory (§ Origin discovery below). If that also returns nothing, the blob is not available in the network.
+**Fallback:** if DHT returns no providers, fall back to the on-chain origin directory. If that also returns nothing, the blob is not available in the network.
 
 **Origin discovery.** A requester that prefers an authorized origin for a hash (e.g., a cache-miss pull where freshness from a publisher-committed source is desirable) discovers candidates through the standard DHT path. The DHT does not discriminate origin vs cache providers — `StoreRequest` is the same wire format regardless of role — so any holder may publish a record. The wire protocol does not surface origin-vs-cache status at probe time either; the requester resolves origin status off-chain by reading `PublisherRegistry.namespaceOf(hash)` and `OriginAssignment.getOrigins(namespaceId)` and intersecting against the probed peer set.
 
@@ -158,7 +158,7 @@ On node startup:
 1. Build initial routing table from the on-chain registry peer list (same source as the peer table bootstrap in [ADR 019](019-node-onboarding.md#adr-019-node-onboarding-and-bootstrapping-flow)).
 2. Issue `FindNode(self.node_id)` to initial peers — standard Kademlia self-lookup that populates k-buckets.
 
-The registry-seeded peer list participates in DHT lookups immediately, so there is no separate bootstrap window during which content discovery is unavailable. If a `FindValue` lookup returns no providers during the first few seconds — before k-buckets are populated — the on-chain origin directory (§ Origin discovery above) provides the deterministic fallback. At PoC scale (30 nodes) the routing table is fully populated after a single self-lookup round.
+The registry-seeded peer list participates in DHT lookups immediately, so there is no separate bootstrap window during which content discovery is unavailable. If a `FindValue` lookup returns no providers during the first few seconds — before k-buckets are populated — the on-chain origin directory provides the deterministic fallback. At PoC scale (30 nodes) the routing table is fully populated after a single self-lookup round.
 
 ### Popularity Signals and Market Dynamics
 
@@ -200,7 +200,7 @@ A node MAY prefetch from popularity signals subject to a configuration block who
 | Key | Recommended default | Purpose |
 |---|---|---|
 | `prefetch.enabled` | `false` | Opt-in. Operators must affirmatively choose to take on the prefetch surface — disables both signals when false. |
-| `prefetch.require_authorized_origin` | `true` | Prefetch fires for a hash only if the DHT FIND_VALUE candidate set contains at least one operator currently authorized as origin for the hash's namespace via `OriginAssignment.getOrigins(namespaceId)`, with `namespaceId == 0` resolving to the default-open allow-list (see [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority) and the read chain in [§ Origin discovery](#origin-discovery) above). Closes the demand-supply Sybil attack: an attacker has to obtain DAO-ratified origin status to bait a prefetch, which is governance-gated by timelock. The cache-tier serving role is unaffected — once any authorized origin holds the hash, cache-tier candidates compete on the unified selection score as usual. |
+| `prefetch.require_authorized_origin` | `true` | Prefetch fires for a hash only if the DHT FIND_VALUE candidate set contains at least one operator currently authorized as origin for the hash's namespace via `OriginAssignment.getOrigins(namespaceId)`, with `namespaceId == 0` resolving to the default-open allow-list (see [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority)). Closes the demand-supply Sybil attack: an attacker has to obtain DAO-ratified origin status to bait a prefetch, which is governance-gated by timelock. The cache-tier serving role is unaffected — once any authorized origin holds the hash, cache-tier candidates compete on the unified selection score as usual. |
 | `prefetch.budget_usdc_per_hour` | operator-set, finite | Hard circuit breaker on aggregate prefetch spend over a rolling 1-hour window. Independent of the origin gate; defends the loss function even if the gate is disabled or partially defeated. The default value is operator-policy, but *some* finite cap is the load-bearing recommendation. |
 | `prefetch.find_value_threshold` | `5` queries | Signal 1 trigger: FIND_VALUE queries for hash H received within `prefetch.threshold_window_secs`. |
 | `prefetch.miss_threshold` | `3` misses | Signal 2 trigger: local cache misses for hash H within `prefetch.threshold_window_secs`. |
