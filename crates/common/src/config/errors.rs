@@ -39,13 +39,13 @@ struct ConfigProblem {
 /// Accumulates every problem found during a single `resolve_config` pass.
 ///
 /// Threaded by `&mut` through the `*_into` section workers. Callers record
-/// problems via [`check`](Self::check) (the `anyhow::ensure!` replacement)
-/// and [`try_with`](Self::try_with) (the `?`/`.context()` replacement),
+/// problems via `check` (the `anyhow::ensure!` replacement) and
+/// [`try_with`](Self::try_with) (the `?`/`.context()` replacement),
 /// substituting a placeholder for any value they could not resolve so
 /// later independent checks still run.
 ///
 /// Insertion order is preserved end-to-end: [`into_result`](Self::into_result)
-/// renders bullets in the same order they were [`push`](Self::push)ed, so
+/// renders bullets in the same order they were `push`ed, so
 /// resolver authors can rely on operator-facing problem order matching the
 /// order of validation logic, and tests that pin specific output order keep
 /// working through future refactors.
@@ -68,7 +68,7 @@ impl ConfigErrorBag {
     }
 
     /// Record a problem under `field` with `message`.
-    pub fn push(&mut self, field: impl Into<String>, message: impl Into<String>) {
+    pub(crate) fn push(&mut self, field: impl Into<String>, message: impl Into<String>) {
         self.problems.push(ConfigProblem {
             field: field.into(),
             message: message.into(),
@@ -78,7 +78,7 @@ impl ConfigErrorBag {
     /// `anyhow::ensure!` replacement for a static message: record `message`
     /// under `field` when `cond` is false. Returns `cond` so callers can
     /// branch and skip a dependent check or substitute a placeholder.
-    pub fn check(
+    pub(crate) fn check(
         &mut self,
         cond: bool,
         field: impl Into<String>,
@@ -94,7 +94,7 @@ impl ConfigErrorBag {
     /// when `cond` is false, matching `anyhow::ensure!`'s format-on-failure
     /// behaviour so the happy path allocates nothing for `format!(...)`
     /// messages.
-    pub fn check_with(
+    pub(crate) fn check_with(
         &mut self,
         cond: bool,
         field: impl Into<String>,
@@ -128,10 +128,18 @@ impl ConfigErrorBag {
     /// Match is exact-string, not prefix: a problem recorded under
     /// `cache.origins[0]` does *not* make `has_field("cache.origins")`
     /// true. Cascade guards must use the same label the producing site
-    /// used (see `IDENTITY_REGION` / `IDENTITY_DATA_DIR` for the
+    /// used (see [`IDENTITY_REGION`] / [`IDENTITY_DATA_DIR`] for the
     /// labels currently participating in guards).
-    pub fn has_field(&self, field: &str) -> bool {
+    pub(crate) fn has_field(&self, field: &str) -> bool {
         self.problems.iter().any(|p| p.field == field)
+    }
+
+    /// Number of problems recorded so far. Useful for emitting a
+    /// structured `problem_count` field on the aggregated reload-failure
+    /// warn line in `runtime::reload`, where the consuming `into_result`
+    /// would otherwise force a `.matches(...).count()` over the message.
+    pub const fn problem_count(&self) -> usize {
+        self.problems.len()
     }
 
     /// Collapse the bag into a single `anyhow::Error` listing every problem

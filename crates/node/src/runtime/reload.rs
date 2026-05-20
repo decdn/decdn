@@ -40,10 +40,11 @@
 //!    section (the all-or-nothing contract). Resolved values are stashed
 //!    in a per-section buffer cell (`Mutex<Option<Self::Resolved>>`) so
 //!    the trait stays `dyn`-safe despite each section having its own
-//!    `Resolved` type; sections that contributed problems to the bag
-//!    still leave a sentinel value in their buffer, but the early return
-//!    skips the swap phase and the next reload's `clear_buffer` evicts
-//!    it before anything else runs.
+//!    `Resolved` type. Every section populates its buffer on every
+//!    resolve — a real value when validation passed, a sentinel /
+//!    placeholder when the section pushed to the bag — but the early
+//!    return skips the swap phase, and the next reload's `clear_buffer`
+//!    evicts any sentinel before anything else runs.
 //! 2. **Run every `fallible_commit`.** The log-level filter swap is the
 //!    only currently-fallible commit. This phase is the rollback
 //!    boundary: commits already applied stay applied; a later failure
@@ -918,12 +919,14 @@ impl RuntimeReloadState {
         for section in &self.sections {
             section.resolve(&file, &mut bag);
         }
+        let problem_count = bag.problem_count();
         if let Err(err) = bag.into_result() {
             tracing::warn!(
                 %err,
+                problem_count,
                 "config reload aborted; entire reload rolled back \
-                 (all-or-nothing): payment, observability, cache.pinned_hashes, \
-                 and security all retained at their previous values",
+                 (all-or-nothing) — all reloadable sections retained at \
+                 their previous values",
             );
             return Err(err);
         }
