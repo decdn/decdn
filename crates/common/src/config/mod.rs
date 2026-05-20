@@ -2,6 +2,7 @@
 //!
 //! Three-layer merge: CLI flags > TOML config file > built-in defaults.
 
+mod errors;
 pub mod resolved;
 pub mod secret;
 pub mod types;
@@ -10,6 +11,8 @@ use std::path::{Path, PathBuf};
 
 use alloy::primitives::Address;
 use anyhow::Context;
+
+use errors::{ConfigErrorBag, IDENTITY_DATA_DIR, IDENTITY_REGION, one_section};
 
 use crate::cli::common::{self, expand_tilde};
 use crate::cli::run::RunArgs;
@@ -33,7 +36,8 @@ const DEFAULT_CACHE_SIZE_MB: u64 = 10_240;
 ///
 /// Deliberately well below `DEFAULT_CACHE_SIZE_MB` so a single oversized
 /// blob can't saturate the entire cache and evict all other content in
-/// one fetch. See [`resolve_cache`] for the accompanying invariant.
+/// one fetch. The `max_blob_size_mb < cache_size_mb` invariant is enforced
+/// at config load (see `resolve_cache_into`).
 const DEFAULT_MAX_BLOB_SIZE_MB: u64 = 1_024;
 /// Default rate per MB in USDC base units ($0.00001/MB).
 const DEFAULT_RATE_PER_MB: u64 = 10;
@@ -109,23 +113,50 @@ pub const DEFAULT_MAX_PROBE_HOLDS: usize = decdn_config_types::DEFAULT_MAX_PROBE
 ///   `staking_registry_address`) is not provided by any source.
 /// - The home directory cannot be determined for default paths.
 pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Result<ResolvedConfig> {
+    // `load_file_config` stays fail-fast: a file we could not read, parse,
+    // or env-expand never produced a `FileConfig`, so there is nothing to
+    // validate. Everything *after* this accumulates into one `bag` so an
+    // operator sees every problem in a single pass.
     let file = load_file_config(config_path)?;
 
-    let identity = resolve_identity(&cli.identity, file.identity.as_ref())?;
+    let mut bag = ConfigErrorBag::new();
+
+    let identity = resolve_identity_into(&cli.identity, file.identity.as_ref(), &mut bag);
+    // A region that was supplied but failed `normalize_region` is already
+    // reported under `identity.region`; the cross-section publish check
+    // must not also fire (see `ensure_region_when_publishing_global_into`).
+    // A data_dir we could not determine becomes a `/nonexistent` placeholder
+    // (see `resolve_identity_into`); the keystore/cache-dir derived from it
+    // would surface as a "cannot access" cascade on top of the real
+    // `identity.data_dir` problem, so downstream resolvers skip path-existence
+    // checks driven off it when `data_dir_valid` is false. The placeholder
+    // never escapes `resolve_config`: `bag.into_result()?` below fails before
+    // the materialized `ResolvedConfig` is returned to the caller.
+    let data_dir_valid = !bag.has_field(IDENTITY_DATA_DIR);
     let network = resolve_network(&cli.network, file.network.as_ref());
-    let blockchain = resolve_blockchain(
+    let blockchain = resolve_blockchain_into(
         &cli.blockchain,
         file.blockchain.as_ref(),
         &identity.data_dir,
-    )?;
-    let cache = resolve_cache(&cli.cache, file.cache.as_ref(), &identity.data_dir)?;
-    let payment = resolve_payment(&cli.payment, file.payment.as_ref())?;
-    let observability = resolve_observability(&cli.observability, file.observability.as_ref())?;
-    let gossip = resolve_gossip(file.gossip.as_ref())?;
-    let security = resolve_security(file.security.as_ref())?;
+        data_dir_valid,
+        &mut bag,
+    );
+    let cache = resolve_cache_into(
+        &cli.cache,
+        file.cache.as_ref(),
+        &identity.data_dir,
+        &mut bag,
+    );
+    let payment = resolve_payment_into(&cli.payment, file.payment.as_ref(), &mut bag);
+    let observability =
+        resolve_observability_into(&cli.observability, file.observability.as_ref(), &mut bag);
+    let gossip = resolve_gossip_into(file.gossip.as_ref(), &mut bag);
+    let security = resolve_security_into(file.security.as_ref(), &mut bag);
 
-    ensure_region_when_publishing_global(&identity, &gossip)?;
-    validate_port_layout(&network, &observability)?;
+    ensure_region_when_publishing_global_into(&identity, &gossip, &mut bag);
+    validate_port_layout_into(&network, &observability, &mut bag);
+
+    bag.into_result()?;
 
     Ok(ResolvedConfig {
         identity,
@@ -145,17 +176,37 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
 /// Region subscription is separately gated on `identity.region.is_some()` in
 /// `GossipService::spawn`, so only the global-topic case needs an interlock:
 /// if global is off and no region is set, the service runs as a no-op.
+// Single-section shim preserving the `anyhow::Result` API the unit tests
+// call directly; `resolve_config` uses the `*_into` worker with the
+// shared bag instead, so this is test-only.
+#[cfg(test)]
 fn ensure_region_when_publishing_global(
     identity: &ResolvedIdentity,
     gossip: &ResolvedGossip,
 ) -> anyhow::Result<()> {
-    anyhow::ensure!(
+    one_section(|bag| ensure_region_when_publishing_global_into(identity, gossip, bag))
+}
+
+fn ensure_region_when_publishing_global_into(
+    identity: &ResolvedIdentity,
+    gossip: &ResolvedGossip,
+    bag: &mut ConfigErrorBag,
+) {
+    // If the operator *did* supply a region but it failed
+    // `normalize_region`, that single problem is already in the bag under
+    // `identity.region`. Reporting "region must be set when subscribe_global
+    // is true" on top of it would be misleading double-counting — they set
+    // it, it was just malformed. Suppress the cascade.
+    if bag.has_field(IDENTITY_REGION) {
+        return;
+    }
+    bag.check(
         identity.region.is_some() || !gossip.subscribe_global,
+        IDENTITY_REGION,
         "identity.region must be set when gossip.subscribe_global is true \
          (it signs every NodeAnnounce); set identity.region or disable the \
-         global topic by setting gossip.subscribe_global = false"
+         global topic by setting gossip.subscribe_global = false",
     );
-    Ok(())
 }
 
 /// Cross-section check on the running node's port assignments. Lives at the
@@ -180,21 +231,38 @@ fn ensure_region_when_publishing_global(
 ///
 /// Uses `eprintln!` rather than `tracing::warn!` because `tracing` is not
 /// yet initialized at `resolve_config` time (see `commands::run`).
+#[cfg(test)]
 fn validate_port_layout(
     network: &ResolvedNetwork,
     observability: &ResolvedObservability,
 ) -> anyhow::Result<()> {
+    one_section(|bag| validate_port_layout_into(network, observability, bag))
+}
+
+fn validate_port_layout_into(
+    network: &ResolvedNetwork,
+    observability: &ResolvedObservability,
+    bag: &mut ConfigErrorBag,
+) {
     let bind = network.bind_port;
     let metrics = observability.metrics_port;
     let admin = observability.admin_port;
 
-    // bind vs metrics — UDP/TCP, same-number operator typo.
+    // bind vs metrics — UDP/TCP, same-number operator typo. The three pair
+    // checks are independent: accumulate every collision so an operator who
+    // set all three equal sees all of them, not just the first. Each pair
+    // gets a distinct label encoding both fields, so the bag can carry all
+    // three problems without two collisions colliding under one key (and so
+    // a future `has_field` guard could pick out a specific pair).
     if bind != 0 && metrics != 0 {
-        anyhow::ensure!(
+        bag.check_with(
             bind != metrics,
-            "network.bind_port ({bind}) must differ from observability.metrics_port ({metrics}); \
-             QUIC (UDP) and metrics (TCP) would not collide at bind time, but sharing \
-             the same port number is almost certainly an operator typo",
+            "network.bind_port vs observability.metrics_port",
+            || format!(
+                "network.bind_port ({bind}) must differ from observability.metrics_port ({metrics}); \
+                 QUIC (UDP) and metrics (TCP) would not collide at bind time, but sharing \
+                 the same port number is almost certainly an operator typo"
+            ),
         );
     }
 
@@ -203,11 +271,14 @@ fn validate_port_layout(
         && bind != 0
         && admin != 0
     {
-        anyhow::ensure!(
+        bag.check_with(
             bind != admin,
-            "network.bind_port ({bind}) must differ from observability.admin_port ({admin}); \
-             QUIC (UDP) and admin (TCP) would not collide at bind time, but sharing \
-             the same port number is almost certainly an operator typo",
+            "network.bind_port vs observability.admin_port",
+            || format!(
+                "network.bind_port ({bind}) must differ from observability.admin_port ({admin}); \
+                 QUIC (UDP) and admin (TCP) would not collide at bind time, but sharing \
+                 the same port number is almost certainly an operator typo"
+            ),
         );
     }
 
@@ -216,10 +287,13 @@ fn validate_port_layout(
         && metrics != 0
         && admin != 0
     {
-        anyhow::ensure!(
+        bag.check_with(
             admin != metrics,
-            "observability.admin_port ({admin}) must differ from observability.metrics_port ({metrics}); \
-             the two servers cannot share a TCP port",
+            "observability.admin_port vs observability.metrics_port",
+            || format!(
+                "observability.admin_port ({admin}) must differ from observability.metrics_port ({metrics}); \
+                 the two servers cannot share a TCP port"
+            ),
         );
     }
 
@@ -238,15 +312,22 @@ fn validate_port_layout(
             );
         }
     }
-
-    Ok(())
 }
 
 /// Resolve identity fields.
+#[cfg(test)]
 fn resolve_identity(
     cli: &crate::cli::run::IdentityArgs,
     file: Option<&types::IdentityConfig>,
 ) -> anyhow::Result<ResolvedIdentity> {
+    one_section(|bag| resolve_identity_into(cli, file, bag))
+}
+
+fn resolve_identity_into(
+    cli: &crate::cli::run::IdentityArgs,
+    file: Option<&types::IdentityConfig>,
+    bag: &mut ConfigErrorBag,
+) -> ResolvedIdentity {
     let data_dir = cli
         .data_dir
         .clone()
@@ -256,16 +337,30 @@ fn resolve_identity(
                 .map(|p| expand_tilde(&p))
         })
         .or_else(common::default_data_dir)
-        .ok_or_else(|| anyhow::anyhow!("cannot determine data directory: home dir not found"))?;
+        .unwrap_or_else(|| {
+            // Placeholder so blockchain/cache resolution keeps running and
+            // accumulating their own problems. The placeholder never escapes:
+            // `resolve_config` derives `data_dir_valid` from
+            // `bag.has_field(IDENTITY_DATA_DIR)` and stops path-existence
+            // cascades; the materialized `ResolvedConfig` carrying the
+            // placeholder is dropped when `bag.into_result()?` short-circuits.
+            bag.push(
+                IDENTITY_DATA_DIR,
+                "cannot determine data directory: home dir not found",
+            );
+            PathBuf::from("/nonexistent")
+        });
 
-    let region = cli
+    let region = match cli
         .region
         .clone()
         .or_else(|| file.and_then(|i| i.region.clone()))
-        .map(|r| normalize_region(&r))
-        .transpose()?;
+    {
+        Some(raw) => bag.try_with(IDENTITY_REGION, normalize_region(&raw)),
+        None => None,
+    };
 
-    Ok(ResolvedIdentity { data_dir, region })
+    ResolvedIdentity { data_dir, region }
 }
 
 /// Normalize an operator-supplied region code: uppercase it and require
@@ -324,38 +419,118 @@ fn parse_contract_address(flag_name: &str, raw: &str) -> anyhow::Result<String> 
     Ok(addr.to_checksum(None))
 }
 
+/// `metadata`/`is_file`/`File::open` triad proving the keystore path
+/// exists, is a regular file, and is readable. Kept as one fail-fast
+/// `Result` (the three steps are sequentially dependent — one keystore
+/// problem, not three) and routed through the bag by the caller so a
+/// bad keystore doesn't abort the rest of blockchain resolution.
+fn check_keystore_readable(path: &std::path::Path) -> anyhow::Result<()> {
+    let meta = std::fs::metadata(path)
+        .with_context(|| format!("invalid eth_keystore: cannot access {}", path.display()))?;
+    anyhow::ensure!(
+        meta.is_file(),
+        "invalid eth_keystore: {} is not a regular file",
+        path.display()
+    );
+    std::fs::File::open(path).with_context(|| {
+        format!(
+            "invalid eth_keystore: cannot open {} for reading",
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+/// Resolve a required contract address: record the "missing required
+/// option" problem when absent, or the parse/checksum problem when
+/// malformed, and return the canonical checksummed form (empty-string
+/// placeholder on failure so resolution keeps accumulating).
+fn resolve_contract_address(
+    field: &str,
+    flag_name: &str,
+    missing_msg: &str,
+    raw: Option<String>,
+    bag: &mut ConfigErrorBag,
+) -> String {
+    match raw.filter(|s| !s.is_empty()) {
+        None => {
+            bag.push(field, missing_msg);
+            String::new()
+        }
+        Some(v) => bag
+            .try_with(field, parse_contract_address(flag_name, &v))
+            .unwrap_or_default(),
+    }
+}
+
 /// Resolve blockchain fields.
-// Linear field-by-field resolution (rpc_url, keystore, three contract
-// addresses, chain_id, watchdog) — splitting it would scatter the
-// "missing required option" error wording that tests assert on.
-#[allow(clippy::too_many_lines)]
+#[cfg(test)]
 fn resolve_blockchain(
     cli: &crate::cli::run::BlockchainArgs,
     file: Option<&types::BlockchainConfig>,
     data_dir: &std::path::Path,
 ) -> anyhow::Result<ResolvedBlockchain> {
-    let rpc_url = cli
+    one_section(|bag| resolve_blockchain_into(cli, file, data_dir, true, bag))
+}
+
+// Linear field-by-field resolution (rpc_url, keystore, three contract
+// addresses, chain_id, watchdog) — splitting it would scatter the
+// "missing required option" error wording that tests assert on.
+#[allow(clippy::too_many_lines)]
+fn resolve_blockchain_into(
+    cli: &crate::cli::run::BlockchainArgs,
+    file: Option<&types::BlockchainConfig>,
+    data_dir: &std::path::Path,
+    data_dir_valid: bool,
+    bag: &mut ConfigErrorBag,
+) -> ResolvedBlockchain {
+    let rpc_url = match cli
         .rpc_url
         .clone()
         .or_else(|| file.and_then(|b| b.rpc_url.clone()))
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "missing required option: --rpc-url (or blockchain.rpc_url in config file)"
-            )
-        })?;
+    {
+        None => {
+            bag.push(
+                "blockchain.rpc_url",
+                "missing required option: --rpc-url (or blockchain.rpc_url in config file)",
+            );
+            // Placeholder; skip the URL parse + scheme checks below — a
+            // synthesized URL would only emit a misleading second error.
+            String::new()
+        }
+        Some(raw) => {
+            match bag.try_with(
+                "blockchain.rpc_url",
+                url::Url::parse(&raw).context("blockchain.rpc_url is not a valid URL"),
+            ) {
+                None => String::new(),
+                Some(parsed) => {
+                    if bag.check_with(
+                        parsed.scheme() == "http" || parsed.scheme() == "https",
+                        "blockchain.rpc_url",
+                        || {
+                            format!(
+                                "blockchain.rpc_url must use http or https scheme (got {:?})",
+                                parsed.scheme()
+                            )
+                        },
+                    ) {
+                        // Store the normalized form (lowercase scheme,
+                        // trailing slash, etc.). Userinfo (basic auth) is
+                        // preserved by `url::Url::to_string` and we depend
+                        // on that for RPC providers that require it.
+                        parsed.to_string()
+                    } else {
+                        String::new()
+                    }
+                }
+            }
+        }
+    };
 
-    let parsed = url::Url::parse(&rpc_url).context("blockchain.rpc_url is not a valid URL")?;
-    anyhow::ensure!(
-        parsed.scheme() == "http" || parsed.scheme() == "https",
-        "blockchain.rpc_url must use http or https scheme (got {:?})",
-        parsed.scheme()
-    );
-    // Store the normalized form (lowercase scheme, trailing slash, etc.).
-    // Userinfo (basic auth) is preserved by url::Url::to_string and we
-    // depend on that for RPC providers that require it.
-    let rpc_url = parsed.to_string();
-
+    let keystore_from_cli_or_file =
+        cli.eth_keystore.is_some() || file.and_then(|b| b.eth_keystore.as_ref()).is_some();
     let eth_keystore = cli
         .eth_keystore
         .clone()
@@ -366,83 +541,70 @@ fn resolve_blockchain(
         })
         .unwrap_or_else(|| data_dir.join("keystore.json"));
 
-    // Fail fast: otherwise a bad keystore path only surfaces at first sign.
-    // `metadata`/`is_file` catches missing paths, broken symlinks, and
-    // directories (which `File::open` silently accepts on Linux); `File::open`
-    // then proves read permission.
-    let meta = std::fs::metadata(&eth_keystore).with_context(|| {
-        format!(
-            "invalid eth_keystore: cannot access {}",
-            eth_keystore.display()
-        )
-    })?;
-    anyhow::ensure!(
-        meta.is_file(),
-        "invalid eth_keystore: {} is not a regular file",
-        eth_keystore.display()
+    // An explicitly-set keystore path (CLI/file) is always validated. A
+    // *defaulted* keystore is validated only when data_dir resolved: when
+    // data_dir itself failed, the keystore path is `/nonexistent/keystore.json`
+    // and a "cannot access" error here is pure cascade noise on top of the
+    // real `identity.data_dir` problem (which already fails resolution), so
+    // the skip is deliberate cascade-suppression, not an unchecked hole.
+    if keystore_from_cli_or_file || data_dir_valid {
+        bag.try_with(
+            "blockchain.eth_keystore",
+            check_keystore_readable(&eth_keystore),
+        );
+    }
+
+    let payment_channel_address = resolve_contract_address(
+        "blockchain.payment_channel_address",
+        "payment_channel_address",
+        "missing required option: --payment-channel-address \
+         (or blockchain.payment_channel_address in config file)",
+        cli.payment_channel_address
+            .clone()
+            .or_else(|| file.and_then(|b| b.payment_channel_address.clone())),
+        bag,
     );
-    std::fs::File::open(&eth_keystore).with_context(|| {
-        format!(
-            "invalid eth_keystore: cannot open {} for reading",
-            eth_keystore.display()
-        )
-    })?;
 
-    let payment_channel_address = cli
-        .payment_channel_address
-        .clone()
-        .or_else(|| file.and_then(|b| b.payment_channel_address.clone()))
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "missing required option: --payment-channel-address \
-                 (or blockchain.payment_channel_address in config file)"
-            )
-        })?;
-    let payment_channel_address =
-        parse_contract_address("payment_channel_address", &payment_channel_address)?;
-
-    let staking_registry_address = cli
-        .staking_registry_address
-        .clone()
-        .or_else(|| file.and_then(|b| b.staking_registry_address.clone()))
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "missing required option: --staking-registry-address \
-                 (or blockchain.staking_registry_address in config file)"
-            )
-        })?;
-    let staking_registry_address =
-        parse_contract_address("staking_registry_address", &staking_registry_address)?;
+    let staking_registry_address = resolve_contract_address(
+        "blockchain.staking_registry_address",
+        "staking_registry_address",
+        "missing required option: --staking-registry-address \
+         (or blockchain.staking_registry_address in config file)",
+        cli.staking_registry_address
+            .clone()
+            .or_else(|| file.and_then(|b| b.staking_registry_address.clone())),
+        bag,
+    );
 
     // Required like the other contract addresses: a wrong/zero
     // `verifyingContract` silently produces `slash_sig`s no verifier accepts
-    // (ADR 014 §1), so fail fast rather than default to a placeholder.
-    let slash_judge_address = cli
-        .slash_judge_address
-        .clone()
-        .or_else(|| file.and_then(|b| b.slash_judge_address.clone()))
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "missing required option: --slash-judge-address \
-                 (or blockchain.slash_judge_address in config file)"
-            )
-        })?;
-    let slash_judge_address = parse_contract_address("slash_judge_address", &slash_judge_address)?;
+    // (ADR 014 §1).
+    let slash_judge_address = resolve_contract_address(
+        "blockchain.slash_judge_address",
+        "slash_judge_address",
+        "missing required option: --slash-judge-address \
+         (or blockchain.slash_judge_address in config file)",
+        cli.slash_judge_address
+            .clone()
+            .or_else(|| file.and_then(|b| b.slash_judge_address.clone())),
+        bag,
+    );
     // The all-zero address is syntactically valid but is never a real
     // `SlashJudge` deployment; signing against it produces `slash_sig`s no
-    // verifier can attribute (ADR 014 §1). Reject it explicitly rather than
-    // letting the node start in a silently-broken state.
-    anyhow::ensure!(
-        slash_judge_address
-            .trim_start_matches("0x")
-            .bytes()
-            .any(|b| b != b'0'),
-        "blockchain.slash_judge_address must not be the zero address — \
-         set it to the deployed SlashJudge contract (ADR 014 §1)"
-    );
+    // verifier can attribute (ADR 014 §1). Only meaningful once the address
+    // itself parsed — a placeholder empty string here just means the
+    // missing/parse problem is already recorded, so skip the cascade.
+    if !slash_judge_address.is_empty() {
+        bag.check(
+            slash_judge_address
+                .trim_start_matches("0x")
+                .bytes()
+                .any(|b| b != b'0'),
+            "blockchain.slash_judge_address",
+            "blockchain.slash_judge_address must not be the zero address — \
+             set it to the deployed SlashJudge contract (ADR 014 §1)",
+        );
+    }
 
     let chain_id = cli
         .chain_id
@@ -452,22 +614,28 @@ fn resolve_blockchain(
     // (and the runtime signer). Chain id 0 is not a real network; signing
     // against it produces `slash_sig`s no `SlashJudge` can verify — the same
     // silently-broken-but-running failure mode the zero-`slash_judge_address`
-    // check below prevents. Fail fast (ADR 014 §1).
-    anyhow::ensure!(
-        chain_id != 0,
-        "blockchain.chain_id must not be 0 — set it to the deployed L2 \
-         chain id (default {DEFAULT_CHAIN_ID}, Arbitrum Sepolia)"
-    );
+    // check above prevents.
+    bag.check_with(chain_id != 0, "blockchain.chain_id", || {
+        format!(
+            "blockchain.chain_id must not be 0 — set it to the deployed L2 \
+             chain id (default {DEFAULT_CHAIN_ID}, Arbitrum Sepolia)"
+        )
+    });
 
     let rpc_watchdog_interval_sec = file
         .and_then(|b| b.rpc_watchdog_interval_sec)
         .unwrap_or(DEFAULT_RPC_WATCHDOG_INTERVAL_SEC);
-    anyhow::ensure!(
+    bag.check_with(
         rpc_watchdog_interval_sec == 0
             || rpc_watchdog_interval_sec >= MIN_RPC_WATCHDOG_INTERVAL_SEC,
-        "blockchain.rpc_watchdog_interval_sec={rpc_watchdog_interval_sec} \
-         would flood the RPC endpoint (minimum {MIN_RPC_WATCHDOG_INTERVAL_SEC}s, \
-         or 0 to disable)"
+        "blockchain.rpc_watchdog_interval_sec",
+        || {
+            format!(
+                "blockchain.rpc_watchdog_interval_sec={rpc_watchdog_interval_sec} \
+             would flood the RPC endpoint (minimum {MIN_RPC_WATCHDOG_INTERVAL_SEC}s, \
+             or 0 to disable)"
+            )
+        },
     );
 
     // CLI/env only — no TOML field. `expand_tilde` for parity with the
@@ -477,7 +645,7 @@ fn resolve_blockchain(
     // clearer than a config-resolution-time stat() error.
     let keystore_password_file = cli.keystore_password_file.clone().map(|p| expand_tilde(&p));
 
-    Ok(ResolvedBlockchain {
+    ResolvedBlockchain {
         rpc_url,
         eth_keystore,
         keystore_password_file,
@@ -486,7 +654,7 @@ fn resolve_blockchain(
         slash_judge_address,
         chain_id,
         rpc_watchdog_interval_sec,
-    })
+    }
 }
 
 /// Resolve cache fields.
@@ -497,11 +665,21 @@ fn resolve_blockchain(
 /// than a useful cache. Equality is rejected along with the greater-than
 /// case because a cache that can hold exactly one blob has the same
 /// failure mode as one that overflows.
+#[cfg(test)]
 fn resolve_cache(
     cli: &crate::cli::run::CacheArgs,
     file: Option<&types::CacheConfig>,
     data_dir: &std::path::Path,
 ) -> anyhow::Result<ResolvedCache> {
+    one_section(|bag| resolve_cache_into(cli, file, data_dir, bag))
+}
+
+fn resolve_cache_into(
+    cli: &crate::cli::run::CacheArgs,
+    file: Option<&types::CacheConfig>,
+    data_dir: &std::path::Path,
+    bag: &mut ConfigErrorBag,
+) -> ResolvedCache {
     let cache_dir = cli
         .cache_dir
         .clone()
@@ -522,20 +700,35 @@ fn resolve_cache(
         .or_else(|| file.and_then(|c| c.max_blob_size_mb))
         .unwrap_or(DEFAULT_MAX_BLOB_SIZE_MB);
 
-    anyhow::ensure!(
+    bag.check_with(
         max_blob_size_mb < cache_size_mb,
-        "cache.max_blob_size_mb ({max_blob_size_mb}) must be strictly less than \
-         cache.cache_size_mb ({cache_size_mb}); otherwise a single oversized blob \
-         can saturate the cache on one fetch"
+        "cache.max_blob_size_mb",
+        || {
+            format!(
+                "cache.max_blob_size_mb ({max_blob_size_mb}) must be strictly less than \
+             cache.cache_size_mb ({cache_size_mb}); otherwise a single oversized blob \
+             can saturate the cache on one fetch"
+            )
+        },
     );
 
-    let origins = resolve_origins(file)?;
+    let origins = resolve_origins_into(file, bag);
 
-    let pinned_hashes = parse_pinned_hashes(file.and_then(|c| c.pinned_hashes.as_deref()))
-        .context("invalid cache.pinned_hashes")?;
+    let pinned_hashes = bag
+        .try_with(
+            "cache.pinned_hashes",
+            parse_pinned_hashes(file.and_then(|c| c.pinned_hashes.as_deref()))
+                .context("invalid cache.pinned_hashes"),
+        )
+        .unwrap_or_else(decdn_config_types::PinnedHashes::empty);
 
-    let origin_retry = resolve_origin_retry(file.and_then(|c| c.origin_retry.as_ref()))
-        .context("invalid cache.origin_retry")?;
+    let origin_retry = bag
+        .try_with(
+            "cache.origin_retry",
+            resolve_origin_retry(file.and_then(|c| c.origin_retry.as_ref()))
+                .context("invalid cache.origin_retry"),
+        )
+        .unwrap_or_default();
 
     // `cache.user_agent` (#435): operator override of the default
     // `decdn-node/<version>` UA we send on every origin pull. We
@@ -547,11 +740,16 @@ fn resolve_cache(
     // verbatim so an operator who genuinely wants `MyCdn / 1.0` gets
     // exactly that.
     let user_agent = match file.and_then(|c| c.user_agent.as_ref()) {
-        Some(s) => {
-            validate_user_agent(s)?;
+        Some(s)
+            if bag
+                .try_with("cache.user_agent", validate_user_agent(s))
+                .is_some() =>
+        {
             s.clone()
         }
-        None => decdn_config_types::DEFAULT_USER_AGENT.to_string(),
+        // Absent, or present-but-invalid (the problem is already in the
+        // bag): fall back to the default UA so resolution can continue.
+        _ => decdn_config_types::DEFAULT_USER_AGENT.to_string(),
     };
 
     let gc_interval_sec = file
@@ -565,7 +763,7 @@ fn resolve_cache(
             usize::try_from(v).unwrap_or(usize::MAX)
         });
 
-    Ok(ResolvedCache {
+    ResolvedCache {
         cache_dir,
         cache_size_mb,
         max_blob_size_mb,
@@ -575,7 +773,7 @@ fn resolve_cache(
         user_agent,
         gc_interval_sec,
         max_probe_holds,
-    })
+    }
 }
 
 /// Resolve and validate the cache origin section (#437, #284). Collapses
@@ -597,39 +795,58 @@ fn resolve_cache(
 /// `tracing::warn!` log. Two HTTP origins pointing at the same URL is
 /// legitimate for connection-pool sharding, but is more often a
 /// copy-paste mistake worth flagging in the startup log.
-fn resolve_origins(
+fn resolve_origins_into(
     file: Option<&types::CacheConfig>,
-) -> anyhow::Result<Vec<crate::config::ResolvedOrigin>> {
+    bag: &mut ConfigErrorBag,
+) -> Vec<crate::config::ResolvedOrigin> {
     let Some(cache) = file else {
-        return Ok(Vec::new());
+        return Vec::new();
     };
 
     match (&cache.origin, &cache.origins) {
-        (Some(_), Some(_)) => Err(anyhow::anyhow!(
-            "cache.origin and cache.origins are mutually exclusive — \
-             use [cache.origin] for a single backend or [[cache.origins]] \
-             for an ordered fallback list, not both"
-        )),
-        (Some(single), None) => Ok(vec![
-            resolve_origin(single).context("invalid cache.origin")?,
-        ]),
-        (None, Some(list)) => {
-            anyhow::ensure!(
-                !list.is_empty(),
-                "cache.origins must contain at least one entry; \
-                 omit the key entirely for no pull-through"
+        (Some(_), Some(_)) => {
+            // One unambiguous problem: the operator picked two mutually
+            // exclusive fallback policies. Don't also emit "must contain
+            // at least one entry" — resolve to no pull-through.
+            bag.push(
+                "cache.origins",
+                "cache.origin and cache.origins are mutually exclusive — \
+                 use [cache.origin] for a single backend or [[cache.origins]] \
+                 for an ordered fallback list, not both",
             );
+            Vec::new()
+        }
+        (Some(single), None) => bag
+            .try_with(
+                "cache.origin",
+                resolve_origin(single).context("invalid cache.origin"),
+            )
+            .map(|o| vec![o])
+            .unwrap_or_default(),
+        (None, Some(list)) => {
+            if !bag.check(
+                !list.is_empty(),
+                "cache.origins",
+                "cache.origins must contain at least one entry; \
+                 omit the key entirely for no pull-through",
+            ) {
+                return Vec::new();
+            }
+            // Independent entries: validate every one so an operator with
+            // several bad backends sees all of them, not just the first.
             let mut resolved = Vec::with_capacity(list.len());
             for (idx, entry) in list.iter().enumerate() {
-                resolved.push(
-                    resolve_origin(entry)
-                        .with_context(|| format!("invalid cache.origins[{idx}]"))?,
-                );
+                if let Some(o) = bag.try_with(
+                    format!("cache.origins[{idx}]"),
+                    resolve_origin(entry).with_context(|| format!("invalid cache.origins[{idx}]")),
+                ) {
+                    resolved.push(o);
+                }
             }
             warn_on_duplicate_origins(&resolved);
-            Ok(resolved)
+            resolved
         }
-        (None, None) => Ok(Vec::new()),
+        (None, None) => Vec::new(),
     }
 }
 
@@ -1037,20 +1254,34 @@ pub fn resolve_payment(
     cli: &crate::cli::run::PaymentArgs,
     file: Option<&types::PaymentConfig>,
 ) -> anyhow::Result<ResolvedPayment> {
+    one_section(|bag| resolve_payment_into(cli, file, bag))
+}
+
+fn resolve_payment_into(
+    cli: &crate::cli::run::PaymentArgs,
+    file: Option<&types::PaymentConfig>,
+    bag: &mut ConfigErrorBag,
+) -> ResolvedPayment {
     let rate_per_mb = cli
         .rate_per_mb
         .or_else(|| file.and_then(|p| p.rate_per_mb))
         .unwrap_or(DEFAULT_RATE_PER_MB);
-    anyhow::ensure!(
+    bag.check(
         rate_per_mb > 0,
+        "payment.rate_per_mb",
         "payment.rate_per_mb must be > 0 (used in the node selection score, \
-         ADR 001); got 0"
+         ADR 001); got 0",
     );
-    anyhow::ensure!(
+    bag.check_with(
         rate_per_mb <= decdn_protocol::MAX_RATE_PER_MB,
-        "payment.rate_per_mb {rate_per_mb} exceeds protocol MAX_RATE_PER_MB ({}); \
-         honest clients reject `ProbeResponse`s above this ceiling (issue #378)",
-        decdn_protocol::MAX_RATE_PER_MB,
+        "payment.rate_per_mb",
+        || {
+            format!(
+                "payment.rate_per_mb {rate_per_mb} exceeds protocol MAX_RATE_PER_MB ({}); \
+             honest clients reject `ProbeResponse`s above this ceiling (issue #378)",
+                decdn_protocol::MAX_RATE_PER_MB,
+            )
+        },
     );
     // PoC-local stand-in for the on-chain `getRateBounds()` (ADR 005 §Rate
     // bounds validation). Defaults (`0` .. `MAX_RATE_PER_MB`) make the clamp
@@ -1063,33 +1294,44 @@ pub fn resolve_payment(
         .delivery_ceiling
         .or_else(|| file.and_then(|p| p.delivery_ceiling))
         .unwrap_or(decdn_protocol::MAX_RATE_PER_MB);
-    anyhow::ensure!(
+    bag.check_with(
         delivery_floor <= delivery_ceiling,
-        "payment.delivery_floor ({delivery_floor}) must be <= \
-         payment.delivery_ceiling ({delivery_ceiling})"
+        "payment.delivery_floor",
+        || {
+            format!(
+                "payment.delivery_floor ({delivery_floor}) must be <= \
+             payment.delivery_ceiling ({delivery_ceiling})"
+            )
+        },
     );
     // A ceiling of 0 would clamp every quoted rate to 0, bypassing the
     // `rate_per_mb > 0` guard above and making the node advertise a
     // free/selection-winning rate (ADR 001). With ceiling >= 1 and the
     // validated `rate_per_mb >= 1`, `clamp(rate, floor, ceiling)` is always
     // >= 1, so the signed rate can never collapse to 0.
-    anyhow::ensure!(
+    bag.check(
         delivery_ceiling >= 1,
+        "payment.delivery_ceiling",
         "payment.delivery_ceiling must be >= 1 (clamping to 0 would sign a \
-         free rate and bypass the rate_per_mb > 0 guard, ADR 001)"
+         free rate and bypass the rate_per_mb > 0 guard, ADR 001)",
     );
-    anyhow::ensure!(
+    bag.check_with(
         delivery_ceiling <= decdn_protocol::MAX_RATE_PER_MB,
-        "payment.delivery_ceiling {delivery_ceiling} exceeds protocol \
-         MAX_RATE_PER_MB ({}); clamping to it could still emit a rate honest \
-         clients reject",
-        decdn_protocol::MAX_RATE_PER_MB,
+        "payment.delivery_ceiling",
+        || {
+            format!(
+                "payment.delivery_ceiling {delivery_ceiling} exceeds protocol \
+             MAX_RATE_PER_MB ({}); clamping to it could still emit a rate honest \
+             clients reject",
+                decdn_protocol::MAX_RATE_PER_MB,
+            )
+        },
     );
-    Ok(ResolvedPayment {
+    ResolvedPayment {
         rate_per_mb,
         delivery_floor,
         delivery_ceiling,
-    })
+    }
 }
 
 /// Resolve observability fields.
@@ -1103,6 +1345,14 @@ pub fn resolve_observability(
     cli: &crate::cli::run::ObservabilityArgs,
     file: Option<&types::ObservabilityConfig>,
 ) -> anyhow::Result<ResolvedObservability> {
+    one_section(|bag| resolve_observability_into(cli, file, bag))
+}
+
+fn resolve_observability_into(
+    cli: &crate::cli::run::ObservabilityArgs,
+    file: Option<&types::ObservabilityConfig>,
+    bag: &mut ConfigErrorBag,
+) -> ResolvedObservability {
     let log_level = cli
         .log_level
         .or_else(|| file.and_then(|o| o.log_level))
@@ -1141,54 +1391,81 @@ pub fn resolve_observability(
 
     if let Some(ref ep) = otlp_endpoint {
         let lower = ep.to_ascii_lowercase();
-        anyhow::ensure!(
+        bag.check_with(
             lower.starts_with("http://") || lower.starts_with("https://"),
-            "observability.otlp_endpoint must start with http:// or https:// \
-             (got {ep:?}); gRPC/OTLP collectors require an HTTP-scheme URL"
+            "observability.otlp_endpoint",
+            || {
+                format!(
+                    "observability.otlp_endpoint must start with http:// or https:// \
+                 (got {ep:?}); gRPC/OTLP collectors require an HTTP-scheme URL"
+                )
+            },
         );
     }
 
-    Ok(ResolvedObservability {
+    ResolvedObservability {
         log_level,
         log_format,
         metrics_port,
         metrics_bind,
         admin_port,
         otlp_endpoint,
-    })
+    }
 }
 
-/// Resolve gossip fields. Allowlist entries are parsed as 64-character hex
-/// node IDs (either case accepted); bad entries fail loudly at startup
-/// rather than silently degrading to accept-all mode later.
+/// Resolve gossip fields. Every allowlist entry is parsed as a 64-character
+/// hex node ID (either case accepted); each malformed entry is dropped from
+/// the returned list and recorded under `gossip.allowlist[<idx>]` (so an
+/// operator sees every bad ID at once), and resolution still fails at startup
+/// before the partial allowlist is used — never silently degrading to
+/// accept-all mode later.
+#[cfg(test)]
 fn resolve_gossip(file: Option<&types::GossipConfig>) -> anyhow::Result<ResolvedGossip> {
+    one_section(|bag| resolve_gossip_into(file, bag))
+}
+
+fn resolve_gossip_into(
+    file: Option<&types::GossipConfig>,
+    bag: &mut ConfigErrorBag,
+) -> ResolvedGossip {
     let announce_interval_sec = file
         .and_then(|g| g.announce_interval_sec)
         .unwrap_or(DEFAULT_ANNOUNCE_INTERVAL_SEC);
-    anyhow::ensure!(
+    bag.check(
         announce_interval_sec > 0,
-        "gossip.announce_interval_sec must be > 0"
+        "gossip.announce_interval_sec",
+        "gossip.announce_interval_sec must be > 0",
     );
 
     let peer_ttl_sec = file
         .and_then(|g| g.peer_ttl_sec)
         .unwrap_or(DEFAULT_PEER_TTL_SEC);
-    anyhow::ensure!(peer_ttl_sec > 0, "gossip.peer_ttl_sec must be > 0");
+    bag.check(
+        peer_ttl_sec > 0,
+        "gossip.peer_ttl_sec",
+        "gossip.peer_ttl_sec must be > 0",
+    );
 
     let subscribe_global = file.and_then(|g| g.subscribe_global).unwrap_or(true);
 
     let allowlist = file
         .and_then(|g| g.allowlist.as_ref())
-        .map(|v| v.iter().map(|s| parse_node_id_hex(s)).collect())
-        .transpose()?
+        .map(|v| {
+            v.iter()
+                .enumerate()
+                .filter_map(|(idx, s)| {
+                    bag.try_with(format!("gossip.allowlist[{idx}]"), parse_node_id_hex(s))
+                })
+                .collect()
+        })
         .unwrap_or_default();
 
-    Ok(ResolvedGossip {
+    ResolvedGossip {
         announce_interval_sec,
         peer_ttl_sec,
         subscribe_global,
         allowlist,
-    })
+    }
 }
 
 /// Resolve security / rate-limiting fields.
@@ -1207,8 +1484,15 @@ fn resolve_gossip(file: Option<&types::GossipConfig>) -> anyhow::Result<Resolved
 // triple; splitting them out would scatter the field-pair invariants
 // (rate/burst coupling) across helpers that have to take both arguments
 // anyway. Keep it linear.
-#[allow(clippy::cognitive_complexity)]
 pub fn resolve_security(file: Option<&types::SecurityConfig>) -> anyhow::Result<ResolvedSecurity> {
+    one_section(|bag| resolve_security_into(file, bag))
+}
+
+#[allow(clippy::cognitive_complexity)]
+fn resolve_security_into(
+    file: Option<&types::SecurityConfig>,
+    bag: &mut ConfigErrorBag,
+) -> ResolvedSecurity {
     let max_concurrent_handlers = file
         .and_then(|s| s.max_concurrent_handlers)
         .unwrap_or(DEFAULT_MAX_CONCURRENT_HANDLERS);
@@ -1220,27 +1504,32 @@ pub fn resolve_security(file: Option<&types::SecurityConfig>) -> anyhow::Result<
     // so the failure mode is "node refuses to boot with a clear
     // error" rather than "node panics on next reload."
     let max_permits = tokio::sync::Semaphore::MAX_PERMITS;
-    anyhow::ensure!(
+    bag.check_with(
         usize::try_from(max_concurrent_handlers).is_ok_and(|v| v <= max_permits),
-        "security.max_concurrent_handlers={max_concurrent_handlers} exceeds tokio Semaphore::MAX_PERMITS={max_permits} on this target"
+        "security.max_concurrent_handlers",
+        || format!(
+            "security.max_concurrent_handlers={max_concurrent_handlers} exceeds tokio Semaphore::MAX_PERMITS={max_permits} on this target"
+        ),
     );
 
     let per_source_rate_per_sec = file
         .and_then(|s| s.per_source_rate_per_sec)
         .unwrap_or(DEFAULT_PER_SOURCE_RATE_PER_SEC);
-    anyhow::ensure!(
+    bag.check(
         per_source_rate_per_sec.is_finite() && per_source_rate_per_sec >= 0.0,
+        "security.per_source_rate_per_sec",
         "security.per_source_rate_per_sec must be a finite non-negative number \
-         (0 disables the per-source layer)"
+         (0 disables the per-source layer)",
     );
 
     let per_source_burst = file
         .and_then(|s| s.per_source_burst)
         .unwrap_or(DEFAULT_PER_SOURCE_BURST);
-    anyhow::ensure!(
+    bag.check(
         per_source_rate_per_sec == 0.0 || per_source_burst > 0,
+        "security.per_source_burst",
         "security.per_source_burst must be > 0 when per_source_rate_per_sec > 0 \
-         (set both to 0 to disable the per-source layer)"
+         (set both to 0 to disable the per-source layer)",
     );
 
     let max_tracked_sources = file
@@ -1260,12 +1549,12 @@ pub fn resolve_security(file: Option<&types::SecurityConfig>) -> anyhow::Result<
         );
     }
 
-    Ok(ResolvedSecurity {
+    ResolvedSecurity {
         max_concurrent_handlers,
         per_source_rate_per_sec,
         per_source_burst,
         max_tracked_sources,
-    })
+    }
 }
 
 /// Parse a 64-character hex (case-insensitive) node ID into 32 raw bytes.
@@ -1893,24 +2182,33 @@ mod tests {
         );
     }
 
-    /// A multi-entry allowlist with one valid and one invalid entry
-    /// must reject the whole resolution — half-applied allowlists are
-    /// a worse failure mode than fail-fast at startup. The invalid
-    /// entry is positioned second so a regression that returns early
-    /// after parsing the first valid entry would silently accept the
-    /// bad list.
+    /// Every malformed allowlist entry is dropped from the returned vec
+    /// *and* recorded under its own `gossip.allowlist[<idx>]` label, so
+    /// resolution fails at startup before the partial list is used (never
+    /// silently degrading to accept-all). Two invalid entries at indices
+    /// 0 and 2 (valid hex at 1) must both surface — a regression to
+    /// fail-fast on the first bad entry would only report one.
     #[test]
-    fn resolve_gossip_rejects_when_any_allowlist_entry_invalid() {
+    fn resolve_gossip_accumulates_every_invalid_allowlist_entry() {
         let cfg = types::GossipConfig {
             allowlist: Some(vec![
-                "0123456789abcdef".repeat(4), // valid
-                "z".repeat(64),               // invalid: non-hex
+                "z".repeat(64),               // idx 0: invalid (non-hex)
+                "0123456789abcdef".repeat(4), // idx 1: valid
+                "q".repeat(64),               // idx 2: invalid (non-hex)
             ]),
             ..Default::default()
         };
         let err = resolve_gossip(Some(&cfg))
-            .expect_err("any invalid entry must reject the whole list")
+            .expect_err("every invalid allowlist entry must be reported")
             .to_string();
+        assert!(
+            err.contains("gossip.allowlist[0]") && err.contains("gossip.allowlist[2]"),
+            "both bad entries must be named by index: {err}"
+        );
+        assert!(
+            !err.contains("gossip.allowlist[1]"),
+            "the valid entry must not be reported: {err}"
+        );
         assert!(
             err.contains("hex"),
             "error must surface hex-validation failure: {err}"
@@ -2672,6 +2970,43 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn resolve_cache_origins_accumulates_every_bad_entry() -> anyhow::Result<()> {
+        // Intra-section accumulation: two malformed origins at indices 0
+        // and 2 (valid at 1) must both be reported by index. A regression
+        // to fail-fast on the first bad entry would only report `[0]`.
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig {
+            origins: Some(vec![
+                types::OriginConfig::Http {
+                    url: String::new(), // idx 0: empty URL
+                    decompress: None,
+                },
+                types::OriginConfig::Http {
+                    url: "https://good.example/".to_string(), // idx 1: valid
+                    decompress: None,
+                },
+                types::OriginConfig::Fs {
+                    path: std::path::PathBuf::new(), // idx 2: empty path
+                },
+            ]),
+            ..Default::default()
+        };
+        let err = resolve_cache(&cli, Some(&toml), Path::new("/tmp"))
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected per-entry validation rejection"))?;
+        let msg = format!("{err:#}");
+        anyhow::ensure!(
+            msg.contains("cache.origins[0]") && msg.contains("cache.origins[2]"),
+            "both bad entries must be named by index: {msg}"
+        );
+        anyhow::ensure!(
+            !msg.contains("cache.origins[1]"),
+            "the valid entry must not be reported: {msg}"
+        );
+        Ok(())
+    }
+
     // resolve_cache must reject a non-http(s) URL at config resolution
     // instead of deferring the check to engine wiring. This locks in the
     // "single parser" invariant introduced by `parse_origin_url`.
@@ -3122,6 +3457,36 @@ mod tests {
             resolved.user_agent
         );
         Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_user_agent_invalid_falls_back_to_default() {
+        // Present-but-invalid UA must both record the `cache.user_agent`
+        // problem AND leave the resolved struct carrying
+        // `DEFAULT_USER_AGENT`. The fallback matters because
+        // `resolve_config` keeps accumulating across sections after this
+        // call; a `ResolvedCache` carrying the invalid bytes would smuggle
+        // them past the resolver into the eventual `reqwest::Client::builder`.
+        // The shim `resolve_cache` returns `Err` and drops the partial
+        // value, so the test drives `resolve_cache_into` directly to
+        // observe the field.
+        let cli = cache_cli(None, None);
+        let file = types::CacheConfig {
+            user_agent: Some("evil\r\nX-Inject: 1".to_string()),
+            ..types::CacheConfig::default()
+        };
+        let mut bag = ConfigErrorBag::new();
+        let resolved = resolve_cache_into(&cli, Some(&file), Path::new("/tmp"), &mut bag);
+        assert!(
+            bag.has_field("cache.user_agent"),
+            "expected cache.user_agent problem to be recorded"
+        );
+        assert_eq!(
+            resolved.user_agent,
+            decdn_config_types::DEFAULT_USER_AGENT,
+            "invalid UA must fall back to DEFAULT_USER_AGENT, got: {}",
+            resolved.user_agent
+        );
     }
 
     #[test]
@@ -4491,6 +4856,33 @@ mod tests {
     }
 
     #[test]
+    fn validate_port_layout_aggregates_three_way_collision() {
+        // All three ports set to the same number: each pair surfaces its
+        // own problem (bind/metrics, bind/admin, admin/metrics) instead of
+        // the first collision masking the other two. Locks the comment in
+        // `validate_port_layout_into` that promises accumulation across
+        // pairs, and verifies each pair carries a distinct field label so
+        // the bag can hold all three without one overwriting another.
+        let mut bag = ConfigErrorBag::new();
+        validate_port_layout_into(&net(7000), &obs_with_admin(7000, 7000), &mut bag);
+        let err = bag
+            .into_result()
+            .expect_err("three colliding ports must report problems");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("3 problem(s):"),
+            "expected three pair problems: {msg}"
+        );
+        for needle in [
+            "network.bind_port vs observability.metrics_port",
+            "network.bind_port vs observability.admin_port",
+            "observability.admin_port vs observability.metrics_port",
+        ] {
+            assert!(msg.contains(needle), "missing pair label {needle:?}: {msg}");
+        }
+    }
+
+    #[test]
     fn resolve_observability_metrics_bind_defaults_to_localhost() -> anyhow::Result<()> {
         let obs = resolve_observability(&obs_cli(None, None), None)?;
         assert_eq!(
@@ -5583,6 +5975,247 @@ staking_registry_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
         assert!(
             msg.contains("network.bind_port") && msg.contains("metrics_port"),
             "error should name both colliding ports: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_config_aggregates_all_problems_in_one_pass() -> anyhow::Result<()> {
+        // Four independent problems across three sections (bad region,
+        // missing rpc_url, max_blob >= cache, rate_per_mb = 0) must all
+        // surface in a single error so the operator fixes them in one
+        // edit cycle.
+        let body = r#"
+[identity]
+region = "USA"
+
+[blockchain]
+payment_channel_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+staking_registry_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+slash_judge_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+
+[cache]
+cache_size_mb = 100
+max_blob_size_mb = 500
+
+[payment]
+rate_per_mb = 0
+"#;
+        let dir = data_dir_with_keystore()?;
+        let path = write_minimal_toml(&dir, body)?;
+        let args = run_args_with_data_dir(dir.path());
+        let Err(err) = resolve_config(Some(&path), &args) else {
+            anyhow::bail!("expected resolve_config to fail with multiple problems");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("configuration has 4 problem(s):"),
+            "expected aggregated header with count: {msg}"
+        );
+        for needle in [
+            "identity.region",
+            "rpc_url",
+            "max_blob_size_mb",
+            "rate_per_mb",
+        ] {
+            assert!(
+                msg.contains(needle),
+                "aggregated error missing {needle:?}: {msg}"
+            );
+        }
+        // A present-but-invalid region must not also trigger the
+        // subscribe_global cross-section cascade (only the 4 real
+        // problems, no double-count).
+        assert!(
+            !msg.contains("must be set when gossip.subscribe_global"),
+            "region cascade should be suppressed: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_config_missing_rpc_url_emits_no_parse_cascade() -> anyhow::Result<()> {
+        // Cascade guard: a missing `rpc_url` records exactly the
+        // "missing required option" problem and skips the URL-parse +
+        // scheme checks (a synthesized placeholder must not also emit
+        // "is not a valid URL"). subscribe_global=false keeps region
+        // out of it so this is a single, clean problem.
+        let body = r#"
+[blockchain]
+payment_channel_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+staking_registry_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+slash_judge_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+
+[gossip]
+subscribe_global = false
+"#;
+        let dir = data_dir_with_keystore()?;
+        let path = write_minimal_toml(&dir, body)?;
+        let args = run_args_with_data_dir(dir.path());
+        let Err(err) = resolve_config(Some(&path), &args) else {
+            anyhow::bail!("expected resolve_config to fail on missing rpc_url");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("configuration has 1 problem(s):"),
+            "missing rpc_url must be the only problem (no parse cascade): {msg}"
+        );
+        assert!(
+            msg.contains("missing required option: --rpc-url"),
+            "expected the missing-option message: {msg}"
+        );
+        assert!(
+            !msg.contains("is not a valid URL"),
+            "URL-parse cascade must be suppressed: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_config_malformed_slash_judge_emits_no_zero_address_cascade() -> anyhow::Result<()> {
+        // Cascade guard: a slash_judge_address that fails to parse
+        // records the parse/checksum problem and skips the zero-address
+        // check (the empty placeholder must not also emit "must not be
+        // the zero address"). The address is set via CLI args because
+        // `empty_blockchain_args` defaults `slash_judge_address` to a
+        // valid one (CLI > file), so a TOML value would be ignored.
+        let body = r#"
+[blockchain]
+rpc_url = "https://example/rpc"
+payment_channel_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+staking_registry_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+
+[gossip]
+subscribe_global = false
+"#;
+        let dir = data_dir_with_keystore()?;
+        let path = write_minimal_toml(&dir, body)?;
+        let mut args = run_args_with_data_dir(dir.path());
+        args.blockchain.slash_judge_address = Some("0xnothex".to_string());
+        let Err(err) = resolve_config(Some(&path), &args) else {
+            anyhow::bail!("expected resolve_config to fail on bad slash_judge_address");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("configuration has 1 problem(s):"),
+            "bad slash_judge must be the only problem (no zero-addr cascade): {msg}"
+        );
+        assert!(
+            msg.contains("slash_judge_address"),
+            "error should name slash_judge_address: {msg}"
+        );
+        assert!(
+            !msg.contains("must not be the zero address"),
+            "zero-address cascade must be suppressed: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_config_missing_home_dir_emits_no_keystore_cascade() -> anyhow::Result<()> {
+        // Cascade guard for `IDENTITY_DATA_DIR`: when `data_dir` cannot be
+        // resolved (no CLI/file path and `dirs::home_dir()` returns None),
+        // `resolve_identity_into` records the `identity.data_dir` problem
+        // and stamps a `/nonexistent` placeholder. The downstream
+        // `eth_keystore` existence check (which would otherwise fail on
+        // `/nonexistent/keystore.json`) must be suppressed via
+        // `data_dir_valid` so the operator sees the real problem rather
+        // than a stack of cascading filesystem errors.
+        let body = r#"
+[blockchain]
+rpc_url = "https://example/rpc"
+payment_channel_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+staking_registry_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+slash_judge_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+
+[gossip]
+subscribe_global = false
+"#;
+        let dir = TempDir::new()?;
+        let path = write_minimal_toml(&dir, body)?;
+        // `empty_run_args` leaves `identity.data_dir = None`, so resolution
+        // falls through to `default_data_dir()`; the override forces
+        // `dirs::home_dir()` to None, triggering the placeholder path.
+        let args = empty_run_args();
+        let err =
+            common::test_support::with_home_override(None, || resolve_config(Some(&path), &args))
+                .expect_err("expected resolve_config to fail with data_dir problem");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("configuration has 1 problem(s):"),
+            "data_dir failure must be the only problem (no keystore cascade): {msg}"
+        );
+        assert!(
+            msg.contains("identity.data_dir"),
+            "expected identity.data_dir problem: {msg}"
+        );
+        assert!(
+            !msg.contains("eth_keystore"),
+            "keystore cascade must be suppressed when data_dir is invalid: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_config_aggregates_cross_and_intra_section_problems() -> anyhow::Result<()> {
+        // Cross-section + intra-section accumulation compose with a
+        // correct count: bad region (1) + two malformed cache.origins
+        // (2) + rate_per_mb=0 (1) = 4. The present-but-invalid region
+        // also suppresses the subscribe_global cascade.
+        let body = r#"
+[identity]
+region = "USA"
+
+[blockchain]
+rpc_url = "https://example/rpc"
+payment_channel_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+staking_registry_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+slash_judge_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+
+[[cache.origins]]
+kind = "http"
+url = ""
+
+[[cache.origins]]
+kind = "http"
+url = "https://good.example/"
+
+[[cache.origins]]
+kind = "fs"
+path = ""
+
+[payment]
+rate_per_mb = 0
+"#;
+        let dir = data_dir_with_keystore()?;
+        let path = write_minimal_toml(&dir, body)?;
+        let args = run_args_with_data_dir(dir.path());
+        let Err(err) = resolve_config(Some(&path), &args) else {
+            anyhow::bail!("expected resolve_config to fail with 4 problems");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("configuration has 4 problem(s):"),
+            "expected exactly 4 problems: {msg}"
+        );
+        for needle in [
+            "identity.region",
+            "cache.origins[0]",
+            "cache.origins[2]",
+            "rate_per_mb",
+        ] {
+            assert!(
+                msg.contains(needle),
+                "aggregated error missing {needle:?}: {msg}"
+            );
+        }
+        assert!(
+            !msg.contains("cache.origins[1]"),
+            "the valid origin must not be reported: {msg}"
+        );
+        assert!(
+            !msg.contains("must be set when gossip.subscribe_global"),
+            "region cascade should be suppressed: {msg}"
         );
         Ok(())
     }
