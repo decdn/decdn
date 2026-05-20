@@ -1,8 +1,9 @@
 //! Structured config-validation error accumulator.
 //!
 //! [`ConfigErrorBag`] is threaded through every section resolver during a
-//! `resolve_config` pass so every problem an operator made surfaces in one
-//! bulleted `anyhow::Error`, not one per re-run.
+//! `resolve_config` pass — and through every reloadable section during a
+//! SIGHUP reload (`runtime::reload`) — so every problem an operator made
+//! surfaces in one bulleted `anyhow::Error`, not one per re-run.
 //!
 //! Each problem is recorded under a dotted field label (`blockchain.rpc_url`,
 //! `cache.origins[2]`, ...) with the resolver's message text. Single-line
@@ -29,6 +30,7 @@ pub(crate) const IDENTITY_DATA_DIR: &str = "identity.data_dir";
 
 /// One resolved-config problem: a dotted field label (`blockchain.rpc_url`)
 /// plus the resolver's message text.
+#[derive(Debug)]
 struct ConfigProblem {
     field: String,
     message: String,
@@ -47,19 +49,26 @@ struct ConfigProblem {
 /// resolver authors can rely on operator-facing problem order matching the
 /// order of validation logic, and tests that pin specific output order keep
 /// working through future refactors.
-pub(crate) struct ConfigErrorBag {
+#[derive(Debug)]
+pub struct ConfigErrorBag {
     problems: Vec<ConfigProblem>,
 }
 
+impl Default for ConfigErrorBag {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ConfigErrorBag {
-    pub(crate) const fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             problems: Vec::new(),
         }
     }
 
     /// Record a problem under `field` with `message`.
-    pub(crate) fn push(&mut self, field: impl Into<String>, message: impl Into<String>) {
+    pub fn push(&mut self, field: impl Into<String>, message: impl Into<String>) {
         self.problems.push(ConfigProblem {
             field: field.into(),
             message: message.into(),
@@ -69,7 +78,7 @@ impl ConfigErrorBag {
     /// `anyhow::ensure!` replacement for a static message: record `message`
     /// under `field` when `cond` is false. Returns `cond` so callers can
     /// branch and skip a dependent check or substitute a placeholder.
-    pub(crate) fn check(
+    pub fn check(
         &mut self,
         cond: bool,
         field: impl Into<String>,
@@ -85,7 +94,7 @@ impl ConfigErrorBag {
     /// when `cond` is false, matching `anyhow::ensure!`'s format-on-failure
     /// behaviour so the happy path allocates nothing for `format!(...)`
     /// messages.
-    pub(crate) fn check_with(
+    pub fn check_with(
         &mut self,
         cond: bool,
         field: impl Into<String>,
@@ -100,7 +109,7 @@ impl ConfigErrorBag {
     /// `?` / `.context()` replacement: on `Err`, record the full `{e:#}`
     /// alternate-form context chain under `field` and return `None`; on
     /// `Ok`, return `Some(value)`.
-    pub(crate) fn try_with<T>(
+    pub fn try_with<T>(
         &mut self,
         field: impl Into<String>,
         result: anyhow::Result<T>,
@@ -119,9 +128,9 @@ impl ConfigErrorBag {
     /// Match is exact-string, not prefix: a problem recorded under
     /// `cache.origins[0]` does *not* make `has_field("cache.origins")`
     /// true. Cascade guards must use the same label the producing site
-    /// used (see [`IDENTITY_REGION`] / [`IDENTITY_DATA_DIR`] for the
+    /// used (see `IDENTITY_REGION` / `IDENTITY_DATA_DIR` for the
     /// labels currently participating in guards).
-    pub(crate) fn has_field(&self, field: &str) -> bool {
+    pub fn has_field(&self, field: &str) -> bool {
         self.problems.iter().any(|p| p.field == field)
     }
 
@@ -135,7 +144,7 @@ impl ConfigErrorBag {
     /// `  - <field>: `, and a trailing `\n` becomes a dangling-indent blank
     /// line; neither shape is produced by the current resolvers but a future
     /// `{e:#}` source whose `Display` ends in a newline would surface it.
-    pub(crate) fn into_result(self) -> anyhow::Result<()> {
+    pub fn into_result(self) -> anyhow::Result<()> {
         if self.problems.is_empty() {
             return Ok(());
         }

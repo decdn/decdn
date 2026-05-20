@@ -12,11 +12,12 @@ use std::path::{Path, PathBuf};
 use alloy::primitives::Address;
 use anyhow::Context;
 
-use errors::{ConfigErrorBag, IDENTITY_DATA_DIR, IDENTITY_REGION, one_section};
+use errors::{IDENTITY_DATA_DIR, IDENTITY_REGION, one_section};
 
 use crate::cli::common::{self, expand_tilde};
 use crate::cli::run::RunArgs;
 
+pub use errors::ConfigErrorBag;
 pub use resolved::{
     ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedGossip, ResolvedIdentity,
     ResolvedNetwork, ResolvedObservability, ResolvedOrigin, ResolvedPayment, ResolvedS3Config,
@@ -1257,7 +1258,14 @@ pub fn resolve_payment(
     one_section(|bag| resolve_payment_into(cli, file, bag))
 }
 
-fn resolve_payment_into(
+/// Bag-threading variant of [`resolve_payment`]. Used by both
+/// [`resolve_config`] (single bag across every section at startup) and the
+/// SIGHUP hot-reload path in `runtime::reload` (single bag across every
+/// reloadable section), so an operator sees every problem in one error
+/// instead of fixing them one SIGHUP at a time. Always returns a
+/// [`ResolvedPayment`] (with placeholder values for fields that failed
+/// validation) so later checks can still run against it.
+pub fn resolve_payment_into(
     cli: &crate::cli::run::PaymentArgs,
     file: Option<&types::PaymentConfig>,
     bag: &mut ConfigErrorBag,
@@ -1348,7 +1356,10 @@ pub fn resolve_observability(
     one_section(|bag| resolve_observability_into(cli, file, bag))
 }
 
-fn resolve_observability_into(
+/// Bag-threading variant of [`resolve_observability`]. Shares a bag with
+/// other sections during startup ([`resolve_config`]) and SIGHUP reload
+/// (`runtime::reload`); see [`resolve_payment_into`] for the rationale.
+pub fn resolve_observability_into(
     cli: &crate::cli::run::ObservabilityArgs,
     file: Option<&types::ObservabilityConfig>,
     bag: &mut ConfigErrorBag,
@@ -1488,8 +1499,11 @@ pub fn resolve_security(file: Option<&types::SecurityConfig>) -> anyhow::Result<
     one_section(|bag| resolve_security_into(file, bag))
 }
 
+/// Bag-threading variant of [`resolve_security`]. Shares a bag with other
+/// sections during startup ([`resolve_config`]) and SIGHUP reload
+/// (`runtime::reload`); see [`resolve_payment_into`] for the rationale.
 #[allow(clippy::cognitive_complexity)]
-fn resolve_security_into(
+pub fn resolve_security_into(
     file: Option<&types::SecurityConfig>,
     bag: &mut ConfigErrorBag,
 ) -> ResolvedSecurity {
