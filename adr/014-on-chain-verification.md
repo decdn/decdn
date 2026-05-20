@@ -169,7 +169,7 @@ All challenge types MUST validate evidence age using a skew-safe comparison. Let
 - `SlashJudge.setMaxEvidenceAge(uint256 newValueUs)` MUST revert if `newValueUs >= StakingRegistry.unbondingPeriod * 1_000_000` (or the integer-overflow-safe equivalent), in addition to the [1 day, 30 days] individual bound.
 - `StakingRegistry.setUnbondingPeriod(uint256 newValueSeconds)` MUST revert if `newValueSeconds * 1_000_000 <= SlashJudge.maxEvidenceAgeUs`, in addition to the [3 days, 30 days] individual bound.
 
-The check applies at initialization too — neither contract may be deployed with an initial pair that violates the invariant. This matches the cross-parameter setter pattern used elsewhere (see [ADR 009 § Governable Parameters with Safety Bounds](009-governance.md#governable-parameters-with-safety-bounds): `OriginAssignment.minRedundancy ≤ maxOriginsPerNamespace`; [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds): the FeeRouter sum-to-100% invariant) — invariants between parameters with a genuine ordering relationship are contract-enforced, not implementation-enforced.
+The check applies at initialization too — neither contract may be deployed with an initial pair that violates the invariant. This matches the cross-parameter setter pattern used elsewhere (see [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds): the FeeRouter sum-to-100% invariant) — invariants between parameters with a genuine ordering relationship are contract-enforced, not implementation-enforced.
 
 **Rate manipulation:** 1–3. Same `SignatureChecker` verification and identity check as phantom
 4. Verify `streamResponse.rate_per_mb > probeResponse.rate_per_mb`
