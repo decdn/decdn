@@ -1,31 +1,34 @@
-//! Structured config-validation error accumulator (issue #222).
+//! Structured config-validation error accumulator.
 //!
-//! `resolve_config` used to fail fast on the first problem: an operator
-//! with three mistakes fixed one, re-ran, hit the next, re-ran again.
-//! [`ConfigErrorBag`] collects every problem found in a single resolution
-//! pass so the whole list is reported at once.
+//! [`ConfigErrorBag`] is threaded through every section resolver during a
+//! `resolve_config` pass so every problem an operator made surfaces in one
+//! bulleted `anyhow::Error`, not one per re-run.
 //!
-//! The bag preserves each fail-fast resolver's original message text under
-//! a dotted field label: single-line messages verbatim, multi-line messages
-//! with their continuation lines indented (see [`ConfigErrorBag::into_result`]).
-//! All current messages are single-line — anyhow's `{e:#}` joins context with
-//! `": "`, not newlines — so existing `.contains("substring")` assertions keep
-//! matching.
+//! Each problem is recorded under a dotted field label (`blockchain.rpc_url`,
+//! `cache.origins[2]`, ...) with the resolver's message text. Single-line
+//! messages are reproduced verbatim; multi-line messages have their
+//! continuation lines indented to stay under their bullet (see
+//! [`ConfigErrorBag::into_result`]).
 
 /// Field labels that participate in a `has_field` cascade-suppression guard.
 ///
 /// These are the only labels whose exact string is load-bearing for
-/// *correctness* (a producing-site `push`/`try_with` and a guarding-site
-/// `has_field` must agree byte-for-byte, ~200 lines apart, or the misleading
-/// cascade error issue #222 was meant to kill silently reappears). Naming
-/// them as constants makes that coupling refactor-safe. The other ~60
-/// non-guarded labels stay inline literals — they only appear in operator
-/// output, never in a guard.
+/// *correctness*: a producing-site `push`/`try_with` and a guarding-site
+/// `has_field` (e.g. `resolve_identity_into` and
+/// `ensure_region_when_publishing_global_into`) must agree byte-for-byte, or
+/// the cascade-suppression guard silently degrades and a misleading second
+/// error bubbles up. Naming them as constants makes that coupling
+/// refactor-safe.
+///
+/// Add a new constant here only when introducing a new `has_field` guard.
+/// The other ~60 non-guarded labels stay inline literals — they appear only
+/// in operator output, never in a guard, so promoting them all would defeat
+/// the point of singling these two out.
 pub(crate) const IDENTITY_REGION: &str = "identity.region";
 pub(crate) const IDENTITY_DATA_DIR: &str = "identity.data_dir";
 
 /// One resolved-config problem: a dotted field label (`blockchain.rpc_url`)
-/// plus the verbatim message the fail-fast resolver used to return.
+/// plus the resolver's message text.
 struct ConfigProblem {
     field: String,
     message: String,
@@ -38,6 +41,12 @@ struct ConfigProblem {
 /// and [`try_with`](Self::try_with) (the `?`/`.context()` replacement),
 /// substituting a placeholder for any value they could not resolve so
 /// later independent checks still run.
+///
+/// Insertion order is preserved end-to-end: [`into_result`](Self::into_result)
+/// renders bullets in the same order they were [`push`](Self::push)ed, so
+/// resolver authors can rely on operator-facing problem order matching the
+/// order of validation logic, and tests that pin specific output order keep
+/// working through future refactors.
 pub(crate) struct ConfigErrorBag {
     problems: Vec<ConfigProblem>,
 }
@@ -89,9 +98,8 @@ impl ConfigErrorBag {
     }
 
     /// `?` / `.context()` replacement: on `Err`, record the full `{e:#}`
-    /// context chain under `field` and return `None`; on `Ok`, return
-    /// `Some(value)`. The `{e:#}` form matches what `?` propagation +
-    /// `format!("{err:#}")` produced before, so message text is unchanged.
+    /// alternate-form context chain under `field` and return `None`; on
+    /// `Ok`, return `Some(value)`.
     pub(crate) fn try_with<T>(
         &mut self,
         field: impl Into<String>,
@@ -106,25 +114,27 @@ impl ConfigErrorBag {
         }
     }
 
-    /// Whether any problem has already been recorded for `field` (exact
-    /// match). Used to suppress a misleading cascade error on a field that
-    /// already failed an earlier check (e.g. region present-but-invalid
-    /// must not also trigger "region must be set when `subscribe_global`").
+    /// Whether any problem has already been recorded for `field`.
+    ///
+    /// Match is exact-string, not prefix: a problem recorded under
+    /// `cache.origins[0]` does *not* make `has_field("cache.origins")`
+    /// true. Cascade guards must use the same label the producing site
+    /// used (see [`IDENTITY_REGION`] / [`IDENTITY_DATA_DIR`] for the
+    /// labels currently participating in guards).
     pub(crate) fn has_field(&self, field: &str) -> bool {
         self.problems.iter().any(|p| p.field == field)
     }
 
-    #[cfg(test)]
-    pub(crate) const fn is_empty(&self) -> bool {
-        self.problems.is_empty()
-    }
-
     /// Collapse the bag into a single `anyhow::Error` listing every problem
-    /// as a `  - <field>: <message>` bullet, or `Ok(())` when empty. Each
-    /// message is reproduced unchanged except that continuation lines of a
-    /// multi-line message are indented to stay under their bullet; single-line
-    /// messages (all current ones) are verbatim, so existing substring
-    /// assertions keep matching.
+    /// as a `  - <field>: <message>` bullet, or `Ok(())` when empty.
+    /// Single-line messages are reproduced verbatim; continuation lines of
+    /// a multi-line message are indented to stay under their bullet.
+    ///
+    /// Only `\n` is replaced — `\r\n` continuations have their `\n` re-indented
+    /// but the carriage return is left in place. An empty `message` renders as
+    /// `  - <field>: `, and a trailing `\n` becomes a dangling-indent blank
+    /// line; neither shape is produced by the current resolvers but a future
+    /// `{e:#}` source whose `Display` ends in a newline would surface it.
     pub(crate) fn into_result(self) -> anyhow::Result<()> {
         if self.problems.is_empty() {
             return Ok(());
@@ -148,11 +158,11 @@ impl ConfigErrorBag {
     }
 }
 
-/// Run a single-section resolver worker with its own private bag,
-/// preserving the existing `anyhow::Result` public signature that
-/// `runtime::reload` and the unit tests call directly. Cross-section
-/// aggregation happens in `resolve_config`, which drives the `*_into`
-/// workers with one shared bag instead of going through this shim.
+/// Wraps a section `*_into` worker so a single-section caller (a
+/// `runtime::reload` path or a `#[cfg(test)]` shim) gets back an
+/// `anyhow::Result<T>`.
+/// Cross-section aggregation lives in `resolve_config`, which runs the
+/// workers against one shared bag instead.
 pub(crate) fn one_section<T>(f: impl FnOnce(&mut ConfigErrorBag) -> T) -> anyhow::Result<T> {
     let mut bag = ConfigErrorBag::new();
     let value = f(&mut bag);
@@ -172,21 +182,19 @@ mod tests {
 
     #[test]
     fn empty_bag_is_ok() {
-        let bag = ConfigErrorBag::new();
-        assert!(bag.is_empty());
-        assert!(bag.into_result().is_ok());
+        assert!(ConfigErrorBag::new().into_result().is_ok());
     }
 
     #[test]
     fn check_records_only_on_false_and_returns_cond() {
         let mut bag = ConfigErrorBag::new();
         assert!(bag.check(true, "a.b", "should not appear"));
-        assert!(bag.is_empty());
         assert!(!bag.check(false, "a.b", "boom"));
-        assert!(!bag.is_empty());
         let msg = format!("{:#}", bag.into_result().unwrap_err());
-        assert!(msg.contains("a.b"), "{msg}");
-        assert!(msg.contains("boom"), "{msg}");
+        // Exactly one problem — proves the `true` branch did not push.
+        assert!(msg.contains("1 problem(s):"), "{msg}");
+        assert!(!msg.contains("should not appear"), "{msg}");
+        assert!(msg.contains("a.b: boom"), "{msg}");
     }
 
     #[test]
@@ -215,14 +223,11 @@ mod tests {
     fn check_with_runs_closure_only_on_failure() {
         let mut bag = ConfigErrorBag::new();
         let mut calls = 0;
-        // cond == true: closure must not run, nothing recorded.
         assert!(bag.check_with(true, "a.b", || {
             calls += 1;
             "unreachable".to_string()
         }));
         assert_eq!(calls, 0);
-        assert!(bag.is_empty());
-        // cond == false: closure runs once, message recorded.
         assert!(!bag.check_with(false, "a.b", || {
             calls += 1;
             format!("boom {}", 42)

@@ -36,7 +36,8 @@ const DEFAULT_CACHE_SIZE_MB: u64 = 10_240;
 ///
 /// Deliberately well below `DEFAULT_CACHE_SIZE_MB` so a single oversized
 /// blob can't saturate the entire cache and evict all other content in
-/// one fetch. See [`resolve_cache_into`] for the accompanying invariant.
+/// one fetch. The `max_blob_size_mb < cache_size_mb` invariant is enforced
+/// at config load (see `resolve_cache_into`).
 const DEFAULT_MAX_BLOB_SIZE_MB: u64 = 1_024;
 /// Default rate per MB in USDC base units ($0.00001/MB).
 const DEFAULT_RATE_PER_MB: u64 = 10;
@@ -115,7 +116,7 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
     // `load_file_config` stays fail-fast: a file we could not read, parse,
     // or env-expand never produced a `FileConfig`, so there is nothing to
     // validate. Everything *after* this accumulates into one `bag` so an
-    // operator sees every problem in a single pass (issue #222).
+    // operator sees every problem in a single pass.
     let file = load_file_config(config_path)?;
 
     let mut bag = ConfigErrorBag::new();
@@ -124,8 +125,13 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
     // A region that was supplied but failed `normalize_region` is already
     // reported under `identity.region`; the cross-section publish check
     // must not also fire (see `ensure_region_when_publishing_global_into`).
-    // A data_dir we could not determine becomes a placeholder — skip the
-    // keystore existence check that would otherwise spuriously fail on it.
+    // A data_dir we could not determine becomes a `/nonexistent` placeholder
+    // (see `resolve_identity_into`); the keystore/cache-dir derived from it
+    // would surface as a "cannot access" cascade on top of the real
+    // `identity.data_dir` problem, so downstream resolvers skip path-existence
+    // checks driven off it when `data_dir_valid` is false. The placeholder
+    // never escapes `resolve_config`: `bag.into_result()?` below fails before
+    // the materialized `ResolvedConfig` is returned to the caller.
     let data_dir_valid = !bag.has_field(IDENTITY_DATA_DIR);
     let network = resolve_network(&cli.network, file.network.as_ref());
     let blockchain = resolve_blockchain_into(
@@ -244,11 +250,14 @@ fn validate_port_layout_into(
 
     // bind vs metrics — UDP/TCP, same-number operator typo. The three pair
     // checks are independent: accumulate every collision so an operator who
-    // set all three equal sees all of them, not just the first.
+    // set all three equal sees all of them, not just the first. Each pair
+    // gets a distinct label encoding both fields, so the bag can carry all
+    // three problems without two collisions colliding under one key (and so
+    // a future `has_field` guard could pick out a specific pair).
     if bind != 0 && metrics != 0 {
         bag.check_with(
             bind != metrics,
-            "network.bind_port",
+            "network.bind_port vs observability.metrics_port",
             || format!(
                 "network.bind_port ({bind}) must differ from observability.metrics_port ({metrics}); \
                  QUIC (UDP) and metrics (TCP) would not collide at bind time, but sharing \
@@ -262,13 +271,15 @@ fn validate_port_layout_into(
         && bind != 0
         && admin != 0
     {
-        bag.check_with(bind != admin, "network.bind_port", || {
-            format!(
+        bag.check_with(
+            bind != admin,
+            "network.bind_port vs observability.admin_port",
+            || format!(
                 "network.bind_port ({bind}) must differ from observability.admin_port ({admin}); \
                  QUIC (UDP) and admin (TCP) would not collide at bind time, but sharing \
                  the same port number is almost certainly an operator typo"
-            )
-        });
+            ),
+        );
     }
 
     // metrics vs admin — both TCP, second bind would fail silently.
@@ -278,7 +289,7 @@ fn validate_port_layout_into(
     {
         bag.check_with(
             admin != metrics,
-            "observability.admin_port",
+            "observability.admin_port vs observability.metrics_port",
             || format!(
                 "observability.admin_port ({admin}) must differ from observability.metrics_port ({metrics}); \
                  the two servers cannot share a TCP port"
@@ -328,9 +339,11 @@ fn resolve_identity_into(
         .or_else(common::default_data_dir)
         .unwrap_or_else(|| {
             // Placeholder so blockchain/cache resolution keeps running and
-            // accumulating their own problems. `data_dir_valid` is derived
-            // from `bag.has_field("identity.data_dir")` in `resolve_config`,
-            // and the keystore existence check is skipped for a placeholder.
+            // accumulating their own problems. The placeholder never escapes:
+            // `resolve_config` derives `data_dir_valid` from
+            // `bag.has_field(IDENTITY_DATA_DIR)` and stops path-existence
+            // cascades; the materialized `ResolvedConfig` carrying the
+            // placeholder is dropped when `bag.into_result()?` short-circuits.
             bag.push(
                 IDENTITY_DATA_DIR,
                 "cannot determine data directory: home dir not found",
@@ -1435,8 +1448,6 @@ fn resolve_gossip_into(
 
     let subscribe_global = file.and_then(|g| g.subscribe_global).unwrap_or(true);
 
-    // Independent entries: validate every one so an operator with several
-    // malformed node IDs sees all of them in one pass.
     let allowlist = file
         .and_then(|g| g.allowlist.as_ref())
         .map(|v| {
@@ -2171,14 +2182,12 @@ mod tests {
         );
     }
 
-    /// Post-#222 the allowlist resolves with `filter_map` over
-    /// `enumerate()`: every malformed entry is dropped *and* recorded
-    /// under its own `gossip.allowlist[<idx>]` label, and resolution
-    /// still fails at startup before the partial list is used (never
-    /// silently degrading to accept-all). Two invalid entries at
-    /// indices 0 and 2 (valid hex at 1) must *both* surface — a
-    /// regression that reverted to fail-fast on the first bad entry
-    /// would only report one.
+    /// Every malformed allowlist entry is dropped from the returned vec
+    /// *and* recorded under its own `gossip.allowlist[<idx>]` label, so
+    /// resolution fails at startup before the partial list is used (never
+    /// silently degrading to accept-all). Two invalid entries at indices
+    /// 0 and 2 (valid hex at 1) must both surface — a regression to
+    /// fail-fast on the first bad entry would only report one.
     #[test]
     fn resolve_gossip_accumulates_every_invalid_allowlist_entry() {
         let cfg = types::GossipConfig {
@@ -2963,10 +2972,9 @@ mod tests {
 
     #[test]
     fn resolve_cache_origins_accumulates_every_bad_entry() -> anyhow::Result<()> {
-        // Intra-section accumulation (issue #222): two malformed origins
-        // at indices 0 and 2 (valid at 1) must BOTH be reported, by
-        // index. A regression that reverted the per-entry loop to
-        // fail-fast on the first bad entry would only report `[0]`.
+        // Intra-section accumulation: two malformed origins at indices 0
+        // and 2 (valid at 1) must both be reported by index. A regression
+        // to fail-fast on the first bad entry would only report `[0]`.
         let cli = empty_cache_args();
         let toml = types::CacheConfig {
             origins: Some(vec![
@@ -3449,6 +3457,36 @@ mod tests {
             resolved.user_agent
         );
         Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_user_agent_invalid_falls_back_to_default() {
+        // Present-but-invalid UA must both record the `cache.user_agent`
+        // problem AND leave the resolved struct carrying
+        // `DEFAULT_USER_AGENT`. The fallback matters because
+        // `resolve_config` keeps accumulating across sections after this
+        // call; a `ResolvedCache` carrying the invalid bytes would smuggle
+        // them past the resolver into the eventual `reqwest::Client::builder`.
+        // The shim `resolve_cache` returns `Err` and drops the partial
+        // value, so the test drives `resolve_cache_into` directly to
+        // observe the field.
+        let cli = cache_cli(None, None);
+        let file = types::CacheConfig {
+            user_agent: Some("evil\r\nX-Inject: 1".to_string()),
+            ..types::CacheConfig::default()
+        };
+        let mut bag = ConfigErrorBag::new();
+        let resolved = resolve_cache_into(&cli, Some(&file), Path::new("/tmp"), &mut bag);
+        assert!(
+            bag.has_field("cache.user_agent"),
+            "expected cache.user_agent problem to be recorded"
+        );
+        assert_eq!(
+            resolved.user_agent,
+            decdn_config_types::DEFAULT_USER_AGENT,
+            "invalid UA must fall back to DEFAULT_USER_AGENT, got: {}",
+            resolved.user_agent
+        );
     }
 
     #[test]
@@ -4818,6 +4856,33 @@ mod tests {
     }
 
     #[test]
+    fn validate_port_layout_aggregates_three_way_collision() {
+        // All three ports set to the same number: each pair surfaces its
+        // own problem (bind/metrics, bind/admin, admin/metrics) instead of
+        // the first collision masking the other two. Locks the comment in
+        // `validate_port_layout_into` that promises accumulation across
+        // pairs, and verifies each pair carries a distinct field label so
+        // the bag can hold all three without one overwriting another.
+        let mut bag = ConfigErrorBag::new();
+        validate_port_layout_into(&net(7000), &obs_with_admin(7000, 7000), &mut bag);
+        let err = bag
+            .into_result()
+            .expect_err("three colliding ports must report problems");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("3 problem(s):"),
+            "expected three pair problems: {msg}"
+        );
+        for needle in [
+            "network.bind_port vs observability.metrics_port",
+            "network.bind_port vs observability.admin_port",
+            "observability.admin_port vs observability.metrics_port",
+        ] {
+            assert!(msg.contains(needle), "missing pair label {needle:?}: {msg}");
+        }
+    }
+
+    #[test]
     fn resolve_observability_metrics_bind_defaults_to_localhost() -> anyhow::Result<()> {
         let obs = resolve_observability(&obs_cli(None, None), None)?;
         assert_eq!(
@@ -5916,10 +5981,10 @@ staking_registry_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 
     #[test]
     fn resolve_config_aggregates_all_problems_in_one_pass() -> anyhow::Result<()> {
-        // Issue #222: four independent problems across three sections
-        // (bad region, missing rpc_url, max_blob >= cache, rate_per_mb=0)
-        // must all surface in a single error so the operator fixes them
-        // in one edit cycle instead of one-per-run.
+        // Four independent problems across three sections (bad region,
+        // missing rpc_url, max_blob >= cache, rate_per_mb = 0) must all
+        // surface in a single error so the operator fixes them in one
+        // edit cycle.
         let body = r#"
 [identity]
 region = "USA"
@@ -6042,6 +6107,51 @@ subscribe_global = false
         assert!(
             !msg.contains("must not be the zero address"),
             "zero-address cascade must be suppressed: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_config_missing_home_dir_emits_no_keystore_cascade() -> anyhow::Result<()> {
+        // Cascade guard for `IDENTITY_DATA_DIR`: when `data_dir` cannot be
+        // resolved (no CLI/file path and `dirs::home_dir()` returns None),
+        // `resolve_identity_into` records the `identity.data_dir` problem
+        // and stamps a `/nonexistent` placeholder. The downstream
+        // `eth_keystore` existence check (which would otherwise fail on
+        // `/nonexistent/keystore.json`) must be suppressed via
+        // `data_dir_valid` so the operator sees the real problem rather
+        // than a stack of cascading filesystem errors.
+        let body = r#"
+[blockchain]
+rpc_url = "https://example/rpc"
+payment_channel_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+staking_registry_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+slash_judge_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+
+[gossip]
+subscribe_global = false
+"#;
+        let dir = TempDir::new()?;
+        let path = write_minimal_toml(&dir, body)?;
+        // `empty_run_args` leaves `identity.data_dir = None`, so resolution
+        // falls through to `default_data_dir()`; the override forces
+        // `dirs::home_dir()` to None, triggering the placeholder path.
+        let args = empty_run_args();
+        let err =
+            common::test_support::with_home_override(None, || resolve_config(Some(&path), &args))
+                .expect_err("expected resolve_config to fail with data_dir problem");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("configuration has 1 problem(s):"),
+            "data_dir failure must be the only problem (no keystore cascade): {msg}"
+        );
+        assert!(
+            msg.contains("identity.data_dir"),
+            "expected identity.data_dir problem: {msg}"
+        );
+        assert!(
+            !msg.contains("eth_keystore"),
+            "keystore cascade must be suppressed when data_dir is invalid: {msg}"
         );
         Ok(())
     }
