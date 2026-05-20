@@ -594,13 +594,139 @@ Voucher nonces within a channel start at **1**. Nonce 0 is reserved as the senti
 - `claimedNonce == 0` reliably identifies channels where no voucher has ever been submitted, which is the guard condition for the zero-voucher close path callable by either party (see [Channel griefing](#channel-griefing) and the channel close lifecycle in [PaymentChannel](#paymentchannel)).
 - Any real voucher (nonce ≥ 1) can always be used to dispute a zero-voucher close (which records `claimedNonce=0`), since `disputeChannel` requires strictly higher nonce.
 
-### StakingRegistry Modifications
+### Node Registry
 
-The full node registry interface (`NodeInfo`, `registerNode` with atomic binding, `getActiveNodes`, etc.) is defined in [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh). The additions below are payment-specific extensions.
+The on-chain registry of staked nodes is part of the `StakingRegistry` contract, not a separate contract. Staking is a prerequisite for registration ([ADR 026 § Operator economics and minimum stake](026-tokenomics.md#operator-economics-and-minimum-stake)), so co-locating them avoids cross-contract calls and simplifies the atomic stake-then-register flow.
 
 > **No on-channel fee-discount path.** Operator return is differentiated through ve-locked gauge boost ([ADR 034 § Gauge-boost formula](034-gauge-boost-voting-escrow.md#gauge-boost-formula)), not via a stake-multiple fee toggle on the channel contract. `getEffectiveFee`, `getStakeMultiple`, `DISCOUNT_MULTIPLE`, `feePercentage`, and `discountedFeePercentage` are not part of the interface. `StakingRegistry` retains its slashing, registration, and stake-bookkeeping responsibilities; the minimum stake is **50,000 TOKEN** ([ADR 026 § Operator economics and minimum stake](026-tokenomics.md#operator-economics-and-minimum-stake)).
 
-No payment-specific extensions to `StakingRegistry` are required beyond the registry interface defined in [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh).
+#### Data Structure
+
+```solidity
+struct NodeInfo {
+    bytes32 nodeId;              // iroh NodeId (ed25519 public key, 32 bytes)
+    address ethAddress;          // Ethereum address for payment channels (20 bytes)
+    bool    active;              // false after deregistration or auto-ejection (1 byte)
+                                 // ↑ ethAddress + active pack into one slot
+    uint256 registeredAt;        // block.timestamp of current registration
+    uint256 firstRegisteredAt;   // block.timestamp of first-ever registration (immutable once set)
+    uint256 lastMultiaddrUpdate; // block.timestamp of last multiaddr change
+    bytes   multiaddrs;          // packed QUIC multiaddrs (length-prefixed entries)
+    string  regionHint;          // ISO 3166-1 alpha-2 code (self-reported, unverified)
+}
+```
+
+Field order is chosen for storage packing: `ethAddress` (20 B) and `active` (1 B) share one 32-byte slot, dropping `NodeInfo` from 8 slots to 7. `multiaddrs` uses `bytes` rather than `string[]` for gas efficiency: a packed array of `(uint16 length, bytes data)` entries, parsed off-chain by clients. Maximum encoded size is bounded by the governable `maxMultiaddrSize` parameter (initial value 1024 bytes; safety bounds 64–1024 bytes per [ADR 009](009-governance.md#adr-009-governance-model)).
+
+#### Interface (additions to StakingRegistry)
+
+```solidity
+// --- Node Registry ---
+
+// Registration (requires active stake >= minStake)
+function registerNode(
+    bytes32 nodeId,
+    bytes calldata multiaddrs,
+    string calldata regionHint,
+    bytes calldata bindingSignature,
+    bytes calldata ed25519Signature   // proves caller controls nodeId's ed25519 private key
+) external;
+
+function updateMultiaddrs(bytes calldata multiaddrs) external;
+
+function deregisterNode() external;
+
+// NodeId reclaim (production — legitimate owner reclaims a squatted NodeId)
+function reclaimNodeId(
+    bytes32 nodeId,
+    bytes calldata ed25519Signature
+) external;
+
+// Views
+function getNode(bytes32 nodeId) external view returns (NodeInfo memory);
+function getNodeByAddress(address ethAddress) external view returns (NodeInfo memory);
+function isActiveNode(bytes32 nodeId) external view returns (bool);
+function getActiveNodeCount() external view returns (uint256);
+function getActiveNodes(uint256 offset, uint256 limit)
+    external view returns (NodeInfo[] memory);
+function getFirstRegisteredAt(address ethAddress) external view returns (uint256);
+
+// State — per-nodeId nonce for ed25519 registration replay protection
+mapping(bytes32 => uint64) public registrationNonce;
+
+// Events
+event NodeRegistered(
+    bytes32 indexed nodeId,
+    address indexed ethAddress,
+    bytes multiaddrs,
+    string regionHint,
+    uint64 bindingNonce,
+    uint64 registrationNonce
+);
+event NodeMultiaddrUpdated(bytes32 indexed nodeId, bytes multiaddrs);
+event NodeDeregistered(bytes32 indexed nodeId);
+event NodeAutoEjected(bytes32 indexed nodeId, uint256 remainingStake);
+event NodeIdReclaimed(bytes32 indexed nodeId, address indexed previousOwner);
+```
+
+`registerNode` emits both `NodeRegistered` and `NodeIdBound` ([§ On-Chain Registration](#on-chain-registration)) — the latter ensures off-chain indexers tracking the authoritative `nodeIdToAddress` mapping see initial registrations alongside rebindings.
+
+#### Constraints
+
+- **One-to-one mapping.** Each `nodeId` maps to exactly one `ethAddress` and vice versa. Enforced with `require(nodeByAddress[msg.sender].nodeId == bytes32(0))` and `require(nodes[nodeId].ethAddress == address(0))`, where `bytes32(0)` is the sentinel for "unregistered". This enforces a one-stake-position-per-node invariant.
+- **`registerNode` rejects `nodeId == bytes32(0)`** (reserved as the unregistered sentinel). It binds `msg.sender` to `nodeId` — the caller's Ethereum address becomes `ethAddress`. This binding is on-chain and permanent until deregistration, distinct from the ephemeral per-session `NodeId`-to-address binding in [§ Off-Chain (Ephemeral) Binding for Clients](#off-chain-ephemeral-binding-for-clients). The function performs two signature verifications: (1) the `bindingSignature` parameter is an EIP-712 signature over `BindNodeId(nodeId, bindingNonce[msg.sender])` (see [§ Binding Message Format](#binding-message-format)); `registerNode` verifies this against the caller's current `bindingNonce`, then atomically writes the `nodeIdToAddress`/`addressToNodeId` mappings and increments `bindingNonce[msg.sender]`. (2) The `ed25519Signature` parameter proves ownership of the NodeId's ed25519 private key — see [§ NodeId Ownership Verification](#nodeid-ownership-verification) below. The shared per-address `bindingNonce` counter with `bindNodeId` ensures replay protection across both registration and rebinding. Every registered node is immediately slashable — there is no window in which a node is active in the mesh without a verifiable binding. The separate `StakingRegistry.bindNodeId()` function in [§ On-Chain Registration](#on-chain-registration) remains available for rebinding (key rotation) after initial registration.
+- **`deregisterNode` triggers unbonding.** Sets `active = false`, starts the current unbonding period (default 7 days, minimum 3 days per [ADR 009](009-governance.md#adr-009-governance-model)), and increments `registrationNonce[nodeId]` to invalidate any previously issued ed25519 registration signatures for this NodeId. Stake remains slashable during unbonding to prevent slash-then-run.
+- **Auto-ejection.** When slashing drops a node's stake below 50% of the minimum stake requirement ([ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn)), the contract sets `active = false` and emits `NodeAutoEjected`. The node must re-stake at full minimum to rejoin.
+- **`firstRegisteredAt` is write-once.** `registerNode` sets `firstRegisteredAt = block.timestamp` only if the stored value is 0 (first-ever registration for this address). On re-registration after deregistration or auto-ejection it retains its original value; it is never cleared by `deregisterNode` or auto-ejection. Used by clients to determine cold-start bootstrap eligibility ([ADR 008](008-reputation.md#cold-start-bootstrap)).
+
+#### Multiaddr Update Policy
+
+A governable cooldown (0–86400 seconds, see [ADR 009](009-governance.md#adr-009-governance-model)) prevents a compromised node key from rapidly flipping multiaddrs to redirect traffic. The default is 0 (disabled) — `updateMultiaddrs` costs ~$0.03 per call at typical L2 gas prices, so a small mesh updating occasionally (IP change, port rotation) needs no rate limiting. Governance tightens the cooldown if abuse is seen.
+
+#### Gas Costs
+
+| Operation | Estimated Gas | Estimated Cost |
+| --- | --- | --- |
+| `registerNode()` | ~650k–1.15M gas | ~$0.26–$0.46 |
+| `updateMultiaddrs()` | ~60k gas | ~$0.03 |
+| `deregisterNode()` | ~80k gas | ~$0.05 |
+| `reclaimNodeId()` | ~600k–1.1M gas | ~$0.24–$0.44 |
+
+`registerNode` and `reclaimNodeId` include ~500k–1M gas for on-chain ed25519 signature verification (Solidity library) — a one-time cost per node lifetime, negligible vs. the minimum stake deposit. Estimates assume typical multiaddr sizes (2–4 addresses, ~200 bytes total); larger payloads increase storage gas proportionally.
+
+#### Client Query Patterns
+
+Three tiers, from simplest to most scalable:
+
+1. **View functions (PoC).** `getActiveNodes(offset, limit)` with pagination. For tens of nodes, a single call with `limit = 100` returns the full node set. Clients call this on first startup to bootstrap their peer list, then rely on gossip for ongoing discovery (see [ADR 001 § Node Discovery (Gossip)](001-network.md#node-discovery-gossip)).
+
+2. **Event logs (PoC + production).** Clients index `NodeRegistered`, `NodeMultiaddrUpdated`, `NodeDeregistered`, and `NodeAutoEjected` events (indexed by `nodeId`) to maintain a local cache. More efficient than repeated view calls for larger node sets.
+
+3. **Subgraph (future production).** A Graph Protocol subgraph indexing registry events for complex queries (nodes by region, active node count over time, churn analysis). Not in PoC scope.
+
+#### NodeId Ownership Verification
+
+`registerNode` requires an ed25519 signature proving the caller controls the private key corresponding to `nodeId`. Without this proof, an attacker could front-run legitimate registrations by calling `registerNode` with someone else's NodeId — the attacker gains no traffic (cannot complete iroh QUIC handshakes with that identity), but under the one-to-one uniqueness constraint the legitimate owner is permanently blocked from registering. Even with the ed25519 verification overhead, the total `registerNode` cost (~$0.26–$0.46 gas + recoverable minimum stake) is low enough that squatting remains a cheap griefing/DoS vector without the ownership proof.
+
+**Note:** The `bindingSignature` parameter proves the caller's Ethereum key signed the NodeId binding — it does not prove ownership of the ed25519 NodeId itself. These are orthogonal concerns: `bindingSignature` prevents un-slashable registration (required in both PoC and production), while ed25519 ownership verification prevents NodeId squatting.
+
+##### Signed message
+
+The `ed25519Signature` parameter is an ed25519 signature over:
+
+```
+ed25519_sign(private_key, keccak256(abi.encodePacked(nodeId, msg.sender, block.chainid, registrationNonce[nodeId])))
+```
+
+Where `registrationNonce` is a per-`nodeId` counter (distinct from the per-address `bindingNonce` used for EIP-712 binding), incremented by `deregisterNode` on each deregistration. The nonce prevents replay of old signatures after a node deregisters and a different address attempts to re-register the same `nodeId`. The `block.chainid` binding prevents cross-chain signature replay.
+
+##### On-chain verification
+
+EVM has no native ed25519 precompile, and the RIP-7212 proposal is not yet deployed on the production L2 (see [Appendix: L2 Deployment](appendix-l2-deployment.md#appendix-production-l2-deployment-target) for chain and rollout status). The implementation uses a well-audited Solidity ed25519 verification library (e.g., `ed25519-sol`). This adds ~500k–1M gas to `registerNode`, a one-time cost per node lifetime — see [§ Gas Costs](#gas-costs) and the rationale in [ADR 014 § Slash Signatures — secp256k1 EIP-712](014-on-chain-verification.md#slash-signatures--secp256k1-eip-712) for why the secp256k1 `slash_sig` scheme used for routine slash evidence is not needed here.
+
+##### Reclaim flow
+
+If a NodeId was squatted (e.g., during a transition period or via a contract bug), the legitimate ed25519 key holder calls `reclaimNodeId(nodeId, ed25519Signature)`. This verifies the ed25519 signature over `keccak256(abi.encodePacked(nodeId, msg.sender, block.chainid, registrationNonce[nodeId]))`, forcibly deregisters the current holder (triggering their unbonding period and incrementing `registrationNonce`), clears the NodeId-to-address mappings, and emits `NodeIdReclaimed`. The caller can then call `registerNode` under their own address. Reclaim does not require the caller to have stake — it only proves ed25519 key ownership and clears the squatter's binding. `reclaimNodeId` is the sole reclaim mechanism: there is no admin override. Reclaim authority is gated entirely by ed25519 wire-key ownership (the iroh NodeId private key), distinct from the secp256k1 on-chain signatures used for slash evidence ([ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)) and EIP-712 NodeId↔Ethereum binding ([§ NodeId-to-Ethereum Binding](#nodeid-to-ethereum-binding)).
 
 ## Admission and Priority
 
@@ -611,7 +737,7 @@ Node admission and queueing policy — how a node orders incoming `StreamRequest
 
 ## NodeId-to-Ethereum Binding
 
-The protocol requires a verifiable mapping between iroh NodeIds (ed25519 public keys) and Ethereum addresses (secp256k1-derived). This binding is used for payment channel association and slash evidence attribution. Two orthogonal signature mechanisms protect this mapping: the EIP-712 `bindingSignature` (secp256k1) proves the Ethereum key holder consents to the association — preventing un-slashable registration; the `ed25519Signature` ([ADR 001, NodeId Ownership Verification](001-network.md#nodeid-ownership-verification)) proves the NodeId's private key holder authorized the registration — preventing NodeId squatting.
+The protocol requires a verifiable mapping between iroh NodeIds (ed25519 public keys) and Ethereum addresses (secp256k1-derived). This binding is used for payment channel association and slash evidence attribution. Two orthogonal signature mechanisms protect this mapping: the EIP-712 `bindingSignature` (secp256k1) proves the Ethereum key holder consents to the association — preventing un-slashable registration; the `ed25519Signature` ([§ NodeId Ownership Verification](#nodeid-ownership-verification)) proves the NodeId's private key holder authorized the registration — preventing NodeId squatting.
 
 ### Binding Message Format
 
@@ -632,11 +758,11 @@ The EIP-712 domain separator is the same as the `StakingRegistry` contract deplo
 
 ### On-Chain Registration
 
-Node registration and NodeId binding are atomic. `StakingRegistry.registerNode()` ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)) accepts a `bindingSignature` parameter — an EIP-712 signature over `BindNodeId(nodeId, bindingNonce[msg.sender])` — and an `ed25519Signature` parameter proving ownership of the NodeId's ed25519 private key (see [ADR 001, NodeId Ownership Verification](001-network.md#nodeid-ownership-verification)). It verifies both signatures, writes the `nodeIdToAddress`/`addressToNodeId` mappings, and increments `bindingNonce[msg.sender]` in the same transaction that adds the node to the mesh. The per-address nonce counter is shared with `bindNodeId`, giving replay protection across both paths. This eliminates the window in which a node could be active but not slashable.
+Node registration and NodeId binding are atomic. `StakingRegistry.registerNode()` ([§ Node Registry](#node-registry)) accepts a `bindingSignature` parameter — an EIP-712 signature over `BindNodeId(nodeId, bindingNonce[msg.sender])` — and an `ed25519Signature` parameter proving ownership of the NodeId's ed25519 private key (see [§ NodeId Ownership Verification](#nodeid-ownership-verification)). It verifies both signatures, writes the `nodeIdToAddress`/`addressToNodeId` mappings, and increments `bindingNonce[msg.sender]` in the same transaction that adds the node to the mesh. The per-address nonce counter is shared with `bindNodeId`, giving replay protection across both paths. This eliminates the window in which a node could be active but not slashable.
 
 The standalone `StakingRegistry.bindNodeId()` function below remains available for **rebinding only** (key rotation after initial registration). It is no longer needed at initial registration time.
 
-**Canonical source of truth:** The `nodeIdToAddress` / `addressToNodeId` mappings — written atomically by `registerNode` at initial registration and by `bindNodeId` on rebinding — are the authoritative source for payment attribution and slashing. `NodeInfo.ethAddress` in [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) is always `msg.sender`, so the two are consistent by construction under the one-to-one constraint. If the implementation stores both, `NodeInfo.ethAddress` MUST equal `nodeIdToAddress[nodeId]` at all times.
+**Canonical source of truth:** The `nodeIdToAddress` / `addressToNodeId` mappings — written atomically by `registerNode` at initial registration and by `bindNodeId` on rebinding — are the authoritative source for payment attribution and slashing. `NodeInfo.ethAddress` in [§ Data Structure](#data-structure) is always `msg.sender`, so the two are consistent by construction under the one-to-one constraint. If the implementation stores both, `NodeInfo.ethAddress` MUST equal `nodeIdToAddress[nodeId]` at all times.
 
 This creates an authoritative, publicly queryable mapping:
 
@@ -671,7 +797,7 @@ function isActive(address operator) external view returns (bool);
 // Intended for rebinding (key rotation) only — initial binding is performed
 // atomically inside registerNode(). No on-chain guard prevents calling this
 // before registerNode, but doing so creates a binding without mesh membership
-// or stake (harmless but useless). See ADR 001.
+// or stake (harmless but useless). See § Node Registry above.
 function bindNodeId(bytes32 nodeId, bytes calldata signature) external {
     uint64 nonce = bindingNonce[msg.sender];
     bytes32 digest = keccak256(abi.encodePacked(

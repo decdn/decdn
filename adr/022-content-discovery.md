@@ -178,7 +178,7 @@ The signal is honest by construction: FIND_VALUE traffic reflects real client de
 
 #### Signal 2: Local Cache-Miss Frequency
 
-Each node tracks cache miss timestamps per hash in a bounded map ([ADR 001 § Prefetching from Local Demand](001-network.md#adr-001-network-topology-and-peer-mesh)). A hash crossing the local-miss threshold (default: 3 misses in 5 minutes) is prefetched proactively.
+Each node tracks cache miss timestamps per hash in a bounded map (`HashMap<Hash, VecDeque<u64>>`, max 10,000 entries, LRU eviction). Each miss appends a timestamp (refreshing the entry's LRU position); entries older than 5 minutes are pruned on access. When a hash crosses a configurable threshold (default: 3 misses in 5 minutes), the node proactively pulls the blob via the DHT FIND_VALUE → probe → `cdn/client/v1` (paid) path.
 
 #### Prefetch Decision
 

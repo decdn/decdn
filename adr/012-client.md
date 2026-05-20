@@ -87,7 +87,7 @@ The client validates gossip using the same rules as nodes: signature verificatio
 
 Clients participate as gossip *leaves*: they subscribe and validate but never forward received messages back into the mesh. iroh-gossip propagation is the responsibility of staked nodes, which carry economic accountability (slashing, reputation) for relay correctness and availability; unstaked clients carry none. This applies to both PoC and production — not a deployment-time toggle.
 
-The registry query, retry schedule, and `peers.json` fallback defined here supersede the client-specific portions of [ADR 001 — Registry Unavailability](001-network.md#registry-unavailability). [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) retains the specification for node bootstrap and registry interaction.
+Node-side registry interaction and bootstrap is in [ADR 019 § Step 3.3](019-node-onboarding.md#step-33--build-initial-peer-table-from-on-chain-registry).
 
 ### Key Management
 

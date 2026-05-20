@@ -221,7 +221,7 @@ iroh handles NAT traversal transparently via QUIC hole-punching and relay fallba
 
 - When `Endpoint::direct_addresses()` changes (iroh emits an event), call `StakingRegistry.updateMultiaddrs(newMultiaddrs)` to keep the registry current.
 - **PoC:** No cooldown — updates can be submitted on any change (~$0.03/call).
-- **Production:** A governable cooldown prevents rapid address flipping by a compromised key ([ADR 001](001-network.md#multiaddr-update-policy)).
+- **Production:** A governable cooldown prevents rapid address flipping by a compromised key ([ADR 003 § Multiaddr Update Policy](003-payments.md#multiaddr-update-policy)).
 
 **Multiaddr encoding:** `multiaddrs` is a packed `bytes` field: a sequence of `(uint16 length, bytes data)` entries. Each entry is a QUIC multiaddr string (e.g., `/ip4/203.0.113.10/udp/4433/quic-v1`). Maximum total size: 1,024 bytes (governable).
 
