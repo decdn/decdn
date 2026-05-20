@@ -32,19 +32,17 @@
 //! drives a fixed three-phase iteration in [`RuntimeReloadState::reload`]:
 //!
 //! 1. **Resolve every section.** A single [`ConfigErrorBag`] is threaded
-//!    through every section's `resolve` call so an operator who broke N
-//!    fields sees them all in one error instead of fixing them one
-//!    SIGHUP at a time (matches the startup-path aggregation introduced
-//!    in #222). After every section has run, the bag is collapsed once:
-//!    any problem → return early, previous values retained for *every*
-//!    section (the all-or-nothing contract). Resolved values are stashed
-//!    in a per-section buffer cell (`Mutex<Option<Self::Resolved>>`) so
-//!    the trait stays `dyn`-safe despite each section having its own
-//!    `Resolved` type. Every section populates its buffer on every
-//!    resolve — a real value when validation passed, a sentinel /
-//!    placeholder when the section pushed to the bag — but the early
-//!    return skips the swap phase, and the next reload's `clear_buffer`
-//!    evicts any sentinel before anything else runs.
+//!    through every section's `resolve`, so an operator who broke
+//!    multiple fields sees them all in one error rather than fixing them
+//!    one SIGHUP at a time, and collapsed once at the end; any problem
+//!    → return early with previous values retained for *every* section
+//!    (the all-or-nothing contract). Resolved values
+//!    are stashed in a per-section buffer cell
+//!    (`Mutex<Option<Self::Resolved>>`) so the trait stays `dyn`-safe
+//!    despite each section having its own `Resolved` type; every section
+//!    populates its buffer on every resolve (a sentinel placeholder if
+//!    it pushed to the bag). The early return skips the swap phase, and
+//!    the next reload's `clear_buffer` evicts any leftover sentinel.
 //! 2. **Run every `fallible_commit`.** The log-level filter swap is the
 //!    only currently-fallible commit. This phase is the rollback
 //!    boundary: commits already applied stay applied; a later failure
@@ -398,11 +396,9 @@ impl ReloadableSection for PinnedHashesSection {
         }
     }
     fn resolve(&self, file: &FileConfig, bag: &mut ConfigErrorBag) {
-        // Same shape as `resolve_cache_into` in `decdn_common::config`: on
-        // parse failure, push to the shared bag and stash an empty
-        // placeholder in the buffer so later sections still get to run.
-        // The early return in `reload()` (after `bag.into_result()`) makes
-        // sure the placeholder is never observed by the swap phase.
+        // Same shape as `resolve_cache_into`: bag-push on parse failure,
+        // empty placeholder so later sections still run. `reload()`'s
+        // early return guarantees the placeholder never reaches swap.
         let resolved = bag
             .try_with(
                 "cache.pinned_hashes",
@@ -910,11 +906,8 @@ impl RuntimeReloadState {
         }
 
         // Phase 1: resolve every section into one shared bag, then
-        // collapse it once. Aggregating problems matches the startup-path
-        // behaviour introduced in #222 (single bulleted error) so an
-        // operator who broke N fields sees them all in one warn line and
-        // fixes them in one edit/SIGHUP cycle. Any non-empty bag → return
-        // early, no side-effects committed: the all-or-nothing contract.
+        // collapse it once. Non-empty bag → return early, no side-effects
+        // committed (the all-or-nothing contract).
         let mut bag = ConfigErrorBag::new();
         for section in &self.sections {
             section.resolve(&file, &mut bag);
@@ -2151,13 +2144,9 @@ mod tests {
         );
     }
 
-    /// SIGHUP must aggregate every section's problems into one error
-    /// instead of bailing on the first (issue #608). Without this the
-    /// operator goes back to the edit/run/fix/run loop that #222 removed
-    /// for startup. Inputs: bad `payment.rate_per_mb`, bad `security.*`,
-    /// and a malformed `cache.pinned_hashes` entry. All three field names
-    /// must appear in the single returned error, and *no* section's
-    /// previous value may have moved.
+    /// SIGHUP aggregates problems across sections into one error;
+    /// all-or-nothing — no section's previous value moves and the
+    /// log-level setter is never called.
     #[tokio::test]
     async fn reload_aggregates_problems_across_sections() {
         let dir = tempfile::tempdir().unwrap();
@@ -2220,11 +2209,8 @@ mod tests {
         );
     }
 
-    /// Guard against the `*_into` worker calls accidentally short-
-    /// circuiting on the first bag push: two distinct problems inside
-    /// one section must both appear in the aggregated error. Uses
-    /// `[payment]` with `rate_per_mb = 0` and `delivery_ceiling = 0` —
-    /// `resolve_payment_into` runs an independent `bag.check` for each.
+    /// Two problems inside one section must both surface — guards
+    /// against `*_into` workers short-circuiting on the first push.
     #[tokio::test]
     async fn reload_aggregates_two_problems_in_one_section() {
         let dir = tempfile::tempdir().unwrap();

@@ -134,10 +134,10 @@ impl ConfigErrorBag {
         self.problems.iter().any(|p| p.field == field)
     }
 
-    /// Number of problems recorded so far. Useful for emitting a
-    /// structured `problem_count` field on the aggregated reload-failure
-    /// warn line in `runtime::reload`, where the consuming `into_result`
-    /// would otherwise force a `.matches(...).count()` over the message.
+    /// Number of problems recorded. Read before
+    /// [`into_result`](Self::into_result) when the count is needed
+    /// alongside the consumed error (e.g. as a structured
+    /// `problem_count` log field).
     pub const fn problem_count(&self) -> usize {
         self.problems.len()
     }
