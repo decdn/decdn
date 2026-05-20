@@ -1747,6 +1747,17 @@ async fn http_origin_rejects_302_redirect() -> anyhow::Result<()> {
         "redirect target must not be contacted (SSRF defence), got {} hit(s)",
         final_hits.len()
     );
+    // Source-hit count = 1 guards against the test passing vacuously
+    // if the client errored before issuing any HTTP request (e.g. a
+    // URL-build failure on a future refactor): the SSRF assertion
+    // would still see 0 target hits, but the rejection wouldn't be
+    // proving what we think.
+    let source_hits = received_requests_or_fail(&redirect_server, "302 SSRF test source").await?;
+    anyhow::ensure!(
+        source_hits.len() == 1,
+        "expected exactly 1 request to the redirect source, got {}",
+        source_hits.len()
+    );
     anyhow::ensure!(!engine.has(hash).await?, "rejected fetch must not cache");
     Ok(())
 }
@@ -1754,8 +1765,8 @@ async fn http_origin_rejects_302_redirect() -> anyhow::Result<()> {
 /// Resolve `received_requests()` or fail loudly: `None` means wiremock
 /// recording is disabled, in which case the empty-vec proof of "no
 /// requests reached" is meaningless and would silently mask an SSRF
-/// regression. The three redirect tests below rely on this assertion
-/// being load-bearing.
+/// regression. The redirect tests below rely on this assertion being
+/// load-bearing.
 async fn received_requests_or_fail(
     server: &MockServer,
     label: &str,
@@ -1803,6 +1814,12 @@ async fn http_origin_rejects_301_redirect() -> anyhow::Result<()> {
         "redirect target must not be contacted (SSRF defence), got {} hit(s)",
         final_hits.len()
     );
+    let source_hits = received_requests_or_fail(&redirect_server, "301 SSRF test source").await?;
+    anyhow::ensure!(
+        source_hits.len() == 1,
+        "expected exactly 1 request to the redirect source, got {}",
+        source_hits.len()
+    );
     Ok(())
 }
 
@@ -1845,6 +1862,12 @@ async fn http_origin_rejects_307_redirect() -> anyhow::Result<()> {
         "redirect target must not be contacted (SSRF defence), got {} hit(s)",
         final_hits.len()
     );
+    let source_hits = received_requests_or_fail(&redirect_server, "307 SSRF test source").await?;
+    anyhow::ensure!(
+        source_hits.len() == 1,
+        "expected exactly 1 request to the redirect source, got {}",
+        source_hits.len()
+    );
     Ok(())
 }
 
@@ -1884,6 +1907,13 @@ async fn http_origin_redirect_to_404_origin_surfaces_redirect_error() -> anyhow:
         final_hits.is_empty(),
         "redirect target must not be contacted (SSRF defence), got {} hit(s)",
         final_hits.len()
+    );
+    let source_hits =
+        received_requests_or_fail(&redirect_server, "redirect-to-404 SSRF test source").await?;
+    anyhow::ensure!(
+        source_hits.len() == 1,
+        "expected exactly 1 request to the redirect source, got {}",
+        source_hits.len()
     );
     Ok(())
 }
