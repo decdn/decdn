@@ -365,8 +365,9 @@ The publisher and namespace primitives are defined in [ADR 002 § Publisher Iden
 interface IOriginAssignment {
     // Publisher proposes a candidate origin set for one of their namespaces.
     // Reverts if msg.sender is not the namespace owner, if any operator is not
-    // active in StakingRegistry at proposal time, or if the operator count is
-    // outside [minRedundancy, maxOriginsPerNamespace].
+    // active in StakingRegistry at proposal time, if operators.length == 0
+    // (use revokeAssignment for explicit removal), or if operators.length
+    // exceeds maxOriginsPerNamespace.
     function proposeAssignment(uint256 namespaceId, address[] calldata operators) external;
 
     // Governance ratifies a pending proposal after the assignment timelock.
@@ -390,11 +391,8 @@ interface IOriginAssignment {
     //  - Governance may revoke an operator from any namespace.
     // Reverts if `operator` is not a member of the active set for `namespaceId`
     // — typo protection; revoking a non-member is always a programming error.
-    // Revocation that drops the active set below minRedundancy IS allowed; the
-    // namespace enters an under-redundant state until a new proposal is
-    // activated. The min-redundancy invariant binds activations, not revocations,
-    // because revocation is sometimes urgent (operator misbehaving) and forcing
-    // a replacement-before-removal would block the urgent path.
+    // Revocation may drop the active set to zero; the namespace simply enters
+    // the unassigned state until a new proposal is activated.
     function revokeAssignment(uint256 namespaceId, address operator) external;
 
     // Permissionless storage cleanup for blacklisted operators.
@@ -420,10 +418,8 @@ interface IOriginAssignment {
     function setContentBlacklist(address contentBlacklist) external;
 
     // Governable parameters with safety bounds (see ADR 009)
-    function setMinRedundancy(uint256 floor) external;             // non-zero namespaces
     function setMaxOriginsPerNamespace(uint256 cap) external;      // non-zero namespaces
     function setAssignmentTimelock(uint256 secondsDelay) external; // non-zero namespaces
-    function setDefaultOpenMinRedundancy(uint256 floor) external;
     function setDefaultOpenMaxOrigins(uint256 cap) external;
 
     // Views. For namespaceId == 0 these read the default-open allow-list.
@@ -452,11 +448,10 @@ interface IOriginAssignment {
 - **Activation-revert auto-clear** — when `activateAssignment` reverts because pending operators became inactive or blacklisted during the timelock window, the pending proposal is cleared and `AssignmentProposalCancelled(autoCleared=true)` fires; the publisher submits a fresh proposal without an explicit cancellation call.
 - **`ContentBlacklist` unbound during the deployment window** — until `setContentBlacklist` is called post-deploy (see [ADR 016 § Post-Deployment Initialization](016-contract-interactions.md#post-deployment-initialization)), `activateAssignment` skips the blacklist check and validates only against `StakingRegistry.isActive`. Once set the check is mandatory thereafter; `setContentBlacklist(address(0))` reverts to prevent regressing into the deployment-window state. `pruneBlacklistedAssignment` reverts until the binding is set.
 - **`revokeAssignment` of a non-member operator** — reverts. Typo protection; the explicit error surfaces accidental address mismatches that would otherwise pass silently.
-- **`revokeAssignment` dropping the active set below `minRedundancy`** — allowed by design. Revocation is sometimes urgent (operator misbehaving); blocking it on a redundancy invariant would lock the contract into an unsafe state. The namespace enters under-redundant operation until a new proposal is activated; off-chain consumers (clients, monitors) observe this via `getOrigins(namespaceId).length < minRedundancy` and route accordingly.
 
 ### Lifecycle
 
-1. **Publisher proposal.** The publisher calls `proposeAssignment(namespaceId, operators)`. The contract validates that the proposer owns the namespace, that every candidate is currently active in `StakingRegistry`, and that the operator count satisfies the `minRedundancy` and `maxOriginsPerNamespace` bounds. The proposal enters a pending state with `readyAt = block.timestamp + assignmentTimelock` (governance-bounded between 24 hours and 14 days; see [ADR 009](009-governance.md#adr-009-governance-model)).
+1. **Publisher proposal.** The publisher calls `proposeAssignment(namespaceId, operators)`. The contract validates that the proposer owns the namespace, that every candidate is currently active in `StakingRegistry`, that `operators.length >= 1`, and that the operator count does not exceed `maxOriginsPerNamespace`. The proposal enters a pending state with `readyAt = block.timestamp + assignmentTimelock` (governance-bounded between 24 hours and 14 days; see [ADR 009](009-governance.md#adr-009-governance-model)).
 2. **Governance ratification.** Governance reviews the proposal off-chain during the timelock window. After it elapses, a governance proposal calls `activateAssignment(namespaceId)`. Before replacing the active set, activation re-checks every pending operator against `StakingRegistry.isActive` and `ContentBlacklist.isOriginBlacklisted` so a proposal cannot go live with operators that became inactive or were blacklisted during the delay window; if any operator now fails validation, activation reverts and the publisher must submit a fresh proposal. Successful activation replaces the namespace's authorized operator set atomically.
 3. **Operator notification.** Operators in the activated set are now authorized to act as origins for the namespace. They configure their origin store locally and begin serving the namespace's content. The wire protocol does not distinguish origins from cache nodes at probe time — origin status is a publisher-level commitment surfaced via `getOrigins(namespaceId)` for off-chain consumers.
 4. **Revocation.** A publisher may unilaterally remove an operator from their own namespace's set (e.g., the operator is performing poorly). Governance may revoke any operator from any namespace via the standard proposal path (e.g., the operator is misbehaving but has not yet crossed the blacklist threshold). Blacklisting (`ContentBlacklist.addOrigin`) takes effect via runtime checks rather than a cross-call — see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist).
@@ -467,17 +462,17 @@ The two-step propose-then-ratify flow is deliberate: it gives publishers agency 
 
 The default-open namespace has no publisher, so the per-namespace propose / ratify flow does not apply. Instead the DAO directly maintains a single global allow-list of operators authorized to serve as origin for *any* default-open hash, held in `OriginAssignment` under the same per-namespace `EnumerableSet` storage used for registered namespaces, keyed by `namespaceId == 0` — `isAuthorizedOrigin(0, op)` is the same view used everywhere else, no special case downstream.
 
-**Lifecycle.** Allow-list updates are GOVERNANCE_ROLE-only single-step proposals under the Governor's standard timelock. `setDefaultOpenAllowlist(operators)` replaces the active set atomically; `addDefaultOpenOperator` / `removeDefaultOpenOperator` are convenience deltas with the same authority and delay. Each transition appends a checkpoint per affected operator. The contract enforces `operators.length ∈ [defaultOpenMinRedundancy, defaultOpenMaxOrigins]`, that every operator is `StakingRegistry.isActive` at activation time, and rejects duplicate addresses. `isAuthorizedOrigin(0, op)` returns set membership from the first deployment — the allow-list starts empty and default-open content has no authorized origin until governance seats one.
+**Lifecycle.** Allow-list updates are GOVERNANCE_ROLE-only single-step proposals under the Governor's standard timelock. `setDefaultOpenAllowlist(operators)` replaces the active set atomically; `addDefaultOpenOperator` / `removeDefaultOpenOperator` are convenience deltas with the same authority and delay. Each transition appends a checkpoint per affected operator. The contract enforces `operators.length <= defaultOpenMaxOrigins`, that every operator is `StakingRegistry.isActive` at activation time, and rejects duplicate addresses. `isAuthorizedOrigin(0, op)` returns set membership from the first deployment — the allow-list starts empty and default-open content has no authorized origin until governance seats one.
 
-**Parameters and bounds.** `defaultOpenMinRedundancy` (default 10) and `defaultOpenMaxOrigins` (default 100) are bounded by [ADR 009](009-governance.md#adr-009-governance-model), with the cross-parameter invariants `5 ≤ defaultOpenMinRedundancy ≤ defaultOpenMaxOrigins ≤ 500` and `defaultOpenMinRedundancy ≥ minRedundancy` enforced at the contract layer. Both are higher than the per-registered-namespace bounds because one approved operator may serve any default-open hash — the surface area is the entire long tail.
+**Parameters and bounds.** `defaultOpenMaxOrigins` (default 100) is bounded by [ADR 009](009-governance.md#adr-009-governance-model) within `[20, 500]` — a gas-and-storage cap on `getOrigins(0)` view calls and on default-open allow-list growth, larger than the per-registered cap to allow geographic and operator-class diversity at the cost of bounded view gas.
 
 ### Unassigned namespaces
 
 A registered namespace with no activated assignment is **unassigned**. No operator is authorized as origin for unassigned content, but the protocol still permits cache-only serving from any staked operator that happens to hold the blob — see [ADR 005 § cdn/probe/v1](005-protocol.md#cdnprobev1--latency-probe). Publishers who claim content but never propose an assignment effectively prevent any new origin from picking up the content from canonical storage; cached copies eventually expire. This is by design — it lets a publisher delete their content set from the network by claiming the hashes and refusing to assign origins.
 
-### Minimum-redundancy invariant
+### Duplicate-address rejection
 
-The contract enforces `operators.length >= minRedundancy` at both proposal and activation time, and rejects proposals whose `operators` array contains duplicate addresses (without this a publisher could submit `[A, A, A]` to satisfy `minRedundancy = 3` while concentrating origin responsibility on one operator). Activation also re-validates that every pending operator is still active and not blacklisted before the set goes live. `minRedundancy` is governance-bounded (see [ADR 009](009-governance.md#adr-009-governance-model); range `[1, 10]`, default `3`) under the cross-parameter invariant `1 ≤ minRedundancy ≤ maxOriginsPerNamespace`, ensuring no registered namespace can be activated with a single point of failure. The invariant is *not* enforced on revocation — a publisher or governance may revoke operators down to zero, but new activations must satisfy the floor. Under-redundant namespaces are observable via `getOrigins`; clients and off-chain monitors may surface this as a health indicator for the namespace's owner.
+The contract rejects proposals whose `operators` array contains duplicate addresses. Without this, a publisher could submit `[A, A, A]` and concentrate origin responsibility on one operator while appearing to commit to multiple. Activation also re-validates that every pending operator is still active and not blacklisted before the set goes live. Operator-set sizing — including how many operators a publisher commits per namespace — is a publisher/governance policy decision, not a contract invariant; the protocol does not enforce a redundancy floor beyond the requirement that `proposeAssignment` contain at least one operator (use `revokeAssignment` for explicit removal).
 
 ### Cross-contract integration
 
@@ -604,9 +599,9 @@ Slash challenges cannot be opened against operators while the disputed entry is 
 - Emergency path addresses CSAM and actively-exploited material without a 5-day vote cycle
 - Reason field and on-chain audit trail support legal defensibility for operators
 - Local denylist preserves operator autonomy for direct legal notices
-- Origin assignment authority gives publishers a protocol-level way to commit specific operators to serving their content with an enforced minimum-redundancy invariant — no withholding-by-single-origin failure mode for registered namespaces
+- Origin assignment authority gives publishers a protocol-level way to commit specific operators to serving their content; the operator-set size is a publisher/governance decision, not a contract-enforced floor
 - Symmetric blacklist/assignment infrastructure: a blacklisted operator is treated as unauthorized at every runtime check across every namespace they were authorized to serve, with lazy storage cleanup (see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist))
-- Default-open content is governed by a single DAO-maintained allow-list with its own redundancy floor, with a uniform `OriginAssignment` storage and view model across registered namespaces and the default-open namespace
+- Default-open content is governed by a single DAO-maintained allow-list, with a uniform `OriginAssignment` storage and view model across registered namespaces and the default-open namespace
 - Per-entry appeals (see [§ Blacklist Entry Appeals](#blacklist-entry-appeals)) close the regional-blacklist due-process gap with a bounded fast-track, so a wrongly served takedown can be challenged without `suspendRegionalBody` freezing every other entry the body issued
 - Appeal standing extends to publishers, affected operators, and TOKEN holders above a threshold — content advocates and end-user proxies can file without on-chain content ownership, while the bond and frequency caps deter pro-forma filings
 - Disjoint evidence sets across the two appeal paths (see [§ Blacklist Entry Appeals](#blacklist-entry-appeals)) map a single grievance cleanly to a single path
