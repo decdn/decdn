@@ -82,9 +82,21 @@ impl HttpOrigin {
         // decompression — otherwise reqwest would strip the header and
         // hand back already-decompressed bytes, masking what the origin
         // actually sent and bypassing our `UnsupportedEncoding` error path.
+        //
+        // `redirect::Policy::none()` defuses SSRF (#579): the configured
+        // base URL is validated by `parse_origin_url`, but reqwest's
+        // default policy (follow up to 10) would let a compromised or
+        // misconfigured origin 3xx-redirect us to `http://169.254.169.254`
+        // (cloud metadata), `http://127.0.0.1`, or any RFC-1918 host —
+        // the request lands on the internal target before BLAKE3
+        // verification gets a chance to fire on the body. Origins must
+        // serve `{base}/{hex}` directly anyway (query/fragment are
+        // already rejected by `parse_origin_url`), so a redirect was
+        // never a legitimate response shape.
         let client = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .user_agent(user_agent)
+            .redirect(reqwest::redirect::Policy::none())
             .no_gzip()
             .no_deflate()
             .no_brotli()
@@ -172,10 +184,12 @@ fn classify_encoding(trimmed: &str) -> Option<Result<SupportedEncoding, OriginEr
 ///   the `max_retries` ceiling bounds the cost.
 ///
 /// The `else` arm covers `is_builder()` (unreachable with a parsed
-/// `OriginUrl`), `is_redirect()` (we follow with reqwest's default
-/// limit), `is_status()` (we handle status codes ourselves before
-/// reaching here), and any future reqwest variant. Permanent because
-/// none of those are operationally retriable.
+/// `OriginUrl`), `is_redirect()` (unreachable with `Policy::none()` —
+/// 3xx responses are returned as `resp.status()` instead of as a
+/// reqwest error; see `HttpOrigin::new_with_user_agent`), `is_status()`
+/// (we handle status codes ourselves before reaching here), and any
+/// future reqwest variant. Permanent because none of those are
+/// operationally retriable.
 fn classify_reqwest_error(e: reqwest::Error) -> OriginPullError {
     if e.is_connect() || e.is_timeout() || e.is_request() || e.is_body() || e.is_decode() {
         OriginPullError::Transient(e.into())
@@ -241,6 +255,19 @@ impl Origin for HttpOrigin {
             };
 
             let status = resp.status();
+            // SSRF defence (#579): with `redirect::Policy::none()` (set
+            // in the client builder), reqwest returns 3xx responses
+            // straight to us instead of following. Refuse them with a
+            // clear operator-visible message rather than letting the
+            // generic "returned 302" path fire — origins must serve
+            // `{base}/{hex}` directly. Permanent because a compliant
+            // origin will not redirect; retrying won't change that.
+            if status.is_redirection() {
+                return Err(OriginPullError::Permanent(anyhow::anyhow!(
+                    "origin GET {url_log} returned {status}; redirects are disabled \
+                     to prevent SSRF — origin must serve {{base}}/{{hex}} directly"
+                )));
+            }
             if status == StatusCode::NOT_FOUND {
                 return Ok(OriginFetch::NotFound);
             }

@@ -404,6 +404,17 @@ impl Metrics {
 /// Bind the `/metrics` HTTP listener synchronously so startup can fail fast
 /// if the port is unavailable. The returned listener is consumed by [`serve`].
 ///
+/// Emits a `WARN` if `addr` is non-loopback (#579). The `OpenMetrics`
+/// surface exposes peer-table size, gossip rejection reasons,
+/// pull-through byte volumes, GC/connection stats — useful
+/// reconnaissance for anyone who can reach it. The default config
+/// binds loopback (`appendix-local-admin-http` calls metrics
+/// "loopback-only"), but `observability.metrics_bind` is operator-
+/// settable to `0.0.0.0` for containerised deployments
+/// (`crates/common/src/config/types.rs` — `ObservabilityConfig::metrics_bind`).
+/// We warn but do not reject so that documented container workflows
+/// keep working.
+///
 /// # Errors
 ///
 /// Returns an error if the `TcpListener::bind` call fails (port in use,
@@ -412,6 +423,34 @@ pub async fn bind(addr: SocketAddr) -> anyhow::Result<TcpListener> {
     let listener = TcpListener::bind(addr)
         .await
         .map_err(|e| anyhow::anyhow!("metrics bind {addr} failed: {e}"))?;
+    // `to_canonical()` unwraps IPv4-mapped IPv6 (e.g.
+    // `::ffff:127.0.0.1`) so an operator binding the dual-stack
+    // form of loopback doesn't get a false "non-loopback" warning.
+    // `Ipv6Addr::is_loopback()` only matches `::1`.
+    let ip = addr.ip().to_canonical();
+    if !ip.is_loopback() {
+        // `is_unspecified()` (`0.0.0.0` / `::`) is the common
+        // containerised case; we call it out by name so an operator
+        // grepping startup logs sees the intent. A public IP falls
+        // through to the generic non-loopback message.
+        if ip.is_unspecified() {
+            tracing::warn!(
+                %addr,
+                "metrics server is binding all interfaces (non-loopback); the OpenMetrics \
+                 endpoint exposes peer-table size, gossip rejection reasons, pull-through \
+                 byte volumes, and GC/connection stats — gate it behind a private network \
+                 or reverse proxy if reachable from outside the host"
+            );
+        } else {
+            tracing::warn!(
+                %addr,
+                "metrics server is binding a non-loopback address; the OpenMetrics \
+                 endpoint exposes peer-table size, gossip rejection reasons, pull-through \
+                 byte volumes, and GC/connection stats — restrict reachability to trusted \
+                 scrapers"
+            );
+        }
+    }
     tracing::info!(%addr, "metrics server listening");
     Ok(listener)
 }
@@ -745,6 +784,53 @@ mod tests {
                 "counter {name} should report {expected} after 1 miss + 1 hit:\n{text}"
             );
         }
+    }
+
+    /// `bind` accepts both loopback and non-loopback addresses (the
+    /// non-loopback path emits a `WARN` per #579 but does not reject).
+    /// We can't easily intercept the tracing emission without a
+    /// dedicated capture subscriber, so this is a smoke test of both
+    /// branches plus IPv6 loopback — a future refactor that narrowed
+    /// the predicate to e.g. `addr.ip() == Ipv4Addr::LOCALHOST` would
+    /// regress on `::1` and break here visibly.
+    #[tokio::test]
+    async fn bind_accepts_loopback_and_warns_on_non_loopback() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+        // IPv4 loopback: warn-free.
+        let v4_loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let listener = bind(v4_loopback).await.unwrap();
+        let bound = listener.local_addr().unwrap();
+        assert!(
+            bound.ip().is_loopback(),
+            "IPv4 loopback bind should resolve to a loopback addr: got {bound}"
+        );
+        drop(listener);
+
+        // IPv6 loopback `::1`: also warn-free. Some hosts disable
+        // IPv6; skip rather than fail if the bind itself errors.
+        let v6_loopback = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0);
+        if let Ok(listener) = bind(v6_loopback).await {
+            let bound = listener.local_addr().unwrap();
+            assert!(
+                bound.ip().is_loopback(),
+                "IPv6 loopback bind should resolve to a loopback addr: got {bound}"
+            );
+        }
+
+        // Unspecified (`0.0.0.0`): allowed, but the bind path WARNs.
+        // Bind succeeds (a regression that rejected unspecified
+        // would surface as a `bind` error here). `local_addr()`
+        // echoes the requested IP so `is_unspecified()` is the
+        // direct post-bind assertion.
+        let unspecified = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+        let listener = bind(unspecified).await.unwrap();
+        let bound = listener.local_addr().unwrap();
+        assert!(
+            bound.ip().is_unspecified(),
+            "0.0.0.0 bind should resolve to the unspecified addr: got {bound}"
+        );
+        drop(listener);
     }
 
     #[test]
