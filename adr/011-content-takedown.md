@@ -408,8 +408,8 @@ interface IOriginAssignment {
     function pruneBlacklistedAssignment(uint256 namespaceId, address operator) external;
 
     // Default-open allow-list (namespaceId == 0). GOVERNANCE_ROLE only; see
-    // "Default-open allow-list" below for the lifecycle, bootstrap rule, and
-    // validation invariants.
+    // "Default-open allow-list" below for the lifecycle and validation
+    // invariants.
     function setDefaultOpenAllowlist(address[] calldata operators) external;
     function addDefaultOpenOperator(address operator) external;
     function removeDefaultOpenOperator(address operator) external;
@@ -432,10 +432,6 @@ interface IOriginAssignment {
     function getPendingAssignment(uint256 namespaceId)
         external view returns (address[] memory operators, uint256 readyAt);
 
-    // Bootstrap state for the default-open allow-list.
-    function defaultOpenAllowlistActive() external view returns (bool);
-    function defaultOpenActivatedAt() external view returns (uint64);
-
     // Events
     event AssignmentProposed(uint256 indexed namespaceId, address indexed proposer, address[] operators, uint256 readyAt);
     event AssignmentProposalCancelled(uint256 indexed namespaceId, address indexed proposer, bool autoCleared);
@@ -445,7 +441,6 @@ interface IOriginAssignment {
     event DefaultOpenAllowlistUpdated(address[] operators, uint256 indexed updateIndex);
     event DefaultOpenOperatorAdded(address indexed operator);
     event DefaultOpenOperatorRemoved(address indexed operator);
-    event DefaultOpenAllowlistActivated();
 }
 ```
 
@@ -472,9 +467,7 @@ The two-step propose-then-ratify flow is deliberate: it gives publishers agency 
 
 The default-open namespace has no publisher, so the per-namespace propose / ratify flow does not apply. Instead the DAO directly maintains a single global allow-list of operators authorized to serve as origin for *any* default-open hash, held in `OriginAssignment` under the same per-namespace `EnumerableSet` storage used for registered namespaces, keyed by `namespaceId == 0` — `isAuthorizedOrigin(0, op)` is the same view used everywhere else, no special case downstream.
 
-**Lifecycle.** Allow-list updates are GOVERNANCE_ROLE-only single-step proposals under the Governor's standard timelock — no separate `defaultOpenAssignmentTimelock` parameter. `setDefaultOpenAllowlist(operators)` replaces the active set atomically; `addDefaultOpenOperator` / `removeDefaultOpenOperator` are convenience deltas with the same authority and delay. Each transition appends a checkpoint per affected operator. The contract enforces `operators.length ∈ [defaultOpenMinRedundancy, defaultOpenMaxOrigins]`, that every operator is `StakingRegistry.isActive` at activation time, and rejects duplicate addresses.
-
-**Bootstrap.** `isAuthorizedOrigin(0, op)` is permissive (returns `true` for any active staker) until the first non-empty activation, then strict (returns set membership). Activation atomically flips `defaultOpenAllowlistActive` to `true`, sets `defaultOpenActivatedAt`, and emits `DefaultOpenAllowlistActivated` — a single observable transition so reputation and node tooling can pivot cleanly. Rationale: pre-activation deployments must serve content without a Governor having executed any allow-list proposals, so a hard cutover is unworkable, and an implicit genesis-seeded set would be opaque and hard to reason about post-hoc.
+**Lifecycle.** Allow-list updates are GOVERNANCE_ROLE-only single-step proposals under the Governor's standard timelock. `setDefaultOpenAllowlist(operators)` replaces the active set atomically; `addDefaultOpenOperator` / `removeDefaultOpenOperator` are convenience deltas with the same authority and delay. Each transition appends a checkpoint per affected operator. The contract enforces `operators.length ∈ [defaultOpenMinRedundancy, defaultOpenMaxOrigins]`, that every operator is `StakingRegistry.isActive` at activation time, and rejects duplicate addresses. `isAuthorizedOrigin(0, op)` returns set membership from the first deployment — the allow-list starts empty and default-open content has no authorized origin until governance seats one.
 
 **Parameters and bounds.** `defaultOpenMinRedundancy` (default 10) and `defaultOpenMaxOrigins` (default 100) are bounded by [ADR 009](009-governance.md#adr-009-governance-model), with the cross-parameter invariants `5 ≤ defaultOpenMinRedundancy ≤ defaultOpenMaxOrigins ≤ 500` and `defaultOpenMinRedundancy ≥ minRedundancy` enforced at the contract layer. Both are higher than the per-registered-namespace bounds because one approved operator may serve any default-open hash — the surface area is the entire long tail.
 
@@ -626,7 +619,7 @@ Slash challenges cannot be opened against operators while the disputed entry is 
 - Multiple regional bodies add governance coordination overhead; regional bodies can disagree on scope
 - Blacklisted content remains content-addressable and verifiable off-network; eviction stops CDN serving but does not prevent redistribution by other means
 - Origin assignment authority places positive node-role authorization in governance scope alongside the existing negative authority (blacklisting). Capture risk and operator-concentration risk are governance concerns, not just off-protocol coordination concerns
-- Cache-only role is permissionless per [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh); the origin role is governance-gated for all content — per-namespace `OriginAssignment` for registered namespaces and the default-open allow-list for unregistered content. Until governance executes the first default-open allow-list activation, the bootstrap window is open (see [§ Default-open allow-list](#default-open-allow-list)); the activation closes it
+- Cache-only role is permissionless per [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh); the origin role is governance-gated for all content — per-namespace `OriginAssignment` for registered namespaces and the default-open allow-list for unregistered content
 - The appeal flow adds seven entry points (`openBlacklistAppeal` / `fastTrackAppeal` / `unFastTrackAppeal` / `rejectAppeal` / `ratifyAppealRemoval` / `reverseAppeal` / `cleanupExpiredAppeal`), per-appeal escrow accounting, a per-address perjury denylist, and a per-address rejection-cooldown counter to `ContentBlacklist`, increasing the contract's surface area and audit cost — same trade-off acknowledged in [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface)
 - Filers must front `BLACKLIST_APPEAL_BOND` (1,000 TOKEN default) at filing time. For cold-start participants and small-balance TOKEN holders this is a real frictional cost. The bond is governance-bounded `[100, 10,000]` so governance can reduce it if observed filing volumes warrant
 - The per-body concurrent-appeal cap and per-filer 90-day frequency cap trade off coverage for griefing resistance: a coordinated good-faith dispute against many entries issued by a single body can be queued behind the cap. Mitigations are observable on-chain (cap-reached events should be surfaced in operator tooling) and the slow-path ve-Governor override remains available for cases that overflow the fast-track

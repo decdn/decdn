@@ -53,7 +53,7 @@ Before any on-chain or protocol activity:
    namespace's publisher must propose the operator via `OriginAssignment.proposeAssignment`
    and the DAO must ratify after timelock ([ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority));
    for default-open content (`namespaceId == 0`), the operator must be in the
-   DAO-maintained allow-list (subject to the bootstrap rule — see
+   DAO-maintained allow-list (see
    [ADR 011 § Default-open allow-list](011-content-takedown.md#default-open-allow-list)).
    These steps run on the publisher's or governance's timeline, independent of node
    onboarding.
