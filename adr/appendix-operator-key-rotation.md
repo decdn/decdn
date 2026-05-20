@@ -158,7 +158,7 @@ Same as [§ Safe owner / session-key rotation (production preferred path)](#safe
 
 Rotate **iroh first**, then Ethereum:
 
-1. Run [§ iroh node-key rotation only](#iroh-node-key-rotation-only) to completion. `bindNodeId` finality is one block confirmation plus the `NodeIdBound` event — no unbonding period (only `deregisterNode` triggers unbonding per [ADR 001](001-network.md#contract-interface-node-registry)).
+1. Run [§ iroh node-key rotation only](#iroh-node-key-rotation-only) to completion. `bindNodeId` finality is one block confirmation plus the `NodeIdBound` event — no unbonding period (only `deregisterNode` triggers unbonding per [ADR 003 § Node Registry](003-payments.md#node-registry)).
 2. Run [§ EOA → EOA migration (PoC default)](#eoa--eoa-migration-poc-default), [§ EOA → Safe migration (one-time, recommended)](#eoa--safe-migration-one-time-recommended), or [§ Safe owner / session-key rotation (production preferred path)](#safe-owner--session-key-rotation-production-preferred-path) per the account-type goal. Replay protection between the steps is the per-address `bindingNonce`, incremented when [§ iroh node-key rotation only](#iroh-node-key-rotation-only) ran ([ADR 003 § NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)) — no extra cooling-off window required.
 
 Reverse order works but is wasteful: [§ Ethereum signing-key rotation only](#ethereum-signing-key-rotation-only) takes the node offline for the unbonding window anyway, so [§ iroh node-key rotation only](#iroh-node-key-rotation-only) work after [§ Ethereum signing-key rotation only](#ethereum-signing-key-rotation-only) is a no-op against an already-deregistered node.
