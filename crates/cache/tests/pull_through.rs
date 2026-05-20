@@ -1689,27 +1689,29 @@ async fn http_origin_rejects_content_length_one_over_cap() -> anyhow::Result<()>
     Ok(())
 }
 
-// ----- Redirect handling (#375) -----
+// ----- Redirect handling (#375, hardened in #579) -----
 //
-// `HttpOrigin` builds its `reqwest::Client` without an explicit
-// `redirect::Policy`, which means reqwest's default applies: follow up
-// to 10 redirects, then error with `TooManyRedirects`. These tests
-// pin that behaviour so a future change (e.g. switching to
-// `Policy::none()` for SSRF protection, or relaxing the limit) is a
-// deliberate, test-visible decision rather than a silent drift.
+// `HttpOrigin` builds its `reqwest::Client` with `redirect::Policy::none()`
+// (SSRF defence — see `HttpOrigin::new_with_user_agent`). All 3xx
+// responses come back to us as `resp.status()` and are rejected
+// outright with a typed permanent error. Origins MUST serve
+// `{base}/{hex}` directly; query/fragment are already rejected at
+// config-load by `parse_origin_url`, so a redirect was never a
+// legitimate response shape.
 //
-// The content-address invariant covers the worst case regardless: a
-// redirect to attacker-controlled bytes still has to satisfy the
-// BLAKE3 verify the engine runs after the body comes back, so the
-// redirect itself can only get an attacker as far as a
-// `HashMismatch`. But "redirects work" is a behaviour operators may
-// rely on (e.g. an S3-fronted origin that 302s to a presigned URL),
-// so we test both directions.
+// The threat model: even if the configured base URL points at a
+// trusted origin, a compromised or attacker-influenced origin could
+// 3xx-redirect to `http://169.254.169.254/...` (cloud metadata) or
+// `http://127.0.0.1/...` (internal services). BLAKE3 verification
+// only fires after the body arrives; the request itself is the SSRF
+// primitive. Refusing 3xx before any follow-up TCP attempt closes
+// that window.
 
 #[tokio::test]
-async fn http_origin_follows_single_redirect_to_canonical_origin() -> anyhow::Result<()> {
-    // 302 → final origin returns the canonical bytes. Models a
-    // common pattern: a frontend that 302s to a CDN edge.
+async fn http_origin_rejects_302_redirect() -> anyhow::Result<()> {
+    // 302 to a would-be canonical-bytes origin. With `Policy::none()`,
+    // the redirect target must never be contacted — we assert that
+    // directly via `received_requests()`.
     let payload: &[u8] = b"behind a 302";
     let hash = Hash::new(payload);
 
@@ -1729,23 +1731,59 @@ async fn http_origin_follows_single_redirect_to_canonical_origin() -> anyhow::Re
         .await;
 
     let (engine, _tmp) = build_engine(&redirect_server.uri()).await?;
-    let got = engine.get(hash).await?;
+    let err = err_of(engine.get(hash).await)?;
+    let msg = format!("{err:?}");
     anyhow::ensure!(
-        &got[..] == payload,
-        "redirected fetch should land on canonical bytes"
+        matches!(err, CacheError::OriginError { .. }),
+        "expected OriginError from 302, got: {err:?}"
     );
     anyhow::ensure!(
-        engine.has(hash).await?,
-        "redirected fetch should populate the cache"
+        msg.to_ascii_lowercase().contains("redirect"),
+        "error message should name redirects, got: {msg}"
     );
+    let final_hits = received_requests_or_fail(&final_server, "302 SSRF test").await?;
+    anyhow::ensure!(
+        final_hits.is_empty(),
+        "redirect target must not be contacted (SSRF defence), got {} hit(s)",
+        final_hits.len()
+    );
+    // Source-hit count = 1 guards against the test passing vacuously
+    // if the client errored before issuing any HTTP request (e.g. a
+    // URL-build failure on a future refactor): the SSRF assertion
+    // would still see 0 target hits, but the rejection wouldn't be
+    // proving what we think.
+    let source_hits = received_requests_or_fail(&redirect_server, "302 SSRF test source").await?;
+    anyhow::ensure!(
+        source_hits.len() == 1,
+        "expected exactly 1 request to the redirect source, got {}",
+        source_hits.len()
+    );
+    anyhow::ensure!(!engine.has(hash).await?, "rejected fetch must not cache");
     Ok(())
 }
 
+/// Resolve `received_requests()` or fail loudly: `None` means wiremock
+/// recording is disabled, in which case the empty-vec proof of "no
+/// requests reached" is meaningless and would silently mask an SSRF
+/// regression. The redirect tests below rely on this assertion being
+/// load-bearing.
+async fn received_requests_or_fail(
+    server: &MockServer,
+    label: &str,
+) -> anyhow::Result<Vec<wiremock::Request>> {
+    server.received_requests().await.ok_or_else(|| {
+        anyhow::anyhow!(
+            "wiremock recording disabled in `{label}` — SSRF assertion would silently pass; \
+             enable recording or rewrite the test"
+        )
+    })
+}
+
 #[tokio::test]
-async fn http_origin_follows_301_redirect() -> anyhow::Result<()> {
-    // 301 (permanent) is semantically distinct from 302 (temporary)
-    // for caches and crawlers, but reqwest follows both transparently.
-    // Pin that we don't accidentally treat 301 as terminal.
+async fn http_origin_rejects_301_redirect() -> anyhow::Result<()> {
+    // 301 (permanent) is semantically distinct from 302 (temporary),
+    // but `Policy::none()` refuses both classes the same way. Pin
+    // that we don't accidentally distinguish them.
     let payload: &[u8] = b"behind a 301";
     let hash = Hash::new(payload);
 
@@ -1765,20 +1803,83 @@ async fn http_origin_follows_301_redirect() -> anyhow::Result<()> {
         .await;
 
     let (engine, _tmp) = build_engine(&redirect_server.uri()).await?;
-    let got = engine.get(hash).await?;
-    anyhow::ensure!(&got[..] == payload, "301 redirect should be followed");
+    let err = err_of(engine.get(hash).await)?;
+    anyhow::ensure!(
+        matches!(err, CacheError::OriginError { .. }),
+        "expected OriginError from 301, got: {err:?}"
+    );
+    let final_hits = received_requests_or_fail(&final_server, "301 SSRF test").await?;
+    anyhow::ensure!(
+        final_hits.is_empty(),
+        "redirect target must not be contacted (SSRF defence), got {} hit(s)",
+        final_hits.len()
+    );
+    let source_hits = received_requests_or_fail(&redirect_server, "301 SSRF test source").await?;
+    anyhow::ensure!(
+        source_hits.len() == 1,
+        "expected exactly 1 request to the redirect source, got {}",
+        source_hits.len()
+    );
     Ok(())
 }
 
 #[tokio::test]
-async fn http_origin_redirected_404_surfaces_not_found() -> anyhow::Result<()> {
-    // The status-bucket gate runs on the *final* response, not the
-    // intermediate 302. If the redirect target returns 404, the
-    // engine must see `NotFound` (not `OriginError`) — same as a
-    // direct 404. Without this test, a refactor that started gating
-    // on the original status would silently misclassify a redirected
-    // 404 as a transport error.
-    let hash = Hash::new(b"absent at the redirect target");
+async fn http_origin_rejects_307_redirect() -> anyhow::Result<()> {
+    // 307 (Temporary Redirect) preserves the request method, unlike
+    // 301/302 which most clients downgrade to GET. The
+    // `status.is_redirection()` gate in `HttpOrigin::fetch` covers
+    // 300-399 uniformly, so 307/308 are refused for the same reason —
+    // pin that by exercising 307 explicitly. A future refactor that
+    // narrowed the gate to specific status codes (e.g. only 301/302)
+    // would re-open SSRF via 307/308 and this test would catch it.
+    let payload: &[u8] = b"behind a 307";
+    let hash = Hash::new(payload);
+
+    let final_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload))
+        .mount(&final_server)
+        .await;
+
+    let redirect_server = MockServer::start().await;
+    let location = format!("{}/{}", final_server.uri(), hash.to_hex());
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(ResponseTemplate::new(307).insert_header("Location", location.as_str()))
+        .mount(&redirect_server)
+        .await;
+
+    let (engine, _tmp) = build_engine(&redirect_server.uri()).await?;
+    let err = err_of(engine.get(hash).await)?;
+    anyhow::ensure!(
+        matches!(err, CacheError::OriginError { .. }),
+        "expected OriginError from 307, got: {err:?}"
+    );
+    let final_hits = received_requests_or_fail(&final_server, "307 SSRF test").await?;
+    anyhow::ensure!(
+        final_hits.is_empty(),
+        "redirect target must not be contacted (SSRF defence), got {} hit(s)",
+        final_hits.len()
+    );
+    let source_hits = received_requests_or_fail(&redirect_server, "307 SSRF test source").await?;
+    anyhow::ensure!(
+        source_hits.len() == 1,
+        "expected exactly 1 request to the redirect source, got {}",
+        source_hits.len()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn http_origin_redirect_to_404_origin_surfaces_redirect_error() -> anyhow::Result<()> {
+    // Pre-#579 this returned `NotFound` because the 302 was followed
+    // and the downstream 404 became the terminal status. Post-#579
+    // the 3xx itself is terminal — the downstream 404 server should
+    // see zero requests, and the caller surfaces `OriginError`, not
+    // `NotFound`. This pins that we don't treat a 3xx as a possible
+    // NotFound shape.
+    let hash = Hash::new(b"absent at the would-be redirect target");
 
     let final_server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -1798,44 +1899,76 @@ async fn http_origin_redirected_404_surfaces_not_found() -> anyhow::Result<()> {
     let (engine, _tmp) = build_engine(&redirect_server.uri()).await?;
     let err = err_of(engine.get(hash).await)?;
     anyhow::ensure!(
-        matches!(err, CacheError::NotFound { .. }),
-        "expected NotFound from redirect target, got: {err:?}"
+        matches!(err, CacheError::OriginError { .. }),
+        "expected OriginError (3xx is terminal), got: {err:?}"
+    );
+    let final_hits = received_requests_or_fail(&final_server, "redirect-to-404 SSRF test").await?;
+    anyhow::ensure!(
+        final_hits.is_empty(),
+        "redirect target must not be contacted (SSRF defence), got {} hit(s)",
+        final_hits.len()
+    );
+    let source_hits =
+        received_requests_or_fail(&redirect_server, "redirect-to-404 SSRF test source").await?;
+    anyhow::ensure!(
+        source_hits.len() == 1,
+        "expected exactly 1 request to the redirect source, got {}",
+        source_hits.len()
     );
     Ok(())
 }
 
 #[tokio::test]
-async fn http_origin_rejects_redirect_loop() -> anyhow::Result<()> {
-    // Self-referential redirect. reqwest's default policy caps at 10
-    // hops, after which it errors out — surfacing as `OriginError`.
-    // A regression switching to `Policy::limited(usize::MAX)` (or
-    // disabling the cap somehow) would let this hang or loop, so the
-    // test pins that some upper bound exists.
-    let hash = Hash::new(b"loop me");
+async fn http_origin_rejects_redirect_to_internal_address() -> anyhow::Result<()> {
+    // The core SSRF-defence assertion (#579): even when a redirect
+    // points at an internal/loopback address, no TCP attempt is made
+    // toward it. We aim the `Location` at `http://127.0.0.1:1/...`
+    // (port 1 is reserved); the other redirect tests above prove
+    // "no TCP attempt" against a wiremock target via
+    // `received_requests().is_empty()`, but a wiremock can't be
+    // stood up on port 1, so this test pins a different invariant:
+    // the only request that left the client went to the redirect
+    // *source*, which returned a 3xx — proving the SSRF defence
+    // short-circuited at the status check, not at a connect-refused
+    // on the would-be internal target.
+    let hash = Hash::new(b"attacker-pointed");
 
-    let server = MockServer::start().await;
-    // Self-redirect: every GET to /<hex> 302s back to itself.
+    let redirect_server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(ResponseTemplate::new(302).insert_header(
-            "Location",
-            format!("{}/{}", server.uri(), hash.to_hex()).as_str(),
-        ))
-        .mount(&server)
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("Location", format!("http://127.0.0.1:1/{}", hash.to_hex())),
+        )
+        .mount(&redirect_server)
         .await;
 
-    // Tight headers timeout so an unbounded loop fails fast as a
-    // timeout rather than tying up the suite indefinitely.
-    let origin = HttpOrigin::parse(&server.uri())?
+    let origin = HttpOrigin::parse(&redirect_server.uri())?
         .with_timeouts(Duration::from_secs(10), Duration::from_secs(5));
-
     let tmp = tempfile::tempdir()?;
     let engine =
         CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 16).await?;
+
     let err = err_of(engine.get(hash).await)?;
     anyhow::ensure!(
         matches!(err, CacheError::OriginError { .. }),
-        "expected OriginError from redirect loop, got: {err:?}"
+        "expected OriginError from 302-to-internal, got: {err:?}"
+    );
+
+    // Exactly one request hit the redirect source — proving the
+    // 3xx was the terminal response and no follow-up attempt to
+    // the internal address was issued. A regression that resumed
+    // following redirects would either also try `127.0.0.1:1` (and
+    // hang / refuse-connect, not return `OriginError` from
+    // `is_redirection()`) or, depending on the variant, increment
+    // this counter beyond 1; the equality check defends both.
+    let source_hits =
+        received_requests_or_fail(&redirect_server, "internal-address SSRF test").await?;
+    anyhow::ensure!(
+        source_hits.len() == 1,
+        "expected exactly 1 request to the redirect source, got {}: redirects \
+         may be being followed",
+        source_hits.len()
     );
     Ok(())
 }
