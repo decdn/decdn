@@ -72,6 +72,10 @@ pub struct NodeAnnounceBody {
     /// Announcing node's Ed25519 public key (iroh `NodeId`), 32 bytes.
     pub node_id: [u8; 32],
     /// ISO 3166-1 alpha-2 region code, 2 ASCII uppercase letters.
+    /// Acceptance is the allowlist in [`crate::region::is_valid_region`]
+    /// (assigned codes + the user-reserved ranges); receive-side and
+    /// publish-side validators both call it so the wire and config
+    /// layers cannot drift.
     pub region: String,
     /// Microseconds since Unix epoch.
     pub timestamp_us: u64,

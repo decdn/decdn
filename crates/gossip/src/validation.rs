@@ -7,7 +7,9 @@
 
 use std::collections::HashSet;
 
-use decdn_protocol::{GOSSIP_VERSION, GossipEnvelope, GossipPayload, NodeAnnounce, SIGNATURE_LEN};
+use decdn_protocol::{
+    GOSSIP_VERSION, GossipEnvelope, GossipPayload, NodeAnnounce, SIGNATURE_LEN, is_valid_region,
+};
 use thiserror::Error;
 
 /// Every reason an incoming envelope can be rejected. Each variant's
@@ -38,7 +40,7 @@ pub enum AnnounceReject {
     ClockSkew,
     #[error("timestamp not strictly greater than existing entry")]
     StaleTimestamp,
-    #[error("region must be 2 ASCII uppercase letters")]
+    #[error("region must be an ISO 3166-1 alpha-2 code (assigned or user-reserved)")]
     BadRegion,
     #[error("announcer not in allowlist")]
     NotAllowlisted,
@@ -116,8 +118,12 @@ pub fn validate_envelope<S: std::hash::BuildHasher>(
 fn validate_announce_fields(a: &NodeAnnounce, now_us: u64) -> Result<(), AnnounceReject> {
     let b = &a.body;
 
-    // Region: exactly 2 ASCII uppercase letters (ISO 3166-1 alpha-2).
-    if b.region.len() != 2 || !b.region.bytes().all(|c| c.is_ascii_uppercase()) {
+    // Region: must be in the ISO 3166-1 alpha-2 allowlist (assigned codes
+    // + the user-reserved ranges, see `decdn_protocol::region`). The
+    // strict allowlist closes the topic-name injection surface (`/`,
+    // `\0`, non-ASCII) and also rejects unassigned codes like `OO` or
+    // `JJ` that the bare "2 ASCII uppercase" check let through before.
+    if !is_valid_region(&b.region) {
         return Err(AnnounceReject::BadRegion);
     }
 
@@ -325,12 +331,33 @@ mod tests {
     #[test]
     fn bad_region_rejected() {
         let sk = fresh_key();
-        for bad in ["us", "USA", "", "U1", "U"] {
+        // Length / case malformations, unassigned codes, and the
+        // security-critical adversarial chars (slash, NUL, newline,
+        // non-ASCII) that would otherwise reach the topic-name builder.
+        let bad_inputs = [
+            "us", "USA", "", "U1", "U", "OO", "JJ", "BX", "U/", "/U", "U\0", "U\n", "Ü1",
+        ];
+        for bad in bad_inputs {
             let bytes = mk_envelope(&sk, |b| b.region = bad.to_string());
             assert_eq!(
                 validate_envelope(&bytes, 1_700_000_000_000_000, &no_list()),
                 Err(AnnounceReject::BadRegion),
                 "region {bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_region_accepted() {
+        // Reserved-for-user-assignment ranges (AA, QM–QZ, XA–XZ, ZZ) are
+        // accepted so air-gapped / testnet operators can pick a private
+        // code. Spot-check each range boundary.
+        let sk = fresh_key();
+        for good in ["AA", "QM", "QZ", "XA", "XK", "XZ", "ZZ"] {
+            let bytes = mk_envelope(&sk, |b| b.region = good.to_string());
+            assert!(
+                validate_envelope(&bytes, 1_700_000_000_000_000, &no_list()).is_ok(),
+                "region {good:?} should be accepted"
             );
         }
     }
