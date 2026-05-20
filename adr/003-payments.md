@@ -605,17 +605,18 @@ The on-chain registry of staked nodes is part of the `StakingRegistry` contract,
 ```solidity
 struct NodeInfo {
     bytes32 nodeId;              // iroh NodeId (ed25519 public key, 32 bytes)
-    address ethAddress;          // Ethereum address for payment channels
-    bytes   multiaddrs;          // packed QUIC multiaddrs (length-prefixed entries)
-    string  regionHint;          // ISO 3166-1 alpha-2 code (self-reported, unverified)
+    address ethAddress;          // Ethereum address for payment channels (20 bytes)
+    bool    active;              // false after deregistration or auto-ejection (1 byte)
+                                 // ↑ ethAddress + active pack into one slot
     uint256 registeredAt;        // block.timestamp of current registration
     uint256 firstRegisteredAt;   // block.timestamp of first-ever registration (immutable once set)
     uint256 lastMultiaddrUpdate; // block.timestamp of last multiaddr change
-    bool    active;              // false after deregistration or auto-ejection
+    bytes   multiaddrs;          // packed QUIC multiaddrs (length-prefixed entries)
+    string  regionHint;          // ISO 3166-1 alpha-2 code (self-reported, unverified)
 }
 ```
 
-`multiaddrs` uses `bytes` rather than `string[]` for gas efficiency: a packed array of `(uint16 length, bytes data)` entries, parsed off-chain by clients. Maximum encoded size is bounded by the governable `maxMultiaddrSize` parameter (initial value 1024 bytes; safety bounds 64–1024 bytes per [ADR 009](009-governance.md#adr-009-governance-model)).
+Field order is chosen for storage packing: `ethAddress` (20 B) and `active` (1 B) share one 32-byte slot, dropping `NodeInfo` from 8 slots to 7. `multiaddrs` uses `bytes` rather than `string[]` for gas efficiency: a packed array of `(uint16 length, bytes data)` entries, parsed off-chain by clients. Maximum encoded size is bounded by the governable `maxMultiaddrSize` parameter (initial value 1024 bytes; safety bounds 64–1024 bytes per [ADR 009](009-governance.md#adr-009-governance-model)).
 
 #### Interface (additions to StakingRegistry)
 
