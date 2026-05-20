@@ -171,7 +171,6 @@ struct RawPeer {
     region: String,
     first_seen_us: u64,
     last_seen_us: u64,
-    load: decdn_protocol::LoadHint,
     announced_at_us: u64,
 }
 
@@ -182,7 +181,6 @@ impl RawPeer {
             region: entry.announce.body.region.clone(),
             first_seen_us: entry.first_seen_us,
             last_seen_us: entry.last_seen_us,
-            load: entry.announce.body.load,
             announced_at_us: entry.announce.body.timestamp_us,
         }
     }
@@ -193,7 +191,6 @@ impl RawPeer {
             region: self.region,
             first_seen_us: self.first_seen_us,
             last_seen_us: self.last_seen_us,
-            load: self.load,
             announced_at_us: self.announced_at_us,
         }
     }
@@ -443,17 +440,13 @@ pub async fn serve(
 mod tests {
     use super::*;
     use decdn_cache::{Hash, Origin};
-    use decdn_protocol::{LoadHint, NodeAnnounce, NodeAnnounceBody};
+    use decdn_protocol::{NodeAnnounce, NodeAnnounceBody};
 
     fn mk_announce(node_id: [u8; 32], region: &str, ts_us: u64) -> NodeAnnounce {
         NodeAnnounce {
             body: NodeAnnounceBody {
                 node_id,
                 region: region.to_string(),
-                load: LoadHint {
-                    active_streams: 0,
-                    bandwidth_utilization: 0,
-                },
                 timestamp_us: ts_us,
             },
             signature: vec![0u8; 64],

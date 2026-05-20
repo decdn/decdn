@@ -262,7 +262,6 @@ This formalizes the pattern already used for `ethereum_address`, `binding_signat
 struct NodeAnnounceBody {
     node_id: NodeId,
     region: String,  // ISO 3166-1 alpha-2
-    load: LoadHint,
     timestamp_us: u64,
 }
 
@@ -335,7 +334,7 @@ Signatures are computed over a specific byte sequence produced by postcard seria
 | --- | --- | --- |
 | `ProbeResponse` | `hash`, `has_blob`, `rate_per_mb`, `timestamp_us` | `total_bytes` |
 | `StreamResponse` | `hash`, `ok`, `rate_per_mb`, `total_bytes`, `channel_id`, `timestamp_us`, `redirect` | `error`, `voucher_interval_mb` |
-| `NodeAnnounce` | `node_id`, `region`, `load`, `timestamp_us` | *(none currently — see implementation note)* |
+| `NodeAnnounce` | `node_id`, `region`, `timestamp_us` | *(none currently — see implementation note)* |
 | `ReputationReport` | `provider`, `reporter`, `metrics`, `timestamp` | *(none currently)* |
 
 #### Implementation note — separating signed and unsigned fields
@@ -348,7 +347,6 @@ For messages currently signed over all non-signature fields (e.g., `NodeAnnounce
 struct NodeAnnounceBody {
     node_id: NodeId,
     region: String,  // ISO 3166-1 alpha-2, e.g. "US"
-    load: LoadHint,
     timestamp_us: u64,
 }
 

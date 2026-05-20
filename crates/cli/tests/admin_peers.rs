@@ -24,7 +24,7 @@ use decdn_common::admin::AdminRpcClient;
 use decdn_common::cli::{AnnounceArgs, DrainArgs, EvictArgs, HealthArgs, PeersArgs, ReloadArgs};
 use decdn_gossip::PeerTable;
 use decdn_node::admin::{self, AdminState, DrainTrigger};
-use decdn_protocol::{LoadHint, NodeAnnounce, NodeAnnounceBody};
+use decdn_protocol::{NodeAnnounce, NodeAnnounceBody};
 use jsonrpsee::core::ClientError;
 use jsonrpsee::core::client::ClientT;
 use jsonrpsee::http_client::HttpClientBuilder;
@@ -37,10 +37,6 @@ fn mk_announce(node_id: [u8; 32], region: &str, ts_us: u64) -> NodeAnnounce {
         body: NodeAnnounceBody {
             node_id,
             region: region.to_string(),
-            load: LoadHint {
-                active_streams: 0,
-                bandwidth_utilization: 0,
-            },
             timestamp_us: ts_us,
         },
         signature: vec![0u8; 64],

@@ -169,14 +169,14 @@ Each client release ships with a built-in default seed list compiled into the bi
 
 - **RPC endpoint:** Returns correct registry data. A compromised RPC can return a fabricated node list (eclipse). Mitigated in production by multi-source bootstrap (Option B above).
 - **Registry correctness:** The `StakingRegistry` contract accurately reflects staked nodes. Enforced by EVM execution — trust in the chain, not any specific party.
-- **Gossip integrity:** `NodeAnnounce` messages are signed by the announcing node's registered key and validated against the registry. A node cannot forge another's announcement. However, `LoadHint` is advisory — a node can lie, affecting selection quality but not safety.
+- **Gossip integrity:** `NodeAnnounce` messages are signed by the announcing node's registered key and validated against the registry. A node cannot forge another's announcement.
 - **Clock:** NTP-synchronized local clock, used for gossip validation (±60 s freshness). Drift beyond this window causes the client to reject valid gossip.
 
 #### Not trusted — the client does not rely on these
 
-- Any individual node's self-reported metadata (region, load) beyond what is signed and slashable.
+- Any individual node's self-reported metadata (region) beyond what is signed and slashable. The region claim itself is mitigated by latency-based reputation: a node whose observed RTT contradicts its claimed region is penalized ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)).
 - Network-level reputation scores (30% gossip weight in [ADR 008](008-reputation.md#adr-008-reputation-system); local observations dominate at 70%).
-- Node availability promises beyond signed probe responses (unsigned gossip claims like `LoadHint` are advisory).
+- Node availability promises beyond signed probe responses.
 
 ### Client Configuration
 
