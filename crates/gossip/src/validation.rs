@@ -119,10 +119,10 @@ fn validate_announce_fields(a: &NodeAnnounce, now_us: u64) -> Result<(), Announc
     let b = &a.body;
 
     // Region: must be in the ISO 3166-1 alpha-2 allowlist (assigned codes
-    // + the user-reserved ranges). The strict allowlist closes the topic-name
-    // injection surface (`/`, `\0`, non-ASCII) and also rejects unassigned
-    // codes like `XX` or `OO` that the bare "2 ASCII uppercase" check let
-    // through before.
+    // + the user-reserved ranges, see `decdn_protocol::region`). The
+    // strict allowlist closes the topic-name injection surface (`/`,
+    // `\0`, non-ASCII) and also rejects unassigned codes like `OO` or
+    // `JJ` that the bare "2 ASCII uppercase" check let through before.
     if !is_valid_region(&b.region) {
         return Err(AnnounceReject::BadRegion);
     }
