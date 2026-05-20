@@ -83,10 +83,8 @@ The 20% floor on the node-base share is the cashflow invariant defined in [ADR 0
 | Challenge bond | SlashJudge | 1 TOKEN | 1,000 TOKEN |
 | Base slash reset period | StakingRegistry | 30 days | 365 days |
 | Compliance window | ContentBlacklist | 1 hour | 7 days |
-| Minimum origin redundancy | OriginAssignment | 1 | 10 |
 | Assignment timelock | OriginAssignment | 24 hours | 14 days |
 | Max origins per namespace | OriginAssignment | 1 | 50 |
-| Default-open min redundancy | OriginAssignment | 5 | 500 |
 | Default-open max origins | OriginAssignment | 20 | 500 |
 | Max namespaces per publisher | PublisherRegistry | 1 | 1000 |
 | Namespace transfer timelock | PublisherRegistry | 24 hours | 30 days |

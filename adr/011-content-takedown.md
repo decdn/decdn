@@ -472,7 +472,7 @@ A registered namespace with no activated assignment is **unassigned**. No operat
 
 ### Duplicate-address rejection
 
-The contract rejects proposals whose `operators` array contains duplicate addresses. Without this, a publisher could submit `[A, A, A]` and concentrate origin responsibility on one operator while appearing to commit to multiple. Activation also re-validates that every pending operator is still active and not blacklisted before the set goes live. Operator-set sizing — including how many operators a publisher commits per namespace — is a publisher/governance policy decision, not a contract invariant; the protocol does not enforce a floor.
+The contract rejects proposals whose `operators` array contains duplicate addresses. Without this, a publisher could submit `[A, A, A]` and concentrate origin responsibility on one operator while appearing to commit to multiple. Activation also re-validates that every pending operator is still active and not blacklisted before the set goes live. Operator-set sizing — including how many operators a publisher commits per namespace — is a publisher/governance policy decision, not a contract invariant; the protocol does not enforce a redundancy floor beyond the requirement that `proposeAssignment` contain at least one operator (use `revokeAssignment` for explicit removal).
 
 ### Cross-contract integration
 
@@ -599,7 +599,7 @@ Slash challenges cannot be opened against operators while the disputed entry is 
 - Emergency path addresses CSAM and actively-exploited material without a 5-day vote cycle
 - Reason field and on-chain audit trail support legal defensibility for operators
 - Local denylist preserves operator autonomy for direct legal notices
-- Origin assignment authority gives publishers a protocol-level way to commit specific operators to serving their content; the operator-set size is a publisher/governance decision, not a hardcoded floor
+- Origin assignment authority gives publishers a protocol-level way to commit specific operators to serving their content; the operator-set size is a publisher/governance decision, not a contract-enforced floor
 - Symmetric blacklist/assignment infrastructure: a blacklisted operator is treated as unauthorized at every runtime check across every namespace they were authorized to serve, with lazy storage cleanup (see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist))
 - Default-open content is governed by a single DAO-maintained allow-list, with a uniform `OriginAssignment` storage and view model across registered namespaces and the default-open namespace
 - Per-entry appeals (see [§ Blacklist Entry Appeals](#blacklist-entry-appeals)) close the regional-blacklist due-process gap with a bounded fast-track, so a wrongly served takedown can be challenged without `suspendRegionalBody` freezing every other entry the body issued
