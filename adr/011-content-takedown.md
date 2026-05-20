@@ -355,7 +355,7 @@ Without positive authority, origin assignment is purely off-protocol — content
 
 The publisher and namespace primitives are defined in [ADR 002 § Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces). Recap:
 
-- A **publisher** is an Ethereum address registered in `PublisherRegistry`.
+- A **publisher** is an Ethereum address that owns at least one namespace in `PublisherRegistry` (acquired implicitly on the first successful `createNamespace()` call; no separate registration step).
 - A **namespace** is a publisher-owned `uint256` identifier under which blob hashes are claimed.
 - The **default-open namespace** (`namespaceId == 0`) governs all unclaimed content; only operators in the DAO-maintained default-open allow-list may serve as origin for it (see [§ Default-open allow-list](#default-open-allow-list)). Origin assignment authority applies to all namespaces — registered namespaces follow the publisher-propose / DAO-ratify flow, while the default-open namespace is governed by a single DAO-set global allow-list.
 
