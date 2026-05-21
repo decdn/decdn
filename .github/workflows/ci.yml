@@ -553,7 +553,14 @@ jobs:
       - name: Upload SARIF
         # always(): SARIF should reach code-scanning even when slither fails CI
         # so reviewers can see the findings list, not just a red X.
+        # continue-on-error: code scanning requires GitHub Advanced Security
+        # (or a public repo). This repo is private without GHAS, so the
+        # upload throws "Advanced Security must be enabled". The slither
+        # step itself is the authoritative CI gate (fail-on: medium); SARIF
+        # is a nice-to-have surface that activates if GHAS is enabled later
+        # or the repo goes public.
         if: always() && steps.slither.outputs.sarif != ''
+        continue-on-error: true
         uses: github/codeql-action/upload-sarif@v4.35.5
         with:
           sarif_file: ${{ steps.slither.outputs.sarif }}
@@ -564,15 +571,6 @@ jobs:
     runs-on: ubuntu-latest
     needs: changes
     if: needs.changes.outputs.solidity == 'true' || github.event_name != 'pull_request'
-    permissions:
-      contents: read
-      security-events: write
-      # See solidity-slither permissions note above — same upload-sarif
-      # behavior here.
-      actions: read
-    defaults:
-      run:
-        working-directory: contracts
     steps:
       - uses: actions/checkout@v6.0.2
         with:
@@ -580,24 +578,15 @@ jobs:
       - uses: foundry-rs/foundry-toolchain@v1.8.0
         with:
           version: v1.7.1
-      # No official Cyfrin/aderyn-action exists with SARIF support; the
-      # Cyfrin/aderyn-ci action lacks SARIF output. Install aderyn directly
-      # via the official curl installer (pinned to aderyn-v0.6.8 via the
-      # /releases/download/<tag>/ path), which gives us native SARIF.
-      - name: Install Aderyn
-        run: |
-          curl --proto '=https' --tlsv1.2 -LsSf \
-            https://github.com/Cyfrin/aderyn/releases/download/aderyn-v0.6.8/aderyn-installer.sh \
-            | bash
-          echo "$HOME/.cyfrin/bin" >> "$GITHUB_PATH"
-      - name: Run Aderyn
-        run: aderyn . --output aderyn-report.sarif
-      - name: Upload SARIF
-        if: always() && hashFiles('contracts/aderyn-report.sarif') != ''
-        uses: github/codeql-action/upload-sarif@v4.35.5
+      # The official Cyfrin/aderyn-ci action installs aderyn, runs it, and
+      # gates the CI step via fail-on. No SARIF surface (which we don't
+      # need anyway — code scanning requires GHAS on private repos), and
+      # the action handles its own toolchain lifecycle.
+      - name: Aderyn check
+        uses: Cyfrin/aderyn-ci@v0.0.10
         with:
-          sarif_file: contracts/aderyn-report.sarif
-          category: aderyn
+          working-directory: contracts
+          fail-on: high
 
   solidity-gas-snapshot:
     name: solidity gas snapshot
