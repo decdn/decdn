@@ -428,8 +428,26 @@ pub async fn run(
     // list from `dht.static_active_nodes`. The chain-backed
     // `ChainStakerSet` lands with the on-chain origin-directory
     // follow-up; same trait, drop-in swap.
+    //
+    // Empty set is a footgun (ADR 022 line 140 — every `Store` rejects
+    // with `accepted: false`), so we log an explicit warning at
+    // startup. Operators following the testnet bring-up runbook MUST
+    // populate `dht.static_active_nodes` with the testnet's staker set;
+    // a missing entry shows up here as a single high-signal line
+    // rather than as silent per-request `debug!` rejections.
     let staker_set: Arc<dyn StakerSet> =
         Arc::new(ConfigStakerSet::new(cfg.dht.static_active_nodes.clone()));
+    if staker_set.is_empty() {
+        tracing::warn!(
+            "dht.static_active_nodes is empty; every cdn/dht/v1 `Store` will be \
+             rejected (ADR 022 line 140). Populate the field to admit publishers."
+        );
+    } else {
+        tracing::info!(
+            staker_count = staker_set.len(),
+            "dht active-staker set initialised from config"
+        );
+    }
     let dht_handler = Arc::new(DhtHandler::new(
         secret_key.public(),
         Arc::clone(&dht_rate_limiter),
@@ -1593,6 +1611,42 @@ mod tests {
         assert!(
             result.is_ok(),
             "run_dispatch_gc must exit within 500ms of shutdown signal; \
+             a 60s hang here means the stop arm of the select was lost"
+        );
+        result
+            .expect("timeout already asserted")
+            .expect("task should not panic");
+    }
+
+    /// `run_record_store_gc` exits promptly when the stop oneshot
+    /// fires, mirroring the `run_dispatch_gc` contract above. A
+    /// regression that reordered the `tokio::select!` arms or dropped
+    /// `biased` would silently extend `SHUTDOWN_DEADLINE` by up to
+    /// one tick interval — under default `DISPATCH_GC_INTERVAL=60s`
+    /// the node would hang for a minute at shutdown.
+    #[tokio::test]
+    async fn run_record_store_gc_exits_promptly_on_shutdown() {
+        use crate::dht::{RecordStore, RecordStoreConfig};
+
+        let records = Arc::new(std::sync::Mutex::new(RecordStore::new(
+            RecordStoreConfig::default(),
+        )));
+        let (stop_tx, stop_rx) = oneshot::channel::<()>();
+        // 60s interval matches the runtime default so the test would
+        // hang for 60s on a regression rather than racing through a
+        // shorter interval.
+        let task = tokio::spawn(run_record_store_gc(
+            Arc::clone(&records),
+            stop_rx,
+            Duration::from_mins(1),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        stop_tx.send(()).expect("receiver still alive");
+        let result = tokio::time::timeout(Duration::from_millis(500), task).await;
+        assert!(
+            result.is_ok(),
+            "run_record_store_gc must exit within 500ms of shutdown signal; \
              a 60s hang here means the stop arm of the select was lost"
         );
         result

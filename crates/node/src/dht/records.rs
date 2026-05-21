@@ -188,11 +188,22 @@ impl RecordStore {
         {
             // Remove old `global_lru` key, insert refreshed.
             let Some(slot) = entries.get_mut(idx) else {
-                // `position` returned a valid index — this branch is
-                // unreachable, but the get_mut keeps clippy's
-                // anti-panic indexing rule satisfied without a bare
-                // `[idx]` expression.
-                return InsertOutcome::Refreshed;
+                // `position()` just returned `Some(idx)` and `entries`
+                // hasn't been mutated since — this branch is
+                // unreachable except under heap corruption. Report
+                // `RejectedQuotaExceeded` (NOT a fake `Refreshed`,
+                // which would map to `accepted: true` on the wire and
+                // confirm a write that never happened). The
+                // `.get_mut(idx)` keeps clippy's anti-panic policy
+                // satisfied without bare `[idx]` indexing.
+                tracing::error!(
+                    holder = ?holder,
+                    hash = ?hash,
+                    idx,
+                    "RecordStore::insert_at: position->Some but get_mut->None; \
+                     rejecting publish on corruption"
+                );
+                return InsertOutcome::RejectedQuotaExceeded;
             };
             let prev = *slot;
             self.global_lru
@@ -434,12 +445,13 @@ mod tests {
         // Count stays at 1 (refresh, not new).
         assert_eq!(s.len(), 1);
         assert_eq!(s.publisher_record_count(&nid(1)), 1);
-        // expiry_us must reflect the LATER receive_us.
+        // expiry_us must reflect the LATER receive_us (the refresh is
+        // at wall-clock 200 with `ttl_us = 1_000_000`, so the refreshed
+        // entry's expiry is exactly 200 + ttl_us = 1_000_200).
         let entries = s.by_hash.get(&h(1)).unwrap();
         assert_eq!(entries.len(), 1);
-        // receive_us is monotonic-counter-mixed but later >= earlier.
-        assert!(entries[0].receive_us > 100);
-        assert!(entries[0].expiry_us > 100 + 1_000_000);
+        assert_eq!(entries[0].receive_us, 200);
+        assert_eq!(entries[0].expiry_us, 200 + 1_000_000);
     }
 
     #[test]
@@ -543,6 +555,56 @@ mod tests {
         assert_eq!(providers.len(), 4);
     }
 
+    /// `RecordStoreConfig::default` MUST match the ADR 022 §Content
+    /// Records and TTL table verbatim. Every other test uses
+    /// `small_cfg()`, so without this assertion a regression that
+    /// halves the production defaults would not fail any test.
+    #[test]
+    fn default_config_matches_adr_022() {
+        let d = RecordStoreConfig::default();
+        assert_eq!(d.max_records_per_publisher, 200);
+        assert_eq!(d.max_records_global, 100_000);
+        assert_eq!(d.max_providers_per_hash, MAX_PROVIDERS_PER_HASH);
+        assert_eq!(d.max_providers_per_hash, 50);
+        // 1 hour in microseconds.
+        assert_eq!(d.ttl_us, 3_600_000_000);
+    }
+
+    /// Boundary case: when both the global cap and the per-publisher
+    /// cap are saturated simultaneously, the per-publisher cap MUST
+    /// fire first (hard reject). The global LRU MUST NOT evict
+    /// another publisher's record on a request that's about to be
+    /// rejected for quota reasons — that would let a quota-exceeded
+    /// publisher displace records they should not be touching.
+    #[test]
+    fn publisher_quota_beats_global_lru() {
+        // Tight caps: per-publisher = 3, global = 3. Publisher 1 fills
+        // both caps simultaneously.
+        let cfg = RecordStoreConfig {
+            max_records_per_publisher: 3,
+            max_records_global: 3,
+            max_providers_per_hash: 100,
+            ttl_us: 1_000_000,
+        };
+        let mut s = RecordStore::new(cfg);
+        for i in 1..=3u8 {
+            assert_eq!(s.insert_at(nid(1), h(i), i.into()), InsertOutcome::Inserted);
+        }
+        // Both global (3 records) and per-publisher (3 from nid(1))
+        // caps are now at the threshold. A 4th Store from nid(1)
+        // must hard-reject without touching the global LRU.
+        let len_before = s.len();
+        let count_before = s.publisher_record_count(&nid(1));
+        let out = s.insert_at(nid(1), h(99), 100);
+        assert_eq!(out, InsertOutcome::RejectedQuotaExceeded);
+        assert_eq!(s.len(), len_before, "rejected insert must not evict");
+        assert_eq!(s.publisher_record_count(&nid(1)), count_before);
+        // Existing records are intact.
+        for i in 1..=3u8 {
+            assert!(!s.providers_at(&h(i), 0).is_empty(), "h({i}) intact");
+        }
+    }
+
     #[test]
     fn outcome_accepted_helper() {
         assert!(InsertOutcome::Inserted.accepted());
@@ -572,10 +634,10 @@ mod tests {
     /// ADR 022 §Content Records and TTL line 122: `expiry_us =
     /// receive_us + record_ttl_us`. A previous implementation mixed a
     /// monotonic insert counter into `receive_us`, which made TTL drift
-    /// forward with insert volume (1M inserts ≈ 1s drift). This test
-    /// pins the no-drift contract by inserting one record after a
-    /// million unrelated inserts and confirming its TTL is *exactly*
-    /// `ttl_us` after the wall-clock it was admitted at.
+    /// forward with insert volume. This test pins the no-drift
+    /// contract by inserting one record after 10k unrelated inserts
+    /// and confirming its TTL is *exactly* `ttl_us` after the
+    /// wall-clock it was admitted at.
     #[test]
     fn ttl_is_anchored_to_wall_clock_regardless_of_insert_volume() {
         let mut cfg = small_cfg();
@@ -597,7 +659,7 @@ mod tests {
         // Insert the record under test at wall-clock 500.
         s.insert_at(nid(0xCC), h(0xFF), 500);
         // Expiry MUST be exactly 500 + 1_000 = 1_500, with no drift
-        // from the prior 100k inserts.
+        // from the prior 10k inserts.
         let entries = s.by_hash.get(&h(0xFF)).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(

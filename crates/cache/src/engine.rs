@@ -762,7 +762,7 @@ impl CacheEngine {
     /// pull-through path (the private `pull_through` is the single
     /// convergence point).
     /// Used by the DHT republish scheduler (ADR 022 §STORE Flow line
-    /// 124 — "When a node caches blob H ...") to schedule the first
+    /// 126 — "When a node caches blob H ...") to schedule the first
     /// publish-set to the K+3 closest peers.
     ///
     /// The channel is bounded and best-effort: lagged receivers see a

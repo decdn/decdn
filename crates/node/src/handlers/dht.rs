@@ -297,11 +297,12 @@ impl DhtHandler {
     /// exhaustive over the active set without needing a panic or echo
     /// fallback for the impossible cases.
     //
-    // `msg` is moved-in so future PR slices can take ownership of
-    // larger payloads (e.g. the `FindValueResponse` providers Vec)
-    // without re-allocating. Every current request variant is `Copy`,
-    // so by-value is a no-op at the ABI level today; the by-value
-    // signature is the steady-state shape.
+    // `msg` is moved-in so future variants whose request payloads
+    // include `Vec` fields (e.g. a `BatchStoreRequest::hashes` once
+    // the handler-side admission lands) can take ownership without
+    // re-allocating. Every current request variant is `Copy`, so the
+    // by-value signature is a no-op at the ABI level today; it's the
+    // steady-state shape.
     #[allow(clippy::needless_pass_by_value)]
     fn dispatch(&self, peer_node_id: [u8; 32], msg: DhtServerRequest) -> wire::DhtMessage {
         match msg {
@@ -326,12 +327,20 @@ impl DhtHandler {
     ///    was newly inserted, refreshed, or hard-rejected at the
     ///    publisher cap — all of which map to `accepted` (refresh +
     ///    new) or `not accepted` (cap) on the wire.
+    // Linear admission sequence (auth check → staker filter → insert →
+    // counter bump per outcome). Splitting would scatter the ADR 022
+    // §STORE Flow rule order across helpers; same rationale as the
+    // `ProbeHandler::serve` cognitive-complexity allow upstream.
+    #[allow(clippy::cognitive_complexity)]
     fn handle_store(&self, peer_node_id: [u8; 32], req: wire::StoreRequest) -> wire::StoreAck {
         // Step 1: holder must equal the QUIC-bound peer NodeId.
         // ADR 022 §STORE Flow line 140: "The receiving node MUST reject
         // any record whose `holder` does not equal the authenticated
-        // NodeId of the inbound QUIC connection."
+        // NodeId of the inbound QUIC connection." Bump a dedicated
+        // counter so the lying-`holder` attack rate is visible on the
+        // scrape without `RUST_LOG=debug`.
         if req.holder != peer_node_id {
+            self.metrics.dht_store_rejected_holder_mismatch();
             tracing::debug!(
                 holder = ?req.holder,
                 peer = ?peer_node_id,
@@ -343,8 +352,12 @@ impl DhtHandler {
             };
         }
 
-        // Step 2: active-staker filter.
+        // Step 2: active-staker filter. A sustained non-zero rate on
+        // this counter without matching `dht_store_accepted` growth
+        // signals a Sybil-attempt — an attacker rotating fresh NodeIds
+        // to spam records.
         if !self.staker_set.is_active(&req.holder) {
+            self.metrics.dht_store_rejected_non_staked();
             tracing::debug!(
                 holder = ?req.holder,
                 "dht Store rejected: holder not in active-staker set"
@@ -357,14 +370,28 @@ impl DhtHandler {
 
         // Step 3: receiver-anchored insert with all the cap rules.
         let now_us = now_us();
-        let accepted = if let Ok(mut store) = self.records.lock() {
-            store.insert_at(req.holder, req.hash, now_us).accepted()
+        let outcome = if let Ok(mut store) = self.records.lock() {
+            Some(store.insert_at(req.holder, req.hash, now_us))
         } else {
             // Poisoned record-store mutex: respond `accepted: false`
             // so the publisher backs off rather than retrying into a
             // node whose admission path is broken.
             tracing::error!("dht Store: record-store mutex poisoned; rejecting publish");
-            false
+            None
+        };
+        let accepted = match outcome {
+            Some(o) if o.accepted() => {
+                self.metrics.dht_store_accepted();
+                true
+            }
+            Some(crate::dht::InsertOutcome::RejectedQuotaExceeded) => {
+                self.metrics.dht_store_rejected_quota();
+                false
+            }
+            // None = poisoned mutex; already logged above. No counter
+            // for this path — it should fire 0 times in a healthy node
+            // and the error log is the operator-actionable signal.
+            _ => false,
         };
         wire::StoreAck {
             hash: req.hash,
@@ -503,11 +530,11 @@ async fn read_dht_request(
             //    the client side.
             // 2. `BatchStore` requests. Wire types are pinned at their
             //    ADR-022 canonical discriminants so a future handler can
-            //    land without a wire shuffle, but the PR-2-of-#320 slice
-            //    does not implement batch admission (two-stage rate
-            //    limit, single holder check, per-hash quota). ADR 022
-            //    §Schema Evolution line 138 and §STORE Flow specify that
-            //    the unsupported signal MUST be stream-close-without-ack
+            //    land without a wire shuffle, but this slice does not
+            //    implement batch admission (two-stage rate limit,
+            //    single holder check, per-hash quota). ADR 022 §STORE
+            //    Flow line 138 + §Schema Evolution specify that the
+            //    unsupported signal MUST be stream-close-without-ack
             //    — an all-`false` `BatchStoreAck` would be read by
             //    publishers as "your batch was processed, every hash
             //    rejected" and trigger no fallback. Closing the stream
@@ -554,9 +581,25 @@ async fn read_dht_request(
 /// the `RecordStore` then folds in its monotonic counter so subsequent
 /// inserts still produce strictly-increasing keys.
 fn now_us() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
+    // A wall-clock before UNIX_EPOCH means the operator's hardware
+    // clock is mis-set — every record inserted while this is true
+    // collapses to `receive_us = 0` and they all expire on the same
+    // tick when the clock recovers. Surface it as an operator-visible
+    // error (not a debug-level swallow) so the failure mode is
+    // diagnosable from logs. The 0 fallback keeps the store
+    // functional in the degraded state — `next_sequence` still
+    // disambiguates LRU keys so admission never panics.
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => u64::try_from(d.as_micros()).unwrap_or(u64::MAX),
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                "wall-clock before UNIX_EPOCH; falling back to receive_us=0 — \
+                 DHT records will expire en masse when the clock recovers. Set the host clock."
+            );
+            0
+        }
+    }
 }
 
 /// Lift the peer IP out of a connection's currently-selected path.
