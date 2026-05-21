@@ -433,6 +433,11 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+      # dawidd6/action-download-artifact calls the workflow_runs API to
+      # find the latest successful main run; without actions: read it
+      # 403s and the step (continue-on-error) silently produces no
+      # baseline — every PR would render "no baseline available".
+      actions: read
     defaults:
       run:
         working-directory: contracts
@@ -465,9 +470,11 @@ jobs:
       # `if_no_artifact_found: warn` keeps the job green on a first-ever
       # PR or after an artifact has expired.
       - name: Download coverage baseline
+        id: dl_baseline
         if: github.event_name == 'pull_request'
         continue-on-error: true
-        uses: dawidd6/action-download-artifact@v21
+        # SHA-pinned (v21); rebind would require a deliberate ref change.
+        uses: dawidd6/action-download-artifact@b6e2e70617bc3265edd6dab6c906732b2f1ae151
         with:
           workflow: ci.yml
           branch: main
@@ -478,6 +485,22 @@ jobs:
           # so this lands the file at contracts/baseline/lcov.info.
           path: contracts/baseline/
           if_no_artifact_found: warn
+
+      # Record WHY the baseline is absent so the comment script can
+      # distinguish "first PR / artifact expired" from "download failed
+      # with the artifact available" — otherwise an artifact-API outage
+      # looks identical to a legitimate first PR.
+      - name: Tag baseline status
+        if: github.event_name == 'pull_request'
+        run: |
+          mkdir -p baseline
+          if [[ -s baseline/lcov.info ]]; then
+            rm -f baseline/.absent-reason
+          elif [[ "${{ steps.dl_baseline.outcome }}" == "success" ]]; then
+            printf 'not-found\n' > baseline/.absent-reason
+          else
+            printf 'download-failed\n' > baseline/.absent-reason
+          fi
 
       # Post (or update) the sticky PR comment with total line coverage and
       # delta vs main. Mirrors the existing coverage-diff.py sticky-comment
@@ -544,23 +567,22 @@ jobs:
           version: v1.7.1
       - name: Run Slither
         id: slither
-        uses: crytic/slither-action@v0.4.2
+        # SHA-pinned (v0.4.2). slither-config carries fail_on: medium too;
+        # `fail-on` on the action input is the authoritative gate.
+        uses: crytic/slither-action@b52cc1cbfee9ca3e8722dd5224299d16c9a6b80f
         with:
           target: contracts/
           slither-config: contracts/slither.config.json
           sarif: results.sarif
           fail-on: medium
       - name: Upload SARIF
-        # always(): SARIF should reach code-scanning even when slither fails CI
-        # so reviewers can see the findings list, not just a red X.
-        # continue-on-error: code scanning requires GitHub Advanced Security
-        # (or a public repo). This repo is private without GHAS, so the
-        # upload throws "Advanced Security must be enabled". The slither
-        # step itself is the authoritative CI gate (fail-on: medium); SARIF
-        # is a nice-to-have surface that activates if GHAS is enabled later
-        # or the repo goes public.
+        # always(): SARIF should reach code-scanning even when slither fails
+        # CI so reviewers can see the findings list, not just a red X.
+        # Code scanning requires GitHub Advanced Security on a private repo;
+        # GHAS is enabled on this repo, so a failed upload is a real signal
+        # (token-scope drift, schema rejection, billing lapse) and the step
+        # is no longer continue-on-error.
         if: always() && steps.slither.outputs.sarif != ''
-        continue-on-error: true
         uses: github/codeql-action/upload-sarif@v4.35.5
         with:
           sarif_file: ${{ steps.slither.outputs.sarif }}
@@ -583,7 +605,11 @@ jobs:
       # need anyway — code scanning requires GHAS on private repos), and
       # the action handles its own toolchain lifecycle.
       - name: Aderyn check
-        uses: Cyfrin/aderyn-ci@v0.0.10
+        # SHA-pinned (v0.0.10). The action emits a `working-directory`
+        # deprecation warning suggesting `root` in aderyn.toml; both work
+        # today and the warning is benign — the action still respects
+        # the input.
+        uses: Cyfrin/aderyn-ci@6c7e313326652c60f82f804b7f3641650334baaf
         with:
           working-directory: contracts
           fail-on: high
@@ -614,13 +640,16 @@ jobs:
         # delta); contract changes legitimately move gas, and the signal
         # belongs in the PR comment, not as a hard block.
         #
-        # Fail the step if `forge snapshot` itself errors (compile / test
-        # failure, missing baseline, etc.) — otherwise an empty diff file
-        # would silently post as "No gas changes vs base". An empty
-        # diff from a successful run remains valid and is reported as
-        # "No gas changes" by the comment script.
+        # Explicit baseline existence check: `forge snapshot --diff` on a
+        # missing baseline exits 0 and writes a full snapshot to stdout
+        # instead of a diff — which would post a giant fake "gas changes"
+        # comment. GH Actions bash already runs with `set -eo pipefail`,
+        # so the forge invocation aborts the step on compile/test failure.
         run: |
-          set -o pipefail
+          if [[ ! -f .gas-snapshot ]]; then
+            echo "::error::contracts/.gas-snapshot baseline missing; regenerate via 'FOUNDRY_PROFILE=ci forge snapshot --snap .gas-snapshot'"
+            exit 1
+          fi
           forge snapshot --diff .gas-snapshot > /tmp/gas-diff.txt
       - name: Post comment
         # Fork PRs have read-only GITHUB_TOKEN; createComment would 403.
