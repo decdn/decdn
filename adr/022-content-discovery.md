@@ -194,6 +194,57 @@ On node startup:
 
 The registry-seeded peer list participates in DHT lookups immediately, so there is no separate bootstrap window during which content discovery is unavailable. If a `FindValue` lookup returns no providers during the first few seconds — before k-buckets are populated — the on-chain origin directory provides the deterministic fallback. At PoC scale (30 nodes) the routing table is fully populated after a single self-lookup round.
 
+**Cold-start re-publish scheduling.** A node holding C cached blobs at startup must establish DHT records for all of them. The publisher MUST draw a per-record jitter from `uniform(0, 50 min)` for each blob's first re-publish after startup, independently per record. Subsequent re-publishes use the standard `uniform(30 min, 50 min)` interval per [§ STORE Flow (Cache Event → DHT Publish)](#store-flow-cache-event--dht-publish). Naive "re-publish everything on the next scheduler tick" implementations are non-conforming: at moderate cache sizes a single-tick re-publish issues `C × (K+3)` STOREs in one window, saturating the per-peer rate limit at every receiver and turning startup into a multi-minute rate-limited drip. Per-record jitter on cold start makes bootstrap rate match steady-state rate; see [§ DHT Bandwidth Analysis](#dht-bandwidth-analysis).
+
+### DHT Bandwidth Analysis
+
+Per-RPC wire costs (32B hashes and NodeIds, varint framing, QUIC stream overhead):
+
+| RPC | Request | Response | Round-trip typical |
+|-----|---------|----------|--------------------|
+| FindValue | ~100B | ~500B typical, ~2.3 KB max (50 providers + 20 closer_nodes) | ~600B |
+| Store | ~100B | ~70B `StoreAck` | ~170B |
+| FindNode | ~100B | ~700B (20 closer_nodes) | ~800B |
+
+#### Steady state
+
+STORE re-publish dominates and scales with cached blob count C, **not** network size N. Each STORE targets K+3 receivers regardless of N; a receiver's inbound rate from any one publisher decreases as 1/N while the publisher count increases as N, leaving total per-receiver inbound constant in N. With K+3=23 targets and 40-minute average re-publish cycle:
+
+| C (cached blobs/node) | STORE bandwidth (per node, each direction) | Notes |
+|-----------------------|---------------------------------------------|-------|
+| 100 | ~1.3 Kbps | Light client |
+| 1,000 | ~13 Kbps | Typical staked node |
+| 10,000 | ~130 Kbps | Comparable order to gossip at N=1000 ([ADR 001 § Gossip Bandwidth Analysis](001-network.md#gossip-bandwidth-analysis)) |
+| 100,000 | ~1.3 Mbps | Heavy-caching node |
+
+FIND_VALUE traffic scales with the cache-miss rate M and weakly with N (hop count grows as log N, mitigated by α=3 parallelism). At N=500 and M=1 miss/sec: ~15 RPCs per miss × ~600B/RPC ≈ 75 Kbps outbound. FIND_NODE bucket-refresh traffic (every 1 hour per bucket × ~3 RPCs/refresh) is ~1.4 Kbps — negligible.
+
+At a representative operating point — C=10,000, M=1 miss/sec, N=500 — total per-node DHT bandwidth is ~200–300 Kbps in each direction, the same order as gossip at scale.
+
+#### Bootstrap surge
+
+A restarting publisher with C cached blobs needs `C × (K+3)` STOREs to fully populate DHT records. At C=10,000: 230,000 STOREs. The natural spread mechanism is per-record jitter on cold start ([§ Bootstrap](#bootstrap)): with `uniform(0, 50 min)` draws, bootstrap rate matches steady state at ~96 STOREs/sec averaged across all receivers, fitting comfortably within the rate-limit budget. Without per-record jitter at cold start, the same 230,000 STOREs deliver in a single scheduler interval, saturating the per-peer rate limit at every receiver. The cold-start jitter requirement is what makes bootstrap the publisher's problem to schedule rather than the receiver's problem to absorb.
+
+#### Headroom against rate limits
+
+At C=10,000 and N=500 steady state, the per-peer inbound STORE rate is `(C × (K+3)) / (N × cycle_sec)` ≈ 0.19/sec average, ~2/sec burst under jitter clustering:
+
+| Bucket | Modeled steady-state load | Limit ([§ DHT Rate Limiting](#dht-rate-limiting)) | Headroom |
+|--------|---------------------------|----------------------------------------------------|----------|
+| Per-peer (NodeId) | ~0.19/sec avg, ~2/sec burst | 20/sec | ~10× burst, ~100× sustained |
+| Per-IP | same in single-peer-per-IP case | 100/sec | ~50× |
+| Global inbound | ~95/sec STORE + ~10–50/sec FIND_VALUE serving ≈ 100–150/sec | 1000/sec | ~7–10× |
+
+The limits are conservative ceilings on adversarial load, not steady-state operating targets. Operators may tighten or loosen them; the table above is the baseline for what's economically justifiable at the analyzed parameters.
+
+#### Bottleneck regimes
+
+Three asymptotic regimes inform protocol-level optimizations:
+
+- **Low C (≤1,000).** Bandwidth is gossip-dominated; DHT is a rounding error. No DHT-specific optimization warranted.
+- **Moderate C (10,000–50,000).** DHT and gossip are comparable. The bottleneck is QUIC stream-setup overhead, not bytes-on-wire — 230,000 STOREs at bootstrap costs ~11.5 MB of pure framing on top of ~28 MB of payload. Batched STORE collapses concentration into one RPC per publisher-receiver pair per scheduler tick, reducing stream count by two-to-three orders of magnitude and saving ~40% of bootstrap bytes-on-wire to framing. Specified in a follow-up.
+- **High C (≥100,000).** DHT dominates and per-publisher STORE bandwidth exceeds 1 Mbps. The protocol does not impose a ceiling on C; operator-policy caps on cached-blob count become the relevant capacity-planning lever.
+
 ### Popularity Signals and Market Dynamics
 
 Content discovery in an incentive-driven network requires nodes to learn what content is in demand *before* being asked to serve it. Two complementary signals provide this.
@@ -294,3 +345,4 @@ DHT STORE and FIND_VALUE operations carry no protocol-level fee. The incentive t
 13. The requester randomizes the surviving provider set before issuing `cdn/probe/v1` requests; probe order is statistically independent of `FindValueResponse.providers` order.
 14. NodeIds returning `has_blob: false` for hash H are not re-probed for H within the negative probe cache TTL ([ADR 001 § Probe cache](001-network.md#probe-cache)).
 15. Re-publish time per record is drawn from `uniform(30 min, 50 min)` independently per draw; STORE targets are the K+3 closest nodes in the publisher's routing table.
+16. On cold start, each cached blob's first re-publish time is drawn from `uniform(0, 50 min)` independently per record. A naive single-tick bulk re-publish across all cached blobs at startup is non-conforming.
