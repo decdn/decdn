@@ -212,6 +212,10 @@ mod tests {
         // by `AnnounceReject::label`; keep them pinned here too.
         assert_eq!(crate::service::SUBSCRIBE_FAILED_LABEL, "subscribe_failed");
         assert_eq!(crate::service::PEER_TABLE_FULL_LABEL, "peer_table_full");
+        assert_eq!(
+            crate::service::RESUBSCRIBE_FAILED_LABEL,
+            "resubscribe_failed"
+        );
     }
 
     fn sample_body(sk: &SecretKey, ts_us: u64) -> NodeAnnounceBody {
