@@ -294,6 +294,9 @@ contract StakingRegistry is AccessControl, ReentrancyGuard, Pausable {
     function unstake() external nonReentrant whenNotPaused {
         UnbondingRequest memory req = unbondingOf[msg.sender];
         if (req.amount == 0) revert NoUnbondingRequest();
+        // Validator timestamp manipulation is bounded by consensus drift
+        // (seconds) and dwarfed by the unbonding period (days per ADR 003).
+        // forge-lint: disable-next-line(block-timestamp)
         if (block.timestamp < req.unlockAt) revert UnbondingNotComplete(req.unlockAt);
 
         delete unbondingOf[msg.sender];
@@ -341,25 +344,48 @@ contract StakingRegistry is AccessControl, ReentrancyGuard, Pausable {
         lifetimeOffenseCount[operator] = newCount;
         uint256 tierBps = newCount == 1 ? SLASH_BPS_TIER_1 : newCount == 2 ? SLASH_BPS_TIER_2 : SLASH_BPS_TIER_3;
 
-        // Slash applies to total at-risk stake (active + unbonding).
-        UnbondingRequest memory req = unbondingOf[operator];
-        uint256 totalAtRisk = activeStake[operator] + uint256(req.amount);
-        slashAmount = (totalAtRisk * tierBps) / BPS_DENOMINATOR;
+        // Block scopes `req`, `totalAtRisk`, and `remainder` so they release
+        // their stack slots before the share locals + `autoEject` bool are
+        // declared below — otherwise the function overflows Solidity's
+        // 16-slot stack limit (compile fails without via_ir).
+        {
+            UnbondingRequest memory req = unbondingOf[operator];
+            uint256 totalAtRisk = activeStake[operator] + uint256(req.amount);
+            slashAmount = (totalAtRisk * tierBps) / BPS_DENOMINATOR;
 
-        // Reduce active stake first, then unbonding bucket.
-        if (slashAmount <= activeStake[operator]) {
-            activeStake[operator] -= slashAmount;
-        } else {
-            uint256 remainder = slashAmount - activeStake[operator];
-            activeStake[operator] = 0;
-            unbondingOf[operator].amount = req.amount - remainder;
+            // Reduce active stake first, then unbonding bucket.
+            if (slashAmount <= activeStake[operator]) {
+                activeStake[operator] -= slashAmount;
+            } else {
+                uint256 remainder = slashAmount - activeStake[operator];
+                activeStake[operator] = 0;
+                unbondingOf[operator].amount = req.amount - remainder;
+            }
         }
 
         // Split: 50% challenger / 30% SafetyReserve / 20% burn.
         // Burn is the remainder so the three legs sum exactly to slashAmount.
+        // The divide-before-multiply pattern (slashAmount was computed by
+        // a prior division) is intentional: rounding dust from the bps
+        // splits is captured in burnShare via subtraction, so no value
+        // is lost. The three-leg sum invariant is exercised by
+        // testFuzz_slash_threeLegsSumToSlashAmount.
+        // slither-disable-next-line divide-before-multiply
         uint256 challengerShare = (slashAmount * CHALLENGER_BPS) / BPS_DENOMINATOR;
+        // slither-disable-next-line divide-before-multiply
         uint256 safetyShare = (slashAmount * SAFETY_BPS) / BPS_DENOMINATOR;
         uint256 burnShare = slashAmount - challengerShare - safetyShare;
+
+        // Checks-effects-interactions: decide the eject status from
+        // post-slash state and commit it BEFORE the external calls below.
+        // ADR 026 — "auto-ejection at 50% of minimum stake"; triggered on
+        // the *active* leg only since an operator with stake in unbonding
+        // is already exiting. AutoEjected emit is deferred to the end so
+        // log order in indexers still reads "transfers, then eject".
+        bool autoEject = activeStake[operator] < (minStake / 2) && !ejected[operator];
+        if (autoEject) {
+            ejected[operator] = true;
+        }
 
         if (challengerShare != 0) {
             IERC20(address(token)).safeTransfer(challenger, challengerShare);
@@ -372,11 +398,7 @@ contract StakingRegistry is AccessControl, ReentrancyGuard, Pausable {
             token.burn(burnShare);
         }
 
-        // Auto-ejection check (ADR 026 — "auto-ejection at 50% of
-        // minimum stake"). Triggered on the *active* leg only; an
-        // operator with stake in unbonding is already exiting.
-        if (activeStake[operator] < (minStake / 2) && !ejected[operator]) {
-            ejected[operator] = true;
+        if (autoEject) {
             emit AutoEjected(operator, activeStake[operator]);
         }
 

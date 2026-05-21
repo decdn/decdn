@@ -120,6 +120,8 @@ jobs:
               - 'contracts/**'
               - '.gitmodules'
               - '.github/workflows/ci.yml'
+              - '.github/scripts/post-gas-snapshot-comment.sh'
+              - '.github/scripts/contracts-coverage-comment.sh'
 
   test:
     name: test
@@ -377,12 +379,31 @@ jobs:
               throw e;
             }
 
-  solidity:
-    name: solidity
+  # ----- Solidity contracts ----------------------------------------------
+  # The contracts pipeline mirrors the Rust split (one concern per job).
+  # All jobs gate on `needs.changes.outputs.solidity` and are accepted
+  # via ci-success allowed-skips when no contracts/ paths changed.
+  # Foundry is pinned to a concrete release tag (v1.7.1) for reproducibility.
+
+  solidity-fmt:
+    name: solidity fmt
     runs-on: ubuntu-latest
     needs: changes
-    # Skips when no contracts/ paths changed (accepted via ci-success
-    # allowed-skips below). The gate matches the existing rust/adr pattern.
+    if: needs.changes.outputs.solidity == 'true' || github.event_name != 'pull_request'
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - uses: foundry-rs/foundry-toolchain@v1.8.0
+        with:
+          version: v1.7.1
+      - run: forge fmt --check
+
+  solidity-build-test:
+    name: solidity build+test
+    runs-on: ubuntu-latest
+    needs: changes
     if: needs.changes.outputs.solidity == 'true' || github.event_name != 'pull_request'
     defaults:
       run:
@@ -394,21 +415,250 @@ jobs:
     steps:
       # submodules: recursive is required — forge-std and openzeppelin-contracts
       # are git submodules under contracts/lib/, and OZ pulls ds-test transitively.
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.0.2
         with:
           submodules: recursive
-      - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@v1
+      - uses: foundry-rs/foundry-toolchain@v1.8.0
         with:
-          version: stable
-      - name: Show forge version
-        run: forge --version
-      - name: forge fmt --check
-        run: forge fmt --check
-      - name: forge build
-        run: forge build --sizes
-      - name: forge test
-        run: forge test
+          version: v1.7.1
+      - run: forge --version
+      - run: forge build --sizes --deny warnings
+      - run: forge test -vvv
+
+  solidity-coverage:
+    name: solidity coverage
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.solidity == 'true' || github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: write
+      # dawidd6/action-download-artifact calls the workflow_runs API to
+      # find the latest successful main run; without actions: read it
+      # 403s and the step (continue-on-error) silently produces no
+      # baseline — every PR would render "no baseline available".
+      actions: read
+    defaults:
+      run:
+        working-directory: contracts
+    env:
+      FOUNDRY_PROFILE: coverage
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          submodules: recursive
+      - uses: foundry-rs/foundry-toolchain@v1.8.0
+        with:
+          version: v1.7.1
+      # The coverage profile disables optimizer + via_ir for accurate source
+      # mapping. If forge coverage hits "stack too deep" as more contracts
+      # land, add --ir-minimum here.
+      - name: forge coverage
+        run: forge coverage --report lcov --report summary
+
+      # Push to main: publish the LCOV as a baseline artifact for PRs to
+      # diff against. Mirrors the Rust coverage flow (test job).
+      - name: Upload coverage baseline
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v7
+        with:
+          name: contracts-coverage-lcov
+          path: contracts/lcov.info
+          retention-days: 90
+
+      # PR: download the baseline so the comment script can render a delta.
+      # `if_no_artifact_found: warn` keeps the job green on a first-ever
+      # PR or after an artifact has expired.
+      - name: Download coverage baseline
+        id: dl_baseline
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        # SHA-pinned (v21); rebind would require a deliberate ref change.
+        uses: dawidd6/action-download-artifact@b6e2e70617bc3265edd6dab6c906732b2f1ae151
+        with:
+          workflow: ci.yml
+          branch: main
+          workflow_conclusion: success
+          name: contracts-coverage-lcov
+          # action-download-artifact resolves `path:` relative to
+          # GITHUB_WORKSPACE, not the job-default working-directory,
+          # so this lands the file at contracts/baseline/lcov.info.
+          path: contracts/baseline/
+          if_no_artifact_found: warn
+
+      # Record WHY the baseline is absent so the comment script can
+      # distinguish "first PR / artifact expired" from "download failed
+      # with the artifact available" — otherwise an artifact-API outage
+      # looks identical to a legitimate first PR.
+      - name: Tag baseline status
+        if: github.event_name == 'pull_request'
+        run: |
+          mkdir -p baseline
+          if [[ -s baseline/lcov.info ]]; then
+            rm -f baseline/.absent-reason
+          elif [[ "${{ steps.dl_baseline.outcome }}" == "success" ]]; then
+            printf 'not-found\n' > baseline/.absent-reason
+          else
+            printf 'download-failed\n' > baseline/.absent-reason
+          fi
+
+      # Post (or update) the sticky PR comment with total line coverage and
+      # delta vs main. Mirrors the existing coverage-diff.py sticky-comment
+      # pattern but contracts-scoped (distinct marker, distinct script).
+      # Skips on fork PRs — GITHUB_TOKEN is read-only there.
+      - name: Post coverage comment
+        if: |
+          github.event_name == 'pull_request'
+          && github.event.pull_request.head.repo.full_name == github.repository
+        continue-on-error: true
+        env:
+          GH_PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # CWD is contracts/ via the job-level defaults.run.working-directory.
+        # lcov.info lives here (from forge coverage); baseline/lcov.info was
+        # written by the prior step (action-download-artifact uses
+        # GITHUB_WORKSPACE-relative paths, so its `path: contracts/baseline/`
+        # lands the file at <ws>/contracts/baseline/lcov.info, which is
+        # ./baseline/lcov.info from here).
+        run: |
+          base="baseline/lcov.info"
+          if [[ ! -s "$base" ]]; then base=""; fi
+          ../.github/scripts/contracts-coverage-comment.sh lcov.info "$base" baseline/.absent-reason
+
+  solidity-solhint:
+    name: solidity solhint
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.solidity == 'true' || github.event_name != 'pull_request'
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - uses: actions/setup-node@v6.4.0
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: contracts/package-lock.json
+      # npm ci (not npm install) enforces the committed lock file so the
+      # transitive dependency graph stays pinned, not just solhint itself.
+      - run: npm ci --no-audit --no-fund
+      - run: npm run lint
+
+  solidity-slither:
+    name: solidity slither
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.solidity == 'true' || github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      # GitHub Advanced Security is NOT enabled on decdn/decdn (private
+      # repo, no GHAS license), so the SARIF upload step below is
+      # commented out. The slither-action's `fail-on: medium` is still
+      # the authoritative CI gate (findings ≥ medium fail the job and
+      # surface in the run log). Re-enable the upload step + add back
+      # `security-events: write` and `actions: read` permissions if
+      # GHAS is ever turned on or the repo flips public.
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          submodules: recursive
+      - uses: foundry-rs/foundry-toolchain@v1.8.0
+        with:
+          version: v1.7.1
+      - name: Run Slither
+        id: slither
+        # SHA-pinned (v0.4.2). slither-config carries fail_on: medium too;
+        # `fail-on` on the action input is the authoritative gate.
+        uses: crytic/slither-action@b52cc1cbfee9ca3e8722dd5224299d16c9a6b80f
+        with:
+          target: contracts/
+          slither-config: contracts/slither.config.json
+          sarif: results.sarif
+          fail-on: medium
+      # SARIF upload disabled until GHAS is enabled on this repo (see
+      # job-level permissions comment above). Restore by uncommenting
+      # the step below and adding `security-events: write` + `actions:
+      # read` back to `permissions:`. The slither step still produces
+      # results.sarif on disk; only the upload-to-code-scanning is
+      # gated.
+      # - name: Upload SARIF
+      #   if: always() && steps.slither.outputs.sarif != ''
+      #   uses: github/codeql-action/upload-sarif@v4.35.5
+      #   with:
+      #     sarif_file: ${{ steps.slither.outputs.sarif }}
+      #     category: slither
+
+  solidity-aderyn:
+    name: solidity aderyn
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.solidity == 'true' || github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          submodules: recursive
+      - uses: foundry-rs/foundry-toolchain@v1.8.0
+        with:
+          version: v1.7.1
+      # The official Cyfrin/aderyn-ci action installs aderyn, runs it, and
+      # gates the CI step via fail-on. No SARIF surface (which we don't
+      # need anyway — code scanning requires GHAS on private repos), and
+      # the action handles its own toolchain lifecycle.
+      - name: Aderyn check
+        # SHA-pinned (v0.0.10). The action emits a `working-directory`
+        # deprecation warning suggesting `root` in aderyn.toml; both work
+        # today and the warning is benign — the action still respects
+        # the input.
+        uses: Cyfrin/aderyn-ci@6c7e313326652c60f82f804b7f3641650334baaf
+        with:
+          working-directory: contracts
+          fail-on: high
+
+  solidity-gas-snapshot:
+    name: solidity gas snapshot
+    runs-on: ubuntu-latest
+    needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.solidity == 'true'
+    permissions:
+      contents: read
+      pull-requests: write
+    defaults:
+      run:
+        working-directory: contracts
+    env:
+      FOUNDRY_PROFILE: ci
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          submodules: recursive
+      - uses: foundry-rs/foundry-toolchain@v1.8.0
+        with:
+          version: v1.7.1
+      - name: Generate diff
+        # --diff compares current run vs the committed .gas-snapshot file.
+        # We deliberately do not pass --check (which would fail CI on any
+        # delta); contract changes legitimately move gas, and the signal
+        # belongs in the PR comment, not as a hard block.
+        #
+        # Explicit baseline existence check: `forge snapshot --diff` on a
+        # missing baseline exits 0 and writes a full snapshot to stdout
+        # instead of a diff — which would post a giant fake "gas changes"
+        # comment. GH Actions bash already runs with `set -eo pipefail`,
+        # so the forge invocation aborts the step on compile/test failure.
+        run: |
+          if [[ ! -f .gas-snapshot ]]; then
+            echo "::error::contracts/.gas-snapshot baseline missing; regenerate via 'FOUNDRY_PROFILE=ci forge snapshot --snap .gas-snapshot'"
+            exit 1
+          fi
+          forge snapshot --diff .gas-snapshot > /tmp/gas-diff.txt
+      - name: Post comment
+        # Fork PRs have read-only GITHUB_TOKEN; createComment would 403.
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GH_PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ../.github/scripts/post-gas-snapshot-comment.sh /tmp/gas-diff.txt
 
   markdownlint:
     name: markdownlint
@@ -470,16 +720,22 @@ jobs:
     name: CI success
     if: always()
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, changes, test, deny, doc, msrv, markdownlint, adr-book-list, solidity]
+    needs: [fmt, clippy, changes, test, deny, doc, msrv, markdownlint, adr-book-list,
+            solidity-fmt, solidity-build-test, solidity-coverage,
+            solidity-solhint, solidity-slither, solidity-aderyn,
+            solidity-gas-snapshot]
     steps:
       - uses: re-actors/alls-green@release/v1
         with:
           jobs: ${{ toJSON(needs) }}
           # Rust jobs are gated on `needs.changes.outputs.rust`,
-          # adr-book-list on `needs.changes.outputs.adr`, and solidity on
-          # `needs.changes.outputs.solidity`; each skips when its paths
-          # are untouched. alls-green treats `skipped` as failure unless
-          # listed here. `changes` and `markdownlint` are intentionally
-          # omitted — they always run, so a skip from either signals a
-          # misconfiguration that should fail the gate.
-          allowed-skips: fmt, clippy, test, deny, doc, msrv, adr-book-list, solidity
+          # adr-book-list on `needs.changes.outputs.adr`, and the solidity-*
+          # jobs on `needs.changes.outputs.solidity`; each skips when its
+          # paths are untouched. alls-green treats `skipped` as failure
+          # unless listed here. `changes` and `markdownlint` are
+          # intentionally omitted — they always run, so a skip from either
+          # signals a misconfiguration that should fail the gate.
+          allowed-skips: fmt, clippy, test, deny, doc, msrv, adr-book-list,
+                         solidity-fmt, solidity-build-test, solidity-coverage,
+                         solidity-solhint, solidity-slither, solidity-aderyn,
+                         solidity-gas-snapshot

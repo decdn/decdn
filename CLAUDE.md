@@ -19,7 +19,10 @@ cargo nextest run -p decdn-protocol  # single crate
 cargo fmt -- --check                 # check formatting
 cargo deny check                     # license + advisory audit
 pre-commit run --all-files           # run all hooks
+(cd contracts && forge fmt --check && forge build --sizes && forge test)  # contracts
 ```
+
+Full Solidity workflow (static analysis, coverage, gas snapshots) lives in [CONTRIBUTING.md § Solidity development](CONTRIBUTING.md#solidity-development).
 
 ## Architecture
 
