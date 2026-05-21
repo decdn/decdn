@@ -1,7 +1,7 @@
 # ADR 001: Network Topology and Peer Mesh
 
 **Date:** 2026-03-28
-**Status:** Draft
+**Status:** Accepted
 
 ## Context
 
@@ -205,11 +205,11 @@ Node identity is the iroh `NodeId` (ed25519 public key). All staked nodes regist
 
 - No external infrastructure is reachable — origin-backed nodes completely hide their backends, so no client or node can bypass the payment layer via a direct storage URL
 - All nodes share the same discovery and transport protocols. The cache-only role remains permissionless — any staked operator may pull cached blobs from authorized origins and re-serve them. The origin role is DAO-governed: registered namespaces have publisher-proposed `OriginAssignment` operator sets, and a global allow-list covers unregistered content. See [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority) and [ADR 002 § Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces)
-- Gossip messages are lightweight (~800 bytes) — no content inventories, Bloom filters, or hash lists. At the PoC default 60-second interval, per-node bandwidth is ~3 Kbps at 30 nodes, scaling linearly to ~111 Kbps at 1,000 nodes (see [Gossip Bandwidth Analysis](#gossip-bandwidth-analysis)). Regional topics speed regional delivery but do not reduce global topic bandwidth
+- Gossip messages are lightweight (~800 bytes) — no content inventories, Bloom filters, or hash lists. At default 60-second interval, per-node bandwidth is ~3 Kbps at 30 nodes, scaling linearly to ~111 Kbps at 1,000 nodes (see [Gossip Bandwidth Analysis](#gossip-bandwidth-analysis)). Regional topics speed regional delivery but do not reduce global topic bandwidth
 - Content discovery via `cdn/dht/v1` provides targeted O(log N) provider lookup; probe confirms live availability. No stale content inventory to maintain — stale DHT records self-expire within TTL (1 hour)
 - Probe cache prevents redundant probe batches for popular content within a 15-second window
 - Once a node in a region caches a blob, other regional nodes pull from it at competitive rates rather than origin-backed prices — popular content gets cheaper as it spreads
-- The flat mesh is simple to reason about and easy to test at small scale (PoC is tens of nodes)
+- The flat mesh is simple to reason about and easy to test at small scale
 - NodeId squatting is prevented by on-chain ed25519 ownership proof — an attacker cannot register a NodeId they do not control, and a legitimate owner can reclaim a squatted NodeId
 
 ### Negative

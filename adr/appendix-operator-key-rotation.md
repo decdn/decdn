@@ -105,7 +105,7 @@ cast code <addr>      # EOA → returns 0x ; Safe → returns deployed proxy cod
 Procedure:
 
 1. **Drain** and **stop** the node (same as [§ iroh node-key rotation only](#iroh-node-key-rotation-only) steps 2–3).
-2. **Wait** for all open inbound channels to settle. Watch `decdn_channels_open`. If any channel is in the dispute window, do **not** rotate — settling a stale state in step 7 requires the old keystore. PoC dispute window 48h ([ADR 003](003-payments.md#adr-003-payment-model)); production governable 12h–72h ([ADR 009](009-governance.md#adr-009-governance-model)).
+2. **Wait** for all open inbound channels to settle. Watch `decdn_channels_open`. If any channel is in the dispute window, do **not** rotate — settling a stale state in step 7 requires the old keystore. Dispute window 48h ([ADR 003](003-payments.md#adr-003-payment-model)); production governable 12h–72h ([ADR 009](009-governance.md#adr-009-governance-model)).
 3. **`StakingRegistry.deregisterNode()`** from the old address. Sets `active = false`, starts the unbonding period, increments `registrationNonce[nodeId]`. Stake remains slashable during unbonding ([ADR 019 § Re-Onboarding](019-node-onboarding.md#re-onboarding-after-deregistration-or-auto-ejection)).
 4. **Wait** the full unbonding period (default 7d, minimum 3d governable). Stake remains slashable here — do not relax monitoring.
 5. **`StakingRegistry.withdraw()`** to the old address.
