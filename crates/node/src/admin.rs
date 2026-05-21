@@ -478,7 +478,7 @@ mod tests {
     }
 
     async fn state_with(peers: Vec<([u8; 32], &str, u64, u64)>) -> (AdminState, tempfile::TempDir) {
-        let mut table = PeerTable::new(0);
+        let mut table = PeerTable::new(0, 0);
         for (id, region, ts_us, now_us) in peers {
             table
                 .insert_or_refresh(mk_announce(id, region, ts_us), now_us)
@@ -513,7 +513,7 @@ mod tests {
         // first_seen_us and last_seen_us differ. Distinct values catch a
         // field-swap regression (first↔last) that identical seeds would
         // not.
-        let mut table = PeerTable::new(0);
+        let mut table = PeerTable::new(0, 0);
         table
             .insert_or_refresh(mk_announce(id, "US", 10), 100)
             .expect("seed insert");
@@ -549,7 +549,7 @@ mod tests {
         let started = Instant::now();
         let (cache, _tmp) = test_cache().await;
         let state = AdminState::new(
-            Arc::new(RwLock::new(PeerTable::new(0))),
+            Arc::new(RwLock::new(PeerTable::new(0, 0))),
             id,
             started,
             cache,
@@ -649,7 +649,7 @@ mod tests {
         let _ = cache.get(hash).await?;
 
         let state = AdminState::new(
-            Arc::new(RwLock::new(PeerTable::new(0))),
+            Arc::new(RwLock::new(PeerTable::new(0, 0))),
             [0u8; 32],
             Instant::now(),
             cache.clone(),
@@ -701,7 +701,7 @@ mod tests {
         // flagged in PR review.
         let (cache, _tmp) = test_cache().await;
         let state = AdminState::new(
-            Arc::new(RwLock::new(PeerTable::new(0))),
+            Arc::new(RwLock::new(PeerTable::new(0, 0))),
             [0u8; 32],
             Instant::now(),
             cache,
@@ -783,7 +783,7 @@ mod tests {
         let _ = cache.get(hash).await?;
 
         let state = AdminState::new(
-            Arc::new(RwLock::new(PeerTable::new(0))),
+            Arc::new(RwLock::new(PeerTable::new(0, 0))),
             [0u8; 32],
             Instant::now(),
             cache.clone(),
@@ -899,7 +899,7 @@ mod tests {
         cache.evict(hash)?;
 
         let state = AdminState::new(
-            Arc::new(RwLock::new(PeerTable::new(0))),
+            Arc::new(RwLock::new(PeerTable::new(0, 0))),
             [0u8; 32],
             Instant::now(),
             cache,
@@ -960,7 +960,7 @@ mod tests {
         let trigger = Arc::new(decdn_gossip::AnnounceTrigger::for_test(Arc::clone(&notify)));
         let (cache, _tmp) = test_cache().await;
         let state = AdminState::new(
-            Arc::new(RwLock::new(PeerTable::new(0))),
+            Arc::new(RwLock::new(PeerTable::new(0, 0))),
             [0u8; 32],
             Instant::now(),
             cache,
@@ -1028,7 +1028,7 @@ mod tests {
         };
         let (cache, _tmp) = test_cache().await;
         let state = AdminState::new(
-            Arc::new(RwLock::new(PeerTable::new(0))),
+            Arc::new(RwLock::new(PeerTable::new(0, 0))),
             [0u8; 32],
             Instant::now(),
             cache,
@@ -1092,7 +1092,7 @@ mod tests {
         let trigger = Arc::new(DrainTrigger::new());
         let (cache, _tmp) = test_cache().await;
         let state = AdminState::new(
-            Arc::new(RwLock::new(PeerTable::new(0))),
+            Arc::new(RwLock::new(PeerTable::new(0, 0))),
             [0u8; 32],
             Instant::now(),
             cache,
@@ -1144,7 +1144,7 @@ mod tests {
         };
         let (cache, _tmp) = test_cache().await;
         let state = AdminState::new(
-            Arc::new(RwLock::new(PeerTable::new(0))),
+            Arc::new(RwLock::new(PeerTable::new(0, 0))),
             [0u8; 32],
             Instant::now(),
             cache,
