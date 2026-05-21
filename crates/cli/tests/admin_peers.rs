@@ -85,7 +85,7 @@ async fn spawn_admin(
 
 #[tokio::test]
 async fn peers_list_empty_peer_table() -> anyhow::Result<()> {
-    let peer_table = Arc::new(RwLock::new(PeerTable::new(0)));
+    let peer_table = Arc::new(RwLock::new(PeerTable::new(0, 0)));
     let (cache, _tmp) = test_cache().await?;
     let state = AdminState::new(
         peer_table,
@@ -110,7 +110,7 @@ async fn peers_list_empty_peer_table() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn peers_list_seeded_entries_sorted_desc() -> anyhow::Result<()> {
-    let peer_table = Arc::new(RwLock::new(PeerTable::new(0)));
+    let peer_table = Arc::new(RwLock::new(PeerTable::new(0, 0)));
     {
         let mut guard = peer_table.write().await;
         // (id, region, announce_ts_us, now_us)
@@ -166,7 +166,7 @@ async fn peers_list_seeded_entries_sorted_desc() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn health_returns_hex_node_id_and_uptime() -> anyhow::Result<()> {
-    let peer_table = Arc::new(RwLock::new(PeerTable::new(0)));
+    let peer_table = Arc::new(RwLock::new(PeerTable::new(0, 0)));
     let id = [0xABu8; 32];
     let (cache, _tmp) = test_cache().await?;
     let state = AdminState::new(
@@ -203,7 +203,7 @@ async fn health_returns_hex_node_id_and_uptime() -> anyhow::Result<()> {
 /// a method name outside the `admin_v1_` namespace.
 #[tokio::test]
 async fn unknown_method_returns_method_not_found() -> anyhow::Result<()> {
-    let peer_table = Arc::new(RwLock::new(PeerTable::new(0)));
+    let peer_table = Arc::new(RwLock::new(PeerTable::new(0, 0)));
     let (cache, _tmp) = test_cache().await?;
     let state = AdminState::new(
         peer_table,
@@ -486,7 +486,7 @@ async fn cli_reload_rejects_zero_timeout() -> anyhow::Result<()> {
 /// prove the trigger fires; this test proves the RPC path reaches it.
 #[tokio::test]
 async fn admin_v1_drain_returns_initiated_true() -> anyhow::Result<()> {
-    let peer_table = Arc::new(RwLock::new(PeerTable::new(0)));
+    let peer_table = Arc::new(RwLock::new(PeerTable::new(0, 0)));
     let (cache, _tmp) = test_cache().await?;
     let drain_trigger = Arc::new(DrainTrigger::new());
     let state = AdminState::new(
@@ -562,7 +562,7 @@ async fn cli_drain_rejects_zero_timeout() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn admin_shutdown_closes_listener() -> anyhow::Result<()> {
-    let peer_table = Arc::new(RwLock::new(PeerTable::new(0)));
+    let peer_table = Arc::new(RwLock::new(PeerTable::new(0, 0)));
     let (cache, _tmp) = test_cache().await?;
     let state = AdminState::new(
         peer_table,

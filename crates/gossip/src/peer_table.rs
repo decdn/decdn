@@ -26,6 +26,13 @@ pub enum InsertOutcome {
     Inserted,
     /// Existing entry refreshed with a newer announce.
     Refreshed,
+    /// New entry rejected because the table is at its hard cap (#577 H3).
+    /// Returned only for previously-unseen node IDs after a one-shot
+    /// inline TTL sweep failed to free a slot; existing entries are
+    /// always refreshed regardless of the cap so legitimate peers
+    /// don't lose their slot under a fresh-keypair flood. Subscriber-
+    /// loop callers should bump a `peer_table_full` rejection metric.
+    RejectedFull,
 }
 
 /// Error returned by [`PeerTable::insert_or_refresh`] when the incoming
@@ -44,15 +51,24 @@ pub struct StaleTimestamp {
 pub struct PeerTable {
     entries: HashMap<[u8; 32], PeerEntry>,
     ttl_us: u64,
+    /// Hard cap on entry count (#577 H3). `0` disables the cap; the
+    /// resolved-config validator rejects `0` so production paths never
+    /// hit the unbounded branch, but in-process tests use it.
+    max_entries: usize,
 }
 
 impl PeerTable {
-    /// Create an empty table. `ttl_us` is how long an unrefreshed entry may
-    /// live — pass `0` to disable TTL (useful in tests).
-    pub fn new(ttl_us: u64) -> Self {
+    /// Create an empty table.
+    ///
+    /// * `ttl_us` — how long an unrefreshed entry may live; `0` disables TTL.
+    /// * `max_entries` — hard cap on entry count enforced by
+    ///   [`Self::insert_or_refresh`]; `0` disables the cap (test-only,
+    ///   the config resolver rejects `0` on the production path).
+    pub fn new(ttl_us: u64, max_entries: usize) -> Self {
         Self {
             entries: HashMap::new(),
             ttl_us,
+            max_entries,
         }
     }
 
@@ -94,18 +110,30 @@ impl PeerTable {
             }
             existing.announce = announce;
             existing.last_seen_us = now_us;
-            Ok(InsertOutcome::Refreshed)
-        } else {
-            self.entries.insert(
-                node_id,
-                PeerEntry {
-                    announce,
-                    first_seen_us: now_us,
-                    last_seen_us: now_us,
-                },
-            );
-            Ok(InsertOutcome::Inserted)
+            return Ok(InsertOutcome::Refreshed);
         }
+
+        // New entry. Enforce the hard cap (#577 H3) with a one-shot inline
+        // TTL sweep: under a fresh-keypair flood the table is full of new
+        // entries the 30s background sweeper hasn't reached yet, so the
+        // inline sweep gives expired slots a chance to be reclaimed before
+        // the request is rejected. `max_entries == 0` disables the cap.
+        if self.max_entries > 0 && self.entries.len() >= self.max_entries {
+            self.evict_expired(now_us);
+            if self.entries.len() >= self.max_entries {
+                return Ok(InsertOutcome::RejectedFull);
+            }
+        }
+
+        self.entries.insert(
+            node_id,
+            PeerEntry {
+                announce,
+                first_seen_us: now_us,
+                last_seen_us: now_us,
+            },
+        );
+        Ok(InsertOutcome::Inserted)
     }
 
     /// Evict entries whose `last_seen_us` is older than `now_us - ttl_us`.
@@ -145,7 +173,7 @@ mod tests {
 
     #[test]
     fn insert_then_refresh() -> Result<(), StaleTimestamp> {
-        let mut t = PeerTable::new(0);
+        let mut t = PeerTable::new(0, 0);
         let id = [1u8; 32];
         assert_eq!(
             t.insert_or_refresh(mk_announce(id, 10), 100)?,
@@ -164,7 +192,7 @@ mod tests {
 
     #[test]
     fn monotonic_rejects_regression() {
-        let mut t = PeerTable::new(0);
+        let mut t = PeerTable::new(0, 0);
         let id = [2u8; 32];
         assert_eq!(
             t.insert_or_refresh(mk_announce(id, 10), 100).unwrap(),
@@ -178,7 +206,7 @@ mod tests {
 
     #[test]
     fn ttl_evicts_stale_entries() {
-        let mut t = PeerTable::new(1_000); // 1000 µs TTL
+        let mut t = PeerTable::new(1_000, 0); // 1000 µs TTL, unbounded
         let a = [3u8; 32];
         let b = [4u8; 32];
         assert_eq!(
@@ -198,7 +226,7 @@ mod tests {
 
     #[test]
     fn ttl_zero_is_noop() {
-        let mut t = PeerTable::new(0);
+        let mut t = PeerTable::new(0, 0);
         let id = [5u8; 32];
         assert_eq!(
             t.insert_or_refresh(mk_announce(id, 1), 10).unwrap(),
@@ -211,7 +239,7 @@ mod tests {
     #[test]
     fn evict_at_exact_cutoff_keeps_entry() {
         // ttl=100, last_seen=100, now=200 → cutoff=100, 100 >= 100 so entry stays.
-        let mut t = PeerTable::new(100);
+        let mut t = PeerTable::new(100, 0);
         let id = [6u8; 32];
         assert_eq!(
             t.insert_or_refresh(mk_announce(id, 1), 100).unwrap(),
@@ -225,7 +253,7 @@ mod tests {
     #[test]
     fn evict_one_microsecond_past_cutoff_removes_entry() {
         // ttl=100, last_seen=100, now=201 → cutoff=101, 100 < 101 so entry is evicted.
-        let mut t = PeerTable::new(100);
+        let mut t = PeerTable::new(100, 0);
         let id = [7u8; 32];
         assert_eq!(
             t.insert_or_refresh(mk_announce(id, 1), 100).unwrap(),
@@ -240,7 +268,7 @@ mod tests {
     fn saturating_sub_underflow_keeps_all_entries() {
         // ttl=1000, last_seen=10, now=50 → saturating_sub clamps cutoff to 0,
         // so 10 >= 0 and the entry stays. Guards the saturating_sub path.
-        let mut t = PeerTable::new(1_000);
+        let mut t = PeerTable::new(1_000, 0);
         let id = [8u8; 32];
         assert_eq!(
             t.insert_or_refresh(mk_announce(id, 1), 10).unwrap(),
@@ -255,7 +283,7 @@ mod tests {
     fn refresh_at_boundary_keeps_entry() {
         // Insert at last_seen=100, refresh to last_seen=200. Then evict at now=200
         // with ttl=100 → cutoff=100, refreshed last_seen=200 >= 100 so entry stays.
-        let mut t = PeerTable::new(100);
+        let mut t = PeerTable::new(100, 0);
         let id = [9u8; 32];
         assert_eq!(
             t.insert_or_refresh(mk_announce(id, 1), 100).unwrap(),
@@ -277,7 +305,7 @@ mod tests {
         // Without a refresh, evict_expired(300) with ttl=100 would cut off at 200
         // and remove an entry whose last_seen=100. Refreshing to last_seen=250
         // should keep it alive (250 >= 200).
-        let mut t = PeerTable::new(100);
+        let mut t = PeerTable::new(100, 0);
         let id = [10u8; 32];
         assert_eq!(
             t.insert_or_refresh(mk_announce(id, 1), 100).unwrap(),
@@ -292,5 +320,96 @@ mod tests {
         assert_eq!(evicted, 0);
         let entry = t.get(&id).expect("entry should still be present");
         assert_eq!(entry.last_seen_us, 250);
+    }
+
+    // #577 H3 — cap behavior.
+
+    #[test]
+    fn insert_rejected_when_table_full() {
+        // ttl=0 so the inline sweep on the cap path is a no-op; this isolates
+        // the "cap reached, no eviction possible" branch from the "sweep
+        // freed a slot" branch (covered by the next test).
+        let mut t = PeerTable::new(0, 2);
+        let a = [11u8; 32];
+        let b = [12u8; 32];
+        let c = [13u8; 32];
+        assert_eq!(
+            t.insert_or_refresh(mk_announce(a, 1), 100).unwrap(),
+            InsertOutcome::Inserted
+        );
+        assert_eq!(
+            t.insert_or_refresh(mk_announce(b, 1), 100).unwrap(),
+            InsertOutcome::Inserted
+        );
+        // Third distinct id must be rejected — the table is at cap and the
+        // inline sweep finds nothing to evict (ttl=0).
+        assert_eq!(
+            t.insert_or_refresh(mk_announce(c, 1), 100).unwrap(),
+            InsertOutcome::RejectedFull
+        );
+        assert_eq!(t.len(), 2);
+        assert!(t.get(&a).is_some());
+        assert!(t.get(&b).is_some());
+        assert!(t.get(&c).is_none());
+    }
+
+    #[test]
+    fn refresh_allowed_when_table_full() {
+        // The cap is on *new* node IDs only — under a fresh-keypair flood,
+        // legitimate peers must still be able to refresh their slot.
+        let mut t = PeerTable::new(0, 1);
+        let id = [14u8; 32];
+        assert_eq!(
+            t.insert_or_refresh(mk_announce(id, 1), 100).unwrap(),
+            InsertOutcome::Inserted
+        );
+        // Refresh of the existing id at the cap succeeds.
+        assert_eq!(
+            t.insert_or_refresh(mk_announce(id, 2), 200).unwrap(),
+            InsertOutcome::Refreshed
+        );
+        let entry = t.get(&id).expect("entry should still be present");
+        assert_eq!(entry.last_seen_us, 200);
+        assert_eq!(t.len(), 1);
+    }
+
+    #[test]
+    fn inline_sweep_on_full_admits_new_after_expiry() {
+        // ttl=100, cap=1. Insert at t=100; advance the clock past the TTL
+        // before the next insert. The new insert finds the table at cap,
+        // triggers the inline sweep, the original entry expires, and the
+        // new one is admitted.
+        let mut t = PeerTable::new(100, 1);
+        let a = [15u8; 32];
+        let b = [16u8; 32];
+        assert_eq!(
+            t.insert_or_refresh(mk_announce(a, 1), 100).unwrap(),
+            InsertOutcome::Inserted
+        );
+        // now_us = 300, ttl = 100, so cutoff = 200 and a (last_seen=100) is
+        // expired. The inline sweep on the cap-full path reclaims it.
+        assert_eq!(
+            t.insert_or_refresh(mk_announce(b, 1), 300).unwrap(),
+            InsertOutcome::Inserted
+        );
+        assert_eq!(t.len(), 1);
+        assert!(t.get(&a).is_none());
+        assert!(t.get(&b).is_some());
+    }
+
+    #[test]
+    fn max_entries_zero_is_unbounded() {
+        // The `0 = unbounded` escape hatch is used by every existing
+        // single-arg call site (tests + admin fixtures). A regression that
+        // treated `0` as the cap would reject every insert.
+        let mut t = PeerTable::new(0, 0);
+        for i in 0u8..50 {
+            let id = [i; 32];
+            assert_eq!(
+                t.insert_or_refresh(mk_announce(id, 1), 100).unwrap(),
+                InsertOutcome::Inserted
+            );
+        }
+        assert_eq!(t.len(), 50);
     }
 }

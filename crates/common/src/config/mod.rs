@@ -64,6 +64,12 @@ const MIN_RPC_WATCHDOG_INTERVAL_SEC: u64 = 10;
 const DEFAULT_ANNOUNCE_INTERVAL_SEC: u64 = 60;
 /// Default peer-table entry TTL after which a stale entry is evicted.
 const DEFAULT_PEER_TTL_SEC: u64 = 600;
+/// Default hard cap on `PeerTable` entry count (#577 H3). Sized for ~tens
+/// of MB of resident memory at the ~few-hundred-byte `PeerEntry` size,
+/// which is plenty of headroom for the tens-of-nodes `PoC` while still
+/// capping the fresh-keypair memory-DoS that the empty-allowlist
+/// stand-in would otherwise leave unbounded.
+const DEFAULT_MAX_PEER_TABLE_ENTRIES: u64 = 100_000;
 /// Default global cap on concurrent in-flight QUIC handler tasks.
 const DEFAULT_MAX_CONCURRENT_HANDLERS: u32 = 256;
 /// Default per-source rate-limit refill (cells/second). A single source
@@ -1462,6 +1468,15 @@ fn resolve_gossip_into(
         "gossip.peer_ttl_sec must be > 0",
     );
 
+    let max_peer_table_entries = file
+        .and_then(|g| g.max_peer_table_entries)
+        .unwrap_or(DEFAULT_MAX_PEER_TABLE_ENTRIES);
+    bag.check(
+        max_peer_table_entries > 0,
+        "gossip.max_peer_table_entries",
+        "gossip.max_peer_table_entries must be > 0",
+    );
+
     let subscribe_global = file.and_then(|g| g.subscribe_global).unwrap_or(true);
 
     let allowlist = file
@@ -1481,6 +1496,7 @@ fn resolve_gossip_into(
         peer_ttl_sec,
         subscribe_global,
         allowlist,
+        max_peer_table_entries,
     }
 }
 
@@ -2031,6 +2047,7 @@ mod tests {
             peer_ttl_sec: 600,
             subscribe_global,
             allowlist: Vec::new(),
+            max_peer_table_entries: DEFAULT_MAX_PEER_TABLE_ENTRIES,
         }
     }
 
@@ -2065,12 +2082,14 @@ mod tests {
             peer_ttl_sec: Some(123),
             subscribe_global: Some(false),
             allowlist: None,
+            max_peer_table_entries: Some(7),
         };
         let g = resolve_gossip(Some(&cfg))?;
         assert_eq!(g.announce_interval_sec, 42);
         assert_eq!(g.peer_ttl_sec, 123);
         assert!(!g.subscribe_global);
         assert!(g.allowlist.is_empty());
+        assert_eq!(g.max_peer_table_entries, 7);
         Ok(())
     }
 
@@ -2081,6 +2100,44 @@ mod tests {
         assert_eq!(g.peer_ttl_sec, DEFAULT_PEER_TTL_SEC);
         assert!(g.subscribe_global);
         assert!(g.allowlist.is_empty());
+        assert_eq!(g.max_peer_table_entries, DEFAULT_MAX_PEER_TABLE_ENTRIES);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_gossip_rejects_zero_max_peer_table_entries() {
+        let cfg = types::GossipConfig {
+            max_peer_table_entries: Some(0),
+            ..Default::default()
+        };
+        let err = resolve_gossip(Some(&cfg))
+            .expect_err("expected error")
+            .to_string();
+        assert!(
+            err.contains("max_peer_table_entries"),
+            "error missing field context: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_gossip_max_peer_table_entries_file_override() -> anyhow::Result<()> {
+        let cfg = types::GossipConfig {
+            max_peer_table_entries: Some(42_000),
+            ..Default::default()
+        };
+        let g = resolve_gossip(Some(&cfg))?;
+        assert_eq!(g.max_peer_table_entries, 42_000);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_gossip_max_peer_table_entries_default_when_field_absent() -> anyhow::Result<()> {
+        let cfg = types::GossipConfig {
+            announce_interval_sec: Some(30),
+            ..Default::default()
+        };
+        let g = resolve_gossip(Some(&cfg))?;
+        assert_eq!(g.max_peer_table_entries, DEFAULT_MAX_PEER_TABLE_ENTRIES);
         Ok(())
     }
 

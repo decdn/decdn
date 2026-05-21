@@ -420,6 +420,12 @@ pub async fn run(
 
     let peer_table = Arc::new(RwLock::new(PeerTable::new(
         cfg.gossip.peer_ttl_sec.saturating_mul(1_000_000),
+        // Saturate at `usize::MAX` on 32-bit targets where the configured
+        // `u64` cap might not fit; mirrors the saturating cast pattern
+        // already used on `i64::try_from(table.len())` in the sweeper
+        // path. The config resolver rejects `0`, so the runtime never
+        // hits the unbounded escape hatch.
+        usize::try_from(cfg.gossip.max_peer_table_entries).unwrap_or(usize::MAX),
     )));
 
     // Admin HTTP surface (ADR 025). Bind here — *before* the gossip service
@@ -1264,6 +1270,7 @@ mod tests {
                 peer_ttl_sec: 600,
                 subscribe_global: false,
                 allowlist: Vec::new(),
+                max_peer_table_entries: 100_000,
             },
             security: ResolvedSecurity {
                 max_concurrent_handlers: 256,
