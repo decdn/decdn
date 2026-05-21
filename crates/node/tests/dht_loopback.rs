@@ -287,3 +287,88 @@ async fn find_value_returns_placeholder_with_closer_nodes() -> anyhow::Result<()
     server_ep.close().await;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn find_node_does_not_insert_attacker_supplied_requester() -> anyhow::Result<()> {
+    // Regression guard for the routing-table poisoning hole flagged in
+    // PR #643 review: the handler must NOT trust the unauthenticated
+    // `req.requester` wire field. An authenticated peer A sending
+    // `FindNode { requester: B }` for an arbitrary B must NOT cause B to
+    // be inserted into the responder's routing table — only A's
+    // QUIC-authenticated NodeId is honest enough to insert.
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let rate_limiter = permissive_dht_rate_limiter(&metrics);
+    let routing = Arc::new(Mutex::new(RoutingTable::new(*server_id.as_bytes())));
+    let handler = Arc::new(DhtHandler::with_routing(
+        server_id,
+        Arc::clone(&routing),
+        rate_limiter,
+        limiter,
+        Arc::clone(&metrics),
+    ));
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_DHT.to_vec()]).await?;
+    let server_ep_bg = server_ep.clone();
+    let accept_task = tokio::spawn(async move {
+        if let Some(incoming) = server_ep_bg.accept().await {
+            let connecting = incoming
+                .accept()
+                .map_err(|e| anyhow::anyhow!("accept: {e}"))?;
+            let conn = connecting
+                .await
+                .map_err(|e| anyhow::anyhow!("handshake: {e}"))?;
+            handler
+                .accept(conn)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let client_id = client_ep.id();
+    let attacker_id: [u8; 32] = [0xEE; 32];
+
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    let conn = client_ep
+        .connect(target, ALPN_DHT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+
+    // Authenticated client A sends a FindNode whose `requester` claims to
+    // be the unrelated `attacker_id`.
+    let req = wire::FindNodeRequest {
+        target: [0x12; 32],
+        requester: attacker_id,
+    };
+    let payload = encode_message(&wire::DhtMessage::FindNode(req))?;
+    write_frame(&mut send, &payload).await?;
+    send.finish()?;
+    let frame = read_frame(&mut recv).await?;
+    let (_msg, _) = decode_message::<wire::DhtMessage>(&frame)?;
+
+    conn.close(0u32.into(), b"bye");
+    client_ep.close().await;
+    accept_task
+        .await
+        .map_err(|e| anyhow::anyhow!("accept task join: {e}"))??;
+    server_ep.close().await;
+
+    let t = routing.lock().expect("routing lock poisoned");
+    assert!(
+        t.contains(client_id.as_bytes()),
+        "authenticated client must be inserted by the connection-level refresh"
+    );
+    assert!(
+        !t.contains(&attacker_id),
+        "attacker-supplied req.requester must NOT be inserted (routing-table poisoning guard)"
+    );
+    Ok(())
+}

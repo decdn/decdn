@@ -139,12 +139,14 @@ impl DhtHandler {
         };
         let _guard = self.metrics.connection_guard();
 
-        // Resolve the peer's NodeId (authenticated by QUIC) and IP up front.
-        // The NodeId is the key for the per-peer rate-limit layer and also
-        // the value we'll feed into our routing table on each admitted
-        // request.
+        // Resolve the peer's NodeId once (it's the authenticated QUIC
+        // identity and cannot change for the lifetime of the connection).
+        // The IP, by contrast, is re-evaluated per stream below — iroh
+        // can switch the selected path mid-connection (e.g. relay → direct
+        // UDP after hole-punching) and caching the initial value would
+        // permanently disable the per-IP rate-limit layer for any
+        // connection that started relay-only.
         let peer_node_id = *conn.remote_id().as_bytes();
-        let peer_ip = peer_ip(&conn);
 
         // ADR 022 §DHT Rate Limiting check fires before any deserialization
         // of the per-stream frame body — we do it per stream below since
@@ -164,7 +166,11 @@ impl DhtHandler {
             else {
                 break;
             };
-            // Rate-limit per request (ADR 022 §DHT Rate Limiting).
+            // Rate-limit per request (ADR 022 §DHT Rate Limiting). Re-read
+            // `peer_ip` here so a relay→direct path switch over the
+            // connection's lifetime engages the per-IP layer for
+            // subsequent streams.
+            let peer_ip = peer_ip(&conn);
             if let Err(layer) = self.rate_limiter.check(&peer_node_id, peer_ip) {
                 Self::close_stream_with_rate_limit(send, recv, layer);
                 continue;
@@ -268,13 +274,25 @@ impl DhtHandler {
                     accepted: false,
                 })
             }
+            wire::DhtMessage::BatchStore(req) => {
+                // Wire variants are defined now to pin ADR-022 discriminant
+                // positions, but `BatchStore` admission (two-stage rate
+                // limit, holder check, per-hash quota) is a follow-up to
+                // #320. Until then we acknowledge with `accepted: false`
+                // for every hash so publishers cleanly fall back to
+                // per-hash `Store` per ADR 022 §Schema Evolution.
+                wire::DhtMessage::BatchStoreAck(wire::BatchStoreAck {
+                    results: vec![false; req.hashes.len()],
+                })
+            }
             // Responses sent to us where we expected a request: surface as
             // unsupported on this server stream. The handler is a
             // request-only endpoint; clients write the response frame back
             // on the same stream by reading it themselves.
             wire::DhtMessage::FindNodeResponse(_)
             | wire::DhtMessage::FindValueResponse(_)
-            | wire::DhtMessage::StoreAck(_) => {
+            | wire::DhtMessage::StoreAck(_)
+            | wire::DhtMessage::BatchStoreAck(_) => {
                 // Echo back an empty FindNodeResponse with target=[0;32] —
                 // the caller will see a malformed-looking but well-formed
                 // frame and disconnect. (We can't error out cleanly with
@@ -288,11 +306,14 @@ impl DhtHandler {
     }
 
     fn handle_find_node(&self, req: wire::FindNodeRequest) -> wire::FindNodeResponse {
-        // Refresh the requester first (cheap, already done at the
-        // connection level — but a peer sending FindNode for someone else
-        // may not be the routing-table refresh we just did, so it's
-        // idempotent here).
-        self.note_peer_seen(req.requester);
+        // NB: do NOT insert `req.requester` here. It is an attacker-
+        // controlled field on the wire — letting it through would allow
+        // an authenticated peer to inject arbitrary (potentially
+        // unreachable) NodeIds into the routing table without owning the
+        // matching keys (routing-table poisoning). The authenticated peer
+        // NodeId from the QUIC handshake is already refreshed once per
+        // admitted request in `serve()`, which is the only honest signal
+        // we have about who is on the other end.
         let closer_nodes = self.closest_to(&req.target);
         wire::FindNodeResponse {
             target: req.target,
@@ -374,7 +395,8 @@ async fn read_dht_request(
             match &msg {
                 wire::DhtMessage::FindNodeResponse(_)
                 | wire::DhtMessage::FindValueResponse(_)
-                | wire::DhtMessage::StoreAck(_) => {
+                | wire::DhtMessage::StoreAck(_)
+                | wire::DhtMessage::BatchStoreAck(_) => {
                     reset(send, recv, APP_ERR_UNSUPPORTED_MESSAGE);
                     Err(DhtReadError {
                         err: anyhow::anyhow!("peer sent dht response on server stream"),

@@ -13,7 +13,12 @@
 //! 022 §DHT Rate Limiting). A request rejected by the global cap never
 //! pays the per-IP map lookup; a per-IP rejection never pays the per-peer
 //! map lookup. The first rejection short-circuits and is the only one
-//! counted in `decdn_dht_rate_limit_rejections_total{layer=...}`.
+//! counted in one of
+//! `decdn_dht_rate_limit_rejected_{per_peer,per_ip,global}_total` — one
+//! Counter per layer (the iroh-metrics backend does not support per-field
+//! labels, so we use distinct counters; see `Metrics::dht_rate_limit_rejected_*`
+//! for the deviation rationale from ADR 022 §Observability's labeled-counter
+//! shape and the rolled-up Prometheus query operators can use).
 //!
 //! # Trusted-IP exemption
 //!
@@ -75,8 +80,9 @@ impl Default for DhtRateLimitConfig {
     }
 }
 
-/// Layer label for the rejection metric, matching ADR 022 §Observability
-/// (`decdn_dht_rate_limit_rejections_total{layer={per_peer,per_ip,global}}`).
+/// Layer that triggered a rejection. Used as a log/trace field and to
+/// pick the right per-layer Counter to bump
+/// (`decdn_dht_rate_limit_rejected_{per_peer,per_ip,global}_total`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DhtRejectLayer {
     /// Per-peer (`NodeId`) bucket exhausted.
@@ -137,9 +143,10 @@ impl DhtRateLimiter {
     /// charge), matching the `ConnectionLimiter` precedent at
     /// [`crate::dispatch::ConnectionLimiter::acquire`].
     ///
-    /// On rejection, increments the layer-labelled
-    /// `decdn_dht_rate_limit_rejections_total` counter and returns the
-    /// layer that fired. No counter increment on the success path.
+    /// On rejection, increments the appropriate per-layer counter
+    /// (`decdn_dht_rate_limit_rejected_{per_peer,per_ip,global}_total`)
+    /// and returns the layer that fired. No counter increment on the
+    /// success path.
     ///
     /// Cheapest-first ordering (global → per-IP → per-peer): the first
     /// layer to reject short-circuits, so a per-peer-flooded request that

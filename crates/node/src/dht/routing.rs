@@ -84,9 +84,12 @@ fn bucket_index(d: &[u8; NODE_ID_LEN]) -> Option<usize> {
             // returns 0..=8; combined with the byte index, the resulting
             // bit position is unique to one bucket.
             let bit_within = byte.leading_zeros() as usize;
-            // KEYSPACE_BITS - 1 - bit_position-from-msb. We invert because
-            // bucket 0 holds the most-distant peers (high-bit set, "no shared
-            // prefix") and bucket 255 the closest (only the lowest bit differs).
+            // KEYSPACE_BITS - 1 - bit_from_msb. The inversion lines up the
+            // bucket index with shared-prefix length: bucket 255 holds the
+            // most-distant peers (high bit set in `d` => zero shared prefix
+            // bits => `bit_from_msb == 0`) and bucket 0 holds the closest
+            // peers (only the lowest bit of `d` differs => `bit_from_msb ==
+            // 255`).
             let bit_from_msb = i * 8 + bit_within;
             return Some(KEYSPACE_BITS - 1 - bit_from_msb);
         }
@@ -113,15 +116,13 @@ impl RoutingTable {
     /// Construct an empty routing table anchored at `self_id`.
     #[must_use]
     pub fn new(self_id: NodeId) -> Self {
-        // `[Vec::new(); KEYSPACE_BITS]` requires `Copy`; build via array-from-fn.
-        let buckets: Box<[Vec<NodeId>; KEYSPACE_BITS]> = (0..KEYSPACE_BITS)
-            .map(|_| Vec::<NodeId>::new())
-            .collect::<Vec<_>>()
-            .into_boxed_slice()
-            .try_into()
-            // The collected Vec has exactly KEYSPACE_BITS elements; the
-            // `try_into` is infallible by construction.
-            .unwrap_or_else(|_| unreachable_size_mismatch());
+        // `std::array::from_fn` builds the fixed-size array in place, so
+        // there is no intermediate `Vec` and no fallible length conversion
+        // — the type system guarantees we end up with exactly
+        // `KEYSPACE_BITS` empty buckets. We `Box` after the fact so the
+        // 160 KiB live on the heap rather than the stack.
+        let buckets: Box<[Vec<NodeId>; KEYSPACE_BITS]> =
+            Box::new(std::array::from_fn(|_| Vec::new()));
         Self { self_id, buckets }
     }
 
@@ -221,7 +222,11 @@ impl RoutingTable {
     pub fn closest(&self, target: &NodeId, n: usize) -> Vec<NodeId> {
         let cap = n.min(K_BUCKET_SIZE);
         let mut candidates: Vec<NodeId> = self.buckets.iter().flatten().copied().collect();
-        candidates.sort_unstable_by(|a, b| cmp_by_distance(a, b, target));
+        // `sort_unstable_by_key` computes `xor_distance` once per element
+        // and reuses the result; the older `sort_unstable_by` form would
+        // recompute it twice per pairwise comparison (~`n log n` extra
+        // XORs over a fully-populated table).
+        candidates.sort_unstable_by_key(|p| xor_distance(p, target));
         candidates.truncate(cap);
         candidates
     }
@@ -233,23 +238,6 @@ impl RoutingTable {
     pub fn iter_peers(&self) -> impl Iterator<Item = &NodeId> + '_ {
         self.buckets.iter().flatten()
     }
-}
-
-/// Marked `#[cold]` so the unreachable-array-size branch in
-/// [`RoutingTable::new`] doesn't pollute the hot-path layout. Calling it is
-/// a programming error — the iterator produces exactly `KEYSPACE_BITS`
-/// elements by construction.
-#[cold]
-#[inline(never)]
-fn unreachable_size_mismatch() -> Box<[Vec<NodeId>; KEYSPACE_BITS]> {
-    // Allocate a fresh boxed array to satisfy the type system without
-    // panicking. Returning this means a programming error in `new`; under
-    // anti-panic policy we surface a clearly-wrong empty table instead of
-    // panicking. In practice this is unreachable.
-    let v: Vec<Vec<NodeId>> = (0..KEYSPACE_BITS).map(|_| Vec::new()).collect();
-    v.into_boxed_slice()
-        .try_into()
-        .unwrap_or_else(|_| unreachable_size_mismatch())
 }
 
 #[cfg(test)]
@@ -307,16 +295,18 @@ mod tests {
     }
 
     #[test]
-    fn bucket_index_max_distance_is_zero() {
-        // High bit of first byte set -> bit_from_msb = 0 -> bucket 255.
+    fn bucket_index_max_distance_is_top_bucket() {
+        // High bit of first byte set -> bit_from_msb = 0 -> bucket 255 =
+        // most-distant peers (zero shared prefix bits with self_id).
         let mut d = [0u8; 32];
         d[0] = 0x80;
         assert_eq!(bucket_index(&d), Some(255));
     }
 
     #[test]
-    fn bucket_index_min_nonzero_is_max_bucket() {
-        // Low bit of last byte set -> bit_from_msb = 255 -> bucket 0.
+    fn bucket_index_min_nonzero_is_bucket_zero() {
+        // Low bit of last byte set -> bit_from_msb = 255 -> bucket 0 =
+        // closest peers (only the lowest bit of distance differs).
         let mut d = [0u8; 32];
         d[31] = 0x01;
         assert_eq!(bucket_index(&d), Some(0));
