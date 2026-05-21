@@ -27,7 +27,10 @@ use decdn_gossip::{GossipMetrics, GossipRuntimeConfig, GossipService, PeerTable}
 
 use crate::admin;
 use crate::channel_store::PersistentChannelStateStore;
-use crate::dht::{DhtRateLimiter, rate_limit::DhtRateLimitConfig};
+use crate::dht::{
+    ConfigStakerSet, DhtRateLimiter, RecordStore, RecordStoreConfig, StakerSet,
+    rate_limit::DhtRateLimitConfig,
+};
 use crate::dispatch::ConnectionLimiter;
 use crate::handlers::dht::DhtHandler;
 use crate::handlers::limited::LimitedHandler;
@@ -343,11 +346,10 @@ pub async fn run(
     // handler's data structures aren't fixed yet, and coupling the
     // runtime to a not-yet-written handler signature would block #317
     // unnecessarily.
-    // `cdn/dht/v1` handler (ADR 022 / #320). PR slice: serves `FindNode`
-    // off an in-memory k-bucket routing table seeded from inbound requests;
-    // `Store` and `FindValue` get placeholder responses until PR 3 lands
-    // the record store. Three-layer rate limiter is wired up at full
-    // ADR 022 spec.
+    // `cdn/dht/v1` handler (ADR 022 / #320). FindNode + FindValue +
+    // Store all wired up; iterative requester-side lookup and the
+    // republish scheduler land in PR 4 of #320. Three-layer rate limiter
+    // operates at the full ADR 022 spec.
     let dht_rate_limit_cfg = DhtRateLimitConfig {
         per_peer_rate_per_sec: cfg.dht.per_peer_rate_per_sec,
         per_peer_burst: cfg.dht.per_peer_burst,
@@ -361,11 +363,27 @@ pub async fn run(
         &dht_rate_limit_cfg,
         Arc::clone(&node_metrics),
     ));
+    // Record store sized from the ADR 022 defaults; per-publisher /
+    // global / per-hash caps are pinned by the protocol and only the
+    // TTL field is plausibly operator-tunable, but no knob is exposed
+    // yet — operators with non-default needs should file a follow-up
+    // rather than tune in TOML.
+    let record_store = Arc::new(std::sync::Mutex::new(RecordStore::new(
+        RecordStoreConfig::default(),
+    )));
+    // Active-staker set. `ConfigStakerSet` reads the operator-supplied
+    // list from `dht.static_active_nodes`. The chain-backed
+    // `ChainStakerSet` lands with the on-chain origin-directory
+    // follow-up; same trait, drop-in swap.
+    let staker_set: Arc<dyn StakerSet> =
+        Arc::new(ConfigStakerSet::new(cfg.dht.static_active_nodes.clone()));
     let dht_handler = Arc::new(DhtHandler::new(
         secret_key.public(),
         Arc::clone(&dht_rate_limiter),
         Arc::clone(&limiter),
         Arc::clone(&node_metrics),
+        Arc::clone(&staker_set),
+        Arc::clone(&record_store),
     ));
 
     let router = Router::builder(ep.clone())

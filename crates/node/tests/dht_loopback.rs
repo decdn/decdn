@@ -1,12 +1,18 @@
-//! Two-endpoint loopback test for `cdn/dht/v1` (ADR 022, #320).
+//! Two-endpoint loopback tests for `cdn/dht/v1` (ADR 022, #320).
 //!
 //! Spawns a server endpoint running the DHT handler, connects a client
-//! over iroh on localhost, sends a `FindNodeRequest`, and verifies that
-//! the response echoes the target and returns the K-closest seeded peers.
+//! over iroh on localhost, exchanges messages, and verifies the
+//! responses. Covers:
 //!
-//! Only `FindNode` is exercised here — `Store` / `FindValue` get
-//! placeholder responses in this PR slice (see [`crate::handlers::dht`]
-//! doc comment); their loopback coverage lands with PR 3 of #320.
+//! - `FindNode` round-trip + routing-table refresh of the authenticated
+//!   peer + the routing-table poisoning regression guard.
+//! - `FindValue` against an empty store (no providers + closer-nodes
+//!   only).
+//! - `Store` admission: holder/peer mismatch rejection, non-staked
+//!   rejection, and the full Store → `FindValue` round-trip for a staked
+//!   publisher.
+//! - ADR 013 application error codes on malformed / unsupported /
+//!   rate-limited streams (the `adr_013_error_codes` submodule).
 
 #![allow(
     clippy::unwrap_used,
@@ -21,7 +27,9 @@ use std::sync::Mutex;
 
 use decdn_common::config::ResolvedSecurity;
 use decdn_node::dht::routing::RoutingTable;
-use decdn_node::dht::{DhtRateLimiter, rate_limit::DhtRateLimitConfig};
+use decdn_node::dht::{
+    DhtRateLimiter, RecordStore, RecordStoreConfig, StakerSet, rate_limit::DhtRateLimitConfig,
+};
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::dht::DhtHandler;
 use decdn_node::metrics::Metrics;
@@ -43,6 +51,28 @@ fn permissive_limiter(metrics: &Arc<Metrics>) -> Arc<ConnectionLimiter> {
         max_tracked_sources: 4096,
     };
     Arc::new(ConnectionLimiter::new(&cfg, Arc::clone(metrics)))
+}
+
+/// A `StakerSet` that admits any `NodeId` — used by tests that don't
+/// exercise the active-staker filter so they don't have to enumerate
+/// every test peer in a `HashSet`.
+#[derive(Debug)]
+struct AllStaked;
+
+impl StakerSet for AllStaked {
+    fn is_active(&self, _: &[u8; 32]) -> bool {
+        true
+    }
+    fn active_nodes(&self) -> Vec<[u8; 32]> {
+        Vec::new()
+    }
+    fn len(&self) -> usize {
+        usize::MAX
+    }
+}
+
+fn empty_record_store() -> Arc<Mutex<RecordStore>> {
+    Arc::new(Mutex::new(RecordStore::new(RecordStoreConfig::default())))
 }
 
 fn permissive_dht_rate_limiter(metrics: &Arc<Metrics>) -> Arc<DhtRateLimiter> {
@@ -113,6 +143,8 @@ async fn find_node_returns_closer_peers_from_routing_table() -> anyhow::Result<(
         rate_limiter,
         limiter,
         Arc::clone(&metrics),
+        Arc::new(AllStaked),
+        empty_record_store(),
     ));
 
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_DHT.to_vec()]).await?;
@@ -205,11 +237,14 @@ async fn find_node_returns_closer_peers_from_routing_table() -> anyhow::Result<(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn find_value_returns_placeholder_with_closer_nodes() -> anyhow::Result<()> {
-    // PR-2 placeholder behaviour: FindValue returns an empty providers
-    // list plus the closest seeded routing-table peers. Pinned now so an
-    // accidental real-handling regression while the record store lands
-    // can't pass under the same loopback name.
+async fn find_value_with_empty_store_returns_no_providers_but_closer_nodes() -> anyhow::Result<()> {
+    // Empty record store ⇒ no providers in the response, but the
+    // responder still surfaces its K-closest peers from the routing
+    // table so the requester can continue iterative lookup (ADR 022
+    // §FIND_VALUE Flow). This is the steady-state behaviour when a
+    // hash hasn't been stored at this responder yet — distinct from
+    // the previous PR's hand-coded placeholder behaviour, which
+    // returned the same shape but bypassed the record store entirely.
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let metrics = Arc::new(Metrics::new());
@@ -228,6 +263,8 @@ async fn find_value_returns_placeholder_with_closer_nodes() -> anyhow::Result<()
         rate_limiter,
         limiter,
         Arc::clone(&metrics),
+        Arc::new(AllStaked),
+        empty_record_store(),
     ));
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_DHT.to_vec()]).await?;
     let server_ep_bg = server_ep.clone();
@@ -308,6 +345,8 @@ async fn find_node_does_not_insert_attacker_supplied_requester() -> anyhow::Resu
         rate_limiter,
         limiter,
         Arc::clone(&metrics),
+        Arc::new(AllStaked),
+        empty_record_store(),
     ));
 
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_DHT.to_vec()]).await?;
@@ -417,6 +456,8 @@ mod adr_013_error_codes {
             rate_limiter,
             limiter,
             metrics,
+            Arc::new(AllStaked),
+            empty_record_store(),
         ));
         let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_DHT.to_vec()]).await?;
         let server_ep_bg = server_ep.clone();
@@ -577,6 +618,8 @@ mod adr_013_error_codes {
             rate_limiter,
             limiter,
             metrics,
+            Arc::new(AllStaked),
+            empty_record_store(),
         ));
         let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_DHT.to_vec()]).await?;
         let server_ep_bg = server_ep.clone();
@@ -630,6 +673,313 @@ mod adr_013_error_codes {
         conn.close(0u32.into(), b"bye");
         client_ep.close().await;
         let _ = accept_task.await;
+        server_ep.close().await;
+        Ok(())
+    }
+}
+
+// ADR 022 §STORE Flow + §FIND_VALUE Flow — real record-store admission.
+// PR 3 of #320 replaces the previous "always reject" placeholder with
+// the spec-conformant `(holder == authenticated NodeId) + active-staker
+// filter + per-publisher quota + global LRU + receiver-anchored TTL`
+// pipeline. These tests pin the boundary conditions a future refactor
+// could regress.
+
+mod store_admission {
+    use super::*;
+
+    /// Spin up a DHT server where the client is in the active-staker
+    /// set, then issue one `Store` and one `FindValue` and verify the
+    /// stored holder comes back in `providers`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::too_many_lines)] // Linear setup → Store → FindValue → assert flow; splitting into helpers loses the readable narrative.
+    async fn store_then_find_value_roundtrip_for_staked_publisher() -> anyhow::Result<()> {
+        let server_sk = fresh_key();
+        let server_id = server_sk.public();
+        let metrics = Arc::new(Metrics::new());
+        let limiter = permissive_limiter(&metrics);
+        let rate_limiter = permissive_dht_rate_limiter(&metrics);
+        let routing = Arc::new(Mutex::new(RoutingTable::new(*server_id.as_bytes())));
+        let records = empty_record_store();
+
+        // Need the client NodeId in the active-staker set BEFORE we
+        // build the handler — capture the client key first.
+        let client_sk = fresh_key();
+        let client_id = client_sk.public();
+        let mut active = std::collections::HashSet::new();
+        active.insert(*client_id.as_bytes());
+        let staker_set: Arc<dyn StakerSet> =
+            Arc::new(decdn_node::dht::staker_set::ConfigStakerSet::new(active));
+
+        let handler = Arc::new(DhtHandler::with_routing(
+            server_id,
+            routing,
+            rate_limiter,
+            limiter,
+            Arc::clone(&metrics),
+            staker_set,
+            Arc::clone(&records),
+        ));
+        let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_DHT.to_vec()]).await?;
+        let server_ep_bg = server_ep.clone();
+        let accept_task = tokio::spawn(async move {
+            // Two streams on one connection: Store, then FindValue.
+            // Both call `handler.accept` which loops over `accept_bi`.
+            if let Some(incoming) = server_ep_bg.accept().await {
+                let connecting = incoming
+                    .accept()
+                    .map_err(|e| anyhow::anyhow!("accept: {e}"))?;
+                let conn = connecting
+                    .await
+                    .map_err(|e| anyhow::anyhow!("handshake: {e}"))?;
+                handler
+                    .accept(conn)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+            Ok::<_, anyhow::Error>(())
+        });
+        let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+        let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+        let conn = client_ep
+            .connect(target, ALPN_DHT)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+
+        let target_hash = [0xAAu8; 32];
+
+        // Store the record.
+        {
+            let (mut s, mut r) = conn
+                .open_bi()
+                .await
+                .map_err(|e| anyhow::anyhow!("open_bi store: {e}"))?;
+            let req = wire::DhtMessage::Store(wire::StoreRequest {
+                hash: target_hash,
+                holder: *client_id.as_bytes(),
+            });
+            let payload = encode_message(&req)?;
+            write_frame(&mut s, &payload).await?;
+            s.finish()?;
+            let frame = read_frame(&mut r).await?;
+            let (msg, _) = decode_message::<wire::DhtMessage>(&frame)?;
+            let ack = match msg {
+                wire::DhtMessage::StoreAck(a) => a,
+                other => anyhow::bail!("expected StoreAck, got {other:?}"),
+            };
+            assert!(ack.accepted, "staked publisher's Store must be accepted");
+            assert_eq!(ack.hash, target_hash);
+        }
+
+        // FindValue should now surface the stored holder.
+        {
+            let (mut s, mut r) = conn
+                .open_bi()
+                .await
+                .map_err(|e| anyhow::anyhow!("open_bi find: {e}"))?;
+            let req = wire::DhtMessage::FindValue(wire::FindValueRequest {
+                hash: target_hash,
+                requester: *client_id.as_bytes(),
+            });
+            let payload = encode_message(&req)?;
+            write_frame(&mut s, &payload).await?;
+            s.finish()?;
+            let frame = read_frame(&mut r).await?;
+            let (msg, _) = decode_message::<wire::DhtMessage>(&frame)?;
+            let resp = match msg {
+                wire::DhtMessage::FindValueResponse(r) => r,
+                other => anyhow::bail!("expected FindValueResponse, got {other:?}"),
+            };
+            assert_eq!(resp.hash, target_hash);
+            assert_eq!(
+                resp.providers,
+                vec![*client_id.as_bytes()],
+                "stored holder must appear in providers"
+            );
+        }
+
+        conn.close(0u32.into(), b"bye");
+        client_ep.close().await;
+        accept_task
+            .await
+            .map_err(|e| anyhow::anyhow!("accept task join: {e}"))??;
+        server_ep.close().await;
+        Ok(())
+    }
+
+    /// `Store` from a non-staked publisher must be rejected — the
+    /// active-staker filter is the load-bearing admission check that
+    /// stops every randomly-rotating attacker `NodeId` from publishing
+    /// records.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn store_from_non_staked_publisher_is_rejected() -> anyhow::Result<()> {
+        let server_sk = fresh_key();
+        let server_id = server_sk.public();
+        let metrics = Arc::new(Metrics::new());
+        let limiter = permissive_limiter(&metrics);
+        let rate_limiter = permissive_dht_rate_limiter(&metrics);
+        let routing = Arc::new(Mutex::new(RoutingTable::new(*server_id.as_bytes())));
+
+        // Empty staker set ⇒ EVERY publisher is non-staked ⇒ every
+        // Store rejects. This is the "no operator opt-in" default.
+        let staker_set: Arc<dyn StakerSet> =
+            Arc::new(decdn_node::dht::staker_set::ConfigStakerSet::empty());
+        let records = empty_record_store();
+
+        let handler = Arc::new(DhtHandler::with_routing(
+            server_id,
+            routing,
+            rate_limiter,
+            limiter,
+            Arc::clone(&metrics),
+            staker_set,
+            Arc::clone(&records),
+        ));
+        let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_DHT.to_vec()]).await?;
+        let server_ep_bg = server_ep.clone();
+        let accept_task = tokio::spawn(async move {
+            if let Some(incoming) = server_ep_bg.accept().await {
+                let connecting = incoming
+                    .accept()
+                    .map_err(|e| anyhow::anyhow!("accept: {e}"))?;
+                let conn = connecting
+                    .await
+                    .map_err(|e| anyhow::anyhow!("handshake: {e}"))?;
+                handler
+                    .accept(conn)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+            Ok::<_, anyhow::Error>(())
+        });
+        let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+        let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+        let conn = client_ep
+            .connect(target, ALPN_DHT)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+        let (mut s, mut r) = conn
+            .open_bi()
+            .await
+            .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+        let req = wire::DhtMessage::Store(wire::StoreRequest {
+            hash: [0xCCu8; 32],
+            holder: *client_ep.id().as_bytes(),
+        });
+        let payload = encode_message(&req)?;
+        write_frame(&mut s, &payload).await?;
+        s.finish()?;
+        let frame = read_frame(&mut r).await?;
+        let (msg, _) = decode_message::<wire::DhtMessage>(&frame)?;
+        let ack = match msg {
+            wire::DhtMessage::StoreAck(a) => a,
+            other => anyhow::bail!("expected StoreAck, got {other:?}"),
+        };
+        assert!(
+            !ack.accepted,
+            "Store from non-staked publisher must NOT be accepted"
+        );
+        // Record store is still empty post-rejection.
+        assert!(records.lock().expect("records lock").is_empty());
+
+        conn.close(0u32.into(), b"bye");
+        client_ep.close().await;
+        accept_task
+            .await
+            .map_err(|e| anyhow::anyhow!("accept task join: {e}"))??;
+        server_ep.close().await;
+        Ok(())
+    }
+
+    /// Lying-`holder` attack: an authenticated peer A sends
+    /// `Store { holder: B }` claiming to be a different staked node B.
+    /// The handler MUST reject this even when B is in the staker set,
+    /// because the QUIC handshake proves only A's identity, not B's.
+    /// Without this check a single staked Sybil could publish records
+    /// on behalf of every other staker.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn store_with_holder_not_authenticated_is_rejected() -> anyhow::Result<()> {
+        let server_sk = fresh_key();
+        let server_id = server_sk.public();
+        let metrics = Arc::new(Metrics::new());
+        let limiter = permissive_limiter(&metrics);
+        let rate_limiter = permissive_dht_rate_limiter(&metrics);
+        let routing = Arc::new(Mutex::new(RoutingTable::new(*server_id.as_bytes())));
+
+        // Both the client AND the fake `holder` (B) are staked, so the
+        // staker filter alone would let this through — the
+        // authenticated-NodeId check is what catches it.
+        let client_sk = fresh_key();
+        let client_id = client_sk.public();
+        let fake_holder: [u8; 32] = [0xBB; 32];
+        let mut active = std::collections::HashSet::new();
+        active.insert(*client_id.as_bytes());
+        active.insert(fake_holder);
+        let staker_set: Arc<dyn StakerSet> =
+            Arc::new(decdn_node::dht::staker_set::ConfigStakerSet::new(active));
+        let records = empty_record_store();
+
+        let handler = Arc::new(DhtHandler::with_routing(
+            server_id,
+            routing,
+            rate_limiter,
+            limiter,
+            Arc::clone(&metrics),
+            staker_set,
+            Arc::clone(&records),
+        ));
+        let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_DHT.to_vec()]).await?;
+        let server_ep_bg = server_ep.clone();
+        let accept_task = tokio::spawn(async move {
+            if let Some(incoming) = server_ep_bg.accept().await {
+                let connecting = incoming
+                    .accept()
+                    .map_err(|e| anyhow::anyhow!("accept: {e}"))?;
+                let conn = connecting
+                    .await
+                    .map_err(|e| anyhow::anyhow!("handshake: {e}"))?;
+                handler
+                    .accept(conn)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+            Ok::<_, anyhow::Error>(())
+        });
+        let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+        let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+        let conn = client_ep
+            .connect(target, ALPN_DHT)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+        let (mut s, mut r) = conn
+            .open_bi()
+            .await
+            .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+        let req = wire::DhtMessage::Store(wire::StoreRequest {
+            hash: [0xDDu8; 32],
+            holder: fake_holder, // != client_id
+        });
+        let payload = encode_message(&req)?;
+        write_frame(&mut s, &payload).await?;
+        s.finish()?;
+        let frame = read_frame(&mut r).await?;
+        let (msg, _) = decode_message::<wire::DhtMessage>(&frame)?;
+        let ack = match msg {
+            wire::DhtMessage::StoreAck(a) => a,
+            other => anyhow::bail!("expected StoreAck, got {other:?}"),
+        };
+        assert!(
+            !ack.accepted,
+            "Store with holder != authenticated NodeId must be rejected"
+        );
+        // Record store still empty — the rejection happened pre-insert.
+        assert!(records.lock().expect("records lock").is_empty());
+
+        conn.close(0u32.into(), b"bye");
+        client_ep.close().await;
+        accept_task
+            .await
+            .map_err(|e| anyhow::anyhow!("accept task join: {e}"))??;
         server_ep.close().await;
         Ok(())
     }

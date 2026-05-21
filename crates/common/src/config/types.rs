@@ -505,6 +505,16 @@ pub struct DhtConfig {
     /// the defaults from the ADR (20/100/1000 req/s with 40/200/2000
     /// bursts).
     pub rate_limit: Option<DhtRateLimitConfig>,
+    /// Operator-supplied active-staker `NodeId` set (ADR 022 §STORE
+    /// Flow line 140). Each entry is a 64-character lowercase hex
+    /// encoding of an iroh `NodeId` (32-byte Ed25519 public key). Absent
+    /// or empty => no peer is admitted as a `Store` publisher (every
+    /// `StoreRequest` returns `accepted: false`). The chain-backed
+    /// `ChainStakerSet` that reads `StakingRegistry.getActiveNodes()`
+    /// lives in the on-chain origin-directory follow-up; this static
+    /// list is the bootstrap-network stand-in. Malformed entries fail
+    /// config resolution.
+    pub static_active_nodes: Option<Vec<String>>,
 }
 
 /// `[dht.rate_limit]` — three-layer token-bucket settings (ADR 022 §DHT

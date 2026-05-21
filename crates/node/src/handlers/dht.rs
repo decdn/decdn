@@ -1,11 +1,17 @@
 //! `cdn/dht/v1` handler (ADR 022) — Kademlia content discovery.
 //!
-//! Current slice (PR 2 of #320):
+//! Current slice (PR 3 of #320):
 //!
-//! - `FindNode` is fully honored against the in-memory routing table.
-//! - `FindValue` and `Store` produce placeholder responses (empty
-//!   `providers` + the K-closest peers; `accepted: false`). Real
-//!   admission lands in PR 3 of #320.
+//! - `FindNode` honored against the in-memory routing table.
+//! - `Store` admission runs the full ADR 022 pipeline: holder ==
+//!   authenticated `NodeId`, active-staker filter, per-publisher quota
+//!   (200), global LRU (100k), per-hash provider cap (50), receiver-
+//!   anchored TTL (1 h).
+//! - `FindValue` consults the record store + the routing table; per
+//!   ADR 022 §Lookup integrity the requester-side filters (XOR-distance,
+//!   active-staker, negative-probe-cache, randomisation) are the
+//!   requester's job and live in the iterative-lookup module that
+//!   lands with PR 4.
 //! - `BatchStore` is rejected at frame read with `APP_ERR_UNSUPPORTED_MESSAGE`
 //!   (`0x01`). The wire variant exists at its ADR-022 canonical
 //!   discriminant so a future handler doesn't shuffle wire positions,
@@ -30,7 +36,7 @@ use iroh::Watcher as _;
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 
-use crate::dht::{DhtRateLimiter, DhtRejectLayer, RoutingTable};
+use crate::dht::{DhtRateLimiter, DhtRejectLayer, RecordStore, RoutingTable, StakerSet};
 use crate::dispatch::{ConnectionLimiter, RejectReason};
 use crate::metrics::Metrics;
 
@@ -57,6 +63,16 @@ const APP_ERR_MALFORMED_MESSAGE: u32 = 0x03;
 pub struct DhtHandler {
     self_id: PublicKey,
     routing: Arc<Mutex<RoutingTable>>,
+    /// Receiver-side record store (ADR 022 §Content Records and TTL).
+    /// `std::sync::Mutex` for the same reason as `routing`: the
+    /// critical section is microseconds long (one `HashMap` mutation +
+    /// two index updates) with no awaits.
+    records: Arc<Mutex<RecordStore>>,
+    /// Cached active-staker set consulted on every `Store` admission
+    /// (ADR 022 §STORE Flow line 140). `Arc<dyn StakerSet>` so the
+    /// runtime can swap a chain-backed implementation in once the
+    /// on-chain origin-directory follow-up lands.
+    staker_set: Arc<dyn StakerSet>,
     rate_limiter: Arc<DhtRateLimiter>,
     dispatch_limiter: Arc<ConnectionLimiter>,
     metrics: Arc<Metrics>,
@@ -76,19 +92,23 @@ impl DhtHandler {
     /// Construct a handler. The routing table is empty at startup; PR 4
     /// of #320 wires bootstrap from the on-chain staker set, and the
     /// handler additionally updates the table from every incoming
-    /// request's `requester` field once it knows the peer is rate-limit
-    /// admitted.
+    /// request's authenticated `NodeId` once it knows the peer is
+    /// rate-limit admitted.
     #[must_use]
     pub fn new(
         self_id: PublicKey,
         rate_limiter: Arc<DhtRateLimiter>,
         dispatch_limiter: Arc<ConnectionLimiter>,
         metrics: Arc<Metrics>,
+        staker_set: Arc<dyn StakerSet>,
+        records: Arc<Mutex<RecordStore>>,
     ) -> Self {
         let routing = Arc::new(Mutex::new(RoutingTable::new(*self_id.as_bytes())));
         Self {
             self_id,
             routing,
+            records,
+            staker_set,
             rate_limiter,
             dispatch_limiter,
             metrics,
@@ -99,16 +119,21 @@ impl DhtHandler {
     /// bootstrap path that wants to seed the table before the handler
     /// goes live.
     #[must_use]
+    #[allow(clippy::too_many_arguments)] // wiring struct; each arg is distinct runtime state.
     pub const fn with_routing(
         self_id: PublicKey,
         routing: Arc<Mutex<RoutingTable>>,
         rate_limiter: Arc<DhtRateLimiter>,
         dispatch_limiter: Arc<ConnectionLimiter>,
         metrics: Arc<Metrics>,
+        staker_set: Arc<dyn StakerSet>,
+        records: Arc<Mutex<RecordStore>>,
     ) -> Self {
         Self {
             self_id,
             routing,
+            records,
+            staker_set,
             rate_limiter,
             dispatch_limiter,
             metrics,
@@ -185,7 +210,7 @@ impl DhtHandler {
             // token. That's the same admission criteria ADR 022 §Routing
             // Table demands for table insertion.
             self.note_peer_seen(peer_node_id);
-            if let Err(e) = self.handle_one(send, recv).await {
+            if let Err(e) = self.handle_one(peer_node_id, send, recv).await {
                 // The per-request error already carries the ADR 013 app
                 // error code via the stream reset inside `handle_one` /
                 // `read_dht_request`; here we surface the failure to
@@ -235,8 +260,15 @@ impl DhtHandler {
 
     /// Read one framed `DhtMessage`, dispatch on variant, write the
     /// response frame back. Each stream carries exactly one
-    /// request/response pair.
-    async fn handle_one(&self, mut send: SendStream, mut recv: RecvStream) -> anyhow::Result<()> {
+    /// request/response pair. The authenticated `peer_node_id` is
+    /// threaded in so `Store` admission can compare the wire-level
+    /// `holder` against the QUIC-bound identity.
+    async fn handle_one(
+        &self,
+        peer_node_id: [u8; 32],
+        mut send: SendStream,
+        mut recv: RecvStream,
+    ) -> anyhow::Result<()> {
         let req = match read_dht_request(&mut send, &mut recv).await {
             Ok(req) => req,
             Err(DhtReadError { err, app_code }) => {
@@ -246,7 +278,7 @@ impl DhtHandler {
             }
         };
 
-        let resp = self.dispatch(req);
+        let resp = self.dispatch(peer_node_id, req);
         let payload = encode_message(&resp)
             .map_err(|e| anyhow::anyhow!("dht response encode failed: {e}"))?;
         write_frame(&mut send, &payload)
@@ -265,32 +297,99 @@ impl DhtHandler {
     /// exhaustive over the active set without needing a panic or echo
     /// fallback for the impossible cases.
     //
-    // `msg` is moved-in so future PR slices' record-store insertion
-    // paths can take ownership of larger payloads (e.g. the
-    // FindValueResponse providers Vec) without re-allocating. Every
-    // current request variant is `Copy`, so by-value is a no-op at the
-    // ABI level today; the by-value signature is the steady-state shape.
+    // `msg` is moved-in so future PR slices can take ownership of
+    // larger payloads (e.g. the `FindValueResponse` providers Vec)
+    // without re-allocating. Every current request variant is `Copy`,
+    // so by-value is a no-op at the ABI level today; the by-value
+    // signature is the steady-state shape.
     #[allow(clippy::needless_pass_by_value)]
-    fn dispatch(&self, msg: DhtServerRequest) -> wire::DhtMessage {
+    fn dispatch(&self, peer_node_id: [u8; 32], msg: DhtServerRequest) -> wire::DhtMessage {
         match msg {
             DhtServerRequest::FindNode(req) => {
                 wire::DhtMessage::FindNodeResponse(self.handle_find_node(req))
             }
             DhtServerRequest::FindValue(req) => {
-                // PR 3 of #320: implement record-store lookup.
-                wire::DhtMessage::FindValueResponse(wire::FindValueResponse {
-                    hash: req.hash,
-                    providers: Vec::new(),
-                    closer_nodes: self.closest_to(&req.hash),
-                })
+                wire::DhtMessage::FindValueResponse(self.handle_find_value(req))
             }
             DhtServerRequest::Store(req) => {
-                // PR 3 of #320: implement quota + active-staker check.
-                wire::DhtMessage::StoreAck(wire::StoreAck {
-                    hash: req.hash,
-                    accepted: false,
-                })
+                wire::DhtMessage::StoreAck(self.handle_store(peer_node_id, req))
             }
+        }
+    }
+
+    /// `Store` admission (ADR 022 §STORE Flow):
+    /// 1. `holder == authenticated NodeId` (caller invariant; rejects with
+    ///    `accepted: false` on mismatch, never inserts).
+    /// 2. `StakerSet::is_active(holder)` (caller's cached set).
+    /// 3. Record-store insert under per-publisher quota + global LRU +
+    ///    per-hash provider cap. The store returns whether the record
+    ///    was newly inserted, refreshed, or hard-rejected at the
+    ///    publisher cap — all of which map to `accepted` (refresh +
+    ///    new) or `not accepted` (cap) on the wire.
+    fn handle_store(&self, peer_node_id: [u8; 32], req: wire::StoreRequest) -> wire::StoreAck {
+        // Step 1: holder must equal the QUIC-bound peer NodeId.
+        // ADR 022 §STORE Flow line 140: "The receiving node MUST reject
+        // any record whose `holder` does not equal the authenticated
+        // NodeId of the inbound QUIC connection."
+        if req.holder != peer_node_id {
+            tracing::debug!(
+                holder = ?req.holder,
+                peer = ?peer_node_id,
+                "dht Store rejected: holder != authenticated NodeId"
+            );
+            return wire::StoreAck {
+                hash: req.hash,
+                accepted: false,
+            };
+        }
+
+        // Step 2: active-staker filter.
+        if !self.staker_set.is_active(&req.holder) {
+            tracing::debug!(
+                holder = ?req.holder,
+                "dht Store rejected: holder not in active-staker set"
+            );
+            return wire::StoreAck {
+                hash: req.hash,
+                accepted: false,
+            };
+        }
+
+        // Step 3: receiver-anchored insert with all the cap rules.
+        let now_us = now_us();
+        let accepted = if let Ok(mut store) = self.records.lock() {
+            store.insert_at(req.holder, req.hash, now_us).accepted()
+        } else {
+            // Poisoned record-store mutex: respond `accepted: false`
+            // so the publisher backs off rather than retrying into a
+            // node whose admission path is broken.
+            tracing::error!("dht Store: record-store mutex poisoned; rejecting publish");
+            false
+        };
+        wire::StoreAck {
+            hash: req.hash,
+            accepted,
+        }
+    }
+
+    /// `FindValue` flow (ADR 022 §FIND\_VALUE Flow, responder side):
+    /// the responder returns its known holders for `hash` plus the
+    /// K-closest peers from the routing table. Per ADR 022 §Lookup
+    /// integrity, requester-side filtering (XOR-distance check, active-
+    /// staker filter, negative-probe-cache consultation, randomisation)
+    /// is the requester's job; we don't apply it here.
+    fn handle_find_value(&self, req: wire::FindValueRequest) -> wire::FindValueResponse {
+        let now_us = now_us();
+        let providers = if let Ok(mut store) = self.records.lock() {
+            store.providers_at(&req.hash, now_us)
+        } else {
+            tracing::error!("dht FindValue: record-store mutex poisoned; returning empty");
+            Vec::new()
+        };
+        wire::FindValueResponse {
+            hash: req.hash,
+            providers,
+            closer_nodes: self.closest_to(&req.hash),
         }
     }
 
@@ -441,6 +540,23 @@ async fn read_dht_request(
             }
         }
     }
+}
+
+/// Receiver-side wall-clock at microsecond resolution (ADR 022 §Content
+/// Records and TTL: `expiry_us = receive_us + record_ttl_us` is anchored
+/// on the receiver's wall-clock). `SystemTime::UNIX_EPOCH.elapsed()` is
+/// used rather than `Instant::now()` because the value is stored in
+/// records that survive process restarts (in a future persistence
+/// extension) and a monotonic clock would not be comparable across
+/// reboots.
+///
+/// On a wall-clock before-epoch (unset hardware clock) this returns 0;
+/// the `RecordStore` then folds in its monotonic counter so subsequent
+/// inserts still produce strictly-increasing keys.
+fn now_us() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
 }
 
 /// Lift the peer IP out of a connection's currently-selected path.
