@@ -188,6 +188,15 @@ impl PeerTable {
     pub fn iter(&self) -> impl Iterator<Item = (&[u8; 32], &PeerEntry)> {
         self.entries.iter()
     }
+
+    /// Test-only inspector for the last-inline-sweep timestamp so the
+    /// throttle tests can assert the sweep didn't fire (the CPU-bound
+    /// invariant the throttle exists to enforce). Not part of the
+    /// production API.
+    #[cfg(test)]
+    pub(crate) const fn last_inline_sweep_us(&self) -> u64 {
+        self.last_inline_sweep_us
+    }
 }
 
 #[cfg(test)]
@@ -440,35 +449,36 @@ mod tests {
         // fresh-keypair flood at cap forces a full O(N) HashMap::retain
         // scan per signature-valid announce — moves the original
         // memory-DoS into a CPU + lock-contention DoS. The throttle is
-        // observed indirectly: insert N=2 entries at the cap, then
-        // expire them, then drive two rejected inserts in the same
-        // throttle window — the second one must remain RejectedFull
-        // because the throttle suppresses the re-sweep that would
-        // otherwise reclaim the expired slots.
+        // observed directly via [`PeerTable::last_inline_sweep_us`] — the
+        // contract under test is "the sweep doesn't fire on the second
+        // call within the throttle window", not merely "the second call
+        // still returns RejectedFull" (which a regression that re-ran
+        // the sweep but discarded the result would also satisfy).
         //
-        // Layout (ttl=100µs, cap=2, all times in µs):
-        //   t=100:        insert A → Inserted
-        //   t=100:        insert B → Inserted (table at cap)
-        //   t=400:        insert C → cap-hit, sweep fires (sentinel 0),
-        //                            A+B both expired, C admitted.
-        //                            last_inline_sweep_us is now 400.
-        //   t=500:        insert D → cap-hit, but 500-400=100 µs <
-        //                            MIN_INLINE_SWEEP_INTERVAL_US (1 s),
-        //                            so the sweep is THROTTLED. C is the
-        //                            only entry and its last_seen=400 is
-        //                            fresh, so even an unthrottled sweep
-        //                            would leave the table at cap.
-        //                            Result: RejectedFull, as expected.
-        //   t=400 + 1s:   insert E → throttle elapsed, sweep fires; C
-        //                            (last_seen=400, ttl=100) is expired
-        //                            at t=1_000_400 (cutoff=1_000_300),
-        //                            reclaimed; E admitted.
+        // Layout (ttl=100 µs, cap=2, all times in µs):
+        //   t=100:    insert A → Inserted
+        //   t=100:    insert B → Inserted (table at cap [A, B])
+        //   t=400:    insert C → cap-hit, sweep fires (sentinel 0):
+        //                       A+B both expired (last_seen=100,
+        //                       cutoff=300), reclaimed; C admitted.
+        //                       last_inline_sweep_us is now 400.
+        //   t=400:    insert F → Inserted (table at cap again, [C, F]).
+        //   t=500:    insert D → cap-hit, throttle binds
+        //                       (500 − 400 = 100 µs < 1 s). The sweep
+        //                       is SKIPPED — last_inline_sweep_us must
+        //                       still be 400, NOT 500. Result:
+        //                       RejectedFull.
+        //   t=400+1s: insert E → throttle elapsed, sweep fires; both C
+        //                       and F have last_seen=400, ttl=100,
+        //                       cutoff=1_000_300 → both reclaimed; E
+        //                       admitted.
         let mut t = PeerTable::new(100, 2);
         let a = [20u8; 32];
         let b = [21u8; 32];
         let c = [22u8; 32];
         let d = [23u8; 32];
         let e = [24u8; 32];
+        let f = [25u8; 32]; // filler that keeps the table at cap for the t=500 probe
 
         assert_eq!(
             t.insert_or_refresh(mk_announce(a, 1), 100).unwrap(),
@@ -478,42 +488,153 @@ mod tests {
             t.insert_or_refresh(mk_announce(b, 1), 100).unwrap(),
             InsertOutcome::Inserted
         );
-        // First cap-overflow at t=400: sweep fires (sentinel 0), reclaims
-        // both expired entries, C is admitted.
+        assert_eq!(
+            t.last_inline_sweep_us(),
+            0,
+            "sentinel 0 until the first cap-overflow sweep"
+        );
+
+        // First cap-overflow at t=400: sweep fires (sentinel 0 path),
+        // reclaims both expired entries, C is admitted.
         assert_eq!(
             t.insert_or_refresh(mk_announce(c, 1), 400).unwrap(),
             InsertOutcome::Inserted
         );
         assert_eq!(t.len(), 1);
+        assert_eq!(t.last_inline_sweep_us(), 400, "first sweep recorded");
 
-        // Fill the second slot so the table is at cap again, then prove
-        // the throttle binds: at t=500 (< 1 s after the previous sweep),
-        // a fresh-id insert at cap is rejected without a re-sweep — even
-        // though we just expired nothing, the assertion is that the
-        // throttle path runs and returns RejectedFull immediately.
-        // We need the table at cap to exercise the cap branch, so insert
-        // one more first.
-        let filler = [25u8; 32];
+        // Re-fill to cap so the next cap-overflow has a fresh table to
+        // operate on. Both C and F have last_seen=400 here.
         assert_eq!(
-            t.insert_or_refresh(mk_announce(filler, 1), 400).unwrap(),
+            t.insert_or_refresh(mk_announce(f, 1), 400).unwrap(),
             InsertOutcome::Inserted
         );
         assert_eq!(t.len(), 2);
-        // t=500: cap-overflow, throttle binds (500-400=100µs < 1s).
+
+        // t=500: cap-overflow, throttle binds (500 − 400 = 100 µs < 1 s).
+        // The CPU-bound contract: the sweep MUST NOT fire on this call.
+        // Without the accessor below, a regression that re-ran the sweep
+        // but ignored the result would still produce RejectedFull and
+        // silently slip past.
         assert_eq!(
             t.insert_or_refresh(mk_announce(d, 1), 500).unwrap(),
             InsertOutcome::RejectedFull
         );
+        assert_eq!(
+            t.last_inline_sweep_us(),
+            400,
+            "throttle binds: last sweep timestamp must NOT advance"
+        );
 
-        // Pass the throttle window: at t=1_000_400, the elapsed since
-        // the last sweep is exactly MIN_INLINE_SWEEP_INTERVAL_US.
-        // Now C is expired (last_seen=400, ttl=100, cutoff=1_000_300)
-        // and the sweep reclaims it. E is admitted.
+        // Pass the throttle window: at t = 400 + MIN_INLINE_SWEEP_INTERVAL_US,
+        // the elapsed since the last sweep is exactly one interval.
+        // Both C and F are expired (last_seen=400, ttl=100,
+        // cutoff=post_throttle − 100), the sweep reclaims them, E is
+        // admitted, and the sweep timestamp advances.
         let post_throttle = 400 + MIN_INLINE_SWEEP_INTERVAL_US;
         assert_eq!(
             t.insert_or_refresh(mk_announce(e, 1), post_throttle)
                 .unwrap(),
             InsertOutcome::Inserted
+        );
+        assert_eq!(
+            t.last_inline_sweep_us(),
+            post_throttle,
+            "second sweep recorded at the post-throttle timestamp"
+        );
+    }
+
+    #[test]
+    fn throttle_still_binds_one_microsecond_below_interval() {
+        // Boundary partner for [`inline_sweep_is_throttled_under_sustained_flood`]:
+        // the `>=` in the throttle gate at peer_table.rs makes
+        // `now - last == MIN_INLINE_SWEEP_INTERVAL_US` release the
+        // throttle, and `now - last == MIN_INLINE_SWEEP_INTERVAL_US - 1`
+        // must keep it bound. A regression that flipped `>=` to `>` (or
+        // vice-versa) is the failure mode this pair catches. Mirrors
+        // the existing `evict_at_exact_cutoff` / `one_microsecond_past_cutoff`
+        // boundary discipline.
+        let mut t = PeerTable::new(0, 1); // ttl=0 keeps the sweep a no-op
+        let a = [30u8; 32];
+        let b = [31u8; 32];
+        // Seed at a non-zero `now` so saturating_sub doesn't dominate.
+        let base = 10 * MIN_INLINE_SWEEP_INTERVAL_US;
+        assert_eq!(
+            t.insert_or_refresh(mk_announce(a, 1), base).unwrap(),
+            InsertOutcome::Inserted
+        );
+        // First cap-overflow records the sweep at `base`.
+        assert_eq!(
+            t.insert_or_refresh(mk_announce(b, 1), base).unwrap(),
+            InsertOutcome::RejectedFull
+        );
+        assert_eq!(t.last_inline_sweep_us(), base);
+        // Probe at exactly one µs below the interval: throttle still binds.
+        let just_below = base + MIN_INLINE_SWEEP_INTERVAL_US - 1;
+        assert_eq!(
+            t.insert_or_refresh(mk_announce(b, 2), just_below).unwrap(),
+            InsertOutcome::RejectedFull
+        );
+        assert_eq!(
+            t.last_inline_sweep_us(),
+            base,
+            "1 µs below interval must keep the throttle bound"
+        );
+        // Probe at exactly the interval: throttle releases.
+        let at_interval = base + MIN_INLINE_SWEEP_INTERVAL_US;
+        assert_eq!(
+            t.insert_or_refresh(mk_announce(b, 3), at_interval).unwrap(),
+            InsertOutcome::RejectedFull
+        );
+        assert_eq!(
+            t.last_inline_sweep_us(),
+            at_interval,
+            "exactly at interval must release the throttle"
+        );
+    }
+
+    #[test]
+    fn throttle_holds_under_clock_reversal() {
+        // The throttle uses `saturating_sub(now_us, last_inline_sweep_us)`
+        // to stay safe when the wall clock moves backwards (NTP step
+        // backwards, VM resume after pause with stale clock —
+        // `service::now_us` swallows `SystemTime::now` failures into 0,
+        // so backward jumps reach `insert_or_refresh`). A regression
+        // that switched to bare subtraction would underflow and either
+        // panic in debug or fire the sweep prematurely in release.
+        //
+        // Setup: seed a sweep at a large timestamp, then drive a
+        // cap-overflow at a smaller timestamp. Must (a) not panic,
+        // (b) leave `last_inline_sweep_us` unchanged (throttle held —
+        // saturating_sub returns 0, 0 ≥ 1 s is false), (c) still
+        // return RejectedFull.
+        let mut t = PeerTable::new(0, 1);
+        let a = [40u8; 32];
+        let b = [41u8; 32];
+        // Far enough into the future that a 1-hour backward jump still
+        // leaves `past` strictly positive — otherwise the test setup
+        // itself would underflow before exercising the production path.
+        let future = 5000 * MIN_INLINE_SWEEP_INTERVAL_US;
+        assert_eq!(
+            t.insert_or_refresh(mk_announce(a, 1), future).unwrap(),
+            InsertOutcome::Inserted
+        );
+        // First cap-overflow seeds last_inline_sweep_us = future.
+        assert_eq!(
+            t.insert_or_refresh(mk_announce(b, 1), future).unwrap(),
+            InsertOutcome::RejectedFull
+        );
+        assert_eq!(t.last_inline_sweep_us(), future);
+        // Clock moves backwards by an hour.
+        let past = future - 3600 * MIN_INLINE_SWEEP_INTERVAL_US;
+        assert_eq!(
+            t.insert_or_refresh(mk_announce(b, 2), past).unwrap(),
+            InsertOutcome::RejectedFull
+        );
+        assert_eq!(
+            t.last_inline_sweep_us(),
+            future,
+            "backward clock jump must not advance the sweep timestamp"
         );
     }
 

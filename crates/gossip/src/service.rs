@@ -245,6 +245,40 @@ impl GossipService {
     }
 }
 
+/// Insert (or refresh) an already-validated announce into `table` and
+/// emit the matching metric. Pulled out of [`subscriber_task`] so the
+/// subscriber loop and the contract test exercise the *same* dispatch
+/// code; a future change here (new `InsertOutcome` variant, metric
+/// rename, gauge re-emission on a rejected arm) cannot drift between
+/// production and test.
+///
+/// Caller holds the `PeerTable` write lock for the duration of this call.
+pub(crate) fn dispatch_insert(
+    table: &mut PeerTable,
+    announce: decdn_protocol::NodeAnnounce,
+    now_us: u64,
+    metrics: &dyn GossipMetrics,
+) {
+    match table.insert_or_refresh(announce, now_us) {
+        Ok(InsertOutcome::Inserted | InsertOutcome::Refreshed) => {
+            metrics.set_peer_table_size(i64::try_from(table.len()).unwrap_or(i64::MAX));
+        }
+        // #577 H3: peer table is at its hard cap and the inline TTL
+        // sweep couldn't free a slot. Drop the announce, bump the
+        // rejection metric (no size update — the table didn't change).
+        Ok(InsertOutcome::RejectedFull) => {
+            metrics.inc_rejected(PEER_TABLE_FULL_LABEL);
+        }
+        // Exhaustive match on the typed error: adding a new
+        // `PeerTable` failure mode is a compile error here, so a
+        // future variant can't be silently mislabeled as
+        // `stale_timestamp`.
+        Err(crate::StaleTimestamp { .. }) => {
+            metrics.inc_rejected(AnnounceReject::StaleTimestamp.label());
+        }
+    }
+}
+
 /// Build `(topic_name, TopicId)` pairs to subscribe to. `TopicId` is the
 /// blake3 hash of the topic name, matching iroh-gossip's own convention for
 /// deriving topic IDs from a string namespace.
@@ -311,27 +345,7 @@ fn subscriber_task(
                 match validate_envelope(&msg.content, now, allowlist.as_ref()) {
                     Ok(announce) => {
                         let mut table = peer_table.write().await;
-                        match table.insert_or_refresh(announce, now) {
-                            Ok(InsertOutcome::Inserted | InsertOutcome::Refreshed) => {
-                                metrics.set_peer_table_size(
-                                    i64::try_from(table.len()).unwrap_or(i64::MAX),
-                                );
-                            }
-                            // #577 H3: peer table is at its hard cap and the
-                            // inline TTL sweep couldn't free a slot. Drop the
-                            // announce, bump the rejection metric (no size
-                            // update — the table didn't change).
-                            Ok(InsertOutcome::RejectedFull) => {
-                                metrics.inc_rejected(PEER_TABLE_FULL_LABEL);
-                            }
-                            // Exhaustive match on the typed error: adding a new
-                            // `PeerTable` failure mode is a compile error here,
-                            // so a future variant can't be silently mislabeled as
-                            // `stale_timestamp`.
-                            Err(crate::StaleTimestamp { .. }) => {
-                                metrics.inc_rejected(AnnounceReject::StaleTimestamp.label());
-                            }
-                        }
+                        dispatch_insert(&mut table, announce, now, metrics.as_ref());
                     }
                     Err(reject) => metrics.inc_rejected(reject.label()),
                 }
@@ -550,22 +564,19 @@ mod tests {
             .expect("waiter task should complete cleanly");
     }
 
-    /// #577 H3 — when `PeerTable` returns `RejectedFull`, the subscriber
-    /// loop must bump `inc_rejected(PEER_TABLE_FULL_LABEL)` exactly once
-    /// per drop and must NOT touch the size gauge. This locks both halves
-    /// of the match-arm contract at `service.rs:308` so a regression that
-    /// (a) routed the rejection through the `StaleTimestamp` label or
-    /// (b) re-published the size gauge after a reject would break here.
-    /// We exercise the inserts directly rather than spinning up
-    /// iroh-gossip; the dispatch logic mirrors the match arm above so a
-    /// behavioral drift in either is caught by this assertion pair.
+    /// #577 H3 — locks the metric contract of [`dispatch_insert`]:
+    /// (a) `RejectedFull` bumps `inc_rejected(PEER_TABLE_FULL_LABEL)`
+    /// exactly once per drop and (b) does NOT re-publish the size
+    /// gauge. The subscriber loop calls the same `dispatch_insert`
+    /// function, so the test exercises production code directly — no
+    /// inline mirror to drift.
     #[test]
     fn peer_table_full_dispatch_increments_reject_label_and_skips_size_gauge() {
         use std::sync::Mutex;
 
         use decdn_protocol::{NodeAnnounce, NodeAnnounceBody};
 
-        use crate::{InsertOutcome, PeerTable};
+        use crate::PeerTable;
 
         #[derive(Debug, Default)]
         struct Recorder {
@@ -604,28 +615,13 @@ mod tests {
             }
         }
 
-        // Inline mirror of the `service.rs::subscriber_task` match: any
-        // drift between this dispatch and the one in the loop is what
-        // this test guards against. ttl=0 to isolate the cap branch.
-        fn dispatch(table: &mut PeerTable, metrics: &Recorder, a: NodeAnnounce, now: u64) {
-            match table.insert_or_refresh(a, now) {
-                Ok(InsertOutcome::Inserted | InsertOutcome::Refreshed) => {
-                    metrics.set_peer_table_size(i64::try_from(table.len()).unwrap_or(i64::MAX));
-                }
-                Ok(InsertOutcome::RejectedFull) => {
-                    metrics.inc_rejected(PEER_TABLE_FULL_LABEL);
-                }
-                Err(crate::StaleTimestamp { .. }) => {
-                    metrics.inc_rejected(AnnounceReject::StaleTimestamp.label());
-                }
-            }
-        }
-
         let mut table = PeerTable::new(0, 2);
         let metrics = Recorder::default();
-        dispatch(&mut table, &metrics, mk_announce(1, 1), 100);
-        dispatch(&mut table, &metrics, mk_announce(2, 1), 100);
-        dispatch(&mut table, &metrics, mk_announce(3, 1), 100); // expected RejectedFull
+        // ttl=0 isolates the cap branch from any inline-sweep
+        // interaction. Three distinct ids; the third hits the cap.
+        dispatch_insert(&mut table, mk_announce(1, 1), 100, &metrics);
+        dispatch_insert(&mut table, mk_announce(2, 1), 100, &metrics);
+        dispatch_insert(&mut table, mk_announce(3, 1), 100, &metrics);
 
         let state = metrics.inner.lock().unwrap();
         assert_eq!(
