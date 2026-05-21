@@ -11,12 +11,13 @@ The protocol layer is distinct from the transport layer (iroh/QUIC) and the paym
 
 ## Decision
 
-Two core protocols negotiated via ALPN, plus the built-in iroh-gossip protocol:
+Three core protocols negotiated via ALPN, plus the built-in iroh-gossip protocol:
 
 | Protocol | Participants | Purpose |
 | --- | --- | --- |
 | `cdn/probe/v1` | any node ↔ any node | Latency and availability check before committing to a node |
 | `cdn/client/v1` | payer ↔ delivering node | Paid blob delivery with payment vouchers (client→node, node→node on cache miss) |
+| `cdn/dht/v1` | any node ↔ any node | Kademlia content discovery (FIND_VALUE / STORE / FIND_NODE) — see [ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale) |
 | iroh-gossip (built-in) | all nodes | Node metadata announcements (`NodeAnnounce`), node discovery |
 
 ### Gossip topics
