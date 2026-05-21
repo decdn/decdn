@@ -273,6 +273,42 @@ pub struct ResolvedObservability {
     pub otlp_endpoint: Option<String>,
 }
 
+/// Resolved `cdn/dht/v1` settings (ADR 022).
+///
+/// Each `*_rate_per_sec == 0.0` and matching `*_burst == 0` disables that
+/// layer. `trusted_ips` is the parsed-and-deduplicated IP set; the
+/// resolver rejects malformed entries.
+///
+/// `Default` returns the ADR 022 §DHT Rate Limiting defaults so test sites
+/// that build a `ResolvedConfig` by hand can write `ResolvedDht::default()`
+/// instead of restating the constants. The production `resolve_dht_into`
+/// path threads the defaults through the resolver bag and is what
+/// `decdn-common`'s integration tests cover.
+#[derive(Debug, Clone)]
+pub struct ResolvedDht {
+    pub per_peer_rate_per_sec: f64,
+    pub per_peer_burst: u32,
+    pub per_ip_rate_per_sec: f64,
+    pub per_ip_burst: u32,
+    pub global_rate_per_sec: f64,
+    pub global_burst: u32,
+    pub trusted_ips: std::collections::HashSet<std::net::IpAddr>,
+}
+
+impl Default for ResolvedDht {
+    fn default() -> Self {
+        Self {
+            per_peer_rate_per_sec: 20.0,
+            per_peer_burst: 40,
+            per_ip_rate_per_sec: 100.0,
+            per_ip_burst: 200,
+            global_rate_per_sec: 1000.0,
+            global_burst: 2000,
+            trusted_ips: std::collections::HashSet::new(),
+        }
+    }
+}
+
 /// Resolved security / rate-limiting fields.
 #[derive(Debug, Clone)]
 pub struct ResolvedSecurity {
@@ -306,4 +342,5 @@ pub struct ResolvedConfig {
     pub observability: ResolvedObservability,
     pub gossip: ResolvedGossip,
     pub security: ResolvedSecurity,
+    pub dht: ResolvedDht,
 }

@@ -137,6 +137,20 @@ pub struct DecdnMetrics {
     /// validation). Operator-visible name:
     /// `decdn_rate_bounds_clamp_events_total`.
     pub rate_bounds_clamp_events: Counter,
+    /// `cdn/dht/v1` requests rejected by the per-peer (`NodeId`) token
+    /// bucket (ADR 022 §DHT Rate Limiting). One Counter per layer to match
+    /// the existing `dispatch_rejected_*` convention since the metrics
+    /// backend doesn't support per-field labels. Operator-visible name:
+    /// `decdn_dht_rate_limit_rejected_per_peer_total`.
+    pub dht_rate_limit_rejected_per_peer: Counter,
+    /// `cdn/dht/v1` requests rejected by the per-IP token bucket. Sibling
+    /// to `dht_rate_limit_rejected_per_peer` — see its docs. Operator-
+    /// visible name: `decdn_dht_rate_limit_rejected_per_ip_total`.
+    pub dht_rate_limit_rejected_per_ip: Counter,
+    /// `cdn/dht/v1` requests rejected by the global token bucket. Sibling
+    /// to `dht_rate_limit_rejected_per_peer` — see its docs. Operator-
+    /// visible name: `decdn_dht_rate_limit_rejected_global_total`.
+    pub dht_rate_limit_rejected_global: Counter,
 }
 
 /// Self-imposed cap on the distinct-peer tracking set (and hence the
@@ -313,6 +327,21 @@ impl Metrics {
     /// time.
     pub fn dispatch_per_source_skipped_no_addr(&self) {
         self.decdn.dispatch_per_source_skipped_no_addr.inc();
+    }
+
+    /// Record a `cdn/dht/v1` request rejected at the per-peer layer.
+    pub fn dht_rate_limit_rejected_per_peer(&self) {
+        self.decdn.dht_rate_limit_rejected_per_peer.inc();
+    }
+
+    /// Record a `cdn/dht/v1` request rejected at the per-IP layer.
+    pub fn dht_rate_limit_rejected_per_ip(&self) {
+        self.decdn.dht_rate_limit_rejected_per_ip.inc();
+    }
+
+    /// Record a `cdn/dht/v1` request rejected at the global layer.
+    pub fn dht_rate_limit_rejected_global(&self) {
+        self.decdn.dht_rate_limit_rejected_global.inc();
     }
 
     /// Record a 0-RTT connection attempt (ADR 015): a cached session

@@ -29,6 +29,9 @@ pub struct FileConfig {
     pub gossip: Option<GossipConfig>,
     /// Connection rate-limiting settings.
     pub security: Option<SecurityConfig>,
+    /// `cdn/dht/v1` Kademlia DHT settings (ADR 022). Absent => defaults
+    /// from the ADR 022 §DHT Rate Limiting table.
+    pub dht: Option<DhtConfig>,
 }
 
 /// Identity section of the config file.
@@ -484,6 +487,41 @@ pub struct SecurityConfig {
     /// baseline. Default: 4096. `0` makes the map unbounded — see the
     /// type-level docs for the operator-opt-in warning.
     pub max_tracked_sources: Option<usize>,
+}
+
+/// `[dht]` section — `cdn/dht/v1` settings (ADR 022).
+///
+/// The Kademlia routing-table parameters (k, α, bucket count, refresh
+/// interval) are pinned by the protocol and not exposed here. Only the
+/// rate-limit knobs are operator-tunable; their defaults are conservative
+/// ceilings on adversarial load per ADR 022 §DHT Rate Limiting "Why three
+/// layers, not one", not steady-state operating targets.
+///
+/// Setting any `*_rate_per_sec` to `0.0` disables that layer (operator
+/// opt-out); the matching `*_burst` must also be `0` to avoid a deny-all
+/// configuration. The resolver enforces this pairing the same way
+/// `security.per_source_rate_per_sec` / `per_source_burst` are paired.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DhtConfig {
+    /// Per-peer (source `NodeId`) sustained rate. Absent => 20 req/s
+    /// (ADR 022 §DHT Rate Limiting). `0.0` disables the layer.
+    pub per_peer_rate_per_sec: Option<f64>,
+    /// Per-peer burst capacity. Absent => 40. Required `> 0` when
+    /// `per_peer_rate_per_sec > 0`.
+    pub per_peer_burst: Option<u32>,
+    /// Per-IP sustained rate. Absent => 100 req/s. `0.0` disables.
+    pub per_ip_rate_per_sec: Option<f64>,
+    /// Per-IP burst capacity. Absent => 200.
+    pub per_ip_burst: Option<u32>,
+    /// Global inbound DHT sustained rate. Absent => 1000 req/s.
+    pub global_rate_per_sec: Option<f64>,
+    /// Global inbound DHT burst capacity. Absent => 2000.
+    pub global_burst: Option<u32>,
+    /// IPs that bypass the per-IP layer only (per-peer + global still
+    /// apply). Format: dotted IPv4 or RFC 5952 IPv6. Absent or empty =>
+    /// no trusted IPs. ADR 022 §Trusted-IP exemption.
+    pub trusted_ips: Option<Vec<String>>,
 }
 
 /// Observability section of the config file.

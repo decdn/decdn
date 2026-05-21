@@ -27,7 +27,9 @@ use decdn_gossip::{GossipMetrics, GossipRuntimeConfig, GossipService, PeerTable}
 
 use crate::admin;
 use crate::channel_store::PersistentChannelStateStore;
+use crate::dht::{DhtRateLimiter, rate_limit::DhtRateLimitConfig};
 use crate::dispatch::ConnectionLimiter;
+use crate::handlers::dht::DhtHandler;
 use crate::handlers::limited::LimitedHandler;
 use crate::handlers::probe::ProbeHandler;
 use crate::metrics;
@@ -341,8 +343,34 @@ pub async fn run(
     // handler's data structures aren't fixed yet, and coupling the
     // runtime to a not-yet-written handler signature would block #317
     // unnecessarily.
+    // `cdn/dht/v1` handler (ADR 022 / #320). PR slice: serves `FindNode`
+    // off an in-memory k-bucket routing table seeded from inbound requests;
+    // `Store` and `FindValue` get placeholder responses until PR 3 lands
+    // the record store. Three-layer rate limiter is wired up at full
+    // ADR 022 spec.
+    let dht_rate_limit_cfg = DhtRateLimitConfig {
+        per_peer_rate_per_sec: cfg.dht.per_peer_rate_per_sec,
+        per_peer_burst: cfg.dht.per_peer_burst,
+        per_ip_rate_per_sec: cfg.dht.per_ip_rate_per_sec,
+        per_ip_burst: cfg.dht.per_ip_burst,
+        global_rate_per_sec: cfg.dht.global_rate_per_sec,
+        global_burst: cfg.dht.global_burst,
+        trusted_ips: cfg.dht.trusted_ips.clone(),
+    };
+    let dht_rate_limiter = Arc::new(DhtRateLimiter::new(
+        &dht_rate_limit_cfg,
+        Arc::clone(&node_metrics),
+    ));
+    let dht_handler = Arc::new(DhtHandler::new(
+        secret_key.public(),
+        Arc::clone(&dht_rate_limiter),
+        Arc::clone(&limiter),
+        Arc::clone(&node_metrics),
+    ));
+
     let router = Router::builder(ep.clone())
         .accept(ProbeHandler::ALPN, probe_handler)
+        .accept(DhtHandler::ALPN, dht_handler)
         .accept(
             GOSSIP_ALPN,
             LimitedHandler::new(gossip.clone(), Arc::clone(&limiter)),
@@ -1271,6 +1299,7 @@ mod tests {
                 per_source_burst: 200,
                 max_tracked_sources: 4096,
             },
+            dht: decdn_common::config::ResolvedDht::default(),
         };
         (tmp, cfg)
     }
