@@ -1,7 +1,7 @@
 # ADR 002: Content Addressing
 
 **Date:** 2026-03-28
-**Status:** Draft
+**Status:** Accepted
 
 ## Context
 
