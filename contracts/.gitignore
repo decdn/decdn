@@ -3,3 +3,5 @@ report.sarif
 aderyn-report.md
 aderyn-report.json
 aderyn-report.sarif
+lcov.info
+baseline/

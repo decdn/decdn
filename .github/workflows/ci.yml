@@ -121,6 +121,7 @@ jobs:
               - '.gitmodules'
               - '.github/workflows/ci.yml'
               - '.github/scripts/post-gas-snapshot-comment.sh'
+              - '.github/scripts/contracts-coverage-comment.sh'
 
   test:
     name: test
@@ -429,6 +430,9 @@ jobs:
     runs-on: ubuntu-latest
     needs: changes
     if: needs.changes.outputs.solidity == 'true' || github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: write
     defaults:
       run:
         working-directory: contracts
@@ -446,12 +450,57 @@ jobs:
       # land, add --ir-minimum here.
       - name: forge coverage
         run: forge coverage --report lcov --report summary
-      - uses: codecov/codecov-action@v6.0.1
+
+      # Push to main: publish the LCOV as a baseline artifact for PRs to
+      # diff against. Mirrors the Rust coverage flow (test job).
+      - name: Upload coverage baseline
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v7
         with:
-          files: contracts/lcov.info
-          flags: contracts
-          fail_ci_if_error: false
-          token: ${{ secrets.CODECOV_TOKEN }}
+          name: contracts-coverage-lcov
+          path: contracts/lcov.info
+          retention-days: 90
+
+      # PR: download the baseline so the comment script can render a delta.
+      # `if_no_artifact_found: warn` keeps the job green on a first-ever
+      # PR or after an artifact has expired.
+      - name: Download coverage baseline
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        uses: dawidd6/action-download-artifact@v21
+        with:
+          workflow: ci.yml
+          branch: main
+          workflow_conclusion: success
+          name: contracts-coverage-lcov
+          # action-download-artifact resolves `path:` relative to
+          # GITHUB_WORKSPACE, not the job-default working-directory,
+          # so this lands the file at contracts/baseline/lcov.info.
+          path: contracts/baseline/
+          if_no_artifact_found: warn
+
+      # Post (or update) the sticky PR comment with total line coverage and
+      # delta vs main. Mirrors the existing coverage-diff.py sticky-comment
+      # pattern but contracts-scoped (distinct marker, distinct script).
+      # Skips on fork PRs — GITHUB_TOKEN is read-only there.
+      - name: Post coverage comment
+        if: |
+          github.event_name == 'pull_request'
+          && github.event.pull_request.head.repo.full_name == github.repository
+        continue-on-error: true
+        env:
+          GH_PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # CWD is contracts/ via the job-level defaults.run.working-directory.
+        # lcov.info lives here (from forge coverage); baseline/lcov.info was
+        # written by the prior step (action-download-artifact uses
+        # GITHUB_WORKSPACE-relative paths, so its `path: contracts/baseline/`
+        # lands the file at <ws>/contracts/baseline/lcov.info, which is
+        # ./baseline/lcov.info from here).
+        run: |
+          base="baseline/lcov.info"
+          if [[ ! -s "$base" ]]; then base=""; fi
+          ../.github/scripts/contracts-coverage-comment.sh lcov.info "$base"
 
   solidity-solhint:
     name: solidity solhint

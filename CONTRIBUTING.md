@@ -195,7 +195,7 @@ The `solidity-gas-snapshot` CI job posts a sticky PR comment with the diff so re
 
 - **Slither / Aderyn** results upload to GitHub's Security → Code scanning tab. Medium-and-above slither findings fail CI. For true positives, fix the contract. For confirmed false positives, suppress *inline* (`// slither-disable-next-line <detector>` with a comment justifying the suppression) — never expand the global exclusion list in `slither.config.json`.
 - **Solhint** failures point at code; fix the code rather than disabling the rule. Rule changes require a separate PR with rationale. Solhint lints `contracts/src/` only; test files (Foundry's `test_xxx_yyy` convention) are out of scope by design.
-- **Coverage** posts to Codecov under the `contracts` flag, alongside the Rust report.
+- **Coverage** posts a sticky PR comment with total line coverage + delta vs `main` (the `solidity-coverage` job uploads an LCOV baseline on push-to-main and downloads it on PRs). The comment script is `.github/scripts/contracts-coverage-comment.sh`; the Rust side uses the analogous `coverage-diff.py`.
 
 ## Rust Toolchain
 
