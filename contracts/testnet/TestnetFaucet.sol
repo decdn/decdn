@@ -159,8 +159,12 @@ contract TestnetFaucet is AccessControl, ReentrancyGuard, Pausable {
     ///         and is dwarfed by typical cooldown values (hours-to-days);
     ///         since this is testnet onboarding, treat `block.timestamp` as
     ///         authoritative.
+    ///
+    ///         Modifier order: `whenNotPaused` runs before `nonReentrant` so
+    ///         the cheap `paused` SLOAD short-circuits without paying the
+    ///         reentrancy-guard SSTORE on the pause-revert path.
     // forge-lint: disable-next-line(block-timestamp)
-    function claim() external nonReentrant whenNotPaused {
+    function claim() external whenNotPaused nonReentrant {
         uint256 amount = claimAmount;
         uint256 last = lastClaimedAt[msg.sender];
 
@@ -215,7 +219,10 @@ contract TestnetFaucet is AccessControl, ReentrancyGuard, Pausable {
 
     /// @notice Sweep `amount` TOKEN from this contract to `to`. Pause-independent
     ///         so governance can drain a paused faucet without unpausing it.
-    function withdraw(address to, uint256 amount) external nonReentrant onlyRole(GOVERNANCE_ROLE) {
+    /// @dev    Modifier order: `onlyRole` runs before `nonReentrant` so an
+    ///         unauthorized caller reverts on the cheap role-check without
+    ///         paying the reentrancy-guard SSTORE.
+    function withdraw(address to, uint256 amount) external onlyRole(GOVERNANCE_ROLE) nonReentrant {
         if (to == address(0)) revert ZeroAddress();
         if (amount == 0) revert ZeroAmount();
         uint256 balance = token.balanceOf(address(this));

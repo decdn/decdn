@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import { Script } from "forge-std/Script.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import { TestnetFaucet } from "../testnet/TestnetFaucet.sol";
 
 /// @title DeployTestnetFaucet — testnet-only forge script
@@ -24,6 +25,8 @@ import { TestnetFaucet } from "../testnet/TestnetFaucet.sol";
 ///           - `CLAIM_AMOUNT`      — per-claim payout in wei (default `1_000e18`)
 ///           - `COOLDOWN_SECONDS`  — cooldown per address (default `1 days`)
 contract DeployTestnetFaucet is Script {
+    using SafeERC20 for IERC20;
+
     uint256 internal constant DEFAULT_CLAIM_AMOUNT = 1000e18;
     uint256 internal constant DEFAULT_COOLDOWN_SECONDS = 1 days;
 
@@ -42,13 +45,18 @@ contract DeployTestnetFaucet is Script {
         uint256 cooldown = vm.envOr("COOLDOWN_SECONDS", DEFAULT_COOLDOWN_SECONDS);
 
         // Predict the deployed faucet address so we can approve before the
-        // constructor calls `safeTransferFrom`. forge script broadcasts under
-        // a single sender (the treasury), so `vm.getNonce(treasury)` is the
-        // nonce that will be consumed by `new TestnetFaucet`.
-        address predicted = vm.computeCreateAddress(treasury, vm.getNonce(treasury));
+        // constructor calls `safeTransferFrom`. forge script broadcasts both
+        // the approve and the `new TestnetFaucet` under the treasury sender,
+        // so the approve consumes nonce N and the contract creation runs at
+        // nonce N+1 — predict using N+1 accordingly.
+        address predicted = vm.computeCreateAddress(treasury, vm.getNonce(treasury) + 1);
 
         vm.startBroadcast(treasury);
-        token.approve(predicted, funding);
+        // `forceApprove` (not bare `approve`) so the script reverts loudly on
+        // a token whose approve returns `false` instead of silently failing
+        // and leaving the constructor `safeTransferFrom` to error with a
+        // less actionable message.
+        token.forceApprove(predicted, funding);
         faucet = new TestnetFaucet(token, treasury, funding, claimAmount, cooldown, admin, governance, pauser);
         vm.stopBroadcast();
 
