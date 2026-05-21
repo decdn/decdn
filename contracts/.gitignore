@@ -1,0 +1,6 @@
+node_modules/
+package-lock.json
+report.sarif
+aderyn-report.md
+aderyn-report.json
+aderyn-report.sarif
