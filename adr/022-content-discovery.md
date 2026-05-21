@@ -8,38 +8,18 @@
 
 Content discovery answers: "which nodes currently hold blob H?" The answer drives both client→node delivery (client picks a node to stream from) and node→node pull-through (a node with a cache miss finds a provider to pull from).
 
-### The scaling problem with probe fan-out
-
-An earlier design in [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) used **broadcast probe fan-out**: on a cache miss, a node sends a `cdn/probe/v1` message to every known peer simultaneously. This works at PoC scale (tens of nodes) but breaks at production scale:
-
-- **O(N) probes per cache miss.** At 1,000 nodes each cache miss generates ~1,000 outbound probe messages. Under a 10 fan-outs/second rate limit that is 10,000 probe messages/second/node — a self-DoS risk and a meaningful burden on the probed peers.
-- **O(N) probe overhead for the prober.** Even rate-limited, fan-out latency grows with N: the node waits for the probe collection window on each of those N connections.
-
-These problems exist regardless of network scale. Probe fan-out is the wrong primary mechanism even from day one — the DHT is.
-
-### Why gossip content announcements don't work
-
-Gossiping a `ContentAnnounce` every time a node caches or evicts a blob generates unbounded traffic: content churn is proportional to demand × network size, not to a configurable interval like `NodeAnnounce`. High-demand blobs with frequent cache rotation produce interleaved announce/retract storms. Rejected.
-
-### Why hash-prefix range hints don't work
-
-A node cannot advertise "I hold hashes in prefix range 0x00–0x3F" because nodes are economically incentivised to cache **popular** content regardless of hash prefix. Range hints would be uniformly meaningless in an incentive-driven network. Rejected.
-
-### Why a content DHT works
-
 A **Kademlia-based content DHT** has the right properties for an incentive-driven CDN:
 
 - Nodes publish `(hash → NodeId)` records **only when they hold a blob** — a voluntary, self-interested advertisement to attract paying clients. No economic incentive exists to publish records for blobs you don't hold (false records attract probes that reveal the lie, degrading reputation and earnings).
 - **O(log N) lookup** — a querying node contacts ~5 peers to find providers at 1,000 nodes.
 - **O(log N) publish cost** — a STORE record is pushed to only the K nodes closest to the hash in keyspace. No global broadcast.
-- **At PoC scale (30 nodes), DHT is trivially cheap** — `log2(30) ≈ 5`, routing tables hold all 30 peers, FIND_VALUE resolves in 1–2 hops. Implementing DHT from day one avoids a later rewrite and validates the mechanism under controlled test conditions.
 - **The probe step is preserved** — DHT lookup narrows the candidate set; `cdn/probe/v1` still confirms live availability and measures latency before any delivery commitment.
 
-iroh's built-in `DhtDiscovery` (mainline BitTorrent DHT via pkarr) is unrelated — it resolves `NodeId → address` on the public internet. A separate content DHT scoped to the registered node set is required.
+The DHT defined here is a separate content DHT scoped to the registered node set, operating over the `cdn/dht/v1` ALPN on iroh QUIC. It is distinct from iroh's built-in `DhtDiscovery` (mainline BitTorrent DHT via pkarr), which resolves `NodeId → address` on the public internet.
 
 ## Decision
 
-`cdn/dht/v1` is the **primary content discovery mechanism from day one**, including PoC. The DHT bootstraps from `StakingRegistry.getActiveNodes()` — a freshly-started node's first peers come from the on-chain registry and immediately participate in DHT lookups, so there is no separate bootstrap window during which DHT cannot resolve. When a DHT lookup returns no providers, the on-chain origin directory is the deterministic last-resort fallback. Broadcast probe fan-out is not part of the protocol. There is no phased rollout — the DHT is always on.
+`cdn/dht/v1` is the **primary content discovery mechanism**. The DHT bootstraps from `StakingRegistry.getActiveNodes()` — a freshly-started node's first peers come from the on-chain registry and immediately participate in DHT lookups, so there is no separate bootstrap window during which DHT cannot resolve. When a DHT lookup returns no providers, the on-chain origin directory is the deterministic last-resort fallback.
 
 ### `cdn/dht/v1` Protocol
 
@@ -218,7 +198,7 @@ On node startup:
 1. Build initial routing table from the on-chain registry peer list (same source as the peer table bootstrap in [ADR 019](019-node-onboarding.md#adr-019-node-onboarding-and-bootstrapping-flow)).
 2. Issue `FindNode(self.node_id)` to initial peers — standard Kademlia self-lookup that populates k-buckets.
 
-The registry-seeded peer list participates in DHT lookups immediately, so there is no separate bootstrap window during which content discovery is unavailable. If a `FindValue` lookup returns no providers during the first few seconds — before k-buckets are populated — the on-chain origin directory provides the deterministic fallback. At PoC scale (30 nodes) the routing table is fully populated after a single self-lookup round.
+The registry-seeded peer list participates in DHT lookups immediately, so there is no separate bootstrap window during which content discovery is unavailable. If a `FindValue` lookup returns no providers during the first few seconds — before k-buckets are populated — the on-chain origin directory provides the deterministic fallback.
 
 **Cold-start re-publish scheduling.** A node holding C cached blobs at startup must establish DHT records for all of them. The publisher MUST draw a per-record jitter from `uniform(0, 40 min)` for each blob's first re-publish after startup, independently per record. The window matches the steady-state mean re-publish cycle (40 min — the mean of `uniform(30, 50)`), so bootstrap rate matches steady-state rate by construction. Subsequent re-publishes use the standard `uniform(30 min, 50 min)` interval per [§ STORE Flow (Cache Event → DHT Publish)](#store-flow-cache-event--dht-publish). Naive "re-publish everything on the next scheduler tick" implementations are non-conforming: at moderate cache sizes a single-tick re-publish issues `C × (K+3)` STOREs in one window, saturating the per-peer rate limit at every receiver and turning startup into a multi-minute rate-limited drip. See [§ DHT Bandwidth Analysis](#dht-bandwidth-analysis) for the throughput model.
 
@@ -358,12 +338,12 @@ New optional variants (e.g., `BatchStore` / `BatchStoreAck` added for publishing
 
 ### Acceptance Criteria
 
-1. A node in a 30-node PoC network can discover providers for a cached blob in ≤3 FIND_VALUE hops.
+1. A node in a 30-node network can discover providers for a cached blob in ≤3 FIND_VALUE hops.
 2. A node in a 500-node network can discover providers in ≤5 FIND_VALUE hops.
 3. A cache event (blob added) generates ≤(K+3) (=23) outgoing STORE messages, not O(N).
 4. A stale STORE record (node evicted the blob) expires within TTL (1 hour) with no explicit retraction.
 5. A false STORE record (node claims to hold a blob it doesn't) fails at the probe step; the publishing node incurs a reputation penalty within one gossip cycle.
-6. During bootstrap (routing table < k entries), the on-chain origin directory provides the fallback; routing table fully populated within 2 self-lookup rounds at PoC scale.
+6. During bootstrap (routing table < k entries), the on-chain origin directory provides the fallback.
 7. A node with `prefetch.enabled = true` observing a prefetch trigger for hash H (either ≥`prefetch.find_value_threshold` FIND_VALUE queries or ≥`prefetch.miss_threshold` local cache misses within `prefetch.threshold_window_secs`) initiates a prefetch for H, subject to the `prefetch.require_authorized_origin` gate (default `true`), the `prefetch.budget_usdc_per_hour` ceiling, and the demand-quality auto-throttle (see [§ Prefetch Decision](#prefetch-decision)).
 8. Demand signals derive from DHT FIND_VALUE traffic and local cache-miss timestamps; both are emitted as observability metrics in [Appendix: Observability](appendix-observability.md#appendix-observability-and-metrics).
 9. An accepted `StoreRequest`'s record TTL is anchored on the receiver's wall-clock at acceptance time (`expiry_us = receive_us + record_ttl_us`), independent of any holder-supplied timestamp.
