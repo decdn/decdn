@@ -56,6 +56,8 @@ enum DhtMessage {
     FindValueResponse(FindValueResponse),
     Store(StoreRequest),
     StoreAck(StoreAck),
+    BatchStore(BatchStoreRequest),
+    BatchStoreAck(BatchStoreAck),
     FindNode(FindNodeRequest),
     FindNodeResponse(FindNodeResponse),
 }
@@ -82,6 +84,17 @@ struct StoreRequest {
 struct StoreAck {
     hash: Hash,
     accepted: bool,
+}
+
+/// Batched publication: many hashes from one holder to one receiver in a single RPC.
+/// Optimization for bootstrap and dense re-publish; see § DHT Bandwidth Analysis.
+struct BatchStoreRequest {
+    hashes: Vec<Hash>,       // ≤256 entries; one holder, many hashes
+    holder: NodeId,          // single holder; checked once vs authenticated QUIC NodeId
+}
+
+struct BatchStoreAck {
+    results: Vec<bool>,          // per-hash outcome (accepted/rejected) in request order
 }
 
 /// Standard Kademlia node lookup — used during routing table bootstrap
@@ -138,6 +151,12 @@ When a node caches blob H:
 
 **Re-publish.** Re-publish reuses the same step 1–2 sequence with a fresh jitter draw per step 3; missed slots (e.g., local downtime) re-fire at the next scheduler tick rather than back-filling.
 
+**Batched STORE.** When a publisher has multiple hashes to send to the same receiver — typically at cold start ([§ Bootstrap](#bootstrap)) or when re-publish windows across cached blobs concentrate on overlapping receiver sets — it MAY send a single `BatchStoreRequest { hashes, holder }` covering all hashes destined for that receiver instead of separate `StoreRequest` RPCs. The receiver checks the `holder == authenticated QUIC NodeId` equality once for the batch (the field is a single `NodeId`, not per-hash) and applies the remaining admission rules per-hash (per-publisher quota with two-tier eviction, active-staker check, rate-limit accounting per [§ DHT Rate Limiting](#dht-rate-limiting)). The reply is `BatchStoreAck { results }` with per-hash outcomes in request order. Receiver-anchored TTL is computed per-hash from a single `receive_us` for the batch.
+
+Batch size is bounded at 256 hashes (≈8 KB request payload at 32B/hash). Publishers split larger publish sets into multiple batches. A `BatchStoreRequest` with `hashes.len() > 256` is rejected by closing the stream with `MALFORMED_MESSAGE` (`0x03`) per [ADR 013 § Application Error Codes](013-schema-evolution.md#application-error-codes); the publisher is expected to fix the request shape and retry, not back off.
+
+Backward compatibility: receivers that do not implement the `BatchStore` / `BatchStoreAck` variants silently drop the message ([§ Schema Evolution](#schema-evolution)). Publishers detect non-support by stream-close-without-ack and MUST fall back to per-hash `StoreRequest` for that receiver. Once fallback is observed for a receiver, the publisher SHOULD cache the result and skip batched attempts for some bounded duration to avoid repeated drop-and-fallback cycles. The motivation for batching and the modeled bandwidth savings are in [§ DHT Bandwidth Analysis](#dht-bandwidth-analysis).
+
 The receiving node MUST reject any record whose `holder` does not equal the authenticated NodeId of the inbound QUIC connection. NodeIds are 32-byte ed25519 public keys ([§ Routing Table](#routing-table)) and iroh's QUIC handshake authenticates the connection against that key, so the equality check binds the record to its claimed origin without a per-record signature. This depends on the publisher-only re-publish model ([§ Content Records and TTL](#content-records-and-ttl) and [§ STORE Flow (Cache Event → DHT Publish)](#store-flow-cache-event--dht-publish) step 2): records are pushed directly by the holder to the K-closest nodes and never propagated peer-to-peer. If a future scheme introduces peer relay of records (e.g., Kademlia replication-on-churn), receivers no longer have a direct authenticated connection to `holder` and a per-record signature MUST be reintroduced. In that case an in-scope sender timestamp MUST also be reintroduced inside the signed body — otherwise the captured signed bytes are constant and trivially replayable, defeating the signature ([ADR 015 § Replay Safety Analysis](015-zero-rtt.md#replay-safety-analysis) makes the same point at the transport layer). The receiver MUST additionally verify that `holder` is in the cached active-staker set (populated from `StakingRegistry.getActiveNodes()` per [ADR 019 § Step 3.3](019-node-onboarding.md#step-33--build-initial-peer-table-from-on-chain-registry)) before accepting the record; non-staked publishers are rejected with `StoreAck { accepted: false }`. Receiving nodes do **not** verify that the holder actually has the blob — that is the probe step's job. A false STORE publisher (a node claiming to hold a blob it does not) fails at probe time, degrading its reputation. **Note:** "publisher" in this ADR refers to a node publishing a DHT STORE record (an act of advertising). It is distinct from the on-chain *content publisher* identity defined in [ADR 002 § Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces), which is an Ethereum address registered in `PublisherRegistry`. Where confusion is possible this ADR uses "STORE publisher" or "holder" for the DHT-record sender.
 
 #### DHT Rate Limiting
@@ -150,7 +169,14 @@ The receiving node MUST reject any record whose `holder` does not equal the auth
 | Per-IP | 100 requests/sec | 200 | Source IP address on the QUIC connection |
 | Global | 1000 requests/sec | 2000 | All inbound DHT traffic across all peers |
 
-Checks fire cheapest-first (global → per-IP → per-peer) so a request rejected by the global cap never costs a per-IP-bucket lookup. Each admitted request consumes one token from each bucket. The three layers apply uniformly to `FindValueRequest`, `FindNodeRequest`, and `StoreRequest` — admission decisions do not inspect message type.
+Checks fire cheapest-first (global → per-IP → per-peer) so a request rejected by the global cap never costs a per-IP-bucket lookup. Each admitted `FindValueRequest`, `FindNodeRequest`, or `StoreRequest` consumes exactly one token from each bucket — admission decisions for these three variants do not inspect message-type-specific contents. `BatchStoreRequest` uses a two-stage variant of the same rule (see § Batch token accounting below) that keeps cheapest-first ordering intact while charging per-hash cost.
+
+**Batch token accounting.** A `BatchStoreRequest` is admission-tested in two stages so the rate limit fires before any deserialization of the request body:
+
+1. **Frame admission.** Consume 1 token from each bucket to admit the inbound frame, identical to per-hash STORE. If any layer is exhausted, reject with `RATE_LIMITED` without deserializing the body — an attacker mounting oversized-batch floods is rate-limited at this stage before paying deserialization cost, preserving the cheapest-first ordering principle.
+2. **Per-hash admission.** Deserialize the request header to obtain `n = hashes.len()`. Verify the batch-level `holder == authenticated QUIC NodeId`; reject the entire batch with `MALFORMED_MESSAGE` if not. Let `b = min(remaining_tokens_per_peer, remaining_tokens_per_ip, remaining_tokens_global)`. Consume `min(b, n - 1)` more tokens from each bucket. The first `k = 1 + min(b, n - 1)` hashes pass through per-hash processing (per-publisher quota with two-tier eviction, active-staker filter); the remaining `n - k` hashes are marked `accepted: false` in the ack without further processing.
+
+Total tokens consumed: `k`, matching what the per-hash equivalent would have charged. The work done per second is bounded the same whether the publisher sends `n` separate `StoreRequest`s or one `BatchStoreRequest` of size `n`. The wire-framing, `holder`-de-duplication, and ack-shape savings are real; the throughput ceiling is unchanged. Partial admission avoids forcing a publisher to retransmit a full batch when only the tail is over budget — the ack identifies rejected hashes by their request-order position, and the publisher retries only those.
 
 **Why three layers, not one.** Per-peer alone is bypassable: any QUIC client can initiate a `cdn/dht/v1` connection and rotate `NodeId` at zero cost (the STORE staker-set check applies only after admission, and FIND_VALUE / FIND_NODE require no staker membership at all). The per-IP layer raises the cost of single-source flooding — IP rotation requires money (proxies, IPv6 prefix delegation, cloud bills). The global cap is defence in depth against distributed attacks across many IPs that would otherwise exhaust the node's routing-table-lookup and response-serialization capacity. The asymmetry between cheap request (`FindValueRequest` is ~40 bytes on the wire) and expensive response (full k-bucket walk plus serialization of K closer-node entries) is what makes DHT flooding economical to mount without these limits.
 
@@ -242,7 +268,7 @@ The limits are conservative ceilings on adversarial load, not steady-state opera
 Three asymptotic regimes inform protocol-level optimizations:
 
 - **Low C (≤1,000).** Bandwidth is gossip-dominated; DHT is a rounding error. No DHT-specific optimization warranted.
-- **Moderate C (10,000–50,000).** DHT and gossip are comparable. The bottleneck is QUIC stream-setup overhead — 230,000 STOREs at C=10,000 bootstrap cost ~39 MB total, of which ~12 MB is per-stream framing and ~7 MB is repeated `holder` field across every request. Batched STORE collapses concentration into one RPC per publisher-receiver pair per scheduler tick (256 hashes per batch ≈ 898 batches total), reducing total bootstrap bytes-on-wire to ~15 MB — **a ~60% reduction**, of which ~30 percentage points come from framing elimination and ~20 from `holder` de-duplication (one holder field per batch instead of per-RPC). Specified in a follow-up.
+- **Moderate C (10,000–50,000).** DHT and gossip are comparable. The bottleneck is QUIC stream-setup overhead — 230,000 STOREs at C=10,000 bootstrap cost ~39 MB total, of which ~12 MB is per-stream framing, ~7 MB is repeated `holder` field across every request, and ~7 MB is repeated `hash` field across every per-RPC ack. Batched STORE collapses concentration into one RPC per publisher-receiver pair per scheduler tick (256 hashes per batch ≈ 898 batches total), with a `Vec<bool>` ack carrying per-hash outcomes in request order (no hashes repeated). Total bootstrap bytes-on-wire drop to ~8 MB — **a ~80% reduction**, of which ~30 percentage points come from framing elimination, ~20 from `holder` de-duplication, and ~20 from ack-shape compaction (bitmap-style ack instead of per-result hash). Specified in [§ STORE Flow (Cache Event → DHT Publish)](#store-flow-cache-event--dht-publish) and [§ DHT Rate Limiting](#dht-rate-limiting).
 - **High C (≥100,000).** DHT dominates and per-publisher STORE bandwidth exceeds 1 Mbps. The protocol does not impose a ceiling on C; operator-policy caps on cached-blob count become the relevant capacity-planning lever.
 
 ### Popularity Signals and Market Dynamics
@@ -328,6 +354,8 @@ DHT STORE and FIND_VALUE operations carry no protocol-level fee. The incentive t
 
 `DhtMessage` uses a top-level enum consistent with the per-ALPN protocol enum pattern in [ADR 013 — Protocol Enums](013-schema-evolution.md#protocol-enums). Unknown variants are silently dropped.
 
+New optional variants (e.g., `BatchStore` / `BatchStoreAck` added for publishing optimization in [§ STORE Flow (Cache Event → DHT Publish)](#store-flow-cache-event--dht-publish)) are minor changes — no ALPN bump. Publishers detect receiver support by issuing the new variant and falling back to the per-hash equivalent on stream-close-without-ack, the natural signal under "unknown variants are silently dropped." This negotiation pattern relies on the variant being a pure optimization with an existing per-hash equivalent; variants without a fallback path would require an ALPN bump.
+
 ### Acceptance Criteria
 
 1. A node in a 30-node PoC network can discover providers for a cached blob in ≤3 FIND_VALUE hops.
@@ -346,3 +374,7 @@ DHT STORE and FIND_VALUE operations carry no protocol-level fee. The incentive t
 14. NodeIds returning `has_blob: false` for hash H are not re-probed for H within the negative probe cache TTL ([ADR 001 § Probe cache](001-network.md#probe-cache)).
 15. Re-publish time per record is drawn from `uniform(30 min, 50 min)` independently per draw; STORE targets are the K+3 closest nodes in the publisher's routing table.
 16. On cold start, each cached blob's first re-publish time is drawn from `uniform(0, 40 min)` independently per record. A naive single-tick bulk re-publish across all cached blobs at startup is non-conforming.
+17. A `BatchStoreRequest` with `n ≤ 256` hashes from publisher P produces a `BatchStoreAck` whose `results` carries one `bool` per request hash, in request order. The batch-level `holder` is checked once against the authenticated QUIC NodeId; the remaining admission decisions (rate limit, per-publisher quota with two-tier eviction, active-staker check) are applied per-hash and match those of `n` separate `StoreRequest` RPCs from P.
+18. A `BatchStoreRequest` consumes between 1 and `n` tokens from each rate-limit bucket: stage 1 charges 1 token before deserialization; stage 2 charges up to `n - 1` more after reading `n = hashes.len()`, bounded by remaining budget. The first `k` admitted hashes pass per-hash processing; the remaining `n - k` are marked `false` in the ack without further processing.
+19. A `BatchStoreRequest` with `hashes.len() > 256` is rejected by closing the stream with `MALFORMED_MESSAGE` (`0x03`); the publisher MUST split larger publish sets across multiple batches.
+20. A publisher whose `BatchStoreRequest` to a given receiver results in stream-close-without-ack MUST fall back to per-hash `StoreRequest` for subsequent publications to that receiver; the publisher SHOULD cache the negative result for some bounded duration to avoid repeated drop-and-fallback cycles.
