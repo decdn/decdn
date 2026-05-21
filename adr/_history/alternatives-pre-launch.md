@@ -66,23 +66,28 @@ These are governance-policy guidelines, not on-chain enforcement. The revisiting
 
 ## ADR 022 — Content Discovery at Scale
 
-Source: [ADR 022 — Content Discovery at Scale (DHT)](../022-content-discovery.md).
+Source: [ADR 022 — Content Discovery at Scale (DHT)](../022-content-discovery.md). The canonical decision — `cdn/dht/v1` (Kademlia subset) as the primary content-discovery mechanism from day one, with the on-chain origin directory as the deterministic last-resort fallback — is documented inline in ADR 022. The rejected alternatives:
 
 ### Broadcast probe fan-out as primary mechanism
 
-The existing approach in [ADR 001](../001-network.md). Generates O(N) probe messages per cache miss. Retained as a bootstrap fallback and emergency fallback when DHT returns no providers. Not suitable as the primary mechanism even at PoC scale, because the O(N) cost is a design ceiling rather than an operational limit — the network should not be architected around it. Probe fan-out is a sound fallback because it is maximally complete: a miss definitively means no node holds the blob.
+An earlier design in [ADR 001](../001-network.md#adr-001-network-topology-and-peer-mesh) used **broadcast probe fan-out**: on a cache miss, a node sends a `cdn/probe/v1` message to every known peer simultaneously. Tolerable at network sizes of tens of nodes, but fails as N grows:
+
+- **O(N) probes per cache miss.** At 1,000 nodes each cache miss generates ~1,000 outbound probe messages. Under a 10 fan-outs/second rate limit that is 10,000 probe messages/second/node — a self-DoS risk and a meaningful burden on the probed peers.
+- **O(N) probe overhead for the prober.** Even rate-limited, fan-out latency grows with N: the node waits for the probe collection window on each of those N connections.
+
+The O(N) cost is a design ceiling rather than an operational limit, and the protocol should not be architected around it at any N. Broadcast probe fan-out is not part of the protocol; the registry-seeded DHT bootstrap path ([ADR 022 § Bootstrap](../022-content-discovery.md#bootstrap)) removes any need for a fallback discovery mechanism.
 
 ### Gossip content announcements
 
-Each cache/evict event generates a gossip message. Rejected: unbounded traffic proportional to cache churn, retraction storms under high eviction rates. See ADR 022 Context section.
+Each cache/evict event generates a gossip `ContentAnnounce` message. Rejected: content churn is proportional to demand × network size, not to a configurable interval like `NodeAnnounce`, so traffic is unbounded by design. High-demand blobs with frequent cache rotation produce interleaved announce/retract storms.
 
 ### Hash-prefix range hints in `NodeAnnounce`
 
-Rejected: economically irrational in an incentive-driven network where nodes cache popular content regardless of hash prefix. See ADR 022 Context section.
+A node advertises "I hold hashes in prefix range 0x00–0x3F" via gossip, and queriers route lookups by prefix overlap. Rejected: nodes are economically incentivised to cache **popular** content regardless of hash prefix, so range hints would be uniformly meaningless in an incentive-driven network.
 
 ### iroh mainline DHT (`DhtDiscovery` / pkarr)
 
-Rejected for this use case. iroh's built-in DHT resolves `NodeId → address` on the public mainline BitTorrent DHT. It does not support content-hash records, is not scoped to the deCDN registered-node set, and exposes lookup patterns to the public internet.
+Rejected for this use case. iroh's built-in DHT resolves `NodeId → address` on the public mainline BitTorrent DHT. It does not support content-hash records, is not scoped to the deCDN registered-node set, and exposes lookup patterns to the public internet. A separate content DHT scoped to the registered node set is required, which is what `cdn/dht/v1` provides.
 
 ### Indexer nodes (`cdn/search/v1`)
 
