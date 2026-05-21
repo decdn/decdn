@@ -75,7 +75,7 @@ An earlier design in [ADR 001](../001-network.md#adr-001-network-topology-and-pe
 - **O(N) probes per cache miss.** At 1,000 nodes each cache miss generates ~1,000 outbound probe messages. Under a 10 fan-outs/second rate limit that is 10,000 probe messages/second/node — a self-DoS risk and a meaningful burden on the probed peers.
 - **O(N) probe overhead for the prober.** Even rate-limited, fan-out latency grows with N: the node waits for the probe collection window on each of those N connections.
 
-The O(N) cost is a design ceiling rather than an operational limit, and the protocol should not be architected around it at any N. Broadcast probe fan-out is not part of the protocol; the registry-seeded DHT bootstrap path ([ADR 022 § Bootstrap](../022-content-discovery.md#bootstrap)) removes any need for a fallback discovery mechanism.
+The O(N) cost is a design ceiling rather than an operational limit, and the protocol should not be architected around it at any N. The registry-seeded DHT bootstrap path ([ADR 022 § Bootstrap](../022-content-discovery.md#bootstrap)) removes any need for a fallback discovery mechanism.
 
 ### Gossip content announcements
 

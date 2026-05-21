@@ -15,7 +15,7 @@ A **Kademlia-based content DHT** has the right properties for an incentive-drive
 - **O(log N) publish cost** — a STORE record is pushed to only the K nodes closest to the hash in keyspace. No global broadcast.
 - **The probe step is preserved** — DHT lookup narrows the candidate set; `cdn/probe/v1` still confirms live availability and measures latency before any delivery commitment.
 
-The DHT defined here is a separate content DHT scoped to the registered node set, operating over the `cdn/dht/v1` ALPN on iroh QUIC; it is distinct from iroh's built-in `DhtDiscovery` (mainline BitTorrent DHT via pkarr), which resolves `NodeId → address` on the public internet.
+The DHT defined here is a separate content DHT scoped to the registered node set, operating over the `cdn/dht/v1` ALPN on iroh QUIC. It is distinct from iroh's built-in `DhtDiscovery` (mainline BitTorrent DHT via pkarr), which resolves `NodeId → address` on the public internet.
 
 ## Decision
 
