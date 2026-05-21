@@ -152,7 +152,7 @@ Contracts live in `contracts/` and use [Foundry](https://book.getfoundry.sh). CI
 
 ```bash
 forge fmt --check                       # formatting check (CI gate)
-forge build --sizes --deny-warnings     # build + report sizes; fail on warnings (CI gate)
+forge build --sizes --deny warnings     # build + report sizes; fail on warnings (CI gate)
 forge test                              # default profile: 256 fuzz, 32-depth invariants
 FOUNDRY_PROFILE=ci forge test           # 1024 fuzz, 256/50-depth (matches CI)
 FOUNDRY_PROFILE=fuzz forge test         # 10k fuzz, 1024/100-depth (nightly/manual)

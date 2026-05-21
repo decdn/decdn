@@ -93,10 +93,10 @@ repos:
       # pre-push-stage (only on `git push`, medium cost):
 
       - id: forge-build
-        name: forge build --deny-warnings
+        name: forge build --deny warnings
         language: system
         stages: [pre-push]
-        entry: bash -c 'cd contracts && forge build --deny-warnings'
+        entry: bash -c 'cd contracts && forge build --deny warnings'
         files: '^contracts/.*\.sol$'
         pass_filenames: false
 
