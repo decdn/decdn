@@ -424,6 +424,21 @@ jobs:
       - run: forge --version
       - run: forge build --sizes --deny warnings
       - run: forge test -vvv
+      # Structural enforcement that `TestnetFaucet` never leaks into the
+      # production audit surface (issue #636, #452). The contract lives at
+      # `testnet/TestnetFaucet.sol` and is wired only from
+      # `script/TestnetFaucet.s.sol` + the test suite — any reference from
+      # `src/` or from any other `script/*.s.sol` fails CI.
+      - name: Verify TestnetFaucet stays in testnet boundary
+        run: |
+          set -euo pipefail
+          leak=$(grep -rnw 'TestnetFaucet' src/ script/ 2>/dev/null \
+                   | grep -v '^script/TestnetFaucet\.s\.sol:' || true)
+          if [[ -n "$leak" ]]; then
+            echo "::error::TestnetFaucet must not appear outside contracts/testnet/ or contracts/script/TestnetFaucet.s.sol"
+            echo "$leak"
+            exit 1
+          fi
 
   solidity-coverage:
     name: solidity coverage
