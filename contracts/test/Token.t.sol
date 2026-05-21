@@ -125,37 +125,23 @@ contract TokenTest is Test {
     }
 
     // -----------------------------------------------------------------
-    // ERC20Votes — vote weight independence
+    // ERC20Votes is intentionally not inherited (see Token.sol NatSpec).
+    // Locked here so a future contributor doesn't silently re-add it:
+    // `delegate`, `getVotes`, `getPastVotes`, `delegates` must not exist
+    // on the public surface. Each selector probe via low-level call.
     // -----------------------------------------------------------------
 
-    function test_votes_zeroByDefault_requiresDelegation() public view {
-        // Vote weight is zero until the holder self-delegates — matches
-        // OZ ERC20Votes semantics; documenting it because the deCDN Governor
-        // sources votes from VotingEscrow (ADR 026), so this checkpoint is
-        // unused on the canonical path but must still behave correctly.
-        assertEq(token.getVotes(holder), 0);
-    }
-
-    function test_votes_selfDelegate_setsVoteWeight() public {
-        vm.prank(holder);
-        token.delegate(holder);
-
-        assertEq(token.getVotes(holder), token.balanceOf(holder));
-    }
-
-    function test_votes_checkpointsOnTransfer() public {
-        address recipient = makeAddr("recipient");
-
-        vm.prank(holder);
-        token.delegate(holder);
-
-        uint256 transferAmount = 1000e18;
-        vm.prank(holder);
-        assertTrue(token.transfer(recipient, transferAmount));
-
-        // recipient hasn't delegated, so they have 0 vote weight;
-        // holder's weight has dropped by the transferred amount.
-        assertEq(token.getVotes(holder), token.balanceOf(holder));
-        assertEq(token.getVotes(recipient), 0);
+    function test_noVotesSurfaceExposed() public {
+        bytes[5] memory probes = [
+            abi.encodeWithSignature("delegate(address)", holder),
+            abi.encodeWithSignature("getVotes(address)", holder),
+            abi.encodeWithSignature("getPastVotes(address,uint256)", holder, 0),
+            abi.encodeWithSignature("delegates(address)", holder),
+            abi.encodeWithSignature("getPastTotalSupply(uint256)", 0)
+        ];
+        for (uint256 i = 0; i < probes.length; i++) {
+            (bool ok,) = address(token).call(probes[i]);
+            assertFalse(ok, "ERC20Votes surface must not exist on Token");
+        }
     }
 }
