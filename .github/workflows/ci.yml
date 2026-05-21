@@ -523,7 +523,7 @@ jobs:
         run: |
           base="baseline/lcov.info"
           if [[ ! -s "$base" ]]; then base=""; fi
-          ../.github/scripts/contracts-coverage-comment.sh lcov.info "$base"
+          ../.github/scripts/contracts-coverage-comment.sh lcov.info "$base" baseline/.absent-reason
 
   solidity-solhint:
     name: solidity solhint
