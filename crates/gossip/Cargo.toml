@@ -16,6 +16,7 @@ postcard = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+arc-swap = { workspace = true }
 bytes = { workspace = true }
 blake3 = "1"
 

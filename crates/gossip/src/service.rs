@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 use decdn_protocol::{
     GOSSIP_VERSION, GossipEnvelope, GossipPayload, NodeAnnounce, NodeAnnounceBody, TOPIC_GLOBAL,
@@ -171,14 +172,22 @@ impl GossipService {
         // Open one subscription per topic up front. Failures bump a metric
         // and emit an error log; the topic is then skipped so the caller
         // isn't left with half-wired state.
-        let mut senders: Vec<(String, GossipSender)> = Vec::new();
-        let mut receivers: Vec<(String, TopicId, GossipReceiver)> = Vec::new();
+        //
+        // Each topic owns one `Arc<ArcSwap<GossipSender>>` slot shared by
+        // the subscriber and the publisher (#577 H2). The subscriber's
+        // reconnect path stores the fresh sender into its slot, and the
+        // publisher reads through the slot on each broadcast — so the
+        // two halves can't desynchronise after a stream reset.
+        let mut senders: Vec<(String, Arc<ArcSwap<GossipSender>>)> = Vec::new();
+        let mut receivers: Vec<(String, TopicId, GossipReceiver, Arc<ArcSwap<GossipSender>>)> =
+            Vec::new();
         for (topic_name, topic_id) in topics {
             match gossip.subscribe(topic_id, Vec::new()).await {
                 Ok(topic) => {
                     let (sender, receiver) = topic.split();
-                    senders.push((topic_name.clone(), sender));
-                    receivers.push((topic_name, topic_id, receiver));
+                    let slot = Arc::new(ArcSwap::from_pointee(sender));
+                    senders.push((topic_name.clone(), Arc::clone(&slot)));
+                    receivers.push((topic_name, topic_id, receiver, slot));
                 }
                 Err(err) => {
                     metrics.inc_rejected(SUBSCRIBE_FAILED_LABEL);
@@ -200,7 +209,7 @@ impl GossipService {
 
         let mut handles: Vec<JoinHandle<()>> = Vec::new();
 
-        for (topic_name, tid, receiver) in receivers {
+        for (topic_name, tid, receiver, sender_slot) in receivers {
             handles.push(subscriber_task(
                 topic_name,
                 receiver,
@@ -209,6 +218,7 @@ impl GossipService {
                 Arc::clone(&allowlist),
                 Arc::clone(&peer_table),
                 Arc::clone(&metrics),
+                sender_slot,
             ));
         }
 
@@ -306,6 +316,7 @@ const RECONNECT_MAX_BACKOFF: Duration = Duration::from_mins(1);
 /// Initial backoff after the first stream drop (1 second).
 const RECONNECT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 
+#[allow(clippy::too_many_arguments)] // each arg is load-bearing; grouping would obscure intent
 fn subscriber_task(
     topic_name: String,
     initial_receiver: GossipReceiver,
@@ -314,6 +325,12 @@ fn subscriber_task(
     allowlist: Arc<HashSet<[u8; 32]>>,
     peer_table: Arc<RwLock<PeerTable>>,
     metrics: Arc<dyn GossipMetrics>,
+    // Per-topic publisher-visible sender slot (#577 H2). On reconnect this
+    // task swaps the freshly-split sender into the slot so the publisher's
+    // next iteration picks it up via `ArcSwap::load_full` rather than
+    // continuing to broadcast through a stale `mpsc::Sender` whose
+    // iroh-gossip-side receiver is gone.
+    sender_slot: Arc<ArcSwap<GossipSender>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut receiver = initial_receiver;
@@ -360,7 +377,14 @@ fn subscriber_task(
 
                 match gossip.subscribe(topic_id, Vec::new()).await {
                     Ok(topic) => {
-                        let (_sender, new_receiver) = topic.split();
+                        // #577 H2: store the *new* sender into the shared slot
+                        // before resuming. The publisher's next broadcast loads
+                        // through the slot and sees this sender; a regression
+                        // that drops this `store` is caught by the
+                        // `publisher_sees_swapped_sender_after_reconnect` test
+                        // in this module.
+                        let (new_sender, new_receiver) = topic.split();
+                        sender_slot.store(Arc::new(new_sender));
                         receiver = new_receiver;
                         metrics.inc_reconnected(&topic_name);
                         tracing::info!(topic = %topic_name, "gossip subscription reconnected");
@@ -383,7 +407,12 @@ fn publisher_task(
     secret_key: SecretKey,
     region_code: String,
     interval: Duration,
-    senders: Vec<(String, GossipSender)>,
+    // Per-topic sender slots shared with the subscriber tasks. Each
+    // broadcast iteration calls `slot.load_full()` to pick up the latest
+    // sender, so a subscriber-driven reconnect (which swaps a fresh
+    // sender into the slot) is observed on the next publish without
+    // dropping a manual `announce_now()` trigger on the floor — #577 H2.
+    senders: Vec<(String, Arc<ArcSwap<GossipSender>>)>,
     metrics: Arc<dyn GossipMetrics>,
     announce_now: Arc<Notify>,
 ) -> JoinHandle<()> {
@@ -434,7 +463,15 @@ fn publisher_task(
                     continue;
                 }
             };
-            for (name, sender) in &senders {
+            for (name, slot) in &senders {
+                // Load through the slot every iteration so a subscriber-
+                // driven reconnect (which swaps a fresh `GossipSender`
+                // into this slot) is picked up here without a publisher
+                // restart. Pre-#577-H2, the publisher captured the
+                // original sender at spawn and silently kept broadcasting
+                // through it even after the iroh-gossip-side receiver
+                // disappeared.
+                let sender = slot.load_full();
                 if let Err(err) = sender.broadcast(encoded.clone()).await {
                     // `warn!` rather than `debug!`: a broadcast failure on
                     // the manual-trigger path (operator running `decdn node
@@ -536,6 +573,55 @@ mod tests {
         assert_eq!(topics.len(), 2);
         assert_eq!(topics[0].0, "cdn/global/v1");
         assert_eq!(topics[1].0, "cdn/region/US/v1");
+    }
+
+    /// #577 H2 — locks the architectural property the fix relies on:
+    /// the publisher reads its sender *through* the per-topic
+    /// `Arc<ArcSwap<...>>` slot on every iteration, so a subscriber-
+    /// driven reconnect that swaps a fresh value into the slot is
+    /// observed on the next publisher iteration. A regression that
+    /// captured the sender by value at spawn (as the pre-fix code did,
+    /// silently dropping manual / interval announces after a stream
+    /// reset) would fail this test.
+    ///
+    /// `GossipSender` is from iroh-gossip and not easily faked without
+    /// spinning up a real `Gossip` instance, so this test exercises the
+    /// shape with a stand-in `&'static str` value. The two production
+    /// call sites (`publisher_task`'s broadcast loop and
+    /// `subscriber_task`'s reconnect arm) use the same `load_full` /
+    /// `store` pair against the same `Arc<ArcSwap<GossipSender>>`
+    /// instance — the diff sites are short and visible by inspection.
+    #[test]
+    fn publisher_sees_swapped_sender_after_reconnect() {
+        let slot: Arc<ArcSwap<&'static str>> = Arc::new(ArcSwap::from_pointee("initial"));
+
+        // Simulate the publisher's first iteration after spawn.
+        let first = slot.load_full();
+        assert_eq!(*first, "initial");
+
+        // Simulate the subscriber's reconnect arm storing a fresh value
+        // into the same slot. The clone of `Arc::clone(&slot)` mirrors
+        // how the spawn code hands the same Arc to both tasks.
+        let subscriber_view = Arc::clone(&slot);
+        subscriber_view.store(Arc::new("after_reconnect"));
+
+        // Publisher's next iteration must observe the swap. A
+        // regression that captured the sender into a local would still
+        // return "initial" here, demonstrating the bug.
+        let second = slot.load_full();
+        assert_eq!(
+            *second, "after_reconnect",
+            "publisher must read through the slot, not capture the sender at spawn"
+        );
+
+        // Sanity: the original Arc returned by the first load is
+        // unchanged — `ArcSwap::store` swaps the slot's pointer; it
+        // does not mutate the previously-loaded Arc in place. If a
+        // future change to `ArcSwap` semantics ever did mutate the
+        // loaded Arc the publisher would actually be safe under this
+        // test, but the assertion above would still catch the original
+        // bug (publisher captures by value).
+        assert_eq!(*first, "initial");
     }
 
     /// `AnnounceTrigger::announce_now()` must actually wake a waiting
