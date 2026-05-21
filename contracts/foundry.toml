@@ -32,7 +32,11 @@ invariant = { runs = 256, depth = 50 }
 verbosity = 3
 
 [profile.fuzz]
-fuzz = { runs = 10_000, max_test_rejects = 1_000_000 }
+# Keep max_test_rejects at the foundry default (65_536). A test hitting the
+# ceiling means inputs are over-constrained (typically vm.assume overuse);
+# fix the test with vm.bound or tighter input types rather than raising
+# this further — see https://book.getfoundry.sh/forge/fuzz-testing.
+fuzz = { runs = 10_000, max_test_rejects = 65_536 }
 invariant = { runs = 1024, depth = 100 }
 
 [profile.coverage]

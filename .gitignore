@@ -15,8 +15,7 @@
 # Foundry
 /contracts/out/
 /contracts/cache/
-/contracts/broadcast/*/[0-9]*/
-/contracts/broadcast/**/dry-run/
+/contracts/broadcast/
 /contracts/docs/
 
 # ADR PDF build output
