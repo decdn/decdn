@@ -6,8 +6,8 @@ import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.s
 import { Pausable } from "@openzeppelin/contracts/utils/Pausable.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
 
-import { IBurnableERC20 } from "./interfaces/IBurnableERC20.sol";
 import { ISafetyReserve } from "./interfaces/ISafetyReserve.sol";
 
 /// @title StakingRegistry — staking, slashing, and settlement-recording core
@@ -41,7 +41,7 @@ import { ISafetyReserve } from "./interfaces/ISafetyReserve.sol";
 ///             the unbonding bucket absorbs any remainder.
 ///           - Distribution: 50% to challenger, 30% to SafetyReserve
 ///             (via `safeTransfer` + `recordSlashInflow`), 20% burned
-///             via `IBurnableERC20.burn` on the TOKEN contract.
+///             via `ERC20Burnable.burn` on the TOKEN contract.
 ///           - Auto-ejection: if post-slash active stake falls below
 ///             `minStake / 2`, the operator's `ejected` flag is set;
 ///             they must re-stake to at least `minStake` to clear it
@@ -113,18 +113,27 @@ contract StakingRegistry is AccessControl, ReentrancyGuard, Pausable {
     // Immutable wiring
     // -----------------------------------------------------------------
 
-    /// @notice TOKEN contract. Burnable per ADR 016 § Contract Inventory.
+    /// @notice TOKEN contract. Typed as OZ's `ERC20Burnable` directly — Token
+    ///         inherits from it, so callers pass `Token` without a cast and
+    ///         the 20%-burn leg of `slash` calls `token.burn(amount)` against
+    ///         the canonical OZ surface (no custom interface).
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
-    IBurnableERC20 public immutable token;
+    ERC20Burnable public immutable token;
 
     // -----------------------------------------------------------------
     // Storage
     // -----------------------------------------------------------------
 
     /// @notice Per-operator unbonding request. At most one in-flight.
+    /// @dev    Both fields are `uint256` for consistency with the contract's
+    ///         other timestamp + balance storage (`lastSettlementAt`,
+    ///         `activeStake`) — packing this struct into a single slot would
+    ///         save one SSTORE per `requestUnstake` but at the cost of
+    ///         needing two narrowing casts (`uint128`, `uint64`) that audit
+    ///         then has to reason about.
     struct UnbondingRequest {
-        uint128 amount;
-        uint64 unlockAt;
+        uint256 amount;
+        uint256 unlockAt;
     }
 
     /// @notice Active stake per operator. Excludes amounts in unbonding —
@@ -186,7 +195,10 @@ contract StakingRegistry is AccessControl, ReentrancyGuard, Pausable {
     event AutoEjected(address indexed operator, uint256 remainingStake);
     event EjectedByBlacklist(address indexed operator);
     event Reinstated(address indexed operator);
-    event SettlementRecorded(address indexed operator, uint256 timestamp);
+    /// @dev `block.timestamp` is implicit on every log via the block header;
+    ///      a redundant explicit timestamp would only inflate calldata costs
+    ///      for indexers that already have the canonical value.
+    event SettlementRecorded(address indexed operator);
     event MinStakeUpdated(uint256 oldValue, uint256 newValue);
     event UnbondingPeriodUpdated(uint256 oldValue, uint256 newValue);
     event SafetyReserveUpdated(address indexed oldAddr, address indexed newAddr);
@@ -218,7 +230,7 @@ contract StakingRegistry is AccessControl, ReentrancyGuard, Pausable {
     /// @param unbondingPeriod_ Initial unbonding period (ADR 003 default
     ///                         7 days; bounded `[3 days, 30 days]` per
     ///                         ADR 009).
-    constructor(IBurnableERC20 token_, address admin, uint256 minStake_, uint256 unbondingPeriod_) {
+    constructor(ERC20Burnable token_, address admin, uint256 minStake_, uint256 unbondingPeriod_) {
         if (address(token_) == address(0) || admin == address(0)) revert ZeroAddress();
         _enforceMinStakeBounds(minStake_);
         _enforceUnbondingPeriodBounds(unbondingPeriod_);
@@ -269,14 +281,8 @@ contract StakingRegistry is AccessControl, ReentrancyGuard, Pausable {
         if (unbondingOf[msg.sender].amount != 0) revert UnbondingInProgress();
 
         activeStake[msg.sender] -= amount;
-        // Safe: block.timestamp + unbondingPeriod (max 30 days) is bounded
-        // far below uint64.max (year ~292,277,026,596).
-        // forge-lint: disable-next-line(unsafe-typecast)
-        uint64 unlockAt = uint64(block.timestamp + unbondingPeriod);
-        // Safe: `amount` is bounded by `activeStake[msg.sender]`, which is
-        // bounded by TOTAL_SUPPLY (1e27) — well below uint128.max (~3.4e38).
-        // forge-lint: disable-next-line(unsafe-typecast)
-        unbondingOf[msg.sender] = UnbondingRequest({ amount: uint128(amount), unlockAt: unlockAt });
+        uint256 unlockAt = block.timestamp + unbondingPeriod;
+        unbondingOf[msg.sender] = UnbondingRequest({ amount: amount, unlockAt: unlockAt });
 
         emit UnbondingRequested(msg.sender, amount, unlockAt, activeStake[msg.sender]);
     }
@@ -345,12 +351,7 @@ contract StakingRegistry is AccessControl, ReentrancyGuard, Pausable {
         } else {
             uint256 remainder = slashAmount - activeStake[operator];
             activeStake[operator] = 0;
-            // Safe: `req.amount - remainder` is non-negative (slashAmount is
-            // capped by totalAtRisk which is `active + req.amount`, and
-            // remainder = slashAmount - active ≤ req.amount); result fits in
-            // uint128 because it's ≤ the existing uint128 `req.amount`.
-            // forge-lint: disable-next-line(unsafe-typecast)
-            unbondingOf[operator].amount = uint128(uint256(req.amount) - remainder);
+            unbondingOf[operator].amount = req.amount - remainder;
         }
 
         // Split: 50% challenger / 30% SafetyReserve / 20% burn.
@@ -412,7 +413,7 @@ contract StakingRegistry is AccessControl, ReentrancyGuard, Pausable {
     function recordSettlement(address operator) external onlyRole(SETTLEMENT_REPORTER_ROLE) {
         if (operator == address(0)) revert ZeroAddress();
         lastSettlementAt[operator] = block.timestamp;
-        emit SettlementRecorded(operator, block.timestamp);
+        emit SettlementRecorded(operator);
     }
 
     // -----------------------------------------------------------------
