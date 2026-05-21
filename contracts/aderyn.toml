@@ -1,0 +1,7 @@
+root = "."
+src = ["src"]
+exclude = ["lib", "out", "cache", "test", "broadcast", "node_modules"]
+remappings = [
+    "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+    "forge-std/=lib/forge-std/src/",
+]
