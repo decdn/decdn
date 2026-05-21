@@ -52,10 +52,13 @@ contract DeployTestnetFaucet is Script {
         address predicted = vm.computeCreateAddress(treasury, vm.getNonce(treasury) + 1);
 
         vm.startBroadcast(treasury);
-        // `forceApprove` (not bare `approve`) so the script reverts loudly on
-        // a token whose approve returns `false` instead of silently failing
-        // and leaving the constructor `safeTransferFrom` to error with a
-        // less actionable message.
+        // `forceApprove` (not bare `approve`) for two reasons:
+        //   1. Handles USDT-style ERC20s that disallow non-zero→non-zero
+        //      allowance updates by zero-ing first then setting the new value.
+        //   2. Surfaces a concrete `SafeERC20FailedOperation` revert if the
+        //      approve fails, rather than silently returning `false` (some
+        //      non-standard tokens) and deferring the failure to the
+        //      constructor's `safeTransferFrom`.
         token.forceApprove(predicted, funding);
         faucet = new TestnetFaucet(token, treasury, funding, claimAmount, cooldown, admin, governance, pauser);
         vm.stopBroadcast();

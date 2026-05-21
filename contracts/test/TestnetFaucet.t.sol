@@ -137,6 +137,43 @@ contract TestnetFaucetTest is Test {
         new TestnetFaucet(IERC20(address(t)), treasury, INITIAL_FUNDING, 0, COOLDOWN, admin, governance, pauser);
     }
 
+    function test_constructor_revertsOnCooldownExceedingMax() public {
+        Token t = new Token(treasury);
+        address predicted = vm.computeCreateAddress(address(this), vm.getNonce(address(this)));
+        vm.prank(treasury);
+        t.approve(predicted, INITIAL_FUNDING);
+
+        uint256 tooBig = 30 days + 1;
+        vm.expectRevert(abi.encodeWithSelector(TestnetFaucet.CooldownTooLarge.selector, tooBig, 30 days));
+        new TestnetFaucet(
+            IERC20(address(t)), treasury, INITIAL_FUNDING, CLAIM_AMOUNT, tooBig, admin, governance, pauser
+        );
+    }
+
+    function test_constructor_revertsOnMainnetChainId() public {
+        Token t = new Token(treasury);
+        vm.chainId(1);
+        vm.expectRevert(TestnetFaucet.MainnetForbidden.selector);
+        new TestnetFaucet(
+            IERC20(address(t)), treasury, INITIAL_FUNDING, CLAIM_AMOUNT, COOLDOWN, admin, governance, pauser
+        );
+    }
+
+    function test_constructor_revertsWhenTreasuryNotApproved() public {
+        // Treasury holds the supply but has NOT approved the predicted faucet
+        // address. `safeTransferFrom` inside the constructor must revert
+        // (OZ's ERC20InsufficientAllowance); the test pins that this is a
+        // hard failure — if anyone ever swapped `safeTransferFrom` for plain
+        // `transferFrom`, the constructor would silently leave a half-broken
+        // faucet (deployed but unfunded).
+        Token t = new Token(treasury);
+        // No prior `t.approve(predicted, ...)` here.
+        vm.expectRevert();
+        new TestnetFaucet(
+            IERC20(address(t)), treasury, INITIAL_FUNDING, CLAIM_AMOUNT, COOLDOWN, admin, governance, pauser
+        );
+    }
+
     // -----------------------------------------------------------------
     // claim
     // -----------------------------------------------------------------
@@ -178,6 +215,35 @@ contract TestnetFaucetTest is Test {
 
         assertEq(token.balanceOf(alice), 2 * CLAIM_AMOUNT);
         assertEq(faucet.lastClaimedAt(alice), block.timestamp);
+    }
+
+    function test_claim_revertsOneSecondBeforeCooldownBoundary() public {
+        // Pins the inequality direction: claim must revert at exactly
+        // `lastClaimedAt + cooldown - 1`, with `remaining == 1`. Catches a
+        // mutation of `<` to `<=` on the cooldown check.
+        vm.prank(alice);
+        faucet.claim();
+
+        vm.warp(block.timestamp + COOLDOWN - 1);
+
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(TestnetFaucet.CooldownNotElapsed.selector, 1));
+        faucet.claim();
+    }
+
+    function test_claim_succeedsAtExactCooldownBoundary() public {
+        // Pins the other side: claim must succeed at exactly
+        // `lastClaimedAt + cooldown` (i.e. `remaining == 0` is permitted,
+        // not deferred to the next second).
+        vm.prank(alice);
+        faucet.claim();
+        uint256 firstClaimAt = block.timestamp;
+
+        vm.warp(firstClaimAt + COOLDOWN);
+
+        vm.prank(alice);
+        faucet.claim();
+        assertEq(faucet.lastClaimedAt(alice), firstClaimAt + COOLDOWN);
     }
 
     function test_claim_perCallerCooldownIndependence() public {
@@ -233,10 +299,11 @@ contract TestnetFaucetTest is Test {
     // Cooldown fuzz (#636 explicit acceptance criterion)
     // -----------------------------------------------------------------
 
-    function testFuzz_claim_cooldownBoundary(uint256 delta) public {
-        // Bound delta so block.timestamp + delta doesn't overflow but still
-        // exercises both sides of the cooldown threshold.
-        delta = bound(delta, 0, 30 days);
+    function testFuzz_claim_belowCooldown(uint256 delta) public {
+        // Concentrates fuzz samples in `[0, COOLDOWN - 1]` so every run
+        // actually exercises the revert path — the wider `[0, 30 days]`
+        // range sampled the boundary at near-zero probability.
+        delta = bound(delta, 0, COOLDOWN - 1);
 
         vm.prank(alice);
         faucet.claim();
@@ -244,17 +311,27 @@ contract TestnetFaucetTest is Test {
 
         vm.warp(firstClaimAt + delta);
 
-        if (delta >= COOLDOWN) {
-            vm.prank(alice);
-            faucet.claim();
-            assertEq(faucet.lastClaimedAt(alice), block.timestamp, "lastClaimedAt must advance");
-            assertEq(token.balanceOf(alice), 2 * CLAIM_AMOUNT, "two payouts");
-        } else {
-            vm.prank(alice);
-            vm.expectRevert(abi.encodeWithSelector(TestnetFaucet.CooldownNotElapsed.selector, COOLDOWN - delta));
-            faucet.claim();
-            assertEq(faucet.lastClaimedAt(alice), firstClaimAt, "lastClaimedAt unchanged on revert");
-        }
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(TestnetFaucet.CooldownNotElapsed.selector, COOLDOWN - delta));
+        faucet.claim();
+        assertEq(faucet.lastClaimedAt(alice), firstClaimAt, "lastClaimedAt unchanged on revert");
+    }
+
+    function testFuzz_claim_atOrAboveCooldown(uint256 delta) public {
+        // Mirror fuzz on the success side, capped at MAX_COOLDOWN so we
+        // exercise the contract's full governance-allowed cooldown range.
+        delta = bound(delta, COOLDOWN, 30 days);
+
+        vm.prank(alice);
+        faucet.claim();
+        uint256 firstClaimAt = block.timestamp;
+
+        vm.warp(firstClaimAt + delta);
+
+        vm.prank(alice);
+        faucet.claim();
+        assertEq(faucet.lastClaimedAt(alice), firstClaimAt + delta, "lastClaimedAt must advance");
+        assertEq(token.balanceOf(alice), 2 * CLAIM_AMOUNT, "two payouts");
     }
 
     // -----------------------------------------------------------------
@@ -311,6 +388,19 @@ contract TestnetFaucetTest is Test {
         vm.prank(governance);
         faucet.setCooldown(2 days);
         assertEq(faucet.cooldown(), 2 days);
+    }
+
+    function test_setCooldown_revertsOnExceedingMax() public {
+        uint256 tooBig = 30 days + 1;
+        vm.prank(governance);
+        vm.expectRevert(abi.encodeWithSelector(TestnetFaucet.CooldownTooLarge.selector, tooBig, 30 days));
+        faucet.setCooldown(tooBig);
+    }
+
+    function test_setCooldown_acceptsMaxCooldown() public {
+        vm.prank(governance);
+        faucet.setCooldown(30 days);
+        assertEq(faucet.cooldown(), 30 days);
     }
 
     function test_setCooldown_allowsZero() public {
@@ -495,9 +585,16 @@ contract MaliciousERC20 is ERC20 {
     function _update(address from, address to, uint256 value) internal override {
         super._update(from, to, value);
         // Only re-enter when the faucet is paying out — i.e. on the
-        // `safeTransfer(msg.sender, amount)` inside `claim`.
+        // `safeTransfer(msg.sender, amount)` inside `claim`. The re-entered
+        // `claim()` call runs as `msg.sender = address(this)` (the token
+        // contract), a fresh address with `lastClaimedAt == 0`, so the
+        // cooldown sentinel does NOT short-circuit — `nonReentrant` is the
+        // only thing stopping the second `claim()`. Removing the
+        // `nonReentrant` modifier on `claim` makes this test fail.
         if (attacking && from == address(faucet) && address(faucet) != address(0)) {
-            attacking = false; // single-shot — otherwise we'd recurse forever pre-guard
+            // Disarm before the recursive call so an unguarded `claim` path
+            // can only enter twice (outer + one re-entry), not infinitely.
+            attacking = false;
             faucet.claim();
         }
     }

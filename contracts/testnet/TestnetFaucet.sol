@@ -8,13 +8,19 @@ import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.s
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 /// @title TestnetFaucet — per-address TOKEN dispenser for testnet onboarding
-/// @notice ⚠️ TESTNET ONLY — MUST NOT be deployed to mainnet. This contract is
-///         intentionally **out of the audited 14-contract surface** tracked in
-///         decdn/decdn#452. The on-disk path (`contracts/testnet/`), the
-///         separately-named deploy script (`script/TestnetFaucet.s.sol`), and
-///         the CI grep gate in `.github/workflows/ci.yml` together enforce
-///         that this contract cannot accidentally land in a production deploy
-///         bundle.
+/// @notice ⚠️ TESTNET ONLY. Intentionally **out of the audited contract
+///         surface** tracked in decdn/decdn#452. Three layers prevent it
+///         from reaching Ethereum mainnet:
+///           1. On-chain: the constructor reverts `MainnetForbidden` when
+///              `block.chainid == 1`.
+///           2. CI: a grep gate in `.github/workflows/ci.yml` (`solidity
+///              build+test` job) fails any PR referencing `TestnetFaucet`
+///              from `contracts/src/` or from any `contracts/script/*.s.sol`
+///              other than `TestnetFaucet.s.sol`.
+///           3. Convention: the file lives at `contracts/testnet/`, off the
+///              audited source tree, and its deploy script is separately
+///              named so future production deploy scripts cannot reference
+///              it without tripping the CI gate.
 ///
 ///         The deployer pre-funds the faucet in the constructor by approving
 ///         `initialFunding` TOKEN to this address and then deploying. Each
@@ -72,8 +78,20 @@ contract TestnetFaucet is AccessControl, ReentrancyGuard, Pausable {
     uint256 public claimAmount;
 
     /// @notice Minimum seconds between consecutive claims per address.
-    ///         Settable by `GOVERNANCE_ROLE`. May be 0 (no cooldown).
+    ///         Settable by `GOVERNANCE_ROLE`. May be 0 (no cooldown). Bounded
+    ///         above by `MAX_COOLDOWN` so `last + cooldown` cannot overflow
+    ///         `uint256` for any realistic `last`, keeping `claim()` and
+    ///         `timeUntilNext()` from reverting with a generic `Panic(0x11)`.
     uint256 public cooldown;
+
+    /// @notice Upper bound on `cooldown`. 30 days is far longer than any
+    ///         realistic testnet faucet cadence and many orders of magnitude
+    ///         below `type(uint256).max`, so `last + cooldown` never
+    ///         overflows. The bound also prevents a misconfigured (or
+    ///         compromised) `GOVERNANCE_ROLE` from bricking the faucet's
+    ///         revert messages by pushing every claimer into an unreachable
+    ///         future.
+    uint256 public constant MAX_COOLDOWN = 30 days;
 
     /// @notice `block.timestamp` of each caller's most recent successful
     ///         claim. Sentinel value `0` means "never claimed", which is
@@ -97,6 +115,8 @@ contract TestnetFaucet is AccessControl, ReentrancyGuard, Pausable {
     error ZeroAmount();
     error CooldownNotElapsed(uint256 remaining);
     error InsufficientBalance(uint256 balance, uint256 requested);
+    error CooldownTooLarge(uint256 provided, uint256 max);
+    error MainnetForbidden();
 
     // -----------------------------------------------------------------
     // Constructor
@@ -125,6 +145,12 @@ contract TestnetFaucet is AccessControl, ReentrancyGuard, Pausable {
         address governance,
         address pauser
     ) {
+        // Defense-in-depth against accidental mainnet deployment. Combined
+        // with the CI grep gate and the `contracts/testnet/` path convention,
+        // this is the only layer that catches an operator pointing
+        // `forge create` directly at this file with a mainnet RPC.
+        if (block.chainid == 1) revert MainnetForbidden();
+
         if (
             address(token_) == address(0) || treasury == address(0) || admin == address(0)
                 || governance == address(0) || pauser == address(0)
@@ -135,6 +161,9 @@ contract TestnetFaucet is AccessControl, ReentrancyGuard, Pausable {
         // `initialCooldown == 0` is allowed: governance may legitimately want
         // a no-cooldown faucet for a short test burst. Pausing is the safety
         // net if this is abused.
+        if (initialCooldown > MAX_COOLDOWN) {
+            revert CooldownTooLarge({ provided: initialCooldown, max: MAX_COOLDOWN });
+        }
 
         token = token_;
         claimAmount = initialClaimAmount;
@@ -160,10 +189,11 @@ contract TestnetFaucet is AccessControl, ReentrancyGuard, Pausable {
     ///         since this is testnet onboarding, treat `block.timestamp` as
     ///         authoritative.
     ///
-    ///         Modifier order: `whenNotPaused` runs before `nonReentrant` so
-    ///         the cheap `paused` SLOAD short-circuits without paying the
-    ///         reentrancy-guard SSTORE on the pause-revert path.
-    // forge-lint: disable-next-line(block-timestamp)
+    ///         Modifier order: `whenNotPaused` runs before `nonReentrant`.
+    ///         Either ordering produces equivalent state (the revert rolls
+    ///         back any SSTORE the guard performs); the win is gas — the
+    ///         pause-revert path avoids executing the reentrancy-guard's
+    ///         SSTORE before the revert.
     function claim() external whenNotPaused nonReentrant {
         uint256 amount = claimAmount;
         uint256 last = lastClaimedAt[msg.sender];
@@ -212,6 +242,7 @@ contract TestnetFaucet is AccessControl, ReentrancyGuard, Pausable {
     }
 
     function setCooldown(uint256 newCooldown) external onlyRole(GOVERNANCE_ROLE) {
+        if (newCooldown > MAX_COOLDOWN) revert CooldownTooLarge({ provided: newCooldown, max: MAX_COOLDOWN });
         uint256 old = cooldown;
         cooldown = newCooldown;
         emit CooldownSet(old, newCooldown);
@@ -219,9 +250,11 @@ contract TestnetFaucet is AccessControl, ReentrancyGuard, Pausable {
 
     /// @notice Sweep `amount` TOKEN from this contract to `to`. Pause-independent
     ///         so governance can drain a paused faucet without unpausing it.
-    /// @dev    Modifier order: `onlyRole` runs before `nonReentrant` so an
-    ///         unauthorized caller reverts on the cheap role-check without
-    ///         paying the reentrancy-guard SSTORE.
+    /// @dev    Modifier order: `onlyRole` runs before `nonReentrant` —
+    ///         unauthorized callers revert on the cheap role-check without
+    ///         executing the reentrancy-guard's SSTORE (gas saving on the
+    ///         revert path; equivalent end state since the SSTORE would
+    ///         roll back either way).
     function withdraw(address to, uint256 amount) external onlyRole(GOVERNANCE_ROLE) nonReentrant {
         if (to == address(0)) revert ZeroAddress();
         if (amount == 0) revert ZeroAmount();
