@@ -46,6 +46,24 @@ pub struct StaleTimestamp {
     pub existing_us: u64,
 }
 
+/// Minimum spacing between inline TTL sweeps fired from
+/// [`PeerTable::insert_or_refresh`]'s cap-overflow path (#577 H3 review).
+///
+/// The cap path triggers `evict_expired`, which is an O(N) `HashMap::retain`
+/// scan. Without throttling, a fresh-keypair flood at cap forces a full
+/// 100k-entry scan per signature-valid announce — the write lock is held
+/// the whole time, which would block legitimate refreshes and the 30 s
+/// background sweeper. With a 1 s floor, the worst-case sustained CPU
+/// cost of the inline sweep is bounded at ~one scan/second regardless of
+/// attacker rate; rejected inserts in between are O(1).
+///
+/// The floor isn't an upper bound on slot reclamation: the 30 s background
+/// sweeper (`service::ttl_sweeper_task`) still runs in parallel and
+/// reclaims expired entries on its own cadence. The inline sweep
+/// exists only to shorten the time between a slot expiring and the
+/// next admitted insert when the table is under cap pressure.
+pub const MIN_INLINE_SWEEP_INTERVAL_US: u64 = 1_000_000;
+
 /// In-memory, TTL-bounded peer table.
 #[derive(Debug)]
 pub struct PeerTable {
@@ -55,6 +73,12 @@ pub struct PeerTable {
     /// resolved-config validator rejects `0` so production paths never
     /// hit the unbounded branch, but in-process tests use it.
     max_entries: usize,
+    /// Wall-clock microseconds of the last inline TTL sweep fired from
+    /// [`Self::insert_or_refresh`]'s cap path. `0` is the never-swept
+    /// sentinel that lets the first cap-overflow always trigger a
+    /// sweep. See [`MIN_INLINE_SWEEP_INTERVAL_US`] for the rate-limit
+    /// rationale.
+    last_inline_sweep_us: u64,
 }
 
 impl PeerTable {
@@ -69,6 +93,7 @@ impl PeerTable {
             entries: HashMap::new(),
             ttl_us,
             max_entries,
+            last_inline_sweep_us: 0,
         }
     }
 
@@ -113,13 +138,24 @@ impl PeerTable {
             return Ok(InsertOutcome::Refreshed);
         }
 
-        // New entry. Enforce the hard cap (#577 H3) with a one-shot inline
-        // TTL sweep: under a fresh-keypair flood the table is full of new
-        // entries the 30s background sweeper hasn't reached yet, so the
-        // inline sweep gives expired slots a chance to be reclaimed before
-        // the request is rejected. `max_entries == 0` disables the cap.
+        // New entry. Enforce the hard cap (#577 H3) with a rate-limited
+        // inline TTL sweep: under a fresh-keypair flood the table is full
+        // of fresh entries the 30 s background sweeper hasn't reached, so
+        // the inline sweep gives expired slots a chance to be reclaimed
+        // before the request is rejected. The sweep is throttled to at
+        // most once per `MIN_INLINE_SWEEP_INTERVAL_US` so the attacker
+        // can't force an O(N) `HashMap::retain` per signature-valid
+        // announce — rejected inserts in between are O(1). `max_entries
+        // == 0` disables the cap (test-only escape hatch).
         if self.max_entries > 0 && self.entries.len() >= self.max_entries {
-            self.evict_expired(now_us);
+            // `0` is the never-swept sentinel; otherwise gate on elapsed.
+            // `saturating_sub` keeps this safe under a clock reversal.
+            let due = self.last_inline_sweep_us == 0
+                || now_us.saturating_sub(self.last_inline_sweep_us) >= MIN_INLINE_SWEEP_INTERVAL_US;
+            if due {
+                self.evict_expired(now_us);
+                self.last_inline_sweep_us = now_us;
+            }
             if self.entries.len() >= self.max_entries {
                 return Ok(InsertOutcome::RejectedFull);
             }
@@ -395,6 +431,90 @@ mod tests {
         assert_eq!(t.len(), 1);
         assert!(t.get(&a).is_none());
         assert!(t.get(&b).is_some());
+    }
+
+    #[test]
+    #[allow(clippy::many_single_char_names)] // ids labelled to match the timeline comment
+    fn inline_sweep_is_throttled_under_sustained_flood() {
+        // Defends against the review finding (#656): without throttling, a
+        // fresh-keypair flood at cap forces a full O(N) HashMap::retain
+        // scan per signature-valid announce — moves the original
+        // memory-DoS into a CPU + lock-contention DoS. The throttle is
+        // observed indirectly: insert N=2 entries at the cap, then
+        // expire them, then drive two rejected inserts in the same
+        // throttle window — the second one must remain RejectedFull
+        // because the throttle suppresses the re-sweep that would
+        // otherwise reclaim the expired slots.
+        //
+        // Layout (ttl=100µs, cap=2, all times in µs):
+        //   t=100:        insert A → Inserted
+        //   t=100:        insert B → Inserted (table at cap)
+        //   t=400:        insert C → cap-hit, sweep fires (sentinel 0),
+        //                            A+B both expired, C admitted.
+        //                            last_inline_sweep_us is now 400.
+        //   t=500:        insert D → cap-hit, but 500-400=100 µs <
+        //                            MIN_INLINE_SWEEP_INTERVAL_US (1 s),
+        //                            so the sweep is THROTTLED. C is the
+        //                            only entry and its last_seen=400 is
+        //                            fresh, so even an unthrottled sweep
+        //                            would leave the table at cap.
+        //                            Result: RejectedFull, as expected.
+        //   t=400 + 1s:   insert E → throttle elapsed, sweep fires; C
+        //                            (last_seen=400, ttl=100) is expired
+        //                            at t=1_000_400 (cutoff=1_000_300),
+        //                            reclaimed; E admitted.
+        let mut t = PeerTable::new(100, 2);
+        let a = [20u8; 32];
+        let b = [21u8; 32];
+        let c = [22u8; 32];
+        let d = [23u8; 32];
+        let e = [24u8; 32];
+
+        assert_eq!(
+            t.insert_or_refresh(mk_announce(a, 1), 100).unwrap(),
+            InsertOutcome::Inserted
+        );
+        assert_eq!(
+            t.insert_or_refresh(mk_announce(b, 1), 100).unwrap(),
+            InsertOutcome::Inserted
+        );
+        // First cap-overflow at t=400: sweep fires (sentinel 0), reclaims
+        // both expired entries, C is admitted.
+        assert_eq!(
+            t.insert_or_refresh(mk_announce(c, 1), 400).unwrap(),
+            InsertOutcome::Inserted
+        );
+        assert_eq!(t.len(), 1);
+
+        // Fill the second slot so the table is at cap again, then prove
+        // the throttle binds: at t=500 (< 1 s after the previous sweep),
+        // a fresh-id insert at cap is rejected without a re-sweep — even
+        // though we just expired nothing, the assertion is that the
+        // throttle path runs and returns RejectedFull immediately.
+        // We need the table at cap to exercise the cap branch, so insert
+        // one more first.
+        let filler = [25u8; 32];
+        assert_eq!(
+            t.insert_or_refresh(mk_announce(filler, 1), 400).unwrap(),
+            InsertOutcome::Inserted
+        );
+        assert_eq!(t.len(), 2);
+        // t=500: cap-overflow, throttle binds (500-400=100µs < 1s).
+        assert_eq!(
+            t.insert_or_refresh(mk_announce(d, 1), 500).unwrap(),
+            InsertOutcome::RejectedFull
+        );
+
+        // Pass the throttle window: at t=1_000_400, the elapsed since
+        // the last sweep is exactly MIN_INLINE_SWEEP_INTERVAL_US.
+        // Now C is expired (last_seen=400, ttl=100, cutoff=1_000_300)
+        // and the sweep reclaims it. E is admitted.
+        let post_throttle = 400 + MIN_INLINE_SWEEP_INTERVAL_US;
+        assert_eq!(
+            t.insert_or_refresh(mk_announce(e, 1), post_throttle)
+                .unwrap(),
+            InsertOutcome::Inserted
+        );
     }
 
     #[test]

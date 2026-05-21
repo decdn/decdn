@@ -580,14 +580,15 @@ mod tests {
             fn inc_published(&self, _topic: &str) {}
             fn inc_received(&self, _topic: &str) {}
             fn inc_rejected(&self, reason: &'static str) {
-                if let Ok(mut s) = self.inner.lock() {
-                    s.reject_labels.push(reason);
-                }
+                // The test module already opts into `unwrap_used`. Don't
+                // swallow `PoisonError` with `if let Ok`: silently dropping
+                // recorded events would surface as a confusing "wrong
+                // event count" later instead of pointing at the original
+                // panic that poisoned the mutex.
+                self.inner.lock().unwrap().reject_labels.push(reason);
             }
             fn set_peer_table_size(&self, n: i64) {
-                if let Ok(mut s) = self.inner.lock() {
-                    s.size_gauge_writes.push(n);
-                }
+                self.inner.lock().unwrap().size_gauge_writes.push(n);
             }
             fn inc_reconnected(&self, _topic: &str) {}
         }
