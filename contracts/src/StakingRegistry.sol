@@ -357,7 +357,14 @@ contract StakingRegistry is AccessControl, ReentrancyGuard, Pausable {
 
         // Split: 50% challenger / 30% SafetyReserve / 20% burn.
         // Burn is the remainder so the three legs sum exactly to slashAmount.
+        // The divide-before-multiply pattern (slashAmount was computed by
+        // a prior division) is intentional: rounding dust from the bps
+        // splits is captured in burnShare via subtraction, so no value
+        // is lost. The three-leg sum invariant is exercised by
+        // testFuzz_slash_threeLegsSumToSlashAmount.
+        // slither-disable-next-line divide-before-multiply
         uint256 challengerShare = (slashAmount * CHALLENGER_BPS) / BPS_DENOMINATOR;
+        // slither-disable-next-line divide-before-multiply
         uint256 safetyShare = (slashAmount * SAFETY_BPS) / BPS_DENOMINATOR;
         uint256 burnShare = slashAmount - challengerShare - safetyShare;
 
