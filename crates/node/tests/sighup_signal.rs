@@ -22,7 +22,7 @@
 
 #![cfg(unix)]
 // Tests legitimately call `.unwrap()` / `.expect()` on harness
-// scaffolding. The workspace anti-panic policy is for production code.
+// scaffolding. The workspace anti-panic policy applies to runtime code.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::{Path, PathBuf};

@@ -88,10 +88,10 @@ const DEFAULT_MAX_TRACKED_SOURCES: usize = 4096;
 pub const DEFAULT_GC_INTERVAL_SEC: u64 = 300;
 
 /// Default EIP-712 `chainId` for the `slash_sig` domain separator (ADR 014).
-/// Arbitrum Sepolia — the `PoC` testnet target; matches the chain id bound on
-/// the runtime `PrivateKeySigner` (`decdn_incentive::eth_identity`). When the
-/// production target moves to mainnet this is overridden via
-/// `blockchain.chain_id` (see `appendix-poc-production-seams.md` §Seam 8).
+/// Arbitrum Sepolia — the initial network target; matches the chain id bound
+/// on the runtime `PrivateKeySigner` (`decdn_incentive::eth_identity`). To
+/// target a different chain, override via `blockchain.chain_id` (see
+/// `appendix-poc-production-seams.md` §Seam 8).
 pub const DEFAULT_CHAIN_ID: u64 = 421_614;
 
 /// Default maximum concurrently held (eviction-exempt) blobs for the
@@ -884,10 +884,10 @@ fn origin_identity_key(origin: &crate::config::ResolvedOrigin) -> String {
 /// identity key matches an earlier entry. Two origins pointing at the
 /// same backend can be intentional (connection-pool sharding) but is
 /// usually a copy-paste mistake; warning at startup gives the operator
-/// a chance to notice before debugging a production "why is one origin
-/// being hit twice as often" puzzle. Not an error: ordering still
-/// determines fallback behaviour, and the engine handles duplicate
-/// backends without misbehaviour.
+/// a chance to notice before debugging a "why is one origin being hit
+/// twice as often" puzzle. Not an error: ordering still determines
+/// fallback behaviour, and the engine handles duplicate backends
+/// without misbehaviour.
 fn warn_on_duplicate_origins(origins: &[crate::config::ResolvedOrigin]) {
     let mut seen: std::collections::HashSet<String> =
         std::collections::HashSet::with_capacity(origins.len());
@@ -1296,9 +1296,9 @@ pub fn resolve_payment_into(
             )
         },
     );
-    // PoC-local stand-in for the on-chain `getRateBounds()` (ADR 005 §Rate
-    // bounds validation). Defaults (`0` .. `MAX_RATE_PER_MB`) make the clamp
-    // a no-op so existing deployments see no behavior change.
+    // Locally enforced stand-in for the on-chain `getRateBounds()` (ADR 005
+    // §Rate bounds validation). Defaults (`0` .. `MAX_RATE_PER_MB`) make the
+    // clamp a no-op so existing deployments see no behavior change.
     let delivery_floor = cli
         .delivery_floor
         .or_else(|| file.and_then(|p| p.delivery_floor))
@@ -5730,8 +5730,8 @@ mod tests {
     fn resolve_cache_cli_cache_dir_overrides_file_and_expands_tilde() -> anyhow::Result<()> {
         // Hermetic: inject a stub home so the assertion holds whether or
         // not the host's `dirs::home_dir()` returns Some, and so the
-        // assertion exercises the documented production behaviour
-        // (tilde-expand against $HOME).
+        // assertion exercises the documented behaviour (tilde-expand
+        // against $HOME).
         let home_dir = TempDir::new()?;
         let home = home_dir.path().to_path_buf();
         let mut cli = empty_cache_args();
@@ -5751,7 +5751,7 @@ mod tests {
 
     #[test]
     fn resolve_cache_cli_cache_dir_passes_through_when_home_unavailable() -> anyhow::Result<()> {
-        // Sibling of the above: the production contract is "log + leave
+        // Sibling of the above: the documented contract is "log + leave
         // path unchanged" when `dirs::home_dir()` is None (see
         // `cli::common::expand_tilde`). Verify resolve_cache honours it.
         let mut cli = empty_cache_args();

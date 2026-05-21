@@ -356,8 +356,8 @@ impl ConnectionLimiter {
     /// Cross-module test hook with the same behavior as `acquire`,
     /// minus the iroh `Connection` argument. Exposed as `pub` so unit
     /// tests in other modules and integration tests under `tests/` can
-    /// drive the limiter directly. Production code must not call this —
-    /// `Self::acquire` is the only supported entry point.
+    /// drive the limiter directly. Non-test callers must not invoke this
+    /// — `Self::acquire` is the only supported entry point.
     /// `#[doc(hidden)]` keeps it out of the rendered public API surface.
     #[doc(hidden)]
     pub fn acquire_for_test(&self, peer_ip: Option<IpAddr>) -> Result<Permit, RejectReason> {

@@ -216,8 +216,8 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 
 [payment]
 # rate_per_mb = 10
-# delivery_floor = 0                       # PoC rate-bounds clamp lower bound (ADR 005)
-# delivery_ceiling = 1000000000000         # PoC rate-bounds clamp upper bound; must be >= 1
+# delivery_floor = 0                       # local rate-bounds clamp lower bound (ADR 005)
+# delivery_ceiling = 1000000000000         # local rate-bounds clamp upper bound; must be >= 1
 
 [observability]
 # log_level = "info"

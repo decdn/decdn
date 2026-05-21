@@ -37,7 +37,8 @@
 //! exhausts. After an owner exhausts, however, one waiter may become the
 //! next owner and run its own full retry budget — a sustained outage can
 //! produce up to `N` *sequential* retry budgets across `N` concurrent
-//! waiters. Acceptable at `PoC` scale.
+//! waiters. Accepted as a known trade-off: bounding the amplification would
+//! require a shared retry-budget across waiters, which is not implemented.
 
 use std::future::Future;
 use std::io;

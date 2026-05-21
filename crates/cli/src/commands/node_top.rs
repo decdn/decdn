@@ -1002,7 +1002,7 @@ mod e2e_tests {
     //! In-module rather than a `tests/` integration test because
     //! the assertions exercise `pub(crate)` items (parser +
     //! `Snapshot::from_metrics`); going via `tests/` would force a
-    //! `pub` API surface that no production caller needs.
+    //! `pub` API surface that no non-test caller needs.
 
     use super::*;
     use std::net::SocketAddr;
@@ -1350,9 +1350,9 @@ mod classifier_tests {
     use super::*;
 
     /// Build an `anyhow::Error` from a real reqwest send-error so
-    /// the chain shape matches what `fetch_metrics` would produce
-    /// in production (rather than a hand-constructed mock that
-    /// could diverge from reqwest's internal error structure).
+    /// the chain shape matches what `fetch_metrics` would produce at
+    /// runtime (rather than a hand-constructed mock that could diverge
+    /// from reqwest's internal error structure).
     async fn reqwest_send_error(url: &str) -> anyhow::Error {
         let err = reqwest::Client::new()
             .get(url)

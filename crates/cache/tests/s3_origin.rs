@@ -4,11 +4,10 @@
 //! dispatcher returns canned responses while every other layer (signing,
 //! body framing, modeled-error parsing) runs end-to-end. The SDK's
 //! internal retry layer is **disabled** in every test via
-//! [`mock_s3_client`] / [`mock_s3_client_match_any`], matching the
-//! production posture set by `S3Origin::new`'s
-//! `RetryConfig::disabled()`. This keeps the cache engine's
-//! `cache.origin_retry` policy as the single source of retry budget
-//! and makes per-test dispatch counts deterministic.
+//! [`mock_s3_client`] / [`mock_s3_client_match_any`], matching what
+//! `S3Origin::new` configures (`RetryConfig::disabled()`). This keeps
+//! the cache engine's `cache.origin_retry` policy as the single source
+//! of retry budget and makes per-test dispatch counts deterministic.
 //!
 //! See `crates/cache/tests/pull_through.rs` for the equivalent `wiremock`
 //! suite covering [`decdn_cache::HttpOrigin`].
@@ -31,8 +30,8 @@ use decdn_cache::{
 const BUCKET: &str = "decdn-blobs";
 
 /// Build a mock-backed S3 client with the SDK's internal retry layer
-/// **disabled**, matching the production posture set by `S3Origin::new`
-/// (which configures `aws_config::ConfigLoader::retry_config(RetryConfig::disabled())`).
+/// **disabled**, matching what `S3Origin::new` configures (via
+/// `aws_config::ConfigLoader::retry_config(RetryConfig::disabled())`).
 /// Without this, `mock_client!`'s default would re-enable SDK retries and
 /// every `Transient` test would silently observe extra dispatches.
 ///
@@ -60,7 +59,7 @@ fn s3_origin(client: Client, prefix: &str) -> S3Origin {
     S3Origin::from_parts(client, BUCKET, prefix)
 }
 
-/// Convert a hash to its expected sharded S3 key. Mirrors the production
+/// Convert a hash to its expected sharded S3 key. Mirrors `S3Origin`'s
 /// `key_for` so a regression in the layout would fail this helper rather
 /// than silently mis-assert across multiple tests.
 fn expected_key(prefix: &str, hash: Hash) -> String {

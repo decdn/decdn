@@ -163,8 +163,8 @@ impl OriginFetch {
     /// Drain the stream into a single [`Bytes`]. Returns `Ok(None)`
     /// for `NotFound`, `Ok(Some(bytes))` for `Found`. Used by tests
     /// and other helpers that need the full payload as a contiguous
-    /// buffer; production code on the cache pull-through path goes
-    /// through `add_stream` directly and never collects.
+    /// buffer; the cache pull-through path goes through `add_stream`
+    /// directly and never collects.
     ///
     /// The initial allocation is capped at 1 MiB regardless of
     /// `size_hint` so a hostile origin advertising a multi-TiB

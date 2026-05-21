@@ -2006,9 +2006,9 @@ const fn fast_retry_policy(max_retries: u32) -> RetryPolicy {
         max_backoff_ms: 5,
         jitter_ratio: 0.0,
         // Default-shaped buffer budget so existing tests exercise
-        // the same buffer-then-commit path that production uses for
-        // sub-4-MiB blobs. Mid-stream-retry tests below override this
-        // explicitly when they need to pin a specific code path.
+        // the same buffer-then-commit path the engine uses for sub-4-MiB
+        // blobs. Mid-stream-retry tests below override this explicitly
+        // when they need to pin a specific code path.
         buffered_max_bytes: 4 << 20,
     }
 }

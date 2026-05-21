@@ -233,10 +233,9 @@ impl Origin for FilesystemOrigin {
 /// `CacheError::OriginError` once `temp_tag().await` completes and
 /// the engine inspects the side channel.
 ///
-/// `path_for_log` is captured for the error message so an operator
-/// who hits this in production sees the offending file path. The
-/// path is the canonicalized form (already resolved, so no symlink
-/// trickery in logs).
+/// `path_for_log` is captured for the error message so the operator
+/// log surfaces the offending file path. The path is the canonicalized
+/// form (already resolved, so no symlink trickery in logs).
 fn cap_at_max_bytes<S>(
     stream: S,
     max_bytes: u64,

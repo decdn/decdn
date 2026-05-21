@@ -96,7 +96,8 @@ pub struct Voucher {
     pub nonce: U256,
     /// Cumulative bytes delivered against this channel.
     pub bytes_delivered: U256,
-    /// `ERC-20` token address (`USDC` for the `PoC` `StablePaymentChannel`).
+    /// `ERC-20` token address (`USDC` — the only token bound by
+    /// `StablePaymentChannel`).
     pub token: Address,
 }
 

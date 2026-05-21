@@ -55,16 +55,14 @@ pub const MAX_RATE_PER_MB: u64 = 1_000_000_000_000;
 ///
 /// ADR 014 §1 mandates `slash_sig` is **non-empty** and that requesters MUST
 /// reject missing/zero-length signatures — it does not itself fix a byte
-/// length. In the `PoC` every node signs its own `slash_sig` with a
-/// software-held EOA key (ADR 024 §18: "a software-held signing key … used
-/// as a plain EOA" or wrapped by a 1-of-1 Safe), which is always exactly
-/// this 65-byte form. Variable-length **ERC-1271** smart-account signatures
-/// (ADR 024 production) are verified on-chain by `SlashJudge` via
-/// `SignatureChecker.isValidSignatureNow` (ADR 014 §On-Chain Verification) —
-/// off-chain producers/requesters in the `PoC` are EOA-only, so enforcing
-/// exactly this length is the correct, intentionally-strict `PoC` bound.
-/// When ERC-1271 off-chain handling lands this constant becomes a lower
-/// bound.
+/// length. Off-chain `slash_sig` producers are EOA-only (ADR 024 §18: "a
+/// software-held signing key … used as a plain EOA" or wrapped by a 1-of-1
+/// Safe), which is always exactly this 65-byte form. Variable-length
+/// **ERC-1271** smart-account signatures are verified on-chain by
+/// `SlashJudge` via `SignatureChecker.isValidSignatureNow` (ADR 014
+/// §On-Chain Verification); enforcing exactly this length off-chain is the
+/// correct, intentionally-strict bound for the EOA producer set. When
+/// off-chain ERC-1271 handling lands this constant becomes a lower bound.
 pub const SLASH_SIG_LEN: usize = 65;
 
 /// Errors produced when validating wire-decoded protocol messages.
@@ -84,12 +82,12 @@ pub enum MessageValidationError {
     )]
     RateTooLarge { rate: u64 },
     /// `slash_sig` is missing or not [`SLASH_SIG_LEN`] bytes. ADR 014 §1
-    /// mandates a non-empty signature on every `ProbeResponse`; the `PoC`'s
-    /// EOA-only signing path (ADR 024 §18) makes that exactly
+    /// mandates a non-empty signature on every `ProbeResponse`; the
+    /// EOA-only off-chain signing path (ADR 024 §18) makes that exactly
     /// [`SLASH_SIG_LEN`], which requesters MUST reject deviations from.
     #[error(
         "ProbeResponse.slash_sig has invalid length {len} \
-         (ADR 014 §1: mandatory non-empty; PoC EOA form is {expected} bytes)",
+         (ADR 014 §1: mandatory non-empty; EOA form is {expected} bytes)",
         expected = SLASH_SIG_LEN
     )]
     InvalidSlashSigLen { len: usize },

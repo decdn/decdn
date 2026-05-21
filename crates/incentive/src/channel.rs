@@ -46,7 +46,8 @@ pub struct ChannelState {
     pub channel_id: ChannelId,
     /// The Ethereum address that opened the channel and signs vouchers.
     pub client: Address,
-    /// `ERC-20` token bound by this channel (`USDC` for the `PoC`).
+    /// `ERC-20` token bound by this channel (`USDC` is the only token
+    /// supported by `StablePaymentChannel`).
     pub token: Address,
     /// On-chain deposited amount in token base units. Vouchers MUST NOT
     /// exceed this value.

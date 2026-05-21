@@ -79,10 +79,10 @@ impl CacheError {
     /// `anyhow::Error::chain()` exposes every cause in the chain, and
     /// the typed variant we want lives at the root.
     ///
-    /// Tests assert on the typed variant via `matches!`; production
-    /// observability code can switch on the variant rather than parsing
-    /// `Display` strings. Returns `None` for non-origin failures or
-    /// origin failures that didn't come from `HttpOrigin`'s decoder.
+    /// Tests assert on the typed variant via `matches!`; observability
+    /// code can switch on the variant rather than parsing `Display`
+    /// strings. Returns `None` for non-origin failures or origin failures
+    /// that didn't come from `HttpOrigin`'s decoder.
     pub fn origin_error_kind(&self) -> Option<&OriginError> {
         let Self::OriginError { source, .. } = self else {
             return None;

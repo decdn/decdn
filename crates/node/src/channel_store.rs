@@ -174,7 +174,7 @@ impl PersistentChannelStateStore {
     }
 
     /// Testable form of [`Self::open`] that takes an injectable chmod
-    /// function. Production code calls [`Self::open`], which delegates here
+    /// function. Non-test callers use [`Self::open`], which delegates here
     /// with [`Self::tighten_permissions`]; tests inject a closure that
     /// simulates chmod failure to exercise the cleanup-branch asymmetry
     /// (the security-critical fix for #527 follow-up review).

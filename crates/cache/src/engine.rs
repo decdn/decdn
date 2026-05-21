@@ -615,9 +615,8 @@ impl CacheEngine {
     }
 
     /// Open the cache with full control over policy, metrics, and GC wiring.
-    /// Production callers (the runtime's `build_cache`) use this directly;
-    /// tests usually want [`Self::open`] or [`Self::open_with_pinned`]
-    /// with their defaults.
+    /// The runtime's `build_cache` uses this directly; tests usually want
+    /// [`Self::open`] or [`Self::open_with_pinned`] with their defaults.
     ///
     /// `gc_interval` controls iroh-blobs' built-in GC sweep loop (#518).
     /// [`Duration::ZERO`] disables periodic GC; any other value is forwarded
