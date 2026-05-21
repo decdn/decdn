@@ -163,14 +163,18 @@ forge snapshot --diff .gas-snapshot     # current gas vs committed baseline
 **Local static analysis:**
 
 ```bash
-# Solhint (lint) — uses contracts/package.json
-cd contracts && npm install && npm run lint
+# Solhint (lint) — uses contracts/package.json + package-lock.json
+cd contracts && npm ci && npm run lint
 
 # Slither (SAST) — requires `pip install slither-analyzer`
 cd contracts && slither . --config-file slither.config.json
 
-# Aderyn (SAST) — install via `curl --proto '=https' --tlsv1.2 -LsSf \
-#   https://github.com/Cyfrin/aderyn/releases/latest/download/aderyn-installer.sh | bash`
+# Aderyn (SAST) — install pinned to the version CI uses (aderyn-v0.6.8).
+# Inspect the installer before piping to bash if you don't trust the
+# Cyfrin signing chain; the install URL is reproducible across runs.
+#   curl --proto '=https' --tlsv1.2 -LsSf \
+#     https://github.com/Cyfrin/aderyn/releases/download/aderyn-v0.6.8/aderyn-installer.sh \
+#     | bash
 cd contracts && aderyn .
 ```
 

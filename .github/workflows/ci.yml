@@ -421,7 +421,7 @@ jobs:
         with:
           version: v1.7.1
       - run: forge --version
-      - run: forge build --sizes --deny-warnings
+      - run: forge build --sizes --deny warnings
       - run: forge test -vvv
 
   solidity-coverage:
@@ -466,7 +466,11 @@ jobs:
       - uses: actions/setup-node@v6.4.0
         with:
           node-version: '20'
-      - run: npm install --no-audit --no-fund
+          cache: 'npm'
+          cache-dependency-path: contracts/package-lock.json
+      # npm ci (not npm install) enforces the committed lock file so the
+      # transitive dependency graph stays pinned, not just solhint itself.
+      - run: npm ci --no-audit --no-fund
       - run: npm run lint
 
   solidity-slither:
@@ -477,6 +481,11 @@ jobs:
     permissions:
       contents: read
       security-events: write
+      # codeql-action/upload-sarif calls the workflow_runs API to enrich
+      # SARIF metadata (commit SHA, run URL, branch). Without actions: read
+      # the call 403s and the upload step fails the job after the SARIF
+      # has already been validated.
+      actions: read
     steps:
       - uses: actions/checkout@v6.0.2
         with:
@@ -509,6 +518,9 @@ jobs:
     permissions:
       contents: read
       security-events: write
+      # See solidity-slither permissions note above — same upload-sarif
+      # behavior here.
+      actions: read
     defaults:
       run:
         working-directory: contracts
@@ -563,7 +575,15 @@ jobs:
         # We deliberately do not pass --check (which would fail CI on any
         # delta); contract changes legitimately move gas, and the signal
         # belongs in the PR comment, not as a hard block.
-        run: forge snapshot --diff .gas-snapshot > /tmp/gas-diff.txt || true
+        #
+        # Fail the step if `forge snapshot` itself errors (compile / test
+        # failure, missing baseline, etc.) — otherwise an empty diff file
+        # would silently post as "No gas changes vs base". An empty
+        # diff from a successful run remains valid and is reported as
+        # "No gas changes" by the comment script.
+        run: |
+          set -o pipefail
+          forge snapshot --diff .gas-snapshot > /tmp/gas-diff.txt
       - name: Post comment
         # Fork PRs have read-only GITHUB_TOKEN; createComment would 403.
         if: github.event.pull_request.head.repo.full_name == github.repository

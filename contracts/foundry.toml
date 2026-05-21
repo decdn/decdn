@@ -51,4 +51,14 @@ int_types = "long"
 quote_style = "double"
 number_underscore = "thousands"
 
+# forge-lint exclusions. block-timestamp fires on StakingRegistry's
+# unbonding check (block.timestamp < req.unlockAt). Validator clock-drift
+# manipulation is bounded by consensus tolerance (seconds), dwarfed by the
+# unbonding period (days, per ADR 003) — the comparison is the explicit
+# design. Suppressed at project level rather than inline so the directive
+# is portable across forge versions (older releases don't recognize
+# unknown lint ids and treat them as warnings, breaking --deny-warnings).
+[lint]
+exclude_lints = ["block-timestamp"]
+
 # Issue: https://github.com/decdn/decdn/issues/452 — full 14-contract surface.
