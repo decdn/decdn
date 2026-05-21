@@ -552,12 +552,13 @@ jobs:
     if: needs.changes.outputs.solidity == 'true' || github.event_name != 'pull_request'
     permissions:
       contents: read
-      security-events: write
-      # codeql-action/upload-sarif calls the workflow_runs API to enrich
-      # SARIF metadata (commit SHA, run URL, branch). Without actions: read
-      # the call 403s and the upload step fails the job after the SARIF
-      # has already been validated.
-      actions: read
+      # GitHub Advanced Security is NOT enabled on decdn/decdn (private
+      # repo, no GHAS license), so the SARIF upload step below is
+      # commented out. The slither-action's `fail-on: medium` is still
+      # the authoritative CI gate (findings ≥ medium fail the job and
+      # surface in the run log). Re-enable the upload step + add back
+      # `security-events: write` and `actions: read` permissions if
+      # GHAS is ever turned on or the repo flips public.
     steps:
       - uses: actions/checkout@v6.0.2
         with:
@@ -575,18 +576,18 @@ jobs:
           slither-config: contracts/slither.config.json
           sarif: results.sarif
           fail-on: medium
-      - name: Upload SARIF
-        # always(): SARIF should reach code-scanning even when slither fails
-        # CI so reviewers can see the findings list, not just a red X.
-        # Code scanning requires GitHub Advanced Security on a private repo;
-        # GHAS is enabled on this repo, so a failed upload is a real signal
-        # (token-scope drift, schema rejection, billing lapse) and the step
-        # is no longer continue-on-error.
-        if: always() && steps.slither.outputs.sarif != ''
-        uses: github/codeql-action/upload-sarif@v4.35.5
-        with:
-          sarif_file: ${{ steps.slither.outputs.sarif }}
-          category: slither
+      # SARIF upload disabled until GHAS is enabled on this repo (see
+      # job-level permissions comment above). Restore by uncommenting
+      # the step below and adding `security-events: write` + `actions:
+      # read` back to `permissions:`. The slither step still produces
+      # results.sarif on disk; only the upload-to-code-scanning is
+      # gated.
+      # - name: Upload SARIF
+      #   if: always() && steps.slither.outputs.sarif != ''
+      #   uses: github/codeql-action/upload-sarif@v4.35.5
+      #   with:
+      #     sarif_file: ${{ steps.slither.outputs.sarif }}
+      #     category: slither
 
   solidity-aderyn:
     name: solidity aderyn
