@@ -452,6 +452,11 @@ pub async fn run(
         Arc::clone(&record_store),
     ));
 
+    // The DHT handler builds its own routing table internally; grab a
+    // shared handle so the bootstrap path + republish + bucket-refresh
+    // tasks can all operate on the same instance.
+    let dht_routing = dht_handler.routing_table();
+
     let router = Router::builder(ep.clone())
         .accept(ProbeHandler::ALPN, probe_handler)
         .accept(DhtHandler::ALPN, dht_handler)
@@ -460,6 +465,21 @@ pub async fn run(
             LimitedHandler::new(gossip.clone(), Arc::clone(&limiter)),
         )
         .spawn();
+
+    // Bootstrap (ADR 022 §Bootstrap): seed the routing table from the
+    // active-staker set + parallel `FindNode(self.node_id)` against a
+    // fan-out of seeds. Best-effort — failures here log but don't
+    // abort startup.
+    let bootstrap_outcome =
+        crate::dht::bootstrap::bootstrap(&ep, secret_key.public(), &dht_routing, &staker_set).await;
+    tracing::info!(
+        seeds = bootstrap_outcome.seeds_seen,
+        inserted = bootstrap_outcome.seeds_inserted,
+        find_node_ok = bootstrap_outcome.find_node_ok,
+        find_node_err = bootstrap_outcome.find_node_err,
+        closer_added = bootstrap_outcome.closer_peers_inserted,
+        "dht bootstrap complete"
+    );
 
     let metrics_addr = std::net::SocketAddr::new(
         cfg.observability.metrics_bind,
@@ -506,6 +526,43 @@ pub async fn run(
         Arc::clone(&record_store),
         record_store_gc_stop_rx,
         DISPATCH_GC_INTERVAL,
+    ));
+
+    // DHT republish scheduler (ADR 022 §STORE Flow). Subscribes to
+    // cache-insert events; for every committed blob it schedules a
+    // jittered (30–50 min) republish to the K+3 closest peers. Cold-
+    // start records (blobs already in cache at startup) get a
+    // uniform(0, 40min) first-publish window — ADR 022 §Bootstrap.
+    //
+    // The "iter every cached hash at startup" cold-start path is
+    // deferred: `CacheEngine` does not yet expose a hash-iteration
+    // accessor, and the use case (a node restarting with thousands of
+    // cached blobs) is uncommon for the initial network. Subsequent
+    // commits via `subscribe_inserts` cover the steady-state path.
+    let republish_scheduler = Arc::new(crate::dht::RepublishScheduler::new());
+    let (republish_stop_tx, republish_stop_rx) = oneshot::channel::<()>();
+    let cache_inserts_rx = cache.subscribe_inserts();
+    tasks.spawn(crate::dht::publish::run_republish(
+        ep.clone(),
+        secret_key.public(),
+        Arc::clone(&dht_routing),
+        Arc::clone(&republish_scheduler),
+        cache_inserts_rx,
+        republish_stop_rx,
+    ));
+
+    // DHT bucket-refresh (ADR 022 §Routing Table). Once per hour
+    // picks the bucket with the oldest last-refresh timestamp and
+    // runs `FindNode(random_id_in_bucket)` against the bucket's
+    // freshest peer to repopulate it. Best-effort hygiene — a failed
+    // refresh is silently retried on the next tick.
+    let (bucket_refresh_stop_tx, bucket_refresh_stop_rx) = oneshot::channel::<()>();
+    tasks.spawn(crate::dht::bucket_refresh::run_bucket_refresh(
+        ep.clone(),
+        secret_key.public(),
+        Arc::clone(&dht_routing),
+        bucket_refresh_stop_rx,
+        crate::dht::bucket_refresh::BUCKET_REFRESH_TICK,
     ));
 
     // RPC connectivity watchdog (issue #283). Updates `decdn_rpc_healthy`
@@ -720,6 +777,8 @@ pub async fn run(
     // operator-actionable signal to log at this seam.
     let _ = dispatch_gc_stop_tx.send(());
     let _ = record_store_gc_stop_tx.send(());
+    let _ = republish_stop_tx.send(());
+    let _ = bucket_refresh_stop_tx.send(());
     // Admin server shutdown is ordered per `admin_stop_order`:
     //
     //   - `Early` (the default, including SIGTERM/SIGINT and plain

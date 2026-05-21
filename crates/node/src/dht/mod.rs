@@ -13,11 +13,19 @@
 //! requester-side `FindValue` lookup and the republish scheduler land
 //! in PR 4 of #320.
 
+pub mod bootstrap;
+pub mod bucket_refresh;
+pub mod client;
+pub mod origin;
+pub mod publish;
 pub mod rate_limit;
 pub mod records;
 pub mod routing;
 pub mod staker_set;
 
+pub use bootstrap::{BootstrapOutcome, bootstrap};
+pub use origin::{ConfigOriginDirectory, OriginDirectory};
+pub use publish::RepublishScheduler;
 pub use rate_limit::{DhtRateLimiter, DhtRejectLayer};
 pub use records::{InsertOutcome, RecordStore, RecordStoreConfig};
 pub use routing::{NODE_ID_LEN, NodeId, RoutingTable, xor_distance};
