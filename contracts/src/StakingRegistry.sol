@@ -127,10 +127,10 @@ contract StakingRegistry is AccessControl, ReentrancyGuard, Pausable {
     /// @notice Per-operator unbonding request. At most one in-flight.
     /// @dev    Both fields are `uint256` for consistency with the contract's
     ///         other timestamp + balance storage (`lastSettlementAt`,
-    ///         `activeStake`) — packing this struct into a single slot would
-    ///         save one SSTORE per `requestUnstake` but at the cost of
-    ///         needing two narrowing casts (`uint128`, `uint64`) that audit
-    ///         then has to reason about.
+    ///         `activeStake`). `unlockAt`'s `uint256` typing is the binding
+    ///         constraint — the struct cannot pack into one slot regardless
+    ///         of `amount`'s type — so no narrowing-cast trade-off is left
+    ///         on the table.
     struct UnbondingRequest {
         uint256 amount;
         uint256 unlockAt;
@@ -196,8 +196,9 @@ contract StakingRegistry is AccessControl, ReentrancyGuard, Pausable {
     event EjectedByBlacklist(address indexed operator);
     event Reinstated(address indexed operator);
     /// @dev `block.timestamp` is implicit on every log via the block header;
-    ///      a redundant explicit timestamp would only inflate calldata costs
-    ///      for indexers that already have the canonical value.
+    ///      a redundant explicit timestamp would only inflate the log-data
+    ///      gas paid by the caller for a value indexers can already read
+    ///      from the block.
     event SettlementRecorded(address indexed operator);
     event MinStakeUpdated(uint256 oldValue, uint256 newValue);
     event UnbondingPeriodUpdated(uint256 oldValue, uint256 newValue);

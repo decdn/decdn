@@ -28,7 +28,7 @@ contract StakingRegistryTest is Test {
     function setUp() public {
         token = new Token(admin);
         safetyReserve = new MockSafetyReserve();
-        reg = new StakingRegistry(ERC20Burnable(address(token)), admin, MIN_STAKE, UNBONDING_PERIOD);
+        reg = new StakingRegistry(token, admin, MIN_STAKE, UNBONDING_PERIOD);
 
         vm.startPrank(admin);
         reg.grantRole(reg.SLASH_ROLE(), slashJudge);
@@ -68,21 +68,21 @@ contract StakingRegistryTest is Test {
 
     function test_constructor_revertsOnZeroAdmin() public {
         vm.expectRevert(StakingRegistry.ZeroAddress.selector);
-        new StakingRegistry(ERC20Burnable(address(token)), address(0), MIN_STAKE, UNBONDING_PERIOD);
+        new StakingRegistry(token, address(0), MIN_STAKE, UNBONDING_PERIOD);
     }
 
     function test_constructor_revertsOnOutOfBoundsMinStake() public {
         vm.expectRevert();
-        new StakingRegistry(ERC20Burnable(address(token)), admin, 1e18, UNBONDING_PERIOD);
+        new StakingRegistry(token, admin, 1e18, UNBONDING_PERIOD);
         vm.expectRevert();
-        new StakingRegistry(ERC20Burnable(address(token)), admin, 10_000_000e18, UNBONDING_PERIOD);
+        new StakingRegistry(token, admin, 10_000_000e18, UNBONDING_PERIOD);
     }
 
     function test_constructor_revertsOnOutOfBoundsUnbondingPeriod() public {
         vm.expectRevert();
-        new StakingRegistry(ERC20Burnable(address(token)), admin, MIN_STAKE, 1 days);
+        new StakingRegistry(token, admin, MIN_STAKE, 1 days);
         vm.expectRevert();
-        new StakingRegistry(ERC20Burnable(address(token)), admin, MIN_STAKE, 60 days);
+        new StakingRegistry(token, admin, MIN_STAKE, 60 days);
     }
 
     // -----------------------------------------------------------------
