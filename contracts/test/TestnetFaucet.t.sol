@@ -12,6 +12,7 @@ import { ERC20 } from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import { Pausable } from "@openzeppelin/contracts/utils/Pausable.sol";
 import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.sol";
+import { IERC20Errors } from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 
 contract TestnetFaucetTest is Test {
     Token internal token;
@@ -161,14 +162,19 @@ contract TestnetFaucetTest is Test {
 
     function test_constructor_revertsWhenTreasuryNotApproved() public {
         // Treasury holds the supply but has NOT approved the predicted faucet
-        // address. `safeTransferFrom` inside the constructor must revert
-        // (OZ's ERC20InsufficientAllowance); the test pins that this is a
-        // hard failure — if anyone ever swapped `safeTransferFrom` for plain
-        // `transferFrom`, the constructor would silently leave a half-broken
-        // faucet (deployed but unfunded).
+        // address. `safeTransferFrom` inside the constructor must revert with
+        // OZ's `ERC20InsufficientAllowance(spender, allowance, needed)` —
+        // pinning the exact selector + args so a future regression that
+        // introduces an unrelated *earlier* revert (e.g. someone re-orders
+        // the constructor checks and a different one fires first) cannot
+        // silently pass this test.
         Token t = new Token(treasury);
-        // No prior `t.approve(predicted, ...)` here.
-        vm.expectRevert();
+        address predicted = vm.computeCreateAddress(address(this), vm.getNonce(address(this)));
+        // No prior `t.approve(predicted, ...)` — that's the test premise.
+
+        vm.expectRevert(
+            abi.encodeWithSelector(IERC20Errors.ERC20InsufficientAllowance.selector, predicted, 0, INITIAL_FUNDING)
+        );
         new TestnetFaucet(
             IERC20(address(t)), treasury, INITIAL_FUNDING, CLAIM_AMOUNT, COOLDOWN, admin, governance, pauser
         );
