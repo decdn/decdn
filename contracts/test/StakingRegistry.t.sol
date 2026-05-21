@@ -4,9 +4,9 @@ pragma solidity 0.8.28;
 import { Test } from "forge-std/Test.sol";
 import { Token } from "../src/Token.sol";
 import { StakingRegistry } from "../src/StakingRegistry.sol";
-import { IBurnableERC20 } from "../src/interfaces/IBurnableERC20.sol";
 import { ISafetyReserve } from "../src/interfaces/ISafetyReserve.sol";
 import { MockSafetyReserve } from "./mocks/MockSafetyReserve.sol";
+import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
 import { Pausable } from "@openzeppelin/contracts/utils/Pausable.sol";
 
 contract StakingRegistryTest is Test {
@@ -28,7 +28,7 @@ contract StakingRegistryTest is Test {
     function setUp() public {
         token = new Token(admin);
         safetyReserve = new MockSafetyReserve();
-        reg = new StakingRegistry(IBurnableERC20(address(token)), admin, MIN_STAKE, UNBONDING_PERIOD);
+        reg = new StakingRegistry(token, admin, MIN_STAKE, UNBONDING_PERIOD);
 
         vm.startPrank(admin);
         reg.grantRole(reg.SLASH_ROLE(), slashJudge);
@@ -63,26 +63,26 @@ contract StakingRegistryTest is Test {
 
     function test_constructor_revertsOnZeroToken() public {
         vm.expectRevert(StakingRegistry.ZeroAddress.selector);
-        new StakingRegistry(IBurnableERC20(address(0)), admin, MIN_STAKE, UNBONDING_PERIOD);
+        new StakingRegistry(ERC20Burnable(address(0)), admin, MIN_STAKE, UNBONDING_PERIOD);
     }
 
     function test_constructor_revertsOnZeroAdmin() public {
         vm.expectRevert(StakingRegistry.ZeroAddress.selector);
-        new StakingRegistry(IBurnableERC20(address(token)), address(0), MIN_STAKE, UNBONDING_PERIOD);
+        new StakingRegistry(token, address(0), MIN_STAKE, UNBONDING_PERIOD);
     }
 
     function test_constructor_revertsOnOutOfBoundsMinStake() public {
         vm.expectRevert();
-        new StakingRegistry(IBurnableERC20(address(token)), admin, 1e18, UNBONDING_PERIOD);
+        new StakingRegistry(token, admin, 1e18, UNBONDING_PERIOD);
         vm.expectRevert();
-        new StakingRegistry(IBurnableERC20(address(token)), admin, 10_000_000e18, UNBONDING_PERIOD);
+        new StakingRegistry(token, admin, 10_000_000e18, UNBONDING_PERIOD);
     }
 
     function test_constructor_revertsOnOutOfBoundsUnbondingPeriod() public {
         vm.expectRevert();
-        new StakingRegistry(IBurnableERC20(address(token)), admin, MIN_STAKE, 1 days);
+        new StakingRegistry(token, admin, MIN_STAKE, 1 days);
         vm.expectRevert();
-        new StakingRegistry(IBurnableERC20(address(token)), admin, MIN_STAKE, 60 days);
+        new StakingRegistry(token, admin, MIN_STAKE, 60 days);
     }
 
     // -----------------------------------------------------------------
@@ -148,7 +148,7 @@ contract StakingRegistryTest is Test {
         reg.requestUnstake(MIN_STAKE);
 
         assertEq(reg.activeStake(operator), MIN_STAKE);
-        (uint128 amount, uint64 unlockAt) = reg.unbondingOf(operator);
+        (uint256 amount, uint256 unlockAt) = reg.unbondingOf(operator);
         assertEq(amount, MIN_STAKE);
         assertEq(unlockAt, block.timestamp + UNBONDING_PERIOD);
     }
@@ -192,7 +192,7 @@ contract StakingRegistryTest is Test {
         reg.unstake();
 
         assertEq(token.balanceOf(operator), operatorBalanceBefore + MIN_STAKE);
-        (uint128 amount,) = reg.unbondingOf(operator);
+        (uint256 amount,) = reg.unbondingOf(operator);
         assertEq(amount, 0);
     }
 
@@ -285,7 +285,7 @@ contract StakingRegistryTest is Test {
         assertEq(slashed, 5000e18, "5% of full at-risk");
         // Active reduced first.
         assertEq(reg.activeStake(operator), 55_000e18);
-        (uint128 unbondingAmount,) = reg.unbondingOf(operator);
+        (uint256 unbondingAmount,) = reg.unbondingOf(operator);
         assertEq(unbondingAmount, 40_000e18, "unbonding untouched (active absorbed full slash)");
     }
 
@@ -300,7 +300,7 @@ contract StakingRegistryTest is Test {
 
         assertEq(slashed, 5000e18);
         assertEq(reg.activeStake(operator), 0);
-        (uint128 unbondingAmount,) = reg.unbondingOf(operator);
+        (uint256 unbondingAmount,) = reg.unbondingOf(operator);
         assertEq(unbondingAmount, 95_000e18, "unbonding absorbed 4_000");
     }
 
