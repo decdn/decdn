@@ -294,6 +294,9 @@ contract StakingRegistry is AccessControl, ReentrancyGuard, Pausable {
     function unstake() external nonReentrant whenNotPaused {
         UnbondingRequest memory req = unbondingOf[msg.sender];
         if (req.amount == 0) revert NoUnbondingRequest();
+        // Validator timestamp manipulation is bounded by consensus drift
+        // (seconds) and dwarfed by the unbonding period (days per ADR 003).
+        // forge-lint: disable-next-line(block-timestamp)
         if (block.timestamp < req.unlockAt) revert UnbondingNotComplete(req.unlockAt);
 
         delete unbondingOf[msg.sender];
@@ -341,18 +344,23 @@ contract StakingRegistry is AccessControl, ReentrancyGuard, Pausable {
         lifetimeOffenseCount[operator] = newCount;
         uint256 tierBps = newCount == 1 ? SLASH_BPS_TIER_1 : newCount == 2 ? SLASH_BPS_TIER_2 : SLASH_BPS_TIER_3;
 
-        // Slash applies to total at-risk stake (active + unbonding).
-        UnbondingRequest memory req = unbondingOf[operator];
-        uint256 totalAtRisk = activeStake[operator] + uint256(req.amount);
-        slashAmount = (totalAtRisk * tierBps) / BPS_DENOMINATOR;
+        // Block scopes `req`, `totalAtRisk`, and `remainder` so they release
+        // their stack slots before the share locals + `autoEject` bool are
+        // declared below — otherwise the function overflows Solidity's
+        // 16-slot stack limit (compile fails without via_ir).
+        {
+            UnbondingRequest memory req = unbondingOf[operator];
+            uint256 totalAtRisk = activeStake[operator] + uint256(req.amount);
+            slashAmount = (totalAtRisk * tierBps) / BPS_DENOMINATOR;
 
-        // Reduce active stake first, then unbonding bucket.
-        if (slashAmount <= activeStake[operator]) {
-            activeStake[operator] -= slashAmount;
-        } else {
-            uint256 remainder = slashAmount - activeStake[operator];
-            activeStake[operator] = 0;
-            unbondingOf[operator].amount = req.amount - remainder;
+            // Reduce active stake first, then unbonding bucket.
+            if (slashAmount <= activeStake[operator]) {
+                activeStake[operator] -= slashAmount;
+            } else {
+                uint256 remainder = slashAmount - activeStake[operator];
+                activeStake[operator] = 0;
+                unbondingOf[operator].amount = req.amount - remainder;
+            }
         }
 
         // Split: 50% challenger / 30% SafetyReserve / 20% burn.
@@ -368,39 +376,29 @@ contract StakingRegistry is AccessControl, ReentrancyGuard, Pausable {
         uint256 safetyShare = (slashAmount * SAFETY_BPS) / BPS_DENOMINATOR;
         uint256 burnShare = slashAmount - challengerShare - safetyShare;
 
+        // Checks-effects-interactions: decide the eject status from
+        // post-slash state and commit it BEFORE the external calls below.
+        // ADR 026 — "auto-ejection at 50% of minimum stake"; triggered on
+        // the *active* leg only since an operator with stake in unbonding
+        // is already exiting. AutoEjected emit is deferred to the end so
+        // log order in indexers still reads "transfers, then eject".
+        bool autoEject = activeStake[operator] < (minStake / 2) && !ejected[operator];
+        if (autoEject) {
+            ejected[operator] = true;
+        }
+
         if (challengerShare != 0) {
             IERC20(address(token)).safeTransfer(challenger, challengerShare);
         }
         if (safetyShare != 0) {
             IERC20(address(token)).safeTransfer(address(safetyReserve), safetyShare);
-            // Both static analyzers (slither reentrancy-benign, aderyn
-            // reentrancy-state-change) flag this external call →
-            // `ejected[operator] = true` below as a CEI violation. The
-            // pattern is safe in practice: slash() carries the
-            // ReentrancyGuard `nonReentrant` modifier (line 331), the
-            // `ejected` flag is purely informational (it does not gate
-            // any external call within slash()), and both call targets
-            // (TOKEN, SafetyReserve) are admin-configured trusted
-            // contracts. A CEI-clean refactor that moves the state
-            // write before the external calls requires an extra local
-            // variable, which pushes slash() over Solidity's stack
-            // limit (would need via_ir). The current ordering is the
-            // explicit design.
-            // slither-disable-next-line reentrancy-benign
-            // aderyn-fp-next-line(reentrancy-state-change)
             safetyReserve.recordSlashInflow(operator, safetyShare);
         }
         if (burnShare != 0) {
-            // slither-disable-next-line reentrancy-benign
-            // aderyn-fp-next-line(reentrancy-state-change)
             token.burn(burnShare);
         }
 
-        // Auto-ejection check (ADR 026 — "auto-ejection at 50% of
-        // minimum stake"). Triggered on the *active* leg only; an
-        // operator with stake in unbonding is already exiting.
-        if (activeStake[operator] < (minStake / 2) && !ejected[operator]) {
-            ejected[operator] = true;
+        if (autoEject) {
             emit AutoEjected(operator, activeStake[operator]);
         }
 
