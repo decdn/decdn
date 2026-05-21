@@ -144,6 +144,55 @@ cargo fmt -- --check                 # check formatting
 cargo deny check                     # license + advisory audit (deny.toml)
 ```
 
+## Solidity development
+
+Contracts live in `contracts/` and use [Foundry](https://book.getfoundry.sh). CI pins Foundry to `v1.7.1`; install a matching local toolchain via [`foundryup`](https://book.getfoundry.sh/getting-started/installation).
+
+**Common commands (run from `contracts/`):**
+
+```bash
+forge fmt --check                       # formatting check (CI gate)
+forge build --sizes --deny-warnings     # build + report sizes; fail on warnings (CI gate)
+forge test                              # default profile: 256 fuzz, 32-depth invariants
+FOUNDRY_PROFILE=ci forge test           # 1024 fuzz, 256/50-depth (matches CI)
+FOUNDRY_PROFILE=fuzz forge test         # 10k fuzz, 1024/100-depth (nightly/manual)
+FOUNDRY_PROFILE=coverage forge coverage --report lcov
+forge snapshot --diff .gas-snapshot     # current gas vs committed baseline
+```
+
+**Local static analysis:**
+
+```bash
+# Solhint (lint) — uses contracts/package.json
+cd contracts && npm install && npm run lint
+
+# Slither (SAST) — requires `pip install slither-analyzer`
+cd contracts && slither . --config-file slither.config.json
+
+# Aderyn (SAST) — install via `curl --proto '=https' --tlsv1.2 -LsSf \
+#   https://github.com/Cyfrin/aderyn/releases/latest/download/aderyn-installer.sh | bash`
+cd contracts && aderyn .
+```
+
+The pre-commit hooks run `forge-fmt` and `solhint` on every commit; `forge-build` and `forge-test` on `git push`; `slither` and `aderyn` are manual-stage (`pre-commit run --hook-stage manual <id>`).
+
+**Updating the gas snapshot baseline:**
+
+When a contract change legitimately moves gas, regenerate the committed snapshot in the same PR:
+
+```bash
+cd contracts && FOUNDRY_PROFILE=ci forge snapshot --snap .gas-snapshot
+git add .gas-snapshot
+```
+
+The `solidity-gas-snapshot` CI job posts a sticky PR comment with the diff so reviewers can confirm the change was intentional.
+
+**Interpreting CI findings:**
+
+- **Slither / Aderyn** results upload to GitHub's Security → Code scanning tab. Medium-and-above slither findings fail CI. For true positives, fix the contract. For confirmed false positives, suppress *inline* (`// slither-disable-next-line <detector>` with a comment justifying the suppression) — never expand the global exclusion list in `slither.config.json`.
+- **Solhint** failures point at code; fix the code rather than disabling the rule. Rule changes require a separate PR with rationale. Solhint lints `contracts/src/` only; test files (Foundry's `test_xxx_yyy` convention) are out of scope by design.
+- **Coverage** posts to Codecov under the `contracts` flag, alongside the Rust report.
+
 ## Rust Toolchain
 
 `rust-toolchain.toml` pins an exact stable release (currently `1.95.0`); CI uses the same pin via `dtolnay/rust-toolchain@1.95.0` so pre-commit's `cargo clippy` runs the identical lint set as CI. Under a rustup-managed `cargo` (what the devcontainer ships), the pinned toolchain auto-installs and is selected on first `cargo` invocation; other setups need to install `1.95.0` manually.
