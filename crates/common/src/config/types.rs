@@ -492,10 +492,29 @@ pub struct SecurityConfig {
 /// `[dht]` section — `cdn/dht/v1` settings (ADR 022).
 ///
 /// The Kademlia routing-table parameters (k, α, bucket count, refresh
-/// interval) are pinned by the protocol and not exposed here. Only the
-/// rate-limit knobs are operator-tunable; their defaults are conservative
-/// ceilings on adversarial load per ADR 022 §DHT Rate Limiting "Why three
-/// layers, not one", not steady-state operating targets.
+/// interval) are pinned by the protocol and not exposed here. The
+/// rate-limit knobs nest under `[dht.rate_limit]` to match ADR 022 §DHT
+/// Rate Limiting "Trusted-IP exemption" (`dht.rate_limit.trusted_ips`)
+/// and to leave room for other future `dht.*` top-level knobs (e.g.
+/// bootstrap peers, republish overrides) without breaking the operator
+/// key path.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DhtConfig {
+    /// Rate-limiter settings (ADR 022 §DHT Rate Limiting). Absent =>
+    /// the defaults from the ADR (20/100/1000 req/s with 40/200/2000
+    /// bursts).
+    pub rate_limit: Option<DhtRateLimitConfig>,
+}
+
+/// `[dht.rate_limit]` — three-layer token-bucket settings (ADR 022 §DHT
+/// Rate Limiting).
+///
+/// Defaults match the ADR's conservative ceilings on adversarial load;
+/// they are NOT steady-state operating targets — the ADR's bandwidth
+/// analysis (§DHT Bandwidth Analysis "Headroom against rate limits")
+/// shows realistic node traffic is two orders of magnitude below the
+/// per-peer cap.
 ///
 /// Setting any `*_rate_per_sec` to `0.0` disables that layer (operator
 /// opt-out); the matching `*_burst` must also be `0` to avoid a deny-all
@@ -503,7 +522,7 @@ pub struct SecurityConfig {
 /// `security.per_source_rate_per_sec` / `per_source_burst` are paired.
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DhtConfig {
+pub struct DhtRateLimitConfig {
     /// Per-peer (source `NodeId`) sustained rate. Absent => 20 req/s
     /// (ADR 022 §DHT Rate Limiting). `0.0` disables the layer.
     pub per_peer_rate_per_sec: Option<f64>,

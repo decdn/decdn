@@ -1,14 +1,19 @@
 //! `cdn/dht/v1` handler (ADR 022) — Kademlia content discovery.
 //!
-//! Current PR slice (#320): only [`wire::FindNodeRequest`] is honored. The other
-//! `DhtMessage` variants are answered with safe placeholder responses
-//! (`StoreAck { accepted: false }`, empty `FindValueResponse`) so an
-//! upgraded peer can still send any variant without the connection
-//! getting torn down with a protocol error. Real handling for `Store` and
-//! `FindValue` lands in PR 3 of #320; the placeholder shape matches the
-//! ADR 013 §Schema Evolution "unknown variants silently dropped" pattern
-//! at the *behaviour* level even though the variants themselves are
-//! known.
+//! Current slice (PR 2 of #320):
+//!
+//! - `FindNode` is fully honored against the in-memory routing table.
+//! - `FindValue` and `Store` produce placeholder responses (empty
+//!   `providers` + the K-closest peers; `accepted: false`). Real
+//!   admission lands in PR 3 of #320.
+//! - `BatchStore` is rejected at frame read with `APP_ERR_UNSUPPORTED_MESSAGE`
+//!   (`0x01`). The wire variant exists at its ADR-022 canonical
+//!   discriminant so a future handler doesn't shuffle wire positions,
+//!   but per ADR 022 §Schema Evolution + §STORE Flow line 138 the
+//!   unsupported signal MUST be **stream-close-without-ack** —
+//!   publishers detect that and fall back to per-hash `Store`.
+//! - Response variants arriving on a server-accepted stream are
+//!   similarly rejected with `APP_ERR_UNSUPPORTED_MESSAGE`.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -181,6 +186,14 @@ impl DhtHandler {
             // Table demands for table insertion.
             self.note_peer_seen(peer_node_id);
             if let Err(e) = self.handle_one(send, recv).await {
+                // The per-request error already carries the ADR 013 app
+                // error code via the stream reset inside `handle_one` /
+                // `read_dht_request`; here we surface the failure to
+                // operators via a debug log AND a counter bump so a node
+                // running at default `RUST_LOG=info` still reflects "DHT
+                // requests are failing" in scrapes without needing log
+                // verbosity changes.
+                self.metrics.dht_request_failed();
                 tracing::debug!(error = %e, "dht request handling failed");
                 // Drop this stream and continue accepting; the peer may
                 // succeed on the next request.
@@ -244,22 +257,26 @@ impl DhtHandler {
         Ok(())
     }
 
-    /// Convert a decoded request into a response. Variants other than
-    /// `FindNode` get safe placeholder responses for now (see module docs).
+    /// Convert a decoded request into a response. The argument's enum
+    /// shape encodes the precondition that this is one of the request
+    /// variants the handler implements — `read_dht_request` filters out
+    /// responses-on-server-stream and unsupported requests (`BatchStore`)
+    /// before producing a [`DhtServerRequest`], so this match is
+    /// exhaustive over the active set without needing a panic or echo
+    /// fallback for the impossible cases.
     //
-    // `msg` is moved-in so the match arms can take ownership of
-    // `req.providers` / `req.closer_nodes` in later PR slices without
-    // re-allocating. Even though every PR-2 arm could work with `&msg`
-    // since the current request types are `Copy`, the by-value signature
-    // is the steady-state shape; the lint is a false positive against
-    // the not-yet-written PR-3 record-store insertion paths.
+    // `msg` is moved-in so future PR slices' record-store insertion
+    // paths can take ownership of larger payloads (e.g. the
+    // FindValueResponse providers Vec) without re-allocating. Every
+    // current request variant is `Copy`, so by-value is a no-op at the
+    // ABI level today; the by-value signature is the steady-state shape.
     #[allow(clippy::needless_pass_by_value)]
-    fn dispatch(&self, msg: wire::DhtMessage) -> wire::DhtMessage {
+    fn dispatch(&self, msg: DhtServerRequest) -> wire::DhtMessage {
         match msg {
-            wire::DhtMessage::FindNode(req) => {
+            DhtServerRequest::FindNode(req) => {
                 wire::DhtMessage::FindNodeResponse(self.handle_find_node(req))
             }
-            wire::DhtMessage::FindValue(req) => {
+            DhtServerRequest::FindValue(req) => {
                 // PR 3 of #320: implement record-store lookup.
                 wire::DhtMessage::FindValueResponse(wire::FindValueResponse {
                     hash: req.hash,
@@ -267,39 +284,11 @@ impl DhtHandler {
                     closer_nodes: self.closest_to(&req.hash),
                 })
             }
-            wire::DhtMessage::Store(req) => {
+            DhtServerRequest::Store(req) => {
                 // PR 3 of #320: implement quota + active-staker check.
                 wire::DhtMessage::StoreAck(wire::StoreAck {
                     hash: req.hash,
                     accepted: false,
-                })
-            }
-            wire::DhtMessage::BatchStore(req) => {
-                // Wire variants are defined now to pin ADR-022 discriminant
-                // positions, but `BatchStore` admission (two-stage rate
-                // limit, holder check, per-hash quota) is a follow-up to
-                // #320. Until then we acknowledge with `accepted: false`
-                // for every hash so publishers cleanly fall back to
-                // per-hash `Store` per ADR 022 §Schema Evolution.
-                wire::DhtMessage::BatchStoreAck(wire::BatchStoreAck {
-                    results: vec![false; req.hashes.len()],
-                })
-            }
-            // Responses sent to us where we expected a request: surface as
-            // unsupported on this server stream. The handler is a
-            // request-only endpoint; clients write the response frame back
-            // on the same stream by reading it themselves.
-            wire::DhtMessage::FindNodeResponse(_)
-            | wire::DhtMessage::FindValueResponse(_)
-            | wire::DhtMessage::StoreAck(_)
-            | wire::DhtMessage::BatchStoreAck(_) => {
-                // Echo back an empty FindNodeResponse with target=[0;32] —
-                // the caller will see a malformed-looking but well-formed
-                // frame and disconnect. (We can't error out cleanly with
-                // ADR 013 codes from this synchronous dispatcher.)
-                wire::DhtMessage::FindNodeResponse(wire::FindNodeResponse {
-                    target: [0u8; 32],
-                    closer_nodes: Vec::new(),
                 })
             }
         }
@@ -352,10 +341,26 @@ struct DhtReadError {
     app_code: u32,
 }
 
+/// Request variants the DHT handler accepts on a server stream.
+///
+/// The enum is the narrowed shape produced by [`read_dht_request`] — it
+/// excludes the response variants (responses belong on the client side of
+/// the stream) and any request variants the handler does not yet
+/// implement (`BatchStore` in this PR slice). Carrying the narrowing in a
+/// type, rather than a runtime match-all fallback inside `dispatch`,
+/// keeps the dispatcher exhaustive over the *active* set and prevents an
+/// accidentally-silent "I echoed a bogus `FindNodeResponse`" failure mode
+/// if the wire enum grows new request variants.
+enum DhtServerRequest {
+    FindNode(wire::FindNodeRequest),
+    FindValue(wire::FindValueRequest),
+    Store(wire::StoreRequest),
+}
+
 async fn read_dht_request(
     send: &mut SendStream,
     recv: &mut RecvStream,
-) -> Result<wire::DhtMessage, DhtReadError> {
+) -> Result<DhtServerRequest, DhtReadError> {
     let reset = |send: &mut SendStream, recv: &mut RecvStream, code: u32| {
         let v = VarInt::from_u32(code);
         let _ = send.reset(v);
@@ -390,9 +395,29 @@ async fn read_dht_request(
             })
         }
         Ok((msg, _tail)) => {
-            // Reject *responses* arriving on a server-accepted stream as
-            // unsupported — the handler is a request-only endpoint.
-            match &msg {
+            // Narrow the full wire enum down to the handler-supported
+            // request set. Two filtering cases close the stream with
+            // `APP_ERR_UNSUPPORTED_MESSAGE`:
+            //
+            // 1. Response variants on a server-accepted stream — the
+            //    handler is a request-only endpoint; responses belong on
+            //    the client side.
+            // 2. `BatchStore` requests. Wire types are pinned at their
+            //    ADR-022 canonical discriminants so a future handler can
+            //    land without a wire shuffle, but the PR-2-of-#320 slice
+            //    does not implement batch admission (two-stage rate
+            //    limit, single holder check, per-hash quota). ADR 022
+            //    §Schema Evolution line 138 and §STORE Flow specify that
+            //    the unsupported signal MUST be stream-close-without-ack
+            //    — an all-`false` `BatchStoreAck` would be read by
+            //    publishers as "your batch was processed, every hash
+            //    rejected" and trigger no fallback. Closing the stream
+            //    with `APP_ERR_UNSUPPORTED_MESSAGE` is the conformant "I
+            //    don't speak this yet" signal.
+            match msg {
+                wire::DhtMessage::FindNode(req) => Ok(DhtServerRequest::FindNode(req)),
+                wire::DhtMessage::FindValue(req) => Ok(DhtServerRequest::FindValue(req)),
+                wire::DhtMessage::Store(req) => Ok(DhtServerRequest::Store(req)),
                 wire::DhtMessage::FindNodeResponse(_)
                 | wire::DhtMessage::FindValueResponse(_)
                 | wire::DhtMessage::StoreAck(_)
@@ -403,7 +428,16 @@ async fn read_dht_request(
                         app_code: APP_ERR_UNSUPPORTED_MESSAGE,
                     })
                 }
-                _ => Ok(msg),
+                wire::DhtMessage::BatchStore(_) => {
+                    reset(send, recv, APP_ERR_UNSUPPORTED_MESSAGE);
+                    Err(DhtReadError {
+                        err: anyhow::anyhow!(
+                            "BatchStore handler not implemented (deferred to follow-up of #320); \
+                             stream-close-without-ack triggers publisher fallback to per-hash Store"
+                        ),
+                        app_code: APP_ERR_UNSUPPORTED_MESSAGE,
+                    })
+                }
             }
         }
     }

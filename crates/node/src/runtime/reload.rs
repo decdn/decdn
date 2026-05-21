@@ -551,6 +551,7 @@ struct FileSectionSnapshot {
     cache: Option<serde_json::Value>,
     gossip: Option<serde_json::Value>,
     observability: Option<serde_json::Value>,
+    dht: Option<serde_json::Value>,
 }
 
 impl FileSectionSnapshot {
@@ -567,6 +568,7 @@ impl FileSectionSnapshot {
             cache: snap_section("cache", file.cache.as_ref()),
             gossip: snap_section("gossip", file.gossip.as_ref()),
             observability: snap_section("observability", file.observability.as_ref()),
+            dht: snap_section("dht", file.dht.as_ref()),
         }
     }
 }
@@ -1173,6 +1175,16 @@ fn log_ignored_other_sections(file: &decdn_common::config::FileConfig, prev: &Fi
     }
     if changed("gossip", file.gossip.as_ref(), prev.gossip.as_ref()) && file.gossip.is_some() {
         warn_ignored("gossip.* (announce_interval, peer_ttl, allowlist, subscribe_global)");
+    }
+    if changed("dht", file.dht.as_ref(), prev.dht.as_ref()) && file.dht.is_some() {
+        // `dht.*` (rate-limit caps, trusted IPs) is not currently
+        // hot-reloadable — the limiter is constructed once at startup.
+        // Surfacing "requires restart" here keeps DHT on the same footing
+        // as the other restart-required sections; reloadability follows
+        // the dispatch-limiter pattern (`security.*`) and is a candidate
+        // for a future change once the limiter grows an ArcSwap on its
+        // inner state.
+        warn_ignored("dht.* (rate-limit, trusted_ips)");
     }
     // `security.*` is fully reloadable — see `RuntimeReloadState::reload`'s
     // commit step. Invalid values reject the entire reload via

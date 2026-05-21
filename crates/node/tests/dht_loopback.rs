@@ -372,3 +372,265 @@ async fn find_node_does_not_insert_attacker_supplied_requester() -> anyhow::Resu
     );
     Ok(())
 }
+
+// ADR 013 error-code mapping verification — three loopback tests that send
+// a deliberately malformed/unsupported request and assert the server
+// closes the stream with the expected QUIC application error code. The
+// codes themselves are protocol-wide constants in
+// `crates/protocol/src/lib.rs` and `crates/node/src/handlers/probe.rs`;
+// the mapping for `cdn/dht/v1` lives in `handlers/dht.rs::frame_err_code`
+// + `read_dht_request`.
+
+mod adr_013_error_codes {
+    use super::*;
+    use decdn_protocol::APP_ERR_RATE_LIMITED;
+    use iroh::endpoint::{ConnectionError, ReadError, ReadToEndError, VarInt};
+
+    const APP_ERR_UNSUPPORTED_MESSAGE: u32 = 0x01;
+    // `APP_ERR_MESSAGE_TOO_LARGE = 0x02` is mapped by `frame_err_code`
+    // when the framing layer reports `FrameError::TooLarge` — exercising
+    // it requires sending a length-prefix above `MAX_MESSAGE_SIZE`
+    // without going through `write_frame` (which caps before writing).
+    // Left for a future low-level framing test once a raw-bytes helper
+    // is available.
+    const APP_ERR_MALFORMED_MESSAGE: u32 = 0x03;
+
+    /// Spin up a permissive DHT server, return its address + a join handle
+    /// for the accept task. The handle is expected to `Err` once the
+    /// server rejects the client's input — that signals the right app
+    /// error code was emitted at the server side.
+    async fn spin_up_dht_server() -> anyhow::Result<(
+        Endpoint,
+        std::net::SocketAddr,
+        iroh::PublicKey,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+    )> {
+        let server_sk = fresh_key();
+        let server_id = server_sk.public();
+        let metrics = Arc::new(Metrics::new());
+        let limiter = permissive_limiter(&metrics);
+        let rate_limiter = permissive_dht_rate_limiter(&metrics);
+        let routing = Arc::new(Mutex::new(RoutingTable::new(*server_id.as_bytes())));
+        let handler = Arc::new(DhtHandler::with_routing(
+            server_id,
+            routing,
+            rate_limiter,
+            limiter,
+            metrics,
+        ));
+        let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_DHT.to_vec()]).await?;
+        let server_ep_bg = server_ep.clone();
+        let accept_task = tokio::spawn(async move {
+            if let Some(incoming) = server_ep_bg.accept().await {
+                let connecting = incoming
+                    .accept()
+                    .map_err(|e| anyhow::anyhow!("accept: {e}"))?;
+                let conn = connecting
+                    .await
+                    .map_err(|e| anyhow::anyhow!("handshake: {e}"))?;
+                handler
+                    .accept(conn)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+            Ok::<_, anyhow::Error>(())
+        });
+        Ok((server_ep, server_addr, server_id, accept_task))
+    }
+
+    /// Assert that a `read_to_end` on the client's `recv` stream surfaces
+    /// `expected_code` as either a stream reset or a connection close
+    /// with that ADR 013 app error code.
+    fn assert_close_code(result: Result<Vec<u8>, ReadToEndError>, expected_code: u32) {
+        let expected = VarInt::from_u32(expected_code);
+        match result {
+            Err(ReadToEndError::Read(ReadError::Reset(code))) if code == expected => {}
+            Err(ReadToEndError::Read(ReadError::ConnectionLost(
+                ConnectionError::ApplicationClosed(close),
+            ))) if close.error_code == expected => {}
+            other => panic!(
+                "expected close code {expected_code:#x} (RESET or ApplicationClosed), got {other:?}"
+            ),
+        }
+    }
+
+    /// Malformed postcard body → `APP_ERR_MALFORMED_MESSAGE` (0x03).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn malformed_frame_returns_malformed_message_code() -> anyhow::Result<()> {
+        let (server_ep, server_addr, server_id, accept_task) = spin_up_dht_server().await?;
+        let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+        let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+        let conn = client_ep
+            .connect(target, ALPN_DHT)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+        // Write a valid frame header but garbage postcard body — the
+        // discriminant byte 0x55 has no matching DhtMessage variant.
+        let garbage = [0x55u8, 0x00, 0x00, 0x00];
+        write_frame(&mut send, &garbage).await?;
+        send.finish()?;
+        let r = recv.read_to_end(64).await;
+        assert_close_code(r, APP_ERR_MALFORMED_MESSAGE);
+        conn.close(0u32.into(), b"bye");
+        client_ep.close().await;
+        // The server task is expected to surface the rejection as an Err.
+        let _ = accept_task.await;
+        server_ep.close().await;
+        Ok(())
+    }
+
+    /// Response variant on the server stream → `APP_ERR_UNSUPPORTED_MESSAGE` (0x01).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn response_on_server_stream_returns_unsupported_code() -> anyhow::Result<()> {
+        let (server_ep, server_addr, server_id, accept_task) = spin_up_dht_server().await?;
+        let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+        let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+        let conn = client_ep
+            .connect(target, ALPN_DHT)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+        // FindNodeResponse is a response variant; the handler rejects it.
+        let resp = wire::DhtMessage::FindNodeResponse(wire::FindNodeResponse {
+            target: [0u8; 32],
+            closer_nodes: Vec::new(),
+        });
+        let payload = encode_message(&resp)?;
+        write_frame(&mut send, &payload).await?;
+        send.finish()?;
+        let r = recv.read_to_end(64).await;
+        assert_close_code(r, APP_ERR_UNSUPPORTED_MESSAGE);
+        conn.close(0u32.into(), b"bye");
+        client_ep.close().await;
+        let _ = accept_task.await;
+        server_ep.close().await;
+        Ok(())
+    }
+
+    /// `BatchStore` request → `APP_ERR_UNSUPPORTED_MESSAGE` (0x01). Per
+    /// ADR 022 §STORE Flow line 138 + §Schema Evolution the unsupported
+    /// signal MUST be stream-close-without-ack — an all-`false`
+    /// `BatchStoreAck` would NOT trigger publisher fallback. This test
+    /// guards against a regression that returns a well-formed ack.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn batch_store_returns_unsupported_code_not_ack() -> anyhow::Result<()> {
+        let (server_ep, server_addr, server_id, accept_task) = spin_up_dht_server().await?;
+        let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+        let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+        let conn = client_ep
+            .connect(target, ALPN_DHT)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+        let req = wire::DhtMessage::BatchStore(wire::BatchStoreRequest {
+            hashes: vec![[0x01u8; 32], [0x02u8; 32], [0x03u8; 32]],
+            holder: *client_ep.id().as_bytes(),
+        });
+        let payload = encode_message(&req)?;
+        write_frame(&mut send, &payload).await?;
+        send.finish()?;
+        let r = recv.read_to_end(64).await;
+        assert_close_code(r, APP_ERR_UNSUPPORTED_MESSAGE);
+        conn.close(0u32.into(), b"bye");
+        client_ep.close().await;
+        let _ = accept_task.await;
+        server_ep.close().await;
+        Ok(())
+    }
+
+    /// Rate-limit rejection → `APP_ERR_RATE_LIMITED` (0x10). Build a
+    /// burst=1 limiter, send two requests on the same connection, assert
+    /// the second stream is reset with the rate-limit code.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rate_limit_rejection_returns_rate_limited_code() -> anyhow::Result<()> {
+        let server_sk = fresh_key();
+        let server_id = server_sk.public();
+        let metrics = Arc::new(Metrics::new());
+        let limiter = permissive_limiter(&metrics);
+        // burst=1 on global so the second request on the same connection
+        // hits the cap; per-peer and per-IP loose so we test the global
+        // path. trusted_ips empty.
+        let rate_cfg = DhtRateLimitConfig {
+            per_peer_rate_per_sec: 1e6,
+            per_peer_burst: u32::MAX,
+            per_ip_rate_per_sec: 1e6,
+            per_ip_burst: u32::MAX,
+            global_rate_per_sec: 1.0,
+            global_burst: 1,
+            trusted_ips: std::collections::HashSet::new(),
+        };
+        let rate_limiter = Arc::new(DhtRateLimiter::new(&rate_cfg, Arc::clone(&metrics)));
+        let routing = Arc::new(Mutex::new(RoutingTable::new(*server_id.as_bytes())));
+        let handler = Arc::new(DhtHandler::with_routing(
+            server_id,
+            routing,
+            rate_limiter,
+            limiter,
+            metrics,
+        ));
+        let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_DHT.to_vec()]).await?;
+        let server_ep_bg = server_ep.clone();
+        let accept_task = tokio::spawn(async move {
+            if let Some(incoming) = server_ep_bg.accept().await {
+                let connecting = incoming
+                    .accept()
+                    .map_err(|e| anyhow::anyhow!("accept: {e}"))?;
+                let conn = connecting
+                    .await
+                    .map_err(|e| anyhow::anyhow!("handshake: {e}"))?;
+                handler
+                    .accept(conn)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+            Ok::<_, anyhow::Error>(())
+        });
+
+        let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+        let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+        let conn = client_ep
+            .connect(target, ALPN_DHT)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+
+        // First request consumes the global=1 bucket and must succeed.
+        let (mut s1, mut r1) = conn
+            .open_bi()
+            .await
+            .map_err(|e| anyhow::anyhow!("open_bi #1: {e}"))?;
+        let req = wire::DhtMessage::FindNode(wire::FindNodeRequest {
+            target: [0u8; 32],
+            requester: *client_ep.id().as_bytes(),
+        });
+        let payload = encode_message(&req)?;
+        write_frame(&mut s1, &payload).await?;
+        s1.finish()?;
+        let frame = read_frame(&mut r1).await?;
+        let _ = decode_message::<wire::DhtMessage>(&frame)?;
+
+        // Second request on the same connection must be rate-limited.
+        let (mut s2, mut r2) = conn
+            .open_bi()
+            .await
+            .map_err(|e| anyhow::anyhow!("open_bi #2: {e}"))?;
+        write_frame(&mut s2, &payload).await?;
+        s2.finish()?;
+        let rr = r2.read_to_end(2048).await;
+        assert_close_code(rr, APP_ERR_RATE_LIMITED);
+        conn.close(0u32.into(), b"bye");
+        client_ep.close().await;
+        let _ = accept_task.await;
+        server_ep.close().await;
+        Ok(())
+    }
+}

@@ -1603,58 +1603,64 @@ pub fn resolve_security_into(
 /// fast under the bag pattern.
 #[allow(clippy::cognitive_complexity)] // linear "default-or-file → validate" rows.
 pub fn resolve_dht_into(file: Option<&types::DhtConfig>, bag: &mut ConfigErrorBag) -> ResolvedDht {
-    let per_peer_rate_per_sec = file
-        .and_then(|d| d.per_peer_rate_per_sec)
+    // ADR 022 nests the rate-limit knobs under `dht.rate_limit.*` (see
+    // §Trusted-IP exemption — "Configuration key: dht.rate_limit.trusted_ips").
+    // The file shape mirrors that; an absent `[dht.rate_limit]` collapses
+    // to "all defaults" through the same `.and_then` chain the other
+    // resolvers use.
+    let rate_limit = file.and_then(|d| d.rate_limit.as_ref());
+    let per_peer_rate_per_sec = rate_limit
+        .and_then(|r| r.per_peer_rate_per_sec)
         .unwrap_or(DEFAULT_DHT_PER_PEER_RATE_PER_SEC);
     bag.check(
         per_peer_rate_per_sec.is_finite() && per_peer_rate_per_sec >= 0.0,
-        "dht.per_peer_rate_per_sec",
-        "dht.per_peer_rate_per_sec must be a finite non-negative number (0 disables the layer)",
+        "dht.rate_limit.per_peer_rate_per_sec",
+        "dht.rate_limit.per_peer_rate_per_sec must be a finite non-negative number (0 disables the layer)",
     );
-    let per_peer_burst = file
-        .and_then(|d| d.per_peer_burst)
+    let per_peer_burst = rate_limit
+        .and_then(|r| r.per_peer_burst)
         .unwrap_or(DEFAULT_DHT_PER_PEER_BURST);
     bag.check(
         per_peer_rate_per_sec == 0.0 || per_peer_burst > 0,
-        "dht.per_peer_burst",
-        "dht.per_peer_burst must be > 0 when per_peer_rate_per_sec > 0 (set both to 0 to disable)",
+        "dht.rate_limit.per_peer_burst",
+        "dht.rate_limit.per_peer_burst must be > 0 when per_peer_rate_per_sec > 0 (set both to 0 to disable)",
     );
 
-    let per_ip_rate_per_sec = file
-        .and_then(|d| d.per_ip_rate_per_sec)
+    let per_ip_rate_per_sec = rate_limit
+        .and_then(|r| r.per_ip_rate_per_sec)
         .unwrap_or(DEFAULT_DHT_PER_IP_RATE_PER_SEC);
     bag.check(
         per_ip_rate_per_sec.is_finite() && per_ip_rate_per_sec >= 0.0,
-        "dht.per_ip_rate_per_sec",
-        "dht.per_ip_rate_per_sec must be a finite non-negative number (0 disables the layer)",
+        "dht.rate_limit.per_ip_rate_per_sec",
+        "dht.rate_limit.per_ip_rate_per_sec must be a finite non-negative number (0 disables the layer)",
     );
-    let per_ip_burst = file
-        .and_then(|d| d.per_ip_burst)
+    let per_ip_burst = rate_limit
+        .and_then(|r| r.per_ip_burst)
         .unwrap_or(DEFAULT_DHT_PER_IP_BURST);
     bag.check(
         per_ip_rate_per_sec == 0.0 || per_ip_burst > 0,
-        "dht.per_ip_burst",
-        "dht.per_ip_burst must be > 0 when per_ip_rate_per_sec > 0 (set both to 0 to disable)",
+        "dht.rate_limit.per_ip_burst",
+        "dht.rate_limit.per_ip_burst must be > 0 when per_ip_rate_per_sec > 0 (set both to 0 to disable)",
     );
 
-    let global_rate_per_sec = file
-        .and_then(|d| d.global_rate_per_sec)
+    let global_rate_per_sec = rate_limit
+        .and_then(|r| r.global_rate_per_sec)
         .unwrap_or(DEFAULT_DHT_GLOBAL_RATE_PER_SEC);
     bag.check(
         global_rate_per_sec.is_finite() && global_rate_per_sec >= 0.0,
-        "dht.global_rate_per_sec",
-        "dht.global_rate_per_sec must be a finite non-negative number (0 disables the layer)",
+        "dht.rate_limit.global_rate_per_sec",
+        "dht.rate_limit.global_rate_per_sec must be a finite non-negative number (0 disables the layer)",
     );
-    let global_burst = file
-        .and_then(|d| d.global_burst)
+    let global_burst = rate_limit
+        .and_then(|r| r.global_burst)
         .unwrap_or(DEFAULT_DHT_GLOBAL_BURST);
     bag.check(
         global_rate_per_sec == 0.0 || global_burst > 0,
-        "dht.global_burst",
-        "dht.global_burst must be > 0 when global_rate_per_sec > 0 (set both to 0 to disable)",
+        "dht.rate_limit.global_burst",
+        "dht.rate_limit.global_burst must be > 0 when global_rate_per_sec > 0 (set both to 0 to disable)",
     );
 
-    let trusted_ips = parse_trusted_ips(file.and_then(|d| d.trusted_ips.as_deref()), bag);
+    let trusted_ips = parse_trusted_ips(rate_limit.and_then(|r| r.trusted_ips.as_deref()), bag);
 
     ResolvedDht {
         per_peer_rate_per_sec,
@@ -1688,8 +1694,10 @@ fn parse_trusted_ips(
                 out.insert(ip);
             }
             Err(e) => {
-                bag.check_with(false, "dht.trusted_ips", || {
-                    format!("dht.trusted_ips entry {entry:?} is not a valid IP address: {e}")
+                bag.check_with(false, "dht.rate_limit.trusted_ips", || {
+                    format!(
+                        "dht.rate_limit.trusted_ips entry {entry:?} is not a valid IP address: {e}"
+                    )
                 });
             }
         }

@@ -14,14 +14,14 @@
 //!
 //! # Eviction policy
 //!
-//! On bucket overflow the least-recently-seen entry is evicted and the new
-//! `NodeId` appended at the tail. Standard Kademlia pings the LRU first and
-//! evicts only if it does not respond; the network-side ping landed in the
-//! follow-up PR that introduces `FindNode` driving. The simpler LRU here
-//! preserves the "newcomers are reachable" property — the LRU is the one
-//! least recently confirmed to be live, so evicting it is the safest bet
-//! among entries already in the bucket. ADR 022 §Routing Table does not
-//! mandate the ping-then-evict variant.
+//! On bucket overflow the least-recently-seen entry is evicted and the
+//! new `NodeId` appended at the tail. Standard Kademlia would ping the
+//! LRU first and evict only if it does not respond; ADR 022 §Routing
+//! Table does not mandate the ping-then-evict variant and we do not
+//! implement it. The simpler LRU here preserves the "newcomers are
+//! reachable" property — the LRU is the one least recently confirmed to
+//! be live, so evicting it is the safest bet among entries already in
+//! the bucket.
 
 use decdn_protocol::MAX_CLOSER_NODES;
 
@@ -413,11 +413,24 @@ mod tests {
         }
         let closest = rt.closest(&target, 4);
         assert_eq!(closest.len(), 4);
-        // First entry must be strictly closer than the last.
-        let first = closest.first().expect("len >= 1");
-        let last = closest.last().expect("len >= 1");
-        let d_first = xor_distance(first, &target);
-        let d_last = xor_distance(last, &target);
+        // Assert the whole vector is monotonically non-decreasing by XOR
+        // distance. A bug that returned "first and last correct, middle
+        // scrambled" would pass an endpoints-only check but fail this
+        // walk over consecutive pairs.
+        let dists: Vec<_> = closest.iter().map(|p| xor_distance(p, &target)).collect();
+        for window in dists.windows(2) {
+            assert!(
+                window[0] <= window[1],
+                "closest() not distance-sorted: {:?} > {:?} in {dists:?}",
+                window[0],
+                window[1]
+            );
+        }
+        // And the first is strictly closer than the last (proves the
+        // monotonic check above isn't vacuously satisfied by all-equal
+        // distances).
+        let d_first = dists.first().expect("len >= 1");
+        let d_last = dists.last().expect("len >= 1");
         assert!(d_first < d_last, "first = {d_first:?} >= last = {d_last:?}");
     }
 
