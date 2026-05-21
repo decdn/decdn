@@ -232,12 +232,13 @@ impl Default for RepublishScheduler {
 // Linear "shutdown? new commit? tick?" select loop. Splitting would
 // scatter the three-way priority across helpers; the function body
 // is a flat dispatcher.
-#[allow(clippy::cognitive_complexity)]
+#[allow(clippy::cognitive_complexity, clippy::too_many_arguments)]
 pub async fn run_republish(
     endpoint: Endpoint,
     self_id: PublicKey,
     routing: Arc<Mutex<RoutingTable>>,
     scheduler: Arc<RepublishScheduler>,
+    cache: decdn_cache::CacheEngine,
     mut cache_inserts: broadcast::Receiver<iroh_blobs::Hash>,
     mut stop_rx: oneshot::Receiver<()>,
 ) {
@@ -260,7 +261,18 @@ pub async fn run_republish(
             insert = cache_inserts.recv() => {
                 match insert {
                     Ok(hash) => {
-                        scheduler.schedule_steady(*hash.as_bytes());
+                        let hash_bytes = *hash.as_bytes();
+                        // ADR 022 §STORE Flow steps 2–3: publish
+                        // *immediately* on cache insertion (step 2),
+                        // then schedule the next republish at `T +
+                        // uniform(30, 50) min` where T is the local
+                        // wall-clock at step 2. Without the initial
+                        // publish a freshly-cached blob isn't
+                        // discoverable for up to 50 minutes — the
+                        // exact failure mode the eager publish
+                        // closes.
+                        publish_hash(&endpoint, self_id_bytes, &routing, &cache, hash_bytes).await;
+                        scheduler.schedule_steady(hash_bytes);
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         // ADR 022 §STORE Flow & doc on
@@ -288,10 +300,20 @@ pub async fn run_republish(
             _ = ticker.tick() => {
                 let due = scheduler.drain_due(now_us());
                 for hash in due {
+                    // ADR 022 §Content Records and TTL line 122: "A
+                    // node stops re-publishing when it evicts the
+                    // blob." Verify the blob is still held before
+                    // each republish; if it's been evicted, drop the
+                    // scheduler entry instead of re-adding it.
+                    if !cache_still_holds(&cache, &hash).await {
+                        scheduler.unschedule(&hash);
+                        continue;
+                    }
                     publish_hash(
                         &endpoint,
                         self_id_bytes,
                         &routing,
+                        &cache,
                         hash,
                     )
                     .await;
@@ -305,6 +327,18 @@ pub async fn run_republish(
     }
 }
 
+/// True iff the cache still holds `hash` (and the operator hasn't
+/// explicitly evicted it). The blob-presence check is what stops the
+/// scheduler from re-publishing content that LRU drift or an
+/// operator-evict already removed from the local store.
+async fn cache_still_holds(cache: &decdn_cache::CacheEngine, hash: &[u8; 32]) -> bool {
+    let h = iroh_blobs::Hash::from_bytes(*hash);
+    if cache.is_evicted(h) {
+        return false;
+    }
+    cache.has(h).await.unwrap_or(false)
+}
+
 /// Send a `Store` to the K+3 closest peers for `hash` in parallel.
 /// Failures are logged at debug level — a missed receiver in this cycle
 /// will be retried on the next cycle (or on the next cold start).
@@ -312,10 +346,18 @@ async fn publish_hash(
     endpoint: &Endpoint,
     self_id_bytes: [u8; 32],
     routing: &Arc<Mutex<RoutingTable>>,
+    _cache: &decdn_cache::CacheEngine,
     hash: [u8; 32],
 ) {
     let targets: Vec<NodeId> = if let Ok(table) = routing.lock() {
-        table.closest(&hash, REPUBLISH_FANOUT)
+        // ADR 022 §STORE Flow line 128 specifies K+3 (= 23) closest
+        // nodes — the three positions beyond K are overflow targets
+        // so an attacker suppressing receivers has to take down K+3
+        // hosts rather than K. The default `closest` caps at K (=
+        // wire `MAX_CLOSER_NODES`), which we MUST NOT use here;
+        // `closest_unbounded` returns up to `n` peers regardless of
+        // the wire cap.
+        table.closest_unbounded(&hash, REPUBLISH_FANOUT)
     } else {
         tracing::error!("dht republish: routing-table mutex poisoned");
         return;

@@ -275,3 +275,101 @@ async fn client_store_lands_record_at_server() -> anyhow::Result<()> {
     server.accept_task.abort();
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn run_republish_publishes_immediately_on_cache_insert() -> anyhow::Result<()> {
+    // ADR 022 §STORE Flow steps 2-3: a freshly cached blob MUST be
+    // published to the K+3 closest peers *immediately*, then
+    // scheduled for next republish 30-50 min later. The previous
+    // implementation scheduled with the steady-state window from the
+    // start, so a blob wasn't discoverable for up to 50 minutes —
+    // this test is the regression guard.
+    use decdn_node::dht::{RepublishScheduler, publish::run_republish};
+    use std::path::PathBuf;
+    use tokio::sync::{broadcast, oneshot};
+
+    // Server S in `staked` so the publish-driven `Store` from the
+    // republish task lands successfully.
+    let publisher_sk = fresh_key();
+    let publisher_id = publisher_sk.public();
+    let mut staked = HashSet::new();
+    staked.insert(*publisher_id.as_bytes());
+    let server = spin_up_server(staked).await?;
+
+    // Build the publisher endpoint + a routing table that seeds the
+    // server as the only known peer (so the republish fan-out targets
+    // it).
+    let (publisher_ep, _) = local_endpoint(publisher_sk, vec![]).await?;
+    let routing = Arc::new(Mutex::new(RoutingTable::new(*publisher_id.as_bytes())));
+    {
+        let mut t = routing.lock().unwrap();
+        t.insert(*server.id.as_bytes());
+    }
+
+    // Pre-resolve the server's path by issuing one `FindNode`
+    // (loopback tests disable iroh discovery; without this the
+    // republish task can't connect by NodeId alone).
+    let target = EndpointAddr::new(server.id).with_ip_addr(server.addr);
+    let _ = client::find_node(
+        &publisher_ep,
+        target,
+        *server.id.as_bytes(),
+        *publisher_id.as_bytes(),
+    )
+    .await?;
+
+    // Spin up `run_republish` with a fake cache + insert channel.
+    // We need a real `CacheEngine` for the stop-on-evict check; use
+    // an empty cache rooted in a tempdir.
+    let cache_dir = tempfile::tempdir()?;
+    let cache = decdn_cache::CacheEngine::open(cache_dir.path(), vec![], 16).await?;
+    let scheduler = Arc::new(RepublishScheduler::new());
+    let (inserts_tx, inserts_rx) = broadcast::channel::<iroh_blobs::Hash>(16);
+    let (stop_tx, stop_rx) = oneshot::channel::<()>();
+    let task = tokio::spawn(run_republish(
+        publisher_ep.clone(),
+        publisher_id,
+        Arc::clone(&routing),
+        Arc::clone(&scheduler),
+        cache,
+        inserts_rx,
+        stop_rx,
+    ));
+
+    // Simulate a cache insert by broadcasting on the channel. The
+    // republish task MUST send a `Store` to the server immediately;
+    // we verify by checking the server's RecordStore picks it up.
+    let hash = iroh_blobs::Hash::from_bytes([0xA5u8; 32]);
+    inserts_tx.send(hash).unwrap();
+
+    // Poll the server's record store with a generous timeout — the
+    // republish task is async + needs one RTT.
+    let mut got_record = false;
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let n = {
+            let r = server.records.lock().unwrap();
+            r.publisher_record_count(publisher_id.as_bytes())
+        };
+        if n >= 1 {
+            got_record = true;
+            break;
+        }
+    }
+    let _ = stop_tx.send(());
+    let _ = task.await;
+
+    assert!(
+        got_record,
+        "republish task must send `Store` immediately on cache-insert; \
+         server's RecordStore should hold the publisher's record within \
+         1.5s but did not"
+    );
+    let _ = cache_dir; // suppress "unused let binding" — kept-alive guard.
+    let _ = PathBuf::new(); // satisfy "PathBuf import" if linter pivots.
+
+    publisher_ep.close().await;
+    server.endpoint.close().await;
+    server.accept_task.abort();
+    Ok(())
+}

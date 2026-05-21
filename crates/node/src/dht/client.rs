@@ -121,14 +121,18 @@ async fn exchange(
     request: &wire::DhtMessage,
 ) -> anyhow::Result<wire::DhtMessage> {
     let payload = encode_message(request).context("dht client: encode request")?;
+    // Use `.context()` (not `anyhow::anyhow!("...: {e}")`) so the
+    // underlying typed iroh error stays in the error chain — that
+    // way `extract_app_error_code` can downcast it to `ConnectionError`
+    // / `ReadError` and pull out the ADR 013 application error code
+    // the peer closed the stream with. The string-format wrap form
+    // discarded the typed source and made the helper unreliable.
     let response = tokio::time::timeout(DHT_CLIENT_TIMEOUT, async {
         let connecting = endpoint
             .connect_with_opts(target, ALPN_DHT, ConnectOptions::new())
             .await
-            .map_err(|e| anyhow::anyhow!("dht client: connect failed: {e}"))?;
-        let conn = connecting
-            .await
-            .map_err(|e| anyhow::anyhow!("dht client: handshake failed: {e}"))?;
+            .context("dht client: connect failed")?;
+        let conn = connecting.await.context("dht client: handshake failed")?;
         let resp = exchange_on(&conn, &payload).await?;
         // `0u32` = "no app error"; matches the server's normal-close
         // code so the peer's `conn.closed()` arm reads the same way

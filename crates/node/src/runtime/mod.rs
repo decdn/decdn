@@ -547,6 +547,7 @@ pub async fn run(
         secret_key.public(),
         Arc::clone(&dht_routing),
         Arc::clone(&republish_scheduler),
+        cache.clone(),
         cache_inserts_rx,
         republish_stop_rx,
     ));

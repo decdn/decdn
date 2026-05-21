@@ -77,7 +77,7 @@ pub fn cmp_by_distance(a: &NodeId, b: &NodeId, target: &NodeId) -> std::cmp::Ord
 /// Returns `None` when `d == 0` — the all-zero distance corresponds to the
 /// node's own identity, which is never stored in the table.
 #[must_use]
-fn bucket_index(d: &[u8; NODE_ID_LEN]) -> Option<usize> {
+pub(crate) fn bucket_index(d: &[u8; NODE_ID_LEN]) -> Option<usize> {
     for (i, byte) in d.iter().enumerate() {
         if *byte != 0 {
             // Leading-zero count within the byte. `byte.leading_zeros()`
@@ -218,16 +218,37 @@ impl RoutingTable {
     /// Walks every bucket; with 256 × 20 entries the worst case is 5120
     /// XOR-compares + a partial sort — well under a microsecond on modern
     /// hardware and dwarfed by the QUIC round-trip cost.
+    ///
+    /// The result is capped at [`K_BUCKET_SIZE`] (= [`MAX_CLOSER_NODES`])
+    /// so it can be serialised directly into a wire `closer_nodes` field.
+    /// Callers needing more than K candidates (e.g. ADR 022 §STORE Flow
+    /// "K+3 closest" republish fanout) MUST use [`Self::closest_unbounded`].
     #[must_use]
     pub fn closest(&self, target: &NodeId, n: usize) -> Vec<NodeId> {
         let cap = n.min(K_BUCKET_SIZE);
+        self.closest_unbounded(target, cap)
+    }
+
+    /// Like [`Self::closest`] but without the wire-cap clamp at
+    /// [`K_BUCKET_SIZE`]. Used by the republish path which fans out to
+    /// K+3 closest peers per ADR 022 §STORE Flow line 128 ("three
+    /// positions beyond K are overflow targets — publishing to a wider
+    /// set than the minimum required by the routing geometry means an
+    /// attacker forcing record expiry by suppressing receivers must
+    /// take down K+3 hosts rather than K").
+    ///
+    /// MUST NOT be used to populate wire responses — those are bound at
+    /// [`MAX_CLOSER_NODES`] and a larger result would violate the
+    /// ADR 022 wire-cost ceiling. Use [`Self::closest`] for that path.
+    #[must_use]
+    pub fn closest_unbounded(&self, target: &NodeId, n: usize) -> Vec<NodeId> {
         let mut candidates: Vec<NodeId> = self.buckets.iter().flatten().copied().collect();
         // `sort_unstable_by_key` computes `xor_distance` once per element
         // and reuses the result; the older `sort_unstable_by` form would
         // recompute it twice per pairwise comparison (~`n log n` extra
         // XORs over a fully-populated table).
         candidates.sort_unstable_by_key(|p| xor_distance(p, target));
-        candidates.truncate(cap);
+        candidates.truncate(n);
         candidates
     }
 
@@ -450,6 +471,25 @@ mod tests {
     fn closest_on_empty_table_is_empty() {
         let rt = RoutingTable::new(id(0));
         assert!(rt.closest(&id(0xFF), 10).is_empty());
+    }
+
+    /// ADR 022 §STORE Flow step 1 requires publishing to **K+3 = 23**
+    /// closest nodes. The wire-capped [`RoutingTable::closest`] tops
+    /// out at `K_BUCKET_SIZE = 20`; the unbounded variant is what
+    /// the republish path uses to honour the K+3 contract.
+    #[test]
+    fn closest_unbounded_returns_more_than_k_when_requested() {
+        let self_id = id(0);
+        let mut rt = RoutingTable::new(self_id);
+        for b in 0..30_usize {
+            rt.insert(id_in_bucket(&self_id, b, 0));
+        }
+        // The bounded variant caps at K=20 (wire `MAX_CLOSER_NODES`).
+        assert_eq!(rt.closest(&id(0xFF), 1000).len(), K_BUCKET_SIZE);
+        // The unbounded variant returns up to `n` regardless.
+        assert_eq!(rt.closest_unbounded(&id(0xFF), 23).len(), 23);
+        // And caps at table size when `n > len`.
+        assert_eq!(rt.closest_unbounded(&id(0xFF), 1000).len(), 30);
     }
 
     #[test]

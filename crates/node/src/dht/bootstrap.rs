@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use iroh::{Endpoint, EndpointAddr, PublicKey};
+use rand::seq::SliceRandom;
 
 use crate::dht::client;
 use crate::dht::routing::{NodeId, RoutingTable};
@@ -110,16 +111,17 @@ pub async fn bootstrap(
     }
 
     // Step 2: parallel self-lookup against a fan-out of the seed set.
-    // We deliberately don't randomise the order — `active_nodes` from a
-    // file-config-backed `StakerSet` returns an insertion-order-stable
-    // view, which is fine because seed reachability isn't an
-    // attacker-controlled signal. A future chain-backed impl that returns
-    // a stable on-chain ordering will exhibit the same property.
-    let fanout: Vec<NodeId> = seeds
-        .into_iter()
-        .filter(|n| *n != self_id_bytes)
-        .take(BOOTSTRAP_FANOUT)
-        .collect();
+    // The `StakerSet` trait contract (line 30 of staker_set.rs) says:
+    // "Order is unspecified; the caller MUST randomize before any
+    // selection step that an attacker could influence (e.g. bootstrap
+    // target picking)." A future chain-backed `StakerSet` may return
+    // entries in on-chain insertion order, which an attacker who
+    // submits transactions can influence — so we shuffle here to keep
+    // the picks unpredictable from outside the node.
+    let mut seeds_shuffled: Vec<NodeId> =
+        seeds.into_iter().filter(|n| *n != self_id_bytes).collect();
+    seeds_shuffled.shuffle(&mut rand::rng());
+    let fanout: Vec<NodeId> = seeds_shuffled.into_iter().take(BOOTSTRAP_FANOUT).collect();
     let mut handles = Vec::with_capacity(fanout.len());
     for peer in fanout {
         let endpoint_cloned = endpoint.clone();
