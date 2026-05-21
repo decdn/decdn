@@ -66,7 +66,7 @@ These are governance-policy guidelines, not on-chain enforcement. The revisiting
 
 ## ADR 022 — Content Discovery at Scale
 
-Source: [ADR 022 — Content Discovery at Scale (DHT)](../022-content-discovery.md). The canonical decision — `cdn/dht/v1` (Kademlia subset) as the primary content-discovery mechanism from day one, with the on-chain origin directory as the deterministic last-resort fallback — is documented inline in ADR 022. The rejected alternatives:
+Source: [ADR 022 — Content Discovery at Scale (DHT)](../022-content-discovery.md). The canonical decision — `cdn/dht/v1` (Kademlia subset) as the primary content-discovery mechanism, with the on-chain origin directory as the deterministic last-resort fallback — is documented inline in ADR 022. The rejected alternatives:
 
 ### Broadcast probe fan-out as primary mechanism
 
