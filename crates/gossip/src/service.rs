@@ -389,7 +389,24 @@ fn subscriber_task(
                         let mut table = peer_table.write().await;
                         dispatch_insert(&mut table, announce, now, metrics.as_ref());
                     }
-                    Err(reject) => metrics.inc_rejected(reject.label()),
+                    Err(reject) => {
+                        // #577 M3: oversize-trailing-bytes is an active-attack
+                        // signal (amplification probe). Surface forensic
+                        // context — size + threshold + topic — alongside the
+                        // metric so operators investigating the counter spike
+                        // have correlation data without enabling debug logs.
+                        // Other reject reasons stay metric-only to avoid log
+                        // floods on routine per-peer wire faults.
+                        if matches!(reject, AnnounceReject::OversizeTrailingBytes) {
+                            tracing::warn!(
+                                topic = %topic_name,
+                                content_len = msg.content.len(),
+                                max_trailing = crate::validation::MAX_TRAILING_BYTES,
+                                "gossip envelope rejected: oversize trailing bytes (#577 M3) — possible amplification probe"
+                            );
+                        }
+                        metrics.inc_rejected(reject.label());
+                    }
                 }
             }
 

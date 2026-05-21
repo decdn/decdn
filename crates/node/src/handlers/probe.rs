@@ -34,6 +34,14 @@ const PROBE_CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 const REJECTION_CLOSE_TIMEOUT: Duration = Duration::from_millis(250);
 
 // QUIC application error codes defined by ADR 013 §Application Error Codes.
+//
+// `APP_ERR_NO_ERROR = 0` is the implicit QUIC "no app error" default and is
+// what the handler returns for transport-level conditions (read timeout,
+// mid-frame EOF, peer reset) where no protocol fault occurred. Named to
+// avoid magic-number drift; #577 M1 motivated splitting it out from
+// `APP_ERR_MALFORMED_MESSAGE` so peers don't apply protocol-fault backoff
+// to a transport drop.
+const APP_ERR_NO_ERROR: u32 = 0x00;
 const APP_ERR_UNSUPPORTED_MESSAGE: u32 = 0x01;
 const APP_ERR_MESSAGE_TOO_LARGE: u32 = 0x02;
 const APP_ERR_MALFORMED_MESSAGE: u32 = 0x03;
@@ -366,7 +374,13 @@ const fn frame_err_code(e: &FrameError) -> u32 {
     // into `APP_ERR_MALFORMED_MESSAGE`.
     match e {
         FrameError::TooLarge(_) => APP_ERR_MESSAGE_TOO_LARGE,
-        FrameError::Io(_) | FrameError::Varint | FrameError::Decode(_) => APP_ERR_MALFORMED_MESSAGE,
+        // #577 M1: transport-level fault (short read, peer reset,
+        // mid-frame EOF) is NOT a protocol fault. Mirrors the
+        // timeout-path convention in `read_probe_request` — peers must
+        // not apply MALFORMED-class backoff/penalty for a dropped
+        // connection.
+        FrameError::Io(_) => APP_ERR_NO_ERROR,
+        FrameError::Varint | FrameError::Decode(_) => APP_ERR_MALFORMED_MESSAGE,
     }
 }
 
@@ -399,15 +413,17 @@ async fn read_probe_request(
 
     let frame = match tokio::time::timeout(PROBE_READ_TIMEOUT, read_frame(recv)).await {
         Err(_) => {
-            // ADR 013 defines no timeout-specific code; use 0 (no app error).
-            reset(send, recv, 0);
+            // ADR 013 defines no timeout-specific code; use the named
+            // `APP_ERR_NO_ERROR` constant (same convention now applied
+            // to `FrameError::Io(_)` per #577 M1).
+            reset(send, recv, APP_ERR_NO_ERROR);
             tracing::warn!(
                 timeout_ms = u64::try_from(PROBE_READ_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
                 "probe request read timed out"
             );
             return Err(ProbeReadError {
                 err: anyhow::anyhow!("probe request timed out after {PROBE_READ_TIMEOUT:?}"),
-                app_code: 0,
+                app_code: APP_ERR_NO_ERROR,
             });
         }
         Ok(Err(e)) => {
