@@ -63,6 +63,26 @@ These are low-level framing helpers. Application-layer deserialization is separa
 
 `ChunkData` payloads (1024-byte blob chunks) are already implicitly length-delimited by the QUIC stream's byte count and the voucher interval. They MUST still use varint-length framing for consistency — the receiver must distinguish `ChunkData` from `Voucher`/`VoucherAck` on the same stream via the protocol enum discriminant. The 1–2 byte overhead on 1024-byte chunks is ~0.1%.
 
+#### Gossip Framing
+
+The `MAX_MESSAGE_SIZE = 16 MiB` ceiling above applies to the deCDN-implemented ALPNs (`cdn/probe/v1`, `cdn/client/v1`, `cdn/dht/v1`) whose framing is owned by `decdn_protocol::framing`. Gossip messages travel through **iroh-gossip's own length-prefixed framing**, not deCDN's, and carry an independent per-frame ceiling enforced inside `iroh_gossip::net::util::read_lp` *before* the inbound `BytesMut` is resized. The deCDN value is:
+
+- **`GOSSIP_MAX_FRAME = 16 KiB`** (`decdn_gossip::GOSSIP_MAX_FRAME`, wired into `Gossip::builder().max_message_size(...)` at runtime construction).
+
+Rationale (analytical bounds from iroh-gossip 0.98 source):
+
+- Data-frame floor ≈ **4.4 KiB**: maximally-padded `GossipEnvelope` (`NodeAnnounce` body + 64 B ed25519 signature + version byte ≈ 256 B envelope) + `MAX_TRAILING_BYTES` (4 KiB Tier-1 extension) + plumtree/topic message wrappers (variant tags, `MessageId`, `DeliveryScope`/`Round` ≈ 64 B) + iroh-gossip's 4 B u32 length prefix.
+- HyParView control upper bound ≈ **1.7 KiB**: at default fanout (`shuffle_active_view_count=3`, `shuffle_passive_view_count=4`), a `Shuffle`/`ShuffleReply` carries up to 7 `PeerInfo` entries — each 32 B node id + opaque `PeerData` (~100-200 B for relay URL + direct addresses) — plus enum tags and `Ttl(u16)`.
+- 16 KiB gives ~3.7× headroom over the data-frame floor and ~9× over HyParView control, leaving room for future Tier-1 extensions and `PeerData` growth (e.g. multi-relay nodes).
+
+The upstream default (`DEFAULT_MAX_MESSAGE_SIZE = 4096`) is **insufficient**: it cannot carry our `MAX_TRAILING_BYTES` extension allowance even for a single legitimate announce. Pinning the value in code also defends against silent shifts on iroh-gossip minor-version bumps.
+
+**Network-coordination invariant.** Unlike the per-ALPN ceilings above, `GOSSIP_MAX_FRAME` is enforced symmetrically by iroh-gossip on both send and receive paths. Tightening it on one deployment silently partitions the gossip swarm for legitimate HyParView control frames originating elsewhere (cf. [iroh-gossip#131](https://github.com/n0-computer/iroh-gossip/issues/131) — oversize publishes fail silently on the sender). Treat changes to this constant as **wire-compatibility events** requiring coordinated rollout. Do not surface this as an operator-tunable config key.
+
+**Operator-policy scope.** The note above ("Operators on memory-constrained nodes SHOULD set a lower `MAX_MESSAGE_SIZE` as local policy") applies only to deCDN-owned ALPNs whose framing is decoded inside this node and cannot affect a peer; it does NOT apply to `GOSSIP_MAX_FRAME`.
+
+**iroh-gossip dependency.** The cap is wired via `iroh_gossip::net::Gossip::builder().max_message_size(N)` (iroh-gossip ≥ 0.98). The minimum allowed value is `MIN_MAX_MESSAGE_SIZE = 512`; the 4 KiB upstream default is too small for our envelope shape and is deliberately overridden.
+
 ### Protocol Enums
 
 Each ALPN defines a single top-level enum wrapping all message types for that protocol, serialized as the outermost postcard value inside the length-prefixed frame. Postcard encodes enum variants with a varint discriminant (1 byte for variants 0–127), providing explicit, extensible message type tags on the wire.

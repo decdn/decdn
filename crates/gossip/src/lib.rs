@@ -15,5 +15,6 @@ pub use metrics::GossipMetrics;
 pub use peer_table::{InsertOutcome, PeerEntry, PeerTable, StaleTimestamp};
 pub use service::{
     AnnounceTrigger, GossipHandles, GossipRuntimeConfig, GossipService, GossipSpawnError,
+    build_gossip,
 };
-pub use validation::{AnnounceReject, validate_envelope};
+pub use validation::{AnnounceReject, GOSSIP_MAX_FRAME, validate_envelope};

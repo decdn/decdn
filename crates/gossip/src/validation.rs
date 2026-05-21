@@ -46,9 +46,9 @@ pub enum AnnounceReject {
     NotAllowlisted,
     /// Trailing bytes after the postcard envelope exceed
     /// [`MAX_TRAILING_BYTES`] (#577 M3). ADR 013 §Tier 1 permits trailing
-    /// bytes for forward-compat; the cap defends against a peer padding
-    /// every ~150-byte announce up to iroh-gossip's 16 MiB ceiling to
-    /// force per-message allocations across the fan-out.
+    /// bytes for forward-compat; this defence-in-depth cap catches shape
+    /// violations that slip under iroh-gossip's per-frame
+    /// [`GOSSIP_MAX_FRAME`] allocation ceiling.
     #[error("trailing bytes after envelope exceed {MAX_TRAILING_BYTES} byte allowance")]
     OversizeTrailingBytes,
 }
@@ -81,17 +81,50 @@ pub const CLOCK_SKEW_TOLERANCE_US: u64 = 60 * 1_000_000;
 /// [`validate_envelope`] (#577 M3). ADR 013 §Tier 1 documents trailing
 /// bytes as the forward-compat extension mechanism; a sane envelope
 /// today is ~150 bytes and any plausible future Tier-1 extension is
-/// expected to be well under 4 KiB. The ceiling defends against a peer
-/// padding announces up to deCDN's `MAX_MESSAGE_SIZE` (16 MiB, ADR 013
-/// §Wire Framing — `decdn_protocol::framing::MAX_MESSAGE_SIZE`, enforced
-/// by the read path) to force allocations across the gossip fan-out
-/// without changing any observable wire shape. This cap stays well above
-/// any legitimate extension while making the attack visible via the
-/// `oversize_trailing_bytes` rejection metric. Per-ALPN tightening of
-/// the upstream allocation is a separate concern — see the operator-
-/// policy note in ADR 013 §Wire Framing ("Operators on memory-constrained
-/// nodes SHOULD set a lower `MAX_MESSAGE_SIZE` as local policy").
+/// expected to be well under 4 KiB. Defence-in-depth behind iroh-
+/// gossip's per-actor [`GOSSIP_MAX_FRAME`] ceiling (enforced before
+/// allocation in `read_lp`, ADR 013 §Gossip Framing): even under that
+/// ceiling, an attacker padding every ~150-byte announce up to
+/// `GOSSIP_MAX_FRAME` multiplies baseline allocations ~100× across the
+/// gossip fan-out. Rejecting at the validation layer caps that
+/// amplification and surfaces it via the `oversize_trailing_bytes`
+/// metric, while leaving legitimate Tier-1 extensions room to grow.
 pub const MAX_TRAILING_BYTES: usize = 4 * 1024;
+
+/// Maximum size in bytes of a single iroh-gossip wire frame on the
+/// deCDN gossip actor (ADR 013 §Gossip Framing). Passed to
+/// `iroh_gossip::net::Gossip::builder().max_message_size(...)` and
+/// applies symmetrically to every frame the actor sends or receives:
+/// `NodeAnnounce` traffic on `cdn/global/v1` and the region topic,
+/// plus iroh-gossip's `HyParView` control frames (which are not
+/// topic-scoped). The cap bounds allocation inside iroh-gossip's
+/// `read_lp` *before* the frame ever reaches [`validate_envelope`].
+/// Must accommodate (a) a maximally-extended
+/// [`decdn_protocol::GossipEnvelope`] — envelope (~256 B) +
+/// [`MAX_TRAILING_BYTES`] padding — plus plumtree/topic message-wrapper
+/// overhead (~64 B), and (b) `HyParView` control frames carrying peer-
+/// info lists (analytical upper bound from iroh-gossip 0.98 source:
+/// Shuffle/ShuffleReply at default fanout = ~1.7 KiB for 7 `PeerInfo`
+/// entries with two-relay `AddrInfo`). 16 KiB gives ~3.7× headroom
+/// over the ~4.4 KiB data-frame floor.
+///
+/// **Network-coordination invariant:** this value must agree across
+/// all deCDN nodes on the network. iroh-gossip enforces the cap on
+/// both send and receive; tightening it asymmetrically silently
+/// partitions the gossip swarm for legitimate ``HyParView`` control
+/// frames. Treat changes as wire-compatibility events.
+pub const GOSSIP_MAX_FRAME: usize = 16 * 1024;
+
+/// Compile-time invariant: the validation-layer trailing-bytes cap
+/// must fit inside a single iroh-gossip frame with room for the
+/// envelope itself and plumtree/topic wrappers. The numeric padding
+/// reflects: ~256 B envelope (`NodeAnnounce` body + 64 B signature +
+/// version byte + postcard overhead) + ~64 B plumtree/topic message
+/// wrappers (variant tags, `MessageId`, `DeliveryScope`/`Round`).
+const _: () = assert!(
+    MAX_TRAILING_BYTES + 256 + 64 <= GOSSIP_MAX_FRAME,
+    "GOSSIP_MAX_FRAME must fit a maximally-padded GossipEnvelope plus plumtree/topic wrappers"
+);
 
 /// Validate a postcard-encoded [`GossipEnvelope`]. On success, returns the
 /// contained [`NodeAnnounce`]. The caller is responsible for threading the
@@ -125,10 +158,10 @@ pub fn validate_envelope<S: std::hash::BuildHasher>(
 
     // #577 M3: bound the trailing-bytes allowance. Reject before signature
     // verify so an attacker can't burn ed25519 cycles on a shape we'll drop
-    // regardless. iroh-gossip already allocated the full padded message —
-    // detection here surfaces the attack via metric + keeps the announce
-    // out of the peer table; tightening the upstream allocation is tracked
-    // separately (see [`MAX_TRAILING_BYTES`] doc-comment).
+    // regardless. Defence-in-depth behind [`GOSSIP_MAX_FRAME`], which
+    // already capped the iroh-gossip allocation; this surfaces shape
+    // violations under that ceiling via the rejection metric and keeps
+    // them out of the peer table.
     if rest.len() > MAX_TRAILING_BYTES {
         return Err(AnnounceReject::OversizeTrailingBytes);
     }
