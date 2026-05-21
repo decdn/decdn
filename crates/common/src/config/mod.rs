@@ -1927,6 +1927,9 @@ mod tests {
 
     // vitalik.eth, known-good EIP-55 checksum.
     const GOOD_ADDR: &str = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045";
+    const ALT_ADDR_1: &str = "0x0000000000000000000000000000000000000001";
+    const ALT_ADDR_2: &str = "0x0000000000000000000000000000000000000002";
+    const ALT_ADDR_3: &str = "0x0000000000000000000000000000000000000003";
 
     #[test]
     fn parse_contract_address_accepts_checksummed() -> anyhow::Result<()> {
@@ -5927,6 +5930,27 @@ subscribe_global = false
 "#
     }
 
+    fn blockchain_toml_body(
+        rpc_url: &str,
+        payment_channel_address: &str,
+        staking_registry_address: &str,
+        rpc_watchdog_interval_sec: Option<u64>,
+    ) -> String {
+        let watchdog = rpc_watchdog_interval_sec
+            .map(|value| format!("rpc_watchdog_interval_sec = {value}\n"))
+            .unwrap_or_default();
+        format!(
+            r#"
+[blockchain]
+rpc_url = "{rpc_url}"
+payment_channel_address = "{payment_channel_address}"
+staking_registry_address = "{staking_registry_address}"
+{watchdog}[gossip]
+subscribe_global = false
+"#
+        )
+    }
+
     /// Build a minimal `RunArgs` that, combined with `complete_toml_body`,
     /// produces a successfully-resolving config.  `data_dir` points at a
     /// tempdir holding a fake `keystore.json`, which lets `resolve_blockchain`
@@ -5972,6 +5996,102 @@ subscribe_global = false
         // not required (covers `ensure_region_when_publishing_global` happy
         // path through resolve_config).
         assert!(!resolved.gossip.subscribe_global);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_config_blockchain_override_layer_beats_file_for_required_fields()
+    -> anyhow::Result<()> {
+        // Env vars and CLI flags both populate the same top `RunArgs` layer;
+        // `run_subcommand_args_are_wired_to_decdn_env_vars` pins the env
+        // mapping, while this test pins that the populated override layer wins
+        // for every required blockchain field in one end-to-end resolve.
+        let dir = data_dir_with_keystore()?;
+        let path = write_minimal_toml(
+            &dir,
+            &blockchain_toml_body(
+                "https://file.example/rpc",
+                ALT_ADDR_1,
+                ALT_ADDR_2,
+                Some(DEFAULT_RPC_WATCHDOG_INTERVAL_SEC),
+            ),
+        )?;
+        let mut args = run_args_with_data_dir(dir.path());
+        args.blockchain.rpc_url = Some("https://override.example/rpc".to_string());
+        args.blockchain.payment_channel_address = Some(GOOD_ADDR.to_string());
+        args.blockchain.staking_registry_address = Some(ALT_ADDR_3.to_string());
+
+        let resolved = resolve_config(Some(&path), &args)?;
+
+        assert!(
+            resolved
+                .blockchain
+                .rpc_url
+                .starts_with("https://override.example/rpc"),
+            "override-layer rpc_url should win, got {}",
+            resolved.blockchain.rpc_url,
+        );
+        assert_eq!(resolved.blockchain.payment_channel_address, GOOD_ADDR);
+        assert_eq!(resolved.blockchain.staking_registry_address, ALT_ADDR_3);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_config_accepts_file_only_blockchain_fields_at_watchdog_min() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let path = write_minimal_toml(
+            &dir,
+            &blockchain_toml_body(
+                "https://file-only.example/rpc",
+                ALT_ADDR_1,
+                ALT_ADDR_2,
+                Some(MIN_RPC_WATCHDOG_INTERVAL_SEC),
+            ),
+        )?;
+        let args = run_args_with_data_dir(dir.path());
+
+        let resolved = resolve_config(Some(&path), &args)?;
+
+        assert!(
+            resolved
+                .blockchain
+                .rpc_url
+                .starts_with("https://file-only.example/rpc"),
+            "file-only rpc_url should be used, got {}",
+            resolved.blockchain.rpc_url,
+        );
+        assert_eq!(resolved.blockchain.payment_channel_address, ALT_ADDR_1);
+        assert_eq!(resolved.blockchain.staking_registry_address, ALT_ADDR_2);
+        assert_eq!(
+            resolved.blockchain.rpc_watchdog_interval_sec,
+            MIN_RPC_WATCHDOG_INTERVAL_SEC
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_config_rejects_file_only_blockchain_watchdog_below_minimum() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let path = write_minimal_toml(
+            &dir,
+            &blockchain_toml_body(
+                "https://file-only.example/rpc",
+                ALT_ADDR_1,
+                ALT_ADDR_2,
+                Some(MIN_RPC_WATCHDOG_INTERVAL_SEC - 1),
+            ),
+        )?;
+        let args = run_args_with_data_dir(dir.path());
+
+        let Err(err) = resolve_config(Some(&path), &args) else {
+            anyhow::bail!("expected resolve_config to reject a too-small watchdog interval");
+        };
+        let msg = format!("{err:#}");
+        let expected_min = format!("minimum {MIN_RPC_WATCHDOG_INTERVAL_SEC}s");
+        assert!(
+            msg.contains("blockchain.rpc_watchdog_interval_sec") && msg.contains(&expected_min),
+            "error should mention the watchdog field and floor: {msg}"
+        );
         Ok(())
     }
 
