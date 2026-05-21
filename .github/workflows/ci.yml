@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    # `edited` is included so a title change re-runs the pr-title job below;
+    # without it, branch protection would honor a previously-cached pass
+    # even after the title was edited to a non-conformant value.
+    types: [opened, synchronize, reopened, edited]
   workflow_dispatch:
 
 permissions:
@@ -660,6 +664,40 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ../.github/scripts/post-gas-snapshot-comment.sh /tmp/gas-diff.txt
 
+  pr-title:
+    name: PR title
+    runs-on: ubuntu-latest
+    # PR-only check; skipped on push to main and workflow_dispatch and
+    # accepted via ci-success allowed-skips below. Reads PR metadata only
+    # (no PR code is checked out), so running under `pull_request` rather
+    # than the prior `pull_request_target` is safe — the action just hits
+    # the GitHub API with the read-only token.
+    if: github.event_name == 'pull_request'
+    permissions:
+      pull-requests: read
+    steps:
+      - uses: amannn/action-semantic-pull-request@v6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          types: |
+            feat
+            fix
+            docs
+            chore
+            refactor
+            perf
+            test
+            build
+            ci
+            revert
+          requireScope: false
+          subjectPattern: ^(?![A-Z]).+$
+          subjectPatternError: |
+            The subject "{subject}" found in the pull request title "{title}"
+            didn't match the configured pattern. Please ensure that the subject
+            doesn't start with an uppercase character.
+
   markdownlint:
     name: markdownlint
     runs-on: ubuntu-latest
@@ -721,6 +759,7 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     needs: [fmt, clippy, changes, test, deny, doc, msrv, markdownlint, adr-book-list,
+            pr-title,
             solidity-fmt, solidity-build-test, solidity-coverage,
             solidity-solhint, solidity-slither, solidity-aderyn,
             solidity-gas-snapshot]
@@ -736,6 +775,7 @@ jobs:
           # intentionally omitted — they always run, so a skip from either
           # signals a misconfiguration that should fail the gate.
           allowed-skips: fmt, clippy, test, deny, doc, msrv, adr-book-list,
+                         pr-title,
                          solidity-fmt, solidity-build-test, solidity-coverage,
                          solidity-solhint, solidity-slither, solidity-aderyn,
                          solidity-gas-snapshot
