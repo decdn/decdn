@@ -114,23 +114,46 @@ Content records are stored in-memory at the K nodes closest to the hash in keysp
 | Parameter | Value | Rationale |
 |-----------|-------|-----------|
 | Record TTL | 1 hour | Bounds stale record lifetime after eviction |
-| Re-publish interval | 45 minutes | Re-published while blob is held, before TTL expiry |
+| Re-publish interval | jittered, mean 40 min, range [30 min, 50 min] | Re-published while blob is held, before TTL expiry; jitter spreads the targeted-DoS cost on the receiver set across a 20-minute window per record |
 | Max providers per hash | 50 | Well above useful redundancy; bounds record size |
 | Max records per node | 100,000 | ~50 MB memory at max record size |
+| Max records per publisher (per receiver) | 200 | Bounds a single publisher's storage footprint at any receiver; sized so the per-node cap admits ≥500 distinct active publishers concurrently |
 
-A node **stops re-publishing** when it evicts the blob. Stale records self-expire within TTL — no explicit retraction messages needed. **TTL is anchored on the receiver's wall-clock at acceptance time:** the receiver computes `expiry_us = receive_us + record_ttl_us`, where `receive_us` is the receiver's wall-clock microsecond timestamp at acceptance and `record_ttl_us` is the Record TTL parameter above in microseconds (1 hour = 3,600,000,000 μs). `StoreRequest` carries no sender-asserted timestamp, so record lifetime is independent of any clock the holder controls. A re-publish at 45 min refreshes the receiver's record by replacing stored `expiry_us` with one derived from the new `receive_us`, extending effective lifetime ahead of the previous expiry while the holder still has the blob. Rationale matches the receiver-anchored TTL pattern in [Appendix: Peer Table Eviction](appendix-peer-table-eviction.md#appendix-peer-table-eviction-policy).
+**Per-publisher quota and eviction.** When a receiver's per-publisher quota for some publisher P is full, the receiver MUST reject new `StoreRequest`s from P with `StoreAck { accepted: false }`. Eviction is **per-publisher LRU on receive time**, never across publishers: P flooding records can only evict P's own oldest entries. A global LRU policy is not used because it admits an exhaustion path where a single publisher fills all 100,000 slots and forces eviction of legitimate records from other publishers. The per-publisher cap also bounds the surface area of a false-STORE publisher (a node advertising hashes it does not hold) at any one receiver, so the requester's negative probe cache ([ADR 001 § Probe cache](001-network.md#probe-cache)) sees a bounded set of `(NodeId, hash)` pairs to absorb.
+
+A node **stops re-publishing** when it evicts the blob. Stale records self-expire within TTL — no explicit retraction messages needed. **TTL is anchored on the receiver's wall-clock at acceptance time:** the receiver computes `expiry_us = receive_us + record_ttl_us`, where `receive_us` is the receiver's wall-clock microsecond timestamp at acceptance and `record_ttl_us` is the Record TTL parameter above in microseconds (1 hour = 3,600,000,000 μs). `StoreRequest` carries no sender-asserted timestamp, so record lifetime is independent of any clock the holder controls. Each re-publish (scheduled within the jittered re-publish window) refreshes the receiver's record by replacing stored `expiry_us` with one derived from the new `receive_us`, extending effective lifetime ahead of the previous expiry while the holder still has the blob. Rationale matches the receiver-anchored TTL pattern in [Appendix: Peer Table Eviction](appendix-peer-table-eviction.md#appendix-peer-table-eviction-policy).
 
 #### STORE Flow (Cache Event → DHT Publish)
 
 When a node caches blob H:
 
-1. Identify the K closest nodes to H from the local routing table.
+1. Identify the K+3 closest nodes to H from the local routing table. The three positions beyond K are overflow targets — publishing to a wider set than the minimum required by the routing geometry means an attacker forcing record expiry by suppressing receivers must take down K+3 hosts rather than K.
 2. Send a `StoreRequest { hash: H, holder: self.node_id }` to each.
-3. Schedule re-publish at `T + 45 minutes`, where `T` is the local wall-clock at which step 2 was last performed for this blob.
+3. Schedule the next re-publish at `T + uniform(30 min, 50 min)`, where `T` is the local wall-clock at which step 2 was last performed for this blob. The jitter is drawn independently per record so the next re-publish window for a given hash is not predictable from outside the publisher.
 
-**Re-publish.** Re-publish reuses the same step 1–2 sequence; missed slots (e.g., local downtime) re-fire at the next scheduler tick rather than back-filling.
+**Re-publish.** Re-publish reuses the same step 1–2 sequence with a fresh jitter draw per step 3; missed slots (e.g., local downtime) re-fire at the next scheduler tick rather than back-filling.
 
 The receiving node MUST reject any record whose `holder` does not equal the authenticated NodeId of the inbound QUIC connection. NodeIds are 32-byte ed25519 public keys ([§ Routing Table](#routing-table)) and iroh's QUIC handshake authenticates the connection against that key, so the equality check binds the record to its claimed origin without a per-record signature. This depends on the publisher-only re-publish model ([§ Content Records and TTL](#content-records-and-ttl) and [§ STORE Flow (Cache Event → DHT Publish)](#store-flow-cache-event--dht-publish) step 2): records are pushed directly by the holder to the K-closest nodes and never propagated peer-to-peer. If a future scheme introduces peer relay of records (e.g., Kademlia replication-on-churn), receivers no longer have a direct authenticated connection to `holder` and a per-record signature MUST be reintroduced. In that case an in-scope sender timestamp MUST also be reintroduced inside the signed body — otherwise the captured signed bytes are constant and trivially replayable, defeating the signature ([ADR 015 § Replay Safety Analysis](015-zero-rtt.md#replay-safety-analysis) makes the same point at the transport layer). The receiver MUST additionally verify that `holder` is in the cached active-staker set (populated from `StakingRegistry.getActiveNodes()` per [ADR 019 § Step 3.3](019-node-onboarding.md#step-33--build-initial-peer-table-from-on-chain-registry)) before accepting the record; non-staked publishers are rejected with `StoreAck { accepted: false }`. Receiving nodes do **not** verify that the holder actually has the blob — that is the probe step's job. A false STORE publisher (a node claiming to hold a blob it does not) fails at probe time, degrading its reputation. **Note:** "publisher" in this ADR refers to a node publishing a DHT STORE record (an act of advertising). It is distinct from the on-chain *content publisher* identity defined in [ADR 002 § Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces), which is an Ethereum address registered in `PublisherRegistry`. Where confusion is possible this ADR uses "STORE publisher" or "holder" for the DHT-record sender.
+
+#### DHT Rate Limiting
+
+`cdn/dht/v1` inbound requests are subject to three layered token-bucket rate limits applied **before** any routing-table lookup, per-publisher quota check, or response serialization. A request must pass all three layers to be admitted; failing any layer closes the stream with QUIC application error code `0x10` (`RATE_LIMITED`) per [ADR 013 § Application Error Codes](013-schema-evolution.md#application-error-codes).
+
+| Layer | Sustained rate | Burst | Source |
+|-------|----------------|-------|--------|
+| Per-peer (NodeId) | 20 requests/sec | 40 | The source iroh `NodeId` on the QUIC connection |
+| Per-IP | 100 requests/sec | 200 | Source IP address on the QUIC connection |
+| Global | 1000 requests/sec | 2000 | All inbound DHT traffic across all peers |
+
+Checks fire cheapest-first (global → per-IP → per-peer) so a request rejected by the global cap never costs a per-IP-bucket lookup. Each admitted request consumes one token from each bucket. The three layers apply uniformly to `FindValueRequest`, `FindNodeRequest`, and `StoreRequest` — admission decisions do not inspect message type.
+
+**Why three layers, not one.** Per-peer alone is bypassable: any QUIC client can initiate a `cdn/dht/v1` connection and rotate `NodeId` at zero cost (the STORE staker-set check applies only after admission, and FIND_VALUE / FIND_NODE require no staker membership at all). The per-IP layer raises the cost of single-source flooding — IP rotation requires money (proxies, IPv6 prefix delegation, cloud bills). The global cap is defence in depth against distributed attacks across many IPs that would otherwise exhaust the node's routing-table-lookup and response-serialization capacity. The asymmetry between cheap request (`FindValueRequest` is ~40 bytes on the wire) and expensive response (full k-bucket walk plus serialization of K closer-node entries) is what makes DHT flooding economical to mount without these limits.
+
+**Interaction with the per-publisher quota.** STORE admission additionally consumes one slot from the publisher's record quota ([§ Content Records and TTL](#content-records-and-ttl)); the rate limit fires first, so a rate-limited STORE never consumes a quota slot. FIND_VALUE responses that route the requester onward (via `closer_nodes`) do not multiply rate-limit consumption on the responder — one inbound request, one bucket token, regardless of response size.
+
+**Trusted-IP exemption.** Operators MAY configure a list of trusted source IPs that bypass the per-IP layer only — typical use is peer operators with predictable cross-peer DHT traffic, or in-cluster monitoring. The trusted-IP list does NOT bypass the per-peer or global layers. Configuration key: `dht.rate_limit.trusted_ips`. The mechanism mirrors the probe-side equivalent in [ADR 005 § Probe rate limiting](005-protocol.md#probe-rate-limiting).
+
+**Observability.** `decdn_dht_rate_limit_rejections_total{layer={per_peer, per_ip, global}}` counter, same shape as the probe-side metric.
 
 #### FIND_VALUE Flow (Cache Miss → DHT Lookup)
 
@@ -138,14 +161,20 @@ When a node gets a cache miss for hash H and the probe cache is empty:
 
 1. Check local routing table for the α (=3) closest nodes to H.
 2. Send parallel `FindValueRequest { hash: H }` to all α nodes.
-3. Iterate: each responder returns known providers or closer nodes (standard iterative Kademlia).
+3. Iterate: each responder returns known providers or closer nodes (standard iterative Kademlia). Apply the lookup-integrity filters below to each response before incorporating it into the candidate set.
 4. Continue until providers are found or lookup converges (no closer nodes returned).
-5. Probe the returned `NodeId` set via `cdn/probe/v1` to confirm live availability and measure latency.
+5. Randomize the surviving provider set, then probe it via `cdn/probe/v1` to confirm live availability and measure latency.
 6. Select provider by unified node selection score ([ADR 001](001-network.md#node-selection-algorithm)); deliver via `cdn/client/v1`.
 
-**Provider ordering.** When a responder returns multiple providers in `FindValueResponse.providers`, the order SHOULD be randomized so probe traffic spreads across the set rather than concentrating on whichever provider was inserted first. The wire protocol does not enforce per-responder ordering (operators can run modified implementations); randomization is the recommended default.
+**Lookup integrity.** Three requester-side invariants govern lookup result acceptance, applied in order to each `FindValueResponse`:
 
-**Fallback:** if DHT returns no providers, fall back to the on-chain origin directory. If that also returns nothing, the blob is not available in the network.
+1. **XOR distance check on `closer_nodes`.** The requester MUST drop any `closer_nodes` entry whose XOR distance to the target hash is not strictly less than the responder's own. A responder that returns "closer" nodes that are not in fact closer is attempting to redirect the lookup; honest Kademlia responders never produce such entries. Offending entries are dropped without affecting honest entries from the same response.
+2. **Active-staker filter on `providers`.** The requester MUST filter `providers` against its cached active-staker set ([ADR 019](019-node-onboarding.md#adr-019-node-onboarding-and-bootstrapping-flow) registry cache) before probing. Non-staked NodeIds are silently dropped — they cannot legitimately hold DHT records, since STORE receivers reject non-staked publishers at admission ([§ STORE Flow (Cache Event → DHT Publish)](#store-flow-cache-event--dht-publish)), so their appearance in a response is either responder misbehavior or stale state on the responder's side.
+3. **Negative probe cache consultation on `providers`.** The requester MUST consult the negative probe cache ([ADR 001 § Probe cache](001-network.md#probe-cache)) and drop any `(NodeId, H)` pair present. A NodeId that previously returned `has_blob: false` for H within the cache TTL is not re-probed for H during that window; this bounds the cost of false-STORE publishers at the K-closest receivers to one failed probe per requester per cache window.
+
+After these three filters, the requester MUST randomize the order of the surviving provider set before issuing probe RPCs. Responder-side ordering is not authoritative: the wire protocol cannot enforce honest ordering on the response side, and a modified responder can deterministically promote attacker-controlled NodeIds to bias selection. Randomization on the requester is the load-bearing defense against ordering manipulation.
+
+**Fallback:** if DHT returns no providers (or all returned providers are filtered out by the lookup-integrity checks), fall back to the on-chain origin directory. If that also returns nothing, the blob is not available in the network.
 
 **Origin discovery.** A requester that prefers an authorized origin for a hash (e.g., a cache-miss pull where freshness from a publisher-committed source is desirable) discovers candidates through the standard DHT path. The DHT does not discriminate origin vs cache providers — `StoreRequest` is the same wire format regardless of role — so any holder may publish a record. The wire protocol does not surface origin-vs-cache status at probe time either; the requester resolves origin status off-chain by reading `PublisherRegistry.namespaceOf(hash)` and `OriginAssignment.getOrigins(namespaceId)` and intersecting against the probed peer set.
 
@@ -247,10 +276,16 @@ DHT STORE and FIND_VALUE operations carry no protocol-level fee. The incentive t
 
 1. A node in a 30-node PoC network can discover providers for a cached blob in ≤3 FIND_VALUE hops.
 2. A node in a 500-node network can discover providers in ≤5 FIND_VALUE hops.
-3. A cache event (blob added) generates ≤k (=20) outgoing STORE messages, not O(N).
+3. A cache event (blob added) generates ≤(K+3) (=23) outgoing STORE messages, not O(N).
 4. A stale STORE record (node evicted the blob) expires within TTL (1 hour) with no explicit retraction.
 5. A false STORE record (node claims to hold a blob it doesn't) fails at the probe step; the publishing node incurs a reputation penalty within one gossip cycle.
 6. During bootstrap (routing table < k entries), the on-chain origin directory provides the fallback; routing table fully populated within 2 self-lookup rounds at PoC scale.
 7. A node with `prefetch.enabled = true` observing a prefetch trigger for hash H (either ≥`prefetch.find_value_threshold` FIND_VALUE queries or ≥`prefetch.miss_threshold` local cache misses within `prefetch.threshold_window_secs`) initiates a prefetch for H, subject to the `prefetch.require_authorized_origin` gate (default `true`), the `prefetch.budget_usdc_per_hour` ceiling, and the demand-quality auto-throttle (see [§ Prefetch Decision](#prefetch-decision)).
 8. Demand signals derive from DHT FIND_VALUE traffic and local cache-miss timestamps; both are emitted as observability metrics in [Appendix: Observability](appendix-observability.md#appendix-observability-and-metrics).
 9. An accepted `StoreRequest`'s record TTL is anchored on the receiver's wall-clock at acceptance time (`expiry_us = receive_us + record_ttl_us`), independent of any holder-supplied timestamp.
+10. A receiver enforces a per-publisher record quota with per-publisher LRU eviction; a single publisher exceeding its quota receives `StoreAck { accepted: false }` and cannot evict records belonging to any other publisher.
+11. `cdn/dht/v1` inbound traffic is bounded by global, per-IP, and per-peer token buckets; rejected requests close the stream with `RATE_LIMITED` and are counted in `decdn_dht_rate_limit_rejections_total` labeled by layer.
+12. A `FindValueResponse` containing `closer_nodes` entries whose XOR distance is not strictly less than the responder's own has those entries dropped by the requester; honest entries from the same response are retained.
+13. The requester randomizes the surviving provider set before issuing `cdn/probe/v1` requests; probe order is statistically independent of `FindValueResponse.providers` order.
+14. NodeIds returning `has_blob: false` for hash H are not re-probed for H within the negative probe cache TTL ([ADR 001 § Probe cache](001-network.md#probe-cache)).
+15. Re-publish time per record is drawn from `uniform(30 min, 50 min)` independently per draw; STORE targets are the K+3 closest nodes in the publisher's routing table.

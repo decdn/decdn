@@ -94,6 +94,10 @@ A short-lived LRU cache holds `hash → Vec<(NodeId, rate_per_mb, rtt, ProbeResp
 
 **Probe cache TTL is 15 seconds** — half the 30-second slashing evidence window from [ADR 005](005-protocol.md#adr-005-wire-protocol). Probe cache TTL (15s) < `probe_hold_duration` (35s), so any cached probe response used for a stream is within both the slashing window and the eviction hold period.
 
+**Negative probe cache.** A second LRU cache holds `(NodeId, hash)` keys — NodeIds that returned `has_blob: false` for a given hash — with TTL 5 minutes and max 1024 entries. Before issuing a `cdn/probe/v1` request to a NodeId returned in a DHT FIND_VALUE response ([ADR 022 § FIND_VALUE Flow](022-content-discovery.md#find_value-flow-cache-miss--dht-lookup)), the requester consults the negative cache and drops any `(NodeId, hash)` pair present. This bounds the cost of false-STORE publishers at the receivers closest to a hash in keyspace: a publisher advertising a hash it does not hold is exposed at the probe step by a single `has_blob: false` response, and that exposure is then sticky for 5 minutes against the affected requester. Without this cache, every subsequent cache miss for the same hash would re-probe the lying publisher, draining the requester's outbound probe rate budget.
+
+**Negative cache TTL is 5 minutes** — longer than the positive cache (15s) because false-STORE results are less time-sensitive than positive-availability snapshots, and shorter than the DHT record TTL (1h) so a publisher that genuinely acquires the blob during the negative window can re-establish reachability after one cache lifetime. The cache key is `(NodeId, hash)` only — it does not retain the probe response signature, so the negative cache does not accumulate slashing evidence and is purely a request-suppression structure.
+
 #### Probe response collection
 
 After issuing the DHT FIND_VALUE + parallel `ProbeRequest` fan-out (per [ADR 022](022-content-discovery.md#find_value-flow-cache-miss--dht-lookup)), wait for probe responses in two phases:
