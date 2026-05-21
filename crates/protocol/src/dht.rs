@@ -27,8 +27,10 @@
 //! and a future `BatchStore` handler doesn't have to do a wire-breaking
 //! discriminant shuffle. The handler-side admission, two-stage rate-limit
 //! accounting, and per-receiver fallback negotiation land in a follow-up
-//! issue — the runtime treats inbound `BatchStore` frames as unsupported
-//! until then.
+//! issue — until then the runtime closes inbound `BatchStore` streams
+//! with `APP_ERR_UNSUPPORTED_MESSAGE` (`0x01`), which is the
+//! stream-close-without-ack fallback signal ADR 022 §Schema Evolution
+//! requires to trigger per-hash `Store` from the publisher.
 //!
 //! # Bounded-Vec deserialization
 //!
@@ -565,6 +567,16 @@ mod tests {
         assert!(
             framed_len <= 2_300,
             "framed max DhtMessage::FindValueResponse = {framed_len} B exceeds 2.3 KB ADR 022 ceiling"
+        );
+        // Lower-bound guard: a future regression that drops `providers` or
+        // `closer_nodes` from the wire shape would shrink the encoded
+        // size well below the ADR's modeled payload (~2.27 KB) without
+        // failing the upper-bound assert. Pin the lower bound at 2 KB so
+        // any accidental field removal trips the test loudly.
+        assert!(
+            framed_len > 2_000,
+            "framed max DhtMessage::FindValueResponse shrank to {framed_len} B \
+             — has the wire shape lost providers/closer_nodes?"
         );
         // Sanity: round-trips through the outer enum.
         let decoded: DhtMessage = postcard::from_bytes(&payload)?;
