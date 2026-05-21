@@ -229,11 +229,12 @@ pub struct ResolvedPayment {
     /// Rate per MB in USDC base units (6 decimals).
     pub rate_per_mb: u64,
     /// Lower clamp bound applied to `rate_per_mb` before signing a
-    /// `ProbeResponse` (ADR 005 §Rate bounds validation). PoC-local
-    /// stand-in for on-chain `getRateBounds().deliveryFloor`; default `0`.
+    /// `ProbeResponse` (ADR 005 §Rate bounds validation). Locally
+    /// enforced stand-in for on-chain `getRateBounds().deliveryFloor`;
+    /// default `0`.
     pub delivery_floor: u64,
     /// Upper clamp bound applied to `rate_per_mb` before signing a
-    /// `ProbeResponse`. PoC-local stand-in for
+    /// `ProbeResponse`. Locally enforced stand-in for
     /// `getRateBounds().deliveryCeiling`; default
     /// [`decdn_protocol::MAX_RATE_PER_MB`].
     pub delivery_ceiling: u64,
@@ -249,7 +250,8 @@ pub struct ResolvedGossip {
     /// Whether to subscribe to and publish on `cdn/global/v1`.
     pub subscribe_global: bool,
     /// Validated allowlist of accepted announcer node IDs. Empty = accept any
-    /// signature-valid announce (`PoC` substitute for ADR 001 rule 2).
+    /// signature-valid announce (local substitute for ADR 001 rule 2 until
+    /// the on-chain staking registry contract lands).
     pub allowlist: Vec<[u8; 32]>,
 }
 

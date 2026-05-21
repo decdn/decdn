@@ -5,9 +5,9 @@
 //! hash, and inserts the bytes before returning them to the caller. Node-to-
 //! node pull-through via `cdn/client/v1` is a follow-up once that ALPN exists.
 //!
-//! Leaf crate per ADR 023 — no `#[cfg(feature = "poc")]` here, no mode
-//! branching. The `node` crate's wiring layer selects which origin backend
-//! to construct.
+//! Leaf crate per `adr/appendix-poc-production-seams.md` — no `#[cfg(...)]`
+//! mode branching or feature flags here. The `node` crate's wiring layer
+//! selects which origin backend to construct.
 
 pub mod engine;
 pub mod error;

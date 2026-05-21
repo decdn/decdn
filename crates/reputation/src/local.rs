@@ -1,4 +1,4 @@
-//! Local reputation scoring (ADR 008 §3, §14a — `PoC` scope).
+//! Local reputation scoring (ADR 008 §3 with the §14a scope reductions).
 //!
 //! Folds delivery outcomes into a per-peer EWMA score in `[0.0, 1.0]`.
 //! In-memory only; persistence is deferred per ADR 008 §14a.3.
@@ -15,10 +15,10 @@ const DEFAULT_EXPECTED_BPS: u64 = 10 * 1024 * 1024;
 const DEFAULT_SPEED_WEIGHT: f64 = 0.4;
 const DEFAULT_CORRECTNESS_WEIGHT: f64 = 0.4;
 const DEFAULT_REACHABILITY_WEIGHT: f64 = 0.2;
-// ADR 008 §14a excludes per-report clamping for PoC. The clamp logic is kept
-// so production can opt into §8's ±0.05 cap by overriding this field, but the
-// default is `1.0` — a no-op cap given EWMA delta cannot exceed 1.0 when
-// prev, sample ∈ [0,1] and alpha ∈ [0,1].
+// ADR 008 §14a excludes per-report clamping from the local scoring rule. The
+// clamp logic is kept so operators can opt into §8's ±0.05 cap by overriding
+// this field, but the default is `1.0` — a no-op cap given EWMA delta cannot
+// exceed 1.0 when prev, sample ∈ [0,1] and alpha ∈ [0,1].
 const DEFAULT_MAX_DELTA_PER_UPDATE: f64 = 1.0;
 
 /// Validation errors when constructing a [`LocalReputation`].
@@ -69,9 +69,9 @@ pub enum Outcome {
 /// config in isolation is allowed but installing it returns
 /// [`ConfigError`].
 ///
-/// `max_delta_per_update` defaults to `1.0` (no clamping) per §14a's `PoC`
-/// scope; production operators can set it to `0.05` to enforce §8's
-/// per-report cap without code changes.
+/// `max_delta_per_update` defaults to `1.0` (no clamping) per ADR 008 §14a;
+/// operators can set it to `0.05` to enforce §8's per-report cap without
+/// code changes.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct LocalReputationConfig {
@@ -101,8 +101,8 @@ impl Default for LocalReputationConfig {
 /// In-memory store of per-peer EWMA reputation scores keyed by [`NodeId`].
 ///
 /// Cheap to share across tasks via [`std::sync::Arc`]; reads use a
-/// read-lock, writes a write-lock. `PoC` scope — no persistence, no
-/// network aggregation. See ADR 008 §14a.
+/// read-lock, writes a write-lock. No persistence and no network
+/// aggregation per ADR 008 §14a.
 #[derive(Debug)]
 pub struct LocalReputation {
     config: LocalReputationConfig,
@@ -379,10 +379,10 @@ mod tests {
 
     #[test]
     fn clamp_caps_per_update_movement() -> anyhow::Result<()> {
-        // Opt into §8 production clamp; alpha=1 makes the candidate next
-        // value equal the sample so the clamp is the only invariant under
-        // test. Without it, prev=0.5 + sample=0 would land at 0; with the
-        // 0.05 cap it lands at 0.45.
+        // Opt into the §8 ±0.05 per-report clamp; alpha=1 makes the
+        // candidate next value equal the sample so the clamp is the only
+        // invariant under test. Without it, prev=0.5 + sample=0 would land
+        // at 0; with the 0.05 cap it lands at 0.45.
         let cfg = LocalReputationConfig {
             alpha: 1.0,
             max_delta_per_update: 0.05,

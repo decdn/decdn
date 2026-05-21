@@ -114,13 +114,13 @@ impl HttpOrigin {
 
     /// Convenience constructor that parses `raw` via [`parse_origin_url`]
     /// before delegating to [`Self::new`]. Prefer [`Self::new`] in
-    /// production paths so URL validation happens at config-load time.
+    /// runtime paths so URL validation happens at config-load time.
     pub fn parse(raw: &str) -> anyhow::Result<Self> {
         Self::new(parse_origin_url(raw)?)
     }
 
-    /// Override the phase timeouts. Primarily exists for tests — prod
-    /// paths should use the defaults unless operator policy dictates
+    /// Override the phase timeouts. Primarily exists for tests — runtime
+    /// callers should use the defaults unless operator policy dictates
     /// otherwise.
     #[must_use]
     pub const fn with_timeouts(

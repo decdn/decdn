@@ -440,7 +440,7 @@ async fn probe_response_on_server_stream_returns_unsupported_code() -> anyhow::R
 // Closes #241. ProbeHandler has two phase-level timeouts that had no test
 // coverage: ACCEPT_BI_TIMEOUT (client connected but never opened a
 // bi-stream) and PROBE_READ_TIMEOUT (client opened a stream but never
-// wrote a frame). Both are 5s in production; gating tests on the real
+// wrote a frame). Both are 5s at runtime; gating tests on the real
 // deadline would slow every CI run, so instead each test uses
 // `tokio::time::pause()` + `advance()` to fast-forward the handler's
 // inner `tokio::time::timeout` future by 6s of virtual time. iroh's
@@ -760,13 +760,12 @@ async fn probe_rate_clamped_to_ceiling_before_signing() -> anyhow::Result<()> {
 }
 
 /// Verify that `QuicTransportConfig::max_idle_timeout` actually closes a
-/// silent connection (the wiring `production_transport_config` relies on).
-/// The production value is 30s per ADR 005; we shorten it to 300ms here
-/// so the test runs in well under a second. `keep_alive_interval` is
-/// parked at 60s on both ends so the path stays silent across the idle
-/// window — otherwise the keep-alive PINGs the runtime sends in
-/// production would refresh the timer and the test could never observe
-/// the close.
+/// silent connection (the wiring `quic_transport_config` relies on).
+/// The runtime value is 30s per ADR 005; we shorten it to 300ms here so
+/// the test runs in well under a second. `keep_alive_interval` is parked
+/// at 60s on both ends so the path stays silent across the idle window —
+/// otherwise the keep-alive PINGs the runtime sends would refresh the
+/// timer and the test could never observe the close.
 #[tokio::test(flavor = "multi_thread")]
 async fn idle_timeout_closes_quiet_connection() -> anyhow::Result<()> {
     let idle = Duration::from_millis(300);

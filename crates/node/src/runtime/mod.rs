@@ -89,10 +89,10 @@ const QUIC_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// connection and then closing.
 const QUIC_MAX_CONCURRENT_BIDI_STREAMS: u32 = 100;
 
-/// Production [`QuicTransportConfig`]. Tests build their own config via
+/// Runtime [`QuicTransportConfig`]. Tests build their own config via
 /// the same builder when they need to shorten the idle timeout to keep
 /// the test runtime under a second.
-fn production_transport_config() -> anyhow::Result<QuicTransportConfig> {
+fn quic_transport_config() -> anyhow::Result<QuicTransportConfig> {
     let idle_timeout: IdleTimeout = QUIC_MAX_IDLE_TIMEOUT.try_into().map_err(|e| {
         anyhow::anyhow!(
             "BUG: QUIC_MAX_IDLE_TIMEOUT={QUIC_MAX_IDLE_TIMEOUT:?} not representable as IdleTimeout: {e}"
@@ -109,8 +109,8 @@ fn production_transport_config() -> anyhow::Result<QuicTransportConfig> {
 /// the spawn site so the shutdown-promptness contract can be tested
 /// directly: a regression where the loop ignores `stop_rx` would
 /// silently extend `SHUTDOWN_DEADLINE` by up to one tick interval
-/// (60s in production), which the runtime's normal shutdown path
-/// would mask as a "task slow to drain" rather than a bug.
+/// (`DISPATCH_GC_INTERVAL` = 60s by default), which the runtime's normal
+/// shutdown path would mask as a "task slow to drain" rather than a bug.
 ///
 /// The first tick is burned so the first GC pass lands one interval
 /// after startup rather than on the same tick — there are no stale
@@ -259,7 +259,7 @@ pub async fn run(
     );
 
     let transport_config =
-        production_transport_config().context("failed to build QUIC transport config")?;
+        quic_transport_config().context("failed to build QUIC transport config")?;
     let ep = build_endpoint(&secret_key, cfg.network.bind_port, transport_config)
         .await
         .context("failed to build iroh endpoint")?;
@@ -456,7 +456,7 @@ pub async fn run(
     // TODO: GossipService should own its own shutdown (e.g. accept a
     // CancellationToken or expose `shutdown().await`) so the runtime
     // doesn't have to reach in with `.abort()`. Tracked for follow-up;
-    // PoC keeps the parent-driven abort to stay minimal.
+    // the current parent-driven abort is the minimal wiring.
     let decdn_gossip::GossipHandles {
         tasks: gossip_handles,
         announce_trigger,
@@ -709,10 +709,10 @@ async fn build_endpoint(
 /// Resolve the keystore password from CLI/env/prompt, then decrypt the
 /// keystore JSON via alloy's KDF on a blocking thread. The Arbitrum Sepolia
 /// chain id is bound on the signer so EIP-712 signers and any
-/// `eth_sendTransaction` paths inherit a deterministic value. When the
-/// production target moves to mainnet, this should be threaded through
-/// `ResolvedBlockchain` next to `rpc_url` (chain-id-keyed config is already
-/// a seam pattern; see `appendix-poc-production-seams.md` §Seam 8).
+/// `eth_sendTransaction` paths inherit a deterministic value. To target a
+/// different chain, thread the value through `ResolvedBlockchain` next to
+/// `rpc_url` (chain-id-keyed config is already a seam pattern; see
+/// `appendix-poc-production-seams.md` §Seam 8).
 async fn load_eth_signer(cfg: &ResolvedConfig) -> anyhow::Result<PrivateKeySigner> {
     use alloy::signers::Signer;
 
@@ -733,11 +733,11 @@ async fn load_eth_signer(cfg: &ResolvedConfig) -> anyhow::Result<PrivateKeySigne
     // Bind the signer to the *configured* chain id, not a hardcoded
     // constant, so the signer's chain id and the `slash_sig` EIP-712 domain
     // chain id (also `cfg.blockchain.chain_id`, see the slash domain build)
-    // can never silently diverge — e.g. on the documented mainnet move
-    // (appendix-poc-production-seams.md §Seam 8). Note: raw EIP-712
-    // `sign_hash_sync` does not consult the signer's bound chain id, so this
-    // binding only matters for any future `eth_sendTransaction` path; keeping
-    // it single-sourced is defensive against that future code.
+    // can never silently diverge — e.g. when the chain target changes via
+    // the seam in `appendix-poc-production-seams.md` §Seam 8. Note: raw
+    // EIP-712 `sign_hash_sync` does not consult the signer's bound chain
+    // id, so this binding only matters for any future `eth_sendTransaction`
+    // path; keeping it single-sourced is defensive against that future code.
     Ok(signer.with_chain_id(Some(cfg.blockchain.chain_id)))
 }
 
@@ -1442,7 +1442,7 @@ mod tests {
     /// shutdown-wins-over-tick `biased` select, a regression that
     /// dropped the stop arm or polled it after `ticker.tick()` would
     /// silently extend `SHUTDOWN_DEADLINE` by up to one full
-    /// `DISPATCH_GC_INTERVAL` (60s in production).
+    /// `DISPATCH_GC_INTERVAL` (60s by default).
     #[tokio::test]
     async fn run_dispatch_gc_exits_promptly_on_shutdown() {
         use crate::dispatch::ConnectionLimiter;
@@ -1459,10 +1459,10 @@ mod tests {
         let limiter = Arc::new(ConnectionLimiter::new(&cfg, metrics));
 
         let (stop_tx, stop_rx) = oneshot::channel::<()>();
-        // 60s interval to mirror production: the test would hang for
-        // 60s on a regression that polled the ticker before the stop
-        // signal, so the timeout below catches the real bug rather
-        // than an unrelated short-interval race.
+        // 60s interval to mirror the runtime default: the test would hang
+        // for 60s on a regression that polled the ticker before the stop
+        // signal, so the timeout below catches the real bug rather than
+        // an unrelated short-interval race.
         let task = tokio::spawn(run_dispatch_gc(
             Arc::clone(&limiter),
             stop_rx,
@@ -1608,16 +1608,16 @@ mod tests {
     }
 
     /// Guard test for ADR 005 transport defaults. Catches accidental edits to
-    /// the constants and verifies `production_transport_config()` builds
-    /// without error — the integration test in `tests/probe_loopback.rs`
-    /// rebuilds the config on its own to shorten the idle window, so without
-    /// this assertion a regression that changes the production constants (or
-    /// removes the helper's call site) would not be caught.
+    /// the constants and verifies `quic_transport_config()` builds without
+    /// error — the integration test in `tests/probe_loopback.rs` rebuilds
+    /// the config on its own to shorten the idle window, so without this
+    /// assertion a regression that changes the defaults (or removes the
+    /// helper's call site) would not be caught.
     #[test]
     fn adr_005_transport_defaults() {
         assert_eq!(QUIC_MAX_IDLE_TIMEOUT, Duration::from_secs(30));
         assert_eq!(QUIC_KEEP_ALIVE_INTERVAL, Duration::from_secs(10));
         assert_eq!(QUIC_MAX_CONCURRENT_BIDI_STREAMS, 100);
-        production_transport_config().expect("production_transport_config builds");
+        quic_transport_config().expect("quic_transport_config builds");
     }
 }

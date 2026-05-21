@@ -308,8 +308,8 @@ impl S3Origin {
     /// `pub` rather than `pub(crate)` because the integration tests live
     /// outside the crate. `#[doc(hidden)]` excludes the function from
     /// generated rustdoc only — it is technically callable by downstream
-    /// crates and is part of the semver surface by convention. Production
-    /// code uses [`Self::new`].
+    /// crates and is part of the semver surface by convention. Non-test
+    /// callers use [`Self::new`].
     #[doc(hidden)]
     pub fn from_parts(client: Client, bucket: &str, prefix: &str) -> Self {
         Self {

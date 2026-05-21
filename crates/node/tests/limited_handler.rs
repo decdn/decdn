@@ -114,7 +114,7 @@ async fn rejects_second_connection_past_global_cap() -> anyhow::Result<()> {
     let wrapper = LimitedHandler::new(inner.clone(), Arc::clone(&limiter));
 
     // Server endpoint + iroh Router with the wrapper attached. Using Router
-    // (rather than a hand-rolled accept loop) is what the production wiring
+    // (rather than a hand-rolled accept loop) is what the runtime wiring
     // does, so the test exercises the same path.
     let server_sk = fresh_key();
     let server_id = server_sk.public();

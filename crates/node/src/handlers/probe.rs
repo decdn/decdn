@@ -62,7 +62,7 @@ pub struct ProbeHandler {
     /// `blockchain.{slash_judge_address,chain_id}`.
     slash_domain: Eip712Domain,
     /// Lower/upper clamp bounds for `rate_per_mb` before signing (ADR 005
-    /// §Rate bounds validation). PoC-local stand-in for on-chain
+    /// §Rate bounds validation). Locally enforced stand-in for on-chain
     /// `getRateBounds()`.
     delivery_floor: u64,
     delivery_ceiling: u64,

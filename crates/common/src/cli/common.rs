@@ -109,7 +109,7 @@ pub fn expand_tilde(path: &Path) -> PathBuf {
 ///
 /// Wraps `dirs::home_dir()`, with a `#[cfg(test)]` thread-local seam that
 /// lets unit tests inject a deterministic home (or explicitly the
-/// "no home" branch). Production builds always go straight to
+/// "no home" branch). Non-test builds always go straight to
 /// `dirs::home_dir()`. See `test_support::with_home_override` (only
 /// compiled under `#[cfg(test)]`, so a rustdoc intra-doc link would
 /// fail to resolve in regular `cargo doc` builds).

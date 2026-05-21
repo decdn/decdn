@@ -252,9 +252,10 @@ impl ReloadableSection for PaymentSection {
             .rate_per_mb
             .swap(resolved.rate_per_mb, Ordering::Relaxed);
         // The probe handler holds `delivery_floor`/`delivery_ceiling` by
-        // value (ADR 005 §Rate bounds validation is a PoC-local seam); a
-        // changed bound is accepted by `resolve_payment` but cannot take
-        // effect until restart. Surface that rather than silently diverging.
+        // value (ADR 005 §Rate bounds validation is a locally enforced
+        // seam); a changed bound is accepted by `resolve_payment` but
+        // cannot take effect until restart. Surface that rather than
+        // silently diverging.
         if (resolved.delivery_floor, resolved.delivery_ceiling) != self.applied_bounds {
             tracing::warn!(
                 section = self.name(),
@@ -380,8 +381,8 @@ impl ReloadableSection for LogLevelSection {
 struct PinnedHashesSection {
     /// Optional handle to the live cache engine. `None` in unit tests
     /// that exercise reload semantics without a real engine; populated
-    /// in production via [`RuntimeReloadState::attach_cache`] before
-    /// the SIGHUP select loop runs.
+    /// at runtime via [`RuntimeReloadState::attach_cache`] before the
+    /// SIGHUP select loop runs.
     engine: std::sync::Mutex<Option<decdn_cache::CacheEngine>>,
     buf: std::sync::Mutex<Option<decdn_cache::PinnedHashes>>,
 }
@@ -672,8 +673,8 @@ impl RuntimeReloadState {
 
     /// Attach the live cache engine after it's been built. Must be called
     /// before the SIGHUP select loop runs — see `runtime::run`.
-    /// Detaching is permitted (pass `None`) but production code never
-    /// needs to: the engine outlives the reload state by construction.
+    /// Detaching is permitted (pass `None`) but the runtime never needs
+    /// to: the engine outlives the reload state by construction.
     ///
     /// **Poison handling.** A poisoned mutex is recovered by replacing
     /// the inner value via `PoisonError::into_inner()`, but the poison

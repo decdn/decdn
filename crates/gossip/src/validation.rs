@@ -75,9 +75,9 @@ pub const CLOCK_SKEW_TOLERANCE_US: u64 = 60 * 1_000_000;
 /// (rule 4) is enforced against the latest stored entry.
 ///
 /// `allowlist` is checked only if non-empty: empty allowlist means accept
-/// any signature-valid announce. This is the `PoC` stand-in for ADR 001
-/// rule 2 (on-chain staking registry check) until the registry contract
-/// lands; it is not an implementation of the rule itself.
+/// any signature-valid announce. This stands in for ADR 001 rule 2
+/// (on-chain staking registry check) until the registry contract lands;
+/// it is not an implementation of the rule itself.
 pub fn validate_envelope<S: std::hash::BuildHasher>(
     bytes: &[u8],
     now_us: u64,

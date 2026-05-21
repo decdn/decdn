@@ -74,8 +74,8 @@ pub struct BlockchainConfig {
     /// than defaulting.
     pub slash_judge_address: Option<String>,
     /// EIP-712 `chainId` bound into every `slash_sig` domain separator.
-    /// Absent => [`super::DEFAULT_CHAIN_ID`] (Arbitrum Sepolia, the `PoC`
-    /// testnet target — matches the chain id bound on the runtime signer).
+    /// Absent => [`super::DEFAULT_CHAIN_ID`] (Arbitrum Sepolia, the initial
+    /// network target — matches the chain id bound on the runtime signer).
     pub chain_id: Option<u64>,
     /// Seconds between RPC connectivity watchdog probes. `0` disables the
     /// watchdog entirely; absent => default (30s). Non-zero values below
@@ -344,7 +344,7 @@ pub struct S3OriginConfig {
 /// # — or —
 /// [cache.origin.credentials]
 /// source = "default-chain"
-/// # profile = "production"       # optional, override default profile
+/// # profile = "my-profile"       # optional, override default profile
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "source", rename_all = "kebab-case", deny_unknown_fields)]
@@ -380,14 +380,14 @@ pub struct PaymentConfig {
     /// Rate per MB in USDC base units.
     pub rate_per_mb: Option<u64>,
     /// Lower bound the node clamps `rate_per_mb` to before signing a
-    /// `ProbeResponse` (ADR 005 §Rate bounds validation). PoC-local
-    /// stand-in for the on-chain `getRateBounds().deliveryFloor`. Absent =>
-    /// `0` (no floor; current behavior unchanged).
+    /// `ProbeResponse` (ADR 005 §Rate bounds validation). Locally
+    /// enforced stand-in for the on-chain `getRateBounds().deliveryFloor`.
+    /// Absent => `0` (no floor; current behavior unchanged).
     pub delivery_floor: Option<u64>,
     /// Upper bound the node clamps `rate_per_mb` to before signing a
-    /// `ProbeResponse` (ADR 005 §Rate bounds validation). PoC-local
-    /// stand-in for the on-chain `getRateBounds().deliveryCeiling`. Absent
-    /// => [`decdn_protocol::MAX_RATE_PER_MB`] (no effective ceiling;
+    /// `ProbeResponse` (ADR 005 §Rate bounds validation). Locally
+    /// enforced stand-in for the on-chain `getRateBounds().deliveryCeiling`.
+    /// Absent => [`decdn_protocol::MAX_RATE_PER_MB`] (no effective ceiling;
     /// current behavior unchanged).
     pub delivery_ceiling: Option<u64>,
 }
@@ -405,7 +405,8 @@ pub struct GossipConfig {
     pub subscribe_global: Option<bool>,
     /// Optional allowlist of accepted announcer node IDs, hex-encoded
     /// (64 hex chars, either case). Absent/empty = accept any signature-valid
-    /// announce. `PoC` replacement for ADR 001 rule 2 (staked-node check).
+    /// announce. Local stand-in for ADR 001 rule 2 (staked-node check)
+    /// until the on-chain staking registry contract lands.
     pub allowlist: Option<Vec<String>>,
 }
 
@@ -425,7 +426,8 @@ pub struct GossipConfig {
 /// **Caveats:** during a shrink the live concurrency cap is `>= new`
 /// until enough handlers drain; under racing reloads (N→N+1→N) the
 /// post-task permit count may briefly land anywhere in `[N, N+1]`
-/// until the next reload reconciles. Acceptable at `PoC` scale.
+/// until the next reload reconciles. Accepted as a known trade-off:
+/// strict resize semantics would require a full handler-drain barrier.
 ///
 /// Token-bucket state is *not* preserved across a reload — the keyed
 /// limiter is rebuilt from scratch. Operators tuning the per-source

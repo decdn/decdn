@@ -97,14 +97,15 @@ pub struct DecdnMetrics {
     /// knob sizes only the *client* `ClientSessionMemoryCache`). The
     /// value saturates at `SESSION_TICKET_CACHE_CEILING` because the
     /// backing set is bounded there for memory safety, not because it
-    /// tracks a cache of that size — close at `PoC` scale either way.
+    /// tracks a cache of that size — close enough at deployment scales
+    /// where the cap is rarely hit organically.
     pub quic_session_ticket_cache_size: Gauge,
     /// Distinct *new* peers dropped from the tracking set because it hit
-    /// `SESSION_TICKET_CACHE_CEILING`. Zero under organic load at `PoC`
-    /// scale; a rising value means the unauthenticated probe handler is
-    /// being fed many distinct node ids — i.e. it distinguishes a
-    /// Sybil-style saturation from the gauge legitimately reaching the
-    /// ceiling. Operator-visible name:
+    /// `SESSION_TICKET_CACHE_CEILING`. Zero under organic load at
+    /// expected deployment scales; a rising value means the
+    /// unauthenticated probe handler is being fed many distinct node ids
+    /// — i.e. it distinguishes a Sybil-style saturation from the gauge
+    /// legitimately reaching the ceiling. Operator-visible name:
     /// `decdn_quic_session_ticket_peers_dropped_total`.
     pub quic_session_ticket_peers_dropped: Counter,
     /// `decdn_probe_hold_violations_total` per the canonical metric registry
@@ -369,7 +370,7 @@ impl Metrics {
     }
 
     /// Read the current value of the `rpc_healthy` gauge. Test-only —
-    /// production code should rely on the `OpenMetrics` endpoint rather
+    /// non-test callers should rely on the `OpenMetrics` endpoint rather
     /// than reaching into individual gauges.
     #[cfg(test)]
     pub(crate) fn rpc_healthy_value(&self) -> i64 {

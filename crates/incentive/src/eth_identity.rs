@@ -38,12 +38,13 @@ use zeroize::Zeroizing;
 /// loader.
 pub const KEYSTORE_PASSWORD_ENV: &str = "DECDN_KEYSTORE_PASSWORD";
 
-/// Arbitrum Sepolia chain id — decdn's `PoC` testnet target. Bound on every
-/// `PrivateKeySigner` used in the runtime (and the test helpers) so EIP-712
-/// signing and any `eth_sendTransaction` paths inherit a deterministic value.
-/// When the production target moves to mainnet, this should be threaded
-/// through `ResolvedBlockchain` next to `rpc_url` (chain-id-keyed config is
-/// already a seam pattern; see `appendix-poc-production-seams.md` §Seam 8).
+/// Arbitrum Sepolia chain id — decdn's initial network target. Bound on
+/// every `PrivateKeySigner` used in the runtime (and the test helpers) so
+/// EIP-712 signing and any `eth_sendTransaction` paths inherit a
+/// deterministic value. To target a different chain, thread the value
+/// through `ResolvedBlockchain` next to `rpc_url` (chain-id-keyed config
+/// is already a seam pattern; see `appendix-poc-production-seams.md`
+/// §Seam 8).
 pub const ARBITRUM_SEPOLIA_CHAIN_ID: u64 = 421_614;
 
 const KEYSTORE_FILE_NAME: &str = "keystore.json";

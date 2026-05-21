@@ -136,8 +136,8 @@ pub enum StoreError {
 }
 
 /// In-memory [`ChannelStateStore`] for tests and the trait's reference
-/// semantics. Not durable — drops with the process. Production wiring uses
-/// the redb-backed impl in `crates/node`.
+/// semantics. Not durable — drops with the process. The runtime uses the
+/// redb-backed impl in `crates/node`.
 #[derive(Debug, Default)]
 pub struct MemoryChannelStateStore {
     inner: Mutex<HashMap<ChannelId, ChannelState>>,
