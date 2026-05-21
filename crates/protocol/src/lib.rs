@@ -3,11 +3,16 @@
 //! This is the leaf crate in the dependency graph — it has minimal dependencies
 //! and defines the shared vocabulary used by all other deCDN crates.
 
+pub mod dht;
 pub mod framing;
 pub mod gossip;
 pub mod message;
 pub mod region;
 
+pub use dht::{
+    DhtMessage, FindNodeRequest, FindNodeResponse, FindValueRequest, FindValueResponse,
+    MAX_CLOSER_NODES, MAX_PROVIDERS_PER_HASH, StoreAck, StoreRequest,
+};
 pub use framing::{
     FrameError, MAX_MESSAGE_SIZE, decode_message, encode_message, read_frame, write_frame,
 };
