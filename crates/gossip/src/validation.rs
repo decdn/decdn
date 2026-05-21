@@ -82,13 +82,15 @@ pub const CLOCK_SKEW_TOLERANCE_US: u64 = 60 * 1_000_000;
 /// bytes as the forward-compat extension mechanism; a sane envelope
 /// today is ~150 bytes and any plausible future Tier-1 extension is
 /// expected to be well under 4 KiB. The ceiling defends against a peer
-/// padding announces up to iroh-gossip's per-message limit (~16 MiB) to
-/// force allocations across the gossip fan-out without changing any
-/// observable wire shape — this cap stays well above any legitimate
-/// extension while making the attack visible via the
+/// padding announces up to deCDN's `MAX_MESSAGE_SIZE` (16 MiB, ADR 013
+/// §Wire Framing — `decdn_protocol::framing::MAX_MESSAGE_SIZE`, enforced
+/// by the read path) to force allocations across the gossip fan-out
+/// without changing any observable wire shape. This cap stays well above
+/// any legitimate extension while making the attack visible via the
 /// `oversize_trailing_bytes` rejection metric. Per-ALPN tightening of
-/// the upstream iroh-gossip allocation is a separate concern (see ADR
-/// 013 §Wire Framing operator-policy note).
+/// the upstream allocation is a separate concern — see the operator-
+/// policy note in ADR 013 §Wire Framing ("Operators on memory-constrained
+/// nodes SHOULD set a lower `MAX_MESSAGE_SIZE` as local policy").
 pub const MAX_TRAILING_BYTES: usize = 4 * 1024;
 
 /// Validate a postcard-encoded [`GossipEnvelope`]. On success, returns the
@@ -511,8 +513,9 @@ mod tests {
     /// [`MAX_TRAILING_BYTES`] of trailing bytes is accepted (the `>` in
     /// the size gate). A regression that flipped `>` to `>=` (or
     /// vice-versa) is the failure mode this pair catches. Mirrors the
-    /// existing `evict_at_exact_cutoff` / `one_microsecond_past_cutoff`
-    /// boundary discipline in `peer_table::tests`.
+    /// existing `evict_at_exact_cutoff_keeps_entry` /
+    /// `evict_one_microsecond_past_cutoff_removes_entry` boundary
+    /// discipline in `peer_table::tests`.
     #[test]
     fn accepts_trailing_bytes_at_threshold() {
         let sk = fresh_key();
@@ -521,6 +524,36 @@ mod tests {
         assert!(
             validate_envelope(&bytes, 1_700_000_000_000_000, &no_list()).is_ok(),
             "exactly MAX_TRAILING_BYTES of padding must be accepted"
+        );
+    }
+
+    /// #577 M3 — pins the *ordering* of size-check vs signature-verify.
+    /// The variant's doc-comment promises: "Place the check before
+    /// signature verification — no point spending ed25519 cycles on an
+    /// envelope that's going to be rejected for shape." A regression
+    /// that swapped the order (verify-first) would still pass
+    /// [`rejects_oversize_trailing_bytes`] because the inner envelope's
+    /// signature is valid; this test corrupts the signature *and*
+    /// over-pads so verify-first would surface `InvalidSignature`
+    /// instead of `OversizeTrailingBytes`. The assertion locks the
+    /// ed25519-cycle-saving guarantee at the test layer.
+    #[test]
+    fn rejects_oversize_before_checking_signature() {
+        let sk = fresh_key();
+        let body = sample_body(&sk, 1_700_000_000_000_000);
+        // Garbage signature — verify would fail with InvalidSignature.
+        let mut bytes = encode(&GossipEnvelope {
+            version: GOSSIP_VERSION,
+            payload: GossipPayload::NodeAnnounce(NodeAnnounce {
+                body,
+                signature: vec![7u8; SIGNATURE_LEN],
+            }),
+        });
+        bytes.extend(std::iter::repeat_n(0xAAu8, MAX_TRAILING_BYTES + 1));
+        assert_eq!(
+            validate_envelope(&bytes, 1_700_000_000_000_000, &no_list()),
+            Err(AnnounceReject::OversizeTrailingBytes),
+            "size check must run BEFORE signature verify"
         );
     }
 }
