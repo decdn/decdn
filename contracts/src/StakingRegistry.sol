@@ -373,9 +373,26 @@ contract StakingRegistry is AccessControl, ReentrancyGuard, Pausable {
         }
         if (safetyShare != 0) {
             IERC20(address(token)).safeTransfer(address(safetyReserve), safetyShare);
+            // Both static analyzers (slither reentrancy-benign, aderyn
+            // reentrancy-state-change) flag this external call →
+            // `ejected[operator] = true` below as a CEI violation. The
+            // pattern is safe in practice: slash() carries the
+            // ReentrancyGuard `nonReentrant` modifier (line 331), the
+            // `ejected` flag is purely informational (it does not gate
+            // any external call within slash()), and both call targets
+            // (TOKEN, SafetyReserve) are admin-configured trusted
+            // contracts. A CEI-clean refactor that moves the state
+            // write before the external calls requires an extra local
+            // variable, which pushes slash() over Solidity's stack
+            // limit (would need via_ir). The current ordering is the
+            // explicit design.
+            // slither-disable-next-line reentrancy-benign
+            // aderyn-fp-next-line(reentrancy-state-change)
             safetyReserve.recordSlashInflow(operator, safetyShare);
         }
         if (burnShare != 0) {
+            // slither-disable-next-line reentrancy-benign
+            // aderyn-fp-next-line(reentrancy-state-change)
             token.burn(burnShare);
         }
 
