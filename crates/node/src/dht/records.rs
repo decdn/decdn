@@ -60,11 +60,16 @@ impl InsertOutcome {
 }
 
 /// A single `(holder, hash)` record. `receive_us` is the receiver-anchored
-/// wall-clock at acceptance; `expiry_us = receive_us + ttl_us`.
+/// wall-clock at acceptance (ADR 022 §Content Records and TTL line 122);
+/// `expiry_us = receive_us + ttl_us` strictly — no monotonic tie-breaker
+/// mixed in, so TTL never drifts with insert volume. `sequence` is the
+/// per-insert monotonic counter used only to break wall-clock collisions
+/// in the [`RecordStore::global_lru`] ordering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HolderEntry {
     holder: NodeId,
     receive_us: u64,
+    sequence: u64,
     expiry_us: u64,
 }
 
@@ -112,16 +117,19 @@ pub struct RecordStore {
     /// of distinct hashes that holder currently has records for. Stays
     /// in sync with `by_hash` via every insert/evict/expire path.
     by_publisher_count: HashMap<NodeId, usize>,
-    /// Global LRU ordering keyed by `(receive_us, hash, holder)`. The
-    /// tuple is unique enough in practice (microsecond resolution +
-    /// 32-byte hash + 32-byte holder); under burst collisions the
-    /// `BTreeSet` semantics naturally serialise.
-    global_lru: BTreeSet<(u64, Hash, NodeId)>,
-    /// Monotonic counter applied to `receive_us` so two
-    /// `insert_at(holder, hash, ts)` calls with the same wall-clock
-    /// timestamp still produce distinct keys in `global_lru`. We mix it
-    /// into the low bits of `receive_us` at `insert_at` time.
-    monotonic_tail: u64,
+    /// Global LRU ordering keyed by `(receive_us, sequence, hash, holder)`.
+    /// `receive_us` is the wall-clock at acceptance; `sequence` is a
+    /// monotonic counter that breaks wall-clock collisions under burst.
+    /// Since `ttl_us` is constant, ordering by this tuple is also
+    /// ordering by `expiry_us` — which is what makes [`RecordStore::gc`]
+    /// an `O(expired)` front-walk rather than an `O(N)` scan.
+    global_lru: BTreeSet<(u64, u64, Hash, NodeId)>,
+    /// Monotonic per-insert counter feeding the `sequence` field of new
+    /// records (and the second component of `global_lru` keys). Kept
+    /// strictly distinct from `receive_us` so the
+    /// `expiry_us = receive_us + ttl_us` invariant from ADR 022 line
+    /// 122 holds — TTL does not drift forward with insert volume.
+    next_sequence: u64,
 }
 
 impl RecordStore {
@@ -133,7 +141,7 @@ impl RecordStore {
             by_hash: HashMap::new(),
             by_publisher_count: HashMap::new(),
             global_lru: BTreeSet::new(),
-            monotonic_tail: 0,
+            next_sequence: 0,
         }
     }
 
@@ -164,13 +172,15 @@ impl RecordStore {
     /// quota with hard reject, global LRU with eviction, per-hash provider
     /// cap with oldest-provider eviction).
     pub fn insert_at(&mut self, holder: NodeId, hash: Hash, receive_us: u64) -> InsertOutcome {
-        // Mix in a monotonic tail so the global_lru key stays unique
-        // even under bursty wall-clock returns. The mixing is additive
-        // and dominated by the high-order microsecond bits in normal
-        // operation; the BTreeSet ordering is still effectively "oldest
-        // first" because the wall-clock dominates.
-        self.monotonic_tail = self.monotonic_tail.wrapping_add(1);
-        let receive_us = receive_us.saturating_add(self.monotonic_tail);
+        // Allocate one monotonic sequence per call. Stored on the entry
+        // and used as the second component of the `global_lru` key, so
+        // wall-clock collisions don't collapse two records onto one
+        // BTreeSet slot. Crucially this is NOT mixed into `receive_us`
+        // or `expiry_us` — TTL stays exactly `ttl_us` after wall-clock
+        // acceptance per ADR 022 line 122.
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.wrapping_add(1);
+        let expiry_us = receive_us.saturating_add(self.cfg.ttl_us);
 
         // Refresh path: holder already has a record for this hash.
         if let Some(entries) = self.by_hash.get_mut(&hash)
@@ -185,13 +195,15 @@ impl RecordStore {
                 return InsertOutcome::Refreshed;
             };
             let prev = *slot;
-            self.global_lru.remove(&(prev.receive_us, hash, holder));
+            self.global_lru
+                .remove(&(prev.receive_us, prev.sequence, hash, holder));
             *slot = HolderEntry {
                 holder,
                 receive_us,
-                expiry_us: receive_us.saturating_add(self.cfg.ttl_us),
+                sequence,
+                expiry_us,
             };
-            self.global_lru.insert((receive_us, hash, holder));
+            self.global_lru.insert((receive_us, sequence, hash, holder));
             return InsertOutcome::Refreshed;
         }
 
@@ -202,44 +214,57 @@ impl RecordStore {
             return InsertOutcome::RejectedQuotaExceeded;
         }
 
-        // Global cap: when full, evict globally-oldest. By construction
-        // the inserting publisher is below its per-publisher cap here
-        // (we just checked), so the eviction is safe under ADR 022's
-        // two-tier rule.
-        if self.global_lru.len() >= self.cfg.max_records_global {
-            self.evict_globally_oldest();
-        }
-
-        // Per-hash provider cap: if at the wire-response cap, evict the
-        // oldest holder for that hash to make room. ADR 022 doesn't
-        // mandate a specific eviction policy at the per-hash cap — we
-        // pick oldest-receive because (a) `closer_nodes` is already
-        // capped at this number on the response side and (b) the
-        // newcomer is the one most likely to still be live.
-        let entries = self.by_hash.entry(hash).or_default();
-        if entries.len() >= self.cfg.max_providers_per_hash {
-            // Find the entry with the smallest receive_us.
-            if let Some((idx, oldest)) = entries
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, e)| e.receive_us)
-                .map(|(i, e)| (i, *e))
-            {
-                self.global_lru
-                    .remove(&(oldest.receive_us, hash, oldest.holder));
-                let old_holder = oldest.holder;
-                entries.swap_remove(idx);
-                Self::decrement_publisher_count(&mut self.by_publisher_count, &old_holder);
+        // Per-hash provider cap, FIRST. If this hash is at the wire cap
+        // we'll evict one of its existing holders and net out at the
+        // same global count — so the global LRU below MUST NOT also
+        // fire (otherwise one insert produces two evictions and leaves
+        // the store under-full). The block scope releases the `&mut`
+        // borrow on `self.by_hash` before we re-borrow `self` for
+        // global-LRU eviction.
+        let grows_global = {
+            let entries = self.by_hash.entry(hash).or_default();
+            if entries.len() >= self.cfg.max_providers_per_hash {
+                // Find the entry with the smallest receive_us (oldest
+                // by ADR 022's receiver-anchored ordering). ADR 022
+                // doesn't mandate a specific per-hash eviction policy
+                // — we pick oldest-receive because the newcomer is the
+                // one most likely to still be live.
+                if let Some((idx, oldest)) = entries
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, e)| e.receive_us)
+                    .map(|(i, e)| (i, *e))
+                {
+                    let key = (oldest.receive_us, oldest.sequence, hash, oldest.holder);
+                    let old_holder = oldest.holder;
+                    entries.swap_remove(idx);
+                    self.global_lru.remove(&key);
+                    Self::decrement_publisher_count(&mut self.by_publisher_count, &old_holder);
+                    false
+                } else {
+                    true
+                }
+            } else {
+                true
             }
+        };
+
+        // Global cap fires only when we're actually about to grow the
+        // store. By construction the inserting publisher is below its
+        // per-publisher cap here (checked above) so global LRU eviction
+        // is safe under ADR 022's two-tier rule.
+        if grows_global && self.global_lru.len() >= self.cfg.max_records_global {
+            self.evict_globally_oldest();
         }
 
         let entry = HolderEntry {
             holder,
             receive_us,
-            expiry_us: receive_us.saturating_add(self.cfg.ttl_us),
+            sequence,
+            expiry_us,
         };
-        entries.push(entry);
-        self.global_lru.insert((receive_us, hash, holder));
+        self.by_hash.entry(hash).or_default().push(entry);
+        self.global_lru.insert((receive_us, sequence, hash, holder));
         *self.by_publisher_count.entry(holder).or_insert(0) += 1;
         InsertOutcome::Inserted
     }
@@ -263,20 +288,44 @@ impl RecordStore {
             .unwrap_or_default()
     }
 
-    /// Periodic GC sweep — removes every expired record from every
-    /// index. Intended to run on a tokio interval; the wall-clock cost
-    /// scales linearly with the global record count.
+    /// Periodic GC sweep — drops every expired record across the store.
+    /// Returns the number removed.
+    ///
+    /// `ttl_us` is constant for all records, so `global_lru` (ordered by
+    /// `receive_us`) is ALSO ordered by `expiry_us` — the oldest entries
+    /// are always at the front. The sweep pops from `global_lru.first()`
+    /// until it sees a non-expired record and returns, which is
+    /// `O(expired × log N)` rather than the previous `O(N)` full scan.
     pub fn gc(&mut self, now_us: u64) -> usize {
         let mut removed = 0usize;
-        // Walk hashes; for each, drop expired entries and update indexes.
-        let hashes: Vec<Hash> = self.by_hash.keys().copied().collect();
-        for h in hashes {
-            removed += self.scrub_hash_expired(&h, now_us);
+        while let Some(&(receive_us, sequence, hash, holder)) = self.global_lru.iter().next() {
+            // `expiry_us = receive_us + ttl_us` by construction. We
+            // recompute it here rather than carrying it in the key so
+            // the BTreeSet ordering doesn't depend on a derived field.
+            let expiry_us = receive_us.saturating_add(self.cfg.ttl_us);
+            if expiry_us > now_us {
+                break;
+            }
+            self.global_lru
+                .remove(&(receive_us, sequence, hash, holder));
+            if let Some(entries) = self.by_hash.get_mut(&hash) {
+                if let Some(idx) = entries.iter().position(|e| e.holder == holder) {
+                    entries.swap_remove(idx);
+                }
+                if entries.is_empty() {
+                    self.by_hash.remove(&hash);
+                }
+            }
+            Self::decrement_publisher_count(&mut self.by_publisher_count, &holder);
+            removed += 1;
         }
         removed
     }
 
     /// Drop expired holders for `hash`. Returns the number removed.
+    /// Called by [`Self::providers_at`] on the read path so a stale
+    /// holder never appears in a `FindValueResponse` even between GC
+    /// ticks.
     fn scrub_hash_expired(&mut self, hash: &Hash, now_us: u64) -> usize {
         let Some(entries) = self.by_hash.get_mut(hash) else {
             return 0;
@@ -290,7 +339,8 @@ impl RecordStore {
                 break;
             };
             if e.expiry_us <= now_us {
-                self.global_lru.remove(&(e.receive_us, *hash, e.holder));
+                self.global_lru
+                    .remove(&(e.receive_us, e.sequence, *hash, e.holder));
                 entries.swap_remove(i);
                 Self::decrement_publisher_count(&mut self.by_publisher_count, &e.holder);
                 removed += 1;
@@ -306,10 +356,11 @@ impl RecordStore {
 
     /// Evict the globally-oldest record from every index.
     fn evict_globally_oldest(&mut self) {
-        let Some(&(receive_us, hash, holder)) = self.global_lru.iter().next() else {
+        let Some(&(receive_us, sequence, hash, holder)) = self.global_lru.iter().next() else {
             return;
         };
-        self.global_lru.remove(&(receive_us, hash, holder));
+        self.global_lru
+            .remove(&(receive_us, sequence, hash, holder));
         if let Some(entries) = self.by_hash.get_mut(&hash)
             && let Some(idx) = entries.iter().position(|e| e.holder == holder)
         {
@@ -516,5 +567,97 @@ mod tests {
             s.insert_at(nid(1), h(99), 200),
             InsertOutcome::RejectedQuotaExceeded
         );
+    }
+
+    /// ADR 022 §Content Records and TTL line 122: `expiry_us =
+    /// receive_us + record_ttl_us`. A previous implementation mixed a
+    /// monotonic insert counter into `receive_us`, which made TTL drift
+    /// forward with insert volume (1M inserts ≈ 1s drift). This test
+    /// pins the no-drift contract by inserting one record after a
+    /// million unrelated inserts and confirming its TTL is *exactly*
+    /// `ttl_us` after the wall-clock it was admitted at.
+    #[test]
+    fn ttl_is_anchored_to_wall_clock_regardless_of_insert_volume() {
+        let mut cfg = small_cfg();
+        cfg.max_records_per_publisher = usize::MAX;
+        cfg.max_records_global = usize::MAX;
+        cfg.max_providers_per_hash = usize::MAX;
+        cfg.ttl_us = 1_000;
+        let mut s = RecordStore::new(cfg);
+        // Burn 10k inserts on a separate hash so the monotonic counter
+        // advances well past `ttl_us` (10_000 > 1_000). The prior
+        // implementation would have shifted `expiry_us` forward by
+        // ~10k μs at this point; we want exact equality with
+        // `receive_us + ttl_us`.
+        for i in 0..10_000u32 {
+            let mut holder = [0u8; 32];
+            holder[..4].copy_from_slice(&i.to_le_bytes());
+            s.insert_at(holder, h(0xEE), 500);
+        }
+        // Insert the record under test at wall-clock 500.
+        s.insert_at(nid(0xCC), h(0xFF), 500);
+        // Expiry MUST be exactly 500 + 1_000 = 1_500, with no drift
+        // from the prior 100k inserts.
+        let entries = s.by_hash.get(&h(0xFF)).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].expiry_us, 1_500,
+            "TTL drifted to {} — must be exactly receive_us + ttl_us",
+            entries[0].expiry_us,
+        );
+        // And consequently the record is still alive at wall-clock 1_499
+        // and dead at 1_501 (i.e. the TTL window is exactly ttl_us long).
+        assert_eq!(s.providers_at(&h(0xFF), 1_499).len(), 1);
+        assert!(s.providers_at(&h(0xFF), 1_501).is_empty());
+    }
+
+    /// Regression guard for the "two evictions for one insert" bug. When
+    /// the global cap is full AND the inserting hash is at the per-hash
+    /// provider cap, only the per-hash eviction must fire (it nets the
+    /// store out at the same global count). A prior implementation
+    /// evicted globally first, then evicted within the hash — leaving
+    /// the store under-full by one record AND dropping an unrelated
+    /// hash's holder.
+    #[test]
+    fn insert_at_per_hash_cap_does_not_also_trigger_global_eviction() {
+        // Build a config that's easy to saturate: global = 4,
+        // per-hash = 2, per-publisher = 4.
+        let cfg = RecordStoreConfig {
+            max_records_per_publisher: 4,
+            max_records_global: 4,
+            max_providers_per_hash: 2,
+            ttl_us: 1_000_000,
+        };
+        let mut s = RecordStore::new(cfg);
+        // Fill hash A (target) to per-hash cap (2 holders).
+        s.insert_at(nid(1), h(0xAA), 10);
+        s.insert_at(nid(2), h(0xAA), 20);
+        // Fill hash B with two unrelated records to take the store to
+        // the global cap (4 total).
+        s.insert_at(nid(3), h(0xBB), 30);
+        s.insert_at(nid(4), h(0xBB), 40);
+        assert_eq!(s.len(), 4);
+        // Insert into hash A from a new publisher. Per-hash cap fires
+        // (evicts oldest A holder = nid(1)). Global cap MUST NOT also
+        // fire — otherwise hash B's oldest (nid(3) for hash 0xBB)
+        // would be wrongly dropped.
+        let out = s.insert_at(nid(5), h(0xAA), 50);
+        assert_eq!(out, InsertOutcome::Inserted);
+        assert_eq!(s.len(), 4, "global count must remain at the cap");
+        // Hash A: nid(2) and nid(5); nid(1) was evicted by per-hash cap.
+        let a_holders: std::collections::HashSet<_> =
+            s.providers_at(&h(0xAA), 0).into_iter().collect();
+        assert!(!a_holders.contains(&nid(1)));
+        assert!(a_holders.contains(&nid(2)));
+        assert!(a_holders.contains(&nid(5)));
+        // Hash B: BOTH original holders survive — global LRU did NOT
+        // fire on the same insert.
+        let b_holders: std::collections::HashSet<_> =
+            s.providers_at(&h(0xBB), 0).into_iter().collect();
+        assert!(
+            b_holders.contains(&nid(3)),
+            "hash B's nid(3) must NOT be evicted by the per-hash-cap insert into hash A"
+        );
+        assert!(b_holders.contains(&nid(4)));
     }
 }

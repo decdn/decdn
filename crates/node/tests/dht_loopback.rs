@@ -53,9 +53,12 @@ fn permissive_limiter(metrics: &Arc<Metrics>) -> Arc<ConnectionLimiter> {
     Arc::new(ConnectionLimiter::new(&cfg, Arc::clone(metrics)))
 }
 
-/// A `StakerSet` that admits any `NodeId` — used by tests that don't
-/// exercise the active-staker filter so they don't have to enumerate
-/// every test peer in a `HashSet`.
+/// `StakerSet` test stub: every `is_active` returns `true`. The
+/// `active_nodes` / `len` overrides are intentionally NOT enumerable —
+/// no real test consumer of this helper iterates the set, and faking
+/// an infinite or empty list would lie either way. Tests that *do*
+/// need a concrete active set use the production `ConfigStakerSet`
+/// with an explicit `HashSet`.
 #[derive(Debug)]
 struct AllStaked;
 
@@ -63,11 +66,19 @@ impl StakerSet for AllStaked {
     fn is_active(&self, _: &[u8; 32]) -> bool {
         true
     }
+    /// Returns empty — this helper is not enumerable. Any code that
+    /// reads `active_nodes()` from `AllStaked` is using the wrong
+    /// helper for its test; switch to `ConfigStakerSet` with a real
+    /// `HashSet` of peers instead.
     fn active_nodes(&self) -> Vec<[u8; 32]> {
         Vec::new()
     }
+    /// Returns 0 to stay consistent with [`Self::active_nodes`]. A
+    /// previous version returned `usize::MAX` to convey "this
+    /// effectively admits everyone", but the two views (set length vs.
+    /// set contents) MUST agree per the [`StakerSet`] trait contract.
     fn len(&self) -> usize {
-        usize::MAX
+        0
     }
 }
 

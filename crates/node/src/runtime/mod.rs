@@ -150,6 +150,59 @@ async fn run_dispatch_gc(
     }
 }
 
+/// Periodic DHT record-store GC task (ADR 022 §Content Records and TTL).
+///
+/// `RecordStore::providers_at` lazily scrubs expired records for the
+/// hash it's queried about, but a hash that nobody ever queries again
+/// keeps its expired entries — they continue to count against the
+/// publisher's per-publisher quota and against the global cap until
+/// this task fires. Without it a node that publishes a one-shot blob
+/// can eventually exhaust its 200-record quota and have every future
+/// `Store` rejected.
+///
+/// The sweep is `O(expired × log N)` over the global LRU thanks to the
+/// front-walk in [`crate::dht::RecordStore::gc`]. Default interval is
+/// 60s — well below the 1-hour record TTL.
+// Same linear shape as `run_dispatch_gc` above (tick → maybe-prune →
+// log → loop). Splitting the body would scatter the "every tick takes
+// the lock and runs the BTreeSet walk" admission seam — the cognitive
+// complexity is the linear seq of two await points, not branching depth.
+#[allow(clippy::cognitive_complexity)]
+async fn run_record_store_gc(
+    records: Arc<std::sync::Mutex<RecordStore>>,
+    mut stop_rx: oneshot::Receiver<()>,
+    interval: Duration,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut stop_rx => {
+                tracing::debug!("dht record-store GC shutdown signal received");
+                return;
+            }
+            _ = ticker.tick() => {
+                let now_us = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX));
+                let removed = if let Ok(mut store) = records.lock() {
+                    store.gc(now_us)
+                } else {
+                    tracing::error!(
+                        "dht record-store mutex poisoned; skipping GC sweep this tick"
+                    );
+                    0
+                };
+                if removed > 0 {
+                    tracing::debug!(removed, "dht record-store GC sweep complete");
+                }
+            }
+        }
+    }
+}
+
 /// Build the endpoint, register handlers on a `Router`, spawn the metrics
 /// server and gossip tasks, and run until a shutdown signal is received.
 ///
@@ -429,6 +482,19 @@ pub async fn run(
         DISPATCH_GC_INTERVAL,
     ));
 
+    // Periodic DHT record-store GC (ADR 022 §Content Records and TTL).
+    // Without this, expired records accumulate against per-publisher
+    // and global caps — a node could exhaust its 200-record per-
+    // publisher quota and start rejecting every `Store` even though
+    // the TTL window has long passed. Same shutdown shape as the
+    // dispatch GC above.
+    let (record_store_gc_stop_tx, record_store_gc_stop_rx) = oneshot::channel::<()>();
+    tasks.spawn(run_record_store_gc(
+        Arc::clone(&record_store),
+        record_store_gc_stop_rx,
+        DISPATCH_GC_INTERVAL,
+    ));
+
     // RPC connectivity watchdog (issue #283). Updates `decdn_rpc_healthy`
     // each tick; a sustained transition fires an alert. `interval == 0`
     // disables the watchdog entirely (operators can opt out for offline
@@ -633,6 +699,7 @@ pub async fn run(
     // through `JoinSet::join_next` during the drain phase below — no
     // operator-actionable signal to log at this seam.
     let _ = dispatch_gc_stop_tx.send(());
+    let _ = record_store_gc_stop_tx.send(());
     if let Some(tx) = admin_stop_tx
         && tx.send(()).is_err()
     {
