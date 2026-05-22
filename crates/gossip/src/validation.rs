@@ -45,10 +45,10 @@ pub enum AnnounceReject {
     #[error("announcer not in allowlist")]
     NotAllowlisted,
     /// Trailing bytes after the postcard envelope exceed
-    /// [`MAX_TRAILING_BYTES`] (#577 M3). ADR 013 §Tier 1 permits trailing
-    /// bytes for forward-compat; this defense-in-depth cap catches shape
-    /// violations that slip under iroh-gossip's per-frame
-    /// [`GOSSIP_MAX_FRAME`] allocation ceiling.
+    /// [`MAX_TRAILING_BYTES`] (4 KiB, #577 M3). ADR 013 §Tier 1
+    /// permits trailing bytes for forward-compat; this defense-in-
+    /// depth cap catches shape violations that slip under iroh-
+    /// gossip's per-frame [`GOSSIP_MAX_FRAME`] allocation ceiling.
     #[error("trailing bytes after envelope exceed {MAX_TRAILING_BYTES} byte allowance")]
     OversizeTrailingBytes,
 }
@@ -85,10 +85,12 @@ pub const CLOCK_SKEW_TOLERANCE_US: u64 = 60 * 1_000_000;
 /// gossip's per-actor [`GOSSIP_MAX_FRAME`] ceiling (enforced before
 /// allocation in `read_lp`, ADR 013 §Gossip Framing): even under that
 /// ceiling, an attacker padding every ~150-byte announce up to
-/// `GOSSIP_MAX_FRAME` multiplies baseline allocations ~100× across the
-/// gossip fan-out. Rejecting at the validation layer caps that
-/// amplification and surfaces it via the `oversize_trailing_bytes`
-/// metric, while leaving legitimate Tier-1 extensions room to grow.
+/// `GOSSIP_MAX_FRAME` blows each inbound allocation ~100× larger,
+/// and Plumtree fan-out repeats that cost at every eager peer the
+/// message reaches. Rejecting at the validation layer caps the per-
+/// frame size and surfaces the attack via the
+/// `oversize_trailing_bytes` metric, while leaving legitimate Tier-1
+/// extensions room to grow.
 pub const MAX_TRAILING_BYTES: usize = 4 * 1024;
 
 /// Maximum size in bytes of a single iroh-gossip wire frame on the
@@ -96,8 +98,10 @@ pub const MAX_TRAILING_BYTES: usize = 4 * 1024;
 /// `iroh_gossip::net::Gossip::builder().max_message_size(...)` and
 /// applies symmetrically to every frame the actor sends or receives:
 /// `NodeAnnounce` traffic on `cdn/global/v1` and the region topic,
-/// plus iroh-gossip's `HyParView` control frames (which are not
-/// topic-scoped). The cap bounds allocation inside iroh-gossip's
+/// plus iroh-gossip's `HyParView` control frames (which iroh-gossip
+/// maintains per-topic alongside the Plumtree data traffic, so
+/// tightening this constant breaks legitimate non-payload frames
+/// too). The cap bounds allocation inside iroh-gossip's
 /// `read_lp` *before* the frame ever reaches [`validate_envelope`].
 /// Must accommodate (a) a maximally-extended
 /// [`decdn_protocol::GossipEnvelope`] — envelope (~256 B) +

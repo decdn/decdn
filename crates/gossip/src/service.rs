@@ -141,8 +141,9 @@ pub enum GossipSpawnError {
 /// module a single seam to assert against, so deleting the
 /// `.max_message_size(...)` step fails the test loudly instead of
 /// silently reverting to the iroh-gossip upstream default
-/// (`iroh_gossip::proto::DEFAULT_MAX_MESSAGE_SIZE`, currently 4 KiB
-/// — below our `MAX_TRAILING_BYTES + envelope + wrappers` floor).
+/// (`iroh_gossip::proto::DEFAULT_MAX_MESSAGE_SIZE`, 4 KiB in iroh-
+/// gossip 0.98 — below our `MAX_TRAILING_BYTES + envelope + wrappers`
+/// floor).
 pub fn build_gossip(endpoint: Endpoint) -> Gossip {
     Gossip::builder()
         .max_message_size(crate::GOSSIP_MAX_FRAME)
