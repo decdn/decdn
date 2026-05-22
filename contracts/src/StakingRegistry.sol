@@ -752,6 +752,10 @@ contract StakingRegistry is AccessControl, ReentrancyGuard, Pausable, EIP712 {
     ///         line 785 lists "stake fully or partially in unbonding" as a
     ///         false case).
     function isActive(address operator) public view returns (bool) {
+        // `unbondingOf[operator].amount == 0` is a presence check ("no
+        // in-flight unbonding request"), not a value-bearing balance equality
+        // — the strict comparison is the intended semantics.
+        // slither-disable-next-line incorrect-equality
         return _nodes[operator].active && activeStake[operator] >= minStake && unbondingOf[operator].amount == 0
             && !ejected[operator];
     }
