@@ -795,17 +795,30 @@ function nodeIdOf(address operator) external view returns (bytes32 nodeId, bool 
 function isActive(address operator) external view returns (bool);
 
 // Intended for rebinding (key rotation) only — initial binding is performed
-// atomically inside registerNode(). No on-chain guard prevents calling this
-// before registerNode, but doing so creates a binding without mesh membership
-// or stake (harmless but useless). See § Node Registry above.
-function bindNodeId(bytes32 nodeId, bytes calldata signature) external {
+// atomically inside registerNode(). Like registerNode, bindNodeId requires
+// BOTH the EIP-712 binding signature (Ethereum-key consent) AND an ed25519
+// proof of the new NodeId's ownership. The ed25519 requirement is deliberate:
+// without it, an EIP-712-only rebinding would re-open the squatting vector
+// that registerNode's ed25519 check closes (an attacker could bind an unbound
+// NodeId they don't own, blocking the legitimate owner's registerNode). With
+// the proof required on every binding path, no NodeId can be bound without
+// proving ownership, so squatting is impossible and reclaimNodeId is a
+// defense-in-depth backstop (for legacy / buggy bindings) rather than a
+// routine remedy. Calling this before registerNode is permitted but only
+// records a binding without mesh membership or stake.
+function bindNodeId(bytes32 nodeId, bytes calldata bindingSignature, bytes calldata ed25519Signature) external {
     uint64 nonce = bindingNonce[msg.sender];
     bytes32 digest = keccak256(abi.encodePacked(
         "\x19\x01",
         DOMAIN_SEPARATOR,
         keccak256(abi.encode(BIND_NODE_TYPEHASH, nodeId, nonce))
     ));
-    require(SignatureChecker.isValidSignatureNow(msg.sender, digest, signature), "invalid signature");
+    require(SignatureChecker.isValidSignatureNow(msg.sender, digest, bindingSignature), "invalid binding signature");
+
+    // Prove ownership of the new NodeId's ed25519 key (same message preimage
+    // as registerNode; see § NodeId Ownership Verification).
+    bytes32 ed25519Msg = keccak256(abi.encodePacked(nodeId, msg.sender, block.chainid, registrationNonce[nodeId]));
+    require(ed25519Verify(nodeId, ed25519Msg, ed25519Signature), "invalid ed25519 signature");
 
     // Reject if nodeId is already bound to a different address
     address existingOwner = nodeIdToAddress[nodeId];
@@ -813,7 +826,7 @@ function bindNodeId(bytes32 nodeId, bytes calldata signature) external {
 
     // Clear caller's previous binding if exists
     bytes32 oldNodeId = addressToNodeId[msg.sender];
-    if (oldNodeId != bytes32(0)) {
+    if (oldNodeId != bytes32(0) && oldNodeId != nodeId) {
         delete nodeIdToAddress[oldNodeId];
     }
 

@@ -479,6 +479,141 @@ contract StakingRegistryTest is Test {
     }
 
     // -----------------------------------------------------------------
+    // Node registry — bindNodeId (key rotation)
+    // -----------------------------------------------------------------
+
+    function test_bindNodeId_rotatesToNewNodeId() public {
+        (Vm.Wallet memory wallet, bytes32 oldNodeId,) = _registerAt(0);
+        bytes32 newNodeId = bytes32(uint256(0xC0FFEE));
+
+        // bindingNonce is 1 after registerNode.
+        bytes memory bindSig = _signBindNode(wallet, newNodeId, 1);
+        bytes32 expectedHash = keccak256(abi.encodePacked(newNodeId, wallet.addr, block.chainid, uint64(0)));
+        vm.expectCall(
+            address(ed25519Verifier), abi.encodeCall(IEd25519Verifier.verify, (newNodeId, expectedHash, hex"deadbeef"))
+        );
+
+        vm.prank(wallet.addr);
+        reg.bindNodeId(newNodeId, bindSig, hex"deadbeef");
+
+        assertEq(reg.addressToNodeId(wallet.addr), newNodeId);
+        assertEq(reg.nodeIdToAddress(newNodeId), wallet.addr);
+        assertEq(reg.nodeIdToAddress(oldNodeId), address(0), "old binding released");
+        assertEq(reg.bindingNonce(wallet.addr), 2);
+
+        // NodeInfo stays consistent for the active node.
+        StakingRegistry.NodeInfo memory info = reg.getNodeByAddress(wallet.addr);
+        assertEq(info.nodeId, newNodeId);
+        assertTrue(reg.isActiveNode(newNodeId));
+        assertFalse(reg.isActiveNode(oldNodeId));
+    }
+
+    function test_bindNodeId_revertsOnRejectedEd25519() public {
+        (Vm.Wallet memory wallet,,) = _registerAt(0);
+        bytes32 newNodeId = bytes32(uint256(0xC0FFEE));
+        bytes memory bindSig = _signBindNode(wallet, newNodeId, 1);
+
+        ed25519Verifier.setAccept(false);
+        vm.prank(wallet.addr);
+        vm.expectRevert(StakingRegistry.InvalidEd25519Signature.selector);
+        reg.bindNodeId(newNodeId, bindSig, hex"");
+    }
+
+    function test_bindNodeId_revertsOnBadBindingSig() public {
+        (Vm.Wallet memory wallet,,) = _registerAt(0);
+        bytes32 newNodeId = bytes32(uint256(0xC0FFEE));
+        bytes memory badSig = new bytes(65);
+        vm.prank(wallet.addr);
+        vm.expectRevert(StakingRegistry.InvalidBindingSignature.selector);
+        reg.bindNodeId(newNodeId, badSig, hex"");
+    }
+
+    function test_bindNodeId_revertsIfBoundToOther() public {
+        (Vm.Wallet memory wallet1, bytes32 nodeId,) = _registerAt(0);
+        Vm.Wallet memory wallet2 = vm.createWallet("op2");
+        // wallet2 tries to bind wallet1's nodeId.
+        bytes memory bindSig = _signBindNode(wallet2, nodeId, 0);
+        vm.prank(wallet2.addr);
+        vm.expectRevert(abi.encodeWithSelector(StakingRegistry.NodeIdAlreadyBound.selector, wallet1.addr));
+        reg.bindNodeId(nodeId, bindSig, hex"deadbeef");
+    }
+
+    function test_bindNodeId_revertsOnZeroNodeId() public {
+        (Vm.Wallet memory wallet,,) = _registerAt(0);
+        bytes memory bindSig = _signBindNode(wallet, bytes32(0), 1);
+        vm.prank(wallet.addr);
+        vm.expectRevert(StakingRegistry.ZeroNodeId.selector);
+        reg.bindNodeId(bytes32(0), bindSig, hex"deadbeef");
+    }
+
+    function test_bindNodeId_preRegistrationBindsWithoutActiveNode() public {
+        Vm.Wallet memory wallet = vm.createWallet("unregistered");
+        bytes32 nodeId = bytes32(uint256(0xAB));
+        bytes memory bindSig = _signBindNode(wallet, nodeId, 0);
+
+        vm.prank(wallet.addr);
+        reg.bindNodeId(nodeId, bindSig, hex"deadbeef");
+
+        assertEq(reg.nodeIdToAddress(nodeId), wallet.addr);
+        // No active node — harmless binding (ADR 003).
+        assertFalse(reg.isActiveNode(nodeId));
+        assertFalse(reg.getNodeByAddress(wallet.addr).active);
+    }
+
+    // -----------------------------------------------------------------
+    // Node registry — reclaimNodeId (squat recovery backstop)
+    // -----------------------------------------------------------------
+
+    function test_reclaimNodeId_tearsDownHolderBinding() public {
+        (Vm.Wallet memory holder, bytes32 nodeId,) = _registerAt(0);
+        assertEq(reg.getActiveNodeCount(), 1);
+
+        address reclaimer = makeAddr("reclaimer");
+        vm.prank(reclaimer);
+        reg.reclaimNodeId(nodeId, hex"deadbeef"); // mock ed25519 accepts
+
+        assertEq(reg.nodeIdToAddress(nodeId), address(0));
+        assertEq(reg.addressToNodeId(holder.addr), bytes32(0));
+        assertEq(reg.getActiveNodeCount(), 0, "holder's node deactivated");
+        assertFalse(reg.getNodeByAddress(holder.addr).active);
+        assertEq(reg.registrationNonce(nodeId), 1, "nonce bumped");
+    }
+
+    function test_reclaimNodeId_revertsIfNotBound() public {
+        address reclaimer = makeAddr("reclaimer");
+        bytes32 nodeId = bytes32(uint256(0xDEAD));
+        vm.prank(reclaimer);
+        vm.expectRevert(abi.encodeWithSelector(StakingRegistry.NodeIdNotBound.selector, nodeId));
+        reg.reclaimNodeId(nodeId, hex"deadbeef");
+    }
+
+    function test_reclaimNodeId_revertsOnRejectedEd25519() public {
+        (, bytes32 nodeId,) = _registerAt(0);
+        ed25519Verifier.setAccept(false);
+        address reclaimer = makeAddr("reclaimer");
+        vm.prank(reclaimer);
+        vm.expectRevert(StakingRegistry.InvalidEd25519Signature.selector);
+        reg.reclaimNodeId(nodeId, hex"");
+    }
+
+    function test_reclaimThenReRegister_recoversNodeId() public {
+        (, bytes32 nodeId,) = _registerAt(0);
+
+        Vm.Wallet memory reclaimer = vm.createWallet("reclaimer");
+        vm.prank(reclaimer.addr);
+        reg.reclaimNodeId(nodeId, hex"deadbeef");
+
+        // Reclaimer now registers the freed NodeId under their own address.
+        _fundAndStake(reclaimer.addr, MIN_STAKE);
+        bytes memory bindSig = _signBindNode(reclaimer, nodeId, 0);
+        vm.prank(reclaimer.addr);
+        reg.registerNode(nodeId, hex"", "", bindSig, hex"deadbeef");
+
+        assertEq(reg.nodeIdToAddress(nodeId), reclaimer.addr);
+        assertTrue(reg.isActiveNode(nodeId));
+    }
+
+    // -----------------------------------------------------------------
     // Node registry — updateMultiaddrs
     // -----------------------------------------------------------------
 
