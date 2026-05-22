@@ -728,10 +728,60 @@ If a NodeId was squatted (e.g., during a transition period or via a contract bug
 
 ## Admission and Priority
 
-Node admission and queueing policy — how a node orders incoming `StreamRequest`s under congestion — is implementation-defined and lives outside the protocol. The wire format carries no priority bits, the channel and voucher mechanisms encode no per-stream priority state, and different operators are expected to tune their policy differently. Two signals are available to any admission policy:
+Node admission and queueing policy — how a node decides which incoming `StreamRequest`s to accept under congestion and in what order — is implementation-defined and lives outside the protocol. The wire format carries no priority bits, the channel and voucher mechanisms encode no per-stream priority state, and different operators (a small home node, a CDN-scale operator, an enterprise SLA tier) are expected to tune their policy differently. Two signals are available to any admission policy:
 
 - **Committed voucher rate.** The advertised `rate_per_mb` in `ProbeResponse` / `StreamResponse` is a **floor**, not equality — nodes verify `amount_delta / bytes_delta >= rate_per_mb`. Clients MAY commit at higher rates; nodes MAY use the committed rate as a per-stream priority key, with the premium paid directly via [`FeeRouter.routeSettlement`](#feerouter-integration).
 - **Registered node-stake.** `StakingRegistry.stakeOf(address)` is readable on-chain for any registered operator. Nodes MAY treat addresses with `stakeOf >= MIN_STAKE` ([ADR 026 § Operator economics and minimum stake](026-tokenomics.md#operator-economics-and-minimum-stake)) as eligible for a higher-priority admission lane.
+
+The rest of this section describes one workable design built from those two signals. It is implementation guidance, not a protocol requirement — alternative policies (see [§ Operator variations](#operator-variations)) are acceptable.
+
+### Recommended policy: two-lane scheduler
+
+A two-lane scheduler keyed on the two signals above: committed voucher rate as the per-stream priority key, `StakingRegistry.stakeOf` as binary lane eligibility.
+
+```text
+on incoming StreamRequest:
+    requester      = address recovered from the voucher signature or channel.client
+    committed_rate = voucher.amount_delta / voucher.bytes_delta   // bytes_delta > 0
+
+    // Below-floor requests never reach lane assignment: they already fail the
+    // `amount_delta / bytes_delta >= rate_per_mb` verification above. The
+    // advertised `rate_per_mb` is itself the actionable hint.
+
+    lane  = if StakingRegistry.stakeOf(requester) >= MIN_STAKE { Priority } else { Regular }
+    queue = admission_queue[lane]
+
+    if queue.is_full():
+        if committed_rate <= queue.lowest_committed_rate():
+            reject: StreamResponse { ok: false, error: Overloaded }  // hint: lowest admitted rate in lane
+        else:
+            admit(StreamRequest)   // do NOT preempt already-admitted streams
+    else:
+        admit(StreamRequest)
+```
+
+Drain order: Priority lane first; Regular lane only when Priority is empty. Within a lane, admitted streams are served by `committed_rate` descending. The overload rejection is the existing delivery-side `StreamError::Overloaded` ([ADR 005](005-protocol.md#error-handling-and-retry-semantics)), carried in the initial `StreamResponse { ok: false }`.
+
+### Properties
+
+- **Per-stream.** Each `StreamRequest` is admitted independently against its own committed rate — no per-session, per-connection, or per-client priority state.
+- **Admission-time-only.** Priority is fixed at admission; later `stakeOf` changes do not re-rank in-flight streams.
+- **Non-preemptive.** An admitted stream runs to completion (or its protocol-level timeout); a late higher-rate stream does not bump it.
+- **No waiting queue.** A `StreamRequest` is admitted or rejected — no pending state. Permanent starvation is impossible by construction; the worst case is repeated rejection, observable client-side and recoverable.
+- **Reject-with-hint.** Rejections carry an actionable next step — the lane's current admission-floor rate, or the advertised `rate_per_mb`.
+- **Address resolution.** Lane eligibility uses the address recovered from the voucher signature or `channel.client`. The optional ephemeral binding in `StreamRequest` ([§ Off-Chain (Ephemeral) Binding for Clients](#off-chain-ephemeral-binding-for-clients)) is for voucher attribution, not a priority input.
+
+### Per-client concurrent-stream cap
+
+Independent of the lane mechanism, nodes SHOULD apply a per-client concurrent-stream cap (e.g., 10 simultaneous streams per Ethereum address) to stop a single wealthy client monopolizing every admission slot. Node-policy parameter, tuned to the traffic profile; orthogonal to the per-ALPN concurrent-stream limit in [ADR 005 § Concurrent stream limits](005-protocol.md#concurrent-stream-limits).
+
+### Operator variations
+
+- **Voucher-rate alone** — no priority lane. Simplest.
+- **Different lane eligibility** — reputation-, region-, or allow-list-based (e.g. an enterprise SLA tier).
+- **Rate-window aging** — raise the effective priority of a stream waiting at the floor rate; smooths steady-state starvation at the cost of complexity.
+- **FCFS at the rate floor**, reject otherwise — for small home nodes without congestion.
+- **Weighted-fair queueing** across clients — when per-client fairness matters more than revenue maximization.
 
 ## NodeId-to-Ethereum Binding
 
