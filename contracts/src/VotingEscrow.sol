@@ -305,8 +305,8 @@ contract VotingEscrow is AccessControl, ReentrancyGuard, Pausable {
     ///      the global aggregate, scheduling the slope changes that fire when
     ///      `oldLock.end` / `newLock.end` are reached. Faithful veCRV port.
     function _checkpoint(address account, LockedBalance memory oldLock, LockedBalance memory newLock) internal {
-        Point memory uOld;
-        Point memory uNew;
+        Point memory uOld = Point({ bias: 0, slope: 0, ts: 0 });
+        Point memory uNew = Point({ bias: 0, slope: 0, ts: 0 });
         int128 oldDslope = 0;
         int128 newDslope = 0;
 
