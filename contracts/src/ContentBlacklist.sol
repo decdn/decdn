@@ -3,7 +3,6 @@ pragma solidity 0.8.28;
 
 import { AccessControl } from "@openzeppelin/contracts/access/AccessControl.sol";
 import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import { SafeCast } from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 
 import { IStakingRegistryEject } from "./interfaces/IStakingRegistryEject.sol";
 
@@ -34,8 +33,6 @@ import { IStakingRegistryEject } from "./interfaces/IStakingRegistryEject.sol";
 ///         the `isBlacklisted` views are forward-compatible; nothing in this
 ///         contract sets them yet.
 contract ContentBlacklist is AccessControl, ReentrancyGuard {
-    using SafeCast for uint256;
-
     // -----------------------------------------------------------------
     // Roles
     // -----------------------------------------------------------------
@@ -59,17 +56,17 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     }
 
     /// @notice Grace before an emergency entry becomes slashable (fixed).
-    uint64 public constant EMERGENCY_COMPLIANCE_WINDOW = 2 hours;
+    uint256 public constant EMERGENCY_COMPLIANCE_WINDOW = 2 hours;
     /// @notice Auto-expiry for `GENERAL` emergency entries.
-    uint64 public constant GENERAL_EXPIRY = 14 days;
+    uint256 public constant GENERAL_EXPIRY = 14 days;
     /// @notice Auto-expiry for `CSAM` / `TERRORIST` emergency entries.
-    uint64 public constant SEVERE_EXPIRY = 90 days;
+    uint256 public constant SEVERE_EXPIRY = 90 days;
     /// @notice Emergency-path sunset horizon from deployment (ADR 009).
-    uint64 public constant BLACKLIST_SUNSET = 365 days;
+    uint256 public constant BLACKLIST_SUNSET = 365 days;
 
     /// @notice Governable `complianceWindow` safety bounds (ADR 011 / ADR 009).
-    uint64 public constant COMPLIANCE_WINDOW_FLOOR = 1 hours;
-    uint64 public constant COMPLIANCE_WINDOW_CEILING = 7 days;
+    uint256 public constant COMPLIANCE_WINDOW_FLOOR = 1 hours;
+    uint256 public constant COMPLIANCE_WINDOW_CEILING = 7 days;
 
     // -----------------------------------------------------------------
     // Immutables + governable parameters
@@ -81,11 +78,11 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
 
     /// @notice After this timestamp the emergency add paths revert (ADR 009
     ///         sunset). Immutable; extension requires a new deployment.
-    uint64 public immutable blacklistDeadline;
+    uint256 public immutable blacklistDeadline;
 
     /// @notice Grace (seconds) between a governance entry's `addedAt` and its
     ///         `effectiveAt` slashability threshold. Default 24h.
-    uint64 public complianceWindow;
+    uint256 public complianceWindow;
 
     // -----------------------------------------------------------------
     // Storage
@@ -94,10 +91,10 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     /// @notice Per-entry record. `addedAt == 0` means no entry.
     struct BlacklistEntry {
         bytes32 blake3Hash; // the disputed hash (mirrors the key for getEntry returns)
-        uint64 addedAt; // block timestamp when added
-        uint64 effectiveAt; // addedAt + grace — serving after this is slashable
-        uint64 expiresAt; // emergency: addedAt + categoryExpiry; 0 = never (governance entries)
-        uint64 suspendedAtUs; // microsecond ts when `suspended` last flipped true; 0 if never (appeals, PR 2)
+        uint256 addedAt; // block timestamp when added
+        uint256 effectiveAt; // addedAt + grace — serving after this is slashable
+        uint256 expiresAt; // emergency: addedAt + categoryExpiry; 0 = never (governance entries)
+        uint256 suspendedAtUs; // microsecond ts when `suspended` last flipped true; 0 if never (appeals, PR 2)
         bytes2 region; // bytes2(0) = global; ISO 3166-1 alpha-2 otherwise
         bool emergency; // added via the emergency multisig path
         bool suspended; // appeal interim-relief (appeals, PR 2)
@@ -106,8 +103,8 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
 
     /// @notice Per-origin record. Origins are global-only (no region).
     struct OriginEntry {
-        uint64 addedAt;
-        uint64 expiresAt; // emergency: addedAt + categoryExpiry; 0 = never
+        uint256 addedAt;
+        uint256 expiresAt; // emergency: addedAt + categoryExpiry; 0 = never
         bool emergency;
         string reason;
     }
@@ -165,7 +162,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     event RegionalBodyDeregistered(bytes2 indexed region, address indexed body);
     event RegionalBodySuspended(bytes2 indexed region, address indexed body);
     event RegionalBodyUnsuspended(bytes2 indexed region, address indexed body);
-    event ComplianceWindowUpdated(uint64 oldValue, uint64 newValue);
+    event ComplianceWindowUpdated(uint256 oldValue, uint256 newValue);
 
     // -----------------------------------------------------------------
     // Constructor
@@ -224,7 +221,9 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     ///         Global Override).
     function removeHashRegional(bytes32 blake3Hash, string calldata region) external onlyRole(GOVERNANCE_ROLE) {
         bytes2 r = _toRegion(region);
-        _removeHashEntry(blake3Hash, r, region);
+        // Emit the canonical region (upper-cased) so HashRemoved matches the
+        // region encoding HashBlacklisted emits, not the raw caller input.
+        _removeHashEntry(blake3Hash, r, _regionToString(r));
     }
 
     // -----------------------------------------------------------------
@@ -329,13 +328,13 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     // -----------------------------------------------------------------
 
     /// @notice Set the governance-entry compliance window (bounded [1h, 7d]).
-    function setComplianceWindow(uint64 newWindow) external onlyRole(GOVERNANCE_ROLE) {
+    function setComplianceWindow(uint256 newWindow) external onlyRole(GOVERNANCE_ROLE) {
         if (newWindow < COMPLIANCE_WINDOW_FLOOR || newWindow > COMPLIANCE_WINDOW_CEILING) {
             revert ParamOutOfBounds({
                 value: newWindow, floor: COMPLIANCE_WINDOW_FLOOR, ceiling: COMPLIANCE_WINDOW_CEILING
             });
         }
-        uint64 old = complianceWindow;
+        uint256 old = complianceWindow;
         complianceWindow = newWindow;
         emit ComplianceWindowUpdated(old, newWindow);
     }
@@ -373,6 +372,9 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         view
         returns (BlacklistEntry memory)
     {
+        // Empty region resolves to the global entry, consistent with
+        // isBlacklistedInRegion (rather than reverting via _toRegion).
+        if (bytes(region).length == 0) return _entries[blake3Hash][bytes2(0)];
         return _entries[blake3Hash][_toRegion(region)];
     }
 
@@ -389,8 +391,8 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         internal
     {
         if (blake3Hash == bytes32(0)) revert ZeroHash();
-        uint64 nowTs = _now();
-        uint64 grace = emergency ? EMERGENCY_COMPLIANCE_WINDOW : complianceWindow;
+        uint256 nowTs = _now();
+        uint256 grace = emergency ? EMERGENCY_COMPLIANCE_WINDOW : complianceWindow;
 
         BlacklistEntry storage entry = _entries[blake3Hash][region];
         entry.blake3Hash = blake3Hash;
@@ -421,7 +423,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
 
     function _writeOriginEntry(address operatorAddress, string calldata reason, bool emergency, Category cat) internal {
         if (operatorAddress == address(0)) revert ZeroAddress();
-        uint64 nowTs = _now();
+        uint256 nowTs = _now();
 
         OriginEntry storage entry = _origins[operatorAddress];
         entry.addedAt = nowTs;
@@ -474,7 +476,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         if (block.timestamp >= blacklistDeadline) revert EmergencySunsetReached();
     }
 
-    function _expiryForCategory(Category cat) internal pure returns (uint64) {
+    function _expiryForCategory(Category cat) internal pure returns (uint256) {
         return cat == Category.GENERAL ? GENERAL_EXPIRY : SEVERE_EXPIRY;
     }
 
@@ -483,9 +485,9 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         return Category(category);
     }
 
-    function _now() private view returns (uint64) {
+    function _now() private view returns (uint256) {
         // forge-lint: disable-next-line(block-timestamp)
-        return block.timestamp.toUint64();
+        return block.timestamp;
     }
 
     /// @dev Canonicalize a 2-character ISO 3166-1 alpha-2 region to upper-cased

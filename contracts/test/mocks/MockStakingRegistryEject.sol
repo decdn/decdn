@@ -10,7 +10,7 @@ import { IStakingRegistryEject } from "../../src/interfaces/IStakingRegistryEjec
 contract MockStakingRegistryEject is IStakingRegistryEject {
     address[] public ejected;
 
-    function ejectNode(address operator) external {
+    function ejectNode(address operator) external override {
         ejected.push(operator);
     }
 

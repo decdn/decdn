@@ -52,7 +52,7 @@ contract ContentBlacklistTest is Test {
     function test_initialState() public view {
         assertEq(cb.complianceWindow(), 24 hours);
         assertEq(cb.version(), 0);
-        assertEq(cb.blacklistDeadline(), uint64(block.timestamp) + 365 days);
+        assertEq(cb.blacklistDeadline(), uint256(block.timestamp) + 365 days);
         assertTrue(cb.hasRole(cb.GOVERNANCE_ROLE(), governance));
         assertTrue(cb.hasRole(cb.EMERGENCY_ROLE(), emergency));
         assertTrue(cb.hasRole(cb.DEFAULT_ADMIN_ROLE(), admin));
@@ -70,8 +70,8 @@ contract ContentBlacklistTest is Test {
         assertEq(cb.version(), 1);
 
         ContentBlacklist.BlacklistEntry memory e = cb.getEntry(H);
-        assertEq(e.addedAt, uint64(block.timestamp));
-        assertEq(e.effectiveAt, uint64(block.timestamp) + 24 hours);
+        assertEq(e.addedAt, uint256(block.timestamp));
+        assertEq(e.effectiveAt, uint256(block.timestamp) + 24 hours);
         assertEq(e.expiresAt, 0, "governance entry never expires");
         assertEq(e.region, bytes2(0));
         assertFalse(e.emergency);
@@ -112,7 +112,7 @@ contract ContentBlacklistTest is Test {
     function test_addHash_overwriteRefreshesEffectiveAt() public {
         vm.prank(governance);
         cb.addHash(H, "first");
-        uint64 firstEffective = cb.getEntry(H).effectiveAt;
+        uint256 firstEffective = cb.getEntry(H).effectiveAt;
 
         vm.warp(block.timestamp + 1 hours);
         vm.prank(governance);
@@ -256,8 +256,8 @@ contract ContentBlacklistTest is Test {
         cb.emergencyAdd(H, GENERAL, "CSAM-ish");
         ContentBlacklist.BlacklistEntry memory e = cb.getEntry(H);
         assertTrue(e.emergency);
-        assertEq(e.effectiveAt, uint64(block.timestamp) + 2 hours);
-        assertEq(e.expiresAt, uint64(block.timestamp) + 14 days);
+        assertEq(e.effectiveAt, uint256(block.timestamp) + 2 hours);
+        assertEq(e.expiresAt, uint256(block.timestamp) + 14 days);
         assertTrue(cb.isBlacklisted(H));
     }
 
@@ -390,7 +390,7 @@ contract ContentBlacklistTest is Test {
         cb.setComplianceWindow(2 days);
         vm.prank(governance);
         cb.addHash(H, "x");
-        assertEq(cb.getEntry(H).effectiveAt, uint64(block.timestamp) + 2 days);
+        assertEq(cb.getEntry(H).effectiveAt, uint256(block.timestamp) + 2 days);
     }
 
     // -----------------------------------------------------------------
@@ -411,5 +411,33 @@ contract ContentBlacklistTest is Test {
         vm.prank(governance);
         cb.removeHash(H);
         assertEq(cb.version(), 4);
+    }
+
+    // -----------------------------------------------------------------
+    // getEntryInRegion + canonical region emission
+    // -----------------------------------------------------------------
+
+    function test_getEntryInRegion_regionalAndEmptyGlobal() public {
+        _registerEu();
+        vm.prank(euBody);
+        cb.addHashRegional(H, "EU", "x");
+        vm.prank(governance);
+        cb.addHash(H, "global");
+
+        assertEq(cb.getEntryInRegion(H, "EU").region, EU);
+        // Empty region resolves to the global entry (consistent with isBlacklistedInRegion).
+        assertEq(cb.getEntryInRegion(H, "").region, bytes2(0));
+        assertEq(cb.getEntryInRegion(H, "").addedAt, cb.getEntry(H).addedAt);
+    }
+
+    function test_removeHashRegional_emitsCanonicalRegion() public {
+        _registerEu();
+        vm.prank(euBody);
+        cb.addHashRegional(H, "EU", "x");
+        // Called with lowercase "eu"; HashRemoved must carry the canonical "EU".
+        vm.expectEmit(true, false, false, true, address(cb));
+        emit ContentBlacklist.HashRemoved(H, 0, "EU");
+        vm.prank(governance);
+        cb.removeHashRegional(H, "eu");
     }
 }
