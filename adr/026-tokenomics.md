@@ -178,10 +178,11 @@ Burn must be TWAP-limited and liquidity-aware. Mature burn budgets can exceed av
 | Voting source | `VotingEscrow.balanceOfAt` (was `TOKEN.getPastVotes`) |
 | Proposal threshold | 0.1% of total ve-supply |
 | Quorum | 4% of total ve-supply |
+| Voting delay | 1 day (matches [ADR 009](009-governance.md#adr-009-governance-model)) |
 | Voting period | 7 days (matches [ADR 009](009-governance.md#adr-009-governance-model)) |
 | Timelock | 48 hours (matches [ADR 009](009-governance.md#adr-009-governance-model)) |
-| Total governance latency | ≈9 days (7-day vote + 48-hour timelock) |
-| Delegation | ve-balance delegatable, Governor Bravo pattern |
+| Total governance latency | ≈10 days (1-day delay + 7-day vote + 48-hour timelock) |
+| Delegation | Deferred — each voter votes their own ve-balance for now (see [ADR 009 § Delegation](009-governance.md#adr-009-governance-model)) |
 
 Traders with no ve-position cannot vote. The early veTOKEN base is concentrated in self-locked seed/team/treasury positions and POL/airdrop recipients who choose to lock; **governance bootstrapping may require a treasury-funded ve-lock-on-claim airdrop in the first 6–12 months** (sourced from the community / ecosystem allocation or pre-seed). Rest of [ADR 009](009-governance.md#adr-009-governance-model) (emergency multisig, hard-cap pause powers, etc.) unchanged.
 
