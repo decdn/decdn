@@ -46,7 +46,7 @@ pub enum AnnounceReject {
     NotAllowlisted,
     /// Trailing bytes after the postcard envelope exceed
     /// [`MAX_TRAILING_BYTES`] (#577 M3). ADR 013 §Tier 1 permits trailing
-    /// bytes for forward-compat; this defence-in-depth cap catches shape
+    /// bytes for forward-compat; this defense-in-depth cap catches shape
     /// violations that slip under iroh-gossip's per-frame
     /// [`GOSSIP_MAX_FRAME`] allocation ceiling.
     #[error("trailing bytes after envelope exceed {MAX_TRAILING_BYTES} byte allowance")]
@@ -81,7 +81,7 @@ pub const CLOCK_SKEW_TOLERANCE_US: u64 = 60 * 1_000_000;
 /// [`validate_envelope`] (#577 M3). ADR 013 §Tier 1 documents trailing
 /// bytes as the forward-compat extension mechanism; a sane envelope
 /// today is ~150 bytes and any plausible future Tier-1 extension is
-/// expected to be well under 4 KiB. Defence-in-depth behind iroh-
+/// expected to be well under 4 KiB. Defense-in-depth behind iroh-
 /// gossip's per-actor [`GOSSIP_MAX_FRAME`] ceiling (enforced before
 /// allocation in `read_lp`, ADR 013 §Gossip Framing): even under that
 /// ceiling, an attacker padding every ~150-byte announce up to
@@ -111,7 +111,7 @@ pub const MAX_TRAILING_BYTES: usize = 4 * 1024;
 /// **Network-coordination invariant:** this value must agree across
 /// all deCDN nodes on the network. iroh-gossip enforces the cap on
 /// both send and receive; tightening it asymmetrically silently
-/// partitions the gossip swarm for legitimate ``HyParView`` control
+/// partitions the gossip swarm for legitimate `HyParView` control
 /// frames. Treat changes as wire-compatibility events.
 pub const GOSSIP_MAX_FRAME: usize = 16 * 1024;
 
@@ -158,7 +158,7 @@ pub fn validate_envelope<S: std::hash::BuildHasher>(
 
     // #577 M3: bound the trailing-bytes allowance. Reject before signature
     // verify so an attacker can't burn ed25519 cycles on a shape we'll drop
-    // regardless. Defence-in-depth behind [`GOSSIP_MAX_FRAME`], which
+    // regardless. Defense-in-depth behind [`GOSSIP_MAX_FRAME`], which
     // already capped the iroh-gossip allocation; this surfaces shape
     // violations under that ceiling via the rejection metric and keeps
     // them out of the peer table.
