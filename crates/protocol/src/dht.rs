@@ -1,0 +1,694 @@
+//! Wire message types for the `cdn/dht/v1` Kademlia content DHT (ADR 022).
+//!
+//! `cdn/dht/v1` is the primary content discovery mechanism: nodes publish
+//! `(hash → NodeId)` records to the K closest peers in keyspace, and clients
+//! iteratively look up providers in O(log N) hops. This module defines the
+//! wire surface only — routing-table, record-store, scheduler, and rate-limit
+//! logic live in `decdn-node`.
+//!
+//! # Authentication model
+//!
+//! [`StoreRequest`] has no per-record signature. The receiver instead checks
+//! that `holder` equals the authenticated `NodeId` of the inbound QUIC
+//! connection (`NodeId`s are 32-byte Ed25519 public keys; iroh's QUIC handshake
+//! binds the connection to that key). This depends on records being pushed
+//! directly by the holder to the K-closest nodes and never relayed
+//! peer-to-peer — if a future scheme introduces peer relay of records, a
+//! per-record signature MUST be reintroduced together with an in-scope sender
+//! timestamp in the signed body (ADR 022 §STORE Flow, ADR 015 §Replay Safety
+//! Analysis).
+//!
+//! # `BatchStore` wire types
+//!
+//! ADR 022 specifies optional `BatchStoreRequest` / `BatchStoreAck` variants
+//! as a bandwidth optimization. We define the wire types here at their
+//! ADR-canonical [`DhtMessage`] discriminants 4 and 5 so the production
+//! ordering of `FindNode` / `FindNodeResponse` at 6 and 7 matches the ADR
+//! and a future `BatchStore` handler doesn't have to do a wire-breaking
+//! discriminant shuffle. The handler-side admission, two-stage rate-limit
+//! accounting, and per-receiver fallback negotiation land in a follow-up
+//! issue — until then the runtime closes inbound `BatchStore` streams
+//! with `APP_ERR_UNSUPPORTED_MESSAGE` (`0x01`), which is the
+//! stream-close-without-ack fallback signal ADR 022 §Schema Evolution
+//! requires to trigger per-hash `Store` from the publisher.
+//!
+//! # Bounded-Vec deserialization
+//!
+//! Network responses with `Vec` fields are bounded at decode time via
+//! `#[serde(deserialize_with = ...)]` hooks that enforce the wire-level
+//! caps below. The framing layer caps the whole message at 16 MiB
+//! ([`crate::framing::MAX_MESSAGE_SIZE`]), but the per-field caps stop
+//! peers from forcing the responder to allocate up to a megabyte of
+//! 32-byte `NodeId`s (or up to `~16M / 8B` booleans) inside one frame.
+//! Pattern mirrors `ProbeResponseBody::rate_per_mb`.
+
+use serde::de::{self, Deserializer};
+use serde::{Deserialize, Serialize};
+
+/// Wire-level maximum number of providers a [`FindValueResponse`] may carry
+/// (ADR 022 §Content Records and TTL). Bounds the response size at the
+/// `~2.3 KB` ceiling documented in ADR 022 §DHT Bandwidth Analysis.
+///
+/// Enforced at the wire boundary by `deserialize_providers`; oversize values
+/// fail decode rather than being silently truncated.
+pub const MAX_PROVIDERS_PER_HASH: usize = 50;
+
+/// Wire-level maximum number of `NodeId`s in a `closer_nodes` field, equal to
+/// the Kademlia bucket size K=20 (ADR 022 §Routing Table). Applies to both
+/// [`FindValueResponse::closer_nodes`] and [`FindNodeResponse::closer_nodes`].
+/// Enforced at the wire boundary by `deserialize_closer_nodes`.
+pub const MAX_CLOSER_NODES: usize = 20;
+
+/// Wire-level maximum number of hashes a [`BatchStoreRequest`] may carry
+/// (ADR 022 §STORE Flow — "Batch size is bounded at 256 hashes"). Applies
+/// symmetrically to [`BatchStoreAck::results`] (one bool per request hash,
+/// same cap so a malicious responder can't reply with an oversize ack).
+/// Enforced at the wire boundary; ADR 022 spells out that oversize batches
+/// close the stream with `MALFORMED_MESSAGE` (`0x03`) — the decode-time
+/// reject here surfaces as that error code via the framing layer.
+pub const MAX_BATCH_STORE_HASHES: usize = 256;
+
+/// Top-level protocol enum for `cdn/dht/v1`. Variant order matches ADR 022
+/// §Message Types and is frozen per ADR 013.
+///
+/// ⚠️ **VARIANT ORDER FROZEN — ADR 013 §Protocol Enums**
+/// Postcard encodes each variant as its declaration-order index. Reordering,
+/// inserting, or removing a variant is a wire-breaking change requiring an
+/// ALPN version bump (`cdn/dht/v2`). Discriminants are pinned by the
+/// `dht_message_*_discriminant_is_*` tests in this module — if you change this
+/// enum, those tests will fail and tell you why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DhtMessage {
+    /// discriminant 0 — asserted by `dht_message_find_value_discriminant_is_zero`
+    FindValue(FindValueRequest),
+    /// discriminant 1 — asserted by `dht_message_find_value_response_discriminant_is_one`
+    FindValueResponse(FindValueResponse),
+    /// discriminant 2 — asserted by `dht_message_store_discriminant_is_two`
+    Store(StoreRequest),
+    /// discriminant 3 — asserted by `dht_message_store_ack_discriminant_is_three`
+    StoreAck(StoreAck),
+    /// discriminant 4 — asserted by `dht_message_batch_store_discriminant_is_four`.
+    /// Wire type only; handler implementation deferred to a follow-up issue
+    /// (see module docs).
+    BatchStore(BatchStoreRequest),
+    /// discriminant 5 — asserted by `dht_message_batch_store_ack_discriminant_is_five`.
+    /// Wire type only; see [`Self::BatchStore`].
+    BatchStoreAck(BatchStoreAck),
+    /// discriminant 6 — asserted by `dht_message_find_node_discriminant_is_six`
+    FindNode(FindNodeRequest),
+    /// discriminant 7 — asserted by `dht_message_find_node_response_discriminant_is_seven`
+    FindNodeResponse(FindNodeResponse),
+}
+
+/// Query for providers of a specific content hash (ADR 022 §Message Types).
+///
+/// The responder returns any known providers for `hash` and the K closest
+/// `NodeId`s it knows toward the hash in keyspace. `requester` is used by the
+/// responder to update its own routing table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FindValueRequest {
+    /// BLAKE3 hash of the content being sought (iroh `Hash`, 32 bytes).
+    pub hash: [u8; 32],
+    /// The caller's `NodeId` (32-byte Ed25519 public key) so the responder can
+    /// update its routing table with the live peer.
+    pub requester: [u8; 32],
+}
+
+/// Response to a [`FindValueRequest`] (ADR 022 §Message Types).
+///
+/// `providers` is the responder's known holders for `hash` (may be empty);
+/// `closer_nodes` is up to K of the responder's nearest `NodeId`s toward `hash`
+/// in XOR keyspace, used by the requester to continue iterative lookup.
+///
+/// Responders MUST NOT emit more than [`MAX_PROVIDERS_PER_HASH`] providers or
+/// more than [`MAX_CLOSER_NODES`] closer nodes — the wire-cost ceiling
+/// (~2.3 KB) in ADR 022 §DHT Bandwidth Analysis depends on these bounds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FindValueResponse {
+    /// Echoes the requested hash.
+    pub hash: [u8; 32],
+    /// Nodes known to hold this hash. May be empty. Capped at
+    /// [`MAX_PROVIDERS_PER_HASH`]; oversize values fail decode.
+    #[serde(deserialize_with = "deserialize_providers")]
+    pub providers: Vec<[u8; 32]>,
+    /// K closest nodes to `hash` in the responder's routing table. Capped at
+    /// [`MAX_CLOSER_NODES`]; oversize values fail decode.
+    #[serde(deserialize_with = "deserialize_closer_nodes")]
+    pub closer_nodes: Vec<[u8; 32]>,
+}
+
+/// Publish a content record: "I hold this hash" (ADR 022 §Message Types,
+/// §STORE Flow). Sent by the holder to each of the K+3 nodes closest to
+/// `hash` in keyspace.
+///
+/// There is no per-record signature: the receiver MUST instead check that
+/// `holder` equals the authenticated `NodeId` of the inbound QUIC connection.
+/// Records are never relayed peer-to-peer; if that changes, a per-record
+/// signature MUST be reintroduced (see module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoreRequest {
+    /// BLAKE3 hash of the content being advertised.
+    pub hash: [u8; 32],
+    /// The `NodeId` claiming to hold this hash. MUST equal the authenticated
+    /// QUIC `NodeId` of the connection; the receiver rejects mismatches.
+    pub holder: [u8; 32],
+}
+
+/// Acknowledgement for a [`StoreRequest`] (ADR 022 §Message Types).
+///
+/// `accepted == false` means the record was rejected — most commonly the
+/// holder is over per-publisher quota or is not in the receiver's cached
+/// active-staker set (ADR 022 §Content Records and TTL, §STORE Flow).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoreAck {
+    /// Echoes the published hash.
+    pub hash: [u8; 32],
+    /// True iff the record was admitted to the receiver's record store.
+    pub accepted: bool,
+}
+
+/// Kademlia node lookup — used during routing-table bootstrap and bucket
+/// refresh (ADR 022 §Bootstrap, §Routing Table). Distinct from
+/// [`FindValueRequest`] in that the target is a `NodeId`, not a content hash,
+/// and no provider lookup is performed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FindNodeRequest {
+    /// `NodeId` being sought.
+    pub target: [u8; 32],
+    /// Caller's `NodeId` for the responder's routing-table update.
+    pub requester: [u8; 32],
+}
+
+/// Response to a [`FindNodeRequest`] (ADR 022 §Message Types).
+///
+/// Responders MUST NOT emit more than [`MAX_CLOSER_NODES`] entries; oversize
+/// values fail decode at the wire boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FindNodeResponse {
+    /// Echoes the requested target.
+    pub target: [u8; 32],
+    /// K closest `NodeId`s to `target` from the responder's routing table.
+    #[serde(deserialize_with = "deserialize_closer_nodes")]
+    pub closer_nodes: Vec<[u8; 32]>,
+}
+
+/// Batched publication of multiple content records from one holder to one
+/// receiver (ADR 022 §STORE Flow). A bandwidth optimization with a per-hash
+/// [`StoreRequest`] fallback — the wire types are defined here at their
+/// ADR-canonical discriminants so a future handler doesn't shuffle wire
+/// positions, but admission, two-stage rate-limit accounting, and
+/// per-receiver fallback negotiation live in the handler that will land in
+/// a follow-up issue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchStoreRequest {
+    /// Hashes being published in this batch. Capped at
+    /// [`MAX_BATCH_STORE_HASHES`] (ADR 022 §STORE Flow); oversize values fail
+    /// decode (the handler maps that to `MALFORMED_MESSAGE` 0x03 per
+    /// ADR 013).
+    #[serde(deserialize_with = "deserialize_batch_hashes")]
+    pub hashes: Vec<[u8; 32]>,
+    /// Single holder for the batch. Per ADR 022 §STORE Flow the receiver
+    /// checks this once against the authenticated QUIC `NodeId`; the
+    /// per-hash check is skipped because the field is batch-level.
+    pub holder: [u8; 32],
+}
+
+/// Per-hash acknowledgement for a [`BatchStoreRequest`] (ADR 022 §STORE
+/// Flow). `results[i]` corresponds to `BatchStoreRequest.hashes[i]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchStoreAck {
+    /// One `bool` per request hash, in request order. Capped at
+    /// [`MAX_BATCH_STORE_HASHES`] (matches the request cap so a malicious
+    /// responder can't reply with an oversize ack).
+    #[serde(deserialize_with = "deserialize_batch_results")]
+    pub results: Vec<bool>,
+}
+
+// --- Bounded-Vec deserialization hooks (see module docs).
+//
+// Pattern follows `ProbeResponseBody::rate_per_mb`'s field-level
+// `deserialize_with` so the postcard positional layout stays
+// derive-driven — no mirror struct, no `Deserialize` impl drift risk.
+
+fn deserialize_providers<'de, D>(d: D) -> Result<Vec<[u8; 32]>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_node_id_vec(d, MAX_PROVIDERS_PER_HASH, "providers")
+}
+
+fn deserialize_closer_nodes<'de, D>(d: D) -> Result<Vec<[u8; 32]>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_node_id_vec(d, MAX_CLOSER_NODES, "closer_nodes")
+}
+
+fn deserialize_batch_hashes<'de, D>(d: D) -> Result<Vec<[u8; 32]>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_node_id_vec(d, MAX_BATCH_STORE_HASHES, "hashes")
+}
+
+fn deserialize_batch_results<'de, D>(d: D) -> Result<Vec<bool>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v = Vec::<bool>::deserialize(d)?;
+    if v.len() > MAX_BATCH_STORE_HASHES {
+        return Err(de::Error::custom(format!(
+            "BatchStoreAck.results length {} exceeds MAX_BATCH_STORE_HASHES ({})",
+            v.len(),
+            MAX_BATCH_STORE_HASHES,
+        )));
+    }
+    Ok(v)
+}
+
+fn deserialize_bounded_node_id_vec<'de, D>(
+    d: D,
+    max: usize,
+    field: &'static str,
+) -> Result<Vec<[u8; 32]>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v = Vec::<[u8; 32]>::deserialize(d)?;
+    if v.len() > max {
+        return Err(de::Error::custom(format!(
+            "{field} length {} exceeds wire cap ({max})",
+            v.len(),
+        )));
+    }
+    Ok(v)
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+mod tests {
+    use super::*;
+
+    fn sample_find_value_request() -> FindValueRequest {
+        FindValueRequest {
+            hash: [0x11u8; 32],
+            requester: [0x22u8; 32],
+        }
+    }
+
+    fn sample_find_value_response() -> FindValueResponse {
+        FindValueResponse {
+            hash: [0x11u8; 32],
+            providers: vec![[0x33u8; 32], [0x44u8; 32]],
+            closer_nodes: vec![[0x55u8; 32]],
+        }
+    }
+
+    fn sample_store_request() -> StoreRequest {
+        StoreRequest {
+            hash: [0x66u8; 32],
+            holder: [0x77u8; 32],
+        }
+    }
+
+    fn sample_store_ack() -> StoreAck {
+        StoreAck {
+            hash: [0x66u8; 32],
+            accepted: true,
+        }
+    }
+
+    fn sample_find_node_request() -> FindNodeRequest {
+        FindNodeRequest {
+            target: [0x88u8; 32],
+            requester: [0x99u8; 32],
+        }
+    }
+
+    fn sample_find_node_response() -> FindNodeResponse {
+        FindNodeResponse {
+            target: [0x88u8; 32],
+            closer_nodes: vec![[0xAAu8; 32], [0xBBu8; 32]],
+        }
+    }
+
+    fn sample_batch_store_request() -> BatchStoreRequest {
+        BatchStoreRequest {
+            hashes: vec![[0xCCu8; 32], [0xDDu8; 32]],
+            holder: [0xEEu8; 32],
+        }
+    }
+
+    fn sample_batch_store_ack() -> BatchStoreAck {
+        BatchStoreAck {
+            results: vec![true, false],
+        }
+    }
+
+    #[test]
+    fn find_value_request_roundtrip() -> Result<(), postcard::Error> {
+        let msg = sample_find_value_request();
+        let bytes = postcard::to_allocvec(&msg)?;
+        let decoded: FindValueRequest = postcard::from_bytes(&bytes)?;
+        assert_eq!(decoded, msg);
+        Ok(())
+    }
+
+    #[test]
+    fn find_value_response_roundtrip() -> Result<(), postcard::Error> {
+        let msg = sample_find_value_response();
+        let bytes = postcard::to_allocvec(&msg)?;
+        let decoded: FindValueResponse = postcard::from_bytes(&bytes)?;
+        assert_eq!(decoded, msg);
+        Ok(())
+    }
+
+    #[test]
+    fn find_value_response_empty_providers_roundtrip() -> Result<(), postcard::Error> {
+        let msg = FindValueResponse {
+            hash: [0x11u8; 32],
+            providers: vec![],
+            closer_nodes: vec![[0x55u8; 32]],
+        };
+        let bytes = postcard::to_allocvec(&msg)?;
+        let decoded: FindValueResponse = postcard::from_bytes(&bytes)?;
+        assert_eq!(decoded, msg);
+        Ok(())
+    }
+
+    #[test]
+    fn store_request_roundtrip() -> Result<(), postcard::Error> {
+        let msg = sample_store_request();
+        let bytes = postcard::to_allocvec(&msg)?;
+        let decoded: StoreRequest = postcard::from_bytes(&bytes)?;
+        assert_eq!(decoded, msg);
+        Ok(())
+    }
+
+    #[test]
+    fn store_ack_roundtrip() -> Result<(), postcard::Error> {
+        let msg = sample_store_ack();
+        let bytes = postcard::to_allocvec(&msg)?;
+        let decoded: StoreAck = postcard::from_bytes(&bytes)?;
+        assert_eq!(decoded, msg);
+        Ok(())
+    }
+
+    #[test]
+    fn store_ack_rejected_roundtrip() -> Result<(), postcard::Error> {
+        let msg = StoreAck {
+            hash: [0x66u8; 32],
+            accepted: false,
+        };
+        let bytes = postcard::to_allocvec(&msg)?;
+        let decoded: StoreAck = postcard::from_bytes(&bytes)?;
+        assert_eq!(decoded, msg);
+        Ok(())
+    }
+
+    #[test]
+    fn find_node_request_roundtrip() -> Result<(), postcard::Error> {
+        let msg = sample_find_node_request();
+        let bytes = postcard::to_allocvec(&msg)?;
+        let decoded: FindNodeRequest = postcard::from_bytes(&bytes)?;
+        assert_eq!(decoded, msg);
+        Ok(())
+    }
+
+    #[test]
+    fn find_node_response_roundtrip() -> Result<(), postcard::Error> {
+        let msg = sample_find_node_response();
+        let bytes = postcard::to_allocvec(&msg)?;
+        let decoded: FindNodeResponse = postcard::from_bytes(&bytes)?;
+        assert_eq!(decoded, msg);
+        Ok(())
+    }
+
+    #[test]
+    fn dht_message_find_value_discriminant_is_zero() -> Result<(), postcard::Error> {
+        let msg = DhtMessage::FindValue(sample_find_value_request());
+        let bytes = postcard::to_allocvec(&msg)?;
+        assert_eq!(bytes.first().copied(), Some(0u8));
+        let decoded: DhtMessage = postcard::from_bytes(&bytes)?;
+        assert_eq!(decoded, msg);
+        Ok(())
+    }
+
+    #[test]
+    fn dht_message_find_value_response_discriminant_is_one() -> Result<(), postcard::Error> {
+        let msg = DhtMessage::FindValueResponse(sample_find_value_response());
+        let bytes = postcard::to_allocvec(&msg)?;
+        assert_eq!(bytes.first().copied(), Some(1u8));
+        let decoded: DhtMessage = postcard::from_bytes(&bytes)?;
+        assert_eq!(decoded, msg);
+        Ok(())
+    }
+
+    #[test]
+    fn dht_message_store_discriminant_is_two() -> Result<(), postcard::Error> {
+        let msg = DhtMessage::Store(sample_store_request());
+        let bytes = postcard::to_allocvec(&msg)?;
+        assert_eq!(bytes.first().copied(), Some(2u8));
+        let decoded: DhtMessage = postcard::from_bytes(&bytes)?;
+        assert_eq!(decoded, msg);
+        Ok(())
+    }
+
+    #[test]
+    fn dht_message_store_ack_discriminant_is_three() -> Result<(), postcard::Error> {
+        let msg = DhtMessage::StoreAck(sample_store_ack());
+        let bytes = postcard::to_allocvec(&msg)?;
+        assert_eq!(bytes.first().copied(), Some(3u8));
+        let decoded: DhtMessage = postcard::from_bytes(&bytes)?;
+        assert_eq!(decoded, msg);
+        Ok(())
+    }
+
+    #[test]
+    fn dht_message_batch_store_discriminant_is_four() -> Result<(), postcard::Error> {
+        let msg = DhtMessage::BatchStore(sample_batch_store_request());
+        let bytes = postcard::to_allocvec(&msg)?;
+        assert_eq!(bytes.first().copied(), Some(4u8));
+        let decoded: DhtMessage = postcard::from_bytes(&bytes)?;
+        assert_eq!(decoded, msg);
+        Ok(())
+    }
+
+    #[test]
+    fn dht_message_batch_store_ack_discriminant_is_five() -> Result<(), postcard::Error> {
+        let msg = DhtMessage::BatchStoreAck(sample_batch_store_ack());
+        let bytes = postcard::to_allocvec(&msg)?;
+        assert_eq!(bytes.first().copied(), Some(5u8));
+        let decoded: DhtMessage = postcard::from_bytes(&bytes)?;
+        assert_eq!(decoded, msg);
+        Ok(())
+    }
+
+    #[test]
+    fn dht_message_find_node_discriminant_is_six() -> Result<(), postcard::Error> {
+        let msg = DhtMessage::FindNode(sample_find_node_request());
+        let bytes = postcard::to_allocvec(&msg)?;
+        assert_eq!(bytes.first().copied(), Some(6u8));
+        let decoded: DhtMessage = postcard::from_bytes(&bytes)?;
+        assert_eq!(decoded, msg);
+        Ok(())
+    }
+
+    #[test]
+    fn dht_message_find_node_response_discriminant_is_seven() -> Result<(), postcard::Error> {
+        let msg = DhtMessage::FindNodeResponse(sample_find_node_response());
+        let bytes = postcard::to_allocvec(&msg)?;
+        assert_eq!(bytes.first().copied(), Some(7u8));
+        let decoded: DhtMessage = postcard::from_bytes(&bytes)?;
+        assert_eq!(decoded, msg);
+        Ok(())
+    }
+
+    #[test]
+    fn batch_store_request_roundtrip() -> Result<(), postcard::Error> {
+        let msg = sample_batch_store_request();
+        let bytes = postcard::to_allocvec(&msg)?;
+        let decoded: BatchStoreRequest = postcard::from_bytes(&bytes)?;
+        assert_eq!(decoded, msg);
+        Ok(())
+    }
+
+    #[test]
+    fn batch_store_ack_roundtrip() -> Result<(), postcard::Error> {
+        let msg = sample_batch_store_ack();
+        let bytes = postcard::to_allocvec(&msg)?;
+        let decoded: BatchStoreAck = postcard::from_bytes(&bytes)?;
+        assert_eq!(decoded, msg);
+        Ok(())
+    }
+
+    #[test]
+    fn dht_message_rejects_unknown_discriminant() {
+        // Discriminant 99 has no matching variant — silent-drop is a handler
+        // concern; at the type level postcard surfaces a decode error.
+        let bytes = [99u8, 0, 0, 0, 0];
+        let r: Result<DhtMessage, _> = postcard::from_bytes(&bytes);
+        assert!(r.is_err());
+    }
+
+    // ADR 022 §DHT Bandwidth Analysis pins the max FindValueResponse at
+    // ~2.3 KB on the wire (50 providers × 32 B + 20 closer_nodes × 32 B +
+    // framing). We measure the **fully wrapped** `DhtMessage` payload (one
+    // discriminant byte for the outer enum + the inner struct) PLUS the
+    // length-prefix varint added by `crate::framing::write_frame` so the
+    // bound matches the operator-observable wire shape — measuring only
+    // the inner struct would let drift creep in via discriminant or
+    // framing-layer changes.
+    #[test]
+    fn find_value_response_max_framed_size_under_ceiling() -> Result<(), postcard::Error> {
+        let inner = FindValueResponse {
+            hash: [0xFFu8; 32],
+            providers: vec![[0xCDu8; 32]; MAX_PROVIDERS_PER_HASH],
+            closer_nodes: vec![[0xCDu8; 32]; MAX_CLOSER_NODES],
+        };
+        let msg = DhtMessage::FindValueResponse(inner.clone());
+        let payload = postcard::to_allocvec(&msg)?;
+        // Account for the framing varint length prefix the writer prepends.
+        // postcard `to_allocvec(&u32)` produces the same varint layout, so
+        // its length is the right proxy for the prefix's byte count.
+        let payload_len_u32: u32 = u32::try_from(payload.len())
+            .expect("payload length must fit in u32 for framing varint");
+        let length_prefix_len = postcard::to_allocvec(&payload_len_u32)?.len();
+        let framed_len = payload.len() + length_prefix_len;
+        // 1 (enum discriminant) + 32 (hash) + 1 (len varint, 50 fits in 1B)
+        // + 50×32 (providers) + 1 (len varint, 20 fits in 1B) + 20×32 (closer)
+        // = 1 + 32 + 1 + 1600 + 1 + 640 = 2275 B inner; + ~2B varint length
+        // prefix = ~2277 B on the wire. Round up to 2.3 KB ceiling.
+        assert!(
+            framed_len <= 2_300,
+            "framed max DhtMessage::FindValueResponse = {framed_len} B exceeds 2.3 KB ADR 022 ceiling"
+        );
+        // Lower-bound guard: a future regression that drops `providers` or
+        // `closer_nodes` from the wire shape would shrink the encoded
+        // size well below the ADR's modeled payload (~2.27 KB) without
+        // failing the upper-bound assert. Pin the lower bound at 2 KB so
+        // any accidental field removal trips the test loudly.
+        assert!(
+            framed_len > 2_000,
+            "framed max DhtMessage::FindValueResponse shrank to {framed_len} B \
+             — has the wire shape lost providers/closer_nodes?"
+        );
+        // Sanity: round-trips through the outer enum.
+        let decoded: DhtMessage = postcard::from_bytes(&payload)?;
+        assert_eq!(decoded, msg);
+        Ok(())
+    }
+
+    #[test]
+    fn find_value_response_decode_rejects_oversize_providers() -> Result<(), postcard::Error> {
+        // Serialize a response whose `providers` field exceeds the cap.
+        // Decoding must fail with the `deserialize_with` hook's error
+        // rather than allocate the oversize Vec.
+        let msg = FindValueResponse {
+            hash: [0xFFu8; 32],
+            providers: vec![[0xCDu8; 32]; MAX_PROVIDERS_PER_HASH + 1],
+            closer_nodes: vec![],
+        };
+        let bytes = postcard::to_allocvec(&msg)?;
+        let decoded: Result<FindValueResponse, _> = postcard::from_bytes(&bytes);
+        assert!(
+            decoded.is_err(),
+            "providers length {} > MAX_PROVIDERS_PER_HASH must reject at decode",
+            MAX_PROVIDERS_PER_HASH + 1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn find_value_response_decode_rejects_oversize_closer_nodes() -> Result<(), postcard::Error> {
+        let msg = FindValueResponse {
+            hash: [0xFFu8; 32],
+            providers: vec![],
+            closer_nodes: vec![[0xCDu8; 32]; MAX_CLOSER_NODES + 1],
+        };
+        let bytes = postcard::to_allocvec(&msg)?;
+        let decoded: Result<FindValueResponse, _> = postcard::from_bytes(&bytes);
+        assert!(decoded.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn find_node_response_decode_rejects_oversize_closer_nodes() -> Result<(), postcard::Error> {
+        let msg = FindNodeResponse {
+            target: [0u8; 32],
+            closer_nodes: vec![[0xCDu8; 32]; MAX_CLOSER_NODES + 1],
+        };
+        let bytes = postcard::to_allocvec(&msg)?;
+        let decoded: Result<FindNodeResponse, _> = postcard::from_bytes(&bytes);
+        assert!(decoded.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn batch_store_request_decode_rejects_oversize_hashes() -> Result<(), postcard::Error> {
+        let msg = BatchStoreRequest {
+            hashes: vec![[0xCDu8; 32]; MAX_BATCH_STORE_HASHES + 1],
+            holder: [0u8; 32],
+        };
+        let bytes = postcard::to_allocvec(&msg)?;
+        let decoded: Result<BatchStoreRequest, _> = postcard::from_bytes(&bytes);
+        assert!(
+            decoded.is_err(),
+            "ADR 022 §STORE Flow: BatchStore > 256 hashes must reject at decode"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn batch_store_ack_decode_rejects_oversize_results() -> Result<(), postcard::Error> {
+        let msg = BatchStoreAck {
+            results: vec![true; MAX_BATCH_STORE_HASHES + 1],
+        };
+        let bytes = postcard::to_allocvec(&msg)?;
+        let decoded: Result<BatchStoreAck, _> = postcard::from_bytes(&bytes);
+        assert!(decoded.is_err());
+        Ok(())
+    }
+
+    // Caps are inclusive: exactly-MAX must round-trip cleanly to confirm
+    // the boundary check is on `>`, not `>=`.
+    #[test]
+    fn caps_accept_exactly_max() -> Result<(), postcard::Error> {
+        let resp = FindValueResponse {
+            hash: [0u8; 32],
+            providers: vec![[0u8; 32]; MAX_PROVIDERS_PER_HASH],
+            closer_nodes: vec![[0u8; 32]; MAX_CLOSER_NODES],
+        };
+        let bytes = postcard::to_allocvec(&resp)?;
+        let decoded: FindValueResponse = postcard::from_bytes(&bytes)?;
+        assert_eq!(decoded.providers.len(), MAX_PROVIDERS_PER_HASH);
+        assert_eq!(decoded.closer_nodes.len(), MAX_CLOSER_NODES);
+        let batch = BatchStoreRequest {
+            hashes: vec![[0u8; 32]; MAX_BATCH_STORE_HASHES],
+            holder: [0u8; 32],
+        };
+        let bytes = postcard::to_allocvec(&batch)?;
+        let decoded: BatchStoreRequest = postcard::from_bytes(&bytes)?;
+        assert_eq!(decoded.hashes.len(), MAX_BATCH_STORE_HASHES);
+        Ok(())
+    }
+
+    #[test]
+    fn dht_message_trailing_bytes_tolerated() -> Result<(), postcard::Error> {
+        // ADR 013 Tier-1: extension bytes after the message are silently
+        // tolerated by `take_from_bytes`. Confirms the DHT enum behaves the
+        // same as ProbeMessage under unknown-extension data.
+        let msg = DhtMessage::FindValue(sample_find_value_request());
+        let mut bytes = postcard::to_allocvec(&msg)?;
+        bytes.extend_from_slice(&[0xAAu8, 0xBB, 0xCC]);
+        let (decoded, tail) = postcard::take_from_bytes::<DhtMessage>(&bytes)?;
+        assert_eq!(decoded, msg);
+        assert_eq!(tail, &[0xAAu8, 0xBB, 0xCC]);
+        Ok(())
+    }
+}
