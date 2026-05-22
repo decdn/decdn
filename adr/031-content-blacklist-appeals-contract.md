@@ -1,7 +1,6 @@
 # ADR 031: ContentBlacklist appeal-contract surface
 
-**Date:** 2026-05-14
-**Status:** Draft
+**Status:** Accepted
 
 ## Context
 
@@ -168,7 +167,7 @@ function rejectAppeal(uint256 appealId) external onlyEmergencyMultisig;
 function rejectAppealAsPerjury(uint256 appealId) external onlyEmergencyMultisig;
 ```
 
-`rejectAppealAsPerjury` is a sibling entry point for the [ADR 011 § Evidence](011-content-takedown.md#evidence)claration was false. It does everything `rejectAppeal` does, plus sets `appeals[appealId].perjuryFlagged = 1` and `perjuryDenylistUntilUs[appeal.filer] = nowUs + 365 days * 1_000_000`. Multisig may call either against an `Open`, `UnFastTracked`, or `FastTracked` appeal; on a `FastTracked` appeal the suspension is released as a side effect (mirrors `unFastTrackAppeal` slot accounting before terminating).
+`rejectAppealAsPerjury` is a sibling entry point for the [ADR 011 § Evidence](011-content-takedown.md#evidence) case where the sworn declaration was false. It does everything `rejectAppeal` does, plus sets `appeals[appealId].perjuryFlagged = 1` and `perjuryDenylistUntilUs[appeal.filer] = nowUs + 365 days * 1_000_000`. Multisig may call either against an `Open`, `UnFastTracked`, or `FastTracked` appeal; on a `FastTracked` appeal the suspension is released as a side effect (mirrors `unFastTrackAppeal` slot accounting before terminating).
 
 | Revert | Trigger |
 | --- | --- |
@@ -197,7 +196,7 @@ Both require `status == FastTracked` and `nowUs < reviewWindowEndsUs`. Both term
 
 `reverseAppeal`:
 
-- `status = Reversed`; `regionActiveReliefCount[appeal.region]--`; `entry.suspended = false`. `entry.effectiveAt` is **preserved** per [ADR 011 § Authority and flow](011-content-takedown.md#authority-and-flow)roactively shielding pre-suspension non-compliance.
+- `status = Reversed`; `regionActiveReliefCount[appeal.region]--`; `entry.suspended = false`. `entry.effectiveAt` is **preserved** per [ADR 011 § Authority and flow](011-content-takedown.md#authority-and-flow) to avoid retroactively shielding pre-suspension non-compliance.
 - Bond burn: `TOKEN.burn(appeal.bond)`; `totalBondsEscrowed -= appeal.bond`.
 - **Emits:** `BlacklistAppealReversed(appealId)`.
 
@@ -263,7 +262,7 @@ stateDiagram-v2
     Lapsed --> [*]
 ```
 
-`UnFastTracked → FastTracked` is one-shot per [ADR 011 § Contract surface](011-content-takedown.md#contract-surface) the same `appealId` reverts with `AlreadyUnFastTracked`.
+`UnFastTracked → FastTracked` is one-shot per [ADR 011 § Contract surface](011-content-takedown.md#contract-surface): a second `unFastTrackAppeal` on the same `appealId` reverts with `AlreadyUnFastTracked`.
 
 ### Integration with ContentBlacklist core
 
@@ -274,11 +273,11 @@ stateDiagram-v2
 
 ### Multisig capability scope
 
-`fastTrackAppeal`, `unFastTrackAppeal`, `rejectAppeal`, and `rejectAppealAsPerjury` are sub-modes of [ADR 009 § Emergency Multisig](009-governance.md#emergency-multisig)'s existing `suspendRegionalBody` capability — same 3-of-5 threshold, same signing semantics, same post-incident reporting obligations. They do **not** introduce a new multisig power. [ADR 009](009-governance.md#emergency-multisig)'s capability enumeration should be editorially expanded to list the appeal-specific entry points as sub-modes of the regional-body capability (parallel to the recommendation in [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface) for SafetyReserve appeals).
+`fastTrackAppeal`, `unFastTrackAppeal`, `rejectAppeal`, and `rejectAppealAsPerjury` are sub-modes of [ADR 009 § Emergency Multisig](009-governance.md#emergency-multisig)'s existing `suspendRegionalBody` capability — same 3-of-5 threshold, same signing semantics, same post-incident reporting obligations. They do **not** introduce a new multisig power. [ADR 009 § Emergency Multisig](009-governance.md#emergency-multisig) enumerates these appeal-specific entry points as sub-modes of the regional-body-suspension capability (capability 3), alongside the analogous SafetyReserve appeal sub-modes under capability 4.
 
 ### Gas-optimization notes
 
-- **`region` as `bytes2`.** Per [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)'s gas-optimization note on `BlacklistEntry`, the production region representation is `bytes2`. The `openBlacklistAppeal` external entry takes `string calldata region` for ADR-conformant interface stability but canonicalizes internally to `bytes2` for storage. Helpers (`_toBytes2(string)`) revert on length ≠ 2 or non-ASCII-alpha characters per ISO 3166-1 alpha-2.
+- **`region` as `bytes2`.** Per [ADR 011 § Contract: ContentBlacklist](011-content-takedown.md#contract-contentblacklist), the canonical region storage representation is `bytes2`. The `openBlacklistAppeal` external entry takes `string calldata region` for ADR-conformant interface stability but canonicalizes internally to `bytes2` for storage. Helpers (`_toBytes2(string)`) revert on length ≠ 2 or non-ASCII-alpha characters per ISO 3166-1 alpha-2.
 - **Struct packing.** The `BlacklistAppeal` struct is laid out across 5 slots (160 bytes total) with explicit padding fields marking unused slot space. Future field additions append to slot 4 (which has 14 bytes of free padding) or open a slot 5.
 - **`RejectionWindow` packing.** The fixed-length `uint64[3]` plus `uint64 cooldownUntilUs` fit in a single 32-byte slot, so `filerRejections` is one SLOAD per cap check.
 - **`appeals[0]` reserved.** Reading uninitialized appeal records (`appealId == 0` or unallocated) returns `status == None`; functions revert with `AppealNotFound()` on `status == None`. The contract does not store `0`-indexed entries.
@@ -294,7 +293,6 @@ stateDiagram-v2
 ### Negative
 
 - Five-slot struct + four auxiliary mappings per appeal carry non-trivial storage cost. Expected volume is low (most regional entries are never appealed; bond + frequency caps + per-body cap bound the active set), but high-volume regional adversarial activity multiplies storage cost linearly.
-- Multisig capability scope is implicit: `ADR 009` enumerates four capabilities; the blacklist-appeal entry points are sub-modes of capability (1) (regional-body suspension) but not yet listed. An [ADR 009](009-governance.md#adr-009-governance-model) editorial pass is owed.
 
 ### Risks
 
