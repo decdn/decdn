@@ -26,7 +26,10 @@ use decdn_gossip::{GossipMetrics, GossipRuntimeConfig, GossipService, PeerTable,
 
 use crate::admin;
 use crate::channel_store::PersistentChannelStateStore;
-use crate::dht::{DhtRateLimiter, rate_limit::DhtRateLimitConfig};
+use crate::dht::{
+    ConfigStakerSet, DhtRateLimiter, RecordStore, RecordStoreConfig, StakerSet,
+    rate_limit::DhtRateLimitConfig,
+};
 use crate::dispatch::ConnectionLimiter;
 use crate::handlers::dht::DhtHandler;
 use crate::handlers::limited::LimitedHandler;
@@ -140,6 +143,59 @@ async fn run_dispatch_gc(
                         dropped,
                         "dispatch GC sweep complete"
                     );
+                }
+            }
+        }
+    }
+}
+
+/// Periodic DHT record-store GC task (ADR 022 §Content Records and TTL).
+///
+/// `RecordStore::providers_at` lazily scrubs expired records for the
+/// hash it's queried about, but a hash that nobody ever queries again
+/// keeps its expired entries — they continue to count against the
+/// publisher's per-publisher quota and against the global cap until
+/// this task fires. Without it a node that publishes a one-shot blob
+/// can eventually exhaust its 200-record quota and have every future
+/// `Store` rejected.
+///
+/// The sweep is `O(expired × log N)` over the global LRU thanks to the
+/// front-walk in [`crate::dht::RecordStore::gc`]. Default interval is
+/// 60s — well below the 1-hour record TTL.
+// Same linear shape as `run_dispatch_gc` above (tick → maybe-prune →
+// log → loop). Splitting the body would scatter the "every tick takes
+// the lock and runs the BTreeSet walk" admission seam — the cognitive
+// complexity is the linear seq of two await points, not branching depth.
+#[allow(clippy::cognitive_complexity)]
+async fn run_record_store_gc(
+    records: Arc<std::sync::Mutex<RecordStore>>,
+    mut stop_rx: oneshot::Receiver<()>,
+    interval: Duration,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut stop_rx => {
+                tracing::debug!("dht record-store GC shutdown signal received");
+                return;
+            }
+            _ = ticker.tick() => {
+                let now_us = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX));
+                let removed = if let Ok(mut store) = records.lock() {
+                    store.gc(now_us)
+                } else {
+                    tracing::error!(
+                        "dht record-store mutex poisoned; skipping GC sweep this tick"
+                    );
+                    0
+                };
+                if removed > 0 {
+                    tracing::debug!(removed, "dht record-store GC sweep complete");
                 }
             }
         }
@@ -348,11 +404,10 @@ pub async fn run(
     // handler's data structures aren't fixed yet, and coupling the
     // runtime to a not-yet-written handler signature would block #317
     // unnecessarily.
-    // `cdn/dht/v1` handler (ADR 022 / #320). PR slice: serves `FindNode`
-    // off an in-memory k-bucket routing table seeded from inbound requests;
-    // `Store` and `FindValue` get placeholder responses until PR 3 lands
-    // the record store. Three-layer rate limiter is wired up at full
-    // ADR 022 spec.
+    // `cdn/dht/v1` handler (ADR 022 / #320). FindNode + FindValue +
+    // Store all wired up; iterative requester-side lookup and the
+    // republish scheduler land in PR 4 of #320. Three-layer rate limiter
+    // operates at the full ADR 022 spec.
     let dht_rate_limit_cfg = DhtRateLimitConfig {
         per_peer_rate_per_sec: cfg.dht.per_peer_rate_per_sec,
         per_peer_burst: cfg.dht.per_peer_burst,
@@ -366,11 +421,35 @@ pub async fn run(
         &dht_rate_limit_cfg,
         Arc::clone(&node_metrics),
     ));
+    // Record store sized from the ADR 022 defaults; per-publisher /
+    // global / per-hash caps are pinned by the protocol and only the
+    // TTL field is plausibly operator-tunable, but no knob is exposed
+    // yet — operators with non-default needs should file a follow-up
+    // rather than tune in TOML.
+    let record_store = Arc::new(std::sync::Mutex::new(RecordStore::new(
+        RecordStoreConfig::default(),
+    )));
+    // Active-staker set. Wired as an empty `ConfigStakerSet` until the
+    // chain-backed `ChainStakerSet` (reads `StakingRegistry.getActiveNodes()`
+    // and subscribes to `Staked`/`Unstaked`) lands with PR 4 of #320 — at
+    // which point the runtime swaps the construction here without
+    // touching the handler, which holds the trait object. Until then
+    // every inbound `cdn/dht/v1` `Store` is rejected with
+    // `accepted: false` per ADR 022 line 140; the cache → DHT republish
+    // hook exposed in this PR has no producer yet (PR 4 brings the
+    // scheduler), so no publisher-side traffic is gated either.
+    let staker_set: Arc<dyn StakerSet> = Arc::new(ConfigStakerSet::empty());
+    tracing::warn!(
+        "dht active-staker set is empty; every cdn/dht/v1 `Store` will be \
+         rejected (ADR 022 line 140). Chain-backed StakerSet lands with PR 4 of #320."
+    );
     let dht_handler = Arc::new(DhtHandler::new(
         secret_key.public(),
         Arc::clone(&dht_rate_limiter),
         Arc::clone(&limiter),
         Arc::clone(&node_metrics),
+        Arc::clone(&staker_set),
+        Arc::clone(&record_store),
     ));
 
     let router = Router::builder(ep.clone())
@@ -413,6 +492,19 @@ pub async fn run(
     tasks.spawn(run_dispatch_gc(
         dispatch_gc_limiter,
         dispatch_gc_stop_rx,
+        DISPATCH_GC_INTERVAL,
+    ));
+
+    // Periodic DHT record-store GC (ADR 022 §Content Records and TTL).
+    // Without this, expired records accumulate against per-publisher
+    // and global caps — a node could exhaust its 200-record per-
+    // publisher quota and start rejecting every `Store` even though
+    // the TTL window has long passed. Same shutdown shape as the
+    // dispatch GC above.
+    let (record_store_gc_stop_tx, record_store_gc_stop_rx) = oneshot::channel::<()>();
+    tasks.spawn(run_record_store_gc(
+        Arc::clone(&record_store),
+        record_store_gc_stop_rx,
         DISPATCH_GC_INTERVAL,
     ));
 
@@ -627,6 +719,7 @@ pub async fn run(
     // through `JoinSet::join_next` during the drain phase below — no
     // operator-actionable signal to log at this seam.
     let _ = dispatch_gc_stop_tx.send(());
+    let _ = record_store_gc_stop_tx.send(());
     // Admin server shutdown is ordered per `admin_stop_order`:
     //
     //   - `Early` (the default, including SIGTERM/SIGINT and plain
@@ -1659,6 +1752,42 @@ mod tests {
         assert!(
             result.is_ok(),
             "run_dispatch_gc must exit within 500ms of shutdown signal; \
+             a 60s hang here means the stop arm of the select was lost"
+        );
+        result
+            .expect("timeout already asserted")
+            .expect("task should not panic");
+    }
+
+    /// `run_record_store_gc` exits promptly when the stop oneshot
+    /// fires, mirroring the `run_dispatch_gc` contract above. A
+    /// regression that reordered the `tokio::select!` arms or dropped
+    /// `biased` would silently extend `SHUTDOWN_DEADLINE` by up to
+    /// one tick interval — under default `DISPATCH_GC_INTERVAL=60s`
+    /// the node would hang for a minute at shutdown.
+    #[tokio::test]
+    async fn run_record_store_gc_exits_promptly_on_shutdown() {
+        use crate::dht::{RecordStore, RecordStoreConfig};
+
+        let records = Arc::new(std::sync::Mutex::new(RecordStore::new(
+            RecordStoreConfig::default(),
+        )));
+        let (stop_tx, stop_rx) = oneshot::channel::<()>();
+        // 60s interval matches the runtime default so the test would
+        // hang for 60s on a regression rather than racing through a
+        // shorter interval.
+        let task = tokio::spawn(run_record_store_gc(
+            Arc::clone(&records),
+            stop_rx,
+            Duration::from_mins(1),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        stop_tx.send(()).expect("receiver still alive");
+        let result = tokio::time::timeout(Duration::from_millis(500), task).await;
+        assert!(
+            result.is_ok(),
+            "run_record_store_gc must exit within 500ms of shutdown signal; \
              a 60s hang here means the stop arm of the select was lost"
         );
         result

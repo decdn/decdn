@@ -15,7 +15,7 @@ use iroh_blobs::Hash;
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::store::fs::options::Options as FsStoreOptions;
 use iroh_blobs::store::{GcConfig, ProtectOutcome};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, broadcast};
 
 use decdn_config_types::{PinDiff, PinnedHashes, RetryPolicy};
 
@@ -128,6 +128,16 @@ struct Inner {
     /// retry loop bumps `origin_retry_exhausted` on terminal exhaustion.
     /// `None` in tests / non-metrics builds — bumps short-circuit.
     metrics: Option<Arc<CacheMetrics>>,
+    /// Broadcast channel announcing successful blob commits to interested
+    /// subscribers (DHT republish per ADR 022 §STORE Flow). Producers (the
+    /// `pull_through` success arm) call `send` and ignore the
+    /// "no-active-receivers" error — broadcast is fire-and-forget. The
+    /// channel is bounded; lagged receivers see [`broadcast::error::RecvError::Lagged`]
+    /// on the next recv and decide for themselves whether to backfill —
+    /// the DHT-side subscriber treats it as "force a republish sweep on
+    /// the next tick", so a brief stall in the consumer doesn't lose
+    /// blobs from the republish set.
+    inserts_tx: broadcast::Sender<Hash>,
     /// Strong reference to the GC callback's late-bound `FsStore`
     /// handle (#518). `Some` when `gc_interval > 0` was passed to
     /// [`CacheEngine::open_full`], `None` when GC is disabled.
@@ -734,9 +744,34 @@ impl CacheEngine {
                 evicted_log_path,
                 retry_policy,
                 metrics,
+                // Bounded channel — slow consumers (e.g. a republish
+                // scheduler under load) lag instead of backpressuring
+                // the cache hot path. Cap of 1024 matches the dispatch
+                // limiter's similar in-flight slot count; sized
+                // generously enough that a steady-state pull rate above
+                // 1000/s would have to also lose all subscribers for
+                // the lag to actually fire.
+                inserts_tx: broadcast::channel(1024).0,
                 gc_store_handle,
             }),
         })
+    }
+
+    /// Subscribe to a stream of `Hash`es announcing every blob that
+    /// successfully landed in the local store via the cache's
+    /// pull-through path (the private `pull_through` is the single
+    /// convergence point).
+    /// Used by the DHT republish scheduler (ADR 022 §STORE Flow line
+    /// 126 — "When a node caches blob H ...") to schedule the first
+    /// publish-set to the K+3 closest peers.
+    ///
+    /// The channel is bounded and best-effort: lagged receivers see a
+    /// [`broadcast::error::RecvError::Lagged`] on the next recv and
+    /// MUST treat it as "force a full republish sweep" rather than try
+    /// to backfill — the cache does not retain the missed hashes.
+    #[must_use]
+    pub fn subscribe_inserts(&self) -> broadcast::Receiver<Hash> {
+        self.inner.inserts_tx.subscribe()
     }
 
     /// Atomically swap the pinned-hashes set. Called by the runtime's
@@ -1327,7 +1362,21 @@ impl CacheEngine {
             // NotFound advance as "primary failed" once any earlier
             // origin had errored.
             let advance_was_error = match outcome {
-                Ok(PullThroughOutcome::Bytes(bytes)) => return Ok(bytes),
+                Ok(PullThroughOutcome::Bytes(bytes)) => {
+                    // Announce the successful commit to any DHT
+                    // republish-scheduler subscribers (ADR 022 §STORE
+                    // Flow). `broadcast::send` returns `Err(SendError)`
+                    // only when there are no active subscribers, which
+                    // is the normal state when no DHT republish task
+                    // exists — ignore. We deliberately do NOT emit on
+                    // the local-store hit short-circuit at line ~1090:
+                    // the consumer cares about *fresh* commits (which
+                    // start a new TTL cycle), and a get-from-local
+                    // doesn't change the holder's relationship with the
+                    // blob.
+                    let _ = self.inner.inserts_tx.send(hash);
+                    return Ok(bytes);
+                }
                 Ok(PullThroughOutcome::NotFound) => {
                     any_not_found = true;
                     false
@@ -1949,6 +1998,66 @@ mod tests {
         anyhow::ensure!(
             engine.last_accessed(hash).is_some(),
             "expected Some(Instant) after pull-through get"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn subscribe_inserts_emits_on_pull_through_success() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"hello dht hook";
+        let hash = Hash::new(payload);
+        let origin = StubOrigin::new(payload);
+
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
+        let mut rx = engine.subscribe_inserts();
+
+        // Successful pull-through must announce the hash to the
+        // subscriber. The DHT republish scheduler (PR 4 of #320)
+        // consumes this stream to drive `Store` fan-out to the K+3
+        // closest peers.
+        let _ = engine.get(hash).await?;
+        let announced = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting for subscribe_inserts emit"))?
+            .map_err(|e| anyhow::anyhow!("recv: {e}"))?;
+        anyhow::ensure!(
+            announced == hash,
+            "expected announced hash to equal committed hash"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn subscribe_inserts_does_not_emit_on_cache_hit() -> anyhow::Result<()> {
+        // A `get` that hits the local store (no pull-through, no new
+        // commit) must NOT emit on the channel — only fresh commits
+        // do, because the consumer's job is to schedule a NEW publish
+        // cycle for newly-cached blobs.
+        let tmp = tempfile::tempdir()?;
+        let payload = b"hello cached-hit";
+        let hash = Hash::new(payload);
+        let origin = StubOrigin::new(payload);
+
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
+
+        // First get: pull-through, should emit. Drain that emission so
+        // the channel is empty before the second get.
+        let mut rx = engine.subscribe_inserts();
+        let _ = engine.get(hash).await?;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .map_err(|_| anyhow::anyhow!("first pull-through emission missing"))?
+            .map_err(|e| anyhow::anyhow!("recv first: {e}"))?;
+
+        // Second get: cache hit. No emission expected.
+        let _ = engine.get(hash).await?;
+        let r = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
+        anyhow::ensure!(
+            r.is_err(),
+            "cache hit must not emit on subscribe_inserts; got {r:?}"
         );
         Ok(())
     }

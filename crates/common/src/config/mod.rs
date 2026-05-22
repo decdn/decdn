@@ -1722,10 +1722,14 @@ fn parse_trusted_ips(
 }
 
 /// Parse a 64-character hex (case-insensitive) node ID into 32 raw bytes.
+///
+/// The error message is field-agnostic — callers (currently
+/// `gossip.allowlist`) wrap the result with the field path of the
+/// offending entry.
 fn parse_node_id_hex(s: &str) -> anyhow::Result<[u8; 32]> {
     anyhow::ensure!(
         s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()),
-        "gossip.allowlist entry must be 64 hex chars, got {s:?}"
+        "must be 64 hex chars, got {s:?}"
     );
     let mut out = [0u8; 32];
     let bytes = s.as_bytes();

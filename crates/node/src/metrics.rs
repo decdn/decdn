@@ -159,6 +159,28 @@ pub struct DecdnMetrics {
     /// failures without scraping debug-level logs. Operator-visible name:
     /// `decdn_dht_requests_failed_total`.
     pub dht_requests_failed: Counter,
+    /// `Store` rejected because `holder != authenticated NodeId` (ADR
+    /// 022 §STORE Flow line 140). This is the lying-`holder` attack
+    /// signal — a non-zero value means at least one peer is trying to
+    /// publish records on behalf of someone else's `NodeId`. Operator-
+    /// visible name: `decdn_dht_store_rejected_holder_mismatch_total`.
+    pub dht_store_rejected_holder_mismatch: Counter,
+    /// `Store` rejected because the holder is not in the active-staker
+    /// set (ADR 022 §STORE Flow line 140). Sustained growth from many
+    /// distinct holders without matching `decdn_dht_store_accepted`
+    /// growth is a Sybil-attempt indicator. Operator-visible name:
+    /// `decdn_dht_store_rejected_non_staked_total`.
+    pub dht_store_rejected_non_staked: Counter,
+    /// `Store` rejected because the publisher is at the per-publisher
+    /// quota (ADR 022 §Content Records and TTL — 200-record hard cap).
+    /// Normal load shouldn't trip this. Operator-visible name:
+    /// `decdn_dht_store_rejected_quota_total`.
+    pub dht_store_rejected_quota: Counter,
+    /// `Store` admitted to the record store (newly inserted OR
+    /// refreshed). Pair with the three `dht_store_rejected_*` counters
+    /// to compute admission rate. Operator-visible name:
+    /// `decdn_dht_store_accepted_total`.
+    pub dht_store_accepted: Counter,
 }
 
 /// Self-imposed cap on the distinct-peer tracking set (and hence the
@@ -390,6 +412,30 @@ impl Metrics {
     /// timeout, etc).
     pub fn dht_request_failed(&self) {
         self.decdn.dht_requests_failed.inc();
+    }
+
+    /// Record a `Store` rejected by the `holder != authenticated NodeId`
+    /// check (ADR 022 §STORE Flow line 140 — lying-holder attack).
+    pub fn dht_store_rejected_holder_mismatch(&self) {
+        self.decdn.dht_store_rejected_holder_mismatch.inc();
+    }
+
+    /// Record a `Store` rejected by the active-staker filter (ADR 022
+    /// §STORE Flow line 140 — non-staked publisher).
+    pub fn dht_store_rejected_non_staked(&self) {
+        self.decdn.dht_store_rejected_non_staked.inc();
+    }
+
+    /// Record a `Store` rejected by the per-publisher quota (ADR 022
+    /// §Content Records and TTL — 200-record hard cap).
+    pub fn dht_store_rejected_quota(&self) {
+        self.decdn.dht_store_rejected_quota.inc();
+    }
+
+    /// Record a `Store` admitted to the record store (newly inserted or
+    /// refreshed).
+    pub fn dht_store_accepted(&self) {
+        self.decdn.dht_store_accepted.inc();
     }
 
     /// Record a 0-RTT connection attempt (ADR 015): a cached session
