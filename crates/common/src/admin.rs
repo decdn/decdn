@@ -75,6 +75,15 @@ pub struct HealthResponse {
     /// so wall-clock skew can't produce a negative or non-monotonic
     /// value.
     pub uptime_s: u64,
+    /// Currently in-flight QUIC handler tasks holding a dispatch permit
+    /// (read off the `decdn_dispatch_in_flight` gauge — see
+    /// `ConnectionLimiter` in `decdn-node`). Polled by `decdn node drain
+    /// --wait` (issue #604) to detect when all client streams have
+    /// completed during a graceful drain. `#[serde(default)]` keeps
+    /// older servers (which don't serialize the field) round-tripping
+    /// cleanly through new clients as `0`.
+    #[serde(default)]
+    pub in_flight_streams: u64,
 }
 
 /// Request body for `admin_v1_evict` (issue #279).
@@ -215,20 +224,40 @@ pub struct ReloadResponse {
     pub log_level: String,
 }
 
+/// Request body for `admin_v1_drain` (issue #244).
+///
+/// All fields are `#[serde(default)]` so older clients calling with no
+/// params (the pre-#604 shape) still deserialize cleanly to
+/// `DrainRequest::default()` and trigger the original SIGTERM-equivalent
+/// shutdown order.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DrainRequest {
+    /// When `true`, ask the runtime to keep the admin server alive
+    /// *through* `router.shutdown` instead of closing it early (issue
+    /// #604). This is the opt-in seam for `decdn node drain --wait`: the
+    /// CLI polls `admin_v1_health` for `in_flight_streams == 0` and the
+    /// admin port must stay open long enough for that loop to observe
+    /// completion. Default `false` preserves the deliberate ADR-025
+    /// SIGTERM ordering (admin closes before `router.shutdown`); setting
+    /// `true` only reorders that single drain.
+    #[serde(default)]
+    pub wait_admin: bool,
+}
+
 /// Response body for `admin_v1_drain` (issue #244). Always `initiated:
 /// true` on a non-error response — drain is fire-and-forget; the runtime
-/// begins the same graceful sequence SIGTERM triggers, and the admin server
-/// is among the first surfaces to stop (metrics first, then admin, both
-/// before `router.shutdown`), so an operator that needs to observe
-/// completion polls process exit (systemd/K8s) or `decdn node health`
-/// until the connection is refused.
+/// begins the same graceful sequence SIGTERM triggers, and the admin
+/// server normally stops early (metrics first, then admin, both before
+/// `router.shutdown`). When the request set `wait_admin: true`
+/// (issue #604) the runtime instead keeps the admin server alive until
+/// `router.shutdown` returns so a polling client (`decdn node drain
+/// --wait`) can observe `admin_v1_health.in_flight_streams` reach 0.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DrainResponse {
     /// Always `true` on a non-error response — the trigger has been fired
     /// and the runtime's shutdown sequence is underway. "Initiated", not
     /// "completed": the admin server may close before the response
-    /// returns because the admin server is intentionally one of the first
-    /// surfaces to stop during shutdown.
+    /// returns when `wait_admin` was unset (the original ADR-025 order).
     pub initiated: bool,
 }
 
@@ -322,13 +351,19 @@ pub trait AdminRpc {
     /// drain is bounded by the runtime's 15s `SHUTDOWN_DEADLINE` (the
     /// router-shutdown step itself is unbounded — a stuck handler hangs
     /// the runtime, only the post-router task join is timeout-gated).
-    /// Fire-and-forget: the response returns as soon as the trigger lands,
-    /// not when shutdown completes — the admin server is one of the first
-    /// surfaces to stop, so a blocking-until-drained RPC would race its
-    /// own listener closing. Equivalent to `kill -TERM <pid>` for
-    /// operators who'd rather not stat the PID.
+    ///
+    /// Fire-and-forget by default: the response returns as soon as the
+    /// trigger lands, not when shutdown completes. Equivalent to `kill
+    /// -TERM <pid>` for operators who'd rather not stat the PID.
+    ///
+    /// Set `req.wait_admin = true` (issue #604) to ask the runtime to
+    /// keep the admin server alive through `router.shutdown` so a
+    /// polling client can observe `admin_v1_health.in_flight_streams`
+    /// reach 0. Older clients sending no parameters still deserialize
+    /// to `DrainRequest::default()` and get the original
+    /// SIGTERM-equivalent shutdown order.
     #[method(name = "drain")]
-    async fn drain(&self) -> RpcResult<DrainResponse>;
+    async fn drain(&self, req: DrainRequest) -> RpcResult<DrainResponse>;
 }
 
 /// Decode a 64-character hex BLAKE3 hash into a [`struct@Hash`].

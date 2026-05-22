@@ -493,7 +493,7 @@ pub async fn run(
     // `AnnounceTrigger`, spawn the admin serve task with the full state.
     // Bind happened earlier (see `admin_listener` above) so a port collision
     // would have failed startup before any side-effectful subscribes ran.
-    let admin_stop_tx = if let Some(listener) = admin_listener {
+    let mut admin_stop_tx = if let Some(listener) = admin_listener {
         let (tx, rx) = oneshot::channel::<()>();
         // Build the reload hook only when a config file path was passed
         // (CLI-only invocation has nothing on disk to re-read). The
@@ -514,6 +514,7 @@ pub async fn run(
             reload_hook,
             Arc::clone(&drain_trigger),
             Arc::clone(&eth_signer),
+            Arc::clone(&node_metrics),
         );
         tasks.spawn(async move {
             if let Err(err) = admin::serve(listener, state, rx).await {
@@ -598,7 +599,21 @@ pub async fn run(
     // through `JoinSet::join_next` during the drain phase below — no
     // operator-actionable signal to log at this seam.
     let _ = dispatch_gc_stop_tx.send(());
-    if let Some(tx) = admin_stop_tx
+    // Admin server shutdown is ordered per `drain_trigger.wait_admin()`
+    // (issue #604):
+    //
+    //   - `false` (the default, SIGTERM/SIGINT and plain `admin_v1_drain`):
+    //     stop admin *before* `router.shutdown` so admin doesn't keep
+    //     accepting fresh loopback connections during drain. This is the
+    //     ADR-025 ordering.
+    //   - `true` (only set by `admin_v1_drain` with `wait_admin: true`,
+    //     i.e. `decdn node drain --wait`): keep admin alive *through*
+    //     `router.shutdown` so a polling client can observe
+    //     `admin_v1_health.in_flight_streams` reach 0. The admin stop
+    //     signal fires below, after `router.shutdown` returns.
+    let wait_admin = drain_trigger.wait_admin();
+    if !wait_admin
+        && let Some(tx) = admin_stop_tx.take()
         && tx.send(()).is_err()
     {
         tracing::warn!("admin server exited before shutdown signal was sent");
@@ -622,6 +637,20 @@ pub async fn run(
     }
     for handle in &gossip_handles {
         handle.abort();
+    }
+
+    // Late admin stop (issue #604 `wait_admin` path). The polling
+    // client (`decdn node drain --wait`) needed admin to stay open
+    // while `router.shutdown` awaited the last in-flight client
+    // streams; now that it's returned, tear admin down so the polling
+    // client either sees `in_flight_streams == 0` on its next tick or
+    // observes ECONNREFUSED — both of which it treats as "drain
+    // complete".
+    if wait_admin
+        && let Some(tx) = admin_stop_tx.take()
+        && tx.send(()).is_err()
+    {
+        tracing::warn!("admin server exited before late shutdown signal was sent");
     }
 
     // Flush the cache store before the drain deadline so in-flight writes

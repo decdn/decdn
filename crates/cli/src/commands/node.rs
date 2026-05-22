@@ -11,8 +11,8 @@ use jsonrpsee::http_client::HttpClientBuilder;
 use serde::Deserialize;
 
 use decdn_common::admin::{
-    AdminRpcClient, AnnounceResponse, DrainResponse, EvictRequest, EvictResponse, HealthResponse,
-    PeerView, PeersResponse, ReloadResponse,
+    AdminRpcClient, AnnounceResponse, DrainRequest, DrainResponse, EvictRequest, EvictResponse,
+    HealthResponse, PeerView, PeersResponse, ReloadResponse,
 };
 use decdn_common::cli;
 use decdn_common::cli::ConfigPathSource;
@@ -279,16 +279,35 @@ pub async fn reload(args: &cli::ReloadArgs, global_config: Option<&Path>) -> any
 }
 
 /// `decdn node drain`: call `admin_v1_drain` on the running node to trigger
-/// graceful shutdown (issue #244, ADR 025). Fire-and-forget: returns
-/// `drain_initiated=true` as soon as the trigger is queued; the runtime
-/// then begins the same shutdown sequence SIGTERM triggers. Observe
-/// completion via process exit or `decdn node health` until ECONNREFUSED.
+/// graceful shutdown (issue #244, ADR 025).
+///
+/// Without `--wait`: fire-and-forget — returns `drain_initiated=true` as
+/// soon as the trigger is queued; observe completion via process exit
+/// or `decdn node health` until ECONNREFUSED.
+///
+/// With `--wait` (issue #604): asks the runtime to keep the admin
+/// server alive through `router.shutdown` (`DrainRequest { wait_admin:
+/// true }`), then polls `admin_v1_health` for `in_flight_streams == 0`.
+/// Returns `Ok` once the count reaches 0 or admin closes
+/// (ECONNREFUSED — drain finished and tore admin down). Returns `Err`
+/// with `drain_timeout=true in_flight_streams=N` on stderr if
+/// `--wait-timeout-secs` elapses first.
 pub async fn drain(args: &cli::DrainArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
     anyhow::ensure!(
         args.timeout_ms > 0,
         "--timeout-ms must be > 0 (jsonrpsee treats Duration::ZERO as \
          'never' rather than 'sub-millisecond deadline')"
     );
+    if args.wait {
+        anyhow::ensure!(
+            args.wait_timeout_secs > 0,
+            "--wait-timeout-secs must be > 0 when --wait is set"
+        );
+        anyhow::ensure!(
+            args.wait_poll_ms > 0,
+            "--wait-poll-ms must be > 0 when --wait is set"
+        );
+    }
 
     let config_path = args.config.as_deref().or(global_config);
     let url = resolve_admin_url(args.admin_url.as_deref(), config_path)?;
@@ -299,23 +318,91 @@ pub async fn drain(args: &cli::DrainArgs, global_config: Option<&Path>) -> anyho
         .with_context(|| format!("failed to build admin JSON-RPC client for {url}"))?;
 
     let resp: DrainResponse = client
-        .drain()
+        .drain(DrainRequest {
+            wait_admin: args.wait,
+        })
         .await
         .map_err(|err| classify_client_error(&url, args.timeout_ms, err))?;
 
-    if args.json {
-        let pretty =
-            serde_json::to_string_pretty(&resp).context("failed to encode drain response")?;
-        println!("{pretty}");
-    } else {
-        // One stable, grep-friendly line. "Initiated", not "completed":
-        // fire-and-forget semantics mean the process is still running when
-        // this prints. Observe completion via `decdn node health` until
-        // ECONNREFUSED, or let the process supervisor (systemd/K8s) notify.
-        println!("drain_initiated={}", resp.initiated);
+    if !args.wait {
+        if args.json {
+            let pretty =
+                serde_json::to_string_pretty(&resp).context("failed to encode drain response")?;
+            println!("{pretty}");
+        } else {
+            // One stable, grep-friendly line. "Initiated", not "completed":
+            // fire-and-forget semantics mean the process is still running when
+            // this prints. Observe completion via `decdn node health` until
+            // ECONNREFUSED, or let the process supervisor (systemd/K8s) notify.
+            println!("drain_initiated={}", resp.initiated);
+        }
+        return Ok(());
     }
 
-    Ok(())
+    // `--wait` path: drain has been initiated with `wait_admin=true`, so
+    // the server is keeping admin alive through `router.shutdown`. Poll
+    // until `in_flight_streams == 0`, admin closes (ECONNREFUSED), or
+    // the wall-clock budget elapses.
+    let deadline = std::time::Instant::now() + Duration::from_secs(args.wait_timeout_secs);
+    let poll_interval = Duration::from_millis(args.wait_poll_ms);
+    loop {
+        let h = match client.health().await {
+            Ok(h) => h,
+            Err(JsonRpcClientError::Transport(inner)) if is_connection_refused(inner.as_ref()) => {
+                // Admin closed — runtime finished `router.shutdown` and
+                // moved on. This is the success path: in-flight streams
+                // are necessarily zero (router awaited them all) and
+                // the runtime has now torn down admin as designed.
+                if args.json {
+                    // Synthesize a minimal terminal response so `--json`
+                    // consumers still get a well-formed object instead of
+                    // a half-written stream.
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "drain_complete": true,
+                            "in_flight_streams": 0,
+                            "admin_closed": true,
+                        })
+                    );
+                } else {
+                    println!("drain_complete=true in_flight_streams=0 admin_closed=true");
+                }
+                return Ok(());
+            }
+            Err(other) => {
+                return Err(classify_client_error(&url, args.timeout_ms, other));
+            }
+        };
+        if h.in_flight_streams == 0 {
+            if args.json {
+                let pretty =
+                    serde_json::to_string_pretty(&h).context("failed to encode health response")?;
+                println!("{pretty}");
+            } else {
+                println!("drain_complete=true in_flight_streams=0");
+            }
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            // Print the diagnostic to stderr so a `--json` consumer of
+            // stdout doesn't see a corrupted half-stream, and so plain
+            // operator output stays grep-friendly. Then return Err so
+            // the process exits non-zero — operator scripts can fail
+            // closed on stuck drains.
+            let n = h.in_flight_streams;
+            eprintln!(
+                "drain_timeout=true in_flight_streams={n} \
+                 wait_timeout_secs={}",
+                args.wait_timeout_secs
+            );
+            return Err(anyhow::anyhow!(
+                "drain --wait timed out after {}s; {n} stream(s) still in flight",
+                args.wait_timeout_secs
+            ));
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
 }
 
 /// `decdn node peers`: call `admin_v1_peersList` on the running node and

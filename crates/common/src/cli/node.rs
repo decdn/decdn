@@ -208,12 +208,23 @@ pub struct ReloadArgs {
 
 /// `decdn node drain` — trigger graceful shutdown of the running node via
 /// `admin_v1_drain` (issue #244, ADR 025). Fires the same runtime shutdown
-/// path as SIGTERM without needing the process PID. The response
-/// (`drain_initiated=true`) means "shutdown has been requested", not that
-/// it has completed — the admin server is one of the first surfaces to
-/// stop (metrics is signalled first, then admin, both before
-/// `router.shutdown`), so the connection will close before the node
-/// fully exits.
+/// path as SIGTERM without needing the process PID.
+///
+/// Without `--wait`, the command is fire-and-forget: it returns
+/// `drain_initiated=true` as soon as the trigger lands and the admin
+/// server begins its early-stop sequence (metrics, then admin, both
+/// before `router.shutdown`). The connection will close before the
+/// node fully exits — observe completion via process exit
+/// (systemd/K8s) or `decdn node health` until ECONNREFUSED.
+///
+/// Pass `--wait` (issue #604) to opt the runtime into keeping the
+/// admin server alive *through* `router.shutdown` and have the CLI
+/// poll `admin_v1_health.in_flight_streams` until it reaches 0 (or
+/// the wait budget expires). On a clean drain the command returns
+/// success once the count is zero; on overrun it prints
+/// `drain_timeout=true in_flight_streams=N` to stderr and exits
+/// non-zero so operator scripts can fail closed during a stuck
+/// rolling upgrade.
 #[derive(Args, Debug)]
 pub struct DrainArgs {
     /// Base URL of the node's admin HTTP surface. See `health --admin-url`
@@ -230,9 +241,33 @@ pub struct DrainArgs {
     #[arg(long)]
     pub json: bool,
 
-    /// Roundtrip timeout in milliseconds.
+    /// Roundtrip timeout in milliseconds for each individual RPC
+    /// (the initial `drain` call and each poll under `--wait`).
     #[arg(long, value_name = "MS", default_value_t = 5_000)]
     pub timeout_ms: u64,
+
+    /// Block until all in-flight client streams complete (or the wait
+    /// budget expires) before returning. Opt-in seam for #604: when set,
+    /// the server keeps admin alive through `router.shutdown` so the CLI
+    /// can poll `admin_v1_health.in_flight_streams` to observe
+    /// completion. Without it, the original SIGTERM-equivalent
+    /// ordering applies.
+    #[arg(long)]
+    pub wait: bool,
+
+    /// Wall-clock budget (seconds) for the `--wait` polling loop. On
+    /// overrun the CLI exits non-zero and prints `drain_timeout=true`.
+    /// Ignored without `--wait`. Default 30s covers the runtime's 15s
+    /// `SHUTDOWN_DEADLINE` plus typical settle time.
+    #[arg(long, value_name = "SECS", default_value_t = 30)]
+    pub wait_timeout_secs: u64,
+
+    /// Cadence (milliseconds) at which `--wait` polls
+    /// `admin_v1_health`. Lower values converge faster on short drains;
+    /// higher values reduce admin churn on long ones. Ignored without
+    /// `--wait`.
+    #[arg(long, value_name = "MS", default_value_t = 250)]
+    pub wait_poll_ms: u64,
 }
 
 /// `decdn node peers` — list the gossip peer table of a running node.

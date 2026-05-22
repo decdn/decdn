@@ -308,6 +308,20 @@ impl Metrics {
         self.decdn.dispatch_in_flight.dec();
     }
 
+    /// Current value of the `dispatch_in_flight` gauge as a `u64`. Read
+    /// by `admin_v1_health.in_flight_streams` (issue #604) so the
+    /// `decdn node drain --wait` client can observe in-flight client
+    /// streams reach 0 during a graceful drain. Negative gauge readings
+    /// (theoretically possible if `dispatch_permit_released` ever ran
+    /// without a paired acquire — the permit RAII pair forbids this,
+    /// but the gauge type is signed) clamp to 0 rather than wrapping
+    /// to a huge `u64`.
+    #[must_use]
+    pub fn dispatch_in_flight_value(&self) -> u64 {
+        let raw = self.decdn.dispatch_in_flight.get();
+        u64::try_from(raw).unwrap_or(0)
+    }
+
     /// Record a relay-only connection accepted while the per-source
     /// layer was enabled but no peer IP could be resolved at accept
     /// time.

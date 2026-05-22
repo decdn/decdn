@@ -20,10 +20,11 @@ use std::time::Instant;
 
 use decdn_cache::CacheEngine;
 use decdn_cli::commands::node as commands;
-use decdn_common::admin::AdminRpcClient;
+use decdn_common::admin::{AdminRpcClient, DrainRequest};
 use decdn_common::cli::{AnnounceArgs, DrainArgs, EvictArgs, HealthArgs, PeersArgs, ReloadArgs};
 use decdn_gossip::PeerTable;
 use decdn_node::admin::{self, AdminState, DrainTrigger};
+use decdn_node::metrics::Metrics;
 use decdn_protocol::{NodeAnnounce, NodeAnnounceBody};
 use jsonrpsee::core::ClientError;
 use jsonrpsee::core::client::ClientT;
@@ -96,6 +97,7 @@ async fn peers_list_empty_peer_table() -> anyhow::Result<()> {
         None,
         Arc::new(DrainTrigger::new()),
         throwaway_signer(),
+        Arc::new(Metrics::new()),
     );
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
@@ -134,6 +136,7 @@ async fn peers_list_seeded_entries_sorted_desc() -> anyhow::Result<()> {
         None,
         Arc::new(DrainTrigger::new()),
         throwaway_signer(),
+        Arc::new(Metrics::new()),
     );
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
@@ -178,6 +181,7 @@ async fn health_returns_hex_node_id_and_uptime() -> anyhow::Result<()> {
         None,
         Arc::new(DrainTrigger::new()),
         throwaway_signer(),
+        Arc::new(Metrics::new()),
     );
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
@@ -214,6 +218,7 @@ async fn unknown_method_returns_method_not_found() -> anyhow::Result<()> {
         None,
         Arc::new(DrainTrigger::new()),
         throwaway_signer(),
+        Arc::new(Metrics::new()),
     );
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
@@ -498,12 +503,19 @@ async fn admin_v1_drain_returns_initiated_true() -> anyhow::Result<()> {
         None,
         Arc::clone(&drain_trigger),
         throwaway_signer(),
+        Arc::new(Metrics::new()),
     );
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
     let client = HttpClientBuilder::default().build(&url)?;
-    let resp = client.drain().await?;
+    let resp = client.drain(DrainRequest::default()).await?;
     assert!(resp.initiated, "expected initiated=true");
+    // Default request leaves wait_admin false → SIGTERM-equivalent
+    // ordering preserved.
+    assert!(
+        !drain_trigger.wait_admin(),
+        "default DrainRequest must not flip wait_admin on"
+    );
 
     // The RPC handler should have fired the trigger.
     let waited =
@@ -527,6 +539,9 @@ async fn cli_drain_surfaces_connection_refused() -> anyhow::Result<()> {
         config: None,
         json: false,
         timeout_ms: 2_000,
+        wait: false,
+        wait_timeout_secs: 30,
+        wait_poll_ms: 250,
     };
     let err = commands::drain(&args, None)
         .await
@@ -547,6 +562,9 @@ async fn cli_drain_rejects_zero_timeout() -> anyhow::Result<()> {
         config: None,
         json: false,
         timeout_ms: 0,
+        wait: false,
+        wait_timeout_secs: 30,
+        wait_poll_ms: 250,
     };
     let err = commands::drain(&args, None)
         .await
@@ -557,6 +575,120 @@ async fn cli_drain_rejects_zero_timeout() -> anyhow::Result<()> {
         err.contains("--timeout-ms"),
         "error should mention the flag, got: {err}"
     );
+    Ok(())
+}
+
+/// `decdn node drain --wait` succeeds when `in_flight_streams` is
+/// already 0 — the server's gauge starts at 0 and the polling loop
+/// returns on the first `health()` tick.
+#[tokio::test]
+async fn cli_drain_wait_returns_immediately_when_idle() -> anyhow::Result<()> {
+    let peer_table = Arc::new(RwLock::new(PeerTable::new(0, 0)));
+    let (cache, _tmp) = test_cache().await?;
+    let drain_trigger = Arc::new(DrainTrigger::new());
+    let state = AdminState::new(
+        peer_table,
+        [0u8; 32],
+        Instant::now(),
+        cache,
+        None,
+        None,
+        Arc::clone(&drain_trigger),
+        throwaway_signer(),
+        Arc::new(Metrics::new()),
+    );
+    let (url, stop_tx, join) = spawn_admin(state).await?;
+
+    let args = DrainArgs {
+        admin_url: Some(url.clone()),
+        config: None,
+        json: false,
+        timeout_ms: 5_000,
+        wait: true,
+        wait_timeout_secs: 10,
+        wait_poll_ms: 50,
+    };
+    commands::drain(&args, None).await?;
+
+    // Server-side: drain RPC fired with wait_admin=true.
+    assert!(
+        drain_trigger.wait_admin(),
+        "wait flag should be set on the server's trigger"
+    );
+
+    let _ = stop_tx.send(());
+    join.await?;
+    Ok(())
+}
+
+/// `decdn node drain --wait` exits non-zero with a `drain_timeout=true`
+/// diagnostic on stderr when the in-flight count stays above zero past
+/// the wait budget. Simulates the stuck-stream case by holding a
+/// dispatch permit for the duration of the test.
+#[tokio::test]
+async fn cli_drain_wait_times_out_on_stuck_stream() -> anyhow::Result<()> {
+    use decdn_common::config::ResolvedSecurity;
+
+    let peer_table = Arc::new(RwLock::new(PeerTable::new(0, 0)));
+    let (cache, _tmp) = test_cache().await?;
+    let drain_trigger = Arc::new(DrainTrigger::new());
+    let metrics = Arc::new(Metrics::new());
+    let state = AdminState::new(
+        peer_table,
+        [0u8; 32],
+        Instant::now(),
+        cache,
+        None,
+        None,
+        Arc::clone(&drain_trigger),
+        throwaway_signer(),
+        Arc::clone(&metrics),
+    );
+    let (url, stop_tx, join) = spawn_admin(state).await?;
+
+    // Hold one permit for the lifetime of the test — the limiter shares
+    // the same metrics handle, so `dispatch_in_flight` reads 1 from the
+    // CLI's `health()` polls.
+    let limiter = decdn_node::dispatch::ConnectionLimiter::new(
+        &ResolvedSecurity {
+            max_concurrent_handlers: u32::MAX,
+            per_source_rate_per_sec: 1e9,
+            per_source_burst: u32::MAX,
+            max_tracked_sources: 16,
+        },
+        Arc::clone(&metrics),
+    );
+    let _held = limiter
+        .acquire_for_test(Some(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST)))
+        .ok()
+        .ok_or_else(|| anyhow::anyhow!("permit acquire"))?;
+
+    let args = DrainArgs {
+        admin_url: Some(url.clone()),
+        config: None,
+        json: false,
+        timeout_ms: 5_000,
+        wait: true,
+        // Sub-second wait budget so the test completes promptly.
+        wait_timeout_secs: 1,
+        wait_poll_ms: 50,
+    };
+    let err = commands::drain(&args, None)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("expected timeout error"))?
+        .to_string();
+    assert!(
+        err.contains("timed out"),
+        "error should mention timeout, got: {err}"
+    );
+    assert!(
+        err.contains("1 stream(s) still in flight") || err.contains("1 stream(s)"),
+        "error should mention 1 in-flight, got: {err}"
+    );
+
+    let _ = stop_tx.send(());
+    join.await?;
     Ok(())
 }
 
@@ -573,6 +705,7 @@ async fn admin_shutdown_closes_listener() -> anyhow::Result<()> {
         None,
         Arc::new(DrainTrigger::new()),
         throwaway_signer(),
+        Arc::new(Metrics::new()),
     );
     let (url, stop_tx, join) = spawn_admin(state).await?;
 

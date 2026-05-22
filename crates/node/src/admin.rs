@@ -16,16 +16,20 @@ use std::time::Instant;
 use alloy::signers::local::PrivateKeySigner;
 use decdn_cache::{CacheEngine, CacheError};
 use decdn_common::admin::{
-    AdminRpcServer, AnnounceResponse, CACHE_ERROR_CODE, CONFIG_PATH_UNSET_CODE, DrainResponse,
-    EvictPreview, EvictRequest, EvictResponse, HealthResponse, PUBLISHER_DISABLED_CODE, PeerView,
-    PeersResponse, RELOAD_ERROR_CODE, ReloadResponse, parse_hash_arg,
+    AdminRpcServer, AnnounceResponse, CACHE_ERROR_CODE, CONFIG_PATH_UNSET_CODE, DrainRequest,
+    DrainResponse, EvictPreview, EvictRequest, EvictResponse, HealthResponse,
+    PUBLISHER_DISABLED_CODE, PeerView, PeersResponse, RELOAD_ERROR_CODE, ReloadResponse,
+    parse_hash_arg,
 };
 use decdn_gossip::{AnnounceTrigger, PeerEntry, PeerTable};
 use jsonrpsee::core::{RpcResult, async_trait};
 use jsonrpsee::server::{Server, ServerConfig};
 use jsonrpsee::types::ErrorObjectOwned;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, RwLock, oneshot};
+
+use crate::metrics::Metrics;
 
 // Wire types live in `decdn_common::admin`. We import the server-side
 // trait, the request DTO, and the few error codes the server impl
@@ -88,6 +92,13 @@ pub struct AdminState {
     /// the secret scalar.
     #[allow(dead_code)] // Wired in #406; consumed by #319 / #327.
     signer: Arc<PrivateKeySigner>,
+    /// Live process metrics handle, used by `admin_v1_health` to read
+    /// the current `dispatch_in_flight` gauge for the
+    /// `in_flight_streams` field (issue #604). The `Arc<Metrics>` is
+    /// the same handle the dispatch limiter increments/decrements via
+    /// its permit RAII pair, so the value is always consistent with
+    /// the live in-flight handler count.
+    metrics: Arc<Metrics>,
 }
 
 /// One-shot trigger that lets `admin_v1_drain` wake the runtime's main
@@ -96,9 +107,18 @@ pub struct AdminState {
 /// blocking on the runtime's shutdown latency. The runtime side awaits
 /// `wait()` in its select loop; firing twice is a no-op (the second
 /// `notify_one` coalesces, same as `Notify`).
+///
+/// The `wait_admin` flag is a side-channel set by the drain RPC handler
+/// *before* it calls [`fire`](Self::fire) when the request carries
+/// `wait_admin: true` (issue #604). The runtime reads it after
+/// [`wait`](Self::wait) resolves to decide whether to delay the admin
+/// server's stop signal until after `router.shutdown` returns — the
+/// "keep admin alive so `decdn node drain --wait` can poll" seam.
+/// Default `false` preserves the original SIGTERM-equivalent order.
 #[derive(Debug, Default)]
 pub struct DrainTrigger {
     notify: Notify,
+    wait_admin: AtomicBool,
 }
 
 impl DrainTrigger {
@@ -112,6 +132,22 @@ impl DrainTrigger {
     /// coalesces into the pending permit the first call stored).
     pub fn fire(&self) {
         self.notify.notify_one();
+    }
+
+    /// Set the `wait_admin` flag the runtime will read after `wait`
+    /// resolves. Must be called *before* [`fire`](Self::fire) so the
+    /// flag is observable by the runtime's reader; the drain RPC
+    /// handler establishes that ordering. `Ordering::Release` here
+    /// pairs with the runtime's `Ordering::Acquire` load.
+    pub fn set_wait_admin(&self, value: bool) {
+        self.wait_admin.store(value, Ordering::Release);
+    }
+
+    /// Read the current `wait_admin` flag. Called by the runtime after
+    /// [`wait`](Self::wait) resolves to decide the shutdown order.
+    #[must_use]
+    pub fn wait_admin(&self) -> bool {
+        self.wait_admin.load(Ordering::Acquire)
     }
 
     /// Wait until [`fire`](Self::fire) is called. Returns immediately if
@@ -133,9 +169,8 @@ pub struct ReloadHook {
 }
 
 impl AdminState {
-    // Now at 8 params after the #406 signer addition. A builder would be
-    // tidier but is out of scope for #406 — defer until a third call site
-    // appears.
+    // Now at 9 params after the #604 metrics addition. A builder would be
+    // tidier but is out of scope here — defer until the next addition.
     #[allow(clippy::too_many_arguments)]
     pub const fn new(
         peer_table: Arc<RwLock<PeerTable>>,
@@ -146,6 +181,7 @@ impl AdminState {
         reload_hook: Option<ReloadHook>,
         drain_trigger: Arc<DrainTrigger>,
         signer: Arc<PrivateKeySigner>,
+        metrics: Arc<Metrics>,
     ) -> Self {
         Self {
             peer_table,
@@ -156,6 +192,7 @@ impl AdminState {
             reload_hook,
             drain_trigger,
             signer,
+            metrics,
         }
     }
 }
@@ -222,6 +259,7 @@ impl AdminRpcServer for AdminRpcImpl {
         Ok(HealthResponse {
             node_id: alloy::primitives::hex::encode(self.state.node_id),
             uptime_s: self.state.started_at.elapsed().as_secs(),
+            in_flight_streams: self.state.metrics.dispatch_in_flight_value(),
         })
     }
 
@@ -327,7 +365,13 @@ impl AdminRpcServer for AdminRpcImpl {
         })
     }
 
-    async fn drain(&self) -> RpcResult<DrainResponse> {
+    async fn drain(&self, req: DrainRequest) -> RpcResult<DrainResponse> {
+        // Establish `wait_admin` *before* firing the trigger so the
+        // runtime's reader (which loads it after `wait()` resolves) can
+        // see the request's value with no acquire-side race. The
+        // `Release` store inside `set_wait_admin` is paired with the
+        // runtime's `Acquire` load — see `DrainTrigger`.
+        self.state.drain_trigger.set_wait_admin(req.wait_admin);
         // `initiated: true` reflects "the trigger was fired", not "the
         // runtime is now in the AdminDrain branch". If shutdown is
         // already underway (a SIGTERM/SIGINT raced this RPC) the runtime
@@ -494,6 +538,7 @@ mod tests {
             None,
             Arc::new(DrainTrigger::new()),
             throwaway_signer(),
+            Arc::new(crate::metrics::Metrics::new()),
         );
         (state, tmp)
     }
@@ -530,6 +575,7 @@ mod tests {
             None,
             Arc::new(DrainTrigger::new()),
             throwaway_signer(),
+            Arc::new(crate::metrics::Metrics::new()),
         );
         let rpc = AdminRpcImpl::new(state);
 
@@ -557,6 +603,7 @@ mod tests {
             None,
             Arc::new(DrainTrigger::new()),
             throwaway_signer(),
+            Arc::new(crate::metrics::Metrics::new()),
         );
         let rpc = AdminRpcImpl::new(state);
 
@@ -657,6 +704,7 @@ mod tests {
             None,
             Arc::new(DrainTrigger::new()),
             throwaway_signer(),
+            Arc::new(crate::metrics::Metrics::new()),
         );
         let rpc = AdminRpcImpl::new(state);
 
@@ -709,6 +757,7 @@ mod tests {
             None,
             Arc::new(DrainTrigger::new()),
             throwaway_signer(),
+            Arc::new(crate::metrics::Metrics::new()),
         );
         let rpc = AdminRpcImpl::new(state);
         let hash = Hash::new(b"prefix-test");
@@ -791,6 +840,7 @@ mod tests {
             None,
             Arc::new(DrainTrigger::new()),
             throwaway_signer(),
+            Arc::new(crate::metrics::Metrics::new()),
         );
         let rpc = AdminRpcImpl::new(state);
 
@@ -907,6 +957,7 @@ mod tests {
             None,
             Arc::new(DrainTrigger::new()),
             throwaway_signer(),
+            Arc::new(crate::metrics::Metrics::new()),
         );
         let rpc = AdminRpcImpl::new(state);
 
@@ -968,6 +1019,7 @@ mod tests {
             None,
             Arc::new(DrainTrigger::new()),
             throwaway_signer(),
+            Arc::new(crate::metrics::Metrics::new()),
         );
         let rpc = AdminRpcImpl::new(state);
 
@@ -1036,6 +1088,7 @@ mod tests {
             Some(hook),
             Arc::new(DrainTrigger::new()),
             throwaway_signer(),
+            Arc::new(crate::metrics::Metrics::new()),
         );
         let rpc = AdminRpcImpl::new(state);
 
@@ -1100,11 +1153,18 @@ mod tests {
             None,
             Arc::clone(&trigger),
             throwaway_signer(),
+            Arc::new(crate::metrics::Metrics::new()),
         );
         let rpc = AdminRpcImpl::new(state);
 
-        let resp = rpc.drain().await.expect("drain ok");
+        let resp = rpc.drain(DrainRequest::default()).await.expect("drain ok");
         assert!(resp.initiated, "expected initiated=true");
+        // Default DrainRequest leaves `wait_admin` at false, matching
+        // SIGTERM-equivalent ordering.
+        assert!(
+            !trigger.wait_admin(),
+            "default DrainRequest must not enable wait_admin"
+        );
 
         // Verify the trigger actually fired: `wait()` should resolve
         // immediately because the Notify stored a permit.
@@ -1113,6 +1173,114 @@ mod tests {
         assert!(
             waited.is_ok(),
             "drain RPC did not fire the underlying DrainTrigger"
+        );
+    }
+
+    /// `admin_v1_drain` with `wait_admin: true` (issue #604) sets the
+    /// trigger's `wait_admin` flag *before* firing it, so the runtime's
+    /// `wait_admin()` reader (which loads after `wait()` resolves) sees
+    /// the request's value with no acquire-side race. Without the
+    /// ordering, a runtime that polled the flag mid-shutdown could see
+    /// the default `false` and tear admin down early — defeating the
+    /// whole point of `decdn node drain --wait`.
+    #[tokio::test]
+    async fn admin_drain_with_wait_admin_sets_flag_before_fire() {
+        let trigger = Arc::new(DrainTrigger::new());
+        let (cache, _tmp) = test_cache().await;
+        let state = AdminState::new(
+            Arc::new(RwLock::new(PeerTable::new(0, 0))),
+            [0u8; 32],
+            Instant::now(),
+            cache,
+            None,
+            None,
+            Arc::clone(&trigger),
+            throwaway_signer(),
+            Arc::new(crate::metrics::Metrics::new()),
+        );
+        let rpc = AdminRpcImpl::new(state);
+
+        // Pre-condition: trigger starts with wait_admin=false.
+        assert!(
+            !trigger.wait_admin(),
+            "trigger must start with wait_admin=false"
+        );
+
+        let resp = rpc
+            .drain(DrainRequest { wait_admin: true })
+            .await
+            .expect("drain ok");
+        assert!(resp.initiated, "expected initiated=true");
+        assert!(
+            trigger.wait_admin(),
+            "wait_admin=true request must set the trigger flag"
+        );
+
+        // The fire must still happen — runtime needs to wake up either way.
+        let waited =
+            tokio::time::timeout(std::time::Duration::from_millis(100), trigger.wait()).await;
+        assert!(
+            waited.is_ok(),
+            "drain RPC with wait_admin=true must still fire the trigger"
+        );
+    }
+
+    /// `admin_v1_health.in_flight_streams` reflects the live
+    /// `dispatch_in_flight` gauge value (issue #604). Without this
+    /// wiring, `decdn node drain --wait` would loop forever — the
+    /// polling client sees a constant 0 regardless of the actual
+    /// in-flight handler count.
+    #[tokio::test]
+    async fn health_reports_in_flight_streams_from_dispatch_gauge() {
+        use decdn_common::config::ResolvedSecurity;
+
+        let trigger = Arc::new(DrainTrigger::new());
+        let (cache, _tmp) = test_cache().await;
+        let metrics = Arc::new(crate::metrics::Metrics::new());
+        let state = AdminState::new(
+            Arc::new(RwLock::new(PeerTable::new(0, 0))),
+            [0u8; 32],
+            Instant::now(),
+            cache,
+            None,
+            None,
+            Arc::clone(&trigger),
+            throwaway_signer(),
+            Arc::clone(&metrics),
+        );
+        let rpc = AdminRpcImpl::new(state);
+
+        // Baseline: no permits held, gauge reads 0.
+        let h = rpc.health().await.expect("health ok");
+        assert_eq!(h.in_flight_streams, 0, "baseline must be 0");
+
+        // Acquire a permit via the limiter; the gauge increments.
+        // Use a permissive resolved-security so neither layer rejects.
+        let limiter = crate::dispatch::ConnectionLimiter::new(
+            &ResolvedSecurity {
+                max_concurrent_handlers: u32::MAX,
+                per_source_rate_per_sec: 1e9,
+                per_source_burst: u32::MAX,
+                max_tracked_sources: 16,
+            },
+            Arc::clone(&metrics),
+        );
+        let permit = limiter
+            .acquire_for_test(Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)))
+            .expect("acquire permit");
+
+        let h = rpc.health().await.expect("health ok");
+        assert_eq!(
+            h.in_flight_streams, 1,
+            "expected gauge=1 while one permit is held"
+        );
+
+        // Dropping the permit decrements the gauge.
+        drop(permit);
+        let h = rpc.health().await.expect("health ok");
+        assert_eq!(
+            h.in_flight_streams, 0,
+            "expected gauge=0 after dropping the permit"
         );
     }
 
@@ -1152,6 +1320,7 @@ mod tests {
             Some(hook),
             Arc::new(DrainTrigger::new()),
             throwaway_signer(),
+            Arc::new(crate::metrics::Metrics::new()),
         );
         let rpc = AdminRpcImpl::new(state);
 
