@@ -27,7 +27,7 @@ use decdn_gossip::{GossipMetrics, GossipRuntimeConfig, GossipService, PeerTable,
 use crate::admin;
 use crate::channel_store::PersistentChannelStateStore;
 use crate::dht::{
-    ConfigStakerSet, DhtRateLimiter, RecordStore, RecordStoreConfig, StakerSet,
+    ChainStakerSet, DhtRateLimiter, RecordStore, RecordStoreConfig, StakerSet,
     rate_limit::DhtRateLimitConfig,
 };
 use crate::dispatch::ConnectionLimiter;
@@ -35,6 +35,8 @@ use crate::handlers::dht::DhtHandler;
 use crate::handlers::limited::LimitedHandler;
 use crate::handlers::probe::ProbeHandler;
 use crate::metrics;
+use alloy::primitives::Address;
+use alloy::providers::ProviderBuilder;
 use alloy::signers::local::PrivateKeySigner;
 use decdn_common::config::ResolvedConfig;
 use decdn_common::identity;
@@ -429,19 +431,47 @@ pub async fn run(
     let record_store = Arc::new(std::sync::Mutex::new(RecordStore::new(
         RecordStoreConfig::default(),
     )));
-    // Active-staker set. Wired as an empty `ConfigStakerSet` until the
-    // chain-backed `ChainStakerSet` (reads `StakingRegistry.getActiveNodes()`
-    // and subscribes to `Staked`/`Unstaked`) lands with PR 4 of #320 — at
-    // which point the runtime swaps the construction here without
-    // touching the handler, which holds the trait object. Until then
-    // every inbound `cdn/dht/v1` `Store` is rejected with
-    // `accepted: false` per ADR 022 line 140; the cache → DHT republish
-    // hook exposed in this PR has no producer yet (PR 4 brings the
-    // scheduler), so no publisher-side traffic is gated either.
-    let staker_set: Arc<dyn StakerSet> = Arc::new(ConfigStakerSet::empty());
-    tracing::warn!(
-        "dht active-staker set is empty; every cdn/dht/v1 `Store` will be \
-         rejected (ADR 022 line 140). Chain-backed StakerSet lands with PR 4 of #320."
+    // Chain-backed active-staker set. Reads
+    // `StakingRegistry.getActiveNodes()` once at startup and spawns a
+    // background watcher that follows the six membership-mutating
+    // events (`NodeRegistered`, `NodeDeregistered`, `NodeAutoEjected`,
+    // `Reinstated`, `EjectedByBlacklist`, `UnbondingRequested`) per
+    // ADR 022 §STORE Flow line 140 + ADR 019 § Step 3.3.
+    //
+    // The alloy `Provider` is built fresh here and not reused with the
+    // existing RPC connectivity watchdog (which uses a raw
+    // `reqwest::Client`). Folding the watchdog onto the same provider
+    // is a viable cleanup but orthogonal to the chain-backed staker
+    // work; deferred.
+    //
+    // Bootstrap failure is fatal: the DHT cannot function without a
+    // populated staker set (every `Store` would be silently rejected,
+    // and once iterative `FindValue` lands the lookup filter would
+    // drop every responder).
+    let rpc_url: alloy::transports::http::reqwest::Url =
+        cfg.blockchain.rpc_url.parse().with_context(|| {
+            format!(
+                "blockchain.rpc_url {:?} is not a valid URL",
+                cfg.blockchain.rpc_url
+            )
+        })?;
+    let staking_registry_addr: Address = cfg
+        .blockchain
+        .staking_registry_address
+        .parse()
+        .with_context(|| {
+            format!(
+                "blockchain.staking_registry_address {:?} is not a valid address",
+                cfg.blockchain.staking_registry_address
+            )
+        })?;
+    let chain_provider = ProviderBuilder::new().connect_http(rpc_url);
+    let staker_set: Arc<dyn StakerSet> = Arc::new(
+        ChainStakerSet::bootstrap(chain_provider, staking_registry_addr)
+            .await
+            .with_context(|| {
+                format!("ChainStakerSet bootstrap from StakingRegistry at {staking_registry_addr}")
+            })?,
     );
     let dht_handler = Arc::new(DhtHandler::new(
         secret_key.public(),
@@ -534,14 +564,28 @@ pub async fn run(
     // start records (blobs already in cache at startup) get a
     // uniform(0, 40min) first-publish window — ADR 022 §Bootstrap.
     //
-    // The "iter every cached hash at startup" cold-start path is
-    // deferred: `CacheEngine` does not yet expose a hash-iteration
-    // accessor, and the use case (a node restarting with thousands of
-    // cached blobs) is uncommon for the initial network. Subsequent
-    // commits via `subscribe_inserts` cover the steady-state path.
+    // The cold-start path seeds the scheduler from
+    // `CacheEngine::access_times_snapshot()` *before* the
+    // `run_republish` task spawns, so any blob already on disk gets a
+    // jittered first-publish entry without waiting for
+    // `subscribe_inserts` (which only fires on fresh pull-through
+    // commits, not on cache reuse across restarts). The subscribe
+    // channel handle is taken **before** the cold-start seed so a
+    // commit that races with seed-time still lands in the channel
+    // backlog and is picked up by the spawned task.
     let republish_scheduler = Arc::new(crate::dht::RepublishScheduler::new());
     let (republish_stop_tx, republish_stop_rx) = oneshot::channel::<()>();
     let cache_inserts_rx = cache.subscribe_inserts();
+    let cold_start_count = republish_scheduler.seed_cold_start(
+        cache
+            .access_times_snapshot()
+            .into_keys()
+            .map(|h| *h.as_bytes()),
+    );
+    tracing::info!(
+        cold_start_count,
+        "republish scheduler seeded from existing cache (ADR 022 §Bootstrap cold-start)"
+    );
     tasks.spawn(crate::dht::publish::run_republish(
         ep.clone(),
         secret_key.public(),

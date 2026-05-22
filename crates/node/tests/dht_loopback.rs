@@ -59,8 +59,21 @@ fn permissive_limiter(metrics: &Arc<Metrics>) -> Arc<ConnectionLimiter> {
 /// an infinite or empty list would lie either way. Tests that *do*
 /// need a concrete active set use the production `ConfigStakerSet`
 /// with an explicit `HashSet`.
+///
+/// Holds a `broadcast::Sender<StakerChange>` solely to satisfy
+/// [`StakerSet::subscribe_changes`]; never sends. Equivalent to
+/// `ConfigStakerSet`'s no-op subscribe semantics.
 #[derive(Debug)]
-struct AllStaked;
+struct AllStaked {
+    changes_tx: tokio::sync::broadcast::Sender<decdn_node::dht::StakerChange>,
+}
+
+impl AllStaked {
+    fn new() -> Self {
+        let (changes_tx, _) = tokio::sync::broadcast::channel(1);
+        Self { changes_tx }
+    }
+}
 
 impl StakerSet for AllStaked {
     fn is_active(&self, _: &[u8; 32]) -> bool {
@@ -79,6 +92,9 @@ impl StakerSet for AllStaked {
     /// set contents) MUST agree per the [`StakerSet`] trait contract.
     fn len(&self) -> usize {
         0
+    }
+    fn subscribe_changes(&self) -> tokio::sync::broadcast::Receiver<decdn_node::dht::StakerChange> {
+        self.changes_tx.subscribe()
     }
 }
 
@@ -154,7 +170,7 @@ async fn find_node_returns_closer_peers_from_routing_table() -> anyhow::Result<(
         rate_limiter,
         limiter,
         Arc::clone(&metrics),
-        Arc::new(AllStaked),
+        Arc::new(AllStaked::new()),
         empty_record_store(),
     ));
 
@@ -274,7 +290,7 @@ async fn find_value_with_empty_store_returns_no_providers_but_closer_nodes() -> 
         rate_limiter,
         limiter,
         Arc::clone(&metrics),
-        Arc::new(AllStaked),
+        Arc::new(AllStaked::new()),
         empty_record_store(),
     ));
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_DHT.to_vec()]).await?;
@@ -356,7 +372,7 @@ async fn find_node_does_not_insert_attacker_supplied_requester() -> anyhow::Resu
         rate_limiter,
         limiter,
         Arc::clone(&metrics),
-        Arc::new(AllStaked),
+        Arc::new(AllStaked::new()),
         empty_record_store(),
     ));
 
@@ -467,7 +483,7 @@ mod adr_013_error_codes {
             rate_limiter,
             limiter,
             metrics,
-            Arc::new(AllStaked),
+            Arc::new(AllStaked::new()),
             empty_record_store(),
         ));
         let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_DHT.to_vec()]).await?;
@@ -629,7 +645,7 @@ mod adr_013_error_codes {
             rate_limiter,
             limiter,
             metrics,
-            Arc::new(AllStaked),
+            Arc::new(AllStaked::new()),
             empty_record_store(),
         ));
         let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_DHT.to_vec()]).await?;

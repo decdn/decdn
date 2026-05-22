@@ -15,6 +15,7 @@
 
 pub mod bootstrap;
 pub mod bucket_refresh;
+pub mod chain_staker_set;
 pub mod client;
 pub mod origin;
 pub mod publish;
@@ -24,9 +25,10 @@ pub mod routing;
 pub mod staker_set;
 
 pub use bootstrap::{BootstrapOutcome, bootstrap};
+pub use chain_staker_set::ChainStakerSet;
 pub use origin::{ConfigOriginDirectory, OriginDirectory};
 pub use publish::RepublishScheduler;
 pub use rate_limit::{DhtRateLimiter, DhtRejectLayer};
 pub use records::{InsertOutcome, RecordStore, RecordStoreConfig};
 pub use routing::{NODE_ID_LEN, NodeId, RoutingTable, xor_distance};
-pub use staker_set::{ConfigStakerSet, StakerSet};
+pub use staker_set::{ConfigStakerSet, StakerChange, StakerSet};

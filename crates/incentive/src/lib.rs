@@ -16,6 +16,7 @@ pub mod client_reputation;
 pub mod eth_identity;
 pub mod probe_sig;
 pub mod rate;
+pub mod staking_registry;
 pub mod store;
 pub mod voucher;
 

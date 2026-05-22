@@ -162,6 +162,28 @@ impl RepublishScheduler {
         self.schedule_with_offset(hash, offset);
     }
 
+    /// Batch-schedule every hash in `iter` with an independent
+    /// cold-start jitter draw (uniform(0, 40 min) per hash, NOT a
+    /// shared timestamp). Consumed by the runtime at startup over
+    /// [`decdn_cache::CacheEngine::access_times_snapshot`] so any
+    /// blob already on disk gets a republish entry without waiting
+    /// for `subscribe_inserts` (which only fires on fresh
+    /// pull-through commits, not on cache reuse across restarts).
+    /// Returns the number of hashes scheduled — useful for the
+    /// startup log line so operators can see how big the cold-start
+    /// queue is.
+    pub fn seed_cold_start<I>(&self, iter: I) -> usize
+    where
+        I: IntoIterator<Item = [u8; 32]>,
+    {
+        let mut count = 0usize;
+        for hash in iter {
+            self.schedule_cold_start(hash);
+            count = count.saturating_add(1);
+        }
+        count
+    }
+
     fn schedule_with_offset(&self, hash: [u8; 32], offset_us: u64) {
         let due_us = now_us().saturating_add(offset_us);
         // Add to the scheduled set first; if the hash was already
@@ -470,6 +492,35 @@ mod tests {
             let j = jitter_us(Duration::ZERO, COLD_START_MAX);
             assert!(j <= u64::try_from(COLD_START_MAX.as_micros()).unwrap());
         }
+    }
+
+    #[test]
+    fn seed_cold_start_schedules_every_hash_with_cold_start_jitter() {
+        // Seeding N hashes via `seed_cold_start` produces N scheduled
+        // entries, each due within the cold-start window. Returns N.
+        let s = RepublishScheduler::new();
+        let hashes: Vec<[u8; 32]> = (1u8..=5).map(h).collect();
+        let n = s.seed_cold_start(hashes.iter().copied());
+        assert_eq!(n, 5);
+        assert_eq!(s.len(), 5);
+        // None of them should be due in the next moment (jitter > 0 case);
+        // and all should be due before now + COLD_START_MAX (plus a small
+        // slack for clock drift between scheduling and the bound check).
+        let max_due = now_us()
+            .saturating_add(u64::try_from(COLD_START_MAX.as_micros()).unwrap())
+            .saturating_add(1_000); // 1 ms slack
+        let heap = s.heap.lock().unwrap();
+        for Reverse(Entry { due_us, .. }) in heap.iter() {
+            assert!(*due_us <= max_due, "due_us {due_us} > max {max_due}");
+        }
+    }
+
+    #[test]
+    fn seed_cold_start_empty_input_is_noop() {
+        let s = RepublishScheduler::new();
+        let n = s.seed_cold_start(std::iter::empty::<[u8; 32]>());
+        assert_eq!(n, 0);
+        assert!(s.is_empty());
     }
 
     #[test]
