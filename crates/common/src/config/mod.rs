@@ -1593,15 +1593,15 @@ pub fn resolve_security_into(
         .and_then(|s| s.max_tracked_sources)
         .unwrap_or(DEFAULT_MAX_TRACKED_SOURCES);
 
+    // `eprintln!` not `tracing::{info,warn}!`: tracing is not initialized
+    // at `resolve_config` time (see `commands::run` and the rationale on
+    // `validate_port_layout_into`).
     if max_concurrent_handlers == 0 {
-        tracing::info!("security.max_concurrent_handlers = 0: global concurrency cap disabled");
+        eprintln!("info: security.max_concurrent_handlers = 0: global concurrency cap disabled");
     }
     if per_source_rate_per_sec == 0.0 {
-        tracing::info!("security.per_source_rate_per_sec = 0: per-source rate-limit disabled");
+        eprintln!("info: security.per_source_rate_per_sec = 0: per-source rate-limit disabled");
     }
-    // `eprintln!` not `tracing::warn!`: tracing is not initialized at
-    // `resolve_config` time (see `commands::run` and the rationale on
-    // `validate_port_layout_into`).
     if max_tracked_sources == 0 {
         eprintln!(
             "warning: security.max_tracked_sources = 0: rate-limit bookkeeping map is unbounded; \

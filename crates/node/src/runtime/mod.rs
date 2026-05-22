@@ -235,7 +235,9 @@ async fn run_record_store_gc(
 /// failing to drop on a quiet node (the lazy-prune path in `check` also
 /// writes these gauges, but on a quiet node `check` is not called, so
 /// the periodic sweep is the only writer — and it stops writing if it
-/// dies).
+/// dies). The signal needs a non-zero starting value: a map that was
+/// already empty when the sweep died will sit at `0` legitimately,
+/// indistinguishable from a healthy GC task on an empty map.
 // Same linear shape as `run_dispatch_gc` and `run_record_store_gc`
 // above (tick → maybe-prune-per-layer → log → loop), with two
 // `if let Some(...)` branches instead of one because there are two
