@@ -1248,6 +1248,56 @@ impl CacheEngine {
         guard.clone()
     }
 
+    /// Walk every committed blob in the local iroh-blobs store and return its
+    /// hash, excluding operator-evicted blobs ([ADR 011](../../../adr/011-content-takedown.md))
+    /// and partial-import bytes (`BlobStatus != Complete`). Consumed by the
+    /// DHT republish scheduler at startup (ADR 022 §Bootstrap AC 16): every
+    /// cached blob's first re-publish time is drawn from `uniform(0, 40 min)`
+    /// per record, so the bootstrap `Store` rate matches steady-state by
+    /// construction. The complementary [`Self::subscribe_inserts`] stream
+    /// handles fresh pull-through commits during steady state; the two
+    /// together cover every blob the node holds.
+    ///
+    /// Unlike [`Self::access_times_snapshot`], this accessor reflects on-disk
+    /// state and is non-empty on cold start. `access_times` maps `Hash →
+    /// Instant` and is initialised empty on every [`Self::open`] — only
+    /// hashes touched since process start appear there — so it is the wrong
+    /// input for the cold-start seed.
+    ///
+    /// Returns a [`Vec`] rather than an async stream because the consumer
+    /// drains the input strictly into a hash set, so streaming saves nothing
+    /// downstream. The transient is small: at C = 100k blobs the allocation
+    /// is roughly 100k × 32 bytes = 3.2 MiB.
+    ///
+    /// Race semantics: a blob evicted between the iroh-blobs `list()`
+    /// emission and the per-hash [`Self::is_evicted`] filter would be
+    /// included, but downstream publish paths re-check the evicted set, so a
+    /// stale entry in the scheduler's heap fails the membership check at
+    /// publish time rather than re-advertising a takedown.
+    pub async fn iter_hashes(&self) -> CacheResult<Vec<Hash>> {
+        let blobs = self.inner.store.blobs();
+        let mut stream = blobs
+            .list()
+            .stream()
+            .await
+            .map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
+        let mut out = Vec::new();
+        while let Some(hash) = stream.next().await {
+            let hash = hash.map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
+            if self.is_evicted(hash) {
+                continue;
+            }
+            let status = blobs
+                .status(hash)
+                .await
+                .map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
+            if matches!(status, iroh_blobs::api::blobs::BlobStatus::Complete { .. }) {
+                out.push(hash);
+            }
+        }
+        Ok(out)
+    }
+
     /// Return a snapshot of access times **excluding pinned hashes**.
     /// This is the canonical input to LRU eviction (#276): a pinned hash
     /// never appears here, so any candidate-picking sort or top-K query
@@ -2123,6 +2173,118 @@ mod tests {
         anyhow::ensure!(
             engine.last_accessed(unknown).is_none(),
             "expected None for a hash that was never accessed"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn iter_hashes_returns_empty_on_empty_store() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let engine = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
+        let hashes = engine.iter_hashes().await?;
+        anyhow::ensure!(
+            hashes.is_empty(),
+            "expected empty iter_hashes on a fresh store, got {hashes:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn iter_hashes_returns_all_committed_blobs() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payloads: &[&[u8]] = &[b"iter-a", b"iter-b", b"iter-c"];
+        let origin = MultiStubOrigin::new(payloads);
+
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
+
+        let mut expected: HashSet<Hash> = HashSet::new();
+        for p in payloads {
+            let h = Hash::new(*p);
+            let _ = engine.get(h).await?;
+            expected.insert(h);
+        }
+
+        // Use a HashSet for the comparison — iroh-blobs `list()` order is
+        // not contractually stable.
+        let actual: HashSet<Hash> = engine.iter_hashes().await?.into_iter().collect();
+        anyhow::ensure!(actual == expected, "expected {expected:?}, got {actual:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn iter_hashes_excludes_evicted_blobs() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payloads: &[&[u8]] = &[b"evict-a", b"evict-b", b"evict-c", b"evict-d"];
+        let origin = MultiStubOrigin::new(payloads);
+
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
+
+        let hashes: Vec<Hash> = payloads.iter().map(|p| Hash::new(*p)).collect();
+        for h in &hashes {
+            let _ = engine.get(*h).await?;
+        }
+
+        // Evict half — odd indices.
+        let mut kept: Vec<Hash> = Vec::new();
+        let mut evicted: Vec<Hash> = Vec::new();
+        for (i, h) in hashes.iter().enumerate() {
+            if i % 2 == 0 {
+                kept.push(*h);
+            } else {
+                evicted.push(*h);
+            }
+        }
+        for h in &evicted {
+            engine.evict(*h)?;
+        }
+
+        let actual: HashSet<Hash> = engine.iter_hashes().await?.into_iter().collect();
+        let kept_set: HashSet<Hash> = kept.iter().copied().collect();
+
+        anyhow::ensure!(
+            actual == kept_set,
+            "iter_hashes must return exactly the non-evicted set; expected {kept_set:?}, got {actual:?}"
+        );
+        Ok(())
+    }
+
+    /// Pinned blobs MUST appear in `iter_hashes`: pinning protects against
+    /// LRU eviction, not against DHT republish. They're the most valuable
+    /// content to surface, so they have to seed the cold-start scheduler
+    /// alongside everything else. Locks the contract against a future
+    /// "exclude pinned for symmetry with `access_times_snapshot`" refactor.
+    #[tokio::test]
+    async fn iter_hashes_includes_pinned_blobs() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload_pinned: &[u8] = b"pin-a";
+        let payload_plain: &[u8] = b"pin-b";
+        let origin = MultiStubOrigin::new(&[payload_pinned, payload_plain]);
+
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
+
+        let h_pinned = Hash::new(payload_pinned);
+        let h_plain = Hash::new(payload_plain);
+        let _ = engine.get(h_pinned).await?;
+        let _ = engine.get(h_plain).await?;
+
+        let s = [from_store_hash(h_pinned)].into_iter().collect();
+        let diff = engine.set_pinned(&PinnedHashes::new(s));
+        // Without this guard, a future bug where set_pinned silently
+        // no-ops would let the test pass on the strength of pre-pin
+        // presence alone.
+        anyhow::ensure!(
+            diff.added == 1 && diff.removed == 0,
+            "set_pinned must apply the pin to make this test meaningful, got {diff:?}"
+        );
+
+        let actual: HashSet<Hash> = engine.iter_hashes().await?.into_iter().collect();
+        let expected: HashSet<Hash> = [h_pinned, h_plain].into_iter().collect();
+        anyhow::ensure!(
+            actual == expected,
+            "iter_hashes must include pinned blobs (they're the highest-value DHT advertisements); expected {expected:?}, got {actual:?}"
         );
         Ok(())
     }
