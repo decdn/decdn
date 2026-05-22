@@ -121,6 +121,14 @@ contract StakingRegistry is AccessControl, ReentrancyGuard, Pausable, EIP712 {
     uint256 internal constant MAX_MULTIADDR_SIZE_FLOOR = 64;
     uint256 internal constant MAX_MULTIADDR_SIZE_CEILING = 1024;
 
+    /// @notice Conservative cap on the stored `regionHint` byte length. ADR 003
+    ///         specifies an ISO 3166-1 alpha-2 code (2 bytes); the value is
+    ///         self-reported and unverified, so this is an anti-bloat bound
+    ///         rather than a format validator — generous enough for alpha-3 or
+    ///         short subdivision codes, tight enough to keep registration cost
+    ///         and downstream assumptions bounded.
+    uint256 internal constant MAX_REGION_HINT_BYTES = 16;
+
     // -----------------------------------------------------------------
     // EIP-712 typehashes
     // -----------------------------------------------------------------
@@ -292,6 +300,8 @@ contract StakingRegistry is AccessControl, ReentrancyGuard, Pausable, EIP712 {
     error MultiaddrCooldownActive(uint256 readyAt);
     error NodeNotActive();
     error StakeBelowMinimum(uint256 stake, uint256 required);
+    error OperatorEjected();
+    error RegionHintTooLong(uint256 size, uint256 ceiling);
 
     // -----------------------------------------------------------------
     // Constructor
@@ -417,7 +427,7 @@ contract StakingRegistry is AccessControl, ReentrancyGuard, Pausable, EIP712 {
         bytes calldata bindingSignature,
         bytes calldata ed25519Signature
     ) external nonReentrant whenNotPaused {
-        _checkRegistrationPreconditions(nodeId, multiaddrs.length);
+        _checkRegistrationPreconditions(nodeId, multiaddrs.length, bytes(regionHint).length);
         _checkBindingOneToOne(nodeId);
         uint64 usedBindingNonce = _verifyBindingSignature(nodeId, bindingSignature);
         uint64 usedRegistrationNonce = _verifyEd25519OwnershipSignature(nodeId, ed25519Signature);
@@ -434,14 +444,27 @@ contract StakingRegistry is AccessControl, ReentrancyGuard, Pausable, EIP712 {
         emit NodeIdBound(msg.sender, nodeId, usedBindingNonce);
     }
 
-    function _checkRegistrationPreconditions(bytes32 nodeId, uint256 multiaddrsLength) internal view {
+    function _checkRegistrationPreconditions(bytes32 nodeId, uint256 multiaddrsLength, uint256 regionHintLength)
+        internal
+        view
+    {
         if (nodeId == bytes32(0)) revert ZeroNodeId();
         if (multiaddrsLength > maxMultiaddrSize) {
             revert MultiaddrsTooLarge({ size: multiaddrsLength, ceiling: maxMultiaddrSize });
         }
+        if (regionHintLength > MAX_REGION_HINT_BYTES) {
+            revert RegionHintTooLong({ size: regionHintLength, ceiling: MAX_REGION_HINT_BYTES });
+        }
         if (activeStake[msg.sender] < minStake) {
             revert StakeBelowMinimum({ stake: activeStake[msg.sender], required: minStake });
         }
+        // An ejected operator (blacklist or slash auto-eject) must be
+        // reinstated first — re-stake to >= minStake clears the `ejected`
+        // flag in `stake()`. Without this guard an ejected operator could
+        // re-enter `_registeredAddrs` / `getActiveNodes` while still flagged
+        // ejected, producing a node that `isActive` reports false for but
+        // pagination still lists.
+        if (ejected[msg.sender]) revert OperatorEjected();
         if (_nodes[msg.sender].active) revert NodeAlreadyRegistered();
     }
 
@@ -493,14 +516,20 @@ contract StakingRegistry is AccessControl, ReentrancyGuard, Pausable, EIP712 {
         info.regionHint = regionHint;
     }
 
-    /// @notice Mark `msg.sender`'s registered node as inactive and remove
-    ///         from the active set. Does NOT move stake — operators
-    ///         exit stake separately via `requestUnstake` / `unstake`.
-    /// @dev    Increments `registrationNonce[nodeId]` so any pre-deregistration
-    ///         ed25519 signature cannot be replayed after a re-registration.
-    ///         Stake remains slashable while it sits in the unbonding flow;
-    ///         the `MAX_EVIDENCE_AGE_US < unbondingPeriod` invariant
-    ///         (ADR 014 § Unbonding interaction) prevents slash-then-run.
+    /// @notice Mark `msg.sender`'s registered node as inactive and remove it
+    ///         from the active set. Does NOT move stake — deregistration and
+    ///         stake exit are deliberately separate (see ADR 003 § Node
+    ///         Registry, deregister rationale).
+    /// @dev    Stake stays bonded as `activeStake` and remains fully slashable
+    ///         after deregistration — accountability is preserved, and an
+    ///         operator who changes their mind can re-register without
+    ///         re-funding. To withdraw stake the operator calls
+    ///         `requestUnstake` then `unstake`; the
+    ///         `MAX_EVIDENCE_AGE_US < unbondingPeriod` invariant
+    ///         (ADR 014 § Unbonding interaction) is what blocks slash-then-run,
+    ///         and it keys off `requestUnstake`, not off deregistration.
+    ///         Increments `registrationNonce[nodeId]` so any pre-deregistration
+    ///         ed25519 signature cannot be replayed on re-registration.
     function deregisterNode() external nonReentrant whenNotPaused {
         NodeInfo storage info = _nodes[msg.sender];
         if (!info.active) revert NodeNotActive();
@@ -715,9 +744,16 @@ contract StakingRegistry is AccessControl, ReentrancyGuard, Pausable, EIP712 {
     }
 
     /// @notice Full ADR 003 active predicate: registered + active flag + stake
-    ///         at or above `minStake` + not ejected.
+    ///         at or above `minStake` + no in-flight unbonding + not ejected.
+    /// @dev    The `unbondingOf[operator].amount == 0` clause makes an operator
+    ///         with any stake "fully or partially in unbonding" inactive, even
+    ///         when the remaining `activeStake` is still `>= minStake` — an
+    ///         operator that has begun exiting is signalling departure (ADR 003
+    ///         line 785 lists "stake fully or partially in unbonding" as a
+    ///         false case).
     function isActive(address operator) public view returns (bool) {
-        return _nodes[operator].active && activeStake[operator] >= minStake && !ejected[operator];
+        return _nodes[operator].active && activeStake[operator] >= minStake && unbondingOf[operator].amount == 0
+            && !ejected[operator];
     }
 
     // -----------------------------------------------------------------

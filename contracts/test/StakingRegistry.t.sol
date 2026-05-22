@@ -210,6 +210,26 @@ contract StakingRegistryTest is Test {
         assertFalse(reg.isActive(op));
     }
 
+    function test_isActive_falseWhenAnyStakeInUnbonding() public {
+        Vm.Wallet memory wallet = vm.createWallet("unbond-test");
+        address op = wallet.addr;
+
+        // Stake 2x minimum and register → active
+        _fundAndStake(op, 2 * MIN_STAKE);
+        bytes32 nodeId = bytes32(uint256(0xBEEF));
+        bytes memory sig = _signBindNode(wallet, nodeId, 0);
+        vm.prank(op);
+        reg.registerNode(nodeId, hex"", "", sig, hex"");
+        assertTrue(reg.isActive(op));
+
+        // Begin unbonding a portion; remaining activeStake (MIN_STAKE) is still
+        // >= minStake, but ADR 003 treats "partially in unbonding" as inactive.
+        vm.prank(op);
+        reg.requestUnstake(MIN_STAKE);
+        assertEq(reg.activeStake(op), MIN_STAKE);
+        assertFalse(reg.isActive(op), "any in-flight unbonding makes operator inactive");
+    }
+
     // -----------------------------------------------------------------
     // Unbonding + unstake
     // -----------------------------------------------------------------
@@ -358,6 +378,32 @@ contract StakingRegistryTest is Test {
         vm.prank(wallet.addr);
         vm.expectRevert(StakingRegistry.InvalidEd25519Signature.selector);
         reg.registerNode(nodeId, hex"", "", bindingSig, hex"");
+    }
+
+    function test_registerNode_revertsWhenEjected() public {
+        (Vm.Wallet memory wallet, bytes32 nodeId, bytes memory bindingSig) = _prepareRegistration(0);
+        _fundAndStake(wallet.addr, MIN_STAKE);
+
+        // Blacklist-eject before registering (stake stays >= minStake).
+        vm.prank(blacklist);
+        reg.ejectNode(wallet.addr);
+        assertTrue(reg.ejected(wallet.addr));
+
+        // Even with sufficient stake, an ejected operator cannot register —
+        // they must be reinstated (re-stake to >= minStake clears the flag).
+        vm.prank(wallet.addr);
+        vm.expectRevert(StakingRegistry.OperatorEjected.selector);
+        reg.registerNode(nodeId, hex"", "", bindingSig, hex"");
+    }
+
+    function test_registerNode_revertsWhenRegionHintTooLong() public {
+        (Vm.Wallet memory wallet, bytes32 nodeId, bytes memory bindingSig) = _prepareRegistration(0);
+        _fundAndStake(wallet.addr, MIN_STAKE);
+
+        string memory longHint = "this-is-way-too-long-for-a-region-code";
+        vm.prank(wallet.addr);
+        vm.expectRevert(abi.encodeWithSelector(StakingRegistry.RegionHintTooLong.selector, bytes(longHint).length, 16));
+        reg.registerNode(nodeId, hex"", longHint, bindingSig, hex"");
     }
 
     function test_registerNode_revertsOnAlreadyRegistered() public {
