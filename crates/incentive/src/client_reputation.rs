@@ -75,6 +75,14 @@ pub enum ConfigError {
         /// Configured accept threshold.
         accept: f64,
     },
+    /// `alpha` was exactly `0.0`. The unit-interval check accepts `0.0`,
+    /// but a zero alpha freezes the EWMA at `initial_score` for every
+    /// future event — the ledger silently stops responding to behaviour.
+    /// `alpha` is documented as `(0.0, 1.0]`; this guard enforces it.
+    #[error(
+        "alpha must be strictly greater than 0.0; a zero alpha freezes the EWMA at initial_score"
+    )]
+    AlphaCannotBeZero,
 }
 
 /// Per-client reputation snapshot. One entry per `channel.client` address.
@@ -93,7 +101,16 @@ pub struct ClientReputation {
     /// Tracked for operator observability; the EWMA is per-event, not
     /// per-byte, by design — see module docs.
     pub total_bytes_delivered: u64,
-    /// Unix-microseconds of the most recent update; `0` if never observed.
+    /// Unix-microseconds of the most recent update. `0` indicates either
+    /// "never observed" (e.g., a default-constructed entry, or a row
+    /// hydrated from persistence that pre-dated time tracking) *or* a
+    /// system whose clock was behind the UNIX epoch at the time of the
+    /// most recent update — the internal time helper saturates to `0`
+    /// in that case, indistinguishably. Operators relying on this field
+    /// for liveness should treat `0` as "no observation in the post-epoch
+    /// era". To distinguish "unobserved" from "observed but timestamp
+    /// lost" prefer [`ClientReputation::event_count`] — that field is
+    /// `0` only for truly never-observed entries.
     pub last_seen_us: u64,
 }
 
@@ -250,8 +267,11 @@ impl ClientReputationLedger {
     /// Decide whether to admit `client`. Maps the per-client EWMA to one of
     /// [`Admission::Accept`], [`Admission::AcceptCapped`], or
     /// [`Admission::Reject`] per the ADR 003 three-tier framing. An
-    /// unseen client (no observed events) yields
-    /// [`Admission::AcceptCapped`] with [`ClientReputationConfig::new_client_cap_bytes`].
+    /// unseen client (no map entry, *or* a hydrated/default-constructed
+    /// entry with `event_count == 0`) yields [`Admission::AcceptCapped`]
+    /// with [`ClientReputationConfig::new_client_cap_bytes`] — so a
+    /// snapshot round-trip of an empty row is admission-equivalent to a
+    /// never-recorded client.
     pub fn admit(&self, client: Address) -> Admission {
         // Poison recovery: read-only path; cannot itself corrupt state.
         let guard = self
@@ -263,6 +283,15 @@ impl ClientReputationLedger {
                 byte_cap: self.config.new_client_cap_bytes,
             };
         };
+        // A row with `event_count == 0` carries no real signal — its
+        // `completion_ratio` is whatever the persistence/default path put
+        // there. Treat it as unseen so persistence layers don't have to
+        // distinguish "never inserted" from "default row".
+        if rep.event_count == 0 {
+            return Admission::AcceptCapped {
+                byte_cap: self.config.new_client_cap_bytes,
+            };
+        }
         if rep.completion_ratio >= self.config.accept_threshold {
             Admission::Accept
         } else if rep.completion_ratio >= self.config.reject_threshold {
@@ -339,6 +368,13 @@ fn unix_micros() -> u64 {
 
 fn validate(c: &ClientReputationConfig) -> Result<(), ConfigError> {
     require_unit_interval(c.alpha, "alpha")?;
+    // Tighter alpha bound: `(0.0, 1.0]`. A zero alpha leaves the EWMA
+    // frozen at `initial_score` for every future event, silently
+    // disabling the ledger. Docs document this as `(0.0, 1.0]`; enforce
+    // it here.
+    if c.alpha == 0.0 {
+        return Err(ConfigError::AlphaCannotBeZero);
+    }
     require_unit_interval(c.initial_score, "initial_score")?;
     require_unit_interval(c.accept_threshold, "accept_threshold")?;
     require_unit_interval(c.reject_threshold, "reject_threshold")?;
@@ -371,10 +407,22 @@ pub trait ClientReputationStore: Send + Sync {
     /// Load every persisted entry. Called once during node bring-up to
     /// hydrate the ledger before the admission path starts.
     ///
+    /// Implementations SHOULD silently skip entries whose payload is
+    /// logically invalid (e.g., `completion_ratio` non-finite or outside
+    /// `[0.0, 1.0]`) rather than failing the load — the ledger tolerates
+    /// partial loss per ADR 003 §Corrupted delivery. The hydration
+    /// performed by [`ClientReputationLedger::from_snapshot`] applies the
+    /// same skip rule, so an impl that surfaces invalid rows here would
+    /// be erroring out work the ledger is about to discard anyway.
+    /// Reserve [`StoreError`] for *backend*-level failures (truncated
+    /// frame, unreadable file, malformed magic) where no recovery is
+    /// possible.
+    ///
     /// # Errors
     ///
     /// Returns [`StoreError`] if the backing store is unreadable or
-    /// contains corrupt entries.
+    /// structurally corrupt at the byte / framing level. Logically-
+    /// invalid rows MUST NOT cause a load failure.
     fn load_all(&self) -> Result<Vec<(Address, ClientReputation)>, StoreError>;
 
     /// Persist the reputation row for one client.
@@ -530,6 +578,17 @@ mod tests {
             ClientReputationLedger::new(bad),
             Err(ConfigError::ThresholdOrdering { .. })
         ));
+
+        // `alpha == 0.0` passes the closed-interval unit check but is
+        // documented as `(0.0, 1.0]` — a zero alpha freezes the EWMA.
+        let bad = ClientReputationConfig {
+            alpha: 0.0,
+            ..ClientReputationConfig::default()
+        };
+        assert!(matches!(
+            ClientReputationLedger::new(bad),
+            Err(ConfigError::AlphaCannotBeZero)
+        ));
     }
 
     #[test]
@@ -649,6 +708,8 @@ mod tests {
         // The decision logic uses `>=` for both thresholds: a score sitting
         // exactly on accept_threshold is Accept; one exactly on
         // reject_threshold is AcceptCapped (not Reject). Lock this in.
+        // event_count must be >0 — a zero-event row is treated as unseen
+        // (see `default_constructed_entry_treated_as_unseen`).
         let on_accept = address!("0000000000000000000000000000000000000004");
         let on_reject = address!("0000000000000000000000000000000000000005");
         let entries = [
@@ -656,6 +717,7 @@ mod tests {
                 on_accept,
                 ClientReputation {
                     completion_ratio: 0.70,
+                    event_count: 1,
                     ..ClientReputation::default()
                 },
             ),
@@ -663,6 +725,7 @@ mod tests {
                 on_reject,
                 ClientReputation {
                     completion_ratio: 0.30,
+                    event_count: 1,
                     ..ClientReputation::default()
                 },
             ),
@@ -674,6 +737,29 @@ mod tests {
         ensure!(matches!(l.admit(on_accept), Admission::Accept));
         ensure!(matches!(l.admit(on_reject), Admission::AcceptCapped { .. }));
         Ok(())
+    }
+
+    #[test]
+    fn default_constructed_entry_treated_as_unseen() -> anyhow::Result<()> {
+        // A persistence layer may round-trip a default-constructed entry
+        // (event_count == 0) — `admit` should treat it as admission-
+        // equivalent to a never-recorded client, NOT a borderline-tier
+        // client whose score happens to equal `initial_score`. The
+        // distinction is observable when `new_client_cap_bytes` differs
+        // from `borderline_cap_bytes`.
+        let cfg = ClientReputationConfig {
+            new_client_cap_bytes: 100,
+            borderline_cap_bytes: 200,
+            ..ClientReputationConfig::default()
+        };
+        let l = ClientReputationLedger::from_snapshot(
+            cfg,
+            std::iter::once((client_a(), ClientReputation::default())),
+        )?;
+        match l.admit(client_a()) {
+            Admission::AcceptCapped { byte_cap: 100 } => Ok(()),
+            other => anyhow::bail!("expected AcceptCapped {{ byte_cap: 100 }}, got {other:?}"),
+        }
     }
 
     #[test]
