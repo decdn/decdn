@@ -1,5 +1,6 @@
 # ADR 031: ContentBlacklist appeal-contract surface
 
+**Date:** 2026-05-14
 **Status:** Accepted
 
 ## Context
@@ -262,7 +263,7 @@ stateDiagram-v2
     Lapsed --> [*]
 ```
 
-`UnFastTracked → FastTracked` is one-shot per [ADR 011 § Contract surface](011-content-takedown.md#contract-surface): a second `unFastTrackAppeal` on the same `appealId` reverts with `AlreadyUnFastTracked`.
+`unFastTrackAppeal` is one-shot per [ADR 011 § Contract surface](011-content-takedown.md#contract-surface): a second `unFastTrackAppeal` on the same `appealId` reverts with `AlreadyUnFastTracked`, so the fast-track ↔ un-fast-track cycle (`FastTracked → UnFastTracked → FastTracked`) cannot repeat.
 
 ### Integration with ContentBlacklist core
 

@@ -1,5 +1,6 @@
 # ADR 011: Content Takedown and Hash Blacklisting
 
+**Date:** 2026-03-30
 **Status:** Accepted
 
 ## Context
@@ -135,7 +136,7 @@ struct BlacklistEntry {
 }
 ```
 
-> **Region representation.** The `region` field is **stored as `bytes2`** — ISO 3166-1 alpha-2 codes are always exactly 2 ASCII characters, with `bytes2(0)` as the global sentinel. The `string` form shown in the interface signatures, events, and the `BlacklistEntry` struct above is the external-boundary representation only; it is canonicalized to `bytes2` for storage (a `_toBytes2(string)` helper reverts on length ≠ 2 or non-ASCII-alpha input). The pinned storage layout — for parent entries and appeal records alike — is in [ADR 031 § Storage layout](031-content-blacklist-appeals-contract.md#storage-layout).
+> **Region representation.** The `region` field is **stored as `bytes2`** — ISO 3166-1 alpha-2 codes are always exactly 2 ASCII characters, with `bytes2(0)` as the global sentinel. The `string` form shown in the interface signatures, events, and the `BlacklistEntry` struct above is the external-boundary representation only; it is canonicalized to `bytes2` for storage (a `_toBytes2(string)` helper reverts on length ≠ 2 or non-ASCII-alpha input). The `BlacklistEntry` layout is the struct above; the gas-packed appeal-record storage layout is pinned in [ADR 031 § Storage layout](031-content-blacklist-appeals-contract.md#storage-layout).
 
 ### Blacklist version
 
