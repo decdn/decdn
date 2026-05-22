@@ -460,7 +460,7 @@ All events use indexed `channelId` plus an indexed actor field where applicable.
 
 **Rate bounds are in USDC base units (6 decimals).** The contract stores a single `RateBounds` struct with `deliveryFloor` and `deliveryCeiling`.
 
-**Initial rate bounds (PoC):**
+**Initial rate bounds:**
 
 | Parameter | Value (USD/MB) | USDC base units | Rationale |
 | --- | --- | --- | --- |
@@ -475,7 +475,7 @@ Nodes must keep their local `RateBounds` copy current so advertised `rate_per_mb
 
 **Primary mechanism: event listening.** Nodes SHOULD subscribe to `RateBoundsUpdated` events on the `PaymentChannel` contract and update the local cache immediately. Governance actions are infrequent (days to weeks), so high-frequency polling would be wasteful.
 
-**Fallback mechanism: periodic polling.** Nodes MUST poll `getRateBounds()` at a configurable interval (`rate_bounds_poll_interval`, default **1 hour** for PoC), guarding against missed events from RPC provider issues, WebSocket disconnections, or chain reorganizations. The 1-hour default is deliberately longer than the 10-minute registry ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)) / blacklist ([ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)) intervals: registry freshness is connectivity-critical and blacklist freshness slashing-critical, but rate-bounds staleness only risks counterparties rejecting the node's advertised rate.
+**Fallback mechanism: periodic polling.** Nodes MUST poll `getRateBounds()` at a configurable interval (`rate_bounds_poll_interval`, default **1 hour**), guarding against missed events from RPC provider issues, WebSocket disconnections, or chain reorganizations. The 1-hour default is deliberately longer than the 10-minute registry ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)) / blacklist ([ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)) intervals: registry freshness is connectivity-critical and blacklist freshness slashing-critical, but rate-bounds staleness only risks counterparties rejecting the node's advertised rate.
 
 #### Startup
 
