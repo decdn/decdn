@@ -428,6 +428,36 @@ jobs:
       - run: forge --version
       - run: forge build --sizes --deny warnings
       - run: forge test -vvv
+      # Structural enforcement that `TestnetFaucet` never leaks into the
+      # production audit surface (issue #636, #452). The contract lives at
+      # `testnet/TestnetFaucet.sol` and is wired only from
+      # `script/TestnetFaucet.s.sol` + the test suite — any reference from
+      # `src/` or from any other `script/*.s.sol` fails CI.
+      - name: Verify TestnetFaucet stays in testnet boundary
+        run: |
+          set -euo pipefail
+          # Explicit dir-existence check so a future refactor that renames /
+          # removes `src/` or `script/` fails the gate loudly instead of
+          # silently passing — without it, `grep`'s missing-dir error is
+          # swallowed by `2>/dev/null` and `|| true` and the gate degrades
+          # to a no-op against the new layout.
+          for d in src script; do
+            if [[ ! -d "$d" ]]; then
+              echo "::error::expected directory contracts/$d to exist for the TestnetFaucet boundary check"
+              exit 1
+            fi
+          done
+          # Note: this intentionally matches comment mentions too. If a
+          # production file ever needs to *name* TestnetFaucet (e.g., in a
+          # doc reference), the right move is to update this gate
+          # deliberately, not to soften it.
+          leak=$(grep -rnw 'TestnetFaucet' src/ script/ \
+                   | grep -v '^script/TestnetFaucet\.s\.sol:' || true)
+          if [[ -n "$leak" ]]; then
+            echo "::error::TestnetFaucet must not appear outside contracts/testnet/ or contracts/script/TestnetFaucet.s.sol"
+            echo "$leak"
+            exit 1
+          fi
 
   solidity-coverage:
     name: solidity coverage

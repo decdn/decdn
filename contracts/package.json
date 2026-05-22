@@ -7,6 +7,6 @@
     "solhint": "6.2.1"
   },
   "scripts": {
-    "lint": "solhint 'src/**/*.sol'"
+    "lint": "solhint 'src/**/*.sol' 'testnet/**/*.sol' 'script/**/*.sol'"
   }
 }
