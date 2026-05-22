@@ -82,6 +82,16 @@ contract VotingEscrowTest is Test {
         new VotingEscrow(IERC20(address(token)), admin, MAX_LOCK + 1, MAX_LOCK);
     }
 
+    function test_constructor_revertsMaxLockExceedsWalkCap() public {
+        // The checkpoint walk is capped at 255 week-steps; a maxLockDuration
+        // beyond 255 weeks could outrun it and corrupt totalSupplyAt.
+        uint256 tooLong = 256 weeks;
+        vm.expectRevert();
+        new VotingEscrow(IERC20(address(token)), admin, MIN_LOCK, tooLong);
+        // 255 weeks is the boundary and is accepted.
+        new VotingEscrow(IERC20(address(token)), admin, MIN_LOCK, 255 weeks);
+    }
+
     // -----------------------------------------------------------------
     // createLock
     // -----------------------------------------------------------------

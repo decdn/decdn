@@ -132,6 +132,14 @@ contract VotingEscrow is AccessControl, ReentrancyGuard, Pausable {
         if (minLockDuration_ == 0 || minLockDuration_ > maxLockDuration_) {
             revert LockDurationOutOfRange(minLockDuration_, 1, maxLockDuration_);
         }
+        // The global checkpoint walk is capped at MAX_CHECKPOINT_ITERATIONS
+        // week-steps. A lock's full lifespan must fit within one walk's reach
+        // or slope changes past the cap could be missed, corrupting
+        // totalSupplyAt. ADR 034's 4-year max (~208 weeks) is within the
+        // 255-week bound; reject any configuration that isn't.
+        if (maxLockDuration_ > MAX_CHECKPOINT_ITERATIONS * WEEK) {
+            revert LockDurationOutOfRange(maxLockDuration_, minLockDuration_, MAX_CHECKPOINT_ITERATIONS * WEEK);
+        }
 
         token = token_;
         minLockDuration = minLockDuration_;
@@ -439,22 +447,21 @@ contract VotingEscrow is AccessControl, ReentrancyGuard, Pausable {
     //
     // The veCRV checkpoint math is signed (slopes carry negative
     // slope-change deltas), so unsigned amounts / time deltas cross into
-    // int128 and clamped biases cross back. All inputs are bounded - amounts
-    // ≤ TOKEN supply (1e27), time deltas ≤ maxLockDuration (~1.3e8 s), and
-    // the derived slopes/biases (≤ ~1e27) sit far inside int128 range
-    // (~1.7e38). The narrowing-cast lint disables are localized to these two
-    // helpers instead of scattering ~28 inline disables across the math.
+    // int128 and clamped biases cross back. Inputs are bounded in practice
+    // (amounts <= TOKEN supply 1e27, time deltas <= maxLockDuration), but the
+    // casts go through OZ SafeCast so an out-of-range value reverts rather
+    // than silently wrapping and corrupting slope/bias math. Localizing the
+    // casts to these two helpers also keeps the call sites clean.
 
-    /// @dev Cast a bounded unsigned value into int128 (see note above).
+    /// @dev Checked cast of an unsigned value into int128 (reverts on overflow).
     function _toInt128(uint256 x) internal pure returns (int128) {
-        // forge-lint: disable-next-line(unsafe-typecast)
-        return int128(int256(x));
+        return SafeCast.toInt128(SafeCast.toInt256(x));
     }
 
-    /// @dev Cast an already-clamped (>= 0) int128 bias back to uint256.
+    /// @dev Checked cast of an already-clamped (>= 0) int128 bias to uint256
+    ///      (reverts if `x` is negative, which the callers never pass).
     function _toUint256(int128 x) internal pure returns (uint256) {
-        // forge-lint: disable-next-line(unsafe-typecast)
-        return uint256(uint128(x));
+        return SafeCast.toUint256(int256(x));
     }
 
     // -----------------------------------------------------------------
