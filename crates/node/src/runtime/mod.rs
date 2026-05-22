@@ -429,30 +429,20 @@ pub async fn run(
     let record_store = Arc::new(std::sync::Mutex::new(RecordStore::new(
         RecordStoreConfig::default(),
     )));
-    // Active-staker set. `ConfigStakerSet` reads the operator-supplied
-    // list from `dht.static_active_nodes`. The chain-backed
-    // `ChainStakerSet` lands with the on-chain origin-directory
-    // follow-up; same trait, drop-in swap.
-    //
-    // Empty set is a footgun (ADR 022 line 140 — every `Store` rejects
-    // with `accepted: false`), so we log an explicit warning at
-    // startup. Operators following the testnet bring-up runbook MUST
-    // populate `dht.static_active_nodes` with the testnet's staker set;
-    // a missing entry shows up here as a single high-signal line
-    // rather than as silent per-request `debug!` rejections.
-    let staker_set: Arc<dyn StakerSet> =
-        Arc::new(ConfigStakerSet::new(cfg.dht.static_active_nodes.clone()));
-    if staker_set.is_empty() {
-        tracing::warn!(
-            "dht.static_active_nodes is empty; every cdn/dht/v1 `Store` will be \
-             rejected (ADR 022 line 140). Populate the field to admit publishers."
-        );
-    } else {
-        tracing::info!(
-            staker_count = staker_set.len(),
-            "dht active-staker set initialised from config"
-        );
-    }
+    // Active-staker set. Wired as an empty `ConfigStakerSet` until the
+    // chain-backed `ChainStakerSet` (reads `StakingRegistry.getActiveNodes()`
+    // and subscribes to `Staked`/`Unstaked`) lands with PR 4 of #320 — at
+    // which point the runtime swaps the construction here without
+    // touching the handler, which holds the trait object. Until then
+    // every inbound `cdn/dht/v1` `Store` is rejected with
+    // `accepted: false` per ADR 022 line 140; the cache → DHT republish
+    // hook exposed in this PR has no producer yet (PR 4 brings the
+    // scheduler), so no publisher-side traffic is gated either.
+    let staker_set: Arc<dyn StakerSet> = Arc::new(ConfigStakerSet::empty());
+    tracing::warn!(
+        "dht active-staker set is empty; every cdn/dht/v1 `Store` will be \
+         rejected (ADR 022 line 140). Chain-backed StakerSet lands with PR 4 of #320."
+    );
     let dht_handler = Arc::new(DhtHandler::new(
         secret_key.public(),
         Arc::clone(&dht_rate_limiter),

@@ -1677,8 +1677,6 @@ pub fn resolve_dht_into(file: Option<&types::DhtConfig>, bag: &mut ConfigErrorBa
     );
 
     let trusted_ips = parse_trusted_ips(rate_limit.and_then(|r| r.trusted_ips.as_deref()), bag);
-    let static_active_nodes =
-        parse_static_active_nodes(file.and_then(|d| d.static_active_nodes.as_deref()), bag);
 
     ResolvedDht {
         per_peer_rate_per_sec,
@@ -1688,33 +1686,7 @@ pub fn resolve_dht_into(file: Option<&types::DhtConfig>, bag: &mut ConfigErrorBa
         global_rate_per_sec,
         global_burst,
         trusted_ips,
-        static_active_nodes,
     }
-}
-
-fn parse_static_active_nodes(
-    raw: Option<&[String]>,
-    bag: &mut ConfigErrorBag,
-) -> std::collections::HashSet<[u8; 32]> {
-    let mut out = std::collections::HashSet::new();
-    let Some(entries) = raw else {
-        return out;
-    };
-    for entry in entries {
-        match parse_node_id_hex(entry) {
-            Ok(id) => {
-                out.insert(id);
-            }
-            Err(e) => {
-                bag.check_with(false, "dht.static_active_nodes", || {
-                    format!(
-                        "dht.static_active_nodes entry {entry:?} is not a 64-char hex NodeId: {e}"
-                    )
-                });
-            }
-        }
-    }
-    out
 }
 
 /// Convenience wrapper for [`resolve_dht_into`] that takes a fresh
@@ -1752,8 +1724,8 @@ fn parse_trusted_ips(
 /// Parse a 64-character hex (case-insensitive) node ID into 32 raw bytes.
 ///
 /// The error message is field-agnostic — callers (currently
-/// `gossip.allowlist` and `dht.static_active_nodes`) wrap the result
-/// with the field path of the offending entry.
+/// `gossip.allowlist`) wrap the result with the field path of the
+/// offending entry.
 fn parse_node_id_hex(s: &str) -> anyhow::Result<[u8; 32]> {
     anyhow::ensure!(
         s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()),

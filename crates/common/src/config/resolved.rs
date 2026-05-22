@@ -297,14 +297,6 @@ pub struct ResolvedDht {
     pub global_rate_per_sec: f64,
     pub global_burst: u32,
     pub trusted_ips: std::collections::HashSet<std::net::IpAddr>,
-    /// Parsed active-staker `NodeId` set from
-    /// `dht.static_active_nodes` (ADR 022 §STORE Flow line 140). Empty
-    /// means no peer is admitted as a `Store` publisher — every
-    /// `StoreRequest` returns `accepted: false`. The runtime feeds
-    /// this directly into `ConfigStakerSet`; the chain-backed
-    /// replacement reads `StakingRegistry.getActiveNodes()` and is
-    /// tracked in the on-chain origin-directory follow-up.
-    pub static_active_nodes: std::collections::HashSet<[u8; 32]>,
 }
 
 impl Default for ResolvedDht {
@@ -317,7 +309,6 @@ impl Default for ResolvedDht {
             global_rate_per_sec: 1000.0,
             global_burst: 2000,
             trusted_ips: std::collections::HashSet::new(),
-            static_active_nodes: std::collections::HashSet::new(),
         }
     }
 }

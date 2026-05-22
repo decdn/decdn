@@ -45,14 +45,14 @@ pub trait StakerSet: Send + Sync + std::fmt::Debug {
     }
 }
 
-/// File-config-driven [`StakerSet`] implementation.
+/// In-memory [`StakerSet`] implementation, built from a parsed
+/// `NodeId` set or empty.
 ///
-/// The initial network rollout lists active stakers in the node TOML
-/// config (`dht.static_active_nodes`); the chain-backed `ChainStakerSet`
-/// (issue tracked in the on-chain origin-directory follow-up) reads
-/// `StakingRegistry.getActiveNodes()` once at startup and on `Staked` /
-/// `Unstaked` event subscription. Both implementations satisfy the same
-/// trait so the handler is independent of the source.
+/// The runtime wires this with [`Self::empty`] until the chain-backed
+/// `ChainStakerSet` (reads `StakingRegistry.getActiveNodes()` once at
+/// startup and subscribes to `Staked` / `Unstaked` events) lands with
+/// PR 4 of #320 — same trait, drop-in swap at the runtime construction
+/// site. Tests construct via [`Self::new`] with a known `HashSet`.
 #[derive(Debug)]
 pub struct ConfigStakerSet {
     active: HashSet<NodeId>,
