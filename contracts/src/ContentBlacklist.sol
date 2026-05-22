@@ -270,6 +270,8 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     /// @notice Remove an origin entry. Does not un-eject the operator on
     ///         `StakingRegistry`; the operator restakes to re-activate.
     function removeOrigin(address operatorAddress) external onlyRole(GOVERNANCE_ROLE) {
+        // `addedAt == 0` is the presence sentinel (no entry), not a value-bearing equality.
+        // slither-disable-next-line incorrect-equality
         if (_origins[operatorAddress].addedAt == 0) revert OriginNotFound();
         delete _origins[operatorAddress];
         _bumpVersion();
@@ -408,6 +410,9 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     }
 
     function _removeHashEntry(bytes32 blake3Hash, bytes2 region, string memory regionStr) internal {
+        // `addedAt == 0` is the presence sentinel (no entry), not a value-bearing
+        // equality — the strict comparison is the intended semantics.
+        // slither-disable-next-line incorrect-equality
         if (_entries[blake3Hash][region].addedAt == 0) revert EntryNotFound();
         delete _entries[blake3Hash][region];
         _bumpVersion();
