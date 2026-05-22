@@ -500,6 +500,10 @@ contract StakingRegistryTest is Test {
         assertEq(reg.nodeIdToAddress(newNodeId), wallet.addr);
         assertEq(reg.nodeIdToAddress(oldNodeId), address(0), "old binding released");
         assertEq(reg.bindingNonce(wallet.addr), 2);
+        assertEq(
+            reg.registrationNonce(oldNodeId), 1, "old NodeId nonce bumped on rotation to invalidate stale ed25519 sigs"
+        );
+        assertEq(reg.registrationNonce(newNodeId), 0, "new NodeId nonce untouched");
 
         // NodeInfo stays consistent for the active node.
         StakingRegistry.NodeInfo memory info = reg.getNodeByAddress(wallet.addr);
@@ -569,6 +573,10 @@ contract StakingRegistryTest is Test {
         assertEq(reg.getActiveNodeCount(), 1);
 
         address reclaimer = makeAddr("reclaimer");
+        // Reclaim deactivating an active node signals the active-set removal
+        // with NodeDeregistered (consistent with deregister), not NodeAutoEjected.
+        vm.expectEmit(true, false, false, false, address(reg));
+        emit StakingRegistry.NodeDeregistered(nodeId);
         vm.prank(reclaimer);
         reg.reclaimNodeId(nodeId, hex"deadbeef"); // mock ed25519 accepts
 

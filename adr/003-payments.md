@@ -824,15 +824,24 @@ function bindNodeId(bytes32 nodeId, bytes calldata bindingSignature, bytes calld
     address existingOwner = nodeIdToAddress[nodeId];
     require(existingOwner == address(0) || existingOwner == msg.sender, "NodeId bound to another address");
 
-    // Clear caller's previous binding if exists
+    // Clear caller's previous binding if rotating to a different NodeId, and
+    // bump its registrationNonce so any pre-rotation ed25519 signature for the
+    // released NodeId is invalidated (mirrors deregisterNode: every binding
+    // exit requires a fresh ownership proof to re-bind).
     bytes32 oldNodeId = addressToNodeId[msg.sender];
     if (oldNodeId != bytes32(0) && oldNodeId != nodeId) {
         delete nodeIdToAddress[oldNodeId];
+        registrationNonce[oldNodeId] += 1;
     }
 
     nodeIdToAddress[nodeId] = msg.sender;
     addressToNodeId[msg.sender] = nodeId;
     bindingNonce[msg.sender] = nonce + 1;
+
+    // Keep the registration record consistent for an already-active node.
+    if (nodes[msg.sender].active) {
+        nodes[msg.sender].nodeId = nodeId;
+    }
 
     emit NodeIdBound(msg.sender, nodeId, nonce);
 }

@@ -577,6 +577,11 @@ contract StakingRegistry is AccessControl, ReentrancyGuard, Pausable, EIP712 {
         bytes32 oldNodeId = addressToNodeId[msg.sender];
         if (oldNodeId != bytes32(0) && oldNodeId != nodeId) {
             delete nodeIdToAddress[oldNodeId];
+            // Exiting the old NodeId's binding invalidates any pre-rotation
+            // ed25519 registration signature for it, mirroring `deregisterNode`
+            // / `_ejectNodeEffects`: every active-set / binding exit bumps the
+            // nonce so a fresh ownership proof is required to bind it again.
+            registrationNonce[oldNodeId] += 1;
         }
 
         nodeIdToAddress[nodeId] = msg.sender;
@@ -627,6 +632,11 @@ contract StakingRegistry is AccessControl, ReentrancyGuard, Pausable, EIP712 {
             if (info.active) {
                 info.active = false;
                 _removeFromRegisteredSet(currentHolder);
+                // Signal the active-set removal to off-chain indexers, consistent
+                // with the other deactivation paths. This is not an ejection (no
+                // penalty, no `ejected` flag), so it reuses `NodeDeregistered`
+                // rather than `NodeAutoEjected`.
+                emit NodeDeregistered(nodeId);
             }
             info.nodeId = bytes32(0);
         }
