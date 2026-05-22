@@ -1274,6 +1274,14 @@ impl CacheEngine {
     /// included, but downstream publish paths re-check the evicted set, so a
     /// stale entry in the scheduler's heap fails the membership check at
     /// publish time rather than re-advertising a takedown.
+    ///
+    /// Error semantics: a failure on the iroh-blobs cursor itself
+    /// (`list()` or `stream.next()`) aborts the walk — we can't trust
+    /// subsequent yields once the cursor is broken. But a per-blob
+    /// `status()` failure logs-and-skips so a single inaccessible blob
+    /// doesn't deny the seed for every other healthy blob. The
+    /// republish surface is best-effort by design; partial completion
+    /// strictly beats total failure.
     pub async fn iter_hashes(&self) -> CacheResult<Vec<Hash>> {
         let blobs = self.inner.store.blobs();
         let mut stream = blobs
@@ -1287,10 +1295,17 @@ impl CacheEngine {
             if self.is_evicted(hash) {
                 continue;
             }
-            let status = blobs
-                .status(hash)
-                .await
-                .map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
+            let status = match blobs.status(hash).await {
+                Ok(s) => s,
+                Err(err) => {
+                    tracing::warn!(
+                        hash = %hash,
+                        error = %err,
+                        "iter_hashes: blob status() failed; skipping (cold-start seed continues with remaining blobs)"
+                    );
+                    continue;
+                }
+            };
             if matches!(status, iroh_blobs::api::blobs::BlobStatus::Complete { .. }) {
                 out.push(hash);
             }
