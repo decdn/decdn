@@ -102,7 +102,13 @@ interface IContentBlacklist {
     function isBlacklisted(bytes32 blake3Hash) external view returns (bool);
     function isBlacklistedInRegion(bytes32 blake3Hash, string calldata region) external view returns (bool);
     function isOriginBlacklisted(address operatorAddress) external view returns (bool);
+    // Entries are keyed by (blake3Hash, region) with region == bytes2(0) as the
+    // global sentinel, so a hash may carry a global entry and/or independent
+    // regional entries. getEntry returns the global (region == 0) entry;
+    // getEntryInRegion returns the (hash, region) entry. Both return a zero
+    // struct (addedAt == 0) when absent.
     function getEntry(bytes32 blake3Hash) external view returns (BlacklistEntry memory);
+    function getEntryInRegion(bytes32 blake3Hash, string calldata region) external view returns (BlacklistEntry memory);
     function getBlacklistVersion() external view returns (uint256);
 
     // Events
@@ -122,7 +128,8 @@ interface IContentBlacklist {
 struct BlacklistEntry {
     bytes32 blake3Hash;
     uint256 addedAt;          // block timestamp when added
-    uint256 effectiveAt;      // addedAt + compliance window (0 for emergency adds)
+    uint256 effectiveAt;      // addedAt + grace = slashability threshold (grace = complianceWindow for
+                              // governance entries, 2h for emergency); see § Compliance Window
     string  region;           // ISO 3166-1 alpha-2, or "" for global
     string  reason;           // free-form, e.g. "DMCA-2026-001", "CSAM", "DSA-DE-001"
     bool    emergency;        // true if added via emergency multisig path
@@ -311,11 +318,13 @@ If `removeHash` or `removeHashRegional` fires while an appeal is open against th
 
 ## Compliance Window
 
-| Path | Compliance window |
+| Path | Grace (`addedAt` → `effectiveAt`) |
 |------|-------------------|
-| Standard governance vote (global) | 24 hours after `effectiveAt` |
-| Regional governance body | 24 hours after `effectiveAt` |
-| Emergency multisig add | `effectiveAt = addedAt` — slash applies after 2 hours |
+| Standard governance vote (global) | `complianceWindow` (default 24 hours) |
+| Regional governance body | `complianceWindow` (default 24 hours) |
+| Emergency multisig add | 2 hours (fixed) |
+
+`effectiveAt = addedAt + grace` is the **slashability threshold**: serving the hash after `effectiveAt` is the slashable offense, and `SlashJudge` admits delivery evidence only once `delivery_timestamp > effectiveAt`. A node's eviction obligation, by contrast, begins immediately at `addedAt` — the `isBlacklisted` / `isBlacklistedInRegion` views return `true` as soon as the entry exists (and is not suspended/expired) and do **not** gate on `effectiveAt`; the grace only bounds when continued non-compliance becomes slashable.
 
 The 24-hour window accounts for nodes that are offline or have a long poll interval. The 2-hour emergency window is tight enough to matter for active illegal content while giving online nodes time to act. The emergency multisig path is subject to a 12-month sunset (`blacklistDeadline = deployTimestamp + 365 days`) — see [ADR 009](009-governance.md#emergency-multisig).
 
