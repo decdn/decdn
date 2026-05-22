@@ -19,11 +19,10 @@ use iroh::endpoint::{IdleTimeout, QuicTransportConfig, VarInt, presets};
 use iroh::protocol::Router;
 use iroh::{Endpoint, SecretKey};
 use iroh_gossip::ALPN as GOSSIP_ALPN;
-use iroh_gossip::net::Gossip;
 use tokio::sync::{RwLock, oneshot};
 use tokio::task::JoinSet;
 
-use decdn_gossip::{GossipMetrics, GossipRuntimeConfig, GossipService, PeerTable};
+use decdn_gossip::{GossipMetrics, GossipRuntimeConfig, GossipService, PeerTable, build_gossip};
 
 use crate::admin;
 use crate::channel_store::PersistentChannelStateStore;
@@ -268,7 +267,13 @@ pub async fn run(
         .register_iroh_endpoint(&ep)
         .context("failed to register iroh metrics")?;
 
-    let gossip = Gossip::builder().spawn(ep.clone());
+    // Pin iroh-gossip's per-actor frame ceiling to a deCDN-controlled
+    // value (ADR 013 §Gossip Framing, #660). `read_lp` enforces this
+    // cap before allocating the inbound `BytesMut`, bounding per-peer
+    // DoS exposure. Constructed via `build_gossip` so a regression
+    // that drops the cap fails the gossip-crate test that exercises
+    // the same helper.
+    let gossip = build_gossip(ep.clone());
 
     let limiter = Arc::new(ConnectionLimiter::new(
         &cfg.security,

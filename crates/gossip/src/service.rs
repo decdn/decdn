@@ -133,6 +133,23 @@ pub enum GossipSpawnError {
     },
 }
 
+/// Construct the per-node iroh-gossip actor with the deCDN frame
+/// ceiling ([`crate::GOSSIP_MAX_FRAME`]) wired through
+/// `iroh_gossip::net::Gossip::builder().max_message_size(...)` (ADR
+/// 013 §Gossip Framing, #660). Pinning the cap here — rather than
+/// inline at every call site — gives the regression test in this
+/// module a single seam to assert against, so deleting the
+/// `.max_message_size(...)` step fails the test loudly instead of
+/// silently reverting to the iroh-gossip upstream default
+/// (`iroh_gossip::proto::DEFAULT_MAX_MESSAGE_SIZE`, 4 KiB in iroh-
+/// gossip 0.98 — below our `MAX_TRAILING_BYTES + envelope + wrappers`
+/// floor).
+pub fn build_gossip(endpoint: Endpoint) -> Gossip {
+    Gossip::builder()
+        .max_message_size(crate::GOSSIP_MAX_FRAME)
+        .spawn(endpoint)
+}
+
 /// Returned by [`GossipService::spawn`]: the spawned task handles plus an
 /// optional [`AnnounceTrigger`] for the publisher task. The trigger is
 /// `None` when the publisher is disabled (no region configured) — see
@@ -793,5 +810,53 @@ mod tests {
             second.is_err(),
             "second notified() must NOT resolve — three calls coalesce to one permit"
         );
+    }
+
+    /// #660 — exercises [`build_gossip`], the single seam every
+    /// production-mode caller uses to construct an iroh-gossip actor,
+    /// and asserts the resulting `Gossip` reports the deCDN-controlled
+    /// [`GOSSIP_MAX_FRAME`] through `Gossip::max_message_size()`. The
+    /// runtime calls the same helper (`crates/node/src/runtime/mod.rs`),
+    /// so a regression that drops `.max_message_size(...)` from the
+    /// helper fails this test rather than silently reverting to
+    /// `iroh_gossip::proto::DEFAULT_MAX_MESSAGE_SIZE` (below our
+    /// `MAX_TRAILING_BYTES + envelope + wrappers` floor).
+    ///
+    /// Also pins both iroh-gossip 0.98 API surfaces this PR depends on
+    /// (`Builder::max_message_size` setter and `Gossip::max_message_size`
+    /// accessor) at compile/run time — an upstream rename or removal
+    /// fails compilation here. A full multi-node behavioral test of
+    /// `read_lp` rejecting an oversized frame is intentionally out of
+    /// scope: iroh-gossip 0.98 exposes no in-process seam for that
+    /// path (the `net::util` module is `pub(crate)`), so it requires
+    /// the two-`Gossip`-instance harness deferred alongside other
+    /// integration tests. The compile-time `const _: () = assert!`
+    /// in `validation.rs` already enforces the floor invariant.
+    #[tokio::test]
+    async fn build_gossip_wires_gossip_max_frame() {
+        use iroh::Endpoint;
+        use iroh::endpoint::presets;
+        use iroh_gossip::proto::MIN_MAX_MESSAGE_SIZE;
+
+        let ep = Endpoint::builder(presets::Minimal)
+            .bind()
+            .await
+            .expect("bind minimal endpoint");
+        let gossip = build_gossip(ep);
+
+        assert_eq!(
+            gossip.max_message_size(),
+            crate::GOSSIP_MAX_FRAME,
+            "build_gossip must thread GOSSIP_MAX_FRAME into iroh-gossip's builder"
+        );
+
+        // Compile-time sanity: above iroh-gossip's panic floor and
+        // strictly below the 16 MiB mental model PR #659 mistakenly
+        // anchored on (deCDN's `MAX_MESSAGE_SIZE`, which applies to
+        // `cdn/probe/v1` / `cdn/client/v1` — *not* gossip).
+        const {
+            assert!(crate::GOSSIP_MAX_FRAME >= MIN_MAX_MESSAGE_SIZE);
+            assert!(crate::GOSSIP_MAX_FRAME < 16 * 1024 * 1024);
+        }
     }
 }
