@@ -81,17 +81,19 @@ impl NegativeProbeCache {
     }
 
     /// Build with a custom capacity (TTL stays at the spec default).
-    /// `cap == 0` is clamped to 1.
+    /// `cap == 0` is clamped to 1. Test-only — only the unit tests
+    /// below need to override capacity.
+    #[cfg(test)]
     #[must_use]
-    pub fn with_capacity(cap: usize) -> Self {
+    fn with_capacity(cap: usize) -> Self {
         Self::with_capacity_and_ttl(cap, DEFAULT_TTL)
     }
 
-    /// Build with a custom capacity and TTL. Test-only convenience
-    /// to allow sub-second TTL expiry checks; production callers use
-    /// [`Self::new`].
+    /// Build with a custom capacity and TTL. Module-private: only
+    /// the unit tests below need sub-second TTL expiry; production
+    /// callers use [`Self::new`].
     #[must_use]
-    pub fn with_capacity_and_ttl(cap: usize, ttl: Duration) -> Self {
+    fn with_capacity_and_ttl(cap: usize, ttl: Duration) -> Self {
         let cap = cap.max(1);
         Self {
             inner: Mutex::new(Inner {

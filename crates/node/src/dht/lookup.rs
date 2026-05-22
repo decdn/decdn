@@ -218,6 +218,9 @@ fn process_response(
     let kept_providers = filter_negative_cache(kept_providers, &ctx.target, ctx.negative_cache);
 
     for p in kept_providers {
+        if p == ctx.requester_id {
+            continue;
+        }
         state.record_provider(p);
     }
     let mut observed_closer = false;
@@ -347,10 +350,13 @@ impl LookupState {
     /// in a candidate strictly closer than the current best queried
     /// distance (the convergence-tracking signal).
     fn add_candidate(&mut self, peer: NodeId) -> bool {
-        if self.queried.contains(&peer) || self.candidates.values().any(|v| v == &peer) {
+        let dist = xor_distance(&peer, &self.target);
+        // XOR distance is bijective for a fixed target, so
+        // `contains_key(&dist)` is equivalent to scanning values for
+        // `peer` — but O(log N) instead of O(N).
+        if self.queried.contains(&peer) || self.candidates.contains_key(&dist) {
             return false;
         }
-        let dist = xor_distance(&peer, &self.target);
         let strictly_closer = dist < self.best_queried_distance;
         self.candidates.insert(dist, peer);
         strictly_closer
