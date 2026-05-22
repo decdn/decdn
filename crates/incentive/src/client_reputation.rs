@@ -9,10 +9,14 @@
 //!
 //! Each [`ClientReputationLedger::record_voucher_received`] /
 //! [`ClientReputationLedger::record_voucher_withheld`] call folds a sample
-//! into a per-client EWMA in `[0.0, 1.0]`. The fold rule matches the
-//! per-peer scoring in [`crates/reputation/src/local.rs`](../../../crates/reputation/src/local.rs)
-//! (ADR 008 §3 default α = 0.1) — same math, simpler outcomes (signed = 1.0,
-//! withheld = 0.0).
+//! into a per-client EWMA in `[0.0, 1.0]`. The EWMA core matches the
+//! per-peer scoring in the sibling `decdn-reputation` crate's local
+//! module at default settings (ADR 008 §Local Score Calculation,
+//! α = 0.1) — both implement `next = (1 - α) · prev + α · sample`
+//! followed by a `clamp(0.0, 1.0)`. This ledger omits the configurable
+//! `max_delta_per_update` cap that the sibling crate carries, because
+//! the only samples here are exactly `0.0` and `1.0` and the
+//! single-event cap that knob exists to enforce is already structural.
 //!
 //! [`ClientReputationLedger::admit`] maps the score to one of three tiers
 //! per the ADR framing:
@@ -83,14 +87,21 @@ pub enum ConfigError {
         "alpha must be strictly greater than 0.0; a zero alpha freezes the EWMA at initial_score"
     )]
     AlphaCannotBeZero,
+    /// One of the byte-cap knobs was `0`. `AcceptCapped { byte_cap: 0 }`
+    /// is functionally `Reject` — the borderline tier silently
+    /// collapses. Caps must be strictly positive.
+    #[error("{field} must be strictly greater than 0; a zero cap is functionally a reject")]
+    ZeroCap {
+        /// The offending field name.
+        field: &'static str,
+    },
 }
 
 /// Per-client reputation snapshot. One entry per `channel.client` address.
 ///
-/// `last_seen_us` records the most recent observation in Unix microseconds;
-/// `0` denotes "never observed" (e.g., an instance produced by
-/// [`ClientReputation::default`]). `event_count` and `total_bytes_delivered`
-/// saturate at `u64::MAX`.
+/// `event_count == 0` is the canonical "never observed" sentinel — see the
+/// field doc and [`ClientReputationLedger::admit`]. `event_count` and
+/// `total_bytes_delivered` saturate at `u64::MAX`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ClientReputation {
     /// EWMA in `[0.0, 1.0]`. `1.0` = always signs; `0.0` = always withholds.
@@ -101,16 +112,16 @@ pub struct ClientReputation {
     /// Tracked for operator observability; the EWMA is per-event, not
     /// per-byte, by design — see module docs.
     pub total_bytes_delivered: u64,
-    /// Unix-microseconds of the most recent update. `0` indicates either
-    /// "never observed" (e.g., a default-constructed entry, or a row
-    /// hydrated from persistence that pre-dated time tracking) *or* a
-    /// system whose clock was behind the UNIX epoch at the time of the
-    /// most recent update — the internal time helper saturates to `0`
-    /// in that case, indistinguishably. Operators relying on this field
-    /// for liveness should treat `0` as "no observation in the post-epoch
-    /// era". To distinguish "unobserved" from "observed but timestamp
-    /// lost" prefer [`ClientReputation::event_count`] — that field is
-    /// `0` only for truly never-observed entries.
+    /// Unix-microseconds of the most recent update; use
+    /// [`ClientReputation::event_count`] (not this field) as the
+    /// unambiguous "never observed" signal — `event_count == 0` is the
+    /// canonical sentinel and is what [`ClientReputationLedger::admit`]
+    /// keys off. This field is `0` in three otherwise-distinct cases:
+    /// (a) never observed, (b) the system clock was behind the UNIX
+    /// epoch at the most recent update (the time helper saturates to
+    /// `0`), or (c) — far enough in the future — overflow saturation to
+    /// `u64::MAX`. Operators relying on this as a liveness signal should
+    /// treat it as "no observation in the post-epoch era".
     pub last_seen_us: u64,
 }
 
@@ -126,7 +137,15 @@ impl Default for ClientReputation {
 }
 
 /// Admission decision for one client encounter.
+///
+/// `#[must_use]` because dropping the value silently discards the
+/// `AcceptCapped` byte cap — a pattern like
+/// `Admission::Accept | Admission::AcceptCapped { .. } => serve(req)`
+/// would compile cleanly while stripping the deterrent the ledger exists
+/// to produce. Callers must explicitly destructure the variant and
+/// enforce the cap they receive.
 #[non_exhaustive]
+#[must_use = "Admission carries an enforcement contract — destructure and act on the byte_cap"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Admission {
     /// Full service.
@@ -219,9 +238,13 @@ impl ClientReputationLedger {
     /// specific tier boundaries).
     ///
     /// Entries whose `completion_ratio` is non-finite or outside
-    /// `[0.0, 1.0]` are silently skipped — a single corrupt row should
-    /// not prevent the ledger from coming up. Per ADR 003 the deterrent is
+    /// `[0.0, 1.0]` are skipped — a single corrupt row should not
+    /// prevent the ledger from coming up. Per ADR 003 the deterrent is
     /// statistical, not cryptographic, so partial loss is tolerable.
+    /// Each skipped row emits a `tracing::warn!` with the affected
+    /// address and the offending value; a `tracing::info!` summarises
+    /// the load with loaded / skipped counts so operators have visibility
+    /// into hydration integrity instead of silent data loss.
     ///
     /// # Errors
     ///
@@ -231,19 +254,30 @@ impl ClientReputationLedger {
         config: ClientReputationConfig,
         entries: impl IntoIterator<Item = (Address, ClientReputation)>,
     ) -> Result<Self, ConfigError> {
-        let ledger = Self::new(config)?;
-        // Brand-new lock owned by `ledger`; no poison recovery needed.
-        let mut guard = ledger
-            .state
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        validate(&config)?;
+        let mut map = HashMap::new();
+        let mut skipped: u64 = 0;
         for (addr, rep) in entries {
             if rep.completion_ratio.is_finite() && (0.0..=1.0).contains(&rep.completion_ratio) {
-                guard.insert(addr, rep);
+                map.insert(addr, rep);
+            } else {
+                skipped = skipped.saturating_add(1);
+                tracing::warn!(
+                    %addr,
+                    completion_ratio = rep.completion_ratio,
+                    "client_reputation: skipping invalid hydrated row",
+                );
             }
         }
-        drop(guard);
-        Ok(ledger)
+        tracing::info!(
+            loaded = map.len(),
+            skipped,
+            "client_reputation: hydration complete",
+        );
+        Ok(Self {
+            config,
+            state: RwLock::new(map),
+        })
     }
 
     /// Fold a "stream completed, voucher received" event into `client`'s
@@ -264,33 +298,32 @@ impl ClientReputationLedger {
         self.fold_event(client, 0.0, bytes_delivered)
     }
 
-    /// Decide whether to admit `client`. Maps the per-client EWMA to one of
-    /// [`Admission::Accept`], [`Admission::AcceptCapped`], or
-    /// [`Admission::Reject`] per the ADR 003 three-tier framing. An
-    /// unseen client (no map entry, *or* a hydrated/default-constructed
-    /// entry with `event_count == 0`) yields [`Admission::AcceptCapped`]
-    /// with [`ClientReputationConfig::new_client_cap_bytes`] — so a
-    /// snapshot round-trip of an empty row is admission-equivalent to a
-    /// never-recorded client.
+    /// Decide whether to admit `client`. Maps the per-client EWMA to one
+    /// of [`Admission::Accept`], [`Admission::AcceptCapped`], or
+    /// [`Admission::Reject`] per the ADR 003 three-tier framing.
+    ///
+    /// "Unseen" is defined as either no map entry, *or* an entry with
+    /// `event_count == 0` (i.e., a hydrated or default-constructed row
+    /// that carries no real signal — its `completion_ratio` is just the
+    /// default the persistence/struct-literal path put there). Both
+    /// resolve to [`Admission::AcceptCapped`] with
+    /// [`ClientReputationConfig::new_client_cap_bytes`], so a snapshot
+    /// round-trip of an empty row is admission-equivalent to a
+    /// never-recorded client and persistence layers don't have to
+    /// distinguish the two states.
     pub fn admit(&self, client: Address) -> Admission {
-        // Poison recovery: read-only path; cannot itself corrupt state.
         let guard = self
             .state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(rep) = guard.get(&client) else {
-            return Admission::AcceptCapped {
-                byte_cap: self.config.new_client_cap_bytes,
-            };
+        let unseen = Admission::AcceptCapped {
+            byte_cap: self.config.new_client_cap_bytes,
         };
-        // A row with `event_count == 0` carries no real signal — its
-        // `completion_ratio` is whatever the persistence/default path put
-        // there. Treat it as unseen so persistence layers don't have to
-        // distinguish "never inserted" from "default row".
+        let Some(rep) = guard.get(&client) else {
+            return unseen;
+        };
         if rep.event_count == 0 {
-            return Admission::AcceptCapped {
-                byte_cap: self.config.new_client_cap_bytes,
-            };
+            return unseen;
         }
         if rep.completion_ratio >= self.config.accept_threshold {
             Admission::Accept
@@ -368,10 +401,6 @@ fn unix_micros() -> u64 {
 
 fn validate(c: &ClientReputationConfig) -> Result<(), ConfigError> {
     require_unit_interval(c.alpha, "alpha")?;
-    // Tighter alpha bound: `(0.0, 1.0]`. A zero alpha leaves the EWMA
-    // frozen at `initial_score` for every future event, silently
-    // disabling the ledger. Docs document this as `(0.0, 1.0]`; enforce
-    // it here.
     if c.alpha == 0.0 {
         return Err(ConfigError::AlphaCannotBeZero);
     }
@@ -382,6 +411,16 @@ fn validate(c: &ClientReputationConfig) -> Result<(), ConfigError> {
         return Err(ConfigError::ThresholdOrdering {
             reject: c.reject_threshold,
             accept: c.accept_threshold,
+        });
+    }
+    if c.new_client_cap_bytes == 0 {
+        return Err(ConfigError::ZeroCap {
+            field: "new_client_cap_bytes",
+        });
+    }
+    if c.borderline_cap_bytes == 0 {
+        return Err(ConfigError::ZeroCap {
+            field: "borderline_cap_bytes",
         });
     }
     Ok(())
@@ -476,7 +515,19 @@ impl ClientReputationStore for MemoryClientReputationStore {
             .inner
             .lock()
             .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
-        Ok(guard.iter().map(|(k, v)| (*k, *v)).collect())
+        // Match the trait's SHOULD-skip contract: drop rows whose
+        // `completion_ratio` is non-finite or outside `[0.0, 1.0]`. In
+        // the memory impl this is mostly defensive (the only writer is
+        // `record`), but matching the contract here keeps the reference
+        // impl self-consistent — future redb impl reviewers see the
+        // shape they're meant to mirror.
+        Ok(guard
+            .iter()
+            .filter(|(_, rep)| {
+                rep.completion_ratio.is_finite() && (0.0..=1.0).contains(&rep.completion_ratio)
+            })
+            .map(|(k, v)| (*k, *v))
+            .collect())
     }
 
     fn record(&self, client: Address, state: &ClientReputation) -> Result<(), StoreError> {
@@ -904,9 +955,17 @@ mod tests {
 
     #[test]
     fn concurrent_record_does_not_lose_updates() -> anyhow::Result<()> {
-        // Eight threads each fold 1000 withhold events. EWMA decays as
-        // 0.5 * 0.9^n; after 8000 withholds the score is well below 1e-100.
-        // Any non-trivial final score would indicate a torn read-modify-write.
+        // Eight threads each fold 1000 withhold events. The load-bearing
+        // assertion is `event_count == 8_000`: under a torn
+        // read-modify-write `saturating_add` would skip increments and
+        // the count would drift below 8000 — that's the strict invariant
+        // a lost update breaks. The EWMA-decay check (`score < 1e-4`)
+        // is a softer secondary signal: 0.5 * 0.9^8000 ≈ 10^-366 is so
+        // steep that a partial torn write (e.g. one missed event in
+        // 8000) would still saturate `score` to ~10^-365, easily under
+        // 1e-4 — so on its own it would fail to detect anything but a
+        // catastrophic loss. Keep both; the count is what actually
+        // catches races.
         let l = Arc::new(ledger()?);
         let mut handles = Vec::new();
         for _ in 0..8 {
@@ -922,16 +981,214 @@ mod tests {
             h.join()
                 .map_err(|_| anyhow::anyhow!("worker thread panicked"))?;
         }
-        let s = l.score(client_a()).context("client missing")?;
+        // Headline: every increment must land.
+        let entry = l.entry(client_a()).context("client missing")?;
+        ensure!(
+            entry.event_count == 8_000,
+            "lost update: event_count = {} (expected 8000)",
+            entry.event_count
+        );
+        // Sanity: score in range and EWMA reached the expected decay regime.
+        let s = entry.completion_ratio;
         ensure!((0.0..=1.0).contains(&s), "score out of range: {s}");
-        ensure!(s < 1e-4, "expected near-zero score, got {s}");
-        let snap = l.snapshot();
-        ensure!(snap.len() == 1, "expected one entry, got {}", snap.len());
-        let entry = snap
-            .first()
-            .map(|(_, rep)| *rep)
-            .context("snapshot empty")?;
-        ensure!(entry.event_count == 8_000, "got {}", entry.event_count);
+        ensure!(s < 1e-4, "EWMA failed to converge: {s}");
+        ensure!(
+            l.snapshot().len() == 1,
+            "expected one entry, got {}",
+            l.snapshot().len()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn alpha_one_replaces_score_with_sample() -> anyhow::Result<()> {
+        // alpha = 1.0 collapses the fold to next = sample. A refactor
+        // that re-introduced any inertia (e.g. `(1.0 - alpha).max(eps)`)
+        // would silently break this boundary; pin it explicitly.
+        let cfg = ClientReputationConfig {
+            alpha: 1.0,
+            ..ClientReputationConfig::default()
+        };
+        let l = ClientReputationLedger::new(cfg)?;
+        ensure!(approx(l.record_voucher_received(client_a(), 0), 1.0));
+        ensure!(approx(l.record_voucher_withheld(client_a(), 0), 0.0));
+        ensure!(approx(l.record_voucher_received(client_a(), 0), 1.0));
+        Ok(())
+    }
+
+    #[test]
+    fn accept_threshold_one_is_valid_config() -> anyhow::Result<()> {
+        // `require_unit_interval` admits 1.0; the resulting config makes
+        // Accept reachable only at score == 1.0. Verify the boundary
+        // config constructs cleanly.
+        let cfg = ClientReputationConfig {
+            accept_threshold: 1.0,
+            reject_threshold: 0.999,
+            ..ClientReputationConfig::default()
+        };
+        ClientReputationLedger::new(cfg)?;
+        Ok(())
+    }
+
+    #[test]
+    fn zero_cap_config_rejected() {
+        let bad = ClientReputationConfig {
+            new_client_cap_bytes: 0,
+            ..ClientReputationConfig::default()
+        };
+        assert!(matches!(
+            ClientReputationLedger::new(bad),
+            Err(ConfigError::ZeroCap {
+                field: "new_client_cap_bytes"
+            })
+        ));
+
+        let bad = ClientReputationConfig {
+            borderline_cap_bytes: 0,
+            ..ClientReputationConfig::default()
+        };
+        assert!(matches!(
+            ClientReputationLedger::new(bad),
+            Err(ConfigError::ZeroCap {
+                field: "borderline_cap_bytes"
+            })
+        ));
+    }
+
+    #[test]
+    fn from_snapshot_skips_infinity_and_negative_completion_ratio() -> anyhow::Result<()> {
+        // Extend the corruption-skip coverage beyond NaN and 2.0:
+        // INFINITY, NEG_INFINITY, and a strictly-negative value should
+        // all be dropped by the same `is_finite() && in [0,1]` predicate.
+        let inf = address!("0000000000000000000000000000000000000010");
+        let neg_inf = address!("0000000000000000000000000000000000000011");
+        let negative = address!("0000000000000000000000000000000000000012");
+        let neg_zero = address!("0000000000000000000000000000000000000013");
+        let entries = [
+            (
+                inf,
+                ClientReputation {
+                    completion_ratio: f64::INFINITY,
+                    ..ClientReputation::default()
+                },
+            ),
+            (
+                neg_inf,
+                ClientReputation {
+                    completion_ratio: f64::NEG_INFINITY,
+                    ..ClientReputation::default()
+                },
+            ),
+            (
+                negative,
+                ClientReputation {
+                    completion_ratio: -0.1,
+                    ..ClientReputation::default()
+                },
+            ),
+            (
+                // `-0.0` is finite and `(0.0..=1.0).contains(&-0.0) == true`
+                // (negative zero compares equal to positive zero), so it
+                // should NOT be skipped — pinned here so a future
+                // predicate change doesn't quietly start filtering it.
+                neg_zero,
+                ClientReputation {
+                    completion_ratio: -0.0,
+                    event_count: 1,
+                    ..ClientReputation::default()
+                },
+            ),
+        ];
+        let l = ClientReputationLedger::from_snapshot(
+            ClientReputationConfig::default(),
+            entries.iter().copied(),
+        )?;
+        ensure!(l.score(inf).is_none(), "INFINITY leaked through");
+        ensure!(l.score(neg_inf).is_none(), "NEG_INFINITY leaked through");
+        ensure!(l.score(negative).is_none(), "-0.1 leaked through");
+        ensure!(l.score(neg_zero).is_some(), "-0.0 should NOT be skipped");
+        Ok(())
+    }
+
+    #[test]
+    fn from_snapshot_empty_iterator_yields_empty_ledger() -> anyhow::Result<()> {
+        // First-boot / empty-store path. Trivial structurally, but the
+        // realistic case for any fresh node coming up.
+        let l = ClientReputationLedger::from_snapshot(
+            ClientReputationConfig::default(),
+            std::iter::empty(),
+        )?;
+        ensure!(l.snapshot().is_empty());
+        ensure!(l.score(client_a()).is_none());
+        // And the unseen-admission shape still holds.
+        ensure!(matches!(
+            l.admit(client_a()),
+            Admission::AcceptCapped { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn counters_saturate_instead_of_wrapping() -> anyhow::Result<()> {
+        // Seed an entry one short of `u64::MAX` on both saturating
+        // counters; record a single event; confirm both saturate to
+        // `u64::MAX` without wrapping. Without `saturating_add` a wrap
+        // here would produce `0`, breaking every counter-derived
+        // operator metric forever.
+        let near_max = u64::MAX - 1;
+        let entries = [(
+            client_a(),
+            ClientReputation {
+                completion_ratio: 0.5,
+                event_count: near_max,
+                total_bytes_delivered: near_max,
+                last_seen_us: 1,
+            },
+        )];
+        let l = ClientReputationLedger::from_snapshot(
+            ClientReputationConfig::default(),
+            entries.iter().copied(),
+        )?;
+        // One event pushes to MAX; a second proves the saturation holds.
+        l.record_voucher_received(client_a(), 2);
+        l.record_voucher_received(client_a(), 2);
+        let e = l.entry(client_a()).context("entry missing")?;
+        ensure!(e.event_count == u64::MAX, "got {}", e.event_count);
+        ensure!(
+            e.total_bytes_delivered == u64::MAX,
+            "got {}",
+            e.total_bytes_delivered
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn memory_store_load_all_filters_invalid_rows() -> anyhow::Result<()> {
+        // The trait doc says load_all SHOULD skip logically-invalid rows
+        // — the memory impl must honour that contract so the reference
+        // impl matches the shape the redb impl will mirror.
+        let s = MemoryClientReputationStore::new();
+        let bad = ClientReputation {
+            completion_ratio: f64::NAN,
+            event_count: 1,
+            total_bytes_delivered: 1,
+            last_seen_us: 1,
+        };
+        let good = ClientReputation {
+            completion_ratio: 0.7,
+            event_count: 1,
+            total_bytes_delivered: 1,
+            last_seen_us: 1,
+        };
+        s.record(client_a(), &bad)?;
+        s.record(client_b(), &good)?;
+        let loaded = s.load_all()?;
+        ensure!(
+            loaded.len() == 1,
+            "expected 1 row loaded, got {}",
+            loaded.len()
+        );
+        ensure!(loaded.first().context("empty")?.0 == client_b());
         Ok(())
     }
 }
