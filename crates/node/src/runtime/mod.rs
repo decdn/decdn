@@ -27,7 +27,7 @@ use decdn_gossip::{GossipMetrics, GossipRuntimeConfig, GossipService, PeerTable,
 use crate::admin;
 use crate::channel_store::PersistentChannelStateStore;
 use crate::dht::{
-    ConfigStakerSet, DhtRateLimiter, RecordStore, RecordStoreConfig, StakerSet,
+    ChainStakerSet, DhtRateLimiter, RecordStore, RecordStoreConfig, StakerSet,
     rate_limit::DhtRateLimitConfig,
 };
 use crate::dispatch::ConnectionLimiter;
@@ -35,6 +35,8 @@ use crate::handlers::dht::DhtHandler;
 use crate::handlers::limited::LimitedHandler;
 use crate::handlers::probe::ProbeHandler;
 use crate::metrics;
+use alloy::primitives::Address;
+use alloy::providers::ProviderBuilder;
 use alloy::signers::local::PrivateKeySigner;
 use decdn_common::config::ResolvedConfig;
 use decdn_common::identity;
@@ -429,19 +431,34 @@ pub async fn run(
     let record_store = Arc::new(std::sync::Mutex::new(RecordStore::new(
         RecordStoreConfig::default(),
     )));
-    // Active-staker set. Wired as an empty `ConfigStakerSet` until the
-    // chain-backed `ChainStakerSet` (reads `StakingRegistry.getActiveNodes()`
-    // and subscribes to `Staked`/`Unstaked`) lands with PR 4 of #320 — at
-    // which point the runtime swaps the construction here without
-    // touching the handler, which holds the trait object. Until then
-    // every inbound `cdn/dht/v1` `Store` is rejected with
-    // `accepted: false` per ADR 022 line 140; the cache → DHT republish
-    // hook exposed in this PR has no producer yet (PR 4 brings the
-    // scheduler), so no publisher-side traffic is gated either.
-    let staker_set: Arc<dyn StakerSet> = Arc::new(ConfigStakerSet::empty());
-    tracing::warn!(
-        "dht active-staker set is empty; every cdn/dht/v1 `Store` will be \
-         rejected (ADR 022 line 140). Chain-backed StakerSet lands with PR 4 of #320."
+    // Chain-backed active-staker set. Bootstrap failure is fatal: an
+    // empty set silently rejects every inbound `Store`, and once the
+    // iterative `FindValue` lookup filter exists it would drop every
+    // responder.
+    let rpc_url: alloy::transports::http::reqwest::Url =
+        cfg.blockchain.rpc_url.parse().with_context(|| {
+            format!(
+                "blockchain.rpc_url {:?} is not a valid URL",
+                cfg.blockchain.rpc_url
+            )
+        })?;
+    let staking_registry_addr: Address = cfg
+        .blockchain
+        .staking_registry_address
+        .parse()
+        .with_context(|| {
+            format!(
+                "blockchain.staking_registry_address {:?} is not a valid address",
+                cfg.blockchain.staking_registry_address
+            )
+        })?;
+    let chain_provider = ProviderBuilder::new().connect_http(rpc_url);
+    let staker_set: Arc<dyn StakerSet> = Arc::new(
+        ChainStakerSet::bootstrap(chain_provider, staking_registry_addr)
+            .await
+            .with_context(|| {
+                format!("ChainStakerSet bootstrap from StakingRegistry at {staking_registry_addr}")
+            })?,
     );
     let dht_handler = Arc::new(DhtHandler::new(
         secret_key.public(),
@@ -452,6 +469,11 @@ pub async fn run(
         Arc::clone(&record_store),
     ));
 
+    // The DHT handler builds its own routing table internally; grab a
+    // shared handle so the bootstrap path + republish + bucket-refresh
+    // tasks can all operate on the same instance.
+    let dht_routing = dht_handler.routing_table();
+
     let router = Router::builder(ep.clone())
         .accept(ProbeHandler::ALPN, probe_handler)
         .accept(DhtHandler::ALPN, dht_handler)
@@ -460,6 +482,21 @@ pub async fn run(
             LimitedHandler::new(gossip.clone(), Arc::clone(&limiter)),
         )
         .spawn();
+
+    // Bootstrap (ADR 022 §Bootstrap): seed the routing table from the
+    // active-staker set + parallel `FindNode(self.node_id)` against a
+    // fan-out of seeds. Best-effort — failures here log but don't
+    // abort startup.
+    let bootstrap_outcome =
+        crate::dht::bootstrap::bootstrap(&ep, secret_key.public(), &dht_routing, &staker_set).await;
+    tracing::info!(
+        seeds = bootstrap_outcome.seeds_seen,
+        inserted = bootstrap_outcome.seeds_inserted,
+        find_node_ok = bootstrap_outcome.find_node_ok,
+        find_node_err = bootstrap_outcome.find_node_err,
+        closer_added = bootstrap_outcome.closer_peers_inserted,
+        "dht bootstrap complete"
+    );
 
     let metrics_addr = std::net::SocketAddr::new(
         cfg.observability.metrics_bind,
@@ -506,6 +543,47 @@ pub async fn run(
         Arc::clone(&record_store),
         record_store_gc_stop_rx,
         DISPATCH_GC_INTERVAL,
+    ));
+
+    // DHT republish scheduler (ADR 022 §STORE Flow). The subscribe
+    // handle is taken before the cold-start seed so a commit racing
+    // with seed-time lands in the channel backlog rather than the
+    // gap between the snapshot and the spawn.
+    let republish_scheduler = Arc::new(crate::dht::RepublishScheduler::new());
+    let (republish_stop_tx, republish_stop_rx) = oneshot::channel::<()>();
+    let cache_inserts_rx = cache.subscribe_inserts();
+    let cold_start_count = republish_scheduler.seed_cold_start(
+        cache
+            .access_times_snapshot()
+            .into_keys()
+            .map(|h| *h.as_bytes()),
+    );
+    tracing::info!(
+        cold_start_count,
+        "republish scheduler seeded from existing cache (ADR 022 §Bootstrap cold-start)"
+    );
+    tasks.spawn(crate::dht::publish::run_republish(
+        ep.clone(),
+        secret_key.public(),
+        Arc::clone(&dht_routing),
+        Arc::clone(&republish_scheduler),
+        cache.clone(),
+        cache_inserts_rx,
+        republish_stop_rx,
+    ));
+
+    // DHT bucket-refresh (ADR 022 §Routing Table). Once per hour
+    // picks the bucket with the oldest last-refresh timestamp and
+    // runs `FindNode(random_id_in_bucket)` against the bucket's
+    // freshest peer to repopulate it. Best-effort hygiene — a failed
+    // refresh is silently retried on the next tick.
+    let (bucket_refresh_stop_tx, bucket_refresh_stop_rx) = oneshot::channel::<()>();
+    tasks.spawn(crate::dht::bucket_refresh::run_bucket_refresh(
+        ep.clone(),
+        secret_key.public(),
+        Arc::clone(&dht_routing),
+        bucket_refresh_stop_rx,
+        crate::dht::bucket_refresh::BUCKET_REFRESH_TICK,
     ));
 
     // RPC connectivity watchdog (issue #283). Updates `decdn_rpc_healthy`
@@ -720,6 +798,8 @@ pub async fn run(
     // operator-actionable signal to log at this seam.
     let _ = dispatch_gc_stop_tx.send(());
     let _ = record_store_gc_stop_tx.send(());
+    let _ = republish_stop_tx.send(());
+    let _ = bucket_refresh_stop_tx.send(());
     // Admin server shutdown is ordered per `admin_stop_order`:
     //
     //   - `Early` (the default, including SIGTERM/SIGINT and plain

@@ -2646,6 +2646,7 @@ dependencies = [
  "decdn-protocol",
  "decdn-reputation",
  "dirs",
+ "futures-util",
  "governor",
  "http-body-util",
  "hyper 1.9.0",
