@@ -724,7 +724,7 @@ EVM has no native ed25519 precompile, and the RIP-7212 proposal is not yet deplo
 
 ##### Reclaim flow
 
-If a NodeId was squatted (e.g., during a transition period or via a contract bug), the legitimate ed25519 key holder calls `reclaimNodeId(nodeId, ed25519Signature)`. This verifies the ed25519 signature over `keccak256(abi.encodePacked(nodeId, msg.sender, block.chainid, registrationNonce[nodeId]))`, forcibly deregisters the current holder (triggering their unbonding period and incrementing `registrationNonce`), clears the NodeId-to-address mappings, and emits `NodeIdReclaimed`. The caller can then call `registerNode` under their own address. Reclaim does not require the caller to have stake — it only proves ed25519 key ownership and clears the squatter's binding. `reclaimNodeId` is the sole reclaim mechanism: there is no admin override. Reclaim authority is gated entirely by ed25519 wire-key ownership (the iroh NodeId private key), distinct from the secp256k1 on-chain signatures used for slash evidence ([ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)) and EIP-712 NodeId↔Ethereum binding ([§ NodeId-to-Ethereum Binding](#nodeid-to-ethereum-binding)).
+If a NodeId was squatted (e.g., during a transition period or via a contract bug), the legitimate ed25519 key holder calls `reclaimNodeId(nodeId, ed25519Signature)`. This verifies the ed25519 signature over `keccak256(abi.encodePacked(nodeId, msg.sender, block.chainid, registrationNonce[nodeId]))`, deactivates the current holder's node if the reclaimed NodeId was its bound id (clearing the active flag and removing it from the active set — stake is left bonded and slashable, exactly as `deregisterNode`; the holder exits stake separately via `requestUnstake`), clears the NodeId↔address mappings (and zeroes the holder's now-stale `NodeInfo.nodeId` so the read views stay consistent with the cleared binding), increments `registrationNonce[nodeId]`, and emits `NodeIdReclaimed`. The caller can then call `registerNode` under their own address. Reclaim does not require the caller to have stake — it only proves ed25519 key ownership and clears the squatter's binding. `reclaimNodeId` is the sole reclaim mechanism: there is no admin override. Reclaim authority is gated entirely by ed25519 wire-key ownership (the iroh NodeId private key), distinct from the secp256k1 on-chain signatures used for slash evidence ([ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)) and EIP-712 NodeId↔Ethereum binding ([§ NodeId-to-Ethereum Binding](#nodeid-to-ethereum-binding)).
 
 ## Admission and Priority
 
@@ -793,31 +793,53 @@ function nodeIdOf(address operator) external view returns (bytes32 nodeId, bool 
 function isActive(address operator) external view returns (bool);
 
 // Intended for rebinding (key rotation) only — initial binding is performed
-// atomically inside registerNode(). No on-chain guard prevents calling this
-// before registerNode, but doing so creates a binding without mesh membership
-// or stake (harmless but useless). See § Node Registry above.
-function bindNodeId(bytes32 nodeId, bytes calldata signature) external {
+// atomically inside registerNode(). Like registerNode, bindNodeId requires
+// BOTH the EIP-712 binding signature (Ethereum-key consent) AND an ed25519
+// proof of the new NodeId's ownership. The ed25519 requirement is deliberate:
+// without it, an EIP-712-only rebinding would re-open the squatting vector
+// that registerNode's ed25519 check closes (an attacker could bind an unbound
+// NodeId they don't own, blocking the legitimate owner's registerNode). With
+// the proof required on every binding path, no NodeId can be bound without
+// proving ownership, so squatting is impossible and reclaimNodeId is a
+// defense-in-depth backstop (for legacy / buggy bindings) rather than a
+// routine remedy. Calling this before registerNode is permitted but only
+// records a binding without mesh membership or stake.
+function bindNodeId(bytes32 nodeId, bytes calldata bindingSignature, bytes calldata ed25519Signature) external {
     uint64 nonce = bindingNonce[msg.sender];
     bytes32 digest = keccak256(abi.encodePacked(
         "\x19\x01",
         DOMAIN_SEPARATOR,
         keccak256(abi.encode(BIND_NODE_TYPEHASH, nodeId, nonce))
     ));
-    require(SignatureChecker.isValidSignatureNow(msg.sender, digest, signature), "invalid signature");
+    require(SignatureChecker.isValidSignatureNow(msg.sender, digest, bindingSignature), "invalid binding signature");
+
+    // Prove ownership of the new NodeId's ed25519 key (same message preimage
+    // as registerNode; see § NodeId Ownership Verification).
+    bytes32 ed25519Msg = keccak256(abi.encodePacked(nodeId, msg.sender, block.chainid, registrationNonce[nodeId]));
+    require(ed25519Verify(nodeId, ed25519Msg, ed25519Signature), "invalid ed25519 signature");
 
     // Reject if nodeId is already bound to a different address
     address existingOwner = nodeIdToAddress[nodeId];
     require(existingOwner == address(0) || existingOwner == msg.sender, "NodeId bound to another address");
 
-    // Clear caller's previous binding if exists
+    // Clear caller's previous binding if rotating to a different NodeId, and
+    // bump its registrationNonce so any pre-rotation ed25519 signature for the
+    // released NodeId is invalidated (mirrors deregisterNode: every binding
+    // exit requires a fresh ownership proof to re-bind).
     bytes32 oldNodeId = addressToNodeId[msg.sender];
-    if (oldNodeId != bytes32(0)) {
+    if (oldNodeId != bytes32(0) && oldNodeId != nodeId) {
         delete nodeIdToAddress[oldNodeId];
+        registrationNonce[oldNodeId] += 1;
     }
 
     nodeIdToAddress[nodeId] = msg.sender;
     addressToNodeId[msg.sender] = nodeId;
     bindingNonce[msg.sender] = nonce + 1;
+
+    // Keep the registration record consistent for an already-active node.
+    if (nodes[msg.sender].active) {
+        nodes[msg.sender].nodeId = nodeId;
+    }
 
     emit NodeIdBound(msg.sender, nodeId, nonce);
 }

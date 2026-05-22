@@ -54,12 +54,12 @@ import { ISafetyReserve } from "./interfaces/ISafetyReserve.sol";
 ///         from the active set, and increments `registrationNonce[nodeId]`
 ///         to invalidate any pre-deregistration ed25519 signatures. The
 ///         stake remains untouched — operators manage exit via the
-///         separate `requestUnstake` / `unstake` flow.
-///
-///         Out of this PR: `bindNodeId` (rebinding / key rotation) and
-///         `reclaimNodeId` (squat recovery). Both are advanced flows
-///         from ADR 003 that don't block the happy path; they layer on
-///         top of the binding state this PR establishes.
+///         separate `requestUnstake` / `unstake` flow. `bindNodeId`
+///         rotates the binding to a new NodeId (key rotation) and
+///         `reclaimNodeId` recovers a NodeId from its holder by ed25519
+///         proof — both require the same ed25519 ownership proof as
+///         `registerNode`, so a NodeId can never be bound without proving
+///         ownership of it (no squat vector).
 ///
 ///         ADR drift: ADR 014 line 237 originally specified
 ///         `slash(node, offenseType)` (2 args). The 50% challenger share
@@ -210,8 +210,8 @@ contract StakingRegistry is AccessControl, ReentrancyGuard, Pausable, EIP712 {
     /// @notice NodeId → Ethereum address. Reverse of `addressToNodeId`.
     mapping(bytes32 nodeId => address operator) public nodeIdToAddress;
 
-    /// @notice Ethereum address → NodeId. Cleared via `bindNodeId` rebinding
-    ///         (which lands with the rebinding PR).
+    /// @notice Ethereum address → NodeId. Cleared on `bindNodeId` rebinding to
+    ///         a different NodeId and on `reclaimNodeId`.
     mapping(address operator => bytes32 nodeId) public addressToNodeId;
 
     /// @notice Per-Ethereum-address replay counter for the EIP-712 binding
@@ -277,6 +277,7 @@ contract StakingRegistry is AccessControl, ReentrancyGuard, Pausable, EIP712 {
     event NodeMultiaddrUpdated(bytes32 indexed nodeId, bytes multiaddrs);
     event NodeDeregistered(bytes32 indexed nodeId);
     event NodeAutoEjected(bytes32 indexed nodeId, uint256 remainingStake);
+    event NodeIdReclaimed(bytes32 indexed nodeId, address indexed previousOwner);
 
     // -----------------------------------------------------------------
     // Errors
@@ -301,6 +302,7 @@ contract StakingRegistry is AccessControl, ReentrancyGuard, Pausable, EIP712 {
     error NodeNotActive();
     error StakeBelowMinimum(uint256 stake, uint256 required);
     error OperatorEjected();
+    error NodeIdNotBound(bytes32 nodeId);
     error RegionHintTooLong(uint256 size, uint256 ceiling);
 
     // -----------------------------------------------------------------
@@ -540,6 +542,110 @@ contract StakingRegistry is AccessControl, ReentrancyGuard, Pausable, EIP712 {
         _removeFromRegisteredSet(msg.sender);
 
         emit NodeDeregistered(nodeId);
+    }
+
+    /// @notice Rebind `msg.sender` to a new `nodeId` (key rotation). Requires
+    ///         BOTH the EIP-712 `BindNodeId` signature (Ethereum-key consent +
+    ///         replay protection via `bindingNonce`) and an ed25519 proof of
+    ///         the new NodeId's ownership — the same anti-squat as
+    ///         `registerNode` (ADR 003 § NodeId Ownership Verification).
+    /// @dev    Requiring the ed25519 proof closes the squat vector that an
+    ///         EIP-712-only rebinding would re-open (an attacker binding an
+    ///         unbound NodeId they don't own). The caller's previous binding,
+    ///         if any, is released. If the caller has an active registered
+    ///         node, its `NodeInfo.nodeId` is updated so the registry stays
+    ///         consistent. Does not change `active` / stake — this only moves
+    ///         the NodeId binding.
+    /// @param nodeId           New NodeId to bind (must be unbound or already
+    ///                         the caller's).
+    /// @param bindingSignature EIP-712 over `BindNodeId(nodeId, bindingNonce[msg.sender])`.
+    /// @param ed25519Signature ed25519 over `keccak256(nodeId, msg.sender,
+    ///                         block.chainid, registrationNonce[nodeId])`.
+    function bindNodeId(bytes32 nodeId, bytes calldata bindingSignature, bytes calldata ed25519Signature)
+        external
+        nonReentrant
+        whenNotPaused
+    {
+        if (nodeId == bytes32(0)) revert ZeroNodeId();
+        address nodeIdOwner = nodeIdToAddress[nodeId];
+        if (nodeIdOwner != address(0) && nodeIdOwner != msg.sender) revert NodeIdAlreadyBound(nodeIdOwner);
+
+        uint64 usedBindingNonce = _verifyBindingSignature(nodeId, bindingSignature);
+        _verifyEd25519OwnershipSignature(nodeId, ed25519Signature);
+
+        // Release the caller's previous binding if rotating to a different NodeId.
+        bytes32 oldNodeId = addressToNodeId[msg.sender];
+        if (oldNodeId != bytes32(0) && oldNodeId != nodeId) {
+            delete nodeIdToAddress[oldNodeId];
+            // Exiting the old NodeId's binding invalidates any pre-rotation
+            // ed25519 registration signature for it, mirroring `deregisterNode`
+            // / `_ejectNodeEffects`: every active-set / binding exit bumps the
+            // nonce so a fresh ownership proof is required to bind it again.
+            registrationNonce[oldNodeId] += 1;
+        }
+
+        nodeIdToAddress[nodeId] = msg.sender;
+        addressToNodeId[msg.sender] = nodeId;
+        bindingNonce[msg.sender] = usedBindingNonce + 1;
+
+        // Keep the registration record consistent for an active node.
+        if (_nodes[msg.sender].active) {
+            _nodes[msg.sender].nodeId = nodeId;
+        }
+
+        emit NodeIdBound(msg.sender, nodeId, usedBindingNonce);
+    }
+
+    /// @notice Reclaim a `nodeId` from its current holder by proving ed25519
+    ///         ownership. Forcibly tears down the holder's binding: clears the
+    ///         binding mappings and — when the holder's registration record
+    ///         points at the reclaimed NodeId — deactivates the node and zeroes
+    ///         its `NodeInfo.nodeId` so the read views stay consistent. Bumps
+    ///         `registrationNonce[nodeId]`. The caller can then `registerNode`
+    ///         under their own address.
+    /// @dev    Sole reclaim mechanism — no admin override (ADR 003 § Reclaim
+    ///         flow). With ed25519 now required on both `registerNode` and
+    ///         `bindNodeId`, no legitimate path binds a NodeId without
+    ///         ownership proof, so this is a defense-in-depth backstop for
+    ///         legacy / buggy bindings rather than a routine path. Does not
+    ///         require the caller to hold stake; does not touch the holder's
+    ///         stake (they keep it and can exit via `requestUnstake`).
+    /// @param nodeId           NodeId to reclaim (must currently be bound).
+    /// @param ed25519Signature ed25519 over `keccak256(nodeId, msg.sender,
+    ///                         block.chainid, registrationNonce[nodeId])`.
+    function reclaimNodeId(bytes32 nodeId, bytes calldata ed25519Signature) external nonReentrant whenNotPaused {
+        if (nodeId == bytes32(0)) revert ZeroNodeId();
+        address currentHolder = nodeIdToAddress[nodeId];
+        if (currentHolder == address(0)) revert NodeIdNotBound(nodeId);
+
+        _verifyEd25519OwnershipSignature(nodeId, ed25519Signature);
+
+        // Tear down the holder's registration record for this NodeId so the
+        // read views stay consistent with the binding mappings cleared below:
+        // a reclaimed NodeId is no longer the holder's, so `NodeInfo.nodeId`
+        // must not keep pointing at it (otherwise `getNodeByAddress(holder)`
+        // would still report it while `addressToNodeId[holder]` reads zero).
+        // Historical fields (multiaddrs / regionHint / timestamps) are left
+        // as-is, matching the deregister convention.
+        NodeInfo storage info = _nodes[currentHolder];
+        if (info.nodeId == nodeId) {
+            if (info.active) {
+                info.active = false;
+                _removeFromRegisteredSet(currentHolder);
+                // Signal the active-set removal to off-chain indexers, consistent
+                // with the other deactivation paths. This is not an ejection (no
+                // penalty, no `ejected` flag), so it reuses `NodeDeregistered`
+                // rather than `NodeAutoEjected`.
+                emit NodeDeregistered(nodeId);
+            }
+            info.nodeId = bytes32(0);
+        }
+        delete nodeIdToAddress[nodeId];
+        delete addressToNodeId[currentHolder];
+        // Invalidate the just-used signature and any of the holder's stale ones.
+        registrationNonce[nodeId] += 1;
+
+        emit NodeIdReclaimed(nodeId, currentHolder);
     }
 
     /// @notice Replace the registered multiaddrs for `msg.sender`'s node.
