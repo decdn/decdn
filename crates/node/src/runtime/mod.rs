@@ -19,11 +19,10 @@ use iroh::endpoint::{IdleTimeout, QuicTransportConfig, VarInt, presets};
 use iroh::protocol::Router;
 use iroh::{Endpoint, SecretKey};
 use iroh_gossip::ALPN as GOSSIP_ALPN;
-use iroh_gossip::net::Gossip;
 use tokio::sync::{RwLock, oneshot};
 use tokio::task::JoinSet;
 
-use decdn_gossip::{GossipMetrics, GossipRuntimeConfig, GossipService, PeerTable};
+use decdn_gossip::{GossipMetrics, GossipRuntimeConfig, GossipService, PeerTable, build_gossip};
 
 use crate::admin;
 use crate::channel_store::PersistentChannelStateStore;
@@ -326,7 +325,13 @@ pub async fn run(
         .register_iroh_endpoint(&ep)
         .context("failed to register iroh metrics")?;
 
-    let gossip = Gossip::builder().spawn(ep.clone());
+    // Pin iroh-gossip's per-actor frame ceiling to a deCDN-controlled
+    // value (ADR 013 §Gossip Framing, #660). `read_lp` enforces this
+    // cap before allocating the inbound `BytesMut`, bounding per-peer
+    // DoS exposure. Constructed via `build_gossip` so a regression
+    // that drops the cap fails the gossip-crate test that exercises
+    // the same helper.
+    let gossip = build_gossip(ep.clone());
 
     let limiter = Arc::new(ConnectionLimiter::new(
         &cfg.security,
@@ -550,6 +555,12 @@ pub async fn run(
 
     let peer_table = Arc::new(RwLock::new(PeerTable::new(
         cfg.gossip.peer_ttl_sec.saturating_mul(1_000_000),
+        // Saturate at `usize::MAX` on 32-bit targets where the configured
+        // `u64` cap might not fit; mirrors the saturating cast pattern
+        // already used on `i64::try_from(table.len())` in the sweeper
+        // path. The config resolver rejects `0`, so the runtime never
+        // hits the unbounded escape hatch.
+        usize::try_from(cfg.gossip.max_peer_table_entries).unwrap_or(usize::MAX),
     )));
 
     // Admin HTTP surface (ADR 025). Bind here — *before* the gossip service
@@ -612,7 +623,7 @@ pub async fn run(
     // `AnnounceTrigger`, spawn the admin serve task with the full state.
     // Bind happened earlier (see `admin_listener` above) so a port collision
     // would have failed startup before any side-effectful subscribes ran.
-    let admin_stop_tx = if let Some(listener) = admin_listener {
+    let mut admin_stop_tx = if let Some(listener) = admin_listener {
         let (tx, rx) = oneshot::channel::<()>();
         // Build the reload hook only when a config file path was passed
         // (CLI-only invocation has nothing on disk to re-read). The
@@ -633,6 +644,7 @@ pub async fn run(
             reload_hook,
             Arc::clone(&drain_trigger),
             Arc::clone(&eth_signer),
+            Arc::clone(&node_metrics),
         );
         tasks.spawn(async move {
             if let Err(err) = admin::serve(listener, state, rx).await {
@@ -718,7 +730,31 @@ pub async fn run(
     // operator-actionable signal to log at this seam.
     let _ = dispatch_gc_stop_tx.send(());
     let _ = record_store_gc_stop_tx.send(());
-    if let Some(tx) = admin_stop_tx
+    // Admin server shutdown is ordered per `admin_stop_order`:
+    //
+    //   - `Early` (the default, including SIGTERM/SIGINT and plain
+    //     `admin_v1_drain`): stop admin *before* `router.shutdown` so
+    //     admin doesn't keep accepting fresh loopback connections
+    //     during drain. This is the original ordering (see
+    //     `appendix-local-admin-http`).
+    //   - `AfterRouter` (only when an `admin_v1_drain` call carried
+    //     `wait_admin: true`, i.e. `decdn node drain --wait`): keep
+    //     admin alive *through* `router.shutdown` so a polling client
+    //     can observe `admin_v1_health.in_flight_streams` reach 0. The
+    //     admin stop signal fires below, after `router.shutdown`
+    //     returns.
+    //
+    // `wait_admin` is sampled once into a local; the two `if` blocks
+    // below are mutually exclusive, so the single `Option<Sender>` is
+    // consumed by exactly one branch. The signal-gating on
+    // `AdminDrain` means a sticky `wait_admin=true` from an in-flight
+    // RPC that was racing a SIGTERM does *not* flip the runtime onto
+    // the AfterRouter path when SIGTERM actually won the select (the
+    // operator's stated intent wins; the RPC's request becomes a
+    // no-op since drain is already in progress).
+    let stop_order = admin_stop_order(signal, &drain_trigger);
+    if matches!(stop_order, AdminStopOrder::Early)
+        && let Some(tx) = admin_stop_tx.take()
         && tx.send(()).is_err()
     {
         tracing::warn!("admin server exited before shutdown signal was sent");
@@ -742,6 +778,31 @@ pub async fn run(
     }
     for handle in &gossip_handles {
         handle.abort();
+    }
+
+    // Late admin stop (issue #604 `AfterRouter` path). The polling
+    // client (`decdn node drain --wait`) needed admin to stay open
+    // while `router.shutdown` awaited the last in-flight client
+    // streams; now that it's returned, tear admin down so the polling
+    // client either sees `in_flight_streams == 0` on its next tick or
+    // observes ECONNREFUSED — both of which it treats as "drain
+    // complete".
+    //
+    // If the receiver has already dropped (i.e. the admin task
+    // crashed/panicked between the Early skip and this point), that's
+    // a violated invariant — `decdn node drain --wait` clients may
+    // have misread the ECONNREFUSED as drain completion while
+    // in-flight streams were still draining. Log at `error!`
+    // accordingly so post-mortems surface it.
+    if matches!(stop_order, AdminStopOrder::AfterRouter)
+        && let Some(tx) = admin_stop_tx.take()
+        && tx.send(()).is_err()
+    {
+        tracing::error!(
+            "admin server exited while runtime was awaiting router.shutdown; \
+             `decdn node drain --wait` clients may have observed ECONNREFUSED \
+             before in-flight streams completed (false drain-complete)"
+        );
     }
 
     // Flush the cache store before the drain deadline so in-flight writes
@@ -1062,6 +1123,36 @@ impl std::fmt::Display for ShutdownSignal {
     }
 }
 
+/// Whether the admin server's stop signal fires before or after
+/// `router.shutdown()` for this drain (issue #604). `Early` is the
+/// SIGTERM-equivalent default; `AfterRouter` opts in to keeping the
+/// admin port alive so `decdn node drain --wait` can poll
+/// `admin_v1_health.in_flight_streams` until it reaches 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdminStopOrder {
+    Early,
+    AfterRouter,
+}
+
+/// Decide the admin shutdown ordering for a drain.
+///
+/// `AfterRouter` is selected **only** when the drain originated from
+/// the admin RPC (`AdminDrain`) *and* the in-flight RPC asked for
+/// `wait_admin: true`. Signal-driven shutdowns (SIGINT/SIGTERM)
+/// always pick `Early` — even if an `admin_v1_drain { wait_admin:
+/// true }` call was in-flight when the signal landed, the operator's
+/// stated intent wins. This prevents a "sticky `wait_admin`" race
+/// where an RPC stored the flag, SIGTERM won the select, and the
+/// runtime would otherwise take the `AfterRouter` path against the
+/// operator's signal (issue #604 review).
+fn admin_stop_order(signal: ShutdownSignal, drain_trigger: &admin::DrainTrigger) -> AdminStopOrder {
+    if matches!(signal, ShutdownSignal::AdminDrain) && drain_trigger.wait_admin() {
+        AdminStopOrder::AfterRouter
+    } else {
+        AdminStopOrder::Early
+    }
+}
+
 /// Persistent SIGHUP stream, installed once at startup. The
 /// `Signal` instance lives on `self` for the lifetime of the runtime
 /// so successive SIGHUPs delivered while a reload is in progress are
@@ -1323,6 +1414,65 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    /// `admin_stop_order` defaults to `Early` (the original
+    /// `appendix-local-admin-http` ordering) — the admin server stops
+    /// before `router.shutdown` for SIGINT/SIGTERM and for any drain
+    /// RPC that didn't ask for `wait_admin`.
+    #[test]
+    fn admin_stop_order_default_is_early() {
+        let trigger = admin::DrainTrigger::new();
+        // No fire yet → wait_admin() returns false.
+        assert_eq!(
+            admin_stop_order(ShutdownSignal::AdminDrain, &trigger),
+            AdminStopOrder::Early,
+        );
+        // A drain RPC that explicitly asks for the default ordering.
+        let _ = trigger.fire(false);
+        assert_eq!(
+            admin_stop_order(ShutdownSignal::AdminDrain, &trigger),
+            AdminStopOrder::Early,
+        );
+    }
+
+    /// `admin_stop_order` returns `AfterRouter` when (and only when)
+    /// the drain originated from the admin RPC *and* it asked for
+    /// `wait_admin: true`.
+    #[test]
+    fn admin_stop_order_admin_drain_with_wait_admin_is_after_router() {
+        let trigger = admin::DrainTrigger::new();
+        let _ = trigger.fire(true);
+        assert_eq!(
+            admin_stop_order(ShutdownSignal::AdminDrain, &trigger),
+            AdminStopOrder::AfterRouter,
+        );
+    }
+
+    /// SIGINT wins over a sticky `wait_admin=true` flag: an RPC that
+    /// stored `wait_admin=true` mid-flight when an operator hit
+    /// Ctrl-C must not flip the runtime onto the `AfterRouter` path.
+    /// The operator's stated intent (SIGINT = stop now) wins.
+    #[test]
+    fn admin_stop_order_sigint_overrides_sticky_wait_admin() {
+        let trigger = admin::DrainTrigger::new();
+        let _ = trigger.fire(true);
+        assert_eq!(
+            admin_stop_order(ShutdownSignal::Sigint, &trigger),
+            AdminStopOrder::Early,
+        );
+    }
+
+    /// Same as the SIGINT test, but for SIGTERM (unix only).
+    #[cfg(unix)]
+    #[test]
+    fn admin_stop_order_sigterm_overrides_sticky_wait_admin() {
+        let trigger = admin::DrainTrigger::new();
+        let _ = trigger.fire(true);
+        assert_eq!(
+            admin_stop_order(ShutdownSignal::Sigterm, &trigger),
+            AdminStopOrder::Early,
+        );
+    }
+
     /// Build a minimal `ResolvedConfig` with the cache section
     /// pointed at the given `origin`. Other sections carry sensible
     /// dummies — only the cache is exercised. Mirrors the fixture
@@ -1395,6 +1545,7 @@ mod tests {
                 peer_ttl_sec: 600,
                 subscribe_global: false,
                 allowlist: Vec::new(),
+                max_peer_table_entries: 100_000,
             },
             security: ResolvedSecurity {
                 max_concurrent_handlers: 256,

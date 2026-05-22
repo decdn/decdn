@@ -408,6 +408,49 @@ async fn probe_garbage_postcard_returns_malformed_code() -> anyhow::Result<()> {
     tear_down(h).await
 }
 
+/// #577 M1 — a transport-level truncation (client promises `len` bytes
+/// then finishes the stream early) hits `FrameError::Io(UnexpectedEof)`
+/// in `read_frame`, which must surface as `APP_ERR_NO_ERROR` (0x00),
+/// not `APP_ERR_MALFORMED_MESSAGE` (0x03). A dropped connection is not
+/// a protocol fault; collapsing the two would push peers toward the
+/// wrong backoff/penalty discipline. Pairs the existing
+/// `probe_garbage_postcard_returns_malformed_code` (genuine
+/// `Decode`-class fault, 0x03) and
+/// `probe_read_timeout_resets_stream_with_zero_code` (timeout, 0x00).
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_io_truncated_frame_returns_zero_code() -> anyhow::Result<()> {
+    let h = spin_up_probe_harness().await?;
+    let (mut send, mut recv) = h
+        .client_conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+
+    // Write a varint length prefix promising 100 bytes of payload, then
+    // write only 3 bytes and finish the stream. The server's
+    // `read_frame` reads the varint, allocates the buffer, then
+    // `read_exact` short-reads → `FrameError::Io(UnexpectedEof)`.
+    let mut bogus = Vec::new();
+    let mut v: u32 = 100;
+    loop {
+        let byte = (v & 0x7F) as u8;
+        v >>= 7;
+        if v == 0 {
+            bogus.push(byte);
+            break;
+        }
+        bogus.push(byte | 0x80);
+    }
+    bogus.extend_from_slice(b"abc");
+    send.write_all(&bogus)
+        .await
+        .map_err(|e| anyhow::anyhow!("write: {e}"))?;
+    send.finish().map_err(|e| anyhow::anyhow!("finish: {e}"))?;
+
+    assert_reset_with_code(&mut recv, 0x00).await?;
+    tear_down(h).await
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn probe_response_on_server_stream_returns_unsupported_code() -> anyhow::Result<()> {
     let h = spin_up_probe_harness().await?;

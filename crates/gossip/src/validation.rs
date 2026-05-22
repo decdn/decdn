@@ -44,6 +44,13 @@ pub enum AnnounceReject {
     BadRegion,
     #[error("announcer not in allowlist")]
     NotAllowlisted,
+    /// Trailing bytes after the postcard envelope exceed
+    /// [`MAX_TRAILING_BYTES`] (4 KiB, #577 M3). ADR 013 §Tier 1
+    /// permits trailing bytes for forward-compat; this defense-in-
+    /// depth cap catches shape violations that slip under iroh-
+    /// gossip's per-frame [`GOSSIP_MAX_FRAME`] allocation ceiling.
+    #[error("trailing bytes after envelope exceed {MAX_TRAILING_BYTES} byte allowance")]
+    OversizeTrailingBytes,
 }
 
 impl AnnounceReject {
@@ -61,6 +68,7 @@ impl AnnounceReject {
             Self::StaleTimestamp => "stale_timestamp",
             Self::BadRegion => "bad_region",
             Self::NotAllowlisted => "not_allowlisted",
+            Self::OversizeTrailingBytes => "oversize_trailing_bytes",
         }
     }
 }
@@ -68,6 +76,59 @@ impl AnnounceReject {
 /// Maximum tolerated difference between `timestamp_us` and receiver clock
 /// (ADR 001 rule 3). 60 seconds in microseconds.
 pub const CLOCK_SKEW_TOLERANCE_US: u64 = 60 * 1_000_000;
+
+/// Maximum trailing bytes tolerated after the postcard envelope in
+/// [`validate_envelope`] (#577 M3). ADR 013 §Tier 1 documents trailing
+/// bytes as the forward-compat extension mechanism; a sane envelope
+/// today is ~150 bytes and any plausible future Tier-1 extension is
+/// expected to be well under 4 KiB. Defense-in-depth behind iroh-
+/// gossip's per-actor [`GOSSIP_MAX_FRAME`] ceiling (enforced before
+/// allocation in `read_lp`, ADR 013 §Gossip Framing): even under that
+/// ceiling, an attacker padding every ~150-byte announce up to
+/// `GOSSIP_MAX_FRAME` blows each inbound allocation ~100× larger,
+/// and Plumtree fan-out repeats that cost at every eager peer the
+/// message reaches. Rejecting at the validation layer caps the per-
+/// frame size and surfaces the attack via the
+/// `oversize_trailing_bytes` metric, while leaving legitimate Tier-1
+/// extensions room to grow.
+pub const MAX_TRAILING_BYTES: usize = 4 * 1024;
+
+/// Maximum size in bytes of a single iroh-gossip wire frame on the
+/// deCDN gossip actor (ADR 013 §Gossip Framing). Passed to
+/// `iroh_gossip::net::Gossip::builder().max_message_size(...)` and
+/// applies symmetrically to every frame the actor sends or receives:
+/// `NodeAnnounce` traffic on `cdn/global/v1` and the region topic,
+/// plus iroh-gossip's `HyParView` control frames (which iroh-gossip
+/// maintains per-topic alongside the Plumtree data traffic, so
+/// tightening this constant breaks legitimate non-payload frames
+/// too). The cap bounds allocation inside iroh-gossip's
+/// `read_lp` *before* the frame ever reaches [`validate_envelope`].
+/// Must accommodate (a) a maximally-extended
+/// [`decdn_protocol::GossipEnvelope`] — envelope (~256 B) +
+/// [`MAX_TRAILING_BYTES`] padding — plus plumtree/topic message-wrapper
+/// overhead (~64 B), and (b) `HyParView` control frames carrying peer-
+/// info lists (analytical upper bound from iroh-gossip 0.98 source:
+/// Shuffle/ShuffleReply at default fanout = ~1.7 KiB for 7 `PeerInfo`
+/// entries with two-relay `AddrInfo`). 16 KiB gives ~3.7× headroom
+/// over the ~4.4 KiB data-frame floor.
+///
+/// **Network-coordination invariant:** this value must agree across
+/// all deCDN nodes on the network. iroh-gossip enforces the cap on
+/// both send and receive; tightening it asymmetrically silently
+/// partitions the gossip swarm for legitimate `HyParView` control
+/// frames. Treat changes as wire-compatibility events.
+pub const GOSSIP_MAX_FRAME: usize = 16 * 1024;
+
+/// Compile-time invariant: the validation-layer trailing-bytes cap
+/// must fit inside a single iroh-gossip frame with room for the
+/// envelope itself and plumtree/topic wrappers. The numeric padding
+/// reflects: ~256 B envelope (`NodeAnnounce` body + 64 B signature +
+/// version byte + postcard overhead) + ~64 B plumtree/topic message
+/// wrappers (variant tags, `MessageId`, `DeliveryScope`/`Round`).
+const _: () = assert!(
+    MAX_TRAILING_BYTES + 256 + 64 <= GOSSIP_MAX_FRAME,
+    "GOSSIP_MAX_FRAME must fit a maximally-padded GossipEnvelope plus plumtree/topic wrappers"
+);
 
 /// Validate a postcard-encoded [`GossipEnvelope`]. On success, returns the
 /// contained [`NodeAnnounce`]. The caller is responsible for threading the
@@ -94,10 +155,20 @@ pub fn validate_envelope<S: std::hash::BuildHasher>(
     }
 
     // ADR 013: trailing bytes are tolerated so future unsigned extensions on
-    // the envelope don't break old decoders. Use `take_from_bytes` and drop
+    // the envelope don't break old decoders. Use `take_from_bytes` and inspect
     // the remainder rather than `from_bytes`, which errors on trailing input.
-    let (env, _rest): (GossipEnvelope, &[u8]) =
+    let (env, rest): (GossipEnvelope, &[u8]) =
         postcard::take_from_bytes(bytes).map_err(|_| AnnounceReject::DecodeFailed)?;
+
+    // #577 M3: bound the trailing-bytes allowance. Reject before signature
+    // verify so an attacker can't burn ed25519 cycles on a shape we'll drop
+    // regardless. Defense-in-depth behind [`GOSSIP_MAX_FRAME`], which
+    // already capped the iroh-gossip allocation; this surfaces shape
+    // violations under that ceiling via the rejection metric and keeps
+    // them out of the peer table.
+    if rest.len() > MAX_TRAILING_BYTES {
+        return Err(AnnounceReject::OversizeTrailingBytes);
+    }
 
     // Only one variant today; future variants will need their own handling.
     #[allow(irrefutable_let_patterns)]
@@ -188,6 +259,7 @@ mod tests {
                 AnnounceReject::StaleTimestamp => "stale_timestamp",
                 AnnounceReject::BadRegion => "bad_region",
                 AnnounceReject::NotAllowlisted => "not_allowlisted",
+                AnnounceReject::OversizeTrailingBytes => "oversize_trailing_bytes",
             }
         }
         // One representative value per variant; the match above is the real
@@ -204,6 +276,7 @@ mod tests {
             AnnounceReject::StaleTimestamp,
             AnnounceReject::BadRegion,
             AnnounceReject::NotAllowlisted,
+            AnnounceReject::OversizeTrailingBytes,
         ] {
             assert_eq!(r.label(), expected_label(&r), "label drift for {r:?}");
         }
@@ -211,6 +284,11 @@ mod tests {
         // Free-form labels passed directly to `inc_rejected` aren't covered
         // by `AnnounceReject::label`; keep them pinned here too.
         assert_eq!(crate::service::SUBSCRIBE_FAILED_LABEL, "subscribe_failed");
+        assert_eq!(crate::service::PEER_TABLE_FULL_LABEL, "peer_table_full");
+        assert_eq!(
+            crate::service::RESUBSCRIBE_FAILED_LABEL,
+            "resubscribe_failed"
+        );
     }
 
     fn sample_body(sk: &SecretKey, ts_us: u64) -> NodeAnnounceBody {
@@ -448,6 +526,71 @@ mod tests {
         assert_eq!(
             validate_envelope(&bytes, 1_700_000_000_000_000, &no_list()),
             Err(AnnounceReject::InvalidSignature)
+        );
+    }
+
+    /// #577 M3 — a peer padding a valid envelope past
+    /// [`MAX_TRAILING_BYTES`] is rejected before signature verification.
+    /// The reject must come from the size check, not from a downstream
+    /// signature mismatch, so the test appends garbage *after* the
+    /// signed envelope completes (trailing bytes are outside postcard's
+    /// consumed range and don't affect signature verification).
+    #[test]
+    fn rejects_oversize_trailing_bytes() {
+        let sk = fresh_key();
+        let mut bytes = mk_envelope(&sk, |_| {});
+        bytes.extend(std::iter::repeat_n(0xAAu8, MAX_TRAILING_BYTES + 1));
+        assert_eq!(
+            validate_envelope(&bytes, 1_700_000_000_000_000, &no_list()),
+            Err(AnnounceReject::OversizeTrailingBytes)
+        );
+    }
+
+    /// Boundary partner for [`rejects_oversize_trailing_bytes`]: exactly
+    /// [`MAX_TRAILING_BYTES`] of trailing bytes is accepted (the `>` in
+    /// the size gate). A regression that flipped `>` to `>=` (or
+    /// vice-versa) is the failure mode this pair catches. Mirrors the
+    /// existing `evict_at_exact_cutoff_keeps_entry` /
+    /// `evict_one_microsecond_past_cutoff_removes_entry` boundary
+    /// discipline in `peer_table::tests`.
+    #[test]
+    fn accepts_trailing_bytes_at_threshold() {
+        let sk = fresh_key();
+        let mut bytes = mk_envelope(&sk, |_| {});
+        bytes.extend(std::iter::repeat_n(0xAAu8, MAX_TRAILING_BYTES));
+        assert!(
+            validate_envelope(&bytes, 1_700_000_000_000_000, &no_list()).is_ok(),
+            "exactly MAX_TRAILING_BYTES of padding must be accepted"
+        );
+    }
+
+    /// #577 M3 — pins the *ordering* of size-check vs signature-verify.
+    /// The variant's doc-comment promises: "Place the check before
+    /// signature verification — no point spending ed25519 cycles on an
+    /// envelope that's going to be rejected for shape." A regression
+    /// that swapped the order (verify-first) would still pass
+    /// [`rejects_oversize_trailing_bytes`] because the inner envelope's
+    /// signature is valid; this test corrupts the signature *and*
+    /// over-pads so verify-first would surface `InvalidSignature`
+    /// instead of `OversizeTrailingBytes`. The assertion locks the
+    /// ed25519-cycle-saving guarantee at the test layer.
+    #[test]
+    fn rejects_oversize_before_checking_signature() {
+        let sk = fresh_key();
+        let body = sample_body(&sk, 1_700_000_000_000_000);
+        // Garbage signature — verify would fail with InvalidSignature.
+        let mut bytes = encode(&GossipEnvelope {
+            version: GOSSIP_VERSION,
+            payload: GossipPayload::NodeAnnounce(NodeAnnounce {
+                body,
+                signature: vec![7u8; SIGNATURE_LEN],
+            }),
+        });
+        bytes.extend(std::iter::repeat_n(0xAAu8, MAX_TRAILING_BYTES + 1));
+        assert_eq!(
+            validate_envelope(&bytes, 1_700_000_000_000_000, &no_list()),
+            Err(AnnounceReject::OversizeTrailingBytes),
+            "size check must run BEFORE signature verify"
         );
     }
 }

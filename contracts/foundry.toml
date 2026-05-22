@@ -16,6 +16,12 @@ libs = ["lib"]
 script = "script"
 test = "test"
 cache_path = "cache"
+# Testnet-only contracts live under `testnet/` (deliberately outside `src`)
+# and are pulled in transitively by `script/TestnetFaucet.s.sol` +
+# `test/TestnetFaucet.t.sol`. The on-disk separation pairs with the CI
+# grep gate (`.github/workflows/ci.yml` → `solidity build+test` job) to
+# enforce that `testnet/` references never leak into the production
+# deploy surface.
 
 solc_version = "0.8.28"
 evm_version = "cancun"

@@ -253,6 +253,10 @@ pub struct ResolvedGossip {
     /// signature-valid announce (local substitute for ADR 001 rule 2 until
     /// the on-chain staking registry contract lands).
     pub allowlist: Vec<[u8; 32]>,
+    /// Hard cap on `PeerTable` entry count (#577 H3). Always positive
+    /// (the resolver rejects `0`); the runtime casts to `usize` when
+    /// constructing the table.
+    pub max_peer_table_entries: u64,
 }
 
 /// Resolved observability fields.

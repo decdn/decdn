@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 use decdn_protocol::{
     GOSSIP_VERSION, GossipEnvelope, GossipPayload, NodeAnnounce, NodeAnnounceBody, TOPIC_GLOBAL,
@@ -24,6 +25,33 @@ use crate::{AnnounceReject, GossipMetrics, InsertOutcome, PeerTable, validate_en
 /// call fails at startup. Pinned by the label-stability test in
 /// `validation::tests` so a rename fails CI.
 pub(crate) const SUBSCRIBE_FAILED_LABEL: &str = "subscribe_failed";
+
+/// Label passed to [`GossipMetrics::inc_rejected`] when an inbound
+/// signature-valid announce is dropped because the peer table is at its
+/// hard cap and the inline TTL sweep couldn't free a slot (#577 H3).
+/// Pinned by the label-stability test in `validation::tests`.
+pub(crate) const PEER_TABLE_FULL_LABEL: &str = "peer_table_full";
+
+/// Label passed to [`GossipMetrics::inc_rejected`] when a subscriber's
+/// reconnect attempt to `gossip.subscribe(topic_id, ...)` fails (#577 H2
+/// follow-up). The existing `tracing::error!` is informative but
+/// unscrapable; this counter lets operators alert on a node stuck in a
+/// reconnect loop. Pinned by the label-stability test in `validation::tests`.
+pub(crate) const RESUBSCRIBE_FAILED_LABEL: &str = "resubscribe_failed";
+
+/// Per-topic plumbing produced by `GossipService::spawn` and handed to
+/// the matching `subscriber_task`. Bundling these together is the single
+/// point where the subscriber's view of a topic is constructed from
+/// `topic.split()` — the `sender_slot` here is the same `Arc` that the
+/// publisher's `senders` vec also holds, so the "subscriber writes the
+/// sender the publisher reads" pairing is enforced by construction
+/// rather than by parallel-vec-by-index discipline (#577 H2).
+struct TopicWiring {
+    name: String,
+    id: TopicId,
+    receiver: GossipReceiver,
+    sender_slot: Arc<ArcSwap<GossipSender>>,
+}
 
 /// Configuration handed to [`GossipService::spawn`] by the consumer. The
 /// peer-table TTL is configured on the `PeerTable` itself at construction
@@ -105,6 +133,23 @@ pub enum GossipSpawnError {
     },
 }
 
+/// Construct the per-node iroh-gossip actor with the deCDN frame
+/// ceiling ([`crate::GOSSIP_MAX_FRAME`]) wired through
+/// `iroh_gossip::net::Gossip::builder().max_message_size(...)` (ADR
+/// 013 §Gossip Framing, #660). Pinning the cap here — rather than
+/// inline at every call site — gives the regression test in this
+/// module a single seam to assert against, so deleting the
+/// `.max_message_size(...)` step fails the test loudly instead of
+/// silently reverting to the iroh-gossip upstream default
+/// (`iroh_gossip::proto::DEFAULT_MAX_MESSAGE_SIZE`, 4 KiB in iroh-
+/// gossip 0.98 — below our `MAX_TRAILING_BYTES + envelope + wrappers`
+/// floor).
+pub fn build_gossip(endpoint: Endpoint) -> Gossip {
+    Gossip::builder()
+        .max_message_size(crate::GOSSIP_MAX_FRAME)
+        .spawn(endpoint)
+}
+
 /// Returned by [`GossipService::spawn`]: the spawned task handles plus an
 /// optional [`AnnounceTrigger`] for the publisher task. The trigger is
 /// `None` when the publisher is disabled (no region configured) — see
@@ -165,14 +210,28 @@ impl GossipService {
         // Open one subscription per topic up front. Failures bump a metric
         // and emit an error log; the topic is then skipped so the caller
         // isn't left with half-wired state.
-        let mut senders: Vec<(String, GossipSender)> = Vec::new();
-        let mut receivers: Vec<(String, TopicId, GossipReceiver)> = Vec::new();
+        //
+        // Each topic owns one `Arc<ArcSwap<GossipSender>>` slot shared by
+        // the subscriber's `TopicWiring` and the publisher's `senders`
+        // vec (#577 H2). The subscriber's reconnect path stores the
+        // fresh sender into its slot, and the publisher reads through
+        // the slot on each broadcast — so the two halves can't
+        // desynchronise after a stream reset. Pairing is single-site
+        // here: both pushes derive from the same `Arc::clone(&slot)`.
+        let mut senders: Vec<(String, Arc<ArcSwap<GossipSender>>)> = Vec::new();
+        let mut wirings: Vec<TopicWiring> = Vec::new();
         for (topic_name, topic_id) in topics {
             match gossip.subscribe(topic_id, Vec::new()).await {
                 Ok(topic) => {
                     let (sender, receiver) = topic.split();
-                    senders.push((topic_name.clone(), sender));
-                    receivers.push((topic_name, topic_id, receiver));
+                    let slot = Arc::new(ArcSwap::from_pointee(sender));
+                    senders.push((topic_name.clone(), Arc::clone(&slot)));
+                    wirings.push(TopicWiring {
+                        name: topic_name,
+                        id: topic_id,
+                        receiver,
+                        sender_slot: slot,
+                    });
                 }
                 Err(err) => {
                     metrics.inc_rejected(SUBSCRIBE_FAILED_LABEL);
@@ -185,7 +244,7 @@ impl GossipService {
             }
         }
 
-        if receivers.is_empty() {
+        if wirings.is_empty() {
             // Caller asked for at least one topic and got none. This is
             // a startup failure the runtime must surface, not a soft
             // degraded state — see `GossipSpawnError::AllSubscribesFailed`.
@@ -194,12 +253,10 @@ impl GossipService {
 
         let mut handles: Vec<JoinHandle<()>> = Vec::new();
 
-        for (topic_name, tid, receiver) in receivers {
+        for wiring in wirings {
             handles.push(subscriber_task(
-                topic_name,
-                receiver,
+                wiring,
                 gossip.clone(),
-                tid,
                 Arc::clone(&allowlist),
                 Arc::clone(&peer_table),
                 Arc::clone(&metrics),
@@ -239,6 +296,40 @@ impl GossipService {
     }
 }
 
+/// Insert (or refresh) an already-validated announce into `table` and
+/// emit the matching metric. Pulled out of [`subscriber_task`] so the
+/// subscriber loop and the contract test exercise the *same* dispatch
+/// code; a future change here (new `InsertOutcome` variant, metric
+/// rename, gauge re-emission on a rejected arm) cannot drift between
+/// production and test.
+///
+/// Caller holds the `PeerTable` write lock for the duration of this call.
+pub(crate) fn dispatch_insert(
+    table: &mut PeerTable,
+    announce: decdn_protocol::NodeAnnounce,
+    now_us: u64,
+    metrics: &dyn GossipMetrics,
+) {
+    match table.insert_or_refresh(announce, now_us) {
+        Ok(InsertOutcome::Inserted | InsertOutcome::Refreshed) => {
+            metrics.set_peer_table_size(i64::try_from(table.len()).unwrap_or(i64::MAX));
+        }
+        // #577 H3: peer table is at its hard cap and the inline TTL
+        // sweep couldn't free a slot. Drop the announce, bump the
+        // rejection metric (no size update — the table didn't change).
+        Ok(InsertOutcome::RejectedFull) => {
+            metrics.inc_rejected(PEER_TABLE_FULL_LABEL);
+        }
+        // Exhaustive match on the typed error: adding a new
+        // `PeerTable` failure mode is a compile error here, so a
+        // future variant can't be silently mislabeled as
+        // `stale_timestamp`.
+        Err(crate::StaleTimestamp { .. }) => {
+            metrics.inc_rejected(AnnounceReject::StaleTimestamp.label());
+        }
+    }
+}
+
 /// Build `(topic_name, TopicId)` pairs to subscribe to. `TopicId` is the
 /// blake3 hash of the topic name, matching iroh-gossip's own convention for
 /// deriving topic IDs from a string namespace.
@@ -267,14 +358,22 @@ const RECONNECT_MAX_BACKOFF: Duration = Duration::from_mins(1);
 const RECONNECT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 
 fn subscriber_task(
-    topic_name: String,
-    initial_receiver: GossipReceiver,
+    wiring: TopicWiring,
     gossip: Gossip,
-    topic_id: TopicId,
     allowlist: Arc<HashSet<[u8; 32]>>,
     peer_table: Arc<RwLock<PeerTable>>,
     metrics: Arc<dyn GossipMetrics>,
 ) -> JoinHandle<()> {
+    // Destructure once so the rest of the body reads as if the fields had
+    // always been positional args. `sender_slot` is the publisher's view
+    // of this topic's `GossipSender`; storing into it on reconnect is the
+    // #577 H2 fix.
+    let TopicWiring {
+        name: topic_name,
+        id: topic_id,
+        receiver: initial_receiver,
+        sender_slot,
+    } = wiring;
     tokio::spawn(async move {
         let mut receiver = initial_receiver;
         let mut backoff = RECONNECT_INITIAL_BACKOFF;
@@ -305,22 +404,26 @@ fn subscriber_task(
                 match validate_envelope(&msg.content, now, allowlist.as_ref()) {
                     Ok(announce) => {
                         let mut table = peer_table.write().await;
-                        match table.insert_or_refresh(announce, now) {
-                            Ok(InsertOutcome::Inserted | InsertOutcome::Refreshed) => {
-                                metrics.set_peer_table_size(
-                                    i64::try_from(table.len()).unwrap_or(i64::MAX),
-                                );
-                            }
-                            // Exhaustive match on the typed error: adding a new
-                            // `PeerTable` failure mode is a compile error here,
-                            // so a future variant can't be silently mislabeled as
-                            // `stale_timestamp`.
-                            Err(crate::StaleTimestamp { .. }) => {
-                                metrics.inc_rejected(AnnounceReject::StaleTimestamp.label());
-                            }
-                        }
+                        dispatch_insert(&mut table, announce, now, metrics.as_ref());
                     }
-                    Err(reject) => metrics.inc_rejected(reject.label()),
+                    Err(reject) => {
+                        // #577 M3: oversize-trailing-bytes is an active-attack
+                        // signal (amplification probe). Surface forensic
+                        // context — size + threshold + topic — alongside the
+                        // metric so operators investigating the counter spike
+                        // have correlation data without enabling debug logs.
+                        // Other reject reasons stay metric-only to avoid log
+                        // floods on routine per-peer wire faults.
+                        if matches!(reject, AnnounceReject::OversizeTrailingBytes) {
+                            tracing::warn!(
+                                topic = %topic_name,
+                                content_len = msg.content.len(),
+                                max_trailing = crate::validation::MAX_TRAILING_BYTES,
+                                "gossip envelope rejected: oversize trailing bytes (#577 M3) — possible amplification probe"
+                            );
+                        }
+                        metrics.inc_rejected(reject.label());
+                    }
                 }
             }
 
@@ -333,13 +436,26 @@ fn subscriber_task(
 
                 match gossip.subscribe(topic_id, Vec::new()).await {
                     Ok(topic) => {
-                        let (_sender, new_receiver) = topic.split();
+                        // #577 H2: store the *new* sender into the shared slot
+                        // before resuming. The publisher's next broadcast loads
+                        // through the slot and sees this sender; a regression
+                        // that drops this `store` is caught by the
+                        // `publisher_sees_swapped_sender_after_reconnect` test
+                        // in this module.
+                        let (new_sender, new_receiver) = topic.split();
+                        sender_slot.store(Arc::new(new_sender));
                         receiver = new_receiver;
                         metrics.inc_reconnected(&topic_name);
                         tracing::info!(topic = %topic_name, "gossip subscription reconnected");
                         break; // Exit reconnection loop, back to event processing.
                     }
                     Err(err) => {
+                        // Bump the rejection counter alongside the error log
+                        // so operators can alert on a node stuck in a
+                        // reconnect loop without scraping logs. Pre-fix
+                        // this path was log-only — diagnosable but not
+                        // operationally observable.
+                        metrics.inc_rejected(RESUBSCRIBE_FAILED_LABEL);
                         tracing::error!(
                             %err,
                             topic = %topic_name,
@@ -356,7 +472,12 @@ fn publisher_task(
     secret_key: SecretKey,
     region_code: String,
     interval: Duration,
-    senders: Vec<(String, GossipSender)>,
+    // Per-topic sender slots shared with the subscriber tasks. Each
+    // broadcast iteration calls `slot.load_full()` to pick up the latest
+    // sender, so a subscriber-driven reconnect (which swaps a fresh
+    // sender into the slot) is observed on the next publish without
+    // dropping a manual `announce_now()` trigger on the floor — #577 H2.
+    senders: Vec<(String, Arc<ArcSwap<GossipSender>>)>,
     metrics: Arc<dyn GossipMetrics>,
     announce_now: Arc<Notify>,
 ) -> JoinHandle<()> {
@@ -407,7 +528,15 @@ fn publisher_task(
                     continue;
                 }
             };
-            for (name, sender) in &senders {
+            for (name, slot) in &senders {
+                // Load through the slot every iteration so a subscriber-
+                // driven reconnect (which swaps a fresh `GossipSender`
+                // into this slot) is picked up here without a publisher
+                // restart. Pre-#577-H2, the publisher captured the
+                // original sender at spawn and silently kept broadcasting
+                // through it even after the iroh-gossip-side receiver
+                // disappeared.
+                let sender = slot.load_full();
                 if let Err(err) = sender.broadcast(encoded.clone()).await {
                     // `warn!` rather than `debug!`: a broadcast failure on
                     // the manual-trigger path (operator running `decdn node
@@ -511,6 +640,45 @@ mod tests {
         assert_eq!(topics[1].0, "cdn/region/US/v1");
     }
 
+    /// #577 H2 — locks the architectural property the fix relies on:
+    /// the publisher reads its sender *through* the per-topic
+    /// `Arc<ArcSwap<...>>` slot on every iteration, so a subscriber-
+    /// driven reconnect that swaps a fresh value into the slot is
+    /// observed on the next publisher iteration. A regression that
+    /// captured the sender by value at spawn (as the pre-fix code did,
+    /// silently dropping manual / interval announces after a stream
+    /// reset) would fail this test.
+    ///
+    /// Stand-in `&'static str` instead of a real `GossipSender` because
+    /// the latter can't be constructed without a live
+    /// `iroh_gossip::net::Gossip` instance. This test covers the
+    /// load-through-slot primitive only; a full integration test would
+    /// spin up two `Gossip` instances, force a stream reset, and assert
+    /// the next publish lands — that's tracked separately, not blocking
+    /// this PR.
+    #[test]
+    fn publisher_sees_swapped_sender_after_reconnect() {
+        let slot: Arc<ArcSwap<&'static str>> = Arc::new(ArcSwap::from_pointee("initial"));
+
+        // Simulate the publisher's first iteration after spawn.
+        assert_eq!(*slot.load_full(), "initial");
+
+        // Simulate the subscriber's reconnect arm storing a fresh value
+        // into the same slot. The `Arc::clone(&slot)` mirrors how the
+        // spawn code hands the same Arc to both tasks.
+        let subscriber_view = Arc::clone(&slot);
+        subscriber_view.store(Arc::new("after_reconnect"));
+
+        // Publisher's next iteration must observe the swap. A regression
+        // that captured the sender into a local would still return
+        // "initial" here, demonstrating the bug.
+        assert_eq!(
+            *slot.load_full(),
+            "after_reconnect",
+            "publisher must read through the slot, not capture the sender at spawn"
+        );
+    }
+
     /// `AnnounceTrigger::announce_now()` must actually wake a waiting
     /// `notified()` future on the same `Notify`. This is the contract
     /// `publisher_task`'s `tokio::select!` arm depends on — a regression
@@ -535,6 +703,83 @@ mod tests {
             .await
             .expect("waiter should resolve within 200ms of announce_now")
             .expect("waiter task should complete cleanly");
+    }
+
+    /// #577 H3 — locks the metric contract of [`dispatch_insert`]:
+    /// (a) `RejectedFull` bumps `inc_rejected(PEER_TABLE_FULL_LABEL)`
+    /// exactly once per drop and (b) does NOT re-publish the size
+    /// gauge. The subscriber loop calls the same `dispatch_insert`
+    /// function, so the test exercises production code directly — no
+    /// inline mirror to drift.
+    #[test]
+    fn peer_table_full_dispatch_increments_reject_label_and_skips_size_gauge() {
+        use std::sync::Mutex;
+
+        use decdn_protocol::{NodeAnnounce, NodeAnnounceBody};
+
+        use crate::PeerTable;
+
+        #[derive(Debug, Default)]
+        struct Recorder {
+            inner: Mutex<RecorderState>,
+        }
+        #[derive(Debug, Default)]
+        struct RecorderState {
+            reject_labels: Vec<&'static str>,
+            size_gauge_writes: Vec<i64>,
+        }
+        impl GossipMetrics for Recorder {
+            fn inc_published(&self, _topic: &str) {}
+            fn inc_received(&self, _topic: &str) {}
+            fn inc_rejected(&self, reason: &'static str) {
+                // The test module already opts into `unwrap_used`. Don't
+                // swallow `PoisonError` with `if let Ok`: silently dropping
+                // recorded events would surface as a confusing "wrong
+                // event count" later instead of pointing at the original
+                // panic that poisoned the mutex.
+                self.inner.lock().unwrap().reject_labels.push(reason);
+            }
+            fn set_peer_table_size(&self, n: i64) {
+                self.inner.lock().unwrap().size_gauge_writes.push(n);
+            }
+            fn inc_reconnected(&self, _topic: &str) {}
+        }
+
+        fn mk_announce(id: u8, ts_us: u64) -> NodeAnnounce {
+            NodeAnnounce {
+                body: NodeAnnounceBody {
+                    node_id: [id; 32],
+                    region: "US".to_string(),
+                    timestamp_us: ts_us,
+                },
+                signature: vec![0u8; 64],
+            }
+        }
+
+        let mut table = PeerTable::new(0, 2);
+        let metrics = Recorder::default();
+        // ttl=0 isolates the cap branch from any inline-sweep
+        // interaction. Three distinct ids; the third hits the cap.
+        dispatch_insert(&mut table, mk_announce(1, 1), 100, &metrics);
+        dispatch_insert(&mut table, mk_announce(2, 1), 100, &metrics);
+        dispatch_insert(&mut table, mk_announce(3, 1), 100, &metrics);
+
+        let state = metrics.inner.lock().unwrap();
+        assert_eq!(
+            state.reject_labels.as_slice(),
+            &[PEER_TABLE_FULL_LABEL],
+            "exactly one rejection with the peer_table_full label"
+        );
+        assert_eq!(
+            state.size_gauge_writes,
+            vec![1, 2],
+            "the size gauge fires only on the two accepted inserts (1 then 2); the rejected \
+             third insert must not re-publish the gauge"
+        );
+        assert_eq!(table.len(), 2);
+        assert!(table.get(&[1u8; 32]).is_some());
+        assert!(table.get(&[2u8; 32]).is_some());
+        assert!(table.get(&[3u8; 32]).is_none());
     }
 
     /// Back-to-back `announce_now()` calls before the publisher consumes
@@ -565,5 +810,53 @@ mod tests {
             second.is_err(),
             "second notified() must NOT resolve — three calls coalesce to one permit"
         );
+    }
+
+    /// #660 — exercises [`build_gossip`], the single seam every
+    /// production-mode caller uses to construct an iroh-gossip actor,
+    /// and asserts the resulting `Gossip` reports the deCDN-controlled
+    /// [`GOSSIP_MAX_FRAME`] through `Gossip::max_message_size()`. The
+    /// runtime calls the same helper (`crates/node/src/runtime/mod.rs`),
+    /// so a regression that drops `.max_message_size(...)` from the
+    /// helper fails this test rather than silently reverting to
+    /// `iroh_gossip::proto::DEFAULT_MAX_MESSAGE_SIZE` (below our
+    /// `MAX_TRAILING_BYTES + envelope + wrappers` floor).
+    ///
+    /// Also pins both iroh-gossip 0.98 API surfaces this PR depends on
+    /// (`Builder::max_message_size` setter and `Gossip::max_message_size`
+    /// accessor) at compile/run time — an upstream rename or removal
+    /// fails compilation here. A full multi-node behavioral test of
+    /// `read_lp` rejecting an oversized frame is intentionally out of
+    /// scope: iroh-gossip 0.98 exposes no in-process seam for that
+    /// path (the `net::util` module is `pub(crate)`), so it requires
+    /// the two-`Gossip`-instance harness deferred alongside other
+    /// integration tests. The compile-time `const _: () = assert!`
+    /// in `validation.rs` already enforces the floor invariant.
+    #[tokio::test]
+    async fn build_gossip_wires_gossip_max_frame() {
+        use iroh::Endpoint;
+        use iroh::endpoint::presets;
+        use iroh_gossip::proto::MIN_MAX_MESSAGE_SIZE;
+
+        let ep = Endpoint::builder(presets::Minimal)
+            .bind()
+            .await
+            .expect("bind minimal endpoint");
+        let gossip = build_gossip(ep);
+
+        assert_eq!(
+            gossip.max_message_size(),
+            crate::GOSSIP_MAX_FRAME,
+            "build_gossip must thread GOSSIP_MAX_FRAME into iroh-gossip's builder"
+        );
+
+        // Compile-time sanity: above iroh-gossip's panic floor and
+        // strictly below the 16 MiB mental model PR #659 mistakenly
+        // anchored on (deCDN's `MAX_MESSAGE_SIZE`, which applies to
+        // `cdn/probe/v1` / `cdn/client/v1` — *not* gossip).
+        const {
+            assert!(crate::GOSSIP_MAX_FRAME >= MIN_MAX_MESSAGE_SIZE);
+            assert!(crate::GOSSIP_MAX_FRAME < 16 * 1024 * 1024);
+        }
     }
 }

@@ -1,0 +1,12 @@
+{
+  "name": "decdn-contracts-tooling",
+  "private": true,
+  "description": "Local solhint installation for contract linting; not published.",
+  "engines": { "node": ">=20" },
+  "devDependencies": {
+    "solhint": "6.2.1"
+  },
+  "scripts": {
+    "lint": "solhint 'src/**/*.sol' 'testnet/**/*.sol' 'script/**/*.sol'"
+  }
+}

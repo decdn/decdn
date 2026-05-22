@@ -93,6 +93,7 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
             peer_ttl_sec: 600,
             subscribe_global: false,
             allowlist: Vec::new(),
+            max_peer_table_entries: 100_000,
         },
         security: ResolvedSecurity {
             max_concurrent_handlers: 256,

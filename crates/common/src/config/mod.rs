@@ -64,6 +64,12 @@ const MIN_RPC_WATCHDOG_INTERVAL_SEC: u64 = 10;
 const DEFAULT_ANNOUNCE_INTERVAL_SEC: u64 = 60;
 /// Default peer-table entry TTL after which a stale entry is evicted.
 const DEFAULT_PEER_TTL_SEC: u64 = 600;
+/// Default hard cap on `PeerTable` entry count (#577 H3). Sized for ~tens
+/// of MB of resident memory at the ~few-hundred-byte `PeerEntry` size,
+/// which is plenty of headroom for the tens-of-nodes `PoC` while still
+/// capping the fresh-keypair memory-DoS that the empty-allowlist
+/// stand-in would otherwise leave unbounded.
+const DEFAULT_MAX_PEER_TABLE_ENTRIES: u64 = 100_000;
 /// Default global cap on concurrent in-flight QUIC handler tasks.
 const DEFAULT_MAX_CONCURRENT_HANDLERS: u32 = 256;
 /// Default per-source rate-limit refill (cells/second). A single source
@@ -1478,6 +1484,15 @@ fn resolve_gossip_into(
         "gossip.peer_ttl_sec must be > 0",
     );
 
+    let max_peer_table_entries = file
+        .and_then(|g| g.max_peer_table_entries)
+        .unwrap_or(DEFAULT_MAX_PEER_TABLE_ENTRIES);
+    bag.check(
+        max_peer_table_entries > 0,
+        "gossip.max_peer_table_entries",
+        "gossip.max_peer_table_entries must be > 0",
+    );
+
     let subscribe_global = file.and_then(|g| g.subscribe_global).unwrap_or(true);
 
     let allowlist = file
@@ -1497,6 +1512,7 @@ fn resolve_gossip_into(
         peer_ttl_sec,
         subscribe_global,
         allowlist,
+        max_peer_table_entries,
     }
 }
 
@@ -2088,6 +2104,9 @@ mod tests {
 
     // vitalik.eth, known-good EIP-55 checksum.
     const GOOD_ADDR: &str = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045";
+    const ALT_ADDR_1: &str = "0x0000000000000000000000000000000000000001";
+    const ALT_ADDR_2: &str = "0x0000000000000000000000000000000000000002";
+    const ALT_ADDR_3: &str = "0x0000000000000000000000000000000000000003";
 
     #[test]
     fn parse_contract_address_accepts_checksummed() -> anyhow::Result<()> {
@@ -2189,6 +2208,7 @@ mod tests {
             peer_ttl_sec: 600,
             subscribe_global,
             allowlist: Vec::new(),
+            max_peer_table_entries: DEFAULT_MAX_PEER_TABLE_ENTRIES,
         }
     }
 
@@ -2223,12 +2243,14 @@ mod tests {
             peer_ttl_sec: Some(123),
             subscribe_global: Some(false),
             allowlist: None,
+            max_peer_table_entries: Some(7),
         };
         let g = resolve_gossip(Some(&cfg))?;
         assert_eq!(g.announce_interval_sec, 42);
         assert_eq!(g.peer_ttl_sec, 123);
         assert!(!g.subscribe_global);
         assert!(g.allowlist.is_empty());
+        assert_eq!(g.max_peer_table_entries, 7);
         Ok(())
     }
 
@@ -2239,6 +2261,44 @@ mod tests {
         assert_eq!(g.peer_ttl_sec, DEFAULT_PEER_TTL_SEC);
         assert!(g.subscribe_global);
         assert!(g.allowlist.is_empty());
+        assert_eq!(g.max_peer_table_entries, DEFAULT_MAX_PEER_TABLE_ENTRIES);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_gossip_rejects_zero_max_peer_table_entries() {
+        let cfg = types::GossipConfig {
+            max_peer_table_entries: Some(0),
+            ..Default::default()
+        };
+        let err = resolve_gossip(Some(&cfg))
+            .expect_err("expected error")
+            .to_string();
+        assert!(
+            err.contains("max_peer_table_entries"),
+            "error missing field context: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_gossip_max_peer_table_entries_file_override() -> anyhow::Result<()> {
+        let cfg = types::GossipConfig {
+            max_peer_table_entries: Some(42_000),
+            ..Default::default()
+        };
+        let g = resolve_gossip(Some(&cfg))?;
+        assert_eq!(g.max_peer_table_entries, 42_000);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_gossip_max_peer_table_entries_default_when_field_absent() -> anyhow::Result<()> {
+        let cfg = types::GossipConfig {
+            announce_interval_sec: Some(30),
+            ..Default::default()
+        };
+        let g = resolve_gossip(Some(&cfg))?;
+        assert_eq!(g.max_peer_table_entries, DEFAULT_MAX_PEER_TABLE_ENTRIES);
         Ok(())
     }
 
@@ -6088,6 +6148,27 @@ subscribe_global = false
 "#
     }
 
+    fn blockchain_toml_body(
+        rpc_url: &str,
+        payment_channel_address: &str,
+        staking_registry_address: &str,
+        rpc_watchdog_interval_sec: Option<u64>,
+    ) -> String {
+        let watchdog = rpc_watchdog_interval_sec
+            .map(|value| format!("rpc_watchdog_interval_sec = {value}\n"))
+            .unwrap_or_default();
+        format!(
+            r#"
+[blockchain]
+rpc_url = "{rpc_url}"
+payment_channel_address = "{payment_channel_address}"
+staking_registry_address = "{staking_registry_address}"
+{watchdog}[gossip]
+subscribe_global = false
+"#
+        )
+    }
+
     /// Build a minimal `RunArgs` that, combined with `complete_toml_body`,
     /// produces a successfully-resolving config.  `data_dir` points at a
     /// tempdir holding a fake `keystore.json`, which lets `resolve_blockchain`
@@ -6133,6 +6214,102 @@ subscribe_global = false
         // not required (covers `ensure_region_when_publishing_global` happy
         // path through resolve_config).
         assert!(!resolved.gossip.subscribe_global);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_config_blockchain_override_layer_beats_file_for_required_fields()
+    -> anyhow::Result<()> {
+        // Env vars and CLI flags both populate the same top `RunArgs` layer;
+        // `run_subcommand_args_are_wired_to_decdn_env_vars` pins the env
+        // mapping, while this test pins that the populated override layer wins
+        // for every required blockchain field in one end-to-end resolve.
+        let dir = data_dir_with_keystore()?;
+        let path = write_minimal_toml(
+            &dir,
+            &blockchain_toml_body(
+                "https://file.example/rpc",
+                ALT_ADDR_1,
+                ALT_ADDR_2,
+                Some(DEFAULT_RPC_WATCHDOG_INTERVAL_SEC),
+            ),
+        )?;
+        let mut args = run_args_with_data_dir(dir.path());
+        args.blockchain.rpc_url = Some("https://override.example/rpc".to_string());
+        args.blockchain.payment_channel_address = Some(GOOD_ADDR.to_string());
+        args.blockchain.staking_registry_address = Some(ALT_ADDR_3.to_string());
+
+        let resolved = resolve_config(Some(&path), &args)?;
+
+        assert!(
+            resolved
+                .blockchain
+                .rpc_url
+                .starts_with("https://override.example/rpc"),
+            "override-layer rpc_url should win, got {}",
+            resolved.blockchain.rpc_url,
+        );
+        assert_eq!(resolved.blockchain.payment_channel_address, GOOD_ADDR);
+        assert_eq!(resolved.blockchain.staking_registry_address, ALT_ADDR_3);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_config_accepts_file_only_blockchain_fields_at_watchdog_min() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let path = write_minimal_toml(
+            &dir,
+            &blockchain_toml_body(
+                "https://file-only.example/rpc",
+                ALT_ADDR_1,
+                ALT_ADDR_2,
+                Some(MIN_RPC_WATCHDOG_INTERVAL_SEC),
+            ),
+        )?;
+        let args = run_args_with_data_dir(dir.path());
+
+        let resolved = resolve_config(Some(&path), &args)?;
+
+        assert!(
+            resolved
+                .blockchain
+                .rpc_url
+                .starts_with("https://file-only.example/rpc"),
+            "file-only rpc_url should be used, got {}",
+            resolved.blockchain.rpc_url,
+        );
+        assert_eq!(resolved.blockchain.payment_channel_address, ALT_ADDR_1);
+        assert_eq!(resolved.blockchain.staking_registry_address, ALT_ADDR_2);
+        assert_eq!(
+            resolved.blockchain.rpc_watchdog_interval_sec,
+            MIN_RPC_WATCHDOG_INTERVAL_SEC
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_config_rejects_file_only_blockchain_watchdog_below_minimum() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let path = write_minimal_toml(
+            &dir,
+            &blockchain_toml_body(
+                "https://file-only.example/rpc",
+                ALT_ADDR_1,
+                ALT_ADDR_2,
+                Some(MIN_RPC_WATCHDOG_INTERVAL_SEC - 1),
+            ),
+        )?;
+        let args = run_args_with_data_dir(dir.path());
+
+        let Err(err) = resolve_config(Some(&path), &args) else {
+            anyhow::bail!("expected resolve_config to reject a too-small watchdog interval");
+        };
+        let msg = format!("{err:#}");
+        let expected_min = format!("minimum {MIN_RPC_WATCHDOG_INTERVAL_SEC}s");
+        assert!(
+            msg.contains("blockchain.rpc_watchdog_interval_sec") && msg.contains(&expected_min),
+            "error should mention the watchdog field and floor: {msg}"
+        );
         Ok(())
     }
 

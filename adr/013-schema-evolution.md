@@ -63,6 +63,26 @@ These are low-level framing helpers. Application-layer deserialization is separa
 
 `ChunkData` payloads (1024-byte blob chunks) are already implicitly length-delimited by the QUIC stream's byte count and the voucher interval. They MUST still use varint-length framing for consistency — the receiver must distinguish `ChunkData` from `Voucher`/`VoucherAck` on the same stream via the protocol enum discriminant. The 1–2 byte overhead on 1024-byte chunks is ~0.1%.
 
+#### Gossip Framing
+
+The `MAX_MESSAGE_SIZE = 16 MiB` ceiling above applies to the deCDN-implemented ALPNs (`cdn/probe/v1`, `cdn/client/v1`, `cdn/dht/v1`) whose framing is owned by `decdn_protocol::framing`. Gossip messages travel through **iroh-gossip's own length-prefixed framing**, not deCDN's, and carry an independent per-frame ceiling enforced inside `iroh_gossip::net::util::read_lp` *before* the inbound `BytesMut` is resized. The deCDN value is:
+
+- **`GOSSIP_MAX_FRAME = 16 KiB`** (`decdn_gossip::GOSSIP_MAX_FRAME`, wired into `Gossip::builder().max_message_size(...)` at runtime construction).
+
+Rationale (analytical bounds from iroh-gossip 0.98 source):
+
+- Data-frame floor ≈ **4.4 KiB**: maximally-padded `GossipEnvelope` (`NodeAnnounce` body + 64 B ed25519 signature + version byte ≈ 256 B envelope) + `MAX_TRAILING_BYTES` (4 KiB Tier-1 extension) + plumtree/topic message wrappers (variant tags, `MessageId`, `DeliveryScope`/`Round` ≈ 64 B) + iroh-gossip's 4 B u32 length prefix.
+- HyParView control upper bound ≈ **1.7 KiB**: at default fanout (`shuffle_active_view_count=3`, `shuffle_passive_view_count=4`), a `Shuffle`/`ShuffleReply` carries up to 7 `PeerInfo` entries — each 32 B node id + opaque `PeerData` (~100-200 B for relay URL + direct addresses) — plus enum tags and `Ttl(u16)`.
+- 16 KiB gives ~3.7× headroom over the data-frame floor and ~9× over HyParView control, leaving room for future Tier-1 extensions and `PeerData` growth (e.g. multi-relay nodes).
+
+The upstream default (`DEFAULT_MAX_MESSAGE_SIZE = 4096`) is **insufficient**: it cannot carry our `MAX_TRAILING_BYTES` extension allowance even for a single legitimate announce. Pinning the value in code also defends against silent shifts on iroh-gossip minor-version bumps.
+
+**Network-coordination invariant.** Unlike the per-ALPN ceilings above, `GOSSIP_MAX_FRAME` is enforced symmetrically by iroh-gossip on both send and receive paths. Tightening it on one deployment silently partitions the gossip swarm for legitimate HyParView control frames originating elsewhere (cf. [iroh-gossip#131](https://github.com/n0-computer/iroh-gossip/issues/131) — oversize publishes fail silently on the sender). Treat changes to this constant as **wire-compatibility events** requiring coordinated rollout. Do not surface this as an operator-tunable config key.
+
+**Operator-policy scope.** The note above ("Operators on memory-constrained nodes SHOULD set a lower `MAX_MESSAGE_SIZE` as local policy") applies only to deCDN-owned ALPNs whose framing is decoded inside this node and cannot affect a peer; it does NOT apply to `GOSSIP_MAX_FRAME`.
+
+**iroh-gossip dependency.** The cap is wired via `iroh_gossip::net::Gossip::builder().max_message_size(N)` (iroh-gossip ≥ 0.98). The minimum allowed value is `MIN_MAX_MESSAGE_SIZE = 512`; the 4 KiB upstream default is too small for our envelope shape and is deliberately overridden.
+
 ### Protocol Enums
 
 Each ALPN defines a single top-level enum wrapping all message types for that protocol, serialized as the outermost postcard value inside the length-prefixed frame. Postcard encodes enum variants with a varint discriminant (1 byte for variants 0–127), providing explicit, extensible message type tags on the wire.
@@ -421,10 +441,10 @@ QUIC application error codes used by this ADR:
 
 | Code | Name | Meaning |
 | --- | --- | --- |
-| `0x00` | `NO_ERROR` | Normal stream/connection close. Also used when a failure does not map to any code below (e.g. read timeout) |
+| `0x00` | `NO_ERROR` | Normal stream/connection close. Also used for transport-level conditions that aren't application-protocol faults — read timeout, short read, peer reset, mid-frame EOF. A peer observing `0x00` after a partial exchange MUST NOT apply the protocol-fault backoff/penalty associated with `0x03`. (Enforcement of the MUST NOT lives on the receiving peer's reputation/backoff layer — yet to be built; see [ADR 008 §Local Score Calculation](008-reputation.md#local-score-calculation). Without that layer the clause is purely normative.) |
 | `0x01` | `UNSUPPORTED_MESSAGE` | Received an unknown protocol enum variant |
 | `0x02` | `MESSAGE_TOO_LARGE` | Received a length prefix exceeding `MAX_MESSAGE_SIZE` |
-| `0x03` | `MALFORMED_MESSAGE` | Frame failed decoding. Covers postcard deserialization failure, varint parse errors, and transport I/O errors during frame read (since the receiver cannot distinguish a truncated frame from a malformed one at the application layer) |
+| `0x03` | `MALFORMED_MESSAGE` | Frame failed application-layer decoding: postcard deserialization failure or varint parse error. Transport-level read failures (truncation, peer reset) are reported as `0x00` instead — the framing layer surfaces them as a distinct error variant (`FrameError::Io` vs `FrameError::Varint`/`Decode`), so a receiver does not have to collapse the two. |
 | `0x10` | `RATE_LIMITED` | Connection rejected by the per-source or global rate limiter. Delivered via `CONNECTION_CLOSE` (not `RESET_STREAM`) because rejection happens before any application stream exists; the close-frame reason bytes carry a short layer label (e.g. `global-full`, `per-source`) so peers can pick an appropriate backoff. Peers that receive this code SHOULD back off before reconnecting; they MUST NOT treat it as a protocol error. |
 
 #### Scope

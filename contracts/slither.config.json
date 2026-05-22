@@ -1,0 +1,15 @@
+{
+  "filter_paths": "lib/|test/|script/",
+  "exclude_informational": false,
+  "exclude_low": false,
+  "exclude_medium": false,
+  "exclude_high": false,
+  "exclude_optimization": true,
+  "disable_color": true,
+  "fail_on": "medium",
+  "solc_remaps": [
+    "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+    "forge-std/=lib/forge-std/src/"
+  ],
+  "detectors_to_exclude": "naming-convention,solc-version,pragma"
+}

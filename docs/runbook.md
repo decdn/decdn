@@ -179,6 +179,42 @@ identity rotation, host clock skew breaking TLS.
    `timedatectl status`). Skew greater than the QUIC handshake tolerance
    breaks every connection silently.
 
+## Testnet faucet
+
+**⚠️ Testnet only.** `contracts/testnet/TestnetFaucet.sol` is **not** part of
+the audited production surface
+([#452](https://github.com/decdn/decdn/issues/452)) and **must not be
+deployed to mainnet**. The CI gate in
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) (`solidity
+build+test` job) fails any PR that references `TestnetFaucet` outside
+`contracts/testnet/` or `contracts/script/TestnetFaucet.s.sol`.
+
+**What it is.** A per-address TOKEN dispenser. Each address may call
+`claim()` to receive `claimAmount` TOKEN once per `cooldown` seconds.
+Defaults at deploy: `1_000 TOKEN` per `24h`.
+
+**Pre-funding.** The constructor pulls `initialFunding` TOKEN from a
+`treasury` address via `safeTransferFrom`. The treasury must `approve` the
+predicted faucet address before deployment; the
+[deploy script](../contracts/script/TestnetFaucet.s.sol) does this in a
+single broadcast under the treasury sender. Source the funding from the
+initial-holder multisig — there is no other TOKEN source pre-TGE.
+
+**USDC is not in scope.** Circle operates the canonical Sepolia USDC
+faucet: <https://developers.circle.com/stablecoins/docs/usdc-on-testnet>.
+The deCDN faucet only dispenses TOKEN.
+
+**Tuning at runtime.** `GOVERNANCE_ROLE` can adjust `claimAmount` and
+`cooldown` without redeploying. `PAUSER_ROLE` can halt claims via `pause()`
+(`withdraw` is intentionally pause-independent so governance can drain a
+paused faucet without unpausing it).
+
+**Abuse / drain escape hatch.** `withdraw(address to, uint256 amount)` is
+gated by `GOVERNANCE_ROLE` and sweeps any portion of the faucet's balance
+to a chosen destination. Use this to reclaim funds if the faucet is being
+abused (paired with `pause()`) or to retire it at the end of a testnet
+campaign.
+
 ## Where to ask for help
 
 - File or browse issues:

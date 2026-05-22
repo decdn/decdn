@@ -63,3 +63,67 @@ repos:
         language: system
         files: ^adr/(.*\.md|Makefile)$
         pass_filenames: false
+
+      # --- Solidity ----------------------------------------------------
+      # commit-stage (every commit, fast):
+
+      - id: forge-fmt
+        name: forge fmt --check
+        language: system
+        entry: bash -c 'cd contracts && forge fmt --check'
+        files: '^contracts/.*\.sol$'
+        pass_filenames: false
+
+      - id: solhint
+        name: solhint
+        language: node
+        # pre-commit manages its own node sandbox via additional_dependencies,
+        # so this hook works even when contracts/node_modules is missing — no
+        # `npm install` step required at hook time.
+        entry: solhint
+        args:
+          - '--config'
+          - 'contracts/.solhint.json'
+          - 'contracts/src/**/*.sol'
+        additional_dependencies:
+          - 'solhint@6.2.1'
+        files: '^contracts/src/.*\.sol$'
+        pass_filenames: false
+
+      # pre-push-stage (only on `git push`, medium cost):
+
+      - id: forge-build
+        name: forge build --deny warnings
+        language: system
+        stages: [pre-push]
+        entry: bash -c 'cd contracts && forge build --deny warnings'
+        files: '^contracts/.*\.sol$'
+        pass_filenames: false
+
+      - id: forge-test
+        name: forge test
+        language: system
+        stages: [pre-push]
+        entry: bash -c 'cd contracts && forge test'
+        files: '^contracts/.*\.sol$'
+        pass_filenames: false
+
+      # manual-stage (explicit invocation: pre-commit run --hook-stage manual <id>):
+
+      - id: slither
+        name: slither
+        language: system
+        # Needs `pip install slither-analyzer` locally. CI is authoritative.
+        stages: [manual]
+        entry: bash -c 'cd contracts && slither . --config-file slither.config.json'
+        files: '^contracts/.*\.sol$'
+        pass_filenames: false
+
+      - id: aderyn
+        name: aderyn
+        language: system
+        # Needs `aderyn` on PATH (cyfrinup or curl installer). CI is authoritative.
+        stages: [manual]
+        entry: bash -c 'cd contracts && aderyn .'
+        files: '^contracts/.*\.sol$'
+        pass_filenames: false

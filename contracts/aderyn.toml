@@ -1,0 +1,4 @@
+version = 1
+root = "."
+src = "src"
+exclude = ["lib", "out", "cache", "test", "broadcast", "node_modules"]
