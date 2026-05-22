@@ -145,11 +145,11 @@ impl RepublishScheduler {
     }
 
     /// Schedule `hash` with the steady-state jitter window (30–50 min).
-    /// Idempotent — re-scheduling a hash that's already in the heap
-    /// updates the existing entry's due time rather than creating a
-    /// duplicate. (Today's implementation pushes a fresh entry and
-    /// the deduplication-by-tombstone in `drain_due` handles it; the
-    /// `scheduled` set is the de-facto idempotency check.)
+    /// Re-scheduling a hash that's already scheduled pushes a fresh
+    /// heap entry; the prior entry isn't removed. `drain_due` dedupes
+    /// on pop via the `scheduled` set, so a hash drains at most once
+    /// per due window regardless of how many stale heap entries it
+    /// has.
     pub fn schedule_steady(&self, hash: [u8; 32]) {
         let offset = jitter_us(STEADY_STATE_MIN, STEADY_STATE_MAX);
         self.schedule_with_offset(hash, offset);
@@ -293,7 +293,7 @@ pub async fn run_republish(
                         // discoverable for up to 50 minutes — the
                         // exact failure mode the eager publish
                         // closes.
-                        publish_hash(&endpoint, self_id_bytes, &routing, &cache, hash_bytes).await;
+                        publish_hash(&endpoint, self_id_bytes, &routing, hash_bytes).await;
                         scheduler.schedule_steady(hash_bytes);
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -331,14 +331,7 @@ pub async fn run_republish(
                         scheduler.unschedule(&hash);
                         continue;
                     }
-                    publish_hash(
-                        &endpoint,
-                        self_id_bytes,
-                        &routing,
-                        &cache,
-                        hash,
-                    )
-                    .await;
+                    publish_hash(&endpoint, self_id_bytes, &routing, hash).await;
                     // Re-schedule with the steady-state jitter window;
                     // ADR 022 line 130 — fresh jitter draw per record
                     // per cycle.
@@ -368,7 +361,6 @@ async fn publish_hash(
     endpoint: &Endpoint,
     self_id_bytes: [u8; 32],
     routing: &Arc<Mutex<RoutingTable>>,
-    _cache: &decdn_cache::CacheEngine,
     hash: [u8; 32],
 ) {
     let targets: Vec<NodeId> = if let Ok(table) = routing.lock() {

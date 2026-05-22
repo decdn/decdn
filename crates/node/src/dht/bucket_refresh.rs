@@ -11,13 +11,13 @@
 //! hour. Live peers in that distance shell respond with their own
 //! K-closest, populating the bucket with fresh entries.
 //!
-//! Implementation: a single tokio task wakes on a 1-hour ticker, picks
-//! one non-empty bucket per tick (the oldest bucket by last-refresh
-//! time, tracked here so the task spreads its work rather than
-//! refreshing every bucket simultaneously). For each picked bucket it
-//! synthesises a random `NodeId` whose XOR distance to `self` falls in
-//! that bucket's range and runs `FindNode` against the bucket's
-//! most-recently-seen peer.
+//! Implementation: a single tokio task wakes on a 1-hour ticker and
+//! refreshes *every* non-empty bucket per tick (see
+//! [`BUCKET_REFRESH_TICK`] for the rate-budget argument). For each
+//! non-empty bucket it synthesises a random `NodeId` whose XOR
+//! distance to `self` falls in that bucket's range and runs
+//! `FindNode` against the bucket's most-recently-seen peer; the
+//! per-bucket RPCs fan out in parallel.
 //!
 //! This is a "best-effort hygiene" task: a refresh that fails (peer
 //! unreachable, timeout) is silently ignored — the next tick will try

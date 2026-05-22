@@ -38,11 +38,6 @@ use iroh::{Endpoint, EndpointAddr};
 /// wedge a republish sweep.
 pub const DHT_CLIENT_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// Maximum response size — same as the framing layer ceiling, but we
-/// pass it explicitly to `read_to_end` so a misbehaving peer can't
-/// stream an arbitrary amount of data on the response stream.
-const MAX_RESPONSE_BYTES: usize = decdn_protocol::MAX_MESSAGE_SIZE as usize;
-
 /// Send a single `FindNode` request to `target` and return the response.
 ///
 /// Used by the bootstrap path (`FindNode(self.node_id)` to seed the
@@ -205,8 +200,6 @@ pub fn extract_app_error_code(err: &anyhow::Error) -> Option<u32> {
             return Some(code);
         }
     }
-    let _ = MAX_RESPONSE_BYTES; // currently informational; kept so a future
-    // chunked-read switch has the right constant on hand.
     None
 }
 

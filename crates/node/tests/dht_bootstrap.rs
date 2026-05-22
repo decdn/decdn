@@ -285,7 +285,6 @@ async fn run_republish_publishes_immediately_on_cache_insert() -> anyhow::Result
     // start, so a blob wasn't discoverable for up to 50 minutes —
     // this test is the regression guard.
     use decdn_node::dht::{RepublishScheduler, publish::run_republish};
-    use std::path::PathBuf;
     use tokio::sync::{broadcast, oneshot};
 
     // Server S in `staked` so the publish-driven `Store` from the
@@ -365,8 +364,6 @@ async fn run_republish_publishes_immediately_on_cache_insert() -> anyhow::Result
          server's RecordStore should hold the publisher's record within \
          1.5s but did not"
     );
-    let _ = cache_dir; // suppress "unused let binding" — kept-alive guard.
-    let _ = PathBuf::new(); // satisfy "PathBuf import" if linter pivots.
 
     publisher_ep.close().await;
     server.endpoint.close().await;
