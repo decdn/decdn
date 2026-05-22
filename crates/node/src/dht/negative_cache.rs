@@ -2,7 +2,7 @@
 //!
 //! Suppresses repeated `cdn/probe/v1` requests to a `(NodeId, hash)`
 //! pair that already returned `has_blob: false` within the TTL window.
-//! Per ADR 001 §97–99 the cache:
+//! Per ADR 001 § Probe cache the cache:
 //!
 //! - is keyed `(NodeId, hash)`;
 //! - holds at most 1024 entries with LRU eviction;
@@ -26,14 +26,14 @@ use crate::dht::routing::NodeId;
 
 pub use crate::dht::records::Hash;
 
-/// ADR 001 §99: negative cache TTL is 5 minutes — longer than the
+/// ADR 001 § Probe cache: negative cache TTL is 5 minutes — longer than the
 /// positive probe cache (15s) because false-STORE results are less
 /// time-sensitive, and shorter than the DHT record TTL (1h) so a
 /// publisher that genuinely acquires the blob during the negative
 /// window can re-establish reachability after one cache lifetime.
 const DEFAULT_TTL: Duration = Duration::from_mins(5);
 
-/// ADR 001 §97: max 1024 entries.
+/// ADR 001 § Probe cache: max 1024 entries.
 const DEFAULT_CAPACITY: usize = 1024;
 
 type Key = (NodeId, Hash);
@@ -45,10 +45,12 @@ struct Inner {
     /// to track LRU order) into a single store: insertion order is
     /// the LRU ordering, with index 0 = most-recently-used and
     /// `len()-1` = least-recently-used. Bumping a hit means
-    /// `shift_remove` + `shift_insert(0, …)`; eviction means
-    /// `pop` from the back.
+    /// `shift_insert(0, …)`; eviction means `pop` from the back.
     entries: IndexMap<Key, Instant>,
+    /// Hard cap on live entries. Clamped to ≥ 1 in the constructor.
     cap: usize,
+    /// TTL applied to each entry on insert. Anchored at insertion
+    /// (NOT refreshed on read) — see [`NegativeProbeCache::contains_active`].
     ttl: Duration,
 }
 
@@ -66,7 +68,7 @@ impl Default for NegativeProbeCache {
 }
 
 impl NegativeProbeCache {
-    /// Build a cache with the ADR 001 §97 defaults (1024 entries, 5-
+    /// Build a cache with the ADR 001 § Probe cache defaults (1024 entries, 5-
     /// minute TTL).
     #[must_use]
     pub fn new() -> Self {
@@ -91,11 +93,11 @@ impl NegativeProbeCache {
         }
     }
 
-    /// Filter 3 (ADR 022 §184): returns `true` iff
+    /// Filter 3 (ADR 022 § Lookup integrity): returns `true` iff
     /// `(node_id, hash)` is in the cache and its TTL hasn't elapsed.
     /// A live hit bumps the entry to the front of the LRU ordering
     /// (index 0) **without refreshing the entry's expiry** — TTL is
-    /// anchored at insertion per ADR 001 §99, not at read. An
+    /// anchored at insertion per ADR 001 § Probe cache, not at read. An
     /// expired entry is evicted before returning `false`.
     #[must_use]
     pub fn contains_active(&self, node_id: &NodeId, hash: &Hash) -> bool {
@@ -110,7 +112,8 @@ impl NegativeProbeCache {
             return false;
         }
         // Bump to front of LRU, preserving the original expiry.
-        guard.entries.shift_remove(&key);
+        // `shift_insert` on an existing key moves it to the given
+        // index — no explicit remove needed.
         guard.entries.shift_insert(0, key, expiry);
         true
     }
@@ -124,9 +127,9 @@ impl NegativeProbeCache {
         let key = (node_id, hash);
         let mut guard = self.lock();
         let expiry = Instant::now() + guard.ttl;
-        // `shift_insert` removes the existing entry (if any) first
-        // and re-inserts at index 0, which is exactly the MRU bump
-        // we want for the refresh case.
+        // `shift_insert` moves an existing key to the new index and
+        // updates the value (returning the old) — which is exactly
+        // the MRU bump we want on the refresh path.
         guard.entries.shift_insert(0, key, expiry);
         if guard.entries.len() > guard.cap {
             // `pop` removes the last entry — the LRU back.
@@ -202,12 +205,13 @@ mod tests {
 
     #[test]
     fn expired_entry_returns_false_and_is_evicted() {
-        // Margins kept generous (TTL 200ms, sleep 300ms) so CI runners
-        // under load don't flake on tight wall-clock checks.
-        let c = NegativeProbeCache::with_capacity_and_ttl(8, Duration::from_millis(200));
+        // Margins kept generous (TTL 500ms, sleep 750ms) so loaded
+        // CI runners with cargo-nextest parallelism don't flake on
+        // wall-clock checks.
+        let c = NegativeProbeCache::with_capacity_and_ttl(8, Duration::from_millis(500));
         c.record_failure(nid(1), h(1));
         assert!(c.contains_active(&nid(1), &h(1)));
-        thread::sleep(Duration::from_millis(300));
+        thread::sleep(Duration::from_millis(750));
         assert!(!c.contains_active(&nid(1), &h(1)));
         assert!(
             c.is_empty(),
@@ -241,21 +245,44 @@ mod tests {
         assert!(c.contains_active(&nid(3), &h(3)));
     }
 
-    /// Pins the ADR 001 §99 invariant that TTL is anchored at
-    /// insertion, NOT refreshed on read. A regression in
+    /// Pins indexmap's `shift_insert(0, existing_key, value)`
+    /// semantic: an existing key MOVES to index 0 (MRU position).
+    /// The LRU bumping in `contains_active` and the refresh path in
+    /// `record_failure` both rely on this. If indexmap ever changes
+    /// to "keep at original index" (a major-version concern), this
+    /// test fails and surfaces the regression before LRU silently
+    /// degrades.
+    #[test]
+    fn shift_insert_on_existing_key_moves_to_front_of_lru() {
+        let c = NegativeProbeCache::with_capacity(4);
+        c.record_failure(nid(1), h(1));
+        c.record_failure(nid(2), h(2));
+        c.record_failure(nid(3), h(3));
+        // Re-record nid(1) — should become MRU (index 0).
+        c.record_failure(nid(1), h(1));
+        let guard = c.lock();
+        assert_eq!(
+            guard.entries.get_index_of(&(nid(1), h(1))),
+            Some(0),
+            "shift_insert should have moved nid(1) to index 0"
+        );
+    }
+
+    /// Pins the ADR 001 § Probe cache invariant that TTL is anchored
+    /// at insertion, NOT refreshed on read. A regression in
     /// [`NegativeProbeCache::contains_active`] that re-stamped
     /// expiry during the LRU bump would extend the suppression
     /// window beyond spec and ship green without this test.
     #[test]
     fn read_hit_does_not_refresh_ttl() {
-        let c = NegativeProbeCache::with_capacity_and_ttl(8, Duration::from_millis(300));
+        let c = NegativeProbeCache::with_capacity_and_ttl(8, Duration::from_millis(500));
         c.record_failure(nid(1), h(1));
         // Half-TTL — entry still live; read bumps LRU.
-        thread::sleep(Duration::from_millis(150));
+        thread::sleep(Duration::from_millis(250));
         assert!(c.contains_active(&nid(1), &h(1)));
         // Past the original TTL window. If the read had refreshed
         // the expiry, the entry would still be live here.
-        thread::sleep(Duration::from_millis(250));
+        thread::sleep(Duration::from_millis(500));
         assert!(
             !c.contains_active(&nid(1), &h(1)),
             "read-hit illegally extended the TTL window"
@@ -264,17 +291,16 @@ mod tests {
 
     #[test]
     fn re_recording_same_key_refreshes_ttl_does_not_grow_len() {
-        // TTL=400ms; insert, wait 200ms, re-record, wait 300ms.
-        // Without the refresh the first insert (at t=0, TTL 400ms)
-        // would have expired by t=500ms; the refresh at t=200 reset
-        // the window, so the entry should still be live at t=500ms
-        // (300ms post-refresh, inside the 400ms TTL). 100ms margins
-        // each side keep this robust under CI load.
-        let c = NegativeProbeCache::with_capacity_and_ttl(8, Duration::from_millis(400));
+        // TTL=1000ms; insert, wait 500ms, re-record, wait 750ms.
+        // Without the refresh the first insert (t=0, TTL 1000ms)
+        // would have expired by t=1250ms; the refresh at t=500ms
+        // reset the window, so the entry should still be live at
+        // t=1250ms (750ms post-refresh, inside the 1000ms TTL).
+        let c = NegativeProbeCache::with_capacity_and_ttl(8, Duration::from_secs(1));
         c.record_failure(nid(1), h(1));
-        thread::sleep(Duration::from_millis(200));
+        thread::sleep(Duration::from_millis(500));
         c.record_failure(nid(1), h(1));
-        thread::sleep(Duration::from_millis(300));
+        thread::sleep(Duration::from_millis(750));
         assert!(c.contains_active(&nid(1), &h(1)));
         assert_eq!(c.len(), 1);
     }

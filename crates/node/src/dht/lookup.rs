@@ -17,9 +17,9 @@
 //!
 //! Mirrors the textbook Kademlia termination. The empty-providers
 //! convergence case lets the caller fall back to the on-chain
-//! origin-directory ([`super::OriginDirectory`]) per ADR 022 §192.
+//! origin-directory ([`super::OriginDirectory`]) per ADR 022 § `FIND_VALUE` Flow.
 //!
-//! ## Three filters (ADR 022 §180–186)
+//! ## Three filters (ADR 022 § Lookup integrity)
 //!
 //! Applied in order to **every** `FindValueResponse`:
 //! 1. **XOR-distance** — drop `closer_nodes` entries whose distance
@@ -34,10 +34,11 @@
 //!    `closer_nodes`.
 //!
 //! After filtering, the surviving provider set is **randomised**
-//! before return. ADR 022 §186: "Randomization on the requester is
+//! before return. ADR 022 § Lookup integrity: "Randomization on the requester is
 //! the load-bearing defense against ordering manipulation."
 
 use std::collections::{BTreeMap, HashSet};
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -53,21 +54,31 @@ use crate::dht::routing::{K_BUCKET_SIZE, NODE_ID_LEN, NodeId, RoutingTable, xor_
 use crate::dht::staker_set::StakerSet;
 
 /// Default α — parallel in-flight RPCs per round. ADR 022 § Routing Table.
-pub const DEFAULT_ALPHA: usize = 3;
+pub const DEFAULT_ALPHA: NonZeroUsize = match NonZeroUsize::new(3) {
+    Some(n) => n,
+    None => NonZeroUsize::MIN,
+};
 /// Default K — providers-accumulated saturation cap. ADR 022 § Routing Table.
-pub const DEFAULT_K: usize = K_BUCKET_SIZE;
+pub const DEFAULT_K: NonZeroUsize = match NonZeroUsize::new(K_BUCKET_SIZE) {
+    Some(n) => n,
+    None => NonZeroUsize::MIN,
+};
 /// Default round timeout. Belt over the per-RPC 8s timeout in
 /// [`super::client`]; bounds the wall-clock budget for a single
 /// iteration even if a few peers hang.
 pub const DEFAULT_ROUND_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// Lookup tuning knobs.
+/// Lookup tuning knobs. `alpha` and `k` are `NonZeroUsize` so the
+/// type system rules out the silent-no-op states a zero would
+/// produce — empty batches from `pick_round_batch`, instant
+/// "saturation" from `have_enough_providers`. Caller-side clamping
+/// belongs at the config-parse boundary, not at every lookup entry.
 #[derive(Debug, Clone, Copy)]
 pub struct LookupConfig {
     /// Parallel in-flight RPCs per round.
-    pub alpha: usize,
+    pub alpha: NonZeroUsize,
     /// Stop after this many providers accumulated.
-    pub k: usize,
+    pub k: NonZeroUsize,
     /// Per-round timeout — applied around the `JoinSet` drain so a
     /// slow / hanging peer doesn't wedge the iteration.
     pub round_timeout: Duration,
@@ -83,34 +94,12 @@ impl Default for LookupConfig {
     }
 }
 
-/// Clamp zero values that would otherwise silently turn the lookup
-/// into a no-op (`alpha == 0` → empty batches; `k == 0` → instant
-/// "saturation" before any round runs). Emits a `warn!` so the
-/// misconfiguration is surfaced at runtime rather than hidden behind
-/// an empty result.
-fn sanitize_config(cfg: LookupConfig) -> LookupConfig {
-    let alpha = cfg.alpha.max(1);
-    let k = cfg.k.max(1);
-    if alpha != cfg.alpha || k != cfg.k {
-        warn!(
-            cfg_alpha = cfg.alpha,
-            cfg_k = cfg.k,
-            "dht lookup: LookupConfig had zero alpha/k; clamped to 1"
-        );
-    }
-    LookupConfig {
-        alpha,
-        k,
-        round_timeout: cfg.round_timeout,
-    }
-}
-
 /// Run the iterative `FindValue` lookup for `target`.
 ///
 /// Returns the randomised, deduplicated, filter-survived provider
 /// list. An empty return means convergence with no usable providers
 /// — the caller should fall back to the on-chain origin directory
-/// (ADR 022 §192) if applicable.
+/// (ADR 022 § `FIND_VALUE` Flow) if applicable.
 ///
 /// The function never panics or returns `Err`. Per-peer RPC
 /// failures are classified: transport-level failures are absorbed
@@ -128,7 +117,6 @@ pub async fn find_providers(
     target: Hash,
     cfg: LookupConfig,
 ) -> Vec<NodeId> {
-    let cfg = sanitize_config(cfg);
     let ctx = LookupCtx {
         endpoint,
         staker_set: staker_set.as_ref(),
@@ -157,12 +145,19 @@ pub async fn find_providers(
 }
 
 /// Per-peer error category surfaced by a single RPC attempt within a
-/// round. Distinguishes "this `NodeId` failed to decode as an
-/// Ed25519 public key" — which implies state-integrity damage
-/// upstream (routing table or filter pipeline let an invalid id
-/// through) and deserves a `warn!` — from a generic transport-level
-/// RPC failure, which is the expected best-effort outcome per the
-/// function docstring and gets logged at `debug!`.
+/// round. Distinguishes:
+///
+/// - **`InvalidPubKey`** — the candidate `NodeId` failed Ed25519
+///   decode. The bytes already survived the routing-table seed
+///   (see [`LookupState::new`]) and/or three response filters, so
+///   reaching this arm implies one of two upstream paths leaked an
+///   invalid id: a corrupt routing table, or a staker-set seeded
+///   with malformed `NodeId` bytes. Either is actionable and gets a
+///   `warn!`.
+/// - **`Transport(_)`** — a generic transport-level RPC failure
+///   (connect timeout, stream drop, malformed response decode).
+///   Expected best-effort outcome per the function docstring;
+///   logged at `debug!`.
 enum RoundRpcError {
     InvalidPubKey,
     Transport(anyhow::Error),
@@ -303,7 +298,7 @@ fn fold_response(
 }
 
 // ============================================================
-// Filter helpers (ADR 022 §180–186) — pure free functions.
+// Filter helpers (ADR 022 § Lookup integrity) — pure free functions.
 // ============================================================
 
 /// Filter 1: drop `closer_nodes` entries whose XOR distance to
@@ -323,7 +318,7 @@ fn filter_xor_closer(closer_nodes: Vec<NodeId>, target: &Hash, responder: &NodeI
 /// Filter 2: drop non-staked `NodeId`s. Applies symmetrically to
 /// `closer_nodes` and `providers` (the caller invokes once per
 /// field). The DHT routing pool is restricted to staked nodes per
-/// ADR 022 §183.
+/// ADR 022 § Lookup integrity.
 #[must_use]
 fn filter_active_stakers(nodes: Vec<NodeId>, staker_set: &dyn StakerSet) -> Vec<NodeId> {
     nodes
@@ -390,18 +385,17 @@ impl LookupState {
             queried: HashSet::new(),
             providers: IndexSet::new(),
             best_queried_distance: [0xFFu8; NODE_ID_LEN],
-            k: cfg.k,
-            alpha: cfg.alpha,
+            k: cfg.k.get(),
+            alpha: cfg.alpha.get(),
         };
         // Seed from the local routing table. Take more than α so the
         // first round has alternates if the closest few don't answer.
+        let seed_count = cfg.alpha.get().saturating_mul(4);
         let seed = match routing_table.lock() {
-            Ok(t) => t.closest(target, cfg.alpha.saturating_mul(4)),
+            Ok(t) => t.closest(target, seed_count),
             Err(poisoned) => {
                 warn!("dht lookup: routing table mutex poisoned; recovering inner state");
-                poisoned
-                    .into_inner()
-                    .closest(target, cfg.alpha.saturating_mul(4))
+                poisoned.into_inner().closest(target, seed_count)
             }
         };
         for peer in seed {
@@ -465,7 +459,7 @@ impl LookupState {
     }
 
     /// Consume state, return the surviving provider set with order
-    /// randomised, then truncated to K. ADR 022 §186 requires
+    /// randomised, then truncated to K. ADR 022 § Lookup integrity requires
     /// randomisation of the *surviving* set — shuffle precedes
     /// truncation so the truncated K is a random sample, not a
     /// deterministic prefix.
@@ -494,6 +488,9 @@ mod tests {
     }
     fn h(byte: u8) -> Hash {
         [byte; 32]
+    }
+    fn nz(n: usize) -> NonZeroUsize {
+        NonZeroUsize::new(n).expect("test literal is non-zero")
     }
 
     #[test]
@@ -536,8 +533,8 @@ mod tests {
         let routing = Arc::new(Mutex::new(RoutingTable::new(nid(0))));
         let target = h(0);
         let cfg = LookupConfig {
-            alpha: 2,
-            k: 20,
+            alpha: nz(2),
+            k: nz(20),
             round_timeout: Duration::from_secs(1),
         };
         let mut state = LookupState::new(&routing, &target, nid(0xFF), cfg);
@@ -582,16 +579,20 @@ mod tests {
 
     #[test]
     fn into_randomised_providers_truncates_to_k_and_shuffles() {
-        // Stronger than "not always canonical": require at least two
-        // distinct orderings across 16 runs, so a swap-only-the-
-        // last-two shuffle bug doesn't ship green.
+        // With 20 providers truncated to 10, a real Fisher-Yates
+        // yields ~16 distinct orderings across 16 runs (the sample
+        // space is 20!/10! ≈ 6.7e11, collisions are negligible).
+        // A 1-or-2-element-cycle shuffle yields ≤ 6 orderings; a
+        // fully degenerate (identity) shuffle yields 1. Threshold
+        // of 8 catches both classes while leaving margin for a
+        // real-but-unlucky shuffle to pass.
         let canonical = (1u8..=20).map(nid).collect::<Vec<_>>();
         let mut seen_orderings: StdHashSet<Vec<NodeId>> = StdHashSet::new();
         for _ in 0..16 {
             let routing = Arc::new(Mutex::new(RoutingTable::new(nid(0))));
             let cfg = LookupConfig {
-                alpha: 3,
-                k: 10,
+                alpha: nz(3),
+                k: nz(10),
                 round_timeout: Duration::from_secs(1),
             };
             let mut state = LookupState::new(&routing, &h(0), nid(0xFF), cfg);
@@ -607,12 +608,13 @@ mod tests {
             seen_orderings.insert(out);
         }
         assert!(
-            seen_orderings.len() >= 2,
-            "providers came back in the same order across 16 runs — shuffle is degenerate or broken"
+            seen_orderings.len() >= 8,
+            "providers produced fewer than 8 distinct orderings across 16 runs — \
+             shuffle is degenerate or only permutes a tiny prefix"
         );
     }
 
-    /// ADR 022 §184 mandates that the negative-cache filter applies
+    /// ADR 022 § Lookup integrity mandates that the negative-cache filter applies
     /// only to `providers`, never `closer_nodes`. A peer that
     /// previously denied holding `target` may still legitimately
     /// route towards it, so dropping it from `closer_nodes` would
@@ -635,7 +637,7 @@ mod tests {
         cache.record_failure(nid(0x10), target);
 
         // Responder 0x20 returns 0x05 + 0x10 in BOTH fields. Per
-        // ADR 022 §184 only `providers` is filtered.
+        // ADR 022 § Lookup integrity only `providers` is filtered.
         let resp = decdn_protocol::dht::FindValueResponse {
             hash: target,
             providers: vec![nid(0x05), nid(0x10)],
@@ -694,14 +696,74 @@ mod tests {
         assert!(state.providers.contains(&nid(0x07)));
     }
 
+    /// Drives F1 + F2 + F3 + `LookupState`'s self-filter on a single
+    /// response. The per-filter tests cover each in isolation; this
+    /// one defends against filter-reorder, short-circuit-on-empty,
+    /// or wrong-field-routing regressions that none of the unit
+    /// tests would individually catch.
+    #[test]
+    fn fold_response_all_filters_compose() {
+        // target = 0x00, requester = 0x01 (so self appears strictly
+        // closer than the responder 0x40 and would survive F1 if
+        // the self-filter weren't running). Stakers include only
+        // the would-be survivors plus requester / responder.
+        let target = h(0x00);
+        let requester = nid(0x01);
+        let responder = nid(0x40);
+
+        let routing = Arc::new(Mutex::new(RoutingTable::new(nid(0))));
+        let cfg = LookupConfig::default();
+        let mut state = LookupState::new(&routing, &target, requester, cfg);
+
+        let staked: StdHashSet<NodeId> = [requester, responder, nid(0x10), nid(0x12)]
+            .into_iter()
+            .collect();
+        let staker_set: Arc<dyn StakerSet> = Arc::new(ConfigStakerSet::new(staked));
+
+        // (nid(0x10), target) flagged negative — should drop from
+        // providers but NOT from closer_nodes.
+        let cache = NegativeProbeCache::new();
+        cache.record_failure(nid(0x10), target);
+
+        let resp = decdn_protocol::dht::FindValueResponse {
+            hash: target,
+            // providers: [self, non-staked, neg-cached, survivor]
+            providers: vec![requester, nid(0x05), nid(0x10), nid(0x12)],
+            // closer_nodes: [self, non-staked, neg-cached (kept!),
+            //                not-strictly-closer (0x80 > 0x40),
+            //                survivor]
+            closer_nodes: vec![requester, nid(0x05), nid(0x10), nid(0x80), nid(0x12)],
+        };
+        fold_response(
+            &target,
+            staker_set.as_ref(),
+            &cache,
+            resp,
+            responder,
+            &mut state,
+        );
+
+        // Providers: F2 drops 0x05, F3 drops 0x10, self-filter
+        // drops requester → only 0x12 survives.
+        let providers: Vec<NodeId> = state.providers.iter().copied().collect();
+        assert_eq!(providers, vec![nid(0x12)]);
+
+        // Closer_nodes: F1 drops 0x80, F2 drops 0x05, self-filter
+        // drops requester → 0x10 (negative-cached but allowed here)
+        // and 0x12 survive.
+        let mut candidates: Vec<NodeId> = state.candidates.values().copied().collect();
+        candidates.sort_unstable();
+        assert_eq!(candidates, vec![nid(0x10), nid(0x12)]);
+    }
+
     /// `have_enough_providers` is `>= k`, not `> k`. Pin the
     /// boundary so a regression at the comparison ships red.
     #[test]
     fn have_enough_providers_is_inclusive_at_k() {
         let routing = Arc::new(Mutex::new(RoutingTable::new(nid(0))));
         let cfg = LookupConfig {
-            alpha: 3,
-            k: 2,
+            alpha: nz(3),
+            k: nz(2),
             round_timeout: Duration::from_secs(1),
         };
         let mut state = LookupState::new(&routing, &h(0), nid(0xFF), cfg);
@@ -736,21 +798,5 @@ mod tests {
         state.record_provider(nid(0x43));
         assert_eq!(state.candidates.len(), 1);
         assert_eq!(state.providers.len(), 1);
-    }
-
-    /// `sanitize_config` clamps zero alpha / k to 1; otherwise a
-    /// caller passing `LookupConfig::default()` with `..Default::default()`
-    /// patterns could silently wedge the lookup.
-    #[test]
-    fn sanitize_config_clamps_zero_alpha_and_k_to_one() {
-        let cfg = LookupConfig {
-            alpha: 0,
-            k: 0,
-            round_timeout: Duration::from_secs(1),
-        };
-        let clamped = sanitize_config(cfg);
-        assert_eq!(clamped.alpha, 1);
-        assert_eq!(clamped.k, 1);
-        assert_eq!(clamped.round_timeout, Duration::from_secs(1));
     }
 }
