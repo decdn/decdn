@@ -31,17 +31,22 @@ Based on OpenZeppelin Governor, sourcing voting weight from `VotingEscrow` (per 
 | --- | --- |
 | Voting source | `VotingEscrow.balanceOfAt(user, ts)` |
 | Voting weight | ve-balance — equals `amount × remaining_lock_time / 4y`, decaying linearly to zero at lock expiry |
+| Voting delay | 1 day between proposal creation and the vote snapshot |
 | Proposal threshold | 0.1% of total ve-supply at proposal snapshot |
 | Voting period | 7 days |
 | Quorum | 4% of total ve-supply at proposal snapshot |
 | Timelock | 48 hours between vote passing and execution |
-| Vote delegation | Supported — Governor Bravo delegation pattern, applied to ve-balance |
+| Vote delegation | Deferred (see **Delegation** below) — each voter votes their own ve-balance for now |
+
+The clock is timestamp-based (ERC-6372 `mode=timestamp`) to align with `VotingEscrow`'s timestamp-keyed checkpoints. Voting weight is read directly from `VotingEscrow.balanceOfAt` rather than through an `IVotes`/IERC-5805 surface — `VotingEscrow` exposes decaying ve-weight, not voting-unit checkpoints — so the Governor supplies the vote source and quorum as thin overrides over `VotingEscrow` rather than via OZ's `GovernorVotes` / `GovernorVotesQuorumFraction` modules. The voting delay/period and the quorum/threshold fractions are fixed constants (they are not in the economic-parameter set governed under safety bounds below); if governance tuning is later desired, bounded setters are added then.
 
 Quorum and proposal threshold are calibrated against `VotingEscrow.totalSupplyAt(ts)`, **not** total TOKEN supply. ve-supply tracks active commitment rather than passive holdings; calibrating against it avoids the failure mode where the quorum bar trivially exceeds engaged voting power as TOKEN circulates.
 
 Traders, passive holders, and any TOKEN that has not been locked into `VotingEscrow` carry zero voting weight. Operator stake held in `StakingRegistry` is also not voting weight; per [ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ Voting escrow (`VotingEscrow`)](026-tokenomics.md#voting-escrow-votingescrow), operator stake and ve-positions are independent contracts with disjoint roles.
 
-**Delegation.** ve-balance is delegatable using the Governor Bravo `delegate(address)` pattern: the underlying ve-position remains non-transferable (per [ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ Voting escrow (`VotingEscrow`)](026-tokenomics.md#voting-escrow-votingescrow)) but its voting weight may be assigned to another address for the purpose of casting votes. The delegate's vote weight at proposal snapshot equals the sum of `VotingEscrow.balanceOfAt(delegator, ts)` over all delegators that have delegated to them, plus the delegate's own ve-balance if not delegated elsewhere. Delegation is revocable at any time and takes effect at the next snapshot.
+**Delegation (deferred).** Vote delegation is not yet implemented: each voter casts votes with their own ve-balance, read directly from `VotingEscrow.balanceOfAt`. The intended end state is a Governor Bravo `delegate(address)` pattern in which the underlying ve-position remains non-transferable (per [ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ Voting escrow (`VotingEscrow`)](026-tokenomics.md#voting-escrow-votingescrow)) but its voting weight may be assigned to another address for casting votes — the delegate's weight at a snapshot being the sum of `VotingEscrow.balanceOfAt(delegator, ts)` over its delegators plus its own undelegated ve-balance, revocable at any time and effective at the next snapshot.
+
+Delegation is deferred because it is materially harder than ERC20Votes-style delegation: ve-weight decays continuously, so a delegate's weight is a time-varying sum of its delegators' decaying balances rather than a static voting-unit checkpoint. Implementing it correctly requires per-delegate bias/slope checkpointing inside `VotingEscrow` (analogous to the global supply checkpoint), so it is sequenced as follow-up work on `VotingEscrow`. Until it lands, `DecdnGovernor` reads ve-balance directly and exposes no delegation entry points; adding delegation later does not change the Governor's external interface.
 
 #### Bootstrap consideration
 
@@ -93,7 +98,7 @@ The 20% floor on the node-base share is the cashflow invariant defined in [ADR 0
 
 There is no settlement-time fee skim or discount-stake mechanic on the channel contract — accordingly there are no "Protocol fee %" / "Discounted fee %" / "Burn percentage of fees" parameters. Burn is a fixed share of the [ADR 026](026-tokenomics.md#adr-026-tokenomics) `FeeRouter` split (governable within the burn-share bound above).
 
-The 7-day voting period balances responsiveness with participation. Combined with the 48-hour timelock, the total governance delay is 9 days minimum — longer than the standard OpenZeppelin Governor defaults, reflecting ve-weighted participation cadence.
+The 7-day voting period balances responsiveness with participation. Combined with the 1-day voting delay and the 48-hour timelock, the total governance delay is ~10 days minimum — longer than the standard OpenZeppelin Governor defaults, reflecting ve-weighted participation cadence.
 
 Staking and slashing parameters are defined in [ADR 026 § Operator economics and minimum stake – § Slashing and burn](026-tokenomics.md#operator-economics-and-minimum-stake); fee-routing parameters are governed by [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds). Payment channel parameters are defined in [ADR 003](003-payments.md#adr-003-payment-model). This ADR defines the governance mechanism that controls them.
 
@@ -151,7 +156,7 @@ The emergency multisig's fast-track authority over gate 2 is constrained by the 
 ### Negative
 
 - ve-weighted governance shifts capture risk from large TOKEN holders to large ve-lockers; safety bounds limit damage but cannot prevent rent-seeking within allowed parameter ranges (e.g., setting the gauge-boost share to the 60% maximum). Operators who lock heavily for gauge boost (per [ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ Gauge-boost formula](026-tokenomics.md#gauge-boost-formula)) also accumulate disproportionate governance weight; this concentration is partially offset by team / seed / treasury vesting acting as a counterweight during the first ~3 years.
-- 7-day voting period + 48-hour timelock means 9 days minimum to respond to non-emergency issues via governance
+- 1-day voting delay + 7-day voting period + 48-hour timelock means ~10 days minimum to respond to non-emergency issues via governance
 - Governance participation typically skews low; 4% quorum (against ve-supply) may be difficult to reach consistently, especially during the thin-ve-supply bootstrap window where the absolute quorum bar is small but the population of distinct lockers is also small
 - Without auto-ve-lock-on-vest ([ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ Supply and distribution](026-tokenomics.md#supply-and-distribution)), early ve-supply is concentrated in self-locked seed/team/treasury and POL/airdrop participants who choose to lock; a treasury-funded ve-lock-on-claim airdrop is recommended in the first 6–12 months to broaden the active voter base
 - Regulatory risk: governance voting rights may contribute to TOKEN being classified as a security in some jurisdictions (see also [ADR 026](026-tokenomics.md#adr-026-tokenomics))
