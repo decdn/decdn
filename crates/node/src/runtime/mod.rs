@@ -232,8 +232,10 @@ async fn run_record_store_gc(
 /// restart. The panic surfaces via `JoinSet::join_next` at graceful
 /// shutdown, not earlier; operators who want earlier notice should
 /// alert on the `decdn_dht_rate_limit_tracked_{per_ip,per_peer}` gauges
-/// failing to drop on a quiet node (they update only on a successful
-/// GC sweep).
+/// failing to drop on a quiet node (the lazy-prune path in `check` also
+/// writes these gauges, but on a quiet node `check` is not called, so
+/// the periodic sweep is the only writer — and it stops writing if it
+/// dies).
 // Same linear shape as `run_dispatch_gc` and `run_record_store_gc`
 // above (tick → maybe-prune-per-layer → log → loop), with two
 // `if let Some(...)` branches instead of one because there are two

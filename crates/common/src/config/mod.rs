@@ -1599,9 +1599,12 @@ pub fn resolve_security_into(
     if per_source_rate_per_sec == 0.0 {
         tracing::info!("security.per_source_rate_per_sec = 0: per-source rate-limit disabled");
     }
+    // `eprintln!` not `tracing::warn!`: tracing is not initialized at
+    // `resolve_config` time (see `commands::run` and the rationale on
+    // `validate_port_layout_into`).
     if max_tracked_sources == 0 {
-        tracing::warn!(
-            "security.max_tracked_sources = 0: rate-limit bookkeeping map is unbounded; \
+        eprintln!(
+            "warning: security.max_tracked_sources = 0: rate-limit bookkeeping map is unbounded; \
              an attacker churning sources can grow it without limit"
         );
     }
@@ -1690,15 +1693,18 @@ pub fn resolve_dht_into(file: Option<&types::DhtConfig>, bag: &mut ConfigErrorBa
     let max_tracked_per_peer = rate_limit
         .and_then(|r| r.max_tracked_per_peer)
         .unwrap_or(DEFAULT_DHT_MAX_TRACKED_PER_PEER);
+    // `eprintln!` not `tracing::warn!`: tracing is not initialized at
+    // `resolve_config` time (see `commands::run` and the rationale on
+    // `validate_port_layout_into`).
     if max_tracked_per_ip == 0 {
-        tracing::warn!(
-            "dht.rate_limit.max_tracked_per_ip = 0: per-IP bookkeeping map is unbounded; \
+        eprintln!(
+            "warning: dht.rate_limit.max_tracked_per_ip = 0: per-IP bookkeeping map is unbounded; \
              an attacker churning source IPs can grow it without limit"
         );
     }
     if max_tracked_per_peer == 0 {
-        tracing::warn!(
-            "dht.rate_limit.max_tracked_per_peer = 0: per-peer bookkeeping map is unbounded; \
+        eprintln!(
+            "warning: dht.rate_limit.max_tracked_per_peer = 0: per-peer bookkeeping map is unbounded; \
              an attacker churning NodeIds can grow it without limit"
         );
     }

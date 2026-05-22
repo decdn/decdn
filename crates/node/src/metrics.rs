@@ -169,7 +169,8 @@ pub struct DecdnMetrics {
     /// `decdn_dht_rate_limit_prune_sweeps_per_ip_total` to detect cap
     /// saturation. Updated post-prune so the value is at most one
     /// `DHT_RATE_LIMIT_GC_INTERVAL` stale on quiet nodes; reads `0`
-    /// until the first GC tick after startup. Operator-visible name:
+    /// until the first successful prune (lazy or periodic) after
+    /// startup. Operator-visible name:
     /// `decdn_dht_rate_limit_tracked_per_ip` (#645).
     pub dht_rate_limit_tracked_per_ip: Gauge,
     /// Sibling of `dht_rate_limit_tracked_per_ip` for the per-peer map.
