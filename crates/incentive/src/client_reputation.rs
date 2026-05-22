@@ -40,6 +40,7 @@
 //! - any on-chain consequence — this is node-local only.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -54,6 +55,12 @@ const DEFAULT_ACCEPT_THRESHOLD: f64 = 0.70;
 const DEFAULT_REJECT_THRESHOLD: f64 = 0.30;
 /// Default cap, in bytes, for [`Admission::AcceptCapped`] decisions. 1 GiB.
 const DEFAULT_CAP_BYTES: u64 = 1 << 30;
+/// Default ceiling on the number of distinct client addresses tracked
+/// in memory. Sized against an order-of-magnitude estimate of concurrent
+/// unique payers per operator; raise it on operators that see a wider
+/// distribution. `0` in the config means "unbounded" (see
+/// [`ClientReputationConfig::max_tracked_clients`]).
+const DEFAULT_MAX_TRACKED_CLIENTS: usize = 100_000;
 
 /// Validation errors when constructing a [`ClientReputationLedger`].
 #[non_exhaustive]
@@ -189,6 +196,22 @@ pub struct ClientReputationConfig {
     /// whose score sits between the reject and accept thresholds.
     /// Default 1 GiB.
     pub borderline_cap_bytes: u64,
+    /// Maximum number of distinct client addresses tracked in memory.
+    /// `0` means unbounded — matches the `max_tracked_sources = 0`
+    /// convention used by `ResolvedSecurity` in `decdn-common`. When the
+    /// cap is reached and a *new* address arrives via
+    /// [`ClientReputationLedger::record_voucher_received`] or
+    /// [`ClientReputationLedger::record_voucher_withheld`], the entry
+    /// with the smallest `last_seen_us` (oldest observation) is evicted;
+    /// updates to an existing entry never trigger eviction. Default
+    /// `100_000`.
+    ///
+    /// The cap is defense-in-depth: each new key requires the attacker
+    /// to open an L2 payment channel (USDC deposit + gas), so Sybil
+    /// growth is structurally rate-limited per ADR 003 §Corrupted
+    /// delivery. This bound caps in-memory growth in the worst case the
+    /// structural deterrent fails to hold.
+    pub max_tracked_clients: usize,
 }
 
 impl Default for ClientReputationConfig {
@@ -200,6 +223,7 @@ impl Default for ClientReputationConfig {
             reject_threshold: DEFAULT_REJECT_THRESHOLD,
             new_client_cap_bytes: DEFAULT_CAP_BYTES,
             borderline_cap_bytes: DEFAULT_CAP_BYTES,
+            max_tracked_clients: DEFAULT_MAX_TRACKED_CLIENTS,
         }
     }
 }
@@ -214,6 +238,11 @@ impl Default for ClientReputationConfig {
 pub struct ClientReputationLedger {
     config: ClientReputationConfig,
     state: RwLock<HashMap<Address, ClientReputation>>,
+    /// Process-lifetime LRU eviction count. Surfaced via
+    /// [`Self::evictions_total`] so the runtime metrics layer can
+    /// publish the `decdn_client_reputation_evictions_total` counter
+    /// without pulling `iroh-metrics` into this leaf crate.
+    evictions_total: AtomicU64,
 }
 
 impl ClientReputationLedger {
@@ -229,6 +258,7 @@ impl ClientReputationLedger {
         Ok(Self {
             config,
             state: RwLock::new(HashMap::new()),
+            evictions_total: AtomicU64::new(0),
         })
     }
 
@@ -277,6 +307,7 @@ impl ClientReputationLedger {
         Ok(Self {
             config,
             state: RwLock::new(map),
+            evictions_total: AtomicU64::new(0),
         })
     }
 
@@ -377,6 +408,28 @@ impl ClientReputationLedger {
             .state
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Keyspace bound: when a *new* client address arrives at
+        // capacity, evict the entry with the smallest `last_seen_us`
+        // (oldest observation). Updates to an existing client never
+        // evict — `is_new` gates the branch so an established entry
+        // can't displace itself. The write lock already single-flights
+        // concurrent over-cap observers, so no separate prune-guard
+        // atomic is needed (contrast `dispatch.rs::ConnectionLimiter`,
+        // which prunes from a read-lock path and needs one). The linear
+        // scan is acceptable at the 100k default cap and bounded to one
+        // scan per new-key insert. `max_tracked_clients == 0` opts out.
+        let is_new = !guard.contains_key(&client);
+        if is_new
+            && self.config.max_tracked_clients > 0
+            && guard.len() >= self.config.max_tracked_clients
+            && let Some(oldest_key) = guard
+                .iter()
+                .min_by_key(|(_, rep)| rep.last_seen_us)
+                .map(|(k, _)| *k)
+        {
+            guard.remove(&oldest_key);
+            self.evictions_total.fetch_add(1, Ordering::Relaxed);
+        }
         let entry = guard.entry(client).or_insert_with(|| ClientReputation {
             completion_ratio: self.config.initial_score,
             event_count: 0,
@@ -390,6 +443,28 @@ impl ClientReputationLedger {
         entry.total_bytes_delivered = entry.total_bytes_delivered.saturating_add(bytes_delivered);
         entry.last_seen_us = now_us;
         next
+    }
+
+    /// Number of distinct client addresses currently tracked. Surfaced
+    /// as a public accessor so the runtime metrics layer can publish
+    /// the `decdn_client_reputation_tracked_clients` gauge without an
+    /// `iroh-metrics` dependency in `decdn-incentive`.
+    #[must_use]
+    pub fn tracked_clients(&self) -> usize {
+        self.state.read().map_or(0, |g| g.len())
+    }
+
+    /// Cumulative LRU evictions since this ledger was constructed.
+    /// Companion to [`Self::tracked_clients`]; the runtime metrics
+    /// layer publishes this as the
+    /// `decdn_client_reputation_evictions_total` counter. A persistently
+    /// non-zero rate signals either an under-sized
+    /// [`ClientReputationConfig::max_tracked_clients`] or an attacker
+    /// spending L2 channel-open cost to churn keys faster than the cap
+    /// (per ADR 003 §Corrupted delivery, that cost IS the bound).
+    #[must_use]
+    pub fn evictions_total(&self) -> u64 {
+        self.evictions_total.load(Ordering::Relaxed)
     }
 }
 
@@ -1189,6 +1264,181 @@ mod tests {
             loaded.len()
         );
         ensure!(loaded.first().context("empty")?.0 == client_b());
+        Ok(())
+    }
+
+    fn addr_from_index(i: u64) -> Address {
+        let mut bytes = [0u8; 20];
+        bytes[12..20].copy_from_slice(&i.to_be_bytes());
+        Address::from(bytes)
+    }
+
+    #[test]
+    fn lru_eviction_bounds_growth_under_flood() -> anyhow::Result<()> {
+        // Cap-sized ledger flooded with cap+50 distinct clients must stay
+        // at exactly `cap` entries; the evictions counter records the
+        // overflow. Default cap (100k) would be too slow for a unit test
+        // so we build a small-cap ledger explicitly.
+        let cfg = ClientReputationConfig {
+            max_tracked_clients: 32,
+            ..ClientReputationConfig::default()
+        };
+        let l = ClientReputationLedger::new(cfg)?;
+        let flood: u64 = 32 + 50;
+        for i in 0..flood {
+            l.record_voucher_received(addr_from_index(i), 1);
+        }
+        ensure!(
+            l.tracked_clients() == 32,
+            "tracked_clients = {} (expected 32)",
+            l.tracked_clients()
+        );
+        ensure!(
+            l.evictions_total() == 50,
+            "evictions_total = {} (expected 50)",
+            l.evictions_total()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lru_eviction_drops_oldest_entry() -> anyhow::Result<()> {
+        // Three clients seeded with strictly ascending `last_seen_us`;
+        // a fourth at-cap insertion must evict the oldest. `from_snapshot`
+        // pins the timestamps deterministically — calling `record_*` in
+        // sequence would yield adjacent microsecond-bucket timestamps on
+        // fast machines and the test would be flaky.
+        let cfg = ClientReputationConfig {
+            max_tracked_clients: 3,
+            ..ClientReputationConfig::default()
+        };
+        let oldest_addr = address!("00000000000000000000000000000000000000a1");
+        let mid_addr = address!("00000000000000000000000000000000000000a2");
+        let newer_addr = address!("00000000000000000000000000000000000000a3");
+        let entries = [
+            (
+                oldest_addr,
+                ClientReputation {
+                    completion_ratio: 0.9,
+                    event_count: 1,
+                    total_bytes_delivered: 1,
+                    last_seen_us: 100,
+                },
+            ),
+            (
+                mid_addr,
+                ClientReputation {
+                    completion_ratio: 0.8,
+                    event_count: 1,
+                    total_bytes_delivered: 1,
+                    last_seen_us: 200,
+                },
+            ),
+            (
+                newer_addr,
+                ClientReputation {
+                    completion_ratio: 0.7,
+                    event_count: 1,
+                    total_bytes_delivered: 1,
+                    last_seen_us: 300,
+                },
+            ),
+        ];
+        let l = ClientReputationLedger::from_snapshot(cfg, entries.iter().copied())?;
+        ensure!(l.tracked_clients() == 3);
+        let arrival = address!("00000000000000000000000000000000000000a4");
+        l.record_voucher_received(arrival, 1);
+        ensure!(l.tracked_clients() == 3);
+        ensure!(l.evictions_total() == 1);
+        ensure!(
+            l.score(oldest_addr).is_none(),
+            "oldest entry should have been evicted"
+        );
+        ensure!(
+            l.score(mid_addr).is_some(),
+            "mid entry should still be present"
+        );
+        ensure!(
+            l.score(newer_addr).is_some(),
+            "newer entry should still be present"
+        );
+        ensure!(l.score(arrival).is_some(), "new arrival should be tracked");
+        // EWMA state preserved for survivors.
+        ensure!(approx(l.score(mid_addr).context("mid missing")?, 0.8));
+        ensure!(approx(l.score(newer_addr).context("newer missing")?, 0.7));
+        Ok(())
+    }
+
+    #[test]
+    fn max_tracked_clients_zero_is_unbounded() -> anyhow::Result<()> {
+        // `0` matches the `max_tracked_sources = 0` convention in
+        // `decdn-common`: opt out of the cap, never evict.
+        let cfg = ClientReputationConfig {
+            max_tracked_clients: 0,
+            ..ClientReputationConfig::default()
+        };
+        let l = ClientReputationLedger::new(cfg)?;
+        for i in 0..1000u64 {
+            l.record_voucher_received(addr_from_index(i), 1);
+        }
+        ensure!(
+            l.tracked_clients() == 1000,
+            "tracked_clients = {} (expected 1000)",
+            l.tracked_clients()
+        );
+        ensure!(
+            l.evictions_total() == 0,
+            "evictions_total = {} (expected 0)",
+            l.evictions_total()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn max_tracked_clients_one_evicts_on_every_new_address() -> anyhow::Result<()> {
+        // cap=1: each new address evicts the previous one. Repeated
+        // updates to the surviving client must NOT evict — that's the
+        // `is_new` gate, and a regression that triggered eviction on
+        // every update would destroy EWMA history for the only tracked
+        // client.
+        let cfg = ClientReputationConfig {
+            max_tracked_clients: 1,
+            ..ClientReputationConfig::default()
+        };
+        let l = ClientReputationLedger::new(cfg)?;
+        for i in 0..5u64 {
+            let a = addr_from_index(i);
+            l.record_voucher_received(a, 1);
+            ensure!(
+                l.tracked_clients() == 1,
+                "tracked_clients = {} at step {} (expected 1)",
+                l.tracked_clients(),
+                i
+            );
+            ensure!(
+                l.score(a).is_some(),
+                "fresh client missing immediately after insert at step {i}"
+            );
+        }
+        // Four evictions: addrs 0..=3 displaced by the time addr 4 lands.
+        ensure!(
+            l.evictions_total() == 4,
+            "evictions_total = {} (expected 4)",
+            l.evictions_total()
+        );
+        // Existing-client updates must not bump the eviction counter.
+        let survivor = addr_from_index(4);
+        let evictions_before = l.evictions_total();
+        for _ in 0..10 {
+            l.record_voucher_received(survivor, 1);
+        }
+        ensure!(
+            l.evictions_total() == evictions_before,
+            "evictions_total bumped on existing-client updates: {} -> {}",
+            evictions_before,
+            l.evictions_total()
+        );
+        ensure!(l.tracked_clients() == 1);
         Ok(())
     }
 }
