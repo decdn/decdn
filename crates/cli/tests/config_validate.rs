@@ -285,6 +285,7 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             per_source_burst: 200,
             max_tracked_sources: 4096,
         },
+        dht: decdn_common::config::ResolvedDht::default(),
     };
     overrides(&mut cfg);
     cfg

@@ -19,9 +19,9 @@ use crate::cli::run::RunArgs;
 
 pub use errors::ConfigErrorBag;
 pub use resolved::{
-    ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedGossip, ResolvedIdentity,
-    ResolvedNetwork, ResolvedObservability, ResolvedOrigin, ResolvedPayment, ResolvedS3Config,
-    ResolvedS3Credentials, ResolvedSecurity,
+    ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedDht, ResolvedGossip,
+    ResolvedIdentity, ResolvedNetwork, ResolvedObservability, ResolvedOrigin, ResolvedPayment,
+    ResolvedS3Config, ResolvedS3Credentials, ResolvedSecurity,
 };
 pub use types::FileConfig;
 
@@ -82,6 +82,20 @@ const DEFAULT_PER_SOURCE_RATE_PER_SEC: f64 = 100.0;
 const DEFAULT_PER_SOURCE_BURST: u32 = 200;
 /// Default hard cap on tracked source entries in the keyed limiter.
 const DEFAULT_MAX_TRACKED_SOURCES: usize = 4096;
+/// Default sustained per-peer (`NodeId`) rate for `cdn/dht/v1` inbound
+/// (ADR 022 §DHT Rate Limiting). Conservative ceiling on adversarial load,
+/// not a steady-state target.
+const DEFAULT_DHT_PER_PEER_RATE_PER_SEC: f64 = 20.0;
+/// Default per-peer burst capacity for `cdn/dht/v1`. ADR 022 default: 40.
+const DEFAULT_DHT_PER_PEER_BURST: u32 = 40;
+/// Default sustained per-IP rate for `cdn/dht/v1`. ADR 022 default: 100.
+const DEFAULT_DHT_PER_IP_RATE_PER_SEC: f64 = 100.0;
+/// Default per-IP burst capacity for `cdn/dht/v1`. ADR 022 default: 200.
+const DEFAULT_DHT_PER_IP_BURST: u32 = 200;
+/// Default sustained global rate for `cdn/dht/v1`. ADR 022 default: 1000.
+const DEFAULT_DHT_GLOBAL_RATE_PER_SEC: f64 = 1000.0;
+/// Default global burst capacity for `cdn/dht/v1`. ADR 022 default: 2000.
+const DEFAULT_DHT_GLOBAL_BURST: u32 = 2000;
 /// Default interval between iroh-blobs GC sweeps in seconds (#518). Five
 /// minutes balances the hostile-origin amplification window against the
 /// per-sweep cost of walking the blob list. The window matters because
@@ -159,6 +173,7 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
         resolve_observability_into(&cli.observability, file.observability.as_ref(), &mut bag);
     let gossip = resolve_gossip_into(file.gossip.as_ref(), &mut bag);
     let security = resolve_security_into(file.security.as_ref(), &mut bag);
+    let dht = resolve_dht_into(file.dht.as_ref(), &mut bag);
 
     ensure_region_when_publishing_global_into(&identity, &gossip, &mut bag);
     validate_port_layout_into(&network, &observability, &mut bag);
@@ -174,6 +189,7 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
         observability,
         gossip,
         security,
+        dht,
     })
 }
 
@@ -1590,6 +1606,119 @@ pub fn resolve_security_into(
         per_source_burst,
         max_tracked_sources,
     }
+}
+
+/// Resolve `cdn/dht/v1` rate-limit settings (ADR 022 §DHT Rate Limiting).
+///
+/// Each `*_rate_per_sec == 0.0` paired with `*_burst == 0` disables that
+/// layer (operator opt-out). Mixing `rate > 0` with `burst == 0` is
+/// rejected as a deny-all corner case — the resolver treats it the same
+/// way [`resolve_security_into`] handles the `per_source` pairing.
+///
+/// Trusted IPs are parsed once at resolution; malformed entries fail
+/// fast under the bag pattern.
+#[allow(clippy::cognitive_complexity)] // linear "default-or-file → validate" rows.
+pub fn resolve_dht_into(file: Option<&types::DhtConfig>, bag: &mut ConfigErrorBag) -> ResolvedDht {
+    // ADR 022 nests the rate-limit knobs under `dht.rate_limit.*` (see
+    // §Trusted-IP exemption — "Configuration key: dht.rate_limit.trusted_ips").
+    // The file shape mirrors that; an absent `[dht.rate_limit]` collapses
+    // to "all defaults" through the same `.and_then` chain the other
+    // resolvers use.
+    let rate_limit = file.and_then(|d| d.rate_limit.as_ref());
+    let per_peer_rate_per_sec = rate_limit
+        .and_then(|r| r.per_peer_rate_per_sec)
+        .unwrap_or(DEFAULT_DHT_PER_PEER_RATE_PER_SEC);
+    bag.check(
+        per_peer_rate_per_sec.is_finite() && per_peer_rate_per_sec >= 0.0,
+        "dht.rate_limit.per_peer_rate_per_sec",
+        "dht.rate_limit.per_peer_rate_per_sec must be a finite non-negative number (0 disables the layer)",
+    );
+    let per_peer_burst = rate_limit
+        .and_then(|r| r.per_peer_burst)
+        .unwrap_or(DEFAULT_DHT_PER_PEER_BURST);
+    bag.check(
+        per_peer_rate_per_sec == 0.0 || per_peer_burst > 0,
+        "dht.rate_limit.per_peer_burst",
+        "dht.rate_limit.per_peer_burst must be > 0 when per_peer_rate_per_sec > 0 (set both to 0 to disable)",
+    );
+
+    let per_ip_rate_per_sec = rate_limit
+        .and_then(|r| r.per_ip_rate_per_sec)
+        .unwrap_or(DEFAULT_DHT_PER_IP_RATE_PER_SEC);
+    bag.check(
+        per_ip_rate_per_sec.is_finite() && per_ip_rate_per_sec >= 0.0,
+        "dht.rate_limit.per_ip_rate_per_sec",
+        "dht.rate_limit.per_ip_rate_per_sec must be a finite non-negative number (0 disables the layer)",
+    );
+    let per_ip_burst = rate_limit
+        .and_then(|r| r.per_ip_burst)
+        .unwrap_or(DEFAULT_DHT_PER_IP_BURST);
+    bag.check(
+        per_ip_rate_per_sec == 0.0 || per_ip_burst > 0,
+        "dht.rate_limit.per_ip_burst",
+        "dht.rate_limit.per_ip_burst must be > 0 when per_ip_rate_per_sec > 0 (set both to 0 to disable)",
+    );
+
+    let global_rate_per_sec = rate_limit
+        .and_then(|r| r.global_rate_per_sec)
+        .unwrap_or(DEFAULT_DHT_GLOBAL_RATE_PER_SEC);
+    bag.check(
+        global_rate_per_sec.is_finite() && global_rate_per_sec >= 0.0,
+        "dht.rate_limit.global_rate_per_sec",
+        "dht.rate_limit.global_rate_per_sec must be a finite non-negative number (0 disables the layer)",
+    );
+    let global_burst = rate_limit
+        .and_then(|r| r.global_burst)
+        .unwrap_or(DEFAULT_DHT_GLOBAL_BURST);
+    bag.check(
+        global_rate_per_sec == 0.0 || global_burst > 0,
+        "dht.rate_limit.global_burst",
+        "dht.rate_limit.global_burst must be > 0 when global_rate_per_sec > 0 (set both to 0 to disable)",
+    );
+
+    let trusted_ips = parse_trusted_ips(rate_limit.and_then(|r| r.trusted_ips.as_deref()), bag);
+
+    ResolvedDht {
+        per_peer_rate_per_sec,
+        per_peer_burst,
+        per_ip_rate_per_sec,
+        per_ip_burst,
+        global_rate_per_sec,
+        global_burst,
+        trusted_ips,
+    }
+}
+
+/// Convenience wrapper for [`resolve_dht_into`] that takes a fresh
+/// `ConfigErrorBag`. Test-only.
+#[cfg(test)]
+pub fn resolve_dht(file: Option<&types::DhtConfig>) -> anyhow::Result<ResolvedDht> {
+    one_section(|bag| resolve_dht_into(file, bag))
+}
+
+fn parse_trusted_ips(
+    raw: Option<&[String]>,
+    bag: &mut ConfigErrorBag,
+) -> std::collections::HashSet<std::net::IpAddr> {
+    let mut out = std::collections::HashSet::new();
+    let Some(entries) = raw else {
+        return out;
+    };
+    for entry in entries {
+        match entry.parse::<std::net::IpAddr>() {
+            Ok(ip) => {
+                out.insert(ip);
+            }
+            Err(e) => {
+                bag.check_with(false, "dht.rate_limit.trusted_ips", || {
+                    format!(
+                        "dht.rate_limit.trusted_ips entry {entry:?} is not a valid IP address: {e}"
+                    )
+                });
+            }
+        }
+    }
+    out
 }
 
 /// Parse a 64-character hex (case-insensitive) node ID into 32 raw bytes.

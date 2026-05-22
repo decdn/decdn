@@ -9,6 +9,7 @@
 pub mod admin;
 pub mod channel_store;
 pub mod commands;
+pub mod dht;
 pub mod dispatch;
 pub mod handlers;
 pub mod metrics;
