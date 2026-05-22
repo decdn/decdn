@@ -576,6 +576,11 @@ contract StakingRegistryTest is Test {
         assertEq(reg.addressToNodeId(holder.addr), bytes32(0));
         assertEq(reg.getActiveNodeCount(), 0, "holder's node deactivated");
         assertFalse(reg.getNodeByAddress(holder.addr).active);
+        assertEq(
+            reg.getNodeByAddress(holder.addr).nodeId,
+            bytes32(0),
+            "NodeInfo.nodeId zeroed so read views stay consistent with cleared binding"
+        );
         assertEq(reg.registrationNonce(nodeId), 1, "nonce bumped");
     }
 
@@ -611,6 +616,25 @@ contract StakingRegistryTest is Test {
 
         assertEq(reg.nodeIdToAddress(nodeId), reclaimer.addr);
         assertTrue(reg.isActiveNode(nodeId));
+    }
+
+    function test_reclaimNodeId_clearsRecordForDeregisteredHolder() public {
+        // Deregister keeps the binding (addressToNodeId / NodeInfo.nodeId) so
+        // the operator can re-register cheaply. A subsequent reclaim must still
+        // zero NodeInfo.nodeId so it stays consistent with the cleared binding.
+        (Vm.Wallet memory holder, bytes32 nodeId,) = _registerAt(0);
+        vm.prank(holder.addr);
+        reg.deregisterNode();
+        assertEq(reg.getNodeByAddress(holder.addr).nodeId, nodeId, "binding retained across deregister");
+
+        address reclaimer = makeAddr("reclaimer");
+        vm.prank(reclaimer);
+        reg.reclaimNodeId(nodeId, hex"deadbeef");
+
+        assertEq(reg.addressToNodeId(holder.addr), bytes32(0));
+        assertEq(
+            reg.getNodeByAddress(holder.addr).nodeId, bytes32(0), "NodeInfo.nodeId zeroed even when already inactive"
+        );
     }
 
     // -----------------------------------------------------------------

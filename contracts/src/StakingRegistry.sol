@@ -210,8 +210,8 @@ contract StakingRegistry is AccessControl, ReentrancyGuard, Pausable, EIP712 {
     /// @notice NodeId → Ethereum address. Reverse of `addressToNodeId`.
     mapping(bytes32 nodeId => address operator) public nodeIdToAddress;
 
-    /// @notice Ethereum address → NodeId. Cleared via `bindNodeId` rebinding
-    ///         (which lands with the rebinding PR).
+    /// @notice Ethereum address → NodeId. Cleared on `bindNodeId` rebinding to
+    ///         a different NodeId and on `reclaimNodeId`.
     mapping(address operator => bytes32 nodeId) public addressToNodeId;
 
     /// @notice Per-Ethereum-address replay counter for the EIP-712 binding
@@ -592,10 +592,12 @@ contract StakingRegistry is AccessControl, ReentrancyGuard, Pausable, EIP712 {
     }
 
     /// @notice Reclaim a `nodeId` from its current holder by proving ed25519
-    ///         ownership. Forcibly tears down the holder's binding (and
-    ///         deactivates their node if it was the reclaimed NodeId), clears
-    ///         the mappings, and bumps `registrationNonce[nodeId]`. The caller
-    ///         can then `registerNode` under their own address.
+    ///         ownership. Forcibly tears down the holder's binding: clears the
+    ///         binding mappings and — when the holder's registration record
+    ///         points at the reclaimed NodeId — deactivates the node and zeroes
+    ///         its `NodeInfo.nodeId` so the read views stay consistent. Bumps
+    ///         `registrationNonce[nodeId]`. The caller can then `registerNode`
+    ///         under their own address.
     /// @dev    Sole reclaim mechanism — no admin override (ADR 003 § Reclaim
     ///         flow). With ed25519 now required on both `registerNode` and
     ///         `bindNodeId`, no legitimate path binds a NodeId without
@@ -613,11 +615,20 @@ contract StakingRegistry is AccessControl, ReentrancyGuard, Pausable, EIP712 {
 
         _verifyEd25519OwnershipSignature(nodeId, ed25519Signature);
 
-        // Deactivate the holder's node if this is its bound NodeId.
+        // Tear down the holder's registration record for this NodeId so the
+        // read views stay consistent with the binding mappings cleared below:
+        // a reclaimed NodeId is no longer the holder's, so `NodeInfo.nodeId`
+        // must not keep pointing at it (otherwise `getNodeByAddress(holder)`
+        // would still report it while `addressToNodeId[holder]` reads zero).
+        // Historical fields (multiaddrs / regionHint / timestamps) are left
+        // as-is, matching the deregister convention.
         NodeInfo storage info = _nodes[currentHolder];
-        if (info.active && info.nodeId == nodeId) {
-            info.active = false;
-            _removeFromRegisteredSet(currentHolder);
+        if (info.nodeId == nodeId) {
+            if (info.active) {
+                info.active = false;
+                _removeFromRegisteredSet(currentHolder);
+            }
+            info.nodeId = bytes32(0);
         }
         delete nodeIdToAddress[nodeId];
         delete addressToNodeId[currentHolder];
