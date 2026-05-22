@@ -365,7 +365,13 @@ impl AdminRpcServer for AdminRpcImpl {
         })
     }
 
-    async fn drain(&self, req: DrainRequest) -> RpcResult<DrainResponse> {
+    async fn drain(&self, req: Option<DrainRequest>) -> RpcResult<DrainResponse> {
+        // Normalize the optional wire param to the resolved-form
+        // `DrainRequest` so the runtime logic operates on a single
+        // canonical type. `None` (caller sent no `params`) is
+        // indistinguishable from `Some(DrainRequest::default())` from
+        // here on — both mean "SIGTERM-equivalent drain".
+        let req = req.unwrap_or_default();
         // Establish `wait_admin` *before* firing the trigger so the
         // runtime's reader (which loads it after `wait()` resolves) can
         // see the request's value with no acquire-side race. The
@@ -379,8 +385,18 @@ impl AdminRpcServer for AdminRpcImpl {
         // so this `fire()` lands in an abandoned arm. Functionally fine
         // — shutdown is happening anyway — but a future reader shouldn't
         // infer causation from the response.
+        //
+        // `wait_admin_honored` mirrors `req.wait_admin` because the
+        // runtime ordering check reads the same flag we just set. The
+        // CLI uses this as a cross-version ack: an older server lacking
+        // the field deserializes it to `false`, and `decdn node drain
+        // --wait` refuses to poll against a server that can't honor the
+        // request.
         self.state.drain_trigger.fire();
-        Ok(DrainResponse { initiated: true })
+        Ok(DrainResponse {
+            initiated: true,
+            wait_admin_honored: req.wait_admin,
+        })
     }
 
     async fn peers_list(&self) -> RpcResult<PeersResponse> {
@@ -1157,13 +1173,22 @@ mod tests {
         );
         let rpc = AdminRpcImpl::new(state);
 
-        let resp = rpc.drain(DrainRequest::default()).await.expect("drain ok");
+        let resp = rpc
+            .drain(Some(DrainRequest::default()))
+            .await
+            .expect("drain ok");
         assert!(resp.initiated, "expected initiated=true");
         // Default DrainRequest leaves `wait_admin` at false, matching
-        // SIGTERM-equivalent ordering.
+        // SIGTERM-equivalent ordering. `wait_admin_honored` therefore
+        // mirrors the request and is also `false` — the CLI uses this
+        // to refuse polling against a server that didn't opt in.
         assert!(
             !trigger.wait_admin(),
             "default DrainRequest must not enable wait_admin"
+        );
+        assert!(
+            !resp.wait_admin_honored,
+            "default DrainRequest must report wait_admin_honored=false"
         );
 
         // Verify the trigger actually fired: `wait()` should resolve
@@ -1207,13 +1232,19 @@ mod tests {
         );
 
         let resp = rpc
-            .drain(DrainRequest { wait_admin: true })
+            .drain(Some(DrainRequest { wait_admin: true }))
             .await
             .expect("drain ok");
         assert!(resp.initiated, "expected initiated=true");
         assert!(
             trigger.wait_admin(),
             "wait_admin=true request must set the trigger flag"
+        );
+        // Server reports the ack so the CLI can refuse to poll when a
+        // server doesn't honor `--wait`.
+        assert!(
+            resp.wait_admin_honored,
+            "wait_admin=true request must report wait_admin_honored=true"
         );
 
         // The fire must still happen — runtime needs to wake up either way.
@@ -1222,6 +1253,52 @@ mod tests {
         assert!(
             waited.is_ok(),
             "drain RPC with wait_admin=true must still fire the trigger"
+        );
+    }
+
+    /// Regression for the wire-compat hole the reviewers flagged
+    /// (#662): when an older client (or a curl/python script) calls
+    /// `admin_v1_drain` with no `params` field, the RPC must still
+    /// trigger drain and return the default response. Per
+    /// `crates/common/src/admin.rs` the trait declares `req:
+    /// Option<DrainRequest>`, so jsonrpsee's proc-macro uses
+    /// `optional_next()` and decodes a missing parameter to `None`;
+    /// the impl normalizes to `DrainRequest::default()`. This test
+    /// asserts that the `None` path produces the same observable
+    /// effects as `Some(DrainRequest::default())`.
+    #[tokio::test]
+    async fn admin_drain_with_no_params_still_triggers() {
+        let trigger = Arc::new(DrainTrigger::new());
+        let (cache, _tmp) = test_cache().await;
+        let state = AdminState::new(
+            Arc::new(RwLock::new(PeerTable::new(0, 0))),
+            [0u8; 32],
+            Instant::now(),
+            cache,
+            None,
+            None,
+            Arc::clone(&trigger),
+            throwaway_signer(),
+            Arc::new(crate::metrics::Metrics::new()),
+        );
+        let rpc = AdminRpcImpl::new(state);
+
+        let resp = rpc.drain(None).await.expect("drain ok");
+        assert!(resp.initiated, "expected initiated=true");
+        assert!(
+            !resp.wait_admin_honored,
+            "no-params drain must report wait_admin_honored=false"
+        );
+        assert!(
+            !trigger.wait_admin(),
+            "no-params drain must keep wait_admin=false"
+        );
+
+        let waited =
+            tokio::time::timeout(std::time::Duration::from_millis(100), trigger.wait()).await;
+        assert!(
+            waited.is_ok(),
+            "no-params drain must still fire the underlying trigger"
         );
     }
 

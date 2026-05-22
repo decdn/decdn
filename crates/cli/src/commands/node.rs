@@ -318,9 +318,9 @@ pub async fn drain(args: &cli::DrainArgs, global_config: Option<&Path>) -> anyho
         .with_context(|| format!("failed to build admin JSON-RPC client for {url}"))?;
 
     let resp: DrainResponse = client
-        .drain(DrainRequest {
+        .drain(Some(DrainRequest {
             wait_admin: args.wait,
-        })
+        }))
         .await
         .map_err(|err| classify_client_error(&url, args.timeout_ms, err))?;
 
@@ -339,10 +339,29 @@ pub async fn drain(args: &cli::DrainArgs, global_config: Option<&Path>) -> anyho
         return Ok(());
     }
 
-    // `--wait` path: drain has been initiated with `wait_admin=true`, so
-    // the server is keeping admin alive through `router.shutdown`. Poll
-    // until `in_flight_streams == 0`, admin closes (ECONNREFUSED), or
-    // the wall-clock budget elapses.
+    // Cross-version safety: `--wait` is only safe when the server is
+    // actually keeping admin alive through `router.shutdown`. A server
+    // that doesn't honor `wait_admin` (older binary, future bug,
+    // anything in between) lacks the `wait_admin_honored` field, which
+    // serde-defaults to `false` on this side. Refuse to enter the
+    // polling loop in that case — otherwise the imminent ECONNREFUSED
+    // from the early admin tear-down would be misread as drain
+    // completion while in-flight streams are still running, defeating
+    // the zero-payment-loss guarantee.
+    if !resp.wait_admin_honored {
+        return Err(anyhow::anyhow!(
+            "admin at {url} did not honor --wait (wait_admin_honored=false); \
+             the server is likely older than the CLI or does not implement \
+             #604. Re-run without --wait, or upgrade the node",
+        ));
+    }
+
+    // `--wait` path: drain has been initiated with `wait_admin=true`,
+    // and the server acked it. Poll until `in_flight_streams == 0`,
+    // admin closes (ECONNREFUSED — the runtime tore admin down after
+    // `router.shutdown` returned), or the wall-clock budget elapses.
+    // Both terminal-success paths emit the same JSON shape so machine
+    // consumers see a single schema regardless of which branch fires.
     let deadline = std::time::Instant::now() + Duration::from_secs(args.wait_timeout_secs);
     let poll_interval = Duration::from_millis(args.wait_poll_ms);
     loop {
@@ -350,24 +369,10 @@ pub async fn drain(args: &cli::DrainArgs, global_config: Option<&Path>) -> anyho
             Ok(h) => h,
             Err(JsonRpcClientError::Transport(inner)) if is_connection_refused(inner.as_ref()) => {
                 // Admin closed — runtime finished `router.shutdown` and
-                // moved on. This is the success path: in-flight streams
-                // are necessarily zero (router awaited them all) and
-                // the runtime has now torn down admin as designed.
-                if args.json {
-                    // Synthesize a minimal terminal response so `--json`
-                    // consumers still get a well-formed object instead of
-                    // a half-written stream.
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "drain_complete": true,
-                            "in_flight_streams": 0,
-                            "admin_closed": true,
-                        })
-                    );
-                } else {
-                    println!("drain_complete=true in_flight_streams=0 admin_closed=true");
-                }
+                // moved on. In-flight streams are necessarily zero
+                // (router awaited them all) and the runtime has now
+                // torn admin down as designed.
+                emit_drain_complete(args.json, true);
                 return Ok(());
             }
             Err(other) => {
@@ -375,13 +380,7 @@ pub async fn drain(args: &cli::DrainArgs, global_config: Option<&Path>) -> anyho
             }
         };
         if h.in_flight_streams == 0 {
-            if args.json {
-                let pretty =
-                    serde_json::to_string_pretty(&h).context("failed to encode health response")?;
-                println!("{pretty}");
-            } else {
-                println!("drain_complete=true in_flight_streams=0");
-            }
+            emit_drain_complete(args.json, false);
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
@@ -402,6 +401,26 @@ pub async fn drain(args: &cli::DrainArgs, global_config: Option<&Path>) -> anyho
             ));
         }
         tokio::time::sleep(poll_interval).await;
+    }
+}
+
+/// Emit the unified terminal-success line for `decdn node drain
+/// --wait`. Both the polled-to-zero and ECONNREFUSED branches print
+/// the same `{drain_complete, in_flight_streams, admin_closed}` shape
+/// so machine consumers don't have to parse two unrelated schemas
+/// depending on which path fired (#662 review).
+fn emit_drain_complete(json: bool, admin_closed: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "drain_complete": true,
+                "in_flight_streams": 0,
+                "admin_closed": admin_closed,
+            })
+        );
+    } else {
+        println!("drain_complete=true in_flight_streams=0 admin_closed={admin_closed}");
     }
 }
 

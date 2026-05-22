@@ -226,10 +226,13 @@ pub struct ReloadResponse {
 
 /// Request body for `admin_v1_drain` (issue #244).
 ///
-/// All fields are `#[serde(default)]` so older clients calling with no
-/// params (the pre-#604 shape) still deserialize cleanly to
-/// `DrainRequest::default()` and trigger the original SIGTERM-equivalent
-/// shutdown order.
+/// Per-field `#[serde(default)]` lets a caller send `{}` (object with
+/// no keys) and get the SIGTERM-equivalent default. Older clients that
+/// omit the `params` field entirely are handled separately by the RPC
+/// signature: the trait declares `req: Option<DrainRequest>` so
+/// jsonrpsee's proc-macro uses `optional_next()` and decodes a missing
+/// parameter to `None`, which the server impl normalizes to
+/// `DrainRequest::default()`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DrainRequest {
     /// When `true`, ask the runtime to keep the admin server alive
@@ -244,21 +247,31 @@ pub struct DrainRequest {
     pub wait_admin: bool,
 }
 
-/// Response body for `admin_v1_drain` (issue #244). Always `initiated:
-/// true` on a non-error response — drain is fire-and-forget; the runtime
-/// begins the same graceful sequence SIGTERM triggers, and the admin
-/// server normally stops early (metrics first, then admin, both before
-/// `router.shutdown`). When the request set `wait_admin: true`
-/// (issue #604) the runtime instead keeps the admin server alive until
-/// `router.shutdown` returns so a polling client (`decdn node drain
-/// --wait`) can observe `admin_v1_health.in_flight_streams` reach 0.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Response body for `admin_v1_drain` (issue #244). `initiated: true`
+/// reports that the trigger fired; `wait_admin_honored` reports
+/// whether the server actually plans to keep admin alive through
+/// `router.shutdown` (issue #604). The `decdn node drain --wait`
+/// client uses `wait_admin_honored` as a cross-version safety check:
+/// against an older server (or any handler that doesn't propagate the
+/// flag) the field deserializes to its serde default of `false`, and
+/// the client refuses to enter the polling loop instead of treating
+/// the imminent ECONNREFUSED as drain completion.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DrainResponse {
-    /// Always `true` on a non-error response — the trigger has been fired
-    /// and the runtime's shutdown sequence is underway. "Initiated", not
-    /// "completed": the admin server may close before the response
-    /// returns when `wait_admin` was unset (the original ADR-025 order).
+    /// `true` once the trigger has been fired and the runtime's
+    /// shutdown sequence is underway. "Initiated", not "completed":
+    /// when `wait_admin_honored` is `false`, the admin server may
+    /// close before the response itself is delivered (the original
+    /// ADR-025 ordering).
     pub initiated: bool,
+    /// `true` when the server received `wait_admin: true` *and* is
+    /// keeping admin alive through `router.shutdown` on this drain.
+    /// `#[serde(default)]` so older servers (which don't serialize the
+    /// field) round-trip cleanly as `false`; the `--wait` client treats
+    /// `false` as "server cannot observe completion safely" and refuses
+    /// to poll.
+    #[serde(default)]
+    pub wait_admin_honored: bool,
 }
 
 /// JSON-RPC error code: the request shape was wrong (bad hex, etc.).
@@ -359,11 +372,15 @@ pub trait AdminRpc {
     /// Set `req.wait_admin = true` (issue #604) to ask the runtime to
     /// keep the admin server alive through `router.shutdown` so a
     /// polling client can observe `admin_v1_health.in_flight_streams`
-    /// reach 0. Older clients sending no parameters still deserialize
-    /// to `DrainRequest::default()` and get the original
+    /// reach 0. The parameter is `Option<DrainRequest>`: jsonrpsee's
+    /// proc-macro maps `Option<T>` arguments to `optional_next()`
+    /// (`render_server.rs:378`), so older clients that omit the
+    /// `params` field entirely decode to `None` rather than
+    /// `InvalidParams`. The server impl normalizes `None` to
+    /// `DrainRequest::default()` and gets the original
     /// SIGTERM-equivalent shutdown order.
     #[method(name = "drain")]
-    async fn drain(&self, req: DrainRequest) -> RpcResult<DrainResponse>;
+    async fn drain(&self, req: Option<DrainRequest>) -> RpcResult<DrainResponse>;
 }
 
 /// Decode a 64-character hex BLAKE3 hash into a [`struct@Hash`].

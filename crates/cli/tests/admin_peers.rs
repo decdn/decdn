@@ -26,10 +26,12 @@ use decdn_gossip::PeerTable;
 use decdn_node::admin::{self, AdminState, DrainTrigger};
 use decdn_node::metrics::Metrics;
 use decdn_protocol::{NodeAnnounce, NodeAnnounceBody};
+use jsonrpsee::RpcModule;
 use jsonrpsee::core::ClientError;
 use jsonrpsee::core::client::ClientT;
 use jsonrpsee::http_client::HttpClientBuilder;
 use jsonrpsee::rpc_params;
+use jsonrpsee::server::{Server, ServerConfig};
 use tokio::net::TcpListener;
 use tokio::sync::{RwLock, oneshot};
 
@@ -508,8 +510,12 @@ async fn admin_v1_drain_returns_initiated_true() -> anyhow::Result<()> {
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
     let client = HttpClientBuilder::default().build(&url)?;
-    let resp = client.drain(DrainRequest::default()).await?;
+    let resp = client.drain(Some(DrainRequest::default())).await?;
     assert!(resp.initiated, "expected initiated=true");
+    assert!(
+        !resp.wait_admin_honored,
+        "default DrainRequest must report wait_admin_honored=false"
+    );
     // Default request leaves wait_admin false → SIGTERM-equivalent
     // ordering preserved.
     assert!(
@@ -578,6 +584,62 @@ async fn cli_drain_rejects_zero_timeout() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Wire-level back-compat regression for the `Option<DrainRequest>`
+/// seam (#662 review): an older client (or any caller — `curl`, a
+/// Python script, the pre-#604 `decdn` CLI) that invokes
+/// `admin_v1_drain` with no `params` field at all must still trigger
+/// drain and return the default response. Without
+/// `req: Option<DrainRequest>` on the trait, jsonrpsee's proc-macro
+/// uses `next()` and would return JSON-RPC `-32602 Invalid params`.
+/// We bypass the generated client (which always sends `Some(...)`)
+/// and call the raw `request` method with `rpc_params![]` to
+/// reproduce the legacy wire shape.
+#[tokio::test]
+async fn admin_v1_drain_with_empty_params_still_triggers() -> anyhow::Result<()> {
+    let peer_table = Arc::new(RwLock::new(PeerTable::new(0, 0)));
+    let (cache, _tmp) = test_cache().await?;
+    let drain_trigger = Arc::new(DrainTrigger::new());
+    let state = AdminState::new(
+        peer_table,
+        [0u8; 32],
+        Instant::now(),
+        cache,
+        None,
+        None,
+        Arc::clone(&drain_trigger),
+        throwaway_signer(),
+        Arc::new(Metrics::new()),
+    );
+    let (url, stop_tx, join) = spawn_admin(state).await?;
+
+    let client = HttpClientBuilder::default().build(&url)?;
+    // Raw call: `rpc_params![]` serializes as `"params":[]`, which
+    // is how a pre-#604 client invokes a parameter-less method.
+    let resp: decdn_common::admin::DrainResponse =
+        client.request("admin_v1_drain", rpc_params![]).await?;
+    assert!(resp.initiated, "expected initiated=true on no-params drain");
+    assert!(
+        !resp.wait_admin_honored,
+        "no-params drain must report wait_admin_honored=false"
+    );
+    // Server-side observable effect: trigger fired and wait_admin
+    // stayed false.
+    assert!(
+        !drain_trigger.wait_admin(),
+        "no-params drain must keep wait_admin=false"
+    );
+    let waited =
+        tokio::time::timeout(std::time::Duration::from_millis(100), drain_trigger.wait()).await;
+    assert!(
+        waited.is_ok(),
+        "no-params drain must still fire the trigger"
+    );
+
+    let _ = stop_tx.send(());
+    join.await?;
+    Ok(())
+}
+
 /// `decdn node drain --wait` succeeds when `in_flight_streams` is
 /// already 0 — the server's gauge starts at 0 and the polling loop
 /// returns on the first `health()` tick.
@@ -618,6 +680,64 @@ async fn cli_drain_wait_returns_immediately_when_idle() -> anyhow::Result<()> {
 
     let _ = stop_tx.send(());
     join.await?;
+    Ok(())
+}
+
+/// `decdn node drain --wait` fails fast (no polling) when the server
+/// responds with `wait_admin_honored: false`, simulating an older
+/// server (or any future regression where the runtime ordering wasn't
+/// reapplied). Without this guard, the imminent ECONNREFUSED from the
+/// early admin tear-down would be misread as drain completion while
+/// in-flight streams keep running — exactly the false-success the
+/// reviewer flagged.
+///
+/// The simulated server is a minimal jsonrpsee `RpcModule` that hand-
+/// rolls an `admin_v1_drain` returning the legacy shape (no
+/// `wait_admin_honored` field; serde-defaults to `false` on the CLI's
+/// side). No `admin_v1_health` is registered — the CLI must reject
+/// before ever polling, so the absence proves the guard fired.
+#[tokio::test]
+async fn cli_drain_wait_refuses_unhonored_server() -> anyhow::Result<()> {
+    let (listener, addr) = bind_loopback().await?;
+    let std_listener = listener.into_std()?;
+    let config = ServerConfig::builder().http_only().build();
+    let server = Server::builder()
+        .set_config(config)
+        .build_from_tcp(std_listener)
+        .map_err(|e| anyhow::anyhow!("build fake admin: {e}"))?;
+    let mut module = RpcModule::new(());
+    module.register_async_method("admin_v1_drain", |_params, _ctx, _ext| async move {
+        // Legacy shape: no `wait_admin_honored` field. Serde on
+        // the CLI side defaults it to `false`, triggering the
+        // safety guard.
+        Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!({
+            "initiated": true,
+        }))
+    })?;
+    let handle = server.start(module);
+
+    let url = format!("http://{addr}");
+    let args = DrainArgs {
+        admin_url: Some(url.clone()),
+        config: None,
+        json: false,
+        timeout_ms: 5_000,
+        wait: true,
+        wait_timeout_secs: 30,
+        wait_poll_ms: 250,
+    };
+    let err = commands::drain(&args, None)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("expected unhonored-server error"))?
+        .to_string();
+    assert!(
+        err.contains("wait_admin_honored=false"),
+        "error should mention wait_admin_honored=false, got: {err}"
+    );
+
+    handle.stop().ok();
+    handle.stopped().await;
     Ok(())
 }
 
