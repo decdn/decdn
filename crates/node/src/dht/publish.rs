@@ -164,14 +164,12 @@ impl RepublishScheduler {
 
     /// Batch-schedule every hash in `iter` with an independent
     /// cold-start jitter draw (uniform(0, 40 min) per hash, NOT a
-    /// shared timestamp). Consumed by the runtime at startup over
-    /// [`decdn_cache::CacheEngine::access_times_snapshot`] so any
-    /// blob already on disk gets a republish entry without waiting
-    /// for `subscribe_inserts` (which only fires on fresh
-    /// pull-through commits, not on cache reuse across restarts).
-    /// Returns the number of hashes scheduled — useful for the
-    /// startup log line so operators can see how big the cold-start
-    /// queue is.
+    /// shared timestamp). Callers should pass
+    /// [`decdn_cache::CacheEngine::iter_hashes`] results (NOT
+    /// `access_times_snapshot`) — see the `iter_hashes` rustdoc for
+    /// the rationale. Returns the number of hashes scheduled —
+    /// useful for the startup log line so operators can see how big
+    /// the cold-start queue is.
     pub fn seed_cold_start<I>(&self, iter: I) -> usize
     where
         I: IntoIterator<Item = [u8; 32]>,

@@ -552,12 +552,25 @@ pub async fn run(
     let republish_scheduler = Arc::new(crate::dht::RepublishScheduler::new());
     let (republish_stop_tx, republish_stop_rx) = oneshot::channel::<()>();
     let cache_inserts_rx = cache.subscribe_inserts();
-    let cold_start_count = republish_scheduler.seed_cold_start(
-        cache
-            .access_times_snapshot()
-            .into_keys()
-            .map(|h| *h.as_bytes()),
-    );
+    // Walk the on-disk store (NOT `access_times_snapshot`, which maps `Hash →
+    // Instant` and is empty on every cold start) so every committed,
+    // non-evicted blob gets a `uniform(0, 40 min)` republish entry per ADR
+    // 022 §Bootstrap AC 16. On a transient list-error we degrade: the
+    // steady-state `subscribe_inserts` path catches only blobs newly fetched
+    // post-boot — blobs already on disk that get cache-HIT requests are NOT
+    // re-scheduled until the next successful restart.
+    let cold_start_count = match cache.iter_hashes().await {
+        Ok(hashes) => {
+            republish_scheduler.seed_cold_start(hashes.into_iter().map(|h| *h.as_bytes()))
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "cold-start seed failed; blobs not re-fetched this session will go un-republished until next restart (ADR 022 §Bootstrap AC 16 degraded)"
+            );
+            0
+        }
+    };
     tracing::info!(
         cold_start_count,
         "republish scheduler seeded from existing cache (ADR 022 §Bootstrap cold-start)"
