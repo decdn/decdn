@@ -56,10 +56,8 @@ const DEFAULT_REJECT_THRESHOLD: f64 = 0.30;
 /// Default cap, in bytes, for [`Admission::AcceptCapped`] decisions. 1 GiB.
 const DEFAULT_CAP_BYTES: u64 = 1 << 30;
 /// Default ceiling on the number of distinct client addresses tracked
-/// in memory. Sized against an order-of-magnitude estimate of concurrent
-/// unique payers per operator; raise it on operators that see a wider
-/// distribution. `0` in the config means "unbounded" (see
-/// [`ClientReputationConfig::max_tracked_clients`]).
+/// in memory. Tune per deployment; `0` in the config means "unbounded"
+/// (see [`ClientReputationConfig::max_tracked_clients`]).
 const DEFAULT_MAX_TRACKED_CLIENTS: usize = 100_000;
 
 /// Validation errors when constructing a [`ClientReputationLedger`].
@@ -306,29 +304,7 @@ impl ClientReputationLedger {
                 );
             }
         }
-        // Enforce the keyspace cap at hydration time too, so the ledger
-        // never starts above its configured ceiling. Without this a
-        // torn / outdated store could re-introduce the very unbounded-
-        // map shape the cap exists to prevent. Uses
-        // `select_nth_unstable_by_key` for an O(n) partition (the bulk-
-        // shrink primitive the issue scope calls out for "if ever
-        // needed"); the eventual redb-backed store should write through
-        // the bounded ledger, so a hydration-side cap-overflow is
-        // expected to be rare in practice — when it happens, the
-        // hydration drops the entries with the smallest `last_seen_us`.
-        let bulk_evicted: u64 =
-            if config.max_tracked_clients > 0 && map.len() > config.max_tracked_clients {
-                let to_remove = map.len() - config.max_tracked_clients;
-                let mut pairs: Vec<(Address, u64)> =
-                    map.iter().map(|(k, v)| (*k, v.last_seen_us)).collect();
-                pairs.select_nth_unstable_by_key(to_remove, |(_, t)| *t);
-                for (addr, _) in pairs.iter().take(to_remove) {
-                    map.remove(addr);
-                }
-                u64::try_from(to_remove).unwrap_or(u64::MAX)
-            } else {
-                0
-            };
+        let bulk_evicted = truncate_to_cap(&mut map, config.max_tracked_clients);
         tracing::info!(
             loaded = map.len(),
             skipped,
@@ -505,6 +481,35 @@ impl ClientReputationLedger {
     pub fn evictions_total(&self) -> u64 {
         self.evictions_total.load(Ordering::Relaxed)
     }
+}
+
+/// Drop the entries with the smallest `last_seen_us` until `map` fits
+/// `cap`. `cap == 0` opts out (matches the [`ClientReputationConfig`]
+/// sentinel). A torn or outdated store could re-introduce the
+/// unbounded-map shape the cap exists to prevent;
+/// `select_nth_unstable_by_key` partitions in O(n) so we drop the
+/// oldest rows without a full sort. Emits a separate `tracing::warn!`
+/// when truncation fires — that's the "unbounded shape reappearing"
+/// integrity signal, distinct from the routine "hydration complete"
+/// summary.
+fn truncate_to_cap(map: &mut HashMap<Address, ClientReputation>, cap: usize) -> u64 {
+    if cap == 0 || map.len() <= cap {
+        return 0;
+    }
+    let to_remove = map.len() - cap;
+    let mut pairs: Vec<(Address, u64)> = map.iter().map(|(k, v)| (*k, v.last_seen_us)).collect();
+    pairs.select_nth_unstable_by_key(to_remove, |(_, t)| *t);
+    for (addr, _) in pairs.iter().take(to_remove) {
+        map.remove(addr);
+    }
+    let bulk_evicted = u64::try_from(to_remove).unwrap_or(u64::MAX);
+    tracing::warn!(
+        cap,
+        bulk_evicted,
+        loaded_after = map.len(),
+        "client_reputation: hydration exceeded cap, dropped oldest rows",
+    );
+    bulk_evicted
 }
 
 fn unix_micros() -> u64 {
@@ -1405,6 +1410,33 @@ mod tests {
         // EWMA state preserved for survivors.
         ensure!(approx(l.score(mid_addr).context("mid missing")?, 0.8));
         ensure!(approx(l.score(newer_addr).context("newer missing")?, 0.7));
+        // Post-eviction the evicted address must resolve as "unseen" — a
+        // future refactor that left a zero-event ghost in the map would
+        // pass `score().is_none()` if the ghost was outside the map but
+        // could slip through if it were inside. Pin the AcceptCapped tier
+        // and `byte_cap == new_client_cap_bytes` explicitly to catch that
+        // class of regression.
+        match l.admit(oldest_addr) {
+            Admission::AcceptCapped { byte_cap } => {
+                ensure!(
+                    byte_cap == ClientReputationConfig::default().new_client_cap_bytes,
+                    "evicted client should re-admit at new_client_cap_bytes ({}), got {}",
+                    ClientReputationConfig::default().new_client_cap_bytes,
+                    byte_cap
+                );
+            }
+            other => anyhow::bail!("evicted client should admit as AcceptCapped, got {other:?}"),
+        }
+        // Re-inserting an evicted address must fold against `initial_score`,
+        // not against the decayed score the evicted entry carried (0.9). A
+        // soft-delete bug here would leak EWMA state across the eviction.
+        let next = l.record_voucher_received(oldest_addr, 0);
+        let cfg = ClientReputationConfig::default();
+        let expected = (1.0 - cfg.alpha) * cfg.initial_score + cfg.alpha * 1.0;
+        ensure!(
+            approx(next, expected),
+            "re-inserted client folded from wrong baseline: got {next}, expected {expected}",
+        );
         Ok(())
     }
 
