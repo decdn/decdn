@@ -297,6 +297,11 @@ pub struct ResolvedDht {
     pub global_rate_per_sec: f64,
     pub global_burst: u32,
     pub trusted_ips: std::collections::HashSet<std::net::IpAddr>,
+    /// Hard cap on the per-IP keyed-limiter map (#645). `0` => unbounded.
+    pub max_tracked_per_ip: usize,
+    /// Hard cap on the per-peer (`NodeId`) keyed-limiter map (#645). `0`
+    /// => unbounded.
+    pub max_tracked_per_peer: usize,
 }
 
 impl Default for ResolvedDht {
@@ -309,6 +314,8 @@ impl Default for ResolvedDht {
             global_rate_per_sec: 1000.0,
             global_burst: 2000,
             trusted_ips: std::collections::HashSet::new(),
+            max_tracked_per_ip: 4096,
+            max_tracked_per_peer: 4096,
         }
     }
 }

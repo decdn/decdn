@@ -151,6 +151,30 @@ pub struct DecdnMetrics {
     /// to `dht_rate_limit_rejected_per_peer` — see its docs. Operator-
     /// visible name: `decdn_dht_rate_limit_rejected_global_total`.
     pub dht_rate_limit_rejected_global: Counter,
+    /// `retain_recent` sweeps of the per-IP DHT keyed-limiter map that
+    /// actually ran (single-flight CAS won, layer enabled). Bump from
+    /// both the lazy-prune path in `DhtRateLimiter::check` and the
+    /// periodic `gc_per_ip` GC task. Persistent growth without a matching
+    /// drop in `decdn_dht_rate_limit_tracked_per_ip` means the limiter
+    /// is observing churn faster than `retain_recent` can release entries
+    /// — investigate cap saturation. Operator-visible name:
+    /// `decdn_dht_rate_limit_prune_sweeps_per_ip_total` (#645).
+    pub dht_rate_limit_prune_sweeps_per_ip: Counter,
+    /// Sibling of `dht_rate_limit_prune_sweeps_per_ip` for the per-peer
+    /// (`NodeId`) keyed-limiter map. Operator-visible name:
+    /// `decdn_dht_rate_limit_prune_sweeps_per_peer_total` (#645).
+    pub dht_rate_limit_prune_sweeps_per_peer: Counter,
+    /// Current size of the per-IP DHT keyed-limiter map after the most
+    /// recent prune (lazy or periodic). Pair with
+    /// `decdn_dht_rate_limit_prune_sweeps_per_ip_total` to detect cap
+    /// saturation. Updated post-prune so the value is at most one
+    /// `DHT_RATE_LIMIT_GC_INTERVAL` stale on quiet nodes; reads `0`
+    /// until the first GC tick after startup. Operator-visible name:
+    /// `decdn_dht_rate_limit_tracked_per_ip` (#645).
+    pub dht_rate_limit_tracked_per_ip: Gauge,
+    /// Sibling of `dht_rate_limit_tracked_per_ip` for the per-peer map.
+    /// Operator-visible name: `decdn_dht_rate_limit_tracked_per_peer` (#645).
+    pub dht_rate_limit_tracked_per_peer: Gauge,
     /// `cdn/dht/v1` request handling failed after the request was admitted
     /// by the rate limiter — frame decode error, response write error,
     /// read timeout, etc. Tracked separately from the rate-limit
@@ -405,6 +429,35 @@ impl Metrics {
     /// Record a `cdn/dht/v1` request rejected at the global layer.
     pub fn dht_rate_limit_rejected_global(&self) {
         self.decdn.dht_rate_limit_rejected_global.inc();
+    }
+
+    /// Record a `retain_recent` sweep of the per-IP DHT keyed-limiter
+    /// map (#645).
+    pub fn dht_rate_limit_prune_sweep_per_ip(&self) {
+        self.decdn.dht_rate_limit_prune_sweeps_per_ip.inc();
+    }
+
+    /// Record a `retain_recent` sweep of the per-peer DHT keyed-limiter
+    /// map (#645).
+    pub fn dht_rate_limit_prune_sweep_per_peer(&self) {
+        self.decdn.dht_rate_limit_prune_sweeps_per_peer.inc();
+    }
+
+    /// Set the per-IP DHT keyed-limiter tracked-size gauge (#645). The
+    /// `try_from(...).unwrap_or(i64::MAX)` clamp matches the existing
+    /// gauge-set pattern elsewhere in this module and stays within the
+    /// workspace's anti-panic policy.
+    pub fn dht_rate_limit_tracked_per_ip_set(&self, n: usize) {
+        self.decdn
+            .dht_rate_limit_tracked_per_ip
+            .set(i64::try_from(n).unwrap_or(i64::MAX));
+    }
+
+    /// Set the per-peer DHT keyed-limiter tracked-size gauge (#645).
+    pub fn dht_rate_limit_tracked_per_peer_set(&self, n: usize) {
+        self.decdn
+            .dht_rate_limit_tracked_per_peer
+            .set(i64::try_from(n).unwrap_or(i64::MAX));
     }
 
     /// Record a `cdn/dht/v1` request that was admitted by the rate
