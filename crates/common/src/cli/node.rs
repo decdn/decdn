@@ -3,9 +3,24 @@
 //! `node` is the operator-local admin namespace: subcommands talk to the
 //! loopback admin HTTP surface (ADR 025) exposed by a running node.
 
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
+
+/// Default `--wait-timeout-secs`. Wrapped here as a `const` so the
+/// `NonZeroU64` constructor can be evaluated at compile time.
+const DEFAULT_WAIT_TIMEOUT_SECS: NonZeroU64 = match NonZeroU64::new(30) {
+    Some(v) => v,
+    None => unreachable!(),
+};
+
+/// Default `--wait-poll-ms`. Wrapped here as a `const` for the same
+/// reason as [`DEFAULT_WAIT_TIMEOUT_SECS`].
+const DEFAULT_WAIT_POLL_MS: NonZeroU64 = match NonZeroU64::new(250) {
+    Some(v) => v,
+    None => unreachable!(),
+};
 
 /// Operator-local admin commands that query a running deCDN node.
 #[derive(Args, Debug)]
@@ -258,16 +273,20 @@ pub struct DrainArgs {
     /// Wall-clock budget (seconds) for the `--wait` polling loop. On
     /// overrun the CLI exits non-zero and prints `drain_timeout=true`.
     /// Ignored without `--wait`. Default 30s covers the runtime's 15s
-    /// `SHUTDOWN_DEADLINE` plus typical settle time.
-    #[arg(long, value_name = "SECS", default_value_t = 30)]
-    pub wait_timeout_secs: u64,
+    /// `SHUTDOWN_DEADLINE` plus typical settle time. `NonZeroU64` so
+    /// clap rejects `0` at parse time — a zero-second budget would
+    /// deadline-overrun on the first iteration with no signal of why.
+    #[arg(long, value_name = "SECS", default_value_t = DEFAULT_WAIT_TIMEOUT_SECS)]
+    pub wait_timeout_secs: NonZeroU64,
 
     /// Cadence (milliseconds) at which `--wait` polls
-    /// `admin_v1_health`. Lower values converge faster on short drains;
-    /// higher values reduce admin churn on long ones. Ignored without
-    /// `--wait`.
-    #[arg(long, value_name = "MS", default_value_t = 250)]
-    pub wait_poll_ms: u64,
+    /// `admin_v1_health`. Lower values converge faster on short
+    /// drains; higher values reduce admin churn on long ones. Ignored
+    /// without `--wait`. `NonZeroU64` so clap rejects `0` at parse
+    /// time — a zero-millisecond poll interval would spin a busy loop
+    /// against the loopback admin port.
+    #[arg(long, value_name = "MS", default_value_t = DEFAULT_WAIT_POLL_MS)]
+    pub wait_poll_ms: NonZeroU64,
 }
 
 /// `decdn node peers` — list the gossip peer table of a running node.

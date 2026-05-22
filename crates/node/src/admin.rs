@@ -10,7 +10,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use alloy::signers::local::PrivateKeySigner;
@@ -25,7 +25,6 @@ use decdn_gossip::{AnnounceTrigger, PeerEntry, PeerTable};
 use jsonrpsee::core::{RpcResult, async_trait};
 use jsonrpsee::server::{Server, ServerConfig};
 use jsonrpsee::types::ErrorObjectOwned;
-use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, RwLock, oneshot};
 
@@ -103,22 +102,38 @@ pub struct AdminState {
 
 /// One-shot trigger that lets `admin_v1_drain` wake the runtime's main
 /// select loop and request graceful shutdown (issue #244). Modelled on
-/// [`tokio::sync::Notify`] so the RPC handler can fire-and-return without
-/// blocking on the runtime's shutdown latency. The runtime side awaits
-/// `wait()` in its select loop; firing twice is a no-op (the second
-/// `notify_one` coalesces, same as `Notify`).
+/// [`tokio::sync::Notify`] so the RPC handler can fire-and-return
+/// without blocking on the runtime's shutdown latency. The runtime
+/// awaits [`wait`](Self::wait) in its select loop; firing twice is a
+/// no-op (the second `notify_one` coalesces, same as `Notify`).
 ///
-/// The `wait_admin` flag is a side-channel set by the drain RPC handler
-/// *before* it calls [`fire`](Self::fire) when the request carries
-/// `wait_admin: true` (issue #604). The runtime reads it after
-/// [`wait`](Self::wait) resolves to decide whether to delay the admin
-/// server's stop signal until after `router.shutdown` returns — the
-/// "keep admin alive so `decdn node drain --wait` can poll" seam.
-/// Default `false` preserves the original SIGTERM-equivalent order.
+/// `wait_admin` (issue #604) is a per-drain configuration bit:
+/// [`fire`](Self::fire) takes it as a parameter. **First writer wins**
+/// — once a fire has established the value, subsequent fires return
+/// that same value rather than overwriting. This collapses two prior
+/// races into one well-defined outcome:
+///
+/// 1. A handler that called `set_wait_admin` after `fire` (no longer
+///    possible — the API has no such method).
+/// 2. Two concurrent drain RPCs whose `wait_admin` values disagreed
+///    (the earlier one's response now correctly reports the effective
+///    value the runtime will see).
+///
+/// Cross-thread visibility comes from the `Notify::notify_one →
+/// Notify::notified()` happens-before edge: the runtime's
+/// [`wait_admin`](Self::wait_admin) load is sequenced after
+/// `notified()` resolves, and tokio's `Notify` publishes prior writes
+/// (including the `OnceLock` store) on that edge. The `OnceLock`'s own
+/// synchronization is belt-and-braces — important only for readers
+/// that don't go through `wait()`.
 #[derive(Debug, Default)]
 pub struct DrainTrigger {
     notify: Notify,
-    wait_admin: AtomicBool,
+    /// `None` until the first `fire(...)` call lands; `Some(v)` once
+    /// some writer has established the effective `wait_admin` value
+    /// for this drain. Subsequent fires return this value without
+    /// overwriting it.
+    wait_admin: OnceLock<bool>,
 }
 
 impl DrainTrigger {
@@ -127,31 +142,42 @@ impl DrainTrigger {
         Self::default()
     }
 
-    /// Signal the runtime to begin graceful shutdown. Fire-and-forget:
-    /// calling this more than once is a no-op (the second `notify_one`
-    /// coalesces into the pending permit the first call stored).
-    pub fn fire(&self) {
+    /// Signal the runtime to begin graceful shutdown with the requested
+    /// `wait_admin` ordering. Returns the *effective* value the runtime
+    /// will see — equal to `wait_admin` if this is the first fire, or
+    /// the prior writer's value if a fire already happened. The drain
+    /// RPC uses the return as the `wait_admin_honored` ack so callers
+    /// see the truth about what the runtime will actually do, even
+    /// under a concurrent-drain race (issue #604 review).
+    ///
+    /// Fire-and-forget: calling this more than once is a no-op as far
+    /// as wake-up goes (the second `notify_one` coalesces into the
+    /// pending permit the first call stored).
+    pub fn fire(&self, wait_admin: bool) -> bool {
+        // First writer wins. `OnceLock::get_or_init` is the atomic
+        // CAS-equivalent: only the first caller's closure runs and
+        // its value is stored; every subsequent call returns the
+        // previously-stored value.
+        let effective = *self.wait_admin.get_or_init(|| wait_admin);
+        // Notify *after* the OnceLock store so the runtime's
+        // `notified()` resolution synchronizes-with our store. Any
+        // reader that calls `wait_admin()` after observing `notified()`
+        // is guaranteed to see `Some(effective)`.
         self.notify.notify_one();
+        effective
     }
 
-    /// Set the `wait_admin` flag the runtime will read after `wait`
-    /// resolves. Must be called *before* [`fire`](Self::fire) so the
-    /// flag is observable by the runtime's reader; the drain RPC
-    /// handler establishes that ordering. `Ordering::Release` here
-    /// pairs with the runtime's `Ordering::Acquire` load.
-    pub fn set_wait_admin(&self, value: bool) {
-        self.wait_admin.store(value, Ordering::Release);
-    }
-
-    /// Read the current `wait_admin` flag. Called by the runtime after
-    /// [`wait`](Self::wait) resolves to decide the shutdown order.
+    /// Read the current `wait_admin` value. `false` when no fire has
+    /// happened yet (runtime should pick the SIGTERM-equivalent
+    /// ordering). The runtime calls this only after `wait()` has
+    /// resolved, at which point `OnceLock::get()` returns `Some`.
     #[must_use]
     pub fn wait_admin(&self) -> bool {
-        self.wait_admin.load(Ordering::Acquire)
+        self.wait_admin.get().copied().unwrap_or(false)
     }
 
-    /// Wait until [`fire`](Self::fire) is called. Returns immediately if
-    /// `fire` was already called before `wait` was polled.
+    /// Wait until [`fire`](Self::fire) is called. Returns immediately
+    /// if `fire` was already called before `wait` was polled.
     pub async fn wait(&self) {
         self.notify.notified().await;
     }
@@ -169,8 +195,9 @@ pub struct ReloadHook {
 }
 
 impl AdminState {
-    // Now at 9 params after the #604 metrics addition. A builder would be
-    // tidier but is out of scope here — defer until the next addition.
+    // A builder would be tidier but is deferred until the next
+    // signature change forces a refactor — the existing call sites
+    // are few and each already passes every field by name.
     #[allow(clippy::too_many_arguments)]
     pub const fn new(
         peer_table: Arc<RwLock<PeerTable>>,
@@ -372,30 +399,17 @@ impl AdminRpcServer for AdminRpcImpl {
         // indistinguishable from `Some(DrainRequest::default())` from
         // here on — both mean "SIGTERM-equivalent drain".
         let req = req.unwrap_or_default();
-        // Establish `wait_admin` *before* firing the trigger so the
-        // runtime's reader (which loads it after `wait()` resolves) can
-        // see the request's value with no acquire-side race. The
-        // `Release` store inside `set_wait_admin` is paired with the
-        // runtime's `Acquire` load — see `DrainTrigger`.
-        self.state.drain_trigger.set_wait_admin(req.wait_admin);
-        // `initiated: true` reflects "the trigger was fired", not "the
-        // runtime is now in the AdminDrain branch". If shutdown is
-        // already underway (a SIGTERM/SIGINT raced this RPC) the runtime
-        // has already passed `drain_trigger.wait()` in its select loop,
-        // so this `fire()` lands in an abandoned arm. Functionally fine
-        // — shutdown is happening anyway — but a future reader shouldn't
-        // infer causation from the response.
-        //
-        // `wait_admin_honored` mirrors `req.wait_admin` because the
-        // runtime ordering check reads the same flag we just set. The
-        // CLI uses this as a cross-version ack: an older server lacking
-        // the field deserializes it to `false`, and `decdn node drain
-        // --wait` refuses to poll against a server that can't honor the
-        // request.
-        self.state.drain_trigger.fire();
+        // Atomic fire-with-wait_admin: returns the *effective* value
+        // the runtime will see. First writer wins, so a concurrent
+        // drain race can no longer produce a response that lies about
+        // what the runtime will do (issue #604 review). The CLI reads
+        // this ack to refuse polling against any server that didn't
+        // honor `wait_admin` — older binary, future regression, or a
+        // race where another caller's `wait_admin: false` won.
+        let honored = self.state.drain_trigger.fire(req.wait_admin);
         Ok(DrainResponse {
             initiated: true,
-            wait_admin_honored: req.wait_admin,
+            wait_admin_honored: honored,
         })
     }
 
@@ -1120,7 +1134,8 @@ mod tests {
     #[tokio::test]
     async fn drain_trigger_fire_then_wait_resolves() {
         let trigger = DrainTrigger::new();
-        trigger.fire();
+        let honored = trigger.fire(false);
+        assert!(!honored, "first writer's value is the effective one");
         let waited =
             tokio::time::timeout(std::time::Duration::from_millis(100), trigger.wait()).await;
         assert!(waited.is_ok(), "wait() did not resolve after fire()");
@@ -1140,15 +1155,41 @@ mod tests {
     #[tokio::test]
     async fn drain_trigger_repeated_fire_does_not_deadlock_wait() {
         let trigger = DrainTrigger::new();
-        trigger.fire();
-        trigger.fire(); // second fire — coalesces, permit still available
-        trigger.fire(); // third fire — same coalesce; defends against the
+        let h1 = trigger.fire(false);
+        let h2 = trigger.fire(false); // second fire — coalesces, permit still available
+        let h3 = trigger.fire(false); // third fire — same coalesce; defends against the
         // "burns one permit per fire" regression class
+        assert_eq!(
+            (h1, h2, h3),
+            (false, false, false),
+            "all three fires must report the same effective value"
+        );
         let waited =
             tokio::time::timeout(std::time::Duration::from_millis(100), trigger.wait()).await;
         assert!(
             waited.is_ok(),
             "wait() did not resolve after three fire() calls"
+        );
+    }
+
+    /// First-writer-wins on `wait_admin` (issue #604 review): two
+    /// races on the same trigger must not produce an ack that lies
+    /// about what the runtime will see. The first `fire(true)` stores
+    /// `true`; a second `fire(false)` must return `true` (the
+    /// effective value the runtime will read), not its own argument.
+    #[tokio::test]
+    async fn drain_trigger_fire_is_first_writer_wins() {
+        let trigger = DrainTrigger::new();
+        let first = trigger.fire(true);
+        let second = trigger.fire(false);
+        assert!(first, "first fire reports its own value");
+        assert!(
+            second,
+            "second fire reports the prior writer's value, not its own"
+        );
+        assert!(
+            trigger.wait_admin(),
+            "runtime reader sees the first writer's value"
         );
     }
 
@@ -1201,13 +1242,11 @@ mod tests {
         );
     }
 
-    /// `admin_v1_drain` with `wait_admin: true` (issue #604) sets the
-    /// trigger's `wait_admin` flag *before* firing it, so the runtime's
-    /// `wait_admin()` reader (which loads after `wait()` resolves) sees
-    /// the request's value with no acquire-side race. Without the
-    /// ordering, a runtime that polled the flag mid-shutdown could see
-    /// the default `false` and tear admin down early — defeating the
-    /// whole point of `decdn node drain --wait`.
+    /// `admin_v1_drain` with `wait_admin: true` (issue #604)
+    /// establishes the trigger's effective value atomically via
+    /// `fire(true)` so the runtime's reader sees it after `wait()`
+    /// resolves. Cross-thread visibility is via the
+    /// `Notify::notify_one → notified()` happens-before edge.
     #[tokio::test]
     async fn admin_drain_with_wait_admin_sets_flag_before_fire() {
         let trigger = Arc::new(DrainTrigger::new());

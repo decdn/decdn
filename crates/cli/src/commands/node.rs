@@ -1,7 +1,9 @@
 //! `decdn node ...` — operator-local admin commands that talk to a running
-//! node over its loopback JSON-RPC admin surface (ADR 025).
+//! node over its loopback JSON-RPC admin surface (`appendix-local-admin-http`).
 
 use std::io;
+use std::io::Write as _;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -298,16 +300,8 @@ pub async fn drain(args: &cli::DrainArgs, global_config: Option<&Path>) -> anyho
         "--timeout-ms must be > 0 (jsonrpsee treats Duration::ZERO as \
          'never' rather than 'sub-millisecond deadline')"
     );
-    if args.wait {
-        anyhow::ensure!(
-            args.wait_timeout_secs > 0,
-            "--wait-timeout-secs must be > 0 when --wait is set"
-        );
-        anyhow::ensure!(
-            args.wait_poll_ms > 0,
-            "--wait-poll-ms must be > 0 when --wait is set"
-        );
-    }
+    // `wait_timeout_secs` and `wait_poll_ms` are `NonZeroU64` — clap
+    // rejects `0` at parse time, so no further runtime check needed.
 
     let config_path = args.config.as_deref().or(global_config);
     let url = resolve_admin_url(args.admin_url.as_deref(), config_path)?;
@@ -349,10 +343,19 @@ pub async fn drain(args: &cli::DrainArgs, global_config: Option<&Path>) -> anyho
     // completion while in-flight streams are still running, defeating
     // the zero-payment-loss guarantee.
     if !resp.wait_admin_honored {
+        // The drain has *already fired* server-side at this point —
+        // fire-and-forget semantics, so the node is now mid-shutdown
+        // via the legacy SIGTERM-equivalent ordering. The operator
+        // can't undo that; the actionable advice is to either let it
+        // finish via the legacy path (process exit / health-until-
+        // ECONNREFUSED) or upgrade the node so `--wait` works next time.
         return Err(anyhow::anyhow!(
-            "admin at {url} did not honor --wait (wait_admin_honored=false); \
-             the server is likely older than the CLI or does not implement \
-             #604. Re-run without --wait, or upgrade the node",
+            "admin at {url} did not honor --wait (wait_admin_honored=false). \
+             Drain has already been initiated server-side and the node is \
+             shutting down via the legacy SIGTERM-equivalent path; observe \
+             completion via process exit or `decdn node health` until \
+             ECONNREFUSED. The server is likely older than the CLI or does \
+             not implement #604 — upgrade the node to use --wait safely",
         ));
     }
 
@@ -362,65 +365,151 @@ pub async fn drain(args: &cli::DrainArgs, global_config: Option<&Path>) -> anyho
     // `router.shutdown` returned), or the wall-clock budget elapses.
     // Both terminal-success paths emit the same JSON shape so machine
     // consumers see a single schema regardless of which branch fires.
-    let deadline = std::time::Instant::now() + Duration::from_secs(args.wait_timeout_secs);
-    let poll_interval = Duration::from_millis(args.wait_poll_ms);
+    let deadline = std::time::Instant::now() + Duration::from_secs(args.wait_timeout_secs.get());
+    let poll_interval = Duration::from_millis(args.wait_poll_ms.get());
     loop {
         let h = match client.health().await {
             Ok(h) => h,
-            Err(JsonRpcClientError::Transport(inner)) if is_connection_refused(inner.as_ref()) => {
+            Err(JsonRpcClientError::Transport(inner))
+                if is_admin_closed_transport_error(inner.as_ref()) =>
+            {
                 // Admin closed — runtime finished `router.shutdown` and
                 // moved on. In-flight streams are necessarily zero
-                // (router awaited them all) and the runtime has now
-                // torn admin down as designed.
-                emit_drain_complete(args.json, true);
+                // (router awaited them all). Treat
+                // ConnectionRefused/Reset/Aborted and UnexpectedEof
+                // all the same: each is a way for a TCP connection to
+                // observe "the listener / accepted socket went away."
+                emit_drain_complete(&mut io::stdout().lock(), args.json, true)
+                    .context("failed to write drain-complete output")?;
                 return Ok(());
+            }
+            // Transient errors during polling shouldn't end the wait
+            // — the polling loop has its own wall-clock deadline. A
+            // single 5s RPC timeout against a momentarily-busy admin
+            // would otherwise collapse a 30s drain budget after one
+            // tick. Retry until the deadline check fires; the
+            // deadline is the single authority on "give up".
+            // Bundling `RequestTimeout` and non-close `Transport`
+            // into the same arm — they have the same retry policy.
+            Err(JsonRpcClientError::RequestTimeout | JsonRpcClientError::Transport(_)) => {
+                check_deadline_and_sleep(deadline, poll_interval, args.wait_timeout_secs).await?;
+                continue;
+            }
+            // Server-side JSON-RPC errors during polling indicate
+            // something genuinely unexpected (MethodNotFound here
+            // would have been caught upstream by the
+            // `wait_admin_honored=false` guard, so any `Call(...)` is
+            // novel). Bail with a clear diagnostic.
+            Err(JsonRpcClientError::Call(obj)) => {
+                return Err(anyhow::anyhow!(
+                    "admin at {url} returned JSON-RPC error {} during --wait poll: {}",
+                    obj.code(),
+                    obj.message(),
+                ));
             }
             Err(other) => {
                 return Err(classify_client_error(&url, args.timeout_ms, other));
             }
         };
         if h.in_flight_streams == 0 {
-            emit_drain_complete(args.json, false);
+            emit_drain_complete(&mut io::stdout().lock(), args.json, false)
+                .context("failed to write drain-complete output")?;
             return Ok(());
         }
-        if std::time::Instant::now() >= deadline {
-            // Print the diagnostic to stderr so a `--json` consumer of
-            // stdout doesn't see a corrupted half-stream, and so plain
-            // operator output stays grep-friendly. Then return Err so
-            // the process exits non-zero — operator scripts can fail
-            // closed on stuck drains.
-            let n = h.in_flight_streams;
-            eprintln!(
-                "drain_timeout=true in_flight_streams={n} \
-                 wait_timeout_secs={}",
-                args.wait_timeout_secs
-            );
-            return Err(anyhow::anyhow!(
-                "drain --wait timed out after {}s; {n} stream(s) still in flight",
-                args.wait_timeout_secs
-            ));
-        }
-        tokio::time::sleep(poll_interval).await;
+        check_deadline_and_sleep_with_count(
+            deadline,
+            poll_interval,
+            args.wait_timeout_secs,
+            h.in_flight_streams,
+        )
+        .await?;
     }
 }
 
-/// Emit the unified terminal-success line for `decdn node drain
-/// --wait`. Both the polled-to-zero and ECONNREFUSED branches print
-/// the same `{drain_complete, in_flight_streams, admin_closed}` shape
-/// so machine consumers don't have to parse two unrelated schemas
-/// depending on which path fired (#662 review).
-fn emit_drain_complete(json: bool, admin_closed: bool) {
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "drain_complete": true,
-                "in_flight_streams": 0,
-                "admin_closed": admin_closed,
-            })
+/// Sleep until `poll_interval` elapses or `deadline` is reached,
+/// whichever fires first; on deadline overrun, return `Err` with the
+/// "no in-flight count known" timeout shape. Sleep is racy with
+/// `ctrl_c` so an operator can interrupt a long wait without
+/// `SIGKILL`ing the process.
+async fn check_deadline_and_sleep(
+    deadline: std::time::Instant,
+    poll_interval: Duration,
+    wait_timeout_secs: NonZeroU64,
+) -> anyhow::Result<()> {
+    if std::time::Instant::now() >= deadline {
+        let _ = writeln!(
+            io::stderr().lock(),
+            "drain_timeout=true wait_timeout_secs={wait_timeout_secs}"
         );
+        return Err(anyhow::anyhow!(
+            "drain --wait timed out after {wait_timeout_secs}s"
+        ));
+    }
+    sleep_or_ctrl_c(poll_interval).await
+}
+
+/// Variant of [`check_deadline_and_sleep`] used when the last
+/// successful health response is available, so the timeout diagnostic
+/// can report the last-known in-flight count to the operator.
+async fn check_deadline_and_sleep_with_count(
+    deadline: std::time::Instant,
+    poll_interval: Duration,
+    wait_timeout_secs: NonZeroU64,
+    in_flight: u64,
+) -> anyhow::Result<()> {
+    if std::time::Instant::now() >= deadline {
+        let _ = writeln!(
+            io::stderr().lock(),
+            "drain_timeout=true in_flight_streams={in_flight} \
+             wait_timeout_secs={wait_timeout_secs}"
+        );
+        return Err(anyhow::anyhow!(
+            "drain --wait timed out after {wait_timeout_secs}s; \
+             {in_flight} stream(s) still in flight"
+        ));
+    }
+    sleep_or_ctrl_c(poll_interval).await
+}
+
+/// Sleep for `dur` but resolve early on Ctrl-C, returning `Err` so
+/// the polling loop can short-circuit with a clean exit. Without the
+/// `ctrl_c` race, a long `--wait-poll-ms` would leave the operator
+/// wedged for the remainder of the tick before they could escape.
+async fn sleep_or_ctrl_c(dur: Duration) -> anyhow::Result<()> {
+    tokio::select! {
+        () = tokio::time::sleep(dur) => Ok(()),
+        result = tokio::signal::ctrl_c() => {
+            result.context("ctrl_c handler failed")?;
+            let _ = writeln!(
+                io::stderr().lock(),
+                "drain --wait interrupted by Ctrl-C; drain continues server-side \
+                 (use `decdn node health` to observe completion)",
+            );
+            Err(anyhow::anyhow!("drain --wait interrupted"))
+        }
+    }
+}
+
+/// Write the unified terminal-success record for `decdn node drain
+/// --wait` to `w`. Both the polled-to-zero and ECONNREFUSED branches
+/// share the same `{drain_complete, in_flight_streams, admin_closed}`
+/// shape so machine consumers don't have to parse two unrelated
+/// schemas depending on which path fired (#662 review). Same
+/// `&mut impl io::Write` pattern as [`write_peers_table`] so tests
+/// can assert exact bytes without a stdout capture.
+fn emit_drain_complete(w: &mut impl io::Write, json: bool, admin_closed: bool) -> io::Result<()> {
+    if json {
+        let value = serde_json::json!({
+            "drain_complete": true,
+            "in_flight_streams": 0,
+            "admin_closed": admin_closed,
+        });
+        writeln!(w, "{value}")
     } else {
-        println!("drain_complete=true in_flight_streams=0 admin_closed={admin_closed}");
+        writeln!(
+            w,
+            "drain_complete=true in_flight_streams=0 admin_closed={admin_closed}"
+        )
     }
 }
 
@@ -501,10 +590,41 @@ fn classify_client_error(url: &str, timeout_ms: u64, err: JsonRpcClientError) ->
 /// details, so match on the innermost `io::Error` kind instead of any
 /// particular transport type.
 fn is_connection_refused(err: &(dyn std::error::Error + 'static)) -> bool {
+    io_error_kind_in_source_chain(err, |kind| kind == std::io::ErrorKind::ConnectionRefused)
+}
+
+/// Walk the `source()` chain looking for any `std::io::Error` whose
+/// kind indicates the admin server's listener (or an already-accepted
+/// connection) has gone away. Used by the `--wait` polling loop to
+/// detect "admin closed after `router.shutdown` returned" — which is
+/// the late-stop success terminal. `ConnectionRefused` is the most
+/// common (new connection rejected because listener dropped), but
+/// `ConnectionReset` / `ConnectionAborted` / `UnexpectedEof` also
+/// occur when a poll lands mid-response as the server tears down.
+/// Without these, the polling loop would treat a race-window error
+/// as fatal and turn drain completion into a non-zero exit.
+fn is_admin_closed_transport_error(err: &(dyn std::error::Error + 'static)) -> bool {
+    io_error_kind_in_source_chain(err, |kind| {
+        matches!(
+            kind,
+            std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::UnexpectedEof
+        )
+    })
+}
+
+/// Helper: walk the `source()` chain, return `true` if any layer is
+/// an `io::Error` whose kind matches `predicate`.
+fn io_error_kind_in_source_chain(
+    err: &(dyn std::error::Error + 'static),
+    predicate: impl Fn(std::io::ErrorKind) -> bool,
+) -> bool {
     let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
     while let Some(e) = current {
         if let Some(io_err) = e.downcast_ref::<std::io::Error>()
-            && io_err.kind() == std::io::ErrorKind::ConnectionRefused
+            && predicate(io_err.kind())
         {
             return true;
         }
@@ -709,6 +829,117 @@ fn format_age(delta_us: u64) -> String {
 )]
 mod tests {
     use super::*;
+
+    /// `emit_drain_complete` JSON shape, polled-to-zero branch:
+    /// `admin_closed=false`. Asserts the exact JSON object so
+    /// machine consumers can rely on a fixed schema across both
+    /// terminal-success paths (#662 review).
+    #[test]
+    fn emit_drain_complete_json_admin_closed_false() {
+        let mut buf = Vec::new();
+        emit_drain_complete(&mut buf, true, false).expect("write succeeds");
+        let s = String::from_utf8(buf).expect("utf8");
+        let parsed: serde_json::Value = serde_json::from_str(s.trim()).expect("valid json");
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "drain_complete": true,
+                "in_flight_streams": 0,
+                "admin_closed": false,
+            })
+        );
+    }
+
+    /// JSON shape, ECONNREFUSED branch: `admin_closed=true`.
+    #[test]
+    fn emit_drain_complete_json_admin_closed_true() {
+        let mut buf = Vec::new();
+        emit_drain_complete(&mut buf, true, true).expect("write succeeds");
+        let s = String::from_utf8(buf).expect("utf8");
+        let parsed: serde_json::Value = serde_json::from_str(s.trim()).expect("valid json");
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "drain_complete": true,
+                "in_flight_streams": 0,
+                "admin_closed": true,
+            })
+        );
+    }
+
+    /// Plain-text shape, both branches. Operator scripts parse the
+    /// `key=value` form via grep, so the exact byte layout is a
+    /// public contract — guard it with a literal assertion.
+    #[test]
+    fn emit_drain_complete_plain_shapes() {
+        let mut buf = Vec::new();
+        emit_drain_complete(&mut buf, false, false).expect("write succeeds");
+        assert_eq!(
+            String::from_utf8(buf).expect("utf8"),
+            "drain_complete=true in_flight_streams=0 admin_closed=false\n",
+        );
+
+        let mut buf = Vec::new();
+        emit_drain_complete(&mut buf, false, true).expect("write succeeds");
+        assert_eq!(
+            String::from_utf8(buf).expect("utf8"),
+            "drain_complete=true in_flight_streams=0 admin_closed=true\n",
+        );
+    }
+
+    /// `is_admin_closed_transport_error` walks the `source()` chain
+    /// and matches the four io kinds that indicate the admin
+    /// listener / accepted socket went away. A regression that
+    /// dropped one of the kinds would falsely turn a race-window
+    /// close into a non-zero exit from the `--wait` polling loop.
+    #[test]
+    fn is_admin_closed_transport_error_matches_close_like_kinds() {
+        use std::io::{Error, ErrorKind};
+        for kind in [
+            ErrorKind::ConnectionRefused,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::UnexpectedEof,
+        ] {
+            let io_err = Error::new(kind, "boom");
+            // Wrap to exercise the source-chain walk, not a direct
+            // downcast — production errors are typically several
+            // layers deep (hyper / jsonrpsee / tower).
+            let wrapped: Box<dyn std::error::Error + 'static> = Box::new(io_err);
+            assert!(
+                is_admin_closed_transport_error(wrapped.as_ref()),
+                "kind {kind:?} must be classified as admin-closed",
+            );
+        }
+        // Unrelated kinds must not match.
+        for kind in [
+            ErrorKind::Other,
+            ErrorKind::PermissionDenied,
+            ErrorKind::TimedOut,
+        ] {
+            let io_err = Error::new(kind, "boom");
+            let wrapped: Box<dyn std::error::Error + 'static> = Box::new(io_err);
+            assert!(
+                !is_admin_closed_transport_error(wrapped.as_ref()),
+                "kind {kind:?} must not be classified as admin-closed",
+            );
+        }
+    }
+
+    /// `is_connection_refused` keeps the original narrow semantics
+    /// — only `ConnectionRefused` matches. Used by the non-wait
+    /// `classify_client_error` path; the wider helper is only for
+    /// the `--wait` poll loop.
+    #[test]
+    fn is_connection_refused_only_matches_refused() {
+        use std::io::{Error, ErrorKind};
+        let refused: Box<dyn std::error::Error + 'static> =
+            Box::new(Error::new(ErrorKind::ConnectionRefused, "x"));
+        assert!(is_connection_refused(refused.as_ref()));
+        let reset: Box<dyn std::error::Error + 'static> =
+            Box::new(Error::new(ErrorKind::ConnectionReset, "x"));
+        assert!(!is_connection_refused(reset.as_ref()));
+    }
 
     fn mk_peer(node_id: &str, region: &str, last_seen_us: u64) -> PeerView {
         PeerView {

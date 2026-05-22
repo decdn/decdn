@@ -311,15 +311,34 @@ impl Metrics {
     /// Current value of the `dispatch_in_flight` gauge as a `u64`. Read
     /// by `admin_v1_health.in_flight_streams` (issue #604) so the
     /// `decdn node drain --wait` client can observe in-flight client
-    /// streams reach 0 during a graceful drain. Negative gauge readings
-    /// (theoretically possible if `dispatch_permit_released` ever ran
-    /// without a paired acquire — the permit RAII pair forbids this,
-    /// but the gauge type is signed) clamp to 0 rather than wrapping
-    /// to a huge `u64`.
+    /// streams reach 0 during a graceful drain.
+    ///
+    /// A negative gauge reading is forbidden by the `Permit`
+    /// acquire/release RAII pair: `dispatch_permit_acquired` runs once
+    /// before each `Permit` exists and `dispatch_permit_released` runs
+    /// once on `Drop`. If the conversion fails the pair has been
+    /// broken — we both `debug_assert!` (loud failure in tests/dev),
+    /// log `tracing::error!` (visible in production), and return 0
+    /// rather than wrapping to a huge `u64`. **Returning 0 here would
+    /// be read by `decdn node drain --wait` as "drain complete" while
+    /// real streams are still in flight**, so the loud log is the
+    /// operator-actionable signal that something broke upstream.
     #[must_use]
     pub fn dispatch_in_flight_value(&self) -> u64 {
         let raw = self.decdn.dispatch_in_flight.get();
-        u64::try_from(raw).unwrap_or(0)
+        if let Ok(v) = u64::try_from(raw) {
+            return v;
+        }
+        debug_assert!(false, "dispatch_in_flight gauge went negative: {raw}");
+        tracing::error!(
+            raw,
+            "dispatch_in_flight gauge is negative; the Permit \
+             acquire/release pair is unbalanced. Reporting 0 to \
+             avoid wraparound — `decdn node drain --wait` clients \
+             may see a premature 'complete' signal until the \
+             underlying accounting bug is fixed."
+        );
+        0
     }
 
     /// Record a relay-only connection accepted while the per-source

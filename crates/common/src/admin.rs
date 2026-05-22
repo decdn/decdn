@@ -369,16 +369,17 @@ pub trait AdminRpc {
     /// trigger lands, not when shutdown completes. Equivalent to `kill
     /// -TERM <pid>` for operators who'd rather not stat the PID.
     ///
-    /// Set `req.wait_admin = true` (issue #604) to ask the runtime to
-    /// keep the admin server alive through `router.shutdown` so a
-    /// polling client can observe `admin_v1_health.in_flight_streams`
-    /// reach 0. The parameter is `Option<DrainRequest>`: jsonrpsee's
-    /// proc-macro maps `Option<T>` arguments to `optional_next()`
-    /// (`render_server.rs:378`), so older clients that omit the
-    /// `params` field entirely decode to `None` rather than
-    /// `InvalidParams`. The server impl normalizes `None` to
-    /// `DrainRequest::default()` and gets the original
-    /// SIGTERM-equivalent shutdown order.
+    /// Send `{"wait_admin": true}` as `params` (issue #604) — or
+    /// from Rust, `Some(DrainRequest { wait_admin: true })` — to ask
+    /// the runtime to keep the admin server alive through
+    /// `router.shutdown` so a polling client can observe
+    /// `admin_v1_health.in_flight_streams` reach 0. The parameter is
+    /// `Option<DrainRequest>`: jsonrpsee's proc-macro maps
+    /// `Option<T>` arguments to `optional_next()` in its server
+    /// renderer, so older clients that omit the `params` field
+    /// entirely decode to `None` rather than `InvalidParams`. The
+    /// server impl normalizes `None` to `DrainRequest::default()` and
+    /// gets the original SIGTERM-equivalent shutdown order.
     #[method(name = "drain")]
     async fn drain(&self, req: Option<DrainRequest>) -> RpcResult<DrainResponse>;
 }
@@ -420,4 +421,66 @@ pub fn parse_hash_arg(hex: &str) -> Result<Hash, ErrorObjectOwned> {
         )
     })?;
     Ok(Hash::from_bytes(arr))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    /// Wire back-compat for `DrainResponse.wait_admin_honored`
+    /// (issue #604 review): a pre-#604 server's response omits the
+    /// field. `#[serde(default)]` must deserialize the omitted field
+    /// to `false` so the new CLI's safety guard fires ("server
+    /// doesn't honor --wait") rather than the CLI proceeding to poll
+    /// against a server that will close admin early.
+    ///
+    /// Accidental removal of the `#[serde(default)]` attribute would
+    /// otherwise turn an old-server response into a deserialize error,
+    /// surfacing as a confusing "transport" failure instead of the
+    /// actionable "upgrade the node" message.
+    #[test]
+    fn drain_response_legacy_shape_defaults_wait_admin_honored_false() {
+        let legacy = r#"{"initiated":true}"#;
+        let resp: DrainResponse =
+            serde_json::from_str(legacy).expect("legacy DrainResponse must deserialize");
+        assert!(resp.initiated);
+        assert!(
+            !resp.wait_admin_honored,
+            "missing wait_admin_honored must default to false"
+        );
+    }
+
+    /// Same guarantee for `HealthResponse.in_flight_streams`: an
+    /// older server lacking the field must round-trip as `0` so
+    /// pre-#604 `decdn node health` clients (and the new --wait
+    /// polling loop, against any old server) don't break.
+    #[test]
+    fn health_response_legacy_shape_defaults_in_flight_streams_zero() {
+        let legacy = r#"{"node_id":"abc","uptime_s":42}"#;
+        let resp: HealthResponse =
+            serde_json::from_str(legacy).expect("legacy HealthResponse must deserialize");
+        assert_eq!(resp.node_id, "abc");
+        assert_eq!(resp.uptime_s, 42);
+        assert_eq!(
+            resp.in_flight_streams, 0,
+            "missing in_flight_streams must default to 0"
+        );
+    }
+
+    /// `DrainRequest` round-trips through `{}` (empty object) by
+    /// deserializing each field to its serde default. The whole-
+    /// parameter-missing case (no `params` field at all) is handled
+    /// at the RPC layer by `req: Option<DrainRequest>` in the trait
+    /// (jsonrpsee's `optional_next`); this test guards the field-
+    /// level default semantics.
+    #[test]
+    fn drain_request_empty_object_deserializes_to_default() {
+        let req: DrainRequest =
+            serde_json::from_str("{}").expect("empty-object DrainRequest must deserialize");
+        assert!(
+            !req.wait_admin,
+            "missing wait_admin must default to false (SIGTERM-equivalent)"
+        );
+    }
 }

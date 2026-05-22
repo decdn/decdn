@@ -15,8 +15,18 @@
 )]
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Instant;
+
+/// Test-only helper so call sites stay compact. The `unwrap` is
+/// statically sound for any positive integer literal we pass in.
+const fn nz(v: u64) -> NonZeroU64 {
+    match NonZeroU64::new(v) {
+        Some(n) => n,
+        None => panic!("test value must be > 0"),
+    }
+}
 
 use decdn_cache::CacheEngine;
 use decdn_cli::commands::node as commands;
@@ -546,8 +556,8 @@ async fn cli_drain_surfaces_connection_refused() -> anyhow::Result<()> {
         json: false,
         timeout_ms: 2_000,
         wait: false,
-        wait_timeout_secs: 30,
-        wait_poll_ms: 250,
+        wait_timeout_secs: nz(30),
+        wait_poll_ms: nz(250),
     };
     let err = commands::drain(&args, None)
         .await
@@ -569,8 +579,8 @@ async fn cli_drain_rejects_zero_timeout() -> anyhow::Result<()> {
         json: false,
         timeout_ms: 0,
         wait: false,
-        wait_timeout_secs: 30,
-        wait_poll_ms: 250,
+        wait_timeout_secs: nz(30),
+        wait_poll_ms: nz(250),
     };
     let err = commands::drain(&args, None)
         .await
@@ -667,8 +677,8 @@ async fn cli_drain_wait_returns_immediately_when_idle() -> anyhow::Result<()> {
         json: false,
         timeout_ms: 5_000,
         wait: true,
-        wait_timeout_secs: 10,
-        wait_poll_ms: 50,
+        wait_timeout_secs: nz(10),
+        wait_poll_ms: nz(50),
     };
     commands::drain(&args, None).await?;
 
@@ -723,8 +733,8 @@ async fn cli_drain_wait_refuses_unhonored_server() -> anyhow::Result<()> {
         json: false,
         timeout_ms: 5_000,
         wait: true,
-        wait_timeout_secs: 30,
-        wait_poll_ms: 250,
+        wait_timeout_secs: nz(30),
+        wait_poll_ms: nz(250),
     };
     let err = commands::drain(&args, None)
         .await
@@ -737,6 +747,91 @@ async fn cli_drain_wait_refuses_unhonored_server() -> anyhow::Result<()> {
     );
 
     handle.stop().ok();
+    handle.stopped().await;
+    Ok(())
+}
+
+/// `decdn node drain --wait` against a server that *does* honor
+/// `wait_admin` but then closes admin mid-poll (the real
+/// late-stop success terminal): the polling client's `health()`
+/// call returns `ECONNREFUSED`, which the CLI treats as drain
+/// completion. Without this test the ECONNREFUSED branch of the
+/// polling loop is uncovered — a regression in
+/// `is_admin_closed_transport_error`'s source-chain walk or in the
+/// match-arm ordering would silently turn drain success into `Err`.
+#[tokio::test]
+async fn cli_drain_wait_treats_econnrefused_as_complete() -> anyhow::Result<()> {
+    // Build a fake server that:
+    //   1. Answers admin_v1_drain with wait_admin_honored=true.
+    //   2. Stops the server as soon as the first admin_v1_health
+    //      call lands, so the polling loop's *next* tick gets
+    //      ECONNREFUSED — exactly the late-stop sequence the
+    //      runtime executes in production.
+    use std::sync::OnceLock;
+
+    let (listener, addr) = bind_loopback().await?;
+    let std_listener = listener.into_std()?;
+    let config = ServerConfig::builder().http_only().build();
+    let server = Server::builder()
+        .set_config(config)
+        .build_from_tcp(std_listener)
+        .map_err(|e| anyhow::anyhow!("build fake admin: {e}"))?;
+    let mut module = RpcModule::new(());
+    module.register_async_method("admin_v1_drain", |_p, _c, _e| async move {
+        Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!({
+            "initiated": true,
+            "wait_admin_honored": true,
+        }))
+    })?;
+    // Set lazily: `Server::start()` is called *after* the module is
+    // built, so the closure can't capture the handle directly.
+    let handle_holder: Arc<OnceLock<jsonrpsee::server::ServerHandle>> = Arc::new(OnceLock::new());
+    let handle_for_health = Arc::clone(&handle_holder);
+    let stop_guard: Arc<OnceLock<()>> = Arc::new(OnceLock::new());
+    module.register_async_method("admin_v1_health", move |_p, _c, _e| {
+        let h = Arc::clone(&handle_for_health);
+        let g = Arc::clone(&stop_guard);
+        async move {
+            // First health() call schedules a stop; subsequent
+            // calls (if any race in before the stop lands) no-op
+            // via the OnceLock guard.
+            if g.set(()).is_ok()
+                && let Some(handle) = h.get().cloned()
+            {
+                tokio::spawn(async move {
+                    // Brief sleep so *this* poll's response is fully
+                    // serialized before the listener closes — the
+                    // CLI must observe `in_flight_streams=1` first,
+                    // then the *next* poll hits ECONNREFUSED.
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    handle.stop().ok();
+                });
+            }
+            Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!({
+                "node_id": "00".repeat(32),
+                "uptime_s": 1,
+                "in_flight_streams": 1,
+            }))
+        }
+    })?;
+    let handle = server.start(module);
+    let _ = handle_holder.set(handle.clone());
+
+    let url = format!("http://{addr}");
+    let args = DrainArgs {
+        admin_url: Some(url.clone()),
+        config: None,
+        json: false,
+        timeout_ms: 5_000,
+        wait: true,
+        wait_timeout_secs: nz(10),
+        // 25ms poll < 50ms server-side stop delay: the first poll
+        // completes, the server then closes during the next sleep,
+        // and the second poll fires ECONNREFUSED.
+        wait_poll_ms: nz(25),
+    };
+    commands::drain(&args, None).await?;
+
     handle.stopped().await;
     Ok(())
 }
@@ -790,8 +885,8 @@ async fn cli_drain_wait_times_out_on_stuck_stream() -> anyhow::Result<()> {
         timeout_ms: 5_000,
         wait: true,
         // Sub-second wait budget so the test completes promptly.
-        wait_timeout_secs: 1,
-        wait_poll_ms: 50,
+        wait_timeout_secs: nz(1),
+        wait_poll_ms: nz(50),
     };
     let err = commands::drain(&args, None)
         .await
